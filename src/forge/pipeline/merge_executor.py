@@ -81,6 +81,22 @@ the sentence), so a thread can print them verbatim rather than compose words of
 its own, and the merge's own receipt records them beside the merge. A
 repository without a sandbox says and records nothing extra: its sentence, its
 report and its receipts are byte for byte what they were.
+
+THE PRESS WRITES THE BUILD'S ENDING (2026-09-10), because it is the only
+thing that knows how the merge ended. Until now it wrote its receipts, its
+report and its stage rows and never touched the build's own row, and the
+conductor's close-out deliberately leaves the merge-card path alone, so
+nothing closed the row at all: a build that merged and was promoted still
+said RUNNING hours later, and so did every honestly refused one, until a
+person ran ``forge cancel`` and wrote CANCELLED over a journey that had
+merged. Now every ending of the press closes the row through the lifecycle's
+own transition seam: a merge that merged and was promoted closes it COMPLETE,
+and every other ending — refused at the candidate check, at the branch, at a
+dirty tree, at a moved main, or red after the merge landed — closes it FAILED
+carrying the very sentence the report and the card carry. A row that
+something else has already closed is left exactly as it is, so the write is
+safe to repeat and a routine feature build, whose row the live build feed
+closes COMPLETE before the card is ever offered, is untouched.
 """
 
 from __future__ import annotations
@@ -133,6 +149,7 @@ __all__ = [
     "MergeExecutorDeps",
     "RED_MERGE_ENDINGS",
     "build_in_daemon_deploy_dispatcher",
+    "close_build_row",
     "execute_merge_deploy",
     "deployed_in_for",
     "merge_wall_seconds",
@@ -573,6 +590,121 @@ def _mint_repair_row(
             type(exc).__name__,
             exc,
         )
+
+
+#: ``builds.error`` is one line, and ``forge status`` renders it in a table
+#: cell. A refusal sentence is one sentence, but an advisory warning line can
+#: ride along behind it, so the reason is collapsed to a line and capped —
+#: the same rule the conductor's own close-out uses, so the two writers of a
+#: build's ending never disagree about what that column holds.
+_ERROR_LINE_LIMIT: int = 500
+
+
+def _one_line(text: str) -> str:
+    """Collapse ``text`` to one trimmed line for ``builds.error``."""
+    collapsed = " ".join(str(text or "").split())
+    if len(collapsed) > _ERROR_LINE_LIMIT:
+        return collapsed[: _ERROR_LINE_LIMIT - 1] + "\u2026"
+    return collapsed
+
+
+def close_build_row(
+    pool: Any,
+    build_id: str,
+    outcome: "MergeDeployOutcome",
+    *,
+    log: logging.Logger = logger,
+) -> str | None:
+    """Write the build's ending, the one thing only the press knows. Never raises.
+
+    The ledger is the estate's record of what happened, and for the whole of
+    the first production journey it recorded a lie: the press merged and
+    promoted, and the build's row still said RUNNING hours later; a refused
+    press left it saying RUNNING too, and each one was cleared by hand with
+    ``forge cancel``, which writes CANCELLED over a journey that had merged
+    or been honestly refused. Nothing else can write that ending. The
+    conductor's close-out steps aside for the merge-card path on purpose (it
+    would be racing the press), the rest of the executor writes receipts, a
+    report and stage rows and never the build row, so the row had no writer
+    at all.
+
+    How the ending is read off the press's own outcome, and nothing else:
+
+    * ``PASSED`` — the merge landed and the promote finished — closes the row
+      COMPLETE, with nothing written to ``builds.error`` (that column is the
+      failure text ``forge status`` renders, and prose in it on a good row
+      reads as a failure to every human and every dashboard).
+    * ``FAILED`` — every refusal (the candidate check, a branch that is not
+      there, a dirty tree, a main that moved) and every red ending after a
+      merge that did land — closes the row FAILED with the press's own
+      sentence as the reason: the same sentence the report carries and the
+      same one Rich reads on the card.
+    * Anything else — today only the ``SKIPPED`` shape, which the press never
+      produces — writes nothing and says so, because a word this seam has
+      not met is not grounds for inventing an ending.
+
+    The write goes through :func:`forge.cli._conductor_outcome.finish_mode_c_build`,
+    the estate's one careful terminal writer, rather than a second one of our
+    own: it composes legal hops with
+    :func:`~forge.lifecycle.state_machine.transition_chain` so
+    ``apply_transition`` stays the sole writer of ``builds.status`` and an
+    illegal move is still refused by the state machine; it leaves an
+    already-terminal row exactly as it found it; and it never raises. Its own
+    log lines are prefixed "conductor" — a cost of reusing it rather than
+    growing a second writer that could drift — but the phrase they name is
+    this one, so the seam is still legible in the log.
+
+    NO TRANSITION HAD TO BE ADDED. Every state a build can be in when its
+    merge word arrives already reaches both endings under today's table: a
+    fix journey's row is RUNNING (RUNNING → FINALISING → COMPLETE, or RUNNING
+    → FAILED), and QUEUED, PREPARING, PAUSED, FINALISING and INTERRUPTED all
+    reach both as well. A routine feature build's row is already COMPLETE
+    before the card is offered — the live build feed closes it when the build
+    finishes, and the card is offered after that write — so the press finds a
+    terminal row and leaves it alone. That is the honest answer to "does this
+    change a routine feature build": it does not, and a test proves it.
+
+    Args:
+        pool: The lifecycle persistence facade.
+        build_id: The build whose row this press is ending.
+        outcome: The press's own outcome — its ``status`` decides the ending
+            and its ``detail`` is the reason.
+        log: The logger to name this seam in.
+
+    Returns:
+        The reason recorded, annotated by the writer when the row write
+        degraded (no row, an already-terminal row, an unwritable row), or
+        ``None`` when this press had no ending to write.
+    """
+    from forge.cli._conductor_outcome import finish_mode_c_build
+    from forge.lifecycle.state_machine import BuildState
+
+    status = str(getattr(outcome, "status", "") or "").strip().upper()
+    if status == "PASSED":
+        to_state = BuildState.COMPLETE
+    elif status == "FAILED":
+        to_state = BuildState.FAILED
+    else:
+        log.info(
+            "merge-executor: the press for %s ended %r, which is not an "
+            "ending this seam writes — the build row is left to its own "
+            "writer",
+            build_id,
+            status or None,
+        )
+        return None
+
+    summary = _one_line(getattr(outcome, "detail", "") or "") or (
+        f"the merge press ended {getattr(outcome, 'result', None) or 'without a word'}"
+    )
+    return finish_mode_c_build(
+        pool,
+        build_id,
+        to_state=to_state,
+        summary=summary,
+        what="the merge press's ending",
+        log=log,
+    )
 
 
 def git_venue(git: Any, repo_root: Path | str) -> str:
@@ -1026,6 +1158,13 @@ async def execute_merge_deploy(
             )
         _write_receipt("merge_deploy_report.json", payload.model_dump(mode="json"))
         _record_report(payload, completed)
+        # THE BUILD'S ENDING, written by the only thing that knows it. After
+        # the report, so a row that cannot be written can never cost the
+        # report; before the repair row, because the journey ends before its
+        # follow-on begins. A dry run never reaches here — it leaves no
+        # durable rows on purpose — and a row something else already closed
+        # is left exactly as it is.
+        close_build_row(deps.pool, build_id, outcome)
         # A PRESS THAT FOUND THE CODE WRONG BECOMES A REPAIR JOB (conductor
         # rewire rule 1). The three red endings are the ones where the merge
         # itself landed and what came after it went red — the live checks,
