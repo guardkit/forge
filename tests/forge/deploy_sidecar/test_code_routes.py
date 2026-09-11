@@ -21,15 +21,20 @@ What these tests are really holding in place:
 * the one git command the door runs is asserted argument for argument, and no
   other program is ever started — in particular the search never reaches grep;
 * the door writes nothing: the repository's commit and its clean status are
-  the same after every route has run.
+  the same after every route has run;
+* the search's time limit is read before every file AND before every line, so
+  one enormous file cannot run past it — and the one shape of pattern no clock
+  in this process could stop is refused before a file is opened.
 """
 
 from __future__ import annotations
 
+import itertools
 import json
 import os
 import subprocess
 import threading
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -739,6 +744,231 @@ class TestSearch:
 
         assert status == 400
         assert "over this door's limit" in body["error"]
+
+    # --- the time limit, and the two limits that stand where it cannot -----
+
+    def test_the_time_limit_stops_the_walk_between_files_and_says_so(
+        self, cfg: ForgeConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A clock already past its wall stops the search before it opens
+        anything, and the answer carries ``timed_out`` rather than looking
+        like a search that found nothing."""
+        monkeypatch.setattr(sidecar, "CODE_SEARCH_TIMEOUT_SECONDS", -1.0)
+
+        status, body = process_code_search_request(
+            {"repo": REPO_KEY, "pattern": "get_user"}, config=cfg
+        )
+
+        assert status == 200, body
+        assert body["timed_out"] is True
+        assert body["files_searched"] == 0 and body["count"] == 0
+
+    def test_the_time_limit_also_stops_the_walk_inside_one_file(
+        self, cfg: ForgeConfig, repo: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The limit is read for every LINE, not only for every file.
+
+        One tracked file of twenty thousand lines carries the only match on
+        its last line. Read with a real clock, the search finds it. Read with
+        a clock wound forward a thousandth of a second on every reading, the
+        search stops partway down that same file — ``files_searched`` is 1, so
+        the file was opened and entered, and the match at the end was never
+        reached. Before this test the limit was read once per file and nothing
+        stopped the work inside one.
+        """
+        (repo / "big").mkdir()
+        (repo / "big" / "huge.py").write_text(
+            "x = 1\n" * 20_000 + "needle = 1\n", encoding="utf-8"
+        )
+        _git(repo, "add", "big/huge.py")
+        _git(repo, "commit", "-qm", "huge")
+
+        found = process_code_search_request(
+            {"repo": REPO_KEY, "pattern": "needle", "under": "big"}, config=cfg
+        )[1]
+        assert found["count"] == 1 and found["timed_out"] is False
+
+        ticks = itertools.count()
+        monkeypatch.setattr(sidecar, "CODE_SEARCH_TIMEOUT_SECONDS", 3.0)
+        monkeypatch.setattr(time, "monotonic", lambda: next(ticks) * 0.001)
+
+        status, body = process_code_search_request(
+            {"repo": REPO_KEY, "pattern": "needle", "under": "big"}, config=cfg
+        )
+
+        assert status == 200, body
+        assert body["timed_out"] is True
+        assert body["files_searched"] == 1
+        assert body["count"] == 0
+
+    def test_a_pattern_whose_work_explodes_is_refused_before_any_file_is_read(
+        self, cfg: ForgeConfig, repo: Path
+    ) -> None:
+        """The shape no clock in this process could stop.
+
+        Python's engine backtracks, one ``search()`` call cannot be
+        interrupted, and while it runs it holds the interpreter — so this
+        ordinary-looking source line and this ordinary-looking pattern would
+        together freeze the whole sidecar, not just this request. The refusal
+        comes back in one sentence, before any file is opened, and it says
+        what to send instead. Ten seconds is a wall for the test itself: the
+        answer is immediate, and the old code never returned at all.
+        """
+        (repo / "src" / "plain.py").write_text(
+            "x = '" + "a" * 64 + "'\n", encoding="utf-8"
+        )
+        _git(repo, "add", "src/plain.py")
+        _git(repo, "commit", "-qm", "plain")
+
+        started = time.monotonic()
+        status, body = process_code_search_request(
+            {"repo": REPO_KEY, "pattern": r"(a+)+$"}, config=cfg
+        )
+        elapsed = time.monotonic() - started
+
+        assert status == 400, body
+        assert elapsed < 10.0
+        assert "repeats a group whose own content repeats" in body["error"]
+        assert "'fixed_string': true" in body["error"]
+
+    @pytest.mark.parametrize(
+        "pattern",
+        [r"a+a+a+a+a+$", r"\s*\w+\s*\w+\s*\w+$"],
+    )
+    def test_two_repeats_that_can_match_the_same_characters_are_refused_too(
+        self, pattern: str, cfg: ForgeConfig, repo: Path
+    ) -> None:
+        """The second shape no clock could stop, and the reason the line cap
+        does not cover it.
+
+        Neither of these repeats a group — they repeat two pieces side by
+        side that can both match the same character, so the engine can split
+        the same line more ways with every character it holds. The file here
+        carries two lines of exactly five hundred characters, which is this
+        door's own line cap, so nothing is trimmed. Measured on this machine
+        against one such line: the first pattern had not finished after
+        twenty-five seconds, and the second took fifteen. The door's whole
+        time limit is thirty seconds, and it cannot be read in the middle of
+        either.
+        """
+        (repo / "src" / "plain.py").write_text(
+            ("a" * 499 + "!\n") * 2, encoding="utf-8"
+        )
+        _git(repo, "add", "src/plain.py")
+        _git(repo, "commit", "-qm", "plain")
+
+        started = time.monotonic()
+        status, body = process_code_search_request(
+            {"repo": REPO_KEY, "pattern": pattern}, config=cfg
+        )
+        elapsed = time.monotonic() - started
+
+        assert status == 400, body
+        assert elapsed < 10.0
+        assert "repeats two pieces side by side" in body["error"]
+        assert "'fixed_string': true" in body["error"]
+
+    def test_that_same_pattern_is_searched_for_happily_as_plain_text(
+        self, cfg: ForgeConfig
+    ) -> None:
+        """The refusal above names this way out, so it has to work: taken
+        literally the pattern is text, and text cannot explode."""
+        status, body = process_code_search_request(
+            {"repo": REPO_KEY, "pattern": r"(a+)+$", "fixed_string": True},
+            config=cfg,
+        )
+
+        assert status == 200, body
+        assert body["count"] == 0 and body["timed_out"] is False
+
+    @pytest.mark.parametrize(
+        "pattern",
+        [
+            r"def get_user",
+            r"^\s*import\s+os",
+            r"(self\.)?user_id",
+            r"^(def|class) \w+",
+            r"router\.(get|post)\(",
+            r"[a-z]+_[a-z]+",
+            r"def\s+\w+\s*\(",
+            r"class \w+\(.*\):",
+            r"^from \S+ import ",
+            r"[A-Z]\w*\s*=\s*\d+",
+            r"#\s*TODO:.*",
+            r"\d{4}-\d{2}-\d{2}",
+        ],
+    )
+    def test_the_shape_check_refuses_none_of_the_patterns_people_write(
+        self, pattern: str, cfg: ForgeConfig
+    ) -> None:
+        """The check refuses a shape, not a feature: groups, alternatives,
+        optional parts and repeats are all still searchable — including two
+        repeats in one pattern when they cannot match the same characters,
+        which is what ``def\s+\w+\s*\(`` is doing here."""
+        status, body = process_code_search_request(
+            {"repo": REPO_KEY, "pattern": pattern}, config=cfg
+        )
+
+        assert status == 200, body
+
+    def test_without_the_parser_the_shape_check_refuses_more_not_less(
+        self, cfg: ForgeConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The shape is normally read with the parser Python's own ``re``
+        module uses. If that reading is ever unavailable, the door falls back
+        to refusing any repeated group — more than it must, never less."""
+        monkeypatch.setattr(sidecar, "_re_parser", None)
+
+        refused = process_code_search_request(
+            {"repo": REPO_KEY, "pattern": r"(get|set)+"}, config=cfg
+        )
+        allowed = process_code_search_request(
+            {"repo": REPO_KEY, "pattern": r"get_user"}, config=cfg
+        )
+
+        assert refused[0] == 400
+        assert "repeats a group whose own content repeats" in refused[1]["error"]
+        assert allowed[0] == 200, allowed[1]
+
+    def test_only_the_first_characters_of_a_long_line_are_searched(
+        self, cfg: ForgeConfig, repo: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The line cap bounds what the engine is handed, which is the second
+        thing standing where the clock cannot — so the answer has to say how
+        many lines were only partly searched, rather than let a caller read a
+        silent nought as 'not in this repository'."""
+        (repo / "big").mkdir()
+        (repo / "big" / "minified.py").write_text(
+            "HEAD = '" + "a" * 900 + "needle'\n", encoding="utf-8"
+        )
+        _git(repo, "add", "big/minified.py")
+        _git(repo, "commit", "-qm", "minified")
+        monkeypatch.setattr(sidecar, "CODE_SEARCH_MAX_LINE_CHARS", 40)
+
+        near = process_code_search_request(
+            {"repo": REPO_KEY, "pattern": "HEAD", "under": "big"}, config=cfg
+        )[1]
+        far = process_code_search_request(
+            {"repo": REPO_KEY, "pattern": "needle", "under": "big"}, config=cfg
+        )[1]
+
+        assert near["count"] == 1
+        assert near["matches"][0]["line_truncated"] is True
+        assert near["long_lines_partly_searched"] == 1
+        # Past the cap the line is not searched at all, and the answer says
+        # that one line was cut rather than pretending the word is absent.
+        assert far["count"] == 0
+        assert far["long_lines_partly_searched"] == 1
+
+    def test_an_ordinary_line_is_searched_whole_and_counted_as_such(
+        self, cfg: ForgeConfig
+    ) -> None:
+        status, body = process_code_search_request(
+            {"repo": REPO_KEY, "pattern": "get_user"}, config=cfg
+        )
+
+        assert status == 200, body
+        assert body["long_lines_partly_searched"] == 0
 
 
 # ---------------------------------------------------------------------------
