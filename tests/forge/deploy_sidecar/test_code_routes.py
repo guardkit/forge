@@ -1450,3 +1450,344 @@ class TestLineNumbersAgreeWithEveryOtherTool:
         assert [(m["path"], m["line"], m["text"]) for m in body["matches"]] == [
             ("windows.txt", 3, "needle_crlf")
         ]
+
+
+# ---------------------------------------------------------------------------
+# A tracked link to an untracked file — the last way through the tracked fence
+# ---------------------------------------------------------------------------
+#
+# git tracks a symbolic link as a link, so "is the path the caller sent
+# tracked?" and "is the file about to be read tracked?" are two different
+# questions. Asking only the first served an untracked file beside the link —
+# and, worse, ``.git/config``, which sits inside the tree, is never tracked,
+# and is where a remote's access token lives. Everything below builds a REAL
+# repository holding exactly those links and drives the real request
+# functions against it.
+
+#: A token shaped like the real thing and belonging to nobody, written into
+#: the test repository's own ``.git/config`` so a leak would be visible.
+FAKE_TOKEN = "ghp_thisisafaketokenfortestsonly0000000"
+
+SECRET_ENV = f"TOKEN={FAKE_TOKEN}\nPASSWORD=hunter2\n"
+
+APP_PY = """import json
+
+from fastapi import APIRouter
+
+
+def list_users() -> list:
+    return json.loads("[]")
+"""
+
+SECRET_TOOLS_PY = """import boto3
+
+CREDENTIAL = "hunter2"
+"""
+
+REAL_PY = "import os\n"
+
+
+@pytest.fixture
+def outside_secret(tmp_path: Path) -> Path:
+    """A file outside the repository, for the fence that already holds."""
+    elsewhere = tmp_path / "outside"
+    elsewhere.mkdir()
+    secret = elsewhere / "keys.txt"
+    secret.write_text("a key from outside the tree\n", encoding="utf-8")
+    return secret
+
+
+@pytest.fixture
+def linked_repo(tmp_path: Path, outside_secret: Path) -> Path:
+    """A real repository whose tracked files include five symbolic links.
+
+    Four of them are the cases that matter: a link to an untracked file beside
+    it, a link to ``.git/config``, a link to a file git DOES track (which is
+    legitimate and must keep working), and a link to a directory.
+    """
+    path = tmp_path / "linked"
+    (path / "src").mkdir(parents=True)
+    (path / "lib").mkdir()
+
+    (path / "README.md").write_text("# linked\n", encoding="utf-8")
+    (path / "src" / "app.py").write_text(APP_PY, encoding="utf-8")
+    (path / "lib" / "real.py").write_text(REAL_PY, encoding="utf-8")
+
+    # Untracked, in the tree, and exactly what a link must not reach.
+    (path / "local-secrets.env").write_text(SECRET_ENV, encoding="utf-8")
+    (path / "secret_tools.py").write_text(SECRET_TOOLS_PY, encoding="utf-8")
+
+    (path / "config.txt").symlink_to("local-secrets.env")
+    (path / "notes.txt").symlink_to(".git/config")
+    (path / "alias.py").symlink_to("src/app.py")
+    (path / "tree.txt").symlink_to("src")
+    (path / "lib" / "helper.py").symlink_to("../secret_tools.py")
+    (path / "escape.txt").symlink_to(outside_secret)
+
+    _git(path, "init", "-q")
+    _git(
+        path,
+        "remote",
+        "add",
+        "origin",
+        f"https://x-access-token:{FAKE_TOKEN}@github.com/acme/linked.git",
+    )
+    _git(path, "add", "README.md", "src", "lib", "config.txt", "notes.txt")
+    _git(path, "add", "alias.py", "tree.txt", "escape.txt")
+    _git(path, "commit", "-qm", "init")
+    return path
+
+
+@pytest.fixture
+def linked_cfg(linked_repo: Path) -> ForgeConfig:
+    return _config({REPO_KEY: str(linked_repo)})
+
+
+def _body_text(body: Any) -> str:
+    """Everything an answer would hand back, as one string to search."""
+    return json.dumps(body)
+
+
+class TestTheRepositoryReallyHoldsTheseLinks:
+    """The repository the cases below are argued on, checked first."""
+
+    def test_git_tracks_the_links_themselves(self, linked_repo: Path) -> None:
+        tracked = _git(linked_repo, "ls-files").stdout.split()
+
+        assert "config.txt" in tracked
+        assert "notes.txt" in tracked
+        assert "alias.py" in tracked
+        assert "lib/helper.py" in tracked
+        # And the files they point at are NOT tracked.
+        assert "local-secrets.env" not in tracked
+        assert "secret_tools.py" not in tracked
+        assert ".git/config" not in tracked
+
+    def test_the_secret_and_the_token_are_really_there_to_be_leaked(
+        self, linked_repo: Path
+    ) -> None:
+        assert FAKE_TOKEN in (linked_repo / "local-secrets.env").read_text()
+        assert FAKE_TOKEN in (linked_repo / ".git" / "config").read_text()
+        # Reading the link by its own name on disk really does give the secret,
+        # which is what makes this a fence and not a formality.
+        assert "hunter2" in (linked_repo / "config.txt").read_text()
+
+
+class TestATrackedLinkToAnUntrackedFile:
+    def test_read_file_refuses_it_and_says_why_without_quoting_it(
+        self, linked_cfg: ForgeConfig
+    ) -> None:
+        status, body = process_code_read_file_request(
+            {"repo": REPO_KEY, "path": "config.txt"}, config=linked_cfg
+        )
+
+        assert status == 400, body
+        assert "config.txt is a link to local-secrets.env" in body["error"]
+        assert "git does not track" in body["error"]
+        assert FAKE_TOKEN not in _body_text(body)
+        assert "hunter2" not in _body_text(body)
+
+    def test_search_never_returns_a_line_of_it(
+        self, linked_cfg: ForgeConfig
+    ) -> None:
+        for pattern in ("hunter2", FAKE_TOKEN, "TOKEN"):
+            status, body = process_code_search_request(
+                {"repo": REPO_KEY, "pattern": pattern}, config=linked_cfg
+            )
+
+            assert status == 200, body
+            assert body["matches"] == [], (pattern, body)
+            # The answer echoes the pattern the caller sent, so what is
+            # checked here is that no MATCH came back carrying the secret.
+            assert FAKE_TOKEN not in _body_text(body["matches"])
+
+    def test_imports_refuses_the_link_by_name(
+        self, linked_cfg: ForgeConfig
+    ) -> None:
+        status, body = process_code_imports_request(
+            {"repo": REPO_KEY, "path": "lib/helper.py"}, config=linked_cfg
+        )
+
+        assert status == 400, body
+        assert "lib/helper.py is a link to secret_tools.py" in body["error"]
+        assert "boto3" not in _body_text(body)
+
+    def test_imports_walking_a_directory_names_the_link_and_reads_nothing(
+        self, linked_cfg: ForgeConfig
+    ) -> None:
+        """The walk must refuse file by file, not only when the link is the
+        path asked for."""
+        status, body = process_code_imports_request(
+            {"repo": REPO_KEY, "path": "lib"}, config=linked_cfg
+        )
+
+        assert status == 200, body
+        by_path = {entry["path"]: entry for entry in body["files"]}
+        assert by_path["lib/real.py"]["imports"] == [
+            {"statement": "import os", "module": "os", "kind": "stdlib"}
+        ]
+        assert by_path["lib/helper.py"]["imports"] == []
+        assert "git does not track" in by_path["lib/helper.py"]["note"]
+        assert "boto3" not in _body_text(body)
+
+
+class TestATrackedLinkToTheGitConfig:
+    def test_read_file_refuses_it_and_hands_back_no_part_of_it(
+        self, linked_cfg: ForgeConfig, linked_repo: Path
+    ) -> None:
+        status, body = process_code_read_file_request(
+            {"repo": REPO_KEY, "path": "notes.txt"}, config=linked_cfg
+        )
+
+        assert status == 400, body
+        assert "notes.txt is a link to .git/config" in body["error"]
+        answer = _body_text(body)
+        assert FAKE_TOKEN not in answer
+        for line in (linked_repo / ".git" / "config").read_text().splitlines():
+            if line.strip():
+                assert line.strip() not in answer, line
+
+    def test_search_does_not_find_the_token_either(
+        self, linked_cfg: ForgeConfig
+    ) -> None:
+        status, body = process_code_search_request(
+            {"repo": REPO_KEY, "pattern": FAKE_TOKEN}, config=linked_cfg
+        )
+
+        assert status == 200, body
+        assert body["matches"] == []
+        assert FAKE_TOKEN not in _body_text(body["matches"])
+
+
+class TestALinkToATrackedFileStillWorks:
+    """The legitimate case, which must not regress: the file it lands on is
+    one this door would have served under its own name anyway."""
+
+    def test_read_file_serves_it_whole(self, linked_cfg: ForgeConfig) -> None:
+        status, body = process_code_read_file_request(
+            {"repo": REPO_KEY, "path": "alias.py"}, config=linked_cfg
+        )
+
+        assert status == 200, body
+        assert body["content"] == APP_PY
+        assert body["path"] == "alias.py"
+
+    def test_imports_reads_it(self, linked_cfg: ForgeConfig) -> None:
+        status, body = process_code_imports_request(
+            {"repo": REPO_KEY, "path": "alias.py"}, config=linked_cfg
+        )
+
+        assert status == 200, body
+        assert [entry["module"] for entry in body["files"][0]["imports"]] == [
+            "json",
+            "fastapi",
+        ]
+
+    def test_search_finds_the_line_through_both_names(
+        self, linked_cfg: ForgeConfig
+    ) -> None:
+        status, body = process_code_search_request(
+            {"repo": REPO_KEY, "pattern": "def list_users"}, config=linked_cfg
+        )
+
+        assert status == 200, body
+        assert sorted(match["path"] for match in body["matches"]) == [
+            "alias.py",
+            "src/app.py",
+        ]
+
+
+class TestAnOrdinaryTrackedFileIsUnchanged:
+    def test_read_file_still_answers_it_whole(
+        self, linked_cfg: ForgeConfig
+    ) -> None:
+        status, body = process_code_read_file_request(
+            {"repo": REPO_KEY, "path": "README.md"}, config=linked_cfg
+        )
+
+        assert status == 200, body
+        assert body["content"] == "# linked\n"
+        assert body["total_lines"] == 1
+
+    def test_list_files_answers_every_tracked_path_including_the_links(
+        self, linked_cfg: ForgeConfig
+    ) -> None:
+        """Listing names opens no file, so the new fence has nothing to do
+        here and the listing is the repository's own."""
+        status, body = process_code_list_files_request(
+            {"repo": REPO_KEY}, config=linked_cfg
+        )
+
+        assert status == 200, body
+        assert body["files"] == [
+            "README.md",
+            "alias.py",
+            "config.txt",
+            "escape.txt",
+            "lib/helper.py",
+            "lib/real.py",
+            "notes.txt",
+            "src/app.py",
+            "tree.txt",
+        ]
+
+
+class TestTheRefusalsThatAlreadyHeldStillHold:
+    def test_a_link_out_of_the_tree_is_refused_after_resolution(
+        self, linked_cfg: ForgeConfig, outside_secret: Path
+    ) -> None:
+        status, body = process_code_read_file_request(
+            {"repo": REPO_KEY, "path": "escape.txt"}, config=linked_cfg
+        )
+
+        assert status == 400, body
+        assert "outside the repository" in body["error"]
+        assert str(outside_secret.resolve()) in body["error"]
+        assert "a key from outside the tree" not in _body_text(body)
+
+    def test_a_link_to_a_directory_is_refused_in_one_sentence(
+        self, linked_cfg: ForgeConfig
+    ) -> None:
+        status, body = process_code_read_file_request(
+            {"repo": REPO_KEY, "path": "tree.txt"}, config=linked_cfg
+        )
+
+        assert status == 400, body
+        assert "tree.txt" in body["error"]
+        assert APP_PY not in _body_text(body)
+
+    def test_the_search_walk_passes_over_every_link_it_may_not_read(
+        self, linked_cfg: ForgeConfig
+    ) -> None:
+        """Nine tracked paths; five of them are links this door may not read
+        (the untracked file beside it, the git config, the untracked Python
+        module, the directory, and the one out of the tree), so four files are
+        searched."""
+        status, body = process_code_search_request(
+            {"repo": REPO_KEY, "pattern": "nothing-matches-this-at-all"},
+            config=linked_cfg,
+        )
+
+        assert status == 200, body
+        assert body["files_searched"] == 4
+
+    def test_the_search_walk_starts_no_process_per_file(
+        self, linked_cfg: ForgeConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The tracked set is worked out once and tested in memory: git is
+        asked for the listing and never again, however many files are walked."""
+        calls: list[list[str]] = []
+        real_run = subprocess.run
+
+        def counting_run(argv: Any, *args: Any, **kwargs: Any) -> Any:
+            calls.append(list(argv))
+            return real_run(argv, *args, **kwargs)
+
+        monkeypatch.setattr(sidecar.subprocess, "run", counting_run)
+        status, body = process_code_search_request(
+            {"repo": REPO_KEY, "pattern": "list_users"}, config=linked_cfg
+        )
+
+        assert status == 200, body
+        assert len(calls) == 1, calls
+        assert calls[0][-2:] == ["ls-files", "-z"]

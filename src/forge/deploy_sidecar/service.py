@@ -3695,19 +3695,30 @@ def process_guardkit_leg_request(
 # So a host sidecar answers these too, for the repositories it already serves,
 # and gains no power it did not have.
 #
-# EVERY PATH A CALLER SENDS IS FENCED THREE TIMES. LAW 1 resolves the
+# EVERY PATH A CALLER SENDS IS FENCED FOUR TIMES. LAW 1 resolves the
 # repository from its key and nothing else, so no caller ever names a
 # directory. :func:`_relative_path_error` refuses anything that is not a plain
 # relative path (no '..', no leading slash, no empty segment) — the same fence
-# the planning routes use. And the path is then RESOLVED and compared against
-# the resolved repository root, so a symbolic link that leaves the tree is
-# refused after resolution even though its spelling looked innocent.
+# the planning routes use. The path is then RESOLVED and compared against the
+# resolved repository root, so a symbolic link that leaves the tree is refused
+# after resolution even though its spelling looked innocent. And the path it
+# LANDS ON, inside the tree, must itself be tracked
+# (:func:`_resolved_not_tracked_error`).
 #
-# AND A FILE IS ONLY SERVED IF GIT TRACKS IT. Tracking is the repository's own
-# statement of what belongs to it (the same argument the pushed inventory
-# makes), so this door can never serve a virtual environment, a build artefact,
-# a local database or a stray secret file that happens to sit in the tree, and
-# no exclusion list has to guess at them.
+# AND A FILE IS ONLY SERVED IF GIT TRACKS IT — the file, not the name it was
+# asked for by. Tracking is the repository's own statement of what belongs to
+# it (the same argument the pushed inventory makes), so this door can never
+# serve a virtual environment, a build artefact, a local database or a stray
+# secret file that happens to sit in the tree, and no exclusion list has to
+# guess at them. The fourth fence is what makes that sentence true rather than
+# nearly true: git tracks a symbolic link as a link, so asking only whether
+# the path a caller SENT is tracked would serve a tracked link pointing at an
+# untracked file beside it — including ``.git/config``, which sits inside the
+# tree, is never tracked, and is where a remote's access token lives. The
+# tracked test is therefore applied AFTER resolution, on every route that
+# reads a byte: ``/code/read-file``, every file ``/code/imports`` parses, and
+# every file ``/code/search`` opens. ``/code/list-files`` answers names out of
+# git's own listing and opens nothing, so there is nothing there to fence.
 #
 # Every refusal is one plain sentence a person can act on — including the
 # sentences nobody means to reach: a path carrying a null character is refused
@@ -3909,6 +3920,52 @@ def _resolve_inside_repo(
             f"the repository at {root} — this door reads only files inside it"
         )
     return resolved, None
+
+
+def _resolved_not_tracked_error(
+    repo_path: Path, resolved: Path, relative: str, tracked: "set[str]"
+) -> str | None:
+    """A plain sentence unless the path a request LANDS ON is tracked too.
+
+    The fence above keeps a link inside the tree; this one keeps it on a file
+    the repository actually owns, and it is the half that matters for a secret.
+    Asking "is the path the caller SENT tracked?" is not the same question as
+    "is the file about to be read tracked?": git tracks a symbolic link as a
+    link, so a tracked ``config.txt`` pointing at an untracked
+    ``local-secrets.env`` beside it passes the first question and reads the
+    secret. Worse, it can point at ``.git/config``, which is inside the tree,
+    is never tracked, and is where a remote's access token lives.
+
+    So the RESOLVED path is turned back into a repository-relative path and
+    that is the one held to the tracked list. An ordinary file resolves to
+    itself and is unaffected. A link to a tracked file is still served, because
+    that is a legitimate thing for a repository to contain and the file it
+    lands on is one this door would have served under its own name anyway.
+
+    The refusal names the link and the path it lands on — both are file names
+    the caller could have listed for itself — and never any part of what is in
+    there, because a refusal that quotes the thing it is refusing has served
+    it. Fails towards refusing: a path that cannot be worked out here is not
+    read.
+    """
+    try:
+        root = repo_path.resolve()
+        landed = resolved.relative_to(root).as_posix()
+    except (OSError, ValueError) as exc:
+        return (
+            f"{relative} could not be checked against this repository's "
+            f"tracked files after it was resolved "
+            f"({type(exc).__name__}: {exc}), so this door will not read it"
+        )
+    if landed == relative or landed in tracked:
+        return None
+    if landed == ".":
+        landed = "the repository's own root directory"
+    return (
+        f"{relative} is a link to {landed}, which git does not track, so this "
+        "door will not read it — a link is served only when the file it lands "
+        "on is one of the repository's own committed files"
+    )
 
 
 def _code_repo_and_files(
@@ -4241,8 +4298,10 @@ def process_code_read_file_request(
 
     The path is fenced for its spelling, resolved and compared against the
     repository root (so a link out of the tree is refused), and must be a file
-    git TRACKS. A file that is not text is refused in one sentence rather than
-    half-served.
+    git TRACKS — both the path sent and the path it lands on once every link
+    has been followed, so a tracked link to an untracked file beside it is
+    refused rather than served. A file that is not text is refused in one
+    sentence rather than half-served.
 
     A file over the byte cap is served a LINE RANGE at a time: ask for one and
     exactly those lines come back, with ``partial`` true, ``total_lines``
@@ -4264,7 +4323,8 @@ def process_code_read_file_request(
     resolved, error = _resolve_inside_repo(repo_path, relative, what="path")
     if error or resolved is None:
         return 400, {"error": error}
-    if relative not in set(tracked):
+    tracked_set = set(tracked)
+    if relative not in tracked_set:
         return 400, {
             "error": (
                 f"git does not track {relative} in this repository, so this "
@@ -4272,6 +4332,11 @@ def process_code_read_file_request(
                 "committed files and nothing else"
             )
         }
+    # The same question asked of the path this one LANDS on, after every link
+    # has been followed. Tracking the link is not tracking the file.
+    error = _resolved_not_tracked_error(repo_path, resolved, relative, tracked_set)
+    if error:
+        return 400, {"error": error}
     first, error = _positive_int(payload.get("first_line"), what="first_line")
     if error:
         return 400, {"error": error}
@@ -4389,7 +4454,8 @@ def process_code_imports_request(
     files, imports — read from the syntax tree, never from the text.
 
     Python only. A tracked file this door cannot parse that way is NAMED in
-    the answer with the reason ("not a Python file", "it does not parse"),
+    the answer with the reason ("not a Python file", "it does not parse", "it
+    is a link to a file git does not track"),
     because a reader who is not told which files were skipped will read the
     answer as the whole truth. The number of files walked is capped and the
     answer says when the cap was reached. Never raises.
@@ -4409,6 +4475,11 @@ def process_code_imports_request(
         return 400, {"error": error}
     tracked_set = set(tracked)
     if relative in tracked_set:
+        error = _resolved_not_tracked_error(
+            repo_path, resolved, relative, tracked_set
+        )
+        if error:
+            return 400, {"error": error}
         chosen = [relative]
     else:
         chosen = _under_filter(tracked, relative)
@@ -4436,6 +4507,13 @@ def process_code_imports_request(
         entry["language"] = "python"
         inside, sub_error = _resolve_inside_repo(repo_path, path, what="path")
         if sub_error or inside is None:
+            entry["note"] = sub_error
+            files.append(entry)
+            continue
+        # A tracked link inside a walked directory gets the same answer as one
+        # asked for by name: the file it lands on has to be tracked as well.
+        sub_error = _resolved_not_tracked_error(repo_path, inside, path, tracked_set)
+        if sub_error:
             entry["note"] = sub_error
             files.append(entry)
             continue
@@ -4681,7 +4759,11 @@ def process_code_search_request(
     max_results?}`` → matching lines across the repository's tracked files.
 
     Python's own regular expressions over files this service reads itself:
-    there is no grep, no shell and no program of any kind started here. A
+    there is no grep, no shell and no program of any kind started here — git
+    is asked once for the tracked listing and never again, so the walk costs
+    no processes at all. Only files git tracks are opened, and a tracked link
+    is opened only when the file it lands on is tracked too, so no line of an
+    untracked file can come back as a match. A
     pattern that does not compile is refused with the reason the regular
     expression engine gave, so the caller can fix it. ``fixed_string`` asks
     for the pattern to be taken literally, which is what somebody searching
@@ -4742,6 +4824,13 @@ def process_code_search_request(
         return 400, {"error": error}
     limit = min(wanted or CODE_SEARCH_MAX_MATCHES, CODE_SEARCH_MAX_MATCHES)
 
+    # The tracked list is turned into a set ONCE, here, and every file in the
+    # walk below is tested against it in memory. The walk must never start a
+    # process per file: this door pays for git exactly once a request (the
+    # listing above), and a repository with three thousand tracked files would
+    # otherwise be three thousand git processes for one search.
+    tracked_set = set(tracked)
+
     matches: list[dict[str, Any]] = []
     files_searched = 0
     long_lines = 0
@@ -4757,6 +4846,12 @@ def process_code_search_request(
             break
         resolved, _error = _resolve_inside_repo(repo_path, path, what="path")
         if resolved is None or not resolved.is_file():
+            continue
+        # A tracked link whose target git does not track is passed over
+        # unsearched, exactly as a link out of the tree already is: a search
+        # that matched a line of an untracked file would hand back its
+        # contents, which is the one thing this door must never do.
+        if _resolved_not_tracked_error(repo_path, resolved, path, tracked_set):
             continue
         try:
             if resolved.stat().st_size > CODE_MAX_FILE_BYTES:
