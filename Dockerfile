@@ -373,6 +373,40 @@ RUN curl -fsSL "https://github.com/Orange-OpenSource/hurl/releases/download/${HU
 # (global by default only from node 19).
 ENV NODE_OPTIONS=--experimental-global-webcrypto
 
+# ---------------------------------------------------------------------------
+# PROVENANCE — which tree this image was built from, and the cache barrier.
+#
+# LIVE INCIDENT (2026-09-11, the go-live of forge a24a825 + 2ad935f): a build
+# from a clean checkout printed "COPY src ./src" and the runtime stage's
+# "COPY --from=builder /opt/venv /opt/venv" as executed rather than cached,
+# rebuilt the forge wheel, passed the oracle verification — and shipped the
+# PREVIOUS commit's code. The installed runner module was 4,907 lines against
+# 5,061 in the tree it was built from. Rebuilding with the builder stage's
+# cache disabled changed nothing; rebuilding with the RUNTIME stage's cache
+# disabled produced the correct code. The stale content entered here, at the
+# copy of the virtual environment out of the builder.
+#
+# These three instructions are the guard, and their PLACEMENT is the whole of
+# it: they are declared and consumed BEFORE the COPY below, so every layer
+# from here down carries the commit in its cache key and cannot be reused from
+# a build of a different commit. They sit after the apt and hurl layers on
+# purpose, so those stay cached and a rebuild does not re-download anything.
+#
+# The stamp file is what ``scripts/verify-forge-oracles.sh`` reads to prove the
+# image knows its own origin; the two environment variables are the same two
+# facts, readable from a running container without shelling in for a file.
+# ``dirty=true`` is honest, not fatal: this estate builds from working trees.
+ARG FORGE_GIT_SHA
+ARG FORGE_GIT_DIRTY=unknown
+
+ENV FORGE_GIT_SHA=${FORGE_GIT_SHA} \
+    FORGE_GIT_DIRTY=${FORGE_GIT_DIRTY}
+
+RUN test -n "${FORGE_GIT_SHA}" \
+        || (echo "FORGE_GIT_SHA build argument is empty — build this image with scripts/build-image.sh, which computes the commit and passes it in" >&2; exit 1) \
+    && printf 'commit=%s\ndirty=%s\n' "${FORGE_GIT_SHA}" "${FORGE_GIT_DIRTY}" > /etc/forge-image-provenance \
+    && cat /etc/forge-image-provenance
+
 # Bring the resolved venv across from the builder stage. Owned by root
 # so the unprivileged ``forge`` user can read but not modify the
 # installed distributions — matches a hardened production posture.
