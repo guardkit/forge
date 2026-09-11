@@ -29,7 +29,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
+import shutil
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -524,6 +526,10 @@ def _make_driver(
             # Present only when the target repo keeps a rules file
             # (docs/architecture-rules.yaml); defined in the schema 2026-08-31.
             "architecture_rules",
+            # Present only when forge can list the target repo's tracked files
+            # (2026-09-11): what the repository ALREADY contains, so the seat
+            # stops planning to build what is already there.
+            "repository_inventory",
         }
         counters["last_feature_id"] = feature_id
         counters["last_descriptor"] = target_repo_descriptor
@@ -905,7 +911,11 @@ async def test_plan_leg_threads_spec_contents_and_discovered_descriptor(
     # only schema-defined fields (repo + test_roots) — no invented keys, and
     # crucially NOT the shallow ``["tests"]`` that let 008 invent ``tests/smoke``.
     descriptor = h.ctx["counters"]["last_descriptor"]
-    assert descriptor == {
+    # The inventory of what the repository already contains rides too, since
+    # 2026-09-11 — here the one tracked file of the scratch repo. Everything
+    # else is exactly as it was.
+    assert descriptor["repository_inventory"]["files"] == ["README.md"]
+    assert {k: v for k, v in descriptor.items() if k != "repository_inventory"} == {
         "repo": TARGET_REPO,
         "test_roots": ["tests/health", "tests/users"],
     }
@@ -1088,8 +1098,10 @@ async def test_replay_invented_tests_smoke_fails_the_real_validate(
 
     await h.driver.drive(CID)
 
-    # (a) the descriptor forge threaded to 008 carried the EXACT roots.
-    assert h.ctx["counters"]["last_descriptor"] == {
+    # (a) the descriptor forge threaded to 008 carried the EXACT roots (and,
+    # since 2026-09-11, the repository's own inventory beside them).
+    descriptor = h.ctx["counters"]["last_descriptor"]
+    assert {k: v for k, v in descriptor.items() if k != "repository_inventory"} == {
         "repo": TARGET_REPO,
         "test_roots": ["tests/health", "tests/users"],
     }
@@ -3492,6 +3504,368 @@ def test_the_real_api_test_rules_file_shape_reads(tmp_path: Path) -> None:
     block = PlanningRunDriver._read_architecture_rules(str(repo))
     assert block is not None
     assert [r["id"] for r in block["rules"]] == ["R-OV-1", "R-ADR001-1"]
+
+
+
+# ---------------------------------------------------------------------------
+# WHAT THE REPOSITORY ALREADY CONTAINS, IN THE DESCRIPTOR (2026-09-11)
+#
+# FEAT-CDFD: Rich asked for one new endpoint on api_test and the plan came back
+# with four waves, the first two of which built a user model, a data-access
+# layer and a router the repository has had since it was born — and invented a
+# column name (creation_timestamp) out of the specification's English, where the
+# repository's own column is created_at. The plan seat cannot open files, so the
+# plan was written from the specification's words alone. It is now told the
+# repository's tracked files: real paths from real git, the factory's own
+# paperwork left out, and directory counts instead of paths for a big tree.
+#
+# Every one of these tests drives REAL git in a REAL temporary repository.
+# ---------------------------------------------------------------------------
+
+
+def _git(repo: Path, *args: str) -> None:
+    """Run one real git command in ``repo``, with an identity so commits work."""
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@t",
+    }
+    subprocess.run(["git", *args], cwd=repo, check=True, env=env)
+
+
+def _write(repo: Path, rel: str, body: str = "x\n") -> None:
+    path = repo / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body, encoding="utf-8")
+
+
+def _repo_with_files(tmp_path: Path, rels: list[str], name: str = "api_test") -> Path:
+    """A real git repository with ``rels`` written AND committed, plus the two
+    api_test-shaped test roots so the rest of the descriptor is realistic."""
+    repo = tmp_path / name
+    repo.mkdir(parents=True, exist_ok=True)
+    _git(repo, "init", "-q")
+    for rel in rels:
+        _write(repo, rel)
+    (repo / "tests" / "health").mkdir(parents=True, exist_ok=True)
+    (repo / "tests" / "users").mkdir(parents=True, exist_ok=True)
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "init")
+    return repo
+
+
+def test_the_inventory_is_the_repositorys_own_tracked_files_sorted(
+    tmp_path: Path,
+) -> None:
+    """The plan seat is handed the real source and test files, in sorted order.
+
+    This is the api_test shape in miniature: had the seat been given this, the
+    FEAT-CDFD plan could not have proposed creating src/users/models.py, because
+    the list says it is already there.
+    """
+    repo = _repo_with_files(
+        tmp_path,
+        [
+            "src/users/router.py",
+            "src/users/models.py",
+            "src/users/crud.py",
+            "src/health/router.py",
+            "tests/users/test_crud.py",
+            "tests/health/__init__.py",
+            "README.md",
+        ],
+    )
+
+    descriptor = PlanningRunDriver._build_target_repo_descriptor(
+        "appmilla/api_test", str(repo)
+    )
+    inventory = descriptor["repository_inventory"]
+    assert inventory["files"] == [
+        "README.md",
+        "src/health/router.py",
+        "src/users/crud.py",
+        "src/users/models.py",
+        "src/users/router.py",
+        "tests/health/__init__.py",
+        "tests/users/test_crud.py",
+    ]
+    assert inventory["file_count"] == 7
+    assert "directories" not in inventory
+    # The rest of the descriptor is untouched.
+    assert descriptor["repo"] == "appmilla/api_test"
+    assert descriptor["test_roots"] == ["tests/health", "tests/users"]
+
+
+def test_the_same_tree_read_twice_gives_the_same_bytes(tmp_path: Path) -> None:
+    """Two runs on one tree produce one answer — nothing here depends on the
+    order the filesystem happens to hand files back in."""
+    repo = _repo_with_files(
+        tmp_path, ["src/b.py", "src/a.py", "src/users/crud.py", "README.md"]
+    )
+    first = PlanningRunDriver._read_repository_inventory(str(repo))
+    second = PlanningRunDriver._read_repository_inventory(str(repo))
+    assert first == second
+    assert json.dumps(first) == json.dumps(second)
+
+
+def test_untracked_files_are_not_in_the_inventory(tmp_path: Path) -> None:
+    """Tracking is the repository's own statement of what belongs to it, so a
+    virtual environment, a cache or a stray database file never has to be
+    guessed at — none of them are tracked."""
+    repo = _repo_with_files(tmp_path, ["src/users/crud.py"])
+    _write(repo, "scratch_notes.md")
+    _write(repo, ".venv/lib/python3.12/site-packages/anything.py")
+    _write(repo, "app.db", "not really a database\n")
+    # Written, never added: git does not track them.
+
+    inventory = PlanningRunDriver._read_repository_inventory(str(repo))
+    assert inventory is not None
+    assert inventory["files"] == ["src/users/crud.py"]
+
+
+def test_the_factorys_own_paperwork_is_left_out(tmp_path: Path) -> None:
+    """Records ABOUT the repository are not the repository's code — and on
+    api_test they are 400 of 695 tracked files. Real files under every excluded
+    folder are committed here and none of them travels."""
+    repo = _repo_with_files(
+        tmp_path,
+        [
+            "src/users/crud.py",
+            "src/users/router.py",
+            ".guardkit/features/FEAT-CDFD.yaml",
+            ".guardkit/config.yaml",
+            ".forge/state.json",
+            ".claude/commands/feature-build.md",
+            "tasks/TASK-CDFD-001.md",
+            "features/stats-endpoint/stats-endpoint.feature",
+            "feature_spec_inputs/2026-09-11-users-per-day.md",
+            "qa/receipts/FEAT-CDFD/run.json",
+            # qa/ itself is the repository's own acceptance material and stays.
+            "qa/twins/users/delete.hurl",
+        ],
+    )
+
+    inventory = PlanningRunDriver._read_repository_inventory(str(repo))
+    assert inventory is not None
+    assert inventory["files"] == [
+        "qa/twins/users/delete.hurl",
+        "src/users/crud.py",
+        "src/users/router.py",
+    ]
+    assert inventory["file_count"] == 3
+    listed = json.dumps(inventory)
+    for paperwork in (
+        ".guardkit",
+        ".forge",
+        ".claude",
+        "tasks/",
+        "feature_spec_inputs",
+    ):
+        assert paperwork not in listed
+
+
+def test_a_big_repository_teaches_its_shape_not_a_cut_off_list(
+    tmp_path: Path,
+) -> None:
+    """Over the cap the inventory carries directory counts and says so.
+
+    A list cut off part-way reads like the whole truth, which is the failure
+    this exists to prevent, so the paths are dropped entirely rather than
+    trimmed.
+    """
+    rels = [f"src/module_{n:02d}/file_{i:03d}.py" for n in range(5) for i in range(90)]
+    assert len(rels) > 400
+    repo = _repo_with_files(tmp_path, rels + ["README.md"])
+
+    inventory = PlanningRunDriver._read_repository_inventory(str(repo))
+    assert inventory is not None
+    assert inventory["directories_only"] is True
+    assert "files" not in inventory
+    assert inventory["file_count"] == 451
+    assert inventory["directories"] == [
+        {"path": ".", "file_count": 1},
+        *[
+            {"path": f"src/module_{n:02d}", "file_count": 90}
+            for n in range(5)
+        ],
+    ]
+
+
+def test_at_the_cap_the_paths_themselves_still_travel(tmp_path: Path) -> None:
+    """The cap is inclusive: 400 files is still a list of 400 paths."""
+    rels = [f"src/file_{i:03d}.py" for i in range(400)]
+    repo = _repo_with_files(tmp_path, rels)
+
+    inventory = PlanningRunDriver._read_repository_inventory(str(repo))
+    assert inventory is not None
+    assert inventory["file_count"] == 400
+    assert inventory["files"] == sorted(rels)
+    assert "directories_only" not in inventory
+
+
+def test_a_directory_that_is_not_a_git_repository_has_no_inventory_key(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """No git repository ⇒ no key at all, one plain warning, and a descriptor
+    byte for byte what it was before this existed."""
+    repo = _repo_with_tests(tmp_path, "plain-directory")
+
+    with caplog.at_level(logging.WARNING):
+        descriptor = PlanningRunDriver._build_target_repo_descriptor(
+            "appmilla/plain-directory", str(repo)
+        )
+    assert descriptor == {
+        "repo": "appmilla/plain-directory",
+        "test_roots": ["tests/health", "tests/users"],
+    }
+    assert any(
+        "not a git repository" in rec.getMessage() for rec in caplog.records
+    )
+
+
+def test_a_path_that_does_not_exist_has_no_inventory_key(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A missing checkout degrades the same quiet way."""
+    with caplog.at_level(logging.WARNING):
+        assert (
+            PlanningRunDriver._read_repository_inventory(str(tmp_path / "nowhere"))
+            is None
+        )
+    assert any("nowhere" in rec.getMessage() for rec in caplog.records)
+
+
+def test_a_git_that_exits_non_zero_warns_and_does_not_raise(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A broken repository — real git, answering unhappily — is a warning and
+    no key, never an exception.
+
+    The .git here is a file holding nonsense, which is the shape a git worktree
+    uses and a corrupted one leaves behind: the marker exists, so the reader
+    goes on to run git, and git itself refuses with a non-zero exit.
+    """
+    repo = _repo_with_files(tmp_path, ["src/users/crud.py"])
+    shutil.rmtree(repo / ".git")
+    (repo / ".git").write_text("gitdir: /nowhere/at/all\n", encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING):
+        descriptor = PlanningRunDriver._build_target_repo_descriptor(
+            "appmilla/api_test", str(repo)
+        )
+    assert "repository_inventory" not in descriptor
+    assert any(
+        "listing the tracked files" in rec.getMessage() for rec in caplog.records
+    )
+
+
+def test_a_git_that_times_out_warns_and_does_not_raise(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A repository that cannot answer in time must never hold up a plan."""
+    repo = _repo_with_files(tmp_path, ["src/users/crud.py"])
+
+    def _slow(*args: Any, **kwargs: Any) -> Any:
+        raise subprocess.TimeoutExpired(cmd="git ls-files", timeout=10)
+
+    monkeypatch.setattr(driver_module.subprocess, "run", _slow)
+
+    with caplog.at_level(logging.WARNING):
+        descriptor = PlanningRunDriver._build_target_repo_descriptor(
+            "appmilla/api_test", str(repo)
+        )
+    assert "repository_inventory" not in descriptor
+    assert descriptor["test_roots"] == ["tests/health", "tests/users"]
+    assert any(
+        "could not list the tracked files" in rec.getMessage()
+        for rec in caplog.records
+    )
+
+
+def test_the_git_command_is_an_argument_list_with_no_shell(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The command forge runs, pinned: a plain argument list, no shell, a
+    timeout, and the safe.directory setting that lets forge read a checkout it
+    does not own."""
+    repo = _repo_with_files(tmp_path, ["src/users/crud.py"])
+    seen: dict[str, Any] = {}
+    real_run = subprocess.run
+
+    def _record(cmd: Any, **kwargs: Any) -> Any:
+        seen["cmd"] = cmd
+        seen["kwargs"] = kwargs
+        return real_run(cmd, **kwargs)
+
+    monkeypatch.setattr(driver_module.subprocess, "run", _record)
+    PlanningRunDriver._read_repository_inventory(str(repo))
+
+    assert seen["cmd"] == [
+        "git",
+        "-c",
+        "safe.directory=*",
+        "-C",
+        str(repo),
+        "ls-files",
+        "-z",
+    ]
+    assert (
+        seen["kwargs"]["timeout"]
+        == driver_module._REPO_INVENTORY_GIT_TIMEOUT_SECONDS
+    )
+    assert seen["kwargs"]["check"] is False
+    assert "shell" not in seen["kwargs"]
+
+
+def test_a_repository_of_paperwork_alone_sends_no_inventory(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Nothing but the factory's records is nothing to tell the seat: no key,
+    rather than an empty list that would read as an empty repository."""
+    repo = _repo_with_files(
+        tmp_path, [".guardkit/features/FEAT-1.yaml", "tasks/TASK-1.md"]
+    )
+
+    with caplog.at_level(logging.WARNING):
+        descriptor = PlanningRunDriver._build_target_repo_descriptor(
+            "appmilla/api_test", str(repo)
+        )
+    assert "repository_inventory" not in descriptor
+    assert any(
+        "factory's own paperwork" in rec.getMessage() for rec in caplog.records
+    )
+
+
+def test_the_inventory_rides_beside_the_architecture_rules(tmp_path: Path) -> None:
+    """Both optional fields together, which is the api_test case: the seat is
+    told the repository's rules AND what it already contains."""
+    repo = _repo_with_files(tmp_path, ["src/users/crud.py"])
+    (repo / "docs").mkdir(parents=True, exist_ok=True)
+    (repo / "docs" / "architecture-rules.yaml").write_text(
+        _RULES_FILE, encoding="utf-8"
+    )
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "rules")
+
+    descriptor = PlanningRunDriver._build_target_repo_descriptor(
+        "appmilla/api_test", str(repo)
+    )
+    assert [r["id"] for r in descriptor["architecture_rules"]["rules"]] == [
+        "R-OV-1",
+        "R-ADR001-1",
+    ]
+    assert descriptor["repository_inventory"]["files"] == [
+        "docs/architecture-rules.yaml",
+        "src/users/crud.py",
+    ]
+    assert set(descriptor) == {
+        "repo",
+        "test_roots",
+        "architecture_rules",
+        "repository_inventory",
+    }
 
 
 # ---------------------------------------------------------------------------
