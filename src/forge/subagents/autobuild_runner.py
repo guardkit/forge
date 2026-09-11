@@ -1359,6 +1359,130 @@ def _load_filesystem_allowlist() -> list[Path] | None:
     return None
 
 
+def _load_routine_seat() -> str | None:
+    """Best-effort loader for ``routine.seat`` — the model this build runs on.
+
+    WHAT THIS CHANGES, IN PLAIN WORDS. Until this function existed, the
+    command line that launches a routine feature build named no model at
+    all. The build system's own command line then fell back to its
+    default, which is the literal string ``claude-sonnet-4-5-20250929``:
+    a frontier vendor's model NAME. It reaches a local model only
+    because the estate's proxy carries a wildcard row mapping
+    ``claude-*`` to the workhorse seat. Nothing was ever mis-served —
+    guardkit's own seat fence (``m0_fence``) is what makes that
+    arrangement LEGAL rather than merely accidental: it refuses a
+    missing model outright, refuses a frontier provider prefix outright,
+    and allows a bare alias only when the base URL names a host on the
+    local allowlist. But which model writes this factory's code was
+    decided by a line in a proxy's configuration file rather than by the
+    factory. With ``routine.seat`` named in ``forge.yaml``, the factory
+    names it, and the two tokens ``--model <seat>`` ride the launch.
+
+    HOW THE SEAT IS READ, mirroring what is already here. The runner
+    subagent does not receive a :class:`~forge.config.models.ForgeConfig`
+    object — it is a LangGraph thread launched by the supervisor — so it
+    reads configuration exactly the way
+    :func:`_load_filesystem_allowlist` above reads the permissions
+    allowlist: ``./forge.yaml`` (or ``$FORGE_CONFIG_PATH``), loaded
+    lazily through the same loader, best-effort. No new channel, no new
+    environment variable, no guess.
+
+    AND IT NEVER KILLS A BUILD. The seat is a lever, not an obligation.
+    A configuration that names no seat, names a blank one, cannot be
+    read, is malformed, or carries a ``routine`` section of the wrong
+    shape all mean the same thing — NO SEAT NAMED — and each says so in
+    one plain log line and returns ``None``. The caller then launches
+    the argv it has always launched, byte for byte. A build an owner has
+    already approved must not die on a setting that is a convenience.
+
+    Returns:
+        The named seat as a bare model alias, or ``None`` when no seat is
+        named (which is today's behaviour exactly).
+    """
+    try:
+        config_path_env = os.environ.get("FORGE_CONFIG_PATH", "").strip()
+        candidate_paths: list[Path] = []
+        if config_path_env:
+            candidate_paths.append(Path(config_path_env).expanduser())
+        candidate_paths.append(Path("forge.yaml"))
+
+        for cfg_path in candidate_paths:
+            if not cfg_path.is_file():
+                continue
+            try:
+                # Local import keeps the module import-light when no config
+                # exists — the same posture as the allowlist loader above.
+                from forge.config.loader import (  # type: ignore[import-not-found]
+                    load_config,
+                )
+
+                cfg = load_config(cfg_path)
+            except Exception as exc:  # noqa: BLE001 — best-effort loader
+                logger.warning(
+                    "autobuild_runner: could not read a routine seat from %s "
+                    "(%s) — this build names no model and runs exactly as it "
+                    "did before the setting existed",
+                    cfg_path,
+                    exc,
+                )
+                return None
+
+            seat_raw = getattr(getattr(cfg, "routine", None), "seat", None)
+            if not isinstance(seat_raw, str):
+                logger.info(
+                    "autobuild_runner: %s names no routine seat — this build "
+                    "names no model and runs exactly as it did before the "
+                    "setting existed",
+                    cfg_path,
+                )
+                return None
+
+            seat = seat_raw.strip()
+            if not seat:
+                logger.info(
+                    "autobuild_runner: the routine seat in %s is blank — this "
+                    "build names no model and runs exactly as it did before "
+                    "the setting existed",
+                    cfg_path,
+                )
+                return None
+
+            if seat.startswith("-"):
+                # Config load already refuses this (RoutineConfig refuses a
+                # dash-leading seat so the daemon will not boot half-
+                # configured). The second guard is here because THIS is the
+                # place where the value would become a command-line token: a
+                # name that starts with a dash is read by the build system's
+                # parser as another OPTION, never as a model. If one ever
+                # reaches this line by some other route, it stops here.
+                logger.warning(
+                    "autobuild_runner: the routine seat in %s is %r, which "
+                    "starts with a dash and would land on the command line as "
+                    "an option rather than as the name of a model — refusing "
+                    "it; this build names no model",
+                    cfg_path,
+                    seat,
+                )
+                return None
+
+            return seat
+
+        logger.info(
+            "autobuild_runner: no forge.yaml found, so no routine seat is "
+            "named — this build names no model and runs exactly as it did "
+            "before the setting existed"
+        )
+        return None
+    except Exception as exc:  # noqa: BLE001 — a lever must never kill a build
+        logger.warning(
+            "autobuild_runner: reading the routine seat failed (%s) — this "
+            "build names no model and runs exactly as it did before the "
+            "setting existed",
+            exc,
+        )
+        return None
+
+
 def _default_repo_opt_in_enabled() -> bool:
     """True iff the operator explicitly licensed the FORGE_DEFAULT_REPO fallback.
 
@@ -3465,6 +3589,13 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
        "feature", feature_id, "--fresh", "--verbose",
        cwd=resolved_repo_path, env=os.environ.copy())`` and stream the
        combined stdout/stderr line-by-line.
+    4b. When ``routine.seat`` names a model in ``forge.yaml``, append the
+       two tokens ``--model <seat>`` to that command line — the factory
+       naming the model that writes its code instead of inheriting it
+       from a wildcard row in a proxy's configuration. With no seat
+       named (or an unreadable one) nothing is appended and the command
+       line is byte for byte the one above. See the block at the argv
+       for the whole statement.
     5. On exit code 0, return a ``running_wave`` snapshot whose
        ``tasks_completed`` is read from the build's OWN ledger — the
        conditional edge then routes to :func:`_node_completed`.
@@ -3662,11 +3793,61 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
     if base_branch is not None:
         argv += ["--base-branch", base_branch]
 
+    # THE ROUTINE SEAT — the factory names the model that writes its code.
+    #
+    # This is the command line that ACTUALLY launches a routine feature
+    # build, and until now it named no model. The build system's own
+    # command line then fell back to its default, the literal string
+    # ``claude-sonnet-4-5-20250929`` — a frontier vendor's model NAME,
+    # which reaches a local model only because the estate's proxy carries
+    # a wildcard row mapping ``claude-*`` to the workhorse seat. Nothing
+    # was ever mis-served: guardkit's own seat fence (``m0_fence``) is
+    # what makes that arrangement LEGAL rather than merely accidental —
+    # it refuses a missing model, refuses a frontier provider prefix, and
+    # allows a bare alias only when the base URL names a host on the
+    # local allowlist. But which model writes this factory's code was
+    # decided by a line in a proxy's configuration file rather than by
+    # the factory. Named in ``forge.yaml`` as ``routine.seat``, the
+    # factory decides it here instead.
+    #
+    # WHERE THE TWO TOKENS SIT, and why: LAST, after everything this argv
+    # already carried, including the optional ``--base-branch`` pair. The
+    # property under test is not "the seat is somewhere on the line", it
+    # is "nothing that was already on the line moved" — and appending is
+    # the only placement under which every existing element keeps its
+    # exact index, so the byte-identity the runner's tests pin still
+    # reads element for element. It is also where the routine seat rides
+    # on this argv's sibling surface, the subprocess dispatcher
+    # (``_build_argv_for_stage`` appends the pair after everything else).
+    # The fix journey's conductor puts its seat FIRST instead, but among
+    # its OWN extras, which are themselves appended wholesale after the
+    # base argv — that rule orders the seat against the conductor's leg
+    # budget flags, which this argv does not have. guardkit takes its
+    # options in any order, so nothing here depends on position.
+    #
+    # UNNAMED IS TODAY, EXACTLY. No seat named, a blank one, an
+    # unreadable or malformed ``forge.yaml``, or a ``routine`` section of
+    # the wrong shape all return ``None`` from the loader with one plain
+    # log line, and this block adds nothing at all: no flag, no empty
+    # flag, nothing reordered. A build an owner has already approved must
+    # never die on a setting that is a lever rather than an obligation.
+    #
+    # THE FIX JOURNEY IS UNTOUCHED. Its legs are dispatched elsewhere (the
+    # conductor's own adapter over the subprocess dispatcher) and already
+    # carry ``--model`` from ``conductor.seat``. Nothing here reaches
+    # them, and this argv never launches one.
+    routine_seat = _load_routine_seat()
+    if routine_seat:
+        argv += ["--model", routine_seat]
+
     logger.info(
-        "autobuild_runner: launching subprocess feature_id=%s cwd=%s timeout=%ss",
+        "autobuild_runner: launching subprocess feature_id=%s cwd=%s "
+        "timeout=%ss seat=%s",
         feature_id,
         run_cwd,
         timeout_seconds,
+        routine_seat
+        or "unnamed (the build system's own default applies, as it always has)",
     )
 
     try:
