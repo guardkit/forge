@@ -1238,6 +1238,112 @@ class ResourcePreflightConfig(BaseModel):
     )
 
 
+class RoutineConfig(BaseModel):
+    """The ROUTINE build's seat — the model that writes this factory's code.
+
+    What the arrangement is today, plainly. Forge names a model for
+    exactly one thing: the fix journey's legs, from
+    :attr:`ConductorConfig.seat`, which ride the argv as
+    ``--model <seat>``. A routine feature build — the whole eight-sentence
+    path, and every feature this factory has ever shipped — is dispatched
+    with NO ``--model`` at all. The build system's own command line then
+    falls back to its default, which is the literal string
+    ``claude-sonnet-4-5-20250929``: a frontier vendor's model NAME. That
+    name reaches a local model only because the estate's proxy carries a
+    wildcard row mapping ``claude-*`` to the workhorse seat. Nothing is
+    broken and nothing has been mis-served — the M0 seat fence makes the
+    arrangement legal by requiring a bare alias to resolve through a
+    local base URL — but WHICH model writes this factory's code is
+    decided by a line in a proxy's configuration file rather than by the
+    factory. A factory should name that model itself. This field is how
+    it does.
+
+    **Why this section.** A reader who knows ``conductor.seat`` names the
+    fix journey's model looks for the routine build's model at the same
+    altitude, one word away, and finds it here::
+
+        conductor:
+          enabled: true
+          seat: qwen3-coder-30b
+        routine:
+          seat: qwen3-coder-30b
+
+    The alternatives hide it. ``pipeline:`` is the lifecycle stream's
+    subjects and originators; ``queue:`` is which work is admitted and
+    how much of it runs at once; ``budget:`` bounds a build that is
+    already running. None of them is where a person goes to ask "which
+    model writes the code?".
+
+    **Unnamed is today, exactly.** ``seat`` defaults to ``None`` and this
+    whole section is optional, so every deployed ``forge.yaml`` keeps
+    working unchanged and a dispatch with no seat named carries no
+    ``--model`` — the same argv, byte for byte, that it carries now. This
+    is a lever, not an obligation: making it required would refuse every
+    existing configuration at boot.
+
+    **Deploy-order law** (mirrors :class:`ConductorConfig` — this model is
+    ``extra=forbid`` and the loader propagates the ValidationError
+    unwrapped): writing a ``routine:`` section into a deployed
+    ``forge.yaml`` before the image that defines it is running refuses the
+    WHOLE config at load, and that binds the langgraph sidecar too, which
+    lazily re-reads the same file and degrades to a permissive filesystem
+    check on any load failure. Merge and redeploy BOTH surfaces first,
+    then add the ``routine:`` section.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    seat: str | None = Field(
+        default=None,
+        description=(
+            "The routine build's seat: the model a routine build's stages "
+            "run on, named on the dispatch as '--model <seat>'. A bare "
+            "fleet alias, exactly like the fix journey's conductor.seat. "
+            "Optional — with no seat named nothing is added to the "
+            "dispatch and the build system's own default applies, which is "
+            "today's behaviour byte for byte. Blank is read as absent, and "
+            "a value starting with '-' is refused (it would land on the "
+            "command line as an option, not as a model name)."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _a_named_seat_must_be_shaped_like_a_name(self) -> RoutineConfig:
+        """Read a blank seat as absent; refuse one that is not a name.
+
+        The same posture as :meth:`ConductorConfig._enabled_requires_a_seat`,
+        minus the requirement — there is no routine switch to turn on, so
+        an unnamed seat is not a half-configured factory, it is today.
+
+        Blank normalises to ``None`` before anything reads it, so
+        ``config.routine.seat`` is either absent or a real name, never a
+        named nothing (``seat: "   "`` would otherwise put an empty token
+        on the command line).
+
+        And the value lands on the dispatch verbatim as ``--model <seat>``,
+        so a seat that starts with ``-`` is not a seat at all: the build
+        system's argument parser reads the next token as another OPTION,
+        and the result is either an unknown-flag error deep inside a
+        spawned build or — worse — a real flag the operator never meant to
+        pass. That is a config mistake, and it is refused HERE, at load, so
+        the daemon refuses to boot on it rather than dying on a build an
+        owner has already approved.
+        """
+        normalised = (self.seat or "").strip() or None
+        if normalised != self.seat:
+            self.seat = normalised
+        if normalised is not None and normalised.startswith("-"):
+            raise ValueError(
+                f"routine.seat is {normalised!r}, which starts with a dash. "
+                "The seat is passed to a routine build as '--model <seat>', "
+                "so a leading dash makes it read as another command-line "
+                "option rather than as the name of a model. Name the model "
+                "with no leading dash (for example 'seat: qwen3-coder-30b'), "
+                "or leave the seat out altogether."
+            )
+        return self
+
+
 class ConductorConfig(BaseModel):
     """The conductor's activation switch (revival design pass §a.5 / §h.8).
 
@@ -1468,6 +1574,16 @@ class ForgeConfig(BaseModel):
             "until reviewer-seat SLMs land in WS4 (Q2 = attended-v1)."
         ),
     )
+    routine: RoutineConfig = Field(
+        default_factory=RoutineConfig,
+        description=(
+            "The routine build's seat — the model a routine build's stages "
+            "run on. Defaults to no seat named, which is today's behaviour "
+            "byte for byte: the dispatch carries no '--model' and the build "
+            "system's own default applies. Its sibling 'conductor.seat' "
+            "names the fix journey's model the same way."
+        ),
+    )
     conductor: ConductorConfig = Field(
         default_factory=ConductorConfig,
         description=(
@@ -1547,6 +1663,7 @@ __all__ = [
     "QueueConfig",
     "ResourcePreflightConfig",
     "ReviewGateConfig",
+    "RoutineConfig",
 ]
 
 
