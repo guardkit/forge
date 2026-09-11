@@ -78,9 +78,24 @@
 #   nothing about how the bootstrap names its own children — no process
 #   patterns live in this file.
 #
+#   BEFORE INSTALLING THIS FILE, check the stop mode is really there. Do not
+#   install this unit for a sandbox until the copy of deploy/sandbox-runner.sh
+#   that the sandbox runs — the factory's clone of that repository — takes the
+#   word "stop" and stops. Older copies of the bootstrap read no arguments at
+#   all: they ignore the word and run their ordinary START path instead. So
+#   against an older copy, "systemctl --user stop" would start ANOTHER
+#   supervisor inside the sandbox, never return, run out the TimeoutStopSec
+#   below, and leave the unit failed — and "restart", being a stop and then a
+#   start, would ADD TWO supervisors where it meant to remove one. That is
+#   worse than the bug this ExecStop exists to fix, in exactly the situation
+#   that cost an hour on 2026-09-11. The leading '-' does not save you: it
+#   forgives a stop that FAILS, not a stop that never finishes.
+#
 #   The leading '-' on the ExecStop line means a failing stop never fails the
-#   unit: stopping something already stopped, or a sandbox that is asleep or
-#   gone, is ordinary and must not leave the unit in a failed state.
+#   unit: stopping something already stopped, or a sandbox that has been
+#   removed, is ordinary and must not leave the unit in a failed state. (A
+#   sandbox that is merely asleep is woken by sbx so the stop can run, which
+#   is what we want.)
 #
 # WHY TimeoutStopSec=60: the stop now does real work inside the sandbox — open
 #   a session, end the bootstrap, wait for both services — so it needs longer

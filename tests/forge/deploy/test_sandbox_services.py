@@ -1063,10 +1063,23 @@ class TestTheRunnerUnit:
         # And one sentence of what it cost.
         assert "supervisors had piled up" in comments
 
+    def test_the_unit_warns_that_the_bootstrap_must_know_the_stop_word_first(self):
+        # An older bootstrap ignores the word and runs its start path, so a stop
+        # against it would add a supervisor and then hang. The file has to say so.
+        comments = _unit_comments(RUNNER_UNIT)
+        assert "BEFORE INSTALLING THIS FILE" in comments
+        assert "ignore the word" in comments
+        assert "TWO supervisors" in comments
+
     def test_the_readme_says_why_stopping_has_to_reach_inside(self):
         readme = (REPO_ROOT / "ops" / "systemd" / "README.md").read_text(encoding="utf-8")
         assert "ExecStop=-/usr/bin/sbx exec %i deploy/sandbox-runner.sh stop" in readme
         assert "Stopping it has to reach inside the sandbox (2026-09-11)" in readme
+
+    def test_the_readme_tells_the_operator_what_to_check_before_installing(self):
+        readme = (REPO_ROOT / "ops" / "systemd" / "README.md").read_text(encoding="utf-8")
+        assert "What the operator has to check before installing this unit." in readme
+        assert "replace that repository's bootstrap first, then" in readme
 
     def test_the_readme_says_how_to_install_it(self):
         readme = (REPO_ROOT / "ops" / "systemd" / "README.md").read_text(encoding="utf-8")

@@ -158,7 +158,20 @@ ExecStop=-/usr/bin/sbx exec %i deploy/sandbox-runner.sh stop
 
 `stop` is the bootstrap's own documented stop mode (the lane beside this one
 adds it): it ends the running bootstrap and the services it started, inside the
-sandbox, and it exits 0 when there is nothing to stop. The unit therefore knows
+sandbox, and it exits 0 when there is nothing to stop.
+
+**What the operator has to check before installing this unit.** Do not install
+this file for a sandbox until the copy of `deploy/sandbox-runner.sh` that the
+sandbox actually runs — the factory's clone of that repository — takes the word
+`stop` and stops. Older copies of the bootstrap read no arguments at all: they
+ignore the word and run their ordinary **start** path instead. Against such a
+copy, `systemctl --user stop` starts another supervisor inside the sandbox,
+never returns, runs out the 60 seconds and leaves the unit failed — and
+`restart`, which is a stop and then a start, adds two supervisors where it meant
+to remove one. That is worse than the bug this stop line exists to fix. The
+leading `-` does not help: it forgives a stop that fails, not a stop that never
+finishes. So the order is: replace that repository's bootstrap first, then
+install this unit. The unit therefore knows
 nothing about how the bootstrap names its children — no process patterns live in
 the unit file. The leading `-` means a failed stop never fails the unit, because
 stopping something that is already stopped is ordinary. `TimeoutStopSec=60`
