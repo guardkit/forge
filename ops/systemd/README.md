@@ -194,10 +194,16 @@ new code.
 The ordinary mechanics, once the bootstrap is right: the unit knows nothing
 about how the bootstrap names its children, because it calls one word — no
 process patterns live in the unit file. The leading `-` means a stop that exits
-non-zero never fails the unit; the case that needs forgiving is a running unit
-with nothing left alive inside the sandbox, or a sandbox that has been removed
-since. And `TimeoutStopSec=60` bounds the whole stop, which now does real work
-in there: if it hangs, systemd kills the held session as it always did.
+non-zero never fails the unit, and what it is there to forgive is the **door**
+failing: the sandbox has been removed, `sbx` cannot reach the daemon, or the
+session will not open, so a unit that cannot get in there is not left failed on
+the host. It is not there for an idle sandbox — what the stop returns in that
+case is said once, above, and is not repeated here — nor for a unit that is
+already stopped, because systemd does not run `ExecStop` for a unit that is
+already inactive. A sandbox that is merely asleep is woken by `sbx` so the stop
+can run, which is what we want. And `TimeoutStopSec=60` bounds the whole stop,
+which now does real work in there: if it hangs, systemd kills the held session
+as it always did.
 
 A sandbox created before the profile named the service ports keeps its old
 shape (no clone, no mounts, no service ports): `sbx` cannot add those to a

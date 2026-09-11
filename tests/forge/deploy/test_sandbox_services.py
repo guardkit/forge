@@ -999,6 +999,38 @@ RUNNER_UNIT = "forge-sandbox-runner@.service"
 #: The start line, which this lane must leave exactly as it found it.
 EXEC_START = "/usr/bin/sbx exec %i deploy/sandbox-runner.sh"
 
+#: The true answer to "what does the bootstrap's stop return when there is
+#: nothing to stop", in the words both documents use for it. The bootstrap is
+#: ``deploy/sandbox-runner.sh`` in the repository the sandbox runs, and its stop
+#: mode exits 0 whether or not it found anything to end; its own tests pin that.
+IDLE_ANSWER = "it exits 0 when there is nothing to stop"
+
+#: Wordings that answered the same question the other way round, or that gave
+#: the leading '-' on the ExecStop line the idle case as its reason. Both
+#: documents carried one of these beside the true sentence, so the lane building
+#: against this file had two opposite answers to choose from.
+CONTRADICTIONS = (
+    "nothing left alive",
+    "has nothing to do and says so with a non-zero exit",
+    "says so with a non-zero exit",
+    "the case that needs forgiving is a running unit",
+)
+
+#: Every wording, right or wrong, that answers that question. A document must
+#: contain exactly one of these, in the place a reader looks for it; any other
+#: passage that used to answer it now points at that place instead.
+IDLE_ANSWERS = (IDLE_ANSWER,) + CONTRADICTIONS
+
+
+def _readme_text() -> str:
+    return (REPO_ROOT / "ops" / "systemd" / "README.md").read_text(encoding="utf-8")
+
+
+def _prose(text: str) -> str:
+    """A document's words as one line, so a sentence wrapped across several
+    lines — or across comment markers — reads the same as one written flat."""
+    return re.sub(r"\s+", " ", text.replace("#", " "))
+
 
 class TestTheRunnerUnit:
     def test_it_is_shaped_like_the_keeper(self):
@@ -1043,8 +1075,12 @@ class TestTheRunnerUnit:
         assert stop_argv[3] == start_argv[3] == "deploy/sandbox-runner.sh"
         assert stop_argv[4:] == ["stop"]
 
-    def test_a_stop_with_nothing_to_stop_does_not_fail_the_unit(self):
-        # systemd's '-' prefix: stopping something already stopped is ordinary.
+    def test_the_leading_dash_is_there_for_the_door_failing(self):
+        # systemd's '-' prefix. What it forgives is the door itself failing —
+        # the sandbox removed, sbx unable to reach the daemon, a session that
+        # will not open — so a unit that cannot get in there is not left failed
+        # on the host. It is NOT there for an idle sandbox: the bootstrap
+        # succeeds in that case, which is why this test no longer says so.
         assert _one_line("ExecStop=").startswith("-")
 
     def test_the_stop_is_bounded_in_time(self):
@@ -1102,6 +1138,64 @@ class TestTheRunnerUnit:
     def test_the_readme_says_how_to_install_it(self):
         readme = (REPO_ROOT / "ops" / "systemd" / "README.md").read_text(encoding="utf-8")
         assert "cp ops/systemd/forge-sandbox-runner@.service ~/.config/systemd/user/" in readme
+
+
+class TestTheIdleAnswerIsSaidOnceAndSaidRight:
+    """What the bootstrap's stop returns when there is nothing to stop.
+
+    The neighbouring lane builds against these two documents, so they have to
+    give one answer. The answer is exit 0: ``deploy/sandbox-runner.sh``'s stop
+    mode says "Ending what is already ended is a success: this exits 0 whether
+    or not it found anything to end", and fails only on a process that will not
+    die (4) or a supervisor that cannot be ended from underneath itself (5).
+    Each document must state that once, where a reader looks for it, and the
+    passage about the leading '-' must not state it again the other way round.
+    """
+
+    def test_the_unit_answers_the_question_exactly_once(self):
+        prose = _prose((REPO_ROOT / "ops" / "systemd" / RUNNER_UNIT).read_text(encoding="utf-8"))
+        answers = sum(prose.count(wording) for wording in IDLE_ANSWERS)
+        assert answers == 1, (
+            "the unit file must answer 'what does the stop return when there is "
+            f"nothing to stop' exactly once; it answers it {answers} times"
+        )
+        assert prose.count(IDLE_ANSWER) == 1
+
+    def test_the_readme_answers_the_question_exactly_once(self):
+        prose = _prose(_readme_text())
+        answers = sum(prose.count(wording) for wording in IDLE_ANSWERS)
+        assert answers == 1, (
+            "the README must answer 'what does the stop return when there is "
+            f"nothing to stop' exactly once; it answers it {answers} times"
+        )
+        assert prose.count(IDLE_ANSWER) == 1
+
+    @pytest.mark.parametrize("wording", CONTRADICTIONS)
+    def test_neither_document_still_says_the_opposite(self, wording):
+        # The absence is the point. A document that says both answers passes a
+        # test that only looks for the right one, which is how this survived.
+        unit = _prose((REPO_ROOT / "ops" / "systemd" / RUNNER_UNIT).read_text(encoding="utf-8"))
+        readme = _prose(_readme_text())
+        assert wording not in unit, f"the unit file still says {wording!r}"
+        assert wording not in readme, f"the README still says {wording!r}"
+
+    def test_the_unit_explains_the_dash_by_the_door_failing(self):
+        prose = _prose(_unit_comments(RUNNER_UNIT))
+        assert "the DOOR itself failing" in prose
+        assert "the sandbox has been removed" in prose
+        assert "cannot reach the daemon" in prose
+        assert "the session will not open" in prose
+        # And that an inactive unit is not the case being forgiven, because
+        # systemd does not reach ExecStop for one at all.
+        assert "never runs ExecStop for a unit that is already inactive" in prose
+
+    def test_the_readme_explains_the_dash_by_the_door_failing(self):
+        prose = _prose(_readme_text())
+        assert "the **door** failing" in prose
+        assert "the sandbox has been removed" in prose
+        assert "cannot reach the daemon" in prose
+        assert "the session will not open" in prose
+        assert "does not run `ExecStop` for a unit that is already inactive" in prose
 
 
 # ---------------------------------------------------------------------------
