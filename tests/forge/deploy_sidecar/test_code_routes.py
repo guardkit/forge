@@ -1087,6 +1087,19 @@ class TestOverLoopback:
         assert status == 400
         assert "outside the repository" in body["error"]
 
+    def test_a_null_character_in_a_path_is_a_400_and_not_a_500(
+        self, server: str
+    ) -> None:
+        """Over the wire, which is where this one used to hurt: the raise
+        became an HTTP 500 reading "internal error: ValueError" with a stack
+        trace in the sidecar's log for every such request."""
+        status, body = _post(
+            server + CODE_READ_FILE_ROUTE, {"repo": REPO_KEY, "path": "src/\x00.py"}
+        )
+
+        assert status == 400, body
+        assert "null character" in body["error"]
+
     def test_a_code_path_that_is_not_one_of_the_four_is_not_a_route(
         self, server: str
     ) -> None:
@@ -1099,3 +1112,341 @@ class TestOverLoopback:
             status, body = _post(server + path, {"repo": REPO_KEY})
             assert status == 404, (path, body)
             assert body["error"] == f"no such path: {path}"
+
+
+# ---------------------------------------------------------------------------
+# A path no operating system can be asked about: the null character
+# ---------------------------------------------------------------------------
+
+
+NULL_PATHS = (
+    (process_code_read_file_request, {"path": "src/\x00.py"}),
+    (process_code_read_file_request, {"path": "\x00"}),
+    (process_code_imports_request, {"path": "src/\x00"}),
+    (process_code_list_files_request, {"under": "src\x00"}),
+    (process_code_search_request, {"pattern": "get_user", "under": "src\x00"}),
+)
+
+
+class TestANullCharacterInAPath:
+    """A null character is not whitespace, not a slash and not an empty
+    segment, so the spelling fence lets it through — and looking such a path
+    up raises ValueError, which is a different family from the OSError this
+    door used to catch. Every route promises in its own docstring that it
+    never raises, and a caller that gets a 500 and a stack trace has been told
+    nothing it can act on."""
+
+    @pytest.mark.parametrize("handler,extra", NULL_PATHS)
+    def test_it_is_refused_in_one_sentence_rather_than_raised(
+        self, handler: Any, extra: dict[str, Any], cfg: ForgeConfig
+    ) -> None:
+        status, body = handler({"repo": REPO_KEY, **extra}, config=cfg)
+
+        assert status == 400, body
+        assert "null character" in body["error"]
+        assert "send the path exactly as git spells it" in body["error"]
+
+
+# ---------------------------------------------------------------------------
+# A file over the byte cap: served a line range at a time
+# ---------------------------------------------------------------------------
+
+
+BIG_LINES = 20_000
+BIG_TEXT = "".join(
+    f"line {number} of a file too big to hand back whole\n"
+    for number in range(1, BIG_LINES + 1)
+)
+BIG_PY = "".join(f"value_{number} = {number}\n" for number in range(1, 40_000))
+
+
+@pytest.fixture
+def big_repo(tmp_path: Path) -> Path:
+    """A real repository whose tracked files are all over the byte cap."""
+    path = tmp_path / "big_repo"
+    (path / "docs").mkdir(parents=True)
+    (path / "src").mkdir()
+    (path / "docs" / "big.txt").write_text(BIG_TEXT, encoding="utf-8")
+    # One line of three hundred thousand characters: a real minified file.
+    (path / "docs" / "one-line.txt").write_text("y" * 300_000, encoding="utf-8")
+    # Over the cap AND binary.
+    (path / "docs" / "big.bin").write_bytes(b"\x00" + b"z" * 300_000)
+    (path / "src" / "big_module.py").write_text(BIG_PY, encoding="utf-8")
+
+    _git(path, "init", "-q")
+    _git(path, "add", "docs", "src")
+    _git(path, "commit", "-qm", "init")
+    return path
+
+
+@pytest.fixture
+def big_cfg(big_repo: Path) -> ForgeConfig:
+    return _config({REPO_KEY: str(big_repo)})
+
+
+class TestAFileOverTheByteCap:
+    def test_the_refusal_names_a_way_out_and_the_way_out_works(
+        self, big_cfg: ForgeConfig
+    ) -> None:
+        """The whole point of this pair. The refusal used to say "read a part
+        of it with 'first_line' and 'last_line'" while the size check ran
+        BEFORE any line slicing, so following the advice gave the identical
+        refusal and a reader concluded the file could not be read."""
+        status, refusal = process_code_read_file_request(
+            {"repo": REPO_KEY, "path": "docs/big.txt"}, config=big_cfg
+        )
+
+        assert status == 400
+        assert "over this door's limit" in refusal["error"]
+        assert "'first_line' and 'last_line'" in refusal["error"]
+
+        status, body = process_code_read_file_request(
+            {
+                "repo": REPO_KEY,
+                "path": "docs/big.txt",
+                "first_line": 1,
+                "last_line": 10,
+            },
+            config=big_cfg,
+        )
+
+        assert status == 200, body
+        assert body["content"] == "".join(
+            f"line {number} of a file too big to hand back whole\n"
+            for number in range(1, 11)
+        )
+
+    def test_a_window_late_in_the_file_is_read_and_says_it_is_a_part(
+        self, big_cfg: ForgeConfig
+    ) -> None:
+        status, body = process_code_read_file_request(
+            {
+                "repo": REPO_KEY,
+                "path": "docs/big.txt",
+                "first_line": 19_998,
+                "last_line": 20_000,
+            },
+            config=big_cfg,
+        )
+
+        assert status == 200, body
+        assert body["content"] == "".join(
+            f"line {number} of a file too big to hand back whole\n"
+            for number in (19_998, 19_999, 20_000)
+        )
+        assert (body["first_line"], body["last_line"]) == (19_998, 20_000)
+        assert body["partial"] is True
+        assert body["total_lines"] is None, (
+            "the rest of the file was never read, so its length is not known"
+        )
+        assert body["bytes"] == len(BIG_TEXT.encode("utf-8"))
+        assert "only the lines you asked for were read" in body["note"]
+
+    def test_a_first_line_alone_reads_to_the_end_of_the_file(
+        self, big_cfg: ForgeConfig
+    ) -> None:
+        status, body = process_code_read_file_request(
+            {"repo": REPO_KEY, "path": "docs/big.txt", "first_line": 19_999},
+            config=big_cfg,
+        )
+
+        assert status == 200, body
+        assert body["last_line"] == 20_000
+        assert body["content"].endswith("line 20000 of a file too big to hand "
+                                        "back whole\n")
+
+    def test_a_window_past_the_end_is_refused_not_answered_empty(
+        self, big_cfg: ForgeConfig
+    ) -> None:
+        status, body = process_code_read_file_request(
+            {
+                "repo": REPO_KEY,
+                "path": "docs/big.txt",
+                "first_line": 90_000,
+                "last_line": 90_010,
+            },
+            config=big_cfg,
+        )
+
+        assert status == 400
+        assert "is past the end of docs/big.txt" in body["error"]
+
+    def test_a_window_bigger_than_the_byte_cap_is_refused_in_one_sentence(
+        self, big_cfg: ForgeConfig
+    ) -> None:
+        """One line of three hundred thousand characters is a whole file's
+        worth of text, and the window has to keep the same limit the whole
+        file did."""
+        status, body = process_code_read_file_request(
+            {
+                "repo": REPO_KEY,
+                "path": "docs/one-line.txt",
+                "first_line": 1,
+                "last_line": 1,
+            },
+            config=big_cfg,
+        )
+
+        assert status == 400
+        assert "come to more than this door's limit" in body["error"]
+        assert "ask for fewer lines" in body["error"]
+
+    def test_an_over_size_binary_file_is_still_refused_as_not_text(
+        self, big_cfg: ForgeConfig
+    ) -> None:
+        status, body = process_code_read_file_request(
+            {"repo": REPO_KEY, "path": "docs/big.bin", "first_line": 1, "last_line": 2},
+            config=big_cfg,
+        )
+
+        assert status == 400
+        assert "is not a text file" in body["error"]
+
+    def test_the_walk_into_a_big_file_stops_where_the_module_says(
+        self, big_cfg: ForgeConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(sidecar, "CODE_READ_SCAN_BYTES", 20_000)
+
+        status, body = process_code_read_file_request(
+            {
+                "repo": REPO_KEY,
+                "path": "docs/big.txt",
+                "first_line": 19_000,
+                "last_line": 19_001,
+            },
+            config=big_cfg,
+        )
+
+        assert status == 400
+        assert "reads no further than 20000 bytes" in body["error"]
+        assert "ask for earlier lines" in body["error"]
+
+    def test_imports_says_something_true_about_an_over_size_file(
+        self, big_cfg: ForgeConfig
+    ) -> None:
+        """/code/imports has no 'first_line' and no 'last_line', so the
+        read-file sentence must never be copied into its answer."""
+        status, body = process_code_imports_request(
+            {"repo": REPO_KEY, "path": "src/big_module.py"}, config=big_cfg
+        )
+
+        assert status == 200, body
+        note = body["files"][0]["note"]
+        assert "over this door's limit" in note
+        assert "its imports were not read" in note
+        assert "first_line" not in note
+        assert "last_line" not in note
+
+    def test_a_file_inside_the_cap_still_answers_whole_and_says_so(
+        self, cfg: ForgeConfig
+    ) -> None:
+        status, body = process_code_read_file_request(
+            {"repo": REPO_KEY, "path": "src/users/router.py"}, config=cfg
+        )
+
+        assert status == 200, body
+        assert body["partial"] is False
+        assert body["note"] is None
+        assert body["total_lines"] == 11
+
+
+# ---------------------------------------------------------------------------
+# Line numbers mean what every other tool means by them
+# ---------------------------------------------------------------------------
+
+
+# Line 3 carries a FORM FEED. Python's splitlines() breaks on it; git, grep,
+# every editor and every traceback do not.
+FORM_FEED_PY = (
+    "import os\n"
+    "\n"
+    "def one():\x0c pass\n"
+    "\n"
+    "needle_here = 1\n"
+)
+CRLF_TXT = "alpha\r\nbeta\r\nneedle_crlf\r\n"
+
+
+@pytest.fixture
+def odd_lines_repo(tmp_path: Path) -> Path:
+    path = tmp_path / "odd_lines"
+    path.mkdir()
+    (path / "feed.py").write_text(FORM_FEED_PY, encoding="utf-8", newline="")
+    (path / "windows.txt").write_text(CRLF_TXT, encoding="utf-8", newline="")
+    _git(path, "init", "-q")
+    _git(path, "add", "feed.py", "windows.txt")
+    _git(path, "commit", "-qm", "init")
+    return path
+
+
+@pytest.fixture
+def odd_cfg(odd_lines_repo: Path) -> ForgeConfig:
+    return _config({REPO_KEY: str(odd_lines_repo)})
+
+
+class TestLineNumbersAgreeWithEveryOtherTool:
+    def test_the_file_really_does_divide_two_ways(self) -> None:
+        """The premise, stated once so the rest of this class is readable:
+        Python's own splitlines() finds six lines in this five-line file."""
+        assert len(FORM_FEED_PY.splitlines()) == 6
+        assert FORM_FEED_PY.count("\n") == 5
+
+    def test_read_file_counts_the_lines_the_file_has(
+        self, odd_cfg: ForgeConfig
+    ) -> None:
+        status, body = process_code_read_file_request(
+            {"repo": REPO_KEY, "path": "feed.py"}, config=odd_cfg
+        )
+
+        assert status == 200, body
+        assert body["total_lines"] == 5
+        assert body["content"] == FORM_FEED_PY
+
+    def test_a_line_range_returns_that_line_of_the_file(
+        self, odd_cfg: ForgeConfig
+    ) -> None:
+        status, body = process_code_read_file_request(
+            {"repo": REPO_KEY, "path": "feed.py", "first_line": 3, "last_line": 3},
+            config=odd_cfg,
+        )
+
+        assert status == 200, body
+        assert body["content"] == "def one():\x0c pass\n"
+
+    def test_search_reports_the_line_number_grep_reports(
+        self, odd_cfg: ForgeConfig, odd_lines_repo: Path
+    ) -> None:
+        status, body = process_code_search_request(
+            {"repo": REPO_KEY, "pattern": "needle_here"}, config=odd_cfg
+        )
+
+        assert status == 200, body
+        assert [(m["path"], m["line"]) for m in body["matches"]] == [("feed.py", 5)]
+
+        # And the same number a real grep gives for the same file — the door
+        # never runs grep, but its answer has to agree with one.
+        grep = subprocess.run(
+            ["grep", "-n", "needle_here", "feed.py"],
+            cwd=odd_lines_repo,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert grep.stdout.split(":", 1)[0] == "5"
+
+    def test_a_windows_file_reads_and_searches_as_three_lines(
+        self, odd_cfg: ForgeConfig
+    ) -> None:
+        status, body = process_code_read_file_request(
+            {"repo": REPO_KEY, "path": "windows.txt"}, config=odd_cfg
+        )
+        assert status == 200, body
+        assert body["total_lines"] == 3
+
+        status, body = process_code_search_request(
+            {"repo": REPO_KEY, "pattern": "needle_crlf"}, config=odd_cfg
+        )
+        assert status == 200, body
+        assert [(m["path"], m["line"], m["text"]) for m in body["matches"]] == [
+            ("windows.txt", 3, "needle_crlf")
+        ]
