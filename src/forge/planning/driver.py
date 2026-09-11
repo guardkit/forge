@@ -47,6 +47,7 @@ import json
 import logging
 import os
 import re
+import subprocess
 import tempfile
 import time
 from dataclasses import dataclass, field
@@ -418,6 +419,44 @@ _ARCHITECTURE_RULES_REL = "docs/architecture-rules.yaml"
 #: sentence is around 200 characters, so neither bound bites there.
 _MAX_ARCHITECTURE_RULES = 60
 _MAX_ARCHITECTURE_RULE_CHARS = 400
+
+#: How long forge waits for the target repository's own `git ls-files` before
+#: giving up on the inventory. Listing tracked files is a local read of the
+#: index; on api_test (695 tracked files) it returns in milliseconds, so a few
+#: seconds is generous and a repository that cannot answer in that time must not
+#: hold up a planning run.
+_REPO_INVENTORY_GIT_TIMEOUT_SECONDS = 10
+
+#: The factory's own paperwork: records ABOUT the repository rather than the
+#: repository's code, and the bulk of the tree (400 of api_test's 695 tracked
+#: files). None of it tells a plan-writer what the application already contains,
+#: so none of it travels.
+#:
+#:   .guardkit/            the build harness's feature YAMLs, task records and
+#:                         gate state, written by the factory for the factory
+#:   .forge/               forge's own per-repository state
+#:   .claude/              harness commands, settings and agents — the tools
+#:                         that work ON the repository, not the application
+#:   tasks/                one record per task the factory has run
+#:   features/             the committed specifications; the current one is
+#:                         already sent with the request, in full
+#:   feature_spec_inputs/  the plain sentences those specifications came from
+#:   qa/receipts/          evidence kept from past runs
+_REPO_INVENTORY_SKIP_PREFIXES = (
+    ".guardkit/",
+    ".forge/",
+    ".claude/",
+    "tasks/",
+    "features/",
+    "feature_spec_inputs/",
+    "qa/receipts/",
+)
+
+#: At or under this many files the inventory carries the file paths themselves.
+#: Over it, it carries one entry per directory with the number of files in it
+#: instead: a big repository has to teach the seat its SHAPE, because a list cut
+#: off part-way reads like the whole truth and is worse than no list at all.
+_MAX_REPO_INVENTORY_FILES = 400
 
 #: The contract reference the auth door's card and its honest terminal name
 #: verbatim (the clause whose OWN words are "requires human confirmation").
@@ -8316,6 +8355,143 @@ class PlanningRunDriver:
         return {"source_file": _ARCHITECTURE_RULES_REL, "rules": rules}
 
     @staticmethod
+    def _read_repository_inventory(repo_path: str) -> dict[str, Any] | None:
+        """Read what the target repository already contains, for the plan seat.
+
+        The plan-writer is handed the specification's words and a small
+        description of the target repository, and it cannot open files. So when
+        a sentence says "add an endpoint that counts users per day", the seat
+        has no way of knowing that the users module, its model, its data access
+        and its router have existed since the repository was born — and it
+        writes a plan whose first two waves build them again. That happened on
+        2026-09-11 (FEAT-CDFD), and the invented field name in that plan,
+        ``creation_timestamp``, was the specification's English rather than the
+        repository's actual column, ``created_at`` — exactly what a writer who
+        cannot see the code produces.
+
+        This is the same cure as the architecture rules one level along: one
+        optional field on the descriptor, and a repository that yields nothing
+        plans byte for byte as it does today.
+
+        What travels, and why it is the TRACKED files:
+
+        * ``git ls-files`` is the repository's OWN statement of what belongs to
+          it, so nothing here has to guess at virtual environments, caches,
+          build output or a stray database file — none of those are tracked.
+        * The factory's own paperwork is dropped
+          (:data:`_REPO_INVENTORY_SKIP_PREFIXES`): it is records ABOUT the
+          repository rather than the repository's code, and on api_test it is
+          400 of 695 files.
+        * At or under :data:`_MAX_REPO_INVENTORY_FILES` the paths themselves
+          travel. Over it, one entry per directory with a count travels instead,
+          and a flag says so.
+        * Everything is sorted, so two runs on the same tree produce the same
+          bytes.
+
+        Honest about WHICH copy this reads: it is the checkout forge itself can
+        see. For a repository that has a sandbox, that is the host's copy of the
+        same repository rather than the sandbox's private clone — the same
+        approximation :meth:`_read_architecture_rules` already makes, and
+        accurate for the shape of the tree, which is what the seat needs.
+        Asking the repository's sidecar instead is a later step, if it ever
+        proves to matter.
+
+        Anything that goes wrong — no path, no git, not a git repository, a
+        timeout, a non-zero exit, an unreadable tree — is ``None``, one plain
+        WARNING line naming what happened, no key in the descriptor, and
+        planning exactly as it is today. Like the rules file, an inventory must
+        never be able to stop a planning run, which is why the whole reader sits
+        inside one try/except.
+        """
+        try:
+            path = Path(repo_path)
+            # `git -C` walks UP to find a repository, so a plain directory
+            # inside somebody else's checkout would otherwise answer with that
+            # checkout's files. The repository's own marker is asked for first
+            # (a file for a worktree, a directory for a normal clone).
+            if not (path / ".git").exists():
+                logger.warning(
+                    "target_repo_descriptor: %s is not a git repository (no "
+                    ".git); planning without the repository inventory",
+                    path,
+                )
+                return None
+            completed = subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "safe.directory=*",
+                    "-C",
+                    str(path),
+                    "ls-files",
+                    "-z",
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=_REPO_INVENTORY_GIT_TIMEOUT_SECONDS,
+                check=False,
+            )
+            if completed.returncode != 0:
+                logger.warning(
+                    "target_repo_descriptor: listing the tracked files of %s "
+                    "failed (git exited %d: %s); planning without the "
+                    "repository inventory",
+                    path,
+                    completed.returncode,
+                    " ".join((completed.stderr or "").split())[:200],
+                )
+                return None
+
+            tracked = [entry for entry in completed.stdout.split("\0") if entry]
+            files = sorted(
+                entry
+                for entry in tracked
+                if not entry.startswith(_REPO_INVENTORY_SKIP_PREFIXES)
+            )
+            if not files:
+                logger.warning(
+                    "target_repo_descriptor: %s tracks no files outside the "
+                    "factory's own paperwork; planning without the repository "
+                    "inventory",
+                    path,
+                )
+                return None
+
+            inventory: dict[str, Any] = {
+                "gathered_from": (
+                    "the repository's own tracked files (git ls-files), with "
+                    "the factory's build and specification records left out"
+                ),
+                "file_count": len(files),
+            }
+            if len(files) <= _MAX_REPO_INVENTORY_FILES:
+                inventory["files"] = files
+                return inventory
+
+            counts: dict[str, int] = {}
+            for entry in files:
+                directory = entry.rsplit("/", 1)[0] if "/" in entry else "."
+                counts[directory] = counts.get(directory, 0) + 1
+            inventory["directories"] = [
+                {"path": directory, "file_count": counts[directory]}
+                for directory in sorted(counts)
+            ]
+            # Said out loud, because a seat reading a list of directories must
+            # know it is reading the repository's shape and not its file list.
+            inventory["directories_only"] = True
+            return inventory
+        except Exception as exc:  # noqa: BLE001 — never fail a plan over this
+            logger.warning(
+                "target_repo_descriptor: could not list the tracked files of "
+                "%s (%s); planning without the repository inventory",
+                repo_path,
+                exc,
+            )
+            return None
+
+    @staticmethod
     def _build_target_repo_descriptor(
         target_repo: str, repo_path: str
     ) -> dict[str, Any]:
@@ -8329,7 +8505,12 @@ class PlanningRunDriver:
         does not cheaply know siblings; ``architecture_rules`` is present only
         when the target repo actually keeps a rules file (see
         :meth:`_read_architecture_rules`), and the schema defines the field as of
-        2026-08-31.
+        2026-08-31; ``repository_inventory`` is present only when forge can read
+        the target repository's tracked files (see
+        :meth:`_read_repository_inventory`), and its schema field is the
+        companion change on the specialist-agent side — the field is optional on
+        both sides deliberately, so either image can be redeployed first and a
+        descriptor without it plans byte for byte as it does today.
 
         ``test_roots`` is the EXACT ``tests/<name>`` set the downstream
         ``guardkit feature validate`` pre-commit oracle enforces, discovered by
@@ -8384,6 +8565,16 @@ class PlanningRunDriver:
         architecture_rules = PlanningRunDriver._read_architecture_rules(repo_path)
         if architecture_rules is not None:
             descriptor["architecture_rules"] = architecture_rules
+        # What the repository ALREADY contains. Before this, the seat was told
+        # the rules but never the code, so on 2026-09-11 a one-endpoint sentence
+        # came back as a four-wave plan whose first two waves rebuilt a model, a
+        # data-access layer and a router the repository has had since it was
+        # born. Same shape of cure as the rules above: present only when the
+        # repository can be read, absent otherwise, and planning unchanged when
+        # it is absent (see :meth:`_read_repository_inventory`).
+        repository_inventory = PlanningRunDriver._read_repository_inventory(repo_path)
+        if repository_inventory is not None:
+            descriptor["repository_inventory"] = repository_inventory
         return descriptor
 
     def _has_leg_event(self, correlation_id: str, stage_label: str) -> bool:
