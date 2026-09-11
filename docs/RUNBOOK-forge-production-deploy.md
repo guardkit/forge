@@ -221,8 +221,39 @@ cd ~/Projects/appmilla_github/forge
 ./scripts/build-image.sh 2>&1 | grep -q "forge oracle verification PASSED" && echo PASS || echo FAIL
 ```
 
-**GATE G3 — the new image carries the change you came to deploy.** Substitute the symbol your
-change introduces; the example is the 2026-08-23 specification-path work.
+**GATE G2b — the image carries the code in the tree you built it from.** This one is the machine's
+own, and it runs inside the build: `build-image.sh` passes the commit into the build, the image
+stores it, and `scripts/verify-forge-oracles.sh` compares every tracked Python file under
+`src/forge` with the same file in the image before it looks at a single oracle. Nothing to type — a build that produces an
+image carrying other code fails, with the differing files named. What a passing build prints:
+
+```
+  OK  provenance  233 Python files compared byte for byte and every one matches — this image
+  carries exactly the forge code in /home/.../forge, built with no uncommitted changes at commit <sha>.
+```
+
+If you built from a working tree with uncommitted changes, the same line says so and the build
+still runs — this estate builds from working trees. To ask a built image where it came from:
+
+```bash
+docker run --rm --entrypoint cat forge:production-validation /etc/forge-image-provenance
+```
+
+> **Why this gate exists — the 2026-09-11 incident, so nobody re-derives it.** During the go-live
+> of forge `a24a825` + `2ad935f`, the build ran from a clean checkout, the log showed the source
+> copy and the wheel build as executed rather than cached, the runtime stage's copy of the virtual
+> environment also read as executed, and the oracle verification passed. The image was carrying the
+> PREVIOUS commit's code: the installed `subagents/autobuild_runner.py` was 4,907 lines — exactly
+> commit `5242da9` — against 5,061 in the tree it was built from, with neither new function in it.
+> Rebuilding with the builder stage's cache disabled changed nothing; rebuilding with the runtime
+> stage's cache disabled produced the right code, so the stale content entered at the copy of the
+> virtual environment out of the builder. G3 below is what caught it. The lesson worth keeping: a
+> passing verification proved the oracles resolved and proved nothing at all about the code.
+
+**GATE G3 — the new image carries the change you came to deploy.** G2b is the machine comparing
+the whole package against a tree; this is your own eyes on the one change you came for, and both
+are worth having. Substitute the symbol your change introduces; the example is the 2026-08-23
+specification-path work.
 
 ```bash
 docker run --rm --entrypoint sh forge:production-validation -c \

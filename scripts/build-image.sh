@@ -141,6 +141,51 @@ fi
 GUARDKIT_SHA="$(git -C ../guardkit rev-parse HEAD 2>/dev/null || echo unknown)"
 echo "RECEIPT: installing guardkit oracle payload from ../guardkit @ ${GUARDKIT_SHA}" >&2
 
+# ---------------------------------------------------------------------------
+# PROVENANCE — the tree this build is building, carried INTO the image.
+#
+# LIVE INCIDENT (2026-09-11, the go-live of forge a24a825 + 2ad935f). This
+# script was run from a clean checkout. The build log printed "COPY src ./src"
+# as executed, the forge wheel was rebuilt, and the runtime stage's
+# "COPY --from=builder /opt/venv /opt/venv" also printed as executed, not
+# cached. The oracle verification below then passed. The image nevertheless
+# carried the PREVIOUS commit's code: the runner module installed in the image
+# was 4,907 lines (the previous commit) against 5,061 in the tree it was built
+# from, and neither new function was in it. The stale content entered at the
+# runtime stage's copy of the virtual environment; nothing in the build
+# noticed, because nothing in the build was comparing.
+#
+# Two things follow, and both are below.
+#
+#   1. The commit — and whether the working tree is dirty — is passed in and
+#      written into the image, so any image can be asked which tree it came
+#      from, and so the verification can compare the two.
+#   2. Because the runtime stage declares and consumes the commit BEFORE it
+#      copies the virtual environment, a runtime layer built from a DIFFERENT
+#      commit can never be reused for this one. That is deliberately an input
+#      rather than a cache-disabling flag: a flag makes every build slow and
+#      can be left off, while an input that changes with the source keeps the
+#      cache working for repeat builds of the SAME commit and cannot be
+#      forgotten.
+#
+# A dirty working tree does NOT refuse the build — this estate builds from
+# working trees — but it is recorded truthfully in the image's stamp and
+# printed here in one line, so an image built from uncommitted work says so.
+if ! FORGE_GIT_SHA="$(git -C "${FORGE_DIR}" rev-parse HEAD 2>/dev/null)"; then
+    echo "ERROR: cannot read the commit of ${FORGE_DIR} — git is unavailable, or this is not a checkout." >&2
+    echo "       Without it the image would carry no honest record of the code inside it," >&2
+    echo "       and the check that compares the two could not run. Fix that before building." >&2
+    exit 1
+fi
+
+if [[ -n "$(git -C "${FORGE_DIR}" status --porcelain 2>/dev/null)" ]]; then
+    FORGE_GIT_DIRTY=true
+    echo "PROVENANCE: building from commit ${FORGE_GIT_SHA} PLUS uncommitted changes in ${FORGE_DIR} — the image will say so." >&2
+else
+    FORGE_GIT_DIRTY=false
+    echo "PROVENANCE: building from commit ${FORGE_GIT_SHA}, with no uncommitted changes." >&2
+fi
+
 # Canonical BuildKit invocation — Contract A producer. Do NOT alter
 # this line without updating the runbook (§6.1) and the Dockerfile-side
 # literal-match test in lockstep. The whitespace and argument order
@@ -149,10 +194,21 @@ echo "RECEIPT: installing guardkit oracle payload from ../guardkit @ ${GUARDKIT_
 # the ``fleet-memory`` named context (the gate's priors read) sits third; the
 # ``guardkitfactory`` named context (the LangGraph leg harness, missing from
 # the image when the conductor's first real leg ran) sits fourth.
-docker buildx build --build-context nats-core=../nats-core --build-context guardkit=../guardkit --build-context fleet-memory=../fleet-memory --build-context guardkitfactory=../guardkitfactory -t forge:production-validation -f Dockerfile .
+#
+# The two provenance arguments are APPENDED after the context ``.`` on
+# purpose: the contract line above them is matched byte for byte by the
+# runbook and by three test files, so adding anything inside it would break
+# four consumers at once. Docker accepts flags after the positional context,
+# and appending is the only placement where every existing byte keeps its
+# position.
+docker buildx build --build-context nats-core=../nats-core --build-context guardkit=../guardkit --build-context fleet-memory=../fleet-memory --build-context guardkitfactory=../guardkitfactory -t forge:production-validation -f Dockerfile . --build-arg FORGE_GIT_SHA="${FORGE_GIT_SHA}" --build-arg FORGE_GIT_DIRTY="${FORGE_GIT_DIRTY}"
 
-# In-container oracle smokes — every build proves its target-terminal oracles
-# resolve before it can ship (the specialist verify-template-payload.sh pattern).
-# A build that produced a guardkit-less image (the B4 run 4b3b0893 failure mode)
-# fails HERE, at build time, instead of live mid-run.
+# The image's own proof, run before it can ship. It now does two jobs, in this
+# order: first it compares the forge package inside the image with the forge
+# package in this tree, file by file, and fails the build if they differ (the
+# 2026-09-11 incident above); then the in-container oracle smokes — every build
+# proves its target-terminal oracles resolve (the specialist
+# verify-template-payload.sh pattern). A build that produced a guardkit-less
+# image (the B4 run 4b3b0893 failure mode), or an image carrying another
+# commit's code, fails HERE, at build time, instead of live mid-run.
 "${FORGE_DIR}/scripts/verify-forge-oracles.sh" forge:production-validation

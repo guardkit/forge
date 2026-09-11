@@ -43,11 +43,250 @@
 # into ``docker run … python -`` silently reads empty input unless ``-i`` is
 # attached and exits 0 — a false pass. ``-c`` has no such dependency.
 #
+# ---------------------------------------------------------------------------
+# BEFORE ANY OF THAT: does the image carry THIS tree's code?
+#
+# LIVE INCIDENT (2026-09-11, the go-live of forge a24a825 + 2ad935f). A build
+# from a clean checkout printed every source step as executed rather than
+# cached, rebuilt the forge wheel, and this script then printed "forge oracle
+# verification PASSED". The image was carrying the PREVIOUS commit's code: the
+# installed runner module was 4,907 lines against 5,061 in the tree it was
+# built from, and neither new function was in it. A passing verification had
+# proved the oracles resolved and had proved NOTHING about the code.
+#
+# So the first thing this script now does is compare, by content, the forge
+# package installed in the image against the forge package in the tree this
+# script was invoked from, and refuse the image if they differ in any file. It
+# also reads the image's provenance stamp and requires it to name this tree's
+# commit. An image with no stamp predates the guard and FAILS with that said
+# plainly — it is never waved through. If the comparison cannot be made at all
+# (no git, no docker, the image will not run, no installed package), this
+# script FAILS: unknown is not a pass.
+#
 # Usage:
 #   ./scripts/verify-forge-oracles.sh [image-tag]   # default: forge:production-validation
+#
+# Two further modes exist so the comparison logic itself can be tested without
+# docker (tests/forge/test_image_provenance.py uses both):
+#   ./scripts/verify-forge-oracles.sh --manifest-dir <dir>
+#       print one line per Python file under <dir>: "<relative path><TAB><sha256>"
+#   ./scripts/verify-forge-oracles.sh --compare <manifest-a> <manifest-b>
+#       compare two such manifests; exit 0 if identical, 1 with the differing,
+#       missing and extra paths named otherwise.
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+WORK="$(mktemp -d)"
+trap 'rm -rf "${WORK}"' EXIT
+
+TAB="$(printf '\t')"
+
+# Set by compare_manifests so the success sentence can report how many files
+# were actually compared.
+COMPARED_COUNT=0
+
+fail() {
+    echo "FAIL: $*" >&2
+    exit 1
+}
+
+# --- the file walker, run on BOTH sides of the comparison --------------------
+# Deliberately POSIX sh so the SAME text runs under the host's bash and under
+# the image's /bin/sh. With no argument it locates the installed forge package
+# itself; with one argument it walks that directory. __pycache__ directories,
+# .pyc files and *.dist-info directories are ignored — none of them is source.
+# Output is sha256sum's own format ("<hash>  <path>"), normalised below.
+# (A source file whose name contained a tab or a newline would defeat this;
+# no Python package has one.)
+MANIFEST_SH="$(cat <<'SH'
+set -eu
+ROOT="${1:-}"
+if [ -z "${ROOT}" ]; then
+    ROOT="$(python -c 'import importlib.util as u
+spec = u.find_spec("forge")
+locations = list(getattr(spec, "submodule_search_locations", None) or []) if spec else []
+if not locations:
+    raise SystemExit("the forge package is not installed here")
+print(locations[0])')"
+fi
+if [ ! -d "${ROOT}" ]; then
+    echo "not a directory: ${ROOT}" >&2
+    exit 3
+fi
+cd "${ROOT}"
+find . -type d -name '__pycache__' -prune -o \
+       -type d -name '*.dist-info' -prune -o \
+       -type f -name '*.py' -print0 \
+    | xargs -0 -r sha256sum
+SH
+)"
+
+# Turn sha256sum's "<hash>  ./<path>" into "<path><TAB><hash>", which is what
+# the comparison joins on.
+normalise_manifest() {
+    sed -E "s|^([0-9a-f]{64})  (\./)?(.*)\$|\3${TAB}\1|"
+}
+
+# --- the comparison itself ---------------------------------------------------
+# Takes two manifests and reports every path that differs, is missing from the
+# image, or is present in the image and not in the tree. Returns 0 only when
+# all three lists are empty.
+compare_manifests() {
+    local tree_manifest="$1" image_manifest="$2"
+    local out="${WORK}/compare.$$"
+    rm -rf "${out}"
+    mkdir -p "${out}"
+
+    # Every step below is checked by hand rather than left to ``set -e``:
+    # this function is called from an ``if``, and bash suspends errexit
+    # inside a condition, so a failure here would otherwise read as a pass.
+    [ -f "${tree_manifest}" ] \
+        || fail "there is no manifest at ${tree_manifest}, so the comparison cannot be made. Unknown is not a pass."
+    [ -f "${image_manifest}" ] \
+        || fail "there is no manifest at ${image_manifest}, so the comparison cannot be made. Unknown is not a pass."
+
+    LC_ALL=C sort -t "${TAB}" -k1,1 "${tree_manifest}" > "${out}/tree" \
+        || fail "${tree_manifest} could not be read, so the comparison cannot be made."
+    LC_ALL=C sort -t "${TAB}" -k1,1 "${image_manifest}" > "${out}/image" \
+        || fail "${image_manifest} could not be read, so the comparison cannot be made."
+
+    LC_ALL=C join -t "${TAB}" -j 1 -o '0,1.2,2.2' "${out}/tree" "${out}/image" > "${out}/common" \
+        || fail "the two manifests could not be compared."
+    awk -F"${TAB}" '$2 != $3 { print $1 }' "${out}/common" > "${out}/differs" \
+        || fail "the two manifests could not be compared."
+    LC_ALL=C join -t "${TAB}" -j 1 -v 1 -o '1.1' "${out}/tree" "${out}/image" > "${out}/missing" \
+        || fail "the two manifests could not be compared."
+    LC_ALL=C join -t "${TAB}" -j 1 -v 2 -o '2.1' "${out}/tree" "${out}/image" > "${out}/extra" \
+        || fail "the two manifests could not be compared."
+
+    COMPARED_COUNT="$(wc -l < "${out}/tree" | tr -d ' ')"
+    local n_differs n_missing n_extra
+    n_differs="$(wc -l < "${out}/differs" | tr -d ' ')"
+    n_missing="$(wc -l < "${out}/missing" | tr -d ' ')"
+    n_extra="$(wc -l < "${out}/extra" | tr -d ' ')"
+
+    if [ "$((n_differs + n_missing + n_extra))" -eq 0 ]; then
+        return 0
+    fi
+
+    {
+        echo "FAIL: the forge package in the image is not the forge package in this tree."
+        echo "      files compared: ${COMPARED_COUNT}"
+        echo "      contents differ: ${n_differs}; in the tree but not in the image: ${n_missing}; in the image but not in the tree: ${n_extra}"
+        if [ "${n_differs}" -gt 0 ]; then
+            echo "      files whose contents differ (first ten):"
+            head -n 10 "${out}/differs" | sed 's|^|        |'
+        fi
+        if [ "${n_missing}" -gt 0 ]; then
+            echo "      files in the tree that the image does not have (first ten):"
+            head -n 10 "${out}/missing" | sed 's|^|        |'
+        fi
+        if [ "${n_extra}" -gt 0 ]; then
+            echo "      files the image has that the tree does not (first ten):"
+            head -n 10 "${out}/extra" | sed 's|^|        |'
+        fi
+        echo "      This is the 2026-09-11 failure: an image can carry another commit's code while"
+        echo "      every build step reports as executed. Do not deploy this image; build it again."
+    } >&2
+    return 1
+}
+
+# --- the tree side -----------------------------------------------------------
+# The repository's own statement of what belongs to it: tracked Python files
+# under src/forge, hashed from the working tree, keyed by their path inside the
+# package so they line up with the installed package's own layout.
+tree_manifest() {
+    local path absolute
+    while IFS= read -r path; do
+        case "${path}" in
+            *.py) ;;
+            *) continue ;;
+        esac
+        case "${path}" in
+            */__pycache__/*) continue ;;
+        esac
+        absolute="${REPO_ROOT}/${path}"
+        if [ ! -f "${absolute}" ]; then
+            fail "the tree lists ${path} as tracked but the file is not on disk, so the comparison cannot be made."
+        fi
+        printf '%s\t%s\n' "${path#src/forge/}" "$(sha256sum "${absolute}" | cut -c1-64)"
+    done < <(git -C "${REPO_ROOT}" ls-files -- src/forge)
+}
+
+# --- the whole provenance check, run before any oracle ----------------------
+check_image_provenance() {
+    local image="$1"
+
+    echo "Checking ${image} carries the code in ${REPO_ROOT}"
+
+    command -v git >/dev/null 2>&1 \
+        || fail "git is not on PATH, so the code in the image cannot be compared with the code in this tree. Unknown is not a pass."
+    command -v docker >/dev/null 2>&1 \
+        || fail "docker is not on PATH, so the image cannot be opened and the comparison cannot be made. Unknown is not a pass."
+    git -C "${REPO_ROOT}" rev-parse --git-dir >/dev/null 2>&1 \
+        || fail "${REPO_ROOT} is not a git checkout, so there is no tree to compare the image against. Unknown is not a pass."
+
+    local tree_sha
+    tree_sha="$(git -C "${REPO_ROOT}" rev-parse HEAD)"
+
+    if ! docker run --rm --entrypoint cat "${image}" /etc/forge-image-provenance \
+            > "${WORK}/stamp" 2> "${WORK}/stamp.err"; then
+        fail "${image} has no provenance stamp at /etc/forge-image-provenance. Either it was built before this guard existed — build it again with scripts/build-image.sh — or it cannot be run at all: $(tr '\n' ' ' < "${WORK}/stamp.err")"
+    fi
+
+    local image_sha image_dirty
+    image_sha="$(sed -n 's/^commit=//p' "${WORK}/stamp")"
+    image_dirty="$(sed -n 's/^dirty=//p' "${WORK}/stamp")"
+    [ -n "${image_sha}" ] \
+        || fail "the provenance stamp in ${image} names no commit, so the image cannot say which tree it came from."
+    [ "${image_sha}" = "${tree_sha}" ] \
+        || fail "${image} was built from commit ${image_sha}, and this tree is at commit ${tree_sha}. Build the image again from the tree you mean to deploy."
+
+    tree_manifest > "${WORK}/tree.tsv"
+    [ -s "${WORK}/tree.tsv" ] \
+        || fail "no tracked Python files under src/forge in ${REPO_ROOT}, so there is nothing to compare. Unknown is not a pass."
+
+    if ! docker run --rm --entrypoint sh "${image}" -c "${MANIFEST_SH}" forge-manifest \
+            > "${WORK}/image.raw" 2> "${WORK}/image.err"; then
+        fail "the forge package inside ${image} could not be listed, so the comparison cannot be made: $(tr '\n' ' ' < "${WORK}/image.err")"
+    fi
+    normalise_manifest < "${WORK}/image.raw" > "${WORK}/image.tsv"
+    [ -s "${WORK}/image.tsv" ] \
+        || fail "the forge package inside ${image} has no Python files in it, so the comparison cannot be made. Unknown is not a pass."
+
+    if ! compare_manifests "${WORK}/tree.tsv" "${WORK}/image.tsv"; then
+        exit 1
+    fi
+
+    local built_from="with no uncommitted changes"
+    if [ "${image_dirty}" = "true" ]; then
+        built_from="from a working tree carrying uncommitted changes"
+    fi
+    echo "  OK  provenance  ${COMPARED_COUNT} Python files compared byte for byte and every one matches — this image carries exactly the forge code in ${REPO_ROOT}, built ${built_from} at commit ${image_sha}."
+}
+
+# --- the two test modes, handled before anything touches an image ------------
+case "${1:-}" in
+    --manifest-dir)
+        [ "$#" -eq 2 ] || fail "usage: $0 --manifest-dir <directory>"
+        sh -c "${MANIFEST_SH}" forge-manifest "$2" | normalise_manifest
+        exit 0
+        ;;
+    --compare)
+        [ "$#" -eq 3 ] || fail "usage: $0 --compare <tree-manifest> <image-manifest>"
+        if compare_manifests "$2" "$3"; then
+            echo "  OK  provenance  ${COMPARED_COUNT} Python files compared byte for byte and every one matches."
+            exit 0
+        fi
+        exit 1
+        ;;
+esac
+
 IMAGE="${1:-forge:production-validation}"
+
+check_image_provenance "${IMAGE}"
 
 echo "Verifying forge target-terminal oracles in ${IMAGE}"
 
