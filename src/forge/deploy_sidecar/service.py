@@ -38,6 +38,19 @@ The narrow contract:
     POST /git/worktree-changed-files {repo, path, base}
               -> {name_status, approval_patch, truncated, head|null,
                   test_patch, test_patch_truncated}
+    POST /code/list-files {repo, under?}
+              -> {files, count, total_tracked, under, capped, cap}
+    POST /code/read-file  {repo, path, first_line?, last_line?}
+              -> {path, content, bytes, total_lines|null, first_line,
+                  last_line, partial, note|null}
+    POST /code/imports    {repo, path}
+              -> {path, files: [{path, language, imports, note?}],
+                  files_walked, capped, cap}
+    POST /code/search     {repo, pattern, under?, fixed_string?,
+                           case_insensitive?, max_results?}
+              -> {matches: [{path, line, text, line_truncated}], count,
+                  files_searched, capped, cap, line_cap,
+                  long_lines_partly_searched, timed_out}
 
 The three routes after ``/git/rev-parse`` are the merge press's own git
 (sandbox first, 2026-09-07, rule 89): its ancestry guards, and the lay-out and
@@ -45,6 +58,15 @@ removal of the branch's tree for the candidate check. Each derives the tree's
 place from the repository its ``repo`` key names, so no path a caller sends
 ever reaches git or the filesystem here. See the section above
 :func:`process_git_is_ancestor_request`.
+
+The four ``/code`` routes are THE CODE DOOR (Rich's ruling, 2026-09-11): a
+READ-ONLY way for a plan or architect seat to ask what a repository already
+holds, instead of forge guessing in advance which facts to push at it. They
+run git for one thing — listing the files the repository tracks — and run
+nothing else, write nothing, check nothing out, touch no worktree and execute
+none of the repository's own code. Only files git TRACKS are served, so the
+door can never hand back a virtual environment, a build artefact or a stray
+secret file. See the block above :func:`process_code_list_files_request`.
 
 The three git operations (sandbox first, 2026-09-07, rule 70) make the
 planning chain's commits where the repository lives: the caller declares the
@@ -139,6 +161,7 @@ unit-testable without a live socket. Neither **ever raises** past its boundary.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import concurrent.futures
 import importlib.util
@@ -150,6 +173,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib import import_module
@@ -3631,6 +3655,1259 @@ def process_guardkit_leg_request(
 
 
 # ---------------------------------------------------------------------------
+# THE CODE DOOR — FOUR READ-ONLY ROUTES INTO A REPOSITORY'S OWN SOURCE
+# (Rich's ruling, 2026-09-11: do the long-term thing now)
+# ---------------------------------------------------------------------------
+#
+# WHY THIS EXISTS. A plan seat that has never seen the target repository
+# proposed creating a user model, a data-access module and a router that the
+# repository has had since it was born. A file inventory now rides on the
+# description forge pushes to that seat, which stops that exact plan — but a
+# pushed summary is forge guessing in advance what a seat will need, and every
+# gap found later costs another field: architecture rules on 31 August, file
+# paths on 11 September, columns next. The long-term thing is that the seat can
+# ASK. The tools to ask with already exist in specialist-agent (scan a file
+# tree, read a source file, extract imports by syntax tree, search the
+# codebase); what blocks them is that a seat container mounts exactly one
+# directory, its own output, and can see no repository at all. Mounting
+# repositories into a seat container would spend the isolation that makes a
+# seat safe to run untrusted output through, so the seat reads through the
+# repository's OWN sandbox sidecar instead — this service, which already fences
+# paths by repository key and already serves git.
+#
+# THIS DOOR IS READ ONLY. That sentence is the whole of its posture, and every
+# route below keeps it:
+#
+#   * it runs git for ONE thing — listing the files the repository tracks —
+#     and runs no other git command, ever;
+#   * it never writes, never checks out, never creates, moves or removes a
+#     branch, a commit or a worktree, and never touches a worktree at all;
+#   * it never executes anything belonging to the repository — no test, no
+#     script, no driver, no installed package;
+#   * there is no shell anywhere, and the search never shells out to grep: it
+#     is Python's own regular expressions over bytes this service read itself.
+#
+# IT IS GATED EXACTLY AS THE EXISTING GIT ROUTES ARE, for the reason written
+# above the ancestry routes: the wall Rich's rule of 2026-09-07 puts up is
+# about running a REPOSITORY'S OWN CODE on the host, and these routes run none.
+# They are the same class of thing as ``/git/rev-parse`` and
+# ``/git/read-file-from-branch``, which a host sidecar has answered since L1.
+# So a host sidecar answers these too, for the repositories it already serves,
+# and gains no power it did not have.
+#
+# EVERY PATH A CALLER SENDS IS FENCED FOUR TIMES. LAW 1 resolves the
+# repository from its key and nothing else, so no caller ever names a
+# directory. :func:`_relative_path_error` refuses anything that is not a plain
+# relative path (no '..', no leading slash, no empty segment) — the same fence
+# the planning routes use. The path is then RESOLVED and compared against the
+# resolved repository root, so a symbolic link that leaves the tree is refused
+# after resolution even though its spelling looked innocent. And the path it
+# LANDS ON, inside the tree, must itself be tracked
+# (:func:`_resolved_not_tracked_error`).
+#
+# AND A FILE IS ONLY SERVED IF GIT TRACKS IT — the file, not the name it was
+# asked for by. Tracking is the repository's own statement of what belongs to
+# it (the same argument the pushed inventory makes), so this door can never
+# serve a virtual environment, a build artefact, a local database or a stray
+# secret file that happens to sit in the tree, and no exclusion list has to
+# guess at them. The fourth fence is what makes that sentence true rather than
+# nearly true: git tracks a symbolic link as a link, so asking only whether
+# the path a caller SENT is tracked would serve a tracked link pointing at an
+# untracked file beside it — including ``.git/config``, which sits inside the
+# tree, is never tracked, and is where a remote's access token lives. The
+# tracked test is therefore applied AFTER resolution, on every route that
+# reads a byte: ``/code/read-file``, every file ``/code/imports`` parses, and
+# every file ``/code/search`` opens. ``/code/list-files`` answers names out of
+# git's own listing and opens nothing, so there is nothing there to fence.
+#
+# Every refusal is one plain sentence a person can act on — including the
+# sentences nobody means to reach: a path carrying a null character is refused
+# like any other bad path rather than raising, and every refusal's advice is
+# something the route that gave it can actually do. And no route here changes
+# the behaviour of any route above it.
+#
+# LINES ARE COUNTED ON NEWLINES, the way git, grep, every editor and every
+# traceback count them, so a line number from this door means the same thing
+# as a line number from anywhere else (see :func:`_split_lines`).
+
+#: The four routes.
+CODE_LIST_FILES_ROUTE: str = "/code/list-files"
+CODE_READ_FILE_ROUTE: str = "/code/read-file"
+CODE_IMPORTS_ROUTE: str = "/code/imports"
+CODE_SEARCH_ROUTE: str = "/code/search"
+
+#: How long the one git command this door runs may take. Listing an index is
+#: fast; this is a wall against a repository on a stalled filesystem, not a
+#: budget anybody is meant to spend.
+CODE_GIT_TIMEOUT_SECONDS: float = 60.0
+
+#: How many tracked paths one listing answers with. Past this the answer is
+#: cut and SAYS it was cut, because a silently short list reads like a whole
+#: repository and is exactly the kind of quiet wrongness this door exists to
+#: end. (api_test tracks 695 files; forge's own main tracks about 3,000.)
+CODE_MAX_TRACKED_PATHS: int = 5_000
+
+#: The largest file this door will hand back, in bytes. A quarter of a
+#: megabyte is a very large source file and a small fraction of a seat's
+#: context; anything bigger is refused in one sentence rather than quietly
+#: truncated, so a reader never mistakes half a file for the whole of it.
+CODE_MAX_FILE_BYTES: int = 262_144
+
+#: How many bytes are sniffed for a null byte before a file is called text.
+CODE_BINARY_SNIFF_BYTES: int = 8_192
+
+#: How far this door reads INTO a file that is over the byte cap, looking for
+#: the lines a caller asked for, and how much it reads at a time while it
+#: looks. A file over the cap is not refused outright: a caller can ask for a
+#: line range and get exactly those lines, which is what a reader wants from a
+#: three-hundred-kilobyte file. What that costs has to be bounded too, though,
+#: or a request for line nine million of a huge file would walk the whole of
+#: it, so the walk stops here and says where it stopped. The memory it costs
+#: is the size of the window asked for, not the size of the file.
+CODE_READ_SCAN_BYTES: int = 16 * 1024 * 1024
+CODE_READ_CHUNK_BYTES: int = 65_536
+
+#: How many files one imports request parses. A directory of a thousand
+#: modules is a request to read the whole repository one syntax tree at a
+#: time; the answer stops here and says it stopped.
+CODE_IMPORTS_MAX_FILES: int = 200
+
+#: How many matching lines one search answers with, and how much of a single
+#: line is SEARCHED and comes back. A minified file is one line of half a
+#: megabyte, and without the second cap one match could be the whole answer.
+#: The same number bounds the text this door hands the regular-expression
+#: engine in one go, which is half of what keeps a search finishing; the other
+#: half is written under the timeout below. A line longer than this is
+#: searched up to here and no further, and the answer says how many lines that
+#: happened to, because a search that quietly skipped the end of a line would
+#: be exactly the sort of silent wrongness this door exists to end.
+CODE_SEARCH_MAX_MATCHES: int = 200
+CODE_SEARCH_MAX_LINE_CHARS: int = 500
+
+#: How long a search may spend before it stops and says so — and exactly what
+#: that promise is worth, because half a promise here would be worse than
+#: none.
+#:
+#: WHAT THE CLOCK HOLDS. It is read before every file and again before every
+#: line, so a search across any number of files, and down any number of lines
+#: inside one file, ends at this wall and comes back with ``timed_out`` true.
+#:
+#: WHAT NO CLOCK OF OURS CAN HOLD. Python's regular expressions backtrack, one
+#: ``search()`` call cannot be interrupted, and while it runs it holds the
+#: interpreter — so a single pathological line would freeze not just its own
+#: request but every other request this sidecar is serving, and the only cure
+#: would be restarting the sidecar, which this estate's own rule forbids while
+#: a build is in flight. Two things stand in for the clock there. The text
+#: handed to the engine for one line is capped (above). And a pattern whose
+#: SHAPE makes that work grow with every character of the line is refused in
+#: one plain sentence before a single file is read — the two shapes that do
+#: that, and the measurements behind them, are written above the check itself.
+#: That is the honest size of the promise: the clock holds everywhere the
+#: clock can see, and the two shapes it could not have stopped never reach the
+#: engine.
+CODE_SEARCH_TIMEOUT_SECONDS: float = 30.0
+
+#: The longest pattern a search may carry. A pattern is a person's sentence,
+#: not a payload.
+CODE_SEARCH_MAX_PATTERN_CHARS: int = 1_000
+
+#: Which file extensions this door parses for imports. Python only — the
+#: syntax-tree reader is Python's own, and a door that guessed at another
+#: language by searching its text would be doing the thing this route exists
+#: to avoid. A file of any other kind is NAMED in the answer, plainly, rather
+#: than skipped or guessed at.
+CODE_PYTHON_SUFFIXES: frozenset[str] = frozenset({".py", ".pyi"})
+
+
+def _code_repo_error(repo_path: Path) -> str | None:
+    """A plain sentence unless ``repo_path`` really is a git repository.
+
+    ``git -C`` walks UP to find a repository, so a configured path that is a
+    plain directory inside somebody else's checkout would otherwise be
+    answered with THAT checkout's files. The repository's own marker is asked
+    for first (a file for a worktree, a directory for a normal clone).
+    """
+    if not repo_path.is_dir():
+        return (
+            f"the repository is configured at {repo_path}, which is not a "
+            "directory on this box"
+        )
+    if not (repo_path / ".git").exists():
+        return (
+            f"{repo_path} is not a git repository (it has no .git), so the "
+            "sidecar cannot tell which files belong to it"
+        )
+    return None
+
+
+def _tracked_files(repo_path: Path) -> tuple[list[str] | None, str | None]:
+    """Every path the repository tracks, sorted — or one plain sentence.
+
+    ONE git command, a fixed argument list, no shell, nothing written:
+    ``git -c safe.directory=* -C <repo> ls-files -z``. ``-z`` is what makes
+    the answer trustworthy — it turns off git's quoting, so a path with a
+    space or a non-ASCII character arrives as itself rather than as a quoted
+    approximation nothing else here would match.
+    """
+    try:
+        completed = subprocess.run(  # noqa: S603 — fixed argv, no shell
+            [
+                "git",
+                "-c",
+                "safe.directory=*",
+                "-C",
+                str(repo_path),
+                "ls-files",
+                "-z",
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=CODE_GIT_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return None, f"sidecar git error: {type(exc).__name__}: {exc}"
+    if completed.returncode != 0:
+        detail = (
+            " ".join((completed.stderr or completed.stdout or "").split())[:200]
+            or "<no output>"
+        )
+        return None, (
+            f"git could not list the tracked files of {repo_path} (it exited "
+            f"{completed.returncode}): {detail}"
+        )
+    return sorted(entry for entry in completed.stdout.split("\0") if entry), None
+
+
+def _resolve_inside_repo(
+    repo_path: Path, relative: str, *, what: str
+) -> tuple[Path | None, str | None]:
+    """The absolute path of ``relative``, refused unless it stays inside.
+
+    The spelling fence above already refuses '..', an absolute path and an
+    empty segment. This is the second half of the same guard and the half a
+    spelling check cannot do: both sides are RESOLVED — every symbolic link
+    followed — and the result must still be the repository root or something
+    under it. A tracked link pointing at somebody's key file outside the tree
+    is refused here, after resolution, however innocent its name looked.
+
+    Never raises. Looking a path up can fail in two different families: the
+    operating system saying no (``OSError``), and the path being one no
+    operating system can be asked about at all (``ValueError`` — a null
+    character in the middle of it, or half of a surrogate pair, both of which
+    ordinary JSON can carry). Both come back as a sentence, because a caller
+    that gets a stack trace instead of a sentence has been told nothing.
+    """
+    if "\x00" in relative:
+        return None, (
+            f"'{what}' {relative!r} carries a null character, which no file "
+            "name on this box can contain — send the path exactly as git "
+            "spells it"
+        )
+    try:
+        root = repo_path.resolve()
+        resolved = (root / relative).resolve()
+    except (OSError, ValueError) as exc:
+        return None, (
+            f"'{what}' {relative!r} could not be resolved inside the "
+            f"repository: {type(exc).__name__}: {exc}"
+        )
+    if resolved != root and root not in resolved.parents:
+        return None, (
+            f"'{what}' {relative!r} resolves to {resolved}, which is outside "
+            f"the repository at {root} — this door reads only files inside it"
+        )
+    return resolved, None
+
+
+def _resolved_not_tracked_error(
+    repo_path: Path, resolved: Path, relative: str, tracked: "set[str]"
+) -> str | None:
+    """A plain sentence unless the path a request LANDS ON is tracked too.
+
+    The fence above keeps a link inside the tree; this one keeps it on a file
+    the repository actually owns, and it is the half that matters for a secret.
+    Asking "is the path the caller SENT tracked?" is not the same question as
+    "is the file about to be read tracked?": git tracks a symbolic link as a
+    link, so a tracked ``config.txt`` pointing at an untracked
+    ``local-secrets.env`` beside it passes the first question and reads the
+    secret. Worse, it can point at ``.git/config``, which is inside the tree,
+    is never tracked, and is where a remote's access token lives.
+
+    So the RESOLVED path is turned back into a repository-relative path and
+    that is the one held to the tracked list. An ordinary file resolves to
+    itself and is unaffected. A link to a tracked file is still served, because
+    that is a legitimate thing for a repository to contain and the file it
+    lands on is one this door would have served under its own name anyway.
+
+    The refusal names the link and the path it lands on — both are file names
+    the caller could have listed for itself — and never any part of what is in
+    there, because a refusal that quotes the thing it is refusing has served
+    it. Fails towards refusing: a path that cannot be worked out here is not
+    read.
+    """
+    try:
+        root = repo_path.resolve()
+        landed = resolved.relative_to(root).as_posix()
+    except (OSError, ValueError) as exc:
+        return (
+            f"{relative} could not be checked against this repository's "
+            f"tracked files after it was resolved "
+            f"({type(exc).__name__}: {exc}), so this door will not read it"
+        )
+    if landed == relative or landed in tracked:
+        return None
+    if landed == ".":
+        landed = "the repository's own root directory"
+    return (
+        f"{relative} is a link to {landed}, which git does not track, so this "
+        "door will not read it — a link is served only when the file it lands "
+        "on is one of the repository's own committed files"
+    )
+
+
+def _code_repo_and_files(
+    payload: dict[str, Any], config: ForgeConfig
+) -> tuple[Path | None, list[str] | None, tuple[int, dict[str, Any]] | None]:
+    """The four routes' shared opening: the repository, and what it tracks.
+
+    Answers ``(repo_path, tracked, None)`` or ``(None, None, (status, body))``
+    with the refusal already shaped. A caller's mistake is a 400; git failing
+    to answer is a 500, because a listing that could not be read must never be
+    passed off as "this repository tracks nothing".
+    """
+    repo_path, error = _resolve_repo_key(payload, config)
+    if error or repo_path is None:
+        return None, None, (400, {"error": error})
+    error = _code_repo_error(repo_path)
+    if error:
+        return None, None, (400, {"error": error})
+    tracked, error = _tracked_files(repo_path)
+    if error or tracked is None:
+        return None, None, (500, {"error": error})
+    return repo_path, tracked, None
+
+
+def _code_under_error(
+    repo_path: Path, value: Any
+) -> tuple[str | None, str | None]:
+    """The optional ``under`` directory: ``(prefix, None)`` or ``(None, error)``.
+
+    Absent means the whole repository. Present, it is held to the same fence
+    every relative path on this service is held to, resolved inside the tree
+    like any other, and must actually be a directory — a plain sentence is
+    more use than an empty list that could mean either "nothing there" or
+    "you spelled it wrong".
+    """
+    if value is None:
+        return None, None
+    error = _relative_path_error(value, what="under")
+    if error:
+        return None, error
+    resolved, error = _resolve_inside_repo(repo_path, str(value), what="under")
+    if error or resolved is None:
+        return None, error
+    if not resolved.is_dir():
+        return None, (
+            f"'under' {str(value)!r} is not a directory in this repository"
+        )
+    return str(value).rstrip("/"), None
+
+
+def _under_filter(tracked: Sequence[str], prefix: str | None) -> list[str]:
+    """The tracked paths inside ``prefix`` (all of them when it is absent)."""
+    if prefix is None:
+        return list(tracked)
+    head = prefix + "/"
+    return [path for path in tracked if path.startswith(head)]
+
+
+def _positive_int(value: Any, *, what: str) -> tuple[int | None, str | None]:
+    """An optional whole number of at least one, or one plain sentence."""
+    if value is None:
+        return None, None
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None, f"'{what}' must be a whole number of at least 1"
+    if value < 1:
+        return None, f"'{what}' must be a whole number of at least 1"
+    return value, None
+
+
+def _split_lines(text: str) -> list[str]:
+    """``text`` in lines, counted the way every other tool counts them.
+
+    Broken on the newline and nothing else. Python's own ``splitlines()`` also
+    breaks on the form feed, the vertical tab, the file, group and record
+    separators and the Unicode line and paragraph separators — git, grep,
+    every editor, every traceback and every "file.py:12" anybody ever pasted
+    do not. One form feed in a Python file is enough to put this door's line
+    numbers one out from the file's own for the whole rest of it, and a caller
+    feeding a search result's line number back into a read, or quoting it into
+    a plan, would be wrong and never told. A carriage return before the
+    newline is folded in, because a Windows line ending is one line ending.
+    """
+    lines = text.replace("\r\n", "\n").split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    return lines
+
+
+#: What a reader is told when a file is over the byte cap — one sentence per
+#: route, because the two routes can do different things about it. Read-file
+#: CAN serve part of such a file, so its sentence offers that and the offer
+#: works. Imports parses whole files only, so its sentence says so instead of
+#: sending a caller to line numbers that route has never had.
+OVER_SIZE_READ_ADVICE: str = (
+    "ask for the part you need with 'first_line' and 'last_line' (a file "
+    "this size is served a line range at a time), or read a smaller file"
+)
+OVER_SIZE_IMPORTS_ADVICE: str = (
+    "this door reads imports by parsing a whole file, so a file this size is "
+    "left unparsed and its imports were not read"
+)
+
+
+def _over_size_error(relative: str, size: int, advice: str) -> str:
+    """The one sentence for a file bigger than this door hands back whole."""
+    return (
+        f"{relative} is {size} bytes, over this door's limit of "
+        f"{CODE_MAX_FILE_BYTES} bytes — {advice}"
+    )
+
+
+def _unreadable_error(relative: str, exc: Exception) -> str:
+    """Tracked by git, and still not readable here — say which and why."""
+    return (
+        f"{relative} is tracked by git but could not be read here: "
+        f"{type(exc).__name__}: {exc}"
+    )
+
+
+def _not_text_error(relative: str) -> str:
+    """Text only, and the reason named so a caller knows what to do next."""
+    return (
+        f"{relative} is not a text file (there is a null byte in its first "
+        "block), and this door serves text only"
+    )
+
+
+def _looks_binary(data: bytes) -> bool:
+    """True when the first block carries a null byte — the same test the
+    seats' own reader uses, and the one git itself uses to call a file
+    binary."""
+    return b"\x00" in data[:CODE_BINARY_SNIFF_BYTES]
+
+
+def _read_text_file(
+    resolved: Path,
+    relative: str,
+    *,
+    over_size_advice: str = OVER_SIZE_READ_ADVICE,
+) -> tuple[str | None, int, tuple[int, dict[str, Any]] | None]:
+    """One tracked file's whole text: ``(text, size, None)`` or a refusal.
+
+    The order matters. Size before anything is read, so an enormous file is
+    refused without being loaded; then the first block only, to say whether it
+    is text at all; then the whole of it. Each refusal names the file and the
+    limit it broke, because "it did not work" sends a reader looking in the
+    wrong place — and the sentence for an over-size file is the CALLER'S, not
+    a general one, because what a caller can do about it depends on which
+    route asked.
+    """
+    try:
+        size = resolved.stat().st_size
+    except OSError as exc:
+        return None, 0, (400, {"error": _unreadable_error(relative, exc)})
+    if size > CODE_MAX_FILE_BYTES:
+        return None, size, (
+            400,
+            {"error": _over_size_error(relative, size, over_size_advice)},
+        )
+    try:
+        with open(resolved, "rb") as handle:
+            head = handle.read(CODE_BINARY_SNIFF_BYTES)
+            rest = handle.read()
+    except OSError as exc:
+        return None, size, (400, {"error": _unreadable_error(relative, exc)})
+    if _looks_binary(head):
+        return None, size, (400, {"error": _not_text_error(relative)})
+    return (head + rest).decode("utf-8", errors="replace"), size, None
+
+
+def _read_line_window(
+    resolved: Path, relative: str, first: int, last: int | None
+) -> tuple[list[str] | None, tuple[int, dict[str, Any]] | None]:
+    """Lines ``first`` to ``last`` of a file too big to hand back whole.
+
+    A block at a time: count the newlines, keep only the lines asked for, stop
+    at the last of them. So what this costs is the size of the window, not the
+    size of the file, and a reader facing a three-hundred-kilobyte file gets
+    the part it needs instead of a refusal telling it to do something that
+    cannot work.
+
+    Three walls, each with its own sentence: the file must still be text, the
+    lines kept must still come to less than the byte limit, and the walk stops
+    after :data:`CODE_READ_SCAN_BYTES` and says where it stopped.
+    """
+    kept: list[str] = []
+    kept_bytes = 0
+    number = 1
+    scanned = 0
+    try:
+        with open(resolved, "rb") as handle:
+            block = handle.read(CODE_BINARY_SNIFF_BYTES)
+            if _looks_binary(block):
+                return None, (400, {"error": _not_text_error(relative)})
+            buffer = block
+            scanned = len(block)
+            while True:
+                newline = buffer.find(b"\n")
+                while newline != -1:
+                    raw, buffer = buffer[:newline], buffer[newline + 1 :]
+                    if number >= first:
+                        kept.append(_decode_line(raw))
+                        kept_bytes += len(raw) + 1
+                        if kept_bytes > CODE_MAX_FILE_BYTES:
+                            return None, (400, {"error": _window_too_big(relative)})
+                    number += 1
+                    if last is not None and number > last:
+                        return kept, None
+                    newline = buffer.find(b"\n")
+                if scanned >= CODE_READ_SCAN_BYTES:
+                    return None, (
+                        400,
+                        {
+                            "error": (
+                                f"this door read the first {scanned} bytes of "
+                                f"{relative} looking for the lines you asked "
+                                "for and stopped there, because it reads no "
+                                f"further than {CODE_READ_SCAN_BYTES} bytes "
+                                "into a file this size — ask for earlier lines"
+                            )
+                        },
+                    )
+                chunk = handle.read(CODE_READ_CHUNK_BYTES)
+                if not chunk:
+                    break
+                buffer += chunk
+                scanned += len(chunk)
+            if buffer and number >= first:
+                # The last line of a file that does not end in a newline. It
+                # is held to the same limit as every other line, because a
+                # minified file IS one line of half a megabyte and letting
+                # this one through would hand back more than the whole-file
+                # cap allows.
+                kept_bytes += len(buffer)
+                if kept_bytes > CODE_MAX_FILE_BYTES:
+                    return None, (400, {"error": _window_too_big(relative)})
+                kept.append(_decode_line(buffer))
+    except OSError as exc:
+        return None, (400, {"error": _unreadable_error(relative, exc)})
+    return kept, None
+
+
+def _window_too_big(relative: str) -> str:
+    """The window keeps the same byte limit the whole file would have."""
+    return (
+        f"the lines you asked for from {relative} come to more than this "
+        f"door's limit of {CODE_MAX_FILE_BYTES} bytes — ask for fewer lines"
+    )
+
+
+def _decode_line(raw: bytes) -> str:
+    """One line's bytes as text, with a Windows line ending folded in."""
+    if raw.endswith(b"\r"):
+        raw = raw[:-1]
+    return raw.decode("utf-8", errors="replace")
+
+
+def _read_file_lines(
+    resolved: Path, relative: str, first: int | None, last: int | None
+) -> tuple[list[str] | None, int, bool, tuple[int, dict[str, Any]] | None]:
+    """The lines of one tracked file: ``(lines, size, partial, None)``.
+
+    Whole when the file is small enough to hand back whole. When it is over
+    the byte cap, a caller that asked for a line range gets exactly those
+    lines and ``partial`` comes back true, so the route can say plainly that
+    the rest of the file was never read; a caller that asked for no range is
+    refused with a sentence whose advice actually works.
+    """
+    try:
+        size = resolved.stat().st_size
+    except OSError as exc:
+        return None, 0, False, (400, {"error": _unreadable_error(relative, exc)})
+    if size > CODE_MAX_FILE_BYTES:
+        if first is None and last is None:
+            return None, size, False, (
+                400,
+                {"error": _over_size_error(relative, size, OVER_SIZE_READ_ADVICE)},
+            )
+        kept, refusal = _read_line_window(resolved, relative, first or 1, last)
+        if refusal is not None or kept is None:
+            return None, size, True, refusal or (
+                500,
+                {"error": f"{relative} could not be read"},
+            )
+        return kept, size, True, None
+    text, _size, refusal = _read_text_file(resolved, relative)
+    if refusal is not None or text is None:
+        return None, size, False, refusal or (
+            500,
+            {"error": f"{relative} could not be read"},
+        )
+    return _split_lines(text), size, False, None
+
+
+def process_code_list_files_request(
+    payload: Any, *, config: ForgeConfig
+) -> tuple[int, dict[str, Any]]:
+    """``{repo, under?}`` → the repository's tracked files, sorted.
+
+    What git tracks is the repository's own statement of what belongs to it,
+    so this is the honest answer to "what is in here?" without an exclusion
+    list guessing at caches and build output. ``under`` narrows it to one
+    directory. The list is capped and the answer says when the cap was
+    reached. Never raises.
+    """
+    if not isinstance(payload, dict):
+        return 400, {"error": "request body must be a JSON object"}
+    repo_path, tracked, refusal = _code_repo_and_files(payload, config)
+    if refusal is not None or repo_path is None or tracked is None:
+        return refusal or (500, {"error": "the sidecar could not read the repository"})
+    prefix, error = _code_under_error(repo_path, payload.get("under"))
+    if error:
+        return 400, {"error": error}
+    chosen = _under_filter(tracked, prefix)
+    capped = len(chosen) > CODE_MAX_TRACKED_PATHS
+    return 200, {
+        "files": chosen[:CODE_MAX_TRACKED_PATHS],
+        "count": min(len(chosen), CODE_MAX_TRACKED_PATHS),
+        "total_tracked": len(tracked),
+        "under": prefix,
+        "capped": capped,
+        "cap": CODE_MAX_TRACKED_PATHS,
+    }
+
+
+def process_code_read_file_request(
+    payload: Any, *, config: ForgeConfig
+) -> tuple[int, dict[str, Any]]:
+    """``{repo, path, first_line?, last_line?}`` → one tracked file's text.
+
+    The path is fenced for its spelling, resolved and compared against the
+    repository root (so a link out of the tree is refused), and must be a file
+    git TRACKS — both the path sent and the path it lands on once every link
+    has been followed, so a tracked link to an untracked file beside it is
+    refused rather than served. A file that is not text is refused in one
+    sentence rather than half-served.
+
+    A file over the byte cap is served a LINE RANGE at a time: ask for one and
+    exactly those lines come back, with ``partial`` true, ``total_lines``
+    null — the rest of the file was never read, so its length is not known
+    here — and a note saying so. Ask for no range and it is refused, with the
+    same advice, which works. Line numbers are the file's own, counted on
+    newlines exactly as git, grep and every editor count them. Never raises.
+    """
+    if not isinstance(payload, dict):
+        return 400, {"error": "request body must be a JSON object"}
+    repo_path, tracked, refusal = _code_repo_and_files(payload, config)
+    if refusal is not None or repo_path is None or tracked is None:
+        return refusal or (500, {"error": "the sidecar could not read the repository"})
+    relative = payload.get("path")
+    error = _relative_path_error(relative, what="path")
+    if error:
+        return 400, {"error": error}
+    relative = str(relative)
+    resolved, error = _resolve_inside_repo(repo_path, relative, what="path")
+    if error or resolved is None:
+        return 400, {"error": error}
+    tracked_set = set(tracked)
+    if relative not in tracked_set:
+        return 400, {
+            "error": (
+                f"git does not track {relative} in this repository, so this "
+                "door will not read it — it serves the repository's own "
+                "committed files and nothing else"
+            )
+        }
+    # The same question asked of the path this one LANDS on, after every link
+    # has been followed. Tracking the link is not tracking the file.
+    error = _resolved_not_tracked_error(repo_path, resolved, relative, tracked_set)
+    if error:
+        return 400, {"error": error}
+    first, error = _positive_int(payload.get("first_line"), what="first_line")
+    if error:
+        return 400, {"error": error}
+    last, error = _positive_int(payload.get("last_line"), what="last_line")
+    if error:
+        return 400, {"error": error}
+    if first is not None and last is not None and last < first:
+        return 400, {
+            "error": (
+                f"'last_line' {last} is before 'first_line' {first}, so there "
+                "are no lines to read"
+            )
+        }
+    lines, size, partial, refusal = _read_file_lines(resolved, relative, first, last)
+    if refusal is not None or lines is None:
+        return refusal or (500, {"error": f"{relative} could not be read"})
+    start = (first or 1) - 1
+    note: str | None = None
+    if partial:
+        # Only the window was read, so the file's own length is not known
+        # from here and is answered as null rather than as the window's
+        # length, which would be a lie a reader could not check.
+        chosen = lines
+        total: int | None = None
+        if not chosen:
+            return 400, {
+                "error": (
+                    f"'first_line' {start + 1} is past the end of {relative}, "
+                    "which has fewer lines than that"
+                )
+            }
+        note = (
+            f"{relative} is {size} bytes, over this door's limit of "
+            f"{CODE_MAX_FILE_BYTES} bytes, so only the lines you asked for "
+            "were read — the number of lines in the whole file is not known "
+            "from here"
+        )
+    else:
+        if start >= len(lines) and lines:
+            return 400, {
+                "error": (
+                    f"'first_line' {start + 1} is past the end of {relative}, "
+                    f"which has {len(lines)} lines"
+                )
+            }
+        end = last if last is not None else len(lines)
+        chosen = lines[start:end]
+        total = len(lines)
+    return 200, {
+        "path": relative,
+        "content": "\n".join(chosen) + ("\n" if chosen else ""),
+        "bytes": size,
+        "total_lines": total,
+        "first_line": start + 1,
+        "last_line": start + len(chosen),
+        "partial": partial,
+        "note": note,
+    }
+
+
+def _import_statements(source: str) -> list[dict[str, str]]:
+    """Every import in ``source``, by walking the syntax tree.
+
+    Python's own parser, never a text search: a line inside a string or a
+    comment is not an import, and a search cannot tell the difference. Raises
+    ``SyntaxError`` when the file does not parse, which the caller turns into
+    a plain sentence naming the file.
+    """
+    found: list[dict[str, str]] = []
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                statement = f"import {alias.name}"
+                if alias.asname:
+                    statement += f" as {alias.asname}"
+                found.append(
+                    {
+                        "statement": statement,
+                        "module": alias.name,
+                        "kind": _import_kind(alias.name),
+                    }
+                )
+        elif isinstance(node, ast.ImportFrom):
+            module = "." * (node.level or 0) + (node.module or "")
+            names = ", ".join(
+                alias.name + (f" as {alias.asname}" if alias.asname else "")
+                for alias in node.names
+            )
+            found.append(
+                {
+                    "statement": f"from {module} import {names}",
+                    "module": module,
+                    "kind": _import_kind(module),
+                }
+            )
+    return found
+
+
+def _import_kind(module: str) -> str:
+    """``local`` for a relative import, ``stdlib`` for a name Python ships,
+    ``third-party`` for everything else — the same three words the seats'
+    own reader uses, so an answer from this door reads exactly like one read
+    beside the repository."""
+    if not module or module.startswith("."):
+        return "local"
+    top = module.split(".")[0]
+    names: frozenset[str] = getattr(sys, "stdlib_module_names", frozenset())
+    return "stdlib" if top in names else "third-party"
+
+
+def process_code_imports_request(
+    payload: Any, *, config: ForgeConfig
+) -> tuple[int, dict[str, Any]]:
+    """``{repo, path}`` → what one tracked file, or one tracked directory of
+    files, imports — read from the syntax tree, never from the text.
+
+    Python only. A tracked file this door cannot parse that way is NAMED in
+    the answer with the reason ("not a Python file", "it does not parse", "it
+    is a link to a file git does not track"),
+    because a reader who is not told which files were skipped will read the
+    answer as the whole truth. The number of files walked is capped and the
+    answer says when the cap was reached. Never raises.
+    """
+    if not isinstance(payload, dict):
+        return 400, {"error": "request body must be a JSON object"}
+    repo_path, tracked, refusal = _code_repo_and_files(payload, config)
+    if refusal is not None or repo_path is None or tracked is None:
+        return refusal or (500, {"error": "the sidecar could not read the repository"})
+    relative = payload.get("path")
+    error = _relative_path_error(relative, what="path")
+    if error:
+        return 400, {"error": error}
+    relative = str(relative).rstrip("/")
+    resolved, error = _resolve_inside_repo(repo_path, relative, what="path")
+    if error or resolved is None:
+        return 400, {"error": error}
+    tracked_set = set(tracked)
+    if relative in tracked_set:
+        error = _resolved_not_tracked_error(
+            repo_path, resolved, relative, tracked_set
+        )
+        if error:
+            return 400, {"error": error}
+        chosen = [relative]
+    else:
+        chosen = _under_filter(tracked, relative)
+        if not chosen:
+            return 400, {
+                "error": (
+                    f"git does not track {relative} in this repository, and it "
+                    "tracks no files under it either, so there is nothing here "
+                    "to read imports from"
+                )
+            }
+    capped = len(chosen) > CODE_IMPORTS_MAX_FILES
+    chosen = chosen[:CODE_IMPORTS_MAX_FILES]
+    files: list[dict[str, Any]] = []
+    for path in chosen:
+        entry: dict[str, Any] = {"path": path, "imports": []}
+        if Path(path).suffix not in CODE_PYTHON_SUFFIXES:
+            entry["language"] = "other"
+            entry["note"] = (
+                f"{path} is not a Python file; this door reads imports by "
+                "parsing Python and does not guess at other languages"
+            )
+            files.append(entry)
+            continue
+        entry["language"] = "python"
+        inside, sub_error = _resolve_inside_repo(repo_path, path, what="path")
+        if sub_error or inside is None:
+            entry["note"] = sub_error
+            files.append(entry)
+            continue
+        # A tracked link inside a walked directory gets the same answer as one
+        # asked for by name: the file it lands on has to be tracked as well.
+        sub_error = _resolved_not_tracked_error(repo_path, inside, path, tracked_set)
+        if sub_error:
+            entry["note"] = sub_error
+            files.append(entry)
+            continue
+        text, _size, refusal = _read_text_file(
+            inside, path, over_size_advice=OVER_SIZE_IMPORTS_ADVICE
+        )
+        if refusal is not None:
+            entry["note"] = refusal[1].get("error")
+            files.append(entry)
+            continue
+        if text is None:
+            entry["note"] = f"{path} could not be read"
+            files.append(entry)
+            continue
+        try:
+            entry["imports"] = _import_statements(text)
+        except SyntaxError as exc:
+            entry["note"] = (
+                f"{path} does not parse as Python (line {exc.lineno}: "
+                f"{exc.msg}), so its imports were not read"
+            )
+        except (ValueError, RecursionError) as exc:
+            entry["note"] = (
+                f"{path} could not be parsed as Python: {type(exc).__name__}: {exc}"
+            )
+        files.append(entry)
+    return 200, {
+        "path": relative,
+        "files": files,
+        "files_walked": len(files),
+        "capped": capped,
+        "cap": CODE_IMPORTS_MAX_FILES,
+    }
+
+
+# --- the one limit a clock cannot keep -------------------------------------
+#
+# Everything else this door promises is kept by reading a number. The search's
+# time limit cannot be, for one line at a time: Python's engine backtracks
+# inside a single call, that call holds the interpreter, and no timer, thread
+# or signal in this process can take it back. So the pattern's own shape is
+# read BEFORE any file is, and the shapes whose work grows explosively are
+# refused. There are two of those shapes, and both were measured on this
+# machine before this code was written:
+#
+#   * A GROUP REPEATED AROUND SOMETHING THAT ITSELF REPEATS or offers
+#     alternatives — ``(a+)+``, ``(\w+\.)+`` — where the engine can split the
+#     same text more ways at every extra character. ``(a+)+$`` against a
+#     sixty-four-character line of a's does not finish.
+#   * TWO REPEATED PIECES THAT CAN BOTH MATCH THE SAME CHARACTER, side by side
+#     with only optional pieces between them — ``a+a+a+a+a+$``, or the far more
+#     ordinary-looking ``\s*\w+\s*\w+\s*\w+$``. Neither finishes on a line of
+#     five hundred characters, which is this door's own line cap, so the cap
+#     does not save us and the clock cannot.
+#
+# Two repeated pieces that CANNOT match the same character are not ambiguous
+# and are not refused, which is why the patterns people actually write —
+# ``def\s+\w+\s*\(``, ``^\s*import\s+os``, ``[a-z]+_[a-z]+`` — all still run.
+#
+# The shape is read with the parser and the compiler Python's own ``re`` module
+# uses, so this is the engine's understanding of the pattern rather than a
+# guess at its text. If either is ever missing, or a pattern defeats the
+# reading, the fallback refuses any quantifier applied to a group at all, and a
+# piece whose characters cannot be worked out counts as matching everything —
+# both of which refuse more than they need to, and never less. This side fails
+# towards refusing.
+
+try:  # pragma: no cover - present in every Python this service runs on
+    from re import _compiler as _re_compiler  # type: ignore[attr-defined]
+    from re import _parser as _re_parser  # type: ignore[attr-defined]
+except Exception:  # pragma: no cover - a Python without the private parser
+    _re_parser = None  # type: ignore[assignment]
+    _re_compiler = None  # type: ignore[assignment]
+
+#: The fallback used only if the parser above is missing: a quantifier applied
+#: to a group.
+_QUANTIFIED_GROUP = re.compile(r"\)(?:[*+]|\{\d+,\})")
+
+#: What the parser calls "repeat this".
+_REPEAT_OPS = frozenset({"MAX_REPEAT", "MIN_REPEAT", "POSSESSIVE_REPEAT"})
+
+
+def _pattern_parts(arguments: Any) -> list[Any]:
+    """Every sub-pattern buried in one parsed node's arguments."""
+    if _re_parser is not None and isinstance(arguments, _re_parser.SubPattern):
+        return [arguments]
+    if isinstance(arguments, (tuple, list)):
+        found: list[Any] = []
+        for item in arguments:
+            found.extend(_pattern_parts(item))
+        return found
+    return []
+
+
+def _repeats_or_chooses(parsed: Any) -> bool:
+    """True if this piece of a pattern repeats anything or offers a choice."""
+    for opcode, arguments in parsed:
+        name = getattr(opcode, "name", str(opcode))
+        if name in _REPEAT_OPS:
+            _low, high, body = arguments
+            if high > 1 or _repeats_or_chooses(body):
+                return True
+        elif name == "BRANCH":
+            return True
+        elif any(_repeats_or_chooses(part) for part in _pattern_parts(arguments)):
+            return True
+    return False
+
+
+def _work_can_explode(parsed: Any) -> bool:
+    """True if a repeated group wraps something that repeats or chooses."""
+    for opcode, arguments in parsed:
+        name = getattr(opcode, "name", str(opcode))
+        if name in _REPEAT_OPS:
+            _low, high, body = arguments
+            if high > 1 and _repeats_or_chooses(body):
+                return True
+            if _work_can_explode(body):
+                return True
+        elif any(_work_can_explode(part) for part in _pattern_parts(arguments)):
+            return True
+    return False
+
+
+#: The characters the second rule asks about. One of each kind a source file
+#: is made of is enough to tell two repeated pieces apart; a piece that none of
+#: them fits is treated as matching everything, which refuses more, not less.
+_SAMPLE_CHARACTERS: tuple[str, ...] = tuple(
+    [chr(code) for code in range(32, 127)] + ["\t", "\n", "é", "€"]
+)
+
+
+def _characters_matched(body: Any, flags: int) -> frozenset[str] | None:
+    """Which sample characters this piece of a pattern can begin with.
+
+    ``None`` means "this piece could match anything", which is what a piece
+    this reader cannot work out is treated as.
+    """
+    if _re_compiler is None:
+        return None
+    try:
+        matcher = _re_compiler.compile(body, flags)
+    except Exception:  # noqa: BLE001 — an unreadable piece matches everything
+        return None
+    found = set()
+    for character in _SAMPLE_CHARACTERS:
+        match = matcher.match(character)
+        if match is not None and match.end() > 0:
+            found.add(character)
+    return frozenset(found) or None
+
+
+def _can_match_nothing(opcode: Any, arguments: Any) -> bool:
+    """True if this node can be skipped over without matching a character."""
+    name = getattr(opcode, "name", str(opcode))
+    if name in _REPEAT_OPS:
+        return arguments[0] == 0
+    if name in {"AT", "ASSERT", "ASSERT_NOT"}:
+        return True
+    if name == "BRANCH":
+        return any(
+            all(_can_match_nothing(*node) for node in branch)
+            for branch in arguments[1]
+        )
+    parts = _pattern_parts(arguments)
+    if name == "SUBPATTERN" and parts:
+        return all(_can_match_nothing(*node) for node in parts[0])
+    return False
+
+
+def _repeats_overlap(parsed: Any, flags: int) -> bool:
+    """True if one run of the pattern repeats two pieces side by side that can
+    both match the same character — the shape whose work grows with every
+    character of the line, with only optional pieces allowed between them."""
+    nodes = list(parsed)
+    repeats: list[tuple[int, frozenset[str] | None]] = []
+    for index, (opcode, arguments) in enumerate(nodes):
+        name = getattr(opcode, "name", str(opcode))
+        if name in _REPEAT_OPS and arguments[1] > 1:
+            repeats.append((index, _characters_matched(arguments[2], flags)))
+    for first in range(len(repeats)):
+        for second in range(first + 1, len(repeats)):
+            left, left_chars = repeats[first]
+            right, right_chars = repeats[second]
+            if not all(
+                _can_match_nothing(*node) for node in nodes[left + 1 : right]
+            ):
+                continue
+            if (
+                left_chars is None
+                or right_chars is None
+                or left_chars & right_chars
+            ):
+                return True
+    return any(
+        _repeats_overlap(part, flags)
+        for _opcode, arguments in nodes
+        for part in _pattern_parts(arguments)
+    )
+
+
+def _explosive_pattern_error(pattern: str, flags: int) -> str | None:
+    """One plain sentence if this pattern's shape could outlast every limit.
+
+    ``None`` means the pattern is a shape the search's clock can hold. Never
+    raises: a pattern that cannot be parsed here has already been refused by
+    the compiler above, with the engine's own reason.
+    """
+    nested = "repeats a group whose own content repeats or offers alternatives"
+    side_by_side = (
+        "repeats two pieces side by side that can both match the same "
+        "characters"
+    )
+    try:
+        if _re_parser is None:
+            raise RuntimeError("this Python has no regular-expression parser")
+        parsed = _re_parser.parse(pattern, flags)
+        if _work_can_explode(parsed):
+            shape = nested
+        elif _repeats_overlap(parsed, flags):
+            shape = side_by_side
+        else:
+            return None
+    except re.error:  # already refused above, with the engine's own reason
+        return None
+    except Exception:  # noqa: BLE001 — a shape this door cannot read is read crudely
+        if _QUANTIFIED_GROUP.search(pattern) is None:
+            return None
+        shape = nested
+    return (
+        f"'pattern' {pattern!r} {shape}, and that shape can make the search "
+        "engine's work grow past any time limit this door is able to enforce, "
+        "so it is refused before any file is read — send 'fixed_string': true "
+        "to search for it as plain text, or write it so that no repeated piece "
+        "can be matched two ways"
+    )
+
+
+def process_code_search_request(
+    payload: Any, *, config: ForgeConfig
+) -> tuple[int, dict[str, Any]]:
+    """``{repo, pattern, under?, fixed_string?, case_insensitive?,
+    max_results?}`` → matching lines across the repository's tracked files.
+
+    Python's own regular expressions over files this service reads itself:
+    there is no grep, no shell and no program of any kind started here — git
+    is asked once for the tracked listing and never again, so the walk costs
+    no processes at all. Only files git tracks are opened, and a tracked link
+    is opened only when the file it lands on is tracked too, so no line of an
+    untracked file can come back as a match. A
+    pattern that does not compile is refused with the reason the regular
+    expression engine gave, so the caller can fix it. ``fixed_string`` asks
+    for the pattern to be taken literally, which is what somebody searching
+    for ``get_user(`` wants. Matches, the length of each searched and returned
+    line and the time spent are all capped, and the answer says which cap it
+    met. Never raises.
+
+    The time limit is read before every file AND before every line, so a
+    search always ends and says whether it ended early. The one thing no clock
+    in this process can interrupt is a single ``search()`` call inside the
+    engine, so two other limits stand there instead. At most
+    :data:`CODE_SEARCH_MAX_LINE_CHARS` characters of any one line are handed to
+    the engine, and ``long_lines_partly_searched`` counts the lines that were
+    longer than that, so a caller is never told a whole line was searched when
+    part of it was. And a pattern of either shape whose work grows with every
+    character of the line — a group repeated around something that itself
+    repeats, or two repeated pieces side by side that can both match the same
+    character — is refused in one sentence before any file is read. A pattern
+    that passes both checks and still outlasts the clock is possible in
+    principle; both shapes we have been able to make do that are refused here.
+    """
+    if not isinstance(payload, dict):
+        return 400, {"error": "request body must be a JSON object"}
+    repo_path, tracked, refusal = _code_repo_and_files(payload, config)
+    if refusal is not None or repo_path is None or tracked is None:
+        return refusal or (500, {"error": "the sidecar could not read the repository"})
+    pattern = payload.get("pattern")
+    if not isinstance(pattern, str) or not pattern.strip():
+        return 400, {"error": "'pattern' is required (the text to search for)"}
+    if len(pattern) > CODE_SEARCH_MAX_PATTERN_CHARS:
+        return 400, {
+            "error": (
+                f"'pattern' is {len(pattern)} characters, over this door's "
+                f"limit of {CODE_SEARCH_MAX_PATTERN_CHARS}"
+            )
+        }
+    fixed = bool(payload.get("fixed_string", False))
+    flags = re.IGNORECASE if bool(payload.get("case_insensitive", False)) else 0
+    try:
+        compiled = re.compile(re.escape(pattern) if fixed else pattern, flags)
+    except re.error as exc:
+        return 400, {
+            "error": (
+                f"'pattern' {pattern!r} is not a regular expression this door "
+                f"can use ({exc}) — fix it, or send 'fixed_string': true to "
+                "search for it as plain text"
+            )
+        }
+    if not fixed:
+        explosive = _explosive_pattern_error(pattern, flags)
+        if explosive is not None:
+            return 400, {"error": explosive}
+    prefix, error = _code_under_error(repo_path, payload.get("under"))
+    if error:
+        return 400, {"error": error}
+    wanted, error = _positive_int(payload.get("max_results"), what="max_results")
+    if error:
+        return 400, {"error": error}
+    limit = min(wanted or CODE_SEARCH_MAX_MATCHES, CODE_SEARCH_MAX_MATCHES)
+
+    # The tracked list is turned into a set ONCE, here, and every file in the
+    # walk below is tested against it in memory. The walk must never start a
+    # process per file: this door pays for git exactly once a request (the
+    # listing above), and a repository with three thousand tracked files would
+    # otherwise be three thousand git processes for one search.
+    tracked_set = set(tracked)
+
+    matches: list[dict[str, Any]] = []
+    files_searched = 0
+    long_lines = 0
+    capped = False
+    timed_out = False
+    deadline = time.monotonic() + CODE_SEARCH_TIMEOUT_SECONDS
+    for path in _under_filter(tracked, prefix):
+        if len(matches) >= limit:
+            capped = True
+            break
+        if time.monotonic() > deadline:
+            timed_out = True
+            break
+        resolved, _error = _resolve_inside_repo(repo_path, path, what="path")
+        if resolved is None or not resolved.is_file():
+            continue
+        # A tracked link whose target git does not track is passed over
+        # unsearched, exactly as a link out of the tree already is: a search
+        # that matched a line of an untracked file would hand back its
+        # contents, which is the one thing this door must never do.
+        if _resolved_not_tracked_error(repo_path, resolved, path, tracked_set):
+            continue
+        try:
+            if resolved.stat().st_size > CODE_MAX_FILE_BYTES:
+                continue
+            data = resolved.read_bytes()
+        except OSError:
+            continue
+        if _looks_binary(data):
+            continue
+        files_searched += 1
+        for number, line in enumerate(
+            _split_lines(data.decode("utf-8", errors="replace")), start=1
+        ):
+            # The clock is read here as well as once per file, because one
+            # file can carry more lines than the whole rest of a repository
+            # and a limit checked only at a file boundary is not a limit.
+            if time.monotonic() > deadline:
+                timed_out = True
+                break
+            # Only this much of the line is handed to the engine, and the
+            # count below means the answer can say so.
+            over_cap = len(line) > CODE_SEARCH_MAX_LINE_CHARS
+            if over_cap:
+                long_lines += 1
+            searched = line[:CODE_SEARCH_MAX_LINE_CHARS] if over_cap else line
+            if not compiled.search(searched):
+                continue
+            if len(matches) >= limit:
+                capped = True
+                break
+            matches.append(
+                {
+                    "path": path,
+                    "line": number,
+                    "text": searched,
+                    "line_truncated": over_cap,
+                }
+            )
+        if timed_out:
+            break
+    return 200, {
+        "pattern": pattern,
+        "fixed_string": fixed,
+        "under": prefix,
+        "matches": matches,
+        "count": len(matches),
+        "files_searched": files_searched,
+        "capped": capped,
+        "cap": limit,
+        "line_cap": CODE_SEARCH_MAX_LINE_CHARS,
+        "long_lines_partly_searched": long_lines,
+        "timed_out": timed_out,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Config resolution (re-read per request so path changes are picked up)
 # ---------------------------------------------------------------------------
 
@@ -3737,6 +5014,10 @@ class DeploySidecarHandler(BaseHTTPRequestHandler):
                 RECEIPTS_EXPORT_ROUTE,
                 STAMPS_EVIDENCE_ROUTE,
                 GUARDKIT_LEG_ROUTE,
+                CODE_LIST_FILES_ROUTE,
+                CODE_READ_FILE_ROUTE,
+                CODE_IMPORTS_ROUTE,
+                CODE_SEARCH_ROUTE,
             ):
                 self._write_json(404, {"error": f"no such path: {self.path}"})
                 return
@@ -3807,6 +5088,16 @@ class DeploySidecarHandler(BaseHTTPRequestHandler):
                 )
             elif route == RECEIPTS_EXPORT_ROUTE:
                 status, body = process_receipts_export_request(payload, config=config)
+            elif route == CODE_LIST_FILES_ROUTE:
+                status, body = process_code_list_files_request(
+                    payload, config=config
+                )
+            elif route == CODE_READ_FILE_ROUTE:
+                status, body = process_code_read_file_request(payload, config=config)
+            elif route == CODE_IMPORTS_ROUTE:
+                status, body = process_code_imports_request(payload, config=config)
+            elif route == CODE_SEARCH_ROUTE:
+                status, body = process_code_search_request(payload, config=config)
             elif route == GUARDKIT_LEG_ROUTE:
                 status, body = process_guardkit_leg_request(
                     payload,
@@ -3965,6 +5256,23 @@ __all__ = [
     "LEG_TIMEOUT_MAX",
     "LEG_MAX_PATHS",
     "process_guardkit_leg_request",
+    "CODE_LIST_FILES_ROUTE",
+    "CODE_READ_FILE_ROUTE",
+    "CODE_IMPORTS_ROUTE",
+    "CODE_SEARCH_ROUTE",
+    "CODE_GIT_TIMEOUT_SECONDS",
+    "CODE_MAX_TRACKED_PATHS",
+    "CODE_MAX_FILE_BYTES",
+    "CODE_IMPORTS_MAX_FILES",
+    "CODE_SEARCH_MAX_MATCHES",
+    "CODE_SEARCH_MAX_LINE_CHARS",
+    "CODE_SEARCH_TIMEOUT_SECONDS",
+    "CODE_SEARCH_MAX_PATTERN_CHARS",
+    "CODE_PYTHON_SUFFIXES",
+    "process_code_list_files_request",
+    "process_code_read_file_request",
+    "process_code_imports_request",
+    "process_code_search_request",
     "default_config_loader",
     "DeploySidecarHandler",
     "build_server",
