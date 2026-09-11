@@ -21,7 +21,9 @@ Six halves are proven here:
   script's environment exactly when they are set;
 * ``forge register-repo --deploy-port`` emits them with this repository's own
   ports and paths, and ships the bootstrap byte for byte;
-* the host unit that holds the bootstrap open is shaped like the keeper;
+* the host unit that holds the bootstrap open is shaped like the keeper, and
+  its stop reaches inside the sandbox — proven by running its own ExecStop
+  command line against a real process of this test's own making;
 * the systemd README's inventory of the runner's ledger touches (rule 72)
   cites lines that exist and still say what is quoted.
 
@@ -35,6 +37,7 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -973,12 +976,36 @@ def _unit_lines(name: str) -> list[str]:
     return [line.strip() for line in text.splitlines() if line.strip() and not line.startswith("#")]
 
 
+def _unit_comments(name: str) -> str:
+    """Everything the unit file says to a person reading it, comments only."""
+    text = (REPO_ROOT / "ops" / "systemd" / name).read_text(encoding="utf-8")
+    return "\n".join(line for line in text.splitlines() if line.lstrip().startswith("#"))
+
+
+def _one_line(prefix: str) -> str:
+    """The unit's single line starting with ``prefix``, value only."""
+    lines = [line for line in _unit_lines(RUNNER_UNIT) if line.startswith(prefix)]
+    assert len(lines) == 1, f"expected exactly one {prefix} line, found {lines}"
+    return lines[0].split("=", 1)[1]
+
+
+def _sandbox_argv(value: str, instance: str) -> list[str]:
+    """An Exec line's command as argv, with systemd's prefixes and %i resolved."""
+    return shlex.split(value.lstrip("-@+!:").replace("%i", instance))
+
+
+RUNNER_UNIT = "forge-sandbox-runner@.service"
+
+#: The start line, which this lane must leave exactly as it found it.
+EXEC_START = "/usr/bin/sbx exec %i deploy/sandbox-runner.sh"
+
+
 class TestTheRunnerUnit:
     def test_it_is_shaped_like_the_keeper(self):
-        runner = _unit_lines("forge-sandbox-runner@.service")
+        runner = _unit_lines(RUNNER_UNIT)
         keeper = _unit_lines("forge-sandbox-keeper@.service")
 
-        assert "ExecStart=/usr/bin/sbx exec %i deploy/sandbox-runner.sh" in runner
+        assert f"ExecStart={EXEC_START}" in runner
         assert "Restart=always" in runner
         assert "KillMode=process" in runner
         assert "Type=simple" in runner
@@ -987,14 +1014,177 @@ class TestTheRunnerUnit:
         assert path_lines == [line for line in keeper if line.startswith("Environment=PATH=")]
 
     def test_it_runs_nothing_of_the_repository_on_the_host(self):
-        # The only command the unit runs is the session inside the sandbox.
-        runner = _unit_lines("forge-sandbox-runner@.service")
+        # Every command the unit runs goes through the sandbox door: there is
+        # no line here that runs any of the repository's own code on the host.
+        runner = _unit_lines(RUNNER_UNIT)
         execs = [line for line in runner if line.startswith("Exec")]
-        assert execs == ["ExecStart=/usr/bin/sbx exec %i deploy/sandbox-runner.sh"]
+        assert execs == [
+            f"ExecStart={EXEC_START}",
+            "ExecStop=-/usr/bin/sbx exec %i deploy/sandbox-runner.sh stop",
+        ]
+        for line in execs:
+            argv = _sandbox_argv(line.split("=", 1)[1], "some-sandbox")
+            assert argv[:2] == ["/usr/bin/sbx", "exec"]
+
+    def test_the_start_line_is_untouched_by_the_stop_lane(self):
+        assert _one_line("ExecStart=") == EXEC_START
+
+    def test_stopping_it_reaches_inside_the_same_sandbox(self):
+        # The stop has to end the work inside the sandbox, not just the client
+        # on the host holding the session open.
+        stop = _one_line("ExecStop=")
+        assert "sbx exec %i" in stop
+        start_argv = _sandbox_argv(_one_line("ExecStart="), "api-test-deploy")
+        stop_argv = _sandbox_argv(stop, "api-test-deploy")
+        # Same program, same door, same sandbox, same script — one word more.
+        door = ["/usr/bin/sbx", "exec", "api-test-deploy"]
+        assert start_argv[:3] == door
+        assert stop_argv[:3] == door
+        assert stop_argv[3] == start_argv[3] == "deploy/sandbox-runner.sh"
+        assert stop_argv[4:] == ["stop"]
+
+    def test_a_stop_with_nothing_to_stop_does_not_fail_the_unit(self):
+        # systemd's '-' prefix: stopping something already stopped is ordinary.
+        assert _one_line("ExecStop=").startswith("-")
+
+    def test_the_stop_is_bounded_in_time(self):
+        seconds = int(_one_line("TimeoutStopSec="))
+        assert 0 < seconds <= 300
+
+    def test_the_unit_says_in_plain_words_why_the_stop_is_there(self):
+        comments = _unit_comments(RUNNER_UNIT)
+        assert "WHY ExecStop" in comments
+        assert "2026-09-11" in comments
+        # The reason itself: a client on the host, the work inside the sandbox.
+        assert "CLIENT on the host" in comments
+        assert "inside the sandbox" in comments
+        # And which script and mode the unit calls, so nobody has to guess.
+        assert "deploy/sandbox-runner.sh stop" in comments
+        # And one sentence of what it cost.
+        assert "supervisors had piled up" in comments
+
+    def test_the_readme_says_why_stopping_has_to_reach_inside(self):
+        readme = (REPO_ROOT / "ops" / "systemd" / "README.md").read_text(encoding="utf-8")
+        assert "ExecStop=-/usr/bin/sbx exec %i deploy/sandbox-runner.sh stop" in readme
+        assert "Stopping it has to reach inside the sandbox (2026-09-11)" in readme
 
     def test_the_readme_says_how_to_install_it(self):
         readme = (REPO_ROOT / "ops" / "systemd" / "README.md").read_text(encoding="utf-8")
         assert "cp ops/systemd/forge-sandbox-runner@.service ~/.config/systemd/user/" in readme
+
+
+# ---------------------------------------------------------------------------
+# The stop, driven for real: the unit's own ExecStop line against a real
+# process this test started itself
+# ---------------------------------------------------------------------------
+#
+# The command line comes from the unit file, unedited except for the two things
+# that would reach the estate: `%i` becomes a made-up sandbox name, and the
+# program `/usr/bin/sbx` becomes a stand-in script in a temporary folder. Every
+# argument after it is the unit's own. The thing being stopped is a real
+# `sleep` this test started in a temporary folder, standing in for the bootstrap
+# inside the sandbox; the stop really kills it.
+
+FAKE_SBX_DOOR = """#!/usr/bin/env bash
+# Stands in for /usr/bin/sbx. Records the argv, checks it is an `exec` into the
+# sandbox it expects, and runs the named script from the fake repository.
+set -euo pipefail
+printf '%s\\n' "$*" >>"${FAKE_SBX_LOG}"
+[[ "$1" == "exec" ]] || { echo "not an exec: $1" >&2; exit 64; }
+[[ "$2" == "${EXPECTED_SANDBOX}" ]] || { echo "wrong sandbox: $2" >&2; exit 65; }
+script="$3"
+shift 3
+exec "${FAKE_REPO}/${script}" "$@"
+"""
+
+FAKE_BOOTSTRAP_WITH_A_STOP_MODE = """#!/usr/bin/env bash
+# Stands in for the repository's deploy/sandbox-runner.sh, with only the stop
+# mode the unit calls: end what is running and say nothing is wrong when
+# nothing is.
+set -euo pipefail
+if [[ "${1:-run}" != "stop" ]]; then
+  echo "this stand-in only knows how to stop" >&2
+  exit 3
+fi
+if [[ -f "${FAKE_PIDFILE}" ]]; then
+  kill "$(cat "${FAKE_PIDFILE}")" 2>/dev/null || true
+  rm -f "${FAKE_PIDFILE}"
+fi
+exit 0
+"""
+
+
+@pytest.fixture
+def stop_door(tmp_path: Path) -> dict:
+    """A stand-in sandbox door and bootstrap, and the unit's own stop argv."""
+    sandbox_name = "made-up-deploy"
+    bin_dir = tmp_path / "bin"
+    repo = tmp_path / "repo"
+    (repo / "deploy").mkdir(parents=True)
+    bin_dir.mkdir()
+    _write_fake(bin_dir, "sbx", FAKE_SBX_DOOR)
+    _write_fake(repo / "deploy", "sandbox-runner.sh", FAKE_BOOTSTRAP_WITH_A_STOP_MODE)
+
+    argv = _sandbox_argv(_one_line("ExecStop="), sandbox_name)
+    assert argv[0] == "/usr/bin/sbx"
+    argv[0] = str(bin_dir / "sbx")
+
+    log = tmp_path / "sbx.log"
+    pidfile = tmp_path / "supervisor.pid"
+    env = {
+        **os.environ,
+        "FAKE_SBX_LOG": str(log),
+        "FAKE_REPO": str(repo),
+        "FAKE_PIDFILE": str(pidfile),
+        "EXPECTED_SANDBOX": sandbox_name,
+    }
+    return {"argv": argv, "env": env, "log": log, "pidfile": pidfile, "dir": tmp_path}
+
+
+class TestTheStopCommandActuallyStops:
+    def test_it_ends_a_running_supervisor(self, stop_door):
+        # A real process of this test's own making, in a temporary folder,
+        # standing in for the bootstrap that keeps running inside the sandbox.
+        supervisor = subprocess.Popen(
+            ["sleep", "300"], cwd=stop_door["dir"], stdout=subprocess.DEVNULL
+        )
+        try:
+            stop_door["pidfile"].write_text(str(supervisor.pid), encoding="utf-8")
+            assert supervisor.poll() is None
+
+            done = subprocess.run(
+                stop_door["argv"],
+                env=stop_door["env"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+
+            assert done.returncode == 0, done.stderr
+            # It really died, rather than the command merely claiming success.
+            assert supervisor.wait(timeout=10) != 0
+            assert supervisor.poll() is not None
+            # And it was asked through the sandbox door, in the unit's words.
+            assert _log_lines(stop_door["log"]) == [
+                "exec made-up-deploy deploy/sandbox-runner.sh stop"
+            ]
+        finally:
+            if supervisor.poll() is None:
+                supervisor.kill()
+                supervisor.wait(timeout=10)
+
+    def test_stopping_what_is_already_stopped_is_not_a_failure(self, stop_door):
+        # No pidfile: nothing is running in there. Stopping must still succeed,
+        # or `systemctl --user stop` would leave the unit failed.
+        assert not stop_door["pidfile"].exists()
+        done = subprocess.run(
+            stop_door["argv"],
+            env=stop_door["env"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert done.returncode == 0, done.stderr
 
 
 # ---------------------------------------------------------------------------
