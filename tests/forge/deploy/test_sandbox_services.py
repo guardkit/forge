@@ -1071,6 +1071,18 @@ class TestTheRunnerUnit:
         assert "ignore the word" in comments
         assert "TWO supervisors" in comments
 
+    def test_the_unit_says_systemd_runs_the_stop_by_itself(self):
+        # The danger is not only a person typing "stop": with Restart=always,
+        # systemd runs ExecStop itself on every automatic restart, so against an
+        # old bootstrap the pile-up is unattended and repeating. And against the
+        # right bootstrap the two services now bounce on a dropped session where
+        # they used to keep serving. Both have to be written down.
+        comments = _unit_comments(RUNNER_UNIT)
+        assert "no protection" in comments
+        assert "Restart=always with RestartSec=5" in comments
+        assert "on a loop" in comments
+        assert "BOUNCE where they used to keep serving" in comments
+
     def test_the_readme_says_why_stopping_has_to_reach_inside(self):
         readme = (REPO_ROOT / "ops" / "systemd" / "README.md").read_text(encoding="utf-8")
         assert "ExecStop=-/usr/bin/sbx exec %i deploy/sandbox-runner.sh stop" in readme
@@ -1080,6 +1092,12 @@ class TestTheRunnerUnit:
         readme = (REPO_ROOT / "ops" / "systemd" / "README.md").read_text(encoding="utf-8")
         assert "What the operator has to check before installing this unit." in readme
         assert "replace that repository's bootstrap first, then" in readme
+        # And that not typing the word is no protection, because systemd runs
+        # the stop itself on every automatic restart — plus what the unit now
+        # does against a correct bootstrap, which is a real change of behaviour.
+        assert "**Deciding never to type `stop` is not a way round that.**" in readme
+        assert "unattended and repeating" in readme
+        assert "**What changes against the correct bootstrap.**" in readme
 
     def test_the_readme_says_how_to_install_it(self):
         readme = (REPO_ROOT / "ops" / "systemd" / "README.md").read_text(encoding="utf-8")
