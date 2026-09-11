@@ -315,6 +315,15 @@ class TestYamlRoundTrip:
                 "min_available_disk_gb": 20.0,
                 "working_path": None,
             },
+            # ``routine`` — the ROUTINE build's seat (2026-09-11): the model
+            # a routine build's stages run on. Default: no seat named, which
+            # is today's behaviour byte for byte (no '--model' on the
+            # dispatch, so the build system's own default applies). It is a
+            # first-class config section, so the unfiltered round-trip dump
+            # always includes it and this exhaustive fixture must declare it.
+            "routine": {
+                "seat": None,
+            },
             # ``conductor`` — the fix journey's activation flag (the conductor
             # revival) plus its SEAT (the local model every fix-journey leg
             # runs on; conductor-activation design pass §2). Default-OFF with
