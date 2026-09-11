@@ -38,6 +38,17 @@ The narrow contract:
     POST /git/worktree-changed-files {repo, path, base}
               -> {name_status, approval_patch, truncated, head|null,
                   test_patch, test_patch_truncated}
+    POST /code/list-files {repo, under?}
+              -> {files, count, total_tracked, under, capped, cap}
+    POST /code/read-file  {repo, path, first_line?, last_line?}
+              -> {path, content, bytes, total_lines, first_line, last_line}
+    POST /code/imports    {repo, path}
+              -> {path, files: [{path, language, imports, note?}],
+                  files_walked, capped, cap}
+    POST /code/search     {repo, pattern, under?, fixed_string?,
+                           case_insensitive?, max_results?}
+              -> {matches: [{path, line, text, line_truncated}], count,
+                  files_searched, capped, cap, line_cap, timed_out}
 
 The three routes after ``/git/rev-parse`` are the merge press's own git
 (sandbox first, 2026-09-07, rule 89): its ancestry guards, and the lay-out and
@@ -45,6 +56,15 @@ removal of the branch's tree for the candidate check. Each derives the tree's
 place from the repository its ``repo`` key names, so no path a caller sends
 ever reaches git or the filesystem here. See the section above
 :func:`process_git_is_ancestor_request`.
+
+The four ``/code`` routes are THE CODE DOOR (Rich's ruling, 2026-09-11): a
+READ-ONLY way for a plan or architect seat to ask what a repository already
+holds, instead of forge guessing in advance which facts to push at it. They
+run git for one thing — listing the files the repository tracks — and run
+nothing else, write nothing, check nothing out, touch no worktree and execute
+none of the repository's own code. Only files git TRACKS are served, so the
+door can never hand back a virtual environment, a build artefact or a stray
+secret file. See the block above :func:`process_code_list_files_request`.
 
 The three git operations (sandbox first, 2026-09-07, rule 70) make the
 planning chain's commits where the repository lives: the caller declares the
@@ -139,6 +159,7 @@ unit-testable without a live socket. Neither **ever raises** past its boundary.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import concurrent.futures
 import importlib.util
@@ -150,6 +171,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib import import_module
@@ -3631,6 +3653,683 @@ def process_guardkit_leg_request(
 
 
 # ---------------------------------------------------------------------------
+# THE CODE DOOR — FOUR READ-ONLY ROUTES INTO A REPOSITORY'S OWN SOURCE
+# (Rich's ruling, 2026-09-11: do the long-term thing now)
+# ---------------------------------------------------------------------------
+#
+# WHY THIS EXISTS. A plan seat that has never seen the target repository
+# proposed creating a user model, a data-access module and a router that the
+# repository has had since it was born. A file inventory now rides on the
+# description forge pushes to that seat, which stops that exact plan — but a
+# pushed summary is forge guessing in advance what a seat will need, and every
+# gap found later costs another field: architecture rules on 31 August, file
+# paths on 11 September, columns next. The long-term thing is that the seat can
+# ASK. The tools to ask with already exist in specialist-agent (scan a file
+# tree, read a source file, extract imports by syntax tree, search the
+# codebase); what blocks them is that a seat container mounts exactly one
+# directory, its own output, and can see no repository at all. Mounting
+# repositories into a seat container would spend the isolation that makes a
+# seat safe to run untrusted output through, so the seat reads through the
+# repository's OWN sandbox sidecar instead — this service, which already fences
+# paths by repository key and already serves git.
+#
+# THIS DOOR IS READ ONLY. That sentence is the whole of its posture, and every
+# route below keeps it:
+#
+#   * it runs git for ONE thing — listing the files the repository tracks —
+#     and runs no other git command, ever;
+#   * it never writes, never checks out, never creates, moves or removes a
+#     branch, a commit or a worktree, and never touches a worktree at all;
+#   * it never executes anything belonging to the repository — no test, no
+#     script, no driver, no installed package;
+#   * there is no shell anywhere, and the search never shells out to grep: it
+#     is Python's own regular expressions over bytes this service read itself.
+#
+# IT IS GATED EXACTLY AS THE EXISTING GIT ROUTES ARE, for the reason written
+# above the ancestry routes: the wall Rich's rule of 2026-09-07 puts up is
+# about running a REPOSITORY'S OWN CODE on the host, and these routes run none.
+# They are the same class of thing as ``/git/rev-parse`` and
+# ``/git/read-file-from-branch``, which a host sidecar has answered since L1.
+# So a host sidecar answers these too, for the repositories it already serves,
+# and gains no power it did not have.
+#
+# EVERY PATH A CALLER SENDS IS FENCED THREE TIMES. LAW 1 resolves the
+# repository from its key and nothing else, so no caller ever names a
+# directory. :func:`_relative_path_error` refuses anything that is not a plain
+# relative path (no '..', no leading slash, no empty segment) — the same fence
+# the planning routes use. And the path is then RESOLVED and compared against
+# the resolved repository root, so a symbolic link that leaves the tree is
+# refused after resolution even though its spelling looked innocent.
+#
+# AND A FILE IS ONLY SERVED IF GIT TRACKS IT. Tracking is the repository's own
+# statement of what belongs to it (the same argument the pushed inventory
+# makes), so this door can never serve a virtual environment, a build artefact,
+# a local database or a stray secret file that happens to sit in the tree, and
+# no exclusion list has to guess at them.
+#
+# Every refusal is one plain sentence a person can act on, and no route here
+# changes the behaviour of any route above it.
+
+#: The four routes.
+CODE_LIST_FILES_ROUTE: str = "/code/list-files"
+CODE_READ_FILE_ROUTE: str = "/code/read-file"
+CODE_IMPORTS_ROUTE: str = "/code/imports"
+CODE_SEARCH_ROUTE: str = "/code/search"
+
+#: How long the one git command this door runs may take. Listing an index is
+#: fast; this is a wall against a repository on a stalled filesystem, not a
+#: budget anybody is meant to spend.
+CODE_GIT_TIMEOUT_SECONDS: float = 60.0
+
+#: How many tracked paths one listing answers with. Past this the answer is
+#: cut and SAYS it was cut, because a silently short list reads like a whole
+#: repository and is exactly the kind of quiet wrongness this door exists to
+#: end. (api_test tracks 695 files; forge's own main tracks about 3,000.)
+CODE_MAX_TRACKED_PATHS: int = 5_000
+
+#: The largest file this door will hand back, in bytes. A quarter of a
+#: megabyte is a very large source file and a small fraction of a seat's
+#: context; anything bigger is refused in one sentence rather than quietly
+#: truncated, so a reader never mistakes half a file for the whole of it.
+CODE_MAX_FILE_BYTES: int = 262_144
+
+#: How many bytes are sniffed for a null byte before a file is called text.
+CODE_BINARY_SNIFF_BYTES: int = 8_192
+
+#: How many files one imports request parses. A directory of a thousand
+#: modules is a request to read the whole repository one syntax tree at a
+#: time; the answer stops here and says it stopped.
+CODE_IMPORTS_MAX_FILES: int = 200
+
+#: How many matching lines one search answers with, and how much of a single
+#: line comes back. A minified file is one line of half a megabyte, and
+#: without the second cap one match could be the whole answer.
+CODE_SEARCH_MAX_MATCHES: int = 200
+CODE_SEARCH_MAX_LINE_CHARS: int = 500
+
+#: How long a search may spend reading files before it stops and says so. The
+#: search is our own code over a bounded file list, so this is a wall, not a
+#: budget.
+CODE_SEARCH_TIMEOUT_SECONDS: float = 30.0
+
+#: The longest pattern a search may carry. A pattern is a person's sentence,
+#: not a payload.
+CODE_SEARCH_MAX_PATTERN_CHARS: int = 1_000
+
+#: Which file extensions this door parses for imports. Python only — the
+#: syntax-tree reader is Python's own, and a door that guessed at another
+#: language by searching its text would be doing the thing this route exists
+#: to avoid. A file of any other kind is NAMED in the answer, plainly, rather
+#: than skipped or guessed at.
+CODE_PYTHON_SUFFIXES: frozenset[str] = frozenset({".py", ".pyi"})
+
+
+def _code_repo_error(repo_path: Path) -> str | None:
+    """A plain sentence unless ``repo_path`` really is a git repository.
+
+    ``git -C`` walks UP to find a repository, so a configured path that is a
+    plain directory inside somebody else's checkout would otherwise be
+    answered with THAT checkout's files. The repository's own marker is asked
+    for first (a file for a worktree, a directory for a normal clone).
+    """
+    if not repo_path.is_dir():
+        return (
+            f"the repository is configured at {repo_path}, which is not a "
+            "directory on this box"
+        )
+    if not (repo_path / ".git").exists():
+        return (
+            f"{repo_path} is not a git repository (it has no .git), so the "
+            "sidecar cannot tell which files belong to it"
+        )
+    return None
+
+
+def _tracked_files(repo_path: Path) -> tuple[list[str] | None, str | None]:
+    """Every path the repository tracks, sorted — or one plain sentence.
+
+    ONE git command, a fixed argument list, no shell, nothing written:
+    ``git -c safe.directory=* -C <repo> ls-files -z``. ``-z`` is what makes
+    the answer trustworthy — it turns off git's quoting, so a path with a
+    space or a non-ASCII character arrives as itself rather than as a quoted
+    approximation nothing else here would match.
+    """
+    try:
+        completed = subprocess.run(  # noqa: S603 — fixed argv, no shell
+            [
+                "git",
+                "-c",
+                "safe.directory=*",
+                "-C",
+                str(repo_path),
+                "ls-files",
+                "-z",
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=CODE_GIT_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return None, f"sidecar git error: {type(exc).__name__}: {exc}"
+    if completed.returncode != 0:
+        detail = (
+            " ".join((completed.stderr or completed.stdout or "").split())[:200]
+            or "<no output>"
+        )
+        return None, (
+            f"git could not list the tracked files of {repo_path} (it exited "
+            f"{completed.returncode}): {detail}"
+        )
+    return sorted(entry for entry in completed.stdout.split("\0") if entry), None
+
+
+def _resolve_inside_repo(
+    repo_path: Path, relative: str, *, what: str
+) -> tuple[Path | None, str | None]:
+    """The absolute path of ``relative``, refused unless it stays inside.
+
+    The spelling fence above already refuses '..', an absolute path and an
+    empty segment. This is the second half of the same guard and the half a
+    spelling check cannot do: both sides are RESOLVED — every symbolic link
+    followed — and the result must still be the repository root or something
+    under it. A tracked link pointing at somebody's key file outside the tree
+    is refused here, after resolution, however innocent its name looked.
+    """
+    try:
+        root = repo_path.resolve()
+        resolved = (root / relative).resolve()
+    except OSError as exc:
+        return None, (
+            f"'{what}' {relative!r} could not be resolved inside the "
+            f"repository: {type(exc).__name__}: {exc}"
+        )
+    if resolved != root and root not in resolved.parents:
+        return None, (
+            f"'{what}' {relative!r} resolves to {resolved}, which is outside "
+            f"the repository at {root} — this door reads only files inside it"
+        )
+    return resolved, None
+
+
+def _code_repo_and_files(
+    payload: dict[str, Any], config: ForgeConfig
+) -> tuple[Path | None, list[str] | None, tuple[int, dict[str, Any]] | None]:
+    """The four routes' shared opening: the repository, and what it tracks.
+
+    Answers ``(repo_path, tracked, None)`` or ``(None, None, (status, body))``
+    with the refusal already shaped. A caller's mistake is a 400; git failing
+    to answer is a 500, because a listing that could not be read must never be
+    passed off as "this repository tracks nothing".
+    """
+    repo_path, error = _resolve_repo_key(payload, config)
+    if error or repo_path is None:
+        return None, None, (400, {"error": error})
+    error = _code_repo_error(repo_path)
+    if error:
+        return None, None, (400, {"error": error})
+    tracked, error = _tracked_files(repo_path)
+    if error or tracked is None:
+        return None, None, (500, {"error": error})
+    return repo_path, tracked, None
+
+
+def _code_under_error(
+    repo_path: Path, value: Any
+) -> tuple[str | None, str | None]:
+    """The optional ``under`` directory: ``(prefix, None)`` or ``(None, error)``.
+
+    Absent means the whole repository. Present, it is held to the same fence
+    every relative path on this service is held to, resolved inside the tree
+    like any other, and must actually be a directory — a plain sentence is
+    more use than an empty list that could mean either "nothing there" or
+    "you spelled it wrong".
+    """
+    if value is None:
+        return None, None
+    error = _relative_path_error(value, what="under")
+    if error:
+        return None, error
+    resolved, error = _resolve_inside_repo(repo_path, str(value), what="under")
+    if error or resolved is None:
+        return None, error
+    if not resolved.is_dir():
+        return None, (
+            f"'under' {str(value)!r} is not a directory in this repository"
+        )
+    return str(value).rstrip("/"), None
+
+
+def _under_filter(tracked: Sequence[str], prefix: str | None) -> list[str]:
+    """The tracked paths inside ``prefix`` (all of them when it is absent)."""
+    if prefix is None:
+        return list(tracked)
+    head = prefix + "/"
+    return [path for path in tracked if path.startswith(head)]
+
+
+def _positive_int(value: Any, *, what: str) -> tuple[int | None, str | None]:
+    """An optional whole number of at least one, or one plain sentence."""
+    if value is None:
+        return None, None
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None, f"'{what}' must be a whole number of at least 1"
+    if value < 1:
+        return None, f"'{what}' must be a whole number of at least 1"
+    return value, None
+
+
+def _looks_binary(data: bytes) -> bool:
+    """True when the first block carries a null byte — the same test the
+    seats' own reader uses, and the one git itself uses to call a file
+    binary."""
+    return b"\x00" in data[:CODE_BINARY_SNIFF_BYTES]
+
+
+def _read_text_file(
+    resolved: Path, relative: str
+) -> tuple[str | None, int, tuple[int, dict[str, Any]] | None]:
+    """One tracked file's text: ``(text, size, None)`` or a refusal.
+
+    The order matters. Size before anything is read, so an enormous file is
+    refused without being loaded; then the first block only, to say whether it
+    is text at all; then the whole of it. Each refusal names the file and the
+    limit it broke, because "it did not work" sends a reader looking in the
+    wrong place.
+    """
+    try:
+        size = resolved.stat().st_size
+    except OSError as exc:
+        return None, 0, (
+            400,
+            {
+                "error": (
+                    f"{relative} is tracked by git but could not be read here: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+            },
+        )
+    if size > CODE_MAX_FILE_BYTES:
+        return None, size, (
+            400,
+            {
+                "error": (
+                    f"{relative} is {size} bytes, over this door's limit of "
+                    f"{CODE_MAX_FILE_BYTES} bytes — read a part of it with "
+                    "'first_line' and 'last_line', or read a smaller file"
+                )
+            },
+        )
+    try:
+        with open(resolved, "rb") as handle:
+            head = handle.read(CODE_BINARY_SNIFF_BYTES)
+            rest = handle.read()
+    except OSError as exc:
+        return None, size, (
+            400,
+            {
+                "error": (
+                    f"{relative} is tracked by git but could not be read here: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+            },
+        )
+    if _looks_binary(head):
+        return None, size, (
+            400,
+            {
+                "error": (
+                    f"{relative} is not a text file (there is a null byte in "
+                    "its first block), and this door serves text only"
+                )
+            },
+        )
+    return (head + rest).decode("utf-8", errors="replace"), size, None
+
+
+def process_code_list_files_request(
+    payload: Any, *, config: ForgeConfig
+) -> tuple[int, dict[str, Any]]:
+    """``{repo, under?}`` → the repository's tracked files, sorted.
+
+    What git tracks is the repository's own statement of what belongs to it,
+    so this is the honest answer to "what is in here?" without an exclusion
+    list guessing at caches and build output. ``under`` narrows it to one
+    directory. The list is capped and the answer says when the cap was
+    reached. Never raises.
+    """
+    if not isinstance(payload, dict):
+        return 400, {"error": "request body must be a JSON object"}
+    repo_path, tracked, refusal = _code_repo_and_files(payload, config)
+    if refusal is not None or repo_path is None or tracked is None:
+        return refusal or (500, {"error": "the sidecar could not read the repository"})
+    prefix, error = _code_under_error(repo_path, payload.get("under"))
+    if error:
+        return 400, {"error": error}
+    chosen = _under_filter(tracked, prefix)
+    capped = len(chosen) > CODE_MAX_TRACKED_PATHS
+    return 200, {
+        "files": chosen[:CODE_MAX_TRACKED_PATHS],
+        "count": min(len(chosen), CODE_MAX_TRACKED_PATHS),
+        "total_tracked": len(tracked),
+        "under": prefix,
+        "capped": capped,
+        "cap": CODE_MAX_TRACKED_PATHS,
+    }
+
+
+def process_code_read_file_request(
+    payload: Any, *, config: ForgeConfig
+) -> tuple[int, dict[str, Any]]:
+    """``{repo, path, first_line?, last_line?}`` → one tracked file's text.
+
+    The path is fenced for its spelling, resolved and compared against the
+    repository root (so a link out of the tree is refused), and must be a file
+    git TRACKS. A file that is not text, or is over the byte cap, is refused
+    in one sentence rather than half-served. Never raises.
+    """
+    if not isinstance(payload, dict):
+        return 400, {"error": "request body must be a JSON object"}
+    repo_path, tracked, refusal = _code_repo_and_files(payload, config)
+    if refusal is not None or repo_path is None or tracked is None:
+        return refusal or (500, {"error": "the sidecar could not read the repository"})
+    relative = payload.get("path")
+    error = _relative_path_error(relative, what="path")
+    if error:
+        return 400, {"error": error}
+    relative = str(relative)
+    resolved, error = _resolve_inside_repo(repo_path, relative, what="path")
+    if error or resolved is None:
+        return 400, {"error": error}
+    if relative not in set(tracked):
+        return 400, {
+            "error": (
+                f"git does not track {relative} in this repository, so this "
+                "door will not read it — it serves the repository's own "
+                "committed files and nothing else"
+            )
+        }
+    first, error = _positive_int(payload.get("first_line"), what="first_line")
+    if error:
+        return 400, {"error": error}
+    last, error = _positive_int(payload.get("last_line"), what="last_line")
+    if error:
+        return 400, {"error": error}
+    if first is not None and last is not None and last < first:
+        return 400, {
+            "error": (
+                f"'last_line' {last} is before 'first_line' {first}, so there "
+                "are no lines to read"
+            )
+        }
+    text, size, refusal = _read_text_file(resolved, relative)
+    if refusal is not None or text is None:
+        return refusal or (500, {"error": f"{relative} could not be read"})
+    lines = text.splitlines()
+    start = (first or 1) - 1
+    if start >= len(lines) and lines:
+        return 400, {
+            "error": (
+                f"'first_line' {start + 1} is past the end of {relative}, "
+                f"which has {len(lines)} lines"
+            )
+        }
+    end = last if last is not None else len(lines)
+    chosen = lines[start:end]
+    return 200, {
+        "path": relative,
+        "content": "\n".join(chosen) + ("\n" if chosen else ""),
+        "bytes": size,
+        "total_lines": len(lines),
+        "first_line": start + 1,
+        "last_line": start + len(chosen),
+    }
+
+
+def _import_statements(source: str) -> list[dict[str, str]]:
+    """Every import in ``source``, by walking the syntax tree.
+
+    Python's own parser, never a text search: a line inside a string or a
+    comment is not an import, and a search cannot tell the difference. Raises
+    ``SyntaxError`` when the file does not parse, which the caller turns into
+    a plain sentence naming the file.
+    """
+    found: list[dict[str, str]] = []
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                statement = f"import {alias.name}"
+                if alias.asname:
+                    statement += f" as {alias.asname}"
+                found.append(
+                    {
+                        "statement": statement,
+                        "module": alias.name,
+                        "kind": _import_kind(alias.name),
+                    }
+                )
+        elif isinstance(node, ast.ImportFrom):
+            module = "." * (node.level or 0) + (node.module or "")
+            names = ", ".join(
+                alias.name + (f" as {alias.asname}" if alias.asname else "")
+                for alias in node.names
+            )
+            found.append(
+                {
+                    "statement": f"from {module} import {names}",
+                    "module": module,
+                    "kind": _import_kind(module),
+                }
+            )
+    return found
+
+
+def _import_kind(module: str) -> str:
+    """``local`` for a relative import, ``stdlib`` for a name Python ships,
+    ``third-party`` for everything else — the same three words the seats'
+    own reader uses, so an answer from this door reads exactly like one read
+    beside the repository."""
+    if not module or module.startswith("."):
+        return "local"
+    top = module.split(".")[0]
+    names: frozenset[str] = getattr(sys, "stdlib_module_names", frozenset())
+    return "stdlib" if top in names else "third-party"
+
+
+def process_code_imports_request(
+    payload: Any, *, config: ForgeConfig
+) -> tuple[int, dict[str, Any]]:
+    """``{repo, path}`` → what one tracked file, or one tracked directory of
+    files, imports — read from the syntax tree, never from the text.
+
+    Python only. A tracked file this door cannot parse that way is NAMED in
+    the answer with the reason ("not a Python file", "it does not parse"),
+    because a reader who is not told which files were skipped will read the
+    answer as the whole truth. The number of files walked is capped and the
+    answer says when the cap was reached. Never raises.
+    """
+    if not isinstance(payload, dict):
+        return 400, {"error": "request body must be a JSON object"}
+    repo_path, tracked, refusal = _code_repo_and_files(payload, config)
+    if refusal is not None or repo_path is None or tracked is None:
+        return refusal or (500, {"error": "the sidecar could not read the repository"})
+    relative = payload.get("path")
+    error = _relative_path_error(relative, what="path")
+    if error:
+        return 400, {"error": error}
+    relative = str(relative).rstrip("/")
+    resolved, error = _resolve_inside_repo(repo_path, relative, what="path")
+    if error or resolved is None:
+        return 400, {"error": error}
+    tracked_set = set(tracked)
+    if relative in tracked_set:
+        chosen = [relative]
+    else:
+        chosen = _under_filter(tracked, relative)
+        if not chosen:
+            return 400, {
+                "error": (
+                    f"git does not track {relative} in this repository, and it "
+                    "tracks no files under it either, so there is nothing here "
+                    "to read imports from"
+                )
+            }
+    capped = len(chosen) > CODE_IMPORTS_MAX_FILES
+    chosen = chosen[:CODE_IMPORTS_MAX_FILES]
+    files: list[dict[str, Any]] = []
+    for path in chosen:
+        entry: dict[str, Any] = {"path": path, "imports": []}
+        if Path(path).suffix not in CODE_PYTHON_SUFFIXES:
+            entry["language"] = "other"
+            entry["note"] = (
+                f"{path} is not a Python file; this door reads imports by "
+                "parsing Python and does not guess at other languages"
+            )
+            files.append(entry)
+            continue
+        entry["language"] = "python"
+        inside, sub_error = _resolve_inside_repo(repo_path, path, what="path")
+        if sub_error or inside is None:
+            entry["note"] = sub_error
+            files.append(entry)
+            continue
+        text, _size, refusal = _read_text_file(inside, path)
+        if refusal is not None:
+            entry["note"] = refusal[1].get("error")
+            files.append(entry)
+            continue
+        if text is None:
+            entry["note"] = f"{path} could not be read"
+            files.append(entry)
+            continue
+        try:
+            entry["imports"] = _import_statements(text)
+        except SyntaxError as exc:
+            entry["note"] = (
+                f"{path} does not parse as Python (line {exc.lineno}: "
+                f"{exc.msg}), so its imports were not read"
+            )
+        except (ValueError, RecursionError) as exc:
+            entry["note"] = (
+                f"{path} could not be parsed as Python: {type(exc).__name__}: {exc}"
+            )
+        files.append(entry)
+    return 200, {
+        "path": relative,
+        "files": files,
+        "files_walked": len(files),
+        "capped": capped,
+        "cap": CODE_IMPORTS_MAX_FILES,
+    }
+
+
+def process_code_search_request(
+    payload: Any, *, config: ForgeConfig
+) -> tuple[int, dict[str, Any]]:
+    """``{repo, pattern, under?, fixed_string?, case_insensitive?,
+    max_results?}`` → matching lines across the repository's tracked files.
+
+    Python's own regular expressions over files this service reads itself:
+    there is no grep, no shell and no program of any kind started here. A
+    pattern that does not compile is refused with the reason the regular
+    expression engine gave, so the caller can fix it. ``fixed_string`` asks
+    for the pattern to be taken literally, which is what somebody searching
+    for ``get_user(`` wants. Matches, the length of each returned line and the
+    time spent are all capped, and the answer says which cap it met. Never
+    raises.
+    """
+    if not isinstance(payload, dict):
+        return 400, {"error": "request body must be a JSON object"}
+    repo_path, tracked, refusal = _code_repo_and_files(payload, config)
+    if refusal is not None or repo_path is None or tracked is None:
+        return refusal or (500, {"error": "the sidecar could not read the repository"})
+    pattern = payload.get("pattern")
+    if not isinstance(pattern, str) or not pattern.strip():
+        return 400, {"error": "'pattern' is required (the text to search for)"}
+    if len(pattern) > CODE_SEARCH_MAX_PATTERN_CHARS:
+        return 400, {
+            "error": (
+                f"'pattern' is {len(pattern)} characters, over this door's "
+                f"limit of {CODE_SEARCH_MAX_PATTERN_CHARS}"
+            )
+        }
+    fixed = bool(payload.get("fixed_string", False))
+    flags = re.IGNORECASE if bool(payload.get("case_insensitive", False)) else 0
+    try:
+        compiled = re.compile(re.escape(pattern) if fixed else pattern, flags)
+    except re.error as exc:
+        return 400, {
+            "error": (
+                f"'pattern' {pattern!r} is not a regular expression this door "
+                f"can use ({exc}) — fix it, or send 'fixed_string': true to "
+                "search for it as plain text"
+            )
+        }
+    prefix, error = _code_under_error(repo_path, payload.get("under"))
+    if error:
+        return 400, {"error": error}
+    wanted, error = _positive_int(payload.get("max_results"), what="max_results")
+    if error:
+        return 400, {"error": error}
+    limit = min(wanted or CODE_SEARCH_MAX_MATCHES, CODE_SEARCH_MAX_MATCHES)
+
+    matches: list[dict[str, Any]] = []
+    files_searched = 0
+    capped = False
+    timed_out = False
+    deadline = time.monotonic() + CODE_SEARCH_TIMEOUT_SECONDS
+    for path in _under_filter(tracked, prefix):
+        if len(matches) >= limit:
+            capped = True
+            break
+        if time.monotonic() > deadline:
+            timed_out = True
+            break
+        resolved, _error = _resolve_inside_repo(repo_path, path, what="path")
+        if resolved is None or not resolved.is_file():
+            continue
+        try:
+            if resolved.stat().st_size > CODE_MAX_FILE_BYTES:
+                continue
+            data = resolved.read_bytes()
+        except OSError:
+            continue
+        if _looks_binary(data):
+            continue
+        files_searched += 1
+        for number, line in enumerate(
+            data.decode("utf-8", errors="replace").splitlines(), start=1
+        ):
+            if not compiled.search(line):
+                continue
+            if len(matches) >= limit:
+                capped = True
+                break
+            matches.append(
+                {
+                    "path": path,
+                    "line": number,
+                    "text": line[:CODE_SEARCH_MAX_LINE_CHARS],
+                    "line_truncated": len(line) > CODE_SEARCH_MAX_LINE_CHARS,
+                }
+            )
+    return 200, {
+        "pattern": pattern,
+        "fixed_string": fixed,
+        "under": prefix,
+        "matches": matches,
+        "count": len(matches),
+        "files_searched": files_searched,
+        "capped": capped,
+        "cap": limit,
+        "line_cap": CODE_SEARCH_MAX_LINE_CHARS,
+        "timed_out": timed_out,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Config resolution (re-read per request so path changes are picked up)
 # ---------------------------------------------------------------------------
 
@@ -3737,6 +4436,10 @@ class DeploySidecarHandler(BaseHTTPRequestHandler):
                 RECEIPTS_EXPORT_ROUTE,
                 STAMPS_EVIDENCE_ROUTE,
                 GUARDKIT_LEG_ROUTE,
+                CODE_LIST_FILES_ROUTE,
+                CODE_READ_FILE_ROUTE,
+                CODE_IMPORTS_ROUTE,
+                CODE_SEARCH_ROUTE,
             ):
                 self._write_json(404, {"error": f"no such path: {self.path}"})
                 return
@@ -3807,6 +4510,16 @@ class DeploySidecarHandler(BaseHTTPRequestHandler):
                 )
             elif route == RECEIPTS_EXPORT_ROUTE:
                 status, body = process_receipts_export_request(payload, config=config)
+            elif route == CODE_LIST_FILES_ROUTE:
+                status, body = process_code_list_files_request(
+                    payload, config=config
+                )
+            elif route == CODE_READ_FILE_ROUTE:
+                status, body = process_code_read_file_request(payload, config=config)
+            elif route == CODE_IMPORTS_ROUTE:
+                status, body = process_code_imports_request(payload, config=config)
+            elif route == CODE_SEARCH_ROUTE:
+                status, body = process_code_search_request(payload, config=config)
             elif route == GUARDKIT_LEG_ROUTE:
                 status, body = process_guardkit_leg_request(
                     payload,
@@ -3965,6 +4678,23 @@ __all__ = [
     "LEG_TIMEOUT_MAX",
     "LEG_MAX_PATHS",
     "process_guardkit_leg_request",
+    "CODE_LIST_FILES_ROUTE",
+    "CODE_READ_FILE_ROUTE",
+    "CODE_IMPORTS_ROUTE",
+    "CODE_SEARCH_ROUTE",
+    "CODE_GIT_TIMEOUT_SECONDS",
+    "CODE_MAX_TRACKED_PATHS",
+    "CODE_MAX_FILE_BYTES",
+    "CODE_IMPORTS_MAX_FILES",
+    "CODE_SEARCH_MAX_MATCHES",
+    "CODE_SEARCH_MAX_LINE_CHARS",
+    "CODE_SEARCH_TIMEOUT_SECONDS",
+    "CODE_SEARCH_MAX_PATTERN_CHARS",
+    "CODE_PYTHON_SUFFIXES",
+    "process_code_list_files_request",
+    "process_code_read_file_request",
+    "process_code_imports_request",
+    "process_code_search_request",
     "default_config_loader",
     "DeploySidecarHandler",
     "build_server",

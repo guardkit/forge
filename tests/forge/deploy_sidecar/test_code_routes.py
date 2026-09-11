@@ -1,0 +1,871 @@
+"""The code door — the sidecar's four read-only routes into a repository's
+own source (Rich's ruling, 2026-09-11: the seat can ASK).
+
+Real code paths throughout. Every case builds a REAL git repository in a
+temporary directory — tracked files, an untracked one, a binary one, a file
+over the byte cap, and a symbolic link pointing out of the tree — and drives
+the real request functions against it. Two cases go the whole way over a real
+loopback HTTP server on an ephemeral port. Nothing is faked except the clock
+the search's own wall is read from, and the one place a git that never answers
+has to be simulated.
+
+What these tests are really holding in place:
+
+* the door serves only what git TRACKS, so it can never hand back a virtual
+  environment, a build artefact or a stray secret file sitting in the tree;
+* a path that leaves the repository is refused three ways — by its spelling
+  ('..'), because it is absolute, and after resolution when a tracked symbolic
+  link points outside;
+* every cap actually caps, and the answer says so rather than quietly
+  shortening;
+* the one git command the door runs is asserted argument for argument, and no
+  other program is ever started — in particular the search never reaches grep;
+* the door writes nothing: the repository's commit and its clean status are
+  the same after every route has run.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import threading
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from forge.config.models import ForgeConfig
+from forge.deploy_sidecar.service import (
+    CODE_IMPORTS_ROUTE,
+    CODE_LIST_FILES_ROUTE,
+    CODE_READ_FILE_ROUTE,
+    CODE_SEARCH_ROUTE,
+    build_server,
+    process_code_imports_request,
+    process_code_list_files_request,
+    process_code_read_file_request,
+    process_code_search_request,
+)
+from forge.deploy_sidecar import service as sidecar
+
+REPO_KEY = "guardkit/api_test"
+
+#: What the repository tracks, and why each file is there.
+USERS_PY = """import os
+from pathlib import Path
+
+from fastapi import APIRouter
+
+from .db import get_session
+
+
+def get_user(user_id: int) -> dict:
+    \"\"\"The endpoint the plan seat kept proposing to create.\"\"\"
+    return {"id": user_id, "created_at": os.environ.get("NOW"), "p": Path(".")}
+"""
+
+MODELS_PY = """from sqlalchemy import Column, DateTime
+
+
+class User:
+    created_at = Column(DateTime)
+"""
+
+BROKEN_PY = "def get_user(:\n    pass\n"
+
+README = "# api_test\n\nA repository that already has a users router.\n"
+
+NOTES_MD = "get_user is documented here, in a file that is not Python.\n"
+
+
+def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@t",
+    }
+    return subprocess.run(
+        ["git", *args],
+        cwd=cwd,
+        check=True,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+
+@pytest.fixture
+def outside(tmp_path: Path) -> Path:
+    """A file OUTSIDE the repository — the thing the fences exist to keep in."""
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    secret = elsewhere / "secret.txt"
+    secret.write_text("the key nobody asked this door for\n", encoding="utf-8")
+    return secret
+
+
+@pytest.fixture
+def repo(tmp_path: Path, outside: Path) -> Path:
+    """A real git repository with one commit and everything a fence needs."""
+    path = tmp_path / "api_test"
+    (path / "src" / "users").mkdir(parents=True)
+    (path / "docs").mkdir()
+    (path / ".venv" / "bin").mkdir(parents=True)
+
+    (path / "src" / "users" / "router.py").write_text(USERS_PY, encoding="utf-8")
+    (path / "src" / "users" / "models.py").write_text(MODELS_PY, encoding="utf-8")
+    (path / "src" / "users" / "broken.py").write_text(BROKEN_PY, encoding="utf-8")
+    (path / "README.md").write_text(README, encoding="utf-8")
+    (path / "docs" / "notes.md").write_text(NOTES_MD, encoding="utf-8")
+    # Tracked and binary: a null byte in the first block.
+    (path / "docs" / "logo.png").write_bytes(b"\x89PNG\r\n\x1a\n\x00" + b"\xff" * 64)
+    # Tracked and far over the byte cap.
+    (path / "docs" / "huge.txt").write_text("x" * 300_000, encoding="utf-8")
+    # Tracked, and a symbolic link that resolves OUT of the repository.
+    (path / "escape.txt").symlink_to(outside)
+    # Present on disk and deliberately NOT tracked — the virtual environment,
+    # the build artefact, the stray secret file.
+    (path / ".venv" / "bin" / "python").write_text("#!/bin/sh\n", encoding="utf-8")
+    (path / "local-secrets.env").write_text("TOKEN=hunter2\n", encoding="utf-8")
+
+    _git(path, "init", "-q")
+    _git(path, "add", "README.md", "docs", "src", "escape.txt")
+    _git(path, "commit", "-qm", "init")
+    return path
+
+
+def _config(paths: dict[str, str]) -> ForgeConfig:
+    return ForgeConfig.model_validate(
+        {
+            "permissions": {"filesystem": {"allowlist": ["/tmp"]}},
+            "planning": {"target_repo_paths": paths},
+        }
+    )
+
+
+@pytest.fixture
+def cfg(repo: Path) -> ForgeConfig:
+    return _config({REPO_KEY: str(repo)})
+
+
+TRACKED = [
+    "README.md",
+    "docs/huge.txt",
+    "docs/logo.png",
+    "docs/notes.md",
+    "escape.txt",
+    "src/users/broken.py",
+    "src/users/models.py",
+    "src/users/router.py",
+]
+
+
+# ---------------------------------------------------------------------------
+# /code/list-files
+# ---------------------------------------------------------------------------
+
+
+class TestListFiles:
+    def test_it_answers_the_tracked_files_sorted_and_nothing_else(
+        self, cfg: ForgeConfig
+    ) -> None:
+        status, body = process_code_list_files_request(
+            {"repo": REPO_KEY}, config=cfg
+        )
+
+        assert status == 200, body
+        assert body["files"] == TRACKED
+        assert body["count"] == len(TRACKED) and body["total_tracked"] == len(TRACKED)
+        assert body["capped"] is False and body["under"] is None
+        # The two things sitting in the tree that git does not track.
+        assert ".venv/bin/python" not in body["files"]
+        assert "local-secrets.env" not in body["files"]
+
+    def test_under_restricts_the_answer_to_one_directory(
+        self, cfg: ForgeConfig
+    ) -> None:
+        status, body = process_code_list_files_request(
+            {"repo": REPO_KEY, "under": "src/users"}, config=cfg
+        )
+
+        assert status == 200, body
+        assert body["files"] == [
+            "src/users/broken.py",
+            "src/users/models.py",
+            "src/users/router.py",
+        ]
+        assert body["under"] == "src/users"
+        assert body["total_tracked"] == len(TRACKED)
+
+    def test_the_one_git_command_is_exactly_this_argument_list(
+        self, cfg: ForgeConfig, repo: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The door runs git for ONE thing, and this is the line it runs."""
+        calls: list[list[str]] = []
+        real = subprocess.run
+
+        def _run(argv, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+            calls.append(list(argv))
+            return real(argv, *args, **kwargs)
+
+        monkeypatch.setattr(subprocess, "run", _run)
+
+        status, _body = process_code_list_files_request(
+            {"repo": REPO_KEY}, config=cfg
+        )
+
+        assert status == 200
+        assert calls == [
+            ["git", "-c", "safe.directory=*", "-C", str(repo), "ls-files", "-z"]
+        ]
+
+    def test_the_cap_caps_and_the_answer_says_it_was_reached(
+        self, cfg: ForgeConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(sidecar, "CODE_MAX_TRACKED_PATHS", 3)
+
+        status, body = process_code_list_files_request(
+            {"repo": REPO_KEY}, config=cfg
+        )
+
+        assert status == 200, body
+        assert body["files"] == TRACKED[:3]
+        assert body["count"] == 3 and body["cap"] == 3
+        assert body["capped"] is True
+        assert body["total_tracked"] == len(TRACKED)
+
+    def test_an_under_that_leaves_the_repository_is_refused(
+        self, cfg: ForgeConfig
+    ) -> None:
+        for value in ("../elsewhere", "/etc", "src/../../elsewhere"):
+            status, body = process_code_list_files_request(
+                {"repo": REPO_KEY, "under": value}, config=cfg
+            )
+            assert status == 400, (value, body)
+            assert "'under'" in body["error"]
+
+    def test_an_under_that_is_not_a_directory_is_refused_plainly(
+        self, cfg: ForgeConfig
+    ) -> None:
+        status, body = process_code_list_files_request(
+            {"repo": REPO_KEY, "under": "README.md"}, config=cfg
+        )
+
+        assert status == 400
+        assert body["error"] == "'under' 'README.md' is not a directory in this repository"
+
+    def test_a_directory_that_is_not_a_git_repository_is_refused(
+        self, tmp_path: Path
+    ) -> None:
+        plain = tmp_path / "not-a-repo"
+        plain.mkdir()
+        status, body = process_code_list_files_request(
+            {"repo": REPO_KEY}, config=_config({REPO_KEY: str(plain)})
+        )
+
+        assert status == 400
+        assert "is not a git repository" in body["error"]
+
+    def test_a_git_that_never_answers_is_a_500_not_an_empty_repository(
+        self, cfg: ForgeConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def _run(argv, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+            raise subprocess.TimeoutExpired(cmd=list(argv), timeout=60.0)
+
+        monkeypatch.setattr(subprocess, "run", _run)
+
+        status, body = process_code_list_files_request(
+            {"repo": REPO_KEY}, config=cfg
+        )
+
+        assert status == 500
+        assert "sidecar git error" in body["error"]
+
+
+# ---------------------------------------------------------------------------
+# /code/read-file
+# ---------------------------------------------------------------------------
+
+
+class TestReadFile:
+    def test_it_answers_one_tracked_file_whole(self, cfg: ForgeConfig) -> None:
+        status, body = process_code_read_file_request(
+            {"repo": REPO_KEY, "path": "src/users/router.py"}, config=cfg
+        )
+
+        assert status == 200, body
+        assert body["content"] == USERS_PY
+        assert body["path"] == "src/users/router.py"
+        assert body["bytes"] == len(USERS_PY.encode("utf-8"))
+        assert body["first_line"] == 1
+        assert body["total_lines"] == len(USERS_PY.splitlines())
+        assert body["last_line"] == body["total_lines"]
+
+    def test_first_and_last_line_read_a_part_of_it(self, cfg: ForgeConfig) -> None:
+        status, body = process_code_read_file_request(
+            {
+                "repo": REPO_KEY,
+                "path": "src/users/router.py",
+                "first_line": 1,
+                "last_line": 2,
+            },
+            config=cfg,
+        )
+
+        assert status == 200, body
+        assert body["content"] == "import os\nfrom pathlib import Path\n"
+        assert (body["first_line"], body["last_line"]) == (1, 2)
+        assert body["total_lines"] == len(USERS_PY.splitlines())
+
+    def test_a_line_range_the_wrong_way_round_is_refused(
+        self, cfg: ForgeConfig
+    ) -> None:
+        status, body = process_code_read_file_request(
+            {
+                "repo": REPO_KEY,
+                "path": "src/users/router.py",
+                "first_line": 9,
+                "last_line": 2,
+            },
+            config=cfg,
+        )
+
+        assert status == 400
+        assert "before 'first_line'" in body["error"]
+
+    def test_a_first_line_past_the_end_is_refused_rather_than_answered_empty(
+        self, cfg: ForgeConfig
+    ) -> None:
+        status, body = process_code_read_file_request(
+            {"repo": REPO_KEY, "path": "src/users/router.py", "first_line": 500},
+            config=cfg,
+        )
+
+        assert status == 400
+        assert "is past the end of src/users/router.py" in body["error"]
+        assert "which has 11 lines" in body["error"]
+
+    def test_a_line_number_that_is_not_a_whole_number_is_refused(
+        self, cfg: ForgeConfig
+    ) -> None:
+        for field in ("first_line", "last_line"):
+            for value in (0, -3, "2", 1.5, True):
+                status, body = process_code_read_file_request(
+                    {"repo": REPO_KEY, "path": "README.md", field: value},
+                    config=cfg,
+                )
+                assert status == 400, (field, value, body)
+                assert body["error"] == (
+                    f"'{field}' must be a whole number of at least 1"
+                )
+
+    def test_a_path_that_leaves_the_repository_by_spelling_is_refused(
+        self, cfg: ForgeConfig
+    ) -> None:
+        for value in ("../elsewhere/secret.txt", "/etc/passwd", "src/../../x"):
+            status, body = process_code_read_file_request(
+                {"repo": REPO_KEY, "path": value}, config=cfg
+            )
+            assert status == 400, (value, body)
+            assert "'path'" in body["error"]
+
+    def test_a_tracked_symlink_that_resolves_outside_is_refused(
+        self, cfg: ForgeConfig, outside: Path
+    ) -> None:
+        """The half a spelling check cannot do. ``escape.txt`` is tracked, is
+        spelled like any other file in the tree, and points at a file outside
+        it — so the refusal has to come after resolution."""
+        status, body = process_code_read_file_request(
+            {"repo": REPO_KEY, "path": "escape.txt"}, config=cfg
+        )
+
+        assert status == 400
+        assert "outside the repository" in body["error"]
+        assert str(outside.resolve()) in body["error"]
+
+    def test_a_file_git_does_not_track_is_refused(self, cfg: ForgeConfig) -> None:
+        for value in (".venv/bin/python", "local-secrets.env"):
+            status, body = process_code_read_file_request(
+                {"repo": REPO_KEY, "path": value}, config=cfg
+            )
+            assert status == 400, (value, body)
+            assert f"git does not track {value}" in body["error"]
+
+    def test_a_binary_file_is_refused_in_one_sentence(self, cfg: ForgeConfig) -> None:
+        status, body = process_code_read_file_request(
+            {"repo": REPO_KEY, "path": "docs/logo.png"}, config=cfg
+        )
+
+        assert status == 400
+        assert "is not a text file" in body["error"]
+
+    def test_a_file_over_the_byte_cap_is_refused_not_truncated(
+        self, cfg: ForgeConfig
+    ) -> None:
+        status, body = process_code_read_file_request(
+            {"repo": REPO_KEY, "path": "docs/huge.txt"}, config=cfg
+        )
+
+        assert status == 400
+        assert "over this door's limit" in body["error"]
+        assert str(sidecar.CODE_MAX_FILE_BYTES) in body["error"]
+
+    def test_the_byte_cap_is_the_one_named_in_the_module(
+        self, cfg: ForgeConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(sidecar, "CODE_MAX_FILE_BYTES", 10)
+
+        status, body = process_code_read_file_request(
+            {"repo": REPO_KEY, "path": "src/users/router.py"}, config=cfg
+        )
+
+        assert status == 400
+        assert "over this door's limit of 10 bytes" in body["error"]
+
+    def test_a_missing_path_is_refused_before_anything_is_read(
+        self, cfg: ForgeConfig
+    ) -> None:
+        status, body = process_code_read_file_request({"repo": REPO_KEY}, config=cfg)
+
+        assert status == 400
+        assert "'path' must be a relative path inside the repository" in body["error"]
+
+
+# ---------------------------------------------------------------------------
+# /code/imports
+# ---------------------------------------------------------------------------
+
+
+class TestImports:
+    def test_one_file_answers_its_imports_from_the_syntax_tree(
+        self, cfg: ForgeConfig
+    ) -> None:
+        status, body = process_code_imports_request(
+            {"repo": REPO_KEY, "path": "src/users/router.py"}, config=cfg
+        )
+
+        assert status == 200, body
+        assert body["files_walked"] == 1 and body["capped"] is False
+        entry = body["files"][0]
+        assert entry["path"] == "src/users/router.py"
+        assert entry["language"] == "python"
+        assert [i["statement"] for i in entry["imports"]] == [
+            "import os",
+            "from pathlib import Path",
+            "from fastapi import APIRouter",
+            "from .db import get_session",
+        ]
+        kinds = {i["module"]: i["kind"] for i in entry["imports"]}
+        assert kinds == {
+            "os": "stdlib",
+            "pathlib": "stdlib",
+            "fastapi": "third-party",
+            ".db": "local",
+        }
+
+    def test_the_reader_is_a_parser_not_a_text_search(
+        self, cfg: ForgeConfig, repo: Path
+    ) -> None:
+        """A line inside a string is not an import, and only a parser knows
+        that. This is the whole reason the route says 'by parsing'."""
+        (repo / "src" / "users" / "decoy.py").write_text(
+            'DOCS = """\nimport nothing_at_all\n"""\n# import also_not_this\n'
+            "import json\n",
+            encoding="utf-8",
+        )
+        _git(repo, "add", "src/users/decoy.py")
+        _git(repo, "commit", "-qm", "decoy")
+
+        status, body = process_code_imports_request(
+            {"repo": REPO_KEY, "path": "src/users/decoy.py"}, config=cfg
+        )
+
+        assert status == 200, body
+        assert [i["module"] for i in body["files"][0]["imports"]] == ["json"]
+
+    def test_a_directory_walks_the_tracked_files_under_it(
+        self, cfg: ForgeConfig
+    ) -> None:
+        status, body = process_code_imports_request(
+            {"repo": REPO_KEY, "path": "src"}, config=cfg
+        )
+
+        assert status == 200, body
+        assert [f["path"] for f in body["files"]] == [
+            "src/users/broken.py",
+            "src/users/models.py",
+            "src/users/router.py",
+        ]
+
+    def test_a_file_that_does_not_parse_is_named_with_the_reason(
+        self, cfg: ForgeConfig
+    ) -> None:
+        status, body = process_code_imports_request(
+            {"repo": REPO_KEY, "path": "src/users/broken.py"}, config=cfg
+        )
+
+        assert status == 200, body
+        entry = body["files"][0]
+        assert entry["imports"] == []
+        assert "does not parse as Python" in entry["note"]
+
+    def test_a_file_that_is_not_python_says_so_rather_than_guessing(
+        self, cfg: ForgeConfig
+    ) -> None:
+        status, body = process_code_imports_request(
+            {"repo": REPO_KEY, "path": "docs/notes.md"}, config=cfg
+        )
+
+        assert status == 200, body
+        entry = body["files"][0]
+        assert entry["language"] == "other" and entry["imports"] == []
+        assert "is not a Python file" in entry["note"]
+        assert "does not guess at other languages" in entry["note"]
+
+    def test_the_walk_cap_caps_and_the_answer_says_it_was_reached(
+        self, cfg: ForgeConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(sidecar, "CODE_IMPORTS_MAX_FILES", 2)
+
+        status, body = process_code_imports_request(
+            {"repo": REPO_KEY, "path": "src"}, config=cfg
+        )
+
+        assert status == 200, body
+        assert body["files_walked"] == 2
+        assert body["capped"] is True and body["cap"] == 2
+
+    def test_an_untracked_path_is_refused(self, cfg: ForgeConfig) -> None:
+        status, body = process_code_imports_request(
+            {"repo": REPO_KEY, "path": ".venv"}, config=cfg
+        )
+
+        assert status == 400
+        assert "git does not track .venv" in body["error"]
+
+    def test_a_path_that_leaves_the_repository_is_refused(
+        self, cfg: ForgeConfig
+    ) -> None:
+        for value in ("../elsewhere", "/etc"):
+            status, body = process_code_imports_request(
+                {"repo": REPO_KEY, "path": value}, config=cfg
+            )
+            assert status == 400, (value, body)
+            assert "'path'" in body["error"]
+
+
+# ---------------------------------------------------------------------------
+# /code/search
+# ---------------------------------------------------------------------------
+
+
+class TestSearch:
+    def test_it_finds_the_matching_lines_with_their_file_and_number(
+        self, cfg: ForgeConfig
+    ) -> None:
+        status, body = process_code_search_request(
+            {"repo": REPO_KEY, "pattern": r"def get_user"}, config=cfg
+        )
+
+        assert status == 200, body
+        # Both tracked Python files carry the phrase: the broken one on its
+        # first line and the router on its ninth, in path order.
+        assert [(m["path"], m["line"]) for m in body["matches"]] == [
+            ("src/users/broken.py", 1),
+            ("src/users/router.py", 9),
+        ]
+        match = body["matches"][1]
+        assert match["text"] == "def get_user(user_id: int) -> dict:"
+        assert match["line_truncated"] is False
+        assert body["timed_out"] is False and body["capped"] is False
+
+    def test_a_pattern_that_does_not_compile_is_refused_with_the_reason(
+        self, cfg: ForgeConfig
+    ) -> None:
+        status, body = process_code_search_request(
+            {"repo": REPO_KEY, "pattern": "get_user("}, config=cfg
+        )
+
+        assert status == 400
+        assert "is not a regular expression this door can use" in body["error"]
+        assert "'fixed_string': true" in body["error"]
+
+    def test_the_same_pattern_as_plain_text_finds_the_line(
+        self, cfg: ForgeConfig
+    ) -> None:
+        status, body = process_code_search_request(
+            {"repo": REPO_KEY, "pattern": "get_user(", "fixed_string": True},
+            config=cfg,
+        )
+
+        assert status == 200, body
+        assert [(m["path"], m["line"]) for m in body["matches"]] == [
+            ("src/users/broken.py", 1),
+            ("src/users/router.py", 9),
+        ]
+        assert body["fixed_string"] is True
+
+    def test_case_insensitive_is_asked_for_and_honoured(
+        self, cfg: ForgeConfig
+    ) -> None:
+        plain = process_code_search_request(
+            {"repo": REPO_KEY, "pattern": "APIROUTER"}, config=cfg
+        )[1]
+        loose = process_code_search_request(
+            {"repo": REPO_KEY, "pattern": "APIROUTER", "case_insensitive": True},
+            config=cfg,
+        )[1]
+
+        assert plain["count"] == 0
+        assert loose["count"] == 1
+
+    def test_under_restricts_the_search_to_one_directory(
+        self, cfg: ForgeConfig
+    ) -> None:
+        status, body = process_code_search_request(
+            {"repo": REPO_KEY, "pattern": "get_user", "under": "docs"}, config=cfg
+        )
+
+        assert status == 200, body
+        assert [m["path"] for m in body["matches"]] == ["docs/notes.md"]
+        assert body["under"] == "docs"
+
+    def test_the_match_cap_caps_and_the_answer_says_it_was_reached(
+        self, cfg: ForgeConfig, repo: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        (repo / "src" / "many.py").write_text("x = 1\n" * 40, encoding="utf-8")
+        _git(repo, "add", "src/many.py")
+        _git(repo, "commit", "-qm", "many")
+        monkeypatch.setattr(sidecar, "CODE_SEARCH_MAX_MATCHES", 5)
+
+        status, body = process_code_search_request(
+            {"repo": REPO_KEY, "pattern": "x = 1"}, config=cfg
+        )
+
+        assert status == 200, body
+        assert body["count"] == 5 and body["cap"] == 5
+        assert body["capped"] is True
+
+    def test_a_caller_may_ask_for_fewer_matches_but_never_more(
+        self, cfg: ForgeConfig, repo: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        (repo / "src" / "many.py").write_text("x = 1\n" * 40, encoding="utf-8")
+        _git(repo, "add", "src/many.py")
+        _git(repo, "commit", "-qm", "many")
+        monkeypatch.setattr(sidecar, "CODE_SEARCH_MAX_MATCHES", 5)
+
+        fewer = process_code_search_request(
+            {"repo": REPO_KEY, "pattern": "x = 1", "max_results": 2}, config=cfg
+        )[1]
+        more = process_code_search_request(
+            {"repo": REPO_KEY, "pattern": "x = 1", "max_results": 500}, config=cfg
+        )[1]
+
+        assert fewer["count"] == 2 and fewer["cap"] == 2
+        assert more["count"] == 5 and more["cap"] == 5
+
+    def test_a_very_long_line_comes_back_cut_and_flagged(
+        self, cfg: ForgeConfig, repo: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        (repo / "src" / "long.py").write_text(
+            "MINIFIED = '" + "a" * 900 + "'  # needle\n", encoding="utf-8"
+        )
+        _git(repo, "add", "src/long.py")
+        _git(repo, "commit", "-qm", "long")
+        monkeypatch.setattr(sidecar, "CODE_SEARCH_MAX_LINE_CHARS", 40)
+
+        status, body = process_code_search_request(
+            {"repo": REPO_KEY, "pattern": "MINIFIED"}, config=cfg
+        )
+
+        assert status == 200, body
+        match = body["matches"][0]
+        assert len(match["text"]) == 40
+        assert match["line_truncated"] is True
+        assert body["line_cap"] == 40
+
+    def test_it_never_shells_out_to_grep_or_starts_any_other_program(
+        self, cfg: ForgeConfig, repo: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls: list[list[str]] = []
+        real = subprocess.run
+
+        def _run(argv, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+            calls.append(list(argv))
+            return real(argv, *args, **kwargs)
+
+        monkeypatch.setattr(subprocess, "run", _run)
+
+        status, _body = process_code_search_request(
+            {"repo": REPO_KEY, "pattern": "get_user"}, config=cfg
+        )
+
+        assert status == 200
+        assert calls == [
+            ["git", "-c", "safe.directory=*", "-C", str(repo), "ls-files", "-z"]
+        ]
+
+    def test_binary_and_over_cap_files_are_passed_over(
+        self, cfg: ForgeConfig
+    ) -> None:
+        """``docs/logo.png`` and ``docs/huge.txt`` are tracked; neither is
+        searched, so the file count is the text files only."""
+        status, body = process_code_search_request(
+            {"repo": REPO_KEY, "pattern": "nothing-matches-this"}, config=cfg
+        )
+
+        assert status == 200, body
+        # Eight tracked paths: the binary, the over-cap file and the symbolic
+        # link out of the tree are all passed over.
+        assert body["files_searched"] == 5
+
+    def test_a_missing_pattern_is_refused(self, cfg: ForgeConfig) -> None:
+        for payload in ({"repo": REPO_KEY}, {"repo": REPO_KEY, "pattern": "   "}):
+            status, body = process_code_search_request(payload, config=cfg)
+            assert status == 400, body
+            assert body["error"] == "'pattern' is required (the text to search for)"
+
+    def test_a_pattern_longer_than_the_cap_is_refused(
+        self, cfg: ForgeConfig
+    ) -> None:
+        status, body = process_code_search_request(
+            {"repo": REPO_KEY, "pattern": "a" * 2_000}, config=cfg
+        )
+
+        assert status == 400
+        assert "over this door's limit" in body["error"]
+
+
+# ---------------------------------------------------------------------------
+# The laws every route on this service keeps
+# ---------------------------------------------------------------------------
+
+
+ROUTES = (
+    (process_code_list_files_request, {}),
+    (process_code_read_file_request, {"path": "README.md"}),
+    (process_code_imports_request, {"path": "src"}),
+    (process_code_search_request, {"pattern": "get_user"}),
+)
+
+
+class TestTheSharedLaws:
+    @pytest.mark.parametrize("handler,extra", ROUTES)
+    def test_an_unknown_repository_key_is_refused_by_name(
+        self, handler: Any, extra: dict[str, Any], cfg: ForgeConfig
+    ) -> None:
+        status, body = handler({"repo": "acme/ghost", **extra}, config=cfg)
+
+        assert status == 400
+        assert "unknown target repo 'acme/ghost'" in body["error"]
+        assert REPO_KEY in body["error"]
+
+    @pytest.mark.parametrize("handler,extra", ROUTES)
+    def test_a_body_that_is_not_an_object_is_refused(
+        self, handler: Any, extra: dict[str, Any], cfg: ForgeConfig
+    ) -> None:
+        status, body = handler(["not", "an", "object"], config=cfg)
+
+        assert status == 400
+        assert body["error"] == "request body must be a JSON object"
+
+    @pytest.mark.parametrize("handler,extra", ROUTES)
+    def test_no_route_here_writes_anything(
+        self, handler: Any, extra: dict[str, Any], cfg: ForgeConfig, repo: Path
+    ) -> None:
+        """READ ONLY, proved on the repository itself: the same commit, the
+        same clean status, and no worktree either side of the call."""
+        before = _git(repo, "rev-parse", "HEAD").stdout
+        handler({"repo": REPO_KEY, **extra}, config=cfg)
+
+        assert _git(repo, "rev-parse", "HEAD").stdout == before
+        assert _git(repo, "status", "--porcelain").stdout == (
+            "?? .venv/\n?? local-secrets.env\n"
+        )
+        assert _git(repo, "worktree", "list", "--porcelain").stdout.count(
+            "worktree "
+        ) == 1
+
+
+# ---------------------------------------------------------------------------
+# End to end over loopback — a real server, a real socket
+# ---------------------------------------------------------------------------
+
+
+def _post(url: str, body: Any, *, timeout: float = 60.0) -> tuple[int, Any]:
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.status, json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read().decode("utf-8"))
+
+
+@pytest.fixture
+def server(cfg: ForgeConfig):
+    srv = build_server(port=0, config_loader=lambda: cfg)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    host, port = srv.server_address[:2]
+    assert host == "127.0.0.1"
+    try:
+        yield f"http://{host}:{port}"
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+class TestOverLoopback:
+    def test_all_four_routes_answer_over_a_real_socket(self, server: str) -> None:
+        status, body = _post(server + CODE_LIST_FILES_ROUTE, {"repo": REPO_KEY})
+        assert status == 200 and body["files"] == TRACKED
+
+        status, body = _post(
+            server + CODE_READ_FILE_ROUTE,
+            {"repo": REPO_KEY, "path": "src/users/models.py"},
+        )
+        assert status == 200 and body["content"] == MODELS_PY
+
+        status, body = _post(
+            server + CODE_IMPORTS_ROUTE,
+            {"repo": REPO_KEY, "path": "src/users/models.py"},
+        )
+        assert status == 200
+        assert body["files"][0]["imports"][0]["module"] == "sqlalchemy"
+
+        status, body = _post(
+            server + CODE_SEARCH_ROUTE, {"repo": REPO_KEY, "pattern": "created_at"}
+        )
+        assert status == 200 and body["count"] >= 1
+
+    def test_a_refusal_over_the_socket_is_an_http_400_with_one_sentence(
+        self, server: str
+    ) -> None:
+        status, body = _post(
+            server + CODE_READ_FILE_ROUTE, {"repo": REPO_KEY, "path": "escape.txt"}
+        )
+
+        assert status == 400
+        assert "outside the repository" in body["error"]
+
+    def test_a_code_path_that_is_not_one_of_the_four_is_not_a_route(
+        self, server: str
+    ) -> None:
+        for path in (
+            "/code/write-file",
+            "/code/list-files/extra",
+            "/code",
+            "/code/run",
+        ):
+            status, body = _post(server + path, {"repo": REPO_KEY})
+            assert status == 404, (path, body)
+            assert body["error"] == f"no such path: {path}"
