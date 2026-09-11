@@ -52,6 +52,7 @@ criteria::
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import os
 import sys
@@ -354,6 +355,60 @@ def compose_merge_guardkit_run(forge_config: Any) -> Any:
         return await per_repo[repo_key](repo_path=repo_path, **kwargs)
 
     return run_merge_where_the_repository_lives
+
+
+def compose_routine_subprocess_dispatcher(forge_config: Any) -> Any:
+    """Name the model a routine build runs on, or leave today's arrangement be.
+
+    What this factory does today, plainly. Forge names a model for exactly
+    one thing: the fix journey's legs, from ``conductor.seat``, which ride
+    the command line as ``--model <seat>``. A routine build is dispatched
+    with no ``--model`` at all, so the build system's own command line
+    falls back to its default — the literal string
+    ``claude-sonnet-4-5-20250929``, a frontier vendor's model NAME, which
+    reaches a local model only because the estate's proxy carries a
+    wildcard row mapping ``claude-*`` to the workhorse seat. Nothing has
+    been mis-served; the seat fence keeps that arrangement legal. But
+    which model writes this factory's code is decided by a line in a
+    proxy's configuration file rather than by the factory, and a factory
+    should name the model that writes its code.
+
+    So: with ``routine.seat`` named in ``forge.yaml``, this binds that
+    seat onto the routine dispatch and it rides every routine dispatch as
+    ``--model <seat>``. With no seat named — the default, and every
+    ``forge.yaml`` deployed today — this returns the dispatch function
+    itself, unbound and unwrapped, so the argv is byte for byte what it is
+    now and the build system's own default still applies.
+
+    The composition root's one job here is to pass through what the
+    operator configured. It invents no seat of its own: an absent seat
+    stays absent rather than being filled in with a default, because a
+    default chosen here would be exactly the silent decision this lever
+    exists to end.
+
+    Logs one line naming which of the two it did, so the answer to "which
+    model is writing the code?" is in the daemon's boot log.
+    """
+    from forge.pipeline.dispatchers.subprocess import dispatch_subprocess_stage
+
+    configured = getattr(getattr(forge_config, "routine", None), "seat", None)
+    seat = (str(configured).strip() if configured else "") or None
+
+    if seat is None:
+        logger.info(
+            "forge-serve: no routine seat is named (routine.seat is unset), so "
+            "a routine build is dispatched exactly as it is today — no "
+            "--model on the command line, and the build system's own default "
+            "applies"
+        )
+        return dispatch_subprocess_stage
+
+    logger.info(
+        "forge-serve: routine builds run on %r — the factory names its own "
+        "seat on every routine dispatch (--model, from routine.seat)",
+        seat,
+    )
+    return functools.partial(dispatch_subprocess_stage, routine_seat=seat)
 
 
 def compose_merge_git_surface(forge_config: Any) -> Any | None:
