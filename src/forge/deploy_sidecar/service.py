@@ -41,14 +41,16 @@ The narrow contract:
     POST /code/list-files {repo, under?}
               -> {files, count, total_tracked, under, capped, cap}
     POST /code/read-file  {repo, path, first_line?, last_line?}
-              -> {path, content, bytes, total_lines, first_line, last_line}
+              -> {path, content, bytes, total_lines|null, first_line,
+                  last_line, partial, note|null}
     POST /code/imports    {repo, path}
               -> {path, files: [{path, language, imports, note?}],
                   files_walked, capped, cap}
     POST /code/search     {repo, pattern, under?, fixed_string?,
                            case_insensitive?, max_results?}
               -> {matches: [{path, line, text, line_truncated}], count,
-                  files_searched, capped, cap, line_cap, timed_out}
+                  files_searched, capped, cap, line_cap,
+                  long_lines_partly_searched, timed_out}
 
 The three routes after ``/git/rev-parse`` are the merge press's own git
 (sandbox first, 2026-09-07, rule 89): its ancestry guards, and the lay-out and
@@ -3707,8 +3709,15 @@ def process_guardkit_leg_request(
 # a local database or a stray secret file that happens to sit in the tree, and
 # no exclusion list has to guess at them.
 #
-# Every refusal is one plain sentence a person can act on, and no route here
-# changes the behaviour of any route above it.
+# Every refusal is one plain sentence a person can act on — including the
+# sentences nobody means to reach: a path carrying a null character is refused
+# like any other bad path rather than raising, and every refusal's advice is
+# something the route that gave it can actually do. And no route here changes
+# the behaviour of any route above it.
+#
+# LINES ARE COUNTED ON NEWLINES, the way git, grep, every editor and every
+# traceback count them, so a line number from this door means the same thing
+# as a line number from anywhere else (see :func:`_split_lines`).
 
 #: The four routes.
 CODE_LIST_FILES_ROUTE: str = "/code/list-files"
@@ -3735,6 +3744,17 @@ CODE_MAX_FILE_BYTES: int = 262_144
 
 #: How many bytes are sniffed for a null byte before a file is called text.
 CODE_BINARY_SNIFF_BYTES: int = 8_192
+
+#: How far this door reads INTO a file that is over the byte cap, looking for
+#: the lines a caller asked for, and how much it reads at a time while it
+#: looks. A file over the cap is not refused outright: a caller can ask for a
+#: line range and get exactly those lines, which is what a reader wants from a
+#: three-hundred-kilobyte file. What that costs has to be bounded too, though,
+#: or a request for line nine million of a huge file would walk the whole of
+#: it, so the walk stops here and says where it stopped. The memory it costs
+#: is the size of the window asked for, not the size of the file.
+CODE_READ_SCAN_BYTES: int = 16 * 1024 * 1024
+CODE_READ_CHUNK_BYTES: int = 65_536
 
 #: How many files one imports request parses. A directory of a thousand
 #: modules is a request to read the whole repository one syntax tree at a
@@ -3861,11 +3881,24 @@ def _resolve_inside_repo(
     followed — and the result must still be the repository root or something
     under it. A tracked link pointing at somebody's key file outside the tree
     is refused here, after resolution, however innocent its name looked.
+
+    Never raises. Looking a path up can fail in two different families: the
+    operating system saying no (``OSError``), and the path being one no
+    operating system can be asked about at all (``ValueError`` — a null
+    character in the middle of it, or half of a surrogate pair, both of which
+    ordinary JSON can carry). Both come back as a sentence, because a caller
+    that gets a stack trace instead of a sentence has been told nothing.
     """
+    if "\x00" in relative:
+        return None, (
+            f"'{what}' {relative!r} carries a null character, which no file "
+            "name on this box can contain — send the path exactly as git "
+            "spells it"
+        )
     try:
         root = repo_path.resolve()
         resolved = (root / relative).resolve()
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         return None, (
             f"'{what}' {relative!r} could not be resolved inside the "
             f"repository: {type(exc).__name__}: {exc}"
@@ -3945,6 +3978,64 @@ def _positive_int(value: Any, *, what: str) -> tuple[int | None, str | None]:
     return value, None
 
 
+def _split_lines(text: str) -> list[str]:
+    """``text`` in lines, counted the way every other tool counts them.
+
+    Broken on the newline and nothing else. Python's own ``splitlines()`` also
+    breaks on the form feed, the vertical tab, the file, group and record
+    separators and the Unicode line and paragraph separators — git, grep,
+    every editor, every traceback and every "file.py:12" anybody ever pasted
+    do not. One form feed in a Python file is enough to put this door's line
+    numbers one out from the file's own for the whole rest of it, and a caller
+    feeding a search result's line number back into a read, or quoting it into
+    a plan, would be wrong and never told. A carriage return before the
+    newline is folded in, because a Windows line ending is one line ending.
+    """
+    lines = text.replace("\r\n", "\n").split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    return lines
+
+
+#: What a reader is told when a file is over the byte cap — one sentence per
+#: route, because the two routes can do different things about it. Read-file
+#: CAN serve part of such a file, so its sentence offers that and the offer
+#: works. Imports parses whole files only, so its sentence says so instead of
+#: sending a caller to line numbers that route has never had.
+OVER_SIZE_READ_ADVICE: str = (
+    "ask for the part you need with 'first_line' and 'last_line' (a file "
+    "this size is served a line range at a time), or read a smaller file"
+)
+OVER_SIZE_IMPORTS_ADVICE: str = (
+    "this door reads imports by parsing a whole file, so a file this size is "
+    "left unparsed and its imports were not read"
+)
+
+
+def _over_size_error(relative: str, size: int, advice: str) -> str:
+    """The one sentence for a file bigger than this door hands back whole."""
+    return (
+        f"{relative} is {size} bytes, over this door's limit of "
+        f"{CODE_MAX_FILE_BYTES} bytes — {advice}"
+    )
+
+
+def _unreadable_error(relative: str, exc: Exception) -> str:
+    """Tracked by git, and still not readable here — say which and why."""
+    return (
+        f"{relative} is tracked by git but could not be read here: "
+        f"{type(exc).__name__}: {exc}"
+    )
+
+
+def _not_text_error(relative: str) -> str:
+    """Text only, and the reason named so a caller knows what to do next."""
+    return (
+        f"{relative} is not a text file (there is a null byte in its first "
+        "block), and this door serves text only"
+    )
+
+
 def _looks_binary(data: bytes) -> bool:
     """True when the first block carries a null byte — the same test the
     seats' own reader uses, and the one git itself uses to call a file
@@ -3953,64 +4044,163 @@ def _looks_binary(data: bytes) -> bool:
 
 
 def _read_text_file(
-    resolved: Path, relative: str
+    resolved: Path,
+    relative: str,
+    *,
+    over_size_advice: str = OVER_SIZE_READ_ADVICE,
 ) -> tuple[str | None, int, tuple[int, dict[str, Any]] | None]:
-    """One tracked file's text: ``(text, size, None)`` or a refusal.
+    """One tracked file's whole text: ``(text, size, None)`` or a refusal.
 
     The order matters. Size before anything is read, so an enormous file is
     refused without being loaded; then the first block only, to say whether it
     is text at all; then the whole of it. Each refusal names the file and the
     limit it broke, because "it did not work" sends a reader looking in the
-    wrong place.
+    wrong place — and the sentence for an over-size file is the CALLER'S, not
+    a general one, because what a caller can do about it depends on which
+    route asked.
     """
     try:
         size = resolved.stat().st_size
     except OSError as exc:
-        return None, 0, (
-            400,
-            {
-                "error": (
-                    f"{relative} is tracked by git but could not be read here: "
-                    f"{type(exc).__name__}: {exc}"
-                )
-            },
-        )
+        return None, 0, (400, {"error": _unreadable_error(relative, exc)})
     if size > CODE_MAX_FILE_BYTES:
         return None, size, (
             400,
-            {
-                "error": (
-                    f"{relative} is {size} bytes, over this door's limit of "
-                    f"{CODE_MAX_FILE_BYTES} bytes — read a part of it with "
-                    "'first_line' and 'last_line', or read a smaller file"
-                )
-            },
+            {"error": _over_size_error(relative, size, over_size_advice)},
         )
     try:
         with open(resolved, "rb") as handle:
             head = handle.read(CODE_BINARY_SNIFF_BYTES)
             rest = handle.read()
     except OSError as exc:
-        return None, size, (
-            400,
-            {
-                "error": (
-                    f"{relative} is tracked by git but could not be read here: "
-                    f"{type(exc).__name__}: {exc}"
-                )
-            },
-        )
+        return None, size, (400, {"error": _unreadable_error(relative, exc)})
     if _looks_binary(head):
-        return None, size, (
-            400,
-            {
-                "error": (
-                    f"{relative} is not a text file (there is a null byte in "
-                    "its first block), and this door serves text only"
-                )
-            },
-        )
+        return None, size, (400, {"error": _not_text_error(relative)})
     return (head + rest).decode("utf-8", errors="replace"), size, None
+
+
+def _read_line_window(
+    resolved: Path, relative: str, first: int, last: int | None
+) -> tuple[list[str] | None, tuple[int, dict[str, Any]] | None]:
+    """Lines ``first`` to ``last`` of a file too big to hand back whole.
+
+    A block at a time: count the newlines, keep only the lines asked for, stop
+    at the last of them. So what this costs is the size of the window, not the
+    size of the file, and a reader facing a three-hundred-kilobyte file gets
+    the part it needs instead of a refusal telling it to do something that
+    cannot work.
+
+    Three walls, each with its own sentence: the file must still be text, the
+    lines kept must still come to less than the byte limit, and the walk stops
+    after :data:`CODE_READ_SCAN_BYTES` and says where it stopped.
+    """
+    kept: list[str] = []
+    kept_bytes = 0
+    number = 1
+    scanned = 0
+    try:
+        with open(resolved, "rb") as handle:
+            block = handle.read(CODE_BINARY_SNIFF_BYTES)
+            if _looks_binary(block):
+                return None, (400, {"error": _not_text_error(relative)})
+            buffer = block
+            scanned = len(block)
+            while True:
+                newline = buffer.find(b"\n")
+                while newline != -1:
+                    raw, buffer = buffer[:newline], buffer[newline + 1 :]
+                    if number >= first:
+                        kept.append(_decode_line(raw))
+                        kept_bytes += len(raw) + 1
+                        if kept_bytes > CODE_MAX_FILE_BYTES:
+                            return None, (400, {"error": _window_too_big(relative)})
+                    number += 1
+                    if last is not None and number > last:
+                        return kept, None
+                    newline = buffer.find(b"\n")
+                if scanned >= CODE_READ_SCAN_BYTES:
+                    return None, (
+                        400,
+                        {
+                            "error": (
+                                f"this door read the first {scanned} bytes of "
+                                f"{relative} looking for the lines you asked "
+                                "for and stopped there, because it reads no "
+                                f"further than {CODE_READ_SCAN_BYTES} bytes "
+                                "into a file this size — ask for earlier lines"
+                            )
+                        },
+                    )
+                chunk = handle.read(CODE_READ_CHUNK_BYTES)
+                if not chunk:
+                    break
+                buffer += chunk
+                scanned += len(chunk)
+            if buffer and number >= first:
+                # The last line of a file that does not end in a newline. It
+                # is held to the same limit as every other line, because a
+                # minified file IS one line of half a megabyte and letting
+                # this one through would hand back more than the whole-file
+                # cap allows.
+                kept_bytes += len(buffer)
+                if kept_bytes > CODE_MAX_FILE_BYTES:
+                    return None, (400, {"error": _window_too_big(relative)})
+                kept.append(_decode_line(buffer))
+    except OSError as exc:
+        return None, (400, {"error": _unreadable_error(relative, exc)})
+    return kept, None
+
+
+def _window_too_big(relative: str) -> str:
+    """The window keeps the same byte limit the whole file would have."""
+    return (
+        f"the lines you asked for from {relative} come to more than this "
+        f"door's limit of {CODE_MAX_FILE_BYTES} bytes — ask for fewer lines"
+    )
+
+
+def _decode_line(raw: bytes) -> str:
+    """One line's bytes as text, with a Windows line ending folded in."""
+    if raw.endswith(b"\r"):
+        raw = raw[:-1]
+    return raw.decode("utf-8", errors="replace")
+
+
+def _read_file_lines(
+    resolved: Path, relative: str, first: int | None, last: int | None
+) -> tuple[list[str] | None, int, bool, tuple[int, dict[str, Any]] | None]:
+    """The lines of one tracked file: ``(lines, size, partial, None)``.
+
+    Whole when the file is small enough to hand back whole. When it is over
+    the byte cap, a caller that asked for a line range gets exactly those
+    lines and ``partial`` comes back true, so the route can say plainly that
+    the rest of the file was never read; a caller that asked for no range is
+    refused with a sentence whose advice actually works.
+    """
+    try:
+        size = resolved.stat().st_size
+    except OSError as exc:
+        return None, 0, False, (400, {"error": _unreadable_error(relative, exc)})
+    if size > CODE_MAX_FILE_BYTES:
+        if first is None and last is None:
+            return None, size, False, (
+                400,
+                {"error": _over_size_error(relative, size, OVER_SIZE_READ_ADVICE)},
+            )
+        kept, refusal = _read_line_window(resolved, relative, first or 1, last)
+        if refusal is not None or kept is None:
+            return None, size, True, refusal or (
+                500,
+                {"error": f"{relative} could not be read"},
+            )
+        return kept, size, True, None
+    text, _size, refusal = _read_text_file(resolved, relative)
+    if refusal is not None or text is None:
+        return None, size, False, refusal or (
+            500,
+            {"error": f"{relative} could not be read"},
+        )
+    return _split_lines(text), size, False, None
 
 
 def process_code_list_files_request(
@@ -4051,8 +4241,15 @@ def process_code_read_file_request(
 
     The path is fenced for its spelling, resolved and compared against the
     repository root (so a link out of the tree is refused), and must be a file
-    git TRACKS. A file that is not text, or is over the byte cap, is refused
-    in one sentence rather than half-served. Never raises.
+    git TRACKS. A file that is not text is refused in one sentence rather than
+    half-served.
+
+    A file over the byte cap is served a LINE RANGE at a time: ask for one and
+    exactly those lines come back, with ``partial`` true, ``total_lines``
+    null — the rest of the file was never read, so its length is not known
+    here — and a note saying so. Ask for no range and it is refused, with the
+    same advice, which works. Line numbers are the file's own, counted on
+    newlines exactly as git, grep and every editor count them. Never raises.
     """
     if not isinstance(payload, dict):
         return 400, {"error": "request body must be a JSON object"}
@@ -4088,27 +4285,50 @@ def process_code_read_file_request(
                 "are no lines to read"
             )
         }
-    text, size, refusal = _read_text_file(resolved, relative)
-    if refusal is not None or text is None:
+    lines, size, partial, refusal = _read_file_lines(resolved, relative, first, last)
+    if refusal is not None or lines is None:
         return refusal or (500, {"error": f"{relative} could not be read"})
-    lines = text.splitlines()
     start = (first or 1) - 1
-    if start >= len(lines) and lines:
-        return 400, {
-            "error": (
-                f"'first_line' {start + 1} is past the end of {relative}, "
-                f"which has {len(lines)} lines"
-            )
-        }
-    end = last if last is not None else len(lines)
-    chosen = lines[start:end]
+    note: str | None = None
+    if partial:
+        # Only the window was read, so the file's own length is not known
+        # from here and is answered as null rather than as the window's
+        # length, which would be a lie a reader could not check.
+        chosen = lines
+        total: int | None = None
+        if not chosen:
+            return 400, {
+                "error": (
+                    f"'first_line' {start + 1} is past the end of {relative}, "
+                    "which has fewer lines than that"
+                )
+            }
+        note = (
+            f"{relative} is {size} bytes, over this door's limit of "
+            f"{CODE_MAX_FILE_BYTES} bytes, so only the lines you asked for "
+            "were read — the number of lines in the whole file is not known "
+            "from here"
+        )
+    else:
+        if start >= len(lines) and lines:
+            return 400, {
+                "error": (
+                    f"'first_line' {start + 1} is past the end of {relative}, "
+                    f"which has {len(lines)} lines"
+                )
+            }
+        end = last if last is not None else len(lines)
+        chosen = lines[start:end]
+        total = len(lines)
     return 200, {
         "path": relative,
         "content": "\n".join(chosen) + ("\n" if chosen else ""),
         "bytes": size,
-        "total_lines": len(lines),
+        "total_lines": total,
         "first_line": start + 1,
         "last_line": start + len(chosen),
+        "partial": partial,
+        "note": note,
     }
 
 
@@ -4219,7 +4439,9 @@ def process_code_imports_request(
             entry["note"] = sub_error
             files.append(entry)
             continue
-        text, _size, refusal = _read_text_file(inside, path)
+        text, _size, refusal = _read_text_file(
+            inside, path, over_size_advice=OVER_SIZE_IMPORTS_ADVICE
+        )
         if refusal is not None:
             entry["note"] = refusal[1].get("error")
             files.append(entry)
@@ -4546,7 +4768,7 @@ def process_code_search_request(
             continue
         files_searched += 1
         for number, line in enumerate(
-            data.decode("utf-8", errors="replace").splitlines(), start=1
+            _split_lines(data.decode("utf-8", errors="replace")), start=1
         ):
             # The clock is read here as well as once per file, because one
             # file can carry more lines than the whole rest of a repository
