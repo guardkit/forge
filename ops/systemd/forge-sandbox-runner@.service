@@ -112,13 +112,14 @@
 #
 #   THE LEADING '-' on the ExecStop line does not save you from any of the
 #   above: it forgives a stop that FAILS, not a stop that never finishes. What
-#   it is for is the ordinary case — a running unit with nothing left alive
-#   inside the sandbox, or a sandbox that has been removed since — where the
-#   bootstrap's stop has nothing to do and says so with a non-zero exit. That
-#   must not leave the unit failed. (systemd never runs ExecStop for a unit
-#   that is already inactive, so that is not the case being forgiven. A sandbox
-#   that is merely asleep is woken by sbx so the stop can run, which is what we
-#   want.)
+#   it is for is the DOOR itself failing — the sandbox has been removed, sbx
+#   cannot reach the daemon, the session will not open — so that a unit which
+#   cannot get in there is not left failed on the host. It is NOT for an idle
+#   sandbox: what the bootstrap's stop returns then is said once, in the
+#   paragraph above, and is not repeated here. Nor is it for a unit that is
+#   already stopped — systemd never runs ExecStop for a unit that is already
+#   inactive, so that is not the case being forgiven either. A sandbox that is
+#   merely asleep is woken by sbx so the stop can run, which is what we want.
 #
 # WHY TimeoutStopSec=60: the stop now does real work inside the sandbox — open
 #   a session, end the bootstrap, wait for both services — so it needs longer
@@ -141,8 +142,9 @@ Type=simple
 Environment=PATH=%h/.agentecflow/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=/usr/bin/sbx exec %i deploy/sandbox-runner.sh
 # The stop reaches inside the same sandbox and asks the bootstrap to stop
-# itself; '-' so a stop with nothing left alive in there cannot fail the unit.
-# systemd also runs this on every automatic restart. See WHY ExecStop above.
+# itself; '-' so a failure of the door — the sandbox gone, sbx unable to reach
+# it — cannot fail the unit. systemd also runs this on every automatic restart.
+# See WHY ExecStop above.
 ExecStop=-/usr/bin/sbx exec %i deploy/sandbox-runner.sh stop
 Restart=always
 RestartSec=5
