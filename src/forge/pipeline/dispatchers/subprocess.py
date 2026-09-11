@@ -658,6 +658,7 @@ def _build_argv_for_stage(
     fix_task: FixTaskReference | None = None,
     fix_task_yaml: str | None = None,
     forward_context: "Mapping[str, Any] | None" = None,
+    routine_seat: str | None = None,
 ) -> _DispatchPlan:
     """Assemble the subprocess argv + extra_context_paths for ``stage``.
 
@@ -722,6 +723,35 @@ def _build_argv_for_stage(
       them wrong. So this function never re-derives a fix journey's
       context. With none supplied the dispatch carries no context entries
       and says so at INFO — honestly less context, never a guessed one.
+
+    **THE ROUTINE SEAT — the model that writes this factory's code.**
+    Until this parameter existed, forge named a model for exactly ONE
+    thing: the fix journey's legs (the conductor adapter appends
+    ``--model <seat>`` from ``conductor.seat``). Every routine dispatch —
+    the whole eight-sentence path — carried no ``--model`` at all, so the
+    build system's own command line fell back to its default, which is
+    the literal string ``claude-sonnet-4-5-20250929``: a frontier
+    vendor's model NAME, which reaches a local model only because the
+    estate's proxy carries a wildcard row mapping ``claude-*`` to the
+    workhorse seat. Nothing was mis-served — the M0 seat fence keeps that
+    arrangement legal — but which model writes this factory's code was
+    decided by a line in a proxy's configuration file rather than by the
+    factory. A factory should name it. ``routine_seat`` (from
+    ``routine.seat`` in ``forge.yaml``) is how, and it rides exactly
+    where the fix journey's seat rides: appended as the two tokens
+    ``--model <seat>``, after everything the dispatch already carried.
+
+    Two rules hold it honest:
+
+    * **Unnamed is today, exactly.** No seat (or a blank one) appends
+      nothing whatsoever — no flag, no empty flag, nothing reordered — so
+      every deployed ``forge.yaml`` keeps working and the build system's
+      CLI default still applies.
+    * **The fix journey is untouched.** A routine seat never rides a
+      fix-journey stage, however it is threaded: those legs take their
+      seat from ``conductor.seat`` through the conductor's own adapter,
+      and a second ``--model`` pair on the same argv would be two answers
+      to one question.
     """
     subcommand = SUBPROCESS_STAGE_COMMANDS[stage]
     if forward_context is not None:
@@ -766,6 +796,18 @@ def _build_argv_for_stage(
         argv.extend(["--feature-id", feature_id])
 
     argv.extend(text_argv)
+
+    # The routine seat, last and only on the routine path — see this
+    # function's docstring for why it exists and why unnamed must stay
+    # byte-identical. Stripped here as well as at config load so a value
+    # that reached the dispatcher some other way can never put an empty
+    # token on the command line; the refusal of an option-shaped seat
+    # ("-m") lives at config load, where the daemon can refuse to boot
+    # instead of dying on a build an owner already approved.
+    seat = (routine_seat or "").strip()
+    if seat and stage not in MODE_C_STAGES:
+        argv.extend(["--model", seat])
+
     return _DispatchPlan(
         subcommand=subcommand,
         args=argv,
@@ -837,6 +879,7 @@ async def dispatch_subprocess_stage(
     fix_task: FixTaskReference | None = None,
     fix_task_yaml: str | None = None,
     forward_context: Mapping[str, Any] | None = None,
+    routine_seat: str | None = None,
     timeout_seconds: int = 600,
     with_nats_streaming: bool = True,
     extra_args: list[str] | None = None,
@@ -916,6 +959,16 @@ async def dispatch_subprocess_stage(
             one source of truth, because the conductor's builder is an
             adapter over that very builder and asking both would drop the
             pack half on the floor.
+        routine_seat: The model a ROUTINE dispatch runs on, named on
+            the command line as ``--model <seat>`` — the composition
+            root reads it from ``routine.seat`` in ``forge.yaml`` and
+            passes it through. ``None`` (the default) or a blank value
+            appends nothing at all, which is this dispatcher's argv
+            exactly as it has always been: no flag, nothing reordered,
+            and the build system's own CLI default still applies. Never
+            rides a fix-journey stage — those legs take their seat from
+            ``conductor.seat`` through the conductor's adapter. See
+            :func:`_build_argv_for_stage` for the whole statement.
         timeout_seconds: Forwarded to the runner. Defaults to the
             FEAT-FORGE-005 600-second contract (ASSUM-001).
         with_nats_streaming: Forwarded to the runner. Defaults to
@@ -1011,6 +1064,7 @@ async def dispatch_subprocess_stage(
             fix_task=fix_task,
             fix_task_yaml=fix_task_yaml,
             forward_context=forward_context,
+            routine_seat=routine_seat,
         )
         full_args = list(plan.args)
         if extra_args:
