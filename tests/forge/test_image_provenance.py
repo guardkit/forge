@@ -40,6 +40,13 @@ WHAT THESE TESTS PIN, and why each one is here.
   names the file; a missing file fails; an extra file fails; ``__pycache__``
   and ``.dist-info`` are ignored. These run the real script over real
   temporary directories, not a reimplementation of it.
+* The failure says what to actually DO, and the two cases need different
+  words. When the only difference is a file the image has and git does not
+  track — almost always a new source file nobody has committed yet —
+  "build it again" is wrong advice: the next build fails identically and
+  the operator goes round a loop. That case is told to commit the file (or
+  delete it) first. The stale-image sentence is kept for the case it truly
+  describes: contents that differ, or files missing from the image.
 * The canonical ``docker buildx build`` line still contains, byte for byte,
   the Contract A string that ``tests/dockerfile/test_install_layer.py``
   literal-matches. The provenance arguments are appended AFTER the context
@@ -358,6 +365,69 @@ def test_a_file_the_tree_does_not_have_fails_and_names_it(tmp_path: Path) -> Non
     assert result.returncode != 0
     assert "cli/leftover.py" in result.stderr
     assert "not in the tree" in result.stderr
+
+
+def test_an_untracked_file_is_told_to_commit_it_not_to_build_again(
+    tmp_path: Path,
+) -> None:
+    """The only difference is a file git does not track, so say so plainly.
+
+    This is what an operator hits when they build from a working tree that
+    holds a NEW file they have not committed yet: the build copies it in,
+    git does not list it, and the comparison refuses the image. The refusal
+    is right — an image should not quietly ship code nobody has committed —
+    but telling that operator to build the image again sends them round a
+    loop, because the next build fails in exactly the same way.
+    """
+    tree = _package(tmp_path / "tree", BASE_PACKAGE)
+    with_new_file = dict(BASE_PACKAGE)
+    with_new_file["coach_probe_tmp.py"] = "PROBE = True\n"
+    image = _package(tmp_path / "image", with_new_file)
+    _manifest(tree, tmp_path / "tree.tsv")
+    _manifest(image, tmp_path / "image.tsv")
+
+    result = _run_verify("--compare", str(tmp_path / "tree.tsv"), str(tmp_path / "image.tsv"))
+
+    assert result.returncode != 0
+    assert "coach_probe_tmp.py" in result.stderr
+    assert "git does not track" in result.stderr, (
+        "the operator must be told the difference is about tracking, not about "
+        f"a stale image; it said: {result.stderr!r}"
+    )
+    assert "Commit the file" in result.stderr, (
+        "the fix for an uncommitted new file is to commit it (or delete it); "
+        f"the failure said: {result.stderr!r}"
+    )
+    assert "This is the 2026-09-11 failure" not in result.stderr, (
+        "the stale-image sentence describes a different failure and its advice "
+        "— build it again — cannot cure an uncommitted file; the failure said: "
+        f"{result.stderr!r}"
+    )
+
+
+def test_contents_that_differ_still_carry_the_stale_image_sentence(
+    tmp_path: Path,
+) -> None:
+    """The sentence is kept for the case it actually describes."""
+    tree = _package(tmp_path / "tree", BASE_PACKAGE)
+    changed = dict(BASE_PACKAGE)
+    changed["subagents/autobuild_runner.py"] = "RUNNER = 'stale'\n"
+    changed["coach_probe_tmp.py"] = "PROBE = True\n"
+    image = _package(tmp_path / "image", changed)
+    _manifest(tree, tmp_path / "tree.tsv")
+    _manifest(image, tmp_path / "image.tsv")
+
+    result = _run_verify("--compare", str(tmp_path / "tree.tsv"), str(tmp_path / "image.tsv"))
+
+    assert result.returncode != 0
+    assert "This is the 2026-09-11 failure" in result.stderr, (
+        "a file whose contents differ IS the incident this guard was built for, "
+        f"and the operator should be told so; it said: {result.stderr!r}"
+    )
+    assert "Commit the file" not in result.stderr, (
+        "committing cures nothing when the image carries different contents; "
+        f"the failure said: {result.stderr!r}"
+    )
 
 
 def test_pycache_and_dist_info_are_ignored(tmp_path: Path) -> None:

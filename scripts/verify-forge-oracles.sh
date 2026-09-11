@@ -184,11 +184,23 @@ compare_manifests() {
             head -n 10 "${out}/missing" | sed 's|^|        |'
         fi
         if [ "${n_extra}" -gt 0 ]; then
-            echo "      files the image has that the tree does not (first ten):"
+            echo "      files the image has that git does not track (first ten):"
             head -n 10 "${out}/extra" | sed 's|^|        |'
         fi
-        echo "      This is the 2026-09-11 failure: an image can carry another commit's code while"
-        echo "      every build step reports as executed. Do not deploy this image; build it again."
+        # What to do next depends on WHICH of the three lists is non-empty, and
+        # telling the operator the wrong one sends them round a loop: building
+        # again cannot cure a file that has never been committed.
+        if [ "$((n_differs + n_missing))" -eq 0 ]; then
+            echo "      Every file the image and this tree share matches, and nothing is missing."
+            echo "      The only difference is the file or files listed above, which the image has"
+            echo "      and git does not track. That is almost always a new source file that has not"
+            echo "      been committed yet: the build copied it in, git does not list it, so there is"
+            echo "      nothing here to compare it against. Building again will fail in the same way."
+            echo "      Commit the file — or delete it, if it was not meant to be there — and build again."
+        else
+            echo "      This is the 2026-09-11 failure: an image can carry another commit's code while"
+            echo "      every build step reports as executed. Do not deploy this image; build it again."
+        fi
     } >&2
     return 1
 }
