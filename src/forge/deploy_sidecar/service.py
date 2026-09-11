@@ -3742,14 +3742,38 @@ CODE_BINARY_SNIFF_BYTES: int = 8_192
 CODE_IMPORTS_MAX_FILES: int = 200
 
 #: How many matching lines one search answers with, and how much of a single
-#: line comes back. A minified file is one line of half a megabyte, and
-#: without the second cap one match could be the whole answer.
+#: line is SEARCHED and comes back. A minified file is one line of half a
+#: megabyte, and without the second cap one match could be the whole answer.
+#: The same number bounds the text this door hands the regular-expression
+#: engine in one go, which is half of what keeps a search finishing; the other
+#: half is written under the timeout below. A line longer than this is
+#: searched up to here and no further, and the answer says how many lines that
+#: happened to, because a search that quietly skipped the end of a line would
+#: be exactly the sort of silent wrongness this door exists to end.
 CODE_SEARCH_MAX_MATCHES: int = 200
 CODE_SEARCH_MAX_LINE_CHARS: int = 500
 
-#: How long a search may spend reading files before it stops and says so. The
-#: search is our own code over a bounded file list, so this is a wall, not a
-#: budget.
+#: How long a search may spend before it stops and says so — and exactly what
+#: that promise is worth, because half a promise here would be worse than
+#: none.
+#:
+#: WHAT THE CLOCK HOLDS. It is read before every file and again before every
+#: line, so a search across any number of files, and down any number of lines
+#: inside one file, ends at this wall and comes back with ``timed_out`` true.
+#:
+#: WHAT NO CLOCK OF OURS CAN HOLD. Python's regular expressions backtrack, one
+#: ``search()`` call cannot be interrupted, and while it runs it holds the
+#: interpreter — so a single pathological line would freeze not just its own
+#: request but every other request this sidecar is serving, and the only cure
+#: would be restarting the sidecar, which this estate's own rule forbids while
+#: a build is in flight. Two things stand in for the clock there. The text
+#: handed to the engine for one line is capped (above). And a pattern whose
+#: SHAPE makes that work grow with every character of the line is refused in
+#: one plain sentence before a single file is read — the two shapes that do
+#: that, and the measurements behind them, are written above the check itself.
+#: That is the honest size of the promise: the clock holds everywhere the
+#: clock can see, and the two shapes it could not have stopped never reach the
+#: engine.
 CODE_SEARCH_TIMEOUT_SECONDS: float = 30.0
 
 #: The longest pattern a search may carry. A pattern is a person's sentence,
@@ -4225,6 +4249,209 @@ def process_code_imports_request(
     }
 
 
+# --- the one limit a clock cannot keep -------------------------------------
+#
+# Everything else this door promises is kept by reading a number. The search's
+# time limit cannot be, for one line at a time: Python's engine backtracks
+# inside a single call, that call holds the interpreter, and no timer, thread
+# or signal in this process can take it back. So the pattern's own shape is
+# read BEFORE any file is, and the shapes whose work grows explosively are
+# refused. There are two of those shapes, and both were measured on this
+# machine before this code was written:
+#
+#   * A GROUP REPEATED AROUND SOMETHING THAT ITSELF REPEATS or offers
+#     alternatives — ``(a+)+``, ``(\w+\.)+`` — where the engine can split the
+#     same text more ways at every extra character. ``(a+)+$`` against a
+#     sixty-four-character line of a's does not finish.
+#   * TWO REPEATED PIECES THAT CAN BOTH MATCH THE SAME CHARACTER, side by side
+#     with only optional pieces between them — ``a+a+a+a+a+$``, or the far more
+#     ordinary-looking ``\s*\w+\s*\w+\s*\w+$``. Neither finishes on a line of
+#     five hundred characters, which is this door's own line cap, so the cap
+#     does not save us and the clock cannot.
+#
+# Two repeated pieces that CANNOT match the same character are not ambiguous
+# and are not refused, which is why the patterns people actually write —
+# ``def\s+\w+\s*\(``, ``^\s*import\s+os``, ``[a-z]+_[a-z]+`` — all still run.
+#
+# The shape is read with the parser and the compiler Python's own ``re`` module
+# uses, so this is the engine's understanding of the pattern rather than a
+# guess at its text. If either is ever missing, or a pattern defeats the
+# reading, the fallback refuses any quantifier applied to a group at all, and a
+# piece whose characters cannot be worked out counts as matching everything —
+# both of which refuse more than they need to, and never less. This side fails
+# towards refusing.
+
+try:  # pragma: no cover - present in every Python this service runs on
+    from re import _compiler as _re_compiler  # type: ignore[attr-defined]
+    from re import _parser as _re_parser  # type: ignore[attr-defined]
+except Exception:  # pragma: no cover - a Python without the private parser
+    _re_parser = None  # type: ignore[assignment]
+    _re_compiler = None  # type: ignore[assignment]
+
+#: The fallback used only if the parser above is missing: a quantifier applied
+#: to a group.
+_QUANTIFIED_GROUP = re.compile(r"\)(?:[*+]|\{\d+,\})")
+
+#: What the parser calls "repeat this".
+_REPEAT_OPS = frozenset({"MAX_REPEAT", "MIN_REPEAT", "POSSESSIVE_REPEAT"})
+
+
+def _pattern_parts(arguments: Any) -> list[Any]:
+    """Every sub-pattern buried in one parsed node's arguments."""
+    if _re_parser is not None and isinstance(arguments, _re_parser.SubPattern):
+        return [arguments]
+    if isinstance(arguments, (tuple, list)):
+        found: list[Any] = []
+        for item in arguments:
+            found.extend(_pattern_parts(item))
+        return found
+    return []
+
+
+def _repeats_or_chooses(parsed: Any) -> bool:
+    """True if this piece of a pattern repeats anything or offers a choice."""
+    for opcode, arguments in parsed:
+        name = getattr(opcode, "name", str(opcode))
+        if name in _REPEAT_OPS:
+            _low, high, body = arguments
+            if high > 1 or _repeats_or_chooses(body):
+                return True
+        elif name == "BRANCH":
+            return True
+        elif any(_repeats_or_chooses(part) for part in _pattern_parts(arguments)):
+            return True
+    return False
+
+
+def _work_can_explode(parsed: Any) -> bool:
+    """True if a repeated group wraps something that repeats or chooses."""
+    for opcode, arguments in parsed:
+        name = getattr(opcode, "name", str(opcode))
+        if name in _REPEAT_OPS:
+            _low, high, body = arguments
+            if high > 1 and _repeats_or_chooses(body):
+                return True
+            if _work_can_explode(body):
+                return True
+        elif any(_work_can_explode(part) for part in _pattern_parts(arguments)):
+            return True
+    return False
+
+
+#: The characters the second rule asks about. One of each kind a source file
+#: is made of is enough to tell two repeated pieces apart; a piece that none of
+#: them fits is treated as matching everything, which refuses more, not less.
+_SAMPLE_CHARACTERS: tuple[str, ...] = tuple(
+    [chr(code) for code in range(32, 127)] + ["\t", "\n", "é", "€"]
+)
+
+
+def _characters_matched(body: Any, flags: int) -> frozenset[str] | None:
+    """Which sample characters this piece of a pattern can begin with.
+
+    ``None`` means "this piece could match anything", which is what a piece
+    this reader cannot work out is treated as.
+    """
+    if _re_compiler is None:
+        return None
+    try:
+        matcher = _re_compiler.compile(body, flags)
+    except Exception:  # noqa: BLE001 — an unreadable piece matches everything
+        return None
+    found = set()
+    for character in _SAMPLE_CHARACTERS:
+        match = matcher.match(character)
+        if match is not None and match.end() > 0:
+            found.add(character)
+    return frozenset(found) or None
+
+
+def _can_match_nothing(opcode: Any, arguments: Any) -> bool:
+    """True if this node can be skipped over without matching a character."""
+    name = getattr(opcode, "name", str(opcode))
+    if name in _REPEAT_OPS:
+        return arguments[0] == 0
+    if name in {"AT", "ASSERT", "ASSERT_NOT"}:
+        return True
+    if name == "BRANCH":
+        return any(
+            all(_can_match_nothing(*node) for node in branch)
+            for branch in arguments[1]
+        )
+    parts = _pattern_parts(arguments)
+    if name == "SUBPATTERN" and parts:
+        return all(_can_match_nothing(*node) for node in parts[0])
+    return False
+
+
+def _repeats_overlap(parsed: Any, flags: int) -> bool:
+    """True if one run of the pattern repeats two pieces side by side that can
+    both match the same character — the shape whose work grows with every
+    character of the line, with only optional pieces allowed between them."""
+    nodes = list(parsed)
+    repeats: list[tuple[int, frozenset[str] | None]] = []
+    for index, (opcode, arguments) in enumerate(nodes):
+        name = getattr(opcode, "name", str(opcode))
+        if name in _REPEAT_OPS and arguments[1] > 1:
+            repeats.append((index, _characters_matched(arguments[2], flags)))
+    for first in range(len(repeats)):
+        for second in range(first + 1, len(repeats)):
+            left, left_chars = repeats[first]
+            right, right_chars = repeats[second]
+            if not all(
+                _can_match_nothing(*node) for node in nodes[left + 1 : right]
+            ):
+                continue
+            if (
+                left_chars is None
+                or right_chars is None
+                or left_chars & right_chars
+            ):
+                return True
+    return any(
+        _repeats_overlap(part, flags)
+        for _opcode, arguments in nodes
+        for part in _pattern_parts(arguments)
+    )
+
+
+def _explosive_pattern_error(pattern: str, flags: int) -> str | None:
+    """One plain sentence if this pattern's shape could outlast every limit.
+
+    ``None`` means the pattern is a shape the search's clock can hold. Never
+    raises: a pattern that cannot be parsed here has already been refused by
+    the compiler above, with the engine's own reason.
+    """
+    nested = "repeats a group whose own content repeats or offers alternatives"
+    side_by_side = (
+        "repeats two pieces side by side that can both match the same "
+        "characters"
+    )
+    try:
+        if _re_parser is None:
+            raise RuntimeError("this Python has no regular-expression parser")
+        parsed = _re_parser.parse(pattern, flags)
+        if _work_can_explode(parsed):
+            shape = nested
+        elif _repeats_overlap(parsed, flags):
+            shape = side_by_side
+        else:
+            return None
+    except re.error:  # already refused above, with the engine's own reason
+        return None
+    except Exception:  # noqa: BLE001 — a shape this door cannot read is read crudely
+        if _QUANTIFIED_GROUP.search(pattern) is None:
+            return None
+        shape = nested
+    return (
+        f"'pattern' {pattern!r} {shape}, and that shape can make the search "
+        "engine's work grow past any time limit this door is able to enforce, "
+        "so it is refused before any file is read — send 'fixed_string': true "
+        "to search for it as plain text, or write it so that no repeated piece "
+        "can be matched two ways"
+    )
+
+
 def process_code_search_request(
     payload: Any, *, config: ForgeConfig
 ) -> tuple[int, dict[str, Any]]:
@@ -4236,9 +4463,23 @@ def process_code_search_request(
     pattern that does not compile is refused with the reason the regular
     expression engine gave, so the caller can fix it. ``fixed_string`` asks
     for the pattern to be taken literally, which is what somebody searching
-    for ``get_user(`` wants. Matches, the length of each returned line and the
-    time spent are all capped, and the answer says which cap it met. Never
-    raises.
+    for ``get_user(`` wants. Matches, the length of each searched and returned
+    line and the time spent are all capped, and the answer says which cap it
+    met. Never raises.
+
+    The time limit is read before every file AND before every line, so a
+    search always ends and says whether it ended early. The one thing no clock
+    in this process can interrupt is a single ``search()`` call inside the
+    engine, so two other limits stand there instead. At most
+    :data:`CODE_SEARCH_MAX_LINE_CHARS` characters of any one line are handed to
+    the engine, and ``long_lines_partly_searched`` counts the lines that were
+    longer than that, so a caller is never told a whole line was searched when
+    part of it was. And a pattern of either shape whose work grows with every
+    character of the line — a group repeated around something that itself
+    repeats, or two repeated pieces side by side that can both match the same
+    character — is refused in one sentence before any file is read. A pattern
+    that passes both checks and still outlasts the clock is possible in
+    principle; both shapes we have been able to make do that are refused here.
     """
     if not isinstance(payload, dict):
         return 400, {"error": "request body must be a JSON object"}
@@ -4267,6 +4508,10 @@ def process_code_search_request(
                 "search for it as plain text"
             )
         }
+    if not fixed:
+        explosive = _explosive_pattern_error(pattern, flags)
+        if explosive is not None:
+            return 400, {"error": explosive}
     prefix, error = _code_under_error(repo_path, payload.get("under"))
     if error:
         return 400, {"error": error}
@@ -4277,6 +4522,7 @@ def process_code_search_request(
 
     matches: list[dict[str, Any]] = []
     files_searched = 0
+    long_lines = 0
     capped = False
     timed_out = False
     deadline = time.monotonic() + CODE_SEARCH_TIMEOUT_SECONDS
@@ -4302,7 +4548,19 @@ def process_code_search_request(
         for number, line in enumerate(
             data.decode("utf-8", errors="replace").splitlines(), start=1
         ):
-            if not compiled.search(line):
+            # The clock is read here as well as once per file, because one
+            # file can carry more lines than the whole rest of a repository
+            # and a limit checked only at a file boundary is not a limit.
+            if time.monotonic() > deadline:
+                timed_out = True
+                break
+            # Only this much of the line is handed to the engine, and the
+            # count below means the answer can say so.
+            over_cap = len(line) > CODE_SEARCH_MAX_LINE_CHARS
+            if over_cap:
+                long_lines += 1
+            searched = line[:CODE_SEARCH_MAX_LINE_CHARS] if over_cap else line
+            if not compiled.search(searched):
                 continue
             if len(matches) >= limit:
                 capped = True
@@ -4311,10 +4569,12 @@ def process_code_search_request(
                 {
                     "path": path,
                     "line": number,
-                    "text": line[:CODE_SEARCH_MAX_LINE_CHARS],
-                    "line_truncated": len(line) > CODE_SEARCH_MAX_LINE_CHARS,
+                    "text": searched,
+                    "line_truncated": over_cap,
                 }
             )
+        if timed_out:
+            break
     return 200, {
         "pattern": pattern,
         "fixed_string": fixed,
@@ -4325,6 +4585,7 @@ def process_code_search_request(
         "capped": capped,
         "cap": limit,
         "line_cap": CODE_SEARCH_MAX_LINE_CHARS,
+        "long_lines_partly_searched": long_lines,
         "timed_out": timed_out,
     }
 
