@@ -1316,20 +1316,19 @@ def _resolve_guardkit_path() -> Path | None:
     return None
 
 
-def _load_filesystem_allowlist() -> list[Path] | None:
-    """Best-effort loader for ``forge_config.permissions.filesystem.allowlist``.
+def _forge_config_file() -> Path | None:
+    """The one ``forge.yaml`` this process reads, or ``None`` when there is none.
 
-    The runner subagent does not receive ``ForgeConfig`` directly (it is a
-    LangGraph thread launched by the supervisor). For the allowlist gate,
-    we attempt to load ``./forge.yaml`` (or ``$FORGE_CONFIG_PATH``) lazily;
-    on any failure we return ``None`` and the resolver falls back to a
-    permissive base-dir-only check. The integration tests bypass this
-    entirely by monkey-patching :func:`_resolve_repo_path` at the module
-    surface.
+    Two candidates, in this order: the file named by ``$FORGE_CONFIG_PATH``
+    (with ``~`` expanded), then ``forge.yaml`` beside the process's working
+    directory. The first that exists as a file wins, and a named path that
+    is not there falls through to the plain ``forge.yaml`` — which is what
+    every reader in this module has always done.
 
-    Returns:
-        A list of allowlisted :class:`Path` roots, or ``None`` when no
-        config could be loaded.
+    This function is the ONE place the module looks for the factory's
+    configuration: the permissions allowlist, the routine seat and the
+    repository map all come through it, so there is a single answer to
+    "which file did the runner read".
     """
     config_path_env = os.environ.get("FORGE_CONFIG_PATH", "").strip()
     candidate_paths: list[Path] = []
@@ -1338,25 +1337,63 @@ def _load_filesystem_allowlist() -> list[Path] | None:
     candidate_paths.append(Path("forge.yaml"))
 
     for cfg_path in candidate_paths:
-        if not cfg_path.is_file():
-            continue
-        try:
-            # Local import keeps the module import-light when no config exists.
-            from forge.config.loader import load_config  # type: ignore[import-not-found]
-
-            cfg = load_config(cfg_path)
-        except Exception as exc:  # noqa: BLE001 — best-effort loader
-            logger.warning(
-                "autobuild_runner: failed to load forge config from %s: %s",
-                cfg_path,
-                exc,
-            )
-            return None
-        try:
-            return list(cfg.permissions.filesystem.allowlist)
-        except AttributeError:
-            return None
+        if cfg_path.is_file():
+            return cfg_path
     return None
+
+
+def _load_forge_config(cfg_path: Path) -> Any:
+    """Parse one ``forge.yaml`` through the estate's own loader.
+
+    Whatever the loader raises comes straight back out: each caller catches
+    it and says, in its own plain words, what it is doing instead. Kept
+    here so the module has one way to PARSE the configuration as well as
+    one way to FIND it.
+
+    There is deliberately no cache. A parse is one file read and one
+    validation, it happens a handful of times in a build that runs for
+    minutes, and a cache would hold a stale document after an operator
+    edits ``forge.yaml`` under a long-running daemon — a real hazard
+    bought for an unmeasurable saving.
+    """
+    # Local import keeps the module import-light when no config exists.
+    from forge.config.loader import load_config  # type: ignore[import-not-found]
+
+    return load_config(cfg_path)
+
+
+def _load_filesystem_allowlist() -> list[Path] | None:
+    """Best-effort loader for ``forge_config.permissions.filesystem.allowlist``.
+
+    The runner subagent does not receive ``ForgeConfig`` directly (it is a
+    LangGraph thread launched by the supervisor). For the allowlist gate,
+    we attempt to load ``./forge.yaml`` (or ``$FORGE_CONFIG_PATH``) lazily,
+    through :func:`_forge_config_file` and :func:`_load_forge_config`; on
+    any failure we return ``None`` and the resolver falls back to a
+    permissive base-dir-only check. The integration tests bypass this
+    entirely by monkey-patching :func:`_resolve_repo_path` at the module
+    surface.
+
+    Returns:
+        A list of allowlisted :class:`Path` roots, or ``None`` when no
+        config could be loaded.
+    """
+    cfg_path = _forge_config_file()
+    if cfg_path is None:
+        return None
+    try:
+        cfg = _load_forge_config(cfg_path)
+    except Exception as exc:  # noqa: BLE001 — best-effort loader
+        logger.warning(
+            "autobuild_runner: failed to load forge config from %s: %s",
+            cfg_path,
+            exc,
+        )
+        return None
+    try:
+        return list(cfg.permissions.filesystem.allowlist)
+    except AttributeError:
+        return None
 
 
 def _load_routine_seat() -> str | None:
@@ -1400,23 +1437,10 @@ def _load_routine_seat() -> str | None:
         named (which is today's behaviour exactly).
     """
     try:
-        config_path_env = os.environ.get("FORGE_CONFIG_PATH", "").strip()
-        candidate_paths: list[Path] = []
-        if config_path_env:
-            candidate_paths.append(Path(config_path_env).expanduser())
-        candidate_paths.append(Path("forge.yaml"))
-
-        for cfg_path in candidate_paths:
-            if not cfg_path.is_file():
-                continue
+        cfg_path = _forge_config_file()
+        if cfg_path is not None:
             try:
-                # Local import keeps the module import-light when no config
-                # exists — the same posture as the allowlist loader above.
-                from forge.config.loader import (  # type: ignore[import-not-found]
-                    load_config,
-                )
-
-                cfg = load_config(cfg_path)
+                cfg = _load_forge_config(cfg_path)
             except Exception as exc:  # noqa: BLE001 — best-effort loader
                 logger.warning(
                     "autobuild_runner: could not read a routine seat from %s "
@@ -1523,11 +1547,116 @@ def repo_resolution_failure_reason(payload: Mapping[str, Any]) -> str:
     return f"unable to resolve repo path for repo={repo_raw!r}"
 
 
+def _configured_repo_path(repo_key: str) -> Path | None:
+    """The checkout the factory's own configuration gives for ``repo_key``.
+
+    WHY THIS EXISTS, in plain words. The runner used to work out where a
+    repository lives by GUESSING: take the last part of the name and look
+    for it under a base directory, which defaults to
+    ``~/Projects/appmilla_github``. That held only while the runner ran as
+    the owner on the owner's machine. Routine builds now run INSIDE the
+    repository's sandbox as a different user, where ``~`` is
+    ``/home/agent``, so the guess pointed at a directory that has never
+    existed and the first routine build after the move died two seconds
+    in with "unable to resolve repo path". The repository was mounted all
+    along, at the same path it has on the host — and that exact path was
+    already written in the factory's own configuration, in
+    ``planning.target_repo_paths``, which this same module already reads
+    for the permissions allowlist and the routine seat. The guess was the
+    defect; the map is the answer.
+
+    HOW IT IS READ. Through :func:`_forge_config_file` and
+    :func:`_load_forge_config` — the same file, found the same way and
+    parsed by the same loader as the allowlist and the seat. No second
+    way to find configuration, no new environment variable.
+
+    THE LOOKUP IS BY EXACT KEY. The map carries a repository under every
+    name the factory calls it by (``guardkit/api_test`` and
+    ``appmilla_github/api_test`` both name the same checkout today), so
+    no fuzzy matching is wanted here: a name the map does not carry is a
+    miss, and a miss falls through to the old base-directory route.
+
+    AND IT NEVER KILLS A BUILD. No configuration file, no planning
+    section, no map, no matching key, a file that cannot be read, a value
+    that is not a path — all mean the same thing, NO CONFIGURED PATH, and
+    the caller then behaves exactly as it did before this function
+    existed.
+
+    Args:
+        repo_key: The repository name exactly as the launch payload
+            carries it, e.g. ``"guardkit/api_test"``.
+
+    Returns:
+        The configured checkout path (unvalidated — the caller applies
+        the same checks it applies to a guessed path), or ``None`` when
+        the configuration names no path for this repository.
+    """
+    try:
+        cfg_path = _forge_config_file()
+        if cfg_path is None:
+            return None
+
+        try:
+            cfg = _load_forge_config(cfg_path)
+        except Exception as exc:  # noqa: BLE001 — best-effort loader
+            logger.warning(
+                "autobuild_runner: could not read the repository map from %s "
+                "(%s) — falling back to looking for the checkout under the "
+                "base directory",
+                cfg_path,
+                exc,
+            )
+            return None
+
+        mapping = getattr(getattr(cfg, "planning", None), "target_repo_paths", None)
+        if not isinstance(mapping, Mapping) or not mapping:
+            return None
+
+        raw = mapping.get(repo_key)
+        if raw is None:
+            return None
+
+        if not isinstance(raw, str) or not raw.strip():
+            logger.warning(
+                "autobuild_runner: the factory's configuration (%s) gives "
+                "repo=%r the value %r, which is not a path — falling back to "
+                "looking for the checkout under the base directory",
+                cfg_path,
+                repo_key,
+                raw,
+            )
+            return None
+
+        configured = Path(raw.strip()).expanduser().resolve()
+        logger.info(
+            "autobuild_runner: repo=%r comes from the factory's configuration "
+            "(%s names it as %s), not from the base directory",
+            repo_key,
+            cfg_path,
+            configured,
+        )
+        return configured
+    except Exception as exc:  # noqa: BLE001 — a reader must never kill a build
+        logger.warning(
+            "autobuild_runner: reading the repository map failed (%s) — "
+            "falling back to looking for the checkout under the base "
+            "directory",
+            exc,
+        )
+        return None
+
+
 def _resolve_repo_path(payload: Mapping[str, Any]) -> Path | None:
     """Resolve the absolute local checkout for ``payload['repo']``.
 
-    Maps ``payload["repo"]`` (e.g. ``"appmilla/api_test"``) to
-    ``<FORGE_REPO_BASE>/<basename>`` and validates that the resolved path:
+    Two routes, in this order. FIRST the factory's own configuration: if
+    ``planning.target_repo_paths`` in ``forge.yaml`` names this exact
+    repository, that path is the candidate (see
+    :func:`_configured_repo_path`). SECOND, and only when the map has
+    nothing to say, the historical guess: ``payload["repo"]`` (e.g.
+    ``"appmilla/api_test"``) mapped to ``<FORGE_REPO_BASE>/<basename>``.
+
+    Either way the candidate is validated the same, in this order:
 
     1. Exists on disk.
     2. Is a git repo (``.git/`` present as a directory or file — git
@@ -1584,23 +1713,48 @@ def _resolve_repo_path(payload: Mapping[str, Any]) -> Path | None:
         )
         repo_raw = env_repo
 
-    # Accept ``org/repo`` and bare ``repo`` (defensive — the BuildQueuedPayload
-    # field is loosely shaped; only the basename matters for the local layout).
-    basename = repo_raw.strip().split("/")[-1]
-    if not basename:
-        logger.warning(
-            "autobuild_runner: repo=%r has empty basename after split — "
-            "cannot resolve checkout path",
-            repo_raw,
-        )
-        return None
+    repo_key = repo_raw.strip()
 
+    # The base directory is worked out on both routes: the guess needs it to
+    # build a path, and BOTH routes fall back to it as the allowlist root
+    # when no configuration is discoverable.
     base_dir_raw = (
         os.environ.get(FORGE_REPO_BASE_ENV, "").strip() or DEFAULT_FORGE_REPO_BASE
     )
     base_dir = Path(base_dir_raw).expanduser().resolve()
-    candidate = (base_dir / basename).resolve()
 
+    # THE MAP FIRST, THE GUESS SECOND. The configured path is what the
+    # factory was told; the base directory is what the runner can infer. When
+    # the two disagree the configuration wins, because the guess is exactly
+    # what broke when routine builds moved inside the sandbox.
+    candidate = _configured_repo_path(repo_key)
+    if candidate is None:
+        # Accept ``org/repo`` and bare ``repo`` (defensive — the
+        # BuildQueuedPayload field is loosely shaped; only the basename
+        # matters for the local layout).
+        basename = repo_key.split("/")[-1]
+        if not basename:
+            logger.warning(
+                "autobuild_runner: repo=%r has empty basename after split — "
+                "cannot resolve checkout path",
+                repo_raw,
+            )
+            return None
+
+        candidate = (base_dir / basename).resolve()
+        logger.info(
+            "autobuild_runner: repo=%r is not named in the factory's "
+            "configuration, so the checkout is looked for under the base "
+            "directory %s",
+            repo_key,
+            base_dir,
+        )
+
+    # ONE SET OF CHECKS, WHICHEVER ROUTE THE PATH CAME FROM — and a
+    # configured path that fails any of them is REFUSED, never quietly
+    # swapped for the guess. A configured path that is wrong is an operator's
+    # mistake in the factory's own configuration: the factory must show it,
+    # not paper over it with a directory that happens to be there.
     if not candidate.exists():
         logger.warning(
             "autobuild_runner: resolved repo path %s does not exist on disk "
