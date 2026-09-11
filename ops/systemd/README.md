@@ -131,6 +131,40 @@ cp ops/systemd/forge-sandbox-runner@.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 ```
 
+### Stopping it has to reach inside the sandbox (2026-09-11)
+
+The unit runs a **client** on the host; all the work happens inside the
+sandbox. So ending the client ends nothing in there — the bootstrap
+`deploy/sandbox-runner.sh` keeps running inside the sandbox, still supervising
+and restarting the sidecar and the build runner. Before this was fixed, every
+`systemctl --user restart` of this unit therefore looked like it had worked and
+quietly left the old work running, adding one more supervisor each time.
+
+On 2026-09-11 four supervisors had piled up inside the api-test-deploy sandbox,
+the oldest a day old, all fighting for ports 8124 and 8125. The one that held
+the ports was older than the code that had just been installed underneath it,
+so it served a mixture of old and new code, and a feature build died one second
+after Rich tapped its gate. Nothing anywhere reported a problem; the go-live's
+own check had looked at the installed FILE, which was correct and beside the
+point.
+
+The unit now carries an `ExecStop` that goes through the same door as the
+start — `sbx exec %i` on the same sandbox — and asks the repository's own
+bootstrap to stop itself:
+
+```
+ExecStop=-/usr/bin/sbx exec %i deploy/sandbox-runner.sh stop
+```
+
+`stop` is the bootstrap's own documented stop mode (the lane beside this one
+adds it): it ends the running bootstrap and the services it started, inside the
+sandbox, and it exits 0 when there is nothing to stop. The unit therefore knows
+nothing about how the bootstrap names its children — no process patterns live in
+the unit file. The leading `-` means a failed stop never fails the unit, because
+stopping something that is already stopped is ordinary. `TimeoutStopSec=60`
+bounds the whole stop: the stop now does real work inside the sandbox, and if it
+hangs, systemd kills the held session as it always did.
+
 A sandbox created before the profile named the service ports keeps its old
 shape (no clone, no mounts, no service ports): `sbx` cannot add those to a
 sandbox that exists, so it is removed and created again, attended, before

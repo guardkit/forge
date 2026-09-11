@@ -20,8 +20,9 @@
 #
 #   Starting it is what the repository's own deploy wrapper does, every deploy,
 #   when the profile's sandbox block names the two service ports; starting an
-#   already-running unit does nothing. Stopping it stops both services inside
-#   the sandbox (the bootstrap stops them on the signal) and ends the session.
+#   already-running unit does nothing. Stopping it runs the ExecStop below,
+#   which reaches inside the sandbox and ends the bootstrap and the two
+#   services, and then ends the held session on the host. See WHY ExecStop.
 #
 #   forge-prod reaches the two services over the ports the sandbox publishes
 #   to the host's loopback (the profile's sidecar_publish and runner_publish,
@@ -53,8 +54,42 @@
 #   exec that was cut off. The bootstrap is safe to run again: the venv and the
 #   install are made once and reused.
 #
-# WHY KillMode=process: stopping the unit should end the held session and
-#   nothing else. The sandbox's own contents are not this unit's business.
+# WHY ExecStop (added 2026-09-11): this unit runs a CLIENT on the host and all
+#   the work happens inside the sandbox. Ending the client ends nothing in
+#   there: the bootstrap deploy/sandbox-runner.sh keeps running inside the
+#   sandbox and keeps supervising and restarting the deploy sidecar and the
+#   build runner. Without an ExecStop, therefore, "systemctl --user stop" (and
+#   every "restart", which is a stop then a start) LOOKS like it worked and
+#   leaves the old work running, so each restart adds another supervisor.
+#
+#   What that cost, on 2026-09-11: four supervisors had piled up inside the
+#   api-test-deploy sandbox, the oldest a day old, all fighting for ports 8124
+#   and 8125; the one holding the ports was older than the code that had just
+#   been installed beneath it, so it served a mixture of old and new code, and
+#   a feature build died one second after Rich tapped its gate. Nothing
+#   anywhere reported a problem.
+#
+#   So the stop goes through the SAME door as the start — `sbx exec %i`, the
+#   same sandbox instance — and asks the repository's own bootstrap to stop
+#   itself: `deploy/sandbox-runner.sh stop`. That is the bootstrap's documented
+#   stop mode (added in the lane beside this one): it ends the running
+#   bootstrap and the services it started, inside the sandbox, and it exits 0
+#   when there is nothing to stop. The unit calls that one word and knows
+#   nothing about how the bootstrap names its own children — no process
+#   patterns live in this file.
+#
+#   The leading '-' on the ExecStop line means a failing stop never fails the
+#   unit: stopping something already stopped, or a sandbox that is asleep or
+#   gone, is ordinary and must not leave the unit in a failed state.
+#
+# WHY TimeoutStopSec=60: the stop now does real work inside the sandbox — open
+#   a session, end the bootstrap, wait for both services — so it needs longer
+#   than the old 20 seconds, and it stays bounded so a stop that hangs cannot
+#   hang the box. When the time runs out systemd kills the session as before.
+#
+# WHY KillMode=process: after the ExecStop above has emptied the sandbox, the
+#   only thing left to kill on the host is the held session itself. The
+#   sandbox's own contents are not this unit's business to kill from out here.
 
 [Unit]
 Description=Keeps the factory's deploy sidecar and build runner up inside the %i Docker Sandbox
@@ -67,9 +102,12 @@ Type=simple
 # tools it reaches for are found under systemd's otherwise minimal environment.
 Environment=PATH=%h/.agentecflow/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=/usr/bin/sbx exec %i deploy/sandbox-runner.sh
+# The stop reaches inside the same sandbox and asks the bootstrap to stop
+# itself; '-' so an already-stopped unit stops cleanly. See WHY ExecStop above.
+ExecStop=-/usr/bin/sbx exec %i deploy/sandbox-runner.sh stop
 Restart=always
 RestartSec=5
-TimeoutStopSec=20
+TimeoutStopSec=60
 KillMode=process
 StandardOutput=journal
 StandardError=journal
