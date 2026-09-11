@@ -59,8 +59,9 @@
 #   there: the bootstrap deploy/sandbox-runner.sh keeps running inside the
 #   sandbox and keeps supervising and restarting the deploy sidecar and the
 #   build runner. Without an ExecStop, therefore, "systemctl --user stop" (and
-#   every "restart", which is a stop then a start) LOOKS like it worked and
-#   leaves the old work running, so each restart adds another supervisor.
+#   every "restart", typed or automatic, which is a stop then a start) LOOKS
+#   like it worked and leaves the old work running, so each restart adds
+#   another supervisor.
 #
 #   What that cost, on 2026-09-11: four supervisors had piled up inside the
 #   api-test-deploy sandbox, the oldest a day old, all fighting for ports 8124
@@ -86,16 +87,38 @@
 #   against an older copy, "systemctl --user stop" would start ANOTHER
 #   supervisor inside the sandbox, never return, run out the TimeoutStopSec
 #   below, and leave the unit failed — and "restart", being a stop and then a
-#   start, would ADD TWO supervisors where it meant to remove one. That is
-#   worse than the bug this ExecStop exists to fix, in exactly the situation
-#   that cost an hour on 2026-09-11. The leading '-' does not save you: it
-#   forgives a stop that FAILS, not a stop that never finishes.
+#   start, would ADD TWO supervisors where it meant to remove one.
 #
-#   The leading '-' on the ExecStop line means a failing stop never fails the
-#   unit: stopping something already stopped, or a sandbox that has been
-#   removed, is ordinary and must not leave the unit in a failed state. (A
-#   sandbox that is merely asleep is woken by sbx so the stop can run, which
-#   is what we want.)
+#   AND NOBODY HAS TO TYPE ANYTHING FOR THAT TO HAPPEN, so "I will install it
+#   and never type stop" is no protection. systemd runs this stop by itself:
+#   its manual says the stop commands run whenever a service that started
+#   successfully goes down, "even if the processes in the service terminated on
+#   their own or were killed". This unit is Restart=always with RestartSec=5,
+#   so every time the held session drops — the sleeping sandbox, the daemon
+#   restart, the exec that was cut off, the three reasons the Restart=always
+#   note above gives — systemd runs the stop before it runs the next start.
+#   Against an older bootstrap that is: one more supervisor, a stop that hangs
+#   for the full sixty seconds, the session killed, and the same again five
+#   seconds later. Unattended, on a loop, for as long as the unit is enabled —
+#   the 2026-09-11 pile-up made continuous, not the one-off pair above. The
+#   only protection is the right bootstrap.
+#
+#   AGAINST THE CORRECT BOOTSTRAP that same automatic stop is what we want, and
+#   it does change how this unit behaves: a dropped session now ends the work
+#   inside the sandbox before starting it again, so the deploy sidecar and the
+#   build runner BOUNCE where they used to keep serving straight through. That
+#   is the trade this line makes deliberately — a few seconds with no service,
+#   instead of supervisors piling up and serving a mixture of old and new code.
+#
+#   THE LEADING '-' on the ExecStop line does not save you from any of the
+#   above: it forgives a stop that FAILS, not a stop that never finishes. What
+#   it is for is the ordinary case — a running unit with nothing left alive
+#   inside the sandbox, or a sandbox that has been removed since — where the
+#   bootstrap's stop has nothing to do and says so with a non-zero exit. That
+#   must not leave the unit failed. (systemd never runs ExecStop for a unit
+#   that is already inactive, so that is not the case being forgiven. A sandbox
+#   that is merely asleep is woken by sbx so the stop can run, which is what we
+#   want.)
 #
 # WHY TimeoutStopSec=60: the stop now does real work inside the sandbox — open
 #   a session, end the bootstrap, wait for both services — so it needs longer
@@ -118,7 +141,8 @@ Type=simple
 Environment=PATH=%h/.agentecflow/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=/usr/bin/sbx exec %i deploy/sandbox-runner.sh
 # The stop reaches inside the same sandbox and asks the bootstrap to stop
-# itself; '-' so an already-stopped unit stops cleanly. See WHY ExecStop above.
+# itself; '-' so a stop with nothing left alive in there cannot fail the unit.
+# systemd also runs this on every automatic restart. See WHY ExecStop above.
 ExecStop=-/usr/bin/sbx exec %i deploy/sandbox-runner.sh stop
 Restart=always
 RestartSec=5

@@ -137,8 +137,9 @@ The unit runs a **client** on the host; all the work happens inside the
 sandbox. So ending the client ends nothing in there — the bootstrap
 `deploy/sandbox-runner.sh` keeps running inside the sandbox, still supervising
 and restarting the sidecar and the build runner. Before this was fixed, every
-`systemctl --user restart` of this unit therefore looked like it had worked and
-quietly left the old work running, adding one more supervisor each time.
+restart of this unit — typed, or made by systemd's own `Restart=always` —
+therefore looked like it had worked and quietly left the old work running,
+adding one more supervisor each time.
 
 On 2026-09-11 four supervisors had piled up inside the api-test-deploy sandbox,
 the oldest a day old, all fighting for ports 8124 and 8125. The one that held
@@ -165,18 +166,38 @@ this file for a sandbox until the copy of `deploy/sandbox-runner.sh` that the
 sandbox actually runs — the factory's clone of that repository — takes the word
 `stop` and stops. Older copies of the bootstrap read no arguments at all: they
 ignore the word and run their ordinary **start** path instead. Against such a
-copy, `systemctl --user stop` starts another supervisor inside the sandbox,
-never returns, runs out the 60 seconds and leaves the unit failed — and
-`restart`, which is a stop and then a start, adds two supervisors where it meant
-to remove one. That is worse than the bug this stop line exists to fix. The
-leading `-` does not help: it forgives a stop that fails, not a stop that never
-finishes. So the order is: replace that repository's bootstrap first, then
-install this unit. The unit therefore knows
-nothing about how the bootstrap names its children — no process patterns live in
-the unit file. The leading `-` means a failed stop never fails the unit, because
-stopping something that is already stopped is ordinary. `TimeoutStopSec=60`
-bounds the whole stop: the stop now does real work inside the sandbox, and if it
-hangs, systemd kills the held session as it always did.
+copy, a stop starts another supervisor inside the sandbox, never returns, runs
+out the 60 seconds and leaves the unit failed; and a restart, being a stop and
+then a start, adds two supervisors where it meant to remove one. So the order
+is: replace that repository's bootstrap first, then install this unit.
+
+**Deciding never to type `stop` is not a way round that.** systemd runs this
+stop by itself. Its manual is explicit that the stop commands run whenever a
+service which started successfully goes down, "even if the processes in the
+service terminated on their own or were killed", and this unit is
+`Restart=always` with `RestartSec=5`. So every time the held session drops — a
+sleeping sandbox, a daemon restart, an exec that was cut off — systemd runs the
+stop before it runs the next start. Against an old bootstrap that is one more
+supervisor, a stop that hangs for the full 60 seconds, the session killed, and
+the same again five seconds later: unattended and repeating, for as long as the
+unit is enabled. That is the 2026-09-11 pile-up made continuous, not the one-off
+pair described above. The only protection is the right bootstrap.
+
+**What changes against the correct bootstrap.** The same automatic stop is then
+what we want, and it is a real change of behaviour worth knowing about: a
+dropped session now ends the work inside the sandbox before starting it again,
+so the sidecar and the build runner bounce where they used to keep serving
+straight through the restart. That is the deliberate trade — a few seconds with
+no service, instead of supervisors piling up and serving a mixture of old and
+new code.
+
+The ordinary mechanics, once the bootstrap is right: the unit knows nothing
+about how the bootstrap names its children, because it calls one word — no
+process patterns live in the unit file. The leading `-` means a stop that exits
+non-zero never fails the unit; the case that needs forgiving is a running unit
+with nothing left alive inside the sandbox, or a sandbox that has been removed
+since. And `TimeoutStopSec=60` bounds the whole stop, which now does real work
+in there: if it hangs, systemd kills the held session as it always did.
 
 A sandbox created before the profile named the service ports keeps its old
 shape (no clone, no mounts, no service ports): `sbx` cannot add those to a
