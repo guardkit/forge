@@ -47,6 +47,7 @@ import logging
 import json
 import posixpath
 import re
+import subprocess
 import tempfile
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -89,8 +90,12 @@ __all__ = [
     "ValidatePassBarFn",
     "DividerRepairResult",
     "comment_box_drawing_dividers",
+    "FrontmatterIdRefusal",
     "FrontmatterIdRepair",
     "FrontmatterRepairResult",
+    "MAX_TRUNCATION_CHARS",
+    "is_repairable_truncation",
+    "read_frontmatter_feature_id",
     "repair_frontmatter_feature_id",
     "repair_plan_task_frontmatter",
     "TS_TEST_FILE_SUFFIXES",
@@ -896,17 +901,70 @@ def _repair_box_drawing_dividers(target: Path, feature_rel_path: str) -> str | N
 # run with NO bounded revision loop. Frontmatter is the last unrepaired
 # truncation site (tree/path truncation already has the defect-#14/#15 repairs).
 #
-# THE REPAIR — conservative by law. For every task doc the plan wrote, parse the
-# ``feature_id`` in its FIRST YAML frontmatter block; ONLY when that value V is a
-# non-empty STRICT PREFIX of the canonical feature id
-# (``canonical.startswith(V) and V != canonical``) — i.e. a truncation — is the
-# one value rewritten in place to the canonical id (quoting style preserved). A
-# NON-prefix mismatch (e.g. ``FEAT-9999`` under FEAT-07F3), an already-correct
-# id, an empty value, a doc with no frontmatter / no feature_id, and every other
-# frontmatter field are all left byte-for-byte untouched so the oracle refuses
-# exactly as today. Idempotent by construction: once V == canonical the strict-
-# prefix guard no longer fires.
+# THE SECOND LIVE INCIDENT, and it is why the three fences below exist
+# (2026-09-12 11:58Z, planning run 1318e2d5, feature FEAT-DBB5): the repair
+# walked EVERY task document in the tree and rewrote twelve of api_test's own
+# PostgreSQL documents — a real, separate feature called FEAT-DB, none of them
+# written by that run — onto FEAT-DBB5, purely because "FEAT-DB" is a prefix of
+# "FEAT-DBB5". A repair for a writer's own slip may NEVER edit a file that
+# writer did not just write: that is the fence that was missing, and it is the
+# one that makes the rest safe. A complete id that happens to be a prefix of
+# another id is indistinguishable from a truncation, so the shape alone can
+# never tell them apart.
+#
+# THE REPAIR — conservative by law, and fenced three ways.
+#
+#   1. SCOPE. Only the task documents THIS planning run wrote are considered:
+#      the ones the leg is about to commit. Every other document in the tree is
+#      out of reach, whatever its frontmatter says.
+#   2. NEVER RENAME A REAL FEATURE. Within that scope, a value the repository
+#      already knows as a feature of its own (a file under ``.guardkit/features/``,
+#      or the feature id of a task document this run did not write) is refused.
+#      If the repository cannot be consulted at all, the rewrite is REFUSED and
+#      reported — unknown is not permission.
+#   3. SHAPE. Only a truncation of the last character or two (see
+#      :data:`MAX_TRUNCATION_CHARS`) is a repairable truncation.
+#
+# Within the fences the rule is the original one: the found value V is rewritten
+# to the canonical id (quoting style preserved) only when V is a non-empty
+# prefix of the canonical id. A NON-prefix mismatch (e.g. ``FEAT-9999`` under
+# FEAT-07F3), an already-correct id, an empty value, a doc with no frontmatter /
+# no feature_id, and every other frontmatter field are all left byte-for-byte
+# untouched so the oracle refuses exactly as today. Idempotent by construction:
+# once V == canonical the prefix test no longer fires.
+#
+# EVERY REFUSAL IS SAID OUT LOUD (one plain sentence naming the document, the id
+# found, the canonical id and the rule that refused it) and rides the same
+# receipt the repairs ride. A silent no-op is how this would go unnoticed in the
+# other direction.
 # ---------------------------------------------------------------------------
+
+#: The most characters a truncation may drop off the END of the canonical
+#: feature id and still be treated as a truncation. The observed defect dropped
+#: exactly ONE character, twice (FEAT-048 for FEAT-0482; FEAT-07F for
+#: FEAT-07F3); two leaves one character of slack for the same deterministic slip
+#: on a longer id, and no more. The old rule — any non-empty prefix — could not
+#: tell a truncation from a complete id that happens to be a prefix of another
+#: (FEAT-DB under FEAT-DBB5), which is how twelve innocent documents were
+#: renamed. The bound alone does not settle that case (FEAT-DB is two characters
+#: short); the scope and known-feature fences do. It is here because a repair
+#: should only ever admit the shape of the defect it was written for.
+MAX_TRUNCATION_CHARS: int = 2
+
+#: How long the ``git status`` that names this run's own writes may take.
+_GIT_SCOPE_TIMEOUT_SECONDS: int = 30
+
+#: How many refusals the receipt spells out before it counts the rest. Every
+#: refusal is logged in full either way; this keeps the sentence a person reads
+#: on a card readable in one pass.
+_REFUSAL_RECEIPT_MAX: int = 5
+
+#: The refusal rules, in the plain words the receipt says them in.
+REFUSAL_NOT_WRITTEN_BY_THIS_RUN = "not written by this run"
+REFUSAL_WRITES_UNKNOWN = "this run's own writes could not be identified"
+REFUSAL_ALREADY_A_FEATURE = "already a feature of this repository"
+REFUSAL_FEATURES_UNREADABLE = "this repository's features could not be read"
+REFUSAL_NOT_A_TRUNCATION = "more missing than a truncation"
 
 #: A ``---`` YAML frontmatter delimiter line (leading/trailing blanks tolerated).
 _FRONTMATTER_DELIM_RE = re.compile(r"^[ \t]*---[ \t]*$")
@@ -931,28 +989,78 @@ class FrontmatterIdRepair:
 
 
 @dataclass
+class FrontmatterIdRefusal:
+    """One task doc the repair COULD have rewritten and deliberately did not.
+
+    ``found`` is the frontmatter feature id, ``canonical`` the feature id of the
+    run, and ``rule`` the plain-words rule that refused it. :attr:`sentence` is
+    the one sentence the receipt carries.
+    """
+
+    rel_path: str
+    found: str
+    canonical: str
+    rule: str
+    reason: str
+
+    @property
+    def sentence(self) -> str:
+        return (
+            f"P-8 frontmatter repair REFUSED for {self.rel_path}: it says "
+            f"feature_id {self.found} and this run's feature is "
+            f'{self.canonical}; rule "{self.rule}" — {self.reason}.'
+        )
+
+
+@dataclass
 class FrontmatterRepairResult:
     """Outcome of :func:`repair_plan_task_frontmatter` over a plan tree.
 
-    ``repairs`` is the per-doc before->after record (empty when the repair did
-    not fire — in which case every scanned doc is byte-untouched on disk).
+    ``repairs`` is the per-doc before->after record; ``refusals`` is the per-doc
+    record of every document the repair could have rewritten by shape and
+    refused by rule. Both empty means every scanned doc is byte-untouched on
+    disk and there was nothing to say. A refusal NEVER changes a file.
     """
 
     repairs: list[FrontmatterIdRepair]
+    refusals: list[FrontmatterIdRefusal] = field(default_factory=list)
 
     @property
     def fired(self) -> bool:
+        """True when there is something to say — a repair or a refusal."""
+        return bool(self.repairs or self.refusals)
+
+    @property
+    def repaired(self) -> bool:
+        """True when at least one document was rewritten."""
         return bool(self.repairs)
 
     def receipt(self, canonical_feature_id: str) -> str:
-        """A LOUD one-line receipt naming every repaired doc + before->after."""
-        detail = "; ".join(
-            f"{r.rel_path}: {r.before} -> {r.after}" for r in self.repairs
-        )
-        return (
-            f"P-8 frontmatter repair: rewrote {len(self.repairs)} truncated "
-            f"task-doc feature_id(s) to canonical {canonical_feature_id} [{detail}]"
-        )
+        """A LOUD receipt: every repaired doc's before->after, then one plain
+        sentence per refusal naming the document, the id found, the canonical
+        id and the rule that refused it. At most
+        :data:`_REFUSAL_RECEIPT_MAX` refusals are spelled out and the rest are
+        counted, so the sentence a person reads stays readable in one pass;
+        every refusal is in the log in full either way."""
+        parts: list[str] = []
+        if self.repairs:
+            detail = "; ".join(
+                f"{r.rel_path}: {r.before} -> {r.after}" for r in self.repairs
+            )
+            parts.append(
+                f"P-8 frontmatter repair: rewrote {len(self.repairs)} truncated "
+                f"task-doc feature_id(s) to canonical {canonical_feature_id} "
+                f"[{detail}]"
+            )
+        shown = self.refusals[:_REFUSAL_RECEIPT_MAX]
+        parts.extend(refusal.sentence for refusal in shown)
+        remaining = len(self.refusals) - len(shown)
+        if remaining > 0:
+            parts.append(
+                f"({remaining} more document(s) were refused the same way; "
+                "every one of them is named in the log.)"
+            )
+        return " ".join(parts)
 
 
 def _unquote_yaml_scalar(value: str) -> str:
@@ -979,95 +1087,382 @@ def _requote_yaml_scalar(original_token: str, replacement: str) -> str:
     return replacement
 
 
-def repair_frontmatter_feature_id(
-    text: str, canonical_feature_id: str
-) -> tuple[str, str | None]:
-    """Repair a strict-prefix-truncated ``feature_id`` in one task doc (P-8).
+def _locate_frontmatter_feature_id(
+    text: str,
+) -> tuple[list[str], int, re.Match[str]] | None:
+    """Find the ``feature_id`` line of the FIRST YAML frontmatter block.
 
-    Pure and deterministic. If ``text`` opens with a ``---`` YAML frontmatter
-    block whose ``feature_id`` value V is a NON-EMPTY STRICT PREFIX of
-    ``canonical_feature_id`` (``canonical.startswith(V) and V != canonical``),
-    that single value is rewritten to the canonical id in place (quoting style
-    preserved) and ``(new_text, V)`` is returned. Every other case — no
-    frontmatter, no ``feature_id``, an already-correct id, an empty value, or a
-    NON-prefix mismatch — returns ``(text, None)`` byte-for-byte unchanged. Only
-    the ``feature_id`` field in the FIRST frontmatter block is ever touched.
+    Returns ``(lines, index, match)`` — the file's lines (newlines kept), the
+    index of the ``feature_id`` line and its match — or ``None`` when the text
+    does not open with a closed frontmatter block carrying a ``feature_id``.
     """
-    if not canonical_feature_id:
-        return text, None
     lines = text.splitlines(keepends=True)
     if not lines or _FRONTMATTER_DELIM_RE.match(lines[0].rstrip("\r\n")) is None:
-        return text, None
+        return None
     close_idx: int | None = None
     for i in range(1, len(lines)):
         if _FRONTMATTER_DELIM_RE.match(lines[i].rstrip("\r\n")) is not None:
             close_idx = i
             break
     if close_idx is None:
-        return text, None
+        return None
     for i in range(1, close_idx):
         match = _FEATURE_ID_LINE_RE.match(lines[i].rstrip("\r\n"))
-        if match is None:
-            continue
-        raw_token = match.group("value").strip()
-        before = _unquote_yaml_scalar(raw_token)
-        # First (and only) feature_id line decides the outcome for this doc.
-        if not before or before == canonical_feature_id:
-            return text, None
-        if not canonical_feature_id.startswith(before):
-            # NON-prefix mismatch — DO NOT touch; let the oracle refuse as today.
-            return text, None
-        newline_suffix = lines[i][len(lines[i].rstrip("\r\n")):]
-        lines[i] = (
-            match.group("prefix")
-            + _requote_yaml_scalar(raw_token, canonical_feature_id)
-            + newline_suffix
+        if match is not None:
+            return lines, i, match
+    return None
+
+
+def read_frontmatter_feature_id(text: str) -> str | None:
+    """The ``feature_id`` of one task doc's first frontmatter block, or ``None``.
+
+    Pure; reads, never writes. An empty value reads as ``None``.
+    """
+    located = _locate_frontmatter_feature_id(text)
+    if located is None:
+        return None
+    _lines, _index, match = located
+    value = _unquote_yaml_scalar(match.group("value").strip())
+    return value or None
+
+
+def is_repairable_truncation(found: str, canonical_feature_id: str) -> bool:
+    """True when ``found`` has the SHAPE of the observed truncation defect.
+
+    That shape is: a non-empty prefix of the canonical id, shorter than it by at
+    most :data:`MAX_TRUNCATION_CHARS` characters. Shape alone is never
+    permission — the scope and known-feature fences decide the rest.
+    """
+    if not found or not canonical_feature_id:
+        return False
+    if not canonical_feature_id.startswith(found) or found == canonical_feature_id:
+        return False
+    return len(canonical_feature_id) - len(found) <= MAX_TRUNCATION_CHARS
+
+
+def repair_frontmatter_feature_id(
+    text: str, canonical_feature_id: str
+) -> tuple[str, str | None]:
+    """Repair a truncated ``feature_id`` in one task doc (P-8).
+
+    Pure and deterministic, and the SHAPE half of the rule only — the caller
+    (:func:`repair_plan_task_frontmatter`) owns the scope and known-feature
+    fences. If ``text`` opens with a ``---`` YAML frontmatter block whose
+    ``feature_id`` value V is a truncation of ``canonical_feature_id`` by
+    :func:`is_repairable_truncation`, that single value is rewritten to the
+    canonical id in place (quoting style preserved) and ``(new_text, V)`` is
+    returned. Every other case — no frontmatter, no ``feature_id``, an
+    already-correct id, an empty value, a NON-prefix mismatch, or a prefix that
+    falls short by more than :data:`MAX_TRUNCATION_CHARS` — returns
+    ``(text, None)`` byte-for-byte unchanged. Only the ``feature_id`` field in
+    the FIRST frontmatter block is ever touched.
+    """
+    if not canonical_feature_id:
+        return text, None
+    located = _locate_frontmatter_feature_id(text)
+    if located is None:
+        return text, None
+    lines, index, match = located
+    raw_token = match.group("value").strip()
+    before = _unquote_yaml_scalar(raw_token)
+    if not is_repairable_truncation(before, canonical_feature_id):
+        # Not the defect's shape — DO NOT touch; let the oracle refuse as today.
+        return text, None
+    newline_suffix = lines[index][len(lines[index].rstrip("\r\n")):]
+    lines[index] = (
+        match.group("prefix")
+        + _requote_yaml_scalar(raw_token, canonical_feature_id)
+        + newline_suffix
+    )
+    return "".join(lines), before
+
+
+def _is_git_worktree(worktree_path: Path) -> bool | None:
+    """Is this directory inside a git worktree? ``None`` when git cannot say."""
+    try:
+        result = subprocess.run(  # noqa: S603 — fixed argv, no shell
+            ["git", "rev-parse", "--is-inside-work-tree"],
+            cwd=str(worktree_path),
+            capture_output=True,
+            text=True,
+            timeout=_GIT_SCOPE_TIMEOUT_SECONDS,
         )
-        return "".join(lines), before
-    return text, None
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode == 0:
+        return result.stdout.strip() == "true"
+    if "not a git repository" in (result.stderr or "").lower():
+        return False
+    return None
+
+
+def _git_uncommitted_paths(worktree_path: Path) -> set[str] | None:
+    """The repository-relative paths this run has written but not committed.
+
+    The planning leg writes its files into a fresh worktree and only then runs
+    this repair, so "what git has not got yet" IS "what this run just wrote".
+    ``None`` when git could not be asked — and unknown is not permission, so the
+    caller then refuses every rewrite and says so.
+    """
+    try:
+        status = subprocess.run(  # noqa: S603 — fixed argv, no shell
+            ["git", "status", "--porcelain", "-z", "--untracked-files=all"],
+            cwd=str(worktree_path),
+            capture_output=True,
+            text=True,
+            timeout=_GIT_SCOPE_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if status.returncode != 0:
+        return None
+    paths: set[str] = set()
+    fields = [f for f in status.stdout.split("\0") if f]
+    index = 0
+    while index < len(fields):
+        entry = fields[index]
+        index += 1
+        if len(entry) < 4:
+            continue
+        codes, path = entry[:2], entry[3:]
+        paths.add(path)
+        if codes[0] in {"R", "C"}:
+            # A rename/copy carries its SOURCE in the next field; the run wrote
+            # the destination, which is the one already added above.
+            index += 1
+    return paths
+
+
+def _normalise_rel(path: str | Path) -> str:
+    """One spelling for a repository-relative path (posix, no ``./`` prefix)."""
+    text = Path(path).as_posix()
+    while text.startswith("./"):
+        text = text[2:]
+    return text.strip("/")
+
+
+def _known_feature_ids_from_registry(worktree_path: Path) -> tuple[set[str], bool]:
+    """The feature ids recorded under ``.guardkit/features/``.
+
+    Returns ``(ids, readable)``. An ABSENT directory is an answer, not a failure
+    — the repository records no features that way — so it reads as an empty set
+    that was readable. A directory that exists and cannot be listed or read IS a
+    failure to consult, and the caller then refuses every rewrite.
+    """
+    features_dir = worktree_path / ".guardkit" / "features"
+    if not features_dir.is_dir():
+        return set(), True
+    ids: set[str] = set()
+    try:
+        entries = sorted(features_dir.iterdir())
+    except OSError:
+        return ids, False
+    for entry in entries:
+        try:
+            if not entry.is_file() or entry.suffix not in {".yaml", ".yml"}:
+                continue
+        except OSError:
+            return ids, False
+        ids.add(entry.stem)
+    return ids, True
+
+
+def _log_refusals(refusals: Sequence[FrontmatterIdRefusal]) -> None:
+    """Every refusal in the log, one line each — the receipt may count the tail,
+    the log never does."""
+    for refusal in refusals:
+        logger.warning("repair_plan_task_frontmatter: %s", refusal.sentence)
 
 
 def repair_plan_task_frontmatter(
-    worktree_path: Path, canonical_feature_id: str
+    worktree_path: Path,
+    canonical_feature_id: str,
+    *,
+    written_rel_paths: Sequence[str | Path] | None = None,
 ) -> FrontmatterRepairResult:
-    """Repair strict-prefix-truncated frontmatter feature_ids across a plan tree.
+    """Repair truncated frontmatter feature_ids among THIS RUN'S OWN task docs.
 
-    Scans every ``*.md`` task doc under ``worktree_path/tasks`` (the plan tree's
-    task files — ``tasks/backlog/**`` per the 008 contract) and applies
-    :func:`repair_frontmatter_feature_id` in place. A doc is rewritten ONLY when
-    its frontmatter feature_id is a strict-prefix truncation of
-    ``canonical_feature_id``; a clean doc is left byte-untouched. Idempotent.
+    ``written_rel_paths`` is the set of repository-relative task documents this
+    planning run wrote — the ones the plan leg is committing, which the leg
+    already knows because it is writing them. When it is not passed, the same
+    set is read from git: the worktree's uncommitted files (see
+    :func:`_git_uncommitted_paths`). Both live callers — the plan leg's own
+    pre-commit closure and the sidecar's declared ``feature-validate`` check —
+    run against a worktree the runner has just materialised and not yet
+    committed, so git's answer there IS this run's writing; a caller that holds
+    the file map it is committing may pass it instead and be exact. A document outside that set is out of
+    reach, whatever its frontmatter says: **a repair for a writer's own slip may
+    never edit a file that writer did not just write.**
+
+    Within that scope a document is rewritten only when its frontmatter
+    feature_id is a truncation of ``canonical_feature_id``
+    (:func:`is_repairable_truncation`) AND that value is not itself a feature
+    this repository already knows — a file under ``.guardkit/features/``, or the
+    feature id of a task document this run did not write. If the repository
+    cannot be consulted, the rewrite is refused rather than guessed.
+
+    Every document the shape alone would have caught and a rule refused is named
+    in :attr:`FrontmatterRepairResult.refusals`, one plain sentence each, so a
+    refusal is never silent. Refusals change no bytes on disk. Idempotent.
 
     Contained per the oracle-boundary doctrine: a missing ``tasks`` tree, or an
-    unreadable / undecodable / unwritable doc, is a silent no-op left for the
-    downstream oracle to report — this never crashes the planning leg.
+    unwritable doc, is a no-op left for the downstream oracle to report — this
+    never crashes the planning leg. A doc that cannot be READ is different: the
+    repair cannot tell what feature it belongs to, so it counts as a repository
+    that could not be consulted and the rewrites are refused.
     """
     repairs: list[FrontmatterIdRepair] = []
+    refusals: list[FrontmatterIdRefusal] = []
     tasks_root = worktree_path / "tasks"
     if not tasks_root.is_dir():
-        return FrontmatterRepairResult(repairs=repairs)
+        return FrontmatterRepairResult(repairs=repairs, refusals=refusals)
+
+    # --- the scope fence: what did THIS run write? -------------------------
+    # A repair for a writer's own slip may NEVER edit a file that writer did not
+    # just write. ``scope`` is the set of repository-relative paths this run
+    # wrote; ``None`` means "there is no repository here, so every task doc in
+    # this tree is this tree's own" — the unit-test fixture shape, never the
+    # live planning worktree, which is always a git worktree.
+    scope: set[str] | None
+    writes_unknown = False
+    if written_rel_paths is not None:
+        scope = {_normalise_rel(p) for p in written_rel_paths}
+    else:
+        inside = _is_git_worktree(worktree_path)
+        if inside is None:
+            scope, writes_unknown = set(), True
+        elif inside is False:
+            scope = None
+        else:
+            from_git = _git_uncommitted_paths(worktree_path)
+            if from_git is None:
+                scope, writes_unknown = set(), True
+            else:
+                scope = {_normalise_rel(path) for path in from_git}
+
+    # --- read the tree once: this run's docs, and everybody else's ---------
+    candidates: list[tuple[Path, str, str, str]] = []  # (doc, rel, text, found)
+    others_ids: set[str] = set()
+    unreadable_doc = False
     for doc in sorted(tasks_root.rglob("*.md")):
         try:
-            original = doc.read_text(encoding="utf-8")
+            rel = _normalise_rel(doc.relative_to(worktree_path))
+        except ValueError:  # pragma: no cover — doc is under the worktree by construction
+            rel = _normalise_rel(doc)
+        mine = scope is None or rel in scope
+        try:
+            text = doc.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
+            # Unreadable: for somebody else's document that means the repair
+            # cannot learn which feature it belongs to, which is a repository it
+            # could not consult.
+            if not mine:
+                unreadable_doc = True
             continue
-        new_text, before = repair_frontmatter_feature_id(original, canonical_feature_id)
-        if before is None:
+        found = read_frontmatter_feature_id(text)
+        if not mine:
+            if found:
+                others_ids.add(found)
+        if not found or found == canonical_feature_id:
+            continue
+        if not canonical_feature_id.startswith(found):
+            # A NON-prefix mismatch was never the defect's shape, and saying so
+            # for every unrelated document in the tree would be noise — the
+            # oracle refuses it exactly as today.
+            continue
+        if mine:
+            candidates.append((doc, rel, text, found))
+            continue
+        # The 12-document incident: a document this run did not write, whose id
+        # is a prefix of this run's feature id. Name it, and touch nothing.
+        refusals.append(
+            FrontmatterIdRefusal(
+                rel_path=rel,
+                found=found,
+                canonical=canonical_feature_id,
+                rule=(
+                    REFUSAL_WRITES_UNKNOWN
+                    if writes_unknown
+                    else REFUSAL_NOT_WRITTEN_BY_THIS_RUN
+                ),
+                reason=(
+                    "this run's own writes could not be read from the "
+                    "repository, and a rewrite nobody can verify is refused"
+                    if writes_unknown
+                    else "this planning run did not write that document"
+                ),
+            )
+        )
+
+    if not candidates:
+        _log_refusals(refusals)
+        return FrontmatterRepairResult(repairs=repairs, refusals=refusals)
+
+    # --- the known-feature fence: never rename a real feature --------------
+    registry_ids, registry_readable = _known_feature_ids_from_registry(worktree_path)
+    known_ids = registry_ids | others_ids
+    consultable = registry_readable and not unreadable_doc
+
+    for doc, rel, text, found in candidates:
+        if not consultable:
+            refusals.append(
+                FrontmatterIdRefusal(
+                    rel_path=rel,
+                    found=found,
+                    canonical=canonical_feature_id,
+                    rule=REFUSAL_FEATURES_UNREADABLE,
+                    reason=(
+                        "the repository's own features could not be read, so "
+                        "the rewrite cannot be shown to be safe, and unknown "
+                        "is not permission"
+                    ),
+                )
+            )
+            continue
+        if found in known_ids:
+            refusals.append(
+                FrontmatterIdRefusal(
+                    rel_path=rel,
+                    found=found,
+                    canonical=canonical_feature_id,
+                    rule=REFUSAL_ALREADY_A_FEATURE,
+                    reason=(
+                        f"{found} is a feature this repository already has, so "
+                        "rewriting it would rename a real feature"
+                    ),
+                )
+            )
+            continue
+        if not is_repairable_truncation(found, canonical_feature_id):
+            short_by = len(canonical_feature_id) - len(found)
+            refusals.append(
+                FrontmatterIdRefusal(
+                    rel_path=rel,
+                    found=found,
+                    canonical=canonical_feature_id,
+                    rule=REFUSAL_NOT_A_TRUNCATION,
+                    reason=(
+                        f"it is {short_by} characters shorter than "
+                        f"{canonical_feature_id}, and a truncation drops at "
+                        f"most {MAX_TRUNCATION_CHARS}"
+                    ),
+                )
+            )
+            continue
+        new_text, before = repair_frontmatter_feature_id(text, canonical_feature_id)
+        if before is None:  # pragma: no cover — the shape was checked above
             continue
         try:
             doc.write_text(new_text, encoding="utf-8")
         except OSError:
             continue
-        try:
-            rel = str(doc.relative_to(worktree_path))
-        except ValueError:  # pragma: no cover — doc is under worktree by construction
-            rel = str(doc)
         repairs.append(
             FrontmatterIdRepair(
                 rel_path=rel, before=before, after=canonical_feature_id
             )
         )
-    return FrontmatterRepairResult(repairs=repairs)
+    _log_refusals(refusals)
+    return FrontmatterRepairResult(repairs=repairs, refusals=refusals)
 
 
 def _combine_validate_error_streams(
@@ -1115,15 +1510,17 @@ def make_validate_feature_plan(
 
     async def _validate(worktree_path: Path, feature_id: str) -> ToolOutcome:
         allowlist = list(read_allowlist or [worktree_path])
-        # P-8 pre-oracle repair: rewrite any strict-prefix-truncated task-doc
-        # frontmatter feature_id to the canonical id BEFORE the guardkit validate
-        # oracle sees the tree, so a deterministic last-character truncation gets
-        # a parity-clean tree instead of dying with no revision loop. Conservative
-        # (only strict-prefix truncations of feature_id), information-preserving,
-        # LOUD (logs + receipts the per-doc before->after when it fires), and
-        # contained (a missing/unreadable doc is a no-op). If the tree STILL fails
-        # to validate afterwards (e.g. a NON-prefix mismatch was left untouched),
-        # the refuse path below is byte-for-byte unchanged.
+        # P-8 pre-oracle repair: rewrite a truncated task-doc frontmatter
+        # feature_id to the canonical id BEFORE the guardkit validate oracle
+        # sees the tree, so a deterministic last-character truncation gets a
+        # parity-clean tree instead of dying with no revision loop. Fenced three
+        # ways (only THIS RUN'S OWN documents; never an id the repository
+        # already knows as a feature; only a truncation of the last character or
+        # two), information-preserving, LOUD (logs + receipts every repair AND
+        # every refusal), and contained (a missing/unwritable doc is a no-op).
+        # If the tree STILL fails to validate afterwards (a refusal, or a
+        # NON-prefix mismatch left untouched), the refuse path below says so and
+        # is otherwise unchanged.
         repair = repair_plan_task_frontmatter(worktree_path, feature_id)
         repair_note: str | None = None
         if repair.fired:
@@ -1158,13 +1555,15 @@ def make_validate_feature_plan(
         # INFO/WARNING preamble. Observability only — the refuse decision is
         # unchanged.
         streams = _combine_validate_error_streams(stdout_tail=tail, stderr=stderr)
-        return ToolOutcome(
-            ok=False,
-            detail=(
-                f"guardkit feature validate {status} (exit {exit_code}) for "
-                f"{feature_id}: {streams}"
-            ),
+        detail = (
+            f"guardkit feature validate {status} (exit {exit_code}) for "
+            f"{feature_id}: {streams}"
         )
+        # A repair that refused is part of why the oracle refused: say it here
+        # too, not only in the log, so nobody has to go looking for it.
+        if repair_note:
+            detail = f"{detail}\n{repair_note}"
+        return ToolOutcome(ok=False, detail=detail)
 
     return _validate
 

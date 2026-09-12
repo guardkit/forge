@@ -8,6 +8,8 @@ guardkit binary).
 
 from __future__ import annotations
 
+import os
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -22,6 +24,8 @@ from forge.planning.target_terminal_tools import (
     comment_box_drawing_dividers,
     FrontmatterIdRepair,
     FrontmatterRepairResult,
+    is_repairable_truncation,
+    read_frontmatter_feature_id,
     repair_frontmatter_feature_id,
     repair_plan_task_frontmatter,
     NormalizerModuleUnresolved,
@@ -1161,6 +1165,299 @@ async def test_p8_wired_clean_docs_no_receipt(tmp_path: Path) -> None:
     assert outcome.ok
     assert outcome.detail == ""  # repair did not fire -> no receipt
     assert (tmp_path / "tasks/backlog/TASK-A001.md").read_text(encoding="utf-8") == original
+
+
+# ---------------------------------------------------------------------------
+# P-8's three fences (2026-09-12) — the repair mends only what THIS run wrote,
+# never renames a real feature, and only ever admits the shape of the defect it
+# was written for. Real files in real temporary directories, and a real git
+# repository where the fence reads the run's own writing from git.
+#
+# THE INCIDENT: planning run 1318e2d5 (feature FEAT-DBB5) rewrote twelve of
+# api_test's own PostgreSQL task documents — feature FEAT-DB, a real separate
+# feature, none of them written by that run — onto FEAT-DBB5, because "FEAT-DB"
+# is a prefix of "FEAT-DBB5".
+# ---------------------------------------------------------------------------
+
+_DB_DOCS = (
+    "tasks/backlog/TASK-DB-005-create-initial-migration.md",
+    "tasks/backlog/postgresql-database/TASK-DB-002-setup-alembic-migrations.md",
+    "tasks/backlog/postgresql-database/TASK-DB-004-setup-test-infrastructure.md",
+)
+
+
+def _git(repo: Path, *args: str) -> str:
+    """Run one git command in ``repo`` and return its stdout (raises on red)."""
+    result = subprocess.run(
+        ["git", *args], cwd=str(repo), capture_output=True, text=True, check=True
+    )
+    return result.stdout
+
+
+def _git_repo_with_committed_db_docs(
+    root: Path, rels: tuple[str, ...] = _DB_DOCS
+) -> Path:
+    """A real repository whose FEAT-DB documents are already on the branch —
+    the shape api_test had when the incident happened."""
+    root.mkdir(parents=True, exist_ok=True)
+    _git(root, "init", "-q", "-b", "main")
+    _git(root, "config", "user.email", "tests@example.invalid")
+    _git(root, "config", "user.name", "P-8 tests")
+    for rel in rels:
+        target = root / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(_task_doc("FEAT-DB", Path(rel).stem), encoding="utf-8")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "the PostgreSQL feature, FEAT-DB")
+    return root
+
+
+def test_p8_the_observed_incident_a_doc_this_run_did_not_write_is_untouched(
+    tmp_path: Path,
+) -> None:
+    """The twelve-document incident, in miniature: FEAT-DB documents already on
+    the branch, a run whose feature is FEAT-DBB5 — and the repair leaves every
+    one of them exactly as it found it."""
+    repo = _git_repo_with_committed_db_docs(tmp_path / "api_test")
+    before = {rel: (repo / rel).read_bytes() for rel in _DB_DOCS}
+
+    result = repair_plan_task_frontmatter(repo, "FEAT-DBB5")
+
+    assert not result.repairs  # nothing was rewritten
+    for rel in _DB_DOCS:
+        assert (repo / rel).read_bytes() == before[rel], rel
+    # And it says why, naming every document it declined to touch.
+    assert {r.rel_path for r in result.refusals} == set(_DB_DOCS)
+    receipt = result.receipt("FEAT-DBB5")
+    for rel in _DB_DOCS:
+        assert rel in receipt
+    assert "FEAT-DB" in receipt and "FEAT-DBB5" in receipt
+    assert ttt.REFUSAL_NOT_WRITTEN_BY_THIS_RUN in receipt
+    assert "did not write that document" in receipt
+
+
+def test_p8_a_refusal_receipt_names_the_document_the_ids_and_the_rule(
+    tmp_path: Path,
+) -> None:
+    repo = _git_repo_with_committed_db_docs(tmp_path / "api_test")
+    result = repair_plan_task_frontmatter(repo, "FEAT-DBB5")
+    refusal = next(
+        r for r in result.refusals if r.rel_path == _DB_DOCS[0]
+    )
+    assert refusal.sentence == (
+        f"P-8 frontmatter repair REFUSED for {_DB_DOCS[0]}: it says feature_id "
+        "FEAT-DB and this run's feature is FEAT-DBB5; rule "
+        '"not written by this run" — this planning run did not write that '
+        "document."
+    )
+
+
+def test_p8_git_names_this_runs_own_writing_and_only_that_is_repaired(
+    tmp_path: Path,
+) -> None:
+    """Both fences at once in one real repository: the committed FEAT-DB
+    documents are out of reach, and the document this run just wrote — a
+    genuine last-character truncation — is repaired."""
+    repo = _git_repo_with_committed_db_docs(tmp_path / "api_test")
+    mine = repo / "tasks/backlog/TASK-DBB5-001-add-the-endpoint.md"
+    mine.write_text(_task_doc("FEAT-DBB", "TASK-DBB5-001"), encoding="utf-8")
+    untouched = {rel: (repo / rel).read_bytes() for rel in _DB_DOCS}
+
+    result = repair_plan_task_frontmatter(repo, "FEAT-DBB5")
+
+    assert [r.rel_path for r in result.repairs] == [
+        "tasks/backlog/TASK-DBB5-001-add-the-endpoint.md"
+    ]
+    assert "feature_id: FEAT-DBB5\n" in mine.read_text(encoding="utf-8")
+    for rel in _DB_DOCS:
+        assert (repo / rel).read_bytes() == untouched[rel], rel
+
+
+def test_p8_a_doc_this_run_wrote_with_a_last_character_truncation_is_repaired(
+    tmp_path: Path,
+) -> None:
+    """The genuine defect-#14/#15 case, repaired byte for byte as today."""
+    rel = "tasks/backlog/TASK-A001.md"
+    _write_task_tree(tmp_path, {rel: _task_doc("FEAT-07F", "TASK-A001")})
+    original = (tmp_path / rel).read_text(encoding="utf-8")
+
+    result = repair_plan_task_frontmatter(
+        tmp_path, "FEAT-07F3", written_rel_paths=[rel]
+    )
+
+    assert [r.rel_path for r in result.repairs] == [rel]
+    assert result.repairs[0].before == "FEAT-07F"
+    assert not result.refusals
+    assert (tmp_path / rel).read_text(encoding="utf-8") == original.replace(
+        "feature_id: FEAT-07F\n", "feature_id: FEAT-07F3\n"
+    )
+    assert (
+        read_frontmatter_feature_id((tmp_path / rel).read_text(encoding="utf-8"))
+        == "FEAT-07F3"
+    )
+
+
+def test_p8_a_written_doc_whose_id_is_a_real_feature_is_refused(
+    tmp_path: Path,
+) -> None:
+    """Even inside the run's own writing, an id the repository already knows as
+    a feature is never renamed — a feature file under .guardkit/features/ is
+    the repository saying so."""
+    features = tmp_path / ".guardkit" / "features"
+    features.mkdir(parents=True)
+    (features / "FEAT-DB.yaml").write_text("id: FEAT-DB\n", encoding="utf-8")
+    rel = "tasks/backlog/TASK-DB-005-create-initial-migration.md"
+    _write_task_tree(tmp_path, {rel: _task_doc("FEAT-DB", "TASK-DB-005")})
+    original = (tmp_path / rel).read_bytes()
+
+    result = repair_plan_task_frontmatter(
+        tmp_path, "FEAT-DBB5", written_rel_paths=[rel]
+    )
+
+    assert not result.repairs
+    assert (tmp_path / rel).read_bytes() == original
+    assert [r.rule for r in result.refusals] == [ttt.REFUSAL_ALREADY_A_FEATURE]
+    receipt = result.receipt("FEAT-DBB5")
+    assert rel in receipt and "FEAT-DB" in receipt and "FEAT-DBB5" in receipt
+    assert "already a feature of this repository" in receipt
+
+
+def test_p8_a_written_doc_whose_id_another_doc_declares_is_refused(
+    tmp_path: Path,
+) -> None:
+    """FEAT-DB has no feature file in api_test — it is recorded only by its own
+    task documents, and that counts as the repository knowing it."""
+    mine = "tasks/backlog/TASK-DB-009-new.md"
+    theirs = "tasks/design_approved/TASK-DB-001-create-database-infrastructure.md"
+    _write_task_tree(
+        tmp_path,
+        {
+            mine: _task_doc("FEAT-DB", "TASK-DB-009"),
+            theirs: _task_doc("FEAT-DB", "TASK-DB-001"),
+        },
+    )
+    original = (tmp_path / mine).read_bytes()
+
+    result = repair_plan_task_frontmatter(
+        tmp_path, "FEAT-DBB5", written_rel_paths=[mine]
+    )
+
+    assert not result.repairs
+    assert (tmp_path / mine).read_bytes() == original
+    rules = {r.rel_path: r.rule for r in result.refusals}
+    assert rules[mine] == ttt.REFUSAL_ALREADY_A_FEATURE
+    assert rules[theirs] == ttt.REFUSAL_NOT_WRITTEN_BY_THIS_RUN
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can read an unreadable directory")
+def test_p8_a_repository_that_cannot_be_consulted_refuses_rather_than_rewrites(
+    tmp_path: Path,
+) -> None:
+    """Unknown is not permission: with the repository's own features
+    unreadable, a rewrite that cannot be shown to be safe is refused."""
+    features = tmp_path / ".guardkit" / "features"
+    features.mkdir(parents=True)
+    (features / "FEAT-07F3.yaml").write_text("id: FEAT-07F3\n", encoding="utf-8")
+    rel = "tasks/backlog/TASK-A001.md"
+    _write_task_tree(tmp_path, {rel: _task_doc("FEAT-07F", "TASK-A001")})
+    original = (tmp_path / rel).read_bytes()
+    os.chmod(features, 0o000)
+    try:
+        result = repair_plan_task_frontmatter(
+            tmp_path, "FEAT-07F3", written_rel_paths=[rel]
+        )
+    finally:
+        os.chmod(features, 0o755)
+
+    assert not result.repairs
+    assert (tmp_path / rel).read_bytes() == original  # the same bytes, refused
+    assert [r.rule for r in result.refusals] == [ttt.REFUSAL_FEATURES_UNREADABLE]
+    assert "unknown is not permission" in result.receipt("FEAT-07F3")
+
+
+def test_p8_when_this_runs_own_writing_cannot_be_read_nothing_is_rewritten(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other half of the same rule: if git cannot say what this run wrote,
+    the repair rewrites nothing and says so."""
+    rel = "tasks/backlog/TASK-A001.md"
+    _write_task_tree(tmp_path, {rel: _task_doc("FEAT-07F", "TASK-A001")})
+    original = (tmp_path / rel).read_bytes()
+    monkeypatch.setattr(ttt, "_is_git_worktree", lambda path: None)
+
+    result = repair_plan_task_frontmatter(tmp_path, "FEAT-07F3")
+
+    assert not result.repairs
+    assert (tmp_path / rel).read_bytes() == original
+    assert [r.rule for r in result.refusals] == [ttt.REFUSAL_WRITES_UNKNOWN]
+    assert rel in result.receipt("FEAT-07F3")
+
+
+def test_p8_the_shape_bound_is_the_observed_defect_and_no_wider(tmp_path: Path) -> None:
+    """A one- or two-character truncation is the defect; three is not."""
+    assert ttt.MAX_TRUNCATION_CHARS == 2
+    assert is_repairable_truncation("FEAT-07F", "FEAT-07F3")
+    assert is_repairable_truncation("FEAT-07", "FEAT-07F3")
+    assert not is_repairable_truncation("FEAT-0", "FEAT-07F3")
+    assert not is_repairable_truncation("FEAT-9999", "FEAT-07F3")
+    assert not is_repairable_truncation("", "FEAT-07F3")
+
+    rel = "tasks/backlog/TASK-A001.md"
+    _write_task_tree(tmp_path, {rel: _task_doc("FEAT-0", "TASK-A001")})
+    original = (tmp_path / rel).read_bytes()
+    result = repair_plan_task_frontmatter(
+        tmp_path, "FEAT-07F3", written_rel_paths=[rel]
+    )
+    assert not result.repairs
+    assert (tmp_path / rel).read_bytes() == original
+    assert [r.rule for r in result.refusals] == [ttt.REFUSAL_NOT_A_TRUNCATION]
+    assert "more missing than a truncation" in result.receipt("FEAT-07F3")
+
+
+def test_p8_an_empty_written_list_means_this_run_wrote_nothing(tmp_path: Path) -> None:
+    rel = "tasks/backlog/TASK-A001.md"
+    _write_task_tree(tmp_path, {rel: _task_doc("FEAT-07F", "TASK-A001")})
+    original = (tmp_path / rel).read_bytes()
+    result = repair_plan_task_frontmatter(tmp_path, "FEAT-07F3", written_rel_paths=[])
+    assert not result.repairs
+    assert (tmp_path / rel).read_bytes() == original
+    assert [r.rule for r in result.refusals] == [ttt.REFUSAL_NOT_WRITTEN_BY_THIS_RUN]
+
+
+def test_p8_a_long_refusal_receipt_stays_readable_and_counts_the_rest(
+    tmp_path: Path,
+) -> None:
+    """Twelve refusals must not become twelve paragraphs on a card: the receipt
+    names the first few and counts the rest, and the data still holds them all."""
+    rels = tuple(f"tasks/backlog/postgresql-database/TASK-DB-{n:03d}.md" for n in range(1, 13))
+    repo = _git_repo_with_committed_db_docs(tmp_path / "api_test", rels)
+
+    result = repair_plan_task_frontmatter(repo, "FEAT-DBB5")
+
+    assert len(result.refusals) == 12
+    receipt = result.receipt("FEAT-DBB5")
+    assert receipt.count("P-8 frontmatter repair REFUSED") == 5
+    assert "7 more document(s) were refused the same way" in receipt
+    for rel in rels:
+        assert (repo / rel).read_text(encoding="utf-8").count("FEAT-DB\n") == 1
+
+
+@pytest.mark.asyncio
+async def test_p8_wired_a_refusal_reaches_the_oracle_outcome(tmp_path: Path) -> None:
+    """The receipt a person reads: the oracle's own refusal, and under it the
+    plain sentence saying which document the repair would not touch and why."""
+    repo = _git_repo_with_committed_db_docs(tmp_path / "api_test")
+    run_fn, _calls = _parity_validate_seam("FEAT-DBB5")
+    validate = make_validate_feature_plan(run_fn=run_fn)
+
+    outcome = await validate(repo, "FEAT-DBB5")
+
+    assert not outcome.ok  # the tree really is not parity-clean, and stays so
+    assert "FRONTMATTER PARITY FAILED" in outcome.detail
+    assert "P-8 frontmatter repair REFUSED" in outcome.detail
+    assert ttt.REFUSAL_NOT_WRITTEN_BY_THIS_RUN in outcome.detail
+    for rel in _DB_DOCS:
+        assert "feature_id: FEAT-DB\n" in (repo / rel).read_text(encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
