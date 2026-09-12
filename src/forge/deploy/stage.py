@@ -158,9 +158,15 @@ from forge.persistence.repositories.runbook_models import Runbook, Step
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "MAX_ASSERTION_VALUE_CHARS_IN_THE_LOG",
+    "MAX_FAILED_ASSERTIONS_IN_THE_LOG",
+    "MAX_FAILED_ASSERTIONS_ON_THE_RECEIPT",
     "DeployStageRunner",
     "DeployStageResult",
+    "assertion_in_words",
+    "failed_assertions",
     "gate_summary",
+    "refusal_assertion_clause",
     "sidecar_refusal",
 ]
 
@@ -271,6 +277,119 @@ class _LiveGateRun:
     evidence_index_ref: str = ""
 
 
+#: HOW MANY FAILED CHECKS RIDE ON EACH SURFACE (2026-09-12). A refusal that
+#: costs a merge has to say what the gate saw, and each surface can hold a
+#: different amount of it. The merge report on disk is the long one: it keeps
+#: every failing assertion up to this many, which is far more than any real
+#: gate produces.
+MAX_FAILED_ASSERTIONS_ON_THE_RECEIPT: int = 50
+#: The operator's log line names them all, up to this many — enough for every
+#: check a repository runs, bounded so one broken gate cannot fill the log.
+MAX_FAILED_ASSERTIONS_IN_THE_LOG: int = 20
+#: One reported value (what was expected, what was seen) is trimmed to this
+#: many characters on the log line. The receipt keeps the value in full.
+MAX_ASSERTION_VALUE_CHARS_IN_THE_LOG: int = 200
+
+
+def _trimmed_value(value: Any, *, cap: int) -> str:
+    """One reported value as one readable line, trimmed to ``cap``."""
+    text = " ".join(str(value).split())
+    if len(text) > cap:
+        return text[: cap - 1].rstrip() + "…"
+    return text
+
+
+def failed_assertions(
+    assertions: tuple[dict[str, Any], ...] | list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Every assertion the gate reported as not passing, in the gate's words.
+
+    The entries are copied through as the gate sent them — nothing is added
+    and nothing is renamed — so a person reading them is reading the gate.
+    An entry with no status at all counts as failed: a check that says
+    nothing about itself is never treated as green.
+    """
+    failed: list[dict[str, Any]] = []
+    for entry in assertions:
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("status") or "").strip().lower() == "pass":
+            continue
+        failed.append(dict(entry))
+    return failed
+
+
+def assertion_in_words(
+    entry: dict[str, Any], *, value_cap: int = MAX_ASSERTION_VALUE_CHARS_IN_THE_LOG
+) -> str:
+    """One failed assertion as a plain sentence fragment.
+
+    Names the check and the assertion inside it, then what the gate said it
+    expected and what it said it saw. Only fields the gate actually sent are
+    used: when it sent neither an expected nor an observed value, the words
+    say exactly that, because a gate that reports a failure without saying
+    what it saw is itself something a person needs to know.
+    """
+    gate_id = str(entry.get("gate_id") or "").strip()
+    assertion_id = str(entry.get("id") or "").strip()
+    if gate_id and assertion_id and assertion_id != gate_id:
+        named = f"{gate_id} ({assertion_id})"
+    else:
+        named = gate_id or assertion_id or "an unnamed check"
+    expected = entry.get("expected")
+    observed = entry.get("observed")
+    if expected is not None and observed is not None:
+        saw = (
+            f"expected {_trimmed_value(expected, cap=value_cap)}, "
+            f"saw {_trimmed_value(observed, cap=value_cap)}"
+        )
+    elif expected is not None:
+        saw = (
+            f"expected {_trimmed_value(expected, cap=value_cap)}; the gate did "
+            "not say what it saw"
+        )
+    elif observed is not None:
+        saw = (
+            f"saw {_trimmed_value(observed, cap=value_cap)}; the gate did not "
+            "say what it expected"
+        )
+    else:
+        saw = "the gate did not say what it expected or what it saw"
+    return f"{named}: {saw}"
+
+
+def refusal_assertion_clause(
+    summary: dict[str, Any] | None,
+    *,
+    cap: int = MAX_FAILED_ASSERTIONS_IN_THE_LOG,
+    value_cap: int = MAX_ASSERTION_VALUE_CHARS_IN_THE_LOG,
+) -> str:
+    """What the gate saw, for the operator's line — or that it said nothing.
+
+    Empty when the summary carries no assertion block at all (the gate never
+    ran, or it passed), so every other refusal reads exactly as it did.
+    """
+    if not summary or "failed_assertions" not in summary:
+        return ""
+    entries = list(summary.get("failed_assertions") or [])
+    if not entries:
+        return (
+            "the gate reported no assertion detail, so it did not say which "
+            "assertion failed or what it saw"
+        )
+    shown = entries[:cap]
+    left_out = len(entries) - len(shown)
+    left_out += int(summary.get("failed_assertions_left_out") or 0)
+    words = "; ".join(assertion_in_words(e, value_cap=value_cap) for e in shown)
+    if left_out:
+        words += (
+            f"; and {left_out} more failing "
+            f"{'assertion' if left_out == 1 else 'assertions'} not named here "
+            "(the merge report has them all)"
+        )
+    return f"what the gate saw: {words}"
+
+
 def gate_summary(
     *,
     verdict: str | None,
@@ -286,6 +405,16 @@ def gate_summary(
     passed; a verdict that is not pass with no per-check results leaves the
     count and the names unknown (None) rather than guessing — the sentence a
     person reads then says the failing checks were not reported.
+
+    A GATE THAT RAN AND DID NOT PASS also carries what it saw (2026-09-12):
+    ``failed_assertions`` is every failing assertion the gate reported, in
+    the gate's own words and up to
+    :data:`MAX_FAILED_ASSERTIONS_ON_THE_RECEIPT` of them, with
+    ``failed_assertions_left_out`` saying how many did not fit and
+    ``assertion_detail_reported`` saying whether the gate reported any at
+    all. Those three keys are added ONLY for a gate that ran and did not
+    pass, so a passing check's summary — and every receipt built from it —
+    is exactly what it was.
     """
     names = [str(g) for g in gate_ids if str(g).strip()]
     per_gate: dict[str, bool] = {}
@@ -312,7 +441,7 @@ def gate_summary(
         failed, passed = [], total
     else:
         failed, passed = None, None
-    return {
+    summary: dict[str, Any] = {
         "verdict": verdict,
         "checks_total": total,
         "checks_passed": passed,
@@ -320,6 +449,13 @@ def gate_summary(
         "gate_ids": names,
         "live_gate_runbook_id": live_gate_runbook_id,
     }
+    if verdict is not None and verdict != "pass":
+        reported = failed_assertions(assertions)
+        kept = reported[:MAX_FAILED_ASSERTIONS_ON_THE_RECEIPT]
+        summary["failed_assertions"] = kept
+        summary["failed_assertions_left_out"] = len(reported) - len(kept)
+        summary["assertion_detail_reported"] = bool(reported)
+    return summary
 
 
 class DeployStageRunner:
@@ -1355,6 +1491,7 @@ class DeployStageRunner:
                     reason="candidate_failed",
                     failing_verdict=verdict if verdict is not None else "instrument_fail",
                     events=events,
+                    gate_summary_for_words=summary,
                 )
                 return failed, summary
         else:
@@ -1428,6 +1565,7 @@ class DeployStageRunner:
         failing_verdict: str | None,
         events: list[str],
         failure_detail: str | None = None,
+        gate_summary_for_words: dict[str, Any] | None = None,
     ) -> DeployStageResult:
         """Publish DeployFailed for a candidate that failed its leg (LIVE intact).
 
@@ -1438,6 +1576,14 @@ class DeployStageRunner:
         ``failure_detail`` is the sidecar's own sentence when the step never
         ran because the sidecar refused it; it goes into the failure line so a
         person reads why, not just where.
+
+        ``gate_summary_for_words`` is the check's own summary when a gate
+        actually ran: the failure line then names every failing assertion and
+        what the gate said it expected and saw (up to
+        :data:`MAX_FAILED_ASSERTIONS_IN_THE_LOG`), or says plainly that the
+        gate reported none. Before this, a refusal that cost a merge named
+        the check and nothing else, and the candidate — with its evidence —
+        was already gone by the time anyone read it.
         """
         when = self._clock()
         detail_verdict = (
@@ -1446,9 +1592,11 @@ class DeployStageRunner:
             else ""
         )
         detail_clause = f" — {failure_detail}" if failure_detail else ""
+        saw = refusal_assertion_clause(gate_summary_for_words)
+        saw_clause = f" — {saw}" if saw else ""
         failure_reason = (
             f"candidate leg failed at {failed_step!r}{detail_verdict}"
-            f"{detail_clause}; the "
+            f"{detail_clause}{saw_clause}; the "
             f"candidate ('{profile.env_id}-cand') was torn down and the LIVE "
             f"name '{profile.env_id}' was never touched (no promote, no revert)"
         )
