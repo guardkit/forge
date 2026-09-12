@@ -2760,3 +2760,271 @@ class TestARepositoryWithASandboxIsPressedWhereItLives:
 
         assert outcome.result == "merged-and-running", outcome.detail
         assert _legs(dp)[0] == "candidate_check"
+
+
+# ---------------------------------------------------------------------------
+# A refusal that costs a merge says what it saw (2026-09-12)
+# ---------------------------------------------------------------------------
+
+
+def _gate_assertion(
+    gate_id: str,
+    status: str,
+    *,
+    assertion_id: str | None = None,
+    expected: str | None = None,
+    observed: str | None = None,
+) -> dict[str, Any]:
+    entry: dict[str, Any] = {
+        "id": assertion_id or f"{gate_id}::status",
+        "gate_id": gate_id,
+        "status": status,
+    }
+    if expected is not None:
+        entry["expected"] = expected
+    if observed is not None:
+        entry["observed"] = observed
+    return entry
+
+
+def _red_gate_with(assertions: tuple[dict[str, Any], ...]) -> dict[str, Any]:
+    """The candidate check's own summary, built by the code that builds it."""
+    from forge.deploy.stage import gate_summary as real_gate_summary
+
+    return real_gate_summary(
+        verdict="fail",
+        gate_ids=RED_GATE["gate_ids"],
+        assertions=assertions,
+        live_gate_runbook_id="live-gate-cand-run",
+    )
+
+
+#: The observed shape: one check red, two failing assertions inside it.
+TWO_FAILING_ASSERTIONS: tuple[dict[str, Any], ...] = tuple(
+    [_gate_assertion(g, "pass") for g in RED_GATE["gate_ids"] if g != "users_count"]
+    + [
+        _gate_assertion(
+            "users_count",
+            "fail",
+            assertion_id="status-is-200",
+            expected="200",
+            observed="500",
+        ),
+        _gate_assertion(
+            "users_count",
+            "fail",
+            assertion_id="seven-days-returned",
+            expected="7 entries",
+            observed="0 entries",
+        ),
+    ]
+)
+
+
+class TestTheRefusalSaysWhatItSaw:
+    """The press's three surfaces after a red candidate check.
+
+    On 2026-09-12 a merge was refused and the whole estate said only the NAME
+    of the failing check: not which assertion, not the status code, not the
+    response. The candidate was torn down by then, so the evidence was gone
+    and nobody could diagnose it. The check's own per-assertion results were
+    already being collected and dropped; these tests hold them on the report,
+    on the operator's line and on the one sentence a person reads.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_sentence_names_the_check_and_the_first_failing_assertion(
+        self, config, pool, repo_root, _receipts_env: Path
+    ) -> None:
+        dp = _FakeDeploy(
+            candidate_outcome="failed",
+            candidate_verdict="fail",
+            gate=_red_gate_with(TWO_FAILING_ASSERTIONS),
+        )
+        deps, publisher, gk, dp = _deps(config, pool, deploy=dp)
+
+        outcome = await _run_executor(deps, repo_root)
+
+        assert outcome.result == "candidate-refused"
+        assert gk.calls == []  # nothing was merged
+        assert outcome.detail == (
+            f"{FEATURE_ID} was checked in the sandbox before merging and failed "
+            "1 of 8 checks (users_count); nothing was merged and the branch is "
+            "kept. The first thing that failed was users_count "
+            "(status-is-200): expected 200, saw 500. The report lists 1 more."
+        )
+        # Short enough for the surface it lands on: one or two lines.
+        assert len(outcome.detail) < 400
+        assert "\n" not in outcome.detail
+
+    @pytest.mark.asyncio
+    async def test_the_report_on_disk_keeps_every_failing_assertion(
+        self, config, pool, repo_root, _receipts_env: Path
+    ) -> None:
+        dp = _FakeDeploy(
+            candidate_outcome="failed",
+            candidate_verdict="fail",
+            gate=_red_gate_with(TWO_FAILING_ASSERTIONS),
+        )
+        deps, publisher, gk, dp = _deps(config, pool, deploy=dp)
+
+        outcome = await _run_executor(deps, repo_root)
+
+        block = outcome.gate_before_merge
+        assert block["failed_checks"] == ["users_count"]
+        assert block["assertion_detail_reported"] is True
+        assert block["failed_assertions_left_out"] == 0
+        assert block["failed_assertions"] == [
+            {
+                "id": "status-is-200",
+                "gate_id": "users_count",
+                "status": "fail",
+                "expected": "200",
+                "observed": "500",
+            },
+            {
+                "id": "seven-days-returned",
+                "gate_id": "users_count",
+                "status": "fail",
+                "expected": "7 entries",
+                "observed": "0 entries",
+            },
+        ]
+        # The same detail on the published report and on the receipt on disk —
+        # the candidate is gone by now, so this file is the whole record.
+        assert publisher.reports[0].gate_before_merge == block
+        written = json.loads(
+            (_receipts_env / f"merge-{BUILD_ID}" / "merge_deploy_report.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert written["gate_before_merge"]["failed_assertions"] == block[
+            "failed_assertions"
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_gate_that_reported_no_assertion_detail_says_so(
+        self, config, pool, repo_root, _receipts_env: Path
+    ) -> None:
+        dp = _FakeDeploy(
+            candidate_outcome="failed",
+            candidate_verdict="fail",
+            gate=_red_gate_with(
+                tuple(
+                    _gate_assertion(g, "fail" if g == "users_count" else "pass")
+                    for g in RED_GATE["gate_ids"]
+                )
+            ),
+        )
+        deps, publisher, gk, dp = _deps(config, pool, deploy=dp)
+
+        outcome = await _run_executor(deps, repo_root)
+
+        assert outcome.detail.endswith(
+            "The first thing that failed was users_count "
+            "(users_count::status): the gate did not say what it expected or "
+            "what it saw."
+        )
+        assert outcome.gate_before_merge["assertion_detail_reported"] is True
+
+    @pytest.mark.asyncio
+    async def test_a_gate_that_reported_nothing_at_all_says_that_too(
+        self, config, pool, repo_root, _receipts_env: Path
+    ) -> None:
+        """The names were reported, the assertions were not: say it plainly."""
+        gate = _red_gate_with(())
+        gate["failed_checks"] = ["users_count"]
+        gate["checks_total"] = 8
+        gate["checks_passed"] = 7
+        dp = _FakeDeploy(
+            candidate_outcome="failed", candidate_verdict="fail", gate=gate
+        )
+        deps, publisher, gk, dp = _deps(config, pool, deploy=dp)
+
+        outcome = await _run_executor(deps, repo_root)
+
+        assert outcome.detail.endswith(
+            "The check did not say which part of it failed or what it saw."
+        )
+        assert outcome.gate_before_merge["assertion_detail_reported"] is False
+        assert outcome.gate_before_merge["failed_assertions"] == []
+
+    @pytest.mark.asyncio
+    async def test_the_sentence_cap_says_how_many_were_left_out(
+        self, config, pool, repo_root, _receipts_env: Path
+    ) -> None:
+        many = tuple(
+            _gate_assertion(
+                "users_count",
+                "fail",
+                assertion_id=f"check-{i}",
+                expected="0",
+                observed=str(i),
+            )
+            for i in range(1, 6)
+        )
+        dp = _FakeDeploy(
+            candidate_outcome="failed",
+            candidate_verdict="fail",
+            gate=_red_gate_with(many),
+        )
+        deps, publisher, gk, dp = _deps(config, pool, deploy=dp)
+
+        outcome = await _run_executor(deps, repo_root)
+
+        # One named on his surface, four counted, all five on the report.
+        assert "The first thing that failed was users_count (check-1)" in outcome.detail
+        assert outcome.detail.endswith("The report lists 4 more.")
+        assert outcome.detail.count("check-") == 1
+        assert len(outcome.gate_before_merge["failed_assertions"]) == 5
+
+    @pytest.mark.asyncio
+    async def test_a_green_press_report_carries_no_assertion_keys_at_all(
+        self, config, pool, repo_root, _receipts_env: Path
+    ) -> None:
+        deps, publisher, gk, dp = _deps(config, pool)
+
+        outcome = await _run_executor(deps, repo_root)
+
+        assert outcome.result == "merged-and-running", outcome.detail
+        assert set(outcome.gate_before_merge) == {
+            "verdict",
+            "checks_passed",
+            "checks_total",
+            "failed_checks",
+            "candidate_sha",
+            "candidate_tree",
+            "merged_tree",
+            "trees_match",
+            "ran",
+            "refusal",
+        }
+
+    @pytest.mark.asyncio
+    async def test_a_candidate_that_never_came_up_reads_exactly_as_before(
+        self, config, pool, repo_root, _receipts_env: Path
+    ) -> None:
+        """No gate ran, so there is nothing it saw and nothing new is said."""
+        dp = _FakeDeploy(
+            candidate_outcome="failed",
+            candidate_verdict=None,
+            candidate_reason="candidate_deploy_failed",
+            candidate_failed_step="health_check",
+            gate={
+                "verdict": None,
+                "checks_total": None,
+                "checks_passed": None,
+                "failed_checks": None,
+                "failed_step": "health_check",
+            },
+        )
+        deps, publisher, gk, dp = _deps(config, pool, deploy=dp)
+
+        outcome = await _run_executor(deps, repo_root)
+
+        assert outcome.detail == (
+            f"{FEATURE_ID} was checked in the sandbox before merging and could "
+            "not be started (the candidate deploy stopped at health_check); "
+            "nothing was merged and the branch is kept."
+        )
+        assert "failed_assertions" not in outcome.gate_before_merge

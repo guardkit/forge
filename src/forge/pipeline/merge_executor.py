@@ -119,6 +119,7 @@ from forge.deploy.candidate_tree import (
     CandidateTreeError,
     InContainerCandidateGit,
 )
+from forge.deploy.stage import assertion_in_words
 from forge.lifecycle.persistence import StageLogEntry
 from forge.pipeline.fix_row_producer import candidate_refused_sentence
 from forge.pipeline.merge_offer import (
@@ -590,6 +591,58 @@ def _mint_repair_row(
             type(exc).__name__,
             exc,
         )
+
+
+#: WHAT THE GATE SAW, ON THE SENTENCE A PERSON READS (2026-09-12). A refusal
+#: that costs a merge has to say what it saw, but the owner's sentence stays
+#: one or two lines: it names the check and the FIRST failing assertion, and
+#: says how many more are in the report.
+MAX_FAILED_ASSERTIONS_IN_THE_SENTENCE: int = 1
+#: One reported value (what was expected, what was seen) is trimmed to this
+#: many characters on that sentence. The report on disk keeps it in full.
+MAX_ASSERTION_VALUE_CHARS_IN_THE_SENTENCE: int = 120
+#: What a refused check adds to the report's ``gate_before_merge`` block. Set
+#: only by a gate that ran and did not pass, so a green press's report is
+#: exactly the report it always was.
+GATE_ASSERTION_KEYS: tuple[str, ...] = (
+    "failed_assertions",
+    "failed_assertions_left_out",
+    "assertion_detail_reported",
+)
+
+
+def what_the_gate_saw(summary: dict[str, Any]) -> str:
+    """The one plain line that says what the failed check actually saw.
+
+    Names the first thing that failed — the check it belongs to, what the
+    gate said it expected and what it said it saw — and then how many more
+    the report holds. When the gate said nothing about what failed inside
+    the check, that is what the line says, because a check that refuses a
+    merge without saying what it saw is itself something to know.
+
+    Plain words on purpose: this is the line the owner reads, so it says
+    what the machine saw and asks him for nothing.
+
+    Empty when the summary carries no such block (a gate that never ran, a
+    passing check, or a summary written before this existed), so every other
+    refusal reads exactly as it did.
+    """
+    if "failed_assertions" not in summary:
+        return ""
+    entries = [e for e in (summary.get("failed_assertions") or []) if isinstance(e, dict)]
+    if not entries:
+        return "The check did not say which part of it failed or what it saw."
+    shown = entries[:MAX_FAILED_ASSERTIONS_IN_THE_SENTENCE]
+    left_out = len(entries) - len(shown)
+    left_out += int(summary.get("failed_assertions_left_out") or 0)
+    words = "; ".join(
+        assertion_in_words(e, value_cap=MAX_ASSERTION_VALUE_CHARS_IN_THE_SENTENCE)
+        for e in shown
+    )
+    line = f"The first thing that failed was {words}."
+    if left_out:
+        line += f" The report lists {left_out} more."
+    return line
 
 
 #: ``builds.error`` is one line, and ``forge status`` renders it in a table
@@ -1067,8 +1120,15 @@ async def execute_merge_deploy(
 
     def _gate_for_report() -> dict[str, Any]:
         """The ``gate_before_merge`` block: the spec's six fields plus the
-        failing check names and whether the trees matched."""
-        return {
+        failing check names and whether the trees matched.
+
+        A check that RAN AND DID NOT PASS adds what it saw as well — every
+        failing assertion the gate reported, in the gate's own words. This is
+        the long record: the candidate is torn down by the time anyone reads
+        the refusal, so if the detail is not written here it is gone. No such
+        key is added by any other ending, so those reports are unchanged.
+        """
+        block = {
             key: gate.get(key)
             for key in (
                 "verdict",
@@ -1083,6 +1143,10 @@ async def execute_merge_deploy(
                 "refusal",
             )
         }
+        for key in GATE_ASSERTION_KEYS:
+            if key in gate:
+                block[key] = gate[key]
+        return block
 
     async def _publish_report(outcome: MergeDeployOutcome) -> MergeDeployOutcome:
         completed = deps.clock()
@@ -1296,14 +1360,20 @@ async def execute_merge_deploy(
                 checks_total=total,
                 failing_checks=list(names),
             )
-            return _refused_before_merge(sentence)
+            # ...and what it saw: the first failing assertion in ordinary
+            # words, or that the gate reported none. One added line, never a
+            # dump — the whole list is on the report.
+            saw = what_the_gate_saw(summary)
+            return _refused_before_merge(f"{sentence} {saw}" if saw else sentence)
         gate["refusal"] = (
             f"failed its checks (the check verdict was {verdict or 'missing'}; "
             "which of the checks failed was not reported)"
         )
-        return _refused_before_merge(
-            candidate_refused_sentence(feature_id, detail=gate["refusal"])
-        )
+        sentence = candidate_refused_sentence(feature_id, detail=gate["refusal"])
+        # The names were not reported, but the gate may still have said what
+        # it saw; when it did, that is the only thing there is to go on.
+        saw = what_the_gate_saw(summary) if summary.get("failed_assertions") else ""
+        return _refused_before_merge(f"{sentence} {saw}" if saw else sentence)
 
     async def _press() -> MergeDeployOutcome:
         nonlocal tree_path, candidate_standing, gate_began
@@ -1394,6 +1464,11 @@ async def execute_merge_deploy(
         gate["checks_passed"] = summary.get("checks_passed")
         gate["checks_total"] = summary.get("checks_total")
         gate["failed_checks"] = summary.get("failed_checks")
+        # What the gate saw, when it ran and did not pass — carried only when
+        # the check itself reported it, so nothing else on this report moves.
+        for key in GATE_ASSERTION_KEYS:
+            if key in summary:
+                gate[key] = summary[key]
         reason = str(c_detail.get("reason") or "")
         gate["ran"] = checked is not None and reason != "no_candidate_section"
         _write_receipt(
