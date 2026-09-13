@@ -33,6 +33,8 @@ The rules (rewrite-on-refusal spec 2026-09-06, Part L, rules 48 and 50):
 
 from __future__ import annotations
 
+from typing import Any
+
 import logging
 import os
 import shutil
@@ -440,3 +442,113 @@ __all__ = [
     "repair_task_ids_on_branches",
     "repair_worktree_path",
 ]
+
+
+# ---------------------------------------------------------------------------
+# The same branch, cut where the build actually runs (sandbox first)
+# ---------------------------------------------------------------------------
+
+
+def materialise_repair_branch_via_sidecar(
+    sidecar_url: str,
+    *,
+    repo: str,
+    repo_root: Path | str,
+    task_id: str,
+    base_branch: str,
+    files: Mapping[str, str],
+    message: str,
+    post: Any = None,
+    timeout_s: float = 120.0,
+) -> RepairBranchResult:
+    """Put ``files`` on ``repair/<task id>`` in the FACTORY'S clone, cut from
+    ``base_branch`` there, through the deploy sidecar's own git routes.
+
+    WHY (2026-09-13, open item 24). :func:`materialise_repair_branch` cuts
+    the branch with host git in the operator's checkout — it was written the
+    day before sandbox-first. The fix journey's worktree is cut inside the
+    repository's sandbox, on the factory's own clone, where that branch does
+    not exist: *"was queued on the branch 'repair/…', but that branch does not
+    exist … the build is REFUSED."* Every automatic repair of a sandboxed
+    repository was impossible from 7 September until this existed.
+
+    Three routes the sidecar already had, in order: ``/git/rev-parse`` to
+    prove the base exists there; ``/git/worktree-add`` with ``base_ref`` to
+    create the branch when it is absent (the route the fix journey's own
+    worktree uses; the temporary tree is removed again at once, the branch
+    stays); ``/git/prepare-branch-and-write-tree`` to commit the files onto
+    it (idempotent: nothing is committed when they are already there).
+    ``post`` is the one HTTP seam, injectable so a test needs no socket.
+    """
+    from forge.planning.sidecar_git_runner import _urllib_post
+
+    send = post or _urllib_post
+    base_url = sidecar_url.rstrip("/")
+    if not files:
+        raise RepairBranchError("no files were given to put on the repair branch")
+
+    def call(route: str, body: dict[str, Any]) -> dict[str, Any]:
+        try:
+            status, decoded = send(f"{base_url}{route}", body, timeout_s)
+        except Exception as exc:  # noqa: BLE001 — transport boundary
+            raise RepairBranchError(
+                f"the sandbox's git could not be reached at {base_url}{route} "
+                f"({type(exc).__name__}: {exc})"
+            ) from exc
+        if status != 200 or not isinstance(decoded, dict):
+            said = decoded.get("error") if isinstance(decoded, dict) else decoded
+            raise RepairBranchError(
+                f"the sandbox's git refused {route} for {repo} (HTTP {status}: {said})"
+            )
+        return decoded
+
+    def sha_of(ref: str) -> str | None:
+        answer = call("/git/rev-parse", {"repo": repo, "ref": ref})
+        sha = answer.get("sha")
+        return str(sha) if sha else None
+
+    if sha_of(base_branch) is None:
+        raise RepairBranchError(
+            f"there is no branch called {base_branch!r} in the factory's clone "
+            f"of {repo} to cut the repair branch from"
+        )
+    branch = repair_branch_name(task_id)
+    before = sha_of(branch)
+    created = before is None
+    if created:
+        # The worktree route is the one that can cut a branch from a named
+        # base; the tree itself is not wanted, so it goes straight back.
+        path = str(Path(repo_root) / ".forge" / "worktrees" / f"{REPAIR_WORKTREE_PREFIX}{task_id}")
+        cut = call(
+            "/git/worktree-add",
+            {"repo": repo, "path": path, "branch": branch, "base_ref": base_branch},
+        )
+        if cut.get("status") != "success":
+            raise RepairBranchError(
+                f"the sandbox's git could not cut {branch} from {base_branch}: "
+                f"{cut.get('detail') or 'no reason given'}"
+            )
+        call("/git/worktree-remove", {"repo": repo, "path": path})
+    written = call(
+        "/git/prepare-branch-and-write-tree",
+        {
+            "repo": repo,
+            "branch": branch,
+            "files": {str(k): str(v) for k, v in files.items()},
+            "message": message,
+            "checks": [],
+        },
+    )
+    if written.get("status") != "success" or not written.get("sha"):
+        raise RepairBranchError(
+            f"the sandbox's git could not commit the repair task onto {branch}: "
+            f"{written.get('detail') or 'no reason given'}"
+        )
+    commit = str(written["sha"])
+    return RepairBranchResult(
+        branch=branch,
+        commit=commit,
+        created_branch=created,
+        committed=(commit != before),
+        files=tuple(sorted(str(k) for k in files)),
+    )

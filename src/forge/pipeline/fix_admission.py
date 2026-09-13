@@ -791,6 +791,8 @@ def materialise_repair_task(
     source_build_id: str | None = None,
     minted: Mapping[str, Any] | None = None,
     receipts_root: Path | str | None = None,
+    sidecar: tuple[str, str] | None = None,
+    post: Any = None,
 ) -> PreparedBranch:
     """Put the task file and the YAML on ``repair/<task id>``, cut from ``base_branch``.
 
@@ -798,6 +800,13 @@ def materialise_repair_task(
     :class:`forge.pipeline.repair_branch.RepairBranchError` with a plain
     sentence when the branch cannot be cut, written or committed; then
     nothing this call made is left behind.
+
+    ``sidecar`` (open item 24, 2026-09-13) is ``(sidecar_url, repo key)`` for
+    a repository that has a sandbox: the branch is then cut on the FACTORY'S
+    clone, through the sidecar's git routes, because that is where the fix
+    journey's worktree is cut from — a branch made with host git in the
+    operator's checkout is invisible there and the conductor refuses the
+    build. ``post`` is the sidecar transport, injectable for tests.
     """
     from forge.pipeline.repair_branch import (
         list_branch_files,
@@ -826,13 +835,28 @@ def materialise_repair_task(
         ),
     }
     subject = source_build_id or task_id
-    result = materialise_repair_branch(
-        repo,
-        task_id=task_id,
-        base_branch=base_branch,
-        files=files,
-        message=f"repair task for {subject}: {name}",
-    )
+    if sidecar is not None:
+        from forge.pipeline.repair_branch import materialise_repair_branch_via_sidecar
+
+        sidecar_url, repo_key = sidecar
+        result = materialise_repair_branch_via_sidecar(
+            sidecar_url,
+            repo=repo_key,
+            repo_root=repo,
+            task_id=task_id,
+            base_branch=base_branch,
+            files=files,
+            message=f"repair task for {subject}: {name}",
+            post=post,
+        )
+    else:
+        result = materialise_repair_branch(
+            repo,
+            task_id=task_id,
+            base_branch=base_branch,
+            files=files,
+            message=f"repair task for {subject}: {name}",
+        )
     logger.info(
         "fix admission: %s carries %s and %s at %s (%s)",
         result.branch,
@@ -1180,6 +1204,22 @@ async def admit_fix_row(
     fix_task_path = features_dir(repo_path) / f"{task_id}.yaml"
     minted = _minted_details(store, queue_id)
 
+    # Where the repair is cut from, and where (open item 24, 2026-09-13). A
+    # build refused at the candidate gate was never merged, so its code lives
+    # only on its own autobuild branch — a repair cut from main would repair a
+    # tree without the code. And a repository with a sandbox keeps the clone
+    # the build runs on INSIDE it, so the branch is cut there, through the
+    # sidecar, or the conductor cannot find it.
+    base_branch = choose_repair_base(minted, branch, parent_feature)
+    sidecar = _sidecar_for(config, resolution.name)
+    if base_branch != branch or sidecar is not None:
+        logger.info(
+            "fix admission: %s's repair branch is cut from %s%s",
+            task_id,
+            base_branch,
+            f" in the sandbox behind {sidecar[0]}" if sidecar else "",
+        )
+
     async def _prepare() -> PreparedBranch:
         import asyncio
 
@@ -1189,10 +1229,11 @@ async def admit_fix_row(
             task_id=task_id,
             feature_id=parent_feature,
             name=name,
-            base_branch=branch,
+            base_branch=base_branch,
             source_build_id=source,
             minted=minted,
             receipts_root=receipts_root,
+            sidecar=sidecar,
         )
         _record_repair_branch(
             store,
@@ -1427,6 +1468,47 @@ def _minted_details(store: Any, queue_id: int) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Small shared helpers
 # ---------------------------------------------------------------------------
+
+
+def choose_repair_base(
+    minted: Mapping[str, Any] | None, branch: str, parent_feature: str
+) -> str:
+    """The branch a repair is cut from.
+
+    A build whose candidate was refused before the merge (the producer's
+    ``source`` is ``candidate-refused``) was never merged: its code exists
+    only on ``autobuild/<feature>``, and that is what needs repairing. Every
+    other repair — a merge that went red live, a queued repair naming its own
+    branch — is cut from ``branch`` exactly as before.
+    """
+    from forge.pipeline.fix_row_producer import SOURCE_CANDIDATE_REFUSED
+
+    source = str((minted or {}).get("source") or "")
+    if source == SOURCE_CANDIDATE_REFUSED and parent_feature:
+        return f"autobuild/{parent_feature}"
+    return branch
+
+
+def _sidecar_for(config: Any, repo_key: str | None) -> tuple[str, str] | None:
+    """``(sidecar_url, repo key)`` when the repository has a sandbox, else None.
+
+    The same lookup the conductor's worktree writer makes
+    (``planning.sandboxes``); kept here so the pipeline does not import the
+    CLI. Never raises: a config with no sandboxes has none.
+    """
+    if not repo_key:
+        return None
+    sandboxes = getattr(getattr(config, "planning", None), "sandboxes", None) or {}
+    try:
+        entry = sandboxes.get(str(repo_key))
+    except AttributeError:  # pragma: no cover — a mapping is what the model gives
+        return None
+    if entry is None:
+        return None
+    url = getattr(entry, "sidecar_url", None)
+    if url is None and isinstance(entry, Mapping):
+        url = entry.get("sidecar_url")
+    return (str(url), str(repo_key)) if url else None
 
 
 def _sanitise_segment(segment: str) -> str:
