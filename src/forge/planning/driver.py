@@ -2929,10 +2929,31 @@ class PlanningRunDriver:
         """
         deps = self._deps
         request_text = self._request_text_of(row)
-        facts = self._repository_facts_for(correlation_id, repo_path, row)
-        review = await self._review_assumptions_on_branch(
-            draft, repo_path=repo_path, branch=branch, request_text=request_text, repository_facts=facts
-        )
+        try:
+            facts = self._repository_facts_for(correlation_id, repo_path, row)
+            review = await self._review_assumptions_on_branch(
+                draft, repo_path=repo_path, branch=branch, request_text=request_text, repository_facts=facts
+            )
+        except Exception as exc:  # noqa: BLE001 — a reviewer must never stop a run
+            # Same posture as the provability check beside it: a reviewer that
+            # cannot read is a reviewer that says so, not a failed planning run.
+            # The card opens exactly as it would have without this step.
+            logger.warning(
+                "planning driver: run %s — the assumption review could not run "
+                "(%s: %s); the card opens as written",
+                correlation_id,
+                type(exc).__name__,
+                str(exc)[:160],
+            )
+            draft["assumption_review"] = {
+                "checked": False,
+                "round": 0,
+                "rewritten": False,
+                "removed": [],
+                "still_flagged": [],
+                "not_checked": f"the review could not run ({type(exc).__name__})",
+            }
+            return draft
         receipt: dict[str, Any] = {
             "checked": review is not None,
             "round": 0,

@@ -3024,3 +3024,24 @@ async def test_a_clean_manifest_leaves_the_leg_byte_for_byte(
     await h.driver.drive(CID)
     assert len(h.ctx["dispatches"]) == 1
     assert "reviewer" not in json.dumps(_digest_cards(h)[0].payload)
+
+
+@pytest.mark.asyncio
+async def test_a_reviewer_that_cannot_read_never_stops_the_run(
+    store: SqlitePlanningRunStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same posture as the provability check beside it: the card opens as
+    written and the receipt says the review could not run."""
+    _queue(store)
+
+    async def boom(*_: object, **__: object) -> None:
+        raise RuntimeError("the branch read fell over")
+
+    h = _make_driver(store, subscriber_factory=SharedScriptFactory([_answer("approve")]))
+    monkeypatch.setattr(
+        type(h.driver), "_review_assumptions_on_branch", boom, raising=True
+    )
+    await h.driver.drive(CID)
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+    assert len(_digest_cards(h)) == 1
+    assert len(h.ctx["dispatches"]) == 1
