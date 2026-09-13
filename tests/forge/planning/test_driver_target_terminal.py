@@ -479,6 +479,8 @@ def _make_driver(
         spec_input: str,
         revision_of: dict[str, str] | None = None,
         validate_feedback: str | None = None,
+        request_text: str | None = None,
+        repository_facts: str | None = None,
     ) -> Any:
         counters["spec"] += 1
         assert spec_input  # forge supplies the committed handoff content

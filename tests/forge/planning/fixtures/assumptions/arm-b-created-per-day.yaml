@@ -1,0 +1,31 @@
+feature: Get Users Created Per Day
+generated: '2026-07-09T14:32:00Z'
+stack: generic
+review_required: true
+assumptions:
+- id: ASSUM-001
+  scenario: A request to the endpoint returns exactly seven days of data ordered oldest
+    first
+  assumption: The response includes exactly 7 data points for the preceding week
+  confidence: low
+  basis: Inferred from request description; not explicitly stated in input
+  human_response: deferred
+- id: ASSUM-002
+  scenario: The oldest day in the response is exactly seven days ago
+  assumption: The oldest day in the response is exactly 7 days before the current
+    day
+  confidence: low
+  basis: Inferred from 'last 7 days' phrasing; could mean 6 days ago or include today
+  human_response: deferred
+- id: ASSUM-003
+  scenario: The newest day in the response is yesterday
+  assumption: The newest day in the response is yesterday, not today
+  confidence: low
+  basis: Inferred from 'last 7 days' phrasing; could include today
+  human_response: deferred
+- id: ASSUM-004
+  scenario: A request without authentication is rejected
+  assumption: The endpoint requires authentication
+  confidence: low
+  basis: Not stated in input; common security practice for analytics endpoints
+  human_response: deferred
