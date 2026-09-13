@@ -458,6 +458,40 @@ _REPO_INVENTORY_SKIP_PREFIXES = (
 #: off part-way reads like the whole truth and is worse than no list at all.
 _MAX_REPO_INVENTORY_FILES = 400
 
+#: How many of the specification's own words are looked for in the repository,
+#: and how many places each may report. Both small on purpose: this is a
+#: pointer for the plan-writer, not a search result page.
+_MAX_SPEC_WORDS_LOOKED_FOR = 8
+_MAX_PLACES_PER_SPEC_WORD = 5
+
+#: A word out of the specification worth looking for: a route path, or an
+#: identifier long enough to be this repository's own name for something.
+#: Deliberately not a language's grammar — kebab, snake and camel all match,
+#: so the same rule serves Python, TypeScript, Go or anything else.
+#: Three shapes, and every one of them is a NAME rather than a word of
+#: English: a route path, a snake or kebab identifier, and a camel one. An
+#: ordinary word like "numeric" or "boundaries" matches none of them, which is
+#: the point — looking for those returns half the repository and teaches the
+#: plan-writer nothing.
+_SPEC_WORD_PATTERN = re.compile(
+    r"/[A-Za-z0-9][A-Za-z0-9/_-]{2,}"
+    r"|[A-Za-z][A-Za-z0-9]*[_-][A-Za-z0-9][A-Za-z0-9_-]*"
+    r"|[a-z]+[A-Z][A-Za-z0-9]+"
+)
+
+#: Words that appear in almost every specification and would match half the
+#: repository. Looking for them tells the plan-writer nothing.
+_SPEC_WORDS_NOT_WORTH_LOOKING_FOR = frozenset(
+    {
+        "scenario", "feature", "background", "given", "should", "returns",
+        "return", "request", "response", "endpoint", "database", "example",
+        "examples", "assumption", "assumptions", "criteria", "criterion",
+        "number", "values", "value", "system", "service", "create", "created",
+        "update", "updated", "delete", "deleted", "exists", "including",
+        "without", "before", "after",
+    }
+)
+
 #: The contract reference the auth door's card and its honest terminal name
 #: verbatim (the clause whose OWN words are "requires human confirmation").
 _SPL_007_AUTH_CLAUSE = "SPL-007 §A.2"
@@ -4270,7 +4304,7 @@ class PlanningRunDriver:
             )
             return None
         target_repo_descriptor = self._build_target_repo_descriptor(
-            target_repo, repo_path
+            target_repo, repo_path, spec_feature
         )
         # WHERE the specification sits, beside WHAT it says (2026-08-22). These
         # are the same paths the stamp normalizer uses further down; they are
@@ -8492,8 +8526,131 @@ class PlanningRunDriver:
             return None
 
     @staticmethod
+    def _where_the_specs_words_already_appear(
+        repo_path: str, spec_feature: str
+    ) -> list[dict[str, Any]] | None:
+        """Where this feature's own words already occur in the repository.
+
+        WHY (2026-09-13, FEAT-19C4). The plan-writer is given the repository's
+        file NAMES and cannot open any of them. So it knew
+        ``src/users/router.py`` existed and could not know that
+        ``/users/count-today`` was already defined inside it — and wrote a plan
+        whose first task was "**create** the /users/count-today endpoint" for an
+        endpoint that had been serving for weeks. The same shape as FEAT-CDFD
+        before the inventory existed, one level down: names were not enough.
+
+        This is the smallest thing that answers it, and deliberately not the
+        exploration pass: no new stage, no seat reading files, no language's
+        grammar. The specification's own distinctive words — route paths, and
+        identifiers long enough to be this repository's name for something — are
+        looked for in the tracked files with ``git grep``. A word that is
+        already there comes back with the places it is, so the writer can plan
+        to CHANGE what exists rather than build it again.
+
+        Stack-agnostic by construction: ``git grep`` for a literal string knows
+        nothing about Python, TypeScript or Go, and the word pattern matches
+        kebab, snake and camel alike. Both caps are small — this is a pointer,
+        not a search result page.
+
+        Returns ``None`` when nothing can be looked for or nothing is found, so
+        the descriptor simply has no such key and planning is byte for byte what
+        it is today. Never raises: like the inventory beside it, this must never
+        be able to stop a planning run.
+        """
+        try:
+            words: list[str] = []
+            seen: set[str] = set()
+            for raw in _SPEC_WORD_PATTERN.findall(spec_feature or ""):
+                word = raw.strip().strip(".,;:")
+                lowered = word.lower().lstrip("/")
+                if not word or lowered in _SPEC_WORDS_NOT_WORTH_LOOKING_FOR:
+                    continue
+                if lowered in seen:
+                    continue
+                seen.add(lowered)
+                words.append(word)
+                if len(words) >= _MAX_SPEC_WORDS_LOOKED_FOR:
+                    break
+            if not words:
+                return None
+
+            found: list[dict[str, Any]] = []
+            for word in words:
+                # The word as the specification wrote it, and the two other
+                # shapes a repository commonly spells the same name in. A route
+                # written /users/count-today is a function named count_today
+                # somewhere, and neither spelling finds the other.
+                tail = word.lstrip("/").split("/")[-1]
+                spellings = {word, tail, tail.replace("-", "_"), tail.replace("_", "-")}
+                places: list[str] = []
+                for spelling in sorted(s for s in spellings if len(s) > 3):
+                    completed = subprocess.run(
+                        [
+                            "git",
+                            "-c",
+                            "safe.directory=*",
+                            "-C",
+                            str(repo_path),
+                            "grep",
+                            "-n",
+                            "--fixed-strings",
+                            "--",
+                            spelling,
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                        check=False,
+                    )
+                    # git grep exits 1 when it found nothing: not an error.
+                    if completed.returncode not in (0, 1):
+                        continue
+                    for line in completed.stdout.splitlines():
+                        path_and_line = ":".join(line.split(":", 2)[:2])
+                        if any(
+                            path_and_line.startswith(prefix)
+                            for prefix in _REPO_INVENTORY_SKIP_PREFIXES
+                        ):
+                            continue
+                        if path_and_line not in places:
+                            places.append(path_and_line)
+                if places:
+                    # The repository's own code first, then its tests, then its
+                    # paperwork. A writer asking "does this already exist?" is
+                    # answered by src/users/router.py, not by a line in a
+                    # markdown file that happens to mention it.
+                    def _how_interesting(place: str) -> tuple[int, str]:
+                        head = place.split("/", 1)[0]
+                        name = place.split(":", 1)[0]
+                        # Data and paperwork answer "where is it written
+                        # down", never "where is it built". Last, always.
+                        if name.endswith(
+                            (".json", ".lock", ".yaml", ".yml", ".md", ".txt", ".csv")
+                        ):
+                            return (3, place)
+                        if head in {"tests", "test", "spec", "qa"}:
+                            return (1, place)
+                        if head in {"docs", "doc", "features"}:
+                            return (2, place)
+                        return (0, place)
+
+                    places.sort(key=_how_interesting)
+                    found.append(
+                        {"words": word, "already_in": places[:_MAX_PLACES_PER_SPEC_WORD]}
+                    )
+            return found or None
+        except Exception as exc:  # noqa: BLE001 — never fail a plan over this
+            logger.warning(
+                "target_repo_descriptor: could not look for the "
+                "specification's words in %s (%s); planning without them",
+                repo_path,
+                exc,
+            )
+            return None
+
+    @staticmethod
     def _build_target_repo_descriptor(
-        target_repo: str, repo_path: str
+        target_repo: str, repo_path: str, spec_feature: str = ""
     ) -> dict[str, Any]:
         """Build the 008 ``target_repo_descriptor`` honestly from what forge knows.
 
@@ -8575,6 +8732,15 @@ class PlanningRunDriver:
         repository_inventory = PlanningRunDriver._read_repository_inventory(repo_path)
         if repository_inventory is not None:
             descriptor["repository_inventory"] = repository_inventory
+        # Names were not enough (FEAT-19C4): the writer knew the router file
+        # existed and planned to create a route already inside it. Present only
+        # when the specification has distinctive words AND the repository
+        # already has them; absent, the plan is byte for byte what it is today.
+        already_there = PlanningRunDriver._where_the_specs_words_already_appear(
+            repo_path, spec_feature
+        )
+        if already_there:
+            descriptor["where_the_specs_words_already_appear"] = already_there
         return descriptor
 
     def _has_leg_event(self, correlation_id: str, stage_label: str) -> bool:
