@@ -104,3 +104,32 @@ def test_a_non_python_file_is_named_but_not_guessed_about(tmp_path: Path) -> Non
 def test_nothing_here_can_raise(tmp_path: Path) -> None:
     assert what_the_repository_already_does(str(tmp_path / "missing"), SENTENCE) is None
     assert routes_in_python_file("def broken(:") == []
+
+
+def test_documentation_that_merely_mentions_a_route_is_not_a_route_file(tmp_path: Path) -> None:
+    """The first live fact sheet (2026-09-13) listed two
+    `.claude/agents/fastapi-*.md` files, because "api" is inside "fastapi".
+    They said "not read", so they misled nobody — but they were noise in front
+    of the coach, and the words are matched as whole words now."""
+    from forge.planning.repository_facts import _looks_like_routes
+
+    assert not _looks_like_routes(".claude/agents/fastapi-specialist-ext.md")
+    assert not _looks_like_routes("docs/API.md")
+    assert not _looks_like_routes("qa/gates/registry.yaml")
+    assert _looks_like_routes("src/users/router.py")
+    assert _looks_like_routes("src/api/users.py")
+    assert _looks_like_routes("app/controllers/users_controller.rb")
+    assert _looks_like_routes("src/routes/users.ts")
+
+    root = _repo(
+        tmp_path,
+        {
+            "src/users/router.py": ROUTER,
+            ".claude/agents/fastapi-specialist-ext.md": "mentions /users/count-today and /users/{user_id}\n",
+            "docs/API.md": "GET /users/count-today returns a count\n",
+        },
+    )
+    sheet = what_the_repository_already_does(str(root), SENTENCE)
+    assert sheet is not None
+    assert "src/users/router.py" in sheet
+    assert ".claude/agents" not in sheet and "docs/API.md" not in sheet
