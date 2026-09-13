@@ -359,9 +359,16 @@ def _make_driver(
         spec_input: str,
         revision_of: dict[str, str] | None = None,
         validate_feedback: str | None = None,
+        request_text: str | None = None,
+        repository_facts: str | None = None,
     ) -> Any:
         dispatches.append(
-            {"revision_of": revision_of, "validate_feedback": validate_feedback}
+            {
+                "revision_of": revision_of,
+                "validate_feedback": validate_feedback,
+                "request_text": request_text,
+                "repository_facts": repository_facts,
+            }
         )
         return replies[min(len(dispatches) - 1, len(replies) - 1)]
 
@@ -717,7 +724,10 @@ async def test_a_note_rewrites_the_spec_and_comes_back_with_a_fresh_card(
     assert len(_digest_cards(h)) == 2
 
     first, second = h.ctx["dispatches"]
-    assert first == {"revision_of": None, "validate_feedback": None}
+    assert first["revision_of"] is None and first["validate_feedback"] is None
+    # ...and, since 2026-09-13, the coach's ground truth rides the first
+    # round too: the run's own sentence, word for word.
+    assert first["request_text"] == "add a GET /version endpoint"
     assert second["validate_feedback"] == (
         "the second example should be a 404, not a 400"
     )
@@ -2596,7 +2606,10 @@ async def test_one_refused_example_runs_the_machines_note_round_before_the_card(
 
     assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
     first, second = h.ctx["dispatches"]
-    assert first == {"revision_of": None, "validate_feedback": None}
+    assert first["revision_of"] is None and first["validate_feedback"] is None
+    # ...and, since 2026-09-13, the coach's ground truth rides the first
+    # round too: the run's own sentence, word for word.
+    assert first["request_text"] == "add a GET /version endpoint"
     assert second["validate_feedback"] == _PRE_CARD_NOTE
     assert set(second["revision_of"]) == {
         f"{SLUG}.feature",
@@ -2918,3 +2931,96 @@ async def test_a_restart_re_opens_the_card_with_the_provability_line_word_for_wo
     assert cards[1].payload["details"]["summary"]["what_happened"] == (
         f"{_ROUND_ONE_TEXT} {_REWROTE_LINE}"
     )
+
+
+# ---------------------------------------------------------------------------
+# The assumptions are reviewed before the card (planning coach, 2026-09-13)
+# ---------------------------------------------------------------------------
+
+_INVENTING_ASSUMPTIONS = (
+    "assumptions:\n"
+    "- id: ASSUM-001\n"
+    "  assumption: The version string comes from the build metadata.\n"
+    "  basis: common practice; the input did not say\n"
+    "- id: ASSUM-002\n"
+    "  assumption: The endpoint requires authentication\n"
+    "  basis: Not stated in input; common security practice for analytics endpoints\n"
+)
+_INVENTING_DIGEST = DIGEST_YAML + (
+    "- id: ASSUM-002\n"
+    "  text: The endpoint requires authentication\n"
+    "  basis: Not stated in input; common security practice for analytics endpoints\n"
+)
+
+
+@pytest.mark.asyncio
+async def test_an_invented_requirement_goes_back_to_the_writer_once_and_the_card_says_so(
+    store: SqlitePlanningRunStore,
+) -> None:
+    """Arm B's defect, replayed: the first draft assumes authentication nobody
+    asked for; the reviewer sends it back as the machine's note; the writer
+    drops it; the card carries one line saying what happened."""
+    _queue(store)
+    h = _make_driver(
+        store,
+        subscriber_factory=SharedScriptFactory([_answer("approve")]),
+        spec_replies=[
+            _spec_reply(assumptions=_INVENTING_ASSUMPTIONS, digest=_INVENTING_DIGEST),
+            _spec_reply(),  # the rewrite: the invented assumption is gone
+        ],
+    )
+    await h.driver.drive(CID)
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+    dispatches = h.ctx["dispatches"]
+    assert len(dispatches) == 2, "exactly one machine round, never a third try"
+    note = dispatches[1]["validate_feedback"]
+    assert note.startswith("The reviewer found 1 assumption(s) that add something the request did not ask for")
+    assert "ASSUM-002" in note and "authentication was not asked for" in note
+    assert note.endswith("Change nothing else.")
+    superseded = [d for status, d in _events(store, "feature-spec-draft") if status == "superseded"]
+    assert superseded and superseded[0]["spec_draft"]["author"] == "planning-driver (assumption review)"
+    assert superseded[0]["spec_draft"]["flagged_assumptions"] == ["ASSUM-002"]
+    cards = _digest_cards(h)
+    assert len(cards) == 1
+    text = json.dumps(cards[0].payload)
+    assert "The machine's reviewer removed 1 assumption(s) the request did not ask for (authentication)." in text
+    assert "not asked for" not in json.dumps(cards[0].payload["details"]["summary"].get("what_the_machine_assumed"))
+
+
+@pytest.mark.asyncio
+async def test_an_invented_requirement_the_writer_keeps_is_shown_with_its_finding(
+    store: SqlitePlanningRunStore,
+) -> None:
+    """The writer would not drop it: the card opens on the rewritten draft with
+    the reviewer's finding under that assumption, and nothing is asked twice."""
+    _queue(store)
+    inventing = _spec_reply(assumptions=_INVENTING_ASSUMPTIONS, digest=_INVENTING_DIGEST)
+    h = _make_driver(
+        store,
+        subscriber_factory=SharedScriptFactory([_answer("approve")]),
+        spec_replies=[inventing, inventing],
+    )
+    await h.driver.drive(CID)
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+    assert len(h.ctx["dispatches"]) == 2
+    cards = _digest_cards(h)
+    assert len(cards) == 1
+    assumed = cards[0].payload["details"]["summary"]["what_the_machine_assumed"]
+    kept = next(a for a in assumed if a["assumption"] == "The endpoint requires authentication")
+    assert "⚠ not asked for — " in kept["why"]
+    assert "authentication was not asked for" in kept["why"]
+    untouched = next(a for a in assumed if a["assumption"].startswith("The version string"))
+    assert "not asked for" not in untouched["why"]
+    assert "reviewer removed" not in json.dumps(cards[0].payload)
+
+
+@pytest.mark.asyncio
+async def test_a_clean_manifest_leaves_the_leg_byte_for_byte(
+    store: SqlitePlanningRunStore,
+) -> None:
+    """No finding, no round, no line: one dispatch and the card as before."""
+    _queue(store)
+    h = _make_driver(store, subscriber_factory=SharedScriptFactory([_answer("approve")]))
+    await h.driver.drive(CID)
+    assert len(h.ctx["dispatches"]) == 1
+    assert "reviewer" not in json.dumps(_digest_cards(h)[0].payload)

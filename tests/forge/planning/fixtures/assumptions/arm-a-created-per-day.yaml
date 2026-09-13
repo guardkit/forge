@@ -1,0 +1,23 @@
+feature: User Creation Analytics - Daily Counts
+generated: '2026-07-09T14:32:00Z'
+stack: generic
+review_required: true
+assumptions:
+- id: ASSUM-001
+  scenario: A request to the daily counts endpoint returns exactly 7 days of data
+    ordered oldest first
+  assumption: The endpoint returns exactly 7 data points covering the most recent
+    7-day window
+  confidence: low
+  basis: Inferred from request description; not explicitly stated whether the window
+    is rolling or fixed
+  human_response: deferred
+- id: ASSUM-002
+  scenario: The endpoint returns 7 data points even when the system has been running
+    for less than 7 days
+  assumption: If the system has been running for less than 7 days, the endpoint returns
+    7 data points with zero counts for missing days
+  confidence: low
+  basis: Open question in input; no explicit decision on how to handle short-running
+    systems
+  human_response: deferred

@@ -520,3 +520,21 @@ def test_wire_true_validation_channel_extracts_the_real_error() -> None:
     ro = PlanningRunDriver._role_output_of(SimpleNamespace(role_output=wire))
     failures = PlanningRunDriver._validation_failures(ro)
     assert any("@negative" in f for f in failures)
+
+
+def test_the_coachs_ground_truth_rides_only_when_given() -> None:
+    """The planning coach's two ground-truth documents (2026-09-13) are extra
+    keys on the same wire: absent, a first-round dispatch is byte-identical
+    to the call that shipped; present, they travel word for word."""
+    plain = build_feature_spec_command_args(from_input="the approved input content")
+    assert plain == {"from_input": "the approved input content"}
+    assert build_feature_spec_command_args(
+        from_input="x", request_text="   ", repository_facts=""
+    ) == {"from_input": "x"}
+    given = build_feature_spec_command_args(
+        from_input="x",
+        request_text="Add a GET /users/created-per-day endpoint.",
+        repository_facts="`src/users/router.py` defines GET /users/count-today.",
+    )
+    assert given["request_text"] == "Add a GET /users/created-per-day endpoint."
+    assert given["repository_facts"] == "`src/users/router.py` defines GET /users/count-today."

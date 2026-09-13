@@ -168,6 +168,8 @@ def build_feature_spec_command_args(
     from_input: str,
     revision_of: dict[str, str] | None = None,
     validate_feedback: str | None = None,
+    request_text: str | None = None,
+    repository_facts: str | None = None,
 ) -> dict[str, Any]:
     """Exact ``po_feature_spec`` (007) wire args. See the CONTRACT note above.
 
@@ -187,6 +189,16 @@ def build_feature_spec_command_args(
         args["revision_of"] = dict(revision_of)
     if validate_feedback is not None and str(validate_feedback).strip():
         args["validate_feedback"] = validate_feedback
+    # The planning coach's ground truth (2026-09-13): the sentence, word for
+    # word, and what the repository already does for the words it uses. Both
+    # are shown to the spec seat's COACH, never the writer, so a draft is
+    # judged against what was asked and what already exists — the two things
+    # the coach could not see when it scored "requires authentication" as a
+    # perfect assumption. Absent, the wire is byte for byte what it was.
+    if request_text is not None and str(request_text).strip():
+        args["request_text"] = str(request_text)
+    if repository_facts is not None and str(repository_facts).strip():
+        args["repository_facts"] = str(repository_facts)
     return args
 
 
@@ -961,6 +973,8 @@ async def compose_planning_consumer_and_dispatch(
             spec_input: str,
             revision_of: dict[str, str] | None = None,
             validate_feedback: str | None = None,
+            request_text: str | None = None,
+            repository_facts: str | None = None,
         ) -> Any:
             return await dispatch_specialist_stage(
                 stage=StageClass.FEATURE_SPEC,
@@ -974,6 +988,8 @@ async def compose_planning_consumer_and_dispatch(
                     from_input=spec_input,
                     revision_of=revision_of,
                     validate_feedback=validate_feedback,
+                    request_text=request_text,
+                    repository_facts=repository_facts,
                 ),
             )
 

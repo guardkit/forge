@@ -89,6 +89,8 @@ from forge.planning.planner import (
     PauseAtCheckpoint,
     plan_next_step,
 )
+from forge.planning.assumption_review import review_assumptions
+from forge.planning.repository_facts import what_the_repository_already_does
 from forge.planning.revision import (
     CYCLE_CAP,
     REVISION_STAGE_LABEL,
@@ -853,6 +855,18 @@ _MACHINE_REWRITE_NOTE = (
 
 #: The note's author on every receipt: the machine, never a person.
 _MACHINE_NOTE_AUTHOR = "planning-driver (stamp normalizer refusal)"
+
+#: The author stamped on a rewrite the ASSUMPTION REVIEW asked for (2026-09-13,
+#: planning coach §4c) — a different reviewer from the stamp normalizer, and
+#: the record must say which.
+_ASSUMPTION_REVIEW_AUTHOR = "planning-driver (assumption review)"
+
+#: Rule-45-shaped line on the card when the writer removed what the reviewer
+#: flagged. Nobody is asked anything; the person is told what happened.
+_ASSUMPTION_REMOVED_CARD_LINE = (
+    "The machine's reviewer removed {count} assumption(s) the request did not "
+    "ask for ({what})."
+)
 
 #: The ONE un-mentioned line the owner reads when the rewrite stamped clean
 #: (rule 5). The spec card is not shown again; the three touches stand.
@@ -2221,6 +2235,22 @@ class PlanningRunDriver:
                 )
                 if drafted is None:
                     return False  # the failure is already loud and terminal
+                # THE ASSUMPTIONS ARE REVIEWED BEFORE THE CARD (2026-09-13,
+                # planning coach §4c): an assumption that adds what the
+                # request did not ask for goes back to the writer once as
+                # the machine's note; the card says what happened.
+                drafted = await self._review_the_assumptions_before_the_card(
+                    row,
+                    correlation_id,
+                    drafted,
+                    target_repo=target_repo,
+                    repo_path=repo_path,
+                    branch=branch,
+                    plan_run_id=plan_run_id,
+                    notes=notes,
+                )
+                if drafted is None:
+                    return False  # the rewrite round's write or digest failed loudly
                 # THE EXAMPLES ARE CHECKED FOR PROVABILITY BEFORE THE CARD
                 # (Part K, 2026-09-07): the committed .feature is run through
                 # the routing law's rules-only check, a refused example goes
@@ -2382,6 +2412,7 @@ class PlanningRunDriver:
         fail_on_refusal: bool = True,
         record: bool = True,
         previous_card: Mapping[str, Any] | None = None,
+        machine_author: str = _MACHINE_NOTE_AUTHOR,
     ) -> dict[str, Any] | None:
         """Dispatch the spec-writer, commit the spec, record the DRAFT row.
 
@@ -2444,6 +2475,10 @@ class PlanningRunDriver:
                 # said.
                 revision_of=prior,
                 validate_feedback=notes[-1] if notes else None,
+                # The coach's ground truth (2026-09-13): the sentence, word for
+                # word, and what the repository already does for its words.
+                request_text=self._request_text_of(row),
+                repository_facts=self._repository_facts_for(correlation_id, repo_path, row),
             )
         except Exception as exc:  # noqa: BLE001 — dispatch boundary
             await self._fail_leg(
@@ -2701,6 +2736,7 @@ class PlanningRunDriver:
                     card,
                     note=str(notes[-1]),
                     note_from_machine=note_from_machine,
+                    machine_author=machine_author,
                 )
 
         draft: dict[str, Any] = {
@@ -2736,6 +2772,7 @@ class PlanningRunDriver:
         *,
         note: str,
         note_from_machine: bool,
+        machine_author: str = _MACHINE_NOTE_AUTHOR,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """What a note's rewrite changed on the list, and the card's words for
         it. Returns ``(card, rewrite)``: the rewrite record (``repeat``, the
@@ -2754,7 +2791,7 @@ class PlanningRunDriver:
             # The machine's own round (2026-09-06): the comparison is what
             # the caller reads to decide between carrying on and stopping,
             # and the receipt names the author.
-            rewrite["author"] = _MACHINE_NOTE_AUTHOR
+            rewrite["author"] = machine_author
             return dict(card), rewrite
         card = dict(card)
         if rewrite["repeat"]:
@@ -2804,6 +2841,245 @@ class PlanningRunDriver:
     # The worked examples are checked for provability before the card
     # (Part K, 2026-09-07)
     # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _request_text_of(row: Any) -> str:
+        """The sentence, word for word, off the run row; empty when absent."""
+        try:
+            return str(row["request_text"] or "")
+        except (KeyError, IndexError, TypeError):
+            return str(getattr(row, "request_text", "") or "")
+
+    def _repository_facts_for(self, correlation_id: str, repo_path: str, row: Any) -> str | None:
+        """The fact sheet for this run, made once and kept for the leg.
+
+        Read by ordinary code from the repository at ``repo_path`` (the same
+        checkout the spec-words finder reads). ``None`` when the request
+        names no route the repository has anything to say about, so the
+        dispatch is byte for byte what it was.
+        """
+        cache: dict[str, str | None] = self.__dict__.setdefault("_repository_facts_cache", {})
+        if correlation_id not in cache:
+            cache[correlation_id] = what_the_repository_already_does(
+                repo_path, self._request_text_of(row)
+            )
+        return cache[correlation_id]
+
+    async def _review_assumptions_on_branch(
+        self,
+        draft: Mapping[str, Any],
+        *,
+        repo_path: str,
+        branch: str,
+        request_text: str,
+        repository_facts: str | None,
+    ) -> Any | None:
+        """The assumption review of the COMMITTED manifest, read back off the
+        planning branch — the same read the provability check makes for the
+        ``.feature``. ``None`` when there is no manifest to read."""
+        manifest_rel = next(
+            (
+                str(rel)
+                for rel in (draft.get("spec_files") or [])
+                if str(rel).endswith(_SPEC_ASSUMPTIONS_SUFFIX)
+            ),
+            None,
+        )
+        if manifest_rel is None:
+            return None
+        text = await self._deps.git_runner.read_file_from_branch(
+            repo_path=repo_path, branch=branch, file_path=manifest_rel
+        )
+        if text is None:
+            return None
+        return review_assumptions(
+            text, request_text=request_text, repository_facts=repository_facts
+        )
+
+    async def _review_the_assumptions_before_the_card(
+        self,
+        row: Any,
+        correlation_id: str,
+        draft: dict[str, Any],
+        *,
+        target_repo: str,
+        repo_path: str,
+        branch: str,
+        plan_run_id: str,
+        notes: list[str],
+    ) -> dict[str, Any] | None:
+        """Hold the committed draft's assumptions against the request and the
+        repository; send the flagged ones back to the writer once; say on the
+        card what happened (planning coach, 2026-09-13, design §4c).
+
+        The deterministic half of the planning coach. An assumption that adds
+        a capability the request does not mention — the one that refused arm
+        B — goes back to the spec writer as the machine's own note, exactly
+        as the plan leg's note goes: same dispatch, same coach, same must-pass
+        criterion, at most one round. If the writer removed it, the card
+        carries one line saying so. If the writer kept it, the card shows it
+        with the finding under it, so the person's touch is a decision rather
+        than a proofread. Never a third try; never a new touch.
+
+        ``draft`` is a committed draft WITHOUT a row yet; this writes none —
+        the provability step that follows writes the draft row. Returns the
+        draft the rest of the leg continues with, its ``assumption_review``
+        receipt set, or ``None`` when the rewrite round's write or digest
+        failed the run loudly.
+        """
+        deps = self._deps
+        request_text = self._request_text_of(row)
+        facts = self._repository_facts_for(correlation_id, repo_path, row)
+        review = await self._review_assumptions_on_branch(
+            draft, repo_path=repo_path, branch=branch, request_text=request_text, repository_facts=facts
+        )
+        receipt: dict[str, Any] = {
+            "checked": review is not None,
+            "round": 0,
+            "rewritten": False,
+            "removed": [],
+            "still_flagged": [],
+            "repository_facts": facts,
+        }
+        if review is None:
+            receipt["not_checked"] = "the committed spec has no assumptions manifest to read"
+            draft["assumption_review"] = receipt
+            return draft
+        receipt["first"] = review.receipt()
+        if not review.findings:
+            draft["assumption_review"] = receipt
+            return draft
+
+        note = review.note()
+        flagged = list(review.flagged_ids)
+        receipt.update({"round": 1, "author": _ASSUMPTION_REVIEW_AUTHOR, "note": note, "flagged": flagged})
+        logger.info(
+            "planning driver: run %s — %d assumption(s) add what the request did "
+            "not ask for; the machine sends them back to the spec writer once "
+            "(round 1) before the card: %s",
+            correlation_id,
+            len(flagged),
+            flagged,
+        )
+        deps.store._record_event(
+            correlation_id=correlation_id,
+            stage_label=_SPEC_DRAFT_STAGE,
+            status="superseded",
+            actor_identity="planning-driver",
+            details_json=json.dumps(
+                {
+                    "spec_draft": {
+                        "slug": draft.get("slug"),
+                        "spec_files": list(draft.get("spec_files") or []),
+                        "sha": draft.get("sha"),
+                        "scenario_count": draft.get("scenario_count"),
+                        "superseded_by_note": note,
+                        "author": _ASSUMPTION_REVIEW_AUTHOR,
+                        "flagged_assumptions": flagged,
+                    }
+                }
+            ),
+        )
+        try:
+            rewritten = await self._draft_spec(
+                row,
+                correlation_id,
+                target_repo=target_repo,
+                repo_path=repo_path,
+                branch=branch,
+                plan_run_id=plan_run_id,
+                notes=[*notes, note],
+                note_from_machine=True,
+                fail_on_refusal=False,
+                record=False,
+                previous_card=draft.get("card") or {},
+                machine_author=_ASSUMPTION_REVIEW_AUTHOR,
+            )
+        except _MachineNoteRefused as refused_round:
+            receipt["refused_by_checker"] = True
+            receipt["checker_reason"] = str(refused_round.reason or "")
+            receipt["dispatch_reason"] = refused_round.dispatch_reason
+            receipt["still_flagged"] = flagged
+            logger.warning(
+                "planning driver: run %s — the checker refused the machine's "
+                "rewrite after the assumption review (round 1: %s); the card "
+                "opens on the draft as first written, with the finding under "
+                "each flagged assumption",
+                correlation_id,
+                refused_round.dispatch_reason,
+            )
+            draft["card"] = self._card_with_assumption_warnings(draft.get("card") or {}, review, flagged)
+            draft["assumption_review"] = receipt
+            return draft
+        if rewritten is None:
+            return None  # the spec leg already failed the run loudly
+        second = await self._review_assumptions_on_branch(
+            rewritten, repo_path=repo_path, branch=branch, request_text=request_text, repository_facts=facts
+        )
+        still = list(second.flagged_ids) if second is not None else []
+        removed = [assumption_id for assumption_id in flagged if assumption_id not in still]
+        final = dict(rewritten)
+        final.pop("rewrite", None)
+        final["cycle"] = draft.get("cycle")
+        receipt.update(
+            {
+                "rewritten": True,
+                "removed": removed,
+                "still_flagged": still,
+                "second": second.receipt() if second is not None else None,
+            }
+        )
+        card = dict(final.get("card") or {})
+        if removed:
+            what = ", ".join(
+                sorted({f.capability for f in review.findings if f.assumption_id in removed})
+            )
+            line = _ASSUMPTION_REMOVED_CARD_LINE.format(count=len(removed), what=what)
+            card["what_happened"] = f"{card.get('what_happened', '')} {line}".strip()
+            receipt["card_line"] = line
+        if still and second is not None:
+            card = self._card_with_assumption_warnings(card, second, still)
+        final["card"] = card
+        final["assumption_review"] = receipt
+        logger.info(
+            "planning driver: run %s — after the assumption review's round: "
+            "%d removed, %d still flagged",
+            correlation_id,
+            len(removed),
+            len(still),
+        )
+        return final
+
+    @staticmethod
+    def _card_with_assumption_warnings(
+        card: Mapping[str, Any], review: Any, flagged: Sequence[str]
+    ) -> dict[str, Any]:
+        """The card with the reviewer's finding under each assumption the
+        writer kept. The card's entries carry the assumption's words, not its
+        id, so the match is on the words the manifest gave them."""
+        warnings: dict[str, str] = {}
+        for entry in review.assumptions:
+            assumption_id = str(entry.get("id") or entry.get("assumption_id") or "")
+            if assumption_id in flagged:
+                text = str(entry.get("assumption") or entry.get("text") or "").strip()
+                warning = review.card_warning(assumption_id)
+                if text and warning:
+                    warnings[text] = warning
+        if not warnings:
+            return dict(card)
+        out = dict(card)
+        assumed = []
+        for item in out.get("what_the_machine_assumed") or []:
+            if not isinstance(item, Mapping):
+                assumed.append(item)
+                continue
+            entry = dict(item)
+            warning = warnings.get(str(entry.get("assumption") or "").strip())
+            if warning:
+                entry["why"] = f"{entry.get('why', '')} {warning}".strip()
+            assumed.append(entry)
+        out["what_the_machine_assumed"] = assumed
+        return out
 
     async def _prove_the_examples_before_the_card(
         self,
