@@ -85,9 +85,32 @@ def _git_grep_files(repo_path: str, needle: str) -> list[str]:
     return [line.strip() for line in completed.stdout.splitlines() if line.strip()]
 
 
+#: Extensions that are documentation or configuration, never a route table.
+#: A markdown file that MENTIONS a route is not a file that DEFINES one, and
+#: putting it on the fact sheet is noise in front of the coach.
+_NOT_SOURCE = (
+    ".md", ".markdown", ".rst", ".txt", ".adoc", ".json", ".lock",
+    ".yaml", ".yml", ".toml", ".ini", ".cfg", ".csv", ".log",
+)
+
+#: The words that name a file as a place routes live, matched as WHOLE words
+#: inside the path's own segments. Substring matching put
+#: ``.claude/agents/fastapi-specialist-ext.md`` on the first live fact sheet
+#: (2026-09-13), because "api" is inside "fastapi".
+_ROUTE_WORDS = frozenset(
+    {"router", "routers", "route", "routes", "api", "apis", "endpoint",
+     "endpoints", "handler", "handlers", "controller", "controllers",
+     "view", "views", "resource", "resources"}
+)
+
+
 def _looks_like_routes(path: str) -> bool:
+    """True when this path is a source file where routes plausibly live."""
     lowered = path.lower()
-    return any(word in lowered for word in ("router", "route", "api", "endpoint", "handler", "controller", "view"))
+    if lowered.endswith(_NOT_SOURCE):
+        return False
+    words = {word for word in re.split(r"[^a-z0-9]+", lowered) if word}
+    return bool(words & _ROUTE_WORDS)
 
 
 def _dependency_names(node: ast.AST) -> list[str]:
@@ -212,7 +235,13 @@ def what_the_repository_already_does(repo_path: str, request_text: str) -> str |
             if len(first) < 3:
                 continue
             files = [f for f in _git_grep_files(str(root), f'"{first}') if _looks_like_routes(f)]
-            files = files or _git_grep_files(str(root), f'"{first}/')
+            if not files:
+                # Same filter on the wider search: a documentation file that
+                # mentions the path is not a file that defines it.
+                files = [
+                    f for f in _git_grep_files(str(root), f'"{first}/')
+                    if _looks_like_routes(f)
+                ]
             for file in files[:_MAX_FILES]:
                 if file in seen_files:
                     continue
