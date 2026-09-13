@@ -7045,3 +7045,94 @@ async def test_after_a_checker_refused_pre_card_round_the_plan_stage_asks_the_mo
     cards = _error_cards(h_b)
     assert len(cards) == 1
     assert _STOP_REFUSED_BY_CHECKER in cards[0]
+
+
+# ---------------------------------------------------------------------------
+# Names were not enough (2026-09-13, FEAT-19C4)
+#
+# The seat knew src/users/router.py existed and could not know that
+# /users/count-today was already defined inside it, so the plan's first task
+# was "create the /users/count-today endpoint" for an endpoint that had been
+# serving for weeks. The specification's own distinctive words are now looked
+# for in the tracked files, and where they already are travels with the plan.
+# ---------------------------------------------------------------------------
+
+
+def test_a_route_the_repository_already_serves_is_reported_with_where(
+    tmp_path: Path,
+) -> None:
+    """The FEAT-19C4 shape: the spec's route is already in the router."""
+    repo = _repo_with_files(tmp_path, ["src/users/router.py", "README.md"])
+    (repo / "src" / "users" / "router.py").write_text(
+        '@router.get("/count-today")\nasync def get_users_count_today(): ...\n'
+    )
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "the endpoint")
+
+    found = PlanningRunDriver._where_the_specs_words_already_appear(
+        str(repo), "When I send a GET request to /users/count-today\n"
+    )
+
+    assert found is not None
+    places = [place for row in found for place in row["already_in"]]
+    assert any(place.startswith("src/users/router.py:") for place in places)
+
+
+def test_the_repositorys_own_code_is_named_before_its_tests_and_paperwork(
+    tmp_path: Path,
+) -> None:
+    """"Does this exist?" is answered by the source, not by a markdown file."""
+    repo = _repo_with_files(
+        tmp_path, ["src/users/router.py", "tests/users/test_it.py", "docs/API.md"]
+    )
+    for rel in ("src/users/router.py", "tests/users/test_it.py", "docs/API.md"):
+        (repo / rel).write_text("count-today\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "everywhere")
+
+    found = PlanningRunDriver._where_the_specs_words_already_appear(
+        str(repo), "the /users/count-today endpoint\n"
+    )
+
+    assert found is not None
+    places = [place for row in found for place in row["already_in"]]
+    assert places[0].startswith("src/")
+
+
+def test_a_genuinely_new_feature_reports_nothing(tmp_path: Path) -> None:
+    """No hits, no key — a plan for new work reads exactly as it does today."""
+    repo = _repo_with_files(tmp_path, ["src/users/router.py"])
+
+    assert (
+        PlanningRunDriver._where_the_specs_words_already_appear(
+            str(repo), "the /users/favourite-colour endpoint\n"
+        )
+        is None
+    )
+
+
+def test_ordinary_english_is_never_looked_for(tmp_path: Path) -> None:
+    """A word like "numeric" would match half the repository and teach nothing."""
+    repo = _repo_with_files(tmp_path, ["src/users/router.py"])
+    (repo / "src" / "users" / "router.py").write_text(
+        "# returns a numeric response that should contain the correct value\n"
+    )
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "prose")
+
+    found = PlanningRunDriver._where_the_specs_words_already_appear(
+        str(repo),
+        "Then the response should contain a numeric value and be correct\n",
+    )
+
+    assert found is None
+
+
+def test_a_tree_that_is_not_a_repository_plans_without_it(tmp_path: Path) -> None:
+    """Never able to stop a plan: anything wrong is None and a warning."""
+    assert (
+        PlanningRunDriver._where_the_specs_words_already_appear(
+            str(tmp_path / "nowhere"), "/users/count-today\n"
+        )
+        is None
+    )
