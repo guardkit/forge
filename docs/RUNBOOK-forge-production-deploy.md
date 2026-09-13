@@ -142,9 +142,17 @@ c,h=d["Config"],d["HostConfig"]
 mounts=d.get("Mounts") or []
 envs=[e.split("=",1)[0] for e in (c.get("Env") or []) if "=" in e]
 hc=c.get("Healthcheck") or {}
-ok = (len(mounts)==6 and h.get("NetworkMode")=="host"
+# The mount COUNT is not fixed: it is the two state mounts plus one bind per
+# registered repository, so it grows every time a repository is registered.
+# It was hard-coded at 6 until 2026-09-13, by which time there were 7 and the
+# gate failed a capture that was perfectly complete. What must be true is that
+# the two state mounts are there and the shape is right.
+dests={m["Destination"] for m in mounts}
+state_mounts = {"/var/forge", "/home/forge/.forge"} <= dests
+ok = (state_mounts and len(mounts) >= 3 and h.get("NetworkMode")=="host"
       and c.get("Entrypoint")==["forge"] and hc.get("Test"))
-print(f"  mounts={len(mounts)} network={h.get('NetworkMode')} env={len(envs)} "
+print(f"  mounts={len(mounts)} (2 state + {len(mounts)-2} repository binds) "
+      f"network={h.get('NetworkMode')} env={len(envs)} "
       f"healthcheck={'present' if hc.get('Test') else 'MISSING'}")
 print("PASS" if ok else "FAIL — capture incomplete; do NOT stop the container")
 PY
