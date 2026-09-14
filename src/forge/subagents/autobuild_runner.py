@@ -1396,6 +1396,72 @@ def _load_filesystem_allowlist() -> list[Path] | None:
         return None
 
 
+def _load_routine_timeout_multiplier() -> float | None:
+    """Best-effort loader for ``routine.timeout_multiplier`` — the seat's companion.
+
+    WHY IT SITS BESIDE THE SEAT. A task's budget is its timeout MINUS however
+    long its wave has already been running, so a slower model on the same work
+    does not simply take longer — it is cut off. On 2026-09-14 arm B of the
+    coder comparison lost a feature to exactly that: two of its three tasks
+    passed in a single turn each, and the third was killed mid-turn when the
+    wave's remaining budget had fallen to 750 seconds. Nothing was wrong with
+    the code. A budget tuned on one seat silently judges another, so the dial
+    that scales it is named in the same place as the seat and moves with it.
+
+    Read exactly as :func:`_load_routine_seat` reads the seat — the same file,
+    the same loader, best-effort — and it never kills a build: unreadable,
+    malformed, absent, or the wrong shape all mean NO MULTIPLIER NAMED, say so
+    in one plain line, and the argv is byte for byte what it was.
+
+    Returns:
+        The multiplier, or ``None`` when none is named (today's behaviour).
+    """
+    try:
+        cfg_path = _forge_config_file()
+        if cfg_path is None:
+            return None
+        try:
+            cfg = _load_forge_config(cfg_path)
+        except Exception as exc:  # noqa: BLE001 — best-effort loader
+            logger.warning(
+                "autobuild_runner: could not read a routine timeout multiplier "
+                "from %s (%s) — this build carries the budgets it always did",
+                cfg_path,
+                exc,
+            )
+            return None
+        raw = getattr(getattr(cfg, "routine", None), "timeout_multiplier", None)
+        if raw is None:
+            return None
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            logger.warning(
+                "autobuild_runner: the routine timeout multiplier in %s is not "
+                "a number (%r) — this build carries the budgets it always did",
+                cfg_path,
+                raw,
+            )
+            return None
+        if not (0 < value <= 10):
+            logger.warning(
+                "autobuild_runner: the routine timeout multiplier in %s is "
+                "outside the range this will pass on (%r) — this build carries "
+                "the budgets it always did",
+                cfg_path,
+                value,
+            )
+            return None
+        return value
+    except Exception as exc:  # noqa: BLE001 — a lever must never kill a build
+        logger.warning(
+            "autobuild_runner: the routine timeout multiplier could not be read "
+            "(%s) — this build carries the budgets it always did",
+            exc,
+        )
+        return None
+
+
 def _load_routine_seat() -> str | None:
     """Best-effort loader for ``routine.seat`` — the model this build runs on.
 
@@ -3993,6 +4059,11 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
     routine_seat = _load_routine_seat()
     if routine_seat:
         argv += ["--model", routine_seat]
+    # The seat's companion (2026-09-14): a slower model needs a bigger budget
+    # for the same work. Unnamed adds nothing, exactly as the seat does.
+    routine_multiplier = _load_routine_timeout_multiplier()
+    if routine_multiplier is not None:
+        argv += ["--timeout-multiplier", str(routine_multiplier)]
 
     logger.info(
         "autobuild_runner: launching subprocess feature_id=%s cwd=%s "

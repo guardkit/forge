@@ -1293,6 +1293,26 @@ class RoutineConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    timeout_multiplier: float | None = Field(
+        default=None,
+        gt=0,
+        le=10,
+        description=(
+            "Scales every per-task time budget this build's stages are given, "
+            "named on the dispatch as '--timeout-multiplier <n>'. It belongs "
+            "beside the seat because it is the seat's companion: a slower "
+            "model needs a bigger budget for the SAME work, and the two must "
+            "move together or the budget silently judges the seat. "
+            "2026-09-14: arm B of the coder comparison failed on exactly "
+            "this. Two of its three tasks passed in one turn each; the third "
+            "was cut off mid-turn when the wave's remaining budget fell to "
+            "750s, because a task's budget is its timeout MINUS however long "
+            "its wave has already run, and that timeout was tuned on a faster "
+            "seat. Nothing was wrong with the code. Optional — unset adds "
+            "nothing to the dispatch and is today's behaviour byte for byte."
+        ),
+    )
+
     seat: str | None = Field(
         default=None,
         description=(
