@@ -61,6 +61,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "MERGE_AGENT_ID",
+    "MERGE_BASE_REF",
     "MERGE_OFFER_DETAILS_KEY",
     "MERGE_OFFER_STAGE_LABEL",
     "MERGE_OFFER_TARGET_IDENTIFIER",
@@ -71,6 +72,8 @@ __all__ = [
     "git_rev_parse_main",
     "merge_request_id",
     "read_baseline_failing",
+    "request_behind_the_build",
+    "run_the_scope_pass",
 ]
 
 #: ``stage_log.target_identifier`` of the durable offer latch.
@@ -87,6 +90,18 @@ MERGE_AGENT_ID: str = "merge-deploy-executor"
 
 #: ``source_id`` on every envelope this module emits (the forge identity).
 SOURCE_ID: str = "forge"
+
+#: What a routine build's branch is held against when the scope pass asks
+#: what it changed. The same branch the merge word merges into, and the same
+#: one :func:`git_rev_parse_main` pins the offer to.
+MERGE_BASE_REF: str = "main"
+
+#: How the scope pass says where it found the person's own sentence, in
+#: ordinary words, on the receipt.
+REQUEST_FROM_THE_RUN: str = "planning_runs.request_text via builds.correlation_id"
+REQUEST_FROM_THE_PARENT: str = (
+    "planning_runs.request_text via the parent build's correlation_id"
+)
 
 
 def merge_request_id(build_id: str) -> str:
@@ -186,6 +201,172 @@ def read_baseline_failing(build_id: str) -> list[str] | None:
     return None
 
 
+def request_behind_the_build(pool: Any, row: Any) -> tuple[str | None, str | None, str | None]:
+    """The sentence this build was asked for — ``(request, where from, why not)``.
+
+    A routine build's ``correlation_id`` is the planning run's own, so one
+    read of ``planning_runs`` finds the sentence; measured read-only against
+    the live ledger on 2026-09-15, that join lands 90 times out of 91.
+
+    A REPAIR build's correlation id is the made-up ``fix-build-<parent build
+    id>``, which joins nothing at all — 0 times out of 112 — so it resolves
+    through its parent build's row in one hop instead. If neither finds a
+    sentence, this says why in ordinary words and the scope pass then
+    publishes "the sentence could not be found" rather than an empty request.
+
+    Never raises.
+    """
+    from forge.pipeline.fix_row_producer import source_build_id_from_correlation_id
+
+    correlation_id = str(getattr(row, "correlation_id", "") or "").strip()
+    source = REQUEST_FROM_THE_RUN
+    if not correlation_id:
+        return None, None, "this build's row carries no correlation id"
+
+    parent_build = source_build_id_from_correlation_id(correlation_id)
+    if parent_build:
+        source = REQUEST_FROM_THE_PARENT
+        try:
+            parent_row = pool.get_build_row(parent_build)
+        except Exception as exc:  # noqa: BLE001 — a reader never stops a card
+            return None, None, (
+                f"the build this repair belongs to ({parent_build}) could not "
+                f"be read ({type(exc).__name__})"
+            )
+        if parent_row is None:
+            return None, None, (
+                f"the build this repair belongs to ({parent_build}) is not in "
+                "the record, so the sentence behind it could not be found"
+            )
+        correlation_id = str(getattr(parent_row, "correlation_id", "") or "").strip()
+        if not correlation_id:
+            return None, None, (
+                f"the build this repair belongs to ({parent_build}) carries no "
+                "correlation id"
+            )
+
+    try:
+        text = _read_request_text(pool, correlation_id)
+    except Exception as exc:  # noqa: BLE001 — a reader never stops a card
+        return None, None, (
+            f"the planning record for {correlation_id} could not be read "
+            f"({type(exc).__name__})"
+        )
+    if not text:
+        return None, None, (
+            f"there is no planning record for {correlation_id}, so the "
+            "sentence behind this build could not be found"
+        )
+    return text, source, None
+
+
+def _read_request_text(pool: Any, correlation_id: str) -> str | None:
+    """One read of ``planning_runs.request_text``, read-only where it can be.
+
+    Opens a fresh read-only handle on the same database file the facade
+    writes to — the pattern every other read side uses — and falls back to
+    the facade's own connection for the in-memory databases tests run on.
+    """
+    from forge.adapters.sqlite.connect import read_only_connect
+
+    db_path = getattr(pool, "db_path", None)
+    statement = "SELECT request_text FROM planning_runs WHERE correlation_id = ?"
+    if db_path is None or str(db_path) in ("", ":memory:"):
+        cursor = pool.connection.execute(statement, (correlation_id,))
+        found = cursor.fetchone()
+    else:
+        cx = read_only_connect(db_path)
+        try:
+            found = cx.execute(statement, (correlation_id,)).fetchone()
+        finally:
+            cx.close()
+    if found is None:
+        return None
+    text = found[0] if not isinstance(found, dict) else found.get("request_text")
+    text = str(text or "").strip()
+    return text or None
+
+
+def run_the_scope_pass(
+    *,
+    config: Any,
+    pool: Any,
+    build_id: str,
+    feature_id: str,
+    row: Any,
+) -> Any | None:
+    """Read the finished branch and hold it against the plan and the request.
+
+    Returns the scope report, or ``None`` when the pass could not even be
+    attempted — no repository path, say — which the card reads as "nobody
+    counted" and says nothing about scope at all.
+
+    Runs git, so it is called off the event loop. Never raises: every way
+    this can fail is a sentence on the receipt, and none of them holds up a
+    merge card.
+    """
+    from forge.config.sandboxes import sandbox_for
+    from forge.pipeline.branch_scope import (
+        read_branch_scope,
+        read_branch_scope_in_sandbox,
+    )
+    from forge.pipeline.scope_report import (
+        scope_of_the_build,
+        unread_scope,
+        write_scope_report,
+    )
+
+    repo_key = str(getattr(row, "repo", "") or "")
+    repo_root_raw = config.planning.target_repo_paths.get(repo_key)
+    if not repo_root_raw:
+        logger.info(
+            "the scope pass: %s has no entry in planning.target_repo_paths, "
+            "so nothing was counted for %s and the card says nothing about "
+            "scope",
+            repo_key,
+            build_id,
+        )
+        return None
+
+    merge_branch = str(getattr(row, "merge_branch", None) or "").strip() or None
+    head = branch_to_merge(feature_id, merge_branch)
+    request, source, why_not = request_behind_the_build(pool, row)
+
+    sandbox = sandbox_for(config, repo_key)
+    try:
+        if sandbox is not None:
+            reading = read_branch_scope_in_sandbox(
+                sandbox=sandbox,
+                repo=repo_key,
+                base=MERGE_BASE_REF,
+                head=head,
+                feature_id=feature_id,
+            )
+        else:
+            reading = read_branch_scope(
+                repo_root=Path(repo_root_raw),
+                base=MERGE_BASE_REF,
+                head=head,
+                feature_id=feature_id,
+            )
+    except Exception as exc:  # noqa: BLE001 — a reader never stops a card
+        report = unread_scope(
+            f"what {head} changed against {MERGE_BASE_REF} could not be read "
+            f"({type(exc).__name__}: {exc})"
+        )
+        write_scope_report(build_id, report)
+        return report
+
+    report = scope_of_the_build(
+        reading=reading,
+        request=request,
+        request_source=source,
+        request_why_not=why_not,
+    )
+    write_scope_report(build_id, report)
+    return report
+
+
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -210,6 +391,9 @@ class MergeOfferService:
             defaults to :func:`git_rev_parse_main`.
         baseline_reader: Injectable ``(build_id) -> list[str] | None`` seam;
             defaults to :func:`read_baseline_failing`.
+        scope_pass: Injectable ``(config, pool, build_id, feature_id, row) ->
+            report | None`` seam; defaults to :func:`run_the_scope_pass`. It
+            runs git, so it is called off the event loop.
         clock: Wall-clock seam for the stage row / paused_at stamps.
     """
 
@@ -222,6 +406,7 @@ class MergeOfferService:
         raw_publish: Callable[[str, bytes], Awaitable[Any]],
         git_head: Callable[[Path], Awaitable[str | None]] = git_rev_parse_main,
         baseline_reader: Callable[[str], list[str] | None] = read_baseline_failing,
+        scope_pass: Callable[..., Any] = run_the_scope_pass,
         clock: Callable[[], datetime] = _utcnow,
     ) -> None:
         self._config = config
@@ -230,6 +415,7 @@ class MergeOfferService:
         self._raw_publish = raw_publish
         self._git_head = git_head
         self._baseline_reader = baseline_reader
+        self._scope_pass = scope_pass
         self._clock = clock
 
     async def maybe_offer(self, event: Any) -> None:
@@ -260,7 +446,16 @@ class MergeOfferService:
             )
             return
 
+        # THE SCOPE PASS (the planner fix, 2026-09-15). Read the finished
+        # branch once, here, before the card is built: what it changed that
+        # the plan did not name, and what it built that the request never
+        # asked for. It is a REPORT and never a refusal — anything it cannot
+        # read is a sentence on its own receipt and the card simply says less.
+        scope = await self._take_the_scope_pass(event)
+
         def _words(branch: str, merge_branch: str | None) -> str:
+            from forge.cli._serve_gate_activation import card_line_about_scope
+
             # The card names the branch only when it is not the feature's own
             # (Part M, rule 55): a feature build's card reads exactly as before.
             named = (
@@ -268,22 +463,63 @@ class MergeOfferService:
                 if merge_branch is not None
                 else event.feature_id
             )
-            return (
+            sentences = [
                 f"{named} built clean — {event.tasks_completed} of "
-                f"{event.tasks_total} tasks passed. Approve = merge into main, "
-                "deploy to the sandbox and run the checks; the branch is kept "
-                "either way. Reject = nothing changes."
+                f"{event.tasks_total} tasks passed."
+            ]
+            in_scope = card_line_about_scope(scope)
+            if in_scope:
+                sentences.append(in_scope)
+            sentences.append(
+                "Approve = merge into main, deploy to the sandbox and run the "
+                "checks; the branch is kept either way. Reject = nothing "
+                "changes."
             )
+            return " ".join(sentences)
+
+        details: dict[str, Any] = {
+            "tasks_completed": event.tasks_completed,
+            "tasks_total": event.tasks_total,
+        }
+        if scope is not None:
+            details["scope_report"] = scope.to_dict()
 
         await self.offer(
             build_id=event.build_id,
             feature_id=event.feature_id,
             card_words=_words,
-            extra_details={
-                "tasks_completed": event.tasks_completed,
-                "tasks_total": event.tasks_total,
-            },
+            extra_details=details,
         )
+
+    async def _take_the_scope_pass(self, event: Any) -> Any | None:
+        """Run the scope pass off the event loop; ``None`` if nobody counted.
+
+        Never raises and never delays the card by more than the reading
+        itself: a scope line is worth having and no merge card has ever
+        waited on one before, so every way this can go wrong ends in a logged
+        sentence and a card that says nothing about scope.
+        """
+        try:
+            row = self._pool.get_build_row(event.build_id)
+            if row is None:
+                return None
+            return await asyncio.to_thread(
+                self._scope_pass,
+                config=self._config,
+                pool=self._pool,
+                build_id=event.build_id,
+                feature_id=event.feature_id,
+                row=row,
+            )
+        except Exception as exc:  # noqa: BLE001 — a report never stops a card
+            logger.warning(
+                "the scope pass: nothing was counted for %s (%s: %s) — the "
+                "merge card says nothing about scope",
+                event.build_id,
+                type(exc).__name__,
+                exc,
+            )
+            return None
 
     async def offer(
         self,

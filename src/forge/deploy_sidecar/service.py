@@ -38,6 +38,9 @@ The narrow contract:
     POST /git/worktree-changed-files {repo, path, base}
               -> {name_status, approval_patch, truncated, head|null,
                   test_patch, test_patch_truncated}
+    POST /git/branch-scope {repo, base, head, feature_id}
+              -> {name_status, added_lines, added_lines_read_whole,
+                  feature_file, plan_documents, head|null, error|null}
     POST /code/list-files {repo, under?}
               -> {files, count, total_tracked, under, capped, cap}
     POST /code/read-file  {repo, path, first_line?, last_line?}
@@ -3058,6 +3061,83 @@ def process_git_worktree_changed_files_request(
     }
 
 
+# ---------------------------------------------------------------------------
+# What a FINISHED BUILD's branch changed, for the merge card's scope line
+# (the planner fix, 2026-09-15)
+# ---------------------------------------------------------------------------
+#
+# The route above answers for a FIX JOURNEY's worktree: one exact path under
+# <repo>/.forge/worktrees/<leaf>, with the span fixed at <base>...HEAD. A
+# routine build has no such worktree — the column is empty on every one of
+# them — and its question is main...autobuild/FEAT-XXXX in the clone root,
+# which that route cannot express. So this is one more git question rather
+# than a widening of that one, and the fix journey's route is left alone.
+#
+# It runs read-only git and nothing else: two diffs and two file reads, fixed
+# argument lists, no shell, nothing written, no repository code executed. LAW
+# 1 resolves the repository from its key and both refs are shape-checked
+# before git sees them, exactly as every other git route does it.
+#
+# The work itself is forge's own module, imported, so the answer from inside
+# a sandbox and the answer taken on this side cannot drift apart. It answers
+# with what git printed and judges nothing: the comparing is done by
+# forge.pipeline.scope_report, in one place, for both venues.
+#
+# A reading that failed comes back as a 200 carrying an 'error' sentence, NOT
+# a 500. The line this feeds is a report on a card and may never refuse a
+# merge, and the caller's own reading of "this could not be read here" is
+# what the card then says.
+
+#: The route.
+GIT_BRANCH_SCOPE_ROUTE: str = "/git/branch-scope"
+
+
+def process_git_branch_scope_request(
+    payload: Any, *, config: ForgeConfig
+) -> tuple[int, dict[str, Any]]:
+    """``{repo, base, head, feature_id}`` → what that branch changed and added,
+    plus the plan of record behind it.
+
+    A 400 is a refusal of the request itself — an unknown repository, a ref
+    that is not a ref, a feature id that is not one. Everything else is a 200,
+    with ``error`` set when git could not answer. Never raises.
+    """
+    from forge.pipeline.branch_scope import read_branch_scope, reading_to_answer
+
+    if not isinstance(payload, dict):
+        return 400, {"error": "request body must be a JSON object"}
+    repo_path, error = _resolve_repo_key(payload, config)
+    if error or repo_path is None:
+        return 400, {"error": error}
+    base = payload.get("base")
+    error = _ref_error(base, what="base")
+    if error:
+        return 400, {"error": error}
+    head = payload.get("head")
+    error = _ref_error(head, what="head")
+    if error:
+        return 400, {"error": error}
+    feature_id = payload.get("feature_id")
+    if not isinstance(feature_id, str) or not SAFE_NAME_PATTERN.match(feature_id):
+        return 400, {
+            "error": (
+                "'feature_id' is required and must be a plain identifier "
+                "(letters, digits, dots, dashes and underscores)"
+            )
+        }
+    logger.info(
+        "forge-deploy-sidecar: reading what %s changed against %s in %s for %s",
+        head,
+        base,
+        repo_path,
+        feature_id,
+    )
+    reading = read_branch_scope(
+        repo_root=repo_path, base=str(base), head=str(head), feature_id=feature_id
+    )
+    return 200, reading_to_answer(reading)
+
+
 def process_receipts_export_request(
     payload: Any, *, config: ForgeConfig
 ) -> tuple[int, dict[str, Any]]:
@@ -5011,6 +5091,7 @@ class DeploySidecarHandler(BaseHTTPRequestHandler):
                 GIT_WORKTREE_REMOVE_ROUTE,
                 GIT_WORKTREE_COMMIT_COUNT_ROUTE,
                 GIT_WORKTREE_CHANGED_FILES_ROUTE,
+                GIT_BRANCH_SCOPE_ROUTE,
                 RECEIPTS_EXPORT_ROUTE,
                 STAMPS_EVIDENCE_ROUTE,
                 GUARDKIT_LEG_ROUTE,
@@ -5084,6 +5165,10 @@ class DeploySidecarHandler(BaseHTTPRequestHandler):
                 )
             elif route == GIT_WORKTREE_CHANGED_FILES_ROUTE:
                 status, body = process_git_worktree_changed_files_request(
+                    payload, config=config
+                )
+            elif route == GIT_BRANCH_SCOPE_ROUTE:
+                status, body = process_git_branch_scope_request(
                     payload, config=config
                 )
             elif route == RECEIPTS_EXPORT_ROUTE:
@@ -5239,6 +5324,7 @@ __all__ = [
     "GIT_WORKTREE_REMOVE_ROUTE",
     "GIT_WORKTREE_COMMIT_COUNT_ROUTE",
     "GIT_WORKTREE_CHANGED_FILES_ROUTE",
+    "GIT_BRANCH_SCOPE_ROUTE",
     "RECEIPTS_EXPORT_ROUTE",
     "STAMPS_EVIDENCE_ROUTE",
     "process_stamps_evidence_request",
@@ -5247,6 +5333,7 @@ __all__ = [
     "process_git_worktree_remove_request",
     "process_git_worktree_commit_count_request",
     "process_git_worktree_changed_files_request",
+    "process_git_branch_scope_request",
     "GIT_BRANCH_DIFF_TIMEOUT_SECONDS",
     "GIT_BRANCH_DIFF_LIMIT_BYTES",
     "process_receipts_export_request",
