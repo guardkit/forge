@@ -1,0 +1,417 @@
+"""The scope pass — hold the finished build against its plan AND against the
+sentence the person actually sent.
+
+WHY (the planner fix, 2026-09-15). Twelve builds for one sentence: the
+specification was right twelve times out of twelve and the plan behind it was
+different every time. Something nobody asked for turned up in ten of the
+twelve — five modules here, a database migration there — and in three of them
+the web address moved, which is what got a run refused at the live gate an
+hour later. None of it reached the card Rich taps to say merge.
+
+So this asks TWO questions of a finished build, and they are deliberately not
+the same question:
+
+* **against the plan** — which files did this build change that no task
+  document named? That is the blast radius, and "the plan did not name it" is
+  the right test for it, because a sentence names no files at all.
+* **against the request** — does this build answer at a web address the
+  sentence never named, or add a capability the sentence never asked for?
+  That is read from what the branch WROTE, not from what the plan promised,
+  and it is the half that catches a plan that was followed faithfully into
+  the wrong place.
+
+Both answers land in ``<receipts>/<build id>/scope_report.json`` at the moment
+the merge card is offered, which is before anyone says merge, so one sentence
+of it can ride on the card.
+
+THE ONE RULE THIS MODULE WILL NOT BREAK: **a count nobody took is never
+published as a count of nothing.** Three separate things can go unread — the
+branch, the plan's own declaration of files, and the request — and the report
+says which, in ordinary words, rather than printing a zero.
+
+Pure: no git, no network, no database. It is handed the reading and the
+request and it compares them. Never raises.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Mapping, Sequence
+
+logger = logging.getLogger(__name__)
+
+__all__ = [
+    "SCOPE_REPORT_NAME",
+    "DeclaredFiles",
+    "ScopeReport",
+    "files_the_plan_named",
+    "read_declared_files",
+    "scope_of_the_build",
+    "unread_scope",
+    "write_scope_report",
+]
+
+#: The receipt's filename, under ``<receipts>/<build id>/``.
+SCOPE_REPORT_NAME: str = "scope_report.json"
+
+#: The two sections a task document declares its files under. They are an
+#: existing convention in this estate, not a new invention: Rich introduced
+#: them by hand in fourteen forge task documents on 2026-05-07.
+_CREATE_HEADING = "## Files to Create"
+_MODIFY_HEADING = "## Files to Modify"
+
+#: What a section with nothing to declare writes. Present-and-empty is NOT
+#: the same as absent: this means "this task creates nothing", and a missing
+#: section means the task never said.
+_NONE_LINE = "_none_"
+
+#: Folders whose files are scaffolding rather than the thing that was asked
+#: for. A test file and a documentation page beside a new endpoint are the
+#: ordinary cost of building it, and naming them on the card would bury the
+#: five-module package the card exists to show.
+_DOC_FOLDERS: tuple[str, ...] = ("docs", "doc", "documentation")
+
+
+@dataclass(frozen=True)
+class DeclaredFiles:
+    """What one task document says it will touch.
+
+    The two sections are kept APART, because a task that creates nothing and
+    changes two files must be able to say exactly that. ``present`` is false
+    when the section is missing altogether, which is a defect in the task
+    document rather than a declaration of nothing.
+    """
+
+    create: tuple[str, ...] = ()
+    modify: tuple[str, ...] = ()
+    create_present: bool = False
+    modify_present: bool = False
+
+    @property
+    def declared_anything(self) -> bool:
+        """True when this task wrote either section at all, empty or not."""
+        return self.create_present or self.modify_present
+
+    @property
+    def all_files(self) -> tuple[str, ...]:
+        """Both sections together, for the one question that needs them
+        together: was this file named anywhere in the plan?"""
+        return tuple(dict.fromkeys((*self.create, *self.modify)))
+
+
+def _section_body(text: str, heading: str) -> str | None:
+    """One ``##`` section's body, or ``None`` when the heading is not there."""
+    lowered = str(text or "").lower()
+    at = lowered.find(heading.lower())
+    if at < 0:
+        return None
+    rest = str(text)[at + len(heading) :]
+    lines: list[str] = []
+    for line in rest.splitlines():
+        if line.startswith("#"):
+            break
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _paths_in(body: str) -> tuple[str, ...]:
+    """The repository-relative paths a section lists, back ticks stripped.
+
+    The single line ``- _none_`` declares nothing, which is a real answer and
+    not a missing one, so it yields no paths and the section still counts as
+    present.
+    """
+    found: list[str] = []
+    for raw in str(body or "").splitlines():
+        line = raw.strip()
+        if not line.startswith(("-", "*")):
+            continue
+        item = line[1:].strip().strip("`").strip()
+        if not item or item.lower() == _NONE_LINE:
+            continue
+        if item.startswith("_") and item.endswith("_"):
+            continue
+        if item not in found:
+            found.append(item)
+    return tuple(found)
+
+
+def read_declared_files(document: str) -> DeclaredFiles:
+    """Read one task document's two file sections.
+
+    This is a NEW reader on purpose. guardkit has one that does the opposite
+    of what is wanted here — it treats a section holding only ``- _none_`` as
+    absent and returns the two sections merged into one set — and two of its
+    tests pin that behaviour, so it keeps its own job and this keeps its own
+    rules. Never raises.
+    """
+    text = str(document or "")
+    create_body = _section_body(text, _CREATE_HEADING)
+    modify_body = _section_body(text, _MODIFY_HEADING)
+    return DeclaredFiles(
+        create=_paths_in(create_body or ""),
+        modify=_paths_in(modify_body or ""),
+        create_present=create_body is not None,
+        modify_present=modify_body is not None,
+    )
+
+
+def files_the_plan_named(
+    plan_documents: Mapping[str, str],
+) -> tuple[tuple[str, ...], bool]:
+    """Every file the plan of record declares, and whether it declared at all.
+
+    The second half of the answer is the honest half: a plan whose task
+    documents carry neither section has told us nothing, and comparing a
+    build against nothing would report every file it changed as a surprise.
+    """
+    named: list[str] = []
+    declared = False
+    for _path, document in sorted(dict(plan_documents or {}).items()):
+        files = read_declared_files(document)
+        declared = declared or files.declared_anything
+        for name in files.all_files:
+            if name not in named:
+                named.append(name)
+    return tuple(named), declared
+
+
+def _is_scaffolding(path: str) -> bool:
+    """True for a test file or a documentation page — the ordinary cost of
+    building the thing that was asked for."""
+    from forge.pipeline.merge_ready_checkpoint import path_is_test
+
+    cleaned = str(path or "").replace("\\", "/").lstrip("./")
+    if not cleaned:
+        return False
+    if path_is_test(cleaned):
+        return True
+    first = cleaned.split("/", 1)[0].lower()
+    return first in _DOC_FOLDERS
+
+
+@dataclass
+class ScopeReport:
+    """What the scope pass found, and what it could not take a count of."""
+
+    #: The branch's own changed files were read.
+    read: bool = False
+    #: One plain sentence for each thing that could not be read, joined.
+    why_not: str | None = None
+    #: The sentence the person sent, word for word, or ``None``.
+    request: str | None = None
+    #: Where that sentence came from, said plainly.
+    request_source: str | None = None
+    #: How many files this build changed.
+    files_changed: int = 0
+    #: The files the plan of record declared.
+    files_the_plan_named: list[str] = field(default_factory=list)
+    #: Files this build changed that no task document named, scaffolding
+    #: aside.
+    files_the_plan_did_not_name: list[str] = field(default_factory=list)
+    #: Files this build changed that the plan did not name and that are a
+    #: test or a documentation page — the ordinary cost of the work.
+    files_allowed_as_scaffolding: list[str] = field(default_factory=list)
+    #: The plan of record declared its files at all. False for every plan
+    #: written before task documents carried the two sections, and the
+    #: comparison is then not taken rather than reported as a sprawl.
+    plan_read: bool = False
+    #: The web addresses the request itself names.
+    routes_in_the_request: list[str] = field(default_factory=list)
+    #: The web addresses this branch wrote.
+    routes_the_branch_declares: list[str] = field(default_factory=list)
+    #: Those of them the request never named.
+    routes_the_request_did_not_name: list[str] = field(default_factory=list)
+    #: Capabilities this branch added that the request never asked for.
+    capabilities_the_request_did_not_name: list[str] = field(default_factory=list)
+    #: The comparison with the sentence was taken at all.
+    routes_read: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        """The receipt, exactly as it is written to disk and put on the row."""
+        return {
+            "read": self.read,
+            "why_not": self.why_not,
+            "request": self.request,
+            "request_source": self.request_source,
+            "files_changed": self.files_changed,
+            "files_the_plan_named": list(self.files_the_plan_named),
+            "files_the_plan_did_not_name": list(self.files_the_plan_did_not_name),
+            "files_allowed_as_scaffolding": list(self.files_allowed_as_scaffolding),
+            "plan_read": self.plan_read,
+            "routes_in_the_request": list(self.routes_in_the_request),
+            "routes_the_branch_declares": list(self.routes_the_branch_declares),
+            "routes_the_request_did_not_name": list(
+                self.routes_the_request_did_not_name
+            ),
+            "capabilities_the_request_did_not_name": list(
+                self.capabilities_the_request_did_not_name
+            ),
+            "routes_read": self.routes_read,
+        }
+
+
+def scope_of_the_build(
+    *,
+    reading: Any,
+    request: str | None,
+    request_source: str | None = None,
+    request_why_not: str | None = None,
+    test_roots: Sequence[str] | None = None,
+) -> ScopeReport:
+    """Compare a finished branch with its plan and with the request.
+
+    ``reading`` is a :class:`~forge.pipeline.branch_scope.BranchScopeReading`
+    (or anything carrying the same attributes). ``request`` is the sentence
+    the person sent, or ``None`` when it could not be found — in which case
+    the comparison with the sentence is simply not taken, and the report says
+    so instead of reporting nothing wrong. ``request_why_not`` is the caller's
+    own sentence for why it could not be found, used in place of the plain
+    one below when the caller knows something more useful.
+
+    Never raises.
+    """
+    from forge.pipeline.merge_ready_checkpoint import parse_changed_files
+    from forge.planning.task_traceability import (
+        _ALL_CAPABILITIES,
+        _is_a_place_on_disk,
+        _route_shaped,
+    )
+
+    report = ScopeReport(request=request or None, request_source=request_source)
+    reasons: list[str] = []
+
+    error = str(getattr(reading, "error", "") or "").strip()
+    if error:
+        report.why_not = error
+        return report
+
+    changes = parse_changed_files(str(getattr(reading, "name_status", "") or ""))
+    changed_paths = [change.path for change in changes if str(change.path).strip()]
+    report.read = True
+    report.files_changed = len(changed_paths)
+
+    # (a) AGAINST THE PLAN — the blast radius.
+    named, declared = files_the_plan_named(
+        getattr(reading, "plan_documents", {}) or {}
+    )
+    report.files_the_plan_named = list(named)
+    report.plan_read = bool(declared)
+    if declared:
+        wanted = {str(name).replace("\\", "/").lstrip("./") for name in named}
+        for path in changed_paths:
+            cleaned = str(path).replace("\\", "/").lstrip("./")
+            if cleaned in wanted:
+                continue
+            if _is_scaffolding(cleaned):
+                report.files_allowed_as_scaffolding.append(path)
+                continue
+            report.files_the_plan_did_not_name.append(path)
+    else:
+        reasons.append(
+            "the plan of record names no files in any of its task documents, "
+            "so there was nothing to compare what this build changed against"
+        )
+
+    # (b) AGAINST THE SENTENCE — the web addresses and the capability words in
+    # what the branch actually wrote. A different question from (a), asked of
+    # the finished build rather than of the plan.
+    added = str(getattr(reading, "added_lines", "") or "")
+    added_read_whole = bool(getattr(reading, "added_lines_read_whole", False))
+    if not request:
+        reasons.append(
+            str(request_why_not).strip()
+            if request_why_not and str(request_why_not).strip()
+            else (
+                "the sentence this build was asked for could not be found, so "
+                "what it built was not compared against it"
+            )
+        )
+    elif not added_read_whole:
+        reasons.append(
+            "what this branch added could not be read whole, so what it "
+            "built was not compared against the request"
+        )
+    else:
+        report.routes_read = True
+        roots = tuple(test_roots) if test_roots else ()
+        in_request = [
+            route.rstrip("/") for route in _route_shaped(request)
+        ]
+        report.routes_in_the_request = list(dict.fromkeys(in_request))
+        known = {route.lower() for route in report.routes_in_the_request}
+        declares: list[str] = []
+        for route in _route_shaped(added):
+            trimmed = route.rstrip("/")
+            if _is_a_place_on_disk(trimmed, roots or ("tests", "test", "spec", "specs")):
+                continue
+            if trimmed not in declares:
+                declares.append(trimmed)
+        report.routes_the_branch_declares = declares
+        report.routes_the_request_did_not_name = [
+            route for route in declares if route.lower() not in known
+        ]
+        for capability, pattern in _ALL_CAPABILITIES:
+            if not pattern.search(added):
+                continue
+            if pattern.search(request):
+                continue  # the person asked for it; a reading, not an addition
+            if capability not in report.capabilities_the_request_did_not_name:
+                report.capabilities_the_request_did_not_name.append(capability)
+
+    report.why_not = " ".join(reasons) if reasons else None
+    return report
+
+
+def unread_scope(why_not: str) -> ScopeReport:
+    """The report for a branch that could not be read at all."""
+    return ScopeReport(read=False, why_not=str(why_not))
+
+
+def write_scope_report(
+    build_id: str, report: ScopeReport, *, receipts_dir: "Path | None" = None
+) -> "Path | None":
+    """Write the receipt BESIDE the build's own evidence. Never raises.
+
+    It lands in the directory this build's receipts already live in, and it
+    does not make that directory: a real build has one from its first line of
+    output, and a build id nobody has ever run is not a reason to start a new
+    tree of receipts somewhere. Returns the path it wrote, or ``None`` when
+    it did not write — which is always a logged sentence and never a reason
+    to hold up a merge card.
+    """
+    from forge.receipts import receipts_root
+
+    try:
+        root = (
+            Path(receipts_dir)
+            if receipts_dir is not None
+            else receipts_root() / str(build_id)
+        )
+        if not root.is_dir():
+            logger.info(
+                "the scope pass: %s has no receipts directory at %s, so the "
+                "scope receipt was not written — what it found is still on "
+                "the card and on the build's own record",
+                build_id,
+                root,
+            )
+            return None
+        path = root / SCOPE_REPORT_NAME
+        path.write_text(
+            json.dumps(report.to_dict(), indent=2, sort_keys=False) + "\n",
+            encoding="utf-8",
+        )
+        return path
+    except Exception as exc:  # noqa: BLE001 — a receipt never holds up a card
+        logger.warning(
+            "the scope pass: the scope receipt for %s could not be written "
+            "(%s: %s) — the card still says what was found",
+            build_id,
+            type(exc).__name__,
+            exc,
+        )
+        return None

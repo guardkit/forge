@@ -2264,10 +2264,24 @@ IN_FLIGHT_STATE_NAME: str = _receipts.IN_FLIGHT_STATE_NAME
 #: 2026-08-15, when guardkit deleted the ``.dcl`` spec track outright — nothing
 #: writes that directory any more, so exporting it only ever produced an
 #: honest "missing" row.
+#: ``docs/state`` joined the list on 2026-09-15 (the planner fix, item 3).
+#: It is where the player writes its own note of what it intended to touch
+#: (``implementation_plan.md``, or ``implementation_plan.json`` as a
+#: fallback), and it died with the worktree. Nothing in this export needs the
+#: ``.guardkit`` prefix — the name is used as both source and destination —
+#: so this one entry exports the directory from the outer worktree and from
+#: every inner task worktree with no other change, and the fix journey's own
+#: exporter, which imports this same list, starts keeping it too.
+#:
+#: BE HONEST ABOUT WHAT THIS IS FOR: the local seat does not currently write
+#: that file. Every plan-audit block in every receipt on this machine says
+#: "skipped — no implementation plan on disk". So keeping it is ARMING A
+#: FUTURE MEASUREMENT, not recovering a lost one.
 _RECEIPT_FAMILIES: tuple[str, ...] = (
     ".guardkit/autobuild-private",
     ".guardkit/qav-shadow",
     ".guardkit/autobuild",
+    "docs/state",
 )
 
 #: Where guardkit registers its per-task INNER worktrees inside the outer

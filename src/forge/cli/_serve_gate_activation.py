@@ -77,6 +77,7 @@ __all__ = [
     "HOLD_SLOT",
     "GateDispatchOutcome",
     "MergeCardNotPublished",
+    "card_line_about_scope",
     "card_line_about_tests",
     "make_merge_card_publisher",
     "merge_card_words",
@@ -534,7 +535,84 @@ def card_line_about_tests(counts: Any) -> str:
     )
 
 
-def merge_card_words(*, feature_id: str, branch: str, gates: Any = None) -> str:
+def card_line_about_scope(report: Any) -> str:
+    """The ONE line about what this build did beyond what was asked for.
+
+    The planner fix, 2026-09-15. Two comparisons, not one, and they answer
+    different questions:
+
+    * **against the plan** — files this build changed that no task document
+      named. That is the blast radius; a sentence names no files, so "the
+      plan did not name it" is the only test that says anything true.
+    * **against the request** — a web address the sentence never named, or a
+      capability the sentence never asked for, read from what the branch
+      itself wrote. This is the half that catches a plan followed faithfully
+      into the wrong place: three of twelve builds for one sentence answered
+      at an address nobody asked for, and one of them was refused at the live
+      gate an hour after the merge word.
+
+    Five shapes. The first two may both appear; the last three each stand
+    alone:
+
+    * something outside the plan — what, how much, where, and "worth a look";
+    * something the request never named — one sentence per web address and
+      one per capability;
+    * nothing outside either — said in one short sentence;
+    * the branch could not be read here — said plainly;
+    * ``""`` when nobody counted, which is byte for byte the card that
+      shipped before this existed.
+
+    A count nobody took is never published as a count of nothing: when the
+    plan named no files at all, or the sentence could not be found, that half
+    is simply left unsaid and the receipt carries the reason in ordinary
+    words.
+    """
+    if report is None:
+        return ""
+    read = bool(getattr(report, "read", False))
+    plan_read = bool(getattr(report, "plan_read", False))
+    routes_read = bool(getattr(report, "routes_read", False))
+    outside_the_plan = tuple(getattr(report, "files_the_plan_did_not_name", ()) or ())
+    unnamed_routes = tuple(getattr(report, "routes_the_request_did_not_name", ()) or ())
+    unnamed_capabilities = tuple(
+        getattr(report, "capabilities_the_request_did_not_name", ()) or ()
+    )
+
+    said: list[str] = []
+    if read and plan_read and outside_the_plan:
+        count = len(outside_the_plan)
+        said.append(
+            f"This build also changed {count} file"
+            f"{'s' if count != 1 else ''} the plan did not name: "
+            f"{_names_the_files(outside_the_plan)} — worth a look before you "
+            "merge."
+        )
+    if routes_read:
+        for route in unnamed_routes:
+            said.append(
+                "It also answers at a web address the request did not name: "
+                f"{route}."
+            )
+        for capability in unnamed_capabilities:
+            said.append(
+                f"It also added {capability}, which the request did not ask "
+                "for."
+            )
+    if said:
+        return " ".join(said)
+    if not read:
+        return "Which files this build changed could not be read here."
+    if plan_read and routes_read:
+        return (
+            "Every file this build changed was named in the plan, and it "
+            "added nothing the request did not ask for."
+        )
+    return ""
+
+
+def merge_card_words(
+    *, feature_id: str, branch: str, gates: Any = None, scope: Any = None
+) -> str:
     """The sentences on the face of the merge-ready checkpoint's card.
 
     Five things a person needs and nothing else: what was checked and what
@@ -557,6 +635,12 @@ def merge_card_words(*, feature_id: str, branch: str, gates: Any = None) -> str:
             decision and in the log, because a card is read by a person.
             Anything missing simply leaves that sentence out — the card
             never claims a check it cannot name.
+        scope: The build's own scope report, when one was taken — what this
+            build changed beyond the files the plan named, and what it built
+            beyond what the request asked for (see
+            :func:`card_line_about_scope`). ``None`` means nobody counted,
+            and the card is then byte for byte the card that shipped before
+            the scope pass existed.
     """
     detail = str(getattr(gates, "detail", "") or "").strip().rstrip(".")
     deferred = str(getattr(gates, "deferred_detail", "") or "").strip()
@@ -569,6 +653,9 @@ def merge_card_words(*, feature_id: str, branch: str, gates: Any = None) -> str:
     tests = card_line_about_tests(getattr(gates, "test_changes", None))
     if tests:
         sentences.append(tests)
+    in_scope = card_line_about_scope(scope)
+    if in_scope:
+        sentences.append(in_scope)
     if deferred:
         # Ordinary words for the fact, never the internal sentence: that one
         # names check ids and their homes, which mean nothing to the person
