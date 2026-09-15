@@ -53,6 +53,7 @@ __all__ = [
     "DeclaredFiles",
     "ScopeReport",
     "files_the_plan_named",
+    "promises_the_capability",
     "read_declared_files",
     "scope_of_the_build",
     "unread_scope",
@@ -128,6 +129,85 @@ _ORDINARY_WIRING = re.compile(
     r"|=\s*logging\.(getLogger|Logger)\b"
     r"|^\s*logging\.(basicConfig|config)\b"
 )
+
+
+#: Words that turn a capability word on the same line into a DENIAL of that
+#: capability rather than a promise of it.
+#:
+#: WHY THIS EXISTS. Driven read-only over all twenty-three real build branches
+#: in the api_test repository on 2026-09-15, two of them put the sentence "It
+#: also added authentication, which the request did not ask for." on the card
+#: the owner taps to say merge — and both were wrong. The evidence in each was
+#: the route's own description string, which says the opposite of what the
+#: card said: "This endpoint does not require authentication." on one branch
+#: and "This endpoint is publicly accessible without authentication." on the
+#: other. A line that says the software does NOT do a thing is not evidence
+#: that the build added it.
+_A_DENIAL: frozenset[str] = frozenset({"not", "no", "never", "without"})
+
+#: How many words before the capability word a denial still reaches. Six is
+#: short on purpose: "does not require authentication" is three words, and a
+#: denial further back than that is usually a different clause saying a
+#: different thing.
+_HOW_FAR_A_DENIAL_REACHES = 6
+
+#: One word, hyphens and apostrophes kept, so that "X-Auth-Token",
+#: "non-authenticated" and "doesn't" are each read as the single word they are.
+_A_WORD = re.compile("[A-Za-z][A-Za-z'’-]*")
+
+
+def _a_denial_stands_before(line: str, at: int) -> bool:
+    """True when the capability word starting at ``at`` on this line is being
+    denied rather than promised.
+
+    Two ways a line denies a capability, and both are read here:
+
+    * the word itself is the capability's absence — "unauthenticated",
+      "non-authenticated" — which is a match that begins after an ``un`` or
+      ``non`` prefix inside one word;
+    * a denial stands a few words in front of it — "not", "no", "never",
+      "without", or anything ending in "n't".
+
+    Never raises.
+    """
+    words = [(match.group(0), match.start()) for match in _A_WORD.finditer(line)]
+    for word, start in words:
+        if start <= at < start + len(word):
+            lowered = word.lower()
+            inside = at - start
+            if lowered.startswith("un") and inside >= 2:
+                return True
+            if lowered.startswith("non") and inside >= 3:
+                return True
+            break
+    before = [word.lower() for word, start in words if start < at]
+    for word in before[-_HOW_FAR_A_DENIAL_REACHES:]:
+        if word in _A_DENIAL or word.endswith("n't") or word.endswith("n’t"):
+            return True
+    return False
+
+
+def promises_the_capability(text: str, pattern: re.Pattern[str]) -> bool:
+    """True when at least one LINE of ``text`` really says the software now
+    does the thing ``pattern`` names.
+
+    The question is asked one line at a time, and on each line a match that a
+    denial stands before does not count. Asking it of the whole text at once
+    was what put a false sentence on two of twenty-three real merge cards: the
+    only mention of authentication on either branch was a line saying the
+    endpoint does not require any. Reading line by line also keeps a true
+    mention elsewhere in the same file: a branch whose description string
+    denies authentication on one line and whose code requires an
+    ``X-Auth-Token`` header on another has still added authentication, and the
+    card still says so.
+
+    Never raises.
+    """
+    for line in str(text or "").splitlines():
+        for match in pattern.finditer(line):
+            if not _a_denial_stands_before(line, match.start()):
+                return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -568,8 +648,13 @@ def scope_of_the_build(
         # and a test fixture or a bare import puts a sentence about a
         # capability on the merge card that nothing in the build supports.
         what_it_declares = what_the_branch_declares(added_by_file or {})
+        # Read one line at a time, and never count a capability word that the
+        # same line denies: two of twenty-three real build branches said "It
+        # also added authentication" on the merge card purely because their
+        # route description reads "This endpoint does not require
+        # authentication."
         for capability, pattern in _ALL_CAPABILITIES:
-            if not pattern.search(what_it_declares):
+            if not promises_the_capability(what_it_declares, pattern):
                 continue
             if pattern.search(request):
                 continue  # the person asked for it; a reading, not an addition

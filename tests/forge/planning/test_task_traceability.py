@@ -197,7 +197,75 @@ def test_a_task_that_quotes_nothing_is_named_and_never_stops_a_run() -> None:
     assert [f.flag for f in review.findings] == [CANNOT_CITE]
     assert review.sends_it_back is True
     assert review.stops_the_run is False
-    assert "do not quote any of the words" in (review.cannot_cite_line() or "")
+    assert review.cannot_cite_line() == (
+        "One task in this plan does not quote any of the words of the request "
+        "it serves: TASK-AAAA-001. The run was not stopped for that on its own."
+    )
+
+
+def test_the_line_a_person_reads_counts_in_words_and_says_what_happened() -> None:
+    """The plural half of the same sentence, and the plain truth about what the
+    run did. The wording it replaced — "1 task(s) ... The plan was not sent
+    back for that on its own." — was machine talk AND untrue: any finding at
+    all opens the one note round, and what actually did not happen is that the
+    run was stopped."""
+    files: dict[str, str] = {}
+    for n in (1, 2, 3):
+        files.update(_task("# A task\n\nDo the work.\n", task_id=f"TASK-BBBB-00{n}"))
+    review = review_task_traceability(files, request_text=REQUEST)
+
+    assert [f.flag for f in review.findings] == [CANNOT_CITE] * 3
+    assert review.cannot_cite_line() == (
+        "Three tasks in this plan do not quote any of the words of the request "
+        "they serve: TASK-BBBB-001, TASK-BBBB-002, TASK-BBBB-003. The run was "
+        "not stopped for that on its own."
+    )
+    line = review.cannot_cite_line() or ""
+    assert "task(s)" not in line
+    assert "sent back" not in line
+
+
+def test_a_paraphrase_under_the_heading_is_not_a_quote() -> None:
+    """Rule 1 of the task document's shape says that section holds words
+    COPIED from the request. The guard as first built took any block quote,
+    so a task could paraphrase and pass while quoting nothing — the one thing
+    the section exists to prevent."""
+    files = _task(
+        "# The daily totals\n\n"
+        "## The words of the request this task serves\n\n"
+        "> Provide a way to see how many accounts appeared recently.\n",
+    )
+    review = review_task_traceability(files, request_text=REQUEST)
+
+    assert [f.flag for f in review.findings] == [CANNOT_CITE]
+    assert review.findings[0].sentence == (
+        "TASK-AAAA-001 quotes words that are not in the request, and claims "
+        "no scaffolding kind (one of: tests, documentation, response-shape, "
+        "data-access)"
+    )
+
+
+def test_a_paraphrase_falls_through_to_the_two_questions_behind_it() -> None:
+    """A quote that is not the request's words is no quote at all, so the task
+    is judged exactly as if it had written no section: its kind still excuses
+    it, and three consecutive words of the request elsewhere in the document
+    still count."""
+    excused_by_kind = _task(
+        "# Add the tests\n\n"
+        "## The words of the request this task serves\n\n"
+        "> Provide a way to see how many accounts appeared recently.\n",
+        front="scaffolding_kind: tests\n",
+    )
+    assert review_task_traceability(excused_by_kind, request_text=REQUEST).findings == []
+
+    quotes_elsewhere = _task(
+        "# The query\n\n"
+        "## The words of the request this task serves\n\n"
+        "> Provide a way to see how many accounts appeared recently.\n\n"
+        "## Acceptance Criteria\n\n"
+        "- [ ] Count users for each of the last 7 days\n",
+    )
+    assert review_task_traceability(quotes_elsewhere, request_text=REQUEST).findings == []
 
 
 def test_three_consecutive_words_of_the_request_are_a_citation() -> None:

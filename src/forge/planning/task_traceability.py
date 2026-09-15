@@ -181,6 +181,31 @@ _DOC_FOLDERS: tuple[str, ...] = ("docs", "doc", "documentation")
 _QUOTE_WINDOW = 3
 
 
+#: Small numbers written the way a person writes them. A card that opens
+#: "1 task(s)" is machine talk; one that opens "One task" is a sentence.
+_IN_WORDS: tuple[str, ...] = (
+    "Zero",
+    "One",
+    "Two",
+    "Three",
+    "Four",
+    "Five",
+    "Six",
+    "Seven",
+    "Eight",
+    "Nine",
+    "Ten",
+)
+
+
+def _in_words(how_many: int) -> str:
+    """``3`` as ``"Three"``. Anything past ten keeps its digits, because
+    "Seventeen" on a card reads worse than "17"."""
+    if 0 <= how_many < len(_IN_WORDS):
+        return _IN_WORDS[how_many]
+    return str(how_many)
+
+
 @dataclass(frozen=True)
 class TaskFinding:
     """One thing wrong with one task, said plainly."""
@@ -257,16 +282,32 @@ class TraceabilityReview:
 
     def cannot_cite_line(self) -> str | None:
         """The one plain line a person reads when tasks quote nothing from the
-        request. ``None`` when every task could quote it."""
+        request. ``None`` when every task could quote it.
+
+        Written the way a person writes it: "One task ... does" or "Three
+        tasks ... do", and the plain truth about what happened, which is that
+        the run carried on. The earlier wording said the plan "was not sent
+        back for that on its own", and that was machine talk and untrue as
+        well: any finding at all opens the one note round the plan writer
+        gets. What is true, and what a person needs to know, is that the run
+        was not STOPPED for it.
+        """
         findings = self.cannot_cite
         if not findings:
             return None
         names = ", ".join(finding.task_id for finding in findings)
-        return (
-            f"{len(findings)} task(s) in this plan do not quote any of the "
-            f"words of the request they serve: {names}. The plan was not sent "
-            "back for that on its own."
-        )
+        how_many = _in_words(len(findings))
+        if len(findings) == 1:
+            said = (
+                f"{how_many} task in this plan does not quote any of the "
+                "words of the request it serves"
+            )
+        else:
+            said = (
+                f"{how_many} tasks in this plan do not quote any of the "
+                "words of the request they serve"
+            )
+        return f"{said}: {names}. The run was not stopped for that on its own."
 
     def stop_sentences(self) -> list[str]:
         """The findings that stopped the run, in ordinary words."""
@@ -347,22 +388,53 @@ def _section(text: str, heading: str) -> str:
     return rest[: nxt.start()] if nxt else rest
 
 
-def _quotes_the_request_in_its_own_section(text: str) -> bool:
-    """True when the task wrote real words of the request under the heading.
+def _the_words_quoted(text: str) -> str:
+    """The block quote the task wrote under the quote heading, its ``>`` lines
+    joined — or the empty string when it wrote no quote there at all.
 
     The excused line — ``_none — this is a tests task_`` — is a declaration
-    that there is nothing to quote, not a quote, so it does not count here;
+    that there is nothing to quote, not a quote, so it yields nothing here;
     whether that task is excused is the scaffolding question, asked next.
     """
     body = _section(text, _QUOTE_HEADING).strip()
     if not body:
-        return False
+        return ""
     for kind in SCAFFOLDING_KINDS:
         if body == excused_task_line(kind):
-            return False
+            return ""
     if re.fullmatch(r"_none.*_", body, re.IGNORECASE | re.DOTALL):
+        return ""
+    quoted = [
+        line.strip().lstrip(">").strip()
+        for line in body.splitlines()
+        if line.strip().startswith(">")
+    ]
+    return "\n".join(part for part in quoted if part)
+
+
+def _quotes_the_request_in_its_own_section(
+    text: str, request_words: Sequence[str]
+) -> bool:
+    """True when the words the task quoted under the heading really are the
+    request's own words.
+
+    Rule 1 of the task document's shape says that section holds "words copied
+    from the request". As first built, this counted ANY block quote under the
+    heading, so a task that paraphrased the request in its own words passed
+    the check while quoting nothing — which is the one thing the section
+    exists to prevent. Found in the coordinator's own review of the build and
+    fixed here: the quoted words count only when at least three consecutive
+    words of them appear in the request, read with this module's own
+    normalisation, so punctuation and capitals never decide it.
+
+    A quote that is not the request's words is no quote at all: the task then
+    falls through to the scaffolding-kind and three-consecutive-words
+    questions exactly as if it had written no section.
+    """
+    quoted = _the_words_quoted(text)
+    if not quoted:
         return False
-    return True
+    return _quotes_three_consecutive_words(quoted, request_words)
 
 
 def _words(text: str) -> list[str]:
@@ -544,7 +616,7 @@ def _review_one_task(
         )
 
     # 3. Can it point at the words of the request it serves?
-    if _quotes_the_request_in_its_own_section(document):
+    if _quotes_the_request_in_its_own_section(document, request_words):
         return
     kind = _scaffolding_kind_of(front)
     if kind is not None:
@@ -553,15 +625,26 @@ def _review_one_task(
         _without(document, contradicted), request_words
     ):
         return
+    # A task that wrote a quote which is not the request's words is told
+    # exactly that, because it is a different mistake from writing nothing and
+    # a different thing to put right.
+    wrote_a_quote = bool(_the_words_quoted(document))
+    kinds = ", ".join(SCAFFOLDING_KINDS)
+    sentence = (
+        f"{task_id} quotes words that are not in the request, and claims no "
+        f"scaffolding kind (one of: {kinds})"
+        if wrote_a_quote
+        else (
+            f"{task_id} quotes nothing from the request and claims no "
+            f"scaffolding kind (one of: {kinds})"
+        )
+    )
     review.findings.append(
         TaskFinding(
             task_id=task_id,
             path=path,
             flag=CANNOT_CITE,
             what="",
-            sentence=(
-                f"{task_id} quotes nothing from the request and claims no "
-                "scaffolding kind (one of: " + ", ".join(SCAFFOLDING_KINDS) + ")"
-            ),
+            sentence=sentence,
         )
     )

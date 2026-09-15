@@ -508,6 +508,202 @@ class TestWhatCountsAsDeclaringACapability:
         assert what_the_branch_declares({"": "x = 1\n"}) == ""
 
 
+#: The route declaration FEAT-3EF3 really committed to ``src/users/router.py``,
+#: copied out of that branch read-only on 2026-09-15. The last line of its
+#: description is the whole defect: the only mention of authentication anywhere
+#: in the code this build was asked for says the endpoint does NOT require any.
+FEAT_3EF3_ROUTER = '''"""Users API router."""
+
+
+@router.get(
+    "/users/created-per-day",
+    response_model=CreatedPerDayResponse,
+    tags=["users"],
+    summary="Get users created per day for the last 7 days",
+    description=(
+        "Returns exactly 7 entries (today and the previous 6 days) showing "
+        "the number of users created on each day, ordered from oldest to newest. "
+        "Days with zero creations are included with a count of 0. "
+        "This endpoint does not require authentication."
+    ),
+    responses={
+        503: {"description": "Database unavailable"},
+    },
+)
+async def get_users_created_per_day(db=Depends(get_db)):
+    return await crud.count_users_created_per_day(db)
+'''
+
+#: The same declaration from FEAT-7A25, which denies it the other way round:
+#: "publicly accessible without authentication".
+FEAT_7A25_ROUTER = '''"""Users API router."""
+
+
+@router.get(
+    "/users/created-per-day",
+    response_model=list[CreatedPerDayEntry],
+    tags=["users"],
+    summary="Get user creation counts per day for the last 7 days",
+    description=(
+        "Returns a JSON array of {day, count} objects showing the number of "
+        "users created on each of the last 7 days, ordered from oldest to "
+        "newest. Days with no user creations are included with a count of 0. "
+        "This endpoint is publicly accessible without authentication."
+    ),
+    responses={
+        503: {"description": "Database unavailable"},
+    },
+)
+async def get_users_created_per_day(db=Depends(get_db)):
+    return await crud.count_users_created_per_day(db)
+'''
+
+#: FEAT-BD8F really did add a login requirement nobody asked for, and its
+#: evidence is a line with no denial on it at all: the endpoint requires an
+#: ``X-Auth-Token`` header. This one must keep its sentence.
+FEAT_BD8F_ROUTER = '''"""Users API router."""
+
+
+@router.get(
+    "/users/created-per-day",
+    response_model=UserCreationStats,
+    tags=["users"],
+    summary="Get the number of users created on each of the last seven days",
+    description=(
+        "Returns the number of users created on each of the last seven calendar "
+        "days, oldest day first, with the total the days account for. The window "
+        "ends yesterday: today is still in progress and is not answered for. A "
+        "day with no creations carries a count of zero rather than going missing. "
+        "Soft-deleted users are not counted as creations. Requires the "
+        "``X-Auth-Token`` header."
+    ),
+    responses={
+        403: {"description": "Unauthorized: valid authentication token required"},
+        503: {"description": "Database unavailable"},
+    },
+)
+async def get_users_created_per_day(request, db=Depends(get_db)):
+    if request.headers.get("X-Auth-Token") != AUTH_TOKEN:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    return await crud.count_users_created_per_day(db)
+'''
+
+
+class TestALineThatDeniesACapability:
+    """A line saying the software does NOT do a thing is not evidence that
+    this build added it.
+
+    Driven read-only over all twenty-three real build branches in the api_test
+    repository on 2026-09-15, two of them carried the sentence "It also added
+    authentication, which the request did not ask for." on the card the owner
+    taps to say merge — and in both, the only mention of authentication in the
+    code the build was asked for was the route's own description saying the
+    endpoint needs none. The three route declarations above are those two
+    branches and the one that really did add it, copied out of the branches
+    themselves.
+    """
+
+    def test_feat_3ef3_loses_a_sentence_that_was_never_true(self, repo: Path) -> None:
+        _build_on(repo, {"src/users/router.py": FEAT_3EF3_ROUTER})
+        reading = read_branch_scope(
+            repo_root=repo, base="main", head=BRANCH, feature_id=FEATURE_ID
+        )
+        report = scope_of_the_build(reading=reading, request=REQUEST)
+
+        assert report.routes_read is True
+        assert report.capabilities_the_request_did_not_name == []
+
+        from forge.cli._serve_gate_activation import card_line_about_scope
+
+        assert "authentication" not in card_line_about_scope(report)
+
+    def test_feat_7a25_loses_it_too_where_the_denying_word_is_without(
+        self, repo: Path
+    ) -> None:
+        _build_on(repo, {"src/users/router.py": FEAT_7A25_ROUTER})
+        reading = read_branch_scope(
+            repo_root=repo, base="main", head=BRANCH, feature_id=FEATURE_ID
+        )
+        report = scope_of_the_build(reading=reading, request=REQUEST)
+
+        assert report.routes_read is True
+        assert report.capabilities_the_request_did_not_name == []
+
+        from forge.cli._serve_gate_activation import card_line_about_scope
+
+        assert "authentication" not in card_line_about_scope(report)
+
+    def test_feat_bd8f_keeps_the_sentence_that_is_true(self, repo: Path) -> None:
+        """This branch really did demand a header nobody asked for, and the
+        card must still say so. A denial reading that swallowed this one would
+        have cost the pass the only true sentence of the three."""
+        _build_on(repo, {"src/users/router.py": FEAT_BD8F_ROUTER})
+        reading = read_branch_scope(
+            repo_root=repo, base="main", head=BRANCH, feature_id=FEATURE_ID
+        )
+        report = scope_of_the_build(reading=reading, request=REQUEST)
+
+        assert report.routes_read is True
+        assert "authentication" in report.capabilities_the_request_did_not_name
+
+        from forge.cli._serve_gate_activation import card_line_about_scope
+
+        assert (
+            "It also added authentication, which the request did not ask for."
+            in card_line_about_scope(report)
+        )
+
+    def test_the_reading_is_per_line_so_a_true_mention_elsewhere_still_counts(
+        self, repo: Path
+    ) -> None:
+        """The denial only ever covers its own line. A build whose description
+        denies authentication on one line and whose code demands an
+        ``X-Auth-Token`` header on another has still added authentication, and
+        the card still says so."""
+        mixed = FEAT_3EF3_ROUTER.replace(
+            "async def get_users_created_per_day(db=Depends(get_db)):\n",
+            "async def get_users_created_per_day(request, db=Depends(get_db)):\n"
+            '    if request.headers.get("X-Auth-Token") != AUTH_TOKEN:\n'
+            '        raise HTTPException(status_code=403, detail="Unauthorized")\n',
+        )
+        assert "X-Auth-Token" in mixed
+        _build_on(repo, {"src/users/router.py": mixed})
+        reading = read_branch_scope(
+            repo_root=repo, base="main", head=BRANCH, feature_id=FEATURE_ID
+        )
+        report = scope_of_the_build(reading=reading, request=REQUEST)
+
+        assert "authentication" in report.capabilities_the_request_did_not_name
+
+    def test_how_far_back_a_denial_reaches(self) -> None:
+        """A denial a few words in front of the capability word reaches it; one
+        far enough back to be a different clause does not, because a rule that
+        swallowed every later sentence would hide real additions."""
+        from forge.planning.assumption_review import _CAPABILITIES
+        from forge.pipeline.scope_report import promises_the_capability
+
+        auth = dict(_CAPABILITIES)["authentication"]
+
+        assert promises_the_capability("every request requires authentication", auth)
+        assert not promises_the_capability(
+            "This endpoint does not require authentication.", auth
+        )
+        assert not promises_the_capability(
+            "This endpoint is publicly accessible without authentication.", auth
+        )
+        assert not promises_the_capability(
+            "do not write a scenario about rejecting unauthenticated requests", auth
+        )
+        assert not promises_the_capability("the route doesn't need a login", auth)
+        # Out of reach: the denial is eight words back and belongs to another
+        # clause about something else entirely.
+        assert promises_the_capability(
+            "There is no cache here at all, and the endpoint now requires "
+            "authentication on every call.",
+            auth,
+        )
+
+
 class TestWhenNothingCouldBeRead:
     def test_a_branch_that_is_not_there_is_said_plainly(self, repo: Path) -> None:
         reading = read_branch_scope(
