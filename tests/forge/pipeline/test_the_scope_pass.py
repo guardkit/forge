@@ -679,3 +679,338 @@ class TestTheReceipt:
             "routes_read",
         ):
             assert field in kept, field
+
+
+class TestTheFactorysOwnPaperworkOnTheBranch:
+    """The way a REAL routine build branch is shaped, which is not the way
+    the fixture above is shaped.
+
+    Every real build branch opens with four planning commits — the feature
+    file, the specification input, the feature plan with its task documents,
+    and the QA pass bars and gate scripts — and only then the coder's commit.
+    So all of the factory's own writing is inside ``main...autobuild/FEAT-…``
+    and, read as the code the build was asked for, it put six to twelve false
+    sentences on the card Rich taps to say merge: a shebang became a web
+    address, a placeholder in a gate script became a web address, an example
+    in a docstring became a web address, and an open question in the
+    specification input ("Are there any authentication or authorization
+    requirements for this endpoint?") became "It also added authentication,
+    which the request did not ask for."
+
+    Measured on 2026-09-15 over all twenty-two real build branches in the
+    api_test repository: 169 "It also …" sentences before this, 11 after, and
+    the nine that survive are things the builds really did — three moved the
+    web address, four added a database migration, and the rest added a way of
+    signing in nobody asked for.
+    """
+
+    THE_GATE_SCRIPT = (
+        "#!/usr/bin/env python3\n"
+        '"""The QA gate for the daily counts endpoint.\n'
+        "\n"
+        "Example: the gate calls /stats and compares the rows.\n"
+        '"""\n'
+        "PLACEHOLDER = '/REPLACE_ME'\n"
+        "def check():\n"
+        "    return True\n"
+    )
+    THE_SPEC_INPUT = (
+        "# The request\n\n"
+        "Add a GET /users/created-per-day endpoint.\n\n"
+        "**open_questions**: ['Are there any authentication or authorization "
+        "requirements for this endpoint?', 'Should a database migration add "
+        "the column?']\n"
+    )
+
+    @pytest.fixture
+    def repo_the_way_the_factory_builds(self, tmp_path: Path) -> Path:
+        """main holds the repository as it stood; the planning papers and the
+        code are both committed on the build's own branch."""
+        root = tmp_path / "api_test"
+        root.mkdir()
+        _git(root, "init", "-q", "-b", "main")
+        _write(root, "src/users/router.py", "# the users router\n")
+        _write(root, "src/users/crud.py", "# the users queries\n")
+        _git(root, "add", "-A")
+        _git(root, "commit", "-q", "-m", "the repository as it stood")
+
+        _git(root, "checkout", "-q", "-b", BRANCH)
+        task_one = "tasks/backlog/daily-counts/TASK-SCOPE-001-the-query.md"
+        task_two = "tasks/backlog/daily-counts/TASK-SCOPE-002-the-endpoint.md"
+        _write(
+            root,
+            f".guardkit/features/{FEATURE_ID}.yaml",
+            _feature_file([task_one, task_two]),
+        )
+        _write(
+            root,
+            task_one,
+            _task_document("TASK-SCOPE-001", create=[], modify=["src/users/crud.py"]),
+        )
+        _write(
+            root,
+            task_two,
+            _task_document("TASK-SCOPE-002", create=[], modify=["src/users/router.py"]),
+        )
+        _write(root, "feature_spec_inputs/8ca406dd-the-request.md", self.THE_SPEC_INPUT)
+        _write(
+            root,
+            "features/created-per-day/created-per-day.feature",
+            "Feature: daily counts\n  # written by /feature-spec\n"
+            "  Scenario: a request without authentication is rejected\n",
+        )
+        _write(
+            root,
+            "features/created-per-day/created-per-day_summary.md",
+            "Written by /feature-plan. It may need a database migration.\n",
+        )
+        _write(root, "qa/gates/created_per_day_gate.py", self.THE_GATE_SCRIPT)
+        _write(
+            root,
+            "qa/pass-bar-TASK-SCOPE-001.yaml",
+            "task_id: TASK-SCOPE-001\nbar: the rows come back oldest first\n",
+        )
+        _git(root, "add", "-A")
+        _git(root, "commit", "-q", "-m", "planning: the plan of record")
+        return root
+
+    def _code(self) -> dict[str, str]:
+        """What the coder wrote: the address in two pieces, the way a real
+        router declares it."""
+        return {
+            "src/users/router.py": (
+                "# the users router\n"
+                'analytics_router = APIRouter(prefix="/users")\n'
+                '@analytics_router.get("/created-per-day")\n'
+                "def counts():\n"
+                "    return []\n"
+            ),
+            "src/users/crud.py": "# the users queries\ndef counts():\n    return []\n",
+        }
+
+    def _report(self, root: Path) -> ScopeReport:
+        reading = read_branch_scope(
+            repo_root=root, base="main", head=BRANCH, feature_id=FEATURE_ID
+        )
+        assert reading.error is None
+        return scope_of_the_build(reading=reading, request=REQUEST)
+
+    def test_a_clean_build_says_nothing_beyond_the_plan_or_the_request(
+        self, repo_the_way_the_factory_builds: Path
+    ) -> None:
+        """The whole point: a build that did exactly what was asked, with the
+        factory's own paperwork beside it, gets the quiet sentence."""
+        from forge.cli._serve_gate_activation import card_line_about_scope
+
+        root = repo_the_way_the_factory_builds
+        self._code_and_commit(root)
+        report = self._report(root)
+
+        assert report.read is True
+        assert report.plan_read is True
+        assert report.routes_read is True
+        assert report.files_the_plan_did_not_name == []
+        assert report.routes_the_request_did_not_name == []
+        assert report.capabilities_the_request_did_not_name == []
+        assert card_line_about_scope(report) == (
+            "Every file this build changed was named in the plan, and it "
+            "added nothing the request did not ask for."
+        )
+
+    def _code_and_commit(self, root: Path) -> dict[str, str]:
+        files = self._code()
+        for rel, text in files.items():
+            _write(root, rel, text)
+        _git(root, "add", "-A")
+        _git(root, "commit", "-q", "-m", "what the build wrote")
+        return files
+
+    def test_the_paperwork_is_never_a_file_the_plan_did_not_name(
+        self, repo_the_way_the_factory_builds: Path
+    ) -> None:
+        """The blast radius names the one real surprise, not the fourteen
+        papers the factory wrote on its way there."""
+        from forge.cli._serve_gate_activation import card_line_about_scope
+
+        root = repo_the_way_the_factory_builds
+        files = self._code()
+        files["alembic/versions/0001_add_created_at.py"] = (
+            "def upgrade() -> None:\n    pass\n"
+            "def downgrade() -> None:\n    pass\n"
+        )
+        for rel, text in files.items():
+            _write(root, rel, text)
+        _git(root, "add", "-A")
+        _git(root, "commit", "-q", "-m", "what the build wrote")
+        report = self._report(root)
+
+        assert report.files_the_plan_did_not_name == [
+            "alembic/versions/0001_add_created_at.py"
+        ]
+        assert ".guardkit/features/FEAT-SCOPE.yaml" in (
+            report.files_allowed_as_scaffolding
+        )
+        for paper in (
+            "feature_spec_inputs/8ca406dd-the-request.md",
+            "features/created-per-day/created-per-day.feature",
+            "qa/gates/created_per_day_gate.py",
+            "qa/pass-bar-TASK-SCOPE-001.yaml",
+            "tasks/backlog/daily-counts/TASK-SCOPE-001-the-query.md",
+        ):
+            assert paper in report.files_allowed_as_scaffolding
+        assert card_line_about_scope(report) == (
+            "This build also changed 1 file the plan did not name: "
+            "alembic/versions/0001_add_created_at.py — worth a look before "
+            "you merge. It also added a database migration, which the "
+            "request did not ask for."
+        )
+
+    def test_the_shebang_the_placeholder_and_the_example_are_not_web_addresses(
+        self, repo_the_way_the_factory_builds: Path
+    ) -> None:
+        """The three that showed on every real card: /usr/bin/env from a
+        shebang, /REPLACE_ME from a placeholder, /stats from an example in a
+        docstring."""
+        root = repo_the_way_the_factory_builds
+        self._code_and_commit(root)
+        report = self._report(root)
+
+        for false_address in ("/usr/bin/env", "/REPLACE_ME", "/stats"):
+            assert false_address not in report.routes_the_branch_declares
+            assert false_address not in report.routes_the_request_did_not_name
+
+    def test_an_open_question_in_the_spec_input_is_not_a_capability(
+        self, repo_the_way_the_factory_builds: Path
+    ) -> None:
+        """The specification input asks, as an open question, whether this
+        endpoint needs authentication. A question the specification asked is
+        not a way of signing in that this build added."""
+        root = repo_the_way_the_factory_builds
+        self._code_and_commit(root)
+        report = self._report(root)
+
+        assert report.capabilities_the_request_did_not_name == []
+
+    def test_a_shebang_and_an_example_in_ordinary_code_are_still_not_addresses(
+        self, repo_the_way_the_factory_builds: Path
+    ) -> None:
+        """The same filter, in a file that is NOT paperwork: a script the
+        build really wrote still must not put its own shebang on the card."""
+        root = repo_the_way_the_factory_builds
+        files = self._code()
+        files["scripts/backfill_created_at.py"] = (
+            "#!/usr/bin/env python3\n"
+            '"""Backfill the column.\n\nCall /admin/backfill by hand.\n"""\n'
+            "# see /internal/notes for why\n"
+            "def run():\n    return None\n"
+        )
+        for rel, text in files.items():
+            _write(root, rel, text)
+        _git(root, "add", "-A")
+        _git(root, "commit", "-q", "-m", "what the build wrote")
+        report = self._report(root)
+
+        for false_address in ("/usr/bin/env", "/admin/backfill", "/internal/notes"):
+            assert false_address not in report.routes_the_branch_declares
+
+    def test_a_build_that_moved_the_address_is_still_named(
+        self, repo_the_way_the_factory_builds: Path
+    ) -> None:
+        """Nothing above is allowed to silence the thing this line exists for:
+        three of the twelve builds moved the endpoint, and that still shows."""
+        root = repo_the_way_the_factory_builds
+        files = self._code()
+        files["src/users/router.py"] = (
+            "# the users router\n"
+            'stats_router = APIRouter(prefix="/stats")\n'
+            '@stats_router.get("/users-created-per-day")\n'
+            "def counts():\n    return []\n"
+        )
+        for rel, text in files.items():
+            _write(root, rel, text)
+        _git(root, "add", "-A")
+        _git(root, "commit", "-q", "-m", "what the build wrote")
+        report = self._report(root)
+
+        assert "/stats" in report.routes_the_request_did_not_name
+        assert "/users-created-per-day" in report.routes_the_request_did_not_name
+
+
+class TestHowAPathIsRead:
+    def test_a_dot_folder_keeps_its_dot(self) -> None:
+        """``.guardkit/features/FEAT-1.yaml`` was being read as
+        ``guardkit/features/FEAT-1.yaml``, because the old normaliser stripped
+        the characters ``.`` and ``/`` one at a time, and so every folder rule
+        below it missed the factory's own feature file."""
+        from forge.pipeline.scope_report import _is_scaffolding, _repo_path
+
+        assert _repo_path(".guardkit/features/FEAT-1.yaml") == (
+            ".guardkit/features/FEAT-1.yaml"
+        )
+        assert _repo_path("./src/users/router.py") == "src/users/router.py"
+        assert _repo_path("src\\users\\router.py") == "src/users/router.py"
+        assert _is_scaffolding(".guardkit/features/FEAT-1.yaml") is True
+        assert _is_scaffolding("src/users/router.py") is False
+
+    def test_the_papers_the_factory_writes_are_not_the_thing_asked_for(self) -> None:
+        from forge.pipeline.scope_report import _is_scaffolding
+
+        for paper in (
+            ".guardkit/features/FEAT-1.yaml",
+            "feature_spec_inputs/abc.md",
+            "features/daily-counts/daily-counts.feature",
+            "qa/pass-bar-TASK-1.yaml",
+            "qa/gates/a_gate.py",
+            "tasks/backlog/TASK-1.md",
+            "tasks/design_approved/TASK-1.md",
+            "docs/api.md",
+            "tests/test_counts.py",
+        ):
+            assert _is_scaffolding(paper) is True, paper
+        for real in (
+            "src/users/router.py",
+            "alembic/versions/0001_add.py",
+            "app/main.py",
+            "scripts/backfill.py",
+        ):
+            assert _is_scaffolding(real) is False, real
+
+    def test_an_address_written_in_pieces_is_not_a_new_address(self) -> None:
+        """A router declares its address in two lines. Each piece read alone
+        looked like somewhere nobody asked for."""
+        from forge.pipeline.scope_report import _pieces_of_a_web_address
+
+        pieces = _pieces_of_a_web_address("/users/created-per-day")
+        assert pieces == ("/users", "/users/created-per-day", "/created-per-day")
+        assert _pieces_of_a_web_address("/stats") == ("/stats",)
+        assert _pieces_of_a_web_address("") == ()
+
+
+class TestTheReasonsReadAsSentences:
+    def test_two_reasons_are_two_sentences(self, tmp_path: Path) -> None:
+        """Both halves can go uncounted at once, and the receipt then carried
+        '…to compare against. the build this repair belongs to…' — a full
+        stop followed by a lower-case word. Each reason now starts and ends
+        like a sentence."""
+        root = tmp_path / "api_test"
+        root.mkdir()
+        _git(root, "init", "-q", "-b", "main")
+        _write(root, "src/users/router.py", "# the users router\n")
+        _git(root, "add", "-A")
+        _git(root, "commit", "-q", "-m", "the repository as it stood")
+        _build_on(root, {"src/users/router.py": "# the users router\ndef counts():\n    return []\n"})
+        reading = read_branch_scope(
+            repo_root=root, base="main", head=BRANCH, feature_id=FEATURE_ID
+        )
+        report = scope_of_the_build(
+            reading=reading,
+            request=None,
+            request_why_not="the build this repair belongs to is not in the record",
+        )
+
+        assert report.why_not is not None
+        sentences = [part.strip() for part in report.why_not.split(". ") if part.strip()]
+        assert len(sentences) == 2
+        for sentence in sentences:
+            assert sentence[0].isupper(), sentence
+        assert report.why_not.endswith(".")
