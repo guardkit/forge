@@ -21,9 +21,13 @@ from pathlib import Path
 import pytest
 
 from forge.pipeline.branch_scope import (
+    BranchScopeReading,
+    added_lines_by_file,
     added_lines_of,
     plan_document_paths,
     read_branch_scope,
+    reading_from_answer,
+    reading_to_answer,
 )
 from forge.pipeline.scope_report import (
     SCOPE_REPORT_NAME,
@@ -31,6 +35,7 @@ from forge.pipeline.scope_report import (
     files_the_plan_named,
     read_declared_files,
     scope_of_the_build,
+    what_the_branch_declares,
     write_scope_report,
 )
 
@@ -322,6 +327,187 @@ class TestAgainstTheSentence:
         assert "no planning record for corr-1" in report.why_not
 
 
+class TestWhatCountsAsDeclaringACapability:
+    """The capability words are read in what the branch DECLARES.
+
+    They were measured on the prose of task documents, where "logging" is a
+    deliberate promise. Read in raw source they fire on ordinary code: driven
+    over one real 184-line commit, the word "permissions" inside a test
+    fixture put "It also added permissions, which the request did not ask
+    for." on the card Rich taps to say merge. A false sentence there buries
+    the true one beside it, so a test file, a note to a reader and a bare
+    import are all left out of the reading.
+    """
+
+    def test_a_word_in_a_test_file_is_not_something_this_build_added(
+        self, repo: Path
+    ) -> None:
+        _build_on(
+            repo,
+            {
+                "src/users/router.py": (
+                    "# the users router\n"
+                    "@router.get('/users/created-per-day')\n"
+                    "def counts():\n    return []\n"
+                ),
+                "src/users/crud.py": "# the users queries\ndef counts():\n    return []\n",
+                "tests/test_router.py": (
+                    "import logging\n"
+                    "\n"
+                    "FIXTURE = 'permissions: {filesystem: {allowlist: [/tmp]}}'\n"
+                    "\n"
+                    "def test_counts():\n    assert True\n"
+                ),
+            },
+        )
+        reading = read_branch_scope(
+            repo_root=repo, base="main", head=BRANCH, feature_id=FEATURE_ID
+        )
+        report = scope_of_the_build(reading=reading, request=REQUEST)
+
+        assert report.routes_read is True
+        assert report.capabilities_the_request_did_not_name == []
+        # and the fixture's own path is not a web address this build answers
+        # at either — the same blindness, in the other half of the sentence
+        assert report.routes_the_request_did_not_name == []
+        assert "/tmp" not in report.routes_the_branch_declares
+        assert "tests/test_router.py" in report.files_allowed_as_scaffolding
+
+        # and the card Rich taps says so: the whole way through, not just in
+        # the report
+        from forge.cli._serve_gate_activation import card_line_about_scope
+
+        line = card_line_about_scope(report)
+        assert "logging" not in line
+        assert "permissions" not in line
+        assert line == (
+            "Every file this build changed was named in the plan, and it "
+            "added nothing the request did not ask for."
+        )
+
+    def test_an_import_and_a_logger_are_not_logging_the_build_added(
+        self, repo: Path
+    ) -> None:
+        _build_on(
+            repo,
+            {
+                "src/users/router.py": (
+                    "import logging\n"
+                    "\n"
+                    "logger = logging.getLogger(__name__)\n"
+                    "\n"
+                    "@router.get('/users/created-per-day')\n"
+                    "def counts():\n    return []\n"
+                ),
+            },
+        )
+        reading = read_branch_scope(
+            repo_root=repo, base="main", head=BRANCH, feature_id=FEATURE_ID
+        )
+        report = scope_of_the_build(reading=reading, request=REQUEST)
+
+        assert report.routes_read is True
+        assert "logging" not in report.capabilities_the_request_did_not_name
+
+    def test_a_note_to_a_reader_is_not_something_the_build_does(
+        self, repo: Path
+    ) -> None:
+        _build_on(
+            repo,
+            {
+                "src/users/crud.py": (
+                    '"""The daily counts.\n'
+                    "\n"
+                    "One day this could grow a service layer of its own.\n"
+                    '"""\n'
+                    "\n"
+                    "# error handling could come later\n"
+                    "def counts():\n    return []\n"
+                ),
+            },
+        )
+        reading = read_branch_scope(
+            repo_root=repo, base="main", head=BRANCH, feature_id=FEATURE_ID
+        )
+        report = scope_of_the_build(reading=reading, request=REQUEST)
+
+        assert report.routes_read is True
+        assert report.capabilities_the_request_did_not_name == []
+
+    def test_the_file_the_build_put_there_still_says_what_it_added(
+        self, repo: Path
+    ) -> None:
+        """The path is the declaration here: nothing in these lines says
+        migration, but a file under ``migrations/`` is one."""
+        _build_on(
+            repo,
+            {
+                "src/users/crud.py": "def counts():\n    return []\n",
+                "migrations/0001_add_created_at.py": (
+                    "revision = '0001'\n"
+                    "\n"
+                    "def upgrade():\n    pass\n"
+                    "\n"
+                    "def downgrade():\n    pass\n"
+                ),
+            },
+        )
+        reading = read_branch_scope(
+            repo_root=repo, base="main", head=BRANCH, feature_id=FEATURE_ID
+        )
+        report = scope_of_the_build(reading=reading, request=REQUEST)
+
+        assert "a database migration" in report.capabilities_the_request_did_not_name
+
+    def test_a_reading_that_never_said_which_file_is_not_counted(self) -> None:
+        """A count nobody could take is never published as a count of
+        nothing, so an answer with no files in it says so."""
+
+        class OnlyTheLines:
+            error = None
+            name_status = "M\x00src/users/crud.py\x00"
+            added_lines = "import logging\n"
+            added_lines_read_whole = True
+
+        report = scope_of_the_build(reading=OnlyTheLines(), request=REQUEST)
+
+        assert report.routes_read is False
+        assert report.capabilities_the_request_did_not_name == []
+        assert report.why_not is not None
+        assert "could not be read whole" in report.why_not
+
+    def test_what_is_read_and_what_is_left_out(self) -> None:
+        declared = what_the_branch_declares(
+            {
+                "src/users/router.py": (
+                    "import logging\n"
+                    "logger = logging.getLogger(__name__)\n"
+                    "# permissions come later\n"
+                    '"""Pagination is out of scope.\n'
+                    'Still out of scope.\n"""\n'
+                    "def counts(user = Depends(require_authentication)):\n"
+                    "    return []\n"
+                ),
+                "tests/test_router.py": "CACHING = 'caching'\n",
+                "docs/api.md": "This endpoint uses rate limiting.\n",
+            }
+        )
+
+        assert "src/users/router.py" in declared
+        assert "require_authentication" in declared
+        assert "import logging" not in declared
+        assert "logging.getLogger" not in declared
+        assert "permissions" not in declared
+        assert "Pagination" not in declared
+        assert "Still out of scope" not in declared
+        assert "caching" not in declared
+        assert "rate limiting" not in declared
+
+    def test_it_never_raises_on_a_reading_with_nothing_in_it(self) -> None:
+        assert what_the_branch_declares({}) == ""
+        assert what_the_branch_declares({"": "x = 1\n"}) == ""
+
+
 class TestWhenNothingCouldBeRead:
     def test_a_branch_that_is_not_there_is_said_plainly(self, repo: Path) -> None:
         reading = read_branch_scope(
@@ -411,6 +597,46 @@ class TestTheFeatureFileAndThePatch:
             "+the new line\n"
         )
         assert added_lines_of(patch) == "the new line"
+
+    def test_the_file_each_added_line_came_from_is_kept(self) -> None:
+        patch = (
+            "diff --git a/src/x.py b/src/x.py\n"
+            "--- a/src/x.py\n"
+            "+++ b/src/x.py\n"
+            "@@ -0,0 +1,2 @@\n"
+            "+import logging\n"
+            "+def counts():\n"
+            "diff --git a/tests/test_x.py b/tests/test_x.py\n"
+            "--- /dev/null\n"
+            "+++ b/tests/test_x.py\n"
+            "@@ -0,0 +1 @@\n"
+            "+import logging\n"
+        )
+        assert added_lines_by_file(patch) == {
+            "src/x.py": "import logging\ndef counts():",
+            "tests/test_x.py": "import logging",
+        }
+
+    def test_the_answer_carries_which_file_each_line_came_from(self) -> None:
+        reading = BranchScopeReading(
+            name_status="M\x00src/x.py\x00",
+            added_by_file={"src/x.py": "def counts():"},
+            added_lines_read_whole=True,
+        )
+        answer = reading_to_answer(reading)
+        assert answer["added_by_file"] == {"src/x.py": "def counts():"}
+
+        came_back = reading_from_answer(answer)
+        assert came_back.added_by_file == reading.added_by_file
+        assert came_back.added_lines == "def counts():"
+        assert came_back.added_lines_read_whole is True
+
+    def test_an_answer_that_never_said_which_file_counts_as_unread(self) -> None:
+        came_back = reading_from_answer(
+            {"name_status": "M\x00src/x.py\x00", "added_lines_read_whole": True}
+        )
+        assert came_back.added_by_file == {}
+        assert came_back.added_lines_read_whole is False
 
 
 class TestTheReceipt:
