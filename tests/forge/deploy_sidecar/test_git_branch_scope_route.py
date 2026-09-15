@@ -145,9 +145,12 @@ class TestWhatComesBack:
 
         assert status == 200, body
         assert body["added_lines_read_whole"] is True
-        assert "/stats/users-created-per-day" in body["added_lines"]
+        added = body["added_by_file"]
+        # the file each line came from is kept: the same words mean different
+        # things in a test file and in the code that was asked for
+        assert "/stats/users-created-per-day" in added["src/users/router.py"]
         # a header is not a line the branch added
-        assert "+++ b/src/users/router.py" not in body["added_lines"]
+        assert "+++ b/src/users/router.py" not in "\n".join(added.values())
 
     def test_the_plan_of_record_behind_the_build(self, cfg: ForgeConfig) -> None:
         status, body = _ask(cfg)
@@ -279,7 +282,7 @@ class TestTheSandboxAndTheHostCannotDrift:
         )
         assert reading.error is None
         assert reading.name_status == answer["name_status"]
-        assert reading.added_lines == answer["added_lines"]
+        assert reading.added_by_file == answer["added_by_file"]
         assert reading.plan_documents == answer["plan_documents"]
         assert reading.added_lines_read_whole is True
 

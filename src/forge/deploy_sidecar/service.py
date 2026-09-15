@@ -39,7 +39,7 @@ The narrow contract:
               -> {name_status, approval_patch, truncated, head|null,
                   test_patch, test_patch_truncated}
     POST /git/branch-scope {repo, base, head, feature_id}
-              -> {name_status, added_lines, added_lines_read_whole,
+              -> {name_status, added_by_file, added_lines_read_whole,
                   feature_file, plan_documents, head|null, error|null}
     POST /code/list-files {repo, under?}
               -> {files, count, total_tracked, under, capped, cap}

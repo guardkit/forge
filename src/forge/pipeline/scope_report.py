@@ -18,7 +18,10 @@ the same question:
   sentence never named, or add a capability the sentence never asked for?
   That is read from what the branch WROTE, not from what the plan promised,
   and it is the half that catches a plan that was followed faithfully into
-  the wrong place.
+  the wrong place. It is read in what the branch DECLARES — the files it
+  changed and the lines that say what the software now does — and not in
+  every line of source it wrote, because a capability word inside a test
+  fixture, a comment or a bare import is not a capability this build added.
 
 Both answers land in ``<receipts>/<build id>/scope_report.json`` at the moment
 the merge card is offered, which is before anyone says merge, so one sentence
@@ -37,9 +40,11 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +56,8 @@ __all__ = [
     "read_declared_files",
     "scope_of_the_build",
     "unread_scope",
+    "what_the_branch_declares",
+    "what_the_branch_wrote",
     "write_scope_report",
 ]
 
@@ -73,6 +80,29 @@ _NONE_LINE = "_none_"
 #: ordinary cost of building it, and naming them on the card would bury the
 #: five-module package the card exists to show.
 _DOC_FOLDERS: tuple[str, ...] = ("docs", "doc", "documentation")
+
+#: A line that is a note to whoever reads the code next, rather than something
+#: the software now does. A comment saying "error handling" does not make the
+#: build handle errors. The capability words were measured on the prose of
+#: task documents, where such a word is a deliberate promise; in source text
+#: the same word turns up in the commentary of almost every honest build.
+_A_NOTE_TO_A_READER = re.compile(r"^\s*(#|//|/\*|\*/|\*\s)")
+
+#: The quotes that open and close a Python docstring — prose again, and not a
+#: thing the software does.
+_A_BLOCK_OF_PROSE = re.compile('"""' + "|'''")
+
+#: Lines that wire a module up rather than declare anything: an import, and a
+#: logger being made. ``import logging`` at the top of a file is the plainest
+#: false alarm there is, and it was putting "It also added logging, which the
+#: request did not ask for." on the card Rich taps to say merge.
+_ORDINARY_WIRING = re.compile(
+    r"^\s*(from\s+\S+\s+)?import\s"
+    r"|^\s*import\s+\S"
+    r"|\brequire\s*\("
+    r"|=\s*logging\.(getLogger|Logger)\b"
+    r"|^\s*logging\.(basicConfig|config)\b"
+)
 
 
 @dataclass(frozen=True)
@@ -191,6 +221,75 @@ def _is_scaffolding(path: str) -> bool:
         return True
     first = cleaned.split("/", 1)[0].lower()
     return first in _DOC_FOLDERS
+
+
+def what_the_branch_wrote(added_by_file: Mapping[str, str]) -> str:
+    """Every line this branch added to a file that is not scaffolding.
+
+    The web addresses are read here, in the code the build was asked for,
+    rather than in everything the branch touched. A test fixture holding
+    ``permissions: {filesystem: {allowlist: [/tmp]}}`` was otherwise read as
+    this build answering at ``/tmp``, which is a false sentence on the card
+    Rich taps to say merge. A web address the build really answers at is
+    declared in the code, so nothing true is lost by leaving the tests and
+    the documentation out. Never raises.
+    """
+    kept: list[str] = []
+    for path, text in dict(added_by_file or {}).items():
+        name = str(path or "").strip()
+        if not name or _is_scaffolding(name):
+            continue
+        if text:
+            kept.append(str(text))
+    return "\n".join(kept)
+
+
+def what_the_branch_declares(added_by_file: Mapping[str, str]) -> str:
+    """What this branch DECLARES, as one piece of text to read capability
+    words in: the names of the files it changed, and the lines it added to
+    them that say something about what the software now does.
+
+    Three kinds of line are left out, because a capability word in one of them
+    is not a capability the build added:
+
+    * everything in a test file or a documentation page — the same scaffolding
+      rule the file comparison uses. A fixture holding the word "permissions",
+      or ``import logging`` at the top of a test, says nothing about what was
+      built;
+    * a note to a reader — a comment, or the prose inside a docstring;
+    * ordinary wiring — an import, or a logger being made.
+
+    The file's own name IS kept, and deliberately: a build that adds
+    ``migrations/0001_add_users.py`` has declared a database migration by
+    putting the file there, whatever its lines say.
+
+    WHY THIS EXISTS. The first version of this pass read every added line of
+    the branch with no idea which file it came from, and the capability words,
+    which were measured on the prose of task documents, then fired on ordinary
+    code. Driven over one real 184-line commit it put a sentence about
+    permissions on the merge card because a test fixture contained the word.
+    A false sentence on the card Rich taps to say merge buries the true one
+    next to it, so the reading is narrowed to what the branch actually
+    declares. Never raises.
+    """
+    declared: list[str] = []
+    for path, text in dict(added_by_file or {}).items():
+        name = str(path or "").strip()
+        if not name or _is_scaffolding(name):
+            continue
+        declared.append(name)
+        inside_prose = False
+        for line in str(text or "").splitlines():
+            quotes = len(_A_BLOCK_OF_PROSE.findall(line))
+            was_inside_prose = inside_prose
+            if quotes % 2:
+                inside_prose = not inside_prose
+            if was_inside_prose or inside_prose or quotes:
+                continue
+            if _A_NOTE_TO_A_READER.match(line) or _ORDINARY_WIRING.search(line):
+                continue
+            declared.append(line)
+    return "\n".join(declared)
 
 
 @dataclass
@@ -319,8 +418,13 @@ def scope_of_the_build(
     # (b) AGAINST THE SENTENCE — the web addresses and the capability words in
     # what the branch actually wrote. A different question from (a), asked of
     # the finished build rather than of the plan.
-    added = str(getattr(reading, "added_lines", "") or "")
-    added_read_whole = bool(getattr(reading, "added_lines_read_whole", False))
+    added_by_file = getattr(reading, "added_by_file", None)
+    # A reading that never said which file its lines came from cannot be
+    # judged here, and a count nobody could take is never published as a count
+    # of nothing.
+    added_read_whole = bool(
+        getattr(reading, "added_lines_read_whole", False)
+    ) and isinstance(added_by_file, Mapping)
     if not request:
         reasons.append(
             str(request_why_not).strip()
@@ -337,6 +441,10 @@ def scope_of_the_build(
         )
     else:
         report.routes_read = True
+        # The web addresses are read in the code this build was asked for.
+        # Read every file the branch touched instead and a path inside a test
+        # fixture is reported as an address the build answers at.
+        added = what_the_branch_wrote(added_by_file or {})
         roots = tuple(test_roots) if test_roots else ()
         in_request = [
             route.rstrip("/") for route in _route_shaped(request)
@@ -354,15 +462,27 @@ def scope_of_the_build(
         report.routes_the_request_did_not_name = [
             route for route in declares if route.lower() not in known
         ]
+        # The capability words are read in what the branch DECLARES — the
+        # files it changed and the lines that say what the software now does —
+        # and not in every line of source it wrote. Read the raw diff instead
+        # and a test fixture or a bare import puts a sentence about a
+        # capability on the merge card that nothing in the build supports.
+        what_it_declares = what_the_branch_declares(added_by_file or {})
         for capability, pattern in _ALL_CAPABILITIES:
-            if not pattern.search(added):
+            if not pattern.search(what_it_declares):
                 continue
             if pattern.search(request):
                 continue  # the person asked for it; a reading, not an addition
             if capability not in report.capabilities_the_request_did_not_name:
                 report.capabilities_the_request_did_not_name.append(capability)
 
-    report.why_not = " ".join(reasons) if reasons else None
+    # Each reason is its own sentence, and ends like one: two reasons joined
+    # by a bare space ran together into a single unreadable line.
+    report.why_not = (
+        ". ".join(reason.strip().rstrip(".") for reason in reasons) + "."
+        if reasons
+        else None
+    )
     return report
 
 
