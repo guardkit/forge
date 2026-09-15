@@ -91,6 +91,7 @@ from forge.planning.planner import (
 )
 from forge.planning.assumption_review import review_assumptions
 from forge.planning.repository_facts import what_the_repository_already_does
+from forge.planning.task_traceability import review_task_traceability
 from forge.planning.revision import (
     CYCLE_CAP,
     REVISION_STAGE_LABEL,
@@ -872,6 +873,19 @@ _MACHINE_NOTE_AUTHOR = "planning-driver (stamp normalizer refusal)"
 #: the record must say which.
 _ASSUMPTION_REVIEW_AUTHOR = "planning-driver (assumption review)"
 
+#: The author stamped on the one note the PLAN review sends (2026-09-15,
+#: planner fix design section 2g) — the plan read against the request before
+#: anything is committed. A third reviewer, and the record must say which.
+_PLAN_REVIEW_AUTHOR = "planning-driver (the plan read against the request)"
+
+#: The durable mark that this run has spent the plan review's one note round.
+#: It is its OWN row, kept apart from the spec rewrite's
+#: ``rewritten_by_machine``, for two reasons: a crash and a re-drive must not
+#: spend the round twice, and the two rounds together must never make a fourth
+#: plan dispatch. The most any run can reach is three — the first attempt, the
+#: spec rewrite's second attempt, and this one rewrite.
+_PLAN_REVIEW_NOTE_STATUS = "plan-note-sent"
+
 #: Rule-45-shaped line on the card when the writer removed what the reviewer
 #: flagged. Nobody is asked anything; the person is told what happened.
 _ASSUMPTION_REMOVED_CARD_LINE = (
@@ -1005,6 +1019,10 @@ class _PlanAttempt:
     files: Mapping[str, str]
     slug: str
     sha: str | None = None
+    #: What the plan review found when it read this tree against the request,
+    #: and what it did about it (2026-09-15). ``None`` only where the attempt
+    #: never got as far as having a tree to read.
+    traceability: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -4642,8 +4660,25 @@ class PlanningRunDriver:
             spec_feature_paths,
         )
 
-        try:
-            result = await deps.dispatch_feature_plan(
+        async def _ask_the_plan_writer(
+            *, note: str | None = None, prior: Mapping[str, str] | None = None
+        ) -> Any:
+            """One call to the plan writer.
+
+            ``note`` and ``prior`` are sent ONLY on the plan review's one
+            rewrite round (2026-09-15): the machine's note, word for word,
+            and the plan tree the rewrite starts from. The first call sends
+            neither and is byte for byte the call that shipped. A dispatch
+            collaborator that predates the note round does not take those two
+            names; the review asks it first and says so on its receipt rather
+            than raising — the two images can be redeployed in either order.
+            """
+            extra: dict[str, Any] = {}
+            if note is not None:
+                extra["validate_feedback"] = note
+            if prior is not None:
+                extra["revision_of"] = dict(prior)
+            return await deps.dispatch_feature_plan(
                 plan_run_id=plan_run_id,
                 correlation_id=correlation_id,
                 feature_id=feature_id,
@@ -4660,7 +4695,11 @@ class PlanningRunDriver:
                 repository_facts=self._repository_facts_for(
                     correlation_id, repo_path, row
                 ),
+                **extra,
             )
+
+        try:
+            result = await _ask_the_plan_writer()
         except Exception as exc:  # noqa: BLE001 — dispatch boundary
             await self._fail_leg(
                 correlation_id,
@@ -4695,6 +4734,25 @@ class PlanningRunDriver:
                 "008 returned no plan tree (invalid artifacts)",
             )
             return None
+
+        # THE PLAN IS READ AGAINST THE REQUEST, BEFORE ANYTHING IS COMMITTED
+        # (2026-09-15, the planner fix). Every task is held against the
+        # sentence the person actually sent: a web address the request does
+        # not name, a capability it never mentions, or a task that cannot
+        # point at any of its words. The tree is still only a mapping of path
+        # to content here, so a plan sent back costs nothing on the branch.
+        read = await self._read_the_plan_against_the_request(
+            row,
+            correlation_id,
+            files,
+            feature_id=feature_id,
+            repo_path=repo_path,
+            test_roots=list(target_repo_descriptor.get("test_roots") or ()),
+            ask_the_plan_writer=_ask_the_plan_writer,
+        )
+        if read is None:
+            return None  # already loud and terminal — the card says why
+        files, traceability = read
 
         # VALIDATION CHANNEL (C5): advisory self-check data, not an oracle —
         # same posture as the 007 leg above. The REAL oracle for the plan tree
@@ -4774,7 +4832,11 @@ class PlanningRunDriver:
                 stamp_state["outcome"] = declared.stamps
                 if declared.stamps.stops_the_run:
                     return _PlanAttempt(
-                        committed=False, stamps=declared.stamps, files=files, slug=slug
+                        committed=False,
+                        stamps=declared.stamps,
+                        files=files,
+                        slug=slug,
+                        traceability=traceability,
                     )
             pre_commit = declared.checks
 
@@ -4806,7 +4868,11 @@ class PlanningRunDriver:
                 # The normalizer stopped the commit — the caller decides
                 # between the machine's one rewrite and the card.
                 return _PlanAttempt(
-                    committed=False, stamps=stamps, files=files, slug=slug
+                    committed=False,
+                    stamps=stamps,
+                    files=files,
+                    slug=slug,
+                    traceability=traceability,
                 )
             await self._fail_leg(
                 correlation_id,
@@ -4820,6 +4886,380 @@ class PlanningRunDriver:
             files=files,
             slug=slug,
             sha=gitres.sha,
+            traceability=traceability,
+        )
+
+    # ------------------------------------------------------------------ #
+    # The plan is read against the request, before anything is committed
+    # (2026-09-15, the planner fix, design section 2g)
+    # ------------------------------------------------------------------ #
+
+    async def _read_the_plan_against_the_request(
+        self,
+        row: Any,
+        correlation_id: str,
+        files: Mapping[str, str],
+        *,
+        feature_id: str,
+        repo_path: str,
+        test_roots: Sequence[str],
+        ask_the_plan_writer: Callable[..., Awaitable[Any]],
+    ) -> "tuple[Mapping[str, str], dict[str, Any]] | None":
+        """Hold every task in the plan against the sentence the person sent,
+        send the plan back once when it does not follow it, and say plainly
+        what happened.
+
+        WHY (2026-09-15). One sentence went through the factory twelve times.
+        The specification was right twelve times out of twelve; the plan behind
+        it was different every time, and every refusal in the whole experiment
+        came from the plan. Three questions are asked of every task document,
+        whole — its title, its body and its acceptance criteria, because that is
+        where the evidence was:
+
+        * does it name a web address the request does not name?
+        * does it ask for a capability the request never mentions?
+        * can it point at any of the words of the request it serves?
+
+        The first two are contradictions of something the person actually said,
+        and both of them already cost a refused run at the live gate an hour
+        later, so a plan that still carries one after being sent back once stops
+        the run here, where nothing has been written and nothing has been built.
+        The third never stops a run on its own — three or four of the nine tasks
+        that drew it in the measurement were innocent — and is said in one plain
+        line beside the plan instead.
+
+        ONE NOTE ROUND PER RUN, and whether it has been spent is read from the
+        durable rows, never from memory, so a crash and a re-drive cannot spend
+        it twice. With the spec rewrite's own round that makes at most three
+        calls to the plan writer in a run — the first attempt, the spec
+        rewrite's second attempt, and this one rewrite. Never four. The person
+        is asked nothing new at any point.
+
+        FAILS SAFE, like the assumption reviewer beside it: a review that cannot
+        run, a rewrite that cannot be dispatched and a rewrite that comes back
+        unreadable all leave the plan exactly as the writer wrote it, with the
+        reason on the receipt. Only a plan that was actually rewritten and still
+        contradicts the request stops a run.
+
+        Returns the plan tree to carry on with — the rewritten one when there
+        was a rewrite — and the receipt; or ``None`` when the run has been
+        stopped loudly and the caller should return.
+        """
+        request_text = self._request_text_of(row)
+        receipt: dict[str, Any] = {
+            "checked": False,
+            "round": 0,
+            "rewritten": False,
+            "flagged_tasks": [],
+            "still_flagged": [],
+            "card_line": None,
+        }
+        if not request_text.strip():
+            receipt["not_checked"] = (
+                "this run carries no request sentence, so there is nothing to "
+                "read the plan against"
+            )
+            return files, receipt
+        try:
+            facts = self._repository_facts_for(correlation_id, repo_path, row)
+            review = review_task_traceability(
+                files,
+                request_text=request_text,
+                repository_facts=facts,
+                test_roots=test_roots,
+            )
+        except Exception as exc:  # noqa: BLE001 — a reviewer never stops a run
+            logger.warning(
+                "planning driver: run %s — the plan could not be read against "
+                "the request (%s: %s); the plan carries on as written",
+                correlation_id,
+                type(exc).__name__,
+                str(exc)[:160],
+            )
+            receipt["not_checked"] = (
+                f"the plan review could not run ({type(exc).__name__})"
+            )
+            return files, receipt
+        receipt["checked"] = True
+        receipt["first"] = review.receipt()
+        receipt["flagged_tasks"] = list(review.flagged_tasks)
+        if not review.sends_it_back:
+            logger.info(
+                "planning driver: run %s — every task in the plan for %s "
+                "follows the request (%d read)",
+                correlation_id,
+                feature_id,
+                review.tasks_read,
+            )
+            return files, receipt
+        receipt["card_line"] = review.cannot_cite_line()
+        note = review.note()
+        flagged = list(review.flagged_tasks)
+        receipt["still_flagged"] = flagged
+
+        if not self._plan_dispatch_takes_a_note(self._deps.dispatch_feature_plan):
+            # An older plan dispatch cannot carry a note. Say so and carry on:
+            # the two images are deployed separately and either may go first.
+            receipt["note_round"] = (
+                "not sent: the plan dispatch wired here does not take the "
+                "machine's note"
+            )
+            logger.warning(
+                "planning driver: run %s — %d task(s) in the plan do not follow "
+                "the request, and the plan dispatch wired here cannot carry the "
+                "machine's note; the finding is receipted and the plan carries "
+                "on: %s",
+                correlation_id,
+                len(flagged),
+                flagged,
+            )
+            return files, receipt
+
+        if self._plan_note_round_spent(correlation_id):
+            receipt["note_round"] = "already spent on this run"
+            if review.stops_the_run:
+                logger.warning(
+                    "planning driver: run %s — the plan still contradicts the "
+                    "request after the machine's one note round; the run stops "
+                    "before anything is committed",
+                    correlation_id,
+                )
+                await self._stop_at_the_plan_review(
+                    correlation_id, feature_id, review, request_text
+                )
+                return None
+            return files, receipt
+
+        self._record_plan_note_round(
+            correlation_id, feature_id=feature_id, note=note, flagged=flagged
+        )
+        receipt.update(
+            {"round": 1, "author": _PLAN_REVIEW_AUTHOR, "note": note}
+        )
+        logger.info(
+            "planning driver: run %s — %d task(s) in the plan for %s do not "
+            "follow the request; the machine sends the plan back to its writer "
+            "once (round 1), before anything is committed: %s",
+            correlation_id,
+            len(flagged),
+            feature_id,
+            flagged,
+        )
+        try:
+            result = await ask_the_plan_writer(
+                note=note,
+                # The tree the rewrite starts from, by file name, exactly as
+                # the spec leg hands the spec writer what it wrote.
+                prior={
+                    str(rel).rsplit("/", 1)[-1]: str(content)
+                    for rel, content in files.items()
+                },
+            )
+        except Exception as exc:  # noqa: BLE001 — dispatch boundary
+            receipt["rewrite_not_read"] = (
+                f"the rewrite dispatch raised {type(exc).__name__}"
+            )
+            logger.warning(
+                "planning driver: run %s — the plan rewrite raised %s: %s; the "
+                "plan carries on as first written",
+                correlation_id,
+                type(exc).__name__,
+                str(exc)[:160],
+            )
+            return files, receipt
+        ok, reason = self._dispatch_ok(result)
+        if not ok:
+            receipt["rewrite_not_read"] = f"the rewrite dispatch {reason}"
+            logger.warning(
+                "planning driver: run %s — the plan rewrite dispatch %s; the "
+                "plan carries on as first written",
+                correlation_id,
+                reason,
+            )
+            return files, receipt
+        rewritten_output = self._role_output_of(result)
+        declared = rewritten_output.get("feature_id")
+        if declared is not None and str(declared) != feature_id:
+            receipt["rewrite_not_read"] = (
+                f"the rewrite declares feature {declared}, not {feature_id}"
+            )
+            logger.warning(
+                "planning driver: run %s — the plan rewrite came back for "
+                "feature %s, not %s; the plan carries on as first written",
+                correlation_id,
+                declared,
+                feature_id,
+            )
+            return files, receipt
+        rewritten = self._plan_tree_files(rewritten_output)
+        if not rewritten:
+            receipt["rewrite_not_read"] = "the rewrite returned no plan tree"
+            logger.warning(
+                "planning driver: run %s — the plan rewrite returned no plan "
+                "tree; the plan carries on as first written",
+                correlation_id,
+            )
+            return files, receipt
+        try:
+            second = review_task_traceability(
+                rewritten,
+                request_text=request_text,
+                repository_facts=facts,
+                test_roots=test_roots,
+            )
+        except Exception as exc:  # noqa: BLE001 — a reviewer never stops a run
+            receipt["rewritten"] = True
+            receipt["rewrite_not_read"] = (
+                f"the rewritten plan could not be read ({type(exc).__name__})"
+            )
+            return rewritten, receipt
+        receipt["rewritten"] = True
+        receipt["second"] = second.receipt()
+        still = list(second.flagged_tasks)
+        receipt["still_flagged"] = still
+        receipt["fixed_tasks"] = [t for t in flagged if t not in still]
+        receipt["card_line"] = second.cannot_cite_line()
+        logger.info(
+            "planning driver: run %s — after the plan review's round: %d "
+            "task(s) fixed, %d still flagged",
+            correlation_id,
+            len(receipt["fixed_tasks"]),
+            len(still),
+        )
+        if second.stops_the_run:
+            await self._stop_at_the_plan_review(
+                correlation_id, feature_id, second, request_text, after_rewrite=True
+            )
+            return None
+        return rewritten, receipt
+
+    @staticmethod
+    def _plan_dispatch_takes_a_note(dispatch: Any) -> bool:
+        """True when the plan dispatch wired here can carry the machine's note
+        and the tree a rewrite starts from.
+
+        A collaborator that predates the note round keeps working exactly as it
+        did: the finding is receipted, one plain line is said, and the plan
+        carries on. That is what lets the two images be redeployed in either
+        order with no window in which planning is refused.
+        """
+        if dispatch is None:
+            return False
+        try:
+            params = inspect.signature(dispatch).parameters
+        except (TypeError, ValueError):  # pragma: no cover — exotic callables
+            return False
+        if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+            return True
+        return "validate_feedback" in params and "revision_of" in params
+
+    def _plan_note_round_spent(self, correlation_id: str) -> bool:
+        """True when this run has already sent the plan writer the machine's
+        one note about the request.
+
+        Read from the durable rows, never from memory, so a crash and a
+        re-drive cannot spend the round twice — and so the plan writer is
+        called at most three times in a run, never four.
+        """
+        for event in self._deps.store.list_events(correlation_id):
+            if (
+                event["stage_label"] == _FEATURE_PLAN_STAGE
+                and event["status"] == _PLAN_REVIEW_NOTE_STATUS
+            ):
+                return True
+        return False
+
+    def _record_plan_note_round(
+        self,
+        correlation_id: str,
+        *,
+        feature_id: str,
+        note: str,
+        flagged: Sequence[str],
+    ) -> None:
+        """Write down that the plan review has spent its one note round, with
+        the note itself, word for word, and the tasks it named.
+
+        Its own row, kept apart from the spec rewrite's — the two rounds are
+        different things and a run may have both, but never two of either.
+        """
+        self._deps.store._record_event(
+            correlation_id=correlation_id,
+            stage_label=_FEATURE_PLAN_STAGE,
+            status=_PLAN_REVIEW_NOTE_STATUS,
+            actor_identity="planning-driver",
+            details_json=json.dumps(
+                {
+                    "plan_review": {
+                        "round": 1,
+                        "author": _PLAN_REVIEW_AUTHOR,
+                        "feature_id": feature_id,
+                        "note": note,
+                        "flagged_tasks": list(flagged),
+                    }
+                }
+            ),
+        )
+
+    async def _stop_at_the_plan_review(
+        self,
+        correlation_id: str,
+        feature_id: str,
+        review: Any,
+        request_text: str,
+        *,
+        after_rewrite: bool = False,
+    ) -> bool:
+        """The plan still contradicts the request — the run stops here, before
+        anything is written to the branch and before anything is built.
+
+        Cheaper than the same run being refused at the live gate an hour later,
+        which is what happened to three of the twelve runs measured on
+        2026-09-15. The card names every finding in ordinary words and quotes
+        the request back, so the person can see at a glance what the plan added
+        that they never asked for.
+        """
+        sentences = review.stop_sentences()
+        reason = (
+            f"the plan for {feature_id} still contradicts the request after the "
+            f"machine's one note round: " + "; ".join(sentences)
+        )
+        return await self._fail_leg(
+            correlation_id,
+            _FEATURE_PLAN_STAGE,
+            reason,
+            owner_message=self._plan_review_card(
+                correlation_id, review, request_text, after_rewrite=after_rewrite
+            ),
+        )
+
+    @staticmethod
+    def _plan_review_card(
+        correlation_id: str,
+        review: Any,
+        request_text: str,
+        *,
+        after_rewrite: bool = False,
+    ) -> str:
+        """The owner's card when the plan review stops the run. Plain words,
+        every finding named, the request quoted back, and what to do next."""
+        findings = "\n".join(f"  - {sentence}" for sentence in review.stop_sentences())
+        already = (
+            "The machine already asked the plan writer once to put this right. "
+            if after_rewrite
+            else "The machine had already spent its one note to the plan writer "
+            "on this run. "
+        )
+        return (
+            f"Planning run {correlation_id} stopped at "
+            f"{plain_stage_name(_FEATURE_PLAN_STAGE)}. {already}"
+            "The plan still asks for things the request never said, so nothing "
+            "was written to the branch and nothing was built:\n"
+            f"{findings}\n"
+            "What the request said, word for word:\n"
+            f"  {request_text}\n"
+            "What to do: send the request again — adding the things you did "
+            "want, if you want them — and the plan is written again from it."
         )
 
     # -- the plan leg's pre-commit checks, declared (sandbox first, rule 70) --
@@ -5766,6 +6206,24 @@ class PlanningRunDriver:
                 ),
                 receipt_block["owner_line_sent"],
             )
+        # THE PLAN READ AGAINST THE REQUEST (2026-09-15). Its receipt goes
+        # where the assumption review's goes — on the leg's own durable row —
+        # and when tasks in the committed plan quote nothing from the request,
+        # the owner reads ONE plain, un-mentioned line saying so. That finding
+        # never stops a run and asks for nothing; the three touches stand.
+        plan_review = (
+            dict(attempt.traceability) if attempt.traceability is not None else None
+        )
+        if plan_review is not None and plan_review.get("card_line"):
+            line = str(plan_review["card_line"])
+            sent = await self._notify(correlation_id, line, level="info", mention=False)
+            plan_review["card_line_sent"] = (
+                "sent"
+                if sent == "sent"
+                else "line not sent (no notifier)"
+                if sent == "no-notifier"
+                else "line not sent (publish failed)"
+            )
         details: dict[str, Any] = {
             "feature_id": feature_id,
             "slug": attempt.slug,
@@ -5776,6 +6234,8 @@ class PlanningRunDriver:
         }
         if stamp_receipt is not None:
             details["stamp_normalizer"] = stamp_receipt
+        if plan_review is not None:
+            details["plan_review"] = plan_review
         deps.store._record_event(
             correlation_id=correlation_id,
             stage_label=_FEATURE_PLAN_STAGE,
