@@ -157,7 +157,11 @@ DispatchCallable = Callable[..., Awaitable[Any]]
 #        every plan is refused pre-model until the second deploy lands, which is
 #        the failure this whole note exists to prevent. Optional, the argument
 #        is inert until both sides carry it, in either order, with no window in
-#        which planning is down.
+#        which planning is down. ``request_text`` and ``repository_facts``
+#        (2026-09-15) join the plan leg on exactly those terms: the sentence
+#        word for word and the fact sheet of what the repository already does,
+#        the same two the spec leg has sent since 2026-09-13, optional on both
+#        sides so either image may be redeployed first.
 # The contract-pin test (tests/forge/planning/test_target_terminal_contract_pin)
 # asserts the literal arg-name sets these emit against those files.
 # ---------------------------------------------------------------------------
@@ -210,6 +214,8 @@ def build_feature_plan_command_args(
     target_repo_descriptor: dict[str, Any],
     spec_assumptions: str | None = None,
     spec_feature_paths: Sequence[str] | None = None,
+    request_text: str | None = None,
+    repository_facts: str | None = None,
 ) -> dict[str, Any]:
     """Exact ``architect_feature_plan`` (008) wire args. See the CONTRACT note above.
 
@@ -225,6 +231,18 @@ def build_feature_plan_command_args(
     feature's title. Forge committed those files itself one leg earlier, so it is
     the party that knows. Blank / empty is omitted entirely: an empty list is not
     a location, and a caller with nothing to say says nothing.
+
+    ``request_text`` and ``repository_facts`` (2026-09-15) are the same two
+    documents the spec leg above already sends, under the same two names, built
+    by the same two helpers: what the person asked for, word for word, and a
+    short sheet of what the repository already does, read by ordinary code and
+    never by a model. The plan leg sent neither, which is how a plan that moved
+    the web address or added a login requirement nobody asked for could still be
+    scored a good plan — the reviewer had never been shown the sentence. Both
+    are optional here and optional on the specialist side on purpose, so the two
+    images can be redeployed in either order with no window in which planning is
+    refused. Blank is not a document: it never reaches the wire, and a run with
+    nothing to say sends exactly the set that shipped before this existed.
     """
     args: dict[str, Any] = {
         "feature_id": feature_id,
@@ -237,6 +255,13 @@ def build_feature_plan_command_args(
     paths = [str(p).strip() for p in (spec_feature_paths or ()) if str(p).strip()]
     if paths:
         args["spec_feature_paths"] = paths
+    # The planning coach's ground truth, now on the plan leg too (2026-09-15) —
+    # the same two lines the spec builder above runs, copied rather than
+    # reworded, so the two legs cannot drift apart.
+    if request_text is not None and str(request_text).strip():
+        args["request_text"] = str(request_text)
+    if repository_facts is not None and str(repository_facts).strip():
+        args["repository_facts"] = str(repository_facts)
     return args
 
 
@@ -1003,6 +1028,8 @@ async def compose_planning_consumer_and_dispatch(
             target_repo_descriptor: dict[str, Any],
             spec_assumptions: str | None = None,
             spec_feature_paths: Sequence[str] | None = None,
+            request_text: str | None = None,
+            repository_facts: str | None = None,
         ) -> Any:
             return await dispatch_specialist_stage(
                 stage=StageClass.FEATURE_PLAN,
@@ -1019,6 +1046,8 @@ async def compose_planning_consumer_and_dispatch(
                     target_repo_descriptor=target_repo_descriptor,
                     spec_assumptions=spec_assumptions,
                     spec_feature_paths=spec_feature_paths,
+                    request_text=request_text,
+                    repository_facts=repository_facts,
                 ),
             )
 

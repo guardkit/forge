@@ -41,6 +41,7 @@ import pytest
 import yaml
 
 from forge.adapters.git.models import GitOpResult
+from forge.cli._serve_planning import build_feature_plan_command_args
 from forge.adapters.git.planning_runner import WorktreeGitRunner
 from forge.adapters.sqlite import connect as sqlite_connect
 from forge.config.models import PlanningConfig, TargetTerminalConfig
@@ -505,6 +506,8 @@ def _make_driver(
         target_repo_descriptor: dict[str, Any],
         spec_assumptions: str | None = None,
         spec_feature_paths: list[str] | None = None,
+        request_text: str | None = None,
+        repository_facts: str | None = None,
     ) -> Any:
         counters["plan"] += 1
         # Reject-on-missing, exactly like the real specialist command router:
@@ -537,6 +540,22 @@ def _make_driver(
         counters["last_descriptor"] = target_repo_descriptor
         counters["last_spec_assumptions"] = spec_assumptions
         counters["last_spec_feature_paths"] = spec_feature_paths
+        # The planning coach's ground truth on the PLAN leg (2026-09-15): the
+        # sentence, word for word, and the fact sheet. Recorded here so a test
+        # can read back what actually went on the wire, and turned into the
+        # real wire arguments so the key set is the real key set.
+        counters["last_request_text"] = request_text
+        counters["last_repository_facts"] = repository_facts
+        counters["last_plan_wire_args"] = build_feature_plan_command_args(
+            feature_id=feature_id,
+            spec_feature=spec_feature,
+            spec_summary=spec_summary,
+            target_repo_descriptor=target_repo_descriptor,
+            spec_assumptions=spec_assumptions,
+            spec_feature_paths=spec_feature_paths,
+            request_text=request_text,
+            repository_facts=repository_facts,
+        )
         if plan_result is not None:
             return plan_result
         if plan_result_factory is not None:
@@ -7171,3 +7190,125 @@ def test_the_formats_own_furniture_is_not_looked_for(tmp_path: Path) -> None:
     assert "/users/count-today" in looked_for
     for furniture in ("/feature-spec", "key-example", "happy-path"):
         assert furniture not in looked_for, f"{furniture} is the format's word, not the feature's"
+
+
+# ---------------------------------------------------------------------------
+# The planning coach's ground truth reaches the PLAN leg too (2026-09-15)
+#
+# The spec leg has sent the sentence and the fact sheet since 2026-09-13. The
+# plan leg sent neither — so the plan-writer's own reviewer scored plans it had
+# never seen the request for, and a plan that moved the web address or added a
+# login requirement nobody asked for could still be called a good plan. These
+# two tests read what actually went on the wire, not what was called.
+# ---------------------------------------------------------------------------
+
+
+def _init_repo_with_a_stats_route(path: Path) -> None:
+    """A scratch repository that really declares a sibling route under /stats,
+    so the fact sheet has something true to say about the sentence."""
+    _init_scratch_repo(path)
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@t",
+    }
+    (path / "src").mkdir(parents=True, exist_ok=True)
+    (path / "src" / "router.py").write_text(
+        "from fastapi import APIRouter\n"
+        "\n"
+        "router = APIRouter()\n"
+        "\n"
+        '@router.get("/stats/uptime")\n'
+        "def uptime() -> dict:\n"
+        "    return {}\n"
+    )
+    subprocess.run(["git", "add", "."], cwd=path, check=True, env=env)
+    subprocess.run(["git", "commit", "-qm", "a route"], cwd=path, check=True, env=env)
+
+
+@pytest.mark.asyncio
+async def test_the_plan_leg_is_sent_the_sentence_and_the_fact_sheet(
+    store: SqlitePlanningRunStore, tmp_path: Path
+) -> None:
+    """The sentence rides word for word, and the fact sheet says what the
+    repository already does — both on the PLAN dispatch, both under the two
+    names the spec leg already uses."""
+    repo = tmp_path / "api_test"
+    _init_repo_with_a_stats_route(repo)
+    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+
+    _queue(store)
+    h = _make_driver(store, git_runner=git, repo_path=str(repo))
+
+    await h.driver.drive(CID)
+
+    counters = h.ctx["counters"]
+    assert counters["plan"] == 1
+    # Word for word, never summarised on the way.
+    assert counters["last_request_text"] == "add a GET /stats endpoint"
+    facts = counters["last_repository_facts"]
+    assert facts is not None
+    assert "src/router.py" in facts and "GET /stats/uptime" in facts
+    assert "None of them declares an authentication dependency." in facts
+
+    # And what the wire actually carries: the four required names, the spec
+    # location, and the coach's two documents. Nothing invented.
+    wire = counters["last_plan_wire_args"]
+    assert set(wire) == {
+        "feature_id",
+        "spec_feature",
+        "spec_summary",
+        "target_repo_descriptor",
+        "spec_assumptions",
+        "spec_feature_paths",
+        "request_text",
+        "repository_facts",
+    }
+    assert wire["request_text"] == "add a GET /stats endpoint"
+    assert wire["repository_facts"] == facts
+
+
+@pytest.mark.asyncio
+async def test_a_run_with_no_sentence_sends_the_set_that_shipped_before(
+    store: SqlitePlanningRunStore, tmp_path: Path
+) -> None:
+    """Nothing to say, nothing said. A run whose row carries no sentence puts
+    exactly the argument set on the wire that it put there before this
+    existed — which is what lets the two images be redeployed in either
+    order with no window in which planning is refused."""
+    repo = tmp_path / "api_test"
+    _init_repo_with_a_stats_route(repo)
+    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+
+    store.record_queued(
+        correlation_id=CID,
+        originating_user=ORIGINATOR,
+        expected_approver=ORIGINATOR,
+        request_text="",
+        triggered_by="jarvis",
+        target_repo=TARGET_REPO,
+    )
+    h = _make_driver(store, git_runner=git, repo_path=str(repo))
+
+    await h.driver.drive(CID)
+
+    counters = h.ctx["counters"]
+    assert counters["plan"] == 1
+    assert counters["last_request_text"] == ""
+    assert counters["last_repository_facts"] is None
+    # The set that shipped before this existed: the four required names plus
+    # the two optional ones this run happens to have. Neither new name is on
+    # the wire at all.
+    wire = counters["last_plan_wire_args"]
+    assert set(wire) == {
+        "feature_id",
+        "spec_feature",
+        "spec_summary",
+        "target_repo_descriptor",
+        "spec_assumptions",
+        "spec_feature_paths",
+    }
+    assert "request_text" not in wire
+    assert "repository_facts" not in wire
