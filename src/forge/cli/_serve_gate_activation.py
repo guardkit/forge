@@ -678,6 +678,8 @@ def make_merge_card_publisher(
     offer_service: Any,
     sqlite_pool: SqliteLifecyclePersistence,
     clock: Callable[[], datetime],
+    config: Any = None,
+    scope_pass: Callable[..., Any] | None = None,
 ) -> Callable[..., Any]:
     """Compose the merge card's ``publish_card`` seam (design pass §c.2).
 
@@ -720,6 +722,31 @@ def make_merge_card_publisher(
     the self-closed-defect measure counts a raised card by. It is written
     after the publish so it can never claim a card that was refused.
 
+    The scope line (the planner fix, 2026-09-15). The design says both merge
+    cards carry the same sentence about what a build did beyond its plan and
+    beyond the request. The routine build's card takes that pass in
+    :meth:`~forge.pipeline.merge_offer.MergeOfferService._maybe_offer`; this
+    one takes the very same pass, :func:`forge.pipeline.merge_offer.run_the_scope_pass`,
+    with the very same four things — the settings, the pool, the build id and
+    the build's own row, all of which are already in hand here. It runs off
+    the event loop because it runs git, and it never raises: a pass that
+    cannot be taken gives nothing, and the card is then byte for byte the card
+    that shipped before the scope pass existed.
+
+    Args:
+        offer_service: The routine path's own merge-card publisher.
+        sqlite_pool: The shared persistence facade; the build's row is read
+            from it, and the scope pass reads the request behind the build
+            through it.
+        clock: Wall-clock seam for the stage row's stamp.
+        config: The validated ``ForgeConfig``, for the scope pass — it needs
+            the repository's path and its sandbox. ``None`` (the default, and
+            what every test that does not care passes) means no scope pass is
+            taken and the card says nothing about scope.
+        scope_pass: Injectable ``(config, pool, build_id, feature_id, row) ->
+            report | None`` seam; defaults to
+            :func:`~forge.pipeline.merge_offer.run_the_scope_pass`.
+
     Returns:
         ``async (*, build_id, feature_id, rationale, branch, gates) ->
         None`` — the seam
@@ -728,7 +755,38 @@ def make_merge_card_publisher(
         nothing because there is no verdict to return; it raises
         :class:`MergeCardNotPublished` when no card went out.
     """
+    from forge.pipeline.merge_offer import run_the_scope_pass
     from forge.pipeline.merge_ready_checkpoint import MERGE_READY_CHECKPOINT_LABEL
+
+    take_the_scope_pass = scope_pass if scope_pass is not None else run_the_scope_pass
+
+    async def _scope_of(build_id: str, feature_id: str, row: Any) -> Any:
+        """Read this branch once against its plan and against the request.
+
+        Never raises and never holds up a card: every way this can go wrong
+        ends in a logged sentence and a card that says nothing about scope,
+        which is exactly the card that shipped before this existed.
+        """
+        if config is None or row is None:
+            return None
+        try:
+            return await asyncio.to_thread(
+                take_the_scope_pass,
+                config=config,
+                pool=sqlite_pool,
+                build_id=build_id,
+                feature_id=feature_id,
+                row=row,
+            )
+        except Exception as exc:  # noqa: BLE001 — a report never stops a card
+            logger.warning(
+                "the scope pass: nothing was counted for %s (%s: %s) — the "
+                "merge card says nothing about scope",
+                build_id,
+                type(exc).__name__,
+                exc,
+            )
+            return None
 
     async def publish_card(
         *,
@@ -748,6 +806,7 @@ def make_merge_card_publisher(
             getattr(row, "feature_id", "") or "" if row is not None else ""
         )
         gated_branch = str(branch or "").strip() or None
+        scope = await _scope_of(build_id, resolved_feature, row)
 
         def _words(merge_target: str, _merge_branch: str | None) -> str:
             if gated_branch is not None and gated_branch != merge_target:
@@ -760,7 +819,10 @@ def make_merge_card_publisher(
                     merge_target,
                 )
             return merge_card_words(
-                feature_id=resolved_feature, branch=merge_target, gates=gates
+                feature_id=resolved_feature,
+                branch=merge_target,
+                gates=gates,
+                scope=scope,
             )
 
         logger.info(

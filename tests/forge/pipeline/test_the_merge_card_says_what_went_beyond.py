@@ -414,3 +414,180 @@ class TestTheCardAndTheDurableRow:
         )
         assert "built clean" in recorder.paused.rationale
         assert "could not be read here" not in recorder.paused.rationale
+
+
+def _repair_gates() -> Any:
+    """The merge-ready checkpoint's own report, as the repair journey hands it
+    over: the declared suite green and nothing left unproved."""
+    from forge.pipeline.merge_ready_checkpoint import GatesReport, GateStatus
+
+    return GatesReport(
+        status=GateStatus.GREEN,
+        detail="the declared suite came back green",
+    )
+
+
+def _repair_publisher(
+    pool: SqliteLifecyclePersistence,
+    recorder: _Recorder,
+    *,
+    config: ForgeConfig,
+    scope_config: Any,
+    **kwargs: Any,
+) -> Any:
+    """The repair journey's merge-card publisher, wired the way the daemon
+    wires it: the routine path's own offer service underneath, and the
+    settings the scope pass needs handed in beside them."""
+    from datetime import UTC, datetime
+
+    from forge.cli._serve_gate_activation import make_merge_card_publisher
+
+    return make_merge_card_publisher(
+        offer_service=_service(config, pool, recorder),
+        sqlite_pool=pool,
+        clock=lambda: datetime(2026, 9, 15, 12, 0, tzinfo=UTC),
+        config=scope_config,
+        **kwargs,
+    )
+
+
+class TestTheRepairJourneysCardCarriesTheSameLine:
+    """The design says both merge cards carry the same sentence about scope.
+
+    Until this fix only the routine build's card did: the repair journey's
+    publisher never passed a scope report to ``merge_card_words``, so the
+    parameter was there and nothing ever filled it. These tests drive the
+    repair publisher over the same real git repository, the same real plan of
+    record and the same real database row the routine tests use, and read the
+    card that actually goes on the wire.
+    """
+
+    def test_the_card_says_what_went_beyond_the_plan_and_the_request(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _insert_build(pool)
+        _insert_planning_run(pool)
+        receipts = tmp_path / "receipts"
+        (receipts / BUILD_ID).mkdir(parents=True)
+        monkeypatch.setenv("FORGE_RECEIPTS_DIR", str(receipts))
+        recorder = _Recorder()
+
+        asyncio.run(
+            _repair_publisher(pool, recorder, config=config, scope_config=config)(
+                build_id=BUILD_ID,
+                feature_id=FEATURE_ID,
+                rationale="mode-c-commits-present",
+                branch=BRANCH,
+                gates=_repair_gates(),
+            )
+        )
+
+        words = recorder.paused.rationale
+        assert (
+            "This build also changed 1 file the plan did not name: "
+            "src/analytics/service.py — worth a look before you merge." in words
+        )
+        assert (
+            "It also answers at a web address the request did not name: "
+            "/stats/users-created-per-day." in words
+        )
+        # and the rest of the card is untouched: the scope line joins the
+        # sentences that were already there, it does not replace one.
+        assert words.startswith(f"{FEATURE_ID} is ready to merge on branch {BRANCH}.")
+        assert "What was checked: the declared suite came back green." in words
+        assert words.endswith(
+            "Reject = nothing changes; the branch is kept either way."
+        )
+
+    def test_the_receipt_is_written_before_anyone_is_asked_to_merge(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The same receipt the routine path writes, in the same place — the
+        card and the file are one pass, not two."""
+        _insert_build(pool)
+        _insert_planning_run(pool)
+        receipts = tmp_path / "receipts"
+        (receipts / BUILD_ID).mkdir(parents=True)
+        monkeypatch.setenv("FORGE_RECEIPTS_DIR", str(receipts))
+
+        asyncio.run(
+            _repair_publisher(pool, _Recorder(), config=config, scope_config=config)(
+                build_id=BUILD_ID,
+                feature_id=FEATURE_ID,
+                rationale="mode-c-commits-present",
+                branch=BRANCH,
+                gates=_repair_gates(),
+            )
+        )
+
+        kept = json.loads(
+            (receipts / BUILD_ID / SCOPE_REPORT_NAME).read_text(encoding="utf-8")
+        )
+        assert kept["read"] is True
+        assert kept["request"] == REQUEST
+        assert kept["files_the_plan_did_not_name"] == ["src/analytics/service.py"]
+
+    def test_with_no_settings_in_hand_the_card_is_the_card_that_shipped_before(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+    ) -> None:
+        """No settings means no repository path and no sandbox, so no pass can
+        be taken. A count nobody took is never published as a count of
+        nothing: the card says nothing about scope at all."""
+        _insert_build(pool)
+        recorder = _Recorder()
+
+        asyncio.run(
+            _repair_publisher(pool, recorder, config=config, scope_config=None)(
+                build_id=BUILD_ID,
+                feature_id=FEATURE_ID,
+                rationale="mode-c-commits-present",
+                branch=BRANCH,
+                gates=_repair_gates(),
+            )
+        )
+
+        words = recorder.paused.rationale
+        assert words == (
+            f"{FEATURE_ID} is ready to merge on branch {BRANCH}. What was "
+            "checked: the declared suite came back green. Approve = check the "
+            "candidate in the sandbox, merge the branch into main and promote "
+            "it. Reject = nothing changes; the branch is kept either way."
+        )
+
+    def test_a_scope_pass_that_raises_never_costs_the_card(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+    ) -> None:
+        _insert_build(pool)
+        recorder = _Recorder()
+
+        def _it_blows_up(**_kwargs: Any) -> Any:
+            raise RuntimeError("the reader fell over")
+
+        asyncio.run(
+            _repair_publisher(
+                pool, recorder, config=config, scope_config=config, scope_pass=_it_blows_up
+            )(
+                build_id=BUILD_ID,
+                feature_id=FEATURE_ID,
+                rationale="mode-c-commits-present",
+                branch=BRANCH,
+                gates=_repair_gates(),
+            )
+        )
+
+        words = recorder.paused.rationale
+        assert "is ready to merge on branch" in words
+        assert "could not be read here" not in words
+        assert "worth a look before you merge" not in words

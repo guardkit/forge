@@ -4270,7 +4270,7 @@ async def test_stamp_normalizer_not_enforced_partial_proceeds_with_receipt_and_o
     assert all(
         mention
         for m, mention in h.ctx["mentions"]
-        if m != _UNENFORCED_LINE and "do not quote any of the words" not in m
+        if m != _UNENFORCED_LINE and "quote any of the words" not in m
     )
     # no error card
     assert not any(lvl == "error" for _, _, lvl in h.ctx["notifications"])

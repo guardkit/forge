@@ -2774,9 +2774,13 @@ async def test_a_checker_refused_pre_card_rewrite_opens_the_card_on_the_original
     assert receipt["refused_by_checker"] is True
     assert receipt["checker_reason"] == reason
     assert receipt["still_refused"] == [_REFUSED_TITLE]
-    # Nobody was told the run stopped, because it did not.
+    # Nobody was told the run stopped, because it did not. The words looked
+    # for are "stopped at", which is how every stop card in this driver opens
+    # ("stopped at the spec", "stopped at writing the task plan"); a bare
+    # "stopped" also matches the plan review's own plain line, which says the
+    # opposite — that the run was NOT stopped.
     assert not [m for _, m, lvl in h.ctx["notifications"] if lvl == "error"]
-    assert not any("stopped" in m for _, m, _ in h.ctx["notifications"])
+    assert not any("stopped at" in m for _, m, _ in h.ctx["notifications"])
 
 
 @pytest.mark.asyncio

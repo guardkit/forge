@@ -280,7 +280,7 @@ async def test_a_plan_that_follows_the_request_opens_no_round_at_all(
     assert row["plan_review"]["flagged_tasks"] == []
     # Nothing was said to anybody about the plan's traceability.
     assert not any(
-        "do not quote any of the words" in message
+        "quote any of the words" in message
         for _, message, _ in h.ctx["notifications"]
     )
 
@@ -372,11 +372,14 @@ async def test_cannot_quote_the_request_is_said_once_and_never_stops_a_run(
     lines = [
         message
         for _, message, level in h.ctx["notifications"]
-        if "do not quote any of the words" in message and level == "info"
+        if "quote any of the words" in message and level == "info"
     ]
     assert len(lines) == 1
     assert "TASK-STAT-001" in lines[0]
-    assert "The plan was not sent back for that on its own." in lines[0]
+    # Plain English, and true: any finding at all opens the one note round, so
+    # what did NOT happen is that the run was stopped.
+    assert lines[0].startswith("One task in this plan does not quote")
+    assert "The run was not stopped for that on its own." in lines[0]
     assert (lines[0], False) in h.ctx["mentions"]
     assert row["plan_review"]["card_line_sent"] == "sent"
 

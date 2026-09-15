@@ -1871,6 +1871,11 @@ def _compose_conductor_router(
             offer_service=merge_offer_service,
             sqlite_pool=sqlite_pool,
             clock=clock,
+            # The settings are what the scope pass needs to find the
+            # repository and its sandbox, so the repair journey's card can
+            # carry the same sentence about scope the routine build's card
+            # carries.
+            config=forge_config,
         )
     else:
         logger.warning(
