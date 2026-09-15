@@ -150,7 +150,10 @@ DispatchCallable = Callable[..., Awaitable[Any]]
 #         object (TARGET_REPO_DESCRIPTOR_SCHEMA); optional: ``spec_assumptions``
 #         = the 007 _assumptions.yaml content, ``spec_feature_paths`` = the
 #         repo-relative path(s) the .feature is committed at on the planning
-#         branch, revision_of, validate_feedback)
+#         branch, revision_of, validate_feedback). The plan leg started
+#         SENDING ``revision_of`` and ``validate_feedback`` on 2026-09-15, on
+#         the same terms as the spec leg: the machine's one note when the plan
+#         does not follow the request, and the tree the rewrite starts from.
 #        ``spec_feature_paths`` is OPTIONAL ON BOTH SIDES ON PURPOSE. The two
 #        repositories ship as separate images and either can be redeployed
 #        first; a REQUIRED argument would mean that in one of those two orders
@@ -216,6 +219,8 @@ def build_feature_plan_command_args(
     spec_feature_paths: Sequence[str] | None = None,
     request_text: str | None = None,
     repository_facts: str | None = None,
+    revision_of: dict[str, str] | None = None,
+    validate_feedback: str | None = None,
 ) -> dict[str, Any]:
     """Exact ``architect_feature_plan`` (008) wire args. See the CONTRACT note above.
 
@@ -243,6 +248,18 @@ def build_feature_plan_command_args(
     images can be redeployed in either order with no window in which planning is
     refused. Blank is not a document: it never reaches the wire, and a run with
     nothing to say sends exactly the set that shipped before this existed.
+
+    ``validate_feedback`` and ``revision_of`` (2026-09-15) are the machine's
+    one note to the plan writer and the plan tree the rewrite starts from —
+    the same two names, meaning the same two things, that the spec builder
+    above has sent since the owner's notes were wired. The plan writer's own
+    tool has accepted both since it was written and forge had never sent
+    either, which is why a plan that named a web address the request did not
+    name, or added a login requirement nobody asked for, could only be found
+    an hour later at the live gate. The note travels VERBATIM: it is the
+    reviewer's own words, never summarised and never reworded on the way. A
+    first-round dispatch sends neither and is byte-identical to the call that
+    shipped.
     """
     args: dict[str, Any] = {
         "feature_id": feature_id,
@@ -262,6 +279,12 @@ def build_feature_plan_command_args(
         args["request_text"] = str(request_text)
     if repository_facts is not None and str(repository_facts).strip():
         args["repository_facts"] = str(repository_facts)
+    # The machine's one note to the plan writer, and what it rewrites from —
+    # the same two lines, in the same order, as the spec builder above.
+    if revision_of:
+        args["revision_of"] = dict(revision_of)
+    if validate_feedback is not None and str(validate_feedback).strip():
+        args["validate_feedback"] = validate_feedback
     return args
 
 
@@ -1030,6 +1053,8 @@ async def compose_planning_consumer_and_dispatch(
             spec_feature_paths: Sequence[str] | None = None,
             request_text: str | None = None,
             repository_facts: str | None = None,
+            revision_of: dict[str, str] | None = None,
+            validate_feedback: str | None = None,
         ) -> Any:
             return await dispatch_specialist_stage(
                 stage=StageClass.FEATURE_PLAN,
@@ -1048,6 +1073,8 @@ async def compose_planning_consumer_and_dispatch(
                     spec_feature_paths=spec_feature_paths,
                     request_text=request_text,
                     repository_facts=repository_facts,
+                    revision_of=revision_of,
+                    validate_feedback=validate_feedback,
                 ),
             )
 
