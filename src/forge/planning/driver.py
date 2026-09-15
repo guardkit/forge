@@ -573,7 +573,8 @@ first-round dispatch passes neither."""
 DispatchFeaturePlanFn = Callable[..., Awaitable[Any]]
 """``async (*, plan_run_id, correlation_id, feature_id, spec_feature,
 spec_summary, target_repo_descriptor, spec_assumptions=None,
-spec_feature_paths=None) -> StageDispatchResult``.
+spec_feature_paths=None, request_text=None, repository_facts=None)
+-> StageDispatchResult``.
 
 Lane B (B2): dispatch the ``architect_feature_plan`` (008) leg. Forge supplies
 the SUPPLIED minted ``feature_id`` (RV-1: the plan leg asserts it), the 007 spec
@@ -593,7 +594,17 @@ six of the ten plans captured on 2026-08-22 that wrote the key named a folder
 that does not exist. Forge already knew: it committed those files itself one leg
 earlier, and reads them back off the branch two statements above this dispatch.
 OPTIONAL on the wire, so an older specialist that does not know the argument is
-unaffected."""
+unaffected.
+
+2026-09-15 (the planner fix): ``request_text`` and ``repository_facts`` are the
+two documents the plan-writer's own reviewer is judged against — the sentence
+the person sent, word for word, and a short sheet of what the repository
+already does, read by ordinary code rather than by a model. The spec leg has
+sent both since 2026-09-13; the plan leg sent neither, which is why a plan that
+moved the web address or added a login requirement nobody asked for could still
+be scored a good plan. Both are OPTIONAL on both sides, so the two images may be
+redeployed in either order, and a run with no sentence on its row sends the set
+that shipped before this existed."""
 
 
 def _reject_word_split(note: str) -> tuple[bool, str]:
@@ -4426,6 +4437,7 @@ class PlanningRunDriver:
                 ),
             )
         first = await self._plan_attempt(
+            row,
             correlation_id,
             target_repo=target_repo,
             repo_path=repo_path,
@@ -4479,6 +4491,7 @@ class PlanningRunDriver:
             # not land (nothing was re-recorded), so the model gets its turn
             # before anyone is told to start again.
             second = await self._plan_attempt(
+                row,
                 correlation_id,
                 target_repo=target_repo,
                 repo_path=repo_path,
@@ -4551,6 +4564,7 @@ class PlanningRunDriver:
 
     async def _plan_attempt(
         self,
+        row: Any,
         correlation_id: str,
         *,
         target_repo: str,
@@ -4568,6 +4582,12 @@ class PlanningRunDriver:
         Runs once today; twice when the machine's one rewrite is in play
         (2026-09-06) — the second pass reads the REWRITTEN spec, because it
         reads the latest approved spec row, which the rewrite re-recorded.
+
+        ``row`` is the run row, handed down from :meth:`_feature_plan_leg`,
+        which already holds it (2026-09-15). It is here for one reason: the
+        sentence the person actually sent lives on it, and the plan-writer's
+        own reviewer was never shown it. The leg reads it rather than the
+        attempt going back to the store for a row the caller already has.
 
         ``rules_only`` (rule 1a, 2026-09-07): ask the stamping step to run by
         rule only — no model fallback — which it does where the routing law
@@ -4632,6 +4652,14 @@ class PlanningRunDriver:
                 target_repo_descriptor=target_repo_descriptor,
                 spec_assumptions=spec_assumptions,
                 spec_feature_paths=spec_feature_paths,
+                # The coach's ground truth, the same two the spec leg sends
+                # (2026-09-15): the sentence, word for word, and what the
+                # repository already does for the words it uses. Absent, the
+                # wire is byte for byte what it was.
+                request_text=self._request_text_of(row),
+                repository_facts=self._repository_facts_for(
+                    correlation_id, repo_path, row
+                ),
             )
         except Exception as exc:  # noqa: BLE001 — dispatch boundary
             await self._fail_leg(

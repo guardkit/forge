@@ -21,7 +21,9 @@ against them; these pins MUST track them byte-for-byte):
          required_args = ("feature_id", "spec_feature", "spec_summary",
                           "target_repo_descriptor")
          optional      = spec_assumptions, spec_feature_paths, revision_of,
-                         validate_feedback
+                         validate_feedback, and (2026-09-15) request_text,
+                         repository_facts — the planning coach's two
+                         ground-truth documents, optional on both sides
          TARGET_REPO_DESCRIPTOR_SCHEMA required = {"repo", "test_roots"}
 
 ``spec_feature_paths`` (2026-08-22) is OPTIONAL on both sides deliberately. The
@@ -59,7 +61,17 @@ _FEATURE_PLAN_REQUIRED = {
 }
 #: The optional 008 args forge emits. ``spec_feature_paths`` rides whenever the
 #: spec leg committed a ``.feature`` — i.e. on every real planning run.
-_FEATURE_PLAN_OPTIONAL_ON_WIRE = {"spec_assumptions", "spec_feature_paths"}
+#: ``request_text`` and ``repository_facts`` (2026-09-15) are the planning
+#: coach's two ground-truth documents, the same two the spec leg has sent since
+#: 2026-09-13: the sentence word for word, and what the repository already does
+#: for the words it uses. They ride whenever the run has them and are silent
+#: when it does not.
+_FEATURE_PLAN_OPTIONAL_ON_WIRE = {
+    "spec_assumptions",
+    "spec_feature_paths",
+    "request_text",
+    "repository_facts",
+}
 _TARGET_REPO_DESCRIPTOR_REQUIRED = {"repo", "test_roots"}
 
 
@@ -206,6 +218,68 @@ def test_feature_plan_wire_args_omit_an_empty_spec_location() -> None:
         )
         assert "spec_feature_paths" not in args
         assert set(args) == _FEATURE_PLAN_REQUIRED
+
+
+def test_feature_plan_wire_args_carry_the_coachs_ground_truth() -> None:
+    """The two documents the plan reviewer is judged against (2026-09-15).
+
+    The plan leg sent neither, and that is the hole this closes: the reviewer
+    scored a plan without ever having been shown the sentence it was written
+    from, so a plan that moved the web address or added a login requirement
+    nobody asked for could still be called a good plan. Both names, and both
+    builders, are the spec leg's — copied, not reworded, so the two legs
+    cannot drift apart.
+    """
+    args = build_feature_plan_command_args(
+        feature_id="FEAT-BEEF",
+        spec_feature="Feature: x\n",
+        spec_summary="# summary\n",
+        target_repo_descriptor={"repo": "guardkit/api_test", "test_roots": []},
+        request_text=(
+            "Add a GET /users/created-per-day endpoint that returns the number "
+            "of users created on each of the last 7 days, oldest first."
+        ),
+        repository_facts="`src/users/router.py` defines GET /users/count-today.",
+    )
+    assert set(args) == _FEATURE_PLAN_REQUIRED | {"request_text", "repository_facts"}
+    assert set(args) - _FEATURE_PLAN_REQUIRED <= _FEATURE_PLAN_OPTIONAL_ON_WIRE
+    # Word for word: neither document is summarised or reworded on the way.
+    assert args["request_text"] == (
+        "Add a GET /users/created-per-day endpoint that returns the number "
+        "of users created on each of the last 7 days, oldest first."
+    )
+    assert args["repository_facts"] == (
+        "`src/users/router.py` defines GET /users/count-today."
+    )
+
+
+def test_feature_plan_wire_args_omit_a_blank_ground_truth() -> None:
+    """THE DEPLOY-ORDER PIN for these two. Blank is not a document: a run with
+    no sentence sends the set that shipped before this existed, byte for byte,
+    so neither image has to be redeployed before the other."""
+    plain = build_feature_plan_command_args(
+        feature_id="FEAT-BEEF",
+        spec_feature="Feature: x\n",
+        spec_summary="# summary\n",
+        target_repo_descriptor={"repo": "guardkit/api_test", "test_roots": []},
+    )
+    assert set(plain) == _FEATURE_PLAN_REQUIRED
+    for blank in (None, "", "   ", "\n"):
+        args = build_feature_plan_command_args(
+            feature_id="FEAT-BEEF",
+            spec_feature="Feature: x\n",
+            spec_summary="# summary\n",
+            target_repo_descriptor={"repo": "guardkit/api_test", "test_roots": []},
+            request_text=blank,
+            repository_facts=blank,
+        )
+        assert args == plain
+    # And neither may ever join the REQUIRED set on either side.
+    assert "request_text" not in _FEATURE_PLAN_REQUIRED
+    assert "repository_facts" not in _FEATURE_PLAN_REQUIRED
+    required_mirror = set(SPECIALIST_REQUIRED_ARGS_BY_STAGE[StageClass.FEATURE_PLAN])
+    assert "request_text" not in required_mirror
+    assert "repository_facts" not in required_mirror
 
 
 def test_feature_plan_required_set_is_unchanged_by_the_location_argument() -> None:
