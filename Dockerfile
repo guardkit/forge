@@ -18,10 +18,9 @@
 #   * ``COPY --from=nats-core / /tmp/nats-core`` pulls the sibling
 #     working tree into the build via
 #     ``--build-context nats-core=../nats-core``.
-#   * nats-core is installed from /tmp/nats-core BEFORE
-#     ``pip install .[providers]`` so pip's resolver treats nats-core
-#     as already-satisfied and never reaches PyPI for the malformed
-#     0.2.0 wheel (TASK-FIX-F0E6 / TASK-REV-F0E4 §5.1).
+#   * nats-core is passed as a local path in the same resolver transaction as
+#     Forge, GuardKit and guardkitfactory, so pip never reaches PyPI for the
+#     malformed 0.2.0 wheel (TASK-FIX-F0E6 / TASK-REV-F0E4 §5.1).
 #   * ``pyproject.toml`` is NOT mutated inside the layer — the dev-host
 #     ``[tool.uv.sources]`` semantics are preserved (scoping §11.4).
 #   * Only the resolved venv crosses the builder→runtime boundary; gcc,
@@ -87,16 +86,9 @@ COPY --from=nats-core / /tmp/nats-core
 # the diagnostic to stderr so ``docker buildx build`` highlights it.
 RUN test -d /tmp/nats-core/src/nats_core || (echo "nats-core layout invalid" >&2; exit 1)
 
-# Install nats-core from the BuildKit context BEFORE forge so pip's
-# resolver treats nats-core>=0.3.0,<0.6 (declared in pyproject.toml)
-# as already-satisfied. Without this step, pip would attempt to fetch
-# the malformed PyPI 0.2.0 wheel (TASK-FIX-F0E6) and the install would
-# fail with ``ModuleNotFoundError: No module named 'nats_core'`` at
-# import time. We deliberately use a non-editable install here so the
-# resulting venv contains nats-core as a regular distribution rather
-# than a ``.pth`` editable pointer to a path that won't exist in the
-# runtime stage.
-RUN pip install /tmp/nats-core
+# Keep this private source staged until the combined resolver transaction
+# below. Passing the local directory there prevents use of the malformed
+# public nats-core wheel.
 
 # Pull the BuildKit-named ``fleet-memory`` context — the gate's priors
 # read (forge.adapters.fleet_memory, the ``memory`` extra). fleet-memory
@@ -112,13 +104,8 @@ COPY --from=fleet-memory / /tmp/fleet-memory
 # pip resolution error several layers down.
 RUN test -d /tmp/fleet-memory/src/fleet_memory || (echo "fleet-memory layout invalid" >&2; exit 1)
 
-# Install fleet-memory from the BuildKit context BEFORE forge so pip's
-# resolver treats fleet-memory>=0.1,<1 (the ``memory`` extra) as
-# already-satisfied and never reaches PyPI, where no fleet-memory
-# distribution exists. Non-editable for the same reason as nats-core:
-# the runtime stage must not depend on a ``.pth`` pointer to a builder
-# path.
-RUN pip install /tmp/fleet-memory
+# Keep fleet-memory staged for the combined transaction. It has no public
+# distribution, so the local path is the only permitted source.
 
 # Copy the forge sources late so changes to forge code don't bust the
 # nats-core install cache layer above. ``pyproject.toml`` is NOT
@@ -128,13 +115,8 @@ COPY pyproject.toml ./
 COPY README.md ./
 COPY src ./src
 
-# Literal-match to RUNBOOK-FEAT-FORGE-008-validation.md §0.4 and §6.1
-# (LES1 §3 DKRX, AC-E / B3 scenario). The runbook validation steps and
-# this Dockerfile share this exact install command — drift here breaks
-# the equivalence claim that FEAT-FORGE-008 relies on. forge installs
-# as a regular distribution (no ``-e``); the C4 scenario asserts the
-# runtime venv contains forge with no ``.pth`` editable pointer.
-RUN pip install .[providers,memory]
+# Forge is staged until guardkitfactory and GuardKit have also been copied.
+# The single transaction below resolves one dependency set for every project.
 
 # ---------------------------------------------------------------------------
 # guardkitfactory — the LangGraph leg-harness runtime.
@@ -156,98 +138,11 @@ COPY --from=guardkitfactory / /tmp/guardkitfactory
 # of a confusing pip resolution error several layers down.
 RUN test -d /tmp/guardkitfactory/src/guardkitfactory || (echo "guardkitfactory layout invalid" >&2; exit 1)
 
-# INSTALL ORDER — deliberately AFTER ``pip install .[providers,memory]``,
-# unlike nats-core / fleet-memory which install BEFORE it. Two facts decide
-# it, and both were checked against the pyprojects rather than assumed:
-#
-#   1. Dependency direction. guardkitfactory declares nothing from this
-#      estate in its DEPENDENCIES (deepagents / langgraph / langchain /
-#      langchain-core / langchain-openai / tree-sitter, all on PyPI), and
-#      guardkit is the one that declares IT —
-#      ``guardkit-py[autobuild]`` -> ``guardkitfactory>=0.2.0,<1``, an extra
-#      this image never installs, so nothing forge installs can reach PyPI
-#      looking for a guardkitfactory distribution (there is none to find).
-#      forge itself never names it.
-#
-#      DO NOT read that as "guardkitfactory is independent of guardkit". Its
-#      runtime IMPORT graph runs the other way:
-#      guardkitfactory/harness/langgraph_harness.py does a module-level
-#      ``from guardkit.orchestrator.harness import ...`` and
-#      ``import guardkitfactory`` reaches it eagerly via ``__init__`` ->
-#      ``.harness``. The two are mutually importing. That is harmless here
-#      only because installation never imports, and both are present in the
-#      final venv before anything imports either (the oracles run
-#      post-build) — but by import direction guardkitfactory would more
-#      properly FOLLOW the guardkit block, not precede it. Placement here is
-#      the deepagents decision below, nothing more.
-#
-#   2. The deepagents band decides the rest, and it is PINNED here on
-#      purpose. forge pins ``deepagents>=0.5.3,<0.6``; guardkitfactory
-#      requires ``deepagents>=0.6.7,<1``. That pair is UNSATISFIABLE in one
-#      venv, and pip's sequential installs make the LAST install the winner.
-#      Installing guardkitfactory first would let forge's install DOWNGRADE
-#      deepagents to 0.5.x, where ``create_deep_agent`` has no
-#      ``state_schema`` keyword (added upstream in 0.6.6 and passed by
-#      guardkitfactory's harness). ``import guardkitfactory`` would still
-#      succeed and the leg would then die at call time — the false-green
-#      class this bake exists to kill. So guardkitfactory installs LAST.
-#
-#      But LAST alone is not enough, and the bare install is a TRAP: pip
-#      resolves ``deepagents>=0.6.7,<1`` to the NEWEST match on PyPI, and
-#      that band today runs 0.6.7…0.6.12 then 0.7.0…0.7.3 — so a bare
-#      ``pip install /tmp/guardkitfactory`` lands 0.7.3, NOT the 0.6.7 this
-#      estate is developed against (guardkitfactory's own .venv carries
-#      0.6.7 and its floor comment stops there). NOTE the ``<0.7`` pin
-#      below bakes the NEWEST 0.6.x — today that is 0.6.12, not 0.6.7;
-#      the reviewed band is what the pin holds, and the oracle's
-#      protocol-prompt probe (not this comment) is what makes any 0.6.x
-#      safe. 0.7.x is a SILENT
-#      regression for the daemon on two counts:
-#
-#        (a) deepagents 0.7.x DELETED the module constant
-#            ``ASYNC_TASK_SYSTEM_PROMPT`` and changed
-#            ``AsyncSubAgentMiddleware.__init__``'s ``system_prompt``
-#            default from that constant to ``None``.
-#            src/forge/cli/serve.py constructs
-#            ``AsyncSubAgentMiddleware(async_subagents=[spec])`` with no
-#            ``system_prompt``, so under 0.7.x the supervisor silently loses
-#            the entire async-subagent operating protocol (start / check /
-#            update / cancel / list rules plus the stale-status rules) it
-#            carries today. NOTHING RAISES — the leg just gets a dumber
-#            supervisor.
-#
-#        (b) 0.7.3 cascade-upgrades the daemon's whole LLM stack unreviewed:
-#            langchain>=1.3.14, langchain-core>=1.5.0,
-#            langchain-anthropic>=1.5.3, langchain-google-genai>=4.3.1,
-#            langsmith>=0.10.9. All sit inside forge's declared ranges so
-#            pip refuses nothing — but forge's SSE contract fixtures
-#            (tests/forge/lifecycle_bridge/test_translation_contract.py)
-#            were recorded against the current set, and forge pins
-#            langgraph-sdk~=0.3.13 / langgraph-api~=0.8.0 around them.
-#
-#      The ``state_schema`` oracle CANNOT catch either: the keyword exists
-#      in 0.6.7 and 0.7.3 alike — it is a FLOOR probe, not a version probe.
-#      Hence the explicit ``deepagents>=0.6.7,<0.7`` on the install line
-#      below, and the version-band assertion in the oracle. Widening that
-#      band is a deliberate act: re-check serve.py's middleware construction
-#      and the SSE contract fixtures first.
-#
-#      Why the daemon tolerates the newer deepagents at all: forge's ENTIRE
-#      deepagents surface is one import —
-#      ``deepagents.middleware.async_subagents.AsyncSubAgentMiddleware``
-#      (src/forge/cli/serve.py) — and that module is identical between
-#      0.5.9 and 0.6.7 apart from prompt-text markdown formatting.
-#      pip WILL print a ``forge 0.1.0 requires deepagents<0.6`` conflict
-#      line at this layer: expected, and loud by design. Reconciling forge's
-#      DECLARED pin with the harness floor is a pyproject ruling, not an
-#      image change — raise it before the next pin edit.
-#
-# scripts/verify-forge-oracles.sh proves the result inside the built image:
-# ``import guardkitfactory`` (which eagerly imports guardkitfactory.harness,
-# hence the whole deepagents/langchain/langgraph stack), the resolved
-# deepagents version band, the ``state_schema`` capability itself, and
-# ``guardkit task-review --help``.
-RUN pip install /tmp/guardkitfactory 'deepagents>=0.6.7,<0.7'
+# guardkitfactory is a private BuildKit context and participates in the same
+# transaction as Forge and GuardKit. One resolver must accept every project's
+# constraints; sequential "last install wins" overrides are forbidden. The
+# image oracle later checks real graph capability, Forge's constructed async
+# protocol, and the exact Deep Agents version.
 
 # ---------------------------------------------------------------------------
 # guardkit oracle payload + CLI — forge-side mirror of the specialist's
@@ -292,12 +187,18 @@ COPY --from=guardkit /installer/core /tmp/guardkit/installer/core
 # confusing pip resolution error several layers down.
 RUN test -d /tmp/guardkit/guardkit || (echo "guardkit layout invalid" >&2; exit 1)
 
-# Real pip install of the guardkit-py distribution (python floor >=3.12 is
-# satisfied). Builds the DF-011 wheel from the staged tree — packages=["guardkit"]
-# plus the ``installer/core`` -> ``guardkit/_installer_core`` force-include — and
-# installs the ``guardkit-py`` console script into /opt/venv/bin.
-RUN pip install /tmp/guardkit \
-    && python -c "import guardkit, guardkit._installer_core; print('guardkit installed at', guardkit.__file__)"
+# Resolve every project and private source once. The explicit SDK argument
+# makes the actual image install command agree with Forge's declaration.
+# ``pip check`` must be green before the runtime imports are accepted.
+RUN pip install \
+        /tmp/nats-core \
+        /tmp/fleet-memory \
+        '.[providers,memory]' \
+        /tmp/guardkitfactory \
+        /tmp/guardkit \
+        'deepagents==0.7.14' \
+    && pip check \
+    && python -c "import importlib.metadata as m; import forge, guardkit, guardkit._installer_core, guardkitfactory; assert m.version('deepagents') == '0.7.14'"
 
 # ---------------------------------------------------------------------------
 # Stage 2: runtime
@@ -326,7 +227,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 ENV FORGE_HEALTHZ_PORT=8080
 
 # Front-load the venv shim onto PATH so ``forge`` resolves to the
-# console-script entry produced by ``pip install .[providers]`` rather
+# console-script entry produced by the combined builder install rather
 # than the system-python executable. Setting PATH on its own line
 # (not folded into the multi-line ENV above) avoids a continuation
 # backslash splitting the literal across lines.

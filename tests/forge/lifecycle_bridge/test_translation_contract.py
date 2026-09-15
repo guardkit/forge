@@ -28,10 +28,13 @@ drift is the Option C risk this contract test is designed to surface.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import UTC, datetime, timedelta
+from importlib.metadata import version
 
 import pytest
+from langgraph_sdk import get_client
 from langgraph_sdk.schema import StreamPart
 from nats_core.events import (
     BuildCompletePayload,
@@ -58,6 +61,67 @@ _ENVELOPE_BY_NAME: dict[str, type] = {
     "BuildCompletePayload": BuildCompletePayload,
     "BuildFailedPayload": BuildFailedPayload,
 }
+
+
+def _as_sse(records: list[dict]) -> bytes:
+    """Encode recorded fixture rows as the Agent Protocol SSE wire format."""
+
+    chunks: list[str] = []
+    for record in records:
+        if record.get("id") is not None:
+            chunks.append(f"id: {record['id']}\n")
+        chunks.append(f"event: {record['event']}\n")
+        chunks.append(
+            "data: "
+            + json.dumps(record.get("data"), separators=(",", ":"))
+            + "\n\n"
+        )
+    return "".join(chunks).encode("utf-8")
+
+
+async def _sdk_parts_from_fake_service(
+    records: list[dict],
+) -> tuple[list[StreamPart], str]:
+    """Parse fixture SSE through the real SDK client and an ephemeral server."""
+
+    body = _as_sse(records)
+    requests: list[str] = []
+
+    async def handle(
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        request = await reader.readuntil(b"\r\n\r\n")
+        requests.append(request.decode("ascii", errors="replace"))
+        writer.write(
+            b"HTTP/1.1 200 OK\r\n"
+            b"Content-Type: text/event-stream\r\n"
+            + f"Content-Length: {len(body)}\r\n".encode("ascii")
+            + b"Connection: close\r\n\r\n"
+            + body
+        )
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    try:
+        async with server:
+            async with get_client(url=f"http://127.0.0.1:{port}") as client:
+                parts = [
+                    part
+                    async for part in client.runs.join_stream(
+                        thread_id="thread-deepagents",
+                        run_id="run-deepagents-001",
+                    )
+                ]
+    finally:
+        server.close()
+        await server.wait_closed()
+
+    assert len(requests) == 1
+    return parts, requests[0].splitlines()[0]
 
 
 def _load_fixture(path=CANONICAL_FIXTURE) -> list[dict]:
@@ -400,3 +464,54 @@ class TestDeepagentsRunnerShape:
         assert terminal.failure_reason == (
             "BuildOrchestrationError: wave 0 task 0 failed"
         )
+
+
+class TestPinnedSdkWireContract:
+    """Revalidate the recorded runner fixture through the actual SDK parser."""
+
+    @pytest.mark.asyncio
+    async def test_sdk_044_parses_recorded_sse_and_translator_contract(
+        self,
+    ) -> None:
+        assert version("langgraph-sdk") == "0.4.4"
+        assert version("langgraph-api") == "0.8.7"
+        records = _load_fixture(DEEPAGENTS_RUNNER_FIXTURE)
+
+        parts, request_line = await _sdk_parts_from_fake_service(records)
+
+        assert request_line.startswith(
+            "GET /threads/thread-deepagents/runs/"
+            "run-deepagents-001/stream?"
+        )
+        assert [
+            {"event": part.event, "data": part.data, "id": part.id}
+            for part in parts
+        ] == [
+            {
+                "event": record["event"],
+                "data": record.get("data"),
+                "id": record.get("id"),
+            }
+            for record in records
+        ]
+
+        success_translator = StreamEventTranslator()
+        failure_translator = StreamEventTranslator()
+        success_ctx = _make_context(
+            "FEAT-DA-OK", correlation_id="corr-da-ok"
+        )
+        failure_ctx = _make_context(
+            "FEAT-DA-FAIL", correlation_id="corr-da-fail"
+        )
+        for record, part in zip(records, parts, strict=True):
+            is_failure = record.get("_path") == "deepagents-failure"
+            translator = (
+                failure_translator if is_failure else success_translator
+            )
+            ctx = failure_ctx if is_failure else success_ctx
+            payload = translator.translate(part, ctx)
+            expected_name = record.get("_expected_envelope")
+            if expected_name is None:
+                assert payload is None
+            else:
+                assert isinstance(payload, _ENVELOPE_BY_NAME[expected_name])

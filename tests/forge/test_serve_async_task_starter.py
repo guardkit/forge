@@ -806,8 +806,14 @@ class TestF010JBuildMiddlewareThreadsUrl:
         captured: dict[str, Any] = {}
 
         class _CapturingMiddleware:
-            def __init__(self, *, async_subagents: list[dict[str, Any]]) -> None:
+            def __init__(
+                self,
+                *,
+                async_subagents: list[dict[str, Any]],
+                system_prompt: str,
+            ) -> None:
                 captured["async_subagents"] = async_subagents
+                captured["system_prompt"] = system_prompt
 
         monkeypatch.setattr(
             ds_module, "AsyncSubAgentMiddleware", _CapturingMiddleware
@@ -826,6 +832,7 @@ class TestF010JBuildMiddlewareThreadsUrl:
         # Existing fields preserved.
         assert autobuild_spec["graph_id"] == AUTOBUILD_RUNNER_NAME
         assert "description" in autobuild_spec
+        assert "Forge async autobuild protocol" in captured["system_prompt"]
 
 
 class TestF010JBuildMiddlewareOmitsUrlWhenAbsent:
@@ -855,8 +862,14 @@ class TestF010JBuildMiddlewareOmitsUrlWhenAbsent:
         captured: dict[str, Any] = {}
 
         class _CapturingMiddleware:
-            def __init__(self, *, async_subagents: list[dict[str, Any]]) -> None:
+            def __init__(
+                self,
+                *,
+                async_subagents: list[dict[str, Any]],
+                system_prompt: str,
+            ) -> None:
                 captured["async_subagents"] = async_subagents
+                captured["system_prompt"] = system_prompt
 
         monkeypatch.setattr(
             ds_module, "AsyncSubAgentMiddleware", _CapturingMiddleware
@@ -885,8 +898,14 @@ class TestF010JBuildMiddlewareOmitsUrlWhenAbsent:
         captured: dict[str, Any] = {}
 
         class _CapturingMiddleware:
-            def __init__(self, *, async_subagents: list[dict[str, Any]]) -> None:
+            def __init__(
+                self,
+                *,
+                async_subagents: list[dict[str, Any]],
+                system_prompt: str,
+            ) -> None:
                 captured["async_subagents"] = async_subagents
+                captured["system_prompt"] = system_prompt
 
         monkeypatch.setattr(
             ds_module, "AsyncSubAgentMiddleware", _CapturingMiddleware

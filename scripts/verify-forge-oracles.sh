@@ -21,9 +21,10 @@
 #   (iv)  the LangGraph leg harness is real: ``import guardkitfactory`` (which
 #         eagerly imports guardkitfactory.harness, hence the whole
 #         deepagents/langchain/langgraph stack), the deepagents that actually
-#         landed is inside the reviewed >=0.6.7,<0.7 band with the supervisor's
-#         async-task protocol prompt intact, AND the ``guardkit task-review``
-#         CLI leg answers. Added after the conductor's first real leg died
+#         landed is exactly 0.7.14, Forge's constructed middleware carries its
+#         application-owned async protocol and five tools, a prompt-less
+#         middleware is rejected, AND the ``guardkit task-review`` CLI leg
+#         answers. Added after the conductor's first real leg died
 #         in-container with ``GUARDKIT_HARNESS=langgraph but guardkitfactory is
 #         not importable`` — the image baked guardkit but not its harness
 #         runtime, and nothing at build time noticed.
@@ -352,71 +353,58 @@ PY
 # deepagents.backends.composite/local_shell/protocol and langchain-core. A
 # harness-less image (the first-real-leg failure mode) dies here.
 #
-# The state_schema probe is the second half of the same oracle. forge pins
-# deepagents<0.6 and guardkitfactory requires >=0.6.7 — an unsatisfiable pair,
-# so the Dockerfile installs guardkitfactory LAST to make its floor win. If a
-# future edit reorders those installs, the import above still SUCCEEDS (0.5.x
-# has create_deep_agent, just without the keyword) and the leg would fail at
-# call time instead. Proving the keyword exists turns that silent reorder into
-# a build-time failure.
-#
-# The version-BAND probe is the third half, and it catches what state_schema
-# structurally cannot. ``state_schema`` is present in 0.6.7 AND in 0.7.3, so
-# the keyword check is a FLOOR probe only: it goes green on a deepagents the
-# daemon has never been reviewed against. The band matters because deepagents
-# 0.7.x DELETED ``ASYNC_TASK_SYSTEM_PROMPT`` and defaulted
-# ``AsyncSubAgentMiddleware(system_prompt=...)`` to ``None``, and
-# src/forge/cli/serve.py constructs that middleware WITHOUT a system_prompt —
-# so 0.7.x silently strips the supervisor's whole async-subagent operating
-# protocol with nothing raising. The Dockerfile pins ``deepagents>=0.6.7,<0.7``
-# on the guardkitfactory install line; this asserts the pin actually took.
+# The ``state_schema`` probe protects guardkitfactory's graph-construction
+# call. The exact version probe protects the lock/install contract. Neither is
+# enough to prove Forge's supervisor behavior, so this also constructs the
+# middleware through serve.py, validates Forge's owned prompt and exact five
+# tools, then proves the validator rejects a prompt-less object.
 read -r -d '' HARNESS_PROG <<'PY' || true
 import inspect
+from types import SimpleNamespace
 
 import deepagents
 import guardkitfactory
 from deepagents import create_deep_agent
-from deepagents.middleware import async_subagents
+from forge.cli.async_subagent_protocol import (
+    AsyncSubagentProtocolError,
+    verify_async_subagent_middleware_contract,
+)
+from forge.cli.serve import _build_async_subagent_middleware
 
 params = inspect.signature(create_deep_agent).parameters
 if "state_schema" not in params:
     raise SystemExit(
         "deepagents.create_deep_agent has no 'state_schema' keyword — the "
         "installed deepagents is below guardkitfactory's >=0.6.7 floor "
-        "(check the Dockerfile install order: guardkitfactory must be "
-        "installed AFTER pip install .[providers,memory])"
+        "(check the combined Docker resolver transaction)"
     )
 
 version = deepagents.__version__
-parts = version.split(".")
-try:
-    major, minor = int(parts[0]), int(parts[1])
-except (IndexError, ValueError):  # pragma: no cover - unparseable upstream
-    raise SystemExit(f"deepagents.__version__ is unparseable: {version!r}")
-if (major, minor) != (0, 6):
+if version != "0.7.14":
     raise SystemExit(
-        f"deepagents {version} is outside the reviewed >=0.6.7,<0.7 band "
-        "(the Dockerfile pins it on the guardkitfactory install line). 0.7.x "
-        "removes ASYNC_TASK_SYSTEM_PROMPT and defaults "
-        "AsyncSubAgentMiddleware(system_prompt=None), which silently strips "
-        "the supervisor protocol forge's serve.py relies on, and "
-        "cascade-upgrades langchain/langchain-core under the recorded SSE "
-        "contract fixtures. Widen the band only after re-reviewing both."
+        f"deepagents {version} is installed; Forge requires exactly 0.7.14"
     )
 
-default = inspect.signature(
-    async_subagents.AsyncSubAgentMiddleware.__init__
-).parameters["system_prompt"].default
-if not isinstance(default, str) or not default.strip():
+middleware = _build_async_subagent_middleware(
+    autobuild_runner_url="https://oracle.invalid"
+)
+tools = verify_async_subagent_middleware_contract(middleware)
+
+try:
+    verify_async_subagent_middleware_contract(
+        SimpleNamespace(system_prompt=None, tools=middleware.tools)
+    )
+except AsyncSubagentProtocolError:
+    pass
+else:
     raise SystemExit(
-        "AsyncSubAgentMiddleware.system_prompt no longer defaults to the "
-        "async-task protocol prompt — forge's serve.py constructs it with no "
-        "system_prompt and would silently lose the supervisor protocol"
+        "Forge's async middleware contract accepted a prompt-less object"
     )
 
 print(
     f"  OK  harness     import guardkitfactory {guardkitfactory.__version__} "
-    f"+ state_schema + deepagents {version} (0.6.x band, protocol prompt intact)"
+    f"+ state_schema + deepagents {version} + Forge protocol/tools "
+    f"{sorted(tools)} + prompt-less negative case"
 )
 PY
 

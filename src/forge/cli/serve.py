@@ -92,6 +92,9 @@ from forge.cli._serve_planning import (
     sweep_interrupted_planning_runs,
 )
 from forge.cli._serve_state import SubscriptionState
+from forge.cli.async_subagent_protocol import (
+    FORGE_ASYNC_SUBAGENT_SYSTEM_PROMPT,
+)
 from forge.pipeline.dispatchers.autobuild_async import (
     AsyncTaskStarter,
     AutobuildStateInitialiser,
@@ -1078,7 +1081,10 @@ def _build_async_subagent_middleware(*, autobuild_runner_url: str | None = None)
     if autobuild_runner_url:
         spec["url"] = autobuild_runner_url
 
-    return AsyncSubAgentMiddleware(async_subagents=[spec])
+    return AsyncSubAgentMiddleware(
+        async_subagents=[spec],
+        system_prompt=FORGE_ASYNC_SUBAGENT_SYSTEM_PROMPT,
+    )
 
 
 def _make_autobuild_dispatcher_closure(

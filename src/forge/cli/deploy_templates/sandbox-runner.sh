@@ -35,15 +35,13 @@
 #   3. Makes ~/.forge-venv with uv from the sandbox's own Python, once. uv's
 #      "never download an interpreter" switch is set on that one command only,
 #      never exported (see step 3 below for why).
-#   4. Installs into it from the copies, in the order forge's own Dockerfile
-#      uses: nats-core and fleet-memory first (neither can come from a package
-#      index — fleet-memory is published nowhere and the nats-core wheel on the
-#      index is malformed), then forge with its providers, memory and sidecar
-#      extras, then guardkitfactory with the deepagents band the Dockerfile
-#      pins, then guardkit — and proves the install with the same import line
-#      the Dockerfile uses. Done again only when a copy changed. The guardkit
-#      the runner shells is the one in this venv, never one on anyone's disk
-#      (rule 61).
+#   4. Installs all five private copies and Deep Agents 0.7.14 in one resolver
+#      transaction: nats-core and fleet-memory can never be substituted from a
+#      package index, while forge, guardkitfactory and guardkit must agree on
+#      one LangChain/LangGraph set. It then runs uv's dependency check and
+#      proves the imports and exact SDK version. Done again only when a copy
+#      changed. The guardkit the runner shells is the one in this venv, never
+#      one on anyone's disk (rule 61).
 #   5. Starts the two services and keeps them running: the deploy sidecar on
 #      port 8125 and the build runner (`langgraph dev`) on port 8124, both
 #      bound on every interface INSIDE the sandbox so the ports the wrapper
@@ -106,10 +104,6 @@ BIND="${SANDBOX_RUNNER_BIND:-0.0.0.0}"
 SIDECAR_PORT="${SANDBOX_SIDECAR_PORT:-8125}"
 RUNNER_PORT="${SANDBOX_RUNNER_PORT:-8124}"
 RESTART_SECONDS="${SANDBOX_RUNNER_RESTART_SECONDS:-5}"
-# The deepagents band forge's Dockerfile pins beside guardkitfactory, for the
-# reasons written there (0.7.x silently drops the supervisor's protocol prompt).
-DEEPAGENTS_BAND='deepagents>=0.6.7,<0.7'
-
 # The mounts, by name, in install order. Each must be a git checkout.
 MOUNT_NAMES=(forge guardkit "${ESTATE_SIBLINGS[@]}")
 mount_path_of() {
@@ -189,18 +183,19 @@ if [[ -f "${INSTALL_STAMP}" && "$(cat "${INSTALL_STAMP}")" == "${wanted}" ]]; th
   log "install already matches the copies"
 else
   log "installing the factory's code into ${VENV} from the copies"
-  # The two folders beside forge that no package index can supply come first,
-  # exactly as forge's own Dockerfile installs them before forge, so nothing
-  # in this venv is ever fetched from the index under those names.
-  uv pip install --python "${VENV}/bin/python" "${SRC_ROOT}/nats-core" "${SRC_ROOT}/fleet-memory"
-  uv pip install --python "${VENV}/bin/python" "${SRC_ROOT}/forge[providers,memory,sidecar]"
-  uv pip install --python "${VENV}/bin/python" "${SRC_ROOT}/guardkitfactory" "${DEEPAGENTS_BAND}"
-  uv pip install --python "${VENV}/bin/python" "${SRC_ROOT}/guardkit"
-  "${VENV}/bin/python" -c "import forge, guardkit, guardkit._installer_core, guardkitfactory"
+  uv pip install --python "${VENV}/bin/python" \
+    "${SRC_ROOT}/nats-core" \
+    "${SRC_ROOT}/fleet-memory" \
+    "${SRC_ROOT}/forge[providers,memory,sidecar]" \
+    "${SRC_ROOT}/guardkitfactory" \
+    "${SRC_ROOT}/guardkit" \
+    'deepagents==0.7.14'
+  uv pip check --python "${VENV}/bin/python"
+  "${VENV}/bin/python" -c "import importlib.metadata as m; import forge, guardkit, guardkit._installer_core, guardkitfactory; assert m.version('deepagents') == '0.7.14'"
   # guardkit's console script is guardkit-py; the runner shells `guardkit`.
   ln -sfn guardkit-py "${VENV}/bin/guardkit"
   printf '%s' "${wanted}" >"${INSTALL_STAMP}"
-  log "install proven: forge, guardkit and guardkitfactory import"
+  log "install proven: coherent dependencies, imports and deepagents 0.7.14"
 fi
 
 if [[ "${SANDBOX_RUNNER_BOOTSTRAP_ONLY:-}" == "1" ]]; then

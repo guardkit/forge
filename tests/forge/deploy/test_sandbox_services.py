@@ -530,11 +530,13 @@ class TestTheBootstrapMakesTheVenvOnce:
         home, src, venv = sandbox["home"], sandbox["home"] / ".forge-src", sandbox["home"] / ".forge-venv"
         assert _log_lines(sandbox["log"]) == [
             f"uv venv --python python3 {venv}",
-            f"uv pip install --python {venv}/bin/python {src}/nats-core {src}/fleet-memory",
-            f"uv pip install --python {venv}/bin/python {src}/forge[providers,memory,sidecar]",
-            f"uv pip install --python {venv}/bin/python {src}/guardkitfactory deepagents>=0.6.7,<0.7",
-            f"uv pip install --python {venv}/bin/python {src}/guardkit",
-            "python -c import forge, guardkit, guardkit._installer_core, guardkitfactory",
+            f"uv pip install --python {venv}/bin/python {src}/nats-core "
+            f"{src}/fleet-memory {src}/forge[providers,memory,sidecar] "
+            f"{src}/guardkitfactory {src}/guardkit deepagents==0.7.14",
+            f"uv pip check --python {venv}/bin/python",
+            "python -c import importlib.metadata as m; import forge, guardkit, "
+            "guardkit._installer_core, guardkitfactory; assert "
+            "m.version('deepagents') == '0.7.14'",
         ]
         # The copies are the tracked files at each mount's HEAD.
         for name in FACTORY_CHECKOUTS:
@@ -572,7 +574,8 @@ class TestTheBootstrapMakesTheVenvOnce:
         assert again.returncode == 0, again.stdout + again.stderr
         lines = _log_lines(sandbox["log"])
         assert not any(line.startswith("uv venv") for line in lines)
-        assert sum(line.startswith("uv pip install") for line in lines) == 4
+        assert sum(line.startswith("uv pip install") for line in lines) == 1
+        assert sum(line.startswith("uv pip check") for line in lines) == 1
         src = sandbox["home"] / ".forge-src"
         assert (src / "forge.commit").read_text().strip() == head
         assert (src / "forge" / "README.md").is_file()
@@ -708,8 +711,6 @@ class TestUvsDownloadSwitchStaysWithTheVenvCommand:
         assert result.returncode == 0, result.stdout + result.stderr
         assert _log_lines(sandbox["uv_env_log"]) == [
             "uv venv UV_PYTHON_DOWNLOADS=never",
-            "uv pip UV_PYTHON_DOWNLOADS=unset",
-            "uv pip UV_PYTHON_DOWNLOADS=unset",
             "uv pip UV_PYTHON_DOWNLOADS=unset",
             "uv pip UV_PYTHON_DOWNLOADS=unset",
         ]
