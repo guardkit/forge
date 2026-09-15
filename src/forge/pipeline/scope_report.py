@@ -81,6 +81,31 @@ _NONE_LINE = "_none_"
 #: five-module package the card exists to show.
 _DOC_FOLDERS: tuple[str, ...] = ("docs", "doc", "documentation")
 
+#: Folders the factory writes its OWN paperwork into, and which are therefore
+#: inside every routine build branch whether anybody asked for them or not.
+#:
+#: WHY THIS LIST EXISTS. A routine build branch opens with four planning
+#: commits before the coder writes a line: the feature's own file, the
+#: specification input, the feature plan with its task documents, and the QA
+#: pass bars and gate scripts. Read on 2026-09-15 over all twenty-two real
+#: build branches in the api_test repository, every one of them carries
+#: ``.guardkit/features/FEAT-XXXX.yaml``, ``feature_spec_inputs/<id>.md``,
+#: ``features/<name>/*``, ``qa/pass-bar-*.yaml`` and a dozen or more files
+#: under ``tasks/``. None of that is the code the build was asked for, and
+#: reading it as such put six to twelve false sentences on the card Rich taps
+#: to say merge: a shebang line became "It also answers at a web address the
+#: request did not name: /usr/bin/env.", and an open question in the
+#: specification input ("Are there any authentication or authorization
+#: requirements for this endpoint?") became "It also added authentication,
+#: which the request did not ask for."
+_FACTORY_PAPERWORK_FOLDERS: tuple[str, ...] = (
+    ".guardkit",
+    "feature_spec_inputs",
+    "features",
+    "qa",
+    "tasks",
+)
+
 #: A line that is a note to whoever reads the code next, rather than something
 #: the software now does. A comment saying "error handling" does not make the
 #: build handle errors. The capability words were measured on the prose of
@@ -209,38 +234,117 @@ def files_the_plan_named(
     return tuple(named), declared
 
 
+def _repo_path(path: str) -> str:
+    """One repository-relative path, written the one way this module reads.
+
+    Backslashes become slashes and a leading ``./`` is dropped. Only a
+    leading ``./`` — the earlier version stripped the characters ``.`` and
+    ``/`` one by one, which quietly turned ``.guardkit/features/FEAT-1.yaml``
+    into ``guardkit/features/FEAT-1.yaml`` and so hid the factory's own
+    feature file from every folder rule below it.
+    """
+    cleaned = str(path or "").replace("\\", "/").strip()
+    while cleaned.startswith("./"):
+        cleaned = cleaned[2:]
+    return cleaned.lstrip("/")
+
+
+def _pieces_of_a_web_address(route: str) -> tuple[str, ...]:
+    """A web address and every run of whole parts inside it.
+
+    ``/users/created-per-day`` gives ``/users``, ``/created-per-day`` and
+    ``/users/created-per-day``. This exists because a router declares its
+    address in pieces — ``APIRouter(prefix="/users")`` on one line and
+    ``@router.get("/created-per-day")`` on another — and each piece read on
+    its own looked like an address the request never named. Driven over the
+    real build branches, that put two false sentences on almost every card,
+    while the address that really did move,
+    ``/stats/users-created-per-day``, is no run of parts of the request's
+    own address and is still named.
+    """
+    parts = [part for part in str(route or "").strip("/").split("/") if part]
+    pieces: list[str] = []
+    for start in range(len(parts)):
+        for end in range(start + 1, len(parts) + 1):
+            piece = "/" + "/".join(parts[start:end])
+            if piece not in pieces:
+                pieces.append(piece)
+    return tuple(pieces)
+
+
 def _is_scaffolding(path: str) -> bool:
-    """True for a test file or a documentation page — the ordinary cost of
-    building the thing that was asked for."""
+    """True for a file that is not the code this build was asked for: a test
+    file, a documentation page, or one of the factory's own planning papers.
+
+    The first two are the ordinary cost of building the thing that was asked
+    for. The third is the factory's own writing — the feature file, the
+    specification input, the feature and its task documents, the QA pass bars
+    and gate scripts — which rides on every routine build branch because the
+    planning commits come before the coder's, and which nobody asked for in
+    the sense the merge card means.
+    """
     from forge.pipeline.merge_ready_checkpoint import path_is_test
 
-    cleaned = str(path or "").replace("\\", "/").lstrip("./")
+    cleaned = _repo_path(path)
     if not cleaned:
         return False
     if path_is_test(cleaned):
         return True
     first = cleaned.split("/", 1)[0].lower()
-    return first in _DOC_FOLDERS
+    return first in _DOC_FOLDERS or first in _FACTORY_PAPERWORK_FOLDERS
+
+
+def _what_one_file_declares(text: str) -> list[str]:
+    """The lines one file added that say something about what the software
+    now does.
+
+    Three kinds of line are dropped, because a web address or a capability
+    word in one of them is not something this build does:
+
+    * a note to a reader — a comment, which includes the ``#!/usr/bin/env``
+      line at the top of a script;
+    * the prose inside a docstring, where an example address such as
+      ``/stats`` is an illustration and not a route the software answers at;
+    * ordinary wiring — an import, or a logger being made.
+
+    Never raises.
+    """
+    kept: list[str] = []
+    inside_prose = False
+    for line in str(text or "").splitlines():
+        quotes = len(_A_BLOCK_OF_PROSE.findall(line))
+        was_inside_prose = inside_prose
+        if quotes % 2:
+            inside_prose = not inside_prose
+        if was_inside_prose or inside_prose or quotes:
+            continue
+        if _A_NOTE_TO_A_READER.match(line) or _ORDINARY_WIRING.search(line):
+            continue
+        kept.append(line)
+    return kept
 
 
 def what_the_branch_wrote(added_by_file: Mapping[str, str]) -> str:
-    """Every line this branch added to a file that is not scaffolding.
+    """Every line this branch added that says what the software now does, in
+    a file that is the code the build was asked for.
 
-    The web addresses are read here, in the code the build was asked for,
-    rather than in everything the branch touched. A test fixture holding
-    ``permissions: {filesystem: {allowlist: [/tmp]}}`` was otherwise read as
-    this build answering at ``/tmp``, which is a false sentence on the card
-    Rich taps to say merge. A web address the build really answers at is
-    declared in the code, so nothing true is lost by leaving the tests and
-    the documentation out. Never raises.
+    The web addresses are read here rather than in everything the branch
+    touched, and for the same two reasons the capability words are. A test
+    fixture holding ``permissions: {filesystem: {allowlist: [/tmp]}}`` was
+    otherwise read as this build answering at ``/tmp``; the shebang on a QA
+    gate script the factory itself wrote was read as ``/usr/bin/env``; and an
+    example address in that script's docstring was read as ``/stats``. All
+    three are false sentences on the card Rich taps to say merge. A web
+    address the build really answers at is declared in the code it was asked
+    for, so nothing true is lost by leaving the tests, the documentation, the
+    factory's own paperwork and the commentary out. Never raises.
     """
     kept: list[str] = []
     for path, text in dict(added_by_file or {}).items():
         name = str(path or "").strip()
         if not name or _is_scaffolding(name):
             continue
-        if text:
-            kept.append(str(text))
+        kept.extend(_what_one_file_declares(text))
     return "\n".join(kept)
 
 
@@ -278,17 +382,7 @@ def what_the_branch_declares(added_by_file: Mapping[str, str]) -> str:
         if not name or _is_scaffolding(name):
             continue
         declared.append(name)
-        inside_prose = False
-        for line in str(text or "").splitlines():
-            quotes = len(_A_BLOCK_OF_PROSE.findall(line))
-            was_inside_prose = inside_prose
-            if quotes % 2:
-                inside_prose = not inside_prose
-            if was_inside_prose or inside_prose or quotes:
-                continue
-            if _A_NOTE_TO_A_READER.match(line) or _ORDINARY_WIRING.search(line):
-                continue
-            declared.append(line)
+        declared.extend(_what_one_file_declares(text))
     return "\n".join(declared)
 
 
@@ -400,9 +494,9 @@ def scope_of_the_build(
     report.files_the_plan_named = list(named)
     report.plan_read = bool(declared)
     if declared:
-        wanted = {str(name).replace("\\", "/").lstrip("./") for name in named}
+        wanted = {_repo_path(name) for name in named}
         for path in changed_paths:
-            cleaned = str(path).replace("\\", "/").lstrip("./")
+            cleaned = _repo_path(path)
             if cleaned in wanted:
                 continue
             if _is_scaffolding(cleaned):
@@ -450,7 +544,13 @@ def scope_of_the_build(
             route.rstrip("/") for route in _route_shaped(request)
         ]
         report.routes_in_the_request = list(dict.fromkeys(in_request))
-        known = {route.lower() for route in report.routes_in_the_request}
+        # An address the request named, and every run of whole parts inside
+        # it, counts as named: a router writes its address in pieces.
+        known = {
+            piece.lower()
+            for route in report.routes_in_the_request
+            for piece in _pieces_of_a_web_address(route)
+        }
         declares: list[str] = []
         for route in _route_shaped(added):
             trimmed = route.rstrip("/")
@@ -476,10 +576,15 @@ def scope_of_the_build(
             if capability not in report.capabilities_the_request_did_not_name:
                 report.capabilities_the_request_did_not_name.append(capability)
 
-    # Each reason is its own sentence, and ends like one: two reasons joined
-    # by a bare space ran together into a single unreadable line.
+    # Each reason is its own sentence, and both starts and ends like one:
+    # joined by a bare space they ran together into one unreadable line, and
+    # joined only by a full stop the second one still began in lower case.
+    def _as_a_sentence(reason: str) -> str:
+        trimmed = str(reason).strip().rstrip(".")
+        return trimmed[:1].upper() + trimmed[1:] if trimmed else ""
+
     report.why_not = (
-        ". ".join(reason.strip().rstrip(".") for reason in reasons) + "."
+        ". ".join(_as_a_sentence(reason) for reason in reasons) + "."
         if reasons
         else None
     )
