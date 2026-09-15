@@ -28,6 +28,7 @@ import asyncio
 import inspect
 import threading
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any, Mapping
 from unittest.mock import MagicMock
 
@@ -240,14 +241,14 @@ class TestDispatchAutobuildSignature:
             "state_channel",
             "lifecycle_emitter",
         ]
-        additive_data_kwargs = ["branch", "repo"]
+        additive_data_kwargs = ["branch", "repo", "budget"]
         assert kw_only == collaborators + additive_data_kwargs, (
             f"dispatch_autobuild_async must expose exactly the five collaborator "
             f"parameters {collaborators!r} followed only by the additive data "
             f"kwargs {additive_data_kwargs!r}; got {kw_only!r}"
         )
         # The additive kwargs are pure data (default None), never collaborators.
-        for name in additive_data_kwargs:
+        for name in ("branch", "repo"):
             assert sig.parameters[name].default is None
 
     def test_lifecycle_emitter_defaults_to_none(self) -> None:
@@ -573,6 +574,202 @@ class TestAsyncSubAgentToolListExposed:
             "list_async_tasks",
         }
         assert isinstance(middleware, deepagents.AsyncSubAgentMiddleware)
+
+    def test_default_middleware_injects_forge_owned_protocol(self) -> None:
+        from forge.cli.async_subagent_protocol import (
+            FORGE_ASYNC_SUBAGENT_SYSTEM_PROMPT,
+            verify_async_subagent_middleware_contract,
+        )
+        from forge.cli.serve import _build_async_subagent_middleware
+
+        middleware = _build_async_subagent_middleware()
+        tools = verify_async_subagent_middleware_contract(middleware)
+        request = MagicMock(system_message=None)
+        overridden_request = object()
+        request.override.return_value = overridden_request
+        received: list[object] = []
+
+        result = middleware.wrap_model_call(
+            request,
+            lambda effective_request: received.append(effective_request)
+            or "model-response",
+        )
+
+        assert result == "model-response"
+        assert received == [overridden_request]
+        effective_system_message = request.override.call_args.kwargs[
+            "system_message"
+        ]
+        effective_text = "\n".join(
+            block["text"]
+            for block in effective_system_message.content
+            if block.get("type") == "text"
+        )
+        assert FORGE_ASYNC_SUBAGENT_SYSTEM_PROMPT in effective_text
+        assert "Available async subagent types:" in effective_text
+        assert set(tools) == {
+            "start_async_task",
+            "check_async_task",
+            "update_async_task",
+            "cancel_async_task",
+            "list_async_tasks",
+        }
+
+    def test_contract_check_rejects_missing_application_prompt(self) -> None:
+        from forge.cli.async_subagent_protocol import (
+            AsyncSubagentProtocolError,
+            verify_async_subagent_middleware_contract,
+        )
+        from forge.cli.serve import _build_async_subagent_middleware
+
+        middleware = _build_async_subagent_middleware()
+        broken = SimpleNamespace(system_prompt=None, tools=middleware.tools)
+
+        with pytest.raises(
+            AsyncSubagentProtocolError,
+            match="protocol is absent",
+        ):
+            verify_async_subagent_middleware_contract(broken)
+
+
+class _FakeRemoteThreads:
+    def __init__(self) -> None:
+        self.created = 0
+        self.values_by_thread: dict[str, dict[str, Any]] = {}
+
+    async def create(self) -> dict[str, str]:
+        self.created += 1
+        thread_id = f"remote-thread-{self.created}"
+        return {"thread_id": thread_id}
+
+    async def get(self, *, thread_id: str) -> dict[str, Any]:
+        return {"values": self.values_by_thread.get(thread_id, {})}
+
+
+class _FakeRemoteRuns:
+    def __init__(self) -> None:
+        self.created: list[dict[str, Any]] = []
+        self.cancelled: list[tuple[str, str]] = []
+        self.status_by_run: dict[str, dict[str, Any]] = {}
+
+    async def create(self, **kwargs: Any) -> dict[str, str]:
+        self.created.append(dict(kwargs))
+        run_id = f"remote-run-{len(self.created)}"
+        self.status_by_run.setdefault(run_id, {"status": "running"})
+        return {"run_id": run_id}
+
+    async def get(self, *, thread_id: str, run_id: str) -> dict[str, Any]:
+        del thread_id
+        return dict(self.status_by_run[run_id])
+
+    async def cancel(self, *, thread_id: str, run_id: str) -> None:
+        self.cancelled.append((thread_id, run_id))
+
+
+class _FakeRemoteClient:
+    def __init__(self) -> None:
+        self.threads = _FakeRemoteThreads()
+        self.runs = _FakeRemoteRuns()
+
+
+class TestAsyncSubAgentFakeTransport:
+    """Exercise the constructed middleware through its real tools."""
+
+    @pytest.mark.asyncio
+    async def test_dispatch_update_cancel_and_terminal_result(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from deepagents.middleware import async_subagents
+        from forge.cli.async_subagent_protocol import (
+            verify_async_subagent_middleware_contract,
+        )
+        from forge.cli.serve import _build_async_subagent_middleware
+
+        remote = _FakeRemoteClient()
+        monkeypatch.setattr(async_subagents, "get_client", lambda **_: remote)
+        middleware = _build_async_subagent_middleware(
+            autobuild_runner_url="https://fake.invalid"
+        )
+        tools = verify_async_subagent_middleware_contract(middleware)
+
+        start = await tools["start_async_task"].coroutine(
+            description="Build FEAT-1",
+            subagent_type="autobuild_runner",
+            runtime=SimpleNamespace(tool_call_id="start-1", state={}),
+        )
+        task = start.update["async_tasks"]["remote-thread-1"]
+        assert task["status"] == "running"
+        assert remote.runs.created[0]["assistant_id"] == "autobuild_runner"
+        assert remote.runs.created[0]["input"] == {
+            "messages": [{"role": "user", "content": "Build FEAT-1"}]
+        }
+
+        update = await tools["update_async_task"].coroutine(
+            task_id=task["task_id"],
+            message="Use the corrected acceptance criteria",
+            runtime=SimpleNamespace(
+                tool_call_id="update-1",
+                state={"async_tasks": {task["task_id"]: task}},
+            ),
+        )
+        updated = update.update["async_tasks"][task["task_id"]]
+        assert updated["task_id"] == task["task_id"]
+        assert updated["run_id"] == "remote-run-2"
+        assert remote.runs.created[1]["multitask_strategy"] == "interrupt"
+
+        cancel = await tools["cancel_async_task"].coroutine(
+            task_id=updated["task_id"],
+            runtime=SimpleNamespace(
+                tool_call_id="cancel-1",
+                state={"async_tasks": {updated["task_id"]: updated}},
+            ),
+        )
+        cancelled = cancel.update["async_tasks"][updated["task_id"]]
+        assert cancelled["status"] == "cancelled"
+        assert remote.runs.cancelled == [
+            (updated["thread_id"], updated["run_id"])
+        ]
+
+        terminal_start = await tools["start_async_task"].coroutine(
+            description="Build FEAT-2",
+            subagent_type="autobuild_runner",
+            runtime=SimpleNamespace(tool_call_id="start-2", state={}),
+        )
+        terminal_task = terminal_start.update["async_tasks"][
+            "remote-thread-2"
+        ]
+        remote.runs.status_by_run[terminal_task["run_id"]] = {
+            "status": "success"
+        }
+        remote.threads.values_by_thread[terminal_task["thread_id"]] = {
+            "messages": [{"role": "assistant", "content": "build complete"}]
+        }
+
+        checked = await tools["check_async_task"].coroutine(
+            task_id=terminal_task["task_id"],
+            runtime=SimpleNamespace(
+                tool_call_id="check-2",
+                state={
+                    "async_tasks": {
+                        terminal_task["task_id"]: terminal_task
+                    }
+                },
+            ),
+        )
+        checked_task = checked.update["async_tasks"][terminal_task["task_id"]]
+        assert checked_task["status"] == "success"
+        assert '"result": "build complete"' in checked.update["messages"][
+            0
+        ].content
+
+        missing = await tools["check_async_task"].coroutine(
+            task_id="not-tracked",
+            runtime=SimpleNamespace(
+                tool_call_id="check-missing",
+                state={"async_tasks": {}},
+            ),
+        )
+        assert missing == "No tracked task found for task_id: 'not-tracked'"
 
 
 # ---------------------------------------------------------------------------

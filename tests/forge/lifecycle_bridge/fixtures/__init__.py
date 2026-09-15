@@ -18,6 +18,13 @@ once the FOLLOWUP-B-FIX runner reaches production; the contract test
 guarantees the translator continues to recognise the snapshot under
 the additional channels.
 
+The recorded bytes were revalidated on 2026-09-16 by serving them from a
+deterministic in-test HTTP server and consuming them through the real
+``langgraph-sdk==0.4.4`` ``runs.join_stream`` client. The parsed
+``StreamPart`` values remained byte-for-data equivalent and produced the
+same envelopes through Forge's translator. ``langgraph-api==0.8.7`` stayed
+on its existing pinned minor line; no fixture row needed to change.
+
 When the ``langgraph-api`` minor version is bumped (per AC-5 of
 TASK-FRR-PEB-003), the fixture MUST be re-recorded against the new
 sidecar — silent SSE-shape drift is the Option C risk this contract
