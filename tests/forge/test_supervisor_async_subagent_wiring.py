@@ -680,6 +680,7 @@ class TestAsyncSubAgentFakeTransport:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         from deepagents.middleware import async_subagents
+
         from forge.cli.async_subagent_protocol import (
             verify_async_subagent_middleware_contract,
         )

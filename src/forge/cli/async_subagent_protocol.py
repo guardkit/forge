@@ -12,7 +12,6 @@ from __future__ import annotations
 
 from typing import Any
 
-
 FORGE_ASYNC_SUBAGENT_SYSTEM_PROMPT = """## Forge async autobuild protocol
 
 Use `start_async_task` to dispatch long-running autobuild work. Preserve the
