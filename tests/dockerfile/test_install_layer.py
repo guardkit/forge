@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import stat
 from pathlib import Path
 
@@ -52,6 +53,25 @@ CONTRACT_A_INVOCATION = (
 NATS_CORE_LAYOUT_GATE = (
     'RUN test -d /tmp/nats-core/src/nats_core '
     '|| (echo "nats-core layout invalid" >&2; exit 1)'
+)
+
+PRIVATE_INSTALL_REQUIREMENTS = (
+    "/tmp/nats-core",
+    "/tmp/fleet-memory",
+    ".[providers,memory]",
+    "/tmp/guardkitfactory",
+    "/tmp/guardkit",
+    "deepagents==0.7.14",
+)
+
+PRIVATE_LAYOUT_GATES = (
+    NATS_CORE_LAYOUT_GATE,
+    'RUN test -d /tmp/fleet-memory/src/fleet_memory '
+    '|| (echo "fleet-memory layout invalid" >&2; exit 1)',
+    'RUN test -d /tmp/guardkitfactory/src/guardkitfactory '
+    '|| (echo "guardkitfactory layout invalid" >&2; exit 1)',
+    'RUN test -d /tmp/guardkit/guardkit '
+    '|| (echo "guardkit layout invalid" >&2; exit 1)',
 )
 
 
@@ -125,6 +145,38 @@ def _runtime_stage_body(dockerfile_text: str) -> str:
     )
     assert match, "Could not locate the runtime stage body"
     return match.group("body")
+
+
+def _builder_install_command(dockerfile_text: str) -> re.Match[str]:
+    """Return the builder's only pip install transaction."""
+
+    matches = list(
+        re.finditer(
+            r"^RUN[ \t]+pip[ \t]+install\b(?:[^\n]*\\\n)*[^\n]*$",
+            dockerfile_text,
+            re.MULTILINE,
+        )
+    )
+    assert len(matches) == 1, (
+        "Builder stage must contain exactly one RUN pip install "
+        f"transaction, found {len(matches)}"
+    )
+    return matches[0]
+
+
+def _builder_install_requirements(dockerfile_text: str) -> tuple[str, ...]:
+    """Return the requirements resolved together before pip check."""
+
+    command = _builder_install_command(dockerfile_text).group()
+    normalized = re.sub(r"\\\s*\n", " ", command)
+    install_clause, separator, remainder = normalized.partition("&&")
+    assert separator and re.match(r"\s*pip\s+check\b", remainder), (
+        "The single install transaction must run pip check immediately "
+        "after dependency resolution"
+    )
+    tokens = shlex.split(install_clause)
+    assert tokens[:3] == ["RUN", "pip", "install"]
+    return tuple(tokens[3:])
 
 
 class TestBuildScriptExists:
@@ -226,40 +278,33 @@ class TestBuilderStageNatsCoreContext:
     def test_layout_gate_runs_before_pip_install(
         self, dockerfile_text: str
     ) -> None:
-        # The early-fail must precede the ``pip install`` RUN line so
-        # its diagnostic surfaces before pip emits a wall of resolution
-        # noise. We anchor on the literal ``RUN pip install
-        # .[providers]`` directive rather than the bare substring so
-        # the test is not confused by mentions of the same string in
-        # leading comments/docstrings.
-        gate_idx = dockerfile_text.find(NATS_CORE_LAYOUT_GATE)
-        pip_match = re.search(
-            r"^RUN\s+pip\s+install\s+\.\[providers,memory\]\s*$",
-            dockerfile_text,
-            re.MULTILINE,
-        )
-        assert gate_idx != -1
-        assert pip_match, (
-            "Dockerfile must declare ``RUN pip install .[providers,memory]``"
-        )
-        assert gate_idx < pip_match.start(), (
-            "Layout-validation gate must appear before the "
-            "``RUN pip install .[providers,memory]`` directive so it fails fast"
-        )
+        # Every private layout gate must fail before dependency resolution
+        # inspects any local project path.
+        install = _builder_install_command(dockerfile_text)
+        for gate in PRIVATE_LAYOUT_GATES:
+            gate_idx = dockerfile_text.find(gate)
+            assert gate_idx != -1, (
+                f"Builder stage must contain layout-validation gate {gate!r}"
+            )
+            assert gate_idx < install.start(), (
+                f"Layout-validation gate {gate!r} must run before the single "
+                "pip install transaction"
+            )
 
 
 class TestBuilderStageInstallLayer:
-    """AC-E: ``pip install .[providers,memory]`` literal-matches runbook §0.4 / §6.1."""
+    """AC-E: every private project resolves in one checked transaction."""
 
     def test_pip_install_providers_literal_match(
         self, dockerfile_text: str
     ) -> None:
-        # B3 scenario: the runbook validation steps and the Dockerfile
-        # share this exact install command. Drift here breaks the
-        # equivalence claim of FEAT-FORGE-008.
-        assert "pip install .[providers,memory]" in dockerfile_text, (
-            "Builder stage must run ``pip install .[providers,memory]`` "
-            "(literal-match to runbook §0.4 and §6.1)"
+        # One resolver invocation sees every private source, Forge's extras,
+        # and the exact SDK pin together.
+        assert _builder_install_requirements(
+            dockerfile_text
+        ) == PRIVATE_INSTALL_REQUIREMENTS, (
+            "The only pip install must resolve all private local projects and "
+            "deepagents==0.7.14 in one coherent transaction"
         )
 
     def test_fleet_memory_installed_from_buildkit_context(
@@ -276,12 +321,11 @@ class TestBuilderStageInstallLayer:
             "Builder stage must contain "
             "``COPY --from=fleet-memory / /tmp/fleet-memory``"
         )
-        assert re.search(
-            r"\b(?:uv\s+)?pip\s+install\s+(?:-e\s+)?/tmp/fleet-memory\b",
-            dockerfile_text,
+        assert (
+            "/tmp/fleet-memory" in _builder_install_requirements(dockerfile_text)
         ), (
             "Builder stage must install fleet-memory from the BuildKit "
-            "context at /tmp/fleet-memory (not from PyPI)"
+            "context in the shared dependency transaction"
         )
         assert (
             'RUN test -d /tmp/fleet-memory/src/fleet_memory '
@@ -309,12 +353,12 @@ class TestBuilderStageInstallLayer:
             "Builder stage must contain "
             "``COPY --from=guardkitfactory / /tmp/guardkitfactory``"
         )
-        assert re.search(
-            r"\b(?:uv\s+)?pip\s+install\s+(?:-e\s+)?/tmp/guardkitfactory\b",
-            dockerfile_text,
+        assert (
+            "/tmp/guardkitfactory"
+            in _builder_install_requirements(dockerfile_text)
         ), (
             "Builder stage must install guardkitfactory from the BuildKit "
-            "context at /tmp/guardkitfactory (not from PyPI)"
+            "context in the shared dependency transaction"
         )
         assert (
             'RUN test -d /tmp/guardkitfactory/src/guardkitfactory '
@@ -327,99 +371,43 @@ class TestBuilderStageInstallLayer:
     def test_guardkitfactory_installs_after_forge(
         self, dockerfile_text: str
     ) -> None:
-        # ORDER IS LOAD-BEARING and the reverse of the nats-core /
-        # fleet-memory posture. forge pins ``deepagents>=0.5.3,<0.6``;
-        # guardkitfactory requires ``deepagents>=0.6.7,<1``. The pair is
-        # unsatisfiable in one venv and pip's sequential installs make the
-        # LAST install the winner, so guardkitfactory MUST come after
-        # ``pip install .[providers,memory]`` — otherwise forge's install
-        # downgrades deepagents to 0.5.x, where ``create_deep_agent`` has no
-        # ``state_schema`` keyword (upstream 0.6.6) and the harness imports
-        # cleanly but dies at call time. See the Dockerfile comment block for
-        # the full reasoning.
-        #
-        # Ordering alone does NOT determine which deepagents lands — that is
-        # the band pin asserted by ``test_guardkitfactory_install_pins_
-        # deepagents_band`` below. Keep the two facts separate: this test
-        # says "guardkitfactory's floor wins"; that one says "and the winner
-        # is the 0.6.x the estate is actually developed against".
-        forge_match = re.search(
-            r"^RUN\s+pip\s+install\s+\.\[providers,memory\]\s*$",
-            dockerfile_text,
-            re.MULTILINE,
-        )
-        gkf_match = re.search(
-            r"^RUN\s+pip\s+install\s+/tmp/guardkitfactory\b.*$",
-            dockerfile_text,
-            re.MULTILINE,
-        )
-        assert forge_match, (
-            "Dockerfile must declare ``RUN pip install .[providers,memory]``"
-        )
-        assert gkf_match, (
-            "Dockerfile must declare ``RUN pip install /tmp/guardkitfactory``"
-        )
-        assert forge_match.start() < gkf_match.start(), (
-            "``RUN pip install /tmp/guardkitfactory`` must come AFTER "
-            "``RUN pip install .[providers,memory]`` so guardkitfactory's "
-            "deepagents>=0.6.7 floor wins the venv (forge's declared "
-            "deepagents<0.6 pin cannot be honoured at the same time)"
+        # Sequential last-install-wins overrides are forbidden. Forge and
+        # guardkitfactory must be inputs to the same resolver invocation.
+        requirements = _builder_install_requirements(dockerfile_text)
+        assert ".[providers,memory]" in requirements
+        assert "/tmp/guardkitfactory" in requirements
+        assert len(
+            re.findall(
+                r"^RUN[ \t]+pip[ \t]+install\b",
+                dockerfile_text,
+                re.MULTILINE,
+            )
+        ) == 1, (
+            "Forge and guardkitfactory must share the only pip transaction"
         )
 
     def test_guardkitfactory_install_pins_deepagents_band(
         self, dockerfile_text: str
     ) -> None:
-        # THE BARE INSTALL IS A TRAP. guardkitfactory declares
-        # ``deepagents>=0.6.7,<1``; pip resolves that to the NEWEST match on
-        # PyPI, and the band runs 0.6.7…0.6.12 then 0.7.0…0.7.3 — so a bare
-        # ``pip install /tmp/guardkitfactory`` lands 0.7.3, not the 0.6.7 the
-        # estate is developed against (guardkitfactory's own .venv carries
-        # 0.6.7).
-        #
-        # 0.7.x is a SILENT regression for the daemon: it deleted the module
-        # constant ``ASYNC_TASK_SYSTEM_PROMPT`` and changed
-        # ``AsyncSubAgentMiddleware.__init__``'s ``system_prompt`` default
-        # from that constant to ``None``. src/forge/cli/serve.py constructs
-        # ``AsyncSubAgentMiddleware(async_subagents=[spec])`` with no
-        # ``system_prompt``, so under 0.7.x the supervisor silently loses the
-        # whole async-subagent operating protocol. Nothing raises. It also
-        # cascade-upgrades langchain / langchain-core / langchain-anthropic
-        # under forge's recorded SSE contract fixtures.
-        #
-        # The image's ``state_schema`` oracle cannot catch it — that keyword
-        # exists in 0.6.7 and 0.7.3 alike (a floor probe, not a version
-        # probe). The band pin on the install line is the control; the oracle
-        # asserts it took.
-        assert re.search(
-            r"^RUN\s+pip\s+install\s+/tmp/guardkitfactory\s+"
-            r"'deepagents>=0\.6\.7,<0\.7'\s*$",
-            dockerfile_text,
-            re.MULTILINE,
-        ), (
-            "The guardkitfactory install must pin the deepagents band "
-            "explicitly — ``RUN pip install /tmp/guardkitfactory "
-            "'deepagents>=0.6.7,<0.7'``. Without it pip resolves "
-            "guardkitfactory's own ``deepagents>=0.6.7,<1`` to the newest "
-            "release (0.7.x), which silently strips the supervisor's "
-            "async-task system prompt in src/forge/cli/serve.py and "
-            "cascade-upgrades the langchain stack under forge's recorded SSE "
-            "contract fixtures"
+        requirements = _builder_install_requirements(dockerfile_text)
+        sdk_requirements = [
+            requirement
+            for requirement in requirements
+            if requirement.startswith("deepagents")
+        ]
+        assert sdk_requirements == ["deepagents==0.7.14"], (
+            "The coherent image install must pin exactly deepagents==0.7.14"
         )
 
     def test_nats_core_installed_from_buildkit_context(
         self, dockerfile_text: str
     ) -> None:
-        # Whether the recipe uses ``pip install /tmp/nats-core`` or
-        # ``uv pip install -e /tmp/nats-core`` (scoping §11.4 shape (a)),
-        # nats-core MUST be installed from the COPYed BuildKit context,
-        # not from PyPI (where the 0.2.0 wheel is malformed —
-        # TASK-FIX-F0E6).
-        assert re.search(
-            r"\b(?:uv\s+)?pip\s+install\s+(?:-e\s+)?/tmp/nats-core\b",
-            dockerfile_text,
+        # nats-core is a local input to the shared resolver transaction.
+        assert (
+            "/tmp/nats-core" in _builder_install_requirements(dockerfile_text)
         ), (
             "Builder stage must install nats-core from the BuildKit "
-            "context at /tmp/nats-core (not from PyPI)"
+            "context in the shared dependency transaction"
         )
 
     def test_pyproject_toml_not_mutated_in_layer(

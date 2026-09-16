@@ -107,15 +107,14 @@ async def _sdk_parts_from_fake_service(
     server = await asyncio.start_server(handle, "127.0.0.1", 0)
     port = server.sockets[0].getsockname()[1]
     try:
-        async with server:
-            async with get_client(url=f"http://127.0.0.1:{port}") as client:
-                parts = [
-                    part
-                    async for part in client.runs.join_stream(
-                        thread_id="thread-deepagents",
-                        run_id="run-deepagents-001",
-                    )
-                ]
+        async with server, get_client(url=f"http://127.0.0.1:{port}") as client:
+            parts = [
+                part
+                async for part in client.runs.join_stream(
+                    thread_id="thread-deepagents",
+                    run_id="run-deepagents-001",
+                )
+            ]
     finally:
         server.close()
         await server.wait_closed()

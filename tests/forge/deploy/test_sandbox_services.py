@@ -530,13 +530,13 @@ class TestTheBootstrapMakesTheVenvOnce:
         home, src, venv = sandbox["home"], sandbox["home"] / ".forge-src", sandbox["home"] / ".forge-venv"
         assert _log_lines(sandbox["log"]) == [
             f"uv venv --python python3 {venv}",
-            f"uv pip install --python {venv}/bin/python {src}/nats-core "
+            (f"uv pip install --python {venv}/bin/python {src}/nats-core "
             f"{src}/fleet-memory {src}/forge[providers,memory,sidecar] "
-            f"{src}/guardkitfactory {src}/guardkit deepagents==0.7.14",
+            f"{src}/guardkitfactory {src}/guardkit deepagents==0.7.14"),
             f"uv pip check --python {venv}/bin/python",
-            "python -c import importlib.metadata as m; import forge, guardkit, "
+            ("python -c import importlib.metadata as m; import forge, guardkit, "
             "guardkit._installer_core, guardkitfactory; assert "
-            "m.version('deepagents') == '0.7.14'",
+            "m.version('deepagents') == '0.7.14'"),
         ]
         # The copies are the tracked files at each mount's HEAD.
         for name in FACTORY_CHECKOUTS:
