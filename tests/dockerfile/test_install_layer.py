@@ -66,12 +66,18 @@ PRIVATE_INSTALL_REQUIREMENTS = (
 
 PRIVATE_LAYOUT_GATES = (
     NATS_CORE_LAYOUT_GATE,
-    'RUN test -d /tmp/fleet-memory/src/fleet_memory '
-    '|| (echo "fleet-memory layout invalid" >&2; exit 1)',
-    'RUN test -d /tmp/guardkitfactory/src/guardkitfactory '
-    '|| (echo "guardkitfactory layout invalid" >&2; exit 1)',
-    'RUN test -d /tmp/guardkit/guardkit '
-    '|| (echo "guardkit layout invalid" >&2; exit 1)',
+    (
+        'RUN test -d /tmp/fleet-memory/src/fleet_memory '
+        '|| (echo "fleet-memory layout invalid" >&2; exit 1)'
+    ),
+    (
+        'RUN test -d /tmp/guardkitfactory/src/guardkitfactory '
+        '|| (echo "guardkitfactory layout invalid" >&2; exit 1)'
+    ),
+    (
+        'RUN test -d /tmp/guardkit/guardkit '
+        '|| (echo "guardkit layout invalid" >&2; exit 1)'
+    ),
 )
 
 
@@ -150,18 +156,40 @@ def _runtime_stage_body(dockerfile_text: str) -> str:
 def _builder_install_command(dockerfile_text: str) -> re.Match[str]:
     """Return the builder's only pip install transaction."""
 
-    matches = list(
-        re.finditer(
-            r"^RUN[ \t]+pip[ \t]+install\b(?:[^\n]*\\\n)*[^\n]*$",
-            dockerfile_text,
-            re.MULTILINE,
-        )
+    builder = re.search(
+        r"^FROM\s+python:3\.14-slim-bookworm@sha256:[0-9a-f]{64}"
+        r"\s+AS\s+builder\b",
+        dockerfile_text,
+        re.MULTILINE | re.IGNORECASE,
     )
-    assert len(matches) == 1, (
-        "Builder stage must contain exactly one RUN pip install "
-        f"transaction, found {len(matches)}"
+    runtime = re.search(
+        r"^FROM\s+python:3\.14-slim-bookworm@sha256:[0-9a-f]{64}"
+        r"\s+AS\s+runtime\b",
+        dockerfile_text,
+        re.MULTILINE | re.IGNORECASE,
     )
-    return matches[0]
+    assert builder and runtime and builder.end() < runtime.start(), (
+        "Could not locate the ordered builder and runtime stages"
+    )
+
+    run_commands = re.compile(
+        r"^RUN\b(?:[^\n]*\\\n)*[^\n]*$",
+        re.MULTILINE,
+    ).finditer(dockerfile_text, builder.start(), runtime.start())
+    install_commands: list[re.Match[str]] = []
+    install_count = 0
+    for command in run_commands:
+        normalized = re.sub(r"\\\s*\n", " ", command.group())
+        count = len(re.findall(r"\bpip[ \t]+install\b", normalized))
+        install_count += count
+        if count:
+            install_commands.append(command)
+
+    assert install_count == 1 and len(install_commands) == 1, (
+        "Builder stage must contain exactly one pip install transaction, "
+        f"found {install_count}"
+    )
+    return install_commands[0]
 
 
 def _builder_install_requirements(dockerfile_text: str) -> tuple[str, ...]:
@@ -306,6 +334,57 @@ class TestBuilderStageInstallLayer:
             "The only pip install must resolve all private local projects and "
             "deepagents==0.7.14 in one coherent transaction"
         )
+
+    def test_rejects_second_install_after_pip_check_in_same_run(
+        self, dockerfile_text: str
+    ) -> None:
+        mutated = dockerfile_text.replace(
+            "&& pip check",
+            "&& pip check && pip install 'deepagents==0.6.12'",
+            1,
+        )
+        assert mutated != dockerfile_text, "Test mutation did not find pip check"
+        with pytest.raises(
+            AssertionError,
+            match="exactly one pip install transaction",
+        ):
+            _builder_install_requirements(mutated)
+
+    def test_rejects_second_python_m_pip_install_run(
+        self, dockerfile_text: str
+    ) -> None:
+        runtime = re.search(
+            r"^FROM\s+python:3\.14-slim-bookworm@sha256:[0-9a-f]{64}"
+            r"\s+AS\s+runtime\b",
+            dockerfile_text,
+            re.MULTILINE | re.IGNORECASE,
+        )
+        assert runtime, "Test mutation could not locate the runtime stage"
+        mutated = (
+            dockerfile_text[: runtime.start()]
+            + "RUN python -m pip install 'deepagents==0.6.12'\n"
+            + dockerfile_text[runtime.start() :]
+        )
+        with pytest.raises(
+            AssertionError,
+            match="exactly one pip install transaction",
+        ):
+            _builder_install_requirements(mutated)
+
+    def test_rejects_second_line_continued_pip_install(
+        self, dockerfile_text: str
+    ) -> None:
+        mutated = dockerfile_text.replace(
+            "&& pip check",
+            "&& pip check && pip \\\n        install 'deepagents==0.6.12'",
+            1,
+        )
+        assert mutated != dockerfile_text, "Test mutation did not find pip check"
+        with pytest.raises(
+            AssertionError,
+            match="exactly one pip install transaction",
+        ):
+            _builder_install_requirements(mutated)
 
     def test_fleet_memory_installed_from_buildkit_context(
         self, dockerfile_text: str
