@@ -78,6 +78,9 @@ def test_missing_or_malformed_review_fails_closed(
         ({"decision": "rejected"}, "not approved"),
         ({"criterion": "wave_sanity"}, "wrong criterion"),
         ({"criterion_score": 0.0}, "did not pass"),
+        ({"criterion_score": float("nan")}, "did not pass"),
+        ({"criterion_score": float("inf")}, "did not pass"),
+        ({"criterion_score": 1.5}, "did not pass"),
         ({"coach_verdict": "REVISE"}, "not accepting"),
         ({"reviewed_after_rewrite": "yes"}, "not boolean"),
     ],
@@ -134,3 +137,15 @@ def test_dispatcher_turns_final_review_revision_into_exact_review_argument() -> 
     )
 
     assert args["semantic_review_artifacts"] == revision
+
+
+def test_huge_integer_semantic_score_fails_closed_without_float_conversion(
+    files: dict[str, str],
+) -> None:
+    receipt = _receipt(files, criterion_score=10**10000)
+    role_output = {**files, "semantic_review.json": receipt}
+
+    review, error = PlanningRunDriver._semantic_review_of(role_output, files)
+
+    assert review is None
+    assert error is not None and "did not pass" in error
