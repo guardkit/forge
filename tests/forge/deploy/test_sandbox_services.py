@@ -1468,3 +1468,41 @@ class TestConsolidationLifecycle:
         finally:
             other.terminate()
             other.wait(timeout=10)
+
+
+def alive(pid):
+    stat = Path(f"/proc/{pid}/stat")
+    return stat.exists() and not stat.read_text().rsplit(") ", 1)[1].startswith("Z ")
+
+
+@pytest.mark.parametrize("ignore_term", [False, True])
+def test_stop_during_install_ends_installer_descendants(sandbox, tmp_path, ignore_term):
+    child_file = tmp_path / "installer-child"
+    uv = sandbox["fake_bin"] / "uv"
+    uv.write_text('#!/usr/bin/python3\nimport os, subprocess, time\nfrom pathlib import Path\np = subprocess.Popen(["/usr/bin/python3", "-c", "import signal,time; " + ("signal.signal(signal.SIGTERM, signal.SIG_IGN); " if os.environ.get("IGNORE_TERM") == "1" else "") + "time.sleep(300)"])\nPath(os.environ["CHILD_FILE"]).write_text(str(p.pid))\ntime.sleep(300)\n')
+    uv.chmod(0o755)
+    script = str(sandbox["repo"] / "deploy/sandbox-runner.sh")
+    env = _bootstrap_env(sandbox, CHILD_FILE=str(child_file), IGNORE_TERM="1" if ignore_term else "0")
+    child = None
+    with (tmp_path / "supervisor.log").open("w") as log:
+        proc = subprocess.Popen([script], env=env, stdout=log, stderr=log, start_new_session=True)
+        try:
+            _wait_for(lambda: child_file.exists())
+            child = int(child_file.read_text())
+            result = subprocess.run([script, "stop"], env=env, capture_output=True, text=True, timeout=15)
+            print("stop exit", result.returncode, "stdout", result.stdout, "stderr", result.stderr)
+            proc.wait(timeout=3)
+            time.sleep(0.2)
+            assert result.returncode == 0
+            assert not alive(child), f"stop reported success but installer child {child} remains alive"
+        finally:
+            # Own dedicated session and recorded child only; no live process matching.
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.wait(timeout=3)
+            if child and alive(child):
+                os.kill(child, signal.SIGKILL)
+            if child:
+                _wait_for(lambda: not alive(child))
