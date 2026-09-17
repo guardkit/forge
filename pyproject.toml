@@ -28,7 +28,7 @@ dependencies = [
     # langgraph-sdk>=0.4.2. Keep the SSE-sensitive SDK line bounded to 0.4.x;
     # the recorded translation fixtures are revalidated with every change.
     "langgraph-sdk>=0.4.2,<0.5",
-    "langgraph-api~=0.8.0",
+    "langgraph-api==0.14.1",
     "langchain-community>=0.4,<0.5",
     "langchain-anthropic>=1.4,<2",
     # nats-core: widened <0.7 -> <0.8 (WS2 B8, 2026-07-09). The 0.6.0 -> 0.7.0
@@ -53,7 +53,8 @@ dependencies = [
     # Major-line caps match what `pip install` resolves today; tighten if
     # the codebase starts depending on click 9.x or rich 15.x APIs.
     "click>=8.1,<9",
-    "rich>=13,<15",
+    # Required dcode 0.1.69 uses Rich 15; verify CLI formatting on this band.
+    "rich>=15,<16",
     # TASK-FRR-PEB-010: ``packaging`` powers
     # ``forge.lifecycle_bridge.version_check.check_langgraph_runner_version``'s
     # ``SpecifierSet``/``Version`` comparison. It is also a transitive
@@ -61,7 +62,8 @@ dependencies = [
     # ``setuptools``-less wheel install (or a future setuptools that
     # stops vendoring ``packaging``) does not silently break the
     # version-skew diagnostic at daemon boot.
-    "packaging>=24,<26",
+    # Required dcode 0.1.69 shares the runner environment and requires >=26.2.
+    "packaging>=26.2,<27",
 ]
 
 [project.optional-dependencies]

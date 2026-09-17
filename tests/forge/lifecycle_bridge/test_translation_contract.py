@@ -473,7 +473,7 @@ class TestPinnedSdkWireContract:
         self,
     ) -> None:
         assert version("langgraph-sdk") == "0.4.4"
-        assert version("langgraph-api") == "0.8.7"
+        assert version("langgraph-api") == "0.14.1"
         records = _load_fixture(DEEPAGENTS_RUNNER_FIXTURE)
 
         parts, request_line = await _sdk_parts_from_fake_service(records)

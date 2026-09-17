@@ -128,6 +128,9 @@ case "$1" in
     chmod 755 "$dir/bin/python"
     ;;
   pip)
+    if [ "${2:-}" = "install" ] && [ -n "${FAKE_BROKEN_RUNTIME:-}" ]; then
+      rm -f "$FAKE_BROKEN_RUNTIME"
+    fi
     py=""
     prev=""
     for arg in "$@"; do
@@ -150,11 +153,18 @@ FAKE_SERVICE = """#!/usr/bin/env bash
 # value), then stays up like a service — unless a marker in FAKE_DIE_ONCE_DIR
 # tells it to exit once, which is how "a service died" is played.
 me="$(basename "$0")"
+if [ "$me" = "python" ] && [ "${1:-}" = "-c" ]; then
+  case "${2:-}" in
+    *"sys.version"*) exec /usr/bin/python3 "$@" ;;
+  esac
+fi
 printf '%s\\n' "$me $*" >> "$FAKE_LOG"
 if [ "$me" = "python" ] && [ "${1:-}" = "-c" ]; then
   case "${2:-}" in
     *"serve("*) ;;
-    *) exit 0 ;;
+    *)
+      if [ -n "${FAKE_BROKEN_RUNTIME:-}" ] && [ -f "$FAKE_BROKEN_RUNTIME" ]; then exit 1; fi
+      exit 0 ;;
   esac
 fi
 if [ -n "${FORGE_DB_PATH+x}" ]; then db=set; else db=unset; fi
@@ -529,14 +539,14 @@ class TestTheBootstrapMakesTheVenvOnce:
         assert result.returncode == 0, result.stdout + result.stderr
         home, src, venv = sandbox["home"], sandbox["home"] / ".forge-src", sandbox["home"] / ".forge-venv"
         assert _log_lines(sandbox["log"]) == [
-            f"uv venv --python python3 {venv}",
+            f"uv venv --python /usr/bin/python3 {venv}",
             (f"uv pip install --python {venv}/bin/python {src}/nats-core "
             f"{src}/fleet-memory {src}/forge[providers,memory,sidecar] "
-            f"{src}/guardkitfactory {src}/guardkit deepagents==0.7.14"),
+            f"{src}/guardkitfactory {src}/guardkit[autobuild] deepagents==0.7.14 deepagents-code==0.1.69"),
             f"uv pip check --python {venv}/bin/python",
             ("python -c import importlib.metadata as m; import forge, guardkit, "
-            "guardkit._installer_core, guardkitfactory; assert "
-            "m.version('deepagents') == '0.7.14'"),
+            "guardkit._installer_core, guardkitfactory, deepagents_code, claude_agent_sdk; assert "
+            "m.version('deepagents') == '0.7.14'; assert m.version('deepagents-code') == '0.1.69'"),
         ]
         # The copies are the tracked files at each mount's HEAD.
         for name in FACTORY_CHECKOUTS:
@@ -557,7 +567,10 @@ class TestTheBootstrapMakesTheVenvOnce:
         second = _bootstrap_only(sandbox)
 
         assert second.returncode == 0, second.stdout + second.stderr
-        assert _log_lines(sandbox["log"]) == []
+        lines = _log_lines(sandbox["log"])
+        assert len(lines) == 2
+        assert lines[0].startswith("uv pip check ")
+        assert "deepagents_code" in lines[1]
         assert "venv already at" in second.stdout
         assert "install already matches the copies" in second.stdout
         assert second.stdout.count("copy already at") == len(FACTORY_CHECKOUTS)
@@ -1365,3 +1378,93 @@ class TestTheLedgerInventory:
         assert "writes it nowhere" in section
         assert "forge-prod is its only writer" in section
         assert "deploy/sandbox-runner.sh` unsets\n`FORGE_DB_PATH`" in section
+
+
+class TestConsolidationRuntimeReuse:
+    def test_missing_dcode_rejects_reuse_and_reinstalls(self, sandbox, tmp_path):
+        assert _bootstrap_only(sandbox).returncode == 0
+        missing = tmp_path / "missing-dcode"
+        missing.touch()
+        result = _bootstrap_only(sandbox, FAKE_BROKEN_RUNTIME=str(missing))
+        assert result.returncode == 0, result.stdout + result.stderr
+        lines = _log_lines(sandbox["log"])
+        assert sum(line.startswith("uv pip install ") for line in lines) == 1
+        assert not missing.exists()
+        assert "deepagents-code==0.1.69" in "\n".join(lines)
+
+    def test_changed_dependency_metadata_invalidates_reuse(self, sandbox):
+        assert _bootstrap_only(sandbox).returncode == 0
+        metadata = sandbox["home"] / ".forge-src/guardkitfactory/pyproject.toml"
+        metadata.write_text(metadata.read_text() + '\ndependencies = ["changed"]\n')
+        result = _bootstrap_only(sandbox)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert any(line.startswith("uv pip install ") for line in _log_lines(sandbox["log"]))
+
+    def test_changed_interpreter_retains_old_environment_and_rebuilds(self, sandbox):
+        assert _bootstrap_only(sandbox).returncode == 0
+        python = sandbox["home"] / ".forge-venv/bin/python"
+        python.write_text('#!/bin/sh\nprintf "old-interpreter\\n"\n')
+        python.chmod(0o755)
+        result = _bootstrap_only(sandbox)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert any(line.startswith("uv venv ") for line in _log_lines(sandbox["log"]))
+        assert len(list(sandbox["home"].glob(".forge-venv.previous.*"))) == 1
+
+
+class TestConsolidationLifecycle:
+    def test_stop_never_installs_even_without_mounts(self, sandbox):
+        shutil.rmtree(sandbox["estate"] / "guardkitfactory")
+        result = subprocess.run(
+            [str(sandbox["repo"] / "deploy/sandbox-runner.sh"), "stop"],
+            env=_bootstrap_env(sandbox), capture_output=True, text=True, timeout=10,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert _log_lines(sandbox["log"]) == []
+        assert not (sandbox["home"] / ".forge-venv").exists()
+
+    def test_repeated_start_has_one_supervisor_and_stop_ends_descendants(self, sandbox, tmp_path):
+        script = str(sandbox["repo"] / "deploy/sandbox-runner.sh")
+        children = tmp_path / "children"
+        fake = sandbox["fake_bin"] / "fake-service"
+        fake.write_text(fake.read_text().replace(
+            "exec sleep 300", 'sleep 300 &\nprintf "%s\\n" "$!" >> "$FAKE_CHILDREN"\nwait'
+        ))
+        env = _bootstrap_env(sandbox, FAKE_CHILDREN=str(children))
+        with (tmp_path / "runner.log").open("w") as log:
+            proc = subprocess.Popen([script], env=env, stdout=log, stderr=log, start_new_session=True)
+            try:
+                _wait_for(lambda: children.exists() and len(children.read_text().splitlines()) == 2)
+                before = _log_lines(sandbox["log"])
+                again = subprocess.run([script], env=env, capture_output=True, text=True, timeout=10)
+                assert again.returncode == 0
+                assert "already running" in again.stdout
+                assert _log_lines(sandbox["log"]) == before
+                child_pids = [int(pid) for pid in children.read_text().splitlines()]
+                stopped = subprocess.run([script, "stop"], env=env, capture_output=True, text=True, timeout=15)
+                assert stopped.returncode == 0, stopped.stdout + stopped.stderr
+                assert proc.wait(timeout=10) == 0
+                for pid in child_pids:
+                    stat = Path(f"/proc/{pid}/stat")
+                    assert not stat.exists() or stat.read_text().split(") ", 1)[1].startswith("Z ")
+                assert _log_lines(sandbox["log"]) == before
+            finally:
+                if proc.poll() is None:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                    proc.wait(timeout=15)
+
+    def test_wrong_process_record_never_signals_unrelated_process(self, sandbox):
+        import hashlib
+        script = str(sandbox["repo"] / "deploy/sandbox-runner.sh")
+        state = sandbox["home"] / ".forge-runner" / hashlib.sha256(str(sandbox["repo"]).encode()).hexdigest()
+        state.mkdir(parents=True)
+        other = subprocess.Popen(["sleep", "60"])
+        try:
+            token = Path(f"/proc/{other.pid}/stat").read_text().rsplit(") ", 1)[1].split()[19]
+            (state / "supervisor").write_text(f"{other.pid} {token}\n")
+            result = subprocess.run([script, "stop"], env=_bootstrap_env(sandbox), capture_output=True, text=True, timeout=10)
+            assert result.returncode == 0
+            assert "stale" in result.stdout
+            assert other.poll() is None
+        finally:
+            other.terminate()
+            other.wait(timeout=10)
