@@ -95,7 +95,7 @@ class LangGraphVersionMismatchError(RuntimeError):
     Attributes:
         expected_range: The :class:`packaging.specifiers.SpecifierSet`
             string the bridge was built against.
-        observed_version: The version string the sidecar's ``/version``
+        observed_version: The version string the sidecar's ``/info``
             endpoint returned.
     """
 
@@ -118,12 +118,12 @@ def _default_fetch(url: str, timeout_seconds: float) -> str:
 
     The endpoint is expected to return either a bare version string or a
     JSON object with a ``"version"`` key (the convention used by the
-    langgraph-api ``/version`` endpoint). Any other shape is forwarded
+    langgraph-api ``/info`` endpoint). Any other shape is forwarded
     verbatim and the caller's :class:`packaging.version.Version` parser
     decides whether it is acceptable.
 
     Args:
-        url: The fully-qualified ``/version`` URL.
+        url: The fully-qualified ``/info`` URL.
         timeout_seconds: Per-request timeout. ``socket.timeout`` /
             :class:`TimeoutError` propagate out so the caller can
             decide whether to fail-fast or defer.
@@ -152,7 +152,7 @@ def _default_fetch(url: str, timeout_seconds: float) -> str:
     if isinstance(decoded, str):
         return decoded.strip()
     raise ValueError(
-        f"Unexpected /version payload shape from {url!r}: {body!r}"
+        f"Unexpected /info payload shape from {url!r}: {body!r}"
     )
 
 
@@ -161,13 +161,13 @@ def _default_fetch(url: str, timeout_seconds: float) -> str:
 # CODE-stale sidecar
 # ---------------------------------------------------------------------------
 #
-# This diagnostic catches *package*-version skew: the sidecar's ``/version``
+# This diagnostic catches *package*-version skew: the sidecar's ``/info``
 # endpoint reports the ``langgraph-api`` SDK version, which we compare against
 # LANGGRAPH_API_SUPPORTED_RANGE. It CANNOT catch a sidecar that is running a
 # stale checkout of *forge's own* graph code (the B4 round-17 failure mode: a
 # ``--no-reload`` sidecar served July-3 ``autobuild_runner.py`` for days while
 # the package version was unchanged). The reason it cannot be cheaply extended
-# to catch that: ``/version`` is a langgraph-api-owned endpoint that reports
+# to catch that: ``/info`` is a langgraph-api-owned endpoint that reports
 # only the SDK package version — it has no knowledge of the forge git rev of
 # the graph modules the SDK imports, and those bytes are identical-versioned
 # whether fresh or months old. Surfacing forge's code rev here would require
@@ -198,9 +198,9 @@ def check_langgraph_runner_version(
     +----------------------------------+------------------------------------+
     | Sidecar response                 | Outcome                            |
     +==================================+====================================+
-    | In-range version (e.g. 0.8.7)    | Returns ``None`` silently.         |
+    | In-range version (e.g. 0.14.1)    | Returns ``None`` silently.         |
     +----------------------------------+------------------------------------+
-    | Out-of-range version (e.g. 0.9.0)| Prints AC-4 diagnostic to stderr   |
+    | Out-of-range version (e.g. 0.15.0)| Prints AC-4 diagnostic to stderr   |
     |                                  | **and** raises                     |
     |                                  | :class:`LangGraphVersionMismatchError`. |
     +----------------------------------+------------------------------------+
@@ -217,7 +217,7 @@ def check_langgraph_runner_version(
 
     Args:
         sidecar_url: Base URL of the langgraph-runner sidecar (without
-            the ``/version`` suffix). Trailing slashes are normalised.
+            the ``/info`` suffix). Trailing slashes are normalised.
         supported_range: Override the module-level
             :data:`LANGGRAPH_API_SUPPORTED_RANGE` for tests / future
             callers that need a tighter window.
@@ -237,7 +237,7 @@ def check_langgraph_runner_version(
             "check_langgraph_runner_version: sidecar_url must be non-empty"
         )
 
-    url = sidecar_url.rstrip("/") + "/version"
+    url = sidecar_url.rstrip("/") + "/info"
     err_stream = stderr if stderr is not None else sys.stderr
 
     # ---- Fetch ----------------------------------------------------------
