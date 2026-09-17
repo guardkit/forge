@@ -45,6 +45,7 @@ import hashlib
 import inspect
 import json
 import logging
+import math
 import os
 import re
 import subprocess
@@ -8901,7 +8902,9 @@ class PlanningRunDriver:
         if (
             isinstance(score, bool)
             or not isinstance(score, (int, float))
-            or not 0.5 <= float(score) <= 1.0
+            or (isinstance(score, float) and not math.isfinite(score))
+            or score < 0.5
+            or score > 1.0
         ):
             return None, "request_traceability did not pass"
         if parsed.get("coach_verdict") not in {"ACCEPTABLE", "GOOD"}:
