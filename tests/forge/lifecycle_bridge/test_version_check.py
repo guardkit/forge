@@ -84,10 +84,10 @@ class TestSupportedRangeConstant:
     def test_constant_parses_as_specifier_set(self) -> None:
         # Smoke check — the constant is a valid SpecifierSet expression.
         spec = SpecifierSet(LANGGRAPH_API_SUPPORTED_RANGE)
-        # The active range used at design time is ``>=0.8.5,<0.9``;
+        # The consolidated runtime pins ``==0.14.1``;
         # update both the constant and this canary together if the
         # supported range changes.
-        assert "0.8.7" in spec
+        assert "0.14.1" in spec
         assert "0.9.0" not in spec
         assert "0.8.4" not in spec
 
@@ -108,7 +108,7 @@ class TestVersionInRange:
 
     def test_in_range_returns_silently(self) -> None:
         stderr = io.StringIO()
-        fetch = _make_fetch(version="0.8.7")
+        fetch = _make_fetch(version="0.14.1")
         # No exception, no stderr writes.
         check_langgraph_runner_version(
             "http://localhost:2024",
@@ -118,7 +118,7 @@ class TestVersionInRange:
         assert stderr.getvalue() == ""
 
     def test_fetch_is_called_with_version_endpoint(self) -> None:
-        fetch = _make_fetch(version="0.8.5")
+        fetch = _make_fetch(version="0.14.1")
         check_langgraph_runner_version(
             "http://localhost:2024",
             fetch=fetch,
@@ -131,7 +131,7 @@ class TestVersionInRange:
         assert timeout == DEFAULT_VERSION_CHECK_TIMEOUT_SECONDS
 
     def test_trailing_slash_in_sidecar_url_is_normalised(self) -> None:
-        fetch = _make_fetch(version="0.8.5")
+        fetch = _make_fetch(version="0.14.1")
         check_langgraph_runner_version(
             "http://localhost:2024/",
             fetch=fetch,
@@ -148,7 +148,7 @@ class TestVersionInRange:
         # so the JSON-decoding lives in the default fetch implementation
         # and the unit test here only needs to verify that a stripped
         # bare version string is accepted.
-        fetch = _make_fetch(version="0.8.6")
+        fetch = _make_fetch(version="0.14.1")
         check_langgraph_runner_version(
             "http://localhost:2024",
             fetch=fetch,
@@ -223,13 +223,13 @@ class TestVersionMismatch:
         # The default range is the module constant, but tests / future
         # callers can pass ``supported_range=...`` to lock to a tighter
         # window without monkeypatching the module constant.
-        fetch = _make_fetch(version="0.8.7")
+        fetch = _make_fetch(version="0.14.1")
         with pytest.raises(LangGraphVersionMismatchError):
             check_langgraph_runner_version(
                 "http://localhost:2024",
                 fetch=fetch,
                 stderr=io.StringIO(),
-                supported_range=">=0.9,<1.0",
+                supported_range="==0.8.7",
             )
 
 
@@ -314,7 +314,7 @@ class TestBridgeIntegration:
     def test_in_range_sidecar_constructs_cleanly(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        fetch = _make_fetch(version="0.8.7")
+        fetch = _make_fetch(version="0.14.1")
         # Patch the bridge's view of check_langgraph_runner_version to
         # inject the stub fetch — keeps the bridge call site honest.
         from forge.lifecycle_bridge import bridge as bridge_mod

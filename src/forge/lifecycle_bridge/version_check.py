@@ -63,11 +63,11 @@ __all__ = [
 # AC-1: declared support range. Keep in sync with the
 # ``langgraph``/``langgraph-api`` pin in ``pyproject.toml``. The active
 # `langgraph` dep is ``>=1.1,<2`` but the *runner* (``langgraph-api``)
-# tracks a separate cadence; ``>=0.8.5,<0.9`` reflects the sidecar
-# version current at task design (TASK-FRR-PEB-010, 2026-05-06). When
-# the sidecar moves to 0.9, update both this constant and the
-# ``pyproject.toml`` extra in lock-step.
-LANGGRAPH_API_SUPPORTED_RANGE: str = ">=0.8.5,<0.9"
+# tracks a separate cadence; ``==0.14.1`` reflects the dcode-compatible sidecar
+# version required by dcode 0.1.69 (consolidation, 2026-09-17). Keep
+# this constant and pyproject metadata in lock-step; replay stream
+# fixtures and verify the actual runner before changing either.
+LANGGRAPH_API_SUPPORTED_RANGE: str = "==0.14.1"
 
 
 # Test-requirement: the version check uses a 5s timeout so a

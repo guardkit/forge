@@ -93,6 +93,96 @@ cd "${REPO_ROOT}"
 
 log() { printf '[sandbox-runner.sh] %s\n' "$*"; }
 
+# The process record belongs to this exact checkout. Handle stop before mounts,
+# installation or startup: systemd invokes this even when a held session drops.
+SCRIPT_PATH="${SCRIPT_DIR}/$(basename "${BASH_SOURCE[0]}")"
+STATE_ROOT="${HOME}/.forge-runner/$(printf '%s' "${REPO_ROOT}" | sha256sum | cut -d' ' -f1)"
+PID_FILE="${STATE_ROOT}/supervisor"
+SIDECAR_PID=""
+RUNNER_PID=""
+proc_token() {
+  local stat
+  [[ -r "/proc/$1/stat" ]] || return 1
+  stat="$(cat "/proc/$1/stat")" || return 1
+  # Drop pid/comm; comm can contain spaces and parentheses. starttime is field 22.
+  printf '%s\n' "${stat##*) }" | awk '{print $20}'
+}
+owned_supervisor() {
+  local pid="$1" token="$2" arg
+  [[ "$pid" =~ ^[0-9]+$ && "$pid" != "$$" ]] || return 1
+  [[ "$(proc_token "$pid")" == "$token" ]] || return 1
+  while IFS= read -r -d '' arg; do
+    [[ "$arg" == */* ]] || continue
+    if [[ "$(realpath -m "/proc/$pid/cwd/$arg" 2>/dev/null)" == "$SCRIPT_PATH" ||
+          "$arg" == "$SCRIPT_PATH" ]]; then
+      return 0
+    fi
+  done < "/proc/$pid/cmdline"
+  return 1
+}
+terminate_tree() {
+  local pid="$1" token child
+  token="$(proc_token "$pid")" || return 0
+  kill -TERM "$pid" 2>/dev/null || true
+  while read -r child; do
+    [[ -n "$child" ]] && terminate_tree "$child"
+  done < <(ps -o pid= --ppid "$pid" 2>/dev/null || true)
+  [[ "$(proc_token "$pid")" == "$token" ]] && kill -TERM "$pid" 2>/dev/null || true
+}
+case "${1:-start}" in
+  stop)
+    if [[ ! -r "$PID_FILE" ]]; then log "no owned supervisor to stop"; exit 0; fi
+    read -r owner token < "$PID_FILE"
+    if ! owned_supervisor "$owner" "$token"; then
+      log "stale supervisor record; no matching process was signalled"
+      exit 0
+    fi
+    log "stopping owned supervisor $owner and its children"
+    terminate_tree "$owner"
+    for ((i=0; i<100; i++)); do
+      if ! owned_supervisor "$owner" "$token"; then exit 0; fi
+      sleep 0.1
+    done
+    log "FATAL: owned supervisor did not stop within ten seconds"
+    exit 1
+    ;;
+  start) ;;
+  *) log "usage: $0 [start|stop]"; exit 2 ;;
+esac
+mkdir -p "$STATE_ROOT"
+exec 9>"${STATE_ROOT}/lock"
+if ! flock -n 9; then
+  log "an owned supervisor or bootstrap is already running"
+  exit 0
+fi
+printf '%s %s\n' "$$" "$(proc_token $$)" > "${PID_FILE}.tmp"
+mv "${PID_FILE}.tmp" "$PID_FILE"
+stop_services() {
+  local pid
+  [[ -n "$SIDECAR_PID$RUNNER_PID" ]] || return 0
+  for pid in "$SIDECAR_PID" "$RUNNER_PID"; do
+    if [[ -n "$pid" ]]; then
+      # Each service starts its own session, including its descendants.
+      kill -TERM -- "-$pid" 2>/dev/null || true
+    fi
+  done
+  for ((i=0; i<50; i++)); do
+    if ! kill -0 -- "-${SIDECAR_PID:-0}" 2>/dev/null &&
+       ! kill -0 -- "-${RUNNER_PID:-0}" 2>/dev/null; then break; fi
+    sleep 0.1
+  done
+  for pid in "$SIDECAR_PID" "$RUNNER_PID"; do
+    [[ -n "$pid" ]] && kill -KILL -- "-$pid" 2>/dev/null || true
+  done
+  wait 2>/dev/null || true
+}
+cleanup() {
+  stop_services
+  rm -f "$PID_FILE"
+}
+trap cleanup EXIT
+trap 'log "asked to stop; stopping both services"; exit 0' TERM INT
+
 # --- step 1: the settings ---------------------------------------------------
 ESTATE_ROOT="$(cd "${REPO_ROOT}/.." && pwd)"
 FORGE_MOUNT="${SANDBOX_FORGE_PATH:-${ESTATE_ROOT}/forge}"
@@ -104,6 +194,7 @@ BIND="${SANDBOX_RUNNER_BIND:-0.0.0.0}"
 SIDECAR_PORT="${SANDBOX_SIDECAR_PORT:-8125}"
 RUNNER_PORT="${SANDBOX_RUNNER_PORT:-8124}"
 RESTART_SECONDS="${SANDBOX_RUNNER_RESTART_SECONDS:-5}"
+FACTORY_PYTHON="${SANDBOX_RUNNER_PYTHON:-/usr/bin/python3}"
 # The mounts, by name, in install order. Each must be a git checkout.
 MOUNT_NAMES=(forge guardkit "${ESTATE_SIBLINGS[@]}")
 mount_path_of() {
@@ -164,38 +255,53 @@ done
 # venv is pinned by guardkit to the floor of that repository's requires-python,
 # which the sandbox's Python may be newer than. Exporting it made every work
 # leg inside api_test's sandbox fail for want of an interpreter on 2026-09-08.
+# Interpreter identity includes the resolved base executable and complete version.
+# A replaced interpreter or changed dependency request cannot reuse the old stamp.
+IDENTITY_CODE='import json, os, sys; assert sys.version_info >= (3, 12); print(json.dumps([os.path.realpath(getattr(sys, "_base_executable", sys.executable)), sys.version]))'
+python_identity="$($FACTORY_PYTHON -c "$IDENTITY_CODE")"
+if [[ -x "${VENV}/bin/python" ]] &&
+   [[ "$("${VENV}/bin/python" -c "$IDENTITY_CODE" 2>/dev/null || true)" != "$python_identity" ]]; then
+  log "interpreter changed; retaining the previous venv before replacement"
+  mv "$VENV" "${VENV}.previous.$(date +%s).$$"
+fi
 if [[ -x "${VENV}/bin/python" ]]; then
   log "venv already at ${VENV}"
 else
-  log "making the venv at ${VENV} from the sandbox's python3 with $(command -v uv)"
-  UV_PYTHON_DOWNLOADS=never uv venv --python python3 "${VENV}"
+  log "making the venv at ${VENV} from ${FACTORY_PYTHON}"
+  UV_PYTHON_DOWNLOADS=never uv venv --python "$FACTORY_PYTHON" "${VENV}"
 fi
 
-# --- step 4: the install, when a copy changed ------------------------------
-# The stamp is the commits every copy was made from, so a changed copy means a
-# fresh install and an unchanged set means none.
 INSTALL_STAMP="${VENV}/.forge-installed"
-wanted=""
+VERIFY_CODE="import importlib.metadata as m; import forge, guardkit, guardkit._installer_core, guardkitfactory, deepagents_code, claude_agent_sdk; assert m.version('deepagents') == '0.7.14'; assert m.version('deepagents-code') == '0.1.69'"
+verify_install() {
+  uv pip check --python "${VENV}/bin/python" &&
+    "${VENV}/bin/python" -c "$VERIFY_CODE"
+}
+wanted="python=$python_identity request=forge[providers,memory,sidecar],guardkit[autobuild],deepagents==0.7.14,deepagents-code==0.1.69 "
 for name in "${MOUNT_NAMES[@]}"; do
   wanted="${wanted}${name}=$(cat "${SRC_ROOT}/${name}.commit") "
+  for metadata in pyproject.toml uv.lock; do
+    if [[ -f "${SRC_ROOT}/${name}/${metadata}" ]]; then
+      wanted="${wanted}${name}/${metadata}=$(sha256sum "${SRC_ROOT}/${name}/${metadata}" | cut -d' ' -f1) "
+    fi
+  done
 done
-if [[ -f "${INSTALL_STAMP}" && "$(cat "${INSTALL_STAMP}")" == "${wanted}" ]]; then
-  log "install already matches the copies"
+if [[ -f "${INSTALL_STAMP}" && "$(cat "${INSTALL_STAMP}")" == "${wanted}" ]] && verify_install; then
+  log "install already matches the copies and verified runtime"
 else
+  rm -f "$INSTALL_STAMP"
   log "installing the factory's code into ${VENV} from the copies"
   uv pip install --python "${VENV}/bin/python" \
     "${SRC_ROOT}/nats-core" \
     "${SRC_ROOT}/fleet-memory" \
     "${SRC_ROOT}/forge[providers,memory,sidecar]" \
     "${SRC_ROOT}/guardkitfactory" \
-    "${SRC_ROOT}/guardkit" \
-    'deepagents==0.7.14'
-  uv pip check --python "${VENV}/bin/python"
-  "${VENV}/bin/python" -c "import importlib.metadata as m; import forge, guardkit, guardkit._installer_core, guardkitfactory; assert m.version('deepagents') == '0.7.14'"
-  # guardkit's console script is guardkit-py; the runner shells `guardkit`.
+    "${SRC_ROOT}/guardkit[autobuild]" \
+    'deepagents==0.7.14' 'deepagents-code==0.1.69'
+  verify_install
   ln -sfn guardkit-py "${VENV}/bin/guardkit"
   printf '%s' "${wanted}" >"${INSTALL_STAMP}"
-  log "install proven: coherent dependencies, imports and deepagents 0.7.14"
+  log "install proven: coherent dependencies, SDK 0.7.14 and dcode 0.1.69"
 fi
 
 if [[ "${SANDBOX_RUNNER_BOOTSTRAP_ONLY:-}" == "1" ]]; then
@@ -232,8 +338,6 @@ for name in OPENAI_BASE_URL OPENAI_API_KEY FORGE_CONFIG_PATH FORGE_NATS_URL FORG
   fi
 done
 
-SIDECAR_PID=""
-RUNNER_PID=""
 
 # The deploy sidecar, through the same function `python -m forge.deploy_sidecar`
 # runs, but bound on every interface inside the sandbox rather than its
@@ -241,7 +345,7 @@ RUNNER_PID=""
 start_sidecar() {
   log "starting the deploy sidecar on ${BIND}:${SIDECAR_PORT}"
   SANDBOX_RUNNER_BIND="${BIND}" FORGE_DEPLOY_SIDECAR_PORT="${SIDECAR_PORT}" \
-    "${VENV}/bin/python" -c 'import os; from forge.deploy_sidecar.service import serve; serve(host=os.environ["SANDBOX_RUNNER_BIND"], port=int(os.environ["FORGE_DEPLOY_SIDECAR_PORT"]))' &
+    setsid "${VENV}/bin/python" -c 'import os; from forge.deploy_sidecar.service import serve; serve(host=os.environ["SANDBOX_RUNNER_BIND"], port=int(os.environ["FORGE_DEPLOY_SIDECAR_PORT"]))' 9>&- &
   SIDECAR_PID=$!
 }
 
@@ -253,28 +357,17 @@ start_runner() {
   log "starting the build runner on ${BIND}:${RUNNER_PORT}"
   (
     cd "${SRC_ROOT}/forge" &&
-      exec "${VENV}/bin/langgraph" dev \
+      exec setsid "${VENV}/bin/langgraph" dev \
         --config forge.langgraph.json \
         --host "${BIND}" \
         --port "${RUNNER_PORT}" \
         --no-browser \
         --no-reload \
         --allow-blocking
-  ) &
+  ) 9>&- &
   RUNNER_PID=$!
 }
 
-stop_services() {
-  local pid
-  for pid in "${SIDECAR_PID}" "${RUNNER_PID}"; do
-    if [[ -n "${pid}" ]]; then
-      kill "${pid}" 2>/dev/null || true
-    fi
-  done
-  wait 2>/dev/null || true
-}
-
-trap 'log "asked to stop; stopping both services"; stop_services; exit 0' TERM INT
 
 start_sidecar
 start_runner
