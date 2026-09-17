@@ -5,7 +5,7 @@ Acceptance-criteria coverage map:
 * AC-1: ``LANGGRAPH_API_SUPPORTED_RANGE`` is declared and parses cleanly
   with :class:`packaging.specifiers.SpecifierSet` —
   :class:`TestSupportedRangeConstant`.
-* AC-2: :class:`LifecycleBridge` calls ``/version`` at construction
+* AC-2: :class:`LifecycleBridge` calls ``/info`` at construction
   (before ``recover_in_flight``) when ``sidecar_url`` is supplied —
   :class:`TestBridgeIntegration`.
 * AC-3: An out-of-range observed version raises
@@ -54,7 +54,7 @@ def _make_fetch(
     Either ``version`` (return value) or ``raise_exc`` (exception to raise)
     must be supplied. The returned callable records the URL it was called
     with on the ``calls`` list attribute so tests can assert the
-    ``/version`` URL was contacted.
+    ``/info`` URL was contacted.
     """
     calls: list[tuple[str, float]] = []
 
@@ -126,8 +126,8 @@ class TestVersionInRange:
         )
         assert len(fetch.calls) == 1  # type: ignore[attr-defined]
         url, timeout = fetch.calls[0]  # type: ignore[attr-defined]
-        # The /version path is appended; trailing slashes are normalised.
-        assert url.endswith("/version")
+        # The /info path is appended; trailing slashes are normalised.
+        assert url.endswith("/info")
         assert timeout == DEFAULT_VERSION_CHECK_TIMEOUT_SECONDS
 
     def test_trailing_slash_in_sidecar_url_is_normalised(self) -> None:
@@ -138,12 +138,12 @@ class TestVersionInRange:
             stderr=io.StringIO(),
         )
         url, _ = fetch.calls[0]  # type: ignore[attr-defined]
-        # No double slash before "version".
-        assert "//version" not in url
-        assert url.endswith("/version")
+        # No double slash before "info".
+        assert "//info" not in url
+        assert url.endswith("/info")
 
     def test_accepts_dict_payload_with_version_key(self) -> None:
-        # The convention for /version endpoints is ``{"version": "X.Y.Z"}``
+        # The convention for /info endpoints is ``{"version": "X.Y.Z"}``
         # — but our fetch contract is to return the bare version string,
         # so the JSON-decoding lives in the default fetch implementation
         # and the unit test here only needs to verify that a stripped
