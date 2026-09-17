@@ -330,7 +330,9 @@ fi
 
 # --- step 5: the two services, kept running ---------------------------------
 export PATH="${VENV}/bin:${PATH}"
-export FORGE_GUARDKIT_PATH="${VENV}/bin/guardkit"
+# An explicit path can be a reviewed namespace/evaluation launcher. Preserve it;
+# ordinary runners still use the GuardKit installed in this coherent venv.
+export FORGE_GUARDKIT_PATH="${FORGE_GUARDKIT_PATH:-${VENV}/bin/guardkit}"
 export GUARDKIT_HARNESS="${GUARDKIT_HARNESS:-langgraph}"
 # This sidecar is the one INSIDE a repository's sandbox, and it says so. The
 # deploy stage sends it the repository's own deploy/deploy.sh rather than the

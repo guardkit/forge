@@ -703,6 +703,43 @@ class TestTheBootstrapKeepsBothServicesUp:
         # Names only, never a value.
         assert "forge-prod-state" not in stdout
 
+    def test_explicit_guardkit_launcher_reaches_both_services(self, sandbox, tmp_path):
+        launcher = tmp_path / "reviewed-guardkit-launcher"
+        launcher.write_text("#!/bin/sh\n", encoding="utf-8")
+        launcher.chmod(0o755)
+        sandbox["log"].write_text("", encoding="utf-8")
+        stdout_path = tmp_path / "bootstrap-explicit-guardkit.out"
+
+        with stdout_path.open("w", encoding="utf-8") as out:
+            proc = subprocess.Popen(
+                [str(sandbox["repo"] / "deploy" / "sandbox-runner.sh")],
+                cwd=sandbox["repo"],
+                env=_bootstrap_env(sandbox, FORGE_GUARDKIT_PATH=str(launcher)),
+                stdout=out,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+            try:
+
+                def both_reported() -> bool:
+                    lines = _log_lines(sandbox["log"])
+                    return any(line.startswith("env langgraph ") for line in lines) and any(
+                        line.startswith("env python ") for line in lines
+                    )
+
+                _wait_for(both_reported)
+            finally:
+                os.killpg(proc.pid, signal.SIGTERM)
+                proc.wait(timeout=15)
+
+        service_env = [
+            line
+            for line in _log_lines(sandbox["log"])
+            if line.startswith(("env langgraph ", "env python "))
+        ]
+        assert len(service_env) == 2
+        assert all(f"FORGE_GUARDKIT_PATH={launcher}" in line for line in service_env)
+
 
 class TestUvsDownloadSwitchStaysWithTheVenvCommand:
     """The switch that forbids uv to fetch an interpreter belongs to the one
