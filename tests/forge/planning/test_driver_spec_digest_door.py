@@ -297,15 +297,31 @@ def _spec_reply(
 
 
 def _plan_reply(feature_id: str) -> Any:
+    plan_files = {
+        f".guardkit/features/{feature_id}.yaml": (
+            f"id: {feature_id}\ntasks:\n- id: TASK-VER-001\n"
+        ),
+        f"tasks/backlog/{SLUG}/TASK-VER-001.md": "# task\n",
+    }
     return SimpleNamespace(
         outcome=SimpleNamespace(value="completed"),
         role_output={
-            f".guardkit/features/{feature_id}.yaml": (
-                f"id: {feature_id}\ntasks:\n- id: TASK-VER-001\n"
-            ),
-            f"tasks/backlog/{SLUG}/TASK-VER-001.md": "# task\n",
+            **plan_files,
             "validation.json": json.dumps(
                 {"accepted": True, "errors": [], "gates_run": ["feature_validate"]}
+            ),
+            "semantic_review.json": json.dumps(
+                {
+                    "schema_version": 1,
+                    "decision": "approved",
+                    "criterion": "request_traceability",
+                    "criterion_score": 1.0,
+                    "coach_verdict": "GOOD",
+                    "artifact_identity": PlanningRunDriver._plan_artifact_identity(
+                        plan_files
+                    ),
+                    "reviewed_after_rewrite": False,
+                }
             ),
         },
         reason=None,
