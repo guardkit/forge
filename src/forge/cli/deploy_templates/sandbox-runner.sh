@@ -100,6 +100,7 @@ STATE_ROOT="${HOME}/.forge-runner/$(printf '%s' "${REPO_ROOT}" | sha256sum | cut
 PID_FILE="${STATE_ROOT}/supervisor"
 SIDECAR_PID=""
 RUNNER_PID=""
+BOOTSTRAP_PID=""
 proc_token() {
   local stat
   [[ -r "/proc/$1/stat" ]] || return 1
@@ -123,7 +124,7 @@ owned_supervisor() {
 terminate_tree() {
   local pid="$1" token child
   token="$(proc_token "$pid")" || return 0
-  kill -TERM "$pid" 2>/dev/null || true
+  # Enumerate and stop children before their parent can exit and orphan them.
   while read -r child; do
     [[ -n "$child" ]] && terminate_tree "$child"
   done < <(ps -o pid= --ppid "$pid" 2>/dev/null || true)
@@ -138,7 +139,11 @@ case "${1:-start}" in
       exit 0
     fi
     log "stopping owned supervisor $owner and its children"
+    # Freeze restart decisions while its children are signalled; then resume
+    # the validated supervisor to run its TERM/EXIT cleanup.
+    kill -STOP "$owner" 2>/dev/null || true
     terminate_tree "$owner"
+    [[ "$(proc_token "$owner")" == "$token" ]] && kill -CONT "$owner" 2>/dev/null || true
     for ((i=0; i<100; i++)); do
       if ! owned_supervisor "$owner" "$token"; then exit 0; fi
       sleep 0.1
@@ -158,23 +163,37 @@ fi
 printf '%s %s\n' "$$" "$(proc_token $$)" > "${PID_FILE}.tmp"
 mv "${PID_FILE}.tmp" "$PID_FILE"
 stop_services() {
-  local pid
-  [[ -n "$SIDECAR_PID$RUNNER_PID" ]] || return 0
-  for pid in "$SIDECAR_PID" "$RUNNER_PID"; do
-    if [[ -n "$pid" ]]; then
-      # Each service starts its own session, including its descendants.
-      kill -TERM -- "-$pid" 2>/dev/null || true
-    fi
+  local pid any_alive
+  local groups=("$BOOTSTRAP_PID" "$SIDECAR_PID" "$RUNNER_PID")
+  for pid in "${groups[@]}"; do
+    # Installers and services each own a session, including their descendants.
+    [[ -n "$pid" ]] && kill -TERM -- "-$pid" 2>/dev/null || true
   done
   for ((i=0; i<50; i++)); do
-    if ! kill -0 -- "-${SIDECAR_PID:-0}" 2>/dev/null &&
-       ! kill -0 -- "-${RUNNER_PID:-0}" 2>/dev/null; then break; fi
+    any_alive=0
+    for pid in "${groups[@]}"; do
+      if [[ -n "$pid" ]] && kill -0 -- "-$pid" 2>/dev/null; then any_alive=1; fi
+    done
+    [[ "$any_alive" == 0 ]] && break
     sleep 0.1
   done
-  for pid in "$SIDECAR_PID" "$RUNNER_PID"; do
+  for pid in "${groups[@]}"; do
     [[ -n "$pid" ]] && kill -KILL -- "-$pid" 2>/dev/null || true
   done
   wait 2>/dev/null || true
+}
+# Waiting for an asynchronous owned session lets TERM interrupt installation.
+# The PID remains recorded until wait succeeds/fails, so EXIT owns its cleanup.
+run_bootstrap() {
+  local rc=0
+  setsid "$@" 9>&- &
+  BOOTSTRAP_PID=$!
+  wait "$BOOTSTRAP_PID" || rc=$?
+  # A failed command may have left descendants behind. Never clear ownership
+  # before cleaning those up, even when the original group leader has exited.
+  if kill -0 -- "-$BOOTSTRAP_PID" 2>/dev/null; then stop_services; fi
+  BOOTSTRAP_PID=""
+  return "$rc"
 }
 cleanup() {
   stop_services
@@ -268,14 +287,14 @@ if [[ -x "${VENV}/bin/python" ]]; then
   log "venv already at ${VENV}"
 else
   log "making the venv at ${VENV} from ${FACTORY_PYTHON}"
-  UV_PYTHON_DOWNLOADS=never uv venv --python "$FACTORY_PYTHON" "${VENV}"
+  UV_PYTHON_DOWNLOADS=never run_bootstrap uv venv --python "$FACTORY_PYTHON" "${VENV}"
 fi
 
 INSTALL_STAMP="${VENV}/.forge-installed"
 VERIFY_CODE="import importlib.metadata as m; import forge, guardkit, guardkit._installer_core, guardkitfactory, deepagents_code, claude_agent_sdk; assert m.version('deepagents') == '0.7.14'; assert m.version('deepagents-code') == '0.1.69'"
 verify_install() {
-  uv pip check --python "${VENV}/bin/python" &&
-    "${VENV}/bin/python" -c "$VERIFY_CODE"
+  run_bootstrap uv pip check --python "${VENV}/bin/python" &&
+    run_bootstrap "${VENV}/bin/python" -c "$VERIFY_CODE"
 }
 wanted="python=$python_identity request=forge[providers,memory,sidecar],guardkit[autobuild],deepagents==0.7.14,deepagents-code==0.1.69 "
 for name in "${MOUNT_NAMES[@]}"; do
@@ -291,7 +310,7 @@ if [[ -f "${INSTALL_STAMP}" && "$(cat "${INSTALL_STAMP}")" == "${wanted}" ]] && 
 else
   rm -f "$INSTALL_STAMP"
   log "installing the factory's code into ${VENV} from the copies"
-  uv pip install --python "${VENV}/bin/python" \
+  run_bootstrap uv pip install --python "${VENV}/bin/python" \
     "${SRC_ROOT}/nats-core" \
     "${SRC_ROOT}/fleet-memory" \
     "${SRC_ROOT}/forge[providers,memory,sidecar]" \
