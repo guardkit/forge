@@ -302,19 +302,45 @@ def _spec_result(files: dict[str, str] | None = None, slug: str = "stats-endpoin
     )
 
 
-def _plan_result(feature_id: str, files: dict[str, str] | None = None) -> Any:
+def _semantic_review_json(
+    files: dict[str, str],
+    *,
+    reviewed_after_rewrite: bool = False,
+) -> str:
+    return json.dumps(
+        {
+            "schema_version": 1,
+            "decision": "approved",
+            "criterion": "request_traceability",
+            "criterion_score": 1.0,
+            "coach_verdict": "GOOD",
+            "artifact_identity": PlanningRunDriver._plan_artifact_identity(files),
+            "reviewed_after_rewrite": reviewed_after_rewrite,
+        }
+    )
+
+
+def _plan_result(
+    feature_id: str,
+    files: dict[str, str] | None = None,
+    *,
+    reviewed_after_rewrite: bool = False,
+) -> Any:
+    plan_files = files if files is not None else {
+        f"features/stats-endpoint/{feature_id}.yaml": (
+            f"id: {feature_id}\ntasks:\n- id: TASK-STAT-001\n"
+        ),
+        "tasks/TASK-STAT-001.md": "# task\n",
+    }
     return SimpleNamespace(
         outcome=SimpleNamespace(value="completed"),
         role_output={
             "feature_id": feature_id,
-            "files": files
-            if files is not None
-            else {
-                f"features/stats-endpoint/{feature_id}.yaml": (
-                    f"id: {feature_id}\ntasks:\n- id: TASK-STAT-001\n"
-                ),
-                "tasks/TASK-STAT-001.md": "# task\n",
-            },
+            "files": plan_files,
+            "semantic_review.json": _semantic_review_json(
+                plan_files,
+                reviewed_after_rewrite=reviewed_after_rewrite,
+            ),
         },
         reason=None,
     )
@@ -348,21 +374,25 @@ def _plan_result_native(feature_id: str, slug: str = "stats-endpoint",
     """The DEPLOYED 008 reply shape: ``role_output`` is the NATIVE artifact map
     whose keys are ALREADY repo-relative paths (.guardkit/features/<id>.yaml,
     tasks/backlog/**, qa/*) PLUS the validation.json channel."""
+    role_output = {
+        # The real 008 map lists tasks in the feature YAML but emits NO
+        # per-task qa/pass-bar-*.yaml (the round-19 gap forge now fills).
+        f".guardkit/features/{feature_id}.yaml": (
+            f"id: {feature_id}\ntasks:\n- id: TASK-STAT-001\n"
+        ),
+        f"tasks/backlog/{slug}/IMPLEMENTATION-GUIDE.md": "# guide\n",
+        f"tasks/backlog/{slug}/TASK-STAT-001.md": "# task\n",
+        "validation.json": json.dumps(
+            {"accepted": accepted, "errors": [] if accepted else ["bad"],
+             "gates_run": ["feature_validate"]}
+        ),
+    }
+    plan_files = PlanningRunDriver._plan_tree_files(role_output)
+    assert plan_files is not None
+    role_output["semantic_review.json"] = _semantic_review_json(plan_files)
     return SimpleNamespace(
         outcome=SimpleNamespace(value="completed"),
-        role_output={
-            # The real 008 map lists tasks in the feature YAML but emits NO
-            # per-task qa/pass-bar-*.yaml (the round-19 gap forge now fills).
-            f".guardkit/features/{feature_id}.yaml": (
-                f"id: {feature_id}\ntasks:\n- id: TASK-STAT-001\n"
-            ),
-            f"tasks/backlog/{slug}/IMPLEMENTATION-GUIDE.md": "# guide\n",
-            f"tasks/backlog/{slug}/TASK-STAT-001.md": "# task\n",
-            "validation.json": json.dumps(
-                {"accepted": accepted, "errors": [] if accepted else ["bad"],
-                 "gates_run": ["feature_validate"]}
-            ),
-        },
+        role_output=role_output,
         reason=None,
     )
 
@@ -508,8 +538,15 @@ def _make_driver(
         spec_feature_paths: list[str] | None = None,
         request_text: str | None = None,
         repository_facts: str | None = None,
+        revision_of: dict[str, str] | None = None,
+        validate_feedback: str | None = None,
     ) -> Any:
-        counters["plan"] += 1
+        if revision_of is None:
+            counters["plan"] += 1
+        else:
+            counters["semantic_rereview"] = (
+                counters.get("semantic_rereview", 0) + 1
+            )
         # Reject-on-missing, exactly like the real specialist command router:
         # the 008 contract of record (specialist-agent architect/modes/
         # feature_plan.py) requires feature_id + the spec triple CONTENTS +
@@ -555,11 +592,25 @@ def _make_driver(
             spec_feature_paths=spec_feature_paths,
             request_text=request_text,
             repository_facts=repository_facts,
+            revision_of=revision_of,
+            validate_feedback=validate_feedback,
         )
+        if revision_of is not None:
+            counters.setdefault("plan_revisions", []).append(dict(revision_of))
+            return _plan_result(
+                feature_id,
+                dict(revision_of),
+                reviewed_after_rewrite=True,
+            )
         if plan_result is not None:
             return plan_result
         if plan_result_factory is not None:
-            return plan_result_factory(feature_id)
+            produced = plan_result_factory(feature_id)
+            output = produced.role_output
+            projected = PlanningRunDriver._plan_tree_files(output)
+            assert projected is not None
+            output["semantic_review.json"] = _semantic_review_json(projected)
+            return produced
         return _plan_result(feature_id)
 
     async def _normalize(worktree: Path, feature_rel: str) -> ToolOutcome:
@@ -1290,6 +1341,49 @@ async def test_plan_invalid_artifacts_fails(store: SqlitePlanningRunStore) -> No
         ),
     )
     assert await _drive_to_failure(h, store) == PlanningState.FAILED.value
+
+
+@pytest.mark.asyncio
+async def test_plan_missing_semantic_review_fails_before_write(
+    store: SqlitePlanningRunStore,
+) -> None:
+    _queue(store)
+    files = {"features/x/FEAT-X.yaml": "id: FEAT-X\n"}
+    h = _make_driver(
+        store,
+        plan_result=SimpleNamespace(
+            outcome=SimpleNamespace(value="completed"),
+            role_output={"files": files},
+            reason=None,
+        ),
+    )
+
+    assert await _drive_to_failure(h, store) == PlanningState.FAILED.value
+    assert any(
+        "semantic review" in message.lower()
+        for _, message, _ in h.ctx["notifications"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_plan_rewrite_with_stale_semantic_review_fails_before_write(
+    store: SqlitePlanningRunStore,
+) -> None:
+    _queue(store)
+    result = _plan_result("FEAT-PLACEHOLDER")
+    approved_files = dict(result.role_output["files"])
+    result.role_output.pop("feature_id")
+    result.role_output["files"] = {
+        **approved_files,
+        "tasks/TASK-STAT-001.md": "# rewritten after approval\n",
+    }
+    h = _make_driver(store, plan_result=result)
+
+    assert await _drive_to_failure(h, store) == PlanningState.FAILED.value
+    assert any(
+        "digest does not match" in message
+        for _, message, _ in h.ctx["notifications"]
+    )
 
 
 @pytest.mark.asyncio
@@ -7319,3 +7413,80 @@ async def test_a_run_with_no_sentence_sends_the_set_that_shipped_before(
     }
     assert "request_text" not in wire
     assert "repository_facts" not in wire
+
+
+@pytest.mark.asyncio
+async def test_unchanged_approved_plan_does_not_request_semantic_rereview(
+    store: SqlitePlanningRunStore,
+) -> None:
+    _queue(store)
+    h = _make_driver(store)
+
+    await h.driver.drive(CID)
+
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+    assert h.ctx["counters"].get("semantic_rereview", 0) == 0
+
+
+@pytest.mark.asyncio
+async def test_normalizer_rewrite_requests_exact_semantic_rereview(
+    store: SqlitePlanningRunStore,
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "api_test"
+    _init_scratch_repo(repo)
+    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    _queue(store)
+    sink: dict[str, Any] = {}
+    h = _make_driver(
+        store,
+        git_runner=git,
+        repo_path=str(repo),
+        spec_result=_spec_result_native(),
+        plan_result_factory=_plan_result_native,
+        normalize_stamps_fn=_stamping_normalizer(sink, write=True),
+    )
+
+    await h.driver.drive(CID)
+
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+    assert h.ctx["counters"]["semantic_rereview"] == 1
+    assert h.ctx["counters"]["plan_revisions"]
+
+
+@pytest.mark.asyncio
+async def test_failed_exact_re_review_stops_normalized_plan_before_commit(
+    store: SqlitePlanningRunStore,
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "api_test"
+    _init_scratch_repo(repo)
+    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    _queue(store)
+
+    async def _reviewer(**kwargs: Any) -> Any:
+        feature_id = kwargs["feature_id"]
+        revision = kwargs.get("revision_of")
+        if revision is None:
+            return _plan_result_native(feature_id)
+        return _plan_result(
+            feature_id,
+            dict(revision),
+            reviewed_after_rewrite=False,
+        )
+
+    sink: dict[str, Any] = {}
+    h = _make_driver(
+        store,
+        git_runner=git,
+        repo_path=str(repo),
+        spec_result=_spec_result_native(),
+        plan_dispatch=_reviewer,
+        normalize_stamps_fn=_stamping_normalizer(sink, write=True),
+    )
+
+    assert await _drive_to_failure(h, store) == PlanningState.FAILED.value
+    assert any(
+        "did not mark the rewritten tree" in message
+        for _, message, _ in h.ctx["notifications"]
+    )

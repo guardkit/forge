@@ -94,6 +94,7 @@ from forge.pipeline.forward_context_builder import (
 from forge.pipeline.stage_taxonomy import StageClass
 
 __all__ = [
+    "FINAL_PLAN_REVIEW_FEEDBACK",
     "SPECIALIST_CAPABILITY_BY_STAGE",
     "SPECIALIST_COMMAND_BY_STAGE",
     "SPECIALIST_INTENT_BY_STAGE",
@@ -233,6 +234,13 @@ SPECIALIST_REQUIRED_ARGS_BY_STAGE: dict[StageClass, tuple[str, ...]] = {
     ),
 }
 
+# Internal marker on the existing revision wire. The dispatcher turns the
+# accompanying revision_of tree into a review-only argument for the specialist;
+# no new production callback signature or transport field is required.
+FINAL_PLAN_REVIEW_FEEDBACK = (
+    "Review this exact final artifact set after Forge normalization; do not rewrite it."
+)
+
 
 # Parameter name carrying the build's correlation_id onto the dispatch
 # envelope. Group I @data-integrity asserts that the correlation_id is
@@ -349,6 +357,15 @@ def build_specialist_command(
     # ``str(value).strip()`` guard only skips blank scalars. ``setdefault`` keeps
     # any value already sourced above authoritative.
     if extra_command_args:
+        if (
+            stage is StageClass.FEATURE_PLAN
+            and extra_command_args.get("validate_feedback")
+            == FINAL_PLAN_REVIEW_FEEDBACK
+            and isinstance(extra_command_args.get("revision_of"), Mapping)
+        ):
+            args["semantic_review_artifacts"] = dict(
+                extra_command_args["revision_of"]
+            )
         for arg_name, value in extra_command_args.items():
             if str(value).strip():
                 args.setdefault(arg_name, value)
