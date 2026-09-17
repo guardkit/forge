@@ -59,6 +59,9 @@ import yaml
 
 from forge.gating.identity import derive_request_id, parse_request_id
 from forge.lifecycle.identifiers import validate_feature_id
+from forge.pipeline.dispatchers.specialist import (
+    FINAL_PLAN_REVIEW_FEEDBACK,
+)
 from forge.pipeline.stage_names import plain_stage_name
 from forge.pipeline.stage_taxonomy import StageClass
 from forge.planning.checkpoint import (
@@ -521,6 +524,7 @@ _NON_ARTIFACT_KEYS = frozenset(
     {
         "validation.json",
         "seed_errors.json",
+        "semantic_review.json",
         "feature_id",
         "slug",
         "role_id",
@@ -1019,9 +1023,9 @@ class _PlanAttempt:
     files: Mapping[str, str]
     slug: str
     sha: str | None = None
-    #: What the plan review found when it read this tree against the request,
-    #: and what it did about it (2026-09-15). ``None`` only where the attempt
-    #: never got as far as having a tree to read.
+    #: The specialist's decisive semantic review and exact artifact identity.
+    #: ``None`` only where the attempt never got as far as a reviewed tree.
+    #: The legacy field name is retained to avoid widening this private record.
     traceability: Mapping[str, Any] | None = None
 
 
@@ -4735,24 +4739,58 @@ class PlanningRunDriver:
             )
             return None
 
-        # THE PLAN IS READ AGAINST THE REQUEST, BEFORE ANYTHING IS COMMITTED
-        # (2026-09-15, the planner fix). Every task is held against the
-        # sentence the person actually sent: a web address the request does
-        # not name, a capability it never mentions, or a task that cannot
-        # point at any of its words. The tree is still only a mapping of path
-        # to content here, so a plan sent back costs nothing on the branch.
-        read = await self._read_the_plan_against_the_request(
-            row,
-            correlation_id,
-            files,
-            feature_id=feature_id,
-            repo_path=repo_path,
-            test_roots=list(target_repo_descriptor.get("test_roots") or ()),
-            ask_the_plan_writer=_ask_the_plan_writer,
-        )
-        if read is None:
-            return None  # already loud and terminal — the card says why
-        files, traceability = read
+        # Semantic judgement belongs to the specialist Player/Coach. Forge's
+        # caller enforces that exact decision and the identity of the exact
+        # artifact tree it is about; it does not infer intent from phrases.
+        traceability, semantic_error = self._semantic_review_of(role_output, files)
+        if semantic_error is not None:
+            await self._fail_leg(
+                correlation_id,
+                _FEATURE_PLAN_STAGE,
+                "008 semantic review refused: " + semantic_error,
+            )
+            return None
+
+        semantic_state: dict[str, Any] = {
+            "role_output": role_output,
+            "review": traceability,
+        }
+
+        async def _ensure_semantic_review(
+            candidate_files: Mapping[str, str],
+        ) -> str | None:
+            current, current_error = self._semantic_review_of(
+                semantic_state["role_output"], candidate_files
+            )
+            if current_error is None:
+                semantic_state["review"] = current
+                return None
+            try:
+                reviewed_result = await _ask_the_plan_writer(
+                    note=FINAL_PLAN_REVIEW_FEEDBACK,
+                    prior=candidate_files,
+                )
+            except Exception as exc:  # noqa: BLE001 - dispatch boundary
+                return f"exact-artifact re-review raised {type(exc).__name__}: {exc}"
+            reviewed_ok, reviewed_reason = self._dispatch_ok(reviewed_result)
+            if not reviewed_ok:
+                return "exact-artifact re-review " + reviewed_reason
+            reviewed_output = self._role_output_of(reviewed_result)
+            reviewed_files = self._plan_tree_files(reviewed_output)
+            if reviewed_files is None:
+                return "exact-artifact re-review returned no plan tree"
+            if dict(reviewed_files) != dict(candidate_files):
+                return "exact-artifact re-review rewrote the supplied plan tree"
+            review, review_error = self._semantic_review_of(
+                reviewed_output, candidate_files
+            )
+            if review_error is not None:
+                return "exact-artifact re-review refused: " + review_error
+            if review is None or review.get("reviewed_after_rewrite") is not True:
+                return "exact-artifact re-review did not mark the rewritten tree"
+            semantic_state["role_output"] = reviewed_output
+            semantic_state["review"] = review
+            return None
 
         # VALIDATION CHANNEL (C5): advisory self-check data, not an oracle —
         # same posture as the 007 leg above. The REAL oracle for the plan tree
@@ -4797,6 +4835,23 @@ class PlanningRunDriver:
                 return PreCommitResult(
                     ok=False, detail=f"stamp normalizer {stamps.status}: {stamps.detail}"
                 )
+            post_normalizer: dict[str, str] = {}
+            for rel in files:
+                path = worktree / rel
+                try:
+                    post_normalizer[str(rel)] = path.read_text(encoding="utf-8")
+                except (OSError, UnicodeError):
+                    return PreCommitResult(
+                        ok=False,
+                        detail=f"semantic review artifact {rel} became unreadable",
+                    )
+            semantic_error = await _ensure_semantic_review(post_normalizer)
+            if semantic_error is not None:
+                return PreCommitResult(
+                    ok=False,
+                    detail="semantic re-review after normalization failed: "
+                    + semantic_error,
+                )
             outcome = await validate(worktree, feature_id)
             return PreCommitResult(ok=outcome.ok, detail=outcome.detail)
 
@@ -4840,6 +4895,15 @@ class PlanningRunDriver:
                     )
             pre_commit = declared.checks
 
+        semantic_error = await _ensure_semantic_review(files)
+        if semantic_error is not None:
+            await self._fail_leg(
+                correlation_id,
+                _FEATURE_PLAN_STAGE,
+                "plan tree changed after semantic approval: " + semantic_error,
+            )
+            return None
+
         try:
             gitres = await git_runner.prepare_branch_and_write_tree(
                 repo_path=repo_path,
@@ -4872,12 +4936,36 @@ class PlanningRunDriver:
                     stamps=stamps,
                     files=files,
                     slug=slug,
-                    traceability=traceability,
+                    traceability=semantic_state["review"],
                 )
             await self._fail_leg(
                 correlation_id,
                 _FEATURE_PLAN_STAGE,
                 f"plan write / feature validate failed: {gitres.stderr}",
+            )
+            return None
+
+        committed_files: dict[str, str] = {}
+        for rel in files:
+            content = await git_runner.read_file_from_branch(
+                repo_path=repo_path, branch=branch, file_path=str(rel)
+            )
+            if content is None:
+                await self._fail_leg(
+                    correlation_id,
+                    _FEATURE_PLAN_STAGE,
+                    f"committed semantic-review artifact is unreadable: {rel}",
+                )
+                return None
+            committed_files[str(rel)] = content
+        _, semantic_error = self._semantic_review_of(
+            semantic_state["role_output"], committed_files
+        )
+        if semantic_error is not None:
+            await self._fail_leg(
+                correlation_id,
+                _FEATURE_PLAN_STAGE,
+                "committed plan lost semantic approval: " + semantic_error,
             )
             return None
         return _PlanAttempt(
@@ -4886,7 +4974,7 @@ class PlanningRunDriver:
             files=files,
             slug=slug,
             sha=gitres.sha,
-            traceability=traceability,
+            traceability=semantic_state["review"],
         )
 
     # ------------------------------------------------------------------ #
@@ -6206,24 +6294,11 @@ class PlanningRunDriver:
                 ),
                 receipt_block["owner_line_sent"],
             )
-        # THE PLAN READ AGAINST THE REQUEST (2026-09-15). Its receipt goes
-        # where the assumption review's goes — on the leg's own durable row —
-        # and when tasks in the committed plan quote nothing from the request,
-        # the owner reads ONE plain, un-mentioned line saying so. That finding
-        # never stops a run and asks for nothing; the three touches stand.
-        plan_review = (
+        # Keep the exact specialist decision and reviewed artifact identity on
+        # the durable approved row.
+        semantic_review = (
             dict(attempt.traceability) if attempt.traceability is not None else None
         )
-        if plan_review is not None and plan_review.get("card_line"):
-            line = str(plan_review["card_line"])
-            sent = await self._notify(correlation_id, line, level="info", mention=False)
-            plan_review["card_line_sent"] = (
-                "sent"
-                if sent == "sent"
-                else "line not sent (no notifier)"
-                if sent == "no-notifier"
-                else "line not sent (publish failed)"
-            )
         details: dict[str, Any] = {
             "feature_id": feature_id,
             "slug": attempt.slug,
@@ -6234,8 +6309,8 @@ class PlanningRunDriver:
         }
         if stamp_receipt is not None:
             details["stamp_normalizer"] = stamp_receipt
-        if plan_review is not None:
-            details["plan_review"] = plan_review
+        if semantic_review is not None:
+            details["semantic_review"] = semantic_review
         deps.store._record_event(
             correlation_id=correlation_id,
             stage_label=_FEATURE_PLAN_STAGE,
@@ -8764,6 +8839,98 @@ class PlanningRunDriver:
             if isinstance(v, str) and str(k) not in _NON_ARTIFACT_KEYS
         }
         return tree or None
+
+    @staticmethod
+    def _plan_artifact_identity(files: Mapping[str, str]) -> dict[str, Any]:
+        """Reproduce the specialist's canonical identity for a plan tree."""
+        tree = {str(path): str(content) for path, content in files.items()}
+        canonical = json.dumps(
+            tree, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")
+        return {
+            "algorithm": "sha256",
+            "digest": hashlib.sha256(canonical).hexdigest(),
+            "paths": sorted(tree),
+        }
+
+    @staticmethod
+    def _semantic_review_of(
+        role_output: Mapping[str, Any],
+        files: Mapping[str, str],
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        """Read and verify the specialist's decisive semantic review receipt.
+
+        Missing or malformed evidence is never approval. The receipt must name
+        the one semantic criterion, carry an accepting Coach verdict, and bind
+        byte-for-byte to the plan tree Forge is about to use.
+        """
+        raw = role_output.get("semantic_review.json")
+        if isinstance(raw, str):
+            try:
+                parsed: Any = json.loads(raw)
+            except (json.JSONDecodeError, ValueError):
+                return None, "semantic_review.json is not parseable JSON"
+        elif isinstance(raw, Mapping):
+            parsed = dict(raw)
+        else:
+            return None, "semantic_review.json is missing"
+        if not isinstance(parsed, Mapping):
+            return None, "semantic_review.json is not an object"
+
+        expected_keys = {
+            "schema_version",
+            "decision",
+            "criterion",
+            "criterion_score",
+            "coach_verdict",
+            "artifact_identity",
+            "reviewed_after_rewrite",
+        }
+        if set(parsed) != expected_keys:
+            return None, "semantic_review.json has the wrong fields"
+        if (
+            type(parsed.get("schema_version")) is not int
+            or parsed.get("schema_version") != 1
+        ):
+            return None, "semantic review schema_version is not 1"
+        if parsed.get("decision") != "approved":
+            return None, "specialist semantic decision is not approved"
+        if parsed.get("criterion") != "request_traceability":
+            return None, "semantic review names the wrong criterion"
+        score = parsed.get("criterion_score")
+        if (
+            isinstance(score, bool)
+            or not isinstance(score, (int, float))
+            or not 0.5 <= float(score) <= 1.0
+        ):
+            return None, "request_traceability did not pass"
+        if parsed.get("coach_verdict") not in {"ACCEPTABLE", "GOOD"}:
+            return None, "Coach verdict is not accepting"
+        if type(parsed.get("reviewed_after_rewrite")) is not bool:
+            return None, "reviewed_after_rewrite is not boolean"
+
+        identity = parsed.get("artifact_identity")
+        if not isinstance(identity, Mapping):
+            return None, "artifact_identity is missing or malformed"
+        if set(identity) != {"algorithm", "digest", "paths"}:
+            return None, "artifact_identity has the wrong fields"
+        if identity.get("algorithm") != "sha256":
+            return None, "artifact_identity uses an unsupported algorithm"
+        paths = identity.get("paths")
+        if (
+            not isinstance(paths, list)
+            or any(not isinstance(path, str) for path in paths)
+            or paths != sorted(set(paths))
+        ):
+            return None, "artifact_identity paths are malformed"
+
+        actual = PlanningRunDriver._plan_artifact_identity(files)
+        if paths != actual["paths"]:
+            return None, "semantic review artifact paths do not match the plan tree"
+        digest = identity.get("digest")
+        if not isinstance(digest, str) or digest != actual["digest"]:
+            return None, "semantic review artifact digest does not match the plan tree"
+        return dict(parsed), None
 
     @staticmethod
     def _validation_failures(role_output: Mapping[str, Any]) -> list[str]:
