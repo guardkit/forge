@@ -577,6 +577,12 @@ async def cut_worktree_in_checkout(
     # it. The refusal names the branch, because "invalid reference" from git
     # would not say that the build was queued on a branch nobody made.
     if base_ref != JOURNEY_BASE_REF:
+        immutable_commit = len(base_ref) == 40 and all(
+            char in "0123456789abcdefABCDEF" for char in base_ref
+        )
+        base_spec = (
+            f"{base_ref}^{{commit}}" if immutable_commit else f"refs/heads/{base_ref}"
+        )
         try:
             exists = await _execute(
                 command=[
@@ -584,7 +590,7 @@ async def cut_worktree_in_checkout(
                     "rev-parse",
                     "--verify",
                     "--quiet",
-                    f"refs/heads/{base_ref}",
+                    base_spec,
                 ],
                 cwd=str(checkout_path),
             )

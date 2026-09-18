@@ -327,12 +327,13 @@ def materialise_repair_branch(
     the branch carries. The worktree is removed on every path. A failure to
     write or commit raises :class:`RepairBranchError` and, when this call
     created the branch, deletes it again. When ``expected_base_commit`` is
-    given, the named base must still point to that commit and a reused repair
-    branch must contain it.
+    given, the named base is verified at that commit and the prepared branch is
+    published only if its exact starting tip is unchanged. A reused repair branch
+    must contain the expected base commit.
 
     Never touches the shared checkout's working tree or index: the only
-    commands run against the checkout itself are ``worktree add/remove/prune``,
-    ``rev-parse``, ``for-each-ref`` and ``branch -D``.
+    commands run against the checkout itself are bounded Git worktree, ref,
+    ancestry and compare-and-swap operations.
     """
     repo = Path(repo_root)
     if not files:
@@ -365,33 +366,52 @@ def materialise_repair_branch(
     worktree = repair_worktree_path(repo, task_id)
     _remove_worktree(repo, worktree)  # a leftover from a crash, if any
 
-    created = not branch_exists(repo, branch)
+    existing = _git(repo, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}")
+    before = existing.stdout.strip() if existing.returncode == 0 else None
+    created = before is None
     if not created and expected_base_commit is not None:
         contains = _git(
             repo,
             "merge-base",
             "--is-ancestor",
             expected_base_commit,
-            f"refs/heads/{branch}",
+            str(before),
         )
         if contains.returncode != 0:
             raise RepairBranchError(
                 f"the existing repair branch {branch!r} does not contain the "
                 f"retained candidate {expected_base_commit}; refusing to reuse it"
             )
+    start_commit = before or expected_base_commit or base_commit
     if created:
-        added = _git(repo, "worktree", "add", "-b", branch, str(worktree), base_branch)
+        added = _git(
+            repo,
+            "worktree",
+            "add",
+            "-b",
+            branch,
+            str(worktree),
+            start_commit,
+        )
     else:
-        added = _git(repo, "worktree", "add", str(worktree), branch)
+        added = _git(repo, "worktree", "add", "--detach", str(worktree), start_commit)
     if added.returncode != 0:
         _remove_worktree(repo, worktree)
-        if created and branch_exists(repo, branch):
-            _git(repo, "branch", "-D", branch)
         raise RepairBranchError(
             f"git could not make a worktree for {branch} in {repo}: {_last_line(added)}"
         )
+    if created:
+        detached = _git(worktree, "checkout", "--detach", start_commit)
+        if detached.returncode != 0:
+            _remove_worktree(repo, worktree)
+            _git(repo, "update-ref", "-d", f"refs/heads/{branch}", start_commit)
+            raise RepairBranchError(
+                f"git could not detach the new repair worktree for {branch}: "
+                f"{_last_line(detached)}"
+            )
 
     committed = False
+    published_ref = False
     try:
         written = _write_files(worktree, files)
         staged = _git(worktree, "add", "-f", "--", *written)
@@ -420,17 +440,32 @@ def materialise_repair_branch(
             raise RepairBranchError(
                 f"git could not read the tip of {branch}: {_last_line(head)}"
             )
+        new_commit = head.stdout.strip()
+        old_commit = before or start_commit
+        published = _git(
+            repo,
+            "update-ref",
+            f"refs/heads/{branch}",
+            new_commit,
+            old_commit,
+        )
+        if published.returncode != 0:
+            raise RepairBranchError(
+                f"the repair branch {branch!r} changed while its files were being "
+                "prepared; refusing to overwrite that concurrent update"
+            )
+        published_ref = True
         result = RepairBranchResult(
             branch=branch,
-            commit=head.stdout.strip(),
+            commit=new_commit,
             created_branch=created,
             committed=committed,
             files=tuple(written),
         )
     except Exception as exc:
         _remove_worktree(repo, worktree)
-        if created:
-            _git(repo, "branch", "-D", branch)
+        if created and not published_ref:
+            _git(repo, "update-ref", "-d", f"refs/heads/{branch}", start_commit)
         if isinstance(exc, RepairBranchError):
             raise
         raise RepairBranchError(
@@ -539,7 +574,8 @@ def materialise_repair_branch_via_sidecar(
         sha = answer.get("sha")
         return str(sha) if sha else None
 
-    base_commit = sha_of(base_branch)
+    base_ref = f"refs/heads/{base_branch}"
+    base_commit = sha_of(base_ref)
     if base_commit is None:
         raise RepairBranchError(
             f"there is no branch called {base_branch!r} in the factory's clone "
@@ -552,7 +588,8 @@ def materialise_repair_branch_via_sidecar(
             f"{expected_base_commit}; refusing to repair an unrelated or stale tree"
         )
     branch = repair_branch_name(task_id)
-    before = sha_of(branch)
+    branch_ref = f"refs/heads/{branch}"
+    before = sha_of(branch_ref)
     created = before is None
     if not created and expected_base_commit is not None:
         ancestry = call(
@@ -560,7 +597,7 @@ def materialise_repair_branch_via_sidecar(
             {
                 "repo": repo,
                 "ancestor": expected_base_commit,
-                "descendant": branch,
+                "descendant": str(before),
             },
         ).get("is_ancestor")
         if ancestry is not True:
@@ -574,7 +611,12 @@ def materialise_repair_branch_via_sidecar(
         path = str(Path(repo_root) / ".forge" / "worktrees" / f"{REPAIR_WORKTREE_PREFIX}{task_id}")
         cut = call(
             "/git/worktree-add",
-            {"repo": repo, "path": path, "branch": branch, "base_ref": base_branch},
+            {
+                "repo": repo,
+                "path": path,
+                "branch": branch,
+                "base_ref": expected_base_commit or base_commit,
+            },
         )
         if cut.get("status") != "success":
             raise RepairBranchError(
@@ -590,6 +632,7 @@ def materialise_repair_branch_via_sidecar(
             "files": {str(k): str(v) for k, v in files.items()},
             "message": message,
             "checks": [],
+            "expected_head": before or expected_base_commit or base_commit,
         },
     )
     if written.get("status") != "success" or not written.get("sha"):

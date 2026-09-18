@@ -275,6 +275,7 @@ class WorktreeGitRunner:
         message: str,
         *,
         pre_commit: PreCommitHook | None = None,
+        expected_head: str | None = None,
     ) -> GitOpResult:
         """Write a multi-file tree onto ``branch`` in one commit (Lane B B2).
 
@@ -283,6 +284,8 @@ class WorktreeGitRunner:
         contract. Reuses the same worktree isolation, checkout-collision guard
         (TASK-MP-013), idempotency probe (RT-08) and best-effort cleanup; adds
         the multi-file write and the optional pre-commit oracle hook.
+        When ``expected_head`` is given, prepares from that immutable commit
+        and publishes with ``git update-ref`` compare-and-swap.
         """
         logger.info(
             "prepare_branch_and_write_tree: begin branch=%s files=%d repo=%s",
@@ -308,12 +311,29 @@ class WorktreeGitRunner:
                 )
 
             branch_exists = await self._branch_exists(repo, branch)
+            if expected_head is not None:
+                observed_head = (
+                    await self._rev_parse(repo, branch)
+                    if branch_exists
+                    else None
+                )
+                if observed_head != expected_head:
+                    return GitOpResult(
+                        status="failed",
+                        operation=_TREE_OPERATION,
+                        stderr=(
+                            f"branch {branch} changed before its prepared tree "
+                            f"could be written: expected {expected_head}, observed "
+                            f"{observed_head or 'no branch'}"
+                        ),
+                        exit_code=-1,
+                    )
 
             # RT-08 idempotency: every file already byte-identical on the
             # branch AND no mutating hook required → success with the existing
             # tip, zero mutations. A pre_commit hook may mutate files (the
             # normalizer), so only short-circuit when there is no hook.
-            if branch_exists and pre_commit is None:
+            if branch_exists and pre_commit is None and expected_head is None:
                 all_identical = True
                 for rel_path, content in files.items():
                     existing = await self._show_file(repo, branch, rel_path)
@@ -362,7 +382,16 @@ class WorktreeGitRunner:
                 f"{branch.replace('/', '-')}-{uuid.uuid4().hex[:8]}"
             )
 
-            if branch_exists:
+            if expected_head is not None:
+                add_cmd = [
+                    "git",
+                    "worktree",
+                    "add",
+                    "--detach",
+                    str(worktree),
+                    expected_head,
+                ]
+            elif branch_exists:
                 add_cmd = [
                     "git",
                     "worktree",
@@ -445,24 +474,43 @@ class WorktreeGitRunner:
                     if "nothing to commit" in stderr:
                         # Tree already matched on disk (e.g. an idempotent
                         # re-run whose hook made no change) — RT-08 success.
-                        sha = await self._rev_parse(repo, branch)
+                        sha = expected_head or await self._rev_parse(repo, branch)
+                    else:
                         return GitOpResult(
-                            status="success",
+                            status="failed",
                             operation=_TREE_OPERATION,
-                            sha=sha,
-                            exit_code=0,
+                            stderr=commit_res.stderr,
+                            exit_code=commit_res.exit_code,
                         )
-                    return GitOpResult(
-                        status="failed",
-                        operation=_TREE_OPERATION,
-                        stderr=commit_res.stderr,
-                        exit_code=commit_res.exit_code,
+                else:
+                    sha = commit_res.sha
+                if expected_head is not None:
+                    updated = await self._execute_timed(
+                        command=[
+                            "git",
+                            "update-ref",
+                            f"refs/heads/{branch}",
+                            str(sha),
+                            expected_head,
+                        ],
+                        cwd=str(repo),
                     )
-
+                    if updated.exit_code != 0:
+                        return GitOpResult(
+                            status="failed",
+                            operation=_TREE_OPERATION,
+                            stderr=(
+                                f"branch {branch} changed while its prepared tree "
+                                "was being written; refusing to overwrite that "
+                                "concurrent update"
+                                f": {_failure_stderr(updated.stderr, updated.stdout)}"
+                            ),
+                            exit_code=updated.exit_code,
+                        )
                 return GitOpResult(
                     status="success",
                     operation=_TREE_OPERATION,
-                    sha=commit_res.sha,
+                    sha=sha,
                     exit_code=0,
                 )
             finally:
