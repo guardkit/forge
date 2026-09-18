@@ -71,6 +71,7 @@ def _state_part(
     tasks_failed: int = 0,
     waiting_for: str | None = None,
     last_coach_score: float | None = None,
+    worktree_retention: dict | None = None,
 ) -> StreamPart:
     return StreamPart(
         event=VALUES_STREAM_EVENT,
@@ -87,6 +88,11 @@ def _state_part(
                     "tasks_failed": tasks_failed,
                     "waiting_for": waiting_for,
                     "last_coach_score": last_coach_score,
+                    **(
+                        {"worktree_retention": worktree_retention}
+                        if worktree_retention is not None
+                        else {}
+                    ),
                 }
             }
         },
@@ -671,3 +677,29 @@ class TestBuildCompleteNamesTheBranch:
         )
         assert isinstance(out, BuildCompletePayload)
         assert out.model_dump()["branch"] == "autobuild/FEAT-XLAT-001"
+
+
+def test_completed_payload_keeps_retained_worktree_for_local_offer_hook() -> None:
+    translator = StreamEventTranslator()
+    context = _make_context()
+    translator.translate(
+        _state_part("FEAT-XLAT-001", lifecycle="running_wave"), context
+    )
+    identity = {
+        "ok": True,
+        "build_id": "build-FEAT-XLAT-001-20260507120000",
+        "path": "/workspace/.guardkit/tmp/build-FEAT-XLAT-001-20260507120000",
+        "registrations": [],
+    }
+    event = translator.translate(
+        _state_part(
+            "FEAT-XLAT-001",
+            lifecycle="completed",
+            tasks_completed=1,
+            worktree_retention=identity,
+        ),
+        context,
+    )
+    assert isinstance(event, BuildCompletePayload)
+    assert event.worktree_retention == identity
+    assert "worktree_retention" not in event.model_dump(mode="json")

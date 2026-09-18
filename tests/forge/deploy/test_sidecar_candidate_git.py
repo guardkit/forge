@@ -173,3 +173,54 @@ class TestASidecarThatCannotBeReached:
 
     def test_it_says_where_it_is_in_words_a_person_reads(self) -> None:
         assert self._unreachable().venue == f"in the sandbox that holds {REPO}"
+
+class TestRetainedAutobuildWorktreeLifecycle:
+    @pytest.mark.asyncio
+    async def test_sidecar_inspects_and_retires_only_the_offer_pinned_tree(
+        self,
+        git: SidecarCandidateGit,
+        clone: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        build_id = "build-FEAT-SG1-20260918"
+        base = tmp_path / "autobuild-worktrees"
+        outer = base / build_id
+        monkeypatch.setenv("FORGE_AUTOBUILD_WORKTREE_BASE", str(base))
+        _git(clone, "worktree", "add", "--detach", str(outer), "main")
+        inner = outer / ".guardkit/worktrees/TASK-SG1-001"
+        inner.parent.mkdir(parents=True)
+        _git(clone, "worktree", "add", str(inner), f"autobuild/{FEATURE_ID}")
+        (inner / "ignored-by-owner.txt").write_text("retained\n")
+
+        offered = await git.inspect_autobuild_worktree(build_id, str(outer))
+        assert offered["ok"] is True
+        assert offered["nested_registrations"][0]["path"] == str(inner)
+        assert outer.is_dir() and inner.is_dir()
+        offered["cleanup_registrations"] = offered["nested_registrations"]
+
+        result = await git.retire_autobuild_worktree(
+            build_id, str(outer), offered
+        )
+        assert result["status"] == "removed", result
+        assert not outer.exists() and not inner.exists()
+
+    @pytest.mark.asyncio
+    async def test_sidecar_refuses_a_path_outside_the_configured_base(
+        self,
+        git: SidecarCandidateGit,
+        clone: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv(
+            "FORGE_AUTOBUILD_WORKTREE_BASE", str(tmp_path / "owned-base")
+        )
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "keep").write_text("keep\n")
+
+        answer = await git.inspect_autobuild_worktree("build-X", str(outside))
+        assert answer["ok"] is False
+        assert "configured autobuild worktree" in answer["detail"]
+        assert (outside / "keep").is_file()

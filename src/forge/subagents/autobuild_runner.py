@@ -103,6 +103,7 @@ from typing_extensions import NotRequired, Required, TypedDict
 
 from forge import receipts as _receipts
 from forge.subagents import build_monitor
+from forge.subagents.autobuild_worktree_lifecycle import inspect_autobuild_worktree
 from forge.subagents.inmem_cancel_compat import (
     install_inmem_cancel_listener_compat,
 )
@@ -1228,6 +1229,12 @@ FORGE_AUTOBUILD_WORKTREE_BASE_ENV: str = "FORGE_AUTOBUILD_WORKTREE_BASE"
 #: :data:`FORGE_AUTOBUILD_WORKTREE_BASE_ENV` is unset.
 DEFAULT_AUTOBUILD_WORKTREE_BASE: str = "/tmp/forge-autobuild-worktrees"
 
+#: Optional byte-exact override for the worktree-specific disk preflight.
+#: When absent, the existing resource-preflight disk floor is reused.
+FORGE_AUTOBUILD_MIN_AVAILABLE_BYTES_ENV: str = (
+    "FORGE_AUTOBUILD_MIN_AVAILABLE_BYTES"
+)
+
 #: Regex matching one ``[guardkit-checkpoint] Turn N complete (tests: ...)``
 #: line in guardkit's verbose stdout. The runner counts these to drive the
 #: stage_complete fallback (TASK-ABW-001 §Scope item 3).
@@ -2210,6 +2217,37 @@ def _worktree_base_dir() -> Path:
     return Path(raw).expanduser()
 
 
+def _worktree_min_available_bytes() -> int:
+    """Resolve env override > configured resource-preflight floor > default."""
+    raw = os.environ.get(FORGE_AUTOBUILD_MIN_AVAILABLE_BYTES_ENV, "").strip()
+    if raw:
+        try:
+            value = int(raw)
+        except ValueError as exc:
+            raise WorktreeMaterialisationError(
+                f"{FORGE_AUTOBUILD_MIN_AVAILABLE_BYTES_ENV} must be a positive integer"
+            ) from exc
+        if value <= 0:
+            raise WorktreeMaterialisationError(
+                f"{FORGE_AUTOBUILD_MIN_AVAILABLE_BYTES_ENV} must be a positive integer"
+            )
+        return value
+
+    from forge.config.models import DEFAULT_PREFLIGHT_DISK_FLOOR_GB
+
+    floor_gb = DEFAULT_PREFLIGHT_DISK_FLOOR_GB
+    cfg_path = _forge_config_file()
+    if cfg_path is not None:
+        try:
+            cfg = _load_forge_config(cfg_path)
+            floor_gb = float(cfg.resource_preflight.min_available_disk_gb)
+        except Exception as exc:  # noqa: BLE001 - a safety floor fails closed
+            raise WorktreeMaterialisationError(
+                f"could not read the worktree disk floor from {cfg_path}: {exc}"
+            ) from exc
+    return int(floor_gb * 1024**3)
+
+
 async def _materialise_worktree(
     repo_path: Path, branch: str, build_id: str
 ) -> Path:
@@ -2230,6 +2268,16 @@ async def _materialise_worktree(
     :func:`_local_branch_exists`.
     """
     base = _worktree_base_dir()
+    from forge.subagents.autobuild_worktree_lifecycle import inspect_worktree_capacity
+
+    capacity = inspect_worktree_capacity(
+        base, min_available_bytes=_worktree_min_available_bytes()
+    )
+    if not capacity.get("ok"):
+        raise WorktreeMaterialisationError(
+            "autobuild worktree capacity preflight refused the build before "
+            f"git worktree add: {capacity.get('detail')} (base={base})"
+        )
     base.mkdir(parents=True, exist_ok=True)
     worktree_path = (base / build_id).resolve()
     code, output = await _run_git(
@@ -3107,8 +3155,12 @@ def _export_receipts(worktree_path: Path, build_id: str) -> ReceiptExport:
 
 
 async def _finalize_success_worktree(
-    repo_path: Path, worktree_path: Path, build_id: str
-) -> None:
+    repo_path: Path,
+    worktree_path: Path,
+    build_id: str,
+    *,
+    receipt_build_id: str | None = None,
+) -> dict[str, Any] | None:
     """Success-path worktree finalization: export receipts, THEN remove.
 
     FEAT-DRC ordering crux: the removal is CONDITIONAL on the export —
@@ -3116,15 +3168,55 @@ async def _finalize_success_worktree(
     forensics posture; the F3 preflight prune does not delete directories,
     and a kept tree never regresses a succeeded build).
     """
-    result = _export_receipts(worktree_path, build_id)
-    if result.ok:
-        await _remove_worktree(repo_path, worktree_path)
-    else:
+    result = _export_receipts(worktree_path, receipt_build_id or build_id)
+    if not result.ok:
         logger.warning(
             "autobuild_runner: keeping worktree %s — receipts were not "
             "exported (see the export WARNING above)",
             worktree_path,
         )
+        return None
+
+    identity = inspect_autobuild_worktree(
+        repo=repo_path,
+        base=_worktree_base_dir(),
+        build_id=build_id,
+        path=worktree_path,
+    )
+    if not identity.get("ok"):
+        logger.warning(
+            "autobuild_runner: keeping succeeded worktree %s — its Git "
+            "ownership could not be proved (%s)",
+            worktree_path,
+            identity.get("detail"),
+        )
+        return None
+    if identity.get("nested_registrations"):
+        manifest = _receipts_root() / build_id / "autobuild-worktree-retention.json"
+        try:
+            manifest.parent.mkdir(parents=True, exist_ok=True)
+            manifest.write_text(
+                json.dumps(identity, indent=2, sort_keys=True), encoding="utf-8"
+            )
+            _harden_pack_permissions(manifest.parent)
+        except OSError as exc:
+            logger.warning(
+                "autobuild_runner: keeping succeeded worktree %s but could "
+                "not write its retention identity (%s: %s)",
+                worktree_path,
+                type(exc).__name__,
+                exc,
+            )
+        logger.info(
+            "autobuild_runner: keeping succeeded worktree %s through its "
+            "merge offer — %s registered GuardKit worktree(s) remain",
+            worktree_path,
+            len(identity["nested_registrations"]),
+        )
+        return identity
+
+    await _remove_worktree(repo_path, worktree_path)
+    return None
 
 
 async def _remove_worktree(repo_path: Path, worktree_path: Path) -> None:
@@ -4539,11 +4631,14 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
     if worktree_path is not None:
         # FEAT-DRC: export the build's receipts BEFORE removal; on export
         # failure the worktree is kept (see _finalize_success_worktree).
-        await _finalize_success_worktree(
+        retained_worktree = await _finalize_success_worktree(
             repo_path,
             worktree_path,
-            receipt_build_id,
+            build_id,
+            receipt_build_id=receipt_build_id,
         )
+    else:
+        retained_worktree = None
     # Compute aggregate_coach_score from the decision-bearing turns.
     aggregate_coach_score: float | None = None
     if decision_turns:
@@ -4562,6 +4657,8 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
     snapshot["aggregate_coach_score"] = aggregate_coach_score
     # Name the provenance of the counts on the wire (design §c).
     snapshot["tasks_completed_source"] = success_counts.source
+    if retained_worktree is not None:
+        snapshot["worktree_retention"] = retained_worktree
     logger.info(
         "autobuild_runner: %s succeeded — %s checkpoint TURNS seen on stdout, "
         "tasks_completed=%s tasks_failed=%s (source=%s). Turns are NOT tasks: "
@@ -4610,6 +4707,11 @@ def _node_completed(state: AutobuildRunnerState) -> dict[str, Any]:
         if isinstance(prev_snapshot, Mapping)
         else None
     )
+    worktree_retention = (
+        prev_snapshot.get("worktree_retention")
+        if isinstance(prev_snapshot, Mapping)
+        else None
+    )
     if measured_source:
         wave_index = int(prev_snapshot.get("wave_index") or 0)
         tasks_completed = int(prev_snapshot.get("tasks_completed") or 0)
@@ -4632,6 +4734,8 @@ def _node_completed(state: AutobuildRunnerState) -> dict[str, Any]:
         snapshot["aggregate_coach_score"] = aggregate_coach_score
     if measured_source:
         snapshot["tasks_completed_source"] = measured_source
+    if isinstance(worktree_retention, Mapping):
+        snapshot["worktree_retention"] = dict(worktree_retention)
     return _snapshot_update(snapshot)
 
 

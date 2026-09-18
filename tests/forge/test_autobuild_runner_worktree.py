@@ -532,6 +532,29 @@ def test_materialise_uses_detach_and_does_not_claim_branch(
     assert _git(wt, "branch", "--show-current") == ""
 
 
+def test_materialise_refuses_low_capacity_before_git_or_directory_creation(
+    throwaway_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    base = tmp_path / "capacity-refused"
+    monkeypatch.setenv(ar.FORGE_AUTOBUILD_WORKTREE_BASE_ENV, str(base))
+    monkeypatch.setenv(ar.FORGE_AUTOBUILD_MIN_AVAILABLE_BYTES_ENV, str(10**30))
+    calls: list[list[str]] = []
+
+    async def _must_not_run(args: list[str], *, cwd: Path):
+        calls.append(args)
+        return 1, "unexpected"
+
+    monkeypatch.setattr(ar, "_run_git", _must_not_run)
+    with pytest.raises(ar.WorktreeMaterialisationError, match="capacity preflight"):
+        asyncio.run(
+            ar._materialise_worktree(
+                throwaway_repo, PLANNING_BRANCH, "build-NO-CAPACITY"
+            )
+        )
+    assert calls == []
+    assert not base.exists()
+
+
 # ---------------------------------------------------------------------------
 # F3 — preflight residue sweep
 # ---------------------------------------------------------------------------
@@ -1019,12 +1042,29 @@ class TestFinalizeSuccessWorktree:
         async def _fake_remove(repo: Path, wt: Path) -> None:
             calls.append((repo, wt))
 
-        with patch.object(ar, "_remove_worktree", _fake_remove):
+        identity = {
+            "ok": True,
+            "build_id": "build-X-6",
+            "path": str(worktree),
+            "nested_registrations": [],
+        }
+        with (
+            patch.object(ar, "_remove_worktree", _fake_remove),
+            patch.object(
+                ar, "inspect_autobuild_worktree", return_value=identity
+            ) as inspect,
+        ):
             asyncio.run(
-                ar._finalize_success_worktree(tmp_path, worktree, "build-X-6")
+                ar._finalize_success_worktree(
+                    tmp_path,
+                    worktree,
+                    "build-OWNER-X-6",
+                    receipt_build_id="build-X-6",
+                )
             )
 
         assert calls == [(tmp_path, worktree)]
+        assert inspect.call_args.kwargs["build_id"] == "build-OWNER-X-6"
         assert (
             tmp_path / "receipts/build-X-6/.guardkit/qav-shadow/queue.jsonl"
         ).is_file()

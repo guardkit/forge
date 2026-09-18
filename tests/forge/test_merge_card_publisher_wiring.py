@@ -65,6 +65,11 @@ CORRELATION = "dddd4444-eeee-5555-ffff-666666666666"
 REPO = "guardkit/forge"
 
 
+class _CandidatePins:
+    async def rev_parse(self, ref: str) -> str:
+        return "c" * 40 if ref.endswith("^{tree}") else "b" * 40
+
+
 @pytest.fixture()
 def writer_db(tmp_path: Path) -> Iterator[sqlite3.Connection]:
     cx = sqlite_connect.connect_writer(tmp_path / "forge.db")
@@ -136,6 +141,7 @@ def _offer_service(
         pipeline_publisher=publisher,
         raw_publish=_raw_publish,
         git_head=_git_head,
+        git_surface=lambda _repo, _root: _CandidatePins(),
         baseline_reader=lambda _build_id: None,
         clock=lambda: datetime(2026, 9, 9, 9, 8, tzinfo=UTC),
     )

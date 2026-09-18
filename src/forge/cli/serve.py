@@ -604,9 +604,12 @@ def bind_production_dispatch_chain(
                 from forge.pipeline.merge_offer import MergeOfferService
 
                 _offer_git_head = compose_merge_offer_git_head(forge_config)
-                _offer_kwargs: dict[str, Any] = (
-                    {} if _offer_git_head is None else {"git_head": _offer_git_head}
-                )
+                _offer_git_surface = compose_merge_git_surface(forge_config)
+                _offer_kwargs: dict[str, Any] = {}
+                if _offer_git_head is not None:
+                    _offer_kwargs["git_head"] = _offer_git_head
+                if _offer_git_surface is not None:
+                    _offer_kwargs["git_surface"] = _offer_git_surface
                 merge_offer_service = MergeOfferService(
                     config=forge_config,
                     pool=sqlite_pool,

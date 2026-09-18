@@ -61,6 +61,11 @@ MAIN_SHA = "b" * 40
 NOW = datetime(2026, 9, 9, 9, 8, 15, tzinfo=UTC)
 
 
+class _CandidatePins:
+    async def rev_parse(self, ref: str) -> str:
+        return "c" * 40 if ref.endswith("^{tree}") else "d" * 40
+
+
 @pytest.fixture()
 def pool(tmp_path: Path) -> Iterator[SqliteLifecyclePersistence]:
     cx: sqlite3.Connection = sqlite_connect.connect_writer(tmp_path / "forge.db")
@@ -143,6 +148,7 @@ def _checkpoint(
         pipeline_publisher=wire,
         raw_publish=wire.raw_publish,
         git_head=_git_head,
+        git_surface=lambda _repo, _root: _CandidatePins(),
         baseline_reader=lambda _build_id: None,
         clock=lambda: NOW,
     )

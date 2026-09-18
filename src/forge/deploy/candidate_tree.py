@@ -53,12 +53,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import shutil
 import subprocess
 import tarfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 logger = logging.getLogger(__name__)
 
@@ -380,6 +381,16 @@ class CandidateGit(Protocol):
     ) -> bool:
         """Remove the laid-out tree. Never raises; ``False`` when it could not."""
 
+    async def inspect_autobuild_worktree(
+        self, build_id: str, path: str
+    ) -> dict[str, Any]:
+        """Read one exact retained autobuild worktree identity."""
+
+    async def retire_autobuild_worktree(
+        self, build_id: str, path: str, expected: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Retire an offer-pinned autobuild worktree after lifecycle success."""
+
 
 class InContainerCandidateGit:
     """The five operations run here, against ``repo_root``, exactly as before.
@@ -422,3 +433,46 @@ class InContainerCandidateGit:
     ) -> bool:
         where = path or str(candidate_tree_path(self._repo_root, feature_id))
         return await remove_candidate_tree(where)
+
+    @staticmethod
+    def _autobuild_base() -> Path:
+        from forge.subagents.autobuild_worktree_lifecycle import (
+            DEFAULT_AUTOBUILD_WORKTREE_BASE,
+            FORGE_AUTOBUILD_WORKTREE_BASE_ENV,
+        )
+
+        return Path(
+            os.environ.get(FORGE_AUTOBUILD_WORKTREE_BASE_ENV, "").strip()
+            or DEFAULT_AUTOBUILD_WORKTREE_BASE
+        ).expanduser()
+
+    async def inspect_autobuild_worktree(
+        self, build_id: str, path: str
+    ) -> dict[str, Any]:
+        from forge.subagents.autobuild_worktree_lifecycle import (
+            inspect_autobuild_worktree,
+        )
+
+        return await asyncio.to_thread(
+            inspect_autobuild_worktree,
+            repo=self._repo_root,
+            base=self._autobuild_base(),
+            build_id=build_id,
+            path=Path(path),
+        )
+
+    async def retire_autobuild_worktree(
+        self, build_id: str, path: str, expected: dict[str, Any]
+    ) -> dict[str, Any]:
+        from forge.subagents.autobuild_worktree_lifecycle import (
+            retire_autobuild_worktree,
+        )
+
+        return await asyncio.to_thread(
+            retire_autobuild_worktree,
+            repo=self._repo_root,
+            base=self._autobuild_base(),
+            build_id=build_id,
+            path=Path(path),
+            expected=expected,
+        )

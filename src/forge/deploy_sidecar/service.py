@@ -2464,6 +2464,8 @@ def process_git_rev_parse_request(
 GIT_IS_ANCESTOR_ROUTE: str = "/git/is-ancestor"
 GIT_CANDIDATE_TREE_ROUTE: str = "/git/candidate-tree"
 GIT_CANDIDATE_TREE_REMOVE_ROUTE: str = "/git/candidate-tree-remove"
+GIT_AUTOBUILD_WORKTREE_INSPECT_ROUTE: str = "/git/autobuild-worktree-inspect"
+GIT_AUTOBUILD_WORKTREE_RETIRE_ROUTE: str = "/git/autobuild-worktree-retire"
 
 
 def _feature_id_error(value: Any) -> str | None:
@@ -2630,6 +2632,67 @@ def process_git_candidate_tree_remove_request(
     except Exception as exc:  # noqa: BLE001 — never raise past the boundary
         return 500, {"error": f"sidecar git error: {type(exc).__name__}: {exc}"}
     return 200, {"removed": bool(removed), "path": str(path)}
+
+
+def _autobuild_worktree_request(
+    payload: Any, *, config: ForgeConfig, retire: bool
+) -> tuple[int, dict[str, Any]]:
+    """Inspect or retire one exact configured autobuild worktree.
+
+    The repository key resolves the Git repository. The requested path is
+    accepted only when it is exactly ``<FORGE_AUTOBUILD_WORKTREE_BASE>/<build
+    id>``; the shared lifecycle helper then derives every nested removal from
+    Git's own registrations.
+    """
+    if not isinstance(payload, dict):
+        return 400, {"error": "request body must be a JSON object"}
+    repo_path, error = _resolve_repo_key(payload, config)
+    if error or repo_path is None:
+        return 400, {"error": error}
+    build_id = payload.get("build_id")
+    if not isinstance(build_id, str) or not SAFE_NAME_PATTERN.match(build_id):
+        return 400, {"error": "'build_id' must be one safe path segment"}
+    path = payload.get("path")
+    if not isinstance(path, str) or not path.strip():
+        return 400, {"error": "'path' is required"}
+
+    from forge.subagents.autobuild_worktree_lifecycle import (
+        DEFAULT_AUTOBUILD_WORKTREE_BASE,
+        FORGE_AUTOBUILD_WORKTREE_BASE_ENV,
+        inspect_autobuild_worktree,
+        retire_autobuild_worktree,
+    )
+
+    base = Path(
+        os.environ.get(FORGE_AUTOBUILD_WORKTREE_BASE_ENV, "").strip()
+        or DEFAULT_AUTOBUILD_WORKTREE_BASE
+    ).expanduser()
+    if not retire:
+        return 200, inspect_autobuild_worktree(
+            repo=repo_path, base=base, build_id=build_id, path=Path(path)
+        )
+    expected = payload.get("expected")
+    if not isinstance(expected, dict):
+        return 400, {"error": "'expected' retained worktree identity is required"}
+    return 200, retire_autobuild_worktree(
+        repo=repo_path,
+        base=base,
+        build_id=build_id,
+        path=Path(path),
+        expected=expected,
+    )
+
+
+def process_git_autobuild_worktree_inspect_request(
+    payload: Any, *, config: ForgeConfig
+) -> tuple[int, dict[str, Any]]:
+    return _autobuild_worktree_request(payload, config=config, retire=False)
+
+
+def process_git_autobuild_worktree_retire_request(
+    payload: Any, *, config: ForgeConfig
+) -> tuple[int, dict[str, Any]]:
+    return _autobuild_worktree_request(payload, config=config, retire=True)
 
 
 # ---------------------------------------------------------------------------
@@ -5095,6 +5158,8 @@ class DeploySidecarHandler(BaseHTTPRequestHandler):
                 GIT_IS_ANCESTOR_ROUTE,
                 GIT_CANDIDATE_TREE_ROUTE,
                 GIT_CANDIDATE_TREE_REMOVE_ROUTE,
+                GIT_AUTOBUILD_WORKTREE_INSPECT_ROUTE,
+                GIT_AUTOBUILD_WORKTREE_RETIRE_ROUTE,
                 GIT_WORKTREE_ADD_ROUTE,
                 GIT_WORKTREE_REMOVE_ROUTE,
                 GIT_WORKTREE_COMMIT_COUNT_ROUTE,
@@ -5151,6 +5216,14 @@ class DeploySidecarHandler(BaseHTTPRequestHandler):
                 )
             elif route == GIT_CANDIDATE_TREE_REMOVE_ROUTE:
                 status, body = process_git_candidate_tree_remove_request(
+                    payload, config=config
+                )
+            elif route == GIT_AUTOBUILD_WORKTREE_INSPECT_ROUTE:
+                status, body = process_git_autobuild_worktree_inspect_request(
+                    payload, config=config
+                )
+            elif route == GIT_AUTOBUILD_WORKTREE_RETIRE_ROUTE:
+                status, body = process_git_autobuild_worktree_retire_request(
                     payload, config=config
                 )
             elif route == GIT_WORKTREE_ADD_ROUTE:
@@ -5315,6 +5388,8 @@ __all__ = [
     "GIT_WRITE_TREE_ROUTE",
     "GIT_READ_FILE_ROUTE",
     "GIT_REV_PARSE_ROUTE",
+    "GIT_AUTOBUILD_WORKTREE_INSPECT_ROUTE",
+    "GIT_AUTOBUILD_WORKTREE_RETIRE_ROUTE",
     "GIT_CHECK_NAMES",
     "GIT_CHECK_PATH_ARGS",
     "GIT_CHECK_TIMEOUT_DEFAULTS",
@@ -5328,6 +5403,8 @@ __all__ = [
     "process_git_write_tree_request",
     "process_git_read_file_request",
     "process_git_rev_parse_request",
+    "process_git_autobuild_worktree_inspect_request",
+    "process_git_autobuild_worktree_retire_request",
     "GIT_WORKTREE_ADD_ROUTE",
     "GIT_WORKTREE_REMOVE_ROUTE",
     "GIT_WORKTREE_COMMIT_COUNT_ROUTE",
