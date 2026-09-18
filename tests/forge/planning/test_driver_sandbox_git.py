@@ -29,6 +29,7 @@ import logging
 import subprocess
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -38,6 +39,7 @@ from forge.config.models import ForgeConfig
 from forge.deploy_sidecar.service import GUARDKIT_PATH_ENV, build_server
 from forge.adapters.sqlite import connect as sqlite_connect
 from forge.lifecycle import migrations
+from forge.planning.driver import PlanningRunDriver
 from forge.planning.run_store import SqlitePlanningRunStore
 from forge.planning.sidecar_git_runner import CLOSURE_REFUSED_SENTENCE, SidecarGitRunner
 from forge.planning.states import PlanningState
@@ -64,6 +66,7 @@ from tests.forge.planning.test_driver_target_terminal import (
     _init_scratch_repo,
     _leg_details,
     _make_driver,
+    _plan_result,
     _plan_result_native,
     _plan_result_native_versions,
     _plan_yaml_rel,
@@ -234,7 +237,66 @@ async def test_the_plan_legs_checks_run_in_the_sandbox_and_the_stamps_ride_the_c
     assert receipt["rules_only"] is True
     assert receipt["stamped"] == {"ok": "hurl"}
     assert receipt["enforcement"] == "enforced"
+    # The sidecar normalizer changed the tree after the first approval. Forge
+    # sent the exact committed tree through the existing Coach-only review once
+    # and stored that decision, bound to those bytes. Nothing rewrites the tree
+    # after that review.
+    # There are exactly two real mutations: Forge first fills feature_files,
+    # then the sidecar appends stamps. Each changed tree is reviewed once.
+    assert h.ctx["counters"]["semantic_rereview"] == 2
+    first_reviewed, final_reviewed = h.ctx["counters"]["plan_revisions"]
+    assert "feature_files:" in first_reviewed[_plan_yaml_rel(feature_id)]
+    assert "scenarios:" not in first_reviewed[_plan_yaml_rel(feature_id)]
+    assert final_reviewed[_plan_yaml_rel(feature_id)] == committed
+    semantic = _leg_details(store, "feature-plan")["semantic_review"]
+    assert semantic["reviewed_after_rewrite"] is True
+    assert semantic["artifact_identity"] == PlanningRunDriver._plan_artifact_identity(
+        final_reviewed
+    )
     assert _error_cards(h) == []
+
+
+@pytest.mark.asyncio
+async def test_sidecar_normalizer_review_refusal_fails_after_commit_before_build(
+    store: SqlitePlanningRunStore, sandbox_repo, fake_guardkit: Path
+) -> None:
+    """A mutating declared check cannot inherit the pre-normalization receipt.
+
+    The sidecar has already made the immutable plan commit when Forge can ask
+    the async specialist to judge its exact bytes. A refused review therefore
+    leaves that audit commit in place but stops before the build trigger.
+    """
+    repo, _, _ = sandbox_repo
+    _queue(store)
+
+    async def reviewer(**kwargs: Any) -> Any:
+        revision = kwargs.get("revision_of")
+        if revision is None:
+            return _plan_result_native(kwargs["feature_id"])
+        plan_yaml = revision[_plan_yaml_rel(kwargs["feature_id"])]
+        if "scenarios:" not in plan_yaml:
+            return _plan_result(
+                kwargs["feature_id"],
+                dict(revision),
+                reviewed_after_rewrite=True,
+            )
+        return SimpleNamespace(
+            outcome=SimpleNamespace(value="error"),
+            role_output={},
+            reason="Coach refused normalized tree",
+        )
+
+    h = _driver(store, sandbox_repo, plan_dispatch=reviewer)
+
+    assert await _drive_to_failure(h, store) == PlanningState.FAILED.value
+    assert h.ctx["counters"]["build_trigger"] == 0
+    assert len(normalize_calls(fake_guardkit)) == 1
+    assert _plan_yaml_on_branch(repo, f"planning/{CID}")
+    assert any(
+        "committed plan semantic re-review failed" in message
+        and "Coach refused normalized tree" in message
+        for _, message, _ in h.ctx["notifications"]
+    )
 
 
 @pytest.mark.asyncio

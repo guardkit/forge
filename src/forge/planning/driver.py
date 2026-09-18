@@ -4963,20 +4963,26 @@ class PlanningRunDriver:
                 )
                 return None
             committed_files[str(rel)] = content
-        _, semantic_error = self._semantic_review_of(
-            semantic_state["role_output"], committed_files
-        )
+        # A declared sandbox check can mutate the plan tree immediately before
+        # commit (notably ``normalize-stamps`` adding verifier stamps). The
+        # in-process pre-commit path reviews that exact post-normalizer tree in
+        # ``_pre_commit`` above; a sidecar cannot call the async specialist from
+        # inside its pre-commit transaction. Read the committed bytes back and
+        # use the same Coach-only exact-artifact review here. The helper is
+        # idempotent when the approved bytes are unchanged and fails closed for
+        # every missing, rejected, malformed, or tree-rewriting response.
+        semantic_error = await _ensure_semantic_review(committed_files)
         if semantic_error is not None:
             await self._fail_leg(
                 correlation_id,
                 _FEATURE_PLAN_STAGE,
-                "committed plan lost semantic approval: " + semantic_error,
+                "committed plan semantic re-review failed: " + semantic_error,
             )
             return None
         return _PlanAttempt(
             committed=True,
             stamps=stamp_state.get("outcome"),
-            files=files,
+            files=committed_files,
             slug=slug,
             sha=gitres.sha,
             traceability=semantic_state["review"],
