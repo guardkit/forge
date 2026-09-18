@@ -131,6 +131,73 @@ cp ops/systemd/forge-sandbox-runner@.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 ```
 
+### An existing sandbox keeps the environment it was created with
+
+The template unit deliberately does not choose repository deployment settings.
+For an existing sandbox, that means `sbx exec` inherits the environment captured
+when the sandbox was created. A literal service address in that environment can
+outlive the machine which owned the address: the runner still starts and its
+database health read still works, but every embed-on-read call goes to the stale
+address and memory degrades to an empty context.
+
+Correct that as an **instance setting**, without recreating the sandbox or changing
+the embedding server. Add `FLEET_MEMORY_EMBED_URL` to the instance's existing
+`ExecStart` command through the `env` command already inside `sbx exec`. Use the
+stable host bridge for a model router running on the sandbox host:
+
+```text
+FLEET_MEMORY_EMBED_URL=http://host.docker.internal:9000
+```
+
+An `Environment=` line on the host unit alone is insufficient: it sets the host
+`sbx` client's environment but does not replace a value already present inside the
+sandbox. The name and value must appear in the command executed inside the sandbox,
+before `deploy/sandbox-runner.sh`.
+
+**Preserve the complete effective start command.** Instance drop-ins often carry
+other load-bearing arguments. Before editing, read both the installed unit and its
+resolved start command:
+
+```bash
+systemctl --user cat forge-sandbox-runner@api-test-deploy.service
+systemctl --user show forge-sandbox-runner@api-test-deploy.service \
+  -p ExecStart -p FragmentPath -p DropInPaths
+```
+
+In the instance drop-in, clear `ExecStart`, copy the resolved command exactly, and
+insert only this one argument immediately before `deploy/sandbox-runner.sh`:
+
+```text
+FLEET_MEMORY_EMBED_URL=http://host.docker.internal:9000
+```
+
+Diff the old and proposed commands token by token. The memory URL must be the only
+change. In particular, retain the sandbox name, `--cloud` selection, source-mount
+paths, model-router settings, worktree base, temporary directory, cache directory,
+timeouts, and every existing safety flag. Apply and restart the instance only after
+the active build is terminal; service control remains an attended operator step.
+
+Validate the correction in three layers:
+
+1. Using the restarted runner process's effective environment and Python interpreter,
+   instantiate Fleet's `Settings` and report only the selected `embed_url`, `embed_model`, and `embed_dims` values.
+   Do not print the Postgres DSN or the sandbox environment file. The URL must be the
+   host bridge above, and model/dimensions must still match the resident memory
+   service.
+2. From inside the sandbox, make a metadata-only `GET /running` request to that host
+   and confirm the `embed` alias is ready. This checks routing without running model
+   inference or changing model-serving state.
+3. Replay the previously failing task description through the real
+   `FleetMemoryClient.search` configuration path. Record only health, hit count,
+   durations, scores, lengths, and content hashes. A non-empty result with no search
+   failure or HTTP 500 proves the factory's optional-memory read, while keeping memory
+   contents and credentials out of the receipt.
+
+Do not reset or recreate the sandbox to repair this setting: that couples a one-line
+route correction to mounts, ports, policies, and secret injection. Do not edit the
+model router or add retries either; neither repairs a client which is calling an old
+address.
+
 ### Stopping it has to reach inside the sandbox (2026-09-11)
 
 The unit runs a **client** on the host; all the work happens inside the
