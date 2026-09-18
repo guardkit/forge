@@ -117,7 +117,6 @@ COPY README.md ./
 # Python 3.14 image. Local project distributions remain source-path inputs to
 # the single resolver transaction below.
 COPY requirements-image-py314.lock ./
-ENV PIP_REQUIREMENT=/build/requirements-image-py314.lock
 COPY src ./src
 
 # Forge is staged until guardkitfactory and GuardKit have also been copied.
@@ -201,6 +200,7 @@ RUN pip install \
         '.[providers,memory]' \
         /tmp/guardkitfactory \
         /tmp/guardkit \
+        --requirement /build/requirements-image-py314.lock \
         'deepagents==0.7.14' \
     && pip check \
     && python -c "import importlib.metadata as m; import forge, guardkit, guardkit._installer_core, guardkitfactory; assert m.version('deepagents') == '0.7.14'"
