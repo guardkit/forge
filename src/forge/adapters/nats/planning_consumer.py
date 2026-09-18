@@ -219,6 +219,7 @@ class PlanningConsumerDeps:
 
     store: SqlitePlanningRunStore
     publish_notification: PublishNotification | None = None
+    publish_planning_failed: Callable[[str, str], Awaitable[None]] | None = None
     on_recorded: Callable[[str], Awaitable[None]] | None = None
     planning_config: Any | None = None
     queue_store: WorkQueueStore | None = None
@@ -692,6 +693,7 @@ async def handle_planning_message(msg: _MsgLike, deps: PlanningConsumerDeps) -> 
             owner_message=owner_message,
             actor=INTAKE_ACTOR,
             notify=deps.publish_notification,
+            publish_terminal=deps.publish_planning_failed,
             log=logger,
         )
         # Acked, and the driver is NOT kicked: no planning leg runs.

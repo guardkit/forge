@@ -53,6 +53,9 @@ class _StoreLike(Protocol):  # pragma: no cover - structural typing only
 Notify = Callable[..., Awaitable[Any]]
 """``async (correlation_id, message) -> Any`` — best-effort owner line."""
 
+PublishTerminal = Callable[[str, str], Awaitable[Any]]
+"""``async (correlation_id, reason) -> Any`` — derived terminal projection."""
+
 
 DRIVER_ACTOR = "planning-driver"
 """The chain driver's identity in the durable row and in its log lines."""
@@ -98,8 +101,8 @@ def mark_run_failed(
     actor: str = DRIVER_ACTOR,
     owner_message: str | None = None,
     log: logging.Logger | None = None,
-) -> None:
-    """Write FAILED on the durable row; a refused transition is logged only.
+) -> bool:
+    """Write FAILED on the durable row and report whether it was committed.
 
     ``actor`` is who ended the run — the chain driver by default, the intake
     consumer when a name it cannot resolve is refused before any leg runs. It
@@ -136,6 +139,8 @@ def mark_run_failed(
             refused.current_state,
             reason,
         )
+        return False
+    return True
 
 
 async def fail_run(
@@ -147,6 +152,7 @@ async def fail_run(
     owner_message: str,
     actor: str = DRIVER_ACTOR,
     notify: Notify | None = None,
+    publish_terminal: PublishTerminal | None = None,
     log: logging.Logger | None = None,
 ) -> bool:
     """Move the run to FAILED, log it, tell the owner, and return False.
@@ -158,7 +164,7 @@ async def fail_run(
     """
     logger = log or _logger
     label = _actor_label(actor)
-    mark_run_failed(
+    transitioned = mark_run_failed(
         store,
         correlation_id,
         stage_label=stage_label,
@@ -174,6 +180,16 @@ async def fail_run(
         stage_label,
         reason,
     )
+    if transitioned and publish_terminal is not None:
+        try:
+            await publish_terminal(correlation_id, reason)
+        except Exception:
+            logger.warning(
+                "%s: planning-failed projection did not go out for %s "
+                "(durable row remains FAILED)",
+                label,
+                correlation_id,
+            )
     if notify is not None:
         try:
             await notify(correlation_id, owner_message)

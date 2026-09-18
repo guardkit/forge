@@ -38,6 +38,7 @@ from nats_core.events import (
     BuildProgressPayload,
     BuildResumedPayload,
     BuildStartedPayload,
+    PlanningFailedPayload,
     StageCompletePayload,
 )
 
@@ -148,6 +149,17 @@ def _build_cancelled() -> BuildCancelledPayload:
     )
 
 
+def _planning_failed() -> PlanningFailedPayload:
+    return PlanningFailedPayload(
+        correlation_id=CORRELATION_ID,
+        originator="U-RICH",
+        terminal_state="failed",
+        failure_reason="architect attempts exhausted",
+        recoverable=False,
+        failed_at=datetime.now(timezone.utc),
+    )
+
+
 @pytest.fixture
 def nats_client() -> AsyncMock:
     """A mock async NATS client capturing publish calls."""
@@ -210,6 +222,20 @@ class TestPublisherSurface:
 
 class TestPublishContract:
     """One test per method asserting subject + envelope shape + correlation_id."""
+
+    @pytest.mark.asyncio
+    async def test_publish_planning_failed_uses_correlation_subject_and_envelope(
+        self, publisher: PipelinePublisher, nats_client: AsyncMock
+    ) -> None:
+        await publisher.publish_planning_failed(_planning_failed())
+        nats_client.publish.assert_awaited_once()
+        subject, env = _decode_publish_call(nats_client.publish.call_args)
+        assert subject == f"pipeline.planning-failed.{CORRELATION_ID}"
+        assert env["source_id"] == "forge"
+        assert env["event_type"] == EventType.PLANNING_FAILED.value
+        assert env["correlation_id"] == CORRELATION_ID
+        assert env["payload"]["correlation_id"] == CORRELATION_ID
+        assert env["payload"]["failure_reason"] == "architect attempts exhausted"
 
     @pytest.mark.asyncio
     async def test_publish_build_started(

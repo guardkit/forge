@@ -544,6 +544,9 @@ passes ``mention=False`` (a plain line, no @mention — the stamp normalizer's
 un-enforced line) only to a publisher whose signature takes it, and the
 three-positional form otherwise."""
 
+PublishPlanningFailedFn = Callable[[str, str], Awaitable[None]]
+"""``async (correlation_id, reason)`` — terminal derived projection."""
+
 ResourcePreflightFn = Callable[[], "ResourcePreflightResult"]
 """``() -> ResourcePreflightResult`` — a zero-arg pre-run resource check.
 
@@ -1271,6 +1274,7 @@ class PlanningDriverDeps:
     planning_config: "PlanningConfig"
     clock: Callable[[], datetime]
     publish_notification: PublishNotificationFn | None = None
+    publish_planning_failed: PublishPlanningFailedFn | None = None
     # Sandbox first (2026-09-07, rule 71) — the git runner BY TARGET REPO. The
     # composition sets it when any repository has a sandbox: ``org/name`` →
     # that repository's runner (its sandbox sidecar's, or the in-container
@@ -1477,7 +1481,7 @@ class PlanningRunDriver:
             decision = plan_next_step(history)
 
             if isinstance(decision, BoundaryViolation):
-                self._fail(
+                await self._fail(
                     correlation_id,
                     stage_label="planning-boundary",
                     reason=decision.rationale,
@@ -1485,7 +1489,7 @@ class PlanningRunDriver:
                 return
 
             if isinstance(decision, Fail):
-                self._fail(
+                await self._fail(
                     correlation_id,
                     stage_label="planning-dispatch",
                     reason=decision.reason,
@@ -1526,7 +1530,7 @@ class PlanningRunDriver:
                         # to pause: something upstream is refusing to read it.
                         # Stop loudly rather than spin a no-yield loop writing
                         # the same row forever.
-                        self._fail(
+                        await self._fail(
                             correlation_id,
                             stage_label=_PRODUCT_DOCS_STAGE,
                             reason="the brief-stage checkpoint is already "
@@ -1552,7 +1556,7 @@ class PlanningRunDriver:
                     # repeated failures.
                     checkpoint_failures += 1
                     if checkpoint_failures >= 3:
-                        self._fail(
+                        await self._fail(
                             correlation_id,
                             stage_label=_PRODUCT_DOCS_STAGE,
                             reason="checkpoint pause failed 3 times "
@@ -1613,7 +1617,7 @@ class PlanningRunDriver:
             logger.exception(
                 "planning driver: PO dispatch raised for %s", correlation_id
             )
-            self._fail(
+            await self._fail(
                 correlation_id,
                 stage_label="product_owner",
                 reason=f"PO dispatch raised {type(exc).__name__}: {exc}",
@@ -1668,7 +1672,7 @@ class PlanningRunDriver:
             return True
 
         # soft_timeout / error → terminal failure
-        self._fail(
+        await self._fail(
             correlation_id,
             stage_label="product_owner",
             reason=f"PO dispatch {outcome_value}: {reason or 'no reason supplied'}",
@@ -2118,7 +2122,7 @@ class PlanningRunDriver:
             return
 
         reason = result.get("failure_reason", "handoff failed")
-        self._fail(correlation_id, stage_label="planned-handoff", reason=reason)
+        await self._fail(correlation_id, stage_label="planned-handoff", reason=reason)
         await self._notify(
             correlation_id,
             f"Planning run {correlation_id} handoff failed: {reason}",
@@ -8632,6 +8636,7 @@ class PlanningRunDriver:
                 f"{plain_stage_name(stage_label)}: {reason}"
             ),
             notify=_notify_owner,
+            publish_terminal=self._deps.publish_planning_failed,
             log=logger,
         )
 
@@ -9863,17 +9868,29 @@ class PlanningRunDriver:
                         continue
         return latest
 
-    def _fail(self, correlation_id: str, *, stage_label: str, reason: str) -> None:
+    async def _fail(
+        self, correlation_id: str, *, stage_label: str, reason: str
+    ) -> None:
         # The write itself lives in forge.planning.failure so the intake
         # consumer's refusal and this driver end a run through ONE piece of
         # code (2026-09-05 rule 4).
-        mark_run_failed(
+        transitioned = mark_run_failed(
             self._deps.store,
             correlation_id,
             stage_label=stage_label,
             reason=reason,
             log=logger,
         )
+        publish = self._deps.publish_planning_failed
+        if transitioned and publish is not None:
+            try:
+                await publish(correlation_id, reason)
+            except Exception:
+                logger.warning(
+                    "planning driver: planning-failed projection did not go out "
+                    "for %s (durable row remains FAILED)",
+                    correlation_id,
+                )
 
     async def _notify(
         self,
