@@ -1635,7 +1635,8 @@ async def _retained_candidate_base(
             repo=repo_key,
             post=sidecar_post or _urllib_post,
         )
-        candidate_commit = await runner.rev_parse(str(repo_path), candidate_branch)
+        candidate_ref = f"refs/heads/{candidate_branch}"
+        candidate_commit = await runner.rev_parse(str(repo_path), candidate_ref)
         if candidate_commit is None:
             raise _repair_base_refusal(
                 source_build_id,
@@ -1643,7 +1644,7 @@ async def _retained_candidate_base(
             )
         feature_text = await runner.read_file_from_branch(
             repo_path=str(repo_path),
-            branch=candidate_branch,
+            branch=candidate_ref,
             file_path=feature_path,
         )
     else:

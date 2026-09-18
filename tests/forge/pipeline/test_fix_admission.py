@@ -906,11 +906,13 @@ class _RetainedCandidateSidecar:
         route = url.split("/git/", 1)[1]
         self.calls.append((route, body))
         if route == "rev-parse":
-            return 200, {"sha": self.shas.get(body["ref"])}
+            ref = body["ref"]
+            short = ref.removeprefix("refs/heads/")
+            return 200, {"sha": self.shas.get(ref, self.shas.get(short))}
         if route == "read-file-from-branch":
             content = (
                 f"id: {FEATURE_ID}\n"
-                if body["branch"] == f"autobuild/{FEATURE_ID}"
+                if body["branch"] == f"refs/heads/autobuild/{FEATURE_ID}"
                 and body["file_path"] == f".guardkit/features/{FEATURE_ID}.yaml"
                 else None
             )
@@ -1059,12 +1061,13 @@ class TestABuildFailureRepairsItsRetainedCandidate:
         contract_read = sidecar.calls[1][1]
         assert contract_read == {
             "repo": REPO_KEY,
-            "branch": f"autobuild/{FEATURE_ID}",
+            "branch": f"refs/heads/autobuild/{FEATURE_ID}",
             "file_path": f".guardkit/features/{FEATURE_ID}.yaml",
         }
         cut = sidecar.calls[4][1]
         assert cut["repo"] == REPO_KEY
-        assert cut["base_ref"] == f"autobuild/{FEATURE_ID}"
+        assert cut["base_ref"] == "a" * 40
+        assert sidecar.calls[6][1]["expected_head"] == "a" * 40
         assert YAML_FILE in sidecar.written
         assert "parent_feature: FEAT-44A8" in sidecar.written[YAML_FILE]
         assert branches(repo_root) == ["main"]

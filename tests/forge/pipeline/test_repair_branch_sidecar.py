@@ -46,7 +46,9 @@ class FakeSidecar:
         route = url.split("/git/", 1)[1]
         self.calls.append((route, body))
         if route == "rev-parse":
-            return 200, {"sha": self.shas.get(body["ref"])}
+            ref = body["ref"]
+            short = ref.removeprefix("refs/heads/")
+            return 200, {"sha": self.shas.get(ref, self.shas.get(short))}
         if route == "is-ancestor":
             return 200, {
                 "is_ancestor": (body["ancestor"], body["descendant"])
@@ -91,12 +93,13 @@ def test_a_new_branch_is_cut_from_the_base_then_written() -> None:
     routes = [r for r, _ in fake.calls]
     assert routes == ["rev-parse", "rev-parse", "worktree-add", "worktree-remove", "prepare-branch-and-write-tree"]
     cut = fake.calls[2][1]
-    assert cut["base_ref"] == "autobuild/FEAT-BD8F"
+    assert cut["base_ref"] == "17497a2a"
     assert cut["branch"] == "repair/TASK-FEATBD8FFIX1"
     assert cut["path"] == str(ROOT / ".forge" / "worktrees" / "repair-TASK-FEATBD8FFIX1")
     assert fake.calls[3][1]["path"] == cut["path"]
     written = fake.calls[4][1]
     assert written["files"] == FILES and written["checks"] == []
+    assert written["expected_head"] == "17497a2a"
     assert result.branch == "repair/TASK-FEATBD8FFIX1"
     assert result.commit == "c0ffee11"
     assert result.created_branch is True and result.committed is True
@@ -142,7 +145,7 @@ def test_an_existing_descendant_repair_branch_is_reused() -> None:
             "autobuild/FEAT-BD8F": "wanted000",
             "repair/TASK-FEATBD8FFIX1": "c0ffee11",
         },
-        ancestors={("wanted000", "repair/TASK-FEATBD8FFIX1")},
+        ancestors={("wanted000", "c0ffee11")},
     )
     result = _run(fake, expected_base_commit="wanted000")
     assert [route for route, _ in fake.calls] == [

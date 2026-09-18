@@ -58,7 +58,9 @@ class FakeSidecar:
         route = url.rsplit("/git/", 1)[1]
         self.calls.append((route, body))
         if route == "rev-parse":
-            return 200, {"sha": self.shas.get(body["ref"])}
+            ref = body["ref"]
+            short = ref.removeprefix("refs/heads/")
+            return 200, {"sha": self.shas.get(ref, self.shas.get(short))}
         if route == "worktree-add":
             self.shas[body["branch"]] = "base0"
             return 200, {"status": "success", "path": body["path"], "reused": False, "detail": ""}
@@ -91,9 +93,10 @@ class TestTheTaskRidesTheSidecar:
         routes = [r for r, _ in fake.calls]
         assert routes == ["rev-parse", "rev-parse", "worktree-add", "worktree-remove", "prepare-branch-and-write-tree"]
         cut = fake.calls[2][1]
-        assert cut["base_ref"] == "autobuild/FEAT-BD8F"
+        assert cut["base_ref"] == "17497a2a"
         assert cut["repo"] == "guardkit/api_test"
         written = fake.calls[4][1]["files"]
+        assert fake.calls[4][1]["expected_head"] == "17497a2a"
         assert set(written) == {
             ".guardkit/features/TASK-FEATBD8FFIX1.yaml",
             prepared.task_file_path,

@@ -2255,7 +2255,7 @@ def process_git_write_tree_request(
 ) -> tuple[int, dict[str, Any]]:
     """Validate and perform a ``/git/prepare-branch-and-write-tree`` payload.
 
-    ``{repo, branch, files, message, checks}`` → on a permitted request a 200
+    ``{repo, branch, files, message, checks, expected_head?}`` → on a permitted request a 200
     carrying ``{status, sha, checks, detail}``: ``status`` is the runner's
     (``success`` with the commit's ``sha``, or ``failed`` with ``detail``
     saying why — a check that refused the commit is a ``failed`` with the
@@ -2274,6 +2274,11 @@ def process_git_write_tree_request(
     error = _ref_error(branch, what="branch")
     if error:
         return 400, {"error": error}
+    expected_head = payload.get("expected_head")
+    if expected_head is not None:
+        error = _ref_error(expected_head, what="expected_head")
+        if error:
+            return 400, {"error": error}
     files, error = _validate_files(payload.get("files"))
     if error or files is None:
         return 400, {"error": error}
@@ -2339,6 +2344,9 @@ def process_git_write_tree_request(
                 files=files,
                 message=message,
                 pre_commit=hook,
+                expected_head=(
+                    str(expected_head) if expected_head is not None else None
+                ),
             )
         )
     except Exception as exc:  # noqa: BLE001 — never raise past the boundary
