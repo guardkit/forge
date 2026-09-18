@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import socket
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -223,3 +225,36 @@ def test_capacity_preflight_accepts_exact_floor(tmp_path: Path) -> None:
     report = inspect_worktree_capacity(tmp_path, min_available_bytes=1)
     assert report["ok"] is True
     assert report["capacity"]["available_inodes"] > 0
+
+
+@pytest.mark.parametrize("location", ["outer", "inner"])
+@pytest.mark.parametrize("kind", ["fifo", "socket"])
+def test_git_invisible_special_entry_after_offer_preserves_owned_tree(
+    tmp_path: Path, location: str, kind: str
+) -> None:
+    repo, base, outer, inner = _repo_with_nested(tmp_path)
+    offered = inspect_autobuild_worktree(
+        repo=repo, base=base, build_id=BUILD_ID, path=outer
+    )
+    assert offered["ok"] is True
+    offered["cleanup_registrations"] = offered["nested_registrations"]
+    special = (outer if location == "outer" else inner) / "special"
+    if kind == "fifo":
+        os.mkfifo(special)
+    else:
+        # /proc/self/fd keeps the AF_UNIX address below its 108-byte limit.
+        descriptor = os.open(special.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            with socket.socket(socket.AF_UNIX) as endpoint:
+                endpoint.bind(f"/proc/self/fd/{descriptor}/special")
+        finally:
+            os.close(descriptor)
+    result = retire_autobuild_worktree(
+        repo=repo, base=base, build_id=BUILD_ID, path=outer, expected=offered
+    )
+    assert result["status"] == "kept", result
+    assert "unsupported filesystem entry" in result["detail"]
+    assert outer.is_dir() and inner.is_dir() and special.exists()
+    assert inspect_autobuild_worktree(
+        repo=repo, base=base, build_id=BUILD_ID, path=outer
+    )["ok"] is False

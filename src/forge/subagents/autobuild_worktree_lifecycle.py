@@ -124,9 +124,35 @@ def _is_relative_to(path: Path, root: Path) -> bool:
     return path != root
 
 
+def _unsupported_entry(path: Path) -> str | None:
+    """Refuse Git-invisible special entries without following directory links.
+
+    Git omits sockets and named pipes from its status output. The exact owned
+    tree must therefore also be checked before its Git identity can authorize
+    recursive removal. Ignored entries are checked too; nothing is deleted here.
+    """
+    def unreadable(error: OSError) -> None:
+        raise error
+
+    try:
+        for root, directories, files, descriptor in os.fwalk(
+            path, topdown=True, onerror=unreadable, follow_symlinks=False
+        ):
+            for name in directories + files:
+                mode = os.stat(name, dir_fd=descriptor, follow_symlinks=False).st_mode
+                if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode) or stat.S_ISLNK(mode)):
+                    return f"unsupported filesystem entry: {Path(root) / name}"
+    except OSError as exc:
+        return f"worktree filesystem could not be inspected: {exc}"
+    return None
+
+
 def _status_sha(
     path: Path, *, registered_descendants: tuple[Path, ...] = ()
 ) -> tuple[str | None, str | None]:
+    filesystem_error = _unsupported_entry(path)
+    if filesystem_error:
+        return None, filesystem_error
     code, status_raw = _git(
         path, "status", "--porcelain=v1", "-z", "--untracked-files=all"
     )
