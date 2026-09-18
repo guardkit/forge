@@ -1,15 +1,16 @@
 # Forge production image third-party lock for Python 3.14.
 #
 # Source inventory: accepted image sha256:80485429970e02fc4290d68c249eece9f59ec50c74ef9f0da627ba7dbc4c38c4
-# Inventory receipt SHA256: 532035a99a62cdf920ff670ddd860ac2991469072449e2afe8a725458ffba5e8
+# Path-qualified inventory receipt SHA256: 3a6d24e65f88699602555804adc2d706f47fddcc2dd6a31250476ebd151ed598
 # The five local distributions (forge, guardkit-py, guardkitfactory,
 # fleet-memory, nats-core) are intentionally supplied as source paths in the
 # Dockerfile and therefore do not appear here.
 #
-# Update only from a reviewed accepted-image inventory: canonicalize and sort
-# every installed distribution name, exclude those five local distributions,
-# replace these exact pins, then require pip check plus exact source/package
-# inventory audits before accepting the rebuilt image.
+# Update only from a reviewed accepted-image top-level inventory: canonicalize
+# and sort every installed distribution name, exclude those five local
+# distributions, replace these exact pins, then require pip check plus exact
+# source/package inventory audits before accepting the rebuilt image. Nested
+# vendored *.dist-info metadata is not an installed top-level distribution.
 agent-client-protocol==0.12.1
 aiofile==3.12.3
 aiohappyeyeballs==2.7.1
@@ -21,8 +22,6 @@ anthropic==1.6.0
 anyio==4.15.1
 attrs==26.1.0
 authlib==1.8.0
-autocommand==2.2.2
-backports-tarfile==1.2.0
 beartype==0.22.9
 beautifulsoup4==4.15.0
 blockbuster==1.5.27
@@ -72,11 +71,9 @@ httpx==0.28.1
 httpx-sse==0.4.3
 httpx2==2.13.0
 idna==3.20
-importlib-metadata==8.7.1
 jaraco-classes==3.4.0
-jaraco-context==6.1.0
-jaraco-functools==4.4.0
-jaraco-text==4.0.0
+jaraco-context==6.1.2
+jaraco-functools==4.6.0
 jeepney==0.9.0
 jinja2==3.1.6
 jiter==0.17.0
@@ -117,7 +114,7 @@ markupsafe==3.0.3
 mcp==1.30.0
 mdit-py-plugins==0.6.1
 mdurl==0.1.2
-more-itertools==10.8.0
+more-itertools==11.1.0
 multidict==6.8.0
 nats-py==2.16.0
 numpy==2.5.3
@@ -132,12 +129,12 @@ opentelemetry-sdk==1.42.1
 opentelemetry-semantic-conventions==0.63b1
 orjson==3.12.0
 ormsgpack==1.12.2
-packaging==26.0
+packaging==26.3
 pathable==0.6.0
 pathspec==1.1.1
 pillow==12.3.0
 pip==26.0.1
-platformdirs==4.4.0
+platformdirs==4.11.10
 prometheus-client==0.26.0
 prompt-toolkit==3.0.53
 propcache==0.5.4
@@ -184,7 +181,6 @@ textual==8.2.8
 textual-autocomplete==4.0.6
 textual-speedups==0.2.1
 tiktoken==0.14.0
-tomli==2.4.0
 tomli-w==1.2.0
 tree-sitter==0.26.0
 tree-sitter-language-pack==1.20.0
@@ -201,8 +197,6 @@ watchfiles==1.2.0
 wcmatch==11.0.1
 wcwidth==0.8.4
 websockets==16.1.1
-wheel==0.46.3
 xxhash==4.0.1
 yarl==1.25.1
-zipp==3.23.0
 zstandard==0.25.0
