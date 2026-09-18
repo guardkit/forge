@@ -243,3 +243,42 @@ class SidecarCandidateGit:
             )
             return False
         return bool(decoded.get("removed"))
+
+    async def inspect_autobuild_worktree(
+        self, build_id: str, path: str
+    ) -> dict[str, Any]:
+        decoded, why = await self._ok(
+            "/git/autobuild-worktree-inspect",
+            {"repo": self._repo, "build_id": str(build_id), "path": str(path)},
+            timeout=self._read_timeout_s,
+        )
+        if decoded is None:
+            return {
+                "ok": False,
+                "build_id": str(build_id),
+                "path": str(path),
+                "detail": str(why),
+            }
+        return decoded
+
+    async def retire_autobuild_worktree(
+        self, build_id: str, path: str, expected: dict[str, Any]
+    ) -> dict[str, Any]:
+        decoded, why = await self._ok(
+            "/git/autobuild-worktree-retire",
+            {
+                "repo": self._repo,
+                "build_id": str(build_id),
+                "path": str(path),
+                "expected": expected,
+            },
+            timeout=self._layout_timeout_s,
+        )
+        if decoded is None:
+            return {
+                "status": "kept",
+                "build_id": str(build_id),
+                "path": str(path),
+                "detail": str(why),
+            }
+        return decoded

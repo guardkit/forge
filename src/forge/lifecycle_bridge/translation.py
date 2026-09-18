@@ -236,6 +236,10 @@ class _Snapshot:
     #: payload the same post-construction way ``budget_cap_killed`` rides, so
     #: ``model_dump`` output — the wire bytes — is unchanged.
     terminal_class: str | None = None
+    #: Exact retained autobuild worktree identity. It is attached to the local
+    #: BuildCompletePayload object for the merge-offer hook and deliberately
+    #: remains outside the v1 wire schema.
+    worktree_retention: dict[str, Any] | None = None
 
 
 def _extract_error_metadata(
@@ -333,6 +337,11 @@ def _extract_state(data: Mapping[str, Any], feature_id: str) -> _Snapshot | None
             terminal_class=(
                 str(snap["terminal_class"])
                 if snap.get("terminal_class") is not None
+                else None
+            ),
+            worktree_retention=(
+                dict(snap["worktree_retention"])
+                if isinstance(snap.get("worktree_retention"), Mapping)
                 else None
             ),
         )
@@ -591,6 +600,10 @@ class StreamEventTranslator:
             summary=COMPLETED_SUMMARY_FALLBACK,
         )
         attach_correlation_id_to_v1_payload(payload, correlation_id)
+        if snap.worktree_retention is not None:
+            object.__setattr__(
+                payload, "worktree_retention", dict(snap.worktree_retention)
+            )
         return payload
 
     def build_synthetic_failed(

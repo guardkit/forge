@@ -41,6 +41,28 @@ BUILD_ID = "build-FEAT-MO1-20260824"
 FEATURE_ID = "FEAT-MO1"
 REPO = "appmilla/api_test"
 CORRELATION = "corr-mo-1"
+CANDIDATE_SHA = "c" * 40
+CANDIDATE_TREE = "d" * 40
+
+
+def _git(repo: Path, *args: str) -> str:
+    done = subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.email=tests@example.invalid",
+            "-c",
+            "user.name=tests",
+            "-c",
+            "commit.gpgsign=false",
+            *args,
+        ],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return done.stdout.strip()
 
 
 # ---------------------------------------------------------------------------
@@ -107,12 +129,18 @@ class _Recorder:
         self.events.append(("paused", payload))
 
 
+class _CandidatePins:
+    async def rev_parse(self, ref: str) -> str | None:
+        return CANDIDATE_TREE if ref.endswith("^{tree}") else CANDIDATE_SHA
+
+
 def _service(
     config: ForgeConfig,
     pool: SqliteLifecyclePersistence,
     recorder: _Recorder,
     *,
     sha: str | None = "mainsha1234",
+    git_surface: Any | None = None,
 ) -> MergeOfferService:
     async def _git_head(_repo_root: Path) -> str | None:
         return sha
@@ -125,6 +153,7 @@ def _service(
         ),
         raw_publish=recorder.raw_publish,
         git_head=_git_head,
+        git_surface=git_surface or (lambda _repo, _root: _CandidatePins()),
     )
 
 
@@ -477,3 +506,62 @@ class TestGitPin:
         empty = tmp_path / "empty"
         empty.mkdir()
         assert await git_rev_parse_main(empty) is None
+
+class TestRetainedCandidateIdentity:
+    @pytest.mark.asyncio
+    async def test_offer_pins_candidate_and_registered_retained_worktree(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+        repo_root: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from forge.deploy.candidate_tree import InContainerCandidateGit
+        from forge.subagents.autobuild_worktree_lifecycle import (
+            inspect_autobuild_worktree,
+        )
+
+        build_id = BUILD_ID
+        _git(repo_root, "init", "-b", "main", "-q")
+        (repo_root / "README.md").write_text("main\n", encoding="utf-8")
+        _git(repo_root, "add", "README.md")
+        _git(repo_root, "commit", "-q", "-m", "main")
+        _git(repo_root, "branch", f"autobuild/{FEATURE_ID}")
+        base = tmp_path / "autobuild-worktrees"
+        outer = base / build_id
+        monkeypatch.setenv("FORGE_AUTOBUILD_WORKTREE_BASE", str(base))
+        _git(repo_root, "worktree", "add", "--detach", str(outer), "main")
+        inner = outer / ".guardkit/worktrees/TASK-MO-001"
+        inner.parent.mkdir(parents=True)
+        _git(repo_root, "worktree", "add", str(inner), f"autobuild/{FEATURE_ID}")
+        (inner / "offered-note.txt").write_text("keep through offer\n")
+        retained = inspect_autobuild_worktree(
+            repo=repo_root, base=base, build_id=build_id, path=outer
+        )
+        assert retained["ok"] is True
+
+        _insert_build(pool)
+        event = _event()
+        object.__setattr__(event, "worktree_retention", retained)
+        recorder = _Recorder()
+        await _service(
+            config,
+            pool,
+            recorder,
+            git_surface=lambda _repo, root: InContainerCandidateGit(root),
+        ).maybe_offer(event)
+
+        offer = _offer_rows(pool)[0].details[MERGE_OFFER_DETAILS_KEY]
+        candidate_sha = _git(repo_root, "rev-parse", f"autobuild/{FEATURE_ID}")
+        assert offer["candidate_identity_version"] == 1
+        assert offer["candidate_sha"] == candidate_sha
+        assert offer["candidate_tree"] == _git(
+            repo_root, "rev-parse", f"{candidate_sha}^{{tree}}"
+        )
+        assert offer["worktree_retention"]["path"] == str(outer)
+        assert offer["worktree_retention"]["nested_registrations"][0][
+            "path"
+        ] == str(inner)
+        assert pool.get_build_row(build_id).worktree_path == str(outer)
+        assert outer.is_dir() and inner.is_dir()

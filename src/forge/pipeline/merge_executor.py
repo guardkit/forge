@@ -941,6 +941,9 @@ async def execute_merge_deploy(
     baseline_failing: list[str] | None = None,
     dry_run: bool = False,
     merge_branch: str | None = None,
+    expected_candidate_sha: str | None = None,
+    expected_candidate_tree: str | None = None,
+    worktree_retention: dict[str, Any] | None = None,
 ) -> MergeDeployOutcome:
     """Run candidate check -> merge -> tree check -> promote -> report for one press.
 
@@ -1410,6 +1413,18 @@ async def execute_merge_deploy(
             )
         gate["candidate_sha"] = candidate_sha
         gate["candidate_tree"] = await git.rev_parse(f"{candidate_sha}^{{tree}}")
+        if expected_candidate_sha and candidate_sha != expected_candidate_sha:
+            return _could_not_check(
+                f"the offered branch moved from {expected_candidate_sha} to "
+                f"{candidate_sha}; nothing was merged and its retained "
+                "worktree is kept"
+            )
+        if expected_candidate_tree and gate["candidate_tree"] != expected_candidate_tree:
+            return _could_not_check(
+                f"the offered candidate tree moved from {expected_candidate_tree} "
+                f"to {gate['candidate_tree']}; nothing was merged and its "
+                "retained worktree is kept"
+            )
         excluded_now: bool | None = None
         try:
             excluded_now = await git.ensure_candidate_trees_excluded()
@@ -2038,6 +2053,45 @@ async def execute_merge_deploy(
         # if it is still standing, and its laid-out tree removed — BEFORE the
         # report goes out, so the report never says "torn down" ahead of time.
         await _cleanup()
+    if (
+        not dry_run
+        and outcome.result == "merged-and-running"
+        and isinstance(worktree_retention, dict)
+    ):
+        current_sha = await git.rev_parse(branch)
+        current_tree = (
+            await git.rev_parse(f"{current_sha}^{{tree}}") if current_sha else None
+        )
+        if (
+            current_sha != expected_candidate_sha
+            or current_tree != expected_candidate_tree
+        ):
+            retired = {
+                "status": "kept",
+                "build_id": build_id,
+                "path": worktree_retention.get("path"),
+                "detail": (
+                    "candidate ref/tree diverged after the successful press; "
+                    "the retained worktree was preserved"
+                ),
+                "offered_candidate_sha": expected_candidate_sha,
+                "current_candidate_sha": current_sha,
+                "offered_candidate_tree": expected_candidate_tree,
+                "current_candidate_tree": current_tree,
+            }
+        else:
+            retired = await git.retire_autobuild_worktree(
+                build_id,
+                str(worktree_retention.get("path") or ""),
+                worktree_retention,
+            )
+        _write_receipt("autobuild_worktree_cleanup.json", retired)
+        if retired.get("status") != "removed":
+            logger.warning(
+                "merge-executor: retained autobuild worktree for %s was kept: %s",
+                build_id,
+                retired.get("detail"),
+            )
     return await _publish_report(outcome)
 
 
@@ -2378,6 +2432,25 @@ class MergeApprovalConsumer:
                 request_id,
             )
             return
+        expected_candidate_sha = str(offer.get("candidate_sha") or "") or None
+        expected_candidate_tree = str(offer.get("candidate_tree") or "") or None
+        if offer.get("candidate_identity_version") == 1 and (
+            not expected_candidate_sha or not expected_candidate_tree
+        ):
+            logger.error(
+                "merge-executor: %s approved but its versioned offer carries "
+                "no exact candidate sha/tree — refusing an unpinned candidate",
+                request_id,
+            )
+            return
+        worktree_retention = offer.get("worktree_retention")
+        if worktree_retention is not None and not isinstance(worktree_retention, dict):
+            logger.error(
+                "merge-executor: %s approved but its retained worktree identity "
+                "is malformed",
+                request_id,
+            )
+            return
         baseline = offer.get("baseline_failing")
         baseline_failing = (
             [str(x) for x in baseline] if isinstance(baseline, list) else None
@@ -2394,6 +2467,9 @@ class MergeApprovalConsumer:
                 decided_by=payload.decided_by,
                 baseline_failing=baseline_failing,
                 merge_branch=merge_branch,
+                expected_candidate_sha=expected_candidate_sha,
+                expected_candidate_tree=expected_candidate_tree,
+                worktree_retention=worktree_retention,
             )
         )
         self._tasks.add(task)
@@ -2411,6 +2487,9 @@ class MergeApprovalConsumer:
         decided_by: str,
         baseline_failing: list[str] | None,
         merge_branch: str | None = None,
+        expected_candidate_sha: str | None = None,
+        expected_candidate_tree: str | None = None,
+        worktree_retention: dict[str, Any] | None = None,
     ) -> None:
         # Per-repo single-flight: an asyncio lock per repo key PLUS the
         # executor's own durable step probes.
@@ -2427,6 +2506,9 @@ class MergeApprovalConsumer:
                     decided_by=decided_by,
                     baseline_failing=baseline_failing,
                     merge_branch=merge_branch,
+                    expected_candidate_sha=expected_candidate_sha,
+                    expected_candidate_tree=expected_candidate_tree,
+                    worktree_retention=worktree_retention,
                 )
             except Exception as exc:  # noqa: BLE001 — the task must not die silent
                 logger.error(

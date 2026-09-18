@@ -3028,3 +3028,142 @@ class TestTheRefusalSaysWhatItSaw:
             "nothing was merged and the branch is kept."
         )
         assert "failed_assertions" not in outcome.gate_before_merge
+
+class TestRetainedAutobuildWorktreeEndOfLifecycle:
+    @staticmethod
+    def _retained(
+        repo_root: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> tuple[dict[str, Any], Path, Path, str, str]:
+        from forge.subagents.autobuild_worktree_lifecycle import (
+            inspect_autobuild_worktree,
+        )
+
+        base = tmp_path / "autobuild-worktrees"
+        outer = base / BUILD_ID
+        monkeypatch.setenv("FORGE_AUTOBUILD_WORKTREE_BASE", str(base))
+        _git(repo_root, "worktree", "add", "--detach", str(outer), "main")
+        inner = outer / ".guardkit/worktrees/TASK-MX1-001"
+        inner.parent.mkdir(parents=True)
+        _git(repo_root, "worktree", "add", str(inner), f"autobuild/{FEATURE_ID}")
+        (inner / "retained-note.txt").write_text("available through offer\n")
+        identity = inspect_autobuild_worktree(
+            repo=repo_root, base=base, build_id=BUILD_ID, path=outer
+        )
+        identity["cleanup_registrations"] = identity["nested_registrations"]
+        candidate_sha = _git(repo_root, "rev-parse", f"autobuild/{FEATURE_ID}")
+        candidate_tree = _git(repo_root, "rev-parse", f"{candidate_sha}^{{tree}}")
+        return identity, outer, inner, candidate_sha, candidate_tree
+
+    @pytest.mark.asyncio
+    async def test_merged_and_running_retires_nested_then_outer(
+        self,
+        config,
+        pool,
+        repo_root: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        _receipts_env: Path,
+    ) -> None:
+        identity, outer, inner, sha, tree = self._retained(
+            repo_root, tmp_path, monkeypatch
+        )
+        _ensure_build(pool, build_id=BUILD_ID, feature_id=FEATURE_ID)
+        deps, _publisher, _gk, _dp = _deps(config, pool)
+
+        outcome = await execute_merge_deploy(
+            deps=deps,
+            build_id=BUILD_ID,
+            feature_id=FEATURE_ID,
+            repo=REPO,
+            repo_root=repo_root,
+            expect_main_sha=MAIN_SHA,
+            correlation_id=CORRELATION,
+            decided_by="rich",
+            expected_candidate_sha=sha,
+            expected_candidate_tree=tree,
+            worktree_retention=identity,
+        )
+
+        assert outcome.result == "merged-and-running"
+        assert not outer.exists() and not inner.exists()
+        receipt = json.loads(
+            (_receipts_env / f"merge-{BUILD_ID}/autobuild_worktree_cleanup.json")
+            .read_text()
+        )
+        assert receipt["status"] == "removed"
+
+    @pytest.mark.asyncio
+    async def test_candidate_refusal_keeps_retained_tree(
+        self,
+        config,
+        pool,
+        repo_root: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        _receipts_env: Path,
+    ) -> None:
+        identity, outer, inner, sha, tree = self._retained(
+            repo_root, tmp_path, monkeypatch
+        )
+        _ensure_build(pool, build_id=BUILD_ID, feature_id=FEATURE_ID)
+        deploy = _FakeDeploy(candidate_outcome="failed", gate=dict(RED_GATE))
+        deps, _publisher, _gk, _dp = _deps(config, pool, deploy=deploy)
+
+        outcome = await execute_merge_deploy(
+            deps=deps,
+            build_id=BUILD_ID,
+            feature_id=FEATURE_ID,
+            repo=REPO,
+            repo_root=repo_root,
+            expect_main_sha=MAIN_SHA,
+            correlation_id=CORRELATION,
+            decided_by="rich",
+            expected_candidate_sha=sha,
+            expected_candidate_tree=tree,
+            worktree_retention=identity,
+        )
+
+        assert outcome.result == "candidate-refused"
+        assert outer.is_dir() and inner.is_dir()
+        assert not (
+            _receipts_env / f"merge-{BUILD_ID}/autobuild_worktree_cleanup.json"
+        ).exists()
+
+    @pytest.mark.asyncio
+    async def test_moved_offered_candidate_is_refused_and_kept(
+        self,
+        config,
+        pool,
+        repo_root: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        _receipts_env: Path,
+    ) -> None:
+        identity, outer, inner, sha, tree = self._retained(
+            repo_root, tmp_path, monkeypatch
+        )
+        (inner / "after-offer.txt").write_text("new commit\n")
+        _git(inner, "add", "after-offer.txt")
+        _git(inner, "commit", "-q", "-m", "move offered branch")
+        deps, _publisher, gk, dp = _deps(config, pool)
+
+        outcome = await execute_merge_deploy(
+            deps=deps,
+            build_id=BUILD_ID,
+            feature_id=FEATURE_ID,
+            repo=REPO,
+            repo_root=repo_root,
+            expect_main_sha=MAIN_SHA,
+            correlation_id=CORRELATION,
+            decided_by="rich",
+            expected_candidate_sha=sha,
+            expected_candidate_tree=tree,
+            worktree_retention=identity,
+        )
+
+        assert outcome.result == "candidate-refused"
+        assert "offered branch moved" in outcome.detail
+        assert gk.calls == [] and dp.calls == []
+        assert outer.is_dir() and inner.is_dir()

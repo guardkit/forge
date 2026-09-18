@@ -407,6 +407,7 @@ class MergeOfferService:
         git_head: Callable[[Path], Awaitable[str | None]] = git_rev_parse_main,
         baseline_reader: Callable[[str], list[str] | None] = read_baseline_failing,
         scope_pass: Callable[..., Any] = run_the_scope_pass,
+        git_surface: Callable[[str, Path], Any | None] | None = None,
         clock: Callable[[], datetime] = _utcnow,
     ) -> None:
         self._config = config
@@ -416,6 +417,7 @@ class MergeOfferService:
         self._git_head = git_head
         self._baseline_reader = baseline_reader
         self._scope_pass = scope_pass
+        self._git_surface = git_surface
         self._clock = clock
 
     async def maybe_offer(self, event: Any) -> None:
@@ -445,6 +447,22 @@ class MergeOfferService:
                 event.tasks_failed,
             )
             return
+
+        retained = getattr(event, "worktree_retention", None)
+        if isinstance(retained, Mapping) and retained.get("ok"):
+            path = str(retained.get("path") or "").strip()
+            if (
+                retained.get("build_id") != event.build_id
+                or not path
+                or Path(path).name != event.build_id
+            ):
+                logger.error(
+                    "merge-offer: refusing %s — its retained worktree identity "
+                    "does not bind the build id and path",
+                    event.build_id,
+                )
+                return
+            self._pool.record_worktree_path(event.build_id, path)
 
         # THE SCOPE PASS (the planner fix, 2026-09-15). Read the finished
         # branch once, here, before the card is built: what it changed that
@@ -481,6 +499,8 @@ class MergeOfferService:
             "tasks_completed": event.tasks_completed,
             "tasks_total": event.tasks_total,
         }
+        if isinstance(retained, Mapping) and retained.get("ok"):
+            details["runner_worktree_retention"] = dict(retained)
         if scope is not None:
             details["scope_report"] = scope.to_dict()
 
@@ -604,7 +624,16 @@ class MergeOfferService:
             )
             return False
 
-        # (b) Pin main's sha now — the merge later refuses if main moved.
+        # (b) Pin main and the exact offered candidate now.
+        merge_branch = str(getattr(row, "merge_branch", None) or "").strip() or None
+        branch = branch_to_merge(feature_id, merge_branch)
+        from forge.deploy.candidate_tree import InContainerCandidateGit
+
+        git = (
+            self._git_surface(row.repo, repo_root)
+            if self._git_surface is not None
+            else None
+        ) or InContainerCandidateGit(repo_root)
         expect_main_sha = await self._git_head(repo_root)
         if expect_main_sha is None:
             logger.error(
@@ -615,6 +644,57 @@ class MergeOfferService:
                 build_id,
             )
             return False
+        candidate_sha = await git.rev_parse(branch)
+        candidate_tree = (
+            await git.rev_parse(f"{candidate_sha}^{{tree}}")
+            if candidate_sha
+            else None
+        )
+        if not candidate_sha or not candidate_tree:
+            logger.error(
+                "merge-offer: could not pin the exact candidate %s for %s — "
+                "no card is offered",
+                branch,
+                build_id,
+            )
+            return False
+
+        retained_identity: dict[str, Any] | None = None
+        runner_identity = (extra_details or {}).get("runner_worktree_retention")
+        worktree_path = str(getattr(row, "worktree_path", None) or "").strip()
+        if isinstance(runner_identity, Mapping):
+            if not worktree_path:
+                logger.error(
+                    "merge-offer: refusing %s — the runner retained a worktree "
+                    "but the build row has no recorded path",
+                    build_id,
+                )
+                return False
+            retained_identity = await git.inspect_autobuild_worktree(
+                build_id, worktree_path
+            )
+            registrations = list(
+                retained_identity.get("nested_registrations") or []
+            )
+            candidate_registration = [
+                item
+                for item in registrations
+                if item.get("branch") == f"refs/heads/{branch}"
+                and item.get("head") == candidate_sha
+            ]
+            if not retained_identity.get("ok") or len(candidate_registration) != 1:
+                logger.error(
+                    "merge-offer: refusing %s — the retained worktree does not "
+                    "carry exactly one registered checkout of %s at %s (%s)",
+                    build_id,
+                    branch,
+                    candidate_sha,
+                    retained_identity.get("detail"),
+                )
+                return False
+            retained_identity = dict(retained_identity)
+            retained_identity["cleanup_registrations"] = candidate_registration
+
         baseline_failing = self._baseline_reader(build_id)
 
         # (c) DURABLE LATCH FIRST — probe, then write, BEFORE any wire.
@@ -631,12 +711,6 @@ class MergeOfferService:
 
         request_id = merge_request_id(build_id)
         subject = approval_subject_for(feature_id)
-        # The branch the press will merge (Part M, rule 55): the row's recorded
-        # journey branch for a repair, the feature's own branch otherwise. The
-        # raw column rides beside it so the executor can tell "recorded" from
-        # "derived" without a second lookup.
-        merge_branch = str(getattr(row, "merge_branch", None) or "").strip() or None
-        branch = branch_to_merge(feature_id, merge_branch)
         details: dict[str, Any] = {
             "kind": "merge_deploy_offer",
             "build_id": build_id,
@@ -645,6 +719,14 @@ class MergeOfferService:
             "branch": branch,
             "merge_branch": merge_branch,
             "expect_main_sha": expect_main_sha,
+            "candidate_identity_version": 1,
+            "candidate_sha": candidate_sha,
+            "candidate_tree": candidate_tree,
+            **(
+                {"worktree_retention": retained_identity}
+                if retained_identity is not None
+                else {}
+            ),
             **dict(extra_details or {}),
             "baseline_failing": baseline_failing,
             "resume_options": ["approve", "reject"],
