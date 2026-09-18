@@ -25,7 +25,7 @@ from typing import Any
 
 import pytest
 from nats_core.envelope import EventType, MessageEnvelope
-from nats_core.events import ApprovalResponsePayload
+from nats_core.events import ApprovalResponsePayload, BuildCompletePayload
 
 from forge.adapters.guardkit.models import GuardKitResult
 from forge.adapters.sqlite import connect as sqlite_connect
@@ -51,6 +51,7 @@ from forge.pipeline.merge_offer import (
     MERGE_OFFER_DETAILS_KEY,
     MERGE_OFFER_STAGE_LABEL,
     MERGE_OFFER_TARGET_IDENTIFIER,
+    MergeOfferService,
 )
 
 BUILD_ID = "build-FEAT-MX1-20260824"
@@ -3131,6 +3132,97 @@ class TestRetainedAutobuildWorktreeEndOfLifecycle:
             _receipts_env / f"merge-{BUILD_ID}/autobuild_worktree_cleanup.json"
         ).exists()
 
+
+class TestDurableRetainedCandidateIdentity:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "mutation",
+        ["unchanged", "untracked_content", "tracked_content", "branch_alias"],
+    )
+    async def test_normal_offer_consumer_binds_content_and_exact_branch(
+        self,
+        mutation: str,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+        repo_root: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        _receipts_env: Path,
+    ) -> None:
+        retained, outer, inner, sha, _tree = (
+            TestRetainedAutobuildWorktreeEndOfLifecycle._retained(
+                repo_root, tmp_path, monkeypatch
+            )
+        )
+        if mutation == "tracked_content":
+            (inner / "README.md").write_text("dirty before offer\n")
+        _ensure_build(pool, build_id=BUILD_ID, feature_id=FEATURE_ID)
+
+        class _OfferWire:
+            async def raw_publish(self, _subject: str, _body: bytes) -> None:
+                return None
+
+            async def publish_build_paused(self, _payload: Any) -> None:
+                return None
+
+        wire = _OfferWire()
+        service = MergeOfferService(
+            config=config,
+            pool=pool,
+            pipeline_publisher=wire,
+            raw_publish=wire.raw_publish,
+            git_surface=lambda _repo, root: InContainerCandidateGit(root),
+            scope_pass=lambda **_kwargs: None,
+        )
+        event = BuildCompletePayload(
+            feature_id=FEATURE_ID,
+            build_id=BUILD_ID,
+            tasks_completed=1,
+            tasks_failed=0,
+            tasks_total=1,
+            duration_seconds=1,
+            summary="done",
+        )
+        object.__setattr__(event, "worktree_retention", retained)
+        await service.maybe_offer(event)
+        offers = [
+            row for row in pool.read_stages(BUILD_ID)
+            if row.target_identifier == MERGE_OFFER_TARGET_IDENTIFIER
+        ]
+        assert len(offers) == 1
+        assert offers[0].details[MERGE_OFFER_DETAILS_KEY]["candidate_sha"] == sha
+
+        if mutation == "untracked_content":
+            (inner / "retained-note.txt").write_text("changed after offer\n")
+        elif mutation == "tracked_content":
+            (inner / "README.md").write_text("changed after offer\n")
+        elif mutation == "branch_alias":
+            _git(repo_root, "branch", "different-name-same-sha", sha)
+            pool.connection.execute(
+                "UPDATE builds SET merge_branch=? WHERE build_id=?",
+                ("different-name-same-sha", BUILD_ID),
+            )
+            pool.connection.commit()
+
+        deps, publisher, gk, _deploy = _deps(config, pool)
+        consumer = MergeApprovalConsumer(deps)
+        await consumer.handle_envelope(
+            _envelope(correlation_id=f"corr-{BUILD_ID}")
+        )
+        await _drain(consumer)
+        assert publisher.reports
+        result = publisher.reports[-1].result
+        if mutation == "unchanged":
+            assert result == "merged-and-running"
+            assert not outer.exists()
+        elif mutation in {"untracked_content", "tracked_content"}:
+            assert result == "merged-and-running"
+            assert inner.exists()
+        else:
+            assert result == "candidate-refused"
+            assert inner.exists()
+            assert gk.calls == []
+
     @pytest.mark.asyncio
     async def test_moved_offered_candidate_is_refused_and_kept(
         self,
@@ -3141,8 +3233,10 @@ class TestRetainedAutobuildWorktreeEndOfLifecycle:
         monkeypatch: pytest.MonkeyPatch,
         _receipts_env: Path,
     ) -> None:
-        identity, outer, inner, sha, tree = self._retained(
-            repo_root, tmp_path, monkeypatch
+        identity, outer, inner, sha, tree = (
+            TestRetainedAutobuildWorktreeEndOfLifecycle._retained(
+                repo_root, tmp_path, monkeypatch
+            )
         )
         (inner / "after-offer.txt").write_text("new commit\n")
         _git(inner, "add", "after-offer.txt")
