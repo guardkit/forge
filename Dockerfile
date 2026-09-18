@@ -113,6 +113,11 @@ RUN test -d /tmp/fleet-memory/src/fleet_memory || (echo "fleet-memory layout inv
 # semantics, and pip already considers nats-core satisfied above.
 COPY pyproject.toml ./
 COPY README.md ./
+# The image lock freezes every third-party distribution from the last accepted
+# Python 3.14 image. Local project distributions remain source-path inputs to
+# the single resolver transaction below.
+COPY requirements-image-py314.lock ./
+ENV PIP_REQUIREMENT=/build/requirements-image-py314.lock
 COPY src ./src
 
 # Forge is staged until guardkitfactory and GuardKit have also been copied.
