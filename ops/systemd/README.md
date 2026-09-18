@@ -187,11 +187,15 @@ Validate the correction in three layers:
 2. From inside the sandbox, make a metadata-only `GET /running` request to that host
    and confirm the `embed` alias is ready. This checks routing without running model
    inference or changing model-serving state.
-3. Replay the previously failing task description through the real
-   `FleetMemoryClient.search` configuration path. Record only health, hit count,
-   durations, scores, lengths, and content hashes. A non-empty result with no search
-   failure or HTTP 500 proves the factory's optional-memory read, while keeping memory
-   contents and credentials out of the receipt.
+3. Load the complete original task through `TaskLoader` and replay the actual
+   `AutoBuildContextLoader` path for Player and Coach using that runner's environment
+   and interpreter. Preserve its query, relevance thresholds and context budgets.
+   Record logical searches separately from backend pages/embedding requests, plus
+   errors, durations, source keys, scores, content hashes and selected categories.
+   Verify useful source text survives budgeting and appears in its own correct prompt
+   section; metadata-only history and raw hits cannot establish this. Unsupported
+   categories must not create role or quality-gate policy. Keep credentials and raw
+   private memory out of the receipt, and report Coach cache reuse explicitly.
 
 Do not reset or recreate the sandbox to repair this setting: that couples a one-line
 route correction to mounts, ports, policies, and secret injection. Do not edit the
