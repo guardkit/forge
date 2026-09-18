@@ -813,8 +813,11 @@ async def compose_planning_consumer_and_dispatch(
     try:
         # Heavy imports stay call-time so the module imports without the
         # full dispatch stack available (BDD oracle / lint runners).
+        from nats_core.events import PlanningFailedPayload
+
         from forge.adapters.git.planning_runner import WorktreeGitRunner
         from forge.adapters.nats.approval_publisher import ApprovalPublisher
+        from forge.adapters.nats.pipeline_publisher import PipelinePublisher
         from forge.adapters.nats.approval_subscriber import (
             ApprovalSubscriber,
             ApprovalSubscriberDeps,
@@ -1258,6 +1261,27 @@ async def compose_planning_consumer_and_dispatch(
                 envelope.model_dump_json().encode("utf-8"),
             )
 
+        pipeline_publisher = PipelinePublisher(nats_client)
+
+        async def publish_planning_failed(
+            correlation_id: str, reason: str
+        ) -> None:
+            row = store.get_run(correlation_id)
+            if row is None:
+                raise RuntimeError(
+                    f"FAILED planning row {correlation_id!r} is unavailable"
+                )
+            await pipeline_publisher.publish_planning_failed(
+                PlanningFailedPayload(
+                    correlation_id=correlation_id,
+                    originator=str(row["originating_user"]),
+                    terminal_state="failed",
+                    failure_reason=reason,
+                    recoverable=False,
+                    failed_at=clock_fn(),
+                )
+            )
+
         # -- second opinion provider (DF-006 default-off) ------------------
         second_opinion = FrontierSecondOpinion(
             client=_DisabledFrontierClient(),
@@ -1294,6 +1318,7 @@ async def compose_planning_consumer_and_dispatch(
                 planning_config=config.planning,
                 clock=clock_fn,
                 publish_notification=publish_planning_notification,
+                publish_planning_failed=publish_planning_failed,
                 # O-27/O-29 (E2-S4) — pre-run memory/disk headroom preflight,
                 # bound to a zero-arg callable so the driver stays ignorant of
                 # /proc + shutil. Defaults enabled=True (refuses only BEFORE a
@@ -1349,6 +1374,7 @@ async def compose_planning_consumer_and_dispatch(
         consumer_deps = PlanningConsumerDeps(
             store=store,
             publish_notification=_notify_in_thread,
+            publish_planning_failed=publish_planning_failed,
             on_recorded=_on_recorded,
             # Lane B stage one: a sentence becomes a queue row here, and the
             # take-next loop creates the planning run later.

@@ -1,11 +1,12 @@
 """Outbound lifecycle event publisher for the Forge pipeline.
 
-Owns the eight publish methods described in
+Owns the eight build publish methods described in
 ``docs/design/contracts/API-nats-pipeline-events.md §3`` — one per
 subject in the ``pipeline.{event}.{feature_id}`` family. Every
 envelope it produces is a :class:`nats_core.envelope.MessageEnvelope`
 with ``source_id == "forge"`` and the payload's ``correlation_id``
-threaded onto the envelope.
+threaded onto the envelope. It also owns the planning-failed terminal
+projection, keyed by the planning correlation before a feature id exists.
 
 Publish semantics
 -----------------
@@ -52,6 +53,7 @@ from nats_core.events import (
     BuildProgressPayload,
     BuildResumedPayload,
     BuildStartedPayload,
+    PlanningFailedPayload,
     StageCompletePayload,
 )
 
@@ -88,7 +90,7 @@ class PublishFailure(RuntimeError):
 
 
 class PipelinePublisher:
-    """Publishes the eight lifecycle events for a Forge build.
+    """Publishes Forge build lifecycle events and planning failure terminals.
 
     The class is intentionally thin — it owns no scheduling or retry
     logic. It validates only that the caller passed the expected payload
@@ -148,6 +150,7 @@ class PipelinePublisher:
         event_name: str,
         event_type: EventType,
         payload: BaseModel,
+        subject_key: str = "feature_id",
     ) -> None:
         """Build the envelope and write it to NATS.
 
@@ -155,18 +158,18 @@ class PipelinePublisher:
             event_name: Subject segment (e.g. ``"build-started"``).
             event_type: Envelope ``event_type`` value.
             payload: The Pydantic payload model to wrap.
+            subject_key: Payload field used as the final subject token.
 
         Raises:
             PublishFailure: If the underlying NATS publish raises.
         """
-        feature_id = getattr(payload, "feature_id", None)
-        if not isinstance(feature_id, str) or not feature_id:
-            # Payload models all carry feature_id; this is a defensive
-            # guard for the rare case a caller passes a hand-rolled
-            # BaseModel instead of one of the typed payloads above.
+        subject_id = getattr(payload, subject_key, None)
+        if not isinstance(subject_id, str) or not subject_id:
+            # A defensive guard for the rare case a caller passes a
+            # hand-rolled BaseModel instead of one of the typed payloads.
             msg = (
                 f"payload of type {type(payload).__name__!r} is missing "
-                "feature_id; cannot build subject"
+                f"{subject_key}; cannot build subject"
             )
             raise ValueError(msg)
 
@@ -175,7 +178,7 @@ class PipelinePublisher:
         # payload exposes so the envelope honours the producer's intent.
         correlation_id = getattr(payload, "correlation_id", None)
 
-        subject = self._subject_for(event_name, feature_id)
+        subject = self._subject_for(event_name, subject_id)
 
         envelope = MessageEnvelope(
             source_id=SOURCE_ID,
@@ -275,4 +278,13 @@ class PipelinePublisher:
             event_name="build-cancelled",
             event_type=EventType.BUILD_CANCELLED,
             payload=payload,
+        )
+
+    async def publish_planning_failed(self, payload: PlanningFailedPayload) -> None:
+        """Publish ``pipeline.planning-failed.{correlation_id}`` terminal."""
+        await self._publish_envelope(
+            event_name="planning-failed",
+            event_type=EventType.PLANNING_FAILED,
+            payload=payload,
+            subject_key="correlation_id",
         )

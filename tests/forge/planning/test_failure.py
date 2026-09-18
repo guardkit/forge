@@ -103,6 +103,16 @@ class Recorder:
         self.sent.append((correlation_id, message))
 
 
+class TerminalRecorder:
+    """Captures each derived planning-failed projection."""
+
+    def __init__(self) -> None:
+        self.sent: list[tuple[str, str]] = []
+
+    async def __call__(self, correlation_id: str, reason: str) -> None:
+        self.sent.append((correlation_id, reason))
+
+
 class RecordingStore:
     """A store that only remembers how ``transition`` was called."""
 
@@ -247,6 +257,62 @@ class TestFailRunWritesTheSentence:
         assert notify.sent == [(RUN, OWNER_SENTENCE), (RUN, "a second sentence")]
         assert any(
             "FAILED transition refused" in record.getMessage()
+            for record in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_terminal_projection_follows_commit_once_not_duplicate(
+        self, run_store: SqlitePlanningRunStore
+    ) -> None:
+        _start_run(run_store)
+        terminal = TerminalRecorder()
+
+        await fail_run(
+            run_store,
+            RUN,
+            stage_label=STAGE,
+            reason=MACHINE_REASON,
+            owner_message=OWNER_SENTENCE,
+            publish_terminal=terminal,
+        )
+        await fail_run(
+            run_store,
+            RUN,
+            stage_label=STAGE,
+            reason="duplicate reason",
+            owner_message="duplicate sentence",
+            publish_terminal=terminal,
+        )
+
+        assert terminal.sent == [(RUN, MACHINE_REASON)]
+        assert len(_failed_events(run_store)) == 1
+
+    @pytest.mark.asyncio
+    async def test_terminal_publish_failure_keeps_row_and_owner_notification(
+        self, run_store: SqlitePlanningRunStore, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        _start_run(run_store)
+        notify = Recorder()
+
+        async def broken_terminal(_cid: str, _reason: str) -> None:
+            raise RuntimeError("projection unavailable")
+
+        with caplog.at_level(logging.WARNING, logger="forge.planning.failure"):
+            await fail_run(
+                run_store,
+                RUN,
+                stage_label=STAGE,
+                reason=MACHINE_REASON,
+                owner_message=OWNER_SENTENCE,
+                notify=notify,
+                publish_terminal=broken_terminal,
+            )
+
+        row = run_store.get_run(RUN)
+        assert row is not None and row["state"] == PlanningState.FAILED.value
+        assert notify.sent == [(RUN, OWNER_SENTENCE)]
+        assert any(
+            "planning-failed projection did not go out" in record.getMessage()
             for record in caplog.records
         )
 
