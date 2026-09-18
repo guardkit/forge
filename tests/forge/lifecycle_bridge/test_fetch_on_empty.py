@@ -524,6 +524,92 @@ class TestFetchOnEmptyInterruptedRun:
         handle.ack.assert_awaited_once()
 
 
+class TestInterruptedStateProjectionBoundaries:
+    @pytest.mark.parametrize(
+        "async_tasks",
+        [
+            {},
+            {"FEAT-OTHER": {"lifecycle": "running_wave"}},
+            {"FEAT-TARGET": "malformed"},
+        ],
+    )
+    def test_missing_or_non_mapping_target_is_refused(self, async_tasks) -> None:
+        values = {"async_tasks": async_tasks}
+
+        assert (
+            LifecycleBridgeWireup._project_interrupted_state(
+                values, "FEAT-TARGET"
+            )
+            is None
+        )
+
+    def test_changes_only_selected_lifecycle_and_preserves_sibling_bytes(self) -> None:
+        sibling = {
+            "feature_id": "FEAT-SIBLING",
+            "build_id": "build-sibling",
+            "lifecycle": "completed",
+            "nested": {"values": [1, 2, 3]},
+        }
+        target = {
+            "feature_id": "FEAT-TARGET",
+            "build_id": "build-target",
+            "lifecycle": "running_wave",
+            "tasks_completed": 2,
+        }
+        values = {
+            "messages": ["unchanged"],
+            "async_tasks": {"FEAT-TARGET": target, "FEAT-SIBLING": sibling},
+        }
+        sibling_before = repr(sibling)
+        target_before = dict(target)
+
+        projected = LifecycleBridgeWireup._project_interrupted_state(
+            values, "FEAT-TARGET"
+        )
+
+        assert projected is not None
+        assert repr(projected["async_tasks"]["FEAT-SIBLING"]) == sibling_before
+        assert projected["async_tasks"]["FEAT-SIBLING"] is sibling
+        assert projected["async_tasks"]["FEAT-TARGET"] == {
+            **target_before,
+            "lifecycle": "cancelled",
+        }
+        assert target == target_before
+        assert projected["messages"] is values["messages"]
+
+    @pytest.mark.asyncio
+    async def test_interrupted_missing_target_retains_f6_failure(
+        self,
+        bridge: LifecycleBridge,
+        translator: StreamEventTranslator,
+        fake_publisher: MagicMock,
+    ) -> None:
+        feature_id = "FEAT-INTERRUPTED-MISSING"
+        fetcher = AsyncMock(
+            return_value=RunStateSnapshot(
+                status="interrupted",
+                values={"async_tasks": {"FEAT-OTHER": {"lifecycle": "cancelled"}}},
+            )
+        )
+        wireup = _build_wireup(
+            bridge,
+            translator,
+            fake_publisher,
+            stream_source=_empty_stream_source(),
+            run_state_fetcher=fetcher,
+        )
+        handle = _make_handle()
+
+        await wireup.register_ack_handle(feature_id, "corr-missing", handle)
+        await _drain(wireup, feature_id)
+
+        fake_publisher.publish_build_cancelled.assert_not_awaited()
+        fake_publisher.publish_build_failed.assert_awaited_once()
+        failed = fake_publisher.publish_build_failed.await_args.args[0]
+        assert failed.failure_reason == STREAM_NO_TERMINAL_FAILURE_REASON
+        handle.ack.assert_awaited_once()
+
+
 # ---------------------------------------------------------------------------
 # AC-FETCH-5 — fetcher raises → observer treats as no-snapshot
 # ---------------------------------------------------------------------------

@@ -93,15 +93,6 @@ def install_inmem_cancel_listener_compat(
             return "runtime-unavailable"
         _ops = runtime_ops
 
-    original = getattr(_ops, "listen_for_cancellation", None)
-    if original is None:
-        raise RuntimeError(
-            "refusing autobuild graph startup: langgraph-runtime-inmem "
-            "cancellation listener is absent"
-        )
-    if getattr(original, _PATCH_MARKER, False):
-        return "already-installed"
-
     if _runtime_version is None:
         try:
             _runtime_version = version("langgraph-runtime-inmem")
@@ -115,6 +106,15 @@ def install_inmem_cancel_listener_compat(
             _AFFECTED_VERSION,
         )
         return "version-mismatch"
+
+    original = getattr(_ops, "listen_for_cancellation", None)
+    if original is None:
+        raise RuntimeError(
+            "refusing autobuild graph startup: langgraph-runtime-inmem "
+            "cancellation listener is absent"
+        )
+    if getattr(original, _PATCH_MARKER, False):
+        return "already-installed"
 
     if _source_text is None:
         try:

@@ -155,3 +155,23 @@ def test_installer_leaves_other_runtime_versions_unchanged() -> None:
 
     assert result == "version-mismatch"
     assert ops.listen_for_cancellation is original
+
+
+def test_non_target_version_without_listener_symbol_is_inert() -> None:
+    ops = SimpleNamespace()
+
+    assert (
+        install_inmem_cancel_listener_compat(
+            _ops=ops,
+            _runtime_version="0.35.0",
+        )
+        == "version-mismatch"
+    )
+
+
+def test_known_affected_version_without_listener_symbol_fails_closed() -> None:
+    with pytest.raises(RuntimeError, match="cancellation listener is absent"):
+        install_inmem_cancel_listener_compat(
+            _ops=SimpleNamespace(),
+            _runtime_version="0.34.1",
+        )
