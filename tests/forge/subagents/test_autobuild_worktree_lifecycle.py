@@ -109,11 +109,13 @@ def test_unrelated_registered_guardkit_tree_survives_candidate_cleanup(
 
 def test_changed_untracked_content_after_offer_fails_closed(tmp_path: Path) -> None:
     repo, base, outer, inner = _repo_with_nested(tmp_path)
+    note = inner / "user-note.txt"
+    note.write_text("present at offer\n")
     offered = inspect_autobuild_worktree(
         repo=repo, base=base, build_id=BUILD_ID, path=outer
     )
     offered["cleanup_registrations"] = offered["nested_registrations"]
-    (inner / "user-note.txt").write_text("arrived after offer\n")
+    note.write_text("changed after offer\n")
 
     result = retire_autobuild_worktree(
         repo=repo,
@@ -126,6 +128,30 @@ def test_changed_untracked_content_after_offer_fails_closed(tmp_path: Path) -> N
     assert result["status"] == "kept"
     assert "identity no longer matches" in result["detail"]
     assert outer.is_dir() and inner.is_dir()
+
+
+def test_changed_already_dirty_tracked_content_after_offer_fails_closed(
+    tmp_path: Path,
+) -> None:
+    repo, base, outer, inner = _repo_with_nested(tmp_path)
+    readme = inner / "README"
+    readme.write_text("dirty at offer\n")
+    offered = inspect_autobuild_worktree(
+        repo=repo, base=base, build_id=BUILD_ID, path=outer
+    )
+    offered["cleanup_registrations"] = offered["nested_registrations"]
+    readme.write_text("changed after offer\n")
+
+    result = retire_autobuild_worktree(
+        repo=repo,
+        base=base,
+        build_id=BUILD_ID,
+        path=outer,
+        expected=offered,
+    )
+
+    assert result["status"] == "kept"
+    assert readme.read_text() == "changed after offer\n"
 
 
 def test_stale_or_unowned_path_is_never_removed(tmp_path: Path) -> None:

@@ -943,6 +943,7 @@ async def execute_merge_deploy(
     merge_branch: str | None = None,
     expected_candidate_sha: str | None = None,
     expected_candidate_tree: str | None = None,
+    expected_candidate_branch: str | None = None,
     worktree_retention: dict[str, Any] | None = None,
 ) -> MergeDeployOutcome:
     """Run candidate check -> merge -> tree check -> promote -> report for one press.
@@ -1401,6 +1402,12 @@ async def execute_merge_deploy(
         # double-merge refusal above and nothing else — that guard comes
         # FIRST so the answer to "did this already happen?" never changes
         # because of anything this lane added (L3b's coach, 2026-09-08).
+
+        if expected_candidate_branch and branch != expected_candidate_branch:
+            return _could_not_check(
+                f"the durable offer named branch {expected_candidate_branch}, "
+                f"but the current build row selects {branch}"
+            )
 
         # ------------------------------------------------------------------
         # STEP candidate: the branch is checked in the sandbox BEFORE the merge
@@ -2434,12 +2441,19 @@ class MergeApprovalConsumer:
             return
         expected_candidate_sha = str(offer.get("candidate_sha") or "") or None
         expected_candidate_tree = str(offer.get("candidate_tree") or "") or None
-        if offer.get("candidate_identity_version") == 1 and (
-            not expected_candidate_sha or not expected_candidate_tree
+        candidate_identity_version = offer.get("candidate_identity_version")
+        offered_candidate_branch = str(offer.get("branch") or "").strip() or None
+        expected_candidate_branch = (
+            offered_candidate_branch if candidate_identity_version == 1 else None
+        )
+        if candidate_identity_version == 1 and (
+            not expected_candidate_sha
+            or not expected_candidate_tree
+            or not expected_candidate_branch
         ):
             logger.error(
                 "merge-executor: %s approved but its versioned offer carries "
-                "no exact candidate sha/tree — refusing an unpinned candidate",
+                "no exact candidate branch/sha/tree — refusing an unpinned candidate",
                 request_id,
             )
             return
@@ -2469,6 +2483,7 @@ class MergeApprovalConsumer:
                 merge_branch=merge_branch,
                 expected_candidate_sha=expected_candidate_sha,
                 expected_candidate_tree=expected_candidate_tree,
+                expected_candidate_branch=expected_candidate_branch,
                 worktree_retention=worktree_retention,
             )
         )
@@ -2489,6 +2504,7 @@ class MergeApprovalConsumer:
         merge_branch: str | None = None,
         expected_candidate_sha: str | None = None,
         expected_candidate_tree: str | None = None,
+        expected_candidate_branch: str | None = None,
         worktree_retention: dict[str, Any] | None = None,
     ) -> None:
         # Per-repo single-flight: an asyncio lock per repo key PLUS the
@@ -2508,6 +2524,7 @@ class MergeApprovalConsumer:
                     merge_branch=merge_branch,
                     expected_candidate_sha=expected_candidate_sha,
                     expected_candidate_tree=expected_candidate_tree,
+                    expected_candidate_branch=expected_candidate_branch,
                     worktree_retention=worktree_retention,
                 )
             except Exception as exc:  # noqa: BLE001 — the task must not die silent

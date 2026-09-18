@@ -24,6 +24,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import stat
 import subprocess
 from pathlib import Path
 from typing import Any, Mapping
@@ -115,11 +116,103 @@ def inspect_worktree_capacity(base: Path, *, min_available_bytes: int) -> dict[s
     return report
 
 
-def _status_sha(path: Path) -> tuple[str | None, str | None]:
-    code, raw = _git(path, "status", "--porcelain=v1", "-z", "--untracked-files=all")
+def _is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return path != root
+
+
+def _status_sha(
+    path: Path, *, registered_descendants: tuple[Path, ...] = ()
+) -> tuple[str | None, str | None]:
+    code, status_raw = _git(
+        path, "status", "--porcelain=v1", "-z", "--untracked-files=all"
+    )
     if code != 0:
-        return None, raw.decode("utf-8", errors="replace").strip()
-    return hashlib.sha256(raw).hexdigest(), None
+        return None, status_raw.decode("utf-8", errors="replace").strip()
+    code, index_raw = _git(path, "ls-files", "--stage", "-z")
+    if code != 0:
+        return None, index_raw.decode("utf-8", errors="replace").strip()
+    code, names_raw = _git(
+        path,
+        "ls-files",
+        "--modified",
+        "--deleted",
+        "--others",
+        "--exclude-standard",
+        "-z",
+    )
+    if code != 0:
+        return None, names_raw.decode("utf-8", errors="replace").strip()
+
+    root = path.resolve()
+    registered = {child.resolve() for child in registered_descendants}
+    digest = hashlib.sha256()
+    digest.update(b"status\0" + status_raw)
+    digest.update(b"index\0" + index_raw)
+    for raw_name in sorted({name for name in names_raw.split(b"\0") if name}):
+        name = os.fsdecode(raw_name)
+        relative = Path(name)
+        if relative.is_absolute() or any(part == ".." for part in relative.parts):
+            return None, f"dirty worktree entry escapes its root: {name!r}"
+        candidate = root / relative
+        try:
+            resolved = candidate.resolve(strict=False)
+            resolved.relative_to(root)
+        except (OSError, ValueError) as exc:
+            return None, f"dirty worktree entry escapes or is unreadable: {name!r}: {exc}"
+        digest.update(b"path\0" + raw_name + b"\0")
+        if resolved in registered:
+            # Git reports a nested registered worktree as an untracked
+            # directory in its outer owner. Its own identity row below binds
+            # its HEAD, branch, status and dirty contents; only that exact
+            # registration is exempt here, never an arbitrary directory.
+            digest.update(b"registered-worktree\0")
+            continue
+        try:
+            before = candidate.lstat()
+        except FileNotFoundError:
+            digest.update(b"missing\0")
+            continue
+        except OSError as exc:
+            return None, f"dirty worktree entry is unreadable: {name!r}: {exc}"
+        digest.update(f"mode:{before.st_mode:o}\0".encode())
+        if stat.S_ISLNK(before.st_mode):
+            try:
+                target = os.readlink(candidate)
+            except OSError as exc:
+                return None, f"dirty symlink is unreadable: {name!r}: {exc}"
+            digest.update(b"symlink\0" + os.fsencode(target) + b"\0")
+            continue
+        if not stat.S_ISREG(before.st_mode):
+            return None, f"dirty worktree entry is not a regular file: {name!r}"
+        try:
+            with candidate.open("rb") as handle:
+                while chunk := handle.read(1024 * 1024):
+                    digest.update(chunk)
+            after = candidate.stat()
+        except OSError as exc:
+            return None, f"dirty worktree entry is unreadable: {name!r}: {exc}"
+        stable_before = (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        )
+        stable_after = (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        )
+        if stable_before != stable_after:
+            return None, f"dirty worktree entry changed while read: {name!r}"
+        digest.update(b"\0")
+    return digest.hexdigest(), None
 
 
 def _owned_path(base: Path, build_id: str, path: Path) -> tuple[Path | None, str | None]:
@@ -198,7 +291,16 @@ def inspect_autobuild_worktree(
         return answer
     owned = [dict(outer), *sorted(descendants, key=lambda row: str(row["path"]))]
     for row in owned:
-        status_sha, status_error = _status_sha(Path(str(row["path"])))
+        row_path = Path(str(row["path"]))
+        registered_descendants = tuple(
+            Path(str(other["path"]))
+            for other in owned
+            if other is not row
+            and _is_relative_to(Path(str(other["path"])), row_path)
+        )
+        status_sha, status_error = _status_sha(
+            row_path, registered_descendants=registered_descendants
+        )
         if status_sha is None:
             answer["detail"] = (
                 f"git status could not be read in {row['path']}: {status_error}"
