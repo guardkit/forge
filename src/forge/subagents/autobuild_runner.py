@@ -103,11 +103,20 @@ from typing_extensions import NotRequired, Required, TypedDict
 
 from forge import receipts as _receipts
 from forge.subagents import build_monitor
+from forge.subagents.inmem_cancel_compat import (
+    install_inmem_cancel_listener_compat,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - import-time only
     from forge.pipeline import BuildContext, PipelineLifecycleEmitter
 
 logger = logging.getLogger(__name__)
+
+# The local LangGraph runtime serves long builds whose run-control listener in
+# 0.34.1 expires after 240 idle seconds. Install the exact-version/source-shape
+# wrapper before this graph can enter Runs.enter; on any other runtime it is an
+# explicit no-op. See inmem_cancel_compat for the removal condition.
+_INMEM_CANCEL_COMPAT = install_inmem_cancel_listener_compat()
 
 
 # ---------------------------------------------------------------------------

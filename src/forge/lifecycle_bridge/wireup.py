@@ -1219,9 +1219,29 @@ class LifecycleBridgeWireup:
                 feature_id,
             )
 
-        # Step 2 — actual terminal state.
+        # ``runs.cancel(..., action="interrupt")`` makes the run status
+        # authoritative before the graph worker necessarily checkpoints a
+        # cancelled AutobuildState. In particular, the in-memory runtime can
+        # close the stream with the last persisted snapshot still saying
+        # ``running_wave``. Replaying that stale lifecycle would return a
+        # non-terminal BuildStartedPayload and the caller would then take F6,
+        # falsely publishing ``stream-ended-without-terminal`` as a build
+        # failure for an accepted operator cancel. Project only this exact
+        # authenticated terminal status onto the matching feature snapshot;
+        # every other status and every sibling feature remain byte-for-byte
+        # unchanged.
+        terminal_values = snapshot.values
+        if snapshot.status == "interrupted":
+            interrupted_values = self._project_interrupted_state(
+                snapshot.values, feature_id
+            )
+            if interrupted_values is not None:
+                terminal_values = interrupted_values
+
+        # Step 2 — actual terminal state (with the run-status projection above
+        # only for an authenticated interrupted run).
         terminal_event = await self._translate_and_publish(
-            values=snapshot.values,
+            values=terminal_values,
             context=context,
             feature_id=feature_id,
             stage="terminal",
@@ -1262,6 +1282,39 @@ class LifecycleBridgeWireup:
             feature_id,
         )
         return True
+
+    @staticmethod
+    def _project_interrupted_state(
+        values: Mapping[str, Any], feature_id: str
+    ) -> Mapping[str, Any] | None:
+        """Project an authenticated interrupted run onto its feature state.
+
+        LangGraph's run row is the authority for an accepted
+        ``action="interrupt"``. The thread checkpoint may legitimately lag
+        behind that row and still carry ``lifecycle="running_wave"``. Copy
+        the existing snapshot and change only its lifecycle so the canonical
+        translator emits :class:`BuildCancelledPayload` with the original
+        build/feature identity. A malformed or missing feature snapshot is
+        refused (``None``); callers retain the existing fail-closed F6 path.
+        """
+        if not isinstance(values, Mapping):
+            return None
+        async_tasks = values.get("async_tasks")
+        if not isinstance(async_tasks, Mapping):
+            return None
+        feature_snapshot = async_tasks.get(feature_id)
+        if not isinstance(feature_snapshot, Mapping):
+            return None
+
+        cancelled_snapshot = dict(feature_snapshot)
+        cancelled_snapshot["lifecycle"] = "cancelled"
+        projected: dict[str, Any] = {
+            key: value for key, value in values.items() if key != "async_tasks"
+        }
+        projected_tasks = dict(async_tasks)
+        projected_tasks[feature_id] = cancelled_snapshot
+        projected["async_tasks"] = projected_tasks
+        return projected
 
     async def _translate_and_publish(
         self,

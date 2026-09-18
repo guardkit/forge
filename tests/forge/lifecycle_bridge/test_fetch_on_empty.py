@@ -64,6 +64,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from langgraph_sdk.schema import StreamPart
 from nats_core.events import (
+    BuildCancelledPayload,
     BuildCompletePayload,
     BuildFailedPayload,
     BuildStartedPayload,
@@ -470,6 +471,55 @@ class TestFetchOnEmptyFailedRun:
         assert "placeholder body raised" in failed_arg.failure_reason
 
         # build-complete must NOT fire on the failure path.
+        fake_publisher.publish_build_complete.assert_not_awaited()
+        handle.ack.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# AC-FETCH-4b — interrupted run + stale running state → BuildCancelled
+# ---------------------------------------------------------------------------
+
+
+class TestFetchOnEmptyInterruptedRun:
+    """An accepted SDK interrupt outranks a stale running checkpoint."""
+
+    @pytest.mark.asyncio
+    async def test_interrupted_status_emits_cancelled_from_running_snapshot(
+        self,
+        bridge: LifecycleBridge,
+        translator: StreamEventTranslator,
+        fake_publisher: MagicMock,
+    ) -> None:
+        feature_id = "FEAT-FETCH-INTERRUPTED"
+        snapshot = RunStateSnapshot(
+            status="interrupted",
+            values=_terminal_state_values(
+                feature_id,
+                lifecycle="running_wave",
+                tasks_completed=0,
+            ),
+        )
+        fetcher = AsyncMock(return_value=snapshot)
+        wireup = _build_wireup(
+            bridge,
+            translator,
+            fake_publisher,
+            stream_source=_empty_stream_source(),
+            run_state_fetcher=fetcher,
+        )
+        handle = _make_handle()
+
+        await wireup.register_ack_handle(feature_id, "corr-fetch-interrupt", handle)
+        await _drain(wireup, feature_id)
+
+        fake_publisher.publish_build_started.assert_awaited_once()
+        fake_publisher.publish_build_cancelled.assert_awaited_once()
+        cancelled = fake_publisher.publish_build_cancelled.await_args.args[0]
+        assert isinstance(cancelled, BuildCancelledPayload)
+        assert cancelled.feature_id == feature_id
+        assert cancelled.build_id == "build-FEAT-FETCH-001-20260508153000"
+        assert cancelled.correlation_id == "corr-fetch-interrupt"
+        fake_publisher.publish_build_failed.assert_not_awaited()
         fake_publisher.publish_build_complete.assert_not_awaited()
         handle.ack.assert_awaited_once()
 
