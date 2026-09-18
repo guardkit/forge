@@ -315,6 +315,7 @@ def materialise_repair_branch(
     *,
     task_id: str,
     base_branch: str,
+    expected_base_commit: str | None = None,
     files: Mapping[str, str],
     message: str,
 ) -> RepairBranchResult:
@@ -325,7 +326,9 @@ def materialise_repair_branch(
     directory and committed there; nothing changes when they are already what
     the branch carries. The worktree is removed on every path. A failure to
     write or commit raises :class:`RepairBranchError` and, when this call
-    created the branch, deletes it again.
+    created the branch, deletes it again. When ``expected_base_commit`` is
+    given, the named base must still point to that commit and a reused repair
+    branch must contain it.
 
     Never touches the shared checkout's working tree or index: the only
     commands run against the checkout itself are ``worktree add/remove/prune``,
@@ -343,6 +346,19 @@ def materialise_repair_branch(
             f"there is no local branch called {base_branch!r} in {repo} to cut "
             "the repair branch from"
         )
+    base = _git(repo, "rev-parse", "--verify", f"refs/heads/{base_branch}")
+    if base.returncode != 0:
+        raise RepairBranchError(
+            f"git could not resolve the base branch {base_branch!r} in {repo}: "
+            f"{_last_line(base)}"
+        )
+    base_commit = base.stdout.strip()
+    if expected_base_commit is not None and base_commit != expected_base_commit:
+        raise RepairBranchError(
+            f"the base branch {base_branch!r} is at {base_commit}, not the "
+            f"retained candidate {expected_base_commit}; refusing to repair an "
+            "unrelated or stale tree"
+        )
 
     branch = repair_branch_name(task_id)
     ensure_forge_excluded(repo)
@@ -350,6 +366,19 @@ def materialise_repair_branch(
     _remove_worktree(repo, worktree)  # a leftover from a crash, if any
 
     created = not branch_exists(repo, branch)
+    if not created and expected_base_commit is not None:
+        contains = _git(
+            repo,
+            "merge-base",
+            "--is-ancestor",
+            expected_base_commit,
+            f"refs/heads/{branch}",
+        )
+        if contains.returncode != 0:
+            raise RepairBranchError(
+                f"the existing repair branch {branch!r} does not contain the "
+                f"retained candidate {expected_base_commit}; refusing to reuse it"
+            )
     if created:
         added = _git(repo, "worktree", "add", "-b", branch, str(worktree), base_branch)
     else:
@@ -456,6 +485,7 @@ def materialise_repair_branch_via_sidecar(
     repo_root: Path | str,
     task_id: str,
     base_branch: str,
+    expected_base_commit: str | None = None,
     files: Mapping[str, str],
     message: str,
     post: Any = None,
@@ -479,6 +509,8 @@ def materialise_repair_branch_via_sidecar(
     stays); ``/git/prepare-branch-and-write-tree`` to commit the files onto
     it (idempotent: nothing is committed when they are already there).
     ``post`` is the one HTTP seam, injectable so a test needs no socket.
+    ``expected_base_commit`` applies the same exact-ref and ancestry checks as
+    the local materialiser.
     """
     from forge.planning.sidecar_git_runner import _urllib_post
 
@@ -507,14 +539,35 @@ def materialise_repair_branch_via_sidecar(
         sha = answer.get("sha")
         return str(sha) if sha else None
 
-    if sha_of(base_branch) is None:
+    base_commit = sha_of(base_branch)
+    if base_commit is None:
         raise RepairBranchError(
             f"there is no branch called {base_branch!r} in the factory's clone "
             f"of {repo} to cut the repair branch from"
         )
+    if expected_base_commit is not None and base_commit != expected_base_commit:
+        raise RepairBranchError(
+            f"the base branch {base_branch!r} in the factory's clone of {repo} "
+            f"is at {base_commit}, not the retained candidate "
+            f"{expected_base_commit}; refusing to repair an unrelated or stale tree"
+        )
     branch = repair_branch_name(task_id)
     before = sha_of(branch)
     created = before is None
+    if not created and expected_base_commit is not None:
+        ancestry = call(
+            "/git/is-ancestor",
+            {
+                "repo": repo,
+                "ancestor": expected_base_commit,
+                "descendant": branch,
+            },
+        ).get("is_ancestor")
+        if ancestry is not True:
+            raise RepairBranchError(
+                f"the existing repair branch {branch!r} does not contain the "
+                f"retained candidate {expected_base_commit}; refusing to reuse it"
+            )
     if created:
         # The worktree route is the one that can cut a branch from a named
         # base; the tree itself is not wanted, so it goes straight back.

@@ -68,6 +68,7 @@ from forge.pipeline.fix_admission import (
     write_fix_task_yaml,
 )
 from forge.pipeline.fix_row_producer import (
+    SOURCE_BUILD_FAILED,
     fix_correlation_id,
     make_failure_pack_source_reader,
 )
@@ -132,6 +133,7 @@ def make_config(
     *,
     profiles: dict[str, Any] | None = None,
     default_profile: str = "attended",
+    sandbox: bool = False,
 ) -> ForgeConfig:
     body: dict[str, Any] = {
         "permissions": {"filesystem": {"allowlist": [str(repo_root.parent)]}},
@@ -139,6 +141,14 @@ def make_config(
         "planning": {"target_repo_paths": {REPO_KEY: str(repo_root)}},
         "conductor": {"enabled": True, "seat": "qwen3-coder-30b"},
     }
+    if sandbox:
+        body["planning"]["sandboxes"] = {
+            REPO_KEY: {
+                "name": "api-test-deploy",
+                "sidecar_url": "http://127.0.0.1:8925",
+                "runner_url": "http://127.0.0.1:8924",
+            }
+        }
     if profiles is not None:
         body["budget"] = {
             "default_profile": default_profile,
@@ -810,6 +820,371 @@ class TestAdmittingAQueueRow:
 
         assert caught.value.reason == "no-source-build"
         assert caught.value.permanent is True
+
+
+def _file_build_failed_row(store: WorkQueueStore) -> int:
+    return store.file_sentence(
+        correlation_id=fix_correlation_id(SOURCE_BUILD),
+        sentence="The feature build failed after coding began",
+        originating_user="rich",
+        target_repo=REPO_KEY,
+        kind="fix",
+        action="minted",
+        extra_details={
+            "source": SOURCE_BUILD_FAILED,
+            "source_build_id": SOURCE_BUILD,
+        },
+    ).queue_id
+
+
+def _failure_manifest(
+    receipts_root: Path,
+    *,
+    worktree: Path | None,
+    subprocess_ran: bool,
+    worktree_kept: bool,
+) -> Path:
+    pack = receipts_root / SOURCE_BUILD
+    pack.mkdir(parents=True)
+    path = pack / "failure-manifest.json"
+    path.write_text(
+        json.dumps(
+            {
+                "build_id": SOURCE_BUILD,
+                "feature_id": FEATURE_ID,
+                "correlation_id": f"corr-{SOURCE_BUILD}",
+                "branch": "main",
+                "worktree_path": str(worktree) if worktree is not None else None,
+                "evidence": {
+                    "subprocess_ran": subprocess_ran,
+                    "worktree_kept": worktree_kept,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _retained_candidate(repo_root: Path, tmp_path: Path) -> tuple[Path, str]:
+    outer = tmp_path / "retained" / SOURCE_BUILD
+    outer.parent.mkdir()
+    git(repo_root, "worktree", "add", "--detach", str(outer), "main")
+    candidate = outer / ".guardkit" / "worktrees" / FEATURE_ID
+    candidate.parent.mkdir(parents=True)
+    git(
+        outer,
+        "worktree",
+        "add",
+        "-b",
+        f"autobuild/{FEATURE_ID}",
+        str(candidate),
+        "main",
+    )
+    (candidate / "partial-candidate.txt").write_text(
+        "accepted task and unfinished work\n", encoding="utf-8"
+    )
+    git(candidate, "add", "partial-candidate.txt")
+    git(candidate, "commit", "-q", "-m", "retained partial candidate")
+    return outer, head(candidate)
+
+
+class _RetainedCandidateSidecar:
+    """A sandbox clone visible only through the deployed Git route shapes."""
+
+    def __init__(self, candidate_commit: str) -> None:
+        self.candidate_commit = candidate_commit
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.written: dict[str, str] = {}
+        self.shas: dict[str, str | None] = {
+            f"autobuild/{FEATURE_ID}": candidate_commit,
+        }
+
+    def __call__(
+        self, url: str, body: dict[str, Any], timeout: float
+    ) -> tuple[int, Any]:
+        route = url.split("/git/", 1)[1]
+        self.calls.append((route, body))
+        if route == "rev-parse":
+            return 200, {"sha": self.shas.get(body["ref"])}
+        if route == "read-file-from-branch":
+            content = (
+                f"id: {FEATURE_ID}\n"
+                if body["branch"] == f"autobuild/{FEATURE_ID}"
+                and body["file_path"] == f".guardkit/features/{FEATURE_ID}.yaml"
+                else None
+            )
+            return 200, {"content": content}
+        if route == "worktree-add":
+            self.shas[body["branch"]] = self.candidate_commit
+            return 200, {
+                "status": "success",
+                "path": body["path"],
+                "reused": False,
+                "detail": "",
+            }
+        if route == "worktree-remove":
+            return 200, {"status": "success", "path": body["path"], "detail": ""}
+        if route == "prepare-branch-and-write-tree":
+            self.written = dict(body["files"])
+            self.shas[body["branch"]] = "repair-commit"
+            return 200, {
+                "status": "success",
+                "sha": "repair-commit",
+                "checks": [],
+                "detail": "",
+            }
+        return 404, {"error": f"no route {route}"}
+
+
+class TestABuildFailureRepairsItsRetainedCandidate:
+    def _admit(
+        self,
+        *,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+        store: WorkQueueStore,
+        receipts_root: Path,
+        sidecar_post: Any = None,
+    ) -> Any:
+        return asyncio.run(
+            admit_fix_row(
+                config=config,
+                persistence=pool,
+                store=store,
+                queue_id=_file_build_failed_row(store),
+                correlation_id=fix_correlation_id(SOURCE_BUILD),
+                sentence="The feature build failed after coding began",
+                target_repo=REPO_KEY,
+                publish=Publisher(),
+                profile=FIX_JOURNEY_PROFILE_NAME,
+                receipts_root=receipts_root,
+                sidecar_post=sidecar_post,
+            )
+        )
+
+    def test_the_exact_retained_candidate_keeps_contract_and_partial_work(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+        store: WorkQueueStore,
+        repo_root: Path,
+        tmp_path: Path,
+    ) -> None:
+        seed_failed_build(pool)
+        outer, candidate_commit = _retained_candidate(repo_root, tmp_path)
+        receipts = tmp_path / "receipts"
+        _failure_manifest(
+            receipts,
+            worktree=outer,
+            subprocess_ran=True,
+            worktree_kept=True,
+        )
+
+        admission = self._admit(
+            config=config,
+            pool=pool,
+            store=store,
+            receipts_root=receipts,
+        )
+
+        assert git(
+            repo_root,
+            "merge-base",
+            "--is-ancestor",
+            candidate_commit,
+            admission.branch,
+        ).returncode == 0
+        assert show(repo_root, admission.branch, "partial-candidate.txt") == (
+            "accepted task and unfinished work\n"
+        )
+        assert yaml.safe_load(
+            show(repo_root, admission.branch, f".guardkit/features/{FEATURE_ID}.yaml")
+        )["id"] == FEATURE_ID
+        assert show(
+            repo_root,
+            admission.branch,
+            "tasks/backlog/add-the-thing/TASK-44A8-001-add-the-thing.md",
+        )
+        assert yaml.safe_load(show(repo_root, admission.branch, YAML_FILE))[
+            "parent_feature"
+        ] == FEATURE_ID
+
+    def test_the_normal_sandbox_consumer_never_reads_its_path_on_the_coordinator(
+        self,
+        pool: SqliteLifecyclePersistence,
+        store: WorkQueueStore,
+        repo_root: Path,
+        tmp_path: Path,
+    ) -> None:
+        seed_failed_build(pool)
+        sandbox_config = make_config(
+            repo_root,
+            profiles={
+                "attended": {},
+                FIX_JOURNEY_PROFILE_NAME: {"max_review_cycles": 2},
+            },
+            sandbox=True,
+        )
+        sandbox_only_outer = tmp_path / "not-mounted-on-coordinator" / SOURCE_BUILD
+        assert not sandbox_only_outer.exists()
+        receipts = tmp_path / "receipts"
+        _failure_manifest(
+            receipts,
+            worktree=sandbox_only_outer,
+            subprocess_ran=True,
+            worktree_kept=True,
+        )
+        sidecar = _RetainedCandidateSidecar("a" * 40)
+
+        admission = self._admit(
+            config=sandbox_config,
+            pool=pool,
+            store=store,
+            receipts_root=receipts,
+            sidecar_post=sidecar,
+        )
+
+        assert admission.branch == "repair/TASK-FEAT44A8FIX1"
+        routes = [route for route, _ in sidecar.calls]
+        assert routes == [
+            "rev-parse",
+            "read-file-from-branch",
+            "rev-parse",
+            "rev-parse",
+            "worktree-add",
+            "worktree-remove",
+            "prepare-branch-and-write-tree",
+        ]
+        contract_read = sidecar.calls[1][1]
+        assert contract_read == {
+            "repo": REPO_KEY,
+            "branch": f"autobuild/{FEATURE_ID}",
+            "file_path": f".guardkit/features/{FEATURE_ID}.yaml",
+        }
+        cut = sidecar.calls[4][1]
+        assert cut["repo"] == REPO_KEY
+        assert cut["base_ref"] == f"autobuild/{FEATURE_ID}"
+        assert YAML_FILE in sidecar.written
+        assert "parent_feature: FEAT-44A8" in sidecar.written[YAML_FILE]
+        assert branches(repo_root) == ["main"]
+
+    def test_missing_candidate_after_coding_fails_closed_without_a_branch(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+        store: WorkQueueStore,
+        repo_root: Path,
+        tmp_path: Path,
+    ) -> None:
+        seed_failed_build(pool)
+        outer = tmp_path / "retained" / SOURCE_BUILD
+        outer.parent.mkdir()
+        git(repo_root, "worktree", "add", "--detach", str(outer), "main")
+        receipts = tmp_path / "receipts"
+        _failure_manifest(
+            receipts,
+            worktree=outer,
+            subprocess_ran=True,
+            worktree_kept=True,
+        )
+
+        with pytest.raises(FixAdmissionRefused) as caught:
+            self._admit(
+                config=config,
+                pool=pool,
+                store=store,
+                receipts_root=receipts,
+            )
+
+        assert caught.value.reason == "repair-base"
+        assert "Refusing to fall back to main" in caught.value.message
+        assert branches(repo_root) == ["main"]
+        assert len(build_rows(pool)) == 1
+
+    def test_candidate_from_another_repository_fails_closed(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+        store: WorkQueueStore,
+        repo_root: Path,
+        tmp_path: Path,
+    ) -> None:
+        seed_failed_build(pool)
+        outer = tmp_path / "retained" / SOURCE_BUILD
+        outer.mkdir(parents=True)
+        git(outer, "init", "-q", "-b", "main")
+        git(outer, "config", "user.email", "tests@example.com")
+        git(outer, "config", "user.name", "the tests")
+        (outer / "seed").write_text("unrelated\n", encoding="utf-8")
+        git(outer, "add", "seed")
+        git(outer, "commit", "-q", "-m", "unrelated repository")
+        candidate = outer / ".guardkit" / "worktrees" / FEATURE_ID
+        candidate.parent.mkdir(parents=True)
+        git(
+            outer,
+            "worktree",
+            "add",
+            "-b",
+            f"autobuild/{FEATURE_ID}",
+            str(candidate),
+            "main",
+        )
+        contract = candidate / ".guardkit" / "features"
+        contract.mkdir(parents=True)
+        (contract / f"{FEATURE_ID}.yaml").write_text(
+            f"id: {FEATURE_ID}\n", encoding="utf-8"
+        )
+        git(candidate, "add", "-A")
+        git(candidate, "commit", "-q", "-m", "lookalike candidate")
+        receipts = tmp_path / "receipts"
+        _failure_manifest(
+            receipts,
+            worktree=outer,
+            subprocess_ran=True,
+            worktree_kept=True,
+        )
+
+        with pytest.raises(FixAdmissionRefused) as caught:
+            self._admit(
+                config=config,
+                pool=pool,
+                store=store,
+                receipts_root=receipts,
+            )
+
+        assert caught.value.reason == "repair-base"
+        assert "different repository" in caught.value.message
+        assert branches(repo_root) == ["main"]
+
+    def test_a_proven_pre_candidate_failure_still_repairs_main(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+        store: WorkQueueStore,
+        repo_root: Path,
+        tmp_path: Path,
+    ) -> None:
+        seed_failed_build(pool)
+        receipts = tmp_path / "receipts"
+        _failure_manifest(
+            receipts,
+            worktree=None,
+            subprocess_ran=False,
+            worktree_kept=False,
+        )
+
+        admission = self._admit(
+            config=config,
+            pool=pool,
+            store=store,
+            receipts_root=receipts,
+        )
+
+        assert commit_count(repo_root, admission.branch) == (
+            commit_count(repo_root, "main") + 1
+        )
+        assert not branch_exists(repo_root, f"autobuild/{FEATURE_ID}")
 
 
 # ---------------------------------------------------------------------------

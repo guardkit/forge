@@ -60,11 +60,14 @@ def repo(tmp_path: Path) -> Path:
     return make_feature_repo(tmp_path / "api_test")
 
 
-def _materialise(repo: Path, files=FILES, *, base: str = "main"):
+def _materialise(
+    repo: Path, files=FILES, *, base: str = "main", expected: str | None = None
+):
     return materialise_repair_branch(
         repo,
         task_id=TASK_ID,
         base_branch=base,
+        expected_base_commit=expected,
         files=files,
         message="repair task for build-1: repair",
     )
@@ -160,6 +163,37 @@ class TestDoingItAgain:
 
         assert result.committed is True
         assert not stale.exists()
+
+    def test_a_stale_base_ref_is_refused_before_a_branch_is_cut(
+        self, repo: Path
+    ) -> None:
+        expected = head(repo, "main")
+        (repo / "later.txt").write_text("the ref moved\n", encoding="utf-8")
+        git(repo, "add", "later.txt")
+        git(repo, "commit", "-q", "-m", "move the base")
+
+        with pytest.raises(RepairBranchError, match="not the retained candidate"):
+            _materialise(repo, expected=expected)
+
+        assert branches(repo) == ["main"]
+
+    def test_an_existing_wrong_base_repair_branch_is_not_reused(
+        self, repo: Path
+    ) -> None:
+        expected_branch = "autobuild/FEAT-44A8"
+        wrong = _materialise(repo)
+        (repo / "candidate.txt").write_text("retained work\n", encoding="utf-8")
+        git(repo, "add", "candidate.txt")
+        git(repo, "commit", "-q", "-m", "retained candidate")
+        git(repo, "branch", expected_branch)
+        expected = head(repo, expected_branch)
+
+        with pytest.raises(
+            RepairBranchError, match="does not contain the retained candidate"
+        ):
+            _materialise(repo, base=expected_branch, expected=expected)
+
+        assert head(repo, wrong.branch) == wrong.commit
 
 
 class TestFailingCleanly:

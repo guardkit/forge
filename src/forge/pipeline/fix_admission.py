@@ -79,6 +79,7 @@ import inspect
 import json
 import logging
 import re
+import subprocess
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -154,6 +155,10 @@ _FILED_BECAUSE: dict[str, str] = {
     "build-failed": "the build failed",
 }
 
+#: A build-failed repair whose retained candidate cannot be identified exactly.
+REPAIR_BASE_REASON: str = "repair-base"
+
+
 #: ``expected '…', observed '…'`` at the end of a gate evidence description.
 _EXPECTED_OBSERVED: re.Pattern[str] = re.compile(
     r"""expected (['"])(.*?)\1, observed (['"])(.*)\3\s*$""", re.DOTALL
@@ -195,6 +200,14 @@ class PreparedBranch:
     commit: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class RepairBase:
+    """The branch a repair is cut from and its pinned commit, when required."""
+
+    branch: str
+    expected_commit: str | None = None
+
+
 class FixAdmissionRefused(Exception):
     """The journey did not open, and nothing was written.
 
@@ -203,7 +216,8 @@ class FixAdmissionRefused(Exception):
         reason: A short machine word for the caller to map onto its own
             exit code — one of ``cap``, ``task-id``, ``fix-task-yaml``,
             ``parent-feature``, ``repo-not-allowed``, ``repo-unknown``,
-            ``no-source-build``, ``repair-task`` or ``duplicate``.
+            ``no-source-build``, ``repair-base``, ``repair-task`` or
+            ``duplicate``.
         permanent: Whether trying again changes anything. A repository the
             configuration does not know, a budget profile with no cap, a row
             that names no build, a fix-task file that will not parse: every
@@ -790,6 +804,7 @@ def materialise_repair_task(
     base_branch: str = "main",
     source_build_id: str | None = None,
     minted: Mapping[str, Any] | None = None,
+    expected_base_commit: str | None = None,
     receipts_root: Path | str | None = None,
     sidecar: tuple[str, str] | None = None,
     post: Any = None,
@@ -807,6 +822,10 @@ def materialise_repair_task(
     journey's worktree is cut from — a branch made with host git in the
     operator's checkout is invisible there and the conductor refuses the
     build. ``post`` is the sidecar transport, injectable for tests.
+
+    ``expected_base_commit`` pins a retained candidate across admission and
+    branch creation. A moved base ref or an existing repair branch with no
+    candidate ancestry is refused before any files are written.
     """
     from forge.pipeline.repair_branch import (
         list_branch_files,
@@ -847,6 +866,7 @@ def materialise_repair_task(
             base_branch=base_branch,
             files=files,
             message=f"repair task for {subject}: {name}",
+            expected_base_commit=expected_base_commit,
             post=post,
         )
     else:
@@ -856,6 +876,7 @@ def materialise_repair_task(
             base_branch=base_branch,
             files=files,
             message=f"repair task for {subject}: {name}",
+            expected_base_commit=expected_base_commit,
         )
     logger.info(
         "fix admission: %s carries %s and %s at %s (%s)",
@@ -1132,6 +1153,7 @@ async def admit_fix_row(
     actor_identity: str = "forge-work-queue",
     receipts_root: Path | str | None = None,
     clock: Callable[[], datetime] | None = None,
+    sidecar_post: Any = None,
 ) -> FixAdmission:
     """Turn one ``kind='fix'`` queue row into an open fix journey.
 
@@ -1207,11 +1229,24 @@ async def admit_fix_row(
     # Where the repair is cut from, and where (open item 24, 2026-09-13). A
     # build refused at the candidate gate was never merged, so its code lives
     # only on its own autobuild branch — a repair cut from main would repair a
-    # tree without the code. And a repository with a sandbox keeps the clone
-    # the build runs on INSIDE it, so the branch is cut there, through the
-    # sidecar, or the conductor cannot find it.
-    base_branch = choose_repair_base(minted, branch, parent_feature)
+    # tree without the code. A failed build may also have a retained candidate;
+    # its failure pack must identify that exact ref and commit before it can be
+    # used. And a repository with a sandbox keeps the clone the build runs on
+    # INSIDE it, so the branch is cut there, through the sidecar, or the
+    # conductor cannot find it.
     sidecar = _sidecar_for(config, resolution.name)
+    repair_base = await resolve_repair_base(
+        minted=minted,
+        branch=branch,
+        parent_feature=parent_feature,
+        source_build_id=source,
+        source_build=row,
+        repo_path=repo_path,
+        receipts_root=receipts_root,
+        sidecar=sidecar,
+        sidecar_post=sidecar_post,
+    )
+    base_branch = repair_base.branch
     if base_branch != branch or sidecar is not None:
         logger.info(
             "fix admission: %s's repair branch is cut from %s%s",
@@ -1230,10 +1265,12 @@ async def admit_fix_row(
             feature_id=parent_feature,
             name=name,
             base_branch=base_branch,
+            expected_base_commit=repair_base.expected_commit,
             source_build_id=source,
             minted=minted,
             receipts_root=receipts_root,
             sidecar=sidecar,
+            post=sidecar_post,
         )
         _record_repair_branch(
             store,
@@ -1468,6 +1505,244 @@ def _minted_details(store: Any, queue_id: int) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Small shared helpers
 # ---------------------------------------------------------------------------
+
+
+def _git_text(repo: Path, *args: str) -> str | None:
+    """One bounded, read-only Git query, or ``None`` when Git cannot answer."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo), *args],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    value = result.stdout.strip()
+    return value if result.returncode == 0 and value else None
+
+
+def _git_common_dir(repo: Path) -> Path | None:
+    value = _git_text(repo, "rev-parse", "--git-common-dir")
+    if value is None:
+        return None
+    path = Path(value)
+    return (path if path.is_absolute() else repo / path).resolve()
+
+
+def _repair_base_refusal(source_build_id: str, detail: str) -> FixAdmissionRefused:
+    return FixAdmissionRefused(
+        f"Nothing was queued: {source_build_id} failed after coding began, but "
+        f"its retained candidate could not be verified ({detail}). Refusing to "
+        "fall back to main because that would discard the failed build's work.",
+        reason=REPAIR_BASE_REASON,
+        permanent=True,
+    )
+
+
+async def _retained_candidate_base(
+    *,
+    source_build_id: str,
+    source_build: Any,
+    parent_feature: str,
+    repo_path: Path,
+    receipts_root: Path | str | None,
+    sidecar: tuple[str, str] | None,
+    sidecar_post: Any,
+    fallback_branch: str,
+) -> RepairBase:
+    """Resolve a build-failed repair to its exact retained candidate.
+
+    A failure before the GuardKit subprocess started provably has no candidate,
+    so it keeps the caller's branch. Once coding began, every identity must
+    agree: manifest/build/feature/source branch, retained-worktree evidence,
+    candidate branch, committed feature contract and commit. A local target
+    also proves the outer and candidate worktrees share the configured
+    repository; a sandbox target reads its branch and contract through the
+    sidecar because its worktree path is not mounted in the coordinator.
+    The materialiser pins the commit again at the final local/sidecar ref read,
+    closing the race between this inspection and the branch cut.
+    """
+    from forge.pipeline.fix_journey_receipts import read_failure_pack
+
+    pack = read_failure_pack(source_build_id, receipts_root=receipts_root)
+    if pack is None or not pack.has_manifest:
+        raise _repair_base_refusal(
+            source_build_id, "the failure pack has no readable manifest"
+        )
+    recorded_build = str(pack.raw.get("build_id") or "")
+    if recorded_build != source_build_id:
+        raise _repair_base_refusal(
+            source_build_id,
+            f"the manifest names build {recorded_build!r}",
+        )
+    if pack.feature_id != parent_feature:
+        raise _repair_base_refusal(
+            source_build_id,
+            f"the manifest names feature {pack.feature_id!r}, not {parent_feature!r}",
+        )
+    row_correlation = str(getattr(source_build, "correlation_id", "") or "")
+    if row_correlation and pack.correlation_id != row_correlation:
+        raise _repair_base_refusal(
+            source_build_id,
+            "the manifest correlation id does not match the source build",
+        )
+    row_branch = str(getattr(source_build, "branch", "") or "")
+    if row_branch and pack.branch != row_branch:
+        raise _repair_base_refusal(
+            source_build_id,
+            f"the manifest branch {pack.branch!r} does not match the source "
+            f"build branch {row_branch!r}",
+        )
+
+    evidence = pack.evidence
+    subprocess_ran = (
+        evidence.get("subprocess_ran") if isinstance(evidence, Mapping) else None
+    )
+    if subprocess_ran is False:
+        return RepairBase(branch=fallback_branch)
+    if subprocess_ran is not True:
+        raise _repair_base_refusal(
+            source_build_id,
+            "the manifest does not say whether the coding subprocess ran",
+        )
+    if evidence.get("worktree_kept") is not True:
+        raise _repair_base_refusal(
+            source_build_id,
+            "the manifest does not verify that the failed worktree was retained",
+        )
+    if not pack.worktree_path:
+        raise _repair_base_refusal(
+            source_build_id, "the manifest records no retained worktree path"
+        )
+
+    outer_record = Path(pack.worktree_path)
+    if outer_record.name != source_build_id:
+        raise _repair_base_refusal(
+            source_build_id,
+            f"the recorded worktree {pack.worktree_path} does not belong to this build",
+        )
+    candidate_branch = f"autobuild/{parent_feature}"
+    feature_path = "/".join((*FEATURES_DIR_PARTS, f"{parent_feature}.yaml"))
+
+    if sidecar is not None:
+        from forge.planning.sidecar_git_runner import SidecarGitRunner, _urllib_post
+
+        sidecar_url, repo_key = sidecar
+        runner = SidecarGitRunner(
+            sidecar_url,
+            repo=repo_key,
+            post=sidecar_post or _urllib_post,
+        )
+        candidate_commit = await runner.rev_parse(str(repo_path), candidate_branch)
+        if candidate_commit is None:
+            raise _repair_base_refusal(
+                source_build_id,
+                f"the sandbox cannot resolve the retained ref {candidate_branch!r}",
+            )
+        feature_text = await runner.read_file_from_branch(
+            repo_path=str(repo_path),
+            branch=candidate_branch,
+            file_path=feature_path,
+        )
+    else:
+        outer = outer_record.resolve()
+        if not outer.is_dir():
+            raise _repair_base_refusal(
+                source_build_id, f"the recorded worktree {outer} is missing"
+            )
+        candidate = outer.joinpath(".guardkit", "worktrees", parent_feature)
+        if not candidate.is_dir():
+            raise _repair_base_refusal(
+                source_build_id,
+                f"the retained candidate worktree {candidate} is missing",
+            )
+        observed_branch = _git_text(
+            candidate, "symbolic-ref", "--quiet", "--short", "HEAD"
+        )
+        if observed_branch != candidate_branch:
+            raise _repair_base_refusal(
+                source_build_id,
+                (
+                    f"the retained worktree is on {observed_branch!r}, not "
+                    f"{candidate_branch!r}"
+                ),
+            )
+        candidate_commit = _git_text(candidate, "rev-parse", "--verify", "HEAD")
+        if candidate_commit is None:
+            raise _repair_base_refusal(
+                source_build_id, "Git cannot resolve the retained candidate commit"
+            )
+        outer_common = _git_common_dir(outer)
+        candidate_common = _git_common_dir(candidate)
+        if outer_common is None or candidate_common != outer_common:
+            raise _repair_base_refusal(
+                source_build_id,
+                "the retained candidate is not a worktree of the recorded failed build",
+            )
+        if _git_common_dir(repo_path) != outer_common:
+            raise _repair_base_refusal(
+                source_build_id,
+                "the retained candidate belongs to a different repository",
+            )
+        feature_text = _git_text(candidate, "show", f"HEAD:{feature_path}")
+    if feature_text is None:
+        raise _repair_base_refusal(
+            source_build_id,
+            (
+                "the retained candidate does not carry its original contract "
+                f"{feature_path}"
+            ),
+        )
+    try:
+        import yaml
+
+        feature = yaml.safe_load(feature_text)
+    except yaml.YAMLError as exc:
+        raise _repair_base_refusal(
+            source_build_id, f"the original feature contract is malformed ({exc})"
+        ) from exc
+    if (
+        not isinstance(feature, Mapping)
+        or str(feature.get("id") or "") != parent_feature
+    ):
+        raise _repair_base_refusal(
+            source_build_id,
+            "the retained candidate's original feature contract has the wrong id",
+        )
+    return RepairBase(branch=candidate_branch, expected_commit=candidate_commit)
+
+
+async def resolve_repair_base(
+    *,
+    minted: Mapping[str, Any] | None,
+    branch: str,
+    parent_feature: str,
+    source_build_id: str,
+    source_build: Any,
+    repo_path: Path,
+    receipts_root: Path | str | None,
+    sidecar: tuple[str, str] | None,
+    sidecar_post: Any = None,
+) -> RepairBase:
+    """Choose the repair base, preserving a verified build-failed candidate."""
+    from forge.pipeline.fix_row_producer import SOURCE_BUILD_FAILED
+
+    chosen = choose_repair_base(minted, branch, parent_feature)
+    source = str((minted or {}).get("source") or "")
+    if source != SOURCE_BUILD_FAILED:
+        return RepairBase(branch=chosen)
+    return await _retained_candidate_base(
+        source_build_id=source_build_id,
+        source_build=source_build,
+        parent_feature=parent_feature,
+        repo_path=repo_path,
+        receipts_root=receipts_root,
+        sidecar=sidecar,
+        sidecar_post=sidecar_post,
+        fallback_branch=branch,
+    )
 
 
 def choose_repair_base(
