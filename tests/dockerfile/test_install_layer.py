@@ -55,12 +55,16 @@ NATS_CORE_LAYOUT_GATE = (
     '|| (echo "nats-core layout invalid" >&2; exit 1)'
 )
 
+IMAGE_LOCK_PATH = "/build/requirements-image-py314.lock"
+
 PRIVATE_INSTALL_REQUIREMENTS = (
     "/tmp/nats-core",
     "/tmp/fleet-memory",
     ".[providers,memory]",
     "/tmp/guardkitfactory",
     "/tmp/guardkit",
+    "--requirement",
+    IMAGE_LOCK_PATH,
     "deepagents==0.7.14",
 )
 
@@ -207,6 +211,23 @@ def _builder_install_requirements(dockerfile_text: str) -> tuple[str, ...]:
     return tuple(tokens[3:])
 
 
+def _assert_builder_install_contract(dockerfile_text: str) -> None:
+    """Require the complete image lock without exporting it to build isolation."""
+
+    assert _builder_install_requirements(
+        dockerfile_text
+    ) == PRIVATE_INSTALL_REQUIREMENTS, (
+        "The only pip install must resolve all private local projects, the "
+        f"exact image lock at {IMAGE_LOCK_PATH}, and deepagents==0.7.14 in "
+        "one coherent transaction"
+    )
+    assert not re.search(
+        r"^ENV\s+PIP_REQUIREMENT(?:=|\s)",
+        dockerfile_text,
+        re.MULTILINE,
+    ), "PIP_REQUIREMENT must not be exported into isolated package builds"
+
+
 class TestBuildScriptExists:
     """AC: ``scripts/build-image.sh`` exists and is executable."""
 
@@ -327,13 +348,49 @@ class TestBuilderStageInstallLayer:
         self, dockerfile_text: str
     ) -> None:
         # One resolver invocation sees every private source, Forge's extras,
-        # and the exact SDK pin together.
-        assert _builder_install_requirements(
-            dockerfile_text
-        ) == PRIVATE_INSTALL_REQUIREMENTS, (
-            "The only pip install must resolve all private local projects and "
-            "deepagents==0.7.14 in one coherent transaction"
+        # the complete image lock, and the exact SDK pin together.
+        _assert_builder_install_contract(dockerfile_text)
+
+    def test_rejects_absent_image_lock(self, dockerfile_text: str) -> None:
+        mutated = dockerfile_text.replace(
+            f"--requirement {IMAGE_LOCK_PATH}",
+            "",
+            1,
         )
+        assert mutated != dockerfile_text, "Test mutation did not find image lock"
+        with pytest.raises(AssertionError, match="exact image lock"):
+            _assert_builder_install_contract(mutated)
+
+    def test_rejects_wrong_image_lock(self, dockerfile_text: str) -> None:
+        mutated = dockerfile_text.replace(
+            IMAGE_LOCK_PATH,
+            "/build/wrong-image.lock",
+            1,
+        )
+        assert mutated != dockerfile_text, "Test mutation did not find image lock"
+        with pytest.raises(AssertionError, match="exact image lock"):
+            _assert_builder_install_contract(mutated)
+
+    def test_rejects_exported_pip_requirement(
+        self, dockerfile_text: str
+    ) -> None:
+        copy_directive = "COPY requirements-image-py314.lock ./"
+        mutated = dockerfile_text.replace(
+            copy_directive,
+            (
+                f"{copy_directive}\n"
+                f"ENV PIP_REQUIREMENT={IMAGE_LOCK_PATH}"
+            ),
+            1,
+        )
+        assert mutated != dockerfile_text, (
+            "Test mutation did not find image lock COPY"
+        )
+        with pytest.raises(
+            AssertionError,
+            match="must not be exported",
+        ):
+            _assert_builder_install_contract(mutated)
 
     def test_rejects_second_install_after_pip_check_in_same_run(
         self, dockerfile_text: str
