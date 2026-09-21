@@ -377,8 +377,20 @@ class TestTheCardAndTheDurableRow:
         config: ForgeConfig,
         pool: SqliteLifecyclePersistence,
     ) -> None:
-        """The seam answering ``None`` is "nobody counted", and the card is
-        then byte for byte the card that shipped before the scope pass."""
+        """The seam answering ``None`` is "nobody counted", and the card then
+        says nothing at all about scope.
+
+        Amended 2026-09-21. This used to read "byte for byte the card that
+        shipped before the scope pass". The card now also carries one reading
+        of what the finished feature was actually checked for, and a build
+        with no record of that says so out loud rather than falling silent —
+        an absent record on a finished build means something went wrong, and
+        silence there reads as "built clean". So the claim this test owns is
+        narrowed to its own subject: nobody counted the scope, and not one
+        word about scope is on the card. The finished-feature reading is
+        pinned out with its own seam, and its own file holds it to its own
+        four wordings.
+        """
         _insert_build(pool)
         recorder = _Recorder()
 
@@ -386,15 +398,26 @@ class TestTheCardAndTheDurableRow:
             return None
 
         asyncio.run(
-            _service(config, pool, recorder, scope_pass=_nobody_counted).maybe_offer(
-                _event()
-            )
+            _service(
+                config,
+                pool,
+                recorder,
+                scope_pass=_nobody_counted,
+                finished_feature_reader=lambda *_a, **_k: (
+                    {"status": "passed", "declared": True, "not_checked": []},
+                    None,
+                    None,
+                ),
+            ).maybe_offer(_event())
         )
-        assert recorder.paused.rationale == (
-            f"{FEATURE_ID} built clean — 5 of 5 tasks passed. Approve = merge "
-            "into main, deploy to the sandbox and run the checks; the branch "
-            "is kept either way. Reject = nothing changes."
+        words = recorder.paused.rationale
+        assert words.startswith(f"{FEATURE_ID} built clean — 5 of 5 tasks passed.")
+        assert words.endswith(
+            "Approve = merge into main, deploy to the sandbox and run the "
+            "checks; the branch is kept either way. Reject = nothing changes."
         )
+        for about_scope in ("also changed", "web address", "This build changed"):
+            assert about_scope not in words
 
     def test_a_scope_pass_that_raises_never_costs_the_card(
         self,
