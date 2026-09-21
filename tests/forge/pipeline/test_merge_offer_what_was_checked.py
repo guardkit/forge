@@ -964,8 +964,9 @@ class TestAPartlyReadCheckIsSaidOnTheCard:
             ),
         )
         assert "3 things the checks were given could not be read" in said.text
-        # It ran and found nothing IN WHAT IT COULD READ, and both are said.
-        assert "Code checks: no findings" in said.text
+        # It ran and found nothing IN WHAT IT COULD READ, and the line says so
+        # in those words rather than leading with a bare "no findings".
+        assert "Code checks: no findings in what could be read" in said.text
 
     def test_a_check_that_read_everything_says_nothing_about_it(self) -> None:
         said = what_was_checked(a_record(), a_code_checks())
