@@ -565,7 +565,12 @@ def _code_checks_line(code_checks: Mapping[str, Any] | None) -> str:
             f"({named})"
         )
     elif looked:
-        said.append("no findings")
+        # A check that read only part of what it was given found nothing IN
+        # THAT PART; leading the line with a bare "no findings" would say more
+        # than it knows (coordinator's review, 21 September 2026).
+        said.append(
+            "no findings in what could be read" if partly_read > 0 else "no findings"
+        )
     elif blocks_total:
         said.append("nothing was checked")
     else:
