@@ -348,7 +348,7 @@ class TestTheCardAndTheDurableRow:
         asyncio.run(_service(config, pool, recorder).maybe_offer(_event()))
 
         words = recorder.paused.rationale
-        assert words.startswith(f"{FEATURE_ID} built clean — 5 of 5 tasks passed. ")
+        assert words.startswith(f"{FEATURE_ID} built — 5 of 5 tasks passed. ")
         assert (
             "This build also changed 1 file the plan did not name: "
             "src/analytics/service.py — worth a look before you merge." in words
@@ -426,7 +426,7 @@ class TestTheCardAndTheDurableRow:
             ).maybe_offer(_event())
         )
         words = recorder.paused.rationale
-        assert words.startswith(f"{FEATURE_ID} built clean — 5 of 5 tasks passed.")
+        assert words.startswith(f"{FEATURE_ID} built — 5 of 5 tasks passed.")
         assert words.endswith(
             "Approve = merge into main, deploy to the sandbox and run the "
             "checks; the branch is kept either way. Reject = nothing changes."
@@ -450,7 +450,7 @@ class TestTheCardAndTheDurableRow:
                 _event()
             )
         )
-        assert "built clean" in recorder.paused.rationale
+        assert "built — 5 of 5 tasks passed." in recorder.paused.rationale
         assert "could not be read here" not in recorder.paused.rationale
 
 

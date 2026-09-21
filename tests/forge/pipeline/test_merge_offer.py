@@ -384,7 +384,7 @@ class TestDualEnvelope:
         assert details["merge_branch"] == "fix/TASK-MX1FIX1-00000001"
         paused = recorder.events[1][1]
         assert paused.rationale.startswith(
-            f"{FEATURE_ID} (branch fix/TASK-MX1FIX1-00000001) built clean — "
+            f"{FEATURE_ID} (branch fix/TASK-MX1FIX1-00000001) built — "
         )
         assert "Approve = merge into main" in paused.rationale
         # The durable latch says the same thing the card said.
@@ -411,7 +411,7 @@ class TestDualEnvelope:
         assert details["merge_branch"] is None
         paused = recorder.events[1][1]
         # The card is byte for byte what it always was: no branch named.
-        assert paused.rationale.startswith(f"{FEATURE_ID} built clean — 5 of 5 tasks passed. ")
+        assert paused.rationale.startswith(f"{FEATURE_ID} built — 5 of 5 tasks passed. ")
         assert "(branch " not in paused.rationale
 
     @pytest.mark.asyncio
