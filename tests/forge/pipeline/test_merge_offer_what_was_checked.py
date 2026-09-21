@@ -241,11 +241,20 @@ class TestARecordThatSaysNothingClaimsNothing:
         assert said.state == "unavailable"
         assert said.text.startswith(EVIDENCE_UNAVAILABLE)
 
-    def test_a_record_with_no_status_but_a_real_list_is_still_read(self) -> None:
-        # The lists are the evidence; a record that carries one is a record.
+    def test_a_record_with_no_status_but_a_real_list_says_nothing_ran(self) -> None:
+        """Corrected 21 September 2026, the Stage C re-check's own residual.
+
+        A list beside no status is not evidence that anything ran; it is only
+        evidence that something was written down. This used to open "The
+        project's check of the finished feature ran." off a record that never
+        said it had.
+        """
         said = what_was_checked({"feature": FEATURE_ID, "not_checked": []})
-        assert said.state == "ran"
-        assert "It left nothing on its not-checked list." in said.text
+        assert said.state == "unavailable"
+        assert said.text.startswith(EVIDENCE_UNAVAILABLE)
+        assert "does not say whether the check ran" in said.text
+        assert CHECK_RAN not in said.text
+        assert "It left nothing on its not-checked list." not in said.text
 
     def test_a_not_checked_list_that_is_not_a_list_is_never_left_nothing(
         self,
@@ -819,7 +828,9 @@ class TestAReadingFaultNeverStopsACard:
         words, details = _card(recorder)
         block = details[FINISHED_FEATURE_DETAILS_KEY]
         assert block["card_characters"] <= FINISHED_FEATURE_BUDGET
-        assert " ".join(block["card_lines"]) in words
+        # ONE LINE EACH, and the breaks are inside the budget: the block on
+        # the card is the block the details describe, joined the same way.
+        assert "\n".join(block["card_lines"]) in words
 
     @pytest.mark.asyncio
     async def test_the_card_still_says_everything_it_said_before(
@@ -833,8 +844,150 @@ class TestAReadingFaultNeverStopsACard:
             lambda *_a, **_k: (a_record(), None, None),
         ).maybe_offer(_event())
         words, _ = _card(recorder)
-        assert words.startswith(f"{FEATURE_ID} built clean — 5 of 5 tasks passed.")
+        assert words.startswith(f"{FEATURE_ID} built — 5 of 5 tasks passed.")
         assert words.endswith(
             "Approve = merge into main, deploy to the sandbox and run the "
             "checks; the branch is kept either way. Reject = nothing changes."
         )
+
+
+# ---------------------------------------------------------------------------
+# One sentence per line, and the opening word that was not true
+# ---------------------------------------------------------------------------
+
+
+class TestOneSentencePerLine:
+    """Added 21 September 2026.
+
+    Everything this reading adds used to be joined into the card's one
+    paragraph, so the four wordings, the not-checked list, three "Asked /
+    Answered" pairs and the code-checks line arrived as a wall of text. They
+    now take a line each, and the closing sentence starts a line of its own.
+    A line break costs exactly what a space cost, so the budget is unchanged
+    and the breaks are counted inside it.
+    """
+
+    def test_every_part_of_the_block_is_its_own_line(self) -> None:
+        said = what_was_checked(a_record(), a_code_checks())
+        lines = said.text.split("\n")
+        assert lines[0] == CHECK_RAN
+        assert len([ln for ln in lines if ln.startswith("Not checked:")]) == 1
+        assert len([ln for ln in lines if ln.startswith("Asked: ")]) == 2
+        assert len([ln for ln in lines if ln.startswith("Code checks: ")]) == 1
+        # And no line carries two of them.
+        for line in lines:
+            assert line.count("Asked: ") <= 1
+            assert not (line.startswith("Not checked:") and "Asked: " in line)
+
+    def test_the_budget_counts_the_line_breaks(self) -> None:
+        said = what_was_checked(_longest_allowed(), a_code_checks())
+        assert said.details["card_characters"] == len(said.text)
+        assert said.text.count("\n") == len(said.lines) - 1
+        assert len(said.text) <= FINISHED_FEATURE_BUDGET
+
+    @pytest.mark.asyncio
+    async def test_the_card_carries_the_breaks_and_loses_no_sentence(
+        self, config, pool
+    ) -> None:
+        recorder = _Recorder()
+        await _service(
+            config,
+            pool,
+            recorder,
+            lambda *_a, **_k: (a_record(), a_code_checks(), None),
+        ).maybe_offer(_event())
+        words, details = _card(recorder)
+        lines = words.split("\n")
+        # The opening sentence, then a line each for the reading, then the
+        # closing sentence on a line of its own.
+        assert lines[0] == f"{FEATURE_ID} built — 5 of 5 tasks passed."
+        for line in details[FINISHED_FEATURE_DETAILS_KEY]["card_lines"]:
+            assert line in lines
+        assert lines[-1].startswith("Approve = merge into main")
+        assert "passed. The project's check" not in words
+
+    @pytest.mark.asyncio
+    async def test_the_opening_sentence_no_longer_calls_the_build_clean(
+        self, config, pool
+    ) -> None:
+        """It counted the build's own tasks and called that clean, on a card
+        that went on to say not one of the feature's examples was checked."""
+        recorder = _Recorder()
+        await _service(
+            config,
+            pool,
+            recorder,
+            lambda *_a, **_k: (a_record(), a_code_checks(), None),
+        ).maybe_offer(_event())
+        words, _ = _card(recorder)
+        assert "clean" not in words
+        assert words.startswith(f"{FEATURE_ID} built — 5 of 5 tasks passed.")
+
+
+class TestAPartlyReadCheckIsSaidOnTheCard:
+    """A check that read only part of what it was given, 21 September 2026.
+
+    The record carries the count beside the state — for a group of tasks
+    since this was written, and now for a task as well. Forge adds them up
+    and repeats the number; it works nothing out from it.
+    """
+
+    def test_the_count_reaches_the_card(self) -> None:
+        said = what_was_checked(
+            a_record(not_checked=[], observations=[]),
+            a_code_checks(
+                finding_count=0,
+                tasks_with_something_not_checked=0,
+                shell_command_count=0,
+                tasks=[
+                    {
+                        "task": "TASK-WC1-001",
+                        "checks": {
+                            "wiring": {
+                                "state": "ran_and_found_nothing",
+                                "findings": [],
+                                "finding_count": 0,
+                                "inputs_not_read": 2,
+                            }
+                        },
+                    }
+                ],
+                groups=[
+                    {
+                        "group": 1,
+                        "state": "ran_and_found_nothing",
+                        "findings": [],
+                        "finding_count": 0,
+                        "inputs_not_read": 1,
+                    }
+                ],
+            ),
+        )
+        assert "3 things the checks were given could not be read" in said.text
+        # It ran and found nothing IN WHAT IT COULD READ, and both are said.
+        assert "Code checks: no findings" in said.text
+
+    def test_a_check_that_read_everything_says_nothing_about_it(self) -> None:
+        said = what_was_checked(a_record(), a_code_checks())
+        assert "could not be read" not in said.text
+
+    def test_one_thing_is_said_in_the_singular(self) -> None:
+        said = what_was_checked(
+            a_record(not_checked=[], observations=[]),
+            a_code_checks(
+                finding_count=0,
+                tasks_with_something_not_checked=0,
+                shell_command_count=0,
+                tasks=[],
+                groups=[
+                    {
+                        "group": 1,
+                        "state": "ran_and_found_nothing",
+                        "findings": [],
+                        "finding_count": 0,
+                        "inputs_not_read": 1,
+                    }
+                ],
+            ),
+        )
+        assert "1 thing the checks were given could not be read" in said.text

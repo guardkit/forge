@@ -223,7 +223,8 @@ def read_baseline_failing(build_id: str) -> list[str] | None:
 # and "nothing was reported" read exactly like "nothing was wrong": the one
 # build that answered with an empty list where seven entries were asked for,
 # and whose own examples were never checked at all, offered a card that read
-# "built clean".
+# "built clean". (That word was taken off the opening sentence on
+# 21 September 2026; the sentence still counts the build's own tasks.)
 #
 # So the card gains a reading of two records the build leaves behind and the
 # runner already exports: the whole-feature record (what the project's own
@@ -340,7 +341,17 @@ class WhatWasChecked:
 
     @property
     def text(self) -> str:
-        return " ".join(self.lines)
+        """The block as it goes on the card: ONE SENTENCE PER LINE.
+
+        Joined with a line break and not a space (21 September 2026). Read
+        as one paragraph, the four wordings, the not-checked list, each
+        observation and the code-checks line ran together into a wall of
+        text a person skims past — and the whole point of this reading is
+        that a person reads it. A line break costs exactly what a space
+        cost, so :data:`FINISHED_FEATURE_BUDGET` is unchanged and the
+        breaks are counted inside it.
+        """
+        return "\n".join(self.lines)
 
 
 def _tidy(value: Any) -> str:
@@ -489,6 +500,12 @@ def _code_checks_line(code_checks: Mapping[str, Any] | None) -> str:
     come out as the single line "Code checks: no findings." — which an owner
     reads as "the code was checked and was clean". The states are the
     record's own; they are counted, not interpreted.
+
+    **A check that could read only part of what it was given says so**
+    (21 September 2026). The record carries that count as ``inputs_not_read``
+    beside the state, for a group of tasks and now for a task as well; the
+    numbers are added up and repeated, and nothing here works out what an
+    input is.
     """
     if not isinstance(code_checks, Mapping):
         return CODE_CHECKS_UNAVAILABLE
@@ -501,6 +518,11 @@ def _code_checks_line(code_checks: Mapping[str, Any] | None) -> str:
     blocks_total = 0
     looked = 0
     kind_not_supported = 0
+    # How many of the things the checks were given they could not read. A
+    # check that read only part of its input and found nothing in the rest
+    # has not covered the part it could not read, so the record carries the
+    # number beside the state and the card repeats it (21 September 2026).
+    partly_read = 0
     for row in list(code_checks.get("tasks") or []) + list(
         code_checks.get("groups") or []
     ):
@@ -519,6 +541,11 @@ def _code_checks_line(code_checks: Mapping[str, Any] | None) -> str:
                 looked += 1
             elif state == _CHECK_KIND_NOT_SUPPORTED:
                 kind_not_supported += 1
+            try:
+                unread = block.get("inputs_not_read")
+                partly_read += int(unread) if unread is not None else 0
+            except (TypeError, ValueError):
+                pass
             for finding in list(block.get("findings") or []):
                 if not isinstance(finding, Mapping):
                     continue
@@ -547,6 +574,11 @@ def _code_checks_line(code_checks: Mapping[str, Any] | None) -> str:
         said.append(
             f"{kind_not_supported} of {blocks_total} checks do not cover this "
             "kind of project"
+        )
+    if partly_read > 0:
+        said.append(
+            f"{partly_read} thing{'s' if partly_read != 1 else ''} the checks "
+            "were given could not be read"
         )
     try:
         not_checked = int(code_checks.get("tasks_with_something_not_checked") or 0)
@@ -624,24 +656,37 @@ def _what_was_checked(
         details.update({"state": state, "reason": _tidy(record.get("reason"))})
         return _fit(state, [NO_CHECK_DECLARED], [], "", details)
 
-    # (1b) A record that says NOTHING is not a record of a check that ran
-    # (21 September 2026, the Stage C review). GuardKit always writes a full
-    # record, so no status and not one of its three lists means a truncated
-    # or corrupted one — and the only wording that fits is the one kept for
-    # evidence that could not be read. It is never the affirmative wording.
+    # (1b) A record that does not say the check ran is not a record of a
+    # check that ran (21 September 2026, the Stage C review and its
+    # re-check). GuardKit always writes a status, so a record without one is
+    # truncated or corrupted — and a list beside it is not evidence that
+    # anything ran, only that something was written down. Both cases take
+    # the wording kept for evidence that cannot be read; neither may open
+    # with "The project's check of the finished feature ran."
     carries_not_checked = isinstance(record.get("not_checked"), list)
     carries_a_list = (
         carries_not_checked
         or isinstance(record.get("observations"), list)
         or isinstance(record.get("scenarios_covered"), list)
     )
-    if not status and not carries_a_list:
+    if not status:
         reason = _shorten(
-            why_not or "the record carries no status and none of its lists",
+            why_not
+            or (
+                "the record does not say whether the check ran"
+                if carries_a_list
+                else "the record carries no status and none of its lists"
+            ),
             _REASON_CHARS,
         )
         state = "unavailable"
-        details.update({"state": state, "reason": reason})
+        details.update(
+            {
+                "state": state,
+                "reason": reason,
+                "carried_a_list_without_a_status": carries_a_list,
+            }
+        )
         return _fit(state, [f"{EVIDENCE_UNAVAILABLE} {reason}"], [], "", details)
 
     # (2) What the check left unchecked. COUNT THE LIST, never the record's
@@ -765,7 +810,11 @@ def _fit(
     tail = [code_checks_line] if code_checks_line else []
 
     def whole(parts: list[str]) -> str:
-        return " ".join(p for p in parts if p)
+        # ONE SENTENCE PER LINE (21 September 2026). The separator is a line
+        # break rather than a space, and it is one character either way, so
+        # every number this function works out — the budget, the cut, the
+        # card's own character count — counts the breaks and is unchanged.
+        return "\n".join(p for p in parts if p)
 
     shortened = False
     dropped = 0
@@ -1097,20 +1146,33 @@ class MergeOfferService:
                 if merge_branch is not None
                 else event.feature_id
             )
-            sentences = [
-                f"{named} built clean — {event.tasks_completed} of "
+            # THE OPENING SENTENCE no longer says "clean" (21 September
+            # 2026). It counted the build's own tasks and then the card went
+            # on to say that not one of the feature's examples had been
+            # checked, so "clean" was the least true word on it. What it
+            # counts is unchanged; only the word is gone.
+            opening = [
+                f"{named} built — {event.tasks_completed} of "
                 f"{event.tasks_total} tasks passed."
             ]
             in_scope = card_line_about_scope(scope)
             if in_scope:
-                sentences.append(in_scope)
-            sentences.extend(checked.lines)
-            sentences.append(
+                opening.append(in_scope)
+
+            # ONE SENTENCE PER LINE for everything the finished-feature
+            # reading adds, and a line of its own for the closing sentence.
+            # Slack renders the breaks as breaks (they ride an inert
+            # ``plain_text`` block and are never cut), and a person can find
+            # the not-checked line and each "Asked / Answered" pair without
+            # reading a paragraph.
+            lines = [" ".join(opening)]
+            lines.extend(line for line in checked.lines if line)
+            lines.append(
                 "Approve = merge into main, deploy to the sandbox and run the "
                 "checks; the branch is kept either way. Reject = nothing "
                 "changes."
             )
-            return " ".join(sentences)
+            return "\n".join(lines)
 
         details: dict[str, Any] = {
             "tasks_completed": event.tasks_completed,
