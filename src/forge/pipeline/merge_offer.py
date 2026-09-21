@@ -63,6 +63,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "CHECK_COULD_NOT_RUN",
     "CHECK_RAN",
+    "CODE_CHECKS_FOR_ANOTHER_FEATURE",
     "CODE_CHECKS_UNAVAILABLE",
     "EVIDENCE_UNAVAILABLE",
     "FINISHED_FEATURE_BUDGET",
@@ -291,6 +292,16 @@ CODE_CHECKS_UNAVAILABLE: str = (
     "whether anything looked at the code."
 )
 
+#: Said instead when the only summary exported was written for a different
+#: feature (21 September 2026, the coordinator's review of parts 1 and 2).
+#: It is refused rather than shown, and the card says whose it was: another
+#: feature's checks say nothing about this one, and a silent swap would read
+#: as this feature's.
+CODE_CHECKS_FOR_ANOTHER_FEATURE: str = (
+    "Code checks: the summary exported was written for {other}, not for this "
+    "feature, so nothing here says whether anything looked at this code."
+)
+
 #: How long the card will wait for the two records to be read. It is a disk
 #: read of a small tree, so this is not a budget, it is a stop: a records
 #: folder that has stopped answering must cost the owner a sentence on the
@@ -368,29 +379,61 @@ def _shorten(value: Any, limit: int) -> str:
     return text[:keep].rstrip() + CUT_MARK
 
 
+def _feature_a_record_names(data: Mapping[str, Any]) -> str:
+    """The feature a record says it is about, or ``""`` when it names none.
+
+    ``"none"`` and ``"null"`` are read as naming none: the record is written
+    from whatever the build was given, and a build with no feature name in
+    hand writes the word rather than leaving the field out.
+    """
+    named = _tidy(data.get("feature"))
+    return "" if named.casefold() in _NAMES_NO_FEATURE else named
+
+
+#: What a record's ``feature`` field can say that is not a feature's name.
+_NAMES_NO_FEATURE: tuple[str, ...] = ("", "none", "null")
+
+
 def _read_one_record(
     build_id: str, name: str, feature_id: str | None
-) -> tuple[dict[str, Any] | None, str | None]:
-    """One exported record by FILE NAME — ``(record, why not)``, never raises.
+) -> tuple[dict[str, Any] | None, str | None, str | None]:
+    """One exported record by FILE NAME. Never raises.
+
+    Returns ``(record, why not, the other feature it was written for)``.
 
     Globs ``receipts_root()/<build_id>/**/<name>``, exactly as
     :func:`read_baseline_failing` does, so nothing here knows or assumes
-    where in the exported tree a record landed. When several copies were
-    exported (the runner exports the outer tree and every inner one), a copy
-    whose own ``feature`` matches this build's feature wins, then the
-    shallowest path, then alphabetical order — a rule with no ties in it, so
-    two runs of this reader can never disagree.
+    where in the exported tree a record landed.
+
+    **A record that names a DIFFERENT feature is refused, never returned**
+    (21 September 2026, after the coordinator's review of parts 1 and 2). It
+    used only to lose a preference, so when this build's own record was
+    missing another feature's answers were shown as this feature's — the one
+    reading on the card an owner cannot check for himself. When every copy
+    found is refused, the reading is "evidence unavailable" with the other
+    feature named, and the card is still offered.
+
+    A record that names NO feature is ACCEPTED, because the build's own
+    folder already scopes it and nothing about it is a mismatch that can be
+    shown. GuardKit does always write the field — ``feature_check.py``
+    (``to_dict``) and ``code_checks.py`` both put the build's feature in
+    every record they write — so an unnamed record is an older or foreign
+    shape, not this build's neighbour. A record naming this feature still
+    wins over an unnamed one, then the shallowest path, then alphabetical
+    order — a rule with no ties in it, so two runs can never disagree.
     """
     try:
         root = receipts_root() / build_id
         if not root.is_dir():
-            return None, "nothing was exported for this build"
+            return None, "nothing was exported for this build", None
         found = sorted(
             root.glob(f"**/{name}"), key=lambda p: (len(p.parts), str(p))
         )
         if not found:
-            return None, f"no {name} was exported for this build"
+            return None, f"no {name} was exported for this build", None
+        wanted = _tidy(feature_id)
         records: list[tuple[int, Path, dict[str, Any]]] = []
+        refused: list[str] = []
         first_trouble: str | None = None
         for path in found:
             try:
@@ -405,16 +448,36 @@ def _read_one_record(
                 if first_trouble is None:
                     first_trouble = f"{name} is not a record this could read"
                 continue
-            mine = (
-                0
-                if feature_id and _tidy(data.get("feature")) == _tidy(feature_id)
-                else 1
+            named = _feature_a_record_names(data)
+            if wanted and named and named.casefold() != wanted.casefold():
+                if named not in refused:
+                    refused.append(named)
+                continue
+            records.append((0 if named else 1, path, data))
+        if records:
+            records.sort(key=lambda item: item[0])
+            return records[0][2], None, None
+        if refused:
+            others = ", ".join(_shorten(other, 60) for other in refused[:3])
+            if len(refused) > 3:
+                others = f"{others} and {len(refused) - 3} more"
+            reason = (
+                f"the only {name} exported was written for {others}, not for "
+                f"this feature"
+                if len(refused) == 1
+                else f"every {name} exported was written for another feature "
+                f"({others})"
             )
-            records.append((mine, path, data))
-        if not records:
-            return None, first_trouble or f"no {name} could be read"
-        records.sort(key=lambda item: item[0])
-        return records[0][2], None
+            logger.warning(
+                "the finished-feature reading: every %s exported under %s "
+                "names another feature (%s) — it is refused and the card "
+                "says the evidence was unavailable",
+                name,
+                build_id,
+                others,
+            )
+            return None, reason, others
+        return None, first_trouble or f"no {name} could be read", None
     except Exception as exc:  # noqa: BLE001 — a reader never stops a card
         logger.debug(
             "the finished-feature reading: %s could not be looked for under "
@@ -423,25 +486,32 @@ def _read_one_record(
             build_id,
             exc,
         )
-        return None, f"{name} could not be looked for ({type(exc).__name__})"
+        return None, f"{name} could not be looked for ({type(exc).__name__})", None
 
 
 def read_what_was_checked(
     build_id: str, feature_id: str | None = None
-) -> tuple[dict[str, Any] | None, dict[str, Any] | None, str | None]:
-    """The two exported records for this build — ``(record, code checks, why not)``.
+) -> tuple[
+    dict[str, Any] | None, dict[str, Any] | None, str | None, str | None
+]:
+    """The two exported records for this build.
 
-    ``why not`` is a short reason the whole-feature record could not be read,
-    and it is the only one that changes what the card says: the code-checks
-    summary simply goes unmentioned when it is not there. Never raises.
+    ``(record, code checks, why not, the code-checks summary was another
+    feature's)``.
+
+    ``why not`` is a short reason the whole-feature record could not be read.
+    The fourth value is set only when the code-checks summary was refused for
+    naming a different feature, because that is the one absence the card has
+    to explain rather than pass over: every other way the summary can be
+    missing already has its own sentence. Never raises.
     """
-    record, why_not = _read_one_record(
+    record, why_not, _ = _read_one_record(
         build_id, FEATURE_CHECK_RECORD_NAME, feature_id
     )
-    code_checks, _ = _read_one_record(
+    code_checks, _, code_checks_for_another = _read_one_record(
         build_id, CODE_CHECKS_RECORD_NAME, feature_id
     )
-    return record, code_checks, why_not
+    return record, code_checks, why_not, code_checks_for_another
 
 
 def _pairs(raw: Any, keys: tuple[str, str]) -> list[tuple[str, str]]:
@@ -487,7 +557,10 @@ def _not_checked_line(names: list[str], total: int, limit: int) -> str:
     return assembled(shown)
 
 
-def _code_checks_line(code_checks: Mapping[str, Any] | None) -> str:
+def _code_checks_line(
+    code_checks: Mapping[str, Any] | None,
+    for_another_feature: str | None = None,
+) -> str:
     """One line about what the checks inside the build did.
 
     Findings are named, tasks nothing looked at are counted, and commands the
@@ -506,8 +579,19 @@ def _code_checks_line(code_checks: Mapping[str, Any] | None) -> str:
     beside the state, for a group of tasks and now for a task as well; the
     numbers are added up and repeated, and nothing here works out what an
     input is.
+
+    **A summary written for a different feature is refused, and the line says
+    whose it was** (21 September 2026, the coordinator's review of parts 1
+    and 2).
     """
     if not isinstance(code_checks, Mapping):
+        if for_another_feature:
+            return _shorten(
+                CODE_CHECKS_FOR_ANOTHER_FEATURE.format(
+                    other=_shorten(for_another_feature, 60)
+                ),
+                _CODE_CHECKS_LINE_CHARS,
+            )
         return CODE_CHECKS_UNAVAILABLE
     said: list[str] = []
     try:
@@ -610,6 +694,7 @@ def what_was_checked(
     record: Mapping[str, Any] | None,
     code_checks: Mapping[str, Any] | None = None,
     why_not: str | None = None,
+    code_checks_for_another_feature: str | None = None,
 ) -> WhatWasChecked:
     """Turn the two records into the card's sentences. Never raises.
 
@@ -621,7 +706,9 @@ def what_was_checked(
     is dropped.
     """
     try:
-        return _what_was_checked(record, code_checks, why_not)
+        return _what_was_checked(
+            record, code_checks, why_not, code_checks_for_another_feature
+        )
     except Exception as exc:  # noqa: BLE001 — a reader never stops a card
         logger.warning(
             "the finished-feature reading: the records could not be put into "
@@ -643,8 +730,11 @@ def _what_was_checked(
     record: Mapping[str, Any] | None,
     code_checks: Mapping[str, Any] | None,
     why_not: str | None,
+    code_checks_for_another_feature: str | None = None,
 ) -> WhatWasChecked:
     details: dict[str, Any] = {"budget_characters": FINISHED_FEATURE_BUDGET}
+    if code_checks_for_another_feature:
+        details["code_checks_written_for"] = code_checks_for_another_feature
 
     # (1) Which of the four wordings opens the block.
     if not isinstance(record, Mapping):
@@ -652,7 +742,17 @@ def _what_was_checked(
         opening = f"{EVIDENCE_UNAVAILABLE} {reason}"
         state = "unavailable"
         details.update({"state": state, "reason": reason})
-        return _fit(state, [opening], [], "", details)
+        # One record refused and the other good is said honestly both ways:
+        # the whole-feature reading is unavailable, and the summary of the
+        # checks inside the build is still shown when it was readable (or
+        # named as another feature's when it was refused).
+        tail = ""
+        if isinstance(code_checks, Mapping) or code_checks_for_another_feature:
+            tail = _code_checks_line(code_checks, code_checks_for_another_feature)
+            details["code_checks_summary_read"] = isinstance(code_checks, Mapping)
+            if isinstance(code_checks, Mapping):
+                details["code_checks"] = _code_checks_details(code_checks)
+        return _fit(state, [opening], [], tail, details)
 
     status = _tidy(record.get("status")).lower()
     declared = record.get("declared")
@@ -773,26 +873,31 @@ def _what_was_checked(
     )
     details["code_checks_summary_read"] = isinstance(code_checks, Mapping)
     if isinstance(code_checks, Mapping):
-        details["code_checks"] = {
-            key: code_checks.get(key)
-            for key in (
-                "finding_count",
-                "tasks_total",
-                "tasks_with_something_not_checked",
-                "tasks_not_checked",
-                "shell_command_count",
-            )
-            if key in code_checks
-        }
+        details["code_checks"] = _code_checks_details(code_checks)
 
     return _fit(
         state,
         head,
         observed,
-        _code_checks_line(code_checks),
+        _code_checks_line(code_checks, code_checks_for_another_feature),
         details,
         not_checked_count=not_checked_count,
     )
+
+
+def _code_checks_details(code_checks: Mapping[str, Any]) -> dict[str, Any]:
+    """The summary's own numbers for the durable row. Nothing is worked out."""
+    return {
+        key: code_checks.get(key)
+        for key in (
+            "finding_count",
+            "tasks_total",
+            "tasks_with_something_not_checked",
+            "tasks_not_checked",
+            "shell_command_count",
+        )
+        if key in code_checks
+    }
 
 
 def _fit(
@@ -1049,8 +1154,9 @@ class MergeOfferService:
         baseline_reader: Injectable ``(build_id) -> list[str] | None`` seam;
             defaults to :func:`read_baseline_failing`.
         finished_feature_reader: Injectable ``(build_id, feature_id) ->
-            (record, code checks, why not)`` seam; defaults to
-            :func:`read_what_was_checked`. It reads two exported records off
+            (record, code checks, why not, the code-checks summary was
+            another feature's)`` seam, whose last value may be left off;
+            defaults to :func:`read_what_was_checked`. It reads two records off
             disk, so it is called off the event loop, and anything it does —
             including raising — costs the card nothing but the sentences.
         scope_pass: Injectable ``(config, pool, build_id, feature_id, row) ->
@@ -1209,7 +1315,7 @@ class MergeOfferService:
         fall silent and read as clean.
         """
         try:
-            record, code_checks, why_not = await asyncio.wait_for(
+            read = await asyncio.wait_for(
                 asyncio.to_thread(
                     self._finished_feature_reader,
                     event.build_id,
@@ -1217,6 +1323,12 @@ class MergeOfferService:
                 ),
                 timeout=FINISHED_FEATURE_READ_SECONDS,
             )
+            # Three values or four: the fourth (the code-checks summary was
+            # another feature's) was added on 21 September 2026 and a reader
+            # put here by something else may still answer with three.
+            values = list(read)
+            values += [None] * max(0, 4 - len(values))
+            record, code_checks, why_not, code_checks_for_another = values[:4]
         except TimeoutError:
             reason = (
                 f"the records did not come back within "
@@ -1247,7 +1359,9 @@ class MergeOfferService:
                 lines=(f"{EVIDENCE_UNAVAILABLE} {reason}.",),
                 details={"state": "unavailable", "reason": reason},
             )
-        return what_was_checked(record, code_checks, why_not)
+        return what_was_checked(
+            record, code_checks, why_not, code_checks_for_another
+        )
 
     async def _take_the_scope_pass(self, event: Any) -> Any | None:
         """Run the scope pass off the event loop; ``None`` if nobody counted.
