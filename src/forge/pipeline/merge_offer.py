@@ -63,6 +63,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "CHECK_COULD_NOT_RUN",
     "CHECK_RAN",
+    "CODE_CHECKS_UNAVAILABLE",
     "EVIDENCE_UNAVAILABLE",
     "FINISHED_FEATURE_BUDGET",
     "FINISHED_FEATURE_DETAILS_KEY",
@@ -74,6 +75,7 @@ __all__ = [
     "MERGE_OFFER_TARGET_IDENTIFIER",
     "MergeOfferService",
     "NO_CHECK_DECLARED",
+    "NO_NOT_CHECKED_LIST",
     "WhatWasChecked",
     "approval_subject_for",
     "branch_to_merge",
@@ -272,6 +274,22 @@ CHECK_RAN_AND_FAILED: str = (
     "The project's check of the finished feature ran and did not pass."
 )
 
+#: Said instead of "it left nothing on its not-checked list" when the record
+#: carries no list that could be read (21 September 2026, the Stage C review).
+#: An empty list is a statement; a list that is not there is not one, and the
+#: difference has to be on the card or an absence reads as a clean run.
+NO_NOT_CHECKED_LIST: str = "Its not-checked list could not be read."
+
+#: Said when the summary of the checks inside the build could not be read at
+#: all (21 September 2026, the Stage C review). GuardKit writes that summary
+#: on every finished build and never raises, so an absence means something
+#: went wrong — and a missing line would cost the card a sentence and read as
+#: nothing to report.
+CODE_CHECKS_UNAVAILABLE: str = (
+    "Code checks: no summary of them could be read, so nothing here says "
+    "whether anything looked at the code."
+)
+
 #: How long the card will wait for the two records to be read. It is a disk
 #: read of a small tree, so this is not a budget, it is a stop: a records
 #: folder that has stopped answering must cost the owner a sentence on the
@@ -282,6 +300,16 @@ FINISHED_FEATURE_READ_SECONDS: float = 15.0
 #: nothing here assumes where in the exported tree they landed.
 FEATURE_CHECK_RECORD_NAME: str = "feature_check.json"
 CODE_CHECKS_RECORD_NAME: str = "code_checks.json"
+
+#: The states one check reports about itself in that summary, in the record's
+#: own words. Only these two mean a check actually looked at something; every
+#: other state means it did not, and none of them may be worded as if it had.
+#: Nothing here works out what a check is or what it looked at.
+_CHECK_LOOKED: tuple[str, ...] = ("ran_and_found_nothing", "found_something")
+#: The one state that says the check has nothing to say about a project of
+#: this kind. It is counted and said in so many words, because a summary full
+#: of it used to come out as "no findings" (21 September 2026, Stage C review).
+_CHECK_KIND_NOT_SUPPORTED: str = "kind_of_project_not_supported"
 
 #: Caps, applied before the budget is counted.
 MAX_OBSERVATIONS_ON_THE_CARD: int = 6
@@ -449,20 +477,30 @@ def _not_checked_line(names: list[str], total: int, limit: int) -> str:
 
 
 def _code_checks_line(code_checks: Mapping[str, Any] | None) -> str:
-    """One line about what the checks inside the build did, or ``""``.
+    """One line about what the checks inside the build did.
 
     Findings are named, tasks nothing looked at are counted, and commands the
     build ran directly are noted because a file one of those wrote is in no
     list any check could read. It never refuses anything.
+
+    **"No findings" is said only when a check actually looked at something**
+    (21 September 2026, the Stage C review). A summary where every check said
+    it does not cover this kind of project, or kept nothing at all, used to
+    come out as the single line "Code checks: no findings." — which an owner
+    reads as "the code was checked and was clean". The states are the
+    record's own; they are counted, not interpreted.
     """
     if not isinstance(code_checks, Mapping):
-        return ""
+        return CODE_CHECKS_UNAVAILABLE
     said: list[str] = []
     try:
         finding_count = int(code_checks.get("finding_count") or 0)
     except (TypeError, ValueError):
         finding_count = 0
     names: list[str] = []
+    blocks_total = 0
+    looked = 0
+    kind_not_supported = 0
     for row in list(code_checks.get("tasks") or []) + list(
         code_checks.get("groups") or []
     ):
@@ -475,6 +513,12 @@ def _code_checks_line(code_checks: Mapping[str, Any] | None) -> str:
         for block in blocks:
             if not isinstance(block, Mapping):
                 continue
+            blocks_total += 1
+            state = _tidy(block.get("state")).lower()
+            if state in _CHECK_LOOKED:
+                looked += 1
+            elif state == _CHECK_KIND_NOT_SUPPORTED:
+                kind_not_supported += 1
             for finding in list(block.get("findings") or []):
                 if not isinstance(finding, Mapping):
                     continue
@@ -493,8 +537,17 @@ def _code_checks_line(code_checks: Mapping[str, Any] | None) -> str:
             f"{finding_count} finding{'s' if finding_count != 1 else ''} "
             f"({named})"
         )
-    else:
+    elif looked:
         said.append("no findings")
+    elif blocks_total:
+        said.append("nothing was checked")
+    else:
+        said.append("no check of the code is recorded here")
+    if kind_not_supported:
+        said.append(
+            f"{kind_not_supported} of {blocks_total} checks do not cover this "
+            "kind of project"
+        )
     try:
         not_checked = int(code_checks.get("tasks_with_something_not_checked") or 0)
         total = int(code_checks.get("tasks_total") or 0)
@@ -571,6 +624,26 @@ def _what_was_checked(
         details.update({"state": state, "reason": _tidy(record.get("reason"))})
         return _fit(state, [NO_CHECK_DECLARED], [], "", details)
 
+    # (1b) A record that says NOTHING is not a record of a check that ran
+    # (21 September 2026, the Stage C review). GuardKit always writes a full
+    # record, so no status and not one of its three lists means a truncated
+    # or corrupted one — and the only wording that fits is the one kept for
+    # evidence that could not be read. It is never the affirmative wording.
+    carries_not_checked = isinstance(record.get("not_checked"), list)
+    carries_a_list = (
+        carries_not_checked
+        or isinstance(record.get("observations"), list)
+        or isinstance(record.get("scenarios_covered"), list)
+    )
+    if not status and not carries_a_list:
+        reason = _shorten(
+            why_not or "the record carries no status and none of its lists",
+            _REASON_CHARS,
+        )
+        state = "unavailable"
+        details.update({"state": state, "reason": reason})
+        return _fit(state, [f"{EVIDENCE_UNAVAILABLE} {reason}"], [], "", details)
+
     # (2) What the check left unchecked. COUNT THE LIST, never the record's
     # own total: that field adds the central guard's names to the project's
     # names for the same examples, so it says fourteen beside seven entries
@@ -605,7 +678,14 @@ def _what_was_checked(
             )
         )
     elif state == "ran":
-        head.append("It left nothing on its not-checked list.")
+        # An empty list is the project saying "nothing was left unchecked".
+        # A list that is not there says nothing at all, and the two must not
+        # be worded the same (21 September 2026, the Stage C review).
+        head.append(
+            "It left nothing on its not-checked list."
+            if carries_not_checked
+            else NO_NOT_CHECKED_LIST
+        )
 
     # (3) The project's own observations, as text, capped and never judged.
     observations = _pairs(record.get("observations"), ("asked", "answered"))[
@@ -641,6 +721,7 @@ def _what_was_checked(
             "observations_count": len(observations),
         }
     )
+    details["code_checks_summary_read"] = isinstance(code_checks, Mapping)
     if isinstance(code_checks, Mapping):
         details["code_checks"] = {
             key: code_checks.get(key)

@@ -176,6 +176,20 @@ class _Recorder:
         return [payload for kind, payload in self.events if kind == "paused"][0]
 
 
+def _no_records_were_exported(*_args: Any, **_kwargs: Any) -> tuple[Any, Any, str]:
+    """The finished-feature reader, pinned out of this file's subject.
+
+    Added 21 September 2026 after the Stage C review. Without it these tests
+    call the real reader, which looks under the HOST's own receipts folder:
+    harmless today, because no build of theirs is in it, but it couples a
+    unit test to ``~/forge-state`` and to whatever happens to be there. This
+    answers exactly what the real reader answers for a build that exported
+    nothing, so the cards these tests read are the cards they read before.
+    The finished-feature reading has its own file and its own four wordings.
+    """
+    return None, None, "nothing was exported for this build"
+
+
 def _service(
     config: ForgeConfig,
     pool: SqliteLifecyclePersistence,
@@ -185,6 +199,7 @@ def _service(
     async def _git_head(_repo_root: Path) -> str | None:
         return "mainsha1234"
 
+    kwargs.setdefault("finished_feature_reader", _no_records_were_exported)
     return MergeOfferService(
         config=config,
         pool=pool,
