@@ -588,7 +588,7 @@ class TestTheReader:
         (deep / "feature_check.json").write_text(json.dumps(a_record()), "utf-8")
         (deep / "code_checks.json").write_text(json.dumps(a_code_checks()), "utf-8")
         monkeypatch.setenv("FORGE_RECEIPTS_DIR", str(tmp_path / "receipts"))
-        record, code_checks, why_not = read_what_was_checked(BUILD_ID, FEATURE_ID)
+        record, code_checks, why_not, _ = read_what_was_checked(BUILD_ID, FEATURE_ID)
         assert why_not is None
         assert record is not None and record["feature"] == FEATURE_ID
         assert code_checks is not None and code_checks["finding_count"] == 1
@@ -606,7 +606,7 @@ class TestTheReader:
             json.dumps(a_record()), "utf-8"
         )
         monkeypatch.setenv("FORGE_RECEIPTS_DIR", str(tmp_path / "receipts"))
-        record, _, why_not = read_what_was_checked(BUILD_ID, FEATURE_ID)
+        record, _, why_not, _ = read_what_was_checked(BUILD_ID, FEATURE_ID)
         assert why_not is None
         assert record is not None and record["feature"] == FEATURE_ID
 
@@ -614,7 +614,7 @@ class TestTheReader:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setenv("FORGE_RECEIPTS_DIR", str(tmp_path / "nowhere"))
-        record, code_checks, why_not = read_what_was_checked(BUILD_ID, FEATURE_ID)
+        record, code_checks, why_not, _ = read_what_was_checked(BUILD_ID, FEATURE_ID)
         assert record is None and code_checks is None
         assert why_not and "exported" in why_not
 
@@ -625,7 +625,7 @@ class TestTheReader:
         root.mkdir(parents=True)
         (root / "feature_check.json").write_text("not json at all", "utf-8")
         monkeypatch.setenv("FORGE_RECEIPTS_DIR", str(tmp_path / "receipts"))
-        record, _, why_not = read_what_was_checked(BUILD_ID, FEATURE_ID)
+        record, _, why_not, _ = read_what_was_checked(BUILD_ID, FEATURE_ID)
         assert record is None
         assert why_not and "could not be read" in why_not
 
@@ -636,7 +636,7 @@ class TestTheReader:
         root.mkdir(parents=True)
         (root / "feature_check.json").write_text(json.dumps([1, 2, 3]), "utf-8")
         monkeypatch.setenv("FORGE_RECEIPTS_DIR", str(tmp_path / "receipts"))
-        record, _, why_not = read_what_was_checked(BUILD_ID, FEATURE_ID)
+        record, _, why_not, _ = read_what_was_checked(BUILD_ID, FEATURE_ID)
         assert record is None
         assert why_not and "not a record" in why_not
 
@@ -647,7 +647,7 @@ class TestTheReader:
         root.mkdir(parents=True)
         (root / "feature_check.json").write_text(json.dumps(a_record()), "utf-8")
         monkeypatch.setenv("FORGE_RECEIPTS_DIR", str(tmp_path / "receipts"))
-        record, code_checks, why_not = read_what_was_checked(BUILD_ID, FEATURE_ID)
+        record, code_checks, why_not, _ = read_what_was_checked(BUILD_ID, FEATURE_ID)
         assert record is not None and code_checks is None and why_not is None
 
 
@@ -992,3 +992,230 @@ class TestAPartlyReadCheckIsSaidOnTheCard:
             ),
         )
         assert "1 thing the checks were given could not be read" in said.text
+
+
+# ---------------------------------------------------------------------------
+# Another feature's record is never shown as this feature's
+# ---------------------------------------------------------------------------
+
+
+class TestAnotherFeaturesRecordIsRefused:
+    """Added 21 September 2026, after the coordinator's review of parts 1 and 2.
+
+    The reader used to PREFER a record naming this build's feature and fall
+    back to one naming a different feature, so a build whose own record was
+    missing showed another feature's answers as its own — the one reading on
+    the card an owner cannot check for himself. Now a record that explicitly
+    names a different feature is refused, the card says the evidence is
+    unavailable and names whose record it was, and the card is still offered.
+    """
+
+    OTHER = "FEAT-OTHER"
+
+    def _put(self, root: Path, where: str, name: str, data: Any) -> None:
+        folder = root / where
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / name).write_text(json.dumps(data), "utf-8")
+
+    def test_the_whole_feature_record_of_another_feature_is_refused(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        root = tmp_path / "receipts" / BUILD_ID
+        self._put(
+            root, "outer", "feature_check.json", a_record(feature=self.OTHER)
+        )
+        monkeypatch.setenv("FORGE_RECEIPTS_DIR", str(tmp_path / "receipts"))
+        record, _, why_not, _ = read_what_was_checked(BUILD_ID, FEATURE_ID)
+        assert record is None
+        assert why_not and self.OTHER in why_not
+
+    def test_the_card_says_unavailable_and_whose_record_it_was(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        root = tmp_path / "receipts" / BUILD_ID
+        self._put(
+            root,
+            "outer",
+            "feature_check.json",
+            a_record(
+                feature=self.OTHER,
+                observations=[
+                    {"asked": "another feature's question", "answered": "its answer"}
+                ],
+            ),
+        )
+        monkeypatch.setenv("FORGE_RECEIPTS_DIR", str(tmp_path / "receipts"))
+        said = what_was_checked(*read_what_was_checked(BUILD_ID, FEATURE_ID))
+        assert said.state == "unavailable"
+        assert said.text.startswith(EVIDENCE_UNAVAILABLE)
+        assert self.OTHER in said.text
+        # And not one word of the other feature's reading reaches the card.
+        assert "another feature's question" not in said.text
+        assert CHECK_RAN not in said.text
+
+    def test_the_code_checks_summary_of_another_feature_is_refused(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        root = tmp_path / "receipts" / BUILD_ID
+        self._put(root, "outer", "feature_check.json", a_record())
+        self._put(
+            root,
+            "outer",
+            "code_checks.json",
+            a_code_checks(feature=self.OTHER, finding_count=7),
+        )
+        monkeypatch.setenv("FORGE_RECEIPTS_DIR", str(tmp_path / "receipts"))
+        record, code_checks, why_not, for_another = read_what_was_checked(
+            BUILD_ID, FEATURE_ID
+        )
+        assert record is not None and why_not is None
+        assert code_checks is None and for_another == self.OTHER
+        said = what_was_checked(record, code_checks, why_not, for_another)
+        # The good record is still shown in full...
+        assert said.state == "ran"
+        assert CHECK_RAN in said.text
+        # ...and the refused one is said honestly, not passed over and never
+        # counted as a clean run.
+        assert f"written for {self.OTHER}" in said.text
+        assert "7 findings" not in said.text
+        assert said.details["code_checks_summary_read"] is False
+        assert said.details["code_checks_written_for"] == self.OTHER
+
+    def test_the_refused_record_and_the_good_summary_are_both_said(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        root = tmp_path / "receipts" / BUILD_ID
+        self._put(
+            root, "outer", "feature_check.json", a_record(feature=self.OTHER)
+        )
+        self._put(root, "outer", "code_checks.json", a_code_checks())
+        monkeypatch.setenv("FORGE_RECEIPTS_DIR", str(tmp_path / "receipts"))
+        said = what_was_checked(*read_what_was_checked(BUILD_ID, FEATURE_ID))
+        assert said.state == "unavailable"
+        assert self.OTHER in said.text
+        assert "Code checks: 1 finding" in said.text
+        assert said.details["code_checks"]["finding_count"] == 1
+
+    def test_several_copies_one_mismatched_one_matching(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        root = tmp_path / "receipts" / BUILD_ID
+        # The mismatched copy is the SHALLOWEST, so only the refusal keeps it
+        # off the card.
+        self._put(
+            root,
+            ".",
+            "feature_check.json",
+            a_record(feature=self.OTHER, status="could_not_run"),
+        )
+        self._put(
+            root, f"worktrees/{FEATURE_ID}", "feature_check.json", a_record()
+        )
+        self._put(
+            root, ".", "code_checks.json", a_code_checks(feature=self.OTHER)
+        )
+        self._put(
+            root, f"worktrees/{FEATURE_ID}", "code_checks.json", a_code_checks()
+        )
+        monkeypatch.setenv("FORGE_RECEIPTS_DIR", str(tmp_path / "receipts"))
+        record, code_checks, why_not, for_another = read_what_was_checked(
+            BUILD_ID, FEATURE_ID
+        )
+        assert why_not is None and for_another is None
+        assert record is not None and record["feature"] == FEATURE_ID
+        assert record["status"] == "passed"
+        assert code_checks is not None and code_checks["feature"] == FEATURE_ID
+
+    def test_every_copy_of_a_kind_refused_names_them_all(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        root = tmp_path / "receipts" / BUILD_ID
+        self._put(root, "one", "feature_check.json", a_record(feature="FEAT-A"))
+        self._put(root, "two", "feature_check.json", a_record(feature="FEAT-B"))
+        monkeypatch.setenv("FORGE_RECEIPTS_DIR", str(tmp_path / "receipts"))
+        record, _, why_not, _ = read_what_was_checked(BUILD_ID, FEATURE_ID)
+        assert record is None
+        assert why_not and "FEAT-A" in why_not and "FEAT-B" in why_not
+
+    def test_a_record_that_names_no_feature_is_still_read(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The build's own folder scopes it, and it is no other feature's.
+
+        GuardKit always writes the field, so this shape is an older or
+        foreign record rather than a neighbour's — refusing it would cost a
+        reading that nothing says is wrong.
+        """
+        root = tmp_path / "receipts" / BUILD_ID
+        unnamed = a_record()
+        unnamed.pop("feature")
+        self._put(root, "outer", "feature_check.json", unnamed)
+        monkeypatch.setenv("FORGE_RECEIPTS_DIR", str(tmp_path / "receipts"))
+        record, _, why_not, _ = read_what_was_checked(BUILD_ID, FEATURE_ID)
+        assert why_not is None
+        assert record is not None and record["status"] == "passed"
+
+    def test_this_features_own_record_beats_one_that_names_none(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        root = tmp_path / "receipts" / BUILD_ID
+        unnamed = a_record(status="could_not_run")
+        unnamed.pop("feature")
+        self._put(root, ".", "feature_check.json", unnamed)
+        self._put(
+            root, f"worktrees/{FEATURE_ID}", "feature_check.json", a_record()
+        )
+        monkeypatch.setenv("FORGE_RECEIPTS_DIR", str(tmp_path / "receipts"))
+        record, _, why_not, _ = read_what_was_checked(BUILD_ID, FEATURE_ID)
+        assert why_not is None
+        assert record is not None and record["feature"] == FEATURE_ID
+
+    def test_the_same_name_in_another_case_is_not_a_mismatch(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        root = tmp_path / "receipts" / BUILD_ID
+        self._put(
+            root,
+            "outer",
+            "feature_check.json",
+            a_record(feature=FEATURE_ID.lower()),
+        )
+        monkeypatch.setenv("FORGE_RECEIPTS_DIR", str(tmp_path / "receipts"))
+        record, _, why_not, _ = read_what_was_checked(BUILD_ID, FEATURE_ID)
+        assert why_not is None and record is not None
+
+    @pytest.mark.asyncio
+    async def test_the_card_is_still_offered_when_both_are_refused(
+        self, config, pool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        root = tmp_path / "receipts" / BUILD_ID
+        self._put(
+            root,
+            "outer",
+            "feature_check.json",
+            a_record(
+                feature=self.OTHER,
+                observations=[
+                    {"asked": "another feature's question", "answered": "its answer"}
+                ],
+            ),
+        )
+        self._put(
+            root, "outer", "code_checks.json", a_code_checks(feature=self.OTHER)
+        )
+        monkeypatch.setenv("FORGE_RECEIPTS_DIR", str(tmp_path / "receipts"))
+        recorder = _Recorder()
+        await _service(
+            config, pool, recorder, read_what_was_checked
+        ).maybe_offer(_event())
+        words, details = _card(recorder)
+        assert EVIDENCE_UNAVAILABLE in words
+        assert self.OTHER in words
+        assert "another feature's question" not in words
+        assert details[FINISHED_FEATURE_DETAILS_KEY]["state"] == "unavailable"
+        # The card is a real offer, not a half one.
+        assert [
+            s
+            for s in pool.read_stages(BUILD_ID)
+            if s.target_identifier == MERGE_OFFER_TARGET_IDENTIFIER
+        ]
