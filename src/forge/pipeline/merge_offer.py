@@ -43,6 +43,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping
@@ -60,20 +61,30 @@ from forge.receipts import receipts_root
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "CHECK_COULD_NOT_RUN",
+    "CHECK_RAN",
+    "EVIDENCE_UNAVAILABLE",
+    "FINISHED_FEATURE_BUDGET",
+    "FINISHED_FEATURE_DETAILS_KEY",
+    "FINISHED_FEATURE_READ_SECONDS",
     "MERGE_AGENT_ID",
     "MERGE_BASE_REF",
     "MERGE_OFFER_DETAILS_KEY",
     "MERGE_OFFER_STAGE_LABEL",
     "MERGE_OFFER_TARGET_IDENTIFIER",
     "MergeOfferService",
+    "NO_CHECK_DECLARED",
+    "WhatWasChecked",
     "approval_subject_for",
     "branch_to_merge",
     "default_merge_branch",
     "git_rev_parse_main",
     "merge_request_id",
     "read_baseline_failing",
+    "read_what_was_checked",
     "request_behind_the_build",
     "run_the_scope_pass",
+    "what_was_checked",
 ]
 
 #: ``stage_log.target_identifier`` of the durable offer latch.
@@ -199,6 +210,517 @@ def read_baseline_failing(build_id: str) -> list[str] | None:
             exc,
         )
     return None
+
+
+# ---------------------------------------------------------------------------
+# What was actually checked about the finished feature — the card's own words
+# ---------------------------------------------------------------------------
+#
+# WHY THIS EXISTS (21 September 2026). A build that reached this point is a
+# build nothing refused. Until now that was the whole of what the card said,
+# and "nothing was reported" read exactly like "nothing was wrong": the one
+# build that answered with an empty list where seven entries were asked for,
+# and whose own examples were never checked at all, offered a card that read
+# "built clean".
+#
+# So the card gains a reading of two records the build leaves behind and the
+# runner already exports: the whole-feature record (what the project's own
+# check did, what it left unchecked, and what it saw when it asked the
+# finished product something) and the code-checks summary (what the checks
+# inside the build did, or did not do).
+#
+# THREE PROPERTIES THIS MUST KEEP, in order of importance:
+#
+# 1. It REPORTS and never refuses. Every way this can go wrong ends in a
+#    sentence on the card and a card that is still offered. It is called the
+#    way the scope pass is called and it never raises past itself.
+# 2. "Not checked" is never worded as a pass. Four wordings, below, and none
+#    of them can be mistaken for another.
+# 3. It knows nothing about any language, test runner, protocol, database or
+#    product. It carries the project's own TEXT and never reads, compares or
+#    judges it. The one word here that belongs to anybody's toolchain is the
+#    key ``shell_command_count``, which is the name of a field in a record
+#    written elsewhere; this module repeats its number and says nothing about
+#    what a command is.
+
+#: Everything parts 1, 2 and 3a add to the card fits in this many characters
+#: (design pass 21 September 2026, revision item 4). Jarvis does not cut long
+#: text — it splits it into 2,900-character blocks — so the limit has to be
+#: ours, and it is counted here over the whole block this reading adds.
+FINISHED_FEATURE_BUDGET: int = 900
+
+#: ``details`` key carrying the same reading as structured data.
+FINISHED_FEATURE_DETAILS_KEY: str = "finished_feature_check"
+
+#: The mark left wherever words were cut, so a reader can see it happened.
+CUT_MARK: str = " …(cut)"
+
+#: THE FOUR WORDINGS. They open the block, exactly one of them appears, and
+#: no two of them can be read for each other. A check that ran and found
+#: nothing wrong is NEVER worded like any of the last three.
+CHECK_RAN: str = "The project's check of the finished feature ran."
+CHECK_COULD_NOT_RUN: str = (
+    "The project's check of the finished feature could not run:"
+)
+NO_CHECK_DECLARED: str = "This project declares no check of the finished feature."
+EVIDENCE_UNAVAILABLE: str = "Feature-check evidence unavailable:"
+
+#: A check that ran and came back red. It belongs to the first wording's
+#: family ("it ran"), and a build whose check failed is not offered a card at
+#: all — this is here so an unexpected record is still said plainly.
+CHECK_RAN_AND_FAILED: str = (
+    "The project's check of the finished feature ran and did not pass."
+)
+
+#: How long the card will wait for the two records to be read. It is a disk
+#: read of a small tree, so this is not a budget, it is a stop: a records
+#: folder that has stopped answering must cost the owner a sentence on the
+#: card and not a card that never arrives.
+FINISHED_FEATURE_READ_SECONDS: float = 15.0
+
+#: The record names, as the build leaves them. Only the file NAME is used:
+#: nothing here assumes where in the exported tree they landed.
+FEATURE_CHECK_RECORD_NAME: str = "feature_check.json"
+CODE_CHECKS_RECORD_NAME: str = "code_checks.json"
+
+#: Caps, applied before the budget is counted.
+MAX_OBSERVATIONS_ON_THE_CARD: int = 6
+_OBSERVATION_SIDE_CHARS: int = 260
+_NOT_CHECKED_LINE_CHARS: int = 300
+_CODE_CHECKS_LINE_CHARS: int = 220
+_NAMES_ON_THE_CARD: int = 3
+_REASON_CHARS: int = 160
+#: How many entries of each list the DETAILS carry (the card's own words are
+#: capped much harder by the budget above; the details are the full record's
+#: shape for anyone reading the row afterwards).
+_DETAILS_LIST_CAP: int = 50
+
+
+@dataclass(frozen=True)
+class WhatWasChecked:
+    """The card's sentences about the finished feature, and the same as data.
+
+    ``lines`` is what goes on the face of the card, already inside
+    :data:`FINISHED_FEATURE_BUDGET`. ``details`` is the same reading as
+    structured data for the durable row and the approval envelope. ``state``
+    is which of the four wordings was used.
+    """
+
+    state: str
+    lines: tuple[str, ...] = ()
+    details: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def text(self) -> str:
+        return " ".join(self.lines)
+
+
+def _tidy(value: Any) -> str:
+    """One line of whitespace-collapsed text, never ``None``."""
+    return " ".join(str(value if value is not None else "").split())
+
+
+def _shorten(value: Any, limit: int) -> str:
+    """``value`` as one line, cut at ``limit`` with a visible mark."""
+    text = _tidy(value)
+    if len(text) <= limit:
+        return text
+    keep = max(limit - len(CUT_MARK), 0)
+    return text[:keep].rstrip() + CUT_MARK
+
+
+def _read_one_record(
+    build_id: str, name: str, feature_id: str | None
+) -> tuple[dict[str, Any] | None, str | None]:
+    """One exported record by FILE NAME — ``(record, why not)``, never raises.
+
+    Globs ``receipts_root()/<build_id>/**/<name>``, exactly as
+    :func:`read_baseline_failing` does, so nothing here knows or assumes
+    where in the exported tree a record landed. When several copies were
+    exported (the runner exports the outer tree and every inner one), a copy
+    whose own ``feature`` matches this build's feature wins, then the
+    shallowest path, then alphabetical order — a rule with no ties in it, so
+    two runs of this reader can never disagree.
+    """
+    try:
+        root = receipts_root() / build_id
+        if not root.is_dir():
+            return None, "nothing was exported for this build"
+        found = sorted(
+            root.glob(f"**/{name}"), key=lambda p: (len(p.parts), str(p))
+        )
+        if not found:
+            return None, f"no {name} was exported for this build"
+        records: list[tuple[int, Path, dict[str, Any]]] = []
+        first_trouble: str | None = None
+        for path in found:
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                if first_trouble is None:
+                    first_trouble = (
+                        f"{name} could not be read ({type(exc).__name__})"
+                    )
+                continue
+            if not isinstance(data, dict):
+                if first_trouble is None:
+                    first_trouble = f"{name} is not a record this could read"
+                continue
+            mine = (
+                0
+                if feature_id and _tidy(data.get("feature")) == _tidy(feature_id)
+                else 1
+            )
+            records.append((mine, path, data))
+        if not records:
+            return None, first_trouble or f"no {name} could be read"
+        records.sort(key=lambda item: item[0])
+        return records[0][2], None
+    except Exception as exc:  # noqa: BLE001 — a reader never stops a card
+        logger.debug(
+            "the finished-feature reading: %s could not be looked for under "
+            "%s (%s)",
+            name,
+            build_id,
+            exc,
+        )
+        return None, f"{name} could not be looked for ({type(exc).__name__})"
+
+
+def read_what_was_checked(
+    build_id: str, feature_id: str | None = None
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None, str | None]:
+    """The two exported records for this build — ``(record, code checks, why not)``.
+
+    ``why not`` is a short reason the whole-feature record could not be read,
+    and it is the only one that changes what the card says: the code-checks
+    summary simply goes unmentioned when it is not there. Never raises.
+    """
+    record, why_not = _read_one_record(
+        build_id, FEATURE_CHECK_RECORD_NAME, feature_id
+    )
+    code_checks, _ = _read_one_record(
+        build_id, CODE_CHECKS_RECORD_NAME, feature_id
+    )
+    return record, code_checks, why_not
+
+
+def _pairs(raw: Any, keys: tuple[str, str]) -> list[tuple[str, str]]:
+    """A list of two-sided entries, read defensively. Anything else is dropped."""
+    out: list[tuple[str, str]] = []
+    if not isinstance(raw, list):
+        return out
+    for item in raw:
+        if not isinstance(item, Mapping):
+            continue
+        left = _tidy(item.get(keys[0]))
+        right = _tidy(item.get(keys[1]))
+        if left or right:
+            out.append((left, right))
+    return out
+
+
+def _not_checked_line(names: list[str], total: int, limit: int) -> str:
+    """``Not checked: 7 — a; b — and 5 more.`` in the record's own words.
+
+    Names are added one at a time only while the WHOLE line still fits, so
+    the line is never cut in the middle of a name and the count at the front
+    is always the truth. With room for none of them it is a bare count, which
+    is still an honest sentence.
+    """
+    head = f"Not checked: {total}"
+
+    def assembled(shown: list[str]) -> str:
+        if not shown:
+            return f"{head}."
+        rest = total - len(shown)
+        tail = f" — and {rest} more." if rest > 0 else "."
+        return f"{head} — " + "; ".join(shown) + tail
+
+    shown: list[str] = []
+    for name in names[:_NAMES_ON_THE_CARD]:
+        tidy = _shorten(name, 140)
+        if not tidy:
+            continue
+        if len(assembled(shown + [tidy])) > limit:
+            break
+        shown.append(tidy)
+    return assembled(shown)
+
+
+def _code_checks_line(code_checks: Mapping[str, Any] | None) -> str:
+    """One line about what the checks inside the build did, or ``""``.
+
+    Findings are named, tasks nothing looked at are counted, and commands the
+    build ran directly are noted because a file one of those wrote is in no
+    list any check could read. It never refuses anything.
+    """
+    if not isinstance(code_checks, Mapping):
+        return ""
+    said: list[str] = []
+    try:
+        finding_count = int(code_checks.get("finding_count") or 0)
+    except (TypeError, ValueError):
+        finding_count = 0
+    names: list[str] = []
+    for row in list(code_checks.get("tasks") or []) + list(
+        code_checks.get("groups") or []
+    ):
+        if not isinstance(row, Mapping):
+            continue
+        checks = row.get("checks")
+        blocks = (
+            list(checks.values()) if isinstance(checks, Mapping) else [row]
+        )
+        for block in blocks:
+            if not isinstance(block, Mapping):
+                continue
+            for finding in list(block.get("findings") or []):
+                if not isinstance(finding, Mapping):
+                    continue
+                name = _tidy(finding.get("name")) or _tidy(finding.get("file"))
+                if name and name not in names:
+                    names.append(name)
+    if finding_count:
+        shown = names[:_NAMES_ON_THE_CARD]
+        rest = finding_count - len(shown)
+        named = ", ".join(shown)
+        if shown and rest > 0:
+            named = f"{named} and {rest} more"
+        elif not shown:
+            named = "not named in the summary"
+        said.append(
+            f"{finding_count} finding{'s' if finding_count != 1 else ''} "
+            f"({named})"
+        )
+    else:
+        said.append("no findings")
+    try:
+        not_checked = int(code_checks.get("tasks_with_something_not_checked") or 0)
+        total = int(code_checks.get("tasks_total") or 0)
+    except (TypeError, ValueError):
+        not_checked, total = 0, 0
+    if not_checked:
+        said.append(f"{not_checked} of {total} tasks not fully checked")
+    try:
+        # The key belongs to the record this reads; its number is repeated
+        # here and nothing is worked out from it.
+        commands = int(code_checks.get("shell_command_count") or 0)
+    except (TypeError, ValueError):
+        commands = 0
+    if commands:
+        said.append(
+            f"{commands} commands the build ran directly, and files they "
+            "wrote are in no list a check could read"
+        )
+    return _shorten("Code checks: " + " · ".join(said) + ".", _CODE_CHECKS_LINE_CHARS)
+
+
+def what_was_checked(
+    record: Mapping[str, Any] | None,
+    code_checks: Mapping[str, Any] | None = None,
+    why_not: str | None = None,
+) -> WhatWasChecked:
+    """Turn the two records into the card's sentences. Never raises.
+
+    The block is: one of the four wordings; then what was left unchecked;
+    then up to six of the project's own observations, each said as what was
+    asked and what came back; then one line about the checks inside the
+    build. It is cut to :data:`FINISHED_FEATURE_BUDGET` with a visible mark,
+    and the not-checked list shortens to a bare count BEFORE any observation
+    is dropped.
+    """
+    try:
+        return _what_was_checked(record, code_checks, why_not)
+    except Exception as exc:  # noqa: BLE001 — a reader never stops a card
+        logger.warning(
+            "the finished-feature reading: the records could not be put into "
+            "words (%s: %s) — the card says the evidence was unavailable",
+            type(exc).__name__,
+            exc,
+        )
+        return WhatWasChecked(
+            state="unavailable",
+            lines=(f"{EVIDENCE_UNAVAILABLE} it could not be read here.",),
+            details={
+                "state": "unavailable",
+                "reason": f"it could not be read here ({type(exc).__name__})",
+            },
+        )
+
+
+def _what_was_checked(
+    record: Mapping[str, Any] | None,
+    code_checks: Mapping[str, Any] | None,
+    why_not: str | None,
+) -> WhatWasChecked:
+    details: dict[str, Any] = {"budget_characters": FINISHED_FEATURE_BUDGET}
+
+    # (1) Which of the four wordings opens the block.
+    if not isinstance(record, Mapping):
+        reason = _shorten(why_not or "no record of the check was found", _REASON_CHARS)
+        opening = f"{EVIDENCE_UNAVAILABLE} {reason}"
+        state = "unavailable"
+        details.update({"state": state, "reason": reason})
+        return _fit(state, [opening], [], "", details)
+
+    status = _tidy(record.get("status")).lower()
+    declared = record.get("declared")
+    if status == "not_declared" or declared is False:
+        state = "not_declared"
+        details.update({"state": state, "reason": _tidy(record.get("reason"))})
+        return _fit(state, [NO_CHECK_DECLARED], [], "", details)
+
+    # (2) What the check left unchecked. COUNT THE LIST, never the record's
+    # own total: that field adds the central guard's names to the project's
+    # names for the same examples, so it says fourteen beside seven entries
+    # (found while driving stage B, 21 September 2026). The list is the one
+    # thing here that cannot double-count itself.
+    not_checked = _pairs(record.get("not_checked"), ("name", "reason"))
+    not_checked_count = len(not_checked)
+
+    if status == "could_not_run":
+        reason = _shorten(
+            record.get("could_not_run_reason")
+            or record.get("reason")
+            or "the project did not say why",
+            _REASON_CHARS,
+        )
+        opening = f"{CHECK_COULD_NOT_RUN} {reason}"
+        state = "could_not_run"
+    elif status and status != "passed":
+        opening = CHECK_RAN_AND_FAILED
+        state = "ran"
+    else:
+        opening = CHECK_RAN
+        state = "ran"
+
+    head = [opening]
+    if not_checked_count:
+        head.append(
+            _not_checked_line(
+                [name for name, _ in not_checked],
+                not_checked_count,
+                _NOT_CHECKED_LINE_CHARS,
+            )
+        )
+    elif state == "ran":
+        head.append("It left nothing on its not-checked list.")
+
+    # (3) The project's own observations, as text, capped and never judged.
+    observations = _pairs(record.get("observations"), ("asked", "answered"))[
+        :MAX_OBSERVATIONS_ON_THE_CARD
+    ]
+    observed = [
+        "Asked: "
+        + (_shorten(asked, _OBSERVATION_SIDE_CHARS) or "(not said)")
+        + " / Answered: "
+        + (_shorten(answered, _OBSERVATION_SIDE_CHARS) or "(not said)")
+        for asked, answered in observations
+    ]
+
+    details.update(
+        {
+            "state": state,
+            "status": status or None,
+            "could_not_run_reason": _tidy(record.get("could_not_run_reason")) or None,
+            "not_checked_count": not_checked_count,
+            "not_checked": [
+                {"name": name, "reason": reason}
+                for name, reason in not_checked[:_DETAILS_LIST_CAP]
+            ],
+            "scenarios_covered": [
+                _tidy(name)
+                for name in list(record.get("scenarios_covered") or [])
+                if _tidy(name)
+            ][:_DETAILS_LIST_CAP],
+            "observations": [
+                {"asked": asked, "answered": answered}
+                for asked, answered in observations
+            ],
+            "observations_count": len(observations),
+        }
+    )
+    if isinstance(code_checks, Mapping):
+        details["code_checks"] = {
+            key: code_checks.get(key)
+            for key in (
+                "finding_count",
+                "tasks_total",
+                "tasks_with_something_not_checked",
+                "tasks_not_checked",
+                "shell_command_count",
+            )
+            if key in code_checks
+        }
+
+    return _fit(
+        state,
+        head,
+        observed,
+        _code_checks_line(code_checks),
+        details,
+        not_checked_count=not_checked_count,
+    )
+
+
+def _fit(
+    state: str,
+    head: list[str],
+    observed: list[str],
+    code_checks_line: str,
+    details: dict[str, Any],
+    *,
+    not_checked_count: int = 0,
+) -> WhatWasChecked:
+    """Put the block inside the budget, in the order the design fixed.
+
+    The not-checked list shortens to a bare count first; then observations
+    are dropped from the end, and the card says how many are not shown; only
+    then is what is left cut with a visible mark. The code-checks line is
+    never one of the things dropped — it is the shortest and it is the only
+    one that speaks for the checks inside the build.
+    """
+    tail = [code_checks_line] if code_checks_line else []
+
+    def whole(parts: list[str]) -> str:
+        return " ".join(p for p in parts if p)
+
+    shortened = False
+    dropped = 0
+    lines = head + observed + tail
+    if len(whole(lines)) > FINISHED_FEATURE_BUDGET and not_checked_count:
+        head = [head[0], f"Not checked: {not_checked_count}."]
+        shortened = True
+        lines = head + observed + tail
+
+    kept = list(observed)
+    while len(whole(lines)) > FINISHED_FEATURE_BUDGET and kept:
+        kept.pop()
+        dropped = len(observed) - len(kept)
+        note = [
+            f"({dropped} more observation{'s' if dropped != 1 else ''} not "
+            "shown here.)"
+        ]
+        lines = head + kept + note + tail
+
+    text = whole(lines)
+    cut = False
+    if len(text) > FINISHED_FEATURE_BUDGET:
+        text = _shorten(text, FINISHED_FEATURE_BUDGET)
+        lines = [text]
+        cut = True
+
+    details.update(
+        {
+            "card_characters": len(whole(lines)),
+            "not_checked_shortened_to_a_count": shortened,
+            "observations_not_shown": dropped,
+            "cut_to_fit": cut,
+            "card_lines": list(lines),
+        }
+    )
+    return WhatWasChecked(state=state, lines=tuple(lines), details=details)
 
 
 def request_behind_the_build(pool: Any, row: Any) -> tuple[str | None, str | None, str | None]:
@@ -391,6 +913,11 @@ class MergeOfferService:
             defaults to :func:`git_rev_parse_main`.
         baseline_reader: Injectable ``(build_id) -> list[str] | None`` seam;
             defaults to :func:`read_baseline_failing`.
+        finished_feature_reader: Injectable ``(build_id, feature_id) ->
+            (record, code checks, why not)`` seam; defaults to
+            :func:`read_what_was_checked`. It reads two exported records off
+            disk, so it is called off the event loop, and anything it does —
+            including raising — costs the card nothing but the sentences.
         scope_pass: Injectable ``(config, pool, build_id, feature_id, row) ->
             report | None`` seam; defaults to :func:`run_the_scope_pass`. It
             runs git, so it is called off the event loop.
@@ -406,6 +933,7 @@ class MergeOfferService:
         raw_publish: Callable[[str, bytes], Awaitable[Any]],
         git_head: Callable[[Path], Awaitable[str | None]] = git_rev_parse_main,
         baseline_reader: Callable[[str], list[str] | None] = read_baseline_failing,
+        finished_feature_reader: Callable[..., Any] = read_what_was_checked,
         scope_pass: Callable[..., Any] = run_the_scope_pass,
         git_surface: Callable[[str, Path], Any | None] | None = None,
         clock: Callable[[], datetime] = _utcnow,
@@ -416,6 +944,7 @@ class MergeOfferService:
         self._raw_publish = raw_publish
         self._git_head = git_head
         self._baseline_reader = baseline_reader
+        self._finished_feature_reader = finished_feature_reader
         self._scope_pass = scope_pass
         self._git_surface = git_surface
         self._clock = clock
@@ -471,6 +1000,12 @@ class MergeOfferService:
         # read is a sentence on its own receipt and the card simply says less.
         scope = await self._take_the_scope_pass(event)
 
+        # WHAT WAS ACTUALLY CHECKED (parts 1, 2 and 3a, 2026-09-21). Beside
+        # the scope pass, and on exactly the same terms: one reading, off the
+        # event loop, that reports and never refuses. Its whole job is to
+        # stop "nothing was reported" reading like "nothing was wrong".
+        checked = await self._read_what_was_checked(event)
+
         def _words(branch: str, merge_branch: str | None) -> str:
             from forge.cli._serve_gate_activation import card_line_about_scope
 
@@ -488,6 +1023,7 @@ class MergeOfferService:
             in_scope = card_line_about_scope(scope)
             if in_scope:
                 sentences.append(in_scope)
+            sentences.extend(checked.lines)
             sentences.append(
                 "Approve = merge into main, deploy to the sandbox and run the "
                 "checks; the branch is kept either way. Reject = nothing "
@@ -503,6 +1039,7 @@ class MergeOfferService:
             details["runner_worktree_retention"] = dict(retained)
         if scope is not None:
             details["scope_report"] = scope.to_dict()
+        details[FINISHED_FEATURE_DETAILS_KEY] = dict(checked.details)
 
         await self.offer(
             build_id=event.build_id,
@@ -510,6 +1047,59 @@ class MergeOfferService:
             card_words=_words,
             extra_details=details,
         )
+
+    async def _read_what_was_checked(self, event: Any) -> WhatWasChecked:
+        """Read the two exported records and put them into words.
+
+        Off the event loop, because it touches disk. It never raises, never
+        refuses a card and never delays one by more than the read itself: a
+        reader that falls over says so on the card in the words reserved for
+        exactly that — "Feature-check evidence unavailable" — and the card is
+        offered anyway. A finished build always leaves one of these records
+        behind, even when the project declares no check, so an absent record
+        means something went wrong and the card has to say so rather than
+        fall silent and read as clean.
+        """
+        try:
+            record, code_checks, why_not = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self._finished_feature_reader,
+                    event.build_id,
+                    event.feature_id,
+                ),
+                timeout=FINISHED_FEATURE_READ_SECONDS,
+            )
+        except TimeoutError:
+            reason = (
+                f"the records did not come back within "
+                f"{int(FINISHED_FEATURE_READ_SECONDS)} seconds"
+            )
+            logger.warning(
+                "the finished-feature reading: %s for %s — the card is "
+                "offered anyway and says the evidence was unavailable",
+                reason,
+                event.build_id,
+            )
+            return WhatWasChecked(
+                state="unavailable",
+                lines=(f"{EVIDENCE_UNAVAILABLE} {reason}.",),
+                details={"state": "unavailable", "reason": reason},
+            )
+        except Exception as exc:  # noqa: BLE001 — a reader never stops a card
+            logger.warning(
+                "the finished-feature reading: nothing could be read for %s "
+                "(%s: %s) — the card says the evidence was unavailable",
+                event.build_id,
+                type(exc).__name__,
+                exc,
+            )
+            reason = f"the records could not be read ({type(exc).__name__})"
+            return WhatWasChecked(
+                state="unavailable",
+                lines=(f"{EVIDENCE_UNAVAILABLE} {reason}.",),
+                details={"state": "unavailable", "reason": reason},
+            )
+        return what_was_checked(record, code_checks, why_not)
 
     async def _take_the_scope_pass(self, event: Any) -> Any | None:
         """Run the scope pass off the event loop; ``None`` if nobody counted.
