@@ -154,6 +154,16 @@ def _service(
         raw_publish=recorder.raw_publish,
         git_head=_git_head,
         git_surface=git_surface or (lambda _repo, _root: _CandidatePins()),
+        # Pinned 21 September 2026 (the Stage C review, the same hygiene
+        # finding): without it these tests call the real finished-feature
+        # reader, which looks under the HOST's own receipts folder. This
+        # answers exactly what the real reader answers for a build that
+        # exported nothing, so the cards are the cards they already read.
+        finished_feature_reader=lambda *_a, **_k: (
+            None,
+            None,
+            "nothing was exported for this build",
+        ),
     )
 
 

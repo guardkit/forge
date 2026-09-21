@@ -41,12 +41,14 @@ from forge.pipeline import merge_offer as merge_offer_module
 from forge.pipeline.merge_offer import (
     CHECK_COULD_NOT_RUN,
     CHECK_RAN,
+    CODE_CHECKS_UNAVAILABLE,
     CUT_MARK,
     EVIDENCE_UNAVAILABLE,
     FINISHED_FEATURE_BUDGET,
     FINISHED_FEATURE_DETAILS_KEY,
     MERGE_OFFER_TARGET_IDENTIFIER,
     NO_CHECK_DECLARED,
+    NO_NOT_CHECKED_LIST,
     MergeOfferService,
     read_what_was_checked,
     what_was_checked,
@@ -215,6 +217,54 @@ class TestNotCheckedIsNeverAPass:
         assert not said.text.startswith(CHECK_RAN)
 
 
+class TestARecordThatSaysNothingClaimsNothing:
+    """Added 21 September 2026 after the Stage C review.
+
+    ``what_was_checked({})`` used to give "The project's check of the
+    finished feature ran. It left nothing on its not-checked list." — an
+    affirmative clean claim made out of no evidence at all. GuardKit always
+    writes a full record, so it takes a truncated or corrupted one to get
+    here, and the four wordings already keep a place for exactly that.
+    """
+
+    def test_an_empty_record_is_evidence_unavailable(self) -> None:
+        said = what_was_checked({})
+        assert said.state == "unavailable"
+        assert said.text.startswith(EVIDENCE_UNAVAILABLE)
+        for other in (CHECK_RAN, CHECK_COULD_NOT_RUN, NO_CHECK_DECLARED):
+            assert other not in said.text
+
+    def test_a_record_with_no_status_and_no_lists_is_evidence_unavailable(
+        self,
+    ) -> None:
+        said = what_was_checked({"feature": FEATURE_ID, "declared": True})
+        assert said.state == "unavailable"
+        assert said.text.startswith(EVIDENCE_UNAVAILABLE)
+
+    def test_a_record_with_no_status_but_a_real_list_is_still_read(self) -> None:
+        # The lists are the evidence; a record that carries one is a record.
+        said = what_was_checked({"feature": FEATURE_ID, "not_checked": []})
+        assert said.state == "ran"
+        assert "It left nothing on its not-checked list." in said.text
+
+    def test_a_not_checked_list_that_is_not_a_list_is_never_left_nothing(
+        self,
+    ) -> None:
+        said = what_was_checked(
+            a_record(not_checked="everything was checked, honestly")
+        )
+        assert said.state == "ran"
+        assert NO_NOT_CHECKED_LIST in said.text
+        assert "It left nothing on its not-checked list." not in said.text
+
+    def test_a_record_with_no_not_checked_key_is_never_left_nothing(self) -> None:
+        record = a_record()
+        record.pop("not_checked")
+        said = what_was_checked(record)
+        assert NO_NOT_CHECKED_LIST in said.text
+        assert "It left nothing on its not-checked list." not in said.text
+
+
 class TestObservations:
     def test_both_sides_of_every_observation_reach_the_card(self) -> None:
         said = what_was_checked(a_record())
@@ -262,16 +312,142 @@ class TestCodeChecksLine:
         said = what_was_checked(a_record(not_checked=[], observations=[]), a_code_checks())
         assert "37 commands the build ran directly" in said.text
 
-    def test_no_summary_means_no_line_rather_than_a_claim(self) -> None:
-        said = what_was_checked(a_record(), None)
-        assert "Code checks:" not in said.text
+    def test_no_summary_is_said_out_loud_rather_than_costing_a_line(self) -> None:
+        """Amended 21 September 2026 after the Stage C review.
 
-    def test_a_summary_with_nothing_found_says_no_findings(self) -> None:
+        This used to assert that a missing summary left the card one line
+        shorter. GuardKit writes that summary on every finished build and
+        never raises, so its absence means something went wrong — and a line
+        that simply is not there is read as nothing to report.
+        """
+        said = what_was_checked(a_record(), None)
+        assert CODE_CHECKS_UNAVAILABLE in said.text
+        assert said.details["code_checks_summary_read"] is False
+
+    def test_no_findings_is_said_only_when_a_check_looked_at_something(
+        self,
+    ) -> None:
         said = what_was_checked(
             a_record(),
-            a_code_checks(finding_count=0, tasks=[], tasks_with_something_not_checked=0),
+            a_code_checks(
+                finding_count=0,
+                tasks_with_something_not_checked=0,
+                tasks=[
+                    {
+                        "task": "TASK-WC1-001",
+                        "checks": {
+                            "wiring": {
+                                "state": "ran_and_found_nothing",
+                                "findings": [],
+                                "finding_count": 0,
+                            }
+                        },
+                    }
+                ],
+            ),
         )
         assert "Code checks: no findings" in said.text
+
+    def test_a_summary_where_nothing_looked_never_says_no_findings(self) -> None:
+        """The wrong and the right build of 19 September, exactly.
+
+        Every one of their twenty checks is in the ``not_checked`` state, and
+        the card used to open that line with "no findings" (Stage C review,
+        21 September 2026).
+        """
+        said = what_was_checked(
+            a_record(),
+            a_code_checks(
+                finding_count=0,
+                tasks=[
+                    {
+                        "task": f"TASK-WC1-00{n}",
+                        "checks": {
+                            name: {
+                                "state": "not_checked",
+                                "reason": "no review record of this task was kept",
+                                "findings": [],
+                                "finding_count": 0,
+                            }
+                            for name in ("wiring", "mocked_seam", "stub_scan")
+                        },
+                    }
+                    for n in (1, 2)
+                ],
+            ),
+        )
+        assert "Code checks: nothing was checked" in said.text
+        assert "no findings" not in said.text
+
+    def test_a_kind_of_project_nothing_supports_is_said_in_so_many_words(
+        self,
+    ) -> None:
+        """The reviewer's own break case, 21 September 2026.
+
+        Every check says it does not cover this kind of project, so
+        GuardKit's two counts both come out at nought and the card used to
+        show the single line "Code checks: no findings." — which an owner
+        reads as "the code was checked and was clean".
+        """
+        said = what_was_checked(
+            a_record(),
+            a_code_checks(
+                finding_count=0,
+                tasks_with_something_not_checked=0,
+                tasks_not_checked=[],
+                shell_command_count=0,
+                tasks=[
+                    {
+                        "task": f"TASK-{n}",
+                        "checks": {
+                            name: {
+                                "state": "kind_of_project_not_supported",
+                                "reason": (
+                                    "this check does not cover this kind of project"
+                                ),
+                                "findings": [],
+                                "finding_count": 0,
+                            }
+                            for name in ("wiring", "mocked_seam", "stub_scan", "coverage")
+                        },
+                    }
+                    for n in (1, 2)
+                ],
+            ),
+        )
+        assert "Code checks: nothing was checked" in said.text
+        assert "8 of 8 checks do not cover this kind of project" in said.text
+        assert "no findings" not in said.text
+
+    def test_a_summary_holding_no_check_at_all_claims_nothing(self) -> None:
+        said = what_was_checked(
+            a_record(),
+            a_code_checks(
+                finding_count=0, tasks=[], groups=[], tasks_with_something_not_checked=0
+            ),
+        )
+        assert "Code checks: no check of the code is recorded here" in said.text
+        assert "no findings" not in said.text
+
+    def test_a_finding_is_still_named_when_some_checks_do_not_cover_this_kind(
+        self,
+    ) -> None:
+        summary = a_code_checks()
+        summary["tasks"] = list(summary["tasks"]) + [
+            {
+                "task": "TASK-WC1-005",
+                "checks": {
+                    "wiring": {
+                        "state": "kind_of_project_not_supported",
+                        "findings": [],
+                        "finding_count": 0,
+                    }
+                },
+            }
+        ]
+        said = what_was_checked(a_record(), summary)
+        assert "1 finding (the_thing_nothing_calls)" in said.text
+        assert "1 of 2 checks do not cover this kind of project" in said.text
 
 
 # ---------------------------------------------------------------------------
