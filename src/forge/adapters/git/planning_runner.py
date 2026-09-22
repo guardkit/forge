@@ -49,7 +49,12 @@ from forge.adapters.git.operations import (
     _failure_stderr,
     commit_all,
 )
-from forge.deploy.candidate_tree import RemoteStartPoint, fetch_remote_start_point
+from forge.deploy.candidate_tree import (
+    FileAtCommit,
+    RemoteStartPoint,
+    fetch_remote_start_point,
+    read_file_at_commit,
+)
 from forge.planning.handoff import PreCommitHook
 
 logger = logging.getLogger(__name__)
@@ -129,6 +134,24 @@ class WorktreeGitRunner:
                 refusal=f"there is no copy of this project at {repo_path}"
             )
         return await fetch_remote_start_point(repo)
+
+    async def read_file_at_commit(
+        self, repo_path: str, commit: str, file_path: str
+    ) -> FileAtCommit:
+        """Read one file exactly as it is at ``commit`` in this copy.
+
+        The project's own memory (item 2, 2026-09-21): the declaration is read
+        out of the COMMIT the work starts from, never out of the working folder
+        and never off the branch the copy has checked out. "The file is not in
+        that commit" is an answer; "the commit is not in this copy" is a
+        refusal. Never raises.
+        """
+        repo = Path(repo_path)
+        if not repo.is_dir():
+            return FileAtCommit(
+                refusal=f"there is no copy of this project at {repo_path}"
+            )
+        return await read_file_at_commit(repo, commit, file_path)
 
     async def prepare_branch_and_write(
         self,

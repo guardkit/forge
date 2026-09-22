@@ -71,6 +71,7 @@ from pathlib import Path
 from typing import Any
 
 from forge.adapters.guardkit.context_resolver import resolve_context_flags
+from forge.launch_environment import build_launch_env
 from forge.adapters.guardkit.models import GuardKitResult, GuardKitWarning
 from forge.adapters.guardkit.parser import parse_guardkit_output
 
@@ -379,9 +380,32 @@ async def _execute_subprocess(
     """
     started_at = time.monotonic()
     output_surrendered = False
+    # WHAT THE LEG IS LAUNCHED WITH (the design pass of 2026-09-21, item 1,
+    # second revision, section D). This spawn used to pass no ``env=`` at all,
+    # which inherits this process's whole environment implicitly — an
+    # operator's shell, a forwarded agent socket, a cloud token, the
+    # coordinator's own ledger. It is the same hole the long-running build's
+    # ``os.environ.copy()`` was, reached a different way. It is now the SHORT
+    # NAMED LIST in :mod:`forge.launch_environment`, where every entry carries
+    # the one line that says why it is there, and nothing else is passed.
+    #
+    # NO MEMORY NAME IS HANDED OVER HERE, deliberately. These legs (the
+    # planning stages, and the fix journey's review and work) run IN the
+    # project's own working folder, so the build system reads the project's own
+    # declaration out of the very file this factory read at the starting
+    # commit — the same two lines, the same name. Threading the recorded name
+    # down to every leg would be a second way of saying the same thing, and a
+    # second way to get it wrong. A project that declares nothing never reaches
+    # here at all: the door refused it.
+    #
+    # It is built HERE rather than passed in because this function is the
+    # stubbable seam the tests replace: a seam that spawns nothing has no
+    # environment to be given, and keeping the argument list as it was means
+    # every existing stub still answers.
     proc = await asyncio.create_subprocess_exec(
         *command,
         cwd=cwd,
+        env=build_launch_env(),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         # The child LEADS its own process group — the precondition that

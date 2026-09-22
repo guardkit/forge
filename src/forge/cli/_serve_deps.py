@@ -283,6 +283,7 @@ def _build_resume_launcher(
     state_channel: Any,
     lifecycle_emitter: Any,
     async_task_starter: AsyncTaskStarter | None,
+    memory_project_reader: Callable[[str], str | None] | None = None,
 ) -> Callable[..., Any]:
     """Return the launch closure — ``dispatch_build`` minus ``record_pending_build``.
 
@@ -328,6 +329,18 @@ def _build_resume_launcher(
         # provenance. The live dispatch path resolves it from ``builds.profile``
         # and passes it; the boot-rearm resume path leaves it None (a resume is
         # not a fresh launch) so the resume bytes stay byte-compatible too.
+        #
+        # WHICH MEMORY THIS BUILD BELONGS TO (item 2, 2026-09-21) is read off
+        # the build's own ledger row HERE, in the one closure BOTH the live
+        # approve path and the boot-rearm resume path go through, rather than
+        # threaded down from every caller. A resume gets the same name its
+        # first launch had, which is the point: the memory a piece of work
+        # belongs to is decided once, when the work starts.
+        memory_project = (
+            memory_project_reader(build_id)
+            if memory_project_reader is not None and build_id
+            else None
+        )
         return await dispatch_autobuild_async(
             build_id=build_id,
             feature_id=feature_id,
@@ -340,6 +353,7 @@ def _build_resume_launcher(
             branch=branch,
             repo=repo,
             budget=budget,
+            memory_project=memory_project,
         )
 
     return launch
@@ -414,6 +428,12 @@ def build_serve_resume_launcher(
         state_channel,
         lifecycle_emitter,
         async_task_starter,
+        # Which memory this build belongs to, off its own ledger row (item 2,
+        # 2026-09-21). ``None`` from the reader is "not recorded", and the
+        # launch omits the name rather than inventing one. A pool that does not
+        # offer the read at all — a narrowed adapter in a test — is the same
+        # answer: nothing recorded, never a guess.
+        getattr(sqlite_pool, "read_memory_project", None),
     )
 
     async def guarded_launch(
@@ -682,6 +702,12 @@ def _build_dispatch_build(
         state_channel,
         lifecycle_emitter,
         async_task_starter,
+        # Which memory this build belongs to, off its own ledger row (item 2,
+        # 2026-09-21). ``None`` from the reader is "not recorded", and the
+        # launch omits the name rather than inventing one. A pool that does not
+        # offer the read at all — a narrowed adapter in a test — is the same
+        # answer: nothing recorded, never a guess.
+        getattr(sqlite_pool, "read_memory_project", None),
     )
     clock = gate_clock or _utc_now
 

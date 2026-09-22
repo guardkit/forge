@@ -214,6 +214,17 @@ class RecordingGitRunner:
 
         return RemoteStartPoint(branch="main", commit="0" * 39 + "1")
 
+    async def read_file_at_commit(
+        self, repo_path: str, commit: str, file_path: str
+    ) -> Any:
+        """The memory rule's read (item 2): this stand-in project declares a
+        name, so the door lets the run through to what these tests are about."""
+        from forge.deploy.candidate_tree import FileAtCommit
+
+        return FileAtCommit(
+            content="memory:\n  project: scratch_project\n", found=True
+        )
+
     async def prepare_branch_and_write(
         self,
         repo_path: str,

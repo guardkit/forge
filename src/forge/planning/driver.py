@@ -72,6 +72,7 @@ from forge.planning.checkpoint import (
     build_planning_approval_envelope,
     checkpoint_product_docs,
 )
+from forge.planning.declared_memory import DECLARATION_PATH, read_declared_memory
 from forge.planning.escalation import (
     EscalationOutcome,
     EscalationPolicy,
@@ -2170,6 +2171,21 @@ class PlanningRunDriver:
             return False
         start_commit, target_branch = start
 
+        # THE MEMORY RULE (the project's own memory, item 2, 2026-09-21), and
+        # it runs SECOND, immediately after the starting commit is recorded and
+        # before any model is asked anything: the project's own
+        # ``.guardkit/config.yaml`` is read AT that commit and must name the
+        # memory this work belongs to. A project that declares none, or that
+        # declares a name the memory service would refuse, is refused here in
+        # plain words naming the two lines to add, and nothing is started.
+        # Building with no context is pointless, and filing one project's
+        # outcomes under another project's name is worse than filing none.
+        memory_project = await self._memory_project(
+            correlation_id, target_repo, repo_path, start_commit
+        )
+        if memory_project is None:
+            return False
+
         try:
             result = await deps.git_runner.prepare_branch_and_write(
                 repo_path=repo_path,
@@ -2205,6 +2221,7 @@ class PlanningRunDriver:
                     "handoff_path": handoff_path,
                     "start_commit": start_commit,
                     "target_branch": target_branch,
+                    "memory_project": memory_project,
                 }
             ),
         )
@@ -2311,6 +2328,104 @@ class PlanningRunDriver:
             remote_branch,
         )
         return commit, remote_branch
+
+    async def _memory_project(
+        self,
+        correlation_id: str,
+        target_repo: str,
+        repo_path: str,
+        start_commit: str,
+    ) -> str | None:
+        """The memory this work belongs to, or None after failing the run.
+
+        The memory rule's one call, and the place it is written down (the
+        project's own memory, item 2, 2026-09-21):
+
+        * a run that ALREADY has a recorded name keeps it. A re-drive of this
+          leg must not quietly move a run onto a different memory than the one
+          its branch was cut under. Nothing is read in that case;
+        * otherwise the git runner for this repository — the SAME one that
+          fetched the starting commit and is about to cut the branch — is asked
+          for the project's own ``.guardkit/config.yaml`` AS IT IS AT THAT
+          COMMIT. Never the working folder, never the checked-out branch: a
+          stale checkout must not be able to supply the name;
+        * the name is recorded on the planning run BEFORE the branch is cut, so
+          a crash between the two leaves a record of which memory the work was
+          about to belong to rather than nothing at all;
+        * a project that declares nothing, a name the memory service would
+          refuse, or a settings file that could not be read at that commit, all
+          fail the run loudly with their own sentence, which reaches the owner
+          exactly where every other planning refusal does.
+        """
+        deps = self._deps
+        recorded = None
+        getter = getattr(deps.store, "get_memory_project", None)
+        if getter is not None:
+            recorded = getter(correlation_id)
+        if recorded:
+            logger.info(
+                "planning driver: run %s already belongs to the memory %s; not "
+                "reading the declaration again",
+                correlation_id,
+                recorded,
+            )
+            return str(recorded)
+
+        runner = deps.git_runner
+        read = getattr(runner, "read_file_at_commit", None)
+        if read is None:
+            await self._fail_leg(
+                correlation_id,
+                "target-terminal-enter",
+                (
+                    "the git runner wired for this factory cannot read a file "
+                    "at a commit, so there is no way to tell which memory this "
+                    "work belongs to"
+                ),
+            )
+            return None
+        try:
+            answer = await read(repo_path, start_commit, DECLARATION_PATH)
+        except Exception as exc:  # noqa: BLE001 — boundary, never crash the run
+            await self._fail_leg(
+                correlation_id,
+                "target-terminal-enter",
+                (
+                    f"{target_repo}'s {DECLARATION_PATH} could not be read at "
+                    f"the commit this work starts from ({start_commit}): "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+            )
+            return None
+
+        declared = read_declared_memory(
+            repo=target_repo,
+            commit=start_commit,
+            content=getattr(answer, "content", None),
+            found=bool(getattr(answer, "found", False)),
+            unreadable_because=getattr(answer, "refusal", None),
+        )
+        if not declared.ok:
+            await self._fail_leg(
+                correlation_id,
+                "target-terminal-enter",
+                declared.refusal or "the project's memory name could not be read",
+            )
+            return None
+
+        name = str(declared.project)
+        recorder = getattr(deps.store, "record_memory_project", None)
+        if recorder is not None:
+            recorder(correlation_id, memory_project=name)
+        logger.info(
+            "planning driver: run %s belongs to the memory %s, the name %s "
+            "declares at %s",
+            correlation_id,
+            name,
+            target_repo,
+            start_commit,
+        )
+        return name
 
     async def _feature_spec_leg(self, row: Any, correlation_id: str) -> bool:
         """FEATURE_SPEC leg: write the spec, show it to a person, then advance.

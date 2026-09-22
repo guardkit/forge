@@ -485,6 +485,53 @@ class SqlitePlanningRunStore:
         branch = row["target_branch"] if "target_branch" in keys else None
         return (commit or None), (branch or None)
 
+    def record_memory_project(self, correlation_id: str, *, memory_project: str) -> bool:
+        """Write down which memory this run's work belongs to (item 2).
+
+        The name the project declares in its own ``.guardkit/config.yaml``, as
+        it is AT the recorded starting commit — not as the project's main copy
+        happens to have it checked out. It is written before the branch is cut,
+        beside the starting point, so the record says what the work belonged to
+        even if nothing after this finishes.
+
+        Status-preserving, like its sibling: it touches this one column and
+        nothing else, so the state machine stays the only writer of ``state``.
+        Last write wins. Returns True when a row was updated.
+
+        Raises:
+            ValueError: if the name is blank. A blank reads back exactly like
+                the NULL that means "not recorded", without being it.
+        """
+        if not correlation_id:
+            raise ValueError("record_memory_project: correlation_id must be non-empty")
+        if not memory_project or not memory_project.strip():
+            raise ValueError(
+                "record_memory_project: memory_project must be a non-blank name"
+            )
+        cursor = self._connection.execute(
+            """
+            UPDATE planning_runs
+            SET memory_project = ?
+            WHERE correlation_id = ?
+            """,
+            (memory_project.strip(), correlation_id),
+        )
+        self._connection.commit()
+        return cursor.rowcount > 0
+
+    def get_memory_project(self, correlation_id: str) -> str | None:
+        """The run's recorded memory name, or ``None`` for "not recorded".
+
+        A run recorded before item 2 existed has none, and that reads back as
+        NOT RECORDED — never as "guardkit".
+        """
+        row = self._get_run(correlation_id)
+        if row is None:
+            return None
+        if "memory_project" not in set(row.keys()):
+            return None
+        return row["memory_project"] or None
+
     def update_pending_approval_request_id(
         self, correlation_id: str, request_id: str
     ) -> None:

@@ -79,7 +79,15 @@ def make_remote_and_copy(
     seed.mkdir(parents=True)
     _git(seed, "init", "-q", "-b", default_branch)
     (seed / "README.md").write_text("one\n", encoding="utf-8")
-    _git(seed, "add", ".")
+    # The project says which memory it uses (item 2, 2026-09-21): a project
+    # that declares none is refused at the door, and these tests are about the
+    # starting rule rather than the memory rule. Two lines, and nothing about
+    # what the project is made of.
+    (seed / ".guardkit").mkdir()
+    (seed / ".guardkit" / "config.yaml").write_text(
+        "memory:\n  project: scratch_project\n", encoding="utf-8"
+    )
+    _git(seed, "add", "-A")
     _git(seed, "commit", "-qm", "one")
     remote.mkdir(parents=True)
     _git(remote, "init", "--bare", "-q", "-b", default_branch)
@@ -397,6 +405,14 @@ async def test_the_remote_is_asked_before_anything_is_written(
             order.append("fetch")
             return await real.fetch_remote_start_point(repo_path)
 
+        async def read_file_at_commit(
+            self, repo_path: str, commit: str, file_path: str
+        ) -> Any:
+            # The memory rule's read (item 2) sits BETWEEN the two, and it
+            # reads at the commit the fetch just answered.
+            order.append(f"read {file_path} at {commit}")
+            return await real.read_file_at_commit(repo_path, commit, file_path)
+
         async def prepare_branch_and_write(self, **kwargs: Any) -> Any:
             order.append(f"write from {kwargs.get('start_commit')}")
             return await real.prepare_branch_and_write(**kwargs)
@@ -409,4 +425,8 @@ async def test_the_remote_is_asked_before_anything_is_written(
     assert await h.driver._enter_target_terminal(row, CID) is True
 
     commit, _branch = store.get_start_point(CID)
-    assert order == ["fetch", f"write from {commit}"]
+    assert order == [
+        "fetch",
+        f"read .guardkit/config.yaml at {commit}",
+        f"write from {commit}",
+    ]

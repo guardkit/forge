@@ -54,13 +54,18 @@ from typing import Final
 # recording) to add the additive ``start_commit`` / ``target_branch`` columns
 # to BOTH ``planning_runs`` and ``builds`` — where a piece of work started
 # from, and which branch of the remote it is aimed at, decided once. NULL on
-# every pre-existing row and read as "not recorded", never as a guess.
+# every pre-existing row and read as "not recorded", never as a guess;
+# bumped to 13 in the same lane (item 2, the project's own memory) to add the
+# additive ``memory_project`` column to BOTH tables — which memory this piece
+# of work actually belongs to, read from the project's own declaration at the
+# recorded starting commit. NULL on every pre-existing row and read as "not
+# recorded", never as "guardkit".
 # Future
 # schema bumps should follow the same pattern: append a sibling
 # ``schema_v{N}.sql`` and add a ``(N, "schema_v{N}.sql")`` entry to
 # ``_MIGRATIONS`` in ascending order. The runner applies every entry whose
 # version is greater than the current ``schema_version`` ledger row.
-_SCHEMA_VERSION: Final[int] = 12
+_SCHEMA_VERSION: Final[int] = 13
 _MIGRATIONS: Final[tuple[tuple[int, str], ...]] = (
     (1, "schema.sql"),
     (2, "schema_v2.sql"),
@@ -101,6 +106,15 @@ _MIGRATIONS: Final[tuple[tuple[int, str], ...]] = (
     # columns hold it. NULL-able: every historical row reads back as "not
     # recorded".
     (12, "schema_v12.sql"),
+    # v13 (the project's own memory, item 2) — the additive
+    # ``memory_project`` column on ``planning_runs`` and on ``builds``. Every
+    # build used to read and write memory under the name "guardkit", because
+    # that name came from one setting nothing set; now the project declares its
+    # own name, Forge reads it at the recorded starting commit and hands it to
+    # the build, and this column is where the name that was read is written
+    # down. NULL-able: a historical row, and a build queued by hand with no
+    # planning run, read back as "not recorded".
+    (13, "schema_v13.sql"),
 )
 
 

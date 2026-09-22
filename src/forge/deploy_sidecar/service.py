@@ -31,6 +31,8 @@ The narrow contract:
     POST /git/rev-parse {repo, ref} -> {sha|null}
     POST /git/remote-start-point {repo}
               -> {branch|null, commit|null, refusal|null}
+    POST /git/read-file-at-commit {repo, commit, file_path}
+              -> {content|null, found, refusal|null}
     POST /git/is-ancestor {repo, ancestor, descendant} -> {is_ancestor|null}
     POST /git/candidate-tree {repo, feature_id, sha}
               -> {path, tree, exclude_written}
@@ -1634,6 +1636,14 @@ GIT_REV_PARSE_ROUTE: str = "/git/rev-parse"
 #: touches a working folder.
 GIT_REMOTE_START_POINT_ROUTE: str = "/git/remote-start-point"
 
+#: The project's own memory (item 2, 2026-09-21): read ONE file exactly as
+#: it is at ONE commit. Distinct from ``/git/read-file-from-branch``, which
+#: answers ``null`` alike for "the file is not there", "the commit is not
+#: there" and "the venue could not be reached"; this one says which, because
+#: the sentence a person is shown turns on the difference. It writes nothing,
+#: changes no checked-out branch and touches no working folder.
+GIT_READ_FILE_AT_COMMIT_ROUTE: str = "/git/read-file-at-commit"
+
 #: The checks the sidecar knows how to run — the closed list.
 GIT_CHECK_NAMES: tuple[str, ...] = PRE_COMMIT_CHECK_NAMES
 
@@ -2482,6 +2492,59 @@ def process_git_remote_start_point_request(
         "forge-deploy-sidecar: the starting point for %s is %s",
         repo_path,
         f"{answer.branch} at {answer.commit}" if answer.ok else answer.refusal,
+    )
+    return 200, answer.to_wire()
+
+
+def process_git_read_file_at_commit_request(
+    payload: Any, *, config: ForgeConfig
+) -> tuple[int, dict[str, Any]]:
+    """``{repo, commit, file_path}`` → ``{content, found, refusal}``.
+
+    The project's own memory (item 2, 2026-09-21): read one file exactly as it
+    is at one commit in the clone inside the sandbox, through the same code the
+    in-container venue runs
+    (:func:`forge.deploy.candidate_tree.read_file_at_commit`), so both venues
+    give the same answer and the same sentences.
+
+    A request this route refuses (an unknown repository key, a commit or path
+    this service will not pass to git, a body that is not an object) is a 4xx
+    with one plain sentence, as every git route here is. A file that is simply
+    not in that commit is a 200 with ``found`` false and no refusal: it is an
+    answer about the project rather than a fault in the request, and the caller
+    is the one that decides what to say about it. Never raises.
+    """
+    if not isinstance(payload, dict):
+        return 400, {"error": "request body must be a JSON object"}
+    repo_path, error = _resolve_repo_key(payload, config)
+    if error or repo_path is None:
+        return 400, {"error": error}
+    commit = payload.get("commit")
+    error = _ref_error(commit, what="commit")
+    if error:
+        return 400, {"error": error}
+    file_path = payload.get("file_path")
+    error = _relative_path_error(file_path, what="file_path")
+    if error:
+        return 400, {"error": error}
+    from forge.deploy.candidate_tree import read_file_at_commit
+
+    try:
+        answer = _run_coroutine(
+            read_file_at_commit(repo_path, str(commit), str(file_path))
+        )
+    except Exception as exc:  # noqa: BLE001 — never raise past the boundary
+        return 500, {"error": f"sidecar git error: {type(exc).__name__}: {exc}"}
+    logger.info(
+        "forge-deploy-sidecar: %s at %s in %s: %s",
+        file_path,
+        commit,
+        repo_path,
+        (
+            "read"
+            if answer.ok and answer.found
+            else ("not in that commit" if answer.ok else answer.refusal)
+        ),
     )
     return 200, answer.to_wire()
 
@@ -5214,6 +5277,7 @@ class DeploySidecarHandler(BaseHTTPRequestHandler):
                 GIT_READ_FILE_ROUTE,
                 GIT_REV_PARSE_ROUTE,
                 GIT_REMOTE_START_POINT_ROUTE,
+                GIT_READ_FILE_AT_COMMIT_ROUTE,
                 GIT_IS_ANCESTOR_ROUTE,
                 GIT_CANDIDATE_TREE_ROUTE,
                 GIT_CANDIDATE_TREE_REMOVE_ROUTE,
@@ -5269,6 +5333,10 @@ class DeploySidecarHandler(BaseHTTPRequestHandler):
                 status, body = process_git_rev_parse_request(payload, config=config)
             elif route == GIT_REMOTE_START_POINT_ROUTE:
                 status, body = process_git_remote_start_point_request(
+                    payload, config=config
+                )
+            elif route == GIT_READ_FILE_AT_COMMIT_ROUTE:
+                status, body = process_git_read_file_at_commit_request(
                     payload, config=config
                 )
             elif route == GIT_IS_ANCESTOR_ROUTE:
@@ -5450,6 +5518,7 @@ __all__ = [
     "process_guardkit_merge_request",
     "GIT_WRITE_TREE_ROUTE",
     "GIT_READ_FILE_ROUTE",
+    "GIT_READ_FILE_AT_COMMIT_ROUTE",
     "GIT_REMOTE_START_POINT_ROUTE",
     "GIT_REV_PARSE_ROUTE",
     "GIT_AUTOBUILD_WORKTREE_INSPECT_ROUTE",
@@ -5468,6 +5537,7 @@ __all__ = [
     "process_git_read_file_request",
     "process_git_rev_parse_request",
     "process_git_remote_start_point_request",
+    "process_git_read_file_at_commit_request",
     "process_git_autobuild_worktree_inspect_request",
     "process_git_autobuild_worktree_retire_request",
     "GIT_WORKTREE_ADD_ROUTE",

@@ -73,7 +73,10 @@ __all__ = [
     "CandidateGit",
     "CandidateTreeError",
     "CandidateTreeLayout",
+    "FileAtCommit",
     "InContainerCandidateGit",
+    "MAX_FILE_AT_COMMIT_BYTES",
+    "READ_AT_COMMIT_TIMEOUT_SECONDS",
     "REMOTE_NAME",
     "REMOTE_TIMEOUT_SECONDS",
     "RemoteStartPoint",
@@ -82,6 +85,7 @@ __all__ = [
     "ensure_candidate_trees_excluded",
     "fetch_remote_start_point",
     "git_is_ancestor",
+    "read_file_at_commit",
     "git_rev_parse",
     "is_candidate_tree_path",
     "materialise_candidate_tree",
@@ -270,13 +274,21 @@ def _git_said(done: "subprocess.CompletedProcess[str]") -> str:
     return lines[0]
 
 
-def _run_git(repo_root: Path, *args: str) -> "subprocess.CompletedProcess[str]":
-    """One git command, fixed argv, no shell, bounded."""
+def _run_git(
+    repo_root: Path, *args: str, timeout: float | None = None
+) -> "subprocess.CompletedProcess[str]":
+    """One git command, fixed argv, no shell, bounded.
+
+    ``errors="replace"`` because the bytes may come out of a commit the factory
+    did not write: a file that is not text is then a sentence a person can read
+    rather than an exception nobody catches.
+    """
     return subprocess.run(  # noqa: S603 — fixed argv, no shell
         ["git", "-C", str(repo_root), *args],
         capture_output=True,
         text=True,
-        timeout=REMOTE_TIMEOUT_SECONDS,
+        errors="replace",
+        timeout=REMOTE_TIMEOUT_SECONDS if timeout is None else timeout,
         check=False,
     )
 
@@ -379,6 +391,170 @@ async def fetch_remote_start_point(repo_root: Path | str) -> RemoteStartPoint:
     one remote-tracking ref and reads it.
     """
     return await asyncio.to_thread(_fetch_remote_start_point_sync, Path(repo_root))
+
+
+# ---------------------------------------------------------------------------
+# One file, out of one commit (the project's own memory, item 2, 2026-09-21)
+# ---------------------------------------------------------------------------
+#
+# The starting rule writes down the commit a piece of work starts from. This
+# operation reads ONE file out of exactly that commit — never the working
+# folder, never the branch the copy happens to have checked out — so the
+# project's own declaration is read from the copy the work actually starts
+# from and a stale checkout cannot supply it.
+#
+# WHY IT IS ITS OWN OPERATION AND NOT ``read_file_from_branch``. That one
+# answers ``None`` for "the file is not there", "the commit is not there" and
+# "the venue could not be reached" alike. Here those are three different
+# things to say to a person: a project that declares nothing is told which two
+# lines to add; a copy that could not be read at that commit is told that
+# instead, and is never accused of declaring nothing.
+#
+# BOUNDED, because the file comes out of a commit the factory did not write:
+# the blob's size is asked for first and a file bigger than the bound is not
+# read at all.
+
+#: How long a plain local git read may take.
+READ_AT_COMMIT_TIMEOUT_SECONDS: float = 60.0
+
+#: A file bigger than this is not read out of a commit. The caller's parse is
+#: bounded too; this keeps the bytes off the wire in the first place.
+MAX_FILE_AT_COMMIT_BYTES: int = 256 * 1024
+
+
+@dataclass(frozen=True)
+class FileAtCommit:
+    """One file as it is at one commit, or why it could not be read.
+
+    ``found`` is False when the commit is readable and simply does not carry
+    that file — a fact about the project, not a fault. ``refusal`` is set only
+    when the read itself could not be made: the commit is not in this copy, the
+    file is too big to read, git could not be run, the venue could not be
+    reached. ``content`` is set only when ``found`` is True and there is no
+    refusal.
+    """
+
+    content: str | None = None
+    found: bool = False
+    refusal: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        """True when the read was made, whether or not the file was there."""
+        return self.refusal is None
+
+    def to_wire(self) -> dict[str, Any]:
+        """The answer as the sandbox's helper service sends it."""
+        return {
+            "content": self.content,
+            "found": self.found,
+            "refusal": self.refusal,
+        }
+
+    @classmethod
+    def from_wire(cls, decoded: Any) -> "FileAtCommit":
+        """The answer as it came back, or a refusal saying it made no sense."""
+        if not isinstance(decoded, dict):
+            return cls(refusal="the answer was not an object with a file in it")
+        refusal = decoded.get("refusal")
+        if isinstance(refusal, str) and refusal.strip():
+            return cls(refusal=refusal.strip())
+        found = bool(decoded.get("found"))
+        content = decoded.get("content")
+        if not found:
+            return cls(found=False)
+        if not isinstance(content, str):
+            return cls(
+                refusal="the answer said the file is there but sent no contents"
+            )
+        return cls(content=content, found=True)
+
+
+def _read_file_at_commit_sync(
+    repo_root: Path, commit: str, file_path: str
+) -> FileAtCommit:
+    """The three steps, in order: is the commit here, is the file, read it."""
+    where = str(repo_root)
+    try:
+        present = _run_git(
+            repo_root,
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            f"{commit}^{{commit}}",
+            timeout=READ_AT_COMMIT_TIMEOUT_SECONDS,
+        )
+        if present.returncode != 0 or not (present.stdout or "").strip():
+            return FileAtCommit(
+                refusal=(
+                    f"the copy of this project at {where} does not have the "
+                    f"commit {commit}, so nothing can be read out of it"
+                )
+            )
+
+        sized = _run_git(
+            repo_root,
+            "cat-file",
+            "-s",
+            f"{commit}:{file_path}",
+            timeout=READ_AT_COMMIT_TIMEOUT_SECONDS,
+        )
+        if sized.returncode != 0:
+            # git says much the same for "no such path in that commit" and for
+            # "that path is a folder"; either way the file is not there.
+            return FileAtCommit(found=False)
+        try:
+            size = int((sized.stdout or "").strip())
+        except ValueError:
+            size = -1
+        if size > MAX_FILE_AT_COMMIT_BYTES:
+            return FileAtCommit(
+                refusal=(
+                    f"{file_path} at {commit} is {size} bytes, larger than the "
+                    f"{MAX_FILE_AT_COMMIT_BYTES} this factory will read"
+                )
+            )
+
+        shown = _run_git(
+            repo_root,
+            "show",
+            f"{commit}:{file_path}",
+            timeout=READ_AT_COMMIT_TIMEOUT_SECONDS,
+        )
+        if shown.returncode != 0:
+            return FileAtCommit(
+                refusal=(
+                    f"{file_path} could not be read at {commit} in {where}: "
+                    f"{_git_said(shown)}"
+                )
+            )
+        return FileAtCommit(content=shown.stdout or "", found=True)
+    except OSError as exc:
+        return FileAtCommit(
+            refusal=f"git could not be run in {where}: {type(exc).__name__}: {exc}"
+        )
+    except subprocess.TimeoutExpired:
+        return FileAtCommit(
+            refusal=(
+                f"reading {file_path} at {commit} in {where} did not finish "
+                f"within {READ_AT_COMMIT_TIMEOUT_SECONDS:.0f} seconds"
+            )
+        )
+
+
+async def read_file_at_commit(
+    repo_root: Path | str, commit: str, file_path: str
+) -> FileAtCommit:
+    """Read ``file_path`` exactly as it is at ``commit``.
+
+    Never raises, never writes, never touches the working folder and never
+    changes the branch the copy has checked out: it is ``git show`` and two
+    plumbing probes. "The file is not in that commit" is an answer, not a
+    refusal; "the commit is not in this copy" is a refusal.
+    """
+    return await asyncio.to_thread(
+        _read_file_at_commit_sync, Path(repo_root), str(commit), str(file_path)
+    )
 
 
 def _materialise_sync(repo_root: Path, dest: Path, sha: str) -> None:
