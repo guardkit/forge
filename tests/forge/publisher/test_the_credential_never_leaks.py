@@ -32,6 +32,10 @@ from forge.publisher.credential import (
     the_askpass_program,
     the_environment_git_is_given,
 )
+from forge.publisher.git_work import (
+    THE_ADDRESS_IS_NOT_WRITTEN_DOWN,
+    without_the_addresses,
+)
 from forge.publisher.service import Publisher
 from tests.forge.publisher.a_project_and_a_ledger import (
     THE_MADE_UP_CREDENTIAL,
@@ -140,6 +144,89 @@ class TestTheProgramGitAsksThrough:
             "LC_ALL",
             "GIT_ASKPASS",
         }
+
+
+class TestItIsWrittenOnceAndNotOncePerGitCommand:
+    """The reviewer's seventh finding, 22 September 2026.
+
+    It used to be written on the way into EVERY git command. The publisher
+    works on different projects at the same time — its one-at-a-time lock is
+    per project, exactly so that it can — so two requests wrote the same file
+    at the same moment, and a file being written is momentarily a file with
+    nothing in it. Git, running for the other request, could read a truncated
+    program, get no credential, and be refused by the remote for a reason
+    that had nothing to do with the remote.
+    """
+
+    def _a_credential(self, tmp_path: Path) -> object:
+        where = tmp_path / "the-credential"
+        where.write_text(THE_MADE_UP_CREDENTIAL + "\n", encoding="utf-8")
+        held, _ = read_the_credential(where)
+        assert held is not None
+        return held
+
+    def test_the_file_is_written_once_and_then_left_alone(
+        self, tmp_path: Path
+    ) -> None:
+        held = self._a_credential(tmp_path)
+        state = tmp_path / "state"
+
+        first = the_askpass_program(held, state_dir=state)  # type: ignore[arg-type]
+        was = (first.stat().st_ino, first.stat().st_mtime_ns)
+        for _ in range(50):
+            again = the_askpass_program(held, state_dir=state)  # type: ignore[arg-type]
+            assert again == first
+        assert (first.stat().st_ino, first.stat().st_mtime_ns) == was
+
+    def test_every_git_command_finds_a_whole_program(self, tmp_path: Path) -> None:
+        """Many at once, and not one of them ever reads a piece of one."""
+        import threading
+
+        held = self._a_credential(tmp_path)
+        state = tmp_path / "state"
+        ends_with = "sys.stdout.write(handle.read().strip() + chr(10))\n"
+        what_they_saw: list[str] = []
+        trouble: list[BaseException] = []
+
+        def one_request() -> None:
+            try:
+                for _ in range(25):
+                    given = the_environment_git_is_given(
+                        held, state_dir=state, home=state  # type: ignore[arg-type]
+                    )
+                    what_they_saw.append(
+                        Path(given["GIT_ASKPASS"]).read_text(encoding="utf-8")
+                    )
+            except BaseException as exc:  # noqa: BLE001 - reported, not swallowed
+                trouble.append(exc)
+
+        threads = [threading.Thread(target=one_request) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert trouble == []
+        assert len(what_they_saw) == 8 * 25
+        # EVERY read was of a whole program. A truncated one is the failure
+        # this is about, and an empty one is the shape it took.
+        assert all(text.endswith(ends_with) for text in what_they_saw)
+        assert all(THE_MADE_UP_CREDENTIAL not in text for text in what_they_saw)
+
+    def test_a_publisher_writes_it_at_start(self, tmp_path: Path) -> None:
+        """Before any request arrives, so no request is the one that writes it."""
+        root = tmp_path / "world"
+        project = make_the_project(root)
+        make_the_ledger(root / "forge.db", project=project)
+        settings = settings_for(root, project, ledger=root / "forge.db")
+
+        Publisher(settings)
+
+        program = Path(settings.state_dir) / "ask-for-the-credential"
+        assert program.is_file()
+        assert THE_MADE_UP_CREDENTIAL not in program.read_text(encoding="utf-8")
+        # And nothing half-written is left lying about beside it.
+        assert list(Path(settings.state_dir).glob("*being-written*")) == []
 
 
 class TestAWholePublishLeaksNothing:
@@ -260,3 +347,92 @@ class TestAWholePublishLeaksNothing:
         # child's own environment — never a credential.
         assert reads == ['"PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),']
         assert os.environ is not None  # the module under test, not this one
+
+
+#: A recognisable string planted in an address. Nothing anywhere accepts it;
+#: it stands for whatever somebody setting the publisher up at rollout might
+#: put in an address, and the test greps for it.
+THE_PLANTED_STRING = "notarealtoken-TESTONLY-b41f"
+
+
+class TestNoAddressIsEverWrittenDown:
+    """The reviewer's sixth finding, 22 September 2026.
+
+    Git names the address it was working with in its own messages, and those
+    messages go into a refusal a person reads, a receipt and a row of the
+    ledger. An address is also the easiest place for a credential to end up:
+    the ordinary way to give git one without a helper is to put it in the
+    address. Nothing in this estate does that today, and the addresses come
+    out of a settings file somebody fills in at rollout — so the rule cannot
+    be "nobody will".
+    """
+
+    def test_an_address_this_publisher_knows_is_taken_out(self) -> None:
+        said = (
+            f"fatal: \'/somewhere/{THE_PLANTED_STRING}/remote.git\' does not "
+            "appear to be a git repository"
+        )
+        cleaned = without_the_addresses(
+            said, (f"/somewhere/{THE_PLANTED_STRING}/remote.git",)
+        )
+        assert THE_PLANTED_STRING not in cleaned
+        assert THE_ADDRESS_IS_NOT_WRITTEN_DOWN in cleaned
+        # What went wrong still reads.
+        assert "does not appear to be a git repository" in cleaned
+
+    def test_who_is_asking_is_taken_out_of_an_address_nobody_declared(
+        self,
+    ) -> None:
+        """Even an address this publisher was never told about."""
+        said = (
+            f"fatal: could not read from \'x://somebody:{THE_PLANTED_STRING}"
+            "@elsewhere.invalid/a/b\'"
+        )
+        cleaned = without_the_addresses(said, ())
+        assert THE_PLANTED_STRING not in cleaned
+        assert "could not read from" in cleaned
+
+    def _a_world_with_the_string_in_its_paths(self, tmp_path: Path) -> tuple:
+        root = tmp_path / f"world-{THE_PLANTED_STRING}"
+        project = make_the_project(root)
+        make_the_ledger(root / "forge.db", project=project)
+        settings = settings_for(root, project, ledger=root / "forge.db")
+        assert THE_PLANTED_STRING in settings.projects[
+            list(settings.projects)[0]
+        ].remote
+        return root, project, Publisher(settings)
+
+    def test_the_remotes_address_is_not_in_a_refusal(self, tmp_path: Path) -> None:
+        """A real git failure, with a real address, said out loud by git."""
+        import shutil
+
+        _root, project, publisher = self._a_world_with_the_string_in_its_paths(
+            tmp_path
+        )
+        # The remote is taken away, so git has to say something about it.
+        shutil.rmtree(project["bare"])
+
+        answer = publisher.publish(a_request(project))
+
+        assert answer.published is False
+        assert answer.refusal_kind == "the-remote-could-not-be-read"
+        assert THE_PLANTED_STRING not in str(answer.refusal)
+        assert THE_ADDRESS_IS_NOT_WRITTEN_DOWN in str(answer.refusal)
+
+    def test_the_source_address_is_not_in_a_refusal_either(
+        self, tmp_path: Path
+    ) -> None:
+        """The read-only address a project's copy is reached at, the same way."""
+        import shutil
+
+        _root, project, publisher = self._a_world_with_the_string_in_its_paths(
+            tmp_path
+        )
+        shutil.rmtree(project["copy"])
+
+        answer = publisher.publish(a_request(project))
+
+        assert answer.published is False
+        assert answer.refusal_kind == "the-joined-commit-is-not-there"
+        assert THE_PLANTED_STRING not in str(answer.refusal)
+        assert THE_ADDRESS_IS_NOT_WRITTEN_DOWN in str(answer.refusal)

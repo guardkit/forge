@@ -11,6 +11,8 @@ it was, and its own reflog shows nobody moved it.
 
 from __future__ import annotations
 
+import sqlite3
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -27,6 +29,9 @@ from tests.forge.publisher.a_project_and_a_ledger import (
     settings_for,
     what_the_remote_has,
 )
+
+#: A second project, which this build has nothing to do with.
+ANOTHER_PROJECT = "bench/somebody-elses-shop"
 
 
 @pytest.fixture()
@@ -318,3 +323,131 @@ class TestEveryRefusalIsOneSentenceAPersonCanRead:
         route = ProjectRoute(name="p", source="s", remote="r")
         assert (route.name, route.source, route.remote) == ("p", "s", "r")
         assert BUILD  # the build the tests press, named once
+
+
+class TestARecordBelongsToItsOwnProject:
+    """The build's record is bound to the project it was built for.
+
+    22 September 2026, the stage's reviewer. A build identifier is not a
+    project: the publisher used to read the record by build alone and never
+    ask whose build it was, so a request naming one project, carrying another
+    project's build, passed every check the record makes and went on to send.
+    Which remote is written to comes from the request, so that is one
+    project's work landing on another project's remote — the worst thing this
+    service could do.
+    """
+
+    def _a_second_project(self, root: Path, project: dict) -> Path:
+        """Another project's remote, which really could take this work.
+
+        It is made from the first one's history on purpose. A second remote
+        with nothing in common would be refused later anyway, for a different
+        reason (the join was not made onto anything it contains), and would
+        prove nothing about the project being checked. This one would take the
+        commit, which is what makes the refusal load-bearing.
+        """
+        other = root / "another-remote.git"
+        subprocess.run(
+            ["git", "clone", "--bare", "-q", str(project["bare"]), str(other)],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "--git-dir", str(other), "config", "core.logAllRefUpdates", "true"],
+            check=True,
+            capture_output=True,
+        )
+        log = other / "logs" / "refs" / "heads" / project["branch"]
+        if log.is_file():
+            log.write_text("", encoding="utf-8")
+        return other
+
+    def _publisher_knowing_both(
+        self, tmp_path: Path, project: dict
+    ) -> tuple[Publisher, Path]:
+        root = tmp_path / "world"
+        make_the_ledger(root / "forge.db", project=project)
+        other = self._a_second_project(root, project)
+        publisher = Publisher(
+            settings_for(
+                root,
+                project,
+                ledger=root / "forge.db",
+                projects={
+                    PROJECT: ProjectRoute(
+                        name=PROJECT,
+                        source=str(project["copy"]),
+                        remote=str(project["bare"]),
+                    ),
+                    ANOTHER_PROJECT: ProjectRoute(
+                        name=ANOTHER_PROJECT,
+                        source=str(project["copy"]),
+                        remote=str(other),
+                    ),
+                },
+            )
+        )
+        return publisher, other
+
+    def test_another_projects_build_is_refused_and_nothing_is_sent(
+        self, tmp_path: Path, project: dict
+    ) -> None:
+        """The exact request the reviewer reproduced: project B, A's build."""
+        publisher, other = self._publisher_knowing_both(tmp_path, project)
+        before = what_the_remote_has(project["bare"], project["branch"])
+        other_before = what_the_remote_has(other, project["branch"])
+
+        asked = a_request(project)
+        asked["project"] = ANOTHER_PROJECT
+
+        answer = publisher.publish(asked)
+
+        assert answer.published is False
+        assert answer.refusal_kind == "that-build-belongs-to-another-project"
+        assert ANOTHER_PROJECT in str(answer.refusal)
+        assert PROJECT in str(answer.refusal)
+        assert "bound to its own project" in str(answer.refusal)
+        # NEITHER remote moved: not the one named in the request, and not the
+        # one the build really belongs to.
+        _nothing_moved(project, before)
+        assert what_the_remote_has(other, project["branch"]) == other_before
+        assert every_push_the_remote_saw(other, project["branch"]) == []
+
+    def test_its_own_project_is_still_sent(
+        self, tmp_path: Path, project: dict
+    ) -> None:
+        """The same publisher, the same record, the right project: it sends."""
+        publisher, other = self._publisher_knowing_both(tmp_path, project)
+
+        answer = publisher.publish(a_request(project))
+
+        assert answer.published is True
+        assert answer.contains_j is True
+        assert what_the_remote_has(project["bare"], project["branch"]) == project["j"]
+        # And the other project's remote was never touched.
+        assert every_push_the_remote_saw(other, project["branch"]) == []
+
+    def test_a_record_that_does_not_say_which_project_at_all(
+        self, tmp_path: Path, project: dict
+    ) -> None:
+        """A record with no project is evidence about no project."""
+        root = tmp_path / "world"
+        make_the_ledger(root / "forge.db", project=project)
+        connection = sqlite3.connect(str(root / "forge.db"))
+        try:
+            connection.execute(
+                "UPDATE publication_records SET repo = NULL WHERE build_id = ?",
+                (BUILD,),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        publisher = Publisher(settings_for(root, project, ledger=root / "forge.db"))
+        before = what_the_remote_has(project["bare"], project["branch"])
+
+        answer = publisher.publish(a_request(project))
+
+        assert answer.published is False
+        assert answer.refusal_kind == "the-record-does-not-say-which-project"
+        assert BUILD in str(answer.refusal)
+        _nothing_moved(project, before)
