@@ -42,6 +42,9 @@ PARENT = {
     "ANTHROPIC_BASE_URL": "http://localhost:9000",
     "GUARDKIT_TIMEOUT_MULTIPLIER": "4.0",
     "GUARDKIT_AUTOBUILD_TASK_TIMEOUT_FLOOR": "900",
+    "GUARDKIT_ARCH_CONFORMANCE_BLOCKING": "1",
+    "GUARDKIT_ZERO_TEST_BLOCKING": "1",
+    "GUARDKIT_BOOT_SMOKE_BLOCKING": "1",
     "FLEET_MEMORY_ENABLED": "true",
     "FLEET_MEMORY_PG_DSN": "postgresql://somewhere/memory",
     "FLEET_MEMORY_EMBED_URL": "http://embed:9000",
@@ -156,6 +159,62 @@ def test_a_setting_the_parent_does_not_have_stays_unset() -> None:
 
     assert set(env) == {"PATH", GUARDKIT_MEMORY_PROJECT_ENV}
     assert "GUARDKIT_HARNESS" not in env
+
+
+# ---------------------------------------------------------------------------
+# A switch the owner turned on keeps working
+# ---------------------------------------------------------------------------
+
+#: The three switches the build system reads straight out of the environment at
+#: build time. Each one ships OFF, and an operator turns it on by dropping a
+#: file beside the runner's unit that sets it — the drop-in's own comment calls
+#: itself "the whole switch". They are written out here, and not imported from
+#: the build system, because this repository does not depend on it: if one is
+#: ever renamed there, this test is where the rename surfaces.
+#:
+#: WHY THIS TEST EXISTS. The named list was written without them, and a named
+#: list that leaves out a switch turns it off — silently. No error, no log line,
+#: the drop-in still sitting there looking switched on, and architecture
+#: findings quietly not reaching the code generator any more.
+OPERATOR_SWITCHES = (
+    "GUARDKIT_ARCH_CONFORMANCE_BLOCKING",
+    "GUARDKIT_ZERO_TEST_BLOCKING",
+    "GUARDKIT_BOOT_SMOKE_BLOCKING",
+)
+
+
+def test_a_switch_the_owner_turned_on_reaches_the_build() -> None:
+    env = build_launch_env(parent=PARENT, memory_project="widget_shop")
+
+    for switch in OPERATOR_SWITCHES:
+        assert env.get(switch) == "1", switch
+
+
+def test_every_operator_switch_is_accounted_for_one_way_or_the_other() -> None:
+    """On the list with its reason, or on the left-out list with its reason.
+    Never simply missing, which is how the first one was lost."""
+    named = set(launch_setting_names()) | {
+        name for name, _ in SETTINGS_DELIBERATELY_NOT_PASSED
+    }
+    for switch in OPERATOR_SWITCHES:
+        assert switch in named, switch
+
+
+def test_a_switch_nobody_turned_on_is_not_invented() -> None:
+    """Today only the architecture one is set on this estate. The other two must
+    stay unset rather than arrive as an empty string, which several readers of
+    these treat as a value."""
+    parent = {
+        name: value
+        for name, value in PARENT.items()
+        if name not in ("GUARDKIT_ZERO_TEST_BLOCKING", "GUARDKIT_BOOT_SMOKE_BLOCKING")
+    }
+
+    env = build_launch_env(parent=parent, memory_project="widget_shop")
+
+    assert env["GUARDKIT_ARCH_CONFORMANCE_BLOCKING"] == "1"
+    assert "GUARDKIT_ZERO_TEST_BLOCKING" not in env
+    assert "GUARDKIT_BOOT_SMOKE_BLOCKING" not in env
 
 
 # ---------------------------------------------------------------------------

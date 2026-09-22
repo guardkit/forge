@@ -22,6 +22,7 @@ from pathlib import Path
 
 import yaml
 
+from forge.launch_environment import build_launch_env
 from forge.review_gate.models import Finding, ReviewFindingsRecord
 
 __all__ = [
@@ -151,12 +152,29 @@ def validate_review_findings(
             f"{', '.join(_GUARDKIT_BINARIES)}) — cannot validate the F14 record; "
             "an absent validator is not a pass."
         )
+    # WHAT THE VALIDATOR IS LAUNCHED WITH (the design pass of 2026-09-21, item
+    # 1, second revision, section D). This spawn passed no ``env=`` at all,
+    # which inherits this process's whole environment implicitly — and the
+    # process here is the coordinator's own, so that is an operator's shell, a
+    # forwarded agent socket, a cloud token and the coordinator's ledger path,
+    # handed to the build system across the frozen seam. It is the same hole
+    # the build's ``os.environ.copy()`` was, reached a third way. It is now the
+    # one written-down list in :mod:`forge.launch_environment`.
+    #
+    # The binary above is still resolved from THIS process's PATH, which is
+    # right: which validator to run is the coordinator's decision, and the
+    # resolved absolute path is what is launched.
+    #
+    # NO MEMORY NAME IS HANDED OVER, deliberately. This leg checks the shape of
+    # one record already written to disk; it reads and writes no memory, so
+    # there is no work for a name to belong to.
     proc = subprocess.run(  # noqa: S603 — binary resolved via shutil.which
         [binary, "qa", "validate", F14_KIND, str(path)],
         capture_output=True,
         text=True,
         timeout=timeout,
         check=False,
+        env=build_launch_env(),
     )
     return ValidationResult(
         ok=proc.returncode == 0,

@@ -4209,8 +4209,11 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
     # whatever this process happened to be holding, in full — an operator's
     # shell, a forwarded agent socket, a cloud token, the coordinator's own
     # ledger. It is now the SHORT NAMED LIST in
-    # :mod:`forge.subagents.launch_environment`, where every entry carries the
-    # one line that says why it is there, and nothing else is passed.
+    # :mod:`forge.launch_environment` — which sits at the top of the package
+    # rather than here beside the runner, because the bounded legs launch the
+    # build system too and the adapter layer keeps no dependency on this one;
+    # that module's own docstring says so at length. Every entry there carries
+    # the one line that says why it is there, and nothing else is passed.
     #
     # And the one setting that is decided per build rather than inherited: the
     # memory this work belongs to (item 2). Forge read the project's own
