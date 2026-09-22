@@ -79,6 +79,7 @@ __all__ = [
     "Build",
     "BuildMode",
     "BuildRow",
+    "BuildStartPoint",
     "BuildStatusView",
     "DuplicateBuildError",
     "SqliteBuildCanceller",
@@ -256,6 +257,39 @@ class BuildRow(BaseModel):
     # ``autobuild/<feature id>`` exactly as before. Distinct from ``branch``,
     # which is the branch the build was queued ON.
     merge_branch: str | None = None
+    # Where this build's work started (``schema_v12.sql``; one true copy, item
+    # 1, 2026-09-21). ``start_commit`` is the commit the project's remote had
+    # its default branch at when the planning run started; ``target_branch``
+    # is that branch's name, decided once. Copied onto the build from its
+    # planning run at the single INSERT site. ``None`` on both means NOT
+    # RECORDED — every row written before the starting rule, and every build
+    # queued by hand with no planning run — and it is read as that, never as a
+    # guess at where the work started.
+    start_commit: str | None = None
+    target_branch: str | None = None
+
+
+class BuildStartPoint(BaseModel):
+    """Where a build's work started, or the honest absence of that fact.
+
+    ``recorded`` is False for every build queued before the starting rule and
+    for every build with no planning run behind it. ``sentence`` is what a
+    person is shown either way, so nothing has to turn a missing commit into a
+    guess.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    build_id: str
+    recorded: bool = False
+    start_commit: str | None = None
+    target_branch: str | None = None
+
+    @property
+    def sentence(self) -> str:
+        if not self.recorded:
+            return "not recorded"
+        return f"{self.start_commit} on {self.target_branch}"
 
 
 class BuildStatusView(BaseModel):
@@ -360,6 +394,8 @@ def _row_to_build_row(row: sqlite3.Row | tuple[Any, ...]) -> BuildRow:
             "task_id",
             "terminal_class",
             "merge_branch",
+            "start_commit",
+            "target_branch",
         )
         data = dict(zip(keys, row, strict=False))
 
@@ -398,6 +434,8 @@ def _row_to_build_row(row: sqlite3.Row | tuple[Any, ...]) -> BuildRow:
         task_id=data.get("task_id"),
         terminal_class=data.get("terminal_class"),
         merge_branch=data.get("merge_branch"),
+        start_commit=data.get("start_commit"),
+        target_branch=data.get("target_branch"),
     )
 
 
@@ -769,39 +807,58 @@ class SqliteLifecyclePersistence:
         # already passes the payload, and the wire field is the single source.
         # ``None`` for Mode A / Mode B — the routine path is untouched.
         task_id: str | None = getattr(payload, "task_id", None)
+        # Where the work started (``schema_v12.sql``; one true copy, item 1).
+        # The planning run wrote the commit and the target branch down before
+        # it cut the first branch; the build carries the SAME two facts, copied
+        # here — the one place a build row is ever inserted — from the planning
+        # run with this build's correlation id. A build with no planning run
+        # behind it (a hand-queued build) leaves both NULL, which reads back as
+        # "not recorded" rather than as a guess.
+        # A ledger that has not had the starting-rule migration applied yet has
+        # neither column; the row is still written, and reads back as "not
+        # recorded", which is the truth about it.
+        records_start_point = self._builds_record_the_start_point()
+        start_commit, target_branch = (
+            self._planning_start_point(correlation_id)
+            if records_start_point
+            else (None, None)
+        )
+        columns = (
+            "build_id, feature_id, repo, branch, feature_yaml_path, "
+            "status, triggered_by, originating_adapter, "
+            "originating_user, correlation_id, parent_request_id, "
+            "queued_at, max_turns, sdk_timeout_seconds, mode, profile, "
+            "task_id"
+        )
+        placeholders = "?, ?, ?, ?, ?, 'QUEUED', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?"
+        values: list[Any] = [
+            build_id,
+            feature_id,
+            payload.repo,
+            payload.branch,
+            payload.feature_yaml_path,
+            payload.triggered_by,
+            payload.originating_adapter,
+            payload.originating_user,
+            correlation_id,
+            payload.parent_request_id,
+            queued_at.isoformat(),
+            int(payload.max_turns),
+            int(payload.sdk_timeout_seconds),
+            resolved_mode.value,
+            profile,
+            task_id,
+        ]
+        if records_start_point:
+            columns += ", start_commit, target_branch"
+            placeholders += ", ?, ?"
+            values += [start_commit, target_branch]
 
         try:
             self._cx.execute("BEGIN IMMEDIATE;")
             self._cx.execute(
-                """
-                INSERT INTO builds (
-                    build_id, feature_id, repo, branch, feature_yaml_path,
-                    status, triggered_by, originating_adapter,
-                    originating_user, correlation_id, parent_request_id,
-                    queued_at, max_turns, sdk_timeout_seconds, mode, profile,
-                    task_id
-                ) VALUES (
-                    ?, ?, ?, ?, ?, 'QUEUED', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-                )
-                """,
-                (
-                    build_id,
-                    feature_id,
-                    payload.repo,
-                    payload.branch,
-                    payload.feature_yaml_path,
-                    payload.triggered_by,
-                    payload.originating_adapter,
-                    payload.originating_user,
-                    correlation_id,
-                    payload.parent_request_id,
-                    queued_at.isoformat(),
-                    int(payload.max_turns),
-                    int(payload.sdk_timeout_seconds),
-                    resolved_mode.value,
-                    profile,
-                    task_id,
-                ),
+                f"INSERT INTO builds ({columns}) VALUES ({placeholders})",
+                tuple(values),
             )
             self._cx.execute("COMMIT;")
         except sqlite3.IntegrityError as exc:
@@ -1077,6 +1134,89 @@ class SqliteLifecyclePersistence:
     # Write API — record_merge_branch (the branch the merge word merges,
     # schema_v11; rewrite-on-refusal spec Part M, rule 54)
     # ------------------------------------------------------------------
+
+    def _builds_record_the_start_point(self) -> bool:
+        """Does this ledger have the starting-rule columns on ``builds``?
+
+        Asked once per facade and remembered. A ledger from before the
+        migration answers no, and a build queued against it is still written —
+        with nothing recorded about where it started, which is exactly what a
+        reader is then told.
+        """
+        cached = getattr(self, "_start_point_columns", None)
+        if cached is not None:
+            return bool(cached)
+        try:
+            names = {
+                row[1] for row in self._cx.execute("PRAGMA table_info(builds);")
+            }
+        except sqlite3.Error:
+            names = set()
+        answer = {"start_commit", "target_branch"} <= names
+        self._start_point_columns = answer
+        return answer
+
+    def _planning_start_point(
+        self, correlation_id: str
+    ) -> tuple[str | None, str | None]:
+        """The planning run's recorded starting point, or ``(None, None)``.
+
+        Read-only and forgiving on purpose: a ledger that has not had the
+        starting-rule migration applied, or a correlation id with no planning
+        run behind it, answers "nothing recorded" rather than failing a build
+        that is otherwise fine.
+        """
+        if not correlation_id:
+            return None, None
+        try:
+            row = self._cx.execute(
+                """
+                SELECT start_commit, target_branch
+                  FROM planning_runs
+                 WHERE correlation_id = ?
+                """,
+                (correlation_id,),
+            ).fetchone()
+        except sqlite3.Error:
+            return None, None
+        if row is None:
+            return None, None
+        commit = row["start_commit"] if isinstance(row, sqlite3.Row) else row[0]
+        branch = row["target_branch"] if isinstance(row, sqlite3.Row) else row[1]
+        return (commit or None), (branch or None)
+
+    def read_start_point(self, build_id: str) -> BuildStartPoint:
+        """Where this build's work started — or, honestly, that nobody wrote it down.
+
+        A build queued before the starting rule existed, or queued by hand
+        with no planning run behind it, comes back with ``recorded=False`` and
+        the sentence "not recorded". Nothing here ever substitutes a commit it
+        found some other way: an unrecorded start is a fact about the record,
+        not a puzzle to solve.
+        """
+        try:
+            row = self._cx.execute(
+                """
+                SELECT start_commit, target_branch
+                  FROM builds
+                 WHERE build_id = ?
+                """,
+                (build_id,),
+            ).fetchone()
+        except sqlite3.Error:
+            row = None
+        if row is None:
+            return BuildStartPoint(build_id=build_id, recorded=False)
+        commit = row["start_commit"] if isinstance(row, sqlite3.Row) else row[0]
+        branch = row["target_branch"] if isinstance(row, sqlite3.Row) else row[1]
+        if not commit or not branch:
+            return BuildStartPoint(build_id=build_id, recorded=False)
+        return BuildStartPoint(
+            build_id=build_id,
+            recorded=True,
+            start_commit=str(commit),
+            target_branch=str(branch),
+        )
 
     def record_merge_branch(self, build_id: str, branch: str) -> None:
         """Persist the branch the merge word must merge onto the ``builds`` row.

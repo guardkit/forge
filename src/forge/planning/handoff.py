@@ -281,12 +281,26 @@ class GitRunner(Protocol):
     Tests inject recording fakes to verify invocation counts and arguments.
     """
 
+    async def fetch_remote_start_point(self, repo_path: str) -> Any:
+        """Fetch the copy's remote ``origin`` and say where its default branch is.
+
+        The starting rule's one operation (one true copy, item 1,
+        2026-09-21). The answer is a
+        :class:`~forge.deploy.candidate_tree.RemoteStartPoint`: a branch and a
+        commit, or one plain sentence saying why there is nothing to start
+        from. It never raises, never changes a checked-out branch and never
+        touches a working folder.
+        """
+        ...
+
     async def prepare_branch_and_write(
         self,
         repo_path: str,
         branch: str,
         file_path: str,
         content: str,
+        *,
+        start_commit: str | None = None,
     ) -> GitOpResult:
         """Prepare a worktree branch and write a file with content.
 
@@ -300,6 +314,12 @@ class GitRunner(Protocol):
             Relative path within the repo (e.g., "feature_spec_inputs/cid.md").
         content:
             File content to write.
+        start_commit:
+            The commit a BRAND NEW branch is cut from (one true copy, item 1)
+            — the commit the remote's default branch was at when the work
+            started. A branch that already exists is re-attached and never
+            moved onto it. ``None`` keeps the old behaviour: the branch is cut
+            from whatever the copy has checked out.
 
         Returns
         -------
@@ -316,6 +336,7 @@ class GitRunner(Protocol):
         message: str,
         *,
         pre_commit: "PreCommitHook | PreCommitChecks | None" = None,
+        start_commit: str | None = None,
     ) -> GitOpResult:
         """Write a MULTI-file tree onto ``branch`` in one commit (Lane B B2).
 
@@ -357,6 +378,9 @@ class GitRunner(Protocol):
             Commit message.
         pre_commit:
             Optional oracle hook (normalizer / ``feature validate``).
+        start_commit:
+            The commit a BRAND NEW branch is cut from (one true copy, item 1).
+            An existing branch is re-attached, never moved.
 
         Returns
         -------

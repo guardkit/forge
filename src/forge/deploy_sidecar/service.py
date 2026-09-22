@@ -29,6 +29,8 @@ The narrow contract:
                                           detail, note}], detail}
     POST /git/read-file-from-branch {repo, branch, file_path} -> {content|null}
     POST /git/rev-parse {repo, ref} -> {sha|null}
+    POST /git/remote-start-point {repo}
+              -> {branch|null, commit|null, refusal|null}
     POST /git/is-ancestor {repo, ancestor, descendant} -> {is_ancestor|null}
     POST /git/candidate-tree {repo, feature_id, sha}
               -> {path, tree, exclude_written}
@@ -1625,6 +1627,13 @@ GIT_WRITE_TREE_ROUTE: str = "/git/prepare-branch-and-write-tree"
 GIT_READ_FILE_ROUTE: str = "/git/read-file-from-branch"
 GIT_REV_PARSE_ROUTE: str = "/git/rev-parse"
 
+#: The starting rule's own route (one true copy, item 1, 2026-09-21):
+#: fetch the clone's remote ``origin`` in here and say which commit its
+#: default branch is at. It reads the remote and writes one
+#: remote-tracking ref; it never changes a checked-out branch and never
+#: touches a working folder.
+GIT_REMOTE_START_POINT_ROUTE: str = "/git/remote-start-point"
+
 #: The checks the sidecar knows how to run — the closed list.
 GIT_CHECK_NAMES: tuple[str, ...] = PRE_COMMIT_CHECK_NAMES
 
@@ -2255,7 +2264,8 @@ def process_git_write_tree_request(
 ) -> tuple[int, dict[str, Any]]:
     """Validate and perform a ``/git/prepare-branch-and-write-tree`` payload.
 
-    ``{repo, branch, files, message, checks, expected_head?}`` → on a permitted request a 200
+    ``{repo, branch, files, message, checks, expected_head?, start_commit?}`` →
+    on a permitted request a 200
     carrying ``{status, sha, checks, detail}``: ``status`` is the runner's
     (``success`` with the commit's ``sha``, or ``failed`` with ``detail``
     saying why — a check that refused the commit is a ``failed`` with the
@@ -2277,6 +2287,15 @@ def process_git_write_tree_request(
     expected_head = payload.get("expected_head")
     if expected_head is not None:
         error = _ref_error(expected_head, what="expected_head")
+        if error:
+            return 400, {"error": error}
+    # The named starting point (one true copy, item 1, 2026-09-21): the commit
+    # a BRAND NEW branch is cut from. Shape-checked before git sees it, like
+    # every other ref on these routes; a branch that already exists is
+    # re-attached and never moved onto it.
+    start_commit = payload.get("start_commit")
+    if start_commit is not None:
+        error = _ref_error(start_commit, what="start_commit")
         if error:
             return 400, {"error": error}
     files, error = _validate_files(payload.get("files"))
@@ -2346,6 +2365,9 @@ def process_git_write_tree_request(
                 pre_commit=hook,
                 expected_head=(
                     str(expected_head) if expected_head is not None else None
+                ),
+                start_commit=(
+                    str(start_commit) if start_commit is not None else None
                 ),
             )
         )
@@ -2426,6 +2448,42 @@ def process_git_rev_parse_request(
         return 500, {"error": f"sidecar git error: {type(exc).__name__}: {exc}"}
     sha = result.stdout.strip() if result.returncode == 0 else ""
     return 200, {"sha": sha or None}
+
+
+def process_git_remote_start_point_request(
+    payload: Any, *, config: ForgeConfig
+) -> tuple[int, dict[str, Any]]:
+    """``{repo}`` → ``{branch, commit, refusal}`` — the starting rule's answer.
+
+    Fetches this repository's remote named ``origin`` inside the sandbox and
+    says which branch that remote calls its default and which commit it is at,
+    through the same code the in-container venue runs
+    (:func:`forge.deploy.candidate_tree.fetch_remote_start_point`), so both
+    venues give the same answer and the same sentences.
+
+    A request this route refuses (an unknown repository key, a body that is
+    not an object) is a 4xx with one plain sentence, as every git route here
+    is. A remote that is missing, unreachable or nameless is NOT a 4xx: it is
+    a 200 carrying ``refusal``, because it is an answer about the project
+    rather than a fault in the request. Never raises.
+    """
+    if not isinstance(payload, dict):
+        return 400, {"error": "request body must be a JSON object"}
+    repo_path, error = _resolve_repo_key(payload, config)
+    if error or repo_path is None:
+        return 400, {"error": error}
+    from forge.deploy.candidate_tree import fetch_remote_start_point
+
+    try:
+        answer = _run_coroutine(fetch_remote_start_point(repo_path))
+    except Exception as exc:  # noqa: BLE001 — never raise past the boundary
+        return 500, {"error": f"sidecar git error: {type(exc).__name__}: {exc}"}
+    logger.info(
+        "forge-deploy-sidecar: the starting point for %s is %s",
+        repo_path,
+        f"{answer.branch} at {answer.commit}" if answer.ok else answer.refusal,
+    )
+    return 200, answer.to_wire()
 
 
 # ---------------------------------------------------------------------------
@@ -5155,6 +5213,7 @@ class DeploySidecarHandler(BaseHTTPRequestHandler):
                 GIT_WRITE_TREE_ROUTE,
                 GIT_READ_FILE_ROUTE,
                 GIT_REV_PARSE_ROUTE,
+                GIT_REMOTE_START_POINT_ROUTE,
                 GIT_IS_ANCESTOR_ROUTE,
                 GIT_CANDIDATE_TREE_ROUTE,
                 GIT_CANDIDATE_TREE_REMOVE_ROUTE,
@@ -5208,6 +5267,10 @@ class DeploySidecarHandler(BaseHTTPRequestHandler):
                 )
             elif route == GIT_REV_PARSE_ROUTE:
                 status, body = process_git_rev_parse_request(payload, config=config)
+            elif route == GIT_REMOTE_START_POINT_ROUTE:
+                status, body = process_git_remote_start_point_request(
+                    payload, config=config
+                )
             elif route == GIT_IS_ANCESTOR_ROUTE:
                 status, body = process_git_is_ancestor_request(payload, config=config)
             elif route == GIT_CANDIDATE_TREE_ROUTE:
@@ -5387,6 +5450,7 @@ __all__ = [
     "process_guardkit_merge_request",
     "GIT_WRITE_TREE_ROUTE",
     "GIT_READ_FILE_ROUTE",
+    "GIT_REMOTE_START_POINT_ROUTE",
     "GIT_REV_PARSE_ROUTE",
     "GIT_AUTOBUILD_WORKTREE_INSPECT_ROUTE",
     "GIT_AUTOBUILD_WORKTREE_RETIRE_ROUTE",
@@ -5403,6 +5467,7 @@ __all__ = [
     "process_git_write_tree_request",
     "process_git_read_file_request",
     "process_git_rev_parse_request",
+    "process_git_remote_start_point_request",
     "process_git_autobuild_worktree_inspect_request",
     "process_git_autobuild_worktree_retire_request",
     "GIT_WORKTREE_ADD_ROUTE",

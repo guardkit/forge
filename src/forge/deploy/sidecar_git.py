@@ -16,6 +16,7 @@ over HTTP to that sandbox's deploy sidecar:
 operation                        route
 ===============================  =========================================
 ``rev_parse``                    ``POST /git/rev-parse``
+``fetch_remote_start_point``     ``POST /git/remote-start-point``
 ``is_ancestor``                  ``POST /git/is-ancestor``
 ``ensure_candidate_trees_...``   (none — the lay-out route does it)
 ``materialise_candidate_tree``   ``POST /git/candidate-tree``
@@ -42,7 +43,11 @@ import asyncio
 import logging
 from typing import Any
 
-from forge.deploy.candidate_tree import CandidateTreeError, CandidateTreeLayout
+from forge.deploy.candidate_tree import (
+    CandidateTreeError,
+    CandidateTreeLayout,
+    RemoteStartPoint,
+)
 from forge.planning.sidecar_git_runner import HttpPost, _urllib_post
 
 logger = logging.getLogger(__name__)
@@ -152,6 +157,27 @@ class SidecarCandidateGit:
             return None
         sha = decoded.get("sha")
         return str(sha) if isinstance(sha, str) and sha else None
+
+    async def fetch_remote_start_point(self) -> RemoteStartPoint:
+        """Fetch the sandbox clone's remote ``origin`` and say where its
+        default branch is (one true copy, item 1).
+
+        A sandbox that could not be reached, or that answered anything but a
+        starting point, is itself a refusal in plain words — the caller never
+        has to tell "no answer" from "no remote".
+        """
+        decoded, why = await self._ok(
+            "/git/remote-start-point",
+            {"repo": self._repo},
+            timeout=self._read_timeout_s,
+        )
+        if decoded is None:
+            logger.error("sandbox git: remote start point: %s", why)
+            return RemoteStartPoint(refusal=str(why))
+        answer = RemoteStartPoint.from_wire(decoded)
+        if not answer.ok:
+            logger.warning("sandbox git: remote start point: %s", answer.refusal)
+        return answer
 
     async def is_ancestor(self, ancestor: str, descendant: str) -> bool | None:
         """Is ``ancestor`` in ``descendant``? ``None`` = it could not be said."""

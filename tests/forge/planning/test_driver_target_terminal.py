@@ -163,20 +163,53 @@ class FakeSecondOpinion:
 class RecordingGitRunner:
     """Fake git runner recording tree writes; runs the pre_commit hook."""
 
-    def __init__(self, *, tree_fail: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        tree_fail: bool = False,
+        start_commit: str = "0" * 39 + "1",
+        start_branch: str = "main",
+        start_point_refusal: str | None = None,
+    ) -> None:
         self.single_calls: list[dict[str, Any]] = []
         self.tree_calls: list[dict[str, Any]] = []
         self.tree_fail = tree_fail
+        # The starting rule (one true copy, item 1): what this stand-in
+        # remote answers when the driver asks where the work starts.
+        self.start_point_calls: list[str] = []
+        self.start_commit = start_commit
+        self.start_branch = start_branch
+        self.start_point_refusal = start_point_refusal
         # (branch, file_path) -> content, so the plan leg's read-back of the
         # committed spec triple works against the fake exactly as the real
         # WorktreeGitRunner reads it off the branch.
         self._branch_files: dict[str, dict[str, str]] = {}
 
+    async def fetch_remote_start_point(self, repo_path: str) -> Any:
+        """The starting rule's operation, answered by a stand-in remote."""
+        from forge.deploy.candidate_tree import RemoteStartPoint
+
+        self.start_point_calls.append(repo_path)
+        if self.start_point_refusal is not None:
+            return RemoteStartPoint(refusal=self.start_point_refusal)
+        return RemoteStartPoint(branch=self.start_branch, commit=self.start_commit)
+
     async def prepare_branch_and_write(
-        self, repo_path: str, branch: str, file_path: str, content: str
+        self,
+        repo_path: str,
+        branch: str,
+        file_path: str,
+        content: str,
+        *,
+        start_commit: str | None = None,
     ) -> GitOpResult:
         self.single_calls.append(
-            {"branch": branch, "file_path": file_path, "content": content}
+            {
+                "branch": branch,
+                "file_path": file_path,
+                "content": content,
+                "start_commit": start_commit,
+            }
         )
         self._branch_files.setdefault(branch, {})[file_path] = content
         return GitOpResult(
@@ -199,6 +232,7 @@ class RecordingGitRunner:
         message: str,
         *,
         pre_commit: Any = None,
+        start_commit: str | None = None,
     ) -> GitOpResult:
         # Materialise the files into a temp dir so the pre_commit hook can run
         # against a real on-disk tree, then honour its verdict.
@@ -804,6 +838,80 @@ def _init_scratch_repo(path: Path) -> None:
     (path / "README.md").write_text("scratch\n")
     subprocess.run(["git", "add", "."], cwd=path, check=True, env=env)
     subprocess.run(["git", "commit", "-qm", "init"], cwd=path, check=True, env=env)
+    _give_repo_a_remote(path, env)
+
+
+def _give_repo_a_remote(path: Path, env: dict[str, str]) -> Path:
+    """Give this scratch copy a remote named ``origin``: a bare repository
+    beside it, on disk.
+
+    The starting rule (one true copy, item 1, 2026-09-21) fetches the remote
+    named ``origin`` before any branch is cut, so a copy with no remote is
+    refused. A bare repository on a local path IS a remote as far as git is
+    concerned — a fetch against it is real git — which is what lets every
+    case here be driven without touching anybody's real repository.
+    """
+    bare = path.parent / f"{path.name}.origin.git"
+    subprocess.run(["git", "init", "--bare", "-q", str(bare)], check=True, env=env)
+    branch = subprocess.run(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        cwd=path,
+        check=True,
+        env=env,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "remote", "add", "origin", str(bare)], cwd=path, check=True, env=env
+    )
+    subprocess.run(
+        ["git", "push", "-q", "origin", f"HEAD:refs/heads/{branch}"],
+        cwd=path,
+        check=True,
+        env=env,
+    )
+    # The remote says which branch is its default, exactly as a hosted one does.
+    subprocess.run(
+        ["git", "symbolic-ref", "HEAD", f"refs/heads/{branch}"],
+        cwd=bare,
+        check=True,
+        env=env,
+    )
+    return bare
+
+
+def _publish_to_origin(path: Path) -> None:
+    """Put this copy's current commit on its remote's default branch.
+
+    Anything a test seeds into the copy and expects the planning branch to
+    carry has to be on the REMOTE now, because that is where the work starts
+    from. A copy with no remote is left alone — the tests that have none are
+    testing the refusal.
+    """
+    env = _git_env()
+    named = subprocess.run(
+        ["git", "remote", "get-url", "origin"],
+        cwd=path,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    if named.returncode != 0:
+        return
+    branch = subprocess.run(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        cwd=path,
+        check=True,
+        env=env,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "push", "-q", "-f", "origin", f"HEAD:refs/heads/{branch}"],
+        cwd=path,
+        check=True,
+        env=env,
+    )
 
 
 @pytest.mark.asyncio
@@ -1076,6 +1184,7 @@ def _init_api_test_shaped_repo(path: Path) -> None:
         (d / "__init__.py").write_text("")  # git tracks the dir via a real file
     subprocess.run(["git", "add", "."], cwd=path, check=True, env=env)
     subprocess.run(["git", "commit", "-qm", "init"], cwd=path, check=True, env=env)
+    _give_repo_a_remote(path, env)
 
 
 async def _guardkit_smoke_gate_validate(
@@ -2616,6 +2725,7 @@ def _seed_gate_surface(
         check=True,
         env=env,
     )
+    _publish_to_origin(repo)
 
 
 async def _schema_gate_registry_oracle(
@@ -3260,6 +3370,7 @@ def _seed_leftover_dcl_config(repo: Path) -> None:
         check=True,
         env=env,
     )
+    _publish_to_origin(repo)
 
 
 @pytest.mark.asyncio
@@ -4085,6 +4196,7 @@ def _commit_repo_routing_law(repo: Path, value: str) -> None:
     }
     subprocess.run(["git", "add", "-A"], cwd=repo, check=True, env=env)
     subprocess.run(["git", "commit", "-qm", f"routing_law {value}"], cwd=repo, check=True, env=env)
+    _publish_to_origin(repo)
 
 
 def _plan_result_with_feature_flag(value: str):
@@ -7327,6 +7439,7 @@ def _init_repo_with_a_stats_route(path: Path) -> None:
     )
     subprocess.run(["git", "add", "."], cwd=path, check=True, env=env)
     subprocess.run(["git", "commit", "-qm", "a route"], cwd=path, check=True, env=env)
+    _publish_to_origin(path)
 
 
 @pytest.mark.asyncio

@@ -209,9 +209,21 @@ class RecordingGitRunner:
         self.tree_calls: list[dict[str, Any]] = []
         self._branch_files: dict[str, dict[str, str]] = {}
 
+    async def fetch_remote_start_point(self, repo_path: str) -> Any:
+        from forge.deploy.candidate_tree import RemoteStartPoint
+
+        return RemoteStartPoint(branch="main", commit="0" * 39 + "1")
+
     async def prepare_branch_and_write(
-        self, repo_path: str, branch: str, file_path: str, content: str
+        self,
+        repo_path: str,
+        branch: str,
+        file_path: str,
+        content: str,
+        *,
+        start_commit: str | None = None,
     ) -> GitOpResult:
+        self.start_commit_seen = start_commit
         self._branch_files.setdefault(branch, {})[file_path] = content
         return GitOpResult(
             status="success",

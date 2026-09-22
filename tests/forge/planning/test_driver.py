@@ -101,8 +101,20 @@ class RecordingGitRunner:
         self.calls: list[dict[str, Any]] = []
         self.should_fail = should_fail
 
+    async def fetch_remote_start_point(self, repo_path: str) -> Any:
+        from forge.deploy.candidate_tree import RemoteStartPoint
+
+        self.calls.append({"operation": "fetch_remote_start_point", "repo_path": repo_path})
+        return RemoteStartPoint(branch="main", commit="0" * 39 + "1")
+
     async def prepare_branch_and_write(
-        self, repo_path: str, branch: str, file_path: str, content: str
+        self,
+        repo_path: str,
+        branch: str,
+        file_path: str,
+        content: str,
+        *,
+        start_commit: str | None = None,
     ) -> GitOpResult:
         self.calls.append(
             {
@@ -110,6 +122,7 @@ class RecordingGitRunner:
                 "branch": branch,
                 "file_path": file_path,
                 "content": content,
+                "start_commit": start_commit,
             }
         )
         if self.should_fail:

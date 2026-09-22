@@ -431,6 +431,60 @@ class SqlitePlanningRunStore:
         self._connection.commit()
         return cursor.rowcount > 0
 
+    def record_start_point(
+        self, correlation_id: str, *, start_commit: str, target_branch: str
+    ) -> bool:
+        """Write down where this run's work starts (one true copy, item 1).
+
+        ``start_commit`` is the commit the project's remote had its default
+        branch at when the run started, and ``target_branch`` is that branch's
+        name — looked up once, together, before the first branch is cut, so
+        everything afterwards uses the same two facts.
+
+        The write is status-preserving: it touches these two columns and
+        nothing else, so the state machine stays the only writer of ``state``.
+        Last write wins, which makes a re-drive of the same leg a no-op in
+        value terms. Returns True when a row was updated.
+
+        Raises:
+            ValueError: if either value is blank. A blank reads back exactly
+                like the NULL that means "not recorded", without being it.
+        """
+        if not correlation_id:
+            raise ValueError("record_start_point: correlation_id must be non-empty")
+        if not start_commit or not start_commit.strip():
+            raise ValueError(
+                "record_start_point: start_commit must be a non-blank commit"
+            )
+        if not target_branch or not target_branch.strip():
+            raise ValueError(
+                "record_start_point: target_branch must be a non-blank branch name"
+            )
+        cursor = self._connection.execute(
+            """
+            UPDATE planning_runs
+            SET start_commit = ?, target_branch = ?
+            WHERE correlation_id = ?
+            """,
+            (start_commit.strip(), target_branch.strip(), correlation_id),
+        )
+        self._connection.commit()
+        return cursor.rowcount > 0
+
+    def get_start_point(self, correlation_id: str) -> tuple[str | None, str | None]:
+        """``(start_commit, target_branch)`` for a run, or ``(None, None)``.
+
+        A run recorded before the starting rule existed has neither, and that
+        reads back as NOT RECORDED — never as a guess at where it started.
+        """
+        row = self._get_run(correlation_id)
+        if row is None:
+            return None, None
+        keys = set(row.keys())
+        commit = row["start_commit"] if "start_commit" in keys else None
+        branch = row["target_branch"] if "target_branch" in keys else None
+        return (commit or None), (branch or None)
+
     def update_pending_approval_request_id(
         self, correlation_id: str, request_id: str
     ) -> None:

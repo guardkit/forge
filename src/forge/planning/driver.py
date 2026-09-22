@@ -2158,12 +2158,25 @@ class PlanningRunDriver:
         handoff_path = f"feature_spec_inputs/{correlation_id}.md"
         content = build_feature_spec_input_content(self._run_data(row, correlation_id))
 
+        # THE STARTING RULE (one true copy, item 1, 2026-09-21), and it runs
+        # FIRST: before any branch is cut, the project's remote named
+        # ``origin`` is fetched and asked which branch it calls its default and
+        # which commit that branch is at. The branch is then cut from exactly
+        # that commit, and the commit and the branch name are written down. A
+        # project with no such remote, or a remote that cannot be reached, is
+        # refused here in plain words and nothing is started.
+        start = await self._start_point(correlation_id, target_repo, repo_path)
+        if start is None:
+            return False
+        start_commit, target_branch = start
+
         try:
             result = await deps.git_runner.prepare_branch_and_write(
                 repo_path=repo_path,
                 branch=branch,
                 file_path=handoff_path,
                 content=content,
+                start_commit=start_commit,
             )
         except Exception as exc:  # noqa: BLE001 — write boundary, never crash the run
             return await self._fail_leg(
@@ -2190,6 +2203,8 @@ class PlanningRunDriver:
                     "repo_path": repo_path,
                     "branch": branch,
                     "handoff_path": handoff_path,
+                    "start_commit": start_commit,
+                    "target_branch": target_branch,
                 }
             ),
         )
@@ -2201,11 +2216,101 @@ class PlanningRunDriver:
             )
             return False
         logger.info(
-            "planning driver: run %s entered the target terminal (branch=%s)",
+            "planning driver: run %s entered the target terminal (branch=%s, "
+            "cut from %s, the commit %s had for %s)",
             correlation_id,
             branch,
+            start_commit,
+            target_repo,
+            target_branch,
         )
         return True
+
+    async def _start_point(
+        self, correlation_id: str, target_repo: str, repo_path: str
+    ) -> tuple[str, str] | None:
+        """``(start_commit, target_branch)``, or None after failing the run.
+
+        The starting rule's one call, and the place it is written down (one
+        true copy, item 1, 2026-09-21):
+
+        * a run that ALREADY has a recorded starting point keeps it. The
+          target branch is decided once, at the start, and a re-drive of this
+          leg must not quietly move a run onto a newer commit than the branch
+          it already cut. Nothing is fetched in that case;
+        * otherwise the git runner for this repository is asked to fetch the
+          remote named ``origin`` and say where its default branch is. The
+          answer is recorded on the planning run BEFORE the branch is cut, so
+          a crash between the two leaves a record of where the work was about
+          to start rather than nothing at all;
+        * a refusal — no such remote, unreachable, no default branch — fails
+          the run loudly with the refusal's own sentence, which reaches the
+          owner exactly where every other planning refusal does.
+        """
+        deps = self._deps
+        recorded_commit, recorded_branch = deps.store.get_start_point(correlation_id)
+        if recorded_commit and recorded_branch:
+            logger.info(
+                "planning driver: run %s already started from %s on %s; not "
+                "fetching again",
+                correlation_id,
+                recorded_commit,
+                recorded_branch,
+            )
+            return str(recorded_commit), str(recorded_branch)
+
+        # The SAME runner the branch write uses, so the fetch and the cut
+        # always happen in one place: in the sandbox for a project that has
+        # one, in the coordinator for a project that does not.
+        runner = deps.git_runner
+        fetch = getattr(runner, "fetch_remote_start_point", None)
+        if fetch is None:
+            await self._fail_leg(
+                correlation_id,
+                "target-terminal-enter",
+                (
+                    "the git runner wired for this factory cannot fetch a "
+                    "project's remote, so there is no way to start the work "
+                    "from the commit that remote holds"
+                ),
+            )
+            return None
+        try:
+            answer = await fetch(repo_path)
+        except Exception as exc:  # noqa: BLE001 — boundary, never crash the run
+            await self._fail_leg(
+                correlation_id,
+                "target-terminal-enter",
+                (
+                    f"the project's remote could not be read: "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+            )
+            return None
+        if answer is None or not getattr(answer, "ok", False):
+            reason = str(
+                getattr(answer, "refusal", None)
+                or "the project's remote gave no starting point and no reason"
+            )
+            await self._fail_leg(correlation_id, "target-terminal-enter", reason)
+            return None
+
+        commit = str(answer.commit)
+        remote_branch = str(answer.branch)
+        deps.store.record_start_point(
+            correlation_id,
+            start_commit=commit,
+            target_branch=remote_branch,
+        )
+        logger.info(
+            "planning driver: run %s starts from %s, the commit %s has for "
+            "its default branch %s",
+            correlation_id,
+            commit,
+            target_repo,
+            remote_branch,
+        )
+        return commit, remote_branch
 
     async def _feature_spec_leg(self, row: Any, correlation_id: str) -> bool:
         """FEATURE_SPEC leg: write the spec, show it to a person, then advance.
