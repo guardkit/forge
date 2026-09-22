@@ -107,10 +107,20 @@ class TestNowhereCanProduceTheOldWords:
 
 
 class TestThePressStopsAtChecked:
-    def test_the_switch_is_off_on_every_path_there_is(self) -> None:
+    def test_the_switch_is_off_unless_a_setting_says_on(self) -> None:
+        """No setting, no publication. Nothing looser turns it on."""
         assert publication_is_switched_on() is False
         assert publication_is_switched_on(None) is False
         assert publication_is_switched_on(object()) is False
+
+    def test_a_setting_that_says_on_is_not_permission(self) -> None:
+        """Section G: turning it on runs a check, and the check can refuse.
+
+        A configuration that answers True to everything is exactly the shape
+        that must NOT publish: the three conditions only the real machine can
+        settle have nobody's answer behind them, and an unexamined wall is
+        not a wall.
+        """
 
         class _SaysYes:
             publication = True
@@ -122,10 +132,10 @@ class TestThePressStopsAtChecked:
         assert publication_is_switched_on(_SaysYes()) is False
 
     def test_it_says_why_in_plain_words(self) -> None:
-        assert "publisher has not been built" in why_publication_is_off()
+        assert "no setting turns publication on" in why_publication_is_off()
         assert "nothing was sent to the remote" in PUBLICATION_IS_OFF_SENTENCE
 
-    def test_the_press_defines_all_three_names_and_only_one_is_reachable(
+    def test_the_press_defines_all_three_names_and_two_are_reachable(
         self,
     ) -> None:
         assert merge_executor.RESULT_WORD_PUBLICATION_PENDING == "publication-pending"
@@ -137,9 +147,10 @@ class TestThePressStopsAtChecked:
             merge_executor.RESULT_WORD_MERGED_AND_RUNNING
             == "merged-into-the-remote-and-running"
         )
-        # The two later words appear in the press's own source ONLY as these
-        # definitions and the places that compare against them — never as
-        # something a code path hands out.
+        # THE THIRD IS STILL UNREACHABLE. The publisher stage makes the second
+        # one reachable — a commit really is on the remote's branch, read
+        # back — and stops there. "Merged into the remote and running" needs
+        # a deploy, and the deploy is the stage after this one.
         source = Path(merge_executor.__file__).read_text(encoding="utf-8")
         produced = [
             line
@@ -148,18 +159,35 @@ class TestThePressStopsAtChecked:
         ]
         assert produced
         for line in produced:
-            assert "PUBLICATION_PENDING" in line, line
+            assert (
+                "PUBLICATION_PENDING" in line
+                or "PUBLISHED_DEPLOYMENT_PENDING" in line
+            ), line
+        assert not any("MERGED_AND_RUNNING" in line for line in produced)
 
-    def test_everything_past_the_switch_is_unreachable(self) -> None:
-        """The one path beyond the switch refuses rather than guesses.
+    def test_nothing_in_the_press_deploys_anything(self) -> None:
+        """The deploy is the next stage, and the press cannot reach it.
 
-        If somebody switches publication on before the publisher exists, the
-        press must not quietly do something else — it must stop and say the
-        publisher is not there.
+        The press drives the deploy stage through one seam, ``_dispatch``,
+        and the only legs it asks for are the candidate check and the tear
+        down that follows it. The promote leg — the one that would put
+        something live — is named nowhere the press can run it.
         """
         source = Path(merge_executor.__file__).read_text(encoding="utf-8")
-        assert "raise NotImplementedError(" in source
-        assert "the publisher has not been built" in source
+        dispatches = [
+            line.strip()
+            for line in source.splitlines()
+            if "_dispatch(" in line and "async def _dispatch" not in line
+        ]
+        assert dispatches
+        for line in dispatches:
+            assert "promote" not in line, line
+
+    def test_the_press_says_plainly_that_nothing_was_deployed(self) -> None:
+        """The sentence a person reads never implies a deploy that did not run."""
+        source = Path(merge_executor.__file__).read_text(encoding="utf-8")
+        assert "Nothing has been deployed" in source
+        assert "the deploy is its own stage" in source
 
 
 #: The merge word's own modules. Central orchestration: they know that there
@@ -170,7 +198,17 @@ _CENTRAL = (
     "pipeline/publication_record.py",
     "pipeline/merge_join.py",
     "pipeline/publication_switch.py",
+    "pipeline/publication_activation.py",
+    "pipeline/publisher_client.py",
     "cli/merge_deploy.py",
+    # The publisher is the one thing that talks to a remote, so it is the
+    # one most likely to name whoever is hosting it. It knows two git
+    # addresses it was told and the word "origin", and nothing else.
+    "publisher/service.py",
+    "publisher/git_work.py",
+    "publisher/settings.py",
+    "publisher/credential.py",
+    "publisher/the_record.py",
 )
 
 #: Names of hosting providers. A project's own settings may say whatever they
@@ -213,7 +251,8 @@ class TestTheVocabularyNamesNoHostingProvider:
             merge_executor.RESULT_WORD_MERGED_AND_RUNNING
             == "merged-into-the-remote-and-running"
         )
-        # And they are STILL unreachable, which the rename must not change.
+        # And the third is STILL unreachable, which neither the rename nor
+        # the publisher stage changes: it needs a deploy.
         source = Path(merge_executor.__file__).read_text(encoding="utf-8")
         produced = [
             line
@@ -221,8 +260,7 @@ class TestTheVocabularyNamesNoHostingProvider:
             if "result=RESULT_WORD_" in line.replace(" ", "")
         ]
         assert produced
-        for line in produced:
-            assert "PUBLICATION_PENDING" in line, line
+        assert not any("MERGED_AND_RUNNING" in line for line in produced)
 
 
 @pytest.mark.parametrize("word", FORBIDDEN)
