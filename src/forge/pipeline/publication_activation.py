@@ -16,11 +16,12 @@ not assertions: each is asked of what is true, and each answers **yes**, **no**
 or **it cannot be told from here** — and the third is a refusal, because a
 wall nobody has looked at is not a wall.
 
-The sixth was added on 22 September 2026, with the way "no sandbox can reach
-the publisher" is actually made true. The publisher listens on every address
-inside its own container and publishes no port; what can reach it is
-therefore exactly what is on its network, so the network is counted, and the
-answer publication needs is "the coordinator, and nothing else".
+The new one — fifth in the order they are asked — was added on 22 September
+2026, with the way "no sandbox can reach the publisher" is actually made
+true. The publisher listens on every address inside its own container and
+publishes no port; what can reach it is therefore exactly what is on its
+network, so the network is counted, and the answer publication needs is "the
+coordinator, and nothing else".
 
 WHICH ONES CAN BE PROVEN ON THIS MACHINE, AND WHICH ONLY AT ROLLOUT. This is
 the honest split, and it is written here rather than left to be discovered:
