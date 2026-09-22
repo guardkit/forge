@@ -430,7 +430,20 @@ def _join_lines(lines: Sequence[str]) -> str:
 
 
 def _run_guardkit_init(repo: Path, template: str) -> subprocess.CompletedProcess[str]:
-    """Shell out to ``guardkit init <template>`` from the repository."""
+    """Shell out to ``guardkit init <template>`` from the repository.
+
+    WHY THIS ONE IS NOT CUT DOWN to the short named list of 2026-09-21 (item 1,
+    second revision, section D; :mod:`forge.launch_environment`), when the
+    launches of the build system on the coordinator's side were. That list is
+    what an UNATTENDED build is given: it exists so a build cannot reach
+    whatever the long-running runner happened to be holding, which no person
+    ever looked at. This command is the opposite — somebody at a terminal
+    registering a repository, once, by hand, inheriting their own shell, which
+    they can see. It starts no build, reads and writes no memory, and writes
+    only into the repository in front of them. Handing it a list assembled for
+    a build would drop the settings their shell uses to find and run the build
+    system, and would buy nothing.
+    """
     return subprocess.run(  # noqa: S603 — fixed argv, no shell
         ["guardkit", "init", template],
         cwd=str(repo),

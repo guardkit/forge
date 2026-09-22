@@ -1282,6 +1282,32 @@ def run_merge_command(
     the allowlisted, non-secret values the profile itself declares. ``None``
     (every caller before the live gate) inherits the environment exactly as
     before.
+
+    WHY THIS ONE STILL INHERITS, when the three launches of the build system on
+    the coordinator's side were cut down to the short named list of 2026-09-21
+    (item 1, second revision, section D; :mod:`forge.launch_environment`). One
+    of the commands this runs IS the build system (``guardkit autobuild
+    merge``), so the question is a fair one and the answer is that the cut has
+    already been made, one layer out:
+
+    * this function runs inside the repository's sandbox, and the sandbox's own
+      start script (``deploy/sandbox-runner.sh``) is what builds the
+      environment this service is holding. It exports the same named settings
+      the list names, and it unsets the coordinator's ledger path before it
+      starts anything. Inheriting here inherits that, not an operator's shell;
+    * and it is not only the build system that comes through here. The same
+      runner runs the project's OWN declared check command and its own deploy
+      script, whatever those are — the factory does not know and must not
+      guess. A list written for launching the build system would be the wrong
+      list for a project's own script, and cutting one down to it would break
+      projects for a gain already had at the sandbox boundary;
+    * two of this service's own settings are on purpose NOT on that list
+      (``FORGE_SIDECAR_IN_SANDBOX`` tells this service which script it may
+      run), so applying it here would take away the thing that makes this
+      service safe.
+
+    If this ever runs outside a sandbox, that reasoning lapses and this call
+    needs the list.
     """
     env = (os.environ | extra_env) if extra_env else None
     try:

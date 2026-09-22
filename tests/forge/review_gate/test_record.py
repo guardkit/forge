@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import shutil
+import subprocess
 
 import pytest
 import yaml
 
+from forge.launch_environment import launch_setting_names
 from forge.review_gate.assembler import assemble_review_findings
 from forge.review_gate.models import RawFinding, RefuterVote, ReviewSubject
 from forge.review_gate.record import (
@@ -123,6 +125,42 @@ class TestValidateSeam:
 
     def test_kind_is_review_findings(self):
         assert F14_KIND == "review-findings"
+
+    def test_the_validator_is_launched_with_the_named_list(self, tmp_path, monkeypatch):
+        """This spawn passed no ``env=`` at all, and an omitted ``env=``
+        inherits the whole environment of the process that made it — here the
+        coordinator's own, an operator's shell and all. It takes the one
+        written-down list now (the design pass of 2026-09-21, item 1, second
+        revision, section D).
+
+        Nothing is started: the spawn itself is replaced.
+        """
+        ref = write_review_findings(_record(), root=tmp_path)
+        monkeypatch.setattr(
+            "forge.review_gate.record._resolve_guardkit", lambda: "/opt/bin/guardkit"
+        )
+        monkeypatch.setenv("PATH", "/opt/venv/bin:/usr/bin")
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("GH_TOKEN", "a-credential-nobody-should-see")
+        monkeypatch.setenv("FORGE_DB_PATH", str(tmp_path / "forge.db"))
+        seen: dict = {}
+
+        def _fake_run(argv, **kwargs):
+            seen["argv"] = argv
+            seen["env"] = kwargs.get("env")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        monkeypatch.setattr("forge.review_gate.record.subprocess.run", _fake_run)
+
+        result = validate_review_findings(ref)
+
+        assert result.ok
+        env = seen["env"]
+        assert env is not None, "an omitted env= is the whole environment"
+        assert set(env) <= set(launch_setting_names())
+        assert env["PATH"] == "/opt/venv/bin:/usr/bin"
+        assert "GH_TOKEN" not in env
+        assert "FORGE_DB_PATH" not in env
 
     @pytest.mark.skipif(
         shutil.which("guardkit") is None and shutil.which("guardkit-py") is None,

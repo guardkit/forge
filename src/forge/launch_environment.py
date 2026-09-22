@@ -17,7 +17,22 @@ these settings and nothing else:
 * the start script every repository's sandbox runs —
   ``forge``'s ``src/forge/cli/deploy_templates/sandbox-runner.sh``, shipped
   into each repository as ``deploy/sandbox-runner.sh``, whose own "SETTINGS"
-  and "load-bearing settings" sections name the same ones again.
+  and "load-bearing settings" sections name the same ones again;
+* the runner's other drop-ins on this machine, each of which is an operator
+  switch somebody turned on by hand and whose own comment says the file is the
+  whole switch. Those are on the list too — see "the switches the owner turned
+  on" below, and the fault that put them there.
+
+STILL TO BE ENUMERATED, and named here rather than quietly assumed: the
+installed runner carries a third drop-in, ``…service.d/litellm.conf``
+(1 September 2026), whose only line is an ``EnvironmentFile=`` pointing at a
+secrets file. The list above was built from the repository's own captured unit
+and the sandbox start script, neither of which carries that line, so whatever
+NAMES that file supplies to the runner have not been read off. Nobody here
+opened it — it is a secrets file, and reading one to write a list is not a
+trade worth making. Before this list is relied on in anger somebody with the
+right to open it should enumerate its NAMES (never its values) and either add
+them with their reasons or say here why they stop at the runner.
 
 WHAT IS NOT ON THE LIST IS NOT PASSED. Not a credential the operator's shell
 happens to be carrying, not an agent socket, not a cloud token, not the
@@ -146,6 +161,37 @@ LAUNCH_SETTINGS: tuple[tuple[str, str], ...] = (
         "GUARDKIT_AUTOBUILD_TASK_TIMEOUT_FLOOR",
         "the build system's per-task timeout floor, mirrored by the same "
         "supervision for the same reason",
+    ),
+    # --- the switches the owner turned on ----------------------------------
+    # These three are a class of their own, and the reason they are named here
+    # is a fault this list caused on the day it was written. Each one is a
+    # check the build system ships with turned OFF; an operator turns it on by
+    # dropping a file beside the runner's unit that sets it, and that file is
+    # the WHOLE switch. Before this list existed they reached a build because
+    # the launch was a copy of everything — which is exactly what the drop-in's
+    # own comment says its ``Environment=`` lines are for. A named list that
+    # leaves them out turns them off again silently: no error, no log line, the
+    # drop-in still sitting there looking switched on. So a switch an owner
+    # turned on travels, and if one is ever to stop travelling it moves to the
+    # list below with the sentence that says why.
+    (
+        "GUARDKIT_ARCH_CONFORMANCE_BLOCKING",
+        "Rich turned this on, 31 August 2026: a rule the project itself "
+        "declares, broken by freshly written code, is sent back to whatever "
+        "wrote it as a fix-this on its next turn instead of being filed as a "
+        "note. Unset, the build system adds no such rule at all",
+    ),
+    (
+        "GUARDKIT_ZERO_TEST_BLOCKING",
+        "the same shape of switch for work that arrives with no check of its "
+        "own: on, that stops the work; off, it is recorded. Not set on this "
+        "machine today, and it travels for the same reason the one above does",
+    ),
+    (
+        "GUARDKIT_BOOT_SMOKE_BLOCKING",
+        "the same shape of switch for the project's own does-it-start check. "
+        "Also unset today, and named here so turning it on is one file and "
+        "not a hunt through this list",
     ),
     # --- the memory --------------------------------------------------------
     (
