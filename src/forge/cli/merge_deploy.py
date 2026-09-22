@@ -40,14 +40,24 @@ is not the feature's own.
 Exit codes: 0 = the joined result was checked (PASSED); 1 = any other outcome
 (the line printed says plainly which step failed and why).
 
-WHAT "PASSED" MEANS IN THIS VERSION (22 September 2026, the merge word's
-join). The press fetches the branch of the remote this work was recorded
-against, joins the build onto the commit that branch is at, in a working
-folder of its own, and runs both kinds of check on the joined result. It then
-stops: the publisher has not been built, so nothing is sent to the remote and
-nothing is deployed. The result word is ``publication-pending`` and the
-sentence says "checked and ready to publish; publication is not switched on".
-It never says "merged and running".
+WHAT "PASSED" MEANS IN THIS VERSION (22 September 2026, the merge word's join
+and the publisher). The press fetches the branch of the remote this work was
+recorded against, joins the build onto the commit that branch is at, in a
+working folder of its own, and runs both kinds of check on the joined result.
+Then one of two things:
+
+* **publication switched off** — the default, and what every forge does until
+  the five conditions of the design's section G hold. Nothing is sent to the
+  remote and nothing is deployed. The result word is ``publication-pending``
+  and the sentence says why publication is off;
+* **publication switched on** — the publisher, a separate process holding the
+  one credential that can write to a remote, is asked to send the joined
+  commit to the recorded target branch. Read back and confirmed, the result
+  word is ``published-deployment-pending`` and the sentence says the branch
+  now contains the joined commit and that NOTHING has been deployed, because
+  the deploy is the stage after this one.
+
+It never says "merged and running", and it never deploys anything.
 """
 
 from __future__ import annotations

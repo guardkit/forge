@@ -1549,6 +1549,101 @@ class MergeExecutorConfig(BaseModel):
     )
 
 
+class PublicationConfig(BaseModel):
+    """Whether the merge word may send the joined commit to the remote.
+
+    One-true-copy design pass, item 1: the second revision's section D and
+    the third revision's section G. Publication is OFF by default, so a forge
+    that says nothing about it behaves exactly as it does today: the merge
+    word joins onto the remote's recorded branch, runs both kinds of check on
+    the joined result, and stops at "publication pending".
+
+    ``enabled`` alone is not permission. Turning it on runs the activation
+    check (:mod:`forge.pipeline.publication_activation`), which refuses in
+    plain words unless all five of section G's conditions hold, and which is
+    asked again on every press and at every coordinator start. Nothing here
+    holds a credential: the one credential that can write to a remote belongs
+    to the publisher's own process, and ``publisher_credential_file`` below
+    records only the PATH of the file it is in, so that the check can prove
+    that path is named in no other settings.
+
+    **Deploy-order law** (as :class:`ConductorConfig` and
+    :class:`MergeExecutorConfig`): this model is ``extra="forbid"``, so
+    writing a ``publication:`` section into a deployed ``forge.yaml`` before
+    the image that defines the field is running refuses the WHOLE config at
+    load. Merge and redeploy first, then add the section. This stage writes
+    no yaml key anywhere.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = Field(
+        default=False,
+        description=(
+            "Master switch for publication. False (the default) = the merge "
+            "word joins, checks and stops at 'publication pending'; nothing "
+            "is sent to any remote. True = the merge word asks the publisher "
+            "to send the joined commit, IF the activation check's five "
+            "conditions all hold; it stays off, with the reason said in plain "
+            "words, if any one of them does not."
+        ),
+    )
+    publisher_url: str | None = Field(
+        default=None,
+        description=(
+            "Where the publisher listens, on loopback (for example "
+            "http://127.0.0.1:8711). The coordinator asks it to send and "
+            "reads its answer; no credential travels this way in either "
+            "direction. None means the coordinator cannot reach a publisher, "
+            "and every merge word says so rather than guessing."
+        ),
+    )
+    request_timeout_seconds: int = Field(
+        default=300,
+        ge=1,
+        description=(
+            "How long the coordinator waits for the publisher's answer. A "
+            "send that has not answered by then is 'publication pending' with "
+            "that reason — and the next press reads the remote FIRST, so a "
+            "lost answer never becomes a second send."
+        ),
+    )
+    send_attempts: int = Field(
+        default=3,
+        ge=1,
+        le=10,
+        description=(
+            "How many times one merge word may join and send before it stops "
+            "and says 'publication pending'. A new attempt happens only when "
+            "the remote moved under the send: a new commit is fetched, a new "
+            "join is made on a name of its own, and BOTH kinds of check run "
+            "again on the new joined result. Three by the design."
+        ),
+    )
+    builds_may_run_inside_the_coordinator: bool = Field(
+        default=True,
+        description=(
+            "True (the default, and what every forge does today) = the "
+            "coordinator may start builds and project checks inside itself, "
+            "for a project that has no sandbox. A build that runs in there "
+            "can write the ledger, which is the record the publisher trusts, "
+            "so the activation check REFUSES publication while this is true. "
+            "Set it to False — and give every project a sandbox of its own — "
+            "before publication is switched on."
+        ),
+    )
+    publisher_credential_file: str | None = Field(
+        default=None,
+        description=(
+            "The PATH of the one file the publisher's credential is in. Not "
+            "the credential: the coordinator never holds one. The activation "
+            "check needs the path so that it can prove that path is named "
+            "nowhere else in the coordinator's settings, the runner's launch "
+            "list or any sandbox's settings."
+        ),
+    )
+
+
 class ForgeConfig(BaseModel):
     """Root model for ``forge.yaml``.
 
@@ -1622,6 +1717,15 @@ class ForgeConfig(BaseModel):
             "response is consumed; today's behaviour byte-for-byte."
         ),
     )
+    publication: PublicationConfig = Field(
+        default_factory=PublicationConfig,
+        description=(
+            "Whether the merge word may send the joined commit to the project's "
+            "remote (one-true-copy design pass, item 1). Defaults to "
+            "enabled=False — with it off the merge word joins, checks and "
+            "stops at 'publication pending', which is today's behaviour."
+        ),
+    )
     resource_preflight: ResourcePreflightConfig = Field(
         default_factory=ResourcePreflightConfig,
         description=(
@@ -1680,6 +1784,7 @@ __all__ = [
     "PipelineConfig",
     "PlanningConfig",
     "PlanningModelResolution",
+    "PublicationConfig",
     "QueueConfig",
     "ResourcePreflightConfig",
     "ReviewGateConfig",
