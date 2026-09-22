@@ -54,6 +54,7 @@ __all__ = [
     "integration_branch",
     "working_folder_leaf",
     "working_folder_path",
+    "look_at_a_join",
     "look_at_the_leftover_join",
     "make_the_working_folder",
     "target_branch_now",
@@ -279,6 +280,70 @@ class LeftoverJoin:
         return self.exists and not self.is_the_join
 
 
+async def look_at_a_join(
+    git: CandidateGit,
+    *,
+    ref: str,
+    g_commit: str,
+    build_tip: str,
+    named: str | None = None,
+) -> LeftoverJoin:
+    """Is ``ref`` a merge of exactly G and the build's tip, AS THEY ARE NOW?
+
+    ``ref`` is anything the venue can resolve — a branch name or a commit
+    written down earlier. ``named`` is what the sentences call it, for a
+    caller that wants the branch's name rather than a forty-character commit
+    in the reason it prints.
+
+    Asked with the venue's ordinary "what commit is this" operation and no
+    other: ``<ref>^1`` and ``<ref>^2`` are the two parents a merge commit has,
+    and ``<ref>^3`` answering anything at all means it is not the two-parent
+    commit the merge makes.
+
+    THE TWO COMMITS PASSED IN ARE THE ONES THAT MATTER NOW, never the ones an
+    earlier press wrote down. A join made onto an older tip of the build is
+    not this press's join: its tree has none of the work the build gained
+    since, so reusing it would check one tree and publish another.
+    """
+    shown = str(named or ref)
+    head = await git.rev_parse(str(ref))
+    if not head:
+        return LeftoverJoin(exists=False, why=f"{shown} does not exist")
+    first = await git.rev_parse(f"{ref}^1")
+    second = await git.rev_parse(f"{ref}^2")
+    third = await git.rev_parse(f"{ref}^3")
+    parents = (first, second, third)
+    if third:
+        return LeftoverJoin(
+            exists=True,
+            commit=head,
+            parents=parents,
+            why=f"{shown} has more than two parents, so it is not the join",
+        )
+    if not second:
+        return LeftoverJoin(
+            exists=True,
+            commit=head,
+            parents=parents,
+            why=(
+                f"{shown} is not a merge commit — the join had not been made "
+                f"when the run stopped"
+            ),
+        )
+    if first != str(g_commit) or second != str(build_tip):
+        return LeftoverJoin(
+            exists=True,
+            commit=head,
+            parents=parents,
+            why=(
+                f"{shown} is a merge of {str(first)[:10]} and "
+                f"{str(second)[:10]}, not of {str(g_commit)[:10]} and "
+                f"{str(build_tip)[:10]}"
+            ),
+        )
+    return LeftoverJoin(exists=True, is_the_join=True, commit=head, parents=parents)
+
+
 async def look_at_the_leftover_join(
     git: CandidateGit,
     *,
@@ -289,48 +354,15 @@ async def look_at_the_leftover_join(
 ) -> LeftoverJoin:
     """Does this attempt's branch exist, and is it a merge of exactly G and the tip?
 
-    Asked with the venue's ordinary "what commit is this" operation and no
-    other: ``<branch>^1`` and ``<branch>^2`` are the two parents a merge
-    commit has, and ``<branch>^3`` answering anything at all means it is not
-    the two-parent commit the merge makes.
+    The same question as :func:`look_at_a_join`, asked of the branch this
+    attempt's join was made on. The two commits given are the ones the press
+    holds NOW — where the remote's recorded branch is at this moment, and what
+    the build's branch is at this moment.
     """
     branch = integration_branch(feature_id, attempt)
-    head = await git.rev_parse(branch)
-    if not head:
-        return LeftoverJoin(exists=False, why=f"{branch} does not exist")
-    first = await git.rev_parse(f"{branch}^1")
-    second = await git.rev_parse(f"{branch}^2")
-    third = await git.rev_parse(f"{branch}^3")
-    parents = (first, second, third)
-    if third:
-        return LeftoverJoin(
-            exists=True,
-            commit=head,
-            parents=parents,
-            why=f"{branch} has more than two parents, so it is not the join",
-        )
-    if not second:
-        return LeftoverJoin(
-            exists=True,
-            commit=head,
-            parents=parents,
-            why=(
-                f"{branch} is not a merge commit — the join had not been made "
-                f"when the run stopped"
-            ),
-        )
-    if first != str(g_commit) or second != str(build_tip):
-        return LeftoverJoin(
-            exists=True,
-            commit=head,
-            parents=parents,
-            why=(
-                f"{branch} is a merge of {str(first)[:10]} and "
-                f"{str(second)[:10]}, not of {str(g_commit)[:10]} and "
-                f"{str(build_tip)[:10]}"
-            ),
-        )
-    return LeftoverJoin(exists=True, is_the_join=True, commit=head, parents=parents)
+    return await look_at_a_join(
+        git, ref=branch, g_commit=g_commit, build_tip=build_tip, named=branch
+    )
 
 
 def join_inputs(
@@ -346,8 +378,17 @@ def join_inputs(
     """The exact inputs of one join attempt, for the record's "about to" line.
 
     Exact on purpose: a pick-up asks the world about THIS attempt, and it can
-    only do that if the line says which branch, which commit and which folder
-    the attempt used.
+    only do that if the line says which branch and which commits the attempt
+    used.
+
+    ``working_folder_expected`` is named for what it is. The "about to" line
+    is written BEFORE the folder is made, which is the whole point of it, so
+    the only path it can carry is the one the coordinator works out for its
+    own side — and for a repository that lives in a sandbox that is not the
+    path the folder really has in there. The venue's own answer goes on the
+    "done" line as ``working_folder``. The field was called ``working_folder``
+    on both lines until 22 September 2026, which read as though the two were
+    the same fact.
     """
     return {
         "feature_id": str(feature_id),
@@ -357,5 +398,5 @@ def join_inputs(
         "build_tip": str(build_tip),
         "branch_merged": str(branch_to_merge),
         "integration_branch": integration_branch(feature_id, attempt),
-        "working_folder": str(folder),
+        "working_folder_expected": str(folder),
     }

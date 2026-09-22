@@ -280,6 +280,79 @@ class TestHappyPath:
         assert result.exit_code == 0, result.output
         assert f"merge-{BUILD_ID}/" in result.output
 
+    def test_a_project_whose_recorded_branch_is_not_main_can_be_pressed(
+        self, config, pool, fakes, repo_root: Path, _receipts_env: Path
+    ) -> None:
+        """The one plain pick-up command, for a project that has no "main".
+
+        It used to read a branch literally named ``main`` for its pin and
+        refuse when there was none, so a project whose recorded branch is
+        "trunk" — or a release line, or anything else — could not be pressed
+        by this command at all. The recorded name is now what is read.
+        """
+        # The remote and the copy know only "trunk". There is no "main"
+        # anywhere: the old code would have refused before the press ran.
+        _git(repo_root, "branch", "-m", "main", "trunk")
+        bare = _git(repo_root, "remote", "get-url", "origin")
+        _git(repo_root, "push", "-q", "origin", "trunk")
+        subprocess.run(
+            ["git", "-C", bare, "symbolic-ref", "HEAD", "refs/heads/trunk"],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-C", bare, "branch", "-D", "main"], check=True, capture_output=True
+        )
+        assert _git(repo_root, "branch", "--list", "main") == ""
+        assert (
+            subprocess.run(
+                ["git", "-C", bare, "branch", "--list", "main"],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip()
+            == ""
+        )
+
+        _insert_build(pool)
+        pool.connection.execute(
+            "UPDATE builds SET target_branch = 'trunk' WHERE build_id = ?",
+            (BUILD_ID,),
+        )
+        pool.connection.commit()
+
+        result = CliRunner().invoke(merge_deploy_cmd, [FEATURE_ID], obj=config)
+
+        assert result.exit_code == 0, result.output
+        assert "result=publication-pending" in result.output
+        assert "joined onto trunk" in result.output
+        # The pin it computed is the RECORDED branch's commit, and it rode
+        # into the press's own receipt rather than deciding anything.
+        args = fakes["gk_calls"][0]["args"]
+        assert args[args.index("--target") + 1] == f"factory-integration/{FEATURE_ID}"
+        receipt = json.loads(
+            (
+                _receipts_env / f"merge-{BUILD_ID}" / "merge_deploy_merge.json"
+            ).read_text(encoding="utf-8")
+        )
+        assert receipt["target_branch"] == "trunk"
+
+    def test_a_build_with_no_recorded_branch_is_not_refused_by_the_command(
+        self, config, pool, fakes
+    ) -> None:
+        """The press says it, and says it better than this command could."""
+        _insert_build(pool)
+        pool.connection.execute(
+            "UPDATE builds SET target_branch = NULL WHERE build_id = ?", (BUILD_ID,)
+        )
+        pool.connection.commit()
+
+        result = CliRunner().invoke(merge_deploy_cmd, [FEATURE_ID], obj=config)
+
+        assert result.exit_code == 1, result.output
+        assert "refusing an unpinned merge" not in result.output
+        assert "no target branch on its record" in result.output
+
     def test_dry_run_threads_through(self, config, pool, fakes) -> None:
         _insert_build(pool)
         result = CliRunner().invoke(

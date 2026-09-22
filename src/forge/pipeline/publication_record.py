@@ -109,7 +109,15 @@ RESULT_PUBLISHED_DEPLOYMENT_PENDING: str = "published, deployment pending"
 
 #: The remote has the joined commit, and what was checked is deployed. NOT
 #: reachable in this version.
-RESULT_MERGED_AND_RUNNING: str = "merged into GitHub and running"
+#:
+#: IT NAMES NO HOSTING PROVIDER. It used to read "merged into GitHub and
+#: running", which was the design's own wording and wrong for central
+#: orchestration: the factory knows only "the remote named origin", and a
+#: project whose remote is somewhere else would have been told, in the
+#: factory's own vocabulary, that it was merged into a service it has never
+#: heard of. Renamed 22 September 2026 with its sibling in the press
+#: (``RESULT_WORD_MERGED_AND_RUNNING``). Still unreachable, and pinned so.
+RESULT_MERGED_AND_RUNNING: str = "merged into the remote and running"
 
 #: The three, in the order a build passes through them.
 PUBLICATION_RESULTS: tuple[str, ...] = (

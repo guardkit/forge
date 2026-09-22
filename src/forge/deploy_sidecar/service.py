@@ -890,6 +890,8 @@ def process_live_gate_run(
     profile: DeployProfile,
     extra_env: dict[str, str],
     command_runner: MergeRunner,
+    memory_project: str | None = None,
+    launch_settings: Sequence[str] | None = None,
 ) -> tuple[int, dict[str, Any]]:
     """``/run`` carrying the repository's own live-gate driver (rule 85).
 
@@ -903,6 +905,15 @@ def process_live_gate_run(
     The answer carries ``stdout`` whole (up to the merge route's cap) rather
     than a combined tail, because the driver prints its results envelope
     there and the caller reads the verdict out of it.
+
+    WHAT THE DRIVER IS LAUNCHED WITH (threaded 22 September 2026). This route
+    called the filtered runner with neither the memory name nor the project's
+    declared setting names, so a project's own declarations were stripped on
+    the way through: a driver that needs a toolchain setting the project
+    declared did not get it, and a driver that launches the build system got
+    memory OFF. Both now come off the request, which the coordinator fills
+    from the ledger for the build the check belongs to. A request that
+    carries neither is exactly what it was.
     """
     spec = profile.live_gate
     if spec is None:
@@ -967,6 +978,8 @@ def process_live_gate_run(
             timeout=timeout,
             what="the live-gate driver",
             extra_env=extra_env or None,
+            memory_project=memory_project,
+            launch_settings=launch_settings,
         )
     except Exception as exc:  # noqa: BLE001 — never raise past the boundary
         return 500, {
@@ -990,6 +1003,8 @@ def process_declared_test_run(
     *,
     repo_path: Path,
     command_runner: MergeRunner,
+    memory_project: str | None = None,
+    launch_settings: Sequence[str] | None = None,
 ) -> tuple[int, dict[str, Any]]:
     """``/run`` carrying the repository's own declared test command (rule 88).
 
@@ -1006,6 +1021,15 @@ def process_declared_test_run(
     so it is handed to ``/bin/sh -c`` — the same shape the in-container reader
     uses. What may reach that shell is the repository's own checked-in text
     and nothing a caller composed.
+
+    WHAT THE COMMAND IS LAUNCHED WITH (threaded 22 September 2026). This route
+    called the filtered runner with neither the memory name nor the project's
+    declared setting names, so a project's own declarations were stripped on
+    the way through — the command that most needs them, since it is the
+    project's own test command, got the factory's list alone. Both now come
+    off the request, which the coordinator fills from the ledger for the build
+    whose gates are being read. A request that carries neither is exactly what
+    it was.
     """
     error = _worktree_path_error(repo_path, payload.get("cwd"), what="cwd")
     if error:
@@ -1051,6 +1075,8 @@ def process_declared_test_run(
             cwd=cwd,
             timeout=timeout,
             what="the declared test command",
+            memory_project=memory_project,
+            launch_settings=launch_settings,
         )
     except Exception as exc:  # noqa: BLE001 — never raise past the boundary
         return 500, {
@@ -1107,6 +1133,17 @@ def process_run_request(
     Left as ``None`` it is read from the bootstrap's own environment value
     (:func:`sidecar_is_inside_sandbox`), which is how the running service
     answers it; a caller passes it only in tests.
+
+    ``memory_project`` and ``launch_settings`` on the body are checked here
+    once and handed to BOTH of those routes (22 September 2026): they launch
+    the project's own program, and until this they were launching it with the
+    project's own declarations stripped. The vetted-script path below does
+    NOT use them, and that is not an oversight: it runs the project's deploy
+    script through ``_run_script_step``, which still hands the child
+    everything this process holds. Closing that is the executor stage's, which
+    owns the deploy path; until then the deploy script is the one command from
+    this helper that is not filtered, and saying so here is better than
+    letting a reader assume otherwise.
     """
     if not isinstance(payload, dict):
         return 400, {"error": "request body must be a JSON object"}
@@ -1139,6 +1176,16 @@ def process_run_request(
         sidecar_is_inside_sandbox() if inside_sandbox is None else bool(inside_sandbox)
     )
 
+    # WHAT THE PROJECT DECLARED, AND WHICH MEMORY THE WORK BELONGS TO. Both
+    # are the coordinator's own facts off the ledger, and both are checked
+    # here for the same reason every other field is: this service starts
+    # processes, and a request is input. They are read once, before either of
+    # the two routes below, because both of them launch the project's own
+    # program and both were stripping these until 22 September 2026.
+    launch_memory, launch_names, launch_error = _launch_fields(payload)
+    if launch_error is not None:
+        return 400, {"error": launch_error}
+
     # SANDBOX FIRST (rule 88) — the merge-ready gates reader's declared test
     # command. It is answered BEFORE the deploy profile is read, because a
     # repository can have a fix journey without being deployable at all: what
@@ -1151,6 +1198,8 @@ def process_run_request(
             payload,
             repo_path=repo_path,
             command_runner=command_runner or run_merge_command,
+            memory_project=launch_memory,
+            launch_settings=launch_names,
         )
 
     # LAW 2 (part a) — re-read the target's profile ourselves.
@@ -1177,6 +1226,8 @@ def process_run_request(
             profile=profile,
             extra_env=env_only,
             command_runner=command_runner or run_merge_command,
+            memory_project=launch_memory,
+            launch_settings=launch_names,
         )
 
     # LAW 2 (part b) — refuse any script the profile does not name.

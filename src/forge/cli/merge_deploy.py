@@ -8,20 +8,28 @@ the card-lost fallback (an offer whose publish died still has its latch; the
 merge still happens on this command).
 
 Resolves the newest COMPLETE routine build row for FEATURE_ID (or the row
-named by ``--build-id``), computes expect-main-sha NOW (main may have moved
-since the build — the merge verb refuses if it moves again after this), and
-prints receipt lines.
+named by ``--build-id``), reads where the branch of the remote this work was
+recorded against is right now — by the name on the record, never a branch
+called "main" — and prints receipt lines.
 
-The order is the executor's, so it is the same as the card's (protect-main,
-rule 39): the feature branch is checked in the Docker Sandbox FIRST, and only
-if every check passes does the merge land and that exact build get promoted.
-A branch that fails the check is never merged.
+THAT READING IS A RECEIPT FIELD AND NOTHING ELSE (22 September 2026). The
+press fetches the recorded branch itself and joins onto the commit it is at,
+so nothing here decides anything; the value is carried into the press's own
+merge receipt as what this command saw when it was invoked. A build with no
+recorded branch, or a remote whose default branch was renamed since, is not
+refused here: the press has its own plain sentence for each, and it says more
+than this command could.
+
+The order is the executor's, so it is the same as the card's: the build is
+joined onto the recorded branch in a working folder of its own, and BOTH
+kinds of check run on the joined result. Nothing is checked, published or
+deployed on the evidence of the build's own branch alone.
 
 For a repository whose factory lives in its own sandbox (sandbox first, rule
-89) every git operation of the press — main's commit for the pin, the branch,
-the candidate's tree, the ancestry checks and the tree comparison — happens
-inside that sandbox, on the factory's clone, exactly as it does for the card's
-press. A repository with no sandbox is pressed here, as before.
+89) every git operation of the press — the recorded branch's commit, the
+build's branch, the working folder, the join and the candidate's tree —
+happens inside that sandbox, on the factory's clone, exactly as it does for
+the card's press. A repository with no sandbox is pressed here, as before.
 
 The branch merged is the branch the build made (Part M of the rewrite-on-refusal
 spec): the row's recorded ``merge_branch`` when the conductor cut one (a
@@ -155,10 +163,7 @@ async def _arun(
         MergeExecutorDeps,
         execute_merge_deploy,
     )
-    from forge.pipeline.merge_offer import (
-        git_rev_parse_main,
-        read_baseline_failing,
-    )
+    from forge.pipeline.merge_offer import read_baseline_failing
 
     pool = _open_pool(_resolve_db_path())
     row = _resolve_build_row(pool, feature_id, build_id)
@@ -173,25 +178,50 @@ async def _arun(
     repo_root = Path(paths[row.repo])
 
     # WHERE this repository's git happens (sandbox first, rule 89): inside its
-    # sandbox when it has one, in this process when it has not. The pin is the
-    # first git the press needs, so it is read in the same place as the rest.
+    # sandbox when it has one, in this process when it has not.
     from forge.cli.serve import compose_merge_git_surface
 
     git_surface = compose_merge_git_surface(config)
     surface = git_surface(row.repo, repo_root) if git_surface is not None else None
-    if surface is None:
-        expect_main_sha = await git_rev_parse_main(repo_root)
-    else:
-        expect_main_sha = await surface.rev_parse("main")
-    if expect_main_sha is None:
-        where = (
-            f"in {repo_root}"
-            if surface is None
-            else f"in the sandbox that holds {row.repo}"
+
+    # THE PIN IS READ OFF THE RECORDED BRANCH, NOT OFF ONE CALLED "main".
+    # Which branch of the remote a piece of work is aimed at is written down
+    # when the work starts, and it may be called anything — "trunk", a
+    # release line, whatever the project uses. Reading a branch literally
+    # named "main" meant this, the one plain command for picking a press up,
+    # could not run at all for such a project: it refused before the executor
+    # was ever called.
+    #
+    # AND THE PIN IS NOW ONLY A RECEIPT FIELD. The press does not merge into
+    # the project's own branch any more: it fetches the recorded branch
+    # itself, calls where it is G, and joins onto G in a working folder of
+    # its own. Nothing decides anything from this value; it is carried into
+    # the press's ``merge_deploy_merge.json`` receipt as "what the command
+    # saw when it was invoked". So a branch that cannot be read is not a
+    # refusal here — the press has its own plain sentence for a build with no
+    # recorded branch, and for a remote whose default branch was renamed, and
+    # those sentences are better than this one.
+    recorded_branch: str | None = None
+    try:
+        start_point = pool.read_start_point(row.build_id)
+        if getattr(start_point, "recorded", False):
+            recorded_branch = (
+                str(getattr(start_point, "target_branch", "") or "").strip() or None
+            )
+    except Exception as exc:  # noqa: BLE001 — the press says this plainly itself
+        logger.warning(
+            "merge-deploy: the start point of %s could not be read (%s: %s) — "
+            "the press will say so",
+            row.build_id,
+            type(exc).__name__,
+            exc,
         )
-        raise click.ClickException(
-            f"could not read main's sha {where} — refusing an unpinned merge"
-        )
+    expect_main_sha = ""
+    if recorded_branch:
+        from forge.deploy.candidate_tree import InContainerCandidateGit
+
+        venue = surface if surface is not None else InContainerCandidateGit(repo_root)
+        expect_main_sha = str(await venue.rev_parse(recorded_branch) or "")
     baseline_failing = read_baseline_failing(row.build_id)
     # The branch the build made, when the conductor recorded one (a repair).
     merge_branch = str(getattr(row, "merge_branch", None) or "").strip() or None

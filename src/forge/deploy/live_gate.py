@@ -42,7 +42,7 @@ import os
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, Sequence, runtime_checkable
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from forge.adapters.guardkit.models import GuardKitResult
@@ -666,6 +666,17 @@ class SidecarLiveGateInvoker:
             ``live_gate.env`` plus the candidate's addressing overlay.
         http_timeout_margin: Seconds added to the driver's wall before the
             socket gives up, so the sidecar's own timeout always fires first.
+        memory_project: Which memory the work this gate checks belongs to,
+            off the ledger for that build. ``None`` means the ledger recorded
+            none, and then the driver runs with memory explicitly OFF — never
+            under some other project's name.
+        launch_settings: The setting NAMES the project declared its own builds
+            need beyond the factory's list, off the same row. Names only; the
+            sandbox helper takes each value from its own environment and only
+            if it has one. Threaded 22 September 2026: without it a driver
+            that needs a toolchain setting the project declared was launched
+            without it, and one that launches the build system got memory off
+            whatever the project had declared.
     """
 
     def __init__(
@@ -678,6 +689,8 @@ class SidecarLiveGateInvoker:
         timeout_seconds: int = 600,
         extra_env: dict[str, str] | None = None,
         http_timeout_margin: float = 30.0,
+        memory_project: str | None = None,
+        launch_settings: Sequence[str] | None = None,
     ) -> None:
         self._base_url = str(base_url).rstrip("/")
         self._repo = repo
@@ -686,6 +699,8 @@ class SidecarLiveGateInvoker:
         self._timeout_seconds = timeout_seconds
         self._extra_env = dict(extra_env or {})
         self._http_timeout_margin = http_timeout_margin
+        self._memory_project = str(memory_project or "").strip() or None
+        self._launch_settings = tuple(str(name) for name in (launch_settings or ()))
 
     @property
     def repo_path(self) -> Path:
@@ -706,6 +721,13 @@ class SidecarLiveGateInvoker:
             "timeout_seconds": self._timeout_seconds,
             "extra_env": dict(self._extra_env),
             "http_timeout_margin": self._http_timeout_margin,
+            # A copy is still the same build's gate, so what the project
+            # declared travels with it. The candidate leg makes one of these
+            # (``with_repo_path`` / ``with_extra_env``), and a copy that lost
+            # the declarations would launch the driver differently from the
+            # invoker it was copied from.
+            "memory_project": self._memory_project,
+            "launch_settings": self._launch_settings,
         }
         fields.update(changes)
         return SidecarLiveGateInvoker(**fields)
@@ -732,7 +754,7 @@ class SidecarLiveGateInvoker:
         run_id_fallback = f"{feature}-{target}"
         gate_ids = tuple(gates)
         url = f"{self._base_url}/run"
-        body = {
+        body: dict[str, Any] = {
             "repo": self._repo,
             "driver": list(self._driver_argv),
             "args": args,
@@ -740,6 +762,14 @@ class SidecarLiveGateInvoker:
             "timeout_seconds": float(self._timeout_seconds),
             "cwd": str(self._repo_path),
         }
+        # WHAT THE PROJECT DECLARED, sent with the request. Absent fields mean
+        # "the request named none", which the helper reads as the factory's
+        # own list and memory off — so a caller that has nothing to say sends
+        # exactly the body it always sent.
+        if self._memory_project:
+            body["memory_project"] = self._memory_project
+        if self._launch_settings:
+            body["launch_settings"] = list(self._launch_settings)
 
         def _instrument(error: str) -> LiveGateInvocation:
             return LiveGateInvocation(

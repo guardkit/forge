@@ -249,4 +249,4 @@ class TestTheVocabulary:
         )
         assert RESULT_PUBLICATION_PENDING == "publication pending"
         assert RESULT_PUBLISHED_DEPLOYMENT_PENDING == "published, deployment pending"
-        assert RESULT_MERGED_AND_RUNNING == "merged into GitHub and running"
+        assert RESULT_MERGED_AND_RUNNING == "merged into the remote and running"
