@@ -241,7 +241,11 @@ class TestDispatchAutobuildSignature:
             "state_channel",
             "lifecycle_emitter",
         ]
-        additive_data_kwargs = ["branch", "repo", "budget"]
+        # ``memory_project`` joined the additive data kwargs on 2026-09-21
+        # (item 2): which memory the build belongs to, read at the recorded
+        # starting commit. Same one-hop truthy-guard convention as the other
+        # three — a launch without it is byte-identical to the one before it.
+        additive_data_kwargs = ["branch", "repo", "budget", "memory_project"]
         assert kw_only == collaborators + additive_data_kwargs, (
             f"dispatch_autobuild_async must expose exactly the five collaborator "
             f"parameters {collaborators!r} followed only by the additive data "

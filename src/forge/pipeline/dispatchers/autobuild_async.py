@@ -335,6 +335,7 @@ async def dispatch_autobuild_async(
     branch: str | None = None,
     repo: str | None = None,
     budget: "dict[str, Any] | None" = None,
+    memory_project: str | None = None,
 ) -> AutobuildDispatchHandle:
     """Dispatch ``feature_id``'s autobuild as a long-running async subagent.
 
@@ -442,6 +443,14 @@ async def dispatch_autobuild_async(
             cannot honour. ``None`` (attended / NULL profile, or the legacy
             CLI / boot-rearm launch) omits the key entirely, keeping the
             launch bytes byte-compatible with the pre-budget shape.
+        memory_project: The project's own memory name (item 2, 2026-09-21),
+            read from its ``.guardkit/config.yaml`` at the recorded starting
+            commit and carried on the ``builds`` row. Threaded into the launch
+            payload as ``payload["memory_project"]`` when set, so the runner can
+            hand it to the build as ``GUARDKIT_MEMORY_PROJECT`` — a runner
+            inside a sandbox cannot read the ledger, so this is the only way the
+            name arrives. ``None`` (nothing recorded: a build queued by hand, or
+            one from before the memory rule) omits the key entirely.
 
     Returns:
         :class:`AutobuildDispatchHandle` carrying the minted ``task_id``
@@ -561,6 +570,21 @@ async def dispatch_autobuild_async(
     # on this path, so nothing here promises token enforcement.
     if budget:
         launch_payload["budget"] = budget
+    # WHICH MEMORY THIS BUILD BELONGS TO (the project's own memory, item 2,
+    # 2026-09-21). Forge read the project's own ``.guardkit/config.yaml`` at
+    # the commit the work started from, refused the run if it declared none,
+    # and wrote the name onto the planning run and the build. It rides the
+    # launch payload by the SAME one-hop truthy-guard convention as
+    # branch/repo/budget, and for one extra reason: a runner inside a
+    # repository's sandbox cannot see the ledger (rule 72), so the name has to
+    # travel with the launch or it does not arrive at all. The runner sets it
+    # as ``GUARDKIT_MEMORY_PROJECT`` on the build's own short named settings
+    # list. Nothing recorded omits the key entirely — the launch bytes stay
+    # byte-compatible with the pre-memory shape, and the build system falls
+    # back to the project's own declaration in the folder it is building,
+    # never to a name this factory made up.
+    if memory_project:
+        launch_payload["memory_project"] = memory_project
     # TASK-FORGE-FRR-F010G: prefer the async launch path. The deepagents
     # middleware's sync path raises on ``url=None`` (the autobuild_runner
     # registration shape) while the async path tolerates ``url=None`` and

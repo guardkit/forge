@@ -104,6 +104,7 @@ from typing_extensions import NotRequired, Required, TypedDict
 from forge import receipts as _receipts
 from forge.subagents import build_monitor
 from forge.subagents.autobuild_worktree_lifecycle import inspect_autobuild_worktree
+from forge.launch_environment import build_launch_env
 from forge.subagents.inmem_cancel_compat import (
     install_inmem_cancel_listener_compat,
 )
@@ -1962,6 +1963,29 @@ def _resolve_resume_attempt_no(payload: Mapping[str, Any]) -> int:
     except (TypeError, ValueError):
         prior = 0
     return max(prior, 0) + 1
+
+
+def _memory_project_for_build(payload: Mapping[str, Any]) -> str | None:
+    """Which memory this build belongs to, as the dispatch handed it over.
+
+    The project's own memory (item 2, 2026-09-21). The name was read from the
+    project's own ``.guardkit/config.yaml`` at the commit the work started from
+    and written onto the planning run and the build; the dispatch reads it back
+    off the ledger and puts it on this payload, because a runner inside a
+    sandbox cannot see the ledger itself (rule 72).
+
+    ``None`` means NOTHING WAS RECORDED — a build queued by hand with no
+    planning run, or one from before the memory rule. It is never turned into a
+    name: the build system then reads the project's own declaration in the
+    folder it is building, and runs with memory OFF if there is none. It never
+    falls back to "guardkit", which is what used to file every project's
+    outcomes under somebody else's name.
+    """
+    raw = payload.get("memory_project")
+    if not isinstance(raw, str):
+        return None
+    name = raw.strip()
+    return name or None
 
 
 # ---------------------------------------------------------------------------
@@ -4180,21 +4204,42 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
     if routine_multiplier is not None:
         argv += ["--timeout-multiplier", str(routine_multiplier)]
 
+    # WHAT THE BUILD IS LAUNCHED WITH (the design pass of 2026-09-21, item 1,
+    # second revision, section D). This used to be ``env=os.environ.copy()``:
+    # whatever this process happened to be holding, in full — an operator's
+    # shell, a forwarded agent socket, a cloud token, the coordinator's own
+    # ledger. It is now the SHORT NAMED LIST in
+    # :mod:`forge.subagents.launch_environment`, where every entry carries the
+    # one line that says why it is there, and nothing else is passed.
+    #
+    # And the one setting that is decided per build rather than inherited: the
+    # memory this work belongs to (item 2). Forge read the project's own
+    # declaration at the commit the work started from and wrote the name down;
+    # the launch hands it over on purpose here. Nothing recorded means the name
+    # is not set at all, and the build system then reads the project's own
+    # declaration in the folder it is building — never a fallback name.
+    memory_project = _memory_project_for_build(payload)
+    launch_env = build_launch_env(memory_project=memory_project)
     logger.info(
         "autobuild_runner: launching subprocess feature_id=%s cwd=%s "
-        "timeout=%ss seat=%s",
+        "timeout=%ss seat=%s memory=%s settings=%s",
         feature_id,
         run_cwd,
         timeout_seconds,
         routine_seat
         or "unnamed (the build system's own default applies, as it always has)",
+        memory_project or "not recorded (the project's own declaration decides)",
+        # NAMES ONLY, never values: what this build was given, so a build that
+        # behaved oddly can be told apart from one that was handed something
+        # different, without a single value reaching a log.
+        ",".join(sorted(launch_env)),
     )
 
     try:
         proc = await asyncio.create_subprocess_exec(
             *argv,
             cwd=str(run_cwd),
-            env=os.environ.copy(),
+            env=launch_env,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )
@@ -4241,12 +4286,19 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
     # drains, plus the build's own on-disk ledger. Rooted at the build's cwd so
     # both the isolated-worktree and legacy shared-checkout paths are watched.
     # The monitor reconstructs guardkit's own timeout arithmetic from the SAME
-    # environment the subprocess is launched with (``env=os.environ.copy()``
-    # above), so its multiplier/floor mirror is guardkit's number rather than a
-    # guess — see build_monitor.resolve_timeout_multiplier.
+    # environment the subprocess is launched with, so its multiplier/floor
+    # mirror is guardkit's number rather than a guess — see
+    # build_monitor.resolve_timeout_multiplier. Since the launch takes the
+    # short named list rather than a copy of everything (2026-09-21), that
+    # environment is ``launch_env`` and it is handed in here EXPLICITLY. Left
+    # to its default the monitor would read this process's own settings, which
+    # are no longer the ones the build was given, and would supervise a build
+    # to a budget the build never had.
     monitor: build_monitor.BuildMonitor | None = None
     if build_monitor.monitor_enabled():
-        monitor = build_monitor.BuildMonitor(root=run_cwd, feature_id=feature_id)
+        monitor = build_monitor.BuildMonitor(
+            root=run_cwd, feature_id=feature_id, env=launch_env
+        )
     else:
         logger.warning(
             "autobuild_runner: build monitor DISABLED via %s — this build is "

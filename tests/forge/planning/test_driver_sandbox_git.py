@@ -62,6 +62,7 @@ from tests.forge.planning.test_driver_target_terminal import (
     _approved_spec_rows,
     _commit_repo_routing_law,
     _drive_to_failure,
+    _git_env,
     _error_cards,
     _init_scratch_repo,
     _leg_details,
@@ -509,6 +510,20 @@ async def test_a_law_that_cannot_be_read_at_all_says_so_and_does_not_block(
 
     repo = tmp_path / "lawless"
     _init_scratch_repo(repo)
+    # This test is about a settings file that cannot be read AT ALL, so this
+    # copy has none. Every other scratch copy carries one since 2026-09-21,
+    # because a project that declares no memory is refused at the door — but
+    # nothing here goes through the door: it calls the plan leg's check
+    # declaration directly.
+    subprocess.run(
+        ["git", "rm", "-q", "-r", ".guardkit"], cwd=repo, check=True, env=_git_env()
+    )
+    subprocess.run(
+        ["git", "commit", "-qm", "no settings file at all"],
+        cwd=repo,
+        check=True,
+        env=_git_env(),
+    )
     runner, shutdown = _sandbox(repo, tmp_path)
     try:
         driver = PlanningRunDriver.__new__(PlanningRunDriver)

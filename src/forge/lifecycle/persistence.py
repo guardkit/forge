@@ -267,6 +267,14 @@ class BuildRow(BaseModel):
     # guess at where the work started.
     start_commit: str | None = None
     target_branch: str | None = None
+    # Which memory this build's work belongs to (``schema_v13.sql``; the
+    # project's own memory, item 2, 2026-09-21). The name the project declares
+    # in its own ``.guardkit/config.yaml``, read AT ``start_commit`` and handed
+    # to the build on purpose when it is launched. Copied onto the build from
+    # its planning run at the same single INSERT site. ``None`` means NOT
+    # RECORDED — a historical row, or a build queued by hand with no planning
+    # run — and it is read as that, never as "guardkit".
+    memory_project: str | None = None
 
 
 class BuildStartPoint(BaseModel):
@@ -396,6 +404,7 @@ def _row_to_build_row(row: sqlite3.Row | tuple[Any, ...]) -> BuildRow:
             "merge_branch",
             "start_commit",
             "target_branch",
+            "memory_project",
         )
         data = dict(zip(keys, row, strict=False))
 
@@ -436,6 +445,7 @@ def _row_to_build_row(row: sqlite3.Row | tuple[Any, ...]) -> BuildRow:
         merge_branch=data.get("merge_branch"),
         start_commit=data.get("start_commit"),
         target_branch=data.get("target_branch"),
+        memory_project=data.get("memory_project"),
     )
 
 
@@ -853,6 +863,17 @@ class SqliteLifecyclePersistence:
             columns += ", start_commit, target_branch"
             placeholders += ", ?, ?"
             values += [start_commit, target_branch]
+        # Which memory this work belongs to (``schema_v13.sql``; item 2), by
+        # the same rule and from the same planning run: the name the project
+        # declared at ``start_commit``, copied onto the build here so the
+        # launch can hand it over on purpose. A ledger without the column, or
+        # a build with no planning run, records nothing — which reads back as
+        # "not recorded", never as "guardkit".
+        records_memory_project = self._builds_record_the_memory_project()
+        if records_memory_project:
+            columns += ", memory_project"
+            placeholders += ", ?"
+            values.append(self._planning_memory_project(correlation_id))
 
         try:
             self._cx.execute("BEGIN IMMEDIATE;")
@@ -1217,6 +1238,74 @@ class SqliteLifecyclePersistence:
             start_commit=str(commit),
             target_branch=str(branch),
         )
+
+    def _builds_record_the_memory_project(self) -> bool:
+        """Does this ledger have ``builds.memory_project`` (``schema_v13``)?
+
+        Asked once per facade and remembered, exactly as the starting-rule
+        columns are. A ledger from before the migration answers no, and a build
+        queued against it is still written — with nothing recorded about which
+        memory it belongs to, which is exactly what a reader is then told.
+        """
+        cached = getattr(self, "_memory_project_column", None)
+        if cached is not None:
+            return bool(cached)
+        try:
+            names = {
+                row[1] for row in self._cx.execute("PRAGMA table_info(builds);")
+            }
+        except sqlite3.Error:
+            names = set()
+        answer = "memory_project" in names
+        self._memory_project_column = answer
+        return answer
+
+    def _planning_memory_project(self, correlation_id: str) -> str | None:
+        """The planning run's recorded memory name, or ``None``.
+
+        Read-only and forgiving on purpose, like its starting-point sibling: a
+        ledger without the column, or a correlation id with no planning run
+        behind it, answers "nothing recorded" rather than failing a build that
+        is otherwise fine.
+        """
+        if not correlation_id:
+            return None
+        try:
+            row = self._cx.execute(
+                """
+                SELECT memory_project
+                  FROM planning_runs
+                 WHERE correlation_id = ?
+                """,
+                (correlation_id,),
+            ).fetchone()
+        except sqlite3.Error:
+            return None
+        if row is None:
+            return None
+        name = row["memory_project"] if isinstance(row, sqlite3.Row) else row[0]
+        return str(name) if name else None
+
+    def read_memory_project(self, build_id: str) -> str | None:
+        """Which memory this build belongs to, or ``None`` for "not recorded".
+
+        The launch path reads this and hands the name to the build on purpose
+        (``GUARDKIT_MEMORY_PROJECT``). ``None`` is NOT "guardkit" and must never
+        be turned into it: a build launched with no name reads and writes
+        nothing under any name unless the project's own working folder declares
+        one, which is the same file this name came out of.
+        """
+        try:
+            row = self._cx.execute(
+                "SELECT memory_project FROM builds WHERE build_id = ?",
+                (build_id,),
+            ).fetchone()
+        except sqlite3.Error:
+            return None
+        if row is None:
+            return None
+        name = row["memory_project"] if isinstance(row, sqlite3.Row) else row[0]
+        return str(name) if name else None
 
     def record_merge_branch(self, build_id: str, branch: str) -> None:
         """Persist the branch the merge word must merge onto the ``builds`` row.

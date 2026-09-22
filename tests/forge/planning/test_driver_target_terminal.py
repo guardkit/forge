@@ -170,6 +170,7 @@ class RecordingGitRunner:
         start_commit: str = "0" * 39 + "1",
         start_branch: str = "main",
         start_point_refusal: str | None = None,
+        declaration: str | None = "memory:\n  project: scratch_project\n",
     ) -> None:
         self.single_calls: list[dict[str, Any]] = []
         self.tree_calls: list[dict[str, Any]] = []
@@ -180,6 +181,11 @@ class RecordingGitRunner:
         self.start_commit = start_commit
         self.start_branch = start_branch
         self.start_point_refusal = start_point_refusal
+        # The memory rule (item 2): what this stand-in project's settings file
+        # says at that commit. ``None`` means it carries none, which the door
+        # refuses.
+        self.declaration_reads: list[tuple[str, str, str]] = []
+        self.declaration = declaration
         # (branch, file_path) -> content, so the plan leg's read-back of the
         # committed spec triple works against the fake exactly as the real
         # WorktreeGitRunner reads it off the branch.
@@ -193,6 +199,22 @@ class RecordingGitRunner:
         if self.start_point_refusal is not None:
             return RemoteStartPoint(refusal=self.start_point_refusal)
         return RemoteStartPoint(branch=self.start_branch, commit=self.start_commit)
+
+    async def read_file_at_commit(
+        self, repo_path: str, commit: str, file_path: str
+    ) -> Any:
+        """The memory rule's read (item 2), answered by a stand-in project.
+
+        ``declaration`` is the settings file's text at the starting commit;
+        ``None`` is a project that carries no settings file there at all,
+        which is what the door refuses.
+        """
+        from forge.deploy.candidate_tree import FileAtCommit
+
+        self.declaration_reads.append((repo_path, commit, file_path))
+        if self.declaration is None:
+            return FileAtCommit(found=False)
+        return FileAtCommit(content=self.declaration, found=True)
 
     async def prepare_branch_and_write(
         self,
@@ -836,9 +858,24 @@ def _init_scratch_repo(path: Path) -> None:
     }
     subprocess.run(["git", "init", "-q"], cwd=path, check=True, env=env)
     (path / "README.md").write_text("scratch\n")
-    subprocess.run(["git", "add", "."], cwd=path, check=True, env=env)
+    _declare_the_projects_memory(path)
+    subprocess.run(["git", "add", "-A"], cwd=path, check=True, env=env)
     subprocess.run(["git", "commit", "-qm", "init"], cwd=path, check=True, env=env)
     _give_repo_a_remote(path, env)
+
+
+def _declare_the_projects_memory(path: Path) -> None:
+    """Write the two lines that say which memory this project uses.
+
+    The memory rule (item 2, 2026-09-21) refuses at the door a project that
+    declares none, so a scratch copy meant to get PAST the door declares one,
+    exactly as every registered project now does. Two lines, and nothing at all
+    about what the project is made of.
+    """
+    (path / ".guardkit").mkdir(exist_ok=True)
+    (path / ".guardkit" / "config.yaml").write_text(
+        "memory:\n  project: scratch_project\n", encoding="utf-8"
+    )
 
 
 def _give_repo_a_remote(path: Path, env: dict[str, str]) -> Path:
@@ -1182,7 +1219,8 @@ def _init_api_test_shaped_repo(path: Path) -> None:
         d = path / "tests" / suite
         d.mkdir(parents=True)
         (d / "__init__.py").write_text("")  # git tracks the dir via a real file
-    subprocess.run(["git", "add", "."], cwd=path, check=True, env=env)
+    _declare_the_projects_memory(path)
+    subprocess.run(["git", "add", "-A"], cwd=path, check=True, env=env)
     subprocess.run(["git", "commit", "-qm", "init"], cwd=path, check=True, env=env)
     _give_repo_a_remote(path, env)
 
@@ -3359,8 +3397,14 @@ def _seed_leftover_dcl_config(repo: Path) -> None:
     checkout carried when the struck leg harvested a brief into its main tree."""
     gk = repo / ".guardkit"
     gk.mkdir(parents=True, exist_ok=True)
+    # The memory declaration stays: this file is the project's whole settings
+    # file, and a project that declares no memory is refused at the door (item
+    # 2, 2026-09-21), which would stop this test before it reached what it is
+    # about.
     (gk / "config.yaml").write_text(
-        "qa:\n  spec_track: dcl\ndcl:\n  capture: true\n", encoding="utf-8"
+        "qa:\n  spec_track: dcl\ndcl:\n  capture: true\n"
+        "memory:\n  project: scratch_project\n",
+        encoding="utf-8",
     )
     env = _git_env()
     subprocess.run(["git", "add", "."], cwd=repo, check=True, env=env)
@@ -4188,7 +4232,12 @@ def _commit_repo_routing_law(repo: Path, value: str) -> None:
     key guardkit's plan-load half reads)."""
     cfg = repo / ".guardkit" / "config.yaml"
     cfg.parent.mkdir(parents=True, exist_ok=True)
-    cfg.write_text(f"toolchain:\n  test: pytest -q\nrouting_law: {value}\n", encoding="utf-8")
+    # The memory declaration stays, for the reason in _seed_leftover_dcl_config.
+    cfg.write_text(
+        f"toolchain:\n  test: pytest -q\nrouting_law: {value}\n"
+        f"memory:\n  project: scratch_project\n",
+        encoding="utf-8",
+    )
     env = {
         **__import__("os").environ,
         "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
