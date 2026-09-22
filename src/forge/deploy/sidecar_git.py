@@ -21,7 +21,18 @@ operation                        route
 ``ensure_candidate_trees_...``   (none — the lay-out route does it)
 ``materialise_candidate_tree``   ``POST /git/candidate-tree``
 ``remove_candidate_tree``        ``POST /git/candidate-tree-remove``
+``add_working_folder``           ``POST /git/worktree-add``
+``remove_working_folder``        ``POST /git/worktree-remove``
 ===============================  =========================================
+
+THE LAST TWO NEEDED NO NEW ROUTE (22 September 2026, the merge word's join).
+The merge is now done in a working folder of its own, made at the commit being
+joined onto, so the project's main copy is never switched. The sidecar has
+answered ``/git/worktree-add`` and ``/git/worktree-remove`` since the planning
+chain's own trees moved into the sandbox, and those two routes already do
+exactly this: a branch cut at a named commit, in a folder under the
+repository's own ``.forge/worktrees/``, and its removal. So the join uses them
+as they stand.
 
 Every request names the repository by its ``org/name`` key and never by a
 path: the sidecar resolves the key against its own repository map, which is
@@ -47,6 +58,7 @@ from forge.deploy.candidate_tree import (
     CandidateTreeError,
     CandidateTreeLayout,
     RemoteStartPoint,
+    WorkingFolder,
 )
 from forge.planning.sidecar_git_runner import HttpPost, _urllib_post
 
@@ -269,6 +281,63 @@ class SidecarCandidateGit:
             )
             return False
         return bool(decoded.get("removed"))
+
+    async def add_working_folder(
+        self, leaf: str, branch: str, base_ref: str
+    ) -> WorkingFolder:
+        """Make the join's working folder inside the sandbox's own clone.
+
+        Only the folder's NAME goes over the wire. The sandbox resolves the
+        repository from the key it was given and puts the folder under that
+        repository's own working folders, so nothing on this side can name a
+        path in there — and the coordinator's own idea of where the
+        repository lives, which for a sandboxed repository is a different
+        path entirely, never reaches git.
+        """
+        decoded, why = await self._ok(
+            "/git/worktree-add",
+            {
+                "repo": self._repo,
+                "leaf": str(leaf),
+                "branch": str(branch),
+                "base_ref": str(base_ref),
+            },
+            timeout=self._read_timeout_s,
+        )
+        if decoded is None:
+            return WorkingFolder(
+                ok=False,
+                branch=str(branch),
+                base_ref=str(base_ref),
+                refusal=str(why),
+            )
+        ok = str(decoded.get("status") or "") == "success"
+        return WorkingFolder(
+            ok=ok,
+            path=decoded.get("path"),
+            branch=str(decoded.get("branch") or branch),
+            base_ref=str(decoded.get("base_ref") or base_ref),
+            reused=bool(decoded.get("reused")),
+            refusal=(
+                None if ok else str(decoded.get("detail") or "the folder was not made")
+            ),
+        )
+
+    async def remove_working_folder(self, path: str) -> bool:
+        """Remove the join's working folder in the sandbox. Never raises."""
+        decoded, why = await self._ok(
+            "/git/worktree-remove",
+            {"repo": self._repo, "path": str(path)},
+            timeout=self._read_timeout_s,
+        )
+        if decoded is None:
+            logger.warning(
+                "sandbox git: the working folder at %s was not removed: %s",
+                path,
+                why,
+            )
+            return False
+        return str(decoded.get("status") or "") == "success"
 
     async def inspect_autobuild_worktree(
         self, build_id: str, path: str

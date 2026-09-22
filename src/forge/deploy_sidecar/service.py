@@ -359,6 +359,18 @@ TOOLCHAIN_MODULE_CANDIDATES: tuple[str, ...] = (
 #: Default wall on the merge command, in seconds (fifteen minutes).
 MERGE_TIMEOUT_DEFAULT: float = 900.0
 
+#: The branch the merge goes into when the caller names none. It is what every
+#: caller written before the merge word's join asked for, so leaving the field
+#: out runs exactly the command it always ran.
+MERGE_DEFAULT_TARGET: str = "main"
+
+#: The one other family of branches this service will merge into: the
+#: factory's own integration branches, made at the commit the remote is at and
+#: joined in a working folder of their own. Anything else is refused here
+#: rather than run, because a service that merges into whatever it is told is
+#: a service that can be told to merge into a person's branch.
+MERGE_INTEGRATION_PREFIX: str = "factory-integration/"
+
 #: Hard cap on a caller-supplied merge timeout, in seconds (half an hour). A
 #: request asking for longer is refused, not quietly shortened, so nobody can
 #: believe they asked for something the sidecar did not do.
@@ -1551,6 +1563,50 @@ def process_guardkit_merge_request(
             return 400, {"error": branch_error}
         branch = branch.strip()
 
+    # WHICH BRANCH IS MERGED INTO, and WHERE (22 September 2026, the merge
+    # word's join). The merge used to go into ``main`` in the repository's own
+    # copy, which switched the branch that copy had checked out underneath
+    # whoever else was using it. It now goes onto a branch of the factory's
+    # own, made at the commit the remote is at, in a working folder of its
+    # own. So the caller names both, and both are shape-checked before git
+    # sees them: the target must be ``main`` or one of the factory's own
+    # integration branches, and the folder must be a working folder of THIS
+    # repository (the same rule the worktree routes use, and no other path).
+    target = payload.get("target")
+    if target is None:
+        target = MERGE_DEFAULT_TARGET
+    if not isinstance(target, str) or not target.strip():
+        return 400, {
+            "error": (
+                "'target' must be the branch to merge into, written as text; "
+                f"got {target!r}. Leave it out to merge into "
+                f"{MERGE_DEFAULT_TARGET!r}."
+            )
+        }
+    target = target.strip()
+    target_error = _ref_error(target, what="target")
+    if target_error is not None:
+        return 400, {"error": target_error}
+    if target != MERGE_DEFAULT_TARGET and not target.startswith(
+        MERGE_INTEGRATION_PREFIX
+    ):
+        return 400, {
+            "error": (
+                f"this service merges into {MERGE_DEFAULT_TARGET!r} or into one "
+                f"of the factory's own {MERGE_INTEGRATION_PREFIX}* branches, "
+                f"and into nothing else; it was asked to merge into {target!r}"
+            )
+        }
+
+    in_worktree = payload.get("in_worktree")
+    if in_worktree is not None:
+        worktree_error = _worktree_path_error(
+            repo_path, in_worktree, what="in_worktree"
+        )
+        if worktree_error is not None:
+            return 400, {"error": worktree_error}
+        in_worktree = str(in_worktree).strip()
+
     memory_project, launch_settings, launch_error = _launch_fields(payload)
     if launch_error is not None:
         return 400, {"error": launch_error}
@@ -1650,11 +1706,16 @@ def process_guardkit_merge_request(
         "merge",
         feature_id,
         "--target",
-        "main",
+        target,
         "--expect-main-sha",
         expect_main_sha,
         "--json",
     ]
+    # The folder is named ONLY when the caller named one, so a request written
+    # before this field existed runs the command it always ran, token for
+    # token.
+    if in_worktree is not None:
+        argv += ["--in-worktree", in_worktree]
     if verify_timeout is not None:
         argv += ["--verify-timeout", str(verify_timeout)]
     # The branch is named ONLY when the caller named it, so a routine feature
@@ -3035,6 +3096,25 @@ def process_git_worktree_add_request(
     repo_path, error = _resolve_repo_key(payload, config)
     if error or repo_path is None:
         return 400, {"error": error}
+    # The caller may name the folder by its own NAME rather than by a path.
+    # A repository that lives in a sandbox has a path in here that has nothing
+    # to do with the path the coordinator knows it by, so a caller that cannot
+    # know this side's path sends the name and this service builds the path
+    # from the repository it already resolved.
+    leaf = payload.get("leaf")
+    if leaf is not None and not payload.get("path"):
+        if not isinstance(leaf, str) or not SAFE_NAME_PATTERN.match(leaf):
+            return 400, {
+                "error": (
+                    "'leaf' is the working folder's own name — letters, "
+                    "digits, dots, dashes and underscores, no slash; got "
+                    f"{leaf!r}"
+                )
+            }
+        from forge.cli._conductor_worktree import WORKTREES_DIR
+
+        payload = dict(payload)
+        payload["path"] = str(repo_path / WORKTREES_DIR / leaf)
     error = _worktree_path_error(repo_path, payload.get("path"))
     if error:
         return 400, {"error": error}

@@ -29,8 +29,17 @@ repair's ``fix/<task id>-<build8>``, reachable here with ``--build-id``), else
 the feature's own ``autobuild/<feature id>``; the printed line names it when it
 is not the feature's own.
 
-Exit codes: 0 = checked, merged and running (PASSED); 1 = any other outcome
+Exit codes: 0 = the joined result was checked (PASSED); 1 = any other outcome
 (the line printed says plainly which step failed and why).
+
+WHAT "PASSED" MEANS IN THIS VERSION (22 September 2026, the merge word's
+join). The press fetches the branch of the remote this work was recorded
+against, joins the build onto the commit that branch is at, in a working
+folder of its own, and runs both kinds of check on the joined result. It then
+stops: the publisher has not been built, so nothing is sent to the remote and
+nothing is deployed. The result word is ``publication-pending`` and the
+sentence says "checked and ready to publish; publication is not switched on".
+It never says "merged and running".
 """
 
 from __future__ import annotations
@@ -273,13 +282,15 @@ def merge_deploy_cmd(
     build_id: str | None,
     dry_run: bool,
 ) -> None:
-    """Check FEATURE_ID in the sandbox, merge it into main, promote it — attended.
+    """Join FEATURE_ID onto the remote's recorded branch and check it — attended.
 
     The invocation IS the human word: the same executor the merge card's
-    press runs, fired directly, in the same order — the candidate is checked
-    first and only a passing one is merged and promoted. Exit 0 = checked,
-    merged and running; 1 = anything else (the printed line names the
-    failed step).
+    press runs, fired directly, in the same order — the branch of the remote
+    this work was recorded against is fetched, the build is joined onto the
+    commit it is at in a working folder of its own, and both kinds of check
+    run on the joined result. Nothing is published and nothing is deployed:
+    the publisher has not been built. Exit 0 = the joined result was checked;
+    1 = anything else (the printed line names the failed step).
     """
     config = ctx.obj if isinstance(ctx.obj, ForgeConfig) else None
     if config is None:

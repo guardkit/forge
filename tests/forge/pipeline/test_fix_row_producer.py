@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
@@ -671,10 +672,17 @@ class TestTheRedMergeHook:
         pool.connection.execute(
             "INSERT OR IGNORE INTO builds (build_id, feature_id, repo, branch, "
             "feature_yaml_path, status, triggered_by, originating_user, "
-            "correlation_id, queued_at, mode) VALUES (?, ?, ?, 'main', "
+            "correlation_id, queued_at, mode, start_commit, target_branch) "
+            "VALUES (?, ?, ?, 'main', "
             "'f.yaml', 'COMPLETE', 'cli', 'rich', ?, "
-            "'2026-09-05T12:00:00Z', 'mode-a')",
-            (self.MERGE_BUILD, self.MERGE_FEATURE, self.MERGE_REPO, "corr-mrg-1"),
+            "'2026-09-05T12:00:00Z', 'mode-a', ?, 'main')",
+            (
+                self.MERGE_BUILD,
+                self.MERGE_FEATURE,
+                self.MERGE_REPO,
+                "corr-mrg-1",
+                "0" * 40,
+            ),
         )
         pool.connection.commit()
 
@@ -706,6 +714,17 @@ class TestTheRedMergeHook:
             self._git(repo_root, "add", "feature.txt")
             self._git(repo_root, "commit", "-q", "-m", "the feature")
             self._git(repo_root, "checkout", "-q", "main")
+            # The merge word joins onto the branch of the remote this work was
+            # recorded against, so the repository needs one: a bare repository
+            # beside it, which is real git and nobody's account.
+            bare = tmp_path / "origin.git"
+            subprocess.run(
+                ["git", "init", "--bare", "-b", "main", "-q", str(bare)],
+                check=True,
+                capture_output=True,
+            )
+            self._git(repo_root, "remote", "add", "origin", str(bare))
+            self._git(repo_root, "push", "-q", "origin", "main")
         merged = self._git(repo_root, "rev-parse", f"autobuild/{self.MERGE_FEATURE}")
         self._seed_build(pool)
 
@@ -773,6 +792,13 @@ class TestTheRedMergeHook:
         )
         return outcome, published
 
+    @pytest.mark.skip(
+        reason=(
+            "while publication is switched off the press stops at \"checked and "
+            "ready to publish\": nothing is deployed, so there is no reverted "
+            "deploy to file a repair for. It comes back with the executor stage."
+        )
+    )
     def test_a_reverted_deploy_files_a_repair_row(
         self, pool: SqliteLifecyclePersistence, tmp_path: Path, receipts: Path
     ) -> None:
@@ -793,7 +819,7 @@ class TestTheRedMergeHook:
             self._run(pool, tmp_path, deploy_outcome="complete")
         )
 
-        assert outcome.result == "merged-and-running"
+        assert outcome.result == "publication-pending"
         assert queue_rows(pool) == []
 
     def test_a_dry_run_files_nothing(
@@ -813,7 +839,9 @@ class TestTheRedMergeHook:
 
         outcome, _ = asyncio.run(self._run(pool, tmp_path))
 
-        assert outcome.result == "merge-refused"
+        # The second press picks the join up rather than making it again, and
+        # nothing about that is a repair.
+        assert outcome.result == "publication-pending"
         assert len(queue_rows(pool)) == first
 
 

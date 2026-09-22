@@ -63,7 +63,8 @@ def _insert_build(
     pool.connection.execute(
         "INSERT INTO builds (build_id, feature_id, repo, branch, "
         "feature_yaml_path, status, triggered_by, correlation_id, queued_at, "
-        "mode) VALUES (?, ?, ?, ?, 'f.yaml', ?, 'cli', ?, ?, ?)",
+        "mode, start_commit, target_branch) VALUES (?, ?, ?, ?, 'f.yaml', ?, "
+        "'cli', ?, ?, ?, ?, 'main')",
         (
             build_id,
             feature_id,
@@ -73,6 +74,7 @@ def _insert_build(
             f"corr-{build_id}",
             queued_at,
             mode,
+            "0" * 40,
         ),
     )
     pool.connection.commit()
@@ -108,6 +110,16 @@ def repo_root(tmp_path: Path) -> Path:
     _git(root, "add", "feature.txt")
     _git(root, "commit", "-q", "-m", "the feature")
     _git(root, "checkout", "-q", "main")
+    # The merge word joins onto the branch of the remote this work was
+    # recorded against: a bare repository beside it stands in for one.
+    bare = tmp_path / "origin.git"
+    subprocess.run(
+        ["git", "init", "--bare", "-b", "main", "-q", str(bare)],
+        check=True,
+        capture_output=True,
+    )
+    _git(root, "remote", "add", "origin", str(bare))
+    _git(root, "push", "-q", "origin", "main")
     return root
 
 
@@ -238,20 +250,24 @@ class TestHappyPath:
         _insert_build(pool)
         result = CliRunner().invoke(merge_deploy_cmd, [FEATURE_ID], obj=config)
         assert result.exit_code == 0, result.output
-        assert "result=merged-and-running" in result.output
+        assert "result=publication-pending" in result.output
         assert "status=PASSED" in result.output
         assert f"merged_sha={fakes['merged']}" in result.output
-        assert "merged and running" in result.output
+        assert "checked and ready to publish" in result.output
         assert "checked in the sandbox before merging: pass (3 of 3 checks passed)" in result.output
         assert f"merge-{BUILD_ID}/" in result.output
         # The executor really ran: the candidate check, one merge, the
         # promote, one report — in that order (protect-main).
         assert len(fakes["gk_calls"]) == 1
-        assert [c["leg"] for c in fakes["dp_calls"]] == ["candidate_check", "promote"]
+        assert [c["leg"] for c in fakes["dp_calls"]] == ["candidate_check", "candidate_down"]
         assert len(fakes["publisher"].reports) == 1
-        # expect-main-sha was computed NOW (the fake pin).
+        # The join is pinned to the commit the REMOTE'S recorded branch is at,
+        # which the press fetched for itself — not the local pin the card
+        # carried.
         args = fakes["gk_calls"][0]["args"]
-        assert args[args.index("--expect-main-sha") + 1] == "e" * 40
+        assert args[args.index("--target") + 1] == f"factory-integration/{FEATURE_ID}"
+        assert len(args[args.index("--expect-main-sha") + 1]) == 40
+        assert "--in-worktree" in args
 
     def test_newest_complete_routine_build_wins(
         self, config, pool, fakes
@@ -307,5 +323,5 @@ class TestHappyPath:
         assert result.exit_code == 1
         assert "result=merge-refused" in result.output
         assert "failed_step=merge" in result.output
-        # The candidate was checked first and taken down after the refusal.
-        assert [c["leg"] for c in fakes["dp_calls"]] == ["candidate_check", "candidate_down"]
+        # The join comes first, so nothing was stood up to come down.
+        assert [c["leg"] for c in fakes["dp_calls"]] == []

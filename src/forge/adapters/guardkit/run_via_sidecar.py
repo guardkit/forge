@@ -72,11 +72,23 @@ ALLOWED_SUBCOMMAND: str = "autobuild"
 #: The only verb of that subcommand this door will carry.
 ALLOWED_VERB: str = "merge"
 
-#: The only branch this door will merge into. The sidecar runs
-#: ``--target main`` as a fixed part of its command, so a request naming any
-#: other branch could not be honoured and is refused here instead of being
-#: quietly run against main.
+#: The branch this door merged into before the merge word had a join, and the
+#: one it still merges into when a caller names no other.
 ALLOWED_TARGET: str = "main"
+
+#: The one other family of branches this door carries (22 September 2026): the
+#: factory's own integration branches. The merge word now joins the build's
+#: work onto the commit the remote is at, on a branch of the factory's own, in
+#: a working folder of its own — so the target travels as its own field and
+#: the folder with it. Anything outside these two is refused here rather than
+#: sent, because a door that merges into whatever it is told is a door that
+#: can be told to merge into somebody's own branch.
+INTEGRATION_TARGET_PREFIX: str = "factory-integration/"
+
+
+def _target_is_carried(target: str) -> bool:
+    """Is this a branch this door will merge into?"""
+    return target == ALLOWED_TARGET or target.startswith(INTEGRATION_TARGET_PREFIX)
 
 #: The sidecar operation the fix journey's legs talk to (rule 75).
 LEG_ENDPOINT: str = "/guardkit-leg"
@@ -286,11 +298,12 @@ def build_sidecar_guardkit_run(
                 f"{subcommand!r} with {args!r}"
             )
         target = _flag_value(args, "--target")
-        if target is not None and target != ALLOWED_TARGET:
+        if target is not None and not _target_is_carried(target):
             raise MergeCallRefused(
                 "the deploy sidecar merges into "
-                f"{ALLOWED_TARGET!r} and nothing else; it was asked to merge "
-                f"into {target!r}"
+                f"{ALLOWED_TARGET!r} or one of the factory's own "
+                f"{INTEGRATION_TARGET_PREFIX}* branches, and into nothing "
+                f"else; it was asked to merge into {target!r}"
             )
         if len(args) < 2:
             raise MergeCallRefused(
@@ -351,6 +364,26 @@ def build_sidecar_guardkit_run(
             )
         if branch is not None:
             body["branch"] = branch
+        # THE TARGET AND THE FOLDER TRAVEL AS THEIR OWN FIELDS, for the same
+        # reason the branch does: the sidecar builds the command on the far
+        # side, so a flag left in this list would simply be dropped. No
+        # ``--target`` means no field, and the far side merges into main
+        # exactly as it always has; no ``--in-worktree`` means no field, and
+        # the merge happens where the command is run, as it always did.
+        if target is not None:
+            body["target"] = target
+        in_worktree = _flag_value(args, "--in-worktree")
+        named_a_folder = any(
+            token == "--in-worktree" or token.startswith("--in-worktree=")
+            for token in args
+        )
+        if named_a_folder and not (in_worktree or "").strip():
+            raise MergeCallRefused(
+                "the merge command's --in-worktree needs the path of the "
+                f"working folder to merge in after it; got {args!r}"
+            )
+        if in_worktree is not None:
+            body["in_worktree"] = in_worktree
         # THE TWO WALLS TRAVEL TOGETHER. ``timeout_seconds`` is the wall around
         # the whole command; ``--verify-timeout`` is how long ONE run of the
         # checks may take. The sidecar builds the command itself, so the inner
