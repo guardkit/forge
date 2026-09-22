@@ -278,6 +278,36 @@ class _FakeGuardKit:
         )
 
 
+class _DiesWhileMerging:
+    """Makes the join for real, then the press dies mid-command.
+
+    This is the kill the pick-up exists for and the one the other stand-ins
+    cannot reach: a press killed WHILE the merge command runs, rather than
+    after it answered. The join is made in the working folder the press was
+    given, exactly as the real merge command makes it — a ``--no-ff`` commit
+    of G and the build's tip — and then nothing ever comes back.
+    """
+
+    def __init__(self, feature_id: str = FEATURE_ID) -> None:
+        self.feature_id = feature_id
+        self.calls: list[dict[str, Any]] = []
+
+    async def __call__(self, **kwargs: Any) -> GuardKitResult:
+        self.calls.append(kwargs)
+        args = list(kwargs["args"])
+        folder = Path(args[args.index("--in-worktree") + 1])
+        _git(
+            folder,
+            "merge",
+            "--no-ff",
+            "-q",
+            "-m",
+            f"join {self.feature_id}",
+            f"autobuild/{self.feature_id}",
+        )
+        raise KeyboardInterrupt("the press was killed while the merge command ran")
+
+
 #: What a green candidate check reports: every check passed, by name.
 GREEN_GATE: dict[str, Any] = {
     "verdict": "pass",
@@ -920,6 +950,108 @@ class TestExecutorSequencing:
             "candidate_check",
             "candidate_down",
         ]
+        # Both kinds of check ran on J in the first press and the join came
+        # back off the record in the second, so the sentence may say plainly
+        # that the joined result was checked.
+        assert f"the joined result {str(first.merged_sha)[:10]} was checked" in (
+            first.detail
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_press_that_dies_while_the_merge_runs_is_picked_up(
+        self, config, pool, repo_root
+    ) -> None:
+        """The stuck-for-good case: killed DURING the merge command, not after.
+
+        The merge step is claimed on the build's stage log before the merge
+        command is run, and the merge command is the longest thing the press
+        does. So a press killed while it runs leaves an "about to join" line
+        on the publication record, a claimed merge step on the build, and the
+        joined commit sitting on the integration branch. Unless an "about to
+        join" with no answer counts as picking up, the next merge word falls
+        into the repeated-merge-step refusal, nothing ever releases that
+        claim, and the build can never be pressed again.
+        """
+        dying = _DiesWhileMerging()
+        deps, publisher, gk, dp = _deps(config, pool, guardkit=dying)
+        with pytest.raises(KeyboardInterrupt):
+            await _run_executor(deps, repo_root)
+
+        # What the dead press left behind, exactly as described.
+        left = pool.connection.execute(
+            "SELECT lines_json FROM publication_records WHERE build_id = ?",
+            (BUILD_ID,),
+        ).fetchone()
+        lines = json.loads(left[0])
+        assert [(l["kind"], l["step"]) for l in lines] == [("about to", "join")]
+        assert MERGE_STEP_MERGE_TARGET_IDENTIFIER in _stage_ids(pool)
+        j_left = _git(repo_root, "rev-parse", f"factory-integration/{FEATURE_ID}")
+
+        # The next merge word picks it up: the join is found, not made again,
+        # and the press runs on to the checks.
+        deps, publisher, gk, dp = _deps(config, pool)
+        outcome = await _run_executor(deps, repo_root)
+        assert outcome.result == "publication-pending"
+        assert outcome.merged_sha == j_left
+        assert gk.calls == []  # the merge command was never run a second time
+        assert _legs(dp) == ["candidate_check", "candidate_down"]
+        steps = [
+            (l["kind"], l["step"])
+            for l in json.loads(
+                pool.connection.execute(
+                    "SELECT lines_json FROM publication_records WHERE build_id = ?",
+                    (BUILD_ID,),
+                ).fetchone()[0]
+            )
+        ]
+        assert steps == [
+            ("about to", "join"),
+            ("done", "join"),
+            ("about to", "candidate-check"),
+            ("done", "candidate-check"),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_pick_up_never_claims_checks_it_did_not_re_run(
+        self, config, pool, repo_root
+    ) -> None:
+        """Say which checks ran, and no more.
+
+        A press that picks an already-made join up does not re-run the build
+        system's own post-merge checks on it — only the factory's live check
+        runs, and its counts are the ones in the sentence. So the sentence
+        must not call the joined result "checked" flatly; and the record,
+        which is what a publisher reads, must have no "done merge-checks"
+        line for that attempt.
+        """
+        dying = _DiesWhileMerging()
+        deps, publisher, gk, dp = _deps(config, pool, guardkit=dying)
+        with pytest.raises(KeyboardInterrupt):
+            await _run_executor(deps, repo_root)
+
+        deps, publisher, gk, dp = _deps(config, pool)
+        outcome = await _run_executor(deps, repo_root)
+        assert outcome.result == "publication-pending"
+        steps = [
+            (l["kind"], l["step"])
+            for l in json.loads(
+                pool.connection.execute(
+                    "SELECT lines_json FROM publication_records WHERE build_id = ?",
+                    (BUILD_ID,),
+                ).fetchone()[0]
+            )
+        ]
+        assert ("done", "merge-checks") not in steps
+        assert f"the joined result {str(outcome.merged_sha)[:10]} was checked" not in (
+            outcome.detail
+        )
+        assert "the factory's own live check ran on the joined result" in outcome.detail
+        assert (
+            "the build system's own checks after a join were not re-run on it"
+            in outcome.detail
+        )
+        # And it still ends where every press in this stage ends.
+        assert "checked and ready to publish" in outcome.detail
 
     @pytest.mark.asyncio
     async def test_checks_derived_from_the_live_gate_verdict(

@@ -9,40 +9,45 @@ Make-merge-work build spec (2026-08-24). Two halves:
   approver VERBATIM, a matching correlation, and no decision yet on record
   (the durable decision row is written FIRST, so a restart can never
   double-run).
-* :func:`execute_merge_deploy` — the executor coroutine. STEP candidate: the
-  feature branch's tree is laid out inside the checkout and the deploy stage's
-  candidate leg builds it, brings it up in the Docker Sandbox and runs the
-  registered live checks against it; STEP merge+verify through the frozen
-  guardkit subprocess boundary, only if every check passed; STEP tree check:
-  the merged commit's tree must be the tree that was checked; STEP promote:
-  the deploy stage's promote leg re-tags the candidate image as live (never a
-  rebuild) and tears the candidate down; STEP report as one additive
-  ``pipeline.stage-complete.{feature_id}`` publish. Per-step durable receipts
-  land under ``receipts_root()/merge-<build_id>/`` and a stage row is written
-  BEFORE each irreversible act, probed on restart.
+* :func:`execute_merge_deploy` — the executor coroutine. STEP join: the
+  recorded target branch is fetched from the remote named ``origin`` (that is
+  G), a working folder of its own is made at G, and the build system's merge
+  runs in THERE, through the frozen guardkit subprocess boundary, onto
+  ``factory-integration/<feature>`` pinned to G; its ``--no-ff`` stays, so the
+  joined commit J is a new commit of exactly G and the build's tip. STEP
+  merge-checks: the build system's own post-merge checks run on J inside that
+  same command. STEP candidate check: J's exact tree is laid out inside the
+  checkout and the deploy stage's candidate leg builds it, brings it up and
+  runs the registered live checks against it — on J and only on J. STEP
+  report as one additive ``pipeline.stage-complete.{feature_id}`` publish.
+  Per-step durable receipts land under ``receipts_root()/merge-<build_id>/``
+  and a stage row is written BEFORE each irreversible act, probed on restart.
 
-PROTECT MAIN (the rewrite-on-refusal spec, Part J, 2026-09-07, on Rich's yes).
-FEAT-8388 and FEAT-39F6 both reached api_test main with a defect the sandbox
-gate found afterwards; the mission says main is the boundary. So the candidate
-check moved in front of the merge. The merge word stays one touch; what
-happens inside it changed order: (1) candidate built from the branch's exact
-tree and checked; (2) merge, pinned to main's commit exactly as before; (3) the
-merge's own post-merge test run; (4) promote the image that was checked;
-(5) candidate torn down. A red check means no merge, no promote: the branch is
-kept, a repair row is filed, and the report says so with the new result word
-``candidate-refused``.
+THE PRESS STOPS AT "CHECKED" (the one-true-copy design, 2026-09-21). The
+publisher does not exist yet, so nothing is sent to the remote and nothing is
+deployed: the record's result is "publication pending" and the sentence a
+person reads is "checked and ready to publish; publication is not switched
+on". The other two result names — "published, deployment pending" and "merged
+into GitHub and running" — are defined as the vocabulary the publisher and
+executor stages will make reachable, and a test pins that neither can be
+produced while publication is switched off.
 
-A MAIN THAT MOVED DURING THE BUILD is refused before the merge, not after it.
-The pinned main commit is read when the offer is made — after the build — so a
-main that moved WHILE the feature was building still matches the pin, the
-merge command would land a merge commit carrying main's new work, its tree
-could never equal the tree that was checked, and the promote would be refused
-with the merge already on main (the coach's finding, 2026-09-07). So after a
-green check and before the merge step is claimed the executor asks git one
-question: is the pinned main commit in the branch? A "no" is ``merge-refused``
-at the merge step with nothing claimed, nothing merged, the candidate torn
-down and the branch kept. The tree comparison after the merge (rule 37) stays
-as the belt for anything else.
+THE PROJECT'S MAIN COPY IS NEVER TOUCHED. It is not switched, not reset and
+not merged into: everything happens in the worktree made at G, and the join
+lands on a branch of the factory's own. What used to protect main — the
+candidate check in front of the merge (Part J, 2026-09-07), the pin to main's
+commit, the ancestry guard and the tree comparison after the merge — is
+subsumed by this shape: there is one tree, J's, and the check and the
+comparison are both about it.
+
+THE PUBLICATION RECORD carries the press across a restart. One row per build:
+who gave the merge word and when, the recorded target branch, G, J, and every
+step written as an "about to" (attempt number and exact inputs) before acting
+and a "done" (the result) after. A lease and a turn number keep one worker on
+it; every write is conditional on the stored turn equalling the writer's, in
+the same statement, and a write that changes no row means the worker was
+replaced, so it stops without tidying up. Builds pressed before the record
+existed read as "not recorded".
 
 Any refusal, conflict, or verify failure stops the run with nothing
 half-done: the branch is always kept, the candidate is torn down and its tree
@@ -90,9 +95,9 @@ nothing closed the row at all: a build that merged and was promoted still
 said RUNNING hours later, and so did every honestly refused one, until a
 person ran ``forge cancel`` and wrote CANCELLED over a journey that had
 merged. Now every ending of the press closes the row through the lifecycle's
-own transition seam: a merge that merged and was promoted closes it COMPLETE,
-and every other ending — refused at the candidate check, at the branch, at a
-dirty tree, at a moved main, or red after the merge landed — closes it FAILED
+own transition seam: a press that joined and checked closes it COMPLETE, and
+every other ending — refused at the join, at the branch, at a conflict, or red
+at either kind of check — closes it FAILED
 carrying the very sentence the report and the card carry. A row that
 something else has already closed is left exactly as it is, so the write is
 safe to repeat and a routine feature build, whose row the live build feed
@@ -139,6 +144,7 @@ from forge.pipeline.merge_join import (
     working_folder_path,
 )
 from forge.pipeline.publication_record import (
+    LINE_DONE,
     RESULT_PUBLICATION_PENDING,
     STEP_CANDIDATE_CHECK,
     STEP_JOIN,
@@ -723,13 +729,14 @@ def close_build_row(
 
     How the ending is read off the press's own outcome, and nothing else:
 
-    * ``PASSED`` — the merge landed and the promote finished — closes the row
+    * ``PASSED`` — the join was made and what it produced was checked —
+      closes the row
       COMPLETE, with nothing written to ``builds.error`` (that column is the
       failure text ``forge status`` renders, and prose in it on a good row
       reads as a failure to every human and every dashboard).
-    * ``FAILED`` — every refusal (the candidate check, a branch that is not
-      there, a dirty tree, a main that moved) and every red ending after a
-      merge that did land — closes the row FAILED with the press's own
+    * ``FAILED`` — every refusal (a branch that is not there, a remote that
+      could not be read, a conflict) and every red ending after a
+      join that was made — closes the row FAILED with the press's own
       sentence as the reason: the same sentence the report carries and the
       same one Rich reads on the card.
     * Anything else — today only the ``SKIPPED`` shape, which the press never
@@ -986,26 +993,44 @@ async def execute_merge_deploy(
     expected_candidate_branch: str | None = None,
     worktree_retention: dict[str, Any] | None = None,
 ) -> MergeDeployOutcome:
-    """Run candidate check -> merge -> tree check -> promote -> report for one press.
+    """Run join -> checks -> report for one press, and stop before publishing.
 
-    The order inside the merge word (protect-main, rule 36):
+    The order inside the merge word (the one-true-copy design, 2026-09-21):
 
-    1. the candidate is built from the feature branch's exact tree, brought up
-       in the sandbox, and the registered live checks run against it;
-    2. only if every check passed does the merge land — ``guardkit autobuild
-       merge`` pinned to main's commit, exactly as before;
-    3. the merge's own post-merge test run stays;
-    4. the merged commit's tree must be the tree that was checked (rule 37),
-       else the promote is refused and nothing live changes;
-    5. the promote re-tags the candidate image that was checked — never a
-       rebuild — and the candidate is torn down.
+    1. the recorded target branch is fetched from the remote named ``origin``
+       and where it is now is G;
+    2. a working folder of its own is made at G (a git worktree, through the
+       same venue every other git operation of the press uses) and the build
+       system's merge runs IN THERE, onto ``factory-integration/<feature>``,
+       pinned to G. Its ``--no-ff`` stays, so the joined commit J is a new
+       commit of exactly G and the build's tip. The project's main copy is
+       never switched, reset or merged into;
+    3. the build system's own post-merge checks run on J, inside that same
+       command;
+    4. the factory's live candidate check runs on J's exact tree, laid out
+       with the candidate-tree operation, and ONLY there;
+    5. the record stops at "checked", and the result is worded "checked and
+       ready to publish; publication is not switched on". The publisher (the
+       send and the read-back) and the executor (the deploy and the fixed
+       identity of what was checked) are the next two stages; until they
+       exist nothing is sent to the remote and nothing is deployed.
 
-    A red check at (1) means no merge and no promote: the candidate is torn
-    down, the branch is kept, the repair row is filed, and the report says so
-    (``candidate-refused``). The candidate's laid-out tree is removed on every
-    ending. Never raises past its boundary: every result class lands as an
-    honest :class:`MergeDeployOutcome`, one additive ``stage-complete``
-    publish, and per-step JSON receipts under ``receipts_root()/merge-<build_id>/``.
+    A conflict or a refusal at (2) is reported as it always was: nothing is
+    merged, nothing is published, the branch is kept. The laid-out tree is
+    removed on every ending. Never raises past its boundary: every result
+    class lands as an honest :class:`MergeDeployOutcome`, one additive
+    ``stage-complete`` publish, and per-step JSON receipts under
+    ``receipts_root()/merge-<build_id>/``.
+
+    PICKING UP. Every step is written to the build's publication record as an
+    "about to" before it happens and a "done" after, so a press that died
+    part-way is carried on rather than started again: an "about to join" with
+    no answer makes the next press LOOK — is that attempt's branch a merge of
+    exactly G and the build's tip? Then it is J and it is marked done; any
+    other leftover is set aside under its own name and the join is made
+    afresh on the next attempt's name. A record held by a live lease is left
+    alone; a takeover needs the lease to have expired and raises the turn
+    number by one.
 
     ``merge_branch`` is the build row's recorded journey branch (Part M, rule
     54) — a repair's ``fix/<task id>-<build8>`` — and ``None`` for a feature
@@ -1650,11 +1675,30 @@ async def execute_merge_deploy(
         # it and nothing else.
         store = None if dry_run else _publication_store()
         already = store.read(build_id) if store is not None else None
+        # A JOIN THAT WAS ONLY EVER STARTED COUNTS TOO. The merge step is
+        # claimed on the build's stage log BEFORE the merge command is run,
+        # and the merge command is the longest thing the press does, so a
+        # press that is killed while it runs leaves an "about to join" line
+        # and a claimed merge step and nothing else. Before this was
+        # allowed for, that build could never be pressed again: every later
+        # merge word fell into the repeated-merge-step refusal below and
+        # nothing in the codebase ever released the claim on that path, so
+        # the join sitting on the integration branch could not be picked up
+        # and the build was stuck for good. An "about to join" with no
+        # answer is exactly the case the pick-up was built for: the factory
+        # looks at the world (is that branch a join of G and the build's
+        # tip?) rather than assuming, so it is a pick-up, not a new merge.
+        unfinished_already = already.unfinished() if already is not None else None
         picking_up = bool(
             already is not None
             and already.recorded
-            and already.j_commit
-            and already.is_done(STEP_JOIN)
+            and (
+                (already.j_commit and already.is_done(STEP_JOIN))
+                or (
+                    unfinished_already is not None
+                    and unfinished_already.step == STEP_JOIN
+                )
+            )
         )
 
         if not picking_up and _has_step(MERGE_STEP_MERGE_TARGET_IDENTIFIER):
@@ -1853,6 +1897,23 @@ async def execute_merge_deploy(
         # somebody else made has none of its own and says None.
         checks_passed: int | None = None
         checks_total: int | None = None
+        # Did the build system's own post-merge checks run on THIS attempt's
+        # joined commit? True when this press ran them; a press that picked a
+        # join up does not, and says so.
+        merge_checks_ran_here = False
+
+        def _the_build_systems_checks_ran_on_j() -> bool:
+            if merge_checks_ran_here:
+                return True
+            if record is None:
+                return False
+            return any(
+                line.kind == LINE_DONE
+                and line.step == STEP_MERGE_CHECKS
+                and int(getattr(line, "attempt", -1)) == attempt
+                for line in getattr(record, "lines", ())
+            )
+
         unfinished = record.unfinished() if record is not None else None
         if unfinished is not None and unfinished.step == STEP_JOIN:
             # The last line says a join was about to happen and never said
@@ -2219,6 +2280,7 @@ async def execute_merge_deploy(
                 },
             ):
                 return _replaced_here()
+            merge_checks_ran_here = True
 
             # Advisory: does the joined tree keep the promises in the feature's
             # spec digest? Deterministic and never blocking.
@@ -2363,10 +2425,27 @@ async def execute_merge_deploy(
                 and isinstance(gate.get("checks_total"), int)
                 else ""
             )
+            # SAY WHICH CHECKS RAN. Two different things check the joined
+            # result: the build system's own checks, which run inside the
+            # merge command, and the factory's live check on J's tree. A
+            # press that picked an already-made join up never re-runs the
+            # first of those, and the counts in the sentence are the live
+            # check's alone — so the sentence must not call that "checked"
+            # flatly. The record is the thing a publisher reads; the
+            # sentence is the thing a person reads, and it says the same.
+            if _the_build_systems_checks_ran_on_j():
+                what_ran = f"the joined result {str(j_commit)[:10]} was checked{checks}"
+            else:
+                what_ran = (
+                    f"the factory's own live check ran on the joined result "
+                    f"{str(j_commit)[:10]}{checks}, but the build system's own "
+                    "checks after a join were not re-run on it — this press "
+                    "picked up a join an earlier one had already made"
+                )
             detail = (
                 f"{named} was joined onto {target_branch} at "
-                f"{g_commit[:10]} in a working folder of its own, and the "
-                f"joined result {str(j_commit)[:10]} was checked{checks}. "
+                f"{g_commit[:10]} in a working folder of its own, and "
+                f"{what_ran}. "
                 "It is checked and ready to publish; publication is not "
                 "switched on, so nothing was sent to the remote and nothing "
                 "was deployed. The branch is kept."

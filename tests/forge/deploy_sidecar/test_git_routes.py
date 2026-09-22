@@ -1151,6 +1151,59 @@ def test_rev_parse_refuses_a_ref_git_could_misread(cfg: ForgeConfig) -> None:
     for bad in ("", "-x", "--output=/tmp/x", "a b", None):
         status, body = process_git_rev_parse_request({"repo": REPO_KEY, "ref": bad}, config=cfg)
         assert status == 400 and "'ref'" in body["error"]
+    # A dash cannot sneak in after the caret either, and the caret suffix is
+    # one suffix, not a chain.
+    for bad in ("main^-1", "main^{-x}", "main^1^2", "main^0x", "main^"):
+        status, body = process_git_rev_parse_request({"repo": REPO_KEY, "ref": bad}, config=cfg)
+        assert status == 400, bad
+
+
+def test_rev_parse_answers_a_commit_s_numbered_parents(
+    cfg: ForgeConfig, tmp_path: Path, repo: Path
+) -> None:
+    """``<ref>^1`` and ``<ref>^2``, which is how a merge is recognised.
+
+    The merge word settles an interrupted join by asking whether that
+    attempt's branch is a merge of exactly two named commits — its first and
+    second parents. This route refused both forms, so in a sandbox the answer
+    was always "it is not a merge commit": a sandboxed repository would set
+    its real join aside and join afresh, for ever. The peel form
+    (``^{tree}``) already worked and still does.
+    """
+    _write(cfg, tmp_path, checks=[])
+
+    def _run(*args: str) -> None:
+        subprocess.run(
+            ["git", "-C", str(repo), "-c", "user.email=t@example.invalid",
+             "-c", "user.name=t", "-c", "commit.gpgsign=false", *args],
+            check=True, capture_output=True,
+        )
+
+    first = git_rev_parse(repo, "HEAD")
+    _run("checkout", "-q", "-b", "the-other-hand", first)
+    (repo / "other.txt").write_text("the other hand\n", encoding="utf-8")
+    _run("add", "other.txt")
+    _run("commit", "-q", "-m", "the other hand")
+    second = git_rev_parse(repo, "the-other-hand")
+    _run("checkout", "-q", "-b", "factory-integration-like", first)
+    _run("merge", "--no-ff", "-q", "-m", "the join", "the-other-hand")
+    joined = git_rev_parse(repo, "factory-integration-like")
+
+    for ref, expected in (
+        ("factory-integration-like", joined),
+        ("factory-integration-like^1", first),
+        ("factory-integration-like^2", second),
+    ):
+        status, body = process_git_rev_parse_request(
+            {"repo": REPO_KEY, "ref": ref}, config=cfg
+        )
+        assert status == 200, (ref, body)
+        assert body["sha"] == expected, ref
+    # A third parent answers nothing, which is how "exactly two" is proved.
+    status, body = process_git_rev_parse_request(
+        {"repo": REPO_KEY, "ref": "factory-integration-like^3"}, config=cfg
+    )
+    assert status == 200 and body == {"sha": None}
 
 
 # ---------------------------------------------------------------------------

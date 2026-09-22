@@ -1,10 +1,17 @@
-"""The attended ``forge merge-deploy`` command follows the merge card's order.
+"""The attended ``forge merge-deploy`` command follows the merge press's order.
 
-Protect-main (Part J, rule 39): the candidate is checked in the sandbox
-FIRST; only if every check passes does the merge land and that exact build
-get promoted. The command drives the same executor as the card press, so it
-cannot keep the old order — this proves it, with the NATS, guardkit and
-deploy seams faked and a real git repository for the branch.
+The one-true-copy design (2026-09-21) changed that order, and this file was
+left pinning the old one. The work is now JOINED onto the branch of the remote
+it was recorded against, in a working folder of its own, and what is checked
+afterwards is the joined result and nothing else. So the order pinned here is:
+the merge command first, then the live check on the joined commit, then the
+candidate taken down — and there is no promote, because publication is not
+switched on and the press stops at "checked and ready to publish".
+
+The command drives the same executor as the card press, so it cannot keep an
+order of its own; this proves it, with the NATS, guardkit and deploy seams
+faked and a real git repository — with a bare "remote" beside it, because the
+join needs one — for the branch.
 """
 
 from __future__ import annotations
@@ -48,6 +55,23 @@ def _receipts_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return root
 
 
+def _bare_remote_for(root: Path, tmp_path: Path, name: str = "origin.git") -> Path:
+    """A "remote" that is a bare repository on disk, so nothing real is touched.
+
+    The merge word joins onto the branch of the remote the work was recorded
+    against, so a repository the press is driven against needs one.
+    """
+    bare = tmp_path / name
+    subprocess.run(
+        ["git", "init", "--bare", "-b", "main", "-q", str(bare)],
+        check=True,
+        capture_output=True,
+    )
+    _git(root, "remote", "add", "origin", str(bare))
+    _git(root, "push", "-q", "origin", "main")
+    return bare
+
+
 @pytest.fixture
 def repo_root(tmp_path: Path) -> Path:
     root = tmp_path / "api_test"
@@ -61,19 +85,32 @@ def repo_root(tmp_path: Path) -> Path:
     _git(root, "add", "feature.txt")
     _git(root, "commit", "-q", "-m", "the feature")
     _git(root, "checkout", "-q", "main")
+    _bare_remote_for(root, tmp_path)
     return root
 
 
 @pytest.fixture
-def pool(tmp_path: Path) -> SqliteLifecyclePersistence:
+def pool(tmp_path: Path, repo_root: Path) -> SqliteLifecyclePersistence:
     cx: sqlite3.Connection = sqlite_connect.connect_writer(tmp_path / "forge.db")
     migrations.apply_at_boot(cx)
     pool = SqliteLifecyclePersistence(connection=cx)
+    # The row carries where this work started and which branch of the remote
+    # it is aimed at: the merge word joins onto the branch the record names,
+    # and refuses a build that names none.
     cx.execute(
         "INSERT INTO builds (build_id, feature_id, repo, branch, feature_yaml_path, "
-        "status, triggered_by, correlation_id, queued_at, mode) VALUES "
-        "(?, ?, ?, ?, 'f.yaml', 'COMPLETE', 'cli', ?, '2026-09-07T00:00:00Z', 'mode-a')",
-        (BUILD_ID, FEATURE_ID, REPO, f"autobuild/{FEATURE_ID}", f"corr-{BUILD_ID}"),
+        "status, triggered_by, correlation_id, queued_at, mode, start_commit, "
+        "target_branch) VALUES "
+        "(?, ?, ?, ?, 'f.yaml', 'COMPLETE', 'cli', ?, '2026-09-07T00:00:00Z', "
+        "'mode-a', ?, 'main')",
+        (
+            BUILD_ID,
+            FEATURE_ID,
+            REPO,
+            f"autobuild/{FEATURE_ID}",
+            f"corr-{BUILD_ID}",
+            _git(repo_root, "rev-parse", "main"),
+        ),
     )
     cx.commit()
     return pool
@@ -158,30 +195,43 @@ def _wire(
     return {"order": order, "publisher": publisher, "merged": merged}
 
 
-def test_the_attended_command_checks_then_merges_then_promotes(
+def test_the_attended_command_joins_then_checks_the_joined_result(
     config, pool, repo_root, monkeypatch
 ) -> None:
     wired = _wire(monkeypatch, pool, repo_root)
     result = CliRunner().invoke(merge_deploy_cmd, [FEATURE_ID], obj=config)
     assert result.exit_code == 0, result.output
-    assert wired["order"] == ["candidate_check", "merge", "promote"]
-    assert "result=merged-and-running" in result.output
+    # The join comes first, the live check runs on what it produced, and the
+    # candidate comes down. No promote: publication is not switched on.
+    assert wired["order"] == ["merge", "candidate_check", "candidate_down"]
+    assert "result=publication-pending" in result.output
+    assert "merged-and-running" not in result.output
+    assert "checked and ready to publish" in result.output
     assert "checked in the sandbox before merging: pass (5 of 5 checks passed)" in result.output
     assert f"merged_sha={wired['merged']}" in result.output
     report = wired["publisher"].reports[0]
     assert report.gate_before_merge["verdict"] == "pass"
     assert report.gate_before_merge["trees_match"] is True
+    # The project's own copy was never switched or merged into.
+    assert _git(repo_root, "rev-parse", "--abbrev-ref", "HEAD") == "main"
     # The tree it laid out is gone again.
     assert not (repo_root / ".forge-candidates" / FEATURE_ID).exists()
 
 
-def test_the_attended_command_never_merges_a_branch_that_failed_its_check(
+def test_the_attended_command_publishes_nothing_when_the_check_on_the_join_is_red(
     config, pool, repo_root, monkeypatch
 ) -> None:
+    """The check now runs on the JOINED result, so a red one cannot un-join it.
+
+    What it can do, and what this pins, is stop everything after it: the
+    result is ``candidate-refused``, nothing is published, nothing is
+    deployed, and the project's own copy is exactly what it was.
+    """
     wired = _wire(monkeypatch, pool, repo_root, candidate_verdict="fail")
+    main_before = _git(repo_root, "rev-parse", "main")
     result = CliRunner().invoke(merge_deploy_cmd, [FEATURE_ID], obj=config)
     assert result.exit_code == 1
-    assert wired["order"] == ["candidate_check"]
+    assert wired["order"] == ["merge", "candidate_check"]
     assert "result=candidate-refused" in result.output
     assert "failed_step=candidate" in result.output
     assert (
@@ -189,8 +239,10 @@ def test_the_attended_command_never_merges_a_branch_that_failed_its_check(
         "checks (etag); nothing was merged and the branch is kept."
     ) in result.output
     assert "checked in the sandbox before merging: fail (4 of 5 checks passed)" in result.output
-    # main did not move.
-    assert _git(repo_root, "rev-parse", "main") != wired["merged"]
+    # The project's own main did not move, and neither did its checked-out
+    # branch: the join happened in a working folder of its own.
+    assert _git(repo_root, "rev-parse", "main") == main_before
+    assert _git(repo_root, "rev-parse", "--abbrev-ref", "HEAD") == "main"
 
 
 # ---------------------------------------------------------------------------
@@ -266,10 +318,17 @@ def test_a_repair_named_by_build_id_merges_its_recorded_branch(
     repair_tip = _git(repo_root, "rev-parse", REPAIR_BRANCH)
     pool.connection.execute(
         "INSERT INTO builds (build_id, feature_id, repo, branch, feature_yaml_path, "
-        "status, triggered_by, correlation_id, queued_at, mode, task_id) VALUES "
+        "status, triggered_by, correlation_id, queued_at, mode, task_id, "
+        "start_commit, target_branch) VALUES "
         "(?, ?, ?, 'repair/TASK-MD1FIX1', 'f.yaml', 'COMPLETE', 'cli', ?, "
-        "'2026-09-07T12:00:00Z', 'mode-c', 'TASK-MD1FIX1')",
-        (REPAIR_BUILD_ID, FEATURE_ID, REPO, f"corr-{REPAIR_BUILD_ID}"),
+        "'2026-09-07T12:00:00Z', 'mode-c', 'TASK-MD1FIX1', ?, 'main')",
+        (
+            REPAIR_BUILD_ID,
+            FEATURE_ID,
+            REPO,
+            f"corr-{REPAIR_BUILD_ID}",
+            _git(repo_root, "rev-parse", "main"),
+        ),
     )
     pool.connection.commit()
     pool.record_merge_branch(REPAIR_BUILD_ID, REPAIR_BRANCH)
@@ -281,9 +340,14 @@ def test_a_repair_named_by_build_id_merges_its_recorded_branch(
 
     assert result.exit_code == 0, result.output
     assert wired["argv"][0][-2:] == ["--branch", REPAIR_BRANCH]
-    assert f"merge-deploy {FEATURE_ID} (branch {REPAIR_BRANCH}) @ {REPO}: result=merged-and-running" in result.output
+    assert (
+        f"merge-deploy {FEATURE_ID} (branch {REPAIR_BRANCH}) @ {REPO}: "
+        "result=publication-pending"
+    ) in result.output
     report = wired["publisher"].reports[0]
     assert report.branch == REPAIR_BRANCH
+    # What was checked is the JOINED commit, not the branch's own tip — the
+    # whole point of the join — and there is one tree, so it matches itself.
     assert report.gate_before_merge["candidate_sha"] == repair_tip
     assert report.gate_before_merge["trees_match"] is True
     assert not (repo_root / ".forge-candidates" / FEATURE_ID).exists()
@@ -300,7 +364,9 @@ def test_a_feature_build_is_merged_without_a_branch_flag_and_named_as_before(
     assert result.exit_code == 0, result.output
     assert "--branch" not in wired["argv"][0]
     assert wired["argv"][0][-1] == "--json"
-    assert f"merge-deploy {FEATURE_ID} @ {REPO}: result=merged-and-running" in result.output
+    assert (
+        f"merge-deploy {FEATURE_ID} @ {REPO}: result=publication-pending"
+    ) in result.output
     assert "(branch " not in result.output
     assert wired["publisher"].reports[0].branch == f"autobuild/{FEATURE_ID}"
 
@@ -332,6 +398,9 @@ def sandbox_clone(tmp_path: Path) -> Path:
     _git(root, "add", "feature.txt")
     _git(root, "commit", "-q", "-m", "the feature")
     _git(root, "checkout", "-q", "main")
+    # The sandbox's own clone needs the remote too: the press's git runs in
+    # there, so that is where the join's fetch happens.
+    _bare_remote_for(root, tmp_path, name="sandbox-origin.git")
     return root.resolve()
 
 
@@ -397,8 +466,13 @@ def test_the_attended_command_presses_a_sandboxed_repository_in_its_sandbox(
     result = CliRunner().invoke(merge_deploy_cmd, [FEATURE_ID], obj=settings)
 
     assert result.exit_code == 0, result.output
-    assert wired["order"] == ["candidate_check", "merge", "promote"]
-    assert "result=merged-and-running" in result.output
+    assert wired["order"] == ["merge", "candidate_check", "candidate_down"]
+    assert "result=publication-pending" in result.output
+    assert "merged-and-running" not in result.output
+    # The join was made in the SANDBOX's clone, in a working folder of its
+    # own, and that clone's own checked-out branch never moved.
+    assert (sandbox_clone / ".forge" / "worktrees" / f"integration-{FEATURE_ID}").exists()
+    assert _git(sandbox_clone, "rev-parse", "--abbrev-ref", "HEAD") == "main"
     # The candidate was laid out in the clone, and taken away again.
     assert not (on_this_side / ".forge-candidates").exists()
     assert not (sandbox_clone / ".forge-candidates" / FEATURE_ID).exists()
