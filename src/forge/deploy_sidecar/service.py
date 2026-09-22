@@ -1876,7 +1876,21 @@ GIT_REV_PARSE_TIMEOUT_SECONDS: float = 30.0
 #: The shape a branch name or a ref must have before git sees it: it starts
 #: with a letter or digit (never a dash, so it can never be read as an
 #: option), and carries only the characters branch names and revisions use.
-REF_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/\-]*(\^\{[a-z]+\})?$")
+#:
+#: It ends, optionally, in ONE of the two suffixes the press asks for: a
+#: peel (``^{tree}``, ``^{commit}``) or a numbered parent (``^1``, ``^2``).
+#: The parent form was missing, and without it the whole of "picking up" was
+#: dead in a sandbox: asking whether an interrupted attempt's branch is a
+#: merge of exactly G and the build's tip is asking for ``<branch>^1`` and
+#: ``<branch>^2``, this route refused both, and the answer came back "it is
+#: not a merge commit" for a branch that was one. A sandboxed repository
+#: would have set its real join aside and joined afresh, every time, for
+#: ever. Neither form can carry a space, a dash at the front or anything the
+#: rest of the pattern does not already allow, so git still sees one plain
+#: revision.
+REF_NAME_PATTERN = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._/\-]*(\^[1-9][0-9]*|\^\{[a-z]+\})?$"
+)
 
 
 @dataclass(frozen=True)
