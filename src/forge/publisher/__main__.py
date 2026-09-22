@@ -2,9 +2,13 @@
 
     python -m forge.publisher --settings <path to its settings file>
 
-It binds on loopback only, prints the address it bound to on one line so that
-whatever started it can find the port when the kernel picked one, and then
-serves until it is stopped.
+It binds where its settings say — the loopback address by default, which is
+right for a publisher run outside a container, and every address inside its
+own container when it is run as the service the compose fragment describes,
+which publishes no port and puts it on a network the coordinator alone
+shares. It prints the address it bound to on one line so that whatever
+started it can find the port when the kernel picked one, and then serves
+until it is stopped.
 
 IT PRINTS NO CREDENTIAL, and it cannot: the only thing it holds is a
 :class:`~forge.publisher.credential.Credential`, which shows itself as

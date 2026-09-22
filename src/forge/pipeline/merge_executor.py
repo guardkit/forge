@@ -2502,6 +2502,16 @@ async def execute_merge_deploy(
                 line belongs to, and the joined commit the line says it ran on. A
                 line from another attempt, or one that ran on a different joined
                 commit, is somebody else's answer to somebody else's question.
+
+                A LINE THAT NAMES NO COMMIT AT ALL IS NOT ABOUT THIS ONE EITHER
+                (22 September 2026, the stage's reviewer). This used to let such
+                a line through, and the publisher never did: it requires the
+                line to say it ran on exactly this joined commit before it will
+                count the step as passed. Two readers of one record have to read
+                it the same way, or the press can call a join checked and the
+                publisher then refuse to send it — the same record, two answers.
+                A line with no commit on it is evidence about no commit, and the
+                press now says so too.
                 """
                 if record is None or not j_commit:
                     return None
@@ -2514,7 +2524,7 @@ async def execute_merge_deploy(
                     ran_on = str(
                         line.detail.get("ran_on") or line.detail.get("j_commit") or ""
                     )
-                    if ran_on and ran_on != str(j_commit):
+                    if ran_on != str(j_commit):
                         continue
                     found = line
                 return found

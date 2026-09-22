@@ -46,6 +46,7 @@ from forge.cli._serve_config import ServeConfig
 from forge.config.models import ForgeConfig
 from forge.lifecycle.migrations import apply_at_boot
 from forge.lifecycle.persistence import SqliteLifecyclePersistence
+from forge.pipeline.publication_switch import say_where_publication_stands_at_boot
 from forge.lifecycle_bridge import (
     LifecycleBridge,
     LifecycleBridgeWireup,  # noqa: F401  (re-exported via wireup parts contract)
@@ -1067,6 +1068,16 @@ def bind_production_serve(config: ServeConfig, forge_config: ForgeConfig) -> Non
             "it. Pass --config <path> to ``forge serve`` or run from a "
             "directory containing ./forge.yaml."
         )
+
+    # Step 1.2 (22 September 2026) — WHERE PUBLICATION STANDS, said once, at
+    # boot. The design's section G says the activation check is run again each
+    # time the coordinator starts. The merge press asks it per press, which
+    # settles what each press does but tells nobody who started this process
+    # where things stand; a condition that went false is then discovered only
+    # by pressing merge. This is ONE line saying either that publication is
+    # on, or that it is off and which condition failed. It decides nothing and
+    # sends nothing — the press asks again, and that answer is what governs.
+    say_where_publication_stands_at_boot(forge_config)
 
     # Step 1.5 — validate ``autobuild_runner_url`` is set
     # (TASK-FORGE-FRR-F010I/J). The in-process ASGI fallback path

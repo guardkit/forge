@@ -47,7 +47,7 @@ working folder of its own, and runs both kinds of check on the joined result.
 Then one of two things:
 
 * **publication switched off** — the default, and what every forge does until
-  the five conditions of the design's section G hold. Nothing is sent to the
+  every condition of the design's section G holds. Nothing is sent to the
   remote and nothing is deployed. The result word is ``publication-pending``
   and the sentence says why publication is off;
 * **publication switched on** — the publisher, a separate process holding the

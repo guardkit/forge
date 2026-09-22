@@ -1,25 +1,38 @@
 # The publisher as a service, for the rollout to paste in. NOT STARTED by the
 # stage that wrote it, and the image beside it is not built by it either.
 #
-# READ THE FIVE THINGS THIS FRAGMENT IS SAYING, because each one is one of the
+# READ THE SIX THINGS THIS FRAGMENT IS SAYING, because each one is one of the
 # conditions the activation check refuses without
 # (forge/src/forge/pipeline/publication_activation.py):
 #
 #   1. the credential file is mounted READ-ONLY, into this service and into
 #      nothing else. It is not in the coordinator's settings, not in the
 #      runner's, and not in any sandbox's;
-#   2. the ledger is mounted READ-ONLY. The publisher reads the record and
-#      writes nothing to it, ever;
-#   3. the publisher is bound to LOOPBACK. No sandbox can reach it;
+#   2. the ledger's FOLDER is mounted READ-ONLY. The publisher reads the
+#      record and writes nothing to it, ever. Why the folder and not the one
+#      file is written out below, where it is mounted;
+#   3. the publisher listens on every address INSIDE this container and
+#      publishes NO port. What can reach it is exactly what is on its network,
+#      and its network has the coordinator on it and nothing else. Why, and
+#      why the other two ways of doing this do not work, is written out below,
+#      where the network is declared;
 #   4. it has no docker socket, no project checkout and no deploy step. It
 #      cannot build anything and cannot run a project's own program;
 #   5. the project's copy is reached through a READ-ONLY git address — the
 #      sandbox's own git service for a project built in a sandbox, or the
 #      copy itself for a project built here. There is no writable path into
-#      any project's copy anywhere in this fragment.
+#      any project's copy anywhere in this fragment;
+#   6. nothing else is on the publisher's network. That is condition 3 said as
+#      a thing somebody can count, and it is the activation check's question
+#      "only-the-coordinator-is-on-the-publishers-network", which can only be
+#      answered by looking at the real machine at rollout.
 #
 # The two addresses per project live in the settings file, not here, because
-# they are settings and not plumbing.
+# they are settings and not plumbing. That settings file must say that the
+# publisher listens on every address ("host": "0.0.0.0"), which is what makes
+# it reachable from the coordinator across this network; its default of the
+# loopback address is right for a publisher run outside a container and wrong
+# for this one.
 
 services:
   forge-publisher:
@@ -29,17 +42,57 @@ services:
     image: forge-publisher:local
     container_name: forge-publisher
     restart: unless-stopped
-    # LOOPBACK ONLY. Anything that can reach this can ask for a send.
-    ports:
-      - "127.0.0.1:8711:8711"
+    # ------------------------------------------------------------------
+    # WHERE THE PUBLISHER LISTENS, AND WHY IT IS THIS WAY AND NOT THE OTHER
+    # TWO (22 September 2026, the stage's reviewer).
+    #
+    # The publisher must be reachable by the coordinator and by nothing else:
+    # anything that can reach it can ask for a send. There are three ways to
+    # arrange that, and two of them do not work:
+    #
+    #   * it listens on the loopback address inside its container and a port
+    #     is published to the host — what this fragment used to say. It cannot
+    #     work: a published port carries traffic to the container's own
+    #     address, and something listening on the container's loopback address
+    #     alone never hears it. The service would answer nobody;
+    #   * it listens on every address and a port is published — then every
+    #     container on the default network can reach it, sandboxes included,
+    #     and the condition "no sandbox can reach the publisher" is false;
+    #   * IT LISTENS ON EVERY ADDRESS INSIDE ITS CONTAINER, NO PORT IS
+    #     PUBLISHED, AND IT IS ON A NETWORK OF ITS OWN THAT ONLY THE
+    #     COORDINATOR SHARES. Then the set of things that can reach it is the
+    #     set of things on that network, which is one thing, and it is not
+    #     reachable from the host at all. That is what is written below.
+    #
+    # NO ``ports:`` KEY. Its absence is the point and it is said here so that
+    # nobody adds one back as a convenience: a published port would put the
+    # publisher on the host, where everything that can reach the host can ask
+    # it for a send. To look at it by hand at rollout, join its network from a
+    # throwaway container instead of publishing a port.
+    #
+    # The sandbox is NOT on this network, and the activation check's sixth
+    # question is the check of that, asked of the real machine at rollout.
+    networks:
+      - forge-publisher-net
     volumes:
       # Its settings: which projects, which addresses, where the ledger is.
       - ./settings.json:/etc/forge-publisher/settings.json:ro
       # THE ONE FILE THE CREDENTIAL IS IN. Read-only, and mounted nowhere else
       # in this estate.
       - ${FORGE_PUBLISHER_CREDENTIAL_FILE}:/etc/forge-publisher/credential:ro
-      # The ledger, READ-ONLY. The publisher is a reader of the record.
-      - ${FORGE_LEDGER_FILE}:/var/lib/forge/forge.db:ro
+      # THE LEDGER'S FOLDER, READ-ONLY — the folder, and not the one file.
+      #
+      # WHY THE FOLDER (22 September 2026, the stage's reviewer, who tried it
+      # the other way). The ledger is not one file while it is being used: its
+      # store keeps companion files beside it, in the same folder, holding the
+      # writes that have not yet been folded into the main file, and a reader
+      # is only reading the record if it can see those too. Mounting the one
+      # file hides them, and the reader then does not merely miss the newest
+      # rows — it finds no record table at all ("no such table:
+      # publication_records", reproduced). Mounting the folder read-only gives
+      # the publisher the whole record and still lets it write nothing: it
+      # opens the ledger read-only as well, so there are two walls, not one.
+      - ${FORGE_LEDGER_DIR}:/var/lib/forge:ro
       # Its own folder for its own copies of the projects' commits.
       - forge-publisher-state:/home/publisher/state
     # No docker socket. No sandbox. No project checkout. Nothing to build with.
@@ -58,6 +111,29 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
+
+networks:
+  # THE PUBLISHER'S OWN NETWORK. The coordinator's own service joins this one
+  # as well — it is the only other thing that may — and nothing else does. No
+  # sandbox, no runner, no project's own service. This network is what makes
+  # "no sandbox can reach the publisher" true, and counting what is on it is
+  # what makes it checkable.
+  #
+  # IT IS NOT AN ``internal`` NETWORK, and that is deliberate: the publisher's
+  # whole job is to reach the project's remote, which is outside. Shutting the
+  # network off from outside would leave a publisher that can be asked to send
+  # and can never send.
+  #
+  # WHAT IS NOT SETTLED HERE, and is named rather than papered over. The
+  # publisher also has to READ each project's copy, at the read-only address
+  # in its settings; for a project built in a sandbox that address is the
+  # sandbox's own git service. Putting that service on this network would put
+  # the sandbox within reach of the publisher and undo the whole arrangement,
+  # so it must be reached some other way — one direction only, publisher to
+  # the copy. Which way is a rollout decision about the real machine, it is
+  # not made here, and the sixth condition is asked again after it is made.
+  forge-publisher-net:
+    driver: bridge
 
 volumes:
   forge-publisher-state:

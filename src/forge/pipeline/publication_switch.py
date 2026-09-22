@@ -1,4 +1,4 @@
-"""Is publication switched on? One setting, and five things that must hold.
+"""Is publication switched on? One setting, and the conditions that must hold.
 
 One-true-copy design pass, item 1: the second revision's section D and the
 third revision's section G.
@@ -15,7 +15,7 @@ every caller asks the same question:
 1. **a setting turns it on.** ``publication.enabled`` is False by default, so
    a forge that says nothing publishes nothing;
 2. **the activation check passes.** Turning the setting on is not permission:
-   the five conditions of section G are asked
+   section G's conditions are asked
    (:mod:`forge.pipeline.publication_activation`) and publication stays off,
    with the reason in plain words, unless every one of them holds. The check
    is asked again on every press and at every coordinator start, so a
@@ -55,6 +55,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "PUBLICATION_IS_OFF_SENTENCE",
     "publication_is_switched_on",
+    "say_where_publication_stands_at_boot",
     "the_activation_check",
     "why_publication_is_off",
 ]
@@ -76,14 +77,14 @@ def _the_setting_says_on(config: Any) -> bool:
 def the_activation_check(
     config: Any = None, machine: WhatTheMachineSays | None = None
 ) -> TheVerdict:
-    """Ask section G's five questions. Never raises."""
+    """Ask section G's questions. Never raises."""
     return run_the_activation_check(config, machine)
 
 
 def publication_is_switched_on(
     config: Any = None, machine: WhatTheMachineSays | None = None
 ) -> bool:
-    """Is publication on: the setting says so AND all five conditions hold."""
+    """Is publication on: the setting says so AND every condition holds."""
     if not _the_setting_says_on(config):
         return False
     verdict = the_activation_check(config, machine)
@@ -107,3 +108,37 @@ def why_publication_is_off(
             "checks and stops there"
         )
     return the_activation_check(config, machine).sentence
+
+
+def say_where_publication_stands_at_boot(
+    config: Any = None, machine: WhatTheMachineSays | None = None
+) -> str:
+    """ONE LINE, said when the coordinator starts. Never raises.
+
+    The design's section G says the check is run again each time the
+    coordinator starts. The press asks it per merge word, which settles what
+    each press does; it does not tell the person who started the coordinator
+    where publication stands, and a condition that quietly went false is then
+    found only by pressing merge. So it is asked once at boot as well, and the
+    one line says either that publication is on, or that it is off and which
+    condition failed.
+
+    It CHANGES NOTHING. It sends nothing, writes nothing and decides nothing:
+    the press asks the same question again when it presses, and that answer,
+    not this one, is what governs a send.
+    """
+    try:
+        if publication_is_switched_on(config, machine):
+            line = "publication is ON: the setting says so and every condition holds"
+            logger.info("publication at boot: %s", line)
+            return line
+        line = f"publication is OFF: {why_publication_is_off(config, machine)}"
+        logger.info("publication at boot: %s", line)
+        return line
+    except Exception as exc:  # noqa: BLE001 - a boot line never stops a boot
+        line = (
+            "publication is OFF: where publication stands could not be worked "
+            f"out at boot ({type(exc).__name__})"
+        )
+        logger.warning("publication at boot: %s", line)
+        return line
