@@ -207,7 +207,7 @@ def test_the_attended_command_joins_then_checks_the_joined_result(
     assert "result=publication-pending" in result.output
     assert "merged-and-running" not in result.output
     assert "checked and ready to publish" in result.output
-    assert "checked in the sandbox before merging: pass (5 of 5 checks passed)" in result.output
+    assert "live check of the joined result in the sandbox: pass (5 of 5 checks passed)" in result.output
     assert f"merged_sha={wired['merged']}" in result.output
     report = wired["publisher"].reports[0]
     assert report.gate_before_merge["verdict"] == "pass"
@@ -238,7 +238,7 @@ def test_the_attended_command_publishes_nothing_when_the_check_on_the_join_is_re
         f"{FEATURE_ID} was checked in the sandbox before merging and failed 1 of 5 "
         "checks (etag); nothing was merged and the branch is kept."
     ) in result.output
-    assert "checked in the sandbox before merging: fail (4 of 5 checks passed)" in result.output
+    assert "live check of the joined result in the sandbox: fail (4 of 5 checks passed)" in result.output
     # The project's own main did not move, and neither did its checked-out
     # branch: the join happened in a working folder of its own.
     assert _git(repo_root, "rev-parse", "main") == main_before

@@ -286,7 +286,7 @@ class MergeDeployOutcome:
     # merged-into-the-remote-and-running — are defined but NOT reachable while
     # publication is switched off, and a test pins that.
     result: str
-    status: str  # PASSED | FAILED | SKIPPED
+    status: str  # PASSED | FAILED | SKIPPED | GATED (a reused join whose checks have not all run: not a pass, not a failure, the build row is left open)
     detail: str
     merged_sha: str | None = None
     failed_step: str | None = None
@@ -2675,23 +2675,38 @@ async def execute_merge_deploy(
             # check's alone — so the sentence must not call that "checked"
             # flatly. The record is the thing a publisher reads; the
             # sentence is the thing a person reads, and it says the same.
-            if _the_build_systems_checks_ran_on_j():
-                what_ran = f"the joined result {str(j_commit)[:10]} was checked{checks}"
-            else:
-                what_ran = (
-                    f"the factory's own live check ran on the joined result "
-                    f"{str(j_commit)[:10]}{checks}, but the build system's own "
-                    "checks after a join were not re-run on it — this press "
-                    "picked up a join an earlier one had already made"
+            both_kinds_ran = _the_build_systems_checks_ran_on_j()
+            if both_kinds_ran:
+                detail = (
+                    f"{named} was joined onto {target_branch} at "
+                    f"{g_commit[:10]} in a working folder of its own, and "
+                    f"the joined result {str(j_commit)[:10]} was checked{checks}. "
+                    "It is checked and ready to publish; publication is not "
+                    "switched on, so nothing was sent to the remote and nothing "
+                    "was deployed. The branch is kept."
                 )
-            detail = (
-                f"{named} was joined onto {target_branch} at "
-                f"{g_commit[:10]} in a working folder of its own, and "
-                f"{what_ran}. "
-                "It is checked and ready to publish; publication is not "
-                "switched on, so nothing was sent to the remote and nothing "
-                "was deployed. The branch is kept."
-            )
+            else:
+                # NOT READY (22 September 2026, the second reviewer's first
+                # finding). This press picked up a join an earlier one made;
+                # reuse means the merge command is not run again, and the build
+                # system's own checks after a join live inside it, so they have
+                # NEVER run on this J. One kind of check is not "checked". The
+                # result must not read as a pass: the record already says so
+                # (no done merge-checks line), and the sentence and the status
+                # say the same. Running those checks on a J the press did not
+                # just make is the executor stage's to build.
+                detail = (
+                    f"{named} was joined onto {target_branch} at "
+                    f"{g_commit[:10]} in a working folder of its own; the "
+                    f"factory's own live check ran on the joined result "
+                    f"{str(j_commit)[:10]}{checks}, but the build system's "
+                    "checks after a join have not run on it, because this "
+                    "press picked up a join an earlier one had already made "
+                    "and does not run the merge command again. It is NOT yet "
+                    "checked and not ready to publish. Nothing was sent to the "
+                    "remote and nothing was deployed. The branch and the join "
+                    "are kept."
+                )
             _write_receipt(
                 "merge_deploy_publication.json",
                 {
@@ -2705,11 +2720,14 @@ async def execute_merge_deploy(
                     "attempt": attempt,
                     "turn": turn,
                     "checked": what_was_checked,
+                    "both_kinds_of_check_ran_on_j": both_kinds_ran,
+                    "ready_to_publish": both_kinds_ran,
                 },
             )
             return MergeDeployOutcome(
                 result=RESULT_WORD_PUBLICATION_PENDING,
-                status="PASSED",
+                # A pass only when BOTH kinds of check ran and passed on J.
+                status="PASSED" if both_kinds_ran else "GATED",
                 merged_sha=j_commit,
                 detail=detail,
                 checks_passed=checks_passed,
