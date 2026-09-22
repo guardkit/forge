@@ -742,6 +742,29 @@ class CandidateTreeLayout:
     exclude_written: bool | None = None
 
 
+@dataclass(frozen=True)
+class WorkingFolder:
+    """A working folder of its own, made at a named commit — or why not.
+
+    One-true-copy design pass, item 1, "Every step happens in a working folder
+    of its own". The merge used to switch the branch checked out in the
+    project's main copy; now it is done in a git worktree made at the commit
+    being joined onto, so the main copy is never switched, reset or merged
+    into by the factory at all.
+
+    ``ok`` is True when the folder is there — ``reused`` says whether this
+    call made it or found it already made, which is exactly what a pick-up
+    needs to know. ``refusal`` carries one plain sentence when it is not.
+    """
+
+    ok: bool
+    path: str | None = None
+    branch: str | None = None
+    base_ref: str | None = None
+    reused: bool = False
+    refusal: str | None = None
+
+
 @runtime_checkable
 class CandidateGit(Protocol):
     """One repository's git operations, wherever they happen.
@@ -784,6 +807,25 @@ class CandidateGit(Protocol):
         self, feature_id: str, path: str | None = None
     ) -> bool:
         """Remove the laid-out tree. Never raises; ``False`` when it could not."""
+
+    async def add_working_folder(
+        self, leaf: str, branch: str, base_ref: str
+    ) -> WorkingFolder:
+        """Make a working folder at ``base_ref``, on a new branch ``branch``.
+
+        ``leaf`` is the folder's own NAME, never a path: the venue decides
+        where the repository is, because only the venue knows. A repository
+        that lives in a sandbox has a path in there that has nothing to do
+        with the path the coordinator knows it by, and a path sent from this
+        side would be a path into somewhere else entirely. The answer carries
+        the path the folder really has, where the folder really is.
+
+        The merge word's join happens in here. Never raises: everything that
+        can go wrong comes back as ``ok=False`` with a plain sentence.
+        """
+
+    async def remove_working_folder(self, path: str) -> bool:
+        """Remove a working folder. A path already gone is a success."""
 
     async def inspect_autobuild_worktree(
         self, build_id: str, path: str
@@ -840,6 +882,69 @@ class InContainerCandidateGit:
     ) -> bool:
         where = path or str(candidate_tree_path(self._repo_root, feature_id))
         return await remove_candidate_tree(where)
+
+    async def add_working_folder(
+        self, leaf: str, branch: str, base_ref: str
+    ) -> WorkingFolder:
+        """``git worktree add -b <branch> <repo>/.forge/worktrees/<leaf> <base_ref>``.
+
+        The same function the planning chain already uses to cut a journey's
+        tree (:func:`forge.cli._conductor_worktree.cut_worktree_in_checkout`),
+        called with the commit to start from. Nothing new had to be built for
+        this and no new route had to be added: the operation the factory
+        already has does exactly this.
+        """
+        from forge.cli._conductor_worktree import (
+            WORKTREES_DIR,
+            cut_worktree_in_checkout,
+        )
+
+        leaf = Path(str(leaf)).name
+        path = self._repo_root / WORKTREES_DIR / leaf
+        try:
+            cut = await cut_worktree_in_checkout(
+                checkout=self._repo_root,
+                build_id=leaf,
+                branch=str(branch),
+                base_ref=str(base_ref),
+            )
+        except Exception as exc:  # noqa: BLE001 — a refusal, never an exception
+            return WorkingFolder(
+                ok=False,
+                branch=str(branch),
+                base_ref=str(base_ref),
+                refusal=(
+                    f"a working folder for the join could not be made at "
+                    f"{path}: {type(exc).__name__}: {exc}"
+                ),
+            )
+        return WorkingFolder(
+            ok=bool(cut.ok),
+            path=cut.path or (str(path) if cut.ok else None),
+            branch=cut.branch,
+            base_ref=cut.base_ref,
+            reused=bool(cut.reused),
+            refusal=None if cut.ok else (cut.reason or "the folder was not made"),
+        )
+
+    async def remove_working_folder(self, path: str) -> bool:
+        from forge.cli._conductor_worktree import remove_journey_worktree
+
+        try:
+            removed = await remove_journey_worktree(worktree=str(path))
+        except Exception as exc:  # noqa: BLE001 — cleanup never raises past here
+            logger.warning(
+                "working folder: %s could not be removed (%s: %s)",
+                path,
+                type(exc).__name__,
+                exc,
+            )
+            return False
+        if not removed.ok:
+            logger.warning(
+                "working folder: %s could not be removed (%s)", path, removed.reason
+            )
+        return bool(removed.ok)
 
     @staticmethod
     def _autobuild_base() -> Path:

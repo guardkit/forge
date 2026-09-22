@@ -65,13 +65,20 @@ from typing import Final
 # itself declared its builds need from the launching process beyond the
 # factory's own list. NULL on every pre-existing row and read as "not
 # declared", which is not the same fact as an empty list ("the project was read
-# and asked for nothing extra").
+# and asked for nothing extra");
+# bumped to 15 (22 September 2026) to add the new ``publication_records``
+# table — one row per build saying who gave the merge word, which branch of
+# the remote the work is aimed at, the commit the join was made onto and the
+# joined commit it produced, what the checks found, and every step written
+# down twice (BEFORE it is done and again after), under a lease and a turn
+# number that make a worker which was only paused safe to replace. A build
+# with no row reads as "not recorded".
 # Future
 # schema bumps should follow the same pattern: append a sibling
 # ``schema_v{N}.sql`` and add a ``(N, "schema_v{N}.sql")`` entry to
 # ``_MIGRATIONS`` in ascending order. The runner applies every entry whose
 # version is greater than the current ``schema_version`` ledger row.
-_SCHEMA_VERSION: Final[int] = 14
+_SCHEMA_VERSION: Final[int] = 15
 _MIGRATIONS: Final[tuple[tuple[int, str], ...]] = (
     (1, "schema.sql"),
     (2, "schema_v2.sql"),
@@ -128,6 +135,16 @@ _MIGRATIONS: Final[tuple[tuple[int, str], ...]] = (
     # ``.guardkit/config.yaml`` and this column holds what was read. NULL-able:
     # "not declared", which is not the same as "declared, and empty".
     (14, "schema_v14.sql"),
+    # v15 (the merge word joins onto the remote) — the new
+    # ``publication_records`` table. Nothing wrote down what the merge word had
+    # already done, so a coordinator that stopped part-way could not tell a
+    # finished step from an unfinished one and the only way to find out was to
+    # ask the owner for the merge word again. The record says what is about to
+    # be done before it is done, and what it produced afterwards; every write
+    # to it is conditional on the turn number, so a worker that was replaced
+    # cannot change anything. Purely additive: one new table, no existing
+    # column touched.
+    (15, "schema_v15.sql"),
 )
 
 

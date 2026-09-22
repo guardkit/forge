@@ -73,6 +73,11 @@ def _git(repo: Path, *args: str) -> str:
 
 
 def _make_repo(root: Path) -> Path:
+    """A repository, with a bare "remote" for the merge word to join onto.
+
+    The remote is a bare repository beside it: real git, nobody's account, and
+    nothing here contacts anything.
+    """
     root.mkdir(parents=True)
     _git(root, "init", "-b", "main", "-q")
     (root / "README.md").write_text("first\n", encoding="utf-8")
@@ -83,6 +88,14 @@ def _make_repo(root: Path) -> Path:
     _git(root, "add", "feature.txt")
     _git(root, "commit", "-q", "-m", "the feature")
     _git(root, "checkout", "-q", "main")
+    bare = root.parent / f"{root.name}-origin.git"
+    subprocess.run(
+        ["git", "init", "--bare", "-b", "main", "-q", str(bare)],
+        check=True,
+        capture_output=True,
+    )
+    _git(root, "remote", "add", "origin", str(bare))
+    _git(root, "push", "-q", "origin", "main")
     return root.resolve()
 
 
@@ -246,9 +259,16 @@ def _build_row(pool: SqliteLifecyclePersistence, repo: str = REPO) -> None:
     pool.connection.execute(
         "INSERT OR IGNORE INTO builds (build_id, feature_id, repo, branch, "
         "feature_yaml_path, status, triggered_by, correlation_id, queued_at, "
-        "mode) VALUES (?, ?, ?, ?, 'f.yaml', 'COMPLETE', 'cli', ?, "
-        "'2026-09-08T00:00:00Z', 'mode-a')",
-        (BUILD_ID, FEATURE_ID, repo, f"autobuild/{FEATURE_ID}", CORRELATION),
+        "mode, start_commit, target_branch) VALUES (?, ?, ?, ?, 'f.yaml', "
+        "'COMPLETE', 'cli', ?, '2026-09-08T00:00:00Z', 'mode-a', ?, 'main')",
+        (
+            BUILD_ID,
+            FEATURE_ID,
+            repo,
+            f"autobuild/{FEATURE_ID}",
+            CORRELATION,
+            "0" * 40,
+        ),
     )
     pool.connection.commit()
 
@@ -388,9 +408,10 @@ class TestTheWholePressRunsWhereTheRepositoryLives:
             expect_main_sha=_git(clone, "rev-parse", "main"),
         )
 
-        assert outcome.result == "merged-and-running", outcome.detail
-        # Part J's order, unchanged in meaning.
-        assert deploy.legs() == ["candidate_check", "promote"]
+        assert outcome.result == "publication-pending", outcome.detail
+        # The join first, then the check on the joined result; nothing is
+        # published and nothing is deployed, so the candidate comes down.
+        assert deploy.legs() == ["candidate_check", "candidate_down"]
         # The candidate was laid out in the clone, and that is the tree the
         # deploy leg and the live gate were pointed at.
         assert deploy.seen["cwd"] == str(clone / ".forge-candidates" / FEATURE_ID)
@@ -427,7 +448,7 @@ class TestTheWholePressRunsWhereTheRepositoryLives:
             expect_main_sha=_git(clone, "rev-parse", "main"),
         )
 
-        assert outcome.result == "merged-and-running", outcome.detail
+        assert outcome.result == "publication-pending", outcome.detail
         assert git_calls.any_in(on_this_side) == []
         # Every git command this press caused ran in the clone.
         assert git_calls.any_in(clone), "the press asked git nothing at all"
@@ -442,14 +463,14 @@ class TestTheWholePressRunsWhereTheRepositoryLives:
         git_calls: _GitCalls,
         _receipts_env: Path,
     ) -> None:
-        """The ancestry guard asks the clone, so it still guards (rule 36)."""
+        """A remote that moved is joined onto, in the clone, not refused."""
         # Somebody else landed work on main after this branch was cut, in the
         # clone — which is the only copy that knows.
         (clone / "someone-else.txt").write_text("moved\n", encoding="utf-8")
         _git(clone, "add", "someone-else.txt")
         _git(clone, "commit", "-q", "-m", "somebody else landed work")
         moved_main = _git(clone, "rev-parse", "main")
-        merge = _FakeMergeCommand("0" * 40)
+        merge = _FakeMergeCommand(_git(clone, "rev-parse", f"autobuild/{FEATURE_ID}"))
         deploy = _FakeDeploy()
 
         outcome = await _press(
@@ -463,9 +484,11 @@ class TestTheWholePressRunsWhereTheRepositoryLives:
             expect_main_sha=moved_main,
         )
 
-        assert outcome.result == "merge-refused"
-        assert "main had moved since this was built" in outcome.detail
-        assert merge.calls == [], "nothing may be merged after a moved main"
+        # A remote that moved during the build is no longer a refusal: the
+        # work is JOINED onto where the remote is now, and the joined result
+        # is what gets checked. What the card pinned no longer decides it.
+        assert outcome.result == "publication-pending", outcome.detail
+        assert merge.calls, "the join must be made onto the commit the remote has"
         assert deploy.legs() == ["candidate_check", "candidate_down"]
         assert git_calls.any_in(on_this_side) == []
 
@@ -492,7 +515,7 @@ class TestTheWholePressRunsWhereTheRepositoryLives:
             expect_main_sha=_git(plain_checkout, "rev-parse", "main"),
         )
 
-        assert outcome.result == "merged-and-running", outcome.detail
+        assert outcome.result == "publication-pending", outcome.detail
         assert deploy.seen["cwd"] == str(
             plain_checkout / ".forge-candidates" / FEATURE_ID
         )
@@ -580,6 +603,15 @@ class TestTheWordsAfterAGreenMergeInTheSandbox:
     """A merge that landed in the factory's clone says where it landed and how
     to bring it over (sandbox first, 2026-09-07, rule 79)."""
 
+    @pytest.mark.skip(
+        reason=(
+            "the sentence this pins told an operator to fast-forward their own "
+            "checkout onto the sandbox's main. The merge word now joins onto a "
+            "branch of the factory's own and publication is switched off, so "
+            "there is nothing on anybody's main to fetch and saying so would be "
+            "false. A true version of it belongs to the publisher stage."
+        )
+    )
     @pytest.mark.asyncio
     async def test_the_report_carries_the_plain_sentence_and_the_exact_command(
         self,
@@ -604,7 +636,7 @@ class TestTheWordsAfterAGreenMergeInTheSandbox:
             publisher=publisher,
         )
 
-        assert outcome.result == "merged-and-running", outcome.detail
+        assert outcome.result == "publication-pending", outcome.detail
         checkout = str(on_this_side)
         command = (
             f"git -C {checkout} fetch sandbox-api-test-factory main && "
@@ -632,6 +664,15 @@ class TestTheWordsAfterAGreenMergeInTheSandbox:
         assert raw["sandbox_merge"]["fetch_command"] == command
         assert raw["detail"].endswith(command)
 
+    @pytest.mark.skip(
+        reason=(
+            "the sentence this pins told an operator to fast-forward their own "
+            "checkout onto the sandbox's main. The merge word now joins onto a "
+            "branch of the factory's own and publication is switched off, so "
+            "there is nothing on anybody's main to fetch and saying so would be "
+            "false. A true version of it belongs to the publisher stage."
+        )
+    )
     @pytest.mark.asyncio
     async def test_the_merge_receipt_records_where_the_merge_landed(
         self,
@@ -654,7 +695,7 @@ class TestTheWordsAfterAGreenMergeInTheSandbox:
             expect_main_sha=_git(clone, "rev-parse", "main"),
         )
 
-        assert outcome.result == "merged-and-running", outcome.detail
+        assert outcome.result == "publication-pending", outcome.detail
         landed = _receipt(_receipts_env, "merge_deploy_merge.json")[
             "landed_in_the_sandbox"
         ]
@@ -671,6 +712,15 @@ class TestTheWordsAfterAGreenMergeInTheSandbox:
             "fetch_command"
         ]
 
+    @pytest.mark.skip(
+        reason=(
+            "the sentence this pins told an operator to fast-forward their own "
+            "checkout onto the sandbox's main. The merge word now joins onto a "
+            "branch of the factory's own and publication is switched off, so "
+            "there is nothing on anybody's main to fetch and saying so would be "
+            "false. A true version of it belongs to the publisher stage."
+        )
+    )
     @pytest.mark.asyncio
     async def test_a_repository_without_a_sandbox_says_and_records_nothing_extra(
         self,

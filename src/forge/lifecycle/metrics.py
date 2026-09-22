@@ -86,6 +86,17 @@ MERGE_REPORT_TARGET_IDENTIFIER: str = "merge_deploy_executor"
 #: The one outcome word that means the repair closed itself: merged,
 #: deployed, and still green afterwards.
 MERGED_AND_RUNNING: str = "merged-and-running"
+#
+# NOT PRODUCIBLE SINCE 22 SEPTEMBER 2026 (the merge word's join). The press
+# stops at "checked and ready to publish" while publication is switched off,
+# and its result word is ``publication-pending``. This constant is still the
+# right reading of every row written BEFORE that change, which is what this
+# metric counts over, so it stays; a rate measured over a window after the
+# change will read zero until the publisher and the executor are built, and
+# that is honest rather than broken. When they are, the word this reads
+# becomes ``merged-into-github-and-running``
+# (``forge.pipeline.merge_executor.RESULT_WORD_MERGED_AND_RUNNING``) and this
+# line is the one place that has to learn it.
 
 
 #: Every repair row inside the window that somebody has not withdrawn.

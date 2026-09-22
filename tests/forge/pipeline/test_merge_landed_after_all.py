@@ -96,11 +96,31 @@ def repo(tmp_path: Path) -> Path:
     _git(root, "add", "feature.txt")
     _git(root, "commit", "-q", "-m", "the feature")
     _git(root, "checkout", "-q", "main")
+    # The merge word joins onto the branch of the remote the work was recorded
+    # against, so this repository has one: a bare repository beside it.
+    bare = tmp_path / "origin.git"
+    subprocess.run(
+        ["git", "init", "--bare", "-b", "main", "-q", str(bare)],
+        check=True,
+        capture_output=True,
+    )
+    _git(root, "remote", "add", "origin", str(bare))
+    _git(root, "push", "-q", "origin", "main")
     return root
 
 
 def _main_sha(repo: Path) -> str:
     return _git(repo, "rev-parse", "main")
+
+
+def _joined_sha(repo: Path) -> str | None:
+    """Where the factory's own integration branch is, or None."""
+    done = subprocess.run(
+        ["git", "rev-parse", "--verify", "--quiet",
+         f"factory-integration/{FEATURE_ID}"],
+        cwd=str(repo), capture_output=True, text=True,
+    )
+    return done.stdout.strip() or None
 
 
 def _write_guardkit(
@@ -116,12 +136,31 @@ def _write_guardkit(
 
 #: Merge the branch for real, print nothing, and die the way a killed command
 #: dies: exit 124 with the stopper's sentence on stderr and no report at all.
-MERGES_THEN_DIES = f"""
+
+#: What the real command is now given, and what these stand-ins have to
+#: honour: the branch to merge INTO (the factory's own integration branch) and
+#: the working folder to do it in. A stand-in that ignored them would merge
+#: into the repository's own main, which is exactly what the join stopped.
+_WHERE = """
+def where(argv):
+    target = "main"
+    folder = None
+    for i, token in enumerate(argv):
+        if token == "--target" and i + 1 < len(argv):
+            target = argv[i + 1]
+        if token == "--in-worktree" and i + 1 < len(argv):
+            folder = argv[i + 1]
+    return target, folder
+"""
+MERGES_THEN_DIES = _WHERE + f"""
 import subprocess, sys
 argv = sys.argv[1:]
 feature = argv[2]
+target, folder = where(argv)
 git = ["git", "-c", "user.email=t@example.invalid", "-c", "user.name=t",
        "-c", "commit.gpgsign=false"]
+if folder:
+    git += ["-C", folder]
 subprocess.run(git + ["merge", "--no-ff", "-m", "merge " + feature,
                       "autobuild/" + feature], check=True)
 sys.stderr.write({KILLED_SENTENCE!r})
@@ -154,15 +193,19 @@ sys.exit(2)
 #: protect-main the executor compares the merged commit's tree with the tree
 #: it checked before the merge, and an invented commit would refuse the
 #: promote — rightly.
-MERGES_AND_ECHOES = """
+MERGES_AND_ECHOES = _WHERE + """
 import json, os, subprocess, sys
 argv = sys.argv[1:]
 feature = argv[2]
+target, folder = where(argv)
 git = ["git", "-c", "user.email=t@example.invalid", "-c", "user.name=t",
        "-c", "commit.gpgsign=false"]
+if folder:
+    git += ["-C", folder]
 subprocess.run(git + ["merge", "--no-ff", "-m", "merge " + feature,
                       "autobuild/" + feature], check=True)
-post = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True,
+post = subprocess.run(["git"] + (["-C", folder] if folder else [])
+                      + ["rev-parse", "HEAD"], capture_output=True,
                       text=True, check=True).stdout.strip()
 print(json.dumps({
     "outcome": "merged", "post_sha": post, "verify_ok": True,
@@ -266,14 +309,15 @@ def _ensure_build(pool: SqliteLifecyclePersistence) -> None:
     pool.connection.execute(
         "INSERT OR IGNORE INTO builds (build_id, feature_id, repo, branch, "
         "feature_yaml_path, status, triggered_by, correlation_id, queued_at, "
-        "mode) VALUES (?, ?, ?, ?, 'f.yaml', 'COMPLETE', 'cli', ?, "
-        "'2026-09-06T00:00:00Z', 'mode-a')",
+        "mode, start_commit, target_branch) VALUES (?, ?, ?, ?, 'f.yaml', "
+        "'COMPLETE', 'cli', ?, '2026-09-06T00:00:00Z', 'mode-a', ?, 'main')",
         (
             BUILD_ID,
             FEATURE_ID,
             REPO_KEY,
             f"autobuild/{FEATURE_ID}",
             CORRELATION,
+            "0" * 40,
         ),
     )
     pool.connection.commit()
@@ -351,9 +395,12 @@ async def test_a_merge_that_landed_before_the_command_died_is_not_called_refused
         expect_main_sha=before,
     )
 
-    # git really did merge the branch: main moved and holds the branch tip.
-    after = _main_sha(repo)
-    assert after != before
+    # git really did join the work: the factory's own integration branch holds
+    # a commit of the remote's work and the build's, and the project's own
+    # main is exactly where it was.
+    after = _joined_sha(repo)
+    assert after is not None
+    assert _main_sha(repo) == before
     assert (
         subprocess.run(
             ["git", "merge-base", "--is-ancestor", f"autobuild/{FEATURE_ID}", after],
@@ -367,10 +414,10 @@ async def test_a_merge_that_landed_before_the_command_died_is_not_called_refused
     assert outcome.failed_step == "verify"
     assert outcome.merged_sha == after
     assert outcome.verify_status == "unverified"
-    assert f"{FEATURE_ID} merged ({after[:10]})" in outcome.detail
+    assert f"{FEATURE_ID} joined ({after[:10]})" in outcome.detail
     assert "could not finish" in outcome.detail
     assert KILLED_SENTENCE in outcome.detail
-    assert "The deploy was not dispatched." in outcome.detail
+    assert "Nothing was published." in outcome.detail
 
     # Nothing was deployed, one report went out, and no repair was filed:
     # what is broken is the check, and no amount of building mends that.
@@ -526,8 +573,8 @@ async def test_the_checks_time_limit_reaches_the_command_on_the_host(
         server.shutdown()
         server.server_close()
 
-    assert outcome.result == "merged-and-running"
-    assert deploy.calls  # a clean merge deploys
+    assert outcome.result == "publication-pending"
+    assert deploy.calls  # a clean join is checked
 
     receipt = json.loads(
         (_receipts_env / f"merge-{BUILD_ID}" / "merge_deploy_merge.json").read_text(
@@ -555,12 +602,15 @@ sys.exit(3)
 """
 
 #: Merges, then dies after a log line and one real sentence on stderr.
-MERGES_THEN_DIES_TALKING = f"""
+MERGES_THEN_DIES_TALKING = _WHERE + f"""
 import subprocess, sys
 argv = sys.argv[1:]
 feature = argv[2]
+target, folder = where(argv)
 git = ["git", "-c", "user.email=t@example.invalid", "-c", "user.name=t",
        "-c", "commit.gpgsign=false"]
+if folder:
+    git += ["-C", folder]
 subprocess.run(git + ["merge", "--no-ff", "-m", "merge " + feature,
                       "autobuild/" + feature], check=True)
 sys.stderr.write("INFO resolve_verify_command: repository toolchain declaration: "
@@ -683,6 +733,8 @@ async def test_a_merge_that_landed_is_never_run_twice(
     second, _, _ = await _press_merge(
         config=config, pool=pool, sidecar_url=sidecar, repo=repo, expect_main_sha=_main_sha(repo)
     )
-    assert second.result == "merge-refused"
-    assert "already on record" in second.detail
+    # The join was already made, so the second press picks it up: the same
+    # joined commit, the merge command not run again, no second merge word.
+    assert second.result == "publication-pending"
+    assert second.merged_sha == first.merged_sha
 
