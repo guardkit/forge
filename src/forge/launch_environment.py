@@ -7,8 +7,14 @@ to stop: *"Builds and checks are launched with a short list of named settings,
 not a copy of everything. That is worth doing whatever else is decided, and the
 list is the one the runner's settings file already names."*
 
-THE LIST IS THE RUNNER'S OWN, and it is read from two places that already name
-these settings and nothing else:
+THE LIST IS THE FACTORY'S OWN. Every name on it is something the factory
+itself sets or reads (its own binary, its own settings file, its receipts
+folder, its bus, its memory service, its model router, its switches) or the
+shell's own. Corrected 22 September 2026 after the stage's independent review:
+an earlier version said the list "is read from two places that already name
+these settings and nothing else"; in truth about half the names come from
+GuardKit's own code and appear in no unit or start script. The places that
+DO name some of them, and were the starting point:
 
 * the runner's unit and its drop-in on this machine — ``forge``'s
   ``ops/systemd/forge-langgraph-sidecar.service`` and
@@ -22,6 +28,17 @@ these settings and nothing else:
   switch somebody turned on by hand and whose own comment says the file is the
   whole switch. Those are on the list too — see "the switches the owner turned
   on" below, and the fault that put them there.
+
+NOTHING ON THIS LIST BELONGS TO THE PROJECT'S OWN TOOLS (22 September 2026,
+after the stage's independent review). An earlier version carried
+``UV_CACHE_DIR``, one Python package manager's cache; a project built with
+any other tool got nothing, and this is central code that applies to every
+project whatever it is written in. What a project's own builds need beyond
+this list (a package cache, a toolchain home) is the project's to declare, by
+NAME only, in its own ``.guardkit/config.yaml``, read at the commit the work
+starts from like its memory name: that is the next stage. Until it lands, a
+build gets no project-tool setting from the launch, which is the honest state,
+not a hidden one.
 
 STILL TO BE ENUMERATED, and named here rather than quietly assumed: the
 installed runner carries a third drop-in, ``…service.d/litellm.conf``
@@ -101,11 +118,6 @@ LAUNCH_SETTINGS: tuple[tuple[str, str], ...] = (
         "where a build's scratch files go; left off, a build writes into the "
         "machine's shared temporary folder, which a reboot empties underneath "
         "anything still running",
-    ),
-    (
-        "UV_CACHE_DIR",
-        "where the project's own build venv comes from, so a build does not "
-        "fetch the same dependencies again on every run",
     ),
     # --- the factory's own -------------------------------------------------
     (

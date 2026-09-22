@@ -31,7 +31,6 @@ PARENT = {
     "PATH": "/opt/venv/bin:/usr/bin",
     "HOME": "/home/agent",
     "TMPDIR": "/scratch",
-    "UV_CACHE_DIR": "/scratch/uv",
     "FORGE_GUARDKIT_PATH": "/opt/venv/bin/guardkit",
     "GUARDKIT_HARNESS": "langgraph",
     "FORGE_CONFIG_PATH": "/state/forge.yaml",
@@ -67,6 +66,23 @@ PARENT = {
 # ---------------------------------------------------------------------------
 # The list is a list, written down once
 # ---------------------------------------------------------------------------
+
+
+def test_a_project_tools_own_setting_is_not_on_the_central_list() -> None:
+    """A package manager's cache is the project's to declare, not the factory's.
+
+    22 September 2026: the central list once carried one Python package
+    manager's cache, and a project built with any other tool got nothing.
+    Central code names no project tool; what a project's builds need beyond
+    the factory's own settings is declared by the project (next stage).
+    """
+    parent = dict(PARENT)
+    parent.update({"UV_CACHE_DIR": "/scratch/uv", "npm_config_cache": "/scratch/npm",
+                   "CARGO_HOME": "/scratch/cargo", "GRADLE_USER_HOME": "/scratch/gradle"})
+    env = build_launch_env(parent=parent)
+    for name in ("UV_CACHE_DIR", "npm_config_cache", "CARGO_HOME", "GRADLE_USER_HOME"):
+        assert name not in env
+    assert "UV_CACHE_DIR" not in launch_setting_names()
 
 
 def test_every_setting_carries_a_reason() -> None:
