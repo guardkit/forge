@@ -1374,8 +1374,13 @@ def run_merge_command(
       child of it has no business reading that, and the named list already
       leaves it out.
 
-    The project's own commands — its declared check, its deploy script — go
-    through here too, and the factory does not know what those need. That is
+    The project's declared check and its live-gate driver go through here too,
+    and the factory does not know what those need. Its DEPLOY SCRIPT does NOT
+    yet (corrected 22 September 2026 after the stage's review): that runs
+    through ``process_run_request`` and ``executor/shell_steps.py``, which
+    still hands the child everything. It is closed in the executor stage, which
+    owns that path; until then the deploy script is the one command from the
+    helper that is not filtered. That is
     exactly what the project declares by name in its own settings file and what
     ``launch_settings`` carries: a project says what its scripts need, and it is
     passed. A project that has declared nothing gets the factory's list, which
