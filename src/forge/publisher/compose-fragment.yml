@@ -1,0 +1,63 @@
+# The publisher as a service, for the rollout to paste in. NOT STARTED by the
+# stage that wrote it, and the image beside it is not built by it either.
+#
+# READ THE FIVE THINGS THIS FRAGMENT IS SAYING, because each one is one of the
+# conditions the activation check refuses without
+# (forge/src/forge/pipeline/publication_activation.py):
+#
+#   1. the credential file is mounted READ-ONLY, into this service and into
+#      nothing else. It is not in the coordinator's settings, not in the
+#      runner's, and not in any sandbox's;
+#   2. the ledger is mounted READ-ONLY. The publisher reads the record and
+#      writes nothing to it, ever;
+#   3. the publisher is bound to LOOPBACK. No sandbox can reach it;
+#   4. it has no docker socket, no project checkout and no deploy step. It
+#      cannot build anything and cannot run a project's own program;
+#   5. the project's copy is reached through a READ-ONLY git address — the
+#      sandbox's own git service for a project built in a sandbox, or the
+#      copy itself for a project built here. There is no writable path into
+#      any project's copy anywhere in this fragment.
+#
+# The two addresses per project live in the settings file, not here, because
+# they are settings and not plumbing.
+
+services:
+  forge-publisher:
+    build:
+      context: ../../..
+      dockerfile: src/forge/publisher/Dockerfile
+    image: forge-publisher:local
+    container_name: forge-publisher
+    restart: unless-stopped
+    # LOOPBACK ONLY. Anything that can reach this can ask for a send.
+    ports:
+      - "127.0.0.1:8711:8711"
+    volumes:
+      # Its settings: which projects, which addresses, where the ledger is.
+      - ./settings.json:/etc/forge-publisher/settings.json:ro
+      # THE ONE FILE THE CREDENTIAL IS IN. Read-only, and mounted nowhere else
+      # in this estate.
+      - ${FORGE_PUBLISHER_CREDENTIAL_FILE}:/etc/forge-publisher/credential:ro
+      # The ledger, READ-ONLY. The publisher is a reader of the record.
+      - ${FORGE_LEDGER_FILE}:/var/lib/forge/forge.db:ro
+      # Its own folder for its own copies of the projects' commits.
+      - forge-publisher-state:/home/publisher/state
+    # No docker socket. No sandbox. No project checkout. Nothing to build with.
+    security_opt:
+      - no-new-privileges:true
+    read_only: false
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import urllib.request, sys
+          sys.exit(0 if urllib.request.urlopen(
+              "http://127.0.0.1:8711/healthz", timeout=5).status == 200 else 1)
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  forge-publisher-state:
