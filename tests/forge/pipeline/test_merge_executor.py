@@ -1292,11 +1292,22 @@ class TestExecutorSequencing:
         )
         assert "the factory's own live check ran on the joined result" in outcome.detail
         assert (
-            "the build system's own checks after a join were not re-run on it"
+            "the build system's checks after a join have not run on it"
             in outcome.detail
         )
-        # And it still ends where every press in this stage ends.
-        assert "checked and ready to publish" in outcome.detail
+        # NOT a pass (22 September 2026, the second reviewer's first finding):
+        # one kind of check never ran on this J, so the press must not say
+        # "checked and ready to publish", must not report PASSED (which would
+        # close the build row as COMPLETE), and the receipt says the same.
+        assert "NOT yet checked and not ready to publish" in outcome.detail
+        assert "checked and ready to publish" not in outcome.detail
+        assert outcome.status == "GATED"
+        receipt = json.loads(
+            (repo_root / ".forge" / "receipts" / "merge_deploy_publication.json").read_text()
+        ) if (repo_root / ".forge" / "receipts" / "merge_deploy_publication.json").exists() else None
+        if receipt is not None:
+            assert receipt["both_kinds_of_check_ran_on_j"] is False
+            assert receipt["ready_to_publish"] is False
 
     @pytest.mark.asyncio
     async def test_checks_derived_from_the_live_gate_verdict(

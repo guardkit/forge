@@ -254,7 +254,7 @@ class TestHappyPath:
         assert "status=PASSED" in result.output
         assert f"merged_sha={fakes['merged']}" in result.output
         assert "checked and ready to publish" in result.output
-        assert "checked in the sandbox before merging: pass (3 of 3 checks passed)" in result.output
+        assert "live check of the joined result in the sandbox: pass (3 of 3 checks passed)" in result.output
         assert f"merge-{BUILD_ID}/" in result.output
         # The executor really ran: the candidate check, one merge, the
         # promote, one report — in that order (protect-main).

@@ -274,7 +274,7 @@ async def _arun(
             if isinstance(passed, int) and isinstance(total, int)
             else ""
         )
-        click.echo(f"  checked in the sandbox before merging: {gate['verdict']}{counted}")
+        click.echo(f"  live check of the joined result in the sandbox: {gate['verdict']}{counted}")
     if outcome.merged_sha:
         click.echo(f"  merged_sha={outcome.merged_sha}")
     if outcome.failed_step:
