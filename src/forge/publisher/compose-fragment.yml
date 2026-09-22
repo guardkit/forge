@@ -24,7 +24,7 @@
 #      any project's copy anywhere in this fragment;
 #   6. nothing else is on the publisher's network. That is condition 3 said as
 #      a thing somebody can count, and it is the activation check's question
-#      "only-the-coordinator-is-on-the-publishers-network", which can only be
+#      "only-the-coordinator-is-on-the-publishers-network" — which can only be
 #      answered by looking at the real machine at rollout.
 #
 # The two addresses per project live in the settings file, not here, because
@@ -70,8 +70,9 @@ services:
     # it for a send. To look at it by hand at rollout, join its network from a
     # throwaway container instead of publishing a port.
     #
-    # The sandbox is NOT on this network, and the activation check's sixth
-    # question is the check of that, asked of the real machine at rollout.
+    # The sandbox is NOT on this network, and the activation check's question
+    # "only-the-coordinator-is-on-the-publishers-network" is the check of
+    # that, asked of the real machine at rollout.
     networks:
       - forge-publisher-net
     volumes:
@@ -131,7 +132,7 @@ networks:
   # the sandbox within reach of the publisher and undo the whole arrangement,
   # so it must be reached some other way — one direction only, publisher to
   # the copy. Which way is a rollout decision about the real machine, it is
-  # not made here, and the sixth condition is asked again after it is made.
+  # not made here, and that question is asked again after it is made.
   forge-publisher-net:
     driver: bridge
 
