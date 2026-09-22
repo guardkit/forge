@@ -71,6 +71,7 @@ EVERY_WALL_STANDS = WhatTheMachineSays(
     a_sandbox_can_see_the_ledger=False,
     a_sandbox_can_reach_the_publisher=False,
     the_credential_file_can_be_read_by_them=False,
+    only_the_coordinator_is_on_the_publishers_network=True,
     looked_at_by="a stand-in, in a test",
 )
 
@@ -466,6 +467,11 @@ class TestEveryOtherRefusalStopsAtOnce:
                 "publication": {
                     "enabled": True,
                     "builds_may_run_inside_the_coordinator": False,
+                    # Named, because an unnamed credential file is itself a
+                    # refusal (22 September 2026) and this test is about the
+                    # OTHER thing being missing: nowhere to send the request.
+                    "publisher_credential_file": "/etc/forge-publisher/credential",
+                    # …and no publisher_url, which is the point of this test.
                 },
             }
         )
@@ -698,6 +704,7 @@ class TestWithPublicationOffNothingIsSentAndTheReasonIsSaid:
                 a_sandbox_can_see_the_ledger=True,
                 a_sandbox_can_reach_the_publisher=False,
                 the_credential_file_can_be_read_by_them=False,
+                only_the_coordinator_is_on_the_publishers_network=True,
             ),
         )
 
@@ -774,3 +781,94 @@ class TestNothingHalfCheckedIsEverSent:
         assert joins_two.calls == []
         assert _legs(deploy_two).count("candidate_check") == 1
         assert publisher.asked == []
+
+
+class TestThePressAndThePublisherReadTheRecordTheSameWay:
+    """The reviewer's eighth finding, 22 September 2026.
+
+    The publisher counts a step only when its ``done`` line says it ran on
+    exactly this joined commit. The press used to count a line that named no
+    commit at all. Two readers of one record, two answers: the press could
+    call a join checked and ask for a send, and the publisher could then
+    refuse the very record the press had just read. The press now asks for the
+    commit too.
+    """
+
+    def _forget_which_commit_the_checks_ran_on(
+        self, pool: SqliteLifecyclePersistence  # noqa: F811
+    ) -> None:
+        """Take the commit off the build system's own checks' done line."""
+        import json
+
+        row = pool.connection.execute(
+            "SELECT lines_json FROM publication_records WHERE build_id = ?",
+            (BUILD_ID,),
+        ).fetchone()
+        lines = json.loads(row[0])
+        found = 0
+        for line in lines:
+            if line.get("kind") == "done" and line.get("step") == "merge-checks":
+                detail = line.get("detail") or {}
+                detail.pop("ran_on", None)
+                detail.pop("j_commit", None)
+                line["detail"] = detail
+                found += 1
+        assert found == 1, "the press did not write the line this test edits"
+        pool.connection.execute(
+            "UPDATE publication_records SET lines_json = ? WHERE build_id = ?",
+            (json.dumps(lines), BUILD_ID),
+        )
+        pool.connection.commit()
+
+    @pytest.mark.asyncio
+    async def test_a_done_line_naming_no_commit_is_not_a_check_on_this_one(
+        self,
+        config_with_publication_off: ForgeConfig,
+        config_with_publication_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> None:
+        deps, _deploy, _joins, _bus = _deps(config_with_publication_off, pool)
+        first = await _press(deps, repo_root)
+        assert first.result == "publication-pending"
+        assert "checked and ready to publish" in first.detail
+
+        self._forget_which_commit_the_checks_ran_on(pool)
+
+        publisher = _APublisherThatSays([_published("c" * 40)])
+        deps_two, _deploy_two, joins_two, _bus_two = _deps(
+            config_with_publication_on, pool, publisher=publisher
+        )
+        second = await _press(deps_two, repo_root)
+
+        # The join is picked up, so the merge command is not run again and the
+        # build system's own checks never run on this commit at all.
+        assert joins_two.calls == []
+        assert second.result == "publication-pending"
+        assert "It is NOT yet checked" in second.detail
+        # AND NOTHING WAS ASKED OF THE PUBLISHER, which is the point: the
+        # press stops where the publisher would have refused it.
+        assert publisher.asked == []
+
+    @pytest.mark.asyncio
+    async def test_a_done_line_naming_this_commit_still_counts(
+        self,
+        config_with_publication_off: ForgeConfig,
+        config_with_publication_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> None:
+        """The same two presses, with the line left alone: it is checked."""
+        deps, _deploy, _joins, _bus = _deps(config_with_publication_off, pool)
+        first = await _press(deps, repo_root)
+        assert first.result == "publication-pending"
+
+        publisher = _APublisherThatSays([_published("c" * 40)])
+        deps_two, _deploy_two, joins_two, _bus_two = _deps(
+            config_with_publication_on, pool, publisher=publisher
+        )
+        second = await _press(deps_two, repo_root)
+
+        assert joins_two.calls == []
+        assert second.result == "published-deployment-pending"
+        assert len(publisher.asked) == 1

@@ -1,6 +1,6 @@
 """Publication cannot be switched on until the isolation is proven.
 
-One-true-copy design pass, item 1, third revision section G. Five named
+One-true-copy design pass, item 1, third revision section G. Six named
 questions; publication switches on only when every one of them answers yes,
 and refuses in plain words naming the ones that do not.
 
@@ -8,12 +8,13 @@ WHICH OF THESE ARE PROVEN HERE, AND WHICH ONLY AT ROLLOUT — the honest split,
 pinned by a test of its own below so that it cannot quietly change:
 
 * **here** — question 1 (the setting that permits builds inside the
-  coordinator) and the settings half of question 5 (the credential file is
-  named in no other settings);
-* **only at rollout** — questions 2, 3 and 4 (a sandbox writing the settings
-  file, seeing the ledger, reaching the publisher) and the readability half
-  of question 5. Each is asked of a stand-in here, one field at a time, which
-  proves the REFUSAL works; what it cannot prove is the real machine.
+  coordinator) and the settings half of question 6 (the credential file is
+  named at all, and named in no other settings);
+* **only at rollout** — questions 2, 3, 4 and 5 (a sandbox writing the
+  settings file, seeing the ledger, reaching the publisher, and what else is
+  on the publisher's network) and the readability half of question 6. Each is
+  asked of a stand-in here, one field at a time, which proves the REFUSAL
+  works; what it cannot prove is the real machine.
 """
 
 from __future__ import annotations
@@ -23,13 +24,14 @@ from types import SimpleNamespace
 import pytest
 
 from forge.pipeline.publication_activation import (
-    THE_FIVE_QUESTIONS,
+    THE_QUESTIONS,
     WhatTheMachineSays,
     run_the_activation_check,
     what_is_true_here,
 )
 from forge.pipeline.publication_switch import (
     publication_is_switched_on,
+    say_where_publication_stands_at_boot,
     the_activation_check,
     why_publication_is_off,
 )
@@ -40,6 +42,7 @@ ALL_WALLS_STAND = WhatTheMachineSays(
     a_sandbox_can_see_the_ledger=False,
     a_sandbox_can_reach_the_publisher=False,
     the_credential_file_can_be_read_by_them=False,
+    only_the_coordinator_is_on_the_publishers_network=True,
     looked_at_by="a stand-in, in a test",
 )
 
@@ -62,7 +65,7 @@ def a_config(**publication: object) -> SimpleNamespace:
     )
 
 
-class TestAllFiveHaveToHold:
+class TestEveryOneHasToHold:
     def test_they_all_hold_and_publication_switches_on(self) -> None:
         verdict = run_the_activation_check(a_config(), ALL_WALLS_STAND)
         assert verdict.all_hold is True
@@ -70,15 +73,16 @@ class TestAllFiveHaveToHold:
         assert "checked and holds" in verdict.sentence
         assert publication_is_switched_on(a_config(), ALL_WALLS_STAND) is True
 
-    def test_there_are_exactly_five(self) -> None:
+    def test_there_are_exactly_six(self) -> None:
         verdict = run_the_activation_check(a_config(), ALL_WALLS_STAND)
-        assert len(verdict.answers) == 5
-        assert len(THE_FIVE_QUESTIONS) == 5
+        assert len(verdict.answers) == 6
+        assert len(THE_QUESTIONS) == 6
         assert [answer.name for answer in verdict.answers] == [
             "nothing-is-built-inside-the-coordinator",
             "no-sandbox-can-write-the-coordinators-settings-file",
             "no-sandbox-can-see-the-ledger",
             "no-sandbox-can-reach-the-publisher",
+            "only-the-coordinator-is-on-the-publishers-network",
             "the-credential-is-out-of-their-reach",
         ]
 
@@ -127,6 +131,7 @@ class TestEachOneRefusesOnItsOwn:
                     "a_sandbox_can_see_the_ledger": False,
                     "a_sandbox_can_reach_the_publisher": False,
                     "the_credential_file_can_be_read_by_them": False,
+                    "only_the_coordinator_is_on_the_publishers_network": True,
                 },
                 field: True,
             }
@@ -176,6 +181,7 @@ class TestAnUnexaminedWallIsNotAWall:
             "no-sandbox-can-write-the-coordinators-settings-file",
             "no-sandbox-can-see-the-ledger",
             "no-sandbox-can-reach-the-publisher",
+            "only-the-coordinator-is-on-the-publishers-network",
             "the-credential-is-out-of-their-reach",
         ]
         assert "nobody has looked" in verdict.sentence
@@ -231,13 +237,14 @@ class TestWhatCanBeProvenHereAndWhatOnlyAtRollout:
             "no-sandbox-can-write-the-coordinators-settings-file": False,
             "no-sandbox-can-see-the-ledger": False,
             "no-sandbox-can-reach-the-publisher": False,
+            "only-the-coordinator-is-on-the-publishers-network": False,
             # The one with two halves reports the half that decided it: with
             # every wall standing the answer came from the machine, so it is
             # a rollout answer.
             "the-credential-is-out-of-their-reach": False,
         }
 
-    def test_the_settings_half_of_the_fifth_IS_provable_here(self) -> None:
+    def test_the_settings_half_of_the_sixth_IS_provable_here(self) -> None:
         config = a_config()
         config.conductor.launch_settings = ["/etc/forge-publisher/credential"]
         verdict = run_the_activation_check(config, None)
@@ -270,3 +277,161 @@ class TestWhatIsTrueIsGatheredInOnePlace:
     def test_the_switch_and_the_check_agree(self) -> None:
         assert the_activation_check(a_config(), ALL_WALLS_STAND).all_hold is True
         assert the_activation_check(a_config(), None).all_hold is False
+
+
+class TestWhoElseIsOnThePublishersNetwork:
+    """The sixth question, added 22 September 2026 with the way it is made true.
+
+    The publisher listens on every address inside its own container and
+    publishes no port, so what can reach it is exactly what is on its network.
+    "No sandbox can reach the publisher" is therefore a thing somebody can
+    COUNT, and this is the counting.
+    """
+
+    def _machine(self, **fields: object) -> WhatTheMachineSays:
+        return WhatTheMachineSays(
+            **{
+                **{
+                    "a_sandbox_can_write_the_coordinators_settings_file": False,
+                    "a_sandbox_can_see_the_ledger": False,
+                    "a_sandbox_can_reach_the_publisher": False,
+                    "the_credential_file_can_be_read_by_them": False,
+                    "only_the_coordinator_is_on_the_publishers_network": True,
+                },
+                **fields,
+            }
+        )
+
+    def test_something_else_is_on_it(self) -> None:
+        verdict = run_the_activation_check(
+            a_config(),
+            self._machine(only_the_coordinator_is_on_the_publishers_network=False),
+        )
+        assert verdict.all_hold is False
+        assert [answer.name for answer in verdict.refusals] == [
+            "only-the-coordinator-is-on-the-publishers-network"
+        ]
+        assert "network of its own" in verdict.sentence
+        assert publication_is_switched_on(
+            a_config(),
+            self._machine(only_the_coordinator_is_on_the_publishers_network=False),
+        ) is False
+
+    def test_nobody_has_counted(self) -> None:
+        verdict = run_the_activation_check(
+            a_config(),
+            self._machine(only_the_coordinator_is_on_the_publishers_network=None),
+        )
+        assert verdict.all_hold is False
+        assert [answer.name for answer in verdict.refusals] == [
+            "only-the-coordinator-is-on-the-publishers-network"
+        ]
+        assert "nobody has counted" in verdict.sentence
+        assert "at rollout" in verdict.sentence
+
+    def test_the_coordinator_alone_is_on_it(self) -> None:
+        verdict = run_the_activation_check(a_config(), self._machine())
+        assert verdict.all_hold is True
+
+
+class TestACredentialFileNobodyNamedIsARefusal:
+    """The reviewer's second finding, 22 September 2026.
+
+    The settings half of the sixth question is "is this exact path named
+    anywhere else?". With no path there is nothing to look for, the search
+    finds nothing, and nothing-found used to read as an all-clear: the check
+    passed with the setting unset. It does not any more.
+    """
+
+    def test_with_no_path_the_question_refuses(self) -> None:
+        verdict = run_the_activation_check(
+            a_config(publisher_credential_file=None), ALL_WALLS_STAND
+        )
+        assert verdict.all_hold is False
+        assert [answer.name for answer in verdict.refusals] == [
+            "the-credential-is-out-of-their-reach"
+        ]
+        assert "publication.publisher_credential_file is not set" in verdict.sentence
+
+    def test_it_refuses_even_when_the_machine_says_nobody_can_read_it(self) -> None:
+        """The machine's answer is about a file nobody named. It cannot stand in."""
+        assert (
+            publication_is_switched_on(
+                a_config(publisher_credential_file=None), ALL_WALLS_STAND
+            )
+            is False
+        )
+
+    def test_an_empty_setting_is_the_same_as_no_setting(self) -> None:
+        verdict = run_the_activation_check(
+            a_config(publisher_credential_file="   "), ALL_WALLS_STAND
+        )
+        assert [answer.name for answer in verdict.refusals] == [
+            "the-credential-is-out-of-their-reach"
+        ]
+
+    def test_the_settings_half_settles_it_without_the_machine(self) -> None:
+        verdict = run_the_activation_check(
+            a_config(publisher_credential_file=None), None
+        )
+        sixth = next(
+            answer
+            for answer in verdict.answers
+            if answer.name == "the-credential-is-out-of-their-reach"
+        )
+        assert sixth.provable_here is True
+        assert sixth.holds is False
+
+
+class TestTheBootLine:
+    """One line at coordinator start, saying where publication stands.
+
+    Section G: *the check is run again each time the coordinator starts*. The
+    press asks per press; this is the line the person who started the
+    coordinator reads.
+    """
+
+    def test_off_and_why_when_no_setting_turns_it_on(self) -> None:
+        line = say_where_publication_stands_at_boot(
+            a_config(enabled=False), ALL_WALLS_STAND
+        )
+        assert line.startswith("publication is OFF: ")
+        assert "no setting turns publication on" in line
+
+    def test_off_and_which_condition_failed(self) -> None:
+        line = say_where_publication_stands_at_boot(
+            a_config(builds_may_run_inside_the_coordinator=True), ALL_WALLS_STAND
+        )
+        assert line.startswith("publication is OFF: ")
+        assert "may still start builds" in line
+
+    def test_off_because_nobody_has_looked_which_is_today(self) -> None:
+        line = say_where_publication_stands_at_boot(a_config(), None)
+        assert line.startswith("publication is OFF: ")
+        assert "nobody has looked" in line
+
+    def test_on_when_every_condition_holds(self) -> None:
+        line = say_where_publication_stands_at_boot(a_config(), ALL_WALLS_STAND)
+        assert line.startswith("publication is ON: ")
+
+    def test_it_is_said_once_and_in_the_log(self, caplog) -> None:
+        import logging
+
+        with caplog.at_level(logging.INFO, logger="forge.pipeline.publication_switch"):
+            say_where_publication_stands_at_boot(a_config(), ALL_WALLS_STAND)
+        said = [
+            record.getMessage()
+            for record in caplog.records
+            if "publication at boot" in record.getMessage()
+        ]
+        assert len(said) == 1
+
+    def test_a_settings_object_of_an_unexpected_shape_does_not_stop_a_boot(
+        self,
+    ) -> None:
+        assert say_where_publication_stands_at_boot(object()).startswith(
+            "publication is OFF: "
+        )
+        assert say_where_publication_stands_at_boot(None).startswith(
+            "publication is OFF: "
+        )
