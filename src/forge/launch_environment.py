@@ -188,7 +188,7 @@ LAUNCH_SETTINGS: tuple[tuple[str, str], ...] = (
     # list below with the sentence that says why.
     (
         "GUARDKIT_ARCH_CONFORMANCE_BLOCKING",
-        "Rich turned this on, 31 August 2026: a rule the project itself "
+        "The owner turned this on, 31 August 2026: a rule the project itself "
         "declares, broken by freshly written code, is sent back to whatever "
         "wrote it as a fix-this on its next turn instead of being filed as a "
         "note. Unset, the build system adds no such rule at all",
