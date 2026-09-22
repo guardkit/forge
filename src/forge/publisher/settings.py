@@ -14,7 +14,10 @@ does ONE thing, so it is told only the things that one thing needs:
   is for that project, which is the only place anything is ever sent;
 * **its own private folder**, where it keeps its own copy of each project's
   commits and the small program git asks for the credential through;
-* **where to listen**, on loopback.
+* **where to listen** — an address and a port. The loopback address by
+  default; every address inside its own container when it is run as the
+  service the compose fragment beside this package describes, which
+  publishes no port and shares its network with the coordinator alone.
 
 A PROJECT THE PUBLISHER WAS NOT TOLD ABOUT IS REFUSED. There is no default
 address, no guess from a name and no lookup anywhere else: a project the

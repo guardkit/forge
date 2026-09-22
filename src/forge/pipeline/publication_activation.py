@@ -11,27 +11,36 @@ One-true-copy design pass, item 1, third revision section G:
     coordinator starts; if it fails, publication goes off and every merge word
     reports "publication is switched off: …" with the reason, never a merge.*
 
-FIVE NAMED QUESTIONS, each one testable on its own. They are questions and
+SIX NAMED QUESTIONS, each one testable on its own. They are questions and
 not assertions: each is asked of what is true, and each answers **yes**, **no**
 or **it cannot be told from here** — and the third is a refusal, because a
 wall nobody has looked at is not a wall.
+
+The sixth was added on 22 September 2026, with the way "no sandbox can reach
+the publisher" is actually made true. The publisher listens on every address
+inside its own container and publishes no port; what can reach it is
+therefore exactly what is on its network, so the network is counted, and the
+answer publication needs is "the coordinator, and nothing else".
 
 WHICH ONES CAN BE PROVEN ON THIS MACHINE, AND WHICH ONLY AT ROLLOUT. This is
 the honest split, and it is written here rather than left to be discovered:
 
 * **provable here, from the settings alone** — question 1 (the setting that
-  permits builds inside the coordinator) and the settings half of question 5
-  (the credential file is not named in the coordinator's settings, the
-  runner's launch list or any sandbox's settings). Both are read off a
-  configuration object, so a test can make them true and false at will;
-* **only at rollout, on the real machine** — questions 2, 3 and 4 (whether a
-  sandbox can write the coordinator's settings file, see the ledger or reach
-  the publisher) and the readability half of question 5. Each of those is a
-  fact about mounts, users and networks that no amount of reading a settings
-  file establishes. They are asked of :class:`WhatTheMachineSays`, which is
-  the stand-in: a thing that reports what somebody looked at. Nothing
-  supplies one today, so today the check **refuses**, which is the safe side
-  and is exactly where the design says publication stands ("still gated").
+  permits builds inside the coordinator) and the settings half of question 6
+  (the credential file is named, and named in no other settings). Both are
+  read off a configuration object, so a test can make them true and false at
+  will. **A credential file that is not named at all is a refusal**, not a
+  pass: with no path there is nothing to search for, and a search that found
+  nothing because it looked for nothing is not an all-clear;
+* **only at rollout, on the real machine** — questions 2, 3, 4 and 5 (whether
+  a sandbox can write the coordinator's settings file, see the ledger or
+  reach the publisher, and what else is on the publisher's network) and the
+  readability half of question 6. Each of those is a fact about mounts, users
+  and networks that no amount of reading a settings file establishes. They
+  are asked of :class:`WhatTheMachineSays`, which is the stand-in: a thing
+  that reports what somebody looked at. Nothing supplies one today, so today
+  the check **refuses**, which is the safe side and is exactly where the
+  design says publication stands ("still gated").
 
 WHY IT FAILS CLOSED. An unanswered question is not a pass. If the machine has
 told us nothing about a wall, the check says so by name and publication stays
@@ -51,7 +60,7 @@ from typing import Any, Iterable
 logger = logging.getLogger(__name__)
 
 __all__ = [
-    "THE_FIVE_QUESTIONS",
+    "THE_QUESTIONS",
     "Answer",
     "TheVerdict",
     "WhatTheMachineSays",
@@ -76,6 +85,12 @@ class WhatTheMachineSays:
     a_sandbox_can_see_the_ledger: bool | None = None
     a_sandbox_can_reach_the_publisher: bool | None = None
     the_credential_file_can_be_read_by_them: bool | None = None
+    #: Is the coordinator the ONLY thing on the publisher's network besides
+    #: the publisher itself? The publisher listens on every address inside its
+    #: own container and publishes no port, so what can reach it is exactly
+    #: what shares that network — which makes "who else is on it" the thing
+    #: that has to be counted. ``True`` is the answer publication needs.
+    only_the_coordinator_is_on_the_publishers_network: bool | None = None
 
     #: Where the answers came from, for the record. Free text: "looked at the
     #: sandbox's mounts on <machine>, <date>", or "a stand-in, in a test".
@@ -84,7 +99,7 @@ class WhatTheMachineSays:
 
 @dataclass(frozen=True)
 class WhatIsTrue:
-    """The facts the five questions are asked of, gathered in one place."""
+    """The facts the questions are asked of, gathered in one place."""
 
     builds_may_run_inside_the_coordinator: bool | None
     the_credential_file: str | None
@@ -133,7 +148,7 @@ class TheVerdict:
         """Why publication is off, in plain words, naming what is wrong."""
         if self.all_hold:
             return (
-                "every one of the five things publication needs was checked "
+                "every one of the things publication needs was checked "
                 "and holds"
             )
         said = "; ".join(answer.said for answer in self.refusals)
@@ -148,7 +163,7 @@ class TheVerdict:
 
 
 # ---------------------------------------------------------------------------
-# The five questions
+# The questions
 # ---------------------------------------------------------------------------
 
 
@@ -286,6 +301,30 @@ def _the_credential_is_out_of_their_reach(true: WhatIsTrue) -> Answer:
         "is the publisher's credential file named in, or readable from, the "
         "coordinator's, the runner's or any sandbox's settings?"
     )
+    # WITHOUT THE PATH THERE IS NO SEARCH, so there is no answer, so there is
+    # no pass. The settings half of this question is "is this exact path named
+    # anywhere else?", and with no path to look for, the search trivially
+    # finds nothing — which reads like an all-clear and is not one. The
+    # readability half cannot stand in for it either: it is about a file
+    # nobody has named. The path is what makes the question askable, so its
+    # absence is a refusal, and the refusal names the setting to set.
+    if not true.the_credential_file:
+        return Answer(
+            name,
+            question,
+            False,
+            (
+                "the publisher's credential file is not named at all "
+                "(publication.publisher_credential_file is not set), so there "
+                "is no path to look for in the coordinator's settings, the "
+                "runner's launch list or any sandbox's settings, and this "
+                "question cannot be answered. Set "
+                "publication.publisher_credential_file to the path of the one "
+                "file the publisher's credential is in, before publication is "
+                "switched on"
+            ),
+            provable_here=True,
+        )
     if true.where_the_credential_file_is_named:
         named = ", ".join(true.where_the_credential_file_is_named)
         return Answer(
@@ -339,12 +378,59 @@ def _the_credential_is_out_of_their_reach(true: WhatIsTrue) -> Answer:
     )
 
 
-#: The five, in the order they are asked and reported.
-THE_FIVE_QUESTIONS = (
+def _only_the_coordinator_is_on_the_publishers_network(true: WhatIsTrue) -> Answer:
+    """Who else can reach the publisher, counted rather than assumed.
+
+    The publisher listens on every address INSIDE its own container and
+    publishes no port to the host, so the set of things that can reach it is
+    exactly the set of things on its network. "No sandbox can reach it" is
+    the property; this is the way it is made true and the way it is checked —
+    count what is on that network, and find the coordinator and nothing else.
+
+    A STAND-IN HERE. Nothing in this process can see a container network, so
+    like the three walls above it is asked of :class:`WhatTheMachineSays` and
+    answers "nobody has looked" — a refusal — until somebody looks at the
+    real machine at rollout.
+    """
+    return _machine_question(
+        "only-the-coordinator-is-on-the-publishers-network",
+        "is the coordinator the only thing on the publisher's network?",
+        # The field reads the RIGHT way round (True = the good answer), and
+        # _machine_question reads the wrong way round (True = the refusal),
+        # so it is turned over here rather than at the call site.
+        answer=(
+            None
+            if true.machine.only_the_coordinator_is_on_the_publishers_network is None
+            else not true.machine.only_the_coordinator_is_on_the_publishers_network
+        ),
+        when_true=(
+            "the publisher's network has the coordinator on it and nothing "
+            "else, and no port of the publisher's is published anywhere"
+        ),
+        when_false=(
+            "something other than the coordinator is on the publisher's "
+            "network, and anything that can reach the publisher can ask for a "
+            "send. Put the publisher on a network of its own, shared with the "
+            "coordinator alone and with no sandbox, before publication is "
+            "switched on"
+        ),
+        when_unknown=(
+            "nobody has counted what is on the publisher's network. The "
+            "publisher listens on every address inside its own container, so "
+            "what shares that network is exactly what can reach it, and an "
+            "uncounted network is not a wall. This one can only be settled on "
+            "the real machine, at rollout"
+        ),
+    )
+
+
+#: The questions, in the order they are asked and reported.
+THE_QUESTIONS = (
     _nothing_is_built_inside_the_coordinator,
     _no_sandbox_can_write_the_settings_file,
     _no_sandbox_can_see_the_ledger,
     _no_sandbox_can_reach_the_publisher,
+    _only_the_coordinator_is_on_the_publishers_network,
     _the_credential_is_out_of_their_reach,
 )
 
@@ -427,11 +513,11 @@ def _names_the_credential_file(config: Any, credential_file: str) -> tuple[str, 
 def what_is_true_here(
     config: Any, machine: WhatTheMachineSays | None = None
 ) -> WhatIsTrue:
-    """Gather the facts the five questions are asked of.
+    """Gather the facts the questions are asked of.
 
     The settings are read off ``config``; the machine's answers come from
-    ``machine``, which is ``None`` when nobody has looked — and then the three
-    machine questions refuse by name.
+    ``machine``, which is ``None`` when nobody has looked — and then every
+    machine question refuses by name.
     """
     publication = getattr(config, "publication", None)
     allowed = getattr(publication, "builds_may_run_inside_the_coordinator", None)
@@ -457,7 +543,7 @@ def what_is_true_here(
 def run_the_activation_check(
     config: Any, machine: WhatTheMachineSays | None = None
 ) -> TheVerdict:
-    """Ask all five, and say plainly which of them refuse.
+    """Ask them all, and say plainly which of them refuse.
 
     Never raises: a configuration of an unexpected shape reads as "it cannot
     be told from here", which is a refusal, which is the safe side.
@@ -486,7 +572,7 @@ def run_the_activation_check(
                 ),
             ),
         )
-    answers = tuple(question(true) for question in THE_FIVE_QUESTIONS)
+    answers = tuple(question(true) for question in THE_QUESTIONS)
     return TheVerdict(
         all_hold=all(answer.holds is True for answer in answers), answers=answers
     )

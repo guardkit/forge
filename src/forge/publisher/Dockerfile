@@ -21,12 +21,19 @@
 #   * the one file its credential is in, read-only, owned by its own user and
 #     readable by nobody else — this is the file the design says must not be
 #     readable from the coordinator's, the runner's or any sandbox's settings;
-#   * the ledger, READ-ONLY;
+#   * the ledger's FOLDER, READ-ONLY — the folder, because the ledger's store
+#     keeps companion files beside the ledger file and a reader given only
+#     that one file cannot read the record at all;
 #   * its own folder to keep its copies in.
 #
-# It listens on loopback. Nothing outside the host reaches it, and no sandbox
-# does either: that is one of the five conditions the activation check
-# refuses without (forge/src/forge/pipeline/publication_activation.py).
+# WHERE IT LISTENS. On every address inside this container, which its settings
+# file says, and NO port of its is published. What can reach it is therefore
+# exactly what is on its network, and its network has the coordinator on it
+# and nothing else — the compose fragment beside this file says why, and why
+# the other two arrangements do not work. "No sandbox can reach the publisher"
+# and "only the coordinator is on the publisher's network" are two of the
+# conditions the activation check refuses without
+# (forge/src/forge/pipeline/publication_activation.py).
 # ---------------------------------------------------------------------------
 
 ARG PYTHON_BASE_DIGEST=sha256:2e256d0381371566ed96980584957ed31297f437569b79b0e5f7e17f2720e53a
@@ -57,7 +64,8 @@ USER publisher
 ENV FORGE_PUBLISHER_STATE=/home/publisher/state
 RUN mkdir -p /home/publisher/state
 
-# Loopback only. The port is whatever the settings name.
+# The port is whatever the settings name. EXPOSE documents it for whoever
+# reads this image; it publishes nothing, and nothing here publishes a port.
 EXPOSE 8711
 
 ENTRYPOINT ["python", "-m", "forge.publisher"]

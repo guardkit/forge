@@ -13,8 +13,10 @@ One-true-copy design pass, item 1, second revision section D:
     refused.*
 
 WHAT THE PUBLISHER TRUSTS. The ledger, and only the ledger. It does not trust
-the request it was sent — the request says which build, which turn and which
-joined commit, and every one of those three is checked against the record. It
+the request it was sent — the request says which PROJECT, which build, which
+turn and which joined commit, and every one of those four is checked against
+the record, the project included: a build's record is bound to the project it
+was built for, and a request naming another project is refused. It
 does not trust the folder of exported records, which a sandbox can write, and
 it never reads it. It does not trust a step's existence: a ``done`` line says
 a step finished, not that it was green, and a red run writes one too. So a
@@ -74,6 +76,12 @@ class TheRecord:
     recorded: bool = False
     turn: int = 0
     attempt: int = 0
+    #: WHICH PROJECT THIS BUILD BELONGS TO, as the coordinator wrote it down.
+    #: A build's name is not a project's name. Without this the publisher
+    #: would take a request naming one project, read the record of a build
+    #: belonging to another, and send that other project's commit to the
+    #: first project's remote. It is read so that the refusal can be made.
+    project: str | None = None
     target_branch: str | None = None
     g_commit: str | None = None
     build_tip: str | None = None
@@ -149,7 +157,8 @@ class TheRecordReader:
                 row = connection.execute(
                     """
                     SELECT build_id, target_branch, g_commit, build_tip,
-                           j_commit, attempt, result, turn, lines_json
+                           j_commit, attempt, result, turn, lines_json,
+                           repo
                       FROM publication_records
                      WHERE build_id = ?
                     """,
@@ -175,6 +184,7 @@ class TheRecordReader:
         return TheRecord(
             build_id=str(row[0]),
             recorded=True,
+            project=(str(row[9]) if row[9] else None),
             target_branch=(str(row[1]) if row[1] else None),
             g_commit=(str(row[2]) if row[2] else None),
             build_tip=(str(row[3]) if row[3] else None),

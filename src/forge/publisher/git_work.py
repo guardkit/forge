@@ -22,6 +22,13 @@ habit:
    (:func:`forge.publisher.credential.the_environment_git_is_given`), with
    ``HOME`` inside the publisher's own folder so git reads no person's
    configuration and finds no person's stored credentials.
+5. **No address is ever written down.** Git names the address it was working
+   with in its own messages, and those messages go into refusal sentences,
+   receipts and rows of the ledger. The addresses come out of a settings file
+   somebody fills in at rollout, and an address is the easiest place for a
+   credential to end up. So every sentence git gives this module passes
+   through :func:`without_the_addresses` on its one way out
+   (:func:`_one_line`), and what it says is what went wrong, not where.
 
 THE PUBLISHER'S OWN COPY. It keeps one repository of its own per project, so
 that the commits it fetches have somewhere to live that is nobody else's. It
@@ -40,6 +47,7 @@ import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterable
 
 from forge.publisher.credential import Credential, the_environment_git_is_given
 from forge.publisher.settings import ProjectRoute
@@ -48,11 +56,22 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "GitSaid",
+    "THE_ADDRESS_IS_NOT_WRITTEN_DOWN",
     "TheProjectsCommits",
     "a_plain_branch_name",
     "a_plain_commit_name",
     "the_send_argv",
+    "without_the_addresses",
 ]
+
+#: What stands in an address's place in every sentence the publisher says.
+THE_ADDRESS_IS_NOT_WRITTEN_DOWN: str = "<the address is not written down>"
+
+#: The part of an address that names who is asking, which is where somebody
+#: setting this up at rollout is most likely to put a secret. It is taken out
+#: of anything git said before that text is written anywhere, whatever address
+#: it belongs to — including one this module was never told about.
+_WHO_IS_ASKING = re.compile(r"(?<=//)[^/@\s]*@")
 
 #: A commit as git names it: hexadecimal, full length, nothing else. The
 #: publisher is always given a commit somebody already wrote down, never a
@@ -110,17 +129,53 @@ class GitSaid:
     said: str = ""
 
 
-def _one_line(done: "subprocess.CompletedProcess[str]") -> str:
-    """Git's own reason, in one line, for a sentence a person reads."""
+def without_the_addresses(said: str, addresses: "Iterable[str]" = ()) -> str:
+    """The same sentence with the addresses taken out of it.
+
+    WHY AN ADDRESS IS NEVER WRITTEN DOWN. Git puts the address it was working
+    with into its own messages, and the publisher's sentences go into a
+    refusal a person reads, a receipt and a row of the ledger. An address is
+    also the place a credential most easily ends up: the ordinary way to hand
+    one to git without a helper is to put it in the address itself. Nothing in
+    this estate does that today — the publisher's credential lives in one file
+    and reaches git through the program named by ``GIT_ASKPASS`` — but the
+    addresses come from a settings file somebody will fill in at rollout, and
+    a rule that depends on nobody ever doing the easy thing is not a rule.
+
+    So two things are taken out: the addresses this publisher was told about,
+    by exact text, and the "who is asking" part of ANY address in the line,
+    including one nobody here has ever seen. What is left still says what went
+    wrong; it just does not say where.
+    """
+    cleaned = str(said or "")
+    for address in addresses:
+        text = str(address or "").strip()
+        if text:
+            cleaned = cleaned.replace(text, THE_ADDRESS_IS_NOT_WRITTEN_DOWN)
+    return _WHO_IS_ASKING.sub(THE_ADDRESS_IS_NOT_WRITTEN_DOWN + "@", cleaned)
+
+
+def _one_line(
+    done: "subprocess.CompletedProcess[str]", addresses: "Iterable[str]" = ()
+) -> str:
+    """Git's own reason, in one line, with no address left in it.
+
+    Every sentence the publisher says about a git command comes through here,
+    which is why the taking-out happens here rather than at each caller: a
+    caller that forgot would be a leak, and there is no path around this
+    function.
+    """
     text = ((done.stderr or "") + "\n" + (done.stdout or "")).strip().splitlines()
     lines = [line.strip() for line in text if line.strip()]
     if not lines:
         return f"git exited {done.returncode} and said nothing"
+    chosen = lines[0]
     for line in lines:
         low = line.lower()
         if low.startswith("fatal:") or low.startswith("error:") or " ! [" in line:
-            return line
-    return lines[0]
+            chosen = line
+            break
+    return without_the_addresses(chosen, addresses)
 
 
 class TheProjectsCommits:
@@ -149,6 +204,11 @@ class TheProjectsCommits:
     @property
     def where(self) -> Path:
         return self._where
+
+    @property
+    def _the_addresses(self) -> tuple[str, ...]:
+        """The two addresses this project has, which are never written down."""
+        return (str(self._route.remote), str(self._route.source))
 
     # -- running git -------------------------------------------------------
 
@@ -180,7 +240,7 @@ class TheProjectsCommits:
         return GitSaid(
             ok=done.returncode == 0,
             out=(done.stdout or "").strip(),
-            said=_one_line(done),
+            said=_one_line(done, self._the_addresses),
         )
 
     def ready(self) -> GitSaid:
@@ -207,7 +267,7 @@ class TheProjectsCommits:
                 said=f"the publisher's own copy could not be made ({exc})",
             )
         if done.returncode != 0:
-            return GitSaid(ok=False, said=_one_line(done))
+            return GitSaid(ok=False, said=_one_line(done, self._the_addresses))
         return GitSaid(ok=True)
 
     # -- the four things it does -------------------------------------------

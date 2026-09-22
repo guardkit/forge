@@ -9,11 +9,15 @@ builds or checks is in this process.
 WHAT IT DOES. Given ``{project, build_id, turn, j_commit, target_branch}``:
 
 1. it reads the publication record ITSELF, read-only, and refuses unless a
-   record exists for that build whose turn equals the request's, whose joined
-   commit equals the request's, whose target branch equals the request's, and
-   whose two kinds of check are recorded as PASSED on exactly that joined
-   commit. A ``done`` line is not enough: the line has to say it ran on this
-   commit and its verdict has to be a pass;
+   record exists for that build whose PROJECT equals the request's, whose
+   turn equals the request's, whose joined commit equals the request's, whose
+   target branch equals the request's, and whose two kinds of check are
+   recorded as PASSED on exactly that joined commit. The project is asked
+   first and it is asked of the record, not of the request: a build's name is
+   not a project's name, and a record belonging to another project would put
+   one project's work on another project's remote. A ``done`` line is not
+   enough either: the line has to say it ran on this commit and its verdict
+   has to be a pass;
 2. it brings the joined commit out of the project's copy through the
    read-only git address it was given, never a writable path;
 3. it checks for itself — not on anybody's word — that the joined commit is a
@@ -49,7 +53,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
 
-from forge.publisher.credential import Credential, read_the_credential
+from forge.publisher.credential import (
+    Credential,
+    read_the_credential,
+    the_askpass_program,
+)
 from forge.publisher.git_work import (
     TheProjectsCommits,
     a_plain_branch_name,
@@ -145,6 +153,13 @@ class Publisher:
                 "file; it is never logged, never in an answer and never in a "
                 "child's environment"
             )
+            # AT START, ONCE. The program git asks for the credential through
+            # is written here rather than on the way into each git command:
+            # this publisher runs requests for different projects at the same
+            # time, and a program being rewritten under a running git command
+            # is a program that command can read half of. Writing it now means
+            # every later call finds it already there.
+            the_askpass_program(self._credential, state_dir=self._state)
         self._reader = reader or TheRecordReader(settings.ledger)
         self._commits_for = commits_for or self._its_own_copy
         # ONE PROJECT AT A TIME. The publisher keeps one repository of its own
@@ -250,6 +265,7 @@ class Publisher:
             return _refused("the-record-could-not-be-read", f"{exc}, so nothing was sent.")
         refusal = self._what_the_record_refuses(
             record,
+            project=project,
             build_id=build_id,
             turn=int(turn),
             j_commit=j_commit,
@@ -431,6 +447,7 @@ class Publisher:
         self,
         record: TheRecord,
         *,
+        project: str,
         build_id: str,
         turn: int,
         j_commit: str,
@@ -443,6 +460,31 @@ class Publisher:
                 f"there is no publication record for build {build_id}, so "
                 f"nothing is known to have been joined or checked. Nothing "
                 "was sent.",
+            )
+        # THE RECORD IS BOUND TO ITS OWN PROJECT, and this is asked before
+        # anything else about the record, because everything after it is read
+        # off a record that has to be THIS project's. The request names the
+        # project, and the project decides which remote is written to; a
+        # record belonging to another project would hand one project's commit
+        # to another project's remote, which is the worst thing this service
+        # could do. The two names have to be the same name.
+        recorded_project = str(record.project or "").strip()
+        if not recorded_project:
+            return _refused(
+                "the-record-does-not-say-which-project",
+                f"build {build_id}'s record does not say which project it "
+                f"belongs to, so the publisher cannot tell that it is "
+                f"'{project}'s build. A record with no project is not "
+                "evidence about any project. Nothing was sent.",
+            )
+        if recorded_project != project:
+            return _refused(
+                "that-build-belongs-to-another-project",
+                f"this request names the project '{project}', and build "
+                f"{build_id}'s record says that build belongs to "
+                f"'{recorded_project}'. A build's record is bound to its own "
+                "project, and sending it would put one project's work on "
+                "another project's remote. Nothing was sent.",
             )
         if int(record.turn) != int(turn):
             return _refused(
@@ -488,7 +530,7 @@ class Publisher:
 
 
 class _PublisherServer(ThreadingHTTPServer):
-    """A loopback HTTP server carrying one publisher."""
+    """The server carrying one publisher, bound where the settings say."""
 
     daemon_threads = True
     allow_reuse_address = True
@@ -570,7 +612,7 @@ class PublisherHandler(BaseHTTPRequestHandler):
 def serve(
     settings: PublisherSettings, *, publisher: Publisher | None = None
 ) -> tuple[_PublisherServer, threading.Thread]:
-    """Bind the publisher on loopback and serve it on a thread of its own.
+    """Bind the publisher where its settings say, on a thread of its own.
 
     ``port`` 0 in the settings means "let the kernel pick", which is what a
     test and a bench want; the bound port is on ``server.server_address``.

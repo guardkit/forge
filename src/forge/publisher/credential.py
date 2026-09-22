@@ -39,6 +39,7 @@ import logging
 import os
 import stat
 import sys
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -144,8 +145,26 @@ def read_the_credential(
     return Credential(text.strip(), path=str(where)), None
 
 
+#: The programs already written, by the folder they are in and the file they
+#: read, so that the same one is handed out again instead of written over.
+_ALREADY_WRITTEN: dict[tuple[str, str], Path] = {}
+_WRITING_ONE = threading.Lock()
+
+
+def _the_program_text(credential: Credential) -> str:
+    # The publisher's own interpreter, named by its full path, so the program
+    # does not depend on anything being on a PATH inside a container.
+    return (
+        "#!" + sys.executable + "\n"
+        '"""Print the one named credential file, for git and for nothing else."""\n'
+        "import sys\n"
+        "with open(" + repr(credential.file) + ', "r", encoding="utf-8") as handle:\n'
+        "    sys.stdout.write(handle.read().strip() + chr(10))\n"
+    )
+
+
 def the_askpass_program(credential: Credential, *, state_dir: Path) -> Path:
-    """Write the small program git runs when it asks for a credential.
+    """The small program git runs when it asks for a credential, written ONCE.
 
     Git's own contract: when ``GIT_ASKPASS`` names a program, git runs it with
     the prompt as its argument and reads one line of its output. So this
@@ -155,21 +174,40 @@ def the_askpass_program(credential: Credential, *, state_dir: Path) -> Path:
 
     THE CREDENTIAL IS NOT IN THIS FILE. The path of the credential file is,
     which is not a secret, and a test greps the written program to prove it.
+
+    WRITTEN ONCE, NOT ONCE PER GIT COMMAND (22 September 2026). The publisher
+    works on different projects at the same time — its one-at-a-time lock is
+    per project, exactly so that it can — and every git command asked for this
+    program, so two requests wrote the same file at the same moment. A file
+    being written is momentarily empty or half-written, and git, running for
+    the other request, could read a truncated program, get no credential out
+    of it, and be refused by the remote for a reason that had nothing to do
+    with the remote. Two things prevent that, and both are here because either
+    alone leaves a gap:
+
+    * **it is written once** for a given folder and credential file, and every
+      call after that hands back the same path without touching the file;
+    * **the write itself is whole.** The text goes into a file of its own and
+      is moved into place in one step, so what git opens is either the old
+      program or the new one and never a piece of one — which also holds for
+      two publisher processes sharing a folder, where a lock inside one of
+      them would settle nothing.
     """
-    state_dir.mkdir(parents=True, exist_ok=True)
-    program = state_dir / "ask-for-the-credential"
-    # The publisher's own interpreter, named by its full path, so the program
-    # does not depend on anything being on a PATH inside a container.
-    program.write_text(
-        "#!" + sys.executable + "\n"
-        '"""Print the one named credential file, for git and for nothing else."""\n'
-        "import sys\n"
-        "with open(" + repr(credential.file) + ', "r", encoding="utf-8") as handle:\n'
-        "    sys.stdout.write(handle.read().strip() + chr(10))\n",
-        encoding="utf-8",
-    )
-    program.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
-    return program
+    key = (str(state_dir), credential.file)
+    with _WRITING_ONE:
+        known = _ALREADY_WRITTEN.get(key)
+        if known is not None and known.is_file():
+            return known
+        state_dir.mkdir(parents=True, exist_ok=True)
+        program = state_dir / "ask-for-the-credential"
+        being_written = state_dir / (
+            f"ask-for-the-credential.{os.getpid()}.being-written"
+        )
+        being_written.write_text(_the_program_text(credential), encoding="utf-8")
+        being_written.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+        os.replace(being_written, program)
+        _ALREADY_WRITTEN[key] = program
+        return program
 
 
 def the_environment_git_is_given(

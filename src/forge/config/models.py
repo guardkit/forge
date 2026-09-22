@@ -1560,7 +1560,7 @@ class PublicationConfig(BaseModel):
 
     ``enabled`` alone is not permission. Turning it on runs the activation
     check (:mod:`forge.pipeline.publication_activation`), which refuses in
-    plain words unless all five of section G's conditions hold, and which is
+    plain words unless every one of section G's conditions holds, and which is
     asked again on every press and at every coordinator start. Nothing here
     holds a credential: the one credential that can write to a remote belongs
     to the publisher's own process, and ``publisher_credential_file`` below
@@ -1583,7 +1583,7 @@ class PublicationConfig(BaseModel):
             "Master switch for publication. False (the default) = the merge "
             "word joins, checks and stops at 'publication pending'; nothing "
             "is sent to any remote. True = the merge word asks the publisher "
-            "to send the joined commit, IF the activation check's five "
+            "to send the joined commit, IF the activation check's "
             "conditions all hold; it stays off, with the reason said in plain "
             "words, if any one of them does not."
         ),
@@ -1591,8 +1591,8 @@ class PublicationConfig(BaseModel):
     publisher_url: str | None = Field(
         default=None,
         description=(
-            "Where the publisher listens, on loopback (for example "
-            "http://127.0.0.1:8711). The coordinator asks it to send and "
+            "Where the publisher listens, as the coordinator reaches it. "
+            "The coordinator asks it to send and "
             "reads its answer; no credential travels this way in either "
             "direction. None means the coordinator cannot reach a publisher, "
             "and every merge word says so rather than guessing."
