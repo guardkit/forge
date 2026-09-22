@@ -36,9 +36,23 @@ any other tool got nothing, and this is central code that applies to every
 project whatever it is written in. What a project's own builds need beyond
 this list (a package cache, a toolchain home) is the project's to declare, by
 NAME only, in its own ``.guardkit/config.yaml``, read at the commit the work
-starts from like its memory name: that is the next stage. Until it lands, a
-build gets no project-tool setting from the launch, which is the honest state,
-not a hidden one.
+starts from like its memory name.
+
+THAT DECLARATION LANDED 22 September 2026, and it is the second half of this
+module: a project writes
+
+    launch:
+      settings: [SOME_TOOL_CACHE, ANOTHER_HOME]
+
+and those names are appended to the list below for its own builds, each value
+taken from the launching process only if it has one. NAMES ONLY — a value
+never comes out of a project's settings file. The names are checked for shape
+and against what this factory keeps for itself
+(:func:`declared_setting_refusal`), and a project that asks for a reserved or
+credential-shaped name is refused in plain words at the door. Central code
+here carries the names as text and knows nothing about what tool they belong
+to, which is the whole point: a project built with any toolchain says what its
+builds need, in its own file, in its own words.
 
 STILL TO BE ENUMERATED, and named here rather than quietly assumed: the
 installed runner carries a third drop-in, ``…service.d/litellm.conf``
@@ -77,14 +91,26 @@ setting that is not worth a sentence is not worth handing to a build.
 
 from __future__ import annotations
 
+import logging
 import os
-from typing import Mapping
+import re
+from typing import Iterable, Mapping, Sequence
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
+    "DECLARED_NAME_PATTERN",
+    "GUARDKIT_FACTORY_LAUNCH_ENV",
     "GUARDKIT_MEMORY_PROJECT_ENV",
     "LAUNCH_SETTINGS",
+    "MAX_DECLARED_SETTINGS",
+    "MAX_DECLARED_NAME_LENGTH",
+    "RESERVED_CREDENTIAL_WORDS",
+    "RESERVED_NAMES",
+    "RESERVED_PREFIXES",
     "SETTINGS_DELIBERATELY_NOT_PASSED",
     "build_launch_env",
+    "declared_setting_refusal",
     "launch_setting_names",
 ]
 
@@ -94,6 +120,16 @@ __all__ = [
 #: build system uses the name it was handed (the project's own memory, item 2,
 #: 2026-09-21).
 GUARDKIT_MEMORY_PROJECT_ENV: str = "GUARDKIT_MEMORY_PROJECT"
+
+#: The setting that says "a factory launched you", added 22 September 2026
+#: after the stage's second independent review. It closes a hole the review
+#: found: with a name recorded in the ledger but not handed to a particular
+#: call, the build system fell back to the declaration in whatever folder it
+#: was pointed at — so a changed working copy could choose the memory for a
+#: call the factory made. With this set, the build system uses ONLY the name it
+#: was handed, and runs with memory OFF when it was handed none. Every launch
+#: built here sets it, because every launch built here is a factory launch.
+GUARDKIT_FACTORY_LAUNCH_ENV: str = "GUARDKIT_FACTORY_LAUNCH"
 
 
 #: Every setting a build is launched with, and why each one is there. The order
@@ -213,6 +249,12 @@ LAUNCH_SETTINGS: tuple[tuple[str, str], ...] = (
         "on purpose, so a stale checkout cannot supply it",
     ),
     (
+        GUARDKIT_FACTORY_LAUNCH_ENV,
+        "says a FACTORY launched this, so the build system uses only the name "
+        "handed over above and never the declaration in the folder it happens "
+        "to be pointed at; handed no name, it runs with memory off",
+    ),
+    (
         "FLEET_MEMORY_ENABLED",
         "whether this build uses memory at all",
     ),
@@ -285,6 +327,110 @@ SETTINGS_DELIBERATELY_NOT_PASSED: tuple[tuple[str, str], ...] = (
 )
 
 
+#: The shape of a setting name a project may declare: letters, digits and
+#: underscores, never starting with a digit. That is the shape almost every
+#: shell will actually pass on, and it is checked rather than corrected — a
+#: rewritten name is a second place a value can hide.
+DECLARED_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+#: A declared name longer than this is refused: an accidental paste is not a
+#: setting name.
+MAX_DECLARED_NAME_LENGTH: int = 128
+
+#: How many names a project may declare. A list, not a copy of everything —
+#: the whole point of the named list is that somebody wrote each entry down.
+MAX_DECLARED_SETTINGS: int = 32
+
+#: Name prefixes the factory keeps for itself. A project may not declare one of
+#: these, because a project that could would be choosing what the factory hands
+#: its own build system — which memory to write, which model seat to talk to,
+#: which ledger to open — from a file inside the project.
+RESERVED_PREFIXES: tuple[tuple[str, str], ...] = (
+    ("FORGE_", "the factory's own settings: its binary, its settings file, its receipts folder, its bus, its ledger"),
+    ("GUARDKIT_", "the build system's own settings, including the memory name this factory hands over and the switches an owner turned on"),
+    ("FLEET_MEMORY_", "where the memory store is and how a read is embedded; a project choosing these would choose what its own outcomes are checked against"),
+    ("OPENAI_", "the model seat's address and key; a project must not be able to point its build at another seat"),
+    ("ANTHROPIC_", "the same seat for the build system's other client, and the number its timeout arithmetic reads"),
+)
+
+#: Exact names the factory keeps for itself, beyond the prefixes: the shell's
+#: own three, which the list already sets, and the agent socket, which is a
+#: credential by another name.
+RESERVED_NAMES: tuple[tuple[str, str], ...] = (
+    ("PATH", "where the launch finds programs; the list sets it and a project redeclaring it would be choosing which binaries run"),
+    ("HOME", "where per-user state lives; the list sets it"),
+    ("TMPDIR", "where scratch files go; the list sets it"),
+    ("SSH_AUTH_SOCK", "an agent socket is a live credential, not a setting"),
+)
+
+#: Words that make a name credential-shaped. This is a rule rather than a list
+#: because the factory cannot enumerate every credential a launching process
+#: might be holding, and a project asking for one by name is asking for the
+#: wrong thing whatever it is called. A project that genuinely needs a secret
+#: gets it the way secrets already move here, not from the parent's settings.
+RESERVED_CREDENTIAL_WORDS: tuple[str, ...] = (
+    "TOKEN",
+    "SECRET",
+    "PASSWORD",
+    "PASSWD",
+    "API_KEY",
+    "APIKEY",
+    "CREDENTIAL",
+    "PRIVATE_KEY",
+)
+
+
+def declared_setting_refusal(name: object) -> str | None:
+    """``None`` when a project may declare this name, or the sentence why not.
+
+    The same answer wherever it is asked: at the door, where a run is refused
+    in plain words before anything is cut, and again at the launch, where a
+    name that somehow got past the door is dropped rather than passed.
+
+    Nothing here knows what tool a name belongs to. It is text, checked for
+    shape and against the names the factory reserves for itself.
+    """
+    if not isinstance(name, str):
+        return (
+            f"a declared setting name must be text (this one reads as "
+            f"{type(name).__name__})"
+        )
+    candidate = name.strip()
+    if not candidate:
+        return "a declared setting name is empty"
+    if len(candidate) > MAX_DECLARED_NAME_LENGTH:
+        return (
+            f"the declared setting name is longer than "
+            f"{MAX_DECLARED_NAME_LENGTH} characters"
+        )
+    if not DECLARED_NAME_PATTERN.fullmatch(candidate):
+        return (
+            f"{candidate!r} is not the shape of a setting name: letters, "
+            f"digits and underscores, never starting with a digit"
+        )
+    upper = candidate.upper()
+    for prefix, why in RESERVED_PREFIXES:
+        if upper.startswith(prefix):
+            return (
+                f"{candidate!r} starts with {prefix}, which this factory keeps "
+                f"for itself — {why}"
+            )
+    for reserved, why in RESERVED_NAMES:
+        if upper == reserved:
+            return (
+                f"{candidate!r} is one of the settings this factory sets "
+                f"itself — {why}"
+            )
+    for word in RESERVED_CREDENTIAL_WORDS:
+        if word in upper:
+            return (
+                f"{candidate!r} is credential-shaped (it contains {word!r}), "
+                f"and a build is never handed a credential out of the settings "
+                f"the launching process happens to be holding"
+            )
+    return None
+
+
 def launch_setting_names() -> tuple[str, ...]:
     """Just the names, in the order they are set."""
     return tuple(name for name, _ in LAUNCH_SETTINGS)
@@ -294,6 +440,7 @@ def build_launch_env(
     *,
     parent: Mapping[str, str] | None = None,
     memory_project: str | None = None,
+    declared: Sequence[str] | Iterable[str] | None = None,
 ) -> dict[str, str]:
     """The environment a build is launched with: the named list and nothing else.
 
@@ -303,9 +450,20 @@ def build_launch_env(
         memory_project: The memory name recorded for this build, handed over on
             purpose. ``None`` means nothing was recorded — a build queued by
             hand, or one from before the memory rule — and then the name is NOT
-            set at all, so the build system falls back to the project's own
-            declaration in the folder it is building, and to memory OFF if
-            there is none. It is never filled in with a guess.
+            set at all. The build system then runs with memory OFF, because
+            this launch also says a factory made it
+            (:data:`GUARDKIT_FACTORY_LAUNCH_ENV`) and a factory-launched build
+            never takes the name from the folder it is pointed at. It is never
+            filled in with a guess.
+        declared: The NAMES the project itself declared it needs, read at the
+            recorded starting commit from its own settings file (22 September
+            2026). Each is appended to the list above and its value taken from
+            ``parent`` — only if ``parent`` has one. Names only: a value never
+            comes out of the project. A name the factory reserves for itself,
+            or one that is not the shape of a setting name, is DROPPED here
+            with a warning; the door refuses such a name in plain words long
+            before a launch, and this is the second fence rather than the
+            first.
 
     Returns:
         A new dictionary. A name the parent does not have is simply absent: an
@@ -315,11 +473,28 @@ def build_launch_env(
     source: Mapping[str, str] = os.environ if parent is None else parent
     env: dict[str, str] = {}
     for name, _reason in LAUNCH_SETTINGS:
-        if name == GUARDKIT_MEMORY_PROJECT_ENV:
-            continue  # decided below, from the record, never inherited
+        if name in (GUARDKIT_MEMORY_PROJECT_ENV, GUARDKIT_FACTORY_LAUNCH_ENV):
+            continue  # decided below, never inherited
         value = source.get(name)
         if value is not None:
             env[name] = str(value)
+    # THE PROJECT'S OWN NAMES, after the factory's and never over them: a
+    # project declares what its builds need beyond this list, and central code
+    # carries those names as text without knowing what tool they belong to.
+    for raw in declared or ():
+        refusal = declared_setting_refusal(raw)
+        if refusal is not None:
+            logger.warning(
+                "launch: a declared setting name is not passed — %s", refusal
+            )
+            continue
+        name = str(raw).strip()
+        value = source.get(name)
+        if value is not None:
+            env[name] = str(value)
+    # A factory made this launch, always: these two are decided from the
+    # record, never inherited from whatever the launching process holds.
+    env[GUARDKIT_FACTORY_LAUNCH_ENV] = "1"
     if memory_project and str(memory_project).strip():
         env[GUARDKIT_MEMORY_PROJECT_ENV] = str(memory_project).strip()
     return env

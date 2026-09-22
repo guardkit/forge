@@ -81,7 +81,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, Sequence
 
 from forge.adapters.nats.pipeline_consumer import PipelineConsumerDeps
 from forge.adapters.nats.pipeline_publisher import PipelinePublisher
@@ -284,6 +284,7 @@ def _build_resume_launcher(
     lifecycle_emitter: Any,
     async_task_starter: AsyncTaskStarter | None,
     memory_project_reader: Callable[[str], str | None] | None = None,
+    launch_settings_reader: Callable[[str], "Sequence[str]"] | None = None,
 ) -> Callable[..., Any]:
     """Return the launch closure — ``dispatch_build`` minus ``record_pending_build``.
 
@@ -341,6 +342,11 @@ def _build_resume_launcher(
             if memory_project_reader is not None and build_id
             else None
         )
+        launch_settings = (
+            launch_settings_reader(build_id)
+            if launch_settings_reader is not None and build_id
+            else ()
+        )
         return await dispatch_autobuild_async(
             build_id=build_id,
             feature_id=feature_id,
@@ -354,6 +360,7 @@ def _build_resume_launcher(
             repo=repo,
             budget=budget,
             memory_project=memory_project,
+            launch_settings=launch_settings,
         )
 
     return launch
@@ -434,6 +441,10 @@ def build_serve_resume_launcher(
         # offer the read at all — a narrowed adapter in a test — is the same
         # answer: nothing recorded, never a guess.
         getattr(sqlite_pool, "read_memory_project", None),
+        # And what the project said its own builds need, by name, off the same
+        # row (22 September 2026). An absent read, or a row from before this
+        # existed, is an empty list: the factory's own list and nothing else.
+        getattr(sqlite_pool, "read_launch_settings", None),
     )
 
     async def guarded_launch(
@@ -708,6 +719,10 @@ def _build_dispatch_build(
         # offer the read at all — a narrowed adapter in a test — is the same
         # answer: nothing recorded, never a guess.
         getattr(sqlite_pool, "read_memory_project", None),
+        # And what the project said its own builds need, by name, off the same
+        # row (22 September 2026). An absent read, or a row from before this
+        # existed, is an empty list: the factory's own list and nothing else.
+        getattr(sqlite_pool, "read_launch_settings", None),
     )
     clock = gate_clock or _utc_now
 

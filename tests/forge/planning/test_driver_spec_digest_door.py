@@ -256,6 +256,7 @@ class RecordingGitRunner:
         message: str,
         *,
         pre_commit: Any = None,
+        **_launch: Any,
     ) -> GitOpResult:
         import tempfile
 

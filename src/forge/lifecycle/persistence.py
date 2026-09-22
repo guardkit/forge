@@ -275,6 +275,14 @@ class BuildRow(BaseModel):
     # RECORDED — a historical row, or a build queued by hand with no planning
     # run — and it is read as that, never as "guardkit".
     memory_project: str | None = None
+    # The setting NAMES this build's project declared its builds need
+    # (``schema_v14.sql``, 22 September 2026), as a JSON list of text, read out
+    # of the same file at the same ``start_commit`` and copied on from the same
+    # planning run. NAMES ONLY — no value a project declared has ever been
+    # here, because a project declares none. ``None`` means NOT DECLARED (a
+    # historical row, or a build queued by hand), which is not the same fact as
+    # ``"[]"``: the project was read and asked for nothing extra.
+    launch_settings: str | None = None
 
 
 class BuildStartPoint(BaseModel):
@@ -405,6 +413,7 @@ def _row_to_build_row(row: sqlite3.Row | tuple[Any, ...]) -> BuildRow:
             "start_commit",
             "target_branch",
             "memory_project",
+            "launch_settings",
         )
         data = dict(zip(keys, row, strict=False))
 
@@ -446,6 +455,7 @@ def _row_to_build_row(row: sqlite3.Row | tuple[Any, ...]) -> BuildRow:
         start_commit=data.get("start_commit"),
         target_branch=data.get("target_branch"),
         memory_project=data.get("memory_project"),
+        launch_settings=data.get("launch_settings"),
     )
 
 
@@ -874,6 +884,17 @@ class SqliteLifecyclePersistence:
             columns += ", memory_project"
             placeholders += ", ?"
             values.append(self._planning_memory_project(correlation_id))
+        # And the NAMES the project said its own builds need
+        # (``schema_v14.sql``), by the same rule, out of the same file at the
+        # same commit, from the same planning run. Names only; the launch takes
+        # each value from the launching process, and only if it has one. A
+        # ledger without the column, or a build with no planning run, records
+        # nothing — which reads back as "not declared", and the build is
+        # launched with the factory's own list exactly as before.
+        if self._builds_record_the_launch_settings():
+            columns += ", launch_settings"
+            placeholders += ", ?"
+            values.append(self._planning_launch_settings(correlation_id))
 
         try:
             self._cx.execute("BEGIN IMMEDIATE;")
@@ -1306,6 +1327,82 @@ class SqliteLifecyclePersistence:
             return None
         name = row["memory_project"] if isinstance(row, sqlite3.Row) else row[0]
         return str(name) if name else None
+
+    def _builds_record_the_launch_settings(self) -> bool:
+        """Does this ledger have ``builds.launch_settings`` (``schema_v14``)?
+
+        Asked once per facade and remembered, exactly as its two siblings are.
+        A ledger from before the migration answers no, and a build queued
+        against it is still written — with nothing recorded about what its
+        project asked for, so it is launched with the factory's own list.
+        """
+        cached = getattr(self, "_launch_settings_column", None)
+        if cached is not None:
+            return bool(cached)
+        try:
+            names = {
+                row[1] for row in self._cx.execute("PRAGMA table_info(builds);")
+            }
+        except sqlite3.Error:
+            names = set()
+        answer = "launch_settings" in names
+        self._launch_settings_column = answer
+        return answer
+
+    def _planning_launch_settings(self, correlation_id: str) -> str | None:
+        """The planning run's recorded setting names, as stored, or ``None``.
+
+        Read-only and forgiving on purpose, like its siblings: a ledger without
+        the column, or a correlation id with no planning run behind it, answers
+        "not declared" rather than failing a build that is otherwise fine.
+        """
+        if not correlation_id:
+            return None
+        try:
+            row = self._cx.execute(
+                """
+                SELECT launch_settings
+                  FROM planning_runs
+                 WHERE correlation_id = ?
+                """,
+                (correlation_id,),
+            ).fetchone()
+        except sqlite3.Error:
+            return None
+        if row is None:
+            return None
+        raw = row["launch_settings"] if isinstance(row, sqlite3.Row) else row[0]
+        return str(raw) if raw else None
+
+    def read_launch_settings(self, build_id: str) -> tuple[str, ...]:
+        """The setting NAMES this build's project asked for; empty when none.
+
+        The launch path reads this and appends these names to the factory's own
+        list, taking each value from the launching process only if it has one.
+        A build with nothing recorded, a ledger without the column and a
+        project that asked for nothing all answer the same way here — an empty
+        list — because all three mean the same thing at a launch: the factory's
+        own list, and nothing else.
+        """
+        try:
+            row = self._cx.execute(
+                "SELECT launch_settings FROM builds WHERE build_id = ?",
+                (build_id,),
+            ).fetchone()
+        except sqlite3.Error:
+            return ()
+        if row is None:
+            return ()
+        raw = row["launch_settings"] if isinstance(row, sqlite3.Row) else row[0]
+        if not raw:
+            return ()
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, ValueError):
+            return ()
+        if not isinstance(parsed, list):
+            return ()
+        return tuple(str(name) for name in parsed)
 
     def record_merge_branch(self, build_id: str, branch: str) -> None:
         """Persist the branch the merge word must merge onto the ``builds`` row.

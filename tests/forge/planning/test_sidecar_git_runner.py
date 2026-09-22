@@ -157,6 +157,22 @@ def test_a_sidecar_result_is_a_git_op_result_that_carries_the_checks() -> None:
 # ---------------------------------------------------------------------------
 
 
+#: The settings the stand-in guardkit in this module is steered with. They are
+#: not on the factory's own list — nothing a test invents ever should be — so a
+#: call that expects the stand-in to be told something names them, the way a
+#: project names what its own builds and checks need.
+STAND_IN_SETTINGS: tuple[str, ...] = (
+    "FAKE_GUARDKIT_LOG",
+    "FAKE_GUARDKIT_NORMALIZE",
+    "FAKE_GUARDKIT_VALIDATE",
+    "FAKE_GUARDKIT_CLASSIFY",
+    "FAKE_GUARDKIT_QA_VALIDATE",
+    "FAKE_GUARDKIT_NO_MODEL_REFUSES",
+    "FAKE_NORMALIZER",
+    "PYTHONPATH",
+)
+
+
 @pytest.mark.asyncio
 async def test_a_declared_write_commits_and_answers_with_the_checks(
     sidecar: str, repo: Path, fake_guardkit: Path
@@ -164,7 +180,12 @@ async def test_a_declared_write_commits_and_answers_with_the_checks(
     runner = SidecarGitRunner(sidecar, repo=REPO_KEY)
     assert runner.supports_declared_checks() is True
     result = await runner.prepare_branch_and_write_tree(
-        "/ignored/on/this/side", BRANCH, PLAN_FILES, "planning: plan", pre_commit=_declaration()
+        "/ignored/on/this/side",
+        BRANCH,
+        PLAN_FILES,
+        "planning: plan",
+        pre_commit=_declaration(),
+        launch_settings=STAND_IN_SETTINGS,
     )
     assert isinstance(result, SidecarGitOpResult)
     assert result.status == "success" and result.exit_code == 0
@@ -183,7 +204,12 @@ async def test_a_refused_check_is_a_failed_result_with_the_outcomes(
     monkeypatch.setenv("FAKE_GUARDKIT_NORMALIZE", "refused")
     runner = SidecarGitRunner(sidecar, repo=REPO_KEY)
     result = await runner.prepare_branch_and_write_tree(
-        str(repo), BRANCH, PLAN_FILES, "planning: plan", pre_commit=_declaration()
+        str(repo),
+        BRANCH,
+        PLAN_FILES,
+        "planning: plan",
+        pre_commit=_declaration(),
+        launch_settings=STAND_IN_SETTINGS,
     )
     assert result.status == "failed" and result.sha is None
     assert result.stderr == result.detail
@@ -350,7 +376,7 @@ class _Recording:
         self.calls.append(("single", repo_path))
         return GitOpResult(status="success", operation="prepare_branch_and_write", sha=self.name, exit_code=0)
 
-    async def prepare_branch_and_write_tree(self, repo_path: str, branch: str, files: Any, message: str, *, pre_commit: Any = None, start_commit: str | None = None) -> GitOpResult:
+    async def prepare_branch_and_write_tree(self, repo_path: str, branch: str, files: Any, message: str, *, pre_commit: Any = None, start_commit: str | None = None, **_launch: Any) -> GitOpResult:
         self.calls.append(("tree", repo_path))
         return GitOpResult(status="success", operation="prepare_branch_and_write_tree", sha=self.name, exit_code=0)
 

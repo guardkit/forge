@@ -84,7 +84,7 @@ def _stub_execute(
     ``(stdout, stderr, exit_code, duration_secs, timed_out)`` tuple.
     """
 
-    async def _stub(*, command: list[str], cwd: str, timeout: int):
+    async def _stub(*, command: list[str], cwd: str, timeout: int, **_launch: Any):
         if capture is not None:
             capture["command"] = list(command)
             capture["cwd"] = cwd
@@ -425,7 +425,7 @@ class TestExtraContextPaths:
         )
         captures: list[dict[str, Any]] = [{}, {}]
 
-        async def _stub(*, command: list[str], cwd: str, timeout: int):
+        async def _stub(*, command: list[str], cwd: str, timeout: int, **_launch: Any):
             slot = captures[0] if "command" not in captures[0] else captures[1]
             slot["command"] = list(command)
             return ("", "", 0, 1.0, False)
@@ -782,7 +782,7 @@ class TestParallelCallIsolation:
             lambda *a, **kw: _empty_resolved(),
         )
 
-        async def _stub(*, command: list[str], cwd: str, timeout: int):
+        async def _stub(*, command: list[str], cwd: str, timeout: int, **_launch: Any):
             # Yield once so the event loop can interleave the two calls.
             await asyncio.sleep(0)
             sub = command[1]

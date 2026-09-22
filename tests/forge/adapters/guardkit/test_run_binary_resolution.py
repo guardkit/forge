@@ -89,7 +89,7 @@ def _make_exe(path: Path, body: str = "#!/bin/sh\nexit 0\n") -> Path:
 
 
 def _stub_execute(capture: dict[str, Any] | None = None, *, calls: list | None = None):
-    async def _stub(*, command: list[str], cwd: str, timeout: int):
+    async def _stub(*, command: list[str], cwd: str, timeout: int, **_launch: Any):
         if capture is not None:
             capture["command"] = list(command)
             capture["cwd"] = cwd
@@ -570,7 +570,7 @@ class TestResolvedOnce:
         _no_context(monkeypatch)
         calls: list[list[str]] = []
 
-        async def _slow(*, command: list[str], cwd: str, timeout: int):
+        async def _slow(*, command: list[str], cwd: str, timeout: int, **_launch: Any):
             await asyncio.sleep(0)
             calls.append(list(command))
             return ("", "", 0, 1.0, False)

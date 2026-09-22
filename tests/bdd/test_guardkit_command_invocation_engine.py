@@ -1427,7 +1427,7 @@ def _given_reasoning_invokes_subcommand_wrapper(
     )
     captured: dict[str, Any] = {}
 
-    async def _fake_execute(*, command: list[str], cwd: str, timeout: int):
+    async def _fake_execute(*, command: list[str], cwd: str, timeout: int, **_launch: Any):
         captured["command"] = list(command)
         captured["cwd"] = cwd
         captured["timeout"] = timeout
@@ -1496,7 +1496,7 @@ def _given_build_worktree_prepared(
     gci_world["read_allowlist"] = [worktree]
     captured: dict[str, Any] = {}
 
-    async def _fake_execute(*, command: list[str], cwd: str, timeout: int):
+    async def _fake_execute(*, command: list[str], cwd: str, timeout: int, **_launch: Any):
         captured["command"] = list(command)
         captured["cwd"] = cwd
         captured["timeout"] = timeout
@@ -1568,7 +1568,7 @@ def _when_wrapper_completes_after_seconds(
     canned_stdout = _gci_canned_success_stdout(artefacts=["docs/specs/timing.md"])
     duration = float(seconds)
 
-    async def _fake_execute(*, command: list[str], cwd: str, timeout: int):
+    async def _fake_execute(*, command: list[str], cwd: str, timeout: int, **_launch: Any):
         return (canned_stdout, "", 0, duration, False)
 
     monkeypatch.setattr(gk_run_module, "_execute_subprocess", _fake_execute)
@@ -1599,7 +1599,7 @@ def _then_duration_matches_observed(gci_world: dict[str, Any]) -> None:
 def _when_wrapper_running_longer_than_timeout(
     gci_world: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    async def _fake_execute(*, command: list[str], cwd: str, timeout: int):
+    async def _fake_execute(*, command: list[str], cwd: str, timeout: int, **_launch: Any):
         # Simulate the SIGTERM-after-timeout outcome the real seam
         # produces: empty/partial stdout, exit_code=124 (canonical
         # GNU-coreutils timeout signal), timed_out=True.
@@ -1663,7 +1663,7 @@ def _when_attempts_unallowed_binary(
 ) -> None:
     captured: dict[str, Any] = {"called": False}
 
-    async def _refusing_execute(*, command: list[str], cwd: str, timeout: int):
+    async def _refusing_execute(*, command: list[str], cwd: str, timeout: int, **_launch: Any):
         captured["called"] = True
         # The DeepAgents permission layer raises PermissionError when
         # the binary is not on the shell allowlist; ``run()`` converts
@@ -1737,7 +1737,7 @@ def _when_subprocess_cwd_outside(
 ) -> None:
     not_called: dict[str, bool] = {"called": False}
 
-    async def _should_not_be_called(*, command: list[str], cwd: str, timeout: int):
+    async def _should_not_be_called(*, command: list[str], cwd: str, timeout: int, **_launch: Any):
         not_called["called"] = True
         return ("", "", 0, 0.0, False)
 
@@ -1778,7 +1778,7 @@ def _given_wrapper_returned_failure(
 
     captured_calls: list[dict[str, Any]] = []
 
-    async def _fake_execute(*, command: list[str], cwd: str, timeout: int):
+    async def _fake_execute(*, command: list[str], cwd: str, timeout: int, **_launch: Any):
         captured_calls.append({"command": list(command), "cwd": cwd})
         if len(captured_calls) == 1:
             # First call: structured failure.
@@ -1867,7 +1867,7 @@ def _given_two_wrappers_in_parallel(
 
     call_count = {"n": 0}
 
-    async def _fake_execute(*, command: list[str], cwd: str, timeout: int):
+    async def _fake_execute(*, command: list[str], cwd: str, timeout: int, **_launch: Any):
         call_count["n"] += 1
         # Distinguish by subcommand argument so the per-task artefacts
         # do not bleed into the wrong result.
@@ -1939,7 +1939,7 @@ def _given_subprocess_running(
 
     cancellation_observed = {"hit": False}
 
-    async def _slow_execute(*, command: list[str], cwd: str, timeout: int):
+    async def _slow_execute(*, command: list[str], cwd: str, timeout: int, **_launch: Any):
         try:
             # A long sleep that cancellation will interrupt.
             await asyncio.sleep(60.0)
@@ -2010,7 +2010,7 @@ def _given_silent_subprocess(
 
     seam_called = {"called": False}
 
-    async def _silent_execute(*, command: list[str], cwd: str, timeout: int):
+    async def _silent_execute(*, command: list[str], cwd: str, timeout: int, **_launch: Any):
         seam_called["called"] = True
         # Empty stdout AND empty stderr; timed_out=True, exit_code=124.
         return ("", "", 124, float(timeout), True)

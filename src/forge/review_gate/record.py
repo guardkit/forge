@@ -133,13 +133,20 @@ def _resolve_guardkit() -> str | None:
 
 
 def validate_review_findings(
-    path: str | Path, *, timeout: float = 60.0
+    path: str | Path,
+    *,
+    timeout: float = 60.0,
+    memory_project: str | None = None,
 ) -> ValidationResult:
     """Validate an emitted F14 record via the guardkit CLI (frozen seam).
 
     Shells ``guardkit qa validate review-findings <path>``. Returns a
     :class:`ValidationResult` (``ok`` reflects exit 0) — a validation *failure*
     is reported, not raised.
+
+    ``memory_project`` is which memory this call belongs to, for a caller that
+    knows. Nothing in the gate does today — see the note at the spawn — so it
+    defaults to none and the check runs with memory explicitly off.
 
     Raises:
         GuardkitValidatorUnavailable: if no guardkit CLI is resolvable — an
@@ -165,16 +172,23 @@ def validate_review_findings(
     # right: which validator to run is the coordinator's decision, and the
     # resolved absolute path is what is launched.
     #
-    # NO MEMORY NAME IS HANDED OVER, deliberately. This leg checks the shape of
-    # one record already written to disk; it reads and writes no memory, so
-    # there is no work for a name to belong to.
+    # NO MEMORY NAME IS HANDED OVER unless a caller knows one, and today none
+    # does. This leg checks the shape of one record already written to disk: it
+    # is handed a path, not a build, and the gate that calls it holds a review
+    # packet rather than a ledger row. So it runs with memory EXPLICITLY OFF —
+    # the launch says a factory made it (``GUARDKIT_FACTORY_LAUNCH``), which
+    # stops the build system falling back to the declaration in whatever folder
+    # this process happens to be standing in. Before 22 September 2026 that
+    # fallback was live here, so a working copy could decide which memory a
+    # check the factory ran belonged to. The parameter is there for the day a
+    # caller does know, and the record says plainly that nobody does yet.
     proc = subprocess.run(  # noqa: S603 — binary resolved via shutil.which
         [binary, "qa", "validate", F14_KIND, str(path)],
         capture_output=True,
         text=True,
         timeout=timeout,
         check=False,
-        env=build_launch_env(),
+        env=build_launch_env(memory_project=memory_project),
     )
     return ValidationResult(
         ok=proc.returncode == 0,

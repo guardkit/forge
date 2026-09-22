@@ -20,6 +20,7 @@ from unittest.mock import patch
 import pytest
 
 from forge.launch_environment import (
+    GUARDKIT_FACTORY_LAUNCH_ENV,
     GUARDKIT_MEMORY_PROJECT_ENV,
     launch_setting_names,
 )
@@ -169,9 +170,14 @@ def test_the_memory_name_the_dispatch_handed_over_is_the_one_set(
 def test_nothing_recorded_means_no_name_is_set_and_never_guardkit(
     launched: _Recorder, tmp_path: Path
 ) -> None:
-    """With no name the build system reads the project's own declaration in the
-    folder it is building. It never falls back to "guardkit", which is what
-    used to file every project's outcomes under somebody else's name."""
+    """With no name recorded the build runs with memory OFF and says so.
+
+    It never falls back to "guardkit", which is what used to file every
+    project's outcomes under somebody else's name — and since 22 September
+    2026 it does not fall back to the folder's own declaration either: this
+    launch says a factory made it, and a factory reads the declaration at the
+    commit the work started from, not in whatever copy the build is pointed
+    at."""
     _run(
         launched,
         {
@@ -270,6 +276,82 @@ def test_the_bounded_legs_are_launched_with_the_same_list(
     assert env is not None, "the leg was launched with no named settings at all"
     assert PLANTED not in env
     assert set(env) <= set(launch_setting_names())
-    # No memory name is handed to a leg: it runs IN the project's own working
-    # folder and reads the project's own declaration there.
+    # A leg handed no name runs with memory OFF — and says a factory launched
+    # it, so the build system cannot take the name out of the folder instead.
     assert GUARDKIT_MEMORY_PROJECT_ENV not in env
+    assert env[GUARDKIT_FACTORY_LAUNCH_ENV] == "1"
+
+
+def _drive_a_leg(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, **launch: Any
+) -> dict[str, str]:
+    """Drive one bounded leg with the spawn replaced; answer its settings."""
+    from forge.adapters.guardkit import run as guardkit_run
+
+    seen: dict[str, Any] = {}
+
+    async def _spawn(*args: Any, **kwargs: Any) -> Any:
+        seen["env"] = kwargs.get("env")
+
+        class _Proc:
+            returncode = 0
+
+            async def communicate(self) -> tuple[bytes, bytes]:
+                return b"{}", b""
+
+        return _Proc()
+
+    monkeypatch.setattr(_asyncio, "create_subprocess_exec", _spawn)
+    repo = tmp_path / "project"
+    repo.mkdir(exist_ok=True)
+    stand_in = tmp_path / "guardkit"
+    stand_in.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    stand_in.chmod(0o755)
+    monkeypatch.setenv("FORGE_GUARDKIT_PATH", str(stand_in))
+    monkeypatch.setattr(guardkit_run, "_resolved_guardkit_binary", None, raising=False)
+
+    _asyncio.run(
+        guardkit_run.run(
+            subcommand="task-review",
+            args=["--task-id", "TASK-1"],
+            repo_path=repo,
+            read_allowlist=[repo],
+            with_nats_streaming=False,
+            **launch,
+        )
+    )
+    return seen["env"]
+
+
+def test_a_leg_is_handed_the_name_recorded_for_its_build(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The fault the second review found, and the fence for it.
+
+    The bounded legs used to be handed no name at all, on the reasoning that
+    they run in the project's own folder and would read the same declaration
+    there. The folder is not the commit: with ``recorded_project`` in the
+    ledger and ``changed_project`` in the worktree, the child took the
+    worktree's name.
+    """
+    env = _drive_a_leg(monkeypatch, tmp_path, memory_project="recorded_project")
+
+    assert env[GUARDKIT_MEMORY_PROJECT_ENV] == "recorded_project"
+    assert env[GUARDKIT_FACTORY_LAUNCH_ENV] == "1"
+
+
+def test_a_leg_is_given_the_names_its_project_declared(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("SOME_TOOL_CACHE", "/scratch/cache")
+    monkeypatch.setenv("NOT_DECLARED", "should not travel")
+
+    env = _drive_a_leg(
+        monkeypatch,
+        tmp_path,
+        memory_project="recorded_project",
+        launch_settings=["SOME_TOOL_CACHE"],
+    )
+
+    assert env["SOME_TOOL_CACHE"] == "/scratch/cache"
+    assert "NOT_DECLARED" not in env

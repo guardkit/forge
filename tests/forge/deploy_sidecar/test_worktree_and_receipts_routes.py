@@ -689,7 +689,16 @@ class TestTheLegRoute:
         monkeypatch.setenv("FAKE_LEG_EXIT", "2")
         tree = _worktree_with_receipts(cfg, repo)
         status, body = process_guardkit_leg_request(
-            {"repo": REPO_KEY, "cwd": str(tree), "subcommand": "task-work"},
+            {
+                "repo": REPO_KEY,
+                "cwd": str(tree),
+                "subcommand": "task-work",
+                # A leg is launched with the factory's own named list and
+                # nothing else, so the setting this test steers its stand-in
+                # with is declared by name — the same door a project uses to
+                # say what its own builds need.
+                "launch_settings": ["FAKE_LEG_EXIT"],
+            },
             config=cfg,
         )
         assert status == 200 and body["exit_code"] == 2
@@ -710,7 +719,7 @@ class TestTheLegRoute:
         seen: dict[str, Any] = {}
 
         def _record(
-            *, argv: list[str], cwd: str, timeout: float
+            *, argv: list[str], cwd: str, timeout: float, **_launch: Any
         ) -> tuple[int, str, str]:
             seen["timeout"] = timeout
             return 0, "leg ran", ""
@@ -741,7 +750,7 @@ class TestTheLegRoute:
         seen: dict[str, Any] = {}
 
         def _record(
-            *, argv: list[str], cwd: str, timeout: float
+            *, argv: list[str], cwd: str, timeout: float, **_launch: Any
         ) -> tuple[int, str, str]:
             seen["timeout"] = timeout
             return 0, "leg ran", ""

@@ -219,6 +219,11 @@ async def test_a_red_merge_is_a_failed_result_with_the_report_intact(
         read_allowlist=[repo],
         timeout_seconds=900,
         with_nats_streaming=False,
+        # The merge command is launched with the factory's own named list and
+        # nothing else, so the setting this test steers its stand-in with is
+        # declared by name — the door a project uses to say what its own
+        # builds need.
+        launch_settings=["FAKE_GUARDKIT_EXIT"],
     )
     assert result.status == "failed"
     assert result.exit_code == 4

@@ -261,7 +261,7 @@ class TestBootLogEmitsAppliedCount:
         # added by the one-true-copy lane for the start_commit / target_branch
         # columns on planning_runs and builds — where a piece of work started
         # from, and which branch of the remote it is aimed at) → applied=12.
-        assert "applied 13" in applied_lines[0], applied_lines[0]
+        assert "applied 14" in applied_lines[0], applied_lines[0]
 
 
 # ---------------------------------------------------------------------------

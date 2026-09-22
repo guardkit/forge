@@ -245,7 +245,15 @@ class TestDispatchAutobuildSignature:
         # (item 2): which memory the build belongs to, read at the recorded
         # starting commit. Same one-hop truthy-guard convention as the other
         # three — a launch without it is byte-identical to the one before it.
-        additive_data_kwargs = ["branch", "repo", "budget", "memory_project"]
+        # and ``launch_settings`` beside it on 2026-09-22 — the NAMES the
+        # project declared its own builds need, read at the same commit.
+        additive_data_kwargs = [
+            "branch",
+            "repo",
+            "budget",
+            "memory_project",
+            "launch_settings",
+        ]
         assert kw_only == collaborators + additive_data_kwargs, (
             f"dispatch_autobuild_async must expose exactly the five collaborator "
             f"parameters {collaborators!r} followed only by the additive data "

@@ -79,7 +79,15 @@ import time
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Mapping, Protocol, runtime_checkable
+from typing import (
+    Any,
+    Awaitable,
+    Callable,
+    Mapping,
+    Protocol,
+    Sequence,
+    runtime_checkable,
+)
 
 from forge.adapters.guardkit.models import GuardKitResult
 from forge.pipeline.forward_context_builder import (
@@ -883,6 +891,8 @@ async def dispatch_subprocess_stage(
     timeout_seconds: int = 600,
     with_nats_streaming: bool = True,
     extra_args: list[str] | None = None,
+    memory_project: str | None = None,
+    launch_settings: Sequence[str] | None = None,
 ) -> StageDispatchResult:
     """Dispatch a Mode A subprocess stage and return a structured outcome.
 
@@ -979,6 +989,19 @@ async def dispatch_subprocess_stage(
             ``None`` (no extras). Useful for callers that need to thread
             through optional flags (``--retry``, etc.) without forcing
             the dispatcher to know about them.
+        memory_project: Which memory this stage reads and writes — the
+            name recorded on this build's ledger row, read from the
+            project's own declaration at the commit the work started
+            from. ``None`` means the caller had no build row to read one
+            off, and then the leg runs with memory explicitly OFF: the
+            launch says a factory made it, so the build system never
+            takes the name out of the folder the leg is pointed at.
+            Before 22 September 2026 no name was passed at all and a
+            changed working copy could choose the memory for a call the
+            factory made.
+        launch_settings: The setting NAMES this build's project declared
+            its own builds need beyond the factory's list, recorded the
+            same way at the same commit. Names only.
 
     Returns:
         :class:`StageDispatchResult` capturing the outcome. The
@@ -1079,6 +1102,18 @@ async def dispatch_subprocess_stage(
             "with_nats_streaming": with_nats_streaming,
             "extra_context_paths": plan.extra_context_paths or None,
         }
+        # The two facts the ledger holds about this build's launch. They ride
+        # EVERY leg, in the container and through a sandbox alike, because the
+        # folder a leg runs in is not the commit the work started from and must
+        # not be allowed to answer either question. They are added only when
+        # there is something to add, so a caller with no build row behind it —
+        # and every runner written before these existed — is called with
+        # exactly the arguments it always was, and its leg runs with memory
+        # explicitly off because the launch itself says a factory made it.
+        if memory_project:
+            runner_kwargs["memory_project"] = str(memory_project)
+        if launch_settings:
+            runner_kwargs["launch_settings"] = tuple(str(n) for n in launch_settings)
 
         guardkit_result = await subprocess_runner(**runner_kwargs)
 

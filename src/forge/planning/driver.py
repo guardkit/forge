@@ -72,7 +72,11 @@ from forge.planning.checkpoint import (
     build_planning_approval_envelope,
     checkpoint_product_docs,
 )
-from forge.planning.declared_memory import DECLARATION_PATH, read_declared_memory
+from forge.planning.declared_memory import (
+    DECLARATION_PATH,
+    read_declared_launch_settings,
+    read_declared_memory,
+)
 from forge.planning.escalation import (
     EscalationOutcome,
     EscalationPolicy,
@@ -1430,6 +1434,41 @@ class PlanningRunDriver:
                     )
                     return
 
+        # THE DOOR, AND IT IS BEFORE THE FIRST MODEL IS ASKED ANYTHING
+        # (22 September 2026, after the stage's second independent review).
+        #
+        # The starting rule and the memory rule used to run inside
+        # :meth:`_enter_target_terminal`, which is where the branch is cut —
+        # and that is AFTER the product-owner dispatch. So a project that
+        # declares no memory was refused, correctly, but only after a model had
+        # already been asked to do work, with neither the starting commit nor
+        # the memory name recorded when that call was made. A door that opens
+        # after the first dispatch is not a door.
+        #
+        # Both rules run HERE instead, before the loop below reaches any
+        # dispatch: the project's remote is fetched and the starting commit and
+        # branch written down; the project's own settings file is read AT that
+        # commit for the memory name and for the setting names its builds ask
+        # for; a project that declares no memory, or anything unusable, is
+        # refused in plain words with nothing cut and nothing recorded beyond
+        # where it would have started.
+        #
+        # Only on the two states from which a run can still reach a dispatch,
+        # and only when the machine chain is on — a run already past the door
+        # (FEATURE_SPEC and later) has been through it, and re-running it on a
+        # re-drive could refuse work already in flight. Everything it does is
+        # idempotent anyway: a run with both facts recorded fetches nothing and
+        # reads nothing.
+        if self._target_terminal_enabled() and state in (
+            PlanningState.QUEUED,
+            PlanningState.RUNNING,
+        ):
+            row = deps.store.get_run(correlation_id)
+            if row is None:  # pragma: no cover - defensive
+                return
+            if await self._door(row, correlation_id) is None:
+                return
+
         needs_republish = republish_pending
         checkpoint_failures = 0
         while True:
@@ -2159,32 +2198,18 @@ class PlanningRunDriver:
         handoff_path = f"feature_spec_inputs/{correlation_id}.md"
         content = build_feature_spec_input_content(self._run_data(row, correlation_id))
 
-        # THE STARTING RULE (one true copy, item 1, 2026-09-21), and it runs
-        # FIRST: before any branch is cut, the project's remote named
-        # ``origin`` is fetched and asked which branch it calls its default and
-        # which commit that branch is at. The branch is then cut from exactly
-        # that commit, and the commit and the branch name are written down. A
-        # project with no such remote, or a remote that cannot be reached, is
-        # refused here in plain words and nothing is started.
-        start = await self._start_point(correlation_id, target_repo, repo_path)
-        if start is None:
+        # THE DOOR'S OWN FACTS, asked for again here and answered from the
+        # record. ``drive`` walks the door before the first dispatch, so by the
+        # time the branch is cut the starting commit, the memory name and the
+        # project's declared setting names are already written down and this
+        # fetches nothing and reads nothing. It is called again rather than
+        # passed down because this leg is also reachable on a re-drive, and a
+        # leg that cuts a branch must never do it from facts it was handed by
+        # something that might not have run.
+        passed = await self._door(row, correlation_id)
+        if passed is None:
             return False
-        start_commit, target_branch = start
-
-        # THE MEMORY RULE (the project's own memory, item 2, 2026-09-21), and
-        # it runs SECOND, immediately after the starting commit is recorded and
-        # before any model is asked anything: the project's own
-        # ``.guardkit/config.yaml`` is read AT that commit and must name the
-        # memory this work belongs to. A project that declares none, or that
-        # declares a name the memory service would refuse, is refused here in
-        # plain words naming the two lines to add, and nothing is started.
-        # Building with no context is pointless, and filing one project's
-        # outcomes under another project's name is worse than filing none.
-        memory_project = await self._memory_project(
-            correlation_id, target_repo, repo_path, start_commit
-        )
-        if memory_project is None:
-            return False
+        start_commit, target_branch, memory_project, _declared = passed
 
         try:
             result = await deps.git_runner.prepare_branch_and_write(
@@ -2242,6 +2267,85 @@ class PlanningRunDriver:
             target_branch,
         )
         return True
+
+    def _recorded_launch(self, correlation_id: str) -> tuple[str | None, tuple[str, ...]]:
+        """``(memory name, declared setting names)`` as the door recorded them.
+
+        Read off the run rather than passed down, so any leg that declares
+        checks to a sandbox is launching the build system with exactly what the
+        door wrote down for this run and nothing else. Nothing recorded — a run
+        from before either rule, or a ledger without the columns — answers
+        ``(None, ())``, and the checks are then launched with the factory's own
+        list and memory explicitly off, never with what the sandbox's own
+        checkout happens to declare.
+        """
+        store = self._deps.store
+        name = None
+        getter = getattr(store, "get_memory_project", None)
+        if getter is not None:
+            try:
+                name = getter(correlation_id)
+            except Exception:  # noqa: BLE001 — a read, never a failed leg
+                name = None
+        names: tuple[str, ...] = ()
+        settings_getter = getattr(store, "get_launch_settings", None)
+        if settings_getter is not None:
+            try:
+                names = tuple(settings_getter(correlation_id) or ())
+            except Exception:  # noqa: BLE001 — same
+                names = ()
+        return (str(name) if name else None), names
+
+    async def _door(
+        self, row: Any, correlation_id: str
+    ) -> tuple[str, str, str, tuple[str, ...]] | None:
+        """The door: everything decided before a model is asked anything.
+
+        Returns ``(start_commit, target_branch, memory_project, declared)`` or
+        ``None`` after failing the run loudly and telling the owner why.
+
+        Three questions, in this order, because each needs the one before it:
+
+        1. **where does this work start?** The project's remote named ``origin``
+           is fetched and asked which branch it calls its default and which
+           commit that branch is at, and both are written down (the starting
+           rule, one true copy, item 1, 2026-09-21);
+        2. **which memory does it belong to?** The project's own
+           ``.guardkit/config.yaml`` is read AT that commit and must name it
+           (item 2). A project that declares none is refused in plain words
+           naming the two lines to add. Building with no context is pointless,
+           and filing one project's outcomes under another project's name is
+           worse than filing none;
+        3. **what do its builds need to be launched with?** The same file, the
+           same commit, the same parse: the NAMES the project declares beyond
+           the factory's own list (22 September 2026). A project that asks for
+           nothing gets nothing extra; one that asks for a name this factory
+           keeps for itself is refused, naming it.
+
+        Every part is idempotent: a run that already has these facts recorded
+        fetches nothing and reads nothing, and keeps exactly what it started
+        with. A re-drive must never move a run onto a newer commit, a different
+        memory or a different set of settings than the branch it already cut.
+        """
+        resolved = await self._resolve_repo(
+            row, correlation_id, stage_label="target-terminal-enter"
+        )
+        if resolved is None:
+            return None
+        target_repo, repo_path = resolved
+
+        start = await self._start_point(correlation_id, target_repo, repo_path)
+        if start is None:
+            return None
+        start_commit, target_branch = start
+
+        declarations = await self._declarations(
+            correlation_id, target_repo, repo_path, start_commit
+        )
+        if declarations is None:
+            return None
+        memory_project, declared = declarations
+        return start_commit, target_branch, memory_project, declared
 
     async def _start_point(
         self, correlation_id: str, target_repo: str, repo_path: str
@@ -2329,47 +2433,57 @@ class PlanningRunDriver:
         )
         return commit, remote_branch
 
-    async def _memory_project(
+    async def _declarations(
         self,
         correlation_id: str,
         target_repo: str,
         repo_path: str,
         start_commit: str,
-    ) -> str | None:
-        """The memory this work belongs to, or None after failing the run.
+    ) -> tuple[str, tuple[str, ...]] | None:
+        """What the project declares at the starting commit, or None on refusal.
 
-        The memory rule's one call, and the place it is written down (the
-        project's own memory, item 2, 2026-09-21):
+        ``(memory name, the setting names its builds asked for)``. ONE read of
+        ONE file at ONE commit answers both, because they live in the same file
+        and asking twice is how two readers come to disagree.
 
-        * a run that ALREADY has a recorded name keeps it. A re-drive of this
-          leg must not quietly move a run onto a different memory than the one
-          its branch was cut under. Nothing is read in that case;
+        The rules written down (the project's own memory, item 2, 2026-09-21;
+        the project's own launch settings, 22 September 2026):
+
+        * a run that ALREADY has both recorded keeps them. A re-drive must not
+          quietly move a run onto a different memory, or a different set of
+          settings, than the one its branch was cut under. Nothing is read;
         * otherwise the git runner for this repository — the SAME one that
           fetched the starting commit and is about to cut the branch — is asked
           for the project's own ``.guardkit/config.yaml`` AS IT IS AT THAT
           COMMIT. Never the working folder, never the checked-out branch: a
-          stale checkout must not be able to supply the name;
-        * the name is recorded on the planning run BEFORE the branch is cut, so
-          a crash between the two leaves a record of which memory the work was
-          about to belong to rather than nothing at all;
-        * a project that declares nothing, a name the memory service would
-          refuse, or a settings file that could not be read at that commit, all
-          fail the run loudly with their own sentence, which reaches the owner
-          exactly where every other planning refusal does.
+          stale checkout must not be able to supply either answer;
+        * both are recorded on the planning run BEFORE the branch is cut, so a
+          crash between the two leaves a record of what the work was about to
+          belong to rather than nothing at all;
+        * a project that declares no memory, a name the memory service would
+          refuse, a setting name this factory keeps for itself, or a settings
+          file that could not be read at that commit, all fail the run loudly
+          with their own sentence, which reaches the owner exactly where every
+          other planning refusal does.
         """
         deps = self._deps
-        recorded = None
+        recorded_name = None
         getter = getattr(deps.store, "get_memory_project", None)
         if getter is not None:
-            recorded = getter(correlation_id)
-        if recorded:
+            recorded_name = getter(correlation_id)
+        recorded_settings = None
+        settings_getter = getattr(deps.store, "get_launch_settings", None)
+        if settings_getter is not None:
+            recorded_settings = settings_getter(correlation_id)
+        if recorded_name and recorded_settings is not None:
             logger.info(
-                "planning driver: run %s already belongs to the memory %s; not "
+                "planning driver: run %s already belongs to the memory %s and "
+                "already knows what its project asked to be launched with; not "
                 "reading the declaration again",
                 correlation_id,
-                recorded,
+                recorded_name,
             )
-            return str(recorded)
+            return str(recorded_name), tuple(recorded_settings)
 
         runner = deps.git_runner
         read = getattr(runner, "read_file_at_commit", None)
@@ -2398,12 +2512,16 @@ class PlanningRunDriver:
             )
             return None
 
+        content = getattr(answer, "content", None)
+        found = bool(getattr(answer, "found", False))
+        unreadable = getattr(answer, "refusal", None)
+
         declared = read_declared_memory(
             repo=target_repo,
             commit=start_commit,
-            content=getattr(answer, "content", None),
-            found=bool(getattr(answer, "found", False)),
-            unreadable_because=getattr(answer, "refusal", None),
+            content=content,
+            found=found,
+            unreadable_because=unreadable,
         )
         if not declared.ok:
             await self._fail_leg(
@@ -2413,19 +2531,41 @@ class PlanningRunDriver:
             )
             return None
 
+        wanted = read_declared_launch_settings(
+            repo=target_repo,
+            commit=start_commit,
+            content=content,
+            found=found,
+            unreadable_because=unreadable,
+        )
+        if not wanted.ok:
+            await self._fail_leg(
+                correlation_id,
+                "target-terminal-enter",
+                wanted.refusal
+                or "the settings this project asked for could not be read",
+            )
+            return None
+
         name = str(declared.project)
         recorder = getattr(deps.store, "record_memory_project", None)
         if recorder is not None:
             recorder(correlation_id, memory_project=name)
+        settings_recorder = getattr(deps.store, "record_launch_settings", None)
+        if settings_recorder is not None:
+            settings_recorder(correlation_id, names=list(wanted.names))
         logger.info(
             "planning driver: run %s belongs to the memory %s, the name %s "
-            "declares at %s",
+            "declares at %s, and asks to be launched with %s",
             correlation_id,
             name,
             target_repo,
             start_commit,
+            # NAMES ONLY, never values — and this is central code, which does
+            # not know or care what tool a name belongs to.
+            ", ".join(wanted.names) or "nothing beyond the factory's own list",
         )
-        return name
+        return name, tuple(wanted.names)
 
     async def _feature_spec_leg(self, row: Any, correlation_id: str) -> bool:
         """FEATURE_SPEC leg: write the spec, show it to a person, then advance.
@@ -2905,12 +3045,15 @@ class PlanningRunDriver:
             declared_spec_checks = True
 
         try:
+            recorded_memory, recorded_settings = self._recorded_launch(correlation_id)
             gitres = await git_runner.prepare_branch_and_write_tree(
                 repo_path=repo_path,
                 branch=branch,
                 files=files,
                 message=f"planning: feature spec for {correlation_id} (Lane B 007)",
                 pre_commit=pre_commit,
+                memory_project=recorded_memory,
+                launch_settings=recorded_settings,
             )
         except Exception as exc:  # noqa: BLE001 — write boundary
             await self._fail_leg(
@@ -5130,6 +5273,7 @@ class PlanningRunDriver:
             return None
 
         try:
+            recorded_memory, recorded_settings = self._recorded_launch(correlation_id)
             gitres = await git_runner.prepare_branch_and_write_tree(
                 repo_path=repo_path,
                 branch=branch,
@@ -5139,6 +5283,8 @@ class PlanningRunDriver:
                     "(Lane B 008)"
                 ),
                 pre_commit=pre_commit,
+                memory_project=recorded_memory,
+                launch_settings=recorded_settings,
             )
         except Exception as exc:  # noqa: BLE001 — write boundary
             await self._fail_leg(
@@ -6133,6 +6279,7 @@ class PlanningRunDriver:
                 return None
             files[str(rel)] = content
         try:
+            recorded_memory, recorded_settings = self._recorded_launch(correlation_id)
             gitres = await self._deps.git_runner.prepare_branch_and_write_tree(
                 repo_path=repo_path,
                 branch=branch,
@@ -6140,6 +6287,8 @@ class PlanningRunDriver:
                 message=_SPEC_OF_RECORD_PUT_BACK_MESSAGE.format(
                     correlation_id=correlation_id, rewrite_sha=rewrite_sha
                 ),
+                memory_project=recorded_memory,
+                launch_settings=recorded_settings,
             )
         except Exception as exc:  # noqa: BLE001 — write boundary
             await self._fail_leg(
@@ -7497,6 +7646,7 @@ class PlanningRunDriver:
             )
 
         try:
+            recorded_memory, recorded_settings = self._recorded_launch(correlation_id)
             gitres = await git_runner.prepare_branch_and_write_tree(
                 repo_path=repo_path,
                 branch=branch,
@@ -7506,6 +7656,8 @@ class PlanningRunDriver:
                     f"{correlation_id} ({feature_id}, Lane B seed fan-out)"
                 ),
                 pre_commit=pre_commit,
+                memory_project=recorded_memory,
+                launch_settings=recorded_settings,
             )
         except Exception as exc:  # noqa: BLE001 — write boundary
             return await self._fail_leg(
@@ -8486,6 +8638,7 @@ class PlanningRunDriver:
 
         files = {gate_rel: filled_gate, _GATE_REGISTRY_REL: new_registry}
         try:
+            recorded_memory, recorded_settings = self._recorded_launch(correlation_id)
             gitres = await git_runner.prepare_branch_and_write_tree(
                 repo_path=repo_path,
                 branch=branch,
@@ -8496,6 +8649,8 @@ class PlanningRunDriver:
                     "F2 seed derivation)"
                 ),
                 pre_commit=pre_commit,
+                memory_project=recorded_memory,
+                launch_settings=recorded_settings,
             )
         except Exception as exc:  # noqa: BLE001 — write boundary
             return await self._fail_leg(

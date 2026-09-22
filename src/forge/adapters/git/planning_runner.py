@@ -38,7 +38,7 @@ import logging
 import os
 import tempfile
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from forge.adapters.git.models import GitOpResult
@@ -331,6 +331,8 @@ class WorktreeGitRunner:
         pre_commit: PreCommitHook | None = None,
         expected_head: str | None = None,
         start_commit: str | None = None,
+        memory_project: str | None = None,  # noqa: ARG002 — see below
+        launch_settings: "Sequence[str] | None" = None,  # noqa: ARG002
     ) -> GitOpResult:
         """Write a multi-file tree onto ``branch`` in one commit (Lane B B2).
 
@@ -341,6 +343,13 @@ class WorktreeGitRunner:
         the multi-file write and the optional pre-commit oracle hook.
         When ``expected_head`` is given, prepares from that immutable commit
         and publishes with ``git update-ref`` compare-and-swap.
+        ``memory_project`` and ``launch_settings`` are accepted and NOT used
+        here, on purpose (22 September 2026). They say what a build system
+        launched for this run is given, and this runner launches nothing: its
+        pre-commit checks are Python closures inside this process. The sandbox
+        runner, whose checks are real commands in another process, sends them
+        on. Accepting them in both keeps the one protocol the driver calls.
+
         ``start_commit`` (one true copy, item 1) names the commit a BRAND NEW
         branch is cut from; a branch that already exists is re-attached, never
         moved onto it.

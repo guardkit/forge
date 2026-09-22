@@ -45,7 +45,7 @@ import logging
 import os
 import urllib.error
 import urllib.request
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from pydantic import Field
@@ -272,6 +272,8 @@ class SidecarGitRunner:
         *,
         pre_commit: Any = None,
         start_commit: str | None = None,
+        memory_project: str | None = None,
+        launch_settings: Sequence[str] | None = None,
     ) -> SidecarGitOpResult:
         """Write ``files`` onto ``branch`` in one commit on the sandbox's clone,
         with the declared checks run there first.
@@ -308,6 +310,17 @@ class SidecarGitRunner:
             # cuts a brand new branch from this commit, and leaves a branch
             # that already exists exactly where it is.
             body["start_commit"] = str(start_commit)
+        # WHAT THE DECLARED CHECKS ARE LAUNCHED WITH (22 September 2026). The
+        # checks declared above ARE the build system, run inside the sandbox,
+        # so they are launched the way every other call of it is: the memory
+        # this run belongs to, and the NAMES the project itself declared its
+        # builds and checks need. Both were read out of the project's own
+        # settings file at the commit the work started from and written onto
+        # the run; names only, never values.
+        if memory_project:
+            body["memory_project"] = str(memory_project)
+        if launch_settings:
+            body["launch_settings"] = [str(name) for name in launch_settings]
         logger.info(
             "%s: %d file(s) onto %s for %s via %s (%d declared check(s); "
             "repo_path %s is the sandbox's to resolve)",
@@ -498,6 +511,8 @@ class RepoRoutedGitRunner:
         *,
         pre_commit: Any = None,
         start_commit: str | None = None,
+        memory_project: str | None = None,
+        launch_settings: Sequence[str] | None = None,
     ) -> GitOpResult:
         return await self.runner_for_path(repo_path).prepare_branch_and_write_tree(
             repo_path,
@@ -506,6 +521,8 @@ class RepoRoutedGitRunner:
             message,
             pre_commit=pre_commit,
             start_commit=start_commit,
+            memory_project=memory_project,
+            launch_settings=launch_settings,
         )
 
     async def read_file_from_branch(

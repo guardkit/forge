@@ -17,6 +17,7 @@ service. The "parent environment" in every test is a dictionary made here.
 from __future__ import annotations
 
 from forge.launch_environment import (
+    GUARDKIT_FACTORY_LAUNCH_ENV,
     GUARDKIT_MEMORY_PROJECT_ENV,
     LAUNCH_SETTINGS,
     SETTINGS_DELIBERATELY_NOT_PASSED,
@@ -173,7 +174,13 @@ def test_a_setting_the_parent_does_not_have_stays_unset() -> None:
     treats the two differently."""
     env = build_launch_env(parent={"PATH": "/usr/bin"}, memory_project="widget_shop")
 
-    assert set(env) == {"PATH", GUARDKIT_MEMORY_PROJECT_ENV}
+    # The two the launch DECIDES rather than inherits are always there: which
+    # memory this work belongs to, and the fact that a factory launched it.
+    assert set(env) == {
+        "PATH",
+        GUARDKIT_MEMORY_PROJECT_ENV,
+        GUARDKIT_FACTORY_LAUNCH_ENV,
+    }
     assert "GUARDKIT_HARNESS" not in env
 
 
