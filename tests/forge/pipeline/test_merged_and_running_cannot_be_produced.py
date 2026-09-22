@@ -135,7 +135,7 @@ class TestThePressStopsAtChecked:
         )
         assert (
             merge_executor.RESULT_WORD_MERGED_AND_RUNNING
-            == "merged-into-github-and-running"
+            == "merged-into-the-remote-and-running"
         )
         # The two later words appear in the press's own source ONLY as these
         # definitions and the places that compare against them — never as
@@ -160,6 +160,69 @@ class TestThePressStopsAtChecked:
         source = Path(merge_executor.__file__).read_text(encoding="utf-8")
         assert "raise NotImplementedError(" in source
         assert "the publisher has not been built" in source
+
+
+#: The merge word's own modules. Central orchestration: they know that there
+#: is a remote named ``origin`` and which branch of it a piece of work is
+#: aimed at, and nothing else about who hosts it.
+_CENTRAL = (
+    "pipeline/merge_executor.py",
+    "pipeline/publication_record.py",
+    "pipeline/merge_join.py",
+    "pipeline/publication_switch.py",
+    "cli/merge_deploy.py",
+)
+
+#: Names of hosting providers. A project's own settings may say whatever they
+#: like; the factory's own vocabulary may not name one, because the factory
+#: does not know and must not claim to.
+_PROVIDERS = ("github", "gitlab", "bitbucket", "azure devops", "codeberg", "sourcehut")
+
+
+class TestTheVocabularyNamesNoHostingProvider:
+    """The factory knows "the remote named origin". It knows nothing else.
+
+    ``RESULT_MERGED_AND_RUNNING`` read "merged into GitHub and running" and
+    its result word read ``merged-into-github-and-running`` until 22
+    September 2026. Both were the design's own wording and both were wrong
+    for central code: a project whose remote is hosted anywhere else would
+    have been told, in the factory's words, that it was merged into a service
+    it has never heard of.
+    """
+
+    @pytest.mark.parametrize("relative", _CENTRAL)
+    def test_no_literal_in_the_merge_word_names_one(self, relative: str) -> None:
+        path = _SRC / relative
+        assert path.is_file(), relative
+        named = {
+            provider: text
+            for text in _string_literals(path)
+            for provider in _PROVIDERS
+            if provider in text.lower()
+        }
+        assert named == {}, (
+            f"{relative} names a hosting provider in a string the factory can "
+            f"hand to somebody: {named}"
+        )
+
+    def test_the_two_words_say_the_remote_instead(self) -> None:
+        from forge.pipeline.publication_record import RESULT_MERGED_AND_RUNNING
+
+        assert RESULT_MERGED_AND_RUNNING == "merged into the remote and running"
+        assert (
+            merge_executor.RESULT_WORD_MERGED_AND_RUNNING
+            == "merged-into-the-remote-and-running"
+        )
+        # And they are STILL unreachable, which the rename must not change.
+        source = Path(merge_executor.__file__).read_text(encoding="utf-8")
+        produced = [
+            line
+            for line in source.splitlines()
+            if "result=RESULT_WORD_" in line.replace(" ", "")
+        ]
+        assert produced
+        for line in produced:
+            assert "PUBLICATION_PENDING" in line, line
 
 
 @pytest.mark.parametrize("word", FORBIDDEN)

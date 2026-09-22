@@ -980,6 +980,55 @@ def load_declared_toolchain_from_sandbox(
         return load_declared_toolchain(root)
 
 
+def _the_builds_memory_name(pool: Any, build_id: str) -> str | None:
+    """Which memory this build's work belongs to, off the ledger. Never guesses.
+
+    ``None`` means the ledger recorded none — a build queued before the column
+    existed, or a facade that cannot answer. It is NOT a name to be filled in
+    with a default: a launch handed no name runs with memory explicitly off
+    and says so, which is the whole point of the rule.
+    """
+    reader = getattr(pool, "read_memory_project", None)
+    if reader is None:
+        return None
+    try:
+        name = reader(build_id)
+    except Exception as exc:  # noqa: BLE001 — a gate reading never fails on this
+        logger.warning(
+            "conductor gates: build_id=%s — the memory name could not be read "
+            "off the ledger (%s: %s); the command runs with memory off",
+            build_id,
+            type(exc).__name__,
+            exc,
+        )
+        return None
+    return str(name or "").strip() or None
+
+
+def _the_builds_declared_settings(pool: Any, build_id: str) -> tuple[str, ...]:
+    """The setting NAMES this build's project declared, off the ledger.
+
+    Empty means the same thing three ways over — nothing recorded, no column,
+    or a project that asked for nothing — and all three mean the factory's own
+    list and nothing else at the launch.
+    """
+    reader = getattr(pool, "read_launch_settings", None)
+    if reader is None:
+        return ()
+    try:
+        return tuple(str(name) for name in reader(build_id) or ())
+    except Exception as exc:  # noqa: BLE001 — a gate reading never fails on this
+        logger.warning(
+            "conductor gates: build_id=%s — the project's declared setting "
+            "names could not be read off the ledger (%s: %s); the command runs "
+            "with the factory's own list",
+            build_id,
+            type(exc).__name__,
+            exc,
+        )
+        return ()
+
+
 def run_declared_command_in_sandbox(
     *,
     command: str,
@@ -988,6 +1037,8 @@ def run_declared_command_in_sandbox(
     sandbox: Any,
     repo: str,
     post: Callable[..., Any] | None = None,
+    memory_project: str | None = None,
+    launch_settings: "Sequence[str] | None" = None,
 ) -> "tuple[int | None, str]":
     """Run the declared test command in the sandbox. ``(exit_code, detail)``.
 
@@ -999,17 +1050,30 @@ def run_declared_command_in_sandbox(
     The sidecar checks the command against the repository's own checked-in
     declaration before it runs anything, so what runs in there is the
     repository's own text and nothing composed on this side.
+
+    ``memory_project`` and ``launch_settings`` are the coordinator's own facts
+    off the ledger for the build whose gates are being read: which memory the
+    work belongs to, and the NAMES its project declared its builds need beyond
+    the factory's list. Threaded 22 September 2026, because without them the
+    project's own test command ran with its own declarations stripped — and a
+    command that launches the build system ran with memory off. Names only:
+    every value is taken from the sandbox helper's own environment, and only
+    if it has one.
     """
     from forge.planning.sidecar_git_runner import _urllib_post
 
     sender = post if post is not None else _urllib_post
     url = f"{str(sandbox.sidecar_url).rstrip('/')}/run"
-    body = {
+    body: dict[str, Any] = {
         "repo": repo,
         "declared_test": command,
         "cwd": str(cwd),
         "timeout_seconds": float(timeout_seconds),
     }
+    if memory_project:
+        body["memory_project"] = str(memory_project)
+    if launch_settings:
+        body["launch_settings"] = [str(name) for name in launch_settings]
     try:
         status, decoded = sender(
             url, body, float(timeout_seconds) + SANDBOX_TEST_HTTP_MARGIN_S
@@ -2343,6 +2407,15 @@ def make_gates_green_reader(
             def load(repo_root: Any, _entry: Any = entry, _repo: str = repo_key) -> Any:
                 return _sandbox_load(repo_root, sandbox=_entry, repo=_repo)
 
+            # WHAT THE PROJECT DECLARED FOR THIS BUILD. Read off the ledger by
+            # build id, exactly as the build's own launch reads it, and sent
+            # with the request so the project's own test command is launched
+            # the way its own settings file says (22 September 2026). A ledger
+            # that records neither answers "nothing", which is the factory's
+            # own list and memory off — the honest state, not a hidden one.
+            declared_memory = _the_builds_memory_name(pool, build_id)
+            declared_names = _the_builds_declared_settings(pool, build_id)
+
             def run_command(
                 *,
                 command: str,
@@ -2350,6 +2423,8 @@ def make_gates_green_reader(
                 timeout_seconds: int,
                 _entry: Any = entry,
                 _repo: str = repo_key,
+                _memory: str | None = declared_memory,
+                _names: tuple[str, ...] = declared_names,
             ) -> Any:
                 return _sandbox_run(
                     command=command,
@@ -2357,6 +2432,8 @@ def make_gates_green_reader(
                     timeout_seconds=timeout_seconds,
                     sandbox=_entry,
                     repo=_repo,
+                    memory_project=_memory,
+                    launch_settings=_names,
                 )
 
             # Step 5 goes in there too (L3b's coach, 2026-09-08): the feature's

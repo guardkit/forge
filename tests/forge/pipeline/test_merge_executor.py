@@ -308,6 +308,74 @@ class _DiesWhileMerging:
         raise KeyboardInterrupt("the press was killed while the merge command ran")
 
 
+class _JoinsForReal:
+    """The merge command, doing what the real one does to the repository.
+
+    ``_FakeGuardKit`` answers with a report and touches nothing, which is
+    right for the tests about what the press SAYS. It is not enough for the
+    tests about what a later press may REUSE: reuse is settled by asking git
+    whether the recorded commit is a merge of exactly G and the build's tip,
+    and a stand-in that never merges leaves nothing for git to answer about.
+
+    So this one makes the join for real in the working folder it was given —
+    a ``--no-ff`` commit of G and the build's tip, which is what the build
+    system's merge always makes — and reports that commit. ``verify_ok`` says
+    what the build system's own post-merge checks found, so a red set of
+    checks can be driven through exactly the path a real one takes.
+    """
+
+    def __init__(
+        self,
+        *,
+        feature_id: str = FEATURE_ID,
+        verify_ok: bool = True,
+        verify_detail: str = "",
+        checks_passed: int = 3,
+        checks_total: int = 3,
+    ) -> None:
+        self.feature_id = feature_id
+        self.verify_ok = verify_ok
+        self.verify_detail = verify_detail
+        self.checks_passed = checks_passed
+        self.checks_total = checks_total
+        self.calls: list[dict[str, Any]] = []
+
+    async def __call__(self, **kwargs: Any) -> GuardKitResult:
+        self.calls.append(kwargs)
+        args = list(kwargs["args"])
+        folder = Path(args[args.index("--in-worktree") + 1])
+        _git(
+            folder,
+            "merge",
+            "--no-ff",
+            "-q",
+            "-m",
+            f"join {self.feature_id}",
+            f"autobuild/{self.feature_id}",
+        )
+        joined = _git(folder, "rev-parse", "HEAD")
+        report = {
+            "outcome": "merged",
+            "post_sha": joined,
+            "verify_ran": True,
+            "verify_ok": self.verify_ok,
+            "verify_status": "passed" if self.verify_ok else "failed",
+            "verify_detail": self.verify_detail
+            or ("" if self.verify_ok else "3 checks went red"),
+            "charged_failures": [],
+            "checks_passed": self.checks_passed,
+            "checks_total": self.checks_total,
+        }
+        return GuardKitResult(
+            status="success",
+            subcommand=kwargs.get("subcommand", "autobuild"),
+            duration_secs=0.1,
+            stdout_tail=json.dumps(report),
+            stderr=None,
+            exit_code=0,
+        )
+
+
 #: What a green candidate check reports: every check passed, by name.
 GREEN_GATE: dict[str, Any] = {
     "verdict": "pass",
@@ -934,14 +1002,20 @@ class TestExecutorSequencing:
     ) -> None:
         """Design case 11: stopped after the join and started again, the same
         joined commit is used, nothing is merged twice, and no second merge
-        word is asked for."""
-        deps, publisher, gk, dp = _deps(config, pool)
+        word is asked for.
+
+        The stand-in makes the join FOR REAL, because that is the only thing
+        reuse is decided on: the second press asks git whether the recorded
+        commit is a merge of exactly G and the build's tip as they are now.
+        """
+        joiner = _JoinsForReal()
+        deps, publisher, gk, dp = _deps(config, pool, guardkit=joiner)
         first = await _run_executor(deps, repo_root)
-        assert len(gk.calls) == 1
+        assert len(joiner.calls) == 1
         outcome = await _run_executor(deps, repo_root)
         # The merge command was NOT run again, and the same joined commit
         # came back out of the record.
-        assert len(gk.calls) == 1
+        assert len(joiner.calls) == 1
         assert outcome.result == "publication-pending"
         assert outcome.merged_sha == first.merged_sha
         assert _legs(dp) == [
@@ -956,6 +1030,177 @@ class TestExecutorSequencing:
         assert f"the joined result {str(first.merged_sha)[:10]} was checked" in (
             first.detail
         )
+        # And the second press may say it too — the recorded merge-checks line
+        # says they PASSED on exactly this joined commit.
+        assert f"the joined result {str(first.merged_sha)[:10]} was checked" in (
+            outcome.detail
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_merge_word_refused_before_the_lease_still_leaves_a_row(
+        self, config, pool, repo_root
+    ) -> None:
+        """One row per build, carrying who gave the merge word and when.
+
+        A build with no recorded target branch is refused before the lease
+        would otherwise be taken, and used to leave no publication record at
+        all — so "nobody ever pressed this build" and "it was pressed and
+        refused" read exactly the same afterwards. The refusal is now written
+        down with its reason before the press returns.
+        """
+        _ensure_build(pool, build_id=BUILD_ID, feature_id=FEATURE_ID)
+        pool.connection.execute(
+            "UPDATE builds SET target_branch = NULL WHERE build_id = ?", (BUILD_ID,)
+        )
+        pool.connection.commit()
+        deps, publisher, gk, dp = _deps(config, pool)
+
+        outcome = await _run_executor(deps, repo_root)
+
+        assert outcome.result == "merge-refused"
+        assert "no target branch on its record" in outcome.detail
+        assert gk.calls == []
+
+        row = pool.connection.execute(
+            "SELECT decided_by, decided_at, result, lines_json, j_commit "
+            "FROM publication_records WHERE build_id = ?",
+            (BUILD_ID,),
+        ).fetchone()
+        assert row is not None, "the merge word was given and left no row"
+        assert row[0] == "rich"  # who gave it
+        assert row[1]  # and when
+        assert row[2] == "publication pending"
+        assert row[4] is None  # nothing was joined
+        lines = json.loads(row[3])
+        assert [(l["kind"], l["step"]) for l in lines] == [("done", "join")]
+        assert lines[0]["detail"]["refused_before_the_join"] is True
+        assert lines[0]["detail"]["joined"] is False
+        assert "no target branch on its record" in lines[0]["detail"]["refusal"]
+
+    @pytest.mark.asyncio
+    async def test_a_join_made_onto_an_older_tip_is_never_reused(
+        self, config, pool, repo_root
+    ) -> None:
+        """The blocker: a build that gained a fix between two presses.
+
+        Press one joins the build's tip onto G. The build's branch then gains
+        a commit — a fix, the ordinary reason a press is sent twice. Press two
+        must NOT reuse the first join: its tree has none of the new work, so
+        reusing it would check one tree and publish another, and the record
+        would hold the new tip beside a join made from the old one.
+        """
+        joiner = _JoinsForReal()
+        deps, publisher, gk, dp = _deps(config, pool, guardkit=joiner)
+        first = await _run_executor(deps, repo_root)
+        assert len(joiner.calls) == 1
+        first_j = first.merged_sha
+
+        # The build's branch gains a fix.
+        _git(repo_root, "checkout", "-q", f"autobuild/{FEATURE_ID}")
+        (repo_root / "the-fix.txt").write_text("the fix\n", encoding="utf-8")
+        _git(repo_root, "add", "the-fix.txt")
+        _git(repo_root, "commit", "-q", "-m", "the fix")
+        new_tip = _git(repo_root, "rev-parse", f"autobuild/{FEATURE_ID}")
+        _git(repo_root, "checkout", "-q", "main")
+        assert new_tip != _git(repo_root, "rev-parse", first_j + "^2")
+
+        deps, publisher, gk, dp = _deps(config, pool, guardkit=joiner)
+        second = await _run_executor(deps, repo_root)
+
+        # A fresh join was made, on a name of its own.
+        assert len(joiner.calls) == 2
+        assert second.merged_sha != first_j
+        assert _git(repo_root, "rev-parse", f"{second.merged_sha}^2") == new_tip
+        # The first join is still there, under the name its own attempt gave
+        # it. Nothing was deleted.
+        assert _git(repo_root, "rev-parse", f"factory-integration/{FEATURE_ID}") == first_j
+
+        # THE INVARIANT THE PUBLISHER IS TOLD TO VERIFY HOLDS ON THE RECORD:
+        # the joined commit it carries is a merge of the G and the build tip
+        # it carries, and of nothing else.
+        row = pool.connection.execute(
+            "SELECT g_commit, build_tip, j_commit FROM publication_records "
+            "WHERE build_id = ?",
+            (BUILD_ID,),
+        ).fetchone()
+        g_commit, build_tip, j_commit = row[0], row[1], row[2]
+        assert build_tip == new_tip
+        assert j_commit == second.merged_sha
+        assert _git(repo_root, "rev-parse", f"{j_commit}^1") == g_commit
+        assert _git(repo_root, "rev-parse", f"{j_commit}^2") == build_tip
+
+    @pytest.mark.asyncio
+    async def test_a_red_set_of_checks_is_never_read_back_as_checked(
+        self, config, pool, repo_root
+    ) -> None:
+        """The second blocker: press one goes red, press two must say so.
+
+        Press one's post-join checks fail. Press two finds the same join —
+        the build's tip has not moved, so it is a legitimate reuse — runs the
+        merge command not at all, and must NOT report "checked and ready to
+        publish". The red answer stays the answer until a new attempt's
+        checks pass.
+        """
+        joiner = _JoinsForReal(verify_ok=False, verify_detail="3 checks went red")
+        deps, publisher, gk, dp = _deps(config, pool, guardkit=joiner)
+        first = await _run_executor(deps, repo_root)
+        assert first.result == "merged-verify-failed"
+        assert "the checks after the join did not pass" in first.detail
+
+        # The record says the checks are done AND that they went red.
+        lines = json.loads(
+            pool.connection.execute(
+                "SELECT lines_json FROM publication_records WHERE build_id = ?",
+                (BUILD_ID,),
+            ).fetchone()[0]
+        )
+        red = [l for l in lines if l["step"] == "merge-checks" and l["kind"] == "done"]
+        assert red and red[-1]["detail"]["verify_ok"] is False
+
+        deps, publisher, gk, dp = _deps(config, pool, guardkit=joiner)
+        second = await _run_executor(deps, repo_root)
+
+        # Nothing was re-run, and nothing was laundered.
+        assert len(joiner.calls) == 1
+        assert second.result == "merged-verify-failed"
+        assert second.status == "FAILED"
+        assert second.merged_sha == first.merged_sha
+        assert second.detail == (
+            f"{FEATURE_ID} was joined onto main ({str(first.merged_sha)[:10]}), "
+            "but the checks after the join did not pass: 3 checks went red. "
+            "Nothing was published."
+        )
+        assert "checked and ready to publish" not in second.detail
+        assert "was checked" not in second.detail
+        assert "publication-pending" != second.result
+        # The live check never ran either — the press stopped before it.
+        assert _legs(dp) == []
+
+    @pytest.mark.asyncio
+    async def test_a_red_live_check_is_never_inherited_from_the_record(
+        self, config, pool, repo_root
+    ) -> None:
+        """The same rule for the factory's own live check.
+
+        It is re-run on every press and never read back off the record, so a
+        recorded verdict — green or red — can never stand in for one this
+        press did not run. Press one's live check goes red; press two's
+        passes; the press reports what IT found.
+        """
+        joiner = _JoinsForReal()
+        red = _FakeDeploy(candidate_outcome="failed", gate=dict(RED_GATE))
+        deps, publisher, gk, dp = _deps(config, pool, guardkit=joiner, deploy=red)
+        first = await _run_executor(deps, repo_root)
+        assert first.result == "candidate-refused"
+
+        deps, publisher, gk, dp = _deps(config, pool, guardkit=joiner)
+        second = await _run_executor(deps, repo_root)
+        # The join was reused, the live check ran AGAIN, and this press's own
+        # verdict is what it reports.
+        assert len(joiner.calls) == 1
+        assert second.result == "publication-pending"
+        assert "candidate_check" in _legs(dp)
+        assert second.gate_before_merge["verdict"] == "pass"
 
     @pytest.mark.asyncio
     async def test_a_press_that_dies_while_the_merge_runs_is_picked_up(
@@ -2863,37 +3108,41 @@ class TestTheBranchReachesTheSandboxDoor:
         assert repair_tip != _tip(repo_root)  # the feature branch is a different tip
 
 
-class TestTheLandedDetectionFollowsTheBranch:
-    """``merged_after_all_sha`` asks git about the branch the press was merging."""
+class TestTheDeadPinHelpersAreGone:
+    """The three helpers that read a branch called "main" by name.
 
-    @pytest.mark.asyncio
-    async def test_a_landed_repair_is_seen_on_its_own_branch(
-        self, repo_root
-    ) -> None:
-        from forge.pipeline.merge_executor import merged_after_all_sha
+    ``merged_after_all_sha``, ``pinned_main_in_branch`` and
+    ``moved_main_refusal_sentence`` were about a merge INTO the project's own
+    copy, pinned to a branch literally named ``main``. The factory does
+    neither now: the branch a piece of work is aimed at is the one written
+    down when it started, and it may be called anything. They had no callers
+    and were removed on 22 September 2026 so the publisher stage cannot
+    resurrect them; what replaced each is written where they were.
+    """
 
-        _cut_repair_journey_branch(repo_root)
-        pinned = _git(repo_root, "rev-parse", "main")
-        _git(repo_root, "merge", "--no-ff", "-q", "-m", "merge the repair", REPAIR_BRANCH)
-        new_main = _git(repo_root, "rev-parse", "main")
+    @pytest.mark.parametrize(
+        "name",
+        ["merged_after_all_sha", "pinned_main_in_branch", "moved_main_refusal_sentence"],
+    )
+    def test_the_helper_is_gone(self, name: str) -> None:
+        from forge.pipeline import merge_executor as me
 
-        assert await merged_after_all_sha(repo_root, FEATURE_ID, pinned, branch=REPAIR_BRANCH) == new_main
-        # Asked about the feature's own branch, git says it is not on main: None.
-        assert await merged_after_all_sha(repo_root, FEATURE_ID, pinned) is None
+        assert not hasattr(me, name), f"{name} is back in the merge press"
+        assert name not in me.__all__
 
-    @pytest.mark.asyncio
-    async def test_the_default_is_the_feature_branch_exactly_as_before(
-        self, repo_root
-    ) -> None:
-        from forge.pipeline.merge_executor import merged_after_all_sha
+    def test_what_replaced_them_is_named_where_they_were(self) -> None:
+        from forge.pipeline import merge_executor as me
 
-        pinned = _git(repo_root, "rev-parse", "main")
-        _git(repo_root, "merge", "--no-ff", "-q", "-m", "merge the feature", f"autobuild/{FEATURE_ID}")
-        new_main = _git(repo_root, "rev-parse", "main")
-
-        assert await merged_after_all_sha(repo_root, FEATURE_ID, pinned) == new_main
-        assert await merged_after_all_sha(repo_root, FEATURE_ID, pinned, branch=None) == new_main
-        assert await merged_after_all_sha(repo_root, FEATURE_ID, pinned, branch="  ") == new_main
+        source = Path(me.__file__).read_text(encoding="utf-8")
+        assert "GONE, AND WHY, SO THE PUBLISHER STAGE DOES NOT BRING THEM BACK" in source
+        for name in (
+            "merged_after_all_sha",
+            "pinned_main_in_branch",
+            "moved_main_refusal_sentence",
+            "look_at_a_join",
+            "target_branch_now",
+        ):
+            assert name in source
 
 
 class _RecordingGit:

@@ -28,9 +28,10 @@ publisher does not exist yet, so nothing is sent to the remote and nothing is
 deployed: the record's result is "publication pending" and the sentence a
 person reads is "checked and ready to publish; publication is not switched
 on". The other two result names — "published, deployment pending" and "merged
-into GitHub and running" — are defined as the vocabulary the publisher and
+into the remote and running" — are defined as the vocabulary the publisher and
 executor stages will make reachable, and a test pins that neither can be
-produced while publication is switched off.
+produced while publication is switched off. None of the three names a hosting
+provider: this module knows only "the remote named origin".
 
 THE PROJECT'S MAIN COPY IS NEVER TOUCHED. It is not switched, not reset and
 not merged into: everything happens in the worktree made at G, and the join
@@ -132,12 +133,12 @@ from forge.pipeline.merge_offer import (
     MERGE_OFFER_STAGE_LABEL,
     MERGE_OFFER_TARGET_IDENTIFIER,
     branch_to_merge,
-    git_rev_parse_main,
 )
 from forge.pipeline.digest_conformance import run_digest_conformance
 from forge.pipeline.merge_join import (
     integration_branch,
     join_inputs,
+    look_at_a_join,
     look_at_the_leftover_join,
     make_the_working_folder,
     target_branch_now,
@@ -180,7 +181,6 @@ __all__ = [
     "deployed_in_for",
     "merge_wall_seconds",
     "sandbox_merge_words",
-    "merged_after_all_sha",
 ]
 
 #: CORE subscription filter — one token per feature (``merge-FEAT-X``).
@@ -255,9 +255,17 @@ MERGE_DECISION_DETAILS_KEY: str = "merge_decision"
 #: so that the stages that make them reachable do not invent words of their
 #: own. The plain sentences they stand for are in
 #: :mod:`forge.pipeline.publication_record`.
+#:
+#: NONE OF THE THREE NAMES A HOSTING PROVIDER. The third used to read
+#: ``merged-into-github-and-running``, which put one provider's name into
+#: central orchestration; the factory knows only "the remote named origin",
+#: and a project whose remote is somewhere else must not be told it was
+#: merged into a service it has never heard of. Renamed 22 September 2026
+#: together with its plain sentence in
+#: :mod:`forge.pipeline.publication_record`. Still unreachable, and pinned so.
 RESULT_WORD_PUBLICATION_PENDING: str = "publication-pending"
 RESULT_WORD_PUBLISHED_DEPLOYMENT_PENDING: str = "published-deployment-pending"
-RESULT_WORD_MERGED_AND_RUNNING: str = "merged-into-github-and-running"
+RESULT_WORD_MERGED_AND_RUNNING: str = "merged-into-the-remote-and-running"
 
 
 def _utcnow() -> datetime:
@@ -275,7 +283,7 @@ class MergeDeployOutcome:
     # publication-pending | merged-verify-failed | merge-refused |
     # candidate-refused | rejected. The two words after "publication-pending"
     # in the design's vocabulary — published-deployment-pending and
-    # merged-into-github-and-running — are defined but NOT reachable while
+    # merged-into-the-remote-and-running — are defined but NOT reachable while
     # publication is switched off, and a test pins that.
     result: str
     status: str  # PASSED | FAILED | SKIPPED
@@ -847,87 +855,38 @@ def git_surface_for(
     return InContainerCandidateGit(repo_root)
 
 
-async def merged_after_all_sha(
-    repo_root: Path,
-    feature_id: str,
-    expect_main_sha: str,
-    branch: str | None = None,
-    *,
-    git: CandidateGit | None = None,
-) -> str | None:
-    """Did the merge land even though the command gave no answer?
-
-    When the merge command is killed — a timeout, or a crash after git had
-    already done the merge — it exits without printing its report. Calling
-    that "the merge was refused" is a lie the first small-scale drive caught:
-    the branch was on main and the report said nothing had happened.
-
-    So ask git itself, the same way the merge card pins its target commit
-    (:func:`forge.pipeline.merge_offer.git_rev_parse_main`). If main has moved
-    off the commit the merge was pinned to, AND main now contains the tip of
-    the branch the press was merging (``branch`` when given — a repair's own
-    journey branch, Part M rule 54 — else ``autobuild/<feature>``), the merge
-    landed: return main's new commit. Anything else — main unmoved, main moved
-    for some other reason, git not answering — returns ``None`` and the merge
-    is reported as refused, which is then the truth.
-
-    ``git`` is the venue (rule 89). Without one the questions are asked here,
-    against ``repo_root``, exactly as before; with one they are asked wherever
-    that repository's git lives.
-    """
-    if git is None:
-        new_main = await git_rev_parse_main(repo_root)
-    else:
-        new_main = await git.rev_parse("main")
-    pinned = (expect_main_sha or "").strip().lower()
-    if not new_main or new_main.strip().lower() == pinned:
-        return None
-    branch = branch_to_merge(feature_id, branch)
-    venue = git if git is not None else InContainerCandidateGit(repo_root)
-    contains = await venue.is_ancestor(branch, new_main)
-    if contains is not True:
-        return None
-    return new_main
-
-
-async def pinned_main_in_branch(
-    repo_root: Path,
-    expect_main_sha: str,
-    candidate_sha: str,
-    *,
-    git: CandidateGit | None = None,
-) -> bool | None:
-    """Is the pinned main commit an ancestor of the branch tip?
-
-    The venue answers yes, no, or "could not say" (a pin it does not know, or
-    git not running at all). Only a plain "no" is returned as ``False`` — that
-    is the case where the merge command would land a merge commit carrying
-    work the candidate never saw. ``None`` leaves the decision to the merge
-    command's own pin check, which refuses a main that is not at the pin.
-    """
-    pin = (expect_main_sha or "").strip()
-    tip = (candidate_sha or "").strip()
-    if not pin or not tip:
-        return None
-    venue = git if git is not None else InContainerCandidateGit(repo_root)
-    answer = await venue.is_ancestor(pin, tip)
-    if answer is None:
-        logger.warning(
-            "merge-executor: git could not say whether main's pinned commit %s "
-            "is in the branch at %s — the merge command's own pin check decides",
-            pin[:10],
-            tip[:10],
-        )
-    return answer
-
-
-def moved_main_refusal_sentence(feature_id: str, expect_main_sha: str) -> str:
-    """The plain sentence when main moved during the build (before the merge)."""
-    return (
-        f"{feature_id} passed its sandbox check, but main had moved since this "
-        f"was built ({expect_main_sha[:10]} is not in the branch); nothing was "
-        "merged and the branch is kept. Send the sentence again."
-    )
+# ---------------------------------------------------------------------------
+# GONE, AND WHY, SO THE PUBLISHER STAGE DOES NOT BRING THEM BACK
+# ---------------------------------------------------------------------------
+# Three helpers used to live here and were removed on 22 September 2026:
+#
+#   merged_after_all_sha       — "did the merge land after all?", asked by
+#                                reading the branch literally named ``main``
+#                                in the factory's own copy;
+#   pinned_main_in_branch      — "is the pinned commit of that same local
+#                                ``main`` an ancestor of the branch tip?";
+#   moved_main_refusal_sentence — the sentence said when that local ``main``
+#                                had moved during the build.
+#
+# All three read a branch by the name ``main``, which the factory no longer
+# does anywhere: the branch a piece of work is aimed at is the one written
+# down when the work started, and it may be called anything. All three were
+# also about a merge INTO the project's own copy, which is the shape this
+# design removed — the join is made onto the factory's own integration branch
+# in a working folder of its own, and a remote that moved during the build is
+# the ordinary case rather than a refusal.
+#
+# What replaced each: "did the join land after all?" is
+# :func:`forge.pipeline.merge_join.look_at_a_join`, which asks about the
+# commit's two parents rather than about a branch name; the pin is now the
+# recorded target branch's commit G, fetched by
+# :func:`forge.pipeline.merge_join.target_branch_now`; and the refusal is now
+# one of that function's own plain sentences.
+#
+# They had no callers in ``src`` when they were removed. They are named here
+# so the publisher stage, which needs "where is the remote's branch now" and
+# "did the send land", reaches for the join's own helpers instead of writing
+# ``main`` into central code again.
 
 
 def _merge_branch_of_record(
@@ -1024,13 +983,35 @@ async def execute_merge_deploy(
 
     PICKING UP. Every step is written to the build's publication record as an
     "about to" before it happens and a "done" after, so a press that died
-    part-way is carried on rather than started again: an "about to join" with
-    no answer makes the next press LOOK — is that attempt's branch a merge of
-    exactly G and the build's tip? Then it is J and it is marked done; any
-    other leftover is set aside under its own name and the join is made
-    afresh on the next attempt's name. A record held by a live lease is left
-    alone; a takeover needs the lease to have expired and raises the turn
-    number by one.
+    part-way is carried on rather than started again. Two rules govern what a
+    later press may reuse, and both are about the world as it is NOW, never
+    about what an earlier press wrote down:
+
+    * **a join is reused only when it is a join of what is true now.** Git is
+      asked whether that commit is a merge of exactly G *and the build's
+      current tip* — both halves. A build's branch can gain a fix between two
+      presses, and a join made onto the older tip has a tree without it, so
+      reusing it would check one tree and publish another. Anything else is
+      set aside under the name its own attempt gave it, the record's joined
+      commit is cleared, and a fresh join is made on the next attempt's name.
+      The same question settles an "about to join" that was never answered;
+    * **a step counts as done only when it PASSED on exactly this joined
+      commit.** The existence of a "done" line says the step finished, not
+      that it was green: a red run writes one too. So a press that picks up a
+      join whose post-join checks went red says so — "the checks after the
+      join did not pass" stays the result until a new attempt's checks pass —
+      and a person never reads "checked" for a red run. The factory's own
+      live check is re-run on every press and never inherited at all.
+
+    A record held by a live lease is left alone; a takeover needs the lease to
+    have expired and raises the turn number by one.
+
+    A MERGE WORD REFUSED BEFORE ANY OF THAT still leaves a row. A build with
+    no recorded target branch, or one whose remote has renamed its default
+    branch since, is refused before the lease would otherwise be taken — and
+    the lease is taken anyway, so the record carries who gave the merge word,
+    when, and the refusal with its reason. Without it, "nobody pressed this
+    build" and "it was pressed and refused" would read the same afterwards.
 
     ``merge_branch`` is the build row's recorded journey branch (Part M, rule
     54) — a repair's ``fix/<task id>-<build8>`` — and ``None`` for a feature
@@ -1664,6 +1645,79 @@ async def execute_merge_deploy(
             gate_before_merge=_gate_for_report() if gate_began else None,
         )
 
+    def _write_the_refusal_down(
+        *, store: Any, target_branch: str | None, refusal: str
+    ) -> None:
+        """One row for this build, saying the merge word was given and refused.
+
+        Used where the press stops BEFORE it would otherwise have taken the
+        lease — no branch of the remote was ever written down for this build,
+        or the remote's default branch has been renamed since. Taking the
+        lease is what creates the row, so it is taken here too; it carries
+        who gave the merge word and when, and the refusal is written onto the
+        record as the result with its reason beside it.
+
+        It never costs the press anything: a record that cannot be taken or
+        written is logged and the refusal is returned either way. A build
+        whose record somebody else is holding is left alone, which is the
+        same rule as everywhere else.
+        """
+        if store is None:
+            return
+        try:
+            grant = store.take_lease(
+                build_id=build_id,
+                holder=worker_name,
+                now=deps.clock(),
+                feature_id=feature_id,
+                repo=repo,
+                decided_by=decided_by,
+                target_branch=target_branch,
+            )
+            if grant is None:
+                logger.warning(
+                    "merge-executor: %s's merge word was refused (%s) and the "
+                    "refusal could not be written down — another worker holds "
+                    "the record",
+                    build_id,
+                    refusal,
+                )
+                return
+            store.done(
+                build_id=build_id,
+                turn=grant.turn,
+                now=deps.clock(),
+                step=STEP_JOIN,
+                attempt=0,
+                result={
+                    "joined": False,
+                    "refused_before_the_join": True,
+                    "recorded_target_branch": target_branch,
+                    "refusal": refusal,
+                },
+            )
+            store.record(
+                build_id=build_id,
+                turn=grant.turn,
+                now=deps.clock(),
+                result=RESULT_PUBLICATION_PENDING,
+                # AND THE LEASE IS PUT DOWN AGAIN. Nothing is in progress:
+                # the press stopped before it did anything, so holding the
+                # record would only make the next merge word — from another
+                # process, once somebody has fixed the cause — wait out the
+                # lease for no reason.
+                lease_holder=None,
+                lease_expires_at=None,
+            )
+        except Exception as exc:  # noqa: BLE001 — a record never costs a press
+            logger.warning(
+                "merge-executor: %s's refusal could not be written onto its "
+                "publication record (%s: %s)",
+                build_id,
+                type(exc).__name__,
+                exc,
+            )
+
     async def _press() -> MergeDeployOutcome:
         nonlocal tree_path, candidate_standing, gate_began
 
@@ -1821,6 +1875,19 @@ async def execute_merge_deploy(
                     "nothing_was_joined": True,
                 },
             )
+            # THE ROW IS WRITTEN EVEN THOUGH NOTHING HAPPENED. The design
+            # wants one row per build carrying who gave the merge word and
+            # when, and this is a merge word: somebody pressed it and was
+            # refused. Writing the refusal down before returning is what
+            # makes the record a record of the DECISIONS as well as of the
+            # steps — without it a build refused here has no row at all, and
+            # "nobody ever pressed it" and "it was pressed and refused" read
+            # the same afterwards.
+            _write_the_refusal_down(
+                store=None if dry_run else _publication_store(),
+                target_branch=recorded_branch,
+                refusal=str(where.refusal or "the remote could not be read"),
+            )
             return _cannot_join(
                 f"{named} could not be joined onto the remote: {where.refusal} "
                 "Nothing was merged and the branch is kept."
@@ -1874,23 +1941,69 @@ async def execute_merge_deploy(
         # ------------------------------------------------------------------
         attempt = int(getattr(record, "attempt", 0) or 0)
         j_commit: str | None = None
-        # THE JOIN THIS RECORD ALREADY HOLDS. It is used again only when it
-        # was made onto the commit the remote's recorded branch is at NOW: a
-        # remote that has moved since needs a join of its own, on a name of
-        # its own, and the one that is there is kept exactly where it is.
-        if (
-            record is not None
-            and record.is_done(STEP_JOIN)
-            and record.j_commit
-            and record.g_commit == g_commit
-        ):
-            j_commit = record.j_commit
-            logger.info(
-                "merge-executor: %s's join (%s) is already on the record — it "
-                "is used, not made again",
-                feature_id,
-                str(j_commit)[:10],
+        # THE JOIN THIS RECORD ALREADY HOLDS IS REUSED ONLY WHEN IT IS A JOIN
+        # OF WHAT IS TRUE NOW. Not "the record says the join is done", and not
+        # "the remote is still where it was": git is asked whether that commit
+        # is a merge of exactly G **and the build's CURRENT tip**. Both halves
+        # matter, and the second is the one that was missing: the build's
+        # branch can gain a fix between two presses, and a join made onto the
+        # older tip has a tree without it. Reusing it would check one tree and
+        # publish another, and the record would then hold the new tip beside
+        # the old join — breaking the very invariant the publisher is told to
+        # verify ("J is a merge of G and the recorded build tip").
+        #
+        # Anything else is SET ASIDE: it keeps the branch and the folder its
+        # own attempt gave it, nothing is deleted, the record's ``j_commit``
+        # is cleared so no later reader can mistake it for this press's join,
+        # and a fresh join is made on the next attempt's own name.
+        if record is not None and record.is_done(STEP_JOIN) and record.j_commit:
+            kept = await look_at_a_join(
+                git,
+                ref=str(record.j_commit),
+                g_commit=g_commit,
+                build_tip=candidate_sha,
             )
+            if kept.is_the_join:
+                j_commit = record.j_commit
+                logger.info(
+                    "merge-executor: %s's join (%s) is a merge of %s and the "
+                    "build's tip %s — it is used, not made again",
+                    feature_id,
+                    str(j_commit)[:10],
+                    g_commit[:10],
+                    candidate_sha[:10],
+                )
+            else:
+                why = kept.why or (
+                    f"the recorded join {str(record.j_commit)[:10]} is not a "
+                    f"merge of {g_commit[:10]} and {candidate_sha[:10]}"
+                )
+                logger.warning(
+                    "merge-executor: %s's recorded join is not a join of what "
+                    "is true now (%s) — it is set aside under its own name "
+                    "(%s) and the join is made afresh",
+                    feature_id,
+                    why,
+                    integration_branch(feature_id, attempt),
+                )
+                if store is not None and not store.done(
+                    build_id=build_id,
+                    turn=turn,
+                    now=deps.clock(),
+                    step=STEP_JOIN,
+                    attempt=attempt,
+                    result={
+                        "set_aside": True,
+                        "branch_kept": integration_branch(feature_id, attempt),
+                        "commit_kept": record.j_commit,
+                        "why": why,
+                    },
+                    # The record must not carry a join that is not this
+                    # press's. It is cleared here and written again only when
+                    # a fresh join is really made.
+                    j_commit=None,
+                ):
+                    return _replaced_here()
         # The MERGE COMMAND's own check counts — what the build system ran on
         # the joined result. They are not the live check's counts, which ride
         # the report as ``gate_before_merge``; a press that picked up a join
@@ -1902,32 +2015,74 @@ async def execute_merge_deploy(
         # join up does not, and says so.
         merge_checks_ran_here = False
 
+        def _the_recorded_line(step: str) -> Any | None:
+            """The last ``done`` line for this step, on THIS attempt and THIS J.
+
+            Both halves of "on exactly this J" are checked: the attempt the
+            line belongs to, and the joined commit the line says it ran on. A
+            line from another attempt, or one that ran on a different joined
+            commit, is somebody else's answer to somebody else's question.
+            """
+            if record is None or not j_commit:
+                return None
+            found = None
+            for line in getattr(record, "lines", ()):
+                if line.kind != LINE_DONE or line.step != step:
+                    continue
+                if int(getattr(line, "attempt", -1)) != attempt:
+                    continue
+                ran_on = str(
+                    line.detail.get("ran_on") or line.detail.get("j_commit") or ""
+                )
+                if ran_on and ran_on != str(j_commit):
+                    continue
+                found = line
+            return found
+
+        def _the_recorded_step_passed(step: str) -> bool:
+            """Did that step PASS on exactly this J? Not "was it written down".
+
+            The existence of a ``done`` line says the step finished, not that
+            it was green. A red run writes a ``done`` line too — with
+            ``verify_ok`` false — and counting it as "checked" launders a red
+            set of checks into a word a person trusts.
+            """
+            line = _the_recorded_line(step)
+            if line is None:
+                return False
+            return line.detail.get("verify_ok") is True
+
+        def _why_the_recorded_step_failed(step: str) -> str | None:
+            """The plain reason a recorded step did not pass, or ``None``."""
+            line = _the_recorded_line(step)
+            if line is None or line.detail.get("verify_ok") is not False:
+                return None
+            return str(
+                line.detail.get("verify_detail")
+                or line.detail.get("verify_status")
+                or "verification failed"
+            )
+
         def _the_build_systems_checks_ran_on_j() -> bool:
             if merge_checks_ran_here:
                 return True
-            if record is None:
-                return False
-            return any(
-                line.kind == LINE_DONE
-                and line.step == STEP_MERGE_CHECKS
-                and int(getattr(line, "attempt", -1)) == attempt
-                for line in getattr(record, "lines", ())
-            )
+            return _the_recorded_step_passed(STEP_MERGE_CHECKS)
 
         unfinished = record.unfinished() if record is not None else None
-        if unfinished is not None and unfinished.step == STEP_JOIN:
+        if j_commit is None and unfinished is not None and unfinished.step == STEP_JOIN:
             # The last line says a join was about to happen and never said
-            # what came of it. Look, do not assume.
+            # what came of it. Look, do not assume — and look with the commits
+            # that are true NOW, never the ones that line was written with.
+            # Skipped when the recorded join above was already confirmed to be
+            # a join of what is true now: that question has been answered.
             leftover = await look_at_the_leftover_join(
                 git,
                 feature_id=feature_id,
                 attempt=unfinished.attempt,
-                g_commit=str(unfinished.detail.get("g_commit") or g_commit),
-                build_tip=str(unfinished.detail.get("build_tip") or candidate_sha),
+                g_commit=g_commit,
+                build_tip=candidate_sha,
             )
-            if leftover.is_the_join and str(
-                unfinished.detail.get("g_commit") or ""
-            ) == g_commit:
+            if leftover.is_the_join:
                 j_commit = leftover.commit
                 attempt = unfinished.attempt
                 if store is not None and not store.done(
@@ -1982,6 +2137,22 @@ async def execute_merge_deploy(
 
         if j_commit is None:
             attempt = attempt + 1
+            # WHERE THE FOLDER WILL BE, AS THIS SIDE WORKS IT OUT. The "about
+            # to" line has to be written before the folder is made, so this is
+            # the only path it can carry — and for a repository that lives in
+            # a sandbox it is this side's path, not the one the folder really
+            # has in there. The venue's own answer replaces it below and goes
+            # on the "done" line; the field on the "about to" line is named
+            # ``working_folder_expected`` so the two are not read as one fact.
+            #
+            # LEFT FOR THE EXECUTOR STAGE, and named here rather than found
+            # then: this folder is NEVER REMOVED. Every attempt makes one and
+            # every one of them stays, because the design keeps each joined
+            # commit under a name of its own until the build's record reaches
+            # its end — and its end is a publication this version cannot
+            # perform. The venue already has ``remove_working_folder``; the
+            # stage that can finish a record is the stage that may call it,
+            # and it has to leave the branch alone when it does.
             folder = working_folder_path(repo_root, feature_id, attempt)
             if store is not None and not store.about_to(
                 build_id=build_id,
@@ -2245,6 +2416,18 @@ async def execute_merge_deploy(
 
             # The build system's own checks after the merge ran on J, in the
             # working folder, as part of the same command.
+            #
+            # THIS STEP HAS NO "ABOUT TO" LINE, and that is on purpose here
+            # and worth naming for the executor stage. The checks are not a
+            # step this press starts: they are inside the merge command, so
+            # the "about to join" line already says everything about to
+            # happen, and a second "about to" written after the command
+            # returned would be a line saying "about to" about something that
+            # had already finished. The cost is that a press killed inside the
+            # command cannot tell, from the record alone, whether the checks
+            # ran — which is exactly why the pick-up asks git instead. Any
+            # stage that moves these checks OUT of the merge command owes them
+            # their own "about to" line.
             checks_passed = _report_int(report, "checks_passed")
             checks_total = _report_int(report, "checks_total")
             if store is not None and not store.done(
@@ -2347,9 +2530,68 @@ async def execute_merge_deploy(
                 )
 
         # ------------------------------------------------------------------
+        # A RED SET OF CHECKS STAYS RED. This press may have picked up a join
+        # an earlier one made; if the earlier press ran the build system's
+        # checks on exactly this joined commit and they went red, that is
+        # still the answer. It is not re-run here — the checks live inside the
+        # merge command, and running that command again would try to merge
+        # again — so there is nothing that could have changed it. The result
+        # says what happened, word for word as the press that ran them said
+        # it, and it stays the result until a NEW attempt's checks pass.
+        # ------------------------------------------------------------------
+        recorded_why = _why_the_recorded_step_failed(STEP_MERGE_CHECKS)
+        if recorded_why is not None and not merge_checks_ran_here:
+            detail = (
+                f"{feature_id} was joined onto {target_branch} "
+                f"({(j_commit or '')[:10]}), but the checks after the join "
+                f"did not pass: {recorded_why}. Nothing was published."
+            )
+            logger.warning(
+                "merge-executor: %s's join (%s) was checked by an earlier "
+                "press and went red (%s) — this press re-runs nothing and "
+                "says so; it is not 'checked'",
+                feature_id,
+                str(j_commit)[:10],
+                recorded_why,
+            )
+            if store is not None:
+                store.record(
+                    build_id=build_id,
+                    turn=turn,
+                    now=deps.clock(),
+                    result=RESULT_PUBLICATION_PENDING,
+                )
+            recorded_line = _the_recorded_line(STEP_MERGE_CHECKS)
+            return MergeDeployOutcome(
+                result="merged-verify-failed",
+                status="FAILED",
+                merged_sha=j_commit,
+                failed_step="verify",
+                detail=detail,
+                checks_passed=(
+                    recorded_line.detail.get("checks_passed")
+                    if recorded_line is not None
+                    else None
+                ),
+                checks_total=(
+                    recorded_line.detail.get("checks_total")
+                    if recorded_line is not None
+                    else None
+                ),
+                verify_status="failed",
+            )
+
+        # ------------------------------------------------------------------
         # THE FACTORY'S OWN LIVE CHECK, ON J AND ONLY ON J. Its exact tree is
         # laid out with the same operation the branch's tree used to be, and
         # the registered live checks run against that.
+        #
+        # IT IS RUN ON EVERY PRESS, and never inherited from the record. That
+        # is what makes the same rule as the one above unnecessary here: there
+        # is no path on which a recorded verdict for this step is read and
+        # believed, so a red one cannot be laundered into "checked" either.
+        # The guard is the ``done`` line below being written from THIS run's
+        # verdict, and a test pins that a red recorded check is not inherited.
         # ------------------------------------------------------------------
         j_tree = await git.rev_parse(f"{j_commit}^{{tree}}")
         gate["candidate_sha"] = j_commit
@@ -2549,6 +2791,43 @@ async def execute_merge_deploy(
 # ---------------------------------------------------------------------------
 
 
+def _the_builds_declarations(
+    db_path: Any, build_id: str
+) -> tuple[str | None, tuple[str, ...]]:
+    """This build's memory name and its project's declared setting NAMES.
+
+    Read straight off the ledger, on a connection of its own that is closed
+    again, because the deploy dispatch is handed a path rather than a facade.
+    Nothing here guesses: a ledger that recorded neither answers ``(None, ())``,
+    which is the factory's own launch list and memory explicitly off — the
+    honest state, and never somebody else's project name.
+    """
+    if db_path is None:
+        return None, ()
+    try:
+        from forge.adapters.sqlite.connect import connect_writer
+        from forge.lifecycle.persistence import SqliteLifecyclePersistence
+
+        connection = connect_writer(db_path)
+        try:
+            facade = SqliteLifecyclePersistence(connection=connection, db_path=db_path)
+            name = facade.read_memory_project(build_id)
+            names = tuple(str(entry) for entry in facade.read_launch_settings(build_id))
+        finally:
+            connection.close()
+    except Exception as exc:  # noqa: BLE001 — a launch detail never stops a press
+        logger.warning(
+            "merge-deploy: what %s's project declared could not be read off "
+            "the ledger (%s: %s) — the live check's driver runs with the "
+            "factory's own list and memory off",
+            build_id,
+            type(exc).__name__,
+            exc,
+        )
+        return None, ()
+    return (str(name or "").strip() or None), names
+
+
 def build_in_daemon_deploy_dispatcher(
     *, config: Any, nats_client: Any, db_path: Any
 ) -> Callable[..., Awaitable[Any]]:
@@ -2615,6 +2894,16 @@ def build_in_daemon_deploy_dispatcher(
         spec = profile.live_gate
         invoker = None
         if spec is not None and sandbox is not None:
+            # WHAT THE PROJECT DECLARED FOR THIS BUILD, off the ledger and
+            # sent with the gate's request (22 September 2026). The live check
+            # runs the project's OWN driver inside its sandbox, so it is the
+            # project's own declarations that decide what that driver needs —
+            # and until this they were stripped on the way through: a driver
+            # needing a toolchain setting the project declared did not get it,
+            # and one that launches the build system got memory off. Nothing
+            # recorded reads as "the factory's own list and memory off", which
+            # is the honest state rather than a guessed name.
+            memory_name, declared_names = _the_builds_declarations(db_path, build_id)
             invoker = SidecarLiveGateInvoker(
                 base_url=str(sandbox.sidecar_url),
                 repo=repo,
@@ -2622,6 +2911,8 @@ def build_in_daemon_deploy_dispatcher(
                 driver_argv=list(spec.driver),
                 timeout_seconds=spec.timeout_seconds,
                 extra_env=dict(spec.env),
+                memory_project=memory_name,
+                launch_settings=declared_names,
             )
         elif spec is not None:
             invoker = RepoDriverLiveGateInvoker(

@@ -20,6 +20,7 @@ from forge.deploy.candidate_tree import InContainerCandidateGit
 from forge.pipeline.merge_join import (
     INTEGRATION_BRANCH_PREFIX,
     integration_branch,
+    look_at_a_join,
     look_at_the_leftover_join,
     make_the_working_folder,
     target_branch_now,
@@ -244,3 +245,101 @@ class TestLookingAtWhatAnInterruptedJoinLeft:
         )
         assert leftover.exists is False
         assert leftover.is_the_join is False
+
+
+class TestAskingTheSameQuestionOfACommit:
+    """``look_at_a_join`` — the question asked of a commit written down earlier.
+
+    A press picking a build up holds a joined commit on the record, not a
+    branch name, and it has to ask whether that commit is a join of what is
+    true NOW. That is the same question by the same two parents, so it is the
+    same code; only what it is pointed at differs.
+    """
+
+    @staticmethod
+    async def _joined(repo: Path) -> tuple[str, str, str]:
+        g = _git(repo, "rev-parse", "main")
+        tip = _git(repo, "rev-parse", f"autobuild/{FEATURE}")
+        made = await make_the_working_folder(
+            _venue(repo), repo_root=repo, feature_id=FEATURE, attempt=1, at_commit=g
+        )
+        _git(Path(made.path), "merge", "--no-ff", "-m", "the join", f"autobuild/{FEATURE}")
+        return g, tip, _git(repo, "rev-parse", made.branch)
+
+    @pytest.mark.asyncio
+    async def test_a_commit_that_is_the_join_of_both_is_the_join(
+        self, repo: Path
+    ) -> None:
+        g, tip, joined = await self._joined(repo)
+
+        answer = await look_at_a_join(
+            _venue(repo), ref=joined, g_commit=g, build_tip=tip
+        )
+
+        assert answer.is_the_join is True
+        assert answer.commit == joined
+
+    @pytest.mark.asyncio
+    async def test_a_commit_joined_onto_an_older_tip_is_not_the_join(
+        self, repo: Path
+    ) -> None:
+        """The build gained a fix after the join was made."""
+        g, _old_tip, joined = await self._joined(repo)
+        _git(repo, "checkout", "-q", f"autobuild/{FEATURE}")
+        (repo / "the-fix").write_text("fixed\n", encoding="utf-8")
+        _git(repo, "add", "the-fix")
+        _git(repo, "commit", "-q", "-m", "the fix")
+        new_tip = _git(repo, "rev-parse", f"autobuild/{FEATURE}")
+        _git(repo, "checkout", "-q", "main")
+
+        answer = await look_at_a_join(
+            _venue(repo), ref=joined, g_commit=g, build_tip=new_tip
+        )
+
+        assert answer.is_the_join is False
+        assert answer.set_aside is True
+        assert "is a merge of" in answer.why
+        # And it is still there, under the name its own attempt gave it.
+        assert _git(repo, "rev-parse", integration_branch(FEATURE, 1)) == joined
+
+    @pytest.mark.asyncio
+    async def test_a_commit_that_is_not_a_merge_at_all_is_not_the_join(
+        self, repo: Path
+    ) -> None:
+        tip = _git(repo, "rev-parse", f"autobuild/{FEATURE}")
+
+        answer = await look_at_a_join(
+            _venue(repo),
+            ref=tip,
+            g_commit=_git(repo, "rev-parse", "main"),
+            build_tip=tip,
+        )
+
+        assert answer.is_the_join is False
+        assert "not a merge commit" in answer.why
+
+    @pytest.mark.asyncio
+    async def test_a_commit_nobody_has_is_not_the_join_either(self, repo: Path) -> None:
+        """A recorded commit this repository does not hold is set aside.
+
+        Git answers a full forty-character name with itself without checking
+        that it holds the object, so this does not come back as "not there" —
+        it comes back as "it has no second parent", which is the same safe
+        answer: it is not the join, so it is set aside and one is made afresh.
+        """
+        answer = await look_at_a_join(
+            _venue(repo), ref="c" * 40, g_commit="a" * 40, build_tip="b" * 40
+        )
+
+        assert answer.is_the_join is False
+        assert answer.set_aside is True
+        assert "not a merge commit" in answer.why
+
+    @pytest.mark.asyncio
+    async def test_a_name_nobody_has_is_simply_not_there(self, repo: Path) -> None:
+        answer = await look_at_a_join(
+            _venue(repo), ref="no-such-branch", g_commit="a" * 40, build_tip="b" * 40
+        )
+
+        assert answer.exists is False
+        assert answer.is_the_join is False
