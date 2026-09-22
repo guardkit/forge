@@ -68,7 +68,7 @@ import shutil
 import signal
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from forge.adapters.guardkit.context_resolver import resolve_context_flags
 from forge.launch_environment import build_launch_env
@@ -348,6 +348,8 @@ async def _execute_subprocess(
     command: list[str],
     cwd: str,
     timeout: int,
+    memory_project: str | None = None,
+    launch_settings: Sequence[str] | None = None,
 ) -> tuple[str, str, int, float, bool, bool]:
     """Execute a command via :func:`asyncio.create_subprocess_exec`.
 
@@ -389,23 +391,32 @@ async def _execute_subprocess(
     # NAMED LIST in :mod:`forge.launch_environment`, where every entry carries
     # the one line that says why it is there, and nothing else is passed.
     #
-    # NO MEMORY NAME IS HANDED OVER HERE, deliberately. These legs (the
-    # planning stages, and the fix journey's review and work) run IN the
-    # project's own working folder, so the build system reads the project's own
-    # declaration out of the very file this factory read at the starting
-    # commit — the same two lines, the same name. Threading the recorded name
-    # down to every leg would be a second way of saying the same thing, and a
-    # second way to get it wrong. A project that declares nothing never reaches
-    # here at all: the door refused it.
+    # THE MEMORY NAME IS HANDED OVER HERE TOO (22 September 2026, after the
+    # stage's second independent review). The first pass deliberately handed
+    # these legs no name, reasoning that they run IN the project's own working
+    # folder and the build system would read the same declaration out of the
+    # same file. The review showed what that reasoning missed: the WORKING
+    # FOLDER is not the recorded commit. With one name in the ledger and a
+    # different one in the folder, the child took the folder's — so a changed
+    # working copy chose the memory for a call the factory made.
     #
-    # It is built HERE rather than passed in because this function is the
-    # stubbable seam the tests replace: a seam that spawns nothing has no
-    # environment to be given, and keeping the argument list as it was means
-    # every existing stub still answers.
+    # Now every leg is handed the name recorded for its build, and every launch
+    # built here also says a factory made it
+    # (``GUARDKIT_FACTORY_LAUNCH``): handed no name, the build system runs with
+    # memory OFF rather than falling back to whatever the folder declares. A
+    # leg with no build to read a name from — a validator asked about a file,
+    # a caller with no ledger — therefore runs with memory explicitly off, and
+    # says so here rather than borrowing a name from the ground it stands on.
+    #
+    # The environment is built HERE rather than passed in because this function
+    # is the stubbable seam the tests replace: a seam that spawns nothing has
+    # no environment to be given.
     proc = await asyncio.create_subprocess_exec(
         *command,
         cwd=cwd,
-        env=build_launch_env(),
+        env=build_launch_env(
+            memory_project=memory_project, declared=launch_settings
+        ),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         # The child LEADS its own process group — the precondition that
@@ -470,6 +481,8 @@ async def run(
     timeout_seconds: int = _DEFAULT_TIMEOUT_SECONDS,
     with_nats_streaming: bool = True,
     extra_context_paths: list[str] | None = None,
+    memory_project: str | None = None,
+    launch_settings: Sequence[str] | None = None,
 ) -> GuardKitResult:
     """Single subprocess entry point for every GuardKit subcommand.
 
@@ -505,6 +518,19 @@ async def run(
         Caller-supplied ``--context`` paths merged on top of the
         manifest-derived ones for **this call only** — never persisted
         (ASSUM-005, retry path).
+    memory_project:
+        Which memory this leg reads and writes: the name recorded in the
+        ledger for the build this leg belongs to, read from the project's
+        own declaration at the commit the work started from. ``None``
+        means no build was in scope to read a name from, and then the leg
+        runs with memory explicitly OFF — never with the name declared in
+        whatever folder it happens to be pointed at, because this launch
+        also tells the build system that a factory made it.
+    launch_settings:
+        The setting NAMES this leg's project declared its builds need
+        beyond the factory's own list, recorded the same way at the same
+        commit. Names only; each value is taken from this process's own
+        settings, and only if it has one.
 
     Returns
     -------
@@ -616,6 +642,8 @@ async def run(
                 command=command,
                 cwd=str(resolved_repo),
                 timeout=timeout_seconds,
+                memory_project=memory_project,
+                launch_settings=launch_settings,
             )
             output_surrendered = bool(_surrender[0]) if _surrender else False
         except PermissionError as exc:

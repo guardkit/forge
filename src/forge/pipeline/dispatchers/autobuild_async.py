@@ -71,7 +71,14 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Mapping, Protocol, runtime_checkable
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Mapping,
+    Protocol,
+    Sequence,
+    runtime_checkable,
+)
 
 from forge.pipeline.forward_context_builder import (
     ContextEntry,
@@ -336,6 +343,7 @@ async def dispatch_autobuild_async(
     repo: str | None = None,
     budget: "dict[str, Any] | None" = None,
     memory_project: str | None = None,
+    launch_settings: "Sequence[str] | None" = None,
 ) -> AutobuildDispatchHandle:
     """Dispatch ``feature_id``'s autobuild as a long-running async subagent.
 
@@ -451,6 +459,12 @@ async def dispatch_autobuild_async(
             inside a sandbox cannot read the ledger, so this is the only way the
             name arrives. ``None`` (nothing recorded: a build queued by hand, or
             one from before the memory rule) omits the key entirely.
+        launch_settings: The setting NAMES this build's project declared its
+            own builds need beyond the factory's list (22 September 2026), read
+            out of the same file at the same commit and carried on the same
+            row. Names only — a value never travels — and the runner takes each
+            value from its own settings, and only if it has one. Nothing
+            declared omits the key entirely.
 
     Returns:
         :class:`AutobuildDispatchHandle` carrying the minted ``task_id``
@@ -585,6 +599,13 @@ async def dispatch_autobuild_async(
     # never to a name this factory made up.
     if memory_project:
         launch_payload["memory_project"] = memory_project
+    # And what the project itself said its builds need, by name, travelling the
+    # same one hop for the same reason: the runner cannot read the ledger from
+    # inside a sandbox. NAMES ONLY — the values are taken from the runner's own
+    # settings when it launches the build, so nothing a project declared has
+    # ever carried a value across this wire.
+    if launch_settings:
+        launch_payload["launch_settings"] = [str(name) for name in launch_settings]
     # TASK-FORGE-FRR-F010G: prefer the async launch path. The deepagents
     # middleware's sync path raises on ``url=None`` (the autobuild_runner
     # registration shape) while the async path tolerates ``url=None`` and

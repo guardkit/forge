@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -38,7 +39,7 @@ class FakeSeam:
         self.next_results.append(result)
 
     async def __call__(
-        self, *, command: list[str], cwd: str, timeout: int
+        self, *, command: list[str], cwd: str, timeout: int, **_launch: Any
     ) -> tuple[str, str, int, float, bool]:
         self.commands.append((list(command), cwd, timeout))
         if self.next_results:

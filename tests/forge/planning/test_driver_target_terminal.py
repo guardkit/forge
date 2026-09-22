@@ -255,6 +255,7 @@ class RecordingGitRunner:
         *,
         pre_commit: Any = None,
         start_commit: str | None = None,
+        **_launch: Any,
     ) -> GitOpResult:
         # Materialise the files into a temp dir so the pre_commit hook can run
         # against a real on-disk tree, then honour its verdict.
@@ -864,17 +865,48 @@ def _init_scratch_repo(path: Path) -> None:
     _give_repo_a_remote(path, env)
 
 
-def _declare_the_projects_memory(path: Path) -> None:
-    """Write the two lines that say which memory this project uses.
+#: The settings the stand-ins these tests run are steered with — see
+#: :func:`_declare_the_projects_memory`.
+STAND_IN_SETTINGS: tuple[str, ...] = (
+    "FAKE_GUARDKIT_LOG",
+    "FAKE_GUARDKIT_NORMALIZE",
+    "FAKE_GUARDKIT_VALIDATE",
+    "FAKE_GUARDKIT_CLASSIFY",
+    "FAKE_GUARDKIT_QA_VALIDATE",
+    "FAKE_GUARDKIT_NO_MODEL_REFUSES",
+    "FAKE_NORMALIZER",
+    "PYTHONPATH",
+)
 
-    The memory rule (item 2, 2026-09-21) refuses at the door a project that
-    declares none, so a scratch copy meant to get PAST the door declares one,
-    exactly as every registered project now does. Two lines, and nothing at all
-    about what the project is made of.
+
+def _declare_the_projects_memory(path: Path) -> None:
+    """Write what this scratch project declares about itself.
+
+    Two things, both read at the commit the work starts from:
+
+    * the two lines that say which memory it uses. The memory rule (item 2,
+      2026-09-21) refuses at the door a project that declares none, so a
+      scratch copy meant to get PAST the door declares one, exactly as every
+      registered project now does;
+    * the NAMES its own checks need from the launching process (22 September
+      2026). A check is launched with the factory's own short named list and
+      nothing else, and the stand-ins these tests run are steered by settings
+      that are not on it — rightly, since nothing a test invents belongs on a
+      central list. So this project declares them by name, which is the door a
+      real project uses to say what its own builds need. ``PYTHONPATH`` is
+      here because the stand-in normalizer is a PLANTED module; in production
+      that module comes out of the interpreter's own installation.
+
+    Still nothing at all about what the project is made of: names, in the
+    project's own file.
     """
     (path / ".guardkit").mkdir(exist_ok=True)
     (path / ".guardkit" / "config.yaml").write_text(
-        "memory:\n  project: scratch_project\n", encoding="utf-8"
+        "memory:\n"
+        "  project: scratch_project\n"
+        "launch:\n"
+        "  settings: [%s]\n" % ", ".join(STAND_IN_SETTINGS),
+        encoding="utf-8",
     )
 
 
@@ -4232,10 +4264,14 @@ def _commit_repo_routing_law(repo: Path, value: str) -> None:
     key guardkit's plan-load half reads)."""
     cfg = repo / ".guardkit" / "config.yaml"
     cfg.parent.mkdir(parents=True, exist_ok=True)
-    # The memory declaration stays, for the reason in _seed_leftover_dcl_config.
+    # The memory declaration stays, for the reason in _seed_leftover_dcl_config,
+    # and so does what this project declares its checks need by name — see
+    # _declare_the_projects_memory. Rewriting the whole file here would take
+    # both away from every test that goes through this helper.
     cfg.write_text(
         f"toolchain:\n  test: pytest -q\nrouting_law: {value}\n"
-        f"memory:\n  project: scratch_project\n",
+        f"memory:\n  project: scratch_project\n"
+        "launch:\n  settings: [%s]\n" % ", ".join(STAND_IN_SETTINGS),
         encoding="utf-8",
     )
     env = {

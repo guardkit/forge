@@ -56,7 +56,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Mapping
+from typing import Any, Awaitable, Callable, Mapping, Sequence
 
 from forge.adapters.guardkit.models import GuardKitResult, GuardKitWarning
 from forge.adapters.guardkit.parser import parse_guardkit_output
@@ -272,6 +272,8 @@ def build_sidecar_guardkit_run(
         timeout_seconds: int = 900,
         with_nats_streaming: bool = False,  # noqa: ARG001 — no broker on this door
         extra_context_paths: list[str] | None = None,  # noqa: ARG001 — merge only
+        memory_project: str | None = None,
+        launch_settings: Sequence[str] | None = None,
     ) -> GuardKitResult:
         started_at = time.monotonic()
 
@@ -322,6 +324,15 @@ def build_sidecar_guardkit_run(
             "expect_main_sha": expect_main_sha,
             "timeout_seconds": float(timeout_seconds),
         }
+        # WHICH MEMORY THE MERGE WORD'S OWN COMMAND BELONGS TO, and what else
+        # this project asked to be launched with. The merge command runs the
+        # build system inside the sandbox, so it reads and writes memory like
+        # any other leg, and it uses the name recorded for this build rather
+        # than whatever the checkout on the far side declares.
+        if memory_project:
+            body["memory_project"] = str(memory_project)
+        if launch_settings:
+            body["launch_settings"] = [str(name) for name in launch_settings]
         # THE BRANCH TRAVELS AS ITS OWN FIELD. The sidecar builds the command
         # on the far side, so a --branch left in this list would be dropped
         # and a fix journey's repair would be merged from a branch nobody
@@ -516,6 +527,8 @@ def build_sidecar_leg_run(
         timeout_seconds: int = 1800,
         with_nats_streaming: bool = True,
         extra_context_paths: list[str] | None = None,
+        memory_project: str | None = None,
+        launch_settings: Sequence[str] | None = None,
     ) -> GuardKitResult:
         started_at = time.monotonic()
 
@@ -561,6 +574,18 @@ def build_sidecar_leg_run(
             body["extra_context_paths"] = [str(path) for path in extra_context_paths]
         if read_allowlist:
             body["read_allowlist"] = [str(path) for path in read_allowlist]
+        # WHICH MEMORY THIS LEG BELONGS TO, and what else its project asked to
+        # be launched with, travel with the request exactly as the context does
+        # (22 September 2026). The sandbox is a different machine's worth of
+        # environment from the coordinator's, and the worktree the leg runs in
+        # may declare a different name from the commit the work started from —
+        # which is how a changed working copy came to choose the memory for a
+        # call the factory made. The recorded name is sent; absent, the sandbox
+        # runs the leg with memory explicitly off.
+        if memory_project:
+            body["memory_project"] = str(memory_project)
+        if launch_settings:
+            body["launch_settings"] = [str(name) for name in launch_settings]
         http_timeout = float(timeout_seconds) + http_timeout_margin
         try:
             status, parsed = await asyncio.to_thread(

@@ -250,3 +250,103 @@ def test_nothing_recorded_is_never_turned_into_guardkit(
 
     assert persistence.read_memory_project(build_id) is None
     assert persistence.read_memory_project(build_id) != "guardkit"
+
+
+# ---------------------------------------------------------------------------
+# And what the project said its builds need, in the same two places
+# (schema_v14, 22 September 2026)
+# ---------------------------------------------------------------------------
+
+
+def test_the_migration_adds_the_launch_settings_column_to_both_tables(
+    tmp_path: Path,
+) -> None:
+    cx = sqlite_connect.connect_writer(tmp_path / "fresh-14.db")
+    try:
+        version = lifecycle_migrations.apply_at_boot(cx)
+        planning = {row[1] for row in cx.execute("PRAGMA table_info(planning_runs);")}
+        builds = {row[1] for row in cx.execute("PRAGMA table_info(builds);")}
+    finally:
+        cx.close()
+
+    assert version >= 14
+    assert "launch_settings" in planning
+    assert "launch_settings" in builds
+
+
+def test_the_names_are_written_on_the_run_and_read_back(
+    persistence: SqliteLifecyclePersistence,
+) -> None:
+    store = _store(persistence)
+    _queue_run(store)
+
+    assert store.record_launch_settings(
+        CID, names=["SOME_TOOL_CACHE", "ANOTHER_HOME"]
+    ) is True
+    assert store.get_launch_settings(CID) == ("SOME_TOOL_CACHE", "ANOTHER_HOME")
+
+
+def test_declared_and_empty_is_not_the_same_fact_as_not_declared(
+    persistence: SqliteLifecyclePersistence,
+) -> None:
+    """A row nobody wrote anything on reads as "not declared". A project that
+    was read and asked for nothing reads as "asked for nothing"."""
+    store = _store(persistence)
+    _queue_run(store)
+
+    assert store.get_launch_settings(CID) is None
+
+    store.record_launch_settings(CID, names=[])
+    assert store.get_launch_settings(CID) == ()
+
+
+def test_the_names_are_copied_onto_the_build(
+    persistence: SqliteLifecyclePersistence,
+) -> None:
+    store = _store(persistence)
+    _queue_run(store)
+    store.record_memory_project(CID, memory_project="widget_shop")
+    store.record_launch_settings(CID, names=["SOME_TOOL_CACHE"])
+
+    build_id = _queue_build(persistence)
+
+    assert persistence.read_launch_settings(build_id) == ("SOME_TOOL_CACHE",)
+    row = persistence.get_build_row(build_id)
+    assert row is not None and row.launch_settings == '["SOME_TOOL_CACHE"]'
+
+
+def test_a_build_with_no_planning_run_behind_it_asks_for_nothing(
+    persistence: SqliteLifecyclePersistence,
+) -> None:
+    build_id = _queue_build(persistence, "corr-with-no-run")
+
+    assert persistence.read_launch_settings(build_id) == ()
+
+
+def test_an_old_ledger_without_the_column_still_takes_builds(
+    tmp_path: Path,
+) -> None:
+    """A ledger from before this migration: the build is still written, and it
+    is launched with the factory's own list, which is what "not declared"
+    means at a launch."""
+    db_path = tmp_path / "unmigrated-14.db"
+    cx = sqlite_connect.connect_writer(db_path)
+    try:
+        before = [m for m in lifecycle_migrations._MIGRATIONS if m[0] <= 13]
+        with cx:
+            for _version, filename in before:
+                cx.executescript(lifecycle_migrations._load_migration_sql(filename))
+        cx.row_factory = sqlite3.Row
+        persistence = SqliteLifecyclePersistence(connection=cx, db_path=db_path)
+        store = SqlitePlanningRunStore(cx)
+        _queue_run(store, "corr-unmigrated-14")
+
+        # The store says so rather than raising, and the build is still queued.
+        assert store.record_launch_settings("corr-unmigrated-14", names=["A"]) is False
+        assert store.get_launch_settings("corr-unmigrated-14") is None
+        build_id = _queue_build(persistence, "corr-unmigrated-14")
+
+        assert build_id
+        assert persistence.read_launch_settings(build_id) == ()
+    finally:
+        cx.close()

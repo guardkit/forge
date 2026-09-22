@@ -957,7 +957,7 @@ class TestTheSandboxArgvIsTheContainerArgv:
         # The container side: the real runner, with only the spawn stubbed.
         captured: dict[str, Any] = {}
 
-        async def _fake_spawn(*, command: list[str], cwd: str, timeout: int) -> Any:
+        async def _fake_spawn(*, command: list[str], cwd: str, timeout: int, **_launch: Any) -> Any:
             captured["command"] = command
             captured["cwd"] = cwd
             return ("", "", 0, 0.01, False, False)

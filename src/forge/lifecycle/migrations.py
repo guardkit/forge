@@ -59,13 +59,19 @@ from typing import Final
 # additive ``memory_project`` column to BOTH tables — which memory this piece
 # of work actually belongs to, read from the project's own declaration at the
 # recorded starting commit. NULL on every pre-existing row and read as "not
-# recorded", never as "guardkit".
+# recorded", never as "guardkit";
+# bumped to 14 (22 September 2026) to add the additive ``launch_settings``
+# column to BOTH tables — the NAMES, and only the names, that the project
+# itself declared its builds need from the launching process beyond the
+# factory's own list. NULL on every pre-existing row and read as "not
+# declared", which is not the same fact as an empty list ("the project was read
+# and asked for nothing extra").
 # Future
 # schema bumps should follow the same pattern: append a sibling
 # ``schema_v{N}.sql`` and add a ``(N, "schema_v{N}.sql")`` entry to
 # ``_MIGRATIONS`` in ascending order. The runner applies every entry whose
 # version is greater than the current ``schema_version`` ledger row.
-_SCHEMA_VERSION: Final[int] = 13
+_SCHEMA_VERSION: Final[int] = 14
 _MIGRATIONS: Final[tuple[tuple[int, str], ...]] = (
     (1, "schema.sql"),
     (2, "schema_v2.sql"),
@@ -115,6 +121,13 @@ _MIGRATIONS: Final[tuple[tuple[int, str], ...]] = (
     # down. NULL-able: a historical row, and a build queued by hand with no
     # planning run, read back as "not recorded".
     (13, "schema_v13.sql"),
+    # v14 (the settings a project says its builds need) — the additive
+    # ``launch_settings`` column on ``planning_runs`` and on ``builds``. The
+    # launch list is the factory's own and carries no project tool's setting,
+    # so a project declares the NAMES its own builds need in its own
+    # ``.guardkit/config.yaml`` and this column holds what was read. NULL-able:
+    # "not declared", which is not the same as "declared, and empty".
+    (14, "schema_v14.sql"),
 )
 
 

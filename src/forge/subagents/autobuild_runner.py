@@ -1988,6 +1988,30 @@ def _memory_project_for_build(payload: Mapping[str, Any]) -> str | None:
     return name or None
 
 
+def _launch_settings_for_build(payload: Mapping[str, Any]) -> tuple[str, ...]:
+    """The setting NAMES this build's project asked to be launched with.
+
+    The project's own launch settings (22 September 2026). The factory's list
+    is the FACTORY'S own and carries nothing belonging to any project's tools,
+    because central code that named one tool's setting would be a factory with
+    a favourite language. So a project names what its own builds need, in its
+    own settings file, read at the commit the work started from and written
+    onto the planning run and the build; the dispatch reads it back off the
+    ledger and puts it on this payload, because a runner inside a sandbox
+    cannot see the ledger itself (rule 72).
+
+    NAMES ONLY. Nothing a project declared has ever carried a value here: each
+    value is taken from this runner's own settings at the launch, and only if
+    it has one. An empty list is the answer for a project that asked for
+    nothing and for a build queued before this existed alike — both mean the
+    factory's own list, and nothing else.
+    """
+    raw = payload.get("launch_settings")
+    if isinstance(raw, str) or not isinstance(raw, (list, tuple)):
+        return ()
+    return tuple(str(name).strip() for name in raw if str(name).strip())
+
+
 # ---------------------------------------------------------------------------
 # Branch-aware isolated worktrees (DEFECT #19, B4 round-17)
 # ---------------------------------------------------------------------------
@@ -4215,14 +4239,24 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
     # that module's own docstring says so at length. Every entry there carries
     # the one line that says why it is there, and nothing else is passed.
     #
-    # And the one setting that is decided per build rather than inherited: the
+    # And the settings that are decided per build rather than inherited: the
     # memory this work belongs to (item 2). Forge read the project's own
     # declaration at the commit the work started from and wrote the name down;
     # the launch hands it over on purpose here. Nothing recorded means the name
-    # is not set at all, and the build system then reads the project's own
-    # declaration in the folder it is building — never a fallback name.
+    # is not set at all, and because every launch built here also says a
+    # FACTORY made it, the build then runs with memory OFF rather than taking
+    # the name out of the folder it is building — which is a different folder
+    # from the commit the work started from, and the fault the second review
+    # found.
     memory_project = _memory_project_for_build(payload)
-    launch_env = build_launch_env(memory_project=memory_project)
+    # And the names the project itself declared its builds need beyond that
+    # list, read at the same commit and carried on the same payload. Central
+    # code carries them as text: nothing here knows or cares what tool any of
+    # them belongs to.
+    declared_settings = _launch_settings_for_build(payload)
+    launch_env = build_launch_env(
+        memory_project=memory_project, declared=declared_settings
+    )
     logger.info(
         "autobuild_runner: launching subprocess feature_id=%s cwd=%s "
         "timeout=%ss seat=%s memory=%s settings=%s",
@@ -4231,7 +4265,7 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
         timeout_seconds,
         routine_seat
         or "unnamed (the build system's own default applies, as it always has)",
-        memory_project or "not recorded (the project's own declaration decides)",
+        memory_project or "not recorded (this build runs with memory off)",
         # NAMES ONLY, never values: what this build was given, so a build that
         # behaved oddly can be told apart from one that was handed something
         # different, without a single value reaching a log.

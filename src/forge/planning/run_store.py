@@ -34,10 +34,11 @@ References
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Sequence
 
 from forge.planning.states import PlanningState, planning_transitions_for
 
@@ -531,6 +532,66 @@ class SqlitePlanningRunStore:
         if "memory_project" not in set(row.keys()):
             return None
         return row["memory_project"] or None
+
+    def record_launch_settings(
+        self, correlation_id: str, *, names: Sequence[str]
+    ) -> bool:
+        """Write down the setting NAMES this project's builds asked for.
+
+        The names the project declares in its own ``.guardkit/config.yaml``, as
+        it is AT the recorded starting commit, read in the same breath as the
+        memory name and written down beside it. NAMES ONLY: no value a project
+        declared has ever existed here, because a project declares none.
+
+        An empty list is a real answer — "this project was read and asked for
+        nothing extra" — and is written as such, which is not the same fact as
+        the NULL every row written before this rule reads back as.
+
+        Status-preserving; last write wins. Returns True when a row was
+        updated, and False when this ledger has no such column (a database from
+        before the migration), so a run against an older ledger carries on with
+        the factory's own list rather than failing.
+        """
+        if not correlation_id:
+            raise ValueError("record_launch_settings: correlation_id must be non-empty")
+        payload = json.dumps([str(name).strip() for name in names])
+        try:
+            cursor = self._connection.execute(
+                """
+                UPDATE planning_runs
+                SET launch_settings = ?
+                WHERE correlation_id = ?
+                """,
+                (payload, correlation_id),
+            )
+        except sqlite3.OperationalError:
+            return False
+        self._connection.commit()
+        return cursor.rowcount > 0
+
+    def get_launch_settings(self, correlation_id: str) -> tuple[str, ...] | None:
+        """The run's recorded setting names, or ``None`` for "not declared".
+
+        ``None`` means nobody wrote anything down — a run from before this rule,
+        or a ledger without the column. An empty tuple means the project was
+        read and asked for nothing extra. The two are different facts and are
+        never folded into one.
+        """
+        row = self._get_run(correlation_id)
+        if row is None:
+            return None
+        if "launch_settings" not in set(row.keys()):
+            return None
+        raw = row["launch_settings"]
+        if raw is None or str(raw).strip() == "":
+            return None
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(parsed, list):
+            return None
+        return tuple(str(name) for name in parsed)
 
     def update_pending_approval_request_id(
         self, correlation_id: str, request_id: str

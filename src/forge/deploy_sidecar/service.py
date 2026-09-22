@@ -198,7 +198,9 @@ from forge.deploy.profile import (
     wrapper_inner_script,
 )
 from forge.executor.shell_steps import _run_script_step
+from forge.launch_environment import build_launch_env, declared_setting_refusal
 from forge.memory.redaction import scrub_process_output
+from forge.planning.declared_memory import NAME_PATTERN
 from forge.planning.handoff import (
     PRE_COMMIT_CHECK_NAMES,
     PreCommitCheckOutcome,
@@ -436,8 +438,10 @@ class MergeRunner(Protocol):
 
     ``what`` names the command in a "could not be started" sentence, and
     ``extra_env`` is a non-secret overlay for the command's own environment.
-    Both are optional: every caller that predates the live gate and the gates
-    reader leaves them out, so a runner that does not accept them is still a
+    ``memory_project`` is which memory the command reads and writes, as the
+    request carried it, and ``launch_settings`` the NAMES the request's project
+    declared its builds need. All four are optional: every caller that predates
+    them leaves them out, so a runner that does not accept them is still a
     runner.
     """
 
@@ -449,6 +453,8 @@ class MergeRunner(Protocol):
         timeout: float = ...,
         what: str = ...,
         extra_env: dict[str, str] | None = ...,
+        memory_project: str | None = ...,
+        launch_settings: Sequence[str] | None = ...,
     ) -> tuple[int, str, str]: ...
 
 
@@ -704,6 +710,51 @@ def _allowlisted_env(
             )
         env[key] = value
     return env, None
+
+
+def _launch_fields(payload: Any) -> tuple[str | None, tuple[str, ...], str | None]:
+    """``(memory name, declared setting names, refusal)`` off one request.
+
+    Both are optional and both are the coordinator's own facts, read off the
+    ledger for the build this request is for and sent with it: which memory the
+    command reads and writes, and the NAMES the project declared its builds
+    need. A request that carries neither runs the command with the factory's
+    own named list and memory explicitly off, which is what every caller
+    written before these fields existed asks for.
+
+    They are checked here for the same reason every other field is: this
+    service starts processes, and a request is input. The shapes are the ones
+    the rest of the estate uses — a memory name is letters, digits and
+    underscores; a setting name is a setting name and never one the factory
+    keeps for itself.
+    """
+    if not isinstance(payload, dict):
+        return None, (), None
+    raw_name = payload.get("memory_project")
+    name: str | None = None
+    if raw_name is not None:
+        if not isinstance(raw_name, str) or not NAME_PATTERN.fullmatch(raw_name.strip()):
+            return None, (), (
+                "'memory_project', when present, is the memory name this work "
+                "belongs to: letters, digits and underscores; got "
+                f"{raw_name!r}"
+            )
+        name = raw_name.strip()
+    raw_settings = payload.get("launch_settings")
+    names: list[str] = []
+    if raw_settings is not None:
+        if isinstance(raw_settings, str) or not isinstance(raw_settings, (list, tuple)):
+            return None, (), (
+                "'launch_settings', when present, is the list of setting NAMES "
+                "the project declared its builds need; got "
+                f"{type(raw_settings).__name__}"
+            )
+        for entry in raw_settings:
+            refusal = declared_setting_refusal(entry)
+            if refusal is not None:
+                return None, (), f"'launch_settings' cannot be used: {refusal}"
+            names.append(str(entry).strip())
+    return name, tuple(names), None
 
 
 def _text_list(
@@ -1259,6 +1310,8 @@ def run_merge_command(
     timeout: float = MERGE_TIMEOUT_DEFAULT,
     what: str = "the merge command",
     extra_env: dict[str, str] | None = None,
+    memory_project: str | None = None,
+    launch_settings: Sequence[str] | None = None,
 ) -> tuple[int, str, str]:
     """Run one fixed argument list with no shell; return exit code and output.
 
@@ -1283,33 +1336,58 @@ def run_merge_command(
     (every caller before the live gate) inherits the environment exactly as
     before.
 
-    WHY THIS ONE STILL INHERITS, when the three launches of the build system on
-    the coordinator's side were cut down to the short named list of 2026-09-21
-    (item 1, second revision, section D; :mod:`forge.launch_environment`). One
-    of the commands this runs IS the build system (``guardkit autobuild
-    merge``), so the question is a fair one and the answer is that the cut has
-    already been made, one layer out:
+    ``memory_project`` is which memory the command this runs reads and writes —
+    the name the caller's request carried, which the coordinator read off the
+    ledger for that build. ``None`` means the request named none, and then the
+    command runs with memory explicitly OFF: this launch says a factory made it,
+    so the build system uses only the name it was handed and never the one
+    declared in the folder it is pointed at.
 
-    * this function runs inside the repository's sandbox, and the sandbox's own
-      start script (``deploy/sandbox-runner.sh``) is what builds the
-      environment this service is holding. It exports the same named settings
-      the list names, and it unsets the coordinator's ledger path before it
-      starts anything. Inheriting here inherits that, not an operator's shell;
-    * and it is not only the build system that comes through here. The same
-      runner runs the project's OWN declared check command and its own deploy
-      script, whatever those are — the factory does not know and must not
-      guess. A list written for launching the build system would be the wrong
-      list for a project's own script, and cutting one down to it would break
-      projects for a gain already had at the sandbox boundary;
-    * two of this service's own settings are on purpose NOT on that list
-      (``FORGE_SIDECAR_IN_SANDBOX`` tells this service which script it may
-      run), so applying it here would take away the thing that makes this
-      service safe.
+    ``launch_settings`` is the NAMES the request's project declared its own
+    builds need beyond the factory's list. Names only; each value is taken from
+    this service's own environment, and only if it has one.
 
-    If this ever runs outside a sandbox, that reasoning lapses and this call
-    needs the list.
+    WHAT THE CHILD IS GIVEN, and why this was changed on 22 September 2026.
+    This function used to hand its child everything this service holds, and
+    said so with a reason: it runs inside the repository's sandbox, and the
+    sandbox's own start script builds the environment it inherits. The stage's
+    second independent review showed that reason to be wrong on the fact it
+    rests on. The start script EXPORTS the settings the list names and unsets
+    the coordinator's ledger path; it does not FILTER what else the service's
+    process is holding. A fake publishing credential, an agent socket and a
+    name on no list at all were all planted in this service's environment and
+    all three reached the child.
+
+    So the child is built from the same short named list every other launch of
+    the build system uses (:func:`forge.launch_environment.build_launch_env`),
+    plus the project's own declared names, plus the memory name when the
+    request carries one. The exceptions, each with its reason:
+
+    * ``extra_env`` is still laid on top. It is the live-gate driver's
+      allowlisted, non-secret overlay — the candidate leg's gate must address
+      the candidate's port rather than the live one — and every value in it is
+      one the profile itself declares, checked by ``_allowlisted_env`` before
+      it reaches here. It is a named list of its own, which is the same
+      discipline, not an exception to it;
+    * this service's OWN settings stay with this service and are not passed on.
+      ``FORGE_SIDECAR_IN_SANDBOX`` tells it which deploy script it may run; a
+      child of it has no business reading that, and the named list already
+      leaves it out.
+
+    The project's own commands — its declared check, its deploy script — go
+    through here too, and the factory does not know what those need. That is
+    exactly what the project declares by name in its own settings file and what
+    ``launch_settings`` carries: a project says what its scripts need, and it is
+    passed. A project that has declared nothing gets the factory's list, which
+    is the honest state rather than a hidden one.
     """
-    env = (os.environ | extra_env) if extra_env else None
+    env = build_launch_env(
+        parent=os.environ,
+        memory_project=memory_project,
+        declared=launch_settings,
+    )
+    if extra_env:
+        env |= extra_env
     try:
         process = subprocess.Popen(  # noqa: S603 — fixed argv, no shell
             argv,
@@ -1468,6 +1546,10 @@ def process_guardkit_merge_request(
             return 400, {"error": branch_error}
         branch = branch.strip()
 
+    memory_project, launch_settings, launch_error = _launch_fields(payload)
+    if launch_error is not None:
+        return 400, {"error": launch_error}
+
     # The target commit must be a full git hash — a short one would let the
     # merge run against a branch that has moved since the checks ran.
     expect_main_sha = payload.get("expect_main_sha")
@@ -1610,7 +1692,17 @@ def process_guardkit_merge_request(
     )
     try:
         exit_code, stdout, stderr = merge_runner(
-            argv=argv, cwd=str(repo_path), timeout=timeout
+            argv=argv,
+            cwd=str(repo_path),
+            timeout=timeout,
+            # WHICH MEMORY, AND WHAT ELSE THE PROJECT ASKED FOR: the merge word
+            # runs the build system, which reads and writes memory, so the name
+            # the coordinator recorded for this build travels with the request
+            # and is handed over here. Absent, the command runs with memory
+            # explicitly off rather than taking the name out of the folder it
+            # is standing in.
+            memory_project=memory_project,
+            launch_settings=launch_settings,
         )
     except Exception as exc:  # noqa: BLE001 — never raise past the boundary
         return 500, {
@@ -1979,6 +2071,8 @@ def run_declared_check(
     command: tuple[str, ...],
     check_runner: MergeRunner = run_merge_command,
     normalizer_command: tuple[str, ...] | None = None,
+    memory_project: str | None = None,
+    launch_settings: Sequence[str] | None = None,
 ) -> PreCommitCheckOutcome:
     """Run one declared check in ``worktree`` and judge it the way the
     driver's closure judged it.
@@ -2019,7 +2113,16 @@ def run_declared_check(
     )
 
     def _run(argv: list[str]) -> tuple[int, str, str]:
-        return check_runner(argv=argv, cwd=str(worktree), timeout=check.timeout)
+        # Every check is launched with the factory's own named list, the
+        # project's own declared names, and the memory this work belongs to —
+        # the same three things every other launch of the build system gets.
+        return check_runner(
+            argv=argv,
+            cwd=str(worktree),
+            timeout=check.timeout,
+            memory_project=memory_project,
+            launch_settings=launch_settings,
+        )
 
     try:
         if check.name == "normalize-stamps":
@@ -2236,6 +2339,8 @@ def _declared_checks_hook(
     check_runner: MergeRunner,
     outcomes: list[PreCommitCheckOutcome],
     normalizer_command: tuple[str, ...] | None = None,
+    memory_project: str | None = None,
+    launch_settings: Sequence[str] | None = None,
 ) -> Callable[[Path], Awaitable[PreCommitResult]]:
     """The pre-commit hook the in-container runner takes, built from the
     declaration: each check in order, in a worker thread (the runner is
@@ -2251,6 +2356,8 @@ def _declared_checks_hook(
                 command=command,
                 check_runner=check_runner,
                 normalizer_command=normalizer_command,
+                memory_project=memory_project,
+                launch_settings=launch_settings,
             )
             outcomes.append(outcome)
             if check.blocking and not outcome.passed:
@@ -2343,6 +2450,12 @@ def process_git_write_tree_request(
     checks, error = _parse_checks(payload.get("checks"))
     if error or checks is None:
         return 400, {"error": error}
+    # The same two launch facts the merge and leg routes carry: the checks
+    # declared here ARE the build system, run against a tree, so they are
+    # launched the way every other call of it is.
+    memory_project, launch_settings, launch_error = _launch_fields(payload)
+    if launch_error is not None:
+        return 400, {"error": launch_error}
 
     command: tuple[str, ...] | None = None
     if any(check.name != NORMALIZER_CHECK_NAME for check in checks):
@@ -2378,6 +2491,8 @@ def process_git_write_tree_request(
             check_runner=check_runner,
             outcomes=outcomes,
             normalizer_command=normalizer_command,
+            memory_project=memory_project,
+            launch_settings=launch_settings,
         )
         if checks
         else None
@@ -3862,6 +3977,9 @@ def process_guardkit_leg_request(
     )
     if error:
         return 400, {"error": error}
+    memory_project, launch_settings, launch_error = _launch_fields(payload)
+    if launch_error is not None:
+        return 400, {"error": launch_error}
     with_nats_streaming = payload.get("with_nats_streaming", False)
     if not isinstance(with_nats_streaming, bool):
         return 400, {
@@ -3933,7 +4051,17 @@ def process_guardkit_leg_request(
         "on" if with_nats_streaming else "off",
     )
     try:
-        exit_code, stdout, stderr = leg_runner(argv=argv, cwd=cwd, timeout=timeout)
+        exit_code, stdout, stderr = leg_runner(
+            argv=argv,
+            cwd=cwd,
+            timeout=timeout,
+            # The same handover as the merge route's, for the same reason: a
+            # journey's review and work legs read and write memory, and the
+            # name they use is the one recorded for their build, not the one
+            # the worktree they run in happens to declare.
+            memory_project=memory_project,
+            launch_settings=launch_settings,
+        )
     except Exception as exc:  # noqa: BLE001 — never raise past the boundary
         return 500, {
             "error": f"sidecar execution error: {type(exc).__name__}: {exc}",

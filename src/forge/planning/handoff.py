@@ -44,7 +44,7 @@ References
 from __future__ import annotations
 
 import logging
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
@@ -337,6 +337,8 @@ class GitRunner(Protocol):
         *,
         pre_commit: "PreCommitHook | PreCommitChecks | None" = None,
         start_commit: str | None = None,
+        memory_project: str | None = None,
+        launch_settings: "Sequence[str] | None" = None,
     ) -> GitOpResult:
         """Write a MULTI-file tree onto ``branch`` in one commit (Lane B B2).
 

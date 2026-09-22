@@ -166,11 +166,36 @@ def _write(
         "files": dict(PLAN_FILES if files is None else files),
         "message": MESSAGE,
         "checks": checks,
+        # WHAT THE STAND-INS NEED TO BE TOLD, declared BY NAME (22 September
+        # 2026). A check is launched with the factory's own short named list
+        # and nothing else, so the settings this test steers its stand-in
+        # guardkit and stand-in normalizer with do not travel unless they are
+        # named — which is exactly the door a project uses to say what its own
+        # builds and checks need. Naming them here is how the test says it.
+        "launch_settings": list(STAND_IN_SETTINGS),
         **overrides,
     }
     return process_git_write_tree_request(
         payload, config=cfg, worktrees_root=tmp_path / "wt"
     )
+
+
+#: The settings the stand-ins in this module are steered with. They are not on
+#: the factory's own list — nothing a test invents ever should be — so the
+#: requests below declare them by name, the way a project declares what its own
+#: builds need. ``PYTHONPATH`` is here because the stand-in normalizer is a
+#: planted module rather than an installed one; in production that module comes
+#: out of the interpreter's own installation and needs no such setting.
+STAND_IN_SETTINGS: tuple[str, ...] = (
+    "FAKE_GUARDKIT_LOG",
+    "FAKE_GUARDKIT_NORMALIZE",
+    "FAKE_GUARDKIT_VALIDATE",
+    "FAKE_GUARDKIT_CLASSIFY",
+    "FAKE_GUARDKIT_QA_VALIDATE",
+    "FAKE_GUARDKIT_NO_MODEL_REFUSES",
+    "FAKE_NORMALIZER",
+    "PYTHONPATH",
+)
 
 
 def _normalize_check(**args: Any) -> dict[str, Any]:
@@ -870,6 +895,7 @@ def test_the_normalizer_check_needs_no_guardkit_command(
             "files": SPEC_FILES,
             "message": MESSAGE,
             "checks": [_normalize_feature_check()],
+            "launch_settings": list(STAND_IN_SETTINGS),
         },
         config=cfg,
         command_resolver=lambda: None,
@@ -1240,6 +1266,7 @@ def test_a_refused_commit_over_loopback_is_data_not_an_http_error(
             "files": PLAN_FILES,
             "message": MESSAGE,
             "checks": [_normalize_check(no_model=True), _validate_check()],
+            "launch_settings": list(STAND_IN_SETTINGS),
         },
     )
     assert status == 200 and body["status"] == "failed" and body["sha"] is None

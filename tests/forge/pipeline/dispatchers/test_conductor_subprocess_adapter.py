@@ -711,3 +711,82 @@ class TestStageLogWriterBinding:
         await adapter(stage=StageClass.TASK_REVIEW, build_id=BUILD_ID)
 
         assert dispatch.calls[0]["stage_log_writer"] is writer
+
+
+class TestWhatTheLegIsLaunchedWith:
+    """22 September 2026 — the memory a journey's legs belong to.
+
+    The bounded legs were handed no memory name at all, on the reasoning that
+    they run in the project's own folder and would read the same declaration
+    there. A review showed what that missed: the worktree is not the commit the
+    work started from. With one name recorded in the ledger and another in the
+    worktree, the child used the worktree's.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_name_on_the_build_row_rides_every_leg(self) -> None:
+        dispatch = _RecordingDispatch()
+        row = _Row()
+        row.memory_project = "recorded_project"  # type: ignore[attr-defined]
+        row.launch_settings = '["SOME_TOOL_CACHE"]'  # type: ignore[attr-defined]
+        adapter = _adapter(dispatch, row=row)
+
+        await adapter(
+            stage=StageClass.TASK_REVIEW,
+            build_id=BUILD_ID,
+            feature_id=None,
+            rationale="MODE_C planner chose task-review",
+        )
+
+        call = dispatch.calls[0]
+        assert call["memory_project"] == "recorded_project"
+        assert call["launch_settings"] == ("SOME_TOOL_CACHE",)
+
+    @pytest.mark.asyncio
+    async def test_a_row_from_before_the_rule_carries_nothing_and_says_so(
+        self,
+    ) -> None:
+        """Nothing recorded is not a guess: the leg is launched with the
+        factory's own list and memory explicitly off."""
+        dispatch = _RecordingDispatch()
+        adapter = _adapter(dispatch, row=_Row())
+
+        await adapter(
+            stage=StageClass.TASK_REVIEW,
+            build_id=BUILD_ID,
+            feature_id=None,
+            rationale="MODE_C planner chose task-review",
+        )
+
+        call = dispatch.calls[0]
+        assert call["memory_project"] is None
+        assert call["launch_settings"] == ()
+
+    @pytest.mark.asyncio
+    async def test_the_dispatcher_only_names_them_when_there_is_something_to_name(
+        self,
+    ) -> None:
+        """A runner written before these existed is called exactly as it was."""
+        seen: dict[str, Any] = {}
+
+        async def _runner(**kwargs: Any) -> Any:
+            seen.update(kwargs)
+            raise RuntimeError("the runner is reached; its answer is not the point")
+
+        result = await dispatch_subprocess_stage(
+            StageClass.TASK_REVIEW,
+            BUILD_ID,
+            correlation_id="corr-1",
+            repo_path=Path("/work/build"),
+            read_allowlist=[Path("/work")],
+            forward_context_builder=object(),
+            worktree_allowlist=object(),
+            stage_log_writer=object(),
+            subprocess_runner=_runner,
+            task_id="TASK-FIX007",
+        )
+
+        assert result.status is StageDispatchStatus.FAILED  # the runner raised
+        assert seen, "the runner was never called"
+        assert "memory_project" not in seen
+        assert "launch_settings" not in seen

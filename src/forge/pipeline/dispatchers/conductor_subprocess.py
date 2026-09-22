@@ -59,6 +59,7 @@ through an injected reader.
 
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 from pathlib import Path
@@ -229,6 +230,38 @@ def mint_stage_correlation_id(
         parts.append(subject)
     parts.append(tail)
     return ":".join(parts)
+
+
+def _memory_project_of(row: Any) -> str | None:
+    """The memory name on a build row, or ``None`` for "not recorded"."""
+    if row is None:
+        return None
+    raw = getattr(row, "memory_project", None)
+    if not isinstance(raw, str):
+        return None
+    return raw.strip() or None
+
+
+def _launch_settings_of(row: Any) -> tuple[str, ...]:
+    """The setting NAMES on a build row; empty when it declares none.
+
+    The row stores what was read as text (a JSON list), so this is the one
+    place that turns it back into names. Anything unreadable is empty: a leg
+    launched with the factory's own list is the honest answer, and it is what a
+    row written before this existed means.
+    """
+    if row is None:
+        return ()
+    raw = getattr(row, "launch_settings", None)
+    if not raw:
+        return ()
+    try:
+        parsed = json.loads(raw) if isinstance(raw, str) else raw
+    except (TypeError, ValueError):
+        return ()
+    if not isinstance(parsed, (list, tuple)):
+        return ()
+    return tuple(str(name) for name in parsed)
 
 
 def make_conductor_subprocess_dispatcher(
@@ -484,6 +517,16 @@ def make_conductor_subprocess_dispatcher(
             timeout_seconds=stage_timeout,
             with_nats_streaming=with_nats_streaming,
             extra_args=extra_args,
+            # WHICH MEMORY THIS JOURNEY'S LEGS BELONG TO, and what else its
+            # project asked to be launched with (22 September 2026). Both are
+            # on the build's own ledger row, copied there from the planning run
+            # that read them out of the project's settings file at the commit
+            # the work started from. A row from before either existed carries
+            # nothing, and the leg then runs with memory explicitly off — never
+            # with the name the journey worktree happens to declare, which is
+            # the fault this closes.
+            memory_project=_memory_project_of(row),
+            launch_settings=_launch_settings_of(row),
         )
 
     return conductor_subprocess_dispatcher
