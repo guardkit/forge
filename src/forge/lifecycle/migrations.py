@@ -50,13 +50,17 @@ from typing import Final
 # the rewrite-on-refusal lane to add the additive ``builds.merge_branch``
 # column — the branch the merge word merges, written by the conductor for a
 # fix journey and empty (meaning ``autobuild/<feature id>``) for every feature
-# build.
+# build; bumped to 12 in the one-true-copy lane (item 1, starting and
+# recording) to add the additive ``start_commit`` / ``target_branch`` columns
+# to BOTH ``planning_runs`` and ``builds`` — where a piece of work started
+# from, and which branch of the remote it is aimed at, decided once. NULL on
+# every pre-existing row and read as "not recorded", never as a guess.
 # Future
 # schema bumps should follow the same pattern: append a sibling
 # ``schema_v{N}.sql`` and add a ``(N, "schema_v{N}.sql")`` entry to
 # ``_MIGRATIONS`` in ascending order. The runner applies every entry whose
 # version is greater than the current ``schema_version`` ledger row.
-_SCHEMA_VERSION: Final[int] = 11
+_SCHEMA_VERSION: Final[int] = 12
 _MIGRATIONS: Final[tuple[tuple[int, str], ...]] = (
     (1, "schema.sql"),
     (2, "schema_v2.sql"),
@@ -89,6 +93,14 @@ _MIGRATIONS: Final[tuple[tuple[int, str], ...]] = (
     # a feature build never writes it and every reader falls back to
     # ``autobuild/<feature id>``.
     (11, "schema_v11.sql"),
+    # v12 (one true copy, item 1 — starting and recording) — the additive
+    # ``start_commit`` and ``target_branch`` columns on ``planning_runs`` and
+    # on ``builds``. Before the starting rule nothing recorded what commit a
+    # piece of work was cut from; now the remote's default branch is fetched
+    # once at the start, the branch is cut from exactly that commit, and these
+    # columns hold it. NULL-able: every historical row reads back as "not
+    # recorded".
+    (12, "schema_v12.sql"),
 )
 
 

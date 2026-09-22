@@ -126,6 +126,11 @@ class _Provider:
 
 
 class _GitRunner:
+    async def fetch_remote_start_point(self, repo_path: str) -> Any:
+        from forge.deploy.candidate_tree import RemoteStartPoint
+
+        return RemoteStartPoint(branch="main", commit="0" * 39 + "1")
+
     async def prepare_branch_and_write(self, *a: Any, **k: Any) -> Any:
         return SimpleNamespace(
             status="success", operation="w", sha="deadbeef", exit_code=0

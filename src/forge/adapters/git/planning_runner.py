@@ -49,6 +49,7 @@ from forge.adapters.git.operations import (
     _failure_stderr,
     commit_all,
 )
+from forge.deploy.candidate_tree import RemoteStartPoint, fetch_remote_start_point
 from forge.planning.handoff import PreCommitHook
 
 logger = logging.getLogger(__name__)
@@ -113,16 +114,41 @@ class WorktreeGitRunner:
             command=command, cwd=cwd, timeout=self._op_timeout_s
         )
 
+    async def fetch_remote_start_point(self, repo_path: str) -> RemoteStartPoint:
+        """Fetch this copy's remote ``origin`` and say where its default branch is.
+
+        The starting rule's one operation (one true copy, item 1,
+        2026-09-21), run here against the copy at ``repo_path``. The answer is
+        a branch and a commit, or one plain sentence saying why there is
+        nothing to start from. Never raises; nothing it does changes the
+        branch the copy has checked out or touches its working folder.
+        """
+        repo = Path(repo_path)
+        if not repo.is_dir():
+            return RemoteStartPoint(
+                refusal=f"there is no copy of this project at {repo_path}"
+            )
+        return await fetch_remote_start_point(repo)
+
     async def prepare_branch_and_write(
         self,
         repo_path: str,
         branch: str,
         file_path: str,
         content: str,
+        *,
+        start_commit: str | None = None,
     ) -> GitOpResult:
         """Prepare ``branch`` in an isolated worktree and commit ``file_path``.
 
         See module docstring for the idempotency / isolation contract.
+
+        ``start_commit`` (one true copy, item 1) is the commit a BRAND NEW
+        branch is cut from — the commit the remote's default branch was at
+        when the work started, which the caller has just fetched. An existing
+        branch is never moved onto it: a branch that is already there is
+        re-attached exactly as before, because moving it would move work that
+        has already begun.
         """
         try:
             repo = Path(repo_path)
@@ -199,6 +225,11 @@ class WorktreeGitRunner:
                 ]
             else:
                 add_cmd = ["git", "worktree", "add", "-b", branch, str(worktree)]
+                if start_commit:
+                    # The named starting point: the branch is cut from the
+                    # commit the caller fetched, never from whatever this copy
+                    # happens to have checked out.
+                    add_cmd.append(str(start_commit))
 
             add_res = await self._execute_timed(command=add_cmd, cwd=str(repo))
             if add_res.exit_code != 0:
@@ -276,6 +307,7 @@ class WorktreeGitRunner:
         *,
         pre_commit: PreCommitHook | None = None,
         expected_head: str | None = None,
+        start_commit: str | None = None,
     ) -> GitOpResult:
         """Write a multi-file tree onto ``branch`` in one commit (Lane B B2).
 
@@ -286,6 +318,9 @@ class WorktreeGitRunner:
         the multi-file write and the optional pre-commit oracle hook.
         When ``expected_head`` is given, prepares from that immutable commit
         and publishes with ``git update-ref`` compare-and-swap.
+        ``start_commit`` (one true copy, item 1) names the commit a BRAND NEW
+        branch is cut from; a branch that already exists is re-attached, never
+        moved onto it.
         """
         logger.info(
             "prepare_branch_and_write_tree: begin branch=%s files=%d repo=%s",
@@ -402,6 +437,8 @@ class WorktreeGitRunner:
                 ]
             else:
                 add_cmd = ["git", "worktree", "add", "-b", branch, str(worktree)]
+                if start_commit:
+                    add_cmd.append(str(start_commit))
 
             add_res = await self._execute_timed(command=add_cmd, cwd=str(repo))
             if add_res.exit_code != 0:

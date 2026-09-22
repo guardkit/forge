@@ -36,10 +36,13 @@ puzzle.
 
 Nothing here runs docker, ``sbx``, or the deploy script.
 
-THE VENUE SEAM (sandbox first, 2026-09-07, rule 89). The five git operations
-the merge press needs — reading a commit, asking whether one commit is in
+THE VENUE SEAM (sandbox first, 2026-09-07, rule 89). The git operations the
+merge press needs — reading a commit, asking whether one commit is in
 another, keeping the laid-out trees out of the checkout's eyes, laying one
-out, removing it — are gathered into one small surface,
+out, removing it — and, since the one-true-copy lane (item 1, 2026-09-21),
+the one operation a NEW piece of work starts with — fetching the project's
+remote and asking where its default branch is — are gathered into one small
+surface,
 :class:`CandidateGit`, so the press can be told WHERE they happen instead of
 assuming they happen here. :class:`InContainerCandidateGit` is this file's own
 functions, called in the order the press has always called them, for every
@@ -54,6 +57,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import shutil
 import subprocess
 import tarfile
@@ -70,9 +74,13 @@ __all__ = [
     "CandidateTreeError",
     "CandidateTreeLayout",
     "InContainerCandidateGit",
+    "REMOTE_NAME",
+    "REMOTE_TIMEOUT_SECONDS",
+    "RemoteStartPoint",
     "candidate_tree_path",
     "candidate_trees_root",
     "ensure_candidate_trees_excluded",
+    "fetch_remote_start_point",
     "git_is_ancestor",
     "git_rev_parse",
     "is_candidate_tree_path",
@@ -159,6 +167,218 @@ async def git_rev_parse(repo_root: Path | str, ref: str) -> str | None:
     except CandidateTreeError as exc:
         logger.warning("candidate tree: %s", exc)
         return None
+
+
+# ---------------------------------------------------------------------------
+# The starting point — the remote's own default branch and where it is
+# (one true copy, item 1, 2026-09-21)
+# ---------------------------------------------------------------------------
+#
+# A new piece of work must start from the commit the project's remote holds,
+# not from whatever the factory's own copy happens to have checked out. This
+# is the one operation that asks: fetch the remote named ``origin``, and say
+# which branch that remote calls its default and which commit that branch is
+# at.
+#
+# WHY ``git ls-remote --symref origin HEAD`` AND NOT THE OTHER TWO WAYS.
+# ``git symbolic-ref refs/remotes/origin/HEAD`` reads a ref this copy wrote
+# when it was cloned: it answers even when the remote is gone, and it goes on
+# answering the old branch after the remote's default changes, so it cannot
+# tell the truth about the remote. ``git remote show origin`` does ask the
+# remote, but it is porcelain meant for a person to read and its wording is
+# free to change. ``ls-remote --symref`` is plumbing, it asks the remote
+# itself, and it works against a bare repository on a local path exactly as
+# it does against one reached over a network — which is what lets every case
+# here be driven without touching anybody's real repository.
+#
+# Nothing here knows what the project contains, who hosts the remote, or what
+# the default branch is called. Two facts are used and no others: there is a
+# remote named ``origin``, and that remote says which branch is its default.
+
+#: The one remote a project's copy is asked about. A copy that has no remote
+#: by this name is refused, not guessed at.
+REMOTE_NAME: str = "origin"
+
+#: How long a command that talks to the remote may take.
+REMOTE_TIMEOUT_SECONDS: float = 180.0
+
+#: The shape a branch name must have before it is put on a git command line:
+#: it starts with a letter or a digit (so it can never be read as an option)
+#: and carries only the characters branch names use.
+_REMOTE_BRANCH_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/\-]*$")
+
+
+@dataclass(frozen=True)
+class RemoteStartPoint:
+    """Where a new piece of work starts, or one plain sentence saying why not.
+
+    ``branch`` and ``commit`` are the remote's default branch and the commit
+    it is at, both filled in when the answer is yes. ``refusal`` is filled in
+    instead when there is nothing to start from — no remote of that name, a
+    remote that could not be reached, a remote that names no default branch,
+    or a branch that could not be fetched. Exactly one of the two sides is
+    ever filled in, and the sentence is written for a person to read.
+    """
+
+    branch: str | None = None
+    commit: str | None = None
+    refusal: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        """True when this is a starting point rather than a refusal."""
+        return bool(self.branch and self.commit and not self.refusal)
+
+    def to_wire(self) -> dict[str, Any]:
+        """The answer as the sandbox's helper service sends it."""
+        return {"branch": self.branch, "commit": self.commit, "refusal": self.refusal}
+
+    @classmethod
+    def from_wire(cls, decoded: Any) -> "RemoteStartPoint":
+        """The answer as it came back, or a refusal saying it made no sense."""
+        if not isinstance(decoded, dict):
+            return cls(
+                refusal="the answer was not an object with a starting point in it"
+            )
+        branch = decoded.get("branch")
+        commit = decoded.get("commit")
+        refusal = decoded.get("refusal")
+        if isinstance(refusal, str) and refusal.strip():
+            return cls(refusal=refusal.strip())
+        if not isinstance(branch, str) or not branch.strip():
+            return cls(refusal="the answer named no branch and gave no reason")
+        if not isinstance(commit, str) or not commit.strip():
+            return cls(refusal="the answer named no commit and gave no reason")
+        return cls(branch=branch.strip(), commit=commit.strip())
+
+
+def _git_said(done: "subprocess.CompletedProcess[str]") -> str:
+    """What git said, in one line, for a sentence a person reads.
+
+    Git says the useful thing FIRST and then advises ("Please make sure you
+    have the correct access rights / and the repository exists"), so the first
+    ``fatal:`` line is taken where there is one — quoting the last line would
+    hand a person the tail of a sentence with no subject.
+    """
+    said = ((done.stderr or "") + "\n" + (done.stdout or "")).strip().splitlines()
+    lines = [line.strip() for line in said if line.strip()]
+    if not lines:
+        return f"exit code {done.returncode}"
+    for line in lines:
+        if line.lower().startswith("fatal:") or line.lower().startswith("error:"):
+            return line
+    return lines[0]
+
+
+def _run_git(repo_root: Path, *args: str) -> "subprocess.CompletedProcess[str]":
+    """One git command, fixed argv, no shell, bounded."""
+    return subprocess.run(  # noqa: S603 — fixed argv, no shell
+        ["git", "-C", str(repo_root), *args],
+        capture_output=True,
+        text=True,
+        timeout=REMOTE_TIMEOUT_SECONDS,
+        check=False,
+    )
+
+
+def _fetch_remote_start_point_sync(repo_root: Path) -> RemoteStartPoint:
+    """The four steps, in order, each one's failure ending it with a sentence."""
+    where = str(repo_root)
+    try:
+        named = _run_git(repo_root, "remote", "get-url", REMOTE_NAME)
+        if named.returncode != 0:
+            return RemoteStartPoint(
+                refusal=(
+                    f"the copy of this project at {where} has no remote named "
+                    f"'{REMOTE_NAME}', so there is nothing to start the work "
+                    f"from. Add that remote to the copy, then ask again."
+                )
+            )
+
+        asked = _run_git(repo_root, "ls-remote", "--symref", REMOTE_NAME, "HEAD")
+        if asked.returncode != 0:
+            return RemoteStartPoint(
+                refusal=(
+                    f"the remote named '{REMOTE_NAME}' could not be reached "
+                    f"from {where}, so the work cannot be started from it: "
+                    f"{_git_said(asked)}"
+                )
+            )
+
+        branch: str | None = None
+        for line in (asked.stdout or "").splitlines():
+            stripped = line.strip()
+            if stripped.startswith("ref:"):
+                rest = stripped[len("ref:") :].strip().split()
+                ref = rest[0] if rest else ""
+                if ref.startswith("refs/heads/"):
+                    branch = ref[len("refs/heads/") :]
+                break
+        if not branch or not _REMOTE_BRANCH_PATTERN.match(branch):
+            return RemoteStartPoint(
+                refusal=(
+                    f"the remote named '{REMOTE_NAME}' does not say which "
+                    f"branch is its default, so there is nothing to start the "
+                    f"work from. Set that remote's default branch, then ask "
+                    f"again."
+                )
+            )
+
+        fetched = _run_git(
+            repo_root,
+            "fetch",
+            "--no-tags",
+            REMOTE_NAME,
+            f"+refs/heads/{branch}:refs/remotes/{REMOTE_NAME}/{branch}",
+        )
+        if fetched.returncode != 0:
+            return RemoteStartPoint(
+                refusal=(
+                    f"the branch '{branch}' could not be fetched from the "
+                    f"remote named '{REMOTE_NAME}': {_git_said(fetched)}"
+                )
+            )
+
+        read = _run_git(
+            repo_root,
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            f"refs/remotes/{REMOTE_NAME}/{branch}^{{commit}}",
+        )
+        commit = (read.stdout or "").strip()
+        if read.returncode != 0 or not commit:
+            return RemoteStartPoint(
+                refusal=(
+                    f"the branch '{branch}' was fetched from the remote named "
+                    f"'{REMOTE_NAME}' but git could not say which commit it is "
+                    f"at: {_git_said(read)}"
+                )
+            )
+        return RemoteStartPoint(branch=branch, commit=commit)
+    except OSError as exc:
+        return RemoteStartPoint(
+            refusal=f"git could not be run in {where}: {type(exc).__name__}: {exc}"
+        )
+    except subprocess.TimeoutExpired:
+        return RemoteStartPoint(
+            refusal=(
+                f"the remote named '{REMOTE_NAME}' did not answer within "
+                f"{REMOTE_TIMEOUT_SECONDS:.0f} seconds, so the work cannot be "
+                f"started from it"
+            )
+        )
+
+
+async def fetch_remote_start_point(repo_root: Path | str) -> RemoteStartPoint:
+    """Fetch ``origin``'s default branch and say which commit it is at.
+
+    Never raises: everything that can go wrong comes back as ``refusal`` with
+    one plain sentence in it. Nothing this does changes the branch the copy
+    has checked out or writes anything into its working folder — it updates
+    one remote-tracking ref and reads it.
+    """
+    return await asyncio.to_thread(_fetch_remote_start_point_sync, Path(repo_root))
 
 
 def _materialise_sync(repo_root: Path, dest: Path, sha: str) -> None:
@@ -348,7 +568,7 @@ class CandidateTreeLayout:
 
 @runtime_checkable
 class CandidateGit(Protocol):
-    """The merge press's five git operations, wherever they happen.
+    """One repository's git operations, wherever they happen.
 
     One repository, one surface. Every implementation is written never to
     raise except where the press already expects a raise
@@ -359,6 +579,14 @@ class CandidateGit(Protocol):
 
     async def rev_parse(self, ref: str) -> str | None:
         """The commit (or tree) ``ref`` names, or ``None``."""
+
+    async def fetch_remote_start_point(self) -> RemoteStartPoint:
+        """Fetch the remote named ``origin`` and say where its default branch is.
+
+        The starting rule's one operation (one true copy, item 1): the answer
+        is a branch and a commit, or a plain-sentence refusal. It never raises,
+        never changes a checked-out branch and never touches a working folder.
+        """
 
     async def is_ancestor(self, ancestor: str, descendant: str) -> bool | None:
         """Is ``ancestor`` in ``descendant``? ``None`` = git could not say."""
@@ -415,6 +643,9 @@ class InContainerCandidateGit:
 
     async def rev_parse(self, ref: str) -> str | None:
         return await git_rev_parse(self._repo_root, ref)
+
+    async def fetch_remote_start_point(self) -> RemoteStartPoint:
+        return await fetch_remote_start_point(self._repo_root)
 
     async def is_ancestor(self, ancestor: str, descendant: str) -> bool | None:
         return await git_is_ancestor(self._repo_root, ancestor, descendant)

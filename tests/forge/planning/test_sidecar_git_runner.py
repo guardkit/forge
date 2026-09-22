@@ -340,11 +340,17 @@ class _Recording:
         self.name = name
         self.calls: list[tuple[str, str]] = []
 
-    async def prepare_branch_and_write(self, repo_path: str, branch: str, file_path: str, content: str) -> GitOpResult:
+    async def fetch_remote_start_point(self, repo_path: str) -> Any:
+        from forge.deploy.candidate_tree import RemoteStartPoint
+
+        self.calls.append(("start-point", repo_path))
+        return RemoteStartPoint(branch="main", commit="0" * 39 + "1")
+
+    async def prepare_branch_and_write(self, repo_path: str, branch: str, file_path: str, content: str, *, start_commit: str | None = None) -> GitOpResult:
         self.calls.append(("single", repo_path))
         return GitOpResult(status="success", operation="prepare_branch_and_write", sha=self.name, exit_code=0)
 
-    async def prepare_branch_and_write_tree(self, repo_path: str, branch: str, files: Any, message: str, *, pre_commit: Any = None) -> GitOpResult:
+    async def prepare_branch_and_write_tree(self, repo_path: str, branch: str, files: Any, message: str, *, pre_commit: Any = None, start_commit: str | None = None) -> GitOpResult:
         self.calls.append(("tree", repo_path))
         return GitOpResult(status="success", operation="prepare_branch_and_write_tree", sha=self.name, exit_code=0)
 

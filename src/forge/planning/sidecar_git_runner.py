@@ -8,7 +8,8 @@ plan stage's pre-commit checks run as a Python closure beside them. For a
 repository that has a sandbox, this module's :class:`SidecarGitRunner` makes
 the same commits over HTTP against the deploy sidecar running inside that
 sandbox (``POST /git/prepare-branch-and-write-tree``, ``/git/read-file-from-
-branch``, ``/git/rev-parse``), on the factory's own clone.
+branch``, ``/git/rev-parse``, ``/git/remote-start-point``), on the factory's
+own clone.
 
 Two things differ from the in-container runner, and both are said out loud:
 
@@ -50,6 +51,7 @@ from typing import Any
 from pydantic import Field
 
 from forge.adapters.git.models import GitOpResult
+from forge.deploy.candidate_tree import RemoteStartPoint
 from forge.planning.handoff import (
     PreCommitCheckOutcome,
     PreCommitChecks,
@@ -184,12 +186,41 @@ class SidecarGitRunner:
 
     # -- the protocol --------------------------------------------------------
 
+    async def fetch_remote_start_point(self, repo_path: str) -> RemoteStartPoint:
+        """The starting rule's operation, run on the clone inside the sandbox.
+
+        ``{repo}`` to ``/git/remote-start-point``; the answer is a branch and
+        a commit, or one plain sentence. A sandbox that could not be reached
+        is itself a refusal, so the driver never has to tell "no answer" from
+        "no remote". Never raises.
+        """
+        answer = await self._call(
+            "/git/remote-start-point",
+            {"repo": self._repo},
+            timeout=self._read_timeout_s,
+        )
+        if isinstance(answer, Exception):
+            sentence = self._transport_sentence("/git/remote-start-point", answer)
+            logger.error("fetch_remote_start_point: %s", sentence)
+            return RemoteStartPoint(refusal=sentence)
+        status, decoded = answer
+        if status != 200 or not isinstance(decoded, dict):
+            sentence = self._refusal_sentence(status, decoded)
+            logger.error("fetch_remote_start_point: %s", sentence)
+            return RemoteStartPoint(refusal=sentence)
+        start = RemoteStartPoint.from_wire(decoded)
+        if not start.ok:
+            logger.warning("fetch_remote_start_point: %s", start.refusal)
+        return start
+
     async def prepare_branch_and_write(
         self,
         repo_path: str,
         branch: str,
         file_path: str,
         content: str,
+        *,
+        start_commit: str | None = None,
     ) -> GitOpResult:
         """The single-file form: the tree route with one file and the same
         message the in-container runner writes."""
@@ -198,6 +229,7 @@ class SidecarGitRunner:
             branch,
             {file_path: content},
             f"planning: add {file_path} (Mode P planned handoff)",
+            start_commit=start_commit,
         )
         return result.model_copy(update={"operation": _SINGLE_OPERATION})
 
@@ -209,6 +241,7 @@ class SidecarGitRunner:
         message: str,
         *,
         pre_commit: Any = None,
+        start_commit: str | None = None,
     ) -> SidecarGitOpResult:
         """Write ``files`` onto ``branch`` in one commit on the sandbox's clone,
         with the declared checks run there first.
@@ -240,6 +273,11 @@ class SidecarGitRunner:
             "message": message,
             "checks": pre_commit.to_wire() if pre_commit is not None else [],
         }
+        if start_commit:
+            # The named starting point (one true copy, item 1): the sandbox
+            # cuts a brand new branch from this commit, and leaves a branch
+            # that already exists exactly where it is.
+            body["start_commit"] = str(start_commit)
         logger.info(
             "%s: %d file(s) onto %s for %s via %s (%d declared check(s); "
             "repo_path %s is the sandbox's to resolve)",
@@ -394,11 +432,23 @@ class RepoRoutedGitRunner:
         """Only a per-repository answer is meaningful: ask ``runner_for``."""
         return False
 
+    async def fetch_remote_start_point(self, repo_path: str) -> RemoteStartPoint:
+        """The starting rule's operation, routed exactly as the others are."""
+        return await self.runner_for_path(repo_path).fetch_remote_start_point(
+            repo_path
+        )
+
     async def prepare_branch_and_write(
-        self, repo_path: str, branch: str, file_path: str, content: str
+        self,
+        repo_path: str,
+        branch: str,
+        file_path: str,
+        content: str,
+        *,
+        start_commit: str | None = None,
     ) -> GitOpResult:
         return await self.runner_for_path(repo_path).prepare_branch_and_write(
-            repo_path, branch, file_path, content
+            repo_path, branch, file_path, content, start_commit=start_commit
         )
 
     async def prepare_branch_and_write_tree(
@@ -409,9 +459,15 @@ class RepoRoutedGitRunner:
         message: str,
         *,
         pre_commit: Any = None,
+        start_commit: str | None = None,
     ) -> GitOpResult:
         return await self.runner_for_path(repo_path).prepare_branch_and_write_tree(
-            repo_path, branch, files, message, pre_commit=pre_commit
+            repo_path,
+            branch,
+            files,
+            message,
+            pre_commit=pre_commit,
+            start_commit=start_commit,
         )
 
     async def read_file_from_branch(

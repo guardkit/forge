@@ -46,14 +46,24 @@ class RecordingGitRunner:
     existing_branch: str | None = None
     existing_file_content: str | None = None
 
+    async def fetch_remote_start_point(self, repo_path: str) -> Any:
+        """The starting rule's operation: a stand-in remote's default branch."""
+        from forge.deploy.candidate_tree import RemoteStartPoint
+
+        self.start_point_calls = getattr(self, "start_point_calls", 0) + 1
+        return RemoteStartPoint(branch="main", commit="0" * 39 + "1")
+
     async def prepare_branch_and_write(
         self,
         repo_path: str,
         branch: str,
         file_path: str,
         content: str,
+        *,
+        start_commit: str | None = None,
     ) -> GitOpResult:
         """Fake implementation that records calls."""
+        self.start_commit_seen = start_commit
         self.call_count += 1
         self.branch_created = branch
         self.file_written = file_path

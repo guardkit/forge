@@ -257,8 +257,11 @@ class TestBootLogEmitsAppliedCount:
         # the list of sentences the factory has been asked for and has not
         # started yet; schema_v11.sql added by Part M of the rewrite-on-refusal
         # lane for the builds.merge_branch column — the branch the merge word
-        # merges, recorded by the conductor for a fix journey) → applied=11.
-        assert "applied 11" in applied_lines[0], applied_lines[0]
+        # merges, recorded by the conductor for a fix journey; schema_v12.sql
+        # added by the one-true-copy lane for the start_commit / target_branch
+        # columns on planning_runs and builds — where a piece of work started
+        # from, and which branch of the remote it is aimed at) → applied=12.
+        assert "applied 12" in applied_lines[0], applied_lines[0]
 
 
 # ---------------------------------------------------------------------------
