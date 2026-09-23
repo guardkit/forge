@@ -37,21 +37,46 @@ e. **On its own start the executor accepts nothing until it has reconciled.**
    and treated exactly as if the executor had never restarted. None alive ⇒
    the note is cleared, and the next holder reads what is running before it
    acts.
-f. **Notes missing or unreadable is not an empty slot.** The executor looks
-   for any process carrying a deploy marker for that target; found ⇒ occupied;
-   cannot tell ⇒ deploys for that target are refused and the refusal says why.
-   When it can show that nothing is alive, it CONFIRMS the target's current
-   counter and owning build **with the coordinator** — a question put to the
-   coordinator's own read-only answer, not the counter the delayed request
-   presents, because a delayed request presenting an old counter cannot
-   establish who owns the target. (This is the point the design's sign-off
-   note asks reviewers to watch.)
+f. **Notes missing or unreadable is not an empty slot.** MISSING and
+   unreadable are the same case and are treated the same way, because the
+   executor cannot tell a note it never wrote from a note it has lost. Either
+   way it looks for any process carrying a deploy marker for that target;
+   found ⇒ occupied; cannot tell ⇒ deploys for that target are refused and the
+   refusal says why. When it can show that nothing is alive, it CONFIRMS the
+   target's current counter and owning build **with the coordinator** — a
+   question put to the coordinator's own read-only answer, not the counter the
+   delayed request presents, because a delayed request presenting an old
+   counter cannot establish who owns the target. (This is the point the
+   design's sign-off note asks reviewers to watch.)
+
+   WITH NOBODY TO ASK, the two ends of this are not the same, and the
+   difference is the one fact the executor does have: the coordinator read
+   what is running on the target under the lock, and says on the request
+   whether anything is. Something is running there ⇒ a deploy has happened
+   before, so a note SHOULD exist, so its absence is a loss and the request is
+   refused. Nothing has ever run there and nothing is alive ⇒ there is nothing
+   to take over and the first deploy of a target is accepted. Without that
+   line the very first deploy of every target would need a coordinator to
+   answer a question about a target it has never heard of, and the deploy path
+   would be dead on the day it is installed.
 g. **Every deploy command gets a hard time limit**, and the deploy step's
    lease in the ledger is longer than it, so a healthy deploy is not taken
    over.
 h. **The environment door.** The child's environment is built from the named
    list, plus the recorded memory name and the project's own declared setting
    names carried on the request. It is never a copy of this process's own.
+
+WHAT THIS ASKS OF A PROJECT'S DEPLOY STEP, said plainly because it is a
+contract and not an implementation detail. The slot is the life of the
+command's PROCESS GROUP, so when the step returns, the whole group is stopped
+and confirmed gone before the slot is released. A step that leaves a process of
+its own running in that group — a server started in the foreground's own
+group, say — has it stopped. A project's deploy step must therefore finish its
+changes before it returns, and whatever it leaves running must live somewhere
+of its own: its own session, a service manager, a container. This is the same
+requirement the design makes of the step already ("the deploy step must finish
+its changes before it returns"); it is written here because it binds every
+project and a project cannot read it out of the design.
 
 HOW A COMMAND IS IDENTIFIED, and why it is not a process number. Process
 numbers are reused. The identity is three things together: the process GROUP,
@@ -97,6 +122,7 @@ __all__ = [
     "DEPLOY_MARKER_PREFIX",
     "DEFAULT_COMMAND_SECONDS",
     "DEFAULT_STOP_CONFIRM_SECONDS",
+    "NOTES_SETTING_NAME",
     "DeployExecutor",
     "DeployRequest",
     "ExecutorAnswer",
@@ -106,6 +132,11 @@ __all__ = [
     "the_marker_for",
 ]
 
+
+#: The setting that names the folder these notes live in. It is defined here,
+#: beside the thing that writes them, so that a refusal about the folder can
+#: name the setting an operator has to set. The service reads it.
+NOTES_SETTING_NAME: str = "FORGE_DEPLOY_NOTES_DIR"
 
 #: What a deploy command's argument list carries so it can be found again with
 #: no notes at all. It names the TARGET, because "is anything deploying to
@@ -140,8 +171,22 @@ def the_marker_for(target: str, unique: str | None = None) -> str:
 
 
 def _target_in(marker: str) -> str:
-    parts = str(marker).split(":")
-    return parts[1] if len(parts) > 2 else ""
+    """The target a marker names, or ``""``.
+
+    A target name may itself carry colons — the factory composes one out of a
+    project and the environment its profile declares, with ``::`` between them
+    — so the marker is taken apart from BOTH ends rather than split: the
+    prefix off the front, the unique part off the back, and what is left is
+    the target exactly as the note file's own name spells it. Splitting on
+    colons truncated the name at its first one, which made a live command look
+    like one for a target nobody had asked about.
+    """
+    text = str(marker)
+    head = f"{DEPLOY_MARKER_PREFIX}:"
+    if not text.startswith(head):
+        return ""
+    target, _, unique = text[len(head) :].rpartition(":")
+    return target if unique else ""
 
 
 # ---------------------------------------------------------------------------
@@ -289,6 +334,14 @@ class DeployRequest:
     timeout: float = DEFAULT_COMMAND_SECONDS
     identity: str | None = None
     identity_setting: str | None = None
+    #: Does the COORDINATOR say something is already running on this target?
+    #: It read that under the lock, off the target's own row, before it made
+    #: this request. It is used for one thing only, and only when the
+    #: executor's own note for the target is gone and nobody can be asked:
+    #: something is running ⇒ a deploy happened before ⇒ a note should exist
+    #: ⇒ its absence is a loss and the request is refused. It can only make
+    #: the executor stricter, never more permissive (rule f).
+    something_is_running: bool = False
 
 
 @dataclass(frozen=True)
@@ -406,6 +459,14 @@ class DeployExecutor:
         #: Targets whose notes could not be read and whose slot could not be
         #: settled. Deploys for these are refused until somebody looks.
         self._cannot_tell: dict[str, str] = {}
+        #: Set when the notes folder itself cannot be read OR written. Both
+        #: are the same ending: an executor that cannot write its note down
+        #: cannot find its own command again, so it starts nothing. Proved at
+        #: reconcile time rather than discovered on the first deploy, because
+        #: "the folder is not writable by this user" is an operator's fact and
+        #: should be said at the service's start, not in the middle of a
+        #: merge.
+        self._folder_problem: str | None = None
         self._reconciled = False
 
     # -- the notes ---------------------------------------------------------
@@ -497,6 +558,30 @@ class DeployExecutor:
                 return False
         return True
 
+    def _targets_alive_with_no_note(self, files: "list[Path]") -> list[str]:
+        """Targets a live deploy marker names that no note file accounts for.
+
+        The marker's middle part is the target with the characters a file name
+        cannot carry replaced — the same transformation the note file's own
+        name gets — so the two are compared as they stand. ``[]`` when the
+        process table cannot be read: "cannot tell" is answered per request by
+        :meth:`_settle_the_slot`, which refuses, rather than guessed at here.
+        """
+        alive = self._table.carrying(f"{DEPLOY_MARKER_PREFIX}:")
+        if not alive:
+            return []
+        accounted = {path.stem for path in files}
+        found: list[str] = []
+        for pid in alive:
+            line = self._table.command_of(pid) or ""
+            for piece in line.split():
+                if not piece.startswith(f"{DEPLOY_MARKER_PREFIX}:"):
+                    continue
+                stem = _target_in(piece)
+                if stem and stem not in accounted and stem not in found:
+                    found.append(stem)
+        return found
+
     def _anything_for(self, target: str) -> bool | None:
         """Is ANY process carrying a deploy marker for this target? (rule f)"""
         safe = _SAFE_TARGET.sub("-", str(target).strip()) or "unnamed-target"
@@ -577,6 +662,10 @@ class DeployExecutor:
             self._root.mkdir(parents=True, exist_ok=True)
             files = sorted(self._root.glob("*.json"))
         except OSError as exc:
+            self._folder_problem = (
+                f"the executor's notes folder {self._root} could not be read "
+                f"({exc})"
+            )
             logger.error(
                 "deploy executor: its own notes folder %s could not be read "
                 "(%s) — every deploy is refused until somebody looks",
@@ -584,7 +673,26 @@ class DeployExecutor:
                 exc,
             )
             self._reconciled = True
-            return {"*": f"the executor's notes folder could not be read ({exc})"}
+            return {"*": self._folder_problem}
+        # CAN IT BE WRITTEN? A folder that can be read and not written fails
+        # later, once, in the middle of a deploy, with a note that could not be
+        # written. Proved here instead, so it is said at the service's start.
+        probe = self._root / f".writable.{os.getpid()}.{uuid.uuid4().hex}"
+        try:
+            probe.write_text("", encoding="utf-8")
+        except OSError as exc:
+            self._folder_problem = (
+                f"the executor's notes folder {self._root} cannot be written "
+                f"({exc}) — it is named by {NOTES_SETTING_NAME}, and without "
+                "it the executor cannot write down what it is about to deploy "
+                "and so will start nothing"
+            )
+            logger.error("deploy executor: %s", self._folder_problem)
+        else:
+            try:
+                probe.unlink()
+            except OSError:
+                pass
         for path in files:
             try:
                 decoded = json.loads(path.read_text(encoding="utf-8"))
@@ -633,6 +741,27 @@ class DeployExecutor:
             else:
                 self._clear_note(note)
                 settled[note.target] = "cleared"
+        # AND THE TARGETS WITH NO NOTE AT ALL (rule f, the missing half). The
+        # walk above can only see targets this executor has a file for, so a
+        # helper that came back onto an empty folder — a fresh one, a folder
+        # that was not durable, a note somebody removed — would have settled
+        # NOTHING while a deploy command of its own was still alive. The
+        # command carries its marker in its argument list for exactly this, so
+        # the process table is swept for markers no note accounts for. Nothing
+        # is written into the refusal list here: a request names the target
+        # itself and the same question is asked again, properly keyed, by
+        # :meth:`_settle_the_slot`.
+        for stem in self._targets_alive_with_no_note(files):
+            settled[stem] = (
+                "occupied (a deploy marker is alive and no note accounts for it)"
+            )
+            logger.error(
+                "deploy executor: a process carrying a deploy marker for %s is "
+                "alive and this executor has no note of it — its notes did not "
+                "survive. The slot is OCCUPIED, not empty, and deploys for it "
+                "are refused until that command has gone",
+                stem,
+            )
         self._reconciled = True
         logger.info("deploy executor: reconciled %s", settled or "(nothing to settle)")
         return settled
@@ -679,7 +808,12 @@ class DeployExecutor:
             )
 
         with self._gate:
-            settled = self._settle_the_slot(target, counter, request.build)
+            settled = self._settle_the_slot(
+                target,
+                counter,
+                request.build,
+                something_is_running=bool(request.something_is_running),
+            )
             if settled is not None:
                 return settled
             note = self._start(request, counter=counter, target=target)
@@ -695,9 +829,20 @@ class DeployExecutor:
     # -- the slot ----------------------------------------------------------
 
     def _settle_the_slot(
-        self, target: str, counter: int, build: str
+        self,
+        target: str,
+        counter: int,
+        build: str,
+        *,
+        something_is_running: bool = False,
     ) -> ExecutorAnswer | None:
         """``None`` = the slot is this request's. Anything else is a refusal."""
+        if self._folder_problem:
+            return ExecutorAnswer(
+                accepted=False,
+                word="the-executors-notes-folder-cannot-be-used",
+                sentence=f"{self._folder_problem}. Nothing was deployed.",
+            )
         refused = self._cannot_tell.get(target)
         if refused:
             return ExecutorAnswer(
@@ -706,39 +851,25 @@ class DeployExecutor:
                 sentence=f"{refused} Nothing was deployed.",
             )
         note, unreadable = self._read_note(target)
-        if unreadable is not None:
-            # RULE (f). A note that cannot be read is NOT an empty slot.
-            anything = self._anything_for(target)
-            if anything is None:
-                self._cannot_tell[target] = (
-                    f"{unreadable}, and whether anything is still deploying to "
-                    f"{target} could not be told either"
-                )
-                return ExecutorAnswer(
-                    accepted=False,
-                    word="the-slot-cannot-be-settled",
-                    sentence=(
-                        f"{unreadable}, and whether anything is still "
-                        f"deploying to {target} could not be told either, so "
-                        "deploys for it are refused until somebody looks. "
-                        "Nothing was deployed."
-                    ),
-                )
-            if anything is True:
-                return ExecutorAnswer(
-                    accepted=False,
-                    word="the-slot-is-occupied",
-                    sentence=(
-                        f"{unreadable}, and a process carrying a deploy marker "
-                        f"for {target} is still alive, so the slot is occupied "
-                        "and nothing was deployed."
-                    ),
-                )
-            # Nothing is alive. The counter and the owning build are CONFIRMED
-            # WITH THE COORDINATOR, not taken from this request: a delayed
-            # request presenting an old counter cannot establish who owns the
-            # target.
-            return self._confirm_with_the_coordinator(target, counter, build)
+        if note is None:
+            # RULE (f). MISSING and unreadable are the SAME case, and this is
+            # the hole the stage's reviewer drove through: a note that is
+            # absent used to fall straight through to "accepted", so a deploy
+            # command whose note had been removed — or a helper that came back
+            # onto an empty notes folder — had a second command started beside
+            # it. The executor cannot tell a note it never wrote from a note it
+            # has lost, so it does not try: it looks.
+            why = unreadable or (
+                f"this executor has no note of its own for {target}"
+            )
+            return self._slot_with_no_note(
+                target,
+                counter,
+                build,
+                why=why,
+                its_notes_were_unreadable=unreadable is not None,
+                something_is_running=something_is_running,
+            )
 
         highest = self._highest(note)
         if counter < highest:
@@ -752,7 +883,7 @@ class DeployExecutor:
                     "so nothing was deployed."
                 ),
             )
-        if note is not None and counter == highest:
+        if counter == highest:
             # AN EQUAL COUNTER FROM A DIFFERENT BUILD IS REFUSED (rule a). The
             # build it was granted to is remembered whether or not that
             # build's command is still running, because a second build
@@ -771,7 +902,7 @@ class DeployExecutor:
                     ),
                 )
 
-        if note is None or not note.group:
+        if not note.group:
             return None
 
         alive = self._alive(note)
@@ -822,6 +953,91 @@ class DeployExecutor:
             counter,
         )
         self._clear_note(note)
+        return None
+
+    def _slot_with_no_note(
+        self,
+        target: str,
+        counter: int,
+        build: str,
+        *,
+        why: str,
+        its_notes_were_unreadable: bool,
+        something_is_running: bool,
+    ) -> ExecutorAnswer | None:
+        """RULE (f) whole: a note that is not there is not an empty slot.
+
+        The order is the design's. Look for a live deploy marker first, because
+        that is the question with a fact behind it and the one that stops a
+        second command starting beside a live one. Only when nothing is alive
+        does ownership come up at all, and then it is the COORDINATOR that
+        answers it and never this request.
+
+        The last branch is the one place this goes beyond the design's words,
+        and it is written out in the module's own (f) above: with nobody to
+        ask, a target that has never had anything running on it has nothing to
+        take over, and a target that has is a target whose note has been LOST.
+        """
+        anything = self._anything_for(target)
+        if anything is None:
+            self._cannot_tell[target] = (
+                f"{why}, and whether anything is still deploying to {target} "
+                "could not be told either"
+            )
+            return ExecutorAnswer(
+                accepted=False,
+                word="the-slot-cannot-be-settled",
+                sentence=(
+                    f"{why}, and whether anything is still deploying to "
+                    f"{target} could not be told either, so deploys for it are "
+                    "refused until somebody looks. Nothing was deployed."
+                ),
+            )
+        if anything is True:
+            return ExecutorAnswer(
+                accepted=False,
+                word="the-slot-is-occupied",
+                sentence=(
+                    f"{why}, and a process carrying a deploy marker for "
+                    f"{target} is still alive, so the slot is occupied and "
+                    "nothing was deployed."
+                ),
+            )
+        # Nothing is alive. The counter and the owning build are CONFIRMED
+        # WITH THE COORDINATOR, not taken from this request: a delayed request
+        # presenting an old counter cannot establish who owns the target.
+        if self._ask is not None:
+            return self._confirm_with_the_coordinator(target, counter, build)
+        if its_notes_were_unreadable or something_is_running:
+            return ExecutorAnswer(
+                accepted=False,
+                word="nobody-can-be-asked-who-owns-it",
+                sentence=(
+                    f"{why}"
+                    + (
+                        f", and the coordinator says something is already "
+                        f"running on {target}, so a note of it should exist "
+                        "and this executor has lost it"
+                        if something_is_running and not its_notes_were_unreadable
+                        else ""
+                    )
+                    + ". It has no way to ask the coordinator who owns the "
+                    "target, so it cannot accept a counter on this request's "
+                    "word alone. Nothing was deployed."
+                ),
+            )
+        # NOTHING HAS EVER RUN ON THIS TARGET and nothing is alive on it: the
+        # first deploy of a target this executor has never seen. There is no
+        # holder to take over from and no counter to lose, so it is accepted —
+        # and said out loud, because it is the one path where a missing note
+        # is not treated as a loss.
+        logger.info(
+            "deploy executor: %s has no note here and nothing has ever run on "
+            "it, so counter %s for build %s is its first deploy",
+            target,
+            counter,
+            build,
+        )
         return None
 
     def _confirm_with_the_coordinator(
@@ -1045,6 +1261,16 @@ class DeployExecutor:
         output = (output_bytes or b"").decode("utf-8", errors="replace")
         # RULE (d): the note is cleared only after every process of the command
         # is confirmed gone — not when the one we spawned returned.
+        #
+        # AND THIS STOPS THE WHOLE GROUP, on the ordinary success path too.
+        # That is a contract on every project's deploy step and it is named in
+        # this module's own docstring: the slot is the life of the process
+        # GROUP, so anything the step leaves running in its own group is
+        # stopped when the step returns. A step must finish its changes before
+        # it returns, and what it leaves running must live somewhere of its
+        # own — its own session, a service manager, a container. The
+        # alternative is worse: a slot released while something of the command
+        # is still alive is the very thing rule (b) exists to prevent.
         gone, why = self._stop_and_confirm(note)
         with self._gate:
             if gone:
@@ -1144,4 +1370,5 @@ def request_from(ownership: Any, **defaults: Any) -> DeployRequest | str:
         timeout=float(defaults.get("timeout") or DEFAULT_COMMAND_SECONDS),
         identity=str(identity).strip() if identity else None,
         identity_setting=str(setting).strip() if setting else None,
+        something_is_running=bool(ownership.get("something_is_running")),
     )
