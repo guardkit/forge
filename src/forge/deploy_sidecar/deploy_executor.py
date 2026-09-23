@@ -161,6 +161,7 @@ __all__ = [
     "DEFAULT_STOP_CONFIRM_SECONDS",
     "NOTES_SETTING_NAME",
     "STOPPED_BY_A_TAKEOVER",
+    "NOTHING_WAS_STARTED",
     "DeployExecutor",
     "DeployRequest",
     "ExecutorAnswer",
@@ -200,6 +201,22 @@ _GRACE_SECONDS: float = 5.0
 #: deploy that never happened — and, worse, report the SIGNAL as the deploy
 #: step's own exit code. Whatever reads this must treat it as no deploy at all.
 STOPPED_BY_A_TAKEOVER: str = "the-deploy-command-was-stopped-by-a-takeover"
+
+#: The refusals after which NOTHING WAS STARTED on the target (23 September
+#: 2026). A press that meets one of these has deployed nothing: the target is
+#: owned by a later holder, or an earlier command is still alive, or the older
+#: command could not be confirmed stopped. None of them is "the deploy failed",
+#: and the press reads them all the same way as a takeover: the result stays
+#: "published, deployment pending" with the reason said. One list, so the two
+#: readers cannot drift apart.
+NOTHING_WAS_STARTED: tuple[str, ...] = (
+    STOPPED_BY_A_TAKEOVER,
+    "the-counter-has-moved-on",
+    "that-counter-belongs-to-another-build",
+    "the-slot-is-occupied",
+    "a-command-is-already-running",
+    "the-old-command-could-not-be-confirmed-stopped",
+)
 
 #: The word a note carries while its command is being started — after the note
 #: is written and before the command's process group is known. A note in this

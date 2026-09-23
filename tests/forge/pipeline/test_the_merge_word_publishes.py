@@ -1111,14 +1111,19 @@ class TestTheDeployPutsLiveExactlyWhatWasChecked:
 class _ADeployTheExecutorStopped:
     """A promote leg whose deploy command a takeover stopped part-way.
 
+    Given another executor refusal word, it stands for a deploy the executor
+    refused to START (the slot occupied, the counter moved on, the old command
+    not confirmed stopped): also nothing deployed, also not a failure.
+
     This is exactly what the sidecar's runner hands back when the executor
     answers that its command was stopped by a later holder of the target: a
     failed step whose captured output carries the executor's own word and
     sentence. Nothing ran to an end, and the press must not call it a deploy.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, word: str = STOPPED_BY_A_TAKEOVER) -> None:
         self.calls: list[dict[str, Any]] = []
+        self.word = word
 
     async def __call__(self, **kwargs: Any) -> Any:
         from types import SimpleNamespace
@@ -1146,7 +1151,7 @@ class _ADeployTheExecutorStopped:
             failed_step="deploy_compose",
             detail={
                 "deploy_output": (
-                    f"[{STOPPED_BY_A_TAKEOVER}] the deploy command for "
+                    f"[{self.word}] the deploy command for "
                     f"{owns.get('target')} from build {owns.get('build')} (the "
                     f"target's counter {owns.get('target_counter')}) was stopped "
                     "part-way by a later holder of the target, so it did not run "
@@ -1198,6 +1203,44 @@ class TestACommandATakeoverStoppedIsNoDeploy:
 
         row = DeploymentLockStore(pool.connection).read("acme/widget-shop::live")
         assert row.nothing_is_running is True
+
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "word",
+        [
+            "the-slot-is-occupied",
+            "the-counter-has-moved-on",
+            "that-counter-belongs-to-another-build",
+            "the-old-command-could-not-be-confirmed-stopped",
+        ],
+    )
+    async def test_a_refusal_that_started_nothing_is_not_a_failed_deploy(
+        self,
+        word: str,
+        config_with_publication_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> None:
+        """The second reviewer's finding: only the takeover word was read this
+        way, and every other executor refusal ended the press red with 'the
+        project's own deploy step did not finish', while the record it wrote
+        said 'published, deployment pending'. One event, two readings. Now
+        every refusal after which nothing was started reads the same way."""
+        publisher = _APublisherThatSays([_published("c" * 40)])
+        deploy = _ADeployTheExecutorStopped(word=word)
+        deps = _deps_that_can_deploy(
+            config_with_publication_on, pool, publisher=publisher, deploy=deploy
+        )
+
+        outcome = await _press(deps, repo_root)
+
+        assert outcome.result == "published-deployment-pending", outcome.detail
+        assert outcome.result != "merged-deploy-failed"
+        assert "deployed nothing" in outcome.detail
+        assert word in outcome.detail
+        assert "did not finish" not in outcome.detail
+        assert _record(pool).result == RESULT_PUBLISHED_DEPLOYMENT_PENDING
 
 
 class _ABuildSystemWithCheckJoin:
@@ -1350,3 +1393,14 @@ class TestAReusedJoinIsCheckedWhenTheBuildSystemCan:
         assert "did not pass" in outcome.detail
         assert "Nothing was published" in outcome.detail
         assert publisher.asked == []
+
+
+def test_the_two_lists_of_nothing_was_started_words_are_the_same() -> None:
+    """The press repeats the executor's list by name; they must not drift."""
+    from forge.deploy_sidecar import deploy_executor
+    from forge.pipeline import merge_executor
+
+    assert tuple(merge_executor.NOTHING_WAS_STARTED) == tuple(
+        deploy_executor.NOTHING_WAS_STARTED
+    )
+    assert deploy_executor.STOPPED_BY_A_TAKEOVER in deploy_executor.NOTHING_WAS_STARTED

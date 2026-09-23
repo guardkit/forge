@@ -330,6 +330,17 @@ RESULT_WORD_MERGED_AND_RUNNING: str = "merged-into-the-remote-and-running"
 #: that was stopped part-way is NOT a failed deploy and is certainly not a
 #: deploy: it is no deploy at all, and the press says so.
 STOPPED_BY_A_TAKEOVER: str = "the-deploy-command-was-stopped-by-a-takeover"
+#: Every executor refusal after which nothing was started (the executor's own
+#: list, repeated here by name because the press does not import the sidecar's
+#: module; a test pins the two lists equal).
+NOTHING_WAS_STARTED: tuple[str, ...] = (
+    STOPPED_BY_A_TAKEOVER,
+    "the-counter-has-moved-on",
+    "that-counter-belongs-to-another-build",
+    "the-slot-is-occupied",
+    "a-command-is-already-running",
+    "the-old-command-could-not-be-confirmed-stopped",
+)
 
 
 def _utcnow() -> datetime:
@@ -2393,13 +2404,15 @@ async def execute_merge_deploy(
             # checked and published, and would say the target is in an unknown
             # state when in fact somebody else owns it. It stops at
             # "published, deployment pending" with the reason said.
-            if STOPPED_BY_A_TAKEOVER in said:
+            nothing_started = next((w for w in NOTHING_WAS_STARTED if w in said), None)
+            if nothing_started is not None:
                 logger.warning(
-                    "merge-executor: %s's deploy command on %s was stopped by a "
-                    "later holder of the target — nothing was deployed by this "
-                    "press, and it says so rather than calling it a failure",
+                    "merge-executor: %s's deploy on %s did not start or was stopped "
+                    "(%s) — nothing was deployed by this press, and it says so "
+                    "rather than calling it a failure",
                     build_id,
                     target,
+                    nothing_started,
                 )
                 return _published_deployment_pending(
                     j_commit=j_commit,
@@ -2416,6 +2429,12 @@ async def execute_merge_deploy(
                         f"this press's deploy command on {target} was stopped "
                         "part-way by a later holder of the target, so it did "
                         "not run to an end and nothing was deployed by it"
+                        if nothing_started == STOPPED_BY_A_TAKEOVER
+                        else (
+                            f"this press deployed nothing on {target}: the "
+                            f"executor refused to start a command "
+                            f"('{nothing_started}'), so the target is as it was"
+                        )
                     ),
                 )
             if deployed is None or outcome_word != "complete":
