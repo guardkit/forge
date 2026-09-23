@@ -31,8 +31,10 @@ from forge.pipeline.merge_offer import (
     MERGE_OFFER_STAGE_LABEL,
     MERGE_OFFER_TARGET_IDENTIFIER,
     MergeOfferService,
+    _ask_the_head_reader,
     approval_subject_for,
     git_rev_parse_main,
+    head_reader_takes_a_branch,
     merge_request_id,
     read_baseline_failing,
 )
@@ -516,6 +518,182 @@ class TestGitPin:
         empty = tmp_path / "empty"
         empty.mkdir()
         assert await git_rev_parse_main(empty) is None
+
+
+# ---------------------------------------------------------------------------
+# THE BRANCH THE CARD IS PINNED ON — the build's own recorded one
+# ---------------------------------------------------------------------------
+
+
+def _a_repo_on(root: Path, branch: str) -> str:
+    """A real repository whose only branch is ``branch``. Returns its sha."""
+    root.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "init", "-b", branch], cwd=root, check=True, capture_output=True
+    )
+    (root / "a.txt").write_text("x", encoding="utf-8")
+    _git(root, "add", "a.txt")
+    _git(root, "commit", "-m", "one")
+    return _git(root, "rev-parse", branch)
+
+
+def _record_the_target_branch(
+    pool: SqliteLifecyclePersistence, branch: str, build_id: str = BUILD_ID
+) -> None:
+    pool.connection.execute(
+        "UPDATE builds SET target_branch = ? WHERE build_id = ?", (branch, build_id)
+    )
+    pool.connection.commit()
+
+
+def _an_offer(config: ForgeConfig, pool, recorder: "_Recorder", reader) -> MergeOfferService:
+    return MergeOfferService(
+        config=config,
+        pool=pool,
+        pipeline_publisher=SimpleNamespace(
+            publish_build_paused=recorder.publish_build_paused
+        ),
+        raw_publish=recorder.raw_publish,
+        git_head=reader,
+        git_surface=lambda _repo, _root: _CandidatePins(),
+        finished_feature_reader=lambda *_a, **_k: (
+            None,
+            None,
+            "nothing was exported for this build",
+        ),
+    )
+
+
+class TestTheCardIsPinnedOnTheRecordedBranch:
+    """Carried from stage 4a, and it had no test until now (23 September 2026).
+
+    The card used to be pinned by reading the branch literally called ``main``,
+    and NO CARD is made when the pin cannot be read — so a project whose
+    recorded branch is ``trunk`` could never be offered a merge word at all.
+    The offer reads the build row's own recorded branch now, and this is the
+    proof of both halves, with the real reader against a real repository.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_project_whose_recorded_branch_is_trunk_gets_a_card(
+        self, pool, tmp_path: Path
+    ) -> None:
+        repo_root = tmp_path / "trunk-project"
+        sha = _a_repo_on(repo_root, "trunk")
+        config = ForgeConfig.model_validate(
+            {
+                "permissions": {"filesystem": {"allowlist": ["/tmp"]}},
+                "planning": {"target_repo_paths": {REPO: str(repo_root)}},
+                "merge_executor": {"enabled": True},
+            }
+        )
+        _insert_build(pool)
+        _record_the_target_branch(pool, "trunk")
+        recorder = _Recorder()
+        asked: list[str | None] = []
+
+        async def _the_real_reader(root: Path, branch: str | None = None):
+            asked.append(branch)
+            return await git_rev_parse_main(root, branch)
+
+        await _an_offer(config, pool, recorder, _the_real_reader).maybe_offer(_event())
+
+        # THERE IS A CARD, and it is pinned on trunk's own commit.
+        assert [kind for kind, _ in recorder.events] == ["approval", "paused"]
+        assert asked == ["trunk"]
+        _subject, body = recorder.events[0][1]
+        details = MessageEnvelope.model_validate_json(body).payload["details"]
+        assert details["expect_main_sha"] == sha
+        assert len(_offer_rows(pool)) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_build_with_no_recorded_branch_still_gets_a_card(
+        self, pool, tmp_path: Path
+    ) -> None:
+        """Nothing recorded is a build from before the starting rule.
+
+        There is nothing to read but the remote's own default, so that is what
+        is read — and a card is still offered, which is the point: teaching
+        this to read a recorded branch must not take the card away from every
+        build that has none.
+        """
+        repo_root = tmp_path / "default-project"
+        sha = _a_repo_on(repo_root, "main")
+        config = ForgeConfig.model_validate(
+            {
+                "permissions": {"filesystem": {"allowlist": ["/tmp"]}},
+                "planning": {"target_repo_paths": {REPO: str(repo_root)}},
+                "merge_executor": {"enabled": True},
+            }
+        )
+        _insert_build(pool)
+        assert pool.get_build_row(BUILD_ID).target_branch is None
+        recorder = _Recorder()
+        asked: list[str | None] = []
+
+        async def _the_real_reader(root: Path, branch: str | None = None):
+            asked.append(branch)
+            return await git_rev_parse_main(root, branch)
+
+        await _an_offer(config, pool, recorder, _the_real_reader).maybe_offer(_event())
+
+        assert [kind for kind, _ in recorder.events] == ["approval", "paused"]
+        assert asked == [None], "nothing was recorded, and it says so by asking None"
+        _subject, body = recorder.events[0][1]
+        details = MessageEnvelope.model_validate_json(body).payload["details"]
+        assert details["expect_main_sha"] == sha
+
+    @pytest.mark.asyncio
+    async def test_a_head_reader_that_predates_the_branch_still_makes_a_card(
+        self, config, pool
+    ) -> None:
+        """A caller that bound the old one-argument seam is not a crash.
+
+        :func:`head_reader_takes_a_branch` is asked, the old call is made, and
+        the log says the pin was read the way it always was.
+        """
+        _insert_build(pool)
+        _record_the_target_branch(pool, "trunk")
+        recorder = _Recorder()
+        calls: list[tuple] = []
+
+        async def _the_old_seam(root: Path):
+            calls.append((root,))
+            return "oldshapesha"
+
+        assert head_reader_takes_a_branch(_the_old_seam) is False
+        await _an_offer(config, pool, recorder, _the_old_seam).maybe_offer(_event())
+
+        assert len(calls) == 1
+        assert [kind for kind, _ in recorder.events] == ["approval", "paused"]
+        _subject, body = recorder.events[0][1]
+        details = MessageEnvelope.model_validate_json(body).payload["details"]
+        assert details["expect_main_sha"] == "oldshapesha"
+
+    @pytest.mark.asyncio
+    async def test_which_seams_are_asked_for_the_branch_and_which_are_not(
+        self,
+    ) -> None:
+        """Both halves of the question :func:`_ask_the_head_reader` asks."""
+
+        async def _takes_one(root: Path):
+            return "one"
+
+        async def _takes_a_branch(root: Path, branch: str | None = None):
+            return f"two:{branch}"
+
+        async def _takes_kwargs(root: Path, **kw):
+            return f"kw:{kw.get('branch')}"
+
+        assert head_reader_takes_a_branch(_takes_one) is False
+        assert head_reader_takes_a_branch(_takes_a_branch) is True
+        assert head_reader_takes_a_branch(_takes_kwargs) is True
+        assert await _ask_the_head_reader(_takes_one, Path("."), "trunk") == "one"
+        assert (
+            await _ask_the_head_reader(_takes_a_branch, Path("."), "trunk")
+            == "two:trunk"
+        )
+
 
 class TestRetainedCandidateIdentity:
     @pytest.mark.asyncio
