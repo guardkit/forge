@@ -34,8 +34,9 @@ What is driven here, and by what:
   opinion: a matching commit is served, a mismatching one is refused;
 * a request from each door with the stamp deleted, which the helper refuses
   rather than serving quietly at its own HEAD;
-* and the planning door, whose ``by_hand`` is honest — planning runs before
-  there is a build to name — still served.
+* and the planning door, which since 23 September 2026 is stamped like the
+  others (the run's id and its recorded starting commit) and claims nothing
+  by hand: served at that commit, refused on a mismatch.
 
 Nothing real is contacted. Every server here is a child of this process on
 127.0.0.1 on a port the kernel picks; every repository is a throwaway git
