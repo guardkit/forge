@@ -121,7 +121,7 @@ def build_deploy_stage_runner(
     target_repo: str | None = None,
     target_repo_root: str | None = None,
     sandbox: Any | None = None,
-    #: THE STAMP EVERY REQUEST TO THE HELPER CARRIES (27 September 2026). The
+    #: THE STAMP EVERY REQUEST TO THE HELPER CARRIES (23 September 2026). The
     #: build this stage is running, and the commit the coordinator's own ledger
     #: records that build as starting from. They are bound HERE, in one place,
     #: off the ledger, and the script runner puts the same pair on every
@@ -226,7 +226,7 @@ async def dispatch_deploy_stage(
     memory_project: str | None = None,
     launch_settings: tuple[str, ...] = (),
     #: THE BUILD THIS STAGE IS RUNNING, and the recorded commit it STARTS from
-    #: (25 September 2026; bound to the coordinator's record 27 September
+    #: (23 September 2026; bound to the coordinator's record 27 September
     #: 2026). The two are stamped onto every request THIS STAGE sends the
     #: helper — the candidate check, both of the promote's, the read-only
     #: "what are you running" question and the teardown — in one place, the
@@ -237,7 +237,7 @@ async def dispatch_deploy_stage(
     #: absent ⇒ a by-hand run: the far side reads at that copy's committed
     #: HEAD, never its working tree, and says so.
     #:
-    #: WHAT THIS DOES NOT COVER, said plainly (27 September 2026, the seventh
+    #: WHAT THIS DOES NOT COVER, said plainly (23 September 2026, the seventh
     #: review, correcting a sentence that claimed more than was built). The
     #: merge word's own command and the fix journey's two legs go to the same
     #: helper through a different door

@@ -1065,7 +1065,7 @@ DEPLOY_PROFILE_PATH: str = "deploy/profile.yaml"
 def _the_profile_at(repo_root: Path | str, commit: str | None) -> tuple[Any, str | None]:
     """A project's deploy profile AS IT IS AT ``commit``, and why not if not.
 
-    A DECLARATION IS A COMMITTED LINE ON THIS SIDE TOO (28 September 2026, the
+    A DECLARATION IS A COMMITTED LINE ON THIS SIDE TOO (23 September 2026, the
     seventh review, which drove it). The helper that launches the project's own
     commands had already been moved onto the committed file; this side — which
     composes what that helper is sent — was still reading the working copy. So
@@ -1264,7 +1264,7 @@ async def execute_merge_deploy(
     # which is exactly the rule. Nothing about the name is a credential.
     worker_name = f"merge-press:{os.getpid()}"
     # THE COMMIT THIS BUILD STARTS FROM, off this coordinator's own record,
-    # read once and kept (28 September 2026). It is what the project's own
+    # read once and kept (23 September 2026). It is what the project's own
     # declarations are read at on BOTH sides of the deploy: this side composes
     # the deploy block from the profile at this commit, and the helper is
     # stamped with it and confirms it before it reads a line. A list of one, so
@@ -1734,7 +1734,7 @@ async def execute_merge_deploy(
     def _the_identity_the_deploy_uses_today() -> dict[str, Any]:
         """What identifies the thing that was checked.
 
-        REWRITTEN 24 September 2026, after the second review of the executor
+        REWRITTEN 23 September 2026, after the second review of the executor
         stage. This used to record a gap and name it honestly: the check knew
         nothing about identity, and the deploy resolved a name of its own at
         the moment it deployed. That gap was then driven — a second build
@@ -2228,7 +2228,7 @@ async def execute_merge_deploy(
     async def _what_the_target_says(*, target: str, declaration: Any) -> Any:
         """Ask the project, read-only, what it is running on ``target``.
 
-        Added 24 September 2026, after the second review of the executor stage.
+        Added 23 September 2026, after the second review of the executor stage.
         The only-forwards rule was being applied to the LEDGER'S row, and a run
         that deploys and stops before writing that row leaves it wrong — so a
         later pick-up read a stale row, believed it was moving forwards, and put
@@ -2241,7 +2241,7 @@ async def execute_merge_deploy(
         placing one is the caller's job, and a token that places nowhere stops
         the deploy.
 
-        Corrected 25 September 2026, after the third review. A step whose own
+        Corrected 23 September 2026, after the third review. A step whose own
         query FAILED used to arrive here as "nothing is running": it suppressed
         the error, exited zero, and printed an empty value. Four things are
         read as "not established" now, and every one of them deploys nothing —
@@ -2385,7 +2385,7 @@ async def execute_merge_deploy(
         read has no target this press can take a lock on, and the press says
         so rather than guessing one.
 
-        READ AT THE COMMIT THIS BUILD STARTS FROM (28 September 2026, the
+        READ AT THE COMMIT THIS BUILD STARTS FROM (23 September 2026, the
         seventh review). This is the only place the deploy block's setting
         names are composed, and it was composing them off the WORKING COPY
         while the helper checked them against the committed file — so an
@@ -2567,7 +2567,7 @@ async def execute_merge_deploy(
                     "than deployed blind"
                 ),
             )
-        # THE PROJECT HAS TO BE ASKABLE (24 September 2026). Everything below
+        # THE PROJECT HAS TO BE ASKABLE (23 September 2026). Everything below
         # turns on knowing what is ACTUALLY running on the target at the moment
         # of deciding, and only the project can say. A project that declares no
         # read-only "what are you running" step cannot be asked, so its target's
@@ -2649,7 +2649,7 @@ async def execute_merge_deploy(
 
         try:
             # 3. ASK THE TARGET WHAT IT IS RUNNING, under the lock, BEFORE any
-            # of this is decided (24 September 2026). Steps 3 and 4 used to
+            # of this is decided (23 September 2026). Steps 3 and 4 used to
             # read the LEDGER'S row and nothing else, and a run that deploys
             # and stops before writing its row leaves that row wrong: a later
             # pick-up read it, believed it was moving forwards, and put an
@@ -2814,7 +2814,7 @@ async def execute_merge_deploy(
             # beside them. The artifact is the thing the CHECK said it checked;
             # the deploy step must run exactly it and nothing it resolves for
             # itself. (``something_is_running`` used to ride here too and was
-            # taken off on 24 September 2026: the executor consulted it to let a
+            # taken off on 23 September 2026: the executor consulted it to let a
             # note-less first deploy through, and a delayed request carrying a
             # stale copy of it was accepted over a newer build. A request cannot
             # establish its own freshness, so it no longer carries a claim about

@@ -32,7 +32,7 @@
 # SCOPE: a systemd USER unit, the same shape as the deploy sidecar's, binding
 #   the forge developer venv. Loopback by default (the service's own DEFAULT_HOST).
 #   This file is AUTHORED only — the attended install/enable is the coordinator's
-#   step, with Rich present.
+#   step, with the owner present.
 #
 # INSTALL (coordinator, attended):
 #     mkdir -p ~/.config/systemd/user
@@ -53,8 +53,12 @@ Type=simple
 # The coordinator's own record. The same path the requeue sweep's liveness
 # guard reads, and the one the deploy sidecar unit already names.
 Environment=FORGE_DB_PATH=%h/forge-prod-state/.forge/forge.db
-WorkingDirectory=%h/Projects/appmilla_github/forge
-ExecStart=%h/Projects/appmilla_github/forge/.venv/bin/python -m forge.record_answer \
+# THE TWO PATHS BELOW ARE PLACEHOLDERS. This file is committed to a public
+# repository, so it names no real machine's layout. Whoever installs it edits
+# WorkingDirectory and ExecStart to where this checkout and its venv really
+# are on that machine, the way the sibling deploy-sidecar unit was installed.
+WorkingDirectory=%h/forge-src/forge
+ExecStart=%h/forge-src/forge/.venv/bin/python -m forge.record_answer \
   --host 127.0.0.1 \
   --port 8126
 Restart=on-failure

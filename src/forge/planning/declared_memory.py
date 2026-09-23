@@ -233,7 +233,7 @@ def _parse(content: str) -> tuple[dict | None, str | None]:
     the same way whichever question is being asked and a hostile one cannot
     stall a run through either door.
 
-    IT ANSWERS WITH THE CLAUSE, NOT THE SENTENCE (25 September 2026, the fifth
+    IT ANSWERS WITH THE CLAUSE, NOT THE SENTENCE (23 September 2026, the fifth
     review). It used to hand back a finished memory-reader refusal, and the
     launch-settings reader passed that straight on — so a project whose
     settings file would not parse was told "there is no way to tell which
