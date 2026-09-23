@@ -147,10 +147,11 @@ class TestThePressStopsAtChecked:
             merge_executor.RESULT_WORD_MERGED_AND_RUNNING
             == "merged-into-the-remote-and-running"
         )
-        # THE THIRD IS STILL UNREACHABLE. The publisher stage makes the second
-        # one reachable — a commit really is on the remote's branch, read
-        # back — and stops there. "Merged into the remote and running" needs
-        # a deploy, and the deploy is the stage after this one.
+        # ALL THREE ARE REACHABLE NOW (23 September 2026, the executor stage).
+        # "Merged into the remote and running" needed a deploy; the deploy
+        # exists, so the word does too. What is pinned below is the PATH: one
+        # maker, reached only after the identity the running thing reported
+        # has been compared, as text, with the identity it was handed.
         source = Path(merge_executor.__file__).read_text(encoding="utf-8")
         produced = [
             line
@@ -158,20 +159,37 @@ class TestThePressStopsAtChecked:
             if "result=RESULT_WORD_" in line.replace(" ", "")
         ]
         assert produced
-        for line in produced:
-            assert (
-                "PUBLICATION_PENDING" in line
-                or "PUBLISHED_DEPLOYMENT_PENDING" in line
-            ), line
-        assert not any("MERGED_AND_RUNNING" in line for line in produced)
+        assert [
+            line for line in produced if "MERGED_AND_RUNNING" in line
+        ], "the third word is reachable now and nothing produces it"
 
-    def test_nothing_in_the_press_deploys_anything(self) -> None:
-        """The deploy is the next stage, and the press cannot reach it.
+    def test_the_third_word_is_produced_by_one_function_and_only_there(
+        self,
+    ) -> None:
+        """"Merged into the remote and running" has exactly one maker.
 
-        The press drives the deploy stage through one seam, ``_dispatch``,
-        and the only legs it asks for are the candidate check and the tear
-        down that follows it. The promote leg — the one that would put
-        something live — is named nowhere the press can run it.
+        It is the estate's strongest claim — the work is on the remote AND
+        what was checked is running — so it is worth pinning that one place
+        can say it, and that a later change cannot add a second, looser one.
+        """
+        source = Path(merge_executor.__file__).read_text(encoding="utf-8")
+        makers = [
+            line.strip()
+            for line in source.splitlines()
+            if "result=RESULT_WORD_MERGED_AND_RUNNING" in line.replace(" ", "")
+        ]
+        assert len(makers) == 1, makers
+        assert "def _merged_and_running(" in source
+
+    def test_the_press_deploys_only_under_the_lock(self) -> None:
+        """The promote leg is asked for ONCE, and that call carries ownership.
+
+        The press drives the deploy stage through one seam, ``_dispatch``. The
+        candidate check and the tear-down are asked for as they always were.
+        The promote leg — the one that puts something live — is asked for
+        exactly once, and that call carries ``deploy_ownership``: the target,
+        that target's own counter and the build the counter was granted to,
+        which is what the executor on the other side enforces.
         """
         source = Path(merge_executor.__file__).read_text(encoding="utf-8")
         dispatches = [
@@ -180,14 +198,17 @@ class TestThePressStopsAtChecked:
             if "_dispatch(" in line and "async def _dispatch" not in line
         ]
         assert dispatches
-        for line in dispatches:
-            assert "promote" not in line, line
+        promotes = [line for line in dispatches if '"promote"' in line]
+        assert len(promotes) == 1, promotes
+        assert "deploy_ownership=" in promotes[0], promotes[0]
 
-    def test_the_press_says_plainly_that_nothing_was_deployed(self) -> None:
+    def test_the_press_says_plainly_what_was_and_was_not_deployed(self) -> None:
         """The sentence a person reads never implies a deploy that did not run."""
         source = Path(merge_executor.__file__).read_text(encoding="utf-8")
         assert "Nothing has been deployed" in source
-        assert "the deploy is its own stage" in source
+        # ...and when something IS running, the sentence says what confirmed it.
+        assert "reported back" in source
+        assert "it is NOT running" in source
 
 
 #: The merge word's own modules. Central orchestration: they know that there
@@ -251,16 +272,12 @@ class TestTheVocabularyNamesNoHostingProvider:
             merge_executor.RESULT_WORD_MERGED_AND_RUNNING
             == "merged-into-the-remote-and-running"
         )
-        # And the third is STILL unreachable, which neither the rename nor
-        # the publisher stage changes: it needs a deploy.
-        source = Path(merge_executor.__file__).read_text(encoding="utf-8")
-        produced = [
-            line
-            for line in source.splitlines()
-            if "result=RESULT_WORD_" in line.replace(" ", "")
-        ]
-        assert produced
-        assert not any("MERGED_AND_RUNNING" in line for line in produced)
+        # The rename is what this test is about, and it holds whether or not
+        # the word is reachable. It IS reachable since the executor stage, and
+        # its one maker is pinned above.
+        for literal in _string_literals(Path(merge_executor.__file__)):
+            for provider in _PROVIDERS:
+                assert provider not in literal.lower(), literal
 
 
 @pytest.mark.parametrize("word", FORBIDDEN)

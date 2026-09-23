@@ -260,8 +260,12 @@ class TestBootLogEmitsAppliedCount:
         # merges, recorded by the conductor for a fix journey; schema_v12.sql
         # added by the one-true-copy lane for the start_commit / target_branch
         # columns on planning_runs and builds — where a piece of work started
-        # from, and which branch of the remote it is aimed at) → applied=12.
-        assert "applied 15" in applied_lines[0], applied_lines[0]
+        # from, and which branch of the remote it is aimed at; schema_v16.sql
+        # added by the executor stage for the deployment_targets table — one
+        # row per deployment target holding that target's OWN counter, who
+        # holds the lock and until when, and what is running on it now by
+        # commit and by the identity the running thing reported).
+        assert "applied 16" in applied_lines[0], applied_lines[0]
 
 
 # ---------------------------------------------------------------------------
