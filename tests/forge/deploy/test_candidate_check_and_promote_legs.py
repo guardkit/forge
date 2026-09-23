@@ -7,7 +7,10 @@
   38), and the promote never does.
 * ``promote`` — ``PROMOTE=1`` (never a rebuild), the candidate torn down,
   the live gate on the live name, the O-32 revert if that fails.
-* ``candidate_down`` — the teardown on its own.
+* ``candidate_down`` — the teardown on its own. Since 26 September 2026 it
+  takes down the ONE candidate the identity it is handed names, and with no
+  identity it refuses and removes nothing: a teardown that names nothing has
+  to go looking, and what it finds can belong to another build's check.
 * ``run_deploy`` — the two in a row: exactly the events, runbooks and result
   of the one-call shape it always had.
 * ``dispatch_deploy_stage(..., leg=...)`` routes to each.
@@ -52,6 +55,11 @@ from forge.persistence.repositories.runbook import RunbookRepository
 
 FIXED = datetime(2026, 9, 7, 12, 0, 0, tzinfo=UTC)
 CANDIDATE_TREE = "/home/x/api_test/.forge-candidates/FEAT-9A01"
+
+#: WHICH CANDIDATE A TEARDOWN MEANS. The setting is the project's own (these
+#: profiles declare none, so it is the factory's default name) and the value is
+#: the identity the CHECK was handed. Without it a teardown is refused.
+WHICH_CANDIDATE = {"DEPLOY_IDENTITY": "j-9a01beef@feedfacecafe0"}
 
 
 @pytest.fixture
@@ -294,6 +302,7 @@ class TestTheCandidateRunsFromItsOwnTree:
             feature="FEAT-9A01",
             feat_id="FEAT-9A01",
             candidate_cwd=CANDIDATE_TREE,
+            identity_env=WHICH_CANDIDATE,
         )
         assert checked.outcome == "complete"
         cand = _load(repository, "deploy-cand-run-1", "c1")
@@ -313,6 +322,7 @@ class TestTheCandidateRunsFromItsOwnTree:
             feature="FEAT-9A01",
             feat_id="FEAT-9A01",
             prior_events=checked.events,
+            identity_env=WHICH_CANDIDATE,
         )
         assert promoted.outcome == "complete"
         live = _load(repository, "deploy-run-1", "c1")
@@ -436,6 +446,7 @@ class TestTheCandidateGateRunsInTheTree:
             deploy_run_id="run-um",
             feature="FEAT-T5",
             candidate_cwd=CANDIDATE_TREE,
+            identity_env=WHICH_CANDIDATE,
         )
         # Not run at all: a gate in the checkout would check main's registry.
         assert invoker.invocations == 0
@@ -527,6 +538,7 @@ class TestCandidateCheck:
             correlation_id="cf",
             deploy_run_id="run-f",
             feature="FEAT-2",
+            identity_env=WHICH_CANDIDATE,
         )
         assert result.outcome == "failed"
         assert result.failed_step == "candidate_gate"
@@ -599,6 +611,7 @@ class TestPromote:
             deploy_run_id="run-pp",
             feature="FEAT-3",
             prior_events=("DeployQueued",),
+            identity_env=WHICH_CANDIDATE,
         )
         assert result.outcome == "complete"
         assert result.detail["candidate"] == "torn-down"
@@ -662,6 +675,7 @@ class TestPromote:
             deploy_run_id="run-pr",
             feature="FEAT-6",
             prior_events=("DeployQueued",),
+            identity_env=WHICH_CANDIDATE,
         )
         assert result.outcome == "reverted"
         assert result.detail["candidate"] == "torn-down"
@@ -674,17 +688,64 @@ class TestPromote:
         deploy_pub = RecordingDeployPublisher()
         runner = _runner(repository, runbook_publisher, deploy_pub, tmp_path)
         result = await runner.candidate_down(
-            _profile(), correlation_id="cd", deploy_run_id="run-cd"
+            _profile(),
+            correlation_id="cd",
+            deploy_run_id="run-cd",
+            identity_env=WHICH_CANDIDATE,
         )
         assert result.outcome == "complete"
         assert result.detail == {"candidate": "torn-down"}
         teardown = _load(repository, "teardown-cand-run-cd", "cd")
-        assert _step_params(teardown, "deploy_compose")["extra_env"]["CANDIDATE_DOWN"] == "1"
+        params = _step_params(teardown, "deploy_compose")
+        assert params["extra_env"]["CANDIDATE_DOWN"] == "1"
+        # AND WHICH CANDIDATE IT MEANS, under the name this project declares.
+        assert params["extra_env"]["DEPLOY_IDENTITY"] == WHICH_CANDIDATE[
+            "DEPLOY_IDENTITY"
+        ]
         absent = await runner.candidate_down(
             _profile(candidate=False), correlation_id="cd2", deploy_run_id="run-cd2"
         )
         assert absent.outcome == "complete"
         assert absent.detail["candidate"] == "absent"
+
+    @pytest.mark.asyncio
+    async def test_a_teardown_that_names_nothing_is_refused_and_removes_nothing(
+        self, repository, runbook_publisher, tmp_path
+    ) -> None:
+        """One build's cleanup must never touch another's candidate.
+
+        The teardown used to run with no name at all, and a project whose
+        candidate belongs to one check rather than to a shared name then had to
+        go looking — so one build's ending removed every other build's standing
+        candidate. With no identity nothing is run and nothing is removed.
+        """
+        deploy_pub = RecordingDeployPublisher()
+        runner = _runner(repository, runbook_publisher, deploy_pub, tmp_path)
+        result = await runner.candidate_down(
+            _profile(), correlation_id="cdx", deploy_run_id="run-cdx"
+        )
+        assert result.outcome == "failed"
+        assert result.failed_step == "candidate_down"
+        assert result.detail["candidate"] == "standing"
+        assert "no identity" in result.detail["refusal"]
+        assert "belong to another build's check" in result.detail["refusal"]
+        # Nothing was even rendered, so nothing could have been run.
+        assert _load(repository, "teardown-cand-run-cdx", "cdx") is None
+
+    @pytest.mark.asyncio
+    async def test_a_setting_with_an_empty_value_names_nothing_either(
+        self, repository, runbook_publisher, tmp_path
+    ) -> None:
+        deploy_pub = RecordingDeployPublisher()
+        runner = _runner(repository, runbook_publisher, deploy_pub, tmp_path)
+        result = await runner.candidate_down(
+            _profile(),
+            correlation_id="cdy",
+            deploy_run_id="run-cdy",
+            identity_env={"DEPLOY_IDENTITY": "   "},
+        )
+        assert result.outcome == "failed"
+        assert _load(repository, "teardown-cand-run-cdy", "cdy") is None
 
 
 # ---------------------------------------------------------------------------
@@ -702,7 +763,11 @@ class TestRunDeployIsTheTwoLegsInARow:
             repository, runbook_publisher, deploy_pub, tmp_path, live_gate_invoker=_Invoker()
         )
         result = await runner.run_deploy(
-            _profile(), correlation_id="rd", deploy_run_id="run-rd", feature="FEAT-7"
+            _profile(),
+            correlation_id="rd",
+            deploy_run_id="run-rd",
+            feature="FEAT-7",
+            identity_env=WHICH_CANDIDATE,
         )
         assert result.outcome == "complete"
         assert result.events == (
@@ -794,6 +859,9 @@ class TestDispatchByLeg:
             leg=leg,
             candidate_cwd=CANDIDATE_TREE if leg == "candidate_check" else None,
             prior_events=("DeployQueued",) if leg == "promote" else (),
+            # WHICH CANDIDATE A TEARDOWN MEANS: every leg that can take one
+            # down is told, and one that is told nothing removes nothing.
+            identity_env=WHICH_CANDIDATE,
         )
         assert result is not None and result.outcome == "complete"
         assert _load(repository, runbook_present, "x") is not None

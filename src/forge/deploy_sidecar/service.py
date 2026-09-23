@@ -187,6 +187,8 @@ from importlib import import_module
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Protocol, Sequence
 
+import yaml
+
 from forge.adapters.guardkit.context_resolver import resolve_context_flags
 from forge.config.loader import load_config
 from forge.config.models import ForgeConfig
@@ -195,6 +197,7 @@ from forge.deploy.profile import (
     DeployProfile,
     DeployProfileError,
     load_deploy_profile,
+    parse_deploy_profile,
     wrapper_inner_script,
 )
 from forge.deploy_sidecar.deploy_executor import (
@@ -885,13 +888,14 @@ def _not_declared_by_the_project(
     repo: str | None,
     declared: Sequence[str],
     note: str | None = None,
+    where: str = "",
 ) -> str:
     """The one sentence a request gets for a name its project never declared.
 
     It names the name, says whose project it is, lists what that project does
-    declare, and says where a project declares such a thing — so the person
-    reading it can either correct the request or add the line to the project
-    and commit it.
+    declare, says WHERE it was read (which commit), and says where a project
+    declares such a thing — so the person reading it can either correct the
+    request or add the line to the project and commit it.
     """
     whose = f"{repo}" if repo else "this project"
     known = ", ".join(sorted(declared))
@@ -900,19 +904,68 @@ def _not_declared_by_the_project(
         if known
         else "it declares no setting names at all"
     )
+    read_at = f" at {where}" if where else ""
     tail = f" ({note})" if note else ""
     return (
         f"this request asks for a setting called {name!r} to be handed to the "
-        f"command, and {whose} does not declare that name — "
+        f"command, and {whose} does not declare that name{read_at} — "
         f"{what_it_declares}{tail}. A project says what its own builds need in "
         f"its own {DECLARATION_PATH}, under '{LAUNCH_KEY}: {SETTINGS_KEY}:', "
         f"or as one of the identity settings in its deploy/profile.yaml; a "
-        f"request never widens that list. Nothing was started."
+        f"request never widens that list, and an uncommitted line in a working "
+        f"copy is not a declaration. Nothing was started."
     )
 
 
-def project_declared_settings(repo_path: Path) -> tuple[tuple[str, ...], str | None]:
-    """The setting names THIS PROJECT declares, and a note when one was unreadable.
+#: The project's own two declaration files, in the order they are read.
+PROFILE_PATH: str = "deploy/profile.yaml"
+
+
+def _the_project_at(repo_path: Path, commit: str, file_path: str) -> tuple[
+    str | None, bool, str | None
+]:
+    """One of a project's files as it is AT A COMMIT: ``(text, found, why not)``.
+
+    ``found`` false with no reason means the commit is readable and simply does
+    not carry that file — a fact about the project. A reason means the read
+    could not be made at all. Never raises: git and a project's own history are
+    input here, not code.
+    """
+    from forge.deploy.candidate_tree import read_file_at_commit
+
+    try:
+        answer = _run_coroutine(read_file_at_commit(repo_path, commit, file_path))
+    except Exception as exc:  # noqa: BLE001 — a read never crashes the door
+        return None, True, f"reading it raised {type(exc).__name__}"
+    if answer.refusal:
+        return None, True, str(answer.refusal)
+    if not answer.found:
+        return None, False, None
+    return answer.content, True, None
+
+
+def project_declared_settings(
+    repo_path: Path, *, commit: str | None = None
+) -> tuple[tuple[str, ...], str | None, str]:
+    """The setting names THIS PROJECT declares, a note, and where they were read.
+
+    A DECLARATION IS A COMMITTED LINE, NOT A LINE ON DISK (25 September 2026,
+    the fifth review). Both files used to be read as they are in the working
+    copy this service was pointed at, so a line nobody had committed — including
+    one a build had just written into the very checkout the command was about to
+    run out of — counted as a declaration, and a build could widen its own
+    environment door. Both are read at a commit now, with git, exactly the way
+    the coordinator reads the same file for the same project:
+
+    * ``commit`` is the recorded commit the work starts from, sent on the
+      request. Both files are read there and nowhere else;
+    * with no commit on the request, the fallback is the COMMITTED HEAD of the
+      copy of the project this service has (``git show HEAD:…``) — never the
+      working tree. A project that is not a git copy at all declares nothing,
+      which is said rather than guessed around.
+
+    The third element of the answer says which of the two was used, in plain
+    words, so the sentence a person reads names it.
 
     Two places, both the project's own committed files, and nothing else:
 
@@ -934,12 +987,11 @@ def project_declared_settings(repo_path: Path) -> tuple[tuple[str, ...], str | N
     factory's own two defaults there, which is what that door has always
     permitted, so nothing is widened by this being read here too.
 
-    THIS SERVICE CANNOT SEE THE LEDGER. The coordinator reads both of these
-    at the commit the work started from; this helper has no such record and no
-    way to get one, so it reads the copy of the project it has been pointed
-    at — the same copy it would run the project's own scripts out of, resolved
-    by :data:`planning.target_repo_paths`. That is the honest source available
-    here, and it is the same one the profile's own names are already read from.
+    THIS SERVICE STILL CANNOT SEE THE LEDGER, and does not need to: the
+    request carries the build, and the coordinator holds that build's recorded
+    starting commit, so it sends it. The copy of the project this service is
+    pointed at — resolved by :data:`planning.target_repo_paths` — is where the
+    history is read from, and nothing here ever reads that copy's working tree.
 
     Every name is put through :func:`declared_setting_refusal`, so a project
     that declares one of the names or prefixes the factory keeps for itself
@@ -950,57 +1002,72 @@ def project_declared_settings(repo_path: Path) -> tuple[tuple[str, ...], str | N
     file, and the honest one: a project whose declaration is wrong has not
     declared anything.
 
-    Returns ``(names, note)``. ``note`` is one plain clause when the project's
-    settings file is there and could not be used, so a refusal below can say
-    that rather than "it does not declare that name". Never raises: a file out
-    of a project this factory did not write is input.
+    Returns ``(names, note, where)``. ``note`` is one plain clause when the
+    project's settings file is there and could not be used, so a refusal below
+    can say that rather than "it does not declare that name"; ``where`` names
+    the commit the two files were read at. Never raises: a file out of a
+    project this factory did not write is input.
     """
     names: list[str] = []
     note: str | None = None
 
-    declaration = repo_path / Path(DECLARATION_PATH)
-    content: str | None = None
-    found = False
-    unreadable_because: str | None = None
-    try:
-        content = declaration.read_text(encoding="utf-8")
-        found = True
-    except FileNotFoundError:
-        found = False
-    except OSError as exc:
-        found = True
-        unreadable_because = f"reading it raised {type(exc).__name__}"
-    except Exception as exc:  # noqa: BLE001 — a project's file is input, not code
-        found = True
-        unreadable_because = f"reading it raised {type(exc).__name__}"
+    wanted = str(commit or "").strip()
+    read_at = wanted or "HEAD"
+    where = (
+        f"the commit this work starts from ({wanted})"
+        if wanted
+        else "the committed HEAD of the copy of this project this service has"
+    )
+
+    content, found, unreadable_because = _the_project_at(
+        repo_path, read_at, DECLARATION_PATH
+    )
     answer = read_declared_launch_settings(
         repo=str(repo_path),
-        commit="the copy of it this service has",
+        commit=where,
         content=content,
         found=found,
         unreadable_because=unreadable_because,
     )
     if answer.refusal is not None:
         note = (
-            f"its own {DECLARATION_PATH} says something this factory cannot "
-            f"use, so no name was taken from that file"
+            f"its own {DECLARATION_PATH} at {where} says something this "
+            f"factory cannot use, so no name was taken from that file"
         )
         logger.warning(
-            "deploy-sidecar: no launch settings were taken from %s — %s",
-            declaration,
+            "deploy-sidecar: no launch settings were taken from %s at %s — %s",
+            DECLARATION_PATH,
+            where,
             answer.refusal.splitlines()[0],
         )
     else:
         names.extend(answer.names)
 
-    # AND THE PROFILE'S OWN THREE, read the same way the environment door
-    # already reads them. A repository need not be deployable at all — a fix
-    # journey has no deploy profile — and one that is not simply declares
-    # nothing here.
-    try:
-        profile = load_deploy_profile(repo_path / "deploy" / "profile.yaml")
-    except (DeployProfileError, OSError):
-        profile = None
+    # AND THE PROFILE'S OWN THREE, read at the same commit and the same way the
+    # environment door already reads them. A repository need not be deployable
+    # at all — a fix journey has no deploy profile — and one that is not simply
+    # declares nothing here.
+    profile_text, profile_found, profile_unreadable = _the_project_at(
+        repo_path, read_at, PROFILE_PATH
+    )
+    profile = None
+    if profile_found and profile_unreadable is None and profile_text is not None:
+        try:
+            # The same bounded read the file load does, on text that came out
+            # of the history rather than off the disk.
+            profile = parse_deploy_profile(
+                yaml.safe_load(profile_text) or {}, source_ref=PROFILE_PATH
+            )
+        except Exception:  # noqa: BLE001 — a project's own file is input, not code
+            profile = None
+    elif profile_unreadable is not None:
+        logger.info(
+            "deploy-sidecar: %s could not be read at %s (%s), so this project "
+            "declares no identity settings here",
+            PROFILE_PATH,
+            where,
+            profile_unreadable,
+        )
     if profile is not None:
         identity = declared_identity(profile)
         names.extend(
@@ -1024,7 +1091,7 @@ def project_declared_settings(repo_path: Path) -> tuple[tuple[str, ...], str | N
             )
             continue
         permitted.append(name)
-    return tuple(permitted), note
+    return tuple(permitted), note, where
 
 
 def _launch_fields(
@@ -1054,12 +1121,26 @@ def _launch_fields(
     request could hand a build any setting this service's own process happens
     to hold. The environment door is the PROJECT'S to widen: a name presented
     here is permitted only if the project this request names declares it, in
-    its own committed files, read by :func:`project_declared_settings` from
-    the copy of the project this service has. A name it does not declare is
-    refused in plain words and nothing is started.
+    its own committed files, read by :func:`project_declared_settings`. A name
+    it does not declare is refused in plain words and nothing is started.
+
+    AND THE DECLARATION IS READ AT A COMMIT (25 September 2026). ``declared_at``
+    is the recorded commit the work starts from, which the coordinator holds
+    and sends; the two files are read THERE. Without it the fallback is the
+    committed HEAD of the copy of the project this service has, never its
+    working tree — so a line a build writes into the checkout it is about to
+    run out of is not a declaration, and cannot widen its own door. Which of
+    the two was used is named in the sentence either way.
     """
     if not isinstance(payload, dict):
         return None, (), None
+    raw_commit = payload.get("declared_at")
+    declared_at: str | None = None
+    if raw_commit is not None:
+        commit_error = _ref_error(raw_commit, what="declared_at")
+        if commit_error is not None:
+            return None, (), commit_error
+        declared_at = str(raw_commit).strip()
     raw_name = payload.get("memory_project")
     name: str | None = None
     if raw_name is not None:
@@ -1079,7 +1160,9 @@ def _launch_fields(
                 "the project declared its builds need; got "
                 f"{type(raw_settings).__name__}"
             )
-        declared, note = project_declared_settings(repo_path)
+        declared, note, where = project_declared_settings(
+            repo_path, commit=declared_at
+        )
         for entry in raw_settings:
             refusal = declared_setting_refusal(entry)
             if refusal is not None:
@@ -1087,9 +1170,19 @@ def _launch_fields(
             wanted = str(entry).strip()
             if wanted not in declared:
                 return None, (), _not_declared_by_the_project(
-                    wanted, repo=repo, declared=declared, note=note
+                    wanted, repo=repo, declared=declared, note=note, where=where
                 )
             names.append(wanted)
+        if names:
+            # THE ACCEPTANCE SAYS WHERE IT READ THEM TOO, so a person reading
+            # the log never has to guess which commit a name was admitted from.
+            logger.info(
+                "deploy-sidecar: %s declares %s at %s, so this request may hand "
+                "them to the command",
+                repo or str(repo_path),
+                ", ".join(names),
+                where,
+            )
     return name, tuple(names), None
 
 

@@ -58,6 +58,7 @@ def _run_script_step(
     extra_env: dict[str, str] | None = None,
     memory_project: str | None = None,
     launch_settings: Sequence[str] | None = None,
+    declared_at: str | None = None,  # noqa: ARG001 — the far side's door reads it
     deploy: dict[str, object] | None = None,
 ) -> tuple[int, str]:
     """Run a shell script with timeout, size-cap, and credential scrubbing.
@@ -296,6 +297,17 @@ def deploy_compose(step: Step, *, runner: ScriptRunner = _run_script_step) -> St
         else ()
     )
 
+    # WHERE THOSE NAMES WERE SAID: the recorded commit this work starts from.
+    # Only the far side's environment door reads a project's declarations, so
+    # only it uses this — and it is sent ONLY when there is one, so a runner
+    # written before it existed is called exactly as it always was.
+    said_at = step.params.get("declared_at")
+    where_declared = (
+        str(said_at).strip()
+        if isinstance(said_at, str) and said_at.strip()
+        else None
+    )
+
     # Delegate to the runner (default = in-process subprocess core)
     exit_code, captured_output = runner(
         cwd=cwd,
@@ -310,6 +322,7 @@ def deploy_compose(step: Step, *, runner: ScriptRunner = _run_script_step) -> St
             else None
         ),
         launch_settings=launch_settings,
+        **({"declared_at": where_declared} if where_declared else {}),
         deploy=dict(ownership) if isinstance(ownership, dict) else None,
     )
 

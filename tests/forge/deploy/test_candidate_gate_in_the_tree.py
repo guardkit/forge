@@ -44,6 +44,13 @@ from forge.persistence.repositories.runbook import RunbookRepository
 
 FIXED = datetime(2026, 9, 7, 12, 0, 0, tzinfo=UTC)
 FEATURE_ID = "FEAT-TR33"
+
+#: WHICH CANDIDATE A TEARDOWN MEANS (26 September 2026). The identity the CHECK
+#: was handed, under the setting the project declares for it. A teardown with
+#: no identity is refused and removes nothing: it would have to go looking, and
+#: what it found could belong to another build's check.
+WHICH_CANDIDATE = {"DEPLOY_IDENTITY": "j-abcdef012345@0123456789abcdef"}
+
 DRIVER = ["python3", "qa/gates/local_live_gate.py"]
 
 #: The stand-in driver. A gate whose id starts with ``red_`` fails.
@@ -274,6 +281,7 @@ async def test_a_red_check_registered_on_the_branch_is_named_and_the_candidate_t
         deploy_run_id="run-2",
         feature=FEATURE_ID,
         candidate_cwd=str(tree),
+        identity_env=WHICH_CANDIDATE,
     )
     assert checked.outcome == "failed"
     assert checked.failed_step == "candidate_gate"
@@ -309,6 +317,7 @@ async def test_the_evidence_goes_with_the_tree_and_the_numbers_do_not(
         deploy_run_id="run-3",
         feature=FEATURE_ID,
         candidate_cwd=str(tree),
+        identity_env=WHICH_CANDIDATE,
     )
     assert checked.outcome == "complete"
     summary = checked.detail["gate_summary"]

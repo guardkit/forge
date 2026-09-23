@@ -530,12 +530,34 @@ def _repo_of(config: ForgeConfig) -> Path:
     return Path(config.planning.target_repo_paths[REPO])
 
 
+def _a_project_that_declares_its_identity() -> Any:
+    """How this stand-in project wants the identity handed over and reported.
+
+    It is declared here because a CLEANUP now has to NAME the candidate it is
+    taking down (26 September 2026): the identity the check was handed is the
+    only thing that tells one build's candidate from another's, and a press
+    that has none leaves the candidate standing and says so.
+    """
+    from forge.pipeline.deployment_identity import IdentityDeclaration
+
+    return IdentityDeclaration(
+        setting="DEPLOY_IDENTITY",
+        marker="DEPLOYED_IDENTITY",
+        declared=True,
+        checked_as="CHECKED_ARTIFACT",
+        artifact_setting="DEPLOY_ARTIFACT",
+        asked_with="RUNNING_IDENTITY",
+        running_as="RUNNING_IDENTITY",
+    )
+
+
 def _deps(
     config: ForgeConfig,
     pool: SqliteLifecyclePersistence,
     *,
     guardkit: _FakeGuardKit | None = None,
     deploy: _FakeDeploy | None = None,
+    declares_identity: bool = True,
 ) -> tuple[MergeExecutorDeps, _FakePublisher, _FakeGuardKit, _FakeDeploy]:
     publisher = _FakePublisher()
     gk = guardkit if guardkit is not None else _FakeGuardKit()
@@ -546,6 +568,15 @@ def _deps(
         pipeline_publisher=publisher,
         guardkit_run=gk,
         deploy_dispatcher=dp,
+        **(
+            {
+                "deployment_target": lambda repo, root: (
+                    f"{repo}::live", _a_project_that_declares_its_identity()
+                )
+            }
+            if declares_identity
+            else {}
+        ),
     )
     return deps, publisher, gk, dp
 
@@ -793,6 +824,64 @@ async def _run_executor(
         baseline_failing=baseline_failing,
         dry_run=dry_run,
     )
+
+
+class TestOneBuildsCleanupNeverTouchesAnothersCandidate:
+    """The cleanup names the candidate it takes down, or takes none down.
+
+    The press used to ask for the candidate to come down and name NOTHING. A
+    project whose candidate belongs to one check rather than to a shared name
+    then had to go looking for candidates to remove — and what it found could
+    belong to another build's check. It was driven: three builds had
+    candidates standing, the first ended without publishing, and all three
+    went. The identity the CHECK was handed is the only thing that tells them
+    apart, so it travels with every cleanup, and without it nothing is
+    removed.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_cleanup_carries_the_identity_the_check_was_handed(
+        self, config, pool, repo_root
+    ) -> None:
+        deps, publisher, gk, dp = _deps(config, pool)
+        # The press checks, the send is off, and the standing candidate comes
+        # down at the end of the run — by name.
+        outcome = await _run_executor(deps, repo_root)
+        assert outcome.result == "publication-pending"
+        checks = [c for c in dp.calls if c.get("leg") == "candidate_check"]
+        downs = [c for c in dp.calls if c.get("leg") == "candidate_down"]
+        assert checks and downs, _legs(dp)
+        handed = checks[0]["identity_env"]["DEPLOY_IDENTITY"]
+        assert handed
+        # THE SAME IDENTITY, THE SAME SETTING — the project's own name for it.
+        assert downs[0]["identity_env"] == {"DEPLOY_IDENTITY": handed}
+        assert "was left in place" not in outcome.detail
+
+    @pytest.mark.asyncio
+    async def test_with_no_recorded_identity_the_candidate_is_left_standing(
+        self, config, pool, repo_root, _receipts_env: Path
+    ) -> None:
+        deps, publisher, gk, dp = _deps(config, pool, declares_identity=False)
+        outcome = await _run_executor(deps, repo_root)
+        assert "candidate_down" not in _legs(dp), (
+            "a cleanup that cannot name the candidate must not be dispatched"
+        )
+        assert (
+            f"the candidate for {FEATURE_ID} was left in place because its "
+            "identity is not recorded" in outcome.detail
+        )
+        assert "remove it by hand" in outcome.detail
+        # And the report a person reads carries the same sentence.
+        assert "was left in place" in publisher.reports[-1].model_dump(
+            mode="json"
+        )["detail"]
+        # The receipt says it too, so the evidence on disk is not silent.
+        cleanup = json.loads(
+            (_receipts_env / f"merge-{BUILD_ID}" / "merge_deploy_cleanup.json")
+            .read_text(encoding="utf-8")
+        )
+        assert cleanup["candidate_torn_down"] is False
+        assert "left in place" in cleanup["candidate_left_standing"]
 
 
 class TestExecutorSequencing:

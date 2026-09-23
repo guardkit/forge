@@ -75,6 +75,7 @@ class SidecarScriptRunner:
         extra_env: dict[str, str] | None = None,
         memory_project: str | None = None,
         launch_settings: Sequence[str] | None = None,
+        declared_at: str | None = None,
         deploy: dict[str, object] | None = None,
     ) -> tuple[int, str]:
         env: dict[str, str] = dict(extra_env or {})
@@ -94,6 +95,12 @@ class SidecarScriptRunner:
             body["memory_project"] = str(memory_project)
         if launch_settings:
             body["launch_settings"] = [str(name) for name in launch_settings]
+        # AND WHERE THE PROJECT SAID THEM: the recorded commit this work starts
+        # from. The far side reads the project's own declaration files at that
+        # commit rather than off the working copy it runs the scripts out of,
+        # so a line a build writes into that copy is not a declaration.
+        if declared_at:
+            body["declared_at"] = str(declared_at)
         # THE OWNERSHIP OF A DEPLOY OF THE LIVE THING. Present only on the leg
         # that changes the live target; its presence is what sends the request
         # through the far side's EXECUTOR rather than straight to a runner.

@@ -214,6 +214,12 @@ async def dispatch_deploy_stage(
     deploy_ownership: dict[str, Any] | None = None,
     memory_project: str | None = None,
     launch_settings: tuple[str, ...] = (),
+    #: The recorded commit this work STARTS from (25 September 2026). It rides
+    #: with the project's declared names so the far side reads the project's
+    #: own two declaration files AT THAT COMMIT rather than off the working
+    #: copy it runs the project's scripts out of. Absent ⇒ the far side falls
+    #: back to that copy's committed HEAD, never its working tree.
+    declared_at: str | None = None,
     identity_env: dict[str, str] | None = None,
     ask_env: dict[str, str] | None = None,
 ) -> DeployStageResult | None:
@@ -278,6 +284,8 @@ async def dispatch_deploy_stage(
             task_id=task_id,
             deploy_profile_ref=deploy_profile_ref,
             deployer=deployer,
+            declared_at=declared_at,
+            identity_env=identity_env,
         )
     if leg == "candidate_check":
         return await runner.candidate_check(
@@ -295,6 +303,7 @@ async def dispatch_deploy_stage(
             identity_env=identity_env,
             memory_project=memory_project,
             launch_settings=tuple(launch_settings),
+            declared_at=declared_at,
         )
     if leg == "what_is_running":
         return await runner.what_is_running(
@@ -304,6 +313,7 @@ async def dispatch_deploy_stage(
             ask_env=dict(ask_env or {}),
             memory_project=memory_project,
             launch_settings=tuple(launch_settings),
+            declared_at=declared_at,
         )
     if leg == "promote":
         return await runner.promote(
@@ -323,6 +333,8 @@ async def dispatch_deploy_stage(
             deploy_ownership=deploy_ownership,
             memory_project=memory_project,
             launch_settings=tuple(launch_settings),
+            declared_at=declared_at,
+            identity_env=identity_env,
         )
     if leg == "candidate_down":
         return await runner.candidate_down(

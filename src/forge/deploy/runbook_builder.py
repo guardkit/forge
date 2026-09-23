@@ -168,6 +168,7 @@ def build_deploy_runbook(
     deploy_ownership: dict[str, Any] | None = None,
     memory_project: str | None = None,
     launch_settings: Sequence[str] | None = None,
+    declared_at: str | None = None,
 ) -> Runbook:
     """Render the DEPLOY-stage runbook for ``profile``.
 
@@ -320,6 +321,11 @@ def build_deploy_runbook(
         compose_params["memory_project"] = str(memory_project)
     if launch_settings:
         compose_params["launch_settings"] = [str(name) for name in launch_settings]
+    # WHERE THOSE NAMES WERE SAID: the recorded commit this work starts from.
+    # The far side reads the project's own declaration files AT THAT COMMIT
+    # rather than off the working copy it runs the project's scripts out of.
+    if declared_at:
+        compose_params["declared_at"] = str(declared_at)
     steps.append(_step("deploy_compose", compose_params, idx))
     idx += 1
 
@@ -419,6 +425,7 @@ def build_read_only_runbook(
     inside_sandbox: bool = False,
     memory_project: str | None = None,
     launch_settings: Sequence[str] | None = None,
+    declared_at: str | None = None,
 ) -> Runbook:
     """Render a runbook that ASKS the project something and changes nothing.
 
@@ -463,6 +470,11 @@ def build_read_only_runbook(
         compose_params["memory_project"] = str(memory_project)
     if launch_settings:
         compose_params["launch_settings"] = [str(name) for name in launch_settings]
+    # WHERE THOSE NAMES WERE SAID: the recorded commit this work starts from.
+    # The far side reads the project's own declaration files AT THAT COMMIT
+    # rather than off the working copy it runs the project's scripts out of.
+    if declared_at:
+        compose_params["declared_at"] = str(declared_at)
     return Runbook(
         runbook_id=runbook_id,
         target=target,

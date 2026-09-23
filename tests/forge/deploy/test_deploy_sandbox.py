@@ -42,6 +42,13 @@ from forge.persistence.repositories.runbook_models import Runbook
 
 FIXED = datetime(2026, 9, 6, 12, 0, 0, tzinfo=UTC)
 
+#: WHICH CANDIDATE A TEARDOWN MEANS (26 September 2026). The identity the CHECK
+#: was handed, under the setting the project declares for it. A teardown with
+#: no identity is refused and removes nothing: it would have to go looking, and
+#: what it found could belong to another build's check.
+WHICH_CANDIDATE = {"DEPLOY_IDENTITY": "j-abcdef012345@0123456789abcdef"}
+
+
 #: The five names the deploy step threads, exactly as the spec lists them.
 FIVE_NAMES = (
     "SANDBOX_NAME",
@@ -516,6 +523,7 @@ class TestTheWholeStageCarriesThem:
             feature="FEAT-SBX",
             feat_id="FEAT-SBX",
             task_id="TASK-SBX1",
+            identity_env=WHICH_CANDIDATE,
         )
         assert result.outcome == "complete", result.failed_step
 

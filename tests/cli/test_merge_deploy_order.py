@@ -203,7 +203,11 @@ def test_the_attended_command_joins_then_checks_the_joined_result(
     assert result.exit_code == 0, result.output
     # The join comes first, the live check runs on what it produced, and the
     # candidate comes down. No promote: publication is not switched on.
-    assert wired["order"] == ["merge", "candidate_check", "candidate_down"]
+    # A CLEANUP THAT CANNOT NAME THE CANDIDATE DOES NOT RUN (26 September
+    # 2026): this stand-in project declares no identity, so the candidate is
+    # left standing and the report says so rather than a teardown going
+    # looking for candidates that could belong to another build.
+    assert wired["order"] == ["merge", "candidate_check"]
     assert "result=publication-pending" in result.output
     assert "merged-and-running" not in result.output
     assert "checked and ready to publish" in result.output
@@ -466,7 +470,11 @@ def test_the_attended_command_presses_a_sandboxed_repository_in_its_sandbox(
     result = CliRunner().invoke(merge_deploy_cmd, [FEATURE_ID], obj=settings)
 
     assert result.exit_code == 0, result.output
-    assert wired["order"] == ["merge", "candidate_check", "candidate_down"]
+    # A CLEANUP THAT CANNOT NAME THE CANDIDATE DOES NOT RUN (26 September
+    # 2026): this stand-in project declares no identity, so the candidate is
+    # left standing and the report says so rather than a teardown going
+    # looking for candidates that could belong to another build.
+    assert wired["order"] == ["merge", "candidate_check"]
     assert "result=publication-pending" in result.output
     assert "merged-and-running" not in result.output
     # The join was made in the SANDBOX's clone, in a working folder of its

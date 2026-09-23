@@ -411,7 +411,12 @@ class TestTheWholePressRunsWhereTheRepositoryLives:
         assert outcome.result == "publication-pending", outcome.detail
         # The join first, then the check on the joined result; nothing is
         # published and nothing is deployed, so the candidate comes down.
-        assert deploy.legs() == ["candidate_check", "candidate_down"]
+        # A CLEANUP THAT CANNOT NAME THE CANDIDATE DOES NOT RUN (26 September
+        # 2026). This stand-in project declares no identity, so nothing was
+        # handed to the check and nothing recorded says which candidate this
+        # build stood up — the teardown is not dispatched, the candidate is
+        # left standing, and the report says so in plain words.
+        assert deploy.legs() == ["candidate_check"]
         # The candidate was laid out in the clone, and that is the tree the
         # deploy leg and the live gate were pointed at.
         assert deploy.seen["cwd"] == str(clone / ".forge-candidates" / FEATURE_ID)
@@ -489,7 +494,12 @@ class TestTheWholePressRunsWhereTheRepositoryLives:
         # is what gets checked. What the card pinned no longer decides it.
         assert outcome.result == "publication-pending", outcome.detail
         assert merge.calls, "the join must be made onto the commit the remote has"
-        assert deploy.legs() == ["candidate_check", "candidate_down"]
+        # A CLEANUP THAT CANNOT NAME THE CANDIDATE DOES NOT RUN (26 September
+        # 2026). This stand-in project declares no identity, so nothing was
+        # handed to the check and nothing recorded says which candidate this
+        # build stood up — the teardown is not dispatched, the candidate is
+        # left standing, and the report says so in plain words.
+        assert deploy.legs() == ["candidate_check"]
         assert git_calls.any_in(on_this_side) == []
 
     @pytest.mark.asyncio
