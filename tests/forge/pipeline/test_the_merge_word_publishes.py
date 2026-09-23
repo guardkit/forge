@@ -872,3 +872,228 @@ class TestThePressAndThePublisherReadTheRecordTheSameWay:
         assert joins_two.calls == []
         assert second.result == "published-deployment-pending"
         assert len(publisher.asked) == 1
+
+
+# ---------------------------------------------------------------------------
+# The deploy the press makes once the work is published (C, F, I)
+# ---------------------------------------------------------------------------
+
+
+class _ADeployStepThatSays:
+    """A stand-in deploy stage whose promote leg answers like a real one.
+
+    It records the ownership it was handed and prints one
+    ``<marker>=<identity>`` line, which is exactly the contract a project's own
+    deploy step has. ``reports`` overrides what it claims is running, which is
+    how "the step deployed something else" is driven.
+    """
+
+    def __init__(self, *, reports: str | None = None, marker: str = "DEPLOYED_IDENTITY") -> None:
+        self.reports = reports
+        self.marker = marker
+        self.calls: list[dict[str, Any]] = []
+        self.ownership: list[dict[str, Any]] = []
+
+    async def __call__(self, **kwargs: Any) -> Any:
+        from types import SimpleNamespace
+
+        self.calls.append(kwargs)
+        leg = kwargs.get("leg", "deploy")
+        if leg == "candidate_check":
+            from tests.forge.pipeline.test_merge_executor import GREEN_GATE
+
+            return SimpleNamespace(
+                outcome="complete",
+                verdict="pass",
+                failed_step=None,
+                events=("DeployQueued",),
+                detail={"gate_summary": dict(GREEN_GATE), "candidate": "standing"},
+            )
+        if leg == "candidate_down":
+            return SimpleNamespace(
+                outcome="complete", verdict=None, detail={"candidate": "torn-down"}
+            )
+        owns = dict(kwargs.get("deploy_ownership") or {})
+        self.ownership.append(owns)
+        running = self.reports if self.reports is not None else owns.get("identity")
+        return SimpleNamespace(
+            outcome="complete",
+            verdict="pass",
+            deploy_record_ref="docs/state/x.md",
+            detail={
+                "candidate": "torn-down",
+                "deploy_output": (
+                    f"handed={owns.get('identity')}\n{self.marker}={running}\n"
+                ),
+            },
+        )
+
+
+def _a_declaration(*, declared: bool = True) -> Any:
+    from forge.pipeline.deployment_identity import IdentityDeclaration
+
+    return IdentityDeclaration(
+        setting="DEPLOY_IDENTITY", marker="DEPLOYED_IDENTITY", declared=declared
+    )
+
+
+def _deps_that_can_deploy(
+    config: ForgeConfig,
+    pool: SqliteLifecyclePersistence,  # noqa: F811
+    *,
+    publisher: Any,
+    deploy: Any,
+    declared: bool = True,
+    target: str = "acme/widget-shop::live",
+) -> MergeExecutorDeps:
+    from forge.pipeline.deployment_lock import DeploymentLockStore
+
+    return MergeExecutorDeps(
+        config=config,
+        pool=pool,
+        pipeline_publisher=_FakePublisher(),
+        guardkit_run=_JoinsForReal(),
+        deploy_dispatcher=deploy,
+        publisher=publisher,
+        what_the_machine_says=EVERY_WALL_STANDS,
+        deployment_lock=lambda: DeploymentLockStore(pool.connection),
+        deployment_target=lambda repo, root: (target, _a_declaration(declared=declared)),
+    )
+
+
+class TestTheProjectSaysHowItWantsTheIdentity:
+    """A project that declares nothing is not deployed blind. It is not deployed.
+
+    ``IdentityDeclaration`` has said in its own words since it was written that
+    "a project that declared nothing is NOT given a fabricated arrangement:
+    the press records that the project declares no identity, and the deploy is
+    refused rather than run blind". The press did not read the field, so no
+    such refusal existed and the two defaults were used silently. It reads it
+    now, and this is the refusal.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_project_with_no_identity_block_is_published_and_not_deployed(
+        self,
+        config_with_publication_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> None:
+        publisher = _APublisherThatSays([_published("c" * 40)])
+        deploy = _ADeployStepThatSays()
+        deps = _deps_that_can_deploy(
+            config_with_publication_on,
+            pool,
+            publisher=publisher,
+            deploy=deploy,
+            declared=False,
+        )
+
+        outcome = await _press(deps, repo_root)
+
+        assert outcome.result == "published-deployment-pending"
+        assert "does not say how it wants the identity" in outcome.detail
+        assert "identity block in deploy/profile.yaml" in outcome.detail
+        # NOTHING WAS PROMOTED. The refusal comes before the lock is taken.
+        assert [c.get("leg") for c in deploy.calls].count("promote") == 0
+        assert _record(pool).result == RESULT_PUBLISHED_DEPLOYMENT_PENDING
+
+
+class TestTheDeployPutsLiveExactlyWhatWasChecked:
+    @pytest.mark.asyncio
+    async def test_the_step_reports_the_identity_it_was_handed_and_it_is_running(
+        self,
+        config_with_publication_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> None:
+        """The one path to the third result word, end to end through the press."""
+        from forge.pipeline.publication_record import RESULT_MERGED_AND_RUNNING
+
+        publisher = _APublisherThatSays([_published("c" * 40)])
+        deploy = _ADeployStepThatSays()
+        deps = _deps_that_can_deploy(
+            config_with_publication_on, pool, publisher=publisher, deploy=deploy
+        )
+
+        outcome = await _press(deps, repo_root)
+
+        assert outcome.result == "merged-into-the-remote-and-running", outcome.detail
+        assert outcome.status == "PASSED"
+        assert "reported back the identity it was handed" in outcome.detail
+        assert _record(pool).result == RESULT_MERGED_AND_RUNNING
+        # THE OWNERSHIP THE EXECUTOR ENFORCES travelled with it: the target,
+        # that target's own counter, the build it was granted to, and the name
+        # the PROJECT said it wants the identity handed over in.
+        owns = deploy.ownership[-1]
+        assert owns["target"] == "acme/widget-shop::live"
+        assert owns["target_counter"] == 1
+        assert owns["identity_setting"] == "DEPLOY_IDENTITY"
+        # ...and, on a target nothing has ever run on, the fact the executor
+        # needs to tell a first deploy from a lost note.
+        assert owns["something_is_running"] is False
+
+    @pytest.mark.asyncio
+    async def test_a_second_press_says_something_is_running_there_now(
+        self,
+        config_with_publication_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> None:
+        """Once a deploy is confirmed, R is on the row and the next press says so.
+
+        That one fact is what lets the executor tell "this target has never
+        been deployed from here" from "my note for it has been lost", with
+        nobody to ask.
+        """
+        publisher = _APublisherThatSays([_published("c" * 40)])
+        deploy = _ADeployStepThatSays()
+        deps = _deps_that_can_deploy(
+            config_with_publication_on, pool, publisher=publisher, deploy=deploy
+        )
+        await _press(deps, repo_root)
+
+        from forge.pipeline.deployment_lock import DeploymentLockStore
+
+        row = DeploymentLockStore(pool.connection).read("acme/widget-shop::live")
+        assert row.running_identity == deploy.ownership[-1]["identity"]
+        assert row.nothing_is_running is False
+
+    @pytest.mark.asyncio
+    async def test_a_step_that_reports_a_different_identity_is_a_failed_deploy(
+        self,
+        config_with_publication_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> None:
+        publisher = _APublisherThatSays([_published("c" * 40)])
+        deploy = _ADeployStepThatSays(reports="j-somebodyelse@0000")
+        deps = _deps_that_can_deploy(
+            config_with_publication_on, pool, publisher=publisher, deploy=deploy
+        )
+
+        outcome = await _press(deps, repo_root)
+
+        assert outcome.result == "merged-deploy-failed"
+        assert outcome.status == "FAILED"
+        assert "j-somebodyelse@0000" in outcome.detail
+        assert "is NOT running" in outcome.detail
+
+    @pytest.mark.asyncio
+    async def test_a_step_that_reports_nothing_at_all_is_a_failed_deploy(
+        self,
+        config_with_publication_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> None:
+        """Saying nothing is not the same as saying the wrong thing, and it is said."""
+        publisher = _APublisherThatSays([_published("c" * 40)])
+        deploy = _ADeployStepThatSays(marker="SOMETHING_ELSE")
+        deps = _deps_that_can_deploy(
+            config_with_publication_on, pool, publisher=publisher, deploy=deploy
+        )
+
+        outcome = await _press(deps, repo_root)
+
+        assert outcome.result == "merged-deploy-failed"
+        assert "reported no identity at all" in outcome.detail

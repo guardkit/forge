@@ -561,11 +561,264 @@ class TestWhatARequestHasToCarry:
         assert built.target_counter == 3
         assert built.identity == "j-abcdef@1234"
         assert built.launch_settings == ("SOME_TOOL_CACHE",)
+        # The coordinator said nothing about what is running, so nothing is
+        # assumed: the safe reading of an absent field is "this request cannot
+        # tell me a deploy has happened before".
+        assert built.something_is_running is False
+
+    def test_what_the_coordinator_says_is_running_travels_on_the_request(
+        self, workshop, TARGET
+    ) -> None:
+        """It is read off the ownership block the press built under the lock."""
+        built = request_from(
+            {
+                "target": TARGET,
+                "build": "build-a",
+                "target_counter": 3,
+                "something_is_running": True,
+            },
+            cwd=str(workshop),
+            script="deploy.sh",
+        )
+        assert isinstance(built, DeployRequest)
+        assert built.something_is_running is True
+
+
+# ---------------------------------------------------------------------------
+# (f) A NOTE THAT IS NOT THERE IS NOT AN EMPTY SLOT
+#
+# The stage's reviewer drove this hole and it was the blocker: MISSING was
+# handled as "fine, nothing here", and only UNREADABLE took rule (f)'s branch.
+# So a note removed under a live command — or a helper that came back onto an
+# empty notes folder, which is what a sandbox restart onto a fresh
+# FORGE_DEPLOY_NOTES_DIR does — had a second deploy command started beside the
+# first. These are the cases that hole is now closed against.
+# ---------------------------------------------------------------------------
+
+
+class TestANoteThatIsNotThere:
+    def test_the_note_is_removed_under_a_live_command_and_the_slot_is_occupied(
+        self, notes, workshop, TARGET
+    ) -> None:
+        """THE BLOCKER, driven: nothing new starts beside a live command."""
+        executor = _executor(notes, stop_confirm_seconds=20.0)
+        running = _Background(executor, _ask(TARGET, _slow(workshop), 1, "a", workshop))
+        running.begin()
+        group = 0
+        try:
+            group = int(_wait_for_note(notes)["group"])
+            # The note is REMOVED, not corrupted. This is the shape a lost
+            # folder has, and it used to read as an empty slot.
+            for path in notes.glob("*.json"):
+                path.unlink()
+            answer = executor.run(_ask(TARGET, _quick(workshop), 2, "b", workshop))
+            assert answer.accepted is False, answer.sentence
+            assert answer.word == "the-slot-is-occupied"
+            assert "no note of its own" in answer.sentence
+            # ...and the first command is still the only one alive.
+            assert ProcessTable().members_of(group)
+        finally:
+            _kill(group)
+            running.stop()
+
+    def test_a_restarted_helper_with_no_notes_at_all_finds_the_live_command(
+        self, notes, workshop, TARGET
+    ) -> None:
+        """Rule (e) and (f) together: reconcile looks in the process table.
+
+        The walk of the notes folder can only see targets it has a file for,
+        so a helper whose notes did not survive would have settled NOTHING.
+        The command carries its marker in its own argument list for exactly
+        this question.
+        """
+        first = _executor(notes, stop_confirm_seconds=20.0)
+        running = _Background(first, _ask(TARGET, _slow(workshop), 1, "a", workshop))
+        running.begin()
+        group = 0
+        try:
+            group = int(_wait_for_note(notes)["group"])
+            for path in notes.glob("*.json"):
+                path.unlink()
+            second = _executor(notes, stop_confirm_seconds=20.0)
+            settled = second.reconcile()
+            assert "occupied" in settled.get(_safe(TARGET), ""), settled
+            answer = second.run(_ask(TARGET, _quick(workshop), 3, "c", workshop))
+            assert answer.accepted is False, answer.sentence
+            assert answer.word == "the-slot-is-occupied"
+        finally:
+            _kill(group)
+            running.stop()
+
+    def test_nothing_alive_and_nothing_ever_run_is_the_first_deploy(
+        self, notes, workshop, TARGET
+    ) -> None:
+        """The one path where a missing note is not a loss, and why.
+
+        Requiring the coordinator here would mean the first deploy of every
+        target needs an answer about a target nobody has ever heard of, and
+        the deploy path would be dead on the day it is installed.
+        """
+        answer = _executor(notes).run(_ask(TARGET, _quick(workshop), 1, "a", workshop))
+        assert answer.accepted is True, answer.sentence
+
+    def test_nothing_alive_but_something_is_running_there_is_a_lost_note(
+        self, notes, workshop, TARGET
+    ) -> None:
+        """The coordinator read R under the lock and says something is running.
+
+        Then a deploy has happened before, so a note SHOULD exist, so its
+        absence is a loss — and with nobody to ask, that is refused.
+        """
+        answer = _executor(notes).run(
+            _ask(
+                TARGET,
+                _quick(workshop),
+                4,
+                "build-b",
+                workshop,
+                something_is_running=True,
+            )
+        )
+        assert answer.accepted is False, answer.sentence
+        assert answer.word == "nobody-can-be-asked-who-owns-it"
+        assert "something is already running" in answer.sentence
+
+    def test_with_a_coordinator_the_missing_note_is_settled_by_asking_it(
+        self, notes, workshop, TARGET
+    ) -> None:
+        """Rule (f)'s last clause on the MISSING half, not just the unreadable one."""
+        asked: list[str] = []
+
+        def _coordinator(target: str):
+            asked.append(target)
+            return {"counter": 7, "build": "build-c"}
+
+        executor = _executor(notes, ask_the_coordinator=_coordinator)
+        refused = executor.run(
+            _ask(TARGET, _quick(workshop), 6, "build-b", workshop,
+                 something_is_running=True)
+        )
+        assert refused.accepted is False
+        assert refused.word == "the-coordinator-says-somebody-else-owns-it"
+        accepted = executor.run(
+            _ask(TARGET, _quick(workshop), 7, "build-c", workshop,
+                 something_is_running=True)
+        )
+        assert accepted.accepted is True, accepted.sentence
+        assert asked == [TARGET, TARGET]
+
+    def test_a_process_table_that_cannot_be_read_refuses_a_missing_note_too(
+        self, notes, workshop, TARGET
+    ) -> None:
+        executor = _executor(notes, process_table=ProcessTable("/nowhere-at-all"))
+        answer = executor.run(_ask(TARGET, _quick(workshop), 1, "a", workshop))
+        assert answer.accepted is False, answer.sentence
+        assert answer.word == "the-slot-cannot-be-settled"
+        assert "could not be told" in answer.sentence
+
+
+class TestTheNotesFolderItself:
+    def test_a_folder_that_cannot_be_written_is_said_at_the_start(
+        self, tmp_path, workshop, TARGET
+    ) -> None:
+        """The setting is named, once, rather than found in the middle of a merge."""
+        where = tmp_path / "read-only-notes"
+        where.mkdir()
+        where.chmod(0o500)
+        try:
+            executor = _executor(where)
+            executor.reconcile()
+            answer = executor.run(_ask(TARGET, _quick(workshop), 1, "a", workshop))
+            assert answer.accepted is False, answer.sentence
+            assert answer.word == "the-executors-notes-folder-cannot-be-used"
+            assert "FORGE_DEPLOY_NOTES_DIR" in answer.sentence
+        finally:
+            where.chmod(0o700)
+
+
+class TestTheRunningServiceCanAskTheCoordinator:
+    """Rule (f)'s question is reachable in the service, not only in a test.
+
+    The helper used to build its executor with no way to ask, so in the
+    running system that branch could only ever answer "nobody can be asked".
+    It is an operator's setting now: an address for the coordinator's own
+    read-only answer. Unset, the refusal is exactly what it was.
+
+    The stand-in below is a server this test starts on a loopback port the
+    kernel picks. Nothing real is contacted.
+    """
+
+    def test_with_no_address_there_is_nobody_to_ask(self) -> None:
+        from forge.deploy_sidecar.service import coordinator_owner_asker
+
+        assert coordinator_owner_asker({}) is None
+
+    def test_with_an_address_it_asks_and_reads_the_two_fields_back(self) -> None:
+        import http.server
+        import threading
+
+        from forge.deploy_sidecar.service import (
+            COORDINATOR_OWNER_ENV,
+            coordinator_owner_asker,
+        )
+
+        asked: list[str] = []
+
+        class _Answer(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802 — the library's own name
+                asked.append(self.path)
+                body = json.dumps({"counter": 4, "build": "build-b"}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args) -> None:  # noqa: D102 — quiet
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), _Answer)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            host, port = server.server_address[:2]
+            ask = coordinator_owner_asker(
+                {COORDINATOR_OWNER_ENV: f"http://{host}:{port}/who-owns"}
+            )
+            assert ask is not None
+            assert ask("shop::live") == {"counter": 4, "build": "build-b"}
+            assert asked and "target=shop%3A%3Alive" in asked[0]
+        finally:
+            server.shutdown()
+
+    def test_a_coordinator_that_cannot_be_reached_is_a_refusal_not_a_crash(
+        self,
+    ) -> None:
+        from forge.deploy_sidecar.service import (
+            COORDINATOR_OWNER_ENV,
+            coordinator_owner_asker,
+        )
+
+        # Port 1 on loopback: nothing listens, and nothing outside this machine
+        # is contacted.
+        ask = coordinator_owner_asker({COORDINATOR_OWNER_ENV: "http://127.0.0.1:1/x"})
+        assert ask is not None
+        assert ask("shop::live") is None
 
 
 # ---------------------------------------------------------------------------
 # Small helpers
 # ---------------------------------------------------------------------------
+
+
+def _kill(group: int) -> None:
+    """Stop a process group this test started, whatever the notes say."""
+    if not group:
+        return
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(group, sig)
+        except OSError:
+            return
 
 
 def _safe(target: str) -> str:
