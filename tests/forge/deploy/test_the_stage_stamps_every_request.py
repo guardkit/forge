@@ -19,10 +19,26 @@ Two kinds of proof here, and they fail in different ways:
 
 * every request's recorded body is read and the pair asserted on it, so a
   missing stamp is named directly;
-* the stand-in helper REFUSES an unstamped request, the way the real helper
-  refuses a request it cannot bind to a recorded commit, and the refusal comes
-  back as a red leg. So a stamp dropped anywhere between the dispatcher and
-  the wire turns these legs red even if somebody deletes the assertions.
+* the stand-in helper REFUSES an unstamped request, so the refusal comes back
+  as a red leg. A stamp dropped anywhere between the dispatcher and the wire
+  turns these legs red even if somebody deletes the assertions.
+
+WHAT THE STAND-IN IS, EXACTLY (corrected 23 September 2026, the eighth
+review). The second class's stand-in refuses EVERY request that carries
+neither the build nor the commit. The real helper is not that strict and this
+file used to say it was. What the real helper does, since the same review, is
+refuse an unstamped request that asks for the project's own declarations to be
+READ — a deploy of the live thing always asks (its two setting names are
+committed lines), and so does any request naming a memory or a setting of the
+project's own. A request that asks for nothing declared needs no binding and
+is served with the factory's own list, as it always was; a person running one
+by hand says ``by_hand: true`` and is served at the helper's committed HEAD.
+So for the promote's deploy step this stand-in mirrors production, and for the
+plainer legs it is deliberately stricter — a tighter net around the stamp, not
+a claim about the far side. The real helper's own refusal of an unstamped
+deploy is proven against the real route in
+``tests/forge/deploy_sidecar/test_the_project_widens_the_environment_door.py``
+(``test_a_deploy_with_no_build_at_all_is_refused_and_nothing_is_deployed``).
 
 Nothing real is contacted. The stand-in helper is an HTTP server in this
 process, bound to loopback on a port the kernel picks.
@@ -79,11 +95,16 @@ class _ARecordingHelper:
     """A stand-in for the helper: it records every request and answers.
 
     It also REFUSES a request that carries neither the build nor the commit,
-    with the same shape of answer the real helper gives a request it will not
-    serve — an HTTP 400 carrying one plain sentence, which the client relays
-    as a non-zero exit and the step records as a failure. That is what makes a
-    dropped stamp show up as a red leg rather than as a quietly weaker
-    request.
+    in the same SHAPE the real helper refuses one — an HTTP 400 carrying one
+    plain sentence, which the client relays as a non-zero exit and the step
+    records as a failure. That is what makes a dropped stamp show up as a red
+    leg rather than as a quietly weaker request.
+
+    It is stricter than the real helper on purpose, and this file's own
+    docstring says exactly where: the real helper refuses an unstamped request
+    that asks for the project's declarations to be READ (every deploy of the
+    live thing does) and serves one that asks for nothing declared. This
+    stand-in refuses both, so no leg of this stage can drop the pair unnoticed.
     """
 
     def __init__(self) -> None:
@@ -341,6 +362,11 @@ class TestADroppedStampIsARedLeg:
         This is the test that bites when somebody deletes the stamp from where
         the stage makes its script runner: the assertions above name it, and
         this one fails even with those assertions gone.
+
+        The stand-in's refusal is stricter than the real helper's on the
+        plainer legs; the class docstring says so, and the real helper's own
+        refusal of an unstamped deploy is proven against the real route in the
+        door tests rather than claimed here.
         """
         result = await _drive(
             leg=leg,

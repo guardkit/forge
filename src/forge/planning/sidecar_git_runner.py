@@ -321,6 +321,19 @@ class SidecarGitRunner:
             body["memory_project"] = str(memory_project)
         if launch_settings:
             body["launch_settings"] = [str(name) for name in launch_settings]
+        if body.get("memory_project") or body.get("launch_settings"):
+            # AND THIS DOOR CITES NO BUILD RECORD, AND SAYS SO (23 September
+            # 2026, the eighth review). The helper refuses a request that asks
+            # for a project's declarations to be read and says nothing about
+            # whose work it is, because that is also what a request whose
+            # coordinator stamp had been dropped looks like. THIS door never
+            # had a stamp to drop: planning runs before there is a build to
+            # name, so there is no record to bind to and nothing is claiming
+            # one. It asks to be read at the committed HEAD of the copy the
+            # helper has, in as many words. The one door that IS stamped — the
+            # deploy stage's — says nothing here, so a stamp dropped there
+            # still goes red.
+            body["by_hand"] = True
         logger.info(
             "%s: %d file(s) onto %s for %s via %s (%d declared check(s); "
             "repo_path %s is the sandbox's to resolve)",

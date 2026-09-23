@@ -1039,6 +1039,9 @@ def run_declared_command_in_sandbox(
     post: Callable[..., Any] | None = None,
     memory_project: str | None = None,
     launch_settings: "Sequence[str] | None" = None,
+    build: str | None = None,
+    declared_at: str | None = None,
+    by_hand: bool = False,
 ) -> "tuple[int | None, str]":
     """Run the declared test command in the sandbox. ``(exit_code, detail)``.
 
@@ -1059,6 +1062,18 @@ def run_declared_command_in_sandbox(
     command that launches the build system ran with memory off. Names only:
     every value is taken from the sandbox helper's own environment, and only
     if it has one.
+
+    WHO IS ASKING (23 September 2026). The helper reads the project's own
+    declarations at a commit, and since the eighth review it will not do that
+    for a request that says nothing about whose work it is — that shape is
+    what a factory request whose stamp had been dropped looked like, and it
+    used to be served quietly at the helper's committed HEAD. So a request
+    that carries ``memory_project`` or ``launch_settings`` carries one of two
+    things as well: ``build`` (with ``declared_at``, the commit the ledger
+    records it as starting from), which the helper confirms with the
+    coordinator's own read-only answer; or ``by_hand``, which only somebody
+    running this command by hand should set. A caller that declares neither a
+    memory nor a setting name needs neither and is unchanged.
     """
     from forge.planning.sidecar_git_runner import _urllib_post
 
@@ -1074,6 +1089,12 @@ def run_declared_command_in_sandbox(
         body["memory_project"] = str(memory_project)
     if launch_settings:
         body["launch_settings"] = [str(name) for name in launch_settings]
+    if build:
+        body["build"] = str(build)
+    if declared_at:
+        body["declared_at"] = str(declared_at)
+    elif by_hand and not build:
+        body["by_hand"] = True
     try:
         status, decoded = sender(
             url, body, float(timeout_seconds) + SANDBOX_TEST_HTTP_MARGIN_S
@@ -2434,6 +2455,19 @@ def make_gates_green_reader(
                     repo=_repo,
                     memory_project=_memory,
                     launch_settings=_names,
+                    # AND THIS READER CITES NO BUILD RECORD, AND SAYS SO (23
+                    # September 2026, the eighth review). The helper refuses a
+                    # request that asks for a project's declarations to be
+                    # read and names neither a build nor a commit, because
+                    # that is what a dropped coordinator stamp looks like.
+                    # This reader has never sent the build id, so it claims
+                    # what it is really asking for: read them at the committed
+                    # HEAD of the copy you have. CARRY IT FORWARD: the build
+                    # id is right here, and stamping this request with it
+                    # would bind these names to the recorded commit — which
+                    # also needs the coordinator's read-only answer to be
+                    # reachable from inside the sandbox.
+                    by_hand=True,
                 )
 
             # Step 5 goes in there too (L3b's coach, 2026-09-08): the feature's

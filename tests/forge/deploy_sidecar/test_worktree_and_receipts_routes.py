@@ -706,6 +706,11 @@ class TestTheLegRoute:
                 # with is declared by name — the same door a project uses to
                 # say what its own builds need.
                 "launch_settings": ["FAKE_LEG_EXIT"],
+                # And a request that asks for that declaration to be read says
+                # whose it is: a factory request carries the build the
+                # coordinator stamped on it, and this one is made by hand from
+                # a test, at this copy's committed HEAD.
+                "by_hand": True,
             },
             config=cfg,
         )

@@ -369,7 +369,9 @@ class TestADeclarationIsACommittedLine:
         assert DECLARED_SETTING in declared
         assert UNDECLARED_SETTING not in declared
         assert "committed HEAD" in where
-        status, body = _ask(project, {"launch_settings": [UNDECLARED_SETTING]})
+        status, body = _ask(
+            project, {"launch_settings": [UNDECLARED_SETTING], "by_hand": True}
+        )
         assert status == 400, body
         assert "an uncommitted line in a working copy is not a declaration" in (
             body["error"]
@@ -451,11 +453,19 @@ class TestADeclarationIsACommittedLine:
 
 
 class TestTheRealRouteWithARealChild:
-    """The whole way through: the HTTP handler, the runner and the child."""
+    """The whole way through: the HTTP handler, the runner and the child.
+
+    These requests are made BY HAND — no coordinator, no build — and since 23
+    September 2026 a request that asks for a project's declarations to be read
+    has to say that out loud. So each one carries ``by_hand: true``, which is
+    the claim "by hand, at this copy's committed HEAD" and nothing more.
+    """
 
     def test_a_name_the_project_declares_arrives(self, tmp_path: Path) -> None:
         project = _a_project(tmp_path / "widget-shop", declares=(DECLARED_SETTING,))
-        status, body = _ask(project, {"launch_settings": [DECLARED_SETTING]})
+        status, body = _ask(
+            project, {"launch_settings": [DECLARED_SETTING], "by_hand": True}
+        )
         assert status == 200, body
         assert body["exit_code"] == 0, body
         given = _names_the_child_was_given(body)
@@ -466,7 +476,9 @@ class TestTheRealRouteWithARealChild:
         self, tmp_path: Path
     ) -> None:
         project = _a_project(tmp_path / "widget-shop", declares=(DECLARED_SETTING,))
-        status, body = _ask(project, {"launch_settings": [UNDECLARED_SETTING]})
+        status, body = _ask(
+            project, {"launch_settings": [UNDECLARED_SETTING], "by_hand": True}
+        )
         assert status == 400, body
         assert UNDECLARED_SETTING in body["error"]
         assert "does not declare that name" in body["error"]
@@ -482,7 +494,9 @@ class TestTheRealRouteWithARealChild:
         project = _a_project(
             tmp_path / "widget-shop", declares=(A_RESERVED_SETTING, DECLARED_SETTING)
         )
-        status, body = _ask(project, {"launch_settings": [A_RESERVED_SETTING]})
+        status, body = _ask(
+            project, {"launch_settings": [A_RESERVED_SETTING], "by_hand": True}
+        )
         assert status == 400, body
         assert A_RESERVED_SETTING in body["error"]
         assert "keeps for itself" in body["error"]
@@ -491,7 +505,16 @@ class TestTheRealRouteWithARealChild:
     def test_no_launch_settings_is_the_factorys_list_only(
         self, tmp_path: Path
     ) -> None:
-        """The behaviour every caller written before these fields asks for."""
+        """The behaviour every caller written before these fields asks for.
+
+        AND IT NEEDS NO BINDING AND NO CLAIM (23 September 2026). This request
+        asks for nothing declared — no setting names, no memory name, and it
+        owns no deployment target — so there is no declaration to read and
+        nothing to bind a commit to. It carries no build and does not say it
+        is a by-hand run, and it is served all the same, with the factory's
+        own named list and nothing else. Refusing this shape is what swept
+        forty tests the first time this rule was tried.
+        """
         project = _a_project(tmp_path / "widget-shop", declares=(DECLARED_SETTING,))
         status, body = _ask(project, {})
         assert status == 200, body
@@ -662,17 +685,72 @@ class TestTheCommitIsBoundToTheRecord:
     def test_a_by_hand_run_reads_committed_head_and_says_so(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Neither a build nor a commit: this copy's committed HEAD, said out loud."""
+        """Neither a build nor a commit, and it SAYS it is a by-hand run.
+
+        The claim is the whole of it: ``by_hand: true`` means "by hand, at this
+        copy's committed HEAD", and the sentence a refusal is answered with
+        names that HEAD, so a person reading it never has to guess where the
+        name was looked for.
+        """
         project, _older, _head = self._two_commits(tmp_path)
         with _no_coordinator(monkeypatch):
-            status, body = _ask(project, {"launch_settings": [UNDECLARED_SETTING]})
+            status, body = _ask(
+                project,
+                {"launch_settings": [UNDECLARED_SETTING], "by_hand": True},
+            )
         assert status == 200, body
         assert UNDECLARED_SETTING in _names_the_child_was_given(body)
         # And a name at neither commit is refused with HEAD named in words.
         with _no_coordinator(monkeypatch):
-            status, refusal = _ask(project, {"launch_settings": ["NOT_ANYWHERE"]})
+            status, refusal = _ask(
+                project, {"launch_settings": ["NOT_ANYWHERE"], "by_hand": True}
+            )
         assert status == 400, refusal
         assert "the committed HEAD of the copy of this project" in refusal["error"]
+
+    def test_the_same_run_without_the_claim_is_refused_and_nothing_starts(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A DROPPED STAMP IS NOT THE QUIET PATH (23 September 2026).
+
+        The request above, minus the claim, is the shape of a factory request
+        whose coordinator stamp was dropped on the way: it asks for this
+        project's declarations to be read and says nothing about whose work it
+        is. That used to be served at this copy's committed HEAD without a
+        word. It is refused now, and the refusal says both ways of being
+        answerable — carry the build, or say you are running by hand.
+        """
+        project, _older, _head = self._two_commits(tmp_path)
+        with _no_coordinator(monkeypatch):
+            status, body = _ask(project, {"launch_settings": [UNDECLARED_SETTING]})
+        assert status == 400, body
+        assert "names neither the build it is for nor a commit" in body["error"]
+        assert "by_hand" in body["error"]
+        # NOTHING STARTED: no exit code, no output, no child.
+        assert "exit_code" not in body and "output_tail" not in body
+
+    def test_a_build_with_nobody_to_ask_is_refused_not_read_at_head(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A build this helper cannot confirm anything about is not served.
+
+        It used to fall back to this copy's committed HEAD, so a request that
+        named a build was read at a commit nobody recorded for it. The
+        executor's ownership route already pays this cost and this pays it
+        too; the sentence names the setting that carries the coordinator's
+        read-only answer.
+        """
+        project, _older, _head = self._two_commits(tmp_path)
+        with _no_coordinator(monkeypatch):
+            status, body = _ask(
+                project,
+                {"launch_settings": [UNDECLARED_SETTING], "build": THE_BUILD},
+            )
+        assert status == 400, body
+        assert THE_BUILD in body["error"]
+        assert "no way to ask the coordinator" in body["error"]
+        assert COORDINATOR_OWNER_ENV in body["error"]
+        assert "exit_code" not in body
 
 
 class TestBothFilesAreReadAtTheBoundCommit:
@@ -974,3 +1052,32 @@ class TestTheDeployBlocksNamesAreCommittedLinesToo:
         assert status == 400, refused
         assert "does not declare that name" in refused["error"]
         assert executor.handed == []
+
+    def test_a_deploy_with_no_build_at_all_is_refused_and_nothing_is_deployed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """THE STAMP IS NOT OPTIONAL ON THE ONE ROUTE THAT CHANGES THE LIVE
+        THING (23 September 2026, the eighth review).
+
+        A deploy request reads the project's declared setting names whether or
+        not it carries ``launch_settings`` of its own, so it asks for a
+        declaration and must say whose work it is. Stripped of its build and
+        its commit — the shape of a factory request whose coordinator stamp
+        was dropped — it used to be served at this copy's committed HEAD. It
+        is refused now, before the executor sees it, and nothing is deployed.
+        """
+        project, head = self._a_project_that_declares_one_and_has_another_on_disk(
+            tmp_path
+        )
+        owning = self._owning(
+            self.COMMITTED["setting"], self.COMMITTED["artifact"], head
+        )
+        owning.pop("build")
+        owning.pop("declared_at")
+        with _no_coordinator(monkeypatch):
+            status, body, executor = _ask_to_deploy(project, owning)
+        assert status == 400, body
+        assert "names neither the build it is for nor a commit" in body["error"]
+        assert "by_hand" in body["error"]
+        assert executor.handed == [], "nothing may reach the executor"
+        assert "exit_code" not in body
