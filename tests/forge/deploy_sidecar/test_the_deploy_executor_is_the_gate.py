@@ -102,6 +102,34 @@ def _slow(workshop: Path, seconds: int = 120) -> str:
     )
 
 
+def _writes_at_the_end(
+    workshop: Path, name: str, landed: Path, *, seconds: int
+) -> str:
+    """A stand-in deploy step that puts its own name on "the target" at the END.
+
+    The path is baked into the script's own text rather than read out of the
+    environment, because the environment the child gets is the factory's named
+    list and nothing else — which is the door this stage closed.
+    """
+    return _script(
+        workshop,
+        f"deploy-{name}.sh",
+        "#!/bin/sh\n"
+        f'printf "starting {name}\\n"\n'
+        + (f"sleep {seconds}\n" if seconds else "")
+        + f'printf "{name}\\n" > "{landed}"\n'
+        'printf "DEPLOYED_IDENTITY=%s\\n" "${DEPLOY_IDENTITY:-nothing}"\n'
+        "exit 0\n",
+    )
+
+
+def _live_groups(table: ProcessTable, target: str) -> list[int]:
+    """The process groups of every live deploy command for this target."""
+    found = table.carrying(f"{DEPLOY_MARKER_PREFIX}:{_safe(target)}:") or []
+    groups = {table.group_of(pid) for pid in found}
+    return sorted(group for group in groups if group)
+
+
 def _ask(
     target: str, script: str, counter: int, build: str, workshop: Path, **kw
 ) -> DeployRequest:
@@ -264,6 +292,106 @@ class TestATakeoverStopsAndConfirms:
         finally:
             running.stop()
 
+    def test_a_taken_over_command_never_destroys_its_successors_note(
+        self, notes, workshop, TARGET
+    ) -> None:
+        """THE BLOCKER the stage's reviewer drove, step by step.
+
+        A (counter 5) starts a slow command; B (counter 6) takes over, so A's
+        group is stopped and confirmed gone and B's command starts and is
+        alive; A's request then returns. A's waiter used to clear the note it
+        was holding IN MEMORY — which by then was B's note — leaving
+        ``{counter 0, highest 5, highest_build A}`` behind. A third request, C
+        (counter 7), then read an EMPTY slot, was accepted, and its command ran
+        beside B's live one; C finished and wrote its result, and B's OLDER
+        command finished afterwards and overwrote it. Three things went wrong
+        at once: two commands on one target, the target's highest counter
+        LOWERED from 6 to 5, and the older result left running.
+
+        The note is inspected after every step, ONE live command is asserted at
+        every moment, and the NEWEST result is what is on the target at the
+        end. The stage's existing takeover test used a QUICK successor and
+        never looked at the note or made a third request, which is why it
+        passed while this was broken; it is kept, and this stands beside it.
+        """
+        executor = _executor(notes, stop_confirm_seconds=20.0)
+        # WHAT IS "ON THE TARGET": one file each command writes its own name
+        # into, at the END of its work. A command that is stopped part-way
+        # never writes, which is exactly what a stopped deploy means here.
+        landed = workshop / "what-is-on-the-target"
+        a_slow = _writes_at_the_end(workshop, "a", landed, seconds=120)
+        b_slow = _writes_at_the_end(workshop, "b", landed, seconds=120)
+        c_quick = _writes_at_the_end(workshop, "c", landed, seconds=0)
+        table = ProcessTable()
+        a = _Background(executor, _ask(TARGET, a_slow, 5, "build-a", workshop))
+        b = _Background(executor, _ask(TARGET, b_slow, 6, "build-b", workshop))
+        a_group = b_group = 0
+        try:
+            # --- A is running, and the note says so ------------------------
+            a.begin()
+            note = _wait_for_note(notes, until=lambda n: n["counter"] == 5)
+            a_group = int(note["group"])
+            assert note["build"] == "build-a"
+            assert note["highest_counter"] == 5
+            assert table.members_of(a_group), "A's command never started"
+            assert _live_groups(table, TARGET) == [a_group]
+
+            # --- B takes over: A is stopped and confirmed gone -------------
+            b.begin()
+            note = _wait_for_note(notes, until=lambda n: n["counter"] == 6)
+            b_group = int(note["group"])
+            assert note["build"] == "build-b"
+            assert note["highest_counter"] == 6
+            assert table.members_of(a_group) == [], "A's group was not confirmed gone"
+            # ONE live command, and it is B's.
+            assert _live_groups(table, TARGET) == [b_group]
+
+            # --- A's request comes back. IT WRITES NOTHING -----------------
+            a.until_answered()
+            assert a.answer is not None
+            assert a.answer.accepted is False, a.answer.sentence
+            assert a.answer.word == "the-deploy-command-was-stopped-by-a-takeover"
+            assert "nothing was deployed by this request" in a.answer.sentence
+            # B's note is untouched: the counter is still 6 and the group is
+            # still B's, so the slot is not empty and the counter has not gone
+            # backwards.
+            after = _read_note(notes)
+            assert after["counter"] == 6
+            assert after["build"] == "build-b"
+            assert after["group"] == b_group
+            assert after["highest_counter"] == 6
+            assert after["highest_build"] == "build-b"
+
+            # --- C arrives. It takes over B; it does NOT run beside it -----
+            answered = executor.run(_ask(TARGET, c_quick, 7, "build-c", workshop))
+            assert answered.accepted is True, answered.sentence
+            assert table.members_of(b_group) == [], "B's group was not confirmed gone"
+            assert _live_groups(table, TARGET) == []
+
+            # --- B's request comes back. IT WRITES NOTHING EITHER ----------
+            b.until_answered()
+            assert b.answer is not None
+            assert b.answer.accepted is False, b.answer.sentence
+            assert b.answer.word == "the-deploy-command-was-stopped-by-a-takeover"
+
+            # --- the note at the end ---------------------------------------
+            ended = _read_note(notes)
+            assert ended["group"] == 0, "C's command is over, so the slot is free"
+            assert ended["highest_counter"] == 7, "the counter never goes down"
+            assert ended["highest_build"] == "build-c"
+
+            # --- and the NEWEST result is what is on the target ------------
+            assert landed.read_text(encoding="utf-8").strip() == "c"
+            # A delayed request from A cannot deploy anything now.
+            delayed = executor.run(_ask(TARGET, c_quick, 5, "build-a", workshop))
+            assert delayed.accepted is False
+            assert delayed.word == "the-counter-has-moved-on"
+        finally:
+            _kill(a_group)
+            _kill(b_group)
+            a.stop()
+            b.stop()
+
     def test_a_command_that_cannot_be_confirmed_stopped_refuses(
         self, notes, workshop, TARGET
     ) -> None:
@@ -285,6 +413,127 @@ class TestATakeoverStopsAndConfirms:
         assert answer.word == "the-old-command-could-not-be-confirmed-stopped"
         assert "published, deployment pending" in answer.sentence
         assert "not confirmed gone" in answer.sentence
+
+    def test_a_stop_on_one_target_does_not_hold_up_another_target(
+        self, notes, workshop, tmp_path
+    ) -> None:
+        """The slot is per TARGET, and so is the lock that decides it.
+
+        Stopping a command can take the whole stop-and-confirm limit. Under one
+        lock across every target — which is what the code did, while its own
+        comment promised the opposite — a deploy to a target nobody is stopping
+        anything on waited for it.
+        """
+        stubborn = 2**22 - 1  # a group the stub below never lets go of
+        x = f"bench/x-{tmp_path.name}::live"
+        y = f"bench/y-{tmp_path.name}::live"
+        executor = _executor(
+            notes,
+            stop_confirm_seconds=6.0,
+            process_table=_AliveOnly({stubborn}),
+        )
+        _write_note(notes, x, counter=1, build="build-a", group=stubborn)
+        stopping = _Background(executor, _ask(x, _quick(workshop), 2, "build-b", workshop))
+        stopping.begin()
+        try:
+            # X's stop is under way and will not be confirmed for six seconds.
+            time.sleep(0.5)
+            began = time.monotonic()
+            answer = executor.run(_ask(y, _quick(workshop), 1, "build-c", workshop))
+            took = time.monotonic() - began
+            assert answer.accepted is True, answer.sentence
+            assert took < 3.0, f"Y waited {took:.1f}s on a stop for X"
+        finally:
+            stopping.stop()
+
+
+# ---------------------------------------------------------------------------
+# (d) the note is written in two parts, and the window is the marker's to cover
+# ---------------------------------------------------------------------------
+
+
+class TestTheNoteIsWrittenInTwoParts:
+    def test_a_note_is_on_disk_before_the_command_is_started(
+        self, notes, workshop, TARGET
+    ) -> None:
+        """The provisional note — target, counter, build, marker, "starting"."""
+        seen: list[dict] = []
+
+        def _watching_spawn(**kwargs):
+            seen.append(_read_note(notes))
+            return subprocess.Popen(**kwargs)  # noqa: S603 — the executor's own argv
+
+        answer = _executor(notes, spawn=_watching_spawn).run(
+            _ask(TARGET, _quick(workshop), 1, "build-a", workshop)
+        )
+        assert answer.accepted is True, answer.sentence
+        assert len(seen) == 1
+        before = seen[0]
+        assert before["phase"] == "starting"
+        assert before["counter"] == 1
+        assert before["build"] == "build-a"
+        assert before["group"] == 0, "the group does not exist until it exists"
+        assert before["marker"].startswith(f"{DEPLOY_MARKER_PREFIX}:")
+        assert before["highest_counter"] == 1
+
+    def test_the_note_is_completed_with_the_group_after_the_command_starts(
+        self, notes, workshop, TARGET
+    ) -> None:
+        answer = _executor(notes).run(
+            _ask(TARGET, _quick(workshop), 1, "build-a", workshop)
+        )
+        assert answer.accepted is True, answer.sentence
+        ended = _read_note(notes)
+        # The command is over by now, so the slot is free and the counter kept.
+        assert ended["group"] == 0
+        assert ended["highest_counter"] == 1
+        assert ended["highest_build"] == "build-a"
+
+    def test_a_starting_note_is_occupied_while_its_marker_is_alive(
+        self, notes, workshop, TARGET
+    ) -> None:
+        """The window the two writes leave is covered by the MARKER.
+
+        A helper that stopped between writing the note and knowing the
+        command's group has no group to look for. The reconciler must not read
+        that as an empty slot: it looks for the note's own marker.
+        """
+        marker = the_marker_for(TARGET)
+        _write_note(
+            notes,
+            TARGET,
+            counter=1,
+            build="build-a",
+            group=0,
+            marker=marker,
+            phase="starting",
+        )
+        executor = _executor(notes, process_table=_Carrying({marker}))
+        settled = executor.reconcile()
+        assert "occupied" in settled[TARGET], settled
+        answer = executor.run(_ask(TARGET, _quick(workshop), 2, "build-b", workshop))
+        assert answer.accepted is False, answer.sentence
+        assert answer.word == "the-slot-is-occupied"
+        assert "was being started" in answer.sentence
+
+    def test_a_starting_note_with_nothing_alive_is_cleared_and_the_next_runs(
+        self, notes, workshop, TARGET
+    ) -> None:
+        _write_note(
+            notes,
+            TARGET,
+            counter=1,
+            build="build-a",
+            group=0,
+            marker=the_marker_for(TARGET),
+            phase="starting",
+        )
+        executor = _executor(notes)
+        settled = executor.reconcile()
+        assert settled[TARGET] == "cleared"
+        answer = executor.run(_ask(TARGET, _quick(workshop), 2, "build-b", workshop))
+        assert answer.accepted is True, answer.sentence
+        assert _read_note(notes)["highest_counter"] == 2
 
 
 # ---------------------------------------------------------------------------
@@ -341,8 +590,14 @@ class TestReconcilingOnStart:
         first = _executor(notes, stop_confirm_seconds=20.0)
         running = _Background(first, _ask(TARGET, _slow(workshop), 1, "a", workshop))
         running.begin()
+        group = 0
         try:
-            _wait_for_note(notes)
+            # THE GROUP IS REMEMBERED BEFORE THE NOTES ARE SPOILED, because the
+            # tidy-up below finds what to stop by READING the notes — and this
+            # test is about notes that cannot be read. Without it the slow
+            # command outlives the test, and the next run of this same test
+            # meets a live marker for its own target name and refuses.
+            group = int(_wait_for_note(notes)["group"])
             # The notes are made unreadable, as if they had been lost.
             for path in notes.glob("*.json"):
                 path.write_text("this is not a note", encoding="utf-8")
@@ -356,6 +611,7 @@ class TestReconcilingOnStart:
             assert answer.word == "the-slot-is-occupied"
             assert "still alive" in answer.sentence
         finally:
+            _kill(group)
             running.stop()
 
     def test_notes_gone_and_nothing_alive_asks_the_coordinator(
@@ -827,7 +1083,8 @@ def _safe(target: str) -> str:
     return re.sub(r"[^A-Za-z0-9._:-]", "-", target)
 
 
-def _wait_for_note(notes: Path, seconds: float = 10.0) -> dict:
+def _wait_for_note(notes: Path, seconds: float = 20.0, until=None) -> dict:
+    """The note of a live command, optionally one that answers ``until``."""
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
         for path in notes.glob("*.json"):
@@ -835,25 +1092,42 @@ def _wait_for_note(notes: Path, seconds: float = 10.0) -> dict:
                 written = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, ValueError):
                 continue
-            if written.get("group"):
+            if written.get("group") and (until is None or until(written)):
                 return written
         time.sleep(0.05)
     raise AssertionError("no note of a live command was written")
 
 
-def _write_note(notes: Path, target: str, *, counter: int, build: str, group: int):
+def _read_note(notes: Path) -> dict:
+    """The one note in the folder, as it stands right now."""
+    paths = sorted(notes.glob("*.json"))
+    assert len(paths) == 1, f"expected one note, found {[p.name for p in paths]}"
+    return json.loads(paths[0].read_text(encoding="utf-8"))
+
+
+def _write_note(
+    notes: Path,
+    target: str,
+    *,
+    counter: int,
+    build: str,
+    group: int,
+    marker: str | None = None,
+    phase: str = "running",
+):
     (notes / f"{_safe(target)}.json").write_text(
         json.dumps(
             {
                 "target": target,
                 "counter": counter,
                 "build": build,
-                "marker": the_marker_for(target),
+                "marker": marker or the_marker_for(target),
                 "group": group,
                 "started_at": None,
                 "started_wall": time.time(),
                 "limit": 60.0,
                 "highest_counter": counter,
+                "phase": phase,
             }
         ),
         encoding="utf-8",
@@ -892,6 +1166,54 @@ class _AlwaysAlive:
         return ""
 
 
+class _Carrying:
+    """A process table in which one pretend process carries each named marker."""
+
+    available = True
+
+    def __init__(self, markers: set[str]) -> None:
+        self._markers = set(markers)
+
+    def members_of(self, group: int):
+        return []
+
+    def started_at(self, pid: int):
+        return None
+
+    def carrying(self, fragment: str):
+        return [4242] if any(fragment in m for m in self._markers) else []
+
+    def group_of(self, pid: int):
+        return pid
+
+    def command_of(self, pid: int):
+        return " ".join(sorted(self._markers))
+
+
+class _AliveOnly:
+    """A process table in which only the named groups are alive."""
+
+    available = True
+
+    def __init__(self, groups: set[int]) -> None:
+        self._groups = set(groups)
+
+    def members_of(self, group: int):
+        return [group] if group in self._groups else []
+
+    def started_at(self, pid: int):
+        return None
+
+    def carrying(self, fragment: str):
+        return []
+
+    def group_of(self, pid: int):
+        return pid
+
+    def command_of(self, pid: int):
+        return ""
+
+
 class _Background:
     """Run one executor request on a thread, so the test can look while it runs."""
 
@@ -909,6 +1231,12 @@ class _Background:
 
         self._thread = threading.Thread(target=_go, daemon=True)
         self._thread.start()
+
+    def until_answered(self, seconds: float = 30.0) -> None:
+        """Wait for this request's own answer, without touching anything."""
+        if self._thread is not None:
+            self._thread.join(timeout=seconds)
+        assert self.answer is not None, "the request never answered"
 
     def stop(self) -> None:
         # Best effort: stop anything of ours still alive, so no test leaves a
