@@ -76,16 +76,22 @@ f. **Notes missing or unreadable is not an empty slot.** MISSING and
    counter cannot establish who owns the target. (This is the point the
    design's sign-off note asks reviewers to watch.)
 
-   WITH NOBODY TO ASK, the two ends of this are not the same, and the
-   difference is the one fact the executor does have: the coordinator read
-   what is running on the target under the lock, and says on the request
-   whether anything is. Something is running there ⇒ a deploy has happened
-   before, so a note SHOULD exist, so its absence is a loss and the request is
-   refused. Nothing has ever run there and nothing is alive ⇒ there is nothing
-   to take over and the first deploy of a target is accepted. Without that
-   line the very first deploy of every target would need a coordinator to
-   answer a question about a target it has never heard of, and the deploy path
-   would be dead on the day it is installed.
+   **WITH NOBODY TO ASK, THE DEPLOY IS REFUSED — including a target's first.**
+   Until 24 September 2026 there was one more line here, and it was wrong. The
+   request carried the coordinator's reading of whether anything was running on
+   the target, and a request that said "nothing is" was accepted as that
+   target's first deploy. A reviewer drove it: build B completed at counter 2,
+   the note was deleted, the executor restarted, and build A's DELAYED counter-1
+   request arrived carrying a claim that had been true when the request was made
+   and was stale by the time it landed. It was accepted and it replaced B.
+
+   The source was the fault, not the value. **A request cannot establish its own
+   freshness**, so no claim a request makes about the target is consulted on any
+   path any more. The cost is said out loud: a coordinator with no read-only
+   ownership route can deploy nothing once a note is missing, a target's first
+   deployment included, and that route is named in the rollout as the thing that
+   has to exist first. The alternative is a path on which a stale request lets
+   itself in, which was measured rather than imagined.
 g. **Every deploy command gets a hard time limit**, and the deploy step's
    lease in the ledger is longer than it, so a healthy deploy is not taken
    over.
@@ -413,14 +419,12 @@ class DeployRequest:
     timeout: float = DEFAULT_COMMAND_SECONDS
     identity: str | None = None
     identity_setting: str | None = None
-    #: Does the COORDINATOR say something is already running on this target?
-    #: It read that under the lock, off the target's own row, before it made
-    #: this request. It is used for one thing only, and only when the
-    #: executor's own note for the target is gone and nobody can be asked:
-    #: something is running ⇒ a deploy happened before ⇒ a note should exist
-    #: ⇒ its absence is a loss and the request is refused. It can only make
-    #: the executor stricter, never more permissive (rule f).
-    something_is_running: bool = False
+    #: The ARTIFACT the check said it checked, and the setting the project
+    #: wants it handed back in. The step must deploy exactly this, rather than
+    #: resolve a name of its own at the moment it deploys — which is a name
+    #: another build can have taken since the check (24 September 2026).
+    artifact: str | None = None
+    artifact_setting: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1106,12 +1110,7 @@ class DeployExecutor:
         # lock across every target that wait would have blocked a deploy to a
         # different target for no reason at all.
         with self._lock_for(target):
-            settled = self._settle_the_slot(
-                target,
-                counter,
-                request.build,
-                something_is_running=bool(request.something_is_running),
-            )
+            settled = self._settle_the_slot(target, counter, request.build)
             if settled is not None:
                 return settled
             note = self._start(request, counter=counter, target=target)
@@ -1127,12 +1126,7 @@ class DeployExecutor:
     # -- the slot ----------------------------------------------------------
 
     def _settle_the_slot(
-        self,
-        target: str,
-        counter: int,
-        build: str,
-        *,
-        something_is_running: bool = False,
+        self, target: str, counter: int, build: str
     ) -> ExecutorAnswer | None:
         """``None`` = the slot is this request's. Anything else is a refusal."""
         if self._folder_problem:
@@ -1160,14 +1154,7 @@ class DeployExecutor:
             why = unreadable or (
                 f"this executor has no note of its own for {target}"
             )
-            return self._slot_with_no_note(
-                target,
-                counter,
-                build,
-                why=why,
-                its_notes_were_unreadable=unreadable is not None,
-                something_is_running=something_is_running,
-            )
+            return self._slot_with_no_note(target, counter, build, why=why)
 
         highest = self._highest(note)
         if counter < highest:
@@ -1333,8 +1320,6 @@ class DeployExecutor:
         build: str,
         *,
         why: str,
-        its_notes_were_unreadable: bool,
-        something_is_running: bool,
     ) -> ExecutorAnswer | None:
         """RULE (f) whole: a note that is not there is not an empty slot.
 
@@ -1342,12 +1327,31 @@ class DeployExecutor:
         that is the question with a fact behind it and the one that stops a
         second command starting beside a live one. Only when nothing is alive
         does ownership come up at all, and then it is the COORDINATOR that
-        answers it and never this request.
+        answers it, ALWAYS, and never this request.
 
-        The last branch is the one place this goes beyond the design's words,
-        and it is written out in the module's own (f) above: with nobody to
-        ask, a target that has never had anything running on it has nothing to
-        take over, and a target that has is a target whose note has been LOST.
+        WHAT CHANGED ON 24 SEPTEMBER 2026, and why the last branch is gone.
+        This used to have one more step: with nobody to ask, it read the
+        request's own ``something_is_running`` and — when that said nothing was
+        running — accepted the request as a target's first deploy. A reviewer
+        drove the hole straight through it. Build B completed at counter 2, the
+        note was deleted, the executor restarted, and build A's DELAYED counter-1
+        request arrived carrying a ``something_is_running`` that had been true
+        when it was made and was stale by the time it landed. It was accepted,
+        and it replaced B.
+
+        The mistake was not the value; it was the source. **A request cannot
+        establish its own freshness.** Anything it says about the target was
+        true when the request was made, and the whole reason this path exists is
+        that time has passed since. So the request is no longer consulted about
+        the target at all, on any path, and the coordinator's own read-only
+        answer is required — for the first deployment of a target exactly as for
+        every other one. With nobody to ask, the deploy is refused.
+
+        THE COST, SAID PLAINLY. A coordinator with no such route configured can
+        deploy nothing once a note is missing, including the very first deploy
+        of a target. That is the point: the alternative is a path on which a
+        stale request lets itself in, which was measured, not imagined. The
+        route is named in the rollout as the thing that has to exist first.
         """
         anything = self._anything_for(target)
         if anything is None:
@@ -1375,61 +1379,34 @@ class DeployExecutor:
                 ),
             )
         # Nothing is alive. The counter and the owning build are CONFIRMED
-        # WITH THE COORDINATOR, not taken from this request: a delayed request
-        # presenting an old counter cannot establish who owns the target.
-        if self._ask is not None:
-            return self._confirm_with_the_coordinator(target, counter, build)
-        if its_notes_were_unreadable or something_is_running:
-            return ExecutorAnswer(
-                accepted=False,
-                word="nobody-can-be-asked-who-owns-it",
-                sentence=(
-                    f"{why}"
-                    + (
-                        f", and the coordinator says something is already "
-                        f"running on {target}, so a note of it should exist "
-                        "and this executor has lost it"
-                        if something_is_running and not its_notes_were_unreadable
-                        else ""
-                    )
-                    + ". It has no way to ask the coordinator who owns the "
-                    "target, so it cannot accept a counter on this request's "
-                    "word alone. Nothing was deployed."
-                ),
-            )
-        # NOTHING HAS EVER RUN ON THIS TARGET and nothing is alive on it: the
-        # first deploy of a target this executor has never seen. There is no
-        # holder to take over from and no counter to lose, so it is accepted —
-        # and said out loud, because it is the one path where a missing note
-        # is not treated as a loss.
-        logger.info(
-            "deploy executor: %s has no note here and nothing has ever run on "
-            "it, so counter %s for build %s is its first deploy",
-            target,
-            counter,
-            build,
-        )
-        return None
+        # WITH THE COORDINATOR — always, including a target's first deploy, and
+        # never from this request, because a delayed request presenting an old
+        # counter cannot establish who owns the target or when it last did.
+        return self._confirm_with_the_coordinator(target, counter, build, why=why)
 
     def _confirm_with_the_coordinator(
-        self, target: str, counter: int, build: str
+        self, target: str, counter: int, build: str, *, why: str = ""
     ) -> ExecutorAnswer | None:
         """Rule (f)'s last clause: ask the COORDINATOR who owns this target.
 
-        The request cannot establish it. A delayed request carries whatever
-        counter it was made with, and with the executor's notes gone there is
-        nothing here to compare it against — so the question goes to the
-        coordinator's own read-only answer, and this request is accepted only
-        if the coordinator says the same counter and the same build.
+        The request cannot establish it, and since 24 September 2026 it is not
+        asked to: this runs on EVERY note-less request, a target's first
+        deployment included. A delayed request carries whatever counter — and
+        whatever claim about the target — it was made with, and with the
+        executor's notes gone there is nothing here to compare either against.
+        So the question goes to the coordinator's own read-only answer, and the
+        request is accepted only if the coordinator says the same counter and
+        the same build, right now.
         """
+        opening = why or f"the executor's notes for {target} are gone"
         if self._ask is None:
             return ExecutorAnswer(
                 accepted=False,
                 word="nobody-can-be-asked-who-owns-it",
                 sentence=(
-                    f"the executor's notes for {target} are gone and it has no "
-                    "way to ask the coordinator who owns the target, so it "
-                    "cannot accept a counter on this request's word alone. "
+                    f"{opening}, and it has no way to ask the coordinator who "
+                    "owns the target, so it cannot accept a counter on this "
+                    "request's word alone — not even for a first deployment. "
                     "Nothing was deployed."
                 ),
             )
@@ -1449,9 +1426,8 @@ class DeployExecutor:
                 accepted=False,
                 word="nobody-can-be-asked-who-owns-it",
                 sentence=(
-                    f"the executor's notes for {target} are gone and the "
-                    "coordinator did not say who owns the target, so nothing "
-                    "was deployed."
+                    f"{opening}, and the coordinator did not say who owns the "
+                    "target, so nothing was deployed."
                 ),
             )
         try:
@@ -1464,16 +1440,15 @@ class DeployExecutor:
                 accepted=False,
                 word="the-coordinator-says-somebody-else-owns-it",
                 sentence=(
-                    f"the executor's notes for {target} are gone, so it asked "
-                    f"the coordinator who owns the target: the coordinator "
-                    f"says counter {says_counter} and build "
-                    f"{says_build or 'nobody'}, and this request carries "
+                    f"{opening}, so it asked the coordinator who owns the "
+                    f"target: the coordinator says counter {says_counter} and "
+                    f"build {says_build or 'nobody'}, and this request carries "
                     f"counter {counter} for build {build}. Nothing was "
                     "deployed."
                 ),
             )
         logger.warning(
-            "deploy executor: %s's notes were gone; the coordinator confirms "
+            "deploy executor: %s had no note here; the coordinator confirms "
             "counter %s is build %s's, and nothing is alive, so it is accepted",
             target,
             counter,
@@ -1508,6 +1483,12 @@ class DeployExecutor:
             env["ENV_FILE"] = str(request.env_file)
         if request.identity and request.identity_setting:
             env[str(request.identity_setting)] = str(request.identity)
+        # AND THE ARTIFACT THAT WAS CHECKED, under the name the project chose
+        # for it. Without it the step has to work out what to deploy at the
+        # moment it deploys, and that is exactly the window another build gets
+        # in through (24 September 2026).
+        if request.artifact and request.artifact_setting:
+            env[str(request.artifact_setting)] = str(request.artifact)
         return env
 
     def _start(
@@ -1845,6 +1826,8 @@ def request_from(ownership: Any, **defaults: Any) -> DeployRequest | str:
         return f"a deploy request for {target} has to carry that target's counter"
     identity = ownership.get("identity")
     setting = ownership.get("identity_setting")
+    artifact = ownership.get("artifact")
+    artifact_setting = ownership.get("artifact_setting")
     return DeployRequest(
         target=target,
         target_counter=counter,
@@ -1858,5 +1841,8 @@ def request_from(ownership: Any, **defaults: Any) -> DeployRequest | str:
         timeout=float(defaults.get("timeout") or DEFAULT_COMMAND_SECONDS),
         identity=str(identity).strip() if identity else None,
         identity_setting=str(setting).strip() if setting else None,
-        something_is_running=bool(ownership.get("something_is_running")),
+        artifact=str(artifact).strip() if artifact else None,
+        artifact_setting=(
+            str(artifact_setting).strip() if artifact_setting else None
+        ),
     )

@@ -145,6 +145,7 @@ from forge.deploy.runbook_builder import (
     build_candidate_teardown_runbook,
     build_deploy_runbook,
     build_live_gate_runbook,
+    build_read_only_runbook,
     build_revert_runbook,
 )
 from forge.deploy.sidecar_runner import SidecarScriptRunner
@@ -713,6 +714,9 @@ class DeployStageRunner:
         task_id: str | None = None,
         deploy_profile_ref: str | None = None,
         candidate_cwd: str | None = None,
+        identity_env: dict[str, str] | None = None,
+        memory_project: str | None = None,
+        launch_settings: tuple[str, ...] = (),
     ) -> DeployStageResult:
         """Leg one: the candidate up, healthy, and through the live gate.
 
@@ -721,9 +725,18 @@ class DeployStageRunner:
         the repository's own deploy script, found relative to it, builds that
         tree. ``None`` runs from the profile's ``cwd`` as before.
 
+        ``identity_env`` (24 September 2026) is what the CHECK is handed so it
+        can pin what it checked: names the project declared, values the caller
+        made. It rides the candidate step's own env overlay. The step's output
+        comes back in ``detail["gate_summary"]["candidate_output"]``, because
+        the caller has to read out of it the artifact the check says it checked
+        — and record THAT, rather than letting the deploy resolve a name of its
+        own later, which is the whole of the hole this closes. ``None`` ⇒ every
+        caller written before it is byte for byte what it was.
+
         Returns ``outcome="complete"`` with ``verdict="pass"`` and the
-        candidate LEFT STANDING (the promote re-tags its image), and
-        ``detail["gate_summary"]`` saying how many checks ran and passed.
+        candidate LEFT STANDING (the promote deploys the artifact it reported),
+        and ``detail["gate_summary"]`` saying how many checks ran and passed.
         Returns ``outcome="failed"`` when the candidate could not start or
         its gate did not pass — the candidate is then torn down and the live
         name was never touched — or when the profile has no candidate
@@ -788,6 +801,9 @@ class DeployStageRunner:
                 profile_ref=profile_ref,
                 events=events,
                 candidate_cwd=candidate_cwd,
+                identity_env=identity_env,
+                memory_project=memory_project,
+                launch_settings=tuple(launch_settings),
             )
             if terminal is not None:
                 return replace(
@@ -835,6 +851,78 @@ class DeployStageRunner:
             failed_step=None if torn_down else "candidate_down",
             dry_run=self._dry_run,
             detail={"candidate": "torn-down" if torn_down else "standing"},
+        )
+
+    async def what_is_running(
+        self,
+        profile: DeployProfile,
+        *,
+        correlation_id: str,
+        deploy_run_id: str,
+        ask_env: dict[str, str],
+        memory_project: str | None = None,
+        launch_settings: tuple[str, ...] = (),
+    ) -> DeployStageResult:
+        """ASK THE TARGET what it is running. Read-only; nothing is changed.
+
+        Added 24 September 2026, after the second review of the executor stage.
+        The only-forwards rule (the design's B) was being applied to what the
+        LEDGER said was running, and a run that deploys and then stops before
+        its ledger line leaves the ledger wrong. A later pick-up then read a
+        stale row, decided it was moving forwards, and put an OLDER result over
+        a newer one while answering "merged into the remote and running". That
+        was driven through the real merge entry point.
+
+        So before it decides anything, the press asks the project itself. The
+        project declares how it wants to be asked (a setting) and what its
+        answer looks like (a marker); ``ask_env`` carries the first, and the
+        answer comes back in ``detail["deploy_output"]`` for the caller to read
+        the second out of.
+
+        This is deliberately NOT the full deploy leg: one step, no queue event,
+        no deploy record, no live gate, no rollback. It is a question. A
+        project's step that changes anything when asked it has broken its own
+        contract, and the press cannot tell — which is said plainly rather than
+        guarded against, because guarding would mean knowing what the project
+        does.
+        """
+        profile = self._profile_for_run(profile)
+        runbook = build_read_only_runbook(
+            profile,
+            runbook_id=f"ask-{deploy_run_id}",
+            target=profile.env_id,
+            extra_env=dict(ask_env),
+            now=self._clock(),
+            inside_sandbox=self._runs_inside_the_sandbox(),
+            memory_project=memory_project,
+            launch_settings=launch_settings,
+        )
+        try:
+            run_result = await self._run_runbook(runbook, correlation_id)
+            executed = self._repo.load_runbook(
+                runbook.runbook_id, correlation_id=correlation_id
+            )
+        except Exception as exc:  # noqa: BLE001 — a question, never a crash
+            logger.warning(
+                "what-is-running: %s could not be asked what it is running "
+                "(%s: %s)",
+                profile.env_id,
+                type(exc).__name__,
+                exc,
+            )
+            return DeployStageResult(
+                outcome="failed",
+                deploy_run_id=deploy_run_id,
+                failed_step="deploy_compose",
+                dry_run=self._dry_run,
+                detail={"deploy_output": "", "why": f"{type(exc).__name__}: {exc}"},
+            )
+        return DeployStageResult(
+            outcome="complete" if run_result.status == "complete" else "failed",
+            deploy_run_id=deploy_run_id,
+            failed_step=None if run_result.status == "complete" else "deploy_compose",
+            dry_run=self._dry_run,
+            detail={"deploy_output": deploy_step_output(executed)},
         )
 
     async def promote(
@@ -1422,6 +1510,9 @@ class DeployStageRunner:
         profile_ref: str | None,
         events: list[str],
         candidate_cwd: str | None = None,
+        identity_env: dict[str, str] | None = None,
+        memory_project: str | None = None,
+        launch_settings: tuple[str, ...] = (),
     ) -> tuple[DeployStageResult | None, dict[str, Any]]:
         """Stand the candidate up under ``-cand``, gate it, leave-standing-or-teardown.
 
@@ -1447,10 +1538,14 @@ class DeployStageRunner:
         """
         assert profile.candidate is not None  # caller-guarded
         cand_env = dict(profile.candidate.env)
-        compose_extra = {"CANDIDATE": "1", **cand_env}
+        # WHAT THE CHECK IS HANDED SO IT CAN PIN WHAT IT CHECKED. The names are
+        # the project's own; the values the caller's. It goes on last so a
+        # project cannot lose it to its own candidate overlay.
+        compose_extra = {"CANDIDATE": "1", **cand_env, **(identity_env or {})}
         summary: dict[str, Any] = gate_summary(verdict=None, gate_ids=(), assertions=())
         summary["candidate_cwd"] = candidate_cwd
         summary["evidence_index_ref"] = None
+        summary["candidate_output"] = ""
 
         # --- candidate deploy (separate -cand project) ---
         cand_runbook = build_deploy_runbook(
@@ -1462,11 +1557,17 @@ class DeployStageRunner:
             check_extra_env=cand_env,
             cwd_override=candidate_cwd,
             inside_sandbox=self._runs_inside_the_sandbox(),
+            memory_project=memory_project,
+            launch_settings=launch_settings,
         )
         run_result = await self._run_runbook(cand_runbook, correlation_id)
         executed = self._repo.load_runbook(
             cand_runbook.runbook_id, correlation_id=correlation_id
         )
+        # WHAT THE CHECK SAID, carried out whole. The caller reads the artifact
+        # the check reports out of this and records it; the deploy is then
+        # handed that artifact rather than resolving a name of its own.
+        summary["candidate_output"] = deploy_step_output(executed)
         if run_result.status != "complete":
             failed_step, refusal = self._stopped_at(
                 executed, run_result, default="candidate_deploy"

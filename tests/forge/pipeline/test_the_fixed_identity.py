@@ -106,7 +106,7 @@ class TestWhatTheProjectDeclares:
         assert declared.marker == DEFAULT_REPORT_MARKER
 
     def test_nothing_in_this_module_knows_what_the_project_deploys(self) -> None:
-        """The declaration is two names. It is never inspected further."""
+        """The declaration is names, and they are never inspected further."""
         declared = declared_identity(
             _Profile({"identity": {"setting": "A", "reported_as": "B"}})
         )
@@ -114,7 +114,78 @@ class TestWhatTheProjectDeclares:
             "setting": "A",
             "marker": "B",
             "declared": True,
+            # Added 24 September 2026. The first three are given defaults so a
+            # project that declares the block half-way still works; the fourth
+            # is NOT, because inventing a name to ask a project a question with
+            # would mean running its deploy step in a mode nobody declared.
+            "checked_as": "CHECKED_ARTIFACT",
+            "artifact_setting": "DEPLOY_ARTIFACT",
+            "asked_with": "",
+            "running_as": "RUNNING_IDENTITY",
         }
+
+    def test_the_four_names_the_second_review_added(self) -> None:
+        declared = declared_identity(
+            _Profile(
+                {
+                    "identity": {
+                        "setting": "A",
+                        "reported_as": "B",
+                        "checked_as": "C",
+                        "artifact_setting": "D",
+                        "asked_with": "E",
+                        "running_as": "F",
+                    }
+                }
+            )
+        )
+        assert (declared.checked_as, declared.artifact_setting) == ("C", "D")
+        assert (declared.asked_with, declared.running_as) == ("E", "F")
+        assert declared.can_be_asked is True
+
+    def test_a_project_that_says_nothing_about_being_asked_cannot_be(self) -> None:
+        """And the press does not deploy over a target it cannot establish."""
+        declared = declared_identity(_Profile({"identity": {"setting": "A"}}))
+        assert declared.declared is True
+        assert declared.asked_with == ""
+        assert declared.can_be_asked is False
+
+
+class TestWhatTheTargetSays:
+    """The read-only answer has exactly three readings, and empty is one."""
+
+    def test_a_token_is_what_is_running(self) -> None:
+        from forge.pipeline.deployment_identity import what_the_target_says
+
+        assert what_the_target_says(
+            "log line\nRUNNING_IDENTITY=j-abc@1111\n", marker="RUNNING_IDENTITY"
+        ) == ("identity", "j-abc@1111")
+
+    def test_an_empty_value_means_nothing_is_running(self) -> None:
+        from forge.pipeline.deployment_identity import what_the_target_says
+
+        assert what_the_target_says(
+            "log line\nRUNNING_IDENTITY=\n", marker="RUNNING_IDENTITY"
+        ) == ("nothing", None)
+
+    def test_no_line_at_all_is_never_read_as_nothing_running(self) -> None:
+        from forge.pipeline.deployment_identity import what_the_target_says
+
+        assert what_the_target_says(
+            "the step said something else entirely\n", marker="RUNNING_IDENTITY"
+        ) == ("no-answer", None)
+        assert what_the_target_says("", marker="RUNNING_IDENTITY") == (
+            "no-answer",
+            None,
+        )
+
+    def test_the_last_line_wins_here_too(self) -> None:
+        from forge.pipeline.deployment_identity import what_the_target_says
+
+        assert what_the_target_says(
+            "RUNNING_IDENTITY=about-to\nRUNNING_IDENTITY=what-really-is\n",
+            marker="RUNNING_IDENTITY",
+        ) == ("identity", "what-really-is")
 
 
 class TestReadingTheAnswerBack:

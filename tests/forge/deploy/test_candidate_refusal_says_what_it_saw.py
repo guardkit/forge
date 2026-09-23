@@ -524,9 +524,14 @@ class TestTheStageSaysWhatItSaw:
         assert publisher.failed == []
         assert result.detail["candidate"] == "standing"
         summary = dict(result.detail["gate_summary"])
-        # The candidate leg's own two keys, then exactly the old summary.
+        # The candidate leg's own keys, then exactly the old summary.
         summary.pop("candidate_cwd")
         summary.pop("evidence_index_ref")
+        # WHAT THE CHECK PRINTED (24 September 2026). The caller reads out of
+        # it the artifact the check says it checked, and records THAT, so the
+        # deploy runs the thing that was checked rather than whatever a shared
+        # name points at by the time it deploys.
+        summary.pop("candidate_output")
         assert summary == {
             "verdict": "pass",
             "checks_total": 9,

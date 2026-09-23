@@ -145,8 +145,53 @@ def _ask(
     )
 
 
+class _AgreeingCoordinator:
+    """Answers about a target with whatever the request being run presents.
+
+    It stands in for the ledger having granted this very counter to this very
+    build a moment before the request was made — the ORDINARY case, and the one
+    every test that is about counters, notes, stopping or the environment
+    assumes. It is not what proves the freshness rule: that is proven where the
+    coordinator says something ELSE (:class:`TestANoteThatIsNotThere` and
+    :class:`TestADelayedRequestCannotLetItselfIn`).
+    """
+
+    def __init__(self) -> None:
+        self.answer: dict[str, object] | None = None
+        self.asked: list[str] = []
+
+    def __call__(self, target: str) -> dict[str, object] | None:
+        self.asked.append(str(target))
+        return self.answer
+
+
+class _WithAnAgreeingCoordinator(DeployExecutor):
+    """An executor whose coordinator confirms the request it is running.
+
+    Since 24 September 2026 every note-less request is settled by asking the
+    coordinator — a target's FIRST deployment included, because a request cannot
+    establish its own freshness — so an executor with nobody to ask refuses
+    everything on a fresh notes folder. The tests that are not about ownership
+    would then prove nothing, so they are given a coordinator that agrees.
+    """
+
+    def __init__(self, **kw) -> None:
+        self._agreeing = _AgreeingCoordinator()
+        super().__init__(ask_the_coordinator=self._agreeing, **kw)
+
+    def run(self, request: DeployRequest):  # type: ignore[override]
+        self._agreeing.answer = {
+            "counter": request.target_counter,
+            "build": request.build,
+        }
+        return super().run(request)
+
+
 def _executor(notes: Path, **kw) -> DeployExecutor:
-    return DeployExecutor(notes_root=notes, **kw)
+    """An executor with a coordinator that agrees, unless a test names its own."""
+    if "ask_the_coordinator" in kw:
+        return DeployExecutor(notes_root=notes, **kw)
+    return _WithAnAgreeingCoordinator(notes_root=notes, **kw)
 
 
 # ---------------------------------------------------------------------------
@@ -647,7 +692,7 @@ class TestReconcilingOnStart:
     def test_with_nobody_to_ask_it_refuses_rather_than_believing_the_request(
         self, notes, workshop, TARGET
     ) -> None:
-        executor = _executor(notes)
+        executor = _executor(notes, ask_the_coordinator=None)
         (notes / (_safe(TARGET) + ".json")).write_text("rubbish", encoding="utf-8")
         executor._reconciled = True
         answer = executor.run(_ask(TARGET, _quick(workshop), 2, "build-a", workshop))
@@ -806,6 +851,8 @@ class TestWhatARequestHasToCarry:
                 "target_counter": 3,
                 "identity": "j-abcdef@1234",
                 "identity_setting": "DEPLOY_IDENTITY",
+                "artifact": "the-thing-the-check-checked",
+                "artifact_setting": "DEPLOY_ARTIFACT",
             },
             cwd=str(workshop),
             script="deploy.sh",
@@ -817,15 +864,21 @@ class TestWhatARequestHasToCarry:
         assert built.target_counter == 3
         assert built.identity == "j-abcdef@1234"
         assert built.launch_settings == ("SOME_TOOL_CACHE",)
-        # The coordinator said nothing about what is running, so nothing is
-        # assumed: the safe reading of an absent field is "this request cannot
-        # tell me a deploy has happened before".
-        assert built.something_is_running is False
+        assert built.artifact == "the-thing-the-check-checked"
+        assert built.artifact_setting == "DEPLOY_ARTIFACT"
 
-    def test_what_the_coordinator_says_is_running_travels_on_the_request(
+    def test_a_request_carries_no_claim_about_the_target(
         self, workshop, TARGET
     ) -> None:
-        """It is read off the ownership block the press built under the lock."""
+        """24 September 2026: it used to, and that was the hole.
+
+        The ownership block carried the coordinator's reading of whether
+        anything was running on the target, and the executor consulted it when
+        its own notes were gone. A DELAYED request carries a reading that was
+        true when it was made, so a request that said "nothing is running" let
+        itself in over a newer build. Nothing a request says about the target is
+        read any more, and the field is gone rather than ignored.
+        """
         built = request_from(
             {
                 "target": TARGET,
@@ -837,7 +890,7 @@ class TestWhatARequestHasToCarry:
             script="deploy.sh",
         )
         assert isinstance(built, DeployRequest)
-        assert built.something_is_running is True
+        assert not hasattr(built, "something_is_running")
 
 
 # ---------------------------------------------------------------------------
@@ -905,39 +958,38 @@ class TestANoteThatIsNotThere:
             _kill(group)
             running.stop()
 
-    def test_nothing_alive_and_nothing_ever_run_is_the_first_deploy(
+    def test_even_a_first_deploy_is_confirmed_with_the_coordinator(
         self, notes, workshop, TARGET
     ) -> None:
-        """The one path where a missing note is not a loss, and why.
+        """24 September 2026: there is no "first deploy" exception any more.
 
-        Requiring the coordinator here would mean the first deploy of every
-        target needs an answer about a target nobody has ever heard of, and
-        the deploy path would be dead on the day it is installed.
+        There used to be one, and it was the way in. A request that said nothing
+        was running on the target was accepted as that target's first deploy —
+        and a DELAYED request says whatever was true when it was made. The
+        coordinator is asked on every note-less request now, this one included.
         """
-        answer = _executor(notes).run(_ask(TARGET, _quick(workshop), 1, "a", workshop))
+        asked: list[str] = []
+
+        def _coordinator(target: str):
+            asked.append(target)
+            return {"counter": 1, "build": "a"}
+
+        answer = _executor(notes, ask_the_coordinator=_coordinator).run(
+            _ask(TARGET, _quick(workshop), 1, "a", workshop)
+        )
         assert answer.accepted is True, answer.sentence
+        assert asked == [TARGET]
 
-    def test_nothing_alive_but_something_is_running_there_is_a_lost_note(
+    def test_a_first_deploy_with_nobody_to_ask_is_refused(
         self, notes, workshop, TARGET
     ) -> None:
-        """The coordinator read R under the lock and says something is running.
-
-        Then a deploy has happened before, so a note SHOULD exist, so its
-        absence is a loss — and with nobody to ask, that is refused.
-        """
-        answer = _executor(notes).run(
-            _ask(
-                TARGET,
-                _quick(workshop),
-                4,
-                "build-b",
-                workshop,
-                something_is_running=True,
-            )
+        """And the cost of that is said out loud rather than worked around."""
+        answer = _executor(notes, ask_the_coordinator=None).run(
+            _ask(TARGET, _quick(workshop), 1, "a", workshop)
         )
         assert answer.accepted is False, answer.sentence
         assert answer.word == "nobody-can-be-asked-who-owns-it"
-        assert "something is already running" in answer.sentence
+        assert "not even for a first deployment" in answer.sentence
 
     def test_with_a_coordinator_the_missing_note_is_settled_by_asking_it(
         self, notes, workshop, TARGET
@@ -951,14 +1003,12 @@ class TestANoteThatIsNotThere:
 
         executor = _executor(notes, ask_the_coordinator=_coordinator)
         refused = executor.run(
-            _ask(TARGET, _quick(workshop), 6, "build-b", workshop,
-                 something_is_running=True)
+            _ask(TARGET, _quick(workshop), 6, "build-b", workshop)
         )
         assert refused.accepted is False
         assert refused.word == "the-coordinator-says-somebody-else-owns-it"
         accepted = executor.run(
-            _ask(TARGET, _quick(workshop), 7, "build-c", workshop,
-                 something_is_running=True)
+            _ask(TARGET, _quick(workshop), 7, "build-c", workshop)
         )
         assert accepted.accepted is True, accepted.sentence
         assert asked == [TARGET, TARGET]
@@ -971,6 +1021,135 @@ class TestANoteThatIsNotThere:
         assert answer.accepted is False, answer.sentence
         assert answer.word == "the-slot-cannot-be-settled"
         assert "could not be told" in answer.sentence
+
+
+class TestADelayedRequestCannotLetItselfIn:
+    """The reviewer's own sequence, 24 September 2026, driven exactly.
+
+    B completes at counter 2; the note is deleted; the executor restarts; A's
+    DELAYED counter-1 request arrives. It used to be accepted — it said nothing
+    was running on the target, which had been true when it was made — and it
+    replaced B. It is refused now, and the refusal names what the coordinator
+    said.
+    """
+
+    def test_b_completes_then_the_note_goes_then_a_s_old_request_arrives(
+        self, notes, workshop, TARGET
+    ) -> None:
+        landed = workshop / "the-target"
+        # THE COORDINATOR'S OWN ANSWER, as the ledger's lock row would give it:
+        # the target is at counter 2 and it is build-B's.
+        asked: list[str] = []
+
+        def _coordinator(target: str):
+            asked.append(target)
+            return {"counter": 2, "build": "build-B"}
+
+        # B deploys and completes, at counter 2.
+        first = _executor(notes, ask_the_coordinator=_coordinator)
+        b = first.run(
+            _ask(
+                TARGET,
+                _writes_at_the_end(workshop, "B", landed, seconds=0),
+                2,
+                "build-B",
+                workshop,
+            )
+        )
+        assert b.accepted is True, b.sentence
+        assert landed.read_text(encoding="utf-8").strip() == "B"
+
+        # Its note is deleted and the executor restarts onto the empty folder.
+        for path in notes.glob("*.json"):
+            path.unlink()
+        second = _executor(notes, ask_the_coordinator=_coordinator)
+        second.reconcile()
+
+        # A's DELAYED counter-1 request lands.
+        refused = second.run(
+            _ask(
+                TARGET,
+                _writes_at_the_end(workshop, "A", landed, seconds=0),
+                1,
+                "build-A",
+                workshop,
+            )
+        )
+        assert refused.accepted is False, refused.sentence
+        assert refused.word == "the-coordinator-says-somebody-else-owns-it"
+        assert "counter 2" in refused.sentence
+        assert "build-B" in refused.sentence
+        # AND B IS STILL WHAT IS ON THE TARGET.
+        assert landed.read_text(encoding="utf-8").strip() == "B"
+        assert asked == [TARGET, TARGET]
+
+    def test_the_same_sequence_with_nobody_to_ask_is_also_refused(
+        self, notes, workshop, TARGET
+    ) -> None:
+        """With no coordinator there is nothing that can establish freshness."""
+        landed = workshop / "the-target"
+        first = _executor(notes)
+        assert first.run(
+            _ask(
+                TARGET,
+                _writes_at_the_end(workshop, "B", landed, seconds=0),
+                2,
+                "build-B",
+                workshop,
+            )
+        ).accepted
+        for path in notes.glob("*.json"):
+            path.unlink()
+        second = _executor(notes, ask_the_coordinator=None)
+        second.reconcile()
+        refused = second.run(
+            _ask(
+                TARGET,
+                _writes_at_the_end(workshop, "A", landed, seconds=0),
+                1,
+                "build-A",
+                workshop,
+            )
+        )
+        assert refused.accepted is False, refused.sentence
+        assert refused.word == "nobody-can-be-asked-who-owns-it"
+        assert landed.read_text(encoding="utf-8").strip() == "B"
+
+
+class TestTheArtifactReachesTheStep:
+    def test_the_step_is_given_the_artifact_under_the_declared_name(
+        self, notes, workshop, TARGET
+    ) -> None:
+        """Section C's second half: the deploy runs what the CHECK checked.
+
+        The identity is a name; the artifact is the thing. Without the second,
+        the step has to work out what to deploy at the moment it deploys, and
+        that is the window another build gets in through.
+        """
+        given = workshop / "what-it-was-given"
+        _script(
+            workshop,
+            "deploy.sh",
+            "#!/bin/sh\n"
+            f'printf "%s\\n" "${{WIDGET_ARTIFACT:-nothing}}" > "{given}"\n'
+            'printf "DEPLOYED_IDENTITY=%s\\n" "${DEPLOY_IDENTITY:-nothing}"\n'
+            "exit 0\n",
+        )
+        answer = _executor(notes).run(
+            _ask(
+                TARGET,
+                "deploy.sh",
+                1,
+                "build-a",
+                workshop,
+                artifact="the-thing-the-check-checked",
+                artifact_setting="WIDGET_ARTIFACT",
+            )
+        )
+        assert answer.accepted is True, answer.sentence
+        assert given.read_text(encoding="utf-8").strip() == (
+            "the-thing-the-check-checked"
+        )
 
 
 class TestTheNotesFolderItself:

@@ -888,20 +888,45 @@ class TestThePressAndThePublisherReadTheRecordTheSameWay:
 # ---------------------------------------------------------------------------
 
 
-class _ADeployStepThatSays:
-    """A stand-in deploy stage whose promote leg answers like a real one.
+class _AProjectWithATarget:
+    """A stand-in deploy stage AND the target it deploys to, in one object.
 
-    It records the ownership it was handed and prints one
-    ``<marker>=<identity>`` line, which is exactly the contract a project's own
-    deploy step has. ``reports`` overrides what it claims is running, which is
-    how "the step deployed something else" is driven.
+    Rewritten 24 September 2026, after the second review of the executor stage,
+    because the press now does two things this stand-in has to be able to
+    answer: it hands the CHECK the identity and reads back the artifact the
+    check says it checked, and it ASKS THE TARGET what it is running before it
+    decides anything. So this keeps a target of its own — one string, what is
+    running there — which the promote sets and the read-only leg reports.
+
+    ``reports`` overrides what the promote claims is running, which is how "the
+    step deployed something else" is driven. ``says_it_checked`` overrides the
+    artifact the check reports, and ``None`` is a check that reports none.
     """
 
-    def __init__(self, *, reports: str | None = None, marker: str = "DEPLOYED_IDENTITY") -> None:
+    def __init__(
+        self,
+        *,
+        reports: str | None = None,
+        marker: str = "DEPLOYED_IDENTITY",
+        says_it_checked: str | None = "",
+        on_the_target: str | None = None,
+        answers_what_is_running: bool = True,
+    ) -> None:
         self.reports = reports
         self.marker = marker
+        self.says_it_checked = says_it_checked
+        self.answers_what_is_running = answers_what_is_running
+        #: WHAT IS RUNNING ON THE TARGET. ``None`` = nothing.
+        self.on_the_target = on_the_target
         self.calls: list[dict[str, Any]] = []
         self.ownership: list[dict[str, Any]] = []
+        self.handed_to_the_check: list[dict[str, str]] = []
+        self.asked_what_is_running = 0
+
+    def _artifact_for(self, identity: str | None) -> str | None:
+        if self.says_it_checked is None:
+            return None
+        return self.says_it_checked or f"artifact-of-{identity}"
 
     async def __call__(self, **kwargs: Any) -> Any:
         from types import SimpleNamespace
@@ -911,20 +936,47 @@ class _ADeployStepThatSays:
         if leg == "candidate_check":
             from tests.forge.pipeline.test_merge_executor import GREEN_GATE
 
+            handed = dict(kwargs.get("identity_env") or {})
+            self.handed_to_the_check.append(handed)
+            artifact = self._artifact_for(handed.get("DEPLOY_IDENTITY"))
+            summary = dict(GREEN_GATE)
+            summary["candidate_output"] = (
+                f"[the project] checked it\nCHECKED_ARTIFACT={artifact}\n"
+                if artifact is not None
+                else "[the project] checked it, and said nothing about what\n"
+            )
             return SimpleNamespace(
                 outcome="complete",
                 verdict="pass",
                 failed_step=None,
                 events=("DeployQueued",),
-                detail={"gate_summary": dict(GREEN_GATE), "candidate": "standing"},
+                detail={"gate_summary": summary, "candidate": "standing"},
             )
         if leg == "candidate_down":
             return SimpleNamespace(
                 outcome="complete", verdict=None, detail={"candidate": "torn-down"}
             )
+        if leg == "what_is_running":
+            self.asked_what_is_running += 1
+            if not self.answers_what_is_running:
+                return SimpleNamespace(
+                    outcome="failed", verdict=None, detail={"deploy_output": ""}
+                )
+            return SimpleNamespace(
+                outcome="complete",
+                verdict=None,
+                detail={
+                    "deploy_output": (
+                        f"RUNNING_IDENTITY={self.on_the_target or ''}\n"
+                    )
+                },
+            )
         owns = dict(kwargs.get("deploy_ownership") or {})
         self.ownership.append(owns)
         running = self.reports if self.reports is not None else owns.get("identity")
+        # THE DEPLOY REALLY CHANGES THE TARGET in this stand-in, so the next
+        # press's read-only question gets the answer a real one would.
+        self.on_the_target = running
         return SimpleNamespace(
             outcome="complete",
             verdict="pass",
@@ -938,11 +990,21 @@ class _ADeployStepThatSays:
         )
 
 
-def _a_declaration(*, declared: bool = True) -> Any:
+#: The old name, kept because most of this file reads better with it.
+_ADeployStepThatSays = _AProjectWithATarget
+
+
+def _a_declaration(*, declared: bool = True, can_be_asked: bool = True) -> Any:
     from forge.pipeline.deployment_identity import IdentityDeclaration
 
     return IdentityDeclaration(
-        setting="DEPLOY_IDENTITY", marker="DEPLOYED_IDENTITY", declared=declared
+        setting="DEPLOY_IDENTITY",
+        marker="DEPLOYED_IDENTITY",
+        declared=declared,
+        checked_as="CHECKED_ARTIFACT",
+        artifact_setting="DEPLOY_ARTIFACT",
+        asked_with="RUNNING_IDENTITY" if can_be_asked else "",
+        running_as="RUNNING_IDENTITY",
     )
 
 
@@ -953,6 +1015,7 @@ def _deps_that_can_deploy(
     publisher: Any,
     deploy: Any,
     declared: bool = True,
+    can_be_asked: bool = True,
     target: str = "acme/widget-shop::live",
 ) -> MergeExecutorDeps:
     from forge.pipeline.deployment_lock import DeploymentLockStore
@@ -966,7 +1029,9 @@ def _deps_that_can_deploy(
         publisher=publisher,
         what_the_machine_says=EVERY_WALL_STANDS,
         deployment_lock=lambda: DeploymentLockStore(pool.connection),
-        deployment_target=lambda repo, root: (target, _a_declaration(declared=declared)),
+        deployment_target=lambda repo, root: (
+            target, _a_declaration(declared=declared, can_be_asked=can_be_asked)
+        ),
     )
 
 
@@ -1038,9 +1103,18 @@ class TestTheDeployPutsLiveExactlyWhatWasChecked:
         assert owns["target"] == "acme/widget-shop::live"
         assert owns["target_counter"] == 1
         assert owns["identity_setting"] == "DEPLOY_IDENTITY"
-        # ...and, on a target nothing has ever run on, the fact the executor
-        # needs to tell a first deploy from a lost note.
-        assert owns["something_is_running"] is False
+        # ...and THE ARTIFACT THE CHECK SAID IT CHECKED, under the name the
+        # project declared for it. Without this the step would resolve what to
+        # deploy at the moment it deploys, which is the window another build
+        # gets in through.
+        assert owns["artifact"] == f"artifact-of-{owns['identity']}"
+        assert owns["artifact_setting"] == "DEPLOY_ARTIFACT"
+        # A request carries NO claim about the target any more: it cannot
+        # establish its own freshness, so it does not try.
+        assert "something_is_running" not in owns
+        # AND THE TARGET WAS ASKED, before anything was decided.
+        assert deploy.asked_what_is_running == 1
+        assert deploy.handed_to_the_check[-1]["DEPLOY_IDENTITY"] == owns["identity"]
 
     @pytest.mark.asyncio
     async def test_a_second_press_says_something_is_running_there_now(
@@ -1133,16 +1207,25 @@ class _ADeployTheExecutorStopped:
         if leg == "candidate_check":
             from tests.forge.pipeline.test_merge_executor import GREEN_GATE
 
+            summary = dict(GREEN_GATE)
+            summary["candidate_output"] = "CHECKED_ARTIFACT=the-checked-thing\n"
             return SimpleNamespace(
                 outcome="complete",
                 verdict="pass",
                 failed_step=None,
                 events=("DeployQueued",),
-                detail={"gate_summary": dict(GREEN_GATE), "candidate": "standing"},
+                detail={"gate_summary": summary, "candidate": "standing"},
             )
         if leg == "candidate_down":
             return SimpleNamespace(
                 outcome="complete", verdict=None, detail={"candidate": "torn-down"}
+            )
+        if leg == "what_is_running":
+            # Nothing is running on the target: an empty answer, which is the
+            # only way a project says that.
+            return SimpleNamespace(
+                outcome="complete", verdict=None,
+                detail={"deploy_output": "RUNNING_IDENTITY=\n"},
             )
         owns = dict(kwargs.get("deploy_ownership") or {})
         return SimpleNamespace(
