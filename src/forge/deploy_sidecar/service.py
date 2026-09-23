@@ -1408,11 +1408,38 @@ def _bound_commit(
     these fields asks for. That is most of the planning routes, and refusing
     them would be refusing work that never asked a project what it declares.
 
+    THE STAMP IS A LABEL; BINDING IS WHAT HAPPENS WHEN A DECLARATION IS READ
+    (23 September 2026, the tenth review). Every request the factory makes
+    says whose work it is — the build it is for, and the commit that build
+    was recorded as starting from — because a request wearing a person's
+    label gets a person's handling, and the factory is not a person. That
+    label is worth having on a request that asks for nothing declared too: it
+    is how a log says which build ran a command. But a label is not a
+    question, and this helper asks the coordinator ONLY when the answer is
+    going to be used. So a request that asks for nothing declared is bound to
+    nothing and the coordinator is not asked, whatever stamp the request
+    carries; the stamp travels on and is refused nowhere. Before this, a
+    stamped request that asked for nothing declared was dragged into the
+    binding path and could be refused over a record it was never going to
+    read anything at — measured on the merge word's own command, which names
+    neither a memory nor a setting.
+
     Never raises: a request is input, and a coordinator that cannot be reached
     is an unanswered question, never an answer.
     """
     if not isinstance(payload, dict):
         return None, None, "by hand"
+
+    # WHAT IS BEING ASKED FOR, BEFORE ANYTHING IS ASKED OF ANYBODY. A request
+    # that reads none of this project's own declarations has nothing to bind:
+    # there is no commit anything is read at, so there is no record to check
+    # one against and no question for the coordinator.
+    asks_for_a_declaration = bool(reads_declaration) or (
+        payload.get("launch_settings") is not None
+        or payload.get("memory_project") is not None
+    )
+    if not asks_for_a_declaration:
+        return None, None, "nothing declared was asked for, so no commit was bound"
 
     raw_commit = payload.get("declared_at")
     presented: str | None = None
@@ -1435,19 +1462,9 @@ def _bound_commit(
             ), ""
 
     if presented is None and not build:
-        # NOTHING NAMES A BUILD, so there is no record to bind to. What
-        # happens next turns on whether this request asks for the project's
-        # own declarations to be read at all.
-        asks_for_a_declaration = bool(reads_declaration) or (
-            payload.get("launch_settings") is not None
-            or payload.get("memory_project") is not None
-        )
-        if not asks_for_a_declaration:
-            # It asks for nothing declared, so there is nothing to bind and
-            # nothing to claim. The factory's own named list, as ever.
-            return None, None, (
-                "nothing declared was asked for, so no commit was bound"
-            )
+        # NOTHING NAMES A BUILD, so there is no record to bind to — and this
+        # request does ask for a declaration to be read, or it would have been
+        # answered above.
         if payload.get("by_hand") is True:
             # AN EXPLICIT CLAIM, said back in the sentence.
             return None, None, "by hand, at this copy's committed HEAD"

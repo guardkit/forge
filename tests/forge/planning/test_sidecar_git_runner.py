@@ -175,10 +175,31 @@ STAND_IN_SETTINGS: tuple[str, ...] = (
     "PYTHONPATH",
 )
 
+#: The run these writes belong to, and the id this factory's own record keeps
+#: it under (23 September 2026). A write that names what the project declares
+#: says whose work it is and where those declarations were said, so the helper
+#: can check the pair against the record rather than reading at its own HEAD.
+THE_RUN = "corr-run-0001"
+
+
+@pytest.fixture
+def a_coordinator_that_recorded_the_run(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> Any:
+    """The record's read-only answer for this run, stood in for on loopback."""
+    from tests.forge._a_stand_in_coordinator import a_coordinator_that_recorded
+
+    commit = git_rev_parse(repo, "HEAD")
+    with a_coordinator_that_recorded({THE_RUN: str(commit)}, monkeypatch):
+        yield commit
+
 
 @pytest.mark.asyncio
 async def test_a_declared_write_commits_and_answers_with_the_checks(
-    sidecar: str, repo: Path, fake_guardkit: Path
+    sidecar: str,
+    repo: Path,
+    fake_guardkit: Path,
+    a_coordinator_that_recorded_the_run: str,
 ) -> None:
     runner = SidecarGitRunner(sidecar, repo=REPO_KEY)
     assert runner.supports_declared_checks() is True
@@ -189,6 +210,8 @@ async def test_a_declared_write_commits_and_answers_with_the_checks(
         "planning: plan",
         pre_commit=_declaration(),
         launch_settings=STAND_IN_SETTINGS,
+        build=THE_RUN,
+        declared_at=a_coordinator_that_recorded_the_run,
     )
     assert isinstance(result, SidecarGitOpResult)
     assert result.status == "success" and result.exit_code == 0
@@ -202,7 +225,11 @@ async def test_a_declared_write_commits_and_answers_with_the_checks(
 
 @pytest.mark.asyncio
 async def test_a_refused_check_is_a_failed_result_with_the_outcomes(
-    sidecar: str, repo: Path, fake_guardkit: Path, monkeypatch: pytest.MonkeyPatch
+    sidecar: str,
+    repo: Path,
+    fake_guardkit: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    a_coordinator_that_recorded_the_run: str,
 ) -> None:
     monkeypatch.setenv("FAKE_GUARDKIT_NORMALIZE", "refused")
     runner = SidecarGitRunner(sidecar, repo=REPO_KEY)
@@ -213,6 +240,8 @@ async def test_a_refused_check_is_a_failed_result_with_the_outcomes(
         "planning: plan",
         pre_commit=_declaration(),
         launch_settings=STAND_IN_SETTINGS,
+        build=THE_RUN,
+        declared_at=a_coordinator_that_recorded_the_run,
     )
     assert result.status == "failed" and result.sha is None
     assert result.stderr == result.detail

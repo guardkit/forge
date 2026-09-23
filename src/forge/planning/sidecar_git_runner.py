@@ -274,6 +274,8 @@ class SidecarGitRunner:
         start_commit: str | None = None,
         memory_project: str | None = None,
         launch_settings: Sequence[str] | None = None,
+        build: str | None = None,
+        declared_at: str | None = None,
     ) -> SidecarGitOpResult:
         """Write ``files`` onto ``branch`` in one commit on the sandbox's clone,
         with the declared checks run there first.
@@ -282,6 +284,28 @@ class SidecarGitRunner:
         A Python closure is refused with :data:`CLOSURE_REFUSED_SENTENCE` —
         a failed result, never a raise, so the leg fails loudly in the
         driver's own words. Never raises.
+
+        THIS IS A FACTORY DOOR AND IT SAYS SO (23 September 2026, the tenth
+        review). Until now this door sent ``by_hand: true`` whenever the write
+        named a memory or a setting — the label a person at a keyboard wears,
+        which asks the helper to read the project's own declarations at the
+        committed HEAD of whatever copy it has. The reason given was that
+        planning runs before there is a build to name. That was wrong about
+        this factory's own records: the driver writes the run's starting
+        commit onto the planning run BEFORE it writes any tree, and reads the
+        memory name and the declared setting names off that same run. So the
+        run knows whose work it is (``build`` — the id the run's own row is
+        keyed by) and where its declarations were said (``declared_at`` — the
+        commit recorded for that run, read off the store, never composed and
+        never HEAD), and it sends both, exactly as the merge word's own
+        command sends the pair it reads off the build's row.
+
+        A write that names a memory or a setting and has NO recorded starting
+        commit is refused here, before a file is written or a check launched,
+        with the sentence that says how to recover. Falling back to HEAD is
+        what the label used to buy and it is what this closes. A write that
+        names nothing declared asks the project for nothing, so it needs no
+        pair and carries whatever it was given.
         """
         if pre_commit is not None and not isinstance(pre_commit, PreCommitChecks):
             logger.error(
@@ -321,19 +345,44 @@ class SidecarGitRunner:
             body["memory_project"] = str(memory_project)
         if launch_settings:
             body["launch_settings"] = [str(name) for name in launch_settings]
-        if body.get("memory_project") or body.get("launch_settings"):
-            # AND THIS DOOR CITES NO BUILD RECORD, AND SAYS SO (23 September
-            # 2026, the eighth review). The helper refuses a request that asks
-            # for a project's declarations to be read and says nothing about
-            # whose work it is, because that is also what a request whose
-            # coordinator stamp had been dropped looks like. THIS door never
-            # had a stamp to drop: planning runs before there is a build to
-            # name, so there is no record to bind to and nothing is claiming
-            # one. It asks to be read at the committed HEAD of the copy the
-            # helper has, in as many words. The one door that IS stamped — the
-            # deploy stage's — says nothing here, so a stamp dropped there
-            # still goes red.
-            body["by_hand"] = True
+        if build:
+            # WHOSE WORK THIS IS: the id this factory's own record keeps this
+            # run under. It is a label on every request, whether or not
+            # anything declared is being read.
+            body["build"] = str(build)
+        if declared_at:
+            # AND WHERE ITS DECLARATIONS WERE SAID: the commit written onto
+            # the run before the first branch was cut. The helper does not
+            # take this on the request's word — it asks this factory's own
+            # read-only answer about the run named above and reads at the
+            # commit THAT names.
+            body["declared_at"] = str(declared_at)
+        if (
+            body.get("memory_project") or body.get("launch_settings")
+        ) and not body.get("declared_at"):
+            # A DECLARATION WITH NOWHERE TO READ IT. Nothing is written and no
+            # check is launched: the recovery is to record where this run
+            # starts, which is what its target-terminal step does.
+            sentence = (
+                f"this planning run ({build or 'unnamed'}) asks for "
+                f"{self._repo}'s own declarations to be read, and this "
+                "factory has no recorded commit for where the run starts, so "
+                "there is nowhere to read them. They were NOT read at the "
+                "committed HEAD of the copy in the sandbox: a declaration is "
+                "read at the commit the record names, and no record here "
+                "names one. Nothing was written and no check was run. To "
+                "recover, re-run this run's target-terminal step, which fetches "
+                "the project's default branch and writes the starting commit "
+                "onto the run before anything is cut."
+            )
+            logger.error("%s: %s", _TREE_OPERATION, sentence)
+            return SidecarGitOpResult(
+                status="failed",
+                operation=_TREE_OPERATION,
+                stderr=sentence,
+                detail=sentence,
+                exit_code=-1,
+            )
         logger.info(
             "%s: %d file(s) onto %s for %s via %s (%d declared check(s); "
             "repo_path %s is the sandbox's to resolve)",
@@ -526,6 +575,8 @@ class RepoRoutedGitRunner:
         start_commit: str | None = None,
         memory_project: str | None = None,
         launch_settings: Sequence[str] | None = None,
+        build: str | None = None,
+        declared_at: str | None = None,
     ) -> GitOpResult:
         return await self.runner_for_path(repo_path).prepare_branch_and_write_tree(
             repo_path,
@@ -536,6 +587,8 @@ class RepoRoutedGitRunner:
             start_commit=start_commit,
             memory_project=memory_project,
             launch_settings=launch_settings,
+            build=build,
+            declared_at=declared_at,
         )
 
     async def read_file_from_branch(

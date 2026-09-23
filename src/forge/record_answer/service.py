@@ -13,7 +13,13 @@ there was nothing anywhere in the estate to ask:
   build. With nobody to ask, the helper refuses every request that names a
   commit, which is the safe side and which stops the factory deploying: the
   coordinator stamps that commit on every deploy request for a build that came
-  through planning. This service is the other end of that check;
+  through planning. This service is the other end of that check. Since 23
+  September 2026 the same question is asked about a PLANNING RUN, because
+  planning's own writes go through that helper too and are stamped with the id
+  this coordinator keeps the run under — a build's id and a run's id are
+  different strings, and both name a row in this coordinator's own record
+  saying where that work starts, so one question answers from whichever holds
+  it;
 * **who owns a deployment target.** The executor inside the helper asks this
   when its own note for a target is gone and nothing is alive on it: a delayed
   request presenting an old counter cannot establish who owns the target, so
@@ -145,20 +151,58 @@ class TheCoordinatorsRecord:
     def what_build_starts_from(self, build: str) -> dict[str, Any]:
         """What commit was this build recorded as starting from?
 
-        ``recorded`` false with no commit for a build nobody wrote one for —
-        a build queued before the starting rule existed, or one queued by hand
-        with no planning behind it. That is a fact about the record, never a
-        puzzle this service solves some other way.
+        ``recorded`` false with no commit for work nobody wrote one for — work
+        queued before the starting rule existed, or queued by hand with no
+        planning behind it. That is a fact about the record, never a puzzle
+        this service solves some other way.
+
+        TWO RECORDS, ONE QUESTION (23 September 2026). A build is not the only
+        piece of work this coordinator sends to a sandbox. Planning runs before
+        a build exists, under an id of its own, and its writes go through the
+        same helper and read the project's own declarations the same way — so
+        they name the id this coordinator keeps the RUN under. Both ids name
+        this coordinator's own record of where a piece of work starts: a
+        build's row, and a planning run's row. So this reads the builds table
+        first and the planning record when no build of that name has a commit.
+        The answer's shape is unchanged, because the thing asking has one
+        question and can use one answer: the commit this coordinator recorded,
+        or nothing at all.
         """
         row = self._one_row(
             "SELECT start_commit FROM builds WHERE build_id = ?", build
         )
         commit = str(row[0]).strip() if row is not None and row[0] else ""
+        if not commit:
+            commit = self._what_a_planning_run_starts_from(build)
         return {
             "build": str(build),
             "recorded": bool(commit),
             "start_commit": commit or None,
         }
+
+    def _what_a_planning_run_starts_from(self, run: str) -> str:
+        """The starting commit this coordinator recorded for a planning run.
+
+        The empty string when there is no such run, when it has no recorded
+        commit, or when this record keeps no planning rows at all: the builds
+        table has already been read by the time this is asked, so the record
+        itself is readable and a missing answer here is an absence rather than
+        an unreadable record.
+        """
+        try:
+            row = self._one_row(
+                "SELECT start_commit FROM planning_runs WHERE correlation_id = ?",
+                run,
+            )
+        except TheRecordIsUnreadable as exc:
+            logger.info(
+                "record answer: this record holds no planning rows to answer "
+                "about %r (%s)",
+                run,
+                exc,
+            )
+            return ""
+        return str(row[0]).strip() if row is not None and row[0] else ""
 
     def who_owns(self, target: str) -> dict[str, Any]:
         """Which build holds this deployment target, and at which counter?

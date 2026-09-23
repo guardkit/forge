@@ -333,6 +333,8 @@ class WorktreeGitRunner:
         start_commit: str | None = None,
         memory_project: str | None = None,  # noqa: ARG002 — see below
         launch_settings: "Sequence[str] | None" = None,  # noqa: ARG002
+        build: str | None = None,  # noqa: ARG002 — see below
+        declared_at: str | None = None,  # noqa: ARG002
     ) -> GitOpResult:
         """Write a multi-file tree onto ``branch`` in one commit (Lane B B2).
 
@@ -349,6 +351,11 @@ class WorktreeGitRunner:
         pre-commit checks are Python closures inside this process. The sandbox
         runner, whose checks are real commands in another process, sends them
         on. Accepting them in both keeps the one protocol the driver calls.
+        ``build`` and ``declared_at`` are accepted and not used here for the
+        same reason (23 September 2026): they say whose work a request is and
+        which commit its declarations are read at, and this runner sends no
+        request and reads no declaration — it writes with this process's own
+        git, in this process's own worktree.
 
         ``start_commit`` (one true copy, item 1) names the commit a BRAND NEW
         branch is cut from; a branch that already exists is re-attached, never
