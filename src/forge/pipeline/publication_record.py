@@ -405,6 +405,69 @@ class PublicationRecordStore:
             lines=tuple(lines),
         )
 
+    def which_commit_was_checked_as(
+        self, identity: str, *, repo: str | None = None, limit: int = 200
+    ) -> str | None:
+        """The joined commit a running identity belongs to, or ``None``.
+
+        Added 24 September 2026, after the second review of the executor stage.
+        A target can only be reasoned about once what it says it is running has
+        been PLACED: the only-forwards rule compares commits, and the project
+        answers in identities. Every publication record already holds both — the
+        joined commit it was for, and the identity captured when that commit was
+        checked — so this is that map, read back out.
+
+        ``None`` means no record here was checked as that identity, and the
+        caller then treats the target as one it cannot account for and deploys
+        nothing. That is the point: guessing would put an older result over a
+        newer one, which is the failure this exists to stop.
+        """
+        wanted = str(identity or "").strip()
+        if not wanted:
+            return None
+        sql = (
+            "SELECT j_commit, checked_json FROM publication_records "
+            "WHERE j_commit IS NOT NULL"
+        )
+        params: list[Any] = []
+        if repo:
+            sql += " AND repo = ?"
+            params.append(str(repo))
+        sql += " ORDER BY rowid DESC LIMIT ?"
+        params.append(int(limit))
+        try:
+            rows = self._cx.execute(sql, params).fetchall()
+        except sqlite3.Error as exc:
+            logger.warning(
+                "publication record: the records could not be searched for the "
+                "identity %s (%s)",
+                wanted,
+                exc,
+            )
+            return None
+        for row in rows:
+            commit = _as_text(row[0])
+            if not commit or not row[1]:
+                continue
+            try:
+                decoded = json.loads(row[1])
+            except ValueError:
+                continue
+            if not isinstance(decoded, dict):
+                continue
+            block = decoded.get("identity")
+            candidates: list[Any] = [decoded.get("artifact")]
+            if isinstance(block, dict):
+                candidates += [
+                    block.get("handed_to_the_check"),
+                    block.get("artifact"),
+                    block.get("identity"),
+                ]
+            for value in candidates:
+                if value and str(value).strip() == wanted:
+                    return commit
+        return None
+
     # -- the lease and the turn number -------------------------------------
 
     def take_lease(

@@ -31,6 +31,27 @@ step is the only thing that knows, so it is the thing that answers — and its
 answer is checked against what it was handed, which is what catches a step
 that deployed something else, a step that deployed nothing, and a step that
 ignored the identity altogether.
+
+WHAT THE SECOND REVIEW OF THE EXECUTOR STAGE ADDED (24 September 2026). A
+reviewer drove two holes through the first build of section C, and both were
+the same mistake: **a recorded statement was trusted where the target should
+have been looked at.**
+
+* The identity travelled, but the THING it named did not. The project's deploy
+  step was left to find what it had checked by a name of its own at PROMOTE
+  time, and a name can be given to another build's work in between. So the
+  project is now asked, **at the check**, for the artifact's own unrepeatable
+  identity (``checked_as``), Forge records that, and hands it back to the
+  promote (``artifact_setting``) — which must deploy exactly it.
+* Nothing ever ASKED THE TARGET what it was running. Only the ledger was read,
+  and a crash between a deploy and its ledger line makes the ledger wrong. So a
+  project may declare a **read-only step** — asked with ``asked_with``,
+  answering under ``running_as`` — that says what is running right now, changing
+  nothing. A project that declares none is not deployed over on a pick-up: it is
+  left pending, which is the safe half of not knowing.
+
+All four are names, declared by the project, carried as text. Nothing here
+knows what an artifact is, how one is asked about, or what the answer means.
 """
 
 from __future__ import annotations
@@ -44,14 +65,20 @@ from typing import Any, Mapping
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "DEFAULT_ARTIFACT_SETTING",
+    "DEFAULT_ASK_SETTING",
+    "DEFAULT_CHECKED_MARKER",
     "DEFAULT_REPORT_MARKER",
+    "DEFAULT_RUNNING_MARKER",
     "DEFAULT_SETTING_NAME",
+    "TARGET_ANSWERS",
     "FixedIdentity",
     "IdentityDeclaration",
     "declared_identity",
     "fixed_identity",
     "identity_reported_by",
     "the_identities_differ",
+    "what_the_target_says",
 ]
 
 
@@ -64,6 +91,26 @@ DEFAULT_SETTING_NAME: str = "DEPLOY_IDENTITY"
 #: The marker the deploy step prints the running identity after, when a
 #: project declares no other. One line, ``<marker>=<identity>``.
 DEFAULT_REPORT_MARKER: str = "DEPLOYED_IDENTITY"
+
+#: The marker the CHECK prints the artifact it actually checked under, when a
+#: project declares no other. One line, ``<marker>=<artifact>``. The artifact is
+#: the project's own unrepeatable name for the thing that was checked, captured
+#: at the moment it was checked — not a name that can later be given to
+#: something else.
+DEFAULT_CHECKED_MARKER: str = "CHECKED_ARTIFACT"
+
+#: The setting that artifact is handed BACK to the deploy step in, when a
+#: project declares no other. The step must deploy exactly it.
+DEFAULT_ARTIFACT_SETTING: str = "DEPLOY_ARTIFACT"
+
+#: The setting that asks a project, READ-ONLY, what it is running right now,
+#: when a project declares no other. The step so asked changes nothing.
+DEFAULT_ASK_SETTING: str = "RUNNING_IDENTITY"
+
+#: The marker that read-only answer prints under, when a project declares no
+#: other. One line, ``<marker>=<identity>``; an empty value means the project
+#: could not say, and then nothing is deployed.
+DEFAULT_RUNNING_MARKER: str = "RUNNING_IDENTITY"
 
 
 #: What a name made from a commit may contain. Letters, digits, dashes and
@@ -113,12 +160,33 @@ class IdentityDeclaration:
     #: records that the project declares no identity, and the deploy is
     #: refused rather than run blind (the caller decides; this only reports).
     declared: bool = False
+    #: The marker the CHECK prints the artifact it checked under. What comes
+    #: back is recorded and handed to the deploy, so the deploy runs the thing
+    #: that was checked rather than whatever a shared name points at later.
+    checked_as: str = DEFAULT_CHECKED_MARKER
+    #: The setting that recorded artifact is handed back in.
+    artifact_setting: str = DEFAULT_ARTIFACT_SETTING
+    #: The setting that asks the project, read-only, what is running now.
+    #: Empty when the project declares no such step, and then a pick-up that
+    #: cannot otherwise account for the target deploys nothing.
+    asked_with: str = ""
+    #: The marker that read-only answer prints under.
+    running_as: str = DEFAULT_RUNNING_MARKER
+
+    @property
+    def can_be_asked(self) -> bool:
+        """Has this project declared a read-only "what is running" step?"""
+        return bool(self.asked_with and self.running_as)
 
     def to_wire(self) -> dict[str, Any]:
         return {
             "setting": self.setting,
             "marker": self.marker,
             "declared": self.declared,
+            "checked_as": self.checked_as,
+            "artifact_setting": self.artifact_setting,
+            "asked_with": self.asked_with,
+            "running_as": self.running_as,
         }
 
 
@@ -181,16 +249,43 @@ def declared_identity(profile: Any) -> IdentityDeclaration:
         return IdentityDeclaration(
             setting=DEFAULT_SETTING_NAME, marker=DEFAULT_REPORT_MARKER, declared=False
         )
-    if isinstance(block, Mapping):
-        setting = block.get("setting")
-        marker = block.get("reported_as") or block.get("marker")
-    else:
-        setting = getattr(block, "setting", None)
-        marker = getattr(block, "reported_as", None) or getattr(block, "marker", None)
+
+    def _read(*names: str) -> Any:
+        for name in names:
+            value = (
+                block.get(name)
+                if isinstance(block, Mapping)
+                else getattr(block, name, None)
+            )
+            if value:
+                return value
+        return None
+
+    setting = _read("setting")
+    marker = _read("reported_as", "marker")
+    checked_as = _read("checked_as", "checked_marker")
+    artifact_setting = _read("artifact_setting", "artifact")
+    # ``asked_with`` has NO default: a project that has not said how to ask it
+    # what is running has not got a read-only step, and inventing a setting name
+    # for one would mean running the project's deploy step in a mode nobody
+    # declared. "Nobody has said" is a first-class answer here.
+    asked_with = _read("asked_with", "ask_with", "running_setting")
+    running_as = _read("running_as", "running_marker")
     return IdentityDeclaration(
         setting=str(setting or DEFAULT_SETTING_NAME).strip() or DEFAULT_SETTING_NAME,
         marker=str(marker or DEFAULT_REPORT_MARKER).strip() or DEFAULT_REPORT_MARKER,
         declared=True,
+        checked_as=(
+            str(checked_as or DEFAULT_CHECKED_MARKER).strip() or DEFAULT_CHECKED_MARKER
+        ),
+        artifact_setting=(
+            str(artifact_setting or DEFAULT_ARTIFACT_SETTING).strip()
+            or DEFAULT_ARTIFACT_SETTING
+        ),
+        asked_with=str(asked_with or "").strip(),
+        running_as=(
+            str(running_as or DEFAULT_RUNNING_MARKER).strip() or DEFAULT_RUNNING_MARKER
+        ),
     )
 
 
@@ -222,6 +317,57 @@ def identity_reported_by(output: str | None, *, marker: str) -> str | None:
         if value:
             found = value
     return found
+
+
+#: What a project's read-only answer amounted to. ``"identity"`` carries a
+#: value; ``"nothing"`` is the project saying nothing is running there;
+#: ``"no-answer"`` is the project not having said anything this side can read,
+#: which is NOT the same and is never treated as "nothing".
+TARGET_ANSWERS: tuple[str, ...] = ("identity", "nothing", "no-answer")
+
+
+def what_the_target_says(
+    output: str | None, *, marker: str
+) -> tuple[str, str | None]:
+    """Read a project's read-only "what are you running" answer.
+
+    One line, ``<marker>=<value>``, and the LAST such line wins, for the same
+    reason the deploy step's own line does. The VALUE is the whole of the
+    answer, and it has exactly three readings:
+
+    * a token       ⇒ ``("identity", token)`` — that is what is running there,
+      in the project's own terms. Whether the caller can place that token is
+      the caller's problem, and a token it cannot place is a target it cannot
+      account for;
+    * empty         ⇒ ``("nothing", None)`` — the project says nothing is
+      running there. This is the ONLY way a project says that, so a project
+      that knows something is running but cannot name it must answer with a
+      token rather than with nothing;
+    * no line at all ⇒ ``("no-answer", None)`` — the project said nothing this
+      side can read, which is never read as "nothing is running".
+
+    Nothing here knows what a project deploys or what its tokens mean.
+    """
+    if not output or not marker:
+        return ("no-answer", None)
+    needle = f"{marker}="
+    found: str | None = None
+    seen = False
+    for raw in str(output).splitlines():
+        line = raw.strip()
+        position = line.find(needle)
+        if position < 0:
+            continue
+        seen = True
+        value = line[position + len(needle) :].strip()
+        if value[:1] in ("'", '"') and value[-1:] == value[:1] and len(value) >= 2:
+            value = value[1:-1].strip()
+        found = value
+    if not seen:
+        return ("no-answer", None)
+    if not found:
+        return ("nothing", None)
+    return ("identity", found)
 
 
 def the_identities_differ(handed: str | None, reported: str | None) -> bool:

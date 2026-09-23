@@ -214,6 +214,8 @@ async def dispatch_deploy_stage(
     deploy_ownership: dict[str, Any] | None = None,
     memory_project: str | None = None,
     launch_settings: tuple[str, ...] = (),
+    identity_env: dict[str, str] | None = None,
+    ask_env: dict[str, str] | None = None,
 ) -> DeployStageResult | None:
     """Dispatch one DEPLOY (+ optional LIVE_GATE) stage through the runner.
 
@@ -232,7 +234,12 @@ async def dispatch_deploy_stage(
       branch's laid-out tree);
     * ``"promote"`` — :meth:`DeployStageRunner.promote`, with ``prior_events``
       the events the candidate leg already published for this run;
-    * ``"candidate_down"`` — :meth:`DeployStageRunner.candidate_down`.
+    * ``"candidate_down"`` — :meth:`DeployStageRunner.candidate_down`;
+    * ``"what_is_running"`` — :meth:`DeployStageRunner.what_is_running`, with
+      ``ask_env`` the question the project declared it wants to be asked with.
+      It changes nothing and takes no lock: the press asks it before it decides
+      whether to deploy, so the only-forwards rule is applied to what the TARGET
+      says rather than to a ledger row a crash may have left stale.
 
     Any other word is refused with a ``ValueError`` before a seam is touched.
 
@@ -282,6 +289,21 @@ async def dispatch_deploy_stage(
             task_id=task_id,
             deploy_profile_ref=deploy_profile_ref,
             candidate_cwd=candidate_cwd,
+            # WHAT THE CHECK IS HANDED SO IT CAN PIN WHAT IT CHECKED, and the
+            # project's own declarations so the child's environment is built
+            # rather than copied. Absent ⇒ exactly what it was.
+            identity_env=identity_env,
+            memory_project=memory_project,
+            launch_settings=tuple(launch_settings),
+        )
+    if leg == "what_is_running":
+        return await runner.what_is_running(
+            profile,
+            correlation_id=correlation_id,
+            deploy_run_id=deploy_run_id,
+            ask_env=dict(ask_env or {}),
+            memory_project=memory_project,
+            launch_settings=tuple(launch_settings),
         )
     if leg == "promote":
         return await runner.promote(
@@ -308,5 +330,5 @@ async def dispatch_deploy_stage(
         )
     raise ValueError(
         f"unknown deploy leg {leg!r} — expected 'deploy', 'candidate_check', "
-        "'promote' or 'candidate_down'"
+        "'promote', 'candidate_down' or 'what_is_running'"
     )

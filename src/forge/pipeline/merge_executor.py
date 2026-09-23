@@ -170,6 +170,7 @@ from forge.pipeline.deployment_identity import (
     fixed_identity,
     identity_reported_by,
     the_identities_differ,
+    what_the_target_says,
 )
 from forge.pipeline.deployment_lock import (
     DeploymentLockStore,
@@ -349,6 +350,30 @@ def _utcnow() -> datetime:
 
 def _default_receipts_root() -> Path:
     return receipts_root()
+
+
+@dataclass(frozen=True)
+class _TargetSaid:
+    """What the project answered when asked what it is running.
+
+    ``word`` is one of ``"identity"`` (``identity`` carries the project's own
+    token for what is running), ``"nothing"`` (nothing is running there) or
+    ``"no-answer"`` (the project said nothing this press can read, which is
+    never taken as "nothing is running"). ``why`` is the sentence for the last
+    of those, and ``said`` is what the step printed, kept for the record.
+    """
+
+    word: str
+    identity: str | None
+    why: str = ""
+    said: str = ""
+
+    def to_wire(self) -> dict[str, Any]:
+        return {
+            "word": self.word,
+            "identity": self.identity,
+            "why": self.why or None,
+        }
 
 
 @dataclass
@@ -1584,27 +1609,47 @@ async def execute_merge_deploy(
         )
 
     def _the_identity_the_deploy_uses_today() -> dict[str, Any]:
-        """What identifies the thing that was checked — as it stands TODAY.
+        """What identifies the thing that was checked.
 
-        The design's section C says this identity must be one that cannot be
-        reused, and that the project's deploy step must be handed it and made
-        to deploy exactly it. That is the NEXT stage. What is recorded here is
-        what actually exists now, and the gap is named in the record rather
-        than papered over: today the deploy promotes a shared name, which
-        another build can overwrite between this check and that deploy.
+        REWRITTEN 24 September 2026, after the second review of the executor
+        stage. This used to record a gap and name it honestly: the check knew
+        nothing about identity, and the deploy resolved a name of its own at
+        the moment it deployed. That gap was then driven — a second build
+        replaced the name in between and its work went live under the first
+        build's sentence — so the gap is closed here, where it was.
+
+        What is recorded now is the artifact the CHECK itself reported, under
+        the marker the project declared for it: the project's own unrepeatable
+        name for the thing that was checked, captured at the moment it was
+        checked. The deploy is handed THAT and must deploy exactly it.
+
+        ``artifact`` is ``None`` when the project's check said nothing this
+        side can read. That is recorded as it is, and the deploy refuses on it
+        rather than falling back to a name the check never confirmed.
         """
         return {
             "as_it_stands": gate.get("checked_identity"),
-            "how_the_deploy_identifies_it_today": (
-                "a shared name the project's own deploy step promotes"
-            ),
-            "gap": (
-                "the thing that was checked has no identity that cannot be "
-                "reused, so another build could overwrite the shared name "
-                "between this check and a deploy. Section C of the design "
-                "closes this and belongs to the next stage."
+            # THE ONE FIELD THE DEPLOY READS BACK.
+            "artifact": gate.get("checked_artifact"),
+            "handed_to_the_check": gate.get("identity_handed_to_the_check"),
+            "how_the_deploy_identifies_it": (
+                "the artifact the check itself reported, captured when it was "
+                "checked and handed back to the deploy by that same name"
             ),
         }
+
+    def _how_the_project_wants_the_identity() -> Any:
+        """This project's identity declaration, or ``None``.
+
+        The same answer the deploy leg works from, asked earlier: the check has
+        to be handed the identity so it can pin what it checked, and it has to
+        be read back under the marker the project declared.
+        """
+        known = _the_target_and_how_it_wants_the_identity()
+        if known is None:
+            return None
+        _, declaration = known
+        return declaration if getattr(declaration, "declared", False) else None
 
     async def _lay_the_tree_out(sha: str) -> MergeDeployOutcome | None:
         """Lay out the exact tree of ``sha`` for the live check. None = it is there."""
@@ -1646,8 +1691,26 @@ async def execute_merge_deploy(
         was not enough once the remote could have moved under it.
         """
         nonlocal candidate_standing
+        # THE IDENTITY IS HANDED TO THE CHECK, not only to the deploy (24
+        # September 2026). The check is the only moment at which the thing that
+        # was checked certainly still exists, so it is the only moment at which
+        # its identity can honestly be captured. Handing it here lets the
+        # project pin what it checked under a name nothing else can be given,
+        # and report the artifact's own identity back.
+        declaration = _how_the_project_wants_the_identity()
+        identity_env: dict[str, str] | None = None
+        if declaration is not None:
+            handed = fixed_identity(
+                j_commit=sha, content=gate.get("candidate_tree")
+            ).text
+            gate["identity_handed_to_the_check"] = handed
+            identity_env = {declaration.setting: handed}
         try:
-            checked = await _dispatch("candidate_check", candidate_cwd=str(tree_path))
+            checked = await _dispatch(
+                "candidate_check",
+                candidate_cwd=str(tree_path),
+                identity_env=identity_env,
+            )
         except Exception as exc:  # noqa: BLE001 — the sidecar-surface ValueError crack
             _write_receipt(
                 "merge_deploy_candidate.json",
@@ -1676,6 +1739,16 @@ async def execute_merge_deploy(
         gate["checked_identity"] = c_detail.get("deploy_record_ref") or c_detail.get(
             "candidate"
         )
+        # THE ARTIFACT THE CHECK SAYS IT CHECKED, read out of what the
+        # project's own step printed, under the marker the project declared.
+        # This is the thing the deploy is handed; it is never worked out again
+        # later, because "later" is exactly when another build can have taken
+        # the name it would be worked out from.
+        if declaration is not None:
+            gate["checked_artifact"] = identity_reported_by(
+                str(summary.get("candidate_output") or ""),
+                marker=declaration.checked_as,
+            )
         reason = str(c_detail.get("reason") or "")
         gate["ran"] = checked is not None and reason != "no_candidate_section"
         _write_receipt(
@@ -2029,6 +2102,105 @@ async def execute_merge_deploy(
             )
             return None
 
+    async def _what_the_target_says(*, target: str, declaration: Any) -> Any:
+        """Ask the project, read-only, what it is running on ``target``.
+
+        Added 24 September 2026, after the second review of the executor stage.
+        The only-forwards rule was being applied to the LEDGER'S row, and a run
+        that deploys and stops before writing that row leaves it wrong — so a
+        later pick-up read a stale row, believed it was moving forwards, and put
+        an older result over a newer one. The cure is to ask the thing itself,
+        under the lock, before deciding anything.
+
+        The answer is the project's own: a token it uses to name what is
+        running, an empty answer meaning nothing is running there, or no answer
+        at all. Nothing here knows what a token means; placing one is the
+        caller's job, and a token that places nowhere stops the deploy.
+        """
+        why = ""
+        said = ""
+        try:
+            asked = await _dispatch(
+                "what_is_running",
+                ask_env={declaration.asked_with: "1"},
+            )
+        except Exception as exc:  # noqa: BLE001 — a question, never a crash
+            logger.warning(
+                "merge-executor: %s could not be asked what it is running "
+                "(%s: %s)",
+                target,
+                type(exc).__name__,
+                exc,
+            )
+            return _TargetSaid(
+                word="no-answer",
+                identity=None,
+                why=f"the question raised {type(exc).__name__}: {exc}",
+                said="",
+            )
+        if asked is None:
+            return _TargetSaid(
+                word="no-answer",
+                identity=None,
+                why="the deploy stage is switched off, so nothing could be asked",
+                said="",
+            )
+        detail = getattr(asked, "detail", None) or {}
+        said = str(detail.get("deploy_output") or "")
+        if getattr(asked, "outcome", None) != "complete":
+            why = (
+                "the project's own read-only step did not finish "
+                f"({getattr(asked, 'outcome', None) or 'it answered nothing'})"
+            )
+            return _TargetSaid(
+                word="no-answer", identity=None, why=why, said=said
+            )
+        word, value = what_the_target_says(said, marker=declaration.running_as)
+        if word == "no-answer":
+            why = (
+                "the project's own read-only step printed no "
+                f"{declaration.running_as} line, so it said nothing this press "
+                "can read"
+            )
+        return _TargetSaid(word=word, identity=value, why=why, said=said)
+
+    def _which_commit_is(
+        identity: str | None, *, grant: Any, target: str
+    ) -> str | None:
+        """Which joined commit is the thing the target says it is running?
+
+        The target's own row first, because when it still agrees it is the
+        cheapest and most direct answer; then the publication records, which
+        hold identity → joined commit for every build and are what place a
+        result whose own ledger line was lost. ``None`` = nowhere, and the
+        caller then deploys nothing.
+        """
+        wanted = str(identity or "").strip()
+        if not wanted:
+            return None
+        if (
+            grant.running_identity
+            and str(grant.running_identity).strip() == wanted
+            and grant.running_commit
+        ):
+            return str(grant.running_commit)
+        store = _publication_store()
+        finder = getattr(store, "which_commit_was_checked_as", None)
+        if finder is None:
+            return None
+        try:
+            return finder(wanted, repo=repo)
+        except Exception as exc:  # noqa: BLE001 — a lookup, never a crash
+            logger.warning(
+                "merge-executor: what %s is running (%s) could not be placed "
+                "(%s: %s)",
+                target,
+                wanted,
+                type(exc).__name__,
+                exc,
+            )
+            return None
+
     def _the_target_and_how_it_wants_the_identity() -> tuple[str, Any] | None:
         """This project's deployment target, and its identity declaration.
 
@@ -2212,7 +2384,58 @@ async def execute_merge_deploy(
                     "than deployed blind"
                 ),
             )
+        # THE PROJECT HAS TO BE ASKABLE (24 September 2026). Everything below
+        # turns on knowing what is ACTUALLY running on the target at the moment
+        # of deciding, and only the project can say. A project that declares no
+        # read-only "what are you running" step cannot be asked, so its target's
+        # state cannot be established — and an unestablished target is never
+        # deployed over. Said before the lock, like the rule above it.
+        if not getattr(declaration, "can_be_asked", False):
+            return _published_deployment_pending(
+                j_commit=j_commit,
+                target_branch=target_branch,
+                g_commit=g_commit,
+                remote_now=remote_now,
+                checks_passed=checks_passed,
+                checks_total=checks_total,
+                what_was_checked=what_was_checked,
+                attempt=attempt,
+                turn=turn,
+                store=store,
+                why_not_deployed=(
+                    f"{repo}'s deploy profile does not say how to ask it what "
+                    "it is running right now — a read-only step, named in the "
+                    "identity block in deploy/profile.yaml as asked_with and "
+                    "running_as — so what is on the target could not be "
+                    "established and nothing was deployed over it"
+                ),
+            )
         identity = fixed_identity(j_commit=j_commit, content=j_tree)
+        # THE ARTIFACT THAT WAS CHECKED, as the check itself reported it. It is
+        # read off the record rather than worked out here, because "here" is
+        # after the check and a name worked out after the check is a name
+        # another build can have taken. No artifact ⇒ nothing to deploy BY.
+        artifact = str(what_was_checked.get("artifact") or "").strip()
+        if not artifact:
+            return _published_deployment_pending(
+                j_commit=j_commit,
+                target_branch=target_branch,
+                g_commit=g_commit,
+                remote_now=remote_now,
+                checks_passed=checks_passed,
+                checks_total=checks_total,
+                what_was_checked=what_was_checked,
+                attempt=attempt,
+                turn=turn,
+                store=store,
+                why_not_deployed=(
+                    f"the check of {j_commit[:10]} did not report, under "
+                    f"{repo}'s own {declaration.checked_as}, which artifact it "
+                    "checked — so there is no recorded thing for the deploy to "
+                    "run, and it will not work one out from a name that "
+                    "another build can have taken since. Nothing was deployed"
+                ),
+            )
 
         grant = lock.grant(
             target=target,
@@ -2242,13 +2465,41 @@ async def execute_merge_deploy(
             )
 
         try:
-            # 3. THE PICK-UP, BY IDENTITY. If what is running already reports
-            # the identity made for this joined commit, this deploy happened
-            # and its "done" line was lost. Nothing is done twice.
-            if (
-                grant.running_identity
-                and str(grant.running_identity).strip() == identity.text
-            ):
+            # 3. ASK THE TARGET WHAT IT IS RUNNING, under the lock, BEFORE any
+            # of this is decided (24 September 2026). Steps 3 and 4 used to
+            # read the LEDGER'S row and nothing else, and a run that deploys
+            # and stops before writing its row leaves that row wrong: a later
+            # pick-up read it, believed it was moving forwards, and put an
+            # OLDER result over a newer one while answering "merged into the
+            # remote and running". The ledger is a record of what this press
+            # did; only the project can say what is there now.
+            observed = await _what_the_target_says(
+                target=target, declaration=declaration
+            )
+            if observed.word == "no-answer":
+                return _published_deployment_pending(
+                    j_commit=j_commit,
+                    target_branch=target_branch,
+                    g_commit=g_commit,
+                    remote_now=remote_now,
+                    checks_passed=checks_passed,
+                    checks_total=checks_total,
+                    what_was_checked=what_was_checked,
+                    attempt=attempt,
+                    turn=turn,
+                    store=store,
+                    why_not_deployed=(
+                        f"{target} could not be asked what it is running "
+                        f"({observed.why}), so what is there was not "
+                        "established and nothing was deployed over it"
+                    ),
+                )
+
+            # 3b. THE PICK-UP, BY IDENTITY — off the TARGET'S own answer now,
+            # not off the ledger. If the thing running there is the very
+            # identity made for this joined commit, this deploy happened and
+            # its "done" line was lost. Nothing is done twice.
+            if observed.identity == identity.text:
                 logger.info(
                     "merge-executor: %s is already running on %s by the very "
                     "identity made for it (%s) — it was found by looking, not "
@@ -2296,12 +2547,53 @@ async def execute_merge_deploy(
                     checks_total=checks_total,
                 )
 
-            # 4. ONLY FORWARDS.
+            # 3c. PLACE WHAT THE TARGET SAID. The only-forwards rule compares
+            # COMMITS and the project answers in identities, so the answer has
+            # to be mapped back to the commit it was recorded for — off the
+            # target's own row when that row still agrees, and otherwise out of
+            # the publication records, which hold identity → joined commit for
+            # every build. An answer that places nowhere is a target this press
+            # cannot account for, and an unaccounted target is NEVER deployed
+            # over: that is the whole of the cure.
+            running_commit: str | None = None
+            if observed.word == "nothing":
+                running_commit = None
+            else:
+                running_commit = _which_commit_is(
+                    observed.identity, grant=grant, target=target
+                )
+                if running_commit is None:
+                    logger.warning(
+                        "merge-executor: %s says it is running %s, which no "
+                        "record here was checked as — nothing was deployed",
+                        target,
+                        observed.identity,
+                    )
+                    return _published_deployment_pending(
+                        j_commit=j_commit,
+                        target_branch=target_branch,
+                        g_commit=g_commit,
+                        remote_now=remote_now,
+                        checks_passed=checks_passed,
+                        checks_total=checks_total,
+                        what_was_checked=what_was_checked,
+                        attempt=attempt,
+                        turn=turn,
+                        store=store,
+                        why_not_deployed=(
+                            f"{target} says it is running {observed.identity}, "
+                            "and no record here says which result that is. An "
+                            "unresolved target is never deployed over, so "
+                            "nothing was deployed and somebody has to look"
+                        ),
+                    )
+
+            # 4. ONLY FORWARDS, against what the TARGET says is running.
             forwards = await what_to_do_about_j(
                 git,
                 j_commit=j_commit,
-                running_commit=grant.running_commit,
-                running_identity=grant.running_identity,
+                running_commit=running_commit,
+                running_identity=observed.identity,
                 target=target,
             )
             if not forwards.go:
@@ -2335,25 +2627,23 @@ async def execute_merge_deploy(
                     already_running=forwards.already,
                 )
 
-            # 5. HAND THE IDENTITY OVER, with the ownership beside it.
+            # 5. HAND THE IDENTITY AND THE ARTIFACT OVER, with the ownership
+            # beside them. The artifact is the thing the CHECK said it checked;
+            # the deploy step must run exactly it and nothing it resolves for
+            # itself. (``something_is_running`` used to ride here too and was
+            # taken off on 24 September 2026: the executor consulted it to let a
+            # note-less first deploy through, and a delayed request carrying a
+            # stale copy of it was accepted over a newer build. A request cannot
+            # establish its own freshness, so it no longer carries a claim about
+            # the target at all.)
             ownership = {
                 "target": target,
                 "target_counter": grant.counter,
                 "build": build_id,
                 "identity": identity.text,
                 "identity_setting": declaration.setting,
-                # WHETHER ANYTHING IS RUNNING THERE AT ALL, read off the
-                # target's own row under this lock a moment ago. The executor
-                # uses it for one thing: when its own note for this target is
-                # gone and nobody can be asked who owns it, something already
-                # running means a deploy has happened before, so a note should
-                # have existed and its absence is a LOSS — and the executor
-                # refuses rather than treating a missing note as an empty slot.
-                # It can only make the executor stricter, never more
-                # permissive.
-                "something_is_running": bool(
-                    grant.running_commit or grant.running_identity
-                ),
+                "artifact": artifact,
+                "artifact_setting": declaration.artifact_setting,
             }
             if store is not None and not store.about_to(
                 build_id=build_id,
@@ -2366,7 +2656,9 @@ async def execute_merge_deploy(
                     "target": target,
                     "target_counter": grant.counter,
                     "identity": identity.to_wire(),
+                    "artifact": artifact,
                     "declared": declaration.to_wire(),
+                    "what_the_target_said": observed.to_wire(),
                     "what_is_running_now": forwards.to_wire(),
                 },
             ):
@@ -3966,12 +4258,16 @@ async def execute_merge_deploy(
                 "verify_ok": gate.get("verdict") == "pass",
                 "checks_passed": gate.get("checks_passed"),
                 "checks_total": gate.get("checks_total"),
-                # THE IDENTITY THE EXISTING DEPLOY USES TODAY, recorded as it is.
-                # It is a shared name that another build can overwrite, which is
-                # exactly why the design's section C replaces it with an identity
-                # that cannot be reused — in the NEXT stage. Here it is recorded
-                # and the gap is named, not papered over.
+                # THE IDENTITY OF WHAT WAS CHECKED, as the check itself
+                # reported it (section C). The artifact inside it is the
+                # project's own unrepeatable name for the thing that was
+                # checked, captured at the check; the deploy is handed exactly
+                # that and never works one out again later.
                 "identity": _the_identity_the_deploy_uses_today(),
+                # THE SAME ARTIFACT, at the top level, because this is where
+                # the deploy leg reads it from — on this run and on a pick-up
+                # that reads this record back off the ledger.
+                "artifact": gate.get("checked_artifact"),
             }
             if store is not None and not store.done(
                 build_id=build_id,
@@ -4451,6 +4747,8 @@ def build_in_daemon_deploy_dispatcher(
         deploy_run_id: str | None = None,
         task_id: str | None = None,
         deploy_ownership: dict[str, Any] | None = None,
+        identity_env: dict[str, str] | None = None,
+        ask_env: dict[str, str] | None = None,
     ) -> Any:
         from forge.adapters.nats.deploy_publisher import DeployPublisher
         from forge.adapters.nats.runbook_publisher import RunbookPublisher
@@ -4557,6 +4855,11 @@ def build_in_daemon_deploy_dispatcher(
             deploy_ownership=deploy_ownership,
             memory_project=build_memory,
             launch_settings=build_declared,
+            # WHAT THE CHECK IS HANDED so it can pin what it checked, and the
+            # question the project declared it wants "what are you running"
+            # asked with. Both are names the project chose; this carries them.
+            identity_env=identity_env,
+            ask_env=ask_env,
         )
 
     return _dispatch

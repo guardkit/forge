@@ -409,6 +409,70 @@ def build_revert_runbook(
     )
 
 
+def build_read_only_runbook(
+    profile: DeployProfile,
+    *,
+    runbook_id: str,
+    target: str,
+    extra_env: dict[str, str],
+    now: datetime,
+    inside_sandbox: bool = False,
+    memory_project: str | None = None,
+    launch_settings: Sequence[str] | None = None,
+) -> Runbook:
+    """Render a runbook that ASKS the project something and changes nothing.
+
+    Added 24 September 2026. The press has to be able to ask a project what it
+    is running before it decides whether to deploy — the design's B applied to
+    the TARGET rather than to a ledger row a crash can leave stale. The project
+    declares the setting it wants that question asked with, and ``extra_env``
+    carries it.
+
+    One ``deploy_compose`` step and nothing else: no pre-flight, no secrets, no
+    health check, and NO ownership block — so it never goes through the
+    executor, never takes a target's slot and never stops a live command,
+    because it does not change the target. It is built exactly the way the
+    deploy is otherwise, for the same reason the teardown is: whatever the
+    deploy step is sent, the step that asks about it is sent too.
+
+    Args:
+        profile: The parsed deploy profile (its compose invocation is reused).
+        runbook_id: Unique id (typically ``ask-<deploy_run_id>``).
+        target: The runbook target (typically the profile ``env_id``).
+        extra_env: The question, as the project declared it wants to be asked.
+        now: Creation timestamp (injected clock).
+        inside_sandbox: True when this step runs INSIDE the repository's own
+            sandbox — the settings that say how to make that sandbox are not
+            threaded onto it (:func:`sandbox_env`).
+        memory_project: The memory name recorded for this build, and
+        launch_settings: the setting NAMES the project declared — both carried
+            onto the step so the child's environment is built rather than
+            copied (the environment door).
+    """
+    compose_params: dict[str, Any] = {
+        "cwd": profile.cwd,
+        "compose_file": profile.compose.file,
+        "compose_profile": profile.compose.profile,
+        "extra_env": _merged_env(profile, extra_env, inside_sandbox=inside_sandbox),
+    }
+    if profile.compose.script is not None:
+        compose_params["script"] = profile.compose.script
+    if profile.compose.env_file is not None:
+        compose_params["env_file"] = profile.compose.env_file
+    if memory_project:
+        compose_params["memory_project"] = str(memory_project)
+    if launch_settings:
+        compose_params["launch_settings"] = [str(name) for name in launch_settings]
+    return Runbook(
+        runbook_id=runbook_id,
+        target=target,
+        steps=(_step("deploy_compose", compose_params, 0),),
+        current_step_index=0,
+        status=StepStatus.pending,
+        created_at=now,
+    )
+
+
 def build_candidate_teardown_runbook(
     profile: DeployProfile,
     *,
