@@ -226,27 +226,32 @@ def _nesting_too_deep(content: str) -> int | None:
     return worst if worst > MAX_DECLARATION_DEPTH else None
 
 
-def _parse(content: str, repo: str, commit: str) -> tuple[dict | None, DeclaredMemory | None]:
-    """``(settings, None)`` when the file parsed, or ``(None, refusal)``.
+def _parse(content: str) -> tuple[dict | None, str | None]:
+    """``(settings, None)`` when the file parsed, or ``(None, why not)``.
 
     The one bounded parse both questions are answered from, so a file is read
     the same way whichever question is being asked and a hostile one cannot
     stall a run through either door.
+
+    IT ANSWERS WITH THE CLAUSE, NOT THE SENTENCE (25 September 2026, the fifth
+    review). It used to hand back a finished memory-reader refusal, and the
+    launch-settings reader passed that straight on — so a project whose
+    settings file would not parse was told "there is no way to tell which
+    memory this work belongs to" when it had asked which settings its builds
+    need. The clause ("it is not a set of settings") belongs to the file; the
+    sentence around it belongs to the question being asked, and each reader
+    now writes its own.
     """
     if len(content.encode("utf-8", errors="ignore")) > MAX_DECLARATION_BYTES:
-        return None, _unreadable(
-            repo,
-            commit,
+        return None, (
             f"it is larger than {MAX_DECLARATION_BYTES} bytes, which this "
-            f"factory will not parse",
+            f"factory will not parse"
         )
     too_deep = _nesting_too_deep(content)
     if too_deep is not None:
-        return None, _unreadable(
-            repo,
-            commit,
+        return None, (
             f"it nests more than {MAX_DECLARATION_DEPTH} levels deep, which "
-            f"this factory will not parse",
+            f"this factory will not parse"
         )
     try:
         data = yaml.safe_load(content) or {}
@@ -259,13 +264,9 @@ def _parse(content: str, repo: str, commit: str) -> tuple[dict | None, DeclaredM
         # commit this factory did not write is INPUT: whatever it does to the
         # parser is an answer to a person, never a stranded run.
         first = str(exc).strip().splitlines()[0] if str(exc).strip() else ""
-        return None, _unreadable(
-            repo,
-            commit,
-            first or f"reading it raised {type(exc).__name__}",
-        )
+        return None, (first or f"reading it raised {type(exc).__name__}")
     if not isinstance(data, dict):
-        return None, _unreadable(repo, commit, "it is not a set of settings")
+        return None, "it is not a set of settings"
     return data, None
 
 
@@ -319,9 +320,9 @@ def read_declared_memory(
         return _declares_none(repo, commit)
     if content is None:
         return _unreadable(repo, commit, "its contents came back empty-handed")
-    data, refusal = _parse(content, repo, commit)
-    if refusal is not None:
-        return refusal
+    data, why_not = _parse(content)
+    if why_not is not None:
+        return _unreadable(repo, commit, why_not)
     assert data is not None  # _parse answers one or the other, never neither
     if MEMORY_KEY not in data:
         return _declares_none(repo, commit)
@@ -402,9 +403,12 @@ def read_declared_launch_settings(
         # this is only ever reached for a file that exists and says nothing
         # about its launch.
         return DeclaredLaunchSettings()
-    data, parse_refusal = _parse(content, repo, commit)
-    if parse_refusal is not None:
-        return DeclaredLaunchSettings(refusal=parse_refusal.refusal)
+    data, why_not = _parse(content)
+    if why_not is not None:
+        # ITS OWN SENTENCE. This used to hand on the memory reader's, which
+        # said the work's memory could not be told — a true sentence about a
+        # question nobody had asked here.
+        return _launch_refusal(repo, commit, why_not)
     assert data is not None
     if LAUNCH_KEY not in data:
         return DeclaredLaunchSettings()

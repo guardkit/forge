@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import subprocess
 import stat
 import sys
 import threading
@@ -61,6 +62,10 @@ REAL_LOADER_NAME = "guardkit.orchestrator.toolchain_declaration"
 #: recorded for this build.
 DECLARED_SETTING = "SOME_TOOL_CACHE"
 MEMORY_NAME = "widget_shop"
+
+#: The commit this build's work starts from, as the ledger records it. The
+#: helper reads the project's declaration files THERE (26 September 2026).
+START_COMMIT = "1f2e3d4c5b6a79880123456789abcdef01234567"
 
 #: Planted in THIS process, which is the process the helper runs in for these
 #: tests. None of it is on the factory's list and none of it may reach a child.
@@ -150,7 +155,33 @@ def repo(tmp_path: Path) -> Path:
         f"launch:\n  settings: [{DECLARED_SETTING}]\n",
         encoding="utf-8",
     )
+    # AND IT IS COMMITTED (26 September 2026). A declaration is a committed
+    # line: the helper reads both of the project's declaration files out of its
+    # history, at the recorded starting commit or at committed HEAD, and never
+    # off the working copy it runs the project's own programs out of.
+    _commit_the_project(root)
     return root
+
+
+def _commit_the_project(root: Path) -> None:
+    """Put everything in ``root`` into one commit of its own history."""
+    for args in (
+        ("init", "-q", "-b", "main"),
+        ("add", "-A"),
+        ("commit", "-q", "-m", "the project as it is"),
+    ):
+        subprocess.run(
+            [
+                "git",
+                "-c", "user.email=tests@example.invalid",
+                "-c", "user.name=tests",
+                "-c", "commit.gpgsign=false",
+                *args,
+            ],
+            cwd=str(root),
+            check=True,
+            capture_output=True,
+        )
 
 
 @pytest.fixture
@@ -378,10 +409,18 @@ def ledger(tmp_path: Path) -> Path:
         "INSERT INTO builds (build_id, feature_id, repo, branch, "
         "feature_yaml_path, status, triggered_by, correlation_id, queued_at, "
         "started_at, worktree_path, mode, task_id, memory_project, "
-        "launch_settings) VALUES (?, ?, ?, 'autobuild/FEAT-WS1', 'f.yaml', "
+        "launch_settings, start_commit, target_branch) VALUES (?, ?, ?, "
+        "'autobuild/FEAT-WS1', 'f.yaml', "
         "'COMPLETE', 'cli', 'corr-ws1', '2026-09-22T00:00:00Z', "
-        "'2026-09-22T00:00:00Z', '/wt', 'mode-a', 'TASK-WS1', ?, ?)",
-        (BUILD_ID, FEATURE_ID, REPO, MEMORY_NAME, json.dumps([DECLARED_SETTING])),
+        "'2026-09-22T00:00:00Z', '/wt', 'mode-a', 'TASK-WS1', ?, ?, ?, 'main')",
+        (
+            BUILD_ID,
+            FEATURE_ID,
+            REPO,
+            MEMORY_NAME,
+            json.dumps([DECLARED_SETTING]),
+            START_COMMIT,
+        ),
     )
     cx.commit()
     cx.close()
@@ -394,18 +433,21 @@ class TestTheUpstreamCallersReadTheLedger:
     ) -> None:
         from forge.pipeline.merge_executor import _the_builds_declarations
 
-        name, names = _the_builds_declarations(ledger, BUILD_ID)
+        name, names, started_at = _the_builds_declarations(ledger, BUILD_ID)
 
         assert name == MEMORY_NAME
         assert names == (DECLARED_SETTING,)
+        # AND WHERE THE PROJECT SAID THEM: the build's recorded starting
+        # commit, which the helper reads the declaration at.
+        assert started_at == START_COMMIT
 
     def test_a_build_with_nothing_recorded_reads_as_nothing(
         self, ledger: Path
     ) -> None:
         from forge.pipeline.merge_executor import _the_builds_declarations
 
-        assert _the_builds_declarations(ledger, "no-such-build") == (None, ())
-        assert _the_builds_declarations(None, BUILD_ID) == (None, ())
+        assert _the_builds_declarations(ledger, "no-such-build") == (None, (), None)
+        assert _the_builds_declarations(None, BUILD_ID) == (None, (), None)
 
     def test_the_gates_readers_own_readers_take_both_off_the_row(
         self, ledger: Path

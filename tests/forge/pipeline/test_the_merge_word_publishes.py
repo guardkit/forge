@@ -251,7 +251,15 @@ class TestItSendsAndStopsAtPublished:
         assert "deployment pending" in outcome.detail
         assert "Nothing has been deployed" in outcome.detail
         # THE DEPLOY DID NOT RUN. Only the check and its tear-down.
-        assert _legs(deploy) == ["candidate_check", "candidate_down"]
+        # A CLEANUP THAT CANNOT NAME THE CANDIDATE DOES NOT RUN (26 September
+        # 2026). This stand-in project declares no identity, so nothing was
+        # handed to the check and nothing recorded says which candidate this
+        # build stood up — the teardown is not dispatched, the candidate is
+        # left standing, and the report says so in plain words.
+        assert _legs(deploy) == ["candidate_check"]
+        assert "was left in place because its identity is not recorded" in (
+            outcome.detail
+        )
         assert "promote" not in _legs(deploy)
 
     @pytest.mark.asyncio

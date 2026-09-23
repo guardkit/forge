@@ -58,6 +58,13 @@ from forge.persistence.repositories.runbook import RunbookRepository
 
 FIXED = datetime(2026, 7, 16, 12, 0, 0, tzinfo=UTC)
 
+#: WHICH CANDIDATE A TEARDOWN MEANS (26 September 2026). The identity the CHECK
+#: was handed, under the setting the project declares for it. A teardown with
+#: no identity is refused and removes nothing: it would have to go looking, and
+#: what it found could belong to another build's check.
+WHICH_CANDIDATE = {"DEPLOY_IDENTITY": "j-abcdef012345@0123456789abcdef"}
+
+
 
 # ---------------------------------------------------------------------------
 # Fixtures / fakes
@@ -378,6 +385,7 @@ class TestCandidateHappyPath:
             deploy_run_id="run-ok",
             feature="FEAT-B70F",
             feat_id="FEAT-B70F",
+            identity_env=WHICH_CANDIDATE,
         )
 
         assert result.outcome == "complete"
@@ -481,6 +489,7 @@ class TestCandidateGateFail:
             deploy_run_id="run-fail",
             feature="FEAT-3AA",
             feat_id="FEAT-3AA",
+            identity_env=WHICH_CANDIDATE,
         )
 
         assert result.outcome == "failed"
@@ -531,6 +540,7 @@ class TestPromoteLegRevert:
             deploy_run_id="run-rev",
             feature="FEAT-4AA",
             feat_id="FEAT-4AA",
+            identity_env=WHICH_CANDIDATE,
         )
 
         # The promote happened, the live gate failed, and O-32 reverted — exactly

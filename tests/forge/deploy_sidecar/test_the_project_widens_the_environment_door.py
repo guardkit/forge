@@ -18,10 +18,13 @@ itself declares it, in its own committed files —
   block (the setting the identity is handed in, the setting the artifact is
   handed back in, and the setting its read-only question is asked with).
 
-The helper reads those from the copy of the project it has, because it cannot
-see the coordinator's ledger. A name the project does not declare is refused in
-plain words and nothing starts. The reserved list still wins: a project that
-declares one of the factory's own names gets nothing from it.
+The helper reads those at a COMMIT (26 September 2026): the recorded commit the
+work starts from, sent on the request as ``declared_at``, and with none, the
+committed HEAD of the copy of the project it has. Never the working tree — a
+line a build writes into the checkout the command is about to run out of is not
+a declaration. A name the project does not declare is refused in plain words
+and nothing starts. The reserved list still wins: a project that declares one
+of the factory's own names gets nothing from it.
 
 NOTHING LIVE IS TOUCHED HERE. The service is this same process's own test
 server on 127.0.0.1, on a port the kernel picks; the project is a throwaway
@@ -35,6 +38,7 @@ from __future__ import annotations
 
 import json
 import stat
+import subprocess
 import threading
 import urllib.error
 import urllib.request
@@ -115,7 +119,36 @@ def _a_project(
         )
     else:
         declaration.write_text("toolchain:\n  test: qa/run\n", encoding="utf-8")
+    # AND COMMITTED, because a declaration is a committed line. The helper
+    # reads both files out of this history, never off the disk.
+    _commit_everything(root)
     return root
+
+
+def _git(where: Path, *args: str) -> str:
+    done = subprocess.run(
+        [
+            "git",
+            "-c", "user.email=tests@example.invalid",
+            "-c", "user.name=tests",
+            "-c", "commit.gpgsign=false",
+            *args,
+        ],
+        cwd=str(where),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return done.stdout.strip()
+
+
+def _commit_everything(root: Path, message: str = "the project as it is") -> str:
+    """Put everything in ``root`` into a commit; answer that commit."""
+    if not (root / ".git").exists():
+        _git(root, "init", "-q", "-b", "main")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "--allow-empty", "-m", message)
+    return _git(root, "rev-parse", "HEAD")
 
 
 def _config(repo: Path) -> ForgeConfig:
@@ -200,8 +233,9 @@ class TestWhatTheProjectDeclares:
                 "running_as": "RUNNING_IDENTITY",
             },
         )
-        declared, note = project_declared_settings(project)
+        declared, note, where = project_declared_settings(project)
         assert note is None
+        assert "committed HEAD" in where
         assert set(declared) == {
             DECLARED_SETTING,
             "DEPLOY_IDENTITY",
@@ -223,7 +257,7 @@ class TestWhatTheProjectDeclares:
         said nothing.
         """
         project = _a_project(tmp_path / "widget-shop")
-        declared, note = project_declared_settings(project)
+        declared, note, where = project_declared_settings(project)
         assert note is None
         assert DECLARED_SETTING not in declared
         identity = declared_identity(
@@ -245,10 +279,93 @@ class TestWhatTheProjectDeclares:
         project = _a_project(
             tmp_path / "widget-shop", declares=(A_RESERVED_SETTING, DECLARED_SETTING)
         )
-        declared, note = project_declared_settings(project)
+        declared, note, where = project_declared_settings(project)
         assert A_RESERVED_SETTING not in declared
         assert DECLARED_SETTING not in declared
         assert note is not None and "cannot use" in note
+
+
+class TestADeclarationIsACommittedLine:
+    """Read at a commit, never off the disk (26 September 2026).
+
+    Both declaration files used to be read as they are in the working copy the
+    helper was pointed at, so an uncommitted line counted as a declaration —
+    including one a build had just written into the very checkout the command
+    was about to run out of, which let a build widen its own door.
+    """
+
+    def test_a_name_only_in_the_working_tree_is_refused(self, tmp_path: Path) -> None:
+        project = _a_project(tmp_path / "widget-shop", declares=(DECLARED_SETTING,))
+        (project / ".guardkit" / "config.yaml").write_text(
+            "launch:\n  settings: [" + DECLARED_SETTING + ", " + UNDECLARED_SETTING
+            + "]\n",
+            encoding="utf-8",
+        )
+        declared, _note, where = project_declared_settings(project)
+        assert DECLARED_SETTING in declared
+        assert UNDECLARED_SETTING not in declared
+        assert "committed HEAD" in where
+        status, body = _ask(project, {"launch_settings": [UNDECLARED_SETTING]})
+        assert status == 400, body
+        assert "an uncommitted line in a working copy is not a declaration" in (
+            body["error"]
+        )
+
+    def test_the_same_name_committed_at_the_recorded_commit_is_admitted(
+        self, tmp_path: Path
+    ) -> None:
+        project = _a_project(tmp_path / "widget-shop", declares=(DECLARED_SETTING,))
+        (project / ".guardkit" / "config.yaml").write_text(
+            "launch:\n  settings: [" + DECLARED_SETTING + ", " + UNDECLARED_SETTING
+            + "]\n",
+            encoding="utf-8",
+        )
+        started_from = _commit_everything(project, "and the second name")
+        declared, note, where = project_declared_settings(
+            project, commit=started_from
+        )
+        assert note is None
+        assert UNDECLARED_SETTING in declared
+        assert started_from in where
+        status, body = _ask(
+            project,
+            {"launch_settings": [UNDECLARED_SETTING], "declared_at": started_from},
+        )
+        assert status == 200, body
+        assert UNDECLARED_SETTING in _names_the_child_was_given(body)
+
+    def test_a_commit_that_lacks_it_is_refused_even_though_HEAD_has_it(
+        self, tmp_path: Path
+    ) -> None:
+        project = _a_project(tmp_path / "widget-shop", declares=(DECLARED_SETTING,))
+        first = _git(project, "rev-parse", "HEAD")
+        (project / ".guardkit" / "config.yaml").write_text(
+            "launch:\n  settings: [" + DECLARED_SETTING + ", " + UNDECLARED_SETTING
+            + "]\n",
+            encoding="utf-8",
+        )
+        _commit_everything(project, "and the second name")
+        status, body = _ask(
+            project, {"launch_settings": [UNDECLARED_SETTING], "declared_at": first}
+        )
+        assert status == 400, body
+        assert first in body["error"]
+        assert "the commit this work starts from" in body["error"]
+        # And at HEAD it is there, so the refusal is about the commit and not
+        # about the name.
+        at_head, _note, _where = project_declared_settings(project)
+        assert UNDECLARED_SETTING in at_head
+
+    def test_a_commit_of_the_wrong_shape_is_refused_before_git_is_started(
+        self, tmp_path: Path
+    ) -> None:
+        project = _a_project(tmp_path / "widget-shop", declares=(DECLARED_SETTING,))
+        status, body = _ask(
+            project,
+            {"launch_settings": [DECLARED_SETTING], "declared_at": "--upload-pack=x"},
+        )
+        assert status == 400, body
+        assert "declared_at" in body["error"]
 
 
 class TestTheRealRouteWithARealChild:

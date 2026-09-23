@@ -200,6 +200,31 @@ def _utcnow() -> datetime:
     return datetime.now(UTC)
 
 
+#: What a teardown that was told nothing is answered with. One build's cleanup
+#: must never touch another build's candidate, and the only thing that tells
+#: them apart is the identity the CHECK was handed — so a teardown without one
+#: is refused here rather than left to the project's step to guess at.
+A_TEARDOWN_WITH_NO_NAME: str = (
+    "this teardown was handed no identity, so there is no one candidate it "
+    "could name; nothing was taken down. A teardown that names nothing has to "
+    "go looking for candidates, and what it finds can belong to another "
+    "build's check. Hand it the same identity the check was handed, or remove "
+    "the candidate by hand with the project's own teardown step."
+)
+
+
+def _names_one_candidate(identity_env: "dict[str, str] | None") -> bool:
+    """Does this overlay actually name a candidate? Both halves must be there.
+
+    A setting with an empty value names nothing, and an empty overlay names
+    nothing; either way there is no single candidate to take down.
+    """
+    for name, value in dict(identity_env or {}).items():
+        if str(name).strip() and str(value).strip():
+            return True
+    return False
+
+
 @dataclass(frozen=True, slots=True)
 class DeployStageResult:
     """The outcome of one deploy-stage run.
@@ -665,6 +690,8 @@ class DeployStageRunner:
         task_id: str | None = None,
         deploy_profile_ref: str | None = None,
         deployer: str | None = None,
+        declared_at: str | None = None,
+        identity_env: dict[str, str] | None = None,
     ) -> DeployStageResult:
         """Run the DEPLOY (+ optional LIVE_GATE) stage for ``profile`` in one call.
 
@@ -687,6 +714,8 @@ class DeployStageRunner:
                 feat_id=feat_id,
                 task_id=task_id,
                 deploy_profile_ref=deploy_profile_ref,
+                declared_at=declared_at,
+                identity_env=identity_env,
             )
             if checked.outcome != "complete":
                 return checked
@@ -701,6 +730,8 @@ class DeployStageRunner:
             deploy_profile_ref=deploy_profile_ref,
             deployer=deployer,
             prior_events=prior_events,
+            declared_at=declared_at,
+            identity_env=identity_env,
         )
 
     async def candidate_check(
@@ -717,6 +748,7 @@ class DeployStageRunner:
         identity_env: dict[str, str] | None = None,
         memory_project: str | None = None,
         launch_settings: tuple[str, ...] = (),
+        declared_at: str | None = None,
     ) -> DeployStageResult:
         """Leg one: the candidate up, healthy, and through the live gate.
 
@@ -804,6 +836,7 @@ class DeployStageRunner:
                 identity_env=identity_env,
                 memory_project=memory_project,
                 launch_settings=tuple(launch_settings),
+                declared_at=declared_at,
             )
             if terminal is not None:
                 return replace(
@@ -838,7 +871,8 @@ class DeployStageRunner:
 
         ``identity_env`` is the same setting the CHECK was handed, so a project
         whose candidate belongs to one check rather than to a shared name can
-        take down the right one."""
+        take down the right one. It is REQUIRED: with none, this leg refuses
+        and removes nothing (:data:`A_TEARDOWN_WITH_NO_NAME`)."""
         profile = self._profile_for_run(profile)
         if profile.candidate is None:
             return DeployStageResult(
@@ -846,6 +880,22 @@ class DeployStageRunner:
                 deploy_run_id=deploy_run_id,
                 dry_run=self._dry_run,
                 detail={"reason": "no_candidate_section", "candidate": "absent"},
+            )
+        if not _names_one_candidate(identity_env):
+            logger.warning(
+                "candidate teardown for %s was refused: %s",
+                profile.env_id,
+                A_TEARDOWN_WITH_NO_NAME,
+            )
+            return DeployStageResult(
+                outcome="failed",
+                deploy_run_id=deploy_run_id,
+                failed_step="candidate_down",
+                dry_run=self._dry_run,
+                detail={
+                    "candidate": "standing",
+                    "refusal": A_TEARDOWN_WITH_NO_NAME,
+                },
             )
         torn_down = await self._teardown_candidate(
             profile,
@@ -870,6 +920,7 @@ class DeployStageRunner:
         ask_env: dict[str, str],
         memory_project: str | None = None,
         launch_settings: tuple[str, ...] = (),
+        declared_at: str | None = None,
     ) -> DeployStageResult:
         """ASK THE TARGET what it is running. Read-only; nothing is changed.
 
@@ -904,6 +955,7 @@ class DeployStageRunner:
             inside_sandbox=self._runs_inside_the_sandbox(),
             memory_project=memory_project,
             launch_settings=launch_settings,
+            declared_at=declared_at,
         )
         try:
             run_result = await self._run_runbook(runbook, correlation_id)
@@ -965,6 +1017,8 @@ class DeployStageRunner:
         deploy_ownership: dict[str, Any] | None = None,
         memory_project: str | None = None,
         launch_settings: tuple[str, ...] = (),
+        declared_at: str | None = None,
+        identity_env: dict[str, str] | None = None,
     ) -> DeployStageResult:
         """Leg two: the live name comes up on the image the candidate built.
 
@@ -1002,7 +1056,10 @@ class DeployStageRunner:
         # (25 September 2026). A project whose candidate belongs to one check
         # rather than to a shared name cannot be told which one to take down
         # without it. Both names are the project's own and carried as text.
-        identity_env_for_teardown: dict[str, str] = {}
+        # The press under the lock carries it in the ownership block; a caller
+        # that is not the press hands it directly. Either way the teardown
+        # NAMES ONE CANDIDATE or does not run at all.
+        identity_env_for_teardown: dict[str, str] = dict(identity_env or {})
         if deploy_ownership:
             setting = str(deploy_ownership.get("identity_setting") or "").strip()
             identity_text = str(deploy_ownership.get("identity") or "").strip()
@@ -1074,6 +1131,7 @@ class DeployStageRunner:
                 deploy_ownership=deploy_ownership,
                 memory_project=memory_project,
                 launch_settings=launch_settings,
+                declared_at=declared_at,
             )
             await self._safe_publish(
                 self._deploy_publisher.publish_deploy_started,
@@ -1550,6 +1608,7 @@ class DeployStageRunner:
         identity_env: dict[str, str] | None = None,
         memory_project: str | None = None,
         launch_settings: tuple[str, ...] = (),
+        declared_at: str | None = None,
     ) -> tuple[DeployStageResult | None, dict[str, Any]]:
         """Stand the candidate up under ``-cand``, gate it, leave-standing-or-teardown.
 
@@ -1596,6 +1655,7 @@ class DeployStageRunner:
             inside_sandbox=self._runs_inside_the_sandbox(),
             memory_project=memory_project,
             launch_settings=launch_settings,
+            declared_at=declared_at,
         )
         run_result = await self._run_runbook(cand_runbook, correlation_id)
         executed = self._repo.load_runbook(
@@ -1707,11 +1767,26 @@ class DeployStageRunner:
         ``identity_env`` (25 September 2026) is the same setting the CHECK was
         handed, carrying the same identity. A project whose candidate belongs
         to one check rather than to a shared name needs it to know which one to
-        take down, and a project that never used it is unaffected: it is one
-        more setting in the overlay, named by the project and carried here as
-        text. Absent ⇒ byte for byte what this was.
+        take down, and both names are the project's own, carried here as text.
+
+        IT IS REQUIRED, and a teardown handed none is NOT RUN (the fifth
+        review, same day). Without a name the only thing a project's teardown
+        step can do is find candidates by looking, and what it finds can
+        belong to another build's check — which was driven: one build's ending
+        removed three builds' candidates and their data. So with no identity
+        the candidate is left standing and a person removes it by hand.
         """
         assert profile.candidate is not None
+        if not _names_one_candidate(identity_env):
+            logger.warning(
+                "candidate teardown for %s was NOT run: it was handed no "
+                "identity, so there is no one candidate it could name. A "
+                "teardown that names nothing has to go looking, and what it "
+                "finds can belong to another build's check — so the candidate "
+                "is left standing for a person to remove by hand",
+                profile.env_id,
+            )
+            return False
         teardown_env = {
             "CANDIDATE_DOWN": "1",
             **dict(profile.candidate.env),

@@ -1359,6 +1359,13 @@ async def execute_merge_deploy(
         conformance_warning = digest_conformance.get("warning")
         if conformance_warning:
             outcome.detail = f"{outcome.detail}\nWARNING: {conformance_warning}"
+        # A CANDIDATE THIS PRESS COULD NOT NAME IS SAID IN THE REPORT, not only
+        # in a log: something is still standing and a person has to remove it.
+        # The cleanup runs before this, in the caller's ``finally``, so by here
+        # the answer is known.
+        left_standing = str(gate.get("candidate_left_standing") or "").strip()
+        if left_standing:
+            outcome.detail = f"{outcome.detail}\n{left_standing}"
         if gate_began and outcome.gate_before_merge is None:
             outcome.gate_before_merge = _gate_for_report()
         outcome.branch = branch
@@ -1486,11 +1493,68 @@ async def execute_merge_deploy(
             f"{why}; nothing was merged and the branch is kept."
         )
 
+    def _the_identity_a_teardown_must_name() -> tuple[dict[str, str] | None, str]:
+        """``({setting: identity}, "")`` for a teardown, or ``(None, why not)``.
+
+        ONE BUILD'S CLEANUP MUST NEVER TOUCH ANOTHER'S CANDIDATE (25 September
+        2026, the fifth review). The cleanup used to ask for the candidate to
+        come down and name nothing, and a project whose candidate belongs to
+        one check rather than to a shared name then had to go LOOKING for
+        candidates to remove — so one build's ending removed every other
+        build's standing candidate, and their data with them. It was driven:
+        three builds checked, the first ended without publishing, and all
+        three candidates went.
+
+        The name a teardown may use is the identity the CHECK was handed, and
+        nothing else: it is the one thing recorded on the publication record
+        that the project itself made its candidate out of. Both the setting
+        and the value belong to the project; this carries them as text.
+        """
+        declaration = _how_the_project_wants_the_identity()
+        if declaration is None:
+            return None, (
+                "this project declares no identity for the thing that is "
+                "checked, so nothing was handed to the check and there is no "
+                "name a teardown could use"
+            )
+        setting = str(getattr(declaration, "setting", "") or "").strip()
+        if not setting:
+            return None, (
+                "this project's identity declaration names no setting for the "
+                "identity to be handed over in"
+            )
+        handed = str(gate.get("identity_handed_to_the_check") or "").strip()
+        if not handed:
+            return None, (
+                "no identity was handed to the check, so nothing recorded "
+                "says which candidate this build stood up"
+            )
+        return {setting: handed}, ""
+
     async def _tear_down_candidate() -> None:
-        """Best-effort: the candidate that a stopped run left standing."""
+        """Best-effort: the candidate that a stopped run left standing.
+
+        BY NAME OR NOT AT ALL. With no recorded identity the candidate is left
+        exactly where it is and the report says so: a teardown that names
+        nothing would have to find candidates by looking, and what it found
+        could belong to another build's check.
+        """
         nonlocal candidate_standing
+        identity_env, why_not = _the_identity_a_teardown_must_name()
+        if identity_env is None:
+            sentence = (
+                f"the candidate for {feature_id} was left in place because its "
+                f"identity is not recorded ({why_not}); remove it by hand with "
+                f"this project's own teardown step, handing it the identity of "
+                f"the candidate you mean. Nothing was removed automatically, "
+                f"because a teardown that names nothing has to go looking, and "
+                f"what it finds can belong to another build."
+            )
+            gate["candidate_left_standing"] = sentence
+            logger.warning("merge-executor: %s", sentence)
+            return
         try:
-            result = await _dispatch("candidate_down")
+            result = await _dispatch("candidate_down", identity_env=identity_env)
         except Exception as exc:  # noqa: BLE001 — cleanup never costs a report
             logger.warning(
                 "merge-executor: tearing the candidate for %s down raised "
@@ -1531,6 +1595,13 @@ async def execute_merge_deploy(
                 "step": "cleanup",
                 "dry_run": dry_run,
                 "candidate_torn_down": not candidate_standing,
+                # Only when there is something to say: the candidate that was
+                # left standing because nothing recorded its identity.
+                **(
+                    {"candidate_left_standing": gate["candidate_left_standing"]}
+                    if gate.get("candidate_left_standing")
+                    else {}
+                ),
                 "tree_path": str(tree_path) if tree_path else None,
                 "tree_removed": removed,
             },
@@ -4704,17 +4775,24 @@ async def execute_merge_deploy(
 
 def _the_builds_declarations(
     db_path: Any, build_id: str
-) -> tuple[str | None, tuple[str, ...]]:
-    """This build's memory name and its project's declared setting NAMES.
+) -> tuple[str | None, tuple[str, ...], str | None]:
+    """This build's memory name, its declared setting NAMES, and where they were said.
 
     Read straight off the ledger, on a connection of its own that is closed
     again, because the deploy dispatch is handed a path rather than a facade.
-    Nothing here guesses: a ledger that recorded neither answers ``(None, ())``,
-    which is the factory's own launch list and memory explicitly off — the
-    honest state, and never somebody else's project name.
+    Nothing here guesses: a ledger that recorded none of them answers
+    ``(None, (), None)``, which is the factory's own launch list, memory
+    explicitly off and no commit named — the honest state, and never somebody
+    else's project name.
+
+    The third answer is the recorded commit the work STARTS from (25 September
+    2026). The helper that launches the project's own commands cannot see the
+    ledger, so it is sent this and reads the project's declarations there —
+    rather than off the working copy, where a build could have written a line
+    of its own.
     """
     if db_path is None:
-        return None, ()
+        return None, (), None
     try:
         from forge.adapters.sqlite.connect import connect_writer
         from forge.lifecycle.persistence import SqliteLifecyclePersistence
@@ -4724,6 +4802,7 @@ def _the_builds_declarations(
             facade = SqliteLifecyclePersistence(connection=connection, db_path=db_path)
             name = facade.read_memory_project(build_id)
             names = tuple(str(entry) for entry in facade.read_launch_settings(build_id))
+            start = facade.read_start_point(build_id)
         finally:
             connection.close()
     except Exception as exc:  # noqa: BLE001 — a launch detail never stops a press
@@ -4735,8 +4814,9 @@ def _the_builds_declarations(
             type(exc).__name__,
             exc,
         )
-        return None, ()
-    return (str(name or "").strip() or None), names
+        return None, (), None
+    started_at = str(getattr(start, "start_commit", None) or "").strip() or None
+    return (str(name or "").strip() or None), names, started_at
 
 
 def build_in_daemon_deploy_dispatcher(
@@ -4811,7 +4891,9 @@ def build_in_daemon_deploy_dispatcher(
         # needs it, and since 23 September 2026 so does the deploy step: its
         # environment is built from the factory's named list plus these, never
         # copied from whatever this process holds.
-        build_memory, build_declared = _the_builds_declarations(db_path, build_id)
+        build_memory, build_declared, build_started_at = _the_builds_declarations(
+            db_path, build_id
+        )
         if spec is not None and sandbox is not None:
             # WHAT THE PROJECT DECLARED FOR THIS BUILD, off the ledger and
             # sent with the gate's request (22 September 2026). The live check
@@ -4882,6 +4964,11 @@ def build_in_daemon_deploy_dispatcher(
             deploy_ownership=deploy_ownership,
             memory_project=build_memory,
             launch_settings=build_declared,
+            # WHERE THOSE DECLARATIONS WERE SAID: the recorded commit this
+            # build starts from. The helper reads the project's own two files
+            # THERE rather than off the working copy it runs out of, so a line
+            # a build writes into that copy cannot widen its own door.
+            declared_at=build_started_at,
             # WHAT THE CHECK IS HANDED so it can pin what it checked, and the
             # question the project declared it wants "what are you running"
             # asked with. Both are names the project chose; this carries them.

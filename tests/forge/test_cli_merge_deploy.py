@@ -259,7 +259,12 @@ class TestHappyPath:
         # The executor really ran: the candidate check, one merge, the
         # promote, one report — in that order (protect-main).
         assert len(fakes["gk_calls"]) == 1
-        assert [c["leg"] for c in fakes["dp_calls"]] == ["candidate_check", "candidate_down"]
+        # A CLEANUP THAT CANNOT NAME THE CANDIDATE DOES NOT RUN (26 September
+        # 2026). This stand-in project declares no identity, so nothing was
+        # handed to the check and nothing recorded says which candidate this
+        # build stood up — the teardown is not dispatched, the candidate is
+        # left standing, and the report says so in plain words.
+        assert [c["leg"] for c in fakes["dp_calls"]] == ["candidate_check"]
         assert len(fakes["publisher"].reports) == 1
         # The join is pinned to the commit the REMOTE'S recorded branch is at,
         # which the press fetched for itself — not the local pin the card
