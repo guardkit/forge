@@ -155,9 +155,9 @@ import time
 import uuid
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
-from forge.launch_environment import build_launch_env
+from forge.launch_environment import build_launch_env, declared_setting_refusal
 
 logger = logging.getLogger(__name__)
 
@@ -174,6 +174,7 @@ __all__ = [
     "ProcessTable",
     "declared_names",
     "request_from",
+    "setting_refusal",
     "the_marker_for",
 ]
 
@@ -1470,6 +1471,18 @@ class DeployExecutor:
         on the request, because the coordinator is the thing that read them off
         the ledger at the commit the work started from. The identity the step
         must deploy is added under the name the PROJECT declared for it.
+
+        AND THOSE TWO NAMES ARE CHECKED HERE TOO (26 September 2026, the
+        fourth review of this stage). The request's own setting names used to
+        be written straight in. The door in front of this route refuses an
+        environment key the project did not declare, and this line then let
+        the same key in through the deploy block instead: a review drove a
+        setting nobody declared into a live promote, and ``PATH`` — a name
+        this factory keeps for itself — over the child's own, which ended the
+        step at 127. The request is refused at the door now; a name
+        that somehow arrives here anyway is DROPPED rather than passed, which
+        is the rule :func:`declared_setting_refusal` already states for every
+        other declared name.
         """
         env = build_launch_env(
             parent=self._parent,
@@ -1482,14 +1495,44 @@ class DeployExecutor:
         if request.env_file:
             env["ENV_FILE"] = str(request.env_file)
         if request.identity and request.identity_setting:
-            env[str(request.identity_setting)] = str(request.identity)
+            self._put_declared(
+                env,
+                str(request.identity_setting),
+                str(request.identity),
+                what="the identity this step must deploy",
+            )
         # AND THE ARTIFACT THAT WAS CHECKED, under the name the project chose
         # for it. Without it the step has to work out what to deploy at the
         # moment it deploys, and that is exactly the window another build gets
         # in through (24 September 2026).
         if request.artifact and request.artifact_setting:
-            env[str(request.artifact_setting)] = str(request.artifact)
+            self._put_declared(
+                env,
+                str(request.artifact_setting),
+                str(request.artifact),
+                what="the artifact that was checked",
+            )
         return env
+
+    @staticmethod
+    def _put_declared(
+        env: dict[str, str], name: str, value: str, *, what: str
+    ) -> None:
+        """Put one project-declared setting in, or drop it and say why.
+
+        The value is never logged: it is the project's, and a setting's value
+        is where a secret would be if one were ever put in the wrong place.
+        """
+        refusal = declared_setting_refusal(name)
+        if refusal is not None:
+            logger.warning(
+                "deploy executor: the name this request asked for %s to be "
+                "handed over in is not passed — %s",
+                what,
+                refusal,
+            )
+            return
+        env[name] = value
 
     def _start(
         self, request: DeployRequest, *, counter: int, target: str
@@ -1806,13 +1849,61 @@ def declared_names(value: Any) -> tuple[str, ...]:
     return tuple(str(name) for name in value if isinstance(name, str) and name.strip())
 
 
-def request_from(ownership: Any, **defaults: Any) -> DeployRequest | str:
+def setting_refusal(
+    kind: str, name: str, permitted: Sequence[str] | None
+) -> str | None:
+    """``None`` when a deploy block may name this setting, or why not.
+
+    Two questions, in this order. Is it the shape of a setting name at all,
+    and is it one the factory keeps for itself
+    (:func:`declared_setting_refusal`)? And then: is it a name THIS PROJECT
+    declared? ``permitted`` is the project's own declaration, read off the
+    profile by the caller — ``None`` when the caller has no profile to read,
+    and then only the first question is asked.
+    """
+    refusal = declared_setting_refusal(name)
+    if refusal is not None:
+        return (
+            f"this deploy request asks for {kind} to be handed over in a "
+            f"setting called {name!r}, and {refusal}. Nothing was deployed."
+        )
+    if permitted is None:
+        return None
+    wanted = [str(entry).strip() for entry in permitted if str(entry).strip()]
+    if name in wanted:
+        return None
+    names = ", ".join(sorted(set(wanted))) or "(none — it declares no names)"
+    return (
+        f"this deploy request asks for {kind} to be handed over in a setting "
+        f"called {name!r}, and this project's own deploy profile does not "
+        f"declare that name — the names it declares are {names}. Nothing was "
+        "deployed."
+    )
+
+
+def request_from(
+    ownership: Any,
+    *,
+    permitted_settings: Sequence[str] | None = None,
+    **defaults: Any,
+) -> DeployRequest | str:
     """Build a :class:`DeployRequest` off a request's ``deploy`` block.
 
     Returns the request, or one plain sentence naming the field that is not
     there. The three ownership fields are required on every deploy request;
     everything the command itself needs comes from the caller, which has
     already checked it the way this route checks every other field.
+
+    ``permitted_settings`` are the setting names THE NAMED PROJECT'S OWN
+    PROFILE declares for the identity it is handed and the artifact it must
+    deploy. They are checked here because this block is the one place a
+    caller says what a setting is called, and a name that is not the
+    project's is refused before anything starts (26 September 2026, the
+    fourth review of this stage: the environment door in front of this route
+    was closed and this block was still open, so a live promote ran with a
+    setting nobody declared, and with the factory's own ``PATH`` replaced).
+    ``None`` means the caller had no profile to read and only the shape and
+    the reserved names are checked.
     """
     if not isinstance(ownership, Mapping):
         return (
@@ -1834,6 +1925,15 @@ def request_from(ownership: Any, **defaults: Any) -> DeployRequest | str:
     setting = ownership.get("identity_setting")
     artifact = ownership.get("artifact")
     artifact_setting = ownership.get("artifact_setting")
+    for kind, raw in (
+        ("the identity this step must deploy", setting),
+        ("the artifact that was checked", artifact_setting),
+    ):
+        if not raw:
+            continue
+        refused = setting_refusal(kind, str(raw).strip(), permitted_settings)
+        if refused is not None:
+            return refused
     return DeployRequest(
         target=target,
         target_counter=counter,

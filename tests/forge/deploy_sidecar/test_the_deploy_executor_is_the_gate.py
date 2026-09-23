@@ -893,6 +893,145 @@ class TestWhatARequestHasToCarry:
         assert not hasattr(built, "something_is_running")
 
 
+class TestTheSettingNamesADeployBlockMayAskFor:
+    """26 September 2026, the fourth review of this stage.
+
+    The helper's environment door was connected to the project's own
+    declaration and this block was not, so a name refused as an env key was
+    accepted here — and went into the environment of the one command that
+    deploys the live thing. A review drove a setting nobody declared into a
+    live promote, and the factory's own ``PATH`` over the child's, which
+    ended the step at 127.
+    """
+
+    DECLARED = ("DEPLOY_IDENTITY", "DEPLOY_ARTIFACT")
+
+    def _block(self, TARGET, **extra) -> dict:
+        return {
+            "target": TARGET,
+            "build": "build-a",
+            "target_counter": 1,
+            "identity": "j-abcdef@1234",
+            "identity_setting": "DEPLOY_IDENTITY",
+            **extra,
+        }
+
+    def test_the_projects_own_names_are_accepted(self, workshop, TARGET) -> None:
+        built = request_from(
+            self._block(
+                TARGET,
+                artifact="the-thing-the-check-checked",
+                artifact_setting="DEPLOY_ARTIFACT",
+            ),
+            permitted_settings=self.DECLARED,
+            cwd=str(workshop),
+            script="deploy.sh",
+        )
+        assert isinstance(built, DeployRequest)
+
+    def test_a_name_the_project_did_not_declare_is_refused(
+        self, workshop, TARGET
+    ) -> None:
+        refused = request_from(
+            self._block(TARGET, identity_setting="SOMETHING_NOBODY_DECLARED"),
+            permitted_settings=self.DECLARED,
+            cwd=str(workshop),
+            script="deploy.sh",
+        )
+        assert isinstance(refused, str)
+        assert "SOMETHING_NOBODY_DECLARED" in refused
+        assert "does not declare that name" in refused
+        assert "DEPLOY_IDENTITY" in refused
+        assert "Nothing was deployed." in refused
+
+    def test_the_artifact_setting_is_checked_the_same_way(
+        self, workshop, TARGET
+    ) -> None:
+        refused = request_from(
+            self._block(
+                TARGET,
+                artifact="the-thing-the-check-checked",
+                artifact_setting="SOMETHING_NOBODY_DECLARED",
+            ),
+            permitted_settings=self.DECLARED,
+            cwd=str(workshop),
+            script="deploy.sh",
+        )
+        assert isinstance(refused, str)
+        assert "the artifact that was checked" in refused
+
+    def test_one_of_the_factorys_own_names_is_refused_with_no_profile_at_all(
+        self, workshop, TARGET
+    ) -> None:
+        """No declaration to compare against still refuses a reserved name."""
+        refused = request_from(
+            self._block(TARGET, identity_setting="PATH"),
+            cwd=str(workshop),
+            script="deploy.sh",
+        )
+        assert isinstance(refused, str)
+        assert "PATH" in refused
+        assert "is one of the settings this factory sets itself" in refused
+
+    def test_a_name_that_is_not_the_shape_of_one_is_refused(
+        self, workshop, TARGET
+    ) -> None:
+        refused = request_from(
+            self._block(TARGET, identity_setting="not a setting name"),
+            cwd=str(workshop),
+            script="deploy.sh",
+        )
+        assert isinstance(refused, str)
+        assert "not the shape of a setting name" in refused
+
+
+class TestTheEnvironmentTheChildIsGiven:
+    """The second place the same question is asked, and the last one.
+
+    A name that somehow gets past the door is DROPPED here rather than
+    passed, which is the rule the rest of the estate already states for every
+    declared name.
+    """
+
+    def test_a_reserved_name_never_replaces_the_factorys_own(
+        self, notes, workshop, TARGET
+    ) -> None:
+        executor = _executor(notes)
+        env = executor._child_environment(
+            _ask(
+                TARGET,
+                "deploy.sh",
+                1,
+                "build-a",
+                workshop,
+                identity="j-abcdef@1234",
+                identity_setting="PATH",
+            )
+        )
+        assert env.get("PATH") != "j-abcdef@1234"
+        assert env.get("PATH"), "the child still gets the factory's own PATH"
+
+    def test_a_name_of_the_right_shape_is_passed(
+        self, notes, workshop, TARGET
+    ) -> None:
+        executor = _executor(notes)
+        env = executor._child_environment(
+            _ask(
+                TARGET,
+                "deploy.sh",
+                1,
+                "build-a",
+                workshop,
+                identity="j-abcdef@1234",
+                identity_setting="DEPLOY_IDENTITY",
+                artifact="the-thing-the-check-checked",
+                artifact_setting="DEPLOY_ARTIFACT",
+            )
+        )
+        assert env["DEPLOY_IDENTITY"] == "j-abcdef@1234"
+        assert env["DEPLOY_ARTIFACT"] == "the-thing-the-check-checked"
+
+
 # ---------------------------------------------------------------------------
 # (f) A NOTE THAT IS NOT THERE IS NOT AN EMPTY SLOT
 #
@@ -1245,9 +1384,31 @@ class TestTheRunningServiceCanAskTheCoordinator:
 # ---------------------------------------------------------------------------
 
 
+def _is_somebody_elses_group(group: int) -> bool:
+    """Is this a group a test may signal at all?
+
+    TWO GROUPS ARE NEVER SIGNALLED, and the second is the one that matters.
+    Group 0 means "my own group" to ``killpg``, and a note that has not yet
+    recorded a group carries 0 — so signalling it would take down the test
+    run. ``os.getpgrp()`` is the same group said the other way round: a
+    fixture that read the runner's own group off a note, or a child that
+    never got a group of its own, would name it explicitly and the guard
+    against 0 alone would let it through. The reviewer of this stage
+    disclosed both, and both are refused here, in the one helper every
+    signalling fixture in this file goes through.
+    """
+    if not group:
+        return False
+    try:
+        mine = os.getpgrp()
+    except OSError:  # pragma: no cover — no getpgrp is a platform we skip on
+        return False
+    return group != mine
+
+
 def _kill(group: int) -> None:
     """Stop a process group this test started, whatever the notes say."""
-    if not group:
+    if not _is_somebody_elses_group(group):
         return
     for sig in (signal.SIGTERM, signal.SIGKILL):
         try:
@@ -1426,7 +1587,7 @@ class _Background:
             except (OSError, ValueError):
                 continue
             group = int(written.get("group") or 0)
-            if group:
+            if _is_somebody_elses_group(group):
                 for sig in (signal.SIGTERM, signal.SIGKILL):
                     try:
                         os.killpg(group, sig)
