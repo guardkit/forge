@@ -72,13 +72,21 @@ from typing import Final
 # joined commit it produced, what the checks found, and every step written
 # down twice (BEFORE it is done and again after), under a lease and a turn
 # number that make a worker which was only paused safe to replace. A build
-# with no row reads as "not recorded".
+# with no row reads as "not recorded";
+# bumped to 16 (23 September 2026) to add the new ``deployment_targets``
+# table — one row per deployment target holding that target's OWN deployment
+# counter (up by one on every grant or takeover, by any build), who holds the
+# lock and until when, and what is running on it now, by commit and by the
+# identity the running thing reported. The build's turn number and the
+# target's counter count different things and are deliberately separate: a
+# build picked up twice is on turn 3 while a fresh build starts at turn 1, so
+# the two cannot be compared across builds.
 # Future
 # schema bumps should follow the same pattern: append a sibling
 # ``schema_v{N}.sql`` and add a ``(N, "schema_v{N}.sql")`` entry to
 # ``_MIGRATIONS`` in ascending order. The runner applies every entry whose
 # version is greater than the current ``schema_version`` ledger row.
-_SCHEMA_VERSION: Final[int] = 15
+_SCHEMA_VERSION: Final[int] = 16
 _MIGRATIONS: Final[tuple[tuple[int, str], ...]] = (
     (1, "schema.sql"),
     (2, "schema_v2.sql"),
@@ -145,6 +153,14 @@ _MIGRATIONS: Final[tuple[tuple[int, str], ...]] = (
     # cannot change anything. Purely additive: one new table, no existing
     # column touched.
     (15, "schema_v15.sql"),
+    # v16 (the deployment lock and the target's counter) — the new
+    # ``deployment_targets`` table. The reservation this factory had protects
+    # one process only, so it could not say who owns a deployment target
+    # across two coordinators or across a restart; and a build's own turn
+    # number cannot be compared across builds. This table gives each target a
+    # counter of its own, held in the ledger, taken in a transaction, and
+    # raised on every grant or takeover by any build. Purely additive.
+    (16, "schema_v16.sql"),
 )
 
 
