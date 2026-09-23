@@ -326,7 +326,13 @@ async def dispatch_deploy_stage(
         )
     if leg == "candidate_down":
         return await runner.candidate_down(
-            profile, correlation_id=correlation_id, deploy_run_id=deploy_run_id
+            profile,
+            correlation_id=correlation_id,
+            deploy_run_id=deploy_run_id,
+            # The same setting the CHECK was handed, so a project whose
+            # candidate belongs to one check rather than to a shared name can
+            # be told which one to take down. Absent ⇒ exactly what it was.
+            identity_env=identity_env,
         )
     raise ValueError(
         f"unknown deploy leg {leg!r} — expected 'deploy', 'candidate_check', "

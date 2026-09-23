@@ -171,6 +171,7 @@ from forge.pipeline.deployment_identity import (
     identity_reported_by,
     the_identities_differ,
     what_the_target_says,
+    why_the_target_could_not_say,
 )
 from forge.pipeline.deployment_lock import (
     DeploymentLockStore,
@@ -2113,9 +2114,18 @@ async def execute_merge_deploy(
         under the lock, before deciding anything.
 
         The answer is the project's own: a token it uses to name what is
-        running, an empty answer meaning nothing is running there, or no answer
-        at all. Nothing here knows what a token means; placing one is the
-        caller's job, and a token that places nowhere stops the deploy.
+        running, the word that means nothing is running there, or no
+        established answer at all. Nothing here knows what a token means;
+        placing one is the caller's job, and a token that places nowhere stops
+        the deploy.
+
+        Corrected 25 September 2026, after the third review. A step whose own
+        query FAILED used to arrive here as "nothing is running": it suppressed
+        the error, exited zero, and printed an empty value. Four things are
+        read as "not established" now, and every one of them deploys nothing —
+        the step exiting non-zero, no line at all, an empty value, and the
+        step's own ``<marker>_UNKNOWN=`` line, whose reason is carried into the
+        sentence a person reads.
         """
         why = ""
         said = ""
@@ -2147,21 +2157,38 @@ async def execute_merge_deploy(
             )
         detail = getattr(asked, "detail", None) or {}
         said = str(detail.get("deploy_output") or "")
+        # THE STEP'S OWN REASON, when it gave one. A step that exits non-zero
+        # has still usually said why on its last line, and that sentence is far
+        # more use to whoever reads the result than "it did not finish".
+        the_steps_reason = why_the_target_could_not_say(
+            said, marker=declaration.running_as
+        )
         if getattr(asked, "outcome", None) != "complete":
             why = (
                 "the project's own read-only step did not finish "
                 f"({getattr(asked, 'outcome', None) or 'it answered nothing'})"
             )
+            if the_steps_reason:
+                why = f"{why}: {the_steps_reason}"
             return _TargetSaid(
                 word="no-answer", identity=None, why=why, said=said
             )
         word, value = what_the_target_says(said, marker=declaration.running_as)
         if word == "no-answer":
-            why = (
-                "the project's own read-only step printed no "
-                f"{declaration.running_as} line, so it said nothing this press "
-                "can read"
-            )
+            if value:
+                # The step said, in its own words, why it could not tell.
+                why = (
+                    "the project's own read-only step could not establish what "
+                    f"is running: {value}"
+                )
+            else:
+                why = (
+                    "the project's own read-only step printed no "
+                    f"{declaration.running_as} line this press can read, so "
+                    "what is there was not established. An empty answer is not "
+                    "read as 'nothing is running'"
+                )
+            value = None
         return _TargetSaid(word=word, identity=value, why=why, said=said)
 
     def _which_commit_is(

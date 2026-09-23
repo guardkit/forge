@@ -205,6 +205,7 @@ from forge.deploy_sidecar.deploy_executor import (
 from forge.executor.shell_steps import _run_script_step
 from forge.launch_environment import build_launch_env, declared_setting_refusal
 from forge.memory.redaction import scrub_process_output
+from forge.pipeline.deployment_identity import declared_identity
 from forge.planning.declared_memory import NAME_PATTERN
 from forge.planning.handoff import (
     PRE_COMMIT_CHECK_NAMES,
@@ -702,10 +703,40 @@ def allowed_scripts(
     return scripts
 
 
-def allowed_env_keys(profile: DeployProfile) -> set[str]:
+def allowed_env_keys(
+    profile: DeployProfile, *, declared: Sequence[str] | None = None
+) -> set[str]:
     """The allowlisted env-key names for this profile (LAW 3).
 
-    Base allowlist UNION ``live_gate.env`` keys UNION ``candidate.env`` keys.
+    The factory's own base allowlist, UNION the names THIS PROJECT declared in
+    its own ``deploy/profile.yaml``:
+
+    * ``live_gate.env`` keys and ``candidate.env`` keys;
+    * the three settings of its ``identity`` block — the setting the identity
+      of what was checked is handed over in, the setting that artifact is
+      handed back in, and the setting its read-only "what are you running"
+      step is asked with. The block's other three entries are MARKERS: they
+      name lines the step PRINTS, not settings it is given, and a marker is
+      never permitted as an environment key;
+    * the ``declared`` names on the request — the settings the project said its
+      builds need, already checked at the door.
+
+    Every project-declared name is put through
+    :func:`declared_setting_refusal` first: letters, digits and underscores,
+    never starting with a digit, and never one of the names or prefixes this
+    factory keeps for itself. A project cannot widen this door onto the
+    factory's own settings by writing a name in its own file.
+
+    WHY THE IDENTITY SETTINGS ARE HERE (25 September 2026, the third review of
+    the executor stage). They were not, and nothing noticed, because every
+    drive of the deploy had gone round this route rather than through it.
+    Through the real route with api_test's committed profile, the candidate
+    check was refused 400 for ``DEPLOY_IDENTITY`` and the read-only question
+    was refused 400 for ``RUNNING_IDENTITY``: **neither command started**. A
+    project declaring the names and central code refusing them is one half of
+    the factory disagreeing with the other, and the cure is that the permitted
+    list is READ FROM THE SAME DECLARATION the deploy stage reads.
+
     The base list carries the settings a profile's ``sandbox`` block can put
     in a deploy step's environment except four — ``SANDBOX_ENV_FILE``,
     ``SANDBOX_FORGE_PATH``, ``SANDBOX_GUARDKIT_PATH`` and
@@ -729,6 +760,30 @@ def allowed_env_keys(profile: DeployProfile) -> set[str]:
             cand_env = candidate.get("env")
             if isinstance(cand_env, dict):
                 keys.update(str(k) for k in cand_env)
+    # THE NAMES THE PROJECT DECLARED, each one checked before it is permitted.
+    # A name the factory keeps for itself is dropped here with a warning; the
+    # project is not refused over it, because it is refused the moment it tries
+    # to USE it, in one plain sentence, by the loop that reads this set.
+    declaration = declared_identity(profile)
+    project_names = [
+        declaration.setting,
+        declaration.artifact_setting,
+        declaration.asked_with,
+        *(str(name) for name in (declared or ())),
+    ]
+    for raw in project_names:
+        name = str(raw or "").strip()
+        if not name:
+            continue
+        refusal = declared_setting_refusal(name)
+        if refusal is not None:
+            logger.warning(
+                "deploy-sidecar: a name this project declared is not permitted "
+                "as a setting — %s",
+                refusal,
+            )
+            continue
+        keys.add(name)
     return keys
 
 
@@ -785,18 +840,22 @@ def _tail(output: str) -> str:
 
 
 def _allowlisted_env(
-    raw_env: Any, profile: DeployProfile
+    raw_env: Any, profile: DeployProfile, *, declared: Sequence[str] | None = None
 ) -> tuple[dict[str, str], str | None]:
     """LAW 3 — the caller's env, or one plain sentence saying why not.
 
     One implementation for every shape ``/run`` carries: the vetted script,
     the live-gate driver. Absent reads as no overlay at all.
+
+    ``declared`` are the setting names the project said its builds need, off
+    the request and already checked at the door; they are permitted alongside
+    the ones its deploy profile declares.
     """
     if raw_env is None:
         raw_env = {}
     if not isinstance(raw_env, dict):
         return {}, "'env' must be a JSON object of allowlisted string values"
-    permitted_keys = allowed_env_keys(profile)
+    permitted_keys = allowed_env_keys(profile, declared=declared)
     env: dict[str, str] = {}
     for key, value in raw_env.items():
         if key not in permitted_keys:
@@ -1317,7 +1376,9 @@ def process_run_request(
     if payload.get("driver") is not None:
         if not in_sandbox:
             return 400, {"error": _not_inside_a_sandbox("live-gate driver")}
-        env_only, error = _allowlisted_env(payload.get("env"), profile)
+        env_only, error = _allowlisted_env(
+            payload.get("env"), profile, declared=launch_names
+        )
         if error:
             return 400, {"error": error}
         return process_live_gate_run(
@@ -1352,7 +1413,7 @@ def process_run_request(
         }
 
     # LAW 3 — env keys allowlisted, values must be strings.
-    extra_env, env_error = _allowlisted_env(raw_env, profile)
+    extra_env, env_error = _allowlisted_env(raw_env, profile, declared=launch_names)
     if env_error is not None:
         return 400, {"error": env_error}
 
