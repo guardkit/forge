@@ -1642,6 +1642,12 @@ class DeployExecutor:
 
     @staticmethod
     def _kill_now(group: int) -> None:
+        # Never signal group 0 (this process's own group) or our own group: a
+        # spawn seam that answers with no pid would otherwise turn this into
+        # the deploy sidecar killing itself (23 September 2026, the hazard a
+        # reviewer met with a stubbed spawn). _stop_confirmed guards the same.
+        if not group or group == os.getpgrp():
+            return
         for sig in (signal.SIGTERM, signal.SIGKILL):
             try:
                 os.killpg(group, sig)
