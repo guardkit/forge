@@ -44,6 +44,7 @@ from forge.pipeline.merge_executor import (
     MergeExecutorDeps,
     execute_merge_deploy,
 )
+from tests.forge._a_stand_in_coordinator import a_coordinator_that_recorded
 
 REPO_KEY = "appmilla/api_test"
 BUILD_ID = "build-FEAT-MX9-20260906"
@@ -305,6 +306,27 @@ class _Deploy:
         )
 
 
+#: The commit this file's ledger row records the build as starting from. The
+#: merge word stamps every command it sends the helper with its build and this
+#: commit (23 September 2026), so there is now a question to ask and the
+#: stand-in coordinator below is what answers it.
+THE_RECORDED_START = "0" * 40
+
+
+@pytest.fixture(autouse=True)
+def _the_coordinators_answer(monkeypatch: pytest.MonkeyPatch):
+    """Somebody to ask what this build starts from, on loopback.
+
+    The helper checks the pair on a stamped request against the coordinator's
+    own record before it runs anything, and refuses in plain words when there
+    is nobody to ask. Every press in this file is a real press through a real
+    helper, so every press needs an answer. It is a child of this process; no
+    real coordinator, ledger or service is anywhere near it.
+    """
+    with a_coordinator_that_recorded({BUILD_ID: THE_RECORDED_START}, monkeypatch):
+        yield
+
+
 def _ensure_build(pool: SqliteLifecyclePersistence) -> None:
     pool.connection.execute(
         "INSERT OR IGNORE INTO builds (build_id, feature_id, repo, branch, "
@@ -317,7 +339,7 @@ def _ensure_build(pool: SqliteLifecyclePersistence) -> None:
             REPO_KEY,
             f"autobuild/{FEATURE_ID}",
             CORRELATION,
-            "0" * 40,
+            THE_RECORDED_START,
         ),
     )
     pool.connection.commit()

@@ -483,6 +483,8 @@ async def run(
     extra_context_paths: list[str] | None = None,
     memory_project: str | None = None,
     launch_settings: Sequence[str] | None = None,
+    build: str | None = None,  # noqa: ARG001 — see the note in the docstring
+    start_commit: str | None = None,  # noqa: ARG001 — likewise
 ) -> GuardKitResult:
     """Single subprocess entry point for every GuardKit subcommand.
 
@@ -531,6 +533,18 @@ async def run(
         beyond the factory's own list, recorded the same way at the same
         commit. Names only; each value is taken from this process's own
         settings, and only if it has one.
+    build, start_commit:
+        ACCEPTED AND NOT USED HERE (23 September 2026). A caller cannot
+        know which of the two runners it was handed — this one, which
+        starts a process in the copy of the project it is pointed at, or
+        the one that sends the same call to a helper over loopback. The
+        helper reads the project's own declaration files at a commit, so
+        it has to be told which build the call is for and what commit the
+        coordinator recorded that build as starting from, and it refuses a
+        call that asks for anything declared and says neither. Nothing is
+        read at a commit on this path: the command runs in the directory
+        it is given, as it always has, so there is nothing here to bind
+        and these two are ignored rather than refused.
 
     Returns
     -------

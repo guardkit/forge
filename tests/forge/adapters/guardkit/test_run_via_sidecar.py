@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import stat
+import subprocess
 import threading
 from pathlib import Path
 
@@ -24,6 +25,7 @@ from forge.adapters.guardkit.run_via_sidecar import (
 )
 from forge.config.models import ForgeConfig
 from forge.deploy_sidecar.service import GUARDKIT_PATH_ENV, build_server
+from tests.forge._a_stand_in_coordinator import a_coordinator_that_recorded
 
 REPO_KEY = "appmilla/api_test"
 FEATURE = "FEAT-3ABD"
@@ -45,6 +47,23 @@ def _executor_args(baseline_path: str | None = None) -> list[str]:
     return args
 
 
+def _git(where: Path, *args: str) -> str:
+    done = subprocess.run(
+        [
+            "git",
+            "-c", "user.email=tests@example.invalid",
+            "-c", "user.name=tests",
+            "-c", "commit.gpgsign=false",
+            *args,
+        ],
+        cwd=str(where),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return done.stdout.strip()
+
+
 @pytest.fixture
 def repo(tmp_path: Path) -> Path:
     root = tmp_path / "api_test"
@@ -57,6 +76,12 @@ def repo(tmp_path: Path) -> Path:
     (root / ".guardkit" / "config.yaml").write_text(
         "launch:\n  settings: [FAKE_GUARDKIT_EXIT]\n", encoding="utf-8"
     )
+    # AND IT IS COMMITTED, because a declaration is a committed line: the
+    # helper reads the file out of this history at the commit the request's
+    # stamp names, never off the working copy it runs the command in.
+    _git(root, "init", "-q", "-b", "main")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "the project as it is")
     return root
 
 
@@ -220,19 +245,30 @@ async def test_a_red_merge_is_a_failed_result_with_the_report_intact(
     still be able to read the report out of stdout."""
     monkeypatch.setenv("FAKE_GUARDKIT_EXIT", "4")
     run = _run(sidecar, repo)
-    result = await run(
-        subcommand="autobuild",
-        args=_executor_args(),
-        repo_path=repo,
-        read_allowlist=[repo],
-        timeout_seconds=900,
-        with_nats_streaming=False,
-        # The merge command is launched with the factory's own named list and
-        # nothing else, so the setting this test steers its stand-in with is
-        # declared by name — the door a project uses to say what its own
-        # builds need.
-        launch_settings=["FAKE_GUARDKIT_EXIT"],
-    )
+    # A REQUEST THAT ASKS FOR THIS PROJECT'S OWN DECLARATION TO BE READ SAYS
+    # WHOSE WORK IT IS (23 September 2026). The door carries the build and the
+    # commit the coordinator recorded it as starting from, and the helper
+    # checks the pair before it reads a line — so this drive needs a
+    # coordinator to answer, on loopback, and the project's declaration has to
+    # be committed at the commit named.
+    build = "build-FEAT-MX1-20260923"
+    at = _git(repo, "rev-parse", "HEAD")
+    with a_coordinator_that_recorded({build: at}, monkeypatch):
+        result = await run(
+            subcommand="autobuild",
+            args=_executor_args(),
+            repo_path=repo,
+            read_allowlist=[repo],
+            timeout_seconds=900,
+            with_nats_streaming=False,
+            # The merge command is launched with the factory's own named list
+            # and nothing else, so the setting this test steers its stand-in
+            # with is declared by name — the door a project uses to say what
+            # its own builds need.
+            launch_settings=["FAKE_GUARDKIT_EXIT"],
+            build=build,
+            start_commit=at,
+        )
     assert result.status == "failed"
     assert result.exit_code == 4
     assert json.loads(result.stdout_tail)["outcome"] == "merged"

@@ -5,9 +5,9 @@
 #   docker-capable HOST. The forge container deliberately has NO docker access
 #   (C4 catch #24 — docker socket in a container ≈ host root); this sidecar is
 #   how the in-container daemon dispatches a deploy WITHOUT a docker socket. It
-#   adds ZERO new privilege: Rich's user, on Rich's box, running only scripts
-#   the target repo's own deploy/profile.yaml already names (deny by default).
-#   Design of record:
+#   adds ZERO new privilege: the owner's own user, on the owner's own machine,
+#   running only scripts the target repo's own deploy/profile.yaml already
+#   names (deny by default). Design of record:
 #     docs/factory-deploy-execution-surface-design-2026-07-16.md §1
 #
 # CONTRACT (loopback-only, :8125):
@@ -45,7 +45,7 @@
 
 [Unit]
 Description=forge deploy sidecar (loopback deploy/health-check script runner, C4 #24)
-Documentation=file:///home/richardwoollcott/Projects/appmilla_github/ai-transition/docs/factory-deploy-execution-surface-design-2026-07-16.md
+Documentation=docs/factory-deploy-execution-surface-design-2026-07-16.md
 After=network-online.target
 Wants=network-online.target
 
@@ -67,12 +67,17 @@ Environment=FORGE_CONFIG_PATH=%h/forge-state/forge.yaml
 # — the safe side, and the reason this line has to be in place before that
 # binding is rolled out. Served by scripts/systemd/forge-record-answer.service.
 Environment=FORGE_TARGET_OWNER_URL=http://127.0.0.1:8126/recorded
-# Rich enough PATH for the spawned vetted scripts (git, docker compose, etc.).
+# A wide enough PATH for the spawned vetted scripts (version control, the
+# container tool, and whatever else a project's own declared script calls).
 Environment=PATH=%h/.agentecflow/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
-WorkingDirectory=%h/Projects/appmilla_github/forge
+# THE TWO PATHS BELOW ARE PLACEHOLDERS. This file is committed to a public
+# repository, so it names no real machine's layout. Whoever installs it edits
+# WorkingDirectory and ExecStart to where this checkout and its venv really
+# are on that machine, the way the sibling record-answer unit says.
+WorkingDirectory=%h/forge-src/forge
 # Loopback binding is enforced in code (HOST=127.0.0.1); -m runs the package
 # entry point (forge.deploy_sidecar.__main__).
-ExecStart=%h/Projects/appmilla_github/forge/.venv/bin/python -m forge.deploy_sidecar
+ExecStart=%h/forge-src/forge/.venv/bin/python -m forge.deploy_sidecar
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=15

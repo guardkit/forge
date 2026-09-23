@@ -43,6 +43,7 @@ from forge.deploy_sidecar.service import build_server
 from forge.lifecycle import migrations
 from forge.lifecycle.persistence import SqliteLifecyclePersistence
 from forge.pipeline.conductor_driver import _maybe_await
+from tests.forge._a_stand_in_coordinator import a_coordinator_that_recorded
 
 REPO_KEY = "guardkit/api_test"
 PLAIN_KEY = "guardkit/no_sandbox"
@@ -171,6 +172,32 @@ def _row(pool: SqliteLifecyclePersistence, repo: str, build_id: str = BUILD_ID) 
         (build_id, repo, f"corr-{build_id}", TASK_ID),
     )
     pool.connection.commit()
+
+
+#: What the coordinator's record says these builds start from. Since 23
+#: September 2026 a leg's runner is bound to its build's row where the runner
+#: is chosen, and the request carries that build — so the helper checks it
+#: against the coordinator's own record before it runs anything, and refuses
+#: when there is nobody to ask. Every leg driven through the REAL helper in
+#: this file therefore needs an answer.
+THE_RECORDED_START = "0" * 40
+
+
+@pytest.fixture(autouse=True)
+def _the_coordinators_answer(monkeypatch: pytest.MonkeyPatch):
+    """Somebody to ask what these builds start from, on loopback.
+
+    A child of this process on a port the kernel picks; no real coordinator,
+    ledger or service is anywhere near it.
+    """
+    with a_coordinator_that_recorded(
+        {
+            BUILD_ID: THE_RECORDED_START,
+            "build-FEAT-SBX1-20260907180000": THE_RECORDED_START,
+        },
+        monkeypatch,
+    ):
+        yield
 
 
 # ---------------------------------------------------------------------------
@@ -542,7 +569,9 @@ class TestWhereTheLegsRun:
     ) -> None:
         _row(pool, REPO_KEY)
         made: list[dict[str, Any]] = []
-        sentinel = object()
+
+        async def sentinel(**_kwargs: Any) -> Any:  # the door, stood in for
+            return None
 
         def _build(**kwargs: Any) -> Any:
             made.append(kwargs)
@@ -555,7 +584,12 @@ class TestWhereTheLegsRun:
             build_sidecar_run=_build,
         )
 
-        assert choose(BUILD_ID) is sentinel
+        # The door is the injected one; what the chooser hands back is that
+        # door with this build's stamp already bound to it (23 September
+        # 2026), so the identity is read through the binding.
+        chosen = choose(BUILD_ID)
+        assert chosen.func is sentinel
+        assert chosen.keywords["build"] == BUILD_ID
         assert made[0]["base_url"] == sidecar.url
         assert made[0]["repo_paths"] == dict(
             sidecar.config.planning.target_repo_paths
@@ -585,9 +619,12 @@ class TestWhereTheLegsRun:
         _row(pool, REPO_KEY, build_id="build-FEAT-SBX1-20260907180000")
         made: list[Any] = []
 
+        async def _a_door(**_kwargs: Any) -> Any:
+            return None
+
         def _build(**kwargs: Any) -> Any:
             made.append(kwargs)
-            return object()
+            return _a_door
 
         choose = make_conductor_guardkit_run_chooser(
             pool=pool,
@@ -597,7 +634,10 @@ class TestWhereTheLegsRun:
         )
         first = choose(BUILD_ID)
         second = choose("build-FEAT-SBX1-20260907180000")
-        assert first is second and len(made) == 1
+        # ONE DOOR per repository still — what differs between two builds is
+        # only the stamp bound onto it, which is the build's own.
+        assert first.func is second.func and len(made) == 1
+        assert first.keywords["build"] != second.keywords["build"]
 
     def test_a_row_that_cannot_be_read_falls_back_to_the_container(
         self, sidecar: Any
@@ -624,7 +664,7 @@ class TestWhereTheLegsRun:
         chosen = choose(BUILD_ID)
         assert chosen is not in_container
         assert callable(chosen)
-        assert chosen.__name__ == "run_leg_via_sidecar"
+        assert chosen.func.__name__ == "run_leg_via_sidecar"
 
 
 class TestTheSupervisorFactoryUsesTheChooser:

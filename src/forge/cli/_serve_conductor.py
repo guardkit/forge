@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import functools
 import logging
 import os
 import subprocess
@@ -1027,6 +1028,35 @@ def _the_builds_declared_settings(pool: Any, build_id: str) -> tuple[str, ...]:
             exc,
         )
         return ()
+
+
+def _the_builds_start_commit(pool: Any, build_id: str) -> str | None:
+    """The commit THIS COORDINATOR'S LEDGER records this build as starting from.
+
+    The same fact the deploy stage stamps its requests with, read off the same
+    row, so a gate reading and a deploy leg for one build are bound to one
+    commit. ``None`` means the record names none — and then the request
+    carries the build alone and the helper asks the coordinator for the
+    commit, rather than reading at whatever HEAD the copy it has happens to
+    be at.
+    """
+    reader = getattr(pool, "read_start_point", None)
+    if reader is None:
+        return None
+    try:
+        point = reader(build_id)
+    except Exception as exc:  # noqa: BLE001 — a gate reading never fails on this
+        logger.warning(
+            "conductor gates: build_id=%s — the commit this build starts from "
+            "could not be read off the ledger (%s: %s)",
+            build_id,
+            type(exc).__name__,
+            exc,
+        )
+        return None
+    if not getattr(point, "recorded", False):
+        return None
+    return str(getattr(point, "start_commit", None) or "").strip() or None
 
 
 def run_declared_command_in_sandbox(
@@ -2436,6 +2466,17 @@ def make_gates_green_reader(
             # own list and memory off — the honest state, not a hidden one.
             declared_memory = _the_builds_memory_name(pool, build_id)
             declared_names = _the_builds_declared_settings(pool, build_id)
+            # AND WHERE THOSE DECLARATIONS WERE SAID (23 September 2026, the
+            # carry-forward closed). This reader used to send ``by_hand:
+            # true`` — the label a person running a command by hand wears —
+            # although the build id was right here, so the helper read the
+            # project's declarations at the committed HEAD of the copy it has
+            # instead of at the commit the record names. Both facts are read
+            # off the same row now and stamped on the request; the helper
+            # confirms the pair with the coordinator's read-only answer, which
+            # has to be reachable from inside the sandbox (the setting that
+            # names it is FORGE_TARGET_OWNER_URL).
+            declared_at = _the_builds_start_commit(pool, build_id)
 
             def run_command(
                 *,
@@ -2446,6 +2487,8 @@ def make_gates_green_reader(
                 _repo: str = repo_key,
                 _memory: str | None = declared_memory,
                 _names: tuple[str, ...] = declared_names,
+                _build: str = build_id,
+                _declared_at: str | None = declared_at,
             ) -> Any:
                 return _sandbox_run(
                     command=command,
@@ -2455,19 +2498,8 @@ def make_gates_green_reader(
                     repo=_repo,
                     memory_project=_memory,
                     launch_settings=_names,
-                    # AND THIS READER CITES NO BUILD RECORD, AND SAYS SO (23
-                    # September 2026, the eighth review). The helper refuses a
-                    # request that asks for a project's declarations to be
-                    # read and names neither a build nor a commit, because
-                    # that is what a dropped coordinator stamp looks like.
-                    # This reader has never sent the build id, so it claims
-                    # what it is really asking for: read them at the committed
-                    # HEAD of the copy you have. CARRY IT FORWARD: the build
-                    # id is right here, and stamping this request with it
-                    # would bind these names to the recorded commit — which
-                    # also needs the coordinator's read-only answer to be
-                    # reachable from inside the sandbox.
-                    by_hand=True,
+                    build=_build,
+                    declared_at=_declared_at,
                 )
 
             # Step 5 goes in there too (L3b's coach, 2026-09-08): the feature's
@@ -3050,7 +3082,21 @@ def make_conductor_guardkit_run_chooser(
                 getattr(entry, "name", "?"),
                 entry.sidecar_url,
             )
-        return runners[repo]
+        # THE STAMP THIS BUILD'S LEGS CARRY (23 September 2026). The helper in
+        # the sandbox reads the project's own declaration files at a commit
+        # before it launches a leg. It used to be told the leg was somebody
+        # running a command BY HAND, which it never is, and so it read them at
+        # the committed HEAD of the copy it has — a build could widen its own
+        # door by committing a line and then asking for a leg. The runner is
+        # already chosen per build off this row, so the pair is bound here,
+        # once, from the record: the build, and the commit the record says it
+        # starts from. Nothing further down composes either. A row with no
+        # recorded commit sends the build alone, and the helper asks the
+        # coordinator for the commit rather than falling back to a HEAD.
+        start_commit = str(getattr(row, "start_commit", None) or "").strip() or None
+        return functools.partial(
+            runners[repo], build=build_id, start_commit=start_commit
+        )
 
     return choose
 

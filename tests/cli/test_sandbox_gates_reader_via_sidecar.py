@@ -40,6 +40,7 @@ from forge.deploy_sidecar.service import build_server
 from forge.lifecycle import migrations
 from forge.lifecycle.persistence import SqliteLifecyclePersistence
 from forge.pipeline.merge_ready_checkpoint import GateStatus
+from tests.forge._a_stand_in_coordinator import a_coordinator_that_recorded
 
 REPO_WITH = "guardkit/api_test"
 REPO_WITHOUT = "guardkit/plain"
@@ -232,6 +233,25 @@ def _row(pool: SqliteLifecyclePersistence, repo: str, worktree: Path) -> None:
         (BUILD_ID, repo, f"fix/{BUILD_ID}", str(worktree)),
     )
     pool.connection.commit()
+
+
+#: What the coordinator's record says this build starts from. Since 23
+#: September 2026 the gates reader stamps the project's own test command with
+#: the build it is reading for and that commit, instead of claiming to be
+#: somebody running it by hand — so the helper has a question to ask, and the
+#: stand-in below is what answers it.
+THE_RECORDED_START = "0" * 40
+
+
+@pytest.fixture(autouse=True)
+def _the_coordinators_answer(monkeypatch: pytest.MonkeyPatch):
+    """Somebody to ask what this build starts from, on loopback.
+
+    A child of this process on a port the kernel picks; no real coordinator,
+    ledger or service is anywhere near it.
+    """
+    with a_coordinator_that_recorded({BUILD_ID: THE_RECORDED_START}, monkeypatch):
+        yield
 
 
 # ---------------------------------------------------------------------------
