@@ -71,7 +71,9 @@ __all__ = [
     "DEFAULT_REPORT_MARKER",
     "DEFAULT_RUNNING_MARKER",
     "DEFAULT_SETTING_NAME",
+    "NOTHING_IS_RUNNING",
     "TARGET_ANSWERS",
+    "UNKNOWN_SUFFIX",
     "FixedIdentity",
     "IdentityDeclaration",
     "declared_identity",
@@ -79,6 +81,7 @@ __all__ = [
     "identity_reported_by",
     "the_identities_differ",
     "what_the_target_says",
+    "why_the_target_could_not_say",
 ]
 
 
@@ -108,9 +111,29 @@ DEFAULT_ARTIFACT_SETTING: str = "DEPLOY_ARTIFACT"
 DEFAULT_ASK_SETTING: str = "RUNNING_IDENTITY"
 
 #: The marker that read-only answer prints under, when a project declares no
-#: other. One line, ``<marker>=<identity>``; an empty value means the project
-#: could not say, and then nothing is deployed.
+#: other. One line, ``<marker>=<identity>``.
 DEFAULT_RUNNING_MARKER: str = "RUNNING_IDENTITY"
+
+#: THE WORD THAT MEANS "NOTHING IS RUNNING HERE" (25 September 2026, the third
+#: review of the executor stage). It used to be an EMPTY value, and that was a
+#: hole rather than a design: a project's step whose own query FAILED printed
+#: an empty value too — nothing had to go wrong for it to, because suppressing
+#: a query's error and printing what it did not learn is the most ordinary
+#: mistake a step can make — and this side then read a free target and put an
+#: older result over a newer one. A project now has to SAY it, and an empty
+#: value is read as "this could not be established", which deploys nothing.
+#:
+#: It is a word, carried as text, and it names nothing about any project: what
+#: is running, and how a project finds out, remain entirely the project's.
+NOTHING_IS_RUNNING: str = "none"
+
+#: What a project adds to its own marker to say the question could not be
+#: answered: ``<marker>_UNKNOWN=<reason in plain words>``. The marker is the
+#: project's; this is the one piece of shape around it, and it exists so a
+#: step can say WHY rather than only that. Any such line is read as "could not
+#: be established", exactly like no line at all, and the reason is carried into
+#: the sentence a person reads.
+UNKNOWN_SUFFIX: str = "_UNKNOWN"
 
 
 #: What a name made from a commit may contain. Letters, digits, dashes and
@@ -326,6 +349,31 @@ def identity_reported_by(output: str | None, *, marker: str) -> str | None:
 TARGET_ANSWERS: tuple[str, ...] = ("identity", "nothing", "no-answer")
 
 
+def why_the_target_could_not_say(output: str | None, *, marker: str) -> str | None:
+    """The project's own reason for not being able to answer, or ``None``.
+
+    A step that knows why its question failed says so on one line,
+    ``<marker>_UNKNOWN=<reason>``, and the LAST such line wins. The reason is
+    plain text written by the project for a person to read; nothing here
+    interprets it, and it only ever ends up in a sentence.
+    """
+    if not output or not marker:
+        return None
+    needle = f"{marker}{UNKNOWN_SUFFIX}="
+    found: str | None = None
+    for raw in str(output).splitlines():
+        line = raw.strip()
+        position = line.find(needle)
+        if position < 0:
+            continue
+        value = line[position + len(needle) :].strip()
+        if value[:1] in ("'", '"') and value[-1:] == value[:1] and len(value) >= 2:
+            value = value[1:-1].strip()
+        if value:
+            found = value
+    return found
+
+
 def what_the_target_says(
     output: str | None, *, marker: str
 ) -> tuple[str, str | None]:
@@ -335,22 +383,34 @@ def what_the_target_says(
     reason the deploy step's own line does. The VALUE is the whole of the
     answer, and it has exactly three readings:
 
-    * a token       ⇒ ``("identity", token)`` — that is what is running there,
-      in the project's own terms. Whether the caller can place that token is
-      the caller's problem, and a token it cannot place is a target it cannot
-      account for;
-    * empty         ⇒ ``("nothing", None)`` — the project says nothing is
-      running there. This is the ONLY way a project says that, so a project
-      that knows something is running but cannot name it must answer with a
-      token rather than with nothing;
-    * no line at all ⇒ ``("no-answer", None)`` — the project said nothing this
-      side can read, which is never read as "nothing is running".
+    * a token             ⇒ ``("identity", token)`` — that is what is running
+      there, in the project's own terms. Whether the caller can place that
+      token is the caller's problem, and a token it cannot place is a target it
+      cannot account for;
+    * the word :data:`NOTHING_IS_RUNNING` ⇒ ``("nothing", None)`` — the project
+      says nothing is running there. This is the ONLY way a project says that;
+    * anything else       ⇒ ``("no-answer", reason or None)`` — no line at all,
+      an empty value, or a ``<marker>_UNKNOWN=`` line. The project has not
+      established what is there, and that is NEVER read as "nothing is
+      running". When the project said why, the reason comes back beside the
+      word so a person can be told it.
+
+    WHAT CHANGED, AND WHY (25 September 2026, the third review of the executor
+    stage). An EMPTY value used to mean "nothing is running". A reviewer made
+    the project's own query fail: its step suppressed the error, exited zero
+    and printed an empty value, this side read a free target, and an older
+    result went live over a newer one. An empty value is the shape a step
+    prints when it has learnt nothing, so it cannot also be the shape that
+    means it learnt the target is free. "Free" is now a word a project has to
+    say, and everything else leaves the target unestablished.
 
     Nothing here knows what a project deploys or what its tokens mean.
     """
     if not output or not marker:
         return ("no-answer", None)
+    unknown = why_the_target_could_not_say(output, marker=marker)
     needle = f"{marker}="
+    unknown_needle = f"{marker}{UNKNOWN_SUFFIX}="
     found: str | None = None
     seen = False
     for raw in str(output).splitlines():
@@ -358,14 +418,22 @@ def what_the_target_says(
         position = line.find(needle)
         if position < 0:
             continue
+        # ``<marker>_UNKNOWN=`` is its own line and is read by the function
+        # above; a marker that is a prefix of it must not swallow it.
+        if line.find(unknown_needle) >= 0:
+            continue
         seen = True
         value = line[position + len(needle) :].strip()
         if value[:1] in ("'", '"') and value[-1:] == value[:1] and len(value) >= 2:
             value = value[1:-1].strip()
         found = value
+    if unknown is not None:
+        return ("no-answer", unknown)
     if not seen:
         return ("no-answer", None)
     if not found:
+        return ("no-answer", None)
+    if found.strip().lower() == NOTHING_IS_RUNNING:
         return ("nothing", None)
     return ("identity", found)
 

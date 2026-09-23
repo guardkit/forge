@@ -830,10 +830,15 @@ class DeployStageRunner:
         *,
         correlation_id: str,
         deploy_run_id: str,
+        identity_env: dict[str, str] | None = None,
     ) -> DeployStageResult:
         """Tear the standing candidate down on its own — for a run that stops
         between the two legs. Never raises; ``outcome="failed"`` with
-        ``failed_step="candidate_down"`` when the teardown did not complete."""
+        ``failed_step="candidate_down"`` when the teardown did not complete.
+
+        ``identity_env`` is the same setting the CHECK was handed, so a project
+        whose candidate belongs to one check rather than to a shared name can
+        take down the right one."""
         profile = self._profile_for_run(profile)
         if profile.candidate is None:
             return DeployStageResult(
@@ -843,7 +848,10 @@ class DeployStageRunner:
                 detail={"reason": "no_candidate_section", "candidate": "absent"},
             )
         torn_down = await self._teardown_candidate(
-            profile, correlation_id=correlation_id, deploy_run_id=deploy_run_id
+            profile,
+            correlation_id=correlation_id,
+            deploy_run_id=deploy_run_id,
+            identity_env=identity_env,
         )
         return DeployStageResult(
             outcome="complete" if torn_down else "failed",
@@ -899,9 +907,6 @@ class DeployStageRunner:
         )
         try:
             run_result = await self._run_runbook(runbook, correlation_id)
-            executed = self._repo.load_runbook(
-                runbook.runbook_id, correlation_id=correlation_id
-            )
         except Exception as exc:  # noqa: BLE001 — a question, never a crash
             logger.warning(
                 "what-is-running: %s could not be asked what it is running "
@@ -917,12 +922,32 @@ class DeployStageRunner:
                 dry_run=self._dry_run,
                 detail={"deploy_output": "", "why": f"{type(exc).__name__}: {exc}"},
             )
+        # WHAT THE STEP SAID IS WANTED EITHER WAY (25 September 2026, the third
+        # review). A step that could not find out exits non-zero AND says why
+        # on its last line, and that sentence is the whole use of asking. It
+        # used to be thrown away with the run: the load was inside the same
+        # guard, so a failed ask answered with an empty output and the caller
+        # could only report that the step "did not finish".
+        said = ""
+        try:
+            executed = self._repo.load_runbook(
+                runbook.runbook_id, correlation_id=correlation_id
+            )
+            said = deploy_step_output(executed)
+        except Exception as exc:  # noqa: BLE001 — a question, never a crash
+            logger.warning(
+                "what-is-running: %s answered and the answer could not be read "
+                "back (%s: %s)",
+                profile.env_id,
+                type(exc).__name__,
+                exc,
+            )
         return DeployStageResult(
             outcome="complete" if run_result.status == "complete" else "failed",
             deploy_run_id=deploy_run_id,
             failed_step=None if run_result.status == "complete" else "deploy_compose",
             dry_run=self._dry_run,
-            detail={"deploy_output": deploy_step_output(executed)},
+            detail={"deploy_output": said},
         )
 
     async def promote(
@@ -973,6 +998,16 @@ class DeployStageRunner:
         events: list[str] = list(prior_events)
         profile_ref = deploy_profile_ref or profile.source_ref
         deployer = deployer or deploy_run_id
+        # THE SAME SETTING THE CHECK WAS HANDED, for the teardown that follows
+        # (25 September 2026). A project whose candidate belongs to one check
+        # rather than to a shared name cannot be told which one to take down
+        # without it. Both names are the project's own and carried as text.
+        identity_env_for_teardown: dict[str, str] = {}
+        if deploy_ownership:
+            setting = str(deploy_ownership.get("identity_setting") or "").strip()
+            identity_text = str(deploy_ownership.get("identity") or "").strip()
+            if setting and identity_text:
+                identity_env_for_teardown = {setting: identity_text}
         reservation_resource = profile.reservation_resource
         handle: ReservationHandle | None = None
         candidate_word = "absent" if profile.candidate is None else "standing"
@@ -994,6 +1029,7 @@ class DeployStageRunner:
                         profile,
                         correlation_id=correlation_id,
                         deploy_run_id=deploy_run_id,
+                        identity_env=identity_env_for_teardown,
                     )
                     candidate_word = "torn-down" if torn else "standing"
                 failed = await self._fail_before_start(
@@ -1122,6 +1158,7 @@ class DeployStageRunner:
                         profile,
                         correlation_id=correlation_id,
                         deploy_run_id=deploy_run_id,
+                        identity_env=identity_env_for_teardown,
                     )
                     candidate_word = "torn-down" if torn else "standing"
 
@@ -1576,6 +1613,7 @@ class DeployStageRunner:
                 profile,
                 correlation_id=correlation_id,
                 deploy_run_id=deploy_run_id,
+                identity_env=identity_env,
             )
             # This is the words the merge report says the candidate stopped
             # at, so when the step never ran the sidecar's own reason travels
@@ -1630,6 +1668,7 @@ class DeployStageRunner:
                     profile,
                     correlation_id=correlation_id,
                     deploy_run_id=deploy_run_id,
+                    identity_env=identity_env,
                 )
                 failed = await self._candidate_failed_result(
                     profile,
@@ -1658,14 +1697,26 @@ class DeployStageRunner:
         *,
         correlation_id: str,
         deploy_run_id: str,
+        identity_env: dict[str, str] | None = None,
     ) -> bool:
-        """Tear the ``-cand`` compose project down (best-effort, never raises).
+        """Tear the candidate down (best-effort, never raises).
 
         True when the teardown runbook completed; False when it did not, or
-        could not be run at all — the ``-cand`` project may then still be up.
+        could not be run at all — the candidate may then still be up.
+
+        ``identity_env`` (25 September 2026) is the same setting the CHECK was
+        handed, carrying the same identity. A project whose candidate belongs
+        to one check rather than to a shared name needs it to know which one to
+        take down, and a project that never used it is unaffected: it is one
+        more setting in the overlay, named by the project and carried here as
+        text. Absent ⇒ byte for byte what this was.
         """
         assert profile.candidate is not None
-        teardown_env = {"CANDIDATE_DOWN": "1", **dict(profile.candidate.env)}
+        teardown_env = {
+            "CANDIDATE_DOWN": "1",
+            **dict(profile.candidate.env),
+            **(identity_env or {}),
+        }
         teardown_runbook = build_candidate_teardown_runbook(
             profile,
             runbook_id=f"teardown-cand-{deploy_run_id}",

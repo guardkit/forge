@@ -911,11 +911,20 @@ class _AProjectWithATarget:
         says_it_checked: str | None = "",
         on_the_target: str | None = None,
         answers_what_is_running: bool = True,
+        the_read_only_answer: str | None = None,
+        the_read_only_step_finished: bool = True,
     ) -> None:
         self.reports = reports
         self.marker = marker
         self.says_it_checked = says_it_checked
         self.answers_what_is_running = answers_what_is_running
+        #: The read-only step's output, verbatim, when a case wants to drive
+        #: exactly what the project printed (25 September 2026). ``None`` is
+        #: the ordinary answer made from ``on_the_target``.
+        self.the_read_only_answer = the_read_only_answer
+        #: Did that step FINISH? A project whose own query failed exits
+        #: non-zero, and the press has to read that as "not established".
+        self.the_read_only_step_finished = the_read_only_step_finished
         #: WHAT IS RUNNING ON THE TARGET. ``None`` = nothing.
         self.on_the_target = on_the_target
         self.calls: list[dict[str, Any]] = []
@@ -958,16 +967,27 @@ class _AProjectWithATarget:
             )
         if leg == "what_is_running":
             self.asked_what_is_running += 1
+            if self.the_read_only_answer is not None:
+                return SimpleNamespace(
+                    outcome=(
+                        "complete" if self.the_read_only_step_finished else "failed"
+                    ),
+                    verdict=None,
+                    detail={"deploy_output": self.the_read_only_answer},
+                )
             if not self.answers_what_is_running:
                 return SimpleNamespace(
                     outcome="failed", verdict=None, detail={"deploy_output": ""}
                 )
+            # "Nothing is running here" is the WORD ``none`` (25 September
+            # 2026): an empty value is what a step prints when its own query
+            # failed, so it cannot also mean the target is free.
             return SimpleNamespace(
                 outcome="complete",
                 verdict=None,
                 detail={
                     "deploy_output": (
-                        f"RUNNING_IDENTITY={self.on_the_target or ''}\n"
+                        f"RUNNING_IDENTITY={self.on_the_target or 'none'}\n"
                     )
                 },
             )
@@ -1221,11 +1241,11 @@ class _ADeployTheExecutorStopped:
                 outcome="complete", verdict=None, detail={"candidate": "torn-down"}
             )
         if leg == "what_is_running":
-            # Nothing is running on the target: an empty answer, which is the
+            # Nothing is running on the target: the word ``none``, which is the
             # only way a project says that.
             return SimpleNamespace(
                 outcome="complete", verdict=None,
-                detail={"deploy_output": "RUNNING_IDENTITY=\n"},
+                detail={"deploy_output": "RUNNING_IDENTITY=none\n"},
             )
         owns = dict(kwargs.get("deploy_ownership") or {})
         return SimpleNamespace(
@@ -1487,3 +1507,102 @@ def test_the_two_lists_of_nothing_was_started_words_are_the_same() -> None:
         deploy_executor.NOTHING_WAS_STARTED
     )
     assert deploy_executor.STOPPED_BY_A_TAKEOVER in deploy_executor.NOTHING_WAS_STARTED
+
+
+class TestAFailedObservationIsNeverAFreeTarget:
+    """The third review's second fault, at the press.
+
+    A project's read-only step whose own query FAILED used to reach the press
+    as "nothing is running": it suppressed the error, exited zero and printed
+    an empty value. The press read a free target and put an OLDER result over
+    a newer one, answering "merged into the remote and running". Four shapes
+    are read as "not established" now, and every one of them deploys nothing.
+    """
+
+    @pytest.mark.asyncio
+    async def test_an_empty_answer_deploys_nothing(
+        self,
+        config_with_publication_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> None:
+        publisher = _APublisherThatSays([_published("c" * 40)])
+        deploy = _ADeployStepThatSays(the_read_only_answer="RUNNING_IDENTITY=\n")
+        deps = _deps_that_can_deploy(
+            config_with_publication_on, pool, publisher=publisher, deploy=deploy
+        )
+
+        outcome = await _press(deps, repo_root)
+
+        assert outcome.result == "published-deployment-pending", outcome.detail
+        assert "was not established" in outcome.detail
+        assert "not read as 'nothing is running'" in outcome.detail
+        assert [c.get("leg") for c in deploy.calls].count("promote") == 0
+        assert _record(pool).result == RESULT_PUBLISHED_DEPLOYMENT_PENDING
+
+    @pytest.mark.asyncio
+    async def test_the_steps_own_reason_reaches_the_sentence(
+        self,
+        config_with_publication_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> None:
+        publisher = _APublisherThatSays([_published("c" * 40)])
+        deploy = _ADeployStepThatSays(
+            the_read_only_answer=(
+                "RUNNING_IDENTITY_UNKNOWN=the query failed: the daemon is not "
+                "answering\n"
+            ),
+            the_read_only_step_finished=False,
+        )
+        deps = _deps_that_can_deploy(
+            config_with_publication_on, pool, publisher=publisher, deploy=deploy
+        )
+
+        outcome = await _press(deps, repo_root)
+
+        assert outcome.result == "published-deployment-pending", outcome.detail
+        assert "the daemon is not answering" in outcome.detail
+        assert [c.get("leg") for c in deploy.calls].count("promote") == 0
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_line_on_a_step_that_exited_zero_still_stops_it(
+        self,
+        config_with_publication_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> None:
+        publisher = _APublisherThatSays([_published("c" * 40)])
+        deploy = _ADeployStepThatSays(
+            the_read_only_answer="RUNNING_IDENTITY_UNKNOWN=it could not look\n"
+        )
+        deps = _deps_that_can_deploy(
+            config_with_publication_on, pool, publisher=publisher, deploy=deploy
+        )
+
+        outcome = await _press(deps, repo_root)
+
+        assert outcome.result == "published-deployment-pending", outcome.detail
+        assert "it could not look" in outcome.detail
+        assert [c.get("leg") for c in deploy.calls].count("promote") == 0
+
+    @pytest.mark.asyncio
+    async def test_the_word_none_after_a_good_query_IS_a_free_target(
+        self,
+        config_with_publication_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> None:
+        """And the other half: a project that SAYS the target is free is believed."""
+        from forge.pipeline.publication_record import RESULT_MERGED_AND_RUNNING
+
+        publisher = _APublisherThatSays([_published("c" * 40)])
+        deploy = _ADeployStepThatSays(the_read_only_answer="RUNNING_IDENTITY=none\n")
+        deps = _deps_that_can_deploy(
+            config_with_publication_on, pool, publisher=publisher, deploy=deploy
+        )
+
+        outcome = await _press(deps, repo_root)
+
+        assert outcome.result == "merged-into-the-remote-and-running", outcome.detail
+        assert _record(pool).result == RESULT_MERGED_AND_RUNNING

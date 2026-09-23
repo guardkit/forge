@@ -152,7 +152,16 @@ class TestWhatTheProjectDeclares:
 
 
 class TestWhatTheTargetSays:
-    """The read-only answer has exactly three readings, and empty is one."""
+    """The read-only answer has three readings, and "free" is a WORD.
+
+    Changed 25 September 2026, after the third review of the executor stage.
+    An EMPTY value used to mean "nothing is running". A reviewer made the
+    project's own query fail: the step suppressed the error, exited zero and
+    printed an empty value, this side read a free target, and an older result
+    went live over a newer one. An empty value is the shape a step prints when
+    it has learnt nothing, so it cannot also be the shape that means it learnt
+    the target is free.
+    """
 
     def test_a_token_is_what_is_running(self) -> None:
         from forge.pipeline.deployment_identity import what_the_target_says
@@ -161,12 +170,45 @@ class TestWhatTheTargetSays:
             "log line\nRUNNING_IDENTITY=j-abc@1111\n", marker="RUNNING_IDENTITY"
         ) == ("identity", "j-abc@1111")
 
-    def test_an_empty_value_means_nothing_is_running(self) -> None:
+    def test_the_word_none_means_nothing_is_running(self) -> None:
+        from forge.pipeline.deployment_identity import (
+            NOTHING_IS_RUNNING,
+            what_the_target_says,
+        )
+
+        assert what_the_target_says(
+            f"log line\nRUNNING_IDENTITY={NOTHING_IS_RUNNING}\n",
+            marker="RUNNING_IDENTITY",
+        ) == ("nothing", None)
+
+    def test_an_empty_value_is_NOT_nothing_is_running(self) -> None:
+        """The hole the third review drove through. It is closed."""
         from forge.pipeline.deployment_identity import what_the_target_says
 
         assert what_the_target_says(
             "log line\nRUNNING_IDENTITY=\n", marker="RUNNING_IDENTITY"
-        ) == ("nothing", None)
+        ) == ("no-answer", None)
+
+    def test_the_steps_own_reason_comes_back_with_the_refusal(self) -> None:
+        from forge.pipeline.deployment_identity import what_the_target_says
+
+        word, why = what_the_target_says(
+            "RUNNING_IDENTITY_UNKNOWN=the query failed: docker exited 1\n",
+            marker="RUNNING_IDENTITY",
+        )
+        assert word == "no-answer"
+        assert why == "the query failed: docker exited 1"
+
+    def test_an_unknown_line_wins_over_a_value_beside_it(self) -> None:
+        """A step that said it could not tell has not told, whatever else it printed."""
+        from forge.pipeline.deployment_identity import what_the_target_says
+
+        word, why = what_the_target_says(
+            "RUNNING_IDENTITY=j-abc@1111\nRUNNING_IDENTITY_UNKNOWN=and then it fell over\n",
+            marker="RUNNING_IDENTITY",
+        )
+        assert word == "no-answer"
+        assert why == "and then it fell over"
 
     def test_no_line_at_all_is_never_read_as_nothing_running(self) -> None:
         from forge.pipeline.deployment_identity import what_the_target_says
