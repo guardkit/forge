@@ -120,8 +120,12 @@ def _ask(url: str, request: dict[str, Any], timeout: float) -> dict[str, Any]:
     except (urllib.error.URLError, OSError, TimeoutError) as exc:
         return _refusal(
             PUBLISHER_COULD_NOT_BE_REACHED,
-            f"the publisher at {url} could not be reached ({exc}), so nothing "
-            "was sent",
+            # The publisher's address is not written down either (the same
+            # rule as a project's remote address, 23 September 2026): a
+            # sentence that reaches a receipt and a ledger row must never be
+            # a place a credential could end up at some future rollout.
+            f"the publisher could not be reached ({type(exc).__name__}), so "
+            "nothing was sent",
         )
     try:
         decoded = json.loads(raw)

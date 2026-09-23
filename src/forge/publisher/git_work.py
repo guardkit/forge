@@ -116,8 +116,20 @@ def the_send_argv(remote: str, commit: str, branch: str) -> list[str]:
     function in the publisher builds a push. That is what "impossible by
     construction" means here, and a test reads both this list and the whole
     module's source to pin it.
+
+    It also checks its own inputs (23 September 2026): the service checks them
+    before it ever gets here, but a function that says it is the one place a
+    send is built must not build ``x:refs/heads/+main`` for a caller that did
+    not. A bad name raises, and nothing is run.
     """
-    return ["push", str(remote), f"{commit}:refs/heads/{branch}"]
+    plain_commit = a_plain_commit_name(commit)
+    plain_branch = a_plain_branch_name(branch)
+    if plain_commit is None or plain_branch is None:
+        raise ValueError(
+            "the send is built only from a plain commit and a plain branch "
+            "name; one of them is not"
+        )
+    return ["push", str(remote), f"{plain_commit}:refs/heads/{plain_branch}"]
 
 
 @dataclass(frozen=True)
