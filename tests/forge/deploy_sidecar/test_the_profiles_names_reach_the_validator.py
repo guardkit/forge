@@ -36,6 +36,7 @@ import yaml
 
 from forge.config.models import ForgeConfig
 from forge.deploy.profile import load_deploy_profile
+from forge.deploy_sidecar.deploy_executor import ExecutorAnswer
 from forge.deploy_sidecar.service import allowed_env_keys, process_run_request
 
 #: A real project's committed profile, in the estate this factory serves. It is
@@ -206,6 +207,109 @@ class TestTheRealRouteWithTheCommittedProfile:
         )
         assert status == 400
         assert "not allowlisted" in body["error"]
+
+
+class _WouldHaveDeployed:
+    """An executor that records the request instead of starting anything."""
+
+    def __init__(self) -> None:
+        self.asked: list[object] = []
+
+    def run(self, request: object) -> ExecutorAnswer:
+        self.asked.append(request)
+        return ExecutorAnswer(
+            accepted=True,
+            word="the-deploy-command-ran",
+            sentence="the command would have run here",
+            exit_code=0,
+        )
+
+
+class TestTheDeployBlocksSettingNamesToo:
+    """The other half of the same rule (26 September, the fourth review).
+
+    The env door above was connected to this project's declaration and the
+    ``deploy`` block was not, so a name the door refused was accepted through
+    the block and went into the environment of the one command that deploys
+    the live thing. Both halves read the SAME declaration now, and this is
+    the test that goes red if they ever drift apart again.
+    """
+
+    def _deploy(
+        self, tmp_path: Path, block: dict
+    ) -> tuple[int, dict, _WouldHaveDeployed]:
+        repo = _a_project(tmp_path, _profile_text())
+        executor = _WouldHaveDeployed()
+        status, body = process_run_request(
+            {
+                "repo": "bench/a-project",
+                "script": "deploy/deploy.sh",
+                "env": {"PROMOTE": "1"},
+                "timeout_seconds": 5,
+                "deploy": {
+                    "target": "a-project::live",
+                    "target_counter": 1,
+                    "build": "build-a",
+                    **block,
+                },
+            },
+            config=_config(repo),
+            script_runner=_Ran(),
+            deploy_executor=executor,
+            inside_sandbox=True,
+        )
+        return status, body, executor
+
+    def test_the_names_this_project_declares_are_accepted(
+        self, tmp_path: Path
+    ) -> None:
+        declared = yaml.safe_load(_profile_text()).get("identity") or {}
+        status, body, executor = self._deploy(
+            tmp_path,
+            {
+                "identity": "j-0123456789ab@ffff",
+                "identity_setting": str(declared["setting"]),
+                "artifact": "an-artifact-of-its-own",
+                "artifact_setting": str(declared["artifact_setting"]),
+            },
+        )
+        assert status == 200, body
+        assert executor.asked, "the deploy never reached the executor"
+
+    def test_a_name_this_project_never_declared_is_refused(
+        self, tmp_path: Path
+    ) -> None:
+        status, body, executor = self._deploy(
+            tmp_path,
+            {
+                "identity": "j-0123456789ab@ffff",
+                "identity_setting": "SOMETHING_NOBODY_DECLARED",
+            },
+        )
+        assert status == 400
+        assert "does not declare that name" in body["error"]
+        assert not executor.asked, "nothing may start on a refused request"
+
+    def test_one_of_the_factorys_own_names_is_refused(self, tmp_path: Path) -> None:
+        status, body, executor = self._deploy(
+            tmp_path,
+            {"identity": "j-0123456789ab@ffff", "identity_setting": "PATH"},
+        )
+        assert status == 400
+        assert "is one of the settings this factory sets itself" in body["error"]
+        assert not executor.asked
+
+    def test_a_marker_is_refused_here_as_well(self, tmp_path: Path) -> None:
+        """A marker names a line the step prints; it is never handed to one."""
+        declared = yaml.safe_load(_profile_text()).get("identity") or {}
+        marker = str(declared["checked_as"])
+        status, body, executor = self._deploy(
+            tmp_path,
+            {"identity": "j-0123456789ab@ffff", "identity_setting": marker},
+        )
+        assert status == 400
+        assert marker in body["error"]
+        assert not executor.asked
 
 
 class TestADeclaredLaunchSettingOnTheRequest:

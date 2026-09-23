@@ -1457,8 +1457,19 @@ def process_run_request(
                     "target can be held and stopped."
                 )
             }
+        # THE SETTING NAMES IN THIS BLOCK ARE THE PROJECT'S OWN, and they are
+        # read from the SAME declaration the environment door above reads (26
+        # September 2026, the fourth review of this stage). Without this the
+        # door was closed and the deploy block was not: a name refused as an
+        # env key was accepted here, and went into the environment of the one
+        # command that deploys the live thing.
+        declaration = declared_identity(profile)
         built = deploy_request_from(
             payload.get("deploy"),
+            permitted_settings=(
+                declaration.setting,
+                declaration.artifact_setting,
+            ),
             cwd=str(cwd),
             script=script,
             env_file=env_file,
