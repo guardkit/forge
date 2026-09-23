@@ -64,11 +64,25 @@ def _profile_text() -> str:
     return _the_committed_profile().read_text(encoding="utf-8")
 
 
-def _a_project(tmp_path: Path, profile_text: str) -> Path:
-    """A repository whose ``deploy/profile.yaml`` is the given text."""
+def _a_project(
+    tmp_path: Path, profile_text: str, *, declares: tuple[str, ...] = ()
+) -> Path:
+    """A repository whose ``deploy/profile.yaml`` is the given text.
+
+    ``declares`` is what that project says its own builds need, written into
+    its own ``.guardkit/config.yaml``. Since 23 September 2026 that file and
+    the profile's identity block are the ONLY things that widen the helper's
+    environment door: a request presenting a name the project has not declared
+    is refused and nothing starts.
+    """
     repo = tmp_path / "a-project"
     (repo / "deploy").mkdir(parents=True)
     (repo / "deploy" / "profile.yaml").write_text(profile_text, encoding="utf-8")
+    if declares:
+        (repo / ".guardkit").mkdir(parents=True, exist_ok=True)
+        (repo / ".guardkit" / "config.yaml").write_text(
+            "launch:\n  settings: [" + ", ".join(declares) + "]\n", encoding="utf-8"
+        )
     return repo
 
 
@@ -324,34 +338,50 @@ class TestTheDeployBlocksSettingNamesToo:
 
 
 class TestADeclaredLaunchSettingOnTheRequest:
-    def test_it_is_permitted_as_an_env_key_too(self, tmp_path: Path) -> None:
-        repo = _a_project(tmp_path, _profile_text())
-        status, body = process_run_request(
+    """And the request cannot widen the door on its own say-so.
+
+    Rewritten 23 September 2026. The first of these used to pass with no
+    declaration anywhere: a name of the right shape on the request was enough.
+    It is not any more — the project's own file has to name it.
+    """
+
+    def _ask(self, repo: Path, body: dict) -> tuple[int, dict]:
+        ran = _Ran()
+        status, answer = process_run_request(
             {
                 "repo": "bench/a-project",
                 "script": "deploy/deploy.sh",
                 "env": {"A_PROJECT_TOOL_HOME": "somewhere"},
-                "launch_settings": ["A_PROJECT_TOOL_HOME"],
                 "timeout_seconds": 5,
+                **body,
             },
             config=_config(repo),
-            script_runner=_Ran(),
+            script_runner=ran,
             inside_sandbox=True,
         )
+        return status, {**answer, "_started": bool(ran.calls)}
+
+    def test_it_is_permitted_as_an_env_key_too(self, tmp_path: Path) -> None:
+        repo = _a_project(
+            tmp_path, _profile_text(), declares=("A_PROJECT_TOOL_HOME",)
+        )
+        status, body = self._ask(repo, {"launch_settings": ["A_PROJECT_TOOL_HOME"]})
         assert status == 200, body
+        assert body["_started"]
+
+    def test_the_request_cannot_declare_it_on_the_projects_behalf(
+        self, tmp_path: Path
+    ) -> None:
+        repo = _a_project(tmp_path, _profile_text())
+        status, body = self._ask(repo, {"launch_settings": ["A_PROJECT_TOOL_HOME"]})
+        assert status == 400
+        assert "A_PROJECT_TOOL_HOME" in body["error"]
+        assert "does not declare that name" in body["error"]
+        assert not body["_started"], "nothing may start on a refused request"
 
     def test_and_is_refused_without_the_declaration(self, tmp_path: Path) -> None:
         repo = _a_project(tmp_path, _profile_text())
-        status, body = process_run_request(
-            {
-                "repo": "bench/a-project",
-                "script": "deploy/deploy.sh",
-                "env": {"A_PROJECT_TOOL_HOME": "somewhere"},
-                "timeout_seconds": 5,
-            },
-            config=_config(repo),
-            script_runner=_Ran(),
-            inside_sandbox=True,
-        )
+        status, body = self._ask(repo, {})
         assert status == 400
         assert "not allowlisted" in body["error"]
+        assert not body["_started"]

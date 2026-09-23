@@ -206,7 +206,13 @@ from forge.executor.shell_steps import _run_script_step
 from forge.launch_environment import build_launch_env, declared_setting_refusal
 from forge.memory.redaction import scrub_process_output
 from forge.pipeline.deployment_identity import declared_identity
-from forge.planning.declared_memory import NAME_PATTERN
+from forge.planning.declared_memory import (
+    DECLARATION_PATH,
+    LAUNCH_KEY,
+    NAME_PATTERN,
+    SETTINGS_KEY,
+    read_declared_launch_settings,
+)
 from forge.planning.handoff import (
     PRE_COMMIT_CHECK_NAMES,
     PreCommitCheckOutcome,
@@ -873,7 +879,160 @@ def _allowlisted_env(
     return env, None
 
 
-def _launch_fields(payload: Any) -> tuple[str | None, tuple[str, ...], str | None]:
+def _not_declared_by_the_project(
+    name: str,
+    *,
+    repo: str | None,
+    declared: Sequence[str],
+    note: str | None = None,
+) -> str:
+    """The one sentence a request gets for a name its project never declared.
+
+    It names the name, says whose project it is, lists what that project does
+    declare, and says where a project declares such a thing — so the person
+    reading it can either correct the request or add the line to the project
+    and commit it.
+    """
+    whose = f"{repo}" if repo else "this project"
+    known = ", ".join(sorted(declared))
+    what_it_declares = (
+        f"the names it declares are {known}"
+        if known
+        else "it declares no setting names at all"
+    )
+    tail = f" ({note})" if note else ""
+    return (
+        f"this request asks for a setting called {name!r} to be handed to the "
+        f"command, and {whose} does not declare that name — "
+        f"{what_it_declares}{tail}. A project says what its own builds need in "
+        f"its own {DECLARATION_PATH}, under '{LAUNCH_KEY}: {SETTINGS_KEY}:', "
+        f"or as one of the identity settings in its deploy/profile.yaml; a "
+        f"request never widens that list. Nothing was started."
+    )
+
+
+def project_declared_settings(repo_path: Path) -> tuple[tuple[str, ...], str | None]:
+    """The setting names THIS PROJECT declares, and a note when one was unreadable.
+
+    Two places, both the project's own committed files, and nothing else:
+
+    * the ``launch:`` block of its :data:`DECLARATION_PATH` — the names a
+      project says its own builds need beyond the factory's list;
+    * the setting names its ``deploy/profile.yaml`` declares in its
+      ``identity`` block: the setting the identity of what was checked is
+      handed to its deploy step in, the setting that artifact is handed back
+      in, and the setting its read-only "what are you running" question is
+      asked with. The block's other three entries are MARKERS — they name
+      lines a step PRINTS, not settings it is given — and a marker is never a
+      setting name here, exactly as in :func:`allowed_env_keys`.
+
+    THE SAME READING AS THE ENVIRONMENT DOOR'S, deliberately: these are the
+    names :func:`allowed_env_keys` already permits as environment keys, read
+    the same way and through the same reader, so the two halves cannot come to
+    disagree about what a project said. A profile with no ``identity`` block at
+    all — every profile written before that block existed — reads as the
+    factory's own two defaults there, which is what that door has always
+    permitted, so nothing is widened by this being read here too.
+
+    THIS SERVICE CANNOT SEE THE LEDGER. The coordinator reads both of these
+    at the commit the work started from; this helper has no such record and no
+    way to get one, so it reads the copy of the project it has been pointed
+    at — the same copy it would run the project's own scripts out of, resolved
+    by :data:`planning.target_repo_paths`. That is the honest source available
+    here, and it is the same one the profile's own names are already read from.
+
+    Every name is put through :func:`declared_setting_refusal`, so a project
+    that declares one of the names or prefixes the factory keeps for itself
+    gets nothing from it: the reserved list wins over any declaration, here as
+    everywhere else. A ``launch:`` block with such a name in it is unusable as
+    a whole — the shared reader refuses the file rather than quietly keeping
+    the rest of it, which is the same answer the coordinator gets from the same
+    file, and the honest one: a project whose declaration is wrong has not
+    declared anything.
+
+    Returns ``(names, note)``. ``note`` is one plain clause when the project's
+    settings file is there and could not be used, so a refusal below can say
+    that rather than "it does not declare that name". Never raises: a file out
+    of a project this factory did not write is input.
+    """
+    names: list[str] = []
+    note: str | None = None
+
+    declaration = repo_path / Path(DECLARATION_PATH)
+    content: str | None = None
+    found = False
+    unreadable_because: str | None = None
+    try:
+        content = declaration.read_text(encoding="utf-8")
+        found = True
+    except FileNotFoundError:
+        found = False
+    except OSError as exc:
+        found = True
+        unreadable_because = f"reading it raised {type(exc).__name__}"
+    except Exception as exc:  # noqa: BLE001 — a project's file is input, not code
+        found = True
+        unreadable_because = f"reading it raised {type(exc).__name__}"
+    answer = read_declared_launch_settings(
+        repo=str(repo_path),
+        commit="the copy of it this service has",
+        content=content,
+        found=found,
+        unreadable_because=unreadable_because,
+    )
+    if answer.refusal is not None:
+        note = (
+            f"its own {DECLARATION_PATH} says something this factory cannot "
+            f"use, so no name was taken from that file"
+        )
+        logger.warning(
+            "deploy-sidecar: no launch settings were taken from %s — %s",
+            declaration,
+            answer.refusal.splitlines()[0],
+        )
+    else:
+        names.extend(answer.names)
+
+    # AND THE PROFILE'S OWN THREE, read the same way the environment door
+    # already reads them. A repository need not be deployable at all — a fix
+    # journey has no deploy profile — and one that is not simply declares
+    # nothing here.
+    try:
+        profile = load_deploy_profile(repo_path / "deploy" / "profile.yaml")
+    except (DeployProfileError, OSError):
+        profile = None
+    if profile is not None:
+        identity = declared_identity(profile)
+        names.extend(
+            (identity.setting, identity.artifact_setting, identity.asked_with)
+        )
+
+    permitted: list[str] = []
+    for raw in names:
+        name = str(raw or "").strip()
+        if not name or name in permitted:
+            continue
+        refusal = declared_setting_refusal(name)
+        if refusal is not None:
+            # THE RESERVED LIST WINS OVER ANY DECLARATION. The project is not
+            # refused over it here; it is refused the moment a request tries to
+            # USE the name, in one plain sentence.
+            logger.warning(
+                "deploy-sidecar: a name this project declares is not permitted "
+                "as a setting — %s",
+                refusal,
+            )
+            continue
+        permitted.append(name)
+    return tuple(permitted), note
+
+
+def _launch_fields(
+    payload: Any,
+    *,
+    repo_path: Path,
+    repo: str | None = None,
+) -> tuple[str | None, tuple[str, ...], str | None]:
     """``(memory name, declared setting names, refusal)`` off one request.
 
     Both are optional and both are the coordinator's own facts, read off the
@@ -888,6 +1047,16 @@ def _launch_fields(payload: Any) -> tuple[str | None, tuple[str, ...], str | Non
     the rest of the estate uses — a memory name is letters, digits and
     underscores; a setting name is a setting name and never one the factory
     keeps for itself.
+
+    THE REQUEST DOES NOT WIDEN THE DOOR (23 September 2026). Until now a name
+    of the right shape that was not one the factory keeps for itself was
+    admitted on the request's say-so alone, which meant whoever could send a
+    request could hand a build any setting this service's own process happens
+    to hold. The environment door is the PROJECT'S to widen: a name presented
+    here is permitted only if the project this request names declares it, in
+    its own committed files, read by :func:`project_declared_settings` from
+    the copy of the project this service has. A name it does not declare is
+    refused in plain words and nothing is started.
     """
     if not isinstance(payload, dict):
         return None, (), None
@@ -910,11 +1079,17 @@ def _launch_fields(payload: Any) -> tuple[str | None, tuple[str, ...], str | Non
                 "the project declared its builds need; got "
                 f"{type(raw_settings).__name__}"
             )
+        declared, note = project_declared_settings(repo_path)
         for entry in raw_settings:
             refusal = declared_setting_refusal(entry)
             if refusal is not None:
                 return None, (), f"'launch_settings' cannot be used: {refusal}"
-            names.append(str(entry).strip())
+            wanted = str(entry).strip()
+            if wanted not in declared:
+                return None, (), _not_declared_by_the_project(
+                    wanted, repo=repo, declared=declared, note=note
+                )
+            names.append(wanted)
     return name, tuple(names), None
 
 
@@ -1340,8 +1515,13 @@ def process_run_request(
     # here for the same reason every other field is: this service starts
     # processes, and a request is input. They are read once, before either of
     # the two routes below, because both of them launch the project's own
-    # program and both were stripping these until 22 September 2026.
-    launch_memory, launch_names, launch_error = _launch_fields(payload)
+    # program and both were stripping these until 22 September 2026. A NAME
+    # THE REQUEST PRESENTS IS CHECKED AGAINST THE PROJECT'S OWN DECLARATION
+    # (23 September 2026): the request carries the coordinator's reading of
+    # it, and this service confirms it against the copy of the project it has.
+    launch_memory, launch_names, launch_error = _launch_fields(
+        payload, repo_path=repo_path, repo=repo
+    )
     if launch_error is not None:
         return 400, {"error": launch_error}
 
@@ -1887,7 +2067,11 @@ def process_guardkit_merge_request(
             return 400, {"error": worktree_error}
         in_worktree = str(in_worktree).strip()
 
-    memory_project, launch_settings, launch_error = _launch_fields(payload)
+    # The names on the request are checked against what THIS project declares
+    # in its own committed files, read from the copy this service has.
+    memory_project, launch_settings, launch_error = _launch_fields(
+        payload, repo_path=repo_path, repo=str(payload.get("repo") or "") or None
+    )
     if launch_error is not None:
         return 400, {"error": launch_error}
 
@@ -2812,8 +2996,11 @@ def process_git_write_tree_request(
         return 400, {"error": error}
     # The same two launch facts the merge and leg routes carry: the checks
     # declared here ARE the build system, run against a tree, so they are
-    # launched the way every other call of it is.
-    memory_project, launch_settings, launch_error = _launch_fields(payload)
+    # launched the way every other call of it is — and a setting name on the
+    # request is checked against the project's own declaration the same way.
+    memory_project, launch_settings, launch_error = _launch_fields(
+        payload, repo_path=repo_path, repo=str(payload.get("repo") or "") or None
+    )
     if launch_error is not None:
         return 400, {"error": launch_error}
 
@@ -4356,7 +4543,9 @@ def process_guardkit_leg_request(
     )
     if error:
         return 400, {"error": error}
-    memory_project, launch_settings, launch_error = _launch_fields(payload)
+    memory_project, launch_settings, launch_error = _launch_fields(
+        payload, repo_path=repo_path, repo=str(payload.get("repo") or "") or None
+    )
     if launch_error is not None:
         return 400, {"error": launch_error}
     with_nats_streaming = payload.get("with_nats_streaming", False)
@@ -6087,6 +6276,7 @@ __all__ = [
     "sidecar_is_inside_sandbox",
     "SIDECAR_IN_SANDBOX_ENV",
     "allowed_env_keys",
+    "project_declared_settings",
     "process_run_request",
     "process_guardkit_merge_request",
     "GIT_WRITE_TREE_ROUTE",

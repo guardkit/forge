@@ -95,7 +95,12 @@ def _config(paths: dict[str, str]) -> ForgeConfig:
 
 @pytest.fixture
 def repo(tmp_path: Path) -> Path:
-    return scratch_repo(tmp_path / "api_test")
+    # THE PROJECT DECLARES WHAT ITS OWN BUILDS NEED, and the requests below
+    # present those names. The helper permits a name on a request only when
+    # the project's own committed declaration lists it (23 September 2026), so
+    # the declaration is written here rather than the request being taken on
+    # its own say-so.
+    return scratch_repo(tmp_path / "api_test", declares=STAND_IN_SETTINGS)
 
 
 @pytest.fixture

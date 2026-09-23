@@ -88,6 +88,14 @@ def repo(tmp_path: Path) -> Path:
     path.mkdir()
     _git(path, "init", "-b", "main")
     (path / "README").write_text("scratch\n", encoding="utf-8")
+    # WHAT THIS PROJECT SAYS ITS OWN BUILDS NEED. The helper permits a setting
+    # name on a request only when the project itself declares it (23 September
+    # 2026), so the setting a test below steers its stand-in leg with is
+    # declared here, in the project's own file, the way a real project does.
+    (path / ".guardkit").mkdir()
+    (path / ".guardkit" / "config.yaml").write_text(
+        "launch:\n  settings: [FAKE_LEG_EXIT]\n", encoding="utf-8"
+    )
     _git(path, "add", "-A")
     _git(path, "commit", "-m", "init")
     _git(path, "branch", "repair/TASK-WT-001")
