@@ -57,6 +57,16 @@ Type=simple
 Environment=FORGE_CONFIG_PATH=%h/forge-state/forge.yaml
 # Optional non-default port for a drill (defaults to 8125 in code):
 # Environment=FORGE_DEPLOY_SIDECAR_PORT=8125
+# WHERE THE COORDINATOR'S READ-ONLY ANSWER IS (27 September 2026). Two of this
+# service's gates need one fact each out of the coordinator's own record and
+# cannot hold it themselves: what commit a build was recorded as starting from
+# (which is where that project's own declarations are read), and which build
+# holds a deployment target. Both go to this address as questions, and nothing
+# is ever sent to it but a build's or a target's name. Unset means nobody can be
+# asked, and then a request that names a commit is refused rather than believed
+# — the safe side, and the reason this line has to be in place before that
+# binding is rolled out. Served by scripts/systemd/forge-record-answer.service.
+Environment=FORGE_TARGET_OWNER_URL=http://127.0.0.1:8126/recorded
 # Rich enough PATH for the spawned vetted scripts (git, docker compose, etc.).
 Environment=PATH=%h/.agentecflow/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 WorkingDirectory=%h/Projects/appmilla_github/forge

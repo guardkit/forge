@@ -77,6 +77,12 @@
 #   Everything the services themselves read — OPENAI_BASE_URL and its key,
 #   FORGE_CONFIG_PATH, GUARDKIT_HARNESS, the bus address, the memory keys —
 #   arrives in the same environment from the sandbox's environment file.
+#   FORGE_TARGET_OWNER_URL, where the coordinator's read-only answer is,
+#   arrives the same way (deploy/sandbox-deploy.sh also carries it in when the
+#   host has it). The deploy sidecar started below asks it what commit a build
+#   was recorded as starting from, and who holds a deployment target; unset, it
+#   cannot ask, and refuses a request naming a commit rather than believing it.
+#   The address has to be one that resolves from inside this sandbox.
 #
 # SAFETY. In the build lane this script is proven against fake `uv`, `python`
 # and `langgraph` programs in a temporary home, with real git in temporary
@@ -351,7 +357,7 @@ fi
 unset FORGE_DB_PATH
 
 # Which of the load-bearing settings the services will find. Names only.
-for name in OPENAI_BASE_URL OPENAI_API_KEY FORGE_CONFIG_PATH FORGE_NATS_URL FORGE_RECEIPTS_DIR GUARDKIT_HARNESS FORGE_SIDECAR_IN_SANDBOX; do
+for name in OPENAI_BASE_URL OPENAI_API_KEY FORGE_CONFIG_PATH FORGE_NATS_URL FORGE_RECEIPTS_DIR GUARDKIT_HARNESS FORGE_SIDECAR_IN_SANDBOX FORGE_TARGET_OWNER_URL; do
   if [[ -n "${!name:-}" ]]; then
     log "setting ${name}: set"
   else
