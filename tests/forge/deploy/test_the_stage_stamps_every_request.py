@@ -33,12 +33,20 @@ committed lines), and so does any request naming a memory or a setting of the
 project's own. A request that asks for nothing declared needs no binding and
 is served with the factory's own list, as it always was; a person running one
 by hand says ``by_hand: true`` and is served at the helper's committed HEAD.
-So for the promote's deploy step this stand-in mirrors production, and for the
-plainer legs it is deliberately stricter — a tighter net around the stamp, not
-a claim about the far side. The real helper's own refusal of an unstamped
-deploy is proven against the real route in
+
+AND THE ENVIRONMENT HALF ASKS TOO (23 September 2026, the ninth review). The
+real helper now counts a request carrying a setting name that only the
+project's own committed declaration permits as asking for that declaration —
+which is what the candidate check, the teardown and the read-only question
+send. On those legs this stand-in no longer stands in for something looser
+than production. What is left of the difference is a request whose every
+setting name is one the factory itself carries: production serves that one and
+this stand-in still refuses it, deliberately — a tighter net around the stamp,
+not a claim about the far side. The real helper's own refusals are proven
+against the real route in
 ``tests/forge/deploy_sidecar/test_the_project_widens_the_environment_door.py``
-(``test_a_deploy_with_no_build_at_all_is_refused_and_nothing_is_deployed``).
+(``test_a_deploy_with_no_build_at_all_is_refused_and_nothing_is_deployed``,
+and ``TestTheEnvironmentDoorIsBoundToo`` for the environment half).
 
 Nothing real is contacted. The stand-in helper is an HTTP server in this
 process, bound to loopback on a port the kernel picks.
@@ -102,8 +110,9 @@ class _ARecordingHelper:
 
     It is stricter than the real helper on purpose, and this file's own
     docstring says exactly where: the real helper refuses an unstamped request
-    that asks for the project's declarations to be READ (every deploy of the
-    live thing does) and serves one that asks for nothing declared. This
+    that asks for the project's declarations to be READ — every deploy of the
+    live thing does, and so does every leg naming a setting only the project
+    declares — and serves one whose every name is the factory's own. This
     stand-in refuses both, so no leg of this stage can drop the pair unnoticed.
     """
 

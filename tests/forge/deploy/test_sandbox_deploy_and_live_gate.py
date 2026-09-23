@@ -328,6 +328,10 @@ def _stage(
         target_repo=REPO_KEY,
         target_repo_root=str(clone),
         sandbox=sandbox,
+        # These drives name no build — they are by-hand runs, and since 23
+        # September 2026 the helper will not read a project's declarations for
+        # a request that says nothing about whose work it is. So they say it.
+        by_hand=True,
     )
 
 
@@ -451,6 +455,7 @@ class TestTheDeployStepRunsTheInnerScriptInTheSandbox:
                 driver_argv=DRIVER,
                 timeout_seconds=120,
                 extra_env={"API_TEST_BASE_URL": "http://localhost:8901"},
+                by_hand=True,
             ),
         )
 
@@ -574,6 +579,7 @@ class TestTheLiveGateRunsInsideTheSandbox:
             driver_argv=DRIVER,
             timeout_seconds=120,
             extra_env={"API_TEST_BASE_URL": "http://localhost:8901"},
+            by_hand=True,
         ).with_repo_path(tree).with_extra_env(
             {"API_TEST_BASE_URL": "http://localhost:8902"}
         )
@@ -738,6 +744,7 @@ class TestTheDeployIsSentTheEnvironmentItsVenueCanUse:
                 driver_argv=DRIVER,
                 timeout_seconds=120,
                 extra_env={"API_TEST_BASE_URL": "http://localhost:8901"},
+                by_hand=True,
             ),
         )
 
@@ -826,7 +833,10 @@ class TestTheHostWrapperIsStillServed:
     )
 
     def _client(self, sidecar: Any) -> SidecarScriptRunner:
-        return SidecarScriptRunner(base_url=sidecar.url, repo=REPO_KEY)
+        # A by-hand drive: it names no build, and says so.
+        return SidecarScriptRunner(
+            base_url=sidecar.url, repo=REPO_KEY, by_hand=True
+        )
 
     def test_the_settings_the_wrapper_reads_are_accepted(
         self, clone: Path, sidecar: Any, marker_dir: Path

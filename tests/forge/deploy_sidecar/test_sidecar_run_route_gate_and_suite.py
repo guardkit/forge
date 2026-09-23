@@ -247,6 +247,9 @@ class TestTheLiveGateDriverMustBeTheDeclaredOne:
                 "driver": ["python3", "qa/gates/local_live_gate.py"],
                 "args": ["--feature", "FEAT-X", "--target", "apitest"],
                 "env": {"API_TEST_BASE_URL": "http://localhost:8902"},
+                # A setting name only this project's own declaration
+                # permits, so this request says whose run it is.
+                "by_hand": True,
             },
             config=config,
             command_runner=runner,
@@ -296,6 +299,7 @@ class TestTheLiveGateDriverMustBeTheDeclaredOne:
                 "repo": REPO,
                 "driver": ["python3", "qa/gates/local_live_gate.py"],
                 "env": {"AWS_SECRET_ACCESS_KEY": "x"},
+                "by_hand": True,
             },
             config=config,
             command_runner=runner,

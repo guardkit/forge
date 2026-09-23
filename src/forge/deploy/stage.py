@@ -548,6 +548,7 @@ class DeployStageRunner:
         sandbox: Any | None = None,
         build_id: str | None = None,
         start_commit: str | None = None,
+        by_hand: bool = False,
     ) -> None:
         self._repo = repository
         self._runbook_publisher = runbook_publisher
@@ -582,6 +583,13 @@ class DeployStageRunner:
         # so the far side never has to take a commit on a request's own word.
         self._build_id = str(build_id or "").strip() or None
         self._start_commit = str(start_commit or "").strip() or None
+        # AND AN ATTENDED RUN SAYS IT IS ONE (23 September 2026). With no
+        # build to stamp, the far side refuses a request that asks the project
+        # to widen its environment door unless the request claims the run is
+        # by hand. Only a caller that knows a person asked for this sets it;
+        # it is never derived from "there is no build here", because that
+        # would turn a dropped stamp into a claim.
+        self._by_hand = bool(by_hand)
 
     def _resolve_script_runner(self) -> ScriptRunner | None:
         """The docker-touching-step execution seam for this stage.
@@ -616,6 +624,7 @@ class DeployStageRunner:
             repo=self._target_repo,
             build=self._build_id,
             start_commit=self._start_commit,
+            by_hand=self._by_hand,
         )
 
     def _runs_inside_the_sandbox(self) -> bool:

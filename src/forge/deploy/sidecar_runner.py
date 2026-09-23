@@ -64,6 +64,7 @@ class SidecarScriptRunner:
         repo: str,
         build: str | None = None,
         start_commit: str | None = None,
+        by_hand: bool = False,
         http_timeout_margin: float = 30.0,
     ):
         self._base_url = base_url.rstrip("/")
@@ -84,8 +85,20 @@ class SidecarScriptRunner:
         # commit with no build behind it is exactly the authority a request
         # may not establish for itself, and forwarding one would only earn a
         # refusal further on.
+        #
+        # AND A BY-HAND RUNNER SAYS SO OUT LOUD (23 September 2026, the ninth
+        # review). "No build" stopped being the quiet default at the far side:
+        # a request that asks the project to widen its environment door and
+        # says nothing about whose work it is looks exactly like a factory
+        # request whose stamp was dropped, and is refused. So an attended run
+        # makes its runner with ``by_hand=True`` and the claim travels on the
+        # request. It is NEVER derived from "this runner has no build": that
+        # would turn a dropped stamp back into a claim, which is the whole
+        # thing being guarded against. Only a caller that knows a person asked
+        # for this sets it.
         self._build = str(build or "").strip() or None
         self._start_commit = str(start_commit or "").strip() or None
+        self._by_hand = bool(by_hand)
         # The HTTP read wall is the script timeout plus a margin, so the socket
         # does not trip before the sidecar's own subprocess timeout fires.
         self._http_timeout_margin = http_timeout_margin
@@ -132,6 +145,8 @@ class SidecarScriptRunner:
             body["build"] = self._build
         if self._start_commit:
             body["declared_at"] = self._start_commit
+        elif self._by_hand and not self._build:
+            body["by_hand"] = True
         # THE OWNERSHIP OF A DEPLOY OF THE LIVE THING. Present only on the leg
         # that changes the live target; its presence is what sends the request
         # through the far side's EXECUTOR rather than straight to a runner.
