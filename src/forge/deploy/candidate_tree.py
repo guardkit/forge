@@ -86,6 +86,7 @@ __all__ = [
     "fetch_remote_start_point",
     "git_is_ancestor",
     "read_file_at_commit",
+    "read_file_at_commit_sync",
     "git_rev_parse",
     "is_candidate_tree_path",
     "materialise_candidate_tree",
@@ -470,10 +471,18 @@ class FileAtCommit:
         return cls(content=content, found=True)
 
 
-def _read_file_at_commit_sync(
+def read_file_at_commit_sync(
     repo_root: Path, commit: str, file_path: str
 ) -> FileAtCommit:
-    """The three steps, in order: is the commit here, is the file, read it."""
+    """The three steps, in order: is the commit here, is the file, read it.
+
+    The same read as :func:`read_file_at_commit`, for a caller that has no
+    event loop to await in. ONE reader serves both venues on purpose: the
+    helper that launches a project's own commands and the coordinator that
+    composes what it sends read a project's declarations through this one
+    function, so they cannot come to disagree about what the project said at
+    a commit.
+    """
     where = str(repo_root)
     try:
         present = _run_git(
@@ -553,7 +562,7 @@ async def read_file_at_commit(
     refusal; "the commit is not in this copy" is a refusal.
     """
     return await asyncio.to_thread(
-        _read_file_at_commit_sync, Path(repo_root), str(commit), str(file_path)
+        read_file_at_commit_sync, Path(repo_root), str(commit), str(file_path)
     )
 
 

@@ -787,3 +787,190 @@ class TestACommitThisCopyDoesNotCarry:
         assert never_here in body["error"]
         assert "says something this factory cannot use" not in body["error"]
         assert "exit_code" not in body
+
+
+class _AnExecutorThatRecords:
+    """A stand-in for the one thing that runs a deploy of the live thing.
+
+    It never starts anything: it records the request it was handed and says
+    yes. What matters here is whether the request reached it at all, and with
+    which setting names on it.
+    """
+
+    def __init__(self) -> None:
+        self.handed: list[Any] = []
+
+    def run(self, request: Any) -> Any:
+        from types import SimpleNamespace
+
+        self.handed.append(request)
+        return SimpleNamespace(
+            accepted=True,
+            word="the-deploy-ran",
+            sentence="the deploy step ran and ended with 0.",
+            marker=None,
+            exit_code=0,
+            output="",
+        )
+
+
+def _ask_to_deploy(
+    project: Path, body: dict[str, Any]
+) -> tuple[int, dict[str, Any], _AnExecutorThatRecords]:
+    """POST a request that OWNS a deployment target, through the real route."""
+    executor = _AnExecutorThatRecords()
+    server = build_server(
+        port=0, config_loader=lambda: _config(project), deploy_executor=executor
+    )
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    host, port = server.server_address[:2]
+    try:
+        status, answer = _run(
+            f"http://{host}:{port}",
+            {
+                "repo": REPO,
+                "script": THE_SCRIPT,
+                "timeout_seconds": 30,
+                **body,
+            },
+        )
+        return status, answer, executor
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+class TestTheDeployBlocksNamesAreCommittedLinesToo:
+    """The LAST uncommitted reading in this door (28 September 2026).
+
+    The env-key half of the door had been moved onto the profile read at the
+    bound commit. The DEPLOY BLOCK's own two names — the setting the identity
+    is handed over in, and the setting the artifact that was checked is handed
+    back in — were still checked against the profile loaded off the WORKING
+    COPY. Driven: an uncommitted ``identity: setting:`` line in the checkout
+    passed this door, and the name the project really declares at the bound
+    commit was refused. Both halves read the same committed file now.
+    """
+
+    COMMITTED = {"setting": "WIDGET_SHOP_IDENTITY", "artifact": "WIDGET_SHOP_ARTIFACT"}
+    ONLY_ON_DISK = {"setting": "WORKTREE_ONLY_IDENTITY", "artifact": "WORKTREE_ONLY_ARTIFACT"}
+
+    def _a_project_that_declares_one_and_has_another_on_disk(
+        self, tmp_path: Path
+    ) -> tuple[Path, str]:
+        project = _a_project(
+            tmp_path / "widget-shop",
+            identity={
+                "setting": self.COMMITTED["setting"],
+                "artifact_setting": self.COMMITTED["artifact"],
+            },
+        )
+        head = _git(project, "rev-parse", "HEAD")
+        profile = yaml.safe_load(
+            (project / "deploy" / "profile.yaml").read_text(encoding="utf-8")
+        )
+        profile["identity"] = {
+            "setting": self.ONLY_ON_DISK["setting"],
+            "artifact_setting": self.ONLY_ON_DISK["artifact"],
+        }
+        (project / "deploy" / "profile.yaml").write_text(
+            yaml.safe_dump(profile), encoding="utf-8"
+        )
+        return project, head
+
+    @staticmethod
+    def _owning(setting: str, artifact_setting: str, commit: str) -> dict[str, Any]:
+        return {
+            "build": THE_BUILD,
+            "declared_at": commit,
+            "deploy": {
+                "target": "widgetshop-live",
+                "target_counter": 1,
+                "build": THE_BUILD,
+                "identity": "j-abc123@def456",
+                "identity_setting": setting,
+                "artifact": "the-thing-that-was-checked",
+                "artifact_setting": artifact_setting,
+            },
+        }
+
+    def test_a_name_only_in_the_working_tree_is_refused_and_nothing_is_handed_over(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        project, head = self._a_project_that_declares_one_and_has_another_on_disk(
+            tmp_path
+        )
+        with _a_coordinator_that_recorded({THE_BUILD: head}, monkeypatch):
+            status, body, executor = _ask_to_deploy(
+                project,
+                self._owning(
+                    self.ONLY_ON_DISK["setting"],
+                    self.ONLY_ON_DISK["artifact"],
+                    head,
+                ),
+            )
+        assert status == 400, body
+        assert self.ONLY_ON_DISK["setting"] in body["error"]
+        assert "does not declare that name" in body["error"]
+        # And the names it DOES declare are the committed ones, said plainly.
+        assert self.COMMITTED["setting"] in body["error"]
+        assert executor.handed == [], "nothing may reach the executor"
+
+    def test_the_name_committed_at_the_bound_commit_is_admitted(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        project, head = self._a_project_that_declares_one_and_has_another_on_disk(
+            tmp_path
+        )
+        with _a_coordinator_that_recorded({THE_BUILD: head}, monkeypatch):
+            status, body, executor = _ask_to_deploy(
+                project,
+                self._owning(
+                    self.COMMITTED["setting"], self.COMMITTED["artifact"], head
+                ),
+            )
+        assert status == 200, body
+        assert body["accepted"] is True
+        assert len(executor.handed) == 1
+        handed = executor.handed[0]
+        assert handed.identity_setting == self.COMMITTED["setting"]
+        assert handed.artifact_setting == self.COMMITTED["artifact"]
+
+    def test_bound_to_an_older_commit_the_same_committed_name_is_refused(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The binding is to ONE commit, not to "somewhere in the history"."""
+        project = _a_project(tmp_path / "widget-shop")
+        older = _git(project, "rev-parse", "HEAD")
+        profile = yaml.safe_load(
+            (project / "deploy" / "profile.yaml").read_text(encoding="utf-8")
+        )
+        profile["identity"] = {
+            "setting": self.COMMITTED["setting"],
+            "artifact_setting": self.COMMITTED["artifact"],
+        }
+        (project / "deploy" / "profile.yaml").write_text(
+            yaml.safe_dump(profile), encoding="utf-8"
+        )
+        head = _commit_everything(project, "the project declares an identity")
+
+        with _a_coordinator_that_recorded({THE_BUILD: head}, monkeypatch):
+            status, body, executor = _ask_to_deploy(
+                project,
+                self._owning(
+                    self.COMMITTED["setting"], self.COMMITTED["artifact"], head
+                ),
+            )
+        assert status == 200, body
+        assert len(executor.handed) == 1
+
+        with _a_coordinator_that_recorded({THE_BUILD: older}, monkeypatch):
+            status, refused, executor = _ask_to_deploy(
+                project,
+                self._owning(
+                    self.COMMITTED["setting"], self.COMMITTED["artifact"], older
+                ),
+            )
+        assert status == 400, refused
+        assert "does not declare that name" in refused["error"]
+        assert executor.handed == []

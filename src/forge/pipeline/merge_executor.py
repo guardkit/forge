@@ -1057,6 +1057,50 @@ def _report_sha(report: dict[str, Any] | None) -> str | None:
     return None
 
 
+#: The project's own deploy declaration file, by the one name this factory
+#: reads it under. A path, not a layout: what is inside it is the project's.
+DEPLOY_PROFILE_PATH: str = "deploy/profile.yaml"
+
+
+def _the_profile_at(repo_root: Path | str, commit: str | None) -> tuple[Any, str | None]:
+    """A project's deploy profile AS IT IS AT ``commit``, and why not if not.
+
+    A DECLARATION IS A COMMITTED LINE ON THIS SIDE TOO (28 September 2026, the
+    seventh review, which drove it). The helper that launches the project's own
+    commands had already been moved onto the committed file; this side — which
+    composes what that helper is sent — was still reading the working copy. So
+    an ``identity: setting:`` line written into the checkout and never
+    committed became the name this side handed over, and the name the project
+    really declares at the bound commit was the one refused. The two now read
+    the same file, at the same commit, through the same reader
+    (:func:`forge.deploy.candidate_tree.read_file_at_commit_sync`).
+
+    ``commit`` empty ⇒ the COMMITTED HEAD of the copy this coordinator has,
+    never its working tree. Returns ``(profile, None)`` or ``(None, why)``;
+    never raises — a file out of a project this factory did not write is input.
+    """
+    import yaml
+
+    from forge.deploy.candidate_tree import read_file_at_commit_sync
+    from forge.deploy.profile import parse_deploy_profile
+
+    at = str(commit or "").strip() or "HEAD"
+    try:
+        answer = read_file_at_commit_sync(Path(repo_root), at, DEPLOY_PROFILE_PATH)
+    except Exception as exc:  # noqa: BLE001 — a read, never a crash
+        return None, f"{type(exc).__name__}: {exc}"
+    if answer.refusal:
+        return None, str(answer.refusal)
+    if not answer.found or answer.content is None:
+        return None, f"there is no {DEPLOY_PROFILE_PATH} at {at}"
+    try:
+        return parse_deploy_profile(
+            yaml.safe_load(answer.content) or {}, source_ref=DEPLOY_PROFILE_PATH
+        ), None
+    except Exception as exc:  # noqa: BLE001 — a project's own file is input
+        return None, f"{DEPLOY_PROFILE_PATH} at {at} cannot be used: {exc}"
+
+
 # ---------------------------------------------------------------------------
 # The executor coroutine
 # ---------------------------------------------------------------------------
@@ -1219,6 +1263,13 @@ async def execute_merge_deploy(
     # process is a different name and is left alone until the lease runs out,
     # which is exactly the rule. Nothing about the name is a credential.
     worker_name = f"merge-press:{os.getpid()}"
+    # THE COMMIT THIS BUILD STARTS FROM, off this coordinator's own record,
+    # read once and kept (28 September 2026). It is what the project's own
+    # declarations are read at on BOTH sides of the deploy: this side composes
+    # the deploy block from the profile at this commit, and the helper is
+    # stamped with it and confirms it before it reads a line. A list of one, so
+    # a nested reader can fill it without a nonlocal.
+    _start_commit_memo: list[str | None] = []
 
     def _write_receipt(name: str, data: dict[str, Any]) -> None:
         try:
@@ -2299,6 +2350,31 @@ async def execute_merge_deploy(
             )
             return None
 
+    def _the_recorded_start_commit() -> str | None:
+        """The commit THIS COORDINATOR'S LEDGER records this build as starting
+        from, or ``None`` when it recorded none.
+
+        The same fact the helper is stamped with and asks back for, read from
+        the same row, so the two sides are bound to one commit.
+        """
+        if _start_commit_memo:
+            return _start_commit_memo[0]
+        recorded: str | None = None
+        try:
+            point = deps.pool.read_start_point(build_id)
+            if getattr(point, "recorded", False):
+                recorded = str(getattr(point, "start_commit", None) or "").strip() or None
+        except Exception as exc:  # noqa: BLE001 — an unreadable record is not a crash
+            logger.warning(
+                "merge-executor: the commit %s starts from could not be read "
+                "off the record (%s: %s)",
+                build_id,
+                type(exc).__name__,
+                exc,
+            )
+        _start_commit_memo.append(recorded)
+        return recorded
+
     def _the_target_and_how_it_wants_the_identity() -> tuple[str, Any] | None:
         """This project's deployment target, and its identity declaration.
 
@@ -2308,6 +2384,16 @@ async def execute_merge_deploy(
         after — are the project's to choose. A project whose profile cannot be
         read has no target this press can take a lock on, and the press says
         so rather than guessing one.
+
+        READ AT THE COMMIT THIS BUILD STARTS FROM (28 September 2026, the
+        seventh review). This is the only place the deploy block's setting
+        names are composed, and it was composing them off the WORKING COPY
+        while the helper checked them against the committed file — so an
+        uncommitted ``identity:`` line in the checkout became what this side
+        sent, and the project's real declaration was refused. Both sides read
+        the one committed file at the one recorded commit now. A copy with no
+        recorded commit falls back to its own committed HEAD, never its
+        working tree.
         """
         if deps.deployment_target is not None:
             try:
@@ -2321,17 +2407,16 @@ async def execute_merge_deploy(
                     exc,
                 )
                 return None
-        try:
-            from forge.deploy.profile import load_deploy_profile
-
-            profile = load_deploy_profile(repo_root / "deploy" / "profile.yaml")
-        except Exception as exc:  # noqa: BLE001 — a refusal, never a crash
+        at = _the_recorded_start_commit()
+        profile, why_not = _the_profile_at(repo_root, at)
+        if profile is None:
             logger.warning(
-                "merge-executor: %s's deploy profile could not be read (%s: "
-                "%s), so there is no deployment target to take a lock on",
+                "merge-executor: %s's %s could not be read at %s (%s), so "
+                "there is no deployment target to take a lock on",
                 repo,
-                type(exc).__name__,
-                exc,
+                DEPLOY_PROFILE_PATH,
+                at or "the committed HEAD of the copy this coordinator has",
+                why_not,
             )
             return None
         return (
