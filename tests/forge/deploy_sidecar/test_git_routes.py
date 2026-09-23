@@ -178,6 +178,12 @@ def _write(
         # named — which is exactly the door a project uses to say what its own
         # builds and checks need. Naming them here is how the test says it.
         "launch_settings": list(STAND_IN_SETTINGS),
+        # AND WHO IS ASKING (23 September 2026). A request that asks for a
+        # project's declarations to be read carries the build it is for, which
+        # the coordinator stamps on it — or it says it is being run by hand, at
+        # this copy's committed HEAD. These requests are made by hand, from a
+        # test, with no coordinator anywhere, so they say so.
+        "by_hand": True,
         **overrides,
     }
     return process_git_write_tree_request(
@@ -901,6 +907,8 @@ def test_the_normalizer_check_needs_no_guardkit_command(
             "message": MESSAGE,
             "checks": [_normalize_feature_check()],
             "launch_settings": list(STAND_IN_SETTINGS),
+            # Made by hand, from a test: no build, and it says so.
+            "by_hand": True,
         },
         config=cfg,
         command_resolver=lambda: None,
@@ -1325,6 +1333,8 @@ def test_a_refused_commit_over_loopback_is_data_not_an_http_error(
             "message": MESSAGE,
             "checks": [_normalize_check(no_model=True), _validate_check()],
             "launch_settings": list(STAND_IN_SETTINGS),
+            # Made by hand, from a test: no build, and it says so.
+            "by_hand": True,
         },
     )
     assert status == 200 and body["status"] == "failed" and body["sha"] is None

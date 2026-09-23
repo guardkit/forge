@@ -1335,12 +1335,19 @@ def _bound_commit(
     payload: Any,
     *,
     ask: Any = FROM_THIS_SERVICES_SETTINGS,
+    reads_declaration: bool = False,
 ) -> tuple[str | None, str | None, str]:
     """The commit this request's declarations are read at, or why none is.
 
     Returns ``(commit, refusal, how it was bound)``. ``commit`` ``None`` with
     no refusal means the committed HEAD of the copy of the project this
     service has — never its working tree.
+
+    ``reads_declaration`` is the caller saying "this route reads the project's
+    declared names whatever the request's own fields say" — the deploy block's
+    two setting names are read that way. A request that carries
+    ``launch_settings`` or ``memory_project`` is asking for a declaration to be
+    read by its own fields and needs no such flag.
 
     THE COMMIT IS BOUND TO THE RECORD, NOT TAKEN FROM THE REQUEST (27
     September 2026, the sixth review, Codex's requirement of the 23rd). Until
@@ -1363,12 +1370,30 @@ def _bound_commit(
     * a request that names a build and no commit is bound to whatever the
       coordinator has recorded for that build, which is the same binding
       arrived at from the other end;
-    * with no way to ask the coordinator, a request that names a commit is
-      REFUSED. That is deliberate and it is the same cost the executor's
-      ownership route already accepts: the alternative is a request letting
-      itself in, which is the hole being closed;
+    * with no way to ask the coordinator, a request that names a BUILD — with
+      or without a commit — is REFUSED. That is deliberate and it is the same
+      cost the executor's ownership route already accepts: the alternative is
+      a request letting itself in, which is the hole being closed;
     * a request that names neither — a by-hand run — reads at the committed
       HEAD of this copy, and the sentence it is answered with says so.
+
+    AND A BY-HAND RUN SAYS IT IS ONE (23 September 2026, the eighth review).
+    Until now "no build and no commit" was the SILENT default, so a factory
+    request whose coordinator stamp had been dropped was not refused: it was
+    served, quietly, at whatever the committed HEAD of this copy happened to
+    be. A dropped stamp is exactly the mistake this whole binding exists to
+    catch, so it may not be the quiet path. A request that asks for this
+    project's own declarations to be read and names neither a build nor a
+    commit is served ONLY when it says ``by_hand: true`` — an explicit claim,
+    said back in the sentence. Without it, refused in plain words.
+
+    A request that asks for NOTHING declared — no ``launch_settings``, no
+    ``memory_project``, and a route that does not read the deploy block's own
+    setting names — needs no binding at all and is untouched by this: it is
+    served with the factory's own named list and nothing else, exactly as
+    every caller written before these fields asks for. That is most of the
+    planning routes, and refusing them would be refusing work that never asked
+    a project what it declares.
 
     Never raises: a request is input, and a coordinator that cannot be reached
     is an unanswered question, never an answer.
@@ -1397,9 +1422,31 @@ def _bound_commit(
             ), ""
 
     if presented is None and not build:
-        # A BY-HAND RUN. Nothing names a build, so there is no record to bind
-        # to and nothing is claiming one. Committed HEAD, and said out loud.
-        return None, None, "by hand, at this copy's committed HEAD"
+        # NOTHING NAMES A BUILD, so there is no record to bind to. What
+        # happens next turns on whether this request asks for the project's
+        # own declarations to be read at all.
+        asks_for_a_declaration = bool(reads_declaration) or (
+            payload.get("launch_settings") is not None
+            or payload.get("memory_project") is not None
+        )
+        if not asks_for_a_declaration:
+            # It asks for nothing declared, so there is nothing to bind and
+            # nothing to claim. The factory's own named list, as ever.
+            return None, None, (
+                "nothing declared was asked for, so no commit was bound"
+            )
+        if payload.get("by_hand") is True:
+            # AN EXPLICIT CLAIM, said back in the sentence.
+            return None, None, "by hand, at this copy's committed HEAD"
+        return None, (
+            "this request asks for this project's own declarations to be "
+            "read, and it names neither the build it is for nor a commit. A "
+            "factory request always carries its build — the coordinator "
+            "stamps it — and a person running one by hand says so, by "
+            "sending 'by_hand': true, which reads at this copy's committed "
+            "HEAD. Neither was said, so nothing was read and nothing was "
+            "started."
+        ), ""
 
     if presented is not None and not build:
         return None, (
@@ -1415,13 +1462,24 @@ def _bound_commit(
     asker = coordinator_recorded_build() if ask is FROM_THIS_SERVICES_SETTINGS else ask
     if not callable(asker):
         if presented is None:
-            # A build with no commit on the request and nobody to ask: this
-            # copy's committed HEAD, which is a fact about the copy rather
-            # than anything the request said. Exactly what it did before.
-            return None, None, (
-                "at this copy's committed HEAD — the coordinator could not be "
-                "asked what this build starts from"
-            )
+            # A BUILD WITH NOBODY TO ASK IS A REFUSAL, NOT A FALL TO HEAD (23
+            # September 2026, the eighth review). This used to read at this
+            # copy's committed HEAD, so a request that named a build this
+            # helper could not confirm anything about was served anyway, at a
+            # commit nobody recorded. The executor's ownership route already
+            # accepts this cost and this takes it too: a build's declarations
+            # are read at the commit the RECORD names, or they are not read.
+            return None, (
+                f"this request says it is for build {build}, and this helper "
+                "has no way to ask the coordinator what commit that build was "
+                "recorded as starting from, so the build could not be "
+                "confirmed. It was not read at this copy's committed HEAD "
+                "instead: a build's declarations are read at the commit the "
+                "record names, and there is no record here to name one. "
+                "Nothing was read and nothing was started. (The coordinator's "
+                f"read-only answer is named by the setting "
+                f"{COORDINATOR_OWNER_ENV}.)"
+            ), ""
         return None, (
             f"this request asks for {repr(presented)} to be the commit build "
             f"{build} has its declarations read at, and this helper has no way "
@@ -1496,6 +1554,7 @@ def _launch_fields(
     repo_path: Path,
     repo: str | None = None,
     ask: Any = FROM_THIS_SERVICES_SETTINGS,
+    reads_declaration: bool = False,
 ) -> tuple[str | None, tuple[str, ...], str | None, str | None]:
     """``(memory name, declared setting names, refusal, the bound commit)``.
 
@@ -1535,10 +1594,19 @@ def _launch_fields(
     request. The fourth answer is that commit, so the OTHER half of the same
     door, :func:`allowed_env_keys`, reads the project's profile at exactly the
     same place rather than off the working copy.
+
+    AND A REQUEST THAT ASKS FOR ONE SAYS WHOSE IT IS (23 September 2026, the
+    eighth review). ``reads_declaration`` is passed by a route that reads the
+    project's declared names whatever fields the request carries — the deploy
+    block's two setting names — so such a request is bound like one carrying
+    ``launch_settings``. A request that asks for nothing declared is bound to
+    nothing and served as it always was.
     """
     if not isinstance(payload, dict):
         return None, (), None, None
-    declared_at, bind_refusal, how = _bound_commit(payload, ask=ask)
+    declared_at, bind_refusal, how = _bound_commit(
+        payload, ask=ask, reads_declaration=reads_declaration
+    )
     if bind_refusal is not None:
         return None, (), bind_refusal, None
     raw_name = payload.get("memory_project")
@@ -2014,8 +2082,18 @@ def process_run_request(
     # THE REQUEST PRESENTS IS CHECKED AGAINST THE PROJECT'S OWN DECLARATION
     # (23 September 2026): the request carries the coordinator's reading of
     # it, and this service confirms it against the copy of the project it has.
+    #
+    # AND A DEPLOY OF THE LIVE THING ASKS FOR A DECLARATION EVEN WHEN IT NAMES
+    # NO SETTING OF ITS OWN (23 September 2026, the eighth review): the deploy
+    # block's two setting names are read off the same committed declaration
+    # below. So such a request is bound the same way one carrying
+    # ``launch_settings`` is — it carries its build, or it says it is being
+    # run by hand.
     launch_memory, launch_names, launch_error, bound_at = _launch_fields(
-        payload, repo_path=repo_path, repo=repo
+        payload,
+        repo_path=repo_path,
+        repo=repo,
+        reads_declaration=payload.get("deploy") is not None,
     )
     if launch_error is not None:
         return 400, {"error": launch_error}

@@ -693,6 +693,7 @@ class SidecarLiveGateInvoker:
         launch_settings: Sequence[str] | None = None,
         build: str | None = None,
         start_commit: str | None = None,
+        by_hand: bool = False,
     ) -> None:
         self._base_url = str(base_url).rstrip("/")
         self._repo = repo
@@ -707,11 +708,17 @@ class SidecarLiveGateInvoker:
         # September 2026): the build, and the commit the coordinator's own
         # ledger records it as starting from. This gate goes to the same
         # helper route as the deploy steps do and through the same environment
-        # door, so it is bound the same way. Both absent = a by-hand run, and
-        # the far side reads the project's declarations at the committed HEAD
-        # of the copy it has.
+        # door, so it is bound the same way.
+        #
+        # AND A RUN WITH NO BUILD SAYS SO OUT LOUD (23 September 2026). Both
+        # absent used to mean "read at the committed HEAD of the copy the
+        # helper has", silently — which is also what a factory request whose
+        # stamp had been dropped looked like. The helper refuses that shape
+        # now unless the request claims it: ``by_hand`` is that claim, and
+        # only somebody running this gate by hand should set it.
         self._build = str(build or "").strip() or None
         self._start_commit = str(start_commit or "").strip() or None
+        self._by_hand = bool(by_hand)
 
     @property
     def repo_path(self) -> Path:
@@ -741,6 +748,7 @@ class SidecarLiveGateInvoker:
             "launch_settings": self._launch_settings,
             "build": self._build,
             "start_commit": self._start_commit,
+            "by_hand": self._by_hand,
         }
         fields.update(changes)
         return SidecarLiveGateInvoker(**fields)
@@ -787,6 +795,11 @@ class SidecarLiveGateInvoker:
             body["build"] = self._build
         if self._start_commit:
             body["declared_at"] = self._start_commit
+        elif self._by_hand and not self._build:
+            # No build to name, and this caller says it is running the gate by
+            # hand. The helper serves such a request at the committed HEAD of
+            # the copy it has, and refuses one that says nothing at all.
+            body["by_hand"] = True
 
         def _instrument(error: str) -> LiveGateInvocation:
             return LiveGateInvocation(

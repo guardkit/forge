@@ -263,6 +263,10 @@ class TestTheLiveCheckRoute:
             timeout_seconds=60,
             memory_project=MEMORY_NAME,
             launch_settings=[DECLARED_SETTING],
+            # A request that asks for this project's declarations to be read
+            # says whose work it is. These are driven by hand from a test,
+            # with no build and no coordinator, so they say exactly that.
+            by_hand=True,
         )
 
         outcome = invoker.invoke(feature=FEATURE_ID, target="candidate")
@@ -284,6 +288,10 @@ class TestTheLiveCheckRoute:
             timeout_seconds=60,
             memory_project=MEMORY_NAME,
             launch_settings=[DECLARED_SETTING],
+            # A request that asks for this project's declarations to be read
+            # says whose work it is. These are driven by hand from a test,
+            # with no build and no coordinator, so they say exactly that.
+            by_hand=True,
         )
 
         invoker.invoke(feature=FEATURE_ID, target="candidate")
@@ -359,6 +367,9 @@ class TestTheDeclaredTestRoute:
             repo,
             memory_project=MEMORY_NAME,
             launch_settings=[DECLARED_SETTING],
+            # Said out loud, the same way: by hand, no build, at the copy's
+            # committed HEAD.
+            by_hand=True,
         )
         assert exit_code == 0, detail
 
@@ -375,6 +386,9 @@ class TestTheDeclaredTestRoute:
             repo,
             memory_project=MEMORY_NAME,
             launch_settings=[DECLARED_SETTING],
+            # Said out loud, the same way: by hand, no build, at the copy's
+            # committed HEAD.
+            by_hand=True,
         )
         assert exit_code == 0, detail
 

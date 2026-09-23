@@ -363,6 +363,18 @@ def build_sidecar_guardkit_run(
             body["memory_project"] = str(memory_project)
         if launch_settings:
             body["launch_settings"] = [str(name) for name in launch_settings]
+        if body.get("memory_project") or body.get("launch_settings"):
+            # AND THIS DOOR CITES NO BUILD RECORD, AND SAYS SO (23 September
+            # 2026, the eighth review). The helper refuses a request that asks
+            # for a project's declarations to be read and names neither a
+            # build nor a commit, because that is what a dropped coordinator
+            # stamp looks like. This door has never carried the build id onto
+            # the wire, so it claims what it is really asking for: read them
+            # at the committed HEAD of the copy you have. CARRY IT FORWARD:
+            # the merge word does know which build it is for, and stamping
+            # this request with it would bind these names to the recorded
+            # commit the way the deploy stage's requests are bound.
+            body["by_hand"] = True
         # THE BRANCH TRAVELS AS ITS OWN FIELD. The sidecar builds the command
         # on the far side, so a --branch left in this list would be dropped
         # and a fix journey's repair would be merged from a branch nobody
@@ -636,6 +648,12 @@ def build_sidecar_leg_run(
             body["memory_project"] = str(memory_project)
         if launch_settings:
             body["launch_settings"] = [str(name) for name in launch_settings]
+        if body.get("memory_project") or body.get("launch_settings"):
+            # AND THIS DOOR CITES NO BUILD RECORD, AND SAYS SO — the same
+            # sentence as the merge door above, for the same reason, with the
+            # same thing to carry forward: the fix journey's legs do know
+            # which build they belong to.
+            body["by_hand"] = True
         http_timeout = float(timeout_seconds) + http_timeout_margin
         try:
             status, parsed = await asyncio.to_thread(
