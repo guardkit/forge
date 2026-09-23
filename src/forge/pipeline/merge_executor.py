@@ -4972,11 +4972,14 @@ def build_in_daemon_deploy_dispatcher(
             # WHICH BUILD THIS IS, AND WHERE ITS DECLARATIONS WERE SAID: the
             # recorded commit this build starts from, both read off THIS
             # coordinator's own ledger just above. They are stamped onto every
-            # request the helper is sent for this build, in one place, so the
-            # helper reads the project's own two files THERE rather than off
-            # the working copy it runs out of — and can ask this coordinator
-            # whether that commit really is the one recorded for this build
-            # before it reads a line of them.
+            # request THE DEPLOY STAGE sends the helper for this build, in one
+            # place, so the helper reads the project's own two files THERE
+            # rather than off the working copy it runs out of — and can ask
+            # this coordinator whether that commit really is the one recorded
+            # for this build before it reads a line of them. The merge word's
+            # own command and the fix journey's legs go through a different
+            # door and carry neither; see the note beside these two parameters
+            # in forge.deploy.composition.
             build_id=build_id,
             declared_at=build_started_at,
             # WHAT THE CHECK IS HANDED so it can pin what it checked, and the
