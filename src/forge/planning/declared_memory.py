@@ -359,11 +359,13 @@ class DeclaredLaunchSettings:
         return self.refusal is None
 
 
-def _launch_refusal(repo: str, commit: str, what: str) -> DeclaredLaunchSettings:
+def _launch_refusal(
+    repo: str, commit: str, what: str, *, at: str | None = None
+) -> DeclaredLaunchSettings:
     return DeclaredLaunchSettings(
         refusal=(
             f"the settings {repo} declares its builds need, in "
-            f"{DECLARATION_PATH} at {_at(commit)}, cannot be used: {what}. A "
+            f"{DECLARATION_PATH} at {at or _at(commit)}, cannot be used: {what}. A "
             f"project names the settings its own builds need, and nothing "
             f"else: names only, never values, never a name this factory keeps "
             f"for itself. Correct these two lines in {DECLARATION_PATH}, "
@@ -380,6 +382,7 @@ def read_declared_launch_settings(
     content: str | None,
     found: bool,
     unreadable_because: str | None = None,
+    at: str | None = None,
 ) -> DeclaredLaunchSettings:
     """Turn one settings file, as it is at one commit, into the names.
 
@@ -393,10 +396,17 @@ def read_declared_launch_settings(
     because a build launched without a setting its own project said it needs
     fails somewhere further on, in a sentence about something else.
 
+    ``at`` is the caller's own plain words for WHERE the file was read, for a
+    caller whose answer is not "the commit this work starts from" — the helper
+    service falls back to a project copy's committed HEAD, and a refusal that
+    called that "the commit this work starts from (the committed HEAD of …)"
+    was a sentence inside a sentence. With nothing given the wording is
+    unchanged.
+
     Never raises.
     """
     if unreadable_because:
-        return _launch_refusal(repo, commit, unreadable_because)
+        return _launch_refusal(repo, commit, unreadable_because, at=at)
     if not found or content is None:
         # No file, or nothing came back: the project has not said. The memory
         # question already refuses a project with no declaration at all, so
@@ -408,7 +418,7 @@ def read_declared_launch_settings(
         # ITS OWN SENTENCE. This used to hand on the memory reader's, which
         # said the work's memory could not be told — a true sentence about a
         # question nobody had asked here.
-        return _launch_refusal(repo, commit, why_not)
+        return _launch_refusal(repo, commit, why_not, at=at)
     assert data is not None
     if LAUNCH_KEY not in data:
         return DeclaredLaunchSettings()
@@ -425,6 +435,7 @@ def read_declared_launch_settings(
             repo,
             commit,
             f"it is not a list of names (it reads as {type(raw).__name__})",
+            at=at,
         )
     if len(raw) > MAX_DECLARED_SETTINGS:
         return _launch_refusal(
@@ -432,12 +443,13 @@ def read_declared_launch_settings(
             commit,
             f"it names {len(raw)} settings and this factory passes at most "
             f"{MAX_DECLARED_SETTINGS}",
+            at=at,
         )
     names: list[str] = []
     for entry in raw:
         refusal = declared_setting_refusal(entry)
         if refusal is not None:
-            return _launch_refusal(repo, commit, refusal)
+            return _launch_refusal(repo, commit, refusal, at=at)
         name = str(entry).strip()
         if name not in names:
             names.append(name)

@@ -920,6 +920,30 @@ def _not_declared_by_the_project(
 #: The project's own two declaration files, in the order they are read.
 PROFILE_PATH: str = "deploy/profile.yaml"
 
+#: What is said, in place of a commit, about a copy of a project that has no
+#: commits in it at all. A declaration is a committed line, so such a copy
+#: declares nothing — and the honest sentence names the copy rather than
+#: telling a person to commit two lines to a history that is not there.
+_NO_COMMITTED_HISTORY: str = (
+    "the copy of this project at {path}, which carries no committed history "
+    "at all"
+)
+
+
+def _has_committed_history(repo_path: Path) -> bool:
+    """True when this copy of a project has at least one commit in it.
+
+    Asked only when a read at a commit has already failed, to tell "this copy
+    has no history" from every other reason a read could not be made. Never
+    raises: an unanswerable question is False, and the caller says so plainly.
+    """
+    from forge.deploy.candidate_tree import git_rev_parse
+
+    try:
+        return bool(_run_coroutine(git_rev_parse(repo_path, "HEAD")))
+    except Exception:  # noqa: BLE001 — a probe never crashes the door
+        return False
+
 
 def _the_project_at(repo_path: Path, commit: str, file_path: str) -> tuple[
     str | None, bool, str | None
@@ -961,8 +985,15 @@ def project_declared_settings(
       request. Both files are read there and nowhere else;
     * with no commit on the request, the fallback is the COMMITTED HEAD of the
       copy of the project this service has (``git show HEAD:…``) — never the
-      working tree. A project that is not a git copy at all declares nothing,
-      which is said rather than guessed around.
+      working tree.
+
+    A COPY WITH NO COMMITS IN IT DECLARES NOTHING, and says exactly that (23
+    September 2026, after the review of the change that brought the rule in). There is no committed line to read in such a copy, so no
+    name comes out of either file and every request naming one is refused with
+    nothing started. That is the rule working, not a fault, but the sentence a
+    person was shown for it was the general one — "correct these two lines and
+    commit them" — about a history that is not there. The refusal now names the
+    copy and its missing history instead.
 
     The third element of the answer says which of the two was used, in plain
     words, so the sentence a person reads names it.
@@ -1022,9 +1053,33 @@ def project_declared_settings(
     content, found, unreadable_because = _the_project_at(
         repo_path, read_at, DECLARATION_PATH
     )
+    if unreadable_because is not None and not _has_committed_history(repo_path):
+        # THE NO-HISTORY CASE, SAID IN ITS OWN WORDS (23 September 2026, after
+        # the review of the change that brought the rule in). A copy of a project with no commits in it cannot have
+        # a committed line in it either, so it declares nothing — but the
+        # sentence a person got was the general one, which told them to commit
+        # two lines to a copy that has nowhere to commit them to. This is a
+        # fact about the copy, not about what the project wrote, and it is now
+        # said that way in the refusal a request is answered with.
+        where = _NO_COMMITTED_HISTORY.format(path=repo_path)
+        note = (
+            f"a declaration is a committed line and this copy has none, so no "
+            f"name was taken from its own {DECLARATION_PATH} or its "
+            f"{PROFILE_PATH}"
+        )
+        logger.warning(
+            "deploy-sidecar: no setting names were taken from %s or %s — %s, "
+            "so it declares nothing until its declaration is committed",
+            DECLARATION_PATH,
+            PROFILE_PATH,
+            where,
+        )
+        return (), note, where
+
     answer = read_declared_launch_settings(
         repo=str(repo_path),
-        commit=where,
+        commit=read_at,
+        at=where,
         content=content,
         found=found,
         unreadable_because=unreadable_because,
