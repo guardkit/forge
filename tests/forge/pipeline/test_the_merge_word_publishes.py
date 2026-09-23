@@ -1614,3 +1614,108 @@ class TestAFailedObservationIsNeverAFreeTarget:
 
         assert outcome.result == "merged-into-the-remote-and-running", outcome.detail
         assert _record(pool).result == RESULT_MERGED_AND_RUNNING
+
+
+# ---------------------------------------------------------------------------
+# WHICH COPY OF THE PROJECT'S DECLARATION THIS SIDE COMPOSES FROM
+# ---------------------------------------------------------------------------
+
+
+#: The project's deploy declaration as it is COMMITTED at the commit this work
+#: starts from.
+_COMMITTED_PROFILE = """\
+env_id: live
+compose:
+  file: compose.yaml
+  script: deploy/deploy.sh
+identity:
+  setting: COMMITTED_IDENTITY
+  artifact_setting: COMMITTED_ARTIFACT
+  asked_with: COMMITTED_ASK
+"""
+
+#: ...and a line NOBODY COMMITTED, written into the very checkout this press
+#: runs out of. A build can write one; it must not become what this side sends.
+_WORKTREE_ONLY_PROFILE = """\
+env_id: live
+compose:
+  file: compose.yaml
+  script: deploy/deploy.sh
+identity:
+  setting: WORKTREE_ONLY_IDENTITY
+  artifact_setting: WORKTREE_ONLY_ARTIFACT
+  asked_with: WORKTREE_ONLY_ASK
+"""
+
+
+def _the_project_declares(repo_root: Path, text: str) -> str:  # noqa: F811
+    """Commit ``text`` as the project's deploy profile; answer that commit."""
+    (repo_root / "deploy").mkdir(parents=True, exist_ok=True)
+    (repo_root / "deploy" / "profile.yaml").write_text(text, encoding="utf-8")
+    _git(repo_root, "add", "deploy/profile.yaml")
+    _git(repo_root, "commit", "-q", "-m", "the project's deploy declaration")
+    return _git(repo_root, "rev-parse", "HEAD")
+
+
+class TestTheDeployBlockIsComposedFromTheCommittedDeclaration:
+    """A DECLARATION IS A COMMITTED LINE ON THIS SIDE TOO (28 September 2026).
+
+    The helper that launches the project's own commands had already been moved
+    onto the committed file. This side — which composes what that helper is
+    sent — was still reading the working copy, so the two halves of one door
+    disagreed about what the project said: an uncommitted ``identity:
+    setting:`` line became the name this side handed over and passed, and the
+    name the project really declares at the bound commit was refused.
+    """
+
+    @pytest.mark.asyncio
+    async def test_an_uncommitted_identity_line_is_not_what_this_side_sends(
+        self,
+        config_with_publication_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> None:
+        from forge.pipeline.deployment_lock import DeploymentLockStore
+
+        started_at = _the_project_declares(repo_root, _COMMITTED_PROFILE)
+        # The working copy now says something else, and nobody committed it.
+        (repo_root / "deploy" / "profile.yaml").write_text(
+            _WORKTREE_ONLY_PROFILE, encoding="utf-8"
+        )
+        _ensure_build(
+            pool,
+            build_id=BUILD_ID,
+            feature_id=FEATURE_ID,
+            start_commit=started_at,
+        )
+
+        publisher = _APublisherThatSays([_published("c" * 40)])
+        deploy = _ADeployStepThatSays()
+        deps = MergeExecutorDeps(
+            config=config_with_publication_on,
+            pool=pool,
+            pipeline_publisher=_FakePublisher(),
+            guardkit_run=_JoinsForReal(),
+            deploy_dispatcher=deploy,
+            publisher=publisher,
+            what_the_machine_says=EVERY_WALL_STANDS,
+            deployment_lock=lambda: DeploymentLockStore(pool.connection),
+            # NO stand-in for the project's target: this is the real reader,
+            # which is the thing under test.
+        )
+
+        outcome = await _press(deps, repo_root)
+
+        assert outcome.result == "merged-into-the-remote-and-running", outcome.detail
+        owns = deploy.ownership[-1]
+        # The names the project DECLARED, at the commit this work starts from.
+        assert owns["identity_setting"] == "COMMITTED_IDENTITY"
+        assert owns["artifact_setting"] == "COMMITTED_ARTIFACT"
+        # ...and the environment this project's own deployment target is named
+        # after came out of the same committed file.
+        assert owns["target"] == f"{REPO}::live"
+        # The check was handed the identity under the committed name too.
+        assert list(deploy.handed_to_the_check[-1]) == ["COMMITTED_IDENTITY"]
+        # Nowhere does the uncommitted name appear, on any leg.
+        said = json.dumps(deploy.calls, default=str)
+        assert "WORKTREE_ONLY" not in said

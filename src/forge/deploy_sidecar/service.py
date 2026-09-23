@@ -2024,6 +2024,17 @@ def process_run_request(
     # same bound commit (27 September 2026). Read once here, so both shapes
     # below — the live-gate driver and the vetted script — are widened by the
     # same committed declaration rather than by whatever is on the disk.
+    #
+    # ONE READER FOR EVERY SETTING NAME THIS ROUTE CONSULTS (28 September
+    # 2026). This is that reader: the env-key allowlist below and the deploy
+    # block's own two setting names are both taken from this one answer, so
+    # they cannot come to disagree about what the project declared. What it
+    # does NOT decide is which of the project's own programs runs — the
+    # script allowlist, the working directory and the live-gate driver are
+    # read off the profile on disk, because the program's own contents come
+    # off that same working copy and reading its NAME out of history would not
+    # make the program committed. That is a different question from "what may
+    # a request name", which is the one this reader answers.
     committed_profile, _ = profile_at_commit(repo_path, bound_at)
 
     # SANDBOX FIRST (rule 88) — the merge-ready gates reader's declared test
@@ -2149,7 +2160,21 @@ def process_run_request(
         # door was closed and the deploy block was not: a name refused as an
         # env key was accepted here, and went into the environment of the one
         # command that deploys the live thing.
-        declaration = declared_identity(profile)
+        #
+        # AND FROM THE SAME COPY OF IT: THE COMMITTED ONE (28 September 2026,
+        # the seventh review, which drove it). "The same declaration" was true
+        # of the FILE and not of the COPY — the env door had been moved onto
+        # the profile read at the bound commit and this line was left reading
+        # the working copy, so the two halves disagreed about what the project
+        # said. An ``identity: setting:`` line written into the checkout and
+        # never committed passed here, and the name the project really
+        # declares at the bound commit was refused. One reader now serves both
+        # halves: ``committed_profile``, read once above at the commit the
+        # coordinator recorded this build as starting from. A profile that
+        # cannot be read there declares nothing of its own, so the names left
+        # are the factory's own two defaults, which is the safe side and what
+        # a project that has never written an ``identity:`` block always got.
+        declaration = declared_identity(committed_profile)
         built = deploy_request_from(
             payload.get("deploy"),
             permitted_settings=(
