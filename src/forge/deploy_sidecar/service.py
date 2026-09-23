@@ -197,6 +197,10 @@ from forge.deploy.profile import (
     load_deploy_profile,
     wrapper_inner_script,
 )
+from forge.deploy_sidecar.deploy_executor import (
+    DeployExecutor,
+    request_from as deploy_request_from,
+)
 from forge.executor.shell_steps import _run_script_step
 from forge.launch_environment import build_launch_env, declared_setting_refusal
 from forge.memory.redaction import scrub_process_output
@@ -547,6 +551,28 @@ def sidecar_is_inside_sandbox(env: "dict[str, str] | None" = None) -> bool:
     """
     source = os.environ if env is None else env
     return str(source.get(SIDECAR_IN_SANDBOX_ENV, "")).strip().lower() in _TRUTHY
+
+
+#: The setting that says where the executor's own notes live. They have to
+#: outlive the service, because a note is what stops a restarted helper coming
+#: back with an empty slot while an old deploy command is still running.
+DEPLOY_NOTES_ENV: str = "FORGE_DEPLOY_NOTES_DIR"
+
+#: Where they go when nothing says otherwise: beside the receipts, under the
+#: same root the rest of this service's durable state uses.
+DEPLOY_NOTES_DEFAULT: str = "/var/lib/forge/deploy-executor"
+
+
+def deploy_executor_notes_root(env: "dict[str, str] | None" = None) -> Path:
+    """Where the executor writes down what it is about to deploy.
+
+    One folder, named by a setting so an operator can put it on durable
+    storage. Nothing in it is a credential: a target, a counter, a build, a
+    process group and a start time.
+    """
+    source = os.environ if env is None else env
+    named = str(source.get(DEPLOY_NOTES_ENV, "")).strip()
+    return Path(named or DEPLOY_NOTES_DEFAULT)
 
 
 def _not_inside_a_sandbox(what: str, *, verb: str = "run") -> str:
@@ -1103,6 +1129,7 @@ def process_run_request(
     script_runner: ScriptRunner = _run_script_step,
     command_runner: "MergeRunner | None" = None,
     inside_sandbox: bool | None = None,
+    deploy_executor: "DeployExecutor | None" = None,
 ) -> tuple[int, dict[str, Any]]:
     """Validate + execute a ``/run`` payload; return ``(http_status, body)``.
 
@@ -1135,15 +1162,24 @@ def process_run_request(
     answers it; a caller passes it only in tests.
 
     ``memory_project`` and ``launch_settings`` on the body are checked here
-    once and handed to BOTH of those routes (22 September 2026): they launch
-    the project's own program, and until this they were launching it with the
-    project's own declarations stripped. The vetted-script path below does
-    NOT use them, and that is not an oversight: it runs the project's deploy
-    script through ``_run_script_step``, which still hands the child
-    everything this process holds. Closing that is the executor stage's, which
-    owns the deploy path; until then the deploy script is the one command from
-    this helper that is not filtered, and saying so here is better than
-    letting a reader assume otherwise.
+    once and handed to EVERY route that starts a project's own program — the
+    live-gate driver, the declared test command, and, since 23 September 2026,
+    the vetted-script path below. That last one used to be THE DOOR: it ran
+    the project's deploy script through ``_run_script_step``, which built the
+    child's environment with ``os.environ.copy()`` and handed it everything
+    this process held. The environment door is now closed (the design's fourth
+    revision H): the script's environment is BUILT from the factory's own
+    named list plus these two fields, and what is not named is not passed.
+
+    A REQUEST THAT CARRIES A ``deploy`` BLOCK is a deploy of the live thing,
+    and it goes through the EXECUTOR (the design's H, I and J) rather than
+    straight to the runner: one deploy command per target, the slot held for
+    the whole life of the command's process group, ownership enforced on the
+    target's own counter bound to the build it was granted to, and a note
+    written down durably before anything starts. A request without that block
+    is what this route has always served — a candidate leg, a teardown — and
+    it does not change the live target, so it is not gated; it goes through
+    the same environment door all the same.
     """
     if not isinstance(payload, dict):
         return 400, {"error": "request body must be a JSON object"}
@@ -1280,6 +1316,57 @@ def process_run_request(
     if candidate_cwd is not None:
         cwd = candidate_cwd
 
+    # THE EXECUTOR IS THE GATE ON A DEPLOY OF THE LIVE THING (the design's
+    # fourth revision H and fifth revision I and J). A request that owns a
+    # deployment target says so, and then this route does not run anything
+    # itself: it hands the request to the one thing that keeps a slot per
+    # target, enforces that target's own counter bound to the build it was
+    # granted to, and can find and stop a command that is already running.
+    if payload.get("deploy") is not None:
+        if deploy_executor is None:
+            return 400, {
+                "error": (
+                    "this request owns a deployment target, and this helper "
+                    "has no executor to run it through — so nothing was "
+                    "deployed. A deploy is only run where one command per "
+                    "target can be held and stopped."
+                )
+            }
+        built = deploy_request_from(
+            payload.get("deploy"),
+            cwd=str(cwd),
+            script=script,
+            env_file=env_file,
+            extra_env=extra_env,
+            memory_project=launch_memory,
+            launch_settings=launch_names,
+            timeout=timeout,
+        )
+        if isinstance(built, str):
+            return 400, {"error": built}
+        try:
+            answered = deploy_executor.run(built)
+        except Exception as exc:  # noqa: BLE001 — never raise past the boundary
+            return 500, {
+                "error": f"sidecar deploy error: {type(exc).__name__}: {exc}",
+                "exit_code": 1,
+                "output_tail": "",
+            }
+        # A REFUSAL IS NOT A TRANSPORT FAILURE and it is not a script that went
+        # red: it is the executor saying this request may not run. Either way
+        # the answer is a 200 carrying ``accepted``, the machine-readable word
+        # and the plain sentence, so the caller records the reason rather than
+        # a number it has to interpret.
+        return 200, {
+            "accepted": answered.accepted,
+            "word": answered.word,
+            "sentence": answered.sentence,
+            "marker": answered.marker,
+            "exit_code": answered.exit_code,
+            "output_tail": _tail(answered.output) if answered.output else "",
+            "cwd": str(cwd),
+        }
+
     # LAW 6 — execute through the shared subprocess core, no shell. The runner
     # itself never raises, but we still fence it so a stub/HTTP-layer surprise
     # cannot take the process down.
@@ -1290,6 +1377,12 @@ def process_run_request(
             env_file=env_file,
             timeout=timeout,
             extra_env=extra_env or None,
+            # THE ENVIRONMENT DOOR, closed for the vetted-script path too
+            # (23 September 2026). The runner builds the child's environment
+            # from the factory's own named list plus these two, rather than
+            # copying this process's whole one.
+            memory_project=launch_memory,
+            launch_settings=launch_names,
         )
     except Exception as exc:  # noqa: BLE001 — never raise past the boundary
         return 500, {
@@ -5529,6 +5622,7 @@ class _SidecarServer(ThreadingHTTPServer):
         merge_runner: MergeRunner = run_merge_command,
         check_runner: MergeRunner = run_merge_command,
         worktrees_root: Path | None = None,
+        deploy_executor: DeployExecutor | None = None,
     ) -> None:
         super().__init__(server_address, handler_cls)
         self.config_loader = config_loader
@@ -5539,6 +5633,13 @@ class _SidecarServer(ThreadingHTTPServer):
         # default under the temp directory).
         self.check_runner = check_runner
         self.worktrees_root = worktrees_root
+        # THE GATE ON EVERY DEPLOY THIS HELPER RUNS. One per service, because
+        # one deploy command per target is a property of the SERVICE and not
+        # of a request: two requests landing together have to meet the same
+        # slot. ``None`` means this helper runs no deploys of the live thing
+        # at all, and a request that owns a target is refused in plain words
+        # rather than run ungated.
+        self.deploy_executor = deploy_executor
 
 
 class DeploySidecarHandler(BaseHTTPRequestHandler):
@@ -5711,6 +5812,7 @@ class DeploySidecarHandler(BaseHTTPRequestHandler):
                     config=config,
                     script_runner=self.server.script_runner,  # type: ignore[attr-defined]
                     command_runner=self.server.merge_runner,  # type: ignore[attr-defined]
+                    deploy_executor=self.server.deploy_executor,  # type: ignore[attr-defined]
                 )
             self._write_json(status, body)
         except Exception as exc:  # noqa: BLE001 — never crash the server
@@ -5735,12 +5837,18 @@ def build_server(
     merge_runner: MergeRunner = run_merge_command,
     check_runner: MergeRunner = run_merge_command,
     worktrees_root: Path | None = None,
+    deploy_executor: DeployExecutor | None = None,
 ) -> _SidecarServer:
     """Build (but do not start) the loopback-only sidecar HTTP server.
 
     ``host`` defaults to the loopback constant (LAW 5). Tests pass ``port=0`` to
     claim an ephemeral port and assert the bound address is loopback.
     ``check_runner`` and ``worktrees_root`` are the git routes' seams.
+
+    ``deploy_executor`` is the gate on deploys of the live thing. Left unset,
+    this helper runs no such deploy: a request that owns a deployment target
+    is refused in plain words. :func:`serve` builds one, because the running
+    service is the thing a real deploy goes through.
     """
     return _SidecarServer(
         (host, port),
@@ -5750,6 +5858,7 @@ def build_server(
         merge_runner=merge_runner,
         check_runner=check_runner,
         worktrees_root=worktrees_root,
+        deploy_executor=deploy_executor,
     )
 
 
@@ -5764,6 +5873,12 @@ def serve(
 ) -> None:
     """Run the sidecar forever (the ``python -m forge.deploy_sidecar`` body)."""
     logging.basicConfig(level=logging.INFO)
+    # THE EXECUTOR RECONCILES BEFORE THE SERVICE ANSWERS ANYTHING (the
+    # design's J): a helper that comes back with an empty slot while an old
+    # deploy command is still alive undoes the whole of H. Its notes live in a
+    # folder of its own, so they survive this process.
+    executor = DeployExecutor(notes_root=deploy_executor_notes_root())
+    executor.reconcile()
     server = build_server(
         host=host,
         port=port,
@@ -5771,6 +5886,7 @@ def serve(
         script_runner=script_runner,
         merge_runner=merge_runner,
         check_runner=check_runner,
+        deploy_executor=executor,
     )
     bound_host, bound_port = server.server_address[:2]
     logger.info(
@@ -5782,6 +5898,14 @@ def serve(
         "forge-deploy-sidecar listening on http://%s:%s (loopback-only)",
         bound_host,
         bound_port,
+    )
+    # WHERE IT IS LISTENING, said once on its own stream, so a parent that
+    # started it on a port the kernel picked can find it without reading a
+    # log. The publisher already says the same thing the same way. It carries
+    # an address and nothing else.
+    print(
+        json.dumps({"listening_on": f"http://{bound_host}:{bound_port}"}),
+        flush=True,
     )
     try:
         server.serve_forever()

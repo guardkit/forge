@@ -13,9 +13,10 @@ from __future__ import annotations
 
 import os
 import subprocess
-from typing import Callable
+from typing import Callable, Sequence
 
 from forge.executor.registry import StepOutcome, StepTypeRegistry
+from forge.launch_environment import build_launch_env
 from forge.memory.redaction import scrub_process_output
 from forge.persistence.repositories.runbook_models import Step, StepStatus
 
@@ -55,6 +56,9 @@ def _run_script_step(
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
     output_cap: int = DEFAULT_OUTPUT_CAP_BYTES,
     extra_env: dict[str, str] | None = None,
+    memory_project: str | None = None,
+    launch_settings: Sequence[str] | None = None,
+    deploy: dict[str, object] | None = None,
 ) -> tuple[int, str]:
     """Run a shell script with timeout, size-cap, and credential scrubbing.
 
@@ -82,6 +86,14 @@ def _run_script_step(
             subprocess environment AFTER ENV_FILE (so entries here win on a
             key collision). Handlers use this to thread step-level signals
             (e.g. the O-32 revert contract) to the vetted script.
+        memory_project: The memory name recorded for the build this script is
+            running for, handed over on purpose. ``None`` = nothing was
+            recorded, and then no name is set at all, which is memory off
+            rather than somebody else's project name.
+        launch_settings: The setting NAMES the project itself declared its own
+            programs need beyond the factory's own list, read at the commit the
+            work started from. Names only; a value never comes out of a
+            project's settings file.
 
     Returns:
         A tuple of (exit_code, output):
@@ -93,8 +105,39 @@ def _run_script_step(
         Never raises. All errors (missing script, permission denied, etc.) are
         returned as non-zero exit codes with descriptive output.
     """
-    # Build environment: inherit parent env, add ENV_FILE if provided
-    env = os.environ.copy()
+    # AN OWNED DEPLOY IS NOT RUN HERE. A step that carries the ownership of a
+    # deployment target has to go through the EXECUTOR — one deploy command
+    # per target, held for the whole life of the command's process group,
+    # findable and stoppable by a takeover. This core can do none of that: it
+    # starts a subprocess and waits. Running an owned deploy here would be
+    # exactly the ungated deploy the design's fourth revision H removes, so it
+    # is refused in plain words rather than run.
+    if deploy:
+        return (
+            1,
+            "this deploy owns a deployment target, and it was sent to the "
+            "plain subprocess runner, which cannot hold one command per "
+            "target and cannot stop one that is already running. Nothing was "
+            "deployed. An owned deploy runs through the executor in the "
+            "helper service where the project lives.",
+        )
+
+    # THE ENVIRONMENT DOOR (23 September 2026; the one-true-copy design pass,
+    # item 1, fourth revision H, "the environment door"). This used to be
+    # ``os.environ.copy()`` — whatever the process that got here happened to
+    # be holding, handed whole to a project's own program. It was the ONE
+    # command the sandbox's helper service did not filter, and its own
+    # docstring said so where a reader met it.
+    #
+    # Now the child's environment is BUILT: the factory's own named list, plus
+    # the memory name recorded for this build and the setting NAMES the
+    # project itself declared, both passed in by the caller that read them off
+    # the ledger. What is not named is not passed — not a credential the
+    # operator's shell was carrying, not an agent socket, not the
+    # coordinator's ledger.
+    env = build_launch_env(
+        memory_project=memory_project, declared=launch_settings or ()
+    )
     if env_file is not None:
         env["ENV_FILE"] = env_file
     if extra_env:
@@ -236,6 +279,23 @@ def deploy_compose(step: Step, *, runner: ScriptRunner = _run_script_step) -> St
     if isinstance(rollback_image_ref, str) and rollback_image_ref:
         extra_env["ROLLBACK_IMAGE_REF"] = rollback_image_ref
 
+    # WHAT THE PROJECT DECLARED, AND WHICH MEMORY THIS WORK BELONGS TO. Both
+    # ride the step's own params, put there by whatever built the runbook from
+    # the ledger. Absent ⇒ the factory's own list and memory explicitly off,
+    # which is the honest state and never a guessed name.
+    # WHO OWNS THE TARGET THIS STEP CHANGES. Present only on a leg that
+    # changes the live thing; its presence sends the step through the
+    # executor, and a runner that has none refuses rather than deploying
+    # ungated.
+    ownership = step.params.get("deploy")
+    memory_project = step.params.get("memory_project")
+    declared = step.params.get("launch_settings")
+    launch_settings = (
+        tuple(str(name) for name in declared if isinstance(name, str))
+        if isinstance(declared, (list, tuple))
+        else ()
+    )
+
     # Delegate to the runner (default = in-process subprocess core)
     exit_code, captured_output = runner(
         cwd=cwd,
@@ -244,6 +304,13 @@ def deploy_compose(step: Step, *, runner: ScriptRunner = _run_script_step) -> St
         timeout=timeout,
         output_cap=output_cap,
         extra_env=extra_env or None,
+        memory_project=(
+            str(memory_project).strip()
+            if isinstance(memory_project, str) and memory_project.strip()
+            else None
+        ),
+        launch_settings=launch_settings,
+        deploy=dict(ownership) if isinstance(ownership, dict) else None,
     )
 
     # Map exit status to verdict
