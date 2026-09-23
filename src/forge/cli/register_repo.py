@@ -59,6 +59,13 @@ from typing import Any, Callable, Iterable, Sequence
 import click
 import yaml
 
+from forge.pipeline.deployment_identity import (
+    DEFAULT_ARTIFACT_SETTING,
+    DEFAULT_CHECKED_MARKER,
+    DEFAULT_REPORT_MARKER,
+    DEFAULT_SETTING_NAME,
+)
+
 __all__ = ["register_repo_cmd"]
 
 
@@ -914,6 +921,26 @@ compose:
   # up and awake, then runs deploy/deploy.sh inside it and returns that
   # script's exit code unchanged.
   script: deploy/sandbox-deploy.sh
+# HOW THIS REPOSITORY WANTS THE IDENTITY OF WHAT WAS CHECKED HANDED OVER.
+# These are names, and they are this repository's to change; the factory
+# carries them as text and knows nothing about what they mean here. They are
+# written in because a project that declares nothing is not deployed blind —
+# it is not deployed. The names below are the factory's own defaults, and the
+# deploy/deploy.sh beside this file already reads and prints exactly them.
+#   setting          -- the setting the identity of what was checked is handed
+#                       to the deploy step in. The candidate check names its own
+#                       throwaway copy after it, and the teardown is handed the
+#                       same one, so one build's cleanup can never take another
+#                       build's candidate — or its database — down with it.
+#   reported_as      -- the marker the deploy step prints one
+#                       "<marker>=<identity>" line with, to say what is running
+#   checked_as       -- the marker the CHECK prints the artifact it checked under
+#   artifact_setting -- the setting that artifact is handed BACK to the promote in
+identity:
+  setting: {DEFAULT_SETTING_NAME}
+  reported_as: {DEFAULT_REPORT_MARKER}
+  checked_as: {DEFAULT_CHECKED_MARKER}
+  artifact_setting: {DEFAULT_ARTIFACT_SETTING}
 hosts:
   - host: localhost
     role: app
