@@ -2268,18 +2268,42 @@ class PlanningRunDriver:
         )
         return True
 
-    def _recorded_launch(self, correlation_id: str) -> tuple[str | None, tuple[str, ...]]:
-        """``(memory name, declared setting names)`` as the door recorded them.
+    def _recorded_launch(
+        self, correlation_id: str
+    ) -> tuple[str | None, tuple[str, ...], str, str | None]:
+        """What this factory recorded about the run the write belongs to.
 
-        Read off the run rather than passed down, so any leg that declares
-        checks to a sandbox is launching the build system with exactly what the
-        door wrote down for this run and nothing else. Nothing recorded — a run
-        from before either rule, or a ledger without the columns — answers
-        ``(None, ())``, and the checks are then launched with the factory's own
-        list and memory explicitly off, never with what the sandbox's own
-        checkout happens to declare.
+        ``(memory name, declared setting names, whose work it is, where its
+        declarations were said)``. All four are read off the run rather than
+        passed down, so any leg that declares checks to a sandbox is launching
+        the build system with exactly what this factory wrote down for this
+        run and nothing else. Nothing recorded for the first two — a run from
+        before either rule, or a ledger without the columns — answers ``(None,
+        ())``, and the checks are then launched with the factory's own list
+        and memory explicitly off, never with what the sandbox's own checkout
+        happens to declare.
+
+        AND THE WRITE SAYS WHOSE WORK IT IS (23 September 2026). "Whose" is
+        the correlation id: the id this factory's own planning record keeps
+        the run under, and the id the run's recorded starting commit is filed
+        against. It is NOT a build id — a build gets its own, derived later
+        from the feature and the moment it was queued — so the pair sent to a
+        sandbox names the RUN, and the read-only answer looks a run up in the
+        planning record when no build of that name exists. "Where" is the
+        starting commit written onto the run before its first branch was cut,
+        read here and never composed; a run with none sends none, and the door
+        that would otherwise have to read a declaration refuses rather than
+        falling back to the far side's HEAD.
         """
         store = self._deps.store
+        declared_at: str | None = None
+        start_getter = getattr(store, "get_start_point", None)
+        if start_getter is not None:
+            try:
+                recorded_commit, _recorded_branch = start_getter(correlation_id)
+                declared_at = str(recorded_commit) if recorded_commit else None
+            except Exception:  # noqa: BLE001 — a read, never a failed leg
+                declared_at = None
         name = None
         getter = getattr(store, "get_memory_project", None)
         if getter is not None:
@@ -2294,7 +2318,7 @@ class PlanningRunDriver:
                 names = tuple(settings_getter(correlation_id) or ())
             except Exception:  # noqa: BLE001 — same
                 names = ()
-        return (str(name) if name else None), names
+        return (str(name) if name else None), names, str(correlation_id), declared_at
 
     async def _door(
         self, row: Any, correlation_id: str
@@ -3045,7 +3069,12 @@ class PlanningRunDriver:
             declared_spec_checks = True
 
         try:
-            recorded_memory, recorded_settings = self._recorded_launch(correlation_id)
+            (
+                recorded_memory,
+                recorded_settings,
+                whose_work,
+                declared_at,
+            ) = self._recorded_launch(correlation_id)
             gitres = await git_runner.prepare_branch_and_write_tree(
                 repo_path=repo_path,
                 branch=branch,
@@ -3054,6 +3083,8 @@ class PlanningRunDriver:
                 pre_commit=pre_commit,
                 memory_project=recorded_memory,
                 launch_settings=recorded_settings,
+                build=whose_work,
+                declared_at=declared_at,
             )
         except Exception as exc:  # noqa: BLE001 — write boundary
             await self._fail_leg(
@@ -5273,7 +5304,12 @@ class PlanningRunDriver:
             return None
 
         try:
-            recorded_memory, recorded_settings = self._recorded_launch(correlation_id)
+            (
+                recorded_memory,
+                recorded_settings,
+                whose_work,
+                declared_at,
+            ) = self._recorded_launch(correlation_id)
             gitres = await git_runner.prepare_branch_and_write_tree(
                 repo_path=repo_path,
                 branch=branch,
@@ -5285,6 +5321,8 @@ class PlanningRunDriver:
                 pre_commit=pre_commit,
                 memory_project=recorded_memory,
                 launch_settings=recorded_settings,
+                build=whose_work,
+                declared_at=declared_at,
             )
         except Exception as exc:  # noqa: BLE001 — write boundary
             await self._fail_leg(
@@ -6279,7 +6317,12 @@ class PlanningRunDriver:
                 return None
             files[str(rel)] = content
         try:
-            recorded_memory, recorded_settings = self._recorded_launch(correlation_id)
+            (
+                recorded_memory,
+                recorded_settings,
+                whose_work,
+                declared_at,
+            ) = self._recorded_launch(correlation_id)
             gitres = await self._deps.git_runner.prepare_branch_and_write_tree(
                 repo_path=repo_path,
                 branch=branch,
@@ -6289,6 +6332,8 @@ class PlanningRunDriver:
                 ),
                 memory_project=recorded_memory,
                 launch_settings=recorded_settings,
+                build=whose_work,
+                declared_at=declared_at,
             )
         except Exception as exc:  # noqa: BLE001 — write boundary
             await self._fail_leg(
@@ -7646,7 +7691,12 @@ class PlanningRunDriver:
             )
 
         try:
-            recorded_memory, recorded_settings = self._recorded_launch(correlation_id)
+            (
+                recorded_memory,
+                recorded_settings,
+                whose_work,
+                declared_at,
+            ) = self._recorded_launch(correlation_id)
             gitres = await git_runner.prepare_branch_and_write_tree(
                 repo_path=repo_path,
                 branch=branch,
@@ -7658,6 +7708,8 @@ class PlanningRunDriver:
                 pre_commit=pre_commit,
                 memory_project=recorded_memory,
                 launch_settings=recorded_settings,
+                build=whose_work,
+                declared_at=declared_at,
             )
         except Exception as exc:  # noqa: BLE001 — write boundary
             return await self._fail_leg(
@@ -8638,7 +8690,12 @@ class PlanningRunDriver:
 
         files = {gate_rel: filled_gate, _GATE_REGISTRY_REL: new_registry}
         try:
-            recorded_memory, recorded_settings = self._recorded_launch(correlation_id)
+            (
+                recorded_memory,
+                recorded_settings,
+                whose_work,
+                declared_at,
+            ) = self._recorded_launch(correlation_id)
             gitres = await git_runner.prepare_branch_and_write_tree(
                 repo_path=repo_path,
                 branch=branch,
@@ -8651,6 +8708,8 @@ class PlanningRunDriver:
                 pre_commit=pre_commit,
                 memory_project=recorded_memory,
                 launch_settings=recorded_settings,
+                build=whose_work,
+                declared_at=declared_at,
             )
         except Exception as exc:  # noqa: BLE001 — write boundary
             return await self._fail_leg(

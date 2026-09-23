@@ -559,6 +559,28 @@ class TestAJourneysLegStampsItsOwnRequest:
         assert "declared_at" not in sent[0]
         assert "by_hand" not in sent[0]
 
+    def test_and_the_real_helper_refuses_it_rather_than_reading_at_its_own_head(
+        self, project, monkeypatch, tmp_path
+    ) -> None:
+        """And what the REAL helper does with that request: nothing, in words.
+
+        The same shape the dispatch sends above — the build named, no commit,
+        and a declaration to read — put to the real route against a coordinator
+        that holds no record for that build. That is what a row queued before
+        the starting rule existed looks like, and it is the case that used to
+        fall through to whatever HEAD the far side happened to be at. It is
+        refused, and nothing is started.
+        """
+        worktree = _a_journey_worktree(project)
+        with _a_coordinator_that_recorded({}, monkeypatch):
+            status, body = _ask_the_real_helper(
+                project, "/guardkit-leg", _a_leg_request(worktree, build=BUILD_ID)
+            )
+        assert status == 400
+        assert BUILD_ID in body["error"]
+        assert "by hand" in body["error"]
+        assert "exit_code" not in body
+
 
 # ---------------------------------------------------------------------------
 # The merge-ready gates reader, which had the build id all along
@@ -662,6 +684,103 @@ def _a_leg_request(worktree: Path, **extra: Any) -> dict[str, Any]:
     }
 
 
+class TestAStampIsALabelAndNotAQuestion:
+    """What the stamp must NOT cost: a request that reads no declaration.
+
+    The merge word's own command asks the project for nothing — no memory, no
+    setting name — so there is no declaration to read and no commit to read one
+    at. Stamping it says whose work it is, which is worth saying; it must not
+    drag the request into a check against a record it was never going to read
+    anything at. Measured here on the real route, because that is where it was
+    measured going wrong: a stamped press-shaped request answered 400 where its
+    parent answered 200, on a machine with no coordinator configured and on a
+    build the coordinator has no record for.
+    """
+
+    def _a_stand_in_command(self, tmp_path: Path, monkeypatch) -> None:
+        """A stand-in for the project's own command: it answers and exits.
+
+        The route has to REACH the command for a 200 to mean anything, so this
+        is the smallest thing that can be reached. It runs nothing, reads
+        nothing and writes nothing.
+        """
+        import stat
+
+        from forge.deploy_sidecar.service import GUARDKIT_PATH_ENV
+
+        where = tmp_path / "bin"
+        where.mkdir(parents=True, exist_ok=True)
+        command = where / "stand-in"
+        command.write_text(
+            '#!/bin/sh\necho \'{"outcome": "merged"}\'\nexit 0\n', encoding="utf-8"
+        )
+        command.chmod(command.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP)
+        monkeypatch.setenv(GUARDKIT_PATH_ENV, str(command))
+
+    def _press_shaped(self, **extra: Any) -> dict[str, Any]:
+        """The body the press really sends: nothing declared is asked for."""
+        return {
+            "repo": REPO,
+            "feature_id": FEATURE_ID,
+            "expect_main_sha": "a" * 40,
+            "timeout_seconds": 20,
+            **extra,
+        }
+
+    def test_a_stamped_press_shaped_merge_runs_with_no_coordinator_at_all(
+        self, project, start_commit, monkeypatch, tmp_path
+    ) -> None:
+        """Nothing declared is asked for, so nothing is bound and nobody is asked."""
+        self._a_stand_in_command(tmp_path, monkeypatch)
+        monkeypatch.delenv(COORDINATOR_OWNER_ENV, raising=False)
+        status, body = _ask_the_real_helper(
+            project,
+            "/guardkit-merge",
+            self._press_shaped(build=BUILD_ID, declared_at=start_commit),
+        )
+        assert status == 200, body
+        assert body["exit_code"] == 0
+
+    def test_a_stamped_merge_a_coordinator_has_no_record_for_still_runs(
+        self, project, start_commit, monkeypatch, tmp_path
+    ) -> None:
+        """A historical row with no recorded starting commit is not a refusal here.
+
+        There is nothing to refuse it over: this request reads none of the
+        project's own declarations, so no commit is chosen for it and no record
+        decides anything.
+        """
+        self._a_stand_in_command(tmp_path, monkeypatch)
+        with _a_coordinator_that_recorded({}, monkeypatch):
+            status, body = _ask_the_real_helper(
+                project,
+                "/guardkit-merge",
+                self._press_shaped(build=BUILD_ID, declared_at=start_commit),
+            )
+        assert status == 200, body
+        assert body["exit_code"] == 0
+
+    def test_the_same_request_asking_for_a_declaration_is_refused_as_before(
+        self, project, start_commit, monkeypatch, tmp_path
+    ) -> None:
+        """And the moment it asks for one, every word of the binding is back."""
+        self._a_stand_in_command(tmp_path, monkeypatch)
+        monkeypatch.delenv(COORDINATOR_OWNER_ENV, raising=False)
+        status, body = _ask_the_real_helper(
+            project,
+            "/guardkit-merge",
+            self._press_shaped(
+                build=BUILD_ID,
+                declared_at=start_commit,
+                memory_project=THE_MEMORY,
+                launch_settings=[DECLARED_SETTING],
+            ),
+        )
+        assert status == 400
+        assert COORDINATOR_OWNER_ENV in body["error"]
+        assert "exit_code" not in body
+
+
 class TestTheHelperBindsTheStampToTheRecord:
     """What the stamp BUYS: the far side checks it, and refuses a wrong one.
 
@@ -725,15 +844,16 @@ class TestTheHelperBindsTheStampToTheRecord:
         assert "by_hand" in body["error"]
         assert "exit_code" not in body
 
-    def test_the_planning_doors_honest_claim_is_still_served(
+    def test_a_persons_own_claim_is_still_served_on_the_tree_route(
         self, project, start_commit, monkeypatch
     ) -> None:
-        """Planning runs BEFORE there is a build to name, so its claim is true.
+        """The claim belongs to a person at a keyboard, and it still works.
 
-        That door is the one place ``by_hand`` is the honest answer, and this
-        pass must not have taken it away: the same request the planning git
-        runner sends is still admitted, and the declared name is admitted with
-        it.
+        The planning chain stopped making it on 23 September 2026 — its runs
+        are this factory's work and it names the run and the commit the record
+        holds for it, like every other door. What is left is somebody writing
+        a tree by hand, who says so; that request is still admitted, and the
+        declared name is admitted with it.
         """
         with _a_coordinator_that_recorded({BUILD_ID: start_commit}, monkeypatch):
             status, body = _ask_the_real_helper(

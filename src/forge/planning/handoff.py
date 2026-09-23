@@ -339,6 +339,8 @@ class GitRunner(Protocol):
         start_commit: str | None = None,
         memory_project: str | None = None,
         launch_settings: "Sequence[str] | None" = None,
+        build: str | None = None,
+        declared_at: str | None = None,
     ) -> GitOpResult:
         """Write a MULTI-file tree onto ``branch`` in one commit (Lane B B2).
 
@@ -383,6 +385,19 @@ class GitRunner(Protocol):
         start_commit:
             The commit a BRAND NEW branch is cut from (one true copy, item 1).
             An existing branch is re-attached, never moved.
+        build:
+            Whose work this write is — the id this factory's own record keeps
+            the run under (23 September 2026). Every request the factory makes
+            carries it, so a log can say which run ran a check and so a runner
+            whose checks are launched elsewhere can have the pair below
+            confirmed against the record. A runner that launches nothing
+            accepts it and uses nothing.
+        declared_at:
+            The commit this run's declarations are read at: the starting
+            commit written onto the run before its first branch was cut, read
+            off the record and never composed. A write that names a memory or
+            a setting and has none is refused by the runner that sends it on,
+            rather than read at whatever HEAD the far side happens to have.
 
         Returns
         -------

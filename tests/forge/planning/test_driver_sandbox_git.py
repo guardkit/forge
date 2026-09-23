@@ -36,7 +36,11 @@ import pytest
 
 from forge.adapters.git.planning_runner import WorktreeGitRunner
 from forge.config.models import ForgeConfig
-from forge.deploy_sidecar.service import GUARDKIT_PATH_ENV, build_server
+from forge.deploy_sidecar.service import (
+    COORDINATOR_OWNER_ENV,
+    GUARDKIT_PATH_ENV,
+    build_server,
+)
 from forge.adapters.sqlite import connect as sqlite_connect
 from forge.lifecycle import migrations
 from forge.planning.driver import PlanningRunDriver
@@ -90,6 +94,34 @@ def store(tmp_path: Path) -> SqlitePlanningRunStore:
     cx = sqlite_connect.connect_writer(tmp_path / "sandbox.db")
     migrations.apply_at_boot(cx)
     return SqlitePlanningRunStore(cx, target_terminal_enabled=True)
+
+
+@pytest.fixture(autouse=True)
+def the_records_own_answer(
+    store: SqlitePlanningRunStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """This factory's own read-only answer, serving the record these runs write.
+
+    Since 23 September 2026 a planning write that names what the project
+    declares also says whose work it is and where those declarations were
+    said, and the helper checks that pair against the record rather than
+    reading at whatever HEAD its own copy has. So a drive against a REAL
+    sidecar needs something to answer that question — and the honest something
+    is the record these very runs are written to, read through the service
+    that serves it. It is a child of this process on 127.0.0.1 on a port the
+    kernel picks, reading a throwaway file under this test's own temporary
+    directory; nothing live is anywhere near it.
+    """
+    from forge.record_answer.service import ANSWER_ROUTE, serve
+
+    server, _thread = serve(ledger=tmp_path / "sandbox.db", host="127.0.0.1", port=0)
+    host, port = server.server_address[:2]
+    monkeypatch.setenv(COORDINATOR_OWNER_ENV, f"http://{host}:{port}{ANSWER_ROUTE}")
+    try:
+        yield
+    finally:
+        server.shutdown()
+        server.server_close()
 
 
 def _sidecar_config(repo: Path) -> ForgeConfig:

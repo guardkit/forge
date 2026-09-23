@@ -182,6 +182,73 @@ class TestTheAnswerService:
         assert answer["recorded"] is False and answer["start_commit"] is None
         assert unknown["recorded"] is False and unknown["start_commit"] is None
 
+    def test_it_answers_for_a_planning_run_that_has_no_build_yet(
+        self, record: SqliteLifecyclePersistence
+    ) -> None:
+        """A planning run is this coordinator's work too, and it is asked about.
+
+        Planning's writes go to the same helper and read the project's own
+        declarations the same way, so they name the id this coordinator keeps
+        the RUN under — a different string from any build id, filed in the
+        planning record rather than the builds table. Both are this
+        coordinator's own record of where a piece of work starts, so one
+        question answers from whichever holds it.
+        """
+        commit = "d" * 40
+        record.connection.row_factory = sqlite3.Row
+        store = SqlitePlanningRunStore(record.connection)
+        store.record_queued(
+            correlation_id="corr-run-with-no-build",
+            originating_user="U1",
+            expected_approver="U1",
+            request_text="a sentence",
+            triggered_by="cli",
+            target_repo=REPO,
+        )
+        assert store.record_start_point(
+            "corr-run-with-no-build", start_commit=commit, target_branch="main"
+        )
+        server, base = _answering(record)
+        try:
+            status, answer = _get(f"{base}{ANSWER_ROUTE}?build=corr-run-with-no-build")
+            _, neither = _get(f"{base}{ANSWER_ROUTE}?build=in-neither-record")
+        finally:
+            server.shutdown()
+            server.server_close()
+
+        assert status == 200
+        assert answer == {
+            "build": "corr-run-with-no-build",
+            "recorded": True,
+            "start_commit": commit,
+        }
+        # A name in neither record still gets the honest "nobody said".
+        assert neither["recorded"] is False and neither["start_commit"] is None
+
+    def test_a_planning_run_with_no_recorded_commit_says_so(
+        self, record: SqliteLifecyclePersistence
+    ) -> None:
+        """A run from before the starting rule is an absence, never a guess."""
+        record.connection.row_factory = sqlite3.Row
+        store = SqlitePlanningRunStore(record.connection)
+        store.record_queued(
+            correlation_id="corr-run-with-no-start",
+            originating_user="U1",
+            expected_approver="U1",
+            request_text="a sentence",
+            triggered_by="cli",
+            target_repo=REPO,
+        )
+        server, base = _answering(record)
+        try:
+            status, answer = _get(f"{base}{ANSWER_ROUTE}?build=corr-run-with-no-start")
+        finally:
+            server.shutdown()
+            server.server_close()
+
+        assert status == 200
+        assert answer["recorded"] is False and answer["start_commit"] is None
+
     def test_it_answers_who_holds_a_deployment_target(
         self, record: SqliteLifecyclePersistence
     ) -> None:
