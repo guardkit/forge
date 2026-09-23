@@ -67,6 +67,39 @@ def repo(tmp_path: Path) -> Path:
         yaml.safe_dump(_profile_dict(root, script="deploy/sandbox-deploy.sh")),
         encoding="utf-8",
     )
+    return _committed(root)
+
+
+def _committed(root: Path) -> Path:
+    """Put this throwaway project into a commit, and answer its root.
+
+    A DECLARATION IS A COMMITTED LINE (27 September 2026). The helper reads a
+    project's ``deploy/profile.yaml`` — the ``identity`` names and the
+    ``candidate: env:`` names its environment door is widened by — out of the
+    project's own history, never off the working copy. A project laid out in a
+    directory with no history declares nothing, so these fixtures commit.
+    """
+    import subprocess
+
+    def _git(*args: str) -> None:
+        subprocess.run(
+            [
+                "git",
+                "-c", "user.email=tests@example.invalid",
+                "-c", "user.name=tests",
+                "-c", "commit.gpgsign=false",
+                *args,
+            ],
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+
+    if not (root / ".git").exists():
+        _git("init", "-q", "-b", "main")
+    _git("add", "-A")
+    _git("commit", "-q", "--allow-empty", "-m", "the project as it is")
     return root
 
 

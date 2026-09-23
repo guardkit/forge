@@ -181,6 +181,7 @@ import signal
 import subprocess
 import sys
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib import import_module
@@ -598,6 +599,14 @@ def deploy_executor_notes_root(env: "dict[str, str] | None" = None) -> Path:
 #: nothing is sent to it but the target's name. Unset ⇒ nobody can be asked,
 #: and the executor refuses rather than believing the request — which is the
 #: safe side and is what it does today.
+#:
+#: AND THE SAME ANSWER IS ASKED ABOUT A BUILD (27 September 2026, the sixth
+#: review). ``GET <url>?build=<the build>`` answers ``{"build": "<the same
+#: build>", "start_commit": "<the commit the coordinator recorded that build as
+#: starting from>"}``. That is the one fact this service needs and cannot hold:
+#: it has no ledger, so without it a request naming the commit its own
+#: declarations are read at is choosing its own authority. See
+#: :func:`_bound_commit`.
 COORDINATOR_OWNER_ENV: str = "FORGE_TARGET_OWNER_URL"
 
 #: How long the executor waits for that one answer. Short on purpose: it is
@@ -624,27 +633,69 @@ def coordinator_owner_asker(
         return None
 
     def _ask(target: str) -> "dict[str, Any] | None":
-        from urllib import error as urllib_error, parse, request as urllib_request
+        return _one_read_only_question(
+            address, "target", str(target), about="who owns"
+        )
 
-        query = parse.urlencode({"target": str(target)})
-        joined = f"{address}{'&' if '?' in address else '?'}{query}"
-        try:
-            with urllib_request.urlopen(  # noqa: S310 — an operator's own address
-                urllib_request.Request(joined, method="GET"),
-                timeout=COORDINATOR_ASK_SECONDS,
-            ) as answer:
-                decoded = json.loads(answer.read().decode("utf-8", errors="replace"))
-        except (urllib_error.URLError, OSError, ValueError, TimeoutError) as exc:
-            logger.warning(
-                "deploy executor: the coordinator at %s could not be asked who "
-                "owns %s (%s: %s)",
-                address,
-                target,
-                type(exc).__name__,
-                exc,
-            )
-            return None
-        return decoded if isinstance(decoded, dict) else None
+    return _ask
+
+
+def _one_read_only_question(
+    address: str, field: str, value: str, *, about: str
+) -> "dict[str, Any] | None":
+    """Ask the coordinator's read-only answer one question; never raise.
+
+    One field goes out and one object comes back. ``None`` means the question
+    could not be answered — the address could not be reached, it took too
+    long, or what came back was not an object — and every caller treats that
+    as "nobody said", never as "the answer is no".
+    """
+    from urllib import error as urllib_error, parse, request as urllib_request
+
+    query = parse.urlencode({field: value})
+    joined = f"{address}{'&' if '?' in address else '?'}{query}"
+    try:
+        with urllib_request.urlopen(  # noqa: S310 — an operator's own address
+            urllib_request.Request(joined, method="GET"),
+            timeout=COORDINATOR_ASK_SECONDS,
+        ) as answer:
+            decoded = json.loads(answer.read().decode("utf-8", errors="replace"))
+    except (urllib_error.URLError, OSError, ValueError, TimeoutError) as exc:
+        logger.warning(
+            "deploy sidecar: the coordinator at %s could not be asked %s %s (%s: %s)",
+            address,
+            about,
+            value,
+            type(exc).__name__,
+            exc,
+        )
+        return None
+    return decoded if isinstance(decoded, dict) else None
+
+
+def coordinator_recorded_build(
+    env: "dict[str, str] | None" = None,
+) -> "Callable[[str], dict[str, Any] | None] | None":
+    """Build the way to ask the coordinator what it RECORDED for one build.
+
+    The same read-only answer the executor already asks who owns a target,
+    asked about a build instead: one field out, one object back, carrying the
+    build and the commit the coordinator wrote down as the one that build
+    starts from.
+
+    ``None`` when the setting names no address, and then this service accepts
+    no commit on a request at all — see :func:`_bound_commit` for why that is
+    the safe side rather than an inconvenience.
+    """
+    source = os.environ if env is None else env
+    address = str(source.get(COORDINATOR_OWNER_ENV, "")).strip()
+    if not address:
+        return None
+
+    def _ask(build: str) -> "dict[str, Any] | None":
+        return _one_read_only_question(
+            address, "build", str(build), about="what it recorded for build"
+        )
 
     return _ask
 
@@ -712,10 +763,35 @@ def allowed_scripts(
     return scripts
 
 
+#: Passed as ``committed`` to say "nobody has read the profile at a commit for
+#: this call", which keeps the working-copy reading every caller had before the
+#: door's other half was closed. Every route in this service passes a real
+#: answer — a profile read at the bound commit, or ``None`` for one that could
+#: not be read there.
+NOT_READ_AT_A_COMMIT: Any = object()
+
+
 def allowed_env_keys(
-    profile: DeployProfile, *, declared: Sequence[str] | None = None
+    profile: DeployProfile,
+    *,
+    declared: Sequence[str] | None = None,
+    committed: Any = NOT_READ_AT_A_COMMIT,
 ) -> set[str]:
     """The allowlisted env-key names for this profile (LAW 3).
+
+    ``committed`` is the project's profile AS IT IS AT THE BOUND COMMIT, and
+    when it is given it — not ``profile`` — is what widens this door.
+
+    THE OTHER HALF OF THE SAME DOOR (27 September 2026, the sixth review; the
+    reviewer of the 23rd carried it forward three times). The names a project
+    declares in its ``.guardkit/config.yaml`` had been made committed lines,
+    and the names it declares in its ``deploy/profile.yaml`` had not: this
+    function was handed the profile loaded off the WORKING COPY, so an
+    uncommitted ``identity:`` or ``candidate: env:`` line in the very checkout
+    a build was about to run out of still widened which settings a request
+    might carry. Both halves read the same committed file at the same bound
+    commit now. A profile that cannot be read there widens nothing, which is
+    the factory's own base list and the safe side.
 
     The factory's own base allowlist, UNION the names THIS PROJECT declared in
     its own ``deploy/profile.yaml``:
@@ -759,28 +835,43 @@ def allowed_env_keys(
     ``extra`` (present-and-well-shaped only).
     """
     keys: set[str] = set(ENV_ALLOWLIST_BASE)
-    if profile.live_gate is not None:
-        keys.update(profile.live_gate.env.keys())
-    if profile.candidate is not None:
-        keys.update(profile.candidate.env.keys())
+    # WHICH COPY OF THE PROFILE WIDENS THIS DOOR. The committed one whenever a
+    # caller has read one; ``None`` there means it could not be read at the
+    # bound commit, and then this project widens nothing at all.
+    widens = profile if committed is NOT_READ_AT_A_COMMIT else committed
+    if widens is None:
+        return keys | _permitted_declared_names(declared)
+    if widens.live_gate is not None:
+        keys.update(widens.live_gate.env.keys())
+    if widens.candidate is not None:
+        keys.update(widens.candidate.env.keys())
     else:
-        candidate = profile.extra.get("candidate")
+        candidate = widens.extra.get("candidate")
         if isinstance(candidate, dict):
             cand_env = candidate.get("env")
             if isinstance(cand_env, dict):
                 keys.update(str(k) for k in cand_env)
     # THE NAMES THE PROJECT DECLARED, each one checked before it is permitted.
-    # A name the factory keeps for itself is dropped here with a warning; the
-    # project is not refused over it, because it is refused the moment it tries
-    # to USE it, in one plain sentence, by the loop that reads this set.
-    declaration = declared_identity(profile)
-    project_names = [
-        declaration.setting,
-        declaration.artifact_setting,
-        declaration.asked_with,
-        *(str(name) for name in (declared or ())),
-    ]
-    for raw in project_names:
+    declaration = declared_identity(widens)
+    return keys | _permitted_declared_names(
+        (
+            declaration.setting,
+            declaration.artifact_setting,
+            declaration.asked_with,
+            *(str(name) for name in (declared or ())),
+        )
+    )
+
+
+def _permitted_declared_names(names: Sequence[str] | None) -> set[str]:
+    """Of these project-declared names, the ones this door may be widened onto.
+
+    A name the factory keeps for itself is dropped here with a warning; the
+    project is not refused over it, because it is refused the moment it tries
+    to USE it, in one plain sentence, by the loop that reads this set.
+    """
+    permitted: set[str] = set()
+    for raw in names or ():
         name = str(raw or "").strip()
         if not name:
             continue
@@ -792,8 +883,8 @@ def allowed_env_keys(
                 refusal,
             )
             continue
-        keys.add(name)
-    return keys
+        permitted.add(name)
+    return permitted
 
 
 def _resolve_cwd(repo_path: Path, profile: DeployProfile) -> Path:
@@ -849,7 +940,11 @@ def _tail(output: str) -> str:
 
 
 def _allowlisted_env(
-    raw_env: Any, profile: DeployProfile, *, declared: Sequence[str] | None = None
+    raw_env: Any,
+    profile: DeployProfile,
+    *,
+    declared: Sequence[str] | None = None,
+    committed: Any = NOT_READ_AT_A_COMMIT,
 ) -> tuple[dict[str, str], str | None]:
     """LAW 3 — the caller's env, or one plain sentence saying why not.
 
@@ -859,12 +954,16 @@ def _allowlisted_env(
     ``declared`` are the setting names the project said its builds need, off
     the request and already checked at the door; they are permitted alongside
     the ones its deploy profile declares.
+
+    ``committed`` is that deploy profile as it is AT THE BOUND COMMIT. When it
+    is given it is the only copy consulted — a working-copy line is not a
+    declaration on either half of this door (27 September 2026).
     """
     if raw_env is None:
         raw_env = {}
     if not isinstance(raw_env, dict):
         return {}, "'env' must be a JSON object of allowlisted string values"
-    permitted_keys = allowed_env_keys(profile, declared=declared)
+    permitted_keys = allowed_env_keys(profile, declared=declared, committed=committed)
     env: dict[str, str] = {}
     for key, value in raw_env.items():
         if key not in permitted_keys:
@@ -966,6 +1065,44 @@ def _the_project_at(repo_path: Path, commit: str, file_path: str) -> tuple[
     if not answer.found:
         return None, False, None
     return answer.content, True, None
+
+
+def profile_at_commit(
+    repo_path: Path, commit: str | None = None
+) -> tuple[DeployProfile | None, str | None]:
+    """A project's deploy profile AS IT IS AT A COMMIT, never off the disk.
+
+    Returns ``(profile, why it could not be read)``. Both can be ``None``: a
+    repository need not be deployable at all — a fix journey has no deploy
+    profile — and one that is not simply declares nothing, which is not a
+    fault and has no reason to give.
+
+    THE SAME RULE AS THE SETTINGS FILE'S (27 September 2026, the sixth review).
+    The half of the environment door that reads the profile's own ``identity``
+    and ``candidate: env:`` names was still handed the profile loaded off the
+    working copy, so an uncommitted line there widened which settings a request
+    might carry — the very hole the other half had already been closed against.
+    A declaration is a committed line in BOTH files now, read at the one commit
+    the request is bound to.
+
+    Never raises: a file out of a project this factory did not write is input,
+    not code.
+    """
+    text, found, unreadable = _the_project_at(
+        repo_path, str(commit or "").strip() or "HEAD", PROFILE_PATH
+    )
+    if unreadable is not None:
+        return None, unreadable
+    if not found or text is None:
+        return None, None
+    try:
+        # The same bounded read the file load does, on text that came out of
+        # the history rather than off the disk.
+        return parse_deploy_profile(
+            yaml.safe_load(text) or {}, source_ref=PROFILE_PATH
+        ), None
+    except Exception as exc:  # noqa: BLE001 — a project's own file is input
+        return None, f"{PROFILE_PATH} there cannot be used: {exc}"
 
 
 def project_declared_settings(
@@ -1085,10 +1222,24 @@ def project_declared_settings(
         unreadable_because=unreadable_because,
     )
     if answer.refusal is not None:
-        note = (
-            f"its own {DECLARATION_PATH} at {where} says something this "
-            f"factory cannot use, so no name was taken from that file"
-        )
+        if unreadable_because is not None:
+            # THE READ COULD NOT BE MADE AT ALL, which is a fact about the copy
+            # and the commit, not about what the project wrote (27 September
+            # 2026, the sixth review). The sentence a caller read used to say
+            # the project's own settings file "says something this factory
+            # cannot use" even when the real reason was that this copy does not
+            # carry the commit — and it sent a person to look at a file that is
+            # perfectly fine. The reader's own words say which it is, so they
+            # are the ones passed on.
+            note = (
+                f"its own {DECLARATION_PATH} could not be read at {where} — "
+                f"{unreadable_because}"
+            )
+        else:
+            note = (
+                f"its own {DECLARATION_PATH} at {where} says something this "
+                f"factory cannot use, so no name was taken from that file"
+            )
         logger.warning(
             "deploy-sidecar: no launch settings were taken from %s at %s — %s",
             DECLARATION_PATH,
@@ -1102,20 +1253,8 @@ def project_declared_settings(
     # environment door already reads them. A repository need not be deployable
     # at all — a fix journey has no deploy profile — and one that is not simply
     # declares nothing here.
-    profile_text, profile_found, profile_unreadable = _the_project_at(
-        repo_path, read_at, PROFILE_PATH
-    )
-    profile = None
-    if profile_found and profile_unreadable is None and profile_text is not None:
-        try:
-            # The same bounded read the file load does, on text that came out
-            # of the history rather than off the disk.
-            profile = parse_deploy_profile(
-                yaml.safe_load(profile_text) or {}, source_ref=PROFILE_PATH
-            )
-        except Exception:  # noqa: BLE001 — a project's own file is input, not code
-            profile = None
-    elif profile_unreadable is not None:
+    profile, profile_unreadable = profile_at_commit(repo_path, read_at)
+    if profile_unreadable is not None:
         logger.info(
             "deploy-sidecar: %s could not be read at %s (%s), so this project "
             "declares no identity settings here",
@@ -1149,13 +1288,205 @@ def project_declared_settings(
     return tuple(permitted), note, where
 
 
+#: What a build is called on a request: a bounded token the coordinator writes
+#: down and this service only ever compares and hands back. Nothing here knows
+#: or cares how a build id is composed.
+BUILD_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+
+#: The one field read off the coordinator's answer about a build.
+RECORDED_START_KEY: str = "start_commit"
+
+#: Passed as ``ask`` to say "make one from this service's own settings". A
+#: caller that has its own way of asking passes that instead; ``None`` says
+#: there is no way to ask at all, which is a refusal and not a shrug.
+FROM_THIS_SERVICES_SETTINGS: Any = object()
+
+
+def _same_commit(recorded: str, presented: str) -> bool:
+    """Do these two spellings name the same commit?
+
+    The same text, or one a prefix of the other and at least seven characters
+    long — the way every other part of this estate compares an abbreviated
+    commit with a full one. Nothing shorter is accepted as a match, because a
+    very short prefix names many commits and this comparison is a gate.
+    """
+    first = str(recorded or "").strip().lower()
+    second = str(presented or "").strip().lower()
+    if not first or not second:
+        return False
+    if first == second:
+        return True
+    shorter, longer = (first, second) if len(first) <= len(second) else (second, first)
+    return len(shorter) >= 7 and longer.startswith(shorter)
+
+
+def _bound_commit(
+    payload: Any,
+    *,
+    ask: Any = FROM_THIS_SERVICES_SETTINGS,
+) -> tuple[str | None, str | None, str]:
+    """The commit this request's declarations are read at, or why none is.
+
+    Returns ``(commit, refusal, how it was bound)``. ``commit`` ``None`` with
+    no refusal means the committed HEAD of the copy of the project this
+    service has — never its working tree.
+
+    THE COMMIT IS BOUND TO THE RECORD, NOT TAKEN FROM THE REQUEST (27
+    September 2026, the sixth review, Codex's requirement of the 23rd). Until
+    now the commit a project's two declaration files were read at was whatever
+    the request said, and the fallback with no commit on it was committed HEAD.
+    Reading a committed line rather than a working-copy one closed the larger
+    hole, but it left a smaller one of exactly the same shape: **a request
+    chose its own authority**. Whoever could send a request could name a
+    commit at which the project declared a setting it does not declare now,
+    and the door opened on that commit's say-so.
+
+    This service cannot see the ledger and never will, so it cannot look the
+    answer up. What it can do is refuse to take the answer from the thing
+    being checked. So:
+
+    * a request that names a commit must say WHICH BUILD it is for, and the
+      pair — that build, that commit — is confirmed with the coordinator's own
+      read-only answer before anything is read. The commit that is then read
+      at is the one the COORDINATOR named, not the one on the request;
+    * a request that names a build and no commit is bound to whatever the
+      coordinator has recorded for that build, which is the same binding
+      arrived at from the other end;
+    * with no way to ask the coordinator, a request that names a commit is
+      REFUSED. That is deliberate and it is the same cost the executor's
+      ownership route already accepts: the alternative is a request letting
+      itself in, which is the hole being closed;
+    * a request that names neither — a by-hand run — reads at the committed
+      HEAD of this copy, and the sentence it is answered with says so.
+
+    Never raises: a request is input, and a coordinator that cannot be reached
+    is an unanswered question, never an answer.
+    """
+    if not isinstance(payload, dict):
+        return None, None, "by hand"
+
+    raw_commit = payload.get("declared_at")
+    presented: str | None = None
+    if raw_commit is not None:
+        shape = _ref_error(raw_commit, what="declared_at")
+        if shape is not None:
+            return None, shape, ""
+        presented = str(raw_commit).strip()
+
+    raw_build = payload.get("build")
+    build = ""
+    if raw_build is not None:
+        build = str(raw_build).strip() if isinstance(raw_build, str) else ""
+        if not build or not BUILD_ID_PATTERN.match(build):
+            return None, (
+                "'build', when present, is the build this request is for, as "
+                "the coordinator writes it down: letters, digits, dots, "
+                "dashes, colons and underscores, at most 128 of them; got "
+                f"{raw_build!r}"
+            ), ""
+
+    if presented is None and not build:
+        # A BY-HAND RUN. Nothing names a build, so there is no record to bind
+        # to and nothing is claiming one. Committed HEAD, and said out loud.
+        return None, None, "by hand, at this copy's committed HEAD"
+
+    if presented is not None and not build:
+        return None, (
+            f"this request asks for {repr(presented)} to be the commit this "
+            "project's declarations are read at, and it does not say which "
+            "build it is for. A request cannot establish its own authority: "
+            "the commit a build starts from is the coordinator's record, and "
+            "the only way this helper can check one is to ask the coordinator "
+            "about the build it belongs to. Nothing was read and nothing was "
+            "started."
+        ), ""
+
+    asker = coordinator_recorded_build() if ask is FROM_THIS_SERVICES_SETTINGS else ask
+    if not callable(asker):
+        if presented is None:
+            # A build with no commit on the request and nobody to ask: this
+            # copy's committed HEAD, which is a fact about the copy rather
+            # than anything the request said. Exactly what it did before.
+            return None, None, (
+                "at this copy's committed HEAD — the coordinator could not be "
+                "asked what this build starts from"
+            )
+        return None, (
+            f"this request asks for {repr(presented)} to be the commit build "
+            f"{build} has its declarations read at, and this helper has no way "
+            "to ask the coordinator what commit that build was recorded as "
+            "starting from. A request cannot establish its own authority, so "
+            "the commit on it was not used and nothing was read at it. "
+            f"Nothing was started. (The coordinator's read-only answer is "
+            f"named by the setting {COORDINATOR_OWNER_ENV}.)"
+        ), ""
+
+    try:
+        answer = asker(build)
+    except Exception as exc:  # noqa: BLE001 — a refusal, never a crash
+        logger.warning(
+            "deploy-sidecar: the coordinator could not be asked what build %s "
+            "starts from (%s: %s)",
+            build,
+            type(exc).__name__,
+            exc,
+        )
+        answer = None
+
+    recorded = ""
+    said_build = ""
+    if isinstance(answer, Mapping):
+        recorded = str(answer.get(RECORDED_START_KEY) or "").strip()
+        said_build = str(answer.get("build") or "").strip()
+
+    if said_build and said_build != build:
+        return None, (
+            f"this request says it is for build {build}, and the coordinator "
+            f"answered about build {said_build} instead, so the two could not "
+            "be confirmed as the same build. Nothing was read and nothing was "
+            "started."
+        ), ""
+
+    if not recorded:
+        if presented is None:
+            return None, None, (
+                "at this copy's committed HEAD — the coordinator recorded no "
+                f"starting commit for build {build}"
+            )
+        return None, (
+            f"this request asks for {repr(presented)} to be the commit build "
+            f"{build} has its declarations read at, and the coordinator did "
+            "not say what commit it recorded that build as starting from. A "
+            "request cannot establish its own authority, so nothing was read "
+            "at that commit and nothing was started."
+        ), ""
+
+    if presented is not None and not _same_commit(recorded, presented):
+        return None, (
+            f"this request asks for this project's declarations to be read at "
+            f"the commit {presented}, and the coordinator says build {build} "
+            f"was recorded as starting from {recorded}. Those are different "
+            "commits, and a request does not choose the commit its own "
+            f"declarations are read at. Nothing was read at {presented} and "
+            "nothing was started."
+        ), ""
+
+    # THE COORDINATOR'S OWN SPELLING IS THE ONE READ AT, even when the request
+    # presented a matching abbreviation of it: the record is the authority all
+    # the way down to which characters are used.
+    return recorded, None, (
+        f"the commit the coordinator recorded build {build} as starting from"
+    )
+
+
 def _launch_fields(
     payload: Any,
     *,
     repo_path: Path,
     repo: str | None = None,
-) -> tuple[str | None, tuple[str, ...], str | None]:
-    """``(memory name, declared setting names, refusal)`` off one request.
+    ask: Any = FROM_THIS_SERVICES_SETTINGS,
+) -> tuple[str | None, tuple[str, ...], str | None, str | None]:
+    """``(memory name, declared setting names, refusal, the bound commit)``.
 
     Both are optional and both are the coordinator's own facts, read off the
     ledger for the build this request is for and sent with it: which memory the
@@ -1186,16 +1517,19 @@ def _launch_fields(
     working tree — so a line a build writes into the checkout it is about to
     run out of is not a declaration, and cannot widen its own door. Which of
     the two was used is named in the sentence either way.
+
+    AND THAT COMMIT IS BOUND TO THE RECORD (27 September 2026). Which commit
+    is read at is settled by :func:`_bound_commit`, against the coordinator's
+    own read-only answer for the build this request names — never by the
+    request. The fourth answer is that commit, so the OTHER half of the same
+    door, :func:`allowed_env_keys`, reads the project's profile at exactly the
+    same place rather than off the working copy.
     """
     if not isinstance(payload, dict):
-        return None, (), None
-    raw_commit = payload.get("declared_at")
-    declared_at: str | None = None
-    if raw_commit is not None:
-        commit_error = _ref_error(raw_commit, what="declared_at")
-        if commit_error is not None:
-            return None, (), commit_error
-        declared_at = str(raw_commit).strip()
+        return None, (), None, None
+    declared_at, bind_refusal, how = _bound_commit(payload, ask=ask)
+    if bind_refusal is not None:
+        return None, (), bind_refusal, None
     raw_name = payload.get("memory_project")
     name: str | None = None
     if raw_name is not None:
@@ -1204,7 +1538,7 @@ def _launch_fields(
                 "'memory_project', when present, is the memory name this work "
                 "belongs to: letters, digits and underscores; got "
                 f"{raw_name!r}"
-            )
+            ), None
         name = raw_name.strip()
     raw_settings = payload.get("launch_settings")
     names: list[str] = []
@@ -1214,31 +1548,33 @@ def _launch_fields(
                 "'launch_settings', when present, is the list of setting NAMES "
                 "the project declared its builds need; got "
                 f"{type(raw_settings).__name__}"
-            )
+            ), None
         declared, note, where = project_declared_settings(
             repo_path, commit=declared_at
         )
         for entry in raw_settings:
             refusal = declared_setting_refusal(entry)
             if refusal is not None:
-                return None, (), f"'launch_settings' cannot be used: {refusal}"
+                return None, (), f"'launch_settings' cannot be used: {refusal}", None
             wanted = str(entry).strip()
             if wanted not in declared:
                 return None, (), _not_declared_by_the_project(
                     wanted, repo=repo, declared=declared, note=note, where=where
-                )
+                ), None
             names.append(wanted)
         if names:
             # THE ACCEPTANCE SAYS WHERE IT READ THEM TOO, so a person reading
-            # the log never has to guess which commit a name was admitted from.
+            # the log never has to guess which commit a name was admitted from,
+            # or on whose word that commit was chosen.
             logger.info(
-                "deploy-sidecar: %s declares %s at %s, so this request may hand "
-                "them to the command",
+                "deploy-sidecar: %s declares %s at %s (%s), so this request may "
+                "hand them to the command",
                 repo or str(repo_path),
                 ", ".join(names),
                 where,
+                how,
             )
-    return name, tuple(names), None
+    return name, tuple(names), None, declared_at
 
 
 def _text_list(
@@ -1667,11 +2003,17 @@ def process_run_request(
     # THE REQUEST PRESENTS IS CHECKED AGAINST THE PROJECT'S OWN DECLARATION
     # (23 September 2026): the request carries the coordinator's reading of
     # it, and this service confirms it against the copy of the project it has.
-    launch_memory, launch_names, launch_error = _launch_fields(
+    launch_memory, launch_names, launch_error, bound_at = _launch_fields(
         payload, repo_path=repo_path, repo=repo
     )
     if launch_error is not None:
         return 400, {"error": launch_error}
+
+    # AND THE PROFILE THE ENVIRONMENT DOOR READS IS THE COMMITTED ONE, at the
+    # same bound commit (27 September 2026). Read once here, so both shapes
+    # below — the live-gate driver and the vetted script — are widened by the
+    # same committed declaration rather than by whatever is on the disk.
+    committed_profile, _ = profile_at_commit(repo_path, bound_at)
 
     # SANDBOX FIRST (rule 88) — the merge-ready gates reader's declared test
     # command. It is answered BEFORE the deploy profile is read, because a
@@ -1705,7 +2047,10 @@ def process_run_request(
         if not in_sandbox:
             return 400, {"error": _not_inside_a_sandbox("live-gate driver")}
         env_only, error = _allowlisted_env(
-            payload.get("env"), profile, declared=launch_names
+            payload.get("env"),
+            profile,
+            declared=launch_names,
+            committed=committed_profile,
         )
         if error:
             return 400, {"error": error}
@@ -1741,7 +2086,9 @@ def process_run_request(
         }
 
     # LAW 3 — env keys allowlisted, values must be strings.
-    extra_env, env_error = _allowlisted_env(raw_env, profile, declared=launch_names)
+    extra_env, env_error = _allowlisted_env(
+        raw_env, profile, declared=launch_names, committed=committed_profile
+    )
     if env_error is not None:
         return 400, {"error": env_error}
 
@@ -2217,7 +2564,7 @@ def process_guardkit_merge_request(
 
     # The names on the request are checked against what THIS project declares
     # in its own committed files, read from the copy this service has.
-    memory_project, launch_settings, launch_error = _launch_fields(
+    memory_project, launch_settings, launch_error, _bound_at = _launch_fields(
         payload, repo_path=repo_path, repo=str(payload.get("repo") or "") or None
     )
     if launch_error is not None:
@@ -3146,7 +3493,7 @@ def process_git_write_tree_request(
     # declared here ARE the build system, run against a tree, so they are
     # launched the way every other call of it is — and a setting name on the
     # request is checked against the project's own declaration the same way.
-    memory_project, launch_settings, launch_error = _launch_fields(
+    memory_project, launch_settings, launch_error, _bound_at = _launch_fields(
         payload, repo_path=repo_path, repo=str(payload.get("repo") or "") or None
     )
     if launch_error is not None:
@@ -4691,7 +5038,7 @@ def process_guardkit_leg_request(
     )
     if error:
         return 400, {"error": error}
-    memory_project, launch_settings, launch_error = _launch_fields(
+    memory_project, launch_settings, launch_error, _bound_at = _launch_fields(
         payload, repo_path=repo_path, repo=str(payload.get("repo") or "") or None
     )
     if launch_error is not None:
@@ -6425,6 +6772,10 @@ __all__ = [
     "SIDECAR_IN_SANDBOX_ENV",
     "allowed_env_keys",
     "project_declared_settings",
+    "profile_at_commit",
+    "coordinator_recorded_build",
+    "BUILD_ID_PATTERN",
+    "RECORDED_START_KEY",
     "process_run_request",
     "process_guardkit_merge_request",
     "GIT_WRITE_TREE_ROUTE",

@@ -58,7 +58,6 @@ def _run_script_step(
     extra_env: dict[str, str] | None = None,
     memory_project: str | None = None,
     launch_settings: Sequence[str] | None = None,
-    declared_at: str | None = None,  # noqa: ARG001 — the far side's door reads it
     deploy: dict[str, object] | None = None,
 ) -> tuple[int, str]:
     """Run a shell script with timeout, size-cap, and credential scrubbing.
@@ -297,16 +296,14 @@ def deploy_compose(step: Step, *, runner: ScriptRunner = _run_script_step) -> St
         else ()
     )
 
-    # WHERE THOSE NAMES WERE SAID: the recorded commit this work starts from.
-    # Only the far side's environment door reads a project's declarations, so
-    # only it uses this — and it is sent ONLY when there is one, so a runner
-    # written before it existed is called exactly as it always was.
-    said_at = step.params.get("declared_at")
-    where_declared = (
-        str(said_at).strip()
-        if isinstance(said_at, str) and said_at.strip()
-        else None
-    )
+    # WHERE THOSE NAMES WERE SAID IS NOT THIS STEP'S TO SAY (27 September
+    # 2026). A step used to carry the commit the project's declarations are
+    # read at, and pass it on to the runner. That made the commit part of what
+    # a caller composes, and the far side then had nothing better than the
+    # request's own word for it. The build and its recorded starting commit are
+    # bound ONCE now, where the runner is made, off the coordinator's own
+    # ledger; the runner stamps them onto every request it sends and this step
+    # hands over nothing about either.
 
     # Delegate to the runner (default = in-process subprocess core)
     exit_code, captured_output = runner(
@@ -322,7 +319,6 @@ def deploy_compose(step: Step, *, runner: ScriptRunner = _run_script_step) -> St
             else None
         ),
         launch_settings=launch_settings,
-        **({"declared_at": where_declared} if where_declared else {}),
         deploy=dict(ownership) if isinstance(ownership, dict) else None,
     )
 

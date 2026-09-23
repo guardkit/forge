@@ -4914,6 +4914,11 @@ def build_in_daemon_deploy_dispatcher(
                 extra_env=dict(spec.env),
                 memory_project=memory_name,
                 launch_settings=declared_names,
+                # The same stamp the deploy steps carry: this build, and the
+                # commit this coordinator's ledger records it as starting
+                # from. The gate goes through the same environment door.
+                build=build_id,
+                start_commit=build_started_at,
             )
         elif spec is not None:
             invoker = RepoDriverLiveGateInvoker(
@@ -4964,10 +4969,15 @@ def build_in_daemon_deploy_dispatcher(
             deploy_ownership=deploy_ownership,
             memory_project=build_memory,
             launch_settings=build_declared,
-            # WHERE THOSE DECLARATIONS WERE SAID: the recorded commit this
-            # build starts from. The helper reads the project's own two files
-            # THERE rather than off the working copy it runs out of, so a line
-            # a build writes into that copy cannot widen its own door.
+            # WHICH BUILD THIS IS, AND WHERE ITS DECLARATIONS WERE SAID: the
+            # recorded commit this build starts from, both read off THIS
+            # coordinator's own ledger just above. They are stamped onto every
+            # request the helper is sent for this build, in one place, so the
+            # helper reads the project's own two files THERE rather than off
+            # the working copy it runs out of — and can ask this coordinator
+            # whether that commit really is the one recorded for this build
+            # before it reads a line of them.
+            build_id=build_id,
             declared_at=build_started_at,
             # WHAT THE CHECK IS HANDED so it can pin what it checked, and the
             # question the project declared it wants "what are you running"
