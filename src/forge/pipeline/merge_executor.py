@@ -3989,6 +3989,22 @@ async def execute_merge_deploy(
                     read_allowlist=[repo_root],
                     timeout_seconds=merge_wall,
                     with_nats_streaming=False,
+                    # WHOSE WORK THIS COMMAND IS, AND WHERE ITS DECLARATIONS
+                    # WERE SAID (23 September 2026). When this command goes to
+                    # the helper inside the repository's sandbox, the helper
+                    # reads that project's own declaration files at a commit
+                    # before it launches anything. It used to be told this was
+                    # somebody running a command BY HAND, which it is not, and
+                    # so it read them at the committed HEAD of the copy it had
+                    # — the one way left for a build to widen its own door by
+                    # committing a line and then pressing merge. The press
+                    # knows its build, and the commit this coordinator's own
+                    # ledger records that build as starting from is read here,
+                    # off the record, never guessed. The in-container runner
+                    # takes both and ignores them: it reads nothing at a
+                    # commit.
+                    build=build_id,
+                    start_commit=_the_recorded_start_commit(),
                 )
                 report = _parse_merge_report(result)
                 merged_in_report = bool(report and report.get("outcome") == "merged")

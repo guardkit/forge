@@ -53,6 +53,7 @@ from forge.pipeline.merge_offer import (
     MERGE_OFFER_TARGET_IDENTIFIER,
     MergeOfferService,
 )
+from tests.forge._a_stand_in_coordinator import a_coordinator_that_recorded
 
 BUILD_ID = "build-FEAT-MX1-20260824"
 FEATURE_ID = "FEAT-MX1"
@@ -61,6 +62,11 @@ CORRELATION = "corr-mx-1"
 MAIN_SHA = "a" * 40
 
 from datetime import datetime, timezone
+
+#: The commit the build rows below record their work as starting from. The
+#: merge word stamps its command with it, and the two presses in this file
+#: that go through a REAL helper need a coordinator that says the same.
+THE_RECORDED_START = "0" * 40
 
 
 def _utcnow() -> datetime:
@@ -1996,7 +2002,14 @@ class TestTheSameMergeThroughTheSidecar:
         server = build_server(port=0, config_loader=lambda: config)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
-        try:
+        # SOMEBODY TO ASK WHAT THIS BUILD STARTS FROM (23 September 2026). The
+        # merge word stamps its command with the build it is pressing and the
+        # commit the ledger records that build as starting from, and the
+        # helper checks that pair against the coordinator's own record before
+        # it runs anything. A child of this process on loopback answers it.
+        with a_coordinator_that_recorded(
+            {BUILD_ID: THE_RECORDED_START}, monkeypatch
+        ):
             host, port = server.server_address[:2]
             sidecar_receipts = tmp_path / "receipts-sidecar"
             sidecar_pool = self._fresh_pool(tmp_path / "sidecar.db")
@@ -2012,12 +2025,13 @@ class TestTheSameMergeThroughTheSidecar:
                 deploy_dispatcher=_FakeDeploy(),
                 receipts_root_fn=lambda: sidecar_receipts,
             )
-            outcome_b = await _run_executor(
-                deps_b, repo_root, baseline_failing=baseline
-            )
-        finally:
-            server.shutdown()
-            server.server_close()
+            try:
+                outcome_b = await _run_executor(
+                    deps_b, repo_root, baseline_failing=baseline
+                )
+            finally:
+                server.shutdown()
+                server.server_close()
 
         # The merge really did run on the host, through the sidecar.
         host_baseline = (
@@ -3215,7 +3229,12 @@ class TestTheBranchReachesTheSandboxDoor:
         server = build_server(port=0, config_loader=lambda: config)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
-        try:
+        # The same stamp, and the same somebody to check it against: this
+        # press is a repair's, so it is that build the coordinator is asked
+        # about.
+        with a_coordinator_that_recorded(
+            {REPAIR_BUILD_ID: THE_RECORDED_START}, monkeypatch
+        ):
             host, port = server.server_address[:2]
             deps, publisher, _gk, dp = _deps(
                 config,
@@ -3226,16 +3245,17 @@ class TestTheBranchReachesTheSandboxDoor:
                 ),
             )
             consumer = MergeApprovalConsumer(deps)
-            await consumer.handle_envelope(
-                _envelope(
-                    request_id=f"merge-{REPAIR_BUILD_ID}",
-                    correlation_id=f"corr-{REPAIR_BUILD_ID}",
+            try:
+                await consumer.handle_envelope(
+                    _envelope(
+                        request_id=f"merge-{REPAIR_BUILD_ID}",
+                        correlation_id=f"corr-{REPAIR_BUILD_ID}",
+                    )
                 )
-            )
-            await _drain(consumer)
-        finally:
-            server.shutdown()
-            server.server_close()
+                await _drain(consumer)
+            finally:
+                server.shutdown()
+                server.server_close()
 
         report = publisher.reports[0]
         assert report.result == "publication-pending"

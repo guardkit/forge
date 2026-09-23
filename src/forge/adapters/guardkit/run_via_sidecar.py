@@ -46,22 +46,26 @@ or the landed-merge detection. No branch in the argument list means no branch
 in the request, and the merge command derives the feature's own branch exactly
 as it always has.
 
-WHAT THESE TWO DOORS DO NOT CARRY, said plainly (27 September 2026, the
-seventh review, correcting a record that claimed more than was built). The
-deploy stage stamps every request it sends the helper with the build it is for
-and the commit the coordinator recorded that build as starting from, so the
-helper reads that project's own declaration files THERE. These two doors do
-not: their callables are built per ADDRESS, once, rather than per build, and
-the requests carry the memory name and the declared setting names but no build
-and no commit. The helper reads them as by-hand runs and takes the project's
-declarations from the committed HEAD of the copy it has — which is exactly
-what they did before the binding existed, so nothing got worse. Nothing here
-chooses its own authority either: there is no commit on these requests for the
-helper to honour. But it is the one route left by which a build could widen
-its own door by COMMITTING a line and then asking for a merge or a leg, and
-closing it means threading the build and its recorded starting commit down to
-these two calls — a change to the merge path, deliberately not made in the
-same pass as the binding.
+WHAT THESE TWO DOORS NOW CARRY (23 September 2026, closing the carry-forward
+the previous note left open). The deploy stage stamps every request it sends
+the helper with the build it is for and the commit the coordinator recorded
+that build as starting from, so the helper reads that project's own
+declaration files THERE. Until this pass these two doors instead sent
+``by_hand: true`` — the label a PERSON running a command by hand wears — on
+every factory request that named a memory or a setting. Two things were wrong
+with that. It is the shape the rule forbids: a request the factory made,
+wearing the manual label, so a manual reading is what it got. And the reading
+it got was the committed HEAD of whatever copy the far side has, which is the
+one route left by which a build could widen its own door by COMMITTING a line
+and then asking for a merge or a leg.
+
+Both doors' callables are still built per ADDRESS, so the pair travels per
+CALL instead: the merge word passes the build it is pressing and the commit
+its own ledger records that build as starting from, and a fix journey's leg
+runner is bound to its build's row where the runner is chosen. Neither door
+composes either value, and neither offers a by-hand claim, because neither has
+a caller that runs by hand. A call with no build sends none, and the far side
+refuses it if it asks for anything declared.
 """
 
 from __future__ import annotations
@@ -303,6 +307,8 @@ def build_sidecar_guardkit_run(
         extra_context_paths: list[str] | None = None,  # noqa: ARG001 — merge only
         memory_project: str | None = None,
         launch_settings: Sequence[str] | None = None,
+        build: str | None = None,
+        start_commit: str | None = None,
     ) -> GuardKitResult:
         started_at = time.monotonic()
 
@@ -363,18 +369,27 @@ def build_sidecar_guardkit_run(
             body["memory_project"] = str(memory_project)
         if launch_settings:
             body["launch_settings"] = [str(name) for name in launch_settings]
-        if body.get("memory_project") or body.get("launch_settings"):
-            # AND THIS DOOR CITES NO BUILD RECORD, AND SAYS SO (23 September
-            # 2026, the eighth review). The helper refuses a request that asks
-            # for a project's declarations to be read and names neither a
-            # build nor a commit, because that is what a dropped coordinator
-            # stamp looks like. This door has never carried the build id onto
-            # the wire, so it claims what it is really asking for: read them
-            # at the committed HEAD of the copy you have. CARRY IT FORWARD:
-            # the merge word does know which build it is for, and stamping
-            # this request with it would bind these names to the recorded
-            # commit the way the deploy stage's requests are bound.
-            body["by_hand"] = True
+        # AND WHOSE WORK THIS IS, AND WHERE THAT WORK'S DECLARATIONS WERE SAID
+        # (23 September 2026, the carry-forward closed). This door used to send
+        # ``by_hand: true`` here, unconditionally — a factory request wearing
+        # the label a person running one by hand wears, which is the one shape
+        # the rule forbids, and which made the far side read this project's
+        # declarations at the committed HEAD of the copy it has rather than at
+        # the commit the record names. The merge word knows its build: it is
+        # stamped on the request, with the commit THIS COORDINATOR'S LEDGER
+        # records that build as starting from, and the far side confirms the
+        # pair with the coordinator before it reads a line. Neither is composed
+        # here: both are the caller's, off the record.
+        #
+        # There is no by-hand caller of this door — the merge word is the only
+        # one — so there is no by-hand claim to make and none is offered. A
+        # call that names no build sends none, and the far side refuses it if
+        # it asks for anything declared, which is the honest answer rather than
+        # a quiet read at whatever HEAD happens to be.
+        if build:
+            body["build"] = str(build)
+        if start_commit:
+            body["declared_at"] = str(start_commit)
         # THE BRANCH TRAVELS AS ITS OWN FIELD. The sidecar builds the command
         # on the far side, so a --branch left in this list would be dropped
         # and a fix journey's repair would be merged from a branch nobody
@@ -591,6 +606,8 @@ def build_sidecar_leg_run(
         extra_context_paths: list[str] | None = None,
         memory_project: str | None = None,
         launch_settings: Sequence[str] | None = None,
+        build: str | None = None,
+        start_commit: str | None = None,
     ) -> GuardKitResult:
         started_at = time.monotonic()
 
@@ -648,12 +665,17 @@ def build_sidecar_leg_run(
             body["memory_project"] = str(memory_project)
         if launch_settings:
             body["launch_settings"] = [str(name) for name in launch_settings]
-        if body.get("memory_project") or body.get("launch_settings"):
-            # AND THIS DOOR CITES NO BUILD RECORD, AND SAYS SO — the same
-            # sentence as the merge door above, for the same reason, with the
-            # same thing to carry forward: the fix journey's legs do know
-            # which build they belong to.
-            body["by_hand"] = True
+        # AND WHOSE WORK THIS LEG IS, AND WHERE THAT WORK'S DECLARATIONS WERE
+        # SAID — the same pair as the merge door above, for the same reason,
+        # and the same claim removed. A fix journey's legs belong to a build;
+        # the runner for a leg is bound to that build's row when it is made,
+        # so the stamp arrives here from the record rather than from anything
+        # this door composes. No by-hand caller of this door exists, so no
+        # by-hand claim is offered.
+        if build:
+            body["build"] = str(build)
+        if start_commit:
+            body["declared_at"] = str(start_commit)
         http_timeout = float(timeout_seconds) + http_timeout_margin
         try:
             status, parsed = await asyncio.to_thread(
