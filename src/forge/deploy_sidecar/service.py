@@ -607,6 +607,17 @@ def deploy_executor_notes_root(env: "dict[str, str] | None" = None) -> Path:
 #: it has no ledger, so without it a request naming the commit its own
 #: declarations are read at is choosing its own authority. See
 #: :func:`_bound_commit`.
+#:
+#: WHAT SERVES IT (27 September 2026, the seventh review). The small read-only
+#: service :mod:`forge.record_answer`, which answers exactly these two
+#: questions off the coordinator's own record and changes nothing. Until it
+#: existed this setting named an address nothing in the estate served, so a
+#: helper started by the settings of the day had no way to ask and refused
+#: every request that named a commit: safe, and the factory not deploying.
+#: The address reaches this service's own settings on the host through
+#: ``scripts/systemd/forge-deploy-sidecar.service``, and inside a repository's
+#: sandbox through that sandbox's environment, which ``deploy/sandbox-deploy.sh``
+#: carries it into when the host has it.
 COORDINATOR_OWNER_ENV: str = "FORGE_TARGET_OWNER_URL"
 
 #: How long the executor waits for that one answer. Short on purpose: it is

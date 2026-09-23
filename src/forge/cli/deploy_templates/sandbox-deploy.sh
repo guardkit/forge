@@ -70,6 +70,17 @@
 #                            the receipts root, the build settings. A file
 #                            rendered by sops at deploy time, passed to `sbx`
 #                            with --env-file. Never anyone's shell.
+#   FORGE_TARGET_OWNER_URL   where the coordinator's read-only answer is, with
+#                            its route on the end. The deploy sidecar inside
+#                            this sandbox asks it two things — what commit a
+#                            build was recorded as starting from, and which
+#                            build holds a deployment target — and sends it
+#                            nothing but those names. Carried in when it is
+#                            set; the address must be one that resolves from
+#                            INSIDE the sandbox, and SANDBOX_ALLOW_NETWORK must
+#                            name it. Unset means the sidecar in here cannot
+#                            ask, and it then refuses a request that names a
+#                            commit rather than believing it.
 #   The factory's code is mounted from five checkouts, not two: forge's own
 #   pyproject names nats-core and fleet-memory as the folders beside it, and
 #   guardkitfactory is the harness the runner's builds import. They are
@@ -234,6 +245,16 @@ create_sandbox() {
     argv+=(--env SANDBOX_FORGE_PATH --env SANDBOX_GUARDKIT_PATH)
     if [[ -n "${SANDBOX_RECEIPTS_PATH}" ]]; then
       argv+=(--env SANDBOX_RECEIPTS_PATH)
+    fi
+    # WHERE THE COORDINATOR'S READ-ONLY ANSWER IS, carried in when this script
+    # was given it. The deploy sidecar in here asks it what commit a build was
+    # recorded as starting from before it reads that project's declarations at
+    # one, and who owns a deployment target when its own note is gone. Only the
+    # name of a build or a target is ever sent to it. Left unset, the sidecar in
+    # here cannot ask, and refuses a request naming a commit rather than
+    # believing it — nothing is deployed and the sentence says why.
+    if [[ -n "${FORGE_TARGET_OWNER_URL:-}" ]]; then
+      argv+=(--env FORGE_TARGET_OWNER_URL)
     fi
   fi
   if carries_the_factory; then
