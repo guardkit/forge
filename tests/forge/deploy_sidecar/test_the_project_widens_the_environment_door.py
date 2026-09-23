@@ -752,6 +752,96 @@ class TestTheCommitIsBoundToTheRecord:
         assert COORDINATOR_OWNER_ENV in body["error"]
         assert "exit_code" not in body
 
+    def test_a_build_the_coordinator_says_nothing_about_is_refused_too(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """AND THE CASE THAT ACTUALLY HAPPENS (23 September 2026).
+
+        The test above is the weak case: nobody to ask. This is the one a
+        wrong or stale build takes wherever the coordinator's route IS set —
+        it is asked, and it has no record of that build. That used to fall
+        through to this copy's committed HEAD with a log line for its only
+        trace, which is the very quietness the whole binding exists to end.
+        """
+        project, _older, head = self._two_commits(tmp_path)
+        with _a_coordinator_that_recorded({"some-other-build": head}, monkeypatch):
+            status, body = _ask(
+                project,
+                {"launch_settings": [UNDECLARED_SETTING], "build": THE_BUILD},
+            )
+        assert status == 400, body
+        assert THE_BUILD in body["error"]
+        assert "did not say what commit it recorded" in body["error"]
+        assert "was not read at this copy's committed HEAD instead" in body["error"]
+        # NOTHING STARTED, and the name never reached a child.
+        assert "exit_code" not in body and "output_tail" not in body
+
+
+class TestTheEnvironmentDoorIsBoundToo:
+    """A request asking this project to widen its environment door (ninth review).
+
+    The env half of the same door was left unbound. The permitted setting
+    names are the factory's own list UNION what this project declares in its
+    committed profile, read at the bound commit — so a request carrying a name
+    the factory's own list does not hold is asking for that declaration to be
+    read, exactly as one carrying ``launch_settings`` is. It was not counted
+    as asking, so it was served with no build and no claim; and that is the
+    shape of three of the deploy stage's own legs.
+    """
+
+    IDENTITY = {
+        "setting": "WIDGET_SHOP_IDENTITY",
+        "reported_as": "WIDGET_SHOP_DEPLOYED",
+        "asked_with": "WIDGET_SHOP_RUNNING",
+        "running_as": "WIDGET_SHOP_RUNNING",
+    }
+
+    def _a_project_that_declares_its_identity(self, tmp_path: Path) -> Path:
+        return _a_project(tmp_path / "widget-shop", identity=dict(self.IDENTITY))
+
+    def test_a_declared_setting_on_the_request_with_no_build_is_refused(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        project = self._a_project_that_declares_its_identity(tmp_path)
+        with _no_coordinator(monkeypatch):
+            status, body = _ask(
+                project, {"env": {"WIDGET_SHOP_IDENTITY": "j-abc123@def456"}}
+            )
+        assert status == 400, body
+        assert "names neither the build it is for nor a commit" in body["error"]
+        assert "by_hand" in body["error"]
+        assert "exit_code" not in body and "output_tail" not in body
+
+    def test_the_same_request_saying_it_is_by_hand_is_served(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        project = self._a_project_that_declares_its_identity(tmp_path)
+        with _no_coordinator(monkeypatch):
+            status, body = _ask(
+                project,
+                {
+                    "env": {"WIDGET_SHOP_IDENTITY": "j-abc123@def456"},
+                    "by_hand": True,
+                },
+            )
+        assert status == 200, body
+        assert "WIDGET_SHOP_IDENTITY" in _names_the_child_was_given(body)
+
+    def test_only_the_factorys_own_names_asks_for_nothing_and_is_served(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The factory's own list is not this project's to widen or withhold.
+
+        A request whose every name is one the factory itself carries asks this
+        project for nothing, so it is bound to nothing and served exactly as
+        every caller written before these fields asks for.
+        """
+        project = self._a_project_that_declares_its_identity(tmp_path)
+        with _no_coordinator(monkeypatch):
+            status, body = _ask(project, {"env": {"CANDIDATE": "1"}})
+        assert status == 200, body
+        assert "CANDIDATE" in _names_the_child_was_given(body)
+
 
 class TestBothFilesAreReadAtTheBoundCommit:
     """The profile's own names are committed lines too (the door's other half).
@@ -801,7 +891,12 @@ class TestBothFilesAreReadAtTheBoundCommit:
             yaml.safe_dump(profile), encoding="utf-8"
         )
         with _no_coordinator(monkeypatch):
-            status, body = _ask(project, {"env": {UNDECLARED_SETTING: "anything"}})
+            # Run by hand and saying so, so what this proves is the
+            # environment door's own verdict rather than the binding above it.
+            status, body = _ask(
+                project,
+                {"env": {UNDECLARED_SETTING: "anything"}, "by_hand": True},
+            )
         assert status == 400, body
         assert "not allowlisted" in body["error"]
         assert "exit_code" not in body

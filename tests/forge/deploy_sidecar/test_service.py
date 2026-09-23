@@ -270,7 +270,14 @@ def test_unlisted_env_key_refused(repo: Path) -> None:
     cfg = _config({"appmilla/api_test": str(repo)})
     runner = _RecordingRunner()
     status, body = process_run_request(
-        {"repo": "appmilla/api_test", "script": "deploy.sh", "env": {"EVIL": "x"}},
+        {
+            "repo": "appmilla/api_test",
+            "script": "deploy.sh",
+            "env": {"EVIL": "x"},
+            # A NAME OUTSIDE THE FACTORY'S OWN LIST asks this project to
+            # widen its door, so the request says whose run it is.
+            "by_hand": True,
+        },
         config=cfg,
         script_runner=runner,
     )
@@ -474,6 +481,7 @@ def test_the_sandbox_creation_paths_are_deliberately_refused(
             "repo": "appmilla/api_test",
             "script": "deploy.sh",
             "env": {key: "/run/user/1000/anything"},
+            "by_hand": True,
         },
         config=cfg,
         script_runner=runner,
@@ -492,6 +500,7 @@ def test_a_near_miss_sandbox_key_is_still_refused(repo: Path) -> None:
             "repo": "appmilla/api_test",
             "script": "deploy.sh",
             "env": {"SANDBOX_COMMAND": "rm -rf /"},
+            "by_hand": True,
         },
         config=cfg,
         script_runner=runner,
@@ -519,6 +528,7 @@ def test_live_gate_env_key_allowed(repo: Path) -> None:
             "repo": "appmilla/api_test",
             "script": "deploy.sh",
             "env": {"BASE_URL": "http://localhost:8080"},
+            "by_hand": True,
         },
         config=cfg,
         script_runner=runner,
@@ -541,6 +551,7 @@ def test_candidate_env_key_allowed(repo: Path) -> None:
             "repo": "appmilla/api_test",
             "script": "deploy.sh",
             "env": {"CAND_PORT": "18080"},
+            "by_hand": True,
         },
         config=cfg,
         script_runner=runner,

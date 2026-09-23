@@ -130,6 +130,12 @@ def build_deploy_stage_runner(
     #: the copy it has and says so.
     build_id: str | None = None,
     start_commit: str | None = None,
+    #: An ATTENDED run, asked for by a person, with no build to stamp. The
+    #: far side refuses an unstamped request that asks a project to widen its
+    #: environment door, so an attended run says what it is. Never derived
+    #: from ``build_id`` being absent: that is also what a dropped stamp looks
+    #: like, and the whole point is to tell the two apart.
+    by_hand: bool = False,
 ) -> DeployStageRunner | None:
     """Compose the deploy-stage runner, gated on ``config.enabled``.
 
@@ -192,6 +198,7 @@ def build_deploy_stage_runner(
         sandbox=sandbox,
         build_id=build_id,
         start_commit=start_commit,
+        by_hand=by_hand,
     )
 
 
@@ -250,6 +257,8 @@ async def dispatch_deploy_stage(
     #: would make it true.
     build_id: str | None = None,
     declared_at: str | None = None,
+    #: An attended run with no build to stamp — see above.
+    by_hand: bool = False,
     identity_env: dict[str, str] | None = None,
     ask_env: dict[str, str] | None = None,
 ) -> DeployStageResult | None:
@@ -301,6 +310,7 @@ async def dispatch_deploy_stage(
         sandbox=sandbox,
         build_id=build_id,
         start_commit=declared_at,
+        by_hand=by_hand,
     )
     if runner is None:
         # Flag OFF — no dispatch. Byte-for-byte no-op.

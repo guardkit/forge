@@ -165,6 +165,14 @@ async def _adispatch(
             feat_id=feature_id,
             task_id=task_id,
             deployer=deployer,
+            # AN ATTENDED DEPLOY, ASKED FOR BY A PERSON (23 September 2026).
+            # This command names no build, so nothing stamps the requests it
+            # sends the helper — and the helper will not read a project's own
+            # declarations for a request that says nothing about whose work it
+            # is, because that shape is exactly what a dropped coordinator
+            # stamp looks like. So this run says what it is: by hand, at the
+            # committed HEAD of the copy the helper has.
+            by_hand=True,
         )
     finally:
         await closer()

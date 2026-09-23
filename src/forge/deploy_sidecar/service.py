@@ -1345,9 +1345,10 @@ def _bound_commit(
 
     ``reads_declaration`` is the caller saying "this route reads the project's
     declared names whatever the request's own fields say" — the deploy block's
-    two setting names are read that way. A request that carries
-    ``launch_settings`` or ``memory_project`` is asking for a declaration to be
-    read by its own fields and needs no such flag.
+    two setting names are read that way, and so is a setting name on the
+    request that only the project's own declaration can permit. A request that
+    carries ``launch_settings`` or ``memory_project`` is asking for a
+    declaration to be read by its own fields and needs no such flag.
 
     THE COMMIT IS BOUND TO THE RECORD, NOT TAKEN FROM THE REQUEST (27
     September 2026, the sixth review, Codex's requirement of the 23rd). Until
@@ -1374,6 +1375,9 @@ def _bound_commit(
       or without a commit — is REFUSED. That is deliberate and it is the same
       cost the executor's ownership route already accepts: the alternative is
       a request letting itself in, which is the hole being closed;
+    * and a build the coordinator IS asked about and says nothing about is
+      refused for the same reason, rather than falling to this copy's
+      committed HEAD (23 September 2026, the ninth review);
     * a request that names neither — a by-hand run — reads at the committed
       HEAD of this copy, and the sentence it is answered with says so.
 
@@ -1387,13 +1391,22 @@ def _bound_commit(
     commit is served ONLY when it says ``by_hand: true`` — an explicit claim,
     said back in the sentence. Without it, refused in plain words.
 
+    AND SO DOES A REQUEST THAT ASKS THE PROJECT TO WIDEN ITS ENVIRONMENT DOOR
+    (23 September 2026, the ninth review). The other half of that door was
+    still unbound: a request carrying a setting name that only the project's
+    own committed declaration can permit is asking for that declaration to be
+    read, exactly as one carrying ``launch_settings`` is, but it was not
+    counted as asking, so it was served with no build and no claim. The route
+    that reads names off the request tells this helper so, through
+    ``reads_declaration``.
+
     A request that asks for NOTHING declared — no ``launch_settings``, no
-    ``memory_project``, and a route that does not read the deploy block's own
-    setting names — needs no binding at all and is untouched by this: it is
-    served with the factory's own named list and nothing else, exactly as
-    every caller written before these fields asks for. That is most of the
-    planning routes, and refusing them would be refusing work that never asked
-    a project what it declares.
+    ``memory_project``, no setting name beyond the factory's own list, and a
+    route that does not read the deploy block's own setting names — needs no
+    binding at all and is untouched by this: it is served with the factory's
+    own named list and nothing else, exactly as every caller written before
+    these fields asks for. That is most of the planning routes, and refusing
+    them would be refusing work that never asked a project what it declares.
 
     Never raises: a request is input, and a coordinator that cannot be reached
     is an unanswered question, never an answer.
@@ -1518,10 +1531,27 @@ def _bound_commit(
 
     if not recorded:
         if presented is None:
-            return None, None, (
-                "at this copy's committed HEAD — the coordinator recorded no "
-                f"starting commit for build {build}"
-            )
+            # AND A BUILD THE COORDINATOR SAYS NOTHING ABOUT IS REFUSED TOO
+            # (23 September 2026, the ninth review). This was the last quiet
+            # way in: asking the coordinator and being told nothing fell
+            # through to this copy's committed HEAD, with a log line for its
+            # only trace. That is the shape a wrong or stale build takes
+            # wherever the coordinator's route IS set, which is every place
+            # this runs in earnest — so the weaker case (nobody to ask) was
+            # refused above while the case that actually occurs was served.
+            # Both are the same question with the same answer: a build's
+            # declarations are read at the commit the record names, or they
+            # are not read.
+            return None, (
+                f"this request says it is for build {build}, and the "
+                "coordinator did not say what commit it recorded that build "
+                "as starting from, so the build could not be confirmed. It "
+                "was not read at this copy's committed HEAD instead: a "
+                "build's declarations are read at the commit the record "
+                "names, and no record here names one. Nothing was read and "
+                "nothing was started. (Somebody running this by hand says so "
+                "instead, by sending 'by_hand': true and no build.)"
+            ), ""
         return None, (
             f"this request asks for {repr(presented)} to be the commit build "
             f"{build} has its declarations read at, and the coordinator did "
@@ -1598,9 +1628,10 @@ def _launch_fields(
     AND A REQUEST THAT ASKS FOR ONE SAYS WHOSE IT IS (23 September 2026, the
     eighth review). ``reads_declaration`` is passed by a route that reads the
     project's declared names whatever fields the request carries — the deploy
-    block's two setting names — so such a request is bound like one carrying
-    ``launch_settings``. A request that asks for nothing declared is bound to
-    nothing and served as it always was.
+    block's two setting names, and a setting name on the request that only
+    this project's own declaration can permit (the ninth review) — so such a
+    request is bound like one carrying ``launch_settings``. A request that
+    asks for nothing declared is bound to nothing and served as it always was.
     """
     if not isinstance(payload, dict):
         return None, (), None, None
@@ -2089,11 +2120,27 @@ def process_run_request(
     # below. So such a request is bound the same way one carrying
     # ``launch_settings`` is — it carries its build, or it says it is being
     # run by hand.
+    #
+    # AND SO DOES A REQUEST THAT ASKS THIS PROJECT TO WIDEN ITS ENVIRONMENT
+    # DOOR (23 September 2026, the ninth review). The env half of the door was
+    # still unbound: the permitted setting names below are the factory's own
+    # list UNION what this project declares in its committed profile, read at
+    # the bound commit — so a request carrying a name the factory's own list
+    # does not hold is asking for that declaration to be read, just as one
+    # carrying ``launch_settings`` is. It was not counted as asking, so it was
+    # served with no build and no claim, and that is the shape of three of the
+    # deploy stage's own legs. A request whose names are all the factory's own
+    # asks the project for nothing and is bound to nothing, as before.
+    asks_the_project_to_widen = isinstance(raw_env, dict) and any(
+        str(key) not in ENV_ALLOWLIST_BASE for key in raw_env
+    )
     launch_memory, launch_names, launch_error, bound_at = _launch_fields(
         payload,
         repo_path=repo_path,
         repo=repo,
-        reads_declaration=payload.get("deploy") is not None,
+        reads_declaration=(
+            payload.get("deploy") is not None or asks_the_project_to_widen
+        ),
     )
     if launch_error is not None:
         return 400, {"error": launch_error}

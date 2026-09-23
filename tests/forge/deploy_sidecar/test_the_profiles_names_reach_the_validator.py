@@ -191,6 +191,13 @@ class TestTheRealRouteWithTheCommittedProfile:
                 "script": script,
                 "env": env,
                 "timeout_seconds": 5,
+                # RUN BY HAND, AND SAYING SO (23 September 2026). These
+                # requests name settings only this project's own declaration
+                # permits, so they ask for that declaration to be read — and a
+                # request that asks carries either the build the coordinator
+                # stamped it with or this claim. What is under test here is the
+                # door's verdict, so the claim is the honest one to make.
+                "by_hand": True,
             },
             config=_config(repo),
             script_runner=ran,
@@ -257,6 +264,7 @@ class TestTheRealRouteWithTheCommittedProfile:
                 "script": "deploy/deploy.sh",
                 "env": {"FORGE_LEDGER_PATH": "/somewhere/of/my/own"},
                 "timeout_seconds": 5,
+                "by_hand": True,
             },
             config=_config(repo),
             script_runner=_Ran(),
@@ -303,6 +311,12 @@ class TestTheDeployBlocksSettingNamesToo:
                 "script": "deploy/deploy.sh",
                 "env": {"PROMOTE": "1"},
                 "timeout_seconds": 5,
+                # A deploy of the live thing always asks for this project's
+                # declaration (its two setting names are committed lines), so
+                # it carries its build or says it is by hand. The build inside
+                # the block below is the deploy's own target counter's build,
+                # not the coordinator's stamp on the request.
+                "by_hand": True,
                 "deploy": {
                     "target": "a-project::live",
                     "target_counter": 1,
@@ -394,6 +408,7 @@ class TestADeclaredLaunchSettingOnTheRequest:
                 "script": "deploy/deploy.sh",
                 "env": {"A_PROJECT_TOOL_HOME": "somewhere"},
                 "timeout_seconds": 5,
+                "by_hand": True,
                 **body,
             },
             config=_config(repo),
