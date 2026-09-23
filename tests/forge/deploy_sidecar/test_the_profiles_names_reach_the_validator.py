@@ -41,16 +41,27 @@ from forge.deploy_sidecar.service import allowed_env_keys, process_run_request
 
 #: A real project's committed profile, in the estate this factory serves. It is
 #: READ, never written and never run: what is wanted from it is the names it
-#: declares, exactly as they are committed.
-A_COMMITTED_PROFILE = Path(
-    "/home/richardwoollcott/Projects/appmilla_github/api_test/deploy/profile.yaml"
-)
+#: declares, exactly as they are committed. Where it lives is this machine's
+#: business, not this repository's: the path comes from one setting, and with
+#: no setting the test skips. (A default path used to be written here; this
+#: repository is public, and a machine's own layout does not belong in it.)
+import os
+
+A_COMMITTED_PROFILE = Path(os.environ.get("FORGE_TEST_COMMITTED_PROFILE", ""))
+
+
+def _the_committed_profile() -> Path:
+    """The profile's path, or a skip: every reader of it goes through here."""
+    if not str(A_COMMITTED_PROFILE) or not A_COMMITTED_PROFILE.is_file():
+        pytest.skip(
+            "set FORGE_TEST_COMMITTED_PROFILE to a project's committed "
+            "deploy/profile.yaml to run this against a real one"
+        )
+    return A_COMMITTED_PROFILE
 
 
 def _profile_text() -> str:
-    if not A_COMMITTED_PROFILE.is_file():
-        pytest.skip(f"{A_COMMITTED_PROFILE} is not in this checkout")
-    return A_COMMITTED_PROFILE.read_text(encoding="utf-8")
+    return _the_committed_profile().read_text(encoding="utf-8")
 
 
 def _a_project(tmp_path: Path, profile_text: str) -> Path:
@@ -85,7 +96,7 @@ class TestTheCommittedProfilesOwnNames:
     """Every setting this project declares is permitted, by name."""
 
     def test_the_identity_settings_are_permitted(self) -> None:
-        profile = load_deploy_profile(A_COMMITTED_PROFILE)
+        profile = load_deploy_profile(_the_committed_profile())
         declared = yaml.safe_load(_profile_text()).get("identity") or {}
         permitted = allowed_env_keys(profile)
         for key in ("setting", "artifact_setting", "asked_with"):
@@ -103,7 +114,7 @@ class TestTheCommittedProfilesOwnNames:
         (``RUNNING_IDENTITY`` is both what the step is asked with and what it
         answers under), so the one that proves the rule is the check's marker.
         """
-        profile = load_deploy_profile(A_COMMITTED_PROFILE)
+        profile = load_deploy_profile(_the_committed_profile())
         declared = yaml.safe_load(_profile_text()).get("identity") or {}
         settings = {
             str(declared.get(k) or "")
