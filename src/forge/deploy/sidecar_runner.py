@@ -35,6 +35,7 @@ import logging
 import os
 import urllib.error
 import urllib.request
+from collections.abc import Sequence
 from pathlib import Path
 
 from forge.deploy.candidate_tree import CANDIDATE_TREES_DIRNAME
@@ -72,6 +73,9 @@ class SidecarScriptRunner:
         timeout: float = 600.0,
         output_cap: int | None = None,  # noqa: ARG002 — sidecar caps its own tail
         extra_env: dict[str, str] | None = None,
+        memory_project: str | None = None,
+        launch_settings: Sequence[str] | None = None,
+        deploy: dict[str, object] | None = None,
     ) -> tuple[int, str]:
         env: dict[str, str] = dict(extra_env or {})
         if env_file is not None:
@@ -82,6 +86,19 @@ class SidecarScriptRunner:
             "env": env,
             "timeout_seconds": timeout,
         }
+        # WHAT THE PROJECT DECLARED, AND WHICH MEMORY THIS WORK BELONGS TO, so
+        # the far side can build the child's environment from the named list
+        # rather than from whatever it happens to hold — the environment door
+        # (23 September 2026).
+        if memory_project:
+            body["memory_project"] = str(memory_project)
+        if launch_settings:
+            body["launch_settings"] = [str(name) for name in launch_settings]
+        # THE OWNERSHIP OF A DEPLOY OF THE LIVE THING. Present only on the leg
+        # that changes the live target; its presence is what sends the request
+        # through the far side's EXECUTOR rather than straight to a runner.
+        if deploy:
+            body["deploy"] = dict(deploy)
         if isinstance(cwd, str) and cwd.strip():
             # The sidecar decides: a candidate tree is honoured, anything else
             # is ignored in favour of the profile's own working directory.
@@ -125,6 +142,15 @@ class SidecarScriptRunner:
                 SIDECAR_TRANSPORT_EXIT_CODE,
                 f"sidecar response missing exit_code: {parsed!r}",
             )
+        # A DEPLOY THE EXECUTOR REFUSED is not a script that went red and not a
+        # transport failure: nothing ran. It comes back as a non-zero exit with
+        # the executor's own plain sentence, which is what the step records and
+        # what a person reads, and the word beside it so a caller can tell the
+        # refusals apart without reading English.
+        if parsed.get("accepted") is False:
+            word = str(parsed.get("word") or "the-deploy-was-refused")
+            sentence = str(parsed.get("sentence") or "the deploy was refused")
+            return (SIDECAR_TRANSPORT_EXIT_CODE, f"[{word}] {sentence}")
         exit_code = parsed.get("exit_code")
         output = parsed.get("output_tail", "")
         if not isinstance(exit_code, int) or isinstance(exit_code, bool):

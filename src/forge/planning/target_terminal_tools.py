@@ -58,6 +58,7 @@ from typing import Any
 import yaml
 
 from forge.adapters.guardkit.run import run as guardkit_run
+from forge.launch_environment import build_launch_env
 
 logger = logging.getLogger(__name__)
 
@@ -642,16 +643,34 @@ ValidateGateRegistryFn = Callable[[Path, str], Awaitable[ToolOutcome]]
 
 
 async def _default_normalizer_subprocess(
-    *, command: Sequence[str], cwd: str, timeout: int
+    *,
+    command: Sequence[str],
+    cwd: str,
+    timeout: int,
+    memory_project: str | None = None,
+    launch_settings: Sequence[str] | None = None,
 ) -> tuple[str, str, int, bool]:
     """Bounded subprocess seam for the normalizer (stubbable in tests).
 
     Returns ``(stdout, stderr, exit_code, timed_out)``. Never raises for a
     non-zero exit — the caller maps exit codes to :class:`ToolOutcome`.
+
+    THE ENVIRONMENT DOOR (23 September 2026; the one-true-copy design pass,
+    item 1, fourth revision H, "the environment door"). This launch named no
+    environment at all, which is the same door ``executor/shell_steps.py`` had
+    by the other spelling: a launch with no ``env=`` hands the child this
+    whole process's environment. It is now BUILT — the factory's own named
+    list, plus the memory name recorded for the work and the setting NAMES the
+    project itself declared. What is not named is not passed, so a credential
+    the launching process happened to be holding does not travel into a
+    program run against a project's working folder.
     """
     proc = await asyncio.create_subprocess_exec(
         *command,
         cwd=cwd,
+        env=build_launch_env(
+            memory_project=memory_project, declared=launch_settings or ()
+        ),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
