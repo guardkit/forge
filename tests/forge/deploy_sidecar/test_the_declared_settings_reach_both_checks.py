@@ -141,8 +141,13 @@ def repo(tmp_path: Path) -> Path:
         ),
         encoding="utf-8",
     )
+    # AND THE PROJECT SAYS WHAT ITS OWN BUILDS NEED, in the same file, in its
+    # own words. Since 23 September 2026 this is the ONLY thing that widens
+    # the helper's environment door: a request presenting a name the project
+    # has not declared here is refused and nothing starts.
     (root / ".guardkit" / "config.yaml").write_text(
-        f"toolchain:\n  test: {child}\n  test_timeout: 120\n",
+        f"toolchain:\n  test: {child}\n  test_timeout: 120\n"
+        f"launch:\n  settings: [{DECLARED_SETTING}]\n",
         encoding="utf-8",
     )
     return root

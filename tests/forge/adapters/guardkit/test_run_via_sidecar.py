@@ -49,6 +49,14 @@ def _executor_args(baseline_path: str | None = None) -> list[str]:
 def repo(tmp_path: Path) -> Path:
     root = tmp_path / "api_test"
     root.mkdir()
+    # WHAT THIS PROJECT SAYS ITS OWN BUILDS NEED. Since 23 September 2026 the
+    # helper permits a setting name on a request only when the project's own
+    # declaration lists it, so the setting a test below steers its stand-in
+    # with is declared here, in the project's own file.
+    (root / ".guardkit").mkdir()
+    (root / ".guardkit" / "config.yaml").write_text(
+        "launch:\n  settings: [FAKE_GUARDKIT_EXIT]\n", encoding="utf-8"
+    )
     return root
 
 

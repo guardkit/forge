@@ -37,7 +37,7 @@ from __future__ import annotations
 
 import os
 import stat
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 
 #: The two titles the fake refuses — the driver test's own fixture titles.
@@ -392,8 +392,16 @@ def validate_saw(path: Path) -> list[tuple[bool, bool]]:
     ]
 
 
-def scratch_repo(path: Path) -> Path:
-    """A git repository with one commit, the way the driver tests make one."""
+def scratch_repo(path: Path, *, declares: Sequence[str] | None = None) -> Path:
+    """A git repository with one commit, the way the driver tests make one.
+
+    ``declares`` are the settings THIS PROJECT says its own builds need, written
+    into its own ``.guardkit/config.yaml`` and committed with everything else.
+    A test whose stand-in programs are steered by settings has to say so here,
+    because the helper service permits a setting name on a request only when
+    the project itself declares it (23 September 2026) — the environment door
+    is the project's to widen, never the request's.
+    """
     import subprocess
 
     path.mkdir(parents=True, exist_ok=True)
@@ -406,6 +414,11 @@ def scratch_repo(path: Path) -> Path:
     }
     subprocess.run(["git", "init", "-q"], cwd=path, check=True, env=env)
     (path / "README.md").write_text("scratch\n", encoding="utf-8")
+    if declares:
+        declaration = path / ".guardkit" / "config.yaml"
+        declaration.parent.mkdir(parents=True, exist_ok=True)
+        names = ", ".join(str(name) for name in declares)
+        declaration.write_text(f"launch:\n  settings: [{names}]\n", encoding="utf-8")
     subprocess.run(["git", "add", "."], cwd=path, check=True, env=env)
     subprocess.run(["git", "commit", "-qm", "init"], cwd=path, check=True, env=env)
     return path
