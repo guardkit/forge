@@ -36,6 +36,7 @@ import pytest
 from forge.config.models import ForgeConfig
 from forge.lifecycle.persistence import SqliteLifecyclePersistence
 from forge.pipeline.merge_executor import (
+    STOPPED_BY_A_TAKEOVER,
     MergeExecutorDeps,
     execute_merge_deploy,
 )
@@ -777,8 +778,13 @@ class TestNothingHalfCheckedIsEverSent:
         assert second.status == "GATED"
         assert "It is NOT yet checked" in second.detail
         assert "nothing was sent to the remote" in second.detail
-        # The live check DID run on it; the merge command did not.
-        assert joins_two.calls == []
+        # THE MERGE COMMAND WAS NOT RUN AGAIN. The only thing asked of the
+        # build system is the question this stage added — check a join this
+        # press did not make — and the installed one has no such sub-command,
+        # so the sentence names it and the build stays gated.
+        assert [call["args"][0] for call in joins_two.calls] == ["check-join"]
+        assert "autobuild check-join" in second.detail
+        assert "does not have it" in second.detail
         assert _legs(deploy_two).count("candidate_check") == 1
         assert publisher.asked == []
 
@@ -841,11 +847,14 @@ class TestThePressAndThePublisherReadTheRecordTheSameWay:
         )
         second = await _press(deps_two, repo_root)
 
-        # The join is picked up, so the merge command is not run again and the
-        # build system's own checks never run on this commit at all.
-        assert joins_two.calls == []
+        # The join is picked up, so the merge command is not run again; the one
+        # thing asked is the check-join question, which the installed build
+        # system has no sub-command for, so those checks never run on this
+        # commit at all.
+        assert [call["args"][0] for call in joins_two.calls] == ["check-join"]
         assert second.result == "publication-pending"
         assert "It is NOT yet checked" in second.detail
+        assert "autobuild check-join" in second.detail
         # AND NOTHING WAS ASKED OF THE PUBLISHER, which is the point: the
         # press stops where the publisher would have refused it.
         assert publisher.asked == []
@@ -1097,3 +1106,247 @@ class TestTheDeployPutsLiveExactlyWhatWasChecked:
 
         assert outcome.result == "merged-deploy-failed"
         assert "reported no identity at all" in outcome.detail
+
+
+class _ADeployTheExecutorStopped:
+    """A promote leg whose deploy command a takeover stopped part-way.
+
+    This is exactly what the sidecar's runner hands back when the executor
+    answers that its command was stopped by a later holder of the target: a
+    failed step whose captured output carries the executor's own word and
+    sentence. Nothing ran to an end, and the press must not call it a deploy.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    async def __call__(self, **kwargs: Any) -> Any:
+        from types import SimpleNamespace
+
+        self.calls.append(kwargs)
+        leg = kwargs.get("leg", "deploy")
+        if leg == "candidate_check":
+            from tests.forge.pipeline.test_merge_executor import GREEN_GATE
+
+            return SimpleNamespace(
+                outcome="complete",
+                verdict="pass",
+                failed_step=None,
+                events=("DeployQueued",),
+                detail={"gate_summary": dict(GREEN_GATE), "candidate": "standing"},
+            )
+        if leg == "candidate_down":
+            return SimpleNamespace(
+                outcome="complete", verdict=None, detail={"candidate": "torn-down"}
+            )
+        owns = dict(kwargs.get("deploy_ownership") or {})
+        return SimpleNamespace(
+            outcome="failed",
+            verdict=None,
+            failed_step="deploy_compose",
+            detail={
+                "deploy_output": (
+                    f"[{STOPPED_BY_A_TAKEOVER}] the deploy command for "
+                    f"{owns.get('target')} from build {owns.get('build')} (the "
+                    f"target's counter {owns.get('target_counter')}) was stopped "
+                    "part-way by a later holder of the target, so it did not run "
+                    "to an end and nothing was deployed by this request."
+                )
+            },
+        )
+
+
+class TestACommandATakeoverStoppedIsNoDeploy:
+    """The stage reviewer's second finding, on the press's side of it.
+
+    A command a takeover stopped did not run. It is not a failed deploy
+    either: a later holder of the target owns it and is deploying its own
+    newer result. The build is joined, checked and published, so the press
+    stops at "published, deployment pending" and says exactly why.
+    """
+
+    def test_the_press_and_the_executor_use_the_same_word(self) -> None:
+        from forge.deploy_sidecar.deploy_executor import (
+            STOPPED_BY_A_TAKEOVER as THE_EXECUTORS_OWN,
+        )
+
+        assert STOPPED_BY_A_TAKEOVER == THE_EXECUTORS_OWN
+
+    @pytest.mark.asyncio
+    async def test_a_stopped_command_is_published_deployment_pending_not_failed(
+        self,
+        config_with_publication_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> None:
+        publisher = _APublisherThatSays([_published("c" * 40)])
+        deploy = _ADeployTheExecutorStopped()
+        deps = _deps_that_can_deploy(
+            config_with_publication_on, pool, publisher=publisher, deploy=deploy
+        )
+
+        outcome = await _press(deps, repo_root)
+
+        assert outcome.result == "published-deployment-pending", outcome.detail
+        assert outcome.result != "merged-deploy-failed"
+        assert "stopped part-way by a later holder of the target" in outcome.detail
+        assert "nothing was deployed" in outcome.detail
+        # Nothing claims to be running, and nothing was written onto the
+        # target's row as though it had been.
+        assert _record(pool).result == RESULT_PUBLISHED_DEPLOYMENT_PENDING
+        from forge.pipeline.deployment_lock import DeploymentLockStore
+
+        row = DeploymentLockStore(pool.connection).read("acme/widget-shop::live")
+        assert row.nothing_is_running is True
+
+
+class _ABuildSystemWithCheckJoin:
+    """An installed build system that HAS the check-join sub-command.
+
+    It answers the merge command exactly as :class:`_JoinsForReal` does — the
+    join is made for real, because reuse is settled by asking git — and
+    answers `check-join` with a report of its own.
+    """
+
+    def __init__(self, *, verify_ok: bool = True, detail: str = "") -> None:
+        self._merges = _JoinsForReal()
+        self.verify_ok = verify_ok
+        self.detail = detail
+        self.calls: list[dict[str, Any]] = []
+
+    async def __call__(self, **kwargs: Any) -> Any:
+        from forge.adapters.guardkit.models import GuardKitResult
+
+        self.calls.append(kwargs)
+        args = list(kwargs.get("args") or [])
+        if not args or args[0] != "check-join":
+            return await self._merges(**kwargs)
+        report = {
+            "outcome": "checked",
+            "joined_commit": args[args.index("--joined") + 1],
+            "verify_ran": True,
+            "verify_ok": self.verify_ok,
+            "verify_status": "passed" if self.verify_ok else "failed",
+            "verify_detail": self.detail or ("" if self.verify_ok else "2 checks went red"),
+            "checks_passed": 3 if self.verify_ok else 1,
+            "checks_total": 3,
+        }
+        return GuardKitResult(
+            status="success" if self.verify_ok else "failed",
+            subcommand="autobuild",
+            duration_secs=0.1,
+            stdout_tail=json.dumps(report),
+            stderr=None,
+            exit_code=0 if self.verify_ok else 1,
+        )
+
+
+class TestAReusedJoinIsCheckedWhenTheBuildSystemCan:
+    """Item 6, the half that IS built: the press asks, and uses the answer.
+
+    The build system's own checks after a join live inside its merge command,
+    which a press that picked up a join does not run again. The press now asks
+    for a sub-command that checks an already-joined commit. A build system
+    that has it closes the GATED ending by itself; one that has not — every
+    one today — leaves the build gated with that sub-command named.
+    """
+
+    async def _a_join_nobody_checked(
+        self, config, pool, repo_root  # noqa: ANN001
+    ) -> None:
+        """Leave a joined commit behind whose build-system checks never ran."""
+        from tests.forge.pipeline.test_merge_executor import _DiesWhileMerging
+
+        deps = MergeExecutorDeps(
+            config=config,
+            pool=pool,
+            pipeline_publisher=_FakePublisher(),
+            guardkit_run=_DiesWhileMerging(),
+            deploy_dispatcher=_FakeDeploy(),
+            publisher=_APublisherThatSays([_published("c" * 40)]),
+            what_the_machine_says=EVERY_WALL_STANDS,
+        )
+        with pytest.raises(KeyboardInterrupt):
+            await _press(deps, repo_root)
+
+    @pytest.mark.asyncio
+    async def test_a_build_system_that_has_it_is_asked_and_its_pass_is_used(
+        self,
+        config_with_publication_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> None:
+        await self._a_join_nobody_checked(config_with_publication_on, pool, repo_root)
+
+        publisher = _APublisherThatSays([_published("c" * 40)])
+        build_system = _ABuildSystemWithCheckJoin(verify_ok=True)
+        deps = MergeExecutorDeps(
+            config=config_with_publication_on,
+            pool=pool,
+            pipeline_publisher=_FakePublisher(),
+            guardkit_run=build_system,
+            deploy_dispatcher=_FakeDeploy(),
+            publisher=publisher,
+            what_the_machine_says=EVERY_WALL_STANDS,
+        )
+
+        outcome = await _press(deps, repo_root)
+
+        # It was ASKED, with the feature and the joined commit.
+        asked = [c for c in build_system.calls if c["args"][0] == "check-join"]
+        assert len(asked) == 1
+        assert asked[0]["args"][1] == FEATURE_ID
+        assert asked[0]["args"][2] == "--joined"
+        # The merge command was NOT run again.
+        assert [c["args"][0] for c in build_system.calls].count("merge") == 0
+        # ...and both kinds of check have now run on it, so it was published.
+        assert outcome.result == "published-deployment-pending", outcome.detail
+        assert publisher.asked != []
+        assert "It is NOT yet checked" not in outcome.detail
+        # The record carries the answer as a merge-checks line on this J.
+        lines = json.loads(
+            pool.connection.execute(
+                "SELECT lines_json FROM publication_records WHERE build_id = ?",
+                (BUILD_ID,),
+            ).fetchone()[0]
+        )
+        checked = [
+            line
+            for line in lines
+            if line.get("kind") == "done" and line.get("step") == "merge-checks"
+        ]
+        assert checked, "the answer was not written down"
+        assert checked[-1]["detail"]["verify_ok"] is True
+        assert checked[-1]["detail"]["ran_on"] == outcome.merged_sha
+        assert (
+            checked[-1]["detail"]["asked_the_build_system_about_a_reused_join"] is True
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_build_system_that_has_it_and_says_red_is_not_published(
+        self,
+        config_with_publication_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> None:
+        await self._a_join_nobody_checked(config_with_publication_on, pool, repo_root)
+
+        publisher = _APublisherThatSays([_published("c" * 40)])
+        build_system = _ABuildSystemWithCheckJoin(verify_ok=False)
+        deps = MergeExecutorDeps(
+            config=config_with_publication_on,
+            pool=pool,
+            pipeline_publisher=_FakePublisher(),
+            guardkit_run=build_system,
+            deploy_dispatcher=_FakeDeploy(),
+            publisher=publisher,
+            what_the_machine_says=EVERY_WALL_STANDS,
+        )
+
+        outcome = await _press(deps, repo_root)
+
+        assert outcome.result == "merged-verify-failed"
+        assert outcome.status == "FAILED"
+        assert "did not pass" in outcome.detail
+        assert "Nothing was published" in outcome.detail
+        assert publisher.asked == []

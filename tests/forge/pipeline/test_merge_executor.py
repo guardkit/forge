@@ -239,6 +239,32 @@ class _FakePublisher:
         self.reports.append(payload)
 
 
+def a_build_system_without_check_join(kwargs: dict[str, Any]) -> GuardKitResult | None:
+    """What an installed build system says when asked for a verb it has not got.
+
+    ``None`` when the call is not the check-join question at all, so every
+    stand-in below answers merges exactly as it always did.
+
+    THE FACTORY ASKS THIS QUESTION of every join it picked up rather than made
+    (23 September 2026): `autobuild check-join <FEAT> --joined <J>` would run
+    the build system's own checks on an already-joined commit. Nothing has that
+    verb today — the factory runs its build system from a frozen container
+    image — so the honest stand-in is a command line that has never heard of
+    it, and the press must stay GATED and say so by name.
+    """
+    args = list(kwargs.get("args") or [])
+    if not args or args[0] != "check-join":
+        return None
+    return GuardKitResult(
+        status="failed",
+        subcommand=str(kwargs.get("subcommand", "autobuild")),
+        duration_secs=0.01,
+        stdout_tail="",
+        stderr="Usage: autobuild [OPTIONS] COMMAND\nError: No such command 'check-join'.",
+        exit_code=2,
+    )
+
+
 class _FakeGuardKit:
     """Records calls; returns a canned merge report.
 
@@ -268,6 +294,9 @@ class _FakeGuardKit:
 
     async def __call__(self, **kwargs: Any) -> GuardKitResult:
         self.calls.append(kwargs)
+        not_there = a_build_system_without_check_join(kwargs)
+        if not_there is not None:
+            return not_there
         return GuardKitResult(
             status=self.status,  # type: ignore[arg-type]
             subcommand=kwargs.get("subcommand", "autobuild"),
@@ -294,6 +323,9 @@ class _DiesWhileMerging:
 
     async def __call__(self, **kwargs: Any) -> GuardKitResult:
         self.calls.append(kwargs)
+        not_there = a_build_system_without_check_join(kwargs)
+        if not_there is not None:
+            return not_there
         args = list(kwargs["args"])
         folder = Path(args[args.index("--in-worktree") + 1])
         _git(
@@ -342,6 +374,9 @@ class _JoinsForReal:
 
     async def __call__(self, **kwargs: Any) -> GuardKitResult:
         self.calls.append(kwargs)
+        not_there = a_build_system_without_check_join(kwargs)
+        if not_there is not None:
+            return not_there
         args = list(kwargs["args"])
         folder = Path(args[args.index("--in-worktree") + 1])
         _git(
@@ -1238,7 +1273,10 @@ class TestExecutorSequencing:
         outcome = await _run_executor(deps, repo_root)
         assert outcome.result == "publication-pending"
         assert outcome.merged_sha == j_left
-        assert gk.calls == []  # the merge command was never run a second time
+        # The merge command was never run a second time. The one thing asked of
+        # the build system is the check-join question this stage added, and the
+        # installed one has no such sub-command.
+        assert [call["args"][0] for call in gk.calls] == ["check-join"]
         assert _legs(dp) == ["candidate_check", "candidate_down"]
         steps = [
             (l["kind"], l["step"])
@@ -1292,9 +1330,15 @@ class TestExecutorSequencing:
         )
         assert "the factory's own live check ran on the joined result" in outcome.detail
         assert (
-            "the build system's checks after a join have not run on it"
+            "the build system's own checks after a join have not run on "
             in outcome.detail
         )
+        # AND IT NAMES WHAT WOULD RUN THEM (23 September 2026). The press asks
+        # the installed build system for a sub-command that checks an
+        # already-joined commit; it has none, so the sentence says which one
+        # by name rather than leaving a reader to wonder what is missing.
+        assert "autobuild check-join" in outcome.detail
+        assert "does not have it" in outcome.detail
         # NOT a pass (22 September 2026, the second reviewer's first finding):
         # one kind of check never ran on this J, so the press must not say
         # "checked and ready to publish", must not report PASSED (which would
