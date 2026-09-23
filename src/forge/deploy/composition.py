@@ -227,13 +227,27 @@ async def dispatch_deploy_stage(
     launch_settings: tuple[str, ...] = (),
     #: THE BUILD THIS STAGE IS RUNNING, and the recorded commit it STARTS from
     #: (25 September 2026; bound to the coordinator's record 27 September
-    #: 2026). The two are stamped onto EVERY request the helper is sent, in one
-    #: place — the script runner — so the far side reads the project's own two
-    #: declaration files AT THAT COMMIT rather than off the working copy it
-    #: runs the project's scripts out of, and can confirm with the coordinator
-    #: that the commit is the one recorded for that build before it reads a
-    #: line. Both absent ⇒ a by-hand run: the far side reads at that copy's
-    #: committed HEAD, never its working tree, and says so.
+    #: 2026). The two are stamped onto every request THIS STAGE sends the
+    #: helper — the candidate check, both of the promote's, the read-only
+    #: "what are you running" question and the teardown — in one place, the
+    #: script runner, so the far side reads the project's own two declaration
+    #: files AT THAT COMMIT rather than off the working copy it runs the
+    #: project's scripts out of, and can confirm with the coordinator that the
+    #: commit is the one recorded for that build before it reads a line. Both
+    #: absent ⇒ a by-hand run: the far side reads at that copy's committed
+    #: HEAD, never its working tree, and says so.
+    #:
+    #: WHAT THIS DOES NOT COVER, said plainly (27 September 2026, the seventh
+    #: review, correcting a sentence that claimed more than was built). The
+    #: merge word's own command and the fix journey's two legs go to the same
+    #: helper through a different door
+    #: (:mod:`forge.adapters.guardkit.run_via_sidecar`), and those requests
+    #: carry neither field: their callables are made per ADDRESS rather than
+    #: per build. The helper reads them as by-hand runs, at the committed HEAD
+    #: of the copy it has. They carry no commit for anything to honour, so
+    #: nothing chooses its own authority there — but "every request the helper
+    #: is sent" was never true of them, and this stage is not the place that
+    #: would make it true.
     build_id: str | None = None,
     declared_at: str | None = None,
     identity_env: dict[str, str] | None = None,

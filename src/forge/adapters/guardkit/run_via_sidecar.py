@@ -45,6 +45,23 @@ name of its own, so it can never disagree with the offer, the candidate check
 or the landed-merge detection. No branch in the argument list means no branch
 in the request, and the merge command derives the feature's own branch exactly
 as it always has.
+
+WHAT THESE TWO DOORS DO NOT CARRY, said plainly (27 September 2026, the
+seventh review, correcting a record that claimed more than was built). The
+deploy stage stamps every request it sends the helper with the build it is for
+and the commit the coordinator recorded that build as starting from, so the
+helper reads that project's own declaration files THERE. These two doors do
+not: their callables are built per ADDRESS, once, rather than per build, and
+the requests carry the memory name and the declared setting names but no build
+and no commit. The helper reads them as by-hand runs and takes the project's
+declarations from the committed HEAD of the copy it has — which is exactly
+what they did before the binding existed, so nothing got worse. Nothing here
+chooses its own authority either: there is no commit on these requests for the
+helper to honour. But it is the one route left by which a build could widen
+its own door by COMMITTING a line and then asking for a merge or a leg, and
+closing it means threading the build and its recorded starting commit down to
+these two calls — a change to the merge path, deliberately not made in the
+same pass as the binding.
 """
 
 from __future__ import annotations
