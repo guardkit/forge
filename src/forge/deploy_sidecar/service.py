@@ -198,6 +198,7 @@ from forge.deploy.profile import (
     wrapper_inner_script,
 )
 from forge.deploy_sidecar.deploy_executor import (
+    NOTES_SETTING_NAME,
     DeployExecutor,
     request_from as deploy_request_from,
 )
@@ -556,7 +557,7 @@ def sidecar_is_inside_sandbox(env: "dict[str, str] | None" = None) -> bool:
 #: The setting that says where the executor's own notes live. They have to
 #: outlive the service, because a note is what stops a restarted helper coming
 #: back with an empty slot while an old deploy command is still running.
-DEPLOY_NOTES_ENV: str = "FORGE_DEPLOY_NOTES_DIR"
+DEPLOY_NOTES_ENV: str = NOTES_SETTING_NAME
 
 #: Where they go when nothing says otherwise: beside the receipts, under the
 #: same root the rest of this service's durable state uses.
@@ -573,6 +574,69 @@ def deploy_executor_notes_root(env: "dict[str, str] | None" = None) -> Path:
     source = os.environ if env is None else env
     named = str(source.get(DEPLOY_NOTES_ENV, "")).strip()
     return Path(named or DEPLOY_NOTES_DEFAULT)
+
+
+#: The setting that names the coordinator's own READ-ONLY answer about who
+#: owns a deployment target. The executor asks it exactly once, and only when
+#: its own note for a target is gone and nothing is alive on it (rule f): a
+#: delayed request presenting an old counter cannot establish who owns the
+#: target, so the question goes to the thing that granted it.
+#:
+#: WHAT IT HAS TO ANSWER. One request, ``GET <url>?target=<the target>``, and
+#: one object back: ``{"counter": <the target's own deployment counter>,
+#: "build": "<the build it was granted to>"}``. Nothing else is read off it and
+#: nothing is sent to it but the target's name. Unset ⇒ nobody can be asked,
+#: and the executor refuses rather than believing the request — which is the
+#: safe side and is what it does today.
+COORDINATOR_OWNER_ENV: str = "FORGE_TARGET_OWNER_URL"
+
+#: How long the executor waits for that one answer. Short on purpose: it is
+#: asked while a deploy request is being settled, and "the coordinator did not
+#: answer" is a refusal, not a delay worth holding a merge open for.
+COORDINATOR_ASK_SECONDS: float = 10.0
+
+
+def coordinator_owner_asker(
+    env: "dict[str, str] | None" = None,
+) -> "Callable[[str], dict[str, Any] | None] | None":
+    """Build the executor's way of asking the coordinator who owns a target.
+
+    ``None`` when the setting names no address, and then the executor refuses
+    on that path instead of accepting a counter on the request's own word.
+
+    Nothing here knows what is deployed, what an identity is or what the
+    coordinator is written in. It sends a target's name and reads two fields
+    back.
+    """
+    source = os.environ if env is None else env
+    address = str(source.get(COORDINATOR_OWNER_ENV, "")).strip()
+    if not address:
+        return None
+
+    def _ask(target: str) -> "dict[str, Any] | None":
+        from urllib import error as urllib_error, parse, request as urllib_request
+
+        query = parse.urlencode({"target": str(target)})
+        joined = f"{address}{'&' if '?' in address else '?'}{query}"
+        try:
+            with urllib_request.urlopen(  # noqa: S310 — an operator's own address
+                urllib_request.Request(joined, method="GET"),
+                timeout=COORDINATOR_ASK_SECONDS,
+            ) as answer:
+                decoded = json.loads(answer.read().decode("utf-8", errors="replace"))
+        except (urllib_error.URLError, OSError, ValueError, TimeoutError) as exc:
+            logger.warning(
+                "deploy executor: the coordinator at %s could not be asked who "
+                "owns %s (%s: %s)",
+                address,
+                target,
+                type(exc).__name__,
+                exc,
+            )
+            return None
+        return decoded if isinstance(decoded, dict) else None
+
+    return _ask
 
 
 def _not_inside_a_sandbox(what: str, *, verb: str = "run") -> str:
@@ -5877,7 +5941,16 @@ def serve(
     # design's J): a helper that comes back with an empty slot while an old
     # deploy command is still alive undoes the whole of H. Its notes live in a
     # folder of its own, so they survive this process.
-    executor = DeployExecutor(notes_root=deploy_executor_notes_root())
+    # ...and it is given the ONE question rule (f) makes it ask: when its own
+    # note for a target is gone and nothing is alive on it, who does the
+    # COORDINATOR say owns that target. Without an address for that answer the
+    # branch the design's sign-off note singles out could only ever refuse,
+    # which is safe but is not the rule built. The address is an operator's
+    # setting; unset, the refusal is exactly what it was.
+    executor = DeployExecutor(
+        notes_root=deploy_executor_notes_root(),
+        ask_the_coordinator=coordinator_owner_asker(),
+    )
     executor.reconcile()
     server = build_server(
         host=host,

@@ -2159,6 +2159,34 @@ async def execute_merge_deploy(
                 ),
             )
         target, declaration = known
+        # WHAT AN IDENTITY IS BELONGS TO THE PROJECT, and so do the two names
+        # it travels under: the setting the deploy step is handed it in, and
+        # the marker the step reports what is running after. A project that
+        # declares neither has not been asked this question yet, and handing
+        # its step a name the factory picked and then failing it for not
+        # reporting one back is a deploy run blind. It is said before the lock
+        # is taken, because there is nothing here to hold a lock for.
+        if not getattr(declaration, "declared", False):
+            return _published_deployment_pending(
+                j_commit=j_commit,
+                target_branch=target_branch,
+                g_commit=g_commit,
+                remote_now=remote_now,
+                checks_passed=checks_passed,
+                checks_total=checks_total,
+                what_was_checked=what_was_checked,
+                attempt=attempt,
+                turn=turn,
+                store=store,
+                why_not_deployed=(
+                    f"{repo}'s deploy profile does not say how it wants the "
+                    "identity of what was checked handed to its deploy step, "
+                    "or what the step reports back — both are the project's "
+                    "own to declare, in an identity block in "
+                    "deploy/profile.yaml — so nothing was deployed rather "
+                    "than deployed blind"
+                ),
+            )
         identity = fixed_identity(j_commit=j_commit, content=j_tree)
 
         grant = lock.grant(
@@ -2289,6 +2317,18 @@ async def execute_merge_deploy(
                 "build": build_id,
                 "identity": identity.text,
                 "identity_setting": declaration.setting,
+                # WHETHER ANYTHING IS RUNNING THERE AT ALL, read off the
+                # target's own row under this lock a moment ago. The executor
+                # uses it for one thing: when its own note for this target is
+                # gone and nobody can be asked who owns it, something already
+                # running means a deploy has happened before, so a note should
+                # have existed and its absence is a LOSS — and the executor
+                # refuses rather than treating a missing note as an empty slot.
+                # It can only make the executor stricter, never more
+                # permissive.
+                "something_is_running": bool(
+                    grant.running_commit or grant.running_identity
+                ),
             }
             if store is not None and not store.about_to(
                 build_id=build_id,

@@ -100,15 +100,21 @@ LINE_ABOUT_TO: str = "about to"
 LINE_DONE: str = "done"
 
 #: The remote does not have the joined commit. Nothing is deployed, and the
-#: reason is said. The only result this version can produce.
+#: reason is said.
 RESULT_PUBLICATION_PENDING: str = "publication pending"
 
 #: The remote has the joined commit; the deploy has not finished. It is never
-#: called a merge that is running. NOT reachable in this version.
+#: called a merge that is running.
 RESULT_PUBLISHED_DEPLOYMENT_PENDING: str = "published, deployment pending"
 
-#: The remote has the joined commit, and what was checked is deployed. NOT
-#: reachable in this version.
+#: The remote has the joined commit, and what was checked is deployed.
+#:
+#: REACHABLE SINCE 23 SEPTEMBER 2026 (the executor stage), on ONE path and no
+#: other: the press deployed the very thing it checked, and the project's own
+#: deploy step reported back, as text, the identity it was handed. These three
+#: comments used to say "NOT reachable in this version", which was true of the
+#: two stages before this one; what is pinned by test now is that path, not
+#: the absence of it.
 #:
 #: IT NAMES NO HOSTING PROVIDER. It used to read "merged into GitHub and
 #: running", which was the design's own wording and wrong for central
@@ -116,7 +122,7 @@ RESULT_PUBLISHED_DEPLOYMENT_PENDING: str = "published, deployment pending"
 #: project whose remote is somewhere else would have been told, in the
 #: factory's own vocabulary, that it was merged into a service it has never
 #: heard of. Renamed 22 September 2026 with its sibling in the press
-#: (``RESULT_WORD_MERGED_AND_RUNNING``). Still unreachable, and pinned so.
+#: (``RESULT_WORD_MERGED_AND_RUNNING``).
 RESULT_MERGED_AND_RUNNING: str = "merged into the remote and running"
 
 #: The three, in the order a build passes through them.
