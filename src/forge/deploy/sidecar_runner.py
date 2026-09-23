@@ -57,9 +57,35 @@ class SidecarScriptRunner:
     the ``{exit_code, output_tail}`` response.
     """
 
-    def __init__(self, *, base_url: str, repo: str, http_timeout_margin: float = 30.0):
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        repo: str,
+        build: str | None = None,
+        start_commit: str | None = None,
+        http_timeout_margin: float = 30.0,
+    ):
         self._base_url = base_url.rstrip("/")
         self._repo = repo
+        # ONE PLACE STAMPS EVERY REQUEST THIS BUILD SENDS (27 September 2026,
+        # Codex's requirement of the 23rd). ``build`` and ``start_commit`` are
+        # read off the COORDINATOR'S OWN LEDGER for this build, once, where
+        # this runner is made — never off a step's parameters, a runbook or
+        # anything else a caller composed. Every request this runner sends —
+        # the candidate check, the promote, the read-only "what are you
+        # running" question, the teardown — carries the same pair, so the far
+        # side can confirm it with the coordinator before it reads a line of
+        # this project's declarations.
+        #
+        # A runner made with neither is a BY-HAND runner: it stamps nothing,
+        # and the far side reads at the committed HEAD of the copy it has and
+        # says so. It does not forward a commit a caller hands it, because a
+        # commit with no build behind it is exactly the authority a request
+        # may not establish for itself, and forwarding one would only earn a
+        # refusal further on.
+        self._build = str(build or "").strip() or None
+        self._start_commit = str(start_commit or "").strip() or None
         # The HTTP read wall is the script timeout plus a margin, so the socket
         # does not trip before the sidecar's own subprocess timeout fires.
         self._http_timeout_margin = http_timeout_margin
@@ -75,7 +101,6 @@ class SidecarScriptRunner:
         extra_env: dict[str, str] | None = None,
         memory_project: str | None = None,
         launch_settings: Sequence[str] | None = None,
-        declared_at: str | None = None,
         deploy: dict[str, object] | None = None,
     ) -> tuple[int, str]:
         env: dict[str, str] = dict(extra_env or {})
@@ -95,12 +120,18 @@ class SidecarScriptRunner:
             body["memory_project"] = str(memory_project)
         if launch_settings:
             body["launch_settings"] = [str(name) for name in launch_settings]
-        # AND WHERE THE PROJECT SAID THEM: the recorded commit this work starts
-        # from. The far side reads the project's own declaration files at that
-        # commit rather than off the working copy it runs the scripts out of,
-        # so a line a build writes into that copy is not a declaration.
-        if declared_at:
-            body["declared_at"] = str(declared_at)
+        # AND WHERE THE PROJECT SAID THEM: the build this request is for, and
+        # the commit the coordinator's own ledger records that build as
+        # starting from. Both are the stamp bound when this runner was made,
+        # never anything a caller passed in here. The far side reads the
+        # project's own declaration files at that commit rather than off the
+        # working copy it runs the scripts out of — and, before it reads a
+        # thing, it asks the coordinator whether that commit really is the one
+        # recorded for that build.
+        if self._build:
+            body["build"] = self._build
+        if self._start_commit:
+            body["declared_at"] = self._start_commit
         # THE OWNERSHIP OF A DEPLOY OF THE LIVE THING. Present only on the leg
         # that changes the live target; its presence is what sends the request
         # through the far side's EXECUTOR rather than straight to a runner.

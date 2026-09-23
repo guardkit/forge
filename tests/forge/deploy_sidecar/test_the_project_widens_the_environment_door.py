@@ -36,12 +36,14 @@ written in this file.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import stat
 import subprocess
 import threading
 import urllib.error
 import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
@@ -50,7 +52,11 @@ import yaml
 
 from forge.config.models import ForgeConfig
 from forge.deploy.profile import load_deploy_profile
-from forge.deploy_sidecar.service import build_server, project_declared_settings
+from forge.deploy_sidecar.service import (
+    COORDINATOR_OWNER_ENV,
+    build_server,
+    project_declared_settings,
+)
 from forge.pipeline.deployment_identity import declared_identity
 
 REPO = "org/widget-shop"
@@ -207,6 +213,64 @@ def _ask(project: Path, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         server.server_close()
 
 
+#: The build these requests say they are for.
+THE_BUILD = "build-0001"
+
+
+class _TheCoordinatorsAnswer(BaseHTTPRequestHandler):
+    """A stand-in for the coordinator's own READ-ONLY answer.
+
+    It answers one question — what commit did you record this build as
+    starting from — out of a plain mapping written in the test. It is a child
+    of this process on 127.0.0.1 on a port the kernel picks; no real
+    coordinator, ledger or service is anywhere near it.
+    """
+
+    records: dict[str, str] = {}
+
+    def do_GET(self) -> None:  # noqa: N802 — the base class's spelling
+        from urllib.parse import parse_qs, urlparse
+
+        asked = parse_qs(urlparse(self.path).query)
+        build = (asked.get("build") or [""])[0]
+        answer: dict[str, Any] = {}
+        if build in self.records:
+            answer = {"build": build, "start_commit": self.records[build]}
+        payload = json.dumps(answer).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, *args: Any) -> None:  # noqa: D102 — quiet in tests
+        return
+
+
+@contextlib.contextmanager
+def _a_coordinator_that_recorded(
+    records: dict[str, str], monkeypatch: pytest.MonkeyPatch
+):
+    """Point the helper at a stand-in coordinator holding ``records``."""
+    handler = type("_Answer", (_TheCoordinatorsAnswer,), {"records": dict(records)})
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    host, port = server.server_address[:2]
+    monkeypatch.setenv(COORDINATOR_OWNER_ENV, f"http://{host}:{port}/what-did-you-record")
+    try:
+        yield
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+@contextlib.contextmanager
+def _no_coordinator(monkeypatch: pytest.MonkeyPatch):
+    """No route configured at all — the estate before the rollout."""
+    monkeypatch.delenv(COORDINATOR_OWNER_ENV, raising=False)
+    yield
+
+
 def _names_the_child_was_given(body: dict[str, Any]) -> set[str]:
     return {
         line[len("SETTING ") :].strip()
@@ -312,7 +376,7 @@ class TestADeclarationIsACommittedLine:
         )
 
     def test_the_same_name_committed_at_the_recorded_commit_is_admitted(
-        self, tmp_path: Path
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         project = _a_project(tmp_path / "widget-shop", declares=(DECLARED_SETTING,))
         (project / ".guardkit" / "config.yaml").write_text(
@@ -327,16 +391,28 @@ class TestADeclarationIsACommittedLine:
         assert note is None
         assert UNDECLARED_SETTING in declared
         assert started_from in where
-        status, body = _ask(
-            project,
-            {"launch_settings": [UNDECLARED_SETTING], "declared_at": started_from},
-        )
+        with _a_coordinator_that_recorded({THE_BUILD: started_from}, monkeypatch):
+            status, body = _ask(
+                project,
+                {
+                    "launch_settings": [UNDECLARED_SETTING],
+                    "build": THE_BUILD,
+                    "declared_at": started_from,
+                },
+            )
         assert status == 200, body
         assert UNDECLARED_SETTING in _names_the_child_was_given(body)
 
     def test_a_commit_that_lacks_it_is_refused_even_though_HEAD_has_it(
-        self, tmp_path: Path
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """The coordinator recorded THE OLDER commit, and the name is not there.
+
+        This is the commit-binding working the other way round from the test
+        below it: the request and the record agree, so the read is made — at a
+        commit that simply does not carry the name, and the refusal says where
+        it looked.
+        """
         project = _a_project(tmp_path / "widget-shop", declares=(DECLARED_SETTING,))
         first = _git(project, "rev-parse", "HEAD")
         (project / ".guardkit" / "config.yaml").write_text(
@@ -345,9 +421,15 @@ class TestADeclarationIsACommittedLine:
             encoding="utf-8",
         )
         _commit_everything(project, "and the second name")
-        status, body = _ask(
-            project, {"launch_settings": [UNDECLARED_SETTING], "declared_at": first}
-        )
+        with _a_coordinator_that_recorded({THE_BUILD: first}, monkeypatch):
+            status, body = _ask(
+                project,
+                {
+                    "launch_settings": [UNDECLARED_SETTING],
+                    "build": THE_BUILD,
+                    "declared_at": first,
+                },
+            )
         assert status == 400, body
         assert first in body["error"]
         assert "the commit this work starts from" in body["error"]
@@ -419,3 +501,289 @@ class TestTheRealRouteWithARealChild:
             assert name not in given, (
                 f"{name} reached the child although the request named nothing"
             )
+
+
+class TestTheCommitIsBoundToTheRecord:
+    """A request does not choose the commit its own declarations are read at.
+
+    WHY THIS EXISTS (27 September 2026, Codex's requirement of the 23rd).
+    Reading a project's declarations at a COMMIT rather than off the working
+    copy closed the larger hole, and left a smaller one of the same shape: the
+    commit came off the request. Whoever could send a request could name a
+    commit at which the project declared a setting it does not declare now, and
+    the door opened on that commit's own say-so.
+
+    The helper cannot see the ledger, so it cannot look the answer up. What it
+    can do is refuse to take it from the thing being checked: the request says
+    which BUILD it is for, and the pair — that build, that commit — is
+    confirmed with the coordinator's own read-only answer before a line is
+    read. The coordinator here is a stand-in: a child of this process on
+    127.0.0.1, on a port the kernel picks, answering out of a mapping written
+    in this file.
+    """
+
+    @staticmethod
+    def _two_commits(tmp_path: Path) -> tuple[Path, str, str]:
+        """A project whose older commit lacks the declaration and whose HEAD has it."""
+        project = _a_project(tmp_path / "widget-shop", declares=(DECLARED_SETTING,))
+        older = _git(project, "rev-parse", "HEAD")
+        (project / ".guardkit" / "config.yaml").write_text(
+            "launch:\n  settings: [" + DECLARED_SETTING + ", " + UNDECLARED_SETTING
+            + "]\n",
+            encoding="utf-8",
+        )
+        head = _commit_everything(project, "and the second name")
+        return project, older, head
+
+    def test_bound_to_head_and_confirmed_is_admitted(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        project, _older, head = self._two_commits(tmp_path)
+        with _a_coordinator_that_recorded({THE_BUILD: head}, monkeypatch):
+            status, body = _ask(
+                project,
+                {
+                    "launch_settings": [UNDECLARED_SETTING],
+                    "build": THE_BUILD,
+                    "declared_at": head,
+                },
+            )
+        assert status == 200, body
+        assert UNDECLARED_SETTING in _names_the_child_was_given(body)
+
+    def test_the_older_commit_with_the_coordinator_saying_head_is_refused(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The heart of it: the request names one commit, the record another."""
+        project, older, head = self._two_commits(tmp_path)
+        with _a_coordinator_that_recorded({THE_BUILD: head}, monkeypatch):
+            status, body = _ask(
+                project,
+                {
+                    "launch_settings": [UNDECLARED_SETTING],
+                    "build": THE_BUILD,
+                    "declared_at": older,
+                },
+            )
+        assert status == 400, body
+        # The sentence NAMES THE MISMATCH: both commits and the build.
+        assert older in body["error"]
+        assert head in body["error"]
+        assert THE_BUILD in body["error"]
+        assert "does not choose the commit" in body["error"]
+        # NOTHING WAS READ and nothing was started.
+        assert "exit_code" not in body and "output_tail" not in body
+
+    def test_an_unrelated_commit_is_refused(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        project, _older, head = self._two_commits(tmp_path)
+        unrelated = "0" * 40
+        with _a_coordinator_that_recorded({THE_BUILD: head}, monkeypatch):
+            status, body = _ask(
+                project,
+                {
+                    "launch_settings": [UNDECLARED_SETTING],
+                    "build": THE_BUILD,
+                    "declared_at": unrelated,
+                },
+            )
+        assert status == 400, body
+        assert unrelated in body["error"]
+        assert "exit_code" not in body
+
+    def test_a_commit_with_no_build_is_refused(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A request cannot establish its own authority."""
+        project, _older, head = self._two_commits(tmp_path)
+        with _a_coordinator_that_recorded({THE_BUILD: head}, monkeypatch):
+            status, body = _ask(
+                project,
+                {"launch_settings": [UNDECLARED_SETTING], "declared_at": head},
+            )
+        assert status == 400, body
+        assert "cannot establish its own authority" in body["error"]
+        assert "exit_code" not in body
+
+    def test_no_coordinator_route_and_a_commit_is_refused(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        project, _older, head = self._two_commits(tmp_path)
+        with _no_coordinator(monkeypatch):
+            status, body = _ask(
+                project,
+                {
+                    "launch_settings": [UNDECLARED_SETTING],
+                    "build": THE_BUILD,
+                    "declared_at": head,
+                },
+            )
+        assert status == 400, body
+        assert "no way to ask the coordinator" in body["error"]
+        assert COORDINATOR_OWNER_ENV in body["error"]
+        assert "exit_code" not in body
+
+    def test_a_coordinator_that_knows_nothing_of_the_build_is_refused(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        project, _older, head = self._two_commits(tmp_path)
+        with _a_coordinator_that_recorded({"some-other-build": head}, monkeypatch):
+            status, body = _ask(
+                project,
+                {
+                    "launch_settings": [UNDECLARED_SETTING],
+                    "build": THE_BUILD,
+                    "declared_at": head,
+                },
+            )
+        assert status == 400, body
+        assert "did not say what commit it recorded" in body["error"]
+
+    def test_a_build_with_no_commit_is_bound_to_what_the_coordinator_recorded(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Bound from the other end: the record decides, the request says nothing.
+
+        The coordinator recorded the OLDER commit for this build, and the name
+        is only at HEAD — so it is refused although the working copy, HEAD and
+        every other reading would have admitted it.
+        """
+        project, older, _head = self._two_commits(tmp_path)
+        with _a_coordinator_that_recorded({THE_BUILD: older}, monkeypatch):
+            status, body = _ask(
+                project,
+                {"launch_settings": [UNDECLARED_SETTING], "build": THE_BUILD},
+            )
+        assert status == 400, body
+        assert older in body["error"]
+        assert "does not declare that name" in body["error"]
+
+    def test_a_by_hand_run_reads_committed_head_and_says_so(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Neither a build nor a commit: this copy's committed HEAD, said out loud."""
+        project, _older, _head = self._two_commits(tmp_path)
+        with _no_coordinator(monkeypatch):
+            status, body = _ask(project, {"launch_settings": [UNDECLARED_SETTING]})
+        assert status == 200, body
+        assert UNDECLARED_SETTING in _names_the_child_was_given(body)
+        # And a name at neither commit is refused with HEAD named in words.
+        with _no_coordinator(monkeypatch):
+            status, refusal = _ask(project, {"launch_settings": ["NOT_ANYWHERE"]})
+        assert status == 400, refusal
+        assert "the committed HEAD of the copy of this project" in refusal["error"]
+
+
+class TestBothFilesAreReadAtTheBoundCommit:
+    """The profile's own names are committed lines too (the door's other half).
+
+    Until now ``allowed_env_keys`` was handed the profile loaded off the
+    WORKING COPY, so an uncommitted ``identity:`` line in the very checkout a
+    build was about to run out of still widened which settings a request might
+    carry. That was the last uncommitted reading left in this door.
+    """
+
+    #: Names of this project's own choosing, none of them one of the factory's
+    #: defaults — so what is permitted here is permitted BECAUSE this project
+    #: committed the line, and nothing else.
+    IDENTITY = {
+        "setting": "WIDGET_SHOP_IDENTITY",
+        "reported_as": "WIDGET_SHOP_DEPLOYED",
+        "asked_with": "WIDGET_SHOP_RUNNING",
+        "running_as": "WIDGET_SHOP_RUNNING",
+    }
+
+    def _a_project_whose_profile_gains_an_identity(
+        self, tmp_path: Path
+    ) -> tuple[Path, str, str]:
+        project = _a_project(tmp_path / "widget-shop")
+        older = _git(project, "rev-parse", "HEAD")
+        profile = yaml.safe_load(
+            (project / "deploy" / "profile.yaml").read_text(encoding="utf-8")
+        )
+        profile["identity"] = dict(self.IDENTITY)
+        (project / "deploy" / "profile.yaml").write_text(
+            yaml.safe_dump(profile), encoding="utf-8"
+        )
+        head = _commit_everything(project, "the project declares an identity")
+        return project, older, head
+
+    def test_an_identity_only_in_the_working_tree_does_not_widen_the_door(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        project = _a_project(tmp_path / "widget-shop")
+        profile = yaml.safe_load(
+            (project / "deploy" / "profile.yaml").read_text(encoding="utf-8")
+        )
+        # A NAME NOBODY COMMITTED, written into the checkout the command is
+        # about to run out of — the shape of a build widening its own door.
+        profile["identity"] = {**self.IDENTITY, "asked_with": UNDECLARED_SETTING}
+        (project / "deploy" / "profile.yaml").write_text(
+            yaml.safe_dump(profile), encoding="utf-8"
+        )
+        with _no_coordinator(monkeypatch):
+            status, body = _ask(project, {"env": {UNDECLARED_SETTING: "anything"}})
+        assert status == 400, body
+        assert "not allowlisted" in body["error"]
+        assert "exit_code" not in body
+
+    def test_a_teardown_reads_the_profile_at_the_bound_commit(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The same binding on the leg that takes a candidate down.
+
+        A teardown carries the identity of the candidate it may remove, in the
+        setting the project declared for it. Bound to HEAD — where the project
+        declares that setting — it is admitted; bound to the older commit,
+        where it does not, the same request is refused and nothing runs.
+        """
+        project, older, head = self._a_project_whose_profile_gains_an_identity(
+            tmp_path
+        )
+        teardown = {
+            "env": {"WIDGET_SHOP_IDENTITY": "j-abc123@def456", "CANDIDATE_DOWN": "1"},
+            "build": THE_BUILD,
+        }
+        with _a_coordinator_that_recorded({THE_BUILD: head}, monkeypatch):
+            status, body = _ask(project, {**teardown, "declared_at": head})
+        assert status == 200, body
+        assert "WIDGET_SHOP_IDENTITY" in _names_the_child_was_given(body)
+
+        with _a_coordinator_that_recorded({THE_BUILD: older}, monkeypatch):
+            status, refused = _ask(project, {**teardown, "declared_at": older})
+        assert status == 400, refused
+        assert "not allowlisted" in refused["error"]
+        assert "exit_code" not in refused
+
+
+class TestACommitThisCopyDoesNotCarry:
+    """The sentence says what is actually wrong (27 September 2026).
+
+    When the coordinator records a commit this copy of the project does not
+    have — a clone that has not fetched it yet, most plainly — the sentence a
+    person read said the project's own ``.guardkit/config.yaml`` "says
+    something this factory cannot use", and sent them to look at a file that is
+    perfectly fine. The reason is a fact about the COPY, and it is said that
+    way now.
+    """
+
+    def test_the_refusal_names_the_missing_commit_not_a_bad_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        project = _a_project(tmp_path / "widget-shop", declares=(DECLARED_SETTING,))
+        never_here = "0" * 40
+        with _a_coordinator_that_recorded({THE_BUILD: never_here}, monkeypatch):
+            status, body = _ask(
+                project,
+                {
+                    "launch_settings": [DECLARED_SETTING],
+                    "build": THE_BUILD,
+                    "declared_at": never_here,
+                },
+            )
+        assert status == 400, body
+        assert "does not have the commit" in body["error"]
+        assert never_here in body["error"]
+        assert "says something this factory cannot use" not in body["error"]
+        assert "exit_code" not in body

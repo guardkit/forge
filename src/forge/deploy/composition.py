@@ -121,6 +121,15 @@ def build_deploy_stage_runner(
     target_repo: str | None = None,
     target_repo_root: str | None = None,
     sandbox: Any | None = None,
+    #: THE STAMP EVERY REQUEST TO THE HELPER CARRIES (27 September 2026). The
+    #: build this stage is running, and the commit the coordinator's own ledger
+    #: records that build as starting from. They are bound HERE, in one place,
+    #: off the ledger, and the script runner puts the same pair on every
+    #: request it sends. Both absent = a by-hand run: nothing is stamped, and
+    #: the far side reads the project's declarations at the committed HEAD of
+    #: the copy it has and says so.
+    build_id: str | None = None,
+    start_commit: str | None = None,
 ) -> DeployStageRunner | None:
     """Compose the deploy-stage runner, gated on ``config.enabled``.
 
@@ -181,6 +190,8 @@ def build_deploy_stage_runner(
         target_repo=target_repo,
         target_repo_root=target_repo_root,
         sandbox=sandbox,
+        build_id=build_id,
+        start_commit=start_commit,
     )
 
 
@@ -214,11 +225,16 @@ async def dispatch_deploy_stage(
     deploy_ownership: dict[str, Any] | None = None,
     memory_project: str | None = None,
     launch_settings: tuple[str, ...] = (),
-    #: The recorded commit this work STARTS from (25 September 2026). It rides
-    #: with the project's declared names so the far side reads the project's
-    #: own two declaration files AT THAT COMMIT rather than off the working
-    #: copy it runs the project's scripts out of. Absent ⇒ the far side falls
-    #: back to that copy's committed HEAD, never its working tree.
+    #: THE BUILD THIS STAGE IS RUNNING, and the recorded commit it STARTS from
+    #: (25 September 2026; bound to the coordinator's record 27 September
+    #: 2026). The two are stamped onto EVERY request the helper is sent, in one
+    #: place — the script runner — so the far side reads the project's own two
+    #: declaration files AT THAT COMMIT rather than off the working copy it
+    #: runs the project's scripts out of, and can confirm with the coordinator
+    #: that the commit is the one recorded for that build before it reads a
+    #: line. Both absent ⇒ a by-hand run: the far side reads at that copy's
+    #: committed HEAD, never its working tree, and says so.
+    build_id: str | None = None,
     declared_at: str | None = None,
     identity_env: dict[str, str] | None = None,
     ask_env: dict[str, str] | None = None,
@@ -269,6 +285,8 @@ async def dispatch_deploy_stage(
         target_repo=target_repo,
         target_repo_root=target_repo_root,
         sandbox=sandbox,
+        build_id=build_id,
+        start_commit=declared_at,
     )
     if runner is None:
         # Flag OFF — no dispatch. Byte-for-byte no-op.
@@ -284,7 +302,6 @@ async def dispatch_deploy_stage(
             task_id=task_id,
             deploy_profile_ref=deploy_profile_ref,
             deployer=deployer,
-            declared_at=declared_at,
             identity_env=identity_env,
         )
     if leg == "candidate_check":
@@ -299,11 +316,10 @@ async def dispatch_deploy_stage(
             candidate_cwd=candidate_cwd,
             # WHAT THE CHECK IS HANDED SO IT CAN PIN WHAT IT CHECKED, and the
             # project's own declarations so the child's environment is built
-            # rather than copied. Absent ⇒ exactly what it was.
+            # rather than copied.
             identity_env=identity_env,
             memory_project=memory_project,
             launch_settings=tuple(launch_settings),
-            declared_at=declared_at,
         )
     if leg == "what_is_running":
         return await runner.what_is_running(
@@ -313,7 +329,6 @@ async def dispatch_deploy_stage(
             ask_env=dict(ask_env or {}),
             memory_project=memory_project,
             launch_settings=tuple(launch_settings),
-            declared_at=declared_at,
         )
     if leg == "promote":
         return await runner.promote(
@@ -333,7 +348,6 @@ async def dispatch_deploy_stage(
             deploy_ownership=deploy_ownership,
             memory_project=memory_project,
             launch_settings=tuple(launch_settings),
-            declared_at=declared_at,
             identity_env=identity_env,
         )
     if leg == "candidate_down":
@@ -343,7 +357,16 @@ async def dispatch_deploy_stage(
             deploy_run_id=deploy_run_id,
             # The same setting the CHECK was handed, so a project whose
             # candidate belongs to one check rather than to a shared name can
-            # be told which one to take down. Absent ⇒ exactly what it was.
+            # be told which one to take down.
+            #
+            # ABSENT MEANS REFUSED, NOT "EXACTLY WHAT IT WAS" (27 September
+            # 2026; this sentence was left behind by the cure of 26 September
+            # and a reviewer caught it). A teardown that names nothing used to
+            # go looking, and what it found could be another build's candidate
+            # — three builds lost their databases to one build's cleanup. With
+            # no identity the project's teardown step now removes nothing and
+            # says so, and the press dispatches no teardown at all for a
+            # project that declares no identity.
             identity_env=identity_env,
         )
     raise ValueError(

@@ -546,6 +546,8 @@ class DeployStageRunner:
         target_repo: str | None = None,
         target_repo_root: str | None = None,
         sandbox: Any | None = None,
+        build_id: str | None = None,
+        start_commit: str | None = None,
     ) -> None:
         self._repo = repository
         self._runbook_publisher = runbook_publisher
@@ -573,6 +575,13 @@ class DeployStageRunner:
         # DF-021 trust ledger reads it. None (older callers/tests) → the emission
         # is a no-op, since it cannot name the qa/ tree.
         self._target_repo_root = target_repo_root
+        # THE STAMP THIS STAGE'S REQUESTS CARRY (27 September 2026). The build
+        # and the commit the coordinator's ledger records it as starting from,
+        # read off that ledger by whoever composed this stage and bound here
+        # once. Every request the script runner below sends carries the pair,
+        # so the far side never has to take a commit on a request's own word.
+        self._build_id = str(build_id or "").strip() or None
+        self._start_commit = str(start_commit or "").strip() or None
 
     def _resolve_script_runner(self) -> ScriptRunner | None:
         """The docker-touching-step execution seam for this stage.
@@ -602,7 +611,12 @@ class DeployStageRunner:
             # engine are (rule 85). The global address stays for every
             # repository that has no sandbox.
             base_url = str(getattr(self._sandbox, "sidecar_url", "") or base_url)
-        return SidecarScriptRunner(base_url=base_url, repo=self._target_repo)
+        return SidecarScriptRunner(
+            base_url=base_url,
+            repo=self._target_repo,
+            build=self._build_id,
+            start_commit=self._start_commit,
+        )
 
     def _runs_inside_the_sandbox(self) -> bool:
         """Does this stage's work happen inside the repository's own sandbox?
@@ -690,7 +704,6 @@ class DeployStageRunner:
         task_id: str | None = None,
         deploy_profile_ref: str | None = None,
         deployer: str | None = None,
-        declared_at: str | None = None,
         identity_env: dict[str, str] | None = None,
     ) -> DeployStageResult:
         """Run the DEPLOY (+ optional LIVE_GATE) stage for ``profile`` in one call.
@@ -714,7 +727,6 @@ class DeployStageRunner:
                 feat_id=feat_id,
                 task_id=task_id,
                 deploy_profile_ref=deploy_profile_ref,
-                declared_at=declared_at,
                 identity_env=identity_env,
             )
             if checked.outcome != "complete":
@@ -730,7 +742,6 @@ class DeployStageRunner:
             deploy_profile_ref=deploy_profile_ref,
             deployer=deployer,
             prior_events=prior_events,
-            declared_at=declared_at,
             identity_env=identity_env,
         )
 
@@ -748,7 +759,6 @@ class DeployStageRunner:
         identity_env: dict[str, str] | None = None,
         memory_project: str | None = None,
         launch_settings: tuple[str, ...] = (),
-        declared_at: str | None = None,
     ) -> DeployStageResult:
         """Leg one: the candidate up, healthy, and through the live gate.
 
@@ -836,7 +846,6 @@ class DeployStageRunner:
                 identity_env=identity_env,
                 memory_project=memory_project,
                 launch_settings=tuple(launch_settings),
-                declared_at=declared_at,
             )
             if terminal is not None:
                 return replace(
@@ -920,7 +929,6 @@ class DeployStageRunner:
         ask_env: dict[str, str],
         memory_project: str | None = None,
         launch_settings: tuple[str, ...] = (),
-        declared_at: str | None = None,
     ) -> DeployStageResult:
         """ASK THE TARGET what it is running. Read-only; nothing is changed.
 
@@ -955,7 +963,6 @@ class DeployStageRunner:
             inside_sandbox=self._runs_inside_the_sandbox(),
             memory_project=memory_project,
             launch_settings=launch_settings,
-            declared_at=declared_at,
         )
         try:
             run_result = await self._run_runbook(runbook, correlation_id)
@@ -1017,7 +1024,6 @@ class DeployStageRunner:
         deploy_ownership: dict[str, Any] | None = None,
         memory_project: str | None = None,
         launch_settings: tuple[str, ...] = (),
-        declared_at: str | None = None,
         identity_env: dict[str, str] | None = None,
     ) -> DeployStageResult:
         """Leg two: the live name comes up on the image the candidate built.
@@ -1131,7 +1137,6 @@ class DeployStageRunner:
                 deploy_ownership=deploy_ownership,
                 memory_project=memory_project,
                 launch_settings=launch_settings,
-                declared_at=declared_at,
             )
             await self._safe_publish(
                 self._deploy_publisher.publish_deploy_started,
@@ -1608,7 +1613,6 @@ class DeployStageRunner:
         identity_env: dict[str, str] | None = None,
         memory_project: str | None = None,
         launch_settings: tuple[str, ...] = (),
-        declared_at: str | None = None,
     ) -> tuple[DeployStageResult | None, dict[str, Any]]:
         """Stand the candidate up under ``-cand``, gate it, leave-standing-or-teardown.
 
@@ -1655,7 +1659,6 @@ class DeployStageRunner:
             inside_sandbox=self._runs_inside_the_sandbox(),
             memory_project=memory_project,
             launch_settings=launch_settings,
-            declared_at=declared_at,
         )
         run_result = await self._run_runbook(cand_runbook, correlation_id)
         executed = self._repo.load_runbook(
