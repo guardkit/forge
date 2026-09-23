@@ -163,8 +163,18 @@ def _profile_yaml(root: Path) -> dict[str, Any]:
 
 
 @pytest.fixture
-def clone(tmp_path: Path) -> Path:
-    """Stands in for the factory's own clone inside the sandbox."""
+def clone(tmp_path: Path, marker_dir: Path) -> Path:
+    """Stands in for the factory's own clone inside the sandbox.
+
+    THE TWO DEPLOY SCRIPTS ARE WRITTEN WITH THEIR MARKER FOLDER BAKED IN (23
+    September 2026). They used to read ``$MARKER_DIR`` out of the environment
+    they inherited, and that stopped working the day the environment door
+    closed: a deploy script's environment is now BUILT from the factory's own
+    named list plus what the project itself declared, so a setting a test
+    happens to put in its own process no longer travels into it. Baking the
+    path keeps exactly what these tests prove — which script ran, and in which
+    working directory — without asking the door to stay open for them.
+    """
     root = tmp_path / "api_test"
     (root / "qa" / "gates").mkdir(parents=True)
     (root / "deploy").mkdir()
@@ -177,7 +187,9 @@ def clone(tmp_path: Path) -> Path:
         ("healthcheck.sh", HEALTHCHECK),
     ):
         path = root / "deploy" / name
-        path.write_text(body, encoding="utf-8")
+        path.write_text(
+            body.replace("${MARKER_DIR}", str(marker_dir)), encoding="utf-8"
+        )
         path.chmod(0o755)
     (root / "deploy" / "profile.yaml").write_text(
         yaml.safe_dump(_profile_yaml(root)), encoding="utf-8"
