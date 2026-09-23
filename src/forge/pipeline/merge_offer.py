@@ -41,6 +41,7 @@ Ordering laws (all load-bearing):
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 from dataclasses import dataclass, field
@@ -148,17 +149,34 @@ def approval_subject_for(feature_id: str) -> str:
     return f"agents.approval.forge.merge-{feature_id}"
 
 
-async def git_rev_parse_main(repo_root: Path) -> str | None:
-    """Read ``main``'s sha in ``repo_root`` — the merge's expect-main-sha pin.
+async def git_rev_parse_main(
+    repo_root: Path, branch: str | None = None
+) -> str | None:
+    """Read the BUILD'S RECORDED target branch in ``repo_root`` for the card.
 
-    Returns ``None`` on any failure (missing repo, no ``main``, git absent):
-    the caller refuses to make an offer it cannot pin, loudly.
+    ``branch`` is the branch of the remote the work was recorded against when
+    it started. A project whose branch is ``trunk``, or a release line, or
+    anything at all, is read by its own name.
+
+    THE NAME "main" IS NO LONGER WRITTEN INTO THIS (23 September 2026, carried
+    from stage 4a's list). This function read the branch literally called
+    ``main`` and answered ``None`` when there was none, and the caller makes no
+    card at all on a ``None`` — so a project whose recorded branch is anything
+    else got no merge card, ever. Nothing about this factory knows what a
+    project calls its branches. ``branch`` left unset still reads ``main``,
+    because a build with nothing recorded is a build from before the starting
+    rule and ``main`` is the only thing there is to try; the caller says so in
+    its own log rather than pretending it was told.
+
+    Returns ``None`` on any failure (missing repo, no such branch, git
+    absent): the caller refuses to make an offer it cannot pin, loudly.
     """
+    wanted = str(branch or "").strip() or "main"
     try:
         proc = await asyncio.create_subprocess_exec(
             "git",
             "rev-parse",
-            "main",
+            wanted,
             cwd=str(repo_root),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -166,14 +184,16 @@ async def git_rev_parse_main(repo_root: Path) -> str | None:
         stdout_b, stderr_b = await proc.communicate()
     except Exception as exc:  # noqa: BLE001 — best-effort probe, honest None
         logger.warning(
-            "merge-offer: git rev-parse main failed to run in %s (%s)",
+            "merge-offer: git rev-parse %s failed to run in %s (%s)",
+            wanted,
             repo_root,
             exc,
         )
         return None
     if proc.returncode != 0:
         logger.warning(
-            "merge-offer: git rev-parse main exited %s in %s (%s)",
+            "merge-offer: git rev-parse %s exited %s in %s (%s)",
+            wanted,
             proc.returncode,
             repo_root,
             stderr_b.decode("utf-8", errors="replace").strip(),
@@ -181,6 +201,58 @@ async def git_rev_parse_main(repo_root: Path) -> str | None:
         return None
     sha = stdout_b.decode("utf-8", errors="replace").strip()
     return sha or None
+
+
+def head_reader_takes_a_branch(read_head: Callable[..., Any]) -> bool:
+    """Does this ``git_head`` collaborator take the branch to read?
+
+    The same shape as :func:`normalizer_accepts_rules_only` above, and for the
+    same reason: this is an injected seam, a caller may have bound one that
+    predates the recorded target branch, and a ``TypeError`` at the moment a
+    card would be made costs the card. True when the signature names a second
+    positional parameter or takes ``**kwargs``; a signature that cannot be
+    read is taken as NOT taking it, so the old call is made.
+    """
+    try:
+        signature = inspect.signature(read_head)
+    except (TypeError, ValueError):
+        return False
+    for name, parameter in signature.parameters.items():
+        if parameter.kind is inspect.Parameter.VAR_KEYWORD:
+            return True
+        if name == "branch" and parameter.kind in (
+            inspect.Parameter.KEYWORD_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        ):
+            return True
+    positional = [
+        parameter
+        for parameter in signature.parameters.values()
+        if parameter.kind
+        in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    ]
+    return len(positional) >= 2
+
+
+async def _ask_the_head_reader(
+    read_head: Callable[..., Any], repo_root: Path, branch: str | None
+) -> str | None:
+    """Read the recorded branch's commit, whichever seam is bound.
+
+    A seam that predates the recorded target branch is called the way it was
+    always called, and the log says so — never a crash, and never a silently
+    different branch.
+    """
+    if head_reader_takes_a_branch(read_head):
+        return await read_head(repo_root, branch)
+    if branch:
+        logger.warning(
+            "merge-offer: the bound head reader does not take a branch, so "
+            "the card's pin is read the way it always was rather than from "
+            "the recorded branch %s",
+            branch,
+        )
+    return await read_head(repo_root)
 
 
 def read_baseline_failing(build_id: str) -> list[str] | None:
@@ -1476,7 +1548,7 @@ class MergeOfferService:
             )
             return False
 
-        # (b) Pin main and the exact offered candidate now.
+        # (b) Pin the RECORDED target branch and the exact offered candidate.
         merge_branch = str(getattr(row, "merge_branch", None) or "").strip() or None
         branch = branch_to_merge(feature_id, merge_branch)
         from forge.deploy.candidate_tree import InContainerCandidateGit
@@ -1486,12 +1558,21 @@ class MergeOfferService:
             if self._git_surface is not None
             else None
         ) or InContainerCandidateGit(repo_root)
-        expect_main_sha = await self._git_head(repo_root)
+        # WHICH BRANCH OF THE REMOTE THIS WORK IS AIMED AT, off the build's own
+        # row — the name written down when the work started, never one chosen
+        # here (23 September 2026, carried from stage 4a's list). This used to
+        # read the branch literally called ``main`` and make NO CARD when
+        # there was none, so a project whose recorded branch is anything else
+        # could never be offered a merge word at all.
+        recorded_target = str(getattr(row, "target_branch", None) or "").strip()
+        expect_main_sha = await _ask_the_head_reader(
+            self._git_head, repo_root, recorded_target or None
+        )
         if expect_main_sha is None:
             logger.error(
-                "merge-offer: could not read main's sha in %s — an offer "
-                "without an expect-main-sha pin would not be honest; no card "
-                "for %s",
+                "merge-offer: could not read %s's sha in %s — an offer "
+                "without a pin would not be honest; no card for %s",
+                recorded_target or "main (nothing was recorded for this build)",
                 repo_root,
                 build_id,
             )

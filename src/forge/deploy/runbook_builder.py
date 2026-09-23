@@ -24,6 +24,7 @@ exactly what each handler reads (see :mod:`forge.deploy.steps`).
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime
 from typing import Any
 
@@ -164,6 +165,9 @@ def build_deploy_runbook(
     check_extra_env: dict[str, str] | None = None,
     cwd_override: str | None = None,
     inside_sandbox: bool = False,
+    deploy_ownership: dict[str, Any] | None = None,
+    memory_project: str | None = None,
+    launch_settings: Sequence[str] | None = None,
 ) -> Runbook:
     """Render the DEPLOY-stage runbook for ``profile``.
 
@@ -192,6 +196,21 @@ def build_deploy_runbook(
             commit the merge will land. The promote leg never passes it: it
             runs from the checkout and re-tags the image the candidate built.
             ``None`` ⇒ the profile's ``cwd``, exactly as before.
+        deploy_ownership: WHO OWNS THE DEPLOYMENT TARGET this step changes
+            (23 September 2026; the design's fourth revision H and fifth
+            revision I and J). The deployment target, that target's own
+            counter, the build the counter was granted to, and the identity
+            the step must deploy with the name the PROJECT declared for it.
+            Its presence is what sends the step through the executor — one
+            deploy command per target, held for the whole life of the
+            command's process group — instead of straight to a runner.
+            ``None`` (the candidate leg, a teardown, a direct-live deploy of
+            a project that owns no target) ⇒ no such key ⇒ byte-identical.
+        memory_project: The memory name recorded for this build, and
+        launch_settings: the setting NAMES the project itself declared — both
+            carried onto the step so whatever runs it can build the child's
+            environment from the factory's named list rather than copying its
+            own (the environment door).
         inside_sandbox: True when these steps run INSIDE the repository's own
             sandbox, so the settings that say how to make that sandbox are not
             threaded onto them — there is nothing there to make and nothing
@@ -292,6 +311,15 @@ def build_deploy_runbook(
     )
     if compose_env:
         compose_params["extra_env"] = compose_env
+    # WHO OWNS THE TARGET THIS STEP CHANGES, and what the project declared.
+    # Only the compose step carries them: it is the one that changes the live
+    # thing, and the identity it is handed is the one it must deploy.
+    if deploy_ownership:
+        compose_params["deploy"] = dict(deploy_ownership)
+    if memory_project:
+        compose_params["memory_project"] = str(memory_project)
+    if launch_settings:
+        compose_params["launch_settings"] = [str(name) for name in launch_settings]
     steps.append(_step("deploy_compose", compose_params, idx))
     idx += 1
 

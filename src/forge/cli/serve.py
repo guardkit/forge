@@ -480,14 +480,19 @@ def compose_merge_offer_git_head(forge_config: Any) -> Any | None:
 
     paths = dict(forge_config.planning.target_repo_paths)
 
-    async def read_main(repo_root: Path) -> str | None:
+    async def read_main(repo_root: Path, branch: str | None = None) -> str | None:
         from forge.adapters.guardkit.run_via_sidecar import _resolve_repo_key
 
+        # THE BUILD'S RECORDED TARGET BRANCH, never the name "main" written in
+        # here (23 September 2026). Left unset — a build from before the
+        # starting rule — it is "main", because that is the only thing there
+        # is to try, and the caller says so in its own log.
+        wanted = str(branch or "").strip() or "main"
         repo_key = _resolve_repo_key(Path(repo_root), paths)
         surface = surface_for(repo_key, Path(repo_root)) if repo_key else None
         if surface is None:
-            return await git_rev_parse_main(Path(repo_root))
-        return await surface.rev_parse("main")
+            return await git_rev_parse_main(Path(repo_root), wanted)
+        return await surface.rev_parse(wanted)
 
     return read_main
 

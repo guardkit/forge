@@ -211,6 +211,9 @@ async def dispatch_deploy_stage(
     leg: str = "deploy",
     candidate_cwd: str | None = None,
     prior_events: tuple[str, ...] = (),
+    deploy_ownership: dict[str, Any] | None = None,
+    memory_project: str | None = None,
+    launch_settings: tuple[str, ...] = (),
 ) -> DeployStageResult | None:
     """Dispatch one DEPLOY (+ optional LIVE_GATE) stage through the runner.
 
@@ -291,6 +294,13 @@ async def dispatch_deploy_stage(
             deploy_profile_ref=deploy_profile_ref,
             deployer=deployer,
             prior_events=tuple(prior_events),
+            # WHO OWNS THE TARGET THIS LEG CHANGES, and what the project
+            # declared. Present only on a press that took the deployment lock;
+            # absent on every caller written before it, whose runbook is
+            # byte-identical.
+            deploy_ownership=deploy_ownership,
+            memory_project=memory_project,
+            launch_settings=tuple(launch_settings),
         )
     if leg == "candidate_down":
         return await runner.candidate_down(
