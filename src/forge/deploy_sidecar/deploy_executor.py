@@ -77,7 +77,7 @@ f. **Notes missing or unreadable is not an empty slot.** MISSING and
    design's sign-off note asks reviewers to watch.)
 
    **WITH NOBODY TO ASK, THE DEPLOY IS REFUSED — including a target's first.**
-   Until 24 September 2026 there was one more line here, and it was wrong. The
+   Until 23 September 2026 there was one more line here, and it was wrong. The
    request carried the coordinator's reading of whether anything was running on
    the target, and a request that said "nothing is" was accepted as that
    target's first deploy. A reviewer drove it: build B completed at counter 2,
@@ -423,7 +423,7 @@ class DeployRequest:
     #: The ARTIFACT the check said it checked, and the setting the project
     #: wants it handed back in. The step must deploy exactly this, rather than
     #: resolve a name of its own at the moment it deploys — which is a name
-    #: another build can have taken since the check (24 September 2026).
+    #: another build can have taken since the check (23 September 2026).
     artifact: str | None = None
     artifact_setting: str | None = None
 
@@ -1390,7 +1390,7 @@ class DeployExecutor:
     ) -> ExecutorAnswer | None:
         """Rule (f)'s last clause: ask the COORDINATOR who owns this target.
 
-        The request cannot establish it, and since 24 September 2026 it is not
+        The request cannot establish it, and since 23 September 2026 it is not
         asked to: this runs on EVERY note-less request, a target's first
         deployment included. A delayed request carries whatever counter — and
         whatever claim about the target — it was made with, and with the
@@ -1472,7 +1472,7 @@ class DeployExecutor:
         the ledger at the commit the work started from. The identity the step
         must deploy is added under the name the PROJECT declared for it.
 
-        AND THOSE TWO NAMES ARE CHECKED HERE TOO (26 September 2026, the
+        AND THOSE TWO NAMES ARE CHECKED HERE TOO (23 September 2026, the
         fourth review of this stage). The request's own setting names used to
         be written straight in. The door in front of this route refuses an
         environment key the project did not declare, and this line then let
@@ -1504,7 +1504,7 @@ class DeployExecutor:
         # AND THE ARTIFACT THAT WAS CHECKED, under the name the project chose
         # for it. Without it the step has to work out what to deploy at the
         # moment it deploys, and that is exactly the window another build gets
-        # in through (24 September 2026).
+        # in through (23 September 2026).
         if request.artifact and request.artifact_setting:
             self._put_declared(
                 env,
@@ -1898,7 +1898,7 @@ def request_from(
     PROFILE declares for the identity it is handed and the artifact it must
     deploy. They are checked here because this block is the one place a
     caller says what a setting is called, and a name that is not the
-    project's is refused before anything starts (26 September 2026, the
+    project's is refused before anything starts (23 September 2026, the
     fourth review of this stage: the environment door in front of this route
     was closed and this block was still open, so a live promote ran with a
     setting nobody declared, and with the factory's own ``PATH`` replaced).

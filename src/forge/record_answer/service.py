@@ -1,6 +1,6 @@
 """The coordinator's read-only answer: two questions about its own record.
 
-WHY THIS EXISTS (27 September 2026, the seventh review). The helper that runs
+WHY THIS EXISTS (23 September 2026, the seventh review). The helper that runs
 a project's deploy scripts cannot see the coordinator's record and never will.
 Two of its gates need one fact each out of that record, and until this service
 there was nothing anywhere in the estate to ask:

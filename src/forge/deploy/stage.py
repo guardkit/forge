@@ -575,7 +575,7 @@ class DeployStageRunner:
         # DF-021 trust ledger reads it. None (older callers/tests) → the emission
         # is a no-op, since it cannot name the qa/ tree.
         self._target_repo_root = target_repo_root
-        # THE STAMP THIS STAGE'S REQUESTS CARRY (27 September 2026). The build
+        # THE STAMP THIS STAGE'S REQUESTS CARRY (23 September 2026). The build
         # and the commit the coordinator's ledger records it as starting from,
         # read off that ledger by whoever composed this stage and bound here
         # once. Every request the script runner below sends carries the pair,
@@ -767,7 +767,7 @@ class DeployStageRunner:
         the repository's own deploy script, found relative to it, builds that
         tree. ``None`` runs from the profile's ``cwd`` as before.
 
-        ``identity_env`` (24 September 2026) is what the CHECK is handed so it
+        ``identity_env`` (23 September 2026) is what the CHECK is handed so it
         can pin what it checked: names the project declared, values the caller
         made. It rides the candidate step's own env overlay. The step's output
         comes back in ``detail["gate_summary"]["candidate_output"]``, because
@@ -932,7 +932,7 @@ class DeployStageRunner:
     ) -> DeployStageResult:
         """ASK THE TARGET what it is running. Read-only; nothing is changed.
 
-        Added 24 September 2026, after the second review of the executor stage.
+        Added 23 September 2026, after the second review of the executor stage.
         The only-forwards rule (the design's B) was being applied to what the
         LEDGER said was running, and a run that deploys and then stops before
         its ledger line leaves the ledger wrong. A later pick-up then read a
@@ -981,7 +981,7 @@ class DeployStageRunner:
                 dry_run=self._dry_run,
                 detail={"deploy_output": "", "why": f"{type(exc).__name__}: {exc}"},
             )
-        # WHAT THE STEP SAID IS WANTED EITHER WAY (25 September 2026, the third
+        # WHAT THE STEP SAID IS WANTED EITHER WAY (23 September 2026, the third
         # review). A step that could not find out exits non-zero AND says why
         # on its last line, and that sentence is the whole use of asking. It
         # used to be thrown away with the run: the load was inside the same
@@ -1059,7 +1059,7 @@ class DeployStageRunner:
         profile_ref = deploy_profile_ref or profile.source_ref
         deployer = deployer or deploy_run_id
         # THE SAME SETTING THE CHECK WAS HANDED, for the teardown that follows
-        # (25 September 2026). A project whose candidate belongs to one check
+        # (23 September 2026). A project whose candidate belongs to one check
         # rather than to a shared name cannot be told which one to take down
         # without it. Both names are the project's own and carried as text.
         # The press under the lock carries it in the ownership block; a caller
@@ -1767,7 +1767,7 @@ class DeployStageRunner:
         True when the teardown runbook completed; False when it did not, or
         could not be run at all — the candidate may then still be up.
 
-        ``identity_env`` (25 September 2026) is the same setting the CHECK was
+        ``identity_env`` (23 September 2026) is the same setting the CHECK was
         handed, carrying the same identity. A project whose candidate belongs
         to one check rather than to a shared name needs it to know which one to
         take down, and both names are the project's own, carried here as text.

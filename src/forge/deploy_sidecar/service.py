@@ -600,7 +600,7 @@ def deploy_executor_notes_root(env: "dict[str, str] | None" = None) -> Path:
 #: and the executor refuses rather than believing the request — which is the
 #: safe side and is what it does today.
 #:
-#: AND THE SAME ANSWER IS ASKED ABOUT A BUILD (27 September 2026, the sixth
+#: AND THE SAME ANSWER IS ASKED ABOUT A BUILD (23 September 2026, the sixth
 #: review). ``GET <url>?build=<the build>`` answers ``{"build": "<the same
 #: build>", "start_commit": "<the commit the coordinator recorded that build as
 #: starting from>"}``. That is the one fact this service needs and cannot hold:
@@ -608,7 +608,7 @@ def deploy_executor_notes_root(env: "dict[str, str] | None" = None) -> Path:
 #: declarations are read at is choosing its own authority. See
 #: :func:`_bound_commit`.
 #:
-#: WHAT SERVES IT (27 September 2026, the seventh review). The small read-only
+#: WHAT SERVES IT (23 September 2026, the seventh review). The small read-only
 #: service :mod:`forge.record_answer`, which answers exactly these two
 #: questions off the coordinator's own record and changes nothing. Until it
 #: existed this setting named an address nothing in the estate served, so a
@@ -793,7 +793,7 @@ def allowed_env_keys(
     ``committed`` is the project's profile AS IT IS AT THE BOUND COMMIT, and
     when it is given it — not ``profile`` — is what widens this door.
 
-    THE OTHER HALF OF THE SAME DOOR (27 September 2026, the sixth review; the
+    THE OTHER HALF OF THE SAME DOOR (23 September 2026, the sixth review; the
     reviewer of the 23rd carried it forward three times). The names a project
     declares in its ``.guardkit/config.yaml`` had been made committed lines,
     and the names it declares in its ``deploy/profile.yaml`` had not: this
@@ -823,7 +823,7 @@ def allowed_env_keys(
     factory keeps for itself. A project cannot widen this door onto the
     factory's own settings by writing a name in its own file.
 
-    WHY THE IDENTITY SETTINGS ARE HERE (25 September 2026, the third review of
+    WHY THE IDENTITY SETTINGS ARE HERE (23 September 2026, the third review of
     the executor stage). They were not, and nothing noticed, because every
     drive of the deploy had gone round this route rather than through it.
     Through the real route with api_test's committed profile, the candidate
@@ -968,7 +968,7 @@ def _allowlisted_env(
 
     ``committed`` is that deploy profile as it is AT THE BOUND COMMIT. When it
     is given it is the only copy consulted — a working-copy line is not a
-    declaration on either half of this door (27 September 2026).
+    declaration on either half of this door (23 September 2026).
     """
     if raw_env is None:
         raw_env = {}
@@ -1088,7 +1088,7 @@ def profile_at_commit(
     profile — and one that is not simply declares nothing, which is not a
     fault and has no reason to give.
 
-    THE SAME RULE AS THE SETTINGS FILE'S (27 September 2026, the sixth review).
+    THE SAME RULE AS THE SETTINGS FILE'S (23 September 2026, the sixth review).
     The half of the environment door that reads the profile's own ``identity``
     and ``candidate: env:`` names was still handed the profile loaded off the
     working copy, so an uncommitted line there widened which settings a request
@@ -1121,7 +1121,7 @@ def project_declared_settings(
 ) -> tuple[tuple[str, ...], str | None, str]:
     """The setting names THIS PROJECT declares, a note, and where they were read.
 
-    A DECLARATION IS A COMMITTED LINE, NOT A LINE ON DISK (25 September 2026,
+    A DECLARATION IS A COMMITTED LINE, NOT A LINE ON DISK (23 September 2026,
     the fifth review). Both files used to be read as they are in the working
     copy this service was pointed at, so a line nobody had committed — including
     one a build had just written into the very checkout the command was about to
@@ -1521,7 +1521,7 @@ def _launch_fields(
     its own committed files, read by :func:`project_declared_settings`. A name
     it does not declare is refused in plain words and nothing is started.
 
-    AND THE DECLARATION IS READ AT A COMMIT (25 September 2026). ``declared_at``
+    AND THE DECLARATION IS READ AT A COMMIT (23 September 2026). ``declared_at``
     is the recorded commit the work starts from, which the coordinator holds
     and sends; the two files are read THERE. Without it the fallback is the
     committed HEAD of the copy of the project this service has, never its
@@ -1529,7 +1529,7 @@ def _launch_fields(
     run out of is not a declaration, and cannot widen its own door. Which of
     the two was used is named in the sentence either way.
 
-    AND THAT COMMIT IS BOUND TO THE RECORD (27 September 2026). Which commit
+    AND THAT COMMIT IS BOUND TO THE RECORD (23 September 2026). Which commit
     is read at is settled by :func:`_bound_commit`, against the coordinator's
     own read-only answer for the build this request names — never by the
     request. The fourth answer is that commit, so the OTHER half of the same
@@ -2021,7 +2021,7 @@ def process_run_request(
         return 400, {"error": launch_error}
 
     # AND THE PROFILE THE ENVIRONMENT DOOR READS IS THE COMMITTED ONE, at the
-    # same bound commit (27 September 2026). Read once here, so both shapes
+    # same bound commit (23 September 2026). Read once here, so both shapes
     # below — the live-gate driver and the vetted script — are widened by the
     # same committed declaration rather than by whatever is on the disk.
     #
@@ -2161,7 +2161,7 @@ def process_run_request(
         # env key was accepted here, and went into the environment of the one
         # command that deploys the live thing.
         #
-        # AND FROM THE SAME COPY OF IT: THE COMMITTED ONE (28 September 2026,
+        # AND FROM THE SAME COPY OF IT: THE COMMITTED ONE (23 September 2026,
         # the seventh review, which drove it). "The same declaration" was true
         # of the FILE and not of the COPY — the env door had been moved onto
         # the profile read at the bound commit and this line was left reading
