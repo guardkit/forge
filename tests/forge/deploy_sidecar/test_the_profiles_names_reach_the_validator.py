@@ -29,6 +29,7 @@ what it was asked to run and returns, so what is proved is the door's verdict.
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -64,8 +65,29 @@ def _profile_text() -> str:
     return _the_committed_profile().read_text(encoding="utf-8")
 
 
+def _git(where: Path, *args: str) -> str:
+    done = subprocess.run(
+        [
+            "git",
+            "-c", "user.email=tests@example.invalid",
+            "-c", "user.name=tests",
+            "-c", "commit.gpgsign=false",
+            *args,
+        ],
+        cwd=str(where),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return done.stdout.strip()
+
+
 def _a_project(
-    tmp_path: Path, profile_text: str, *, declares: tuple[str, ...] = ()
+    tmp_path: Path,
+    profile_text: str,
+    *,
+    declares: tuple[str, ...] = (),
+    committed: bool = True,
 ) -> Path:
     """A repository whose ``deploy/profile.yaml`` is the given text.
 
@@ -74,6 +96,12 @@ def _a_project(
     the profile's identity block are the ONLY things that widen the helper's
     environment door: a request presenting a name the project has not declared
     is refused and nothing starts.
+
+    AND SINCE THE LAST CHANGE A DECLARATION IS A COMMITTED LINE, so this writes
+    the project's history as well as its files: the helper reads both of them
+    out of a commit and never off the disk, and a copy laid out as a plain
+    directory declares nothing at all. ``committed=False`` builds exactly that
+    plain directory, for the one test below that is about it.
     """
     repo = tmp_path / "a-project"
     (repo / "deploy").mkdir(parents=True)
@@ -83,6 +111,10 @@ def _a_project(
         (repo / ".guardkit" / "config.yaml").write_text(
             "launch:\n  settings: [" + ", ".join(declares) + "]\n", encoding="utf-8"
         )
+    if committed:
+        _git(repo, "init", "-q", "-b", "main")
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-q", "-m", "the project as it is")
     return repo
 
 
@@ -343,6 +375,15 @@ class TestADeclaredLaunchSettingOnTheRequest:
     Rewritten 23 September 2026. The first of these used to pass with no
     declaration anywhere: a name of the right shape on the request was enough.
     It is not any more — the project's own file has to name it.
+
+    Rewritten again 23 September 2026, and this is the fault the review of the
+    last change found. The rule became "a declaration is a COMMITTED line",
+    and the project these tests build was a plain directory with no history,
+    so the declaration written into it was no declaration at all and the first
+    test below went red. The project is committed now, which is what the rule
+    asks of a real one; the plain directory has its own test, because what
+    happens to a copy with no history is worth pinning down rather than
+    leaving as a surprise.
     """
 
     def _ask(self, repo: Path, body: dict) -> tuple[int, dict]:
@@ -368,6 +409,30 @@ class TestADeclaredLaunchSettingOnTheRequest:
         status, body = self._ask(repo, {"launch_settings": ["A_PROJECT_TOOL_HOME"]})
         assert status == 200, body
         assert body["_started"]
+
+    def test_a_copy_with_no_history_declares_nothing_and_says_so(
+        self, tmp_path: Path
+    ) -> None:
+        """The same declaration, in a copy that has no commits in it.
+
+        A declaration is a committed line, so a copy with nowhere to commit to
+        has declared nothing, and every request naming a setting is refused
+        with nothing started. It is the refusal SENTENCE that matters here: it
+        names the copy and says it carries no committed history, rather than
+        telling a person to commit two lines to a history that is not there.
+        """
+        repo = _a_project(
+            tmp_path,
+            _profile_text(),
+            declares=("A_PROJECT_TOOL_HOME",),
+            committed=False,
+        )
+        status, body = self._ask(repo, {"launch_settings": ["A_PROJECT_TOOL_HOME"]})
+        assert status == 400, body
+        assert "carries no committed history" in body["error"], body["error"]
+        assert "a declaration is a committed line" in body["error"], body["error"]
+        assert str(repo) in body["error"]
+        assert not body["_started"], "nothing may start on a refused request"
 
     def test_the_request_cannot_declare_it_on_the_projects_behalf(
         self, tmp_path: Path
