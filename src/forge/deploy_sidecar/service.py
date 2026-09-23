@@ -1438,8 +1438,6 @@ def _bound_commit(
         payload.get("launch_settings") is not None
         or payload.get("memory_project") is not None
     )
-    if not asks_for_a_declaration:
-        return None, None, "nothing declared was asked for, so no commit was bound"
 
     raw_commit = payload.get("declared_at")
     presented: str | None = None
@@ -1460,6 +1458,17 @@ def _bound_commit(
                 "dashes, colons and underscores, at most 128 of them; got "
                 f"{raw_build!r}"
             ), ""
+
+    if not asks_for_a_declaration:
+        # THE STAMP IS STILL A LABEL, so its shape is checked above even when
+        # nothing is bound: rubbish in 'build' or 'declared_at' is refused as
+        # it always was, and a well-formed pair is said back so a log can say
+        # which build ran a command that read none of the project's own
+        # declarations (the second review of 23 September 2026).
+        label = f" (build {build})" if build else ""
+        return None, None, (
+            "nothing declared was asked for, so no commit was bound" + label
+        )
 
     if presented is None and not build:
         # NOTHING NAMES A BUILD, so there is no record to bind to — and this
