@@ -313,7 +313,7 @@ class TestEveryRefusalIsOneSentenceAPersonCanRead:
         # EXACTLY ONE line in the whole module builds a push, and it is the
         # body of ``the_send_argv``.
         assert pushes == [
-            'return ["push", str(remote), f"{commit}:refs/heads/{branch}"]'
+            'return ["push", str(remote), f"{plain_commit}:refs/heads/{plain_branch}"]'
         ], pushes
         # And the one place a push IS built names the REMOTE, never the source.
         argv = git_work.the_send_argv("the-remote", "a" * 40, "main")

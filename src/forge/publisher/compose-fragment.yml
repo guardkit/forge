@@ -77,6 +77,10 @@ services:
       - forge-publisher-net
     volumes:
       # Its settings: which projects, which addresses, where the ledger is.
+      # Start from settings.sample.json beside this file: it sets "host" to
+      # 0.0.0.0, which the container needs (see above), and it carries no
+      # secret, only the path of the credential file. The code's own default
+      # host is 127.0.0.1, right for a test and silently wrong here.
       - ./settings.json:/etc/forge-publisher/settings.json:ro
       # THE ONE FILE THE CREDENTIAL IS IN. Read-only, and mounted nowhere else
       # in this estate.

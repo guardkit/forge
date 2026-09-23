@@ -1,0 +1,16 @@
+{
+  "_what_this_is": "A sample of the publisher's settings file, for the container. Copy it beside compose-fragment.yml as settings.json and fill in the four paths and the project routes. Every value is a path, an address or a name; the credential itself is NEVER in this file: only the path of the file that holds it, which is mounted read-only into the container and read once at start.",
+  "_host": "0.0.0.0 on purpose. Inside its own container, on a network shared only with the coordinator and with NO port published to the host, the publisher must listen on every address of the container or the coordinator cannot reach it. The default in code is 127.0.0.1, which is right for a test and wrong for the container: a publisher left on 127.0.0.1 inside a container answers nobody, and fails SILENTLY. The boot line of the coordinator and the publisher's own start line both say where it was told to listen, so this is caught on the day.",
+  "credential_file": "/run/secrets/forge-publisher-credential",
+  "ledger": "/var/lib/forge/forge.db",
+  "state_dir": "/var/lib/forge-publisher",
+  "host": "0.0.0.0",
+  "port": 8711,
+  "git_timeout_seconds": 180,
+  "projects": {
+    "the-project-name-as-registered": {
+      "source": "the read-only git address the joined commit is brought out of (the sandbox's git daemon, or the project's copy)",
+      "remote": "the address of the remote named origin, WITHOUT any credential in it"
+    }
+  }
+}
