@@ -496,3 +496,47 @@ def test_an_answer_naming_the_same_tree_spelled_differently_is_accepted(
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_a_command_the_executor_stopped_comes_back_as_no_deploy(tmp_path: Path) -> None:
+    """The takeover word travels the whole way to whatever reads the step.
+
+    The executor answers ``accepted: false`` with its own word when a later
+    holder of the target stopped its command part-way. Through this client that
+    is a non-zero exit carrying the word and the sentence — never a zero exit,
+    and never a step that looks as though it ran.
+    """
+    from forge.deploy_sidecar.deploy_executor import STOPPED_BY_A_TAKEOVER
+
+    repo = tmp_path / "api_test"
+    repo.mkdir()
+    server = _fixed_answer_server(
+        {
+            "accepted": False,
+            "word": STOPPED_BY_A_TAKEOVER,
+            "sentence": (
+                "the deploy command for shop::live from build build-a (the "
+                "target's counter 5) was stopped part-way by a later holder of "
+                "the target, so it did not run to an end and nothing was "
+                "deployed by this request."
+            ),
+            "exit_code": None,
+            "output_tail": "starting a\n",
+        }
+    )
+    _serve(server)
+    try:
+        exit_code, output = _client_for(server)(
+            cwd=str(repo),
+            script="deploy.sh",
+            env_file=None,
+            timeout=10,
+            deploy={"target": "shop::live", "target_counter": 5, "build": "build-a"},
+        )
+        assert exit_code == SIDECAR_TRANSPORT_EXIT_CODE
+        assert exit_code != 0
+        assert output.startswith(f"[{STOPPED_BY_A_TAKEOVER}]")
+        assert "nothing was deployed by this request" in output
+    finally:
+        server.shutdown()
+        server.server_close()

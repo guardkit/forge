@@ -2011,6 +2011,13 @@ class DeployStageRunner:
             events=tuple(events),
             deploy_runbook_id=f"deploy-{deploy_run_id}",
             dry_run=self._dry_run,
+            # WHAT THE STEP SAID, on the failure path too (23 September 2026).
+            # The complete path has always carried it. A caller that has to
+            # tell a deploy step which went red from one the executor refused
+            # or STOPPED PART-WAY needs the same line — the executor's own
+            # word rides in it — and withholding it leaves that caller
+            # guessing from an exit code.
+            detail={"deploy_output": deploy_step_output(executed)},
         )
 
     async def _fail_before_start(
