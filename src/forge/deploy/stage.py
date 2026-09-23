@@ -171,6 +171,30 @@ __all__ = [
 ]
 
 
+def deploy_step_output(executed: Any) -> str:
+    """What the project's own deploy step printed, out of an executed runbook.
+
+    The caller needs it for one reason: the identity the step reported is in
+    there, and it has to be compared with the identity the step was handed.
+    Everything else on the runbook is already recorded. An empty answer is an
+    honest "the step said nothing this side can read", which the comparison
+    treats as a mismatch rather than a pass.
+    """
+    if executed is None:
+        return ""
+    said: list[str] = []
+    for step in getattr(executed, "steps", ()) or ():
+        if getattr(step, "step_type", "") != "deploy_compose":
+            continue
+        result = getattr(step, "result", None)
+        payload = getattr(result, "payload", None)
+        if isinstance(payload, dict):
+            captured = payload.get("captured_output")
+            if isinstance(captured, str) and captured:
+                said.append(captured)
+    return "\n".join(said)
+
+
 def _utcnow() -> datetime:
     return datetime.now(UTC)
 
@@ -825,6 +849,9 @@ class DeployStageRunner:
         deploy_profile_ref: str | None = None,
         deployer: str | None = None,
         prior_events: tuple[str, ...] = (),
+        deploy_ownership: dict[str, Any] | None = None,
+        memory_project: str | None = None,
+        launch_settings: tuple[str, ...] = (),
     ) -> DeployStageResult:
         """Leg two: the live name comes up on the image the candidate built.
 
@@ -840,6 +867,19 @@ class DeployStageRunner:
         among them, so one run is queued once. The result's ``detail``
         carries ``candidate``: ``"torn-down"``, ``"kept"``, ``"standing"``
         (the promote stopped before the teardown) or ``"absent"``.
+
+        ``deploy_ownership`` (23 September 2026) is who owns the deployment
+        target this leg changes: the target, that target's own counter, the
+        build the counter was granted to, and the IDENTITY this step must
+        deploy under the setting name the PROJECT declared. It rides the
+        deploy step's own params, and its presence is what sends the step
+        through the executor rather than straight to a runner. Absent ⇒ every
+        existing caller is byte for byte what it was.
+
+        The result's ``detail`` also carries ``deploy_output`` — what the
+        project's own deploy step printed — because the caller has to read the
+        identity the step reported back out of it and compare it, as text,
+        with the identity it handed over.
         """
         profile = self._profile_for_run(profile)
         events: list[str] = list(prior_events)
@@ -907,6 +947,9 @@ class DeployStageRunner:
                 now=self._clock(),
                 compose_extra_env=promote_extra_env,
                 inside_sandbox=self._runs_inside_the_sandbox(),
+                deploy_ownership=deploy_ownership,
+                memory_project=memory_project,
+                launch_settings=launch_settings,
             )
             await self._safe_publish(
                 self._deploy_publisher.publish_deploy_started,
@@ -1062,7 +1105,14 @@ class DeployStageRunner:
                 deploy_runbook_id=deploy_runbook.runbook_id,
                 live_gate_runbook_id=live_gate_runbook_id,
                 dry_run=self._dry_run,
-                detail={"candidate": candidate_word},
+                detail={
+                    "candidate": candidate_word,
+                    # WHAT THE PROJECT'S OWN DEPLOY STEP SAID. The caller reads
+                    # the identity of what is now running out of this and
+                    # compares it, as text, with the identity it handed over.
+                    # A step that reported nothing is a mismatch, not a pass.
+                    "deploy_output": deploy_step_output(executed),
+                },
             )
         finally:
             if handle is not None:

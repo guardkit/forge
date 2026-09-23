@@ -160,11 +160,24 @@ from forge.pipeline.merge_join import (
     target_branch_now,
     working_folder_path,
 )
+from forge.pipeline.deployment_identity import (
+    declared_identity,
+    fixed_identity,
+    identity_reported_by,
+    the_identities_differ,
+)
+from forge.pipeline.deployment_lock import (
+    DeploymentLockStore,
+    deployment_target_name,
+)
+from forge.pipeline.only_forwards import what_to_do_about_j
 from forge.pipeline.publication_record import (
     LINE_DONE,
+    RESULT_MERGED_AND_RUNNING,
     RESULT_PUBLICATION_PENDING,
     RESULT_PUBLISHED_DEPLOYMENT_PENDING,
     STEP_CANDIDATE_CHECK,
+    STEP_DEPLOY,
     STEP_JOIN,
     STEP_MERGE_CHECKS,
     STEP_SEND,
@@ -408,6 +421,19 @@ class MergeExecutorDeps:
     #: commit and a branch, and the answer carries whether the remote's branch
     #: now contains that commit.
     publisher: Callable[..., Awaitable[dict[str, Any]]] | None = None
+    #: WHERE THE DEPLOYMENT LOCK LIVES — ``() -> DeploymentLockStore | None``
+    #: (the design's F and I). Left unset, the press takes the ledger's own
+    #: connection off ``pool.connection``. A press with no lock store DOES NOT
+    #: DEPLOY: it stops at "published, deployment pending" and says why,
+    #: because a deploy with nothing holding the target is the very thing
+    #: sections F, H, I and J exist to prevent.
+    deployment_lock: Callable[[], Any] | None = None
+    #: WHICH DEPLOYMENT TARGET THIS PROJECT HAS, and how it wants the identity
+    #: handed over — ``(repo, repo_root) -> (target, IdentityDeclaration)``.
+    #: Left unset it is read from the project's own deploy profile, which is
+    #: where a project declares what it deploys and what an identity is for
+    #: it. Central code never invents either.
+    deployment_target: Callable[[str, Path], Any] | None = None
     #: WHAT SOMEBODY WHO LOOKED AT THE MACHINE REPORTS — the stand-in for the
     #: three conditions of section G that no settings file can establish
     #: (:class:`~forge.pipeline.publication_activation.WhatTheMachineSays`).
@@ -1852,14 +1878,25 @@ async def execute_merge_deploy(
         attempt: int,
         turn: int,
         store: Any,
+        why_not_deployed: str = "",
+        already_running: bool = False,
     ) -> MergeDeployOutcome:
         """The remote has it. The deploy has not run, and IT IS NOT CLAIMED TO.
 
         The second result of the design's three-name vocabulary. It is never
         called a merge that is running: what is running is not this, and
-        saying so would be the very claim this whole lane removed. The deploy
-        — what was checked, deployed by its own identity, under a lock — is
-        the executor's stage.
+        saying so would be the very claim this whole lane removed.
+
+        ``why_not_deployed`` says WHY in the sentence a person reads. There is
+        always a reason now that the deploy exists — the lock is held by
+        somebody else, the project declares no target, or the only-forwards
+        rule said not to — and a result with "pending" in its name that does
+        not say what it is pending on is a result nobody can act on.
+
+        ``already_running`` is the one ending that is not waiting for
+        anything: the design's section B, a later result that already includes
+        this one. Nothing more will be deployed for this build, and the
+        sentence says that rather than leaving somebody waiting.
         """
         if store is not None and not store.record(
             build_id=build_id,
@@ -1884,14 +1921,36 @@ async def execute_merge_deploy(
                 "turn": turn,
                 "checked": what_was_checked,
                 "deployed": False,
+                "already_running": already_running,
                 "why_nothing_was_deployed": (
-                    "the deploy is its own stage: what was checked has to be "
-                    "deployed by an identity that cannot be reused, under a "
-                    "lock held across the whole decision. Neither exists yet, "
-                    "so nothing was deployed and nothing claims to be running"
+                    why_not_deployed
+                    or "the press did not reach the deploy"
                 ),
             },
         )
+        if already_running:
+            return MergeDeployOutcome(
+                result=RESULT_WORD_PUBLISHED_DEPLOYMENT_PENDING,
+                # PASSED: nothing is waiting. The work is on the remote and a
+                # later result that contains it is already running, so there
+                # is no step left for anything in this estate to take.
+                status="PASSED",
+                merged_sha=j_commit,
+                detail=(
+                    f"{named} was joined onto {target_branch} at "
+                    f"{g_commit[:10]} in a working folder of its own, the "
+                    f"joined result {j_commit[:10]} was checked"
+                    f"{_the_checks_sentence()}, and it was published: the "
+                    f"branch {target_branch} on the remote named origin is at "
+                    f"{remote_now[:10]} and contains it. It was NOT deployed, "
+                    f"and it will not be: {why_not_deployed} Nothing more is "
+                    "waiting for this build."
+                ),
+                checks_passed=checks_passed,
+                checks_total=checks_total,
+                deployed_in=None,
+                gate_before_merge=_gate_for_report() if gate_began else None,
+            )
         return MergeDeployOutcome(
             result=RESULT_WORD_PUBLISHED_DEPLOYMENT_PENDING,
             # PASSED, AND WHY, because it is a fair question with the word
@@ -1911,8 +1970,8 @@ async def execute_merge_deploy(
                 f"{j_commit[:10]} was checked{_the_checks_sentence()}, and it "
                 f"was published: the branch {target_branch} on the remote "
                 f"named origin is at {remote_now[:10]} and contains it. "
-                "Nothing has been deployed — that is the next stage — so this "
-                "is published, deployment pending."
+                "Nothing has been deployed, so this is published, deployment "
+                f"pending: {why_not_deployed or 'the deploy did not run'}."
             ),
             checks_passed=checks_passed,
             checks_total=checks_total,
@@ -1920,6 +1979,547 @@ async def execute_merge_deploy(
             # A PICK-UP NEVER RAN A CHECK, so it has no gate to report and
             # says so by sending no block at all rather than a block of
             # nothings.
+            gate_before_merge=_gate_for_report() if gate_began else None,
+        )
+
+    # -----------------------------------------------------------------------
+    # THE DEPLOY: under the lock, only forwards, by an identity that cannot be
+    # reused, and confirmed from what the running thing itself reports.
+    # -----------------------------------------------------------------------
+
+    def _deployment_lock_store() -> Any:
+        if deps.deployment_lock is not None:
+            return deps.deployment_lock()
+        connection = getattr(deps.pool, "connection", None)
+        if connection is None:
+            return None
+        try:
+            return DeploymentLockStore(connection)
+        except Exception as exc:  # noqa: BLE001 — a missing lock is a refusal
+            logger.warning(
+                "merge-executor: no deployment lock for %s (%s: %s)",
+                build_id,
+                type(exc).__name__,
+                exc,
+            )
+            return None
+
+    def _the_target_and_how_it_wants_the_identity() -> tuple[str, Any] | None:
+        """This project's deployment target, and its identity declaration.
+
+        Both come from the PROJECT: the target is the project and the
+        environment its own deploy profile declares, and the two names — the
+        setting the identity is handed in, the marker the step reports it
+        after — are the project's to choose. A project whose profile cannot be
+        read has no target this press can take a lock on, and the press says
+        so rather than guessing one.
+        """
+        if deps.deployment_target is not None:
+            try:
+                return deps.deployment_target(repo, repo_root)
+            except Exception as exc:  # noqa: BLE001 — a refusal, never a crash
+                logger.warning(
+                    "merge-executor: %s's deployment target could not be "
+                    "worked out (%s: %s)",
+                    repo,
+                    type(exc).__name__,
+                    exc,
+                )
+                return None
+        try:
+            from forge.deploy.profile import load_deploy_profile
+
+            profile = load_deploy_profile(repo_root / "deploy" / "profile.yaml")
+        except Exception as exc:  # noqa: BLE001 — a refusal, never a crash
+            logger.warning(
+                "merge-executor: %s's deploy profile could not be read (%s: "
+                "%s), so there is no deployment target to take a lock on",
+                repo,
+                type(exc).__name__,
+                exc,
+            )
+            return None
+        return (
+            deployment_target_name(repo, getattr(profile, "env_id", None)),
+            declared_identity(profile),
+        )
+
+    def _merged_and_running(
+        *,
+        j_commit: str,
+        target_branch: str,
+        g_commit: str,
+        remote_now: str,
+        target: str,
+        identity: str,
+        checks_passed: int | None,
+        checks_total: int | None,
+    ) -> MergeDeployOutcome:
+        """The third result word, and the ONLY path that can produce it.
+
+        It is said when, and only when, the joined commit is on the remote's
+        recorded branch AND the thing that was checked for it has been
+        deployed AND the running thing reported back the very identity it was
+        handed. Anything short of all three is one of the two words before it.
+        """
+        return MergeDeployOutcome(
+            result=RESULT_WORD_MERGED_AND_RUNNING,
+            status="PASSED",
+            merged_sha=j_commit,
+            detail=(
+                f"{named} was joined onto {target_branch} at {g_commit[:10]} "
+                f"in a working folder of its own, the joined result "
+                f"{j_commit[:10]} was checked{_the_checks_sentence()}, it was "
+                f"published — the branch {target_branch} on the remote named "
+                f"origin is at {remote_now[:10]} and contains it — and what "
+                f"was checked is now running on {target}, which reported back "
+                f"the identity it was handed ({identity}). Merged into the "
+                "remote and running."
+            ),
+            checks_passed=checks_passed,
+            checks_total=checks_total,
+            deployed_in=deployed_in_for(repo_root),
+            gate_before_merge=_gate_for_report() if gate_began else None,
+        )
+
+    async def _deploy_what_was_checked(
+        *,
+        j_commit: str,
+        j_tree: str | None,
+        target_branch: str,
+        g_commit: str,
+        remote_now: str,
+        checks_passed: int | None,
+        checks_total: int | None,
+        what_was_checked: dict[str, Any],
+        attempt: int,
+        turn: int,
+        store: Any,
+    ) -> MergeDeployOutcome:
+        """Published. Now deploy exactly what was checked, or say why not.
+
+        The whole of the design's C, B, F, I and the coordinator's half of H
+        and J happens here, in this order and under one lock:
+
+        1. work out the project's own deployment target and how it wants the
+           identity handed over and reported back;
+        2. TAKE THE LOCK in the ledger, which raises the TARGET'S own counter
+           and binds it to this build. Everything after this is done against
+           that counter, and a takeover cancels it;
+        3. read what is running, R, off the lock's own row — and if the
+           identity recorded there is already the identity for this joined
+           commit, the deploy has already happened and nothing is done again
+           (the pick-up after a crash between "about to deploy" and its
+           "done");
+        4. apply ONLY FORWARDS: nothing running or R part of J ⇒ deploy; J
+           part of R ⇒ do not deploy, a later result that includes it is
+           already running; neither ⇒ stop and say so for a person;
+        5. hand the project's declared deploy step the fixed identity, under
+           the setting name the project declared, with the target's counter
+           and this build beside it so the executor can enforce ownership;
+        6. read back the identity the step says is now running and compare it
+           with the one it was handed, AS TEXT. A mismatch is a FAILED deploy;
+        7. record R and release the lock.
+        """
+        lock = _deployment_lock_store()
+        if lock is None:
+            return _published_deployment_pending(
+                j_commit=j_commit,
+                target_branch=target_branch,
+                g_commit=g_commit,
+                remote_now=remote_now,
+                checks_passed=checks_passed,
+                checks_total=checks_total,
+                what_was_checked=what_was_checked,
+                attempt=attempt,
+                turn=turn,
+                store=store,
+                why_not_deployed=(
+                    "there is no deployment lock here to hold the target "
+                    "with, and nothing is deployed without one"
+                ),
+            )
+        known = _the_target_and_how_it_wants_the_identity()
+        if known is None:
+            return _published_deployment_pending(
+                j_commit=j_commit,
+                target_branch=target_branch,
+                g_commit=g_commit,
+                remote_now=remote_now,
+                checks_passed=checks_passed,
+                checks_total=checks_total,
+                what_was_checked=what_was_checked,
+                attempt=attempt,
+                turn=turn,
+                store=store,
+                why_not_deployed=(
+                    f"{repo} does not declare a deployment target this press "
+                    "can read, so there was nothing to take a lock on and "
+                    "nothing was deployed"
+                ),
+            )
+        target, declaration = known
+        identity = fixed_identity(j_commit=j_commit, content=j_tree)
+
+        grant = lock.grant(
+            target=target,
+            build_id=build_id,
+            turn=turn,
+            holder=worker_name,
+            now=deps.clock(),
+        )
+        if grant is None:
+            current = lock.read(target)
+            return _published_deployment_pending(
+                j_commit=j_commit,
+                target_branch=target_branch,
+                g_commit=g_commit,
+                remote_now=remote_now,
+                checks_passed=checks_passed,
+                checks_total=checks_total,
+                what_was_checked=what_was_checked,
+                attempt=attempt,
+                turn=turn,
+                store=store,
+                why_not_deployed=(
+                    f"another build ({current.holder_build or 'unnamed'}) "
+                    f"holds the deployment lock on {target}, so this press "
+                    "deployed nothing and left it alone"
+                ),
+            )
+
+        try:
+            # 3. THE PICK-UP, BY IDENTITY. If what is running already reports
+            # the identity made for this joined commit, this deploy happened
+            # and its "done" line was lost. Nothing is done twice.
+            if (
+                grant.running_identity
+                and str(grant.running_identity).strip() == identity.text
+            ):
+                logger.info(
+                    "merge-executor: %s is already running on %s by the very "
+                    "identity made for it (%s) — it was found by looking, not "
+                    "deployed again",
+                    j_commit[:10],
+                    target,
+                    identity.text,
+                )
+                if store is not None and not store.done(
+                    build_id=build_id,
+                    turn=turn,
+                    now=deps.clock(),
+                    step=STEP_DEPLOY,
+                    attempt=attempt,
+                    result={
+                        "ran_on": j_commit,
+                        "deployed": True,
+                        "found_by_looking": True,
+                        "target": target,
+                        "target_counter": grant.counter,
+                        "identity": identity.to_wire(),
+                        "detail": (
+                            "the deploy had already been made when the run "
+                            "stopped; what is running reported this very "
+                            "identity, so it was not deployed again"
+                        ),
+                    },
+                ):
+                    return _replaced_here()
+                if store is not None and not store.record(
+                    build_id=build_id,
+                    turn=turn,
+                    now=deps.clock(),
+                    result=RESULT_MERGED_AND_RUNNING,
+                ):
+                    return _replaced_here()
+                return _merged_and_running(
+                    j_commit=j_commit,
+                    target_branch=target_branch,
+                    g_commit=g_commit,
+                    remote_now=remote_now,
+                    target=target,
+                    identity=identity.text,
+                    checks_passed=checks_passed,
+                    checks_total=checks_total,
+                )
+
+            # 4. ONLY FORWARDS.
+            forwards = await what_to_do_about_j(
+                git,
+                j_commit=j_commit,
+                running_commit=grant.running_commit,
+                running_identity=grant.running_identity,
+                target=target,
+            )
+            if not forwards.go:
+                if store is not None and not store.done(
+                    build_id=build_id,
+                    turn=turn,
+                    now=deps.clock(),
+                    step=STEP_DEPLOY,
+                    attempt=attempt,
+                    result={
+                        "ran_on": j_commit,
+                        "deployed": False,
+                        "target": target,
+                        "target_counter": grant.counter,
+                        "only_forwards": forwards.to_wire(),
+                    },
+                ):
+                    return _replaced_here()
+                return _published_deployment_pending(
+                    j_commit=j_commit,
+                    target_branch=target_branch,
+                    g_commit=g_commit,
+                    remote_now=remote_now,
+                    checks_passed=checks_passed,
+                    checks_total=checks_total,
+                    what_was_checked=what_was_checked,
+                    attempt=attempt,
+                    turn=turn,
+                    store=store,
+                    why_not_deployed=forwards.sentence,
+                    already_running=forwards.already,
+                )
+
+            # 5. HAND THE IDENTITY OVER, with the ownership beside it.
+            ownership = {
+                "target": target,
+                "target_counter": grant.counter,
+                "build": build_id,
+                "identity": identity.text,
+                "identity_setting": declaration.setting,
+            }
+            if store is not None and not store.about_to(
+                build_id=build_id,
+                turn=turn,
+                now=deps.clock(),
+                step=STEP_DEPLOY,
+                attempt=attempt,
+                inputs={
+                    "j_commit": j_commit,
+                    "target": target,
+                    "target_counter": grant.counter,
+                    "identity": identity.to_wire(),
+                    "declared": declaration.to_wire(),
+                    "what_is_running_now": forwards.to_wire(),
+                },
+            ):
+                return _replaced_here()
+
+            try:
+                deployed = await _dispatch("promote", deploy_ownership=ownership)
+            except Exception as exc:  # noqa: BLE001 — a refusal, never a crash
+                why = (
+                    f"the deploy of {identity.text} to {target} raised "
+                    f"({type(exc).__name__}: {exc}), so what is running there "
+                    "is not known to have changed"
+                )
+                return _deploy_failed(
+                    j_commit=j_commit,
+                    target=target,
+                    why=why,
+                    identity=identity.text,
+                    reported=None,
+                    attempt=attempt,
+                    turn=turn,
+                    store=store,
+                    counter=grant.counter,
+                )
+
+            outcome_word = getattr(deployed, "outcome", None)
+            detail = getattr(deployed, "detail", None) or {}
+            said = str(detail.get("deploy_output") or "")
+            reported = identity_reported_by(said, marker=declaration.marker)
+            if deployed is None or outcome_word != "complete":
+                return _deploy_failed(
+                    j_commit=j_commit,
+                    target=target,
+                    why=(
+                        f"the project's own deploy step did not finish "
+                        f"({outcome_word or 'the deploy stage answered nothing'})"
+                    ),
+                    identity=identity.text,
+                    reported=reported,
+                    attempt=attempt,
+                    turn=turn,
+                    store=store,
+                    counter=grant.counter,
+                )
+
+            # 6. WHAT IS RUNNING HAS TO BE WHAT WAS HANDED OVER.
+            if the_identities_differ(identity.text, reported):
+                return _deploy_failed(
+                    j_commit=j_commit,
+                    target=target,
+                    why=(
+                        f"the deploy step was handed {identity.text} and "
+                        + (
+                            f"reported {reported} as what is now running"
+                            if reported
+                            else (
+                                "reported no identity at all, so what is "
+                                "running has not been shown to be what was "
+                                "checked"
+                            )
+                        )
+                    ),
+                    identity=identity.text,
+                    reported=reported,
+                    attempt=attempt,
+                    turn=turn,
+                    store=store,
+                    counter=grant.counter,
+                )
+
+            # 7. R IS WRITTEN DOWN, AND ONLY THEN IS THE LOCK PUT DOWN.
+            if not lock.record_running(
+                target=target,
+                counter=grant.counter,
+                now=deps.clock(),
+                commit=j_commit,
+                identity=identity.text,
+                build_id=build_id,
+            ):
+                return _replaced_here()
+            if store is not None and not store.done(
+                build_id=build_id,
+                turn=turn,
+                now=deps.clock(),
+                step=STEP_DEPLOY,
+                attempt=attempt,
+                result={
+                    "ran_on": j_commit,
+                    "deployed": True,
+                    "target": target,
+                    "target_counter": grant.counter,
+                    "identity": identity.to_wire(),
+                    "reported": reported,
+                    "verify_ok": True,
+                },
+            ):
+                return _replaced_here()
+            if store is not None and not store.record(
+                build_id=build_id,
+                turn=turn,
+                now=deps.clock(),
+                result=RESULT_MERGED_AND_RUNNING,
+            ):
+                return _replaced_here()
+            _write_receipt(
+                "merge_deploy_deployment.json",
+                {
+                    "step": "deploy",
+                    "target": target,
+                    "target_counter": grant.counter,
+                    "build_id": build_id,
+                    "turn": turn,
+                    "attempt": attempt,
+                    "j_commit": j_commit,
+                    "identity": identity.to_wire(),
+                    "declared": declaration.to_wire(),
+                    "reported": reported,
+                    "only_forwards": forwards.to_wire(),
+                    "result": RESULT_MERGED_AND_RUNNING,
+                },
+            )
+            return _merged_and_running(
+                j_commit=j_commit,
+                target_branch=target_branch,
+                g_commit=g_commit,
+                remote_now=remote_now,
+                target=target,
+                identity=identity.text,
+                checks_passed=checks_passed,
+                checks_total=checks_total,
+            )
+        finally:
+            # THE LOCK IS PUT DOWN AFTER THE CONFIRMATION IS RECORDED, on
+            # every ending. A release that changes no row means this holder
+            # was taken over while it worked, which is exactly the case the
+            # counter exists for, and it is left alone.
+            try:
+                lock.release(
+                    target=target, counter=grant.counter, now=deps.clock()
+                )
+            except Exception as exc:  # noqa: BLE001 — never costs a result
+                logger.warning(
+                    "merge-executor: the deployment lock on %s could not be "
+                    "put down (%s: %s) — it expires on its own",
+                    target,
+                    type(exc).__name__,
+                    exc,
+                )
+
+    def _deploy_failed(
+        *,
+        j_commit: str,
+        target: str,
+        why: str,
+        identity: str,
+        reported: str | None,
+        attempt: int,
+        turn: int,
+        store: Any,
+        counter: int,
+    ) -> MergeDeployOutcome:
+        """The deploy did not put what was checked live. Said, not softened."""
+        logger.error(
+            "merge-executor: the deploy of %s to %s FAILED — %s",
+            j_commit[:10],
+            target,
+            why,
+        )
+        if store is not None:
+            store.done(
+                build_id=build_id,
+                turn=turn,
+                now=deps.clock(),
+                step=STEP_DEPLOY,
+                attempt=attempt,
+                result={
+                    "ran_on": j_commit,
+                    "deployed": False,
+                    "verify_ok": False,
+                    "target": target,
+                    "target_counter": counter,
+                    "identity": identity,
+                    "reported": reported,
+                    "why": why,
+                },
+            )
+            store.record(
+                build_id=build_id,
+                turn=turn,
+                now=deps.clock(),
+                result=RESULT_PUBLISHED_DEPLOYMENT_PENDING,
+            )
+        _write_receipt(
+            "merge_deploy_deployment.json",
+            {
+                "step": "deploy",
+                "target": target,
+                "target_counter": counter,
+                "j_commit": j_commit,
+                "identity": identity,
+                "reported": reported,
+                "deployed": False,
+                "why": why,
+            },
+        )
+        return MergeDeployOutcome(
+            # One of the three RED endings the estate already knows: the work
+            # landed on the remote and what came after it went red, which is
+            # worth a repair job.
+            result="merged-deploy-failed",
+            status="FAILED",
+            merged_sha=j_commit,
+            failed_step="deploy",
+            detail=(
+                f"{named}'s joined result {j_commit[:10]} is on the remote, "
+                f"but it is NOT running: {why}. Nothing claims to be running "
+                "that has not been shown to be."
+            ),
             gate_before_merge=_gate_for_report() if gate_began else None,
         )
 
@@ -2110,14 +2710,20 @@ async def execute_merge_deploy(
                 },
             ):
                 return _replaced_here()
-        return _published_deployment_pending(
+        # IT IS PUBLISHED. The deploy is a separate decision and it is made
+        # here too, because a press that picked a landed send up is exactly
+        # the press that has to settle whether what was checked is running —
+        # which it does by looking at the target, not by believing a line.
+        checked_here = dict(getattr(record, "checked", {}) or {})
+        return await _deploy_what_was_checked(
             j_commit=str(j),
+            j_tree=str(checked_here.get("j_tree") or "") or None,
             target_branch=target_branch,
             g_commit=str(getattr(record, "g_commit", None) or g_commit),
             remote_now=g_commit,
             checks_passed=None,
             checks_total=None,
-            what_was_checked=dict(getattr(record, "checked", {}) or {}),
+            what_was_checked=checked_here,
             attempt=int(getattr(record, "attempt", 0) or 0),
             turn=turn,
             store=store,
@@ -2204,6 +2810,20 @@ async def execute_merge_deploy(
                 "to run the merge twice",
                 build_id,
             )
+            # THE ROW IS WRITTEN EVEN THOUGH NOTHING HAPPENED (carried from
+            # stage 4b's list). This is one of the two refusals that happen
+            # BEFORE the lease, and it used to leave no publication record at
+            # all — so "nobody ever pressed this build" and "it was pressed
+            # and refused because it had already merged" read the same
+            # afterwards. The merge word was given; the record says so.
+            _write_the_refusal_down(
+                store=store,
+                target_branch=None,
+                refusal=(
+                    "a merge step is already on record for this build — "
+                    "refusing to run it twice"
+                ),
+            )
             return MergeDeployOutcome(
                 result="merge-refused",
                 status="FAILED",
@@ -2232,9 +2852,16 @@ async def execute_merge_deploy(
         gate_began = True
         candidate_sha = await git.rev_parse(branch)
         if not candidate_sha:
-            return _could_not_check(
+            # THE SECOND PRE-LEASE REFUSAL, and it leaves a row too (carried
+            # from stage 4b's list). A branch that is not there is a merge
+            # word that was given and refused, and the record has to say so.
+            not_found = (
                 f"the branch {branch} was not found {git_venue(git, repo_root)}"
             )
+            _write_the_refusal_down(
+                store=store, target_branch=None, refusal=not_found
+            )
+            return _could_not_check(not_found)
         gate["candidate_sha"] = candidate_sha
         offered_tree = await git.rev_parse(f"{candidate_sha}^{{tree}}")
         if expected_candidate_sha and candidate_sha != expected_candidate_sha:
@@ -3327,8 +3954,12 @@ async def execute_merge_deploy(
                 return _replaced_here()
 
             if published:
-                return _published_deployment_pending(
+                # PUBLISHED IS NOT PERMISSION TO DEPLOY (the design's section
+                # B), so the deploy is its own decision, made under the
+                # deployment lock and only forwards.
+                return await _deploy_what_was_checked(
                     j_commit=str(j_commit),
+                    j_tree=j_tree,
                     target_branch=target_branch,
                     g_commit=g_commit,
                     remote_now=str(answer.get("remote_now") or ""),
@@ -3415,6 +4046,46 @@ async def execute_merge_deploy(
             store=store,
         )
 
+    async def _retire_the_joins_working_folders(record: Any) -> list[dict[str, Any]]:
+        """Remove every attempt's working folder — and ONLY at the record's end.
+
+        Carried from stage 4a, which made these folders and never removed one,
+        because the design keeps each joined commit under a name of its own
+        until the build's record reaches its end, and no earlier version could
+        reach it. The end is reachable now: the joined commit is on the remote
+        and what was checked is running.
+
+        THE BRANCH IS LEFT ALONE. Only the working FOLDER goes. Every joined
+        commit of every attempt stays exactly where it is, on the branch its
+        own attempt named, which is what "kept until the record's end" was
+        protecting — a folder is scaffolding, a commit is the work.
+        """
+        retired: list[dict[str, Any]] = []
+        highest = int(getattr(record, "attempt", 0) or 0) if record is not None else 0
+        for attempt_number in range(1, max(highest, 1) + 1):
+            folder = working_folder_path(repo_root, feature_id, attempt_number)
+            try:
+                removed = await git.remove_working_folder(folder)
+            except Exception as exc:  # noqa: BLE001 — never costs a result
+                retired.append(
+                    {
+                        "attempt": attempt_number,
+                        "folder": folder,
+                        "removed": False,
+                        "detail": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+                continue
+            retired.append(
+                {
+                    "attempt": attempt_number,
+                    "folder": folder,
+                    "removed": bool(removed),
+                    "branch_kept": integration_branch(feature_id, attempt_number),
+                }
+            )
+        return retired
+
     try:
         outcome = await _press()
     finally:
@@ -3422,12 +4093,30 @@ async def execute_merge_deploy(
         # if it is still standing, and its laid-out tree removed — BEFORE the
         # report goes out, so the report never says "torn down" ahead of time.
         await _cleanup()
-    # THE BUILD'S OWN RETAINED WORKING FOLDER is retired only when the whole
-    # press has finished — which, in this version, never happens: the record
-    # stops at "checked" and the result word below is not reachable. That is
-    # the safe side of the line. The design says every joined commit and
-    # everything the build made is kept until the build's record reaches its
-    # end, and its end is a publication this version cannot perform.
+    # THE RECORD'S END, and the only place anything the press made is removed.
+    # It is reachable now: the joined commit is on the remote's recorded
+    # branch and what was checked is running, confirmed from the identity the
+    # running thing reported. The JOIN'S working folders go here — every
+    # attempt's, the branches left exactly as they are — and the build's own
+    # retained folder is retired below on the same word.
+    if not dry_run and outcome.result == RESULT_WORD_MERGED_AND_RUNNING:
+        try:
+            store_now = _publication_store()
+            record_now = store_now.read(build_id) if store_now is not None else None
+        except Exception:  # noqa: BLE001 — a tidy-up never costs a result
+            record_now = None
+        _write_receipt(
+            "merge_deploy_join_folders.json",
+            {
+                "step": "retire-the-join-folders",
+                "why_now": (
+                    "the build's record has reached its end: the joined "
+                    "commit is on the remote and what was checked is running"
+                ),
+                "branches_kept": True,
+                "folders": await _retire_the_joins_working_folders(record_now),
+            },
+        )
     if (
         not dry_run
         and outcome.result == RESULT_WORD_MERGED_AND_RUNNING
@@ -3546,6 +4235,7 @@ def build_in_daemon_deploy_dispatcher(
         prior_events: tuple[str, ...] = (),
         deploy_run_id: str | None = None,
         task_id: str | None = None,
+        deploy_ownership: dict[str, Any] | None = None,
     ) -> Any:
         from forge.adapters.nats.deploy_publisher import DeployPublisher
         from forge.adapters.nats.runbook_publisher import RunbookPublisher
@@ -3577,6 +4267,11 @@ def build_in_daemon_deploy_dispatcher(
         sandbox = sandbox_for(config, repo)
         spec = profile.live_gate
         invoker = None
+        # WHAT THE PROJECT DECLARED FOR THIS BUILD, read once. The live check
+        # needs it, and since 23 September 2026 so does the deploy step: its
+        # environment is built from the factory's named list plus these, never
+        # copied from whatever this process holds.
+        build_memory, build_declared = _the_builds_declarations(db_path, build_id)
         if spec is not None and sandbox is not None:
             # WHAT THE PROJECT DECLARED FOR THIS BUILD, off the ledger and
             # sent with the gate's request (22 September 2026). The live check
@@ -3587,7 +4282,7 @@ def build_in_daemon_deploy_dispatcher(
             # and one that launches the build system got memory off. Nothing
             # recorded reads as "the factory's own list and memory off", which
             # is the honest state rather than a guessed name.
-            memory_name, declared_names = _the_builds_declarations(db_path, build_id)
+            memory_name, declared_names = build_memory, build_declared
             invoker = SidecarLiveGateInvoker(
                 base_url=str(sandbox.sidecar_url),
                 repo=repo,
@@ -3640,6 +4335,13 @@ def build_in_daemon_deploy_dispatcher(
             leg=leg,
             candidate_cwd=candidate_cwd,
             prior_events=tuple(prior_events),
+            # WHO OWNS THE TARGET THIS LEG CHANGES (the design's H, I and J),
+            # and what the project declared, so the deploy step is handed the
+            # identity it must deploy and an environment that was built rather
+            # than copied.
+            deploy_ownership=deploy_ownership,
+            memory_project=build_memory,
+            launch_settings=build_declared,
         )
 
     return _dispatch
