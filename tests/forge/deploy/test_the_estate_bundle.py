@@ -550,3 +550,31 @@ class TestTheCheckStillHasEveryItemTheDesignAsksFor:
             assert modes[number] == "services", (
                 f"item {number} can only be checked AFTER things have started"
             )
+
+
+class TestTheEstateForwardsWhatTheBundleForwards:
+    """The estate composes deploy/compose in, so the names it hands a project's
+    sandbox are that bundle's names. The two lists had drifted by 24 September
+    2026 (the estate's copy did not forward FORGE_IMAGE or FORGE_IMAGE_IDENTITY,
+    which the bootstrap requires); this holds them identical."""
+
+    def _names(self, path: Path) -> list[str]:
+        import re
+        text = path.read_text()
+        match = re.search(r"^SANDBOX_ENV_NAMES=(.*)$", text, re.M)
+        assert match, f"{path} has no SANDBOX_ENV_NAMES line"
+        return match.group(1).split()
+
+    def test_the_two_lists_are_identical(self) -> None:
+        estate = self._names(ESTATE / ".env.example")
+        bundle = self._names(ESTATE.parent / "compose" / ".env.example")
+        assert estate == bundle, (
+            "deploy/estate/.env.example forwards a different list from "
+            f"deploy/compose/.env.example:\n  estate only: {sorted(set(estate) - set(bundle))}"
+            f"\n  bundle only: {sorted(set(bundle) - set(estate))}"
+        )
+
+    def test_every_forwarded_name_has_a_line_in_the_estates_example(self) -> None:
+        text = (ESTATE / ".env.example").read_text()
+        missing = [n for n in self._names(ESTATE / ".env.example") if f"\n{n}=" not in text]
+        assert not missing, f"forwarded but given no line to fill in: {missing}"
