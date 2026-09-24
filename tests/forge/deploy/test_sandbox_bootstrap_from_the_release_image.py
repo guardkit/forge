@@ -147,9 +147,12 @@ def an_engine(style: str = "classic", **how) -> dict:
 #: about a real engine substituting a real image.
 #:
 #: Settings a test uses to make it behave badly: STANDIN_NO_IMAGE (this engine
-#: holds nothing), STANDIN_RM_REFUSES (this container will not go), and
+#: holds nothing), STANDIN_RM_REFUSES (this container will not go),
 #: STANDIN_PS_FAILS_FROM (the numbered listing from which this engine stops
-#: answering at all — which is not the same as answering "nothing there").
+#: answering at all — which is not the same as answering "nothing there") and
+#: STANDIN_ANSWERS_WITH_HALF_A_DOCUMENT (it renders only the layers part of
+#: the identity document, which is what the stage 4d reviewer's own stand-in
+#: engine does).
 STANDIN_DOCKER = '''#!/usr/bin/env python3
 import json, os, pathlib, sys
 
@@ -234,6 +237,11 @@ if verb == "image" and len(argv) > 1 and argv[1] == "inspect":
     if key is None:
         sys.exit(1)
     if "forge-image-identity/1" in fmt:
+        if os.environ.get("STANDIN_ANSWERS_WITH_HALF_A_DOCUMENT"):
+            # An engine that rendered only the part it understood.
+            for one in table["images"][key]["layers"]:
+                print("layer " + one)
+            sys.exit(0)
         print(identity_document(key))
         if table.get("move_tag_to"):
             the_tag_has_moved.write_text("the tag names another image now\\n")
@@ -1216,6 +1224,21 @@ class TestTheImageIsCheckedByWhatItIsAndNotByItsLayers:
         )
         result = _run(sandbox, FORGE_IMAGE_IDENTITY=recorded)
         assert result.returncode == 2
+        assert not any(line.startswith("run ") for line in _calls(sandbox))
+
+    def test_half_an_answer_is_refused_rather_than_hashed(self, sandbox):
+        """A hash of half the truth compares perfectly well with another one.
+
+        Found on 24 September 2026 by running the stage 4d reviewer's own
+        stand-in engine against the fixed script: that engine answers the
+        identity question with the layer list alone, and a script that simply
+        hashed whatever came back would have been comparing layer lists again
+        without anybody noticing. The document's first line is a fixed word,
+        so an answer that is not the whole document is refused.
+        """
+        result = _run(sandbox, STANDIN_ANSWERS_WITH_HALF_A_DOCUMENT="1")
+        assert result.returncode == 2
+        assert "did not begin" in result.stdout or "does not begin" in result.stdout
         assert not any(line.startswith("run ") for line in _calls(sandbox))
 
     def test_a_changed_platform_alone_is_refused(self, sandbox):
