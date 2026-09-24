@@ -1,16 +1,17 @@
 # ---------------------------------------------------------------------------
-# The factory's release manifest — what exactly goes into one Forge image.
+# The factory's release manifest — what exactly goes into one Forge release,
+# and which images come out of it.
 #
 # Written 2026-09-24. Until this file existed, the Forge image was built from
 # whatever four checkouts happened to sit beside forge/ on one machine
 # (scripts/build-image.sh), so "the same release on two machines" was not
 # possible. This file is the answer: every input named by its repository, the
 # exact commit, and the branch that commit came from, plus the Python base
-# image the Dockerfile pins.
+# image the Dockerfiles pin.
 #
 # It is read by scripts/build-release-image.sh, which fetches each repository
-# from GitHub at the commit below into a fresh temporary folder and builds the
-# image from those clones alone. Nothing beside forge/ is used.
+# from GitHub at the commit below into a fresh temporary folder and builds
+# every image below from those clones alone. Nothing beside forge/ is used.
 #
 # All five repositories are public, so fetching them needs no credential.
 #
@@ -18,32 +19,74 @@
 #   scripts/build-release-image.sh /path/to/manifest.yaml
 # from any directory. The script refuses if a commit cannot be fetched, if a
 # clone lands on a different commit, or if the base image digest here has
-# drifted from the one in the Dockerfile.
+# drifted from the one in any of the Dockerfiles named below.
 #
 # Format note: this is a deliberately small, flat subset of YAML so that the
 # build script can read it with awk alone. A second machine therefore needs
 # only this file, Docker, and network access to GitHub — no YAML tool, no
 # language runtime, no checkout. Keep it to "key: value" at the top level and
-# to the exact four keys per repository below.
+# to the exact keys per list entry below.
 # ---------------------------------------------------------------------------
 
-schema: 1
-version: 2026.09.24-3
+# Schema 2 (24 September 2026): a release is a SET of images, listed under
+# "images:" below, and no longer a single one named by "image_name". Schema 1
+# manifests still build — the script reads them as one image, the
+# coordinator's, from the build-context root's own Dockerfile.
+schema: 2
+version: 2026.09.24-4
+
+# The one image this repository's own operator scripts mean by "the release
+# image" (ops/forge-prod-recreate.sh reads this line). It is the same name as
+# the images: entry whose role is coordinator, and the build script refuses if
+# the two ever disagree.
 image_name: forge
 
-# The Python base image both Dockerfile stages start FROM. The build script
-# reads the Dockerfile's own FROM lines and refuses to build if they disagree
-# with this line, so the pin cannot quietly drift out of the manifest.
+# The Python base image EVERY stage of EVERY Dockerfile below starts FROM. The
+# build script reads each Dockerfile's own FROM lines and refuses to build if
+# any of them disagrees with this line, so the pin cannot quietly drift out of
+# the manifest and the images of one release cannot end up on two bases.
 python_base_digest: sha256:2e256d0381371566ed96980584957ed31297f437569b79b0e5f7e17f2720e53a
 
-# The five repositories that make up the image.
+# ---------------------------------------------------------------------------
+# THE IMAGES THIS RELEASE IS MADE OF.
+#
+# Both are built in ONE run, from ONE set of fetched clones, and both carry
+# the same release labels — every commit, the manifest's hash, the version —
+# plus their own role. That is what makes them a set: they cannot be built
+# from different code and still answer to the same release name.
+#
+#   name        the image's name; its two tags are <name>:<forge commit> and
+#               <name>:<version>
+#   dockerfile  the file it is built from, as a path INSIDE the fetched clone
+#               of the build-context root. Never a path on a machine
+#   role        which of the release's images this is. It goes into a label
+#   proof       the script, also from the fetched clone, that has to pass
+#               before the release calls itself built
+# ---------------------------------------------------------------------------
+images:
+  - name: forge
+    dockerfile: Dockerfile
+    role: coordinator
+    proof: scripts/verify-forge-oracles.sh
+  # THE PUBLISHER'S OWN IMAGE. Built for the first time on 24 September 2026.
+  # Before that the release built only the coordinator's, so every proof of
+  # the publisher ran the coordinator's image with the publisher's start line
+  # — a stand-in. The publisher is the one process holding the credential that
+  # can write to a project's remote, and its separateness IS the wall, so the
+  # image the wall is made of is now built and proved with everything else.
+  - name: forge-publisher
+    dockerfile: src/forge/publisher/Dockerfile
+    role: publisher
+    proof: scripts/verify-publisher-image.sh
+
+# The five repositories that make up the images above.
 #   role: build-context-root  — the Dockerfile and the main build context
 #   role: named-context       — supplied to the build as --build-context <name>=<clone>
 repositories:
   - name: forge
     url: https://github.com/guardkit/forge.git
     branch: main
-    commit: 23d6331fea4b1b5ae62943a56080a5a0280cec4f
+    commit: 4f080ef241e3ad0aa7cd7ba9cd82cfe30e163808
     role: build-context-root
   - name: guardkit
     url: https://github.com/guardkit/guardkit.git
