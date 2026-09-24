@@ -91,8 +91,9 @@ folder for. Hand it to the same two numbers `.env` gives:
 
 ```
 docker compose --env-file .env -f compose.yaml -f compose.sandbox-runner.yaml create
+set -a; . ./.env; set +a
 docker run --rm -v <project>_sandbox-client-state:/v1 \
-  alpine sh -c 'chown ${FACTORY_HOST_UID}:${FACTORY_HOST_GID} /v1'
+  alpine chown "${FACTORY_HOST_UID}:${FACTORY_HOST_GID}" /v1
 ```
 
 ### The stop is the point of it
