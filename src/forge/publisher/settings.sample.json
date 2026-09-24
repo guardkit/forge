@@ -3,7 +3,7 @@
   "_host": "0.0.0.0 on purpose. Inside its own container, on a network shared only with the coordinator and with NO port published to the host, the publisher must listen on every address of the container or the coordinator cannot reach it. The default in code is 127.0.0.1, which is right for a test and wrong for the container: a publisher left on 127.0.0.1 inside a container answers nobody, and fails SILENTLY. The boot line of the coordinator and the publisher's own start line both say where it was told to listen, so this is caught on the day.",
   "credential_file": "/run/secrets/forge-publisher-credential",
   "ledger": "/var/lib/forge/forge.db",
-  "state_dir": "/var/lib/forge-publisher",
+  "state_dir": "/home/publisher/state",
   "host": "0.0.0.0",
   "port": 8711,
   "git_timeout_seconds": 180,
