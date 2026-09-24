@@ -565,6 +565,66 @@ class TestTheFoldersBothContainersShare:
         assert str(wanted) in result.stdout
         assert not any(line.startswith("run ") for line in _calls(sandbox))
 
+    def test_the_fallback_receipts_root_says_nothing_outside_is_looking(
+        self, sandbox
+    ):
+        """Surviving a container is not the same as being where anyone reads.
+
+        The stage 4e reviewer's rollout note, 24 September 2026: with nothing
+        naming a receipts root, the bootstrap uses one of its own in the
+        sandbox. That survives a container being replaced — which is all this
+        stage was about — but it is a path nothing outside the sandbox knows,
+        and a project whose receipts are read from outside has to name its own
+        folder. Nothing does it for anyone, so the start log has to say so.
+        """
+        process = subprocess.Popen(
+            ["bash", str(sandbox["script"])],
+            env=_settings(sandbox),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        try:
+            for _ in range(100):
+                if len([c for c in _calls(sandbox) if c.startswith("run ")]) >= 2:
+                    break
+                time.sleep(0.1)
+        finally:
+            process.terminate()
+            said = process.communicate(timeout=30)[0]
+        assert "SANDBOX_RECEIPTS_PATH" in said
+        assert "receipts_path" in said
+        assert "nothing outside this sandbox is looking at it" in said
+
+
+# ---------------------------------------------------------------------------
+class TestTheHeaderNamesBothWorktreeFoldersInsideTheClone:
+    """A list that names one of two sibling folders reads as if the other moved.
+
+    Forge cuts per-build trees in two places inside a registered checkout:
+    ``.guardkit/worktrees/<task or feature id>`` (autobuild) and
+    ``.forge/worktrees/<build id>`` (the conductor,
+    ``src/forge/cli/_conductor_worktree.py``). Both are under the project's
+    clone, which IS the shared mount, so the mounting was right either way —
+    but the header's list named only the first, which the stage 4e reviewer
+    recorded on 24 September 2026. This holds the naming complete.
+    """
+
+    def test_both_are_named_under_the_clone(self):
+        header = BOOTSTRAP.read_text().split("WHAT IT NEVER DOES", 1)[0]
+        clause = header.split("the project's own clone", 1)[1].split(
+            "the per-build git worktrees", 1
+        )[0]
+        assert ".guardkit/worktrees" in clause
+        assert ".forge/worktrees" in clause
+
+    def test_the_conductors_own_module_still_cuts_them_there(self):
+        """If Forge moves that folder, this list is wrong and should fail."""
+        conductor = (
+            Path(templates.__file__).resolve().parents[1] / "_conductor_worktree.py"
+        )
+        assert ".forge/worktrees" in conductor.read_text()
+
 
 # ---------------------------------------------------------------------------
 class TestASecondStartRefuses:
