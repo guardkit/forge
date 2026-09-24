@@ -167,8 +167,11 @@ class TestTheStopEndsTheWorkInside:
         """A container that dies without waiting is the defect, not the fix."""
         service = _start(root, FAKE_STOP_SECONDS="3")
         try:
+            # Wait for the START, not the stop that precedes it: a stop signal
+            # sent during that first stop is answered by finishing it and
+            # exiting, which is right, and would measure the wrong stop here.
             assert _wait_for(
-                lambda: any("the/projects/own/bootstrap" in c for c in _calls(root))
+                lambda: any(c.endswith("the/projects/own/bootstrap") for c in _calls(root))
             )
             service.send_signal(signal.SIGTERM)
             started_waiting = time.monotonic()

@@ -479,6 +479,29 @@ class TestTheOrdinaryPathStillWorks:
         assert len(_starts(root)) == 1, "the shutdown must not have started anything"
         assert "[sandbox-runner] stopped" in output.splitlines()
 
+    def test_a_stop_signal_during_the_first_stop_starts_nothing(
+        self, root: Path
+    ) -> None:
+        """The third review of 24 September 2026: told to stop while its first
+        stop was still being retried, the service went on to start the
+        bootstrap and then stop it again. Now: the stop finishes (the work
+        inside was asked to stop, and it stops), nothing starts, exit 0."""
+        _configure(root, stop_fails_until=2)
+        already_inside = _seed_the_work_already_inside(root)
+
+        service = _start(root, SANDBOX_STOP_RETRY_SECONDS="3")
+        assert _wait_for(lambda: len(_stops(root)) == 1), "the first stop never happened"
+        service.send_signal(signal.SIGTERM)
+        output = _finish(service)
+
+        assert service.returncode == 0
+        assert "[sandbox-runner] stopped" in output.splitlines()
+        assert not _starts(root), f"it started the bootstrap after being told to stop: {_events(root)}"
+        assert _wait_for(lambda: already_inside not in _workers_alive(root), seconds=10), (
+            "the retried stop said it worked but the old work is still alive"
+        )
+        assert not _of_kind(root, "hold"), "it held the sandbox awake for nothing"
+
     def test_a_clean_shutdown_ends_the_work_and_lets_the_sandbox_sleep(
         self, root: Path
     ) -> None:
