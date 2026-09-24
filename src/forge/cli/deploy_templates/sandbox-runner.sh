@@ -704,6 +704,17 @@ IDENTITY_DOCUMENT="$(image_field "${IMAGE_IDENTITY_DOCUMENT_FORMAT}" | tr -d '\r
 if [[ -z "${IDENTITY_DOCUMENT}" ]]; then
   refuse "this sandbox's own engine would not say what the image ${IMAGE} is made of and how it is configured, so there is nothing to check against the identity the machine recorded. Refusing to start."
 fi
+# AND IT HAS TO BE THE WHOLE DOCUMENT. The first line of the document is a
+# fixed word, so an answer that does not begin with it is not an identity
+# document: an engine that rendered only part of what was asked for, or
+# answered something else entirely, would otherwise have a hash taken of
+# whatever it did say — and a hash of half the truth compares perfectly well
+# against another hash of half the truth (found on 24 September 2026, hashing
+# the stage 4d reviewer's own stand-in engine, which answers with the layer
+# list alone).
+if [[ "${IDENTITY_DOCUMENT%%$'\n'*}" != "forge-image-identity/1" ]]; then
+  refuse "this sandbox's own engine did not answer with an identity document for ${IMAGE}: what came back does not begin with the line an identity document begins with, so it is not the whole of what was asked for and nothing can be concluded by hashing it. Refusing to start."
+fi
 ACTUAL_IDENTITY="$(printf '%s\n' "${IDENTITY_DOCUMENT}" | sha256sum | cut -d' ' -f1)"
 if [[ "${ACTUAL_IDENTITY}" != "${EXPECTED_IDENTITY}" ]]; then
   refuse "the image called ${IMAGE} in this sandbox is not the one the machine handed over. It expected an image whose platform, layers and runtime configuration hash to ${EXPECTED_IDENTITY}, and this engine holds one that hashes to ${ACTUAL_IDENTITY}. That covers the environment, the entry point, the command, the user, the working directory, the labels, the ports and the volumes as well as the filesystem, so the same layers under a changed configuration land here too — and rightly: it would not be the image that was tested. Hand the release image in again. Refusing to start."

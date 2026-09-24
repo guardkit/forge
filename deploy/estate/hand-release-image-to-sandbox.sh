@@ -151,6 +151,10 @@ workdir {{.Config.WorkingDir}}
 hash_the_document() {
   local document="$1"
   [[ -n "${document}" ]] || return 1
+  # The whole document or none of it: its first line is a fixed word, so an
+  # engine that rendered only part of what was asked for is caught here rather
+  # than having a hash taken of whatever it did say.
+  [[ "${document%%$'\n'*}" == "forge-image-identity/1" ]] || return 1
   printf '%s\n' "${document}" | sha256sum | cut -d' ' -f1
 }
 identity_here() {
