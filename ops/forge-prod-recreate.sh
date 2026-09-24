@@ -19,15 +19,65 @@
 # (and never reaches the network to resolve dependencies) in the seconds before 'docker rm -f'. The
 # container comes down only after a read that changes nothing.
 #
-# Usage:  bash ops/forge-prod-recreate.sh            # gate, remove the old container, run the new one
-#         DRY_RUN=1 bash ops/forge-prod-recreate.sh  # print the docker command (names only), change nothing
-#         FORGE_CONFIG=/path/forge.yaml bash ...     # read the repository map from another config
+# FORGE_IMAGE is required and has no default (2026-09-24). It used to default to 'forge:latest', which
+# is NOT what forge-prod runs: on 24 September the container was running a tagged build from 19
+# September while 'forge:latest' pointed at an image ten days older, so anyone running this script
+# with nothing set would have quietly downgraded production. The script now refuses and prints both
+# candidates — what is running now, and what the repository's release manifest names — and leaves the
+# choice to the person running it.
+#
+# Usage:  FORGE_IMAGE=forge:<tag> bash ops/forge-prod-recreate.sh   # gate, remove the old container, run the new one
+#         FORGE_IMAGE=forge:<tag> DRY_RUN=1 bash ...                # print the docker command (names only), change nothing
+#         FORGE_CONFIG=/path/forge.yaml bash ...                    # read the repository map from another config
+#         bash ops/forge-prod-recreate.sh                           # with no FORGE_IMAGE: refuse, and say what the choices are
 #
 # To change a setting (for example the LiteLLM base URL or key): sops ~/.config/fleet-secrets/forge/forge-prod.enc.env
 set -euo pipefail
 
+FORGE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENC="${FORGE_PROD_ENV_ENC:-$HOME/.config/fleet-secrets/forge/forge-prod.enc.env}"
-IMAGE="${FORGE_IMAGE:-forge:latest}"
+
+IMAGE="${FORGE_IMAGE:-}"
+if [ -z "$IMAGE" ]; then
+  {
+    echo "FORGE_IMAGE is not set, and this script no longer picks an image for you."
+    echo
+    # What forge-prod is running right now. Read-only: 'docker inspect' only.
+    running_id="$(docker inspect forge-prod --format '{{.Image}}' 2>/dev/null || true)"
+    running_ref="$(docker inspect forge-prod --format '{{.Config.Image}}' 2>/dev/null || true)"
+    if [ -n "$running_id" ]; then
+      running_tags="$(docker image inspect "$running_id" --format '{{join .RepoTags ", "}}' 2>/dev/null || true)"
+      echo "Running now:   forge-prod was started from '${running_ref:-unknown}'"
+      echo "               image id ${running_id}"
+      if [ -n "$running_tags" ]; then
+        echo "               tags on that image: ${running_tags}"
+      else
+        echo "               that image carries no tags"
+      fi
+    else
+      echo "Running now:   there is no forge-prod container here to read (or docker could not be asked)."
+    fi
+    echo
+    # What this repository's release manifest names. Plain text reading, no YAML tool.
+    manifest="$FORGE_ROOT/release/manifest.yaml"
+    if [ -r "$manifest" ]; then
+      m_name="$(sed -n 's/^image_name:[[:space:]]*//p' "$manifest" | head -1 | tr -d '"'"'"' ')"
+      m_version="$(sed -n 's/^version:[[:space:]]*//p' "$manifest" | head -1 | tr -d '"'"'"' ')"
+      if [ -n "$m_name" ] && [ -n "$m_version" ]; then
+        echo "Release named: ${m_name}:${m_version}  (release/manifest.yaml)"
+      else
+        echo "Release named: release/manifest.yaml is there but names no image_name/version."
+      fi
+    else
+      echo "Release named: there is no release/manifest.yaml in $FORGE_ROOT."
+    fi
+    echo
+    echo "These two are often NOT the same image. Decide which one you mean, then run:"
+    echo "  FORGE_IMAGE=<image> bash ops/forge-prod-recreate.sh"
+  } >&2
+  exit 1
+fi
+
 [ -r "$ENC" ] || { echo "settings of record not found: $ENC" >&2; exit 1; }
 
 # The container's settings, by name. PATH / PYTHON_* are the image's own and are NOT passed.
@@ -44,7 +94,6 @@ ENV_FLAGS=""; for n in "${NAMES[@]}"; do ENV_FLAGS+=" -e $n"; done
 
 # The repositories the container can build in, straight from the repository map. One '-v' per
 # distinct checkout path; the map's two key spellings for the same repository collapse to one bind.
-FORGE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FORGE_CONFIG="${FORGE_CONFIG:-$HOME/forge-state/forge.yaml}"
 REPO_PATHS=$(uv run --frozen --no-sync --project "$FORGE_ROOT" forge repo-paths --config "$FORGE_CONFIG") || {
   echo "could not read the repository map from $FORGE_CONFIG ('forge repo-paths' failed) - refusing to recreate forge-prod" >&2
@@ -60,9 +109,14 @@ done <<< "$REPO_PATHS"
   exit 1
 }
 
+# The two state binds. They are fixed in SHAPE and follow the invoking account's home directory
+# rather than one written-out home path (2026-09-24), so this script carries no machine's path.
+FORGE_STATE_DIR="${FORGE_STATE_DIR:-$HOME/forge-state}"
+FORGE_PROD_HOME_STATE="${FORGE_PROD_HOME_STATE:-$HOME/forge-prod-state/.forge}"
+
 RUN="docker run -d --name forge-prod --network host --restart unless-stopped --user forge --workdir /home/forge --entrypoint forge${ENV_FLAGS}${REPO_BINDS} \
- -v /home/richardwoollcott/forge-state:/var/forge:rw \
- -v /home/richardwoollcott/forge-prod-state/.forge:/home/forge/.forge:rw \
+ -v $FORGE_STATE_DIR:/var/forge:rw \
+ -v $FORGE_PROD_HOME_STATE:/home/forge/.forge:rw \
  $IMAGE --config /var/forge/forge.yaml serve"
 
 if [ "${DRY_RUN:-0}" = "1" ]; then echo "$RUN"; exit 0; fi
