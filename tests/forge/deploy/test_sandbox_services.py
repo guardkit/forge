@@ -14,9 +14,10 @@ Six halves are proven here:
   both host units — and, without the new settings, is byte for byte what it
   was (the argv is pinned both ways);
 * the bootstrap that runs inside the sandbox (``deploy/sandbox-runner.sh``)
-  copies the factory's code out of the mounts, makes the venv once, installs
-  once, proves the install, starts both services, starts a died one again,
-  and never opens the ledger;
+  is proven in its own file now that it runs the factory from the release
+  image — see
+  ``tests/forge/deploy/test_sandbox_bootstrap_from_the_release_image.py``
+  and the note where those tests used to be, below;
 * the profile's six new settings load, are checked, and reach the deploy
   script's environment exactly when they are set;
 * ``forge register-repo --deploy-port`` emits them with this repository's own
@@ -39,9 +40,7 @@ import os
 import re
 import shlex
 import shutil
-import signal
 import subprocess
-import time
 from pathlib import Path
 
 import pytest
@@ -107,78 +106,6 @@ FAKE_SYSTEMCTL = """#!/usr/bin/env bash
 printf '%s\\n' "$*" >> "$SYSTEMCTL_LOG"
 exit 0
 """
-
-FAKE_UV = """#!/usr/bin/env bash
-# A stand-in for uv. `uv venv DIR` makes DIR/bin/python out of the fake
-# service program; `uv pip install --python PY ...` makes the two console
-# scripts beside PY. Every call is written down. Nothing is installed.
-# Each call also writes, to its own separate log so the call log stays exactly
-# what it was, whether uv's "never download an interpreter" switch was in the
-# environment it was handed.
-printf '%s\\n' "uv $*" >> "$FAKE_LOG"
-if [ -n "${UV_ENV_LOG:-}" ]; then
-  if [ -n "${UV_PYTHON_DOWNLOADS+x}" ]; then downloads="$UV_PYTHON_DOWNLOADS"; else downloads=unset; fi
-  printf '%s\\n' "uv $1 UV_PYTHON_DOWNLOADS=$downloads" >> "$UV_ENV_LOG"
-fi
-case "$1" in
-  venv)
-    dir="${@: -1}"
-    mkdir -p "$dir/bin"
-    cp "$FAKE_BIN/fake-service" "$dir/bin/python"
-    chmod 755 "$dir/bin/python"
-    ;;
-  pip)
-    if [ "${2:-}" = "install" ] && [ -n "${FAKE_BROKEN_RUNTIME:-}" ]; then
-      rm -f "$FAKE_BROKEN_RUNTIME"
-    fi
-    py=""
-    prev=""
-    for arg in "$@"; do
-      if [ "$prev" = "--python" ]; then py="$arg"; fi
-      prev="$arg"
-    done
-    bindir="$(dirname "$py")"
-    for tool in langgraph guardkit-py; do
-      cp "$FAKE_BIN/fake-service" "$bindir/$tool"
-      chmod 755 "$bindir/$tool"
-    done
-    ;;
-esac
-exit 0
-"""
-
-FAKE_SERVICE = """#!/usr/bin/env bash
-# A stand-in for the venv's python, langgraph and guardkit-py. Writes down its
-# name and arguments, then the names of the settings it can see (never a
-# value), then stays up like a service — unless a marker in FAKE_DIE_ONCE_DIR
-# tells it to exit once, which is how "a service died" is played.
-me="$(basename "$0")"
-if [ "$me" = "python" ] && [ "${1:-}" = "-c" ]; then
-  case "${2:-}" in
-    *"sys.version"*) exec /usr/bin/python3 "$@" ;;
-  esac
-fi
-printf '%s\\n' "$me $*" >> "$FAKE_LOG"
-if [ "$me" = "python" ] && [ "${1:-}" = "-c" ]; then
-  case "${2:-}" in
-    *"serve("*) ;;
-    *)
-      if [ -n "${FAKE_BROKEN_RUNTIME:-}" ] && [ -f "$FAKE_BROKEN_RUNTIME" ]; then exit 1; fi
-      exit 0 ;;
-  esac
-fi
-if [ -n "${FORGE_DB_PATH+x}" ]; then db=set; else db=unset; fi
-printf '%s\\n' "env $me FORGE_DB_PATH=$db FORGE_GUARDKIT_PATH=${FORGE_GUARDKIT_PATH:-unset} FORGE_RECEIPTS_DIR=${FORGE_RECEIPTS_DIR:-unset} GUARDKIT_HARNESS=${GUARDKIT_HARNESS:-unset} SIDECAR_PORT=${FORGE_DEPLOY_SIDECAR_PORT:-unset} BIND=${SANDBOX_RUNNER_BIND:-unset} UV_PYTHON_DOWNLOADS=${UV_PYTHON_DOWNLOADS:-unset} PWD=$PWD" >> "$FAKE_LOG"
-role="$me"
-if [ "$me" = "python" ]; then role=sidecar; fi
-if [ "$me" = "langgraph" ]; then role=runner; fi
-if [ -n "${FAKE_DIE_ONCE_DIR:-}" ] && [ -f "$FAKE_DIE_ONCE_DIR/$role" ]; then
-  rm -f "$FAKE_DIE_ONCE_DIR/$role"
-  exit 1
-fi
-exec sleep 300
-"""
-
 
 def _write_fake(directory: Path, name: str, text: str) -> None:
     path = directory / name
@@ -435,367 +362,32 @@ class TestTheWrapperRefusesInOneSentence:
         assert [line for line in sbx if line.startswith("create ")] == []
         assert systemctl == []
 
-
 # ---------------------------------------------------------------------------
 # The bootstrap inside the sandbox: deploy/sandbox-runner.sh
+#
+# WHAT USED TO BE HERE, AND WHERE IT WENT (24 September 2026, stage 4d). The
+# bootstrap used to copy the factory's own code out of read-only mounts of five
+# checkouts on one machine and build a virtual environment inside the sandbox
+# from them, and about twenty tests in this file proved exactly that: the
+# copies, the venv made once, the installs, the reuse stamps, the interpreter
+# identity, the two services started out of that venv. None of it happens any
+# more, and none of it is coming back: inside the sandbox the factory now runs
+# from the tested release image and from nothing else, because none of those
+# five checkouts exists on a clean machine. Those tests were not weakened or
+# skipped; the behaviour they described was removed on purpose, so they were
+# removed with it.
+#
+# What the bootstrap does now is proven, in the same shell-level way and with
+# the same care, in the sibling file
+# tests/forge/deploy/test_sandbox_bootstrap_from_the_release_image.py: the
+# image check and its refusals, both containers started from that one image,
+# settings crossing by name and never by value, one supervisor only, and a
+# stop that exits 0 only when both containers are really gone.
+#
+# What is still proven HERE is everything around it: the wrapper that creates
+# the sandbox, the profile settings, what register-repo writes, and the host
+# unit that holds the bootstrap open.
 # ---------------------------------------------------------------------------
-
-
-def _git(repo: Path, *args: str) -> str:
-    return subprocess.run(
-        ["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", *args],
-        cwd=repo,
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-
-
-def _commit_all(repo: Path, message: str) -> str:
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-q", "-m", message)
-    return _git(repo, "rev-parse", "HEAD")
-
-
-@pytest.fixture
-def sandbox(tmp_path: Path) -> dict[str, Path]:
-    """What the bootstrap finds inside a sandbox: the mounts as git checkouts,
-    the repository clone with the shipped bootstrap, a fresh home, the fakes."""
-    estate = tmp_path / "estate"
-    for name in FACTORY_CHECKOUTS:
-        checkout = estate / name
-        checkout.mkdir(parents=True)
-        _git(checkout, "init", "-q")
-        (checkout / "pyproject.toml").write_text(
-            f'[project]\nname = "{name}"\nversion = "0.0.1"\n', encoding="utf-8"
-        )
-        if name == "forge":
-            (checkout / "forge.langgraph.json").write_text("{}\n", encoding="utf-8")
-        _commit_all(checkout, "init")
-    repo = estate / "bench-one"
-    (repo / "deploy").mkdir(parents=True)
-    shutil.copy(TEMPLATES / "sandbox-runner.sh", repo / "deploy" / "sandbox-runner.sh")
-    (repo / "deploy" / "sandbox-runner.sh").chmod(0o755)
-    home = tmp_path / "home"
-    home.mkdir()
-    fake_bin = tmp_path / "fake-bin"
-    fake_bin.mkdir()
-    _write_fake(fake_bin, "uv", FAKE_UV)
-    _write_fake(fake_bin, "fake-service", FAKE_SERVICE)
-    receipts = tmp_path / "receipts"
-    receipts.mkdir()
-    return {
-        "estate": estate,
-        "repo": repo,
-        "home": home,
-        "fake_bin": fake_bin,
-        "log": tmp_path / "fake.log",
-        "uv_env_log": tmp_path / "fake-uv-env.log",
-        "receipts": receipts,
-    }
-
-
-def _bootstrap_env(sandbox: dict[str, Path], **extra: str) -> dict[str, str]:
-    env = {
-        **os.environ,
-        "PATH": f"{sandbox['fake_bin']}{os.pathsep}{os.environ['PATH']}",
-        "HOME": str(sandbox["home"]),
-        "FAKE_LOG": str(sandbox["log"]),
-        "FAKE_BIN": str(sandbox["fake_bin"]),
-        "UV_ENV_LOG": str(sandbox["uv_env_log"]),
-        "SANDBOX_RECEIPTS_PATH": str(sandbox["receipts"]),
-        "SANDBOX_RUNNER_RESTART_SECONDS": "0",
-    }
-    for name in (
-        "FORGE_DB_PATH",
-        "FORGE_RECEIPTS_DIR",
-        "FORGE_GUARDKIT_PATH",
-        "GUARDKIT_HARNESS",
-        # Nothing outside the script may supply this one: the whole point of the
-        # test below is that the script itself no longer leaves it lying about.
-        "UV_PYTHON_DOWNLOADS",
-    ):
-        env.pop(name, None)
-    env.update(extra)
-    return env
-
-
-def _bootstrap_only(sandbox: dict[str, Path], **extra: str) -> subprocess.CompletedProcess[str]:
-    sandbox["log"].write_text("", encoding="utf-8")
-    sandbox["uv_env_log"].write_text("", encoding="utf-8")
-    return subprocess.run(
-        [str(sandbox["repo"] / "deploy" / "sandbox-runner.sh")],
-        cwd=sandbox["repo"],
-        env=_bootstrap_env(sandbox, SANDBOX_RUNNER_BOOTSTRAP_ONLY="1", **extra),
-        capture_output=True,
-        text=True,
-    )
-
-
-class TestTheBootstrapMakesTheVenvOnce:
-    def test_the_first_run_copies_makes_the_venv_installs_and_proves_it(self, sandbox):
-        result = _bootstrap_only(sandbox)
-
-        assert result.returncode == 0, result.stdout + result.stderr
-        home, src, venv = sandbox["home"], sandbox["home"] / ".forge-src", sandbox["home"] / ".forge-venv"
-        assert _log_lines(sandbox["log"]) == [
-            f"uv venv --python /usr/bin/python3 {venv}",
-            (f"uv pip install --python {venv}/bin/python {src}/nats-core "
-            f"{src}/fleet-memory {src}/forge[providers,memory,sidecar] "
-            f"{src}/guardkitfactory {src}/guardkit[autobuild] deepagents==0.7.14 deepagents-code==0.1.69"),
-            f"uv pip check --python {venv}/bin/python",
-            ("python -c import importlib.metadata as m; import forge, guardkit, "
-            "guardkit._installer_core, guardkitfactory, deepagents_code, claude_agent_sdk; assert "
-            "m.version('deepagents') == '0.7.14'; assert m.version('deepagents-code') == '0.1.69'"),
-        ]
-        # The copies are the tracked files at each mount's HEAD.
-        for name in FACTORY_CHECKOUTS:
-            assert (src / name / "pyproject.toml").is_file(), name
-            assert (src / f"{name}.commit").read_text().strip() == _git(
-                sandbox["estate"] / name, "rev-parse", "HEAD"
-            )
-        assert (src / "forge" / "forge.langgraph.json").is_file()
-        # The runner shells `guardkit`; the venv's console script is guardkit-py.
-        assert os.readlink(venv / "bin" / "guardkit") == "guardkit-py"
-        assert "bootstrap only" in result.stdout
-        assert home == sandbox["home"]
-
-    def test_the_second_run_copies_nothing_and_installs_nothing(self, sandbox):
-        first = _bootstrap_only(sandbox)
-        assert first.returncode == 0, first.stdout + first.stderr
-
-        second = _bootstrap_only(sandbox)
-
-        assert second.returncode == 0, second.stdout + second.stderr
-        lines = _log_lines(sandbox["log"])
-        assert len(lines) == 2
-        assert lines[0].startswith("uv pip check ")
-        assert "deepagents_code" in lines[1]
-        assert "venv already at" in second.stdout
-        assert "install already matches the copies" in second.stdout
-        assert second.stdout.count("copy already at") == len(FACTORY_CHECKOUTS)
-
-    def test_a_moved_commit_copies_and_installs_again_without_a_new_venv(self, sandbox):
-        first = _bootstrap_only(sandbox)
-        assert first.returncode == 0, first.stdout + first.stderr
-        forge = sandbox["estate"] / "forge"
-        (forge / "README.md").write_text("moved\n", encoding="utf-8")
-        head = _commit_all(forge, "move")
-
-        again = _bootstrap_only(sandbox)
-
-        assert again.returncode == 0, again.stdout + again.stderr
-        lines = _log_lines(sandbox["log"])
-        assert not any(line.startswith("uv venv") for line in lines)
-        assert sum(line.startswith("uv pip install") for line in lines) == 1
-        assert sum(line.startswith("uv pip check") for line in lines) == 1
-        src = sandbox["home"] / ".forge-src"
-        assert (src / "forge.commit").read_text().strip() == head
-        assert (src / "forge" / "README.md").is_file()
-
-    def test_untracked_files_never_come_along(self, sandbox):
-        # The operator's .env beside forge is exactly what must not reach the
-        # sandbox's services: only tracked files are copied.
-        forge = sandbox["estate"] / "forge"
-        (forge / ".env").write_text(
-            "FORGE_NATS_URL=nats://not-a-real-value@example.invalid:4222\n", encoding="utf-8"
-        )
-
-        result = _bootstrap_only(sandbox)
-
-        assert result.returncode == 0, result.stdout + result.stderr
-        assert not (sandbox["home"] / ".forge-src" / "forge" / ".env").exists()
-
-    def test_a_missing_mount_is_refused_in_one_sentence(self, sandbox):
-        shutil.rmtree(sandbox["estate"] / "guardkitfactory")
-
-        result = _bootstrap_only(sandbox)
-
-        assert result.returncode == 2
-        assert "guardkitfactory is not mounted at" in result.stdout
-        assert _log_lines(sandbox["log"]) == []
-
-    def test_a_mount_that_is_not_a_checkout_is_refused(self, sandbox):
-        shutil.rmtree(sandbox["estate"] / "nats-core" / ".git")
-
-        result = _bootstrap_only(sandbox)
-
-        assert result.returncode == 2
-        assert "nats-core is not mounted at" in result.stdout
-
-
-def _wait_for(predicate, *, timeout: float = 20.0) -> None:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if predicate():
-            return
-        time.sleep(0.1)
-    raise AssertionError("the services did not reach the expected state in time")
-
-
-class TestTheBootstrapKeepsBothServicesUp:
-    def test_both_start_a_died_one_starts_again_and_the_ledger_is_never_opened(
-        self, sandbox, tmp_path
-    ):
-        die_once = tmp_path / "die-once"
-        die_once.mkdir()
-        (die_once / "runner").write_text("", encoding="utf-8")
-        sandbox["log"].write_text("", encoding="utf-8")
-        stdout_path = tmp_path / "bootstrap.out"
-        env = _bootstrap_env(
-            sandbox,
-            FAKE_DIE_ONCE_DIR=str(die_once),
-            # The host's ledger path, as the old host unit carried it: it must
-            # not reach either service.
-            FORGE_DB_PATH="/home/someone/forge-prod-state/.forge/forge.db",
-        )
-        venv = sandbox["home"] / ".forge-venv"
-        src = sandbox["home"] / ".forge-src"
-
-        with stdout_path.open("w", encoding="utf-8") as out:
-            proc = subprocess.Popen(
-                [str(sandbox["repo"] / "deploy" / "sandbox-runner.sh")],
-                cwd=sandbox["repo"],
-                env=env,
-                stdout=out,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-            )
-            try:
-
-                def runner_started_twice() -> bool:
-                    lines = _log_lines(sandbox["log"])
-                    return sum(line.startswith("langgraph dev ") for line in lines) >= 2
-
-                _wait_for(runner_started_twice)
-            finally:
-                os.killpg(proc.pid, signal.SIGTERM)
-                returncode = proc.wait(timeout=15)
-
-        assert returncode == 0
-        lines = _log_lines(sandbox["log"])
-        runner_starts = [line for line in lines if line.startswith("langgraph dev ")]
-        assert runner_starts == [
-            "langgraph dev --config forge.langgraph.json --host 0.0.0.0 --port 8124 "
-            "--no-browser --no-reload --allow-blocking"
-        ] * 2
-        sidecar_starts = [line for line in lines if line.startswith("python -c ") and "serve(" in line]
-        assert sidecar_starts == [
-            "python -c import os; from forge.deploy_sidecar.service import serve; "
-            'serve(host=os.environ["SANDBOX_RUNNER_BIND"], '
-            'port=int(os.environ["FORGE_DEPLOY_SIDECAR_PORT"]))'
-        ]
-        # What the services could see: the venv's guardkit, the receipts root,
-        # the mission harness, the ports — and no ledger path at all.
-        runner_env = [line for line in lines if line.startswith("env langgraph ")][0]
-        assert "FORGE_DB_PATH=unset" in runner_env
-        assert f"FORGE_GUARDKIT_PATH={venv}/bin/guardkit" in runner_env
-        assert f"FORGE_RECEIPTS_DIR={sandbox['receipts']}" in runner_env
-        assert "GUARDKIT_HARNESS=langgraph" in runner_env
-        assert f"PWD={src}/forge" in runner_env
-        sidecar_env = [line for line in lines if line.startswith("env python ")][0]
-        assert "FORGE_DB_PATH=unset" in sidecar_env
-        assert "SIDECAR_PORT=8125 BIND=0.0.0.0" in sidecar_env
-        stdout = stdout_path.read_text(encoding="utf-8")
-        assert "the build runner exited 1; starting it again in 0s" in stdout
-        assert "FORGE_DB_PATH was set in this environment; unsetting it" in stdout
-        assert "asked to stop; stopping both services" in stdout
-        # Names only, never a value.
-        assert "forge-prod-state" not in stdout
-
-    def test_explicit_guardkit_launcher_reaches_both_services(self, sandbox, tmp_path):
-        launcher = tmp_path / "reviewed-guardkit-launcher"
-        launcher.write_text("#!/bin/sh\n", encoding="utf-8")
-        launcher.chmod(0o755)
-        sandbox["log"].write_text("", encoding="utf-8")
-        stdout_path = tmp_path / "bootstrap-explicit-guardkit.out"
-
-        with stdout_path.open("w", encoding="utf-8") as out:
-            proc = subprocess.Popen(
-                [str(sandbox["repo"] / "deploy" / "sandbox-runner.sh")],
-                cwd=sandbox["repo"],
-                env=_bootstrap_env(sandbox, FORGE_GUARDKIT_PATH=str(launcher)),
-                stdout=out,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-            )
-            try:
-
-                def both_reported() -> bool:
-                    lines = _log_lines(sandbox["log"])
-                    return any(line.startswith("env langgraph ") for line in lines) and any(
-                        line.startswith("env python ") for line in lines
-                    )
-
-                _wait_for(both_reported)
-            finally:
-                os.killpg(proc.pid, signal.SIGTERM)
-                proc.wait(timeout=15)
-
-        service_env = [
-            line
-            for line in _log_lines(sandbox["log"])
-            if line.startswith(("env langgraph ", "env python "))
-        ]
-        assert len(service_env) == 2
-        assert all(f"FORGE_GUARDKIT_PATH={launcher}" in line for line in service_env)
-
-
-class TestUvsDownloadSwitchStaysWithTheVenvCommand:
-    """The switch that forbids uv to fetch an interpreter belongs to the one
-    command that makes the factory's own venv, and to nothing else.
-
-    Why it matters (seen in api_test's sandbox on 2026-09-08): the bootstrap
-    used to export that switch, so the two services it starts inherited it, and
-    so did guardkit's work leg beneath them. The work leg pins a repository's
-    own build venv to the floor of that repository's ``requires-python`` — 3.11
-    for api_test — which the sandbox's Python (3.14) is newer than; uv was
-    forbidden to fetch a 3.11, and every work leg failed for want of an
-    interpreter. The attended cure was a setting in the sandbox; the cure here
-    is that the bootstrap keeps the switch to itself.
-    """
-
-    def test_the_venv_command_carries_it_and_the_installs_run_without_it(self, sandbox):
-        result = _bootstrap_only(sandbox)
-
-        assert result.returncode == 0, result.stdout + result.stderr
-        assert _log_lines(sandbox["uv_env_log"]) == [
-            "uv venv UV_PYTHON_DOWNLOADS=never",
-            "uv pip UV_PYTHON_DOWNLOADS=unset",
-            "uv pip UV_PYTHON_DOWNLOADS=unset",
-        ]
-
-    def test_neither_started_service_carries_it(self, sandbox, tmp_path):
-        sandbox["log"].write_text("", encoding="utf-8")
-        stdout_path = tmp_path / "services.out"
-
-        with stdout_path.open("w", encoding="utf-8") as out:
-            proc = subprocess.Popen(
-                [str(sandbox["repo"] / "deploy" / "sandbox-runner.sh")],
-                cwd=sandbox["repo"],
-                env=_bootstrap_env(sandbox),
-                stdout=out,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-            )
-            try:
-
-                def both_reported() -> bool:
-                    lines = _log_lines(sandbox["log"])
-                    return any(line.startswith("env langgraph ") for line in lines) and any(
-                        line.startswith("env python ") for line in lines
-                    )
-
-                _wait_for(both_reported)
-            finally:
-                os.killpg(proc.pid, signal.SIGTERM)
-                proc.wait(timeout=15)
-
-        lines = _log_lines(sandbox["log"])
-        runner_env = [line for line in lines if line.startswith("env langgraph ")][0]
-        sidecar_env = [line for line in lines if line.startswith("env python ")][0]
-        assert "UV_PYTHON_DOWNLOADS=unset" in runner_env
-        assert "UV_PYTHON_DOWNLOADS=unset" in sidecar_env
 
 
 # ---------------------------------------------------------------------------
@@ -1415,131 +1007,3 @@ class TestTheLedgerInventory:
         assert "writes it nowhere" in section
         assert "forge-prod is its only writer" in section
         assert "deploy/sandbox-runner.sh` unsets\n`FORGE_DB_PATH`" in section
-
-
-class TestConsolidationRuntimeReuse:
-    def test_missing_dcode_rejects_reuse_and_reinstalls(self, sandbox, tmp_path):
-        assert _bootstrap_only(sandbox).returncode == 0
-        missing = tmp_path / "missing-dcode"
-        missing.touch()
-        result = _bootstrap_only(sandbox, FAKE_BROKEN_RUNTIME=str(missing))
-        assert result.returncode == 0, result.stdout + result.stderr
-        lines = _log_lines(sandbox["log"])
-        assert sum(line.startswith("uv pip install ") for line in lines) == 1
-        assert not missing.exists()
-        assert "deepagents-code==0.1.69" in "\n".join(lines)
-
-    def test_changed_dependency_metadata_invalidates_reuse(self, sandbox):
-        assert _bootstrap_only(sandbox).returncode == 0
-        metadata = sandbox["home"] / ".forge-src/guardkitfactory/pyproject.toml"
-        metadata.write_text(metadata.read_text() + '\ndependencies = ["changed"]\n')
-        result = _bootstrap_only(sandbox)
-        assert result.returncode == 0, result.stdout + result.stderr
-        assert any(line.startswith("uv pip install ") for line in _log_lines(sandbox["log"]))
-
-    def test_changed_interpreter_retains_old_environment_and_rebuilds(self, sandbox):
-        assert _bootstrap_only(sandbox).returncode == 0
-        python = sandbox["home"] / ".forge-venv/bin/python"
-        python.write_text('#!/bin/sh\nprintf "old-interpreter\\n"\n')
-        python.chmod(0o755)
-        result = _bootstrap_only(sandbox)
-        assert result.returncode == 0, result.stdout + result.stderr
-        assert any(line.startswith("uv venv ") for line in _log_lines(sandbox["log"]))
-        assert len(list(sandbox["home"].glob(".forge-venv.previous.*"))) == 1
-
-
-class TestConsolidationLifecycle:
-    def test_stop_never_installs_even_without_mounts(self, sandbox):
-        shutil.rmtree(sandbox["estate"] / "guardkitfactory")
-        result = subprocess.run(
-            [str(sandbox["repo"] / "deploy/sandbox-runner.sh"), "stop"],
-            env=_bootstrap_env(sandbox), capture_output=True, text=True, timeout=10,
-        )
-        assert result.returncode == 0, result.stdout + result.stderr
-        assert _log_lines(sandbox["log"]) == []
-        assert not (sandbox["home"] / ".forge-venv").exists()
-
-    def test_repeated_start_has_one_supervisor_and_stop_ends_descendants(self, sandbox, tmp_path):
-        script = str(sandbox["repo"] / "deploy/sandbox-runner.sh")
-        children = tmp_path / "children"
-        fake = sandbox["fake_bin"] / "fake-service"
-        fake.write_text(fake.read_text().replace(
-            "exec sleep 300", 'sleep 300 &\nprintf "%s\\n" "$!" >> "$FAKE_CHILDREN"\nwait'
-        ))
-        env = _bootstrap_env(sandbox, FAKE_CHILDREN=str(children))
-        with (tmp_path / "runner.log").open("w") as log:
-            proc = subprocess.Popen([script], env=env, stdout=log, stderr=log, start_new_session=True)
-            try:
-                _wait_for(lambda: children.exists() and len(children.read_text().splitlines()) == 2)
-                before = _log_lines(sandbox["log"])
-                again = subprocess.run([script], env=env, capture_output=True, text=True, timeout=10)
-                assert again.returncode == 0
-                assert "already running" in again.stdout
-                assert _log_lines(sandbox["log"]) == before
-                child_pids = [int(pid) for pid in children.read_text().splitlines()]
-                stopped = subprocess.run([script, "stop"], env=env, capture_output=True, text=True, timeout=15)
-                assert stopped.returncode == 0, stopped.stdout + stopped.stderr
-                assert proc.wait(timeout=10) == 0
-                for pid in child_pids:
-                    stat = Path(f"/proc/{pid}/stat")
-                    assert not stat.exists() or stat.read_text().split(") ", 1)[1].startswith("Z ")
-                assert _log_lines(sandbox["log"]) == before
-            finally:
-                if proc.poll() is None:
-                    os.killpg(proc.pid, signal.SIGTERM)
-                    proc.wait(timeout=15)
-
-    def test_wrong_process_record_never_signals_unrelated_process(self, sandbox):
-        import hashlib
-        script = str(sandbox["repo"] / "deploy/sandbox-runner.sh")
-        state = sandbox["home"] / ".forge-runner" / hashlib.sha256(str(sandbox["repo"]).encode()).hexdigest()
-        state.mkdir(parents=True)
-        other = subprocess.Popen(["sleep", "60"])
-        try:
-            token = Path(f"/proc/{other.pid}/stat").read_text().rsplit(") ", 1)[1].split()[19]
-            (state / "supervisor").write_text(f"{other.pid} {token}\n")
-            result = subprocess.run([script, "stop"], env=_bootstrap_env(sandbox), capture_output=True, text=True, timeout=10)
-            assert result.returncode == 0
-            assert "stale" in result.stdout
-            assert other.poll() is None
-        finally:
-            other.terminate()
-            other.wait(timeout=10)
-
-
-def alive(pid):
-    stat = Path(f"/proc/{pid}/stat")
-    return stat.exists() and not stat.read_text().rsplit(") ", 1)[1].startswith("Z ")
-
-
-@pytest.mark.parametrize("ignore_term", [False, True])
-def test_stop_during_install_ends_installer_descendants(sandbox, tmp_path, ignore_term):
-    child_file = tmp_path / "installer-child"
-    uv = sandbox["fake_bin"] / "uv"
-    uv.write_text('#!/usr/bin/python3\nimport os, subprocess, time\nfrom pathlib import Path\np = subprocess.Popen(["/usr/bin/python3", "-c", "import signal,time; " + ("signal.signal(signal.SIGTERM, signal.SIG_IGN); " if os.environ.get("IGNORE_TERM") == "1" else "") + "time.sleep(300)"])\nPath(os.environ["CHILD_FILE"]).write_text(str(p.pid))\ntime.sleep(300)\n')
-    uv.chmod(0o755)
-    script = str(sandbox["repo"] / "deploy/sandbox-runner.sh")
-    env = _bootstrap_env(sandbox, CHILD_FILE=str(child_file), IGNORE_TERM="1" if ignore_term else "0")
-    child = None
-    with (tmp_path / "supervisor.log").open("w") as log:
-        proc = subprocess.Popen([script], env=env, stdout=log, stderr=log, start_new_session=True)
-        try:
-            _wait_for(lambda: child_file.exists())
-            child = int(child_file.read_text())
-            result = subprocess.run([script, "stop"], env=env, capture_output=True, text=True, timeout=15)
-            print("stop exit", result.returncode, "stdout", result.stdout, "stderr", result.stderr)
-            proc.wait(timeout=3)
-            time.sleep(0.2)
-            assert result.returncode == 0
-            assert not alive(child), f"stop reported success but installer child {child} remains alive"
-        finally:
-            # Own dedicated session and recorded child only; no live process matching.
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            proc.wait(timeout=3)
-            if child and alive(child):
-                os.kill(child, signal.SIGKILL)
-            if child:
-                _wait_for(lambda: not alive(child))

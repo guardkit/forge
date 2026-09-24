@@ -208,10 +208,37 @@ met until it runs for real.
   `sandbox` profile here so that a machine without one starts nothing. (Compose
   fills in every setting name **before** it looks at profiles, so
   `SANDBOX_NAME` still needs a value even where the service never starts.)
-- **The project bootstrap refresh.** The bootstrap inside a project's sandbox
-  still copies the factory's code out of read-only mounts of checkouts on the
-  machine. In this design it pulls the release image at its pinned digest
-  instead. That is api_test's own file and a gate of its own.
+- **The project bootstrap refresh.** Forge's own bootstrap template now runs
+  the factory inside a sandbox from the release image and from nothing else
+  (`../../src/forge/cli/deploy_templates/sandbox-runner.sh`, 24 September 2026),
+  and `hand-release-image-to-sandbox.sh` beside this file carries the image in
+  and checks what arrived. What is still outstanding is the **rollout step**:
+  each project's own copy of that bootstrap has to be replaced with the new
+  template, and its `deploy/profile.yaml` has to publish the two service ports
+  on the factory gateway address and allow the answer service's address. That
+  is the project's own file and a gate of its own.
+
+## Carrying the release image into a sandbox
+
+    ./hand-release-image-to-sandbox.sh <sandbox name> <release version>
+
+A sandbox is a small machine of its own with its own Docker engine, and the
+factory's two services for a project run in there as containers from the tested
+release image. This saves the image on this machine, loads it inside through
+the sandbox client, reads it back from in there and **refuses** unless what
+arrived is made of the same layers and carries the same release labels. It
+prints the four settings the sandbox's bootstrap then needs.
+
+When the estate has a registry (open question 1 of the design pass), this
+script is replaced by a `docker pull` at the pinned digest inside the sandbox.
+The check does not change: it is the same comparison, on the same fingerprint,
+and the bootstrap inside the sandbox makes it again before it runs anything.
+
+**Why a fingerprint of the layers and not "the image id".** The two engines do
+not agree on what an image's id is — this machine's reports the image's config,
+a sandbox's reports its manifest — so the same bytes carried across come back
+under a different name. What both report identically is the list of layers the
+filesystem is made of, so that list, hashed, is what is compared.
 
 ## The rollout preconditions this bundle does not meet
 
