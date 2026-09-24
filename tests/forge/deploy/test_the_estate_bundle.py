@@ -67,34 +67,35 @@ _ONLY_THESE_ARE_INHERITED = (
     "XDG_RUNTIME_DIR",
 )
 
-#: The bus's eight account passwords never appear in a file in the bundle: they
-#: are passed into the command from a child process, which is the bus
-#: repository's own arrangement. The render therefore supplies obvious
-#: placeholders, exactly as a real run supplies real ones — and the point of
-#: the arrangement is that these are the only place a value can come from.
-_THE_PASSWORDS_COME_FROM_THE_CALLER = {
-    name: "placeholder-not-a-real-password"
-    for name in (
-        "ADMIN_NATS_PASSWORD",
-        "RICH_NATS_PASSWORD",
-        "JAMES_NATS_PASSWORD",
-        "MARK_NATS_PASSWORD",
-        "FORGE_NATS_PASSWORD",
-        "FLEET_MEMORY_NATS_PASSWORD",
-        "GUARDKIT_NATS_PASSWORD",
-        "JARVIS_NATS_PASSWORD",
-    )
-}
+#: The bus's eight account passwords. They never appear in a file in the
+#: bundle: they are passed into the command from a child process, which is the
+#: bus repository's own arrangement. **Nothing below sets one**, and that is
+#: the point — the estate hands each to the bus as a secret read from the
+#: environment, so the bundle RENDERS without them and only STARTING needs
+#: them. Until 24 September 2026 they were interpolated with ``:?`` and every
+#: command that had to render the file refused in a clean shell, which made
+#: ``estate-check services`` and ``factory-hello`` unusable as the README
+#: documents them.
+_THE_BUSS_ACCOUNT_PASSWORDS = (
+    "ADMIN_NATS_PASSWORD",
+    "RICH_NATS_PASSWORD",
+    "JAMES_NATS_PASSWORD",
+    "MARK_NATS_PASSWORD",
+    "FORGE_NATS_PASSWORD",
+    "FLEET_MEMORY_NATS_PASSWORD",
+    "GUARDKIT_NATS_PASSWORD",
+    "JARVIS_NATS_PASSWORD",
+)
 
 
 def _rendered(*extra: str) -> str:
-    """``docker compose config`` of the estate, with the example env."""
+    """``docker compose config`` of the estate, with the example env and with
+    NO password of any kind in the environment."""
     bare = {
         name: os.environ[name]
         for name in _ONLY_THESE_ARE_INHERITED
         if name in os.environ
     }
-    bare.update(_THE_PASSWORDS_COME_FROM_THE_CALLER)
     done = subprocess.run(
         [
             "docker",
@@ -121,6 +122,19 @@ def _rendered(*extra: str) -> str:
     return done.stdout
 
 
+def _service_block(rendered: str, service: str) -> str:
+    """One service's lines out of the rendered document. A service's own lines
+    are indented four spaces; anything less ends it."""
+    after = rendered.split(f"\n  {service}:", 1)
+    assert len(after) == 2, f"{service} is not in the rendered estate"
+    kept: list[str] = []
+    for line in after[1].splitlines():
+        if line.strip() and not line.startswith("    "):
+            break
+        kept.append(line)
+    return "\n".join(kept)
+
+
 @pytest.fixture(scope="module")
 def rendered() -> str:
     if shutil.which("docker") is None:
@@ -139,6 +153,71 @@ class TestTheEstateRenders:
     def test_it_renders_at_all_from_the_example_env(self, rendered: str) -> None:
         """Every name the estate needs has a line in ``.env.example``."""
         assert "services:" in rendered
+
+    def test_it_renders_with_no_password_in_the_environment(
+        self, rendered: str
+    ) -> None:
+        """READING THE ESTATE NEEDS NO SECRET. The render above was made with
+        nothing but PATH and Docker's own names in the environment, so the fact
+        that it produced a document at all is the test: every command that
+        reads a running estate — ``ps``, ``estate-check services``,
+        ``factory-hello`` — has to render this bundle first, and on 24
+        September 2026 all of them refused in a clean shell and reported
+        healthy services as missing. Starting the estate still needs the
+        values, and ``estate-check host`` checks that they are there."""
+        for name in _THE_BUSS_ACCOUNT_PASSWORDS:
+            assert name not in os.environ or not os.environ[name], (
+                f"{name} is set in this test's own environment, so this test "
+                "cannot show that the bundle renders without it"
+            )
+        assert "nats:" in rendered
+
+    def test_no_password_reaches_a_container_environment(
+        self, rendered: str
+    ) -> None:
+        """The bus's eight passwords reach it as FILES. The bus repository's
+        own compose file puts them in ``environment:``, where ``docker
+        inspect`` shows them to anybody who can reach the Docker daemon; the
+        estate hands each one in as a secret instead and a wrapper puts them
+        into the environment of the bus's own entrypoint process."""
+        bus = _service_block(rendered, "nats")
+        for name in _THE_BUSS_ACCOUNT_PASSWORDS:
+            assert f"{name}:" not in bus, (
+                f"the bus names {name} in its container environment, where "
+                "'docker inspect' would show its value"
+            )
+        assert "/run/secrets" in rendered or "secrets:" in rendered
+
+    def test_the_bus_still_reads_its_own_config(self, rendered: str) -> None:
+        """NAMING AN ENTRYPOINT EMPTIES THE IMAGE'S OWN COMMAND. Compose drops
+        it, and a nats-server started with no command reads no config at all:
+        it listens on 4222, serves no monitoring route, holds no JetStream, and
+        writes a contented log while the estate's health probe fails and every
+        service that waits for the bus never starts. Met on 24 September 2026
+        the first time the bus was given a wrapper."""
+        bus = _service_block(rendered, "nats")
+        assert "entrypoint:" in bus
+        assert "/etc/nats/nats-server.conf" in bus.split("healthcheck:", 1)[0], (
+            "the bus names an entrypoint and no command, so it will start with "
+            "no configuration at all"
+        )
+
+    def test_the_provisioning_address_carries_no_credential(
+        self, rendered: str
+    ) -> None:
+        """THE BLOCKER OF 24 SEPTEMBER 2026. The bus repository's two
+        provisioning scripts print the address they are given, twice each, so
+        an address of the ``nats://user:password@host`` form put the password
+        into the one-shot's container log at every start, on every machine.
+        The address it is given now carries no credential at all."""
+        one_shot = _service_block(rendered, "nats-provision")
+        for line in one_shot.splitlines():
+            if "nats://" in line:
+                address = line.split("nats://", 1)[1]
+                assert "@" not in address.split()[0], (
+                    "the one-shot that provisions the bus is given an address "
+                    f"with a credential in it, and it prints that address: {line.strip()}"
+                )
 
     def test_it_has_forges_services_and_the_bus(self, rendered: str) -> None:
         """Composed in, not copied: Forge's three services are here because the
@@ -361,22 +440,78 @@ THE_DESIGNS_ITEMS = {
 }
 
 
+def _the_checks_items() -> dict[str, tuple[str, str]]:
+    """``estate-check --items``: number -> (name, the check's own sentence)."""
+    done = subprocess.run(
+        [str(ESTATE / "estate-check"), "--items"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert done.returncode == 0, done.stderr
+    found: dict[str, tuple[str, str]] = {}
+    for line in done.stdout.splitlines():
+        parts = line.split(None, 3)
+        if len(parts) >= 4:
+            found[parts[1]] = (parts[2], parts[3])
+    return found
+
+
 class TestTheCheckStillHasEveryItemTheDesignAsksFor:
     @pytest.fixture(scope="class")
     def items(self) -> dict[str, str]:
-        done = subprocess.run(
-            [str(ESTATE / "estate-check"), "--items"],
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-        assert done.returncode == 0, done.stderr
         found: dict[str, str] = {}
-        for line in done.stdout.splitlines():
-            parts = line.split(None, 3)
-            if len(parts) >= 3:
-                found[parts[1]] = parts[2]
+        for number, (name, _sentence) in _the_checks_items().items():
+            found[number] = name
         return found
+
+    def test_where_the_check_is_weaker_than_the_design_the_readme_says_so(
+        self,
+    ) -> None:
+        """ITEM 4 IS DELIBERATELY WEAKER THAN THE DESIGN. Section 3's item 4
+        and the rollout table both say the bundle supplies the tested image by
+        DIGEST; this bundle names TAGS, which the work order relaxed on
+        purpose. Holding the item's name alone let that difference sit quietly
+        between a stored design sentence saying 'digests' and a check saying
+        'tags' — nothing compared them. So: the check must SAY tags, and the
+        README must carry it as a rollout precondition. Remove either and this
+        fails."""
+        design_says = THE_DESIGNS_ITEMS["4"][1]
+        assert "digests" in design_says
+
+        check_says = _the_checks_items()["4"][1]
+        assert "TAGS" in check_says or "tags" in check_says, (
+            "estate-check item 4 no longer says it checks tags. If it now "
+            "checks digests, change THE_DESIGNS_ITEMS and the README instead "
+            "of leaving the two disagreeing silently."
+        )
+
+        readme = (ESTATE / "README.md").read_text()
+        preconditions = readme.split("The rollout preconditions this bundle does not meet", 1)
+        assert len(preconditions) == 2, "the README has no rollout preconditions section"
+        assert "digest" in preconditions[1].split("## ", 1)[0], (
+            "estate-check item 4 checks tags where the design asks for "
+            "digests, and the README's rollout preconditions no longer record "
+            "that. An unmet design requirement that nothing writes down is one "
+            "nobody meets."
+        )
+
+    def test_the_readme_records_what_the_services_check_does_not_prove(
+        self,
+    ) -> None:
+        """Section 7 asks the services check to prove EVERY forbidden
+        direction, including from the LAN, and to repeat after a restart. It
+        proves one. The README's preconditions must say that about the CHECK
+        and not only about the firewall rule."""
+        readme = (ESTATE / "README.md").read_text()
+        preconditions = readme.split(
+            "The rollout preconditions this bundle does not meet", 1
+        )[1].split("## ", 1)[0]
+        for word in ("local network", "restart", "check"):
+            assert word in preconditions, (
+                "the README's rollout preconditions no longer record that "
+                f"estate-check proves one forbidden direction only ({word})"
+            )
 
     def test_every_numbered_item_of_the_design_is_there_by_name(
         self, items: dict[str, str]

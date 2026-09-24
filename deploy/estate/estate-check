@@ -54,7 +54,7 @@ ITEMS=(
 "host|1|machine-qualifies-for-a-sandbox|a supported operating system and processor architecture, and hardware virtualisation available to this user"
 "host|2|docker-is-here-and-answering|Docker is installed and its daemon answers, docker compose is present, and a Docker sign-in is reported present or absent"
 "host|3|sandbox-tool-and-its-daemon|the sbx tool is installed, its version matches the one the release was proven against, and its daemon answers on its socket"
-"host|4|release-images-present-or-fetchable|the release images are present, or can be fetched, at the tags the env file names"
+"host|4|release-images-present-or-fetchable|the release images are present, or can be fetched, at the TAGS the env file names - the design asks for digests, which this bundle does not do yet (README.md, the rollout preconditions)"
 "host|5|volumes-and-disk-room|the declared volumes exist or can be created, and the disk has room"
 "host|6|secret-files-present-and-private|every secret file the env file names exists and is readable by its own service's user and by nobody else"
 "host|7|every-setting-name-has-a-value|every setting name the composed files require has a value"
@@ -154,10 +154,10 @@ unchecked() { UNCHECKED=$((UNCHECKED+1)); printf '  not checked   %-4s not check
 finish() {
     printf '\n'
     if [ "${FAILURES}" -eq 0 ] && [ "${UNCHECKED}" -eq 0 ]; then
-        printf 'PASSED — %s items, all of them.\n' "${PASSES}"
+        printf 'PASSED — %s items, all of them, and every one of them asked something.\n' "${PASSES}"
         exit 0
     fi
-    printf 'NOT PASSED — %s passed, %s failed, %s could not be checked on this machine.\n' \
+    printf 'NOT PASSED — %s items asked something and passed, %s failed, %s could not be checked on this machine.\n' \
         "${PASSES}" "${FAILURES}" "${UNCHECKED}"
     printf 'An item that could not be checked is not a pass: the gate is met when every item runs for real.\n'
     exit 1
@@ -248,26 +248,39 @@ check_host() {
         if [ -n "${missing}" ]; then
             fail 4 "these are not on this machine and cannot be fetched:${missing}. Build the release with scripts/build-release-image.sh and the estate's own two with ./build-estate-images.sh, or point the env file at tags that exist."
         elif [ -n "${fetchable}" ]; then
-            ok 4 "every image the env file names is here or can be fetched; these would be fetched on first start:${fetchable}."
+            ok 4 "every image the env file names is here or can be fetched; these would be fetched on first start:${fetchable}. Checked by TAG: the design asks for digests and this bundle does not name them yet, which README.md records as a rollout precondition."
         else
-            ok 4 "all four images the env file names are on this machine, and so is the volume holding the bus's own config."
+            ok 4 "all four images the env file names are on this machine, and so is the volume holding the bus's own config. Checked by TAG: the design asks for digests and this bundle does not name them yet, which README.md records as a rollout precondition."
         fi
     else
         unchecked 4 "docker does not answer, so the images could not be looked for."
     fi
 
     # --- 5 -----------------------------------------------------------------
+    #
+    # THE VOLUMES ARE COUNTED OUT OF THE RENDERED BUNDLE, so a render that did
+    # not happen must not be counted as no volumes. Before 24 September's
+    # review this item printed "0 volumes are declared" and called itself ok
+    # whenever the render had failed — a true-sounding sentence about nothing.
     if [ "${docker_ok}" = "yes" ]; then
-        local root free_gb want_gb existing=0 declared=0
+        local root free_gb want_gb existing=0 declared=0 names why
         want_gb="$(get ESTATE_DISK_FREE_GB)"; want_gb="${want_gb:-0}"
         root="$(docker system info --format '{{.DockerRootDir}}' 2>/dev/null)"
-        for v in $(compose_volume_names); do
+        # Rendered HERE, in this shell, so that why-it-failed survives.
+        compose_says config
+        why="${COMPOSE_RENDER_PROBLEM}"
+        names="$(volume_names_of "${COMPOSE_SAID}")"
+        for v in ${names}; do
             declared=$((declared+1))
             docker volume inspect "${v}" >/dev/null 2>&1 && existing=$((existing+1))
         done
         free_gb="$(df -BG --output=avail "${root}" 2>/dev/null | tail -1 | tr -dc '0-9')"
-        if [ -z "${free_gb}" ]; then
-            unchecked 5 "the free space where Docker keeps its storage could not be read."
+        if [ -n "${why}" ]; then
+            fail 5 "the volumes could not be counted, because this bundle would not render here: ${why}. Nothing was checked; the free space is a separate question and there is ${free_gb:-an unreadable amount}GB of it."
+        elif [ "${declared}" -eq 0 ]; then
+            fail 5 "the bundle rendered but declares no volumes at all, and this estate has at least the record, the settings, the evidence, the coordinator's own state, the publisher's and the bus's store. Something is wrong with the files this check read, not with this machine."
+        elif [ -z "${free_gb}" ]; then
+            unchecked 5 "the free space where Docker keeps its storage could not be read (${declared} volumes are declared, ${existing} of them already exist)."
         elif [ "${free_gb}" -lt "${want_gb}" ]; then
             fail 5 "${declared} volumes are declared (${existing} already exist, the rest are created at first start), but where Docker keeps its storage there is ${free_gb}GB free and this release asks for ${want_gb}GB."
         else
@@ -278,25 +291,47 @@ check_host() {
     fi
 
     # --- 6 -----------------------------------------------------------------
-    local files owner bad="" absent="" mode uid
+    #
+    # EACH FILE AGAINST ITS OWN SERVICE'S USER, which is what the design asks
+    # for and what the env file now says: entries are 'path:uid'. The bus's
+    # accounts file is never mounted into a container — the operator decrypts
+    # it here — while the publisher's credential is mounted into the publisher
+    # and must belong to the user that image runs as. On a single-user machine
+    # those are the same number today, which is exactly why one number for all
+    # of them looked fine until the estate met a machine where they differ.
+    local files fallback bad="" absent="" guessed="" mode uid want entry path checked=0
     files="$(get ESTATE_SECRET_FILES)"
-    owner="$(get ESTATE_SECRET_OWNER_UID)"
+    fallback="$(get ESTATE_OPERATOR_UID)"
+    [ -n "${fallback}" ] || fallback="$(get ESTATE_SECRET_OWNER_UID)"
     if [ -z "${files}" ]; then
         fail 6 "the env file names no secret files at all (ESTATE_SECRET_FILES is empty), and the estate needs at least the bus's accounts and the publisher's credential."
     else
-        for f in ${files}; do
-            if [ ! -e "${f}" ]; then absent="${absent} ${f}"; continue; fi
-            mode="$(stat -c '%a' "${f}" 2>/dev/null || stat -f '%Lp' "${f}" 2>/dev/null)"
-            uid="$(stat -c '%u' "${f}" 2>/dev/null || stat -f '%u' "${f}" 2>/dev/null)"
-            [ "${uid}" = "${owner}" ] || bad="${bad} ${f}(owned by uid ${uid}, not ${owner})"
+        for entry in ${files}; do
+            path="${entry%:*}"
+            want="${entry##*:}"
+            # 'path' alone, or 'path:' with nothing after it (which is what a
+            # user id name with no value leaves behind), is checked against the
+            # operator's and says so.
+            if [ "${want}" = "${entry}" ] || [ -z "${want}" ]; then
+                path="${entry%:}"
+                want="${fallback}"
+                guessed="${guessed} ${path}"
+            fi
+            checked=$((checked+1))
+            if [ ! -e "${path}" ]; then absent="${absent} ${path}"; continue; fi
+            mode="$(stat -c '%a' "${path}" 2>/dev/null || stat -f '%Lp' "${path}" 2>/dev/null)"
+            uid="$(stat -c '%u' "${path}" 2>/dev/null || stat -f '%u' "${path}" 2>/dev/null)"
+            [ "${uid}" = "${want}" ] || bad="${bad} ${path}(owned by uid ${uid}, and the service that reads it runs as ${want})"
             case "${mode}" in
-                *[1-7][0-7]|*[0-7][1-7]) bad="${bad} ${f}(mode ${mode}: others can read it)" ;;
+                *[1-7][0-7]|*[0-7][1-7]) bad="${bad} ${path}(mode ${mode}: others can read it)" ;;
             esac
         done
         if [ -n "${absent}" ] || [ -n "${bad}" ]; then
             fail 6 "secret files:${absent:+ missing:${absent}}${bad:+ wrong:${bad}}. Nothing here opened a file or printed anything out of one."
         else
-            ok 6 "every secret file the env file names is present and readable only by uid ${owner}. Nothing here opened one or printed anything out of one."
+            local note=""
+            [ -z "${guessed}" ] || note=" — and these were checked against the operator user id ${fallback}, because the env file named no user id for them:${guessed}"
+            ok 6 "all ${checked} secret files the env file names are present, and each is readable only by the user id the env file gives for it${note}. Nothing here opened one or printed anything out of one."
         fi
     fi
 
@@ -318,9 +353,14 @@ check_host() {
 
 # Every ${NAME:?...} in the files the estate composes: the names that have no
 # default and that compose refuses to render without. Also every ${NAME} the
-# env file's own values are built out of, which is where the bus's account
-# passwords come in.
+# env file's own values are built out of, and every name a SECRET is read from
+# — which is where the bus's eight account passwords come in. A secret names an
+# environment variable rather than interpolating one, so it is deliberately
+# invisible to the first rule: compose renders the bundle without it and
+# refuses to START without it, which is why this check is the place the
+# operator finds out before starting.
 required_setting_names() {
+    local indirect=""
     local files=(
         "${HERE}/compose.yaml"
         "${HERE}/../compose/compose.yaml"
@@ -336,20 +376,74 @@ required_setting_names() {
             /bin/grep -hv '^[[:space:]]*#' "${present[@]}" 2>/dev/null \
                 | /bin/grep -o '\${[A-Za-z_][A-Za-z0-9_]*:?' \
                 | sed 's/^\${//; s/:?$//'
+            # A secret's source: 'environment: NAME' on a line of its own. A
+            # service's own environment block is never written that way.
+            /bin/grep -hE '^[[:space:]]+environment:[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*$' "${present[@]}" 2>/dev/null \
+                | awk '{print $2}'
         fi
         /bin/grep -hv '^[[:space:]]*#' "${ENV_FILE}" 2>/dev/null \
             | /bin/grep -o '\${[A-Za-z_][A-Za-z0-9_]*}' \
             | sed 's/^\${//; s/}$//'
+        # And the one a secret's source is named INDIRECTLY by: the env file
+        # says which password name the provisioning account uses, so that name
+        # has to have a value too.
+        indirect="$(value_of NATS_PROVISION_PASSWORD_NAME)"
+        [ -n "${indirect}" ] && printf '%s\n' "${indirect}"
     } | sort -u
+}
+
+# ---------------------------------------------------------------------------
+# RENDERING THE BUNDLE. Everything that has to know what is in the estate —
+# which volumes it declares, which container a service is — asks compose, and
+# compose can refuse: a missing name, a file that is not there, a syntax error.
+# "It would not render" and "that service is not running" are completely
+# different sentences and this check must never print the second when it means
+# the first. (On 24 September's review it did, four times in one run, against a
+# perfectly healthy estate.) So every render goes through here, and the reason
+# it failed is kept for whoever asks.
+# ---------------------------------------------------------------------------
+COMPOSE_RENDER_PROBLEM=""
+COMPOSE_SAID=""
+
+dc() {
+    docker compose --env-file "${ENV_FILE}" -f "${HERE}/compose.yaml" \
+        ${PROJECT:+--project-name "${PROJECT}"} "$@"
+}
+
+# Run a compose command and put what it said in COMPOSE_SAID, and why it failed
+# (if it did) in COMPOSE_RENDER_PROBLEM. Returns compose's own exit code.
+#
+# TWO THINGS THIS HAS TO GET RIGHT, both met on 24 September 2026:
+#
+#   * IT KEEPS THE TWO STREAMS APART. Compose writes warnings to its error
+#     stream even when it succeeds — "the FORGE_NATS_PASSWORD variable is not
+#     set", which is exactly what a clean shell produces and exactly what this
+#     bundle now intends. Folded in with 2>&1, a warning became the container
+#     id, every 'docker exec' was handed a sentence instead of a container, and
+#     a perfectly healthy estate was reported dead;
+#   * IT IS CALLED IN THIS SHELL, never inside "$( )" or on the left of a pipe.
+#     A variable set in a subshell is lost when it ends, and the whole point of
+#     these two is to be read afterwards.
+compose_says() {
+    local err status
+    err="$(mktemp)"
+    COMPOSE_SAID="$(dc "$@" 2>"${err}")"
+    status=$?
+    COMPOSE_RENDER_PROBLEM=""
+    if [ "${status}" -ne 0 ]; then
+        COMPOSE_RENDER_PROBLEM="$(/bin/grep -v '^[[:space:]]*$' "${err}" | /bin/grep -v 'level=warning' | head -2 | tr '\n' ' ')"
+        [ -n "${COMPOSE_RENDER_PROBLEM}" ] || COMPOSE_RENDER_PROBLEM="docker compose exited ${status} without saying why"
+    fi
+    rm -f "${err}"
+    return "${status}"
 }
 
 # The volumes as DOCKER will know them, not as the compose file keys them: a
 # compose-managed volume is named after the project, and an external one keeps
 # its own name. 'config --volumes' prints the keys, so this reads the rendered
 # document instead and takes each volume's real name.
-compose_volume_names() {
-    docker compose --env-file "${ENV_FILE}" -f "${HERE}/compose.yaml" \
-        ${PROJECT:+--project-name "${PROJECT}"} config 2>/dev/null \
+volume_names_of() {
+    printf '%s' "$1" \
     | awk '
         /^volumes:$/ { inside = 1; next }
         /^[a-z]/     { inside = 0 }
@@ -360,20 +454,32 @@ compose_volume_names() {
 # ---------------------------------------------------------------------------
 # THE CHECK AFTER IT HAS STARTED
 # ---------------------------------------------------------------------------
-dc() {
-    docker compose --env-file "${ENV_FILE}" -f "${HERE}/compose.yaml" \
-        ${PROJECT:+--project-name "${PROJECT}"} "$@"
-}
-
 container_of() { dc ps -q "$1" 2>/dev/null | head -1; }
 
 check_services() {
     printf 'estate-check services — the estate, after it has started (env file: %s)\n\n' "${ENV_FILE}"
 
     local coordinator answer bus
-    coordinator="$(container_of coordinator)"
+    # THE ONE RENDER THAT DECIDES WHETHER THERE IS ANYTHING TO ASK, made in
+    # this shell so that its reason survives (see compose_says above).
+    compose_says ps -q coordinator
+    coordinator="$(printf '%s' "${COMPOSE_SAID}" | head -1)"
     answer="$(container_of answer-service)"
     bus="$(container_of nats)"
+
+    # THE BUNDLE ITSELF WOULD NOT RENDER. Nothing below could have found a
+    # container, so say that once, plainly, instead of reporting five services
+    # as down. Every one of these items is then unchecked, not failed, because
+    # nothing was asked of the estate at all.
+    if [ -n "${COMPOSE_RENDER_PROBLEM}" ]; then
+        printf '  This estate could not be read at all: %s\n\n' "${COMPOSE_RENDER_PROBLEM}"
+        for row in "${ITEMS[@]}"; do
+            IFS='|' read -r m n name sentence <<< "${row}"
+            [ "${m}" = "services" ] || continue
+            unchecked "${n}" "the estate bundle would not render here, so nothing could be asked of it. This is a problem with the files or the env file, not with any service."
+        done
+        finish
+    fi
 
     # --- 8 -----------------------------------------------------------------
     local bus_host bus_url
@@ -431,7 +537,7 @@ check_services() {
         from_coordinator="$(docker exec "${coordinator}" curl -s -o /dev/null --max-time 8 -w '%{http_code}' "${publisher_url}/healthz" 2>/dev/null)"
         from_elsewhere="$(docker exec "${answer}" curl -s -o /dev/null --max-time 8 -w '%{http_code}' "${publisher_url}/healthz" 2>/dev/null)"
         if [ "${from_coordinator}" = "200" ] && [ "${from_elsewhere}" != "200" ]; then
-            ok 8g "the publisher answers the coordinator (200 at ${publisher_url}) and refuses the answer service, which is on the factory network only — the coordinator is the only thing on both networks, and that is the whole route to the publisher."
+            ok 8g "the publisher answers the coordinator (200 at ${publisher_url}) and refuses the answer service, which is on the factory network only — the coordinator is the only thing on both networks, and that is the whole route to the publisher. This is ONE forbidden direction; the design asks for every one of them, including from the local network and repeated after a restart, and README.md records that as a rollout precondition this check does not meet."
         elif [ "${from_coordinator}" != "200" ]; then
             fail 8g "the coordinator could not reach the publisher at ${publisher_url} (it said ${from_coordinator:-nothing}), so the merge word would have nothing to hand a joined commit to."
         else
@@ -445,10 +551,18 @@ check_services() {
     finish
 }
 
+# A part of the design's item 8 that the estate does not carry yet.
+#
+# WITH NO ADDRESS NAMED THIS IS NOT A PASS. It used to be: the item printed
+# "there is nothing to ask" and counted itself ok, so a run could report seven
+# passes of which two had asked nothing. That is the same situation as item 9 —
+# a thing never asked — and item 9 has always counted as not passed. The design
+# names the memory service and the model seat in item 8; until they are in the
+# bundle and answering, that item has not run.
 check_named_address() {
     local number="$1" what="$2" url="$3" from="$4" code
     if [ -z "${url}" ]; then
-        ok "${number}" "${what} is not named in the env file, so there is nothing to ask. It is not in this bundle yet — the README says which parts are still to come."
+        unchecked "${number}" "${what} has no address in the env file, so nothing was asked. It is not in this bundle yet — README.md says which parts are still to come — and the design's item 8 names it, so this is an item that has not run rather than one that passed."
         return
     fi
     if [ -z "${from}" ]; then
@@ -466,6 +580,12 @@ check_named_address() {
 # Ask the BUS what buckets and streams it has, and compare that with what the
 # bus repository's own definitions say it should have. Both sides come from
 # somewhere other than this script: the factory does not keep its own list.
+#
+# IT ASKS OVER THE BUS'S OWN MONITORING ROUTE, which takes no credential — so
+# reading the estate needs no password anywhere, and this check runs from an
+# ordinary shell. That route is not published outside the estate; the question
+# is asked from a throwaway container on the estate's own network. A key-value
+# bucket is a stream named KV_<bucket>, which is how the bus reports it.
 check_bus_storage() {
     local image volume network coordinator
     image="$(get NATS_PROVISION_IMAGE)"
@@ -481,23 +601,27 @@ check_bus_storage() {
         unchecked 8b "the factory network could not be identified, so the bus could not be asked what it holds."
         return
     fi
-    local out
+    local address out
+    # The plain service name of the bus, from the address the one-shot uses.
+    address="$(get NATS_PROVISION_ADDRESS)"
+    address="$(printf '%s' "${address}" | sed -E 's#^[a-z]+://##; s#^[^@]*@##; s#[:/].*$##')"
+    [ -n "${address}" ] || address="nats"
     out="$(docker run --rm --network "${network}" \
-            -e "NATS_URL=$(get NATS_PROVISION_URL)" \
+            -e "BUS=${address}" \
             -v "${volume}:/bus:ro" "${image}" '
         set -euo pipefail
-        export XDG_CONFIG_HOME=/tmp/nats-config
-        have_streams="$(nats --server "$NATS_URL" stream ls -n 2>/dev/null | tr -d "\r")"
-        have_kv="$(nats --server "$NATS_URL" kv ls -n 2>/dev/null | tr -d "\r")"
+        held="$(curl -sf "http://$BUS:8222/jsz?accounts=true&streams=true" \
+                | jq -r ".account_details[]? | .stream_detail[]?.name")"
         missing=""
         for want in $(jq -r ".streams[].name" /bus/streams/stream-definitions.json); do
-            printf "%s\n" "$have_streams" | grep -qx "$want" || missing="$missing stream:$want"
+            printf "%s\n" "$held" | grep -qx "$want" || missing="$missing stream:$want"
         done
         for want in $(jq -r ".kv_buckets[].name" /bus/kv/kv-definitions.json); do
-            printf "%s\n" "$have_kv" | grep -qx "$want" || missing="$missing bucket:$want"
+            printf "%s\n" "$held" | grep -qx "KV_$want" || missing="$missing bucket:$want"
         done
-        n_s=$(printf "%s\n" "$have_streams" | grep -c . || true)
-        n_k=$(printf "%s\n" "$have_kv" | grep -c . || true)
+        n_s=$(printf "%s\n" "$held" | grep -c . || true)
+        n_k=$(printf "%s\n" "$held" | grep -c "^KV_" || true)
+        n_s=$((n_s - n_k))
         if [ -n "$missing" ]; then
             printf "MISSING %s | the bus holds %s streams and %s buckets\n" "$missing" "$n_s" "$n_k"
         else
@@ -506,7 +630,7 @@ check_bus_storage() {
     ' 2>&1 | tail -1)"
     case "${out}" in
         ALL*)
-            ok 8b "the bus's storage is provisioned: ${out#ALL } (a key-value bucket is a stream of its own, so it is counted twice), every one the bus repository's own definitions name."
+            ok 8b "the bus's storage is provisioned — ${out#ALL } — every one the bus repository's own definitions name, asked of the bus itself and not of the one-shot's exit code (those scripts exit 0 whatever they print)."
             ;;
         MISSING*)
             fail 8b "the bus is missing storage the bus repository's definitions name: ${out#MISSING }. The coordinator needs its agent-registry bucket and its PIPELINE stream to register at all, which is why the estate provisions the bus before the coordinator starts."

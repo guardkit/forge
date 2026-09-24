@@ -20,10 +20,14 @@
 #
 #     cp .env.example .env            # then fill in the lines marked CHANGE THIS
 #     ./build-estate-images.sh        # the bus image, at its pinned commit
-#     ./estate-check host
+#     sops exec-env "$NATS_SECRETS_FILE" './estate-check host'
 #     sops exec-env "$NATS_SECRETS_FILE" 'docker compose --env-file .env up -d'
-#     ./estate-check services
+#     ./estate-check services         # a clean shell: these need no password
 #     ./factory-hello
+#
+# The first two of those four are run the way the START is run, because one of
+# the things the host check checks is that the passwords have values. The last
+# two need no secret at all and are run from an ordinary shell.
 #
 # TAKE IT DOWN:  docker compose --env-file .env down      # keeps the volumes
 #                docker compose --env-file .env down -v   # and removes them
@@ -55,23 +59,70 @@ services:
   # this bundle. That is the bus repository's own arrangement and the reason
   # for it is worth keeping: an env_file whose values were still encrypted
   # would feed ciphertext through the template renderer and produce a broker
-  # with unusable accounts, whereas 'environment:' interpolation can only ever
-  # receive a real value from the environment the command was run in. The ':?'
-  # on each one makes a bare 'up' fail loudly rather than render empty
-  # passwords.
+  # with unusable accounts, whereas this way a value can only ever be a real
+  # one, from the environment the command was run in.
+  #
+  # BUT THEY DO NOT GO INTO THE CONTAINER'S ENVIRONMENT. The bus repository's
+  # own compose file puts all eight in 'environment:', where 'docker inspect'
+  # shows them to anybody who can reach the Docker daemon, and where they are
+  # copied into the container's declared configuration on disk. Here each one
+  # arrives as a FILE (the 'secrets:' at the foot of this file, each read from
+  # the environment the command was run in), and the small wrapper below puts
+  # them into the environment of the bus's own entrypoint PROCESS and nothing
+  # else. The bus's entrypoint is unchanged and does not know the difference.
+  #
+  # A missing value still fails loudly, in two places: compose refuses to start
+  # a service whose secret names an environment variable nothing set, and the
+  # wrapper refuses an empty file by name.
   # -------------------------------------------------------------------------
   nats:
     image: ${NATS_IMAGE:?name the bus image in the env file, e.g. NATS_IMAGE=factory-nats:2026.09.24-5 - built by ./build-estate-images.sh from the bus repository at its pinned commit}
     restart: unless-stopped
-    environment:
-      ADMIN_NATS_PASSWORD: ${ADMIN_NATS_PASSWORD:?the bus's account passwords come from the environment the command was run in, never from a file in this bundle - see README.md}
-      RICH_NATS_PASSWORD: ${RICH_NATS_PASSWORD:?the bus's account passwords come from the environment the command was run in, never from a file in this bundle}
-      JAMES_NATS_PASSWORD: ${JAMES_NATS_PASSWORD:?the bus's account passwords come from the environment the command was run in, never from a file in this bundle}
-      MARK_NATS_PASSWORD: ${MARK_NATS_PASSWORD:?the bus's account passwords come from the environment the command was run in, never from a file in this bundle}
-      FORGE_NATS_PASSWORD: ${FORGE_NATS_PASSWORD:?the bus's account passwords come from the environment the command was run in, never from a file in this bundle}
-      FLEET_MEMORY_NATS_PASSWORD: ${FLEET_MEMORY_NATS_PASSWORD:?the bus's account passwords come from the environment the command was run in, never from a file in this bundle}
-      GUARDKIT_NATS_PASSWORD: ${GUARDKIT_NATS_PASSWORD:?the bus's account passwords come from the environment the command was run in, never from a file in this bundle}
-      JARVIS_NATS_PASSWORD: ${JARVIS_NATS_PASSWORD:?the bus's account passwords come from the environment the command was run in, never from a file in this bundle}
+    # Every '$$' below is a dollar sign for the SHELL, escaped so that compose
+    # leaves it alone. The last item is the shell's $0; the image's own command
+    # ('-c /etc/nats/nats-server.conf') follows it and is what "$@" hands on.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        for account in ADMIN RICH JAMES MARK FORGE FLEET_MEMORY GUARDKIT JARVIS; do
+            variable="$${account}_NATS_PASSWORD"
+            file="/run/secrets/$$(printf '%s' "$${variable}" | tr 'A-Z' 'a-z')"
+            if [ ! -s "$${file}" ]; then
+                echo "the bus was given no $${variable}: the estate passes each of the bus's eight account passwords in as a file, and this one arrived missing or empty. Start the estate the way deploy/estate/README.md says, with the values passed in from a child process." >&2
+                exit 1
+            fi
+            value="$$(cat "$${file}")"
+            export "$${variable}=$${value}"
+        done
+        exec /usr/local/bin/docker-entrypoint.sh "$$@"
+      - the-estate-hands-the-bus-its-passwords-as-files
+    # THE BUS'S OWN COMMAND, WRITTEN OUT BECAUSE NAMING AN ENTRYPOINT HERE
+    # EMPTIES IT. Compose drops the image's own command whenever a service
+    # names an entrypoint, and a nats-server started with no command reads no
+    # config at all: it listens on 4222, serves no monitoring route, holds no
+    # JetStream, and looks perfectly healthy in its own log while the estate's
+    # health probe fails. This line is the bus image's command, unchanged, and
+    # it must stay the same as the image's.
+    command: ["-c", "/etc/nats/nats-server.conf"]
+    secrets:
+      - source: bus-admin-password
+        target: admin_nats_password
+      - source: bus-rich-password
+        target: rich_nats_password
+      - source: bus-james-password
+        target: james_nats_password
+      - source: bus-mark-password
+        target: mark_nats_password
+      - source: bus-forge-password
+        target: forge_nats_password
+      - source: bus-fleet-memory-password
+        target: fleet_memory_nats_password
+      - source: bus-guardkit-password
+        target: guardkit_nats_password
+      - source: bus-jarvis-password
+        target: jarvis_nats_password
     volumes:
       # THE BUS'S OWN CONFIG, READ-ONLY — exactly the two mounts the bus
       # repository's own compose file makes, at the same two places, but out of
@@ -132,6 +183,19 @@ services:
   # It runs the bus repository's OWN provisioning scripts, from the same pinned
   # commit as the bus's config, against the bus. They are written to be safe on
   # every start: each bucket and stream is checked, then created or updated.
+  #
+  # WHY THE CREDENTIAL IS NOT IN THE ADDRESS. Those two scripts PRINT the
+  # address they were given — "NATS URL: ..." and "Waiting for NATS server
+  # at ..." — so an address of the usual nats://user:password@host form put the
+  # password into this container's log at every start, on every machine, where
+  # container logs routinely leave the box. (Found on 24 September 2026 by the
+  # review of this bundle; nothing was exposed, because only throwaway
+  # passwords had ever gone through it.) The scripts are the bus repository's
+  # and the estate is what runs them, so the estate is what fixes it: the
+  # address below carries NO credential and is safe to print, and the account's
+  # password arrives as a FILE and is written into the nats client's own
+  # context file, which is how that client is meant to be given one. The
+  # scripts then authenticate without ever holding the password.
   # -------------------------------------------------------------------------
   nats-provision:
     image: ${NATS_PROVISION_IMAGE:?name the provisioning image in the env file - built by ./build-estate-images.sh}
@@ -140,19 +204,46 @@ services:
       nats:
         condition: service_healthy
     environment:
-      # WHICH BUS, AND AS WHOM. The address carries an account's user and
-      # password, so this value comes from the environment the command was run
-      # in exactly as the bus's own passwords do. Nothing here prints it.
-      NATS_URL: ${NATS_PROVISION_URL:?name the address the provisioning runs against in the env file - it carries an account's credentials, so it comes from the environment the command was run in}
-      # The nats client writes a context folder if it is allowed to; give it a
-      # temporary one of its own rather than a home folder in the image.
+      # WHICH BUS — a service name on the factory network, and NO credential.
+      # This is the value the scripts print.
+      NATS_URL: ${NATS_PROVISION_ADDRESS:?name the address the provisioning runs against in the env file, e.g. nats://nats:4222 - a service name, with no credential in it}
+      # AS WHOM. The account name is not a secret; its password is, and comes
+      # in as a file below.
+      NATS_PROVISION_USER: ${NATS_PROVISION_USER:?name the bus account the provisioning runs as in the env file - it needs JetStream rights}
+      # The nats client writes its context folder here rather than into a home
+      # folder in the image.
       XDG_CONFIG_HOME: /tmp/nats-config
+    secrets:
+      - source: bus-provision-password
+        target: provision_password
     entrypoint: ["/bin/bash", "-c"]
     command:
       - |
         set -euo pipefail
-        /bus/kv/provision-kv.sh
-        /bus/streams/provision-streams.sh
+        umask 077
+        case "$$NATS_URL" in
+          *@*)
+            echo "the provisioning address carries a credential. The bus repository's scripts print this address, so it must be a plain address: give the password as a password name in the env file instead." >&2
+            exit 1
+            ;;
+        esac
+        mkdir -p "$$XDG_CONFIG_HOME"
+        # The credential goes into the nats client's own context file and
+        # nowhere else. 'nats context save' prints the context it wrote with
+        # the password masked; the scripts below are then given a plain address
+        # on the command line, and take the account and its password from the
+        # context.
+        nats context save estate \
+            --server "$$NATS_URL" \
+            --user "$$NATS_PROVISION_USER" \
+            --password "$$(cat /run/secrets/provision_password)" \
+            --select
+        # A second line of defence, not the fix: anything either script prints
+        # that still looks like an address with a credential in it has the
+        # credential replaced before it reaches this container's log.
+        without_a_credential() { sed -E 's#(://[^:/@[:space:]]+):[^@[:space:]]*@#\1:***@#g'; }
+        /bus/kv/provision-kv.sh 2>&1 | without_a_credential
+        /bus/streams/provision-streams.sh 2>&1 | without_a_credential
     volumes:
       # THE BUS REPOSITORY'S OWN SCRIPTS AND DEFINITIONS, read-only, from the
       # same pinned commit as the bus's config. The factory keeps no copy of
@@ -202,3 +293,48 @@ volumes:
   bus-source:
     external: true
     name: ${BUS_SOURCE_VOLUME:?name the volume holding the bus repository's config and provisioning scripts - ./build-estate-images.sh makes it and prints its name}
+
+# ---------------------------------------------------------------------------
+# THE BUS'S EIGHT ACCOUNT PASSWORDS, AS FILES.
+#
+# Each one is read from the environment the 'docker compose' command was run
+# in — which is a child process of 'sops exec-env', and the only place a value
+# can come from — and is handed to the container as a file under /run/secrets.
+# No value is in any file in this bundle, in any image, in any container's
+# declared environment, or in anything either service prints.
+#
+# Two things follow that are worth knowing:
+#
+#   * 'docker compose config' RENDERS WITHOUT THEM. A secret names an
+#     environment variable rather than interpolating it, so reading the estate
+#     — 'ps', 'config', the estate's own two commands after it has started —
+#     needs no password at all. Only starting it does. Before 24 September's
+#     review these were interpolated with ':?', and every command that had to
+#     render the file refused in a clean shell;
+#   * A MISSING ONE STILL STOPS THE START, loudly and by name: compose refuses
+#     to start a service whose secret names a variable nothing set.
+# ---------------------------------------------------------------------------
+secrets:
+  bus-admin-password:
+    environment: ADMIN_NATS_PASSWORD
+  bus-rich-password:
+    environment: RICH_NATS_PASSWORD
+  bus-james-password:
+    environment: JAMES_NATS_PASSWORD
+  bus-mark-password:
+    environment: MARK_NATS_PASSWORD
+  bus-forge-password:
+    environment: FORGE_NATS_PASSWORD
+  bus-fleet-memory-password:
+    environment: FLEET_MEMORY_NATS_PASSWORD
+  bus-guardkit-password:
+    environment: GUARDKIT_NATS_PASSWORD
+  bus-jarvis-password:
+    environment: JARVIS_NATS_PASSWORD
+
+  # The account the one-shot provisions the bus's storage as. The env file says
+  # WHICH of the eight names above that account's password is under, so the
+  # account can be changed in the env file without changing this file — and so
+  # that it is always one of the eight the bus itself is given.
+  bus-provision-password:
+    environment: ${NATS_PROVISION_PASSWORD_NAME:?name which of the bus's eight password names the provisioning account's password is under, e.g. RICH_NATS_PASSWORD}

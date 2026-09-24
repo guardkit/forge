@@ -49,8 +49,11 @@ in `../compose/`, and is referenced from here rather than copied.
    `../compose/settings.example.yaml`, fill in the project's `org/name` and its
    sandbox's name, and put it on the `forge-settings` volume as `forge.yaml`.
    Nothing writes that volume at run time; it is mounted read-only.
-6. **`./estate-check host`.** Seven items, one sentence each. It exits non-zero
-   if any of them is not met.
+6. **`sops exec-env "$NATS_SECRETS_FILE" './estate-check host'`.** Seven items,
+   one sentence each. It exits non-zero if any of them is not met. Run it the
+   way you are about to start the estate — one of the things it checks is that
+   the bus's eight account passwords have values, and they only do in the child
+   process.
 7. **Start it**, with the bus's account passwords passed in from a child
    process:
 
@@ -59,10 +62,52 @@ in `../compose/`, and is referenced from here rather than copied.
    ```
 
    On a machine that looks after a project's sandbox, add `--profile sandbox`.
-8. **`./estate-check services`.**
-9. **`./factory-hello`** — one line each for the bus, the answer service, the
-   publisher and the two addresses into a project's sandbox, with the address
-   it used on every line.
+8. **`./estate-check services`** — from an ordinary shell. Reading a running
+   estate needs no password: the passwords reach the bus as files, so the
+   bundle renders without them, and the one thing this check asks the bus
+   itself goes over the bus's own monitoring route, which takes no credential.
+9. **`./factory-hello`** — also from an ordinary shell. One line each for the
+   bus, the answer service, the publisher and the two addresses into a
+   project's sandbox, with the address it used on every line.
+
+**Which of the four need a secret:** the start does, and the host check does
+because it checks the values are there. The last two do not. Before 24
+September's review all four did, because eight password names were interpolated
+into the compose file with `:?` and every command that had to render it refused
+in a clean shell — a reviewer ran steps 8 and 9 exactly as written against a
+completely healthy estate and was told the coordinator was not running and the
+bus was not in the estate. Both were. Neither tool could tell "this would not
+render" from "that service is down"; both now say which, in those words.
+
+## How the bus's passwords travel, and why no log has one in it
+
+The bus has eight account passwords. They live encrypted in one file, they are
+never in any file in this bundle, and `sops exec-env` puts them into the
+environment of the `docker compose` command as a child process. From there:
+
+- **each one goes to the bus as a file** under `/run/secrets`, and a four-line
+  wrapper puts them into the environment of the bus's own entrypoint *process*.
+  They are not in the container's declared environment, where `docker inspect`
+  shows them to anybody who can reach the Docker daemon. The bus repository's
+  own compose file does put them there; this is the one thing the estate does
+  differently from it, and the bus's entrypoint cannot tell;
+- **the one-shot that provisions the bus never holds one.** Its address is a
+  plain `nats://nats:4222` with no credential, and the provisioning account's
+  password arrives as a file and is written into the `nats` client's own
+  context file. That is what fixed the blocker this bundle's review found on 24
+  September 2026: the bus repository's two provisioning scripts *print* the
+  address they are given, so an address of the usual
+  `nats://user:password@host` form put the password into the one-shot's
+  container log at every start, on every machine, and container logs routinely
+  leave a cloud box. Nothing was ever exposed — the bundle is not rolled out,
+  and only throwaway passwords ever went through it. Anything either script
+  prints is passed through a redaction step as well, which is a second line of
+  defence and not the fix;
+- **one is still in a container's environment**: the coordinator's
+  `FORGE_NATS_URL`, which carries the `forge` account's password because
+  Forge's own code reads its bus address from that one setting. That is Forge's
+  code to change, not this bundle's, and it is listed with the rollout
+  preconditions below.
 
 ## Walk (b): a cloud machine
 
@@ -118,10 +163,26 @@ files (present or missing, never a value, and readable by nobody but their
 owner); and every setting name the composed files require having a value.
 
 `estate-check services` — after. The bus answers; its buckets and streams
-exist, asked of the bus; the memory service and the model seat, when the env
-file names them; the coordinator's own health route; the answer service
-answering for a build nobody wrote down; and the publisher answering the
-coordinator **and refusing everything else**.
+exist, asked of the bus itself over its own monitoring route rather than taken
+from the one-shot's exit code; the coordinator's own health route; the answer
+service answering for a build nobody wrote down; and the publisher answering
+the coordinator **and refusing the answer service**.
+
+**Two of its items ask nothing here, and say so.** The memory service and the
+model seat are in the design's item 8 and are not in this bundle yet, so with
+no address in `.env` they print *not checked here* and count as **not passed**,
+exactly as item 9 does. A run that reported them as passes would be saying it
+had asked something it never asked. Give either an address and the check asks
+it.
+
+**What it does not prove about the routes.** Section 7 of the design asks this
+check to prove every permitted direction and **every forbidden** one —
+including from the local network and from unwanted factory or sandbox callers —
+and to repeat them after a restart. It proves one forbidden direction: the
+answer service cannot reach the publisher. It makes no probe from the local
+network and it does not repeat anything after a restart. That is recorded with
+the rollout preconditions below, and it is a gap in the **check**, not only in
+the firewall rule.
 
 **Item 9 has never run.** The design's ninth item is the answer service reached
 **from inside a sandbox**, at the factory gateway address the sandbox's own
@@ -159,18 +220,36 @@ the design:
 
 1. **Item 9 has not run** — the route from inside a sandbox to the answer
    service (above).
-2. **The per-route access policy is not enforced.** The design requires each
-   published port to name its listener, its destination port and its allowed
-   source, and to refuse every other caller including the local network, with
-   the negative probes made and repeated after a restart. This bundle publishes
-   two ports and does not yet establish that policy, so the factory gateway
-   address must be a **private** address of the machine until it does.
-3. **api_test's bootstrap has not been refreshed** from Forge's template.
-4. **Recovery after a sandbox-daemon restart is unproven** — the daemon is
+2. **The per-route access policy is not enforced, and the check is weaker than
+   the design asks.** The design requires each published port to name its
+   listener, its destination port and its allowed source, and to refuse every
+   other caller including the local network, with the negative probes made and
+   repeated after a restart. Two things are outstanding, not one: **the rule**
+   — this bundle publishes two ports and establishes no such policy, so the
+   factory gateway address must be a **private** address of the machine until
+   it does; and **the check** — `estate-check services` proves one forbidden
+   direction, makes no probe from the local network, and repeats nothing after
+   a restart.
+3. **The images are named by tag, not by digest.** Section 3's item 4 and the
+   rollout table both say the bundle supplies the tested image *by digest* and
+   records the digest it replaces. `.env.example` names four tags, `estate-check`
+   item 4 looks for those tags, and its own sentence says so. A tag can be
+   moved; a digest cannot, and the whole point of the gate is that the tested
+   image is what runs. (The bus's base image *is* pinned by digest in
+   `estate-pins.conf`; it is the four release tags that are not.)
+4. **The memory service and the model seat have not been asked for real** —
+   they are not in the bundle, so two of the design's item 8 parts count as not
+   passed (above).
+5. **api_test's bootstrap has not been refreshed** from Forge's template.
+6. **Recovery after a sandbox-daemon restart is unproven** — the daemon is
    shared with live sandboxes, so it needs the owner present.
-5. **The two-machine acceptance has not been run**: the same images on a clean
+7. **The two-machine acceptance has not been run**: the same images on a clean
    local machine and on a cloud machine, both digest lists identical.
-6. **Codex's sign-off, and the owner's go.** Nothing here is rollout approval.
+8. **The coordinator's bus password is still in its container environment.**
+   Every other password in the estate now travels as a file; the coordinator's
+   `FORGE_NATS_URL` carries one because Forge's code reads its bus address from
+   that single setting. Changing that is Forge's own work, not this bundle's.
+9. **Codex's sign-off, and the owner's go.** Nothing here is rollout approval.
 
 ## Why the bus's image is not in the release manifest
 
