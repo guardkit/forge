@@ -148,8 +148,8 @@ dev = [
 # mirrors jarvis's existing pattern — see jarvis/pyproject.toml.
 #
 # Canonical layout assumes `nats-core` is a sibling of `forge`:
-#   …/appmilla_github/forge/        ← this project
-#   …/appmilla_github/nats-core/    ← target of `../nats-core`
+#   …/<checkouts>/forge/        ← this project
+#   …/<checkouts>/nats-core/    ← target of `../nats-core`
 #
 # Worktree note: `uv` resolves the path relative to the directory
 # containing this pyproject.toml. From a worktree at
@@ -163,8 +163,8 @@ dev = [
 nats-core = { path = "../nats-core", editable = true }
 # fleet-memory is not published to PyPI; resolve it from the sibling
 # working tree (same layout assumption as nats-core above):
-#   …/appmilla_github/forge/          ← this project
-#   …/appmilla_github/fleet-memory/   ← target of `../fleet-memory`
+#   …/<checkouts>/forge/          ← this project
+#   …/<checkouts>/fleet-memory/   ← target of `../fleet-memory`
 #
 # Worktree note (same caveat nats-core carries): `uv` resolves the path
 # relative to the directory containing this pyproject.toml. From a

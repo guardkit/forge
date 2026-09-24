@@ -28,7 +28,7 @@ What it does, in order:
    ``toolchain:`` block when the repository declares none (it NEVER overwrites a
    declaration that is already there), and records the fleet-memory project id.
 4. Adds the checkout to ``permissions.filesystem.allowlist`` and both key
-   spellings — ``guardkit/<name>`` and ``appmilla_github/<name>`` — to
+   spellings — ``guardkit/<name>`` and ``<checkout-folder>/<name>`` — to
    ``planning.target_repo_paths``, by **surgical line insertion**. The live
    ``forge.yaml``'s comment blocks are load-bearing prose written by the people
    who run this estate; dumping the parsed model back to YAML would erase them,
@@ -54,7 +54,7 @@ import subprocess
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
-from typing import Any, Callable, Iterable, Sequence
+from typing import Any, Callable, Iterable, NoReturn, Sequence
 
 import click
 import yaml
@@ -78,16 +78,25 @@ __all__ = ["register_repo_cmd"]
 #: mint a claim the build side cannot honour.
 EXPECTED_OWNER_UID: int = 1000
 
-#: Environment variable and default for the directory the build side resolves
-#: repositories under by basename (``autobuild_runner.py:1110`` and
-#: ``:1210``; the resolution itself is ``autobuild_runner.py:1463-1479``).
+#: Environment variable for the directory the build side resolves repositories
+#: under by basename (the resolution itself is
+#: ``forge.subagents.autobuild_runner._resolve_repo_path``).
+#:
+#: There is NO default (2026-09-24). Which directory a deployment keeps its
+#: checkouts in is a fact about that deployment, not about the factory, so an
+#: unset setting is refused by name instead of standing in for one folder on
+#: one person's machine — the old default did exactly that, and it was one of
+#: the machine-shaped paths the release image was found to be carrying.
 FORGE_REPO_BASE_ENV: str = "FORGE_REPO_BASE"
-DEFAULT_FORGE_REPO_BASE: str = "~/Projects/appmilla_github"
+DEFAULT_FORGE_REPO_BASE: str | None = None
 
-#: The two key spellings the estate uses for the same repository. Builds are
-#: queued with ``appmilla_github/<name>``; the planning flows use
-#: ``guardkit/<name>``. Both are minted from this one loop so they cannot drift.
-REPO_MAP_NAMESPACES: tuple[str, ...] = ("guardkit", "appmilla_github")
+#: The key spelling every repository is registered under. The estate also
+#: spells the same repository by the folder its checkouts sit in — builds are
+#: queued with ``<folder>/<name>`` — and that second namespace is derived from
+#: :data:`FORGE_REPO_BASE_ENV` at call time by :func:`_repo_map_namespaces`,
+#: because a folder name on one machine is not a fact about the factory. Both
+#: spellings are still minted from one loop so they cannot drift.
+REPO_MAP_NAMESPACES: tuple[str, ...] = ("guardkit",)
 
 #: The command a human runs after this one, printed and never run.
 RECREATE_COMMAND: str = "bash ops/forge-prod-recreate.sh"
@@ -800,9 +809,29 @@ def _has_path_separator(name: str) -> bool:
     return any(sep in name for sep in separators)
 
 
-def _repo_base() -> Path:
+def _repo_base() -> Path | None:
+    """The directory this deployment keeps its checkouts in, or ``None``.
+
+    ``None`` means the setting is unset and there is no default to fall back
+    on, which the caller turns into a refusal naming
+    :data:`FORGE_REPO_BASE_ENV`.
+    """
     raw = os.environ.get(FORGE_REPO_BASE_ENV, "").strip() or DEFAULT_FORGE_REPO_BASE
-    return Path(raw).expanduser().resolve()
+    return Path(raw).expanduser().resolve() if raw else None
+
+
+def _repo_map_namespaces(base: Path) -> tuple[str, ...]:
+    """The key spellings a repository under ``base`` is registered under.
+
+    :data:`REPO_MAP_NAMESPACES` plus the name of the checkout folder itself,
+    because that is the spelling builds are queued with — derived here rather
+    than written into the source, so no machine's folder name lives in the
+    code.
+    """
+    folder = base.name.strip()
+    if folder and folder not in REPO_MAP_NAMESPACES:
+        return REPO_MAP_NAMESPACES + (folder,)
+    return REPO_MAP_NAMESPACES
 
 
 # ---------------------------------------------------------------------------
@@ -1121,7 +1150,7 @@ def register_repo_cmd(
     #: now standing behind no change at all, is removed.
     rollbacks: list[Callable[[], None]] = []
 
-    def refuse(step: str, detail: str) -> None:
+    def refuse(step: str, detail: str) -> NoReturn:
         for undo in reversed(rollbacks):
             try:
                 undo()
@@ -1193,6 +1222,15 @@ def register_repo_cmd(
     steps.append(Step("owner", "ok", f"uid {EXPECTED_OWNER_UID}"))
 
     base = _repo_base()
+    if base is None:
+        refuse(
+            "base",
+            f"{FORGE_REPO_BASE_ENV} is not set, and there is no default — this "
+            "command cannot know which directory this deployment keeps its "
+            f"checkouts in. Set {FORGE_REPO_BASE_ENV} to that directory (the "
+            "build side resolves a repository by folder name under it) and run "
+            "this again",
+        )
     if repo.parent != base:
         refuse(
             "base",
@@ -1203,7 +1241,9 @@ def register_repo_cmd(
     steps.append(Step("base", "ok", f"directly under {base}"))
 
     name = name_opt or repo.name
-    map_keys = [f"{namespace}/{name}" for namespace in REPO_MAP_NAMESPACES]
+    map_keys = [
+        f"{namespace}/{name}" for namespace in _repo_map_namespaces(base)
+    ]
     existing_map: dict[str, str] = dict(
         getattr(getattr(config, "planning", None), "target_repo_paths", {}) or {}
     )

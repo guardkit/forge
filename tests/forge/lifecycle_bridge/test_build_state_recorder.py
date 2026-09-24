@@ -172,7 +172,7 @@ class TestRecorderStateMapping:
                 feature_id=_FEATURE_ID,
                 build_id=build_id,
                 reason="operator cancel",
-                cancelled_by="richardwoollcott",
+                cancelled_by="an-operator",
                 cancelled_at=datetime.now(UTC).isoformat(),
                 correlation_id="corr-bsr-1",
             ),

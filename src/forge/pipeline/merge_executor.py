@@ -946,9 +946,9 @@ def close_build_row(
 def git_venue(git: Any, repo_root: Path | str) -> str:
     """Where this press's git happened, as a phrase a sentence can carry.
 
-    ``in /home/rich/Projects/.../api_test`` when it happened in this
-    container, ``in the sandbox that holds appmilla/api_test`` when it
-    happened where the repository lives.
+    ``in <the checkout path>`` when it happened in this container, ``in the
+    sandbox that holds <org>/<repo>`` when it happened where the repository
+    lives.
     """
     return str(getattr(git, "venue", "") or f"in {repo_root}")
 
