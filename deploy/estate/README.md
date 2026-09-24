@@ -1,0 +1,213 @@
+# The estate bundle — the only thing a new machine clones
+
+*Written 24 September 2026, stage 4a of the containerisation rollout gate.*
+
+This folder starts the factory's own services on a clean machine — a laptop or
+a cloud machine — from one set of files and one env file. It carries no
+machine's address, no home path, no checkout and no host network.
+
+**Forge owns it because Forge is the factory's coordinator.** The estate is
+what the coordinator needs around it in order to work, so the list of those
+parts belongs with the coordinator, in the same repository and at the same
+release. As the estate grows to the memory service and the Slack front door,
+those do **not** get copied in here: each of them has a compose file in its own
+repository, and this file composes that one, exactly as it composes Forge's own
+two today. One description of each service, in the repository that owns it.
+
+## What is here
+
+| File | What it is |
+|---|---|
+| `compose.yaml` | composes Forge's two compose files and adds the bus and the one-shot that provisions it |
+| `.env.example` | every setting name the whole estate needs, with no machine's values. Copy to `.env` |
+| `estate-pins.conf` | what the estate's own two images are built from. Part of the release, never edited per machine. Not named `.env`, because this repository ignores the whole `.env` family as a secrets fence and these are pins, not secrets |
+| `build-estate-images.sh` | builds those two images, and fills the volume holding the bus's own config, from the bus repository at its pinned commit |
+| `provisioner/Dockerfile` | the one-shot image: the NATS project's tool image plus `bash` |
+| `estate-check` | the two checks, one sentence per item |
+| `factory-hello` | asks the coordinator what it can reach, with the address it used |
+
+`settings.example.yaml` — the coordinator's own settings file — is **Forge's**,
+in `../compose/`, and is referenced from here rather than copied.
+
+## Walk (a): a clean local machine
+
+1. **Install Docker**, and `sbx` if this machine will look after a project's
+   sandbox.
+2. **Clone this bundle.** No product repository is cloned: the factory's code
+   is in the release images, and a project's code lives in its own sandbox.
+3. **Build the estate's own two images and fill the bus's volume:**
+   `./build-estate-images.sh`. It fetches the bus repository from GitHub at the
+   commit `estate-pins.conf` pins, builds the bus from **the bus repository's
+   own Dockerfile**, builds the one-shot, and puts the bus's config and
+   provisioning scripts into a volume. The two release images
+   (`forge` and `forge-publisher`) come from
+   `../../scripts/build-release-image.sh` or from a registry.
+4. **`cp .env.example .env`** and fill in the lines marked CHANGE THIS: the
+   factory gateway address, the two sandbox ports, and the paths of the secret
+   files. Put the secret files where it says.
+5. **Put the coordinator's settings file on the settings volume.** Copy
+   `../compose/settings.example.yaml`, fill in the project's `org/name` and its
+   sandbox's name, and put it on the `forge-settings` volume as `forge.yaml`.
+   Nothing writes that volume at run time; it is mounted read-only.
+6. **`./estate-check host`.** Seven items, one sentence each. It exits non-zero
+   if any of them is not met.
+7. **Start it**, with the bus's account passwords passed in from a child
+   process:
+
+   ```
+   sops exec-env "$NATS_SECRETS_FILE" 'docker compose --env-file .env up -d'
+   ```
+
+   On a machine that looks after a project's sandbox, add `--profile sandbox`.
+8. **`./estate-check services`.**
+9. **`./factory-hello`** — one line each for the bus, the answer service, the
+   publisher and the two addresses into a project's sandbox, with the address
+   it used on every line.
+
+## Walk (b): a cloud machine
+
+**The same nine steps, the same bundle, the same images.** Only `.env` differs,
+in three places:
+
+1. **the addresses** — the model seats, and anything still on the first
+   machine;
+2. **storage** — if that machine's data disk is mounted somewhere of its own;
+3. **the sandbox** — either a sandbox daemon on that machine (the same as
+   local, and recommended first, because it is the same code path) or Docker's
+   hosted sandbox service.
+
+If a step in walk (b) has no counterpart in walk (a), the design has failed and
+should be changed rather than documented around.
+
+## Why the bus is provisioned before the coordinator starts
+
+A bus that is merely running is not enough. The coordinator needs the bus's
+`agent-registry` key-value bucket and its `PIPELINE` stream to register at all;
+without them it restarts in a loop whose first message is a programmer's error.
+The live bus was provisioned by hand months ago, so nobody met this until a
+reviewer brought the bundle up against a bare bus on 24 September 2026.
+
+So it is a line in the file rather than a sentence somebody has to remember:
+`nats-provision` runs the **bus repository's own** provisioning scripts, from
+the same pinned commit as the bus's config, and the coordinator waits for it to
+finish **successfully** before it starts. The scripts are safe on every start —
+each bucket and stream is checked, then created or updated — so this costs a
+few seconds at every start and nothing else.
+
+Two things worth knowing about them, met on 24 September 2026:
+
+- the two scripts overlap. `provision-kv.sh` creates the four buckets with
+  their settings, and `provision-streams.sh` then provisions the same four
+  again from its own list, which has only a name and a time-to-live. For the
+  two buckets that have a time-to-live it tries an update the broker refuses,
+  and prints `[ERROR] KV pipeline-state — failed to update bucket`. The buckets
+  are correct — the first script made them — and the one-shot still exits 0, by
+  the scripts' own design. It is the bus repository's to fix, not the
+  factory's;
+- **because those scripts exit 0 whatever they print**, "the one-shot
+  succeeded" is not evidence that the bus is provisioned. That is why
+  `estate-check services` asks the **bus itself** what it holds and compares
+  that with the bus repository's own definitions.
+
+## The two checks
+
+`estate-check host` — before anything starts. Seven items, from section 3 of
+the design: the machine qualifies for a sandbox at all; Docker; the sandbox
+tool and its daemon; the release images; the volumes and the disk; the secret
+files (present or missing, never a value, and readable by nobody but their
+owner); and every setting name the composed files require having a value.
+
+`estate-check services` — after. The bus answers; its buckets and streams
+exist, asked of the bus; the memory service and the model seat, when the env
+file names them; the coordinator's own health route; the answer service
+answering for a build nobody wrote down; and the publisher answering the
+coordinator **and refusing everything else**.
+
+**Item 9 has never run.** The design's ninth item is the answer service reached
+**from inside a sandbox**, at the factory gateway address the sandbox's own
+profile allows. It is the check that proves that route, and without it a
+project's deploy helper refuses every deploy that names a commit. The probe is
+written — it takes the sandbox's name from `.env` and asks from in there — but
+on a machine with no sandbox of that name it prints *not checked here*, with
+the reason, and **counts as NOT PASSED**. The whole run then exits non-zero.
+An item that has not been checked is not a pass, and this bundle's gate is not
+met until it runs for real.
+
+## What is deliberately not here yet
+
+- **The memory service and the model seats.** Their compose files are in their
+  own repositories and will be composed in here, the same way Forge's are.
+  Until then `.env` can name their addresses and `estate-check services` will
+  ask them.
+- **The front door** (the Slack side) and the bus gateway — jarvis's own
+  compose file, a later rollout row.
+- **The sandboxes themselves.** Making one is still an attended step. The
+  sandbox service in `../compose/compose.sandbox-runner.yaml` holds an existing
+  one awake and runs the project's own bootstrap inside it; it is behind the
+  `sandbox` profile here so that a machine without one starts nothing. (Compose
+  fills in every setting name **before** it looks at profiles, so
+  `SANDBOX_NAME` still needs a value even where the service never starts.)
+- **The project bootstrap refresh.** The bootstrap inside a project's sandbox
+  still copies the factory's code out of read-only mounts of checkouts on the
+  machine. In this design it pulls the release image at its pinned digest
+  instead. That is api_test's own file and a gate of its own.
+
+## The rollout preconditions this bundle does not meet
+
+Recorded here so nothing reads as finished that is not, from the build plan and
+the design:
+
+1. **Item 9 has not run** — the route from inside a sandbox to the answer
+   service (above).
+2. **The per-route access policy is not enforced.** The design requires each
+   published port to name its listener, its destination port and its allowed
+   source, and to refuse every other caller including the local network, with
+   the negative probes made and repeated after a restart. This bundle publishes
+   two ports and does not yet establish that policy, so the factory gateway
+   address must be a **private** address of the machine until it does.
+3. **api_test's bootstrap has not been refreshed** from Forge's template.
+4. **Recovery after a sandbox-daemon restart is unproven** — the daemon is
+   shared with live sandboxes, so it needs the owner present.
+5. **The two-machine acceptance has not been run**: the same images on a clean
+   local machine and on a cloud machine, both digest lists identical.
+6. **Codex's sign-off, and the owner's go.** Nothing here is rollout approval.
+
+## Why the bus's image is not in the release manifest
+
+`../../release/manifest.yaml` is where a release's images belong, and the bus's
+is not there yet. The manifest and its build script have **one** build-context
+root — every image's Dockerfile is a path inside the clone of the repository
+the release is cut from — and **one** base image digest that every Dockerfile
+of the release must start FROM. The bus is a different repository and starts
+FROM a NATS base rather than the Python one, so putting it in the manifest
+means changing what a release *is*: per-image context roots and per-image
+bases. That is a real change to the release script and to the meaning of the
+release's labels, and it deserves a pass of its own rather than a corner of
+this one.
+
+Until then the pin lives in `estate-pins.conf`, the images are tagged with the
+**same release version** as the release images, and a test holds all four image
+lines in `.env.example` to the manifest's version. So the estate still moves as
+one release and nothing here is unpinned — but the bus's pin is advanced by
+hand, in a second file, and that is the cost of leaving it out.
+
+## Bring it down
+
+```
+docker compose --env-file .env down          # keeps the volumes
+docker compose --env-file .env down -v       # and removes them — the record with them
+```
+
+`down -v` removes the record. On a real machine that is never what you want.
+It does **not** remove the volume holding the bus's own config, which belongs
+to the release rather than to the run; `docker volume rm` removes that, the
+same as removing an image.
+
+## One more thing worth knowing
+
+**Compose prefers the shell's own environment over `--env-file`.** If your
+shell exports one of the names in `.env` — a `FORGE_NATS_URL` from an old
+habit, say — that value is what gets used and `.env` is silently ignored for
+it. That is also exactly how the bus's passwords reach the estate, which is why
+it is worth understanding rather than working around. Bring the estate up from
+a clean shell.

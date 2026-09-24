@@ -1,0 +1,563 @@
+#!/usr/bin/env bash
+# ---------------------------------------------------------------------------
+# estate-check — is this machine fit to run the estate, and is the estate
+# running properly once it has started.
+#
+# TWO MODES, because some things must be true BEFORE anything starts and
+# others can only be true after:
+#
+#   estate-check host       run it before 'docker compose up'
+#   estate-check services   run it after
+#
+# Each item prints ONE plain sentence saying what was looked for, where, and
+# what to do about it. Anything that is not a pass — a failure, or an item this
+# machine could not check — makes the whole run NOT PASSED and the exit code
+# non-zero, because a gate that has not been met is not met.
+#
+# It never prints the value of a secret. Where an address carries a password it
+# is printed with the password replaced by '***'.
+#
+# The items are the ones in section 3 of
+# docs/factory-containerisation-design-pass-2026-09-23.md, numbered as that
+# section numbers them. 'estate-check --items' prints the list, and a test
+# holds the list to the design so nobody drops one quietly.
+#
+#   --env-file FILE   the estate's env file (default: .env beside this script)
+#   --project NAME    the compose project name, if it is not the default
+#   --items           print the item list and stop
+# ---------------------------------------------------------------------------
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+ENV_FILE="${HERE}/.env"
+PROJECT=""
+MODE=""
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        host|services) MODE="$1"; shift ;;
+        --env-file)    ENV_FILE="${2:?--env-file needs a file}"; shift 2 ;;
+        --project)     PROJECT="${2:?--project needs a name}"; shift 2 ;;
+        --items)       MODE="items"; shift ;;
+        --help|-h)     sed -n '2,27p' "${BASH_SOURCE[0]}"; exit 0 ;;
+        *)             printf 'estate-check: unknown argument "%s". Try --help.\n' "$1" >&2; exit 2 ;;
+    esac
+done
+
+# ---------------------------------------------------------------------------
+# THE ITEM LIST. One line each: mode, number, name, and the sentence from the
+# design that the item comes from. This is the list --items prints and the list
+# the test holds to the design.
+# ---------------------------------------------------------------------------
+ITEMS=(
+"host|1|machine-qualifies-for-a-sandbox|a supported operating system and processor architecture, and hardware virtualisation available to this user"
+"host|2|docker-is-here-and-answering|Docker is installed and its daemon answers, docker compose is present, and a Docker sign-in is reported present or absent"
+"host|3|sandbox-tool-and-its-daemon|the sbx tool is installed, its version matches the one the release was proven against, and its daemon answers on its socket"
+"host|4|release-images-present-or-fetchable|the release images are present, or can be fetched, at the tags the env file names"
+"host|5|volumes-and-disk-room|the declared volumes exist or can be created, and the disk has room"
+"host|6|secret-files-present-and-private|every secret file the env file names exists and is readable by its own service's user and by nobody else"
+"host|7|every-setting-name-has-a-value|every setting name the composed files require has a value"
+"services|8|the-bus-answers|the bus answers at the address the env file gives"
+"services|8b|the-buses-storage-is-provisioned|the bus's key-value buckets and streams exist, asked of the bus itself"
+"services|8c|the-memory-service-answers|the memory service answers at the address the env file gives"
+"services|8d|the-model-seat-answers|the model seat answers at the address the env file gives"
+"services|8e|the-coordinator-answers|the coordinator answers on its own health route"
+"services|8f|the-answer-service-answers|the answer service answers for a build nobody wrote down"
+"services|8g|the-publisher-is-reachable-from-the-coordinator-only|the publisher answers the coordinator and refuses everything else"
+"services|9|the-answer-service-from-inside-a-sandbox|the coordinator's answer service answers FROM INSIDE a sandbox at the address the sandbox profile allows"
+)
+
+if [ "${MODE}" = "items" ]; then
+    for row in "${ITEMS[@]}"; do
+        IFS='|' read -r m n name sentence <<< "${row}"
+        printf '%-8s %-3s %-46s %s\n' "${m}" "${n}" "${name}" "${sentence}"
+    done
+    exit 0
+fi
+
+[ -n "${MODE}" ] || { printf 'estate-check: say which check — "host" before starting, "services" after. Try --help.\n' >&2; exit 2; }
+
+# ---------------------------------------------------------------------------
+# The env file, read the way compose reads it: KEY=VALUE, '#' comments, and a
+# ${NAME} in a value filled in from the environment or from a line above it.
+# The shell's own environment wins, exactly as it does for compose — which is
+# worth knowing, because that is how a stray exported name silently replaces a
+# line in this file.
+# ---------------------------------------------------------------------------
+declare -A ENVV=()
+
+value_of() {
+    local name="$1"
+    if [ -n "${!name:-}" ]; then printf '%s' "${!name}"; return; fi
+    printf '%s' "${ENVV[$name]:-}"
+}
+
+expand() {
+    local s="$1" out="" name v
+    while [[ "${s}" =~ ^([^\$]*)\$\{([A-Za-z_][A-Za-z0-9_]*)(:\-([^}]*))?\}(.*)$ ]]; do
+        out+="${BASH_REMATCH[1]}"
+        name="${BASH_REMATCH[2]}"
+        v="$(value_of "${name}")"
+        if [ -z "${v}" ] && [ -n "${BASH_REMATCH[3]}" ]; then v="${BASH_REMATCH[4]}"; fi
+        out+="${v}"
+        s="${BASH_REMATCH[5]}"
+    done
+    printf '%s' "${out}${s}"
+}
+
+read_env_file() {
+    local file="$1" line name value
+    [ -f "${file}" ] || return 1
+    while IFS= read -r line || [ -n "${line}" ]; do
+        case "${line}" in ''|'#'*) continue ;; esac
+        case "${line}" in *=*) ;; *) continue ;; esac
+        name="${line%%=*}"
+        value="${line#*=}"
+        name="${name#"${name%%[![:space:]]*}"}"
+        name="${name%"${name##*[![:space:]]}"}"
+        case "${name}" in export\ *) name="${name#export }" ;; esac
+        [[ "${name}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+        # surrounding quotes, as compose strips them
+        if [ "${value:0:1}" = '"' ] && [ "${value: -1}" = '"' ] && [ ${#value} -ge 2 ]; then
+            value="${value:1:${#value}-2}"
+        elif [ "${value:0:1}" = "'" ] && [ "${value: -1}" = "'" ] && [ ${#value} -ge 2 ]; then
+            value="${value:1:${#value}-2}"
+        fi
+        ENVV["${name}"]="$(expand "${value}")"
+    done < "${file}"
+}
+
+if ! read_env_file "${ENV_FILE}"; then
+    printf 'estate-check: there is no env file at %s. Copy .env.example to .env and fill in the lines marked CHANGE THIS.\n' "${ENV_FILE}" >&2
+    exit 2
+fi
+
+get() { value_of "$1"; }
+
+# An address with a password in it, said out loud safely.
+redact() {
+    printf '%s' "$1" | sed -E 's#(://[^:/@]+):[^@/]*@#\1:***@#'
+}
+
+# ---------------------------------------------------------------------------
+# Reporting
+# ---------------------------------------------------------------------------
+PASSES=0
+FAILURES=0
+UNCHECKED=0
+
+ok()        { PASSES=$((PASSES+1));     printf '  ok            %-4s %s\n' "$1" "$2"; }
+fail()      { FAILURES=$((FAILURES+1)); printf '  NOT PASSED    %-4s %s\n' "$1" "$2"; }
+unchecked() { UNCHECKED=$((UNCHECKED+1)); printf '  not checked   %-4s not checked here: %s\n' "$1" "$2"; }
+
+finish() {
+    printf '\n'
+    if [ "${FAILURES}" -eq 0 ] && [ "${UNCHECKED}" -eq 0 ]; then
+        printf 'PASSED — %s items, all of them.\n' "${PASSES}"
+        exit 0
+    fi
+    printf 'NOT PASSED — %s passed, %s failed, %s could not be checked on this machine.\n' \
+        "${PASSES}" "${FAILURES}" "${UNCHECKED}"
+    printf 'An item that could not be checked is not a pass: the gate is met when every item runs for real.\n'
+    exit 1
+}
+
+# ---------------------------------------------------------------------------
+# THE CHECK BEFORE ANYTHING STARTS
+# ---------------------------------------------------------------------------
+check_host() {
+    printf 'estate-check host — this machine, before anything starts (env file: %s)\n\n' "${ENV_FILE}"
+
+    # --- 1 -----------------------------------------------------------------
+    local system arch platform supported found
+    system="$(uname -s)"; arch="$(uname -m)"; platform="${system}/${arch}"
+    supported="$(get ESTATE_SUPPORTED_PLATFORMS)"
+    found="no"
+    for candidate in ${supported}; do [ "${candidate}" = "${platform}" ] && found="yes"; done
+    if [ "${found}" != "yes" ]; then
+        fail 1 "this machine is ${platform}, and the release was proven on: ${supported:-nothing named in the env file}. A sandbox cannot be relied on here."
+    elif [ "${system}" != "Linux" ]; then
+        unchecked 1 "${platform} is supported, but this script only knows how to look for hardware virtualisation on Linux (/dev/kvm). Check the sandbox tool's own requirements for ${system}."
+    elif [ -r /dev/kvm ]; then
+        ok 1 "${platform} is supported and hardware virtualisation is available to this user (/dev/kvm is readable), so a sandbox can run here."
+    else
+        fail 1 "${platform} is supported, but /dev/kvm is not readable by this user, so a SANDBOX CANNOT RUN HERE. On a cloud machine that usually means nested virtualisation is switched off; on a local one, that this user is not in the kvm group."
+    fi
+
+    # --- 2 -----------------------------------------------------------------
+    local docker_ok="yes" detail=""
+    if ! command -v docker >/dev/null 2>&1; then
+        fail 2 "docker is not on this machine's PATH, so nothing can start."
+        docker_ok="no"
+    elif ! docker version --format '{{.Server.Version}}' >/dev/null 2>&1; then
+        fail 2 "docker is installed but its daemon does not answer, so nothing can start."
+        docker_ok="no"
+    elif ! docker compose version >/dev/null 2>&1; then
+        fail 2 "docker is answering but 'docker compose' is not present, and the estate is compose files."
+        docker_ok="no"
+    else
+        detail="docker $(docker version --format '{{.Server.Version}}'), $(docker compose version --short 2>/dev/null)"
+        if [ -n "$(docker system info --format '{{.Username}}' 2>/dev/null)" ]; then
+            detail="${detail}, a Docker sign-in is present"
+        else
+            detail="${detail}, no Docker sign-in (needed only if the sandbox tool asks for one)"
+        fi
+        ok 2 "Docker is installed and its daemon answers, and compose is here: ${detail}."
+    fi
+
+    # --- 3 -----------------------------------------------------------------
+    local want_sbx have_sbx
+    want_sbx="$(get ESTATE_SBX_VERSION)"
+    if ! command -v sbx >/dev/null 2>&1; then
+        fail 3 "the sandbox tool 'sbx' is not on this machine's PATH; a project with a sandbox cannot be built here."
+    else
+        have_sbx="$(sbx version 2>/dev/null | sed -n 's/.*version:[[:space:]]*\([^[:space:]]*\).*/\1/p' | head -1)"
+        [ -n "${have_sbx}" ] || have_sbx="unreadable"
+        if sbx daemon status 2>/dev/null | grep -qi '^Status:[[:space:]]*running'; then
+            if [ "${have_sbx}" = "${want_sbx}" ]; then
+                ok 3 "the sandbox tool is ${have_sbx}, which is the version this release was proven against, and its daemon answers on its socket."
+            else
+                fail 3 "the sandbox tool here is ${have_sbx} and this release was proven against ${want_sbx}. Its daemon answers, but this check does not guess whether a different version behaves the same; either match it or prove the estate against this one and change ESTATE_SBX_VERSION."
+            fi
+        else
+            fail 3 "the sandbox tool is installed (${have_sbx}) but its daemon does not answer on its socket, so no sandbox can be started, held awake or reached."
+        fi
+    fi
+
+    # --- 4 -----------------------------------------------------------------
+    if [ "${docker_ok}" = "yes" ]; then
+        local missing="" fetchable="" image
+        for name in FORGE_IMAGE FORGE_PUBLISHER_IMAGE NATS_IMAGE NATS_PROVISION_IMAGE; do
+            image="$(get "${name}")"
+            if [ -z "${image}" ]; then
+                missing="${missing} ${name}=<nothing set>"
+            elif docker image inspect "${image}" >/dev/null 2>&1; then
+                :
+            elif docker manifest inspect "${image}" >/dev/null 2>&1; then
+                fetchable="${fetchable} ${image}"
+            else
+                missing="${missing} ${image}"
+            fi
+        done
+        local volume
+        volume="$(get BUS_SOURCE_VOLUME)"
+        if [ -n "${volume}" ] && ! docker volume inspect "${volume}" >/dev/null 2>&1; then
+            missing="${missing} the-volume-${volume}"
+        fi
+        if [ -n "${missing}" ]; then
+            fail 4 "these are not on this machine and cannot be fetched:${missing}. Build the release with scripts/build-release-image.sh and the estate's own two with ./build-estate-images.sh, or point the env file at tags that exist."
+        elif [ -n "${fetchable}" ]; then
+            ok 4 "every image the env file names is here or can be fetched; these would be fetched on first start:${fetchable}."
+        else
+            ok 4 "all four images the env file names are on this machine, and so is the volume holding the bus's own config."
+        fi
+    else
+        unchecked 4 "docker does not answer, so the images could not be looked for."
+    fi
+
+    # --- 5 -----------------------------------------------------------------
+    if [ "${docker_ok}" = "yes" ]; then
+        local root free_gb want_gb existing=0 declared=0
+        want_gb="$(get ESTATE_DISK_FREE_GB)"; want_gb="${want_gb:-0}"
+        root="$(docker system info --format '{{.DockerRootDir}}' 2>/dev/null)"
+        for v in $(compose_volume_names); do
+            declared=$((declared+1))
+            docker volume inspect "${v}" >/dev/null 2>&1 && existing=$((existing+1))
+        done
+        free_gb="$(df -BG --output=avail "${root}" 2>/dev/null | tail -1 | tr -dc '0-9')"
+        if [ -z "${free_gb}" ]; then
+            unchecked 5 "the free space where Docker keeps its storage could not be read."
+        elif [ "${free_gb}" -lt "${want_gb}" ]; then
+            fail 5 "${declared} volumes are declared (${existing} already exist, the rest are created at first start), but where Docker keeps its storage there is ${free_gb}GB free and this release asks for ${want_gb}GB."
+        else
+            ok 5 "${declared} volumes are declared (${existing} already exist, the rest are created at first start), and there is ${free_gb}GB free where Docker keeps its storage, above the ${want_gb}GB this release asks for."
+        fi
+    else
+        unchecked 5 "docker does not answer, so the volumes and the disk could not be looked at."
+    fi
+
+    # --- 6 -----------------------------------------------------------------
+    local files owner bad="" absent="" mode uid
+    files="$(get ESTATE_SECRET_FILES)"
+    owner="$(get ESTATE_SECRET_OWNER_UID)"
+    if [ -z "${files}" ]; then
+        fail 6 "the env file names no secret files at all (ESTATE_SECRET_FILES is empty), and the estate needs at least the bus's accounts and the publisher's credential."
+    else
+        for f in ${files}; do
+            if [ ! -e "${f}" ]; then absent="${absent} ${f}"; continue; fi
+            mode="$(stat -c '%a' "${f}" 2>/dev/null || stat -f '%Lp' "${f}" 2>/dev/null)"
+            uid="$(stat -c '%u' "${f}" 2>/dev/null || stat -f '%u' "${f}" 2>/dev/null)"
+            [ "${uid}" = "${owner}" ] || bad="${bad} ${f}(owned by uid ${uid}, not ${owner})"
+            case "${mode}" in
+                *[1-7][0-7]|*[0-7][1-7]) bad="${bad} ${f}(mode ${mode}: others can read it)" ;;
+            esac
+        done
+        if [ -n "${absent}" ] || [ -n "${bad}" ]; then
+            fail 6 "secret files:${absent:+ missing:${absent}}${bad:+ wrong:${bad}}. Nothing here opened a file or printed anything out of one."
+        else
+            ok 6 "every secret file the env file names is present and readable only by uid ${owner}. Nothing here opened one or printed anything out of one."
+        fi
+    fi
+
+    # --- 7 -----------------------------------------------------------------
+    local required unset_names="" v
+    required="$(required_setting_names)"
+    for name in ${required}; do
+        v="$(value_of "${name}")"
+        [ -n "${v}" ] || unset_names="${unset_names} ${name}"
+    done
+    if [ -n "${unset_names}" ]; then
+        fail 7 "the composed files require these setting names and nothing set them:${unset_names}. A password name among them means the command was not run the way README.md says, with the values passed in from a child process."
+    else
+        ok 7 "every setting name the composed files require has a value ($(printf '%s' "${required}" | wc -w) of them), including the ones whose values are passed in rather than written down."
+    fi
+
+    finish
+}
+
+# Every ${NAME:?...} in the files the estate composes: the names that have no
+# default and that compose refuses to render without. Also every ${NAME} the
+# env file's own values are built out of, which is where the bus's account
+# passwords come in.
+required_setting_names() {
+    local files=(
+        "${HERE}/compose.yaml"
+        "${HERE}/../compose/compose.yaml"
+        "${HERE}/../compose/compose.sandbox-runner.yaml"
+        "${HERE}/../../src/forge/publisher/compose-fragment.yml"
+    )
+    local present=()
+    for f in "${files[@]}"; do [ -f "${f}" ] && present+=("${f}"); done
+    # A comment is not a setting. These files explain themselves at length and
+    # write names in their prose; only the lines that compose acts on count.
+    {
+        if [ ${#present[@]} -gt 0 ]; then
+            /bin/grep -hv '^[[:space:]]*#' "${present[@]}" 2>/dev/null \
+                | /bin/grep -o '\${[A-Za-z_][A-Za-z0-9_]*:?' \
+                | sed 's/^\${//; s/:?$//'
+        fi
+        /bin/grep -hv '^[[:space:]]*#' "${ENV_FILE}" 2>/dev/null \
+            | /bin/grep -o '\${[A-Za-z_][A-Za-z0-9_]*}' \
+            | sed 's/^\${//; s/}$//'
+    } | sort -u
+}
+
+# The volumes as DOCKER will know them, not as the compose file keys them: a
+# compose-managed volume is named after the project, and an external one keeps
+# its own name. 'config --volumes' prints the keys, so this reads the rendered
+# document instead and takes each volume's real name.
+compose_volume_names() {
+    docker compose --env-file "${ENV_FILE}" -f "${HERE}/compose.yaml" \
+        ${PROJECT:+--project-name "${PROJECT}"} config 2>/dev/null \
+    | awk '
+        /^volumes:$/ { inside = 1; next }
+        /^[a-z]/     { inside = 0 }
+        inside && $1 == "name:" { print $2 }
+    '
+}
+
+# ---------------------------------------------------------------------------
+# THE CHECK AFTER IT HAS STARTED
+# ---------------------------------------------------------------------------
+dc() {
+    docker compose --env-file "${ENV_FILE}" -f "${HERE}/compose.yaml" \
+        ${PROJECT:+--project-name "${PROJECT}"} "$@"
+}
+
+container_of() { dc ps -q "$1" 2>/dev/null | head -1; }
+
+check_services() {
+    printf 'estate-check services — the estate, after it has started (env file: %s)\n\n' "${ENV_FILE}"
+
+    local coordinator answer bus
+    coordinator="$(container_of coordinator)"
+    answer="$(container_of answer-service)"
+    bus="$(container_of nats)"
+
+    # --- 8 -----------------------------------------------------------------
+    local bus_host bus_url
+    bus_url="$(get FORGE_NATS_URL)"
+    bus_host="$(printf '%s' "${bus_url}" | sed -E 's#^[a-z]+://##; s#^[^@]*@##; s#[:/].*$##')"
+    if [ -z "${bus}" ]; then
+        fail 8 "the bus is not running in this estate, so nothing could ask it anything."
+    elif docker exec "${bus}" wget --spider -q "http://localhost:8222/healthz" >/dev/null 2>&1; then
+        ok 8 "the bus answers, at the address the env file gives ($(redact "${bus_url}"))."
+    else
+        fail 8 "the bus is running but does not answer its own health route, so nothing on the estate can use it."
+    fi
+
+    # --- 8b ----------------------------------------------------------------
+    check_bus_storage
+
+    # --- 8c / 8d -----------------------------------------------------------
+    check_named_address 8c "the memory service" "$(get FLEET_MEMORY_URL)" "${coordinator}"
+    check_named_address 8d "the model seat"     "$(get MODEL_SEAT_URL)"   "${coordinator}"
+
+    # --- 8e ----------------------------------------------------------------
+    local code
+    if [ -z "${coordinator}" ]; then
+        fail 8e "the coordinator is not running in this estate."
+    else
+        code="$(docker exec "${coordinator}" curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/healthz 2>/dev/null)"
+        if [ "${code}" = "200" ]; then
+            ok 8e "the coordinator answers its own health route with 200, which it only does once its subscription to the bus is live."
+        else
+            fail 8e "the coordinator answered its health route with ${code:-nothing}. It answers 503 until its subscription to the bus is live, so this usually means the bus."
+        fi
+    fi
+
+    # --- 8f ----------------------------------------------------------------
+    local port answer_url body
+    port="$(get FORGE_ANSWER_PORT)"
+    answer_url="http://answer-service:8126/recorded?build=a-build-nobody-ever-queued"
+    if [ -z "${answer}" ] || [ -z "${coordinator}" ]; then
+        fail 8f "the answer service or the coordinator is not running, so the read-only answer could not be asked for."
+    else
+        body="$(docker exec "${coordinator}" curl -s -w ' HTTP %{http_code}' "${answer_url}" 2>/dev/null)"
+        if printf '%s' "${body}" | grep -q 'HTTP 200' && printf '%s' "${body}" | grep -qi 'false'; then
+            ok 8f "the answer service answers for a build nobody wrote down — it says so rather than failing (asked at ${answer_url}, published for a sandbox at $(get FACTORY_GATEWAY_ADDRESS):${port})."
+        else
+            fail 8f "the answer service did not give a plain answer for an unknown build; it said: ${body:-nothing}."
+        fi
+    fi
+
+    # --- 8g ----------------------------------------------------------------
+    local publisher_url from_coordinator from_elsewhere
+    publisher_url="$(get FORGE_PUBLISHER_URL)"
+    if [ -z "${coordinator}" ] || [ -z "${answer}" ]; then
+        fail 8g "the coordinator or the answer service is not running, so who can reach the publisher could not be established."
+    else
+        from_coordinator="$(docker exec "${coordinator}" curl -s -o /dev/null --max-time 8 -w '%{http_code}' "${publisher_url}/healthz" 2>/dev/null)"
+        from_elsewhere="$(docker exec "${answer}" curl -s -o /dev/null --max-time 8 -w '%{http_code}' "${publisher_url}/healthz" 2>/dev/null)"
+        if [ "${from_coordinator}" = "200" ] && [ "${from_elsewhere}" != "200" ]; then
+            ok 8g "the publisher answers the coordinator (200 at ${publisher_url}) and refuses the answer service, which is on the factory network only — the coordinator is the only thing on both networks, and that is the whole route to the publisher."
+        elif [ "${from_coordinator}" != "200" ]; then
+            fail 8g "the coordinator could not reach the publisher at ${publisher_url} (it said ${from_coordinator:-nothing}), so the merge word would have nothing to hand a joined commit to."
+        else
+            fail 8g "the answer service CAN reach the publisher at ${publisher_url}, and nothing but the coordinator should be able to. The publisher holds the one credential that can write to a project's remote."
+        fi
+    fi
+
+    # --- 9 -----------------------------------------------------------------
+    check_from_inside_a_sandbox
+
+    finish
+}
+
+check_named_address() {
+    local number="$1" what="$2" url="$3" from="$4" code
+    if [ -z "${url}" ]; then
+        ok "${number}" "${what} is not named in the env file, so there is nothing to ask. It is not in this bundle yet — the README says which parts are still to come."
+        return
+    fi
+    if [ -z "${from}" ]; then
+        fail "${number}" "${what} is named (${url}) but the coordinator is not running, so nothing could ask it."
+        return
+    fi
+    code="$(docker exec "${from}" curl -s -o /dev/null --max-time 8 -w '%{http_code}' "${url}" 2>/dev/null)"
+    if [ -n "${code}" ] && [ "${code}" != "000" ]; then
+        ok "${number}" "${what} answers at the address the env file gives (${url}, HTTP ${code})."
+    else
+        fail "${number}" "${what} does not answer at ${url}, which is the address the env file gives."
+    fi
+}
+
+# Ask the BUS what buckets and streams it has, and compare that with what the
+# bus repository's own definitions say it should have. Both sides come from
+# somewhere other than this script: the factory does not keep its own list.
+check_bus_storage() {
+    local image volume network coordinator
+    image="$(get NATS_PROVISION_IMAGE)"
+    volume="$(get BUS_SOURCE_VOLUME)"
+    coordinator="$(container_of coordinator)"
+    [ -n "${coordinator}" ] || coordinator="$(container_of nats)"
+    if [ -z "${image}" ] || [ -z "${volume}" ] || [ -z "${coordinator}" ]; then
+        unchecked 8b "the estate is not running, or the env file names no provisioning image, so the bus could not be asked what it holds."
+        return
+    fi
+    network="$(docker inspect "${coordinator}" --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{"\n"}}{{end}}' 2>/dev/null | grep -- '_factory$\|^factory$' | head -1)"
+    if [ -z "${network}" ]; then
+        unchecked 8b "the factory network could not be identified, so the bus could not be asked what it holds."
+        return
+    fi
+    local out
+    out="$(docker run --rm --network "${network}" \
+            -e "NATS_URL=$(get NATS_PROVISION_URL)" \
+            -v "${volume}:/bus:ro" "${image}" '
+        set -euo pipefail
+        export XDG_CONFIG_HOME=/tmp/nats-config
+        have_streams="$(nats --server "$NATS_URL" stream ls -n 2>/dev/null | tr -d "\r")"
+        have_kv="$(nats --server "$NATS_URL" kv ls -n 2>/dev/null | tr -d "\r")"
+        missing=""
+        for want in $(jq -r ".streams[].name" /bus/streams/stream-definitions.json); do
+            printf "%s\n" "$have_streams" | grep -qx "$want" || missing="$missing stream:$want"
+        done
+        for want in $(jq -r ".kv_buckets[].name" /bus/kv/kv-definitions.json); do
+            printf "%s\n" "$have_kv" | grep -qx "$want" || missing="$missing bucket:$want"
+        done
+        n_s=$(printf "%s\n" "$have_streams" | grep -c . || true)
+        n_k=$(printf "%s\n" "$have_kv" | grep -c . || true)
+        if [ -n "$missing" ]; then
+            printf "MISSING %s | the bus holds %s streams and %s buckets\n" "$missing" "$n_s" "$n_k"
+        else
+            printf "ALL %s streams and %s key-value buckets\n" "$n_s" "$n_k"
+        fi
+    ' 2>&1 | tail -1)"
+    case "${out}" in
+        ALL*)
+            ok 8b "the bus's storage is provisioned: ${out#ALL } (a key-value bucket is a stream of its own, so it is counted twice), every one the bus repository's own definitions name."
+            ;;
+        MISSING*)
+            fail 8b "the bus is missing storage the bus repository's definitions name: ${out#MISSING }. The coordinator needs its agent-registry bucket and its PIPELINE stream to register at all, which is why the estate provisions the bus before the coordinator starts."
+            ;;
+        *)
+            fail 8b "the bus could not be asked what it holds: ${out}"
+            ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# ITEM 9 — the one this bundle cannot yet prove.
+#
+# The design's ninth item is the answer service reached FROM INSIDE a sandbox,
+# at the factory gateway address the sandbox's own profile allows. It is the
+# check that proves the route, and without it a project's deploy helper refuses
+# every deploy that names a commit.
+#
+# The probe below is real: it asks the sandbox named in the env file to fetch
+# the answer service at the gateway address. What it will not do is invent a
+# pass. With no sandbox named, or none of that name on this machine, it says so
+# and counts as NOT PASSED — the gate is met when this runs for real.
+# ---------------------------------------------------------------------------
+check_from_inside_a_sandbox() {
+    local name gateway port url out
+    name="$(get SANDBOX_NAME)"
+    gateway="$(get FACTORY_GATEWAY_ADDRESS)"
+    port="$(get FORGE_ANSWER_PORT)"
+    url="http://${gateway}:${port}/recorded?build=a-build-nobody-ever-queued"
+
+    if [ -z "${name}" ]; then
+        unchecked 9 "the env file names no sandbox (SANDBOX_NAME is empty), so nothing could be asked from inside one. Until this runs for real the route from a sandbox to the answer service is unproven, and a deploy helper inside a sandbox refuses every deploy that names a commit."
+        return
+    fi
+    if ! command -v sbx >/dev/null 2>&1; then
+        unchecked 9 "the sandbox tool is not on this machine, so nothing could be asked from inside the sandbox '${name}'."
+        return
+    fi
+    if ! sbx ls 2>/dev/null | grep -qw -- "${name}"; then
+        unchecked 9 "there is no sandbox called '${name}' on this machine, so the route from inside one to the answer service at ${url} was not tried."
+        return
+    fi
+    out="$(sbx exec "${name}" -- curl -s -o /dev/null --max-time 10 -w '%{http_code}' "${url}" 2>/dev/null | tail -1)"
+    if [ "${out}" = "200" ]; then
+        ok 9 "the answer service answers from inside the sandbox '${name}', at ${url} — the one route across the sandbox boundary that every planned deploy depends on."
+    else
+        fail 9 "the answer service did NOT answer from inside the sandbox '${name}' at ${url} (it said ${out:-nothing}). A deploy helper in there will refuse every deploy that names a commit, which is the safe side and which stops the factory deploying."
+    fi
+}
+
+case "${MODE}" in
+    host)     check_host ;;
+    services) check_services ;;
+esac

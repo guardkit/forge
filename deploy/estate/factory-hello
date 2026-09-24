@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+# ---------------------------------------------------------------------------
+# factory-hello — ask the coordinator, in its own container, what it can reach.
+#
+# One line each for the bus, the answer service, the publisher, and the two
+# addresses into a project's sandbox — the deploy helper and the build runner —
+# with THE ADDRESS IT USED on every line. The sandbox addresses come from the
+# coordinator's own settings file through its own loader, so what is printed is
+# what the coordinator would really dial, not what this script guessed.
+#
+# A line may honestly say "not reachable": on a machine with no sandbox the two
+# sandbox addresses are expected to, and that is printed rather than hidden.
+# Nothing here is a gate; estate-check is the gate.
+#
+#   --env-file FILE   the estate's env file (default: .env beside this script)
+#   --project NAME    the compose project name, if it is not the default
+# ---------------------------------------------------------------------------
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENV_FILE="${HERE}/.env"
+PROJECT=""
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --env-file) ENV_FILE="${2:?--env-file needs a file}"; shift 2 ;;
+        --project)  PROJECT="${2:?--project needs a name}"; shift 2 ;;
+        --help|-h)  sed -n '2,16p' "${BASH_SOURCE[0]}"; exit 0 ;;
+        *)          printf 'factory-hello: unknown argument "%s". Try --help.\n' "$1" >&2; exit 2 ;;
+    esac
+done
+
+CID="$(docker compose --env-file "${ENV_FILE}" -f "${HERE}/compose.yaml" \
+        ${PROJECT:+--project-name "${PROJECT}"} ps -q coordinator 2>/dev/null | head -1)"
+
+if [ -z "${CID}" ]; then
+    printf 'factory-hello: the coordinator is not running, so there is nobody to ask.\n' >&2
+    exit 1
+fi
+
+docker exec -i "${CID}" python - <<'PY'
+"""What the coordinator can reach, from inside the coordinator."""
+from __future__ import annotations
+
+import os
+import re
+import socket
+import urllib.error
+import urllib.parse
+import urllib.request
+
+TIMEOUT = 5.0
+
+# The answer service's name and port inside the estate's own network. Both are
+# the same on every machine: the service name is what the compose file calls
+# it, and the port is the one it listens on INSIDE its container. The port a
+# sandbox reaches it on is published separately, at the factory gateway
+# address, and is a setting.
+ANSWER_SERVICE = "http://answer-service:8126"
+
+
+def said_safely(address: str) -> str:
+    """An address with any password in it replaced, never printed."""
+    return re.sub(r"(://[^:/@]+):[^@/]*@", r"\1:***@", address)
+
+
+def line(what: str, verdict: str, address: str) -> None:
+    print(f"{what:<44} {verdict:<30} at {said_safely(address)}")
+
+
+def over_http(what: str, address: str, route: str = "/healthz") -> None:
+    url = address.rstrip("/") + route
+    try:
+        with urllib.request.urlopen(url, timeout=TIMEOUT) as answer:
+            line(what, f"reachable (HTTP {answer.status})", url)
+    except urllib.error.HTTPError as answer:
+        line(what, f"reachable (HTTP {answer.code})", url)
+    except Exception as why:  # noqa: BLE001 - the reason is the message
+        line(what, f"not reachable: {type(why).__name__}", url)
+
+
+def over_the_bus(address: str) -> None:
+    """The bus speaks first: a connection that is accepted says INFO."""
+    parsed = urllib.parse.urlparse(address)
+    host, port = parsed.hostname or "", parsed.port or 4222
+    try:
+        with socket.create_connection((host, port), timeout=TIMEOUT) as connected:
+            connected.settimeout(TIMEOUT)
+            greeting = connected.recv(64)
+        if greeting.startswith(b"INFO"):
+            line("the bus", "reachable (it said INFO)", address)
+        else:
+            line("the bus", "answered, but not as a bus does", address)
+    except Exception as why:  # noqa: BLE001
+        line("the bus", f"not reachable: {type(why).__name__}", address)
+
+
+print("The coordinator, from inside its own container:\n")
+
+over_the_bus(os.environ.get("FORGE_NATS_URL", ""))
+over_http("the answer service", ANSWER_SERVICE)
+over_http("the publisher", os.environ.get("FORGE_PUBLISHER_URL", ""))
+
+# The two addresses into a project's sandbox, resolved the way the coordinator
+# resolves them: its own settings file, through its own loader, which fills in
+# a ${NAME} from this container's environment and refuses by name if nothing
+# set one.
+try:
+    from forge.config.loader import load_config
+    from pathlib import Path
+
+    settings = load_config(Path("/etc/forge/forge.yaml"))
+    sandboxes = getattr(settings.planning, "sandboxes", {}) or {}
+    if not sandboxes:
+        print(
+            f"{'a sandbox':<44} none in the settings file, so no project has one here"
+        )
+    for project, entry in sandboxes.items():
+        over_http(f"helper [{entry.name}]", entry.sidecar_url)
+        over_http(f"runner [{entry.name}]", entry.runner_url)
+except Exception as why:  # noqa: BLE001
+    print(f"{'the sandbox addresses':<22} could not be read from the settings file: {why}")
+
+print(
+    "\n'not reachable' for a sandbox address is the honest answer on a machine "
+    "that looks after no sandbox."
+)
+PY
