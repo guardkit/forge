@@ -19,8 +19,17 @@ Use these patterns to execute clarification based on context.
 
 ```python
 import sys
-sys.path.insert(0, '/Users/richardwoollcott/.agentecflow/lib')
-sys.path.insert(0, '/Users/richardwoollcott/Projects/appmilla_github/guardkit/installer/core/commands/lib')
+from pathlib import Path
+
+# The installed payload resolver works for both wheels and editable installs,
+# even when this command is run from a different project's working directory.
+sys.path.insert(0, str(Path.home() / '.agentecflow' / 'lib'))
+try:
+    from guardkit.templates.resolver import resolve_installer_core_dir
+except ImportError:
+    pass  # A standalone agentecflow install uses the home library above.
+else:
+    sys.path.insert(0, str(resolve_installer_core_dir() / 'commands' / 'lib'))
 
 from clarification.core import ClarificationMode, ClarificationContext, should_clarify
 from clarification.generators.review_generator import generate_review_questions
@@ -290,10 +299,17 @@ clarification_context:
 
 ```python
 import sys
-sys.path.insert(0, '/Users/richardwoollcott/.agentecflow/lib')
-sys.path.insert(0, '/Users/richardwoollcott/Projects/appmilla_github/guardkit/installer/core/commands/lib')
-
 from pathlib import Path
+
+# The installed payload resolver works for both wheels and editable installs,
+# even when this command is run from a different project's working directory.
+sys.path.insert(0, str(Path.home() / '.agentecflow' / 'lib'))
+try:
+    from guardkit.templates.resolver import resolve_installer_core_dir
+except ImportError:
+    pass  # A standalone agentecflow install uses the home library above.
+else:
+    sys.path.insert(0, str(resolve_installer_core_dir() / 'commands' / 'lib'))
 from clarification.core import (
     ClarificationContext,
     ClarificationMode,

@@ -90,7 +90,9 @@ NAMES=(
   GUARDKIT_STAMP_MODEL GUARDKIT_STAMP_MODEL_MAX_TOKENS GUARDKIT_STAMP_MODEL_URL NODE_OPTIONS OPENAI_API_KEY OPENAI_BASE_URL
   PYTHONDONTWRITEBYTECODE PYTHONUNBUFFERED
 )
-ENV_FLAGS=""; for n in "${NAMES[@]}"; do ENV_FLAGS+=" -e $n"; done
+RUN_ARGS=(docker run -d --name forge-prod --network host --restart unless-stopped
+  --user forge --workdir /home/forge --entrypoint forge)
+for n in "${NAMES[@]}"; do RUN_ARGS+=(-e "$n"); done
 
 # The repositories the container can build in, straight from the repository map. One '-v' per
 # distinct checkout path; the map's two key spellings for the same repository collapse to one bind.
@@ -99,12 +101,13 @@ REPO_PATHS=$(uv run --frozen --no-sync --project "$FORGE_ROOT" forge repo-paths 
   echo "could not read the repository map from $FORGE_CONFIG ('forge repo-paths' failed) - refusing to recreate forge-prod" >&2
   exit 1
 }
-REPO_BINDS=""
+REPO_COUNT=0
 while IFS= read -r p; do
   [ -n "$p" ] || continue
-  REPO_BINDS+=" -v $p:$p:rw"
+  RUN_ARGS+=(-v "$p:$p:rw")
+  REPO_COUNT=$((REPO_COUNT + 1))
 done <<< "$REPO_PATHS"
-[ -n "$REPO_BINDS" ] || {
+[ "$REPO_COUNT" -gt 0 ] || {
   echo "the repository map in $FORGE_CONFIG names no checkouts, so forge-prod would have nowhere to build - refusing" >&2
   exit 1
 }
@@ -114,10 +117,21 @@ done <<< "$REPO_PATHS"
 FORGE_STATE_DIR="${FORGE_STATE_DIR:-$HOME/forge-state}"
 FORGE_PROD_HOME_STATE="${FORGE_PROD_HOME_STATE:-$HOME/forge-prod-state/.forge}"
 
-RUN="docker run -d --name forge-prod --network host --restart unless-stopped --user forge --workdir /home/forge --entrypoint forge${ENV_FLAGS}${REPO_BINDS} \
- -v $FORGE_STATE_DIR:/var/forge:rw \
- -v $FORGE_PROD_HOME_STATE:/home/forge/.forge:rw \
- $IMAGE --config /var/forge/forge.yaml serve"
+RUN_ARGS+=(-v "$FORGE_STATE_DIR:/var/forge:rw"
+  -v "$FORGE_PROD_HOME_STATE:/home/forge/.forge:rw"
+  "$IMAGE" --config /var/forge/forge.yaml serve)
+
+# sops exec-env takes shell text. Preserve each argument, including spaces and
+# literal shell characters in configured paths, using POSIX shell quoting.
+# Simple words stay readable in DRY_RUN; this is also the command sops runs.
+RUN=""
+for arg in "${RUN_ARGS[@]}"; do
+  case "$arg" in
+    ''|*[!a-zA-Z0-9_@%+=:,./-]*)
+      arg="'${arg//\'/\'\\\'\'}'" ;;
+  esac
+  RUN+="${RUN:+ }$arg"
+done
 
 if [ "${DRY_RUN:-0}" = "1" ]; then echo "$RUN"; exit 0; fi
 

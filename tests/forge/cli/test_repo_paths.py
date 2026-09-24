@@ -18,6 +18,8 @@ settings-of-record file is a stub under ``tmp_path``, and a fake ``docker`` on
 from __future__ import annotations
 
 import os
+import json
+import shlex
 import subprocess
 from pathlib import Path
 
@@ -368,3 +370,30 @@ def test_the_script_refuses_when_the_map_names_no_checkouts(tmp_path):
     assert result.returncode == 1
     assert "names no checkouts" in result.stderr
     assert not (tmp_path / "docker-was-called").exists()
+
+
+def test_recreate_preserves_configured_paths_as_single_literal_arguments(tmp_path):
+    repo = tmp_path / "checkouts with spaces" / "repo 'quoted' $(false)"
+    config = _write_config(tmp_path, "permissions:\n  filesystem:\n    allowlist: [/tmp]\nplanning:\n  target_repo_paths:\n    team/repo: " + json.dumps(str(repo)) + "\n")
+    env = _script_env(tmp_path, config)
+    state = tmp_path / "state 'quoted' $(false)"
+    home_state = tmp_path / "home state"
+    env.update(FORGE_STATE_DIR=str(state), FORGE_PROD_HOME_STATE=str(home_state))
+    result = subprocess.run(["bash", str(RECREATE_SCRIPT)], env=env, cwd=tmp_path,
+                            capture_output=True, text=True, timeout=300)
+    assert result.returncode == 0, result.stderr
+    # Execute the printed command through the shell sops uses, but only a fake
+    # Docker can run. This catches both word splitting and shell substitution.
+    argv_file = tmp_path / "argv.json"
+    docker = tmp_path / "bin" / "docker"
+    docker.write_text("#!/usr/bin/env python3\nimport json, os, sys\n"
+                      "open(os.environ['ARGV_FILE'], 'w').write(json.dumps(sys.argv[1:]))\n")
+    env["ARGV_FILE"] = str(argv_file)
+    invoked = subprocess.run(["sh", "-c", result.stdout], env=env, cwd=tmp_path,
+                             capture_output=True, text=True, timeout=30)
+    assert invoked.returncode == 0, invoked.stderr
+    args = json.loads(argv_file.read_text())
+    assert args == shlex.split(result.stdout)[1:]
+    binds = [args[i + 1] for i, value in enumerate(args[:-1]) if value == "-v"]
+    assert binds == [f"{repo}:{repo}:rw", f"{state}:/var/forge:rw",
+                     f"{home_state}:/home/forge/.forge:rw"]
