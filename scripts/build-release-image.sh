@@ -21,7 +21,9 @@
 #     branch (release/manifest.yaml);
 #   * each repository is fetched fresh from GitHub at that exact commit into a
 #     brand-new temporary folder, and the clone is refused if it lands on any
-#     other commit;
+#     other commit, or if that commit is not on the branch the manifest names
+#     (a host serves any commit by its sha, so without that second check the
+#     branch written into the image's labels would be a claim nobody tested);
 #   * the image is built from those clones ALONE — no directory beside this
 #     script, or beside the working directory, is read;
 #   * the resulting image is tagged by the commit it was built from and by the
@@ -32,10 +34,10 @@
 #     already exists. A floating tag is the thing this whole path is replacing.
 #
 # The only things a machine needs to run this: this script, the manifest,
-# Docker (with buildx), and network access to GitHub. All five repositories
-# are public, so no credential is involved; git is run with prompting disabled
-# so that if anything ever DOES ask for one, the build stops loudly instead of
-# hanging.
+# Docker (with buildx), git, awk, and either sha256sum (Linux) or shasum
+# (macOS) for the manifest's own hash. All five repositories are public, so no
+# credential is involved; git is run with prompting disabled so that if
+# anything ever DOES ask for one, the build stops loudly instead of hanging.
 #
 # Usage:
 #   build-release-image.sh [manifest-path] [options]
@@ -54,7 +56,8 @@
 #                          nothing is built, no tag is written.
 #
 # Exit status is non-zero, with a sentence saying which input was wrong, on any
-# drift: a commit that cannot be fetched, a clone at the wrong commit, a
+# drift: a commit that cannot be fetched, a clone at the wrong commit, a commit
+# that is not on the branch the manifest names, a branch that does not exist, a
 # repository missing from the manifest, a base image digest that no longer
 # matches the Dockerfile, or a tag that already exists.
 # ---------------------------------------------------------------------------
@@ -85,7 +88,7 @@ while [ "$#" -gt 0 ]; do
         --skip-proof) RUN_PROOF=0; shift ;;
         --plan-only) PLAN_ONLY=1; shift ;;
         --receipt) [ "$#" -ge 2 ] || die "--receipt needs a path"; RECEIPT="$2"; shift 2 ;;
-        -h|--help) sed -n '1,60p' "$0"; exit 0 ;;
+        -h|--help) sed -n '1,63p' "$0"; exit 0 ;;
         -*) die "unknown option: $1" ;;
         *) [ -z "${MANIFEST}" ] || die "more than one manifest given: ${MANIFEST} and $1"; MANIFEST="$1"; shift ;;
     esac
@@ -98,9 +101,19 @@ MANIFEST="$(cd "$(dirname "${MANIFEST}")" && pwd)/$(basename "${MANIFEST}")"
 command -v docker >/dev/null 2>&1 || die "docker is not on PATH; this script cannot build an image without it."
 command -v git   >/dev/null 2>&1 || die "git is not on PATH; this script cannot fetch the pinned commits without it."
 command -v awk   >/dev/null 2>&1 || die "awk is not on PATH; this script reads the manifest with it."
-command -v sha256sum >/dev/null 2>&1 || die "sha256sum is not on PATH; the manifest's own hash goes into the image's labels."
+# The manifest's own hash goes into the image's labels. Linux spells the tool
+# sha256sum and macOS spells it `shasum -a 256`; both print the same 64
+# characters, so either will do and the script says so rather than telling a
+# Mac it is missing something.
+if command -v sha256sum >/dev/null 2>&1; then
+    hash_of() { sha256sum "$1" | cut -c1-64; }
+elif command -v shasum >/dev/null 2>&1; then
+    hash_of() { shasum -a 256 "$1" | cut -c1-64; }
+else
+    die "neither sha256sum nor shasum is on PATH, so the manifest's own hash cannot be taken, and the image could not record which manifest it was built from. Install GNU coreutils, or use a machine that has shasum."
+fi
 
-MANIFEST_SHA="$(sha256sum "${MANIFEST}" | cut -c1-64)"
+MANIFEST_SHA="$(hash_of "${MANIFEST}")"
 
 # ---------------------------------------------------------------------------
 # Read the manifest.
@@ -261,6 +274,43 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Is the pinned commit actually ON the branch the manifest says it came from?
+#
+# This is not the same question as "does the commit exist". A host serves any
+# commit it can reach by its sha, whatever branch it sits on, so without this
+# check a commit from a side branch — or one that has since left main — would
+# be fetched, would match its pin, and would be labelled `branch: main` as
+# though that had been confirmed. Nothing untrue about the image's CONTENTS
+# could get through that way; an untrue branch label could, and a label nobody
+# checks is worse than no label.
+#
+# The cheap case is the common one: the pin IS the branch tip, which one
+# ls-remote settles without fetching anything more. Otherwise the branch is
+# deepened a step at a time until the commit is inside what was fetched, and
+# merge-base answers. (A shallow clone cannot answer this: history stops at the
+# graft, and everything beyond it looks unrelated. Hence the deepening.)
+verify_on_branch() {
+    local name="$1" url="$2" branch="$3" commit="$4" dest="$5"
+    local tip depth
+    tip="$(git -C "${dest}" ls-remote origin "refs/heads/${branch}" 2>/dev/null | awk 'NR==1 {print $1}')" \
+        || die "could not ask ${url} which commit ${branch} is at, so the manifest's branch for ${name} could not be checked."
+    [ -n "${tip}" ] \
+        || die "the manifest says ${name}'s commit came from branch ${branch}, and ${url} has no branch of that name. A release records where each commit came from; it does not guess."
+    if [ "${tip}" = "${commit}" ]; then
+        say "    ok ${name} ${commit} is the tip of ${branch}"
+        return 0
+    fi
+    for depth in 50 500 5000 2147483647; do
+        git -C "${dest}" fetch --quiet --depth "${depth}" --no-tags origin \
+            "+refs/heads/${branch}:refs/remotes/origin/${branch}" 2>/dev/null || true
+        if git -C "${dest}" merge-base --is-ancestor "${commit}" "refs/remotes/origin/${branch}" 2>/dev/null; then
+            say "    ok ${name} ${commit} is on ${branch}, behind its tip ${tip}"
+            return 0
+        fi
+    done
+    die "the manifest says ${name}'s commit ${commit} came from ${branch}, and it is not on that branch at ${url} (${branch} is at ${tip}). The commit itself exists — the host served it — so it sits on some other branch, or it has since left ${branch}. Refusing to build: the image would carry a label saying ${branch} for code that did not come from there."
+}
+
 fetch_pinned() {
     local name="$1" url="$2" branch="$3" commit="$4" dest="$5"
     say "  fetching ${name} @ ${commit} (${branch}) from ${url}"
@@ -282,6 +332,7 @@ fetch_pinned() {
     [ "${landed}" = "${commit}" ] \
         || die "the fresh clone of ${name} landed on ${landed}, and the manifest pins ${commit}. Refusing to build: an image built from a different commit than the one recorded is the whole failure this path exists to prevent."
     say "    ok ${name} at ${landed}"
+    verify_on_branch "${name}" "${url}" "${branch}" "${commit}" "${dest}"
 }
 
 say "Fetching the pinned commits into ${TMP}"
