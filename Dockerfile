@@ -265,6 +265,53 @@ RUN curl -fsSL "https://github.com/Orange-OpenSource/hurl/releases/download/${HU
     && rm -rf /var/lib/apt/lists/* /tmp/hurl.deb \
     && hurl --version | grep -q "hurl ${HURL_VERSION}"
 
+# ---------------------------------------------------------------------------
+# THE DOCKER CLIENT — THE COMMAND ONLY, AND NEVER A DAEMON
+# 2026-09-24, stage 4e of the containerisation rollout gate.
+#
+# WHY THE FACTORY NEEDS THIS, and it is the factory's own need and not any
+# project's. One of the two services that run from this image is the DEPLOY
+# HELPER, and the helper's whole job is to run the deploy, health-check and
+# live-gate commands A PROJECT DECLARES in its own profile — whatever they are.
+# The factory does not know or care what a project's deploy is written in; it
+# knows only that it runs the project's own vetted script. A great many
+# projects deploy by bringing containers up, so the helper has to be able to
+# run a `docker` command when a project's declared deploy uses one. Nothing
+# here names a project, a language, a test runner or a package manager, and no
+# project is required to use containers: this is the factory being able to run
+# what it is handed.
+#
+# From stage 4d the helper runs inside a project's Docker Sandbox, and the
+# bootstrap there (src/forge/cli/deploy_templates/sandbox-runner.sh) binds THE
+# SANDBOX'S OWN engine socket into the helper's container for exactly this.
+# Until this layer existed that socket had nothing in the image to use it, and
+# a project whose deploy runs containers failed inside the helper — the stage
+# 4d reviewer confirmed `command -v docker` in the release image found nothing.
+#
+# WHAT IS INSTALLED, AND WHAT IS NOT. Only `docker`, the client: one static
+# binary lifted out of Docker's own static release tarball, pinned by version
+# and verified against the sha256 recorded here before anything is unpacked.
+# The tarball also holds `dockerd`, `containerd`, `runc`, `ctr`,
+# `docker-proxy`, `docker-init` and the runc shim, and NONE of them is
+# extracted: there is no daemon in this image, nothing in it listens, and the
+# client can only ever speak to an engine whose socket something outside
+# deliberately binds in. The version matches the engine the sandboxes run
+# (29.8.1), and the architecture follows the hurl layer above — this image is
+# built for arm64 today.
+ARG DOCKER_CLI_VERSION=29.8.1
+ARG DOCKER_CLI_SHA256=667395fbffab52901b80181dfbb39ea76da2fbd7642c4fbddd24e42146b07b48
+RUN curl -fsSL "https://download.docker.com/linux/static/stable/aarch64/docker-${DOCKER_CLI_VERSION}.tgz" \
+        -o /tmp/docker-cli.tgz \
+    && echo "${DOCKER_CLI_SHA256}  /tmp/docker-cli.tgz" | sha256sum --check --strict - \
+    && tar --extract --file /tmp/docker-cli.tgz --directory /usr/local/bin \
+        --strip-components=1 docker/docker \
+    && rm -f /tmp/docker-cli.tgz \
+    && chmod 0755 /usr/local/bin/docker \
+    && docker --version | grep -q "${DOCKER_CLI_VERSION}" \
+    && test ! -e /usr/local/bin/dockerd \
+    && test ! -e /usr/local/bin/containerd \
+    && test ! -e /usr/local/bin/runc
+
 # 2026-08-15 — HISTORICAL REASON, LIVE PACKAGE. guardkit deleted the DCL spec
 # track outright (guardkit b138d92c) and forge's W1-S2 leg went with it, so
 # nothing shells the vendored checker any more. ``nodejs`` and the flag below

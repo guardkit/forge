@@ -776,6 +776,104 @@ class TestRuntimeVenvHandover:
         )
 
 
+class TestTheDockerClientAndNoDaemon:
+    """The runtime image carries the docker CLIENT, pinned, and no daemon.
+
+    WHY THE FACTORY NEEDS IT (24 September 2026, stage 4e of the
+    containerisation rollout gate). One of the two services that run from this
+    image is the deploy helper, and the helper runs the deploy, health-check
+    and live-gate commands a PROJECT declares in its own profile — whatever
+    they are. A project may perfectly well declare a deploy that brings
+    containers up, and inside a sandbox the bootstrap binds that sandbox's own
+    engine socket into the helper for exactly that. Until this layer existed
+    there was nothing in the image to use the socket. Nothing here names a
+    project, a language or a toolchain: this is the factory being able to run
+    what it is handed.
+
+    The proof that the client really answers, and that no daemon came with it,
+    runs against the built image in ``scripts/verify-forge-oracles.sh``. These
+    are the static halves: the pin, the checksum, and the one binary.
+    """
+
+    def test_the_client_is_installed_in_the_runtime_stage(
+        self, dockerfile_text: str
+    ) -> None:
+        runtime_body = _runtime_stage_body(dockerfile_text)
+        assert re.search(
+            r"download\.docker\.com/linux/static/stable/[^\s\"]*"
+            r"docker-\$\{DOCKER_CLI_VERSION\}\.tgz",
+            runtime_body,
+        ), (
+            "The runtime stage must fetch the docker client from Docker's own "
+            "static release, at the version the Dockerfile pins"
+        )
+
+    def test_the_version_is_pinned_and_the_download_is_checksummed(
+        self, dockerfile_text: str
+    ) -> None:
+        runtime_body = _runtime_stage_body(dockerfile_text)
+        version = re.search(
+            r"^ARG\s+DOCKER_CLI_VERSION=(\S+)", runtime_body, re.MULTILINE
+        )
+        digest = re.search(
+            r"^ARG\s+DOCKER_CLI_SHA256=([0-9a-f]{64})\s*$",
+            runtime_body,
+            re.MULTILINE,
+        )
+        assert version, "The docker client's version must be pinned in an ARG"
+        assert digest, (
+            "The docker client's tarball must have its sha256 recorded in an "
+            "ARG — a download nobody checks is a supply chain of its own"
+        )
+        assert "sha256sum --check --strict" in runtime_body, (
+            "The recorded sha256 must actually be checked before the tarball "
+            "is unpacked"
+        )
+
+    def test_only_the_client_binary_is_unpacked(self, dockerfile_text: str) -> None:
+        runtime_body = _runtime_stage_body(dockerfile_text)
+        non_comment = "\n".join(
+            line
+            for line in runtime_body.splitlines()
+            if not line.lstrip().startswith("#")
+        )
+        assert "docker/docker" in non_comment, (
+            "Only ``docker/docker`` — the client — is extracted from the tarball"
+        )
+        for daemon_part in ("docker/dockerd", "docker/containerd", "docker/runc"):
+            assert daemon_part not in non_comment, (
+                f"{daemon_part} must never be extracted: there is no engine in "
+                "this image, and the helper only ever speaks to an engine "
+                "whose socket something outside deliberately binds in"
+            )
+        assert re.search(
+            r"test\s+!\s+-e\s+/usr/local/bin/dockerd", non_comment
+        ), "The layer must prove for itself that no daemon landed in the image"
+
+    def test_the_dockerfile_says_why_the_factory_needs_it(
+        self, dockerfile_text: str
+    ) -> None:
+        # The rule Rich set on 17 September: the factory names no target
+        # project's toolchain. A Docker client in the factory's OWN image is
+        # the factory's own need, and the file has to say so where it is added
+        # rather than leave a reader to guess it is some project's.
+        runtime_body = _runtime_stage_body(dockerfile_text)
+        # One run-on line, so a sentence that wraps across two comment lines
+        # still reads as the sentence it is.
+        comments = re.sub(
+            r"\s+",
+            " ",
+            " ".join(
+                line.lstrip().lstrip("#")
+                for line in runtime_body.splitlines()
+                if line.lstrip().startswith("#")
+            ),
+        ).lower()
+        assert "deploy helper" in comments
+        assert "declare" in comments
+        assert "never a daemon" in comments or "no daemon" in comments
+
+
 class TestHealthcheckDirective:
     """AC: HEALTHCHECK uses curl against /healthz on the contract port."""
 
