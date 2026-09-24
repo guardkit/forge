@@ -33,6 +33,16 @@
 #      session that merely dropped has left its supervisor running in there,
 #      and starting a second one is how the pile-up happens.
 #
+#      AND THE STOP HAS TO HAVE WORKED. A stop that ends nonzero, or does not
+#      finish inside its timeout, means the work in there may still be running.
+#      So nothing is ever started on top of it: the stop is tried a few times,
+#      and if it still will not work this service starts nothing and exits
+#      non-zero, rather than adding a second supervisor or reporting a clean
+#      stop it did not achieve. It is also the reason the stop is made with
+#      exactly the settings the start was made with: a bootstrap that picks
+#      out its own process record, or its target, from one of those settings
+#      would otherwise be asked to stop something else, or nothing at all.
+#
 # WHAT IT IS NOT. It is not a deploy, it never creates, removes or reconfigures
 # a sandbox, and it knows nothing about the project inside it — no language, no
 # test runner, no package manager, no layout. It runs one command the project
@@ -76,6 +86,12 @@
 #                           before it is abandoned (default 45). Keep the
 #                           compose file's stop_grace_period comfortably above
 #                           it.
+#   SANDBOX_STOP_ATTEMPTS   How many times a stop that failed is tried again
+#                           before this service gives up (default 3). Keep
+#                           attempts times (timeout + pause) below the compose
+#                           file's stop_grace_period as well.
+#   SANDBOX_STOP_RETRY_SECONDS
+#                           The pause between those tries (default 5).
 #   SANDBOXES_STORAGE_ROOT  The client's own writable state folder, and the
 #                           folder under which it looks for the daemon's
 #                           socket at state/sandboxes/sandboxes/sandboxd/
@@ -84,7 +100,10 @@
 #                           and complains about authentication.
 #
 # EXIT. 0 after a clean stop. 2 when a required setting is missing — said in
-# one sentence, at the door, rather than started half-configured.
+# one sentence, at the door, rather than started half-configured. 3 when the
+# work inside would not stop: nothing was started on top of it, nothing claims
+# to have stopped, and the container comes back under its restart policy to try
+# the same stop again.
 
 set -uo pipefail
 
@@ -96,6 +115,8 @@ BOOTSTRAP="${SANDBOX_BOOTSTRAP:-}"
 STOP_ARGUMENT="${SANDBOX_BOOTSTRAP_STOP_ARGUMENT:-stop}"
 RESTART_SECONDS="${SANDBOX_RESTART_SECONDS:-5}"
 STOP_TIMEOUT_SECONDS="${SANDBOX_STOP_TIMEOUT_SECONDS:-45}"
+STOP_ATTEMPTS="${SANDBOX_STOP_ATTEMPTS:-3}"
+STOP_RETRY_SECONDS="${SANDBOX_STOP_RETRY_SECONDS:-5}"
 
 # The name the held session runs under inside the sandbox, so that this
 # service can end its own hold and nothing else. It is not a setting: nobody
@@ -160,6 +181,14 @@ if ((${#ENV_PREFIX[@]})); then
   ENV_PREFIX=(env "${ENV_PREFIX[@]}")
 fi
 
+# THE ONE WAY THE PROJECT'S BOOTSTRAP IS REACHED, built once and used by both
+# the start and the stop, so the two cannot drift apart. The stop therefore
+# carries exactly the settings the start carried: a bootstrap that finds its own
+# process record, or its target, through one of those settings is asked to stop
+# the thing it was asked to start, and not something else. It stays an array all
+# the way to the client, so a value with spaces in it arrives as one value.
+BOOTSTRAP_CALL=("${CLIENT_CALL[@]}" "${ENV_PREFIX[@]}" "${BOOTSTRAP}")
+
 log "sandbox=${NAME} bootstrap=${BOOTSTRAP} client=${CLIENT}"
 log "settings handed in (names only): ${FORWARDED[*]:-none}"
 log "settings named but not set here: ${SKIPPED[*]:-none}"
@@ -184,17 +213,18 @@ start_keeper() {
 
 start_bootstrap() {
   log "starting the project's bootstrap inside the sandbox"
-  "${CLIENT_CALL[@]}" "${ENV_PREFIX[@]}" "${BOOTSTRAP}" &
+  "${BOOTSTRAP_CALL[@]}" &
   BOOTSTRAP_PID=$!
 }
 
-# The stop that is the point of this service: through the same door, asking
-# the project's own bootstrap to stop itself, and waited for.
+# The stop that is the point of this service: through the same door, with the
+# same settings, asking the project's own bootstrap to stop itself, and waited
+# for. Returns what the stop returned; 124 is the timeout.
 stop_the_work_inside() {
   local rc=0
   log "asking the bootstrap inside ${NAME} to stop, and waiting for it"
   timeout "${STOP_TIMEOUT_SECONDS}" \
-    "${CLIENT_CALL[@]}" "${BOOTSTRAP}" "${STOP_ARGUMENT}" || rc=$?
+    "${BOOTSTRAP_CALL[@]}" "${STOP_ARGUMENT}" || rc=$?
   if ((rc == 124)); then
     log "the stop inside ${NAME} did not finish within ${STOP_TIMEOUT_SECONDS}s; abandoning it (the work may still be running in there)"
   elif ((rc != 0)); then
@@ -203,6 +233,58 @@ stop_the_work_inside() {
     log "the work inside ${NAME} has stopped"
   fi
   return "${rc}"
+}
+
+# NOTHING IS STARTED ON TOP OF WORK THAT MAY STILL BE RUNNING. Every route to a
+# bootstrap start goes through this, and so does the shutdown. A stop that ends
+# nonzero or times out is tried again, a bounded number of times with a pause;
+# only a stop that really worked lets anything else happen.
+require_the_work_inside_to_stop() {
+  local attempt=1
+  while :; do
+    if stop_the_work_inside; then
+      return 0
+    fi
+    if ((attempt >= STOP_ATTEMPTS)); then
+      log "the stop inside ${NAME} has now failed ${attempt} time(s)"
+      return 1
+    fi
+    attempt=$((attempt + 1))
+    log "trying the stop inside ${NAME} again in ${STOP_RETRY_SECONDS}s (try ${attempt} of ${STOP_ATTEMPTS})"
+    nap "${STOP_RETRY_SECONDS}"
+  done
+}
+
+# The client sessions this container is holding open. Ending them ends NOTHING
+# inside the sandbox — that is the whole premise of this file — but it lets this
+# process go.
+end_the_local_sessions() {
+  local pid
+  for pid in "${BOOTSTRAP_PID}" "${KEEPER_PID}"; do
+    [[ -n "${pid}" ]] && kill "${pid}" 2>/dev/null
+  done
+  wait 2>/dev/null
+  return 0
+}
+
+# WHAT HAPPENS TO THE HOLD WHEN THE STOP WILL NOT WORK: it is LEFT IN PLACE, on
+# purpose, and that is the only case in which this service leaves it. Releasing
+# it would let the sandbox fall asleep about thirty seconds later and cut the
+# work off mid-flight without it ever having been asked to stop — the abrupt
+# ending this whole file exists to avoid — and it would leave the machine
+# looking tidy while the problem was still in there. Left alone, the sandbox
+# stays awake, what is running in it can be looked at and stopped properly, and
+# the next container's stop does not have to wake the sandbox first. The hold
+# runs under one fixed name, so the next release of it ends it and any second
+# copy of it together.
+#
+# The container's restart policy brings this service back, and the first thing
+# it does is the same stop again — which is why the sentence below says so.
+give_up_because_the_stop_failed() {
+  end_the_local_sessions
+  log "this service's hold on ${NAME} is being left in place on purpose, so the sandbox stays awake and the work in there can be stopped properly instead of being cut off when the sandbox falls asleep"
+  log "FATAL: the work inside ${NAME} would not stop after ${STOP_ATTEMPTS} tries and may still be running in there, so this service has started nothing on top of it and is exiting non-zero rather than reporting a stop it did not achieve; the container's restart policy will bring it back and it will try the same stop again before it starts anything, and if it keeps failing, look inside ${NAME} and stop the project's bootstrap by hand."
+  exit 3
 }
 
 # End this service's own hold, and only its own: the held process runs under a
@@ -227,8 +309,9 @@ trap on_stop_signal TERM INT
 # again would otherwise start a SECOND supervisor beside the one still running
 # inside (the second review of 24 September 2026 produced exactly that against
 # a bootstrap with no lock of its own). Nothing running inside is the ordinary
-# case, and the bootstrap's stop says so and exits; that is not a failure.
-stop_the_work_inside
+# case, and the bootstrap's stop says so and exits; that is not a failure. A
+# stop that will not work IS one, and then nothing starts.
+require_the_work_inside_to_stop || give_up_because_the_stop_failed
 start_keeper
 start_bootstrap
 
@@ -243,6 +326,10 @@ while ((STOPPING == 0)); do
     log "no session left to wait for; starting both again"
     nap "${RESTART_SECONDS}"
     ((STOPPING == 1)) && break
+    # Both sessions are gone out here, which says nothing about what is still
+    # running in there: the same stop, and it has to have worked.
+    require_the_work_inside_to_stop || give_up_because_the_stop_failed
+    ((STOPPING == 1)) && break
     start_keeper
     start_bootstrap
     continue
@@ -250,13 +337,16 @@ while ((STOPPING == 0)); do
   if [[ "${died}" == "${BOOTSTRAP_PID}" ]]; then
     log "the bootstrap session ended ${rc}"
     # Before opening another one: the session ending out here left the
-    # supervisor running in there. Starting a second is the pile-up.
-    stop_the_work_inside
+    # supervisor running in there. Starting a second is the pile-up, so the
+    # stop has to have worked before another one is opened.
+    require_the_work_inside_to_stop || give_up_because_the_stop_failed
     ((STOPPING == 1)) && break
     nap "${RESTART_SECONDS}"
     ((STOPPING == 1)) && break
     start_bootstrap
   elif [[ "${died}" == "${KEEPER_PID}" ]]; then
+    # Only the hold is opened again here. The bootstrap's own session is still
+    # up, so nothing is being started on top of it and no stop belongs here.
     log "the hold on ${NAME} ended ${rc}"
     ((STOPPING == 1)) && break
     nap "${RESTART_SECONDS}"
@@ -266,11 +356,11 @@ while ((STOPPING == 0)); do
 done
 
 # The stop, in order: end the work inside first, then let the sandbox sleep.
-stop_the_work_inside
+# If the work inside will not stop, this says so and exits non-zero: `docker
+# compose stop` and `docker ps` then show the truth instead of a tidy 0, and
+# the hold stays (see above) so the sandbox does not fall asleep on top of it.
+require_the_work_inside_to_stop || give_up_because_the_stop_failed
 release_the_hold
-for pid in "${BOOTSTRAP_PID}" "${KEEPER_PID}"; do
-  [[ -n "${pid}" ]] && kill "${pid}" 2>/dev/null
-done
-wait 2>/dev/null
+end_the_local_sessions
 log "stopped"
 exit 0

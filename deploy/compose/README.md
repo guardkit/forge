@@ -111,7 +111,23 @@ and asks the project's own bootstrap to stop itself — one word,
 `SANDBOX_BOOTSTRAP_STOP_ARGUMENT` — and **waits for it**. Docker must wait too,
 which is why `stop_grace_period` is ninety seconds rather than the default ten
 seconds. The same stop runs before every restart of the session, for the same
-reason systemd ran its `ExecStop` before every automatic restart.
+reason systemd ran its `ExecStop` before every automatic restart — and it is
+made with the same settings the start was made with, so a bootstrap that finds
+its own work through one of them is asked to stop the thing it was asked to
+start.
+
+**And the stop has to have worked.** A stop that ends nonzero, or that does not
+finish within `SANDBOX_STOP_TIMEOUT_SECONDS`, means the work may still be
+running in there, so nothing is started on top of it: the service tries the stop
+`SANDBOX_STOP_ATTEMPTS` times (default three, `SANDBOX_STOP_RETRY_SECONDS`
+apart), and if it still will not work it says so in one sentence and **exits
+non-zero** rather than adding a second supervisor or reporting a stop it did not
+achieve. `docker ps` then shows that exit instead of a tidy zero, the restart
+policy brings the container back, and the first thing it does is try the same
+stop again. In that one case the hold on the sandbox is **left in place on
+purpose**: releasing it would let the sandbox fall asleep about thirty seconds
+later and cut the work off mid-flight without it ever having been asked to stop,
+and would leave the machine looking tidy while the problem was still inside.
 
 **Check the project's bootstrap takes that word before you start this
 service.** An older one reads no arguments at all: it would ignore the word and
