@@ -83,10 +83,17 @@
 # writes that a later stage of a build reads, and the decision for each:
 #
 #   the project's own clone, and everything a build writes under it — the
-#   build's branch, its inner worktrees (.guardkit/worktrees), a fix journey's
-#   gate evidence (qa/gates/evidence)
+#   build's branch, a build's inner worktrees (.guardkit/worktrees/<task or
+#   feature id>), the conductor's own per-build tree (.forge/worktrees/<build
+#   id>, cut by src/forge/cli/_conductor_worktree.py and acted on afterwards
+#   by the deploy helper), a fix journey's gate evidence (qa/gates/evidence)
 #       SHARED MOUNT, read-write, at the path the clone already lives at. It
-#       was the only one before this stage.
+#       was the only one before this stage. BOTH worktree folders named above
+#       are INSIDE the clone, so that one mount already carries both and the
+#       answer for them was right before this line was written — the second
+#       name is here because a list that names one and not the other reads as
+#       though the other were somewhere else (the stage 4e reviewer asked for
+#       it, 24 September 2026).
 #
 #   the per-build git worktrees, FORGE_AUTOBUILD_WORKTREE_BASE
 #       SHARED MOUNT. The build runner materialises <base>/<build id> as a
@@ -104,6 +111,14 @@
 #       runner while it works, read afterwards from outside both containers
 #       through the sandbox's own path. They must outlive a container, and the
 #       factory's own default puts them inside one.
+#       AND WHERE NOTHING NAMES IT, READ THIS (stage 4e review, 24 September
+#       2026). With no setting, this script uses a folder of its own state in
+#       the sandbox. That survives a container being replaced, which is all
+#       this stage was about — but it is a path NOTHING OUTSIDE the sandbox
+#       knows, so a project whose receipts are read from outside (through the
+#       folder its own deploy profile calls receipts_path) has to name that
+#       folder here, in that project's own .env, as SANDBOX_RECEIPTS_PATH.
+#       Nothing does it for you, and the start log says so when it falls back.
 #
 #   the build runner's launch declaration (its graph config, written below)
 #       THE SANDBOX'S OWN FILESYSTEM, bound read-only into the runner alone.
@@ -191,7 +206,10 @@
 #                            it wins over SANDBOX_RECEIPTS_PATH; unset, this
 #                            script names a folder in the sandbox's own state
 #                            rather than let receipts land inside a container
-#                            and die with it
+#                            and die with it — a folder that outlives a
+#                            container but that nothing OUTSIDE this sandbox
+#                            is looking at, so a project read from outside
+#                            must name its own (see the receipts root above)
 #     FORGE_AUTOBUILD_WORKTREE_BASE
 #                            where a build's per-build worktrees are cut. Made
 #                            here, bound read-write into BOTH containers at the
@@ -505,6 +523,7 @@ if [[ -z "${RECEIPTS_ROOT}" ]]; then
   RECEIPTS_ROOT="${STATE_ROOT}/receipts"
   RECEIPTS_SETTING="the receipts root (no setting named one, so this script did)"
   log "no receipts root was named, so this sandbox's own ${RECEIPTS_ROOT} is used: the factory's own default is a folder inside a container, and a container here is thrown away and made again"
+  log "that folder outlives a container, but nothing outside this sandbox is looking at it: if this project's receipts are read from outside, set SANDBOX_RECEIPTS_PATH in the project's own .env to the folder its deploy profile calls receipts_path"
 fi
 export FORGE_RECEIPTS_DIR="${RECEIPTS_ROOT}"
 
