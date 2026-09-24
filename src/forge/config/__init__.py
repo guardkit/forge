@@ -7,7 +7,7 @@ decoupled from the internal module layout (see ``forge.config.models``
 and ``forge.config.loader``).
 """
 
-from .loader import load_config
+from .loader import AnAddressNameIsNotSet, fill_in_address_names, load_config
 from .models import (
     ApprovalConfig,
     BudgetConfig,
@@ -25,6 +25,7 @@ from .models import (
 )
 
 __all__ = [
+    "AnAddressNameIsNotSet",
     "ApprovalConfig",
     "BudgetConfig",
     "BudgetGuards",
@@ -38,5 +39,6 @@ __all__ = [
     "PlanningModelResolution",
     "QueueConfig",
     "ReviewGateConfig",
+    "fill_in_address_names",
     "load_config",
 ]

@@ -65,7 +65,13 @@ Environment=FORGE_CONFIG_PATH=%h/forge-state/forge.yaml
 # is ever sent to it but a build's or a target's name. Unset means nobody can be
 # asked, and then a request that names a commit is refused rather than believed
 # — the safe side, and the reason this line has to be in place before that
-# binding is rolled out. Served by scripts/systemd/forge-record-answer.service.
+# binding is rolled out. SERVED BY the 'answer-service' in
+# deploy/compose/compose.yaml (24 September 2026). It used to be served by a
+# unit file beside this one; that unit was never installed anywhere and was
+# deleted when the answer became a compose service. In the container design
+# this address is the factory gateway address and the published answer port,
+# because the helper runs inside a sandbox and a sandbox is a machine of its
+# own — section 7 of the containerisation design pass says why.
 Environment=FORGE_TARGET_OWNER_URL=http://127.0.0.1:8126/recorded
 # A wide enough PATH for the spawned vetted scripts (version control, the
 # container tool, and whatever else a project's own declared script calls).
@@ -73,7 +79,7 @@ Environment=PATH=%h/.agentecflow/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 # THE TWO PATHS BELOW ARE PLACEHOLDERS. This file is committed to a public
 # repository, so it names no real machine's layout. Whoever installs it edits
 # WorkingDirectory and ExecStart to where this checkout and its venv really
-# are on that machine, the way the sibling record-answer unit says.
+# are on that machine.
 WorkingDirectory=%h/forge-src/forge
 # Loopback binding is enforced in code (HOST=127.0.0.1); -m runs the package
 # entry point (forge.deploy_sidecar.__main__).
