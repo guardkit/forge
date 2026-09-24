@@ -256,9 +256,17 @@ class TestWhatItHandsTheBootstrap:
         )
         try:
             assert _wait_for(
-                lambda: any("own/bootstrap" in c for c in _calls(root))
+                lambda: any(c.endswith("own/bootstrap") for c in _calls(root))
             )
-            start = next(c for c in _calls(root) if c.endswith("own/bootstrap"))
+            calls = _calls(root)
+            start = next(c for c in calls if c.endswith("own/bootstrap"))
+            # Before the FIRST start, the bootstrap is asked to stop once, so a
+            # container that died without stopping never starts a second
+            # supervisor beside the one still running inside.
+            first_stop = next(
+                i for i, c in enumerate(calls) if c.endswith("own/bootstrap stop")
+            )
+            assert first_stop < calls.index(start)
         finally:
             service.send_signal(signal.SIGTERM)
             try:
