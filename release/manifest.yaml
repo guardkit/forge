@@ -33,7 +33,7 @@
 # manifests still build — the script reads them as one image, the
 # coordinator's, from the build-context root's own Dockerfile.
 schema: 2
-version: 2026.09.24-4
+version: 2026.09.24-5
 
 # The one image this repository's own operator scripts mean by "the release
 # image" (ops/forge-prod-recreate.sh reads this line). It is the same name as
@@ -86,7 +86,7 @@ repositories:
   - name: forge
     url: https://github.com/guardkit/forge.git
     branch: main
-    commit: 4f080ef241e3ad0aa7cd7ba9cd82cfe30e163808
+    commit: 8c3281161588c875e27913725b6ebee7975728f7
     role: build-context-root
   - name: guardkit
     url: https://github.com/guardkit/guardkit.git
@@ -101,7 +101,7 @@ repositories:
   - name: fleet-memory
     url: https://github.com/guardkit/fleet-memory.git
     branch: main
-    commit: f215487748a8b5270bd32f55b3c55da2cf027125
+    commit: 3ac45863f6a90ca89f9efafbfb4630b28fb6e4bc
     role: named-context
   - name: guardkitfactory
     url: https://github.com/guardkit/guardkitfactory.git
