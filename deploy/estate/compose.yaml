@@ -1,0 +1,204 @@
+# ---------------------------------------------------------------------------
+# THE ESTATE BUNDLE (24 September 2026, stage 4a of the containerisation
+# rollout gate).
+#
+# The design calls this "the only thing a new machine clones": one small set of
+# files that starts the factory's own services on a clean machine, local or
+# cloud, with nothing edited but the env file beside it.
+#
+# IT COMPOSES, IT DOES NOT COPY. Forge's own two compose files are pulled in
+# with 'include:' below, so there is ONE description of the coordinator, the
+# answer service, the publisher and the sandbox service, and this file cannot
+# drift away from them. Everything this file adds is the part of the estate
+# that Forge does not own.
+#
+# WHAT IT ADDS: the bus, and the one-shot that provisions the bus's storage
+# before the coordinator is allowed to start.
+#
+# BRING IT UP (the passwords come from a child process, never from a file
+# here — see README.md):
+#
+#     cp .env.example .env            # then fill in the lines marked CHANGE THIS
+#     ./build-estate-images.sh        # the bus image, at its pinned commit
+#     ./estate-check host
+#     sops exec-env "$NATS_SECRETS_FILE" 'docker compose --env-file .env up -d'
+#     ./estate-check services
+#     ./factory-hello
+#
+# TAKE IT DOWN:  docker compose --env-file .env down      # keeps the volumes
+#                docker compose --env-file .env down -v   # and removes them
+# ---------------------------------------------------------------------------
+
+include:
+  # FORGE'S OWN SERVICES: the coordinator, the read-only answer service, and
+  # the publisher (which that file in turn composes in from the publisher's own
+  # fragment). Composed, never copied.
+  - path: ../compose/compose.yaml
+  # ONE PROJECT'S SANDBOX, looked after by a container. It carries a profile
+  # below, so a machine with no sandbox never starts it and does not have to
+  # comment anything out; a machine that looks after one adds
+  # '--profile sandbox'.
+  - path: ../compose/compose.sandbox-runner.yaml
+
+services:
+
+  # -------------------------------------------------------------------------
+  # THE BUS — the message service everything talks over.
+  #
+  # It is built from the bus repository's OWN Dockerfile and runs its OWN
+  # config, both taken from that repository at a pinned commit by
+  # ./build-estate-images.sh. Nothing is copied into this repository and
+  # nothing is built by compose: the image is named here and built there, the
+  # same way the release images are named here and built by the release script.
+  #
+  # ITS PASSWORDS ARE PASSED IN FROM A CHILD PROCESS, never read from a file in
+  # this bundle. That is the bus repository's own arrangement and the reason
+  # for it is worth keeping: an env_file whose values were still encrypted
+  # would feed ciphertext through the template renderer and produce a broker
+  # with unusable accounts, whereas 'environment:' interpolation can only ever
+  # receive a real value from the environment the command was run in. The ':?'
+  # on each one makes a bare 'up' fail loudly rather than render empty
+  # passwords.
+  # -------------------------------------------------------------------------
+  nats:
+    image: ${NATS_IMAGE:?name the bus image in the env file, e.g. NATS_IMAGE=factory-nats:2026.09.24-5 - built by ./build-estate-images.sh from the bus repository at its pinned commit}
+    restart: unless-stopped
+    environment:
+      ADMIN_NATS_PASSWORD: ${ADMIN_NATS_PASSWORD:?the bus's account passwords come from the environment the command was run in, never from a file in this bundle - see README.md}
+      RICH_NATS_PASSWORD: ${RICH_NATS_PASSWORD:?the bus's account passwords come from the environment the command was run in, never from a file in this bundle}
+      JAMES_NATS_PASSWORD: ${JAMES_NATS_PASSWORD:?the bus's account passwords come from the environment the command was run in, never from a file in this bundle}
+      MARK_NATS_PASSWORD: ${MARK_NATS_PASSWORD:?the bus's account passwords come from the environment the command was run in, never from a file in this bundle}
+      FORGE_NATS_PASSWORD: ${FORGE_NATS_PASSWORD:?the bus's account passwords come from the environment the command was run in, never from a file in this bundle}
+      FLEET_MEMORY_NATS_PASSWORD: ${FLEET_MEMORY_NATS_PASSWORD:?the bus's account passwords come from the environment the command was run in, never from a file in this bundle}
+      GUARDKIT_NATS_PASSWORD: ${GUARDKIT_NATS_PASSWORD:?the bus's account passwords come from the environment the command was run in, never from a file in this bundle}
+      JARVIS_NATS_PASSWORD: ${JARVIS_NATS_PASSWORD:?the bus's account passwords come from the environment the command was run in, never from a file in this bundle}
+    volumes:
+      # THE BUS'S OWN CONFIG, READ-ONLY — exactly the two mounts the bus
+      # repository's own compose file makes, at the same two places, but out of
+      # a VOLUME rather than a folder on a disk. The bus's config is part of the
+      # release, not part of a machine, so it travels with the images: the build
+      # step fetches the bus repository at its pin and fills this volume, and
+      # nothing in the running estate names a path belonging to anybody.
+      - type: volume
+        source: bus-source
+        target: /etc/nats/nats-server.conf
+        read_only: true
+        volume:
+          subpath: config/nats-server.conf
+      - type: volume
+        source: bus-source
+        target: /etc/nats/config/accounts
+        read_only: true
+        volume:
+          subpath: config/accounts
+      # ITS STORE. The design's table calls this volume nats-jetstream and says
+      # the bus is its one writer.
+      - nats-jetstream:/data/jetstream
+    networks:
+      - factory
+    ports:
+      # THE SECOND AND LAST PUBLISHED PORT IN THE ESTATE, and for the same
+      # reason as the first: a sandbox is a separate small machine that cannot
+      # reach a service name, so its route to the bus goes through the factory
+      # gateway address. The monitoring port is NOT published — the estate's
+      # own check asks for it from inside the network.
+      #
+      # The per-route refusal rule (this listener, this port, this allowed
+      # source, refused to everything else including the local network) is NOT
+      # enforced by this bundle yet. README.md lists it as a rollout
+      # precondition, and until it is enforced the gateway address must be a
+      # private address of this machine.
+      - "${FACTORY_GATEWAY_ADDRESS:?name this machine's factory gateway address in the env file}:${NATS_CLIENT_PORT:?name the port the bus is published on in the env file}:4222"
+    healthcheck:
+      # The bus repository's own probe, unchanged.
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8222/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+  # -------------------------------------------------------------------------
+  # PROVISIONING THE BUS'S STORAGE — a one-shot that runs once at every start,
+  # does nothing if there is nothing to do, and exits 0.
+  #
+  # WHY IT EXISTS. On 24 September 2026 a reviewer brought the bundle up
+  # against a bus that had never been provisioned and the coordinator restarted
+  # in a loop showing a programmer's error: it needs the bus's 'agent-registry'
+  # key-value bucket and its 'PIPELINE' stream to exist before it can register
+  # at all. The live bus was provisioned by hand months ago, so nobody had met
+  # this. It is a precondition, so it belongs in the file that starts things
+  # and not in a sentence somebody has to remember.
+  #
+  # It runs the bus repository's OWN provisioning scripts, from the same pinned
+  # commit as the bus's config, against the bus. They are written to be safe on
+  # every start: each bucket and stream is checked, then created or updated.
+  # -------------------------------------------------------------------------
+  nats-provision:
+    image: ${NATS_PROVISION_IMAGE:?name the provisioning image in the env file - built by ./build-estate-images.sh}
+    restart: "no"
+    depends_on:
+      nats:
+        condition: service_healthy
+    environment:
+      # WHICH BUS, AND AS WHOM. The address carries an account's user and
+      # password, so this value comes from the environment the command was run
+      # in exactly as the bus's own passwords do. Nothing here prints it.
+      NATS_URL: ${NATS_PROVISION_URL:?name the address the provisioning runs against in the env file - it carries an account's credentials, so it comes from the environment the command was run in}
+      # The nats client writes a context folder if it is allowed to; give it a
+      # temporary one of its own rather than a home folder in the image.
+      XDG_CONFIG_HOME: /tmp/nats-config
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -euo pipefail
+        /bus/kv/provision-kv.sh
+        /bus/streams/provision-streams.sh
+    volumes:
+      # THE BUS REPOSITORY'S OWN SCRIPTS AND DEFINITIONS, read-only, from the
+      # same pinned commit as the bus's config. The factory keeps no copy of
+      # them and does not second-guess them: the bus's storage is described in
+      # the bus's repository.
+      - type: volume
+        source: bus-source
+        target: /bus
+        read_only: true
+    networks:
+      - factory
+
+  # -------------------------------------------------------------------------
+  # THE COORDINATOR, composed in above, waits for the bus to be PROVISIONED and
+  # not merely running. Without this line the coordinator starts against a bare
+  # bus and restarts in a loop; with it, it does not start at all until the
+  # one-shot above has finished successfully.
+  # -------------------------------------------------------------------------
+  coordinator:
+    depends_on:
+      nats-provision:
+        condition: service_completed_successfully
+
+  # -------------------------------------------------------------------------
+  # ONE PROJECT'S SANDBOX, composed in above and put behind a profile here.
+  #
+  # A machine has one of these per project sandbox and a cloud machine may have
+  # none at all, so it must not start by accident: 'docker compose up' leaves
+  # it alone, and a machine that looks after a sandbox says
+  # '--profile sandbox'. Nothing else about it is changed here.
+  # -------------------------------------------------------------------------
+  sandbox-runner:
+    profiles: ["sandbox"]
+
+volumes:
+  # The bus's store. Forge's four volumes and the publisher's are declared by
+  # the files composed in above.
+  nats-jetstream:
+
+  # THE BUS'S OWN CONFIG AND PROVISIONING SCRIPTS, at the pinned commit.
+  #
+  # It is EXTERNAL because it is made by the build step beside the two images,
+  # out of the same fetch, and it belongs to the release rather than to a run:
+  # 'down -v' removes a run's storage and must not take the release's content
+  # with it. ./build-estate-images.sh makes it and fills it; removing it is
+  # 'docker volume rm', the same as removing an image.
+  bus-source:
+    external: true
+    name: ${BUS_SOURCE_VOLUME:?name the volume holding the bus repository's config and provisioning scripts - ./build-estate-images.sh makes it and prints its name}
