@@ -43,16 +43,16 @@ permissions:
     # The allowlist is deliberately explicit: no implicit default.
     allowlist:
     - /home/forge
-    - /home/richardwoollcott/Projects/appmilla_github/forge
+    - /srv/checkouts/forge
 approval:
   expected_approver: U03QR8WKT29
 planning:
   default_target_repo: guardkit/api_test
   target_repo_paths:
-    guardkit/api_test: /home/richardwoollcott/Projects/appmilla_github/api_test
+    guardkit/api_test: /srv/checkouts/api_test
     # Namespace aliases (2026-08-02, attended): builds are queued with
-    # repo=appmilla_github/<name>.
-    appmilla_github/api_test: /home/richardwoollcott/Projects/appmilla_github/api_test
+    # repo=<checkout-folder>/<name>.
+    checkouts/api_test: /srv/checkouts/api_test
 """
 
 
@@ -155,7 +155,47 @@ def test_fresh_repo_writes_the_allowlist_entry_and_both_keys(_isolate, tmp_path)
     parsed = load_config(config)
     assert Path(str(repo)) in [Path(p) for p in parsed.permissions.filesystem.allowlist]
     assert parsed.planning.target_repo_paths["guardkit/bench-one"] == str(repo)
-    assert parsed.planning.target_repo_paths["appmilla_github/bench-one"] == str(repo)
+    # The second spelling is the checkout folder's own name, derived from
+    # FORGE_REPO_BASE (here ``<tmp_path>/base``) rather than written into the
+    # source, so no machine's folder name lives in the code (2026-09-24).
+    assert parsed.planning.target_repo_paths["base/bench-one"] == str(repo)
+
+
+def test_the_second_key_spelling_follows_the_checkout_folder(_isolate, tmp_path,
+                                                             monkeypatch):
+    """Point FORGE_REPO_BASE somewhere else and the alias namespace moves."""
+    base = tmp_path / "somewhere-else"
+    base.mkdir()
+    monkeypatch.setenv(register_repo.FORGE_REPO_BASE_ENV, str(base))
+    repo = _make_repo(base, "bench-one", toolchain="toolchain:\n  test: pytest\n")
+    config = _write_config(tmp_path)
+
+    result = _run(config, str(repo))
+
+    assert result.exit_code == 0, result.output
+    parsed = load_config(config)
+    assert parsed.planning.target_repo_paths["somewhere-else/bench-one"] == str(repo)
+
+
+def test_it_refuses_when_no_checkout_directory_is_named(_isolate, tmp_path,
+                                                        monkeypatch):
+    """There is no default checkout directory any more (2026-09-24).
+
+    It used to default to one company's folder on one person's machine, which
+    is a path this factory cannot know and which travelled into the release
+    image. With the setting unset the command says so by name and writes
+    nothing.
+    """
+    repo = _make_repo(_isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n")
+    config = _write_config(tmp_path)
+    before = config.read_text(encoding="utf-8")
+    monkeypatch.delenv(register_repo.FORGE_REPO_BASE_ENV, raising=False)
+
+    result = _run(config, str(repo))
+
+    assert result.exit_code != 0
+    assert "FORGE_REPO_BASE is not set" in result.output
+    assert config.read_text(encoding="utf-8") == before
 
 
 def test_the_report_ends_with_the_recreate_command_and_the_slack_sentence(
@@ -895,7 +935,7 @@ def test_the_planning_block_is_created_when_the_config_has_none(_isolate, tmp_pa
     parsed = load_config(config)
     assert set(parsed.planning.target_repo_paths) == {
         "guardkit/bench-one",
-        "appmilla_github/bench-one",
+        "base/bench-one",
     }
 
 

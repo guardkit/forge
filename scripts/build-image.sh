@@ -14,21 +14,21 @@
 #
 # Layout assumed:
 #
-#   …/appmilla_github/forge/                ← this project
+#   …/<checkouts>/forge/                ← this project
 #                    /scripts/build-image.sh ← this script
-#   …/appmilla_github/nats-core/            ← sibling working tree
-#   …/appmilla_github/guardkit/             ← sibling working tree (oracle payload)
-#   …/appmilla_github/fleet-memory/         ← sibling working tree (priors read)
-#   …/appmilla_github/guardkitfactory/      ← sibling working tree (leg harness)
+#   …/<checkouts>/nats-core/            ← sibling working tree
+#   …/<checkouts>/guardkit/             ← sibling working tree (oracle payload)
+#   …/<checkouts>/fleet-memory/         ← sibling working tree (priors read)
+#   …/<checkouts>/guardkitfactory/      ← sibling working tree (leg harness)
 #
 # guardkit is wired the SAME way as nats-core — a BuildKit named context
 # ``--build-context guardkit=../guardkit`` — so the Dockerfile can pip-install
 # the target-terminal oracles (normalizer + ``guardkit feature validate``) that
 # the B4 run 4b3b0893 caught missing from the image.
 #
-# After the cd, buildx runs from ``…/appmilla_github/forge/``, so:
+# After the cd, buildx runs from ``…/<checkouts>/forge/``, so:
 #   * ``--build-context nats-core=../nats-core`` resolves to
-#     ``…/appmilla_github/nats-core`` (the sibling).
+#     ``…/<checkouts>/nats-core`` (the sibling).
 #   * ``-f Dockerfile .`` references this project's Dockerfile and
 #     uses ``forge/`` as the build context root.
 #

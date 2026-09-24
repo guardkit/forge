@@ -1116,8 +1116,8 @@ def _node_planning_waves(state: AutobuildRunnerState) -> dict[str, Any]:
 
 #: Environment override for the base directory containing local repo
 #: checkouts. The resolver expects ``<FORGE_REPO_BASE>/<basename>`` to be a
-#: cloned checkout of ``payload["repo"]``. Defaults to
-#: ``~/Projects/appmilla_github`` per the source plan's single-host layout.
+#: cloned checkout of ``payload["repo"]``. There is no built-in default: see
+#: :data:`DEFAULT_FORGE_REPO_BASE`.
 FORGE_REPO_BASE_ENV: str = "FORGE_REPO_BASE"
 
 #: Environment name of the single-repo default. Historically (TASK-ABW-002)
@@ -1214,11 +1214,24 @@ DEFAULT_AUTOBUILD_TIMEOUT_SECONDS: int = 86400
 #: and changes nothing about the build's outcome.
 TAIL_READ_BUDGET_SECONDS: float = 5.0
 
-#: Default base directory for repo checkouts when
-#: :data:`FORGE_REPO_BASE_ENV` is unset. Resolved at call time via
-#: :meth:`Path.expanduser` so a different ``$HOME`` in the sidecar still
-#: works.
-DEFAULT_FORGE_REPO_BASE: str = "~/Projects/appmilla_github"
+#: There is NO default base directory for repo checkouts (2026-09-24): this
+#: setting says where one particular deployment keeps its checkouts, which no
+#: line of source can know, so when :data:`FORGE_REPO_BASE_ENV` is unset and
+#: the repository map has nothing to say the runner refuses by name rather
+#: than guessing a folder (it used to default to one company's folder on one
+#: person's laptop, which resolved to a directory that does not exist
+#: everywhere else, including inside this image).
+DEFAULT_FORGE_REPO_BASE: str | None = None
+
+#: The refusal a repo-less base produces, in the same voice as the other two:
+#: it names the setting, says what it is for, and names the other way to
+#: answer the same question.
+MISSING_REPO_BASE_REFUSAL: str = (
+    "this repository is not named in the factory's configuration "
+    "(planning.target_repo_paths) and FORGE_REPO_BASE is not set, so there is "
+    "nowhere to look for its checkout — refusing to build. Add the repository "
+    "to the map, or set FORGE_REPO_BASE to the directory the checkouts sit in."
+)
 
 #: Environment override for the base directory that holds per-build ISOLATED
 #: git worktrees (DEFECT #19, B4 round-17). Each branch-aware autobuild
@@ -1619,6 +1632,11 @@ def repo_resolution_failure_reason(payload: Mapping[str, Any]) -> str:
     wrong-repo build. Every other cause (path absent, not a directory, not a
     git repo, outside the allowlist) keeps the historical wording, with the
     resolver's own WARNING lines carrying the specifics.
+
+    One more cause names itself (2026-09-24): a repository the map does not
+    carry, on a deployment that has not said where its checkouts live, gets
+    :data:`MISSING_REPO_BASE_REFUSAL` — the setting by name, on the card,
+    rather than "unable to resolve repo path".
     """
     repo_raw = payload.get("repo")
     if not isinstance(repo_raw, str) or not repo_raw.strip():
@@ -1627,6 +1645,11 @@ def repo_resolution_failure_reason(payload: Mapping[str, Any]) -> str:
         if not os.environ.get(FORGE_DEFAULT_REPO_ENV, "").strip():
             return MISSING_DEFAULT_REPO_REFUSAL
         repo_raw = os.environ.get(FORGE_DEFAULT_REPO_ENV, "").strip()
+    base_raw = (
+        os.environ.get(FORGE_REPO_BASE_ENV, "").strip() or DEFAULT_FORGE_REPO_BASE
+    )
+    if not base_raw and _configured_repo_path(repo_raw.strip()) is None:
+        return MISSING_REPO_BASE_REFUSAL
     return f"unable to resolve repo path for repo={repo_raw!r}"
 
 
@@ -1635,9 +1658,9 @@ def _configured_repo_path(repo_key: str) -> Path | None:
 
     WHY THIS EXISTS, in plain words. The runner used to work out where a
     repository lives by GUESSING: take the last part of the name and look
-    for it under a base directory, which defaults to
-    ``~/Projects/appmilla_github``. That held only while the runner ran as
-    the owner on the owner's machine. Routine builds now run INSIDE the
+    for it under a base directory, which used to default to one folder on
+    one person's machine. That held only while the runner ran as
+    the owner on that machine. Routine builds now run INSIDE the
     repository's sandbox as a different user, where ``~`` is
     ``/home/agent``, so the guess pointed at a directory that has never
     existed and the first routine build after the move died two seconds
@@ -1654,10 +1677,10 @@ def _configured_repo_path(repo_key: str) -> Path | None:
     way to find configuration, no new environment variable.
 
     THE LOOKUP IS BY EXACT KEY. The map carries a repository under every
-    name the factory calls it by (``guardkit/api_test`` and
-    ``appmilla_github/api_test`` both name the same checkout today), so
-    no fuzzy matching is wanted here: a name the map does not carry is a
-    miss, and a miss falls through to the old base-directory route.
+    name the factory calls it by (an estate spells the same checkout under
+    more than one namespace), so no fuzzy matching is wanted here: a name
+    the map does not carry is a miss, and a miss falls through to the
+    base-directory route — which now needs ``FORGE_REPO_BASE`` to be set.
 
     AND IT NEVER KILLS A BUILD. No configuration file, no planning
     section, no map, no matching key, a file that cannot be read, a value
@@ -1804,7 +1827,7 @@ def _resolve_repo_path(payload: Mapping[str, Any]) -> Path | None:
     base_dir_raw = (
         os.environ.get(FORGE_REPO_BASE_ENV, "").strip() or DEFAULT_FORGE_REPO_BASE
     )
-    base_dir = Path(base_dir_raw).expanduser().resolve()
+    base_dir = Path(base_dir_raw).expanduser().resolve() if base_dir_raw else None
 
     # THE MAP FIRST, THE GUESS SECOND. The configured path is what the
     # factory was told; the base directory is what the runner can infer. When
@@ -1812,6 +1835,15 @@ def _resolve_repo_path(payload: Mapping[str, Any]) -> Path | None:
     # what broke when routine builds moved inside the sandbox.
     candidate = _configured_repo_path(repo_key)
     if candidate is None:
+        # NO BASE, NO GUESS (2026-09-24). The base directory used to have a
+        # built-in default naming one machine's folder, so a repository the
+        # map did not carry was "resolved" against a path that only ever
+        # existed on that machine. With no default, an unset setting is said
+        # out loud instead.
+        if base_dir is None:
+            logger.error("autobuild_runner: %s", MISSING_REPO_BASE_REFUSAL)
+            return None
+
         # Accept ``org/repo`` and bare ``repo`` (defensive — the
         # BuildQueuedPayload field is loosely shaped; only the basename
         # matters for the local layout).
@@ -1870,9 +1902,20 @@ def _resolve_repo_path(payload: Mapping[str, Any]) -> Path | None:
     # FORGE_REPO_BASE itself — the resolver convention already constrains
     # paths to that root, so a bare base-dir check is equivalent to the
     # default permissions and avoids hard-failing test environments that
-    # ship without a forge.yaml.
+    # ship without a forge.yaml. With neither an allowlist nor a base there
+    # is nothing to gate against, and an ungated path is not something this
+    # runner may invent: it says so and refuses.
     allowlist = _load_filesystem_allowlist()
     if allowlist is None:
+        if base_dir is None:
+            logger.error(
+                "autobuild_runner: no filesystem allowlist could be read and "
+                "FORGE_REPO_BASE is not set, so %s could not be checked "
+                "against anything — refusing to build (repo=%r)",
+                candidate,
+                repo_raw,
+            )
+            return None
         allowlist = [base_dir]
 
     # Local import to avoid a hard adapter→subagent dep at module load.
@@ -5319,6 +5362,7 @@ __all__ = [
     "FORGE_AUTOBUILD_WORKTREE_BASE_ENV",
     "FORGE_GUARDKIT_PATH_ENV",
     "FORGE_REPO_BASE_ENV",
+    "MISSING_REPO_BASE_REFUSAL",
     "RUNNER_CODE_VERSION",
     "TAIL_READ_BUDGET_SECONDS",
     "AutobuildLifecycle",

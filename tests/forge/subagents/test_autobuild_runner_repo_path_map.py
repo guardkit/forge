@@ -5,7 +5,7 @@ routine builds moved inside the repository's sandbox died two seconds
 after launch with "unable to resolve repo path for repo='guardkit/api_test'".
 Nothing was wrong with the repository: the runner was GUESSING where it
 lives. It took the last part of the name and looked for it under a base
-directory that defaults to ``~/Projects/appmilla_github`` — and inside the
+directory that defaulted to one folder on one person's machine — and inside the
 sandbox the runner is the user ``agent``, so ``~`` is ``/home/agent`` and
 the guess pointed at a directory that has never existed. The repository
 was mounted all along, at the same path it has on the host, and that exact
@@ -237,6 +237,65 @@ def test_no_configuration_file_at_all_behaves_exactly_as_before(
     """No ``forge.yaml`` anywhere in reach: the base-directory route, untouched."""
     repo = _make_git_repo(tmp_path / "base" / "api_test")
     monkeypatch.setenv(FORGE_REPO_BASE_ENV, str(tmp_path / "base"))
+
+    assert _resolve_repo_path({"repo": REPO_KEY}) == repo
+
+
+# ---------------------------------------------------------------------------
+# The base directory has no built-in default any more (2026-09-24)
+# ---------------------------------------------------------------------------
+
+
+def test_a_repository_the_map_does_not_name_refuses_when_no_base_is_set(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The setting is named out loud instead of a folder being guessed.
+
+    ``DEFAULT_FORGE_REPO_BASE`` used to be one company's folder under one
+    person's home directory. Anywhere else — every container included — that
+    path does not exist, so the guess could only ever fail; it also put a
+    machine's layout inside the release image. There is no default now, and a
+    repository the map does not carry is refused by name.
+    """
+    elsewhere = _make_git_repo(tmp_path / "base" / "api_test")
+    monkeypatch.delenv(FORGE_REPO_BASE_ENV, raising=False)
+    _write_config(
+        Path("forge.yaml"),
+        allowlist=[str(tmp_path)],
+        repo_paths={"guardkit/something-else": str(elsewhere)},
+    )
+
+    with caplog.at_level(logging.ERROR, logger=LOGGER_NAME):
+        assert _resolve_repo_path({"repo": REPO_KEY}) is None
+
+    assert "FORGE_REPO_BASE is not set" in _messages(caplog)
+    assert "planning.target_repo_paths" in _messages(caplog)
+
+
+def test_the_refusal_reason_on_the_card_names_the_setting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The reason the build ends with says which setting to fill in."""
+    monkeypatch.delenv(FORGE_REPO_BASE_ENV, raising=False)
+    _write_config(Path("forge.yaml"), allowlist=[str(tmp_path)], repo_paths=None)
+
+    reason = repo_resolution_failure_reason({"repo": REPO_KEY})
+
+    assert reason == ar.MISSING_REPO_BASE_REFUSAL
+    assert "FORGE_REPO_BASE" in reason
+
+
+def test_a_mapped_repository_still_resolves_with_no_base_set(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Removing the default takes nothing away from the route that works."""
+    repo = _make_git_repo(tmp_path / "checkouts" / "api_test")
+    monkeypatch.delenv(FORGE_REPO_BASE_ENV, raising=False)
+    _write_config(
+        Path("forge.yaml"),
+        allowlist=[str(tmp_path)],
+        repo_paths={REPO_KEY: str(repo)},
+    )
 
     assert _resolve_repo_path({"repo": REPO_KEY}) == repo
 

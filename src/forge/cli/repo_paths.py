@@ -7,7 +7,7 @@ registering a repository mints both the claim (the map entry) and the thing
 claimed (the container's bind) from one edit.
 
 The estate spells the same repository two ways in the map — ``guardkit/<name>``
-and ``appmilla_github/<name>`` — so the same checkout appears twice. This
+and ``<checkout-folder>/<name>`` — so the same checkout appears twice. This
 command prints each distinct path once, sorted, one per line, and nothing else:
 its whole job is to be read by a shell loop.
 
