@@ -104,7 +104,7 @@ reporting a problem.
 So a stop signal here goes back through the same door the start went through
 and asks the project's own bootstrap to stop itself — one word,
 `SANDBOX_BOOTSTRAP_STOP_ARGUMENT` — and **waits for it**. Docker must wait too,
-which is why `stop_grace_period` is minutes rather than the default ten
+which is why `stop_grace_period` is ninety seconds rather than the default ten
 seconds. The same stop runs before every restart of the session, for the same
 reason systemd ran its `ExecStop` before every automatic restart.
 

@@ -220,6 +220,15 @@ on_stop_signal() {
 }
 trap on_stop_signal TERM INT
 
+# ONCE, BEFORE THE FIRST START: ask whatever is already running inside to stop.
+# The unit this replaces got this for free, because systemd runs ExecStop even
+# when the client was killed; a container gets no such courtesy. So a container
+# that died without stopping — killed, or the machine went down — and is started
+# again would otherwise start a SECOND supervisor beside the one still running
+# inside (the second review of 24 September 2026 produced exactly that against
+# a bootstrap with no lock of its own). Nothing running inside is the ordinary
+# case, and the bootstrap's stop says so and exits; that is not a failure.
+stop_the_work_inside
 start_keeper
 start_bootstrap
 
