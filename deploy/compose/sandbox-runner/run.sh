@@ -312,6 +312,15 @@ trap on_stop_signal TERM INT
 # case, and the bootstrap's stop says so and exits; that is not a failure. A
 # stop that will not work IS one, and then nothing starts.
 require_the_work_inside_to_stop || give_up_because_the_stop_failed
+# A stop signal that arrived WHILE that first stop was being retried means
+# nothing should start at all: the same guard the two later routes have (the
+# third review of 24 September 2026 caught this one starting a project's whole
+# stack only to tear it straight down again, inside the grace period).
+if ((STOPPING == 1)); then
+  log "asked to stop before anything was started; nothing to do"
+  log "stopped"
+  exit 0
+fi
 start_keeper
 start_bootstrap
 
