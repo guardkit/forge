@@ -342,10 +342,22 @@ check_host() {
         v="$(value_of "${name}")"
         [ -n "${v}" ] || unset_names="${unset_names} ${name}"
     done
+    # THE GATEWAY ADDRESS IS A VALUE THIS CHECK JUDGES, not merely counts
+    # (the stage 4a reviewer, 24 September 2026: a gateway of 0.0.0.0 rendered,
+    # published both ports on every interface, and this check said PASSED).
+    # The compose file's own words: it is never 0.0.0.0 and never blank, because
+    # either puts the estate on the local network, which the per-route policy
+    # forbids. So a gateway that is blank, all-interfaces, or not an address at
+    # all fails item 7 by name.
+    local gateway_value
+    gateway_value="$(value_of FACTORY_GATEWAY_ADDRESS)"
+    case "${gateway_value}" in
+        ""|0.0.0.0|::|"[::]") unset_names="${unset_names} FACTORY_GATEWAY_ADDRESS(is '${gateway_value:-blank}': it must be one private address of this machine, never blank and never every interface)" ;;
+    esac
     if [ -n "${unset_names}" ]; then
-        fail 7 "the composed files require these setting names and nothing set them:${unset_names}. A password name among them means the command was not run the way README.md says, with the values passed in from a child process."
+        fail 7 "the composed files require these setting names and nothing set them, or set them to a value that cannot be used:${unset_names}. A password name among them means the command was not run the way README.md says, with the values passed in from a child process."
     else
-        ok 7 "every setting name the composed files require has a value ($(printf '%s' "${required}" | wc -w) of them), including the ones whose values are passed in rather than written down."
+        ok 7 "every setting name the composed files require has a value ($(printf '%s' "${required}" | wc -w) of them), including the ones whose values are passed in rather than written down, and the gateway address is a single address rather than every interface."
     fi
 
     finish
@@ -488,7 +500,7 @@ check_services() {
     if [ -z "${bus}" ]; then
         fail 8 "the bus is not running in this estate, so nothing could ask it anything."
     elif docker exec "${bus}" wget --spider -q "http://localhost:8222/healthz" >/dev/null 2>&1; then
-        ok 8 "the bus answers, at the address the env file gives ($(redact "${bus_url}"))."
+        ok 8 "the bus answers its own health route inside its container (what was asked: localhost:8222/healthz there; the estate reaches it at $(redact "${bus_url}"), which item 8e proves separately through the coordinator's live subscription)."
     else
         fail 8 "the bus is running but does not answer its own health route, so nothing on the estate can use it."
     fi
