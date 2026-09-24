@@ -158,6 +158,18 @@ docker build --file "${CLONE}/Dockerfile" \
     "${CLONE}" >/dev/null || die "the bus image would not build."
 say "  ok ${BUS_IMAGE}"
 
+# THE COMPOSE FILE'S COMMAND MUST BE THE IMAGE'S OWN. compose.yaml names an
+# entrypoint for the bus (a wrapper), and naming an entrypoint empties the
+# image's CMD, so the compose file writes the command out by hand. Nothing held
+# the two together (the stage 4a reviewer, 24 September 2026): a future pin whose
+# Dockerfile changed its CMD would start the broker on the wrong command and every
+# test would still pass. So the build refuses when they differ.
+IMAGE_CMD="$(docker image inspect --format '{{json .Config.Cmd}}' "${BUS_IMAGE}")"
+COMPOSE_CMD="$(sed -nE 's/^[[:space:]]*command:[[:space:]]*(\[.*\])[[:space:]]*$/\1/p' "${HERE}/compose.yaml" | head -n 1 | tr -d ' ')"
+[ -n "${COMPOSE_CMD}" ] || die "compose.yaml's bus service has no one-line 'command: [...]' to compare with the image's CMD."
+[ "$(printf '%s' "${IMAGE_CMD}" | tr -d ' ')" = "${COMPOSE_CMD}" ] || die "the bus image at ${BUS_REPOSITORY_COMMIT} starts with CMD ${IMAGE_CMD}, but compose.yaml's bus service writes command: ${COMPOSE_CMD}. Make the compose file say what the image says, then build again."
+say "  ok the compose file's bus command matches the image's CMD: ${IMAGE_CMD}"
+
 # --- the one-shot ----------------------------------------------------------
 BASE_REPOSITORY="${BUS_PROVISION_BASE_IMAGE%%:*}"
 say ""
