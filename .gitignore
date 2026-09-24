@@ -246,3 +246,7 @@ __marimo__/
 !.env.sample
 !*.env.example
 !*.env.sample
+
+# Codex endpoints and generated session state belong to this machine.
+/.codex/config.toml
+/.codex/hooks/.state/

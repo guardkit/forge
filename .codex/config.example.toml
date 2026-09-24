@@ -1,0 +1,6 @@
+# Copy this file to .codex/config.toml (ignored by Git) for project-only MCPs.
+# Alternatively, configure MCPs in your user-level ~/.codex/config.toml.
+# An HTTP server URL is a literal value: put the actual endpoint in that local
+# file; do not put a machine hostname or a credential in this example.
+# [mcp_servers.graphiti]
+# url = "https://memory.example.invalid/mcp"

@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "'/Users/richardwoollcott/Projects/appmilla_github/forge/.codex/hooks/capture_slash_command.py'"
+            "command": "python3 \"$(git rev-parse --show-toplevel)/.codex/hooks/capture_slash_command.py\""
           }
         ]
       }
@@ -15,7 +15,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "'/Users/richardwoollcott/Projects/appmilla_github/forge/.codex/hooks/capture_slash_command.py'"
+            "command": "python3 \"$(git rev-parse --show-toplevel)/.codex/hooks/capture_slash_command.py\""
           }
         ]
       }
