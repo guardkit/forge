@@ -28,7 +28,7 @@
 # ---------------------------------------------------------------------------
 
 schema: 1
-version: 2026.09.24-2
+version: 2026.09.24-3
 image_name: forge
 
 # The Python base image both Dockerfile stages start FROM. The build script
@@ -43,12 +43,12 @@ repositories:
   - name: forge
     url: https://github.com/guardkit/forge.git
     branch: main
-    commit: d496dae8f32aa9569a3dac5212772ea625e90905
+    commit: 23d6331fea4b1b5ae62943a56080a5a0280cec4f
     role: build-context-root
   - name: guardkit
     url: https://github.com/guardkit/guardkit.git
     branch: main
-    commit: 0f43566861baedca075932dcf3efeee1508bfc84
+    commit: f126713696a459e8f129ef63af4afa8a0748eb77
     role: named-context
   - name: nats-core
     url: https://github.com/guardkit/nats-core.git
@@ -58,10 +58,10 @@ repositories:
   - name: fleet-memory
     url: https://github.com/guardkit/fleet-memory.git
     branch: main
-    commit: ec1fe9b0ecd21dae96d1d184e3129c11943be72f
+    commit: f215487748a8b5270bd32f55b3c55da2cf027125
     role: named-context
   - name: guardkitfactory
     url: https://github.com/guardkit/guardkitfactory.git
     branch: main
-    commit: 7165193f63abe8f48a98496761f467e6ff7ab631
+    commit: 8358670e3c57442bcc8862ea4ff96a7f4ec78dc7
     role: named-context
