@@ -61,8 +61,10 @@ BOOTSTRAP = "the/projects/own/bootstrap"
 #:
 #: It writes one line per call, and what a stop does depends on ``config.json``:
 #: ``stop_fails_from`` / ``stop_times_out_from`` are the numbered stop at which
-#: stops begin to fail or to hang, and ``drop_sessions`` is how many of the
-#: first bootstrap sessions end by themselves with the work still running.
+#: stops begin to fail or to hang, ``stop_fails_until`` is the numbered stop
+#: before which every stop fails (so a stop can fail and then succeed on a
+#: retry), and ``drop_sessions`` is how many of the first bootstrap sessions
+#: end by themselves with the work still running.
 STAND_IN_CLIENT = '''#!/usr/bin/env python3
 import json, os, signal, subprocess, sys, time
 from pathlib import Path
@@ -122,6 +124,8 @@ elif len(request) > 1 and request[-1] == "stop":
     if count >= config.get("stop_times_out_from", NEVER):
         time.sleep(600)
     if count >= config.get("stop_fails_from", NEVER):
+        sys.exit(17)
+    if count < config.get("stop_fails_until", 0):
         sys.exit(17)
     for item in happened():
         if item["kind"] == "worker" and item["slot"] == slot and alive(item["pid"]):
@@ -447,6 +451,34 @@ class TestTheStopCarriesTheSettingsTheStartDid:
 
 
 class TestTheOrdinaryPathStillWorks:
+    def test_a_stop_that_succeeds_on_a_retry_permits_exactly_one_replacement(
+        self, root: Path
+    ) -> None:
+        """Codex, 24 September 2026: "a stop that succeeds on a later retry
+        permits exactly one replacement." The first stop fails, the second
+        succeeds; the work already inside is gone, and exactly one bootstrap
+        has been started on top of nothing."""
+        _configure(root, stop_fails_until=2)
+        already_inside = _seed_the_work_already_inside(root)
+
+        service = _start(root, SANDBOX_STOP_RETRY_SECONDS="1")
+        assert _wait_for(lambda: len(_starts(root)) == 1), (
+            f"expected one start after the retried stop, saw: {_events(root)}"
+        )
+        assert _wait_for(lambda: already_inside not in _workers_alive(root), seconds=10), (
+            "the retried stop said it worked but the old work is still alive"
+        )
+        assert len(_stops(root)) == 2, f"expected a failed stop then a good one: {_stops(root)}"
+        assert len(_workers_alive(root)) == 1, (
+            f"exactly one worker should be alive, the replacement: {_workers_alive(root)}"
+        )
+
+        service.send_signal(signal.SIGTERM)
+        output = _finish(service)
+        assert service.returncode == 0
+        assert len(_starts(root)) == 1, "the shutdown must not have started anything"
+        assert "[sandbox-runner] stopped" in output.splitlines()
+
     def test_a_clean_shutdown_ends_the_work_and_lets_the_sandbox_sleep(
         self, root: Path
     ) -> None:

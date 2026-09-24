@@ -62,10 +62,15 @@ services:
     # THE WHOLE POINT OF THE PASS. A stop signal here runs the project's
     # bootstrap's own stop mode INSIDE the sandbox and waits for it, because
     # ending the client out here ends nothing in there. Docker must therefore
-    # wait too: this is the ceiling on that wait, and it is deliberately above
-    # SANDBOX_STOP_TIMEOUT_SECONDS so the script gives up before Docker does
-    # and can still release its hold. The unit this replaces allowed 60s.
-    stop_grace_period: ${SANDBOX_STOP_GRACE_PERIOD:-90s}
+    # wait too: this is the ceiling on that wait, and it must stay above the
+    # WORST case of the script's own stopping, or Docker kills the container
+    # mid-retry and the operator loses the plain sentence in exactly the case
+    # that needs it (the second review of 24 September 2026). The worst case
+    # is every try timing out: attempts x (timeout + pause) for the stop, then
+    # one more timeout to release the hold. With the defaults below that is
+    # 3 x (45 + 5) + 45 = 195s, so the ceiling is 210s. Change one, change the
+    # others. The unit this replaces allowed 60s and never retried.
+    stop_grace_period: ${SANDBOX_STOP_GRACE_PERIOD:-210s}
     stop_signal: SIGTERM
 
     # NO NETWORK AT ALL. Everything this service says, it says over a unix
@@ -90,6 +95,8 @@ services:
       SANDBOX_CLIENT_ARGUMENTS: ${SANDBOX_CLIENT_ARGUMENTS:-}
       SANDBOX_RESTART_SECONDS: ${SANDBOX_RESTART_SECONDS:-5}
       SANDBOX_STOP_TIMEOUT_SECONDS: ${SANDBOX_STOP_TIMEOUT_SECONDS:-45}
+      SANDBOX_STOP_ATTEMPTS: ${SANDBOX_STOP_ATTEMPTS:-3}
+      SANDBOX_STOP_RETRY_SECONDS: ${SANDBOX_STOP_RETRY_SECONDS:-5}
       # THE CLIENT'S OWN STATE FOLDER. It must be writable and it must be the
       # folder the socket sits under, at exactly the path below. Put the
       # socket anywhere else and the client decides it is talking to a hosted

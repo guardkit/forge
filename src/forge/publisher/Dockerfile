@@ -1,8 +1,9 @@
 # ---------------------------------------------------------------------------
-# The publisher's own image. NOT BUILT by the stage that wrote it, and not
-# started by it: it is here so that the thing the design calls "its own
-# process in its own container" has one, and so that the rollout has
-# something to read rather than something to invent.
+# The publisher's own image. Written by the stage that designed the publisher,
+# which built and started nothing; since 24 September 2026 the release script
+# (scripts/build-release-image.sh) builds it from the same manifest as the
+# coordinator's image, tagged forge-publisher:<version>, so the thing the
+# design calls "its own process in its own container" has one for real.
 #
 # WHY IT IS ITS OWN IMAGE AND NOT A FLAG ON THE COORDINATOR'S. The publisher
 # holds the one credential that can write to a project's remote. Builds are
