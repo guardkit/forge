@@ -76,7 +76,7 @@ services:
   # wrapper refuses an empty file by name.
   # -------------------------------------------------------------------------
   nats:
-    image: ${NATS_IMAGE:?name the bus image in the env file, e.g. NATS_IMAGE=factory-nats:2026.09.24-5 - built by ./build-estate-images.sh from the bus repository at its pinned commit}
+    image: ${NATS_IMAGE:?name the bus image in the env file, e.g. NATS_IMAGE=factory-nats:2026.09.24-6 - built by ./build-estate-images.sh from the bus repository at its pinned commit}
     restart: unless-stopped
     # Every '$$' below is a dollar sign for the SHELL, escaped so that compose
     # leaves it alone. The last item is the shell's $0; the image's own command

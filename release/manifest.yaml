@@ -33,7 +33,15 @@
 # manifests still build — the script reads them as one image, the
 # coordinator's, from the build-context root's own Dockerfile.
 schema: 2
-version: 2026.09.24-5
+# 2026.09.24-6 (24 September 2026, stage 4e). What it adds to release 5: the
+# two folders both of a sandbox's containers share are made and bound as
+# mounts, a refused second start of the bootstrap exits 4 with its sentence,
+# and the image carries the docker CLIENT — pinned, checksummed, no daemon —
+# so the factory's deploy helper can run a deploy a project declares that
+# brings containers up. The forge pin below moves with it; the other four
+# repositories are at the same commits release 5 was cut from, which are still
+# their main on GitHub today (checked 24 September 2026).
+version: 2026.09.24-6
 
 # The one image this repository's own operator scripts mean by "the release
 # image" (ops/forge-prod-recreate.sh reads this line). It is the same name as
@@ -86,7 +94,7 @@ repositories:
   - name: forge
     url: https://github.com/guardkit/forge.git
     branch: main
-    commit: 8c3281161588c875e27913725b6ebee7975728f7
+    commit: 4e096ddce24ad3e08d664e7998f9beaa735c4e8b
     role: build-context-root
   - name: guardkit
     url: https://github.com/guardkit/guardkit.git
