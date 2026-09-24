@@ -348,6 +348,33 @@ RUN chmod 0755 /opt/forge/sandbox-runner/run.sh
 RUN groupadd --system --gid 1000 forge \
     && useradd --system --uid 1000 --gid 1000 --home-dir /home/forge --create-home --shell /usr/sbin/nologin forge
 
+# ---------------------------------------------------------------------------
+# THE FOUR FOLDERS THE COMPOSE BUNDLE MOUNTS VOLUMES ON, made here and owned
+# by the user this image runs as (24 September 2026, stage 2b of the
+# containerisation rollout gate).
+#
+# WHY THIS IS AN IMAGE CHANGE AND NOT A COMPOSE ONE. Docker fills a FRESH
+# named volume from whatever the image has at that path — contents and
+# ownership together — and where the image has nothing, it makes an empty
+# folder owned by root. All four of these mounts used to land on nothing, so
+# the first start on a clean machine handed an unprivileged service four
+# root-owned folders: the coordinator could not write its own record, and
+# deploy/compose/README.md had to tell the operator to run a chown over the
+# four volumes before the first start. That step is now deleted, because this
+# is where it belonged: a step a person has to remember is a step a clean
+# machine gets wrong.
+#
+# The paths are exactly the four volume mounts in deploy/compose/compose.yaml:
+# the record, the evidence, the settings (mounted read-only there — the
+# machine puts the settings file on the volume before anything starts) and
+# this service's own small state under its home. Keep the two in step.
+#
+# The publisher's image does the same thing for its own one folder, in its own
+# way: it runs ``mkdir -p /home/publisher/state`` AFTER dropping to the
+# publisher user, so the folder is made owned by that user without a chown.
+RUN mkdir -p /var/lib/forge /var/lib/forge-evidence /etc/forge /home/forge/.forge \
+    && chown forge:forge /var/lib/forge /var/lib/forge-evidence /etc/forge /home/forge/.forge
+
 WORKDIR /home/forge
 
 # Drop privileges before declaring the entrypoint so the container's

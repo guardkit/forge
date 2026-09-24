@@ -1,9 +1,15 @@
 #!/usr/bin/env bash
 # ---------------------------------------------------------------------------
-# scripts/build-release-image.sh — build ONE Forge release image from a
-# manifest, from nothing but GitHub.
+# scripts/build-release-image.sh — build a release's IMAGES from a manifest,
+# from nothing but GitHub.
 #
-# Written 2026-09-24 for the containerisation rollout gate.
+# Written 2026-09-24 for the containerisation rollout gate. Extended the same
+# day (stage 2b) from one image to the SET of images a release is made of,
+# because the estate runs two: the coordinator's and the publisher's. Until
+# then only the coordinator's was ever built, so every proof of the publisher
+# had run the coordinator's image with the publisher's start line — a
+# stand-in, and the one image holding the credential that can write to a
+# project's remote was the one image nobody had built.
 #
 # WHY THIS EXISTS, ALONGSIDE scripts/build-image.sh
 #
@@ -24,14 +30,20 @@
 #     other commit, or if that commit is not on the branch the manifest names
 #     (a host serves any commit by its sha, so without that second check the
 #     branch written into the image's labels would be a claim nobody tested);
-#   * the image is built from those clones ALONE — no directory beside this
-#     script, or beside the working directory, is read;
-#   * the resulting image is tagged by the commit it was built from and by the
-#     manifest version, and labelled with all five commits, the manifest
-#     version and the manifest's own hash, so the image can always say what it
-#     is made of;
-#   * the image is NEVER tagged `latest`, and never tags over an image that
+#   * EVERY image the manifest names is built from those clones ALONE — no
+#     directory beside this script, or beside the working directory, is read.
+#     One run, one set of clones, so the images of a release cannot be built
+#     from different code and still carry the same release name;
+#   * each resulting image is tagged by the commit it was built from and by
+#     the manifest version, and labelled with all five commits, the manifest
+#     version, the manifest's own hash and its own ROLE in the release, so any
+#     image can say both what it is made of and which of the release's images
+#     it is;
+#   * no image is EVER tagged `latest`, and none tags over an image that
 #     already exists. A floating tag is the thing this whole path is replacing.
+#     Every refusal below applies to every image in the set, and it is made
+#     for all of them BEFORE anything is fetched or built, so a release never
+#     half-lands;
 #
 # The only things a machine needs to run this: this script, the manifest,
 # Docker (with buildx), git, awk, and either sha256sum (Linux) or shasum
@@ -49,17 +61,34 @@
 #                           reader, i.e. in the current directory)
 #     --allow-existing-tag permit building over a tag that already exists.
 #                          Off by default: a release tag is written once.
-#     --skip-proof         skip the image's own proof step. For diagnosis only;
-#                          a release is never cut with this.
+#     --skip-proof         skip every image's own proof step. For diagnosis
+#                          only; a release is never cut with this.
 #     --plan-only          read and check the manifest, print what would be
-#                          fetched and built, and stop. Nothing is fetched,
+#                          fetched and built — every image, its file, its role
+#                          and its two tags — and stop. Nothing is fetched,
 #                          nothing is built, no tag is written.
 #
 # Exit status is non-zero, with a sentence saying which input was wrong, on any
 # drift: a commit that cannot be fetched, a clone at the wrong commit, a commit
 # that is not on the branch the manifest names, a branch that does not exist, a
 # repository missing from the manifest, a base image digest that no longer
-# matches the Dockerfile, or a tag that already exists.
+# matches one of the Dockerfiles, or a tag that already exists.
+#
+# THE TWO MANIFEST SCHEMAS
+#
+#   schema: 1   names ONE image, in `image_name`. It is read as the
+#               coordinator's image, built from the build-context root's own
+#               `Dockerfile` and proved by `scripts/verify-forge-oracles.sh` —
+#               which is exactly what this script did before it could build a
+#               set. A release cut before the publisher's image existed still
+#               builds, unchanged.
+#   schema: 2   names a SET, under `images:`. Each entry has a name, the
+#               dockerfile to build it from (a path inside the build-context
+#               root's clone), its role in the release, and optionally the
+#               proof script that has to pass before the release is called
+#               built. `image_name` stays, and must be the name of the one
+#               entry whose role is `coordinator`: it is the image this
+#               repository's own operator scripts mean by "the release image".
 # ---------------------------------------------------------------------------
 
 set -euo pipefail
@@ -88,7 +117,7 @@ while [ "$#" -gt 0 ]; do
         --skip-proof) RUN_PROOF=0; shift ;;
         --plan-only) PLAN_ONLY=1; shift ;;
         --receipt) [ "$#" -ge 2 ] || die "--receipt needs a path"; RECEIPT="$2"; shift 2 ;;
-        -h|--help) sed -n '1,63p' "$0"; exit 0 ;;
+        -h|--help) sed -n '1,92p' "$0"; exit 0 ;;
         -*) die "unknown option: $1" ;;
         *) [ -z "${MANIFEST}" ] || die "more than one manifest given: ${MANIFEST} and $1"; MANIFEST="$1"; shift ;;
     esac
@@ -124,13 +153,42 @@ MANIFEST_SHA="$(hash_of "${MANIFEST}")"
 # is honest rather than clever. Anything the reader does not recognise is
 # reported by name rather than ignored.
 # ---------------------------------------------------------------------------
+#
+# TWO lists, not one, since stage 2b: `repositories:` (what goes in) and
+# `images:` (what comes out). They are read by the same three rules — a header
+# on its own line, an entry that starts with a dash, and the entry's further
+# keys indented under it — with a different set of permitted keys each. A key
+# that belongs to the other list is reported by name rather than ignored, so
+# an `images:` entry cannot quietly carry a `commit:` and look pinned.
 PARSED="$(
     awk '
         function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
-        function flush_repo() {
-            if (have_repo) {
-                printf "REPO|%s|%s|%s|%s|%s\n", r_name, r_url, r_branch, r_commit, r_role
-                have_repo = 0; r_name = ""; r_url = ""; r_branch = ""; r_commit = ""; r_role = ""
+        function flush_item() {
+            if (!have_item) return
+            if (cur_list == "repositories")
+                printf "REPO|%s|%s|%s|%s|%s\n", f_name, f_url, f_branch, f_commit, f_role
+            else if (cur_list == "images")
+                printf "IMAGE|%s|%s|%s|%s\n", f_name, f_dockerfile, f_role, f_proof
+            have_item = 0
+            f_name = ""; f_url = ""; f_branch = ""; f_commit = ""; f_role = ""
+            f_dockerfile = ""; f_proof = ""
+        }
+        function setkey(key, val) {
+            if (cur_list == "repositories") {
+                if (key == "name") f_name = val
+                else if (key == "url") f_url = val
+                else if (key == "branch") f_branch = val
+                else if (key == "commit") f_commit = val
+                else if (key == "role") f_role = val
+                else printf "UNKNOWN|%s|%s\n", cur_list, key
+            } else if (cur_list == "images") {
+                if (key == "name") f_name = val
+                else if (key == "dockerfile") f_dockerfile = val
+                else if (key == "role") f_role = val
+                else if (key == "proof") f_proof = val
+                else printf "UNKNOWN|%s|%s\n", cur_list, key
+            } else {
+                printf "UNKNOWN|%s|%s\n", cur_list, key
             }
         }
         {
@@ -139,40 +197,42 @@ PARSED="$(
             if (trim(line) == "") next
         }
         # top-level "key: value"
-        /^[a-z_]+:[ \t]*[^ \t]/ {
-            flush_repo()
-            in_repos = 0
+        line ~ /^[a-z_]+:[ \t]*[^ \t]/ {
+            flush_item()
+            cur_list = ""
             k = line; sub(/:.*$/, "", k)
             v = line; sub(/^[a-z_]+:[ \t]*/, "", v)
             printf "TOP|%s|%s\n", trim(k), trim(v)
             next
         }
-        # the list header
-        /^repositories:[ \t]*$/ { flush_repo(); in_repos = 1; next }
+        # a list header, on a line of its own
+        line ~ /^[a-z_]+:[ \t]*$/ {
+            flush_item()
+            cur_list = line; sub(/:.*$/, "", cur_list); cur_list = trim(cur_list)
+            if (cur_list != "repositories" && cur_list != "images")
+                printf "UNKNOWNLIST|%s\n", cur_list
+            next
+        }
         # a new list entry
-        in_repos && /^[ \t]*-[ \t]*[a-z_]+:/ {
-            flush_repo()
-            have_repo = 1
-            e = line; sub(/^[ \t]*-[ \t]*/, "", e)
+        cur_list != "" && line ~ /^[ \t]*-[ \t]*[a-z_]+:/ {
+            flush_item()
+            have_item = 1
+            e = line; sub(/^[ \t]*-[ \t]*/, "", e); e = trim(e)
             k = e; sub(/:.*$/, "", k); k = trim(k)
             v = e; sub(/^[a-z_]+:[ \t]*/, "", v); v = trim(v)
-            if (k == "name") r_name = v; else if (k == "url") r_url = v;
-            else if (k == "branch") r_branch = v; else if (k == "commit") r_commit = v;
-            else if (k == "role") r_role = v; else printf "UNKNOWN|%s\n", k
+            setkey(k, v)
             next
         }
         # a continuation key of the current list entry
-        in_repos && have_repo && /^[ \t]+[a-z_]+:/ {
+        cur_list != "" && have_item && line ~ /^[ \t]+[a-z_]+:/ {
             e = trim(line)
             k = e; sub(/:.*$/, "", k); k = trim(k)
             v = e; sub(/^[a-z_]+:[ \t]*/, "", v); v = trim(v)
-            if (k == "name") r_name = v; else if (k == "url") r_url = v;
-            else if (k == "branch") r_branch = v; else if (k == "commit") r_commit = v;
-            else if (k == "role") r_role = v; else printf "UNKNOWN|%s\n", k
+            setkey(k, v)
             next
         }
         { printf "UNPARSED|%s\n", trim(line) }
-        END { flush_repo() }
+        END { flush_item() }
     ' "${MANIFEST}"
 )" || die "the manifest at ${MANIFEST} could not be read."
 
@@ -181,10 +241,15 @@ if echo "${PARSED}" | grep -q '^UNPARSED'; then
     echo "${PARSED}" | awk -F'[|]' '$1 == "UNPARSED" { print "       " $2 }' >&2
     die "fix the manifest, or the reader, before building a release from it."
 fi
-if echo "${PARSED}" | grep -q '^UNKNOWN'; then
-    echo "ERROR: the manifest names repository keys this reader does not understand:" >&2
-    echo "${PARSED}" | awk -F'[|]' '$1 == "UNKNOWN" { print "       " $2 }' >&2
-    die "the four keys per repository are name, url, branch, commit (plus role)."
+if echo "${PARSED}" | grep -q '^UNKNOWNLIST'; then
+    echo "ERROR: the manifest at ${MANIFEST} has lists this reader does not understand:" >&2
+    echo "${PARSED}" | awk -F'[|]' '$1 == "UNKNOWNLIST" { print "       " $2 ":" }' >&2
+    die "the two lists are 'repositories:' (what goes into the release) and 'images:' (what comes out of it)."
+fi
+if echo "${PARSED}" | grep -q '^UNKNOWN|'; then
+    echo "ERROR: the manifest names keys this reader does not understand:" >&2
+    echo "${PARSED}" | awk -F'[|]' '$1 == "UNKNOWN" { print "       " $3 "  (under " $2 ":)" }' >&2
+    die "a repository has name, url, branch, commit and role; an image has name, dockerfile, role and an optional proof."
 fi
 
 top() { echo "${PARSED}" | awk -F'[|]' -v k="$2" '$1 == "TOP" && $2 == k { print $3; exit }'; }
@@ -194,8 +259,7 @@ VERSION="$(top _ version)"
 IMAGE_NAME="$(top _ image_name)"
 BASE_DIGEST="$(top _ python_base_digest)"
 
-[ "${SCHEMA}" = "1" ] || die "the manifest says schema '${SCHEMA}'; this script reads schema 1."
-[ -n "${VERSION}" ] || die "the manifest has no 'version' line, so the image would have no release name."
+[ -n "${VERSION}" ] || die "the manifest has no 'version' line, so the images would have no release name."
 [ -n "${IMAGE_NAME}" ] || die "the manifest has no 'image_name' line."
 case "${BASE_DIGEST}" in
     sha256:[0-9a-f]*) ;;
@@ -229,30 +293,113 @@ done <<< "${REPO_LINES}"
 
 [ -n "${ROOT_NAME}" ] || die "no repository in the manifest has role build-context-root, so there is no Dockerfile to build."
 
-REPO_COUNT="$(echo "${REPO_LINES}" | wc -l | tr -d ' ')"
-say "Release ${VERSION} — ${REPO_COUNT} repositories, manifest ${MANIFEST_SHA}"
-
 # ---------------------------------------------------------------------------
-# The tags, decided before anything is fetched or built.
+# The images this release is made of.
+#
+# Schema 1 named one, in `image_name`, and built it from the build-context
+# root's own Dockerfile. That is still exactly what a schema 1 manifest means,
+# written out here rather than assumed further down, so the rest of this
+# script has ONE shape to handle and an old manifest keeps building.
 # ---------------------------------------------------------------------------
-TAG_COMMIT="${IMAGE_NAME}:${ROOT_COMMIT}"
-TAG_VERSION="${IMAGE_NAME}:${VERSION}"
+IMAGE_LINES="$(echo "${PARSED}" | awk -F'[|]' '$1 == "IMAGE"')"
 
-for t in "${TAG_COMMIT}" "${TAG_VERSION}"; do
-    case "${t}" in
-        *:latest) die "this script will not produce a '${t}' tag. A release is named by the commit it was built from; a floating tag is what this path replaces." ;;
+case "${SCHEMA}" in
+    1)
+        [ -z "${IMAGE_LINES}" ] \
+            || die "the manifest says schema 1 and also carries an 'images:' list. Schema 1 names exactly one image, in 'image_name'; a manifest that names the set of images a release builds is schema 2."
+        IMAGE_LINES="IMAGE|${IMAGE_NAME}|Dockerfile|coordinator|scripts/verify-forge-oracles.sh"
+        ;;
+    2)
+        [ -n "${IMAGE_LINES}" ] \
+            || die "the manifest says schema 2 and names no images. Schema 2 lists every image the release builds under 'images:'."
+        ;;
+    *)
+        die "the manifest says schema '${SCHEMA}'; this script reads schema 1 (one image, named by 'image_name') and schema 2 (a set of images, listed under 'images:')."
+        ;;
+esac
+
+COORDINATOR_NAME=""
+SEEN_IMAGE_NAMES=""
+
+while IFS='|' read -r _tag iname idockerfile irole iproof; do
+    [ -n "${iname}" ] || die "an image entry in the manifest has no name."
+    [ -n "${idockerfile}" ] \
+        || die "image '${iname}' has no dockerfile, so this script would not know what to build for it. It is a path inside the fetched clone of ${ROOT_NAME}, for example Dockerfile."
+    [ -n "${irole}" ] \
+        || die "image '${iname}' has no role, so the image could not say which of the release's images it is."
+    case "${idockerfile}" in
+        /*) die "image '${iname}' names the dockerfile '${idockerfile}'. It is a path INSIDE the fetched clone, so it is relative — an absolute path would be a path on whichever machine ran the build." ;;
+        *..*) die "image '${iname}' names the dockerfile '${idockerfile}', which climbs out of the fetched clone. Everything a release is built from is inside the clones this run fetched." ;;
     esac
-    if docker image inspect "${t}" >/dev/null 2>&1; then
-        [ "${ALLOW_EXISTING_TAG}" = "1" ] \
-            || die "the tag ${t} already exists on this machine. A release tag is written once, and moving it would change what that name means for anything already using it. Delete it deliberately, or pass --allow-existing-tag if you meant to rebuild it."
+    case "${iproof}" in
+        "") ;;
+        /*) die "image '${iname}' names the proof '${iproof}'. Like the dockerfile it is a path inside the fetched clone, so it is relative." ;;
+        *..*) die "image '${iname}' names the proof '${iproof}', which climbs out of the fetched clone." ;;
+    esac
+    # A role is a plain lower-case word. It goes into a label and into the
+    # receipt, so it says which of the release's images this is and nothing
+    # more: no spaces, no path, nothing that could carry a machine's anything.
+    case "${irole}" in
+        *[!a-z0-9-]*|-*|*-) die "image '${iname}' has role '${irole}'. A role is a plain lower-case word saying which of the release's images this is, for example coordinator or publisher." ;;
+    esac
+    case " ${SEEN_IMAGE_NAMES} " in
+        *" ${iname} "*) die "two images in the manifest are both called '${iname}'. Each image in a release has a name of its own; two of them under one name would tag over each other." ;;
+    esac
+    SEEN_IMAGE_NAMES="${SEEN_IMAGE_NAMES} ${iname}"
+    if [ "${irole}" = "coordinator" ]; then
+        [ -z "${COORDINATOR_NAME}" ] \
+            || die "two images claim role coordinator: ${COORDINATOR_NAME} and ${iname}. One image of a release is the one this repository's own operator scripts mean by 'the release image', and 'image_name' names it."
+        COORDINATOR_NAME="${iname}"
     fi
-done
+done <<< "${IMAGE_LINES}"
+
+[ -n "${COORDINATOR_NAME}" ] \
+    || die "no image in the manifest has role coordinator, so nothing in the release answers to 'image_name'."
+[ "${COORDINATOR_NAME}" = "${IMAGE_NAME}" ] \
+    || die "the manifest's image_name is '${IMAGE_NAME}' and the image whose role is coordinator is called '${COORDINATOR_NAME}'. They are the same image said twice, so they have to agree: ops/forge-prod-recreate.sh reads image_name to name the release it expects."
+
+REPO_COUNT="$(echo "${REPO_LINES}" | wc -l | tr -d ' ')"
+IMAGE_COUNT="$(echo "${IMAGE_LINES}" | wc -l | tr -d ' ')"
+say "Release ${VERSION} — ${REPO_COUNT} repositories, ${IMAGE_COUNT} images, manifest ${MANIFEST_SHA}"
+
+# ---------------------------------------------------------------------------
+# The tags, decided for EVERY image before anything is fetched or built.
+#
+# All of them are checked first, and the run stops on the first one that is
+# wrong, so a release never lands half of its images and then refuses. The two
+# tags an image gets are the commit the release was built from and the release
+# version; the commit tag is shared by every image of the release, which is
+# what says they were built together.
+# ---------------------------------------------------------------------------
+tags_of() { echo "$1:${ROOT_COMMIT} $1:${VERSION}"; }
+
+while IFS='|' read -r _tag iname idockerfile irole iproof; do
+    for t in $(tags_of "${iname}"); do
+        case "${t}" in
+            *:latest) die "this script will not produce a '${t}' tag. A release is named by the commit it was built from; a floating tag is what this path replaces." ;;
+        esac
+        if docker image inspect "${t}" >/dev/null 2>&1 </dev/null; then
+            [ "${ALLOW_EXISTING_TAG}" = "1" ] \
+                || die "the tag ${t} already exists on this machine. A release tag is written once, and moving it would change what that name means for anything already using it. Delete it deliberately, or pass --allow-existing-tag if you meant to rebuild it."
+        fi
+    done
+done <<< "${IMAGE_LINES}"
 
 if [ "${PLAN_ONLY}" = "1" ]; then
-    echo "Release ${VERSION} (manifest ${MANIFEST_SHA})"
-    echo "  would tag : ${TAG_COMMIT}"
-    echo "              ${TAG_VERSION}"
+    echo "Release ${VERSION} (manifest ${MANIFEST_SHA}, schema ${SCHEMA})"
     echo "  base image: ${BASE_DIGEST}"
+    echo "  would build ${IMAGE_COUNT} image(s), all from the same fetched clones:"
+    while IFS='|' read -r _tag iname idockerfile irole iproof; do
+        echo "    ${iname} [${irole}] from ${ROOT_NAME}/${idockerfile}"
+        for t in $(tags_of "${iname}"); do
+            echo "      would tag : ${t}"
+        done
+        if [ -n "${iproof}" ]; then
+            echo "      proved by : ${ROOT_NAME}/${iproof}"
+        else
+            echo "      proved by : nothing — this image names no proof"
+        fi
+    done <<< "${IMAGE_LINES}"
     echo "  would fetch:"
     while IFS='|' read -r _tag name url branch commit role; do
         echo "    ${name} ${commit} (${branch}) ${url} [${role}]"
@@ -341,24 +488,41 @@ while IFS='|' read -r _tag name url branch commit role; do
 done <<< "${REPO_LINES}"
 
 ROOT_DIR="${TMP}/${ROOT_NAME}"
-[ -f "${ROOT_DIR}/Dockerfile" ] \
-    || die "${ROOT_NAME} at ${ROOT_COMMIT} has no Dockerfile, so there is nothing to build."
+
+# Every image's dockerfile and every image's proof has to be IN the fetched
+# clone, and this is checked for all of them before the first build, so a
+# manifest that names a file the pin does not carry stops before anything is
+# tagged rather than after the first image has landed.
+while IFS='|' read -r _tag iname idockerfile irole iproof; do
+    [ -f "${ROOT_DIR}/${idockerfile}" ] \
+        || die "image '${iname}' is built from ${idockerfile}, and ${ROOT_NAME} at ${ROOT_COMMIT} has no such file. The dockerfile comes from the fetched clone at the pin, never from a checkout beside this script."
+    if [ -n "${iproof}" ]; then
+        [ -f "${ROOT_DIR}/${iproof}" ] \
+            || die "image '${iname}' names the proof ${iproof}, and ${ROOT_NAME} at ${ROOT_COMMIT} has no such file. A release proves itself with the code it is made of."
+    fi
+done <<< "${IMAGE_LINES}"
 
 # ---------------------------------------------------------------------------
-# Drift check: the base image the manifest pins must be the base image the
-# fetched Dockerfile actually starts FROM — every stage of it.
+# Drift check: the base image the manifest pins must be the base image EVERY
+# fetched Dockerfile actually starts FROM — every stage of every one of them.
+#
+# One manifest line, every image: the images of a release share a base, and an
+# image that quietly started from another one would be a second supply chain
+# inside a release that claims to have one.
 # ---------------------------------------------------------------------------
-FROM_DIGESTS="$(grep -E '^FROM ' "${ROOT_DIR}/Dockerfile" | sed -n 's/.*@\(sha256:[0-9a-f]\{64\}\).*/\1/p' | sort -u)"
-[ -n "${FROM_DIGESTS}" ] \
-    || die "the Dockerfile at ${ROOT_COMMIT} pins no base image digest, so the manifest's python_base_digest cannot be checked against it."
-if [ "$(echo "${FROM_DIGESTS}" | wc -l | tr -d ' ')" != "1" ]; then
-    echo "ERROR: the Dockerfile starts FROM more than one base digest:" >&2
-    echo "${FROM_DIGESTS}" | sed 's/^/       /' >&2
-    die "the manifest records one base image; fix the Dockerfile or widen the manifest."
-fi
-[ "${FROM_DIGESTS}" = "${BASE_DIGEST}" ] \
-    || die "the manifest pins the base image ${BASE_DIGEST} and the Dockerfile at ${ROOT_COMMIT} starts FROM ${FROM_DIGESTS}. One of them has moved; a release does not guess which."
-say "  ok base image ${BASE_DIGEST} agrees with the Dockerfile"
+while IFS='|' read -r _tag iname idockerfile irole iproof; do
+    FROM_DIGESTS="$(grep -E '^FROM ' "${ROOT_DIR}/${idockerfile}" | sed -n 's/.*@\(sha256:[0-9a-f]\{64\}\).*/\1/p' | sort -u)"
+    [ -n "${FROM_DIGESTS}" ] \
+        || die "${idockerfile} at ${ROOT_COMMIT} (image '${iname}') pins no base image digest, so the manifest's python_base_digest cannot be checked against it."
+    if [ "$(echo "${FROM_DIGESTS}" | wc -l | tr -d ' ')" != "1" ]; then
+        echo "ERROR: ${idockerfile} (image '${iname}') starts FROM more than one base digest:" >&2
+        echo "${FROM_DIGESTS}" | sed 's/^/       /' >&2
+        die "the manifest records one base image; fix the Dockerfile or widen the manifest."
+    fi
+    [ "${FROM_DIGESTS}" = "${BASE_DIGEST}" ] \
+        || die "the manifest pins the base image ${BASE_DIGEST} and ${idockerfile} at ${ROOT_COMMIT} (image '${iname}') starts FROM ${FROM_DIGESTS}. One of them has moved; a release does not guess which."
+    say "  ok base image ${BASE_DIGEST} agrees with ${idockerfile}"
+done <<< "${IMAGE_LINES}"
 
 # ---------------------------------------------------------------------------
 # Build, from the fresh clones alone.
@@ -400,47 +564,98 @@ LABEL_ARGS+=(--label "org.opencontainers.image.source=${ROOT_URL}")
 LABEL_ARGS+=(--label "org.opencontainers.image.version=${VERSION}")
 LABEL_ARGS+=(--label "org.opencontainers.image.created=${RELEASE_DATE}")
 
-IIDFILE="${TMP}/image-id"
-
-say "Building ${TAG_COMMIT} (also tagged ${TAG_VERSION}) from ${TMP} only"
-docker buildx build \
-    "${BUILD_ARGS[@]}" \
-    "${LABEL_ARGS[@]}" \
-    -t "${TAG_COMMIT}" \
-    -t "${TAG_VERSION}" \
-    -f "${ROOT_DIR}/Dockerfile" \
-    "${ROOT_DIR}" \
-    --build-arg "FORGE_GIT_SHA=${ROOT_COMMIT}" \
-    --build-arg "FORGE_GIT_DIRTY=false" \
-    --build-arg "PYTHON_BASE_DIGEST=${BASE_DIGEST}" \
-    --iidfile "${IIDFILE}" \
-    || die "the image build failed. Nothing was tagged."
-
-IMAGE_ID="$(cat "${IIDFILE}")"
-say "  built ${IMAGE_ID}"
+# What each image turned into. One line per image, written as it is built and
+# read again for the receipt, so the receipt cannot say a different set than
+# the run produced.
+BUILT="${TMP}/built-images"
+: > "${BUILT}"
 
 # ---------------------------------------------------------------------------
-# The image's own proof, from the fetched clone — not from any checkout on
-# this machine. The proof script compares the code inside the image with the
-# tree it was invoked from and then smokes the in-container oracles; invoked
-# here, that tree IS the fresh clone at the pinned commit, so the whole proof
-# is self-contained.
+# One build per image, ALL FROM THE SAME FETCHED CLONES.
+#
+# Same context root, same named contexts, same labels, same build arguments —
+# only the dockerfile, the tags and the role label differ. That is the whole
+# of what makes the images of a release a set rather than a coincidence: they
+# cannot be built from different code, because there is only one copy of the
+# code in this run and it is thrown away at the end.
+#
+# The named contexts are offered to every image. BuildKit resolves a named
+# context only where a stage actually names it, so an image that uses none
+# (the publisher's does not) neither reads nor carries them.
+# ---------------------------------------------------------------------------
+while IFS='|' read -r _tag iname idockerfile irole iproof; do
+    TAG_COMMIT="${iname}:${ROOT_COMMIT}"
+    TAG_VERSION="${iname}:${VERSION}"
+    IIDFILE="${TMP}/image-id-${iname}"
+
+    say "Building ${TAG_COMMIT} (also tagged ${TAG_VERSION}) from ${ROOT_NAME}/${idockerfile} in ${TMP} only"
+    docker buildx build \
+        "${BUILD_ARGS[@]}" \
+        "${LABEL_ARGS[@]}" \
+        --label "com.guardkit.release.image.role=${irole}" \
+        --label "com.guardkit.release.image.name=${iname}" \
+        --label "com.guardkit.release.image.dockerfile=${idockerfile}" \
+        --label "org.opencontainers.image.title=${iname}" \
+        -t "${TAG_COMMIT}" \
+        -t "${TAG_VERSION}" \
+        -f "${ROOT_DIR}/${idockerfile}" \
+        "${ROOT_DIR}" \
+        --build-arg "FORGE_GIT_SHA=${ROOT_COMMIT}" \
+        --build-arg "FORGE_GIT_DIRTY=false" \
+        --build-arg "PYTHON_BASE_DIGEST=${BASE_DIGEST}" \
+        --iidfile "${IIDFILE}" \
+        </dev/null \
+        || die "the build of image '${iname}' failed. Anything built before it in this run is still tagged on this machine; the release is NOT built."
+
+    ibuilt="$(cat "${IIDFILE}")"
+    say "  built ${iname} ${ibuilt}"
+    printf '%s|%s|%s|%s|%s|%s\n' "${iname}" "${irole}" "${idockerfile}" "${ibuilt}" "${TAG_COMMIT}" "${TAG_VERSION}" >> "${BUILT}"
+done <<< "${IMAGE_LINES}"
+
+# ---------------------------------------------------------------------------
+# Each image's own proof, from the fetched clone — not from any checkout on
+# this machine. A proof script is given the tag and compares the code inside
+# that image with the tree it was invoked from, then smokes what that image is
+# for; invoked here, that tree IS the fresh clone at the pinned commit, so the
+# whole proof is self-contained.
+#
+# The proofs run AFTER every image is built, not between builds, because a
+# release is proved as a set: a machine with the coordinator's image proved
+# and the publisher's unbuilt is the arrangement this stage exists to end.
 # ---------------------------------------------------------------------------
 if [ "${RUN_PROOF}" = "1" ]; then
-    PROOF="${ROOT_DIR}/scripts/verify-forge-oracles.sh"
-    [ -x "${PROOF}" ] || [ -f "${PROOF}" ] \
-        || die "${ROOT_NAME} at ${ROOT_COMMIT} has no scripts/verify-forge-oracles.sh, so the image cannot prove itself."
-    say "Proving ${TAG_COMMIT} against the fetched clone at ${ROOT_DIR}"
-    bash "${PROOF}" "${TAG_COMMIT}" \
-        || die "the image's own proof failed for ${TAG_COMMIT}. The tags are still on this machine; do not ship it."
+    while IFS='|' read -r iname irole idockerfile ibuilt itagcommit itagversion; do
+        iproof="$(echo "${IMAGE_LINES}" | awk -F'[|]' -v n="${iname}" '$2 == n { print $5; exit }')"
+        if [ -z "${iproof}" ]; then
+            say "Image '${iname}' names no proof, so nothing was proved about it."
+            continue
+        fi
+        say "Proving ${itagcommit} with ${ROOT_NAME}/${iproof}, against the fetched clone at ${ROOT_DIR}"
+        bash "${ROOT_DIR}/${iproof}" "${itagcommit}" </dev/null \
+            || die "the proof of image '${iname}' failed for ${itagcommit}. Every tag of this run is still on this machine; do not ship any of them."
+    done < "${BUILT}"
 fi
 
 # ---------------------------------------------------------------------------
-# The receipt: what went in, and what came out.
+# The receipt: what went in, and what came out — EVERY image of the release,
+# each with its own id, its own two tags and its own labels.
+#
+# The coordinator's id, tags, digests and labels are ALSO written at the top
+# level, under the same names they have always had, because that is where
+# everything that reads a receipt today looks for "the release image". They
+# are the same facts as the coordinator's entry in "images", said twice on
+# purpose rather than moved.
 # ---------------------------------------------------------------------------
 [ -n "${RECEIPT}" ] || RECEIPT="./${IMAGE_NAME}-${VERSION}.json"
 
-REPO_DIGESTS="$(docker image inspect "${IMAGE_ID}" --format '{{json .RepoDigests}}')"
+coordinator_field() {
+    awk -F'[|]' -v n="${IMAGE_NAME}" -v f="$1" '$1 == n { print $f; exit }' "${BUILT}"
+}
+COORDINATOR_ID="$(coordinator_field 4)"
+COORDINATOR_TAG_COMMIT="$(coordinator_field 5)"
+COORDINATOR_TAG_VERSION="$(coordinator_field 6)"
+[ -n "${COORDINATOR_ID}" ] \
+    || die "the coordinator image '${IMAGE_NAME}' is not among the images this run built, so no receipt can be written."
 
 {
     printf '{\n'
@@ -450,12 +665,24 @@ REPO_DIGESTS="$(docker image inspect "${IMAGE_ID}" --format '{{json .RepoDigests
     # is the whole thing this path exists to end.
     printf '  "manifest_file": "%s",\n' "$(basename "${MANIFEST}")"
     printf '  "manifest_sha256": "%s",\n' "${MANIFEST_SHA}"
+    printf '  "manifest_schema": "%s",\n' "${SCHEMA}"
     printf '  "release_version": "%s",\n' "${VERSION}"
     printf '  "release_date": "%s",\n' "${RELEASE_DATE}"
     printf '  "this_build_ran_at_utc": "%s",\n' "${BUILT_AT}"
-    printf '  "image_id": "%s",\n' "${IMAGE_ID}"
-    printf '  "tags": ["%s", "%s"],\n' "${TAG_COMMIT}" "${TAG_VERSION}"
-    printf '  "repo_digests": %s,\n' "${REPO_DIGESTS}"
+    printf '  "image_id": "%s",\n' "${COORDINATOR_ID}"
+    printf '  "tags": ["%s", "%s"],\n' "${COORDINATOR_TAG_COMMIT}" "${COORDINATOR_TAG_VERSION}"
+    printf '  "repo_digests": %s,\n' "$(docker image inspect "${COORDINATOR_ID}" --format '{{json .RepoDigests}}')"
+    printf '  "images": [\n'
+    first=1
+    while IFS='|' read -r iname irole idockerfile ibuilt itagcommit itagversion; do
+        [ "${first}" = "1" ] || printf ',\n'
+        first=0
+        printf '    {"name": "%s", "role": "%s", "dockerfile": "%s", "image_id": "%s", "tags": ["%s", "%s"], "repo_digests": %s, "labels": %s}' \
+            "${iname}" "${irole}" "${idockerfile}" "${ibuilt}" "${itagcommit}" "${itagversion}" \
+            "$(docker image inspect "${ibuilt}" --format '{{json .RepoDigests}}')" \
+            "$(docker image inspect "${ibuilt}" --format '{{json .Config.Labels}}')"
+    done < "${BUILT}"
+    printf '\n  ],\n'
     printf '  "python_base_digest": "%s",\n' "${BASE_DIGEST}"
     printf '  "pins": {\n'
     first=1
@@ -466,18 +693,21 @@ REPO_DIGESTS="$(docker image inspect "${IMAGE_ID}" --format '{{json .RepoDigests
             "${name}" "${url}" "${branch}" "${commit}" "${role}"
     done <<< "${REPO_LINES}"
     printf '\n  },\n'
-    printf '  "labels": %s\n' "$(docker image inspect "${IMAGE_ID}" --format '{{json .Config.Labels}}')"
+    printf '  "labels": %s\n' "$(docker image inspect "${COORDINATOR_ID}" --format '{{json .Config.Labels}}')"
     printf '}\n'
 } > "${RECEIPT}"
 
 say "Receipt written to ${RECEIPT}"
 say ""
-say "Release ${VERSION} built."
-say "  image id : ${IMAGE_ID}"
-say "  tags     : ${TAG_COMMIT}"
-say "             ${TAG_VERSION}"
+say "Release ${VERSION} built — ${IMAGE_COUNT} image(s)."
+while IFS='|' read -r iname irole idockerfile ibuilt itagcommit itagversion; do
+    say "  ${iname} [${irole}]"
+    say "    image id : ${ibuilt}"
+    say "    tags     : ${itagcommit}"
+    say "               ${itagversion}"
+done < "${BUILT}"
 say "  from     : ${REPO_COUNT} pinned repositories and the base image ${BASE_DIGEST}"
 say ""
-say "There is no registry digest until this image is pushed; the image id above is"
-say "what identifies it on this machine. Reproducing it elsewhere needs this manifest,"
+say "There is no registry digest until an image is pushed; the ids above are"
+say "what identify them on this machine. Reproducing them elsewhere needs this manifest,"
 say "Docker, and network access to the repository host."

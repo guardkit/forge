@@ -84,10 +84,15 @@ That is the one exception in the bundle and the socket's permissions are the
 whole of the reason.
 
 **Its own small volume** (`sandbox-client-state`) is the client's writable
-state folder, and needs the same one-off hand-over as the volumes above:
+state folder, and it is the one volume in the bundle that still needs a
+one-off hand-over — because this service alone runs as the *machine's* user
+rather than the image's, so the image cannot know in advance who to make the
+folder for. Hand it to the same two numbers `.env` gives:
 
 ```
-docker run --rm -v <project>_sandbox-client-state:/v1 alpine sh -c 'chown 1000:1000 /v1'
+docker compose --env-file .env -f compose.yaml -f compose.sandbox-runner.yaml create
+docker run --rm -v <project>_sandbox-client-state:/v1 \
+  alpine sh -c 'chown ${FACTORY_HOST_UID}:${FACTORY_HOST_GID} /v1'
 ```
 
 ### The stop is the point of it
@@ -196,35 +201,17 @@ docker compose --env-file .env up -d
 docker compose ps
 ```
 
-Two things have to be done once, before the first start.
+**There is no longer a one-off ownership step before the first start.** It
+used to be here — a `chown 1000:1000` over the four coordinator volumes,
+because Docker makes a fresh named volume root-owned wherever the image has no
+folder of that name and the services are not root. Release `2026.09.24-4`
+makes those four folders in the image, owned by the `forge` user, so Docker
+copies that ownership onto a fresh volume and there is nothing left to hand
+over. The publisher's own image has always done the same for its one folder.
+(The publisher's settings file's `state_dir` must be `/home/publisher/state`,
+which is what `settings.sample.json` says.)
 
-**Make the volumes usable by the image's own user.** Docker creates a fresh
-named volume owned by root wherever the image has no directory of that name,
-and the services run as an unprivileged user, so the coordinator cannot write
-its own record until the volumes are handed over:
-
-```
-docker compose --env-file .env create
-docker run --rm \
-  -v <project>_forge-ledger:/v1 -v <project>_forge-evidence:/v2 \
-  -v <project>_forge-home:/v3 -v <project>_forge-settings:/v4 \
-  alpine sh -c 'chown 1000:1000 /v1 /v2 /v3 /v4'
-```
-
-The publisher's volume (`forge-publisher-state`, mounted at `/home/publisher/state`)
-needs no hand-over when the publisher runs from its own image, because that image
-creates the folder as the `publisher` user and Docker copies the ownership onto the
-fresh volume; if the publisher is ever run from another image, add that volume to the
-list above (its user is also 1000). Its settings file's `state_dir` must be
-`/home/publisher/state`, which is what `settings.sample.json` now says — the sample
-used to name a folder nothing mounted, so a publisher set up by the book kept its
-state in the container's writable layer and lost it on every recreate.
-
-The proper fix is in the image — `/var/lib/forge`, `/var/lib/forge-evidence`
-and `/etc/forge` created and owned by the `forge` user in the Dockerfile, at
-which point Docker copies that ownership onto a fresh volume and this step
-disappears. That is a release change, not a compose change, and it is written
-down here so it is not forgotten.
+One thing still has to be done once, before the first start.
 
 **Put the two files where the services expect them.** The coordinator's
 settings file goes on the `forge-settings` volume (copy
