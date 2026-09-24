@@ -302,3 +302,35 @@ def _seconds(duration: str) -> int:
     parts = re.findall(r"(\d+)([hms])", duration)
     scale = {"h": 3600, "m": 60, "s": 1}
     return sum(int(amount) * scale[unit] for amount, unit in parts)
+
+
+class TestTheExampleNamesTheReleaseThatExists:
+    """Two reviews in one day (24 September 2026) found the example env naming a
+    release the manifest had moved past — once one that could not run the
+    shipped settings, once one that was never built. So the example's two
+    image lines and the compose file's example tag are held to the manifest's
+    version here: the manifest cannot move without them."""
+
+    def _version(self) -> str:
+        import re
+        text = (BUNDLE.parent.parent / "release" / "manifest.yaml").read_text()
+        match = re.search(r"^version:\s*(\S+)\s*$", text, re.M)
+        assert match, "the manifest has no version line"
+        return match.group(1)
+
+    def test_the_example_env_names_the_manifests_release(self) -> None:
+        version = self._version()
+        env = (BUNDLE / ".env.example").read_text()
+        assert f"FORGE_IMAGE=forge:{version}\n" in env, (
+            f"deploy/compose/.env.example's FORGE_IMAGE does not name release {version}"
+        )
+        assert f"FORGE_PUBLISHER_IMAGE=forge-publisher:{version}\n" in env, (
+            f".env.example's FORGE_PUBLISHER_IMAGE does not name release {version}"
+        )
+
+    def test_the_compose_files_example_tag_names_it_too(self) -> None:
+        version = self._version()
+        compose = (BUNDLE / "compose.yaml").read_text()
+        assert f"FORGE_IMAGE=forge:{version}" in compose, (
+            f"compose.yaml's example tag does not name release {version}"
+        )

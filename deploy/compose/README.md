@@ -255,7 +255,16 @@ docker compose down -v       # and removes the volumes too — the record with t
 
 - **The bus.** It is reached at the service name `FORGE_NATS_URL` gives, on
   the `factory` network, and it is started by its own compose file, which the
-  estate bundle composes alongside this one. Forge does not own it.
+  estate bundle composes alongside this one. Forge does not own it. **Its
+  storage must be provisioned before this bundle starts**: the coordinator
+  needs the bus's `agent-registry` key-value bucket and its `PIPELINE` stream,
+  both defined in the bus's own repository (`nats-infrastructure/kv/` and
+  `streams/`, each with a provisioning script beside its definitions). Start
+  the bus, run those two scripts, then start this bundle — otherwise the
+  coordinator restarts in a loop whose first message is a programmer's error
+  (`registry unavailable`, then `stream not found`). The live bus was
+  provisioned months ago, which is why nobody met this until a reviewer brought
+  the bundle up against a bare bus on 24 September 2026.
 - **The memory service and the model seats.** The same: other repositories'
   compose files, addresses in `.env`.
 - **The sandboxes themselves**, and the build runner and deploy helper that run
