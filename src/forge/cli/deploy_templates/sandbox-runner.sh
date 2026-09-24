@@ -42,12 +42,17 @@
 # WHAT IT DOES, IN ORDER:
 #   1. Reads its settings from the sandbox's own environment — names only; it
 #      never reads anyone's shell, home directory or settings file.
-#   2. CHECKS THE RELEASE IMAGE. It asks the sandbox's own engine for the image
-#      the machine named, and refuses, by name, unless the image is there AND
-#      its image id is the one the machine handed over. Where the release
-#      version and the manifest hash are named too, their labels on the image
-#      must match those as well. A missing or different image is a refusal with
-#      a plain sentence, never a fetch of anything.
+#   2. CHECKS THE RELEASE IMAGE, AND THEN NEVER USES THE TAG AGAIN. It asks the
+#      sandbox's own engine what the named image IS — the platform it was built
+#      for, the filesystem it is made of and the runtime configuration it
+#      carries — hashes that one document, and refuses, by name, unless the
+#      hash is the one the machine that handed the image over recorded. Where
+#      the release version and the manifest hash are named too, their labels on
+#      the image must match as well. It then resolves the checked image to the
+#      id THIS engine holds it under and starts and repairs everything from
+#      that id: a tag is a name that can be moved onto another image after it
+#      was checked, an id cannot. A missing or different image is a refusal
+#      with a plain sentence, never a fetch of anything.
 #   3. MAKES THE FOLDERS THE TWO CONTAINERS SHARE, in the sandbox's own
 #      filesystem, and refuses by name if one cannot be made (see the table
 #      below).
@@ -60,7 +65,8 @@
 #      forwards them out as it already does.
 #   5. Supervises them: one supervisor (a lock, so a second start refuses with
 #      exit 4), and a container that dies is started again after a short pause.
-#   6. `stop` stops and removes both containers and exits 0 only when both are
+#   6. `stop` ends the supervisor it can prove is this script's, then stops and
+#      removes both containers, and exits 0 only when it has SEEN that both are
 #      really gone. That is what the host side's stop requires: out there the
 #      client is ended, which ends NOTHING in here, so the stop word is the
 #      only thing that does.
@@ -71,7 +77,13 @@
 # unknown word. 4 when a supervisor of this checkout is ALREADY running in
 # this sandbox and this start was therefore refused: nothing was started, and
 # the non-zero status is there so anything reading a status rather than the
-# words sees a refusal and not a success.
+# words sees a refusal and not a success. 1 when the containers would not go.
+# 5 when the stop COULD NOT BE ESTABLISHED — this sandbox's engine would not
+# answer, or the supervisor would not exit — which is not the same as a stop
+# that failed and is very much not the same as a stop that worked; either way
+# the work in here may still be running, the supervisor record is LEFT WHERE IT
+# IS so the next stop can pick up from it, and the host side (which starts
+# nothing on top of a stop that did not work) is told so plainly.
 #
 # THE FOLDERS THE TWO CONTAINERS SHARE, AND WHY EACH ONE IS OR IS NOT ONE
 # (24 September 2026, stage 4e, from the stage 4d reviewer's first two
@@ -120,6 +132,23 @@
 #       folder here, in that project's own .env, as SANDBOX_RECEIPTS_PATH.
 #       Nothing does it for you, and the start log says so when it falls back.
 #
+#   the deploy helper's executor notes, FORGE_DEPLOY_NOTES_DIR
+#       SHARED MOUNT (stage 4f, 24 September 2026, the stage 4d reviewer's
+#       fourth item). The deploy helper writes one note per deployment target
+#       before it runs anything: the target, the build, the deployment counter
+#       it was granted, the process group it started and when. A note is what
+#       stops a helper that came back finding an empty slot while the deploy
+#       command it forgot about is still running. The factory's own default
+#       for them is a folder inside the container (see
+#       src/forge/deploy_sidecar/service.py, DEPLOY_NOTES_DEFAULT), and a
+#       container in here is thrown away and made again by the supervisor
+#       below — so without this the notes go with it and the next helper
+#       starts blind. The folder is made in the sandbox, handed to both
+#       containers by name and bound into both at the same path; the helper is
+#       its only writer, and the runner is given the same folder rather than
+#       the NAME with nothing under it, which is the one outcome this table
+#       exists to prevent.
+#
 #   the build runner's launch declaration (its graph config, written below)
 #       THE SANDBOX'S OWN FILESYSTEM, bound read-only into the runner alone.
 #       Written fresh at every start, so it can never drift from this file.
@@ -155,24 +184,65 @@
 # not set arrives unset and is reported as unset.
 #
 #   REQUIRED — the image, and proof it is the right one:
-#     FORGE_IMAGE            the release image, by the tag it has IN HERE
-#     FORGE_IMAGE_CONTENT_ID the fingerprint of the image's CONTENTS that the
-#                            machine outside recorded for that tag: the sha256
-#                            of the image's layer list, one layer digest per
-#                            line. Two engines holding the same fingerprint
-#                            hold the same filesystem, layer for layer
+#     FORGE_IMAGE            the release image, by the tag it has IN HERE. The
+#                            tag is used ONCE, to find the image; nothing is
+#                            ever started from it (see below)
+#     FORGE_IMAGE_IDENTITY   the sha256 of that image's IDENTITY DOCUMENT, as
+#                            the machine that handed the image over recorded
+#                            it. This script builds the same document from the
+#                            image in this sandbox and compares the two
 #
-#   WHY A FINGERPRINT OF THE LAYERS AND NOT "THE IMAGE ID" (learned here, 24
-#   September 2026, and the design pass's section 5 says "its digest checked"
-#   without saying which). The two engines do not agree on what an image's id
-#   IS. This machine's engine keeps images the old way and reports the id of
-#   the image's CONFIG; a sandbox's engine keeps them the containerd way and
-#   reports the digest of the image's MANIFEST. Carrying one image from one to
-#   the other and asking each for "the id" gives two different answers for the
-#   same bytes — it did, first time, on 24 September. What both engines DO
-#   report identically is the list of layers that make up the filesystem, so
-#   that list, hashed, is what is compared. A pull and a transfer are checked
-#   the same way.
+#   WHAT THE IDENTITY DOCUMENT IS, AND WHY THE LAYER LIST WAS NOT ENOUGH (24
+#   September 2026, stage 4f, the stage 4d reviewer's third finding). An image
+#   is three things, and the OCI image configuration specification keeps them
+#   apart on purpose: THE PLATFORM it was built for, THE FILESYSTEM it is made
+#   of (its layer list), and THE RUNTIME CONFIGURATION it carries — the
+#   environment, the entry point, the command, the user, the working directory,
+#   the labels, the ports, the volumes and the stop signal. Stage 4d compared
+#   the layer list alone, so an image with the very same filesystem and the
+#   very same release labels, but an environment value changed after the review,
+#   was accepted as the reviewed image. It is not: what a container does is
+#   mostly its configuration.
+#
+#   So what is compared is ALL THREE, as one document. Each side asks its own
+#   engine for those fields, in one fixed order, one per line, strips carriage
+#   returns, and hashes the result:
+#
+#       docker image inspect --format "<the document below>" <the image>
+#           | tr -d '\r' | sha256sum
+#
+#   WHY THAT IS PORTABLE. The two engines do not agree on what an image's "id"
+#   IS: this machine's engine keeps images the old way and reports the digest of
+#   the image's CONFIG, a sandbox's engine keeps them the containerd way and
+#   reports the digest of the image's MANIFEST. Ask each for "the id" and the
+#   same bytes come back under two names — they did, first time, on 24
+#   September. But the fields above are not the engine's opinion of the image;
+#   they are the image's own OCI configuration and its rootfs, which travel
+#   with it, and both engines report them identically because they are reading
+#   the same object. Same image, same document, same hash, on either engine.
+#
+#   WHY IT IS IMMUTABLE. Every line of the document is content, not a pointer:
+#   there is no tag, no repository, no id, no date and nothing of any machine in
+#   it. Change a layer, an environment value, the entry point, the user, a label
+#   or the platform and the hash changes; and nothing anyone can do to a
+#   REGISTRY or to a tag can change what this hash covers, because a tag is not
+#   in it. An image cannot be edited in place either: changing any of this
+#   produces a new image, which is exactly what the new hash says.
+#
+#   WHAT IS DELIBERATELY LEFT OUT. The architecture VARIANT (the two image
+#   stores do not fill it in the same way — one says "v8" where the other says
+#   nothing — and a build for another platform has different layers anyway, so
+#   the platform is pinned regardless); and everything the engine says ABOUT the
+#   image rather than reads FROM it: its id, its repository tags and digests,
+#   when it was created, its history and its size. A health check is not part of
+#   the OCI configuration and both containers here are started with none.
+#
+#   THE SAME DOCUMENT IS BUILT ON THE OTHER SIDE, by the script that hands the
+#   image in (forge/deploy/estate/hand-release-image-to-sandbox.sh), which
+#   prints the hash to put in the machine's env file — and by the same script's
+#   already-present path, which makes every one of these checks before it says
+#   there is nothing to carry. Where the estate pulls from a registry instead,
+#   nothing here changes.
 #
 #   CHECKED WHEN SET (and recommended):
 #     FORGE_RELEASE_VERSION  must equal the image's com.guardkit.release.version
@@ -220,6 +290,17 @@
 #                            in the sandbox's own state, because the factory's
 #                            own default is a folder inside the container and
 #                            the supervisor throws containers away
+#     FORGE_DEPLOY_NOTES_DIR
+#                            where the deploy helper writes its executor notes
+#                            — one per deployment target, saying what it is
+#                            running and under which counter. Made here, bound
+#                            read-write into both containers at the same path,
+#                            handed to them by name, and refused by name if it
+#                            cannot be made. Unset, this script names one in the
+#                            sandbox's own state: the factory's own default is a
+#                            folder inside the container, and a helper that is
+#                            thrown away and made again would come back with no
+#                            note of a deploy command that is still running
 #     SANDBOX_DOCKER         the Docker client in here (default docker)
 #     SANDBOX_DOCKER_SOCKET  THE SANDBOX'S OWN engine socket (default
 #                            /var/run/docker.sock), bound into the helper so a
@@ -265,7 +346,7 @@ log() { printf '[sandbox-runner.sh] %s\n' "$*"; }
 # --- step 1: the settings ---------------------------------------------------
 DOCKER="${SANDBOX_DOCKER:-docker}"
 IMAGE="${FORGE_IMAGE:-}"
-EXPECTED_CONTENT_ID="${FORGE_IMAGE_CONTENT_ID:-}"
+EXPECTED_IDENTITY="${FORGE_IMAGE_IDENTITY:-}"
 EXPECTED_VERSION="${FORGE_RELEASE_VERSION:-}"
 EXPECTED_MANIFEST="${FORGE_RELEASE_MANIFEST_SHA256:-}"
 BIND="${SANDBOX_RUNNER_BIND:-0.0.0.0}"
@@ -283,6 +364,28 @@ EXTRA_ENV_NAMES="${SANDBOX_CONTAINER_ENV_NAMES:-}"
 SCRIPT_PATH="${SCRIPT_DIR}/$(basename "${BASH_SOURCE[0]}")"
 STATE_ROOT="${HOME}/.forge-runner/$(printf '%s' "${REPO_ROOT}" | sha256sum | cut -d' ' -f1)"
 PID_FILE="${STATE_ROOT}/supervisor"
+
+# THE IDENTITY DOCUMENT: what this script asks the engine an image IS. The long
+# version is at the top of this file. Short version: the platform, the
+# filesystem's layer list and the whole of the runtime configuration, in one
+# fixed order, one per line — the image's own OCI configuration, which both
+# kinds of engine report identically, and none of it a name, a pointer or a
+# date. Hashed, it is what is compared with FORGE_IMAGE_IDENTITY. The map
+# fields (labels, ports, volumes) come out in key order, which is the one
+# ordering guarantee this rendering needs and the only one it relies on.
+IMAGE_IDENTITY_DOCUMENT_FORMAT='forge-image-identity/1
+architecture {{.Architecture}}
+os {{.Os}}
+{{range .RootFS.Layers}}layer {{.}}
+{{end}}{{range .Config.Env}}env {{.}}
+{{end}}{{range .Config.Entrypoint}}entrypoint {{.}}
+{{end}}{{range .Config.Cmd}}cmd {{.}}
+{{end}}user {{.Config.User}}
+workdir {{.Config.WorkingDir}}
+{{range $name, $value := .Config.Labels}}label {{$name}}={{$value}}
+{{end}}{{range $port, $ignored := .Config.ExposedPorts}}port {{$port}}
+{{end}}{{range $path, $ignored := .Config.Volumes}}volume {{$path}}
+{{end}}stopsignal {{.Config.StopSignal}}'
 
 # THE BUILD RUNNER'S GRAPH DECLARATION, and why it is written here. The runner
 # is `langgraph dev`, and that wants a config FILE naming the graph to serve.
@@ -317,6 +420,11 @@ FACTORY_ENV_NAMES=(
   # here, so the two containers each used the factory's own default — a folder
   # inside themselves, and a different one each.
   FORGE_AUTOBUILD_WORKTREE_BASE
+  # The deploy helper's executor notes. Named here AND bound as a folder of
+  # this sandbox below (stage 4f): a helper that is replaced must come back to
+  # the notes it wrote, or it cannot tell an old deploy command that is still
+  # running from an empty slot.
+  FORGE_DEPLOY_NOTES_DIR
   FACTORY_GATEWAY_ADDRESS
   FORGE_GUARDKIT_PATH
   GUARDKIT_HARNESS
@@ -326,25 +434,62 @@ FACTORY_ENV_NAMES=(
 )
 
 # --- the containers ---------------------------------------------------------
+#
+# ASKING THE ENGINE A QUESTION IT MIGHT NOT ANSWER (stage 4f, 24 September 2026,
+# the stage 4d reviewer's first finding). Until this pass "is that container
+# there?" turned the engine's answer into a yes or a no and threw away whether
+# there had been an answer at all — so an engine that could not be reached said
+# exactly what an empty engine says, and `stop` reported both containers gone
+# while both were running. An unreadable engine is not an empty engine. So the
+# three answers are kept apart everywhere below:
+#
+#   0  yes, it is there          (the engine answered, and named it)
+#   1  no, it is not there       (the engine answered, and named nothing)
+#   2  THE ENGINE WOULD NOT SAY  (the query itself failed)
+#
+# and WHY_THE_ENGINE_WOULD_NOT_SAY holds what it said, so the sentence a person
+# reads names the real trouble instead of guessing at it.
+WHY_THE_ENGINE_WOULD_NOT_SAY=""
+
+ask_the_engine_about() {
+  local name="$1" scope="$2" listed=""
+  if [[ "${scope}" == "whatever-state" ]]; then
+    if ! listed="$("${DOCKER}" ps -a --filter "name=^${name}$" --format '{{.ID}}' 2>&1)"; then
+      WHY_THE_ENGINE_WOULD_NOT_SAY="${listed}"
+      return 2
+    fi
+  else
+    if ! listed="$("${DOCKER}" ps --filter "name=^${name}$" --format '{{.ID}}' 2>&1)"; then
+      WHY_THE_ENGINE_WOULD_NOT_SAY="${listed}"
+      return 2
+    fi
+  fi
+  [[ -n "${listed}" ]]
+}
 
 # Is a container of this name there at all, whatever state it is in?
 container_exists() {
-  [[ -n "$("${DOCKER}" ps -a --filter "name=^${1}$" --format '{{.ID}}' 2>/dev/null)" ]]
+  ask_the_engine_about "$1" whatever-state
 }
 
 # Is it running right now?
 container_running() {
-  [[ -n "$("${DOCKER}" ps --filter "name=^${1}$" --format '{{.ID}}' 2>/dev/null)" ]]
+  ask_the_engine_about "$1" running-now
 }
 
 # Stop it and remove it. Never a failure on its own: a container that was never
-# there is already in the state this asks for.
+# there is already in the state this asks for. An engine that would not say
+# whether it is there is asked to remove it anyway — asking costs nothing, and
+# the answer that matters is the confirmation afterwards, which is where a
+# silent engine becomes a non-zero stop.
 remove_container() {
-  local name="$1"
-  if container_exists "${name}"; then
-    "${DOCKER}" stop -t 10 "${name}" >/dev/null 2>&1 || true
-    "${DOCKER}" rm -f "${name}" >/dev/null 2>&1 || true
+  local name="$1" answer=0
+  container_exists "${name}" || answer=$?
+  if ((answer == 1)); then
+    return 0
   fi
+  "${DOCKER}" stop -t 10 "${name}" >/dev/null 2>&1 || true
+  "${DOCKER}" rm -f "${name}" >/dev/null 2>&1 || true
 }
 
 remove_both_containers() {
@@ -353,36 +498,121 @@ remove_both_containers() {
 }
 
 # Both gone, said as an exit status. This is what the host side's stop needs to
-# be told the truth about.
+# be told the truth about, and it has the same three answers as the question it
+# is built on: 0 both gone, 1 at least one still there, 2 the engine would not
+# say and therefore NOBODY KNOWS.
 both_containers_are_gone() {
-  ! container_exists "${HELPER_NAME}" && ! container_exists "${RUNNER_NAME}"
+  local name answer
+  for name in "${HELPER_NAME}" "${RUNNER_NAME}"; do
+    answer=0
+    container_exists "${name}" || answer=$?
+    if ((answer == 2)); then
+      return 2
+    fi
+    if ((answer == 0)); then
+      return 1
+    fi
+  done
+  return 0
+}
+
+# --- whose process is that? --------------------------------------------------
+# A PROCESS RECORD NAMES A NUMBER, AND NUMBERS COME ROUND AGAIN (stage 4f, 24
+# September 2026, the stage 4d reviewer's second finding). A supervisor that
+# died leaves its record behind; the sandbox goes on making processes; sooner or
+# later something unrelated is given that number. Stage 4d signalled whatever
+# the record named, and the reviewer's drive had it kill an innocent process and
+# report a clean stop. The template before it did this properly and the rewrite
+# dropped it; this is that check, restored, and it asks two things of the
+# process before ANY signal goes anywhere near it:
+#
+#   IS IT THE SAME PROCESS?  Its birth time, from the system's own record of it,
+#       must equal the birth time written down when the record was made. A
+#       number that came round again belongs to a process born later, so this
+#       tells the two apart — and nothing a later process can do to itself can
+#       make it look born when the original was.
+#   IS IT THIS BOOTSTRAP?    One of its arguments, resolved from its own working
+#       directory, must be THIS script. A process of the right age that is not
+#       running this file is not this checkout's supervisor either.
+#
+# Neither question reads anything of the process beyond those two public facts:
+# no environment, no arguments' values, nothing of anybody's.
+process_birth_time() {
+  local statline
+  [[ -r "/proc/$1/stat" ]] || return 1
+  statline="$(cat "/proc/$1/stat")" || return 1
+  # Drop the number and the name first: a process's name can hold spaces and
+  # brackets, and the field after the closing bracket is a fixed list. Birth
+  # time is field 22 of the whole line, which is field 20 of what is left.
+  printf '%s\n' "${statline##*) }" | awk '{print $20}'
+}
+
+it_is_this_checkouts_supervisor() {
+  local pid="$1" born="$2" argument
+  [[ "${pid}" =~ ^[0-9]+$ && "${pid}" != "$$" ]] || return 1
+  [[ -n "${born}" ]] || return 1
+  [[ "$(process_birth_time "${pid}")" == "${born}" ]] || return 1
+  while IFS= read -r -d '' argument; do
+    [[ "${argument}" == */* ]] || continue
+    if [[ "$(realpath -m "/proc/${pid}/cwd/${argument}" 2>/dev/null)" == "${SCRIPT_PATH}" ||
+          "${argument}" == "${SCRIPT_PATH}" ]]; then
+      return 0
+    fi
+  done < "/proc/${pid}/cmdline"
+  return 1
 }
 
 # --- the stop word, handled before anything else ----------------------------
 # The host side stops this the same way it started it, and it may be stopping
 # a supervisor that is no longer there (a session that dropped, a sandbox that
 # was asleep). So the stop never depends on the supervisor: it ends the
-# supervisor if there is one, then ends the two containers itself, and reports
-# on the CONTAINERS, which are the work.
+# supervisor if it can prove there is one, then ends the two containers itself,
+# and reports on the CONTAINERS, which are the work.
+#
+# WHAT IT REFUSES TO CALL A STOP. A supervisor that was signalled and did not go
+# (it would make the containers again the moment they were removed), and an
+# engine that would not say whether the containers are gone. Both end 5, both
+# leave the record where it is, and both say which of the two happened.
 stop_everything() {
-  local owner="" token="" waited=0
+  local owner="" born="" waited=0 gone=0
   if [[ -r "${PID_FILE}" ]]; then
-    read -r owner token < "${PID_FILE}" || true
-    if [[ -n "${owner}" && "${owner}" =~ ^[0-9]+$ ]] && kill -0 "${owner}" 2>/dev/null; then
+    read -r owner born < "${PID_FILE}" || true
+    if it_is_this_checkouts_supervisor "${owner}" "${born}"; then
       log "asking the supervisor ${owner} to stop"
       kill -TERM "${owner}" 2>/dev/null || true
-      while ((waited < 100)) && kill -0 "${owner}" 2>/dev/null; do
+      while ((waited < 100)) && it_is_this_checkouts_supervisor "${owner}" "${born}"; do
         sleep 0.1
         waited=$((waited + 1))
       done
+      if it_is_this_checkouts_supervisor "${owner}" "${born}"; then
+        log "FATAL: the supervisor ${owner} of this checkout was asked to stop ten seconds ago and is still running. It makes the two containers again whenever they are gone, so removing them now would achieve nothing and reporting a stop would be untrue. The record is left where it is. Nothing may be started in this sandbox until this supervisor has gone."
+        return 5
+      fi
     else
-      log "no supervisor of this checkout is running; stopping the two containers directly"
+      log "the supervisor record names ${owner:-nothing}, which is not a running supervisor of this checkout (a process that has gone, or its number given to something else since); nothing was signalled, and the two containers are stopped directly"
     fi
   else
     log "no supervisor record; stopping the two containers directly"
   fi
+
+  # BEFORE removing anything: if the engine cannot be asked, nothing that
+  # follows can be established either, and saying so here names the real
+  # trouble rather than a container that "would not go".
+  both_containers_are_gone || gone=$?
+  if ((gone == 2)); then
+    log "FATAL: this sandbox's own engine would not say what is running in it, so nothing here can be established: ${WHY_THE_ENGINE_WOULD_NOT_SAY}. The factory's two containers may still be running. The supervisor record is left where it is so the next stop picks up from it, and nothing may be started on top of this."
+    return 5
+  fi
+
   remove_both_containers
-  if both_containers_are_gone; then
+
+  gone=0
+  both_containers_are_gone || gone=$?
+  if ((gone == 2)); then
+    log "FATAL: the factory's two containers were asked to go, and then this sandbox's own engine would not say whether they had: ${WHY_THE_ENGINE_WOULD_NOT_SAY}. A stop that cannot be seen to have worked is not a stop. The supervisor record is left where it is, and nothing may be started on top of this."
+    return 5
+  fi
+  if ((gone == 0)); then
     rm -f "${PID_FILE}"
     log "stopped: neither ${HELPER_NAME} nor ${RUNNER_NAME} is in this sandbox's engine any more"
     return 0
@@ -415,7 +645,12 @@ if ! flock -n 9; then
   log "refusing to start: a supervisor of this checkout is already running in this sandbox, and a second one would leave two sets of the factory's containers behind. Nothing was started."
   exit 4
 fi
-printf '%s %s\n' "$$" "$(date -u +%s)" > "${PID_FILE}.tmp"
+# THE RECORD: this process's number and the time the SYSTEM says it was born —
+# not the wall clock, which any later process could be made to agree with, and
+# not the number alone, which comes round again. A stop reads both back and
+# proves the process it is about to signal is this one (see above). Stage 4f,
+# 24 September 2026: stage 4d wrote the wall clock here and never read it.
+printf '%s %s\n' "$$" "$(process_birth_time $$)" > "${PID_FILE}.tmp"
 mv "${PID_FILE}.tmp" "${PID_FILE}"
 
 STOPPING=0
@@ -441,8 +676,11 @@ refuse() {
 if [[ -z "${IMAGE}" ]]; then
   refuse "FORGE_IMAGE is not set. This sandbox runs the factory from the release image and from nothing else, and it has not been told which image that is. There is no source fallback on purpose: a clone at the pinned commit is not the tested image. Refusing to start."
 fi
-if [[ -z "${EXPECTED_CONTENT_ID}" ]]; then
-  refuse "FORGE_IMAGE_CONTENT_ID is not set. The machine that handed the image in records the fingerprint of the image's contents, and this sandbox refuses to run an image it cannot check against that fingerprint. Refusing to start."
+if [[ -z "${EXPECTED_IDENTITY}" ]]; then
+  if [[ -n "${FORGE_IMAGE_CONTENT_ID:-}" ]]; then
+    refuse "FORGE_IMAGE_IDENTITY is not set, and FORGE_IMAGE_CONTENT_ID is. That older setting was a hash of the image's LAYERS alone, and an image can keep every layer and still have had its environment, its entry point or its user changed after it was reviewed — which is a different image. This sandbox now checks the image's whole identity: its platform, its layers AND its runtime configuration. Hand the image in again with forge/deploy/estate/hand-release-image-to-sandbox.sh, which prints the value to put under FORGE_IMAGE_IDENTITY. Refusing to start."
+  fi
+  refuse "FORGE_IMAGE_IDENTITY is not set. The machine that handed the image over records what that image IS — its platform, its filesystem and its runtime configuration, hashed as one — and this sandbox refuses to run an image it cannot check against that. Refusing to start."
 fi
 if ! command -v "${DOCKER}" >/dev/null 2>&1; then
   refuse "there is no Docker client at '${DOCKER}' in this sandbox. The factory's two services run as containers in the sandbox's OWN engine; without a client there is nothing to run them with. Refusing to start."
@@ -456,9 +694,19 @@ ENGINE_IMAGE_ID="$(image_field '{{.Id}}' || true)"
 if [[ -z "${ENGINE_IMAGE_ID}" ]]; then
   refuse "the release image ${IMAGE} is not in this sandbox's own engine. Hand it in first (save it on the machine that has it and load it in here, or pull it at its pinned digest where this sandbox can pull) — forge/deploy/estate/hand-release-image-to-sandbox.sh does that and checks it. Nothing is fetched from here. Refusing to start."
 fi
-ACTUAL_CONTENT_ID="$(image_field '{{range .RootFS.Layers}}{{.}}{{"\n"}}{{end}}' | sha256sum | cut -d' ' -f1)"
-if [[ "${ACTUAL_CONTENT_ID}" != "${EXPECTED_CONTENT_ID}" ]]; then
-  refuse "the image called ${IMAGE} in this sandbox is not the one the machine handed over: it expected an image whose layers fingerprint to ${EXPECTED_CONTENT_ID} and this engine holds one that fingerprints to ${ACTUAL_CONTENT_ID}. Two engines holding the same fingerprint hold the same filesystem, and these do not. Hand the release image in again. Refusing to start."
+
+# THE IDENTITY, BUILT HERE AND COMPARED. The document is the engine's own
+# answer with carriage returns taken out and exactly one newline at the end, on
+# both sides, so the two hashes are of the same bytes however the answer
+# travelled. An empty answer is refused rather than hashed: the hash of nothing
+# is a perfectly good-looking hash.
+IDENTITY_DOCUMENT="$(image_field "${IMAGE_IDENTITY_DOCUMENT_FORMAT}" | tr -d '\r' || true)"
+if [[ -z "${IDENTITY_DOCUMENT}" ]]; then
+  refuse "this sandbox's own engine would not say what the image ${IMAGE} is made of and how it is configured, so there is nothing to check against the identity the machine recorded. Refusing to start."
+fi
+ACTUAL_IDENTITY="$(printf '%s\n' "${IDENTITY_DOCUMENT}" | sha256sum | cut -d' ' -f1)"
+if [[ "${ACTUAL_IDENTITY}" != "${EXPECTED_IDENTITY}" ]]; then
+  refuse "the image called ${IMAGE} in this sandbox is not the one the machine handed over. It expected an image whose platform, layers and runtime configuration hash to ${EXPECTED_IDENTITY}, and this engine holds one that hashes to ${ACTUAL_IDENTITY}. That covers the environment, the entry point, the command, the user, the working directory, the labels, the ports and the volumes as well as the filesystem, so the same layers under a changed configuration land here too — and rightly: it would not be the image that was tested. Hand the release image in again. Refusing to start."
 fi
 
 if [[ -n "${EXPECTED_VERSION}" ]]; then
@@ -474,7 +722,16 @@ if [[ -n "${EXPECTED_MANIFEST}" ]]; then
   fi
 fi
 
-log "release image ${IMAGE} checked: contents ${ACTUAL_CONTENT_ID}, this engine calls it ${ENGINE_IMAGE_ID}${EXPECTED_VERSION:+, release ${EXPECTED_VERSION}}"
+# FROM HERE ON, THE TAG IS NOT USED (stage 4f). Everything below starts and
+# repairs containers from the id this engine holds the CHECKED image under. A
+# tag is a name, and a name can be moved onto another image a moment after it
+# was inspected — the stage 4d reviewer moved one and watched both containers
+# start from the replacement. An id is the image itself: whatever happens to
+# the tag afterwards, this is the image that was checked, for the first start
+# and for every repair the supervisor makes later.
+IMAGE_REFERENCE="${ENGINE_IMAGE_ID}"
+log "release image ${IMAGE} checked: identity ${ACTUAL_IDENTITY} (its platform, its layers and its runtime configuration), and this engine holds it as ${ENGINE_IMAGE_ID}${EXPECTED_VERSION:+, release ${EXPECTED_VERSION}}"
+log "everything below is started from ${IMAGE_REFERENCE}, not from the tag ${IMAGE}: a tag can be moved onto another image after it has been checked"
 log "repo_root=${REPO_ROOT} helper=${HELPER_NAME}:${SIDECAR_PORT} runner=${RUNNER_NAME}:${RUNNER_PORT}"
 
 if [[ "${SANDBOX_RUNNER_BOOTSTRAP_ONLY:-}" == "1" ]]; then
@@ -537,8 +794,22 @@ if [[ -z "${WORKTREE_BASE}" ]]; then
 fi
 export FORGE_AUTOBUILD_WORKTREE_BASE="${WORKTREE_BASE}"
 
+# The deploy helper's executor notes (stage 4f, the stage 4d reviewer's fourth
+# item). The factory's own default for them is a folder inside the container,
+# and the supervisor below replaces containers, so a helper that was replaced
+# would come back with no note of the deploy command it had started and no way
+# to tell that from nothing running at all.
+NOTES_ROOT="${FORGE_DEPLOY_NOTES_DIR:-}"
+NOTES_SETTING="FORGE_DEPLOY_NOTES_DIR"
+if [[ -z "${NOTES_ROOT}" ]]; then
+  NOTES_ROOT="${STATE_ROOT}/deploy-executor-notes"
+  NOTES_SETTING="the deploy helper's notes folder (no setting named one, so this script did)"
+  log "no folder was named for the deploy helper's executor notes, so this sandbox's own ${NOTES_ROOT} is used: the factory's own default is a folder inside the container, and a helper that is replaced would lose the note of a deploy command that is still running"
+fi
+export FORGE_DEPLOY_NOTES_DIR="${NOTES_ROOT}"
+
 # THE MOUNTS, and there are four kinds and no more: the project's own clone,
-# the two shared folders above, and the sandbox's own engine socket (the
+# the three shared folders above, and the sandbox's own engine socket (the
 # helper's alone, added at its start). Every one of them belongs to this
 # sandbox. Nothing of the machine outside is bound into anything here — no
 # checkout of the factory's code, no home folder, no settings file. That is
@@ -546,7 +817,8 @@ export FORGE_AUTOBUILD_WORKTREE_BASE="${WORKTREE_BASE}"
 MOUNTS=(--volume "${REPO_ROOT}:${REPO_ROOT}:rw")
 share_a_folder "${RECEIPTS_SETTING}" "${RECEIPTS_ROOT}"
 share_a_folder "${WORKTREE_SETTING}" "${WORKTREE_BASE}"
-log "folders shared by both containers: ${REPO_ROOT} (the project's clone), ${RECEIPTS_ROOT} (receipts), ${WORKTREE_BASE} (a build's worktrees)"
+share_a_folder "${NOTES_SETTING}" "${NOTES_ROOT}"
+log "folders shared by both containers: ${REPO_ROOT} (the project's clone), ${RECEIPTS_ROOT} (receipts), ${WORKTREE_BASE} (a build's worktrees), ${NOTES_ROOT} (the deploy helper's executor notes)"
 
 # --- step 4: the settings the two containers are given, BY NAME -------------
 # `--env NAME` hands the value this script's own environment holds under that
@@ -598,7 +870,7 @@ fi
 printf '%s\n' "${RUNNER_GRAPH_CONFIG}" > "${RUNNER_CONFIG_FILE}"
 
 start_helper() {
-  log "starting the deploy helper from ${IMAGE} on ${BIND}:${SIDECAR_PORT}"
+  log "starting the deploy helper from ${IMAGE_REFERENCE} on ${BIND}:${SIDECAR_PORT}"
   local socket_mount=()
   if [[ -S "${DOCKER_SOCKET}" ]]; then
     # THE SANDBOX'S OWN engine, not the machine's. The helper's job is to run
@@ -637,13 +909,13 @@ start_helper() {
     ${socket_mount[@]+"${socket_mount[@]}"} \
     --workdir "${REPO_ROOT}" \
     --entrypoint python \
-    "${IMAGE}" \
+    "${IMAGE_REFERENCE}" \
     -c 'import os; from forge.deploy_sidecar.service import serve; serve(host=os.environ["FORGE_DEPLOY_SIDECAR_HOST"], port=int(os.environ["FORGE_DEPLOY_SIDECAR_PORT"]))' \
     >/dev/null
 }
 
 start_runner() {
-  log "starting the build runner from ${IMAGE} on ${BIND}:${RUNNER_PORT}"
+  log "starting the build runner from ${IMAGE_REFERENCE} on ${BIND}:${RUNNER_PORT}"
   "${DOCKER}" run --detach \
     --name "${RUNNER_NAME}" \
     --user "${CONTAINER_USER}" \
@@ -654,7 +926,7 @@ start_runner() {
     --volume "${RUNNER_CONFIG_FILE}:${RUNNER_CONFIG_IN_CONTAINER}:ro" \
     --workdir "${REPO_ROOT}" \
     --entrypoint langgraph \
-    "${IMAGE}" \
+    "${IMAGE_REFERENCE}" \
     dev \
     --config "${RUNNER_CONFIG_IN_CONTAINER}" \
     --host "${BIND}" \
@@ -679,23 +951,36 @@ ensure_runner() {
 
 ensure_helper
 ensure_runner
-log "both containers are up from ${IMAGE}: ${HELPER_NAME} and ${RUNNER_NAME}"
+log "both containers are up from ${IMAGE_REFERENCE}: ${HELPER_NAME} and ${RUNNER_NAME}"
 
 # --- step 4: one supervisor, watching the two containers --------------------
 # A container that dies is made again from the same checked image after a short
 # pause. Docker's own restart policy is deliberately not used for this: the
 # host side has to be able to end everything with one word, and a restart
 # policy would bring a container back after that word had been given.
+#
+# AND AN ENGINE THAT WILL NOT ANSWER IS NOT A CONTAINER THAT DIED (stage 4f).
+# When the question itself fails, this says so and waits for the next round
+# rather than tearing down and remaking a container that is very probably
+# running perfectly well behind an engine that is merely busy or restarting.
+watch_one() {
+  local what="$1" name="$2" answer=0
+  container_running "${name}" || answer=$?
+  if ((answer == 2)); then
+    log "this sandbox's own engine would not say whether ${what} is running (${WHY_THE_ENGINE_WOULD_NOT_SAY}); nothing was changed, and it is asked again in ${RESTART_SECONDS}s"
+    return 0
+  fi
+  if ((answer == 1)); then
+    log "${what} is no longer running; starting it again from ${IMAGE_REFERENCE}, the image that was checked"
+    return 1
+  fi
+  return 0
+}
+
 while ((STOPPING == 0)); do
   nap "${RESTART_SECONDS}"
   ((STOPPING == 1)) && break
-  if ! container_running "${HELPER_NAME}"; then
-    log "the deploy helper is no longer running; starting it again from ${IMAGE}"
-    ensure_helper
-  fi
+  watch_one "the deploy helper" "${HELPER_NAME}" || ensure_helper
   ((STOPPING == 1)) && break
-  if ! container_running "${RUNNER_NAME}"; then
-    log "the build runner is no longer running; starting it again from ${IMAGE}"
-    ensure_runner
-  fi
+  watch_one "the build runner" "${RUNNER_NAME}" || ensure_runner
 done
