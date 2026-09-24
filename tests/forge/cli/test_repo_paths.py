@@ -38,16 +38,16 @@ permissions:
     - /home/forge
 planning:
   target_repo_paths:
-    guardkit/study-tutor: /home/richardwoollcott/Projects/appmilla_github/study-tutor
-    # Namespace aliases: builds are queued with repo=appmilla_github/<name>.
-    appmilla_github/study-tutor: /home/richardwoollcott/Projects/appmilla_github/study-tutor
-    guardkit/api_test: /home/richardwoollcott/Projects/appmilla_github/api_test
-    appmilla_github/api_test: /home/richardwoollcott/Projects/appmilla_github/api_test
+    guardkit/study-tutor: /srv/checkouts/study-tutor
+    # Namespace aliases: builds are queued with repo=<checkout-folder>/<name>.
+    checkouts/study-tutor: /srv/checkouts/study-tutor
+    guardkit/api_test: /srv/checkouts/api_test
+    checkouts/api_test: /srv/checkouts/api_test
 """
 
 SORTED_DISTINCT = [
-    "/home/richardwoollcott/Projects/appmilla_github/api_test",
-    "/home/richardwoollcott/Projects/appmilla_github/study-tutor",
+    "/srv/checkouts/api_test",
+    "/srv/checkouts/study-tutor",
 ]
 
 
@@ -145,9 +145,20 @@ def test_without_any_config_it_says_so_in_plain_english(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def _script_env(tmp_path: Path, config: Path | str) -> dict[str, str]:
+def _script_env(
+    tmp_path: Path,
+    config: Path | str,
+    *,
+    image: str | None = "forge:test-only",
+    home: Path | None = None,
+) -> dict[str, str]:
     """Environment for a script run: fixture config, stub settings file, and a
-    fake ``docker`` first on ``PATH`` that records any call it receives."""
+    fake ``docker`` first on ``PATH`` that records any call it receives.
+
+    ``image`` is what ``FORGE_IMAGE`` is set to; ``None`` leaves it unset,
+    which is the refusal case (the script has no default image — 2026-09-24).
+    ``home`` overrides ``$HOME`` so the two state binds can be shown to follow
+    it rather than being written into the script."""
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir(exist_ok=True)
     sentinel = tmp_path / "docker-was-called"
@@ -168,14 +179,25 @@ def _script_env(tmp_path: Path, config: Path | str) -> dict[str, str]:
         FORGE_PROD_ENV_ENC=str(enc),
         PATH=f"{fake_bin}:{env['PATH']}",
     )
+    env.pop("FORGE_IMAGE", None)
+    if image is not None:
+        env["FORGE_IMAGE"] = image
+    if home is not None:
+        env["HOME"] = str(home)
     return env
 
 
-def _run_script(tmp_path: Path, config: Path | str) -> subprocess.CompletedProcess:
+def _run_script(
+    tmp_path: Path,
+    config: Path | str,
+    *,
+    image: str | None = "forge:test-only",
+    home: Path | None = None,
+) -> subprocess.CompletedProcess:
     return subprocess.run(
         ["bash", str(RECREATE_SCRIPT)],
         cwd=tmp_path,
-        env=_script_env(tmp_path, config),
+        env=_script_env(tmp_path, config, image=image, home=home),
         capture_output=True,
         text=True,
         timeout=300,
@@ -190,12 +212,36 @@ def test_the_dry_run_derives_one_bind_per_repository_path(tmp_path):
     assert result.returncode == 0, result.stderr
     for path in SORTED_DISTINCT:
         assert f" -v {path}:{path}:rw" in result.stdout
-    # the two state binds are untouched
-    assert " -v /home/richardwoollcott/forge-state:/var/forge:rw" in result.stdout
+    # the two state binds are untouched — same shape, under this account's home
+    home = os.environ["HOME"]
+    assert f" -v {home}/forge-state:/var/forge:rw" in result.stdout
     assert (
-        " -v /home/richardwoollcott/forge-prod-state/.forge:/home/forge/.forge:rw"
+        f" -v {home}/forge-prod-state/.forge:/home/forge/.forge:rw" in result.stdout
+    )
+
+
+def test_the_state_binds_follow_the_home_directory_not_a_written_out_path(tmp_path):
+    """No machine's home path is written into the script (2026-09-24).
+
+    Run it with a different ``$HOME`` and the two state binds move with it.
+    Before this change they named one person's home directory outright, which
+    is the same defect as the image carrying a machine's paths.
+    """
+    config = _write_config(tmp_path)
+    elsewhere = tmp_path / "somebody-else"
+    elsewhere.mkdir()
+
+    result = _run_script(tmp_path, config, home=elsewhere)
+
+    assert result.returncode == 0, result.stderr
+    assert f" -v {elsewhere}/forge-state:/var/forge:rw" in result.stdout
+    assert (
+        f" -v {elsewhere}/forge-prod-state/.forge:/home/forge/.forge:rw"
         in result.stdout
     )
+    # And the home directory the suite itself runs under appears nowhere in
+    # the command, which is what "no written-out home path" means.
+    assert f" -v {os.environ['HOME']}/forge-state:" not in result.stdout
 
 
 def test_the_dry_run_runs_no_docker_command(tmp_path):
@@ -217,6 +263,52 @@ def test_no_repository_is_bound_twice_when_the_map_spells_it_twice(tmp_path):
     binds = [part for part in result.stdout.split() if part.endswith(":rw")]
     assert len(binds) == len(set(binds))
     assert len(binds) == len(SORTED_DISTINCT) + 2  # + the two state binds
+
+
+def test_the_script_refuses_when_no_image_is_named(tmp_path):
+    """There is no default image any more (2026-09-24).
+
+    It used to default to ``forge:latest``, which is not what forge-prod runs:
+    on 24 September the container was running a tagged build from 19 September
+    while ``forge:latest`` was ten days older, so a run with nothing set would
+    have quietly downgraded production. The refusal comes before anything is
+    removed or started, and before the map is even read.
+    """
+    config = _write_config(tmp_path)
+
+    result = _run_script(tmp_path, config, image=None)
+
+    assert result.returncode == 1
+    assert "FORGE_IMAGE is not set" in result.stderr
+    assert "forge:latest" not in result.stdout
+    # It printed the two candidates rather than choosing between them.
+    assert "Running now:" in result.stderr
+    assert "Release named:" in result.stderr
+    assert "FORGE_IMAGE=<image> bash ops/forge-prod-recreate.sh" in result.stderr
+    # And nothing was started: the only docker call allowed here is a read.
+    calls = (tmp_path / "docker-was-called")
+    if calls.exists():
+        for line in calls.read_text(encoding="utf-8").splitlines():
+            assert line.startswith("inspect") or line.startswith("image inspect"), line
+
+
+def test_the_refusal_names_the_release_the_manifest_carries(tmp_path):
+    """The operator is told what the repository's own release manifest names."""
+    config = _write_config(tmp_path)
+    manifest = REPO_ROOT / "release" / "manifest.yaml"
+    name = ""
+    version = ""
+    for line in manifest.read_text(encoding="utf-8").splitlines():
+        if line.startswith("image_name:") and not name:
+            name = line.split(":", 1)[1].strip()
+        if line.startswith("version:") and not version:
+            version = line.split(":", 1)[1].strip()
+
+    result = _run_script(tmp_path, config, image=None)
+
+    assert result.returncode == 1
+    assert name and version
+    assert f"{name}:{version}" in result.stderr
 
 
 def test_the_script_refuses_when_the_repository_map_cannot_be_read(tmp_path):
