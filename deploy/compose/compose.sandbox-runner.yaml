@@ -120,7 +120,12 @@ services:
     volumes:
       # THE CLIENT'S OWN STATE. A small named volume, this container's alone.
       # A fresh one belongs to root, and this container is not root: hand it
-      # over once, as README.md says for the other volumes.
+      # over once, as README.md says. This is the ONLY volume in the bundle
+      # that still needs that, and the reason is directly above — this service
+      # alone runs as the MACHINE's user rather than the image's, so the image
+      # cannot make the folder for the right user in advance. The coordinator's
+      # four volumes stopped needing it at release 2026.09.24-4, when the image
+      # started making those folders as its own user.
       - sandbox-client-state:/var/lib/forge-sandbox-client
       # THE CLIENT BINARY, read-only. One statically linked file; the machine
       # says where it is.
