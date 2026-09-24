@@ -127,6 +127,15 @@ docker run --rm \
   alpine sh -c 'chown 1000:1000 /v1 /v2 /v3 /v4'
 ```
 
+The publisher's volume (`forge-publisher-state`, mounted at `/home/publisher/state`)
+needs no hand-over when the publisher runs from its own image, because that image
+creates the folder as the `publisher` user and Docker copies the ownership onto the
+fresh volume; if the publisher is ever run from another image, add that volume to the
+list above (its user is also 1000). Its settings file's `state_dir` must be
+`/home/publisher/state`, which is what `settings.sample.json` now says — the sample
+used to name a folder nothing mounted, so a publisher set up by the book kept its
+state in the container's writable layer and lost it on every recreate.
+
 The proper fix is in the image — `/var/lib/forge`, `/var/lib/forge-evidence`
 and `/etc/forge` created and owned by the `forge` user in the Dockerfile, at
 which point Docker copies that ownership onto a fresh volume and this step
