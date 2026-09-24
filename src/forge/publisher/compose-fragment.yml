@@ -36,11 +36,25 @@
 
 services:
   forge-publisher:
-    build:
-      context: ../../..
-      dockerfile: src/forge/publisher/Dockerfile
-    image: forge-publisher:local
-    container_name: forge-publisher
+    # THE TESTED IMAGE, BY NAME (24 September 2026, the containerisation
+    # stage that composed this fragment into forge/deploy/compose/).
+    #
+    # This used to carry a ``build:`` stanza pointing three folders up. Two
+    # things were wrong with it once this fragment became part of a bundle a
+    # clean machine clones: the context resolved to wherever THIS repository
+    # happened to be checked out, so the rendered bundle carried somebody's
+    # home path; and a machine with no image would have BUILT one, which is
+    # exactly what the acceptance gate forbids — the tested image is what
+    # runs, everywhere, and a local rebuild is not it. The estate bundle
+    # supplies the image by tag or digest, and refuses by name if nothing
+    # named one.
+    image: ${FORGE_PUBLISHER_IMAGE:?name the publisher's tested image in the env file - this fragment never builds one}
+    # NO ``container_name``. It used to fix the container's name to
+    # "forge-publisher", which means exactly one of these per machine and a
+    # collision the moment a second bundle is brought up beside it. Nothing
+    # needs it: the coordinator reaches this service at its SERVICE name,
+    # which compose puts on the shared network whatever the container is
+    # called.
     restart: unless-stopped
     # ------------------------------------------------------------------
     # WHERE THE PUBLISHER LISTENS, AND WHY IT IS THIS WAY AND NOT THE OTHER
@@ -80,8 +94,14 @@ services:
       # Start from settings.sample.json beside this file: it sets "host" to
       # 0.0.0.0, which the container needs (see above), and it carries no
       # secret, only the path of the credential file. The code's own default
-      # host is 127.0.0.1, right for a test and silently wrong here.
-      - ./settings.json:/etc/forge-publisher/settings.json:ro
+      # host is the loopback address, right for a test and silently wrong here.
+      #
+      # NAMED, NOT "./settings.json" (24 September 2026, same stage as the
+      # image above). A relative path resolved to this checkout's own folder,
+      # which put somebody's home path into the rendered bundle and would have
+      # looked for a file that a clean machine does not have. The machine says
+      # where its own copy is, in its env file, like every other path here.
+      - ${FORGE_PUBLISHER_SETTINGS_FILE:?name the publisher's settings file in the env file}:/etc/forge-publisher/settings.json:ro
       # THE ONE FILE THE CREDENTIAL IS IN. Read-only, and mounted nowhere else
       # in this estate.
       - ${FORGE_PUBLISHER_CREDENTIAL_FILE}:/etc/forge-publisher/credential:ro
@@ -105,6 +125,11 @@ services:
       - no-new-privileges:true
     read_only: false
     healthcheck:
+      # This container asking ITSELF, so it says "localhost" and not an
+      # address (24 September 2026). The address it used to carry was the
+      # right one and still read as a machine's address to anybody sweeping
+      # the bundle for them; a name that means "this container" says what is
+      # meant and leaves no address in the file at all.
       test:
         - CMD
         - python
@@ -112,7 +137,7 @@ services:
         - |
           import urllib.request, sys
           sys.exit(0 if urllib.request.urlopen(
-              "http://127.0.0.1:8711/healthz", timeout=5).status == 200 else 1)
+              "http://localhost:8711/healthz", timeout=5).status == 200 else 1)
       interval: 30s
       timeout: 10s
       retries: 3

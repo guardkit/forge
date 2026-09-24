@@ -1,0 +1,78 @@
+# ---------------------------------------------------------------------------
+# THE COORDINATOR'S SETTINGS FILE, AS A CONTAINER GETS IT (24 September 2026).
+#
+# This is the file that goes on the READ-ONLY 'forge-settings' volume and is
+# read at /etc/forge/forge.yaml. Nothing writes it at run time; the machine
+# puts it there before anything starts.
+#
+# EVERY ADDRESS IN IT IS A NAME. The loader fills a ${NAME} in an address
+# field from the service's environment - which compose fills from the env
+# file beside this one - and REFUSES, naming the setting and the line, when
+# nothing set it (src/forge/config/loader.py). It never picks an address for
+# you, because an address quietly defaulted to this machine's loopback is how
+# a containerised coordinator reaches nothing while looking healthy.
+#
+# So: no loopback address, no local-network address, no machine name, no home path
+# anywhere in this file, and none in the copy any machine makes from it.
+#
+# WHAT IS NOT HERE, on purpose:
+#   * the bus, the memory store and the model seats: those are environment
+#     settings (FORGE_NATS_URL, FLEET_MEMORY_*, OPENAI_BASE_URL), named in the
+#     env file, not fields in this document;
+# ONE THING THE MODEL STILL INSISTS ON, said plainly rather than papered over:
+# every project in 'planning.sandboxes' must also appear in
+# 'planning.target_repo_paths', and that field is described as "absolute local
+# working-copy paths". In the container design there is NO checkout on the
+# host - a sandboxed project is built inside its own sandbox, from the pinned
+# release image - so the path below is a path inside the container, and no
+# folder on anybody's machine is bound behind it. The coupling is left as the
+# code has it; untangling it is its own small pass.
+# ---------------------------------------------------------------------------
+
+# The only paths this file carries are paths INSIDE the container, which are
+# the same on every machine. This one is the evidence volume.
+permissions:
+  filesystem:
+    allowlist:
+      - /var/lib/forge-evidence
+
+planning:
+  enabled: true
+  # The coordinator's own copy of each project, by the key the project is
+  # registered under. A path INSIDE the container: nothing on the host is
+  # bound for it, and a sandboxed project's commits are made on the copy
+  # inside its sandbox by the helper there.
+  target_repo_paths:
+    the-org/the-project: /var/lib/forge/projects/the-project
+  # One entry per project that has a sandbox. The key is the project's
+  # 'org/name' as it is registered; 'name' is what the sandbox tool calls
+  # that sandbox on this machine.
+  #
+  # BOTH ADDRESSES CROSS THE SANDBOX BOUNDARY, so both go through the factory
+  # gateway address - the env file builds them out of it, and this file names
+  # them. They used to be this machine's loopback ports, which the coordinator
+  # could only reach because it ran on this machine's network.
+  sandboxes:
+    the-org/the-project:
+      name: the-projects-sandbox
+      sidecar_url: "${FORGE_SANDBOX_SIDECAR_URL}"
+      runner_url: "${FORGE_SANDBOX_RUNNER_URL}"
+
+deploy:
+  # Off until the rollout turns it on, as it is today.
+  enabled: false
+  # The deploy stage's docker-touching scripts run in the helper inside the
+  # project's sandbox, never in this process: a coordinator in a container has
+  # no docker socket and must not have one.
+  execution_surface: sidecar
+  sidecar_url: "${FORGE_SANDBOX_SIDECAR_URL}"
+
+publication:
+  # Off. The merge word joins, checks, and stops at 'publication pending'
+  # until the activation check holds on the real machine (rollout row 8).
+  enabled: false
+  # The publisher, by its SERVICE NAME on the publisher's own private
+  # network. The coordinator is the only thing on that network besides the
+  # publisher, which is the whole of the route to it. No credential travels
+  # this way in either direction.
+  publisher_url: "${FORGE_PUBLISHER_URL}"

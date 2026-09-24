@@ -1,0 +1,217 @@
+# ---------------------------------------------------------------------------
+# FORGE'S OWN SERVICES, AS CONTAINERS (24 September 2026, stage 2 of the
+# containerisation rollout gate).
+#
+# This file is Forge's part of the estate bundle: the coordinator, its
+# read-only answer service, and the publisher composed in from its own
+# fragment. It carries NO machine's address, NO home path, NO host network
+# and NO bind of a folder on anybody's disk. Every address in it is a NAME,
+# filled in from the env file beside it (start from .env.example).
+#
+# WHAT IS DELIBERATELY NOT IN THIS FILE, and where each one comes from:
+#
+#   * THE BUS. It is reached at the service name ${FORGE_NATS_URL} names on
+#     the 'factory' network, and it is started by its own compose file, which
+#     the estate bundle composes alongside this one. It is not here because
+#     Forge does not own it;
+#   * THE MEMORY SERVICE and THE MODEL SEATS — the same: other repositories'
+#     compose files, addresses in the env file;
+#   * THE SANDBOXES, and the build runner and deploy helper that run INSIDE
+#     each project's sandbox. A sandbox is a small machine of its own with its
+#     own engine; it is made by the sandbox daemon on the host, not by
+#     compose. The coordinator reaches into it at the factory gateway address
+#     (see the answer service's ports below);
+#   * THE FRONT DOOR (the Slack side) and the bus gateway — jarvis's own
+#     compose file, a later rollout row.
+#
+# BRING IT UP:    cp .env.example .env   # then fill in the three machine lines
+#                 docker compose --env-file .env up -d
+# TAKE IT DOWN:   docker compose down                  # keeps the volumes
+#                 docker compose down -v               # and removes them
+#
+# README.md beside this file says the same in longer words.
+# ---------------------------------------------------------------------------
+
+# The publisher, composed in from the fragment that already describes it —
+# its own network, its own credential file, no published port. Its text is
+# NOT copied here: this is the same file the rollout reads, and the six
+# conditions written at the top of it are the conditions the activation check
+# refuses without.
+include:
+  - path: ../../src/forge/publisher/compose-fragment.yml
+
+services:
+
+  # -------------------------------------------------------------------------
+  # THE COORDINATOR — 'forge serve'. The same program the recreate script
+  # starts today (ops/forge-prod-recreate.sh), with the two things that tied
+  # it to this machine removed: it is no longer on the host's network, and it
+  # no longer binds two folders out of somebody's home directory.
+  # -------------------------------------------------------------------------
+  coordinator:
+    image: ${FORGE_IMAGE:?name the release image in the env file, e.g. FORGE_IMAGE=forge:2026.09.24-2 - this file never picks one for you}
+    # The image's ENTRYPOINT is 'forge', so this is the rest of the line.
+    # The settings file is on the read-only settings volume, which is the
+    # whole point of splitting it away from the writable state.
+    command: ["--config", "/etc/forge/forge.yaml", "serve"]
+    user: forge
+    restart: unless-stopped
+    environment:
+      # THE BUS, by the service name it answers to on the 'factory' network.
+      # Never this machine's loopback address: the coordinator is not on this
+      # machine's network any more.
+      FORGE_NATS_URL: ${FORGE_NATS_URL:?name the bus in the env file, e.g. nats://nats:4222 - a service name on the factory network}
+      # THE RECORD. One file on the ledger volume, which this service is the
+      # only writer of.
+      FORGE_DB_PATH: /var/lib/forge/forge.db
+      # WHERE A BUILD'S RECEIPTS GO — the evidence volume, not beside the code.
+      FORGE_RECEIPTS_DIR: /var/lib/forge-evidence
+      FORGE_HEALTHZ_PORT: "8080"
+      FORGE_LOG_LEVEL: ${FORGE_LOG_LEVEL:-info}
+      # THE BUILD RUNNER the coordinator dispatches to. In the container world
+      # this is a runner inside a project's sandbox, reached at the factory
+      # gateway address (see section 7 of the design); the env file builds the
+      # whole address out of FACTORY_GATEWAY_ADDRESS and a port.
+      FORGE_AUTOBUILD_RUNNER_URL: ${FORGE_AUTOBUILD_RUNNER_URL:?name the build runner's address in the env file}
+      # The addresses the SETTINGS FILE writes as ${NAME}. The loader fills
+      # them in from here and refuses, by name, anything nothing set
+      # (src/forge/config/loader.py).
+      FORGE_SANDBOX_SIDECAR_URL: ${FORGE_SANDBOX_SIDECAR_URL:?name the sandbox deploy helper's address in the env file}
+      FORGE_SANDBOX_RUNNER_URL: ${FORGE_SANDBOX_RUNNER_URL:?name the sandbox build runner's address in the env file}
+      FORGE_PUBLISHER_URL: ${FORGE_PUBLISHER_URL:?name the publisher's address in the env file - a service name on the publisher's own network}
+    volumes:
+      # THE RECORD, READ-WRITE. This service is its one writer.
+      - forge-ledger:/var/lib/forge
+      # THE SETTINGS, READ-ONLY. Nothing writes this volume at run time; the
+      # machine puts the settings file on it before anything starts. This is
+      # the fix for the old arrangement, where the settings file sat in the
+      # same writable folder as the record.
+      - forge-settings:/etc/forge:ro
+      # THE EVIDENCE. The coordinator reads it; a build's runner writes it.
+      - forge-evidence:/var/lib/forge-evidence
+      # THIS SERVICE'S OWN SMALL STATE.
+      - forge-home:/home/forge/.forge
+    networks:
+      # Both networks, and it is the ONLY thing that is on both: the factory
+      # network where the bus, the answer service and the rest of the estate
+      # are, and the publisher's own network. That is the whole of the route
+      # to the publisher, and why nothing else can take it.
+      - factory
+      - forge-publisher-net
+    healthcheck:
+      # DELIBERATELY NOT THE IMAGE'S OWN HEALTHCHECK. The image probes
+      # /healthz with 'curl -fs', and that endpoint answers 503 until the
+      # daemon's subscription to the bus is live - so the image's probe is a
+      # probe of the BUS as much as of this service, and a bus that is slow to
+      # come up marks the coordinator unhealthy and restarts it under it.
+      # This probe asks only "is this service answering at all", which is a
+      # question about this container and nothing else. Whether the bus is
+      # reached is the estate's own check ('estate check services'), not a
+      # restart trigger.
+      test: ["CMD-SHELL", "curl -s -o /dev/null http://localhost:8080/healthz || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  # -------------------------------------------------------------------------
+  # THE ANSWER SERVICE — the read-only "what commit did this build start
+  # from" and "who holds this deployment target". Same image, different
+  # start command; it is a separate service and not a thread of the
+  # coordinator's because the thing that asks it is on the far side of a
+  # sandbox boundary and must be able to reach it when the coordinator is
+  # busy, restarting or mid-migration.
+  # -------------------------------------------------------------------------
+  answer-service:
+    image: ${FORGE_IMAGE:?name the release image in the env file}
+    entrypoint: ["python", "-m", "forge.record_answer"]
+    command:
+      - "--ledger"
+      - "/var/lib/forge/forge.db"
+      # Every address INSIDE this container, because the published port below
+      # carries traffic to the container's own address and something bound to
+      # the container's loopback address would never hear it. (The same
+      # mistake the publisher's fragment writes out at length.)
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8126"
+    user: forge
+    restart: unless-stopped
+    depends_on:
+      # THE COORDINATOR FIRST, because this service reads the record and
+      # refuses to start when there is none — which is the right refusal (a
+      # service pointed at nothing answers nothing, and an operator should
+      # learn that at the door) but makes a crash loop out of a first start on
+      # an empty volume. The coordinator creates and migrates the record at
+      # its own boot, so waiting for it to be answering is enough.
+      coordinator:
+        condition: service_healthy
+    volumes:
+      # THE RECORD, READ-ONLY — and the FOLDER, not the one file. The store
+      # keeps companion files beside the record while it is in use, and a
+      # reader given only the one file finds no tables at all. The service
+      # also opens the record with mode=ro, so there are two walls.
+      - forge-ledger:/var/lib/forge:ro
+    networks:
+      - factory
+    ports:
+      # THE ONE PUBLISHED PORT IN THIS FILE, AND WHY.
+      #
+      # A project's deploy helper runs INSIDE that project's sandbox. A
+      # sandbox is a separate small machine with its own engine and its own
+      # network: it is not on the 'factory' network and never will be, so a
+      # service name does not reach it and it does not reach a service name.
+      # Every crossing of that boundary goes through ONE machine address, the
+      # factory gateway address, and each crossing is permitted per route -
+      # this listener, this port, this allowed source - and refused to every
+      # other caller including the local network. See section 7 of
+      # docs/factory-containerisation-design-pass-2026-09-23.md ("The routes
+      # across the sandbox boundary"), which also says why a blanket
+      # "allow the sandbox subnet" rule is wrong.
+      #
+      # The helper is given this address as FORGE_TARGET_OWNER_URL, with the
+      # route on the end: http://<gateway>:<port>/recorded. With nothing
+      # answering there the helper refuses every deploy that names a commit,
+      # which is the safe side and which stops the factory deploying.
+      #
+      # FACTORY_GATEWAY_ADDRESS is never 0.0.0.0 and never blank: either
+      # would put this on the local network, which the per-route policy
+      # forbids.
+      - "${FACTORY_GATEWAY_ADDRESS:?name this machine's factory gateway address in the env file}:${FORGE_ANSWER_PORT:?name the port the answer service is published on}:8126"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:8126/healthz || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+networks:
+  # THE ONE DECLARED NETWORK. It replaces the host network the coordinator
+  # runs on today. What is on it: the coordinator, the answer service, and -
+  # from their own compose files in the estate bundle - the bus, the memory
+  # service and the bus gateway. What is NOT on it: the publisher (its own
+  # network, joined only by the coordinator) and every sandbox (its own
+  # machine, reached at the factory gateway address).
+  factory:
+    driver: bridge
+
+volumes:
+  # THE SIX VOLUMES OF THE DESIGN'S TABLE, each with ONE writer. Four are
+  # declared here because Forge owns them; the other two are named so the
+  # table can be read in one place, with the file that declares each.
+  #
+  #   forge-ledger           written by: the coordinator, and nothing else
+  #   forge-settings         written by: NOBODY at run time - the machine puts
+  #                                      the settings file on it before start
+  #   forge-evidence         written by: a build's runner inside its sandbox
+  #   forge-home             written by: the coordinator (its own small state)
+  #   forge-publisher-state  written by: the publisher - declared by the
+  #                                      included fragment, not here
+  #   nats-jetstream         written by: the bus - declared by the bus's own
+  #                                      compose file, which the estate
+  #                                      bundle composes alongside this one
+  forge-ledger:
+  forge-settings:
+  forge-evidence:
+  forge-home:
