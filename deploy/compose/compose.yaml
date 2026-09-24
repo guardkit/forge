@@ -49,7 +49,7 @@ services:
   # no longer binds two folders out of somebody's home directory.
   # -------------------------------------------------------------------------
   coordinator:
-    image: ${FORGE_IMAGE:?name the release image in the env file, e.g. FORGE_IMAGE=forge:2026.09.24-5 - this file never picks one for you}
+    image: ${FORGE_IMAGE:?name the release image in the env file, e.g. FORGE_IMAGE=forge:2026.09.24-6 - this file never picks one for you}
     # The image's ENTRYPOINT is 'forge', so this is the rest of the line.
     # The settings file is on the read-only settings volume, which is the
     # whole point of splitting it away from the writable state.
