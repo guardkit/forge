@@ -1,0 +1,67 @@
+# ---------------------------------------------------------------------------
+# The factory's release manifest — what exactly goes into one Forge image.
+#
+# Written 2026-09-24. Until this file existed, the Forge image was built from
+# whatever four checkouts happened to sit beside forge/ on one machine
+# (scripts/build-image.sh), so "the same release on two machines" was not
+# possible. This file is the answer: every input named by its repository, the
+# exact commit, and the branch that commit came from, plus the Python base
+# image the Dockerfile pins.
+#
+# It is read by scripts/build-release-image.sh, which fetches each repository
+# from GitHub at the commit below into a fresh temporary folder and builds the
+# image from those clones alone. Nothing beside forge/ is used.
+#
+# All five repositories are public, so fetching them needs no credential.
+#
+# To cut a new release: change the commits and the version, then run
+#   scripts/build-release-image.sh /path/to/manifest.yaml
+# from any directory. The script refuses if a commit cannot be fetched, if a
+# clone lands on a different commit, or if the base image digest here has
+# drifted from the one in the Dockerfile.
+#
+# Format note: this is a deliberately small, flat subset of YAML so that the
+# build script can read it with awk alone. A second machine therefore needs
+# only this file, Docker, and network access to GitHub — no YAML tool, no
+# language runtime, no checkout. Keep it to "key: value" at the top level and
+# to the exact four keys per repository below.
+# ---------------------------------------------------------------------------
+
+schema: 1
+version: 2026.09.24-1
+image_name: forge
+
+# The Python base image both Dockerfile stages start FROM. The build script
+# reads the Dockerfile's own FROM lines and refuses to build if they disagree
+# with this line, so the pin cannot quietly drift out of the manifest.
+python_base_digest: sha256:2e256d0381371566ed96980584957ed31297f437569b79b0e5f7e17f2720e53a
+
+# The five repositories that make up the image.
+#   role: build-context-root  — the Dockerfile and the main build context
+#   role: named-context       — supplied to the build as --build-context <name>=<clone>
+repositories:
+  - name: forge
+    url: https://github.com/guardkit/forge.git
+    branch: main
+    commit: 3e06e6c68930b39cef90f2c67e3d77ab5fbea8e9
+    role: build-context-root
+  - name: guardkit
+    url: https://github.com/guardkit/guardkit.git
+    branch: main
+    commit: 0da56d2f67d846b797bccae5a5ac0ca1f86c5969
+    role: named-context
+  - name: nats-core
+    url: https://github.com/guardkit/nats-core.git
+    branch: main
+    commit: fc7bdbbe54aa158a7d77ed7a76eeaab137b6a66c
+    role: named-context
+  - name: fleet-memory
+    url: https://github.com/guardkit/fleet-memory.git
+    branch: main
+    commit: ec1fe9b0ecd21dae96d1d184e3129c11943be72f
+    role: named-context
+  - name: guardkitfactory
+    url: https://github.com/guardkit/guardkitfactory.git
+    branch: main
+    commit: 7165193f63abe8f48a98496761f467e6ff7ab631
+    role: named-context
