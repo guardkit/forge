@@ -80,10 +80,20 @@ def _resolve_context_object(config_path: Path | None) -> object:
     ``queue`` subcommand enforces its own "config required" rule via
     :func:`forge.cli.queue._require_forge_config`.
     """
-    if config_path is not None:
-        return load_config(config_path)
-    if DEFAULT_CONFIG_FILENAME.exists():
-        return load_config(DEFAULT_CONFIG_FILENAME)
+    # AN UNSET ADDRESS NAME IS SAID IN ONE SENTENCE, NOT A STACK (24 September
+    # 2026). The loader refuses a settings file whose address names nothing
+    # set, and its sentence names the setting and the field; delivered as a
+    # traceback, that sentence was the last line of forty. A new machine's
+    # first start should read it as a message.
+    from forge.config.loader import AnAddressNameIsNotSet
+
+    try:
+        if config_path is not None:
+            return load_config(config_path)
+        if DEFAULT_CONFIG_FILENAME.exists():
+            return load_config(DEFAULT_CONFIG_FILENAME)
+    except AnAddressNameIsNotSet as exc:
+        raise click.ClickException(str(exc)) from None
     return None
 
 
