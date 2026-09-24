@@ -74,13 +74,16 @@ _ONLY_THESE_ARE_INHERITED = (
 )
 
 
-def _rendered() -> str:
+def _rendered(*files: str) -> str:
     """``docker compose config`` of the bundle, with the example env."""
     bare = {
         name: os.environ[name]
         for name in _ONLY_THESE_ARE_INHERITED
         if name in os.environ
     }
+    chosen: list[str] = []
+    for name in files or ("compose.yaml",):
+        chosen += ["--file", name]
     done = subprocess.run(
         [
             "docker",
@@ -89,8 +92,7 @@ def _rendered() -> str:
             "forge-compose-bundle-check",
             "--env-file",
             ".env.example",
-            "--file",
-            "compose.yaml",
+            *chosen,
             "config",
         ],
         cwd=BUNDLE,
@@ -111,6 +113,19 @@ def rendered() -> str:
     if shutil.which("docker") is None:
         pytest.skip("docker is not installed here, so there is nothing to render")
     return _rendered()
+
+
+@pytest.fixture(scope="module")
+def rendered_with_the_sandbox_runner() -> str:
+    """The bundle as a machine that looks after a project's sandbox runs it.
+
+    ``compose.sandbox-runner.yaml`` is a file of its own — a machine has one
+    per project sandbox, and a machine with none should not have to comment a
+    service out — so the same checks are made again over both files together.
+    """
+    if shutil.which("docker") is None:
+        pytest.skip("docker is not installed here, so there is nothing to render")
+    return _rendered("compose.yaml", "compose.sandbox-runner.yaml")
 
 
 class TestTheBundleRenders:
@@ -191,3 +206,99 @@ class TestWhatTheBundlePromises:
         block = rendered.split("source: forge-settings", 1)
         assert len(block) == 2, "the settings volume is not mounted anywhere"
         assert "read_only: true" in block[1][:200]
+
+
+class TestTheSandboxRunnerAddsNothingOfThisMachine:
+    """The one service that touches the host, checked the same way.
+
+    It is given the sandbox daemon's socket and the client binary, because the
+    daemon makes the sandboxes and is therefore the host. Both arrive as
+    setting names. Everything else about it is the same promise as the rest of
+    the bundle: no address, no home folder, no published port.
+    """
+
+    def test_it_renders_and_the_service_is_there(
+        self, rendered_with_the_sandbox_runner: str
+    ) -> None:
+        assert "sandbox-runner:" in rendered_with_the_sandbox_runner
+
+    def test_no_address_but_the_documentation_one(
+        self, rendered_with_the_sandbox_runner: str
+    ) -> None:
+        found = {
+            address
+            for address in _AN_ADDRESS.findall(rendered_with_the_sandbox_runner)
+            if address not in _ALLOWED_ADDRESSES
+            and not address.startswith(_DOCUMENTATION_BLOCK)
+        }
+        assert not found, (
+            "the sandbox runner brought an address that belongs to a machine: "
+            f"{sorted(found)}"
+        )
+
+    def test_no_home_directory_but_the_images_own(
+        self, rendered_with_the_sandbox_runner: str
+    ) -> None:
+        for line in rendered_with_the_sandbox_runner.splitlines():
+            if "/home/" not in line:
+                continue
+            assert any(home in line for home in _IN_IMAGE_HOMES), (
+                "the sandbox runner carries a home directory, which is where "
+                f"the socket really lives on most machines: {line.strip()}"
+            )
+
+    def test_it_publishes_nothing(
+        self, rendered_with_the_sandbox_runner: str
+    ) -> None:
+        """Still exactly one published port in the whole bundle, and it is
+        the answer service's. This service talks over a unix socket."""
+        assert rendered_with_the_sandbox_runner.count("mode: ingress") == 1
+        block = rendered_with_the_sandbox_runner.split("sandbox-runner:", 1)[1]
+        assert "network_mode: none" in block, (
+            "the sandbox runner needs no network at all; saying so is what "
+            "makes 'it cannot be reached' true rather than merely likely"
+        )
+
+    def test_it_binds_only_the_binary_and_the_socket(
+        self, rendered_with_the_sandbox_runner: str
+    ) -> None:
+        allowed_targets = (
+            "/etc/forge-publisher/settings.json",
+            "/etc/forge-publisher/credential",
+            "/usr/bin/sbx",
+            "/sandboxd/sandboxd.sock",
+        )
+        for block in rendered_with_the_sandbox_runner.split("- type: bind")[1:]:
+            head = block[:400]
+            assert any(target in head for target in allowed_targets), (
+                "the sandbox runner binds something other than the client "
+                f"binary and the daemon's socket:\n{head}"
+            )
+
+    def test_docker_waits_longer_than_the_stop_inside_the_sandbox(
+        self, rendered_with_the_sandbox_runner: str
+    ) -> None:
+        """The stop reaches inside the sandbox and is waited for, so Docker
+        has to wait too. A grace period under the script's own timeout would
+        kill the container mid-stop and leave the work running in there —
+        which is the exact defect this service exists to fix."""
+        block = rendered_with_the_sandbox_runner.split("sandbox-runner:", 1)[1]
+        grace = re.search(r"stop_grace_period: (\S+)", block)
+        assert grace, "the sandbox runner sets no stop grace period"
+        assert grace.group(1) not in ("0s", "10s"), (
+            f"the grace period is {grace.group(1)}, which is Docker's default "
+            "ten seconds or less; the stop inside the sandbox needs longer"
+        )
+        timeout = re.search(r"SANDBOX_STOP_TIMEOUT_SECONDS: .(\d+).", block)
+        assert timeout, "the sandbox runner sets no stop timeout"
+        assert _seconds(grace.group(1)) > int(timeout.group(1)), (
+            "Docker would give up before the script does, so the script would "
+            "never get to let the sandbox sleep"
+        )
+
+
+def _seconds(duration: str) -> int:
+    """Compose renders a duration as e.g. ``1m30s``; this is that in seconds."""
+    parts = re.findall(r"(\d+)([hms])", duration)
+    scale = {"h": 3600, "m": 60, "s": 1}
+    return sum(int(amount) * scale[unit] for amount, unit in parts)

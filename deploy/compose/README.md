@@ -13,6 +13,7 @@ is the whole of the difference between a laptop and a cloud machine.
 | File | What it is |
 |---|---|
 | `compose.yaml` | the three services, the network and the volumes |
+| `compose.sandbox-runner.yaml` | one project's sandbox, looked after by a container. Only on a machine that has one; composed alongside `compose.yaml` |
 | `.env.example` | every setting name the bundle needs, with no machine's values. Copy it to `.env` and fill in the lines marked CHANGE THIS |
 | `settings.example.yaml` | the coordinator's own settings file, with every address written as a `${NAME}`. Copy it onto the read-only settings volume |
 | `README.md` | this page |
@@ -38,6 +39,89 @@ able to ask while the coordinator is busy, restarting or applying migrations.
 is one description of it and the rollout reads the same file. It holds the one
 credential that can write to a project's remote, which is why it is a separate
 image, a separate user and a separate network.
+
+## The one service that touches the host
+
+**The sandbox runner** (`compose.sandbox-runner.yaml`) is the fourth service,
+and it is the odd one out. It looks after one project's sandbox, and it
+replaces the two host units that used to do that:
+
+| It replaces | Which did |
+|---|---|
+| `forge-sandbox-keeper@<sandbox>` | held the sandbox awake, so it did not go to sleep thirty seconds after the last session ended |
+| `forge-sandbox-runner@<sandbox>` | ran the project's own bootstrap inside the sandbox, and stopped it again |
+
+A machine has one of these per project sandbox, which is why it is a file of
+its own rather than a fourth service in `compose.yaml`: a machine with no
+sandbox should not have to comment anything out. Bring the two up together:
+
+```
+docker compose --env-file .env -f compose.yaml -f compose.sandbox-runner.yaml up -d
+```
+
+**It is the only thing in this bundle that is given anything of the machine
+beyond Docker itself, and it is worth saying why that is allowed.** A sandbox
+is a small machine of its own, and the thing that makes sandboxes is the
+*sandbox daemon*, which runs on the host. There is no more to containerise
+about it than about the Docker daemon underneath this whole file. So the
+service is given exactly two things and nothing else:
+
+- **the daemon's socket**, bound at the one path the client insists on —
+  `<storage root>/state/sandboxes/sandboxes/sandboxd/sandboxd.sock`. Put it
+  anywhere else and the client quietly decides it is talking to Docker's
+  hosted service and complains about authentication, which has nothing to do
+  with what is wrong;
+- **the client binary**, read-only. One statically linked file.
+
+Both arrive as names in `.env` (`SANDBOXD_SOCKET_PATH`, `SBX_BINARY_PATH`), so
+neither this file nor the compose file carries a path belonging to a machine.
+The service joins **no network at all** (`network_mode: none` — everything it
+says, it says over that socket), publishes **no port**, and binds no folder.
+
+**It runs as the machine's own user**, not as the image's `forge` user, because
+the daemon's socket is owner-only: `FACTORY_HOST_UID` and `FACTORY_HOST_GID`.
+That is the one exception in the bundle and the socket's permissions are the
+whole of the reason.
+
+**Its own small volume** (`sandbox-client-state`) is the client's writable
+state folder, and needs the same one-off hand-over as the volumes above:
+
+```
+docker run --rm -v <project>_sandbox-client-state:/v1 alpine sh -c 'chown 1000:1000 /v1'
+```
+
+### The stop is the point of it
+
+The client runs out here and all the work runs in there, so **ending the client
+ends nothing**: the project's bootstrap keeps running inside the sandbox and
+keeps supervising its services. That is written out at length in the unit this
+replaces, and it cost a day: on 11 September 2026 four supervisors had piled up
+inside one sandbox, all fighting over the same two ports, the one holding them
+older than the code installed underneath it — so a build served a mixture of
+old and new code and died a second after its gate was tapped, with nothing
+reporting a problem.
+
+So a stop signal here goes back through the same door the start went through
+and asks the project's own bootstrap to stop itself — one word,
+`SANDBOX_BOOTSTRAP_STOP_ARGUMENT` — and **waits for it**. Docker must wait too,
+which is why `stop_grace_period` is minutes rather than the default ten
+seconds. The same stop runs before every restart of the session, for the same
+reason systemd ran its `ExecStop` before every automatic restart.
+
+**Check the project's bootstrap takes that word before you start this
+service.** An older one reads no arguments at all: it would ignore the word and
+start a *second* supervisor instead, and a restart would add two where it meant
+to remove one.
+
+### What is not proven here
+
+**Recovery after the sandbox daemon is restarted.** The daemon is shared with
+every other sandbox on the machine, including live ones, so that proof cannot
+be made on a disposable sandbox on a working machine. It is rollout step 6,
+with the owner present. Everything else was proven on a disposable sandbox on
+24 September 2026: the client working from inside the container, the start, the
+stop that really ends the work inside, ten stop/start cycles leaving exactly
+one supervisor, and the container's own restart leaving one.
 
 ## Which network each one is on, and why
 
@@ -170,10 +254,13 @@ docker compose down -v       # and removes the volumes too — the record with t
   estate bundle composes alongside this one. Forge does not own it.
 - **The memory service and the model seats.** The same: other repositories'
   compose files, addresses in `.env`.
-- **The sandboxes**, and the build runner and deploy helper that run inside
-  each project's sandbox. A sandbox is made by the sandbox daemon on the host,
-  not by compose. The coordinator reaches into it at the factory gateway
-  address.
+- **The sandboxes themselves**, and the build runner and deploy helper that run
+  inside each project's sandbox. Making a sandbox is still an attended step:
+  the sandbox daemon does it, the project's own wrapper asks for it on a first
+  deploy, and nothing in this bundle creates, removes or reconfigures one.
+  `compose.sandbox-runner.yaml` holds an existing one awake and runs the
+  project's own bootstrap inside it; the coordinator reaches into it at the
+  factory gateway address.
 - **The front door** (the Slack side) and the bus gateway — jarvis's own
   compose file, a later rollout row.
 

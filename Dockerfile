@@ -327,6 +327,17 @@ COPY --from=builder /opt/venv /opt/venv
 # target exists at this point.
 RUN ln -s /opt/venv/bin/guardkit-py /usr/local/bin/guardkit
 
+# The sandbox runner's supervisor script (added 2026-09-24, stage 3 of the
+# containerisation rollout gate). It is the start command of the compose
+# service deploy/compose/compose.sandbox-runner.yaml, which replaces the two
+# host units that looked after a project's sandbox. It lives in the image
+# rather than being bound in from a folder, because a bind is a path and a
+# path belongs to one machine — which is the whole of what this gate is about.
+# It is a leaf: nothing else in the image reads it, and every other start
+# command is unaffected.
+COPY deploy/compose/sandbox-runner/run.sh /opt/forge/sandbox-runner/run.sh
+RUN chmod 0755 /opt/forge/sandbox-runner/run.sh
+
 # Create the unprivileged runtime user *before* WORKDIR/COPY-into-home
 # so any files copied later inherit the correct ownership when --chown
 # is used. UID 1000 is mandated by AC-C and the ``id -u`` runtime
