@@ -1144,11 +1144,18 @@ class TestTheRecordMustNameThisCheckoutsSupervisor:
             for name in ("forge-sandbox-helper", "forge-sandbox-runner"):
                 (sandbox["state"] / name).write_text("made\n")
 
-            stopped = _run(sandbox, "stop")
+            # A second of patience here, where the shipped default is thirty:
+            # a supervisor removes both containers on its way out and Docker
+            # gives each one ten seconds to go, so the default has to cover an
+            # ordinary shutdown (found by running it in a sandbox, 24
+            # September 2026).
+            stopped = _run(
+                sandbox, "stop", SANDBOX_RUNNER_STOP_PATIENCE_SECONDS="1"
+            )
 
             assert stopped.returncode == 5, stopped.stdout
             assert "stopped:" not in stopped.stdout
-            assert "is still running" in stopped.stdout
+            assert "1 seconds later it is still running" in stopped.stdout
             assert "makes the two containers again" in stopped.stdout
             # Nothing was removed on top of a supervisor that would remake it.
             assert (sandbox["state"] / "forge-sandbox-helper").exists()
@@ -1156,6 +1163,11 @@ class TestTheRecordMustNameThisCheckoutsSupervisor:
         finally:
             deaf.kill()
             deaf.wait(timeout=10)
+
+    def test_the_default_patience_covers_two_container_stops(self):
+        """Thirty seconds, because twenty of them are an ordinary shutdown."""
+        script = BOOTSTRAP.read_text()
+        assert 'SANDBOX_RUNNER_STOP_PATIENCE_SECONDS:-30' in script
 
     def test_the_record_it_writes_is_its_own_birth_time(self, sandbox):
         """Not the wall clock, which any later process can be made to match."""

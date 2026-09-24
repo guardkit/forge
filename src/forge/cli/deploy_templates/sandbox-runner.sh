@@ -258,6 +258,13 @@
 #     SANDBOX_RUNNER_RESTART_SECONDS
 #                            the pause before a container that died is started
 #                            again (default 5)
+#     SANDBOX_RUNNER_STOP_PATIENCE_SECONDS
+#                            how long a stop waits for the supervisor it
+#                            signalled to go before it calls it stuck (default
+#                            30). A supervisor removes both containers on its
+#                            way out and each removal may take the ten seconds
+#                            Docker gives a container, so twenty seconds of
+#                            that is an ordinary shutdown, not a fault
 #     SANDBOX_CONTAINER_PREFIX
 #                            what the two containers are called in here
 #                            (default forge-sandbox → -helper and -runner)
@@ -353,6 +360,17 @@ BIND="${SANDBOX_RUNNER_BIND:-0.0.0.0}"
 SIDECAR_PORT="${SANDBOX_SIDECAR_PORT:-8125}"
 RUNNER_PORT="${SANDBOX_RUNNER_PORT:-8124}"
 RESTART_SECONDS="${SANDBOX_RUNNER_RESTART_SECONDS:-5}"
+# HOW LONG A STOP WAITS FOR THE SUPERVISOR IT SIGNALLED, and why it is this
+# long (found by running it in a sandbox, 24 September 2026). The supervisor's
+# own ending is not instant: it removes both containers on its way out, and
+# `docker stop` gives a container ten seconds to go before it insists. Two
+# containers is therefore twenty seconds of perfectly ordinary shutdown, and a
+# stop that gave up at ten would call a supervisor that was doing exactly as it
+# was told one that would not go — and the host side, which starts nothing on
+# top of a stop that failed, would leave a project's factory down over it. Keep
+# this comfortably below the host side's own stop timeout
+# (SANDBOX_STOP_TIMEOUT_SECONDS out there, 45 seconds by default).
+STOP_PATIENCE_SECONDS="${SANDBOX_RUNNER_STOP_PATIENCE_SECONDS:-30}"
 PREFIX="${SANDBOX_CONTAINER_PREFIX:-forge-sandbox}"
 HELPER_NAME="${PREFIX}-helper"
 RUNNER_NAME="${PREFIX}-runner"
@@ -580,12 +598,13 @@ stop_everything() {
     if it_is_this_checkouts_supervisor "${owner}" "${born}"; then
       log "asking the supervisor ${owner} to stop"
       kill -TERM "${owner}" 2>/dev/null || true
-      while ((waited < 100)) && it_is_this_checkouts_supervisor "${owner}" "${born}"; do
+      while ((waited < STOP_PATIENCE_SECONDS * 10)) &&
+            it_is_this_checkouts_supervisor "${owner}" "${born}"; do
         sleep 0.1
         waited=$((waited + 1))
       done
       if it_is_this_checkouts_supervisor "${owner}" "${born}"; then
-        log "FATAL: the supervisor ${owner} of this checkout was asked to stop ten seconds ago and is still running. It makes the two containers again whenever they are gone, so removing them now would achieve nothing and reporting a stop would be untrue. The record is left where it is. Nothing may be started in this sandbox until this supervisor has gone."
+        log "FATAL: the supervisor ${owner} of this checkout was asked to stop, and ${STOP_PATIENCE_SECONDS} seconds later it is still running. It makes the two containers again whenever they are gone, so removing them now would achieve nothing and reporting a stop would be untrue. The record is left where it is. Nothing may be started in this sandbox until this supervisor has gone."
         return 5
       fi
     else
