@@ -30,6 +30,7 @@ declares, and this file declares its own throwaway ones.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -541,3 +542,169 @@ class TestTheOrdinaryPathStillWorks:
         assert _wait_for(lambda: not _workers_alive(root), seconds=10), (
             f"work was left running inside: {output}"
         )
+
+
+#: The bootstrap Forge ships into a repository — the real one, run for real by
+#: the class below through a stand-in door.
+THE_REAL_BOOTSTRAP = (
+    Path(__file__).resolve().parents[3]
+    / "src"
+    / "forge"
+    / "cli"
+    / "deploy_templates"
+    / "sandbox-runner.sh"
+)
+
+#: A stand-in client that RUNS THE THING IT IS ASKED TO RUN. The other one in
+#: this file pretends; this one hands the request to bash, so what answers the
+#: service is the real bootstrap with its real exit status. The hold and the
+#: release of the hold are the only two calls it answers by itself.
+A_DOOR_THAT_REALLY_OPENS = '''#!/usr/bin/env python3
+import json, os, subprocess, sys, time
+from pathlib import Path
+
+here = Path(__file__).resolve().parent
+ledger = here / "events.jsonl"
+request = sys.argv[3:]  # everything after: <client> exec <sandbox>
+settings = {}
+if request and request[0] == "env":
+    rest = request[1:]
+    while rest and "=" in rest[0]:
+        name, value = rest.pop(0).split("=", 1)
+        settings[name] = value
+    request = rest
+with ledger.open("a") as handle:
+    handle.write(json.dumps({"kind": "call", "request": request,
+                             "settings": settings}) + "\\n")
+
+if not request:
+    sys.exit(0)
+if request[0] == "bash":
+    time.sleep(600)  # the hold on the sandbox
+if request[0] == "pkill":
+    sys.exit(0)
+environment = dict(os.environ)
+environment.update(settings)
+sys.exit(subprocess.run(["bash", *request], env=environment).returncode)
+'''
+
+#: An engine inside the sandbox that will not answer at all — the fault Codex
+#: reproduced, seen from out here.
+AN_ENGINE_THAT_WILL_NOT_ANSWER = '''#!/usr/bin/env python3
+import sys
+if sys.argv[1:2] == ["ps"]:
+    print("Cannot connect to the Docker daemon (a stand-in, on purpose)",
+          file=sys.stderr)
+    sys.exit(1)
+sys.exit(0)
+'''
+
+
+class TestTheRealBootstrapsFailedStopStopsThisService:
+    """The two halves, connected: a stop that could not be established.
+
+    Everything else in this file drives the service against a client that
+    pretends. This one runs THE SHIPPED BOOTSTRAP behind the door, with an
+    engine inside the sandbox that will not answer. The bootstrap cannot
+    establish that its containers are gone, says so and ends non-zero — and the
+    question this test asks is what the service out here does about it, because
+    before stage 4f the bootstrap would have said 0 and this service would have
+    started a second supervisor on top of live work.
+    """
+
+    @staticmethod
+    def _a_project_with_the_real_bootstrap(root: Path) -> Path:
+        project = root / "a-throwaway-project"
+        (project / "deploy").mkdir(parents=True)
+        shutil.copy2(THE_REAL_BOOTSTRAP, project / "deploy" / "sandbox-runner.sh")
+        (project / "deploy" / "sandbox-runner.sh").chmod(0o755)
+        return project / "deploy" / "sandbox-runner.sh"
+
+    @staticmethod
+    def _calls_to(root: Path, bootstrap: Path, word: str | None):
+        wanted = [str(bootstrap)] + ([word] if word else [])
+        return [c for c in _of_kind(root, "call") if c["request"] == wanted]
+
+    def test_a_stop_it_could_not_establish_starts_nothing_out_here(
+        self, root: Path
+    ) -> None:
+        bootstrap = self._a_project_with_the_real_bootstrap(root)
+        (root / "sbx").write_text(A_DOOR_THAT_REALLY_OPENS)
+        (root / "sbx").chmod(0o755)
+        engine = root / "an-engine-that-will-not-answer"
+        engine.write_text(AN_ENGINE_THAT_WILL_NOT_ANSWER)
+        engine.chmod(0o755)
+        home = root / "a-home-inside-the-sandbox"
+        home.mkdir()
+        # A supervisor record left behind by an earlier life, so the stop has
+        # something to recover from and this test can prove it is kept.
+        which = hashlib.sha256(str(bootstrap.parent.parent).encode()).hexdigest()
+        record = home / ".forge-runner" / which / "supervisor"
+        record.parent.mkdir(parents=True)
+        record.write_text("999999999 0\n")
+
+        service = _start(
+            root,
+            SANDBOX_BOOTSTRAP=str(bootstrap),
+            SANDBOX_ENV_NAMES="HOME SANDBOX_DOCKER",
+            HOME=str(home),
+            SANDBOX_DOCKER=str(engine),
+        )
+        output = _finish(service)
+
+        assert service.returncode == 3, output
+        assert THE_SENTENCE in output
+        assert "[sandbox-runner] stopped" not in output.splitlines()
+        # The bootstrap was asked to stop, said it could not, and was never
+        # started on top of what may still be running in there.
+        stops = self._calls_to(root, bootstrap, "stop")
+        assert len(stops) == 2, f"expected the two tries: {_events(root)}"
+        assert not self._calls_to(root, bootstrap, None), (
+            f"it started the bootstrap after a stop it could not establish: "
+            f"{_events(root)}"
+        )
+        assert not _of_kind(root, "hold"), "it held the sandbox awake for nothing"
+        # And the bootstrap's own words reached the service's log.
+        assert "would not say what is running in it" in output
+        assert record.exists(), (
+            "the record the next stop needs was thrown away by a stop that "
+            "did not work"
+        )
+
+    def test_the_same_bootstrap_stopping_cleanly_is_a_clean_start(
+        self, root: Path
+    ) -> None:
+        """The other half: with an engine that answers, the stop works.
+
+        Without this the test above would pass just as well against a
+        bootstrap that could never stop anything.
+        """
+        bootstrap = self._a_project_with_the_real_bootstrap(root)
+        (root / "sbx").write_text(A_DOOR_THAT_REALLY_OPENS)
+        (root / "sbx").chmod(0o755)
+        engine = root / "an-engine-that-answers"
+        engine.write_text(
+            "#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n"
+        )
+        engine.chmod(0o755)
+        home = root / "a-home-inside-the-sandbox"
+        home.mkdir()
+
+        service = _start(
+            root,
+            SANDBOX_BOOTSTRAP=str(bootstrap),
+            SANDBOX_ENV_NAMES="HOME SANDBOX_DOCKER",
+            HOME=str(home),
+            SANDBOX_DOCKER=str(engine),
+        )
+        try:
+            assert _wait_for(
+                lambda: bool(self._calls_to(root, bootstrap, None))
+            ), f"the bootstrap was never started: {_events(root)}"
+        finally:
+            service.send_signal(signal.SIGTERM)
+            output = _finish(service)
+
+        assert service.returncode == 0, output
+        assert "[sandbox-runner] stopped" in output.splitlines()
+        assert self._calls_to(root, bootstrap, "stop"), "no stop was ever made"
