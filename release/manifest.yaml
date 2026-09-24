@@ -33,15 +33,25 @@
 # manifests still build — the script reads them as one image, the
 # coordinator's, from the build-context root's own Dockerfile.
 schema: 2
-# 2026.09.24-6 (24 September 2026, stage 4e). What it adds to release 5: the
-# two folders both of a sandbox's containers share are made and bound as
-# mounts, a refused second start of the bootstrap exits 4 with its sentence,
-# and the image carries the docker CLIENT — pinned, checksummed, no daemon —
-# so the factory's deploy helper can run a deploy a project declares that
-# brings containers up. The forge pin below moves with it; the other four
+# 2026.09.24-7 (24 September 2026, stage 4e, after its review). What it adds to
+# release 5: the two folders both of a sandbox's containers share are made and
+# bound as mounts, a refused second start of the bootstrap exits 4 with its
+# sentence, and the image carries the docker CLIENT — pinned, checksummed, no
+# daemon — so the factory's deploy helper can run a deploy a project declares
+# that brings containers up. The forge pin below moves with it; the other four
 # repositories are at the same commits release 5 was cut from, which are still
 # their main on GitHub today (checked 24 September 2026).
-version: 2026.09.24-6
+#
+# WHY 7 AND NOT 6. This line said 2026.09.24-6 for about an hour, pinning forge
+# at 4e096ddc. NO SUCH RELEASE WAS EVER BUILT: cutting one fetches the pin from
+# GitHub and that commit is local, so the script refused at the door and no
+# forge:2026.09.24-6 or forge-publisher:2026.09.24-6 image or tag exists
+# anywhere. The review of that work then asked for two sentences to be said
+# better, in a file that IS in the image, so the image's contents changed. A
+# release number names one set of bytes, so rather than let 2026.09.24-6 mean
+# two different things it is left unused and this is 7. There is no gap to
+# explain in any registry, because 6 never reached one.
+version: 2026.09.24-7
 
 # The one image this repository's own operator scripts mean by "the release
 # image" (ops/forge-prod-recreate.sh reads this line). It is the same name as
@@ -94,7 +104,7 @@ repositories:
   - name: forge
     url: https://github.com/guardkit/forge.git
     branch: main
-    commit: 4e096ddce24ad3e08d664e7998f9beaa735c4e8b
+    commit: 8dac9c2a508ad593475be75cc3e001cc1e8fb99f
     role: build-context-root
   - name: guardkit
     url: https://github.com/guardkit/guardkit.git
