@@ -30,11 +30,33 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-CID="$(docker compose --env-file "${ENV_FILE}" -f "${HERE}/compose.yaml" \
-        ${PROJECT:+--project-name "${PROJECT}"} ps -q coordinator 2>/dev/null | head -1)"
+# ASKING COMPOSE CAN FAIL FOR TWO COMPLETELY DIFFERENT REASONS, and saying the
+# wrong one sends somebody looking in the wrong place: the bundle may not
+# render at all (a name with no value, a missing file), or it may render
+# perfectly and the coordinator not be running. On 24 September's review this
+# printed the second when it meant the first, against a healthy estate.
+# The two streams are kept apart on purpose: compose writes warnings to its
+# error stream even when it succeeds, and a clean shell produces one for every
+# password name this bundle deliberately leaves unset. Folded in with 2>&1, a
+# warning becomes the container id.
+WHY="$(mktemp)"
+SAID="$(docker compose --env-file "${ENV_FILE}" -f "${HERE}/compose.yaml" \
+        ${PROJECT:+--project-name "${PROJECT}"} ps -q coordinator 2>"${WHY}")"
+STATUS=$?
+
+if [ "${STATUS}" -ne 0 ]; then
+    printf 'factory-hello: this estate could not be read at all, so nothing was asked. Compose said: %s\n' \
+        "$(grep -v '^[[:space:]]*$' "${WHY}" | grep -v 'level=warning' | head -2 | tr '\n' ' ')" >&2
+    printf 'That is a problem with the files or the env file, not with any service.\n' >&2
+    rm -f "${WHY}"
+    exit 2
+fi
+rm -f "${WHY}"
+
+CID="$(printf '%s' "${SAID}" | head -1)"
 
 if [ -z "${CID}" ]; then
-    printf 'factory-hello: the coordinator is not running, so there is nobody to ask.\n' >&2
+    printf 'factory-hello: the estate reads fine, and the coordinator is not running in it, so there is nobody to ask.\n' >&2
     exit 1
 fi
 
