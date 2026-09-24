@@ -503,4 +503,36 @@ echo "  OK  cli         /usr/local/bin/guardkit feature validate --help"
 docker run --rm --entrypoint /usr/local/bin/guardkit "${IMAGE}" task-review --help >/dev/null
 echo "  OK  cli         /usr/local/bin/guardkit task-review --help"
 
+# --- the Docker CLIENT, and no daemon (2026-09-24, stage 4e) -----------------
+# THE FACTORY'S OWN NEED. The deploy helper that runs from this image runs the
+# deploy, health-check and live-gate commands a PROJECT declares in its own
+# profile, and a project may perfectly well declare a deploy that brings
+# containers up. Inside a sandbox the bootstrap binds that sandbox's own engine
+# socket into the helper for exactly that; until this image carried a client
+# there was nothing in it to use the socket. Nothing here names a project or a
+# toolchain.
+#
+# `docker --version` is the one that answers with NO engine: this container has
+# no socket bound and none is wanted here, and `docker version` (no dashes)
+# asks an engine for its half and fails without one — which is exactly right in
+# here, and exactly what the deploy helper's own probe inside a sandbox proves
+# instead, where the sandbox's engine socket IS bound. And the daemon and its
+# runtimes must NOT be in the image: only the one client binary is unpacked
+# from Docker's static tarball.
+DOCKER_CLIENT_IN_IMAGE="$(docker run --rm --entrypoint docker "${IMAGE}" --version)"
+[ -n "${DOCKER_CLIENT_IN_IMAGE}" ] || {
+    echo "FAILED: the docker client in ${IMAGE} printed no version." >&2
+    exit 1
+}
+echo "  OK  docker      the client answers in the image (${DOCKER_CLIENT_IN_IMAGE}), for a project's own declared deploy"
+docker run --rm --entrypoint sh "${IMAGE}" -c '
+for daemon in dockerd containerd containerd-shim-runc-v2 runc ctr docker-proxy docker-init; do
+    if command -v "${daemon}" >/dev/null 2>&1; then
+        echo "FAILED: this image carries ${daemon}. Only the docker CLIENT belongs in it: nothing in here runs an engine, and the helper only ever speaks to an engine whose socket something outside deliberately binds in." >&2
+        exit 1
+    fi
+done
+'
+echo "  OK  docker      no daemon, shim or runtime in the image — the client only"
+
 echo "forge oracle verification PASSED for ${IMAGE}"

@@ -48,18 +48,83 @@
 #      version and the manifest hash are named too, their labels on the image
 #      must match those as well. A missing or different image is a refusal with
 #      a plain sentence, never a fetch of anything.
-#   3. Starts the deploy helper and the build runner as TWO CONTAINERS from
+#   3. MAKES THE FOLDERS THE TWO CONTAINERS SHARE, in the sandbox's own
+#      filesystem, and refuses by name if one cannot be made (see the table
+#      below).
+#   4. Starts the deploy helper and the build runner as TWO CONTAINERS from
 #      that one image, each with its own start command, the project's own clone
-#      bound read-write at the path it already lives at, and the factory's
-#      settings passed in BY NAME. The two ports the host side expects are
-#      published inside the sandbox, on every interface in here, so the
-#      sandbox's own publish rule forwards them out as it already does.
-#   4. Supervises them: one supervisor (a lock, so a second start refuses), and
-#      a container that dies is started again after a short pause.
-#   5. `stop` stops and removes both containers and exits 0 only when both are
+#      bound read-write at the path it already lives at, the shared folders
+#      bound into BOTH at the same path, and the factory's settings passed in
+#      BY NAME. The two ports the host side expects are published inside the
+#      sandbox, on every interface in here, so the sandbox's own publish rule
+#      forwards them out as it already does.
+#   5. Supervises them: one supervisor (a lock, so a second start refuses with
+#      exit 4), and a container that dies is started again after a short pause.
+#   6. `stop` stops and removes both containers and exits 0 only when both are
 #      really gone. That is what the host side's stop requires: out there the
 #      client is ended, which ends NOTHING in here, so the stop word is the
 #      only thing that does.
+#
+# WHAT IT EXITS WITH. 0 after a clean stop, or after a warm-up that only
+# checked the image. 2 when it refused at the door — no image named, an image
+# it cannot vouch for, no Docker client, a shared folder it cannot make, an
+# unknown word. 4 when a supervisor of this checkout is ALREADY running in
+# this sandbox and this start was therefore refused: nothing was started, and
+# the non-zero status is there so anything reading a status rather than the
+# words sees a refusal and not a success.
+#
+# THE FOLDERS THE TWO CONTAINERS SHARE, AND WHY EACH ONE IS OR IS NOT ONE
+# (24 September 2026, stage 4e, from the stage 4d reviewer's first two
+# findings). A container is thrown away and made again by the supervisor here
+# whenever it dies, so ANYTHING the two containers must both see, or that must
+# outlive one container, has to be a folder of the SANDBOX's own filesystem
+# bound into both at the same path. Anything else is container-local and dies
+# with the container, which for some things is exactly right. Every path Forge
+# writes that a later stage of a build reads, and the decision for each:
+#
+#   the project's own clone, and everything a build writes under it — the
+#   build's branch, its inner worktrees (.guardkit/worktrees), a fix journey's
+#   gate evidence (qa/gates/evidence)
+#       SHARED MOUNT, read-write, at the path the clone already lives at. It
+#       was the only one before this stage.
+#
+#   the per-build git worktrees, FORGE_AUTOBUILD_WORKTREE_BASE
+#       SHARED MOUNT. The build runner materialises <base>/<build id> as a
+#       worktree of the branch being built, and the deploy helper inspects and
+#       retires that same path on the same build's later stages. Two
+#       containers, one folder — and the supervisor's own repair (throw the
+#       container away, make another from the image) would otherwise delete a
+#       running build's working copy. Unset, the factory's own default is a
+#       folder inside the container, so this script names one in the sandbox
+#       rather than hand a container-local path to two containers.
+#
+#   the receipts root, FORGE_RECEIPTS_DIR (or SANDBOX_RECEIPTS_PATH, which is
+#   what the project's profile calls the same folder)
+#       SHARED MOUNT. Receipts are a build's durable record: written by the
+#       runner while it works, read afterwards from outside both containers
+#       through the sandbox's own path. They must outlive a container, and the
+#       factory's own default puts them inside one.
+#
+#   the build runner's launch declaration (its graph config, written below)
+#       THE SANDBOX'S OWN FILESYSTEM, bound read-only into the runner alone.
+#       Written fresh at every start, so it can never drift from this file.
+#
+#   this script's lock and process record
+#       NEITHER. They belong to the bootstrap, which is not in a container at
+#       all, and nothing in a container reads them.
+#
+#   planning worktrees (forge-planning-worktrees under the temporary folder)
+#       CONTAINER-LOCAL, and right to be. One planning operation makes one and
+#       removes it again before it returns; no later stage reads it.
+#
+#   the coordinator's record (FORGE_DB_PATH, ~/.forge/forge.db)
+#       NEITHER, and never: it stays with the coordinator, out on the machine,
+#       and nothing in this sandbox opens it (rule 72).
+#
+#   the coordinator's evidence volume (/var/lib/forge-evidence)
+#       NOT HERE AT ALL. That is a volume of the coordinator's own container
+#       out on the machine, where it is what FORGE_RECEIPTS_DIR names. Inside a
+#       sandbox the receipts root above is that folder.
 #
 # WHAT IT NEVER DOES. It never mounts a checkout of the factory's code, makes a
 # virtual environment, installs a package or fetches source. It never opens the
@@ -114,15 +179,37 @@
 #     SANDBOX_CONTAINER_USER the user the two containers run as, as uid:gid
 #                            (default: whoever runs this script, so the
 #                            project's own files keep their owner)
-#     SANDBOX_RECEIPTS_PATH  the receipts root inside the sandbox; bound
-#                            read-write into both containers at the same path
-#                            and handed to them as FORGE_RECEIPTS_DIR unless
-#                            that is set already
+#     SANDBOX_RECEIPTS_PATH  the receipts root inside the sandbox, which is
+#                            what a project's profile calls this folder. It is
+#                            MADE here if it is not there, bound read-write
+#                            into BOTH containers at the same path, and handed
+#                            to them as FORGE_RECEIPTS_DIR unless that is set
+#                            already. A folder that cannot be made is a refusal
+#                            naming the setting, never a name handed in with
+#                            nothing bound under it
+#     FORGE_RECEIPTS_DIR     the same folder said the factory's own way. Set,
+#                            it wins over SANDBOX_RECEIPTS_PATH; unset, this
+#                            script names a folder in the sandbox's own state
+#                            rather than let receipts land inside a container
+#                            and die with it
+#     FORGE_AUTOBUILD_WORKTREE_BASE
+#                            where a build's per-build worktrees are cut. Made
+#                            here, bound read-write into BOTH containers at the
+#                            same path, and refused by name if it cannot be
+#                            made — the runner writes them and the helper reads
+#                            and retires them, so one folder has to be both
+#                            containers' folder. Unset, this script names one
+#                            in the sandbox's own state, because the factory's
+#                            own default is a folder inside the container and
+#                            the supervisor throws containers away
 #     SANDBOX_DOCKER         the Docker client in here (default docker)
 #     SANDBOX_DOCKER_SOCKET  THE SANDBOX'S OWN engine socket (default
 #                            /var/run/docker.sock), bound into the helper so a
 #                            project's own deploy can run in here, which is
-#                            what the helper is for. Nothing of the machine
+#                            what the helper is for. The helper is also given
+#                            the GROUP that owns that socket in this sandbox,
+#                            because a bound socket a container's user cannot
+#                            open is no socket at all. Nothing of the machine
 #                            outside is ever bound in
 #     SANDBOX_CONTAINER_ENV_NAMES
 #                            extra setting names, space or comma separated, to
@@ -206,6 +293,12 @@ FACTORY_ENV_NAMES=(
   FORGE_NATS_URL
   FORGE_CONFIG_PATH
   FORGE_RECEIPTS_DIR
+  # Both containers are told where the per-build worktrees are, because both
+  # of them work on them: the runner cuts them, the helper inspects and
+  # retires them. Before stage 4e this name reached the bootstrap and stopped
+  # here, so the two containers each used the factory's own default — a folder
+  # inside themselves, and a different one each.
+  FORGE_AUTOBUILD_WORKTREE_BASE
   FACTORY_GATEWAY_ADDRESS
   FORGE_GUARDKIT_PATH
   GUARDKIT_HARNESS
@@ -293,8 +386,16 @@ esac
 mkdir -p "${STATE_ROOT}"
 exec 9>"${STATE_ROOT}/lock"
 if ! flock -n 9; then
+  # EXIT 4, NOT 0 (stage 4e, the stage 4d reviewer's third finding). Refusing
+  # is the right thing to do here and nothing was started — but "refusing to
+  # start" and a status of 0 read oddly together, and anything that checks the
+  # status instead of the words would call this a success. The host-side
+  # service stops before it starts, so on the ordinary path the lock is free
+  # and this cannot happen; when it does, it is a refusal and says so both
+  # ways. Nothing has been started at this point and the cleanup trap is not
+  # set yet, so exiting here takes nothing down with it.
   log "refusing to start: a supervisor of this checkout is already running in this sandbox, and a second one would leave two sets of the factory's containers behind. Nothing was started."
-  exit 0
+  exit 4
 fi
 printf '%s %s\n' "$$" "$(date -u +%s)" > "${PID_FILE}.tmp"
 mv "${PID_FILE}.tmp" "${PID_FILE}"
@@ -365,14 +466,74 @@ if [[ "${SANDBOX_RUNNER_BOOTSTRAP_ONLY:-}" == "1" ]]; then
   exit 0
 fi
 
-# --- step 3: the settings the two containers are given, BY NAME -------------
+# --- step 3: the folders the two containers share ---------------------------
+# Each one is a folder of THIS SANDBOX's own filesystem, made here before
+# anything starts and bound into BOTH containers at the same path. The table
+# at the top of this file says which folders these are and why every other
+# path Forge writes is not one.
+#
+# MADE HERE, AND BY THIS SCRIPT'S OWN USER, which is also the user the two
+# containers run as unless SANDBOX_CONTAINER_USER says otherwise — so the
+# folder the containers are given is a folder they can write. Docker would
+# make a missing bind source itself, owned by root, which is the one outcome
+# that looks fine and then fails on the first write.
+#
+# A FOLDER THAT CANNOT BE MADE IS A REFUSAL NAMING THE SETTING. The thing not
+# to do is hand the name to both containers with nothing bound under it: the
+# setting would then point at a path that exists separately inside each
+# container, which is believable and wrong, and a build's work would be lost
+# the first time the supervisor replaced a container.
+share_a_folder() {
+  local what="$1" path="$2"
+  if ! mkdir -p "${path}" 2>/dev/null; then
+    refuse "${what} names ${path}, and this sandbox cannot make that folder. It is bound into both of the factory's containers, so there is nowhere for a build's work to go and nothing is started. Name a folder this sandbox's own user can make, or leave the setting out and one under ${STATE_ROOT} is used. Refusing to start."
+  fi
+  if [[ ! -w "${path}" ]]; then
+    refuse "${what} names ${path}, and this sandbox's own user cannot write it. Both of the factory's containers are given that folder to work in. Refusing to start."
+  fi
+  MOUNTS+=(--volume "${path}:${path}:rw")
+}
+
+# The receipts root. Whichever name the machine used for it wins, and the
+# factory's own name is what crosses into the containers.
+RECEIPTS_ROOT="${FORGE_RECEIPTS_DIR:-${SANDBOX_RECEIPTS_PATH:-}}"
+RECEIPTS_SETTING="FORGE_RECEIPTS_DIR"
+if [[ -z "${FORGE_RECEIPTS_DIR:-}" && -n "${SANDBOX_RECEIPTS_PATH:-}" ]]; then
+  RECEIPTS_SETTING="SANDBOX_RECEIPTS_PATH"
+fi
+if [[ -z "${RECEIPTS_ROOT}" ]]; then
+  RECEIPTS_ROOT="${STATE_ROOT}/receipts"
+  RECEIPTS_SETTING="the receipts root (no setting named one, so this script did)"
+  log "no receipts root was named, so this sandbox's own ${RECEIPTS_ROOT} is used: the factory's own default is a folder inside a container, and a container here is thrown away and made again"
+fi
+export FORGE_RECEIPTS_DIR="${RECEIPTS_ROOT}"
+
+# The per-build worktree base.
+WORKTREE_BASE="${FORGE_AUTOBUILD_WORKTREE_BASE:-}"
+WORKTREE_SETTING="FORGE_AUTOBUILD_WORKTREE_BASE"
+if [[ -z "${WORKTREE_BASE}" ]]; then
+  WORKTREE_BASE="${STATE_ROOT}/autobuild-worktrees"
+  WORKTREE_SETTING="the per-build worktree base (no setting named one, so this script did)"
+  log "no per-build worktree base was named, so this sandbox's own ${WORKTREE_BASE} is used: the factory's own default is a folder inside a container, invisible to the other one and destroyed when the supervisor replaces it"
+fi
+export FORGE_AUTOBUILD_WORKTREE_BASE="${WORKTREE_BASE}"
+
+# THE MOUNTS, and there are four kinds and no more: the project's own clone,
+# the two shared folders above, and the sandbox's own engine socket (the
+# helper's alone, added at its start). Every one of them belongs to this
+# sandbox. Nothing of the machine outside is bound into anything here — no
+# checkout of the factory's code, no home folder, no settings file. That is
+# the change stage 4d was.
+MOUNTS=(--volume "${REPO_ROOT}:${REPO_ROOT}:rw")
+share_a_folder "${RECEIPTS_SETTING}" "${RECEIPTS_ROOT}"
+share_a_folder "${WORKTREE_SETTING}" "${WORKTREE_BASE}"
+log "folders shared by both containers: ${REPO_ROOT} (the project's clone), ${RECEIPTS_ROOT} (receipts), ${WORKTREE_BASE} (a build's worktrees)"
+
+# --- step 4: the settings the two containers are given, BY NAME -------------
 # `--env NAME` hands the value this script's own environment holds under that
 # name to the container without that value ever appearing in this file, in a
 # log line or on a command line. A name with nothing set is left out, and said
 # to be unset.
-if [[ -z "${FORGE_RECEIPTS_DIR:-}" && -n "${SANDBOX_RECEIPTS_PATH:-}" ]]; then
-  export FORGE_RECEIPTS_DIR="${SANDBOX_RECEIPTS_PATH}"
-fi
 # This helper is the one INSIDE a repository's sandbox, and it says so: the
 # deploy stage sends it the repository's own deploy script rather than the host
 # wrapper, which calls the sandbox client and cannot run from in here.
@@ -398,17 +559,10 @@ done
 log "settings handed to the two containers (names only): ${FORWARDED[*]:-none}"
 log "settings named but not set here: ${SKIPPED[*]:-none}"
 
-# THE MOUNTS, and there are three kinds and no more: the project's own clone,
-# the project's receipts root, and the sandbox's own engine socket. Every one
-# of them belongs to this sandbox. Nothing of the machine outside is bound into
-# anything here — no checkout of the factory's code, no home folder, no
-# settings file. That is the change this stage is.
-MOUNTS=(--volume "${REPO_ROOT}:${REPO_ROOT}:rw")
-if [[ -n "${SANDBOX_RECEIPTS_PATH:-}" && -d "${SANDBOX_RECEIPTS_PATH}" ]]; then
-  MOUNTS+=(--volume "${SANDBOX_RECEIPTS_PATH}:${SANDBOX_RECEIPTS_PATH}:rw")
-fi
-
 CONTAINER_USER="${SANDBOX_CONTAINER_USER:-$(id -u):$(id -g)}"
+if [[ -n "${SANDBOX_CONTAINER_USER:-}" ]]; then
+  log "the two containers run as ${CONTAINER_USER}, which this sandbox was told to use; the shared folders above were made by this script's own user, so that user and this one have to be able to write the same folders"
+fi
 
 # NO INHERITED HEALTH PROBE on either container. The release image carries one
 # of its own and it is the COORDINATOR's: it curls a coordinator's /healthz on
@@ -432,6 +586,23 @@ start_helper() {
     # a project's own vetted deploy and merge scripts, and a project's deploy
     # ordinarily brings containers up in here.
     socket_mount=(--volume "${DOCKER_SOCKET}:/var/run/docker.sock")
+    # AND THE GROUP THAT OWNS IT. Binding the socket is not enough: it is
+    # owner-and-group only, and the container runs as a plain user who is in
+    # none of this sandbox's groups. Without this the socket is there, the
+    # client is there, and every call answers "permission denied while trying
+    # to connect to the docker API" — which is what happened the first time
+    # this was run, 24 September 2026. The group added is whichever group owns
+    # the socket in this sandbox, read from the socket itself; nothing else
+    # about the container changes, and the runner container, which is given no
+    # socket, is given no group either.
+    local socket_group
+    socket_group="$(stat -c '%g' "${DOCKER_SOCKET}" 2>/dev/null || true)"
+    if [[ -n "${socket_group}" && "${socket_group}" =~ ^[0-9]+$ ]]; then
+      socket_mount+=(--group-add "${socket_group}")
+      log "the helper is given group ${socket_group}, the group that owns this sandbox's engine socket; without it the socket would be bound and unusable"
+    else
+      log "note: the group owning ${DOCKER_SOCKET} could not be read, so the helper is started without it; a project's deploy that runs containers will say permission denied if the container's user cannot reach the socket"
+    fi
   else
     log "note: there is no engine socket at ${DOCKER_SOCKET} in this sandbox, so the helper is started without one; a project whose deploy runs containers will say so when it runs"
   fi

@@ -424,6 +424,149 @@ class TestItStartsTwoContainersFromThatOneImage:
 
 
 # ---------------------------------------------------------------------------
+class TestTheFoldersBothContainersShare:
+    """Anything the two containers share has to be a folder of the sandbox's.
+
+    The supervisor throws a container away and makes another one from the
+    image whenever it dies, so a folder INSIDE a container is gone with it —
+    and the other container never saw it in the first place. A build's
+    per-build worktrees (the runner cuts them, the helper retires them) and its
+    receipts (written during the build, read afterwards from outside both
+    containers) are therefore made in the sandbox and bound into both at the
+    same path. The stage 4d reviewer's first two findings, 24 September 2026.
+    """
+
+    @staticmethod
+    def _runs_of_a_started_bootstrap(sandbox, **extra):
+        """Start it, wait for both containers, return the two run calls."""
+        process = subprocess.Popen(
+            ["bash", str(sandbox["script"])],
+            env=_settings(sandbox, **extra),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        try:
+            for _ in range(100):
+                if len([c for c in _calls(sandbox) if c.startswith("run ")]) >= 2:
+                    break
+                time.sleep(0.1)
+            return [c for c in _calls(sandbox) if c.startswith("run ")]
+        finally:
+            process.terminate()
+            process.wait(timeout=30)
+
+    def test_the_named_folders_are_made_and_bound_into_both(self, sandbox, tmp_path):
+        receipts = tmp_path / "a-receipts-root"
+        worktrees = tmp_path / "a-worktree-base"
+        runs = self._runs_of_a_started_bootstrap(
+            sandbox,
+            SANDBOX_RECEIPTS_PATH=str(receipts),
+            FORGE_AUTOBUILD_WORKTREE_BASE=str(worktrees),
+        )
+        assert len(runs) == 2
+        # Made before anything started — Docker would otherwise make the bind
+        # source itself, owned by root, for a container that is not root.
+        assert receipts.is_dir()
+        assert worktrees.is_dir()
+        for call in runs:
+            assert f"--volume {receipts}:{receipts}:rw" in call
+            assert f"--volume {worktrees}:{worktrees}:rw" in call
+            # And both containers are TOLD where they are, by name.
+            assert "--env FORGE_RECEIPTS_DIR" in call
+            assert "--env FORGE_AUTOBUILD_WORKTREE_BASE" in call
+
+    def test_with_no_setting_a_folder_of_the_sandbox_is_used_anyway(self, sandbox):
+        # Unset, the factory's own defaults are folders inside the container.
+        # The bootstrap names ones in the sandbox instead, so a replaced
+        # container does not take a running build's work with it.
+        runs = self._runs_of_a_started_bootstrap(sandbox)
+        assert len(runs) == 2
+        home = str(sandbox["home"])
+        for call in runs:
+            words = call.split()
+            bound = [
+                word for before, word in zip(words, words[1:]) if before == "--volume"
+            ]
+            # Two read-write folders of the sandbox's own home, each bound at
+            # the same path it has in the sandbox. (The runner also gets its
+            # graph declaration from in there, read-only, at a path of its
+            # own — that one is not a folder the two containers share.)
+            shared = [
+                word
+                for word in bound
+                if word.startswith(home) and word.endswith(":rw")
+            ]
+            assert len(shared) == 2, call
+            for word in shared:
+                inside, outside = word[: -len(":rw")].split(":", 1)
+                assert inside == outside
+            assert "--env FORGE_RECEIPTS_DIR" in call
+            assert "--env FORGE_AUTOBUILD_WORKTREE_BASE" in call
+
+    def test_a_worktree_base_that_cannot_be_made_is_refused_by_name(
+        self, sandbox, tmp_path
+    ):
+        in_the_way = tmp_path / "this-is-a-file"
+        in_the_way.write_text("not a folder\n")
+        wanted = in_the_way / "under-a-file"
+        result = _run(sandbox, FORGE_AUTOBUILD_WORKTREE_BASE=str(wanted))
+        assert result.returncode == 2
+        assert "FORGE_AUTOBUILD_WORKTREE_BASE" in result.stdout
+        assert str(wanted) in result.stdout
+        # Never handed in unbound: nothing was started at all.
+        assert not any(line.startswith("run ") for line in _calls(sandbox))
+
+    def test_the_helper_is_given_the_group_that_owns_the_engine_socket(
+        self, sandbox, tmp_path
+    ):
+        """A bound socket a container's user cannot open is no socket at all.
+
+        Found by running it, 24 September 2026: the socket was bound into the
+        helper and every call answered "permission denied while trying to
+        connect to the docker API". The socket is owner-and-group only and the
+        container runs as a plain user who is in none of the sandbox's groups.
+        """
+        socket_path = tmp_path / "an-engine.sock"
+        subprocess.run(
+            [
+                "python3",
+                "-c",
+                "import socket,sys\n"
+                "s=socket.socket(socket.AF_UNIX)\n"
+                "s.bind(sys.argv[1])\n",
+                str(socket_path),
+            ],
+            check=True,
+            timeout=30,
+        )
+        group = socket_path.stat().st_gid
+        runs = self._runs_of_a_started_bootstrap(
+            sandbox, SANDBOX_DOCKER_SOCKET=str(socket_path)
+        )
+        helper = [call for call in runs if "--name forge-sandbox-helper" in call]
+        runner = [call for call in runs if "--name forge-sandbox-runner" in call]
+        assert len(helper) == 1 and len(runner) == 1
+        assert f"--volume {socket_path}:/var/run/docker.sock" in helper[0]
+        assert f"--group-add {group}" in helper[0]
+        # The runner is given no socket, so it is given no group either.
+        assert "--group-add" not in runner[0]
+        assert "docker.sock" not in runner[0]
+
+    def test_a_receipts_root_that_cannot_be_made_is_refused_by_name(
+        self, sandbox, tmp_path
+    ):
+        in_the_way = tmp_path / "also-a-file"
+        in_the_way.write_text("not a folder\n")
+        wanted = in_the_way / "under-a-file"
+        result = _run(sandbox, SANDBOX_RECEIPTS_PATH=str(wanted))
+        assert result.returncode == 2
+        assert "SANDBOX_RECEIPTS_PATH" in result.stdout
+        assert str(wanted) in result.stdout
+        assert not any(line.startswith("run ") for line in _calls(sandbox))
+
+
+# ---------------------------------------------------------------------------
 class TestASecondStartRefuses:
     """One supervisor per checkout, or a sandbox ends up with two of everything."""
 
@@ -442,7 +585,10 @@ class TestASecondStartRefuses:
                 time.sleep(0.1)
             before = len([c for c in _calls(sandbox) if c.startswith("run ")])
             second = _run(sandbox)
-            assert second.returncode == 0
+            # EXIT 4, its own code with its own sentence (stage 4e). Anything
+            # that reads a status rather than the words has to see a refusal
+            # here, not a success.
+            assert second.returncode == 4
             assert "refusing to start" in second.stdout
             assert "already running in this sandbox" in second.stdout
             assert len([c for c in _calls(sandbox) if c.startswith("run ")]) == before

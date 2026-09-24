@@ -345,6 +345,16 @@ while ((STOPPING == 0)); do
   fi
   if [[ "${died}" == "${BOOTSTRAP_PID}" ]]; then
     log "the bootstrap session ended ${rc}"
+    # A NON-ZERO STATUS HERE IS LOGGED AND HANDLED LIKE ANY OTHER ENDING, and
+    # it cannot loop fast: the stop below has to work first, and then there is
+    # the pause. From 24 September 2026 the shipped bootstrap answers 4 when it
+    # refuses to start because a supervisor of that checkout is already running
+    # in the sandbox — which on this path cannot happen, because the stop above
+    # succeeded before anything was started and succeeds again before anything
+    # is started here. If it ever does appear in these logs, the sandbox holds
+    # a supervisor this service did not start and nothing more should be
+    # started on top of it, which is exactly what happens below.
+    #
     # Before opening another one: the session ending out here left the
     # supervisor running in there. Starting a second is the pile-up, so the
     # stop has to have worked before another one is opened.
