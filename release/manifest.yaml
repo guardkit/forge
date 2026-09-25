@@ -150,18 +150,11 @@ schema: 2
 # commits this is 6, which is the reasoning that left 4 and 2026.09.24-6
 # unused above. There is no gap to explain in any registry.
 #
-# NEITHER THE JARVIS PIN NOR THE FORGE PIN IS ON GITHUB YET, and this line is
-# written knowing it. Both commits below are local to the machine this was made
-# on, so a release build from this manifest STOPS AT THE FETCH and says so —
-# which is the behaviour that exists to stop a release being cut from anybody's
-# disk. It stops on FORGE first, because forge is fetched first; that was tried
-# rather than assumed, and an earlier version of this note named only jarvis,
-# which would have sent whoever cuts the release to push one repository and
-# watch it refuse again. THE COORDINATING SESSION PUSHES BOTH — guardkit/forge
-# and guardkit/jarvis, both PUBLIC — and until it does, this version cannot be
-# built. What was proved instead is written up in the stage 4c evidence: the
-# same Dockerfiles, built to throwaway tags from local clones, running the
-# estate's two services.
+# BOTH PINS BELOW WERE PUSHED BEFORE THIS RELEASE WAS CUT (25 September 2026,
+# 23:03 UTC): a build from this manifest fetched every one of the six
+# repositories from GitHub and built five images. An earlier version of this
+# note, written while the forge and jarvis pins were local, said the build
+# would stop at the fetch; it did, then, which was the check working.
 version: 2026.09.26-1
 
 # The one image this repository's own operator scripts mean by "the release
@@ -255,9 +248,8 @@ images:
 #   role: build-context-root  — the Dockerfile and the main build context
 #   role: named-context       — supplied to the build as --build-context <name>=<clone>
 repositories:
-  # THIS COMMIT IS NOT ON GITHUB YET EITHER, and it is the FIRST thing a build
-  # fetches, so it is the first thing a build refuses on — whatever the jarvis
-  # pin below is doing. Both have to be pushed; see the note beside the version.
+  # The first repository fetched, so the first a build would refuse on if its
+  # pin were not on GitHub; this one is (pushed 25 September 2026, 23:03 UTC).
   - name: forge
     url: https://github.com/guardkit/forge.git
     branch: main
@@ -288,10 +280,8 @@ repositories:
   # tagged by this commit — and it is also, like fleet-memory, a repository the
   # release builds an image FROM rather than merely copies code out of.
   #
-  # THIS COMMIT IS NOT ON GITHUB YET, and neither is the forge pin above. See
-  # the note beside the version: a release build from this manifest stops at the
-  # fetch — on forge first, since that is fetched first — until BOTH are pushed,
-  # and that is the check working, not failing.
+  # Pushed 25 September 2026, 23:03 UTC, together with the forge pin above; the
+  # release was built from GitHub after both were.
   - name: jarvis
     url: https://github.com/guardkit/jarvis.git
     branch: main

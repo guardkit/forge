@@ -195,7 +195,18 @@ PLAN_ONLY=0
 RUN_TAGS=""
 PRE_EXISTING_TAGS=""
 
-die() { echo "ERROR: $*" >&2; exit 1; }
+die() {
+    echo "ERROR: $*" >&2
+    # A run that dies after it has written tags takes them with it (the
+    # fourth review of release 2026.09.26-1): otherwise the next attempt at the
+    # same commit meets "tag exists" and the operator learns to reach for
+    # --allow-existing-tag. RUN_TAGS is empty until the first tag is written.
+    if [ -n "${RUN_TAGS:-}" ] && [ "${TAGS_ALREADY_REMOVED:-0}" != "1" ]; then
+        TAGS_ALREADY_REMOVED=1
+        remove_this_runs_tags
+    fi
+    exit 1
+}
 say() { echo "$*" >&2; }
 
 while [ "$#" -gt 0 ]; do
@@ -771,6 +782,7 @@ sweep_exception_reason() {
 # started — which only happens with --allow-existing-tag — is left exactly as
 # it was found, because it is not this run's to remove.
 remove_this_runs_tags() {
+    TAGS_ALREADY_REMOVED=1
     local t
     for t in ${RUN_TAGS}; do
         case " ${PRE_EXISTING_TAGS} " in
@@ -813,7 +825,8 @@ sweep_tree() {
             [ -n "${path}" ] || continue
             relpath="${path#"${root}/"}"
             if reason="$(sweep_exception_reason "${iname}" "${relpath}")"; then
-                say "    allowed  ${relpath}${where} carries '${term}' — the manifest names this file: ${reason}"
+                say "    allowed  ${relpath}${where} carries one of the words (not printed here; build logs get kept) — the manifest names this file: ${reason}"
+                printf '%s|%s|%s\n' "${iname}" "${relpath}${where}" "${reason}" >> "${SWEEP_ALLOWED_LOG}"
             else
                 printf '%s|%s|%s\n' "${iname}" "${relpath}${where}" "${term}" >> "${refusals}"
             fi
@@ -986,9 +999,15 @@ sweep_image() {
         die "a release image belongs to the release, not to a machine. Take the name out of the source that puts it there — or, if the file needs it (a detector's own patterns, say), name that FILE under sweep_exceptions: in the manifest, with its reason."
     fi
     say "    ok ${iname} carries none of the ${SWEEP_TERM_COUNT} words RELEASE_SWEEP_TERMS names, in its running filesystem or in any layer a push would send"
+    SWEPT_IMAGES="${SWEPT_IMAGES} ${iname}"
 }
 
 SWEEP_TERM_COUNT="$(set -- ${SWEEP_TERMS}; echo "$#")"
+# What the sweep did, kept for the receipt (the fourth review of release
+# 2026.09.26-1, 25 September 2026: from a receipt a swept release and an
+# unswept one were indistinguishable). Term COUNT only, never a term.
+SWEEP_ALLOWED_LOG="$(mktemp)"
+SWEPT_IMAGES=""
 
 # ---------------------------------------------------------------------------
 # Build, from the fresh clones alone.
@@ -1184,6 +1203,26 @@ COORDINATOR_TAG_VERSION="$(coordinator_field 6)"
     done < "${BUILT}"
     printf '\n  ],\n'
     printf '  "python_base_digest": "%s",\n' "${BASE_DIGEST}"
+    # THE SWEEP, ON THE RECORD: how many words (never which), which images
+    # were swept, and every exception the manifest allowed — or the plain
+    # sentence that no sweep ran.
+    if [ "${SWEEP_TERM_COUNT}" -gt 0 ]; then
+        printf '  "sweep": {"terms_counted": %s, "images_swept": [' "${SWEEP_TERM_COUNT}"
+        first=1
+        for sw in ${SWEPT_IMAGES}; do [ "${first}" = "1" ] || printf ', '; printf '"%s"' "${sw}"; first=0; done
+        printf '], "exceptions_allowed": ['
+        first=1
+        if [ -s "${SWEEP_ALLOWED_LOG}" ]; then
+            sort -u "${SWEEP_ALLOWED_LOG}" | while IFS='|' read -r ai apath areason; do
+                [ "${first}" = "1" ] || printf ', '
+                printf '{"image": "%s", "path": "%s", "reason": "%s"}' "${ai}" "${apath}" "${areason}"
+                first=0
+            done
+        fi
+        printf ']},\n'
+    else
+        printf '  "sweep": {"terms_counted": 0, "images_swept": [], "exceptions_allowed": [], "note": "no sweep ran: RELEASE_SWEEP_TERMS was not set when this release was built"},\n'
+    fi
     printf '  "pins": {\n'
     first=1
     while IFS='|' read -r _tag name url branch commit role; do

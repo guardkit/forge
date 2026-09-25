@@ -1014,7 +1014,9 @@ def test_a_refused_sweep_removes_the_tags_that_run_wrote():
     script = SCRIPT.read_text(encoding="utf-8")
     assert "remove_this_runs_tags" in script, "a refused sweep leaves its tags on the machine"
     refusal = script.index("carries names belonging to the machine that built it")
-    called = script.index("        remove_this_runs_tags\n")
+    # The call AFTER the refusal text: die() itself now removes this run's
+    # tags on any failure once a tag is written, so an earlier call exists too.
+    called = script.find("        remove_this_runs_tags\n", refusal)
     assert called > refusal, "the tags are not removed on the sweep's refusal"
     assert "docker rmi" in script, "nothing removes a tag"
 
