@@ -18,7 +18,7 @@ two today. One description of each service, in the repository that owns it.
 
 | File | What it is |
 |---|---|
-| `compose.yaml` | composes Forge's two compose files and adds the bus, the one-shot that provisions it, and the memory service's two containers |
+| `compose.yaml` | composes Forge's two compose files and adds the bus, the one-shot that provisions it, the memory service's two containers, and the Slack front door with its bus gateway |
 | `.env.example` | every setting name the whole estate needs, with no machine's values. Copy to `.env` |
 | `estate-pins.conf` | what the estate's own two images are built from. Part of the release, never edited per machine. Not named `.env`, because this repository ignores the whole `.env` family as a secrets fence and these are pins, not secrets |
 | `build-estate-images.sh` | builds those two images, and fills the volume holding the bus's own config, from the bus repository at its pinned commit |
@@ -206,6 +206,73 @@ found.**
   `/var/lib/fleet-memory` created in the relay's image owned by that user,
   because Docker fills a fresh named volume from what the image has at that
   path, ownership included.
+
+## The Slack front door, and the bus gateway
+
+**What they are.** `front-door` is where Rich approves a spec, taps a build
+gate and says merge — it serves the two graphs the jarvis repository declares.
+`bus-gateway` carries that traffic onto the bus and the factory's answers back.
+They are **two start commands over one image**, the same shape the coordinator
+and the answer service already have, and they replace the two host units
+`jarvis-frontdoor` and `jarvis-serve-nats`, which ran a checkout's virtual
+environment against a settings file under a home directory.
+
+**Neither publishes a port, and that is not an oversight.** Slack pushes
+nothing to this estate. The reply path is **socket mode**: the front door dials
+*out* to Slack over a WebSocket. So there is no inbound route to open, no
+public address to arrange, and no tunnel — none of which would be true of a
+service that receives Slack events over HTTP, which is why this is written down
+rather than left to be inferred. What the front door does serve is its own
+health route, on the `factory` network, which is what `estate-check services`
+item 8h asks.
+
+**The two Slack credentials are files.** A bot token (it posts and edits
+messages) and an app-level token (it opens that WebSocket), both passed in from
+a child process the way the bus's passwords are, handed to each service as a
+file under `/run/secrets`, and put into the process's own environment by the
+wrapper. Neither is in any file in this bundle, in the image, in either
+container's declared environment, or in anything either service prints. The bus
+password travels the same way; the bus address in `.env` is a plain service
+name and the wrapper refuses one that carries a credential.
+
+**Both services are given both tokens**, because both live host units have both
+today. Whether both *should* run the Slack reply path is a question for this
+front door's owner — it is not this bundle's to decide quietly, and it is not
+changed here.
+
+### The open item: it is a development server
+
+`langgraph dev` is the langgraph CLI's **development** server. It is what the
+live host unit has always started, and it is what this image runs. Putting it
+in a container changes *where* the front door runs, not *what* runs — and
+inventing a serving layer the jarvis repository does not have would be a much
+larger thing, done quietly, in the middle of a packaging pass.
+
+The production path that CLI offers is `langgraph up`, which runs a
+**closed-source API server image requiring a licence key**. No licence is baked
+into this image and none is read. So:
+
+- **what should serve these graphs in production is open**, and belongs to the
+  front door's owner: a licence for that server, or a small server of the
+  repository's own that runs the compiled graphs;
+- **nothing about it is hidden.** The image's own Dockerfile says it, this page
+  says it, and the commit that made the image says it.
+
+One consequence already taken, in the jarvis repository: `langgraph-cli` was
+declared only under `dev`, so installing the thing that serves the front door
+also installed pytest, ruff and mypy. It is now named on its own as
+`front-door`, and the image carries no test or lint tooling.
+
+### What is not here
+
+- **The Slack workspace itself.** The app, its scopes, the channel and who is
+  in it are outside this bundle entirely. Nothing here creates or configures
+  them, and no check in this bundle touches that workspace: item 8h proves the
+  server is up and its graphs loaded, not that Slack answers.
+- **Public reachability.** There is none to arrange, because nothing inbound is
+  expected — see above. If this front door ever moves to receiving events over
+  HTTP, a public address or a tunnel becomes the machine's business and a new
+  published port, with its own per-route rule, becomes this bundle's.
 
 ## Walk (b): a cloud machine
 

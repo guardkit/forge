@@ -67,6 +67,8 @@ ITEMS=(
 "services|8e|the-coordinator-answers|the coordinator answers on its own health route"
 "services|8f|the-answer-service-answers|the answer service answers for a build nobody wrote down"
 "services|8g|the-publisher-is-reachable-from-the-coordinator-only|the publisher answers the coordinator and refuses everything else"
+"services|8h|the-front-door-answers|the Slack front door answers its own health route inside the estate - it publishes no port, because Slack is dialled out to and never heard from"
+"services|8i|the-bus-gateway-is-on-the-bus|the bus gateway holds a live connection to the bus, asked of the BUS itself rather than of the gateway"
 "services|9|the-answer-service-from-inside-a-sandbox|the coordinator's answer service answers FROM INSIDE a sandbox at the address the sandbox profile allows"
 )
 
@@ -562,10 +564,82 @@ check_services() {
         fi
     fi
 
+    # --- 8h / 8i -----------------------------------------------------------
+    check_the_front_door
+    check_the_bus_gateway "${bus}"
+
     # --- 9 -----------------------------------------------------------------
     check_from_inside_a_sandbox
 
     finish
+}
+
+# THE SLACK FRONT DOOR. Where Rich approves a spec, taps a build gate and says
+# merge. Added 25 September 2026, stage 4c.
+#
+# IT PUBLISHES NO PORT, so this is asked INSIDE its own container — and that is
+# not a weaker question than it looks. Slack pushes nothing to this estate: the
+# front door dials out to Slack over a WebSocket, so there is no inbound route
+# to open and nothing outside this estate should be able to reach it at all.
+# What its own health route answers is whether the server is up and its graphs
+# loaded, which is the whole of what this service being "up" means.
+#
+# WHAT THIS ITEM DOES NOT PROVE, said here rather than left to be assumed: that
+# Slack is reachable, that the token works, or that a message would arrive.
+# Those need the real workspace, and no check in this bundle touches it.
+check_the_front_door() {
+    local door code
+    door="$(container_of front-door)"
+    if [ -z "${door}" ]; then
+        fail 8h "the Slack front door is not running in this estate, so Rich has nowhere to approve a spec or say merge."
+        return
+    fi
+    code="$(docker exec "${door}" python -c "
+import sys, urllib.request
+try:
+    print(urllib.request.urlopen('http://localhost:2024/ok', timeout=8).status)
+except Exception as why:
+    print(type(why).__name__); sys.exit(1)
+" 2>/dev/null | tr -d '\r')"
+    if [ "${code}" = "200" ]; then
+        ok 8h "the Slack front door answers its own health route with 200 inside its container (localhost:2024/ok there), which it only does once both its graphs have loaded. It publishes no port on purpose: Slack is dialled out to over a WebSocket and never heard from, so there is no inbound route for this machine to open. Whether Slack itself answers is not asked here and nothing in this bundle touches that workspace."
+    else
+        fail 8h "the Slack front door is running but did not answer its own health route; it said ${code:-nothing}. It answers once both its graphs have loaded, so look at its log for the model seat address or its key."
+    fi
+}
+
+# THE BUS GATEWAY, asked of the BUS rather than of the gateway.
+#
+# There is nothing to ask this service over a network: it publishes no port,
+# talks outbound to the bus and to Slack, and answers nobody. Asking whether
+# its container is running would prove only that a process exists — and this
+# command treats the broker as a hard dependency and exits rather than running
+# on without it, so "running" and "connected" are nearly the same thing and
+# neither is evidence of the other.
+#
+# So the question goes to the bus, over the bus's own monitoring route, which
+# takes no credential: does the bus hold a live connection from the jarvis
+# account? That route is not published outside the estate, so it is asked from
+# inside the bus's own container. Account names are printed; no password is
+# read, and none is printable this way.
+check_the_bus_gateway() {
+    local bus="$1" account seen
+    account="$(get JARVIS_NATS_USER)"
+    if [ -z "${bus}" ]; then
+        fail 8i "the bus is not running in this estate, so it could not be asked who is connected to it."
+        return
+    fi
+    if [ -z "${account}" ]; then
+        unchecked 8i "the env file names no bus account for the front door (JARVIS_NATS_USER), so the bus could not be asked whether that account is connected."
+        return
+    fi
+    seen="$(docker exec "${bus}" wget -qO- "http://localhost:8222/connz?auth=1" 2>/dev/null \
+            | tr ',' '\n' | /bin/grep -c "\"user\":\"${account}\"" || true)"
+    if [ "${seen:-0}" -gt 0 ]; then
+        ok 8i "the bus itself reports ${seen} live connection(s) from the '${account}' account, which is the bus gateway holding the bus open — asked of the bus, not of the gateway, because the gateway publishes nothing and answers nobody. No password was read and none is printable this way."
+    else
+        fail 8i "the bus reports no connection from the '${account}' account, so Slack traffic has no way onto the bus and the factory's answers have no way back. The gateway refuses to start at all without the bus, so look at its log: usually the account's password, or the address."
+    fi
 }
 
 # THE MEMORY RELAY. There is nothing to ask it over a network: it listens on

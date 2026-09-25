@@ -467,6 +467,170 @@ services:
       start_period: 60s
 
   # -------------------------------------------------------------------------
+  # THE SLACK FRONT DOOR — where Rich approves a spec, taps a build gate and
+  # says merge. Added 25 September 2026, stage 4c.
+  #
+  # It ran as a host unit out of a checkout and a virtual environment under a
+  # home directory, reading that checkout's own settings file. The design's
+  # inventory calls that habit: the front door needs a bus, a model seat and a
+  # Slack workspace, and not one of those is this machine.
+  #
+  # IT PUBLISHES NO PORT, AND THAT IS NOT AN OVERSIGHT. Slack pushes nothing to
+  # this service: the repository's reply path is SOCKET MODE, an outbound
+  # WebSocket this service dials to Slack
+  # (src/jarvis/infrastructure/slack_reply.py). So there is nothing for Slack
+  # to reach, no inbound route to open, and no public address or tunnel for
+  # this machine to arrange. What the front door does serve over HTTP is its
+  # own server, on the factory network, which is how the estate's own check
+  # asks whether it is up.
+  #
+  # IT IS A DEVELOPMENT SERVER, said plainly. 'langgraph dev' is the langgraph
+  # CLI's development server and it is exactly what the live host unit has
+  # always started. This estate changes WHERE the front door runs, not WHAT
+  # runs. The production alternative that CLI offers needs a licence key for a
+  # closed-source server; none is baked and none is read. README.md carries
+  # this as an open item for the front door's owner.
+  #
+  # ITS SLACK TOKENS ARRIVE AS FILES, and its bus password too — the same
+  # mechanism the bus's own passwords and the memory store's address use. The
+  # wrapper below puts them into the environment of the front door's own
+  # PROCESS and nothing else, so they are not in this container's declared
+  # environment where 'docker inspect' shows them to anybody who can reach the
+  # Docker daemon.
+  # -------------------------------------------------------------------------
+  front-door:
+    image: ${JARVIS_IMAGE:?name the jarvis image in the env file, e.g. JARVIS_IMAGE=jarvis:2026.09.25-4 - built by ../../scripts/build-release-image.sh with the rest of the release}
+    restart: unless-stopped
+    depends_on:
+      # It subscribes to the bus at start-up, so the bus has to hold its
+      # streams before this service comes up.
+      nats-provision:
+        condition: service_completed_successfully
+    # Every '$$' below is a dollar sign for the SHELL, escaped so that compose
+    # leaves it alone. The last item is the shell's $0; the command below
+    # follows it and is what "$@" hands on.
+    entrypoint: &jarvis-entrypoint
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        case "$$JARVIS_NATS_URL" in
+          *@*)
+            echo "this service's bus address carries a credential. Give the address and the account name plainly in the env file; the password comes in as a file, so it never reaches this container's declared environment." >&2
+            exit 1
+            ;;
+        esac
+        password_file=/run/secrets/jarvis_bus_password
+        if [ ! -s "$$password_file" ]; then
+            echo "this service was given no bus password: the estate passes the jarvis account's password in as a file, and this one arrived missing or empty. Start the estate the way deploy/estate/README.md says, with the value passed in from a child process." >&2
+            exit 1
+        fi
+        JARVIS_NATS_PASSWORD="$$(cat "$$password_file")"
+        export JARVIS_NATS_PASSWORD
+        for pair in JARVIS_SLACK_BOT_TOKEN:/run/secrets/slack_bot_token \
+                    JARVIS_SLACK_APP_TOKEN:/run/secrets/slack_app_token; do
+            name="$${pair%%:*}"
+            file="$${pair#*:}"
+            if [ ! -s "$$file" ]; then
+                echo "this service was given no value for $$name: the estate passes each Slack credential in as a file, and that one arrived missing or empty. deploy/estate/README.md says how the machine makes them." >&2
+                exit 1
+            fi
+            eval "$$name=\"\$$(cat \"\$$file\")\"; export $$name"
+        done
+        exec "$$@"
+      - the-estate-hands-jarvis-its-credentials-as-files
+    # The image's own CMD, written out because naming an entrypoint above
+    # empties it. Its proof script holds these two together.
+    command: ["langgraph", "dev", "--no-browser", "--host", "0.0.0.0", "--port", "2024"]
+    environment:
+      # WHERE THE BUS IS, and AS WHOM — both plain, neither a secret. The
+      # wrapper above refuses an address that already carries a credential and
+      # supplies the password from its file; this package reads the account
+      # name and password separately, so no address here ever holds one.
+      JARVIS_NATS_URL: ${JARVIS_NATS_URL:?name the bus's address for jarvis in the env file, e.g. nats://nats:4222 - a service name, with no credential in it}
+      JARVIS_NATS_USER: ${JARVIS_NATS_USER:?name the bus account jarvis connects as in the env file}
+      # THE MODEL SEAT, an address outside this estate, and the key the client
+      # library insists on having before it will be constructed at all.
+      JARVIS_LLAMA_SWAP_BASE_URL: ${JARVIS_MODEL_SEAT_URL:?name the model seat's address for jarvis in the env file}
+      OPENAI_API_KEY: ${JARVIS_MODEL_SEAT_KEY:?name the model seat's key in the env file - a local seat takes any value and the client library refuses to be built without one}
+      # WHICH SLACK CHANNELS AND WHICH PEOPLE. Channel and member ids, which
+      # are names rather than credentials — they identify, they do not admit.
+      JARVIS_SLACK_CHANNEL_ID: ${JARVIS_SLACK_CHANNEL_ID:?name the Slack channel the front door posts in, in the env file}
+      JARVIS_SLACK_OPERATOR_USER_IDS: ${JARVIS_SLACK_OPERATOR_USER_IDS:?name the Slack member ids allowed to approve and merge, in the env file}
+      JARVIS_LOG_LEVEL: ${JARVIS_LOG_LEVEL:-INFO}
+    secrets:
+      - source: bus-jarvis-password
+        target: jarvis_bus_password
+      - source: slack-bot-token
+        target: slack_bot_token
+      - source: slack-app-token
+        target: slack_app_token
+    networks:
+      - factory
+    healthcheck:
+      # The server's own health route, asked on the container's own address.
+      # The image has no curl, so the interpreter asks.
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import urllib.request, sys
+          try:
+              urllib.request.urlopen("http://localhost:2024/ok", timeout=5)
+          except Exception:
+              sys.exit(1)
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # -------------------------------------------------------------------------
+  # THE BUS GATEWAY — the same package's own command, carrying Slack traffic
+  # onto the bus and the factory's answers back. Added 25 September 2026.
+  #
+  # SAME IMAGE, DIFFERENT START COMMAND, which is the shape the coordinator and
+  # the answer service already have: one image per repository release, one
+  # start line per service. It is given the same credentials as the front door,
+  # as files, by the same wrapper — and the same ones the live host unit is
+  # given today, which is a decrypt tool named by an absolute path in a unit
+  # file.
+  #
+  # IT PUBLISHES NOTHING either. It talks to the bus and to Slack, both
+  # outbound, and nothing in the estate or outside it calls it.
+  #
+  # IT REFUSES TO START WITHOUT THE BUS, by its own design, and that is worth
+  # knowing when reading its log: this command treats the broker as a hard
+  # dependency and exits non-zero rather than running on without one.
+  # -------------------------------------------------------------------------
+  bus-gateway:
+    image: ${JARVIS_IMAGE:?name the jarvis image in the env file, e.g. JARVIS_IMAGE=jarvis:2026.09.25-4 - built by ../../scripts/build-release-image.sh with the rest of the release}
+    restart: unless-stopped
+    depends_on:
+      nats-provision:
+        condition: service_completed_successfully
+    entrypoint: *jarvis-entrypoint
+    command: ["jarvis", "serve-nats"]
+    environment:
+      JARVIS_NATS_URL: ${JARVIS_NATS_URL:?name the bus's address for jarvis in the env file, e.g. nats://nats:4222 - a service name, with no credential in it}
+      JARVIS_NATS_USER: ${JARVIS_NATS_USER:?name the bus account jarvis connects as in the env file}
+      JARVIS_LLAMA_SWAP_BASE_URL: ${JARVIS_MODEL_SEAT_URL:?name the model seat's address for jarvis in the env file}
+      OPENAI_API_KEY: ${JARVIS_MODEL_SEAT_KEY:?name the model seat's key in the env file - a local seat takes any value and the client library refuses to be built without one}
+      JARVIS_SLACK_CHANNEL_ID: ${JARVIS_SLACK_CHANNEL_ID:?name the Slack channel the front door posts in, in the env file}
+      JARVIS_SLACK_OPERATOR_USER_IDS: ${JARVIS_SLACK_OPERATOR_USER_IDS:?name the Slack member ids allowed to approve and merge, in the env file}
+      JARVIS_LOG_LEVEL: ${JARVIS_LOG_LEVEL:-INFO}
+    # The same three the front door gets, written out rather than referred to.
+    secrets:
+      - source: bus-jarvis-password
+        target: jarvis_bus_password
+      - source: slack-bot-token
+        target: slack_bot_token
+      - source: slack-app-token
+        target: slack_app_token
+    networks:
+      - factory
+
+  # -------------------------------------------------------------------------
   # THE COORDINATOR, composed in above, with two things added here.
   #
   # ONE: it waits for the bus to be PROVISIONED and not merely running. Without
@@ -632,3 +796,21 @@ secrets:
   # container's declared environment and in nothing either service prints.
   memory-database-address:
     environment: FLEET_MEMORY_PG_DSN
+
+  # THE FRONT DOOR'S TWO SLACK CREDENTIALS, added 25 September 2026.
+  #
+  # A bot token (it posts and edits messages) and an app-level token (it opens
+  # the outbound WebSocket Slack sends events down). Both are read from the
+  # environment the command was run in — the same child process the bus's
+  # passwords come from — and handed to the two jarvis services as files. They
+  # are in no file in this bundle, in no image, in no container's declared
+  # environment and in nothing either service prints.
+  #
+  # BOTH SERVICES GET BOTH, because both live host units have both today. Which
+  # of the two should hold the Slack reply path is a question for the front
+  # door's owner, and README.md records it rather than this bundle deciding it
+  # quietly.
+  slack-bot-token:
+    environment: JARVIS_SLACK_BOT_TOKEN
+  slack-app-token:
+    environment: JARVIS_SLACK_APP_TOKEN
