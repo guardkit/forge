@@ -613,3 +613,58 @@ def test_the_shipped_manifest_names_files_this_repository_really_has():
     assert named, "the shipped manifest names no dockerfile at all"
     for path in named:
         assert (REPO_ROOT / path).is_file(), f"the manifest names {path}, which is not in this tree"
+
+
+# ---------------------------------------------------------------------------
+# An image's STANDARD labels name its own repository
+# ---------------------------------------------------------------------------
+
+
+def test_the_standard_revision_and_source_labels_are_set_per_image():
+    """org.opencontainers.image.revision / .source, per image, not per release.
+
+    WHY (25 September 2026, the review of stage 4b). These two labels mean
+    "the commit this image was built from" and "the repository it came from",
+    and they are what every ordinary tool reads. The script set both ONCE,
+    from the build-context root, which was right while every image came from
+    this repository and became wrong the moment an image could be built from
+    another repository's clone: fleet-memory-mcp reported Forge's commit and
+    Forge's address, while its own tag and its com.guardkit.* labels said
+    fleet-memory's. Two answers to one question, and the widely-read one was
+    the wrong one.
+
+    This reads the script rather than building, because a build takes twenty
+    minutes and a network; the real images are checked in the release proof.
+    """
+    script = SCRIPT.read_text(encoding="utf-8")
+
+    assert "--label \"org.opencontainers.image.revision=${icommit}\"" in script, (
+        "the release script no longer labels each image with the commit of "
+        "the repository THAT image was built from"
+    )
+    assert "--label \"org.opencontainers.image.source=${iurl}\"" in script, (
+        "the release script no longer labels each image with the address of "
+        "the repository THAT image was built from"
+    )
+    assert "org.opencontainers.image.revision=${ROOT_COMMIT}" not in script, (
+        "the release script is back to giving every image the build-context "
+        "root's commit as its standard revision label"
+    )
+    assert "org.opencontainers.image.source=${ROOT_URL}" not in script, (
+        "the release script is back to giving every image the build-context "
+        "root's address as its standard source label"
+    )
+
+
+def test_the_release_wide_labels_are_still_release_wide():
+    """The version, the manifest hash and the base digest are facts about the
+    RELEASE and are the same on every image of it. Only the two that name a
+    repository moved."""
+    script = SCRIPT.read_text(encoding="utf-8")
+    for label in (
+        'LABEL_ARGS+=(--label "com.guardkit.release.version=${VERSION}")',
+        'LABEL_ARGS+=(--label "com.guardkit.release.manifest.sha256=${MANIFEST_SHA}")',
+        'LABEL_ARGS+=(--label "com.guardkit.release.base.digest=${BASE_DIGEST}")',
+        'LABEL_ARGS+=(--label "org.opencontainers.image.version=${VERSION}")',
+    ):
+        assert label in script, f"the release no longer stamps every image with {label}"

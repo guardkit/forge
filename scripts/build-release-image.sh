@@ -296,7 +296,6 @@ REPO_LINES="$(echo "${PARSED}" | awk -F'[|]' '$1 == "REPO"')"
 [ -n "${REPO_LINES}" ] || die "the manifest names no repositories."
 
 ROOT_NAME=""
-ROOT_URL=""
 ROOT_COMMIT=""
 
 while IFS='|' read -r _tag name url branch commit role; do
@@ -310,7 +309,7 @@ while IFS='|' read -r _tag name url branch commit role; do
     case "${role}" in
         build-context-root)
             [ -z "${ROOT_NAME}" ] || die "two repositories claim role build-context-root: ${ROOT_NAME} and ${name}."
-            ROOT_NAME="${name}"; ROOT_URL="${url}"; ROOT_COMMIT="${commit}"
+            ROOT_NAME="${name}"; ROOT_COMMIT="${commit}"
             ;;
         named-context) ;;
         *) die "repository '${name}' has role '${role}'; the two roles are build-context-root and named-context." ;;
@@ -351,6 +350,13 @@ SEEN_IMAGE_NAMES=""
 # which is the commit of the repository THAT image was built from.
 commit_of_repository() {
     echo "${REPO_LINES}" | awk -F'[|]' -v n="$1" '$2 == n { print $5; exit }'
+}
+
+# One repository's address, by name. Used for an image's own
+# org.opencontainers.image.source, which — like its commit tag — names the
+# repository THAT image was built from. See the labels section below.
+url_of_repository() {
+    echo "${REPO_LINES}" | awk -F'[|]' -v n="$1" '$2 == n { print $3; exit }'
 }
 
 # Which repository's clone an image is built from. Empty means the
@@ -613,8 +619,6 @@ done <<< "${REPO_LINES}"
 LABEL_ARGS+=(--label "com.guardkit.release.version=${VERSION}")
 LABEL_ARGS+=(--label "com.guardkit.release.manifest.sha256=${MANIFEST_SHA}")
 LABEL_ARGS+=(--label "com.guardkit.release.base.digest=${BASE_DIGEST}")
-LABEL_ARGS+=(--label "org.opencontainers.image.revision=${ROOT_COMMIT}")
-LABEL_ARGS+=(--label "org.opencontainers.image.source=${ROOT_URL}")
 LABEL_ARGS+=(--label "org.opencontainers.image.version=${VERSION}")
 LABEL_ARGS+=(--label "org.opencontainers.image.created=${RELEASE_DATE}")
 
@@ -640,15 +644,33 @@ BUILT="${TMP}/built-images"
 while IFS='|' read -r _tag iname idockerfile irole iproof icontext; do
     icontext="$(context_of_image "${icontext}")"
     icommit="$(commit_of_repository "${icontext}")"
+    iurl="$(url_of_repository "${icontext}")"
     ICONTEXT_DIR="${TMP}/${icontext}"
     TAG_COMMIT="${iname}:${icommit}"
     TAG_VERSION="${iname}:${VERSION}"
     IIDFILE="${TMP}/image-id-${iname}"
 
+    # AN IMAGE'S OWN REPOSITORY, IN THE STANDARD LABELS TOO.
+    #
+    # org.opencontainers.image.revision and .source mean "the commit this
+    # image was built from" and "the repository it came from", and every
+    # ordinary tool that reads an image reads them. Until 25 September 2026
+    # this script set both ONCE, from the build-context root — which was right
+    # while every image came from this repository, and became wrong the moment
+    # an image could be built from another repository's clone: the memory
+    # service's image said Forge's commit and Forge's address, while its own
+    # tag and its com.guardkit.* labels said fleet-memory's. Two answers to one
+    # question, and the one the rest of the world reads was the wrong one.
+    # They are per image now, and they say the same thing the image's commit
+    # tag says. For every image built from the build-context root — which is
+    # every image of every release cut before per-image contexts — this is
+    # exactly the value it had.
     say "Building ${TAG_COMMIT} (also tagged ${TAG_VERSION}) from ${icontext}/${idockerfile} in ${TMP} only"
     docker buildx build \
         "${BUILD_ARGS[@]}" \
         "${LABEL_ARGS[@]}" \
+        --label "org.opencontainers.image.revision=${icommit}" \
+        --label "org.opencontainers.image.source=${iurl}" \
         --label "com.guardkit.release.image.role=${irole}" \
         --label "com.guardkit.release.image.name=${iname}" \
         --label "com.guardkit.release.image.context=${icontext}" \

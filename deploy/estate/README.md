@@ -117,17 +117,44 @@ it every session starts from nothing.
 
 **Two containers, because it does two things.**
 
-- **`memory`** answers questions. It is the memory repository's resident service,
-  and it is the one the coordinator, a Claude session and a build all ask. Inside
-  the estate it is reached at the service name `memory`; a project's sandbox is a
-  separate small machine and reaches it at the factory gateway address, which is
-  why it is the third and last published port here;
+- **`memory`** answers questions over MCP. It is the memory repository's
+  resident service, and **its caller is a Claude session**, from outside the
+  estate. Inside the estate it is reached at the service name `memory`; a
+  project's sandbox is a separate small machine and reaches it at the factory
+  gateway address, which is why it is the third and last published port here;
 - **`memory-relay`** listens on the bus and writes what it hears into the store.
   It **publishes nothing** — nothing calls it — and it keeps one small file of
   its own, in its own volume, saying when it started and when it last wrote
   something. That file is the only sign of life it gives, because a clean write
   is completely silent: the memory flywheel once went dark for a month and
   nothing said so.
+
+**The coordinator has a memory of its own, and it is NOT the service above.**
+Forge reads the factory's memory itself, at gate time, **straight out of the
+store** — it does not ask the `memory` service, and no Forge code reads
+`FLEET_MEMORY_URL` at all. So there are two paths to memory here: a Claude
+session's, through the service, and the coordinator's, through the database.
+They use the same store and nothing else in common.
+
+That matters because of what happens when the coordinator is not told about it.
+Forge reads five names (`FLEET_MEMORY_ENABLED`, `FLEET_MEMORY_PG_DSN`,
+`FLEET_MEMORY_EMBED_URL`, `FLEET_MEMORY_EMBED_MODEL`,
+`FLEET_MEMORY_EMBED_DIMS`), and with them unset it does not refuse: it logs one
+line — `memory: OFF` — gives the gate an empty reader, and carries on answering
+its health route perfectly. **Until 25 September 2026 this bundle set none of
+them**, so an estate brought up from it had a memory service answering, every
+check passing, and a coordinator remembering nothing. Replacing the live
+coordinator with it would have turned the factory's memory off and said nothing
+— which is this file's own sentence about the flywheel going dark for a month,
+happening again.
+
+So now: `.env` **has to say** `FLEET_MEMORY_ENABLED=true` or `false` (there is
+no default, and the coordinator refuses to start on anything else), the store's
+address reaches the coordinator as the same **file** the two memory containers
+get, the three embedding lines are the same three values, and **`estate-check
+services` item 8c-forge** reads the coordinator's own memory line out of its own
+log. Item 8c — the service answering — never was evidence that anything in the
+estate used memory, and it is not now; 8c-forge is.
 
 **What changed on 25 September 2026.** Both of them ran on the **host's own
 network**, and the relay bound a folder under a home directory
@@ -153,6 +180,28 @@ service** (the model that turns text into the numbers the store searches on).
 Both are addresses in `.env`. The embedding service is a model seat, and model
 seats are out of this gate by the same rule as the others: the GPU is where the
 GPU is, and on another machine it is a line in the env file.
+
+**Two things about the two memory images, said here rather than left to be
+found.**
+
+- **They are built on a newer Python than the ones running today.** A release
+  refuses a Dockerfile that pins no base digest, so the memory repository's two
+  Dockerfiles gained the release's one base digest on 25 September 2026 — and
+  that digest is **Python 3.14.4**, where the images running today were built
+  from a floating `python:3.12-slim` and are on **3.12.13**. That is a
+  two-minor-version jump, and it arrives for anybody who rebuilds fleet-memory
+  from its own compose file as well. It was tested, not assumed: the package
+  installs, both entry modules import, and a real message went end to end on
+  3.14. But it is a change of its own and should not be read as only a pin.
+- **Both run as root**, which the release's other images do not — the
+  publisher's own proof refuses root outright. That is how the memory
+  repository's Dockerfiles have always been, so it is not a regression, but
+  these are release images now. `../../scripts/verify-fleet-memory-image.sh`
+  says so in every release build rather than leaving it unasked, and closing it
+  is a change in **that** repository: a non-root user in both Dockerfiles, and
+  `/var/lib/fleet-memory` created in the relay's image owned by that user,
+  because Docker fills a fresh named volume from what the image has at that
+  path, ownership included.
 
 ## Walk (b): a cloud machine
 
@@ -217,6 +266,13 @@ It also asks the memory service at the address `.env` gives, and asks the memory
 relay for its progress marker — the relay answers nobody over a network, so
 "has it written the file it writes when it starts" is the honest question.
 
+And it asks the **coordinator** whether its own memory is on (item 8c-forge),
+by reading the line Forge writes about itself at every boot: `memory: ON`,
+`memory: OFF` or `memory: DEGRADED`, and there is no fourth answer. This is a
+different question from "does the memory service answer", because the
+coordinator reads the store and not the service; see *Memory* above for why
+that distinction cost this bundle a silent failure until 25 September 2026.
+
 **One of its items asks nothing here, and says so.** The model seat is in the
 design's item 8 and is not in this bundle, so with no address in `.env` it
 prints *not checked here* and counts as **not passed**, exactly as item 9 does.
@@ -249,6 +305,15 @@ met until it runs for real.
   addresses in `.env`; the GPU is where the GPU is.
 - **The memory store's own database.** Memory is here; its Postgres is not, and
   where it should live is an open question of the design (above).
+- **Nothing in the estate calls the memory *service*.** The coordinator reads
+  the store directly and no Forge code reads `FLEET_MEMORY_URL` at all, so the
+  service's only caller is a Claude session over MCP, from outside. The service
+  is not pointless — that session is a real consumer, and it is why the service
+  is published at the gateway address — but `estate-check` item 8c is a check of
+  the service and not of the estate using memory. Item 8c-forge is the one that
+  asks the coordinator. If the two ever want to be one thing, that is Forge's
+  own work: the reader in `src/forge/adapters/fleet_memory/priors.py` would have
+  to go through MCP instead of through the store.
 - **The memory service's compose description lives here rather than in the
   memory repository.** The design says each service's compose file belongs to
   the repository that owns the service, and the estate composes it in — which is

@@ -62,6 +62,7 @@ ITEMS=(
 "services|8b|the-buses-storage-is-provisioned|the bus's key-value buckets and streams exist, asked of the bus itself"
 "services|8c|the-memory-service-answers|the memory service answers at the address the env file gives"
 "services|8c-relay|the-memory-relay-is-running|the memory relay is running and has written its progress marker into its own volume"
+"services|8c-forge|the-coordinator-reads-memory-itself|the coordinator says in its own log that its memory is on - the memory service answering proves the service, not that anything in the estate uses memory"
 "services|8d|the-model-seat-answers|the model seat answers at the address the env file gives"
 "services|8e|the-coordinator-answers|the coordinator answers on its own health route"
 "services|8f|the-answer-service-answers|the answer service answers for a build nobody wrote down"
@@ -510,9 +511,10 @@ check_services() {
     # --- 8b ----------------------------------------------------------------
     check_bus_storage
 
-    # --- 8c / 8c-relay / 8d -------------------------------------------------
+    # --- 8c / 8c-relay / 8c-forge / 8d --------------------------------------
     check_named_address 8c "the memory service" "$(get FLEET_MEMORY_URL)" "${coordinator}"
     check_the_memory_relay
+    check_the_coordinators_own_memory "${coordinator}"
     check_named_address 8d "the model seat"     "$(get MODEL_SEAT_URL)"   "${coordinator}"
 
     # --- 8e ----------------------------------------------------------------
@@ -588,6 +590,46 @@ check_the_memory_relay() {
     else
         fail 8c-relay "the memory relay is running but has not written its progress marker at ${marker}. It writes that file as it starts, after the store is open, so this usually means it has not got that far: look at its log for the store or the bus."
     fi
+}
+
+# THE COORDINATOR'S OWN MEMORY, which is not the same question as item 8c.
+#
+# WHY THIS ITEM EXISTS (added 25 September 2026, after the review of this
+# stage). Item 8c asks the memory SERVICE, and the memory service's caller is a
+# Claude session talking MCP from outside the estate. The coordinator does not
+# use it: Forge reads the factory's memory itself, at gate time, straight out of
+# the store. So item 8c passing says nothing at all about whether anything IN
+# the estate is using memory — and the bundle used to give the coordinator none
+# of Forge's five memory settings, which Forge does not refuse: it logs one
+# line, hands the gate an empty reader, and looks perfectly healthy. Every other
+# item in this list still passed. That is how the memory flywheel goes dark
+# without anything saying so, which has happened here before and cost a month.
+#
+# WHAT IS ASKED. The coordinator's own words, in its own log, at its own boot:
+# Forge writes "memory: ON", "memory: OFF" or "memory: DEGRADED" and there is
+# no fourth answer. Nothing here reads a setting or a secret; it reads what the
+# program said about itself.
+check_the_coordinators_own_memory() {
+    local coordinator="$1" line
+    if [ -z "${coordinator}" ]; then
+        fail 8c-forge "the coordinator is not running in this estate, so it could not be asked whether its own memory is on."
+        return
+    fi
+    line="$(docker logs "${coordinator}" 2>&1 | /bin/grep -E 'memory: (ON|OFF|DEGRADED)' | tail -1)"
+    case "${line}" in
+        *"memory: ON"*)
+            ok 8c-forge "the coordinator says its own memory is ON — its own words at its own boot: \"$(redact "${line#*memory: }")\". This is the coordinator reading the STORE at gate time, which is a different path from the memory service item 8c asks; the memory service's caller is a Claude session over MCP."
+            ;;
+        *"memory: DEGRADED"*)
+            fail 8c-forge "the coordinator says its memory is DEGRADED: \"$(redact "${line#*memory: }")\". It was told memory is on and cannot load what it needs to read the store, so its gates run with no priors while everything else here looks healthy."
+            ;;
+        *"memory: OFF"*)
+            unchecked 8c-forge "the coordinator says its memory is OFF, which the env file asked for (FLEET_MEMORY_ENABLED=false). That is a decision and not a fault, but it is not a pass either: this estate's gates read no priors, and nothing else in this check would have told you."
+            ;;
+        *)
+            fail 8c-forge "the coordinator has said nothing about memory in its log, and it says one of ON, OFF or DEGRADED at every boot. Either it has not finished starting or this is not the coordinator's log."
+            ;;
+    esac
 }
 
 # A part of the design's item 8 that the estate does not carry yet.
