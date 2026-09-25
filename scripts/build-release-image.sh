@@ -66,13 +66,60 @@
 #     --plan-only          read and check the manifest, print what would be
 #                          fetched and built — every image, its file, its role
 #                          and its two tags — and stop. Nothing is fetched,
-#                          nothing is built, no tag is written.
+#                          nothing is built, no tag is written. It is READ-ONLY
+#                          and needs no override flag: a tag that already exists
+#                          is REPORTED in the plan ("a real build would refuse")
+#                          rather than refusing the plan. Until 25 September
+#                          2026 the existing-tag check sat before this branch,
+#                          so anybody who had already built a release had to
+#                          pass --allow-existing-tag to read a plan — and the
+#                          cost of that is people learning to reach for the
+#                          override flag out of habit.
 #
 # Exit status is non-zero, with a sentence saying which input was wrong, on any
 # drift: a commit that cannot be fetched, a clone at the wrong commit, a commit
 # that is not on the branch the manifest names, a branch that does not exist, a
 # repository missing from the manifest, a base image digest that no longer
-# matches one of the Dockerfiles, or a tag that already exists.
+# matches one of the Dockerfiles, a tag that already exists, or a built image
+# carrying one of this machine's own names (see THE SWEEP below).
+#
+# THE SWEEP: NOTHING OF THE BUILDING MACHINE GOES OUT IN A RELEASE IMAGE
+#
+# Rich, on containerisation: a machine's name as a default value is the worst
+# form of this defect. It is not theoretical here — on 25 September 2026 a
+# developer's compiled files rode into an image carrying the absolute path of
+# the machine that compiled them, and the jarvis package's own settings module
+# hard-coded a host name as a default, so that name was in a PUBLIC image.
+# Both were found by sweeping an image BY HAND. Each image's own proof script
+# reads the image's CONFIGURATION and its labels, which is a different and much
+# smaller question, and both of those hits were in the FILESYSTEM.
+#
+# So, after each image is built, this script exports that image's whole
+# filesystem (docker create + docker export) along with its config, its labels
+# and its history, and searches all of it with /bin/grep -F. A hit REFUSES the
+# release and names the image, the file and the word.
+#
+# WHERE THE WORDS COME FROM, AND WHY NOT FROM A FILE HERE. A tracked list of
+# this machine's names would BE the defect it is looking for — a real host name
+# and a real user name, written into a public repository, so that a checker can
+# look for them. So the words come from the MACHINE, at build time, in the
+# environment variable RELEASE_SWEEP_TERMS: space-separated, whatever this
+# operator's machine, account, home directory and projects folder are called.
+# The estate's .env.example carries the NAME with a comment and NO VALUE.
+#
+# WITH RELEASE_SWEEP_TERMS UNSET, NO SWEEP RUNS, and this script says so in
+# plain words rather than printing a tick. A release built without it is not
+# swept, and the operator can see that it was not.
+#
+# THE EXCEPTIONS ARE NAMED BY PATH, NEVER BY WORD. A file may legitimately
+# contain one of these words — today guardkit's own feature-plan.md carries
+# this estate's host names as the PATTERNS its live-infrastructure detector
+# looks FOR, and removing them would switch a check off rather than make
+# anything portable. The manifest lists such files under `sweep_exceptions:`,
+# by image and by path, each with its reason. A hit in one of those files is
+# REPORTED and allowed; a hit anywhere else refuses. An exception cannot be
+# written as "allow this word", because that would put the word back into a
+# tracked file.
 #
 # THE TWO MANIFEST SCHEMAS
 #
@@ -142,7 +189,7 @@ while [ "$#" -gt 0 ]; do
         --skip-proof) RUN_PROOF=0; shift ;;
         --plan-only) PLAN_ONLY=1; shift ;;
         --receipt) [ "$#" -ge 2 ] || die "--receipt needs a path"; RECEIPT="$2"; shift 2 ;;
-        -h|--help) sed -n '1,92p' "$0"; exit 0 ;;
+        -h|--help) sed -n '1,139p' "$0"; exit 0 ;;
         -*) die "unknown option: $1" ;;
         *) [ -z "${MANIFEST}" ] || die "more than one manifest given: ${MANIFEST} and $1"; MANIFEST="$1"; shift ;;
     esac
@@ -179,12 +226,17 @@ MANIFEST_SHA="$(hash_of "${MANIFEST}")"
 # reported by name rather than ignored.
 # ---------------------------------------------------------------------------
 #
-# TWO lists, not one, since stage 2b: `repositories:` (what goes in) and
-# `images:` (what comes out). They are read by the same three rules — a header
-# on its own line, an entry that starts with a dash, and the entry's further
-# keys indented under it — with a different set of permitted keys each. A key
-# that belongs to the other list is reported by name rather than ignored, so
-# an `images:` entry cannot quietly carry a `commit:` and look pinned.
+# THREE lists: `repositories:` (what goes in), `images:` (what comes out) and
+# `sweep_exceptions:` (the named files a sweep hit is allowed in). They are
+# read by the same three rules — a header on its own line, an entry that starts
+# with a dash, and the entry's further keys indented under it — with a
+# different set of permitted keys each. A key that belongs to another list is
+# reported by name rather than ignored, so an `images:` entry cannot quietly
+# carry a `commit:` and look pinned.
+#
+# A `sweep_exceptions:` entry has `image`, `path` and `reason`. It says "a hit
+# in THIS file of THIS image is expected, for this stated reason" — never "this
+# word is allowed", which would put a machine's name back into a tracked file.
 PARSED="$(
     awk '
         function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
@@ -194,9 +246,12 @@ PARSED="$(
                 printf "REPO|%s|%s|%s|%s|%s\n", f_name, f_url, f_branch, f_commit, f_role
             else if (cur_list == "images")
                 printf "IMAGE|%s|%s|%s|%s|%s\n", f_name, f_dockerfile, f_role, f_proof, f_context
+            else if (cur_list == "sweep_exceptions")
+                printf "SWEEPOK|%s|%s|%s\n", f_image, f_path, f_reason
             have_item = 0
             f_name = ""; f_url = ""; f_branch = ""; f_commit = ""; f_role = ""
             f_dockerfile = ""; f_proof = ""; f_context = ""
+            f_image = ""; f_path = ""; f_reason = ""
         }
         function setkey(key, val) {
             if (cur_list == "repositories") {
@@ -212,6 +267,11 @@ PARSED="$(
                 else if (key == "role") f_role = val
                 else if (key == "proof") f_proof = val
                 else if (key == "context") f_context = val
+                else printf "UNKNOWN|%s|%s\n", cur_list, key
+            } else if (cur_list == "sweep_exceptions") {
+                if (key == "image") f_image = val
+                else if (key == "path") f_path = val
+                else if (key == "reason") f_reason = val
                 else printf "UNKNOWN|%s|%s\n", cur_list, key
             } else {
                 printf "UNKNOWN|%s|%s\n", cur_list, key
@@ -235,7 +295,7 @@ PARSED="$(
         line ~ /^[a-z_]+:[ \t]*$/ {
             flush_item()
             cur_list = line; sub(/:.*$/, "", cur_list); cur_list = trim(cur_list)
-            if (cur_list != "repositories" && cur_list != "images")
+            if (cur_list != "repositories" && cur_list != "images" && cur_list != "sweep_exceptions")
                 printf "UNKNOWNLIST|%s\n", cur_list
             next
         }
@@ -270,12 +330,12 @@ fi
 if echo "${PARSED}" | grep -q '^UNKNOWNLIST'; then
     echo "ERROR: the manifest at ${MANIFEST} has lists this reader does not understand:" >&2
     echo "${PARSED}" | awk -F'[|]' '$1 == "UNKNOWNLIST" { print "       " $2 ":" }' >&2
-    die "the two lists are 'repositories:' (what goes into the release) and 'images:' (what comes out of it)."
+    die "the three lists are 'repositories:' (what goes into the release), 'images:' (what comes out of it) and 'sweep_exceptions:' (the named files a sweep hit is allowed in)."
 fi
 if echo "${PARSED}" | grep -q '^UNKNOWN|'; then
     echo "ERROR: the manifest names keys this reader does not understand:" >&2
     echo "${PARSED}" | awk -F'[|]' '$1 == "UNKNOWN" { print "       " $3 "  (under " $2 ":)" }' >&2
-    die "a repository has name, url, branch, commit and role; an image has name, dockerfile, role, an optional context and an optional proof."
+    die "a repository has name, url, branch, commit and role; an image has name, dockerfile, role, an optional context and an optional proof; a sweep exception has image, path and reason."
 fi
 
 top() { echo "${PARSED}" | awk -F'[|]' -v k="$2" '$1 == "TOP" && $2 == k { print $3; exit }'; }
@@ -406,6 +466,30 @@ done <<< "${IMAGE_LINES}"
 [ "${COORDINATOR_NAME}" = "${IMAGE_NAME}" ] \
     || die "the manifest's image_name is '${IMAGE_NAME}' and the image whose role is coordinator is called '${COORDINATOR_NAME}'. They are the same image said twice, so they have to agree: ops/forge-prod-recreate.sh reads image_name to name the release it expects."
 
+# ---------------------------------------------------------------------------
+# The files a sweep hit is allowed in — by image and by PATH, never by word.
+#
+# Checked here, with everything else, so a manifest naming an exception for an
+# image the release does not build is a refusal at the door rather than a line
+# nobody ever reads. Each entry must carry its reason: an exception that cannot
+# say why it exists is one nobody can review later.
+# ---------------------------------------------------------------------------
+SWEEP_OK_LINES="$(echo "${PARSED}" | awk -F'[|]' '$1 == "SWEEPOK"')"
+if [ -n "${SWEEP_OK_LINES}" ]; then
+    while IFS='|' read -r _tag simage spath sreason; do
+        [ -n "${simage}" ] \
+            || die "a sweep_exceptions entry in the manifest names no image, so nothing would know which image the exception belongs to."
+        [ -n "${spath}" ] \
+            || die "the sweep exception for image '${simage}' names no path. An exception is a named FILE, never a word — allowing a word would put a machine's name back into this file."
+        [ -n "${sreason}" ] \
+            || die "the sweep exception for '${simage}' at '${spath}' gives no reason. An exception that cannot say why it exists is one nobody can review later."
+        case " ${SEEN_IMAGE_NAMES} " in
+            *" ${simage} "*) ;;
+            *) die "the manifest has a sweep exception for an image called '${simage}', and this release builds no image of that name." ;;
+        esac
+    done <<< "${SWEEP_OK_LINES}"
+fi
+
 REPO_COUNT="$(echo "${REPO_LINES}" | wc -l | tr -d ' ')"
 IMAGE_COUNT="$(echo "${IMAGE_LINES}" | wc -l | tr -d ' ')"
 say "Release ${VERSION} — ${REPO_COUNT} repositories, ${IMAGE_COUNT} images, manifest ${MANIFEST_SHA}"
@@ -426,28 +510,45 @@ say "Release ${VERSION} — ${REPO_COUNT} repositories, ${IMAGE_COUNT} images, m
 # this is exactly what it was.
 tags_of() { echo "$1:$2 $1:${VERSION}"; }
 
+# A FLOATING TAG IS REFUSED WHATEVER THE MODE, INCLUDING A PLAN. It is a fact
+# about the manifest — this release is called `latest` — so a plan that printed
+# it as though it would work would be telling somebody something untrue about a
+# file they can fix right now. The EXISTING-TAG refusal is a different kind of
+# thing entirely and it has moved below: it is a fact about THIS MACHINE'S
+# image store, and a read-only plan neither reads nor writes that.
 while IFS='|' read -r _tag iname idockerfile irole iproof icontext; do
     icontext="$(context_of_image "${icontext}")"
     for t in $(tags_of "${iname}" "$(commit_of_repository "${icontext}")"); do
         case "${t}" in
             *:latest) die "this script will not produce a '${t}' tag. A release is named by the commit it was built from; a floating tag is what this path replaces." ;;
         esac
-        if docker image inspect "${t}" >/dev/null 2>&1 </dev/null; then
-            [ "${ALLOW_EXISTING_TAG}" = "1" ] \
-                || die "the tag ${t} already exists on this machine. A release tag is written once, and moving it would change what that name means for anything already using it. Delete it deliberately, or pass --allow-existing-tag if you meant to rebuild it."
-        fi
     done
 done <<< "${IMAGE_LINES}"
 
 if [ "${PLAN_ONLY}" = "1" ]; then
     echo "Release ${VERSION} (manifest ${MANIFEST_SHA}, schema ${SCHEMA})"
     echo "  base image: ${BASE_DIGEST}"
+    if [ -n "${RELEASE_SWEEP_TERMS:-}" ]; then
+        echo "  sweep     : $(set -- ${RELEASE_SWEEP_TERMS}; echo "$#") term(s) from RELEASE_SWEEP_TERMS would be swept for in every built image"
+    else
+        echo "  sweep     : RELEASE_SWEEP_TERMS is not set, so a real build would sweep nothing"
+    fi
     echo "  would build ${IMAGE_COUNT} image(s), all from the same fetched clones:"
     while IFS='|' read -r _tag iname idockerfile irole iproof icontext; do
         icontext="$(context_of_image "${icontext}")"
         echo "    ${iname} [${irole}] from ${icontext}/${idockerfile}"
         for t in $(tags_of "${iname}" "$(commit_of_repository "${icontext}")"); do
-            echo "      would tag : ${t}"
+            # READ-ONLY, AND IT SAYS SO RATHER THAN REFUSING. `docker image
+            # inspect` only looks; nothing is fetched, built or tagged by a
+            # plan. Until 25 September 2026 the refusal below sat above this
+            # branch, so reading a plan on a machine that had already built the
+            # release meant passing --allow-existing-tag — and what that
+            # teaches people is to reach for the override flag.
+            if docker image inspect "${t}" >/dev/null 2>&1 </dev/null; then
+                echo "      would tag : ${t}  <-- ALREADY EXISTS: a real build would refuse this (--allow-existing-tag rebuilds it)"
+            else
+                echo "      would tag : ${t}"
+            fi
         done
         if [ -n "${iproof}" ]; then
             echo "      proved by : ${ROOT_NAME}/${iproof}"
@@ -462,6 +563,23 @@ if [ "${PLAN_ONLY}" = "1" ]; then
     echo "Nothing was fetched and nothing was built (--plan-only)."
     exit 0
 fi
+
+# ---------------------------------------------------------------------------
+# The existing-tag refusal, for a real build.
+#
+# Every image is checked before anything is fetched, so a release never lands
+# half of its images and then refuses. A release tag is written once: moving it
+# would change what that name means for anything already using it.
+# ---------------------------------------------------------------------------
+while IFS='|' read -r _tag iname idockerfile irole iproof icontext; do
+    icontext="$(context_of_image "${icontext}")"
+    for t in $(tags_of "${iname}" "$(commit_of_repository "${icontext}")"); do
+        if docker image inspect "${t}" >/dev/null 2>&1 </dev/null; then
+            [ "${ALLOW_EXISTING_TAG}" = "1" ] \
+                || die "the tag ${t} already exists on this machine. A release tag is written once, and moving it would change what that name means for anything already using it. Delete it deliberately, or pass --allow-existing-tag if you meant to rebuild it."
+        fi
+    done
+done <<< "${IMAGE_LINES}"
 
 # ---------------------------------------------------------------------------
 # Fetch every repository, fresh, at exactly its pin.
@@ -585,6 +703,133 @@ while IFS='|' read -r _tag iname idockerfile irole iproof icontext; do
 done <<< "${IMAGE_LINES}"
 
 # ---------------------------------------------------------------------------
+# THE SWEEP — see the header. Nothing of the building machine goes out in a
+# release image, and the words it looks for come from the machine, not from
+# any file in this repository.
+# ---------------------------------------------------------------------------
+SWEEP_TERMS="${RELEASE_SWEEP_TERMS:-}"
+if [ -z "${SWEEP_TERMS}" ]; then
+    say ""
+    say "NO SWEEP WILL RUN. RELEASE_SWEEP_TERMS is not set, so the images of this"
+    say "release will NOT be searched for anything belonging to this machine. Set it"
+    say "to this machine's own names — its host name, its account name, its home"
+    say "directory, its projects folder — separated by spaces, and build again if you"
+    say "want them swept. It is deliberately not a list in any tracked file: such a"
+    say "list would itself be this machine's names written into a public repository."
+    say ""
+fi
+
+# Is a hit in this file, in this image, one the manifest has already named?
+#
+# By PATH. The manifest's path is matched as the END of the file's path inside
+# the image, so an exception can be written the way a person reads it —
+# ".../guardkit/_installer_core/commands/feature-plan.md" — without anybody
+# having to know which site-packages directory a base image happens to use.
+sweep_exception_reason() {
+    local iname="$1" relpath="$2"
+    local _t simage spath sreason norm
+    [ -n "${SWEEP_OK_LINES}" ] || return 1
+    while IFS='|' read -r _t simage spath sreason; do
+        [ "${simage}" = "${iname}" ] || continue
+        norm="${spath#"${spath%%[!./]*}"}"          # drop any leading dots and slashes
+        case "/${relpath}" in
+            *"/${norm}") printf '%s' "${sreason}"; return 0 ;;
+        esac
+    done <<< "${SWEEP_OK_LINES}"
+    return 1
+}
+
+sweep_image() {
+    local iname="$1" itag="$2"
+    if [ -z "${SWEEP_TERMS}" ]; then
+        say "  not swept (RELEASE_SWEEP_TERMS is not set), so nothing is known about what ${iname} carries"
+        return 0
+    fi
+
+    local dir="${TMP}/sweep-${iname}"
+    rm -rf "${dir}"
+    mkdir -p "${dir}/fs"
+
+    # The image's own metadata: its configuration, its labels and its history.
+    docker image inspect --format '{{json .Config}}' "${itag}" > "${dir}/config.json" </dev/null \
+        || die "the configuration of image '${iname}' could not be read, so it could not be swept. Not swept is not a pass."
+    docker image inspect --format '{{json .Config.Labels}}' "${itag}" > "${dir}/labels.json" </dev/null \
+        || die "the labels of image '${iname}' could not be read, so it could not be swept."
+    docker image history --no-trunc "${itag}" > "${dir}/history.txt" </dev/null \
+        || die "the history of image '${iname}' could not be read, so it could not be swept."
+
+    # THE FILESYSTEM, FLATTENED. `docker create` makes a container without
+    # starting one — nothing in the image runs — and `docker export` writes its
+    # whole filesystem as a tar. This is the part each image's own proof script
+    # does NOT do, and it is where both of this estate's real hits were found.
+    local cid
+    cid="$(docker create "${itag}" </dev/null 2>/dev/null)" \
+        || cid="$(docker create --entrypoint /bin/true "${itag}" </dev/null 2>/dev/null)" \
+        || die "no container could be created from image '${iname}' to export its filesystem, so it could not be swept. Not swept is not a pass."
+    docker export "${cid}" > "${dir}/fs.tar" </dev/null \
+        || { docker rm -f "${cid}" >/dev/null 2>&1 </dev/null || true; die "the filesystem of image '${iname}' could not be exported, so it could not be swept."; }
+    docker rm -f "${cid}" >/dev/null 2>&1 </dev/null || true
+
+    # Extracted as this user, so nothing in the image can set an owner or a
+    # mode here, and then made readable — a file with mode 000 inside an image
+    # would otherwise be a file the sweep silently skipped.
+    tar -xf "${dir}/fs.tar" -C "${dir}/fs" --no-same-owner --no-same-permissions \
+        2> "${dir}/tar-errors.txt" || true
+    chmod -R u+rwX "${dir}/fs" 2>/dev/null || true
+
+    # NOT SWEPT IS NOT A PASS, so what came out is counted against what went in.
+    # An export holds device nodes and sockets that cannot be recreated here;
+    # those carry no text and are not counted. Every REGULAR file must be.
+    local in_tar on_disk
+    in_tar="$(tar -tvf "${dir}/fs.tar" 2>/dev/null | awk '$1 ~ /^-/' | wc -l | tr -d ' ')"
+    on_disk="$(find "${dir}/fs" -type f 2>/dev/null | wc -l | tr -d ' ')"
+    [ "${on_disk}" -ge "${in_tar}" ] \
+        || die "the sweep of image '${iname}' unpacked ${on_disk} of the ${in_tar} files in it, so part of that image was never searched. Not swept is not a pass. The unpacking said: $(tr '\n' ' ' < "${dir}/tar-errors.txt")"
+
+    say "  sweeping ${iname}: ${on_disk} files, its configuration, its labels and its history"
+
+    local refusals="${dir}/refusals.txt"
+    : > "${refusals}"
+    local term meta hits path relpath reason
+    for term in ${SWEEP_TERMS}; do
+        # The metadata first — small, and a hit there is never excusable.
+        for meta in config.json labels.json history.txt; do
+            if /bin/grep -q -F -e "${term}" "${dir}/${meta}"; then
+                printf '%s|%s|%s\n' "${iname}" "the image's ${meta%%.*}" "${term}" >> "${refusals}"
+            fi
+        done
+        # Then the filesystem, file by file, so a hit can be named.
+        hits="$(/bin/grep -r -l -F -e "${term}" "${dir}/fs" 2>/dev/null || true)"
+        [ -n "${hits}" ] || continue
+        while IFS= read -r path; do
+            [ -n "${path}" ] || continue
+            relpath="${path#"${dir}/fs/"}"
+            if reason="$(sweep_exception_reason "${iname}" "${relpath}")"; then
+                say "    allowed  ${relpath} carries '${term}' — the manifest names this file: ${reason}"
+            else
+                printf '%s|%s|%s\n' "${iname}" "${relpath}" "${term}" >> "${refusals}"
+            fi
+        done <<< "${hits}"
+    done
+
+    if [ -s "${refusals}" ]; then
+        echo "ERROR: image '${iname}' (${itag}) carries names belonging to the machine that built it:" >&2
+        while IFS='|' read -r _rimage rpath rterm; do
+            echo "       in ${rpath}" >&2
+            echo "          the word: ${rterm}" >&2
+        done < "${refusals}"
+        echo "       Every tag of this run is still on this machine; do not ship any of them." >&2
+        die "a release image belongs to the release, not to a machine. Take the name out of the source that puts it there — or, if the file needs it (a detector's own patterns, say), name that FILE under sweep_exceptions: in the manifest, with its reason."
+    fi
+    say "    ok ${iname} carries none of the ${SWEEP_TERM_COUNT} words RELEASE_SWEEP_TERMS names"
+
+    # The export and its unpacked copy are large; a release is five images.
+    rm -rf "${dir}/fs" "${dir}/fs.tar"
+}
+
+SWEEP_TERM_COUNT="$(set -- ${SWEEP_TERMS}; echo "$#")"
+
+# ---------------------------------------------------------------------------
 # Build, from the fresh clones alone.
 # ---------------------------------------------------------------------------
 BUILT_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -689,6 +934,13 @@ while IFS='|' read -r _tag iname idockerfile irole iproof icontext; do
 
     ibuilt="$(cat "${IIDFILE}")"
     say "  built ${iname} ${ibuilt}"
+
+    # SWEPT THE MOMENT IT EXISTS, not at the end of the run. A release is built
+    # as a set and a refusal stops the whole set either way, but sweeping here
+    # means the image that carries a machine's name is named while it is the
+    # thing that just happened, rather than four builds later.
+    sweep_image "${iname}" "${TAG_COMMIT}"
+
     printf '%s|%s|%s|%s|%s|%s|%s\n' "${iname}" "${irole}" "${idockerfile}" "${ibuilt}" "${TAG_COMMIT}" "${TAG_VERSION}" "${icontext}" >> "${BUILT}"
 done <<< "${IMAGE_LINES}"
 

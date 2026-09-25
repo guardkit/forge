@@ -25,6 +25,7 @@ or layout: it runs one shell script over manifests written in tmp_path.
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -474,12 +475,13 @@ def test_the_shipped_manifest_plans_every_image_of_the_release(tmp_path):
     copy = elsewhere / "manifest.yaml"
     copy.write_text(SHIPPED_MANIFEST.read_text(encoding="utf-8"), encoding="utf-8")
 
-    # ``--allow-existing-tag`` because this test is about WHAT the shipped
-    # manifest would build, and a machine that has already built this release
-    # (or a release sharing its commit tag) would otherwise be refused at the
-    # door for a reason that has nothing to do with the question being asked.
-    # The refusal itself has its own test above.
-    result = _plan(copy, "--allow-existing-tag")
+    # NO OVERRIDE FLAG. A plan is read-only, so it no longer refuses on a tag
+    # that already exists on this machine — it prints that the tag is there and
+    # that a real build would refuse it. Until 25 September 2026 this test had
+    # to pass ``--allow-existing-tag`` just to read a plan, which is exactly
+    # how people learn to reach for an override flag out of habit. The real
+    # build's refusal is a separate test, below.
+    result = _plan(copy)
 
     assert result.returncode == 0, result.stderr
     assert "would build 5 image(s)" in result.stdout
@@ -677,3 +679,264 @@ def test_the_release_wide_labels_are_still_release_wide():
         'LABEL_ARGS+=(--label "org.opencontainers.image.version=${VERSION}")',
     ):
         assert label in script, f"the release no longer stamps every image with {label}"
+
+
+# ---------------------------------------------------------------------------
+# THE SWEEP — nothing of the building machine goes out in a release image
+#
+# Written 25 September 2026. Two real hits reached a PUBLIC image before this
+# existed: a developer's compiled files carrying the absolute path of the
+# machine that compiled them, and a host name a package hard-coded as a
+# default. Both were found by sweeping an image BY HAND, because every image's
+# own proof script reads the image's CONFIGURATION and its labels and both hits
+# were in the FILESYSTEM.
+#
+# A sweep of a real image needs a real build, which needs twenty minutes and a
+# network, so what is held here is the SHAPE — where the words come from, what
+# is searched, what a hit does, and what an unset variable says. The sweep
+# itself is driven against a real image with a planted word in the stage's
+# evidence.
+# ---------------------------------------------------------------------------
+
+
+def _sweep_exception_manifest(tmp_path: Path, **overrides: str) -> Path:
+    entry = {
+        "image": "the-coordinator",
+        "path": "somewhere/inside/the-image/a-file.md",
+        "reason": "the detector's own patterns",
+    }
+    entry.update(overrides)
+    lines = "\n".join(
+        f"    {key}: {value}" if key != "image" else f"  - image: {value}"
+        for key, value in entry.items()
+        if value
+    )
+    return _manifest(
+        tmp_path,
+        f"""
+schema: 2
+version: 0.0.0-sweepexception
+image_name: the-coordinator
+python_base_digest: {_BASE_DIGEST}
+{_repositories()}
+images:
+  - name: the-coordinator
+    dockerfile: Dockerfile
+    role: coordinator
+sweep_exceptions:
+{lines}
+""",
+    )
+
+
+def test_the_words_swept_for_come_from_the_machine_and_not_from_this_repository():
+    """A tracked list of this machine's names would BE the defect.
+
+    The rule (Rich, on containerisation): a machine's name as a default value
+    is the worst form of it — which means the list of words a sweep looks for
+    cannot itself be a tracked list of real machine names in a public
+    repository. It comes from the environment, at build time.
+    """
+    script = SCRIPT.read_text(encoding="utf-8")
+    assert 'SWEEP_TERMS="${RELEASE_SWEEP_TERMS:-}"' in script, (
+        "the release script no longer takes its sweep words from the machine's "
+        "own environment"
+    )
+
+
+def test_the_sweep_reads_the_filesystem_and_not_only_the_configuration():
+    """The whole point: both real hits were in the filesystem."""
+    script = SCRIPT.read_text(encoding="utf-8")
+    for needle in ("docker create", "docker export", "docker image history"):
+        assert needle in script, (
+            f"the release script no longer runs `{needle}`, so it is back to "
+            "asking the small question each proof script already asks"
+        )
+    assert "/bin/grep -r -l -F" in script, "the sweep no longer searches the unpacked filesystem"
+
+
+def test_a_hit_refuses_the_release_and_names_the_image_the_file_and_the_word():
+    script = SCRIPT.read_text(encoding="utf-8")
+    assert "carries names belonging to the machine that built it" in script
+    assert 'echo "       in ${rpath}" >&2' in script, "a refusal no longer names the file"
+    assert 'echo "          the word: ${rterm}" >&2' in script, "a refusal no longer names the word"
+
+
+def test_an_image_that_could_not_be_swept_is_not_called_clean():
+    """Not swept is not a pass — for an export that fails and for one that
+    unpacks short of what was in it."""
+    script = SCRIPT.read_text(encoding="utf-8")
+    assert script.count("Not swept is not a pass") >= 2
+    assert "was never searched" in script
+
+
+@needs_docker
+def test_a_plan_says_plainly_when_no_sweep_would_run(tmp_path):
+    manifest = _two_image_manifest(tmp_path, version="0.0.0-nosweep")
+    environment = dict(os.environ)
+    environment.pop("RELEASE_SWEEP_TERMS", None)
+
+    result = subprocess.run(
+        ["bash", str(SCRIPT), str(manifest), "--plan-only"],
+        cwd=str(manifest.parent),
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env=environment,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "RELEASE_SWEEP_TERMS is not set, so a real build would sweep nothing" in result.stdout
+
+
+@needs_docker
+def test_a_plan_says_how_many_words_would_be_swept_for_without_printing_them(tmp_path):
+    """The count, not the words. They are this machine's names, and a plan is
+    something people paste into a page."""
+    manifest = _two_image_manifest(tmp_path, version="0.0.0-withsweep")
+    environment = dict(os.environ)
+    environment["RELEASE_SWEEP_TERMS"] = "alpha-box someaccount /home/someaccount"
+
+    result = subprocess.run(
+        ["bash", str(SCRIPT), str(manifest), "--plan-only"],
+        cwd=str(manifest.parent),
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env=environment,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "3 term(s) from RELEASE_SWEEP_TERMS" in result.stdout
+    assert "alpha-box" not in result.stdout
+    assert "someaccount" not in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# Sweep exceptions are named by PATH, never by word
+# ---------------------------------------------------------------------------
+
+
+@needs_docker
+def test_a_sweep_exception_is_read_and_the_plan_still_works(tmp_path):
+    result = _plan(_sweep_exception_manifest(tmp_path))
+
+    assert result.returncode == 0, result.stderr
+    assert "would build 1 image(s)" in result.stdout
+
+
+@needs_docker
+def test_a_sweep_exception_without_a_reason_is_refused(tmp_path):
+    """An exception that cannot say why it exists is one nobody can review."""
+    result = _plan(_sweep_exception_manifest(tmp_path, reason=""))
+
+    assert result.returncode != 0
+    assert "gives no reason" in result.stderr
+
+
+@needs_docker
+def test_a_sweep_exception_without_a_path_is_refused(tmp_path):
+    """An exception is a named FILE. Allowing a WORD would put a machine's name
+    back into the manifest, which is the thing being prevented."""
+    result = _plan(_sweep_exception_manifest(tmp_path, path=""))
+
+    assert result.returncode != 0
+    assert "names no path" in result.stderr
+    assert "never a word" in result.stderr
+
+
+@needs_docker
+def test_a_sweep_exception_for_an_image_the_release_does_not_build_is_refused(tmp_path):
+    result = _plan(_sweep_exception_manifest(tmp_path, image="an-image-that-is-not-here"))
+
+    assert result.returncode != 0
+    assert "an-image-that-is-not-here" in result.stderr
+
+
+@needs_docker
+def test_an_unknown_key_under_sweep_exceptions_is_reported_by_name(tmp_path):
+    manifest = _manifest(
+        tmp_path,
+        f"""
+schema: 2
+version: 0.0.0-sweepkey
+image_name: the-coordinator
+python_base_digest: {_BASE_DIGEST}
+{_repositories()}
+images:
+  - name: the-coordinator
+    dockerfile: Dockerfile
+    role: coordinator
+sweep_exceptions:
+  - image: the-coordinator
+    word: promaxgb10
+""",
+    )
+
+    result = _plan(manifest)
+
+    assert result.returncode != 0
+    assert "word" in result.stderr
+    assert "under sweep_exceptions:" in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# --plan-only is READ-ONLY, so it needs no override flag
+# ---------------------------------------------------------------------------
+
+
+@needs_docker
+def test_a_plan_reports_an_existing_tag_rather_than_refusing(tmp_path):
+    """Planning a release on the machine that built it should not need a flag.
+
+    The image used is whichever one this machine already has — the question is
+    about an EXISTING tag, so the test asks the daemon for one rather than
+    building or pulling anything. The name is only read.
+    """
+    listing = subprocess.run(
+        ["docker", "image", "ls", "--format", "{{.Repository}}:{{.Tag}}"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    existing = [
+        line
+        for line in listing.stdout.splitlines()
+        if line and "<none>" not in line and ":" in line
+    ]
+    if not existing:
+        pytest.skip("this machine has no tagged image, so there is no existing tag to plan over")
+
+    name, _, tag = existing[0].rpartition(":")
+    manifest = _manifest(
+        tmp_path,
+        f"""
+schema: 2
+version: {tag}
+image_name: {name}
+python_base_digest: {_BASE_DIGEST}
+{_repositories()}
+images:
+  - name: {name}
+    dockerfile: Dockerfile
+    role: coordinator
+""",
+    )
+
+    result = _plan(manifest)
+
+    assert result.returncode == 0, result.stderr
+    assert "ALREADY EXISTS" in result.stdout
+    assert "a real build would refuse this" in result.stdout
+
+
+def test_the_existing_tag_refusal_still_exists_for_a_real_build():
+    """Moved, not removed: a release tag is still written once."""
+    script = SCRIPT.read_text(encoding="utf-8")
+    assert "already exists on this machine. A release tag is written once" in script
+    plan_branch = script.index('if [ "${PLAN_ONLY}" = "1" ]; then')
+    refusal = script.index("already exists on this machine. A release tag is written once")
+    assert refusal > plan_branch, (
+        "the existing-tag refusal is back above the --plan-only branch, so a "
+        "read-only plan needs --allow-existing-tag again"
+    )
