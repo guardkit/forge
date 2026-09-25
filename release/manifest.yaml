@@ -51,7 +51,7 @@ schema: 2
 # release number names one set of bytes, so rather than let 2026.09.24-6 mean
 # two different things it is left unused and this is 7. There is no gap to
 # explain in any registry, because 6 never reached one.
-version: 2026.09.24-8
+version: 2026.09.25-1
 
 # The one image this repository's own operator scripts mean by "the release
 # image" (ops/forge-prod-recreate.sh reads this line). It is the same name as
@@ -104,7 +104,7 @@ repositories:
   - name: forge
     url: https://github.com/guardkit/forge.git
     branch: main
-    commit: 602e6674f14456fc0e4df6be7556ced7d11207ea
+    commit: a7e1f4e96a33b9e9f4421ba584626cc80851d5e1
     role: build-context-root
   - name: guardkit
     url: https://github.com/guardkit/guardkit.git
