@@ -189,7 +189,7 @@ repositories:
   - name: forge
     url: https://github.com/guardkit/forge.git
     branch: main
-    commit: 3d437fc15bb1ea75882d5f932843bd0c30cea836
+    commit: fd51eb56041f7e50f28f7e4c7b5a89d048227b0b
     role: build-context-root
   - name: guardkit
     url: https://github.com/guardkit/guardkit.git
