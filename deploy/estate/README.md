@@ -39,8 +39,8 @@ in `../compose/`, and is referenced from here rather than copied.
    `./build-estate-images.sh`. It fetches the bus repository from GitHub at the
    commit `estate-pins.conf` pins, builds the bus from **the bus repository's
    own Dockerfile**, builds the one-shot, and puts the bus's config and
-   provisioning scripts into a volume. The four release images (`forge`,
-   `forge-publisher`, `fleet-memory-mcp` and `fleet-memory-relay`) come from
+   provisioning scripts into a volume. The five release images (`forge`,
+   `forge-publisher`, `fleet-memory-mcp`, `fleet-memory-relay` and `jarvis`) come from
    `../../scripts/build-release-image.sh` or from a registry.
 4. **`cp .env.example .env`** and fill in the lines marked CHANGE THIS: the
    factory gateway address, the two sandbox ports, and the paths of the secret
