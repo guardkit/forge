@@ -499,11 +499,16 @@ services:
   # Docker daemon.
   # -------------------------------------------------------------------------
   front-door:
-    image: ${JARVIS_IMAGE:?name the jarvis image in the env file, e.g. JARVIS_IMAGE=jarvis:2026.09.25-4 - built by ../../scripts/build-release-image.sh with the rest of the release}
+    image: ${JARVIS_IMAGE:?name the jarvis image in the env file, e.g. JARVIS_IMAGE=jarvis:2026.09.25-5 - built by ../../scripts/build-release-image.sh with the rest of the release}
     restart: unless-stopped
     depends_on:
-      # It subscribes to the bus at start-up, so the bus has to hold its
-      # streams before this service comes up.
+      # NOT because it touches the bus at start-up — it does not. Its two
+      # graphs are imported when the server starts, but nothing in them
+      # connects to anything until a message is handled: on all three stage 4c
+      # runs the bus saw ONE jarvis connection, the gateway's, not two. The
+      # dependency is still the right one — the first Slack message this
+      # service handles wants the bus, and the streams have to be there by
+      # then rather than being made underneath a running service.
       nats-provision:
         condition: service_completed_successfully
     # Every '$$' below is a dollar sign for the SHELL, escaped so that compose
@@ -604,7 +609,7 @@ services:
   # dependency and exits non-zero rather than running on without one.
   # -------------------------------------------------------------------------
   bus-gateway:
-    image: ${JARVIS_IMAGE:?name the jarvis image in the env file, e.g. JARVIS_IMAGE=jarvis:2026.09.25-4 - built by ../../scripts/build-release-image.sh with the rest of the release}
+    image: ${JARVIS_IMAGE:?name the jarvis image in the env file, e.g. JARVIS_IMAGE=jarvis:2026.09.25-5 - built by ../../scripts/build-release-image.sh with the rest of the release}
     restart: unless-stopped
     depends_on:
       nats-provision:
