@@ -44,7 +44,11 @@ in `../compose/`, and is referenced from here rather than copied.
    `../../scripts/build-release-image.sh` or from a registry.
 4. **`cp .env.example .env`** and fill in the lines marked CHANGE THIS: the
    factory gateway address, the two sandbox ports, and the paths of the secret
-   files. Put the secret files where it says.
+   files. Put the secret files where it says — **and put them there before
+   `up`**: a path that does not exist when a container starts is created by
+   Docker as an empty folder owned by root, in the wrong place, and the service
+   then refuses a folder where it wanted a file. Two reviews met this on
+   25 September 2026 with the publisher's two paths under `/etc/factory/`.
 5. **Put the coordinator's settings file on the settings volume.** Copy
    `../compose/settings.example.yaml`, fill in the project's `org/name` and its
    sandbox's name, and put it on the `forge-settings` volume as `forge.yaml`.
@@ -305,6 +309,21 @@ met until it runs for real.
   addresses in `.env`; the GPU is where the GPU is.
 - **The memory store's own database.** Memory is here; its Postgres is not, and
   where it should live is an open question of the design (above).
+- **Nothing in the estate can *send* memory yet.** The relay consumes
+  `memory.episode.>` on the bus, and the only account allowed to publish there
+  is `guardkit`, the identity a *build* runs under. The coordinator is given
+  neither `FLEET_MEMORY_NATS_URL` nor `GUARDKIT_NATS_PASSWORD`, and it only
+  forwards names it has, so a build launched from this estate writes nothing —
+  silently. The live machine is the same (`ops/forge-prod-recreate.sh` gives
+  the coordinator the same five names). Proven on 25 September 2026: a message
+  published as `guardkit` went the whole way into the store; as `fleet-memory`
+  the broker refused it, by design. So on a fresh machine the relay sits
+  correct and silent until a build is handed that credential — which is the
+  sandbox's business (a secret the sandbox's containers get by name), and is
+  named in the plan as a gap, not fixed here. Related: the project name the
+  coordinator reads memory under comes from a code default (`guardkit`) because
+  `FORGE_MEMORY_PROJECT` is in no env file; right today, and its own docstring
+  says when it stops being.
 - **Nothing in the estate calls the memory *service*.** The coordinator reads
   the store directly and no Forge code reads `FLEET_MEMORY_URL` at all, so the
   service's only caller is a Claude session over MCP, from outside. The service
