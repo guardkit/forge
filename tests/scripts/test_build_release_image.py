@@ -455,14 +455,19 @@ def _pins_of(text: str) -> dict[str, str]:
 
 
 @needs_docker
-def test_the_shipped_manifest_plans_all_four_images(tmp_path):
+def test_the_shipped_manifest_plans_every_image_of_the_release(tmp_path):
     """Read from a folder holding only a copy of it, as a clean machine would.
 
-    FOUR, since 25 September 2026: the coordinator, the publisher, the memory
-    service and the memory relay. The last two are built from the memory
-    repository's clone at the memory repository's pin, which is what a
-    per-image context is for — before it, a service whose code lives in another
+    FIVE, since 25 September 2026: the coordinator, the publisher, the memory
+    service, the memory relay and jarvis. The last three are built from another
+    repository's clone at that repository's pin, which is what a per-image
+    context is for — before it, a service whose code lives in another
     repository could not be a release image at all.
+
+    The jarvis image is ONE image for TWO services — the Slack front door and
+    the bus gateway — so it is one entry here, with the role of the service its
+    own CMD is. The estate starts the other with a different command, and the
+    image's proof script holds both of them to what the image can run.
     """
     elsewhere = tmp_path / "a-folder-that-is-not-a-checkout"
     elsewhere.mkdir()
@@ -477,7 +482,7 @@ def test_the_shipped_manifest_plans_all_four_images(tmp_path):
     result = _plan(copy, "--allow-existing-tag")
 
     assert result.returncode == 0, result.stderr
-    assert "would build 4 image(s)" in result.stdout
+    assert "would build 5 image(s)" in result.stdout
     assert "forge [coordinator] from forge/Dockerfile" in result.stdout
     assert (
         "forge-publisher [publisher] from forge/src/forge/publisher/Dockerfile"
@@ -491,9 +496,11 @@ def test_the_shipped_manifest_plans_all_four_images(tmp_path):
         "fleet-memory-relay [memory-relay] from fleet-memory/deploy/relay/Dockerfile"
         in result.stdout
     )
+    assert "jarvis [front-door] from jarvis/deploy/Dockerfile" in result.stdout
     assert "proved by : forge/scripts/verify-forge-oracles.sh" in result.stdout
     assert "proved by : forge/scripts/verify-publisher-image.sh" in result.stdout
     assert "proved by : forge/scripts/verify-fleet-memory-image.sh" in result.stdout
+    assert "proved by : forge/scripts/verify-jarvis-image.sh" in result.stdout
 
 
 @needs_docker
@@ -520,6 +527,8 @@ def test_an_image_is_tagged_by_the_commit_of_the_repository_it_came_from(tmp_pat
     assert f"fleet-memory-mcp:{pins['fleet-memory']}" in result.stdout
     assert f"fleet-memory-relay:{pins['fleet-memory']}" in result.stdout
     assert f"fleet-memory-mcp:{pins['forge']}" not in result.stdout
+    assert f"jarvis:{pins['jarvis']}" in result.stdout
+    assert f"jarvis:{pins['forge']}" not in result.stdout
 
 
 @needs_docker
