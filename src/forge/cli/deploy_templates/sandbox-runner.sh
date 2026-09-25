@@ -501,6 +501,21 @@ FACTORY_ENV_NAMES=(
   FORGE_SIDECAR_IN_SANDBOX
   OPENAI_BASE_URL
   OPENAI_API_KEY
+  # THE FACTORY'S MEMORY, both directions (Codex's stage 4b sign-off, 25
+  # September 2026: this list forwarded none of these, so a build inside a
+  # sandbox neither read project memory nor wrote an outcome, even when the
+  # machine supplied every one). The build system defaults memory to OFF
+  # without the first; it reads the store with the DSN; it writes outcomes over
+  # the bus as the account whose password is the last name. Two of these are
+  # secrets: they travel by NAME from the sandbox's own environment into the
+  # containers and are never written to a file or a log by this script.
+  FLEET_MEMORY_ENABLED
+  FLEET_MEMORY_PG_DSN
+  FLEET_MEMORY_EMBED_URL
+  FLEET_MEMORY_EMBED_MODEL
+  FLEET_MEMORY_EMBED_DIMS
+  FLEET_MEMORY_NATS_URL
+  GUARDKIT_NATS_PASSWORD
 )
 
 # --- the containers ---------------------------------------------------------

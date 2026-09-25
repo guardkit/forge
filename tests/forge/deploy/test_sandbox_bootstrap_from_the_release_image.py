@@ -695,6 +695,13 @@ class TestItStartsTwoContainersFromThatOneImage:
                 FORGE_TARGET_OWNER_URL=secret,
                 FORGE_NATS_URL=secret,
                 FACTORY_GATEWAY_ADDRESS=secret,
+                FLEET_MEMORY_ENABLED="1",
+                FLEET_MEMORY_PG_DSN=secret,
+                FLEET_MEMORY_EMBED_URL=secret,
+                FLEET_MEMORY_EMBED_MODEL="a-model",
+                FLEET_MEMORY_EMBED_DIMS="768",
+                FLEET_MEMORY_NATS_URL=secret,
+                GUARDKIT_NATS_PASSWORD=secret,
             ),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -710,8 +717,19 @@ class TestItStartsTwoContainersFromThatOneImage:
                 "FORGE_TARGET_OWNER_URL",
                 "FORGE_NATS_URL",
                 "FACTORY_GATEWAY_ADDRESS",
+                # Both directions of a build's memory (Codex's stage 4b
+                # sign-off, 25 September 2026): before this the list carried
+                # none of these, so a build inside a sandbox read no project
+                # memory and wrote no outcome, even when the machine had them.
+                "FLEET_MEMORY_ENABLED",
+                "FLEET_MEMORY_PG_DSN",
+                "FLEET_MEMORY_EMBED_URL",
+                "FLEET_MEMORY_EMBED_MODEL",
+                "FLEET_MEMORY_EMBED_DIMS",
+                "FLEET_MEMORY_NATS_URL",
+                "GUARDKIT_NATS_PASSWORD",
             ):
-                assert f"--env {name}" in runs
+                assert f"--env {name}" in runs, f"{name} was not handed to the containers"
             assert secret not in runs
         finally:
             process.terminate()
