@@ -123,15 +123,43 @@ def an_image(**how) -> dict:
 
 
 def an_engine(style: str = "classic", **how) -> dict:
-    """The whole of a stand-in engine's image table."""
+    """The whole of a stand-in engine's image table.
+
+    ``move_tag_to`` names the image every tag moves onto, and
+    ``move_tag_when`` says after WHICH question of the bootstrap's it moves —
+    which is the whole of the stage 4f reviewer's first finding, because the
+    bootstrap asks the engine four questions in a row and a tag that moves
+    between two of them used to make the checks pass on one image while another
+    was the one started. The moments have the names the bootstrap's own
+    questions have:
+
+    * ``after-the-id``                   — the one lookup that uses the name
+    * ``after-the-identity-document``    — the default, and what stage 4f had
+    * ``after-the-release-version-label``
+    * ``after-the-manifest-label``
+    * ``when-the-test-says-so``          — the test writes the marker itself,
+      which is how a tag is moved after everything has started and before the
+      supervisor repairs a container
+
+    ``and_it_forgets_what_no_name_points_at`` makes the engine let go of an
+    image the moment the last tag leaves it, which is what a containerd store
+    does — so the id the bootstrap resolved is suddenly not in there at all.
+    """
     engine = {
         "style": style,
         "images": {"the-reviewed-release": an_image()},
         "tags": {IMAGE: "the-reviewed-release"},
         "move_tag_to": None,
+        "move_tag_when": "after-the-identity-document",
+        "and_it_forgets_what_no_name_points_at": False,
     }
     engine.update(how)
     return engine
+
+
+#: Where the stand-in engine records that the tag has moved. A test writes it
+#: itself when the moment it wants is not one of the engine's own questions.
+THE_TAG_HAS_MOVED = "the-tag-has-moved"
 
 
 #: A stand-in Docker client: one small engine in a file. It records every call,
@@ -172,37 +200,71 @@ def image_id(key):
     return table["images"][key]["id_" + style]
 
 
+def the_tag_moved():
+    the_tag_has_moved.write_text("the tag names another image now\\n")
+
+
 def resolve(reference):
     """What a name means to this engine RIGHT NOW: an image, or nothing."""
     tags = dict(table["tags"])
-    if table.get("move_tag_to") and the_tag_has_moved.exists():
+    moved = bool(table.get("move_tag_to")) and the_tag_has_moved.exists()
+    if moved:
         for tag in list(tags):
             tags[tag] = table["move_tag_to"]
     if reference in tags:
         return tags[reference]
     for key in table["images"]:
         if reference == image_id(key):
+            # A containerd store lets an image go when the last name leaves
+            # it, so an id resolved a moment ago can be nothing at all now.
+            if (moved and table.get("and_it_forgets_what_no_name_points_at")
+                    and key not in tags.values()):
+                return None
             return key
     return None
 
 
+def written(value):
+    """One value, the way an engine's own JSON encoder writes it.
+
+    Compact, map keys in key order, every control character an escape — and
+    the three characters Go's encoder always escapes, escaped, so this stands
+    in for what `{{json}}` really does rather than for what is convenient.
+    """
+    text = json.dumps(value, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False)
+    for character in "<>&":
+        # chr(92) is the backslash; writing one here would be read as an
+        # escape by the outer file that carries this script.
+        text = text.replace(character, chr(92) + "u%04x" % ord(character))
+    return text
+
+
 def identity_document(key):
-    """Exactly the fields the bootstrap's format string asks this engine for."""
+    """Exactly the fields the bootstrap's format string asks this engine for.
+
+    One header line, then one line of JSON with the fields in the order the
+    format string names them. An array keeps its brackets and a value keeps
+    its own newlines as escapes, which is the whole of version 2.
+    """
     image = table["images"][key]
-    lines = ["forge-image-identity/1",
-             "architecture " + image["architecture"],
-             "os " + image["os"]]
-    lines += ["layer " + one for one in image["layers"]]
-    lines += ["env " + one for one in image["env"]]
-    lines += ["entrypoint " + one for one in image["entrypoint"]]
-    lines += ["cmd " + one for one in image["cmd"]]
-    lines += ["user " + image["user"], "workdir " + image["workdir"]]
-    lines += ["label %s=%s" % (name, image["labels"][name])
-              for name in sorted(image["labels"])]
-    lines += ["port " + one for one in sorted(image["ports"])]
-    lines += ["volume " + one for one in sorted(image["volumes"])]
-    lines += ["stopsignal " + image["stopsignal"]]
-    return "\\n".join(lines)
+    fields = [
+        ("architecture", image["architecture"]),
+        ("os", image["os"]),
+        ("layers", list(image["layers"])),
+        ("env", list(image["env"])),
+        ("entrypoint", list(image["entrypoint"])),
+        ("cmd", list(image["cmd"])),
+        ("user", image["user"]),
+        ("workdir", image["workdir"]),
+        ("labels", dict(image["labels"])),
+        ("ports", dict((one, {}) for one in image["ports"])),
+        ("volumes", dict((one, {}) for one in image["volumes"])),
+        ("stopsignal", image["stopsignal"]),
+    ]
+    body = "{" + ",".join('"%s":%s' % (name, written(value))
+                          for name, value in fields) + "}"
+    return "forge-image-identity/2\\n" + body
 
 
 def named(arguments):
@@ -227,30 +289,53 @@ def exists(name):
 verb = argv[0] if argv else ""
 
 if verb == "image" and len(argv) > 1 and argv[1] == "inspect":
-    if os.environ.get("STANDIN_NO_IMAGE"):
-        sys.exit(1)
     fmt = ""
     for index, word in enumerate(argv):
         if word == "--format" and index + 1 < len(argv):
             fmt = argv[index + 1]
+    # WHICH OF THE BOOTSTRAP'S FOUR QUESTIONS THIS IS. The tag moves after the
+    # one the table names, so a test can put the move in any of the gaps.
+    if "forge-image-identity/2" in fmt:
+        question = "the-identity-document"
+    elif "release.version" in fmt:
+        question = "the-release-version-label"
+    elif "manifest.sha256" in fmt:
+        question = "the-manifest-label"
+    elif ".Id" in fmt:
+        question = "the-id"
+    else:
+        question = "something-else"
+    # EVERY QUESTION ABOUT AN IMAGE, AND WHAT IT WAS ASKED ABOUT. The whole of
+    # the stage 4f reviewer's first finding is which reference each of these
+    # names, so they are written down one per line before anything is answered.
+    with (state / "what-was-inspected.jsonl").open("a") as handle:
+        handle.write(json.dumps(
+            {"question": question, "reference": argv[-1]}) + "\\n")
+    if os.environ.get("STANDIN_NO_IMAGE"):
+        print("Error: No such image: " + argv[-1], file=sys.stderr)
+        sys.exit(1)
     key = resolve(argv[-1])
     if key is None:
+        print("Error: No such image: " + argv[-1], file=sys.stderr)
         sys.exit(1)
-    if "forge-image-identity/1" in fmt:
+    if question == "the-identity-document":
         if os.environ.get("STANDIN_ANSWERS_WITH_HALF_A_DOCUMENT"):
             # An engine that rendered only the part it understood.
             for one in table["images"][key]["layers"]:
                 print("layer " + one)
             sys.exit(0)
         print(identity_document(key))
-        if table.get("move_tag_to"):
-            the_tag_has_moved.write_text("the tag names another image now\\n")
-    elif "release.version" in fmt:
+    elif question == "the-release-version-label":
         print(table["images"][key]["labels"].get("com.guardkit.release.version", ""))
-    elif "manifest.sha256" in fmt:
+    elif question == "the-manifest-label":
         print(table["images"][key]["labels"].get("com.guardkit.release.manifest.sha256", ""))
-    elif ".Id" in fmt:
+    elif question == "the-id":
         print(image_id(key))
+    if table.get("move_tag_to") and (
+        (table.get("move_tag_when") or "after-the-identity-document")
+        == "after-" + question
+    ):
+        the_tag_moved()
     sys.exit(0)
 
 if verb == "ps":
@@ -296,6 +381,11 @@ if verb == "run":
         if word != name and resolve(word) is not None:
             reference = word
             break
+    if not reference:
+        # Nothing this engine holds was named, so nothing runs — which is what
+        # a start from an image that has gone looks like from out here.
+        print("Error: No such image", file=sys.stderr)
+        sys.exit(125)
     with (state / "what-was-started.jsonl").open("a") as handle:
         handle.write(json.dumps({
             "container": name,
@@ -348,9 +438,34 @@ def _the_identity_the_other_engine_recorded(sandbox, engine: dict, reference=IMA
         timeout=30,
     )
     assert answer.returncode == 0, answer.stderr
-    document = answer.stdout.replace("\r", "").rstrip("\n")
+    document = _only_the_line_endings(answer.stdout).rstrip("\n")
     assert document, "the other engine said nothing about the image"
     return hashlib.sha256((document + "\n").encode()).hexdigest()
+
+
+def _only_the_line_endings(text: str) -> str:
+    """What both scripts do with carriage returns, and no more than that.
+
+    Stage 4g: a carriage return that is part of a configuration VALUE is
+    written by the engine's JSON encoder as two characters, so the only
+    literal ones in a rendered document are the line endings a transport put
+    there. Those are what comes out; nothing else is touched.
+    """
+    return text.replace("\r\n", "\n").rstrip("\r")
+
+
+def _the_document_the_engine_renders(sandbox, reference=IMAGE):
+    """The identity document itself, as this sandbox's stand-in engine says it."""
+    answer = subprocess.run(
+        [str(sandbox["client"]), "image", "inspect", "--format", IDENTITY_FORMAT,
+         reference],
+        env=_settings(sandbox),
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert answer.returncode == 0, answer.stderr
+    return _only_the_line_endings(answer.stdout)
 
 
 @pytest.fixture()
@@ -424,6 +539,14 @@ def _what_was_started(sandbox):
 def _calls(sandbox):
     path = sandbox["calls"]
     return path.read_text().splitlines() if path.exists() else []
+
+
+def _what_was_inspected(sandbox):
+    """Every question the bootstrap asked about an image, and about what."""
+    ledger = sandbox["state"] / "what-was-inspected.jsonl"
+    if not ledger.exists():
+        return []
+    return [json.loads(line) for line in ledger.read_text().splitlines() if line]
 
 
 # ---------------------------------------------------------------------------
@@ -1483,8 +1606,8 @@ class TestTheTwoScriptsAskTheEnginesTheSameQuestion:
 
     def test_the_document_covers_configuration_platform_and_filesystem(self):
         for wanted in (
-            "{{.Architecture}}",
-            "{{.Os}}",
+            ".Architecture",
+            ".Os",
             ".RootFS.Layers",
             ".Config.Env",
             ".Config.Entrypoint",
@@ -1500,3 +1623,467 @@ class TestTheTwoScriptsAskTheEnginesTheSameQuestion:
         # Nothing the engine says ABOUT the image rather than reads FROM it.
         for unwanted in ("{{.Id}}", "RepoDigests", "RepoTags", "{{.Created}}"):
             assert unwanted not in IDENTITY_FORMAT, unwanted
+
+    def test_every_field_goes_through_the_engines_json_encoder(self):
+        """Stage 4g: nothing is written into the document raw any more.
+
+        A field rendered raw is a field whose value can look like the end of
+        itself, which is the whole of the reviewer's second finding. So every
+        one of the twelve is inside a ``{{json ...}}``, and the document says
+        which version of itself it is.
+        """
+        assert IDENTITY_FORMAT.startswith("forge-image-identity/2\n")
+        assert IDENTITY_FORMAT.count("{{json ") == 12
+        for field in (
+            ".Architecture",
+            ".Os",
+            ".RootFS.Layers",
+            ".Config.Env",
+            ".Config.Entrypoint",
+            ".Config.Cmd",
+            ".Config.User",
+            ".Config.WorkingDir",
+            ".Config.Labels",
+            ".Config.ExposedPorts",
+            ".Config.Volumes",
+            ".Config.StopSignal",
+        ):
+            assert "{{json %s}}" % field in IDENTITY_FORMAT, field
+        # And the body is ONE line, so a transport's line endings are the only
+        # carriage returns that can be in it.
+        assert len(IDENTITY_FORMAT.splitlines()) == 2
+
+
+class TestTheNameIsTurnedIntoAnImageOnceAndThenNotUsed:
+    """The stage 4f reviewer's first finding, 25 September 2026.
+
+    Stage 4f started and repaired the containers from the id, which cannot be
+    moved — but read the id by the tag, then read the identity BY THE TAG
+    AGAIN, and then both release labels by the tag again after that. Move the
+    tag in any of those gaps and every check passes on one image while another
+    is the one that runs. The reviewer moved it in the first gap and watched
+    both containers, and a later repair, come up from the unreviewed image.
+
+    So: the name is resolved once, and every question and every start after it
+    is about that image by its id. Each test below moves the tag in one of the
+    gaps, and each one ends the way the reviewer asked — the expected image
+    running, or a refusal before anything ran.
+    """
+
+    def _two_images(self, sandbox, tag_names, moves_to, when, **how):
+        engine = an_engine(
+            images={
+                "the-reviewed-release": an_image(),
+                "the-unreviewed-image": an_image(
+                    id_classic=ANOTHER_IMAGE_ID,
+                    id_containerd=ANOTHER_IMAGE_ID,
+                    env=["A_SETTING_BAKED_INTO_THE_IMAGE=never-reviewed"],
+                ),
+            },
+            tags={IMAGE: tag_names},
+            move_tag_to=moves_to,
+            move_tag_when=when,
+            **how,
+        )
+        _write_the_engine(sandbox, engine)
+        return engine
+
+    @staticmethod
+    def _the_reviewed_identity(sandbox):
+        """What the machine outside recorded, off the reviewed image alone."""
+        apart = an_engine(
+            images={"the-reviewed-release": an_image()},
+            tags={IMAGE: "the-reviewed-release"},
+            move_tag_to=None,
+        )
+        return _the_identity_the_other_engine_recorded(sandbox, apart)
+
+    def test_the_tag_moves_between_the_id_and_the_identity_and_it_refuses(
+        self, sandbox
+    ):
+        """The reviewer's own drive, as the refusal it must now be.
+
+        The tag names the unreviewed image when the id is read, and the
+        reviewed one by the time the identity is asked for. Stage 4f passed
+        every check on the reviewed image and started the unreviewed one.
+        """
+        recorded = self._the_reviewed_identity(sandbox)
+        self._two_images(
+            sandbox,
+            tag_names="the-unreviewed-image",
+            moves_to="the-reviewed-release",
+            when="after-the-id",
+        )
+
+        result = _run(sandbox, FORGE_IMAGE_IDENTITY=recorded)
+
+        assert result.returncode == 2, result.stdout
+        assert recorded in result.stdout
+        assert ANOTHER_IMAGE_ID in result.stdout
+        assert not _what_was_started(sandbox)
+        # And the identity was asked of the id, not of the name.
+        asked = _what_was_inspected(sandbox)
+        assert [one["question"] for one in asked][:2] == [
+            "the-id",
+            "the-identity-document",
+        ]
+        assert asked[1]["reference"] == ANOTHER_IMAGE_ID
+
+    def test_the_tag_moves_between_the_id_and_the_identity_and_the_right_one_runs(
+        self, sandbox
+    ):
+        """The same gap, the other way round: the expected image runs.
+
+        The tag names the reviewed image when the id is read and the
+        unreviewed one a moment later. Nothing may notice, because nothing
+        asks the name again.
+        """
+        recorded = self._the_reviewed_identity(sandbox)
+        self._two_images(
+            sandbox,
+            tag_names="the-reviewed-release",
+            moves_to="the-unreviewed-image",
+            when="after-the-id",
+        )
+
+        process = subprocess.Popen(
+            ["bash", str(sandbox["script"])],
+            env=_settings(
+                sandbox,
+                FORGE_IMAGE_IDENTITY=recorded,
+                FORGE_RELEASE_VERSION=VERSION,
+                FORGE_RELEASE_MANIFEST_SHA256=MANIFEST,
+            ),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        try:
+            for _ in range(100):
+                if len(_what_was_started(sandbox)) >= 2:
+                    break
+                time.sleep(0.1)
+            started = _what_was_started(sandbox)
+        finally:
+            process.terminate()
+            process.wait(timeout=30)
+
+        assert len(started) == 2, started
+        for one in started:
+            assert one["reference"] == ENGINE_ID
+            assert one["resolved"] == ENGINE_ID
+        # Every question after the first one was about the id.
+        asked = _what_was_inspected(sandbox)
+        assert asked[0] == {"question": "the-id", "reference": IMAGE}
+        assert all(one["reference"] == ENGINE_ID for one in asked[1:]), asked
+        assert len(asked) == 4, asked
+
+    def test_the_tag_moves_between_the_identity_and_the_label_checks(
+        self, sandbox
+    ):
+        """The gap stage 4f left open behind the one the reviewer drove.
+
+        The replacement carries different release labels, so a label check
+        that asked the name again would refuse a perfectly good image — or,
+        with the labels the other way round, wave a bad one through.
+        """
+        engine = an_engine(
+            images={
+                "the-reviewed-release": an_image(),
+                "the-unreviewed-image": an_image(
+                    id_classic=ANOTHER_IMAGE_ID,
+                    id_containerd=ANOTHER_IMAGE_ID,
+                    labels={
+                        "com.guardkit.release.version": "a-release-nobody-asked-for",
+                        "com.guardkit.release.manifest.sha256": "8" * 64,
+                    },
+                ),
+            },
+            tags={IMAGE: "the-reviewed-release"},
+            move_tag_to="the-unreviewed-image",
+            move_tag_when="after-the-identity-document",
+        )
+        _write_the_engine(sandbox, engine)
+
+        result = _run(
+            sandbox,
+            FORGE_IMAGE_IDENTITY=self._the_reviewed_identity(sandbox),
+            FORGE_RELEASE_VERSION=VERSION,
+            FORGE_RELEASE_MANIFEST_SHA256=MANIFEST,
+            SANDBOX_RUNNER_BOOTSTRAP_ONLY="1",
+        )
+
+        assert result.returncode == 0, result.stdout
+        assert "a-release-nobody-asked-for" not in result.stdout
+        asked = _what_was_inspected(sandbox)
+        assert [one["question"] for one in asked] == [
+            "the-id",
+            "the-identity-document",
+            "the-release-version-label",
+            "the-manifest-label",
+        ]
+        assert all(one["reference"] == ENGINE_ID for one in asked[1:]), asked
+
+    def test_the_tag_moves_before_a_repair(self, sandbox):
+        """A supervisor's repair is a start, and starts are from the id.
+
+        Everything is checked and both containers are up; only then does the
+        tag move. The helper is then taken out from under the supervisor, and
+        what it makes in its place must be the image that was checked.
+        """
+        recorded = self._the_reviewed_identity(sandbox)
+        self._two_images(
+            sandbox,
+            tag_names="the-reviewed-release",
+            moves_to="the-unreviewed-image",
+            when="when-the-test-says-so",
+        )
+
+        process = subprocess.Popen(
+            ["bash", str(sandbox["script"])],
+            env=_settings(
+                sandbox,
+                FORGE_IMAGE_IDENTITY=recorded,
+                SANDBOX_RUNNER_RESTART_SECONDS="0.2",
+            ),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        try:
+            for _ in range(100):
+                if len(_what_was_started(sandbox)) >= 2:
+                    break
+                time.sleep(0.1)
+            assert len(_what_was_started(sandbox)) == 2
+            # The tag moves now: after every check, before the repair.
+            (sandbox["state"] / THE_TAG_HAS_MOVED).write_text("moved\n")
+            (sandbox["state"] / "forge-sandbox-helper").unlink(missing_ok=True)
+            (sandbox["state"] / "forge-sandbox-helper.running").unlink(
+                missing_ok=True
+            )
+            for _ in range(100):
+                if len(_what_was_started(sandbox)) >= 3:
+                    break
+                time.sleep(0.1)
+            started = _what_was_started(sandbox)
+        finally:
+            process.terminate()
+            process.wait(timeout=30)
+
+        assert len(started) == 3, started
+        assert started[2]["container"] == "forge-sandbox-helper"
+        for one in started:
+            assert one["reference"] == ENGINE_ID, one
+            assert one["resolved"] == ENGINE_ID, one
+
+    def test_an_id_the_engine_no_longer_holds_is_refused_by_its_id(
+        self, sandbox
+    ):
+        """No second look at the name — and the refusal says which image.
+
+        A containerd store lets an image go when the last name leaves it, so
+        the id the bootstrap resolved can be nothing at all a moment later.
+        Asking the name again would hand back the replacement, which is the
+        one thing this must never do.
+        """
+        recorded = self._the_reviewed_identity(sandbox)
+        self._two_images(
+            sandbox,
+            tag_names="the-reviewed-release",
+            moves_to="the-unreviewed-image",
+            when="after-the-id",
+            and_it_forgets_what_no_name_points_at=True,
+        )
+
+        result = _run(sandbox, FORGE_IMAGE_IDENTITY=recorded)
+
+        assert result.returncode == 2, result.stdout
+        assert ENGINE_ID in result.stdout
+        assert "No such image" in result.stdout
+        assert "not asked again" in result.stdout
+        assert not _what_was_started(sandbox)
+        # It asked about the id, and it did not go back to the name.
+        asked = _what_was_inspected(sandbox)
+        assert [one["reference"] for one in asked] == [IMAGE, ENGINE_ID]
+
+
+class TestTwoDifferentConfigurationsAreTwoDifferentIdentities:
+    """The stage 4f reviewer's second finding, 25 September 2026.
+
+    Version 1 of the identity document wrote each value out raw, one per line.
+    So a value with a newline in it read as two values, and two values read as
+    one value with a newline in it, and the two hashed the same. The reviewer
+    built both images and watched the second accepted as the first.
+
+    Every test here is the same shape: the machine outside records the
+    identity of the image it reviewed, this sandbox holds an image whose
+    configuration differs ONLY in where the boundaries are, and the bootstrap
+    has to refuse it and start nothing.
+    """
+
+    def _recorded_elsewhere(self, sandbox, reviewed):
+        apart = an_engine(
+            images={"the-reviewed-release": reviewed},
+            tags={IMAGE: "the-reviewed-release"},
+            move_tag_to=None,
+        )
+        return _the_identity_the_other_engine_recorded(sandbox, apart)
+
+    def _it_refuses(self, sandbox, reviewed, changed):
+        recorded = self._recorded_elsewhere(sandbox, reviewed)
+        _write_the_engine(
+            sandbox,
+            an_engine(
+                images={"the-image-in-the-sandbox": changed},
+                tags={IMAGE: "the-image-in-the-sandbox"},
+                move_tag_to=None,
+            ),
+        )
+        result = _run(sandbox, FORGE_IMAGE_IDENTITY=recorded)
+        assert result.returncode == 2, result.stdout
+        assert recorded in result.stdout
+        assert not _what_was_started(sandbox)
+        return result
+
+    def test_the_reviewers_own_pair_of_environments(self, sandbox):
+        """One variable with a newline in it, or two variables. Not the same.
+
+        These are the reviewer's exact two arrays. Under version 1 both came
+        out as the two lines `env MODE=reviewed` and `env FEATURE=off`.
+        """
+        reviewed = an_image(env=["MODE=reviewed\nenv FEATURE=off"])
+        changed = an_image(env=["MODE=reviewed", "FEATURE=off"])
+        self._it_refuses(sandbox, reviewed, changed)
+
+    def test_the_reviewers_own_pair_renders_two_different_documents(
+        self, sandbox
+    ):
+        """And the documents themselves differ, which is the actual fix.
+
+        A refusal could come from anywhere; this looks at the two documents.
+        """
+        reviewed = an_image(env=["MODE=reviewed\nenv FEATURE=off"])
+        changed = an_image(
+            id_classic=ANOTHER_IMAGE_ID,
+            id_containerd=ANOTHER_IMAGE_ID,
+            env=["MODE=reviewed", "FEATURE=off"],
+        )
+        _write_the_engine(
+            sandbox,
+            an_engine(
+                images={"one": reviewed, "other": changed},
+                tags={IMAGE: "one"},
+                move_tag_to=None,
+            ),
+        )
+        one = _the_document_the_engine_renders(sandbox, ENGINE_ID)
+        other = _the_document_the_engine_renders(sandbox, ANOTHER_IMAGE_ID)
+        assert one != other
+        # The newline is written down as an escape rather than acted on, so
+        # both documents are the same two lines long.
+        assert len(one.splitlines()) == 2 and len(other.splitlines()) == 2
+        assert "MODE=reviewed\\nenv FEATURE=off" in one
+        assert '["MODE=reviewed","FEATURE=off"]' in other
+
+    def test_a_carriage_return_inside_a_value(self, sandbox):
+        """Version 1 deleted these outright, on both sides, before hashing."""
+        reviewed = an_image(env=["A_SETTING_BAKED_INTO_THE_IMAGE=as\rreviewed"])
+        changed = an_image(env=["A_SETTING_BAKED_INTO_THE_IMAGE=asreviewed"])
+        self._it_refuses(sandbox, reviewed, changed)
+
+    def test_a_carriage_return_survives_the_trip_when_nothing_changed(
+        self, sandbox
+    ):
+        """And it is not lost on the way: the same image still passes.
+
+        Taking the carriage returns out of a value was the other half of the
+        finding. An image whose configuration really does hold one has to
+        cross from one engine to the other and still be itself.
+        """
+        with_one = an_image(env=["A_SETTING_BAKED_INTO_THE_IMAGE=as\rreviewed"])
+        engine = an_engine(
+            images={"the-reviewed-release": with_one},
+            tags={IMAGE: "the-reviewed-release"},
+            move_tag_to=None,
+        )
+        _write_the_engine(sandbox, engine)
+        recorded = _the_identity_the_other_engine_recorded(sandbox, engine)
+
+        result = _run(
+            sandbox,
+            FORGE_IMAGE_IDENTITY=recorded,
+            SANDBOX_RUNNER_BOOTSTRAP_ONLY="1",
+        )
+
+        assert result.returncode == 0, result.stdout
+        assert recorded in result.stdout
+
+    def test_a_label_whose_value_runs_over_a_line(self, sandbox):
+        """One label with a newline in it, or two labels."""
+        reviewed = an_image(
+            labels={
+                "com.guardkit.release.version": VERSION,
+                "com.guardkit.release.manifest.sha256": MANIFEST,
+                "a.note": "one\nlabel a.other=two",
+            }
+        )
+        changed = an_image(
+            labels={
+                "com.guardkit.release.version": VERSION,
+                "com.guardkit.release.manifest.sha256": MANIFEST,
+                "a.note": "one",
+                "a.other": "two",
+            }
+        )
+        self._it_refuses(sandbox, reviewed, changed)
+
+    def test_an_argument_that_runs_over_a_line(self, sandbox):
+        """One argument with a newline in it, or two arguments.
+
+        The command is what the container actually does, so this is the pair
+        that matters most: `sh -c "a; b"` as one word or as two.
+        """
+        reviewed = an_image(cmd=["the-command-it-was-reviewed-with\ncmd --and-more"])
+        changed = an_image(cmd=["the-command-it-was-reviewed-with", "--and-more"])
+        self._it_refuses(sandbox, reviewed, changed)
+
+    def test_an_empty_list_and_a_list_with_an_empty_thing_in_it(self, sandbox):
+        """Array boundaries, at the edge: no arguments, or one empty one."""
+        reviewed = an_image(entrypoint=[])
+        changed = an_image(entrypoint=[""])
+        self._it_refuses(sandbox, reviewed, changed)
+
+    def test_nothing_at_all_and_an_empty_list_are_the_same_image(self, sandbox):
+        """The one thing that IS normalised, and why.
+
+        One engine answers `null` for an image with no entry point and the
+        other `[]`. That is the same image, and the `{{if}}` in the format
+        string is there to say so. Nothing else is normalised.
+        """
+        engine = an_engine(
+            images={"the-reviewed-release": an_image(entrypoint=[])},
+            tags={IMAGE: "the-reviewed-release"},
+            move_tag_to=None,
+        )
+        _write_the_engine(sandbox, engine)
+        recorded = _the_identity_the_other_engine_recorded(sandbox, engine)
+        assert "[]" in _the_document_the_engine_renders(sandbox)
+
+        result = _run(
+            sandbox,
+            FORGE_IMAGE_IDENTITY=recorded,
+            SANDBOX_RUNNER_BOOTSTRAP_ONLY="1",
+        )
+        assert result.returncode == 0, result.stdout
+
+    def test_the_unchanged_image_still_passes(self, sandbox):
+        """The case every one of these has to be told apart from."""
+        result = _run(
+            sandbox,
+            FORGE_RELEASE_VERSION=VERSION,
+            FORGE_RELEASE_MANIFEST_SHA256=MANIFEST,
+            SANDBOX_RUNNER_BOOTSTRAP_ONLY="1",
+        )
+        assert result.returncode == 0, result.stdout
+        assert sandbox["identity"] in result.stdout

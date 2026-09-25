@@ -42,17 +42,21 @@
 # WHAT IT DOES, IN ORDER:
 #   1. Reads its settings from the sandbox's own environment — names only; it
 #      never reads anyone's shell, home directory or settings file.
-#   2. CHECKS THE RELEASE IMAGE, AND THEN NEVER USES THE TAG AGAIN. It asks the
-#      sandbox's own engine what the named image IS — the platform it was built
-#      for, the filesystem it is made of and the runtime configuration it
-#      carries — hashes that one document, and refuses, by name, unless the
-#      hash is the one the machine that handed the image over recorded. Where
-#      the release version and the manifest hash are named too, their labels on
-#      the image must match as well. It then resolves the checked image to the
-#      id THIS engine holds it under and starts and repairs everything from
-#      that id: a tag is a name that can be moved onto another image after it
-#      was checked, an id cannot. A missing or different image is a refusal
-#      with a plain sentence, never a fetch of anything.
+#   2. TURNS THE TAG INTO AN IMAGE ONCE, AND NEVER USES THE TAG AGAIN. It asks
+#      the sandbox's own engine which image the name FORGE_IMAGE stands for,
+#      and from that moment on every question and every start is about THAT
+#      IMAGE, by the id this engine holds it under — the identity document,
+#      both release labels, both containers and every repair the supervisor
+#      makes later. It asks what that image IS — the platform it was built for,
+#      the filesystem it is made of and the runtime configuration it carries —
+#      hashes that one document, and refuses, by name, unless the hash is the
+#      one the machine that handed the image over recorded. Where the release
+#      version and the manifest hash are named too, their labels on the image
+#      must match as well. A tag is a name that can be moved onto another image
+#      between one question and the next; an id cannot, and an id this engine
+#      no longer holds is a refusal and never a second look at the name. A
+#      missing or different image is a refusal with a plain sentence, never a
+#      fetch of anything.
 #   3. MAKES THE FOLDERS THE TWO CONTAINERS SHARE, in the sandbox's own
 #      filesystem, and refuses by name if one cannot be made (see the table
 #      below).
@@ -205,11 +209,22 @@
 #   mostly its configuration.
 #
 #   So what is compared is ALL THREE, as one document. Each side asks its own
-#   engine for those fields, in one fixed order, one per line, strips carriage
-#   returns, and hashes the result:
+#   engine for those fields, in one fixed order, and hashes the result:
 #
 #       docker image inspect --format "<the document below>" <the image>
-#           | tr -d '\r' | sha256sum
+#           | sha256sum
+#
+#   AND THE FIELDS ARE WRITTEN DOWN UNAMBIGUOUSLY (25 September 2026, stage 4g,
+#   the stage 4f reviewer's second finding). The first version of the document
+#   wrote each value out raw, one per line, so a value with a newline in it read
+#   as two values and two values read as one value with a newline in it. The
+#   reviewer built an image whose single environment variable contained a
+#   newline, and an image with two ordinary variables, and both rendered the
+#   same two lines and hashed the same. Version 2 writes the fields as one line
+#   of JSON through the engine's own encoder: a newline inside a value comes out
+#   as the two characters \ and r or \ and n, an array keeps its brackets, and
+#   nothing in a value can any longer look like the end of it. The long note
+#   beside IMAGE_IDENTITY_DOCUMENT_FORMAT below says what that relies on.
 #
 #   WHY THAT IS PORTABLE. The two engines do not agree on what an image's "id"
 #   IS: this machine's engine keeps images the old way and reports the digest of
@@ -385,25 +400,62 @@ PID_FILE="${STATE_ROOT}/supervisor"
 
 # THE IDENTITY DOCUMENT: what this script asks the engine an image IS. The long
 # version is at the top of this file. Short version: the platform, the
-# filesystem's layer list and the whole of the runtime configuration, in one
-# fixed order, one per line — the image's own OCI configuration, which both
-# kinds of engine report identically, and none of it a name, a pointer or a
-# date. Hashed, it is what is compared with FORGE_IMAGE_IDENTITY. The map
-# fields (labels, ports, volumes) come out in key order, which is the one
-# ordering guarantee this rendering needs and the only one it relies on.
-IMAGE_IDENTITY_DOCUMENT_FORMAT='forge-image-identity/1
-architecture {{.Architecture}}
-os {{.Os}}
-{{range .RootFS.Layers}}layer {{.}}
-{{end}}{{range .Config.Env}}env {{.}}
-{{end}}{{range .Config.Entrypoint}}entrypoint {{.}}
-{{end}}{{range .Config.Cmd}}cmd {{.}}
-{{end}}user {{.Config.User}}
-workdir {{.Config.WorkingDir}}
-{{range $name, $value := .Config.Labels}}label {{$name}}={{$value}}
-{{end}}{{range $port, $ignored := .Config.ExposedPorts}}port {{$port}}
-{{end}}{{range $path, $ignored := .Config.Volumes}}volume {{$path}}
-{{end}}stopsignal {{.Config.StopSignal}}'
+# filesystem's layer list and the whole of the runtime configuration — the
+# image's own OCI configuration, which both kinds of engine report identically,
+# and none of it a name, a pointer or a date. Hashed, it is what is compared
+# with FORGE_IMAGE_IDENTITY.
+#
+# VERSION 2, AND WHY VERSION 1 HAD TO GO (stage 4g, 25 September 2026, the
+# stage 4f reviewer's second finding). Version 1 wrote each value out raw, one
+# per line, with nothing marking where a value ended and the next one began. So
+# these two environments — which are not the same environment —
+#
+#     ["MODE=reviewed\nenv FEATURE=off"]      one variable, with a newline in it
+#     ["MODE=reviewed", "FEATURE=off"]        two variables
+#
+# both came out as the two lines `env MODE=reviewed` and `env FEATURE=off`, and
+# hashed the same. The reviewer built both images and watched the second one
+# accepted as the first. That was an ambiguous way of writing the fields down,
+# not a broken hash.
+#
+# So the whole of the document below the header line is ONE LINE OF JSON, built
+# by the engine's own JSON encoder ({{json}}), which escapes every newline,
+# carriage return and tab inside a value and keeps the brackets round an array.
+# A value can no longer look like the end of itself. What this relies on, and
+# nothing else: that encoder writes a map's keys in key order (so the labels,
+# the ports and the volumes come out in a fixed order), and it writes control
+# characters as escapes (so the rendered document holds no literal control
+# character of its own except the one newline after the header line — which is
+# what makes stripping the carriage returns a transport adds safe, and it is
+# only ever the ones at the ends of lines that are stripped).
+#
+# The `{{if}}` round each list and map is there because the two engines differ
+# on nothing-at-all: one answers `null` for an image with no entry point and
+# the other `[]`, and those are the same image. Empty is written `[]` and `{}`
+# either way. Nothing else is normalised: string contents cross exactly as the
+# image holds them.
+IMAGE_IDENTITY_DOCUMENT_FORMAT='forge-image-identity/2
+{"architecture":{{json .Architecture}},"os":{{json .Os}},"layers":{{if .RootFS.Layers}}{{json .RootFS.Layers}}{{else}}[]{{end}},"env":{{if .Config.Env}}{{json .Config.Env}}{{else}}[]{{end}},"entrypoint":{{if .Config.Entrypoint}}{{json .Config.Entrypoint}}{{else}}[]{{end}},"cmd":{{if .Config.Cmd}}{{json .Config.Cmd}}{{else}}[]{{end}},"user":{{json .Config.User}},"workdir":{{json .Config.WorkingDir}},"labels":{{if .Config.Labels}}{{json .Config.Labels}}{{else}}{}{{end}},"ports":{{if .Config.ExposedPorts}}{{json .Config.ExposedPorts}}{{else}}{}{{end}},"volumes":{{if .Config.Volumes}}{{json .Config.Volumes}}{{else}}{}{{end}},"stopsignal":{{json .Config.StopSignal}}}'
+
+#: The first line of a whole identity document, and the only part of it that is
+#: fixed text. Both this script and the script that hands the image in refuse
+#: an answer that does not begin with it: a hash of half a document compares
+#: perfectly well against another hash of half a document.
+IDENTITY_DOCUMENT_HEADER='forge-image-identity/2'
+
+# CARRIAGE RETURNS ARE LINE ENDINGS HERE, NEVER PART OF A VALUE (stage 4g).
+# An answer that came through a sandbox client can arrive with CRLF line
+# endings. Version 1 deleted every carriage return in the answer, which also
+# deleted real ones out of the middle of configuration values — the reviewer's
+# point. In version 2 a real carriage return inside a value is written by the
+# JSON encoder as the two characters \ and r, so the only carriage returns that
+# can be in the rendered document are the ones transport put at the ends of
+# lines. Those, and only those, are what this takes out.
+only_the_line_endings() {
+  local text="$1"
+  text="${text//$'\r'$'\n'/$'\n'}"
+  printf '%s' "${text%$'\r'}"
+}
 
 # THE BUILD RUNNER'S GRAPH DECLARATION, and why it is written here. The runner
 # is `langgraph dev`, and that wants a config FILE naming the graph to serve.
@@ -692,6 +744,27 @@ refuse() {
   exit 2
 }
 
+# ONE QUESTION TO THE ENGINE ABOUT ONE IMAGE, with the three answers kept apart
+# the way they are for the containers above: what it said, why it would not say
+# it, and whether it answered at all. An engine that will not answer is NOT an
+# image with an empty field, and telling the two apart is the difference between
+# refusing and taking a hash of nothing. The answer and the complaint go to
+# separate places on purpose, so a refusal can quote the engine's own words
+# without any of them ever reaching the document that gets hashed.
+WHAT_THE_ENGINE_SAID=""
+ask_the_engine_about_the_image() {
+  local reference="$1" format="$2" complaint="${STATE_ROOT}/what-the-engine-said"
+  WHAT_THE_ENGINE_SAID=""
+  WHY_THE_ENGINE_WOULD_NOT_SAY=""
+  if ! WHAT_THE_ENGINE_SAID="$("${DOCKER}" image inspect --format "${format}" "${reference}" 2>"${complaint}")"; then
+    WHY_THE_ENGINE_WOULD_NOT_SAY="$(tr '\n' ' ' < "${complaint}" 2>/dev/null || true)"
+    rm -f "${complaint}"
+    return 1
+  fi
+  rm -f "${complaint}"
+  return 0
+}
+
 if [[ -z "${IMAGE}" ]]; then
   refuse "FORGE_IMAGE is not set. This sandbox runs the factory from the release image and from nothing else, and it has not been told which image that is. There is no source fallback on purpose: a clone at the pinned commit is not the tested image. Refusing to start."
 fi
@@ -705,23 +778,42 @@ if ! command -v "${DOCKER}" >/dev/null 2>&1; then
   refuse "there is no Docker client at '${DOCKER}' in this sandbox. The factory's two services run as containers in the sandbox's OWN engine; without a client there is nothing to run them with. Refusing to start."
 fi
 
-image_field() {
-  "${DOCKER}" image inspect --format "$1" "${IMAGE}" 2>/dev/null
-}
-
-ENGINE_IMAGE_ID="$(image_field '{{.Id}}' || true)"
-if [[ -z "${ENGINE_IMAGE_ID}" ]]; then
-  refuse "the release image ${IMAGE} is not in this sandbox's own engine. Hand it in first (save it on the machine that has it and load it in here, or pull it at its pinned digest where this sandbox can pull) — forge/deploy/estate/hand-release-image-to-sandbox.sh does that and checks it. Nothing is fetched from here. Refusing to start."
+# THE NAME IS TURNED INTO AN IMAGE ONCE, AND THEN NEVER USED AGAIN (stage 4g,
+# 25 September 2026, the stage 4f reviewer's first finding). Stage 4f started
+# and repaired the containers from the id — an immutable reference — but asked
+# the engine for the identity document, and for both release labels, BY THE TAG
+# again, after it had read the id. Move the tag in the gap between those two
+# questions and every check passes on the reviewed image while both containers,
+# and every repair afterwards, run the unreviewed one: immutable references,
+# the wrong ones. The reviewer did exactly that and watched it happen.
+#
+# So the tag is resolved here, once. Everything below — the identity document,
+# both release labels, both starts and every repair — asks about THAT IMAGE, by
+# the id this engine holds it under. Nothing asks about the name again, and if
+# this engine stops holding that id (a containerd store lets an image go when
+# the last name leaves it) this refuses and says so: there is no falling back
+# to the name, because by then the name is a name for something else.
+ENGINE_IMAGE_ID=""
+if ask_the_engine_about_the_image "${IMAGE}" '{{.Id}}'; then
+  ENGINE_IMAGE_ID="$(only_the_line_endings "${WHAT_THE_ENGINE_SAID}")"
 fi
+if [[ -z "${ENGINE_IMAGE_ID}" ]]; then
+  refuse "the release image ${IMAGE} is not in this sandbox's own engine${WHY_THE_ENGINE_WOULD_NOT_SAY:+ — this engine said: ${WHY_THE_ENGINE_WOULD_NOT_SAY}}. Hand it in first (save it on the machine that has it and load it in here, or pull it at its pinned digest where this sandbox can pull) — forge/deploy/estate/hand-release-image-to-sandbox.sh does that and checks it. Nothing is fetched from here. Refusing to start."
+fi
+IMAGE_REFERENCE="${ENGINE_IMAGE_ID}"
 
 # THE IDENTITY, BUILT HERE AND COMPARED. The document is the engine's own
-# answer with carriage returns taken out and exactly one newline at the end, on
-# both sides, so the two hashes are of the same bytes however the answer
-# travelled. An empty answer is refused rather than hashed: the hash of nothing
-# is a perfectly good-looking hash.
-IDENTITY_DOCUMENT="$(image_field "${IMAGE_IDENTITY_DOCUMENT_FORMAT}" | tr -d '\r' || true)"
+# answer about THAT IMAGE, with the carriage returns a transport put at the
+# ends of lines taken out and exactly one newline at the end, on both sides, so
+# the two hashes are of the same bytes however the answer travelled. An empty
+# answer is refused rather than hashed: the hash of nothing is a perfectly
+# good-looking hash.
+if ! ask_the_engine_about_the_image "${IMAGE_REFERENCE}" "${IMAGE_IDENTITY_DOCUMENT_FORMAT}"; then
+  refuse "this sandbox's own engine will not say what the image it holds as ${IMAGE_REFERENCE} — which is what the name ${IMAGE} meant a moment ago — is made of and how it is configured${WHY_THE_ENGINE_WOULD_NOT_SAY:+: ${WHY_THE_ENGINE_WOULD_NOT_SAY}}. The name is not asked again on purpose: a name can have been moved onto another image since, and an image this engine has let go is not one to run the factory from. Refusing to start."
+fi
+IDENTITY_DOCUMENT="$(only_the_line_endings "${WHAT_THE_ENGINE_SAID}")"
 if [[ -z "${IDENTITY_DOCUMENT}" ]]; then
-  refuse "this sandbox's own engine would not say what the image ${IMAGE} is made of and how it is configured, so there is nothing to check against the identity the machine recorded. Refusing to start."
+  refuse "this sandbox's own engine would not say what the image it holds as ${IMAGE_REFERENCE} (the name ${IMAGE} meant it) is made of and how it is configured, so there is nothing to check against the identity the machine recorded. Refusing to start."
 fi
 # AND IT HAS TO BE THE WHOLE DOCUMENT. The first line of the document is a
 # fixed word, so an answer that does not begin with it is not an identity
@@ -731,35 +823,41 @@ fi
 # against another hash of half the truth (found on 24 September 2026, hashing
 # the stage 4d reviewer's own stand-in engine, which answers with the layer
 # list alone).
-if [[ "${IDENTITY_DOCUMENT%%$'\n'*}" != "forge-image-identity/1" ]]; then
-  refuse "this sandbox's own engine did not answer with an identity document for ${IMAGE}: what came back does not begin with the line an identity document begins with, so it is not the whole of what was asked for and nothing can be concluded by hashing it. Refusing to start."
+if [[ "${IDENTITY_DOCUMENT%%$'\n'*}" != "${IDENTITY_DOCUMENT_HEADER}" ]]; then
+  refuse "this sandbox's own engine did not answer with an identity document for the image it holds as ${IMAGE_REFERENCE}: what came back does not begin with the line an identity document begins with, so it is not the whole of what was asked for and nothing can be concluded by hashing it. Refusing to start."
 fi
 ACTUAL_IDENTITY="$(printf '%s\n' "${IDENTITY_DOCUMENT}" | sha256sum | cut -d' ' -f1)"
 if [[ "${ACTUAL_IDENTITY}" != "${EXPECTED_IDENTITY}" ]]; then
-  refuse "the image called ${IMAGE} in this sandbox is not the one the machine handed over. It expected an image whose platform, layers and runtime configuration hash to ${EXPECTED_IDENTITY}, and this engine holds one that hashes to ${ACTUAL_IDENTITY}. That covers the environment, the entry point, the command, the user, the working directory, the labels, the ports and the volumes as well as the filesystem, so the same layers under a changed configuration land here too — and rightly: it would not be the image that was tested. Hand the release image in again. Refusing to start."
+  refuse "the image called ${IMAGE} in this sandbox is not the one the machine handed over. It expected an image whose platform, layers and runtime configuration hash to ${EXPECTED_IDENTITY}, and this engine holds one (as ${IMAGE_REFERENCE}) that hashes to ${ACTUAL_IDENTITY}. That covers the environment, the entry point, the command, the user, the working directory, the labels, the ports and the volumes as well as the filesystem, so the same layers under a changed configuration land here too — and rightly: it would not be the image that was tested. Hand the release image in again. Refusing to start."
 fi
 
 if [[ -n "${EXPECTED_VERSION}" ]]; then
-  ACTUAL_VERSION="$(image_field '{{index .Config.Labels "com.guardkit.release.version"}}' || true)"
+  if ! ask_the_engine_about_the_image "${IMAGE_REFERENCE}" '{{index .Config.Labels "com.guardkit.release.version"}}'; then
+    refuse "this sandbox's own engine will not say what release the image it holds as ${IMAGE_REFERENCE} — the image whose identity was just checked — says it is${WHY_THE_ENGINE_WOULD_NOT_SAY:+: ${WHY_THE_ENGINE_WOULD_NOT_SAY}}. The name ${IMAGE} is not asked again; a name can have been moved since the check. Refusing to start."
+  fi
+  ACTUAL_VERSION="$(only_the_line_endings "${WHAT_THE_ENGINE_SAID}")"
   if [[ "${ACTUAL_VERSION}" != "${EXPECTED_VERSION}" ]]; then
     refuse "the image ${IMAGE} says it is release '${ACTUAL_VERSION:-nothing at all}' and this sandbox was told to expect '${EXPECTED_VERSION}'. Refusing to start."
   fi
 fi
 if [[ -n "${EXPECTED_MANIFEST}" ]]; then
-  ACTUAL_MANIFEST="$(image_field '{{index .Config.Labels "com.guardkit.release.manifest.sha256"}}' || true)"
+  if ! ask_the_engine_about_the_image "${IMAGE_REFERENCE}" '{{index .Config.Labels "com.guardkit.release.manifest.sha256"}}'; then
+    refuse "this sandbox's own engine will not say what manifest the image it holds as ${IMAGE_REFERENCE} — the image whose identity was just checked — was built from${WHY_THE_ENGINE_WOULD_NOT_SAY:+: ${WHY_THE_ENGINE_WOULD_NOT_SAY}}. The name ${IMAGE} is not asked again; a name can have been moved since the check. Refusing to start."
+  fi
+  ACTUAL_MANIFEST="$(only_the_line_endings "${WHAT_THE_ENGINE_SAID}")"
   if [[ "${ACTUAL_MANIFEST}" != "${EXPECTED_MANIFEST}" ]]; then
     refuse "the image ${IMAGE} was built from a manifest with hash '${ACTUAL_MANIFEST:-none recorded}' and this sandbox was told to expect '${EXPECTED_MANIFEST}'. Refusing to start."
   fi
 fi
 
-# FROM HERE ON, THE TAG IS NOT USED (stage 4f). Everything below starts and
-# repairs containers from the id this engine holds the CHECKED image under. A
-# tag is a name, and a name can be moved onto another image a moment after it
-# was inspected — the stage 4d reviewer moved one and watched both containers
-# start from the replacement. An id is the image itself: whatever happens to
-# the tag afterwards, this is the image that was checked, for the first start
-# and for every repair the supervisor makes later.
-IMAGE_REFERENCE="${ENGINE_IMAGE_ID}"
+# FROM HERE ON, THE TAG IS NOT USED (stage 4f, and from the first question
+# about the image in stage 4g). Everything below starts and repairs containers
+# from the id this engine holds the CHECKED image under. A tag is a name, and a
+# name can be moved onto another image a moment after it was inspected — the
+# stage 4d reviewer moved one and watched both containers start from the
+# replacement. An id is the image itself: whatever happens to the tag
+# afterwards, this is the image that was checked, for the first start and for
+# every repair the supervisor makes later.
 log "release image ${IMAGE} checked: identity ${ACTUAL_IDENTITY} (its platform, its layers and its runtime configuration), and this engine holds it as ${ENGINE_IMAGE_ID}${EXPECTED_VERSION:+, release ${EXPECTED_VERSION}}"
 log "everything below is started from ${IMAGE_REFERENCE}, not from the tag ${IMAGE}: a tag can be moved onto another image after it has been checked"
 log "repo_root=${REPO_ROOT} helper=${HELPER_NAME}:${SIDECAR_PORT} runner=${RUNNER_NAME}:${RUNNER_PORT}"
