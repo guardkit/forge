@@ -296,7 +296,7 @@ services:
   # same guard the bus got on 24 September 2026.
   # -------------------------------------------------------------------------
   memory:
-    image: ${FLEET_MEMORY_MCP_IMAGE:?name the memory service's image in the env file, e.g. FLEET_MEMORY_MCP_IMAGE=fleet-memory-mcp:2026.09.25-2 - built by ../../scripts/build-release-image.sh with the rest of the release}
+    image: ${FLEET_MEMORY_MCP_IMAGE:?name the memory service's image in the env file, e.g. FLEET_MEMORY_MCP_IMAGE=fleet-memory-mcp:2026.09.25-3 - built by ../../scripts/build-release-image.sh with the rest of the release}
     restart: unless-stopped
     # Every '$$' below is a dollar sign for the SHELL, escaped so that compose
     # leaves it alone. The last item is the shell's $0; the command below
@@ -392,7 +392,7 @@ services:
   # for the relay's own process.
   # -------------------------------------------------------------------------
   memory-relay:
-    image: ${FLEET_MEMORY_RELAY_IMAGE:?name the memory relay's image in the env file, e.g. FLEET_MEMORY_RELAY_IMAGE=fleet-memory-relay:2026.09.25-2 - built by ../../scripts/build-release-image.sh with the rest of the release}
+    image: ${FLEET_MEMORY_RELAY_IMAGE:?name the memory relay's image in the env file, e.g. FLEET_MEMORY_RELAY_IMAGE=fleet-memory-relay:2026.09.25-3 - built by ../../scripts/build-release-image.sh with the rest of the release}
     restart: unless-stopped
     depends_on:
       # The relay BINDS the MEMORY stream rather than creating it, so the bus
