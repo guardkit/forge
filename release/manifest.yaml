@@ -111,6 +111,45 @@ schema: 2
 # explain in any registry, because 4 never reached one — the same reasoning that
 # left 2026.09.24-6 unused above.
 #
+# 2026.09.25-6 (25 September 2026, stage 4c after its second review). TWO REAL
+# CHANGES, one in each repository, and between them they are the difference
+# between a release that cannot honestly be cut and one that can.
+#
+#   * THE HOST NAME IS OUT OF THE JARVIS SOURCE. That package hard-coded a real
+#     machine's name as the DEFAULT model-seat address, so anyone who ran it
+#     with the setting unset was pointed at somebody else's machine without
+#     being told, and the name rode into every image built from a repository
+#     that is public. There is no default now and no neutral stand-in either:
+#     an unset JARVIS_LLAMA_SWAP_BASE_URL is refused BY NAME at the point the
+#     address is needed. Nothing about how the estate runs it changes — the
+#     estate has always supplied that address and refused to start without it;
+#   * THE JARVIS IMAGE STOPS SHIPPING ANOTHER REPOSITORY'S CHECKOUT. Its
+#     Dockerfile copied the whole nats-core clone into /tmp and deleted it four
+#     lines later. A deleted file is gone from what a container sees and still
+#     in what a push sends, and at the nats-core pin below that clone carries
+#     an account name in 127 tracked files. The Dockerfile has two stages now:
+#     the copy happens in a builder that nothing ships, and only the installed
+#     virtual environment crosses into the image;
+#   * AND THE SWEEP WAS READING THE WRONG COPY. It exported each image — the
+#     flattened final filesystem — so it would have called that image clean
+#     while its layers carried this machine's account name in 2,194 files. It
+#     reads every layer a push would send as well now, refuses on a hit naming
+#     the image, the file, the layer and the word, and removes the tags the
+#     refused run wrote. Two smaller things travel with it: the estate's
+#     .env.example no longer reads as though filling it in arms the sweep, and
+#     the two proof scripts say what they do not cover.
+#
+# THE ONE EXCEPTION THIS RELEASE NEEDS is at the bottom of this file, under
+# `sweep_exceptions:`. guardkit's feature-plan.md carries this estate's host
+# names as the PATTERNS its live-infrastructure detector looks FOR, and taking
+# them out would switch a check off rather than make anything portable.
+#
+# 2026.09.25-5 WAS NEVER BUILT EITHER — both of its pins were local, so the
+# script refused at the fetch and no image or tag of it exists anywhere. Both
+# pins move here, so rather than let one release number mean two sets of
+# commits this is 6, which is the reasoning that left 4 and 2026.09.24-6
+# unused above. There is no gap to explain in any registry.
+#
 # NEITHER THE JARVIS PIN NOR THE FORGE PIN IS ON GITHUB YET, and this line is
 # written knowing it. Both commits below are local to the machine this was made
 # on, so a release build from this manifest STOPS AT THE FETCH and says so —
@@ -123,7 +162,7 @@ schema: 2
 # built. What was proved instead is written up in the stage 4c evidence: the
 # same Dockerfiles, built to throwaway tags from local clones, running the
 # estate's two services.
-version: 2026.09.25-5
+version: 2026.09.25-6
 
 # The one image this repository's own operator scripts mean by "the release
 # image" (ops/forge-prod-recreate.sh reads this line). It is the same name as
@@ -222,7 +261,7 @@ repositories:
   - name: forge
     url: https://github.com/guardkit/forge.git
     branch: main
-    commit: 1803f7945e4d33f130233db09590d952017f0124
+    commit: d0bfae5c43cf219e7ea8fb8b0771dd2dfe4ef088
     role: build-context-root
   - name: guardkit
     url: https://github.com/guardkit/guardkit.git
@@ -256,5 +295,39 @@ repositories:
   - name: jarvis
     url: https://github.com/guardkit/jarvis.git
     branch: main
-    commit: 06901676623a3e8ce9cc98cc34e76437ab72fd9f
+    commit: 2a4e254ae5f52d3ee0cc6f792c0bd7283a7cdcd0
     role: named-context
+
+# ---------------------------------------------------------------------------
+# THE FILES A SWEEP HIT IS ALLOWED IN — BY PATH, NEVER BY WORD
+#
+# Added 25 September 2026 with the release sweep. After each image is built,
+# scripts/build-release-image.sh searches its whole filesystem, EVERY LAYER a
+# push would send, its configuration, its labels and its history for the words
+# the MACHINE gives it in RELEASE_SWEEP_TERMS, and refuses the release on a hit.
+#
+# A file may legitimately carry one of those words. The only way to say so is
+# to name THE FILE, because "allow this word" would write a real machine's name
+# back into this tracked, public file — which is the defect the sweep exists to
+# stop. The path is matched as the END of the file's path inside the image, so
+# it can be written the way a person reads it, without anybody having to know
+# which site-packages directory a base image happens to use.
+#
+# Each entry needs an image, a path and a reason; the build refuses one that is
+# missing any of them, or that names an image this release does not build.
+sweep_exceptions:
+  # GuardKit's feature-plan command carries this estate's machine names as the
+  # PATTERNS its live-infrastructure detector looks FOR — `promaxgb10-*` and
+  # `whitestocks`, in the table that decides whether a planned task needs a
+  # human at a real machine. Taking them out would switch a check off rather
+  # than make anything portable, so the file is named here instead.
+  #
+  # AT TODAY'S PINS IT DOES NOT FIRE, and that is said rather than left to be
+  # discovered: the guardkit commit below carries no full host name in anything
+  # the forge image installs. It fires the moment an operator's terms include
+  # the stem of a host name (promaxgb10) or another of this estate's machines
+  # (whitestocks) — which is exactly when a release would otherwise refuse on a
+  # detector doing its job.
+  - image: forge
+    path: guardkit/_installer_core/commands/feature-plan.md
+    reason: the live-infrastructure detector's own patterns
