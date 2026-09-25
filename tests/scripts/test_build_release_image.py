@@ -869,7 +869,7 @@ images:
     role: coordinator
 sweep_exceptions:
   - image: the-coordinator
-    word: promaxgb10
+    word: some-machine-name
 """,
     )
 
