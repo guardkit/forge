@@ -160,6 +160,22 @@ print(f"{'my own memory (the store, not the service)':<44} {_says}")
 
 over_http("the publisher", os.environ.get("FORGE_PUBLISHER_URL", ""))
 
+# THE SLACK FRONT DOOR, on the factory network. Its name and its port are the
+# same on every machine — the service name the compose file gives it, and the
+# port it listens on INSIDE its container — because it publishes nothing:
+# Slack is dialled out to over a WebSocket and never heard from, so there is no
+# inbound route and no address of this machine involved at all.
+over_http("the Slack front door", "http://front-door:2024", route="/ok")
+
+# THE BUS GATEWAY has nothing to be asked. It publishes no port, talks outbound
+# to the bus and to Slack, and answers nobody — so rather than invent a
+# question, this line says where the answer really is: 'estate-check services'
+# item 8i asks the BUS whether the gateway's account is connected to it.
+print(
+    f"{'the bus gateway':<44} nothing to ask — it answers nobody; "
+    "estate-check asks the bus"
+)
+
 # The two addresses into a project's sandbox, resolved the way the coordinator
 # resolves them: its own settings file, through its own loader, which fills in
 # a ${NAME} from this container's environment and refuses by name if nothing

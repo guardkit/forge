@@ -456,6 +456,130 @@ class TestWhatTheEstatePromises:
             "start with no command at all"
         )
 
+    # -----------------------------------------------------------------
+    # THE SLACK FRONT DOOR AND THE BUS GATEWAY (25 September 2026, stage 4c)
+    # -----------------------------------------------------------------
+
+    def test_the_front_door_and_the_gateway_are_in_the_estate(
+        self, rendered: str
+    ) -> None:
+        """Both ran as host units out of a checkout and a virtual environment
+        under a home directory. The design's inventory calls that habit."""
+        for service in ("front-door", "bus-gateway"):
+            assert f"  {service}:" in rendered, (
+                f"the estate has no '{service}' service"
+            )
+
+    def test_the_two_jarvis_services_are_one_image(self, rendered: str) -> None:
+        """One image per repository release, one start command per service —
+        the shape the coordinator and the answer service already have. Two
+        images built from one commit could drift; one cannot."""
+        images = []
+        for service in ("front-door", "bus-gateway"):
+            block = _service_block(rendered, service)
+            line = [ln for ln in block.splitlines() if ln.strip().startswith("image:")]
+            assert line, f"{service} names no image"
+            images.append(line[0].strip())
+        assert images[0] == images[1], (
+            f"the front door and the bus gateway are different images: {images}"
+        )
+
+    def test_the_two_jarvis_services_are_on_the_factory_network_and_no_other(
+        self, rendered: str
+    ) -> None:
+        for service in ("front-door", "bus-gateway"):
+            block = _service_block(rendered, service)
+            assert "factory" in block, f"{service} is not on the factory network"
+            assert "forge-publisher-net" not in block, (
+                f"{service} is on the publisher's own network, and only the "
+                "coordinator may be"
+            )
+
+    def test_neither_jarvis_service_publishes_a_port(
+        self, rendered: str
+    ) -> None:
+        """Slack pushes nothing to this estate: the reply path is socket mode,
+        an outbound WebSocket the front door dials. So there is no inbound
+        route to open, and a published port would be a way in and nothing
+        else."""
+        for service in ("front-door", "bus-gateway"):
+            block = _service_block(rendered, service)
+            assert "ports:" not in block, (
+                f"{service} publishes a port. Slack is dialled out to over a "
+                "WebSocket and never heard from, so nothing needs to reach it."
+            )
+
+    def test_neither_jarvis_service_binds_anything_of_this_machine(
+        self, rendered: str
+    ) -> None:
+        """They read a checkout's own settings file today. Nothing of a
+        checkout, and no folder on a disk, may reach either container."""
+        for service in ("front-door", "bus-gateway"):
+            block = _service_block(rendered, service)
+            assert "type: bind" not in block, (
+                f"{service} binds a folder on this machine's disk"
+            )
+
+    def test_the_slack_credentials_never_reach_a_container_environment(
+        self, rendered: str
+    ) -> None:
+        """A bot token and an app-level token: both secrets, both files. The
+        live units get them from a decrypt tool named by an absolute path in a
+        unit file; here they arrive under /run/secrets and the wrapper puts
+        them into the process's own environment and nowhere else."""
+        for service in ("front-door", "bus-gateway"):
+            block = _service_block(rendered, service)
+            environment = block.split("environment:", 1)
+            if len(environment) == 2:
+                declared = environment[1].split("secrets:", 1)[0]
+                for name in (
+                    "JARVIS_SLACK_BOT_TOKEN:",
+                    "JARVIS_SLACK_APP_TOKEN:",
+                ):
+                    assert name not in declared, (
+                        f"{service} names {name.rstrip(':')} in its container "
+                        "environment, where 'docker inspect' shows it to "
+                        "anybody who can reach the Docker daemon"
+                    )
+            for target in ("slack_bot_token", "slack_app_token"):
+                assert target in block, (
+                    f"{service} is not given {target} as a file"
+                )
+
+    def test_the_jarvis_bus_address_carries_no_credential(
+        self, rendered: str
+    ) -> None:
+        """The live gateway's start line is a whole nats:// address with the
+        password in it. Here the address and the account are plain and the
+        password arrives as a file, which the wrapper refuses to do twice."""
+        for service in ("front-door", "bus-gateway"):
+            block = _service_block(rendered, service)
+            for line in block.splitlines():
+                if "nats://" in line and "JARVIS_NATS_URL:" in line:
+                    address = line.split("nats://", 1)[1]
+                    assert "@" not in address.split()[0], (
+                        f"{service} is given a bus address with a credential "
+                        f"in it: {line.strip()}"
+                    )
+            assert "jarvis_bus_password" in block, (
+                f"{service} is not given the bus password as a file"
+            )
+
+    def test_each_jarvis_service_writes_its_command_out(
+        self, rendered: str
+    ) -> None:
+        """NAMING AN ENTRYPOINT EMPTIES THE IMAGE'S OWN COMMAND, and both name
+        one because both are given their credentials as files. So both write
+        their command out, and the image's release proof holds those two lines
+        to what that one image can really run."""
+        for service in ("front-door", "bus-gateway"):
+            block = _service_block(rendered, service)
+            assert "entrypoint:" in block, f"{service} names no entrypoint"
+            assert "command:" in block, (
+                f"{service} names an entrypoint and no command, so it would "
+                "start with no command at all"
+            )
+
     def test_the_memory_switch_has_no_default(self) -> None:
         """Memory being off must be a decision, never an omission: the compose
         file interpolates FLEET_MEMORY_ENABLED with ``:?``, so an env file that
@@ -520,6 +644,7 @@ class TestTheExampleNamesTheReleaseThatExists:
             f"FORGE_PUBLISHER_IMAGE=forge-publisher:{version}",
             f"FLEET_MEMORY_MCP_IMAGE=fleet-memory-mcp:{version}",
             f"FLEET_MEMORY_RELAY_IMAGE=fleet-memory-relay:{version}",
+            f"JARVIS_IMAGE=jarvis:{version}",
             f"NATS_IMAGE=factory-nats:{version}",
             f"NATS_PROVISION_IMAGE=factory-nats-provision:{version}",
             f"BUS_SOURCE_VOLUME=factory-bus-source-{version}",
@@ -731,6 +856,60 @@ class TestTheCheckStillHasEveryItemTheDesignAsksFor:
             "between the memory service answering and the estate using memory "
             "is written down nowhere"
         )
+
+    def test_the_check_asks_about_the_front_door_and_the_gateway(self) -> None:
+        """ITEMS 8h AND 8i, added 25 September 2026, stage 4c.
+
+        Neither of the two jarvis services publishes a port, so neither can be
+        asked anything from outside — and "the container is running" would
+        prove only that a process exists. So each is asked the honest question:
+        the front door's own health route, inside its own container, and for
+        the gateway, the BUS, because the gateway answers nobody and the bus
+        knows who is connected to it."""
+        items = _the_checks_items()
+        for number, name in (
+            ("8h", "the-front-door-answers"),
+            ("8i", "the-bus-gateway-is-on-the-bus"),
+        ):
+            assert number in items, (
+                f"estate-check no longer has item {number}, so the estate "
+                "could have no Slack front door and pass every item"
+            )
+            assert items[number][0] == name, items[number]
+
+        assert "asked of the BUS itself" in items["8i"][1], (
+            "item 8i no longer says the question goes to the bus. Asking the "
+            "gateway whether it is running proves a process exists, and this "
+            "command refuses to start without the bus anyway."
+        )
+
+        readme = (ESTATE / "README.md").read_text()
+        assert "8h" in readme, (
+            "the README does not mention item 8h, so what it proves — and what "
+            "it does not, which is anything about Slack itself — is written "
+            "down nowhere"
+        )
+
+    def test_the_readme_says_the_front_door_runs_a_development_server(
+        self,
+    ) -> None:
+        """THE HONEST LABEL, held in place.
+
+        ``langgraph dev`` is the langgraph CLI's development server. It is what
+        the live host unit has always run and what the image runs; containing
+        it changed where the front door runs, not what runs. The production
+        path that CLI offers needs a licence key for a closed-source server, no
+        licence is baked, and what ought to serve these graphs is open. A page
+        that stopped saying so would let a development server pass quietly for
+        a production one."""
+        readme = (ESTATE / "README.md").read_text()
+        section = readme.split("The Slack front door, and the bus gateway", 1)
+        assert len(section) == 2, "the README has no front door section"
+        body = section[1].split("\n## ", 1)[0]
+        for phrase in ("development", "licence", "socket mode"):
+            assert phrase in body, (
+                f"the README's front door section no longer says '{phrase}'"
+            )
 
     def test_the_items_before_and_after_are_not_mixed_up(self) -> None:
         """Two checks, not one, because some things must be true before
