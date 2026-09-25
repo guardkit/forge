@@ -58,7 +58,25 @@ schema: 2
 # Two pins move with it — forge, for the build script that can build an image
 # from another repository's clone, and fleet-memory, for the two Dockerfiles
 # that now pin the release's one base image by digest instead of a floating tag.
-version: 2026.09.25-2
+#
+# 2026.09.25-3 (25 September 2026, stage 4b after its review). Only the forge
+# pin moves; fleet-memory is at the same commit. What it changes in the images:
+# each one's org.opencontainers.image.revision and .source now name the
+# repository THAT image was built from, where before both were taken once from
+# the build-context root — so the two memory images reported Forge's commit and
+# Forge's address while their own tags said fleet-memory's. The images
+# themselves are otherwise the same code, and the release number moves because
+# their labels do: a release name means one set of bytes.
+#
+# NOTE ABOUT THE TWO MEMORY IMAGES' BASE, said here because it is easy to read
+# the fleet-memory pin as only a pin. The digest below is Python 3.14.4; the
+# fleet-memory images running today were built from a floating python:3.12-slim
+# and are on 3.12.13. Pinning was necessary — a release refuses a Dockerfile
+# with no digest — but it carries a two-minor-version upgrade with it, for
+# anybody rebuilding fleet-memory from its own compose file as well. It was
+# tested rather than assumed (the package installs, both entry modules import,
+# and a real message went end to end on 3.14).
+version: 2026.09.25-3
 
 # The one image this repository's own operator scripts mean by "the release
 # image" (ops/forge-prod-recreate.sh reads this line). It is the same name as
@@ -136,7 +154,7 @@ repositories:
   - name: forge
     url: https://github.com/guardkit/forge.git
     branch: main
-    commit: 356ca93a95fd1f5c715c0288d27d1ad8b8ace2b7
+    commit: ab0385574e6bedca19e57f3e00de6e7730d868be
     role: build-context-root
   - name: guardkit
     url: https://github.com/guardkit/guardkit.git
