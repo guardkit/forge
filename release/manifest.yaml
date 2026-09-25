@@ -316,18 +316,18 @@ repositories:
 # Each entry needs an image, a path and a reason; the build refuses one that is
 # missing any of them, or that names an image this release does not build.
 sweep_exceptions:
-  # GuardKit's feature-plan command carries this estate's machine names as the
-  # PATTERNS its live-infrastructure detector looks FOR — `promaxgb10-*` and
-  # `whitestocks`, in the table that decides whether a planned task needs a
-  # human at a real machine. Taking them out would switch a check off rather
-  # than make anything portable, so the file is named here instead.
+  # GuardKit's feature-plan command carries two of this estate's machine names
+  # as the PATTERNS its live-infrastructure detector looks FOR, in the table
+  # that decides whether a planned task needs a human at a real machine. Taking
+  # them out would switch a check off rather than make anything portable, so the
+  # file is named here instead. (The names themselves are not written here: this
+  # file is public, and a sweep's words come from the machine, never from a file.)
   #
   # AT TODAY'S PINS IT DOES NOT FIRE, and that is said rather than left to be
   # discovered: the guardkit commit below carries no full host name in anything
   # the forge image installs. It fires the moment an operator's terms include
-  # the stem of a host name (promaxgb10) or another of this estate's machines
-  # (whitestocks) — which is exactly when a release would otherwise refuse on a
-  # detector doing its job.
+  # the stem of that host name or the other machine's name — which is exactly
+  # when a release would otherwise refuse on a detector doing its job.
   - image: forge
     path: guardkit/_installer_core/commands/feature-plan.md
     reason: the live-infrastructure detector's own patterns

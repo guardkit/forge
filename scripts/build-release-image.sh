@@ -1125,8 +1125,14 @@ if [ "${RUN_PROOF}" = "1" ]; then
             continue
         fi
         say "Proving ${itagcommit} with ${ROOT_NAME}/${iproof}, against the fetched clone at ${ROOT_DIR}"
-        bash "${ROOT_DIR}/${iproof}" "${itagcommit}" </dev/null \
-            || die "the proof of image '${iname}' failed for ${itagcommit}. Every tag of this run is still on this machine; do not ship any of them."
+        # A FAILED PROOF REMOVES THIS RUN'S TAGS, as a sweep refusal does (the
+        # follow-up review of 25 September 2026): a refused run that left its
+        # tags behind taught the operator to reach for --allow-existing-tag.
+        if ! bash "${ROOT_DIR}/${iproof}" "${itagcommit}" </dev/null; then
+            echo "ERROR: the proof of image '${iname}' failed for ${itagcommit}." >&2
+            remove_this_runs_tags
+            die "the proof of image '${iname}' failed; this run's tags were removed. Do not ship anything from it."
+        fi
     done < "${BUILT}"
 fi
 
