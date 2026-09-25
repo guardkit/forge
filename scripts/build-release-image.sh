@@ -94,10 +94,21 @@
 # reads the image's CONFIGURATION and its labels, which is a different and much
 # smaller question, and both of those hits were in the FILESYSTEM.
 #
-# So, after each image is built, this script exports that image's whole
-# filesystem (docker create + docker export) along with its config, its labels
-# and its history, and searches all of it with /bin/grep -F. A hit REFUSES the
-# release and names the image, the file and the word.
+# So, after each image is built, this script searches that image with
+# /bin/grep -F — its config, its labels, its history, its flattened filesystem
+# (docker create + docker export) and EVERY LAYER A PUSH WOULD SEND
+# (docker save, every blob unpacked). A hit REFUSES the release and names the
+# image, the file and the word, and the tags this run wrote are removed.
+#
+# WHY THE LAYERS AND NOT ONLY THE FILESYSTEM. An export is the flattened FINAL
+# filesystem: a file a Dockerfile copies in and a later step deletes is gone
+# from it and still in the image, because the layer holding it is still one of
+# the image's layers and is still what a save or a registry push sends. Found
+# by measurement on 25 September 2026: the jarvis image copied another
+# repository's whole clone to /tmp and deleted it four lines later, and its
+# export carried this estate's account name in 0 files while its own layers
+# carried it in 2,194. A check that says a clean thing about a dirty image is
+# worse than no check.
 #
 # WHERE THE WORDS COME FROM, AND WHY NOT FROM A FILE HERE. A tracked list of
 # this machine's names would BE the defect it is looking for — a real host name
@@ -178,6 +189,11 @@ RECEIPT=""
 ALLOW_EXISTING_TAG=0
 RUN_PROOF=1
 PLAN_ONLY=0
+# The tags this run writes, and the ones that were already on this machine
+# before it started. A refused sweep removes the first and never touches the
+# second — see remove_this_runs_tags below.
+RUN_TAGS=""
+PRE_EXISTING_TAGS=""
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 say() { echo "$*" >&2; }
@@ -577,6 +593,9 @@ while IFS='|' read -r _tag iname idockerfile irole iproof icontext; do
         if docker image inspect "${t}" >/dev/null 2>&1 </dev/null; then
             [ "${ALLOW_EXISTING_TAG}" = "1" ] \
                 || die "the tag ${t} already exists on this machine. A release tag is written once, and moving it would change what that name means for anything already using it. Delete it deliberately, or pass --allow-existing-tag if you meant to rebuild it."
+            # Written down so that a refused sweep can remove the tags THIS run
+            # wrote without touching one that was here before it.
+            PRE_EXISTING_TAGS="${PRE_EXISTING_TAGS} ${t}"
         fi
     done
 done <<< "${IMAGE_LINES}"
@@ -739,6 +758,154 @@ sweep_exception_reason() {
     return 1
 }
 
+# WHAT A REFUSED RUN LEAVES BEHIND: nothing that could be shipped, and nothing
+# standing in the way of trying again.
+#
+# Both of an image's tags are written by `docker build`, before anything can be
+# swept. Until 25 September 2026 a refused sweep said "every tag of this run is
+# still on this machine; do not ship any of them" and then left them there — so
+# the next attempt at the same commit refused with "the tag ... already exists"
+# and the operator reached for --allow-existing-tag, which is exactly the habit
+# this script has just finished taking out of its plan. The tags this run wrote
+# are removed and named. A tag that was already on this machine when the run
+# started — which only happens with --allow-existing-tag — is left exactly as
+# it was found, because it is not this run's to remove.
+remove_this_runs_tags() {
+    local t
+    for t in ${RUN_TAGS}; do
+        case " ${PRE_EXISTING_TAGS} " in
+            *" ${t} "*)
+                echo "       ${t} was on this machine before this run started, so it has been left alone." >&2
+                continue
+                ;;
+        esac
+        if docker rmi "${t}" >/dev/null 2>&1 </dev/null; then
+            echo "       removed ${t}, which this run wrote, so the same commit can be built again without --allow-existing-tag." >&2
+        else
+            echo "       ${t} was written by this run and could NOT be removed; remove it before building this release again." >&2
+        fi
+    done
+    echo "       Nothing this run built is to be shipped." >&2
+}
+
+# One unpacked copy of an image, searched file by file so a hit can be named.
+#
+# `where` is what a refusal calls this copy — the running filesystem, or the
+# layer a push sends. A file is a hit if its CONTENTS carry the word or if its
+# PATH does; the path is matched with the unpacking directory stripped off, so
+# where this run happens to unpack has nothing to do with the answer.
+sweep_tree() {
+    local iname="$1" root="$2" where="$3" refusals="$4"
+    local term hits path relpath reason
+    for term in ${SWEEP_TERMS}; do
+        hits="$(
+            {
+                /bin/grep -r -l -F -e "${term}" "${root}" 2>/dev/null || true
+                find "${root}" -type f 2>/dev/null | while IFS= read -r path; do
+                    case "${path#"${root}"}" in
+                        *"${term}"*) printf '%s\n' "${path}" ;;
+                    esac
+                done
+            } | sort -u
+        )"
+        [ -n "${hits}" ] || continue
+        while IFS= read -r path; do
+            [ -n "${path}" ] || continue
+            relpath="${path#"${root}/"}"
+            if reason="$(sweep_exception_reason "${iname}" "${relpath}")"; then
+                say "    allowed  ${relpath}${where} carries '${term}' — the manifest names this file: ${reason}"
+            else
+                printf '%s|%s|%s\n' "${iname}" "${relpath}${where}" "${term}" >> "${refusals}"
+            fi
+        done <<< "${hits}"
+    done
+}
+
+# THE LAYERS, WHICH ARE WHAT A PUSH SENDS.
+#
+# `docker export` (below) is the container's FLATTENED FINAL filesystem. A file
+# a Dockerfile copies in and a later step deletes is gone from it and is still
+# in the image, because the layer that holds it is still one of the image's
+# layers and is still what `docker save` and a registry push send. That is not
+# a hypothetical: on 25 September 2026 the jarvis image copied another
+# repository's whole clone to /tmp and deleted it four lines later, and the
+# export of that image carried this estate's account name in 0 files while the
+# image's own layers carried it in 2,194. A check that says a clean thing about
+# a dirty image is worse than no check, so the sweep reads what ships.
+#
+# Every blob `docker save` writes is asked what it is rather than guessed from
+# its name, because the daemon writes two different shapes (a directory per
+# layer with a layer.tar in it, or an OCI layout of blobs by digest, some of
+# them gzipped). Each layer is unpacked into a directory of its own, so files
+# at the same path in different layers do not overwrite each other.
+sweep_layers() {
+    local iname="$1" itag="$2" dir="$3" refusals="$4"
+    local save="${dir}/save" meta="${dir}/save-meta"
+    mkdir -p "${save}" "${meta}" "${dir}/layers"
+
+    docker save "${itag}" -o "${dir}/image.tar" </dev/null 2>"${dir}/save-errors.txt" \
+        || die "image '${iname}' could not be saved, so the layers a push would send could not be swept. Not swept is not a pass. Docker said: $(tr '\n' ' ' < "${dir}/save-errors.txt")"
+    tar -xf "${dir}/image.tar" -C "${save}" --no-same-owner --no-same-permissions \
+        2>> "${dir}/save-errors.txt" \
+        || die "the saved copy of image '${iname}' could not be unpacked, so its layers were never searched. Not swept is not a pass."
+    rm -f "${dir}/image.tar"
+    chmod -R u+rwX "${save}" 2>/dev/null || true
+
+    local blob src magic layers=0 files=0 out in_tar on_disk
+    while IFS= read -r blob; do
+        [ -f "${blob}" ] || continue
+        src=""
+        magic="$(head -c 2 "${blob}" 2>/dev/null | od -An -tx1 | tr -d ' \n')"
+        if [ "${magic}" = "1f8b" ]; then
+            gzip -dc "${blob}" > "${dir}/blob.tar" 2>/dev/null \
+                || die "a compressed layer of image '${iname}' could not be read, so it was never searched. Not swept is not a pass."
+            src="${dir}/blob.tar"
+        elif tar -tf "${blob}" >/dev/null 2>&1; then
+            src="${blob}"
+        else
+            # Not an archive: the image's own json — its manifest, its config.
+            # Small, and swept as metadata below.
+            cp "${blob}" "${meta}/$(printf '%s' "${blob#"${save}/"}" | tr '/' '_')" 2>/dev/null || true
+            continue
+        fi
+
+        layers=$((layers + 1))
+        out="${dir}/layers/${layers}"
+        mkdir -p "${out}"
+        tar -xf "${src}" -C "${out}" --no-same-owner --no-same-permissions \
+            2>> "${dir}/layer-errors.txt" || true
+        chmod -R u+rwX "${out}" 2>/dev/null || true
+
+        in_tar="$(tar -tvf "${src}" 2>/dev/null | awk '$1 ~ /^-/' | wc -l | tr -d ' ')"
+        on_disk="$(find "${out}" -type f 2>/dev/null | wc -l | tr -d ' ')"
+        [ "${on_disk}" -ge "${in_tar}" ] \
+            || die "layer ${layers} of image '${iname}' unpacked ${on_disk} of the ${in_tar} files in it, so part of what a push would send was never searched. Not swept is not a pass. The unpacking said: $(tr '\n' ' ' < "${dir}/layer-errors.txt")"
+        files=$((files + on_disk))
+        rm -f "${dir}/blob.tar"
+    done <<< "$(find "${save}" -type f | sort)"
+
+    # NOT SWEPT IS NOT A PASS. An image has at least one layer, and the daemon
+    # says how many: fewer unpacked than that means part of the image was never
+    # opened at all.
+    local expected
+    expected="$(docker image inspect --format '{{len .RootFS.Layers}}' "${itag}" </dev/null 2>/dev/null || echo 0)"
+    [ "${layers}" -ge 1 ] \
+        || die "no layer of image '${iname}' could be unpacked from its saved copy, so nothing of what a push would send was searched. Not swept is not a pass."
+    [ "${layers}" -ge "${expected}" ] \
+        || die "image '${iname}' has ${expected} layers and only ${layers} of them could be unpacked, so part of what a push would send was never searched. Not swept is not a pass."
+
+    say "    layers: ${files} files across ${layers} layer(s) — what a push sends, deleted files included"
+
+    local i=1
+    while [ "${i}" -le "${layers}" ]; do
+        sweep_tree "${iname}" "${dir}/layers/${i}" " (in layer ${i} of ${layers}, which a push sends even when a later layer deletes it)" "${refusals}"
+        i=$((i + 1))
+    done
+    sweep_tree "${iname}" "${meta}" " (in the image's own manifest or config, which a push sends)" "${refusals}"
+
+    rm -rf "${save}" "${meta}" "${dir}/layers"
+}
+
 sweep_image() {
     local iname="$1" itag="$2"
     if [ -z "${SWEEP_TERMS}" ]; then
@@ -786,11 +953,11 @@ sweep_image() {
     [ "${on_disk}" -ge "${in_tar}" ] \
         || die "the sweep of image '${iname}' unpacked ${on_disk} of the ${in_tar} files in it, so part of that image was never searched. Not swept is not a pass. The unpacking said: $(tr '\n' ' ' < "${dir}/tar-errors.txt")"
 
-    say "  sweeping ${iname}: ${on_disk} files, its configuration, its labels and its history"
+    say "  sweeping ${iname}: ${on_disk} files in the running filesystem, its configuration, its labels and its history"
 
     local refusals="${dir}/refusals.txt"
     : > "${refusals}"
-    local term meta hits path relpath reason
+    local term meta
     for term in ${SWEEP_TERMS}; do
         # The metadata first — small, and a hit there is never excusable.
         for meta in config.json labels.json history.txt; do
@@ -798,19 +965,16 @@ sweep_image() {
                 printf '%s|%s|%s\n' "${iname}" "the image's ${meta%%.*}" "${term}" >> "${refusals}"
             fi
         done
-        # Then the filesystem, file by file, so a hit can be named.
-        hits="$(/bin/grep -r -l -F -e "${term}" "${dir}/fs" 2>/dev/null || true)"
-        [ -n "${hits}" ] || continue
-        while IFS= read -r path; do
-            [ -n "${path}" ] || continue
-            relpath="${path#"${dir}/fs/"}"
-            if reason="$(sweep_exception_reason "${iname}" "${relpath}")"; then
-                say "    allowed  ${relpath} carries '${term}' — the manifest names this file: ${reason}"
-            else
-                printf '%s|%s|%s\n' "${iname}" "${relpath}" "${term}" >> "${refusals}"
-            fi
-        done <<< "${hits}"
     done
+    # Then the flattened filesystem — what a container of this image would see.
+    sweep_tree "${iname}" "${dir}/fs" "" "${refusals}"
+
+    # The export and its unpacked copy are large; the layers are larger again,
+    # so the first is let go of before the second is written.
+    rm -rf "${dir}/fs" "${dir}/fs.tar"
+
+    # AND THEN WHAT A PUSH WOULD SEND, which is not the same thing at all.
+    sweep_layers "${iname}" "${itag}" "${dir}" "${refusals}"
 
     if [ -s "${refusals}" ]; then
         echo "ERROR: image '${iname}' (${itag}) carries names belonging to the machine that built it:" >&2
@@ -818,13 +982,10 @@ sweep_image() {
             echo "       in ${rpath}" >&2
             echo "          the word: ${rterm}" >&2
         done < "${refusals}"
-        echo "       Every tag of this run is still on this machine; do not ship any of them." >&2
+        remove_this_runs_tags
         die "a release image belongs to the release, not to a machine. Take the name out of the source that puts it there — or, if the file needs it (a detector's own patterns, say), name that FILE under sweep_exceptions: in the manifest, with its reason."
     fi
-    say "    ok ${iname} carries none of the ${SWEEP_TERM_COUNT} words RELEASE_SWEEP_TERMS names"
-
-    # The export and its unpacked copy are large; a release is five images.
-    rm -rf "${dir}/fs" "${dir}/fs.tar"
+    say "    ok ${iname} carries none of the ${SWEEP_TERM_COUNT} words RELEASE_SWEEP_TERMS names, in its running filesystem or in any layer a push would send"
 }
 
 SWEEP_TERM_COUNT="$(set -- ${SWEEP_TERMS}; echo "$#")"
@@ -934,6 +1095,7 @@ while IFS='|' read -r _tag iname idockerfile irole iproof icontext; do
 
     ibuilt="$(cat "${IIDFILE}")"
     say "  built ${iname} ${ibuilt}"
+    RUN_TAGS="${RUN_TAGS} ${TAG_COMMIT} ${TAG_VERSION}"
 
     # SWEPT THE MOMENT IT EXISTS, not at the end of the run. A release is built
     # as a set and a refusal stops the whole set either way, but sweeping here
