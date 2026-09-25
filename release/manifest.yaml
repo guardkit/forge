@@ -222,5 +222,5 @@ repositories:
   - name: jarvis
     url: https://github.com/guardkit/jarvis.git
     branch: main
-    commit: 59a919d92cf88752988388b2b6d1df4882ffebf5
+    commit: 969a4769e1f33b6663f4431c495323fdca70e47f
     role: named-context
