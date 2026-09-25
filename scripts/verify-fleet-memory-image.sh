@@ -33,7 +33,20 @@
 #      image's own command, so the compose file has to write the command out.
 #      Nothing held the two together for the bus until a reviewer asked on 24
 #      September 2026; this is the same guard, made at the same moment.
-#   4. IT CARRIES NOTHING OF ANY MACHINE. No user name, no home path, no
+#   4. WHICH USER IT RUNS AS, said out loud either way. The release has a
+#      standard about this — the publisher's own proof refuses an image that
+#      runs as root, because the publisher holds the one credential that can
+#      write to a project's remote — and until 25 September 2026 this script
+#      asked nothing at all, so "both memory images run as root" was true and
+#      unsaid. It is now asked and answered in the build's own output. Root is
+#      a RECORDED DEVIATION and not a failure: it is how the memory
+#      repository's two Dockerfiles have always been, it is not a regression
+#      of this release, and closing it is a change to THAT repository (a
+#      non-root user, and /var/lib/fleet-memory created in the relay's image
+#      owned by that user, the way the publisher's image does it). What this
+#      check stops is the deviation being invisible, and it holds a
+#      non-root image to the publisher's standard the day one arrives.
+#   5. IT CARRIES NOTHING OF ANY MACHINE. No user name, no home path, no
 #      projects folder, no machine name from wherever it was built, in its
 #      configuration or its labels.
 #
@@ -74,10 +87,16 @@ case "${ROLE}" in
     memory)
         SERVICE="memory"
         MODULE="fleet_memory.mcp"
+        STATE_DIR=""
         ;;
     memory-relay)
         SERVICE="memory-relay"
         MODULE="fleet_memory.app"
+        # The folder the estate's 'memory-state' volume is mounted at. Docker
+        # fills a FRESH named volume from whatever the image has at that path,
+        # ownership included, so this only matters once the image stops running
+        # as root — see the user check below.
+        STATE_DIR="/var/lib/fleet-memory"
         ;;
     *)
         fail "${IMAGE} has role '${ROLE}'. This script proves the two memory images, whose roles are 'memory' and 'memory-relay'."
@@ -120,7 +139,39 @@ COMPOSE_CMD="$(awk -v svc="  ${SERVICE}:" '
     || fail "${IMAGE} starts with CMD ${IMAGE_CMD}, and the estate's '${SERVICE}' service writes command: ${COMPOSE_CMD}. Make the estate say what the image says, then build again."
 echo "  OK  command     the estate's '${SERVICE}' command is the image's own CMD: ${IMAGE_CMD}"
 
-# --- (4) nothing of any machine ---------------------------------------------
+# --- (4) which user it runs as ----------------------------------------------
+#
+# Asked of the image itself, and answered in this output whichever way it comes
+# out. Root is recorded, named and allowed here; anything else is held to the
+# publisher's standard.
+ID_LINE="$(docker run --rm --entrypoint id "${IMAGE}" -u 2>/dev/null | tr -d '\r')" \
+    || fail "${IMAGE} could not be asked which user it runs as. Unknown is not a pass."
+[ -n "${ID_LINE}" ] \
+    || fail "${IMAGE} gave no answer when asked which user it runs as. Unknown is not a pass."
+
+if [ "${ID_LINE}" = "0" ]; then
+    echo "  DEVIATION user   ${IMAGE} runs as ROOT (uid 0), recorded 25 September 2026."
+    echo "                   The release's other images do not: the publisher's proof refuses root outright."
+    echo "                   This is how the memory repository's two Dockerfiles have always been, so it is"
+    echo "                   not a regression of this release — but it is now a release image, and closing it"
+    echo "                   is a change in THAT repository: a non-root user in both Dockerfiles, and in the"
+    echo "                   relay's ${STATE_DIR:-state folder} created owned by that user, because Docker fills a"
+    echo "                   fresh named volume from what the image has at that path, ownership included."
+else
+    echo "  OK  user        runs as uid ${ID_LINE}, not root"
+    # A non-root relay needs its own state folder in the image, owned by it —
+    # the publisher learnt this the hard way on 24 September 2026 (eleven
+    # restarts in two minutes on a root-owned fresh volume).
+    if [ -n "${STATE_DIR}" ]; then
+        STATE_LINE="$(docker run --rm --entrypoint sh "${IMAGE}" -c \
+            "d=${STATE_DIR}; [ -d \"\$d\" ] || { echo missing; exit 0; }; t=\"\$d/.can-this-user-write-here\"; if : > \"\$t\" 2>/dev/null; then rm -f \"\$t\"; echo writable; else echo not-writable; fi" 2>/dev/null | tr -d '\r')"
+        [ "${STATE_LINE}" = "writable" ] \
+            || fail "${IMAGE} runs as uid ${ID_LINE} and ${STATE_DIR} in it is '${STATE_LINE}'. The estate mounts the memory-state volume there and the relay is its one writer; Docker fills a fresh named volume from what the image has at that path, ownership included, so a non-root relay with no folder of its own gets a root-owned volume it cannot write, and crash-loops."
+        echo "  OK  state       ${STATE_DIR} exists in the image and the user it runs as can write to it"
+    fi
+fi
+
+# --- (5) nothing of any machine ---------------------------------------------
 #
 # The image's whole configuration and every label, swept for the things a build
 # on somebody's laptop leaves behind. The words come from THIS machine at the

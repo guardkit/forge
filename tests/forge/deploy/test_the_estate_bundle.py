@@ -401,6 +401,72 @@ class TestWhatTheEstatePromises:
                 "start with no command at all"
             )
 
+    def test_the_coordinator_is_given_forges_own_memory_settings(
+        self, rendered: str
+    ) -> None:
+        """THE BLOCKER OF 25 SEPTEMBER 2026, held shut.
+
+        Forge reads the factory's memory itself, at gate time, out of the
+        store — it does not use the ``memory`` service, which is what a Claude
+        session asks over MCP. It reads five names
+        (src/forge/adapters/fleet_memory/priors.py), and the live coordinator
+        is given all five by ops/forge-prod-recreate.sh. This bundle gave it
+        NONE, and Forge does not refuse that: it logs ``memory: OFF``, hands
+        the gate an empty reader and answers its health route perfectly, so
+        every check in the bundle still passed while the factory remembered
+        nothing. Replacing forge-prod with this estate would have turned memory
+        off in silence.
+        """
+        coordinator = _service_block(rendered, "coordinator")
+        for name in (
+            "FLEET_MEMORY_ENABLED:",
+            "FLEET_MEMORY_EMBED_URL:",
+            "FLEET_MEMORY_EMBED_MODEL:",
+            "FLEET_MEMORY_EMBED_DIMS:",
+        ):
+            assert name in coordinator, (
+                f"the coordinator is not given {name.rstrip(':')}, so its own "
+                "memory would be off and nothing would say so"
+            )
+        assert "memory_database_address" in coordinator, (
+            "the coordinator is not given the store's address, so with memory "
+            "on it has nothing to read"
+        )
+
+    def test_the_coordinators_store_address_is_a_file_and_not_a_value(
+        self, rendered: str
+    ) -> None:
+        """The store's address carries its password, so the coordinator gets it
+        the same way the two memory containers do — as a file, put into its own
+        process's environment by the wrapper and nowhere else."""
+        coordinator = _service_block(rendered, "coordinator")
+        environment = coordinator.split("environment:", 1)
+        if len(environment) == 2:
+            declared = environment[1].split("secrets:", 1)[0]
+            assert "FLEET_MEMORY_PG_DSN:" not in declared, (
+                "the coordinator names the store's address in its container "
+                "environment, where 'docker inspect' would show its password"
+            )
+        assert "entrypoint:" in coordinator, (
+            "the coordinator has no wrapper, so it could not be handed the "
+            "store's address as a file"
+        )
+        assert "command:" in coordinator, (
+            "the coordinator names an entrypoint and no command, so it would "
+            "start with no command at all"
+        )
+
+    def test_the_memory_switch_has_no_default(self) -> None:
+        """Memory being off must be a decision, never an omission: the compose
+        file interpolates FLEET_MEMORY_ENABLED with ``:?``, so an env file that
+        does not say either way refuses to render, by name."""
+        text = (ESTATE / "compose.yaml").read_text()
+        assert "${FLEET_MEMORY_ENABLED:?" in text, (
+            "FLEET_MEMORY_ENABLED has a default or is not required, so an "
+            "estate whose env file forgot it would start with the "
+            "coordinator's memory off and say nothing"
+        )
+
     def test_the_coordinator_waits_for_the_bus_to_be_provisioned(
         self, rendered: str
     ) -> None:
@@ -631,6 +697,40 @@ class TestTheCheckStillHasEveryItemTheDesignAsksFor:
                 f"estate-check's item {number} is called '{items[number]}' and "
                 f"the design's item {number} is '{name}': {sentence}"
             )
+
+    def test_the_check_asks_the_coordinator_about_its_own_memory(self) -> None:
+        """ITEM 8c-forge, added 25 September 2026 after the review of stage 4b.
+
+        Item 8c asks the memory SERVICE, whose caller is a Claude session over
+        MCP from outside the estate. The coordinator does not use it: Forge
+        reads the store itself. So 8c passing was never evidence that anything
+        in the estate used memory, and while the bundle gave the coordinator no
+        memory settings at all, every item here still passed. 8c-forge reads
+        the coordinator's own memory line out of its own log, and the README
+        has to say the two are different questions."""
+        items = _the_checks_items()
+        assert "8c-forge" in items, (
+            "estate-check no longer asks the coordinator whether its own "
+            "memory is on, so an estate that remembers nothing would pass "
+            "every item again"
+        )
+        name, sentence = items["8c-forge"]
+        assert name == "the-coordinator-reads-memory-itself", name
+        assert "coordinator" in sentence
+
+        check = (ESTATE / "estate-check").read_text()
+        for word in ("memory: ON", "memory: OFF", "memory: DEGRADED"):
+            assert word in check, (
+                f"estate-check no longer looks for Forge's own '{word}' line, "
+                "which is the only thing that says what the coordinator did"
+            )
+
+        readme = (ESTATE / "README.md").read_text()
+        assert "8c-forge" in readme, (
+            "the README does not mention item 8c-forge, so the difference "
+            "between the memory service answering and the estate using memory "
+            "is written down nowhere"
+        )
 
     def test_the_items_before_and_after_are_not_mixed_up(self) -> None:
         """Two checks, not one, because some things must be true before

@@ -145,6 +145,19 @@ else:
         "(FLEET_MEMORY_URL)"
     )
 
+# AND MY OWN MEMORY, which is a different thing and is printed next to it so
+# the two are never confused again. The memory SERVICE above is what a Claude
+# session asks over MCP. The coordinator does not use it: it reads the store
+# itself at gate time, and the switch below is what decides whether it does.
+# Before 25 September 2026 this bundle gave the coordinator no memory settings
+# at all, so the address above answering looked like memory working.
+_switch = os.environ.get("FLEET_MEMORY_ENABLED", "").strip()
+_says = {
+    "true": "on — I read the store myself at gate time",
+    "false": "OFF — my gates read no priors (FLEET_MEMORY_ENABLED=false)",
+}.get(_switch, "nothing told me either way (FLEET_MEMORY_ENABLED unset)")
+print(f"{'my own memory (the store, not the service)':<44} {_says}")
+
 over_http("the publisher", os.environ.get("FORGE_PUBLISHER_URL", ""))
 
 # The two addresses into a project's sandbox, resolved the way the coordinator

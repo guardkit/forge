@@ -467,15 +467,85 @@ services:
       start_period: 60s
 
   # -------------------------------------------------------------------------
-  # THE COORDINATOR, composed in above, waits for the bus to be PROVISIONED and
-  # not merely running. Without this line the coordinator starts against a bare
-  # bus and restarts in a loop; with it, it does not start at all until the
-  # one-shot above has finished successfully.
+  # THE COORDINATOR, composed in above, with two things added here.
+  #
+  # ONE: it waits for the bus to be PROVISIONED and not merely running. Without
+  # this line the coordinator starts against a bare bus and restarts in a loop;
+  # with it, it does not start at all until the one-shot above has finished
+  # successfully.
+  #
+  # TWO: IT IS GIVEN MEMORY (added 25 September 2026, after the review of this
+  # stage). Forge reads its own memory settings from five names — the switch,
+  # the store's address, and the three that describe the embedding service
+  # (src/forge/adapters/fleet_memory/priors.py). The live coordinator is given
+  # all five by ops/forge-prod-recreate.sh. This bundle gave it NONE, and that
+  # is not a loud failure: with them unset Forge logs one line — "memory: OFF"
+  # — hands the gate an empty priors reader and carries on looking perfectly
+  # healthy, every check in this bundle still passing. Replacing the live
+  # coordinator with this estate would have turned the factory's memory off and
+  # said nothing, which is the exact failure this README names in its own
+  # words: the memory flywheel once went dark for a month and nothing said so.
+  #
+  # THE SWITCH HAS NO DEFAULT HERE, deliberately. FLEET_MEMORY_ENABLED must be
+  # written in the env file, true or false, so that memory being off is always
+  # somebody's decision and never an omission.
+  #
+  # THE STORE'S ADDRESS ARRIVES AS A FILE, the same one the two memory
+  # containers are given, for the same reason: it carries the store's password.
+  # The wrapper below puts it into the environment of the coordinator's own
+  # process and nowhere else, so it is not in this container's declared
+  # environment where 'docker inspect' would show it.
+  #
+  # NOTE WHICH ROUTE THIS IS. The coordinator does NOT reach memory through the
+  # 'memory' service above: it reads the store directly. The 'memory' service is
+  # what a Claude session asks over MCP. Both are memory; they are two different
+  # paths to it, and only one of them is the coordinator's. README.md says so at
+  # more length.
   # -------------------------------------------------------------------------
   coordinator:
     depends_on:
       nats-provision:
         condition: service_completed_successfully
+    # Every '$$' below is a dollar sign for the SHELL, escaped so that compose
+    # leaves it alone. The last item is the shell's $0; the command the composed
+    # file gives this service follows it and is what "$@" hands on. The image's
+    # own entrypoint is 'forge', which is what this wrapper execs.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        case "$${FLEET_MEMORY_ENABLED}" in
+          true|false) ;;
+          *)
+            echo "the coordinator was given FLEET_MEMORY_ENABLED='$${FLEET_MEMORY_ENABLED}'. It has to say true or false: memory being off is a decision, not an omission, because a coordinator with memory off looks exactly like one with memory on and nothing to say." >&2
+            exit 1
+            ;;
+        esac
+        if [ "$${FLEET_MEMORY_ENABLED}" = "true" ]; then
+            address_file=/run/secrets/memory_database_address
+            if [ ! -s "$${address_file}" ]; then
+                echo "the coordinator was told memory is on and was given no database address: the estate passes it in as a file, and this one arrived missing or empty. Start the estate the way deploy/estate/README.md says, with the value passed in from a child process." >&2
+                exit 1
+            fi
+            FLEET_MEMORY_PG_DSN="$$(cat "$${address_file}")"
+            export FLEET_MEMORY_PG_DSN
+        fi
+        exec forge "$$@"
+      - the-estate-hands-the-coordinator-its-database-address-as-a-file
+    environment:
+      # THE SWITCH. No default: the env file has to say true or false.
+      FLEET_MEMORY_ENABLED: ${FLEET_MEMORY_ENABLED:?say true or false in the env file - a coordinator with memory off looks exactly like one with memory on and nothing to say, so it has to be a decision}
+      # THE EMBEDDING SERVICE, the same three names and the same values the two
+      # memory containers above are given. Forge embeds the gate's query with
+      # the same model the store was written with; a different model or a
+      # different number of dimensions silently returns nothing useful.
+      FLEET_MEMORY_EMBED_URL: ${FLEET_MEMORY_EMBED_URL:?name the embedding service's address in the env file}
+      FLEET_MEMORY_EMBED_MODEL: ${FLEET_MEMORY_EMBED_MODEL:?name the embedding model in the env file}
+      FLEET_MEMORY_EMBED_DIMS: ${FLEET_MEMORY_EMBED_DIMS:?name how many dimensions that model returns in the env file}
+    secrets:
+      - source: memory-database-address
+        target: memory_database_address
 
   # -------------------------------------------------------------------------
   # ONE PROJECT'S SANDBOX, composed in above and put behind a profile here.
