@@ -85,15 +85,45 @@ schema: 2
 # Dockerfile that did not exist until today, and forge, for the proof script
 # that opens that image and the estate that runs the two services out of it.
 #
-# THE JARVIS PIN IS NOT ON GITHUB YET, and this line is written knowing that.
-# The commit below is local to the machine this was made on, so a release build
-# from this manifest STOPS AT THE FETCH and says so — which is the behaviour
-# that exists to stop a release being cut from anybody's disk. The coordinating
-# session pushes that commit; until it does, this version cannot be built, and
-# what was proved instead is written up in the stage 4c evidence: the same
-# Dockerfile, built to throwaway tags from a local clone, running the estate's
-# two services.
-version: 2026.09.25-4
+# 2026.09.25-5 (25 September 2026, stage 4c after its review). Nothing new is
+# built and no service does anything different: three things that were written
+# down wrongly are written down rightly. The jarvis pin moves, because the
+# sentence corrected is in that repository's own Dockerfile; the forge pin moves
+# with it, because the other two corrections are here and in the estate.
+#
+#   * the jarvis image's Dockerfile listed "no machine name" among the things
+#     deliberately not in it, and that was not true: the jarvis package
+#     hard-codes a host name as its default model-seat address, so the name
+#     rides into the image's filesystem. It pre-dates this packaging, in a
+#     repository that is already public, and the estate always supplies that
+#     address — so it changes nothing about the rollout, but the claim had to
+#     stop being made;
+#   * this note itself named ONE repository to push, below, and there are two;
+#   * the estate's front-door service gave a wrong reason for waiting on the
+#     bus. It opens no bus connection at start-up at all — its graphs are
+#     imported, and nothing in them connects to anything until a message is
+#     handled. The wait is still right, for the reason now written there.
+#
+# 2026.09.25-4 IS LEFT UNUSED, and it was never built — cutting it fetches the
+# pins from GitHub and both were local, so the script refused at the door and no
+# image or tag of it exists anywhere. Its pins have now moved, so rather than
+# let one release number mean two sets of commits, this is 5. There is no gap to
+# explain in any registry, because 4 never reached one — the same reasoning that
+# left 2026.09.24-6 unused above.
+#
+# NEITHER THE JARVIS PIN NOR THE FORGE PIN IS ON GITHUB YET, and this line is
+# written knowing it. Both commits below are local to the machine this was made
+# on, so a release build from this manifest STOPS AT THE FETCH and says so —
+# which is the behaviour that exists to stop a release being cut from anybody's
+# disk. It stops on FORGE first, because forge is fetched first; that was tried
+# rather than assumed, and an earlier version of this note named only jarvis,
+# which would have sent whoever cuts the release to push one repository and
+# watch it refuse again. THE COORDINATING SESSION PUSHES BOTH — guardkit/forge
+# and guardkit/jarvis, both PUBLIC — and until it does, this version cannot be
+# built. What was proved instead is written up in the stage 4c evidence: the
+# same Dockerfiles, built to throwaway tags from local clones, running the
+# estate's two services.
+version: 2026.09.25-5
 
 # The one image this repository's own operator scripts mean by "the release
 # image" (ops/forge-prod-recreate.sh reads this line). It is the same name as
@@ -186,10 +216,13 @@ images:
 #   role: build-context-root  — the Dockerfile and the main build context
 #   role: named-context       — supplied to the build as --build-context <name>=<clone>
 repositories:
+  # THIS COMMIT IS NOT ON GITHUB YET EITHER, and it is the FIRST thing a build
+  # fetches, so it is the first thing a build refuses on — whatever the jarvis
+  # pin below is doing. Both have to be pushed; see the note beside the version.
   - name: forge
     url: https://github.com/guardkit/forge.git
     branch: main
-    commit: fd51eb56041f7e50f28f7e4c7b5a89d048227b0b
+    commit: 1803f7945e4d33f130233db09590d952017f0124
     role: build-context-root
   - name: guardkit
     url: https://github.com/guardkit/guardkit.git
@@ -216,11 +249,12 @@ repositories:
   # tagged by this commit — and it is also, like fleet-memory, a repository the
   # release builds an image FROM rather than merely copies code out of.
   #
-  # THIS COMMIT IS NOT ON GITHUB YET. See the note beside the version above: a
-  # release build from this manifest stops at the fetch until it is pushed, and
-  # that is the check working, not failing.
+  # THIS COMMIT IS NOT ON GITHUB YET, and neither is the forge pin above. See
+  # the note beside the version: a release build from this manifest stops at the
+  # fetch — on forge first, since that is fetched first — until BOTH are pushed,
+  # and that is the check working, not failing.
   - name: jarvis
     url: https://github.com/guardkit/jarvis.git
     branch: main
-    commit: 969a4769e1f33b6663f4431c495323fdca70e47f
+    commit: 06901676623a3e8ce9cc98cc34e76437ab72fd9f
     role: named-context
