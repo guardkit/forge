@@ -499,7 +499,7 @@ services:
   # Docker daemon.
   # -------------------------------------------------------------------------
   front-door:
-    image: ${JARVIS_IMAGE:?name the jarvis image in the env file, e.g. JARVIS_IMAGE=jarvis:2026.09.25-5 - built by ../../scripts/build-release-image.sh with the rest of the release}
+    image: ${JARVIS_IMAGE:?name the jarvis image in the env file, e.g. JARVIS_IMAGE=jarvis:2026.09.25-6 - built by ../../scripts/build-release-image.sh with the rest of the release}
     restart: unless-stopped
     depends_on:
       # NOT because it touches the bus at start-up — it does not. Its two
@@ -609,7 +609,7 @@ services:
   # dependency and exits non-zero rather than running on without one.
   # -------------------------------------------------------------------------
   bus-gateway:
-    image: ${JARVIS_IMAGE:?name the jarvis image in the env file, e.g. JARVIS_IMAGE=jarvis:2026.09.25-5 - built by ../../scripts/build-release-image.sh with the rest of the release}
+    image: ${JARVIS_IMAGE:?name the jarvis image in the env file, e.g. JARVIS_IMAGE=jarvis:2026.09.25-6 - built by ../../scripts/build-release-image.sh with the rest of the release}
     restart: unless-stopped
     depends_on:
       nats-provision:
