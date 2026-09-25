@@ -136,7 +136,7 @@ repositories:
   - name: forge
     url: https://github.com/guardkit/forge.git
     branch: main
-    commit: a7e1f4e96a33b9e9f4421ba584626cc80851d5e1
+    commit: 356ca93a95fd1f5c715c0288d27d1ad8b8ace2b7
     role: build-context-root
   - name: guardkit
     url: https://github.com/guardkit/guardkit.git
@@ -151,7 +151,7 @@ repositories:
   - name: fleet-memory
     url: https://github.com/guardkit/fleet-memory.git
     branch: main
-    commit: 3ac45863f6a90ca89f9efafbfb4630b28fb6e4bc
+    commit: 18ab7de6a250bc31a602f0d5733ef8eb99698686
     role: named-context
   - name: guardkitfactory
     url: https://github.com/guardkit/guardkitfactory.git
