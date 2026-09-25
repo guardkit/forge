@@ -12,8 +12,9 @@
 # drift away from them. Everything this file adds is the part of the estate
 # that Forge does not own.
 #
-# WHAT IT ADDS: the bus, and the one-shot that provisions the bus's storage
-# before the coordinator is allowed to start.
+# WHAT IT ADDS: the bus, the one-shot that provisions the bus's storage before
+# the coordinator is allowed to start, and the two containers that are the
+# memory service.
 #
 # BRING IT UP (the passwords come from a child process, never from a file
 # here — see README.md):
@@ -257,6 +258,215 @@ services:
       - factory
 
   # -------------------------------------------------------------------------
+  # MEMORY — what the factory remembers between sessions and between builds.
+  #
+  # TWO CONTAINERS, ONE JOB. 'memory' answers questions (it is the memory
+  # repository's resident MCP service); 'memory-relay' listens on the bus and
+  # writes what it hears into the store. They are two services because they do
+  # two different things at two different times, which is how the memory
+  # repository has always run them.
+  #
+  # WHAT CHANGED HERE, on 25 September 2026 (stage 4b). Both ran on the HOST'S
+  # OWN NETWORK, and the relay bound a folder under somebody's home directory
+  # (~/.local/state/fleet-memory). The design's inventory row says what that
+  # was: habit — "the folder should be a declared volume, the network a
+  # declared network". So: the factory network, a named volume, and every
+  # address a name.
+  #
+  # WHAT IS NOT HERE. The database and the embedding service. Both are outside
+  # the estate today — on another machine — and both are an ADDRESS. The design
+  # leaves where the database should live as an open question, and this bundle
+  # does not answer it: it names the address and says so. README.md says the
+  # same in longer words.
+  #
+  # THE DATABASE ADDRESS IS A SECRET, because it carries the password in it. It
+  # arrives the same way the bus's eight account passwords do — as a FILE under
+  # /run/secrets, read from the environment the command was run in — and a
+  # small wrapper puts it into the environment of the service's own PROCESS and
+  # nothing else. It is never in a container's declared environment, where
+  # 'docker inspect' shows it to anybody who can reach the Docker daemon, and
+  # it is never in any file in this bundle. That is a deliberate choice against
+  # the easier one: the coordinator's own bus address still carries a password
+  # in its environment (README.md's precondition 8), and nothing here repeats
+  # that mistake.
+  #
+  # NAMING AN ENTRYPOINT EMPTIES THE IMAGE'S OWN COMMAND, so each service
+  # writes its command out below. A release proof holds those two lines to what
+  # the two images really say (../../scripts/verify-fleet-memory-image.sh), the
+  # same guard the bus got on 24 September 2026.
+  # -------------------------------------------------------------------------
+  memory:
+    image: ${FLEET_MEMORY_MCP_IMAGE:?name the memory service's image in the env file, e.g. FLEET_MEMORY_MCP_IMAGE=fleet-memory-mcp:2026.09.25-2 - built by ../../scripts/build-release-image.sh with the rest of the release}
+    restart: unless-stopped
+    # Every '$$' below is a dollar sign for the SHELL, escaped so that compose
+    # leaves it alone. The last item is the shell's $0; the command below
+    # follows it and is what "$@" hands on.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        address_file=/run/secrets/memory_database_address
+        if [ ! -s "$$address_file" ]; then
+            echo "the memory service was given no database address: the estate passes it in as a file, and this one arrived missing or empty. Start the estate the way deploy/estate/README.md says, with the value passed in from a child process." >&2
+            exit 1
+        fi
+        FLEET_MEMORY_PG_DSN="$$(cat "$$address_file")"
+        export FLEET_MEMORY_PG_DSN
+        exec "$$@"
+      - the-estate-hands-memory-its-database-address-as-a-file
+    command: ["python", "-m", "fleet_memory.mcp"]
+    environment:
+      # HOW IT SERVES. The transport and the address INSIDE this container: the
+      # published port below carries traffic to the container's own address,
+      # and something bound to the container's loopback would never hear it.
+      FLEET_MEMORY_MCP_TRANSPORT: http
+      FLEET_MEMORY_MCP_HOST: 0.0.0.0
+      FLEET_MEMORY_MCP_PORT: "8005"
+      # WHICH NAMES CALLERS MAY USE. The transport checks the Host header, so
+      # every name this service is reached by has to be listed: the service
+      # name on the factory network, and the gateway address a sandbox uses.
+      # The env file builds both out of names.
+      FLEET_MEMORY_MCP_ALLOWED_HOSTS: ${FLEET_MEMORY_ALLOWED_HOSTS:?name the host names the memory service answers to in the env file - its service name and the gateway address, both with their ports}
+      # THE EMBEDDING SERVICE — an address, outside this estate.
+      FLEET_MEMORY_EMBED_URL: ${FLEET_MEMORY_EMBED_URL:?name the embedding service's address in the env file}
+      FLEET_MEMORY_EMBED_MODEL: ${FLEET_MEMORY_EMBED_MODEL:?name the embedding model in the env file}
+      FLEET_MEMORY_EMBED_DIMS: ${FLEET_MEMORY_EMBED_DIMS:?name how many dimensions that model returns in the env file}
+      FLEET_MEMORY_EMBED_TIMEOUT_S: ${FLEET_MEMORY_EMBED_TIMEOUT_S:?name the embedding timeout in seconds in the env file}
+    secrets:
+      - source: memory-database-address
+        target: memory_database_address
+    networks:
+      - factory
+    ports:
+      # THE THIRD AND LAST PUBLISHED PORT IN THE ESTATE, and for the same
+      # reason as the other two: a sandbox is a separate small machine that
+      # cannot reach a service name, and section 7 of the design says a sandbox
+      # reaches the memory service at the factory gateway address. Everything
+      # inside the estate reaches it at the service name instead.
+      #
+      # The per-route refusal rule (this listener, this port, this allowed
+      # source, refused to everything else including the local network) is NOT
+      # enforced by this bundle yet. README.md lists it as a rollout
+      # precondition, and until it is, the gateway address must be a private
+      # address of this machine.
+      - "${FACTORY_GATEWAY_ADDRESS:?name this machine's factory gateway address in the env file}:${FLEET_MEMORY_PORT:?name the port the memory service is published on in the env file}:8005"
+    healthcheck:
+      # Any HTTP answer proves the server is up; a refused connection is the
+      # failure. This is the memory repository's own probe, unchanged, and it
+      # uses the interpreter because the image has no curl.
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import urllib.request, urllib.error, sys
+          try:
+              urllib.request.urlopen("http://localhost:8005/mcp/", timeout=5)
+          except urllib.error.HTTPError:
+              pass
+          except Exception:
+              sys.exit(1)
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # -------------------------------------------------------------------------
+  # THE MEMORY RELAY — it listens on the bus and writes what it hears into the
+  # store. It PUBLISHES NOTHING: nothing outside the estate ever calls it, so
+  # it has no port, and a sandbox cannot reach it at all.
+  #
+  # ITS STATE IS A NAMED VOLUME with one writer, which is this service. The
+  # relay writes one small file after every message — when it started, when it
+  # last wrote something, how many of each — because a clean ingest is
+  # otherwise completely silent and a dead relay and a busy one look identical
+  # from outside. That file used to land in a folder under somebody's home
+  # directory; it now lands in 'memory-state', and its path inside the
+  # container is a setting rather than a guess.
+  #
+  # ITS BUS PASSWORD NEVER ENTERS ITS ENVIRONMENT EITHER. The memory
+  # repository's own compose file gives it a whole nats:// address with the
+  # password in it; here the address and the account name are plain values and
+  # the password arrives as a file, and the wrapper below builds the address
+  # for the relay's own process.
+  # -------------------------------------------------------------------------
+  memory-relay:
+    image: ${FLEET_MEMORY_RELAY_IMAGE:?name the memory relay's image in the env file, e.g. FLEET_MEMORY_RELAY_IMAGE=fleet-memory-relay:2026.09.25-2 - built by ../../scripts/build-release-image.sh with the rest of the release}
+    restart: unless-stopped
+    depends_on:
+      # The relay BINDS the MEMORY stream rather than creating it, so the bus
+      # has to hold that stream before the relay starts. The one-shot makes it,
+      # from the bus repository's own definitions.
+      nats-provision:
+        condition: service_completed_successfully
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        address_file=/run/secrets/memory_database_address
+        if [ ! -s "$$address_file" ]; then
+            echo "the memory relay was given no database address: the estate passes it in as a file, and this one arrived missing or empty. Start the estate the way deploy/estate/README.md says, with the value passed in from a child process." >&2
+            exit 1
+        fi
+        FLEET_MEMORY_PG_DSN="$$(cat "$$address_file")"
+        export FLEET_MEMORY_PG_DSN
+        password_file=/run/secrets/memory_bus_password
+        if [ ! -s "$$password_file" ]; then
+            echo "the memory relay was given no bus password: the estate passes the memory account's password in as a file, and this one arrived missing or empty." >&2
+            exit 1
+        fi
+        case "$$FLEET_MEMORY_BUS_ADDRESS" in
+          *@*)
+            echo "the memory relay's bus address carries a credential. Give the address and the account name plainly in the env file; the password comes in as a file, so it never reaches this container's declared environment." >&2
+            exit 1
+            ;;
+        esac
+        FLEET_MEMORY_NATS_URL="nats://$${FLEET_MEMORY_BUS_USER}:$$(cat "$$password_file")@$${FLEET_MEMORY_BUS_ADDRESS#nats://}"
+        export FLEET_MEMORY_NATS_URL
+        exec "$$@"
+      - the-estate-hands-the-relay-its-addresses-as-files
+    command: ["faststream", "run", "fleet_memory.app:app"]
+    environment:
+      # WHERE THE BUS IS, and AS WHOM — both plain, neither a secret. The
+      # wrapper above builds the address the relay reads from these two and the
+      # password file, and refuses an address that already carries a credential.
+      FLEET_MEMORY_BUS_ADDRESS: ${FLEET_MEMORY_BUS_ADDRESS:?name the bus's address for the memory relay in the env file, e.g. nats://nats:4222 - a service name, with no credential in it}
+      FLEET_MEMORY_BUS_USER: ${FLEET_MEMORY_BUS_USER:?name the bus account the memory relay connects as in the env file}
+      # ITS PROGRESS MARKER, inside its own volume. A plain path in a container,
+      # the same on every machine, and not a secret.
+      FLEET_MEMORY_FENCE_RELAY_MARKER_PATH: /var/lib/fleet-memory/relay-progress.json
+      FLEET_MEMORY_EMBED_URL: ${FLEET_MEMORY_EMBED_URL:?name the embedding service's address in the env file}
+      FLEET_MEMORY_EMBED_MODEL: ${FLEET_MEMORY_EMBED_MODEL:?name the embedding model in the env file}
+      FLEET_MEMORY_EMBED_DIMS: ${FLEET_MEMORY_EMBED_DIMS:?name how many dimensions that model returns in the env file}
+      FLEET_MEMORY_EMBED_TIMEOUT_S: ${FLEET_MEMORY_EMBED_TIMEOUT_S:?name the embedding timeout in seconds in the env file}
+      FLEET_MEMORY_ACK_WAIT_S: ${FLEET_MEMORY_ACK_WAIT_S:?name how long the bus waits for the relay to finish one message in the env file}
+      FLEET_MEMORY_MAX_DELIVER: ${FLEET_MEMORY_MAX_DELIVER:?name how many delivery attempts a message gets before it is parked in the env file}
+    secrets:
+      - source: memory-database-address
+        target: memory_database_address
+      - source: bus-fleet-memory-password
+        target: memory_bus_password
+    volumes:
+      # THE DESIGN'S TABLE CALLS THIS memory-state and names this service its
+      # one writer. It replaces the bind of a folder under a home directory.
+      - memory-state:/var/lib/fleet-memory
+    networks:
+      - factory
+    healthcheck:
+      # THE MARKER IS THE LIVENESS SIGNAL, which is what it was made for. The
+      # relay writes it when it starts — after the store is open — and again
+      # after every message, so a marker that exists says the relay got all the
+      # way up. There is nothing to ask this service over a network: it listens
+      # on the bus and answers nobody.
+      test: ["CMD", "test", "-f", "/var/lib/fleet-memory/relay-progress.json"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # -------------------------------------------------------------------------
   # THE COORDINATOR, composed in above, waits for the bus to be PROVISIONED and
   # not merely running. Without this line the coordinator starts against a bare
   # bus and restarts in a loop; with it, it does not start at all until the
@@ -282,6 +492,12 @@ volumes:
   # The bus's store. Forge's four volumes and the publisher's are declared by
   # the files composed in above.
   nats-jetstream:
+
+  # THE MEMORY RELAY'S OWN STATE — the design's table names the relay as its
+  # one writer. It replaces ~/.local/state/fleet-memory, a folder under
+  # somebody's home directory, which is the last thing the memory row of the
+  # design's inventory had to lose.
+  memory-state:
 
   # THE BUS'S OWN CONFIG AND PROVISIONING SCRIPTS, at the pinned commit.
   #
@@ -338,3 +554,11 @@ secrets:
   # that it is always one of the eight the bus itself is given.
   bus-provision-password:
     environment: ${NATS_PROVISION_PASSWORD_NAME:?name which of the bus's eight password names the provisioning account's password is under, e.g. RICH_NATS_PASSWORD}
+
+  # THE MEMORY STORE'S ADDRESS, WHICH CARRIES ITS PASSWORD. One value, so one
+  # secret: it is read from the environment the command was run in — the same
+  # child process the bus's passwords come from — and handed to the two memory
+  # containers as a file. It is in no file in this bundle, in no image, in no
+  # container's declared environment and in nothing either service prints.
+  memory-database-address:
+    environment: FLEET_MEMORY_PG_DSN

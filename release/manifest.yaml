@@ -51,7 +51,14 @@ schema: 2
 # release number names one set of bytes, so rather than let 2026.09.24-6 mean
 # two different things it is left unused and this is 7. There is no gap to
 # explain in any registry, because 6 never reached one.
-version: 2026.09.25-1
+#
+# 2026.09.25-2 (25 September 2026, stage 4b). What it adds to 2026.09.25-1: the
+# MEMORY SERVICE AND ITS RELAY are images of the release, built from the memory
+# repository's clone at the pin below. A release is four images now, not two.
+# Two pins move with it — forge, for the build script that can build an image
+# from another repository's clone, and fleet-memory, for the two Dockerfiles
+# that now pin the release's one base image by digest instead of a floating tag.
+version: 2026.09.25-2
 
 # The one image this repository's own operator scripts mean by "the release
 # image" (ops/forge-prod-recreate.sh reads this line). It is the same name as
@@ -68,18 +75,21 @@ python_base_digest: sha256:2e256d0381371566ed96980584957ed31297f437569b79b0e5f7e
 # ---------------------------------------------------------------------------
 # THE IMAGES THIS RELEASE IS MADE OF.
 #
-# Both are built in ONE run, from ONE set of fetched clones, and both carry
-# the same release labels — every commit, the manifest's hash, the version —
-# plus their own role. That is what makes them a set: they cannot be built
-# from different code and still answer to the same release name.
+# All four are built in ONE run, from ONE set of fetched clones, and all four
+# carry the same release labels — every commit, the manifest's hash, the
+# version — plus their own role. That is what makes them a set: they cannot be
+# built from different code and still answer to the same release name.
 #
-#   name        the image's name; its two tags are <name>:<forge commit> and
-#               <name>:<version>
+#   name        the image's name; its two tags are <name>:<its context's
+#               commit> and <name>:<version>
+#   context     which of the repositories below its Dockerfile and its build
+#               context come from. Left out, it is the build-context root —
+#               which is what every image of every earlier release meant
 #   dockerfile  the file it is built from, as a path INSIDE the fetched clone
-#               of the build-context root. Never a path on a machine
+#               of its context. Never a path on a machine
 #   role        which of the release's images this is. It goes into a label
-#   proof       the script, also from the fetched clone, that has to pass
-#               before the release calls itself built
+#   proof       the script, from the fetched clone of the BUILD-CONTEXT ROOT,
+#               that has to pass before the release calls itself built
 # ---------------------------------------------------------------------------
 images:
   - name: forge
@@ -96,6 +106,28 @@ images:
     dockerfile: src/forge/publisher/Dockerfile
     role: publisher
     proof: scripts/verify-publisher-image.sh
+  # THE TWO MEMORY IMAGES. Built as part of a release for the first time on
+  # 25 September 2026. Before that they were built by hand on one machine out
+  # of a checkout, with `docker compose up -d --build`, on a floating base tag,
+  # so "the same memory service on two machines" was not something anybody
+  # could have had.
+  #
+  # They are the first images of a release built from a repository OTHER than
+  # the one the release is cut from. `context:` names which of the pinned
+  # repositories below each one's Dockerfile and build context come from, so
+  # these two are built from the fleet-memory clone at the fleet-memory pin and
+  # tagged by THAT commit. Their proof is one of this repository's own scripts,
+  # because a release's proofs belong to the release.
+  - name: fleet-memory-mcp
+    context: fleet-memory
+    dockerfile: deploy/mcp/Dockerfile
+    role: memory
+    proof: scripts/verify-fleet-memory-image.sh
+  - name: fleet-memory-relay
+    context: fleet-memory
+    dockerfile: deploy/relay/Dockerfile
+    role: memory-relay
+    proof: scripts/verify-fleet-memory-image.sh
 
 # The five repositories that make up the images above.
 #   role: build-context-root  — the Dockerfile and the main build context

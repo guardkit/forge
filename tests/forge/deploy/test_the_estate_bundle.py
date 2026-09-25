@@ -219,16 +219,18 @@ class TestTheEstateRenders:
                     f"with a credential in it, and it prints that address: {line.strip()}"
                 )
 
-    def test_it_has_forges_services_and_the_bus(self, rendered: str) -> None:
+    def test_it_has_forges_services_the_bus_and_memory(self, rendered: str) -> None:
         """Composed in, not copied: Forge's three services are here because the
-        estate includes Forge's own file, and the bus and its one-shot because
-        the estate adds them."""
+        estate includes Forge's own file, and the bus, its one-shot and the
+        memory service's two containers because the estate adds them."""
         for service in (
             "coordinator:",
             "answer-service:",
             "forge-publisher:",
             "nats:",
             "nats-provision:",
+            "memory:",
+            "memory-relay:",
         ):
             assert service in rendered, f"{service} is missing from the estate"
 
@@ -299,14 +301,105 @@ class TestWhatTheEstatePromises:
     def test_nothing_runs_on_the_host_network(self, rendered: str) -> None:
         assert "network_mode: host" not in rendered
 
-    def test_two_published_ports_and_only_two(self, rendered: str) -> None:
+    def test_three_published_ports_and_only_three(self, rendered: str) -> None:
         """Every crossing of the sandbox boundary goes through the factory
-        gateway address, and there are exactly two of them in this bundle: the
-        read-only answer service, and the bus. Everything else talks by service
-        name."""
-        assert rendered.count("mode: ingress") == 2
+        gateway address, and there are exactly three of them in this bundle:
+        the read-only answer service, the bus, and the memory service — the
+        three things section 7 of the design says a sandbox reaches.
+        Everything else talks by service name, and the memory RELAY publishes
+        nothing at all, because nothing calls it."""
+        assert rendered.count("mode: ingress") == 3
         assert "target: 8126" in rendered, "the answer service is not published"
         assert "target: 4222" in rendered, "the bus is not published"
+        assert "target: 8005" in rendered, "the memory service is not published"
+
+    def test_the_memory_relay_publishes_nothing(self, rendered: str) -> None:
+        relay = _service_block(rendered, "memory-relay")
+        assert "ports:" not in relay, (
+            "the memory relay publishes a port. Nothing calls it — it listens "
+            "on the bus — so a published port is a way in and nothing else."
+        )
+
+    def test_memory_is_on_the_factory_network_and_no_other(
+        self, rendered: str
+    ) -> None:
+        """Not the host's network, which is where both of them ran until 25
+        September 2026, and not the publisher's, which only the coordinator
+        joins."""
+        for service in ("memory", "memory-relay"):
+            block = _service_block(rendered, service)
+            assert "factory" in block, f"{service} is not on the factory network"
+            assert "forge-publisher-net" not in block, (
+                f"{service} is on the publisher's own network, and only the "
+                "coordinator may be"
+            )
+
+    def test_the_memory_relays_state_is_a_volume_and_not_a_folder(
+        self, rendered: str
+    ) -> None:
+        """It bound ~/.local/state/fleet-memory, a folder under somebody's home
+        directory. The design's inventory row says what that was: habit."""
+        relay = _service_block(rendered, "memory-relay")
+        assert "memory-state" in relay, (
+            "the memory relay has no memory-state volume, so its progress "
+            "marker has nowhere of its own to live"
+        )
+        assert "type: bind" not in relay, (
+            "the memory relay binds a folder on this machine's disk"
+        )
+
+    def test_the_memory_store_address_never_reaches_a_container_environment(
+        self, rendered: str
+    ) -> None:
+        """It carries the store's password, so it is a secret and travels as a
+        file — the same way the bus's eight account passwords do, and
+        deliberately NOT the way the coordinator's bus address still does."""
+        for service in ("memory", "memory-relay"):
+            block = _service_block(rendered, service)
+            environment = block.split("environment:", 1)
+            if len(environment) == 2:
+                declared = environment[1].split("secrets:", 1)[0]
+                assert "FLEET_MEMORY_PG_DSN:" not in declared, (
+                    f"{service} names the store's address in its container "
+                    "environment, where 'docker inspect' would show its password"
+                )
+            assert "memory_database_address" in block, (
+                f"{service} is not given the store's address as a file"
+            )
+
+    def test_the_relays_bus_address_carries_no_credential(
+        self, rendered: str
+    ) -> None:
+        """The memory repository's own compose file hands the relay a whole
+        nats:// address with the password in it. Here the address and the
+        account are plain and the password arrives as a file."""
+        relay = _service_block(rendered, "memory-relay")
+        for line in relay.splitlines():
+            if "nats://" in line:
+                address = line.split("nats://", 1)[1]
+                assert "@" not in address.split()[0], (
+                    "the memory relay is given a bus address with a credential "
+                    f"in it: {line.strip()}"
+                )
+        assert "memory_bus_password" in relay, (
+            "the memory relay is not given the bus password as a file"
+        )
+
+    def test_each_memory_service_writes_its_command_out(
+        self, rendered: str
+    ) -> None:
+        """NAMING AN ENTRYPOINT EMPTIES THE IMAGE'S OWN COMMAND. Both of these
+        services name one, because each is given its database address as a file
+        rather than as a value anybody with the Docker daemon can read — so
+        each has to write its command out, and a release proof holds those two
+        lines to what the two images really say."""
+        for service in ("memory", "memory-relay"):
+            block = _service_block(rendered, service)
+            assert "entrypoint:" in block, f"{service} names no entrypoint"
+            assert "command:" in block, (
+                f"{service} names an entrypoint and no command, so it would "
+                "start with no command at all"
+            )
 
     def test_the_coordinator_waits_for_the_bus_to_be_provisioned(
         self, rendered: str
@@ -349,8 +442,8 @@ def _the_manifests_version() -> str:
 class TestTheExampleNamesTheReleaseThatExists:
     """Forge's own example env named a release the manifest had moved past
     twice in one day (24 September 2026) — once one that could not run the
-    shipped settings, once one that was never built. The estate has FOUR image
-    lines and a volume named after the release, so all five are held here and
+    shipped settings, once one that was never built. The estate has SIX image
+    lines and a volume named after the release, so all seven are held here and
     the manifest cannot move without them."""
 
     def test_every_image_line_names_the_manifests_release(self) -> None:
@@ -359,6 +452,8 @@ class TestTheExampleNamesTheReleaseThatExists:
         for line in (
             f"FORGE_IMAGE=forge:{version}",
             f"FORGE_PUBLISHER_IMAGE=forge-publisher:{version}",
+            f"FLEET_MEMORY_MCP_IMAGE=fleet-memory-mcp:{version}",
+            f"FLEET_MEMORY_RELAY_IMAGE=fleet-memory-relay:{version}",
             f"NATS_IMAGE=factory-nats:{version}",
             f"NATS_PROVISION_IMAGE=factory-nats-provision:{version}",
             f"BUS_SOURCE_VOLUME=factory-bus-source-{version}",
@@ -431,6 +526,17 @@ THE_DESIGNS_ITEMS = {
         "the-bus-answers",
         "the bus, the memory service and the model seat each answer at the "
         "address the env file gives",
+    ),
+    "8c": (
+        "the-memory-service-answers",
+        "the memory service answers at the address the env file gives — the "
+        "part of the design's item 8 that the memory service is",
+    ),
+    "8c-relay": (
+        "the-memory-relay-is-running",
+        "the memory relay is running and has written the progress marker it "
+        "writes when it starts. It answers nobody over a network, so that "
+        "file is the honest question to ask about it",
     ),
     "9": (
         "the-answer-service-from-inside-a-sandbox",
