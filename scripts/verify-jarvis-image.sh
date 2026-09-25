@@ -60,13 +60,16 @@
 #      to either.
 #
 #      WHO ASKS THAT QUESTION NOW. The release build does, for every image it
-#      builds: scripts/build-release-image.sh exports each image's whole
-#      filesystem and searches it, along with the configuration, the labels and
-#      the history, for words that come from the MACHINE in RELEASE_SWEEP_TERMS
-#      — never from a list written into a tracked file, which would be the
-#      defect itself. A hit refuses the release and names the image, the file
-#      and the word. This script keeps the small, cheap question it has always
-#      asked, and says plainly that it is the smaller one.
+#      builds: scripts/build-release-image.sh searches each image's whole
+#      filesystem AND EVERY LAYER A PUSH WOULD SEND — a file copied in and
+#      deleted by a later step is gone from the first and still in the second,
+#      which is how this very image once carried another repository's clone —
+#      along with the configuration, the labels and the history, for words that
+#      come from the MACHINE in RELEASE_SWEEP_TERMS, never from a list written
+#      into a tracked file, which would be the defect itself. A hit refuses the
+#      release and names the image, the file and the word. This script keeps
+#      the small, cheap question it has always asked, and says plainly that it
+#      is the smaller one.
 #
 # Nothing here names a target project's language, test runner, package manager
 # or layout. It asks about one image of this factory's own estate.

@@ -940,3 +940,101 @@ def test_the_existing_tag_refusal_still_exists_for_a_real_build():
         "the existing-tag refusal is back above the --plan-only branch, so a "
         "read-only plan needs --allow-existing-tag again"
     )
+
+
+# ---------------------------------------------------------------------------
+# THE SWEEP READS WHAT A PUSH SENDS, and not only what a container would see
+#
+# Added 25 September 2026, after a review measured the gap. `docker export` is
+# the FLATTENED FINAL filesystem: a file a Dockerfile copies in and a later
+# step deletes is gone from it and still in the image, because the layer that
+# holds it is still one of the image's layers and is still what `docker save`
+# and a registry push send. On the jarvis image — the image this sweep was
+# written for — the export carried this estate's account name in 0 files while
+# the image's own layers carried it in 2,194.
+# ---------------------------------------------------------------------------
+
+
+def test_the_sweep_reads_every_layer_a_push_would_send():
+    script = SCRIPT.read_text(encoding="utf-8")
+    assert "docker save" in script, (
+        "the sweep no longer reads what a push would send, so a file deleted "
+        "by a later layer is invisible to it while still being in the image"
+    )
+    assert "sweep_layers" in script, "the release script has no layer sweep"
+    assert "sweep_layers " in script.split("sweep_layers()", 1)[1], (
+        "the layer sweep is defined and never called"
+    )
+
+
+def test_a_layer_that_could_not_be_unpacked_is_not_a_pass():
+    """Not swept is not a pass — for the layers as well as for the export."""
+    script = SCRIPT.read_text(encoding="utf-8")
+    for sentence in (
+        "could not be saved, so the layers a push would send could not be swept",
+        "so part of what a push would send was never searched",
+        "could not be unpacked, so its layers were never searched",
+    ):
+        assert sentence in script, (
+            f"the layer sweep no longer refuses when it cannot read something: {sentence!r}"
+        )
+
+
+def test_every_layer_is_unpacked_on_its_own_so_one_cannot_hide_another():
+    """Two layers can hold different files at the same path; unpacked over
+    each other, the earlier one would be swept in the later one's clothes — or
+    not swept at all."""
+    script = SCRIPT.read_text(encoding="utf-8")
+    assert '${dir}/layers/${layers}' in script, (
+        "the layers are no longer unpacked into a directory of their own"
+    )
+    assert "in layer ${i} of ${layers}" in script, (
+        "a refusal no longer says which layer the file is in"
+    )
+
+
+def test_a_file_whose_name_carries_the_word_is_a_hit_too():
+    """A machine's name in a path is the same defect as one in a line."""
+    script = SCRIPT.read_text(encoding="utf-8")
+    sweep_tree = script.split("sweep_tree() {", 1)[1].split("\n}", 1)[0]
+    assert "find" in sweep_tree and 'case "${path#"${root}"}"' in sweep_tree, (
+        "the sweep reads file contents only, so a file NAMED after this "
+        "machine would pass"
+    )
+
+
+def test_a_refused_sweep_removes_the_tags_that_run_wrote():
+    """Both tags are written at build time, before anything can be swept.
+
+    Left behind, they make the next attempt at the same commit refuse with
+    "the tag ... already exists", and the operator reaches for
+    --allow-existing-tag — the habit the plan-only fix has just finished
+    getting rid of.
+    """
+    script = SCRIPT.read_text(encoding="utf-8")
+    assert "remove_this_runs_tags" in script, "a refused sweep leaves its tags on the machine"
+    refusal = script.index("carries names belonging to the machine that built it")
+    called = script.index("        remove_this_runs_tags\n")
+    assert called > refusal, "the tags are not removed on the sweep's refusal"
+    assert "docker rmi" in script, "nothing removes a tag"
+
+
+def test_a_tag_that_was_there_before_the_run_is_left_alone():
+    """Only with --allow-existing-tag can a tag pre-date the run, and that one
+    is not this run's to remove."""
+    script = SCRIPT.read_text(encoding="utf-8")
+    assert "PRE_EXISTING_TAGS" in script
+    assert "was on this machine before this run started, so it has been left alone" in script
+
+
+def test_the_estates_env_example_says_that_filling_it_in_does_not_arm_the_sweep():
+    """RELEASE_SWEEP_TERMS lives in compose's env file, and the release build
+    reads the environment of the shell that runs it and sources no file."""
+    example = (REPO_ROOT / "deploy" / "estate" / ".env.example").read_text(encoding="utf-8")
+    assert "DOES NOT BY ITSELF ARM" in example, (
+        "the estate's .env.example still reads as though filling in "
+        "RELEASE_SWEEP_TERMS there is what makes a release build sweep"
+    )
+    assert "export RELEASE_SWEEP_TERMS=" in example, (
+        "the estate's .env.example does not say how to arm the sweep"
+    )
