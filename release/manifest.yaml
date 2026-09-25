@@ -13,7 +13,7 @@
 # from GitHub at the commit below into a fresh temporary folder and builds
 # every image below from those clones alone. Nothing beside forge/ is used.
 #
-# All five repositories are public, so fetching them needs no credential.
+# All six repositories are public, so fetching them needs no credential.
 #
 # To cut a new release: change the commits and the version, then run
 #   scripts/build-release-image.sh /path/to/manifest.yaml
@@ -76,7 +76,24 @@ schema: 2
 # anybody rebuilding fleet-memory from its own compose file as well. It was
 # tested rather than assumed (the package installs, both entry modules import,
 # and a real message went end to end on 3.14).
-version: 2026.09.25-3
+#
+# 2026.09.25-4 (25 September 2026, stage 4c). What it adds to 2026.09.25-3: the
+# SLACK FRONT DOOR AND THE BUS GATEWAY are one image of the release, built from
+# the jarvis repository's clone at the pin below — a SIXTH repository, and the
+# second built from a repository other than the one the release is cut from. A
+# release is five images now, not four. Two pins move with it: jarvis, for the
+# Dockerfile that did not exist until today, and forge, for the proof script
+# that opens that image and the estate that runs the two services out of it.
+#
+# THE JARVIS PIN IS NOT ON GITHUB YET, and this line is written knowing that.
+# The commit below is local to the machine this was made on, so a release build
+# from this manifest STOPS AT THE FETCH and says so — which is the behaviour
+# that exists to stop a release being cut from anybody's disk. The coordinating
+# session pushes that commit; until it does, this version cannot be built, and
+# what was proved instead is written up in the stage 4c evidence: the same
+# Dockerfile, built to throwaway tags from a local clone, running the estate's
+# two services.
+version: 2026.09.25-4
 
 # The one image this repository's own operator scripts mean by "the release
 # image" (ops/forge-prod-recreate.sh reads this line). It is the same name as
@@ -93,7 +110,7 @@ python_base_digest: sha256:2e256d0381371566ed96980584957ed31297f437569b79b0e5f7e
 # ---------------------------------------------------------------------------
 # THE IMAGES THIS RELEASE IS MADE OF.
 #
-# All four are built in ONE run, from ONE set of fetched clones, and all four
+# All five are built in ONE run, from ONE set of fetched clones, and all five
 # carry the same release labels — every commit, the manifest's hash, the
 # version — plus their own role. That is what makes them a set: they cannot be
 # built from different code and still answer to the same release name.
@@ -146,15 +163,33 @@ images:
     dockerfile: deploy/relay/Dockerfile
     role: memory-relay
     proof: scripts/verify-fleet-memory-image.sh
+  # THE JARVIS IMAGE. Built as part of a release for the first time on 25
+  # September 2026. Before that the Slack front door and the bus gateway ran as
+  # host units out of a checkout and a virtual environment under a home
+  # directory, so "the same front door on two machines" was not something
+  # anybody could have.
+  #
+  # ONE IMAGE, TWO SERVICES, which is why there is one entry here and not two:
+  # the front door serves the graphs that repository declares, the gateway is
+  # the same package's own command on the bus, and they share every dependency.
+  # The estate starts them with two different commands out of this one image —
+  # the same shape the coordinator and the answer service already have. The
+  # role says 'front-door' because that is the service the image's own CMD is,
+  # and its proof holds the estate's two commands to what the image can run.
+  - name: jarvis
+    context: jarvis
+    dockerfile: deploy/Dockerfile
+    role: front-door
+    proof: scripts/verify-jarvis-image.sh
 
-# The five repositories that make up the images above.
+# The six repositories that make up the images above.
 #   role: build-context-root  — the Dockerfile and the main build context
 #   role: named-context       — supplied to the build as --build-context <name>=<clone>
 repositories:
   - name: forge
     url: https://github.com/guardkit/forge.git
     branch: main
-    commit: ab0385574e6bedca19e57f3e00de6e7730d868be
+    commit: 3d437fc15bb1ea75882d5f932843bd0c30cea836
     role: build-context-root
   - name: guardkit
     url: https://github.com/guardkit/guardkit.git
@@ -175,4 +210,17 @@ repositories:
     url: https://github.com/guardkit/guardkitfactory.git
     branch: main
     commit: 8358670e3c57442bcc8862ea4ff96a7f4ec78dc7
+    role: named-context
+  # THE SIXTH REPOSITORY (25 September 2026). It is a named context like the
+  # four above — the jarvis image is built from ITS clone, at this pin, and
+  # tagged by this commit — and it is also, like fleet-memory, a repository the
+  # release builds an image FROM rather than merely copies code out of.
+  #
+  # THIS COMMIT IS NOT ON GITHUB YET. See the note beside the version above: a
+  # release build from this manifest stops at the fetch until it is pushed, and
+  # that is the check working, not failing.
+  - name: jarvis
+    url: https://github.com/guardkit/jarvis.git
+    branch: main
+    commit: 59a919d92cf88752988388b2b6d1df4882ffebf5
     role: named-context
