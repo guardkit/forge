@@ -19,17 +19,21 @@
 # names a path belonging to any machine.
 #
 # WHY THESE TWO ARE NOT IN release/manifest.yaml, which is where a release's
-# images belong. That manifest and its build script have one build-context
-# root — every image's Dockerfile is a path inside the clone of the repository
-# the release is cut from — and one base image digest that every Dockerfile of
-# the release must start FROM. The bus is a different repository and starts
-# FROM a NATS base, not the Python base, so putting it in the manifest means
-# changing what a release IS: per-image context roots and per-image bases. That
-# is a real change to the release script and to the meaning of the release
-# labels, and it deserves its own pass rather than a corner of this one. Until
-# then the pin lives in estate-pins.conf, the tag carries the same release
-# version as the release images, and a test holds the example env file to it —
-# so the estate still moves as one release, and nothing here is unpinned.
+# images belong. Two things used to keep every release image inside one
+# repository: one build-context root, and one base image digest that every
+# Dockerfile of the release must start FROM.
+#
+# The first is gone — on 25 September 2026 an image entry gained a `context:`,
+# naming which of the manifest's own repositories it is built from, and the
+# memory service and its relay are release images on that footing. The second
+# still stands, and it is what keeps the bus out: the bus starts FROM a NATS
+# base rather than the Python one, and a release with two bases is two supply
+# chains under one name. Per-image bases are a change to what a release MEANS —
+# every image's labels say which base the release pins — and that deserves its
+# own pass rather than a corner of this one. Until then the pin lives in
+# estate-pins.conf, the tag carries the same release version as the release
+# images, and a test holds the example env file to it — so the estate still
+# moves as one release, and nothing here is unpinned.
 #
 #   ./build-estate-images.sh                 # tags both at the release version
 #   ./build-estate-images.sh --version 9.9   # a throwaway tag, for a proof

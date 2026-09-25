@@ -18,7 +18,7 @@ two today. One description of each service, in the repository that owns it.
 
 | File | What it is |
 |---|---|
-| `compose.yaml` | composes Forge's two compose files and adds the bus and the one-shot that provisions it |
+| `compose.yaml` | composes Forge's two compose files and adds the bus, the one-shot that provisions it, and the memory service's two containers |
 | `.env.example` | every setting name the whole estate needs, with no machine's values. Copy to `.env` |
 | `estate-pins.conf` | what the estate's own two images are built from. Part of the release, never edited per machine. Not named `.env`, because this repository ignores the whole `.env` family as a secrets fence and these are pins, not secrets |
 | `build-estate-images.sh` | builds those two images, and fills the volume holding the bus's own config, from the bus repository at its pinned commit |
@@ -39,8 +39,8 @@ in `../compose/`, and is referenced from here rather than copied.
    `./build-estate-images.sh`. It fetches the bus repository from GitHub at the
    commit `estate-pins.conf` pins, builds the bus from **the bus repository's
    own Dockerfile**, builds the one-shot, and puts the bus's config and
-   provisioning scripts into a volume. The two release images
-   (`forge` and `forge-publisher`) come from
+   provisioning scripts into a volume. The four release images (`forge`,
+   `forge-publisher`, `fleet-memory-mcp` and `fleet-memory-relay`) come from
    `../../scripts/build-release-image.sh` or from a registry.
 4. **`cp .env.example .env`** and fill in the lines marked CHANGE THIS: the
    factory gateway address, the two sandbox ports, and the paths of the secret
@@ -109,6 +109,51 @@ environment of the `docker compose` command as a child process. From there:
   code to change, not this bundle's, and it is listed with the rollout
   preconditions below.
 
+## Memory — what the factory remembers
+
+**What it is.** The factory's memory across sessions and across builds: what was
+decided, what a build found, what was said about a repository last week. Without
+it every session starts from nothing.
+
+**Two containers, because it does two things.**
+
+- **`memory`** answers questions. It is the memory repository's resident service,
+  and it is the one the coordinator, a Claude session and a build all ask. Inside
+  the estate it is reached at the service name `memory`; a project's sandbox is a
+  separate small machine and reaches it at the factory gateway address, which is
+  why it is the third and last published port here;
+- **`memory-relay`** listens on the bus and writes what it hears into the store.
+  It **publishes nothing** — nothing calls it — and it keeps one small file of
+  its own, in its own volume, saying when it started and when it last wrote
+  something. That file is the only sign of life it gives, because a clean write
+  is completely silent: the memory flywheel once went dark for a month and
+  nothing said so.
+
+**What changed on 25 September 2026.** Both of them ran on the **host's own
+network**, and the relay bound a folder under a home directory
+(`~/.local/state/fleet-memory`). The design's inventory row says what that was:
+habit. They now sit on the `factory` network like everything else, the relay's
+folder is the named volume `memory-state` with the relay as its one writer, and
+the marker's path inside the container is a setting rather than a guess.
+
+**Its database is outside this estate.** It is a Postgres with pgvector, on
+another machine, and this bundle reaches it at an **address** — one it never
+writes down, because that address carries the store's password in it. The
+address arrives the way the bus's account passwords do, from a child process,
+and compose hands it to the two containers as a **file**; a small wrapper puts
+it into the environment of each service's own process and nowhere else. It is in
+no file here, no image, no container's declared environment and nothing either
+service prints. **Where that database should live is an open question the design
+has not answered** — it is not in the estate, it is not in the two walks, and a
+clean machine reaches the existing one or is given one of its own. That is the
+largest thing still outstanding about memory.
+
+**What is deliberately not here:** the database above, and the **embedding
+service** (the model that turns text into the numbers the store searches on).
+Both are addresses in `.env`. The embedding service is a model seat, and model
+seats are out of this gate by the same rule as the others: the GPU is where the
+GPU is, and on another machine it is a line in the env file.
+
 ## Walk (b): a cloud machine
 
 **The same nine steps, the same bundle, the same images.** Only `.env` differs,
@@ -168,12 +213,16 @@ from the one-shot's exit code; the coordinator's own health route; the answer
 service answering for a build nobody wrote down; and the publisher answering
 the coordinator **and refusing the answer service**.
 
-**Two of its items ask nothing here, and say so.** The memory service and the
-model seat are in the design's item 8 and are not in this bundle yet, so with
-no address in `.env` they print *not checked here* and count as **not passed**,
-exactly as item 9 does. A run that reported them as passes would be saying it
-had asked something it never asked. Give either an address and the check asks
-it.
+It also asks the memory service at the address `.env` gives, and asks the memory
+relay for its progress marker — the relay answers nobody over a network, so
+"has it written the file it writes when it starts" is the honest question.
+
+**One of its items asks nothing here, and says so.** The model seat is in the
+design's item 8 and is not in this bundle, so with no address in `.env` it
+prints *not checked here* and counts as **not passed**, exactly as item 9 does.
+A run that reported it as a pass would be saying it had asked something it never
+asked. Give it an address and the check asks it. (The memory service was in the
+same position until 25 September 2026, when it joined the bundle.)
 
 **What it does not prove about the routes.** Section 7 of the design asks this
 check to prove every permitted direction and **every forbidden** one —
@@ -196,10 +245,20 @@ met until it runs for real.
 
 ## What is deliberately not here yet
 
-- **The memory service and the model seats.** Their compose files are in their
-  own repositories and will be composed in here, the same way Forge's are.
-  Until then `.env` can name their addresses and `estate-check services` will
-  ask them.
+- **The model seats**, including the embedding service memory uses. They are
+  addresses in `.env`; the GPU is where the GPU is.
+- **The memory store's own database.** Memory is here; its Postgres is not, and
+  where it should live is an open question of the design (above).
+- **The memory service's compose description lives here rather than in the
+  memory repository.** The design says each service's compose file belongs to
+  the repository that owns the service, and the estate composes it in — which is
+  what it does for Forge's own two. Memory's two services are described in this
+  bundle's own `compose.yaml` instead, because the work that added them was
+  allowed to change the memory repository only where its Dockerfiles could not
+  otherwise be built. Moving them into `fleet-memory/deploy/compose/` and
+  including that file is a small change of its own, and until it is made there
+  are two descriptions of those containers: the memory repository's own
+  host-network ones, which are what runs today, and these.
 - **The front door** (the Slack side) and the bus gateway — jarvis's own
   compose file, a later rollout row.
 - **The sandboxes themselves.** Making one is still an attended step. The
@@ -264,9 +323,10 @@ the design:
    moved; a digest cannot, and the whole point of the gate is that the tested
    image is what runs. (The bus's base image *is* pinned by digest in
    `estate-pins.conf`; it is the four release tags that are not.)
-4. **The memory service and the model seat have not been asked for real** —
-   they are not in the bundle, so two of the design's item 8 parts count as not
-   passed (above).
+4. **The model seat has not been asked for real** — it is not in the bundle, so
+   that part of the design's item 8 counts as not passed (above). The memory
+   service and its relay joined the bundle on 25 September 2026 and are asked
+   for real.
 5. **api_test's bootstrap has not been refreshed** from Forge's template.
 6. **Recovery after a sandbox-daemon restart is unproven** — the daemon is
    shared with live sandboxes, so it needs the owner present.
@@ -281,20 +341,24 @@ the design:
 ## Why the bus's image is not in the release manifest
 
 `../../release/manifest.yaml` is where a release's images belong, and the bus's
-is not there yet. The manifest and its build script have **one** build-context
-root — every image's Dockerfile is a path inside the clone of the repository
-the release is cut from — and **one** base image digest that every Dockerfile
-of the release must start FROM. The bus is a different repository and starts
-FROM a NATS base rather than the Python one, so putting it in the manifest
-means changing what a release *is*: per-image context roots and per-image
-bases. That is a real change to the release script and to the meaning of the
-release's labels, and it deserves a pass of its own rather than a corner of
-this one.
+is not there. Two things used to keep every release image inside one
+repository: **one** build-context root, and **one** base image digest that
+every Dockerfile of the release must start FROM.
 
-Until then the pin lives in `estate-pins.conf`, the images are tagged with the
-**same release version** as the release images, and a test holds all four image
-lines in `.env.example` to the manifest's version. So the estate still moves as
-one release and nothing here is unpinned — but the bus's pin is advanced by
+The first of those is gone. On 25 September 2026 an image entry gained a
+`context:`, naming which of the manifest's own repositories it is built from,
+so the memory service and its relay are release images built from the memory
+repository's clone at the memory repository's pin. The second still stands, and
+it is what keeps the bus out: the bus starts FROM a NATS base, not the Python
+one, and a release with two bases is two supply chains under one name. Giving
+the manifest per-image bases is a change to what a release *means* — every
+image's labels say which base the release pins — and it deserves a pass of its
+own.
+
+So the bus's pin still lives in `estate-pins.conf`, its images are tagged with
+the **same release version** as the release images, and a test holds all six
+image lines in `.env.example` to the manifest's version. The estate still moves
+as one release and nothing here is unpinned — but the bus's pin is advanced by
 hand, in a second file, and that is the cost of leaving it out.
 
 ## Bring it down

@@ -441,9 +441,29 @@ python_base_digest: {_BASE_DIGEST}
 # ---------------------------------------------------------------------------
 
 
+def _pins_of(text: str) -> dict[str, str]:
+    """repository name -> pinned commit, from the manifest's own lines."""
+    pins: dict[str, str] = {}
+    name = ""
+    for line in text.splitlines():
+        stripped = line.split("#", 1)[0].strip()
+        if stripped.startswith("- name:"):
+            name = stripped.split(":", 1)[1].strip()
+        elif stripped.startswith("commit:") and name:
+            pins[name] = stripped.split(":", 1)[1].strip()
+    return pins
+
+
 @needs_docker
-def test_the_shipped_manifest_plans_the_coordinator_and_the_publisher(tmp_path):
-    """Read from a folder holding only a copy of it, as a clean machine would."""
+def test_the_shipped_manifest_plans_all_four_images(tmp_path):
+    """Read from a folder holding only a copy of it, as a clean machine would.
+
+    FOUR, since 25 September 2026: the coordinator, the publisher, the memory
+    service and the memory relay. The last two are built from the memory
+    repository's clone at the memory repository's pin, which is what a
+    per-image context is for — before it, a service whose code lives in another
+    repository could not be a release image at all.
+    """
     elsewhere = tmp_path / "a-folder-that-is-not-a-checkout"
     elsewhere.mkdir()
     copy = elsewhere / "manifest.yaml"
@@ -457,24 +477,138 @@ def test_the_shipped_manifest_plans_the_coordinator_and_the_publisher(tmp_path):
     result = _plan(copy, "--allow-existing-tag")
 
     assert result.returncode == 0, result.stderr
-    assert "would build 2 image(s)" in result.stdout
+    assert "would build 4 image(s)" in result.stdout
     assert "forge [coordinator] from forge/Dockerfile" in result.stdout
     assert (
         "forge-publisher [publisher] from forge/src/forge/publisher/Dockerfile"
         in result.stdout
     )
+    assert (
+        "fleet-memory-mcp [memory] from fleet-memory/deploy/mcp/Dockerfile"
+        in result.stdout
+    )
+    assert (
+        "fleet-memory-relay [memory-relay] from fleet-memory/deploy/relay/Dockerfile"
+        in result.stdout
+    )
     assert "proved by : forge/scripts/verify-forge-oracles.sh" in result.stdout
     assert "proved by : forge/scripts/verify-publisher-image.sh" in result.stdout
+    assert "proved by : forge/scripts/verify-fleet-memory-image.sh" in result.stdout
+
+
+@needs_docker
+def test_an_image_is_tagged_by_the_commit_of_the_repository_it_came_from(tmp_path):
+    """The memory images carry the MEMORY repository's commit, not Forge's.
+
+    A commit tag says "this is what that repository was at". Tagging an image
+    built from another repository's clone with the release root's commit would
+    make that sentence untrue for every image but one, which is worse than no
+    commit tag at all. The release VERSION tag is what says they were built
+    together.
+    """
+    elsewhere = tmp_path / "somewhere"
+    elsewhere.mkdir()
+    copy = elsewhere / "manifest.yaml"
+    text = SHIPPED_MANIFEST.read_text(encoding="utf-8")
+    copy.write_text(text, encoding="utf-8")
+
+    pins = _pins_of(text)
+    result = _plan(copy, "--allow-existing-tag")
+    assert result.returncode == 0, result.stderr
+
+    assert f"forge:{pins['forge']}" in result.stdout
+    assert f"fleet-memory-mcp:{pins['fleet-memory']}" in result.stdout
+    assert f"fleet-memory-relay:{pins['fleet-memory']}" in result.stdout
+    assert f"fleet-memory-mcp:{pins['forge']}" not in result.stdout
+
+
+@needs_docker
+def test_an_image_whose_context_is_not_a_pinned_repository_is_refused(tmp_path):
+    """A context is one of the repositories the release pins, or nothing."""
+    manifest = _manifest(
+        tmp_path,
+        f"""
+schema: 2
+version: 0.0.0-test
+image_name: the-coordinator
+python_base_digest: {_BASE_DIGEST}
+{_repositories()}
+images:
+  - name: the-coordinator
+    dockerfile: Dockerfile
+    role: coordinator
+  - name: from-nowhere
+    dockerfile: Dockerfile
+    role: stray
+    context: a-repository-nobody-pinned
+""",
+    )
+    result = _plan(manifest)
+
+    assert result.returncode != 0
+    assert "a-repository-nobody-pinned" in result.stderr
+    assert "names no repository of that name" in result.stderr
+
+
+@needs_docker
+def test_an_image_with_a_context_is_planned_from_that_repositorys_clone(tmp_path):
+    manifest = _manifest(
+        tmp_path,
+        f"""
+schema: 2
+version: 0.0.0-context
+image_name: the-coordinator
+python_base_digest: {_BASE_DIGEST}
+{_repositories()}
+images:
+  - name: the-coordinator
+    dockerfile: Dockerfile
+    role: coordinator
+  - name: the-other-one
+    dockerfile: deploy/Dockerfile
+    role: elsewhere
+    context: other
+""",
+    )
+    result = _plan(manifest)
+
+    assert result.returncode == 0, result.stderr
+    assert "the-other-one [elsewhere] from other/deploy/Dockerfile" in result.stdout
+    assert f"would tag : the-other-one:{_OTHER_COMMIT}" in result.stdout
+    assert f"would tag : the-coordinator:{_FORGE_COMMIT}" in result.stdout
 
 
 def test_the_shipped_manifest_names_files_this_repository_really_has():
-    """Every dockerfile and proof it names is in the tree it is cut from."""
-    named: list[str] = []
+    """Every dockerfile in THIS repository's own context, and every proof.
+
+    An image built from another repository's clone names a file this tree does
+    not have, and it must not be looked for here: the release build checks it
+    against the fetched clone at the pin, which is the only honest place. A
+    proof, though, is always this repository's — the proofs belong to the
+    release, and asking another repository to carry the factory's proof script
+    would put the factory into it.
+    """
+    entries: list[dict[str, str]] = []
+    current: dict[str, str] | None = None
     for line in SHIPPED_MANIFEST.read_text(encoding="utf-8").splitlines():
-        stripped = line.split("#", 1)[0].strip().lstrip("- ").strip()
-        for key in ("dockerfile:", "proof:"):
-            if stripped.startswith(key):
-                named.append(stripped[len(key):].strip())
+        stripped = line.split("#", 1)[0].strip()
+        if not stripped:
+            continue
+        if stripped.startswith("- "):
+            current = {}
+            entries.append(current)
+            stripped = stripped[2:].strip()
+        if current is None or ":" not in stripped:
+            continue
+        key, value = stripped.split(":", 1)
+        current[key.strip()] = value.strip()
+
+    named: list[str] = []
+    for entry in entries:
+        if "proof" in entry:
+            named.append(entry["proof"])
+        if "dockerfile" in entry and entry.get("context", "forge") == "forge":
+            named.append(entry["dockerfile"])
 
     assert named, "the shipped manifest names no dockerfile at all"
     for path in named:

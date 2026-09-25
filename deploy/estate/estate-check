@@ -61,6 +61,7 @@ ITEMS=(
 "services|8|the-bus-answers|the bus answers at the address the env file gives"
 "services|8b|the-buses-storage-is-provisioned|the bus's key-value buckets and streams exist, asked of the bus itself"
 "services|8c|the-memory-service-answers|the memory service answers at the address the env file gives"
+"services|8c-relay|the-memory-relay-is-running|the memory relay is running and has written its progress marker into its own volume"
 "services|8d|the-model-seat-answers|the model seat answers at the address the env file gives"
 "services|8e|the-coordinator-answers|the coordinator answers on its own health route"
 "services|8f|the-answer-service-answers|the answer service answers for a build nobody wrote down"
@@ -228,7 +229,8 @@ check_host() {
     # --- 4 -----------------------------------------------------------------
     if [ "${docker_ok}" = "yes" ]; then
         local missing="" fetchable="" image
-        for name in FORGE_IMAGE FORGE_PUBLISHER_IMAGE NATS_IMAGE NATS_PROVISION_IMAGE; do
+        for name in FORGE_IMAGE FORGE_PUBLISHER_IMAGE FLEET_MEMORY_MCP_IMAGE \
+                    FLEET_MEMORY_RELAY_IMAGE NATS_IMAGE NATS_PROVISION_IMAGE; do
             image="$(get "${name}")"
             if [ -z "${image}" ]; then
                 missing="${missing} ${name}=<nothing set>"
@@ -250,7 +252,7 @@ check_host() {
         elif [ -n "${fetchable}" ]; then
             ok 4 "every image the env file names is here or can be fetched; these would be fetched on first start:${fetchable}. Checked by TAG: the design asks for digests and this bundle does not name them yet, which README.md records as a rollout precondition."
         else
-            ok 4 "all four images the env file names are on this machine, and so is the volume holding the bus's own config. Checked by TAG: the design asks for digests and this bundle does not name them yet, which README.md records as a rollout precondition."
+            ok 4 "all six images the env file names are on this machine, and so is the volume holding the bus's own config. Checked by TAG: the design asks for digests and this bundle does not name them yet, which README.md records as a rollout precondition."
         fi
     else
         unchecked 4 "docker does not answer, so the images could not be looked for."
@@ -508,8 +510,9 @@ check_services() {
     # --- 8b ----------------------------------------------------------------
     check_bus_storage
 
-    # --- 8c / 8d -----------------------------------------------------------
+    # --- 8c / 8c-relay / 8d -------------------------------------------------
     check_named_address 8c "the memory service" "$(get FLEET_MEMORY_URL)" "${coordinator}"
+    check_the_memory_relay
     check_named_address 8d "the model seat"     "$(get MODEL_SEAT_URL)"   "${coordinator}"
 
     # --- 8e ----------------------------------------------------------------
@@ -561,6 +564,30 @@ check_services() {
     check_from_inside_a_sandbox
 
     finish
+}
+
+# THE MEMORY RELAY. There is nothing to ask it over a network: it listens on
+# the bus and answers nobody, and it publishes no port on purpose. What it does
+# emit is one small file — when it started, when it last wrote something to
+# memory, how many of each — and it writes that file after every message
+# BECAUSE a clean ingest is otherwise completely silent, which is how the
+# memory flywheel once went dark for a month with nothing saying so.
+#
+# So that file is what this item asks for, INSIDE the relay's own volume. A
+# marker that is there says the relay got all the way up: it is written in the
+# relay's start-up, after the store is open. A relay that is running but has
+# never written one has not finished starting, and this says which.
+check_the_memory_relay() {
+    local relay marker
+    relay="$(container_of memory-relay)"
+    marker="/var/lib/fleet-memory/relay-progress.json"
+    if [ -z "${relay}" ]; then
+        fail 8c-relay "the memory relay is not running in this estate, so nothing is writing what the factory hears on the bus into memory."
+    elif docker exec "${relay}" test -f "${marker}" >/dev/null 2>&1; then
+        ok 8c-relay "the memory relay is running and has written its progress marker at ${marker}, inside its own volume rather than a folder under anybody's home directory — which is the relay's only sign of life, because a clean ingest is silent."
+    else
+        fail 8c-relay "the memory relay is running but has not written its progress marker at ${marker}. It writes that file as it starts, after the store is open, so this usually means it has not got that far: look at its log for the store or the bus."
+    fi
 }
 
 # A part of the design's item 8 that the estate does not carry yet.

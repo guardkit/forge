@@ -83,12 +83,37 @@
 #               set. A release cut before the publisher's image existed still
 #               builds, unchanged.
 #   schema: 2   names a SET, under `images:`. Each entry has a name, the
-#               dockerfile to build it from (a path inside the build-context
-#               root's clone), its role in the release, and optionally the
-#               proof script that has to pass before the release is called
+#               dockerfile to build it from (a path inside the clone of the
+#               repository named by its `context`, which defaults to the
+#               build-context root), its role in the release, and optionally
+#               the proof script that has to pass before the release is called
 #               built. `image_name` stays, and must be the name of the one
 #               entry whose role is `coordinator`: it is the image this
 #               repository's own operator scripts mean by "the release image".
+#
+# PER-IMAGE CONTEXT ROOTS (25 September 2026, stage 4b of the rollout gate).
+# Until this pass every image of a release was built from the clone of the ONE
+# repository the release is cut from, so a service whose code lives in another
+# repository could not be a release image at all — which is why the memory
+# service and its relay were outside the release and the bus still is. An image
+# entry may now name `context: <repository>`, one of the manifest's own
+# repositories, and it is built from THAT clone, at THAT pin. Two things follow
+# and both are deliberate:
+#
+#   * an image's commit tag is the commit of the repository IT was built from,
+#     not the release's root commit. `forge:<forge commit>` means what it always
+#     meant; `fleet-memory-mcp:<fleet-memory commit>` means the same kind of
+#     thing about the repository that image really comes from. The release
+#     VERSION tag is what says they were built together, and every image still
+#     carries every repository's commit in its labels;
+#   * a proof script is still a path inside the BUILD-CONTEXT ROOT's clone. The
+#     proofs belong to the release — they are how this repository satisfies
+#     itself about an image before shipping it — and asking another repository
+#     to carry the factory's proof script would put the factory into it.
+#
+# The one base image digest still applies to every Dockerfile of the release,
+# whichever repository it came from: a release has one base, or it has two
+# supply chains and one name.
 # ---------------------------------------------------------------------------
 
 set -euo pipefail
@@ -168,10 +193,10 @@ PARSED="$(
             if (cur_list == "repositories")
                 printf "REPO|%s|%s|%s|%s|%s\n", f_name, f_url, f_branch, f_commit, f_role
             else if (cur_list == "images")
-                printf "IMAGE|%s|%s|%s|%s\n", f_name, f_dockerfile, f_role, f_proof
+                printf "IMAGE|%s|%s|%s|%s|%s\n", f_name, f_dockerfile, f_role, f_proof, f_context
             have_item = 0
             f_name = ""; f_url = ""; f_branch = ""; f_commit = ""; f_role = ""
-            f_dockerfile = ""; f_proof = ""
+            f_dockerfile = ""; f_proof = ""; f_context = ""
         }
         function setkey(key, val) {
             if (cur_list == "repositories") {
@@ -186,6 +211,7 @@ PARSED="$(
                 else if (key == "dockerfile") f_dockerfile = val
                 else if (key == "role") f_role = val
                 else if (key == "proof") f_proof = val
+                else if (key == "context") f_context = val
                 else printf "UNKNOWN|%s|%s\n", cur_list, key
             } else {
                 printf "UNKNOWN|%s|%s\n", cur_list, key
@@ -249,7 +275,7 @@ fi
 if echo "${PARSED}" | grep -q '^UNKNOWN|'; then
     echo "ERROR: the manifest names keys this reader does not understand:" >&2
     echo "${PARSED}" | awk -F'[|]' '$1 == "UNKNOWN" { print "       " $3 "  (under " $2 ":)" }' >&2
-    die "a repository has name, url, branch, commit and role; an image has name, dockerfile, role and an optional proof."
+    die "a repository has name, url, branch, commit and role; an image has name, dockerfile, role, an optional context and an optional proof."
 fi
 
 top() { echo "${PARSED}" | awk -F'[|]' -v k="$2" '$1 == "TOP" && $2 == k { print $3; exit }'; }
@@ -307,7 +333,7 @@ case "${SCHEMA}" in
     1)
         [ -z "${IMAGE_LINES}" ] \
             || die "the manifest says schema 1 and also carries an 'images:' list. Schema 1 names exactly one image, in 'image_name'; a manifest that names the set of images a release builds is schema 2."
-        IMAGE_LINES="IMAGE|${IMAGE_NAME}|Dockerfile|coordinator|scripts/verify-forge-oracles.sh"
+        IMAGE_LINES="IMAGE|${IMAGE_NAME}|Dockerfile|coordinator|scripts/verify-forge-oracles.sh|"
         ;;
     2)
         [ -n "${IMAGE_LINES}" ] \
@@ -321,19 +347,35 @@ esac
 COORDINATOR_NAME=""
 SEEN_IMAGE_NAMES=""
 
-while IFS='|' read -r _tag iname idockerfile irole iproof; do
+# One repository's pinned commit, by name. Used for an image's commit tag,
+# which is the commit of the repository THAT image was built from.
+commit_of_repository() {
+    echo "${REPO_LINES}" | awk -F'[|]' -v n="$1" '$2 == n { print $5; exit }'
+}
+
+# Which repository's clone an image is built from. Empty means the
+# build-context root, which is what every image meant before per-image
+# contexts existed and what a schema 1 manifest still means.
+context_of_image() {
+    if [ -z "$1" ]; then printf '%s' "${ROOT_NAME}"; else printf '%s' "$1"; fi
+}
+
+while IFS='|' read -r _tag iname idockerfile irole iproof icontext; do
     [ -n "${iname}" ] || die "an image entry in the manifest has no name."
+    icontext="$(context_of_image "${icontext}")"
+    [ -n "$(commit_of_repository "${icontext}")" ] \
+        || die "image '${iname}' says it is built from the repository '${icontext}', and the manifest names no repository of that name. An image's context is one of the repositories this release pins, so the image can be built from a clone at a pin and tagged by that pin's commit."
     [ -n "${idockerfile}" ] \
-        || die "image '${iname}' has no dockerfile, so this script would not know what to build for it. It is a path inside the fetched clone of ${ROOT_NAME}, for example Dockerfile."
+        || die "image '${iname}' has no dockerfile, so this script would not know what to build for it. It is a path inside the fetched clone of ${icontext}, for example Dockerfile."
     [ -n "${irole}" ] \
         || die "image '${iname}' has no role, so the image could not say which of the release's images it is."
     case "${idockerfile}" in
-        /*) die "image '${iname}' names the dockerfile '${idockerfile}'. It is a path INSIDE the fetched clone, so it is relative — an absolute path would be a path on whichever machine ran the build." ;;
+        /*) die "image '${iname}' names the dockerfile '${idockerfile}'. It is a path INSIDE the fetched clone of ${icontext}, so it is relative — an absolute path would be a path on whichever machine ran the build." ;;
         *..*) die "image '${iname}' names the dockerfile '${idockerfile}', which climbs out of the fetched clone. Everything a release is built from is inside the clones this run fetched." ;;
     esac
     case "${iproof}" in
         "") ;;
-        /*) die "image '${iname}' names the proof '${iproof}'. Like the dockerfile it is a path inside the fetched clone, so it is relative." ;;
+        /*) die "image '${iname}' names the proof '${iproof}'. Like the dockerfile it is a path inside a fetched clone, so it is relative." ;;
         *..*) die "image '${iname}' names the proof '${iproof}', which climbs out of the fetched clone." ;;
     esac
     # A role is a plain lower-case word. It goes into a label and into the
@@ -371,10 +413,16 @@ say "Release ${VERSION} — ${REPO_COUNT} repositories, ${IMAGE_COUNT} images, m
 # version; the commit tag is shared by every image of the release, which is
 # what says they were built together.
 # ---------------------------------------------------------------------------
-tags_of() { echo "$1:${ROOT_COMMIT} $1:${VERSION}"; }
+#
+# AN IMAGE'S COMMIT TAG IS ITS OWN REPOSITORY'S COMMIT, since per-image
+# contexts (25 September 2026). For every image whose context is the
+# build-context root — which is every image of every release cut before that —
+# this is exactly what it was.
+tags_of() { echo "$1:$2 $1:${VERSION}"; }
 
-while IFS='|' read -r _tag iname idockerfile irole iproof; do
-    for t in $(tags_of "${iname}"); do
+while IFS='|' read -r _tag iname idockerfile irole iproof icontext; do
+    icontext="$(context_of_image "${icontext}")"
+    for t in $(tags_of "${iname}" "$(commit_of_repository "${icontext}")"); do
         case "${t}" in
             *:latest) die "this script will not produce a '${t}' tag. A release is named by the commit it was built from; a floating tag is what this path replaces." ;;
         esac
@@ -389,9 +437,10 @@ if [ "${PLAN_ONLY}" = "1" ]; then
     echo "Release ${VERSION} (manifest ${MANIFEST_SHA}, schema ${SCHEMA})"
     echo "  base image: ${BASE_DIGEST}"
     echo "  would build ${IMAGE_COUNT} image(s), all from the same fetched clones:"
-    while IFS='|' read -r _tag iname idockerfile irole iproof; do
-        echo "    ${iname} [${irole}] from ${ROOT_NAME}/${idockerfile}"
-        for t in $(tags_of "${iname}"); do
+    while IFS='|' read -r _tag iname idockerfile irole iproof icontext; do
+        icontext="$(context_of_image "${icontext}")"
+        echo "    ${iname} [${irole}] from ${icontext}/${idockerfile}"
+        for t in $(tags_of "${iname}" "$(commit_of_repository "${icontext}")"); do
             echo "      would tag : ${t}"
         done
         if [ -n "${iproof}" ]; then
@@ -489,16 +538,19 @@ done <<< "${REPO_LINES}"
 
 ROOT_DIR="${TMP}/${ROOT_NAME}"
 
-# Every image's dockerfile and every image's proof has to be IN the fetched
-# clone, and this is checked for all of them before the first build, so a
-# manifest that names a file the pin does not carry stops before anything is
-# tagged rather than after the first image has landed.
-while IFS='|' read -r _tag iname idockerfile irole iproof; do
-    [ -f "${ROOT_DIR}/${idockerfile}" ] \
-        || die "image '${iname}' is built from ${idockerfile}, and ${ROOT_NAME} at ${ROOT_COMMIT} has no such file. The dockerfile comes from the fetched clone at the pin, never from a checkout beside this script."
+# Every image's dockerfile has to be IN the clone of the repository that image
+# is built from, and every image's proof in the build-context root's clone.
+# Both are checked for all of them before the first build, so a manifest that
+# names a file a pin does not carry stops before anything is tagged rather than
+# after the first image has landed.
+while IFS='|' read -r _tag iname idockerfile irole iproof icontext; do
+    icontext="$(context_of_image "${icontext}")"
+    icommit="$(commit_of_repository "${icontext}")"
+    [ -f "${TMP}/${icontext}/${idockerfile}" ] \
+        || die "image '${iname}' is built from ${idockerfile}, and ${icontext} at ${icommit} has no such file. The dockerfile comes from the fetched clone at the pin, never from a checkout beside this script."
     if [ -n "${iproof}" ]; then
         [ -f "${ROOT_DIR}/${iproof}" ] \
-            || die "image '${iname}' names the proof ${iproof}, and ${ROOT_NAME} at ${ROOT_COMMIT} has no such file. A release proves itself with the code it is made of."
+            || die "image '${iname}' names the proof ${iproof}, and ${ROOT_NAME} at ${ROOT_COMMIT} has no such file. A release proves itself with the code it is made of, and the proofs belong to the repository the release is cut from."
     fi
 done <<< "${IMAGE_LINES}"
 
@@ -510,18 +562,20 @@ done <<< "${IMAGE_LINES}"
 # image that quietly started from another one would be a second supply chain
 # inside a release that claims to have one.
 # ---------------------------------------------------------------------------
-while IFS='|' read -r _tag iname idockerfile irole iproof; do
-    FROM_DIGESTS="$(grep -E '^FROM ' "${ROOT_DIR}/${idockerfile}" | sed -n 's/.*@\(sha256:[0-9a-f]\{64\}\).*/\1/p' | sort -u)"
+while IFS='|' read -r _tag iname idockerfile irole iproof icontext; do
+    icontext="$(context_of_image "${icontext}")"
+    icommit="$(commit_of_repository "${icontext}")"
+    FROM_DIGESTS="$(grep -E '^FROM ' "${TMP}/${icontext}/${idockerfile}" | sed -n 's/.*@\(sha256:[0-9a-f]\{64\}\).*/\1/p' | sort -u)"
     [ -n "${FROM_DIGESTS}" ] \
-        || die "${idockerfile} at ${ROOT_COMMIT} (image '${iname}') pins no base image digest, so the manifest's python_base_digest cannot be checked against it."
+        || die "${icontext}/${idockerfile} at ${icommit} (image '${iname}') pins no base image digest, so the manifest's python_base_digest cannot be checked against it."
     if [ "$(echo "${FROM_DIGESTS}" | wc -l | tr -d ' ')" != "1" ]; then
-        echo "ERROR: ${idockerfile} (image '${iname}') starts FROM more than one base digest:" >&2
+        echo "ERROR: ${icontext}/${idockerfile} (image '${iname}') starts FROM more than one base digest:" >&2
         echo "${FROM_DIGESTS}" | sed 's/^/       /' >&2
         die "the manifest records one base image; fix the Dockerfile or widen the manifest."
     fi
     [ "${FROM_DIGESTS}" = "${BASE_DIGEST}" ] \
-        || die "the manifest pins the base image ${BASE_DIGEST} and ${idockerfile} at ${ROOT_COMMIT} (image '${iname}') starts FROM ${FROM_DIGESTS}. One of them has moved; a release does not guess which."
-    say "  ok base image ${BASE_DIGEST} agrees with ${idockerfile}"
+        || die "the manifest pins the base image ${BASE_DIGEST} and ${icontext}/${idockerfile} at ${icommit} (image '${iname}') starts FROM ${FROM_DIGESTS}. One of them has moved; a release does not guess which."
+    say "  ok base image ${BASE_DIGEST} agrees with ${icontext}/${idockerfile}"
 done <<< "${IMAGE_LINES}"
 
 # ---------------------------------------------------------------------------
@@ -583,24 +637,28 @@ BUILT="${TMP}/built-images"
 # context only where a stage actually names it, so an image that uses none
 # (the publisher's does not) neither reads nor carries them.
 # ---------------------------------------------------------------------------
-while IFS='|' read -r _tag iname idockerfile irole iproof; do
-    TAG_COMMIT="${iname}:${ROOT_COMMIT}"
+while IFS='|' read -r _tag iname idockerfile irole iproof icontext; do
+    icontext="$(context_of_image "${icontext}")"
+    icommit="$(commit_of_repository "${icontext}")"
+    ICONTEXT_DIR="${TMP}/${icontext}"
+    TAG_COMMIT="${iname}:${icommit}"
     TAG_VERSION="${iname}:${VERSION}"
     IIDFILE="${TMP}/image-id-${iname}"
 
-    say "Building ${TAG_COMMIT} (also tagged ${TAG_VERSION}) from ${ROOT_NAME}/${idockerfile} in ${TMP} only"
+    say "Building ${TAG_COMMIT} (also tagged ${TAG_VERSION}) from ${icontext}/${idockerfile} in ${TMP} only"
     docker buildx build \
         "${BUILD_ARGS[@]}" \
         "${LABEL_ARGS[@]}" \
         --label "com.guardkit.release.image.role=${irole}" \
         --label "com.guardkit.release.image.name=${iname}" \
+        --label "com.guardkit.release.image.context=${icontext}" \
         --label "com.guardkit.release.image.dockerfile=${idockerfile}" \
         --label "org.opencontainers.image.title=${iname}" \
         -t "${TAG_COMMIT}" \
         -t "${TAG_VERSION}" \
-        -f "${ROOT_DIR}/${idockerfile}" \
-        "${ROOT_DIR}" \
-        --build-arg "FORGE_GIT_SHA=${ROOT_COMMIT}" \
+        -f "${ICONTEXT_DIR}/${idockerfile}" \
+        "${ICONTEXT_DIR}" \
+        --build-arg "FORGE_GIT_SHA=${icommit}" \
         --build-arg "FORGE_GIT_DIRTY=false" \
         --build-arg "PYTHON_BASE_DIGEST=${BASE_DIGEST}" \
         --iidfile "${IIDFILE}" \
@@ -609,7 +667,7 @@ while IFS='|' read -r _tag iname idockerfile irole iproof; do
 
     ibuilt="$(cat "${IIDFILE}")"
     say "  built ${iname} ${ibuilt}"
-    printf '%s|%s|%s|%s|%s|%s\n' "${iname}" "${irole}" "${idockerfile}" "${ibuilt}" "${TAG_COMMIT}" "${TAG_VERSION}" >> "${BUILT}"
+    printf '%s|%s|%s|%s|%s|%s|%s\n' "${iname}" "${irole}" "${idockerfile}" "${ibuilt}" "${TAG_COMMIT}" "${TAG_VERSION}" "${icontext}" >> "${BUILT}"
 done <<< "${IMAGE_LINES}"
 
 # ---------------------------------------------------------------------------
@@ -624,7 +682,7 @@ done <<< "${IMAGE_LINES}"
 # and the publisher's unbuilt is the arrangement this stage exists to end.
 # ---------------------------------------------------------------------------
 if [ "${RUN_PROOF}" = "1" ]; then
-    while IFS='|' read -r iname irole idockerfile ibuilt itagcommit itagversion; do
+    while IFS='|' read -r iname irole idockerfile ibuilt itagcommit itagversion icontext; do
         iproof="$(echo "${IMAGE_LINES}" | awk -F'[|]' -v n="${iname}" '$2 == n { print $5; exit }')"
         if [ -z "${iproof}" ]; then
             say "Image '${iname}' names no proof, so nothing was proved about it."
@@ -674,11 +732,11 @@ COORDINATOR_TAG_VERSION="$(coordinator_field 6)"
     printf '  "repo_digests": %s,\n' "$(docker image inspect "${COORDINATOR_ID}" --format '{{json .RepoDigests}}')"
     printf '  "images": [\n'
     first=1
-    while IFS='|' read -r iname irole idockerfile ibuilt itagcommit itagversion; do
+    while IFS='|' read -r iname irole idockerfile ibuilt itagcommit itagversion icontext; do
         [ "${first}" = "1" ] || printf ',\n'
         first=0
-        printf '    {"name": "%s", "role": "%s", "dockerfile": "%s", "image_id": "%s", "tags": ["%s", "%s"], "repo_digests": %s, "labels": %s}' \
-            "${iname}" "${irole}" "${idockerfile}" "${ibuilt}" "${itagcommit}" "${itagversion}" \
+        printf '    {"name": "%s", "role": "%s", "context": "%s", "dockerfile": "%s", "image_id": "%s", "tags": ["%s", "%s"], "repo_digests": %s, "labels": %s}' \
+            "${iname}" "${irole}" "${icontext}" "${idockerfile}" "${ibuilt}" "${itagcommit}" "${itagversion}" \
             "$(docker image inspect "${ibuilt}" --format '{{json .RepoDigests}}')" \
             "$(docker image inspect "${ibuilt}" --format '{{json .Config.Labels}}')"
     done < "${BUILT}"
@@ -700,8 +758,8 @@ COORDINATOR_TAG_VERSION="$(coordinator_field 6)"
 say "Receipt written to ${RECEIPT}"
 say ""
 say "Release ${VERSION} built — ${IMAGE_COUNT} image(s)."
-while IFS='|' read -r iname irole idockerfile ibuilt itagcommit itagversion; do
-    say "  ${iname} [${irole}]"
+while IFS='|' read -r iname irole idockerfile ibuilt itagcommit itagversion icontext; do
+    say "  ${iname} [${irole}] built from ${icontext}/${idockerfile}"
     say "    image id : ${ibuilt}"
     say "    tags     : ${itagcommit}"
     say "               ${itagversion}"

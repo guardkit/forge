@@ -2,9 +2,9 @@
 # ---------------------------------------------------------------------------
 # factory-hello — ask the coordinator, in its own container, what it can reach.
 #
-# One line each for the bus, the answer service, the publisher, and the two
-# addresses into a project's sandbox — the deploy helper and the build runner —
-# with THE ADDRESS IT USED on every line. The sandbox addresses come from the
+# One line each for the bus, the answer service, the memory service, the
+# publisher, and the two addresses into a project's sandbox — the deploy helper
+# and the build runner — with THE ADDRESS IT USED on every line. The sandbox addresses come from the
 # coordinator's own settings file through its own loader, so what is printed is
 # what the coordinator would really dial, not what this script guessed.
 #
@@ -55,12 +55,19 @@ rm -f "${WHY}"
 
 CID="$(printf '%s' "${SAID}" | head -1)"
 
+# THE MEMORY SERVICE'S ADDRESS, taken from the same env file compose was given,
+# and from the shell if the shell has one — which is the order compose itself
+# uses, so what is printed is the address the estate really uses. It is a
+# service name on the factory network and carries no secret; the memory store's
+# address, which does carry one, is never read here and never printed.
+MEMORY_URL="${FLEET_MEMORY_URL:-$(sed -n 's/^[[:space:]]*FLEET_MEMORY_URL=//p' "${ENV_FILE}" 2>/dev/null | tail -1)}"
+
 if [ -z "${CID}" ]; then
     printf 'factory-hello: the estate reads fine, and the coordinator is not running in it, so there is nobody to ask.\n' >&2
     exit 1
 fi
 
-docker exec -i "${CID}" python - <<'PY'
+docker exec -i -e "FACTORY_HELLO_MEMORY_URL=${MEMORY_URL}" "${CID}" python - <<'PY'
 """What the coordinator can reach, from inside the coordinator."""
 from __future__ import annotations
 
@@ -91,7 +98,10 @@ def line(what: str, verdict: str, address: str) -> None:
 
 
 def over_http(what: str, address: str, route: str = "/healthz") -> None:
-    url = address.rstrip("/") + route
+    # An empty route means the address already carries its own, so it is used
+    # exactly as the env file wrote it — trailing slash and all, which some
+    # servers care about.
+    url = address if not route else address.rstrip("/") + route
     try:
         with urllib.request.urlopen(url, timeout=TIMEOUT) as answer:
             line(what, f"reachable (HTTP {answer.status})", url)
@@ -121,6 +131,20 @@ print("The coordinator, from inside its own container:\n")
 
 over_the_bus(os.environ.get("FORGE_NATS_URL", ""))
 over_http("the answer service", ANSWER_SERVICE)
+
+# THE MEMORY SERVICE, at the address the estate's env file gives — printed
+# whether or not it answers, because "which address did you use" is the
+# question this command exists to answer. The route is already on the end of
+# that address (the MCP transport serves /mcp/), so nothing is added to it.
+memory = os.environ.get("FACTORY_HELLO_MEMORY_URL", "").strip()
+if memory:
+    over_http("the memory service", memory, route="")
+else:
+    print(
+        f"{'the memory service':<44} no address in the estate's env file "
+        "(FLEET_MEMORY_URL)"
+    )
+
 over_http("the publisher", os.environ.get("FORGE_PUBLISHER_URL", ""))
 
 # The two addresses into a project's sandbox, resolved the way the coordinator
