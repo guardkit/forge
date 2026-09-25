@@ -50,6 +50,17 @@
 #      projects folder, no machine name from wherever it was built, in its
 #      configuration or its labels.
 #
+#      WHAT THIS SWEEP DOES NOT READ IS THE IMAGE'S FILESYSTEM, and that is
+#      where both of this estate's real hits were found, by hand, on 25
+#      September 2026 — a developer's compiled files carrying the path of the
+#      machine that compiled them, and a host name hard-coded as a package's
+#      default. THE RELEASE BUILD asks that larger question now, for every
+#      image it builds: scripts/build-release-image.sh exports each image's
+#      whole filesystem and searches it, with the configuration, the labels and
+#      the history, for words that come from the MACHINE in RELEASE_SWEEP_TERMS
+#      — never from a list in a tracked file, which would be the defect itself.
+#      This check keeps the small, cheap question, and says which one it is.
+#
 # Nothing here names a target project's language, test runner, package manager
 # or layout. It asks about one image of this factory's own estate.
 #

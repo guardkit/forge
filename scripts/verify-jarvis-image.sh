@@ -50,19 +50,23 @@
 #      wherever it was built, and nothing shaped like a bot or app token, in
 #      its configuration or its labels.
 #
-#      WHAT THIS SWEEP DOES NOT READ IS THE IMAGE'S FILESYSTEM, and that gap
-#      has bitten once already: on 25 September 2026 a developer's compiled
+#      WHAT THIS SWEEP DOES NOT READ IS THE IMAGE'S FILESYSTEM. That is a
+#      different and much larger question, and it is where both of this
+#      estate's real hits were: on 25 September 2026 a developer's compiled
 #      files rode into the build context carrying the absolute path of the
-#      machine that compiled them, and it was a sweep done BY HAND that found
-#      them, not this script. The jarvis repository's .dockerignore now keeps
-#      them out. The filesystem also carries a machine name today — the host
-#      name that package hard-codes as its default model-seat address, which
-#      its own Dockerfile records and which the estate always overrides — so a
-#      filesystem sweep here would have to be written around that default
-#      before it could ever pass, and sweeping a whole image on every release
-#      build is not free either. So the filesystem sweep is done by hand at
-#      each stage and written into that stage's evidence, and this paragraph
-#      exists so that nobody reads a pass below as an answer to it.
+#      machine that compiled them, and the jarvis package's own settings module
+#      hard-coded a host name as a default. BOTH were found by sweeping an
+#      image BY HAND, not by this script, and a pass here was never an answer
+#      to either.
+#
+#      WHO ASKS THAT QUESTION NOW. The release build does, for every image it
+#      builds: scripts/build-release-image.sh exports each image's whole
+#      filesystem and searches it, along with the configuration, the labels and
+#      the history, for words that come from the MACHINE in RELEASE_SWEEP_TERMS
+#      — never from a list written into a tracked file, which would be the
+#      defect itself. A hit refuses the release and names the image, the file
+#      and the word. This script keeps the small, cheap question it has always
+#      asked, and says plainly that it is the smaller one.
 #
 # Nothing here names a target project's language, test runner, package manager
 # or layout. It asks about one image of this factory's own estate.
