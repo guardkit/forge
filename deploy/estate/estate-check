@@ -633,8 +633,14 @@ check_the_bus_gateway() {
         unchecked 8i "the env file names no bus account for the front door (JARVIS_NATS_USER), so the bus could not be asked whether that account is connected."
         return
     fi
-    seen="$(docker exec "${bus}" wget -qO- "http://localhost:8222/connz?auth=1" 2>/dev/null \
-            | tr ',' '\n' | /bin/grep -c "\"user\":\"${account}\"" || true)"
+    # The bus pretty-prints this answer and calls the field 'authorized_user',
+    # so the spaces and newlines come out before the field is looked for.
+    # Asked, then read, in two steps rather than one long pipeline: the bus
+    # pretty-prints this answer, so the spaces and newlines come out before the
+    # field is looked for, and the field it calls this is 'authorized_user'.
+    local answer
+    answer="$(docker exec "${bus}" wget -qO- "http://localhost:8222/connz?auth=1" 2>/dev/null)"
+    seen="$(printf '%s' "${answer}" | tr -d ' \n' | /bin/grep -o "\"authorized_user\":\"${account}\"" | wc -l)"
     if [ "${seen:-0}" -gt 0 ]; then
         ok 8i "the bus itself reports ${seen} live connection(s) from the '${account}' account, which is the bus gateway holding the bus open — asked of the bus, not of the gateway, because the gateway publishes nothing and answers nobody. No password was read and none is printable this way."
     else
