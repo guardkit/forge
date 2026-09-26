@@ -1,0 +1,13 @@
+{
+  "kv_buckets": [
+    {
+      "name": "a-bucket",
+      "ttl": "",
+      "storage": "file",
+      "history": 5,
+      "max_value_size": "256KB",
+      "replicas": 1,
+      "description": "a made-up bucket; on the bus it is a stream called KV_a-bucket"
+    }
+  ]
+}

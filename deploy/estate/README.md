@@ -18,12 +18,14 @@ two today. One description of each service, in the repository that owns it.
 
 | File | What it is |
 |---|---|
-| `compose.yaml` | composes Forge's two compose files and adds the bus, the one-shot that provisions it, the memory service's two containers, and the Slack front door with its bus gateway |
+| `compose.yaml` | composes Forge's two compose files and adds the bus, the one-shot that provisions it, the one-shot that says the bus is ready, the memory service's two containers, and the Slack front door with its bus gateway |
+| `compose.external-bus.yaml` | the overlay for **external bus mode** — the estate started against a bus that is already running and belongs to somebody else. *Whose bus is it* below says when |
 | `.env.example` | every setting name the whole estate needs, with no machine's values. Copy to `.env` |
 | `estate-pins.conf` | what the estate's own two images are built from. Part of the release, never edited per machine. Not named `.env`, because this repository ignores the whole `.env` family as a secrets fence and these are pins, not secrets |
 | `build-estate-images.sh` | builds those two images, and fills the volume holding the bus's own config, from the bus repository at its pinned commit |
-| `provisioner/Dockerfile` | the one-shot image: the NATS project's tool image plus `bash` |
-| `estate-check` | the two checks, one sentence per item |
+| `provisioner/Dockerfile` | the one-shot image: the NATS project's tool image plus `bash`, and the estate's own read-only comparison of a running bus with the pinned definitions |
+| `provisioner/compare-bus-with-definitions.sh` | that comparison. It reads a bus's own monitoring route and the pinned definitions and compares them field by field. It never writes to a bus |
+| `estate-check` | the checks, one sentence per item |
 | `factory-hello` | asks the coordinator what it can reach, with the address it used |
 
 `settings.example.yaml` — the coordinator's own settings file — is **Forge's**,
@@ -65,7 +67,14 @@ in `../compose/`, and is referenced from here rather than copied.
    sops exec-env "$NATS_SECRETS_FILE" 'docker compose --env-file .env up -d'
    ```
 
-   On a machine that looks after a project's sandbox, add `--profile sandbox`.
+   On a machine that looks after a project's sandbox, **change the env file's
+   profiles line to `COMPOSE_PROFILES=local-bus,sandbox`** — do not pass
+   `--profile sandbox` on the command line. Checked on Compose v5.2.0 on
+   26 September 2026: `--profile` **replaces** the env file's profiles rather
+   than adding to them, so `--profile sandbox` in local mode takes the bus and
+   the provisioner out of the project. It fails loudly rather than quietly —
+   Compose refuses the project outright, because `bus-ready` then names a
+   service that is not there — but the line to change is the env file's.
 8. **`./estate-check services`** — from an ordinary shell. Reading a running
    estate needs no password: the passwords reach the bus as files, so the
    bundle renders without them, and the one thing this check asks the bus
@@ -357,13 +366,94 @@ Two things worth knowing about them, met on 24 September 2026:
   `estate-check services` asks the **bus itself** what it holds and compares
   that with the bus repository's own definitions.
 
+## Whose bus is it — local and external bus mode
+
+*Added 26 September 2026, build item E1 of the rollout design.*
+
+**Local bus mode** is what this bundle has always done: it starts its own bus
+and provisions its storage. It is the clean-machine path, the cloud path, and
+what every earlier proof used. Nothing about it has changed.
+
+**External bus mode** is for a bus that is **already running and belongs to
+somebody else**. There are two situations, and they are the same shape:
+
+* the first rollout on this machine, where the live bus is **kept** while the
+  record moves. It holds every reader's position and every message still
+  waiting, and moving the record and swapping the bus in one window is two
+  irreversible moves at once;
+* a cloud machine joining a bus it did not start.
+
+**One line in the env file decides, and three carry it:**
+
+```
+BUS_MODE=external
+COMPOSE_PROFILES=
+COMPOSE_FILE=compose.yaml:compose.external-bus.yaml
+BUS_EXTERNAL_NETWORK=<the network that bus is already on>
+```
+
+Compose reads `COMPOSE_FILE` and `COMPOSE_PROFILES` out of the env file itself,
+so `docker compose --env-file .env up -d` stays the whole command in both modes.
+`estate-check host` **refuses** (item 7b) if `BUS_MODE` and those settings
+disagree, because a half-set mode is the one state that could start a second bus
+beside the one being kept.
+
+**What external mode does NOT do**, and must never be made to do:
+
+* **it never provisions.** The mutating one-shot is behind the `local-bus`
+  profile, so in external mode it is not in the project at all — not for `up`,
+  not for `restart`, not for anybody typing `docker compose run`;
+* **it never mutates the bus in any other way.** It joins the bus's network as
+  one that **already exists**, so `docker compose down` leaves the network
+  exactly where it was, and it removes nothing and recreates nothing;
+* **it never writes to the bus's storage.** What it does instead is **read**:
+  `bus-ready` asks the bus's own monitoring route — which takes no credential —
+  and compares the answer, **field by field**, with the definitions this release
+  pins on the read-only `bus-source` volume. Anything missing, different or
+  unreadable **refuses**, names the stream or bucket and the field, prints what
+  the definitions say and what the bus says, and **updates nothing**. The
+  coordinator then never starts. A difference between a running bus and the
+  pinned definitions is settled before a rollout, not during one.
+
+**Why the comparison is not the provisioning scripts' preview mode**, which was
+the first idea: for a stream or bucket that already exists those scripts print
+`Would check/update` and return **before comparing a single field**
+(`streams/provision-streams.sh:146-152`, `kv/provision-kv.sh:134-141`). A clean
+preview is not evidence of a matching bus, and its wording is not evidence of a
+mismatched one.
+
+**The two sides are spelt differently**, which is why this is a script rather
+than a diff: the definitions say `work` and `7d` and the bus answers
+`workqueue` and `604800000000000`; a bucket is a stream called `KV_<bucket>`
+whose `max_msgs_per_subject` is the bucket's history and whose `max_msg_size` is
+its maximum value size. Only the fields the definitions **name** are compared: a
+field the bus reports and the definitions do not pin has nothing to be compared
+against, and inventing an expectation for it here would be this repository
+pinning the bus's storage, which belongs to the bus's repository.
+
+**`bus-ready` is the one bus dependency, in both modes.** Until today four
+services waited on the provisioner finishing. That is the right wait in local
+mode and an impossible one in external mode, where the provisioner is not in the
+project — and Compose does not shrug at that: **a service that depends on a
+service whose profile is off makes Compose refuse the whole project.** So the
+dependency is replaced rather than weakened. In local mode `bus-ready` waits for
+the provisioner and then for the bus's health route, which means exactly what
+the old line meant; in external mode it waits for the health route and makes the
+comparison.
+
+**In external mode the estate's own checks find the bus by address.** Items 8,
+8b and 8i are asked at `BUS_MONITORING_ADDRESS` from inside the estate, never by
+this project's own `docker compose ps -q nats` — which in external mode would
+find nothing every time, and report a perfectly healthy bus as absent.
+
 ## The two checks
 
-`estate-check host` — before anything starts. Seven items, from section 3 of
-the design: the machine qualifies for a sandbox at all; Docker; the sandbox
-tool and its daemon; the release images; the volumes and the disk; the secret
-files (present or missing, never a value, and readable by nobody but their
-owner); and every setting name the composed files require having a value.
+`estate-check host` — before anything starts. Eight items: the machine
+qualifies for a sandbox at all; Docker; the sandbox tool and its daemon; the
+release images; the volumes and the disk; the secret files (present or missing,
+never a value, and readable by nobody but their owner); every setting name the
+composed files require having a value; and (item 7b) that `BUS_MODE` and the
+compose profiles and files in force say the same thing.
 
 `estate-check services` — after. The bus answers; its buckets and streams
 exist, asked of the bus itself over its own monitoring route rather than taken
@@ -407,6 +497,63 @@ on a machine with no sandbox of that name it prints *not checked here*, with
 the reason, and **counts as NOT PASSED**. The whole run then exits non-zero.
 An item that has not been checked is not a pass, and this bundle's gate is not
 met until it runs for real.
+
+## The closed-door check — `estate-check --pre-resume`
+
+*Added 26 September 2026, build item E2 of the rollout design.*
+
+A rollout has a phase where the two things that can bring work in — the Slack
+front door and the bus gateway — are **deliberately stopped**, and everything
+that can be checked with the door shut is checked with the door shut. The
+ordinary `services` check cannot serve that phase: there, a stopped front door
+is the failure. Here a **running** one is, and it is named. The same fact, read
+opposite ways.
+
+**What it checks, in order:**
+
+1. **item 10 — the door really is shut.** No front-door container and no
+   bus-gateway container in this estate; the legacy host units inactive, if they
+   are on this machine at all (read-only, with `systemctl show`); and nothing
+   waiting and nothing unconfirmed on the bus's two durable readers, read from
+   the bus's own monitoring route. **If that route cannot be read, this fails**
+   — "could not be read" is not "nought";
+2. **every other service item**, including the retained bus by address and item
+   9, the answer service reached from inside a sandbox;
+3. **items 8h and 8i are reported as NOT CHECKED**, with the sentence saying
+   they ask a producer and are checked after the door opens. Never as passed and
+   never as failed.
+
+**What it leaves behind, and why.** The rollout's resume step is the point of no
+return, and it must not be taken on an exit code somebody saw an hour ago on a
+different estate. So this writes `pre-resume.json` into `ROLLOUT_STATE_DIR` — the
+same folder the rollout's own records live in — carrying the estate's compose
+project name, the coordinator's image **id** and the release it was named by,
+the bus mode, the retained bus's identity, the time, and **every item's verdict
+in its own words**.
+
+**Three verdicts, and only one may be acted on:**
+
+| Verdict | What it means |
+|---|---|
+| `passed` | every item asked something and passed, and the only items not checked are the two that ask a producer |
+| `passed-with-items-not-checked` | nothing failed, but an item could not be asked on this machine — item 9 with no sandbox is the one that happens. The record is written and says which, the run is NOT PASSED, and reading it back **refuses** it. An unknown stays an unknown all the way through |
+| *(no record)* | something failed. **No record is written, and any record already there is INVALIDATED** — renamed to `pre-resume.json.invalidated` — because a check that has just failed must never leave an earlier pass sitting where the resume step reads |
+
+**`estate-check --read-pre-resume`** is the only way that record may be used,
+and it refuses by name for five reasons: there is no record or it cannot be
+read; it is not a pass; it was written for a different estate; it names a
+different coordinator image than the one running now; or it is older than the
+coordinator's own start or older than `ROLLOUT_PRE_RESUME_MAX_AGE_S`.
+
+**The two durable readers are named in the env file**, not in the check:
+`ROLLOUT_BUS_CONSUMERS`. They are `forge-serve` and `forge-serve-planning` — and
+**`forge-serve`, not `forge-consumer`**, which is the name the rollout design
+used. `forge-consumer` is the durable in `src/forge/adapters/nats/
+pipeline_consumer.py`; what the coordinator actually runs is `forge serve`,
+whose durable is `DEFAULT_DURABLE_NAME = "forge-serve"`
+(`src/forge/cli/_serve_config.py:55`). A tool that read the waiting count for
+`forge-consumer` would be reading a reader that is not there — which is why a
+reader the bus does not hold is a **refusal** here and never a nought.
 
 ## What is deliberately not here yet
 

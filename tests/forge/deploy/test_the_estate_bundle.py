@@ -88,15 +88,25 @@ _THE_BUSS_ACCOUNT_PASSWORDS = (
 )
 
 
-def _rendered(*extra: str) -> str:
+def _render(*extra: str, profiles: str | None = None) -> subprocess.CompletedProcess[str]:
     """``docker compose config`` of the estate, with the example env and with
-    NO password of any kind in the environment."""
+    NO password of any kind in the environment.
+
+    ``profiles`` is passed through the ENVIRONMENT rather than as ``--profile``,
+    because Compose's ``--profile`` flag REPLACES ``COMPOSE_PROFILES`` from the
+    env file rather than adding to it (checked on Compose v5.2.0, 26 September
+    2026). Passing ``--profile sandbox`` on a bundle whose env file asks for
+    ``local-bus`` takes the bus and the provisioner out of the project — which
+    is exactly the trap the compose file and the README now warn about.
+    """
     bare = {
         name: os.environ[name]
         for name in _ONLY_THESE_ARE_INHERITED
         if name in os.environ
     }
-    done = subprocess.run(
+    if profiles is not None:
+        bare["COMPOSE_PROFILES"] = profiles
+    return subprocess.run(
         [
             "docker",
             "compose",
@@ -115,6 +125,10 @@ def _rendered(*extra: str) -> str:
         text=True,
         timeout=180,
     )
+
+
+def _rendered(*extra: str, profiles: str | None = None) -> str:
+    done = _render(*extra, profiles=profiles)
     assert done.returncode == 0, (
         "the estate bundle would not render with its own .env.example:\n"
         f"{done.stderr}"
@@ -146,7 +160,22 @@ def rendered() -> str:
 def rendered_with_the_sandbox() -> str:
     if shutil.which("docker") is None:
         pytest.skip("docker is not installed here, so there is nothing to render")
-    return _rendered("--profile", "sandbox")
+    # A machine that looks after a sandbox ADDS it to the env file's profiles
+    # line. It does not pass '--profile sandbox', which would replace them.
+    return _rendered(profiles="local-bus,sandbox")
+
+
+#: The external-bus overlay, and the two settings that put the bundle in that
+#: mode. ``COMPOSE_PROFILES=""`` because external mode asks for no profile at
+#: all — the bus and the mutating provisioner must not be in the project.
+_EXTERNAL_BUS = ("--file", "compose.external-bus.yaml")
+
+
+@pytest.fixture(scope="module")
+def rendered_against_an_external_bus() -> str:
+    if shutil.which("docker") is None:
+        pytest.skip("docker is not installed here, so there is nothing to render")
+    return _rendered(*_EXTERNAL_BUS, profiles="")
 
 
 class TestTheEstateRenders:
@@ -242,6 +271,157 @@ class TestTheEstateRenders:
         leaves it alone and nobody has to comment a service out."""
         assert "sandbox-runner:" not in rendered
         assert "sandbox-runner:" in rendered_with_the_sandbox
+
+
+class TestTheTwoBusModes:
+    """WHOSE BUS IS IT (26 September 2026, build item E1).
+
+    The estate has to be startable against a bus that is ALREADY RUNNING and
+    belongs to somebody else — the first rollout keeps the live bus, because it
+    holds every reader's position and every message still waiting, and a cloud
+    machine joining a bus it did not start is the same shape.
+
+    Two mechanisms were tried first and neither would have delivered it, so
+    these tests hold the one that does:
+
+    * marking the bus and the provisioner as dependencies that are *not
+      required* says what to do when a dependency is UNAVAILABLE. It does not
+      take a service out of what ``up`` starts;
+    * the provisioning scripts' preview mode, for a stream that already exists,
+      prints "Would check/update" and returns before comparing a single field.
+
+    What this bundle does instead: a PROFILE, which is real exclusion — a
+    service behind a profile that is not asked for is not in the project at all.
+    """
+
+    def test_local_mode_has_the_bus_and_the_provisioner(
+        self, rendered: str
+    ) -> None:
+        """The example env asks for the ``local-bus`` profile, which is the
+        clean-machine and cloud path and what every earlier proof used."""
+        assert "\n  nats:\n" in rendered, "local mode has no bus"
+        assert "\n  nats-provision:\n" in rendered, "local mode has no provisioner"
+
+    def test_external_mode_has_neither(
+        self, rendered_against_an_external_bus: str
+    ) -> None:
+        """NOT STARTED, NOT RESTARTED, NOT BROUGHT BACK BY A SECOND ``up``.
+
+        The provisioner matters more than the bus here: it is the one thing in
+        the estate that WRITES to a bus's storage, and in external mode the bus
+        is somebody else's.
+        """
+        for service in ("nats", "nats-provision"):
+            assert f"\n  {service}:\n" not in rendered_against_an_external_bus, (
+                f"'{service}' is still in the project in external bus mode, so "
+                "this estate would start its own bus beside the one being kept"
+            )
+
+    def test_one_bus_dependency_and_it_is_in_both_modes(
+        self, rendered: str, rendered_against_an_external_bus: str
+    ) -> None:
+        """``bus-ready`` is every other service's only bus dependency, in both
+        modes. Compose REFUSES a project whose service depends on a service
+        whose profile is off ("service X depends on undefined service Y"), so
+        the old dependency on the provisioner could not stay and could not be
+        weakened either — it had to be replaced."""
+        for document in (rendered, rendered_against_an_external_bus):
+            assert "\n  bus-ready:\n" in document, (
+                "bus-ready is not in the project, and it is the one bus "
+                "dependency that has to exist in both modes"
+            )
+            for service in ("coordinator", "memory-relay", "front-door", "bus-gateway"):
+                block = _service_block(document, service)
+                assert "bus-ready" in block, (
+                    f"{service} does not wait for bus-ready"
+                )
+                assert "nats-provision" not in block, (
+                    f"{service} still waits for the provisioner by name, which "
+                    "makes Compose refuse the whole project in external bus mode"
+                )
+
+    def test_bus_ready_keeps_its_own_dependency_only_in_local_mode(
+        self, rendered: str, rendered_against_an_external_bus: str
+    ) -> None:
+        local = _service_block(rendered, "bus-ready")
+        assert "nats-provision" in local, (
+            "in local mode bus-ready must wait for the provisioner, or the "
+            "coordinator can start against a bus with no storage"
+        )
+        external = _service_block(rendered_against_an_external_bus, "bus-ready")
+        assert "depends_on" not in external, (
+            "the external-bus overlay does not clear bus-ready's dependency on "
+            "the profiled-off provisioner, so Compose will refuse the project"
+        )
+
+    def test_the_retained_bus_network_is_one_that_already_exists(
+        self, rendered_against_an_external_bus: str
+    ) -> None:
+        """``external: true`` is what says "this network is not mine": Compose
+        joins it, does not create it, and ``down`` leaves it where it was."""
+        networks = rendered_against_an_external_bus.split("\nnetworks:", 1)[1]
+        assert "retained-bus:" in networks
+        after = networks.split("retained-bus:", 1)[1]
+        assert "external: true" in after[:200], (
+            "the retained bus's network is not declared as one that already "
+            "exists, so this bundle would create a network of its own and the "
+            "bus would not be on it"
+        )
+
+    def test_external_mode_carries_nothing_of_this_machine_either(
+        self, rendered_against_an_external_bus: str
+    ) -> None:
+        found = {
+            address
+            for address in _AN_ADDRESS.findall(rendered_against_an_external_bus)
+            if address not in _ALLOWED_ADDRESSES
+            and not address.startswith(_DOCUMENTATION_BLOCK)
+        }
+        assert not found, f"external bus mode brought an address: {sorted(found)}"
+        for line in rendered_against_an_external_bus.splitlines():
+            if "/home/" not in line:
+                continue
+            assert any(home in line for home in _IN_IMAGE_HOMES), (
+                f"external bus mode carries a home directory: {line.strip()}"
+            )
+
+    def test_the_example_env_carries_both_modes_and_says_which_is_on(
+        self,
+    ) -> None:
+        env = (ESTATE / ".env.example").read_text()
+        for line in ("BUS_MODE=local", "COMPOSE_PROFILES=local-bus", "COMPOSE_FILE=compose.yaml"):
+            assert f"\n{line}\n" in env, f"the example env has no '{line}' line"
+        for name in ("BUS_MONITORING_ADDRESS=", "BUS_EXTERNAL_NETWORK=", "BUS_READY_TIMEOUT_S="):
+            assert f"\n{name}" in env, f"the example env names no {name.rstrip('=')}"
+
+    def test_the_profile_flag_trap_is_written_down(self) -> None:
+        """A REAL TRAP, MET WHILE BUILDING THIS. ``--profile sandbox`` on the
+        command line REPLACES the env file's profiles rather than adding to
+        them, so it takes the bus and the provisioner out of the project. It
+        fails loudly — Compose refuses the project, because bus-ready then names
+        a service that is not there — but the compose file and the README have
+        to say which line to change instead."""
+        for page in (ESTATE / "compose.yaml", ESTATE / "README.md"):
+            text = page.read_text()
+            assert "local-bus,sandbox" in text, (
+                f"{page.name} does not say that a machine with a sandbox adds "
+                "it to COMPOSE_PROFILES rather than passing --profile"
+            )
+
+    def test_asking_for_the_sandbox_the_wrong_way_refuses_loudly(self) -> None:
+        """Not a warning and not a quiet loss of the bus: the project does not
+        render at all. Proved here so that a future Compose which started
+        MERGING profiles instead of replacing them would show up as a failing
+        test rather than as a second bus one day."""
+        if shutil.which("docker") is None:
+            pytest.skip("docker is not installed here, so there is nothing to render")
+        done = _render("--profile", "sandbox")
+        assert done.returncode != 0, (
+            "'--profile sandbox' rendered a project. If Compose now ADDS to "
+            "COMPOSE_PROFILES rather than replacing it, this trap is gone and "
+            "the warnings in compose.yaml and README.md should be removed."
+        )
+        assert "bus-ready" in done.stderr, done.stderr
 
 
 class TestNothingOfThisMachineIsInIt:
@@ -661,13 +841,26 @@ class TestWhatTheEstatePromises:
         restarts in a loop showing a programmer's error — met by a reviewer on
         24 September 2026 against a bus nobody had provisioned. The one-shot
         has to finish successfully first, and that is a line in the file rather
-        than a sentence somebody has to remember."""
-        block = rendered.split("coordinator:", 1)[1].split("\n  answer", 1)[0]
-        assert "nats-provision" in block, (
-            "the coordinator does not wait for the bus to be provisioned"
+        than a sentence somebody has to remember.
+
+        **[26 September 2026] It now waits for ``bus-ready`` rather than for the
+        provisioner by name**, and ``bus-ready`` waits for the provisioner in
+        local mode — so this promise is unchanged, and in external bus mode it
+        means the retained bus answers and already holds what the pinned
+        definitions name. The indirection is not decoration: Compose refuses a
+        whole project whose service depends on a service whose profile is off.
+        """
+        block = _service_block(rendered, "coordinator")
+        assert "bus-ready" in block, (
+            "the coordinator does not wait for the bus to be ready"
         )
         assert "service_completed_successfully" in block, (
             "the coordinator waits for the one-shot, but not for it to SUCCEED"
+        )
+        ready = _service_block(rendered, "bus-ready")
+        assert "nats-provision" in ready and "service_completed_successfully" in ready, (
+            "bus-ready does not wait for the provisioner to SUCCEED in local "
+            "mode, so the coordinator could start against a bus with no storage"
         )
 
     def test_the_buss_own_files_come_from_the_release_not_from_a_disk(
@@ -974,10 +1167,11 @@ class TestTheCheckStillHasEveryItemTheDesignAsksFor:
             )
 
     def test_the_items_before_and_after_are_not_mixed_up(self) -> None:
-        """Two checks, not one, because some things must be true before
-        anything starts and others can only be true after. The first draft of
-        the design asked the bus to answer before the compose file had started
-        it."""
+        """Three readings now, not two, because some things must be true before
+        anything starts, others can only be true after, and one phase of a
+        rollout has to be checked with the door deliberately SHUT. The first
+        draft of the design asked the bus to answer before the compose file had
+        started it."""
         done = subprocess.run(
             [str(ESTATE / "estate-check"), "--items"],
             capture_output=True,
@@ -989,7 +1183,7 @@ class TestTheCheckStillHasEveryItemTheDesignAsksFor:
             parts = line.split(None, 3)
             if len(parts) >= 3:
                 modes[parts[1]] = parts[0]
-        for number in ("1", "2", "3", "4", "5", "6", "7"):
+        for number in ("1", "2", "3", "4", "5", "6", "7", "7b"):
             assert modes[number] == "host", (
                 f"item {number} must be checked BEFORE anything starts"
             )
@@ -997,6 +1191,170 @@ class TestTheCheckStillHasEveryItemTheDesignAsksFor:
             assert modes[number] == "services", (
                 f"item {number} can only be checked AFTER things have started"
             )
+        assert modes["10"] == "pre-resume", (
+            "item 10 asks whether the producers are STOPPED, which is only ever "
+            "true in the closed-door phase; in the ordinary services mode a "
+            "stopped front door is the failure"
+        )
+
+    def test_the_check_knows_whose_bus_it_is(self) -> None:
+        """ITEM 7b (26 September 2026, build item E1).
+
+        BUS_MODE is a word in the env file and does nothing on its own: what
+        decides whether this estate starts a bus of its own are two settings
+        Compose reads for itself. A half-set mode renders perfectly well and
+        starts a SECOND BUS beside the one being kept, which is the one mistake
+        external mode exists to stop."""
+        items = _the_checks_items()
+        assert "7b" in items, "estate-check no longer checks the bus mode"
+        assert items["7b"][0] == "bus-mode-and-the-files-agree", items["7b"]
+        check = (ESTATE / "estate-check").read_text()
+        for word in ("COMPOSE_PROFILES", "COMPOSE_FILE", "BUS_EXTERNAL_NETWORK"):
+            assert word in check, (
+                f"estate-check no longer reads {word}, so BUS_MODE could say "
+                "one thing while the project does another"
+            )
+        readme = (ESTATE / "README.md").read_text()
+        assert "external bus mode" in readme.lower(), (
+            "the README does not describe external bus mode, so when it is used "
+            "and what it deliberately does not do are written down nowhere"
+        )
+
+    def test_the_closed_door_check_exists_and_says_what_it_leaves_out(
+        self,
+    ) -> None:
+        """ITEM 10 AND THE CLOSED-DOOR MODE (26 September 2026, build item E2).
+
+        The two producer items are never reported as passed in this mode and
+        never as failed: they are reported as not checked, with where they ARE
+        checked. An unknown that is read as a pass is how a rollout resumes onto
+        an estate nobody has looked at."""
+        items = _the_checks_items()
+        assert "10" in items, "estate-check has no closed-door item"
+        assert items["10"][0] == "the-producers-are-stopped", items["10"]
+        check = (ESTATE / "estate-check").read_text()
+        for phrase in (
+            "--pre-resume",
+            "--read-pre-resume",
+            "pre-resume.json",
+            "not checked in this mode",
+            "INVALIDATED",
+        ):
+            assert phrase in check, (
+                f"estate-check no longer carries '{phrase}', which is part of "
+                "the closed-door check the resume step reads"
+            )
+        readme = (ESTATE / "README.md").read_text()
+        assert "--pre-resume" in readme, (
+            "the README does not mention the closed-door check, so what it "
+            "proves and what it deliberately leaves out is written down nowhere"
+        )
+
+
+#: The read-only comparison of a running bus against the pinned definitions,
+#: and the saved answers it is driven with here. Nothing in this class asks a
+#: bus anything: each fixture is one answer the monitoring route could give.
+_COMPARE = ESTATE / "provisioner" / "compare-bus-with-definitions.sh"
+_BUS_FIXTURES = Path(__file__).resolve().parent / "bus-comparison-fixtures"
+
+
+def _compare(fixture: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            "bash",
+            str(_COMPARE),
+            "--jsz-file",
+            str(_BUS_FIXTURES / fixture),
+            "--definitions",
+            str(_BUS_FIXTURES),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+
+class TestTheBusIsComparedFieldByField:
+    """THE READ-ONLY COMPARISON (26 September 2026, build item E1).
+
+    In external bus mode nothing may write to the bus, so something has to say
+    whether the bus that is already running is the bus this release expects.
+    This is that something, and these are its four answers.
+
+    WHY NOT THE PROVISIONING SCRIPTS' PREVIEW MODE, which was the first idea:
+    for a stream or bucket that already exists it prints "Would check/update"
+    and returns before comparing a single field
+    (``streams/provision-streams.sh:146-152``, ``kv/provision-kv.sh:134-141``).
+    A clean preview is not evidence of a matching bus.
+
+    THE TWO SIDES ARE SPELT DIFFERENTLY, which is the whole reason this is a
+    script and not a diff: the definitions say ``"work"`` and ``"7d"`` and the
+    bus answers ``"workqueue"`` and ``604800000000000``; a bucket is a stream
+    called ``KV_<bucket>`` whose ``max_msgs_per_subject`` is the bucket's
+    history. Every conversion in the fixtures is one the real bus made.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _needs_jq(self) -> None:
+        if shutil.which("jq") is None:
+            pytest.skip("jq is not on this machine, and the bus answers JSON")
+
+    def test_a_matching_bus_agrees(self) -> None:
+        done = _compare("jsz-a-matching-bus.json")
+        assert done.returncode == 0, done.stdout + done.stderr
+        assert "Nothing was written to the bus" in done.stdout
+
+    def test_one_field_changed_refuses_and_names_the_field(self) -> None:
+        done = _compare("jsz-one-field-changed.json")
+        assert done.returncode == 2, done.stdout + done.stderr
+        assert "A-STREAM" in done.stdout and "max_age" in done.stdout, done.stdout
+        assert "604800000000000" in done.stdout and "3600000000000" in done.stdout, (
+            "the refusal does not print both what was wanted and what was found"
+        )
+        assert "NOTHING WAS UPDATED" in done.stderr
+
+    def test_a_missing_stream_refuses_and_names_it(self) -> None:
+        done = _compare("jsz-a-stream-missing.json")
+        assert done.returncode == 2, done.stdout + done.stderr
+        assert "MISSING" in done.stdout and "ANOTHER-STREAM" in done.stdout
+
+    def test_an_answer_without_the_configuration_is_unknown_not_agreement(
+        self,
+    ) -> None:
+        """THE DISTINCTION THAT MATTERS. An answer this cannot read is not a
+        matching bus and is not a mismatched one: it is a bus nothing is known
+        about, and it leaves by a different door (3, not 0 and not 2)."""
+        done = _compare("jsz-without-the-configuration.json")
+        assert done.returncode == 3, done.stdout + done.stderr
+        assert "could not be read" in done.stderr
+
+    def test_an_answer_that_is_not_json_is_unknown_too(self) -> None:
+        done = _compare("jsz-not-json-at-all.txt")
+        assert done.returncode == 3, done.stdout + done.stderr
+        assert "could not be read" in done.stderr
+
+    def test_a_bus_that_does_not_answer_is_unknown(self) -> None:
+        """An address nothing listens on. Loopback and a port nothing serves,
+        so this asks nothing of any real bus."""
+        done = subprocess.run(
+            [
+                "bash", str(_COMPARE),
+                "--monitoring-address", "127.0.0.1:1",
+                "--definitions", str(_BUS_FIXTURES),
+                "--timeout", "2",
+            ],
+            capture_output=True, text=True, timeout=60,
+        )
+        assert done.returncode == 3, done.stdout + done.stderr
+        assert "NOT agreement" in done.stderr
+
+    def test_the_comparison_travels_in_the_provisioning_image(self) -> None:
+        """It is a FILE in the image rather than a command written into the
+        compose file, so a test can run it on its own — as these do."""
+        dockerfile = (ESTATE / "provisioner" / "Dockerfile").read_text()
+        assert "compare-bus-with-definitions.sh" in dockerfile
+        compose = (ESTATE / "compose.yaml").read_text()
+        assert "/usr/local/bin/compare-bus-with-definitions.sh" in compose
 
 
 class TestTheEstateForwardsWhatTheBundleForwards:
