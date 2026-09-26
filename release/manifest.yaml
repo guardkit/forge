@@ -155,7 +155,7 @@ schema: 2
 # repositories from GitHub and built five images. An earlier version of this
 # note, written while the forge and jarvis pins were local, said the build
 # would stop at the fetch; it did, then, which was the check working.
-version: 2026.09.26-1
+version: 2026.09.26-2
 
 # The one image this repository's own operator scripts mean by "the release
 # image" (ops/forge-prod-recreate.sh reads this line). It is the same name as
@@ -253,7 +253,7 @@ repositories:
   - name: forge
     url: https://github.com/guardkit/forge.git
     branch: main
-    commit: 1fc6b600278d76cad6a384f405599faa2054ab42
+    commit: e63b8d4917ea9d6e1a1bf35a88c34dcf7b6693c9
     role: build-context-root
   - name: guardkit
     url: https://github.com/guardkit/guardkit.git
@@ -285,7 +285,7 @@ repositories:
   - name: jarvis
     url: https://github.com/guardkit/jarvis.git
     branch: main
-    commit: caec2e5c4c617933b365c73aaef1bbd6b0dc8dbd
+    commit: d29746e121399ccec21085f30acc07bf47de1f5b
     role: named-context
 
 # ---------------------------------------------------------------------------
