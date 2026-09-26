@@ -364,10 +364,15 @@ one:** during a rollout the door is down on purpose.
 
 **What it is given, and what that costs.** The bus's monitoring route (which
 takes no credential), the gateway's heartbeat volume (read-only), and **the
-Docker socket, read-only** — because reading a container's log means asking the
-engine and there is no other way to ask. That is a real privilege and it is named
-here rather than hidden; a machine that will not grant it gets `unknown` for that
-one component and never a false `ok`. The watch restarts nothing, writes nothing
+Docker socket** — because reading a container's log means asking the engine and
+there is no other way to ask. It is mounted read-only, but that stops writes to
+the socket *file*, not requests through it: a process holding this socket can
+create and remove anything the engine manages, so the watch container holds
+engine control for as long as it runs (the E3 review, 26 September 2026, created
+and removed a volume through it from inside). That is a real privilege, named
+here rather than hidden; narrowing it to "container logs only" needs a socket
+proxy and is the honest next step, not in this bundle. A machine that will not
+grant it gets `unknown` for that one component and never a false `ok`. The watch restarts nothing, writes nothing
 to the bus, and the only secret it touches is the Slack token it posts its own
 alarm with, which arrives as a file like every other.
 
