@@ -517,9 +517,19 @@ opposite ways.
    waiting and nothing unconfirmed on the bus's two durable readers, read from
    the bus's own monitoring route. **If that route cannot be read, this fails**
    — "could not be read" is not "nought";
-2. **every other service item**, including the retained bus by address and item
+2. **item 10b — what is running is the release this rollout is FOR.** The image
+   the rollout names — `--for-image`, or `FORGE_IMAGE` in the env file, which is
+   the line the estate was started from — is resolved to an image **id** on this
+   machine and compared with the image id the coordinator is really running. A
+   difference names both sides and refuses, so no record is written at all. An
+   identity that could not be read — a tag that is not on this machine, a
+   container whose image cannot be read — refuses in the same way. *Added 26
+   September 2026 after a review: the first version wrote the named release and
+   the running image id into the same record and never compared them, so a
+   record could name a release the estate was not running and be accepted;*
+3. **every other service item**, including the retained bus by address and item
    9, the answer service reached from inside a sandbox;
-3. **items 8h and 8i are reported as NOT CHECKED**, with the sentence saying
+4. **items 8h and 8i are reported as NOT CHECKED**, with the sentence saying
    they ask a producer and are checked after the door opens. Never as passed and
    never as failed.
 
@@ -540,10 +550,19 @@ in its own words**.
 | *(no record)* | something failed. **No record is written, and any record already there is INVALIDATED** — renamed to `pre-resume.json.invalidated` — because a check that has just failed must never leave an earlier pass sitting where the resume step reads |
 
 **`estate-check --read-pre-resume`** is the only way that record may be used,
-and it refuses by name for five reasons: there is no record or it cannot be
+and it refuses by name for six reasons: there is no record or it cannot be
 read; it is not a pass; it was written for a different estate; it names a
-different coordinator image than the one running now; or it is older than the
-coordinator's own start or older than `ROLLOUT_PRE_RESUME_MAX_AGE_S`.
+different coordinator image than the one running now; it was written about a
+different **release** than this rollout is for, or the name it gives that
+release now points at a different image, or the record disagrees with itself
+about the two; or it is older than the coordinator's own start or older than
+`ROLLOUT_PRE_RESUME_MAX_AGE_S`.
+
+The release check is the one that was missing. Comparing the recorded image id
+with the running image id alone is the same number twice whenever the record was
+written here, so the record's own **name** for the release is resolved again
+when it is read — which is also how a tag moved onto a different image since the
+record was written is caught.
 
 **The two durable readers are named in the env file**, not in the check:
 `ROLLOUT_BUS_CONSUMERS`. They are `forge-serve` and `forge-serve-planning` — and

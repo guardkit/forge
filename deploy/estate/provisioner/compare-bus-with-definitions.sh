@@ -51,6 +51,12 @@
 #               are stream fields: history is max_msgs_per_subject, ttl is
 #               max_age, max_value_size is max_msg_size
 #   sizes       "256KB" in the definitions, 262144 on the bus (1KB = 1024)
+#   counts      max_msgs, and a bucket's history, are numbers of MESSAGES and are
+#               read as plain numbers only. "10K" messages is not 10240 and is
+#               not guessed at: it is reported as unreadable (26 September 2026)
+#   subjects    two lists, compared as a SET. The same two subjects in the other
+#               order is the same stream, and was called a difference until
+#               26 September 2026
 #
 # ONLY THE FIELDS THE DEFINITIONS NAME ARE COMPARED. A field the bus reports
 # and the definitions do not pin — max_bytes, discard, duplicate_window on
@@ -73,7 +79,7 @@ DEFINITIONS="/bus"
 TIMEOUT=10
 QUERY='jsz?accounts=true&streams=true&consumers=true&config=true'
 
-usage() { sed -n '2,70p' "${BASH_SOURCE[0]}"; }
+usage() { sed -n '2,72p' "${BASH_SOURCE[0]}"; }
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -162,6 +168,18 @@ REPORT="$(printf '%s' "${ANSWER}" | jq -r \
         elif test("^[0-9]+(\\.[0-9]+)?w$")  then ((.[:-1] | tonumber) * 604800000000000)
         else "UNREADABLE-DURATION:\(.)" end;
 
+    # A COUNT IS NOT A SIZE (26 September 2026, the review of this script).
+    # max_msgs is a number of MESSAGES, and putting it through the size
+    # converter would read a definition written "10K" messages as 10240. So a
+    # count is a plain number and nothing else: anything carrying a unit is
+    # UNREADABLE here and leaves by the unknown door, rather than being quietly
+    # multiplied by 1024. The definitions of today write it as a plain number.
+    def to_count:
+        if . == null or . == "" or . == "null" then -1
+        elif (. | type) == "number" then .
+        elif test("^-?[0-9]+$") then (tonumber)
+        else "UNREADABLE-COUNT:\(.)" end;
+
     def to_bytes:
         if . == null or . == "" or . == "null" then -1
         elif (. | type) == "number" then .
@@ -187,16 +205,26 @@ REPORT="$(printf '%s' "${ANSWER}" | jq -r \
     # Every stream the bus holds, keyed by name, across every account.
     ([.account_details[]? | .stream_detail[]? | select(.config != null) | {key: .config.name, value: .config}] | from_entries) as $held
 
-    # One comparison: a resource name, and a list of {field, wanted, found_at}.
-    | def compare($resource; $wanted_fields):
+    # A LIST IS A SET HERE, NOT AN ORDER (26 September 2026, the review of this
+    # script). The subjects of a stream are two JSON arrays on the two sides, and
+    # comparing them with == called a bus that answered the same two subjects in
+    # the other order a MISMATCH. Nothing on either bus read here ever did that,
+    # and it erred towards refusing rather than towards agreeing, but it is
+    # still wrong: a field marked sorted is compared as a set, and both sides
+    # are still PRINTED as they are written.
+    #
+    # One comparison: a resource name, and a list of {on, want, sorted?}.
+    | def as_a_set($sorted; $v): if $v == null or ($sorted | not) then $v else ($v | sort) end;
+      def compare($resource; $wanted_fields):
         if ($held[$resource] == null)
         then ["MISSING|\($resource)"]
         else ($held[$resource]) as $found
         | ([ $wanted_fields[]
              | . as $f
+             | ($f.sorted // false) as $set
              | ($found[$f.on]) as $got
              | if $got == null then "ABSENT_FIELD|\($resource)|\($f.on)|\($f.want | tostring)"
-               elif ($got == $f.want) then empty
+               elif (as_a_set($set; $got) == as_a_set($set; $f.want)) then empty
                else "MISMATCH|\($resource)|\($f.on)|\($f.want | tostring)|\($got | tostring)"
                end ]) as $problems
         | if ($problems | length) == 0
@@ -208,10 +236,10 @@ REPORT="$(printf '%s' "${ANSWER}" | jq -r \
     ([ $stream_defs[0].streams[]?
        | . as $d
        | compare($d.name;
-           ([ {on: "subjects",     want: ($d.subjects)} ]
+           ([ {on: "subjects",     want: ($d.subjects), sorted: true} ]
             + (if $d.retention == null then [] else [{on: "retention", want: ($d.retention | retention_as_the_bus_says_it)}] end)
             + (if ($d | has("max_age"))  then [{on: "max_age",  want: ($d.max_age  | to_ns)}]    else [] end)
-            + (if ($d | has("max_msgs")) then [{on: "max_msgs", want: ($d.max_msgs | to_bytes)}] else [] end)
+            + (if ($d | has("max_msgs")) then [{on: "max_msgs", want: ($d.max_msgs | to_count)}] else [] end)
             + (if ($d | has("max_bytes")) then [{on: "max_bytes", want: ($d.max_bytes | to_bytes)}] else [] end)
             + (if ($d | has("storage"))  then [{on: "storage",  want: ($d.storage)}]  else [] end)
             + (if ($d | has("replicas")) then [{on: "num_replicas", want: ($d.replicas)}] else [] end)
@@ -227,7 +255,7 @@ REPORT="$(printf '%s' "${ANSWER}" | jq -r \
          | compare("KV_\($d.name)";
              ([ ]
               + (if ($d | has("ttl"))            then [{on: "max_age",              want: ($d.ttl | to_ns)}]              else [] end)
-              + (if ($d | has("history"))        then [{on: "max_msgs_per_subject", want: ($d.history)}]                  else [] end)
+              + (if ($d | has("history"))        then [{on: "max_msgs_per_subject", want: ($d.history | to_count)}]       else [] end)
               + (if ($d | has("max_value_size")) then [{on: "max_msg_size",         want: ($d.max_value_size | to_bytes)}] else [] end)
               + (if ($d | has("storage"))        then [{on: "storage",              want: ($d.storage)}]                  else [] end)
               + (if ($d | has("replicas"))       then [{on: "num_replicas",         want: ($d.replicas)}]                 else [] end)
@@ -244,7 +272,7 @@ fi
 # A conversion this script could not do is an unknown, not a mismatch: it means
 # the definitions are written in units this does not read, and saying "differs"
 # about that would be a lie about the bus.
-if printf '%s' "${REPORT}" | /bin/grep -q 'UNREADABLE-DURATION\|UNREADABLE-SIZE'; then
+if printf '%s' "${REPORT}" | /bin/grep -q 'UNREADABLE-DURATION\|UNREADABLE-SIZE\|UNREADABLE-COUNT'; then
     printf '%s\n' "${REPORT}" | /bin/grep 'UNREADABLE-' >&2
     unknown "a field in the pinned definitions is written in units this comparison does not read (above). Nothing is claimed about the bus."
 fi

@@ -1250,6 +1250,69 @@ class TestTheCheckStillHasEveryItemTheDesignAsksFor:
             "proves and what it deliberately leaves out is written down nowhere"
         )
 
+    def test_the_closed_door_receipt_is_bound_to_the_release_it_is_for(
+        self,
+    ) -> None:
+        """ITEM 10b (26 September 2026, the first of the three conditions
+        Codex's third read put on build item E2 — and the one the first
+        implementation did not meet).
+
+        The first version wrote the release the env file NAMED and the image id
+        the coordinator was REALLY RUNNING into one receipt and never compared
+        them, so an env file naming one release while the estate ran another
+        produced a receipt saying the wrong release without a word — and reading
+        it back accepted it, because the reader compared the recorded id with
+        the running id, which is the same number twice. The receipt sits
+        directly in front of the point of no return, so the two are compared
+        when it is written, and the release it names is resolved again when it
+        is read back."""
+        items = _the_checks_items()
+        assert "10b" in items, (
+            "estate-check no longer asks whether what is running is the release "
+            "the rollout is for, so a closed-door receipt could again name a "
+            "release the estate is not running"
+        )
+        assert items["10b"][0] == (
+            "the-running-release-is-the-one-this-rollout-names"
+        ), items["10b"]
+
+        check = (ESTATE / "estate-check").read_text()
+        for phrase in (
+            "--for-image",
+            "image_id_of",
+            "coordinator_image_named_id",
+            "the tag has been moved since the record was written",
+        ):
+            assert phrase in check, (
+                f"estate-check no longer carries '{phrase}', which is part of "
+                "binding the closed-door receipt to the release the rollout is "
+                "for"
+            )
+
+        readme = (ESTATE / "README.md").read_text()
+        assert "10b" in readme, (
+            "the README does not mention item 10b, so what binds the receipt to "
+            "one release is written down nowhere"
+        )
+
+    def test_the_release_item_belongs_to_the_closed_door_phase(self) -> None:
+        done = subprocess.run(
+            [str(ESTATE / "estate-check"), "--items"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        modes = {}
+        for line in done.stdout.splitlines():
+            parts = line.split(None, 3)
+            if len(parts) >= 3:
+                modes[parts[1]] = parts[0]
+        assert modes["10b"] == "pre-resume", (
+            "item 10b belongs to the closed-door phase: the ordinary services "
+            "check is not a rollout and is never told which release a rollout "
+            "is for"
+        )
+
 
 #: The read-only comparison of a running bus against the pinned definitions,
 #: and the saved answers it is driven with here. Nothing in this class asks a
@@ -1347,6 +1410,147 @@ class TestTheBusIsComparedFieldByField:
         )
         assert done.returncode == 3, done.stdout + done.stderr
         assert "NOT agreement" in done.stderr
+
+    def _own_fixtures(
+        self, tmp_path: Path, definition: dict, config: dict
+    ) -> subprocess.CompletedProcess[str]:
+        """One stream, written the two ways, compared. Used for the shapes the
+        committed fixtures do not have — a stream with two subjects, and a count
+        written with a unit on it."""
+        import json
+
+        (tmp_path / "streams").mkdir()
+        (tmp_path / "kv").mkdir()
+        (tmp_path / "streams" / "stream-definitions.json").write_text(
+            json.dumps({"streams": [definition]})
+        )
+        (tmp_path / "kv" / "kv-definitions.json").write_text(
+            json.dumps({"kv_buckets": []})
+        )
+        answer = {
+            "server_id": "a-made-up-bus",
+            "account_details": [
+                {
+                    "name": "AN-ACCOUNT",
+                    "stream_detail": [{"name": config["name"], "config": config}],
+                }
+            ],
+        }
+        (tmp_path / "jsz.json").write_text(json.dumps(answer))
+        return subprocess.run(
+            [
+                "bash", str(_COMPARE),
+                "--jsz-file", str(tmp_path / "jsz.json"),
+                "--definitions", str(tmp_path),
+            ],
+            capture_output=True, text=True, timeout=60,
+        )
+
+    def test_the_same_two_subjects_in_the_other_order_is_the_same_stream(
+        self, tmp_path: Path
+    ) -> None:
+        """26 September 2026, the review of this script. The two sides are two
+        JSON arrays and were compared with ``==``, so a bus that answered the
+        same two subjects in the other order was called a MISMATCH. It erred
+        towards refusing rather than towards agreeing, and neither throwaway bus
+        ever did it — but a subject list is a set, not an order."""
+        done = self._own_fixtures(
+            tmp_path,
+            {
+                "name": "TWO-SUBJECTS",
+                "subjects": ["a.>", "b.>"],
+                "retention": "limits",
+                "storage": "file",
+                "replicas": 1,
+            },
+            {
+                "name": "TWO-SUBJECTS",
+                "subjects": ["b.>", "a.>"],
+                "retention": "limits",
+                "storage": "file",
+                "num_replicas": 1,
+            },
+        )
+        assert done.returncode == 0, done.stdout + done.stderr
+
+    def test_a_subject_that_is_genuinely_different_still_refuses(
+        self, tmp_path: Path
+    ) -> None:
+        done = self._own_fixtures(
+            tmp_path,
+            {
+                "name": "TWO-SUBJECTS",
+                "subjects": ["a.>", "b.>"],
+                "retention": "limits",
+                "storage": "file",
+                "replicas": 1,
+            },
+            {
+                "name": "TWO-SUBJECTS",
+                "subjects": ["a.>", "c.>"],
+                "retention": "limits",
+                "storage": "file",
+                "num_replicas": 1,
+            },
+        )
+        assert done.returncode == 2, done.stdout + done.stderr
+        assert "subjects" in done.stdout, done.stdout
+
+    def test_a_count_with_a_unit_on_it_is_unreadable_and_never_guessed(
+        self, tmp_path: Path
+    ) -> None:
+        """26 September 2026, the review of this script. ``max_msgs`` is a number
+        of MESSAGES and went through the SIZE converter, so a definition written
+        ``"10K"`` messages would have been read as 10240 and compared against a
+        bus reporting 10000 messages. A count is a plain number here and a unit
+        on one is an unknown, which leaves by the unknown door (3) rather than
+        being multiplied by 1024."""
+        done = self._own_fixtures(
+            tmp_path,
+            {
+                "name": "COUNTED",
+                "subjects": ["c.>"],
+                "retention": "limits",
+                "max_msgs": "10K",
+                "storage": "file",
+                "replicas": 1,
+            },
+            {
+                "name": "COUNTED",
+                "subjects": ["c.>"],
+                "retention": "limits",
+                "max_msgs": 10240,
+                "storage": "file",
+                "num_replicas": 1,
+            },
+        )
+        assert done.returncode == 3, done.stdout + done.stderr
+        assert "UNREADABLE-COUNT" in done.stderr, done.stderr
+        assert "units this comparison does not read" in done.stderr
+
+    def test_a_count_written_as_a_plain_number_still_agrees(
+        self, tmp_path: Path
+    ) -> None:
+        done = self._own_fixtures(
+            tmp_path,
+            {
+                "name": "COUNTED",
+                "subjects": ["c.>"],
+                "retention": "limits",
+                "max_msgs": 10000,
+                "storage": "file",
+                "replicas": 1,
+            },
+            {
+                "name": "COUNTED",
+                "subjects": ["c.>"],
+                "retention": "limits",
+                "max_msgs": 10000,
+                "storage": "file",
+                "num_replicas": 1,
+            },
+        )
+        assert done.returncode == 0, done.stdout + done.stderr
 
     def test_the_comparison_travels_in_the_provisioning_image(self) -> None:
         """It is a FILE in the image rather than a command written into the
