@@ -301,6 +301,14 @@ def test_a_whole_batch_of_three_is_applied_together(
         ("COMMIT", "CREATE TABLE t (id TEXT);\nCOMMIT -- said quietly\nTRANSACTION;\n"),
         ("BEGIN", "/* opening */BEGIN/* now */;\nCREATE TABLE t (id TEXT);\n"),
         ("END", "CREATE TABLE t (id TEXT);\nEND/**/TRANSACTION;\n"),
+        # Codex's re-review of 26 September 2026: a byte-order mark before
+        # the word is invisible to a text split but not to SQLite, which
+        # committed the batch early. The engine's own authorizer now denies
+        # transaction control however it is spelled; the message names the
+        # migration and the statement that was denied.
+        ("COMMIT", "CREATE TABLE t (id TEXT);\n\ufeffCOMMIT;\n"),
+        ("END", "CREATE TABLE t (id TEXT);\n\ufeffEND TRANSACTION;\n"),
+        ("COMMIT", "CREATE TABLE t (id TEXT);\n\u200bCOMMIT;\n"),
     ],
 )
 def test_a_migration_with_its_own_transaction_is_refused(
@@ -321,8 +329,16 @@ def test_a_migration_with_its_own_transaction_is_refused(
 
         message = str(raised.value)
         assert "own-transaction.sql" in message
-        assert "manages its own transaction" in message
-        assert "one transaction around the whole batch" in message
+        # Either the friendly textual guard fired (plain spellings) or the
+        # engine's authorizer denied it (a spelling only SQLite could read);
+        # both name the migration and leave nothing behind.
+        # ... or SQLite refused the spelling outright (a zero-width space is a
+        # syntax error to it). Any of the three is a refusal with nothing kept.
+        assert (
+            "manages its own transaction" in message
+            or "not authorized" in message
+            or "syntax error" in message
+        ), message
         assert _tables(cx) == tables_before
         assert migrations.observed_schema_version(cx) == 11
     finally:
@@ -551,5 +567,50 @@ def test_nothing_pending_means_nothing_is_executed(
 
         monkeypatch.setattr(migrations, "_load_migration_sql", _refuse_to_load)
         assert migrations.apply_at_boot(cx) == version
+    finally:
+        cx.close()
+
+
+def test_a_bom_before_ordinary_ddl_is_still_applied(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    real_migrations: tuple[tuple[int, str], ...],
+) -> None:
+    """The authorizer denies transaction control only: a byte-order mark
+    before an ordinary CREATE TABLE is a valid statement to SQLite and is
+    applied — Codex's control case."""
+    cx = _writer_at(tmp_path, "bom-ddl.db", real=real_migrations, version=11)
+    try:
+        _inject(monkeypatch, {"bom.sql": "\ufeffCREATE TABLE bom_ok (id TEXT);\n"}, ((12, "bom.sql"),))
+        assert migrations.apply_at_boot(cx) == 12
+        assert "bom_ok" in _tables(cx)
+    finally:
+        cx.close()
+
+
+def test_an_earlier_migration_does_not_survive_a_bom_commit_then_a_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    real_migrations: tuple[tuple[int, str], ...],
+) -> None:
+    """Codex's exact reproduction: migration 12 is good, 13 ends with a
+    byte-order-marked COMMIT and 14 fails. Before the authorizer, 12 stayed
+    committed; now nothing does."""
+    cx = _writer_at(tmp_path, "bom-batch.db", real=real_migrations, version=11)
+    try:
+        tables_before = _tables(cx)
+        _inject(
+            monkeypatch,
+            {
+                "good.sql": "CREATE TABLE good_one (id TEXT);\n",
+                "bom-commit.sql": "CREATE TABLE sneaky (id TEXT);\n\ufeffCOMMIT;\n",
+                "bad.sql": "CREATE TABLE later (id TEXT);\nALTER TABLE no_such_table ADD COLUMN x TEXT;\n",
+            },
+            ((12, "good.sql"), (13, "bom-commit.sql"), (14, "bad.sql")),
+        )
+        with pytest.raises(migrations.MigrationError):
+            migrations.apply_at_boot(cx)
+        assert _tables(cx) == tables_before, "an earlier migration survived"
+        assert migrations.observed_schema_version(cx) == 11
     finally:
         cx.close()
