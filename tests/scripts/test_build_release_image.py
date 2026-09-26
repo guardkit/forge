@@ -25,6 +25,7 @@ or layout: it runs one shell script over manifests written in tmp_path.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -755,11 +756,48 @@ def test_the_sweep_reads_the_filesystem_and_not_only_the_configuration():
     assert "/bin/grep -r -l -F" in script, "the sweep no longer searches the unpacked filesystem"
 
 
-def test_a_hit_refuses_the_release_and_names_the_image_the_file_and_the_word():
+def test_a_hit_refuses_the_release_and_names_the_image_and_the_file():
     script = SCRIPT.read_text(encoding="utf-8")
     assert "carries names belonging to the machine that built it" in script
     assert 'echo "       in ${rpath}" >&2' in script, "a refusal no longer names the file"
-    assert 'echo "          the word: ${rterm}" >&2' in script, "a refusal no longer names the word"
+    assert "${rposition} of the ${SWEEP_TERM_COUNT}" in script, (
+        "a refusal no longer says WHICH of the words matched, so a hit cannot "
+        "be diagnosed at all"
+    )
+
+
+def test_a_refusal_says_which_word_by_its_position_and_never_the_word():
+    """CODEX'S REVIEW, 26 September 2026. The allowed-exception line was
+    redacted on 25 September and the REFUSAL line still printed the matched
+    word in full — so a build log, which is kept and pasted, carried one of
+    this machine's own names. A refusal has to be diagnosable without
+    publishing the thing it is refusing.
+
+    The path is redacted with it, because this sweep counts a file whose NAME
+    holds one of the words as a hit, and the path is what gets printed.
+    """
+    script = SCRIPT.read_text(encoding="utf-8")
+    assert "${rterm}" not in script, (
+        "the refusal path still has the matched word itself in it somewhere"
+    )
+    assert "term_position()" in script, "nothing turns a matched word into its position"
+    assert "redact_terms()" in script, "nothing takes a matched word out of a path"
+    refusals_written = [
+        line
+        for line in script.splitlines()
+        if '>> "${refusals}"' in line and "printf" in line
+    ]
+    assert refusals_written, "nothing writes a refusal any more"
+    for line in refusals_written:
+        assert "term_position" in line, (
+            "a refusal is written with the word itself rather than its "
+            f"position: {line.strip()}"
+        )
+    sweep_tree = script.split("sweep_tree() {", 1)[1].split("\n}", 1)[0]
+    assert 'safepath="$(redact_terms' in sweep_tree, (
+        "the path a refusal prints is not redacted, so a file NAMED after one "
+        "of the words publishes it"
+    )
 
 
 def test_an_image_that_could_not_be_swept_is_not_called_clean():
@@ -1040,3 +1078,262 @@ def test_the_estates_env_example_says_that_filling_it_in_does_not_arm_the_sweep(
     assert "export RELEASE_SWEEP_TERMS=" in example, (
         "the estate's .env.example does not say how to arm the sweep"
     )
+
+
+# ---------------------------------------------------------------------------
+# A WHOLE RUN, DRIVEN — the two things a source read cannot answer
+# ---------------------------------------------------------------------------
+#
+# Added 26 September 2026, after Codex's review of release 2026.09.26-1 found
+# two claims that were true of the source and false of the running script:
+#
+#   * "no sweep word is printed" — the allowed-exception line was redacted and
+#     the REFUSAL line still printed the matched word in full;
+#   * "a refused run takes its tags with it" — the removal was inside die(), and
+#     an ordinary failing command under `set -e` is not a die(). A run that
+#     built and swept a clean image set and then failed to write its receipt
+#     left both tags on the machine.
+#
+# Both of those are about what the script DOES, so these drive the script's
+# public entry to the end, with a fake engine on PATH and a local git fixture.
+# The method is Codex's own reproducer, kept here so the repository's suite owns
+# it: nothing reaches a Docker daemon, a network, or any real image or tag, and
+# the swept word is explicitly synthetic — a real one belongs to a machine and
+# would be the defect this sweep looks for if it were written down here.
+#
+# The fake engine understands only the handful of docker calls this script makes
+# and refuses anything else by name, so a future call it does not model fails
+# loudly rather than passing quietly.
+
+_FAKE_ENGINE = r'''#!/usr/bin/env python3
+import sys, os, json, tarfile, io
+from pathlib import Path
+args = sys.argv[1:]
+statefile = Path(os.environ["FAKE_ENGINE_STATE"])
+s = json.loads(statefile.read_text()) if statefile.exists() else {"tags": {}, "labels": {}}
+def save(): statefile.write_text(json.dumps(s))
+def argvalue(flag): return args[args.index(flag) + 1]
+def tarbytes():
+    b = io.BytesIO()
+    with tarfile.open(fileobj=b, mode="w") as t:
+        data = os.environ.get("FAKE_IMAGE_TEXT", "clean content").encode()
+        m = tarfile.TarInfo(os.environ.get("FAKE_IMAGE_FILE", "probe.txt"))
+        m.size = len(data); m.mode = 0o644
+        t.addfile(m, io.BytesIO(data))
+    return b.getvalue()
+if args[:2] == ["buildx", "build"]:
+    iid = "sha256:" + "a" * 64
+    for i, a in enumerate(args[:-1]):
+        if a == "-t": s["tags"][args[i + 1]] = iid
+        if a == "--label":
+            k, v = args[i + 1].split("=", 1); s["labels"][k] = v
+    save(); Path(argvalue("--iidfile")).write_text(iid + "\n"); sys.exit(0)
+if args[:2] == ["image", "inspect"]:
+    fmt = argvalue("--format") if "--format" in args else None
+    refs = [a for i, a in enumerate(args[2:], 2) if a != "--format" and (i == 0 or args[i - 1] != "--format")]
+    ref = refs[0]
+    if ref not in s["tags"] and not (ref == "sha256:" + "a" * 64 and s["labels"]): sys.exit(1)
+    if not fmt: print("[]")
+    elif ".RootFS.Layers" in fmt: print("1")
+    elif ".RepoDigests" in fmt: print("[]")
+    elif ".Config.Labels" in fmt: print(json.dumps(s["labels"]))
+    elif ".Config" in fmt: print(json.dumps({"Labels": s["labels"]}))
+    else: raise SystemExit("unhandled format " + fmt)
+    sys.exit(0)
+if args[:2] == ["image", "history"]: print("fixture image"); sys.exit(0)
+if args[0] == "create": print("fixture-container"); sys.exit(0)
+if args[0] == "export": sys.stdout.buffer.write(tarbytes()); sys.exit(0)
+if args[0] == "save":
+    with tarfile.open(argvalue("-o"), "w") as t:
+        for name, data in [("layer/layer.tar", tarbytes()), ("manifest.json", b"[{}]"), ("config.json", b"{}")]:
+            m = tarfile.TarInfo(name); m.size = len(data); m.mode = 0o644
+            t.addfile(m, io.BytesIO(data))
+    sys.exit(0)
+if args[0] == "rm": sys.exit(0)
+if args[0] == "rmi":
+    for a in args[1:]: s["tags"].pop(a, None)
+    save(); sys.exit(0)
+raise SystemExit("this fake engine does not model: " + repr(args))
+'''
+
+#: Explicitly synthetic, and said twice because it matters: a sweep word is one
+#: of a machine's own names, and a real one written down here would be the
+#: defect the sweep exists to find.
+_SYNTHETIC_TERM = "A-SYNTHETIC-SWEEP-WORD"
+
+
+def _fake_engine_fixture(tmp_path: Path) -> tuple[Path, Path, dict[str, str]]:
+    """A fake engine on PATH, a one-commit local repository, and a manifest that
+    pins it. Returns the working directory, the manifest, and the environment
+    every drive below runs in."""
+    work = tmp_path / "release-fixture"
+    binaries = work / "bin"
+    binaries.mkdir(parents=True)
+    engine = binaries / "docker"
+    engine.write_text(_FAKE_ENGINE, encoding="utf-8")
+    engine.chmod(0o755)
+
+    source = work / "source"
+    source.mkdir()
+    (source / "Dockerfile").write_text(f"FROM python:review@{_BASE_DIGEST}\n", encoding="utf-8")
+    environment = {
+        "PATH": f"{binaries}:/usr/bin:/bin",
+        "HOME": str(work / "home"),
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "LANG": "C.UTF-8",
+        "TMPDIR": str(work),
+    }
+
+    def git(*arguments: str) -> str:
+        return subprocess.check_output(
+            ["git", *arguments], cwd=source, env=environment, stderr=subprocess.STDOUT, text=True
+        ).strip()
+
+    git("init", "-b", "main")
+    git("add", "Dockerfile")
+    git(
+        "-c", "user.name=Release Fixture",
+        "-c", "user.email=fixture@example.invalid",
+        "commit", "-m", "fixture",
+    )
+    commit = git("rev-parse", "HEAD")
+
+    manifest = work / "manifest.yaml"
+    manifest.write_text(
+        f"""schema: 2
+version: 0.0.0-drive
+image_name: review-image
+python_base_digest: {_BASE_DIGEST}
+repositories:
+  - name: source
+    url: {source.as_uri()}
+    branch: main
+    commit: {commit}
+    role: build-context-root
+images:
+  - name: review-image
+    dockerfile: Dockerfile
+    role: coordinator
+""",
+        encoding="utf-8",
+    )
+    return work, manifest, environment
+
+
+def _drive(
+    tmp_path: Path,
+    *,
+    case: str,
+    receipt: Path | str,
+    image_text: str = "clean content",
+    image_file: str = "probe.txt",
+    extra: tuple[str, ...] = (),
+) -> tuple[int, str, list[str], Path]:
+    """One whole run of the script's public entry. Returns its exit status, its
+    whole output, the tags left on the fake engine afterwards, and the receipt
+    path it was given."""
+    work, manifest, environment = _fake_engine_fixture(tmp_path / case)
+    state = work / "engine.json"
+    done = subprocess.run(
+        ["bash", str(SCRIPT), str(manifest), "--skip-proof", "--receipt", str(receipt), *extra],
+        cwd=work,
+        env={
+            **environment,
+            "FAKE_ENGINE_STATE": str(state),
+            "FAKE_IMAGE_TEXT": image_text,
+            "FAKE_IMAGE_FILE": image_file,
+            "RELEASE_SWEEP_TERMS": _SYNTHETIC_TERM,
+        },
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    tags = sorted(json.loads(state.read_text())["tags"]) if state.exists() else []
+    return done.returncode, done.stdout + done.stderr, tags, Path(receipt)
+
+
+class TestARunThatIsRefusedOrFails:
+    def test_a_clean_run_keeps_its_tags_and_writes_its_receipt(self, tmp_path):
+        """The control. Without it, a script that refused everything would pass
+        every other test in this class."""
+        receipt = tmp_path / "control" / "receipt.json"
+        receipt.parent.mkdir(parents=True)
+        status, output, tags, written = _drive(tmp_path, case="control", receipt=receipt)
+        assert status == 0, output
+        assert len(tags) == 2, f"a successful run left {tags}"
+        assert json.loads(written.read_text())["sweep"]["terms_counted"] == 1, output
+
+    def test_a_refusal_prints_no_sweep_word_when_the_word_is_in_a_file(self, tmp_path):
+        status, output, tags, _ = _drive(
+            tmp_path,
+            case="word-in-contents",
+            receipt=tmp_path / "word-in-contents.json",
+            image_text=f"a line holding {_SYNTHETIC_TERM} in it",
+        )
+        assert status != 0, output
+        assert _SYNTHETIC_TERM not in output, (
+            "the refusal printed the matched word, which is one of this "
+            "machine's own names and goes into a build log that is kept"
+        )
+        assert "carries names belonging to the machine that built it" in output
+        assert "number 1 of the 1" in output, (
+            "the refusal does not say which of the words matched, so nobody "
+            "can diagnose it"
+        )
+        assert tags == [], f"a refused run left {tags}"
+
+    def test_a_refusal_prints_no_sweep_word_when_the_word_is_in_a_path(self, tmp_path):
+        """A file whose NAME holds the word is a hit too, and the path is what
+        a refusal prints — so redacting only the word leaves the word in the
+        output. This is the case the first fix missed."""
+        status, output, tags, _ = _drive(
+            tmp_path,
+            case="word-in-path",
+            receipt=tmp_path / "word-in-path.json",
+            image_file=f"home/{_SYNTHETIC_TERM}/notes.txt",
+        )
+        assert status != 0, output
+        assert _SYNTHETIC_TERM not in output, (
+            "the refusal printed a path with the matched word still in it"
+        )
+        assert "<word 1 of 1>" in output, (
+            "the redacted path does not say which word was taken out of it"
+        )
+        assert tags == [], f"a refused run left {tags}"
+
+    def test_a_receipt_that_cannot_be_written_takes_this_runs_tags_with_it(self, tmp_path):
+        """CODEX'S REPRODUCER, 26 September 2026. A clean build and a clean
+        sweep, then a receipt destination whose parent directory does not
+        exist: an ordinary failure under ``set -e``, which never reaches
+        ``die()``. It left both tags behind."""
+        status, output, tags, written = _drive(
+            tmp_path,
+            case="receipt-write-failure",
+            receipt=tmp_path / "receipt-write-failure" / "no-such-directory" / "receipt.json",
+        )
+        assert status != 0, output
+        assert not written.exists(), "a receipt appeared where its directory does not exist"
+        assert tags == [], (
+            "the run failed writing its receipt and left its tags on the "
+            f"machine: {tags}. The next attempt at the same commit then meets "
+            "'the tag already exists' and the operator reaches for "
+            "--allow-existing-tag."
+        )
+        assert output.count("Nothing this run built is to be shipped") == 1, (
+            "the tags were removed more than once, or not named as removed"
+        )
+
+    def test_a_plan_removes_nothing(self, tmp_path):
+        """A plan writes no tag, so it has nothing to take back — and it must
+        not touch a tag another run left."""
+        status, output, tags, _ = _drive(
+            tmp_path,
+            case="plan",
+            receipt=tmp_path / "plan.json",
+            extra=("--plan-only",),
+        )
+        assert status == 0, output
+        assert tags == [], output
+        assert "docker rmi" not in output
+        assert "Nothing this run built is to be shipped" not in output

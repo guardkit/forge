@@ -98,7 +98,10 @@
 # /bin/grep -F — its config, its labels, its history, its flattened filesystem
 # (docker create + docker export) and EVERY LAYER A PUSH WOULD SEND
 # (docker save, every blob unpacked). A hit REFUSES the release and names the
-# image, the file and the word, and the tags this run wrote are removed.
+# image and the file — and says WHICH of the words matched by its position in
+# RELEASE_SWEEP_TERMS rather than printing it, because a build log is kept and
+# the word is one of this machine's own names. The tags this run wrote are
+# removed, and so they are on any other unfinished ending.
 #
 # WHY THE LAYERS AND NOT ONLY THE FILESYSTEM. An export is the flattened FINAL
 # filesystem: a file a Dockerfile copies in and a later step deletes is gone
@@ -194,17 +197,20 @@ PLAN_ONLY=0
 # second — see remove_this_runs_tags below.
 RUN_TAGS=""
 PRE_EXISTING_TAGS=""
+# Whether the tags this run wrote have already been taken back, and whether
+# this run got far enough to be allowed to keep them. Both are read by the
+# EXIT trap installed further down, which is what makes the clean-up cover
+# EVERY unsuccessful ending and not only the ones that call die().
+TAGS_ALREADY_REMOVED=0
+BUILD_SUCCEEDED=0
 
 die() {
     echo "ERROR: $*" >&2
-    # A run that dies after it has written tags takes them with it (the
-    # fourth review of release 2026.09.26-1): otherwise the next attempt at the
-    # same commit meets "tag exists" and the operator learns to reach for
-    # --allow-existing-tag. RUN_TAGS is empty until the first tag is written.
-    if [ -n "${RUN_TAGS:-}" ] && [ "${TAGS_ALREADY_REMOVED:-0}" != "1" ]; then
-        TAGS_ALREADY_REMOVED=1
-        remove_this_runs_tags
-    fi
+    # The tags are taken back by the EXIT trap, whatever the ending — a die(),
+    # an ordinary failing command under `set -e`, or an interrupt. Until 26
+    # September 2026 this removal lived HERE, so a failure that did not route
+    # through die() left both tags behind: Codex's review of that day wrote a
+    # clean image set and then failed on the receipt, and the tags stayed.
     exit 1
 }
 say() { echo "$*" >&2; }
@@ -216,7 +222,7 @@ while [ "$#" -gt 0 ]; do
         --skip-proof) RUN_PROOF=0; shift ;;
         --plan-only) PLAN_ONLY=1; shift ;;
         --receipt) [ "$#" -ge 2 ] || die "--receipt needs a path"; RECEIPT="$2"; shift 2 ;;
-        -h|--help) sed -n '1,139p' "$0"; exit 0 ;;
+        -h|--help) sed -n '1,142p' "$0"; exit 0 ;;
         -*) die "unknown option: $1" ;;
         *) [ -z "${MANIFEST}" ] || die "more than one manifest given: ${MANIFEST} and $1"; MANIFEST="$1"; shift ;;
     esac
@@ -615,14 +621,55 @@ done <<< "${IMAGE_LINES}"
 # Fetch every repository, fresh, at exactly its pin.
 # ---------------------------------------------------------------------------
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/forge-release-XXXXXXXX")"
+
+# WHAT AN UNSUCCESSFUL RUN LEAVES BEHIND: the fetched clones go, and so do the
+# tags this run wrote.
+#
+# This runs on EVERY ending from here on, which is the point of it. Until 26
+# September 2026 the tag clean-up lived inside die() alone, so it covered the
+# refusals this script writes by hand and nothing else — and an ordinary
+# failing command under `set -e` is not a die(). Codex's review of that day
+# drove exactly that: a run that built and swept a clean image set, then failed
+# writing its receipt into a directory that did not exist, exited 1 and left
+# both tags on the machine. The next attempt at the same commit then meets "the
+# tag already exists" and the operator learns to reach for
+# --allow-existing-tag, which is the habit this script spent two passes taking
+# out of its own plan.
+#
+# SUCCESS IS MARKED ONLY AFTER THE RECEIPT IS SAFELY WRITTEN (BUILD_SUCCEEDED),
+# so "the images are built" and "the run finished" cannot come apart: a release
+# whose receipt never landed is not a release anybody can read afterwards.
+#
+# It preserves the exit status it was called with — the diagnosis of WHY the
+# run ended belongs to whatever ended it, not to the clean-up.
+#
+# What it cannot do is survive a SIGKILL, and it does not pretend to: a killed
+# run leaves its tags, and the next attempt says so by name.
 cleanup() {
+    local status=$?
     if [ "${KEEP_TEMP}" = "1" ]; then
         say "the fetched clones were kept at ${TMP} (--keep-temp)"
     else
         rm -rf "${TMP}"
     fi
+    if [ -n "${SWEEP_ALLOWED_LOG:-}" ]; then
+        rm -f "${SWEEP_ALLOWED_LOG}"
+    fi
+    if [ "${status}" -ne 0 ] \
+        && [ "${BUILD_SUCCEEDED}" != "1" ] \
+        && [ -n "${RUN_TAGS}" ] \
+        && [ "${TAGS_ALREADY_REMOVED}" != "1" ]; then
+        echo "ERROR: this run ended without finishing (exit status ${status}) and it had already written tags:" >&2
+        remove_this_runs_tags
+    fi
+    return "${status}"
 }
 trap cleanup EXIT
+# An interrupt or a termination does not run an EXIT trap by itself: the shell
+# dies of the signal. Turning each into an exit does, so a ctrl-C in the middle
+# of a build takes this run's tags with it as any other unfinished run does.
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # Is the pinned commit actually ON the branch the manifest says it came from?
 #
@@ -800,6 +847,45 @@ remove_this_runs_tags() {
     echo "       Nothing this run built is to be shipped." >&2
 }
 
+# WHICH WORD MATCHED, WITHOUT THE WORD.
+#
+# A refusal has to be diagnosable, and it must not publish the thing it is
+# refusing: RELEASE_SWEEP_TERMS holds this machine's own names, and a build log
+# is kept, read and pasted. So every refusal says WHICH of the words matched by
+# its POSITION in that variable — "number 3 of the 6" — and never its value.
+# Codex's review of 26 September 2026 found the allowed-exception line redacted
+# and the refusal line still printing the word in full.
+#
+# A "?" means the word is not in the list any more, which cannot happen while a
+# run is in flight and is still better than printing something.
+term_position() {
+    local wanted="$1" i=1 t
+    for t in ${SWEEP_TERMS}; do
+        if [ "${t}" = "${wanted}" ]; then
+            printf '%s' "${i}"
+            return 0
+        fi
+        i=$((i + 1))
+    done
+    printf '%s' "?"
+}
+
+# A PATH CAN CARRY ONE OF THE WORDS TOO, and this sweep counts a file whose
+# NAME holds a word as a hit — so printing the path prints the word, which is
+# how "no sweep word is printed" was still not true. Every word inside a piece
+# of text is replaced by its position before that text is printed, written into
+# the refusals file, or written into the receipt.
+redact_terms() {
+    local text="$1" i=1 t
+    for t in ${SWEEP_TERMS}; do
+        case "${text}" in
+            *"${t}"*) text="${text//"${t}"/<word ${i} of ${SWEEP_TERM_COUNT}>}" ;;
+        esac
+        i=$((i + 1))
+    done
+    printf '%s' "${text}"
+}
+
 # One unpacked copy of an image, searched file by file so a hit can be named.
 #
 # `where` is what a refusal calls this copy — the running filesystem, or the
@@ -808,7 +894,7 @@ remove_this_runs_tags() {
 # where this run happens to unpack has nothing to do with the answer.
 sweep_tree() {
     local iname="$1" root="$2" where="$3" refusals="$4"
-    local term hits path relpath reason
+    local term hits path relpath safepath reason
     for term in ${SWEEP_TERMS}; do
         hits="$(
             {
@@ -824,11 +910,15 @@ sweep_tree() {
         while IFS= read -r path; do
             [ -n "${path}" ] || continue
             relpath="${path#"${root}/"}"
+            # The path is redacted as well as the word, because a file whose
+            # NAME holds one of the words is a hit here, and the path is what
+            # gets printed and written down.
+            safepath="$(redact_terms "${relpath}${where}")"
             if reason="$(sweep_exception_reason "${iname}" "${relpath}")"; then
-                say "    allowed  ${relpath}${where} carries one of the words (not printed here; build logs get kept) — the manifest names this file: ${reason}"
-                printf '%s|%s|%s\n' "${iname}" "${relpath}${where}" "${reason}" >> "${SWEEP_ALLOWED_LOG}"
+                say "    allowed  ${safepath} carries one of the words (not printed here; build logs get kept) — the manifest names this file: ${reason}"
+                printf '%s|%s|%s\n' "${iname}" "${safepath}" "${reason}" >> "${SWEEP_ALLOWED_LOG}"
             else
-                printf '%s|%s|%s\n' "${iname}" "${relpath}${where}" "${term}" >> "${refusals}"
+                printf '%s|%s|%s\n' "${iname}" "${safepath}" "$(term_position "${term}")" >> "${refusals}"
             fi
         done <<< "${hits}"
     done
@@ -975,7 +1065,7 @@ sweep_image() {
         # The metadata first — small, and a hit there is never excusable.
         for meta in config.json labels.json history.txt; do
             if /bin/grep -q -F -e "${term}" "${dir}/${meta}"; then
-                printf '%s|%s|%s\n' "${iname}" "the image's ${meta%%.*}" "${term}" >> "${refusals}"
+                printf '%s|%s|%s\n' "${iname}" "the image's ${meta%%.*}" "$(term_position "${term}")" >> "${refusals}"
             fi
         done
     done
@@ -991,9 +1081,13 @@ sweep_image() {
 
     if [ -s "${refusals}" ]; then
         echo "ERROR: image '${iname}' (${itag}) carries names belonging to the machine that built it:" >&2
-        while IFS='|' read -r _rimage rpath rterm; do
+        # WHICH FILE, AND WHICH OF THE WORDS BY ITS POSITION — never the word
+        # itself, and never a path with the word still in it. A refusal has to
+        # be diagnosable without publishing the name it is refusing, because a
+        # build log is kept and pasted (Codex's review, 26 September 2026).
+        while IFS='|' read -r _rimage rpath rposition; do
             echo "       in ${rpath}" >&2
-            echo "          the word: ${rterm}" >&2
+            echo "          the word: number ${rposition} of the ${SWEEP_TERM_COUNT} in RELEASE_SWEEP_TERMS — not printed here, because it is one of this machine's own names" >&2
         done < "${refusals}"
         remove_this_runs_tags
         die "a release image belongs to the release, not to a machine. Take the name out of the source that puts it there — or, if the file needs it (a detector's own patterns, say), name that FILE under sweep_exceptions: in the manifest, with its reason."
@@ -1235,6 +1329,17 @@ COORDINATOR_TAG_VERSION="$(coordinator_field 6)"
     printf '  "labels": %s\n' "$(docker image inspect "${COORDINATOR_ID}" --format '{{json .Config.Labels}}')"
     printf '}\n'
 } > "${RECEIPT}"
+
+# THE RUN IS A SUCCESS FROM HERE AND NOT ONE MOMENT EARLIER.
+#
+# Everything above can fail — including this write, which is the failure Codex's
+# review of 26 September 2026 drove: a receipt destination whose parent
+# directory does not exist. Until this line the tags this run wrote are removed
+# by the EXIT trap on any ending, so a release that nobody can read afterwards
+# does not leave images behind that look shippable.
+[ -s "${RECEIPT}" ] \
+    || die "the receipt at ${RECEIPT} is empty or was not written, so this release has nothing that says what it is made of. The images this run built have been removed."
+BUILD_SUCCEEDED=1
 
 say "Receipt written to ${RECEIPT}"
 say ""
