@@ -3,23 +3,66 @@
 Public surface
 ==============
 
-- :func:`apply_at_boot` — execute every migration whose version exceeds
-  the highest row currently in ``schema_version``.
+- :func:`apply_at_boot` — apply every migration whose version exceeds
+  the highest row currently in ``schema_version``, all of them or none
+  of them.
+- :func:`observed_schema_version` — read, and only read, the version a
+  database is actually at. Applies nothing, writes nothing, and works on
+  a read-only connection.
+- :func:`pending_migrations` — which migrations a database at a given
+  version still has to apply.
+- :func:`target_schema_version` — the version this release ships.
 
 Design notes (DDR-003 + TASK-PSM-002)
 -------------------------------------
 
-The schema is shipped as a real ``schema.sql`` file inside this
+The schema is shipped as real ``schema*.sql`` files inside this
 package — see :mod:`importlib.resources`. ``CREATE TABLE IF NOT EXISTS``
-plus ``INSERT OR IGNORE INTO schema_version`` make the script safe to
-re-run on every boot, which is what gives us the *idempotent*
-acceptance criterion for free: running ``apply_at_boot`` against an
-already-migrated database is a no-op (no extra rows, no schema drift).
+plus ``INSERT OR IGNORE INTO schema_version`` make each script safe to
+re-run, which is what gives us the *idempotent* acceptance criterion:
+running ``apply_at_boot`` against an already-migrated database is a
+no-op (no extra rows, no schema drift).
 
-The runner wraps the executescript in a single transaction. A failure
-inside the script rolls back the whole boot — partial schema is the
-worst possible recovery state, so we'd rather raise loudly and let the
-caller surface the error.
+Why this runner does not use ``executescript`` (26 September 2026)
+-----------------------------------------------------------------
+
+Until today the runner wrapped a loop of
+``connection.executescript(sql)`` in ``with connection`` and its
+docstring claimed the batch was one transaction. It was not, for two
+independent reasons:
+
+* ``executescript`` issues a COMMIT before it runs anything, so the
+  Python-level transaction was thrown away on the first migration; and
+* the writer connection is opened with ``isolation_level=None``
+  (:func:`forge.adapters.sqlite.connect.connect_writer`), so every
+  statement autocommitted on its own anyway.
+
+A review on 26 September reproduced the consequence on a throwaway
+database: a migration that added a column and then failed left the
+column behind, left ``schema_version`` at the old number, and made the
+retry fail with ``duplicate column name`` — a database that could not be
+migrated again. So the runner now owns the transaction itself:
+
+1. every pending migration file is read and split into single statements
+   *before* the database is touched, and a migration that carries its own
+   ``BEGIN``/``COMMIT``/``ROLLBACK`` is refused by name;
+2. foreign-key enforcement is turned off for the duration (SQLite's own
+   table-rebuild recipe requires this, and ``PRAGMA foreign_keys`` is
+   silently ignored inside a transaction, so it has to happen here,
+   outside it) and restored afterwards;
+3. ``BEGIN IMMEDIATE``, then every statement of every pending migration
+   in order, then ``PRAGMA foreign_key_check`` — whose rows are actually
+   looked at, which the old script's copy of it never was — then
+   ``COMMIT``;
+4. on any failure, ``ROLLBACK`` and :class:`MigrationError` naming the
+   migration and the statement that failed. SQLite's DDL is
+   transactional, so a rolled-back ``ALTER TABLE`` leaves no column
+   behind and the next boot starts from exactly where the last good boot
+   left off.
+
+The batch is therefore all-or-nothing: either every pending migration is
+applied and every ``schema_version`` row is written, or the database is
+byte-for-byte what it was before.
 """
 
 from __future__ import annotations
@@ -205,20 +248,212 @@ def _current_version(connection: sqlite3.Connection) -> int:
     return int(row[0])
 
 
+# Statements that would take the transaction away from this runner. A
+# migration file is refused outright if it contains one of these, because
+# the runner cannot promise all-or-nothing while the file is opening and
+# closing transactions of its own.
+_TRANSACTION_WORDS: Final[frozenset[str]] = frozenset(
+    {"BEGIN", "COMMIT", "END", "ROLLBACK", "SAVEPOINT", "RELEASE"}
+)
+
+
+def _strip_comments_and_space(text: str) -> str:
+    """Return ``text`` with SQL comments and surrounding space removed.
+
+    Used for two decisions only: is what is left after the last semicolon
+    an unfinished statement, and what is a statement's first word. Both
+    have to ignore comments — several migration files discuss ``BEGIN``
+    and ``COMMIT`` in their header prose, and one of them mentions a
+    "STARTING COMMIT", none of which is a transaction statement.
+    """
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        if text.startswith("--", i):
+            end = text.find("\n", i)
+            i = n if end == -1 else end + 1
+            continue
+        if text.startswith("/*", i):
+            end = text.find("*/", i + 2)
+            i = n if end == -1 else end + 2
+            continue
+        out.append(text[i])
+        i += 1
+    return "".join(out).strip()
+
+
+def _split_statements(sql: str, filename: str) -> list[str]:
+    """Split one migration file into single, complete SQL statements.
+
+    The scan honours single-quoted strings (including ``''`` escapes),
+    double-quoted and backtick-quoted and bracket-quoted identifiers,
+    ``--`` line comments and ``/* */`` block comments, so a semicolon
+    inside any of those is not a statement boundary. A candidate is only
+    accepted at a semicolon when :func:`sqlite3.complete_statement` says
+    it is complete, which is what keeps a ``CREATE TRIGGER`` body (whose
+    ``BEGIN … END`` contains semicolons) in one piece.
+
+    Raises
+    ------
+    MigrationError
+        If anything but comments and whitespace follows the last
+        complete statement — an unclosed quote, comment or statement.
+    """
+    statements: list[str] = []
+    start = 0
+    i = 0
+    n = len(sql)
+    while i < n:
+        char = sql[i]
+        if char in ("'", '"', "`"):
+            i += 1
+            while i < n:
+                if sql[i] == char:
+                    if i + 1 < n and sql[i + 1] == char:
+                        i += 2
+                        continue
+                    i += 1
+                    break
+                i += 1
+            continue
+        if char == "[":
+            end = sql.find("]", i + 1)
+            i = n if end == -1 else end + 1
+            continue
+        if sql.startswith("--", i):
+            end = sql.find("\n", i)
+            i = n if end == -1 else end + 1
+            continue
+        if sql.startswith("/*", i):
+            end = sql.find("*/", i + 2)
+            i = n if end == -1 else end + 2
+            continue
+        if char == ";":
+            candidate = sql[start : i + 1]
+            if sqlite3.complete_statement(candidate):
+                statements.append(candidate.strip())
+                start = i + 1
+            i += 1
+            continue
+        i += 1
+
+    trailing = _strip_comments_and_space(sql[start:])
+    if trailing:
+        raise MigrationError(
+            f"migration {filename!r} ends with an unfinished statement — "
+            "the last statement is missing its semicolon, or a quote or "
+            "comment was never closed"
+        )
+    if not statements:
+        raise MigrationError(f"migration {filename!r} contains no statements")
+    return statements
+
+
+def _first_word(statement: str) -> str:
+    """Return a statement's first word, upper-cased, comments ignored."""
+    words = _strip_comments_and_space(statement).split(None, 1)
+    return words[0].strip("(;").upper() if words else ""
+
+
+def _refuse_own_transaction(
+    statements: list[str],
+    filename: str,
+) -> None:
+    """Refuse a migration that opens or closes a transaction itself.
+
+    The runner puts one transaction around the whole pending batch. A
+    migration that says ``BEGIN`` or ``COMMIT`` inside that would either
+    fail or, worse, commit half the batch — which is the very failure
+    this runner exists to prevent. The check looks at each statement's
+    first word, not at the file's text, so prose that discusses a commit
+    is not mistaken for one.
+    """
+    for statement in statements:
+        word = _first_word(statement)
+        if word in _TRANSACTION_WORDS:
+            raise MigrationError(
+                f"migration {filename!r} manages its own transaction "
+                f"(it contains a {word} statement). The migration runner "
+                "puts one transaction around the whole batch, so a "
+                "migration must not open or close one of its own."
+            )
+
+
+def target_schema_version() -> int:
+    """Return the schema version this release of Forge ships."""
+    return _SCHEMA_VERSION
+
+
+def observed_schema_version(connection: sqlite3.Connection) -> int:
+    """Return the schema version a database is *actually* at.
+
+    Reads and only reads: it applies nothing, writes nothing, and opens
+    no transaction, so it is safe on a ``mode=ro`` connection and on a
+    copy of a live record. A database with no ``schema_version`` table at
+    all reads as 0, meaning "nothing has been applied here yet".
+
+    This exists for the rollout tooling, which has to tell the schema a
+    record *is* from the schema a release *wants*: a valid older record
+    must not be refused merely for being older than
+    :func:`target_schema_version`.
+    """
+    return _current_version(connection)
+
+
+def pending_migrations(version: int) -> tuple[tuple[int, str], ...]:
+    """Return the migrations a database at ``version`` has still to apply.
+
+    Each entry is ``(version, filename)``, in ascending order. An empty
+    tuple means the database is already at — or beyond — the version this
+    release ships. Nothing is read or written; the answer is a function
+    of the number alone, so the rollout tooling can ask it about a
+    version it read from a snapshot minutes earlier.
+    """
+    return tuple(m for m in _MIGRATIONS if m[0] > version)
+
+
 def apply_at_boot(connection: sqlite3.Connection) -> int:
-    """Apply every pending migration to ``connection``.
+    """Apply every pending migration to ``connection``, all or nothing.
+
+    The whole pending batch runs inside one ``BEGIN IMMEDIATE`` …
+    ``COMMIT``. Either every pending migration is applied and every
+    ``schema_version`` row is written, or — on any failure — the
+    transaction is rolled back and the database is exactly what it was
+    before. SQLite's DDL is transactional, so a rolled-back
+    ``ALTER TABLE`` leaves no column behind and the failed migration can
+    be retried once its cause is fixed.
+
+    ``executescript`` is deliberately *not* used: it commits any open
+    transaction before it runs, and the writer connection is in
+    autocommit mode (``isolation_level=None``), so a loop of
+    ``executescript`` calls has no transaction around it at all. Each
+    migration file is instead split into single statements and executed
+    one at a time. A migration that carries its own ``BEGIN``/``COMMIT``
+    is refused by name, because it would take the transaction away from
+    this runner.
 
     The function is **idempotent**: running it twice against the same
-    database leaves the schema unchanged because every DDL statement
-    in the bundled ``schema.sql`` uses ``IF NOT EXISTS`` and the
-    ``schema_version`` seed row uses ``INSERT OR IGNORE``.
+    database leaves the schema unchanged, because every DDL statement in
+    the bundled scripts uses ``IF NOT EXISTS`` and every
+    ``schema_version`` row is written with ``INSERT OR IGNORE``. With
+    nothing pending, nothing at all is executed.
+
+    Foreign-key enforcement is switched off for the duration and restored
+    afterwards. SQLite's own table-rebuild recipe requires that, and
+    ``PRAGMA foreign_keys`` is silently ignored inside a transaction, so
+    it can only be done here — outside it. Before the commit,
+    ``PRAGMA foreign_key_check`` runs and its rows are *read*: a
+    migration that broke a reference is rolled back rather than
+    committed.
 
     Parameters
     ----------
     connection:
         A writable ``sqlite3.Connection`` — typically the persistent
         connection returned by
-        :func:`forge.adapters.sqlite.connect.connect_writer`.
+        :func:`forge.adapters.sqlite.connect.connect_writer`. It must not
+        already have a transaction open; the runner needs to own one.
 
     Returns
     -------
@@ -229,31 +464,101 @@ def apply_at_boot(connection: sqlite3.Connection) -> int:
     Raises
     ------
     MigrationError
-        If any migration script raises a SQLite error. The originating
-        exception is preserved as ``__cause__``.
+        If a migration file cannot be split into statements, manages its
+        own transaction, or raises a SQLite error. The message names the
+        migration and the statement that failed — never the data. Any
+        originating exception is preserved as ``__cause__``.
     """
     starting_version = _current_version(connection)
 
-    pending = [m for m in _MIGRATIONS if m[0] > starting_version]
+    pending = pending_migrations(starting_version)
     if not pending:
-        # Already up to date — re-running schema.sql would still be a
-        # no-op, but skipping it avoids the tiny cost on every boot.
+        # Already up to date — re-running the scripts would still be a
+        # no-op, but skipping them avoids the cost on every boot, and
+        # avoids opening a transaction for nothing.
         return starting_version
 
-    try:
-        with connection:  # transaction: commit on success, rollback on raise
-            for _version, filename in pending:
-                sql = _load_migration_sql(filename)
-                connection.executescript(sql)
-    except sqlite3.Error as exc:
+    # Read and check every file BEFORE the database is touched, so a
+    # malformed or transaction-managing migration is refused without
+    # having changed anything at all.
+    batch: list[tuple[int, str, list[str]]] = []
+    for version, filename in pending:
+        sql = _load_migration_sql(filename)
+        statements = _split_statements(sql, filename)
+        _refuse_own_transaction(statements, filename)
+        batch.append((version, filename, statements))
+
+    if connection.in_transaction:
         raise MigrationError(
-            f"failed to apply migration {filename!r}: {exc}"
-        ) from exc
+            "cannot apply migrations: the connection already has a "
+            "transaction open, and the runner has to own the one "
+            "transaction the whole batch runs in"
+        )
+
+    foreign_keys_were_on = bool(
+        connection.execute("PRAGMA foreign_keys;").fetchone()[0]
+    )
+    if foreign_keys_were_on:
+        # Ignored inside a transaction, which is exactly why it is here.
+        connection.execute("PRAGMA foreign_keys = OFF;")
+
+    try:
+        connection.execute("BEGIN IMMEDIATE;")
+        try:
+            for _version, filename, statements in batch:
+                for statement in statements:
+                    try:
+                        connection.execute(statement)
+                    except sqlite3.Error as exc:
+                        raise MigrationError(
+                            f"failed to apply migration {filename!r} at "
+                            f"statement {_first_line(statement)!r}: {exc}"
+                        ) from exc
+                connection.execute(
+                    "INSERT OR IGNORE INTO schema_version (version, applied_at) "
+                    "VALUES (?, datetime('now'));",
+                    (_version,),
+                )
+            broken = connection.execute("PRAGMA foreign_key_check;").fetchall()
+            if broken:
+                tables = sorted({str(row[0]) for row in broken})
+                raise MigrationError(
+                    "migrations left broken references behind, so nothing "
+                    f"was applied. Tables with broken references: "
+                    f"{', '.join(tables)}"
+                )
+            connection.execute("COMMIT;")
+        except BaseException:
+            # Nothing survives a failure: not a column, not a table, not
+            # a schema_version row.
+            try:
+                connection.execute("ROLLBACK;")
+            except sqlite3.Error:  # pragma: no cover - rollback of a dead txn
+                pass
+            raise
+    except sqlite3.Error as exc:
+        raise MigrationError(f"failed to apply migrations: {exc}") from exc
+    finally:
+        if foreign_keys_were_on:
+            connection.execute("PRAGMA foreign_keys = ON;")
 
     return _current_version(connection)
+
+
+def _first_line(statement: str) -> str:
+    """Return a one-line, shortened form of ``statement`` for a message.
+
+    Migration files are DDL, so this carries no row data. It is trimmed
+    so an error line stays readable.
+    """
+    collapsed = " ".join(_strip_comments_and_space(statement).split())
+    return collapsed if len(collapsed) <= 120 else collapsed[:117] + "..."
 
 
 __all__ = [
     "MigrationError",
     "apply_at_boot",
+    "observed_schema_version",
+    "pending_migrations",
+    "target_schema_version",
 ]

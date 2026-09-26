@@ -17,17 +17,23 @@
 -- meaning); this delta only applies to databases below version 4.
 --
 -- Foreign keys: ``planning_run_events.correlation_id`` REFERENCES
--- planning_runs. The rebuild toggles ``foreign_keys=OFF`` for the swap and
--- back ``ON`` afterwards. This is safe here because the boot migration runner
--- executes each migration via ``executescript``, which COMMITs any pending
--- transaction first — so the PRAGMA is applied outside a transaction (a
--- PRAGMA inside an open transaction is silently ignored). The script wraps
--- the swap in its own BEGIN/COMMIT and a ``foreign_key_check`` verifies
--- referential integrity before the constraint is re-enabled.
-
-PRAGMA foreign_keys=OFF;
-
-BEGIN;
+-- planning_runs, so dropping the old parent table would fail on the implicit
+-- DELETE FROM that a DROP performs while enforcement is on.
+--
+-- UPDATED 26 September 2026. This script used to switch ``foreign_keys`` off
+-- itself and wrap the swap in its own BEGIN/COMMIT, on the reasoning that the
+-- runner's ``executescript`` committed first anyway. That reasoning was the
+-- other side of the defect the runner has now fixed: a migration batch that
+-- was never one transaction. The runner
+-- (``forge.lifecycle.migrations.apply_at_boot``) now owns the single
+-- transaction around the whole batch and switches foreign-key enforcement off
+-- outside it — which is the only place that works, because PRAGMA
+-- foreign_keys is silently ignored inside a transaction — and it reads the
+-- rows of ``PRAGMA foreign_key_check`` before committing, which this script's
+-- own copy of that check never did (``executescript`` threw the rows away).
+-- So the three PRAGMAs and the BEGIN/COMMIT are gone from here, and a
+-- migration that carries its own transaction statements is now refused by the
+-- runner by name.
 
 -- Rebuilt planning_runs with the widened state CHECK. All other columns,
 -- constraints, and STRICT mode are copied verbatim from schema_v3.sql.
@@ -85,14 +91,8 @@ CREATE INDEX IF NOT EXISTS idx_planning_runs_user
 CREATE INDEX IF NOT EXISTS idx_planning_runs_state
     ON planning_runs (state, queued_at DESC);
 
--- Schema version ledger entry (inside the transaction so it commits atomically
--- with the rebuild).
+-- Schema version ledger entry. It commits atomically with the rebuild, and
+-- with every other migration in the same boot's batch, because the runner
+-- holds one transaction around all of them.
 INSERT OR IGNORE INTO schema_version (version, applied_at)
 VALUES (4, datetime('now'));
-
-COMMIT;
-
--- Verify referential integrity survived the swap, then re-enable enforcement.
-PRAGMA foreign_key_check;
-
-PRAGMA foreign_keys=ON;
