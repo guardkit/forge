@@ -202,8 +202,20 @@ REPORT="$(printf '%s' "${ANSWER}" | jq -r \
         elif . == "interest" then "interest"
         else . end;
 
-    # Every stream the bus holds, keyed by name, across every account.
-    ([.account_details[]? | .stream_detail[]? | select(.config != null) | {key: .config.name, value: .config}] | from_entries) as $held
+    # Every stream the bus holds, keyed by name — WITHIN ONE ACCOUNT. A bus
+    # has several accounts, and a name is only unique within one; joining all
+    # accounts into one map let the last account stream win (the E1/E2
+    # review of 26 September 2026). The account that holds the pinned streams
+    # is chosen once: the one named in BUS_STREAMS_ACCOUNT if that setting is
+    # given, else the single account that holds every pinned stream name; two
+    # candidate accounts, or none, is UNKNOWN, not a comparison.
+    ([.account_details[]? | select(.stream_detail != null) | {account: .name, streams: ([.stream_detail[]? | select(.config != null) | {key: .config.name, value: .config}] | from_entries)}]) as $by_account
+    | ([ $stream_defs[0].streams[]? | .name ]) as $pinned
+    | ($by_account | map(select(($ENV.BUS_STREAMS_ACCOUNT // "") == "" or .account == $ENV.BUS_STREAMS_ACCOUNT))) as $candidates
+    | ($candidates | map(select(. as $a | any($pinned[]; . as $n | $a.streams | has($n))))) as $holding
+    | (if ($holding | length) == 1 then $holding[0] else null end) as $chosen
+    | (if $chosen == null then {} else $chosen.streams end) as $held
+    | (if ($holding | length) > 1 then ["AMBIGUOUS_ACCOUNT|\(($holding | map(.account)) | join(","))"] else [] end) as $account_problems
 
     # A LIST IS A SET HERE, NOT AN ORDER (26 September 2026, the review of this
     # script). The subjects of a stream are two JSON arrays on the two sides, and
@@ -233,7 +245,7 @@ REPORT="$(printf '%s' "${ANSWER}" | jq -r \
         end;
 
     # --- the streams the definitions name --------------------------------
-    ([ $stream_defs[0].streams[]?
+    ($account_problems + [ $stream_defs[0].streams[]?
        | . as $d
        | compare($d.name;
            ([ {on: "subjects",     want: ($d.subjects), sorted: true} ]
@@ -303,6 +315,9 @@ done <<< "${REPORT}"
 
 # A field the answer does not carry is an unknown about the bus, so it leaves by
 # the unknown door even though it was found during the comparison.
+if printf '%s' "${REPORT}" | /bin/grep -q '^AMBIGUOUS_ACCOUNT|'; then
+    unknown "more than one account on this bus holds streams by the pinned names ($(printf '%s' "${REPORT}" | sed -n 's/^AMBIGUOUS_ACCOUNT|//p' | head -1)), so it cannot be said which account the coordinator's streams live in. Name the account in BUS_STREAMS_ACCOUNT and run again. Nothing was updated."
+fi
 if printf '%s' "${REPORT}" | /bin/grep -q '^ABSENT_FIELD|'; then
     unknown "a field the pinned definitions name is not in this bus's answer (above), so those fields were not compared. Nothing was updated."
 fi
