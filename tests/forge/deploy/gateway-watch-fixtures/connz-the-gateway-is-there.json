@@ -1,0 +1,28 @@
+{
+  "server_id": "NDFIXTURE",
+  "now": "2026-09-26T16:00:00Z",
+  "num_connections": 3,
+  "connections": [
+    {
+      "cid": 11,
+      "authorized_user": "jarvis",
+      "name": "bus-gateway-factory",
+      "subscriptions": 2,
+      "subscriptions_list": ["agents.command.jarvis", "_INBOX.gateway.*"]
+    },
+    {
+      "cid": 12,
+      "authorized_user": "jarvis",
+      "name": "front-door-factory",
+      "subscriptions": 1,
+      "subscriptions_list": ["_INBOX.door.*"]
+    },
+    {
+      "cid": 13,
+      "authorized_user": "forge",
+      "name": "forge-serve",
+      "subscriptions": 1,
+      "subscriptions_list": ["pipeline.build.>"]
+    }
+  ]
+}

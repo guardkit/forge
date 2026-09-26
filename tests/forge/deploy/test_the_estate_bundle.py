@@ -25,6 +25,7 @@ one rendered compose document and the output of one shell script.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -1679,3 +1680,713 @@ class TestTheEstateForwardsWhatTheBundleForwards:
         text = (ESTATE / ".env.example").read_text()
         missing = [n for n in self._names(ESTATE / ".env.example") if f"\n{n}=" not in text]
         assert not missing, f"forwarded but given no line to fill in: {missing}"
+
+
+# ---------------------------------------------------------------------------
+# THE GATEWAY WATCH (26 September 2026, build item E3)
+#
+# The named replacement for the retired host alarm. Three tests' worth of
+# subject: that the compose file renders it and gives both jarvis services a
+# distinct name on the bus, that the example env file carries every new name,
+# and that the rule it judges a connection by really needs all three parts.
+# ---------------------------------------------------------------------------
+
+_WATCH = ESTATE / "provisioner" / "gateway-watch.sh"
+_WATCH_FIXTURES = Path(__file__).resolve().parent / "gateway-watch-fixtures"
+
+#: A fixed moment, so an age is arithmetic and not a race. Every fixture's times
+#: are written relative to it: 2026-09-26T16:00:00Z.
+_A_FIXED_NOW = "1790438400"
+
+
+def _watch(
+    *,
+    connz: str,
+    heartbeat: str,
+    log: str,
+    notifier_file: Path,
+    account: str = "jarvis",
+    client_name: str = "bus-gateway-factory",
+    subject: str = "agents.command.jarvis",
+    extra_env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """One look, with every answer substituted from a saved file.
+
+    The three test seams (``--connz-file``, ``--log-file``, ``--now``) are the
+    same idea as the retired watchdog's own ``--journal-file`` and
+    ``--now-epoch``: the reads are the edges, and the judgement is what is worth
+    pinning. The notifier is the stand-in that writes a file — no test of this,
+    anywhere, ever touches the real Slack workspace.
+    """
+    env = {
+        **{name: os.environ[name] for name in _ONLY_THESE_ARE_INHERITED if name in os.environ},
+        "JARVIS_NATS_USER": account,
+        "GATEWAY_WATCH_CLIENT_NAME": client_name,
+        "GATEWAY_WATCH_SUBJECT": subject,
+        "BUS_MONITORING_ADDRESS": "nats:8222",
+        "GATEWAY_WATCH_HEARTBEAT_PATH": str(_WATCH_FIXTURES / heartbeat)
+        if heartbeat
+        else str(_WATCH_FIXTURES / "no-such-heartbeat.json"),
+        "GATEWAY_WATCH_NOTIFIER": "file",
+        "GATEWAY_WATCH_NOTIFIER_FILE": str(notifier_file),
+        "TZ": "UTC",
+    }
+    if extra_env:
+        env.update(extra_env)
+    return subprocess.run(
+        [
+            "bash",
+            str(_WATCH),
+            "--once",
+            "--connz-file",
+            str(_WATCH_FIXTURES / connz),
+            "--log-file",
+            str(_WATCH_FIXTURES / log),
+            "--now",
+            _A_FIXED_NOW,
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=60,
+    )
+
+
+def _messages(notifier_file: Path) -> list[str]:
+    if not notifier_file.exists():
+        return []
+    return [
+        json.loads(line)["text"]
+        for line in notifier_file.read_text().splitlines()
+        if line.strip()
+    ]
+
+
+class TestTheComposeFileGivesEachServiceItsOwnName:
+    """E3-j1. The account is shared on purpose; the name is what is not."""
+
+    def test_the_two_jarvis_services_send_two_different_names(
+        self, rendered: str
+    ) -> None:
+        door = _service_block(rendered, "front-door")
+        gateway = _service_block(rendered, "bus-gateway")
+        assert "JARVIS_NATS_CLIENT_NAME: front-door-factory" in door, door
+        assert "JARVIS_NATS_CLIENT_NAME: bus-gateway-factory" in gateway, gateway
+
+    def test_they_still_share_one_account_which_is_why_the_name_is_needed(
+        self, rendered: str
+    ) -> None:
+        door = _service_block(rendered, "front-door")
+        gateway = _service_block(rendered, "bus-gateway")
+        assert "JARVIS_NATS_USER: jarvis" in door
+        assert "JARVIS_NATS_USER: jarvis" in gateway
+
+    def test_the_gateway_is_told_where_to_write_its_heartbeat(
+        self, rendered: str
+    ) -> None:
+        gateway = _service_block(rendered, "bus-gateway")
+        assert "JARVIS_SLACK_HEARTBEAT_PATH: /var/lib/jarvis/slack-heartbeat.json" in gateway
+        assert "gateway-state" in gateway, (
+            "the gateway is told to write a heartbeat and given no volume to "
+            "write it in, so it would go into the container's own layer"
+        )
+
+    def test_the_front_door_is_not_given_the_gateways_volume(
+        self, rendered: str
+    ) -> None:
+        """One writer per volume, the same rule the front door's threads have."""
+        door = _service_block(rendered, "front-door")
+        assert "gateway-state" not in door, door
+
+
+class TestTheWatchIsInTheProjectOnlyWhenAsked:
+    def test_up_does_not_start_it(self, rendered: str) -> None:
+        """Like the sandbox service: a profile that is not asked for takes the
+        service out of the project ALTOGETHER, which is what keeps a rollout
+        window quiet."""
+        assert "\n  gateway-watch:" not in rendered, (
+            "the gateway watch is in the project without its profile, so "
+            "'docker compose up' would start the thing that tells Rich the "
+            "Slack door is down in the middle of a rollout"
+        )
+
+    @pytest.fixture(scope="class")
+    def rendered_with_the_watch(self) -> str:
+        if shutil.which("docker") is None:
+            pytest.skip("docker is not installed here, so there is nothing to render")
+        return _rendered(profiles="local-bus,watch")
+
+    def test_the_profile_renders_it(self, rendered_with_the_watch: str) -> None:
+        block = _service_block(rendered_with_the_watch, "gateway-watch")
+        assert "gateway-watch.sh" in block, block
+
+    def test_it_is_told_the_same_name_the_gateway_sends(
+        self, rendered_with_the_watch: str
+    ) -> None:
+        """Both come from one setting in one file, so the watch cannot end up
+        looking for a name nothing sends."""
+        watch = _service_block(rendered_with_the_watch, "gateway-watch")
+        gateway = _service_block(rendered_with_the_watch, "bus-gateway")
+        assert "GATEWAY_WATCH_CLIENT_NAME: bus-gateway-factory" in watch, watch
+        assert "JARVIS_NATS_CLIENT_NAME: bus-gateway-factory" in gateway
+
+    def test_it_reads_the_heartbeat_and_cannot_write_it(
+        self, rendered_with_the_watch: str
+    ) -> None:
+        block = _service_block(rendered_with_the_watch, "gateway-watch")
+        assert "gateway-state" in block, block
+        assert "read_only: true" in block, (
+            "the watch mounts the gateway's volume writable, and a reader that "
+            "can write the thing it reports on is not a reader"
+        )
+
+    def test_it_asks_the_engine_for_a_log_and_says_so(
+        self, rendered_with_the_watch: str
+    ) -> None:
+        """The one real privilege in this service, named rather than hidden."""
+        block = _service_block(rendered_with_the_watch, "gateway-watch")
+        assert "/var/run/docker.sock" in block, block
+        compose = (ESTATE / "compose.yaml").read_text()
+        assert "docker.sock" in compose and "privilege" in compose, (
+            "the compose file mounts the Docker socket into the watch without "
+            "saying in words what that costs"
+        )
+
+    def test_it_waits_for_the_bus_like_everything_else(
+        self, rendered_with_the_watch: str
+    ) -> None:
+        block = _service_block(rendered_with_the_watch, "gateway-watch")
+        assert "bus-ready" in block, (
+            "the watch does not wait for the bus, so its first look could call "
+            "the door lost because the bus was not answering yet"
+        )
+
+    def test_the_volume_is_declared(self, rendered_with_the_watch: str) -> None:
+        assert "gateway-state" in rendered_with_the_watch.split("volumes:")[-1]
+
+
+class TestTheExampleCarriesEveryNewName:
+    def test_the_new_settings_all_have_a_line(self) -> None:
+        text = (ESTATE / ".env.example").read_text()
+        for name in (
+            "FACTORY_INSTANCE",
+            "GATEWAY_WATCH_INTERVAL_S",
+            "GATEWAY_WATCH_HEARTBEAT_MAX_AGE_S",
+            "GATEWAY_WATCH_MAX_SILENCE_S",
+            "GATEWAY_WATCH_SUBJECT",
+            "GATEWAY_WATCH_NOTIFIER",
+            "GATEWAY_WATCH_NOTIFIER_FILE",
+            "GATEWAY_WATCH_CONTAINER",
+            "JARVIS_WATCHDOG_ALERT_CHANNEL_ID",
+        ):
+            assert f"\n{name}=" in text, (
+                f"{name} is read by the estate and has no line in .env.example, "
+                "so a machine copying the example gets the compose default and "
+                "no idea the setting exists"
+            )
+
+    def test_the_example_says_how_the_fifteen_minutes_happen(self) -> None:
+        """A compose file has no timer. What provides the cadence had to be
+        decided, and a decision nobody can find was not made."""
+        text = (ESTATE / ".env.example").read_text()
+        assert "GATEWAY_WATCH_INTERVAL_S=900" in text
+        readme = (ESTATE / "README.md").read_text()
+        assert "loop in the container" in readme, (
+            "the README does not say what provides the fifteen minutes, so the "
+            "next person will look for a timer that does not exist"
+        )
+        assert "--profile watch run --rm gateway-watch --once" in readme, (
+            "the README does not say how to look once by hand"
+        )
+
+    def test_the_watch_is_named_in_the_profiles_note(self) -> None:
+        """The line a machine actually edits has to say the profile exists."""
+        text = (ESTATE / ".env.example").read_text()
+        before_the_line = text.split("\nCOMPOSE_PROFILES=local-bus")[0]
+        assert "watch" in before_the_line[-2000:], (
+            "the note above the COMPOSE_PROFILES line does not mention the "
+            "watch's profile, so the only way to find it is to read compose.yaml"
+        )
+
+
+class TestTheWatchJudgesOneConnectionByAllThreeThings:
+    """THE POINT OF E3, and the finding that drove it.
+
+    The bundle gives the front door and the gateway the same bus account, so a
+    check that matches only ``authorized_user`` reports a STOPPED GATEWAY AS
+    HEALTHY whenever the front door is up. These cases are the difference.
+
+    Nothing here touches Slack: the notifier is the stand-in that writes a file.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _needs_jq(self) -> None:
+        if shutil.which("jq") is None:
+            pytest.skip("jq is not on this machine, and the bus answers JSON")
+
+    def test_a_healthy_gateway_is_every_component_ok_and_tells_nobody(
+        self, tmp_path: Path
+    ) -> None:
+        told = tmp_path / "messages.jsonl"
+        done = _watch(
+            connz="connz-the-gateway-is-there.json",
+            heartbeat="heartbeat-connected.json",
+            log="log-fresh.txt",
+            notifier_file=told,
+        )
+        assert done.returncode == 0, done.stdout + done.stderr
+        assert "bus connection   ok" in done.stdout
+        assert "Slack session    ok" in done.stdout
+        assert "recent activity  ok" in done.stdout
+        assert _messages(told) == [], "a healthy door was reported to somebody"
+
+    def test_the_account_alone_is_not_enough(self, tmp_path: Path) -> None:
+        """THE CASE THE OLD RULE GOT WRONG. The front door is connected on the
+        same account and the gateway is not there at all."""
+        told = tmp_path / "messages.jsonl"
+        done = _watch(
+            connz="connz-only-the-account.json",
+            heartbeat="heartbeat-connected.json",
+            log="log-fresh.txt",
+            notifier_file=told,
+        )
+        assert done.returncode == 10, done.stdout + done.stderr
+        assert "bus connection   lost" in done.stdout
+        told_texts = _messages(told)
+        assert len(told_texts) == 1, f"expected exactly one message, got {told_texts}"
+        assert "bus-gateway-factory" in told_texts[0]
+        assert "the front door shares it" in told_texts[0], told_texts[0]
+
+    def test_the_name_without_the_subscription_is_not_enough(
+        self, tmp_path: Path
+    ) -> None:
+        """A gateway that has connected and not subscribed answers nothing."""
+        told = tmp_path / "messages.jsonl"
+        done = _watch(
+            connz="connz-the-name-but-not-the-subscription.json",
+            heartbeat="heartbeat-connected.json",
+            log="log-fresh.txt",
+            notifier_file=told,
+        )
+        assert done.returncode == 10
+        assert "bus connection   lost" in done.stdout
+
+    def test_the_subscription_under_another_name_is_not_the_gateway(
+        self, tmp_path: Path
+    ) -> None:
+        told = tmp_path / "messages.jsonl"
+        done = _watch(
+            connz="connz-the-subscription-under-another-name.json",
+            heartbeat="heartbeat-connected.json",
+            log="log-fresh.txt",
+            notifier_file=told,
+        )
+        assert done.returncode == 10
+        assert "bus connection   lost" in done.stdout
+
+    def test_the_other_spelling_of_the_subscription_list_is_read_too(
+        self, tmp_path: Path
+    ) -> None:
+        """The bus answers ``subscriptions_list`` for ``subs=1`` and
+        ``subscriptions_list_detail`` for ``subs=detail``. A watch that knew only
+        one spelling would call a healthy gateway lost on the other."""
+        told = tmp_path / "messages.jsonl"
+        done = _watch(
+            connz="connz-with-subscription-detail.json",
+            heartbeat="heartbeat-connected.json",
+            log="log-fresh.txt",
+            notifier_file=told,
+        )
+        assert done.returncode == 0, done.stdout + done.stderr
+
+    def test_an_answer_it_cannot_read_is_unknown_and_never_healthy(
+        self, tmp_path: Path
+    ) -> None:
+        told = tmp_path / "messages.jsonl"
+        done = _watch(
+            connz="connz-not-json-at-all.txt",
+            heartbeat="heartbeat-connected.json",
+            log="log-fresh.txt",
+            notifier_file=told,
+        )
+        assert done.returncode == 10, done.stdout + done.stderr
+        assert "bus connection   unknown" in done.stdout
+        assert "not agreement" in done.stdout
+
+    def test_no_client_name_configured_refuses_to_guess(self, tmp_path: Path) -> None:
+        """Falling back to the account would be the old, wrong rule returning
+        quietly through the back door."""
+        told = tmp_path / "messages.jsonl"
+        done = _watch(
+            connz="connz-the-gateway-is-there.json",
+            heartbeat="heartbeat-connected.json",
+            log="log-fresh.txt",
+            notifier_file=told,
+            client_name="",
+        )
+        assert done.returncode == 10
+        assert "bus connection   unknown" in done.stdout
+        assert "refuses to guess" in done.stdout
+
+
+class TestTheWatchReportsSlackSeparately:
+    """The second miss Codex named: Slack can die while the bus is fine."""
+
+    @pytest.fixture(autouse=True)
+    def _needs_jq(self) -> None:
+        if shutil.which("jq") is None:
+            pytest.skip("jq is not on this machine, and the heartbeat is JSON")
+
+    def test_slack_lost_while_the_bus_is_ok(self, tmp_path: Path) -> None:
+        told = tmp_path / "messages.jsonl"
+        done = _watch(
+            connz="connz-the-gateway-is-there.json",
+            heartbeat="heartbeat-disconnected.json",
+            log="log-fresh.txt",
+            notifier_file=told,
+        )
+        assert done.returncode == 10, done.stdout + done.stderr
+        assert "bus connection   ok" in done.stdout
+        assert "Slack session    lost" in done.stdout
+        told_texts = _messages(told)
+        assert len(told_texts) == 1
+        assert "lost its Slack session" in told_texts[0], told_texts[0]
+
+    def test_a_heartbeat_older_than_a_rotation_is_lost(self, tmp_path: Path) -> None:
+        told = tmp_path / "messages.jsonl"
+        done = _watch(
+            connz="connz-the-gateway-is-there.json",
+            heartbeat="heartbeat-stale.json",
+            log="log-fresh.txt",
+            notifier_file=told,
+        )
+        assert done.returncode == 10
+        assert "Slack session    lost" in done.stdout
+        assert "21600s" in done.stdout
+
+    def test_an_absent_heartbeat_is_unknown_and_never_healthy(
+        self, tmp_path: Path
+    ) -> None:
+        told = tmp_path / "messages.jsonl"
+        done = _watch(
+            connz="connz-the-gateway-is-there.json",
+            heartbeat="",
+            log="log-fresh.txt",
+            notifier_file=told,
+        )
+        assert done.returncode == 10, done.stdout + done.stderr
+        assert "Slack session    unknown" in done.stdout
+        assert "never healthy" in done.stdout
+
+    def test_a_heartbeat_that_is_not_the_right_shape_is_unknown(
+        self, tmp_path: Path
+    ) -> None:
+        told = tmp_path / "messages.jsonl"
+        done = _watch(
+            connz="connz-the-gateway-is-there.json",
+            heartbeat="heartbeat-not-json.json",
+            log="log-fresh.txt",
+            notifier_file=told,
+        )
+        assert done.returncode == 10
+        assert "Slack session    unknown" in done.stdout
+
+
+class TestTheWatchKeepsTheOldStalledLogCheck:
+    """The retired alarm's third signal, kept, against the container's log."""
+
+    @pytest.fixture(autouse=True)
+    def _needs_jq(self) -> None:
+        if shutil.which("jq") is None:
+            pytest.skip("jq is not on this machine")
+
+    def test_a_door_silent_past_the_backstop_is_stalled(self, tmp_path: Path) -> None:
+        told = tmp_path / "messages.jsonl"
+        done = _watch(
+            connz="connz-the-gateway-is-there.json",
+            heartbeat="heartbeat-connected.json",
+            log="log-silent-past-the-backstop.txt",
+            notifier_file=told,
+        )
+        assert done.returncode == 10, done.stdout + done.stderr
+        assert "recent activity  stalled" in done.stdout
+        assert "gone silent" in _messages(told)[0]
+
+    def test_the_backstop_is_the_old_alarms_own_six_hours(self, tmp_path: Path) -> None:
+        """A shorter window turns a quiet Friday into an alarm: a healthy idle
+        door is not silent, and its Slack session rotates roughly every five
+        hours and logs when it does."""
+        told = tmp_path / "messages.jsonl"
+        done = _watch(
+            connz="connz-the-gateway-is-there.json",
+            heartbeat="heartbeat-connected.json",
+            log="log-fresh.txt",
+            notifier_file=told,
+        )
+        assert "21600s backstop" in done.stdout, done.stdout
+
+    def test_a_log_with_no_times_is_unknown(self, tmp_path: Path) -> None:
+        told = tmp_path / "messages.jsonl"
+        done = _watch(
+            connz="connz-the-gateway-is-there.json",
+            heartbeat="heartbeat-connected.json",
+            log="log-with-no-times.txt",
+            notifier_file=told,
+        )
+        assert done.returncode == 10
+        assert "recent activity  unknown" in done.stdout
+
+
+class TestTheWatchTellsSomebodyTheRightWay:
+    @pytest.fixture(autouse=True)
+    def _needs_jq(self) -> None:
+        if shutil.which("jq") is None:
+            pytest.skip("jq is not on this machine")
+
+    def test_it_reuses_the_retired_alarms_own_setting_names(self) -> None:
+        """Not a second notifier with a second set of names to configure."""
+        text = _WATCH.read_text()
+        for name in (
+            "JARVIS_SLACK_BOT_TOKEN",
+            "JARVIS_SLACK_CHANNEL_ID",
+            "JARVIS_WATCHDOG_ALERT_CHANNEL_ID",
+        ):
+            assert name in text, f"the watch does not read {name}"
+        assert "chat.postMessage" in text, (
+            "the watch does not post the way the retired alarm did"
+        )
+
+    def test_the_message_names_a_component_and_not_a_unit(
+        self, tmp_path: Path
+    ) -> None:
+        told = tmp_path / "messages.jsonl"
+        _watch(
+            connz="connz-only-the-account.json",
+            heartbeat="heartbeat-connected.json",
+            log="log-fresh.txt",
+            notifier_file=told,
+        )
+        message = _messages(told)[0]
+        assert "bus connection" in message
+        assert "Slack session" in message
+        assert "recent activity" in message
+        assert "systemd" not in message and "is-active" not in message, (
+            "the message still talks about a systemd unit, which is the thing "
+            "this replacement exists to stop saying"
+        )
+
+    def test_one_unhappy_look_is_exactly_one_message(self, tmp_path: Path) -> None:
+        """Two components wrong is still one message. Rich is told once."""
+        told = tmp_path / "messages.jsonl"
+        done = _watch(
+            connz="connz-only-the-account.json",
+            heartbeat="heartbeat-disconnected.json",
+            log="log-silent-past-the-backstop.txt",
+            notifier_file=told,
+        )
+        assert done.returncode == 10
+        assert len(_messages(told)) == 1
+
+    def test_a_stand_in_with_nowhere_to_write_is_a_broken_watch(
+        self, tmp_path: Path
+    ) -> None:
+        """Exit 20, not 0. A watch that could not deliver its alarm must never
+        look like a healthy door."""
+        done = _watch(
+            connz="connz-only-the-account.json",
+            heartbeat="heartbeat-connected.json",
+            log="log-fresh.txt",
+            notifier_file=tmp_path / "unused.jsonl",
+            extra_env={"GATEWAY_WATCH_NOTIFIER_FILE": ""},
+        )
+        assert done.returncode == 20, done.stdout + done.stderr
+        assert "nowhere to go" in done.stderr
+
+    def test_an_unknown_notifier_is_a_broken_watch_too(self, tmp_path: Path) -> None:
+        done = _watch(
+            connz="connz-only-the-account.json",
+            heartbeat="heartbeat-connected.json",
+            log="log-fresh.txt",
+            notifier_file=tmp_path / "unused.jsonl",
+            extra_env={"GATEWAY_WATCH_NOTIFIER": "smoke-signals"},
+        )
+        assert done.returncode == 20
+        assert "'slack' or 'file'" in done.stderr
+
+    def test_it_never_names_the_real_slack_host_in_a_rehearsal(
+        self, tmp_path: Path
+    ) -> None:
+        told = tmp_path / "messages.jsonl"
+        done = _watch(
+            connz="connz-only-the-account.json",
+            heartbeat="heartbeat-connected.json",
+            log="log-fresh.txt",
+            notifier_file=told,
+        )
+        assert "Nothing was sent to Slack" in done.stdout, done.stdout
+
+
+class TestTheCheckAndTheWatchAgree:
+    """One estate, one rule. Item 8i of the services check asks the same three
+    things as the watch — an item that was laxer than the watch would be a
+    second, quieter opinion about whether the door is up."""
+
+    def test_item_8i_asks_for_the_name_and_the_subscription_too(self) -> None:
+        check = (ESTATE / "estate-check").read_text()
+        assert "connz?auth=1&subs=1" in check, (
+            "item 8i still asks connz without subscriptions, so it cannot ask "
+            "for the gateway's subscription"
+        )
+        assert "FACTORY_INSTANCE" in check, (
+            "item 8i does not read FACTORY_INSTANCE, so it cannot know the name "
+            "the gateway sends"
+        )
+        assert "agents.command.jarvis" in check
+
+    def test_item_8i_no_longer_matches_the_account_on_its_own(self) -> None:
+        """The exact line Codex named: a count of ``authorized_user`` matches,
+        with nothing else asked."""
+        check = (ESTATE / "estate-check").read_text()
+        assert '/bin/grep -o "\\"authorized_user\\":\\"${account}\\""' not in check, (
+            "item 8i still counts connections by the account alone, which "
+            "reports a stopped gateway as healthy whenever the front door is up"
+        )
+
+    def test_item_8is_sentence_says_all_three(self) -> None:
+        items = _the_checks_items()
+        assert "8i" in items
+        sentence = items["8i"][1]
+        for word in ("account", "client name", "subscription"):
+            assert word in sentence, sentence
+
+
+class TestTheUnrecoveredDropTheHeartbeatCannotSee:
+    """A CORRECTION THE CODE FORCED (26 September 2026).
+
+    The heartbeat is written from the Slack client library's own lifecycle
+    listeners, and on a CLOSE that library RECONNECTS FIRST and only then runs
+    those listeners. So when the reconnect itself throws — which is exactly what
+    an unrecovered Slack drop looks like — the listeners never run, and the file
+    keeps saying 'connected' and is never rewritten again. The freshness window
+    would catch it after six hours; the retired alarm caught it at the next
+    quarter of an hour by reading the SHAPE of the lifecycle in the log.
+
+    Dropping that would have been a real loss of cover, so the watch keeps the
+    retired alarm's second signal from the same log it already reads. The design
+    named only the silence backstop; this is the design meeting the code.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _needs_jq(self) -> None:
+        if shutil.which("jq") is None:
+            pytest.skip("jq is not on this machine")
+
+    def test_a_drop_with_nothing_after_it_is_slack_lost(self, tmp_path: Path) -> None:
+        told = tmp_path / "messages.jsonl"
+        done = _watch(
+            connz="connz-the-gateway-is-there.json",
+            heartbeat="heartbeat-connected.json",
+            log="log-a-drop-that-never-came-back.txt",
+            notifier_file=told,
+        )
+        assert done.returncode == 10, done.stdout + done.stderr
+        assert "bus connection   ok" in done.stdout
+        assert "Slack session    lost" in done.stdout
+        assert "no 'session established' after it" in done.stdout.lower(), done.stdout
+
+    def test_a_healthy_rotation_is_not_a_drop(self, tmp_path: Path) -> None:
+        """THE FALSE ALARM THIS HAD TO AVOID. A rotation always logs its trouble
+        line immediately followed by an established line, and a watch that read
+        the first without the second would alarm every five hours."""
+        told = tmp_path / "messages.jsonl"
+        done = _watch(
+            connz="connz-the-gateway-is-there.json",
+            heartbeat="heartbeat-connected.json",
+            log="log-a-healthy-rotation.txt",
+            notifier_file=told,
+        )
+        assert done.returncode == 0, done.stdout + done.stderr
+        assert "Slack session    ok" in done.stdout
+        assert _messages(told) == []
+
+    def test_trouble_older_than_the_gateways_own_word_stays_quiet(
+        self, tmp_path: Path
+    ) -> None:
+        """The gateway said 'connected' AFTER the trouble line, so it recovered
+        and said so. Somebody else's use of the word 'disconnect' in the same log
+        must not become a live Slack failure either."""
+        log = tmp_path / "log-trouble-then-the-gateway-spoke.txt"
+        log.write_text(
+            "2026-09-26T15:00:00.000000000Z Reconnecting...\n"
+            "2026-09-26T15:59:55.000000000Z {\"event\": \"nats_subscribed\"}\n"
+        )
+        told = tmp_path / "messages.jsonl"
+        done = subprocess.run(
+            [
+                "bash",
+                str(_WATCH),
+                "--once",
+                "--connz-file",
+                str(_WATCH_FIXTURES / "connz-the-gateway-is-there.json"),
+                "--log-file",
+                str(log),
+                "--now",
+                _A_FIXED_NOW,
+            ],
+            capture_output=True,
+            text=True,
+            env={
+                **{
+                    name: os.environ[name]
+                    for name in _ONLY_THESE_ARE_INHERITED
+                    if name in os.environ
+                },
+                "JARVIS_NATS_USER": "jarvis",
+                "GATEWAY_WATCH_CLIENT_NAME": "bus-gateway-factory",
+                "BUS_MONITORING_ADDRESS": "nats:8222",
+                # The gateway last spoke at 15:59:30, after the 15:00 trouble.
+                "GATEWAY_WATCH_HEARTBEAT_PATH": str(
+                    _WATCH_FIXTURES / "heartbeat-connected.json"
+                ),
+                "GATEWAY_WATCH_NOTIFIER": "file",
+                "GATEWAY_WATCH_NOTIFIER_FILE": str(told),
+                "TZ": "UTC",
+            },
+            timeout=60,
+        )
+        assert done.returncode == 0, done.stdout + done.stderr
+        assert "Slack session    ok" in done.stdout
+
+
+class TestAReleaseThatSendsNoNameIsUnknownAndNotDown:
+    """MEASURED ON THE ACTUAL RELEASE IMAGE 2026.09.26-2, 26 September 2026:
+    it sends no client name, so the bus reports one for its connection at all.
+    Calling that gateway 'lost' would alarm Rich every fifteen minutes about a
+    door that is working perfectly; calling it 'ok' on the account alone is the
+    defect this whole item exists to remove. So it is UNKNOWN — never healthy,
+    never a failure — and item 8i says the same thing in the same case."""
+
+    @pytest.fixture(autouse=True)
+    def _needs_jq(self) -> None:
+        if shutil.which("jq") is None:
+            pytest.skip("jq is not on this machine")
+
+    def test_the_watch_says_unknown(self, tmp_path: Path) -> None:
+        told = tmp_path / "messages.jsonl"
+        done = _watch(
+            connz="connz-a-release-that-sends-no-name.json",
+            heartbeat="heartbeat-connected.json",
+            log="log-fresh.txt",
+            notifier_file=told,
+        )
+        assert done.returncode == 10, done.stdout + done.stderr
+        assert "bus connection   unknown" in done.stdout
+        assert "before 26 September 2026" in done.stdout
+
+    def test_the_check_says_the_same_thing(self) -> None:
+        check = (ESTATE / "estate-check").read_text()
+        assert "NONE of them sends a client name" in check, (
+            "item 8i has no answer for a gateway from a release that sends no "
+            "name, so it would either fail a working door or pass on the "
+            "account alone"
+        )

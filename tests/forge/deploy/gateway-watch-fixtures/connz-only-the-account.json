@@ -1,0 +1,21 @@
+{
+  "server_id": "NDFIXTURE",
+  "now": "2026-09-26T16:00:00Z",
+  "num_connections": 2,
+  "connections": [
+    {
+      "cid": 12,
+      "authorized_user": "jarvis",
+      "name": "front-door-factory",
+      "subscriptions": 1,
+      "subscriptions_list": ["_INBOX.door.*"]
+    },
+    {
+      "cid": 13,
+      "authorized_user": "forge",
+      "name": "forge-serve",
+      "subscriptions": 1,
+      "subscriptions_list": ["pipeline.build.>"]
+    }
+  ]
+}

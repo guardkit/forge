@@ -18,13 +18,14 @@ two today. One description of each service, in the repository that owns it.
 
 | File | What it is |
 |---|---|
-| `compose.yaml` | composes Forge's two compose files and adds the bus, the one-shot that provisions it, the one-shot that says the bus is ready, the memory service's two containers, and the Slack front door with its bus gateway |
+| `compose.yaml` | composes Forge's two compose files and adds the bus, the one-shot that provisions it, the one-shot that says the bus is ready, the memory service's two containers, the Slack front door with its bus gateway, and the watch that says whether that door is really carrying traffic |
 | `compose.external-bus.yaml` | the overlay for **external bus mode** — the estate started against a bus that is already running and belongs to somebody else. *Whose bus is it* below says when |
 | `.env.example` | every setting name the whole estate needs, with no machine's values. Copy to `.env` |
 | `estate-pins.conf` | what the estate's own two images are built from. Part of the release, never edited per machine. Not named `.env`, because this repository ignores the whole `.env` family as a secrets fence and these are pins, not secrets |
 | `build-estate-images.sh` | builds those two images, and fills the volume holding the bus's own config, from the bus repository at its pinned commit |
-| `provisioner/Dockerfile` | the one-shot image: the NATS project's tool image plus `bash`, and the estate's own read-only comparison of a running bus with the pinned definitions |
+| `provisioner/Dockerfile` | the small tool image the estate's own scripts run in: the NATS project's tool image plus `bash`, carrying the read-only bus comparison and the gateway watch |
 | `provisioner/compare-bus-with-definitions.sh` | that comparison. It reads a bus's own monitoring route and the pinned definitions and compares them field by field. It never writes to a bus |
+| `provisioner/gateway-watch.sh` | the gateway watch — the named replacement for the retired host alarm. Reads the bus, the gateway's heartbeat and the gateway container's log, reports each separately, and tells somebody once when one of them is not right. It restarts nothing |
 | `estate-check` | the checks, one sentence per item |
 | `factory-hello` | asks the coordinator what it can reach, with the address it used |
 
@@ -309,6 +310,86 @@ One consequence already taken, in the jarvis repository: `langgraph-cli` was
 declared only under `dev`, so installing the thing that serves the front door
 also installed pytest, ruff and mypy. It is now named on its own as
 `front-door`, and the image carries no test or lint tooling.
+
+### Is the door actually carrying traffic — the gateway watch
+
+Added 26 September 2026 (build item E3 of the rollout design). A host timer on
+this machine, `jarvis-serve-nats-watchdog.timer`, fired every fifteen minutes,
+asked systemd whether the gateway's user unit was active, and posted to Slack
+when it was not. The gateway is a container now, so that question has no answer —
+and after the rollout that unit is meant to be **inactive for good**, so the old
+alarm would have told Rich his factory was dead every quarter of an hour. It is
+retired. `gateway-watch` is its named replacement, and it asks the right question
+of the right thing.
+
+**It reports three things separately and never one word,** because the gateway
+holds *two* things open — a bus connection and a Slack Socket Mode websocket —
+and either can die without the other:
+
+| What | How it is established | What it can say |
+|---|---|---|
+| **bus connection** | the bus's own monitoring route (`connz?auth=1&subs=1`), asked from inside the estate. A connection is the gateway's only when **all three** hold: the account, the **client name** the gateway sends for itself, and the subscription `agents.command.jarvis` | `ok` / `lost` / `unknown` |
+| **Slack session** | the small file the gateway writes — its Socket Mode state and when it last said anything — read from the gateway's own volume, mounted read-only | `ok` / `lost` / `unknown` |
+| **recent activity** | the gateway container's log, against the retired alarm's own six-hour silence backstop | `ok` / `stalled` / `unknown` |
+
+**Why a name exists at all.** This bundle gives the front door and the bus
+gateway the **same bus account**, deliberately. So "the bus holds a connection
+from the jarvis account" is *true while the gateway is stopped and the front door
+is running* — a dead door reported healthy, with no hostile client and nothing
+misconfigured. `FACTORY_INSTANCE` in the env file is what makes them
+`front-door-<word>` and `bus-gateway-<word>`; the bus records the name a client
+sends for itself and reports it, and that is how the two are told apart. **Item
+8i of `estate-check services` now asks the same three things**, for the same
+reason: two opinions about "is the door up" inside one estate is worse than none.
+
+**An unknown is never healthy.** An unreadable route, an absent heartbeat, a log
+it could not read — each is reported as an unknown, and each makes the run
+unhappy, because a component nobody can see is what let a stopped door look fine
+in the first place.
+
+**How it is run every fifteen minutes.** A compose file has no timer, so this had
+to be decided rather than assumed: it is a **loop in the container**, with
+`restart: unless-stopped` behind it, and not a host unit — a host unit is exactly
+the machine-shaped thing this rollout exists to remove, and a cloud machine has
+nobody to install one. Turn it on by adding `watch` to `COMPOSE_PROFILES`; look
+once by hand with
+
+```
+docker compose --env-file .env --profile watch run --rm gateway-watch --once
+```
+
+A machine that would rather use its own cron can call that line on a schedule and
+leave the profile off. **The profile goes on after a rollout window, not during
+one:** during a rollout the door is down on purpose.
+
+**What it is given, and what that costs.** The bus's monitoring route (which
+takes no credential), the gateway's heartbeat volume (read-only), and **the
+Docker socket, read-only** — because reading a container's log means asking the
+engine and there is no other way to ask. That is a real privilege and it is named
+here rather than hidden; a machine that will not grant it gets `unknown` for that
+one component and never a false `ok`. The watch restarts nothing, writes nothing
+to the bus, and the only secret it touches is the Slack token it posts its own
+alarm with, which arrives as a file like every other.
+
+**It tells somebody through the retired alarm's own notifier**, with the retired
+alarm's own two setting names (`JARVIS_SLACK_BOT_TOKEN` and
+`JARVIS_WATCHDOG_ALERT_CHANNEL_ID`, falling back to `JARVIS_SLACK_CHANNEL_ID`),
+so nothing new has to be configured and Rich's alarms keep arriving where they
+always did. One message per unhappy run, naming which component and why — never
+"a unit is inactive". A rehearsal sets `GATEWAY_WATCH_NOTIFIER=file` and the
+message is written to a file instead: **no rehearsal ever posts to the real
+workspace.**
+
+**Where the gateway's heartbeat lives.** `gateway-state`, a small volume of the
+gateway's own, mounted at `/var/lib/jarvis`, with the gateway as its one writer
+and the watch as its one read-only reader. It is **not** in the rollout's list of
+state to carry across: it starts empty and is written fresh on every start, so
+there is nothing in it a cutover has to move or could lose. A fresh volume is
+writable with nobody chowning anything, for the same reason the front door's is —
+the jarvis image creates that directory owned by the user it runs as, from 26
+September 2026. An older image leaves it root-owned, the gateway then writes
+nothing, and the watch reports the Slack session as `unknown`, which is the honest
+answer.
 
 ### What is not here
 

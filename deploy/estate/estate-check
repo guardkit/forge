@@ -93,7 +93,7 @@ ITEMS=(
 "services|8f|the-answer-service-answers|the answer service answers for a build nobody wrote down"
 "services|8g|the-publisher-is-reachable-from-the-coordinator-only|the publisher answers the coordinator and refuses everything else"
 "services|8h|the-front-door-answers|the Slack front door answers its own health route inside the estate, and the threads it saves are in a volume it can write rather than in the container - it publishes no port, because Slack is dialled out to and never heard from"
-"services|8i|the-bus-gateway-is-on-the-bus|the bus gateway holds a live connection to the bus, asked of the BUS itself rather than of the gateway"
+"services|8i|the-bus-gateway-is-on-the-bus|the bus gateway's OWN connection is on the bus, asked of the BUS itself rather than of the gateway - its account AND the client name it sends for itself AND its subscription, all three on one connection, because the front door shares its account and the account alone would report a stopped gateway as healthy"
 "services|9|the-answer-service-from-inside-a-sandbox|the coordinator's answer service answers FROM INSIDE a sandbox at the address the sandbox profile allows"
 "pre-resume|10|the-producers-are-stopped|the two things that can bring work in are really stopped - no front-door and no bus-gateway container in this estate, the legacy host units inactive if they are on this machine, and nothing waiting or unconfirmed on the bus's two durable readers"
 "pre-resume|10b|the-running-release-is-the-one-this-rollout-names|what is running is the release this rollout is FOR - the image the rollout names is resolved to an image id and compared with the image id the coordinator is really running, and a difference refuses the phase by name"
@@ -917,19 +917,57 @@ except Exception as why:
 # neither is evidence of the other.
 #
 # So the question goes to the bus, over the bus's own monitoring route, which
-# takes no credential: does the bus hold a live connection from the jarvis
-# account? That route is not published outside the estate, so it is asked from
-# inside the bus's own container. Account names are printed; no password is
-# read, and none is printable this way.
+# takes no credential. That route is not published outside the estate, so it is
+# asked from inside the estate. Account names and client names are printed; no
+# password is read, and none is printable this way.
+#
+# THE ACCOUNT ALONE IS NOT THE GATEWAY (26 September 2026, build item E3).
+# Until today this item asked only "does the bus hold a live connection from the
+# jarvis account?", and that question cannot tell this service from the front
+# door: this bundle gives both the SAME account, deliberately. So the front door
+# alone — connected and perfectly healthy — made the count non-nought, and a
+# STOPPED GATEWAY WAS REPORTED HEALTHY. Codex found it in the design of the
+# rollout's replacement alarm; it was already here, in this check.
+#
+# So a connection counts as the gateway's only when all THREE hold:
+#
+#   the account       JARVIS_NATS_USER, as before
+#   the client name   the name the gateway sends for itself, which the bus
+#                     records and reports as 'name' (jarvis's
+#                     JARVIS_NATS_CLIENT_NAME, built in compose.yaml from
+#                     FACTORY_INSTANCE)
+#   the subscription  agents.command.jarvis, which only the gateway holds
+#
+# The gateway watch (provisioner/gateway-watch.sh) asks exactly the same three,
+# and the two must agree: one of them being laxer than the other is how two
+# opinions about "is the door up" would get into one estate.
+#
+# WHAT HAPPENS WITH AN OLDER JARVIS IMAGE. A gateway from an image built before
+# 26 September 2026 sends no name, so the bus reports an empty one and this item
+# cannot find the connection. That is NOT CHECKED, with the reason, rather than a
+# failure — a gateway that cannot say its name is not a gateway that is down —
+# and it is never reported as ok.
 check_the_bus_gateway() {
-    local bus="$1" coordinator="${2:-}" account seen answer asked_at
+    local bus="$1" coordinator="${2:-}" account answer asked_at
+    local expected_name subject counts mine named
     account="$(get JARVIS_NATS_USER)"
     if [ -z "${account}" ]; then
         unchecked 8i "the env file names no bus account for the front door (JARVIS_NATS_USER), so the bus could not be asked whether that account is connected."
         return
     fi
-    # The bus pretty-prints this answer and calls the field 'authorized_user',
-    # so the spaces and newlines come out before the field is looked for.
+    # The same two values compose.yaml gives the gateway and the watch, read the
+    # same way, so this item cannot look for a name nothing sends.
+    expected_name="$(get FACTORY_INSTANCE)"
+    [ -n "${expected_name}" ] || expected_name="factory"
+    expected_name="bus-gateway-${expected_name}"
+    subject="$(get GATEWAY_WATCH_SUBJECT)"
+    [ -n "${subject}" ] || subject="agents.command.jarvis"
+
+    # SUBSCRIPTIONS ARE ASKED FOR TOO ('subs=1'), because one of the three parts
+    # is a subscription. The bus pretty-prints its answer, so it is read with a
+    # JSON reader rather than by looking for text in it: the three parts have to
+    # hold on the SAME connection, and matching them separately in one flat
+    # string would count a name on one connection and a subscription on another.
     #
     # WHERE IT IS ASKED FROM depends on whose bus it is. Our own bus is stepped
     # into; a bus that is already running and belongs to somebody else is asked
@@ -941,7 +979,7 @@ check_the_bus_gateway() {
             fail 8i "the bus is not this project's, so it is asked at ${asked_at} from inside the estate, and the coordinator is not running to ask from."
             return
         fi
-        answer="$(ask_the_bus_from "${coordinator}" 'connz?auth=1')"
+        answer="$(ask_the_bus_from "${coordinator}" 'connz?auth=1&subs=1')"
         if [ -z "${answer}" ]; then
             fail 8i "the bus did not answer connz at ${asked_at}, asked from inside the coordinator, so who is connected to it could not be read at all."
             return
@@ -952,14 +990,59 @@ check_the_bus_gateway() {
             fail 8i "the bus is not running in this estate, so it could not be asked who is connected to it."
             return
         fi
-        answer="$(docker exec "${bus}" wget -qO- "http://localhost:8222/connz?auth=1" 2>/dev/null)"
+        answer="$(docker exec "${bus}" wget -qO- "http://localhost:8222/connz?auth=1&subs=1" 2>/dev/null)"
     fi
-    seen="$(printf '%s' "${answer}" | tr -d ' \n' | /bin/grep -o "\"authorized_user\":\"${account}\"" | wc -l)"
-    if [ "${seen:-0}" -gt 0 ]; then
-        ok 8i "the bus itself reports ${seen} live connection(s) from the '${account}' account, which is the bus gateway holding the bus open — asked of the bus, not of the gateway, because the gateway publishes nothing and answers nobody. No password was read and none is printable this way."
+
+    # Three numbers out of one read: connections that are the gateway's on all
+    # three counts, connections on that account at all, and connections on that
+    # account that sent any name. The third is what tells "an older image that
+    # sends no name" from "the gateway is not there".
+    counts="$(printf '%s' "${answer}" | _read_the_bus_connections \
+        "${account}" "${expected_name}" "${subject}")"
+    if [ -z "${counts}" ]; then
+        fail 8i "the bus answered connz at ${asked_at} and the answer could not be read as the list of connections it should be, so whether the gateway is on the bus is not known. An answer this check cannot read is not agreement."
+        return
+    fi
+    set -- ${counts}
+    mine="${1:-0}"; named="${3:-0}"
+    local account_total="${2:-0}"
+
+    if [ "${mine}" -gt 0 ]; then
+        ok 8i "the bus itself reports ${mine} connection(s) that are the bus gateway's OWN — the '${account}' account AND the client name '${expected_name}' AND the subscription ${subject}, all three on the same connection. All three are asked because the account alone is shared with the front door, and on its own it would report a stopped gateway as healthy. Asked of the bus at ${asked_at}, not of the gateway, because the gateway publishes nothing and answers nobody. No password was read and none is printable this way."
+    elif [ "${named}" -eq 0 ] && [ "${account_total}" -gt 0 ]; then
+        unchecked 8i "the bus holds ${account_total} connection(s) on the '${account}' account and NONE of them sends a client name, which is what a jarvis image built before 26 September 2026 does. So which of them is the bus gateway cannot be told from here, and the account alone would report a stopped gateway as healthy. A release carrying the client name is what makes this item answerable."
     else
-        fail 8i "the bus reports no connection from the '${account}' account, so Slack traffic has no way onto the bus and the factory's answers have no way back. The gateway refuses to start at all without the bus, so look at its log: usually the account's password, or the address."
+        fail 8i "the bus at ${asked_at} holds NO connection that is the bus gateway's own: nothing there carries the client name '${expected_name}' with the subscription ${subject} on the '${account}' account. It does hold ${account_total} other connection(s) on that account — the front door shares it — and those are not the gateway. So Slack traffic has no way onto the bus and the factory's answers have no way back. The gateway refuses to start at all without the bus, so look at its log: usually the account's password, or the address."
     fi
+}
+
+# The three numbers above, read from connz on standard input. A JSON reader, for
+# the reason the caller gives: the three parts have to hold on ONE connection.
+# The estate's own way of reading JSON without demanding a tool of the machine —
+# this machine's jq if it has one, else the provisioning image's — is the same
+# one the closed-door record is read with.
+_read_the_bus_connections() {
+    local account="$1" name="$2" subject="$3" program image
+    program='
+      def subs: (.subscriptions_list // ([(.subscriptions_list_detail // [])[] | .subject]));
+      (.connections // null) as $c
+      | if $c == null then empty else
+          [ $c[] | select(.authorized_user == $account) ] as $mine
+          | [ $mine[] | select((.name // "") == $name and (subs | index($subject))) ] as $gateway
+          | [ $mine[] | select((.name // "") != "") ] as $named
+          | "\($gateway | length) \($mine | length) \($named | length)"
+        end
+    '
+    if command -v jq >/dev/null 2>&1; then
+        jq -r --arg account "${account}" --arg name "${name}" --arg subject "${subject}" \
+            "${program}" 2>/dev/null
+        return
+    fi
+    image="$(get NATS_PROVISION_IMAGE)"
+    [ -n "${image}" ] || return 1
+    docker run --rm -i --entrypoint jq "${image}" -r \
+        --arg account "${account}" --arg name "${name}" --arg subject "${subject}" \
+        "${program}" 2>/dev/null
 }
 
 # THE MEMORY RELAY. There is nothing to ask it over a network: it listens on

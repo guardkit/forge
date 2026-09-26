@@ -41,5 +41,20 @@ RUN apk add --no-cache bash
 COPY compare-bus-with-definitions.sh /usr/local/bin/compare-bus-with-definitions.sh
 RUN chmod +x /usr/local/bin/compare-bus-with-definitions.sh
 
+# A SECOND SCRIPT OF THE ESTATE'S OWN (26 September 2026, build item E3-e): the
+# gateway watch, the named replacement for the retired host alarm that asked
+# systemd whether a unit was active. It is here for the same reason the
+# comparison is — it needs `curl`, `jq` and `bash` together and this is the image
+# that already carries all three — and it is a file rather than a command in the
+# compose file so that a test can run it on its own against saved answers.
+#
+# THIS IMAGE IS NOW TWO THINGS AND ITS NAME SAYS ONE, which is worth noticing
+# rather than papering over: it is the small tool image the estate's OWN scripts
+# run in, and it happens to have been born to provision the bus. A third image in
+# every release for two shell scripts that need the identical three tools would
+# be worse.
+COPY gateway-watch.sh /usr/local/bin/gateway-watch.sh
+RUN chmod +x /usr/local/bin/gateway-watch.sh
+
 ENTRYPOINT ["/bin/bash", "-c"]
 CMD ["echo 'this image runs the bus repository''s own provisioning scripts; the estate compose file gives it the command'"]
