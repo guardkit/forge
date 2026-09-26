@@ -67,7 +67,7 @@ ITEMS=(
 "services|8e|the-coordinator-answers|the coordinator answers on its own health route"
 "services|8f|the-answer-service-answers|the answer service answers for a build nobody wrote down"
 "services|8g|the-publisher-is-reachable-from-the-coordinator-only|the publisher answers the coordinator and refuses everything else"
-"services|8h|the-front-door-answers|the Slack front door answers its own health route inside the estate - it publishes no port, because Slack is dialled out to and never heard from"
+"services|8h|the-front-door-answers|the Slack front door answers its own health route inside the estate, and the threads it saves are in a volume it can write rather than in the container - it publishes no port, because Slack is dialled out to and never heard from"
 "services|8i|the-bus-gateway-is-on-the-bus|the bus gateway holds a live connection to the bus, asked of the BUS itself rather than of the gateway"
 "services|9|the-answer-service-from-inside-a-sandbox|the coordinator's answer service answers FROM INSIDE a sandbox at the address the sandbox profile allows"
 )
@@ -587,8 +587,43 @@ check_services() {
 # WHAT THIS ITEM DOES NOT PROVE, said here rather than left to be assumed: that
 # Slack is reachable, that the token works, or that a message would arrive.
 # Those need the real workspace, and no check in this bundle touches it.
+#
+# IT ALSO ASKS WHERE THE SAVED THREADS GO (26 September 2026), because a review
+# of release 2026.09.26-1 found the answering half of this item true and the
+# other half missing: the server answered this route perfectly while its threads
+# sat in the container's own writable layer, so a replacement container answered
+# 404 for a thread its predecessor had — and replacing a container is how this
+# estate takes a new release. It is part of this item rather than an item of its
+# own because it is the same question, whether the front door can do its job.
+THE_FRONT_DOORS_STATE_PATH=/app/.langgraph_api
+
+# Asked of the RUNNING CONTAINER, not of the compose file: the file is what
+# should be true and the container is what is. Writable as well as mounted,
+# because a fresh named volume takes its ownership from the image and on an image
+# that does not create that directory it comes up root-owned — where the server
+# would answer this route and then lose every approval.
+#
+# WHAT THIS DOES NOT PROVE, plainly: it does not replace the container and read a
+# thread back. That is a drive rather than a check, and the release's own
+# evidence carries it.
+the_front_doors_state() {
+    local door="$1" path="$2" mounted
+    mounted="$(docker inspect --format \
+        "{{range .Mounts}}{{if eq .Destination \"${path}\"}}{{.Name}}{{end}}{{end}}" \
+        "${door}" 2>/dev/null | tr -d '\r')"
+    if [ -z "${mounted}" ]; then
+        printf 'nothing-mounted'
+        return
+    fi
+    if docker exec "${door}" sh -c "touch '${path}/.estate-check' && rm -f '${path}/.estate-check'" >/dev/null 2>&1; then
+        printf 'kept|%s' "${mounted}"
+    else
+        printf 'not-writable|%s' "${mounted}"
+    fi
+}
+
 check_the_front_door() {
-    local door code
+    local door code state volume
     door="$(container_of front-door)"
     if [ -z "${door}" ]; then
         fail 8h "the Slack front door is not running in this estate, so Rich has nowhere to approve a spec or say merge."
@@ -601,10 +636,16 @@ try:
 except Exception as why:
     print(type(why).__name__); sys.exit(1)
 " 2>/dev/null | tr -d '\r')"
-    if [ "${code}" = "200" ]; then
-        ok 8h "the Slack front door answers its own health route with 200 inside its container (localhost:2024/ok there), which it only does once both its graphs have loaded. It publishes no port on purpose: Slack is dialled out to over a WebSocket and never heard from, so there is no inbound route for this machine to open. Whether Slack itself answers is not asked here and nothing in this bundle touches that workspace."
-    else
+    state="$(the_front_doors_state "${door}" "${THE_FRONT_DOORS_STATE_PATH}")"
+    volume="${state#*|}"
+    if [ "${code}" != "200" ]; then
         fail 8h "the Slack front door is running but did not answer its own health route; it said ${code:-nothing}. It answers once both its graphs have loaded, so look at its log for the model seat address or its key."
+    elif [ "${state}" = "nothing-mounted" ]; then
+        fail 8h "the Slack front door answers its own health route, and nothing is mounted at ${THE_FRONT_DOORS_STATE_PATH}, where it writes the threads Rich approves a spec and says merge in. This container keeps them in its own writable layer, so replacing it — which is how this estate takes a new release — deletes them. Start it from this bundle, which gives it the front-door-state volume."
+    elif [ "${state%%|*}" = "not-writable" ]; then
+        fail 8h "the Slack front door answers its own health route, and it cannot write ${THE_FRONT_DOORS_STATE_PATH} inside the volume ${volume} — so it would take an approval and lose it. A fresh volume takes its ownership from the image: this needs a jarvis image whose own user owns that directory."
+    else
+        ok 8h "the Slack front door answers its own health route with 200 inside its container (localhost:2024/ok there), which it only does once both its graphs have loaded, and the threads it saves go into the volume ${volume} at ${THE_FRONT_DOORS_STATE_PATH}, which it can write — so replacing this container does not delete them. It publishes no port on purpose: Slack is dialled out to over a WebSocket and never heard from, so there is no inbound route for this machine to open. Whether Slack itself answers is not asked here, nothing in this bundle touches that workspace, and this item does not itself replace the container and read a thread back."
     fi
 }
 

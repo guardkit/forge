@@ -542,6 +542,30 @@ services:
             fi
             eval "$$name=\"\$$(cat \"\$$file\")\"; export $$name"
         done
+        # THE FRONT DOOR'S SAVED STATE HAS TO BE WRITABLE BEFORE THE SERVER
+        # STARTS, and only the front door sets this name — the gateway keeps no
+        # files, so this block is skipped for it. Nothing in the jarvis package
+        # reads FRONT_DOOR_STATE_DIR; it is read here, by this wrapper.
+        #
+        # WHY IT IS ASKED AT ALL. The server creates that directory if it can
+        # and then writes its threads into it, so a directory it cannot write is
+        # not a start-up failure: the front door comes up, answers its health
+        # route, takes Rich's approval and loses it. A fresh named volume comes
+        # up root-owned unless the IMAGE has that directory owned by the
+        # server's user, which jarvis images built before 26 September 2026 do
+        # not — so this says which of those two it is, by name, rather than
+        # leaving a silent data loss to be found later.
+        if [ -n "$${FRONT_DOOR_STATE_DIR:-}" ]; then
+            if [ ! -d "$$FRONT_DOOR_STATE_DIR" ]; then
+                echo "the front door's saved threads belong in $$FRONT_DOOR_STATE_DIR and there is no such directory in this image. The estate mounts a volume there; a jarvis image that does not create it cannot be given one." >&2
+                exit 1
+            fi
+            if ! touch "$$FRONT_DOOR_STATE_DIR/.writable" 2>/dev/null; then
+                echo "the front door cannot write $$FRONT_DOOR_STATE_DIR, where its saved threads and checkpoints go, so it would answer its health route and then lose every approval. A fresh volume takes its ownership from the image: this needs a jarvis image whose own user owns that directory (built 26 September 2026 or later)." >&2
+                exit 1
+            fi
+            rm -f "$$FRONT_DOOR_STATE_DIR/.writable"
+        fi
         exec "$$@"
       - the-estate-hands-jarvis-its-credentials-as-files
     # The image's own CMD, written out because naming an entrypoint above
@@ -563,6 +587,39 @@ services:
       JARVIS_SLACK_CHANNEL_ID: ${JARVIS_SLACK_CHANNEL_ID:?name the Slack channel the front door posts in, in the env file}
       JARVIS_SLACK_OPERATOR_USER_IDS: ${JARVIS_SLACK_OPERATOR_USER_IDS:?name the Slack member ids allowed to approve and merge, in the env file}
       JARVIS_LOG_LEVEL: ${JARVIS_LOG_LEVEL:-INFO}
+      # WHERE THIS SERVICE'S SAVED THREADS ARE, read by the wrapper above and by
+      # nothing in the jarvis package. It is the same path as the volume mounted
+      # below, written here so the wrapper can refuse an unwritable one before
+      # the server starts. It is a path inside this image, the same on every
+      # machine, and it names no machine and no person.
+      FRONT_DOOR_STATE_DIR: /app/.langgraph_api
+    # ITS SAVED THREADS SURVIVE BEING REPLACED (26 September 2026).
+    #
+    # Codex's review drove the actual release image: a thread created through
+    # the front door's API survived stopping and starting the same container,
+    # and was gone — 404 — from a replacement container built from the identical
+    # image. Rich's approvals and merge words live in those threads, and
+    # replacing a container is the ordinary way this estate takes a new release,
+    # so that is a build's worth of conversation lost every upgrade.
+    #
+    # WHY /app/.langgraph_api AND NOT SOMEWHERE TIDIER. The development server
+    # writes its threads, runs and checkpoints under the RELATIVE path
+    # '.langgraph_api' in its working directory, and there is no setting or flag
+    # for anywhere else. Its working directory has to stay /app, because
+    # langgraph.json names its two graphs as ./src paths. So the volume goes
+    # where the server already writes, rather than the code moving to suit it.
+    #
+    # ONE WRITER. This volume is the front door's alone — the gateway keeps no
+    # files and mounts nothing, and two processes sharing one checkpoint
+    # directory is a different and worse arrangement than each keeping its own.
+    #
+    # A FRESH VOLUME IS WRITABLE WITH NO HAND-OVER, because Docker fills one
+    # from what the IMAGE has at the mount point, ownership included, and the
+    # jarvis image creates that directory owned by the user it runs as. An image
+    # built before 26 September 2026 does not, and the wrapper above says so by
+    # name instead of letting the front door lose approvals quietly.
+    volumes:
+      - front-door-state:/app/.langgraph_api
     secrets:
       - source: bus-jarvis-password
         target: jarvis_bus_password
@@ -737,6 +794,14 @@ volumes:
   # somebody's home directory, which is the last thing the memory row of the
   # design's inventory had to lose.
   memory-state:
+
+  # THE FRONT DOOR'S SAVED THREADS AND CHECKPOINTS, with the front door as its
+  # ONE writer (26 September 2026). Without it, replacing that container — the
+  # ordinary way this estate takes a new release — deletes every thread Rich
+  # approved a spec or said merge in: proved on the release image itself, which
+  # answered 404 for a thread its predecessor had. 'down -v' removes it, the
+  # same as the bus's store and the relay's marker.
+  front-door-state:
 
   # THE BUS'S OWN CONFIG AND PROVISIONING SCRIPTS, at the pinned commit.
   #

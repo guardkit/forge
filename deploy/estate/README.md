@@ -240,6 +240,44 @@ today. Whether both *should* run the Slack reply path is a question for this
 front door's owner — it is not this bundle's to decide quietly, and it is not
 changed here.
 
+**The front door's saved threads survive being replaced** — added 26 September
+2026, because until then they did not. A review drove the release image itself: a
+thread created through the front door's API was still there after *stopping and
+starting* the same container, and **gone — 404 — from a replacement container
+built from the identical image**. Rich's approvals and merge words live in those
+threads, and replacing a container is the ordinary way this estate takes a new
+release, so that was a build's worth of conversation lost at every upgrade,
+silently.
+
+So `front-door` has a volume of its own, `front-door-state`, and the **front door
+is its only writer** — the gateway keeps no files and mounts nothing. Three
+things about it are worth knowing rather than finding out:
+
+- **it is mounted at `/app/.langgraph_api`, which is not a tidy choice.** The
+  development server writes its threads, runs and checkpoints under the
+  *relative* path `.langgraph_api` in its working directory, and there is no
+  setting or flag for anywhere else; the working directory has to stay `/app`
+  because `langgraph.json` names its two graphs as `./src` paths. The volume
+  therefore goes where the server already writes, rather than the code moving to
+  suit the volume;
+- **a fresh volume is writable with nobody chowning anything.** Docker fills a
+  new named volume from what the *image* has at the mount point, ownership
+  included, so the jarvis image creates that directory owned by the user it runs
+  as. A jarvis image built **before 26 September 2026 does not**, and a fresh
+  volume on one of those comes up root-owned — the front door would answer its
+  health route and then lose every approval. The wrapper refuses to start on
+  that, by name, rather than letting it happen quietly;
+- **`docker compose down -v` deletes it**, the same as the bus's store and the
+  relay's marker. That is a run's storage going, and it means those threads go
+  with it.
+
+What this does **not** cover: the routing-history **traces** both jarvis services
+write under `/home/jarvis/.jarvis/traces`. They are diagnostic offload, nothing
+reads them back, and both services discard them when their container goes. Giving
+each service its own volume for them is a small change and a separate decision;
+it is written down here rather than left unsaid, because the review that found
+the threads found these as well.
+
 ### The open item: it is a development server
 
 `langgraph dev` is the langgraph CLI's **development** server. It is what the
@@ -487,7 +525,16 @@ the design:
    Every other password in the estate now travels as a file; the coordinator's
    `FORGE_NATS_URL` carries one because Forge's code reads its bus address from
    that single setting. Changing that is Forge's own work, not this bundle's.
-9. **Codex's sign-off, and the owner's go.** Nothing here is rollout approval.
+9. **The jarvis image this bundle names is one release behind what this bundle
+   now needs.** The front door's state volume, added 26 September 2026, is
+   mounted at a directory the image has to create and own, and
+   `jarvis:2026.09.26-1` — which `.env.example` names and the manifest pins —
+   predates that line. Started on it, the front door **refuses by name** rather
+   than losing approvals quietly (drive of 26 September 2026: it says so and
+   does not serve). That is the intended order: the next release carries the
+   jarvis commit, and the env file's tag and the manifest's pin move with it.
+   Until then this bundle does not start its front door.
+10. **Codex's sign-off, and the owner's go.** Nothing here is rollout approval.
 
 ## Why the bus's image is not in the release manifest
 
