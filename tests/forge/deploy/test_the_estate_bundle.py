@@ -520,6 +520,68 @@ class TestWhatTheEstatePromises:
                 f"{service} binds a folder on this machine's disk"
             )
 
+    def test_the_front_doors_saved_threads_are_in_a_volume_of_its_own(
+        self, rendered: str
+    ) -> None:
+        """THE BLOCKER OF 26 SEPTEMBER 2026, held shut.
+
+        A review drove the release image itself: a thread created through the
+        front door's API was still there after stopping and starting the same
+        container, and gone — 404 — from a replacement container built from the
+        identical image. Rich's approvals and merge words live in those threads,
+        and replacing a container is how this estate takes a new release.
+
+        The mount point is ``/app/.langgraph_api`` and not something tidier
+        because the development server writes its threads under that RELATIVE
+        path in its working directory, with no setting for anywhere else, and the
+        working directory has to stay ``/app`` — ``langgraph.json`` names its two
+        graphs as ``./src`` paths.
+        """
+        front_door = _service_block(rendered, "front-door")
+        assert "front-door-state" in front_door, (
+            "the front door has no volume for its saved threads, so replacing "
+            "its container deletes every approval and merge word in them"
+        )
+        assert "/app/.langgraph_api" in front_door, (
+            "the front door's volume is not mounted where its server really "
+            "writes: the development runtime writes under the relative path "
+            ".langgraph_api in its working directory, which is /app"
+        )
+        assert "type: bind" not in front_door, (
+            "the front door binds a folder on this machine's disk"
+        )
+
+    def test_the_gateway_does_not_share_the_front_doors_state(
+        self, rendered: str
+    ) -> None:
+        """ONE WRITER. The gateway keeps no files, and two processes sharing one
+        checkpoint directory is a different and worse arrangement than each
+        keeping its own."""
+        gateway = _service_block(rendered, "bus-gateway")
+        assert "front-door-state" not in gateway, (
+            "the bus gateway mounts the front door's state volume, so two "
+            "processes write one checkpoint directory"
+        )
+
+    def test_the_front_door_refuses_to_start_on_state_it_cannot_write(
+        self, rendered: str
+    ) -> None:
+        """A FRESH VOLUME TAKES ITS OWNERSHIP FROM THE IMAGE, and a jarvis image
+        that does not create that directory gets a root-owned one. The server
+        creates the directory if it can and writes its threads into it, so an
+        unwritable one is not a start-up failure: the front door would come up,
+        answer its health route, take an approval and lose it. The wrapper says
+        which of those it is, by name."""
+        front_door = _service_block(rendered, "front-door")
+        assert "FRONT_DOOR_STATE_DIR" in front_door, (
+            "nothing tells the front door's wrapper where its saved threads go, "
+            "so nothing checks that it can write them"
+        )
+        assert "cannot write" in front_door, (
+            "the front door starts without asking whether its state directory "
+            "is writable, so an unwritable volume loses approvals in silence"
+        )
+
     def test_the_slack_credentials_never_reach_a_container_environment(
         self, rendered: str
     ) -> None:
