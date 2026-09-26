@@ -219,7 +219,7 @@ REPORT="$(printf '%s' "${ANSWER}" | jq -r \
     | (if ($holding | length) == 1 then $holding[0] else null end) as $chosen
     | (if $chosen == null then {} else $chosen.streams end) as $held
     | (if ($holding | length) > 1 then ["AMBIGUOUS_ACCOUNT|\(($holding | map(.account)) | join(","))"]
-       elif ($holding | length) == 0 then ["NO_ACCOUNT|\(($candidates | map(.account)) | join(","))"]
+       elif ($holding | length) == 0 then ["NO_ACCOUNT|\(($by_account | map(.account)) | join(","))"]
        else [] end) as $account_problems
 
     # A LIST IS A SET HERE, NOT AN ORDER (26 September 2026, the review of this
