@@ -2358,6 +2358,147 @@ class TestTheUnrecoveredDropTheHeartbeatCannotSee:
         assert "Slack session    ok" in done.stdout
 
 
+class TestABusBlipIsNotALostSlackSession:
+    """THE ONE BLOCKER AN INDEPENDENT REVIEW FOUND, 26 September 2026.
+
+    A reviewer restarted a throwaway bus container and touched nothing else.
+    Slack was up, the gateway reconnected to the bus by itself, and the watch
+    sent one message headed 'The factory's Slack door has lost its Slack
+    session'. The cause: the trouble words above were the retired alarm's own
+    ('disconnect', 'reconnect', 'connection ... refused') and the gateway
+    container's log is NOT a Slack log — jarvis's own bus client writes
+    ``nats_disconnect``, ``nats_reconnect`` and ``nats_error`` into it, and only
+    slack-sdk ever writes the line that clears the signal.
+
+    That is the retired alarm's own crying-wolf failure reappearing in its
+    replacement, with the wrong component named. The log lines below were
+    CAPTURED from a real gateway container on a throwaway estate whose bus was
+    restarted, not written by hand.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _needs_jq(self) -> None:
+        if shutil.which("jq") is None:
+            pytest.skip("jq is not on this machine")
+
+    def test_the_buss_own_drop_and_reconnect_leave_slack_alone(
+        self, tmp_path: Path
+    ) -> None:
+        told = tmp_path / "messages.jsonl"
+        done = _watch(
+            connz="connz-the-gateway-is-there.json",
+            heartbeat="heartbeat-connected.json",
+            log="log-the-bus-blipped-and-slack-was-fine.txt",
+            notifier_file=told,
+        )
+        assert "Slack session    ok" in done.stdout, (
+            "a bus restart is being reported as a lost Slack session, which is "
+            "the retired alarm crying wolf again with the wrong component named"
+        )
+        assert "bus connection   ok" in done.stdout
+        assert "recent activity  ok" in done.stdout
+        assert done.returncode == 0, done.stdout + done.stderr
+        assert _messages(told) == [], (
+            "somebody was told about a Slack failure there was not"
+        )
+
+    def test_a_bus_error_carrying_slack_sounding_words_is_still_the_bus(
+        self, tmp_path: Path
+    ) -> None:
+        """The belt as well as the braces. jarvis passes the words of whatever
+        failed straight through into ``nats_error``, so an error string can carry
+        any words at all — including Slack's. A record written by the bus client
+        is about the bus whatever it says, and is dropped by its logger name."""
+        log = tmp_path / "log-a-bus-error-that-sounds-like-slack.txt"
+        log.write_text(
+            '2026-09-26T15:59:50.000000000Z {"error_class": "OSError", '
+            '"error": "Failed to send a message: the session is no longer active", '
+            '"event": "nats_error", "level": "warning", '
+            '"logger": "jarvis.infrastructure.nats_client", '
+            '"timestamp": "2026-09-26T15:59:50.000000Z"}\n'
+        )
+        told = tmp_path / "messages.jsonl"
+        done = subprocess.run(
+            [
+                "bash",
+                str(_WATCH),
+                "--once",
+                "--connz-file",
+                str(_WATCH_FIXTURES / "connz-the-gateway-is-there.json"),
+                "--log-file",
+                str(log),
+                "--now",
+                _A_FIXED_NOW,
+            ],
+            capture_output=True,
+            text=True,
+            env={
+                **{
+                    name: os.environ[name]
+                    for name in _ONLY_THESE_ARE_INHERITED
+                    if name in os.environ
+                },
+                "JARVIS_NATS_USER": "jarvis",
+                "GATEWAY_WATCH_CLIENT_NAME": "bus-gateway-factory",
+                "BUS_MONITORING_ADDRESS": "nats:8222",
+                "GATEWAY_WATCH_HEARTBEAT_PATH": str(
+                    _WATCH_FIXTURES / "heartbeat-connected.json"
+                ),
+                "GATEWAY_WATCH_NOTIFIER": "file",
+                "GATEWAY_WATCH_NOTIFIER_FILE": str(told),
+                "TZ": "UTC",
+            },
+            timeout=60,
+        )
+        assert "Slack session    ok" in done.stdout, done.stdout
+        assert done.returncode == 0, done.stdout + done.stderr
+
+    def test_a_real_slack_drop_still_speaks_with_bus_noise_all_around_it(
+        self, tmp_path: Path
+    ) -> None:
+        """The fix must not have turned the second signal off. Slack's own words
+        in the middle of a bus blip are still an unrecovered Slack drop."""
+        told = tmp_path / "messages.jsonl"
+        done = _watch(
+            connz="connz-the-gateway-is-there.json",
+            heartbeat="heartbeat-connected.json",
+            log="log-a-slack-drop-with-bus-noise-around-it.txt",
+            notifier_file=told,
+        )
+        assert "Slack session    lost" in done.stdout, done.stdout
+        assert "bus connection   ok" in done.stdout
+        assert done.returncode == 10, done.stdout + done.stderr
+        assert len(_messages(told)) == 1
+        assert "Slack" in _messages(told)[0]
+
+    def test_the_retired_alarms_bare_words_are_gone_from_the_slack_signal(
+        self) -> None:
+        """A regression guard on the source, because this defect was inherited by
+        copying: the Slack trouble pattern must not contain the bare words that
+        match jarvis's own bus records."""
+        text = _WATCH.read_text()
+        pattern = next(
+            (
+                line
+                for line in text.splitlines()
+                if line.startswith("readonly SLACK_SESSION_IN_TROUBLE=")
+            ),
+            "",
+        )
+        assert pattern, (
+            "the watch has no named Slack trouble pattern, so the Slack question "
+            "is being asked of words that are not Slack's"
+        )
+        for bare in ("disconnect", "|reconnect", "connection.*", "failed to connect"):
+            assert bare not in pattern.lower(), (
+                f"the Slack trouble pattern still contains '{bare}', which "
+                "matches jarvis's own bus records in the same log"
+            )
+        assert 'logger' in text and 'nats_client' in text, (
+            "nothing drops the bus client's own records from the Slack question"
+        )
+
+
 class TestAReleaseThatSendsNoNameIsUnknownAndNotDown:
     """MEASURED ON THE ACTUAL RELEASE IMAGE 2026.09.26-2, 26 September 2026:
     it sends no client name, so the bus reports one for its connection at all.
