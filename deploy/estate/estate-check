@@ -39,6 +39,11 @@
 #
 #   --env-file FILE   the estate's env file (default: .env beside this script)
 #   --project NAME    the compose project name, if it is not the default
+#   --for-image NAME  the image this rollout is FOR — a tag or an image id. The
+#                     closed-door check refuses unless that is what is really
+#                     running. Left out, the env file's FORGE_IMAGE is taken as
+#                     the image the rollout names, because that is the line the
+#                     estate was started from
 #   --items           print the item list and stop
 # ---------------------------------------------------------------------------
 set -uo pipefail
@@ -48,6 +53,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="${HERE}/.env"
 PROJECT=""
 MODE=""
+EXPECT_IMAGE=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -56,8 +62,9 @@ while [ $# -gt 0 ]; do
         --read-pre-resume)  MODE="read-pre-resume"; shift ;;
         --env-file)    ENV_FILE="${2:?--env-file needs a file}"; shift 2 ;;
         --project)     PROJECT="${2:?--project needs a name}"; shift 2 ;;
+        --for-image)   EXPECT_IMAGE="${2:?--for-image needs a tag or an image id}"; shift 2 ;;
         --items)       MODE="items"; shift ;;
-        --help|-h)     sed -n '2,41p' "${BASH_SOURCE[0]}"; exit 0 ;;
+        --help|-h)     sed -n '2,47p' "${BASH_SOURCE[0]}"; exit 0 ;;
         *)             printf 'estate-check: unknown argument "%s". Try --help.\n' "$1" >&2; exit 2 ;;
     esac
 done
@@ -89,6 +96,7 @@ ITEMS=(
 "services|8i|the-bus-gateway-is-on-the-bus|the bus gateway holds a live connection to the bus, asked of the BUS itself rather than of the gateway"
 "services|9|the-answer-service-from-inside-a-sandbox|the coordinator's answer service answers FROM INSIDE a sandbox at the address the sandbox profile allows"
 "pre-resume|10|the-producers-are-stopped|the two things that can bring work in are really stopped - no front-door and no bus-gateway container in this estate, the legacy host units inactive if they are on this machine, and nothing waiting or unconfirmed on the bus's two durable readers"
+"pre-resume|10b|the-running-release-is-the-one-this-rollout-names|what is running is the release this rollout is FOR - the image the rollout names is resolved to an image id and compared with the image id the coordinator is really running, and a difference refuses the phase by name"
 )
 
 if [ "${MODE}" = "items" ]; then
@@ -710,10 +718,13 @@ run_the_services_items() {
         return 1
     fi
 
-    # --- 10 ----------------------------------------------------------------
-    # THE CLOSED DOOR ITSELF, and only in the closed-door mode.
+    # --- 10 and 10b --------------------------------------------------------
+    # THE CLOSED DOOR ITSELF, and WHICH RELEASE this phase is about. Both only
+    # in the closed-door mode, and both before anything else is asked: a record
+    # about the wrong release is worse than no record.
     if [ "${phase}" = "closed-door" ]; then
         check_the_producers_are_stopped "${coordinator}"
+        check_the_release_is_the_one_this_rollout_names "${coordinator}"
     fi
 
     # --- 8 -----------------------------------------------------------------
@@ -1274,6 +1285,73 @@ check_the_producers_are_stopped() {
 }
 
 # ---------------------------------------------------------------------------
+# ITEM 10b — IS WHAT IS RUNNING THE RELEASE THIS ROLLOUT IS FOR?
+# (26 September 2026, the first of the three conditions Codex's third read put
+# on build item E2, and the one the first implementation did not meet.)
+#
+# WHAT WAS WRONG. The first version read FORGE_IMAGE out of the env file, wrote
+# it into the record as the release this phase was about, ALSO wrote the image id
+# the coordinator was really running, and never compared the two. So an env file
+# naming forge:2026.09.26-1 while the estate ran 2026.09.26-2's image produced a
+# record that said "release_version": "2026.09.26-1" without a word, and reading
+# it back answered MAY BE ACTED ON — because the read compared the recorded id
+# with the running id, which is the same number twice. A record that names the
+# wrong release is worse than no record: the resume step is the point of no
+# return and it is entitled to believe what the record says.
+#
+# WHAT IT DOES NOW. The image the rollout is FOR — '--for-image', or the env
+# file's FORGE_IMAGE, which is the line the estate was started from — is
+# RESOLVED TO AN IMAGE ID on this machine and compared with the image id the
+# coordinator is really running. A difference names both sides and refuses, so
+# no record is written at all. An identity that could not be read is not an
+# identity that matches: a tag that is not on this machine, or a container whose
+# image cannot be read, refuses in the same way and says which it was.
+# ---------------------------------------------------------------------------
+the_image_this_rollout_names() {
+    if [ -n "${EXPECT_IMAGE}" ]; then printf '%s' "${EXPECT_IMAGE}"; return; fi
+    printf '%s' "$(get FORGE_IMAGE)"
+}
+
+# The image id a name resolves to on this machine, tag or id alike. Nothing is
+# pulled: a name that is not here is an unknown, and this says so by printing
+# nothing.
+image_id_of() {
+    docker image inspect "$1" --format '{{.Id}}' 2>/dev/null | head -1
+}
+
+check_the_release_is_the_one_this_rollout_names() {
+    local coordinator="$1" named named_id running_id tags
+    named="$(the_image_this_rollout_names)"
+
+    if [ -z "${named}" ]; then
+        fail 10b "this rollout does not say which release it is for: there is no --for-image and the env file names no FORGE_IMAGE. The closed-door record would then be a pass about an unnamed release, which the resume step cannot act on, so nothing is written."
+        return
+    fi
+    if [ -z "${coordinator}" ]; then
+        fail 10b "the coordinator is not running here, so there is nothing to compare the release this rollout names (${named}) against. A closed-door record is a statement about a RUNNING estate."
+        return
+    fi
+
+    named_id="$(image_id_of "${named}")"
+    running_id="$(docker inspect "${coordinator}" --format '{{.Image}}' 2>/dev/null)"
+
+    if [ -z "${named_id}" ]; then
+        fail 10b "the release this rollout names, ${named}, is not an image on this machine, so it could not be turned into an image id and nothing could be compared. An identity that cannot be read is not an identity that matches, and no record of this phase is written."
+        return
+    fi
+    if [ -z "${running_id}" ]; then
+        fail 10b "the coordinator's own image id could not be read from ${coordinator}, so what is running could not be compared with the release this rollout names (${named}). An unknown is not a match."
+        return
+    fi
+    if [ "${named_id}" != "${running_id}" ]; then
+        tags="$(docker image inspect "${running_id}" --format '{{join .RepoTags ", "}}' 2>/dev/null)"
+        fail 10b "this rollout is for ${named} (image ${named_id}) and the coordinator is really running ${running_id}${tags:+, which carries the tag(s) ${tags}}. The record this phase would write would name the wrong release, so NOTHING is written: either start the estate from ${named}, or run the rollout for the release that is actually up."
+        return
+    fi
+    ok 10b "what is running is the release this rollout is for — ${named} resolves to ${named_id} on this machine and that is the image id the coordinator is running, so the record this phase writes names the release it is really about."
+}
+
+# ---------------------------------------------------------------------------
 # THE CLOSED-DOOR CHECK, AND THE RECORD IT LEAVES (build item E2).
 #
 # WHY A RECORD AT ALL. The rollout's resume step is the point of no return, and
@@ -1281,6 +1359,11 @@ check_the_producers_are_stopped() {
 # estate. So this writes down WHAT was checked, on WHICH estate, against WHICH
 # image, and WHEN — and '--read-pre-resume' is what says whether that record may
 # be acted on now.
+#
+# AND THE RECORD IS ABOUT THE RELEASE THE ROLLOUT NAMES, not merely about
+# whatever happened to be running: item 10b resolves the named release to an
+# image id and refuses the whole phase if that is not what the coordinator is
+# running, so a record naming the wrong release is never written.
 #
 # THREE VERDICTS, and only one of them may be acted on:
 #
@@ -1314,12 +1397,16 @@ check_pre_resume() {
     run_the_services_items closed-door
 
     # --- what this run is about, so the record names it --------------------
-    local coordinator project image_id image_named started_at now verdict
+    # The named image and the running image id are the SAME image here, and
+    # item 10b is what makes that true: it refuses the phase when they differ,
+    # so nothing below is reached with a name and an id that disagree.
+    local coordinator project image_id image_named image_named_id started_at now verdict
     coordinator="$(container_of coordinator)"
     project="$(docker inspect "${coordinator}" --format '{{index .Config.Labels "com.docker.compose.project"}}' 2>/dev/null)"
     image_id="$(docker inspect "${coordinator}" --format '{{.Image}}' 2>/dev/null)"
     started_at="$(docker inspect "${coordinator}" --format '{{.State.StartedAt}}' 2>/dev/null)"
-    image_named="$(get FORGE_IMAGE)"
+    image_named="$(the_image_this_rollout_names)"
+    image_named_id="$(image_id_of "${image_named}")"
     now="$(date -u +%s)"
 
     printf '\n'
@@ -1354,6 +1441,7 @@ check_pre_resume() {
         printf '  "compose_project": "%s",\n'       "${project}"
         printf '  "coordinator_image_id": "%s",\n'  "${image_id}"
         printf '  "coordinator_image_named": "%s",\n' "${image_named}"
+        printf '  "coordinator_image_named_id": "%s",\n' "${image_named_id}"
         printf '  "release_version": "%s",\n'       "${image_named##*:}"
         printf '  "coordinator_started_at": "%s",\n' "${started_at}"
         printf '  "the_bus": {"monitoring_address": "%s", "network": "%s"},\n' \
@@ -1373,8 +1461,8 @@ check_pre_resume() {
         exit 2
     }
 
-    printf 'The closed-door phase is written down at %s — this estate (%s), this coordinator image (%s), at %s.\n' \
-        "${receipt}" "${project:-unnamed}" "${image_id:-unreadable}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf 'The closed-door phase is written down at %s — this estate (%s), the release this rollout is for (%s), which is the image this coordinator is running (%s), at %s.\n' \
+        "${receipt}" "${project:-unnamed}" "${image_named:-unnamed}" "${image_id:-unreadable}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     if [ "${verdict}" = "passed" ]; then
         printf 'PASSED — %s items asked something and passed; the %s producer items are not checked in this mode and are recorded as such, never as passed.\n' \
             "${PASSES}" "${DELIBERATE}"
@@ -1388,12 +1476,18 @@ check_pre_resume() {
 # ---------------------------------------------------------------------------
 # READING THE CLOSED-DOOR RECORD BACK, which is the only way it may be used.
 #
-# FIVE REASONS TO REFUSE, and each is said by name:
+# SIX REASONS TO REFUSE, and each is said by name:
 #
 #   * there is no record, or it cannot be read;
 #   * it is not a pass — including a pass with something not checked;
 #   * it belongs to a different estate (a different compose project);
 #   * it names a different coordinator image than the one running now;
+#   * it was written about a different RELEASE than this rollout is for, or the
+#     name it gives that release now points at a different image, or the record
+#     disagrees with itself about the two. Comparing the recorded id with the
+#     running id alone is the same number twice whenever the record was written
+#     here, which is why the release it NAMES is resolved again (26 September
+#     2026, the first condition of Codex's third read);
 #   * it is older than the coordinator's own start, or older than the age the
 #     env file allows. A pass from before the estate started says nothing about
 #     the estate that is running.
@@ -1404,6 +1498,8 @@ _read_the_record() {   # <file> — prints shell assignments, one per line
       "R_VERDICT=" + (.verdict // "") ,
       "R_PROJECT=" + (.compose_project // "") ,
       "R_IMAGE=" + (.coordinator_image_id // "") ,
+      "R_NAMED=" + (.coordinator_image_named // "") ,
+      "R_NAMED_ID=" + (.coordinator_image_named_id // "") ,
       "R_BUS_MODE=" + (.bus_mode // "") ,
       "R_EPOCH=" + ((.written_at_epoch // 0) | tostring) ,
       "R_WRITTEN=" + (.written_at // "") ,
@@ -1437,11 +1533,11 @@ check_read_pre_resume() {
         exit 1
     fi
 
-    local R_VERDICT="" R_PROJECT="" R_IMAGE="" R_BUS_MODE="" R_EPOCH=0 R_WRITTEN="" R_NOT_CHECKED=""
+    local R_VERDICT="" R_PROJECT="" R_IMAGE="" R_NAMED="" R_NAMED_ID="" R_BUS_MODE="" R_EPOCH=0 R_WRITTEN="" R_NOT_CHECKED=""
     local key val
     while IFS='=' read -r key val; do
         case "${key}" in
-            R_VERDICT|R_PROJECT|R_IMAGE|R_BUS_MODE|R_EPOCH|R_WRITTEN|R_NOT_CHECKED)
+            R_VERDICT|R_PROJECT|R_IMAGE|R_NAMED|R_NAMED_ID|R_BUS_MODE|R_EPOCH|R_WRITTEN|R_NOT_CHECKED)
                 printf -v "${key}" '%s' "${val}" ;;
         esac
     done < <(_read_the_record "${receipt}")
@@ -1475,6 +1571,36 @@ check_read_pre_resume() {
     else
         [ "${R_PROJECT}" = "${project}" ] || trouble="${trouble} it was written for the estate '${R_PROJECT}' and this one is '${project}';"
         [ "${R_IMAGE}" = "${image_id}" ]  || trouble="${trouble} it names the coordinator image ${R_IMAGE:-none} and this estate is running ${image_id:-unreadable};"
+        # AND THE RELEASE IT SAYS IT IS ABOUT. The line above compares the id
+        # the record carries with the id that is running, which on its own is
+        # the same number twice whenever the record was written here. So the
+        # NAME the record gives the release is resolved again, now, and has to
+        # be the release this rollout names and the image that is running.
+        # This is what catches a record written for one release and read during
+        # another, and a tag that has been moved onto a different image since.
+        local wanted named_now
+        wanted="$(the_image_this_rollout_names)"
+        if [ -z "${R_NAMED}" ]; then
+            trouble="${trouble} it does not say which release it was written about, only an image id, so it cannot be shown to be about this rollout's release (${wanted:-unnamed}); it was written by a version of this check that did not compare the two;"
+        else
+            [ -z "${wanted}" ] || [ "${R_NAMED}" = "${wanted}" ] \
+                || trouble="${trouble} it was written for the release ${R_NAMED} and this rollout is for ${wanted};"
+            named_now="$(image_id_of "${R_NAMED}")"
+            if [ -z "${named_now}" ]; then
+                trouble="${trouble} the release it names, ${R_NAMED}, is no longer an image on this machine, so what it was written about cannot be read back;"
+            elif [ "${named_now}" != "${image_id}" ]; then
+                # The same name and a different image is a tag that has MOVED.
+                # A different name is simply another release, and saying "moved"
+                # about that would be a lie about this machine.
+                if [ "${R_NAMED}" = "${wanted}" ]; then
+                    trouble="${trouble} it was written for ${R_NAMED}, and that name now points at ${named_now} while this estate runs ${image_id:-unreadable} — the tag has been moved since the record was written;"
+                else
+                    trouble="${trouble} the release it names, ${R_NAMED}, is image ${named_now} on this machine and this estate runs ${image_id:-unreadable};"
+                fi
+            fi
+            [ -z "${R_NAMED_ID}" ] || [ "${R_NAMED_ID}" = "${R_IMAGE}" ] \
+                || trouble="${trouble} the record disagrees with itself: it says ${R_NAMED} is image ${R_NAMED_ID} and that the estate ran ${R_IMAGE};"
+        fi
         if [ "${started_epoch}" -gt 0 ] && [ "${R_EPOCH}" -le "${started_epoch}" ]; then
             trouble="${trouble} it was written at ${R_WRITTEN}, before or when this coordinator started, so it says nothing about the estate that is running now;"
         fi
@@ -1489,8 +1615,8 @@ check_read_pre_resume() {
         printf '\nA closed-door record is a statement about ONE estate, ONE image and ONE moment. Run "estate-check --pre-resume" again on the estate that is running.\n'
         exit 1
     fi
-    printf 'MAY BE ACTED ON — written %s (%s seconds ago, and this env file allows %s), for this estate (%s), this coordinator image (%s), in %s bus mode, and every item it names passed.\n' \
-        "${R_WRITTEN}" "${age}" "${max_age}" "${project}" "${image_id}" "${R_BUS_MODE}"
+    printf 'MAY BE ACTED ON — written %s (%s seconds ago, and this env file allows %s), for this estate (%s), for the release %s, which is the image this coordinator is running (%s), in %s bus mode, and every item it names passed.\n' \
+        "${R_WRITTEN}" "${age}" "${max_age}" "${project}" "${R_NAMED:-unnamed}" "${image_id}" "${R_BUS_MODE}"
     exit 0
 }
 
