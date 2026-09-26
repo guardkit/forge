@@ -924,10 +924,17 @@ services:
   # WHAT IT IS GIVEN, AND WHAT THAT COSTS. Three things to read:
   #   * the bus's monitoring route, which takes no credential;
   #   * the gateway's heartbeat volume, READ-ONLY;
-  #   * the Docker socket, read-only, because reading a container's log means
-  #     asking the engine and there is no other way to ask. That is a real
-  #     privilege and it is named here rather than hidden. A machine that will not
-  #     grant it gets 'unknown' for that one component, never a false 'ok'.
+  #   * the Docker socket, because reading a container's log means asking the
+  #     engine and there is no other way to ask. It is mounted with read_only,
+  #     BUT THAT IS NOT THE LIMIT IT SOUNDS LIKE (the E3 review, 26 September
+  #     2026): read_only stops writes to the socket FILE, not requests through
+  #     it — a process holding this socket can create and remove anything the
+  #     engine manages. So this container holds engine control for as long as
+  #     it runs, which is always. That is a real privilege, named here rather
+  #     than hidden; a machine that will not grant it gets 'unknown' for that
+  #     one component, never a false 'ok'. Narrowing it (a socket proxy that
+  #     allows only container logs) is the honest next step and is not in this
+  #     bundle.
   #
   # IT RESTARTS NOTHING, writes nothing to the bus, and the only secret it ever
   # touches is the Slack token it posts its own alarm with — the retired alarm's
@@ -993,6 +1000,11 @@ services:
       # a window shorter than a full rotation turns a quiet Friday into an alarm.
       GATEWAY_WATCH_HEARTBEAT_MAX_AGE_S: ${GATEWAY_WATCH_HEARTBEAT_MAX_AGE_S:-21600}
       GATEWAY_WATCH_MAX_SILENCE_S: ${GATEWAY_WATCH_MAX_SILENCE_S:-21600}
+      # How many of the gateway's newest log lines the Slack signal reads. The
+      # retired alarm read 300 journal lines; a door logging steadily for another
+      # reason could push one trouble line out of a 20-line window inside one
+      # interval (the E3 review). 300 here, and a setting.
+      GATEWAY_WATCH_LOG_LINES: ${GATEWAY_WATCH_LOG_LINES:-300}
       # WHICH CONTAINER THE GATEWAY IS. Left empty, the watch finds it by its
       # compose labels, taking the project from its own labels — so it finds the
       # gateway of ITS estate and not of another on the same machine.

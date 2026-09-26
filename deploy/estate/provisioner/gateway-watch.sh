@@ -51,11 +51,15 @@ readonly EXIT_OK=0
 readonly EXIT_UNHAPPY=10
 readonly EXIT_BROKEN=20
 
-# The retired alarm's own backstop and the reason for it, kept: a healthy but
-# idle door is NOT silent (it logs its bus polling), and the Slack session
-# rotates roughly every five hours, logging as it goes. Six hours is longer than
-# a full rotation, so a door that has said nothing for that long is wedged. A
-# shorter window turns a quiet Friday into an alarm.
+# The retired alarm's backstop, kept — with its reason corrected by the E3
+# review of 26 September 2026: a healthy but idle door in its CONTAINER is
+# silent (zero log lines in four and a half minutes of steady state; the old
+# alarm read a journal that also carried the unit's own chatter). So this
+# window rests on one thing only: the Slack session rotates roughly every five
+# hours and logs as it goes. Six hours is longer than a rotation, with about an
+# hour to spare — thin. A workspace whose rotation ran past six hours would get
+# a wrong "gone silent" every look; that is what GATEWAY_WATCH_MAX_SILENCE_S is
+# for, and the heartbeat's own freshness is the other, independent signal.
 readonly DEFAULT_MAX_SILENCE_S=21600
 # The same number and the same reason for the heartbeat: a rotation rewrites that
 # file, so a file older than a full rotation means the writer stopped.
