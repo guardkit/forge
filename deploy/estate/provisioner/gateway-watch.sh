@@ -68,7 +68,7 @@ readonly DEFAULT_SUBJECT="agents.command.jarvis"
 readonly DEFAULT_HEARTBEAT_PATH="/var/lib/jarvis/slack-heartbeat.json"
 readonly DEFAULT_GATEWAY_SERVICE="bus-gateway"
 readonly DEFAULT_DOCKER_SOCKET="/var/run/docker.sock"
-readonly DEFAULT_LOG_LINES=20
+readonly DEFAULT_LOG_LINES=300
 readonly SLACK_POST_URL="https://slack.com/api/chat.postMessage"
 
 # ---------------------------------------------------------------------------
@@ -422,8 +422,9 @@ check_slack() {
 # a door that has logged nothing for longer than a full rotation is wedged even
 # while the process lingers.
 #
-# HOW A CONTAINER'S LOG IS READ. Over the Docker socket, mounted read-only. That
-# is a real privilege and it is named here rather than hidden: reading a
+# HOW A CONTAINER'S LOG IS READ. Over the Docker socket. The mount is read_only,
+# which guards the socket FILE and not requests through it: this is engine
+# control, a real privilege named here rather than hidden: reading a
 # container's log means asking the engine, and there is no other way to ask. A
 # machine that will not grant it gets 'unknown' — never a false 'ok'.
 # ---------------------------------------------------------------------------

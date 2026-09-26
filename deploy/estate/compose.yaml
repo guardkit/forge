@@ -1039,8 +1039,9 @@ services:
         source: gateway-state
         target: /var/lib/jarvis
         read_only: true
-      # THE ENGINE, READ-ONLY, only so a container's log can be read. Named
-      # plainly because it is the one real privilege in this service.
+      # THE ENGINE'S SOCKET, so a container's log can be read. read_only here
+      # guards the socket file, not requests through it — this is engine
+      # control, the one real privilege in this service, named plainly.
       - type: bind
         source: /var/run/docker.sock
         target: /var/run/docker.sock
