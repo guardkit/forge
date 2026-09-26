@@ -168,9 +168,22 @@ say "  ok ${BUS_IMAGE}"
 # the two together (the stage 4a reviewer, 24 September 2026): a future pin whose
 # Dockerfile changed its CMD would start the broker on the wrong command and every
 # test would still pass. So the build refuses when they differ.
+#
+# READ OUT OF THE BUS'S OWN SERVICE BLOCK, not out of the file as a whole. This
+# used to take the first one-line 'command: [...]' anywhere in compose.yaml,
+# which was the bus's only because the bus happened to be the first service with
+# one. On 26 September 2026 external-bus mode added services above and below it
+# and that assumption became a trap: a service ordered ahead of the bus would
+# have had ITS command compared with the bus image's CMD, and the guard would
+# have failed for a reason that had nothing to do with the bus.
 IMAGE_CMD="$(docker image inspect --format '{{json .Config.Cmd}}' "${BUS_IMAGE}")"
-COMPOSE_CMD="$(sed -nE 's/^[[:space:]]*command:[[:space:]]*(\[.*\])[[:space:]]*$/\1/p' "${HERE}/compose.yaml" | head -n 1 | tr -d ' ')"
-[ -n "${COMPOSE_CMD}" ] || die "compose.yaml's bus service has no one-line 'command: [...]' to compare with the image's CMD."
+COMPOSE_CMD="$(awk '
+    /^  [a-zA-Z0-9_-]+:[[:space:]]*$/ { inside = ($0 == "  nats:") }
+    inside && /^[[:space:]]+command:[[:space:]]*\[.*\][[:space:]]*$/ {
+        sub(/^[[:space:]]*command:[[:space:]]*/, ""); print; exit
+    }
+' "${HERE}/compose.yaml" | head -n 1 | tr -d ' ')"
+[ -n "${COMPOSE_CMD}" ] || die "compose.yaml's bus service ('nats') has no one-line 'command: [...]' to compare with the image's CMD."
 [ "$(printf '%s' "${IMAGE_CMD}" | tr -d ' ')" = "${COMPOSE_CMD}" ] || die "the bus image at ${BUS_REPOSITORY_COMMIT} starts with CMD ${IMAGE_CMD}, but compose.yaml's bus service writes command: ${COMPOSE_CMD}. Make the compose file say what the image says, then build again."
 say "  ok the compose file's bus command matches the image's CMD: ${IMAGE_CMD}"
 

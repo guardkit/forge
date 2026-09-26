@@ -25,8 +25,21 @@ FROM ${NATS_BOX_IMAGE}
 
 RUN apk add --no-cache bash
 
-# Nothing is copied in. The scripts and their definitions arrive as a
-# read-only mount from the bus repository at its pinned commit, so this image
-# holds no copy of them and cannot drift from the bus.
+# NO DEFINITION AND NO SCRIPT OF THE BUS'S IS COPIED IN. The bus repository's
+# own provisioning scripts and its definitions arrive as a read-only mount from
+# that repository at its pinned commit, so this image holds no copy of them and
+# cannot drift from the bus.
+#
+# ONE SCRIPT OF THE ESTATE'S OWN IS (26 September 2026, build item E1): the
+# read-only comparison of a bus that is already running against those pinned
+# definitions, field by field. It is the estate's, not the bus's — the bus
+# repository has nothing that reads a bus and compares it — and it belongs in
+# this image because this is the image that already carries `curl`, `jq` and
+# `bash`. It is a FILE in the image rather than a command written into the
+# compose file so that a test can run it on its own against a saved answer, the
+# way the estate's tests do, and so the compose file stays readable.
+COPY compare-bus-with-definitions.sh /usr/local/bin/compare-bus-with-definitions.sh
+RUN chmod +x /usr/local/bin/compare-bus-with-definitions.sh
+
 ENTRYPOINT ["/bin/bash", "-c"]
 CMD ["echo 'this image runs the bus repository''s own provisioning scripts; the estate compose file gives it the command'"]
