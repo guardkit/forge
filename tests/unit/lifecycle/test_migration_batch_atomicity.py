@@ -293,6 +293,14 @@ def test_a_whole_batch_of_three_is_applied_together(
         ("BEGIN", "BEGIN;\nCREATE TABLE t (id TEXT);\nCOMMIT;\n"),
         ("COMMIT", "CREATE TABLE t (id TEXT);\nCOMMIT;\n"),
         ("ROLLBACK", "CREATE TABLE t (id TEXT);\nROLLBACK;\n"),
+        # Codex's review of 26 September 2026: a comment between the two words
+        # used to be removed outright, so the guard saw COMMITTRANSACTION (in
+        # no list) while SQLite, reading the comment as a space, committed the
+        # batch early. A comment is whitespace.
+        ("COMMIT", "CREATE TABLE t (id TEXT);\nCOMMIT/**/TRANSACTION;\n"),
+        ("COMMIT", "CREATE TABLE t (id TEXT);\nCOMMIT -- said quietly\nTRANSACTION;\n"),
+        ("BEGIN", "/* opening */BEGIN/* now */;\nCREATE TABLE t (id TEXT);\n"),
+        ("END", "CREATE TABLE t (id TEXT);\nEND/**/TRANSACTION;\n"),
     ],
 )
 def test_a_migration_with_its_own_transaction_is_refused(
