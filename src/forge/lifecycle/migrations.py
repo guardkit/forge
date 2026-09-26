@@ -452,8 +452,11 @@ def apply_at_boot(connection: sqlite3.Connection) -> int:
     connection:
         A writable ``sqlite3.Connection`` — typically the persistent
         connection returned by
-        :func:`forge.adapters.sqlite.connect.connect_writer`. It must not
-        already have a transaction open; the runner needs to own one.
+        :func:`forge.adapters.sqlite.connect.connect_writer`. The runner
+        needs to own the transaction, so a connection that already has one
+        open makes SQLite refuse the nested ``BEGIN`` and the refusal is
+        reported as a :class:`MigrationError` — nothing is applied and the
+        caller's own transaction is left alone.
 
     Returns
     -------
@@ -488,13 +491,6 @@ def apply_at_boot(connection: sqlite3.Connection) -> int:
         _refuse_own_transaction(statements, filename)
         batch.append((version, filename, statements))
 
-    if connection.in_transaction:
-        raise MigrationError(
-            "cannot apply migrations: the connection already has a "
-            "transaction open, and the runner has to own the one "
-            "transaction the whole batch runs in"
-        )
-
     foreign_keys_were_on = bool(
         connection.execute("PRAGMA foreign_keys;").fetchone()[0]
     )
@@ -519,7 +515,7 @@ def apply_at_boot(connection: sqlite3.Connection) -> int:
                     "VALUES (?, datetime('now'));",
                     (_version,),
                 )
-            broken = connection.execute("PRAGMA foreign_key_check;").fetchall()
+            broken = list(connection.execute("PRAGMA foreign_key_check;").fetchall())
             if broken:
                 tables = sorted({str(row[0]) for row in broken})
                 raise MigrationError(
