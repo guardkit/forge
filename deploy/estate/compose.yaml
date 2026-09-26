@@ -349,6 +349,10 @@ services:
       # external mode it is the retained bus's name on the retained network.
       BUS_MONITORING_ADDRESS: ${BUS_MONITORING_ADDRESS:?name the bus's monitoring address in the env file, e.g. nats:8222 - a name and a port, with no credential in it}
       BUS_READY_TIMEOUT_S: ${BUS_READY_TIMEOUT_S:-90}
+      # The account the comparison reads (the third E1/E2 review, 26 September
+      # 2026: the setting existed in the env file and never reached the one
+      # container that reads it, so the remedy its own refusal named did nothing).
+      BUS_STREAMS_ACCOUNT: ${BUS_STREAMS_ACCOUNT:-}
     entrypoint: ["/bin/bash", "-c"]
     command:
       - |

@@ -1561,6 +1561,98 @@ class TestTheBusIsComparedFieldByField:
         assert "/usr/local/bin/compare-bus-with-definitions.sh" in compose
 
 
+class TestTheComparisonChoosesOneAccount:
+    """THE THIRD E1/E2 REVIEW (26 September 2026): a bus has several accounts and
+    a stream name is unique only within one. Joining every account's streams
+    into one map let the last account to answer win, and the closed-door
+    check's own waiting-count read had the same fault. The comparison now
+    chooses ONE account: the one named in BUS_STREAMS_ACCOUNT, else the single
+    account holding every pinned name; two is ambiguous, none is no account —
+    both UNKNOWN (exit 3), never a comparison and never twelve false MISSING
+    lines."""
+
+    def _run(self, tmp_path: Path, accounts: list[tuple[str, int]], env_account: str | None):
+        import json, os
+
+        (tmp_path / "streams").mkdir(exist_ok=True)
+        (tmp_path / "kv").mkdir(exist_ok=True)
+        (tmp_path / "streams" / "stream-definitions.json").write_text(
+            json.dumps({"streams": [{"name": "PIPELINE", "subjects": ["pipeline.>"], "max_msgs": 10000}]})
+        )
+        (tmp_path / "kv" / "kv-definitions.json").write_text(json.dumps({"kv_buckets": []}))
+        answer = {"server_id": "two-account-bus", "account_details": [
+            {"name": name, "stream_detail": [{"name": "PIPELINE", "config": {"name": "PIPELINE", "subjects": ["pipeline.>"], "max_msgs": max_msgs}}]}
+            for name, max_msgs in accounts
+        ]}
+        (tmp_path / "jsz.json").write_text(json.dumps(answer))
+        env = dict(os.environ)
+        env.pop("BUS_STREAMS_ACCOUNT", None)
+        if env_account is not None:
+            env["BUS_STREAMS_ACCOUNT"] = env_account
+        return subprocess.run(
+            ["bash", str(_COMPARE), "--jsz-file", str(tmp_path / "jsz.json"), "--definitions", str(tmp_path)],
+            capture_output=True, text=True, timeout=60, env=env,
+        )
+
+    def test_two_accounts_holding_the_name_is_unknown_not_a_pass(self, tmp_path: Path) -> None:
+        done = self._run(tmp_path, [("RVA", 10000), ("RVB", 20000)], None)
+        assert done.returncode == 3, done.stdout + done.stderr
+        assert "more than one account" in done.stderr and "RVA" in done.stderr and "RVB" in done.stderr
+        assert "MISSING" not in done.stdout + done.stderr, "false MISSING lines were printed"
+
+    def test_the_named_account_decides(self, tmp_path: Path) -> None:
+        good = self._run(tmp_path, [("RVA", 10000), ("RVB", 20000)], "RVA")
+        assert good.returncode == 0, good.stdout + good.stderr
+        bad = self._run(tmp_path, [("RVA", 10000), ("RVB", 20000)], "RVB")
+        assert bad.returncode == 2, bad.stdout + bad.stderr
+        assert "max_msgs" in bad.stdout + bad.stderr
+
+    def test_a_misspelt_account_is_unknown_not_twelve_missing_lines(self, tmp_path: Path) -> None:
+        done = self._run(tmp_path, [("RVA", 10000)], "NOT-AN-ACCOUNT")
+        assert done.returncode == 3, done.stdout + done.stderr
+        assert "no account on this bus holds" in done.stderr
+        assert "MISSING" not in done.stdout + done.stderr
+
+    def test_one_account_is_the_ordinary_case(self, tmp_path: Path) -> None:
+        done = self._run(tmp_path, [("RVA", 10000)], None)
+        assert done.returncode == 0, done.stdout + done.stderr
+
+    def test_the_bus_ready_container_is_handed_the_account(self) -> None:
+        compose = (ESTATE / "compose.yaml").read_text()
+        assert "BUS_STREAMS_ACCOUNT: ${BUS_STREAMS_ACCOUNT:-}" in compose, (
+            "the setting exists in the env file but never reaches the container that reads it"
+        )
+
+
+class TestTheClosedDoorAsksBothServiceManagers:
+    """THE THIRD E1/E2 REVIEW: the item that proves the legacy front-door units
+    stopped asked the user manager alone and read an empty answer as absent —
+    so with no session bus it passed while both live units were running. Now
+    both managers are asked and only a READ answer counts. These tests read the
+    script's own words, because driving the item needs a whole estate; the
+    reviewers drive it for real."""
+
+    def test_both_managers_are_asked(self) -> None:
+        text = (ESTATE / "estate-check").read_text()
+        assert 'for mgr in "--user" "--system"' in text
+        assert "unreachable-or-silent" in text
+        assert "could not be read is not stopped" in text
+
+    def test_a_record_from_the_future_is_refused(self) -> None:
+        text = (ESTATE / "estate-check").read_text()
+        assert 'if [ "${age}" -lt 0 ]' in text
+        assert "in the future of this machine" in text
+
+    def test_the_same_bus_question_is_asked_at_the_closed_door_too(self) -> None:
+        text = (ESTATE / "estate-check").read_text()
+        assert text.count("the_same_bus_or_trouble") >= 3, "defined once, asked at the door and at the closed door"
+
+    def test_the_waiting_counts_are_read_in_one_chosen_account(self) -> None:
+        text = (ESTATE / "estate-check").read_text()
+        assert "one must be chosen, in BUS_STREAMS_ACCOUNT" in text
+        assert 'select(.name == \\$acct)' in text or "select(.name == \$acct)" in text
+
+
 class TestTheEstateForwardsWhatTheBundleForwards:
     """The estate composes deploy/compose in, so the names it hands a project's
     sandbox are that bundle's names. The two lists had drifted by 24 September

@@ -207,15 +207,20 @@ REPORT="$(printf '%s' "${ANSWER}" | jq -r \
     # accounts into one map let the last account stream win (the E1/E2
     # review of 26 September 2026). The account that holds the pinned streams
     # is chosen once: the one named in BUS_STREAMS_ACCOUNT if that setting is
-    # given, else the single account that holds every pinned stream name; two
-    # candidate accounts, or none, is UNKNOWN, not a comparison.
+    # given, else the single account that holds ANY pinned stream name — any,
+    # not every, so an account short of one stream is still chosen and that
+    # stream is reported MISSING (a refusal), rather than the whole bus being
+    # called unknown; two such accounts, or none, is UNKNOWN, not a comparison
+    # (NO_ACCOUNT and AMBIGUOUS_ACCOUNT below are read by the shell as unknown).
     ([.account_details[]? | select(.stream_detail != null) | {account: .name, streams: ([.stream_detail[]? | select(.config != null) | {key: .config.name, value: .config}] | from_entries)}]) as $by_account
     | ([ $stream_defs[0].streams[]? | .name ]) as $pinned
     | ($by_account | map(select(($ENV.BUS_STREAMS_ACCOUNT // "") == "" or .account == $ENV.BUS_STREAMS_ACCOUNT))) as $candidates
     | ($candidates | map(select(. as $a | any($pinned[]; . as $n | $a.streams | has($n))))) as $holding
     | (if ($holding | length) == 1 then $holding[0] else null end) as $chosen
     | (if $chosen == null then {} else $chosen.streams end) as $held
-    | (if ($holding | length) > 1 then ["AMBIGUOUS_ACCOUNT|\(($holding | map(.account)) | join(","))"] else [] end) as $account_problems
+    | (if ($holding | length) > 1 then ["AMBIGUOUS_ACCOUNT|\(($holding | map(.account)) | join(","))"]
+       elif ($holding | length) == 0 then ["NO_ACCOUNT|\(($candidates | map(.account)) | join(","))"]
+       else [] end) as $account_problems
 
     # A LIST IS A SET HERE, NOT AN ORDER (26 September 2026, the review of this
     # script). The subjects of a stream are two JSON arrays on the two sides, and
@@ -291,6 +296,13 @@ fi
 
 AGREED=0
 PROBLEMS=0
+# WHEN NO ACCOUNT WAS CHOSEN, THE STREAM LINES ARE NOISE: with no account
+# there is nothing to compare against, and every stream would print as MISSING
+# although the bus holds it (the third E1/E2 review). The account verdict is
+# the whole answer, and it leaves by the unknown door below.
+if printf '%s' "${REPORT}" | /bin/grep -qE '^(NO_ACCOUNT|AMBIGUOUS_ACCOUNT)\|'; then
+    REPORT="$(printf '%s' "${REPORT}" | /bin/grep -E '^(NO_ACCOUNT|AMBIGUOUS_ACCOUNT)\|')"
+fi
 while IFS='|' read -r kind resource field wanted found; do
     [ -n "${kind}" ] || continue
     case "${kind}" in
@@ -298,6 +310,7 @@ while IFS='|' read -r kind resource field wanted found; do
             AGREED=$((AGREED+1))
             say "  agrees       ${resource} — all ${field} field(s) the definitions name"
             ;;
+        NO_ACCOUNT|AMBIGUOUS_ACCOUNT) ;;
         MISSING)
             PROBLEMS=$((PROBLEMS+1))
             say "  MISSING      ${resource} — the pinned definitions name it and this bus does not hold it"
@@ -315,6 +328,9 @@ done <<< "${REPORT}"
 
 # A field the answer does not carry is an unknown about the bus, so it leaves by
 # the unknown door even though it was found during the comparison.
+if printf '%s' "${REPORT}" | /bin/grep -q '^NO_ACCOUNT|'; then
+    unknown "no account on this bus holds any stream by the pinned names (accounts looked at: $(printf '%s' "${REPORT}" | sed -n 's/^NO_ACCOUNT|//p' | head -1)); if BUS_STREAMS_ACCOUNT is set, check its spelling. Nothing was compared and nothing was updated."
+fi
 if printf '%s' "${REPORT}" | /bin/grep -q '^AMBIGUOUS_ACCOUNT|'; then
     unknown "more than one account on this bus holds streams by the pinned names ($(printf '%s' "${REPORT}" | sed -n 's/^AMBIGUOUS_ACCOUNT|//p' | head -1)), so it cannot be said which account the coordinator's streams live in. Name the account in BUS_STREAMS_ACCOUNT and run again. Nothing was updated."
 fi
