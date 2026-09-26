@@ -266,6 +266,12 @@ def _strip_comments_and_space(text: str) -> str:
     and ``COMMIT`` in their header prose, and one of them mentions a
     "STARTING COMMIT", none of which is a transaction statement.
     """
+    # A COMMENT IS WHITESPACE, NOT NOTHING (Codex's review of 26 September
+    # 2026). Removing a comment outright joined the words either side of it,
+    # so ``COMMIT/**/TRANSACTION`` read as one word, ``COMMITTRANSACTION``,
+    # which is in no list — and SQLite, which reads the comment as a space,
+    # committed the batch early. Each comment becomes one space, as SQLite
+    # itself treats it.
     out: list[str] = []
     i = 0
     n = len(text)
@@ -273,10 +279,12 @@ def _strip_comments_and_space(text: str) -> str:
         if text.startswith("--", i):
             end = text.find("\n", i)
             i = n if end == -1 else end + 1
+            out.append(" ")
             continue
         if text.startswith("/*", i):
             end = text.find("*/", i + 2)
             i = n if end == -1 else end + 2
+            out.append(" ")
             continue
         out.append(text[i])
         i += 1
