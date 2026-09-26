@@ -1,0 +1,80 @@
+{
+  "server_id": "a-made-up-bus",
+  "streams": 3,
+  "account_details": [
+    {
+      "name": "AN-ACCOUNT",
+      "stream_detail": [
+        {
+          "name": "A-STREAM",
+          "config": {
+            "name": "A-STREAM",
+            "subjects": [
+              "a.>"
+            ],
+            "retention": "workqueue",
+            "max_consumers": -1,
+            "max_msgs": 10000,
+            "max_bytes": -1,
+            "max_age": 604800000000000,
+            "max_msgs_per_subject": -1,
+            "max_msg_size": -1,
+            "discard": "old",
+            "storage": "file",
+            "num_replicas": 1,
+            "duplicate_window": 120000000000
+          },
+          "state": {
+            "messages": 0
+          }
+        },
+        {
+          "name": "ANOTHER-STREAM",
+          "config": {
+            "name": "ANOTHER-STREAM",
+            "subjects": [
+              "another.>"
+            ],
+            "retention": "limits",
+            "max_consumers": -1,
+            "max_msgs": 500,
+            "max_bytes": -1,
+            "max_age": 3600000000000,
+            "max_msgs_per_subject": -1,
+            "max_msg_size": -1,
+            "discard": "old",
+            "storage": "file",
+            "num_replicas": 1,
+            "duplicate_window": 120000000000
+          },
+          "state": {
+            "messages": 0
+          }
+        },
+        {
+          "name": "KV_a-bucket",
+          "config": {
+            "name": "KV_a-bucket",
+            "subjects": [
+              "$KV.a-bucket.>"
+            ],
+            "retention": "limits",
+            "max_consumers": -1,
+            "max_msgs": -1,
+            "max_bytes": -1,
+            "max_age": 0,
+            "max_msgs_per_subject": 5,
+            "max_msg_size": 262144,
+            "discard": "new",
+            "storage": "file",
+            "num_replicas": 1,
+            "duplicate_window": 120000000000
+          },
+          "state": {
+            "messages": 0
+          }
+        }
+      ]
+    }
+  ]
+}

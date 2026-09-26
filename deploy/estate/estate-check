@@ -3,11 +3,19 @@
 # estate-check — is this machine fit to run the estate, and is the estate
 # running properly once it has started.
 #
-# TWO MODES, because some things must be true BEFORE anything starts and
-# others can only be true after:
+# FOUR MODES, because some things must be true BEFORE anything starts, others
+# can only be true after, and one phase of a rollout has to be checked with the
+# door deliberately SHUT:
 #
-#   estate-check host       run it before 'docker compose up'
-#   estate-check services   run it after
+#   estate-check host              run it before 'docker compose up'
+#   estate-check services         run it after
+#   estate-check --pre-resume     the CLOSED-DOOR check: the estate up, and the
+#                                 two things that can bring work in deliberately
+#                                 NOT running. It writes down what it found so
+#                                 the rollout's resume step can read it back
+#   estate-check --read-pre-resume  read that record and say whether it may be
+#                                 acted on: this estate, this image, recent
+#                                 enough, and a pass
 #
 # Each item prints ONE plain sentence saying what was looked for, where, and
 # what to do about it. Anything that is not a pass — a failure, or an item this
@@ -21,6 +29,13 @@
 # docs/factory-containerisation-design-pass-2026-09-23.md, numbered as that
 # section numbers them. 'estate-check --items' prints the list, and a test
 # holds the list to the design so nobody drops one quietly.
+#
+# IT KNOWS WHOSE BUS IT IS (26 September 2026, build item E1). BUS_MODE in the
+# env file says 'local' or 'external'. In local mode nothing below behaves any
+# differently from the way it did before. In external mode the bus belongs to
+# somebody else, is not a service of this project, and is therefore asked BY
+# ADDRESS from inside the estate rather than by stepping into a container this
+# project does not own.
 #
 #   --env-file FILE   the estate's env file (default: .env beside this script)
 #   --project NAME    the compose project name, if it is not the default
@@ -36,11 +51,13 @@ MODE=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        host|services) MODE="$1"; shift ;;
+        host|services)      MODE="$1"; shift ;;
+        --pre-resume)       MODE="pre-resume"; shift ;;
+        --read-pre-resume)  MODE="read-pre-resume"; shift ;;
         --env-file)    ENV_FILE="${2:?--env-file needs a file}"; shift 2 ;;
         --project)     PROJECT="${2:?--project needs a name}"; shift 2 ;;
         --items)       MODE="items"; shift ;;
-        --help|-h)     sed -n '2,27p' "${BASH_SOURCE[0]}"; exit 0 ;;
+        --help|-h)     sed -n '2,41p' "${BASH_SOURCE[0]}"; exit 0 ;;
         *)             printf 'estate-check: unknown argument "%s". Try --help.\n' "$1" >&2; exit 2 ;;
     esac
 done
@@ -58,6 +75,7 @@ ITEMS=(
 "host|5|volumes-and-disk-room|the declared volumes exist or can be created, and the disk has room"
 "host|6|secret-files-present-and-private|every secret file the env file names exists and is readable by its own service's user and by nobody else"
 "host|7|every-setting-name-has-a-value|every setting name the composed files require has a value"
+"host|7b|bus-mode-and-the-files-agree|BUS_MODE says whose bus this estate runs against, and the compose profiles and files in force say the same thing - a half-set mode is the one state that could start a second bus beside a bus that is being kept"
 "services|8|the-bus-answers|the bus answers at the address the env file gives"
 "services|8b|the-buses-storage-is-provisioned|the bus's key-value buckets and streams exist, asked of the bus itself"
 "services|8c|the-memory-service-answers|the memory service answers at the address the env file gives"
@@ -70,6 +88,7 @@ ITEMS=(
 "services|8h|the-front-door-answers|the Slack front door answers its own health route inside the estate, and the threads it saves are in a volume it can write rather than in the container - it publishes no port, because Slack is dialled out to and never heard from"
 "services|8i|the-bus-gateway-is-on-the-bus|the bus gateway holds a live connection to the bus, asked of the BUS itself rather than of the gateway"
 "services|9|the-answer-service-from-inside-a-sandbox|the coordinator's answer service answers FROM INSIDE a sandbox at the address the sandbox profile allows"
+"pre-resume|10|the-producers-are-stopped|the two things that can bring work in are really stopped - no front-door and no bus-gateway container in this estate, the legacy host units inactive if they are on this machine, and nothing waiting or unconfirmed on the bus's two durable readers"
 )
 
 if [ "${MODE}" = "items" ]; then
@@ -144,25 +163,102 @@ redact() {
     printf '%s' "$1" | sed -E 's#(://[^:/@]+):[^@/]*@#\1:***@#'
 }
 
+# The host out of an address, whatever it carries: a scheme, a credential, a
+# port and a path all come off.
+host_of() {
+    printf '%s' "$1" | sed -E 's#^[a-z]+://##; s#^[^@]*@##; s#[:/].*$##'
+}
+
+# ---------------------------------------------------------------------------
+# WHOSE BUS IS IT (26 September 2026, build item E1).
+#
+#   local      this bundle's own bus, started and provisioned by this project.
+#              Everything below behaves exactly as it did before this was added
+#   external   a bus that is already running and belongs to somebody else. It is
+#              NOT a service of this project, so 'docker compose ps -q nats'
+#              finds nothing and every question to the bus goes BY ADDRESS from
+#              inside the estate
+#
+# An env file that says nothing is read as 'local', because that is the
+# clean-machine path and the one this bundle has always taken. A half-set
+# external mode is what item 7b refuses.
+# ---------------------------------------------------------------------------
+BUS_MODE_IN_FORCE="$(get BUS_MODE)"
+[ -n "${BUS_MODE_IN_FORCE}" ] || BUS_MODE_IN_FORCE="local"
+EXTERNAL_BUS_FILE="${HERE}/compose.external-bus.yaml"
+
+the_bus_is_external() { [ "${BUS_MODE_IN_FORCE}" = "external" ]; }
+
+# THE BUS'S MONITORING ADDRESS, which takes no credential — that is the whole
+# reason the estate's bus questions can be asked from an ordinary shell. Used in
+# both modes: in local mode it is the bus service's own name and port.
+the_buss_monitoring_address() {
+    local address
+    address="$(get BUS_MONITORING_ADDRESS)"
+    if [ -z "${address}" ]; then
+        # An env file written before this setting existed. The bus's monitoring
+        # port is the bus repository's own, and the host is the one the
+        # provisioning address names.
+        address="$(host_of "$(get NATS_PROVISION_ADDRESS)")"
+        [ -n "${address}" ] || address="nats"
+        address="${address}:8222"
+    fi
+    printf '%s' "${address}"
+}
+
+# Ask the bus one of its own monitoring routes FROM INSIDE THE ESTATE, at the
+# address the env file gives. This is how external mode asks: the bus is not a
+# container of this project, so there is nothing of ours to step into, and the
+# route is not published outside the estate, so it cannot be asked from here.
+ask_the_bus_from() {
+    local from="$1" route="$2" address
+    [ -n "${from}" ] || return 2
+    address="$(the_buss_monitoring_address)"
+    docker exec "${from}" curl -sf --max-time 8 "http://${address}/${route}" 2>/dev/null
+}
+
 # ---------------------------------------------------------------------------
 # Reporting
 # ---------------------------------------------------------------------------
 PASSES=0
 FAILURES=0
 UNCHECKED=0
+# Items this MODE deliberately leaves out, which is a different thing from an
+# item that could not be checked. Only the closed-door mode has any, and it has
+# exactly two: the items that ask a producer, while the producers are
+# deliberately stopped. They are never reported as passed and never as failed.
+DELIBERATE=0
 
-ok()        { PASSES=$((PASSES+1));     printf '  ok            %-4s %s\n' "$1" "$2"; }
-fail()      { FAILURES=$((FAILURES+1)); printf '  NOT PASSED    %-4s %s\n' "$1" "$2"; }
-unchecked() { UNCHECKED=$((UNCHECKED+1)); printf '  not checked   %-4s not checked here: %s\n' "$1" "$2"; }
+#: Every item's verdict, in order: number|verdict|sentence. The closed-door
+#: mode writes these into its record so that what it found can be read back
+#: rather than inferred from an exit code.
+RESULTS=()
+
+_record() { RESULTS+=("$1|$2|$3"); }
+
+ok()        { PASSES=$((PASSES+1));     printf '  ok            %-4s %s\n' "$1" "$2"; _record "$1" ok "$2"; }
+fail()      { FAILURES=$((FAILURES+1)); printf '  NOT PASSED    %-4s %s\n' "$1" "$2"; _record "$1" failed "$2"; }
+unchecked() { UNCHECKED=$((UNCHECKED+1)); printf '  not checked   %-4s not checked here: %s\n' "$1" "$2"; _record "$1" not-checked "$2"; }
+
+# NOT CHECKED ON PURPOSE, BY THIS MODE. Said differently from 'not checked',
+# because the two mean opposite things: one is an unknown, and this is a
+# deliberate exclusion with a stated place where the item IS checked.
+not_checked_on_purpose() {
+    DELIBERATE=$((DELIBERATE+1))
+    printf '  NOT CHECKED   %-4s not checked in this mode: %s\n' "$1" "$2"
+    _record "$1" not-checked-on-purpose "$2"
+}
 
 finish() {
     printf '\n'
     if [ "${FAILURES}" -eq 0 ] && [ "${UNCHECKED}" -eq 0 ]; then
         printf 'PASSED — %s items, all of them, and every one of them asked something.\n' "${PASSES}"
+        [ "${DELIBERATE}" -eq 0 ] || printf '%s item(s) were left out of this mode on purpose, and are listed above with where they are checked instead.\n' "${DELIBERATE}"
         exit 0
     fi
     printf 'NOT PASSED — %s items asked something and passed, %s failed, %s could not be checked on this machine.\n' \
         "${PASSES}" "${FAILURES}" "${UNCHECKED}"
+    [ "${DELIBERATE}" -eq 0 ] || printf '%s item(s) were left out of this mode on purpose, and are not counted either way.\n' "${DELIBERATE}"
     printf 'An item that could not be checked is not a pass: the gate is met when every item runs for real.\n'
     exit 1
 }
@@ -365,7 +461,83 @@ check_host() {
         ok 7 "every setting name the composed files require has a value ($(printf '%s' "${required}" | wc -w) of them), including the ones whose values are passed in rather than written down, and the gateway address is a single address rather than every interface."
     fi
 
+    # --- 7b ----------------------------------------------------------------
+    check_the_bus_mode_and_the_files_agree
+
     finish
+}
+
+# ---------------------------------------------------------------------------
+# ITEM 7b — BUS_MODE, AND THE TWO SETTINGS THAT CARRY IT INTO COMPOSE
+# (26 September 2026, build item E1).
+#
+# WHY THIS IS AN ITEM AND NOT A COMMENT. BUS_MODE is a word in the env file and
+# it does nothing on its own: what actually decides whether this estate starts a
+# bus of its own are two settings compose reads for itself, COMPOSE_PROFILES and
+# COMPOSE_FILE. A half-set mode — 'external' with the local profile still asked
+# for — renders perfectly well and starts a SECOND BUS beside the one that was
+# being kept, which is the one mistake this whole mode exists to stop. So the
+# word and the two settings are checked against each other, before anything
+# starts, and any disagreement is a refusal that names both sides.
+#
+# Checked offline on this machine's Compose (v5.2.0): an explicit '-f' on the
+# command line wins over COMPOSE_FILE, and '--profile' on the command line
+# REPLACES COMPOSE_PROFILES rather than adding to it. Both are why this reads the
+# values in force rather than trusting the file.
+# ---------------------------------------------------------------------------
+check_the_bus_mode_and_the_files_agree() {
+    local mode profiles files trouble="" said
+    mode="$(get BUS_MODE)"
+    profiles="$(get COMPOSE_PROFILES)"
+    files="$(get COMPOSE_FILE)"
+    said="BUS_MODE='${mode:-nothing set, so this reads as local}', COMPOSE_PROFILES='${profiles}', COMPOSE_FILE='${files}'"
+
+    case "${mode}" in
+        ""|local|external) ;;
+        *)
+            fail 7b "BUS_MODE is '${mode}' and it has to say local or external. Local means this bundle starts its own bus; external means the bus is already running and belongs to somebody else."
+            return
+            ;;
+    esac
+
+    local has_local_profile="no" has_external_file="no"
+    case ",${profiles}," in *,local-bus,*) has_local_profile="yes" ;; esac
+    case "${files}" in *compose.external-bus.yaml*) has_external_file="yes" ;; esac
+
+    if the_bus_is_external; then
+        [ "${has_local_profile}" = "no" ] || trouble="${trouble} the local-bus profile is still asked for, so this project would START ITS OWN BUS beside the one being kept;"
+        [ "${has_external_file}" = "yes" ] || trouble="${trouble} COMPOSE_FILE does not name compose.external-bus.yaml, so nothing joins the retained bus's network and the project would not render;"
+        [ -f "${EXTERNAL_BUS_FILE}" ] || trouble="${trouble} there is no compose.external-bus.yaml beside this script;"
+        [ -n "$(get BUS_EXTERNAL_NETWORK)" ] || trouble="${trouble} BUS_EXTERNAL_NETWORK names no network, and external mode joins a network that already exists rather than making one;"
+        local network
+        network="$(get BUS_EXTERNAL_NETWORK)"
+        if [ -n "${network}" ] && command -v docker >/dev/null 2>&1; then
+            docker network inspect "${network}" >/dev/null 2>&1 \
+                || trouble="${trouble} there is no docker network called '${network}' on this machine, and external mode joins one that already exists;"
+        fi
+    else
+        [ "${has_local_profile}" = "yes" ] || trouble="${trouble} local mode needs COMPOSE_PROFILES to include local-bus, and it does not — without it the bus and the provisioner are not in the project at all;"
+        [ "${has_external_file}" = "no" ] || trouble="${trouble} COMPOSE_FILE names compose.external-bus.yaml while BUS_MODE says local, which would start this estate's own bus AND join somebody else's;"
+    fi
+
+    # THE ADDRESS THE BUS IS TALKED TO AND THE ADDRESS IT IS ASKED ABOUT MUST BE
+    # THE SAME BUS. Two different hosts would mean the estate checked one bus and
+    # used another, and every item below would be true about the wrong one.
+    local talked asked
+    talked="$(host_of "$(get FORGE_NATS_URL)")"
+    asked="$(host_of "$(the_buss_monitoring_address)")"
+    if [ -n "${talked}" ] && [ -n "${asked}" ] && [ "${talked}" != "${asked}" ]; then
+        trouble="${trouble} the coordinator talks to the bus at '${talked}' and this check would ask about the bus at '${asked}', which are two different hosts;"
+    fi
+    case "$(the_buss_monitoring_address)" in
+        *@*) trouble="${trouble} BUS_MONITORING_ADDRESS carries a credential, and that route takes none;" ;;
+    esac
+
+    if [ -n "${trouble}" ]; then
+        fail 7b "the bus mode and the settings that carry it disagree (${said}):${trouble}"
+    else
+        ok 7b "this estate runs against ${BUS_MODE_IN_FORCE} bus mode, and the settings in force say the same thing (${said}). The bus's monitoring address is ${asked}, which is the same host the coordinator talks to."
+    fi
 }
 
 # Every ${NAME:?...} in the files the estate composes: the names that have no
@@ -384,6 +556,13 @@ required_setting_names() {
         "${HERE}/../compose/compose.sandbox-runner.yaml"
         "${HERE}/../../src/forge/publisher/compose-fragment.yml"
     )
+    # THE EXTERNAL-BUS OVERLAY IS ONE OF THE COMPOSED FILES WHEN IT IS IN FORCE,
+    # and it requires a name of its own — the retained bus's network. In local
+    # mode it is not part of the project, so requiring its name would refuse a
+    # perfectly good clean machine.
+    if the_bus_is_external; then
+        files+=("${EXTERNAL_BUS_FILE}")
+    fi
     local present=()
     for f in "${files[@]}"; do [ -f "${f}" ] && present+=("${f}"); done
     # A comment is not a setting. These files explain themselves at length and
@@ -422,8 +601,17 @@ required_setting_names() {
 COMPOSE_RENDER_PROBLEM=""
 COMPOSE_SAID=""
 
+# EVERY COMPOSE COMMAND THIS SCRIPT MAKES, WITH THE FILES THE MODE IN FORCE
+# REALLY HAS. An explicit '-f' wins over COMPOSE_FILE (checked on Compose
+# v5.2.0), and this names its files explicitly so that it reads the same bundle
+# wherever it is run from — so in external mode it has to add the overlay
+# itself, or it would render a project with a bus in it that is not there.
 dc() {
-    docker compose --env-file "${ENV_FILE}" -f "${HERE}/compose.yaml" \
+    local files=(-f "${HERE}/compose.yaml")
+    if the_bus_is_external; then
+        files+=(-f "${EXTERNAL_BUS_FILE}")
+    fi
+    docker compose --env-file "${ENV_FILE}" "${files[@]}" \
         ${PROJECT:+--project-name "${PROJECT}"} "$@"
 }
 
@@ -474,15 +662,35 @@ volume_names_of() {
 container_of() { dc ps -q "$1" 2>/dev/null | head -1; }
 
 check_services() {
-    printf 'estate-check services — the estate, after it has started (env file: %s)\n\n' "${ENV_FILE}"
+    printf 'estate-check services — the estate, after it has started (env file: %s, %s bus mode)\n\n' "${ENV_FILE}" "${BUS_MODE_IN_FORCE}"
+    run_the_services_items full
+    finish
+}
 
+# ---------------------------------------------------------------------------
+# THE SERVICE ITEMS, IN ONE PLACE, ASKED BY TWO MODES.
+#
+#   full          every item, including the two that ask a producer
+#   closed-door   the same estate with the two producers deliberately STOPPED:
+#                 the producer items are not checked, and a producer that IS
+#                 running is the failure (26 September 2026, build item E2)
+#
+# One list of items and two readings of it, rather than two lists that can
+# drift apart.
+# ---------------------------------------------------------------------------
+run_the_services_items() {
+    local phase="$1"
     local coordinator answer bus
     # THE ONE RENDER THAT DECIDES WHETHER THERE IS ANYTHING TO ASK, made in
     # this shell so that its reason survives (see compose_says above).
     compose_says ps -q coordinator
     coordinator="$(printf '%s' "${COMPOSE_SAID}" | head -1)"
     answer="$(container_of answer-service)"
-    bus="$(container_of nats)"
+    # In external bus mode the bus is not a service of this project, so there is
+    # no container of ours to find and none is looked for. Every question to the
+    # bus then goes by address, from inside the estate.
+    bus=""
+    the_bus_is_external || bus="$(container_of nats)"
 
     # THE BUNDLE ITSELF WOULD NOT RENDER. Nothing below could have found a
     # container, so say that once, plainly, instead of reporting five services
@@ -492,17 +700,35 @@ check_services() {
         printf '  This estate could not be read at all: %s\n\n' "${COMPOSE_RENDER_PROBLEM}"
         for row in "${ITEMS[@]}"; do
             IFS='|' read -r m n name sentence <<< "${row}"
-            [ "${m}" = "services" ] || continue
+            case "${m}" in
+                services) ;;
+                pre-resume) [ "${phase}" = "closed-door" ] || continue ;;
+                *) continue ;;
+            esac
             unchecked "${n}" "the estate bundle would not render here, so nothing could be asked of it. This is a problem with the files or the env file, not with any service."
         done
-        finish
+        return 1
+    fi
+
+    # --- 10 ----------------------------------------------------------------
+    # THE CLOSED DOOR ITSELF, and only in the closed-door mode.
+    if [ "${phase}" = "closed-door" ]; then
+        check_the_producers_are_stopped "${coordinator}"
     fi
 
     # --- 8 -----------------------------------------------------------------
-    local bus_host bus_url
+    local bus_url address
     bus_url="$(get FORGE_NATS_URL)"
-    bus_host="$(printf '%s' "${bus_url}" | sed -E 's#^[a-z]+://##; s#^[^@]*@##; s#[:/].*$##')"
-    if [ -z "${bus}" ]; then
+    address="$(the_buss_monitoring_address)"
+    if the_bus_is_external; then
+        if [ -z "${coordinator}" ]; then
+            fail 8 "the bus is not this project's — it is the one that was already running — so it is asked at ${address} from inside the estate, and the coordinator is not running to ask from."
+        elif ask_the_bus_from "${coordinator}" healthz >/dev/null 2>&1; then
+            ok 8 "the bus answers its monitoring health route at ${address}, asked from inside the coordinator (this estate did not start that bus and holds no container of it; the estate reaches it for work at $(redact "${bus_url}"), which item 8e proves separately through the coordinator's live subscription)."
+        else
+            fail 8 "the bus does not answer its monitoring health route at ${address}, asked from inside the coordinator. In external bus mode that usually means BUS_EXTERNAL_NETWORK does not name the network that bus is really on, or BUS_MONITORING_ADDRESS does not name it on that network."
+        fi
+    elif [ -z "${bus}" ]; then
         fail 8 "the bus is not running in this estate, so nothing could ask it anything."
     elif docker exec "${bus}" wget --spider -q "http://localhost:8222/healthz" >/dev/null 2>&1; then
         ok 8 "the bus answers its own health route inside its container (what was asked: localhost:8222/healthz there; the estate reaches it at $(redact "${bus_url}"), which item 8e proves separately through the coordinator's live subscription)."
@@ -565,13 +791,23 @@ check_services() {
     fi
 
     # --- 8h / 8i -----------------------------------------------------------
-    check_the_front_door
-    check_the_bus_gateway "${bus}"
+    #
+    # THE TWO PRODUCER ITEMS. In the ordinary mode a stopped front door is the
+    # failure. In the closed-door mode a RUNNING one is the failure, and item 10
+    # above is what says so — so these two are not asked here at all, and are
+    # never reported as passed. The same fact, read opposite ways, which is why
+    # one reading cannot serve both.
+    if [ "${phase}" = "closed-door" ]; then
+        not_checked_on_purpose 8h "this item asks a producer, and the producers are deliberately stopped; it is checked after the door opens, by the full 'estate-check services'."
+        not_checked_on_purpose 8i "this item asks a producer, and the producers are deliberately stopped; it is checked after the door opens, by the full 'estate-check services'."
+    else
+        check_the_front_door
+        check_the_bus_gateway "${bus}" "${coordinator}"
+    fi
 
     # --- 9 -----------------------------------------------------------------
     check_from_inside_a_sandbox
-
-    finish
+    return 0
 }
 
 # THE SLACK FRONT DOOR. Where Rich approves a spec, taps a build gate and says
@@ -664,23 +900,38 @@ except Exception as why:
 # inside the bus's own container. Account names are printed; no password is
 # read, and none is printable this way.
 check_the_bus_gateway() {
-    local bus="$1" account seen
+    local bus="$1" coordinator="${2:-}" account seen answer asked_at
     account="$(get JARVIS_NATS_USER)"
-    if [ -z "${bus}" ]; then
-        fail 8i "the bus is not running in this estate, so it could not be asked who is connected to it."
-        return
-    fi
     if [ -z "${account}" ]; then
         unchecked 8i "the env file names no bus account for the front door (JARVIS_NATS_USER), so the bus could not be asked whether that account is connected."
         return
     fi
     # The bus pretty-prints this answer and calls the field 'authorized_user',
     # so the spaces and newlines come out before the field is looked for.
-    # Asked, then read, in two steps rather than one long pipeline: the bus
-    # pretty-prints this answer, so the spaces and newlines come out before the
-    # field is looked for, and the field it calls this is 'authorized_user'.
-    local answer
-    answer="$(docker exec "${bus}" wget -qO- "http://localhost:8222/connz?auth=1" 2>/dev/null)"
+    #
+    # WHERE IT IS ASKED FROM depends on whose bus it is. Our own bus is stepped
+    # into; a bus that is already running and belongs to somebody else is asked
+    # BY ADDRESS from inside the coordinator, because this project holds no
+    # container of it and that route is not published outside the estate.
+    if the_bus_is_external; then
+        asked_at="$(the_buss_monitoring_address)"
+        if [ -z "${coordinator}" ]; then
+            fail 8i "the bus is not this project's, so it is asked at ${asked_at} from inside the estate, and the coordinator is not running to ask from."
+            return
+        fi
+        answer="$(ask_the_bus_from "${coordinator}" 'connz?auth=1')"
+        if [ -z "${answer}" ]; then
+            fail 8i "the bus did not answer connz at ${asked_at}, asked from inside the coordinator, so who is connected to it could not be read at all."
+            return
+        fi
+    else
+        asked_at="its own container (localhost:8222)"
+        if [ -z "${bus}" ]; then
+            fail 8i "the bus is not running in this estate, so it could not be asked who is connected to it."
+            return
+        fi
+        answer="$(docker exec "${bus}" wget -qO- "http://localhost:8222/connz?auth=1" 2>/dev/null)"
+    fi
     seen="$(printf '%s' "${answer}" | tr -d ' \n' | /bin/grep -o "\"authorized_user\":\"${account}\"" | wc -l)"
     if [ "${seen:-0}" -gt 0 ]; then
         ok 8i "the bus itself reports ${seen} live connection(s) from the '${account}' account, which is the bus gateway holding the bus open — asked of the bus, not of the gateway, because the gateway publishes nothing and answers nobody. No password was read and none is printable this way."
@@ -793,26 +1044,41 @@ check_bus_storage() {
     image="$(get NATS_PROVISION_IMAGE)"
     volume="$(get BUS_SOURCE_VOLUME)"
     coordinator="$(container_of coordinator)"
-    [ -n "${coordinator}" ] || coordinator="$(container_of nats)"
+    the_bus_is_external || [ -n "${coordinator}" ] || coordinator="$(container_of nats)"
     if [ -z "${image}" ] || [ -z "${volume}" ] || [ -z "${coordinator}" ]; then
         unchecked 8b "the estate is not running, or the env file names no provisioning image, so the bus could not be asked what it holds."
         return
     fi
-    network="$(docker inspect "${coordinator}" --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{"\n"}}{{end}}' 2>/dev/null | grep -- '_factory$\|^factory$' | head -1)"
-    if [ -z "${network}" ]; then
-        unchecked 8b "the factory network could not be identified, so the bus could not be asked what it holds."
-        return
+    # WHICH NETWORK THE QUESTION IS ASKED ON. In external bus mode the retained
+    # bus is not on any network of this project's making, so the network comes
+    # from the env file — the same name the overlay joins — rather than from the
+    # coordinator's own networks. In local mode nothing changes.
+    if the_bus_is_external; then
+        network="$(get BUS_EXTERNAL_NETWORK)"
+        if [ -z "${network}" ]; then
+            unchecked 8b "external bus mode is in force and BUS_EXTERNAL_NETWORK names no network, so there was nowhere to ask the retained bus from."
+            return
+        fi
+        if ! docker network inspect "${network}" >/dev/null 2>&1; then
+            unchecked 8b "external bus mode is in force and there is no docker network called '${network}' on this machine, so the retained bus could not be asked what it holds."
+            return
+        fi
+    else
+        network="$(docker inspect "${coordinator}" --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{"\n"}}{{end}}' 2>/dev/null | grep -- '_factory$\|^factory$' | head -1)"
+        if [ -z "${network}" ]; then
+            unchecked 8b "the factory network could not be identified, so the bus could not be asked what it holds."
+            return
+        fi
     fi
     local address out
-    # The plain service name of the bus, from the address the one-shot uses.
-    address="$(get NATS_PROVISION_ADDRESS)"
-    address="$(printf '%s' "${address}" | sed -E 's#^[a-z]+://##; s#^[^@]*@##; s#[:/].*$##')"
-    [ -n "${address}" ] || address="nats"
+    # The bus's monitoring address — a name and a port, and no credential,
+    # because that route takes none. The same address in both modes.
+    address="$(the_buss_monitoring_address)"
     out="$(docker run --rm --network "${network}" \
             -e "BUS=${address}" \
             -v "${volume}:/bus:ro" "${image}" '
         set -euo pipefail
-        held="$(curl -sf "http://$BUS:8222/jsz?accounts=true&streams=true" \
+        held="$(curl -sf "http://$BUS/jsz?accounts=true&streams=true" \
                 | jq -r ".account_details[]? | .stream_detail[]?.name")"
         missing=""
         for want in $(jq -r ".streams[].name" /bus/streams/stream-definitions.json); do
@@ -883,7 +1149,354 @@ check_from_inside_a_sandbox() {
     fi
 }
 
+# ---------------------------------------------------------------------------
+# WHICH NETWORK A QUESTION TO THE BUS IS ASKED ON. In local mode the estate's
+# own factory network, found from the coordinator. In external mode the
+# retained bus's network, named in the env file — because the retained bus is
+# not on a network of this project's making.
+# ---------------------------------------------------------------------------
+the_buss_network() {
+    local coordinator
+    if the_bus_is_external; then
+        get BUS_EXTERNAL_NETWORK
+        return
+    fi
+    coordinator="$(container_of coordinator)"
+    [ -n "${coordinator}" ] || coordinator="$(container_of nats)"
+    [ -n "${coordinator}" ] || return 1
+    docker inspect "${coordinator}" \
+        --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{"\n"}}{{end}}' 2>/dev/null \
+        | grep -- '_factory$\|^factory$' | head -1
+}
+
+# ---------------------------------------------------------------------------
+# ITEM 10 — ARE THE TWO THINGS THAT CAN BRING WORK IN REALLY STOPPED?
+# (26 September 2026, build item E2.)
+#
+# THIS IS THE INVERSION THAT MATTERS. Everywhere else in this script a stopped
+# front door is the failure. Here a RUNNING one is, and it is named. The rollout
+# has a phase where the door is deliberately shut and everything that can be
+# checked with it shut is checked — and a check that could not tell the
+# difference between "shut on purpose" and "broken" would be no use in it.
+#
+# FOUR QUESTIONS, and an unknown is never read as a nought:
+#
+#   * no front-door container in this estate;
+#   * no bus-gateway container in this estate;
+#   * the legacy host units inactive, IF they are on this machine at all. They
+#     are read with 'systemctl show', which only reads;
+#   * nothing waiting and nothing unconfirmed on the bus's two durable readers.
+#     Read from the bus's own monitoring route, which takes no credential. If
+#     that route cannot be read this item FAILS: "could not be read" is not
+#     "nought", and the whole point of the phase is that nothing is in flight.
+# ---------------------------------------------------------------------------
+check_the_producers_are_stopped() {
+    local coordinator="$1" trouble="" said="" door gateway
+    door="$(container_of front-door)"
+    gateway="$(container_of bus-gateway)"
+    if [ -n "${door}" ]; then
+        trouble="${trouble} the front-door container is RUNNING (${door});"
+    else
+        said="${said} no front-door container;"
+    fi
+    if [ -n "${gateway}" ]; then
+        trouble="${trouble} the bus-gateway container is RUNNING (${gateway});"
+    else
+        said="${said} no bus-gateway container;"
+    fi
+
+    # THE LEGACY HOST UNITS, read-only. A unit that is not on this machine is
+    # not a failure — a cloud machine has never had them — and it is said so
+    # rather than counted as stopped.
+    local units unit state
+    units="$(get ROLLOUT_LEGACY_PRODUCER_UNITS)"
+    if [ -z "${units}" ]; then
+        said="${said} the env file names no legacy producer units, so none were looked for;"
+    elif ! command -v systemctl >/dev/null 2>&1; then
+        said="${said} this machine has no systemctl, so the legacy units were not looked for;"
+    else
+        for unit in ${units}; do
+            state="$(systemctl --user show -p ActiveState --value "${unit}" 2>/dev/null)"
+            case "${state}" in
+                ""|inactive|failed) said="${said} ${unit} is ${state:-not on this machine};" ;;
+                *)                  trouble="${trouble} the legacy unit ${unit} is ${state};" ;;
+            esac
+        done
+    fi
+
+    # THE TWO WAITING COUNTS, off the bus's own monitoring route.
+    local stream consumers network image counts
+    stream="$(get ROLLOUT_BUS_STREAM)"
+    consumers="$(get ROLLOUT_BUS_CONSUMERS)"
+    image="$(get NATS_PROVISION_IMAGE)"
+    network="$(the_buss_network)"
+    if [ -z "${stream}" ] || [ -z "${consumers}" ]; then
+        trouble="${trouble} the env file does not say which stream and which durable readers to read the waiting counts from (ROLLOUT_BUS_STREAM, ROLLOUT_BUS_CONSUMERS), so nothing was read and nothing may be assumed;"
+    elif [ -z "${image}" ] || [ -z "${network}" ]; then
+        trouble="${trouble} the bus could not be asked for its waiting counts (no provisioning image named, or the bus's network could not be identified), and an unknown is not a nought;"
+    else
+        counts="$(docker run --rm --network "${network}" \
+                    -e "BUS=$(the_buss_monitoring_address)" \
+                    -e "STREAM=${stream}" \
+                    -e "WANTED=${consumers}" \
+                    "${image}" '
+            set -euo pipefail
+            answer="$(curl -sf --max-time 8 "http://$BUS/jsz?accounts=true&streams=true&consumers=true")" || {
+                printf "UNREADABLE the bus did not answer its monitoring route at %s\n" "$BUS"; exit 0; }
+            trouble=""
+            for want in $WANTED; do
+                row="$(printf "%s" "$answer" | jq -r --arg s "$STREAM" --arg c "$want" "
+                    [ .account_details[]?.stream_detail[]?
+                      | select(.name == \$s)
+                      | .consumer_detail[]?
+                      | select(.name == \$c)
+                      | \"\\(.num_pending) \\(.num_ack_pending)\" ] | first // \"absent\"")"
+                case "$row" in
+                    absent) trouble="$trouble $want:not-on-the-bus" ;;
+                    "0 0")  ;;
+                    *)      trouble="$trouble $want:waiting-and-unconfirmed($row)" ;;
+                esac
+            done
+            if [ -n "$trouble" ]; then printf "WAITING%s\n" "$trouble"; else printf "QUIET\n"; fi
+        ' 2>&1 | tail -1)"
+        case "${counts}" in
+            QUIET)      said="${said} nothing waiting and nothing unconfirmed on ${consumers} (stream ${stream});" ;;
+            WAITING*)   trouble="${trouble} the bus still holds work for:${counts#WAITING};" ;;
+            *)          trouble="${trouble} the bus's waiting counts could not be read (${counts}), and an unknown is not a nought;" ;;
+        esac
+    fi
+
+    if [ -n "${trouble}" ]; then
+        fail 10 "the door is not shut:${trouble} The closed-door check is for a phase where nothing can bring work in, so a running producer or unread waiting counts refuse it, and no record of this phase is written."
+    else
+        ok 10 "the two things that can bring work in are stopped and the bus is quiet —${said} so everything below was asked of an estate nothing can arrive at."
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# THE CLOSED-DOOR CHECK, AND THE RECORD IT LEAVES (build item E2).
+#
+# WHY A RECORD AT ALL. The rollout's resume step is the point of no return, and
+# it must not be taken on an exit code somebody saw an hour ago on a different
+# estate. So this writes down WHAT was checked, on WHICH estate, against WHICH
+# image, and WHEN — and '--read-pre-resume' is what says whether that record may
+# be acted on now.
+#
+# THREE VERDICTS, and only one of them may be acted on:
+#
+#   passed                          every item asked something and passed, and
+#                                   the only items not checked are the two that
+#                                   ask a producer
+#   passed-with-items-not-checked   nothing failed, but an item could not be
+#                                   asked on this machine — item 9 with no
+#                                   sandbox is the one that happens. The record
+#                                   is written, the run is NOT PASSED, and
+#                                   '--read-pre-resume' REFUSES it. An unknown
+#                                   stays an unknown all the way through
+#   (nothing)                       something failed. NO record is written, and
+#                                   any record already there is INVALIDATED —
+#                                   renamed out of the way — because a later
+#                                   failed check must never leave an earlier
+#                                   success sitting where the resume step reads
+# ---------------------------------------------------------------------------
+check_pre_resume() {
+    printf 'estate-check --pre-resume — the CLOSED-DOOR check (env file: %s, %s bus mode)\n' "${ENV_FILE}" "${BUS_MODE_IN_FORCE}"
+    printf 'The two things that can bring work in must be STOPPED for this one. A running producer is the failure here.\n\n'
+
+    local state_dir receipt
+    state_dir="$(get ROLLOUT_STATE_DIR)"
+    if [ -z "${state_dir}" ]; then
+        printf 'estate-check: the env file names no ROLLOUT_STATE_DIR, and the closed-door phase has to be written down somewhere the resume step can read it.\n' >&2
+        exit 2
+    fi
+    receipt="${state_dir}/pre-resume.json"
+
+    run_the_services_items closed-door
+
+    # --- what this run is about, so the record names it --------------------
+    local coordinator project image_id image_named started_at now verdict
+    coordinator="$(container_of coordinator)"
+    project="$(docker inspect "${coordinator}" --format '{{index .Config.Labels "com.docker.compose.project"}}' 2>/dev/null)"
+    image_id="$(docker inspect "${coordinator}" --format '{{.Image}}' 2>/dev/null)"
+    started_at="$(docker inspect "${coordinator}" --format '{{.State.StartedAt}}' 2>/dev/null)"
+    image_named="$(get FORGE_IMAGE)"
+    now="$(date -u +%s)"
+
+    printf '\n'
+    if [ "${FAILURES}" -gt 0 ]; then
+        if [ -e "${receipt}" ]; then
+            mv -f "${receipt}" "${receipt}.invalidated" 2>/dev/null \
+                && printf 'The record that was here has been INVALIDATED (moved to %s.invalidated): a check that has just failed must never leave an earlier pass where the resume step reads.\n' "${receipt}"
+        fi
+        printf 'NOT PASSED — %s items passed, %s failed, %s could not be checked. NO closed-door record has been written, so the resume step has nothing to act on.\n' \
+            "${PASSES}" "${FAILURES}" "${UNCHECKED}"
+        exit 1
+    fi
+
+    if [ "${UNCHECKED}" -gt 0 ]; then
+        verdict="passed-with-items-not-checked"
+    else
+        verdict="passed"
+    fi
+
+    mkdir -p "${state_dir}" || {
+        printf 'estate-check: could not make %s, and the closed-door phase has to be written down.\n' "${state_dir}" >&2
+        exit 2
+    }
+
+    {
+        printf '{\n'
+        printf '  "what_this_is": "the closed-door check of a rollout: the estate up, the producers deliberately stopped, everything that can be checked with the door shut checked",\n'
+        printf '  "written_at": "%s",\n'            "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        printf '  "written_at_epoch": %s,\n'        "${now}"
+        printf '  "verdict": "%s",\n'               "${verdict}"
+        printf '  "bus_mode": "%s",\n'              "${BUS_MODE_IN_FORCE}"
+        printf '  "compose_project": "%s",\n'       "${project}"
+        printf '  "coordinator_image_id": "%s",\n'  "${image_id}"
+        printf '  "coordinator_image_named": "%s",\n' "${image_named}"
+        printf '  "release_version": "%s",\n'       "${image_named##*:}"
+        printf '  "coordinator_started_at": "%s",\n' "${started_at}"
+        printf '  "the_bus": {"monitoring_address": "%s", "network": "%s"},\n' \
+               "$(the_buss_monitoring_address)" "$(the_buss_network)"
+        printf '  "items": [\n'
+        local first=1 row number vd sentence
+        for row in "${RESULTS[@]}"; do
+            IFS='|' read -r number vd sentence <<< "${row}"
+            [ "${first}" -eq 1 ] || printf ',\n'
+            first=0
+            printf '    {"item": "%s", "verdict": "%s", "said": "%s"}' \
+                "${number}" "${vd}" "$(printf '%s' "${sentence}" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+        done
+        printf '\n  ]\n}\n'
+    } > "${receipt}" || {
+        printf 'estate-check: could not write %s.\n' "${receipt}" >&2
+        exit 2
+    }
+
+    printf 'The closed-door phase is written down at %s — this estate (%s), this coordinator image (%s), at %s.\n' \
+        "${receipt}" "${project:-unnamed}" "${image_id:-unreadable}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    if [ "${verdict}" = "passed" ]; then
+        printf 'PASSED — %s items asked something and passed; the %s producer items are not checked in this mode and are recorded as such, never as passed.\n' \
+            "${PASSES}" "${DELIBERATE}"
+        exit 0
+    fi
+    printf 'NOT PASSED — %s items passed and %s could not be checked on this machine. The record says so item by item, and "estate-check --read-pre-resume" REFUSES it: an unknown is not a pass, and the resume step is the point of no return.\n' \
+        "${PASSES}" "${UNCHECKED}"
+    exit 1
+}
+
+# ---------------------------------------------------------------------------
+# READING THE CLOSED-DOOR RECORD BACK, which is the only way it may be used.
+#
+# FIVE REASONS TO REFUSE, and each is said by name:
+#
+#   * there is no record, or it cannot be read;
+#   * it is not a pass — including a pass with something not checked;
+#   * it belongs to a different estate (a different compose project);
+#   * it names a different coordinator image than the one running now;
+#   * it is older than the coordinator's own start, or older than the age the
+#     env file allows. A pass from before the estate started says nothing about
+#     the estate that is running.
+# ---------------------------------------------------------------------------
+_read_the_record() {   # <file> — prints shell assignments, one per line
+    local file="$1" program
+    program='
+      "R_VERDICT=" + (.verdict // "") ,
+      "R_PROJECT=" + (.compose_project // "") ,
+      "R_IMAGE=" + (.coordinator_image_id // "") ,
+      "R_BUS_MODE=" + (.bus_mode // "") ,
+      "R_EPOCH=" + ((.written_at_epoch // 0) | tostring) ,
+      "R_WRITTEN=" + (.written_at // "") ,
+      "R_NOT_CHECKED=" + ([.items[]? | select(.verdict == "not-checked") | .item] | join(" "))
+    '
+    if command -v jq >/dev/null 2>&1; then
+        jq -r "${program}" < "${file}" 2>/dev/null
+        return
+    fi
+    # NO jq ON THIS MACHINE. The estate already reads the bus's JSON with the
+    # provisioning image rather than asking a machine to carry a tool, and this
+    # does the same rather than parsing JSON with a regular expression.
+    local image
+    image="$(get NATS_PROVISION_IMAGE)"
+    [ -n "${image}" ] || return 1
+    docker run --rm -i --entrypoint jq "${image}" -r "${program}" < "${file}" 2>/dev/null
+}
+
+check_read_pre_resume() {
+    local state_dir receipt
+    state_dir="$(get ROLLOUT_STATE_DIR)"
+    receipt="${state_dir}/pre-resume.json"
+    printf 'estate-check --read-pre-resume — may the closed-door record at %s be acted on?\n\n' "${receipt}"
+
+    if [ -z "${state_dir}" ]; then
+        printf 'REFUSED — the env file names no ROLLOUT_STATE_DIR, so there is nowhere a closed-door record could be.\n'
+        exit 1
+    fi
+    if [ ! -f "${receipt}" ]; then
+        printf 'REFUSED — there is no closed-door record at %s. Run "estate-check --pre-resume" with the producers stopped.\n' "${receipt}"
+        exit 1
+    fi
+
+    local R_VERDICT="" R_PROJECT="" R_IMAGE="" R_BUS_MODE="" R_EPOCH=0 R_WRITTEN="" R_NOT_CHECKED=""
+    local key val
+    while IFS='=' read -r key val; do
+        case "${key}" in
+            R_VERDICT|R_PROJECT|R_IMAGE|R_BUS_MODE|R_EPOCH|R_WRITTEN|R_NOT_CHECKED)
+                printf -v "${key}" '%s' "${val}" ;;
+        esac
+    done < <(_read_the_record "${receipt}")
+    case "${R_EPOCH}" in ''|*[!0-9]*) R_EPOCH=0 ;; esac
+
+    if [ -z "${R_VERDICT}" ]; then
+        printf 'REFUSED — the closed-door record at %s could not be read as the record it should be. It is JSON; this machine has no jq and the provisioning image could not read it either.\n' "${receipt}"
+        exit 1
+    fi
+
+    local coordinator project image_id started_epoch now age max_age trouble=""
+    coordinator="$(container_of coordinator)"
+    project="$(docker inspect "${coordinator}" --format '{{index .Config.Labels "com.docker.compose.project"}}' 2>/dev/null)"
+    image_id="$(docker inspect "${coordinator}" --format '{{.Image}}' 2>/dev/null)"
+    started_epoch="$(docker inspect "${coordinator}" --format '{{.State.StartedAt}}' 2>/dev/null)"
+    started_epoch="$(date -u -d "${started_epoch}" +%s 2>/dev/null || printf '0')"
+    now="$(date -u +%s)"
+    age=$(( now - R_EPOCH ))
+    max_age="$(get ROLLOUT_PRE_RESUME_MAX_AGE_S)"
+    [ -n "${max_age}" ] || max_age=3600
+
+    case "${R_VERDICT}" in
+        passed) ;;
+        passed-with-items-not-checked)
+            trouble="${trouble} it is not a pass: these items could not be checked when it was written: ${R_NOT_CHECKED:-unnamed}. An unknown is not a pass;" ;;
+        *)
+            trouble="${trouble} its verdict is '${R_VERDICT}', and only 'passed' may be acted on;" ;;
+    esac
+    if [ -z "${coordinator}" ]; then
+        trouble="${trouble} the coordinator is not running here, so there is no estate to check this record against;"
+    else
+        [ "${R_PROJECT}" = "${project}" ] || trouble="${trouble} it was written for the estate '${R_PROJECT}' and this one is '${project}';"
+        [ "${R_IMAGE}" = "${image_id}" ]  || trouble="${trouble} it names the coordinator image ${R_IMAGE:-none} and this estate is running ${image_id:-unreadable};"
+        if [ "${started_epoch}" -gt 0 ] && [ "${R_EPOCH}" -le "${started_epoch}" ]; then
+            trouble="${trouble} it was written at ${R_WRITTEN}, before or when this coordinator started, so it says nothing about the estate that is running now;"
+        fi
+    fi
+    [ "${R_BUS_MODE}" = "${BUS_MODE_IN_FORCE}" ] || trouble="${trouble} it was written in ${R_BUS_MODE:-an unrecorded} bus mode and this estate is in ${BUS_MODE_IN_FORCE} bus mode;"
+    if [ "${age}" -gt "${max_age}" ]; then
+        trouble="${trouble} it is ${age} seconds old and this env file allows ${max_age};"
+    fi
+
+    if [ -n "${trouble}" ]; then
+        printf 'REFUSED —%s\n' "${trouble}"
+        printf '\nA closed-door record is a statement about ONE estate, ONE image and ONE moment. Run "estate-check --pre-resume" again on the estate that is running.\n'
+        exit 1
+    fi
+    printf 'MAY BE ACTED ON — written %s (%s seconds ago, and this env file allows %s), for this estate (%s), this coordinator image (%s), in %s bus mode, and every item it names passed.\n' \
+        "${R_WRITTEN}" "${age}" "${max_age}" "${project}" "${image_id}" "${R_BUS_MODE}"
+    exit 0
+}
+
 case "${MODE}" in
-    host)     check_host ;;
-    services) check_services ;;
+    host)            check_host ;;
+    services)        check_services ;;
+    pre-resume)      check_pre_resume ;;
+    read-pre-resume) check_read_pre_resume ;;
 esac

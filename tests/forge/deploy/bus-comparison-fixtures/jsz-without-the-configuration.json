@@ -1,0 +1,29 @@
+{
+  "server_id": "a-made-up-bus",
+  "streams": 3,
+  "account_details": [
+    {
+      "name": "AN-ACCOUNT",
+      "stream_detail": [
+        {
+          "name": "A-STREAM",
+          "state": {
+            "messages": 0
+          }
+        },
+        {
+          "name": "ANOTHER-STREAM",
+          "state": {
+            "messages": 0
+          }
+        },
+        {
+          "name": "KV_a-bucket",
+          "state": {
+            "messages": 0
+          }
+        }
+      ]
+    }
+  ]
+}

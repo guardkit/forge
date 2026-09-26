@@ -1,0 +1,24 @@
+{
+  "streams": [
+    {
+      "name": "A-STREAM",
+      "subjects": ["a.>"],
+      "retention": "work",
+      "max_age": "7d",
+      "max_msgs": 10000,
+      "storage": "file",
+      "replicas": 1,
+      "description": "a made-up stream, in the shape the bus repository writes them"
+    },
+    {
+      "name": "ANOTHER-STREAM",
+      "subjects": ["another.>"],
+      "retention": "limits",
+      "max_age": "1h",
+      "max_msgs": 500,
+      "storage": "file",
+      "replicas": 1,
+      "description": "a second one, so a missing stream can be told from an empty bus"
+    }
+  ]
+}
