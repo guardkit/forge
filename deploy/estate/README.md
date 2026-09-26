@@ -509,6 +509,16 @@ ordinary `services` check cannot serve that phase: there, a stopped front door
 is the failure. Here a **running** one is, and it is named. The same fact, read
 opposite ways.
 
+**Run it from a shell that can reach the user's service manager.** The item that
+proves the legacy front-door units stopped asks both the user manager and the
+system manager, and a manager it cannot reach is *unknown*, which refuses — it
+is never read as "not on this machine" (that reading passed the closed door
+with both live units running, on 26 September 2026, when there was no session
+bus). So from `sudo`, a cron job, a unit, or a non-login `ssh` the check will
+refuse every time the env file names user units; run it from the operator's own
+login shell, or export `XDG_RUNTIME_DIR` and `DBUS_SESSION_BUS_ADDRESS` first.
+This is the check being honest, not the check being broken.
+
 **What it checks, in order:**
 
 1. **item 10 — the door really is shut.** No front-door container and no

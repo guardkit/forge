@@ -1098,10 +1098,16 @@ check_bus_storage() {
     address="$(the_buss_monitoring_address)"
     out="$(docker run --rm --network "${network}" \
             -e "BUS=${address}" \
+            -e "ACCOUNT=$(get BUS_STREAMS_ACCOUNT)" \
             -v "${volume}:/bus:ro" "${image}" '
         set -euo pipefail
+        # Within ONE account (the third E1/E2 review): a name held by some other
+        # account is not a stream of the coordinator account.
         held="$(curl -sf "http://$BUS/jsz?accounts=true&streams=true" \
-                | jq -r ".account_details[]? | .stream_detail[]?.name")"
+                | jq -r --arg a "${ACCOUNT:-}" "
+                    ([.account_details[]? | select(\$a == \"\" or .name == \$a) | select((.stream_detail // []) | length > 0)]) as \$c
+                    | if (\$c | length) == 1 then (\$c[0].stream_detail[]?.name) else (\"AMBIGUOUS-ACCOUNTS:\" + (\$c | map(.name) | join(\",\"))) end")"
+        case "$held" in AMBIGUOUS-ACCOUNTS:*) printf "%s\n" "$held"; exit 0 ;; esac
         missing=""
         for want in $(jq -r ".streams[].name" /bus/streams/stream-definitions.json); do
             printf "%s\n" "$held" | grep -qx "$want" || missing="$missing stream:$want"
@@ -1294,14 +1300,29 @@ check_the_producers_are_stopped() {
                     -e "BUS=$(the_buss_monitoring_address)" \
                     -e "STREAM=${stream}" \
                     -e "WANTED=${consumers}" \
+                    -e "ACCOUNT=$(get BUS_STREAMS_ACCOUNT)" \
                     "${image}" '
             set -euo pipefail
             answer="$(curl -sf --max-time 8 "http://$BUS/jsz?accounts=true&streams=true&consumers=true")" || {
                 printf "UNREADABLE the bus did not answer its monitoring route at %s\n" "$BUS"; exit 0; }
+            # ONE ACCOUNT, CHOSEN, NEVER "THE FIRST THAT ANSWERED" (the third
+            # E1/E2 review, 26 September 2026: this read the first account
+            # holding a stream of that name and called the bus quiet while
+            # four messages waited on the same stream in another account).
+            # The account named in BUS_STREAMS_ACCOUNT if given; else the one
+            # account holding the stream; two or none is UNREADABLE.
+            holders="$(printf "%s" "$answer" | jq -r --arg s "$STREAM" --arg a "$ACCOUNT" "
+                [ .account_details[]? | select(any(.stream_detail[]?; .name == \$s))
+                  | select(\$a == \"\" or .name == \$a) | .name ] | join(\" \")")"
+            set -- $holders
+            if [ "$#" -ne 1 ]; then
+                printf "UNREADABLE %s account(s) on this bus hold a stream named %s (%s); one must be chosen, in BUS_STREAMS_ACCOUNT, before its waiting counts mean anything\n" "$#" "$STREAM" "${holders:-none}"; exit 0
+            fi
+            chosen="$1"
             trouble=""
             for want in $WANTED; do
-                row="$(printf "%s" "$answer" | jq -r --arg s "$STREAM" --arg c "$want" "
-                    [ .account_details[]?.stream_detail[]?
+                row="$(printf "%s" "$answer" | jq -r --arg acct "$chosen" --arg s "$STREAM" --arg c "$want" "
+                    [ .account_details[]? | select(.name == \$acct) | .stream_detail[]?
                       | select(.name == \$s)
                       | .consumer_detail[]?
                       | select(.name == \$c)
@@ -1312,10 +1333,10 @@ check_the_producers_are_stopped() {
                     *)      trouble="$trouble $want:waiting-and-unconfirmed($row)" ;;
                 esac
             done
-            if [ -n "$trouble" ]; then printf "WAITING%s\n" "$trouble"; else printf "QUIET\n"; fi
+            if [ -n "$trouble" ]; then printf "WAITING%s\n" "$trouble"; else printf "QUIET in account %s\n" "$chosen"; fi
         ' 2>&1 | tail -1)"
         case "${counts}" in
-            QUIET)      said="${said} nothing waiting and nothing unconfirmed on ${consumers} (stream ${stream});" ;;
+            QUIET*)     said="${said} nothing waiting and nothing unconfirmed on ${consumers} (stream ${stream}, ${counts#QUIET });" ;;
             WAITING*)   trouble="${trouble} the bus still holds work for:${counts#WAITING};" ;;
             *)          trouble="${trouble} the bus's waiting counts could not be read (${counts}), and an unknown is not a nought;" ;;
         esac
