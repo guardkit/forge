@@ -364,6 +364,20 @@ def _first_word(statement: str) -> str:
     return words[0].strip("(;").upper() if words else ""
 
 
+def _deny_transaction_control(action: int, *_args: object) -> int:
+    """SQLite's authorizer: deny BEGIN/COMMIT/ROLLBACK/END and savepoints.
+
+    Called by SQLite for every operation it is about to perform while a
+    migration's statement runs. It sees what the ENGINE parsed, not what a
+    text check guessed, so a transaction statement is denied however it was
+    spelled — behind a comment, behind a byte-order mark, in any case.
+    Everything else is allowed.
+    """
+    if action in (sqlite3.SQLITE_TRANSACTION, sqlite3.SQLITE_SAVEPOINT):
+        return sqlite3.SQLITE_DENY
+    return sqlite3.SQLITE_OK
+
+
 def _refuse_own_transaction(
     statements: list[str],
     filename: str,
@@ -512,7 +526,20 @@ def apply_at_boot(connection: sqlite3.Connection) -> int:
             for _version, filename, statements in batch:
                 for statement in statements:
                     try:
-                        connection.execute(statement)
+                        # THE ENGINE ITSELF REFUSES TRANSACTION CONTROL while a
+                        # migration's statement runs (Codex, 26 September 2026:
+                        # a byte-order mark before COMMIT slipped past the
+                        # textual guard, as a comment had the day before, and
+                        # SQLite committed the batch early). The guard above
+                        # is the friendly early sentence; this is the wall:
+                        # SQLite's own parser decides what is a transaction
+                        # statement, and its authorizer denies every one of
+                        # them, whatever bytes it was spelled with.
+                        connection.set_authorizer(_deny_transaction_control)
+                        try:
+                            connection.execute(statement)
+                        finally:
+                            connection.set_authorizer(None)
                     except sqlite3.Error as exc:
                         raise MigrationError(
                             f"failed to apply migration {filename!r} at "
