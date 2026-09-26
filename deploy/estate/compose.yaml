@@ -726,6 +726,20 @@ services:
       # name and password separately, so no address here ever holds one.
       JARVIS_NATS_URL: ${JARVIS_NATS_URL:?name the bus's address for jarvis in the env file, e.g. nats://nats:4222 - a service name, with no credential in it}
       JARVIS_NATS_USER: ${JARVIS_NATS_USER:?name the bus account jarvis connects as in the env file}
+      # AND UNDER WHAT NAME (26 September 2026, build item E3-j1).
+      #
+      # This service and the bus gateway are given the SAME account above,
+      # deliberately. So "the bus holds a connection from the jarvis account" is
+      # TRUE while the gateway is stopped and this one is running — and a health
+      # check built on the account alone would call a dead gateway healthy. The
+      # bus records the name a client sends for itself and reports it on its
+      # monitoring route, so the name is how the two are told apart. It is a
+      # label and not a credential: it admits nobody, and the bus prints it to
+      # anyone who may read that route.
+      #
+      # BOTH NAMES COME FROM ONE SETTING so they cannot drift apart, and so that
+      # two estates on one machine do not both call themselves the same thing.
+      JARVIS_NATS_CLIENT_NAME: front-door-${FACTORY_INSTANCE:-factory}
       # THE MODEL SEAT, an address outside this estate, and the key the client
       # library insists on having before it will be constructed at all.
       JARVIS_LLAMA_SWAP_BASE_URL: ${JARVIS_MODEL_SEAT_URL:?name the model seat's address for jarvis in the env file}
@@ -826,11 +840,42 @@ services:
     environment:
       JARVIS_NATS_URL: ${JARVIS_NATS_URL:?name the bus's address for jarvis in the env file, e.g. nats://nats:4222 - a service name, with no credential in it}
       JARVIS_NATS_USER: ${JARVIS_NATS_USER:?name the bus account jarvis connects as in the env file}
+      # ITS OWN NAME ON THE BUS (26 September 2026, build item E3-j1). The same
+      # setting the front door's name is built from, one word different, so the
+      # two can never end up the same. This is the name the gateway watch below
+      # looks for, and the account alone is not enough because the front door
+      # shares it.
+      JARVIS_NATS_CLIENT_NAME: bus-gateway-${FACTORY_INSTANCE:-factory}
       JARVIS_LLAMA_SWAP_BASE_URL: ${JARVIS_MODEL_SEAT_URL:?name the model seat's address for jarvis in the env file}
       OPENAI_API_KEY: ${JARVIS_MODEL_SEAT_KEY:?name the model seat's key in the env file - a local seat takes any value and the client library refuses to be built without one}
       JARVIS_SLACK_CHANNEL_ID: ${JARVIS_SLACK_CHANNEL_ID:?name the Slack channel the front door posts in, in the env file}
       JARVIS_SLACK_OPERATOR_USER_IDS: ${JARVIS_SLACK_OPERATOR_USER_IDS:?name the Slack member ids allowed to approve and merge, in the env file}
       JARVIS_LOG_LEVEL: ${JARVIS_LOG_LEVEL:-INFO}
+      # WHERE IT WRITES DOWN HOW SLACK IS (26 September 2026, build item E3-j2).
+      #
+      # The gateway holds TWO things open — this bus connection and a Slack
+      # Socket Mode websocket — and the second can die on its own: connected to
+      # the bus, subscribed, and answering nothing at all from Slack. Nothing
+      # outside the process could ask about that, because this service publishes
+      # no port and answers nobody on purpose. So it writes one small file, on
+      # every connect, disconnect, inbound envelope, session close and transport
+      # error, and the watch below reads it.
+      #
+      # A FILE AND NOT A ROUTE, deliberately: a route would mean this service
+      # listening on a port it has no other reason to open.
+      #
+      # The path is inside the image and the same on every machine; the volume
+      # below is mounted there. Nothing in it is secret — a state word and three
+      # times.
+      JARVIS_SLACK_HEARTBEAT_PATH: /var/lib/jarvis/slack-heartbeat.json
+    # ITS OWN SMALL VOLUME, which it writes and the watch mounts read-only. Not
+    # shared with the front door's: one writer per volume. A fresh volume is
+    # writable with no hand-over because the jarvis image creates
+    # /var/lib/jarvis owned by the user it runs as (jarvis images built 26
+    # September 2026 or later); an older image leaves it root-owned and the
+    # gateway then writes nothing, which the watch reports as unknown.
+    volumes:
+      - gateway-state:/var/lib/jarvis
     # The same three the front door gets, written out rather than referred to.
     secrets:
       - source: bus-jarvis-password
@@ -839,6 +884,155 @@ services:
         target: slack_bot_token
       - source: slack-app-token
         target: slack_app_token
+    networks:
+      - factory
+
+  # -------------------------------------------------------------------------
+  # THE GATEWAY WATCH — is the Slack door actually carrying traffic?
+  # (26 September 2026, rollout step 1, build item E3-e.)
+  #
+  # WHAT IT REPLACES. A host timer on the machine this estate is replacing fired
+  # every fifteen minutes, asked systemd whether the Slack gateway's user unit
+  # was active, and posted to Slack when it was not. The gateway is a container
+  # now, so that question has no answer — and after the rollout that unit is
+  # meant to be inactive for good, so the old alarm would have called a healthy
+  # factory dead every quarter of an hour. It is retired, and this is its named
+  # replacement.
+  #
+  # IT REPORTS THREE THINGS SEPARATELY and never one boolean: whether the
+  # gateway's OWN connection is on the bus (its account AND its client name AND
+  # its subscription — the account alone is shared with the front door), what the
+  # gateway says about its Slack session, and whether its container has gone
+  # silent. An unknown is reported as an unknown and never read as healthy.
+  #
+  # WHY IT IS A LOOP IN A CONTAINER AND NOT A HOST TIMER. A compose file has no
+  # timer of its own, so the fifteen minutes had to come from somewhere: the
+  # host's cron or a systemd timer calling 'docker compose run', or a container
+  # that loops. This is the container, because a host unit is exactly the
+  # machine-shaped thing this rollout exists to remove — the estate is meant to
+  # start the same way on a clean machine and in the cloud, and a cloud machine
+  # has nobody to install a timer. A machine that would rather use its own cron
+  # can: the one-shot form is 'docker compose --env-file .env --profile watch run
+  # --rm gateway-watch --once'. README.md says both.
+  #
+  # IT IS BEHIND A PROFILE, like the sandbox service. 'docker compose up' leaves
+  # it alone; a machine that wants the watch adds 'watch' to COMPOSE_PROFILES in
+  # the env file (not '--profile' on the command line, which REPLACES the env
+  # file's profiles). That is also what keeps a rollout window quiet: the profile
+  # is added after the estate is up and the door is open.
+  #
+  # WHAT IT IS GIVEN, AND WHAT THAT COSTS. Three things to read:
+  #   * the bus's monitoring route, which takes no credential;
+  #   * the gateway's heartbeat volume, READ-ONLY;
+  #   * the Docker socket, read-only, because reading a container's log means
+  #     asking the engine and there is no other way to ask. That is a real
+  #     privilege and it is named here rather than hidden. A machine that will not
+  #     grant it gets 'unknown' for that one component, never a false 'ok'.
+  #
+  # IT RESTARTS NOTHING, writes nothing to the bus, and the only secret it ever
+  # touches is the Slack token it posts its own alarm with — the retired alarm's
+  # own two setting names, unchanged, so Rich's alarms keep arriving where they
+  # always did and nothing new has to be configured.
+  # -------------------------------------------------------------------------
+  gateway-watch:
+    profiles: ["watch"]
+    image: ${NATS_PROVISION_IMAGE:?name the provisioning image in the env file - built by ./build-estate-images.sh}
+    restart: unless-stopped
+    depends_on:
+      # The same one bus dependency every other service has, so the watch does
+      # not ask a bus that is not answering yet and call the door lost.
+      bus-ready:
+        condition: service_completed_successfully
+    # THE SAME SHAPE THE OTHER SERVICES HAVE: a small wrapper that puts the one
+    # secret into the environment of the script's own PROCESS and nowhere else,
+    # so it is not in this container's declared environment where 'docker
+    # inspect' shows it to anybody who can reach the Docker daemon. The variable
+    # name is the RETIRED ALARM'S OWN (JARVIS_SLACK_BOT_TOKEN), unchanged, so
+    # nothing new has to be configured.
+    #
+    # A MISSING TOKEN IS NOT A REFUSAL TO START. The watch may be run with the
+    # stand-in notifier, which sends nothing and needs no token; and a watch that
+    # will not start is a watch that is not watching. It says so loudly, by name,
+    # at the moment it actually has something to send.
+    #
+    # Every '$$' is a dollar sign for the SHELL, escaped so compose leaves it
+    # alone. The last item is the shell's $0; the command below follows it and is
+    # what "$@" hands to the script — so 'docker compose run --rm gateway-watch
+    # --once' works as it reads.
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        set -eu
+        token_file=/run/secrets/slack_bot_token
+        if [ -s "$$token_file" ]; then
+            JARVIS_SLACK_BOT_TOKEN="$$(cat "$$token_file")"
+            export JARVIS_SLACK_BOT_TOKEN
+        fi
+        exec /usr/local/bin/gateway-watch.sh "$$@"
+      - the-estate-hands-the-watch-its-token-as-a-file
+    command: ["--every", "${GATEWAY_WATCH_INTERVAL_S:-900}"]
+    environment:
+      # WHERE THE BUS ANSWERS — the same plain monitoring address every other
+      # bus question in this bundle uses, in both bus modes, and never with a
+      # credential in it.
+      BUS_MONITORING_ADDRESS: ${BUS_MONITORING_ADDRESS:?name the bus's monitoring address in the env file, e.g. nats:8222 - a name and a port, with no credential in it}
+      # WHOSE CONNECTION IT IS LOOKING FOR — all three parts. The name is built
+      # from the same setting the gateway's own name is, in this one file, so the
+      # watch cannot end up looking for a name nothing sends.
+      JARVIS_NATS_USER: ${JARVIS_NATS_USER:?name the bus account jarvis connects as in the env file}
+      GATEWAY_WATCH_CLIENT_NAME: bus-gateway-${FACTORY_INSTANCE:-factory}
+      GATEWAY_WATCH_SUBJECT: ${GATEWAY_WATCH_SUBJECT:-agents.command.jarvis}
+      # THE GATEWAY'S HEARTBEAT, at the path the gateway writes it to, inside the
+      # volume mounted read-only below.
+      GATEWAY_WATCH_HEARTBEAT_PATH: /var/lib/jarvis/slack-heartbeat.json
+      # HOW OLD IS TOO OLD, for the heartbeat and for the container's log. Both
+      # default to six hours, and it is the retired alarm's own number for the
+      # retired alarm's own reason: a healthy IDLE door is not silent, and its
+      # Slack session rotates roughly every five hours and writes as it goes, so
+      # a window shorter than a full rotation turns a quiet Friday into an alarm.
+      GATEWAY_WATCH_HEARTBEAT_MAX_AGE_S: ${GATEWAY_WATCH_HEARTBEAT_MAX_AGE_S:-21600}
+      GATEWAY_WATCH_MAX_SILENCE_S: ${GATEWAY_WATCH_MAX_SILENCE_S:-21600}
+      # WHICH CONTAINER THE GATEWAY IS. Left empty, the watch finds it by its
+      # compose labels, taking the project from its own labels — so it finds the
+      # gateway of ITS estate and not of another on the same machine.
+      GATEWAY_WATCH_GATEWAY_SERVICE: bus-gateway
+      GATEWAY_WATCH_CONTAINER: ${GATEWAY_WATCH_CONTAINER:-}
+      GATEWAY_WATCH_DOCKER_SOCKET: /var/run/docker.sock
+      # WHO IT TELLS. 'slack' is the real notifier, with the retired alarm's own
+      # setting names. 'file' is the stand-in a rehearsal uses, which writes the
+      # message to a file and sends nothing: no rehearsal ever posts to the real
+      # workspace.
+      GATEWAY_WATCH_NOTIFIER: ${GATEWAY_WATCH_NOTIFIER:-slack}
+      GATEWAY_WATCH_NOTIFIER_FILE: ${GATEWAY_WATCH_NOTIFIER_FILE:-}
+      # The retired alarm's OWN two names, so nothing new is configured. They
+      # reach this container from the environment the compose command was run in,
+      # the same way every other Slack value does. A watch with no token says so
+      # loudly when it has something to send; it never fails quietly.
+      JARVIS_SLACK_CHANNEL_ID: ${JARVIS_SLACK_CHANNEL_ID:?name the Slack channel the front door posts in, in the env file}
+      JARVIS_WATCHDOG_ALERT_CHANNEL_ID: ${JARVIS_WATCHDOG_ALERT_CHANNEL_ID:-}
+      # Times are read and compared in UTC, so the container's own zone cannot
+      # make a fresh log line look six hours old.
+      TZ: UTC
+    secrets:
+      # THE ONLY SECRET IT TOUCHES. It reads it from the file to post its alarm
+      # with, and it is never in this container's declared environment. The
+      # script reads it from the variable the retired alarm used, which the
+      # entrypoint below fills from the file.
+      - source: slack-bot-token
+        target: slack_bot_token
+    volumes:
+      # THE GATEWAY'S HEARTBEAT, READ-ONLY. One writer, one reader.
+      - type: volume
+        source: gateway-state
+        target: /var/lib/jarvis
+        read_only: true
+      # THE ENGINE, READ-ONLY, only so a container's log can be read. Named
+      # plainly because it is the one real privilege in this service.
+      - type: bind
+        source: /var/run/docker.sock
+        target: /var/run/docker.sock
+        read_only: true
     networks:
       - factory
 
@@ -960,6 +1154,17 @@ volumes:
   # answered 404 for a thread its predecessor had. 'down -v' removes it, the
   # same as the bus's store and the relay's marker.
   front-door-state:
+
+  # THE BUS GATEWAY'S OWN STATE, with the gateway as its ONE writer and the
+  # gateway watch as its one reader, read-only (26 September 2026, build item
+  # E3-j2). One small file in it: how the gateway's Slack Socket Mode session is,
+  # and when it last said so.
+  #
+  # IT IS NOT IN THE ROLLOUT'S LIST OF STATE TO CARRY ACROSS, and that is by
+  # design: it starts empty and is written fresh on every start, so there is
+  # nothing in it a cutover has to move or could lose. 'down -v' removes it, the
+  # same as the bus's store.
+  gateway-state:
 
   # THE BUS'S OWN CONFIG AND PROVISIONING SCRIPTS, at the pinned commit.
   #

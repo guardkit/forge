@@ -1,0 +1,14 @@
+{
+  "server_id": "NDFIXTURE",
+  "now": "2026-09-26T16:00:00Z",
+  "num_connections": 1,
+  "connections": [
+    {
+      "cid": 11,
+      "authorized_user": "jarvis",
+      "name": "bus-gateway-factory",
+      "subscriptions": 1,
+      "subscriptions_list": ["_INBOX.gateway.*"]
+    }
+  ]
+}
