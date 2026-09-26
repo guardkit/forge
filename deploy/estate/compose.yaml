@@ -30,6 +30,31 @@
 # the things the host check checks is that the passwords have values. The last
 # two need no secret at all and are run from an ordinary shell.
 #
+# TWO BUS MODES (26 September 2026, build item E1). BUS_MODE in the env file
+# says which, and it is the only line that has to change:
+#
+#   local      this bundle starts its own bus and provisions its storage. The
+#              clean-machine and cloud path, and what every earlier proof used.
+#              The env file sets COMPOSE_PROFILES=local-bus
+#   external   the bus is ALREADY RUNNING and belongs to somebody else. This
+#              bundle starts no bus and provisions nothing: it joins the bus's
+#              network as one that already exists and READS the bus's own
+#              configuration to check it against the pinned definitions. The env
+#              file sets COMPOSE_FILE=compose.yaml:compose.external-bus.yaml and
+#              leaves COMPOSE_PROFILES empty
+#
+# README.md says when each is used and what external mode deliberately does not
+# do. 'estate-check host' refuses when BUS_MODE and those two settings disagree.
+#
+# A MACHINE THAT LOOKS AFTER A SANDBOX ADDS IT TO THE PROFILES LINE —
+# COMPOSE_PROFILES=local-bus,sandbox — and does NOT pass '--profile sandbox' on
+# the command line. Checked on this machine's Compose (v5.2.0): '--profile' on
+# the command line REPLACES the env file's profiles rather than adding to them,
+# so '--profile sandbox' in local mode takes the bus and the provisioner out of
+# the project. It fails loudly rather than quietly — the project will not render
+# at all, because 'bus-ready' below then names a service that is not there — but
+# the line to change is the env file's.
+#
 # TAKE IT DOWN:  docker compose --env-file .env down      # keeps the volumes
 #                docker compose --env-file .env down -v   # and removes them
 # ---------------------------------------------------------------------------
@@ -75,8 +100,17 @@ services:
   # A missing value still fails loudly, in two places: compose refuses to start
   # a service whose secret names an environment variable nothing set, and the
   # wrapper refuses an empty file by name.
+  #
+  # IT IS BEHIND A PROFILE (26 September 2026, build item E1), because an estate
+  # started against a bus that is already running must not start a second one. A
+  # service behind a profile that is not asked for is NOT IN THE PROJECT AT ALL:
+  # not started by 'up', not restarted by 'restart', not brought back by a second
+  # 'up'. That is real exclusion, and it is the same mechanism the sandbox
+  # service at the foot of this file already uses. Local mode asks for the
+  # profile; external mode does not.
   # -------------------------------------------------------------------------
   nats:
+    profiles: ["local-bus"]
     image: ${NATS_IMAGE:?name the bus image in the env file, e.g. NATS_IMAGE=factory-nats:2026.09.24-7 - built by ./build-estate-images.sh from the bus repository at its pinned commit}
     restart: unless-stopped
     # Every '$$' below is a dollar sign for the SHELL, escaped so that compose
@@ -197,8 +231,16 @@ services:
   # password arrives as a FILE and is written into the nats client's own
   # context file, which is how that client is meant to be given one. The
   # scripts then authenticate without ever holding the password.
+  #
+  # IT IS BEHIND THE SAME PROFILE AS THE BUS (26 September 2026, build item E1),
+  # and for a stronger reason than the bus: this is the one thing in the estate
+  # that WRITES to a bus's storage. In external mode the bus belongs to somebody
+  # else, so the mutating one-shot is not in the project to be run — by 'up', by
+  # 'restart', or by anybody typing 'docker compose run'. What external mode has
+  # instead is 'bus-ready' below, which only reads.
   # -------------------------------------------------------------------------
   nats-provision:
+    profiles: ["local-bus"]
     image: ${NATS_PROVISION_IMAGE:?name the provisioning image in the env file - built by ./build-estate-images.sh}
     restart: "no"
     depends_on:
@@ -250,6 +292,101 @@ services:
       # same pinned commit as the bus's config. The factory keeps no copy of
       # them and does not second-guess them: the bus's storage is described in
       # the bus's repository.
+      - type: volume
+        source: bus-source
+        target: /bus
+        read_only: true
+    networks:
+      - factory
+
+  # -------------------------------------------------------------------------
+  # IS THE BUS READY, WHICHEVER BUS IT IS — a one-shot that is in the project in
+  # BOTH modes and is every other service's ONLY bus dependency.
+  # (26 September 2026, build item E1.)
+  #
+  # WHY IT EXISTS. Until today four services waited on 'nats-provision'
+  # finishing. That is the right wait in local mode and an impossible one in
+  # external mode, where the provisioner is not in the project at all — and
+  # Compose does not shrug at that: a service that depends on a service whose
+  # profile is off makes Compose REFUSE THE WHOLE PROJECT ("service X depends on
+  # undefined service Y: invalid compose project"). Checked on this machine's
+  # Compose (v5.2.0) with the Docker socket pointed at a path that does not
+  # exist, so nothing was started. Making the dependency merely "not required"
+  # does not help either: that setting says what to do when a dependency is
+  # UNAVAILABLE, and it does not take a service out of what 'up' starts.
+  #
+  # So the dependency is REPLACED rather than weakened. This one-shot is present
+  # in both modes, every service that needs the bus waits for THIS, and the
+  # external-mode overlay clears this service's own dependency on the profiled-off
+  # provisioner (depends_on: !reset {}) — which is necessary, not tidiness.
+  #
+  # WHAT IT DOES, in both modes: waits for the bus to answer its own monitoring
+  # HEALTH route at the address the env file gives. In LOCAL mode that is all,
+  # because it waits for the provisioner as well and the provisioner is what made
+  # the storage. In EXTERNAL mode it then COMPARES the running bus, field by
+  # field, against the pinned definitions on the read-only bus-source volume, and
+  # exits non-zero if anything is missing, differs, or cannot be read — so the
+  # coordinator never starts against a bus this release does not recognise.
+  #
+  # IT WRITES NOTHING TO THE BUS IN EITHER MODE. The comparison is a read of the
+  # bus's own monitoring route, which takes no credential, against files mounted
+  # read-only. A difference between a running bus and the pinned definitions is
+  # settled before a rollout, not during one.
+  # -------------------------------------------------------------------------
+  bus-ready:
+    image: ${NATS_PROVISION_IMAGE:?name the provisioning image in the env file - built by ./build-estate-images.sh}
+    restart: "no"
+    depends_on:
+      # LOCAL MODE ONLY. The external-mode overlay resets this line, because the
+      # provisioner is not in the project there and Compose refuses a project
+      # that names a service whose profile is off.
+      nats-provision:
+        condition: service_completed_successfully
+    environment:
+      BUS_MODE: ${BUS_MODE:-local}
+      # THE MONITORING ADDRESS, plain, and NEVER with a credential in it: that
+      # route takes none. In local mode it is the bus service's own name; in
+      # external mode it is the retained bus's name on the retained network.
+      BUS_MONITORING_ADDRESS: ${BUS_MONITORING_ADDRESS:?name the bus's monitoring address in the env file, e.g. nats:8222 - a name and a port, with no credential in it}
+      BUS_READY_TIMEOUT_S: ${BUS_READY_TIMEOUT_S:-90}
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -euo pipefail
+        case "$${BUS_MODE}" in
+          local|external) ;;
+          *)
+            echo "BUS_MODE is '$${BUS_MODE}' and it has to say local or external. Local means this bundle starts its own bus; external means the bus is already running and belongs to somebody else. deploy/estate/README.md says when each is used." >&2
+            exit 1
+            ;;
+        esac
+        case "$${BUS_MONITORING_ADDRESS}" in
+          *@*)
+            echo "the bus's monitoring address carries a credential. That route takes none, and this container prints the address, so give it plainly in the env file as a name and a port." >&2
+            exit 1
+            ;;
+        esac
+        deadline=$$(( $$(date +%s) + BUS_READY_TIMEOUT_S ))
+        until curl -sf --max-time 5 "http://$${BUS_MONITORING_ADDRESS}/healthz" >/dev/null 2>&1; do
+            if [ "$$(date +%s)" -ge "$${deadline}" ]; then
+                echo "the bus did not answer its monitoring health route at http://$${BUS_MONITORING_ADDRESS}/healthz within $${BUS_READY_TIMEOUT_S}s. In external bus mode this usually means BUS_EXTERNAL_NETWORK does not name the network the bus is really on, or BUS_MONITORING_ADDRESS does not name it on that network." >&2
+                exit 1
+            fi
+            sleep 2
+        done
+        echo "the bus answers its monitoring health route at http://$${BUS_MONITORING_ADDRESS}/healthz"
+        if [ "$${BUS_MODE}" = "local" ]; then
+            echo "local bus mode: this estate's own bus, and its storage was provisioned by the one-shot this waited for. Nothing was written to the bus here."
+            exit 0
+        fi
+        echo "external bus mode: this bus is already running and is not this estate's to change. Comparing it with the pinned definitions, read-only — nothing here writes to the bus, and the mutating provisioner is not in this project at all."
+        exec /usr/local/bin/compare-bus-with-definitions.sh \
+            --monitoring-address "$${BUS_MONITORING_ADDRESS}" \
+            --definitions /bus
+    volumes:
+      # THE PINNED DEFINITIONS, read-only, from the same volume and the same
+      # commit the provisioner reads its scripts from. The comparison has to
+      # read what the RELEASE pins, not what a machine has lying about.
       - type: volume
         source: bus-source
         target: /bus
@@ -396,9 +533,12 @@ services:
     restart: unless-stopped
     depends_on:
       # The relay BINDS the MEMORY stream rather than creating it, so the bus
-      # has to hold that stream before the relay starts. The one-shot makes it,
-      # from the bus repository's own definitions.
-      nats-provision:
+      # has to hold that stream before the relay starts. In local mode the
+      # one-shot makes it from the bus repository's own definitions; in external
+      # mode the bus already holds it and 'bus-ready' has checked that it does.
+      # Either way this waits for 'bus-ready', which is the one bus dependency
+      # that exists in both modes (26 September 2026, build item E1).
+      bus-ready:
         condition: service_completed_successfully
     entrypoint:
       - /bin/sh
@@ -509,7 +649,11 @@ services:
       # dependency is still the right one — the first Slack message this
       # service handles wants the bus, and the streams have to be there by
       # then rather than being made underneath a running service.
-      nats-provision:
+      #
+      # It waits for 'bus-ready' rather than for the provisioner, because that is
+      # the one bus dependency that exists in both bus modes (26 September 2026,
+      # build item E1).
+      bus-ready:
         condition: service_completed_successfully
     # Every '$$' below is a dollar sign for the SHELL, escaped so that compose
     # leaves it alone. The last item is the shell's $0; the command below
@@ -669,7 +813,9 @@ services:
     image: ${JARVIS_IMAGE:?name the jarvis image in the env file, e.g. JARVIS_IMAGE=jarvis:2026.09.26-2 - built by ../../scripts/build-release-image.sh with the rest of the release}
     restart: unless-stopped
     depends_on:
-      nats-provision:
+      # 'bus-ready', not the provisioner: the one bus dependency that exists in
+      # both bus modes (26 September 2026, build item E1).
+      bus-ready:
         condition: service_completed_successfully
     entrypoint: *jarvis-entrypoint
     command: ["jarvis", "serve-nats"]
@@ -695,10 +841,18 @@ services:
   # -------------------------------------------------------------------------
   # THE COORDINATOR, composed in above, with two things added here.
   #
-  # ONE: it waits for the bus to be PROVISIONED and not merely running. Without
-  # this line the coordinator starts against a bare bus and restarts in a loop;
-  # with it, it does not start at all until the one-shot above has finished
+  # ONE: it waits for the bus to be READY and not merely running. Without this
+  # line the coordinator starts against a bare bus and restarts in a loop; with
+  # it, it does not start at all until 'bus-ready' above has finished
   # successfully.
+  #
+  # IT WAITS FOR 'bus-ready' AND NOT FOR THE PROVISIONER (26 September 2026,
+  # build item E1). 'bus-ready' is the one bus dependency that exists in both bus
+  # modes: in local mode it waits for the provisioner and so means exactly what
+  # the old line meant, and in external mode it means the retained bus answers
+  # and already holds what the pinned definitions name. The provisioner is not in
+  # the project at all in external mode, and a dependency on a service whose
+  # profile is off makes Compose refuse the whole project.
   #
   # TWO: IT IS GIVEN MEMORY (added 25 September 2026, after the review of this
   # stage). Forge reads its own memory settings from five names — the switch,
@@ -730,7 +884,7 @@ services:
   # -------------------------------------------------------------------------
   coordinator:
     depends_on:
-      nats-provision:
+      bus-ready:
         condition: service_completed_successfully
     # Every '$$' below is a dollar sign for the SHELL, escaped so that compose
     # leaves it alone. The last item is the shell's $0; the command the composed

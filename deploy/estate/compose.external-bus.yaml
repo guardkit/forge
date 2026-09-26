@@ -1,0 +1,118 @@
+# ---------------------------------------------------------------------------
+# EXTERNAL BUS MODE — the estate started against a bus that is ALREADY RUNNING
+# and belongs to somebody else. (26 September 2026, build item E1 of the
+# rollout design.)
+#
+# WHEN THIS IS USED. Two situations, and they are the same shape:
+#
+#   * the first rollout on this machine, where the live bus is KEPT while the
+#     record moves, because it holds every reader's position and every message
+#     still waiting, and moving the record and swapping the bus in one window is
+#     two irreversible moves at once;
+#   * a cloud machine joining a bus it did not start.
+#
+# HOW IT IS TURNED ON. The env file, and nothing else:
+#
+#   BUS_MODE=external
+#   COMPOSE_FILE=compose.yaml:compose.external-bus.yaml
+#   COMPOSE_PROFILES=
+#   BUS_EXTERNAL_NETWORK=<the network that bus is already on>
+#   BUS_MONITORING_ADDRESS=<that bus's name and monitoring port on that network>
+#
+# Compose reads COMPOSE_FILE and COMPOSE_PROFILES out of the env file itself, so
+# 'docker compose --env-file .env up -d' is still the whole command. Two things
+# about that, both checked on this machine's Compose (v5.2.0) offline, with the
+# Docker socket pointed at a path that does not exist so nothing was started:
+#
+#   * an explicit '-f' on the command line WINS over COMPOSE_FILE, so anything
+#     that names files itself — 'estate-check' does — has to add this file
+#     itself in external mode. It does;
+#   * '--profile' on the command line REPLACES the env file's profiles rather
+#     than adding to them.
+#
+# WHAT THIS FILE DOES NOT DO, and must never be made to do:
+#
+#   * it never provisions. The mutating one-shot is behind the 'local-bus'
+#     profile, so in this mode it is not in the project at all — not for 'up',
+#     not for 'restart', not for anybody typing 'docker compose run';
+#   * it never mutates the bus in any other way either. 'bus-ready' READS the
+#     bus's own monitoring route, which takes no credential, and compares it
+#     field by field with the definitions pinned on the read-only bus-source
+#     volume. Missing, different or unreadable REFUSES and changes nothing;
+#   * it never removes or recreates the bus's network or its storage. The
+#     network is declared here as one that ALREADY EXISTS, which means Compose
+#     joins it and 'docker compose down' leaves it exactly where it was.
+#
+# WHY THE SERVICE NAME 'nats' STILL RESOLVES, so that no address in any
+# service's settings has to change: on the retained network the bus already
+# answers to that name, and joining that network is what makes it resolvable
+# here. Nothing in the env file's addresses is rewritten for this mode.
+# ---------------------------------------------------------------------------
+
+services:
+
+  # -------------------------------------------------------------------------
+  # THE ONE DEPENDENCY THAT HAS TO BE CLEARED, and it is necessary rather than
+  # tidy. 'bus-ready' is in the project in both modes and waits for the
+  # provisioner in local mode. The provisioner is behind the 'local-bus'
+  # profile, and Compose REFUSES A PROJECT that names a service whose profile is
+  # off — "service bus-ready depends on undefined service nats-provision:
+  # invalid compose project". So the line is reset, not weakened.
+  #
+  # Nothing else in the estate needs resetting, because every other service's
+  # bus dependency is on 'bus-ready' itself, which is here in both modes.
+  # -------------------------------------------------------------------------
+  bus-ready:
+    depends_on: !reset {}
+    networks:
+      - factory
+      - retained-bus
+
+  # -------------------------------------------------------------------------
+  # EVERYTHING THAT TALKS TO THE BUS JOINS THE RETAINED NETWORK.
+  #
+  # WHICH SERVICES, AND WHY NOT THE OTHERS. The coordinator (it subscribes), the
+  # memory relay (it binds the MEMORY stream), the front door and the bus
+  # gateway (both hold the jarvis account open), and 'bus-ready' above (it reads
+  # the monitoring route). NOT the answer service and NOT the memory service:
+  # the answer service reads the record read-only and answers HTTP, and the
+  # memory service answers MCP — neither touches the bus, so a route to the bus
+  # for either would be a route with no caller. (The design's own list named the
+  # answer service; it does not use the bus, and this file says so rather than
+  # opening it quietly.)
+  # -------------------------------------------------------------------------
+  coordinator:
+    networks:
+      - factory
+      - forge-publisher-net
+      - retained-bus
+
+  memory-relay:
+    networks:
+      - factory
+      - retained-bus
+
+  front-door:
+    networks:
+      - factory
+      - retained-bus
+
+  bus-gateway:
+    networks:
+      - factory
+      - retained-bus
+
+networks:
+  # THE RETAINED BUS'S OWN NETWORK, DECLARED AS ONE THAT ALREADY EXISTS.
+  #
+  # 'external: true' is what says "this network is not mine": Compose joins it,
+  # does not create it, and 'docker compose down' does not remove it. Its real
+  # name is a SETTING, because a network's name belongs to the machine that made
+  # it and nothing belonging to a machine is written into a tracked file.
+  #
+  # If the name is wrong, Compose says so before anything starts — it refuses a
+  # project whose external network does not exist — which is the loud failure to
+  # want here.
+  retained-bus:
+    external: true
+    name: ${BUS_EXTERNAL_NETWORK:?name the network the already-running bus is on in the env file - external bus mode joins it rather than creating it, and 'docker compose down' leaves it alone}
