@@ -528,7 +528,7 @@ the design:
 9. **The jarvis image this bundle names is one release behind what this bundle
    now needs.** The front door's state volume, added 26 September 2026, is
    mounted at a directory the image has to create and own, and
-   `jarvis:2026.09.26-1` — which `.env.example` names and the manifest pins —
+   `jarvis:2026.09.26-2` — which `.env.example` names and the manifest pins —
    predates that line. Started on it, the front door **refuses by name** rather
    than losing approvals quietly (drive of 26 September 2026: it says so and
    does not serve). That is the intended order: the next release carries the
