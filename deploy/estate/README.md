@@ -515,9 +515,20 @@ system manager, and a manager it cannot reach is *unknown*, which refuses — it
 is never read as "not on this machine" (that reading passed the closed door
 with both live units running, on 26 September 2026, when there was no session
 bus). So from `sudo`, a cron job, a unit, or a non-login `ssh` the check will
-refuse every time the env file names user units; run it from the operator's own
-login shell, or export `XDG_RUNTIME_DIR` and `DBUS_SESSION_BUS_ADDRESS` first.
+refuse every time the env file names any legacy unit at all (the user manager is
+asked whatever is named); run it from the operator's own login shell, or export
+`XDG_RUNTIME_DIR` and `DBUS_SESSION_BUS_ADDRESS` first.
 This is the check being honest, not the check being broken.
+
+**One account, chosen once.** A bus has several accounts (the live one has eight),
+and a stream name is unique only within one. Everything here that reads the bus —
+the start-up comparison, the storage-provisioned item and the closed-door
+waiting counts — chooses the same account by the same rule: the one named in
+`BUS_STREAMS_ACCOUNT` in the env file, else the single account holding any
+stream by a pinned name; two such accounts, or none, is *unknown* and refuses,
+naming the setting. On a bus with more than one account holding such streams,
+set `BUS_STREAMS_ACCOUNT` before the first external-mode run, or it will stop at
+the first of those three with that sentence — correct, and avoidable.
 
 **What it checks, in order:**
 

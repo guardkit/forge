@@ -1103,11 +1103,24 @@ check_bus_storage() {
         set -euo pipefail
         # Within ONE account (the third E1/E2 review): a name held by some other
         # account is not a stream of the coordinator account.
+        # ONE RULE FOR CHOOSING THE ACCOUNT, the same as the comparison and
+        # the closed-door check: the account named in BUS_STREAMS_ACCOUNT, else
+        # the single account holding ANY stream by a pinned name (the fourth
+        # E1/E2 review: three items had three rules, and a bus could pass two
+        # and fail the third). Two such accounts, or none, is unknown.
+        pinned="$(jq -r ".streams[].name" /bus/streams/stream-definitions.json | paste -sd" " -)"
         held="$(curl -sf "http://$BUS/jsz?accounts=true&streams=true" \
-                | jq -r --arg a "${ACCOUNT:-}" "
-                    ([.account_details[]? | select(\$a == \"\" or .name == \$a) | select((.stream_detail // []) | length > 0)]) as \$c
-                    | if (\$c | length) == 1 then (\$c[0].stream_detail[]?.name) else (\"AMBIGUOUS-ACCOUNTS:\" + (\$c | map(.name) | join(\",\"))) end")"
-        case "$held" in AMBIGUOUS-ACCOUNTS:*) printf "%s\n" "$held"; exit 0 ;; esac
+                | jq -r --arg a "${ACCOUNT:-}" --arg pinned "$pinned" "
+                    (\$pinned | split(\" \")) as \$p
+                    | ([.account_details[]? | select(\$a == \"\" or .name == \$a)
+                        | select(any((.stream_detail // [])[]?.name; . as \$n | \$p | index(\$n)))]) as \$c
+                    | if (\$c | length) == 1 then (\$c[0].stream_detail[]?.name)
+                      elif (\$c | length) == 0 then \"NO-ACCOUNT\"
+                      else (\"AMBIGUOUS-ACCOUNTS:\" + (\$c | map(.name) | join(\",\"))) end")"
+        case "$held" in
+            AMBIGUOUS-ACCOUNTS:*) printf "more than one account on this bus (%s) holds streams by the pinned names; one must be chosen, in BUS_STREAMS_ACCOUNT, before what the bus holds can be read\n" "${held#AMBIGUOUS-ACCOUNTS:}"; exit 0 ;;
+            NO-ACCOUNT)           printf "no account on this bus holds any stream by the pinned names (if BUS_STREAMS_ACCOUNT is set, check its spelling)\n"; exit 0 ;;
+        esac
         missing=""
         for want in $(jq -r ".streams[].name" /bus/streams/stream-definitions.json); do
             printf "%s\n" "$held" | grep -qx "$want" || missing="$missing stream:$want"
