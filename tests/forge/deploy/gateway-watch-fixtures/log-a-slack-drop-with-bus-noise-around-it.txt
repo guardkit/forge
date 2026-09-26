@@ -1,0 +1,7 @@
+2026-09-26T12:00:00.000000000Z {"event": "A new session (s_16134798510805) has been established"}
+2026-09-26T15:59:45.143903103Z {"agent_id": "jarvis", "event": "nats_disconnect", "level": "warning", "logger": "jarvis.infrastructure.nats_client", "timestamp": "2026-09-26T15:59:45.143777Z"}
+2026-09-26T15:59:47.148757512Z {"agent_id": "jarvis", "event": "nats_reconnect", "level": "info", "logger": "jarvis.infrastructure.nats_client", "timestamp": "2026-09-26T15:59:47.148447Z"}
+2026-09-26T15:59:48.084678821Z {"event": "The session (s_16134804056153) seems to be already closed. Reconnecting..."}
+2026-09-26T15:59:48.089097363Z {"event": "Failed to retrieve WSS URL: The request to the Slack API failed. (url: https://slack.com/api/apps.connections.open, status: 200)\nThe server responded with: {'ok': False, 'error': 'invalid_auth'}"}
+2026-09-26T15:59:48.089123380Z {"event": "Failed to check the current session (s_16134804056153) or reconnect to the server (error: SlackApiError, message: The request to the Slack API failed. (url: https://slack.com/api/apps.connections.open, status: 200)\nThe server responded with: {'ok': False, 'error': 'invalid_auth'})"}
+2026-09-26T15:59:53.096146870Z {"event": "The session (s_16134804056153) seems to be stale. Reconnecting... reason: disconnected for 20+ seconds)"}

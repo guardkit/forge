@@ -67,6 +67,52 @@ readonly DEFAULT_DOCKER_SOCKET="/var/run/docker.sock"
 readonly DEFAULT_LOG_LINES=20
 readonly SLACK_POST_URL="https://slack.com/api/chat.postMessage"
 
+# ---------------------------------------------------------------------------
+# WHICH LINES OF THE LOG ARE ABOUT SLACK AT ALL (26 September 2026, the fix of
+# the one blocker an independent review of this watch found).
+#
+# THE GATEWAY CONTAINER'S LOG IS NOT A SLACK LOG. jarvis's own bus client writes
+# into the very same stream: 'nats_disconnect' when the bus connection drops,
+# 'nats_reconnect' when it comes back, and 'nats_error' carrying the words of
+# whatever failed — 'Connect call failed', 'ConnectionRefusedError'
+# (jarvis/src/jarvis/infrastructure/nats_client.py). The retired alarm's trouble
+# words — 'disconnect', 'reconnect', 'connection ... refused', which were copied
+# in here verbatim from ops/systemd/serve_nats_watchdog.py — match every one of
+# those, and the only line that CLEARS the signal, 'has been established', is
+# written by slack-sdk alone. So a bus event could never be cleared by a bus
+# event.
+#
+# MEASURED, NOT IMAGINED. A reviewer restarted a throwaway bus container and
+# touched nothing else: Slack was up, the gateway reconnected to the bus by
+# itself, and this watch sent one message headed 'The factory's Slack door has
+# lost its Slack session'. On an idle door the heartbeat only moves when Slack
+# sends something — roughly every five hours — so that wrong message would have
+# been repeated every fifteen minutes for hours. The alarm this replaces was
+# retired for crying wolf; a replacement that names the WRONG component is worse
+# than no alarm at all.
+#
+# SO THE SLACK QUESTION IS ASKED OF SLACK'S OWN WORDS ONLY, two ways over:
+#   * jarvis's own bus records are dropped from the lines first — by the structlog
+#     logger name that wrote them, and by their 'nats_' event names;
+#   * and what is left has to match one of slack-sdk's OWN sentences, quoted from
+#     the Socket Mode client jarvis really runs (slack_sdk/socket_mode/aiohttp/
+#     __init__.py lines 183, 188, 194, 205, 274, 305, 368, 415, 438 and
+#     socket_mode/client.py line 60, at the version in jarvis's lock file),
+#     rather than a general pattern of connection-sounding words.
+#
+# Either one of the two would have been enough for the bus restart; both are here
+# because the cost of being wrong is a wrong word in the one alarm that reaches a
+# person, and because an error string jarvis passes through from somewhere else
+# can carry any words at all.
+#
+# THE SILENCE BACKSTOP IS UNCHANGED and still reads the WHOLE log: "has this
+# container said anything at all" is a question about the container, not about
+# Slack.
+# ---------------------------------------------------------------------------
+readonly BUS_CLIENTS_OWN_RECORDS='"logger":[[:space:]]*"[^"]*nats_client"|logger=[^[:space:]]*nats_client|"event":[[:space:]]*"nats_[a-z_]*"'
+readonly SLACK_SESSION_ESTABLISHED='has been established'
+readonly SLACK_SESSION_IN_TROUBLE='has been abandoned|seems to be (already closed|stale)|Received CLOSE event|Failed to (retrieve WSS URL|check the current session|send a ping message|send a message|receive or enqueue a message)|is no longer active'
+
 # The retired alarm's OWN setting names, unchanged, so nothing new has to be
 # configured and Rich's alarms keep arriving where they always did
 # (jarvis/ops/systemd/serve_nats_watchdog.py).
@@ -343,6 +389,13 @@ check_slack() {
     # hold before this speaks, so that a rotation and an old recovered blip stay
     # quiet: there is a trouble line, nothing established after it, and it is
     # newer than the last thing the gateway itself said.
+    #
+    # AND THE TROUBLE LINE HAS TO BE SLACK'S OWN (the 26 September 2026 fix). The
+    # three conditions below do NOT make a bus event safe: jarvis's bus client
+    # writes its drops into this same log, and on an idle door the heartbeat only
+    # moves every five hours, so a bus blip cleared the third condition easily and
+    # was reported here as a lost Slack session. Which lines count is decided in
+    # check_activity, against slack-sdk's own sentences only.
     if [ -n "${LOG_TROUBLE_AT}" ] \
        && { [ -z "${LOG_HEALTHY_AT}" ] || [ "${LOG_TROUBLE_AT}" -gt "${LOG_HEALTHY_AT}" ]; } \
        && [ "${LOG_TROUBLE_AT}" -gt "${last_epoch}" ]; then
@@ -451,7 +504,7 @@ _newest_matching() {
 }
 
 check_activity() {
-    local lines newest newest_epoch age now
+    local lines slack_lines newest newest_epoch age now
     lines="$(read_the_log)"
     if [ -z "${lines}" ]; then
         ACTIVITY_VERDICT="unknown"
@@ -475,13 +528,14 @@ check_activity() {
         ACTIVITY_SENTENCE="the gateway container's newest log line is timed '${newest}', which is not a time this could read."
         return
     fi
-    # The retired alarm's two connection markers, from this same read. HEALTHY is
-    # the library's definitive "the subscription is live again"; TROUBLE is a
-    # drop, a reconnect attempt or a transport error. The words are the retired
-    # alarm's own (jarvis/ops/systemd/serve_nats_watchdog.py).
-    LOG_HEALTHY_AT="$(_newest_matching "${lines}" 'has been established')"
-    LOG_TROUBLE_AT="$(_newest_matching "${lines}" \
-        'reconnect|has been abandoned|already closed|disconnect|websocket.*(error|closed|closing)|connection.*(error|closed|lost|refused)|failed to (send|connect|establish)')"
+    # The two connection markers for the SLACK question, and they are asked of
+    # the Slack-only view of these same lines — jarvis's own bus records taken
+    # out, and only slack-sdk's own sentences counted as trouble. A bus restart
+    # is not a Slack failure, and until 26 September 2026 this read it as one.
+    # See BUS_CLIENTS_OWN_RECORDS at the top for what was measured.
+    slack_lines="$(printf '%s\n' "${lines}" | grep -vE "${BUS_CLIENTS_OWN_RECORDS}")"
+    LOG_HEALTHY_AT="$(_newest_matching "${slack_lines}" "${SLACK_SESSION_ESTABLISHED}")"
+    LOG_TROUBLE_AT="$(_newest_matching "${slack_lines}" "${SLACK_SESSION_IN_TROUBLE}")"
     now="$(now_epoch)"
     age=$(( now - newest_epoch ))
     [ "${age}" -ge 0 ] || age=0

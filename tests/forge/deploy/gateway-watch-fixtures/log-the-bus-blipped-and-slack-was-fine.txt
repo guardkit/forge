@@ -1,0 +1,7 @@
+2026-09-26T12:00:00.000000000Z {"event": "A new session (s_16134798510805) has been established"}
+2026-09-26T15:59:45.143586454Z {"error_class": "UnexpectedEOF", "error": "nats: unexpected EOF", "event": "nats_error", "level": "warning", "logger": "jarvis.infrastructure.nats_client", "timestamp": "2026-09-26T15:59:45.143353Z"}
+2026-09-26T15:59:45.143903103Z {"agent_id": "jarvis", "event": "nats_disconnect", "level": "warning", "logger": "jarvis.infrastructure.nats_client", "timestamp": "2026-09-26T15:59:45.143777Z"}
+2026-09-26T15:59:45.144753912Z {"error_class": "ConnectionRefusedError", "error": "[Errno 111] Connect call failed ('172.27.0.3', 4222)", "event": "nats_error", "level": "warning", "logger": "jarvis.infrastructure.nats_client", "timestamp": "2026-09-26T15:59:45.144653Z"}
+2026-09-26T15:59:47.148757512Z {"agent_id": "jarvis", "event": "nats_reconnect", "level": "info", "logger": "jarvis.infrastructure.nats_client", "timestamp": "2026-09-26T15:59:47.148447Z"}
+2026-09-26T15:59:47.150779938Z {"agent_id": "jarvis", "version": "0.4.0", "event": "fleet_register_published", "level": "info", "logger": "jarvis.infrastructure.fleet_registration", "timestamp": "2026-09-26T15:59:47.150533Z"}
+2026-09-26T15:59:47.150783394Z {"agent_id": "jarvis", "event": "fleet_reregister_published", "level": "info", "logger": "jarvis.infrastructure.nats_client", "timestamp": "2026-09-26T15:59:47.150675Z"}
