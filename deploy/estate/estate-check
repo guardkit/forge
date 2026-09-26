@@ -173,6 +173,17 @@ redact() {
 
 # The host out of an address, whatever it carries: a scheme, a credential, a
 # port and a path all come off.
+# One sentence of trouble, or nothing: does the coordinator talk to the same
+# bus host this check asks about? Used at the door and by the closed-door check.
+the_same_bus_or_trouble() {
+    local talked asked
+    talked="$(host_of "$(get FORGE_NATS_URL)")"
+    asked="$(host_of "$(the_buss_monitoring_address)")"
+    if [ -n "${talked}" ] && [ -n "${asked}" ] && [ "${talked}" != "${asked}" ]; then
+        printf ' the coordinator talks to the bus at %s and this check would ask about the bus at %s, which are two different hosts;' "'${talked}'" "'${asked}'"
+    fi
+}
+
 host_of() {
     printf '%s' "$1" | sed -E 's#^[a-z]+://##; s#^[^@]*@##; s#[:/].*$##'
 }
@@ -531,12 +542,12 @@ check_the_bus_mode_and_the_files_agree() {
     # THE ADDRESS THE BUS IS TALKED TO AND THE ADDRESS IT IS ASKED ABOUT MUST BE
     # THE SAME BUS. Two different hosts would mean the estate checked one bus and
     # used another, and every item below would be true about the wrong one.
-    local talked asked
-    talked="$(host_of "$(get FORGE_NATS_URL)")"
-    asked="$(host_of "$(the_buss_monitoring_address)")"
-    if [ -n "${talked}" ] && [ -n "${asked}" ] && [ "${talked}" != "${asked}" ]; then
-        trouble="${trouble} the coordinator talks to the bus at '${talked}' and this check would ask about the bus at '${asked}', which are two different hosts;"
-    fi
+    # Asked here at the door AND again by the closed-door check (the E1/E2
+    # review of 26 September 2026: it was host-only, and a closed-door record
+    # could describe a bus the coordinator does not use).
+    local same_bus_trouble
+    same_bus_trouble="$(the_same_bus_or_trouble)"
+    [ -z "${same_bus_trouble}" ] || trouble="${trouble}${same_bus_trouble}"
     case "$(the_buss_monitoring_address)" in
         *@*) trouble="${trouble} BUS_MONITORING_ADDRESS carries a credential, and that route takes none;" ;;
     esac
@@ -1226,14 +1237,47 @@ check_the_producers_are_stopped() {
     elif ! command -v systemctl >/dev/null 2>&1; then
         said="${said} this machine has no systemctl, so the legacy units were not looked for;"
     else
+        # BOTH MANAGERS ARE ASKED, AND ONLY A READ ANSWER COUNTS (the E1/E2
+        # review of 26 September 2026: this asked the user manager alone and
+        # read an empty answer as "not on this machine" — so with no session
+        # bus it passed while both live front-door units were running, and a
+        # running SYSTEM unit passed too). Now: the user manager and the
+        # system manager are each asked; a manager that cannot be reached or
+        # answers nothing is UNKNOWN, and unknown refuses; a unit passes only
+        # when every manager that answered read it as inactive or failed, or
+        # as not loaded (LoadState not-found) — a positive answer, not a
+        # missing one.
         for unit in ${units}; do
-            state="$(systemctl --user show -p ActiveState --value "${unit}" 2>/dev/null)"
-            case "${state}" in
-                ""|inactive|failed) said="${said} ${unit} is ${state:-not on this machine};" ;;
-                *)                  trouble="${trouble} the legacy unit ${unit} is ${state};" ;;
-            esac
+            local verdicts="" unknown="" mgr load
+            for mgr in "--user" "--system"; do
+                local out rc
+                out="$(systemctl ${mgr} show -p LoadState -p ActiveState --value "${unit}" 2>/dev/null)"; rc=$?
+                if [ "${rc}" -ne 0 ] || [ -z "${out}" ]; then
+                    unknown="${unknown} ${mgr#--}-manager:unreachable-or-silent"
+                    continue
+                fi
+                load="$(printf '%s\n' "${out}" | sed -n 1p)"
+                state="$(printf '%s\n' "${out}" | sed -n 2p)"
+                case "${load}:${state}" in
+                    not-found:*|masked:inactive)      verdicts="${verdicts} ${mgr#--}:not-loaded" ;;
+                    *:inactive|*:failed)               verdicts="${verdicts} ${mgr#--}:${state}" ;;
+                    *)                                 trouble="${trouble} the legacy unit ${unit} is ${state} in the ${mgr#--} manager;" ;;
+                esac
+            done
+            if [ -n "${unknown}" ]; then
+                trouble="${trouble} the legacy unit ${unit} could not be read (${unknown# }) — could not be read is not stopped, and work may still be running;"
+            elif [ -n "${verdicts}" ]; then
+                said="${said} ${unit}:${verdicts# };"
+            fi
         done
     fi
+
+    # THE SAME BUS, RE-ASKED HERE: the closed-door record describes the bus the
+    # coordinator talks to, so the two hosts must agree at this moment, not
+    # only at the door (item 7b of the host check; the E1/E2 review).
+    local same_bus_trouble
+    same_bus_trouble="$(the_same_bus_or_trouble)"
+    [ -z "${same_bus_trouble}" ] || trouble="${trouble}${same_bus_trouble}"
 
     # THE TWO WAITING COUNTS, off the bus's own monitoring route.
     local stream consumers network image counts
@@ -1606,7 +1650,11 @@ check_read_pre_resume() {
         fi
     fi
     [ "${R_BUS_MODE}" = "${BUS_MODE_IN_FORCE}" ] || trouble="${trouble} it was written in ${R_BUS_MODE:-an unrecorded} bus mode and this estate is in ${BUS_MODE_IN_FORCE} bus mode;"
-    if [ "${age}" -gt "${max_age}" ]; then
+    if [ "${age}" -lt 0 ]; then
+        # A record from the future is not fresh; it is a clock nobody trusts
+        # (the E1/E2 review of 26 September 2026: a negative age passed).
+        trouble="${trouble} it is dated ${R_WRITTEN}, which is $(( -age )) seconds in the future of this machine's clock, so its age cannot be trusted;"
+    elif [ "${age}" -gt "${max_age}" ]; then
         trouble="${trouble} it is ${age} seconds old and this env file allows ${max_age};"
     fi
 
