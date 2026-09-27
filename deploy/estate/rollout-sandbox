@@ -334,19 +334,31 @@ class Rollout:
     def systemctl(self, *args, **kw):
         return self.run(['systemctl','--user',*args], **kw)
 
-    def properties(self, unit, *, stop_hooks=False):
+    def properties(self, unit, *, identity=False):
         fields = ('LoadState','ActiveState','SubState','MainPID','ControlPID','UnitFileState')
-        if stop_hooks:
-            fields += ('ExecStop','ExecStopPost')
+        if identity:
+            fields += ('Id',)
         out = self.systemctl('show',unit,*['--property='+x for x in fields]).stdout
         result = dict(line.split('=',1) for line in out.splitlines() if '=' in line)
         require(all(x in result for x in fields), f'unit state is unreadable for {unit}; inspect its complete systemd state')
         return result
 
+    def empty_command_array(self, unit, field):
+        encoded = ''.join(chr(byte) if chr(byte).isalnum() and byte < 128 else f'_{byte:02x}'
+                          for byte in unit.encode())
+        path = '/org/freedesktop/systemd1/unit/' + encoded
+        result = self.run(['busctl','--user','get-property','org.freedesktop.systemd1',path,
+                           'org.freedesktop.systemd1.Service',field])
+        require(result.stdout.strip() == 'a(sasbttttuii) 0',
+                f'{field} is not proved an explicitly empty command array for {unit}; fix the drop-in before stopping any unit')
+
     def empty_stop(self):
-        p = self.properties(self.units['runner'],stop_hooks=True)
-        require(p['LoadState'] == 'loaded' and p['ExecStop'] == '' and p['ExecStopPost'] == '',
-                f'ExecStop or ExecStopPost is not proved empty for {self.units["runner"]}; fix the drop-in before stopping any unit')
+        unit = self.units['runner']
+        p = self.properties(unit,identity=True)
+        require(p['LoadState'] == 'loaded' and p['Id'] == unit,
+                f'loaded unit identity is not proved for {unit}; inspect its complete systemd state')
+        self.empty_command_array(unit,'ExecStop')
+        self.empty_command_array(unit,'ExecStopPost')
         self.stop_proved = True
 
     def stopped(self, unit):
