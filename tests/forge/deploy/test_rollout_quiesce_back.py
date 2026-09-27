@@ -351,6 +351,8 @@ def test_named_volume_argument_preserves_plain_saved_mode(mode,rw,expected):
     {'Consistency':'cached'},
     {'Name':'bad:name'},
     {'Destination':'relative'},
+    {'Destination':'/'},
+    {'Destination':'/bad\0target'},
     {'Destination':'/bad:target'},
 ])
 def test_named_volume_argument_refuses_changed_or_unrepresentable_flags(change):
@@ -373,7 +375,7 @@ def test_create_old_uses_explicit_volume_syntax_and_preserves_mode(estate,monkey
     command=creates[0]
     assert command[command.index('--volume')+1]=='owned-volume:/owned:'+mode and '--mount' not in command
 
-@pytest.mark.parametrize('change',[{'Mode':'z'},{'Driver':'other'},{'Source':'/different'}])
+@pytest.mark.parametrize('change',[{'Mode':'z'},{'Driver':'other'},{'Source':'/different'},{'Destination':'/'},{'Destination':'/bad\0target'}])
 def test_named_volume_preflight_refuses_before_old_container_deletion(estate,monkeypatch,change):
     recovery=b.Recovery(estate.args);mount=named_volume();mount.update(change);record=volume_runtime(mount);events=[]
     def docker(c,*args,**kwargs):
