@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -21,6 +22,7 @@ def _run_watch(
     *,
     heartbeat_body: str | None = None,
     heartbeat_path: Path | None = None,
+    jq_bin_dir: Path | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
     if heartbeat_path is None:
         heartbeat_path = tmp_path / "heartbeat.json"
@@ -29,7 +31,9 @@ def _run_watch(
 
     notifier = tmp_path / "notifications.jsonl"
     env = {
-        "PATH": os.environ["PATH"],
+        "PATH": f"{jq_bin_dir}:{os.environ['PATH']}"
+        if jq_bin_dir is not None
+        else os.environ["PATH"],
         "JARVIS_NATS_USER": "jarvis",
         "GATEWAY_WATCH_CLIENT_NAME": "bus-gateway-factory",
         "GATEWAY_WATCH_SUBJECT": "agents.command.jarvis",
@@ -139,6 +143,47 @@ def test_connected_heartbeat_accepts_producer_extensions(
     assert done.returncode == 0, done.stdout + done.stderr
     assert "Slack session    ok" in done.stdout
     assert messages == []
+
+
+def test_nonzero_parser_status_cannot_authorize_emitted_valid_json(
+    tmp_path: Path,
+) -> None:
+    real_jq = shutil.which("jq")
+    assert real_jq is not None
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    wrapper = fake_bin / "jq"
+    wrapper.write_text(
+        f"""#!/bin/sh
+if [ "$1" = "-cer" ] && [ "$2" = "-s" ]; then
+    "{real_jq}" "$@"
+    status=$?
+    if [ "$status" -ne 0 ]; then
+        exit "$status"
+    fi
+    exit 1
+fi
+exec "{real_jq}" "$@"
+"""
+    )
+    wrapper.chmod(0o755)
+    heartbeat = json.dumps(
+        {
+            "state": "connected",
+            "last_event_at": "2026-09-26T15:59:55Z",
+        }
+    )
+
+    done, messages = _run_watch(
+        tmp_path,
+        heartbeat_body=heartbeat,
+        jq_bin_dir=fake_bin,
+    )
+
+    assert done.returncode == 10, done.stdout + done.stderr
+    assert "Slack session    unknown" in done.stdout
+    assert len(messages) == 1
+    assert "Slack session    unknown" in messages[0]
 
 
 @pytest.mark.parametrize("state", ["connecting", "disconnected"])
