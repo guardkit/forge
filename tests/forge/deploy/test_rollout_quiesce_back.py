@@ -107,6 +107,7 @@ def public_final_argv(estate):
 
 @pytest.mark.parametrize('partial',[False,True])
 def test_public_final_preserves_sanitized_sandbox_refusal_before_legacy_stops(estate,monkeypatch,capsys,partial):
+    estate.snapshot.rmdir()
     estate.phase='original';estate.doc={'format_version':1,'binding':estate.binding,'stage':'settled'}
     monkeypatch.setattr(estate,'closed',lambda:None);legacy=[]
     monkeypatch.setattr(estate,'systemctl',lambda *a:legacy.append(('systemctl',a)))
@@ -124,10 +125,11 @@ def test_public_final_preserves_sanitized_sandbox_refusal_before_legacy_stops(es
     error=capsys.readouterr().err
     assert 'sentinel-private-value' not in error and '[REDACTED]' in error
     assert legacy==[]
-    report=r.read_json(estate.snapshot/'rollout-sandbox-command.json')
+    report=r.read_json(estate.sandbox_evidence)
     assert report['passed'] is False and report['commands'][0]['exit']==2
     assert 'sentinel-private-value' not in json.dumps(report) and '[REDACTED]' in json.dumps(report)
-    assert (estate.snapshot/'rollout-sandbox-command.json').stat().st_mode&0o777==0o600
+    assert estate.sandbox_evidence.stat().st_mode&0o777==0o600
+    assert not estate.snapshot.exists()
     if partial:
         assert 'installation may be incomplete' in error
         assert 'nothing has been replaced' not in error
@@ -137,16 +139,33 @@ def test_public_final_preserves_sanitized_sandbox_refusal_before_legacy_stops(es
 
 
 def test_sandbox_final_success_records_sanitized_command(estate,monkeypatch):
+    estate.snapshot.rmdir()
     estate.private_values=['sentinel-private-value']
     monkeypatch.setattr(r,'run',lambda *a,**k:SimpleNamespace(returncode=0,stdout='ok sentinel-private-value',stderr=''))
     result=estate.sandbox_final([HERE/'rollout-sandbox','--stop-legacy'])
     assert result.returncode==0
-    report=r.read_json(estate.snapshot/'rollout-sandbox-command.json')
+    report=r.read_json(estate.sandbox_evidence)
     assert report['passed'] is True and report['commands'][0]['exit']==0
     assert 'sentinel-private-value' not in json.dumps(report) and '[REDACTED]' in json.dumps(report)
+    assert not estate.snapshot.exists()
+
+
+def test_public_final_success_reaches_legacy_stop_before_snapshot_creation(estate,monkeypatch,capsys):
+    estate.snapshot.rmdir();estate.phase='original';estate.doc={'format_version':1,'binding':estate.binding,'stage':'settled'}
+    monkeypatch.setattr(estate,'closed',lambda:None);legacy=[]
+    def stop(*args):
+        legacy.append(args);raise r.Refusal('captured expected legacy stop')
+    monkeypatch.setattr(estate,'systemctl',stop)
+    monkeypatch.setattr(r,'run',lambda *a,**k:SimpleNamespace(returncode=0,stdout='',stderr=''))
+    monkeypatch.setattr(q,'Estate',lambda args:estate)
+    assert q.main(public_final_argv(estate))==2
+    assert legacy and 'captured expected legacy stop' in capsys.readouterr().err
+    assert r.read_json(estate.sandbox_evidence)['passed'] is True
+    assert not estate.snapshot.exists()
 
 
 def test_public_final_timeout_is_unknown_and_never_claims_nothing_replaced(estate,monkeypatch,capsys):
+    estate.snapshot.rmdir()
     estate.phase='original';estate.doc={'format_version':1,'binding':estate.binding,'stage':'settled'}
     monkeypatch.setattr(estate,'closed',lambda:None);legacy=[]
     monkeypatch.setattr(estate,'systemctl',lambda *a:legacy.append(a));monkeypatch.setattr(r,'inspect',lambda *a:legacy.append(a))
@@ -157,8 +176,19 @@ def test_public_final_timeout_is_unknown_and_never_claims_nothing_replaced(estat
     assert 'outcome is unknown and installation may be incomplete' in error
     assert 'nothing has been replaced' not in error and 'sentinel-private-value' not in error
     assert legacy==[]
-    report=r.read_json(estate.snapshot/'rollout-sandbox-command.json')
+    report=r.read_json(estate.sandbox_evidence)
     assert report['passed'] is False and report['commands'][0]['exit'] is None
+    assert not estate.snapshot.exists()
+
+
+def test_child_refusal_survives_command_evidence_write_failure(estate,monkeypatch):
+    estate.snapshot.rmdir()
+    child='Refusing: known-file.txt changed; nothing has been replaced; shall I try again?\n'
+    monkeypatch.setattr(r,'run',lambda *a,**k:SimpleNamespace(returncode=2,stdout='',stderr=child))
+    monkeypatch.setattr(r,'atomic_json',lambda *a,**k:(_ for _ in ()).throw(OSError('fixture evidence write failed')))
+    with pytest.raises(r.Refusal,match='known-file.txt changed'):
+        estate.sandbox_final([HERE/'rollout-sandbox','--stop-legacy'])
+    assert not estate.snapshot.exists()
 
 @pytest.mark.parametrize('shape',['half','mismatch','invalid'])
 def test_marker_pair_refuses_ambiguous(estate,monkeypatch,shape):
