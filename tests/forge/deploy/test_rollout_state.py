@@ -12,10 +12,25 @@ import subprocess
 from datetime import datetime, timezone
 from types import SimpleNamespace
 import pytest
+import sys
+from types import ModuleType
+
+# Persistence imports forge.pipeline's initializer, which imports the event
+# package initializer. Mock its client boundary BEFORE that transitive import;
+# neither a real broker client module nor a usable fake connection is loaded.
+_mock_client = ModuleType('nats_core.client')
+_mock_client.__rollout_mock__ = True
+class ForbiddenBrokerClient:
+    def __init__(self, *args, **kwargs):
+        raise AssertionError('a broker client is outside these SQLite tests')
+_mock_client.NATSClient = ForbiddenBrokerClient
+_mock_client.NATSKVManifestRegistry = ForbiddenBrokerClient
+assert 'nats_core.client' not in sys.modules, 'client boundary initialized before mock'
+sys.modules['nats_core.client'] = _mock_client
+
 from forge.lifecycle import migrations
 from forge.adapters.sqlite.connect import connect_writer
 from forge.lifecycle.persistence import SqliteLifecyclePersistence
-from nats_core.events import BuildQueuedPayload
 
 BUNDLE = Path(__file__).resolve().parents[3] / 'deploy' / 'estate'
 spec = importlib.util.spec_from_file_location('rollout_support', BUNDLE / 'rollout_support.py')
@@ -32,7 +47,8 @@ def seed(path, version=16, build=False):
         migrations._MIGRATIONS = original
     if build:
         now = datetime.now(timezone.utc)
-        SqliteLifecyclePersistence(connection=db, db_path=path).record_pending_build(BuildQueuedPayload(
+        SqliteLifecyclePersistence(connection=db, db_path=path).record_pending_build(SimpleNamespace(
+            branch="fixture-branch", originating_adapter=None, originating_user=None, parent_request_id=None, max_turns=5, sdk_timeout_seconds=1800,
             feature_id='FEAT-STATE', repo='example.invalid/made-up', feature_yaml_path='.guardkit/features/f.yaml',
             triggered_by='forge-internal', correlation_id='state-fixture', requested_at=now, queued_at=now))
     db.close()
@@ -261,7 +277,8 @@ def test_previous_runtime_omits_secret_environment_values(setup,monkeypatch):
 def receipt_fixture(c,d,meta):
     migrated=r.sha256(d/'forge.db')
     mark={'format_version':1,'snapshot_sha256':meta['sha256'],'snapshot_created_at':meta['created_at'],
-          'migrated_sha256':migrated,'source_schema_version':meta['schema_version'],'loaded_schema_version':16}
+          'migrated_sha256':migrated,'source_schema_version':meta['schema_version'],'loaded_schema_version':16,
+          'loaded_logical_sha256':r.consolidated_logical_digest(d/'forge.db'),'startup_logical_sha256':r.consolidated_logical_digest(d/'forge.db')}
     staging=d/'loaded-ledger';staging.mkdir()
     shutil.copyfile(d/'forge.db',staging/'forge.db');r.atomic_json(staging/r.MARK,mark)
     sources={role:r.manifest(c['sources'][role]) for role in ('evidence','threads')}
@@ -269,7 +286,8 @@ def receipt_fixture(c,d,meta):
         p=Path(c['sources'][role]);sources[role]=[{'path':name,'size':p.stat().st_size,'sha256':r.sha256(p)}]
     return {'format_version':1,'project':c['project'],'snapshot_sha256':meta['sha256'],'migrated_sha256':migrated,
         'runtime_image':c['runtime_image'],'volumes':c['volumes'],'mark':mark,'manifests':dict(sources,ledger=r.manifest(staging)),
-        'source_manifests':sources,'container_verification':None}
+        'source_manifests':sources,'loaded_logical_sha256':mark['loaded_logical_sha256'],
+        'startup_logical_sha256':mark['startup_logical_sha256'],'container_verification':None}
 
 @pytest.mark.parametrize('value',['../source','innocent/../source','nested/../../source'])
 def test_parent_traversal_rejected_before_any_path_operation(tmp_path,value):
@@ -367,3 +385,100 @@ def test_sibling_prefix_is_not_mistaken_for_source_root(setup,monkeypatch):
     monkeypatch.setattr(r,'docker',lambda *a,**k:SimpleNamespace(stdout=''))
     assert r.snapshot(c,sibling/d.name,plan=True)['plan']
     assert not list(sibling.iterdir())
+
+def test_fresh_process_import_boundary_and_real_writer(tmp_path):
+    # A fresh interpreter is required: a package initializer may hide a client
+    # import even when the requested submodule contains only event dataclasses.
+    code = '''import importlib.abc,runpy,sys,tempfile,pathlib,json
+class NoBrokerClient(importlib.abc.MetaPathFinder):
+ def find_spec(self,fullname,path=None,target=None):
+  if fullname=='nats' or fullname.startswith('nats.') or fullname=='nats_core.client':
+   raise AssertionError('real broker-client import attempted: '+fullname)
+sys.meta_path.insert(0,NoBrokerClient())
+module=runpy.run_path(sys.argv[1])
+with tempfile.TemporaryDirectory() as temporary:
+ p=module['seed'](pathlib.Path(temporary)/'forge.db',build=True)
+ assert module['r'].ledger_state(p)['work_state']['builds']['count']==1
+clients=[n for n in sys.modules if n=='nats' or n.startswith('nats.')]
+assert not clients,clients
+assert sys.modules['nats_core.client'].__rollout_mock__ is True
+print(json.dumps({'real_writer_rows':1,'client_modules':clients,'client_boundary_mocked':True}))
+'''
+    result=subprocess.run(['python','-c',code,str(Path(__file__).resolve())],capture_output=True,text=True)
+    assert result.returncode==0,result.stderr
+    assert json.loads(result.stdout)=={'real_writer_rows':1,'client_modules':[],'client_boundary_mocked':True}
+
+def test_logical_digest_covers_all_rows_schema_and_blobs(tmp_path):
+    p=seed(tmp_path/'forge.db')
+    db=sqlite3.connect(p)
+    initial=r.logical_digest(db)
+    db.execute('CREATE TABLE extra_history(value BLOB, note TEXT)');db.commit()
+    with_table=r.logical_digest(db);assert with_table!=initial
+    db.executemany('INSERT INTO extra_history VALUES(?,?)',[(b'\x00\xff','same'),(b'\x00\xff','same')]);db.commit()
+    duplicate=r.logical_digest(db);assert duplicate!=with_table
+    db.execute('DELETE FROM extra_history WHERE rowid=1');db.commit()
+    assert r.logical_digest(db)!=duplicate
+    db.execute('CREATE INDEX extra_history_note ON extra_history(note)');db.commit()
+    with_index=r.logical_digest(db)
+    db.execute('UPDATE schema_version SET applied_at="changed" WHERE version=1');db.commit()
+    assert r.logical_digest(db)!=with_index
+    db.close()
+
+def test_packaged_boot_digest_is_deterministic_and_broker_free(tmp_path):
+    original=seed(tmp_path/'loaded.db',11)
+    db=connect_writer(original);migrations.apply_at_boot(db);db.close()
+    before=r.consolidated_logical_digest(original)
+    copies=[]
+    for name in ('first.db','second.db'):
+        target=tmp_path/name;shutil.copyfile(original,target)
+        code=r.BOOT_SQLITE_CODE.replace('/copy/forge.db',str(target))
+        result=subprocess.run(['python','-c',code],capture_output=True,text=True)
+        assert result.returncode==0,result.stderr
+        copies.append(r.consolidated_logical_digest(target))
+    assert copies[0]==copies[1] and copies[0]!=before
+    assert r.consolidated_logical_digest(original)==before
+
+@pytest.mark.parametrize('field',['loaded_logical_sha256','startup_logical_sha256'])
+def test_missing_or_mismatched_runtime_digest_refuses(setup,field):
+    c,d=setup;meta=snapshot_fixture(c,d);receipt=receipt_fixture(c,d,meta)
+    receipt[field]='0'*64
+    with pytest.raises(r.Refusal,match='provenance'):r.validate_receipt(c,meta,receipt)
+    receipt.pop(field)
+    with pytest.raises(r.Refusal,match='incomplete'):r.validate_receipt(c,meta,receipt)
+
+def test_normal_boot_wal_and_checkpoint_verify_but_data_change_refuses(setup,monkeypatch):
+    c,d=setup;meta=snapshot_fixture(c,d);receipt=receipt_fixture(c,d,meta)
+    target=d/'loaded-ledger';ledger=target/'forge.db'
+    expected=d/'expected-boot.db';shutil.copyfile(ledger,expected)
+    result=subprocess.run(['python','-c',r.BOOT_SQLITE_CODE.replace('/copy/forge.db',str(expected))],capture_output=True,text=True)
+    assert result.returncode==0,result.stderr
+    startup=r.consolidated_logical_digest(expected)
+    receipt['startup_logical_sha256']=receipt['mark']['startup_logical_sha256']=startup
+    r.atomic_json(target/r.MARK,receipt['mark']);receipt['manifests']['ledger']=r.manifest(target)
+    monkeypatch.setattr(r,'compose',lambda c,*args:SimpleNamespace(stdout=args[-1]))
+    monkeypatch.setattr(r,'inspect',lambda c,name:{'Id':name,'Image':r.PUBLISHER_RUNTIME if name=='forge-publisher' else r.RUNTIME,
+        'State':{'Running':True},'Mounts':[{'Destination':'/var/lib/forge','Type':'volume','Name':c['volumes']['ledger'],'RW':name=='coordinator'}]})
+    def execute(c,*argv,**kwargs):
+        assert argv[0]=='exec' and '--user' not in argv
+        child=subprocess.run(['python','-c',argv[-1].replace('/var/lib/forge/forge.db',str(ledger))],capture_output=True,text=True)
+        assert child.returncode==0,child.stderr
+        return child
+    monkeypatch.setattr(r,'docker',execute)
+    assert r.verify_containers(c,d,meta,receipt,False)['container_verification']
+    # Use the same packaged boot functions, retaining their real writer/WAL.
+    namespace={}
+    code=r.BOOT_SQLITE_CODE.split('assert not any(')[0].replace('/copy/forge.db',str(ledger))
+    exec(code.replace("c.execute('PRAGMA wal_checkpoint(TRUNCATE)');c.close()",''),namespace)
+    writer=namespace['c']
+    try:
+        assert Path(str(ledger)+'-wal').stat().st_size>0
+        assert r.verify_containers(c,d,meta,receipt,False)['container_verification']['coordinator']['logical_sha256']==startup
+        before=writer.execute('SELECT applied_at FROM schema_version WHERE version=1').fetchone()[0]
+        writer.execute('UPDATE schema_version SET applied_at=? WHERE version=1',('unapproved',));writer.commit()
+        with pytest.raises(r.Refusal,match='different ledger'):r.verify_containers(c,d,meta,receipt,False)
+        assert r.read_json(d/'load-receipt.json')['container_verification'] is None
+        writer.execute('UPDATE schema_version SET applied_at=? WHERE version=1',(before,));writer.commit()
+        writer.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+        assert r.verify_containers(c,d,meta,receipt,False)['container_verification']
+    finally:writer.close()
+    assert r.sha256(d/'forge.db')==meta['sha256']
