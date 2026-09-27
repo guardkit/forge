@@ -1,0 +1,416 @@
+#!/usr/bin/env python3
+"""Close, settle, stop, prove and resume one explicitly inventoried estate."""
+from __future__ import annotations
+import argparse
+import importlib.machinery
+import importlib.util
+import inspect as inspect_source
+import json
+import os
+from pathlib import Path
+import re
+import sqlite3
+import sys
+import tempfile
+import time
+from datetime import datetime, timezone
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import rollout_support as r
+
+HERE = Path(__file__).resolve().parent
+SERVICES = ('front-door','bus-gateway','memory-relay','memory','forge-publisher','answer-service','coordinator')
+PRODUCERS = ('front-door','bus-gateway')
+RESUMED = 'ROLLOUT-RESUMED'
+ACTIVE_BUILDS = {'QUEUED','PREPARING','RUNNING','PAUSED','FINALISING'}
+ACTIVE_PLANS = {'QUEUED','RUNNING','PAUSED','FEATURE_SPEC','FEATURE_PLAN'}
+GUARD = '''import sys,types,importlib.abc
+class NoBrokerClient(importlib.abc.MetaPathFinder):
+ def find_spec(self,name,path=None,target=None):
+  if name=='nats' or name.startswith('nats.') or name=='nats_core.client': raise RuntimeError('real broker client is forbidden')
+sys.meta_path.insert(0,NoBrokerClient())
+assert not any(n=='nats' or n.startswith('nats.') or n=='nats_core.client' for n in sys.modules)
+m=types.ModuleType('nats_core.client');m.__rollout_mock__=True
+def forbidden(*a,**k):raise RuntimeError('broker client is forbidden')
+m.NATSClient=forbidden;m.NATSKVManifestRegistry=forbidden;sys.modules['nats_core.client']=m
+'''
+
+def need(condition, sentence):
+    if not condition: r.refuse(sentence)
+
+def now(): return datetime.now(timezone.utc).isoformat()
+
+def load_script(name):
+    loader=importlib.machinery.SourceFileLoader('rollout_'+name.replace('-','_'),str(HERE/name))
+    spec=importlib.util.spec_from_loader(loader.name,loader);module=importlib.util.module_from_spec(spec);loader.exec_module(module);return module
+
+def private_path(value, *, exists=False):
+    p=r.path(value,exists=exists)
+    if p.exists():need(p.is_file() and p.stat().st_nlink==1, f'private artifact {p} is not one unaliased regular file; preserve it and select a safe path')
+    return p
+
+def stable_runtime(item):
+    # Runtime endpoint IDs and assigned IPs disappear on stop. Only declarative
+    # network identity/aliases/IPAM options participate in the reconstruction seal.
+    identity={k:v for k,v in item['service_identity'].items() if k!='container_id'}
+    networks={k:{f:v.get(f) for f in ('Aliases','Links','IPAMConfig','DriverOpts')} for k,v in item['networks'].items()}
+    for network in networks.values():
+        network['Aliases']=sorted(a for a in network['Aliases'] or [] if a not in (item['service_identity']['container_id'],item['service_identity']['container_id'][:12]))
+    return {k:item[k] for k in ('image_id','repo_tags','mounts','port_bindings','restart_policy','network_mode','env_names')} | {'service_identity':identity,'networks':networks}
+
+def work_problems(state):
+    result=[];work=state['work_state']
+    for table,record in work.items():
+        if record.get('status')=='NOT-YET':continue
+        for row in record['rows']:
+            active = (table=='builds' and (row['status'] in ACTIVE_BUILDS or row.get('pending_approval_request_id'))
+                or table=='planning_runs' and (row['state'] in ACTIVE_PLANS or row.get('pending_approval_request_id'))
+                or table=='work_queue'
+                or table=='publication_records' and row.get('result')!='merged into the remote and running'
+                or table=='deployment_targets' and bool(row.get('holder_build')))
+            if active:result.append({'table':table,'row':row})
+    return result
+
+def reader_counts(doc, account=''):
+    need(isinstance(doc,dict) and isinstance(doc.get('account_details'),list),'monitoring response is unknown; restore its complete account details before proceeding')
+    holders=[]
+    for a in doc['account_details']:
+        if account and a.get('name')!=account:continue
+        for stream in a.get('stream_detail',[]):
+            if stream.get('name')=='PIPELINE':holders.append((a.get('name'),stream))
+    need(len(holders)==1,'PIPELINE account is absent or ambiguous; explicitly select its real account before proceeding')
+    name,stream=holders[0];result={}
+    for wanted in ('forge-serve','forge-serve-planning'):
+        rows=[x for x in stream.get('consumer_detail',[]) if x.get('name')==wanted]
+        need(len(rows)==1,f'reader {wanted} is absent or ambiguous; restore its monitoring identity before proceeding')
+        row=rows[0]
+        need(all(type(row.get(k)) is int and row[k]>=0 for k in ('num_pending','num_ack_pending')),f'reader {wanted} has unknown counts; restore readable integer observations before proceeding')
+        result[wanted]={k:row.get(k) for k in ('num_pending','num_ack_pending','delivered','ack_floor')}
+    return {'account':name,'stream':'PIPELINE','readers':result}
+
+def quiet_counts(counts):
+    for name,values in counts['readers'].items():
+        need(values['num_pending']==values['num_ack_pending']==0,f'reader {name} still has pending or unacknowledged work; leave admissions closed and let it settle')
+
+class Estate:
+    def __init__(self,args):
+        self.args=args;self.config_path=r.path(args.config);self.c=r.read_json(self.config_path)
+        self.q=self.c['quiesce'];self.snapshot=r.path(args.snapshot,exists=False)
+        need(re.fullmatch(r'\d{8}T\d{6}Z(?:-[A-Za-z0-9_-]+)?',self.snapshot.name),'snapshot is not a dated path; name its exact future or existing directory')
+        need(self.snapshot.parent==r.path(self.c['snapshot_root']),'snapshot is outside the declared root; select its dated child')
+        need(args.project==self.c['project'] and args.env_file==self.c['env_file'],'explicit env or project conflicts with inventory; select the intended phase inventory')
+        need(re.fullmatch(r'[a-z0-9][a-z0-9_-]+',args.project) and self.c['runtime_image']==r.RUNTIME,'estate project or runtime identity is invalid; use the accepted explicit release')
+        need(set(self.c['volumes'])==r.VOLUME_ROLES and len(set(self.c['volumes'].values()))==5,'five distinct state volumes are required; correct the explicit inventory')
+        need(set(self.c['units'])==r.UNIT_ROLES and set(self.c['old_containers'])=={'coordinator','memory','relay'} and len(set(self.c['units'].values()))==len(r.UNIT_ROLES) and len(set(self.c['old_containers'].values()))==3,'legacy identities are incomplete or repeated; name exactly the distinct recorded units and three containers')
+        need(all(re.fullmatch('[a-zA-Z0-9][a-zA-Z0-9_.-]+',name) for name in self.c['volumes'].values()),'state volume name is invalid; use five explicit named volumes')
+        self.receipt=private_path(self.q['receipt'])
+        old_root=Path(self.c['source_db']).parent
+        need(old_root!=self.receipt and old_root not in self.receipt.parents,'close receipt lies in the old ledger folder; choose external private evidence storage')
+        need(self.snapshot!=self.receipt and self.snapshot not in self.receipt.parents,'close receipt lies inside the future snapshot; select a private external receipt path')
+        paths=[self.config_path,self.snapshot,*[Path(v) for v in self.c['sources'].values()],Path(self.c['source_db'])]
+        paths += [Path(self.q[k]) for k in ('original_env_file','original_settings','prepared_env_file','prepared_settings','settings_receipt')]
+        paths += [Path(x) for x in args.secret_env_file]
+        for p in paths:
+            # Phase-independent binding is lexical: after resume even stat() of
+            # the old folder is forbidden. Existing output aliases are excluded
+            # by private_path's single-link rule; new outputs cannot be aliases.
+            need(p.is_absolute() and '..' not in p.parts,'inventory contains an indirect path; provide absolute direct phase paths')
+            need(self.receipt!=p and p not in self.receipt.parents,f'close receipt aliases or lies within input {p}; choose a distinct private output')
+        old=args.env_file==self.q['original_env_file'];prepared=args.env_file==self.q['prepared_env_file']
+        need(old != prepared,'phase env paths are missing or ambiguous; declare distinct original and prepared inputs')
+        self.phase='original' if old else 'prepared'
+        need(self.c['sources']['settings']==self.q[self.phase+'_settings'],'settings source differs from the declared phase; select the matching original or prepared inventory')
+        renderer=load_script('rollout-settings');public,_=renderer.read_env(r.path(args.env_file));self.values=dict(public)
+        for filename in args.secret_env_file:
+            p=private_path(filename,exists=True);need(p.stat().st_mode & 0o077==0,'private env file is exposed to other users; set mode0600 before proceeding')
+            values,_=renderer.read_env(p)
+            need(not set(values)&set(self.values),'private env input overrides a public or earlier name; resolve duplicate ownership before proceeding')
+            self.values.update(values)
+        for _ in range(8):
+            self.values={k:re.sub(r'\$\{([A-Za-z_][A-Za-z0-9_]*)\}',lambda m:self.values.get(m[1],m[0]),v) for k,v in self.values.items()}
+        need(self.values.get('FORGE_IMAGE')==self.c['runtime_image'],'public env selects another runtime image; select the reviewed phase env')
+        self.env={k:v for k,v in os.environ.items() if k in ('PATH','HOME','DOCKER_CONFIG','XDG_RUNTIME_DIR')};self.env.update(self.values)
+        self.binding={k:self.c[k] for k in ('project','docker_context','runtime_image','source_db','snapshot_root','units','old_containers','volumes')}
+        self.binding['sources']={k:v for k,v in self.c['sources'].items() if k!='settings'}
+        self.binding['phases']={k:self.q[k] for k in ('original_env_file','original_settings','prepared_env_file','prepared_settings','settings_receipt')}
+        self.binding['snapshot']=str(self.snapshot)
+        self.doc=None
+
+    def save(self):
+        private_path(self.receipt);r.atomic_json(self.receipt,self.doc)
+    def record(self):
+        doc=r.read_json(private_path(self.receipt,exists=True))
+        need(doc.get('format_version')==1 and doc.get('binding')==self.binding,'close receipt belongs to different identities or phase paths; reconcile the explicit inventory')
+        self.doc=doc;return doc
+    def compose(self,*args):
+        cmd=['compose','--project-name',self.c['project'],'--env-file',self.args.env_file]
+        for f in self.c['compose_files']:cmd+=['-f',str(r.path(f))]
+        return r.docker(self.c,*cmd,*args,env=self.env)
+    def model(self):return json.loads(self.compose('config','--format','json').stdout)
+    def helper(self,code,args=(),mounts=(),image=None,network='none',input=None,environment=False):
+        cmd=['run','--rm','--network',network,'--read-only','--tmpfs','/tmp','-e','PYTHONDONTWRITEBYTECODE=1','--user','0:0']
+        for mount in mounts:cmd+=['--mount',mount]
+        if environment:
+            for key in self.values:cmd+=['--env',key]
+        return r.docker(self.c,*cmd,'--entrypoint','python',image or self.c['runtime_image'],'-c',code,*args,input=input,env=self.env if environment else None).stdout
+    def volume_exists(self):
+        names=r.docker(self.c,'volume','ls','--format','{{.Name}}').stdout.splitlines()
+        return self.c['volumes']['ledger'] in names
+    def volume(self,role,code,args=(),write=False,environment=False):
+        name=self.c['volumes'][role];r.volume_identity(self.c,name,self.model())
+        return self.helper(code,args,[f'type=volume,src={name},dst=/state'+('' if write else ',readonly')],environment=environment)
+    def markers(self):
+        host_path=private_path(self.snapshot/'resumed.json')
+        host=r.read_json(host_path) if host_path.exists() else None
+        ledger=None
+        if self.volume_exists():
+            text=self.volume('ledger',"import pathlib,json; p=pathlib.Path('/state/ROLLOUT-RESUMED'); assert not p.is_symlink(); print(p.read_text() if p.exists() else 'null')")
+            ledger=json.loads(text)
+        need((host is None)==(ledger is None),'resume marker exists in only one place; keep the estate stopped and reconcile both original markers')
+        if host is not None:
+            need(isinstance(host,dict) and host==ledger and host.get('project')==self.c['project'] and host.get('snapshot')==str(self.snapshot) and host.get('format_version')==1,'resume markers disagree or are invalid; keep current authority and reconcile them')
+            required={'snapshot_sha256','release_tag','image_id','actor','at','work_state','close_receipt_sha256'}
+            need(required<=host.keys() and host['image_id']==self.c['runtime_image'] and host['release_tag']==self.q['release_tag'] and isinstance(host['work_state'],dict) and isinstance(host['actor'],str) and bool(host['actor']) and all(isinstance(host[k],str) and re.fullmatch('[0-9a-f]{64}',host[k]) for k in ('snapshot_sha256','close_receipt_sha256')),'resume marker lacks complete release or provenance facts; retain current authority and reconcile its original pair')
+            need(host['snapshot_sha256']==r.read_json(self.snapshot/'metadata.json')['sha256'],'resume marker names another snapshot; retain current authority and reconcile its provenance')
+            datetime.fromisoformat(host['at'])
+        return host
+    def current_state(self):
+        code='import pathlib,sqlite3,json,hashlib\nfrom contextlib import closing\nPath=pathlib.Path\nWORK_TABLES='+repr(r.WORK_TABLES)+'\n'+inspect_source.getsource(r.Refusal)+inspect_source.getsource(r.refuse)+inspect_source.getsource(r.path)+inspect_source.getsource(r.ledger_state)+inspect_source.getsource(r.logical_digest)+'''
+p=Path('/state/forge.db');wal=Path(str(p)+'-wal');active=wal.exists() and wal.stat().st_size>0
+state=ledger_state(p,consolidated=not active)
+with closing(sqlite3.connect(p.as_uri()+('?mode=ro' if active else '?mode=ro&immutable=1'),uri=True)) as c:
+ c.execute('BEGIN');state['logical_sha256']=logical_digest(c)
+state['fingerprint']={'db_mtime_ns':p.stat().st_mtime_ns,'db_size':p.stat().st_size,'wal_size':wal.stat().st_size if wal.exists() else 0}
+print(json.dumps(state))
+'''
+        return json.loads(self.volume('ledger',code))
+    def state(self):return r.ledger_state(r.path(self.c['source_db'])) if self.phase=='original' else self.current_state()
+    def monitor(self):
+        need(self.values.get('BUS_MODE')=='external','rollout requires the retained external bus; select its explicit public env')
+        need(self.values.get('ROLLOUT_BUS_STREAM')=='PIPELINE' and self.values.get('ROLLOUT_BUS_CONSUMERS','').split()==['forge-serve','forge-serve-planning'],'durable reader inventory differs from the accepted runtime; declare both actual PIPELINE readers')
+        address=self.values.get('BUS_MONITORING_ADDRESS','');from urllib.parse import urlparse
+        parsed=urlparse('http://'+address);client=urlparse(self.values.get('FORGE_NATS_URL',''))
+        need(parsed.hostname and parsed.hostname==client.hostname and parsed.port not in (None,4222) and not parsed.username,'monitoring address is not the declared bus host on an explicit HTTP port; correct public routing')
+        network=self.values.get('BUS_EXTERNAL_NETWORK');need(network,'retained monitoring network is unnamed; declare BUS_EXTERNAL_NETWORK')
+        code="import json,sys,urllib.request; print(urllib.request.urlopen('http://'+sys.argv[1]+'/jsz?accounts=true&streams=true&consumers=true',timeout=8).read().decode())"
+        return reader_counts(json.loads(self.helper(code,[address],network=network)),self.values.get('BUS_STREAMS_ACCOUNT',''))
+    def unit(self,name):
+        fields=('LoadState','ActiveState','SubState','MainPID','ControlPID','UnitFileState')
+        out=r.run(['systemctl','--user','show',name,*['--property='+f for f in fields]]).stdout
+        doc=dict(line.split('=',1) for line in out.splitlines() if '=' in line)
+        if name.endswith('.timer'):
+            doc.setdefault('MainPID','0');doc.setdefault('ControlPID','0')
+        need(all(k in doc for k in fields) and doc['LoadState'] in ('loaded','masked'),f'unit {name} is missing or unreadable; restore its explicit definition')
+        return doc
+    def unit_stopped(self,name):
+        p=self.unit(name);need(p['ActiveState'] in ('inactive','failed') and p['MainPID']==p['ControlPID']=='0',f'unit {name} still has a process; settle it before proceeding');return p
+    def systemctl(self,*args):r.run(['systemctl','--user',*args])
+    def allowed_images(self,service,rendered):return {rendered}
+    def service_ids(self,services=SERVICES):
+        model=self.model();result={}
+        for service in services:
+            need(service in model.get('services',{}),f'service {service} is absent from the actual graph; correct the phase Compose inputs')
+            ids=self.compose('ps','--all','-q',service).stdout.split();need(len(ids)<=1,f'service {service} is ambiguous; reconcile its exact container identity')
+            if ids:
+                item=r.inspect(self.c,ids[0]);labels=item['Config'].get('Labels',{})
+                need(labels.get('com.docker.compose.project')==self.c['project'] and labels.get('com.docker.compose.service')==service,f'container {ids[0]} has conflicting ownership; keep it untouched and reconcile')
+                need(item['Image'] in self.allowed_images(service,model['services'][service]['image']),f'{service} runs another image; reconcile the declared graph before mutation')
+                # Actual authoritative volume attachments must match the rendered graph.
+                for mount in model['services'][service].get('volumes',[]):
+                    if mount['type']=='volume':
+                        volume=model['volumes'][mount['source']]['name']
+                        actual=[m for m in item['Mounts'] if m['Destination']==mount['target']]
+                        need(len(actual)==1 and actual[0]['Type']=='volume' and actual[0]['Name']==volume and actual[0]['RW']==(not mount.get('read_only',False)),f'{service} actual mount differs from its graph; reconcile before stopping it')
+                result[service]=item
+        return result
+    def producers_stopped(self):
+        for name,item in self.service_ids(PRODUCERS).items():need(not item['State']['Running'],f'producer {name} is running; close admissions before proceeding')
+    def stop_current(self,services):
+        for name,item in self.service_ids(services).items():
+            if item['State']['Running']:r.docker(self.c,'stop',item['Id'])
+            need(not r.inspect(self.c,item['Id'])['State']['Running'],f'{name} did not stop; keep admissions closed')
+    def watch_closed(self,*,stop=False,required=False):
+        model=json.loads(self.compose('--profile','watch','config','--format','json').stdout);present='gateway-watch' in model.get('services',{})
+        need(present or not required,'normal gateway-watch service is absent from Compose; use the accepted watch profile before resume')
+        if not present:
+            ids=r.docker(self.c,'ps','--all','--filter','label=com.docker.compose.project='+self.c['project'],'--filter','label=com.docker.compose.service=gateway-watch','--format','{{.ID}}').stdout.strip()
+            need(not ids,'an undeclared gateway-watch exists; reconcile its exact Compose identity')
+            return
+        expected=model['services']['gateway-watch']['image']
+        need(re.fullmatch(r'sha256:[0-9a-f]{64}',expected) and expected==self.values.get('NATS_PROVISION_IMAGE'),'gateway-watch provisioning image is not explicitly pinned; use the reviewed public image ID')
+        ids=self.compose('--profile','watch','ps','--all','-q','gateway-watch').stdout.split()
+        need(len(ids)<=1,'gateway-watch has ambiguous containers; reconcile its exact Compose identity')
+        for identifier in ids:
+            item=r.inspect(self.c,identifier);labels=item['Config'].get('Labels',{})
+            need(labels.get('com.docker.compose.project')==self.c['project'] and labels.get('com.docker.compose.service')=='gateway-watch' and item['Image']==expected,'gateway-watch ownership or image differs; leave it untouched and reconcile')
+            if stop and item['State']['Running']:r.docker(self.c,'stop',item['Id'])
+            need(not r.inspect(self.c,item['Id'])['State']['Running'],'gateway-watch is still monitoring the rollout window; stop its exact container before proceeding')
+
+    def close(self):
+        marker=self.markers()
+        if marker:need(self.phase=='prepared','resumed estate requires prepared inputs; do not access or reopen old state')
+        if self.receipt.exists():self.record()
+        else:
+            need(self.phase=='original' and marker is None,'initial close requires the original phase inventory; preserve current state and locate its close receipt')
+            units={key:self.unit(name) for key,name in self.c['units'].items()}
+            runtimes={}
+            for role,name in self.c['old_containers'].items():
+                item=r.inspect(self.c,name);runtimes[role]=r.previous_runtime(self.c,item)
+                runtimes[role]['labels']=item['Config'].get('Labels',{})
+            self.doc={'format_version':1,'binding':self.binding,'created_at':now(),'units_before':units,'old_runtimes':runtimes,'stage':'recorded','observations':[]};self.save()
+        if self.phase=='prepared':
+            self.watch_closed(stop=True);self.stop_current(PRODUCERS)
+        else:
+            for role in ('watchdog_timer','watchdog_service'):
+                self.systemctl('stop',self.c['units'][role]);self.unit_stopped(self.c['units'][role])
+            for role in ('watchdog_timer','watchdog_service'):self.systemctl('mask',self.c['units'][role])
+            for role in ('gateway','frontdoor'):
+                self.systemctl('stop',self.c['units'][role]);self.unit_stopped(self.c['units'][role]);self.systemctl('disable',self.c['units'][role])
+            self.unit_stopped(self.c['units']['autobuild']);self.systemctl('mask',self.c['units']['autobuild'])
+        self.doc['stage']='closed';self.doc['closed_phase']=self.phase;self.save()
+        return {'closed':True,'notice':'No session may run forge queue until this rollout explicitly resumes.'}
+    def closed(self):
+        self.record();need(self.doc.get('stage') in ('closed','settled','final','resumed'),'admissions closure is not recorded; run --close first')
+        if self.phase=='prepared':
+            self.watch_closed();self.producers_stopped()
+        else:
+            for role in ('gateway','frontdoor','autobuild','watchdog_timer','watchdog_service'):self.unit_stopped(self.c['units'][role])
+            for role in ('watchdog_timer','watchdog_service','autobuild'):need(self.unit(self.c['units'][role])['UnitFileState'] in ('masked','masked-runtime'),f'{role} is not masked; repeat --close')
+    def settle(self):
+        self.closed();observations=[]
+        for index in range(2):
+            count=self.monitor();quiet_counts(count);state=self.state();need(not work_problems(state),'record still has active work; leave admissions closed and settle the named rows')
+            observations.append({'at':now(),'counts':count,'work_state':state['work_state']})
+            if index==0:time.sleep(20)
+        self.doc['observations']+=observations;self.doc['stage']='settled';self.save();return {'settled':observations}
+    def final(self):
+        self.closed();need(self.doc['stage'] in ('settled','final'),'two quiet observations are missing; run --settle before stopping writers')
+        if self.phase=='original':
+            command=[HERE/'rollout-sandbox','--config',self.config_path,'--env-file',self.args.env_file,'--project',self.c['project'],'--stop-legacy']
+            for p in self.args.secret_env_file:command+=['--secret-env-file',p]
+            r.run(command,env=self.env)
+            for role in ('langgraph_sidecar','deploy_sidecar'):self.systemctl('stop',self.c['units'][role]);self.unit_stopped(self.c['units'][role])
+            for role in ('relay','memory','coordinator'):
+                item=r.inspect(self.c,self.c['old_containers'][role]);need(item['Id']==self.doc['old_runtimes'][role]['service_identity']['container_id'],f'old {role} identity changed since close; reconcile before stopping')
+                if item['State']['Running']:r.docker(self.c,'stop',item['Id'])
+            r.stopped(self.c);db=r.path(self.c['source_db']);r.no_holders(db);before=r.fingerprint(db);first=r.ledger_state(db);time.sleep(20);r.no_holders(db)
+            need(before==r.fingerprint(db) and first==r.ledger_state(db),'old ledger changed after stopping; find its remaining writer before snapshot')
+            state=first
+        else:
+            self.stop_current(SERVICES)
+            # Every container attachment, including non-Compose writers, is explicit.
+            attachments=r.docker(self.c,'ps','--filter','volume='+self.c['volumes']['ledger'],'--format','{{.ID}}').stdout.strip();need(not attachments,'a running container still attaches the current ledger; stop its explicit writer before proceeding')
+            first=self.current_state();time.sleep(20);state=self.current_state();need(first==state,'current ledger changed after graph stop; find its remaining writer')
+        need(not work_problems(state),'stopped record still contains active work; reconcile it without cancelling or discarding anything')
+        count=self.monitor();quiet_counts(count);self.doc['stage']='final';self.doc['final_phase']=self.phase;self.doc['final']={'at':now(),'state':state,'counts':count};self.save();return self.doc['final']
+    def planning(self,enabled):
+        code=GUARD+'''import pathlib,sys,json,os,tempfile,yaml
+from forge.config.loader import load_config
+p=pathlib.Path('/state/forge.yaml');assert p.is_file() and not p.is_symlink()
+x=yaml.safe_load(p.read_text());assert isinstance(x.get('planning'),dict);x['planning']['enabled']=sys.argv[1]=='true'
+fd,t=tempfile.mkstemp(dir=p.parent,prefix='.planning-')
+try:
+ with os.fdopen(fd,'w') as f:yaml.safe_dump(x,f,sort_keys=False);f.flush();os.fsync(f.fileno())
+ load_config(pathlib.Path(t))
+ os.chmod(t,0o644);os.chown(t,p.stat().st_uid,p.stat().st_gid);os.replace(t,p)
+ d=os.open(p.parent,os.O_DIRECTORY);os.fsync(d);os.close(d)
+ assert yaml.safe_load(p.read_text())['planning']['enabled']==(sys.argv[1]=='true')
+finally:
+ if os.path.exists(t):os.unlink(t)
+print('planning switch read back')
+'''
+        self.volume('settings',code,['true' if enabled else 'false'],write=True,environment=True)
+    def prepared_settings(self):
+        receipt=r.read_json(private_path(self.q['settings_receipt'],exists=True))
+        need(receipt.get('schema')==1 and receipt.get('env_output_sha256')==r.sha256(r.path(self.args.env_file)) and receipt.get('settings_output_sha256')==r.sha256(r.path(self.q['prepared_settings'])) and receipt.get('previous_runtime_sha256')==r.sha256(self.snapshot/'previous-runtime.json'),'prepared settings receipt differs from the declared artifacts; rerun the accepted renderer before resume')
+        expected=[{'path':str(r.path(p)),'sha256':r.sha256(p)} for p in self.c['compose_files']]
+        need(receipt.get('project_files')==expected,'prepared Compose inputs changed since settings validation; rerun the accepted renderer')
+        code=GUARD+"import pathlib,hashlib,json; from forge.config.loader import load_config; p=pathlib.Path('/state/forge.yaml'); config=load_config(p); assert config.planning.enabled is False; print(hashlib.sha256(p.read_bytes()).hexdigest())"
+        actual=self.volume('settings',code,environment=True).strip()
+        need(actual==receipt['settings_output_sha256'],'current settings volume differs from the validated prepared file; keep admissions closed')
+
+    def resume(self):
+        need(self.phase=='prepared','resume requires prepared settings and env; select the loader inventory')
+        marker=self.markers();self.record()
+        if marker:return {'resumed':True,'idempotent':True,'notice':'Markers already establish current authority; no restore or automatic producer retry is permitted.'}
+        self.prepared_settings()
+        tag=json.loads(r.docker(self.c,'image','inspect',self.q['release_tag']).stdout)[0]
+        need(tag['Id']==self.c['runtime_image'],'release tag moved from the intended image; keep admissions closed')
+        self.watch_closed(required=True)
+        self.producers_stopped();counts=self.monitor();quiet_counts(counts)
+        r.load_volumes(self.c,self.snapshot,verify=True)
+        r.run([HERE/'estate-check','--read-pre-resume','--env-file',self.args.env_file,'--project',self.c['project'],'--for-image',self.c['runtime_image']],env=self.env)
+        need(self.values.get('ROLLOUT_STATE_DIR')==str(self.snapshot),'pre-resume receipt is not in this snapshot; bind ROLLOUT_STATE_DIR before resuming')
+        state=self.current_state();need(not work_problems(state),'current record has active work before resume; keep admissions closed')
+        marker={'format_version':1,'project':self.c['project'],'snapshot':str(self.snapshot),'snapshot_sha256':r.verify_snapshot(self.snapshot)['sha256'],'release_tag':self.q['release_tag'],'image_id':self.c['runtime_image'],'actor':self.q['actor'],'at':now(),'work_state':state['work_state'],'close_receipt_sha256':r.sha256(self.receipt)}
+        code='''import json,os,pathlib,sys
+p=pathlib.Path('/state/ROLLOUT-RESUMED');data=(json.dumps(json.loads(sys.argv[1]),sort_keys=True,indent=2)+'\\n').encode()
+fd=os.open(p,os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600)
+with os.fdopen(fd,'wb') as f:f.write(data);f.flush();os.fsync(f.fileno())
+d=os.open(p.parent,os.O_DIRECTORY);os.fsync(d);os.close(d);assert p.read_bytes()==data
+'''
+        self.volume('ledger',code,[json.dumps(marker)],write=True)
+        private_path(self.snapshot/'resumed.json');need(not (self.snapshot/'resumed.json').exists(),'host resume marker appeared during write; keep current authority and reconcile both markers')
+        r.atomic_json(self.snapshot/'resumed.json',marker);need(self.markers()==marker,'resume marker readback failed; keep admissions closed')
+        self.doc['stage']='resumed';self.save()
+        result={'started_at':now(),'marker':marker,'services_check':None,'factory_hello':None,'passed':False}
+        try:
+            self.planning(True);self.compose('up','--no-deps','-d','--force-recreate','coordinator')
+            self.compose('up','--no-deps','-d',*PRODUCERS)
+            r.run([HERE/'estate-check','services','--env-file',self.args.env_file,'--project',self.c['project']],env=self.env);result['services_check']='passed'
+            r.run([HERE/'factory-hello','--env-file',self.args.env_file,'--project',self.c['project']],env=self.env);result['factory_hello']='completed'
+            self.compose('--profile','watch','up','--no-deps','-d','gateway-watch');result['passed']=True
+        finally:
+            result['finished_at']=now();r.atomic_json(self.snapshot/'post-resume-check.json',result)
+        return result
+    def reopen(self):
+        need(self.markers() is None,'work has resumed; legacy producers must remain retired and only forward-or-stopped recovery is permitted')
+        self.record()
+        if self.doc.get('restored'):
+            names=set(r.docker(self.c,'volume','ls','--format','{{.Name}}').stdout.split())
+            need(not names.intersection(self.c['volumes'].values()),'new state volumes remain after claimed old restore; keep legacy producers closed and reconcile authority')
+            for role,identifier in self.doc['restored_ids'].items():
+                item=r.inspect(self.c,identifier)
+                need(item['Id']==identifier and stable_runtime(r.previous_runtime(self.c,item))==stable_runtime(self.doc['old_runtimes'][role]),'restored old runtime differs from its exact saved reconstruction; keep producers closed')
+        if not self.doc.get('restored'):
+            need(self.phase=='original' and not self.volume_exists() and not (self.snapshot/'load-receipt.json').exists(),'old authority has not been restored and verified; run before-resume rollback before reopening producers')
+            for role,name in self.c['old_containers'].items():
+                item=r.inspect(self.c,name);need(item['Id']==self.doc['old_runtimes'][role]['service_identity']['container_id'],'original authority identity changed; reconcile before reopening')
+                if not item['State']['Running']:r.docker(self.c,'start',item['Id'])
+        # Sandbox runner/keeper remain under the accepted replacement lifecycle;
+        # no saved stop hook or legacy definition is reinstated here.
+        for role in ('runner','keeper','langgraph_sidecar','deploy_sidecar'):
+            if self.doc['units_before'][role]['ActiveState']=='active':self.systemctl('start',self.c['units'][role])
+        for role in ('gateway','frontdoor','autobuild'):
+            name=self.c['units'][role];old=self.doc['units_before'][role]
+            if old['UnitFileState'] not in ('masked','masked-runtime'):self.systemctl('unmask',name)
+            if old['UnitFileState']=='enabled':self.systemctl('enable',name)
+            if old['ActiveState']=='active':self.systemctl('start',name)
+        return {'reopened':True,'retired_alarm':'remains masked'}
+    def plan(self,mode):
+        # Do not create helper containers, SQLite sidecars, or E2 probe files.
+        # Facts needing an execution namespace are explicitly unknown in preview.
+        observations={'markers':{'status':'UNKNOWN','action':'read both actual marker locations during execution'},'readers':{'status':'UNKNOWN','action':'read live monitoring twice and after stopping writers during execution'}}
+        try:
+            if self.phase=='original':
+                p=r.path(self.c['source_db']);wal=Path(str(p)+'-wal')
+                need(not wal.exists() or wal.stat().st_size==0,'committed WAL requires the actual readonly observation')
+                observations['work']=r.ledger_state(p,consolidated=True)
+            else:
+                metadata=r.read_json(self.snapshot/'metadata.json')
+                observations['historical_snapshot_work']=metadata['work_state']
+                observations['work']={'status':'UNKNOWN','action':'read current volume during execution; snapshot facts are historical only'}
+        except Exception:observations['work']={'status':'UNKNOWN','action':'inspect the declared phase input before execution'}
+        return {'plan':True,'mode':mode,'phase':self.phase,'observations':observations,'notice':'No state, helper container, receipt-store probe, marker, unit or application changed; no session may run forge queue.'}
+
+def arguments(argv=None,back=False):
+    p=r.Parser(description=__doc__);p.add_argument('--config',required=True);p.add_argument('--env-file',required=True);p.add_argument('--project',required=True);p.add_argument('--snapshot',required=True);p.add_argument('--secret-env-file',action='append',default=[]);p.add_argument('--plan',action='store_true')
+    if not back:
+        modes=p.add_mutually_exclusive_group(required=True)
+        for mode in ('close','settle','final','resume','reopen'):modes.add_argument('--'+mode,action='store_const',const=mode,dest='mode')
+    return p
+
+def main(argv=None):
+    args=arguments().parse_args(argv)
+    return r.main_guard(lambda: Estate(args).plan(args.mode) if args.plan else getattr(Estate(args),args.mode)())
+if __name__=='__main__':raise SystemExit(main())
