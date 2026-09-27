@@ -161,7 +161,7 @@ def volume_argument(mount):
     allowed={'Type','Name','Source','Destination','Driver','Mode','RW','Propagation'}
     q.need(set(mount)==allowed and mount.get('Type')=='volume','saved named volume identity is incomplete or carries unsupported options; reconcile it before recovery')
     q.need(all(isinstance(mount[k],str) and mount[k] for k in ('Name','Source','Destination','Driver','Mode')),'saved named volume identity is incomplete; reconcile it before recovery')
-    q.need(re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_.-]+',mount['Name']) and mount['Source'].startswith('/') and mount['Destination'].startswith('/') and mount['Destination']!='/' and ':' not in mount['Destination'] and not any(x in mount['Source']+mount['Destination'] for x in ('\0','\n','\r')),'saved named volume cannot be represented safely by Docker --volume; reconcile it before recovery')
+    q.need(re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_.-]+',mount['Name']) and mount['Source'].startswith('/') and mount['Destination'].startswith('/') and all(part not in ('','.','..') for part in mount['Destination'].split('/')[1:]) and ':' not in mount['Destination'] and not any(x in mount['Source']+mount['Destination'] for x in ('\0','\n','\r')),'saved named volume cannot be represented safely by Docker --volume; reconcile it before recovery')
     q.need(type(mount['RW']) is bool and mount['Mode']==('rw' if mount['RW'] else 'ro'),'saved named volume mode is unsupported or contradicts RW; reconcile its exact security semantics before recovery')
     q.need(mount['Propagation']=='','saved named volume propagation is unsupported; reconcile its exact semantics before recovery')
     return mount['Name']+':'+mount['Destination']+':'+mount['Mode']
