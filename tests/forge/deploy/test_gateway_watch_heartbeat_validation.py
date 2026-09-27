@@ -95,6 +95,41 @@ def _run_watch(
             id="wrong-time-type",
         ),
         pytest.param(
+            json.dumps(
+                {
+                    "state": "connected",
+                    "last_event_at": "junk\n2026-09-26T15:59:55Z",
+                }
+            ),
+            id="time-leading-junk-line",
+        ),
+        pytest.param(
+            json.dumps(
+                {
+                    "state": "connected",
+                    "last_event_at": "2026-09-26T15:59:54Z\n2026-09-26T15:59:55Z",
+                }
+            ),
+            id="time-two-lines",
+        ),
+        pytest.param(
+            json.dumps(
+                {
+                    "state": "connected",
+                    "last_event_at": "2026-09-26T15:59:55Z\njunk",
+                }
+            ),
+            id="time-trailing-junk-line",
+        ),
+        pytest.param(
+            '{"state":"connected","last_event_at":"2026-02-30T15:59:55Z"}',
+            id="impossible-calendar-time",
+        ),
+        pytest.param(
+            '{"state":"connected","last_event_at":"2026-09-26T25:59:55Z"}',
+            id="impossible-clock-time",
+        ),
+        pytest.param(
             '{"state":"connected","last_event_at":"not-a-time"}',
             id="unreadable-time",
         ),
@@ -132,7 +167,7 @@ def test_connected_heartbeat_accepts_producer_extensions(
     heartbeat = json.dumps(
         {
             "state": "connected",
-            "last_event_at": "2026-09-26T15:59:55Z",
+            "last_event_at": "2026-09-26T15:59:55.123456+00:00",
             "last_state_change_at": "2026-09-26T15:59:50Z",
             "kind": "envelope",
         }
@@ -171,6 +206,47 @@ exec "{real_jq}" "$@"
         {
             "state": "connected",
             "last_event_at": "2026-09-26T15:59:55Z",
+        }
+    )
+
+    done, messages = _run_watch(
+        tmp_path,
+        heartbeat_body=heartbeat,
+        jq_bin_dir=fake_bin,
+    )
+
+    assert done.returncode == 10, done.stdout + done.stderr
+    assert "Slack session    unknown" in done.stdout
+    assert len(messages) == 1
+    assert "Slack session    unknown" in messages[0]
+
+
+def test_nonzero_timestamp_conversion_status_refuses_emitted_epoch(
+    tmp_path: Path,
+) -> None:
+    real_jq = shutil.which("jq")
+    assert real_jq is not None
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    wrapper = fake_bin / "jq"
+    wrapper.write_text(
+        f"""#!/bin/sh
+if [ "$1" = "-nr" ] && [ "$2" = "--arg" ] && [ "$3" = "stamp" ]; then
+    "{real_jq}" "$@"
+    status=$?
+    if [ "$status" -ne 0 ]; then
+        exit "$status"
+    fi
+    exit 1
+fi
+exec "{real_jq}" "$@"
+"""
+    )
+    wrapper.chmod(0o755)
+    heartbeat = json.dumps(
+        {
+            "state": "connected",
+            "last_event_at": "2026-09-26T15:59:55.123456+00:00",
         }
     )
 
