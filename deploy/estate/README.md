@@ -888,15 +888,17 @@ the design:
    Every other password in the estate now travels as a file; the coordinator's
    `FORGE_NATS_URL` carries one because Forge's code reads its bus address from
    that single setting. Changing that is Forge's own work, not this bundle's.
-9. **The jarvis image this bundle names is one release behind what this bundle
-   now needs.** The front door's state volume, added 26 September 2026, is
-   mounted at a directory the image has to create and own, and
-   `jarvis:2026.09.26-3` — which `.env.example` names and the manifest pins —
-   predates that line. Started on it, the front door **refuses by name** rather
-   than losing approvals quietly (drive of 26 September 2026: it says so and
-   does not serve). That is the intended order: the next release carries the
-   jarvis commit, and the env file's tag and the manifest's pin move with it.
-   Until then this bundle does not start its front door.
+9. **The replacement release still needs its image and rehearsal proof.**
+   Release `2026.09.26-3` already carries the Jarvis serving and state-directory
+   fix at `4efff4f`; its exact front-door image passed the serving check during
+   preparation. The earlier claim that it predates that fix was stale.
+   The manifest and examples now propose `2026.09.27-1` for the reviewed Forge
+   rollout and sandbox-admission changes. This is a source/metadata candidate,
+   not a built image. Publish its reviewed source, use the normal manifest
+   builder, then bind the operator scripts to the actual immutable image IDs
+   in that receipt and complete the throwaway rehearsal. The operator image
+   constants still name release 3 until that receipt exists; candidate metadata
+   does not qualify the replacement images or authorize rollout.
 10. **Codex's sign-off, and the owner's go.** Nothing here is rollout approval.
 
 ## Why the bus's image is not in the release manifest

@@ -150,12 +150,18 @@ schema: 2
 # commits this is 6, which is the reasoning that left 4 and 2026.09.24-6
 # unused above. There is no gap to explain in any registry.
 #
-# BOTH PINS BELOW WERE PUSHED BEFORE THIS RELEASE WAS CUT (25 September 2026,
+# HISTORICAL 2026.09.25-6: BOTH PINS WERE PUSHED BEFORE IT WAS CUT (25 September 2026,
 # 23:03 UTC): a build from this manifest fetched every one of the six
 # repositories from GitHub and built five images. An earlier version of this
 # note, written while the forge and jarvis pins were local, said the build
 # would stop at the fetch; it did, then, which was the check working.
-version: 2026.09.26-3
+# 2026.09.27-1 is a PREPARATION CANDIDATE, not a built release. It combines
+# the reviewed rollout scripts and registered-sandbox BUILD admission fixes.
+# The Forge source pin is the functional integration ancestor of this metadata
+# change; all five other repository pins remain those of 2026.09.26-3.
+# Source publication, the normal manifest build and new-image rehearsal remain
+# pending. Preserve release 2026.09.26-3 and its immutable image receipts.
+version: 2026.09.27-1
 
 # The one image this repository's own operator scripts mean by "the release
 # image" (ops/forge-prod-recreate.sh reads this line). It is the same name as
@@ -248,12 +254,12 @@ images:
 #   role: build-context-root  — the Dockerfile and the main build context
 #   role: named-context       — supplied to the build as --build-context <name>=<clone>
 repositories:
-  # The first repository fetched, so the first a build would refuse on if its
-  # pin were not on GitHub; this one is (pushed 25 September 2026, 23:03 UTC).
+  # The first repository fetched. This reviewed source pin is local pending
+  # publication approval; the normal release build must fetch it from main.
   - name: forge
     url: https://github.com/guardkit/forge.git
     branch: main
-    commit: ff0142269e502a4492fb095d1d20e57aa30f5b7d
+    commit: 3956c79eb53960e522f28fc809d110052eb58148
     role: build-context-root
   - name: guardkit
     url: https://github.com/guardkit/guardkit.git
@@ -280,8 +286,8 @@ repositories:
   # tagged by this commit — and it is also, like fleet-memory, a repository the
   # release builds an image FROM rather than merely copies code out of.
   #
-  # Pushed 25 September 2026, 23:03 UTC, together with the forge pin above; the
-  # release was built from GitHub after both were.
+  # Unchanged from release 2026.09.26-3, including its serving/state-directory
+  # fix. This source was fetched and verified in that release.
   - name: jarvis
     url: https://github.com/guardkit/jarvis.git
     branch: main
