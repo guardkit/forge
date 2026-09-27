@@ -223,6 +223,33 @@ iso_to_epoch() {
     ' 2>/dev/null
 }
 
+# Keep original response bytes out of Bash variables. Raw slurp sees the entire
+# response, including literal NUL (which Bash would silently remove). Reject NUL
+# explicitly because jq versions differ on a terminal NUL; fromjson then requires
+# exactly one complete document. Callers must check the whole producer/parser
+# pipeline under pipefail before using any typed output, even if output preceded
+# a read failure. This is JSON ingress, not Docker's framed log stream.
+parse_json_document() {
+    jq -Rse '
+        if contains("\u0000") then error("literal NUL in JSON response")
+        else fromjson
+        end
+    ' 2>/dev/null
+}
+
+# The epoch has already been validated while it is still inside the parsed JSON.
+# Check the final jq-to-shell boundary as well: status, one value, digits only.
+heartbeat_epoch_for_shell() {
+    local epoch
+    if ! epoch="$(jq -nr --arg stamp "$1" '
+        $stamp | select(test("\\A[0-9]+\\z"))
+    ' 2>/dev/null)" || [ -z "${epoch}" ]; then
+        return 1
+    fi
+    case "${epoch}" in *[!0-9]*) return 1 ;; esac
+    printf '%s' "${epoch}"
+}
+
 plural_seconds() {
     local seconds="$1"
     if [ -z "${seconds}" ]; then printf 'unknown'; else printf '%ss ago' "${seconds}"; fi
@@ -250,7 +277,7 @@ read_the_bus() {
 }
 
 check_the_bus() {
-    local answer counts
+    local counts
 
     if [ -z "${ACCOUNT}" ]; then
         BUS_VERDICT="unknown"
@@ -268,32 +295,32 @@ check_the_bus() {
         return
     fi
 
-    answer="$(read_the_bus)"
-    if [ -z "${answer}" ]; then
-        BUS_VERDICT="unknown"
-        BUS_SENTENCE="the bus did not answer connz at ${BUS_ADDRESS:-${CONNZ_FILE}}, so who is connected to it could not be read at all. This is NOT the gateway being down: it is a bus this watch could not read."
-        return
-    fi
-
     # ALL THREE, in one pass, and the count of account-only matches beside it so
     # the sentence can say what was there instead.
-    counts="$(printf '%s' "${answer}" | jq -r \
+    if ! counts="$(read_the_bus | parse_json_document | jq -er \
         --arg account "${ACCOUNT}" \
         --arg name "${CLIENT_NAME}" \
         --arg subject "${SUBJECT}" '
+        def valid_subs:
+            if .subscriptions_list != null then
+                .subscriptions_list | type == "array" and all(.[]; type == "string")
+            elif .subscriptions_list_detail != null then
+                .subscriptions_list_detail | type == "array"
+                    and all(.[]; type == "object" and (.subject | type == "string"))
+            else true end;
         def subs: (.subscriptions_list // ([(.subscriptions_list_detail // [])[] | .subject]));
-        (.connections // null) as $c
-        | if $c == null then "unparseable" else
+        select(type == "object")
+        | .connections as $c
+        | if ($c | type) != "array" then empty
+          elif all($c[]; type == "object" and valid_subs) | not then empty else
             [ $c[] | select(.authorized_user == $account) ] as $mine
             | [ $mine[] | select((.name // "") == $name and (subs | index($subject))) ] as $gateway
             | [ $mine[] | select((.name // "") != "") ] as $named
             | "\($gateway | length) \($mine | length) \($named | length)"
           end
-    ' 2>/dev/null)"
-
-    if [ -z "${counts}" ] || [ "${counts}" = "unparseable" ]; then
+    ' 2>/dev/null)" || ! [[ "${counts}" =~ ^[0-9]+\ [0-9]+\ [0-9]+$ ]]; then
         BUS_VERDICT="unknown"
-        BUS_SENTENCE="the bus answered at ${BUS_ADDRESS:-${CONNZ_FILE}} and the answer was not the list of connections this expects, so it could not be read. An answer this watch cannot read is not agreement."
+        BUS_SENTENCE="the bus response at ${BUS_ADDRESS:-${CONNZ_FILE}} could not be read as one complete list of connections. An answer this watch cannot read is not agreement."
         return
     fi
 
@@ -339,31 +366,49 @@ SLACK_VERDICT=""
 SLACK_SENTENCE=""
 
 check_slack() {
-    local body state last_event_at last_epoch age now
+    local heartbeat state last_epoch age now
 
     if [ ! -e "${HEARTBEAT_PATH}" ]; then
         SLACK_VERDICT="unknown"
         SLACK_SENTENCE="the gateway has written no heartbeat at ${HEARTBEAT_PATH}, so how its Slack session is cannot be known from here. An absent file is unknown and never healthy: either the gateway has not reached its Slack start-up, or it was not given the setting, or this watch is not mounting the volume it writes."
         return
     fi
-    body="$(cat "${HEARTBEAT_PATH}" 2>/dev/null)"
-    if [ -z "${body}" ]; then
+    # Validate the complete document before any value enters Bash. The shared
+    # ingress parser preserves raw bytes; this second stage retains the heartbeat
+    # contract: the producer may add fields, but the
+    # two fields this watch acts on must have their documented types and the
+    # state must be one the producer can emit. Anything else is evidence this
+    # watch does not understand, never a healthy Slack session.
+    if ! heartbeat="$(cat "${HEARTBEAT_PATH}" 2>/dev/null | parse_json_document | jq -cer -s '
+        if length == 1
+           and (.[0] | type == "object")
+           and (.[0].state | type == "string")
+           and ((.[0].state == "connected")
+                or (.[0].state == "connecting")
+                or (.[0].state == "disconnected"))
+           and (.[0].last_event_at | type == "string")
+        then .[0] as $heartbeat
+          | ($heartbeat.last_event_at
+             | select(test("\\A[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?(Z|\\+00:00)\\z"))
+             | sub("\\.[0-9]+"; "")
+             | sub("\\+00:00\\z"; "Z")) as $normal
+          | (try ($normal | fromdateiso8601) catch empty) as $epoch
+          | select(($epoch | strftime("%Y-%m-%dT%H:%M:%SZ")) == $normal)
+          | $heartbeat + {last_event_epoch: $epoch}
+          | .
+        else empty
+        end
+    ' 2>/dev/null)" || [ -z "${heartbeat}" ]; then
         SLACK_VERDICT="unknown"
-        SLACK_SENTENCE="the gateway's heartbeat at ${HEARTBEAT_PATH} could not be read, so how its Slack session is cannot be known from here."
+        SLACK_SENTENCE="the gateway's heartbeat at ${HEARTBEAT_PATH} is not one complete JSON object with a recognised state and a string time for its last event, so it could not be read."
         return
     fi
-    state="$(printf '%s' "${body}" | jq -r '.state // empty' 2>/dev/null)"
-    last_event_at="$(printf '%s' "${body}" | jq -r '.last_event_at // empty' 2>/dev/null)"
-    if [ -z "${state}" ] || [ -z "${last_event_at}" ]; then
-        SLACK_VERDICT="unknown"
-        SLACK_SENTENCE="the gateway's heartbeat at ${HEARTBEAT_PATH} is not in the shape this expects (a state and the time of its last event), so it could not be read."
-        return
-    fi
+    state="$(printf '%s' "${heartbeat}" | jq -r '.state')"
+    last_epoch="$(printf '%s' "${heartbeat}" | jq -r '.last_event_epoch')"
 
-    last_epoch="$(iso_to_epoch "${last_event_at}")"
-    if [ -z "${last_epoch}" ]; then
+    if ! last_epoch="$(heartbeat_epoch_for_shell "${last_epoch}")" || [ -z "${last_epoch}" ]; then
         SLACK_VERDICT="unknown"
-        SLACK_SENTENCE="the gateway's heartbeat at ${HEARTBEAT_PATH} says its last event was at '${last_event_at}', which is not a time this could read."
+        SLACK_SENTENCE="the gateway's heartbeat at ${HEARTBEAT_PATH} did not produce one numeric time for its last event, so it could not be read."
         return
     fi
     now="$(now_epoch)"
@@ -461,30 +506,40 @@ docker_api() {
 # container's own labels — so the watch finds the gateway of its own estate and
 # not of somebody else's on the same machine.
 find_the_gateway() {
-    local me project answer
+    local me project id
     if [ -n "${GATEWAY_CONTAINER}" ]; then printf '%s' "${GATEWAY_CONTAINER}"; return; fi
     me="$(cat /etc/hostname 2>/dev/null)"
     [ -n "${me}" ] || return 1
-    project="$(docker_api "containers/${me}/json" \
-        | jq -r '.Config.Labels["com.docker.compose.project"] // empty' 2>/dev/null)"
+    if ! project="$(docker_api "containers/${me}/json" | parse_json_document \
+        | jq -er '.Config.Labels["com.docker.compose.project"]
+            | select(type == "string")
+            | select(test("\\A[a-z0-9][a-z0-9_-]*\\z"))' 2>/dev/null)"; then
+        return 1
+    fi
     [ -n "${project}" ] || return 1
     # 'all=true' MATTERS: the engine lists only RUNNING containers by default, so
     # without it a STOPPED gateway — the case this watch exists for — could not be
     # found and its log would be reported as unreadable rather than as silent.
     # Found by stopping the gateway on a rehearsal estate, 26 September 2026.
-    answer="$(curl -sfG --max-time 8 --unix-socket "${DOCKER_SOCKET}" \
+    if ! id="$(curl -sfG --max-time 8 --unix-socket "${DOCKER_SOCKET}" \
         "http://localhost/containers/json" \
         --data-urlencode "all=true" \
         --data-urlencode "filters={\"label\":[\"com.docker.compose.project=${project}\",\"com.docker.compose.service=${GATEWAY_SERVICE}\"]}" \
-        2>/dev/null)"
-    printf '%s' "${answer}" | jq -r '.[0].Id // empty' 2>/dev/null
+        2>/dev/null | parse_json_document \
+        | jq -er 'select(type == "array") | .[0].Id
+            | select(type == "string")
+            | select(test("\\A[a-zA-Z0-9][a-zA-Z0-9_.-]*\\z"))' 2>/dev/null)"; then
+        return 1
+    fi
+    [ -n "${id}" ] || return 1
+    printf '%s' "${id}"
 }
 
 read_the_log() {
     local id
     if [ -n "${LOG_FILE}" ]; then cat "${LOG_FILE}" 2>/dev/null; return; fi
     if [ ! -S "${DOCKER_SOCKET}" ]; then return 1; fi
-    id="$(find_the_gateway)"
+    if ! id="$(find_the_gateway)"; then return 1; fi
     [ -n "${id}" ] || return 1
     # THE ENGINE RETURNS A FRAMED STREAM, not plain lines: every line is preceded
     # by an eight-byte header that says which stream it came from and how long it
