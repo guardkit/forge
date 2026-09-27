@@ -169,7 +169,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--env-output", required=True, type=Path)
     parser.add_argument("--settings-input", required=True, type=Path)
     parser.add_argument("--settings-output", required=True, type=Path)
-    parser.add_argument("--compose-file", required=True, type=Path)
+    parser.add_argument("--compose-file", required=True, action="append", type=Path)
     parser.add_argument("--project", required=True)
     parser.add_argument("--previous-runtime", required=True, type=Path)
     parser.add_argument("--receipt", required=True, type=Path)
@@ -205,6 +205,32 @@ def read_env(path: Path) -> tuple[dict[str, str], bytes]:
             value = value[1:-1]
         values[key] = value
     return values, raw
+
+
+def paths_alias(left: Path, right: Path) -> bool:
+    """Return whether two names identify the same destination, including links."""
+    try:
+        if left.exists() and right.exists() and os.path.samefile(left, right):
+            return True
+    except OSError:
+        # resolve() below is still useful for a broken or temporarily unreadable link.
+        pass
+    return left.resolve(strict=False) == right.resolve(strict=False)
+
+
+def validate_path_boundaries(inputs: tuple[Path, ...], outputs: tuple[Path, ...]) -> None:
+    """Keep every generated artifact disjoint from every input and other output."""
+    for index, output in enumerate(outputs):
+        if output.is_symlink():
+            refuse(f"output {output} is a symbolic link; choose a plain output path")
+        if output.exists() and not output.is_file():
+            refuse(f"output {output} is not a regular file; choose a plain output path")
+        for source in inputs:
+            if paths_alias(output, source):
+                refuse(f"output {output} aliases input {source}; choose disjoint paths so inputs stay unchanged")
+        for prior in outputs[:index]:
+            if paths_alias(output, prior):
+                refuse(f"output {output} aliases output {prior}; choose a distinct path for every artifact")
 
 
 def expand(values: dict[str, str]) -> dict[str, str]:
@@ -270,12 +296,17 @@ def validate_routes(env: dict[str, str], metadata: dict) -> dict:
     answer_host, answer_port, answer_path = endpoint(require(env, "FORGE_TARGET_OWNER_URL"), "FORGE_TARGET_OWNER_URL", ("http", "https"))
     if answer_host != gateway.lower() or answer_port != int(require(env, "FORGE_ANSWER_PORT")) or answer_path != "/recorded":
         refuse("FORGE_TARGET_OWNER_URL is not the gateway answer-service route ending /recorded; correct it")
-    bus_names = ("FORGE_NATS_URL", "FLEET_MEMORY_BUS_ADDRESS", "JARVIS_NATS_URL", "FLEET_MEMORY_NATS_URL")
-    bus_routes = {name: endpoint(require(env, name), name, ("nats",)) for name in bus_names}
-    bus_hosts = {route[0] for route in bus_routes.values()}
-    monitor_host, _, _ = endpoint(require(env, "BUS_MONITORING_ADDRESS"), "BUS_MONITORING_ADDRESS", ())
-    if len(bus_hosts) != 1 or monitor_host not in bus_hosts:
-        refuse("bus client and monitoring routes do not name the same retained bus; correct the env inputs")
+    internal_names = ("FORGE_NATS_URL", "FLEET_MEMORY_BUS_ADDRESS", "JARVIS_NATS_URL")
+    internal_routes = {name: endpoint(require(env, name), name, ("nats",)) for name in internal_names}
+    provision_route = endpoint(require(env, "NATS_PROVISION_ADDRESS"), "NATS_PROVISION_ADDRESS", ("nats",))
+    if provision_route[2] or any(route != provision_route for route in internal_routes.values()):
+        refuse("estate bus clients do not all use the declared internal bus host and client port; correct the env inputs")
+    monitor_route = endpoint(require(env, "BUS_MONITORING_ADDRESS"), "BUS_MONITORING_ADDRESS", ())
+    if monitor_route[0] != provision_route[0] or monitor_route[2]:
+        refuse("BUS_MONITORING_ADDRESS does not name the declared internal bus host; correct the env input")
+    sandbox_bus = endpoint(require(env, "FLEET_MEMORY_NATS_URL"), "FLEET_MEMORY_NATS_URL", ("nats",))
+    if sandbox_bus != (gateway.lower(), int(require(env, "NATS_CLIENT_PORT")), ""):
+        refuse("FLEET_MEMORY_NATS_URL is not the sandbox-to-bus gateway route; correct the private env input")
     memory_host, memory_port, memory_path = endpoint(require(env, "FLEET_MEMORY_URL"), "FLEET_MEMORY_URL", ("http", "https"))
     if (memory_host, memory_port, memory_path.rstrip("/")) != ("memory", 8005, "/mcp"):
         refuse("FLEET_MEMORY_URL is not the memory service route on the factory network; use http://memory:8005/mcp/")
@@ -393,6 +424,24 @@ def validate_compose(rendered: dict, env: dict[str, str], old_paths: list[str], 
         image = service.get("image")
         if image and not IMAGE_ID.fullmatch(str(image)):
             refuse(f"rendered service {service_name} does not use an immutable image ID; correct the env or project")
+    expected_bus_consumers = {
+        "coordinator": ("FORGE_NATS_URL",),
+        "memory-relay": ("FLEET_MEMORY_BUS_ADDRESS",),
+        "front-door": ("JARVIS_NATS_URL",),
+        "bus-gateway": ("JARVIS_NATS_URL",),
+        "bus-ready": ("BUS_MONITORING_ADDRESS",),
+    }
+    for service_name, names in expected_bus_consumers.items():
+        if service_name not in services:
+            continue
+        declared = services[service_name].get("environment", {})
+        if isinstance(declared, list):
+            declared = dict(item.split("=", 1) for item in declared if isinstance(item, str) and "=" in item)
+        if not isinstance(declared, dict):
+            refuse(f"rendered service {service_name} has an unreadable environment; correct the project")
+        for name in names:
+            if str(declared.get(name, "")) != env[name]:
+                refuse(f"rendered service {service_name} does not consume the validated {name}; correct the project")
     coordinator_networks = set(services["coordinator"].get("networks", {}))
     publisher_networks = set(services["forge-publisher"].get("networks", {}))
     if not {"factory", "forge-publisher-net"}.issubset(coordinator_networks) or publisher_networks != {"forge-publisher-net"}:
@@ -404,7 +453,7 @@ def validate_compose(rendered: dict, env: dict[str, str], old_paths: list[str], 
     for name, service in services.items():
         for port in service.get("ports", []) or []:
             host_ip = str(port.get("host_ip", "")) if isinstance(port, dict) else ""
-            if host_ip and host_ip != gateway:
+            if host_ip != gateway:
                 refuse(f"rendered service {name} publishes outside FACTORY_GATEWAY_ADDRESS; correct the project")
         for mount in service.get("volumes", []) or []:
             if isinstance(mount, dict) and mount.get("type") == "bind" and str(mount.get("source")) in old_paths:
@@ -416,16 +465,16 @@ def validate_compose(rendered: dict, env: dict[str, str], old_paths: list[str], 
 
 def main() -> int:
     args = parse_args()
-    inputs = (args.env_file, args.settings_input, args.compose_file, args.previous_runtime, *args.secret_env_file)
+    inputs = (args.env_file, args.settings_input, *args.compose_file, args.previous_runtime, *args.secret_env_file)
     for path in inputs:
         if not path.is_file():
             refuse(f"required input {path} is not a readable file; provide its explicit path")
-    if args.env_file.resolve() == args.env_output.resolve() or args.settings_input.resolve() == args.settings_output.resolve():
-        refuse("an output path equals its input path; choose new output paths so the old files stay unchanged")
+    outputs = (args.env_output, args.settings_output, args.receipt)
+    validate_path_boundaries(inputs, outputs)
     if args.plan:
         print(f"PLAN 1 read public env as data from {args.env_file} and private names from {len(args.secret_env_file)} secret file(s)")
         print(f"PLAN 2 rewrite {args.settings_input} to {args.settings_output} with planning disabled and documented names/container paths")
-        print(f"PLAN 3 validate with the immutable FORGE_IMAGE, the real loader, and Compose project {args.compose_file}")
+        print(f"PLAN 3 validate with the immutable FORGE_IMAGE, the real loader, and {len(args.compose_file)} ordered Compose file(s)")
         print(f"PLAN 4 compare registrations with {args.previous_runtime} and require exact drift acknowledgements")
         print(f"PLAN 5 atomically write {args.env_output}, {args.settings_output}, and {args.receipt}")
         return 0
@@ -441,6 +490,16 @@ def main() -> int:
         secret_values.update(secrets)
         combined.update(secrets)
     resolved = expand(combined)
+    declared_compose = public.get("COMPOSE_FILE", "").strip()
+    if declared_compose:
+        declared_files = tuple(Path(item) for item in declared_compose.split(os.pathsep) if item)
+        explicit_files = tuple(item.resolve() for item in args.compose_file)
+        same_graph = len(declared_files) == len(explicit_files) and all(
+            declared.resolve() == explicit if declared.is_absolute() else declared.name == explicit.name
+            for declared, explicit in zip(declared_files, explicit_files)
+        )
+        if not same_graph:
+            refuse("ordered --compose-file inputs differ from COMPOSE_FILE in --env-file; pass the same project graph explicitly")
     for secret in (value for value in secret_values.values() if len(value) >= 4):
         if secret.encode() in public_bytes:
             refuse(f"public env input {args.env_file} contains a private value; replace it with its env name")
@@ -516,10 +575,11 @@ def main() -> int:
             if unknown:
                 refuse(f"rendered settings retain unsupported name {sorted(unknown)[0]}; add an explicit documented mapping")
 
-        compose_bytes = run(
-            [docker, "compose", "--project-name", args.project, "--env-file", str(args.env_file.resolve()), "-f", str(args.compose_file.resolve()), "config", "--format", "json"],
-            env=process_env,
-        )
+        compose_command = [docker, "compose", "--project-name", args.project, "--env-file", str(args.env_file.resolve())]
+        for compose_file in args.compose_file:
+            compose_command.extend(["-f", str(compose_file.resolve())])
+        compose_command.extend(["config", "--format", "json"])
+        compose_bytes = run(compose_command, env=process_env)
         try:
             rendered = json.loads(compose_bytes)
         except Exception as exc:
@@ -534,7 +594,10 @@ def main() -> int:
             "env_output_sha256": hashlib.sha256(public_bytes).hexdigest(),
             "settings_input_sha256": metadata["input_sha256"],
             "settings_output_sha256": metadata["output_sha256"],
-            "project_file_sha256": hashlib.sha256(args.compose_file.read_bytes()).hexdigest(),
+            "project_files": [
+                {"path": str(path.resolve()), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+                for path in args.compose_file
+            ],
             "previous_runtime_sha256": hashlib.sha256(args.previous_runtime.read_bytes()).hexdigest(),
             "images": image_ids,
             "routes": route_receipt,
