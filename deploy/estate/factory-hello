@@ -41,6 +41,19 @@ value_of() {
     printf '%s' "${ENVV[$name]:-}"
 }
 
+expand() {
+    local s="$1" out="" name v
+    while [[ "${s}" =~ ^([^\$]*)\$\{([A-Za-z_][A-Za-z0-9_]*)(:\-([^}]*))?\}(.*)$ ]]; do
+        out+="${BASH_REMATCH[1]}"
+        name="${BASH_REMATCH[2]}"
+        v="$(value_of "${name}")"
+        if [ -z "${v}" ] && [ -n "${BASH_REMATCH[3]}" ]; then v="${BASH_REMATCH[4]}"; fi
+        out+="${v}"
+        s="${BASH_REMATCH[5]}"
+    done
+    printf '%s' "${out}${s}"
+}
+
 read_env_file() {
     local file="$1" line name value
     [ -f "${file}" ] || return 1
@@ -58,7 +71,7 @@ read_env_file() {
         elif [ "${value:0:1}" = "'" ] && [ "${value: -1}" = "'" ] && [ ${#value} -ge 2 ]; then
             value="${value:1:${#value}-2}"
         fi
-        ENVV["${name}"]="${value}"
+        ENVV["${name}"]="$(expand "${value}")"
     done < "${file}"
 }
 
