@@ -76,6 +76,7 @@ from typing import Any, Callable, Protocol
 
 import click
 
+from forge.config.build_admission import build_admission
 from forge.config.conductor import (
     UNCAPPED_ESCAPE_PROFILE_NAME,
     mode_c_cap_refusal_from_config,
@@ -748,6 +749,18 @@ def queue_cmd(
 
     config = _require_forge_config(config_obj)
 
+    # D4 BUILD admission is earlier than every mode-specific project action.
+    # In strict consolidation mode even retired/repair modes say the same
+    # sandbox-policy reason, and Mode C cannot scan task files or prepare a
+    # branch before this decision.
+    build_policy = build_admission(config, repo_path=repo)
+    if not build_policy.allowed:
+        click.echo(
+            f"{build_policy.reason}. Nothing was queued.",
+            err=True,
+        )
+        sys.exit(EXIT_PATH_REFUSED)
+
     # 0a. Refuse any mode nothing in production will drive — BEFORE every
     #     side effect, including the budget echo below. A queued row in an
     #     unactivated mode is the silently-stuck-row defect (revival design
@@ -950,7 +963,7 @@ def queue_cmd(
     now = datetime.now(UTC)
     payload = BuildQueuedPayload(
         feature_id=feature_id,
-        repo=_path_to_repo_slug(repo_path),
+        repo=build_policy.repo_key or _path_to_repo_slug(repo_path),
         branch=branch,
         feature_yaml_path=str(Path(feature_yaml)),
         max_turns=effective_max_turns,

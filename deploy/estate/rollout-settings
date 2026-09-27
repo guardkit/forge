@@ -79,6 +79,7 @@ publication = raw.get("publication")
 if not isinstance(publication, dict):
     raise ValueError("publication is missing or is not a mapping")
 publication["publisher_url"] = "${FORGE_PUBLISHER_URL}"
+publication["builds_may_run_inside_the_coordinator"] = False
 permissions = raw.get("permissions")
 filesystem = permissions.get("filesystem") if isinstance(permissions, dict) else None
 allowlist = filesystem.get("allowlist") if isinstance(filesystem, dict) else None
@@ -111,6 +112,7 @@ allowed = {
     ("planning", "sandboxes"),
     ("deploy", "sidecar_url"),
     ("publication", "publisher_url"),
+    ("publication", "builds_may_run_inside_the_coordinator"),
     ("permissions", "filesystem", "allowlist"),
 }
 def compare(a, b, path=()):
@@ -120,9 +122,15 @@ def compare(a, b, path=()):
         raise ValueError(f"an unapproved setting changed at {'.'.join(path)}")
     if isinstance(a, dict):
         if list(a) != list(b):
-            raise ValueError(f"an unapproved setting key changed at {'.'.join(path)}")
-        for key in a:
-            compare(a[key], b[key], path + (str(key),))
+            added_build_policy = (
+                path == ("publication",)
+                and set(b) - set(a) == {"builds_may_run_inside_the_coordinator"}
+                and not set(a) - set(b)
+            )
+            if not added_build_policy:
+                raise ValueError(f"an unapproved setting key changed at {'.'.join(path)}")
+        for key in b:
+            compare(a.get(key), b.get(key), path + (str(key),))
     elif isinstance(a, list):
         if len(a) != len(b):
             raise ValueError(f"an unapproved setting list changed at {'.'.join(path)}")

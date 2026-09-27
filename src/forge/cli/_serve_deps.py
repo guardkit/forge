@@ -100,6 +100,7 @@ from forge.cli._serve_deps_forward_context import (
 from forge.cli._serve_deps_lifecycle import build_publisher_and_emitter
 from forge.cli._serve_deps_stage_log import build_stage_log_recorder
 from forge.cli._serve_deps_state_channel import build_autobuild_state_initialiser
+from forge.config.build_admission import build_admission
 from forge.config.models import ForgeConfig, PipelineConfig
 from forge.lifecycle.persistence import SqliteLifecyclePersistence
 from forge.lifecycle.state_machine import TERMINAL_STATES, BuildState
@@ -566,6 +567,37 @@ def _read_task_id(
     return getattr(row, "task_id", None) if row is not None else None
 
 
+def _read_build_identity(
+    sqlite_pool: SqliteLifecyclePersistence,
+    *,
+    feature_id: str,
+    correlation_id: str,
+) -> tuple[str, "BuildState"] | None:
+    """Return an existing build id/state for replay settlement, if any."""
+    try:
+        with sqlite_pool._reader() as cx:
+            row = cx.execute(
+                "SELECT build_id, status FROM builds WHERE feature_id = ? "
+                "AND correlation_id = ?",
+                (feature_id, correlation_id),
+            ).fetchone()
+    except (AttributeError, sqlite3.Error) as exc:
+        logger.warning(
+            "dispatch_build: identity read failed for feature_id=%s "
+            "correlation_id=%s (%s); treating as a fresh admission",
+            feature_id,
+            correlation_id,
+            exc,
+        )
+        return None
+    if row is None:
+        return None
+    build_id = row[0] if not hasattr(row, "keys") else row["build_id"]
+    raw = row[1] if not hasattr(row, "keys") else row["status"]
+    state = raw if isinstance(raw, BuildState) else BuildState(raw)
+    return str(build_id), state
+
+
 def _read_build_status(
     sqlite_pool: SqliteLifecyclePersistence,
     *,
@@ -927,6 +959,58 @@ def _build_dispatch_build(
         # ``--help`` paths (the dispatch closure is the only place the
         # payload type is exercised).
         from forge.lifecycle.persistence import DuplicateBuildError
+
+        # D4's authoritative BUILD boundary is before persistence, the
+        # approval gate and the conductor. It therefore also covers direct
+        # boot reconciliation, which calls this closure without handle_message.
+        build_policy = build_admission(forge_config, target_repo=payload.repo)
+        if not build_policy.allowed:
+            reason = build_policy.reason or "sandbox-required"
+            existing = _read_build_identity(
+                sqlite_pool,
+                feature_id=payload.feature_id,
+                correlation_id=payload.correlation_id,
+            )
+            build_id = ""
+            if existing is not None:
+                build_id, state = existing
+                if state in TERMINAL_STATES:
+                    logger.info(
+                        "dispatch_build: sandbox-policy replay reached terminal "
+                        "build_id=%s state=%s; acking idempotently",
+                        build_id,
+                        state.value,
+                    )
+                    await ack_callback()
+                    return
+                reason = fail_mode_c_build(
+                    sqlite_pool,
+                    build_id,
+                    summary=reason,
+                    what="sandbox BUILD admission refusal",
+                    log=logger,
+                )
+            logger.error(
+                "dispatch_build: %s; refusing before row creation, gate, "
+                "observer, conductor or runner",
+                reason,
+            )
+            if lifecycle_emitter is not None:
+                from forge.pipeline import BuildContext
+
+                await lifecycle_emitter.emit_failed(
+                    BuildContext(
+                        feature_id=payload.feature_id,
+                        build_id=build_id,
+                        correlation_id=payload.correlation_id,
+                        wave_total=1,
+                    ),
+                    failure_reason=reason,
+                    recoverable=False,
+                    failed_task_id=None,
+                )
+            await ack_callback()
+            return
 
         if async_task_starter is None:
             raise RuntimeError(

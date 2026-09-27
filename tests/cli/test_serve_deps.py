@@ -928,3 +928,200 @@ class TestBudgetBreachPreDispatchGate:
 
         assert len(starter.contexts) == 1
         assert pool.cleared == []
+
+
+class TestSandboxOnlyCommonDispatch:
+    class _Starter:
+        def start_async_task(self, subagent_name: str, context: dict) -> str:
+            raise AssertionError("the fake dispatch owns the execution boundary")
+
+        async def astart_async_task(
+            self, subagent_name: str, context: dict
+        ) -> str:
+            raise AssertionError("the fake dispatch owns the execution boundary")
+
+    @staticmethod
+    def _strict_config(tmp_path: Path) -> ForgeConfig:
+        return ForgeConfig.model_validate(
+            {
+                "permissions": {
+                    "filesystem": {"allowlist": [str(tmp_path)]}
+                },
+                "planning": {
+                    "target_repo_paths": {
+                        "example/plain": str(tmp_path / "plain"),
+                        "example/sandboxed": str(tmp_path / "sandboxed"),
+                    },
+                    "sandboxes": {
+                        "example/sandboxed": {
+                            "name": "sandboxed",
+                            "sidecar_url": "http://sandbox:8125",
+                            "runner_url": "http://sandbox:8124",
+                        }
+                    },
+                },
+                "publication": {
+                    "builds_may_run_inside_the_coordinator": False
+                },
+            }
+        )
+
+    @pytest.mark.asyncio
+    async def test_actual_consumer_refuses_then_next_sandboxed_build_progresses(
+        self,
+        tmp_path: Path,
+        stub_client: _StubNatsClient,
+        persistence: SqliteLifecyclePersistence,
+    ) -> None:
+        from nats_core.envelope import EventType, MessageEnvelope
+
+        from forge.adapters.nats.pipeline_consumer import handle_message
+        from forge.cli._conductor_outcome import DECLINED
+
+        feature_yaml = tmp_path / "feature.yaml"
+        feature_yaml.write_text("name: synthetic\n", encoding="utf-8")
+        config = self._strict_config(tmp_path)
+        dispatched: list[str] = []
+        conducted: list[str] = []
+
+        async def fake_dispatch(build_id, feature_id, correlation_id, **kwargs):
+            dispatched.append(feature_id)
+            return SimpleNamespace(task_id=f"task-{feature_id}")
+
+        async def conductor(**kwargs):
+            conducted.append(kwargs["feature_id"])
+            return DECLINED
+
+        deps = build_pipeline_consumer_deps(
+            stub_client,
+            config,
+            persistence,
+            async_task_starter=self._Starter(),
+            conductor_router=conductor,
+        )
+
+        class Message:
+            def __init__(self, data: bytes) -> None:
+                self.data = data
+                self.acks = 0
+                self.naks = 0
+
+            async def ack(self) -> None:
+                self.acks += 1
+
+            async def nak(self) -> None:
+                self.naks += 1
+
+        def message(repo: str, feature_id: str, correlation_id: str) -> Message:
+            now = datetime(2026, 9, 27, tzinfo=UTC)
+            payload = {
+                "feature_id": feature_id,
+                "repo": repo,
+                "branch": "main",
+                "feature_yaml_path": str(feature_yaml),
+                "max_turns": 5,
+                "sdk_timeout_seconds": 1800,
+                "triggered_by": "cli",
+                "originating_adapter": "cli-wrapper",
+                "originating_user": "synthetic-user",
+                "correlation_id": correlation_id,
+                "requested_at": now.isoformat(),
+                "queued_at": now.isoformat(),
+                "mode": "mode-a",
+            }
+            envelope = MessageEnvelope(
+                message_id=f"msg-{feature_id}",
+                timestamp=now,
+                version="1.0",
+                source_id="cli-wrapper",
+                event_type=EventType.BUILD_QUEUED,
+                correlation_id=correlation_id,
+                payload=payload,
+            )
+            return Message(envelope.model_dump_json().encode("utf-8"))
+
+        refused = message("example/plain", "FEAT-D4BAD", "corr-d4-bad")
+        eligible = message("example/sandboxed", "FEAT-D4GOOD", "corr-d4-good")
+
+        with patch.object(_serve_deps, "dispatch_autobuild_async", fake_dispatch):
+            await handle_message(refused, deps)
+            assert refused.acks == 1
+            assert conducted == []
+            assert dispatched == []
+            assert persistence.connection.execute(
+                "SELECT COUNT(*) FROM builds"
+            ).fetchone()[0] == 0
+
+            await handle_message(eligible, deps)
+
+        assert conducted == ["FEAT-D4GOOD"]
+        assert dispatched == ["FEAT-D4GOOD"]
+        assert persistence.connection.execute(
+            "SELECT repo FROM builds WHERE feature_id = 'FEAT-D4GOOD'"
+        ).fetchone()[0] == "example/sandboxed"
+
+    @pytest.mark.asyncio
+    async def test_direct_interrupted_replay_is_failed_and_acked_before_conductor(
+        self,
+        tmp_path: Path,
+        stub_client: _StubNatsClient,
+        persistence: SqliteLifecyclePersistence,
+    ) -> None:
+        config = self._strict_config(tmp_path)
+        calls: list[str] = []
+
+        async def conductor(**kwargs):
+            calls.append("conductor")
+            raise AssertionError("strict refusal must precede conductor")
+
+        deps = build_pipeline_consumer_deps(
+            stub_client,
+            config,
+            persistence,
+            async_task_starter=self._Starter(),
+            conductor_router=conductor,
+        )
+        now = datetime(2026, 9, 27, tzinfo=UTC)
+        persistence.connection.execute(
+            "INSERT INTO builds (build_id, feature_id, repo, branch, "
+            "feature_yaml_path, status, triggered_by, correlation_id, "
+            "queued_at, mode) VALUES (?, ?, ?, 'main', 'feature.yaml', "
+            "'INTERRUPTED', 'cli', ?, ?, 'mode-a')",
+            (
+                "build-d4-replay",
+                "FEAT-D4RPL",
+                "example/plain",
+                "corr-d4-replay",
+                now.isoformat(),
+            ),
+        )
+        persistence.connection.commit()
+        payload = SimpleNamespace(
+            feature_id="FEAT-D4RPL",
+            repo="example/plain",
+            branch="main",
+            feature_yaml_path="feature.yaml",
+            max_turns=5,
+            sdk_timeout_seconds=1800,
+            triggered_by="cli",
+            originating_adapter="cli-wrapper",
+            originating_user="synthetic-user",
+            correlation_id="corr-d4-replay",
+            parent_request_id=None,
+            queued_at=now,
+        )
+        acks = 0
+
+        async def ack() -> None:
+            nonlocal acks
+            acks += 1
+
+        await deps.dispatch_build(payload, ack)
+
+        row = persistence.connection.execute(
+            "SELECT status, error FROM builds WHERE build_id = 'build-d4-replay'"
+        ).fetchone()
+        assert row["status"] == BuildState.FAILED.value
+        assert "sandbox-required" in row["error"]
+        assert acks == 1
+        assert calls == []

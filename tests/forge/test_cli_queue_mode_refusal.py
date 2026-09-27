@@ -460,3 +460,60 @@ class TestModeHelpSpeaksPlainNames:
     ) -> None:
         """The delivery primitive, in the words Rich uses for it."""
         assert "merge-ready checkpoint" in help_text
+
+
+class TestSandboxOnlyBuildAdmission:
+    """Actual Click modes refuse registered repositories without sandboxes."""
+
+    def test_all_modes_and_registrations_refuse_before_any_side_effect(
+        self,
+        tmp_path: Path,
+        feature_yaml: Path,
+        persistence: _RecordingPersistence,
+        published: list,
+    ) -> None:
+        registrations = {}
+        repositories = []
+        for index in range(7):
+            checkout = tmp_path / f"project-{index}"
+            checkout.mkdir()
+            repositories.append(checkout)
+            registrations[f"synthetic/project-{index}"] = str(checkout)
+
+        config_path = tmp_path / "forge-strict.yaml"
+        config_path.write_text(
+            yaml.safe_dump(
+                {
+                    "queue": {"repo_allowlist": [str(tmp_path)]},
+                    "permissions": {
+                        "filesystem": {"allowlist": [str(tmp_path)]}
+                    },
+                    "planning": {
+                        "target_repo_paths": registrations,
+                        "sandboxes": {},
+                    },
+                    "publication": {
+                        "builds_may_run_inside_the_coordinator": False
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        for mode, positional in (
+            ("a", "FEAT-D4A01"),
+            ("b", "FEAT-D4B01"),
+            ("c", "TASK-D4C01"),
+        ):
+            for checkout in repositories:
+                result = _queue(
+                    config_path,
+                    positional=positional,
+                    repo_dir=checkout,
+                    feature_yaml=feature_yaml,
+                    mode=mode,
+                )
+                assert result.exit_code == cli_queue.EXIT_PATH_REFUSED
+                assert "sandbox-required" in result.output
+
+        _assert_nothing_written(persistence, published)

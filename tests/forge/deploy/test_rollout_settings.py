@@ -43,7 +43,13 @@ def scenario(tmp_path: Path):
     ]
     settings["planning"]["target_repo_paths"] = {
         "example/project-one": str(old_one),
-        "seed/seed-two": str(old_two),
+        "synthetic/project-two": str(tmp_path / "project-two"),
+        "synthetic/project-three": str(tmp_path / "project-three"),
+        "synthetic/project-four": str(tmp_path / "project-four"),
+        "synthetic/project-five": str(tmp_path / "project-five"),
+        "synthetic-seed/seed-one": str(tmp_path / "seed-one"),
+        "synthetic-seed/seed-two": str(old_two),
+        "synthetic-seed/seed-three": str(tmp_path / "seed-three"),
     }
     settings["planning"]["sandboxes"] = {
         "example/project-one": {
@@ -260,7 +266,20 @@ raise SystemExit(93)
         "--receipt", str(outputs["receipt"]),
         "--evidence-source-path", str(old_evidence),
         "--secret-env-file", str(secret),
-        "--ack-registration-drift", "seed/seed-two",
+        "--ack-registration-drift",
+        "synthetic/project-two",
+        "--ack-registration-drift",
+        "synthetic/project-three",
+        "--ack-registration-drift",
+        "synthetic/project-four",
+        "--ack-registration-drift",
+        "synthetic/project-five",
+        "--ack-registration-drift",
+        "synthetic-seed/seed-one",
+        "--ack-registration-drift",
+        "synthetic-seed/seed-two",
+        "--ack-registration-drift",
+        "synthetic-seed/seed-three",
         "--machine-term", "old-machine",
     ]
     process_env = os.environ.copy()
@@ -299,11 +318,19 @@ def test_real_loader_preserves_choices_rewrites_only_contract_fields_and_is_idem
     assert rendered["planning"]["enabled"] is False
     assert rendered["planning"]["target_repo_paths"] == {
         "example/project-one": "/var/lib/forge/projects/project-one",
-        "seed/seed-two": "/var/lib/forge/projects/seed-two",
+        "synthetic/project-two": "/var/lib/forge/projects/project-two",
+        "synthetic/project-three": "/var/lib/forge/projects/project-three",
+        "synthetic/project-four": "/var/lib/forge/projects/project-four",
+        "synthetic/project-five": "/var/lib/forge/projects/project-five",
+        "synthetic-seed/seed-one": "/var/lib/forge/projects/seed-one",
+        "synthetic-seed/seed-two": "/var/lib/forge/projects/seed-two",
+        "synthetic-seed/seed-three": "/var/lib/forge/projects/seed-three",
     }
+    assert set(rendered["planning"]["sandboxes"]) == {"example/project-one"}
     assert rendered["planning"]["sandboxes"]["example/project-one"]["sidecar_url"] == "${FORGE_SANDBOX_SIDECAR_URL}"
     assert rendered["deploy"]["enabled"] == original["deploy"]["enabled"]
     assert rendered["publication"]["enabled"] == original["publication"]["enabled"]
+    assert rendered["publication"]["builds_may_run_inside_the_coordinator"] is False
     assert "/var/lib/deliberate-extra" in rendered["permissions"]["filesystem"]["allowlist"]
     assert scenario["settings_input"].read_text() == yaml.safe_dump(original, sort_keys=False)
     before = {name: path.read_bytes() for name, path in scenario["outputs"].items()}
@@ -354,7 +381,7 @@ def test_unacknowledged_registration_drift_refuses_and_names_exact_difference(sc
     del scenario["command"][index:index + 2]
     result = run(scenario)
     assert result.returncode == 2
-    assert "seed/seed-two" in result.stderr and "acknowledgements" in result.stderr
+    assert "synthetic/project-two" in result.stderr and "acknowledgements" in result.stderr
     assert not any(path.exists() for path in scenario["outputs"].values())
 
 
