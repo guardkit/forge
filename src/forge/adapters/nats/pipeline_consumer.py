@@ -1139,7 +1139,9 @@ async def _reconcile_one_redelivery(
         # idempotent ack callback shape as the normal handler so the
         # state machine acks on terminal transition.
         ack_callback = _build_ack_callback(msg)
-        await deps.consumer_deps.dispatch_build(payload, ack_callback)
+        await deps.consumer_deps.dispatch_build(
+            payload, ack_callback, runless_replay=True
+        )
         report.restarted_in_flight += 1
         return
 
@@ -1178,8 +1180,28 @@ async def _reconcile_one_redelivery(
             correlation_id,
         )
         ack_callback = _build_ack_callback(msg)
-        await deps.consumer_deps.dispatch_build(payload, ack_callback)
+        await deps.consumer_deps.dispatch_build(
+            payload, ack_callback, runless_replay=True
+        )
         report.restarted_interrupted += 1
+        return
+
+    # Reconciliation has established that this previous-process QUEUED row
+    # no longer has a lifecycle owner. Its explicit marker, rather than the
+    # state name or current gate wiring, is what makes this replay runless.
+    # Keep the historical fresh-build counter.
+    if state == "QUEUED":
+        logger.info(
+            "reconcile_on_boot: queued build feature_id=%s correlation_id=%s "
+            "was left before lifecycle ownership; replaying as runless",
+            feature_id,
+            correlation_id,
+        )
+        ack_callback = _build_ack_callback(msg)
+        await deps.consumer_deps.dispatch_build(
+            payload, ack_callback, runless_replay=True
+        )
+        report.fresh_builds += 1
         return
 
     # Defensive: unexpected state. This should never fire — the SQLite

@@ -25,6 +25,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 import yaml
@@ -460,3 +461,205 @@ class TestModeHelpSpeaksPlainNames:
     ) -> None:
         """The delivery primitive, in the words Rich uses for it."""
         assert "merge-ready checkpoint" in help_text
+
+
+class TestSandboxOnlyBuildAdmission:
+    """Actual Click modes refuse registered repositories without sandboxes."""
+
+    @pytest.mark.parametrize(
+        "path_case",
+        ["missing-repositories", "missing-feature", "existing-inert-paths"],
+    )
+    def test_all_modes_and_registrations_refuse_before_any_side_effect(
+        self,
+        path_case: str,
+        tmp_path: Path,
+        feature_yaml: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        persistence: _RecordingPersistence,
+        published: list,
+    ) -> None:
+        registrations = {}
+        repositories = []
+        for index in range(7):
+            checkout = tmp_path / f"project-{index}"
+            if path_case != "missing-repositories":
+                checkout.mkdir()
+            repositories.append(checkout)
+            registrations[f"synthetic/project-{index}"] = str(checkout)
+
+        supplied_feature = (
+            tmp_path / "missing-feature.yaml"
+            if path_case == "missing-feature"
+            else feature_yaml
+        )
+
+        config_path = tmp_path / "forge-strict.yaml"
+        config_path.write_text(
+            yaml.safe_dump(
+                {
+                    "queue": {"repo_allowlist": [str(tmp_path)]},
+                    "permissions": {
+                        "filesystem": {"allowlist": [str(tmp_path)]}
+                    },
+                    "planning": {
+                        "target_repo_paths": registrations,
+                        "sandboxes": {},
+                    },
+                    "publication": {
+                        "builds_may_run_inside_the_coordinator": False
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        forbidden_fix_admission = Mock(
+            side_effect=AssertionError("Mode C project access reached")
+        )
+        monkeypatch.setattr(
+            cli_queue,
+            "_admit_fix_journey",
+            forbidden_fix_admission,
+        )
+
+        for mode, positional in (
+            ("a", "FEAT-D4A01"),
+            ("b", "FEAT-D4B01"),
+            ("c", "TASK-D4C01"),
+        ):
+            for checkout in repositories:
+                result = _queue(
+                    config_path,
+                    positional=positional,
+                    repo_dir=checkout,
+                    feature_yaml=supplied_feature,
+                    mode=mode,
+                )
+                assert result.exit_code == cli_queue.EXIT_PATH_REFUSED
+                assert "sandbox-required" in result.output
+
+        forbidden_fix_admission.assert_not_called()
+        _assert_nothing_written(persistence, published)
+
+    def test_sandboxed_rewritten_path_queues_with_the_canonical_registration(
+        self,
+        tmp_path: Path,
+        feature_yaml: Path,
+        persistence: _RecordingPersistence,
+        published: list,
+    ) -> None:
+        checkout = tmp_path / "projects" / "study-tutor"
+        checkout.mkdir(parents=True)
+        canonical_repo = "synthetic/study-tutor"
+        config_path = tmp_path / "forge-strict-sandboxed.yaml"
+        config_path.write_text(
+            yaml.safe_dump(
+                {
+                    "queue": {"repo_allowlist": [str(tmp_path)]},
+                    "permissions": {
+                        "filesystem": {"allowlist": [str(tmp_path)]}
+                    },
+                    "planning": {
+                        "target_repo_paths": {canonical_repo: str(checkout)},
+                        "sandboxes": {
+                            canonical_repo: {
+                                "name": "synthetic",
+                                "runner_url": "http://sandbox:8124",
+                                "sidecar_url": "http://sandbox:8125",
+                            }
+                        },
+                    },
+                    "publication": {
+                        "builds_may_run_inside_the_coordinator": False
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        result = _queue(
+            config_path,
+            positional="FEAT-D4CAN",
+            repo_dir=checkout,
+            feature_yaml=feature_yaml,
+            mode="a",
+        )
+
+        assert result.exit_code == 0, result.output
+        assert len(persistence.rows) == 1
+        assert persistence.rows[0][0].repo == canonical_repo
+        assert len(published) == 1
+
+    @pytest.mark.parametrize(
+        "publication_setting",
+        ["omitted", "legacy-true", "strict-sandboxed"],
+    )
+    @pytest.mark.parametrize(
+        ("invalid_parameter", "expected_detail"),
+        [
+            ("repo", "does not exist"),
+            ("feature_yaml", "does not exist"),
+            ("feature_yaml_directory", "is a directory"),
+        ],
+    )
+    def test_admitted_and_legacy_requests_keep_click_path_validation(
+        self,
+        publication_setting: str,
+        invalid_parameter: str,
+        expected_detail: str,
+        tmp_path: Path,
+        feature_yaml: Path,
+        persistence: _RecordingPersistence,
+        published: list,
+    ) -> None:
+        checkout = tmp_path / "checkout"
+        if invalid_parameter != "repo":
+            checkout.mkdir()
+        supplied_feature = feature_yaml
+        if invalid_parameter == "feature_yaml":
+            supplied_feature = tmp_path / "missing-feature.yaml"
+        elif invalid_parameter == "feature_yaml_directory":
+            supplied_feature = tmp_path
+
+        body: dict[str, Any] = {
+            "queue": {"repo_allowlist": [str(tmp_path)]},
+            "permissions": {"filesystem": {"allowlist": [str(tmp_path)]}},
+        }
+        if publication_setting == "legacy-true":
+            body["publication"] = {
+                "builds_may_run_inside_the_coordinator": True
+            }
+        elif publication_setting == "strict-sandboxed":
+            canonical_repo = "synthetic/admitted"
+            body["planning"] = {
+                "target_repo_paths": {canonical_repo: str(checkout)},
+                "sandboxes": {
+                    canonical_repo: {
+                        "name": "synthetic",
+                        "runner_url": "http://sandbox:8124",
+                        "sidecar_url": "http://sandbox:8125",
+                    }
+                },
+            }
+            body["publication"] = {
+                "builds_may_run_inside_the_coordinator": False
+            }
+        config_path = tmp_path / f"forge-{publication_setting}.yaml"
+        config_path.write_text(yaml.safe_dump(body), encoding="utf-8")
+
+        result = _queue(
+            config_path,
+            positional="FEAT-D4PATH",
+            repo_dir=checkout,
+            feature_yaml=supplied_feature,
+            mode="a",
+        )
+
+        expected_option = (
+            "--repo" if invalid_parameter == "repo" else "--feature-yaml"
+        )
+        assert result.exit_code == 2
+        assert f"Invalid value for '{expected_option}'" in result.output
+        assert expected_detail in result.output
+        _assert_nothing_written(persistence, published)

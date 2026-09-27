@@ -1625,11 +1625,15 @@ class PublicationConfig(BaseModel):
         description=(
             "True (the default, and what every forge does today) = the "
             "coordinator may start builds and project checks inside itself, "
-            "for a project that has no sandbox. A build that runs in there "
+            "for a project that has no sandbox. False makes BUILD admission "
+            "require an unambiguous registered repository with a usable "
+            "sandbox runner (and a sidecar for repair preparation); an "
+            "unsandboxed global or remote runner is not a substitute. This "
+            "does not prohibit plan-only generation, investigation or "
+            "planning Git operations. A build that runs in the coordinator "
             "can write the ledger, which is the record the publisher trusts, "
             "so the activation check REFUSES publication while this is true. "
-            "Set it to False — and give every project a sandbox of its own — "
-            "before publication is switched on."
+            "Give every buildable project a sandbox before setting it False."
         ),
     )
     publisher_credential_file: str | None = Field(
