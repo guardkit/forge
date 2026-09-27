@@ -862,6 +862,10 @@ def test_completed_terminal_planning_history_retains_reference_without_active_wo
     ('FAILED','2026-09-27T22:54:00+01:00','plan-fixture:Build%20approval:0'),
     ('FAILED','2026-09-27T21:54:00+00:00','not-a-canonical-reference'),
     ('FAILED','2026-09-27T21:54:00+00:00',''),
+    ('FAILED','2026-09-27T21:54:00+00:00','plan-%FF:product_docs:0'),
+    ('FAILED','2026-09-27T21:54:00+00:00','plan-%C0%AF:product_docs:0'),
+    ('FAILED','2026-09-27T21:54:00+00:00','plan-%ED%A0%80:product_docs:0'),
+    ('FAILED','2026-09-27T21:54:00+00:00','plan-%41:product_docs:0'),
     ('FAILED','2026-09-27T21:54:00+00:00','plan%GG:stage:0'),
     ('FAILED','2026-09-27T21:54:00+00:00',17),
 ])
@@ -871,3 +875,17 @@ def test_planning_approval_uncertainty_remains_active(state,completed_at,request
         'pending_approval_request_id':request_id,
     }]}}}
     assert q.work_problems(observed)==[{'table':'planning_runs','row':observed['work_state']['planning_runs']['rows'][0]}]
+
+
+@pytest.mark.parametrize(('build_id','stage'),[
+    ('plan-dot.name~suffix','product_docs'),
+    ('plan-unicode-\u00e9','review . ~ : %'),
+    ('plan-percent%FF','product_docs'),
+    ('plan-control\x00','product_docs'),
+])
+def test_canonical_planning_approval_reference_variants_are_history(tmp_path,build_id,stage):
+    state=_terminal_planning_state(tmp_path,PlanningState.FAILED)
+    row=state['work_state']['planning_runs']['rows'][0]
+    row['pending_approval_request_id']=derive_request_id(
+        build_id=build_id,stage_label=stage,attempt_count=2)
+    assert q.work_problems(state)==[]

@@ -16,6 +16,7 @@ import sys
 import tempfile
 import time
 from datetime import datetime, timezone
+from urllib.parse import quote, unquote_to_bytes
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import rollout_support as r
@@ -92,11 +93,21 @@ def stable_runtime(item):
     stable={k:item[k] for k in ('image_id','repo_tags','port_bindings','restart_policy','network_mode','env_names')}
     return stable | {'mounts':[stable_mount(m) for m in item['mounts']],'service_identity':identity,'networks':networks}
 
+def canonical_approval_component(value):
+    try:decoded=unquote_to_bytes(value).decode('utf-8','strict')
+    except UnicodeDecodeError:return False
+    encoded=quote(decoded,safe='').replace('.','%2E').replace('~','%7E')
+    return encoded==value
+
 def completed_terminal_planning_approval(row):
     """Recognize only the exact completed history written by planning."""
     request_id=row.get('pending_approval_request_id')
     if (row.get('state') not in TERMINAL_PLANS or not isinstance(request_id,str)
             or not APPROVAL_REFERENCE.fullmatch(request_id)):
+        return False
+    encoded_build,encoded_stage,_attempt=request_id.split(':')
+    if not (canonical_approval_component(encoded_build)
+            and canonical_approval_component(encoded_stage)):
         return False
     value=row.get('completed_at')
     if not isinstance(value,str):return False
