@@ -573,23 +573,17 @@ def _read_build_identity(
     feature_id: str,
     correlation_id: str,
 ) -> tuple[str, "BuildState"] | None:
-    """Return an existing build id/state for replay settlement, if any."""
-    try:
-        with sqlite_pool._reader() as cx:
-            row = cx.execute(
-                "SELECT build_id, status FROM builds WHERE feature_id = ? "
-                "AND correlation_id = ?",
-                (feature_id, correlation_id),
-            ).fetchone()
-    except (AttributeError, sqlite3.Error) as exc:
-        logger.warning(
-            "dispatch_build: identity read failed for feature_id=%s "
-            "correlation_id=%s (%s); treating as a fresh admission",
-            feature_id,
-            correlation_id,
-            exc,
-        )
-        return None
+    """Return the existing identity, or ``None`` only after proving absence.
+
+    Read failures propagate so the caller can hold the delivery rather than
+    acknowledge a refusal for a potentially nonterminal existing build.
+    """
+    with sqlite_pool._reader() as cx:
+        row = cx.execute(
+            "SELECT build_id, status FROM builds WHERE feature_id = ? "
+            "AND correlation_id = ?",
+            (feature_id, correlation_id),
+        ).fetchone()
     if row is None:
         return None
     build_id = row[0] if not hasattr(row, "keys") else row["build_id"]
@@ -972,11 +966,24 @@ def _build_dispatch_build(
         build_policy = build_admission(forge_config, target_repo=payload.repo)
         if not build_policy.allowed:
             reason = build_policy.reason or "sandbox-required"
-            existing = _read_build_identity(
-                sqlite_pool,
-                feature_id=payload.feature_id,
-                correlation_id=payload.correlation_id,
-            )
+            try:
+                existing = _read_build_identity(
+                    sqlite_pool,
+                    feature_id=payload.feature_id,
+                    correlation_id=payload.correlation_id,
+                )
+            except (AttributeError, sqlite3.Error) as exc:
+                # Do not escape into handle_message's generic dispatch-error
+                # fallback: that emits a failure and acknowledges the slot.
+                logger.error(
+                    "dispatch_build: identity read failed for feature_id=%s "
+                    "correlation_id=%s (%s); holding WITHOUT terminal event "
+                    "or ack",
+                    payload.feature_id,
+                    payload.correlation_id,
+                    exc,
+                )
+                return
             build_id = ""
             if existing is not None:
                 build_id, state = existing
