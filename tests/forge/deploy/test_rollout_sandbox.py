@@ -106,16 +106,9 @@ class Boundary:
                 runner = unit == self.config['units']['runner']
                 props = {'LoadState':'masked' if stopped else 'loaded','ActiveState':'inactive' if stopped else 'active',
                     'SubState':'dead' if stopped else 'running','MainPID':'0' if stopped else '123',
-                    'ControlPID':'0','UnitFileState':'masked' if stopped else 'disabled',
-                    'ExecStop':'evil start' if self.fault == 'stop-hook' and runner else '',
-                    'ExecStopPost':'evil start' if self.fault == 'post-hook' and runner else ''}
-                if stopped:
-                    props.pop('ExecStop')
-                    props.pop('ExecStopPost')
-                if self.fault == 'missing-stop-hook' and runner and not stopped:
-                    props.pop('ExecStop')
-                if self.fault == 'missing-post-hook' and runner and not stopped:
-                    props.pop('ExecStopPost')
+                    'ControlPID':'0','UnitFileState':'masked' if stopped else 'disabled','Id':unit}
+                if self.fault == 'wrong-unit-id' and runner and not stopped:
+                    props['Id']='other.service'
                 if self.fault == 'control-pid' and not runner:
                     props['ControlPID']='77'
                 if self.fault == 'keeper-alive' and not runner:
@@ -126,6 +119,16 @@ class Boundary:
             elif verb == 'unmask':
                 if self.fault=='unmask':code=1
                 else:self.states[argv[3]]=False
+        elif argv[0] == 'busctl':
+            field=argv[-1]
+            out='a(sasbttttuii) 0\n'
+            if self.fault == 'stop-hook' and field == 'ExecStop':out='a(sasbttttuii) 1 "nonempty"\n'
+            if self.fault == 'post-hook' and field == 'ExecStopPost':out='a(sasbttttuii) 1 "nonempty"\n'
+            if self.fault == 'missing-stop-hook' and field == 'ExecStop':out=''
+            if self.fault == 'missing-post-hook' and field == 'ExecStopPost':out=''
+            if self.fault == 'wrong-hook-type' and field == 'ExecStop':out='s ""\n'
+            if self.fault == 'hook-error' and field == 'ExecStop':code=1
+            if self.fault == 'hook-timeout' and field == 'ExecStop':raise subprocess.TimeoutExpired(argv,120)
         elif argv[0] == 'docker' and 'inspect' in argv:
             out=IDENTITY_DOCUMENT+'\n' if argv[-2].startswith('forge-image-identity/2') else IMAGE
         elif argv[0] == 'docker':
@@ -201,7 +204,7 @@ class Boundary:
 
 @pytest.mark.parametrize('fault',[
     'version','client-version','server-unknown','version-missing','version-malformed',
-    'stop-hook','post-hook','missing-stop-hook','missing-post-hook','keeper-alive','control-pid','sessions','stop-fails','stop-timeout','status-timeout',
+    'stop-hook','post-hook','missing-stop-hook','missing-post-hook','wrong-hook-type','hook-error','hook-timeout','wrong-unit-id','keeper-alive','control-pid','sessions','stop-fails','stop-timeout','status-timeout',
     'unknown','empty','running','status-error','status-missing','status-nonlist','status-duplicate','survivor','wake-fails',
     'same-boot','process','file-changed','receipt-changed','clone-changed','disk-unreadable','image',
 ])
@@ -214,7 +217,7 @@ def test_refusal_installs_nothing(inventory,monkeypatch,capsys,fault):
     assert Path(config['sandbox']['profile_source']).read_bytes()==original
     assert not any(x[:3]==['systemctl','--user','unmask'] for x in boundary.argv())
     assert not any(x[0]=='sbx' and any(y in x for y in ('rm','prune','reset','kill')) for x in boundary.argv())
-    if fault in ('stop-hook','post-hook','missing-stop-hook','missing-post-hook'):
+    if fault in ('stop-hook','post-hook','missing-stop-hook','missing-post-hook','wrong-hook-type','hook-error','hook-timeout','wrong-unit-id'):
         assert not any(x[:3]==['systemctl','--user','stop'] for x in boundary.argv())
     if fault in ('keeper-alive','control-pid'):
         assert ['systemctl','--user','stop','owned-runner.service'] not in boundary.argv()
@@ -232,7 +235,11 @@ def test_success_order_exact_template_and_repeat(inventory,monkeypatch):
     calls=b.argv()
     assert calls.index(['systemctl','--user','mask','owned-keeper.service']) < calls.index(['systemctl','--user','stop','owned-runner.service']) < calls.index(['sbx','stop','owned-sandbox'])
     stop_index=calls.index(['systemctl','--user','stop','owned-runner.service'])
-    assert calls[stop_index-1][:4]==['systemctl','--user','show','owned-runner.service']
+    assert calls[stop_index-1] == ['busctl','--user','get-property','org.freedesktop.systemd1',
+        '/org/freedesktop/systemd1/unit/owned_2drunner_2eservice',
+        'org.freedesktop.systemd1.Service','ExecStopPost']
+    assert calls[stop_index-2][-1]=='ExecStop'
+    assert calls[stop_index-3][:4]==['systemctl','--user','show','owned-runner.service']
     assert calls[0] == ['sbx','version','--json']
     assert b.files[config['sandbox']['script_path']]==m.TEMPLATE.read_bytes()
     assert '--sandbox' in next(x for x in calls if x[:4]==['sbx','policy','allow','network'])
