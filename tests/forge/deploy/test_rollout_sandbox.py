@@ -116,6 +116,9 @@ class Boundary:
                 out='\n'.join(k+'='+v for k,v in props.items())
             elif verb == 'mask':
                 self.states[argv[3]]=True
+            elif verb == 'stop':
+                if self.fault=='unit-stop-error':code=1
+                if self.fault=='unit-stop-timeout':raise subprocess.TimeoutExpired(argv,120)
             elif verb == 'unmask':
                 if self.fault=='unmask':code=1
                 else:self.states[argv[3]]=False
@@ -204,7 +207,7 @@ class Boundary:
 
 @pytest.mark.parametrize('fault',[
     'version','client-version','server-unknown','version-missing','version-malformed',
-    'stop-hook','post-hook','missing-stop-hook','missing-post-hook','wrong-hook-type','hook-error','hook-timeout','wrong-unit-id','keeper-alive','control-pid','sessions','stop-fails','stop-timeout','status-timeout',
+    'stop-hook','post-hook','missing-stop-hook','missing-post-hook','wrong-hook-type','hook-error','hook-timeout','wrong-unit-id','unit-stop-error','unit-stop-timeout','keeper-alive','control-pid','sessions','stop-fails','stop-timeout','status-timeout',
     'unknown','empty','running','status-error','status-missing','status-nonlist','status-duplicate','survivor','wake-fails',
     'same-boot','process','file-changed','receipt-changed','clone-changed','disk-unreadable','image',
 ])
@@ -213,6 +216,10 @@ def test_refusal_installs_nothing(inventory,monkeypatch,capsys,fault):
     boundary=Boundary(config,monkeypatch);boundary.fault=fault
     original=Path(config['sandbox']['profile_source']).read_bytes()
     assert m.main(args)==2
+    error=capsys.readouterr().err
+    assert 'nothing has been replaced, and work may still be running inside it' in error
+    assert 'shall I try again, or put it back as it was and stop for today?' in error
+    assert error.rstrip().endswith('stop for today?')
     assert not boundary.files
     assert Path(config['sandbox']['profile_source']).read_bytes()==original
     assert not any(x[:3]==['systemctl','--user','unmask'] for x in boundary.argv())
@@ -222,10 +229,17 @@ def test_refusal_installs_nothing(inventory,monkeypatch,capsys,fault):
     if fault in ('keeper-alive','control-pid'):
         assert ['systemctl','--user','stop','owned-runner.service'] not in boundary.argv()
     if fault in ('unknown','empty','running','status-error','status-missing','status-nonlist','status-duplicate','stop-fails','stop-timeout','status-timeout'):
-        assert 'work may still be running' in capsys.readouterr().err
+        assert 'work may still be running' in error
     if fault=='survivor':
-        assert 'abc123' in capsys.readouterr().err
+        assert 'abc123' in error
         assert not any(x[0]=='sbx' and 'docker' in x and any(y in x for y in ('stop','rm')) for x in boundary.argv())
+    if fault=='file-changed':
+        assert 'known_files changed for ["known.txt"]' in error
+        assert 'a'*64 not in error and 'd'*64 not in error
+    if fault=='unit-stop-error':
+        assert 'systemctl stop refused for unit owned-keeper.service' in error
+    if fault=='unit-stop-timeout':
+        assert 'systemctl stop did not answer for unit owned-keeper.service' in error
 
 
 def test_success_order_exact_template_and_repeat(inventory,monkeypatch):
@@ -338,7 +352,9 @@ def test_unmask_failure_restores_masks_without_old_bootstrap(inventory,monkeypat
     assert b.files[config['sandbox']['script_path']]==m.TEMPLATE.read_bytes()
     dropin=Path(config['sandbox']['systemd_user_dir'])/'owned-runner.service.d/zzzz-rollout-empty-stop.conf'
     assert dropin.read_text()==m.EMPTY_STOP
-    assert 'installation may be incomplete' in capsys.readouterr().err
+    error=capsys.readouterr().err
+    assert 'installation may be incomplete' in error
+    assert 'nothing has been replaced' not in error
 
 
 def test_staging_failure_replaces_neither_file(tmp_path):

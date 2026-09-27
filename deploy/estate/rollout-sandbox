@@ -332,7 +332,14 @@ class Rollout:
         private_write(self.evidence / name, (json.dumps(value,sort_keys=True,indent=2)+'\n').encode())
 
     def systemctl(self, *args, **kw):
-        return self.run(['systemctl','--user',*args], **kw)
+        operation = args[0] if args else 'operation'
+        unit = args[1] if len(args) > 1 and args[1] in self.units.values() else None
+        try:
+            return self.run(['systemctl','--user',*args], **kw)
+        except Refusal as exc:
+            outcome = 'did not answer' if 'did not answer' in str(exc) else 'refused'
+            target = f' for unit {unit}' if unit else ''
+            raise Refusal(f'systemctl {operation} {outcome}{target} in sandbox {self.s["name"]}; keep units masked and inspect it before retrying') from None
 
     def properties(self, unit, *, identity=False):
         fields = ('LoadState','ActiveState','SubState','MainPID','ControlPID','UnitFileState')
@@ -522,7 +529,12 @@ class Rollout:
         self.save('disk-after.json',after)
         require(after['boot_id'] != before['boot_id'], f'{self.s["name"]} did not prove a fresh boot; work may still be running inside, so inspect before retrying')
         for key in ('clone_commit','remote_commit','declarations','known_files','receipt_listing','receipt_file_count','receipt_total_bytes','receipt_listing_sha256','ahead_commits'):
-            require(before[key] == after[key], f'{key} changed in {self.s["clone_path"]} or {self.s["receipts_path"]}; install nothing and reconcile the disk evidence')
+            detail = ''
+            if key == 'known_files' and before[key] != after[key]:
+                names = sorted(name for name in set(before[key]) | set(after[key])
+                               if before[key].get(name) != after[key].get(name))
+                detail = ' for '+json.dumps(names,ensure_ascii=True,separators=(',',':'))
+            require(before[key] == after[key], f'{key} changed{detail} in {self.s["clone_path"]} or {self.s["receipts_path"]}; install nothing and reconcile the disk evidence')
         processes = self.inside('ps','-eo','pid,lstart,args').stdout
         self.save('processes-after.json',{'processes':processes})
         require(not any(marker in processes for marker in self.s['legacy_command_markers']), f'legacy work is visible after waking {self.s["name"]}; leave it untouched and inspect before retrying')
@@ -607,7 +619,10 @@ def main(argv=None):
         message = str(exc) if isinstance(exc,Refusal) else 'required inventory or evidence is unreadable; inspect the named private config and retain the stopped posture before retrying'
         if rollout and rollout.replacement_started and not rollout.complete:
             message += '; current-template/profile installation may be incomplete, so reconcile the private evidence before unmasking either unit'
-        print('Refusing: '+message.replace('\n',' ')+'.',file=sys.stderr)
+        elif rollout and not rollout.replacement_started:
+            message += '; nothing has been replaced, and work may still be running inside it — shall I try again, or put it back as it was and stop for today?'
+        suffix = '' if message.endswith(('?','.','!')) else '.'
+        print('Refusing: '+message.replace('\n',' ')+suffix,file=sys.stderr)
         return 2
 
 
