@@ -930,6 +930,8 @@ def _build_dispatch_build(
         payload: "BuildQueuedPayload",
         ack_callback,
         register_observer=None,
+        *,
+        runless_replay: bool = False,
     ):
         """Persist + gate + dispatch one accepted ``BuildQueuedPayload``.
 
@@ -953,6 +955,10 @@ def _build_dispatch_build(
         closure the consumer passes when the lifecycle bridge is wired;
         it is invoked ONLY on the approve → launch path so no observer is
         live during the pause. ``None`` (no bridge) skips registration.
+        ``runless_replay`` is set only by boot reconciliation after it has
+        established that the previous process can no longer own the row;
+        normal delivery leaves it false so BUILD policy never cancels live or
+        paused work.
         """
         # Local import to avoid pinning this module's import surface to
         # nats_core when the deps factory is imported during CLI
@@ -983,11 +989,28 @@ def _build_dispatch_build(
                     )
                     await ack_callback()
                     return
+                if not runless_replay:
+                    # BUILD admission is not cancellation. A normal delivery
+                    # cannot prove whether this existing row is owned by a
+                    # runner, conductor or approval pause. That includes
+                    # QUEUED/INTERRUPTED under the legacy no-gate path, whose
+                    # live runs do not advance the ledger. Preserve the row
+                    # and held slot; only boot reconciliation may explicitly
+                    # identify an old-process row as runless.
+                    logger.warning(
+                        "dispatch_build: sandbox policy refuses repository "
+                        "for existing build_id=%s state=%s, but the live/"
+                        "paused owner is preserved; holding the queue slot "
+                        "WITHOUT ack",
+                        build_id,
+                        state.value,
+                    )
+                    return
                 reason = fail_mode_c_build(
                     sqlite_pool,
                     build_id,
                     summary=reason,
-                    what="sandbox BUILD admission refusal",
+                    what="sandbox BUILD admission refusal during runless replay",
                     log=logger,
                 )
             logger.error(

@@ -1061,8 +1061,118 @@ class TestSandboxOnlyCommonDispatch:
         ).fetchone()[0] == "example/sandboxed"
 
     @pytest.mark.asyncio
-    async def test_direct_interrupted_replay_is_failed_and_acked_before_conductor(
+    @pytest.mark.parametrize(
+        "state",
+        [
+            BuildState.QUEUED,
+            BuildState.INTERRUPTED,
+            BuildState.PREPARING,
+            BuildState.RUNNING,
+            BuildState.FINALISING,
+            BuildState.PAUSED,
+        ],
+    )
+    async def test_normal_redelivery_preserves_every_existing_owner_state(
         self,
+        state: BuildState,
+        tmp_path: Path,
+        stub_client: _StubNatsClient,
+        persistence: SqliteLifecyclePersistence,
+    ) -> None:
+        from nats_core.envelope import EventType, MessageEnvelope
+
+        from forge.adapters.nats.pipeline_consumer import handle_message
+
+        feature_yaml = tmp_path / "feature.yaml"
+        feature_yaml.write_text("name: synthetic\n", encoding="utf-8")
+        config = self._strict_config(tmp_path)
+        conducted: list[str] = []
+
+        async def conductor(**kwargs):
+            conducted.append(kwargs["feature_id"])
+            raise AssertionError("an existing owner must precede the conductor")
+
+        deps = build_pipeline_consumer_deps(
+            stub_client,
+            config,
+            persistence,
+            async_task_starter=self._Starter(),
+            conductor_router=conductor,
+        )
+        now = datetime(2026, 9, 27, tzinfo=UTC)
+        persistence.connection.execute(
+            "INSERT INTO builds (build_id, feature_id, repo, branch, "
+            "feature_yaml_path, status, triggered_by, correlation_id, "
+            "queued_at, mode) VALUES (?, ?, ?, 'main', ?, ?, 'cli', ?, ?, "
+            "'mode-a')",
+            (
+                "build-d4-owned",
+                "FEAT-D4OWN",
+                "example/plain",
+                str(feature_yaml),
+                state.value,
+                "corr-d4-owned",
+                now.isoformat(),
+            ),
+        )
+        persistence.connection.commit()
+        payload = {
+            "feature_id": "FEAT-D4OWN",
+            "repo": "example/plain",
+            "branch": "main",
+            "feature_yaml_path": str(feature_yaml),
+            "max_turns": 5,
+            "sdk_timeout_seconds": 1800,
+            "triggered_by": "cli",
+            "originating_adapter": "cli-wrapper",
+            "originating_user": "synthetic-user",
+            "correlation_id": "corr-d4-owned",
+            "requested_at": now.isoformat(),
+            "queued_at": now.isoformat(),
+            "mode": "mode-a",
+        }
+        envelope = MessageEnvelope(
+            message_id="msg-d4-owned",
+            timestamp=now,
+            version="1.0",
+            source_id="cli-wrapper",
+            event_type=EventType.BUILD_QUEUED,
+            correlation_id="corr-d4-owned",
+            payload=payload,
+        )
+
+        class Message:
+            def __init__(self) -> None:
+                self.data = envelope.model_dump_json().encode("utf-8")
+                self.acks = 0
+                self.naks = 0
+
+            async def ack(self) -> None:
+                self.acks += 1
+
+            async def nak(self) -> None:
+                self.naks += 1
+
+        message = Message()
+        await handle_message(message, deps)
+
+        row = persistence.connection.execute(
+            "SELECT status, error FROM builds WHERE build_id = 'build-d4-owned'"
+        ).fetchone()
+        assert row["status"] == state.value
+        assert row["error"] is None
+        assert message.acks == 0
+        assert message.naks == 0
+        assert conducted == []
+        assert stub_client.published == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "state", [BuildState.QUEUED, BuildState.INTERRUPTED]
+    )
+    async def test_direct_runless_replay_is_failed_and_acked_before_conductor(
+        self,
+        state: BuildState,
         tmp_path: Path,
         stub_client: _StubNatsClient,
         persistence: SqliteLifecyclePersistence,
@@ -1086,11 +1196,12 @@ class TestSandboxOnlyCommonDispatch:
             "INSERT INTO builds (build_id, feature_id, repo, branch, "
             "feature_yaml_path, status, triggered_by, correlation_id, "
             "queued_at, mode) VALUES (?, ?, ?, 'main', 'feature.yaml', "
-            "'INTERRUPTED', 'cli', ?, ?, 'mode-a')",
+            "?, 'cli', ?, ?, 'mode-a')",
             (
                 "build-d4-replay",
                 "FEAT-D4RPL",
                 "example/plain",
+                state.value,
                 "corr-d4-replay",
                 now.isoformat(),
             ),
@@ -1116,7 +1227,7 @@ class TestSandboxOnlyCommonDispatch:
             nonlocal acks
             acks += 1
 
-        await deps.dispatch_build(payload, ack)
+        await deps.dispatch_build(payload, ack, runless_replay=True)
 
         row = persistence.connection.execute(
             "SELECT status, error FROM builds WHERE build_id = 'build-d4-replay'"
