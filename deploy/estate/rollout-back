@@ -1,0 +1,310 @@
+#!/usr/bin/env python3
+"""Recover one estate before resume, or retain current authority after resume."""
+from __future__ import annotations
+import importlib.machinery
+import importlib.util
+import inspect as inspect_source
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import sys
+import tempfile
+import uuid
+sys.dont_write_bytecode=True
+HERE=Path(__file__).resolve().parent
+loader=importlib.machinery.SourceFileLoader('rollout_quiesce',str(HERE/'rollout-quiesce'))
+spec=importlib.util.spec_from_loader(loader.name,loader);q=importlib.util.module_from_spec(spec);loader.exec_module(q)
+r=q.r
+
+
+def h6_probe():
+    """Runs ONLY inside the selected offline candidate; no live state is mounted."""
+    import asyncio,collections,hashlib,json,os,pathlib,shutil,signal,sqlite3,subprocess,sys,threading,time,uuid
+    from datetime import datetime,timezone,timedelta
+    from forge.adapters.sqlite.connect import connect_writer
+    from forge.lifecycle.persistence import SqliteLifecyclePersistence
+    from forge.config.models import ForgeConfig
+    from forge.pipeline.merge_executor import MergeExecutorDeps,execute_merge_deploy
+    from forge.pipeline.publication_record import PublicationRecordStore
+    from forge.pipeline.deployment_lock import DeploymentLockStore
+    from forge.deploy_sidecar.deploy_executor import DeployExecutor,DeployRequest,ProcessTable
+    root=pathlib.Path(sys.argv[1]);pristine=pathlib.Path(sys.argv[2]);wanted=sys.argv[3];image=sys.argv[4]
+    sha=lambda p:hashlib.sha256(p.read_bytes()).hexdigest()
+    assert sha(pristine)==wanted,'pristine current copy changed'
+    cx=sqlite3.connect(pristine.as_uri()+'?mode=ro&immutable=1',uri=True)
+    assert cx.execute('PRAGMA quick_check').fetchall()==[('ok',)]
+    assert cx.execute('SELECT max(version) FROM schema_version').fetchone()[0]==16
+    required={'publication_records':'build_id feature_id repo decided_by decided_at target_branch g_commit build_tip j_commit attempt result checked_json lease_holder lease_expires_at turn lines_json created_at updated_at',
+              'deployment_targets':'target counter holder_build holder_turn holder_name granted_at expires_at running_commit running_identity running_build running_at created_at updated_at',
+              'builds':'build_id feature_id repo branch feature_yaml_path status triggered_by correlation_id queued_at mode start_commit target_branch'}
+    columns={table:[row[1] for row in cx.execute('PRAGMA table_info('+table+')')] for table in required}
+    assert all(set(names.split())<=set(columns[table]) for table,names in required.items()),'current schema does not support real recovery'
+    def packed(row):return json.dumps(list(row),sort_keys=True,default=lambda v:{'blob':v.hex()} if isinstance(v,bytes) else str(v))
+    tables=[row[0] for row in cx.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")]
+    before={table:collections.Counter(packed(row) for row in cx.execute('SELECT * FROM "'+table+'"')) for table in tables};cx.close()
+    work=root/'working.db';shutil.copyfile(pristine,work);pre_fixture=sha(work)
+    c=connect_writer(work);pool=SqliteLifecyclePersistence(connection=c,db_path=work)
+    token='h6-'+uuid.uuid4().hex;build=token+'-build';feature=token+'-feature';repo=token+'-project';target=repo+'::fixture';old_build=token+'-old';new_build=token+'-new';N=41
+    for table,column,value in [('builds','build_id',build),('publication_records','build_id',build),('deployment_targets','target',target)]:assert c.execute('SELECT count(*) FROM '+table+' WHERE '+column+'=?',(value,)).fetchone()[0]==0
+    gitroot=root/'repository';bare=root/'remote.git';gitroot.mkdir()
+    def git(*args,cwd=gitroot):return subprocess.check_output(['git','-c','protocol.file.allow=always',*args],cwd=cwd,stderr=subprocess.PIPE,text=True).strip()
+    git('init','-q','-b','main');git('config','user.name','Offline H6');git('config','user.email','h6@example.invalid')
+    (gitroot/'base').write_text('base\n');git('add','.');git('commit','-qm','base');G=git('rev-parse','HEAD')
+    branch='autobuild/'+feature;git('checkout','-qb',branch);(gitroot/'feature').write_text('feature\n');git('add','.');git('commit','-qm','feature');tip=git('rev-parse','HEAD')
+    git('checkout','-q','main');git('merge','--no-ff','-qm','joined',branch);J=git('rev-parse','HEAD');tree=git('rev-parse','HEAD^{tree}')
+    git('init','--bare','-q','-b','main',str(bare));git('remote','add','origin',str(bare));git('push','-q','origin','main');git('checkout','-q',branch)
+    clock=datetime.now(timezone.utc);stamp=clock.isoformat();past=(clock-timedelta(days=1)).isoformat()
+    c.execute("INSERT INTO builds(build_id,feature_id,repo,branch,feature_yaml_path,status,triggered_by,correlation_id,queued_at,mode,start_commit,target_branch) VALUES(?,?,?,?,?,'COMPLETE','cli',?,?,'mode-a',?,'main')",(build,feature,repo,branch,'h6.yaml',token,stamp,G))
+    checked={'identity':J,'j_commit':J,'j_tree':tree}
+    lines=[{'kind':'done','step':step,'attempt':1,'at':past,'detail':{'ran_on':J,'passed':True}} for step in ('join','merge-checks','candidate-check')]
+    lines.append({'kind':'about to','step':'send','attempt':1,'at':past,'detail':{'project':repo,'build_id':build,'turn':3,'j_commit':J,'target_branch':'main'}})
+    c.execute('INSERT INTO publication_records(build_id,feature_id,repo,decided_by,decided_at,target_branch,g_commit,build_tip,j_commit,attempt,result,checked_json,lease_holder,lease_expires_at,turn,lines_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(build,feature,repo,'h6',past,'main',G,tip,J,1,'publication pending',json.dumps(checked),'h6-old',past,3,json.dumps(lines),past,past));c.commit()
+    publication_before=packed(c.execute('SELECT * FROM publication_records WHERE build_id=?',(build,)).fetchone())
+    callbacks={'publisher':0,'guardkit':0,'deploy':0,'stage_complete':0}
+    class Capture:
+        async def publish_stage_complete(self,payload):callbacks['stage_complete']+=1
+    def tripwire(name):
+        async def call(*a,**k):callbacks[name]+=1;raise AssertionError('unexpected '+name+' replay')
+        return call
+    config=ForgeConfig.model_validate({'permissions':{'filesystem':{'allowlist':[str(root)]}},'planning':{'target_repo_paths':{repo:str(gitroot)}},'approval':{'expected_approver':'h6'},'merge_executor':{'enabled':True}})
+    deps=MergeExecutorDeps(config=config,pool=pool,pipeline_publisher=Capture(),guardkit_run=tripwire('guardkit'),deploy_dispatcher=tripwire('deploy'),publisher=tripwire('publisher'),clock=lambda:clock,receipts_root_fn=lambda:root/'receipts')
+    outcome=asyncio.run(execute_merge_deploy(deps=deps,build_id=build,feature_id=feature,repo=repo,repo_root=gitroot,expect_main_sha=G,correlation_id=token,decided_by='h6'))
+    record=PublicationRecordStore(c).read(build)
+    assert outcome.result=='published-deployment-pending',str(outcome)
+    assert record.turn==4 and record.g_commit==G and record.j_commit==J and record.checked==checked
+    assert all(callbacks[x]==0 for x in ('publisher','guardkit','deploy'))
+    send=[x for x in record.lines if x.step=='send' and x.kind=='done'][-1]
+    assert send.detail['found_by_looking'] and send.detail['published'] and send.detail['contains_j']
+    assert [x.to_wire() for x in record.lines[:len(lines)]]==lines
+    publication_after=packed(c.execute('SELECT * FROM publication_records WHERE build_id=?',(build,)).fetchone())
+    c.execute('INSERT INTO deployment_targets(target,counter,holder_build,holder_turn,holder_name,granted_at,expires_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)',(target,N,old_build,3,'h6-old',past,past,past,past));c.commit()
+    # Freshness answers come from the real working ledger, never the request.
+    def ask(name):
+        db=sqlite3.connect(work);row=db.execute('SELECT counter,holder_build FROM deployment_targets WHERE target=?',(name,)).fetchone();db.close()
+        return {'counter':row[0],'build':row[1]} if row else None
+    notes=root/'notes';notes.mkdir();slow=root/'slow.sh';quick=root/'quick.sh'
+    slow.write_text('#!/bin/sh\nsleep 90\n');quick.write_text('#!/bin/sh\necho DEPLOYED_IDENTITY=$DEPLOY_IDENTITY\n');slow.chmod(0o755);quick.chmod(0o755)
+    first=DeployExecutor(notes_root=notes,ask_the_coordinator=ask,stop_confirm_seconds=5)
+    answers=[];failure=[]
+    def run_old():
+        try:answers.append(first.run(DeployRequest(target=target,target_counter=N,build=old_build,cwd=str(root),script=str(slow),identity='old',identity_setting='DEPLOY_IDENTITY',timeout=100)).to_wire())
+        except BaseException as e:failure.append(str(e))
+    thread=threading.Thread(target=run_old);thread.start();group=None;old_note=None;second_answer=None
+    try:
+        deadline=time.monotonic()+15
+        while time.monotonic()<deadline:
+            files=list(notes.glob('*.json'))
+            if files:
+                candidate=json.loads(files[0].read_text())
+                if candidate.get('group'):old_note=candidate;group=int(candidate['group']);break
+            time.sleep(.05)
+        assert group and ProcessTable().members_of(group),'old executor did not create a live marked worker'
+        second=DeployExecutor(notes_root=notes,ask_the_coordinator=ask,stop_confirm_seconds=5)
+        reconciled=second.reconcile();assert reconciled[target]=='occupied (adopted)',reconciled
+        store=DeploymentLockStore(c);grant=store.grant(target=target,build_id=new_build,turn=4,holder='h6-new',now=clock)
+        assert grant and grant.counter==N+1
+        row=packed(c.execute('SELECT * FROM deployment_targets WHERE target=?',(target,)).fetchone())
+        assert not store.renew(target=target,counter=N,now=clock)
+        assert not store.record_running(target=target,counter=N,now=clock,commit='wrong',identity='wrong',build_id=old_build)
+        assert not store.release(target=target,counter=N,now=clock)
+        assert row==packed(c.execute('SELECT * FROM deployment_targets WHERE target=?',(target,)).fetchone())
+        second_answer=second.run(DeployRequest(target=target,target_counter=N+1,build=new_build,cwd=str(root),script=str(quick),identity=J,identity_setting='DEPLOY_IDENTITY')).to_wire()
+        assert second_answer['accepted'] and second_answer['exit_code']==0,second_answer
+        assert not ProcessTable().members_of(group),'old worker survived successor'
+        final_note=json.loads(next(notes.glob('*.json')).read_text());assert final_note['highest_counter']==N+1
+    finally:
+        if group and ProcessTable().members_of(group):os.killpg(group,signal.SIGTERM)
+        thread.join(10)
+        if group and ProcessTable().members_of(group):os.killpg(group,signal.SIGKILL);thread.join(5)
+        assert not thread.is_alive() and not failure and (not group or not ProcessTable().members_of(group)),'owned worker cleanup failed'
+    for table,original in before.items():
+        after=collections.Counter(packed(row) for row in c.execute('SELECT * FROM "'+table+'"'))
+        assert not original-after,'existing current rows changed in '+table
+        if table not in ('builds','stage_log','publication_records','deployment_targets'):assert after==original,'unrelated rows added in '+table
+    c.close();assert sha(pristine)==wanted
+    assert not any(n=='nats' or n.startswith('nats.') for n in sys.modules)
+    result={'format_version':1,'outcome':'handled-both','candidate_image_id':image,'pristine_sha256':wanted,'working_pre_fixture_sha256':pre_fixture,'schema_version':16,'columns':columns,'fixture_ids':{'build':build,'target':target},'git':{'G':G,'tip':tip,'J':J},'publication':{'before_sha256':hashlib.sha256(publication_before.encode()).hexdigest(),'after_sha256':hashlib.sha256(publication_after.encode()).hexdigest(),'turn':record.turn,'result':record.result,'line_kinds':[x.kind+' '+x.step for x in record.lines],'send_result':send.detail,'callbacks':callbacks},'deployment':{'N':N,'N_plus_1':grant.counter,'reconcile':reconciled,'old_note':old_note,'old_answers':answers,'successor':second_answer,'final_note':final_note},'cleanup':'no owned worker remains','existing_rows_unchanged':True,'real_client_modules':[]}
+    (root/'h6-result.json').write_text(json.dumps(result,sort_keys=True,indent=2)+'\n');print(json.dumps(result))
+
+
+class Recovery(q.Estate):
+    def __init__(self,args):super().__init__(args);self.back=self.c.get('back',{})
+    def allowed_images(self,service,rendered):
+        images={rendered}
+        if getattr(self,'_after_candidate',None) and service in ('coordinator','answer-service'):images.add(self._after_candidate)
+        return images
+    def remove_current(self):
+        items=self.service_ids();self.stop_current(q.SERVICES)
+        for item in items.values():r.docker(self.c,'rm',item['Id'])
+    def old_values(self,role,record):
+        filename=self.back['old_env_files'][role];p=q.private_path(filename,exists=True)
+        q.need(p.stat().st_mode & 0o077==0,'old runtime values file is not private; restore mode0600 before recovery')
+        values,_=q.load_script('rollout-settings').read_env(p)
+        q.need(set(values)==set(record['env_names']),f'old {role} environment names differ from the runtime record; supply the complete private source')
+        return values
+    def validate_runtime(self,record):
+        image=record['image_id'];q.need(re.fullmatch(r'sha256:[0-9a-f]{64}',image),'previous release is not an immutable image ID; preserve current state and name the saved ID')
+        actual=json.loads(r.docker(self.c,'image','inspect',image).stdout)[0];q.need(actual['Id']==image,'saved image ID is absent; keep both authorities stopped')
+        for tag in record['repo_tags']:
+            found=json.loads(r.docker(self.c,'image','inspect',tag).stdout)[0]['Id']
+            q.need(found==image,f'recorded image {image} tag {tag} now resolves to {found}; keep the estate stopped and reconcile the moved tag')
+        q.need(record['network_mode'] not in ('host','container') and record['networks'],'previous network cannot be safely reconstructed; reconcile the saved runtime')
+        for name,network in record['networks'].items():
+            r.docker(self.c,'network','inspect',name)
+            q.need(not network.get('Links') and not network.get('IPAMConfig') and not network.get('DriverOpts'),'saved network requires unsupported static options; keep both authorities stopped and reconcile exact reconstruction')
+        for bindings in (record['port_bindings'] or {}).values():
+            q.need(all(x.get('HostPort') and x['HostPort']!='0' for x in bindings or []),'saved runtime uses an unspecified allocated port; reconcile its exact listener before recovery')
+        for m in record['mounts']:
+            q.need(m['Type'] in ('bind','volume'),'previous mount type is unsupported; keep the estate stopped')
+            if m['Type']=='bind':r.path(m['Source'])
+            else:r.docker(self.c,'volume','inspect',m['Name'])
+    def create_old(self,role,record):
+        self.validate_runtime(record);values=self.old_values(role,record);identity=record['service_identity'];name=identity['name'].lstrip('/')
+        old=r.docker(self.c,'ps','--all','--filter','name=^/'+name+'$','--format','{{.ID}}').stdout.split()
+        if old:
+            item=r.inspect(self.c,old[0]);q.need(len(old)==1 and item['Id']==identity['container_id'] and not item['State']['Running'],f'old {role} name is occupied by another or running container; keep recovery stopped')
+            r.docker(self.c,'rm',item['Id'])
+        networks=list(record['networks']);cmd=['create','--name',name,'--network',networks[0]]
+        for key,flag in [('hostname','--hostname'),('user','--user'),('working_dir','--workdir')]:
+            if identity.get(key):cmd += [flag,identity[key]]
+        for key,value in record.get('labels',{}).items():cmd+=['--label',key+'='+value]
+        policy=record['restart_policy'];restart=policy.get('Name')
+        if restart:cmd+=['--restart',restart+(':'+str(policy['MaximumRetryCount']) if restart=='on-failure' and policy.get('MaximumRetryCount') else '')]
+        for m in record['mounts']:
+            text='type='+m['Type']+',src='+str(m['Source'] if m['Type']=='bind' else m['Name'])+',dst='+m['Destination']
+            if not m['RW']:text+=',readonly'
+            if m['Type']=='bind' and m.get('Propagation'):text+=',bind-propagation='+m['Propagation']
+            cmd+=['--mount',text]
+        for port,bindings in (record['port_bindings'] or {}).items():
+            for binding in bindings or []:cmd+=['--publish',(binding.get('HostIp') or '0.0.0.0')+':'+binding['HostPort']+':'+port]
+        for key in record['env_names']:cmd+=['--env',key]
+        entry=identity.get('entrypoint') or [];command=identity.get('command') or []
+        if isinstance(entry,str):entry=[entry]
+        q.need(isinstance(command,list),'old command is not an explicit argument list; reconcile its recorded runtime')
+        if entry:cmd+=['--entrypoint',entry[0]]
+        for alias in record['networks'][networks[0]].get('Aliases') or []:
+            if alias not in (identity['container_id'],identity['container_id'][:12]):cmd+=['--network-alias',alias]
+        created=r.docker(self.c,*cmd,record['image_id'],*entry[1:],*command,env={**self.env,**values}).stdout.strip()
+        for network in networks[1:]:
+            command=['network','connect']
+            for alias in record['networks'][network].get('Aliases') or []:
+                if alias not in (identity['container_id'],identity['container_id'][:12]):command+=['--alias',alias]
+            r.docker(self.c,*command,network,created)
+        actual=r.inspect(self.c,created);q.need(actual['Image']==record['image_id'] and not actual['State']['Running'],'recreated runtime identity is not proved stopped; reconcile before authorizing it')
+        q.need(q.stable_runtime(r.previous_runtime(self.c,actual))==q.stable_runtime(record),'recreated runtime mounts, ports, environment names or network identity differ; keep all authorities stopped')
+        return actual['Id']
+    def before(self):
+        q.need(self.markers() is None,'work has resumed or markers are ambiguous; the snapshot can never replace current authority')
+        self.record()
+        if self.doc.get('restored'):return {'restored':True,'idempotent':True,'ids':self.doc.get('restored_ids')}
+        q.need(self.phase=='prepared','before-resume recovery must first quiesce the new graph using prepared inputs')
+        self.close();self.settle();self.final()
+        metadata=r.verify_snapshot(self.snapshot)
+        saved=r.read_json(self.snapshot/'previous-runtime.json')
+        q.need(q.stable_runtime(saved)==q.stable_runtime(self.doc['old_runtimes']['coordinator']),'saved coordinator reconstruction differs from close-time identity; preserve both records and reconcile')
+        for role,item in self.doc['old_runtimes'].items():self.validate_runtime(item);self.old_values(role,item)
+        current=self.current_state();self.doc['rollback_comparison']={'snapshot':metadata['work_state'],'current':current['work_state']};self.save()
+        receipt=r.read_json(self.snapshot/'load-receipt.json');r.validate_receipt(self.c,metadata,receipt);r.verify_derivation(self.c,self.snapshot,receipt)
+        baseline=r.ledger_state(self.snapshot/r.MIGRATED_ARTIFACT,consolidated=True)['work_state']
+        q.need(current['work_state']==baseline,'current publication, target, build, planning or open-queue facts differ from the migrated snapshot; preserve current authority and reconcile the changed work')
+        actual_mark=json.loads(self.volume('ledger',"import pathlib;print(pathlib.Path('/state/ROLLOUT-SNAPSHOT.json').read_text())"))
+        q.need(actual_mark==receipt['mark'],'current ledger snapshot mark differs; preserve current authority and reconcile its provenance')
+        old_db=r.path(self.c['source_db']);q.need(old_db.stat().st_nlink==1 and not os.path.samefile(old_db,self.snapshot/'forge.db') and not any(ch in str(old_db) for ch in '\n\r\"'),'old ledger aliases another file or has an unsafe backup name; preserve the snapshot and reconcile its exact path')
+        q.need(os.access(old_db,os.W_OK) and os.access(old_db.parent,os.W_OK|os.X_OK),'old ledger or parent is not writable by the operator; repair ownership before retiring any new volume')
+        r.no_holders(old_db);self.remove_current()
+        journal=self.doc.setdefault('rollback',{'stage':'stopped','created':{},'retired':[]});self.save()
+        for role in ('memory','relay','coordinator'):
+            if role not in journal['created']:journal['created'][role]=self.create_old(role,self.doc['old_runtimes'][role]);self.save()
+        model=self.model()
+        for role,name in self.c['volumes'].items():
+            if role not in journal['retired']:
+                r.volume_identity(self.c,name,model);q.need(not r.docker(self.c,'ps','--all','--filter','volume='+name,'--format','{{.ID}}').stdout.strip(),'new state volume still has an attachment; keep both authorities stopped')
+                r.docker(self.c,'volume','rm',name);journal['retired'].append(role);self.save()
+        db=r.path(self.c['source_db']);r.no_holders(db);target=str(db).replace('"','""')
+        r.run(['sqlite3','-readonly',self.snapshot/'forge.db','.backup "'+target+'"'])
+        q.need(r.ledger_state(db)=={k:metadata[k] for k in ('schema_version','tables','work_state')},'restored old ledger differs from snapshot; keep all recreated containers stopped')
+        journal['stage']='restored';self.save()
+        try:
+            for role in ('memory','relay','coordinator'):
+                identifier=journal['created'][role];q.need(identifier!=self.doc['old_runtimes'][role]['service_identity']['container_id'],'recovery selected an old container; refuse to restart it')
+                r.docker(self.c,'start',identifier)
+        except Exception:
+            for identifier in journal['created'].values():r.docker(self.c,'stop',identifier,check=False)
+            self.doc['rollback']['stage']='restored-start-failed-stopped';self.save();raise
+        self.doc['restored']=True;self.doc['restored_ids']=journal['created'];self.save()
+        return {'restored':True,'ids':journal['created'],'next':'Use --reopen only after verifying the restored estate; the retired alarm stays masked.'}
+    def current_copy(self,directory):
+        output=directory/'current.db'
+        code='''import pathlib,sqlite3,hashlib,json
+p=pathlib.Path('/state/forge.db');wal=p.with_name(p.name+'-wal');active=wal.exists() and wal.stat().st_size>0
+source=sqlite3.connect(p.as_uri()+('?mode=ro' if active else '?mode=ro&immutable=1'),uri=True);target=sqlite3.connect('/out/current.db');source.backup(target);target.close();source.close()
+p=pathlib.Path('/out/current.db');print(json.dumps({'sha256':hashlib.sha256(p.read_bytes()).hexdigest(),'size':p.stat().st_size}))
+'''
+        name=self.c['volumes']['ledger'];r.volume_identity(self.c,name,self.model())
+        observed=json.loads(self.helper(code,mounts=[f'type=volume,src={name},dst=/state,readonly',f'type=bind,src={directory},dst=/out']))
+        q.need(r.sha256(output)==observed['sha256'],'current-copy hash differs; retain stopped authority and retry the copy')
+        return output,observed
+    def h6(self,candidate,directory):
+        q.need(re.fullmatch(r'sha256:[0-9a-f]{64}',candidate),'compatibility candidate must be an immutable image ID; do not supply a tag')
+        q.need(json.loads(r.docker(self.c,'image','inspect',candidate).stdout)[0]['Id']==candidate,'compatibility image is not locally available by ID; leave the estate stopped')
+        pristine,observation=self.current_copy(directory);working=directory/'probe';working.mkdir(mode=0o700)
+        # container user owns only its own throwaway fixture; original copy is read-only.
+        os.chmod(working,0o777)
+        name=self.c['project']+'-h6-'+uuid.uuid4().hex[:12]
+        code=q.GUARD+'\n'+inspect_source.getsource(h6_probe)+'\nh6_probe()\n'
+        cid=r.docker(self.c,'create','--name',name,'--network','none','--read-only','--tmpfs','/tmp','-e','PYTHONDONTWRITEBYTECODE=1','--mount',f'type=bind,src={working},dst=/probe','--mount',f'type=bind,src={pristine},dst=/pristine.db,readonly','--entrypoint','python',candidate,'-c',code,'/probe','/pristine.db',observation['sha256'],candidate).stdout.strip()
+        try:
+            q.need(r.inspect(self.c,cid)['Image']==candidate,'H6 container image differs from the chosen ID; leave the estate stopped')
+            r.docker(self.c,'start','--attach',cid)
+            q.need(r.inspect(self.c,cid)['State']['ExitCode']==0,'candidate H6 publication or leftover-worker recovery refused; inspect its private probe evidence and remain stopped')
+        finally:r.docker(self.c,'rm','--force',cid,check=False)
+        result=r.read_json(working/'h6-result.json')
+        q.need(result.get('outcome')=='handled-both' and result.get('candidate_image_id')==candidate and result.get('pristine_sha256')==r.sha256(pristine)==observation['sha256'],'H6 result does not bind the actual candidate and current copy; keep the estate stopped')
+        return result
+    def after(self):
+        marker=self.markers();q.need(marker is not None,'after-resume recovery requires two matching markers; classify authority before touching any graph')
+        q.need(self.phase=='prepared','after-resume recovery requires current prepared inventory; no old folder will be accessed')
+        self._after_candidate=self.args.candidate_image
+        self.record();self.close();self.settle();self.final()
+        result={'format_version':1,'at':q.now(),'marker':marker,'mode':'after-resume','volumes_kept':self.c['volumes'],'status':'stopped','candidate':self.args.candidate_image,'configuration':{'env_file':self.args.env_file,'compose_files':self.c['compose_files'],'planning_enabled':False},'notice':'Only a compatible forward release or stopped reconciliation is permitted; old folders, units and sandbox routes remain untouched.'}
+        destination=self.snapshot/'rollback-reconciliation.json';r.atomic_json(destination,result)
+        try:self.planning(False);self.remove_current()
+        except Exception:
+            result['status']='stopped-configuration-or-removal-refused';r.atomic_json(destination,result);raise
+        if not self.args.candidate_image:return result
+        candidate=self.args.candidate_image;q.need(self.args.candidate_env_file,'candidate configuration is unnamed; provide its explicit public env file')
+        candidate_values,_=q.load_script('rollout-settings').read_env(r.path(self.args.candidate_env_file));current_values,_=q.load_script('rollout-settings').read_env(r.path(self.args.env_file))
+        q.need(candidate_values.get('FORGE_IMAGE')==candidate and {k:v for k,v in candidate_values.items() if k!='FORGE_IMAGE'}=={k:v for k,v in current_values.items() if k!='FORGE_IMAGE'},'candidate env changes routes or unrelated settings; provide the current public env with only the immutable image changed')
+        directory=self.snapshot/('h6-'+uuid.uuid4().hex);directory.mkdir(mode=0o700)
+        try:
+            proof=self.h6(candidate,directory);result['h6']=proof
+            override=directory/'candidate-compose.json';r.atomic_json(override,{'services':{'coordinator':{'image':candidate},'answer-service':{'image':candidate}}})
+            cmd=['compose','--project-name',self.c['project'],'--env-file',self.args.candidate_env_file]
+            for f in self.c['compose_files']:cmd+=['-f',f]
+            cmd+=['-f',str(override)]
+            clean={**self.env,'FORGE_IMAGE':candidate}
+            model=json.loads(r.docker(self.c,*cmd,'config','--format','json',env=clean).stdout)
+            q.need(model['services']['coordinator']['image']==candidate and model['services']['answer-service']['image']==candidate,'candidate rendered image differs; remain stopped')
+            r.docker(self.c,*cmd,'up','--no-deps','-d','memory','memory-relay','forge-publisher','answer-service','coordinator',env=clean)
+            result['status']='compatible-current-release-started-with-admissions-closed';result['configuration'].update(env_file=self.args.candidate_env_file,candidate_override=str(override),candidate_override_sha256=r.sha256(override))
+        except Exception:
+            # An interrupted Compose up can leave a partial compatible graph.
+            # Stop only exact project/service labels from this candidate attempt.
+            for service in ('memory','memory-relay','forge-publisher','answer-service','coordinator'):
+                ids=r.docker(self.c,'ps','--filter','label=com.docker.compose.project='+self.c['project'],'--filter','label=com.docker.compose.service='+service,'--format','{{.ID}}').stdout.split()
+                for identifier in ids:r.docker(self.c,'stop',identifier)
+            result['status']='stopped-incompatible-or-unknown';raise
+        finally:r.atomic_json(destination,result)
+        return result
+
+def main(argv=None):
+    p=q.arguments(back=True);m=p.add_mutually_exclusive_group(required=True);m.add_argument('--before-resume',action='store_const',const='before',dest='mode');m.add_argument('--after-resume',action='store_const',const='after',dest='mode');p.add_argument('--candidate-image');p.add_argument('--candidate-env-file')
+    args=p.parse_args(argv)
+    def execute():
+        q.need(args.mode=='after' or not (args.candidate_image or args.candidate_env_file),'candidate options belong only to after-resume recovery; select the intended authority mode')
+        estate=Recovery(args)
+        return estate.plan(args.mode) if args.plan else getattr(estate,args.mode)()
+    return r.main_guard(execute)
+if __name__=='__main__':raise SystemExit(main())
