@@ -276,6 +276,31 @@ def test_runtime_seal_accepts_docker_cli_entrypoint_partition_only():
     recreated['service_identity']['command'][-1]='other.module'
     assert q.stable_runtime(base)!=q.stable_runtime(recreated)
 
+def test_runtime_seal_accepts_only_plain_equivalent_bind_mode_spelling():
+    base={'service_identity':{'container_id':'a'*64,'name':'/old'},'networks':{'internal':{'Aliases':['old']}},'image_id':'x','repo_tags':[],'port_bindings':{},'restart_policy':{},'network_mode':'internal','env_names':['ONE']}
+    old=[{'Type':'bind','Source':'/owned/rw','Destination':'/rw','Mode':'rw','RW':True,'Propagation':'rprivate'},{'Type':'bind','Source':'/owned/ro','Destination':'/ro','Mode':'ro','RW':False,'Propagation':'rprivate'}]
+    recreated=json.loads(json.dumps(base));base['mounts']=old;recreated['mounts']=[dict(x,Mode='') for x in old]
+    assert q.stable_runtime(base)==q.stable_runtime(recreated)
+    for field,value in [('Source','/different'),('Destination','/different'),('RW',False),('Propagation','rshared'),('Type','volume')]:
+        changed=json.loads(json.dumps(recreated));changed['mounts'][0][field]=value
+        assert q.stable_runtime(base)!=q.stable_runtime(changed)
+
+@pytest.mark.parametrize('mode,rw',[('ro',True),('rw',False),('z',True),('Z',False),('ro,z',False),('cached',True)])
+def test_bind_mode_with_other_or_contradictory_semantics_refuses(mode,rw):
+    mount={'Type':'bind','Source':'/owned/source','Destination':'/target','Mode':mode,'RW':rw,'Propagation':'rprivate'}
+    with pytest.raises(r.Refusal,match='unsupported or contradictory'):q.stable_mount(mount)
+
+@pytest.mark.parametrize('change',[
+    {'Consistency':'cached'},
+    {'Propagation':'made-up'},
+    {'Source':'/owned/source,readonly'},
+    {'Destination':'/target\nother'},
+])
+def test_bind_options_not_reconstructed_by_docker_mount_refuse(change):
+    mount={'Type':'bind','Source':'/owned/source','Destination':'/target','Mode':'rw','RW':True,'Propagation':'rprivate'};mount.update(change)
+    with pytest.raises(r.Refusal):q.stable_mount(mount)
+
+
 def test_post_create_failure_journals_id_and_retry_reuses_only_that_container(estate,monkeypatch):
     recovery=b.Recovery(estate.args);created='b'*64;old='a'*64;network='owned-primary'
     record={'image_id':r.RUNTIME,'repo_tags':[],'mounts':[],'networks':{network:{'Aliases':['owned-memory'],'Links':None,'IPAMConfig':None,'DriverOpts':None}},'port_bindings':{},'restart_policy':{'Name':'no','MaximumRetryCount':0},'network_mode':network,'env_names':[],'service_identity':{'name':'/owned-memory','container_id':old,'hostname':'owned-host','user':'','working_dir':'/app','entrypoint':['/bin/sh','-c','exec "$@"','argv0'],'command':['python','-m','fleet_memory.mcp']}}

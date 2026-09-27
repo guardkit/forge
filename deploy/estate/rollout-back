@@ -188,7 +188,7 @@ class Recovery(q.Estate):
             q.need(all(x.get('HostPort') and x['HostPort']!='0' for x in bindings or []),'saved runtime uses an unspecified allocated port; reconcile its exact listener before recovery')
         for m in record['mounts']:
             q.need(m['Type'] in ('bind','volume'),'previous mount type is unsupported; keep the estate stopped')
-            if m['Type']=='bind':r.path(m['Source'])
+            if m['Type']=='bind':q.stable_mount(m);r.path(m['Source'])
             else:r.docker(self.c,'volume','inspect',m['Name'])
     def create_old(self,role,record,journal):
         self.validate_runtime(record);values=self.old_values(role,record);identity=record['service_identity'];name=identity['name'].lstrip('/')
