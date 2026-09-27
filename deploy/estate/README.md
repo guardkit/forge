@@ -897,10 +897,14 @@ the design:
    SHA-256 `91dd319387efde1cd33f8636ca85a5567139ac1ed196950a6b2803a8e9ab8eb2`,
    records all five image roles, and reports a two-term sweep with no exceptions.
    The operator constants now name the immutable Forge coordinator and publisher
-   image IDs recorded by that receipt. These are build facts only: independent
-   package/image qualification and the fresh throwaway rehearsals remain
-   outstanding, so the receipt and pin update do not by themselves authorize
-   rollout.
+   image IDs recorded by that receipt. Independent package checks passed in
+   their measured scopes, but the actual legacy configuration exposed a named
+   repair admission defect for projects with shared-path aliases. The accepted
+   source correction is pinned by candidate `2026.09.28-1`; that candidate has
+   not been published or built. Operator image constants deliberately remain
+   on the previous receipt until the normal build supplies new immutable IDs.
+   The replacement image must pass qualification and both fresh throwaway
+   rehearsals before rollout readiness can be claimed.
 10. **Codex's sign-off, and the owner's go.** Nothing here is rollout approval.
 
 ## Why the bus's image is not in the release manifest

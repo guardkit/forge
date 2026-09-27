@@ -155,13 +155,15 @@ schema: 2
 # repositories from GitHub and built five images. An earlier version of this
 # note, written while the forge and jarvis pins were local, said the build
 # would stop at the fetch; it did, then, which was the check working.
-# 2026.09.27-1 is a PREPARATION CANDIDATE, not a built release. It combines
-# the reviewed rollout scripts and registered-sandbox BUILD admission fixes.
-# The Forge source pin is the functional integration ancestor of this metadata
-# change; all five other repository pins remain those of 2026.09.26-3.
-# Source publication, the normal manifest build and new-image rehearsal remain
-# pending. Preserve release 2026.09.26-3 and its immutable image receipts.
-version: 2026.09.27-1
+# 2026.09.27-1 was built from published Forge 3956c79e. Its measured package
+# checks remain valid, but named repairs with legitimate shared-path aliases
+# require the later accepted admission correction before this rollout.
+# 2026.09.28-1 is a PREPARATION CANDIDATE, not a built release. The Forge pin
+# below contains that correction and the accepted operator integration. The
+# other five repository pins are unchanged. Source publication, the normal
+# manifest build, new-image qualification and full rehearsal remain pending.
+# Preserve prior releases and their immutable image receipts.
+version: 2026.09.28-1
 
 # The one image this repository's own operator scripts mean by "the release
 # image" (ops/forge-prod-recreate.sh reads this line). It is the same name as
@@ -259,7 +261,7 @@ repositories:
   - name: forge
     url: https://github.com/guardkit/forge.git
     branch: main
-    commit: 3956c79eb53960e522f28fc809d110052eb58148
+    commit: a545a86a435862b573b595e10346e4cb75d6e715
     role: build-context-root
   - name: guardkit
     url: https://github.com/guardkit/guardkit.git
