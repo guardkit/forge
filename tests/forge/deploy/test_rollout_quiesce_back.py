@@ -340,6 +340,12 @@ def test_three_representative_saved_roles_preserve_process_mount_and_runtime_ide
 def test_named_volume_argument_preserves_plain_saved_mode(mode,rw,expected):
     assert b.volume_argument(named_volume(mode,rw))==expected
 
+@pytest.mark.parametrize('mode,rw',[('rw',True),('ro',False)])
+@pytest.mark.parametrize('destination',['/data/.hidden','/data/nested/sub-name_1'])
+def test_named_volume_argument_preserves_canonical_hidden_and_nested_paths(mode,rw,destination):
+    mount=named_volume(mode,rw);mount['Destination']=destination
+    assert b.volume_argument(mount)=='owned-volume:'+destination+':'+mode
+
 @pytest.mark.parametrize('change',[
     {'Mode':'z'},
     {'Mode':'Z'},
@@ -352,6 +358,14 @@ def test_named_volume_argument_preserves_plain_saved_mode(mode,rw,expected):
     {'Name':'bad:name'},
     {'Destination':'relative'},
     {'Destination':'/'},
+    {'Destination':'//'},
+    {'Destination':'/./'},
+    {'Destination':'/data/..'},
+    {'Destination':'/../'},
+    {'Destination':'/data/'},
+    {'Destination':'/data//sub'},
+    {'Destination':'/data/./sub'},
+    {'Destination':'/data/../sub'},
     {'Destination':'/bad\0target'},
     {'Destination':'/bad:target'},
 ])
@@ -375,7 +389,7 @@ def test_create_old_uses_explicit_volume_syntax_and_preserves_mode(estate,monkey
     command=creates[0]
     assert command[command.index('--volume')+1]=='owned-volume:/owned:'+mode and '--mount' not in command
 
-@pytest.mark.parametrize('change',[{'Mode':'z'},{'Driver':'other'},{'Source':'/different'},{'Destination':'/'},{'Destination':'/bad\0target'}])
+@pytest.mark.parametrize('change',[{'Mode':'z'},{'Driver':'other'},{'Source':'/different'},{'Destination':'/'},{'Destination':'//'},{'Destination':'/./'},{'Destination':'/data/..'},{'Destination':'/../'},{'Destination':'/data/'},{'Destination':'/data//sub'},{'Destination':'/data/./sub'},{'Destination':'/data/../sub'},{'Destination':'/bad\0target'}])
 def test_named_volume_preflight_refuses_before_old_container_deletion(estate,monkeypatch,change):
     recovery=b.Recovery(estate.args);mount=named_volume();mount.update(change);record=volume_runtime(mount);events=[]
     def docker(c,*args,**kwargs):
