@@ -1102,6 +1102,19 @@ async def compose_planning_consumer_and_dispatch(
             plan_files: list[str],
             originating_user: str | None,
         ) -> BuildTriggerResult:
+            from forge.config.build_admission import build_admission
+
+            build_policy = build_admission(config, target_repo=target_repo)
+            if not build_policy.allowed:
+                logger.error(
+                    "planning target terminal: %s; no BUILD event was published",
+                    build_policy.reason,
+                )
+                return BuildTriggerResult(
+                    queued=False,
+                    reason=build_policy.reason or "sandbox-required",
+                )
+
             from nats_core.envelope import EventType, MessageEnvelope
             from nats_core.events import BuildQueuedPayload
 
@@ -1134,7 +1147,7 @@ async def compose_planning_consumer_and_dispatch(
             # ``forge-internal`` and omits the adapter.
             payload = BuildQueuedPayload(
                 feature_id=feature_id,
-                repo=target_repo,
+                repo=build_policy.repo_key or target_repo,
                 branch=branch,
                 feature_yaml_path=feature_yaml_path,
                 triggered_by="forge-internal",

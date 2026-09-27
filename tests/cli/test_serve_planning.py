@@ -1032,3 +1032,42 @@ class TestBuildTriggerWiring:
             await asyncio.gather(
                 *(result.background_tasks or []), return_exceptions=True
             )
+
+
+class TestSandboxOnlyPlanningBuildTransition:
+    @pytest.mark.asyncio
+    async def test_planning_composes_but_unsandboxed_build_trigger_publishes_nothing(
+        self, tmp_db: Path
+    ) -> None:
+        broker = InMemoryNats()
+        config = _make_planning_config(
+            target_terminal={"enabled": True},
+            target_repo_paths={"example/plain": "/srv/checkouts/plain"},
+        )
+        config.publication.builds_may_run_inside_the_coordinator = False
+
+        result = await compose_planning_consumer_and_dispatch(
+            db_path=tmp_db, nats_client=broker, config=config, clock=FixedClock()
+        )
+        assert result is not None and result.driver is not None
+        try:
+            trigger = result.driver._deps.dispatch_build_trigger
+            outcome = await trigger(
+                plan_run_id="plan-d4",
+                correlation_id="corr-d4",
+                feature_id="FEAT-D4PLN",
+                target_repo="example/plain",
+                branch="planning/corr-d4",
+                plan_files=["features/FEAT-D4PLN.yaml"],
+                originating_user="synthetic-user",
+            )
+
+            assert outcome.queued is False
+            assert "sandbox-required" in (outcome.reason or "")
+            assert "pipeline.build-queued.FEAT-D4PLN" not in broker.published
+        finally:
+            for task in list(result.background_tasks or []):
+                task.cancel()
+            await asyncio.gather(
+                *(result.background_tasks or []), return_exceptions=True
+            )

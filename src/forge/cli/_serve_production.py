@@ -866,44 +866,50 @@ class _RepoRoutedAsyncTaskStarter:
     """Dispatch each build to the runner that lives with its repository.
 
     SANDBOX FIRST (2026-09-07, rule 78). A build installs and runs a
-    repository's own code, so for a repository that has a sandbox it is
-    dispatched to the build runner INSIDE that sandbox, whose worktrees, venvs
-    and test runs exist only there. Every other repository is dispatched to
-    the one global runner exactly as before.
+    repository's own code. Repositories with a registered sandbox are sent to
+    that sandbox's runner. In compatibility mode other repositories retain the
+    global runner; when coordinator builds are disabled, missing, ambiguous or
+    unusable sandbox routes are refused.
 
-    The choice is per dispatch, not per boot, because one daemon serves every
-    repository and only some of them have a sandbox. The repository rides on
-    the dispatch itself (``context["repo"]``, which
-    :func:`forge.pipeline.dispatchers.autobuild_async.dispatch_autobuild_async`
-    puts there); a dispatch that names no repository, or names one with no
-    sandbox, goes to the global runner.
-
-    This class is only ever built when ``planning.sandboxes`` names at least
-    one repository — with the mapping empty the composition hands the
-    dispatcher the same single starter it always did, so nothing routes at all.
+    The choice is per dispatch because one daemon serves every repository.
+    The canonical repository identity rides on ``context["repo"]`` from
+    :func:`forge.pipeline.dispatchers.autobuild_async.dispatch_autobuild_async`.
+    The shared admission helper resolves that identity before a starter can be
+    selected, so strict mode never falls through to the global starter.
     """
 
-    __slots__ = ("_default", "_by_repo")
+    __slots__ = ("_default", "_by_repo", "_config")
 
     def __init__(
-        self, *, default: AsyncTaskStarter, by_repo: dict[str, AsyncTaskStarter]
+        self,
+        *,
+        default: AsyncTaskStarter,
+        by_repo: dict[str, AsyncTaskStarter],
+        forge_config: Any,
     ) -> None:
         self._default = default
         self._by_repo = dict(by_repo)
+        self._config = forge_config
 
     def _starter_for(self, context: "Mapping[str, Any]") -> AsyncTaskStarter:
         try:
             repo = str(context.get("repo") or "").strip()
         except AttributeError:  # pragma: no cover — a mapping is what is sent
-            return self._default
-        starter = self._by_repo.get(repo)
+            repo = ""
+        from forge.config.build_admission import build_admission
+
+        admission = build_admission(self._config, target_repo=repo)
+        if not admission.allowed:
+            raise RuntimeError(admission.reason or "sandbox-required")
+        canonical_repo = admission.repo_key or repo
+        starter = self._by_repo.get(canonical_repo)
         if starter is None:
             return self._default
         logger.info(
             "autobuild dispatch: %s has a sandbox, so this build runs on the "
             "build runner inside it — the repository's own code is never "
             "installed or run on the host",
-            repo,
+            canonical_repo,
         )
         return starter
 
@@ -927,17 +933,18 @@ def build_repo_routed_async_task_starter(
 ) -> AsyncTaskStarter:
     """Return the starter the dispatch chain uses — routed only if it must be.
 
-    With ``planning.sandboxes`` empty (the default, and the estate's state
-    until an operator fills it in) this returns ``default_starter`` itself, so
-    the composition is byte for byte what it was before this lane. Otherwise
-    it builds one more middleware per sandboxed repository, each registered
-    against that sandbox's own runner address, and wraps them all in
-    :class:`_RepoRoutedAsyncTaskStarter`.
+    Compatibility mode with no sandbox registrations returns
+    ``default_starter`` unchanged. Otherwise this builds one middleware per
+    sandbox runner and wraps the starters in
+    :class:`_RepoRoutedAsyncTaskStarter`. Strict mode creates the wrapper even
+    when no usable routes exist so every attempted dispatch is refused.
     """
+    from forge.config.build_admission import builds_require_sandbox
     from forge.config.sandboxes import sandboxes_of
 
     sandboxes = sandboxes_of(forge_config)
-    if not sandboxes:
+    strict = builds_require_sandbox(forge_config)
+    if not sandboxes and not strict:
         return default_starter
     by_repo: dict[str, AsyncTaskStarter] = {}
     for repo, entry in sandboxes.items():
@@ -945,8 +952,8 @@ def build_repo_routed_async_task_starter(
         if not runner_url:
             logger.warning(
                 "autobuild dispatch: %s has a sandbox (%s) but no runner "
-                "address, so its builds go to the global build runner — the "
-                "repository's code would run on the host. Set runner_url in "
+                "address. Strict BUILD admission will refuse it; compatibility "
+                "mode retains the global build runner. Set runner_url in "
                 "planning.sandboxes",
                 repo,
                 getattr(entry, "name", "?"),
@@ -963,10 +970,12 @@ def build_repo_routed_async_task_starter(
             getattr(entry, "name", "?"),
             runner_url,
         )
-    if not by_repo:
+    if not by_repo and not strict:
         return default_starter
     return _RepoRoutedAsyncTaskStarter(
-        default=default_starter, by_repo=by_repo
+        default=default_starter,
+        by_repo=by_repo,
+        forge_config=forge_config,
     )
 
 

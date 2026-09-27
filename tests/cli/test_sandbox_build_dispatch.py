@@ -75,9 +75,17 @@ class _FakeServeModule:
         )
 
 
-def _config(*, with_sandbox: bool, runner_url: str = SANDBOX_RUNNER) -> ForgeConfig:
+def _config(
+    *,
+    with_sandbox: bool,
+    runner_url: str = SANDBOX_RUNNER,
+    strict: bool = False,
+) -> ForgeConfig:
     planning: dict[str, Any] = {
-        "target_repo_paths": {REPO_WITH: "/repos/api_test", REPO_WITHOUT: "/repos/plain"}
+        "target_repo_paths": {
+            REPO_WITH: "/repos/api_test",
+            REPO_WITHOUT: "/repos/plain",
+        }
     }
     if with_sandbox:
         planning["sandboxes"] = {
@@ -88,7 +96,13 @@ def _config(*, with_sandbox: bool, runner_url: str = SANDBOX_RUNNER) -> ForgeCon
             }
         }
     return ForgeConfig.model_validate(
-        {"permissions": {"filesystem": {"allowlist": ["/repos"]}}, "planning": planning}
+        {
+            "permissions": {"filesystem": {"allowlist": ["/repos"]}},
+            "planning": planning,
+            "publication": {
+                "builds_may_run_inside_the_coordinator": not strict
+            },
+        }
     )
 
 
@@ -496,3 +510,51 @@ class TestTheWatchingSeamsTakeTheRoutedAddress:
             f"run-in-{GLOBAL_RUNNER}",
         )
         assert asked == [SANDBOX_RUNNER, GLOBAL_RUNNER]
+
+
+class TestSandboxOnlyRoutingHasNoGlobalFallback:
+    def test_empty_map_refuses_sync_and_async_without_calling_remote_default(
+        self,
+    ) -> None:
+        seen: list[tuple[str, str]] = []
+        module = _FakeServeModule()
+        routed = build_repo_routed_async_task_starter(
+            serve_module=module,
+            forge_config=_config(with_sandbox=False, strict=True),
+            default_starter=_default_starter(seen),
+        )
+
+        with pytest.raises(RuntimeError, match="sandbox-required"):
+            routed.start_async_task(
+                "autobuild_runner", {"repo": REPO_WITHOUT}
+            )
+        with pytest.raises(RuntimeError, match="sandbox-required"):
+            asyncio.run(
+                routed.astart_async_task(
+                    "autobuild_runner", {"repo": "unknown/project"}
+                )
+            )
+
+        assert seen == []
+        assert module.launches == []
+
+    def test_rewritten_path_resolves_to_the_canonical_sandbox_runner(self) -> None:
+        seen: list[tuple[str, str]] = []
+        module = _FakeServeModule()
+        config = _config(with_sandbox=True, strict=True)
+        routed = build_repo_routed_async_task_starter(
+            serve_module=module,
+            forge_config=config,
+            default_starter=_default_starter(seen),
+        )
+
+        task_id = asyncio.run(
+            routed.astart_async_task(
+                "autobuild_runner",
+                {"repo": config.planning.target_repo_paths[REPO_WITH]},
+            )
+        )
+
+        assert task_id == f"thread-for-{SANDBOX_RUNNER}"
+        assert module.launches == [(SANDBOX_RUNNER, "async")]
+        assert seen == []

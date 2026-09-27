@@ -1831,3 +1831,105 @@ class TestGuardkitsLoaderFindsTheFile:
         )
         assert proc_main.returncode != 0
         assert "not found" in (proc_main.stderr + proc_main.stdout)
+
+
+class TestSandboxOnlyRepairAdmission:
+    def test_direct_repair_refuses_before_reading_a_missing_task_spec(
+        self, repo_root: Path, pool: SqliteLifecyclePersistence
+    ) -> None:
+        config = make_config(
+            repo_root,
+            profiles={FIX_JOURNEY_PROFILE_NAME: {"max_review_cycles": 2}},
+            default_profile=FIX_JOURNEY_PROFILE_NAME,
+        )
+        config.publication.builds_may_run_inside_the_coordinator = False
+        prepared: list[str] = []
+
+        with pytest.raises(FixAdmissionRefused) as caught:
+            asyncio.run(
+                admit_fix_build(
+                    config=config,
+                    persistence=pool,
+                    task_id="TASK-D4FIX1",
+                    fix_task_yaml=repo_root / "does-not-exist.yaml",
+                    repo_path=repo_root,
+                    correlation_id="fix-build-d4",
+                    publish=Publisher(),
+                    profile=FIX_JOURNEY_PROFILE_NAME,
+                    prepare_branch=lambda: prepared.append("called"),
+                )
+            )
+
+        assert caught.value.reason == "sandbox-required"
+        assert prepared == []
+        assert build_rows(pool) == []
+
+    def test_strict_sandboxed_repair_publishes_the_canonical_registration(
+        self, repo_root: Path, pool: SqliteLifecyclePersistence
+    ) -> None:
+        config = make_config(
+            repo_root,
+            profiles={FIX_JOURNEY_PROFILE_NAME: {"max_review_cycles": 2}},
+            default_profile=FIX_JOURNEY_PROFILE_NAME,
+            sandbox=True,
+        )
+        config.publication.builds_may_run_inside_the_coordinator = False
+        publisher = Publisher()
+
+        admission = asyncio.run(
+            admit_fix_build(
+                config=config,
+                persistence=pool,
+                task_id="TASK-D4FIX2",
+                fix_task_yaml=write_fix_task(repo_root),
+                repo_path=repo_root,
+                correlation_id="fix-build-d4-positive",
+                publish=publisher,
+                profile=FIX_JOURNEY_PROFILE_NAME,
+            )
+        )
+
+        assert admission.repo == REPO_KEY
+        assert publisher.payloads[0]["repo"] == REPO_KEY
+
+    def test_work_queue_repair_refuses_before_scanning_a_missing_checkout(
+        self,
+        tmp_path: Path,
+        pool: SqliteLifecyclePersistence,
+        store: WorkQueueStore,
+    ) -> None:
+        missing_repo = tmp_path / "not-present"
+        config = make_config(
+            missing_repo,
+            profiles={FIX_JOURNEY_PROFILE_NAME: {"max_review_cycles": 2}},
+            default_profile=FIX_JOURNEY_PROFILE_NAME,
+        )
+        config.publication.builds_may_run_inside_the_coordinator = False
+        seed_failed_build(pool)
+        queue_id = store.file_sentence(
+            correlation_id=fix_correlation_id(SOURCE_BUILD),
+            sentence="synthetic repair",
+            originating_user="synthetic-user",
+            target_repo=REPO_KEY,
+            kind="fix",
+            action="minted",
+        ).queue_id
+
+        with pytest.raises(FixAdmissionRefused) as caught:
+            asyncio.run(
+                admit_fix_row(
+                    config=config,
+                    persistence=pool,
+                    store=store,
+                    queue_id=queue_id,
+                    correlation_id=fix_correlation_id(SOURCE_BUILD),
+                    sentence="synthetic repair",
+                    target_repo=REPO_KEY,
+                    publish=Publisher(),
+                    profile=FIX_JOURNEY_PROFILE_NAME,
+                )
+            )
+
+        assert caught.value.reason == "sandbox-required"
+        assert not missing_repo.exists()
+        assert len(build_rows(pool)) == 1

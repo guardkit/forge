@@ -85,8 +85,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
-logger = logging.getLogger(__name__)
+from forge.config.build_admission import build_admission
 
+logger = logging.getLogger(__name__)
 
 #: The wire's pattern for a fix journey's subject identifier. Mirrors
 #: ``TASK_ID_PATTERN`` in ``nats_core.events._pipeline`` so a bad id is
@@ -969,6 +970,19 @@ async def admit_fix_build(
     from forge.lifecycle.modes import BuildMode
     from forge.lifecycle.persistence import DuplicateBuildError
 
+    # D4: direct repair callers must cross the BUILD boundary before reading
+    # their task specification or preparing a branch. Repairs also need the
+    # sandbox sidecar because that is where their branch is materialised.
+    build_policy = build_admission(
+        config, repo_path=repo_path, require_sidecar=True
+    )
+    if not build_policy.allowed:
+        raise FixAdmissionRefused(
+            build_policy.reason or "sandbox-required",
+            reason="sandbox-required",
+            permanent=True,
+        )
+
     # 1. THE CAP LAW, before every side effect.
     cap_refusal = mode_c_cap_refusal_from_config(
         config, profile, uncapped_acknowledged=uncapped_acknowledged
@@ -1048,7 +1062,7 @@ async def admit_fix_build(
     queue_config = getattr(config, "queue", None)
     payload = BuildQueuedPayload(
         feature_id=feature_id,
-        repo=repo_slug(repo),
+        repo=build_policy.repo_key or repo_slug(repo),
         branch=branch,
         feature_yaml_path=str(Path(fix_task_yaml)),
         max_turns=(
@@ -1218,6 +1232,21 @@ async def admit_fix_row(
             permanent=True,
         )
     repo_path = Path(str(paths[resolution.name])).expanduser()
+
+    # Resolve the canonical key from the declared registration and refuse
+    # before task scans, repair-base reads or branch preparation.
+    build_policy = build_admission(
+        config,
+        target_repo=resolution.name,
+        repo_path=repo_path,
+        require_sidecar=True,
+    )
+    if not build_policy.allowed:
+        raise FixAdmissionRefused(
+            build_policy.reason or "sandbox-required",
+            reason="sandbox-required",
+            permanent=True,
+        )
 
     task_id = _task_id_already_on_row(store, queue_id) or mint_fix_task_id(
         parent_feature, existing=existing_fix_task_ids(repo_path)
