@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -551,3 +552,65 @@ def test_output_ancestor_collision_refuses_before_effects(scenario):
     assert "ancestor or child" in result.stderr
     assert not scenario["docker_log"].exists()
     assert not any(path.exists() for path in scenario["outputs"].values())
+
+
+
+def test_answer_publication_must_match_declared_callback_port(scenario):
+    compose = json.loads(scenario["compose_json"].read_text())
+    compose["services"]["answer-service"]["ports"][0]["published"] = "18199"
+    scenario["compose_json"].write_text(json.dumps(compose))
+
+    result = run(scenario)
+
+    assert result.returncode == 2
+    assert "TCP publication does not match" in result.stderr
+    assert not any(path.exists() for path in scenario["outputs"].values())
+
+
+def test_explicit_matching_nondefault_answer_publication_is_valid(scenario):
+    scenario["env_file"].write_text(
+        scenario["env_file"].read_text().replace(
+            "FORGE_ANSWER_PORT=18126", "FORGE_ANSWER_PORT=18199"
+        )
+    )
+    compose = json.loads(scenario["compose_json"].read_text())
+    compose["services"]["answer-service"]["ports"][0]["published"] = "18199"
+    scenario["compose_json"].write_text(json.dumps(compose))
+
+    result = run(scenario)
+
+    assert result.returncode == 0, result.stderr
+    receipt = json.loads(scenario["outputs"]["receipt"].read_text())
+    assert receipt["routes"]["answer_port"] == 18199
+
+
+def test_interrupt_during_replacement_reports_possible_partial_output(scenario):
+    wrapper = r"""
+import os, runpy, signal, sys
+script, *arguments = sys.argv[1:]
+original = os.replace
+calls = 0
+def interrupted_replace(source, destination):
+    global calls
+    calls += 1
+    if calls == 2:
+        signal.raise_signal(signal.SIGINT)
+    return original(source, destination)
+os.replace = interrupted_replace
+sys.argv = [script, *arguments]
+runpy.run_path(script, run_name="__main__")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", wrapper, *scenario["command"]],
+        env=scenario["env"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "may already have been replaced" in result.stderr
+    assert "no partial output" not in result.stderr
+    assert scenario["outputs"]["env"].is_file()
+    assert not scenario["outputs"]["settings"].exists()
+    assert not scenario["outputs"]["receipt"].exists()
