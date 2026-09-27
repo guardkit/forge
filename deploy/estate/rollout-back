@@ -106,9 +106,8 @@ def h6_probe():
         store=DeploymentLockStore(c);grant=store.grant(target=target,build_id=new_build,turn=4,holder='h6-new',now=clock)
         assert grant and grant.counter==N+1
         row=packed(c.execute('SELECT * FROM deployment_targets WHERE target=?',(target,)).fetchone())
-        assert not store.renew(target=target,counter=N,now=clock)
-        assert not store.record_running(target=target,counter=N,now=clock,commit='wrong',identity='wrong',build_id=old_build)
-        assert not store.release(target=target,counter=N,now=clock)
+        fencing={'renew':store.renew(target=target,counter=N,now=clock),'record_running':store.record_running(target=target,counter=N,now=clock,commit='wrong',identity='wrong',build_id=old_build),'release':store.release(target=target,counter=N,now=clock)}
+        assert all(value is False for value in fencing.values())
         assert row==packed(c.execute('SELECT * FROM deployment_targets WHERE target=?',(target,)).fetchone())
         second_answer=second.run(DeployRequest(target=target,target_counter=N+1,build=new_build,cwd=str(root),script=str(quick),identity=J,identity_setting='DEPLOY_IDENTITY')).to_wire()
         assert second_answer['accepted'] and second_answer['exit_code']==0,second_answer
@@ -125,9 +124,37 @@ def h6_probe():
         if table not in ('builds','stage_log','publication_records','deployment_targets'):assert after==original,'unrelated rows added in '+table
     c.close();assert sha(pristine)==wanted
     assert not any(n=='nats' or n.startswith('nats.') for n in sys.modules)
-    result={'format_version':1,'outcome':'handled-both','candidate_image_id':image,'pristine_sha256':wanted,'working_pre_fixture_sha256':pre_fixture,'schema_version':16,'columns':columns,'fixture_ids':{'build':build,'target':target},'git':{'G':G,'tip':tip,'J':J},'publication':{'before_sha256':hashlib.sha256(publication_before.encode()).hexdigest(),'after_sha256':hashlib.sha256(publication_after.encode()).hexdigest(),'turn':record.turn,'result':record.result,'line_kinds':[x.kind+' '+x.step for x in record.lines],'send_result':send.detail,'callbacks':callbacks},'deployment':{'N':N,'N_plus_1':grant.counter,'reconcile':reconciled,'old_note':old_note,'old_answers':answers,'successor':second_answer,'final_note':final_note},'cleanup':'no owned worker remains','existing_rows_unchanged':True,'real_client_modules':[]}
+    result={'format_version':1,'outcome':'handled-both','candidate_image_id':image,'configuration_sha256':sys.argv[5],'pristine_sha256':wanted,'working_pre_fixture_sha256':pre_fixture,'schema_version':16,'columns':columns,'fixture_ids':{'build':build,'target':target},'git':{'G':G,'tip':tip,'J':J,'tree':tree},'publication':{'before_sha256':hashlib.sha256(publication_before.encode()).hexdigest(),'after_sha256':hashlib.sha256(publication_after.encode()).hexdigest(),'turn':record.turn,'result':record.result,'g_commit':record.g_commit,'j_commit':record.j_commit,'checked':record.checked,'original_lines_preserved':True,'line_kinds':[x.kind+' '+x.step for x in record.lines],'send_result':send.detail,'callbacks':callbacks},'deployment':{'N':N,'N_plus_1':grant.counter,'stale_fencing':fencing,'stale_record_unchanged':True,'reconcile':reconciled,'old_note':old_note,'old_answers':answers,'successor':second_answer,'final_note':final_note},'cleanup':'no owned worker remains','existing_rows_unchanged':True,'worker_group_empty':True,'worker_thread_stopped':True,'real_client_modules':[]}
     (root/'h6-result.json').write_text(json.dumps(result,sort_keys=True,indent=2)+'\n');print(json.dumps(result))
 
+
+def validate_h6(result,candidate,digest,configuration_sha256):
+    """Every required observation is explicit; a summary string grants nothing."""
+    def require(value):q.need(value,'H6 behavioral proof is incomplete or contradictory; preserve current authority and inspect the private probe result')
+    try:
+        require(type(result['format_version']) is int and result['format_version']==1 and result['outcome']=='handled-both')
+        require(result['candidate_image_id']==candidate and result['pristine_sha256']==digest and result['working_pre_fixture_sha256']==digest and result['configuration_sha256']==configuration_sha256)
+        require(type(result['schema_version']) is int and result['schema_version']==16 and result['existing_rows_unchanged'] is True and result['real_client_modules']==[])
+        require(result['cleanup']=='no owned worker remains' and result['worker_group_empty'] is True and result['worker_thread_stopped'] is True)
+        needed={'builds':{'build_id','status','mode','start_commit','target_branch'},'publication_records':{'build_id','g_commit','j_commit','checked_json','turn','lines_json'},'deployment_targets':{'target','counter','holder_build','holder_turn','running_commit'}}
+        require(all(columns<=set(result['columns'][table]) for table,columns in needed.items()))
+        git=result['git'];require(all(isinstance(git[k],str) and re.fullmatch('[0-9a-f]{40}',git[k]) for k in ('G','tip','J','tree')) and len({git[k] for k in ('G','tip','J')})==3)
+        pub=result['publication'];require(type(pub['turn']) is int and pub['turn']==4 and pub['result']=='published, deployment pending')
+        require(pub['g_commit']==git['G'] and pub['j_commit']==git['J'] and pub['checked']=={'identity':git['J'],'j_commit':git['J'],'j_tree':git['tree']} and pub['original_lines_preserved'] is True)
+        require(pub['callbacks']=={'publisher':0,'guardkit':0,'deploy':0,'stage_complete':1} and all(type(value) is int for value in pub['callbacks'].values()))
+        require(pub['line_kinds']==['done join','done merge-checks','done candidate-check','about to send','done send'])
+        require(all(isinstance(pub[k],str) and re.fullmatch('[0-9a-f]{64}',pub[k]) for k in ('before_sha256','after_sha256')) and pub['before_sha256']!=pub['after_sha256'])
+        send=pub['send_result'];require(all(send[k] is True for k in ('found_by_looking','published','contains_j')) and send['ran_on']==git['J'] and send['remote_now']==git['J'])
+        target=result['fixture_ids']['target'];require(isinstance(target,str) and target and isinstance(result['fixture_ids']['build'],str))
+        deploy=result['deployment'];require(type(deploy['N']) is int and deploy['N']==41 and type(deploy['N_plus_1']) is int and deploy['N_plus_1']==42)
+        require(deploy['stale_fencing']=={'renew':False,'record_running':False,'release':False} and all(value is False for value in deploy['stale_fencing'].values()) and deploy['stale_record_unchanged'] is True)
+        require(deploy['reconcile']=={target:'occupied (adopted)'})
+        old=deploy['old_note'];final=deploy['final_note'];require(old['target']==final['target']==target and old['counter']==old['highest_counter']==41 and type(old['group']) is int and old['group']>0 and old['phase']=='running')
+        require(final['highest_counter']==42 and final['group']==0 and final['counter']==0 and final['phase']=='' and final['highest_build']!=old['build'])
+        require(len(deploy['old_answers'])==1 and deploy['old_answers'][0]['accepted'] is False and deploy['old_answers'][0]['word']=='the-deploy-command-was-stopped-by-a-takeover')
+        successor=deploy['successor'];require(successor['accepted'] is True and type(successor['exit_code']) is int and successor['exit_code']==0 and successor['word']=='the-deploy-command-ran' and 'DEPLOYED_IDENTITY='+git['J'] in successor['output_tail'])
+    except (KeyError,TypeError,ValueError,AttributeError):require(False)
+    return result
 
 class Recovery(q.Estate):
     def __init__(self,args):super().__init__(args);self.back=self.c.get('back',{})
@@ -198,7 +225,8 @@ class Recovery(q.Estate):
     def before(self):
         q.need(self.markers() is None,'work has resumed or markers are ambiguous; the snapshot can never replace current authority')
         self.record()
-        if self.doc.get('restored'):return {'restored':True,'idempotent':True,'ids':self.doc.get('restored_ids')}
+        if self.doc.get('restored'):
+            self.verify_restored();return {'restored':True,'idempotent':True,'ids':self.doc['restored_ids']}
         q.need(self.phase=='prepared','before-resume recovery must first quiesce the new graph using prepared inputs')
         self.close();self.settle();self.final()
         metadata=r.verify_snapshot(self.snapshot)
@@ -247,21 +275,45 @@ p=pathlib.Path('/out/current.db');print(json.dumps({'sha256':hashlib.sha256(p.re
         q.need(r.sha256(output)==observed['sha256'],'current-copy hash differs; retain stopped authority and retry the copy')
         return output,observed
     def h6(self,candidate,directory):
-        q.need(re.fullmatch(r'sha256:[0-9a-f]{64}',candidate),'compatibility candidate must be an immutable image ID; do not supply a tag')
-        q.need(json.loads(r.docker(self.c,'image','inspect',candidate).stdout)[0]['Id']==candidate,'compatibility image is not locally available by ID; leave the estate stopped')
-        pristine,observation=self.current_copy(directory);working=directory/'probe';working.mkdir(mode=0o700)
-        # container user owns only its own throwaway fixture; original copy is read-only.
-        os.chmod(working,0o777)
-        name=self.c['project']+'-h6-'+uuid.uuid4().hex[:12]
-        code=q.GUARD+'\n'+inspect_source.getsource(h6_probe)+'\nh6_probe()\n'
-        cid=r.docker(self.c,'create','--name',name,'--network','none','--read-only','--tmpfs','/tmp','-e','PYTHONDONTWRITEBYTECODE=1','--mount',f'type=bind,src={working},dst=/probe','--mount',f'type=bind,src={pristine},dst=/pristine.db,readonly','--entrypoint','python',candidate,'-c',code,'/probe','/pristine.db',observation['sha256'],candidate).stdout.strip()
+        report={'format_version':1,'stage':'candidate-image','candidate_image_id':candidate,'status':'running','commands':[],'cleanup':{'container_removed':False},'started_at':q.now()};cid=None
+        destination=q.private_path(directory/'h6-diagnostic.json')
+        def docker(stage,*args):
+            report['stage']=stage
+            return self.captured(['docker','--context',self.c['docker_context'],*args],stage,report['commands'])
         try:
-            q.need(r.inspect(self.c,cid)['Image']==candidate,'H6 container image differs from the chosen ID; leave the estate stopped')
-            r.docker(self.c,'start','--attach',cid)
-            q.need(r.inspect(self.c,cid)['State']['ExitCode']==0,'candidate H6 publication or leftover-worker recovery refused; inspect its private probe evidence and remain stopped')
-        finally:r.docker(self.c,'rm','--force',cid,check=False)
-        result=r.read_json(working/'h6-result.json')
-        q.need(result.get('outcome')=='handled-both' and result.get('candidate_image_id')==candidate and result.get('pristine_sha256')==r.sha256(pristine)==observation['sha256'],'H6 result does not bind the actual candidate and current copy; keep the estate stopped')
+            q.need(re.fullmatch(r'sha256:[0-9a-f]{64}',candidate),'compatibility candidate must be an immutable image ID; do not supply a tag')
+            q.need(json.loads(r.docker(self.c,'image','inspect',candidate).stdout)[0]['Id']==candidate,'compatibility image is not locally available by ID; leave the estate stopped')
+            report['stage']='current-copy';pristine,observation=self.current_copy(directory);report['pristine_sha256']=observation['sha256']
+            env_file=self.args.candidate_env_file or self.args.env_file
+            model=self.model()
+            configuration={'project':self.c['project'],'candidate_image_id':candidate,'env_file':str(r.path(env_file)),'env_sha256':r.sha256(env_file),'compose_files':[{'path':str(r.path(p)),'sha256':r.sha256(p)} for p in self.c['compose_files']],'volumes':self.c['volumes'],'networks':{k:{'name':v.get('name',k),'external':bool(v.get('external',False))} for k,v in model.get('networks',{}).items()},'planning_enabled':False}
+            import hashlib
+            configuration_sha256=hashlib.sha256(json.dumps(configuration,sort_keys=True,separators=(',',':')).encode()).hexdigest();report['configuration']=configuration;report['configuration_sha256']=configuration_sha256
+            working=directory/'probe';working.mkdir(mode=0o700);os.chmod(working,0o777)
+            name=self.c['project']+'-h6-'+uuid.uuid4().hex[:12]
+            code=q.GUARD+'\n'+inspect_source.getsource(h6_probe)+'\nh6_probe()\n'
+            cid=docker('h6-create','create','--name',name,'--network','none','--read-only','--tmpfs','/tmp','-e','PYTHONDONTWRITEBYTECODE=1','--mount',f'type=bind,src={working},dst=/probe','--mount',f'type=bind,src={pristine},dst=/pristine.db,readonly','--entrypoint','python',candidate,'-c',code,'/probe','/pristine.db',observation['sha256'],candidate,configuration_sha256).stdout.strip()
+            report['container_id']=cid;q.need(r.inspect(self.c,cid)['Image']==candidate,'H6 container image differs from the chosen ID; leave the estate stopped')
+            docker('h6-publication-and-worker-recovery','start','--attach',cid)
+            report['child_exit']=r.inspect(self.c,cid)['State']['ExitCode'];q.need(report['child_exit']==0,'candidate H6 child refused; inspect its private stage and diagnostics and remain stopped')
+            report['stage']='h6-result-validation';result=r.read_json(q.private_path(working/'h6-result.json',exists=True))
+            q.need(r.sha256(pristine)==observation['sha256'],'H6 pristine current copy changed; preserve stopped authority')
+            validate_h6(result,candidate,observation['sha256'],configuration_sha256)
+            report['status']='passed';report['result']=result
+        except Exception as exc:
+            report['status']='refused';report['reason']=self.sanitize(str(exc))
+            details='\n'.join(item.get('stderr','') for item in report['commands'])
+            report['failure_kind']='git-unavailable' if 'FileNotFoundError' in details and 'git' in details else ('schema-or-protocol-refusal' if 'schema' in details or 'no such table' in details else 'candidate-operation-refused')
+            raise
+        finally:
+            if cid:
+                try:
+                    cleanup=r.docker(self.c,'rm','--force',cid,check=False)
+                    report['cleanup']={'container_removed':getattr(cleanup,'returncode',1)==0,'exit':getattr(cleanup,'returncode',None),'reason':self.sanitize(getattr(cleanup,'stderr',''))}
+                except Exception as cleanup_error:
+                    report['cleanup']={'container_removed':False,'exit':None,'reason':self.sanitize(str(cleanup_error))}
+            report['finished_at']=q.now();r.atomic_json(destination,report)
+        q.need(report['cleanup']['container_removed'],'H6 disposable container cleanup is unproved; leave the estate stopped and reconcile the recorded container')
         return result
     def after(self):
         marker=self.markers();q.need(marker is not None,'after-resume recovery requires two matching markers; classify authority before touching any graph')

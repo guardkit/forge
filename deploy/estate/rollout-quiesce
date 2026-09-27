@@ -10,6 +10,8 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import stat
+import uuid
 import sys
 import tempfile
 import time
@@ -92,6 +94,75 @@ def quiet_counts(counts):
     for name,values in counts['readers'].items():
         need(values['num_pending']==values['num_ack_pending']==0,f'reader {name} still has pending or unacknowledged work; leave admissions closed and let it settle')
 
+def marker_file(value):
+    """Physical absence is different from any present, malformed artifact."""
+    import os, json, pathlib, stat
+    p=pathlib.Path(value)
+    try:before=p.lstat()
+    except FileNotFoundError:return {'present':False}
+    if not stat.S_ISREG(before.st_mode) or before.st_nlink!=1 or before.st_uid!=os.geteuid() or stat.S_IMODE(before.st_mode)!=0o600:
+        raise ValueError('resume marker is not a private owned unaliased regular file')
+    fd=os.open(p,os.O_RDONLY|os.O_NOFOLLOW)
+    with os.fdopen(fd) as f:
+        opened=os.fstat(f.fileno())
+        if (opened.st_dev,opened.st_ino)!=(before.st_dev,before.st_ino):raise ValueError('resume marker identity changed')
+        value=json.load(f)
+    after=p.lstat()
+    if (before.st_dev,before.st_ino,before.st_size,before.st_mtime_ns,before.st_nlink)!=(after.st_dev,after.st_ino,after.st_size,after.st_mtime_ns,after.st_nlink):raise ValueError('resume marker changed during read')
+    if not isinstance(value,dict):raise ValueError('present resume marker is not an object')
+    return {'present':True,'value':value}
+
+def ledger_holders(root, proc='/proc'):
+    """Observe inode identities, never descriptor contents, environment or commands."""
+    import os, pathlib, stat
+    root=pathlib.Path(root);proc=pathlib.Path(proc);unknown=[];holders=[]
+    def identities():
+        result={}
+        for name in ('forge.db','forge.db-wal','forge.db-shm'):
+            path=root/name
+            try:item=path.lstat()
+            except FileNotFoundError:
+                if name=='forge.db':raise ValueError('current ledger is absent')
+                continue
+            if not stat.S_ISREG(item.st_mode) or item.st_nlink!=1:raise ValueError('current ledger file identity is unsafe')
+            result[name]=[item.st_dev,item.st_ino]
+        return result
+    initial=identities();wanted={tuple(value):key for key,value in initial.items()}
+    namespace=os.readlink(str(proc/'self/ns/pid'));initial_namespace=os.readlink(str(proc/'1/ns/pid'))
+    if namespace!=initial_namespace:raise ValueError('complete selected PID namespace is unavailable')
+    seen=set()
+    for attempt in range(3):
+        processes={p.name:p for p in proc.iterdir() if p.name.isdecimal()}
+        for pid in sorted(set(processes)-seen,key=int):
+            process=processes[pid]
+            try:
+                process_identity=process.stat().st_ino;descriptors=list((process/'fd').iterdir())
+            except FileNotFoundError:continue
+            except OSError:unknown.append({'pid':int(pid),'reason':'descriptor directory unreadable'});continue
+            for descriptor in descriptors:
+                try:opened=descriptor.stat()
+                except FileNotFoundError:continue
+                except OSError:unknown.append({'pid':int(pid),'reason':'descriptor identity unreadable'});continue
+                name=wanted.get((opened.st_dev,opened.st_ino))
+                if name:holders.append({'pid':int(pid),'fd':descriptor.name,'file':name})
+            try:
+                with (process/'maps').open() as maps:
+                    for line in maps:
+                        fields=line.split(None,5)
+                        if len(fields)<5:raise ValueError('process mapping identity is malformed')
+                        major,minor=fields[3].split(':');identity=(os.makedev(int(major,16),int(minor,16)),int(fields[4]))
+                        name=wanted.get(identity)
+                        if name:holders.append({'pid':int(pid),'mapping':True,'file':name})
+                if process.stat().st_ino!=process_identity:raise ValueError('process identity changed during census')
+            except FileNotFoundError:continue
+            except (OSError,ValueError):unknown.append({'pid':int(pid),'reason':'mapped-file identities unreadable or unstable'})
+            seen.add(pid)
+        if not ({p.name for p in proc.iterdir() if p.name.isdecimal()}-seen):break
+    else:unknown.append({'reason':'process census kept changing'})
+    if initial!=identities():unknown.append({'reason':'ledger identities changed during census'})
+    return {'format_version':1,'complete':not unknown,'holders':holders,'unknown':unknown,'files':initial,'pid_namespace':namespace,'processes_examined':len(seen)}
+
+
 class Estate:
     def __init__(self,args):
         self.args=args;self.config_path=r.path(args.config);self.c=r.read_json(self.config_path)
@@ -120,12 +191,12 @@ class Estate:
         need(old != prepared,'phase env paths are missing or ambiguous; declare distinct original and prepared inputs')
         self.phase='original' if old else 'prepared'
         need(self.c['sources']['settings']==self.q[self.phase+'_settings'],'settings source differs from the declared phase; select the matching original or prepared inventory')
-        renderer=load_script('rollout-settings');public,_=renderer.read_env(r.path(args.env_file));self.values=dict(public)
+        renderer=load_script('rollout-settings');public,_=renderer.read_env(r.path(args.env_file));self.values=dict(public);self.private_values=[]
         for filename in args.secret_env_file:
             p=private_path(filename,exists=True);need(p.stat().st_mode & 0o077==0,'private env file is exposed to other users; set mode0600 before proceeding')
             values,_=renderer.read_env(p)
             need(not set(values)&set(self.values),'private env input overrides a public or earlier name; resolve duplicate ownership before proceeding')
-            self.values.update(values)
+            self.values.update(values);self.private_values.extend(values.values())
         for _ in range(8):
             self.values={k:re.sub(r'\$\{([A-Za-z_][A-Za-z0-9_]*)\}',lambda m:self.values.get(m[1],m[0]),v) for k,v in self.values.items()}
         need(self.values.get('FORGE_IMAGE')==self.c['runtime_image'],'public env selects another runtime image; select the reviewed phase env')
@@ -142,17 +213,68 @@ class Estate:
         doc=r.read_json(private_path(self.receipt,exists=True))
         need(doc.get('format_version')==1 and doc.get('binding')==self.binding,'close receipt belongs to different identities or phase paths; reconcile the explicit inventory')
         self.doc=doc;return doc
+    def sanitize(self,value):
+        text=str(value)
+        redactions=list(getattr(self,'private_values',[]))
+        redactions += [v for k,v in self.values.items() if re.search(r'(?i)token|secret|password|passwd|credential|api.?key|private.?key',k)]
+        for secret in sorted(set(redactions),key=len,reverse=True):
+            if secret:text=text.replace(secret,'[REDACTED]')
+        text=re.sub(r'(?i)(https?://)[^\s/@:]+:[^\s/@]+@',r'\1[REDACTED]@',text)
+        text=re.sub(r'(?im)^([^\n]*(?:authorization|password|access.token|api.key|secret)\s*[:=]\s*).+$',r'\1[REDACTED]',text)
+        return text[-32768:]
+    def captured(self,argv,stage,events,**kwargs):
+        command=[str(x) for x in argv];shown=list(command)
+        if '-c' in shown:
+            index=shown.index('-c')+1
+            if index<len(shown):shown[index]='<inline program>'
+        event={'stage':stage,'command':[self.sanitize(x) for x in shown],'started_at':now(),'exit':None}
+        events.append(event)
+        try:
+            result=r.run(command,check=False,**kwargs)
+            event.update(exit=getattr(result,'returncode',0),stdout=self.sanitize(getattr(result,'stdout','')),stderr=self.sanitize(getattr(result,'stderr','')))
+            need(event['exit']==0,f'{stage} failed; inspect its private rollout diagnostic and retain current authority')
+            return result
+        except Exception as exc:
+            event['reason']=self.sanitize(str(exc));raise
+        finally:event['finished_at']=now()
+    def recorded_docker(self,*args,**kwargs):
+        events=getattr(self,'_diagnostic_events',None)
+        if events is None:return r.docker(self.c,*args,**kwargs)
+        return self.captured(['docker','--context',self.c['docker_context'],*args],self._diagnostic_stage,events,**kwargs)
+    def verify_restored(self):
+        try:
+            need(set(self.doc.get('restored_ids',{}))=={'coordinator','memory','relay'} and len(set(self.doc['restored_ids'].values()))==3,'restored runtime identities are incomplete; keep recovery stopped and reconcile')
+            journal=self.doc.get('rollback',{})
+            need(set(journal.get('retired',[]))==r.VOLUME_ROLES and journal.get('created')==self.doc['restored_ids'],'restored retirement journal is incomplete; reconcile authority')
+            names=set(r.docker(self.c,'volume','ls','--format','{{.Name}}').stdout.split())
+            need(not names.intersection(self.c['volumes'].values()),'a retired state volume exists again; reconcile both authorities before proceeding')
+            for role,identifier in self.doc['restored_ids'].items():
+                saved=self.doc['old_runtimes'][role]
+                need(identifier!=saved['service_identity']['container_id'],'restored receipt selects an original container; reconcile its reconstruction')
+                item=r.inspect(self.c,identifier)
+                need(item['Id']==identifier and stable_runtime(r.previous_runtime(self.c,item))==stable_runtime(saved),'restored runtime identity changed; keep producers closed and reconcile')
+            metadata=r.verify_snapshot(self.snapshot);db=r.path(self.c['source_db'])
+            need(db.is_file() and db.stat().st_nlink==1 and not os.path.samefile(db,self.snapshot/'forge.db'),'restored source aliases another artifact; preserve the snapshot and reconcile')
+            r.ledger_state(db)
+            with sqlite3.connect(db.as_uri()+'?mode=ro',uri=True) as connection:
+                connection.execute('PRAGMA query_only=ON');connection.execute('BEGIN');actual=r.logical_digest(connection)
+            need(actual==r.consolidated_logical_digest(self.snapshot/'forge.db'),'restored authoritative source differs from the original snapshot; preserve it and reconcile')
+            self.doc['restored_verification']={'at':now(),'passed':True,'source_logical_sha256':actual,'snapshot_sha256':metadata['sha256']};self.save()
+        except Exception as exc:
+            self.doc['restored_verification']={'at':now(),'passed':False,'reason':self.sanitize(str(exc))};self.save()
+            r.refuse('restored authority no longer matches its receipt; inspect the private reconciliation evidence and do not recreate or restart it automatically')
+
     def compose(self,*args):
         cmd=['compose','--project-name',self.c['project'],'--env-file',self.args.env_file]
         for f in self.c['compose_files']:cmd+=['-f',str(r.path(f))]
-        return r.docker(self.c,*cmd,*args,env=self.env)
+        return self.recorded_docker(*cmd,*args,env=self.env)
     def model(self):return json.loads(self.compose('config','--format','json').stdout)
     def helper(self,code,args=(),mounts=(),image=None,network='none',input=None,environment=False):
         cmd=['run','--rm','--network',network,'--read-only','--tmpfs','/tmp','-e','PYTHONDONTWRITEBYTECODE=1','--user','0:0']
         for mount in mounts:cmd+=['--mount',mount]
         if environment:
             for key in self.values:cmd+=['--env',key]
-        return r.docker(self.c,*cmd,'--entrypoint','python',image or self.c['runtime_image'],'-c',code,*args,input=input,env=self.env if environment else None).stdout
+        return self.recorded_docker(*cmd,'--entrypoint','python',image or self.c['runtime_image'],'-c',code,*args,input=input,env=self.env if environment else None).stdout
     def volume_exists(self):
         names=r.docker(self.c,'volume','ls','--format','{{.Name}}').stdout.splitlines()
         return self.c['volumes']['ledger'] in names
@@ -160,13 +282,17 @@ class Estate:
         name=self.c['volumes'][role];r.volume_identity(self.c,name,self.model())
         return self.helper(code,args,[f'type=volume,src={name},dst=/state'+('' if write else ',readonly')],environment=environment)
     def markers(self):
-        host_path=private_path(self.snapshot/'resumed.json')
-        host=r.read_json(host_path) if host_path.exists() else None
-        ledger=None
+        try:host_record=marker_file(private_path(self.snapshot/'resumed.json'))
+        except Exception:r.refuse('host resume marker is present but unsafe or unreadable; preserve it and reconcile before touching old authority')
+        ledger_record={'present':False}
         if self.volume_exists():
-            text=self.volume('ledger',"import pathlib,json; p=pathlib.Path('/state/ROLLOUT-RESUMED'); assert not p.is_symlink(); print(p.read_text() if p.exists() else 'null')")
-            ledger=json.loads(text)
-        need((host is None)==(ledger is None),'resume marker exists in only one place; keep the estate stopped and reconcile both original markers')
+            code="import json\n"+inspect_source.getsource(marker_file)+"\nprint(json.dumps(marker_file('/state/ROLLOUT-RESUMED')))"
+            try:ledger_record=json.loads(self.volume('ledger',code))
+            except Exception:r.refuse('ledger resume marker is unsafe or unreadable; preserve current authority and reconcile the original pair')
+        need(isinstance(ledger_record,dict) and type(ledger_record.get('present')) is bool,'ledger marker presence is unknown; preserve current authority and reconcile')
+        need(host_record['present']==ledger_record['present'],'resume marker exists in only one place; keep the estate stopped and reconcile both original markers')
+        if not host_record['present']:return None
+        host=host_record['value'];ledger=ledger_record.get('value')
         if host is not None:
             need(isinstance(host,dict) and host==ledger and host.get('project')==self.c['project'] and host.get('snapshot')==str(self.snapshot) and host.get('format_version')==1,'resume markers disagree or are invalid; keep current authority and reconcile them')
             required={'snapshot_sha256','release_tag','image_id','actor','at','work_state','close_receipt_sha256'}
@@ -174,6 +300,16 @@ class Estate:
             need(host['snapshot_sha256']==r.read_json(self.snapshot/'metadata.json')['sha256'],'resume marker names another snapshot; retain current authority and reconcile its provenance')
             datetime.fromisoformat(host['at'])
         return host
+    def current_holders(self):
+        name=self.c['volumes']['ledger'];r.volume_identity(self.c,name,self.model())
+        code=inspect_source.getsource(ledger_holders)+"\nimport json;print(json.dumps(ledger_holders('/state')))"
+        args=['run','--rm','--name',self.c['project']+'-holder-census-'+uuid.uuid4().hex[:12],'--network','none','--pid','host','--cap-add','SYS_PTRACE','--read-only','--user','0:0','--tmpfs','/tmp','-e','PYTHONDONTWRITEBYTECODE=1','--mount',f'type=volume,src={name},dst=/state,readonly','--entrypoint','python',self.c['runtime_image'],'-c',code]
+        try:census=json.loads(r.docker(self.c,*args).stdout)
+        except Exception:r.refuse('complete current DB/WAL/SHM holder census is unavailable; keep authority stopped and obtain authorized process visibility')
+        need(isinstance(census,dict) and census.get('complete') is True and census.get('unknown')==[],'current DB/WAL/SHM holder census is incomplete; keep authority stopped and reconcile process visibility')
+        need(census.get('holders')==[],'current DB/WAL/SHM has an open holder; ask its explicit owner to stop it before proceeding')
+        return census
+
     def current_state(self):
         code='import pathlib,sqlite3,json,hashlib\nfrom contextlib import closing\nPath=pathlib.Path\nWORK_TABLES='+repr(r.WORK_TABLES)+'\n'+inspect_source.getsource(r.Refusal)+inspect_source.getsource(r.refuse)+inspect_source.getsource(r.path)+inspect_source.getsource(r.ledger_state)+inspect_source.getsource(r.logical_digest)+'''
 p=Path('/state/forge.db');wal=Path(str(p)+'-wal');active=wal.exists() and wal.stat().st_size>0
@@ -300,7 +436,8 @@ print(json.dumps(state))
             self.stop_current(SERVICES)
             # Every container attachment, including non-Compose writers, is explicit.
             attachments=r.docker(self.c,'ps','--filter','volume='+self.c['volumes']['ledger'],'--format','{{.ID}}').stdout.strip();need(not attachments,'a running container still attaches the current ledger; stop its explicit writer before proceeding')
-            first=self.current_state();time.sleep(20);state=self.current_state();need(first==state,'current ledger changed after graph stop; find its remaining writer')
+            holders_before=self.current_holders();first=self.current_state();time.sleep(20);holders_after=self.current_holders();state=self.current_state();need(first==state,'current ledger changed after graph stop; find its remaining writer')
+            self.doc['current_holder_proof']={'before':holders_before,'after':holders_after}
         need(not work_problems(state),'stopped record still contains active work; reconcile it without cancelling or discarding anything')
         count=self.monitor();quiet_counts(count);self.doc['stage']='final';self.doc['final_phase']=self.phase;self.doc['final']={'at':now(),'state':state,'counts':count};self.save();return self.doc['final']
     def planning(self,enabled):
@@ -353,25 +490,23 @@ d=os.open(p.parent,os.O_DIRECTORY);os.fsync(d);os.close(d);assert p.read_bytes()
         private_path(self.snapshot/'resumed.json');need(not (self.snapshot/'resumed.json').exists(),'host resume marker appeared during write; keep current authority and reconcile both markers')
         r.atomic_json(self.snapshot/'resumed.json',marker);need(self.markers()==marker,'resume marker readback failed; keep admissions closed')
         self.doc['stage']='resumed';self.save()
-        result={'started_at':now(),'marker':marker,'services_check':None,'factory_hello':None,'passed':False}
+        result={'started_at':now(),'marker':marker,'services_check':None,'factory_hello':None,'passed':False,'commands':[],'cleanup':{'status':'no-destructive-cleanup','current_authority_retained':True,'resume_markers':'retained'}}
+        self._diagnostic_events=result['commands'];self._diagnostic_stage='planning-enable'
         try:
-            self.planning(True);self.compose('up','--no-deps','-d','--force-recreate','coordinator')
-            self.compose('up','--no-deps','-d',*PRODUCERS)
-            r.run([HERE/'estate-check','services','--env-file',self.args.env_file,'--project',self.c['project']],env=self.env);result['services_check']='passed'
-            r.run([HERE/'factory-hello','--env-file',self.args.env_file,'--project',self.c['project']],env=self.env);result['factory_hello']='completed'
-            self.compose('--profile','watch','up','--no-deps','-d','gateway-watch');result['passed']=True
+            self.planning(True);self._diagnostic_stage='coordinator-recreate';self.compose('up','--no-deps','-d','--force-recreate','coordinator')
+            self._diagnostic_stage='producer-open';self.compose('up','--no-deps','-d',*PRODUCERS)
+            self.captured([HERE/'estate-check','services','--env-file',self.args.env_file,'--project',self.c['project']],'estate-check services',result['commands'],env=self.env);result['services_check']='passed'
+            self.captured([HERE/'factory-hello','--env-file',self.args.env_file,'--project',self.c['project']],'factory-hello',result['commands'],env=self.env);result['factory_hello']='completed'
+            self._diagnostic_stage='gateway-watch-start';self.compose('--profile','watch','up','--no-deps','-d','gateway-watch');result['passed']=True
+        except Exception as exc:
+            result['failure']={'stage':result['commands'][-1]['stage'] if result['commands'] else self._diagnostic_stage,'reason':self.sanitize(str(exc))};raise
         finally:
-            result['finished_at']=now();r.atomic_json(self.snapshot/'post-resume-check.json',result)
+            self._diagnostic_events=None;result['finished_at']=now();private_path(self.snapshot/'post-resume-check.json');r.atomic_json(self.snapshot/'post-resume-check.json',result)
         return result
     def reopen(self):
         need(self.markers() is None,'work has resumed; legacy producers must remain retired and only forward-or-stopped recovery is permitted')
         self.record()
-        if self.doc.get('restored'):
-            names=set(r.docker(self.c,'volume','ls','--format','{{.Name}}').stdout.split())
-            need(not names.intersection(self.c['volumes'].values()),'new state volumes remain after claimed old restore; keep legacy producers closed and reconcile authority')
-            for role,identifier in self.doc['restored_ids'].items():
-                item=r.inspect(self.c,identifier)
-                need(item['Id']==identifier and stable_runtime(r.previous_runtime(self.c,item))==stable_runtime(self.doc['old_runtimes'][role]),'restored old runtime differs from its exact saved reconstruction; keep producers closed')
+        if self.doc.get('restored'):self.verify_restored()
         if not self.doc.get('restored'):
             need(self.phase=='original' and not self.volume_exists() and not (self.snapshot/'load-receipt.json').exists(),'old authority has not been restored and verified; run before-resume rollback before reopening producers')
             for role,name in self.c['old_containers'].items():

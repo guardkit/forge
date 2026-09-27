@@ -133,19 +133,29 @@ def test_fresh_process_import_guard_and_h6_source(tmp_path):
     assert p.returncode==0,p.stderr
 
 @pytest.mark.parametrize('failing_check',['services','factory-hello'])
-def test_post_resume_failure_keeps_pair_and_records_failure(estate,monkeypatch,failing_check):
+@pytest.mark.parametrize('real_child',[False,True])
+def test_post_resume_failure_keeps_pair_and_records_failure(estate,monkeypatch,failing_check,real_child):
     estate.phase='prepared';estate.doc={'format_version':1,'binding':estate.binding,'stage':'final'};estate.save();pair={}
     monkeypatch.setattr(estate,'markers',lambda:pair.get('marker'));monkeypatch.setattr(estate,'record',lambda:estate.doc);monkeypatch.setattr(estate,'prepared_settings',lambda:None);monkeypatch.setattr(estate,'unit',lambda n:{});monkeypatch.setattr(estate,'watch_closed',lambda **kw:None);monkeypatch.setattr(estate,'producers_stopped',lambda:None);monkeypatch.setattr(estate,'monitor',lambda:q.reader_counts(monitor()));monkeypatch.setattr(r,'load_volumes',lambda *a,**k:None);monkeypatch.setattr(r,'verify_snapshot',lambda d:{'sha256':'a'*64});monkeypatch.setattr(estate,'current_state',lambda:{'work_state':{}});estate.values['ROLLOUT_STATE_DIR']=str(estate.snapshot)
     monkeypatch.setattr(r,'docker',lambda *a,**k:SimpleNamespace(stdout=json.dumps([{'Id':r.RUNTIME}])))
     monkeypatch.setattr(estate,'volume',lambda role,code,args=(),**kw:pair.update(marker=json.loads(args[0])))
     monkeypatch.setattr(estate,'planning',lambda enabled:None);monkeypatch.setattr(estate,'compose',lambda *a:pytest.fail('watch enabled after failed gate') if 'gateway-watch' in a else None)
     monkeypatch.setattr(estate,'systemctl',lambda *a:pytest.fail('invented host watch'))
+    original_run=r.run;estate.private_values=['fixture-private-value']
     def check(argv,**kw):
-        if failing_check in [str(x) for x in argv] or str(argv[0]).endswith(failing_check):raise r.Refusal('named post-resume check failed')
+        if failing_check in [str(x) for x in argv] or str(argv[0]).endswith(failing_check):
+            if real_child:return original_run([sys.executable,'-c',"import sys;print('item 9 failed fixture-private-value',file=sys.stderr);raise SystemExit(42)"],check=False)
+            raise r.Refusal('named post-resume check failed')
     monkeypatch.setattr(r,'run',check)
     with pytest.raises(r.Refusal):estate.resume()
     assert pair['marker']==r.read_json(estate.snapshot/'resumed.json')
-    assert not r.read_json(estate.snapshot/'post-resume-check.json')['passed']
+    report=r.read_json(estate.snapshot/'post-resume-check.json');assert not report['passed']
+    assert report['cleanup']['current_authority_retained'] is True
+    if real_child:
+        event=report['commands'][-1];assert event['exit']==42 and 'item 9 failed' in event['stderr'] and '[REDACTED]' in event['stderr']
+        assert event['stage']==('estate-check services' if failing_check=='services' else 'factory-hello')
+        assert 'fixture-private-value' not in json.dumps(report)
+        assert (estate.snapshot/'post-resume-check.json').stat().st_mode & 0o777==0o600
     assert estate.doc['stage']=='resumed'
 
 def test_real_timer_has_no_service_pid_properties(estate,monkeypatch):
@@ -210,3 +220,127 @@ def test_after_only_explicit_candidate_is_allowed_alongside_recorded_image(estat
     recovery._after_candidate=candidate
     assert recovery.allowed_images('coordinator',r.RUNTIME)=={r.RUNTIME,candidate}
     assert recovery.allowed_images('memory',r.RUNTIME)=={r.RUNTIME}
+
+@pytest.mark.parametrize('payload',['null','false','[]','{"broken"'])
+def test_present_invalid_marker_never_reopens(estate,monkeypatch,payload):
+    marker=estate.snapshot/'resumed.json';marker.write_text(payload);marker.chmod(0o600)
+    monkeypatch.setattr(r,'inspect',lambda *a:pytest.fail('old runtime accessed'))
+    monkeypatch.setattr(estate,'systemctl',lambda *a:pytest.fail('producer mutation'))
+    with pytest.raises(r.Refusal):estate.reopen()
+
+@pytest.mark.parametrize('kind',['hardlink','symlink','public','null'])
+def test_marker_reader_rejects_unsafe_ledger_or_host_file(tmp_path,kind):
+    p=tmp_path/'marker';p.write_text('{}');p.chmod(0o600)
+    if kind=='hardlink':os.link(p,tmp_path/'alias')
+    if kind=='symlink':p.unlink();p.symlink_to(tmp_path/'missing')
+    if kind=='public':p.chmod(0o644)
+    if kind=='null':p.write_text('null')
+    with pytest.raises((ValueError,OSError)):q.marker_file(p)
+
+def test_marker_true_absence_and_valid_private_object(tmp_path):
+    p=tmp_path/'marker';assert q.marker_file(p)=={'present':False}
+    p.write_text('{"valid":"object"}');p.chmod(0o600)
+    assert q.marker_file(p)=={'present':True,'value':{'valid':'object'}}
+
+def test_stale_restored_container_refuses_and_records_without_mutation(estate,monkeypatch):
+    e=b.Recovery(estate.args);e.doc={'format_version':1,'binding':e.binding,'restored':True,'restored_ids':{'coordinator':'new-c','memory':'new-m','relay':'new-r'},'old_runtimes':{role:{'service_identity':{'container_id':'old-'+role}} for role in ('coordinator','memory','relay')},'rollback':{'retired':list(r.VOLUME_ROLES),'created':{'coordinator':'new-c','memory':'new-m','relay':'new-r'}}};e.save()
+    monkeypatch.setattr(e,'markers',lambda:None)
+    def docker(c,*a,**kw):assert a==('volume','ls','--format','{{.Name}}');return SimpleNamespace(stdout='')
+    monkeypatch.setattr(r,'docker',docker)
+    monkeypatch.setattr(r,'inspect',lambda *a:(_ for _ in ()).throw(r.Refusal('missing saved container')))
+    with pytest.raises(r.Refusal,match='reconciliation'):e.before()
+    assert r.read_json(e.receipt)['restored_verification']['passed'] is False
+
+def valid_h6():
+    J='3'*40;target='fixture-target'
+    return {'format_version':1,'outcome':'handled-both','candidate_image_id':r.RUNTIME,'pristine_sha256':'a'*64,'working_pre_fixture_sha256':'a'*64,'configuration_sha256':'b'*64,'schema_version':16,'existing_rows_unchanged':True,'real_client_modules':[],'cleanup':'no owned worker remains','worker_group_empty':True,'worker_thread_stopped':True,'columns':{'builds':['build_id','status','mode','start_commit','target_branch'],'publication_records':['build_id','g_commit','j_commit','checked_json','turn','lines_json'],'deployment_targets':['target','counter','holder_build','holder_turn','running_commit']},'git':{'G':'1'*40,'tip':'2'*40,'J':J,'tree':'4'*40},'fixture_ids':{'build':'fixture-build','target':target},'publication':{'turn':4,'result':'published, deployment pending','g_commit':'1'*40,'j_commit':J,'checked':{'identity':J,'j_commit':J,'j_tree':'4'*40},'original_lines_preserved':True,'callbacks':{'publisher':0,'guardkit':0,'deploy':0,'stage_complete':1},'line_kinds':['done join','done merge-checks','done candidate-check','about to send','done send'],'before_sha256':'c'*64,'after_sha256':'d'*64,'send_result':{'found_by_looking':True,'published':True,'contains_j':True,'ran_on':J,'remote_now':J}},'deployment':{'N':41,'N_plus_1':42,'stale_fencing':{'renew':False,'record_running':False,'release':False},'stale_record_unchanged':True,'reconcile':{target:'occupied (adopted)'},'old_note':{'target':target,'counter':41,'highest_counter':41,'group':4,'phase':'running','build':'old'},'final_note':{'target':target,'highest_counter':42,'group':0,'counter':0,'phase':'','highest_build':'new'},'old_answers':[{'accepted':False,'word':'the-deploy-command-was-stopped-by-a-takeover'}],'successor':{'accepted':True,'exit_code':0,'word':'the-deploy-command-ran','output_tail':'DEPLOYED_IDENTITY='+J}}}
+
+@pytest.mark.parametrize('field',['publication','deployment','cleanup','worker_group_empty','existing_rows_unchanged','configuration_sha256','columns','git'])
+def test_h6_missing_required_behavior_never_authorizes(field):
+    proof=valid_h6();del proof[field]
+    with pytest.raises(r.Refusal):b.validate_h6(proof,r.RUNTIME,'a'*64,'b'*64)
+
+@pytest.mark.parametrize('case',['replay','successor','counter','fencing','cleanup','rows','configuration'])
+def test_h6_contradictory_behavior_never_authorizes(case):
+    p=valid_h6()
+    if case=='replay':p['publication']['callbacks']['publisher']=2
+    if case=='successor':p['deployment']['successor']['accepted']=False
+    if case=='counter':p['deployment']['N_plus_1']=41
+    if case=='fencing':p['deployment']['stale_fencing']['renew']=True
+    if case=='cleanup':p['worker_group_empty']=False
+    if case=='rows':p['existing_rows_unchanged']=False
+    if case=='configuration':p['configuration_sha256']='c'*64
+    with pytest.raises(r.Refusal):b.validate_h6(p,r.RUNTIME,'a'*64,'b'*64)
+
+def test_h6_complete_consistent_behavior_passes():
+    proof=valid_h6();assert b.validate_h6(proof,r.RUNTIME,'a'*64,'b'*64)==proof
+
+def test_real_exit42_diagnostic_is_private_and_sanitized(estate):
+    events=[];estate.private_values=['owned-private-value']
+    with pytest.raises(r.Refusal):estate.captured([sys.executable,'-c',"import sys;print('item 9 callback refused; owned-private-value',file=sys.stderr);sys.exit(42)"],'estate-check services',events)
+    assert events[0]['exit']==42 and 'item 9 callback refused' in events[0]['stderr']
+    assert 'owned-private-value' not in json.dumps(events)
+    output=estate.snapshot/'diagnostic.json';r.atomic_json(output,events)
+    assert output.stat().st_mode&0o777==0o600
+
+def test_exact_holder_algorithm_clean_and_idle_alias_in_owned_namespace(estate,tmp_path):
+    root=Path(estate.c['source_db']).parent
+    assert q.ledger_holders(root)['complete'] and not q.ledger_holders(root)['holders']
+    alias=tmp_path/'alias';alias.symlink_to(root,target_is_directory=True)
+    with (alias/'forge.db').open('r+b'):
+        result=q.ledger_holders(root)
+        assert result['complete'] and any(row['file']=='forge.db' for row in result['holders'])
+    assert not q.ledger_holders(root)['holders']
+
+def test_holder_unknown_permissions_is_not_absence(estate,monkeypatch):
+    original=Path.iterdir
+    def unreadable(p):
+        if str(p)=='/proc/1/fd':raise PermissionError('owned test visibility denied')
+        return original(p)
+    monkeypatch.setattr(Path,'iterdir',unreadable)
+    proof=q.ledger_holders(Path(estate.c['source_db']).parent)
+    assert not proof['complete'] and proof['unknown']
+
+@pytest.mark.parametrize('proof',[{'complete':False,'unknown':[{'reason':'permission'}],'holders':[]},{'complete':True,'unknown':[],'holders':[{'pid':1,'file':'forge.db'}]}])
+def test_public_holder_gate_refuses_unknown_or_actual_holder_without_execution(estate,monkeypatch,proof):
+    monkeypatch.setattr(estate,'model',lambda:{});monkeypatch.setattr(r,'volume_identity',lambda *a:{})
+    def docker(c,*args,**kw):
+        assert args[args.index('--pid')+1]=='host' and args[args.index('--cap-add')+1]=='SYS_PTRACE'
+        assert '--privileged' not in args and '--read-only' in args and 'readonly' in args[args.index('--mount')+1]
+        return SimpleNamespace(stdout=json.dumps(proof))
+    monkeypatch.setattr(r,'docker',docker)
+    with pytest.raises(r.Refusal):estate.current_holders()
+
+
+def test_census_catches_mapped_ledger_with_original_fd_closed(estate):
+    import mmap
+    root=Path(estate.c['source_db']).parent;fd=os.open(root/'forge.db',os.O_RDWR)
+    with mmap.mmap(fd,0,access=mmap.ACCESS_WRITE,trackfd=False):
+        os.close(fd)
+        proof=q.ledger_holders(root)
+        assert proof['complete'] and any(item.get('mapping') and item['file']=='forge.db' for item in proof['holders'])
+    assert not q.ledger_holders(root)['holders']
+
+@pytest.mark.parametrize('case',['valid','missing','contradictory','wrong-configuration','current-copy-changed'])
+def test_actual_h6_result_ingestion_tamper_boundary(estate,tmp_path,monkeypatch,case):
+    import hashlib
+    e=b.Recovery(estate.args);directory=tmp_path/('probe-'+case);directory.mkdir();pristine=directory/'current.db';pristine.write_bytes(b'owned envelope boundary bytes');digest=r.sha256(pristine);state={}
+    monkeypatch.setattr(e,'current_copy',lambda path:(pristine,{'sha256':digest}));monkeypatch.setattr(e,'model',lambda:{})
+    def docker(c,*args,**kw):
+        return SimpleNamespace(stdout=json.dumps([{'Id':r.RUNTIME}]) if args[:2]==('image','inspect') else '',stderr='',returncode=0)
+    monkeypatch.setattr(r,'docker',docker);monkeypatch.setattr(r,'inspect',lambda *a:{'Image':r.RUNTIME,'State':{'ExitCode':0}})
+    def captured(argv,stage,events,**kwargs):
+        if stage=='h6-create':state['configuration']=argv[-1];return SimpleNamespace(stdout='owned-candidate-id',returncode=0)
+        proof=valid_h6();proof.update(pristine_sha256=digest,working_pre_fixture_sha256=digest,configuration_sha256=state['configuration'])
+        if case=='missing':del proof['deployment']
+        if case=='contradictory':proof['publication']['callbacks']['publisher']=2
+        if case=='wrong-configuration':proof['configuration_sha256']='f'*64
+        if case=='current-copy-changed':pristine.write_bytes(b'changed')
+        (directory/'probe/h6-result.json').write_text(json.dumps(proof))
+        return SimpleNamespace(stdout='',returncode=0)
+    monkeypatch.setattr(e,'captured',captured)
+    if case=='valid':assert e.h6(r.RUNTIME,directory)['outcome']=='handled-both'
+    else:
+        with pytest.raises(r.Refusal):e.h6(r.RUNTIME,directory)
+        diagnostic=r.read_json(directory/'h6-diagnostic.json')
+        assert diagnostic['status']=='refused' and diagnostic['cleanup']['container_removed']
