@@ -1,0 +1,312 @@
+"""CLI-boundary rehearsal; no broker, sandbox, systemd or host app execution.
+
+These fault injections do not establish actual F2/F3 sandbox acceptance.
+"""
+import argparse
+import copy
+import importlib.machinery
+import importlib.util
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[3]
+SCRIPT = ROOT / 'deploy/estate/rollout-sandbox'
+loader = importlib.machinery.SourceFileLoader('rollout_sandbox', str(SCRIPT))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+m = importlib.util.module_from_spec(spec)
+loader.exec_module(m)
+IMAGE = 'sha256:' + '1' * 64
+
+
+@pytest.fixture
+def inventory(tmp_path):
+    env = tmp_path / 'private.env'
+    env.write_text('\n'.join([
+        'FORGE_IMAGE='+IMAGE, 'FACTORY_GATEWAY_ADDRESS=192.0.2.10',
+        'FORGE_TARGET_OWNER_URL=http://192.0.2.10:8900',
+        'FORGE_SANDBOX_SIDECAR_URL=http://192.0.2.10:8925',
+        'FORGE_SANDBOX_RUNNER_URL=http://192.0.2.10:8924',
+        'FLEET_MEMORY_ENABLED=false',
+    ])+'\n')
+    source = tmp_path / 'project' / 'deploy' / 'profile.yaml'
+    source.parent.mkdir(parents=True)
+    source.write_text('''env_id: fixture
+compose:
+  file: compose.yaml
+sandbox:
+  name: owned-sandbox
+  publish: ["127.0.0.1:8901:8901", "127.0.0.1:8902:8902"]
+  sidecar_publish: "127.0.0.1:8925:8125"
+  runner_publish: "127.0.0.1:8924:8124"
+  allow_network: ["example.test:443"]
+  receipts_path: /old/receipts
+cwd: /old/clone
+custom_choice:
+  keep: true
+''')
+    config = {
+        'project':'owned-project','env_file':str(env),'runtime_image':IMAGE,
+        'docker_context':'explicit-test','forbidden_roots':[str(tmp_path/'project')],
+        'units':{'runner':'owned-runner.service','keeper':'owned-keeper.service'},
+        'sandbox':{'name':'owned-sandbox','clone_path':'/private/clone',
+            'known_files':['known.txt'],'receipts_path':'/private/receipts',
+            'script_path':'/private/clone/deploy/sandbox-runner.sh',
+            'profile_path':'/private/clone/deploy/profile.yaml','profile_source':str(source),
+            'systemd_user_dir':str(tmp_path/'units'),'evidence_dir':str(tmp_path/'evidence'),
+            'remote_ref':'origin/main','remote_name':'origin','declared_remote':'https://example.invalid/project.git','declaration_files':['README.md'],'release_image':'forge:fixture','expected_sbx_version':'v0.42.1',
+            'legacy_dropins':[], 'legacy_command_markers':['legacy-bootstrap.sh','old-sidecar','old-runner'],
+            'forbidden_values':['/old/','127.0.0.1'], 'allow_replacements':{},
+        },
+    }
+    path = tmp_path/'inventory.json'
+    path.write_text(json.dumps(config))
+    args = ['--config',str(path),'--env-file',str(env),'--project','owned-project','--stop-legacy']
+    return config,path,args
+
+
+class Boundary:
+    """Model just the external CLI boundary, retaining exact argv and failures."""
+    def __init__(self, config, monkeypatch):
+        self.config = config
+        self.calls = []
+        self.phase = 'before'
+        self.states = {v:False for v in config['units'].values()}
+        self.fault = None
+        self.files = {}
+        self.boot = 'boot-before'
+        self.disk_doc = {'clone_commit':'a'*40,'known_files':{'known.txt':'a'*64},
+            'receipt_listing':[{'path':'spaced receipt.txt','bytes':3,'sha256':'b'*64}],
+            'receipt_file_count':1,'receipt_total_bytes':3,'receipt_listing_sha256':'c'*64,
+            'ahead_commits':'','remote_commit':'a'*40,'declarations':{'README.md':'b'*64},'boot_id':self.boot}
+        monkeypatch.setattr(m.subprocess,'run',self.run)
+
+    def run(self, argv, **kwargs):
+        self.calls.append((argv,kwargs))
+        out = ''; code = 0
+        if argv[0] == 'systemctl':
+            verb = argv[2]
+            if verb == 'show':
+                unit = argv[3]
+                stopped = self.states[unit]
+                runner = unit == self.config['units']['runner']
+                props = {'LoadState':'loaded','ActiveState':'inactive' if stopped else 'active',
+                    'SubState':'dead' if stopped else 'running','MainPID':'0' if stopped else '123',
+                    'ControlPID':'0','UnitFileState':'masked' if stopped else 'disabled',
+                    'ExecStop':'evil start' if self.fault == 'stop-hook' and runner else '',
+                    'ExecStopPost':'evil start' if self.fault == 'post-hook' and runner else ''}
+                if self.fault == 'control-pid' and not runner:
+                    props['ControlPID']='77'
+                if self.fault == 'keeper-alive' and not runner:
+                    props['ActiveState']='active'
+                out='\n'.join(k+'='+v for k,v in props.items())
+            elif verb == 'mask':
+                self.states[argv[3]]=True
+            elif verb == 'unmask':
+                if self.fault=='unmask':code=1
+                else:self.states[argv[3]]=False
+        elif argv[0] == 'docker' and 'inspect' in argv:
+            out=IMAGE
+        elif argv[0] == 'docker':
+            # Exercise the actual schema/rewrite payload without another Docker.
+            original = json.loads(kwargs['input'])
+            from io import StringIO
+            oldin,oldout=sys.stdin,sys.stdout
+            sys.stdin=StringIO(json.dumps(original)); sys.stdout=StringIO()
+            try:
+                exec(m.PROFILE,{})
+                out=sys.stdout.getvalue()
+            finally:
+                sys.stdin,sys.stdout=oldin,oldout
+        elif argv[0] == 'bash':
+            if self.fault == 'image': code=4
+            out='\n'.join('[hand-release-image]   '+k+'='+v for k,v in {'FORGE_IMAGE':'forge:fixture','FORGE_IMAGE_IDENTITY':'a'*64,'FORGE_RELEASE_VERSION':'fixture','FORGE_RELEASE_MANIFEST_SHA256':'b'*64}.items())
+        elif argv[:2] == ['sbx','version']:
+            out='Client Version:  v0.42.1 abc123\nBuild Tags: cloud\nServer Version:  v0.42.1 abc123\n'
+            if self.fault=='version':out=out.replace('Server Version:  v0.42.1','Server Version:  v0.43.0')
+        elif argv[:2] == ['sbx','inspect']:
+            out=json.dumps({'name':'owned-sandbox','sessions':1 if self.fault=='sessions' else 0})
+        elif argv[:2] == ['sbx','stop']:
+            self.phase='after'
+            if self.fault == 'stop-fails':code=1
+            if self.fault == 'stop-timeout':raise subprocess.TimeoutExpired(argv,120)
+        elif argv[:2] == ['sbx','ls']:
+            status={'unknown':'mystery','empty':'','running':'running'}.get(self.fault,'stopped')
+            out=json.dumps([{'name':'owned-sandbox','status':status}])
+            if self.fault=='status-error': code=1;out='invalid'
+            if self.fault=='status-timeout':raise subprocess.TimeoutExpired(argv,120)
+        elif argv[:2] == ['sbx','exec']:
+            args=argv[3:] if argv[2] != '-i' else argv[4:]
+            if args[:2] == ['python3','-c'] and args[2] == m.DISK:
+                doc=copy.deepcopy(self.disk_doc)
+                if self.phase=='after':
+                    doc['boot_id']='boot-after'
+                    if self.fault=='same-boot':doc['boot_id']='boot-before'
+                    if self.fault=='file-changed':doc['known_files']['known.txt']='d'*64
+                    if self.fault=='receipt-changed':doc['receipt_listing'][0]['sha256']='e'*64
+                    if self.fault=='clone-changed':doc['clone_commit']='f'*40
+                    if self.fault=='disk-unreadable':code=1
+                out=json.dumps(doc)
+            elif args[:2]==['python3','-c'] and args[2]==m.INSTALL:
+                for item in json.loads(kwargs['input']):
+                    import base64
+                    self.files[item['path']]=base64.b64decode(item['data'])
+                out='installed-and-read-back'
+            elif args[0]=='sha256sum':
+                out=m.digest(self.files[args[1]])+'  '+args[1]
+            elif args[0]=='ps':
+                out='PID STARTED COMMAND\n1 Sun Sep 27 08:00:00 2026 init\n'
+                if self.phase=='after' and self.fault=='process':out+='55 old-sidecar\n'
+                if self.phase=='before' and self.fault=='diagnostics':code=1
+                if self.phase=='before' and self.fault=='diagnostics-timeout':raise subprocess.TimeoutExpired(argv,120)
+            elif args[:2]==['docker','ps']:
+                if self.fault=='survivor':out='abc123\n'
+                if self.fault=='wake-fails':code=1
+        return subprocess.CompletedProcess(argv,code,out,'private-error-do-not-print' if code else '')
+
+    def argv(self):
+        return [x[0] for x in self.calls]
+
+
+@pytest.mark.parametrize('fault',[
+    'version','stop-hook','post-hook','keeper-alive','control-pid','sessions','stop-fails','stop-timeout','status-timeout',
+    'unknown','empty','running','status-error','survivor','wake-fails',
+    'same-boot','process','file-changed','receipt-changed','clone-changed','disk-unreadable','image',
+])
+def test_refusal_installs_nothing(inventory,monkeypatch,capsys,fault):
+    config,path,args=inventory
+    boundary=Boundary(config,monkeypatch);boundary.fault=fault
+    original=Path(config['sandbox']['profile_source']).read_bytes()
+    assert m.main(args)==2
+    assert not boundary.files
+    assert Path(config['sandbox']['profile_source']).read_bytes()==original
+    assert not any(x[:3]==['systemctl','--user','unmask'] for x in boundary.argv())
+    assert not any(x[0]=='sbx' and any(y in x for y in ('rm','prune','reset','kill')) for x in boundary.argv())
+    if fault in ('stop-hook','post-hook'):
+        assert not any(x[:3]==['systemctl','--user','stop'] for x in boundary.argv())
+    if fault in ('keeper-alive','control-pid'):
+        assert ['systemctl','--user','stop','owned-runner.service'] not in boundary.argv()
+    if fault in ('unknown','empty','running','status-error','stop-fails','stop-timeout','status-timeout'):
+        assert 'work may still be running' in capsys.readouterr().err
+    if fault=='survivor':
+        assert 'abc123' in capsys.readouterr().err
+        assert not any(x[0]=='sbx' and 'docker' in x and any(y in x for y in ('stop','rm')) for x in boundary.argv())
+
+
+def test_success_order_exact_template_and_repeat(inventory,monkeypatch):
+    config,path,args=inventory
+    b=Boundary(config,monkeypatch)
+    assert m.main(args)==0
+    calls=b.argv()
+    assert calls.index(['systemctl','--user','mask','owned-keeper.service']) < calls.index(['systemctl','--user','stop','owned-runner.service']) < calls.index(['sbx','stop','owned-sandbox'])
+    stop_index=calls.index(['systemctl','--user','stop','owned-runner.service'])
+    assert calls[stop_index-1][:4]==['systemctl','--user','show','owned-runner.service']
+    assert b.files[config['sandbox']['script_path']]==m.TEMPLATE.read_bytes()
+    assert '--sandbox' in next(x for x in calls if x[:4]==['sbx','policy','allow','network'])
+    assert all('DOCKER_HOST' not in kw['env'] for _,kw in b.calls)
+    handoff=next(kw for x,kw in b.calls if x[0]=='bash')
+    assert handoff['env']['FORGE_IMAGE']=='forge:fixture'
+    installed=json.loads((Path(config['sandbox']['evidence_dir'])/'sandbox-installed.json').read_text())
+    assert installed['actual_memory_read_write']=='NOT-TESTED'
+    b.calls.clear()
+    assert m.main(args)==0
+    assert not any(x[:2]==['sbx','stop'] for x in b.argv())
+
+
+@pytest.mark.parametrize('fault',['diagnostics','diagnostics-timeout'])
+def test_diagnostics_failure_is_not_process_authority(inventory,monkeypatch,fault):
+    config,path,args=inventory;b=Boundary(config,monkeypatch);b.fault=fault
+    assert m.main(args)==0
+
+
+def test_plan_is_real_cli_side_effect_free(inventory,tmp_path):
+    config,path,args=inventory
+    before=set(tmp_path.rglob('*'))
+    result=subprocess.run([sys.executable,str(SCRIPT),*args,'--plan'],capture_output=True,text=True,env={'PATH':'/does-not-exist'})
+    assert result.returncode==0,result.stderr
+    assert 'NOT VERIFIED' in result.stdout
+    assert set(tmp_path.rglob('*'))==before
+
+
+@pytest.mark.parametrize('line',['BROKEN=$(touch /tmp/escape)','export KEY=value','DUP=a\nDUP=b','VALUE=${SHELL}','VALUE=`id`'])
+def test_env_never_sourced(inventory,line,monkeypatch):
+    config,path,args=inventory
+    with Path(config['env_file']).open('a') as f:f.write(line+'\n')
+    monkeypatch.setattr(m.subprocess,'run',lambda *a,**k:pytest.fail('external command on malformed env'))
+    assert m.main(args)==2
+
+
+def test_shell_routes_cannot_override_explicit_env(inventory,monkeypatch):
+    config,path,args=inventory
+    monkeypatch.setenv('FORGE_TARGET_OWNER_URL','http://evil.test:9999')
+    monkeypatch.setenv('DOCKER_HOST','unix:///host.sock')
+    b=Boundary(config,monkeypatch)
+    assert m.main(args)==0
+    assert any('http://192.0.2.10:8900' in x for x in b.argv())
+    assert not any('evil.test' in str(x) for x in b.argv())
+
+
+def test_profile_preserves_choices_and_all_routes(inventory,monkeypatch):
+    config,path,args=inventory;b=Boundary(config,monkeypatch)
+    assert m.main(args)==0
+    import yaml
+    doc=yaml.safe_load(Path(config['sandbox']['profile_source']).read_text())
+    assert doc['custom_choice']=={'keep':True}
+    assert doc['sandbox']['allow_network']==['example.test:443','192.0.2.10:8900']
+    assert doc['sandbox']['receipts_path']=='/private/receipts'
+    assert doc['cwd']=='/private/clone'
+    publishes=[x[-1] for x in b.argv() if x[:3]==['sbx','ports','owned-sandbox'] and '--publish' in x]
+    assert len(publishes)==4 and all(x.startswith('192.0.2.10:') for x in publishes)
+
+
+def test_actual_disk_payload_detects_same_size_receipt_and_named_file_changes(tmp_path):
+    root=tmp_path/'clone';root.mkdir();receipts=tmp_path/'receipts';receipts.mkdir()
+    (root/'known.txt').write_text('before')
+    (receipts/'receipt with spaces').write_text('abc')
+    def git(*args):
+        subprocess.run(['git','-C',str(root),*args],check=True,capture_output=True)
+    git('init');git('remote','add','origin','https://example.invalid/project.git');git('add','.');git('-c','user.name=Fixture','-c','user.email=fixture@example.invalid','commit','-m','seed')
+    config={'clone_path':str(root),'receipts_path':str(receipts),'known_files':['known.txt'],'remote_ref':'HEAD','remote_name':'origin','declared_remote':'https://example.invalid/project.git','declaration_files':['known.txt']}
+    def observe():
+        r=subprocess.run([sys.executable,'-c',m.DISK,json.dumps(config)],check=True,capture_output=True,text=True)
+        return json.loads(r.stdout)
+    first=observe();(receipts/'receipt with spaces').write_text('xyz');second=observe()
+    assert first['receipt_total_bytes']==second['receipt_total_bytes']==3
+    assert first['receipt_listing_sha256']!=second['receipt_listing_sha256']
+    (root/'known.txt').write_text('after!');third=observe()
+    assert first['known_files']!=third['known_files']
+
+
+def test_actual_install_payload_writes_template_exactly(tmp_path):
+    import base64
+    path=tmp_path/'sandbox-runner.sh'
+    data=m.TEMPLATE.read_bytes()
+    item={'path':str(path),'root':str(tmp_path),'data':base64.b64encode(data).decode(),'mode':0o755}
+    r=subprocess.run([sys.executable,'-c',m.INSTALL],input=json.dumps([item]),text=True,capture_output=True)
+    assert r.returncode==0,r.stderr
+    assert path.read_bytes()==data and path.stat().st_mode & 0o777==0o755
+
+
+def test_unmask_failure_restores_masks_without_old_bootstrap(inventory,monkeypatch,capsys):
+    config,path,args=inventory;b=Boundary(config,monkeypatch);b.fault='unmask'
+    assert m.main(args)==2
+    assert all(b.states.values())
+    assert b.files[config['sandbox']['script_path']]==m.TEMPLATE.read_bytes()
+    dropin=Path(config['sandbox']['systemd_user_dir'])/'owned-runner.service.d/zzzz-rollout-empty-stop.conf'
+    assert dropin.read_text()==m.EMPTY_STOP
+    assert 'installation may be incomplete' in capsys.readouterr().err
+
+
+def test_staging_failure_replaces_neither_file(tmp_path):
+    import base64
+    first=tmp_path/'first';first.write_text('original')
+    items=[{'path':str(first),'root':str(tmp_path),'data':base64.b64encode(b'new').decode(),'mode':0o755},
+           {'path':str(tmp_path/'missing'/'second'),'root':str(tmp_path),'data':base64.b64encode(b'new').decode(),'mode':0o644}]
+    r=subprocess.run([sys.executable,'-c',m.INSTALL],input=json.dumps(items),capture_output=True,text=True)
+    assert r.returncode!=0
+    assert first.read_text()=='original'
+    assert not list(tmp_path.glob('.rollout-*'))
