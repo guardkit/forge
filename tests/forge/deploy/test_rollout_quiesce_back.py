@@ -39,7 +39,13 @@ def estate(tmp_path):
 
 @pytest.mark.parametrize('pending,ack',[(1,0),(0,1),(1,1)])
 def test_ack_and_pending_never_zero(pending,ack):
-    with pytest.raises(r.Refusal):q.quiet_counts(q.reader_counts(monitor(pending,ack)))
+    with pytest.raises(r.Refusal) as refused:q.quiet_counts(q.reader_counts(monitor(pending,ack)))
+    message=str(refused.value)
+    assert 'reader forge-serve' in message
+    assert f'pending={pending}' in message
+    assert f'unacknowledged={ack}' in message
+def test_zero_counts_are_quiet():
+    assert q.quiet_counts(q.reader_counts(monitor(0,0))) is None
 @pytest.mark.parametrize('value',[None,'0',False,-1])
 def test_unknown_count_is_not_zero(value):
     with pytest.raises(r.Refusal):q.reader_counts(monitor(value))
@@ -92,6 +98,67 @@ def test_alarm_unsettled_refuses_before_mask(estate,monkeypatch):
 def test_inflight_arriving_second_read_refuses(estate,monkeypatch):
     estate.doc={'observations':[]};monkeypatch.setattr(estate,'closed',lambda:None);counts=iter([q.reader_counts(monitor()),q.reader_counts(monitor(1))]);monkeypatch.setattr(estate,'monitor',lambda:next(counts));monkeypatch.setattr(estate,'state',lambda:{'work_state':{}});monkeypatch.setattr(q.time,'sleep',lambda n:None)
     with pytest.raises(r.Refusal):estate.settle()
+
+
+def public_final_argv(estate):
+    return ['--config',str(estate.config_path),'--env-file',estate.c['env_file'],
+            '--project',estate.c['project'],'--snapshot',str(estate.snapshot),'--final']
+
+
+@pytest.mark.parametrize('partial',[False,True])
+def test_public_final_preserves_sanitized_sandbox_refusal_before_legacy_stops(estate,monkeypatch,capsys,partial):
+    estate.phase='original';estate.doc={'format_version':1,'binding':estate.binding,'stage':'settled'}
+    monkeypatch.setattr(estate,'closed',lambda:None);legacy=[]
+    monkeypatch.setattr(estate,'systemctl',lambda *a:legacy.append(('systemctl',a)))
+    monkeypatch.setattr(r,'inspect',lambda *a:legacy.append(('inspect',a)))
+    estate.private_values=['sentinel-private-value']
+    if partial:
+        child='Refusing: systemctl unmask refused for unit owned-runner.service; current-template/profile installation may be incomplete, so reconcile the private evidence before unmasking either unit; sentinel-private-value.\n'
+    else:
+        child='Refusing: known_files changed for ["known-file.txt"]; systemctl stop refused for unit owned-keeper.service; nothing has been replaced, and work may still be running inside it — shall I try again, or put it back as it was and stop for today? sentinel-private-value\n'
+    def refused(argv,**kwargs):
+        assert Path(argv[0]).name=='rollout-sandbox' and '--stop-legacy' in argv
+        return SimpleNamespace(returncode=2,stdout='sentinel-private-value stdout',stderr=child)
+    monkeypatch.setattr(r,'run',refused);monkeypatch.setattr(q,'Estate',lambda args:estate)
+    assert q.main(public_final_argv(estate))==2
+    error=capsys.readouterr().err
+    assert 'sentinel-private-value' not in error and '[REDACTED]' in error
+    assert legacy==[]
+    report=r.read_json(estate.snapshot/'rollout-sandbox-command.json')
+    assert report['passed'] is False and report['commands'][0]['exit']==2
+    assert 'sentinel-private-value' not in json.dumps(report) and '[REDACTED]' in json.dumps(report)
+    assert (estate.snapshot/'rollout-sandbox-command.json').stat().st_mode&0o777==0o600
+    if partial:
+        assert 'installation may be incomplete' in error
+        assert 'nothing has been replaced' not in error
+    else:
+        assert 'known-file.txt' in error and 'owned-keeper.service' in error
+        assert 'shall I try again, or put it back as it was and stop for today?' in error
+
+
+def test_sandbox_final_success_records_sanitized_command(estate,monkeypatch):
+    estate.private_values=['sentinel-private-value']
+    monkeypatch.setattr(r,'run',lambda *a,**k:SimpleNamespace(returncode=0,stdout='ok sentinel-private-value',stderr=''))
+    result=estate.sandbox_final([HERE/'rollout-sandbox','--stop-legacy'])
+    assert result.returncode==0
+    report=r.read_json(estate.snapshot/'rollout-sandbox-command.json')
+    assert report['passed'] is True and report['commands'][0]['exit']==0
+    assert 'sentinel-private-value' not in json.dumps(report) and '[REDACTED]' in json.dumps(report)
+
+
+def test_public_final_timeout_is_unknown_and_never_claims_nothing_replaced(estate,monkeypatch,capsys):
+    estate.phase='original';estate.doc={'format_version':1,'binding':estate.binding,'stage':'settled'}
+    monkeypatch.setattr(estate,'closed',lambda:None);legacy=[]
+    monkeypatch.setattr(estate,'systemctl',lambda *a:legacy.append(a));monkeypatch.setattr(r,'inspect',lambda *a:legacy.append(a))
+    def timeout(argv,**kwargs):raise subprocess.TimeoutExpired(argv,180,stderr='sentinel-private-value')
+    estate.private_values=['sentinel-private-value'];monkeypatch.setattr(r,'run',timeout);monkeypatch.setattr(q,'Estate',lambda args:estate)
+    assert q.main(public_final_argv(estate))==2
+    error=capsys.readouterr().err
+    assert 'outcome is unknown and installation may be incomplete' in error
+    assert 'nothing has been replaced' not in error and 'sentinel-private-value' not in error
+    assert legacy==[]
+    report=r.read_json(estate.snapshot/'rollout-sandbox-command.json')
+    assert report['passed'] is False and report['commands'][0]['exit'] is None
 
 @pytest.mark.parametrize('shape',['half','mismatch','invalid'])
 def test_marker_pair_refuses_ambiguous(estate,monkeypatch,shape):

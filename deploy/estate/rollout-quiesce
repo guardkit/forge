@@ -92,7 +92,8 @@ def reader_counts(doc, account=''):
 
 def quiet_counts(counts):
     for name,values in counts['readers'].items():
-        need(values['num_pending']==values['num_ack_pending']==0,f'reader {name} still has pending or unacknowledged work; leave admissions closed and let it settle')
+        need(values['num_pending']==values['num_ack_pending']==0,
+             f'reader {name} has pending={values["num_pending"]} and unacknowledged={values["num_ack_pending"]}; leave admissions closed and let it settle')
 
 def marker_file(value):
     """Physical absence is different from any present, malformed artifact."""
@@ -273,6 +274,26 @@ class Estate:
         except Exception as exc:
             event['reason']=self.sanitize(str(exc));raise
         finally:event['finished_at']=now()
+    def sandbox_final(self,command):
+        evidence=self.snapshot/'rollout-sandbox-command.json'
+        record={'format_version':1,'started_at':now(),'passed':False,'commands':[]}
+        try:
+            result=self.captured(command,'rollout-sandbox',record['commands'],env=self.env)
+            record['passed']=True
+            return result
+        except Exception:
+            event=record['commands'][-1] if record['commands'] else {}
+            if type(event.get('exit')) is int:
+                lines=[line[len('Refusing: '):].strip() for line in event.get('stderr','').splitlines()
+                       if line.startswith('Refusing: ')]
+                if lines:
+                    raise r.Refusal('rollout-sandbox refused: '+lines[-1][:8192]) from None
+                raise r.Refusal('rollout-sandbox refused without a usable child diagnostic; installation may be incomplete, so inspect its private command evidence before stopping legacy writers') from None
+            raise r.Refusal('rollout-sandbox outcome is unknown and installation may be incomplete; inspect its private command evidence before stopping legacy writers') from None
+        finally:
+            record['finished_at']=now()
+            private_path(evidence)
+            r.atomic_json(evidence,record)
     def recorded_docker(self,*args,**kwargs):
         events=getattr(self,'_diagnostic_events',None)
         if events is None:return r.docker(self.c,*args,**kwargs)
@@ -470,7 +491,7 @@ print(json.dumps(state))
         if self.phase=='original':
             command=[HERE/'rollout-sandbox','--config',self.config_path,'--env-file',self.args.env_file,'--project',self.c['project'],'--stop-legacy']
             for p in self.args.secret_env_file:command+=['--secret-env-file',p]
-            r.run(command,env=self.env)
+            self.sandbox_final(command)
             for role in ('langgraph_sidecar','deploy_sidecar'):self.systemctl('stop',self.c['units'][role]);self.unit_stopped(self.c['units'][role])
             for role in ('relay','memory','coordinator'):
                 item=r.inspect(self.c,self.c['old_containers'][role]);need(item['Id']==self.doc['old_runtimes'][role]['service_identity']['container_id'],f'old {role} identity changed since close; reconcile before stopping')
