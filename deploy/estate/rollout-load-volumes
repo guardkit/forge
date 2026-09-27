@@ -1,0 +1,7 @@
+#!/usr/bin/env python3
+"""Load five new stores, then explicitly verify the real service snapshot marks."""
+import sys
+sys.dont_write_bytecode = True
+from rollout_support import cli
+if __name__ == '__main__':
+    raise SystemExit(cli('load'))

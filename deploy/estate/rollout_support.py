@@ -1,0 +1,462 @@
+"""Internal standard-library support for the rollout commands; not an application entry point.
+
+Artifact format 1: metadata.json describes the untouched forge.db and full work_state;
+previous-runtime.json contains environment NAMES only. ROLLOUT-SNAPSHOT.json binds
+both the original and migrated hashes. load-receipt.json never asserts service
+readback until --verify-containers has actually read the mark in all three services.
+"""
+from __future__ import annotations
+import argparse
+from contextlib import closing
+import shlex
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+from datetime import datetime, timezone
+
+MARK = 'ROLLOUT-SNAPSHOT.json'
+RUNTIME = 'sha256:f91d3e4b0f2a63e08dd9525d4ad3dff464a78d1cc0be05ca203760cc1b2a4798'
+UNIT_ROLES = {'gateway', 'frontdoor', 'watchdog_timer', 'watchdog_service', 'autobuild', 'runner', 'keeper', 'langgraph_sidecar', 'deploy_sidecar'}
+VOLUME_ROLES = {'ledger', 'settings', 'evidence', 'threads', 'relay_progress'}
+PUBLISHER_RUNTIME = 'sha256:5eee763590ac686c8617c2d8411a223aea97c1c08fad3d531235fac104d936d4'
+WORK_TABLES = {'builds': 1, 'planning_runs': 3, 'work_queue': 10, 'publication_records': 15, 'deployment_targets': 16}
+
+class Refusal(Exception):
+    pass
+
+def refuse(message):
+    raise Refusal(message)
+
+def run(argv, *, input=None, check=True, env=None):
+    # Never print a failed command's stderr: Compose diagnostics can contain secrets.
+    result = subprocess.run([str(x) for x in argv], input=input, capture_output=True, text=True, timeout=180, env=env)
+    if check and result.returncode:
+        refuse(f'{Path(str(argv[0])).name} could not complete the requested read or operation; inspect its private diagnostics and retry')
+    return result
+
+def path(value, *, exists=True):
+    p = Path(value)
+    if not p.is_absolute() or any(x.is_symlink() for x in (p, *p.parents)):
+        refuse(f'path {p} is relative or crosses a symlink; supply an absolute direct path')
+    if exists and not p.exists():
+        refuse(f'path {p} is missing; supply the intended existing path')
+    return p
+
+def read_json(p):
+    return json.loads(path(p).read_text())
+
+def sha256(p):
+    with open(p, 'rb') as f:
+        return hashlib.file_digest(f, 'sha256').hexdigest()
+
+def atomic_json(p, value):
+    p = Path(p)
+    path(p, exists=False)
+    fd, tmp = tempfile.mkstemp(prefix='.' + p.name, dir=p.parent)
+    try:
+        with os.fdopen(fd, 'w') as f:
+            json.dump(value, f, sort_keys=True, indent=2)
+            f.write('\n'); f.flush(); os.fsync(f.fileno())
+        os.replace(tmp, p)
+        fd = os.open(p.parent, os.O_DIRECTORY)
+        try: os.fsync(fd)
+        finally: os.close(fd)
+    finally:
+        if os.path.exists(tmp): os.unlink(tmp)
+
+def ledger_state(p):
+    p = path(p)
+    # mode=ro is required, not immutable: a stopped source can still have committed WAL.
+    with closing(sqlite3.connect(p.as_uri() + '?mode=ro', uri=True)) as db:
+        db.row_factory = sqlite3.Row
+        db.execute('PRAGMA query_only=ON')
+        if [r[0] for r in db.execute('PRAGMA integrity_check')] != ['ok']:
+            refuse(f'ledger {p} failed integrity_check; repair the source before retrying')
+        tables = sorted(r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"))
+        if 'schema_version' not in tables:
+            refuse(f'ledger {p} has no recorded schema; select the authoritative Forge ledger')
+        version = db.execute('SELECT max(version) FROM schema_version').fetchone()[0]
+        if type(version) is not int or not 1 <= version <= 16:
+            refuse(f'ledger {p} has an unsupported schema; select a release that knows this schema')
+        counts = {}
+        for name in tables:
+            quoted = '"' + name.replace('"', '""') + '"'
+            counts[name] = db.execute(f'SELECT count(*) FROM {quoted}').fetchone()[0]
+        work = {}
+        for table, introduced in WORK_TABLES.items():
+            if table not in tables:
+                if version >= introduced:
+                    refuse(f'ledger {p} is missing required table {table}; reconcile its schema before retrying')
+                work[table] = {'status': 'NOT-YET', 'introduced_in': introduced}
+            else:
+                columns = {
+                    'builds': ['build_id', 'status', 'completed_at', 'pending_approval_request_id'],
+                    'planning_runs': ['correlation_id', 'state', 'completed_at', 'pending_approval_request_id'],
+                    'work_queue': ['id', 'status', 'correlation_id', 'rank', 'admitted_at', 'closed_at'],
+                }.get(table)
+                present = {r[1] for r in db.execute(f'PRAGMA table_info("{table}")')}
+                if columns and not set(columns) <= present:
+                    refuse(f'ledger {p} lacks required state columns in {table}; reconcile its schema before retrying')
+                selection = ','.join('"'+x+'"' for x in columns) if columns else '*'
+                predicate = " WHERE status IN ('QUEUED','ADMITTED')" if table == 'work_queue' else ''
+                rows = [dict(r) for r in db.execute(f'SELECT {selection} FROM "{table}"{predicate}')]
+                rows.sort(key=lambda r: json.dumps(r, sort_keys=True))
+                work[table] = {'status': 'observed', 'rows': rows, 'count': len(rows)}
+        return {'schema_version': version, 'tables': counts, 'work_state': work}
+
+def verify_snapshot(directory):
+    directory = path(directory)
+    metadata = read_json(directory / 'metadata.json')
+    db = path(directory / 'forge.db')
+    if metadata.get('format_version') != 1 or sha256(db) != metadata.get('sha256'):
+        refuse(f'snapshot {directory} does not match its recorded hash; recover the untouched snapshot')
+    actual = ledger_state(db)
+    if any(metadata.get(k) != v for k, v in actual.items()):
+        refuse(f'snapshot {directory} state differs from its metadata; recover the untouched snapshot')
+    runtime = path(directory / 'previous-runtime.json')
+    if sha256(runtime) != metadata.get('previous_runtime_sha256'):
+        refuse(f'snapshot {directory} runtime record was changed; recover the original runtime record')
+    return metadata
+
+def config(p, env_file=None, project=None):
+    c = read_json(p)
+    for key in ('project', 'docker_context', 'env_file', 'compose_files', 'runtime_image', 'source_db', 'snapshot_root', 'forbidden_roots', 'units', 'old_containers', 'sources', 'volumes'):
+        if not c.get(key): refuse(f'configuration is missing {key}; name it explicitly before retrying')
+    if not re.fullmatch(r'[a-z0-9][a-z0-9_-]+', c['project']): refuse('project name is invalid; supply an explicit Compose project name')
+    for key, value in [('env_file', env_file), ('project', project)]:
+        if value is not None and c[key] != value:
+            refuse(f'{key} conflicts with the private inventory; use matching explicit inputs')
+    environment = {}
+    for line in path(c['env_file']).read_text().splitlines():
+        if not line.strip() or line.lstrip().startswith('#'): continue
+        key, sep, value = line.partition('=')
+        if not sep or not re.fullmatch(r'[A-Za-z_][A-Za-z_0-9]*', key.strip()):
+            refuse('estate env file contains an invalid assignment; use plain environment assignments')
+        parsed = shlex.split(value, comments=True)
+        if len(parsed) > 1: refuse('estate env file has an ambiguous value; quote each complete value')
+        environment[key.strip()] = parsed[0] if parsed else ''
+    if environment.get('FORGE_IMAGE') != c['runtime_image']:
+        refuse('FORGE_IMAGE in the estate env file differs from the immutable migration image; use the same accepted image ID')
+    if c['runtime_image'] != RUNTIME:
+        refuse('runtime_image is not the accepted immutable migration image; use the reviewed release image ID')
+    if set(c['units']) != UNIT_ROLES or set(c['old_containers']) != {'coordinator', 'memory', 'relay'}:
+        refuse('stopped-service inventory is incomplete; explicitly name every required unit and old container')
+    if len(set(c['units'].values())) != len(UNIT_ROLES): refuse('unit inventory repeats a unit; name every distinct stopped service')
+    if set(c['volumes']) != VOLUME_ROLES or len(set(c['volumes'].values())) != 5:
+        refuse('volume mapping does not name five distinct state volumes; supply the ledger, settings, evidence, threads and relay progress volumes')
+    for name in c['volumes'].values():
+        if not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_.-]+', name): refuse('volume name is not a named volume; correct the volume mapping')
+    path(c['env_file']); path(c['source_db']); path(c['snapshot_root'])
+    for f in c['compose_files']: path(f)
+    return c
+
+def docker(c, *args, **kwargs):
+    return run(['docker', '--context', c['docker_context'], *args], **kwargs)
+
+def inspect(c, name):
+    result = json.loads(docker(c, 'inspect', name).stdout)
+    if len(result) != 1: refuse(f'container {name} is ambiguous; name exactly one container')
+    return result[0]
+
+def stopped(c):
+    observations = {}
+    for role, unit in sorted(c['units'].items()):
+        result = run(['systemctl', '--user', 'show', unit, '--property=LoadState,ActiveState,SubState,MainPID,ControlPID', '--no-pager'])
+        fields = dict(line.split('=', 1) for line in result.stdout.splitlines() if '=' in line)
+        if fields.get('LoadState') not in ('loaded', 'masked') or fields.get('ActiveState') != 'inactive' or fields.get('MainPID') != '0' or fields.get('ControlPID') != '0':
+            refuse(f'unit {unit} is not proved inactive and settled; stop it through the authorized quiesce procedure')
+        observations[role] = fields
+    containers = {}
+    for role, name in c['old_containers'].items():
+        item = inspect(c, name)
+        if item['State'].get('Status') != 'exited' or item['State'].get('Running') or item['State'].get('Pid') != 0:
+            refuse(f'container {name} is not exited; stop it before taking or loading the snapshot')
+        containers[role] = item
+    return observations, containers
+
+def no_holders(db):
+    files = [str(p) for p in (db, Path(str(db)+'-wal'), Path(str(db)+'-shm')) if p.exists()]
+    result = run(['fuser', *files], check=False)
+    if result.returncode != 1 or result.stdout.strip() or result.stderr.strip():
+        refuse(f'ledger {db} has an open holder or its holders are unreadable; stop every writer and retry')
+
+def fingerprint(db):
+    wal = Path(str(db)+'-wal')
+    return {'db_mtime_ns': db.stat().st_mtime_ns, 'db_size': db.stat().st_size, 'wal_size': wal.stat().st_size if wal.exists() else 0}
+
+def previous_runtime(c, item):
+    image = json.loads(docker(c, 'image', 'inspect', item['Image']).stdout)[0]
+    cfg, host, net = item['Config'], item['HostConfig'], item['NetworkSettings']
+    required = ('Mounts', 'Image', 'Name', 'Id')
+    if any(k not in item for k in required) or not net.get('Networks'):
+        refuse('previous coordinator runtime cannot be recorded completely; repair runtime discovery before retrying')
+    return {'format_version': 1, 'image_id': item['Image'], 'repo_tags': image['RepoTags'] or [],
+            'mounts': item['Mounts'], 'networks': net['Networks'], 'ports': net.get('Ports', {}),
+            'port_bindings': host['PortBindings'], 'restart_policy': host['RestartPolicy'],
+            'network_mode': host['NetworkMode'], 'env_names': sorted(x.split('=',1)[0] for x in cfg.get('Env', [])),
+            'service_identity': {'name': item['Name'], 'container_id': item['Id'], 'hostname': cfg['Hostname'],
+              'user': cfg['User'], 'working_dir': cfg['WorkingDir'], 'entrypoint': cfg['Entrypoint'], 'command': cfg['Cmd']},
+            'release_image_id': c['runtime_image']}
+
+def safe_snapshot_destination(c, dest):
+    root = path(c['snapshot_root'])
+    dest = path(dest, exists=False)
+    if dest.parent != root or not re.fullmatch(r'\d{8}T\d{6}Z(?:-[a-zA-Z0-9_-]+)?', dest.name):
+        refuse(f'snapshot destination {dest} is not a dated child of the snapshot root; use YYYYMMDDTHHMMSSZ with an optional suffix')
+    roots = [path(x) for x in c['forbidden_roots']] + [path(c['source_db']).parent]
+    for p in (root, *root.parents):
+        if (p / '.git').exists(): refuse(f'snapshot root {root} is inside a repository; choose external storage')
+    names = docker(c, 'volume', 'ls', '--format', '{{.Name}}').stdout.splitlines()
+    if names:
+        roots += [Path(v['Mountpoint']) for v in json.loads(docker(c, 'volume', 'inspect', *names).stdout)]
+    if any(root == r or r in root.parents for r in roots):
+        refuse(f'snapshot root {root} is inside source, repository or volume storage; choose external storage')
+    return dest
+
+def snapshot(c, dest, plan=False):
+    dest = safe_snapshot_destination(c, dest)
+    db = path(c['source_db'])
+    summary = {'source_db': str(db), **fingerprint(db), 'destination': str(dest)}
+    if plan: return {'plan': True, **summary, 'actions': ['prove every unit inactive and old container exited', 'check holders and frozen state twice 20 seconds apart', 'sqlite3 -readonly .backup', 'integrity, schema, work state and runtime record']}
+    if dest.exists():
+        metadata = verify_snapshot(dest)
+        if metadata['source_db'] != str(db) or metadata['project'] != c['project']:
+            refuse(f'existing snapshot {dest} belongs to another source or project; choose a fresh dated destination')
+        return {'idempotent': True, 'snapshot': str(dest), 'sha256': metadata['sha256']}
+    units, containers = stopped(c); no_holders(db)
+    before = fingerprint(db); state = ledger_state(db)
+    time.sleep(20)
+    _, current_containers = stopped(c); no_holders(db)
+    if any(current_containers[k]['Id'] != v['Id'] for k, v in containers.items()):
+        refuse('old container identity changed during the quiet interval; settle the intended runtime before retrying')
+    if fingerprint(db) != before or ledger_state(db) != state:
+        refuse(f'ledger {db} changed during the quiet interval; settle all writers and retry')
+    runtime = previous_runtime(c, containers['coordinator'])
+    stage = Path(tempfile.mkdtemp(prefix='.snapshot-', dir=dest.parent))
+    try:
+        backup = stage / 'forge.db'
+        # Destination is generated, never interpolated into a shell; sqlite's dot-command
+        # parser accepts double-quoted paths with embedded quotes escaped.
+        target = str(backup).replace('"', '""')
+        run(['sqlite3', '-readonly', str(db), '.backup "' + target + '"'])
+        actual = ledger_state(backup)
+        if actual != state or ledger_state(db) != state or fingerprint(db) != before:
+            refuse(f'ledger {db} changed while being backed up; settle every writer and retry')
+        no_holders(db); stopped(c)
+        atomic_json(stage / 'previous-runtime.json', runtime)
+        metadata = {'format_version': 1, 'created_at': datetime.now(timezone.utc).isoformat(),
+            'project': c['project'], 'source_db': str(db), 'source_size': before['db_size'],
+            'source_observation': before, 'sha256': sha256(backup), 'size': backup.stat().st_size,
+            'previous_runtime_sha256': sha256(stage / 'previous-runtime.json'), 'units': units, **state}
+        atomic_json(stage / 'metadata.json', metadata)
+        stage.rename(dest)
+        return {'snapshot': str(dest), **metadata}
+    finally:
+        if stage.exists(): shutil.rmtree(stage)
+
+# Executed only inside the explicitly selected release container. Source folders are
+# mounted read-only, destination volumes only at /destination, and networking is off.
+MANIFEST_CODE = r'''
+import os, pathlib, json, hashlib, sys
+root=pathlib.Path(sys.argv[1]); result=[]
+for p in sorted(root.rglob('*')):
+ if p.is_symlink() or not (p.is_file() or p.is_dir()): raise RuntimeError('nonregular entry')
+ if p.is_file():
+  with p.open('rb') as f: digest=hashlib.file_digest(f,'sha256').hexdigest()
+  result.append({'path':p.relative_to(root).as_posix(),'size':p.stat().st_size,'sha256':digest})
+ else: result.append({'path':p.relative_to(root).as_posix()+'/', 'directory':True})
+print(json.dumps(result,sort_keys=True))
+'''
+
+def manifest(root):
+    root = path(root)
+    result = []
+    for p in sorted(root.rglob('*')):
+        path(p)
+        if p.is_file(): result.append({'path': p.relative_to(root).as_posix(), 'size': p.stat().st_size, 'sha256': sha256(p)})
+        elif p.is_dir(): result.append({'path': p.relative_to(root).as_posix()+'/', 'directory': True})
+        else: refuse(f'source {p} is not a regular file or directory; remove unsupported entries before retrying')
+    return result
+
+def container_python(c, code, args=(), mounts=(), *, readonly=True):
+    argv = ['run', '--rm', '--pull', 'never', '--name', c['project']+'-rollout-'+uuid.uuid4().hex[:12], '--network', 'none', '--read-only', '--user', '0:0', '--security-opt', 'no-new-privileges', '--cap-drop', 'ALL', '--cap-add', 'CHOWN', '--cap-add', 'FOWNER', '--cap-add', 'DAC_OVERRIDE', '--tmpfs', '/tmp:rw,noexec,nosuid', '--entrypoint', 'python']
+    for mount in mounts: argv += ['--mount', mount]
+    return docker(c, *argv, c['runtime_image'], '-c', code, *args).stdout
+
+def compose(c, *args):
+    argv = ['compose', '--project-name', c['project'], '--env-file', c['env_file']]
+    for f in c['compose_files']: argv += ['-f', f]
+    clean_env = {k: v for k, v in os.environ.items() if k in ('PATH', 'HOME', 'DOCKER_CONFIG', 'XDG_RUNTIME_DIR')}
+    return docker(c, *argv, *args, env=clean_env)
+
+def rendered(c):
+    model = json.loads(compose(c, 'config', '--format', 'json').stdout)
+    expected = c['volumes']['ledger']
+    for service in ('coordinator', 'answer-service', 'forge-publisher'):
+        mounts = [v for v in model['services'][service].get('volumes', []) if v['target'] == '/var/lib/forge']
+        if len(mounts) != 1 or mounts[0]['type'] != 'volume':
+            refuse(f'{service} record mount is not one named volume; correct the actual Compose configuration')
+        source = mounts[0]['source']
+        if model['volumes'][source].get('name') != expected:
+            refuse(f'{service} record volume differs from {expected}; correct the actual Compose configuration')
+    for service, expected_image in [('coordinator', RUNTIME), ('answer-service', RUNTIME), ('forge-publisher', PUBLISHER_RUNTIME)]:
+        if model['services'][service].get('image') != expected_image:
+            refuse(f'{service} does not select the accepted immutable image; correct the estate env image ID')
+    if model['services']['coordinator'].get('environment', {}).get('FORGE_DB_PATH') != '/var/lib/forge/forge.db':
+        refuse('coordinator does not explicitly select the shared ledger file; set FORGE_DB_PATH to /var/lib/forge/forge.db')
+    mapping = {'settings': ('coordinator', '/etc/forge'), 'evidence': ('coordinator','/var/lib/forge-evidence'), 'threads': ('front-door','/app/.langgraph_api'), 'relay_progress': ('memory-relay','/var/lib/fleet-memory')}
+    for role, (service,target) in mapping.items():
+        mounts = [v for v in model['services'][service].get('volumes',[]) if v['target'] == target]
+        if len(mounts) != 1 or mounts[0]['type'] != 'volume' or model['volumes'][mounts[0]['source']].get('name') != c['volumes'][role]:
+            refuse(f'{service} {role} volume does not match the load destination; correct the Compose volume mapping')
+    # An inherited project checkout cannot sneak into the new coordinator.
+    if any(v['type'] == 'bind' for v in model['services']['coordinator'].get('volumes', [])):
+        refuse('coordinator still binds a host folder; remove legacy project and seed binds before loading')
+    return model
+
+def volume_manifest(c, name):
+    return json.loads(container_python(c, MANIFEST_CODE, ['/destination'], [f'type=volume,src={name},dst=/destination,readonly']))
+
+def volume_inventory(c):
+    names = set(docker(c, 'volume', 'ls', '--format', '{{.Name}}').stdout.splitlines())
+    return {role: (volume_manifest(c, name) if name in names else None) for role,name in c['volumes'].items()}
+
+def verify_containers(c, directory, metadata, receipt, plan):
+    if receipt.get('snapshot_sha256') != metadata['sha256'] or receipt.get('volumes') != c['volumes']:
+        refuse('load receipt belongs to another snapshot or volume mapping; load the intended snapshot first')
+    mark = receipt['mark']
+    results = {}
+    for service in ('coordinator', 'answer-service', 'forge-publisher'):
+        ids = compose(c, 'ps', '--all', '-q', service).stdout.split()
+        if len(ids) != 1: refuse(f'{service} has no unique actual container; start the closed-door estate then verify again')
+        item = inspect(c, ids[0])
+        mounts = [m for m in item['Mounts'] if m['Destination'] == '/var/lib/forge']
+        if len(mounts) != 1 or mounts[0]['Type'] != 'volume' or mounts[0].get('Name') != c['volumes']['ledger']:
+            refuse(f'{service} actual container mounts another ledger; correct its mount before verifying')
+        expected_image = PUBLISHER_RUNTIME if service == 'forge-publisher' else RUNTIME
+        if item.get('Image') != expected_image:
+            refuse(f'{service} runs a different immutable image; recreate the closed-door service with the accepted release')
+        if service != 'coordinator' and mounts[0].get('RW') is not False:
+            refuse(f'{service} has a writable ledger mount; restore its read-only mount before verifying')
+        if not item['State']['Running']: refuse(f'{service} is not running; start the closed-door estate then verify again')
+        if plan: results[service] = 'would read snapshot mark'; continue
+        text = docker(c, 'exec', ids[0], 'python', '-c', 'from pathlib import Path; print(Path("/var/lib/forge/'+MARK+'").read_text())').stdout
+        if json.loads(text) != mark: refuse(f'{service} reads a different snapshot mark; keep the door closed and reconcile the mount')
+        results[service] = {'container_id': item['Id'], 'snapshot_sha256': mark['snapshot_sha256']}
+    if not plan:
+        receipt['container_verification'] = {'verified_at': datetime.now(timezone.utc).isoformat(), 'services': results}
+        atomic_json(directory / 'load-receipt.json', receipt)
+    return {'plan': plan, 'container_verification': results}
+
+def load_volumes(c, directory, plan=False, verify=False):
+    directory = path(directory); metadata = verify_snapshot(directory)
+    if metadata['project'] != c['project']: refuse('snapshot belongs to another Compose project; select its matching project')
+    model = rendered(c)
+    if verify:
+        return verify_containers(c, directory, metadata, read_json(directory / 'load-receipt.json'), plan)
+    sources = c['sources']
+    if set(sources) != {'settings', 'evidence', 'threads', 'relay_progress'}:
+        refuse('source mapping is incomplete; explicitly name all four source stores')
+    for p in sources.values(): path(p)
+    if Path(sources['relay_progress']).name != 'relay-progress.json': refuse('relay source is not relay-progress.json; name only the relay progress file')
+    # Planning performs no helper-container, receipt-reader probe, mkdir or volume creation.
+    if plan:
+        return {'plan': True, 'snapshot_sha256': metadata['sha256'], 'source_schema': metadata['schema_version'], 'volumes': c['volumes'], 'actions': ['migrate a disposable copy with accepted runtime', 'refuse occupied volumes unless every byte matches the existing receipt', 'copy and compare every filename, size and SHA-256', 'verify real service snapshot marks later with --verify-containers'], 'not_copied': ['retained bus', 'Postgres', 'project and seed folders', 'chronicler and liveness files', 'gateway heartbeat']}
+    stopped(c)
+    source_manifests = {role: manifest(sources[role]) for role in ('evidence', 'threads')}
+    for role, filename in [('settings', 'forge.yaml'), ('relay_progress', 'relay-progress.json')]:
+        p = path(sources[role])
+        if not p.is_file(): refuse(f'{role} source {p} is not a regular file; supply the intended file')
+        source_manifests[role] = [{'path': filename, 'size': p.stat().st_size, 'sha256': sha256(p)}]
+    # Refuse any container already using a destination, including stopped containers:
+    # the tool has no authority to choose which one will next become a writer.
+    for role,name in c['volumes'].items():
+        if docker(c, 'ps', '--all', '--filter', 'volume='+name, '--format', '{{.ID}}').stdout.strip():
+            refuse(f'volume {name} is attached to a container; keep the estate stopped and remove its old attachment before loading')
+    receipt_path = directory / 'load-receipt.json'
+    inventory = volume_inventory(c)
+    if receipt_path.exists():
+        receipt = read_json(receipt_path)
+        if receipt.get('snapshot_sha256') == metadata['sha256'] and receipt.get('volumes') == c['volumes'] and receipt.get('manifests') == inventory and receipt.get('source_manifests') == source_manifests and receipt.get('runtime_image') == c['runtime_image'] and receipt.get('project') == c['project']:
+            return {'idempotent': True, 'snapshot_sha256': metadata['sha256'], 'container_verification': receipt.get('container_verification')}
+        refuse('existing load receipt or destination bytes differ; reconcile the occupied state before retrying')
+    if any(items for items in inventory.values()): refuse('a destination volume is occupied without a matching verified receipt; select empty new volumes')
+    with tempfile.TemporaryDirectory(prefix='.load-', dir=directory.parent) as temporary:
+        temp = Path(temporary)
+        for role in VOLUME_ROLES: (temp / role).mkdir()
+        ledger = temp / 'ledger' / 'forge.db'
+        shutil.copyfile(directory / 'forge.db', ledger)
+        migrate = 'import sqlite3; from forge.lifecycle.migrations import apply_at_boot; c=sqlite3.connect("/copy/forge.db", isolation_level=None); apply_at_boot(c); c.execute("PRAGMA wal_checkpoint(TRUNCATE)"); c.close()'
+        try:
+            container_python(c, migrate, mounts=[f'type=bind,src={temp / "ledger"},dst=/copy'])
+        except Refusal:
+            refuse(f'migration of a disposable copy from {directory} failed; keep services stopped and reconcile the source schema before retrying')
+        migrated = ledger_state(ledger)
+        if migrated['schema_version'] != 16: refuse('disposable migration did not reach schema 16; repair the selected runtime before retrying')
+        if sha256(directory / 'forge.db') != metadata['sha256']: refuse('snapshot changed during disposable migration; stop and recover the original snapshot')
+        mark = {'format_version': 1, 'snapshot_sha256': metadata['sha256'], 'snapshot_created_at': metadata['created_at'], 'migrated_sha256': sha256(ledger), 'source_schema_version': metadata['schema_version'], 'loaded_schema_version': 16}
+        atomic_json(temp / 'ledger' / MARK, mark)
+        shutil.copyfile(sources['settings'], temp / 'settings' / 'forge.yaml')
+        shutil.copyfile(sources['relay_progress'], temp / 'relay_progress' / 'relay-progress.json')
+        for role in ('evidence', 'threads'):
+            original = manifest(sources[role])
+            shutil.copytree(sources[role], temp / role, dirs_exist_ok=True)
+            if manifest(temp / role) != original or manifest(sources[role]) != original:
+                refuse(f'{role} source changed while copied; settle its writer and retry')
+        expected = {role: manifest(temp / role) for role in VOLUME_ROLES}
+        if any(expected[role] != source_manifests[role] for role in sources):
+            refuse('a source changed during the copy; settle all source writers and retry')
+        for role in ('settings', 'relay_progress'):
+            if sha256(sources[role]) != source_manifests[role][0]['sha256']:
+                refuse(f'{role} changed during the copy; settle its writer and retry')
+        created = []
+        try:
+            for role,name in c['volumes'].items():
+                # Empty existing volumes may be loaded, but are never deleted on failure.
+                if inventory[role] is None:
+                    compose_key = next(key for key, spec in model['volumes'].items() if spec.get('name') == name)
+                    docker(c, 'volume', 'create', '--label', 'com.docker.compose.project='+c['project'], '--label', 'com.docker.compose.volume='+compose_key, '--label', 'rollout.snapshot='+metadata['sha256'], name)
+                    created.append(name)
+                uid = 10001 if role == 'threads' else (0 if role == 'relay_progress' else 1000)
+                code = 'import pathlib,shutil,os; s=pathlib.Path("/source"); d=pathlib.Path("/destination"); assert not list(d.iterdir()), "occupied"; shutil.copytree(s,d,dirs_exist_ok=True); uid='+str(uid)+'; [(os.chown(p,uid,uid)) for p in [d,*d.rglob("*")]]; [(os.fsync(f.fileno())) for p in d.rglob("*") if p.is_file() for f in [p.open("rb")]]; fd=os.open(d,os.O_DIRECTORY); os.fsync(fd); os.close(fd)'
+                container_python(c, code, mounts=[f'type=bind,src={temp / role},dst=/source,readonly', f'type=volume,src={name},dst=/destination'])
+                if volume_manifest(c, name) != expected[role]: refuse(f'volume {name} differs from its source manifest; keep services stopped and reconcile the copy')
+            receipt = {'format_version': 1, 'project': c['project'], 'snapshot_sha256': metadata['sha256'], 'migrated_sha256': mark['migrated_sha256'], 'runtime_image': c['runtime_image'], 'volumes': c['volumes'], 'manifests': expected, 'source_manifests': source_manifests, 'mark': mark, 'container_verification': None}
+            atomic_json(receipt_path, receipt)
+        except BaseException:
+            for name in reversed(created): docker(c, 'volume', 'rm', name, check=False)
+            raise
+    return {'loaded': True, 'snapshot_sha256': metadata['sha256'], 'migrated_sha256': mark['migrated_sha256'], 'container_verification': 'NOT-YET: run --verify-containers after closed-door bring-up', 'not_copied': ['retained bus', 'Postgres', 'project and seed folders', 'chronicler and liveness files', 'gateway heartbeat']}
+
+def main_guard(function):
+    try:
+        result = function()
+        print(json.dumps(result, sort_keys=True, indent=2)); return 0
+    except Exception as exc:
+        message = str(exc) if isinstance(exc, Refusal) else 'an input or required operation could not be read safely; check the explicit paths and private service diagnostics before retrying'
+        print('Refused: ' + message.rstrip('.') + '.', file=sys.stderr)
+        return 2
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        self.exit(2, 'Refused: required command arguments are missing or invalid; run --help and supply explicit inputs.\n')
+
+def cli(command):
+    parser = Parser(description='Prepare durable rollout state without starting application services.')
+    parser.add_argument('--config', required=True, help='absolute JSON configuration; no implicit machine defaults')
+    parser.add_argument('--snapshot', required=True, help='absolute dated snapshot directory')
+    parser.add_argument('--env-file', help='explicit estate env file; must match inventory')
+    parser.add_argument('--project', help='explicit Compose project; must match inventory')
+    parser.add_argument('--plan', action='store_true', help='read-only preview, creating no files, containers or volumes')
+    if command == 'load': parser.add_argument('--verify-containers', action='store_true', help='read the snapshot mark in all three actual running services')
+    args = parser.parse_args()
+    return main_guard(lambda: snapshot(config(args.config, args.env_file, args.project), args.snapshot, args.plan) if command == 'snapshot' else load_volumes(config(args.config, args.env_file, args.project), args.snapshot, args.plan, args.verify_containers))
