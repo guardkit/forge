@@ -681,6 +681,91 @@ whose durable is `DEFAULT_DURABLE_NAME = "forge-serve"`
 `forge-consumer` would be reading a reader that is not there — which is why a
 reader the bus does not hold is a **refusal** here and never a nought.
 
+## Preparing and operating the rollout tools
+
+The six `rollout-*` commands are host operator tools for this estate. Their
+source revision is separate from the immutable application images they run.
+Keep the reviewed tool revision, exact image IDs, private inputs and receipts
+together. Source acceptance does not authorize a live rollout: complete the
+required throwaway rehearsal and obtain the owner's rollout approval first.
+
+| Command | Responsibility |
+|---|---|
+| `rollout-quiesce` | Close admissions, observe quiet readers and work, stop writers, and resume only after the recorded checks. |
+| `rollout-snapshot` | Back up the explicitly named stopped ledger and record its state and previous coordinator runtime. |
+| `rollout-settings` | Produce separate validated public env, container settings and receipt files, with planning disabled. |
+| `rollout-load-volumes` | Load the five state volumes and verify the actual coordinator, answer service and publisher read the same marked ledger. |
+| `rollout-sandbox` | Replace the named sandbox's legacy runner lifecycle, verify preserved disk state and install the release template and routes. |
+| `rollout-back` | Restore the old authority before resume, or preserve current state and use compatible forward recovery after resume. |
+
+Every command supports `--plan`. A plan creates no helper container or output
+artifact; observations that need execution remain unknown. It is not a passed
+runtime check. Use each command's `--help`: settings takes individual input and
+output paths, while the other commands take a JSON inventory. Snapshot, load,
+quiesce and recovery also take the exact dated snapshot directory. Pass the env
+file and Compose project explicitly and consistently.
+
+Keep original and prepared inventories distinct. They name the same project,
+Docker context, immutable runtime image, old ledger, snapshot root, nine legacy
+units, three old containers and five distinct state volumes. The prepared
+inventory selects the separately rendered settings and env paths. The quiesce
+section names both phases and a private close receipt outside the future
+snapshot; recovery names private reconstruction env files for all three old
+roles. Sandbox inventory additionally names its existing clone, producer profile,
+runner/keeper units, disk witnesses and evidence paths. The original folders and
+values files are inputs, not locations for generated rollout reports.
+
+Use private explicit secret inputs where the command supports them. They add
+names; they must not override public or earlier names. Never commit their values,
+conversation state or raw application responses. A saved-thread source must be
+the directory whose **contents** belong at `/app/.langgraph_api`; verify the
+copied files and retrieve an existing thread through the normal API.
+
+The execution sequence is:
+
+1. With original inputs, run quiesce `--close`, `--settle`, then `--final`.
+   The final phase calls the complete sandbox `--stop-legacy` replacement before
+   stopping the remaining legacy writers; it is not a stop-only shortcut. The
+   retired alarm's timer and service are stopped and masked. No session may
+   submit new work during this window.
+2. Take the snapshot, render separate settings/env outputs, then load the five
+   volumes using the prepared inventory. Bring up the closed estate with planning
+   disabled and producers stopped. Run load `--verify-containers` against the
+   three actual readers, `estate-check --pre-resume` for the intended image, and
+   all required sandbox, memory, retained-state and route checks.
+3. With prepared inputs, quiesce `--resume` revalidates its evidence and writes
+   both durable resume markers **before** enabling planning or producers. It then
+   runs the full `estate-check services`, `factory-hello`, and finally the Compose
+   `gateway-watch` profile. The new watch has no host timer or service.
+
+Prepared-state final verification also requires complete visibility of processes
+holding the current ledger, WAL or shared-memory file. The tool runs its pinned
+helper with the host PID namespace and `SYS_PTRACE`, with no network and the
+ledger mounted read-only. It compares file identities; it does not read process
+commands, environment or descriptor contents, and it never kills a holder.
+Permission errors or incomplete observations refuse the operation. Establish
+that this access is permitted and works in the intended environment before the
+rehearsal; a quiet database or empty Docker volume filter is insufficient.
+
+The two recovery modes preserve different authorities. Before resume,
+`rollout-back --before-resume` requires both markers absent, unchanged recorded
+work, a valid snapshot and a quiescent current estate. It recreates the saved old
+runtimes by immutable image ID, retires the five new volumes and restores the old
+ledger. `rollout-quiesce --reopen` is available only for a verified old authority;
+the retired alarm remains masked. A partial destructive recovery stays stopped
+for explicit reconciliation; do not interpret a receipt alone as proof that
+recovery completed.
+
+Once either marker exists, preserve it. A missing partner, unreadable marker or
+disagreement is a refusal, never permission to restore. With matching markers,
+`rollout-back --after-resume` keeps the current volumes, settings and sandbox
+routes. Without a candidate it leaves the estate stopped and writes a
+reconciliation record. A candidate requires an immutable image ID and explicit
+configuration changing only that image; its schema and actual publication and
+leftover-worker recovery must pass the built-in H6 probe against a throwaway copy
+of the current ledger. The old folder is not a recovery source after resume.
+A failed post-resume check follows this current-state recovery path too.
+
 ## What is deliberately not here yet
 
 - **The model seats**, including the embedding service memory uses. They are
