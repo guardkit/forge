@@ -212,6 +212,7 @@ class Estate:
         need(set(self.c['units'])==r.UNIT_ROLES and set(self.c['old_containers'])=={'coordinator','memory','relay'} and len(set(self.c['units'].values()))==len(r.UNIT_ROLES) and len(set(self.c['old_containers'].values()))==3,'legacy identities are incomplete or repeated; name exactly the distinct recorded units and three containers')
         need(all(re.fullmatch('[a-zA-Z0-9][a-zA-Z0-9_.-]+',name) for name in self.c['volumes'].values()),'state volume name is invalid; use five explicit named volumes')
         self.receipt=private_path(self.q['receipt'])
+        self.sandbox_evidence=private_path(self.receipt.with_name(self.receipt.name+'.rollout-sandbox-command.json'))
         old_root=Path(self.c['source_db']).parent
         need(old_root!=self.receipt and old_root not in self.receipt.parents,'close receipt lies in the old ledger folder; choose external private evidence storage')
         need(self.snapshot!=self.receipt and self.snapshot not in self.receipt.parents,'close receipt lies inside the future snapshot; select a private external receipt path')
@@ -224,6 +225,7 @@ class Estate:
             # by private_path's single-link rule; new outputs cannot be aliases.
             need(p.is_absolute() and '..' not in p.parts,'inventory contains an indirect path; provide absolute direct phase paths')
             need(self.receipt!=p and p not in self.receipt.parents,f'close receipt aliases or lies within input {p}; choose a distinct private output')
+            need(self.sandbox_evidence!=p and p not in self.sandbox_evidence.parents,f'sandbox command evidence aliases or lies within input {p}; choose a distinct private close receipt path')
         old=args.env_file==self.q['original_env_file'];prepared=args.env_file==self.q['prepared_env_file']
         need(old != prepared,'phase env paths are missing or ambiguous; declare distinct original and prepared inputs')
         self.phase='original' if old else 'prepared'
@@ -275,25 +277,31 @@ class Estate:
             event['reason']=self.sanitize(str(exc));raise
         finally:event['finished_at']=now()
     def sandbox_final(self,command):
-        evidence=self.snapshot/'rollout-sandbox-command.json'
         record={'format_version':1,'started_at':now(),'passed':False,'commands':[]}
+        result=None;failure=None
         try:
             result=self.captured(command,'rollout-sandbox',record['commands'],env=self.env)
             record['passed']=True
-            return result
         except Exception:
             event=record['commands'][-1] if record['commands'] else {}
             if type(event.get('exit')) is int:
                 lines=[line[len('Refusing: '):].strip() for line in event.get('stderr','').splitlines()
                        if line.startswith('Refusing: ')]
                 if lines:
-                    raise r.Refusal('rollout-sandbox refused: '+lines[-1][:8192]) from None
-                raise r.Refusal('rollout-sandbox refused without a usable child diagnostic; installation may be incomplete, so inspect its private command evidence before stopping legacy writers') from None
-            raise r.Refusal('rollout-sandbox outcome is unknown and installation may be incomplete; inspect its private command evidence before stopping legacy writers') from None
-        finally:
-            record['finished_at']=now()
-            private_path(evidence)
-            r.atomic_json(evidence,record)
+                    failure=r.Refusal('rollout-sandbox refused: '+lines[-1][:8192])
+                else:
+                    failure=r.Refusal('rollout-sandbox refused without a usable child diagnostic; installation may be incomplete, so inspect its private command evidence before stopping legacy writers')
+            else:
+                failure=r.Refusal('rollout-sandbox outcome is unknown and installation may be incomplete; inspect its private command evidence before stopping legacy writers')
+        record['finished_at']=now()
+        try:
+            private_path(self.sandbox_evidence)
+            r.atomic_json(self.sandbox_evidence,record)
+        except Exception:
+            if failure is not None:raise failure from None
+            raise r.Refusal('rollout-sandbox completed but its private command evidence could not be saved; retain current authority and reconcile the external evidence path before stopping legacy writers') from None
+        if failure is not None:raise failure from None
+        return result
     def recorded_docker(self,*args,**kwargs):
         events=getattr(self,'_diagnostic_events',None)
         if events is None:return r.docker(self.c,*args,**kwargs)
