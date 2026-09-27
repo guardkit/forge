@@ -359,7 +359,7 @@ check_slack() {
     # two fields this watch acts on must have their documented types and the
     # state must be one the producer can emit. Anything else is evidence this
     # watch does not understand, never a healthy Slack session.
-    heartbeat="$(printf '%s' "${body}" | jq -cer -s '
+    if ! heartbeat="$(printf '%s' "${body}" | jq -cer -s '
         if length == 1
            and (.[0] | type == "object")
            and (.[0].state | type == "string")
@@ -370,8 +370,7 @@ check_slack() {
         then .[0]
         else empty
         end
-    ' 2>/dev/null)"
-    if [ -z "${heartbeat}" ]; then
+    ' 2>/dev/null)" || [ -z "${heartbeat}" ]; then
         SLACK_VERDICT="unknown"
         SLACK_SENTENCE="the gateway's heartbeat at ${HEARTBEAT_PATH} is not one complete JSON object with a recognised state and a string time for its last event, so it could not be read."
         return
