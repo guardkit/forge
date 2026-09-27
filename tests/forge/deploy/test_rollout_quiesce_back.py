@@ -344,3 +344,101 @@ def test_actual_h6_result_ingestion_tamper_boundary(estate,tmp_path,monkeypatch,
         with pytest.raises(r.Refusal):e.h6(r.RUNTIME,directory)
         diagnostic=r.read_json(directory/'h6-diagnostic.json')
         assert diagnostic['status']=='refused' and diagnostic['cleanup']['container_removed']
+
+
+def public_marker_case(estate,monkeypatch,phase,shape,stage='settled'):
+    """Actual CLI/constructor/closed/classifier, with external operations captured."""
+    if phase=='prepared':
+        estate.c['env_file']=estate.q['prepared_env_file']
+        estate.c['sources']['settings']=estate.q['prepared_settings']
+        r.atomic_json(estate.config_path,estate.c)
+    estate.doc={'format_version':1,'binding':estate.binding,'stage':stage,'observations':[]};estate.save()
+    host=estate.snapshot/'resumed.json';ledger=estate.receipt.parent/'current-ledger-marker'
+    marker={'format_version':1,'project':estate.c['project'],'snapshot':str(estate.snapshot),'snapshot_sha256':'a'*64,'release_tag':estate.q['release_tag'],'image_id':r.RUNTIME,'actor':'entry-test','at':q.now(),'work_state':{},'close_receipt_sha256':r.sha256(estate.receipt)}
+    r.atomic_json(estate.snapshot/'metadata.json',{'sha256':'a'*64})
+    if shape!='absent':
+        r.atomic_json(host,marker);r.atomic_json(ledger,marker)
+        if shape=='host-null':r.atomic_json(host,None)
+        elif shape=='ledger-null':r.atomic_json(ledger,None)
+        elif shape=='malformed':host.write_text('{')
+        elif shape=='host-half':ledger.unlink()
+        elif shape=='ledger-half':host.unlink()
+        elif shape.endswith('hardlink'):
+            selected=host if shape.startswith('host') else ledger
+            os.link(selected,selected.with_name(selected.name+'-alias'))
+        elif shape.endswith('symlink'):
+            selected=host if shape.startswith('host') else ledger
+            target=selected.with_name(selected.name+'-target');selected.rename(target);selected.symlink_to(target)
+    events=[];reads=[]
+    def boundary(name):
+        def stop(*args,**kwargs):events.append(name);raise r.Refusal('captured test boundary '+name)
+        return stop
+    def volume(self,role,code,args=(),**kwargs):
+        assert role=='ledger' and not kwargs.get('write',False)
+        return json.dumps(q.marker_file(ledger))
+    monkeypatch.setattr(q.Estate,'volume_exists',lambda self:shape!='absent')
+    monkeypatch.setattr(q.Estate,'volume',volume)
+    monkeypatch.setattr(q.Estate,'unit_stopped',lambda self,name:reads.append('unit-stopped') or {})
+    monkeypatch.setattr(q.Estate,'unit',lambda self,name:reads.append('unit') or {'UnitFileState':'masked'})
+    def watch(self,**kwargs):
+        if kwargs.get('stop'):boundary('watch-stop')()
+        reads.append('watch-observe')
+    monkeypatch.setattr(q.Estate,'watch_closed',watch)
+    monkeypatch.setattr(q.Estate,'producers_stopped',lambda self:reads.append('producer-observe'))
+    monkeypatch.setattr(q.Estate,'stop_current',boundary('current-writer-stop'))
+    monkeypatch.setattr(q.Estate,'systemctl',boundary('legacy-unit-stop'))
+    monkeypatch.setattr(q.Estate,'monitor',boundary('reader-observation'))
+    monkeypatch.setattr(q.Estate,'prepared_settings',boundary('prepared-settings'))
+    monkeypatch.setattr(q.Estate,'current_holders',lambda *a,**k:pytest.fail('forbidden host census must not execute'))
+    monkeypatch.setattr(r,'run',boundary('sandbox-stop'))
+    monkeypatch.setattr(r,'inspect',boundary('old-container-access'))
+    argv=['--config',str(estate.config_path),'--env-file',estate.c['env_file'],'--project',estate.c['project'],'--snapshot',str(estate.snapshot)]
+    return argv,events,reads
+
+
+@pytest.mark.parametrize('mode',['close','settle','final','resume','reopen'])
+@pytest.mark.parametrize('phase',['original','prepared'])
+@pytest.mark.parametrize('shape',['host-null','ledger-null','malformed','host-half','ledger-half','host-hardlink','ledger-hardlink','host-symlink','ledger-symlink'])
+def test_public_mutation_entries_refuse_unsafe_marker_before_external_access(estate,monkeypatch,mode,phase,shape,capsys):
+    argv,events,reads=public_marker_case(estate,monkeypatch,phase,shape)
+    before=estate.receipt.read_bytes()
+    assert q.main(argv+['--'+mode])==2
+    assert events==[] and reads==[]
+    assert estate.receipt.read_bytes()==before
+    assert 'Refused:' in capsys.readouterr().err
+
+
+@pytest.mark.parametrize('mode,phase,shape,next_boundary',[
+    ('final','original','absent','sandbox-stop'),
+    ('final','prepared','absent','current-writer-stop'),
+    ('final','prepared','valid','current-writer-stop'),
+    ('settle','original','absent','reader-observation'),
+    ('settle','prepared','absent','reader-observation'),
+    ('settle','prepared','valid','reader-observation'),
+    ('close','original','absent','legacy-unit-stop'),
+    ('close','prepared','absent','watch-stop'),
+    ('close','prepared','valid','watch-stop'),
+    ('resume','prepared','absent','prepared-settings'),
+    ('reopen','original','absent','old-container-access'),
+])
+def test_public_marker_authority_positive_reaches_intended_boundary(estate,monkeypatch,mode,phase,shape,next_boundary):
+    argv,events,reads=public_marker_case(estate,monkeypatch,phase,shape)
+    assert q.main(argv+['--'+mode])==2  # Deliberately stopped at the named external boundary.
+    assert events==[next_boundary]
+
+
+@pytest.mark.parametrize('mode',['close','settle','final','reopen'])
+@pytest.mark.parametrize('stage',['closed','settled','final','resumed'])
+def test_public_legacy_entries_refuse_actual_resumed_pair_despite_saved_stage(estate,monkeypatch,mode,stage):
+    argv,events,reads=public_marker_case(estate,monkeypatch,'original','valid',stage)
+    assert q.main(argv+['--'+mode])==2
+    assert events==[] and reads==[]
+
+
+@pytest.mark.parametrize('stage',['closed','settled','final','resumed'])
+def test_public_resume_crash_after_pair_is_idempotent_without_old_access(estate,monkeypatch,stage,capsys):
+    argv,events,reads=public_marker_case(estate,monkeypatch,'prepared','valid',stage)
+    assert q.main(argv+['--resume'])==0
+    result=json.loads(capsys.readouterr().out)
+    assert result['resumed'] is True and result['idempotent'] is True
+    assert events==[] and reads==[]
