@@ -406,6 +406,10 @@ print(json.dumps(state))
         self.doc['stage']='closed';self.doc['closed_phase']=self.phase;self.save()
         return {'closed':True,'notice':'No session may run forge queue until this rollout explicitly resumes.'}
     def closed(self):
+        # Each invocation must establish current authority before reading legacy
+        # units or stopping writers; a saved closure stage cannot establish it.
+        marker=self.markers()
+        if marker:need(self.phase=='prepared','resumed estate requires prepared inputs; do not access or reopen old state')
         self.record();need(self.doc.get('stage') in ('closed','settled','final','resumed'),'admissions closure is not recorded; run --close first')
         if self.phase=='prepared':
             self.watch_closed();self.producers_stopped()
