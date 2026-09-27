@@ -72,7 +72,7 @@ import sys
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Protocol, cast
 
 import click
 
@@ -142,6 +142,30 @@ _MODE_FLAG_TO_BUILD_MODE: dict[str, BuildMode] = {
     "b": BuildMode.MODE_B,
     "c": BuildMode.MODE_C,
 }
+
+# Click normally validates these paths while parsing, before ``queue_cmd`` can
+# apply strict BUILD admission. Keep the original Path definitions here and
+# run them explicitly after the sandbox decision so missing checkouts cannot
+# stand in for the D4 policy refusal. Passing Click's real option object back
+# into ``convert`` preserves its standard error text and parameter hints for
+# admitted sandbox and legacy requests.
+_REPO_PATH_TYPE = click.Path(exists=True, file_okay=True, dir_okay=True)
+_FEATURE_YAML_PATH_TYPE = click.Path(exists=True, dir_okay=False)
+
+
+def _validate_deferred_path(
+    value: str,
+    *,
+    parameter_name: str,
+    path_type: click.Path,
+) -> str:
+    ctx = click.get_current_context()
+    parameter = next(
+        parameter
+        for parameter in ctx.command.params
+        if parameter.name == parameter_name
+    )
+    return cast(str, path_type.convert(value, parameter, ctx))
 
 #: Help text for ``--mode``. Speaks the phrase-book's plain names first —
 #: an operator choosing a mode reads what the mode *does*, and what it
@@ -629,7 +653,8 @@ def _admit_fix_journey(
 @click.option(
     "--repo",
     required=True,
-    type=click.Path(exists=True, file_okay=True, dir_okay=True),
+    type=str,
+    metavar="PATH",
     help="Filesystem path to the local checkout. Must match repo_allowlist.",
 )
 @click.option(
@@ -648,7 +673,8 @@ def _admit_fix_journey(
     "--feature-yaml",
     "feature_yaml",
     required=True,
-    type=click.Path(exists=True, dir_okay=False),
+    type=str,
+    metavar="PATH",
     help="Path to the feature YAML spec consumed by GuardKit.",
 )
 @click.option(
@@ -760,6 +786,20 @@ def queue_cmd(
             err=True,
         )
         sys.exit(EXIT_PATH_REFUSED)
+
+    # Preserve the original Click Path validation for requests the BUILD
+    # policy admits. This deliberately follows strict admission: the estate's
+    # absent unsandboxed checkouts must still report ``sandbox-required``.
+    repo = _validate_deferred_path(
+        repo,
+        parameter_name="repo",
+        path_type=_REPO_PATH_TYPE,
+    )
+    feature_yaml = _validate_deferred_path(
+        feature_yaml,
+        parameter_name="feature_yaml",
+        path_type=_FEATURE_YAML_PATH_TYPE,
+    )
 
     # 0a. Refuse any mode nothing in production will drive — BEFORE every
     #     side effect, including the budget echo below. A queued row in an
