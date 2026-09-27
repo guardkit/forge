@@ -167,6 +167,21 @@ def volume_argument(mount):
     return mount['Name']+':'+mount['Destination']+':'+mount['Mode']
 
 
+def reconstruction_networks(record):
+    """Return only a saved network shape Docker can recreate exactly."""
+    mode=record.get('network_mode');networks=record.get('networks')
+    q.need(isinstance(mode,str) and mode and isinstance(networks,dict) and networks,'previous network identity is malformed; reconcile the saved runtime')
+    q.need(mode!='container' and not mode.startswith('container:'),'container-shared networking cannot be safely reconstructed; reconcile the saved runtime')
+    if mode=='host':
+        options=networks.get('host');fields={'Aliases','Links','IPAMConfig','DriverOpts'}
+        q.need(set(networks)=={'host'} and isinstance(options,dict) and fields<=set(options),'saved host network identity is incomplete or mixed with named networks; reconcile the saved runtime')
+        q.need(all(options[field] is None for field in fields),'saved host network carries aliases, links, static IPAM or driver options; reconcile its exact network identity')
+        q.need(isinstance(record.get('port_bindings'),dict) and not record['port_bindings'],'saved host network carries explicit port bindings; reconcile its exact listener identity')
+        return ['host']
+    q.need('host' not in networks and mode in networks and all(isinstance(name,str) and name and isinstance(options,dict) for name,options in networks.items()),'previous primary network cannot be safely reconstructed; reconcile the saved runtime')
+    return [mode,*[name for name in networks if name!=mode]]
+
+
 class Recovery(q.Estate):
     def __init__(self,args):super().__init__(args);self.back=self.c.get('back',{})
     def allowed_images(self,service,rendered):
@@ -191,9 +206,10 @@ class Recovery(q.Estate):
         identity=record['service_identity'];argv=q.effective_argv(identity)
         q.need(argv and (identity.get('entrypoint') or [argv[0]])[0],'previous process has no executable entrypoint or command; reconcile the saved runtime')
         q.need(all(isinstance(identity.get(k,''),str) for k in ('name','hostname','user','working_dir')) and identity.get('name','').startswith('/'),'previous service identity cannot be represented exactly; reconcile the saved runtime')
-        q.need(record['network_mode'] not in ('host','container') and record['networks'] and record['network_mode'] in record['networks'],'previous primary network cannot be safely reconstructed; reconcile the saved runtime')
-        for name,network in record['networks'].items():
-            r.docker(self.c,'network','inspect',name)
+        networks=reconstruction_networks(record)
+        for name in networks:
+            network=record['networks'][name]
+            if name!='host':r.docker(self.c,'network','inspect',name)
             q.need(not network.get('Links') and not network.get('IPAMConfig') and not network.get('DriverOpts'),'saved network requires unsupported static options; keep both authorities stopped and reconcile exact reconstruction')
         for bindings in (record['port_bindings'] or {}).values():
             q.need(all(x.get('HostPort') and x['HostPort']!='0' for x in bindings or []),'saved runtime uses an unspecified allocated port; reconcile its exact listener before recovery')
@@ -205,7 +221,7 @@ class Recovery(q.Estate):
             q.need(isinstance(found,list) and len(found)==1 and found[0].get('Name')==m['Name'] and found[0].get('Driver')==m['Driver'] and found[0].get('Mountpoint')==m['Source'],'saved named volume name, driver or source no longer matches Docker; keep recovery stopped and reconcile it before removing any container')
     def create_old(self,role,record,journal):
         self.validate_runtime(record);values=self.old_values(role,record);identity=record['service_identity'];name=identity['name'].lstrip('/')
-        networks=[record['network_mode'],*[x for x in record['networks'] if x!=record['network_mode']]];created=journal['created'].get(role)
+        networks=reconstruction_networks(record);created=journal['created'].get(role)
         if created is None:
             old=r.docker(self.c,'ps','--all','--filter','name=^/'+name+'$','--format','{{.ID}}').stdout.split()
             if old:
