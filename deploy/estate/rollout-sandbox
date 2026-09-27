@@ -11,7 +11,7 @@ FORGE_TARGET_OWNER_URL, FORGE_SANDBOX_SIDECAR_URL, FORGE_SANDBOX_RUNNER_URL.
 The producer profile retains all choices except gateway publish addresses,
 explicit allow-rule replacements, receipts_path and cwd. sandbox.allow_replacements
 maps old host:port entries to env variable NAMES holding replacement host:port.
-No credentials, arbitrary shell code, environment overrides or broker clients.
+No shell sourcing, ambient route overrides or broker clients.
 """
 from __future__ import annotations
 
@@ -78,21 +78,47 @@ def private_write(path, data, mode=0o600):
             os.unlink(temp)
 
 
-def load_env(path):
-    result = {}
-    for line in Path(path).read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith('#'):
-            continue
-        key, sep, value = line.partition('=')
-        require(sep and re.fullmatch(r'[A-Z_][A-Z0-9_]*', key) and key not in result,
-                f'env file {path} contains a malformed or duplicate name; fix that line')
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-            value = value[1:-1]
-        require(not any(token in value for token in ('$', '`', '\x00', '\n', '\r')),
-                f'env file {path} contains executable or unresolved text; render literal values first')
-        result[key] = value
-    return result
+def load_env(path, secret_paths=()):
+    """Expand only explicit ${NAME} references; never consult a shell/env."""
+    raw = {}
+    for source in (path, *secret_paths):
+        source = Path(source)
+        if source != Path(path):
+            require(source.is_file() and not source.is_symlink() and source.stat().st_mode & 0o077 == 0,
+                    f'secret env file {source} is not private; use a regular mode-0600 file')
+        for line in source.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            key, sep, value = line.partition('=')
+            require(sep and re.fullmatch(r'[A-Z_][A-Z0-9_]*', key) and key not in raw,
+                    f'env file {source} contains a malformed or duplicate name; fix that line')
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                value = value[1:-1]
+            require(not any(token in value for token in ('$(', '`', '\x00', '\n', '\r')),
+                    f'env file {source} contains executable text; provide literal values or named references')
+            raw[key] = value
+    resolved = {}
+    visiting = set()
+    pattern = re.compile(r'\$\{([A-Z_][A-Z0-9_]*)\}')
+
+    def resolve(name):
+        require(name in raw, f'env name {name} is unset in the explicit files; supply its value there')
+        require(name not in visiting, f'env name {name} has a cyclic reference; fix the explicit files')
+        if name in resolved:
+            return resolved[name]
+        require(len(visiting) < 64, 'env reference nesting exceeds 64 names; simplify the explicit files')
+        visiting.add(name)
+        value = raw[name]
+        require('${' not in pattern.sub('', value), f'env name {name} contains an unsupported reference; use only ${{NAME}}')
+        value = pattern.sub(lambda match: resolve(match[1]), value)
+        visiting.remove(name)
+        resolved[name] = value
+        return value
+
+    for name in raw:
+        resolve(name)
+    return resolved
 
 
 # Read-only stdlib payload; no /proc/*/environ and no signal or Docker mutation.
@@ -191,14 +217,14 @@ class Rollout:
         require(c.get('project') == args.project, 'project differs from the private inventory; use its explicit project')
         require(str(Path(c['env_file']).resolve()) == str(Path(args.env_file).resolve()),
                 'env file differs from the private inventory; use its explicit env file')
-        self.values = load_env(args.env_file)
+        self.values = load_env(args.env_file, args.secret_env_file)
         self.s = c['sandbox']
         s = self.s
         require(re.fullmatch(r'[a-z0-9][a-z0-9-]{1,62}', s['name']), 'sandbox name is invalid; name one sandbox explicitly')
         require(re.fullmatch(r'sha256:[0-9a-f]{64}', c['runtime_image']), 'runtime image must be immutable; supply its sha256 image ID')
         require(self.values.get('FORGE_IMAGE') == c['runtime_image'], 'FORGE_IMAGE differs from runtime_image; use the accepted immutable image')
         require(isinstance(c['docker_context'], str) and c['docker_context'], 'Docker context is missing; name it in the private inventory')
-        for name in ('clone_path', 'receipts_path', 'script_path', 'profile_path', 'profile_source', 'systemd_user_dir', 'evidence_dir'):
+        for name in ('clone_path', 'receipts_path', 'script_path', 'profile_path', 'profile_source', 'systemd_user_dir', 'evidence_dir', 'bootstrap_env_file'):
             value = s[name]
             require(isinstance(value, str) and PurePosixPath(value).is_absolute() and '..' not in PurePosixPath(value).parts,
                     f'sandbox.{name} is not an absolute path; name its exact location')
@@ -231,7 +257,7 @@ class Rollout:
                 'gateway address is loopback or unspecified; name the sandbox boundary address')
         for key in ('FORGE_TARGET_OWNER_URL','FORGE_SANDBOX_SIDECAR_URL','FORGE_SANDBOX_RUNNER_URL'):
             u = urlsplit(self.values[key])
-            require(u.scheme in ('http','https') and u.hostname == gateway and u.port and not u.username and not u.password and u.path in ('','/') and not u.query and not u.fragment,
+            require(u.scheme in ('http','https') and u.hostname == gateway and u.port and not u.username and not u.password and u.path in (('','/','/recorded') if key == 'FORGE_TARGET_OWNER_URL' else ('','/')) and not u.query and not u.fragment,
                     f'{key} does not use the gateway with an explicit port; fix the env route')
         owner = urlsplit(self.values['FORGE_TARGET_OWNER_URL'])
         self.answer = f'{gateway}:{owner.port}'
@@ -252,9 +278,18 @@ class Rollout:
             if key in os.environ:
                 self.env[key] = os.environ[key]
         self.env['DOCKER_CONTEXT'] = c['docker_context']
+        self.bootstrap_env = Path(s['bootstrap_env_file'])
+        require(self.values.get('SANDBOX_PROJECT_ENV_FILE') == str(self.bootstrap_env), 'SANDBOX_PROJECT_ENV_FILE does not name sandbox.bootstrap_env_file; bind the existing Compose runner to that explicit private output')
+        require(self.values.get('SANDBOX_NAME') == s['name'] and self.values.get('SANDBOX_BOOTSTRAP') == s['script_path'], 'normal Compose runner sandbox/bootstrap differs from this inventory; fix its explicit env inputs')
+        self.forwarded_names = self.values.get('SANDBOX_ENV_NAMES','').replace(',',' ').split()
+        mandatory = {'FORGE_IMAGE','FORGE_IMAGE_IDENTITY','FORGE_RELEASE_VERSION','FORGE_RELEASE_MANIFEST_SHA256','FORGE_TARGET_OWNER_URL',*MEMORY_NAMES}
+        require(set(self.forwarded_names) >= mandatory and all(re.fullmatch(r'[A-Z_][A-Z0-9_]*',x) for x in self.forwarded_names), 'SANDBOX_ENV_NAMES lacks required image, answer or memory names; fix the normal runner declaration')
+        if self.values['FLEET_MEMORY_ENABLED'] == 'true':
+            require(all(self.values.get(name) for name in MEMORY_NAMES), 'enabled memory lacks explicit private values; supply all seven names through the named files')
         self.evidence = Path(s['evidence_dir'])
         forbidden = [ROOT.resolve(),Path(s['profile_source']).resolve().parent]
         forbidden += [Path(x).resolve() for x in c['forbidden_roots']]
+        require(not any(self.bootstrap_env.resolve().is_relative_to(root) for root in forbidden) and not self.bootstrap_env.resolve().is_relative_to(self.evidence.resolve()) and self.bootstrap_env.resolve() not in {Path(args.env_file).resolve(),Path(args.config).resolve(),*[Path(x).resolve() for x in args.secret_env_file]}, 'bootstrap_env_file overlaps source, evidence or input files; choose a separate private operational path')
         require(not any(self.evidence.resolve().is_relative_to(root) for root in forbidden),
                 'evidence_dir is inside a source checkout; choose a private external directory')
         require(not self.evidence.is_symlink() and (not self.evidence.exists() or self.evidence.stat().st_mode & 0o077 == 0),
@@ -366,6 +401,11 @@ class Rollout:
                 out = self.inside('sha256sum',path).stdout.split()
                 require(out and out[0] == digest(data), f'installed file differs at {path}; reconcile without re-running legacy shutdown')
             require(Path(self.s['profile_source']).read_bytes() == profile['text'].encode(), 'producer profile differs from the installed profile; reconcile its routes')
+            settings = previous['bootstrap_image_settings']
+            expected = {name:self.values[name] for name in self.forwarded_names if name in self.values}
+            expected.update(settings)
+            encoded = ''.join(name+'='+json.dumps(value.replace('$','$$'),ensure_ascii=False)+'\n' for name,value in sorted(expected.items()))
+            require(self.bootstrap_env.read_bytes() == encoded.encode(), 'normal runner env file differs from explicit inputs; reconcile it before starting the sandbox service')
             print('Sandbox replacement already matches the current template and profile; legacy shutdown was not repeated.')
             return
         before = self.disk()
@@ -423,6 +463,13 @@ class Rollout:
         self.replacement_started = True
         self.inside('python3','-c',INSTALL,input=json.dumps(items))
         private_write(Path(self.s['profile_source']),profile['text'].encode(),0o644)
+        # Existing Compose runner consumes this exact explicit env_file. Its
+        # normal run.sh forwards only SANDBOX_ENV_NAMES, unchanged by this tool.
+        bootstrap = {name:self.values[name] for name in self.forwarded_names if name in self.values}
+        bootstrap.update(image_settings)
+        encoded = ''.join(name+'='+json.dumps(value.replace('$','$$'),ensure_ascii=False)+'\n' for name,value in sorted(bootstrap.items()))
+        private_write(self.bootstrap_env,encoded.encode())
+        require(self.bootstrap_env.read_bytes() == encoded.encode(), 'normal runner env file readback differs; reconcile the private operational output')
         for path in self.s['legacy_dropins']:
             Path(path).unlink(missing_ok=True)
         self.dropin.unlink()
@@ -438,7 +485,7 @@ class Rollout:
             self.systemctl('daemon-reload',check=False)
             raise
         self.save('commands.json',self.events)
-        self.save('sandbox-installed.json',{'format_version':1,'project':self.args.project,'sandbox':self.s['name'],'image':self.config['runtime_image'],'template_sha256':digest(self.template),'profile_sha256':digest(profile['text'].encode()),'answer_rule':self.answer,'disk_before':before,'disk_after':after,'bootstrap_image_settings':image_settings,'remote_fetch_through_normal_entry':'NOT-TESTED','memory_forwarded_names':list(MEMORY_NAMES),'actual_memory_read_write':'NOT-TESTED'})
+        self.save('sandbox-installed.json',{'format_version':1,'project':self.args.project,'sandbox':self.s['name'],'image':self.config['runtime_image'],'template_sha256':digest(self.template),'profile_sha256':digest(profile['text'].encode()),'answer_rule':self.answer,'disk_before':before,'disk_after':after,'bootstrap_image_settings':image_settings,'bootstrap_env_file':str(self.bootstrap_env),'bootstrap_env_names':sorted(bootstrap),'remote_fetch_through_normal_entry':'NOT-TESTED','memory_forwarded_names':list(MEMORY_NAMES),'actual_memory_read_write':'NOT-TESTED'})
         self.complete = True
         print('Current template and producer profile installed and read back; units are unmasked but stopped; actual memory read/write and normal lifecycle checks remain required.')
 
@@ -448,6 +495,7 @@ def main(argv=None):
     parser.add_argument('--config',required=True)
     parser.add_argument('--env-file',required=True)
     parser.add_argument('--project',required=True)
+    parser.add_argument('--secret-env-file',action='append',default=[],help='private literal env input, repeatable; cannot override public names')
     parser.add_argument('--stop-legacy',action='store_true',help='perform the one-time legacy stop, verify, and replacement')
     parser.add_argument('--plan',action='store_true')
     args = parser.parse_args(argv)
