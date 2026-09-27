@@ -59,6 +59,22 @@ def effective_argv(identity):
     need(isinstance(command,list) and all(isinstance(x,str) for x in command),'old command is not an explicit string argument list; reconcile its recorded runtime')
     return entry+command
 
+def stable_mount(mount):
+    """Canonicalize only Docker's two spellings of a plain bind ro/rw mode."""
+    result=dict(mount)
+    if result.get('Type')!='bind':return result
+    allowed={'Type','Source','Destination','Mode','RW','Propagation'}
+    required={'Type','Source','Destination','RW','Propagation'}
+    need(required<=set(result)<=allowed,'saved bind mount carries unsupported options; reconcile its exact semantics before recovery')
+    need(type(result['RW']) is bool and all(isinstance(result[k],str) and result[k] for k in ('Source','Destination')),'saved bind mount identity is incomplete; reconcile its exact semantics before recovery')
+    need(not any(x in result[k] for k in ('Source','Destination') for x in (',','\n','\r')),'saved bind mount path cannot be represented safely by Docker --mount; reconcile it before recovery')
+    expected='rw' if result['RW'] else 'ro';mode=result.get('Mode','')
+    need(mode in ('',expected),'saved bind mount mode contains unsupported or contradictory options; reconcile its exact semantics before recovery')
+    need(result['Propagation'] in ('','private','rprivate','shared','rshared','slave','rslave'),'saved bind propagation cannot be represented by Docker --mount; reconcile it before recovery')
+    result['Mode']=expected
+    return result
+
+
 def stable_runtime(item):
     # Runtime endpoint IDs and assigned IPs disappear on stop. Only declarative
     # network identity/aliases/IPAM options participate in the reconstruction seal.
@@ -70,7 +86,8 @@ def stable_runtime(item):
     networks={k:{f:v.get(f) for f in ('Aliases','Links','IPAMConfig','DriverOpts')} for k,v in item['networks'].items()}
     for network in networks.values():
         network['Aliases']=sorted(a for a in network['Aliases'] or [] if a not in (item['service_identity']['container_id'],item['service_identity']['container_id'][:12]))
-    return {k:item[k] for k in ('image_id','repo_tags','mounts','port_bindings','restart_policy','network_mode','env_names')} | {'service_identity':identity,'networks':networks}
+    stable={k:item[k] for k in ('image_id','repo_tags','port_bindings','restart_policy','network_mode','env_names')}
+    return stable | {'mounts':[stable_mount(m) for m in item['mounts']],'service_identity':identity,'networks':networks}
 
 def work_problems(state):
     result=[];work=state['work_state']
