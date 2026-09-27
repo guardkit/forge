@@ -505,7 +505,7 @@ check_host() {
 # values in force rather than trusting the file.
 # ---------------------------------------------------------------------------
 check_the_bus_mode_and_the_files_agree() {
-    local mode profiles files trouble="" said
+    local mode profiles files trouble="" said asked
     mode="$(get BUS_MODE)"
     profiles="$(get COMPOSE_PROFILES)"
     files="$(get COMPOSE_FILE)"
@@ -548,7 +548,8 @@ check_the_bus_mode_and_the_files_agree() {
     local same_bus_trouble
     same_bus_trouble="$(the_same_bus_or_trouble)"
     [ -z "${same_bus_trouble}" ] || trouble="${trouble}${same_bus_trouble}"
-    case "$(the_buss_monitoring_address)" in
+    asked="$(the_buss_monitoring_address)"
+    case "${asked}" in
         *@*) trouble="${trouble} BUS_MONITORING_ADDRESS carries a credential, and that route takes none;" ;;
     esac
 
@@ -1228,7 +1229,7 @@ check_bus_storage() {
             fail 8b "the bus is missing storage the bus repository's definitions name: ${out#MISSING }. The coordinator needs its agent-registry bucket and its PIPELINE stream to register at all, which is why the estate provisions the bus before the coordinator starts."
             ;;
         *)
-            fail 8b "the bus could not be asked what it holds: ${out}"
+            unchecked 8b "the bus could not be asked what it holds: ${out}"
             ;;
     esac
 }
@@ -1311,11 +1312,11 @@ the_buss_network() {
 #     are read with 'systemctl show', which only reads;
 #   * nothing waiting and nothing unconfirmed on the bus's two durable readers.
 #     Read from the bus's own monitoring route, which takes no credential. If
-#     that route cannot be read this item FAILS: "could not be read" is not
+#     that route cannot be read this item is UNKNOWN: "could not be read" is not
 #     "nought", and the whole point of the phase is that nothing is in flight.
 # ---------------------------------------------------------------------------
 check_the_producers_are_stopped() {
-    local coordinator="$1" trouble="" said="" door gateway
+    local coordinator="$1" trouble="" unknown="" said="" door gateway
     door="$(container_of front-door)"
     gateway="$(container_of bus-gateway)"
     if [ -n "${door}" ]; then
@@ -1337,7 +1338,7 @@ check_the_producers_are_stopped() {
     if [ -z "${units}" ]; then
         said="${said} the env file names no legacy producer units, so none were looked for;"
     elif ! command -v systemctl >/dev/null 2>&1; then
-        said="${said} this machine has no systemctl, so the legacy units were not looked for;"
+        unknown="${unknown} this machine has no systemctl, so the named legacy units could not be checked;"
     else
         # BOTH MANAGERS ARE ASKED, AND ONLY A READ ANSWER COUNTS (the E1/E2
         # review of 26 September 2026: this asked the user manager alone and
@@ -1350,12 +1351,12 @@ check_the_producers_are_stopped() {
         # as not loaded (LoadState not-found) — a positive answer, not a
         # missing one.
         for unit in ${units}; do
-            local verdicts="" unknown="" mgr load
+            local verdicts="" manager_unknown="" mgr load
             for mgr in "--user" "--system"; do
                 local out rc
                 out="$(systemctl ${mgr} show -p LoadState -p ActiveState --value "${unit}" 2>/dev/null)"; rc=$?
                 if [ "${rc}" -ne 0 ] || [ -z "${out}" ]; then
-                    unknown="${unknown} ${mgr#--}-manager:unreachable-or-silent"
+                    manager_unknown="${manager_unknown} ${mgr#--}-manager:unreachable-or-silent"
                     continue
                 fi
                 load="$(printf '%s\n' "${out}" | sed -n 1p)"
@@ -1366,8 +1367,8 @@ check_the_producers_are_stopped() {
                     *)                                 trouble="${trouble} the legacy unit ${unit} is ${state} in the ${mgr#--} manager;" ;;
                 esac
             done
-            if [ -n "${unknown}" ]; then
-                trouble="${trouble} the legacy unit ${unit} could not be read (${unknown# }) — could not be read is not stopped, and work may still be running;"
+            if [ -n "${manager_unknown}" ]; then
+                unknown="${unknown} the legacy unit ${unit} could not be read (${manager_unknown# }) — could not be read is not stopped, and work may still be running;"
             elif [ -n "${verdicts}" ]; then
                 said="${said} ${unit}:${verdicts# };"
             fi
@@ -1388,9 +1389,9 @@ check_the_producers_are_stopped() {
     image="$(get NATS_PROVISION_IMAGE)"
     network="$(the_buss_network)"
     if [ -z "${stream}" ] || [ -z "${consumers}" ]; then
-        trouble="${trouble} the env file does not say which stream and which durable readers to read the waiting counts from (ROLLOUT_BUS_STREAM, ROLLOUT_BUS_CONSUMERS), so nothing was read and nothing may be assumed;"
+        unknown="${unknown} the env file does not say which stream and which durable readers to read the waiting counts from (ROLLOUT_BUS_STREAM, ROLLOUT_BUS_CONSUMERS), so nothing was read and nothing may be assumed;"
     elif [ -z "${image}" ] || [ -z "${network}" ]; then
-        trouble="${trouble} the bus could not be asked for its waiting counts (no provisioning image named, or the bus's network could not be identified), and an unknown is not a nought;"
+        unknown="${unknown} the bus could not be asked for its waiting counts (no provisioning image named, or the bus's network could not be identified), and an unknown is not a nought;"
     else
         counts="$(docker run --rm --network "${network}" \
                     -e "BUS=$(the_buss_monitoring_address)" \
@@ -1434,12 +1435,14 @@ check_the_producers_are_stopped() {
         case "${counts}" in
             QUIET*)     said="${said} nothing waiting and nothing unconfirmed on ${consumers} (stream ${stream}, ${counts#QUIET });" ;;
             WAITING*)   trouble="${trouble} the bus still holds work for:${counts#WAITING};" ;;
-            *)          trouble="${trouble} the bus's waiting counts could not be read (${counts}), and an unknown is not a nought;" ;;
+            *)          unknown="${unknown} the bus's waiting counts could not be read (${counts}), and an unknown is not a nought;" ;;
         esac
     fi
 
     if [ -n "${trouble}" ]; then
-        fail 10 "the door is not shut:${trouble} The closed-door check is for a phase where nothing can bring work in, so a running producer or unread waiting counts refuse it, and no record of this phase is written."
+        fail 10 "the door is not shut:${trouble}${unknown:+ These facts also could not be checked:${unknown}} The closed-door check is for a phase where nothing can bring work in, so a running producer or unread waiting counts refuse it, and no record of this phase is written."
+    elif [ -n "${unknown}" ]; then
+        unchecked 10 "whether the door is shut could not be established:${unknown} The closed-door check refuses because an unknown is not a stopped producer or a nought waiting count."
     else
         ok 10 "the two things that can bring work in are stopped and the bus is quiet —${said} so everything below was asked of an estate nothing can arrive at."
     fi
@@ -1554,6 +1557,23 @@ check_pre_resume() {
         exit 2
     fi
     receipt="${state_dir}/pre-resume.json"
+    mkdir -p "${state_dir}" || {
+        printf 'estate-check: could not make %s, and the closed-door phase has to be written down.\n' "${state_dir}" >&2
+        exit 2
+    }
+    # A new run supersedes the old verdict immediately. When the directory
+    # cannot rename the old receipt, invalidating the writable file in place is
+    # still fail-closed: interruption can leave invalid JSON, never an old pass.
+    if [ -e "${receipt}" ]; then
+        if mv -f "${receipt}" "${receipt}.invalidated" 2>/dev/null; then
+            printf 'The earlier record has been INVALIDATED before this new check (moved to %s.invalidated), so an interrupted or failed recheck cannot leave an older pass usable.\n' "${receipt}"
+        elif printf '{"verdict":"invalidated-before-recheck"}\n' > "${receipt}" 2>/dev/null; then
+            printf 'The earlier record has been INVALIDATED in place before this new check because its directory could not replace it; it is no longer a pass.\n'
+        else
+            printf 'estate-check: could not invalidate the earlier record at %s, so this check cannot start safely. Make the rollout state writable and run it again.\n' "${receipt}" >&2
+            exit 2
+        fi
+    fi
 
     run_the_services_items closed-door
 
@@ -1572,10 +1592,6 @@ check_pre_resume() {
 
     printf '\n'
     if [ "${FAILURES}" -gt 0 ]; then
-        if [ -e "${receipt}" ]; then
-            mv -f "${receipt}" "${receipt}.invalidated" 2>/dev/null \
-                && printf 'The record that was here has been INVALIDATED (moved to %s.invalidated): a check that has just failed must never leave an earlier pass where the resume step reads.\n' "${receipt}"
-        fi
         printf 'NOT PASSED — %s items passed, %s failed, %s could not be checked. NO closed-door record has been written, so the resume step has nothing to act on.\n' \
             "${PASSES}" "${FAILURES}" "${UNCHECKED}"
         exit 1
@@ -1587,8 +1603,9 @@ check_pre_resume() {
         verdict="passed"
     fi
 
-    mkdir -p "${state_dir}" || {
-        printf 'estate-check: could not make %s, and the closed-door phase has to be written down.\n' "${state_dir}" >&2
+    local receipt_tmp
+    receipt_tmp="$(mktemp "${state_dir}/.pre-resume.json.XXXXXX")" || {
+        printf 'estate-check: could not create a new receipt beside %s, so no partial result will replace the current verdict.\n' "${receipt}" >&2
         exit 2
     }
 
@@ -1617,10 +1634,16 @@ check_pre_resume() {
                 "${number}" "${vd}" "$(printf '%s' "${sentence}" | sed 's/\\/\\\\/g; s/"/\\"/g')"
         done
         printf '\n  ]\n}\n'
-    } > "${receipt}" || {
-        printf 'estate-check: could not write %s.\n' "${receipt}" >&2
+    } > "${receipt_tmp}" || {
+        rm -f "${receipt_tmp}"
+        printf 'estate-check: could not write a complete receipt beside %s.\n' "${receipt}" >&2
         exit 2
     }
+    if ! mv -f "${receipt_tmp}" "${receipt}"; then
+        rm -f "${receipt_tmp}"
+        printf 'estate-check: could not atomically replace %s with the new complete receipt.\n' "${receipt}" >&2
+        exit 2
+    fi
 
     printf 'The closed-door phase is written down at %s — this estate (%s), the release this rollout is for (%s), which is the image this coordinator is running (%s), at %s.\n' \
         "${receipt}" "${project:-unnamed}" "${image_named:-unnamed}" "${image_id:-unreadable}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -1653,30 +1676,52 @@ check_pre_resume() {
 #     env file allows. A pass from before the estate started says nothing about
 #     the estate that is running.
 # ---------------------------------------------------------------------------
-_read_the_record() {   # <file> — prints shell assignments, one per line
+_read_the_record() {   # <file> — prints validated shell assignments, one per line
     local file="$1" program
     program='
-      "R_VERDICT=" + (.verdict // "") ,
-      "R_PROJECT=" + (.compose_project // "") ,
-      "R_IMAGE=" + (.coordinator_image_id // "") ,
-      "R_NAMED=" + (.coordinator_image_named // "") ,
-      "R_NAMED_ID=" + (.coordinator_image_named_id // "") ,
-      "R_BUS_MODE=" + (.bus_mode // "") ,
-      "R_EPOCH=" + ((.written_at_epoch // 0) | tostring) ,
-      "R_WRITTEN=" + (.written_at // "") ,
-      "R_NOT_CHECKED=" + ([.items[]? | select(.verdict == "not-checked") | .item] | join(" "))
+      def token: type == "string" and test("^[A-Za-z0-9][A-Za-z0-9_./:@+-]*$");
+      def expected_items: ["10", "10b", "8", "8b", "8c", "8c-forge", "8c-relay", "8d", "8e", "8f", "8g", "8h", "8i", "9"];
+      select(length == 1) | .[0]
+      | select(
+          type == "object"
+          and (.verdict == "passed" or .verdict == "passed-with-items-not-checked")
+          and (.compose_project | token)
+          and (.coordinator_image_id | token)
+          and (.coordinator_image_named | token)
+          and ((has("coordinator_image_named_id") | not) or (.coordinator_image_named_id | token))
+          and (.bus_mode == "local" or .bus_mode == "external")
+          and (.written_at | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
+          and (.written_at_epoch | type == "number" and . > 0 and floor == .)
+          and (.items | type == "array" and length == 14)
+          and (([.items[].item] | sort) == (expected_items | sort))
+          and (([.items[].item] | unique | length) == 14)
+          and all(.items[]; (.item | token) and (.said | type == "string")
+              and (.verdict == "ok" or .verdict == "not-checked" or .verdict == "not-checked-on-purpose"))
+          and (if .verdict == "passed" then
+                 all(.items[]; if (.item == "8h" or .item == "8i") then .verdict == "not-checked-on-purpose" else .verdict == "ok" end)
+               else
+                 any(.items[]; .verdict == "not-checked")
+                 and all(.items[]; if (.item == "8h" or .item == "8i") then .verdict == "not-checked-on-purpose" else (.verdict == "ok" or .verdict == "not-checked") end)
+               end)
+        )
+      | "R_VERDICT=" + .verdict ,
+        "R_PROJECT=" + .compose_project ,
+        "R_IMAGE=" + .coordinator_image_id ,
+        "R_NAMED=" + .coordinator_image_named ,
+        "R_NAMED_ID=" + (.coordinator_image_named_id // "") ,
+        "R_BUS_MODE=" + .bus_mode ,
+        "R_EPOCH=" + (.written_at_epoch | tostring) ,
+        "R_WRITTEN=" + .written_at ,
+        "R_NOT_CHECKED=" + ([.items[] | select(.verdict == "not-checked") | .item] | join(" "))
     '
     if command -v jq >/dev/null 2>&1; then
-        jq -r "${program}" < "${file}" 2>/dev/null
+        jq -ers "${program}" < "${file}" 2>/dev/null
         return
     fi
-    # NO jq ON THIS MACHINE. The estate already reads the bus's JSON with the
-    # provisioning image rather than asking a machine to carry a tool, and this
-    # does the same rather than parsing JSON with a regular expression.
     local image
     image="$(get NATS_PROVISION_IMAGE)"
     [ -n "${image}" ] || return 1
-    docker run --rm -i --entrypoint jq "${image}" -r "${program}" < "${file}" 2>/dev/null
+    docker run --rm -i --entrypoint jq "${image}" -ers "${program}" < "${file}" 2>/dev/null
 }
 
 check_read_pre_resume() {
@@ -1695,13 +1740,17 @@ check_read_pre_resume() {
     fi
 
     local R_VERDICT="" R_PROJECT="" R_IMAGE="" R_NAMED="" R_NAMED_ID="" R_BUS_MODE="" R_EPOCH=0 R_WRITTEN="" R_NOT_CHECKED=""
-    local key val
+    local key val record_data
+    if ! record_data="$(_read_the_record "${receipt}")"; then
+        printf 'REFUSED — the closed-door record at %s is not one complete, valid receipt with this estate, image, time and exact item set.\n' "${receipt}"
+        exit 1
+    fi
     while IFS='=' read -r key val; do
         case "${key}" in
             R_VERDICT|R_PROJECT|R_IMAGE|R_NAMED|R_NAMED_ID|R_BUS_MODE|R_EPOCH|R_WRITTEN|R_NOT_CHECKED)
                 printf -v "${key}" '%s' "${val}" ;;
         esac
-    done < <(_read_the_record "${receipt}")
+    done <<< "${record_data}"
     case "${R_EPOCH}" in ''|*[!0-9]*) R_EPOCH=0 ;; esac
 
     if [ -z "${R_VERDICT}" ]; then
@@ -1709,12 +1758,12 @@ check_read_pre_resume() {
         exit 1
     fi
 
-    local coordinator project image_id started_epoch now age max_age trouble=""
+    local coordinator project image_id started_at started_epoch now age max_age trouble=""
     coordinator="$(container_of coordinator)"
     project="$(docker inspect "${coordinator}" --format '{{index .Config.Labels "com.docker.compose.project"}}' 2>/dev/null)"
     image_id="$(docker inspect "${coordinator}" --format '{{.Image}}' 2>/dev/null)"
-    started_epoch="$(docker inspect "${coordinator}" --format '{{.State.StartedAt}}' 2>/dev/null)"
-    started_epoch="$(date -u -d "${started_epoch}" +%s 2>/dev/null || printf '0')"
+    started_at="$(docker inspect "${coordinator}" --format '{{.State.StartedAt}}' 2>/dev/null)"
+    started_epoch="$(date -u -d "${started_at}" +%s 2>/dev/null || printf '0')"
     now="$(date -u +%s)"
     age=$(( now - R_EPOCH ))
     max_age="$(get ROLLOUT_PRE_RESUME_MAX_AGE_S)"
@@ -1762,7 +1811,9 @@ check_read_pre_resume() {
             [ -z "${R_NAMED_ID}" ] || [ "${R_NAMED_ID}" = "${R_IMAGE}" ] \
                 || trouble="${trouble} the record disagrees with itself: it says ${R_NAMED} is image ${R_NAMED_ID} and that the estate ran ${R_IMAGE};"
         fi
-        if [ "${started_epoch}" -gt 0 ] && [ "${R_EPOCH}" -le "${started_epoch}" ]; then
+        if [ "${started_epoch}" -le 0 ]; then
+            trouble="${trouble} this coordinator's start time could not be read (${started_at:-nothing}), so the receipt cannot be shown to be newer than the estate that is running;"
+        elif [ "${R_EPOCH}" -le "${started_epoch}" ]; then
             trouble="${trouble} it was written at ${R_WRITTEN}, before or when this coordinator started, so it says nothing about the estate that is running now;"
         fi
     fi
