@@ -738,14 +738,19 @@ The execution sequence is:
    runs the full `estate-check services`, `factory-hello`, and finally the Compose
    `gateway-watch` profile. The new watch has no host timer or service.
 
-Prepared-state final verification also requires complete visibility of processes
-holding the current ledger, WAL or shared-memory file. The tool runs its pinned
-helper with the host PID namespace and `SYS_PTRACE`, with no network and the
-ledger mounted read-only. It compares file identities; it does not read process
-commands, environment or descriptor contents, and it never kills a holder.
-Permission errors or incomplete observations refuse the operation. Establish
-that this access is permitted and works in the intended environment before the
-rehearsal; a quiet database or empty Docker volume filter is insufficient.
+Prepared-state final verification also requires proof that the current ledger,
+WAL and shared-memory inodes have no open holder. The tool first verifies the
+project's ordinary local named volume, then runs its pinned helper as the exact
+ledger owner with no network, no capabilities, a read-only root and the ledger
+mounted read-only. The helper immediately takes Linux write leases on every
+present owned inode, checks the complete file set and identities, and releases
+all leases. It does not inspect any process or process namespace. Unsupported
+filesystems, permissions, identity changes, lease breaks and uncertain cleanup
+all refuse the operation. A racing new open can be blocked briefly while these
+leases are held, and opening against a pre-existing lease can notify that lease
+holder even though the helper uses nonblocking opens. Establish this narrow
+kernel behavior in the intended environment before rehearsal; a quiet database
+or empty Docker volume filter is insufficient.
 
 The two recovery modes preserve different authorities. Before resume,
 `rollout-back --before-resume` requires both markers absent, unchanged recorded
