@@ -102,6 +102,35 @@ def test_inherited_nonempty_bus_mode_wins_over_the_file(tmp_path: Path) -> None:
     assert files[-1] == str(ESTATE / "compose.external-bus.yaml")
 
 
+@pytest.mark.parametrize(
+    ("mode", "prefix"),
+    [
+        ("${REVIEW_MODE}", "REVIEW_MODE=external\n"),
+        ("${REVIEW_UNSET:-external}", ""),
+    ],
+)
+def test_accepted_mode_expansion_renders_with_the_overlay(
+    tmp_path: Path, mode: str, prefix: str
+) -> None:
+    env_file = estate_env(tmp_path, mode)
+    env_file.write_text(prefix + env_file.read_text())
+    result, calls = invoke(tmp_path, env_file)
+    assert result.returncode == 0, result.stderr
+    files = [calls[0][i + 1] for i, value in enumerate(calls[0]) if value == "-f"]
+    assert files == [str(ESTATE / "compose.yaml"), str(ESTATE / "compose.external-bus.yaml")]
+
+
+def test_expansion_does_not_execute_dotenv_shell_syntax(tmp_path: Path) -> None:
+    marker = tmp_path / "dotenv-was-executed"
+    env_file = estate_env(tmp_path, "${REVIEW_UNSET:-external}")
+    env_file.write_text(f'REVIEW_LITERAL="$(touch {marker})"\n' + env_file.read_text())
+    result, calls = invoke(tmp_path, env_file)
+    assert result.returncode == 0, result.stderr
+    assert not marker.exists()
+    files = [calls[0][i + 1] for i, value in enumerate(calls[0]) if value == "-f"]
+    assert files[-1] == str(ESTATE / "compose.external-bus.yaml")
+
+
 def test_render_failure_is_not_reported_as_a_missing_container(tmp_path: Path) -> None:
     result, _ = invoke(tmp_path, estate_env(tmp_path, "external"), FAKE_COMPOSE_FAIL="1")
     assert result.returncode == 2
