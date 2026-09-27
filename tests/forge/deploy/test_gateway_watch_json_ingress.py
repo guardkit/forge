@@ -140,3 +140,35 @@ def test_json_ingress_rejects_wrong_types_and_unsafe_identifiers(tmp_path: Path,
     if not target.startswith("bus-"):
         assert "recent activity  unknown" in done.stdout
         assert "logs" not in calls
+
+
+@pytest.mark.parametrize("subscriptions", [
+    {"subscriptions_list": "agents.command.jarvis"},
+    {"subscriptions_list": [7, "agents.command.jarvis"]},
+    {"subscriptions_list": False},
+    {"subscriptions_list_detail": {"subject": "agents.command.jarvis"}},
+    {"subscriptions_list_detail": [{"subject": 7}, {"subject": "agents.command.jarvis"}]},
+    {"subscriptions_list_detail": ["agents.command.jarvis"]},
+])
+def test_bus_identity_requires_typed_subscription_lists(tmp_path: Path, subscriptions: dict) -> None:
+    connection = {"authorized_user": "jarvis", "name": "bus-gateway-factory", **subscriptions}
+    done, messages, _ = run_ingress(tmp_path, "bus-file", json.dumps({"connections": [connection]}).encode())
+    assert done.returncode == 10, done.stdout + done.stderr
+    assert "bus connection   unknown" in done.stdout
+    assert len(messages) == 1
+
+
+@pytest.mark.parametrize("subscriptions,verdict", [
+    ({"subscriptions_list": ["agents.command.jarvis"]}, "ok"),
+    ({"subscriptions_list_detail": [{"subject": "agents.command.jarvis"}]}, "ok"),
+    ({"subscriptions_list": []}, "lost"),
+    ({"subscriptions_list_detail": []}, "lost"),
+    ({}, "lost"),
+    ({"subscriptions_list": ["some.other.subject"]}, "lost"),
+])
+def test_bus_typed_subscription_controls(tmp_path: Path, subscriptions: dict, verdict: str) -> None:
+    connection = {"authorized_user": "jarvis", "name": "bus-gateway-factory", **subscriptions}
+    done, messages, _ = run_ingress(tmp_path, "bus-file", json.dumps({"connections": [connection]}).encode())
+    assert done.returncode == (0 if verdict == "ok" else 10), done.stdout + done.stderr
+    assert "bus connection   " + verdict in done.stdout
+    assert len(messages) == (0 if verdict == "ok" else 1)
