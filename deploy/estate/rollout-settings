@@ -41,11 +41,25 @@ import yaml
 from forge.config.loader import load_config
 from forge.config.models import PublicationConfig
 
-source, destination, metadata_path, evidence_source = map(Path, sys.argv[1:5])
+source, destination, metadata_path, runtime_path = map(Path, sys.argv[1:5])
+evidence_source_text = sys.argv[5]
+
+def canonical_absolute(value, label):
+    if not isinstance(value, str) or not value.startswith("/"):
+        raise ValueError(f"{label} is not an absolute path")
+    if os.path.normpath(value) != value or str(Path(value)) != value:
+        raise ValueError(f"{label} is not a canonical absolute path")
+    return Path(value)
+
+evidence_source = canonical_absolute(evidence_source_text, "the declared evidence source path")
 raw = yaml.safe_load(source.read_text(encoding="utf-8"))
 if not isinstance(raw, dict):
     raise ValueError("the input settings document is not a mapping")
 original = copy.deepcopy(raw)
+runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
+runtime_mounts = runtime.get("mounts") if isinstance(runtime, dict) else None
+if not isinstance(runtime_mounts, list) or not all(isinstance(item, dict) for item in runtime_mounts):
+    raise ValueError("the previous runtime does not contain a mount list")
 planning = raw.get("planning")
 if not isinstance(planning, dict):
     raise ValueError("planning is missing or is not a mapping")
@@ -118,7 +132,48 @@ for item in allowlist:
         new_allowlist.append(old_paths[item])
     else:
         new_allowlist.append(item)
-if replaced_evidence != 1:
+if replaced_evidence == 0:
+    evidence_mappings = []
+    for mount in runtime_mounts:
+        mount_type = str(mount.get("Type", mount.get("type", ""))).lower()
+        if mount_type != "bind":
+            continue
+        bind_source = canonical_absolute(
+            mount.get("Source", mount.get("source")), "a previous-runtime bind source"
+        )
+        bind_destination = canonical_absolute(
+            mount.get("Destination", mount.get("destination", mount.get("target"))),
+            "a previous-runtime bind destination",
+        )
+        try:
+            relative_evidence = evidence_source.relative_to(bind_source)
+        except ValueError:
+            continue
+        evidence_mappings.append(
+            (bind_destination, bind_destination / relative_evidence)
+        )
+    if len(evidence_mappings) != 1:
+        raise ValueError("the declared evidence source must be beneath exactly one previous-runtime bind")
+    bind_destination, container_evidence = evidence_mappings[0]
+    covering_permissions = []
+    for item in allowlist:
+        try:
+            permission = canonical_absolute(item, "an evidence permission")
+        except ValueError:
+            continue
+        inside_mapped_bind = (
+            permission == bind_destination or bind_destination in permission.parents
+        )
+        covers_evidence = (
+            container_evidence == permission or permission in container_evidence.parents
+        )
+        if inside_mapped_bind and covers_evidence:
+            covering_permissions.append(permission)
+    if len(covering_permissions) != 1:
+        raise ValueError("the mapped evidence path must have exactly one existing container permission")
+    if "/var/lib/forge-evidence" not in new_allowlist:
+        new_allowlist.append("/var/lib/forge-evidence")
+elif replaced_evidence != 1:
     raise ValueError("the declared evidence source path must appear exactly once in the allowlist")
 filesystem["allowlist"] = new_allowlist
 
@@ -671,8 +726,9 @@ def main() -> int:
             command.extend(["-e", f"{name}={require(resolved, name)}"])
         command.extend([
             "-v", f"{args.settings_input.resolve()}:/input/forge.yaml:ro",
+            "-v", f"{args.previous_runtime.resolve()}:/input/previous-runtime.json:ro",
             "-v", f"{work}:/output", resolved["FORGE_IMAGE"], "-c", TRANSFORMER,
-            "/input/forge.yaml", "/output/forge.yaml", "/output/metadata.json",
+            "/input/forge.yaml", "/output/forge.yaml", "/output/metadata.json", "/input/previous-runtime.json",
             str(args.evidence_source_path),
         ])
         run(command, env=process_env)

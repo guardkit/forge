@@ -364,6 +364,37 @@ def configure_legacy_alias_shape(scenario):
     return registrations, alias_pairs, sandbox_projects
 
 
+def configure_parent_mapped_evidence(scenario):
+    settings = yaml.safe_load(scenario["settings_input"].read_text())
+    old_evidence = settings["permissions"]["filesystem"]["allowlist"][0]
+    settings["permissions"]["filesystem"]["allowlist"] = [
+        "/var/forge" if item == old_evidence else item
+        for item in settings["permissions"]["filesystem"]["allowlist"]
+    ]
+    scenario["settings_input"].write_text(
+        yaml.safe_dump(settings, sort_keys=False), encoding="utf-8"
+    )
+
+    host_parent = scenario["settings_input"].parent / "synthetic-forge-state"
+    evidence_source = host_parent / "receipts"
+    evidence_source.mkdir(parents=True)
+    runtime = json.loads(scenario["runtime"].read_text())
+    runtime["mounts"].append(
+        {"Type": "bind", "Source": str(host_parent), "Destination": "/var/forge"}
+    )
+    scenario["runtime"].write_text(json.dumps(runtime), encoding="utf-8")
+
+    command = scenario["command"]
+    evidence_index = command.index("--evidence-source-path") + 1
+    command[evidence_index] = str(evidence_source)
+    return host_parent, evidence_source
+
+
+def transformer_run_arguments(scenario):
+    calls = [json.loads(line) for line in scenario["docker_log"].read_text().splitlines()]
+    return next(call for call in calls if call and call[0] == "run")
+
+
 def test_legacy_settings_add_safe_publication_and_preserve_alias_identity(scenario):
     registrations, alias_pairs, sandbox_projects = configure_legacy_alias_shape(scenario)
 
@@ -398,6 +429,123 @@ def test_legacy_settings_add_safe_publication_and_preserve_alias_identity(scenar
         assert receipt["registrations"][left]["new_path"] == (
             receipt["registrations"][right]["new_path"]
         )
+
+
+def test_parent_mapped_evidence_adds_only_canonical_permission(scenario):
+    _, evidence_source = configure_parent_mapped_evidence(scenario)
+    input_before = scenario["settings_input"].read_bytes()
+
+    result = run(scenario)
+
+    assert result.returncode == 0, result.stderr
+    assert scenario["settings_input"].read_bytes() == input_before
+    rendered = yaml.safe_load(scenario["outputs"]["settings"].read_text())
+    allowlist = rendered["permissions"]["filesystem"]["allowlist"]
+    assert "/var/forge" in allowlist
+    assert "/var/lib/deliberate-extra" in allowlist
+    assert "/var/lib/forge-evidence" in allowlist
+    assert allowlist.count("/var/lib/forge-evidence") == 1
+    assert str(evidence_source) not in allowlist
+
+    docker_args = transformer_run_arguments(scenario)
+    assert any(
+        item.endswith(":/input/previous-runtime.json:ro") for item in docker_args
+    )
+    assert "/input/previous-runtime.json" in docker_args
+
+
+def test_parent_mapped_evidence_requires_a_matching_bind(scenario):
+    host_parent, _ = configure_parent_mapped_evidence(scenario)
+    runtime = json.loads(scenario["runtime"].read_text())
+    runtime["mounts"] = [
+        mount for mount in runtime["mounts"] if mount.get("Source") != str(host_parent)
+    ]
+    scenario["runtime"].write_text(json.dumps(runtime), encoding="utf-8")
+
+    result = run(scenario)
+
+    assert result.returncode == 2
+    assert not any(path.exists() for path in scenario["outputs"].values())
+
+
+def test_parent_mapped_evidence_requires_existing_container_permission(scenario):
+    configure_parent_mapped_evidence(scenario)
+    settings = yaml.safe_load(scenario["settings_input"].read_text())
+    settings["permissions"]["filesystem"]["allowlist"] = [
+        "/var/unrelated" if item == "/var/forge" else item
+        for item in settings["permissions"]["filesystem"]["allowlist"]
+    ]
+    scenario["settings_input"].write_text(
+        yaml.safe_dump(settings, sort_keys=False), encoding="utf-8"
+    )
+
+    result = run(scenario)
+
+    assert result.returncode == 2
+    assert not any(path.exists() for path in scenario["outputs"].values())
+
+
+def test_unrelated_ancestor_permission_does_not_authorize_evidence(scenario):
+    configure_parent_mapped_evidence(scenario)
+    settings = yaml.safe_load(scenario["settings_input"].read_text())
+    settings["permissions"]["filesystem"]["allowlist"] = [
+        "/var" if item == "/var/forge" else item
+        for item in settings["permissions"]["filesystem"]["allowlist"]
+    ]
+    scenario["settings_input"].write_text(
+        yaml.safe_dump(settings, sort_keys=False), encoding="utf-8"
+    )
+
+    result = run(scenario)
+
+    assert result.returncode == 2
+    assert not any(path.exists() for path in scenario["outputs"].values())
+
+
+def test_bind_source_prefix_is_not_path_ancestry(scenario):
+    host_parent, _ = configure_parent_mapped_evidence(scenario)
+    runtime = json.loads(scenario["runtime"].read_text())
+    for mount in runtime["mounts"]:
+        if mount.get("Source") == str(host_parent):
+            mount["Source"] = str(host_parent).removesuffix("-state")
+    scenario["runtime"].write_text(json.dumps(runtime), encoding="utf-8")
+
+    result = run(scenario)
+
+    assert result.returncode == 2
+    assert not any(path.exists() for path in scenario["outputs"].values())
+
+
+def test_nested_bind_mapping_is_ambiguous_and_refuses(scenario):
+    _, evidence_source = configure_parent_mapped_evidence(scenario)
+    runtime = json.loads(scenario["runtime"].read_text())
+    runtime["mounts"].append(
+        {
+            "Type": "bind",
+            "Source": str(evidence_source),
+            "Destination": "/var/other-receipts",
+        }
+    )
+    scenario["runtime"].write_text(json.dumps(runtime), encoding="utf-8")
+
+    result = run(scenario)
+
+    assert result.returncode == 2
+    assert not any(path.exists() for path in scenario["outputs"].values())
+
+
+def test_noncanonical_bind_path_refuses(scenario):
+    host_parent, _ = configure_parent_mapped_evidence(scenario)
+    runtime = json.loads(scenario["runtime"].read_text())
+    for mount in runtime["mounts"]:
+        if mount.get("Source") == str(host_parent):
+            mount["Destination"] = "/var/forge/../forge"
+    scenario["runtime"].write_text(json.dumps(runtime), encoding="utf-8")
+
+    result = run(scenario)
+
+    assert result.returncode == 2
+    assert not any(path.exists() for path in scenario["outputs"].values())
 
 
 def test_existing_publication_enabled_policy_is_preserved(scenario):
