@@ -1341,3 +1341,185 @@ class TestSandboxOnlyCommonDispatch:
         assert "sandbox-required" in row["error"]
         assert acks == 1
         assert calls == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("state", "pr_url", "warning"),
+        [
+            (BuildState.INTERRUPTED, None, None),
+            (BuildState.PREPARING, None, None),
+            (BuildState.RUNNING, None, None),
+            (BuildState.QUEUED, None, None),
+            (BuildState.FINALISING, "https://example.invalid/pr/23", "PR may exist at https://example.invalid/pr/23"),
+            (BuildState.FINALISING, None, "PR creation status unknown"),
+        ],
+    )
+    async def test_boot_write_failure_refuses_then_healthy_boot_settles(
+        self, state: BuildState, pr_url: str | None, warning: str | None,
+        tmp_path: Path, stub_client: _StubNatsClient,
+        persistence: SqliteLifecyclePersistence,
+        monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A best-effort writer cannot make boot claim terminal success."""
+        from forge.cli._serve_production import _build_recovery_reconcile_seam
+
+        config = self._strict_config(tmp_path)
+        now = datetime(2026, 9, 27, tzinfo=UTC)
+        persistence.connection.execute(
+            "INSERT INTO builds (build_id, feature_id, repo, branch, feature_yaml_path, "
+            "status, triggered_by, correlation_id, queued_at, mode, pr_url) VALUES "
+            "(?, ?, ?, 'main', 'feature.yaml', ?, 'cli', ?, ?, 'mode-a', ?)",
+            ("build-d4-retry", "FEAT-D4RETRY", "example/plain", state.value,
+             "corr-d4-retry", now.isoformat(), pr_url),
+        )
+        persistence.connection.commit()
+        original = persistence.apply_transition
+        failed: list[bool] = []
+
+        def fail_terminal_once(transition) -> None:
+            if not failed and transition.to_state is BuildState.FAILED:
+                failed.append(True)
+                raise sqlite3.OperationalError("synthetic terminal write failure")
+            original(transition)
+
+        monkeypatch.setattr(persistence, "apply_transition", fail_terminal_once)
+        seam = _build_recovery_reconcile_seam(persistence, config)
+        with pytest.raises(RuntimeError, match="did not durably settle"):
+            await seam(stub_client)
+        first = persistence.get_build_row("build-d4-retry")
+        assert first is not None and first.status is not BuildState.FAILED
+        assert stub_client.published == []
+        if warning is not None:
+            assert warning in (first.error or "")
+
+        monkeypatch.setattr(persistence, "apply_transition", original)
+        await seam(stub_client)
+        settled = persistence.get_build_row("build-d4-retry")
+        assert settled is not None and settled.status is BuildState.FAILED
+        assert "sandbox-required" in (settled.error or "")
+        assert len(stub_client.published) == 1
+        if warning is not None:
+            assert warning in (settled.error or "")
+            assert warning.encode() in stub_client.published[0][1]
+            assert warning in caplog.text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("pr_url", ["https://example.invalid/pr/23", None])
+    @pytest.mark.parametrize(
+        "failed_hop", [BuildState.PREPARING, BuildState.FAILED, None]
+    )
+    async def test_finalising_warning_survives_each_failed_policy_hop(
+        self, pr_url: str | None, failed_hop: BuildState | None, tmp_path: Path,
+        stub_client: _StubNatsClient, persistence: SqliteLifecyclePersistence,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from forge.cli._serve_production import _build_recovery_reconcile_seam
+
+        config = self._strict_config(tmp_path)
+        now = datetime(2026, 9, 27, tzinfo=UTC)
+        persistence.connection.execute(
+            "INSERT INTO builds (build_id, feature_id, repo, branch, feature_yaml_path, "
+            "status, triggered_by, correlation_id, queued_at, mode, pr_url) VALUES "
+            "('build-d4-final', 'FEAT-D4FINAL', 'example/plain', 'main', "
+            "'feature.yaml', 'FINALISING', 'cli', 'corr-d4-final', ?, 'mode-a', ?)",
+            (now.isoformat(), pr_url),
+        )
+        persistence.connection.commit()
+        original = persistence.apply_transition
+        failed: list[bool] = []
+
+        def fail_once(transition) -> None:
+            if not failed and transition.to_state is failed_hop:
+                failed.append(True)
+                raise sqlite3.OperationalError("synthetic policy hop failure")
+            original(transition)
+
+        monkeypatch.setattr(persistence, "apply_transition", fail_once)
+        original_get = persistence.get_build_row
+        readback_failed: list[bool] = []
+
+        def fail_terminal_readback_once(build_id: str):
+            row = original_get(build_id)
+            if (
+                failed_hop is None
+                and not readback_failed
+                and row is not None
+                and row.status is BuildState.FAILED
+            ):
+                readback_failed.append(True)
+                raise sqlite3.OperationalError("synthetic policy readback failure")
+            return row
+
+        monkeypatch.setattr(persistence, "get_build_row", fail_terminal_readback_once)
+        with pytest.raises(RuntimeError, match="durable FAILED|durably settle"):
+            await _build_recovery_reconcile_seam(persistence, config)(stub_client)
+        row = persistence.get_build_row("build-d4-final")
+        expected = f"PR may exist at {pr_url}" if pr_url else "PR creation status unknown"
+        assert expected in (row.error or "")
+        assert stub_client.published == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "failed_hop", [BuildState.PREPARING, BuildState.FAILED, None]
+    )
+    async def test_direct_runless_failure_holds_without_event_or_ack(
+        self, failed_hop: BuildState | None, tmp_path: Path,
+        stub_client: _StubNatsClient, persistence: SqliteLifecyclePersistence,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        config = self._strict_config(tmp_path)
+        now = datetime(2026, 9, 27, tzinfo=UTC)
+        persistence.connection.execute(
+            "INSERT INTO builds (build_id, feature_id, repo, branch, feature_yaml_path, "
+            "status, triggered_by, correlation_id, queued_at, mode) VALUES "
+            "('build-d4-direct-fail', 'FEAT-D4DIRECT', 'example/plain', 'main', "
+            "'feature.yaml', 'INTERRUPTED', 'cli', 'corr-d4-direct', ?, 'mode-a')",
+            (now.isoformat(),),
+        )
+        persistence.connection.commit()
+        original = persistence.apply_transition
+
+        def fail_hop(transition) -> None:
+            if transition.to_state is failed_hop:
+                raise sqlite3.OperationalError("synthetic direct replay write failure")
+            original(transition)
+
+        monkeypatch.setattr(persistence, "apply_transition", fail_hop)
+        original_get = persistence.get_build_row
+        readback_failed: list[bool] = []
+
+        def fail_terminal_readback_once(build_id: str):
+            row = original_get(build_id)
+            if (
+                failed_hop is None
+                and not readback_failed
+                and row is not None
+                and row.status is BuildState.FAILED
+            ):
+                readback_failed.append(True)
+                raise sqlite3.OperationalError("synthetic replay readback failure")
+            return row
+
+        monkeypatch.setattr(persistence, "get_build_row", fail_terminal_readback_once)
+        deps = build_pipeline_consumer_deps(
+            stub_client, config, persistence, async_task_starter=self._Starter()
+        )
+        payload = SimpleNamespace(
+            feature_id="FEAT-D4DIRECT", repo="example/plain", branch="main",
+            feature_yaml_path="feature.yaml", max_turns=5, sdk_timeout_seconds=1800,
+            triggered_by="cli", originating_adapter="cli-wrapper",
+            originating_user="synthetic-user", correlation_id="corr-d4-direct",
+            parent_request_id=None, queued_at=now,
+        )
+        acks = 0
+
+        async def ack() -> None:
+            nonlocal acks
+            acks += 1
+
+        await deps.dispatch_build(payload, ack, runless_replay=True)
+        row = persistence.get_build_row("build-d4-direct-fail")
+        assert row is not None
+        assert row.status is BuildState.FAILED if failed_hop is None else row.status is not BuildState.FAILED
+        assert acks == 0
+        assert stub_client.published == []

@@ -682,7 +682,7 @@ async def _settle_strict_runless_builds_at_boot(
     """
     from forge.cli._conductor_outcome import fail_mode_c_build
     from forge.config.build_admission import build_admission
-    from forge.lifecycle.state_machine import TERMINAL_STATES
+    from forge.lifecycle.state_machine import TERMINAL_STATES, BuildState
     from forge.pipeline import BuildContext
 
     settled = 0
@@ -693,30 +693,59 @@ async def _settle_strict_runless_builds_at_boot(
         admission = build_admission(forge_config, target_repo=current.repo)
         if admission.allowed:
             continue
-        reason = fail_mode_c_build(
+        policy_reason = admission.reason or "sandbox-required"
+        finalising_warning = str(current.error or "")
+        if not finalising_warning.startswith("finalising-interrupted:"):
+            finalising_warning = ""
+        durable_reason = (
+            f"{policy_reason}; {finalising_warning}"
+            if finalising_warning
+            else policy_reason
+        )
+        fail_mode_c_build(
             sqlite_pool,
             current.build_id,
-            summary=admission.reason or "sandbox-required",
+            summary=durable_reason,
             what="sandbox BUILD admission refusal during serialized boot recovery",
             log=logger,
         )
+        try:
+            persisted = sqlite_pool.get_build_row(current.build_id)
+        except Exception as exc:  # noqa: BLE001 — startup must refuse safely
+            raise RuntimeError(
+                "sandbox BUILD admission could not verify durable FAILED "
+                f"state for runless build {current.build_id}: {exc}"
+            ) from exc
+        if (
+            persisted is None
+            or persisted.status is not BuildState.FAILED
+            or persisted.error != durable_reason
+        ):
+            observed = "missing" if persisted is None else (
+                f"status={persisted.status.value} error={persisted.error!r}"
+            )
+            raise RuntimeError(
+                "sandbox BUILD admission did not durably settle runless "
+                f"build {current.build_id} as FAILED ({observed}); refusing "
+                "startup before consumer attachment"
+            )
         await emitter.emit_failed(
             BuildContext(
-                feature_id=current.feature_id,
-                build_id=current.build_id,
-                correlation_id=current.correlation_id,
+                feature_id=persisted.feature_id,
+                build_id=persisted.build_id,
+                correlation_id=persisted.correlation_id,
                 wave_total=1,
             ),
-            failure_reason=reason,
+            failure_reason=durable_reason,
             recoverable=False,
-            failed_task_id=current.task_id,
+            failed_task_id=persisted.task_id,
         )
         settled += 1
         logger.error(
             "forge-serve: boot recovery terminally refused runless build_id=%s "
             "(%s)",
-            current.build_id,
-            reason,
+            persisted.build_id,
+            durable_reason,
         )
     return settled
 

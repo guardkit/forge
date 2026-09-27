@@ -1006,13 +1006,37 @@ def _build_dispatch_build(
                         state.value,
                     )
                     return
-                reason = fail_mode_c_build(
+                durable_reason = reason
+                fail_mode_c_build(
                     sqlite_pool,
                     build_id,
-                    summary=reason,
+                    summary=durable_reason,
                     what="sandbox BUILD admission refusal during runless replay",
                     log=logger,
                 )
+                try:
+                    persisted = sqlite_pool.get_build_row(build_id)
+                except Exception as exc:  # noqa: BLE001 — hold the delivery
+                    logger.error(
+                        "dispatch_build: could not verify durable FAILED "
+                        "state for runless build_id=%s (%s); holding WITHOUT "
+                        "terminal event or ack",
+                        build_id,
+                        exc,
+                    )
+                    return
+                if (
+                    persisted is None
+                    or persisted.status is not BuildState.FAILED
+                    or persisted.error != durable_reason
+                ):
+                    logger.error(
+                        "dispatch_build: runless build_id=%s did not durably "
+                        "reach FAILED; holding WITHOUT terminal event or ack",
+                        build_id,
+                    )
+                    return
+                reason = durable_reason
             logger.error(
                 "dispatch_build: %s; refusing before row creation, gate, "
                 "observer, conductor or runner",

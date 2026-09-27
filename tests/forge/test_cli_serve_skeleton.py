@@ -477,6 +477,48 @@ class TestRunServeBootOrder:
         assert recovery_idx < min(post_reconcile)
         assert consumer_idx < min(post_reconcile)
 
+    def test_recovery_refusal_prevents_attachment_and_readiness(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A durability refusal aborts startup before any consumer exists."""
+        import asyncio as _asyncio
+
+        from forge.cli import _serve_daemon
+        from forge.cli import serve as serve_module
+        from forge.cli._serve_config import ServeConfig
+        from forge.cli._serve_state import SubscriptionState
+
+        stub_client = _StubNatsClient()
+        reached: list[str] = []
+
+        async def _fake_connect(servers: str) -> object:
+            return stub_client
+
+        async def _fake_open_fleet(nats_url: str) -> object:
+            return stub_client
+
+        async def _refuse_recovery(client: object) -> None:
+            reached.append("recovery")
+            raise RuntimeError("durable FAILED readback refused")
+
+        async def _unexpected(*args: object, **kwargs: object) -> None:
+            reached.append("post-recovery")
+
+        monkeypatch.setattr(_serve_daemon, "nats_connect", _fake_connect)
+        monkeypatch.setattr(serve_module, "open_fleet_client", _fake_open_fleet)
+        monkeypatch.setattr(serve_module, "recovery_reconcile_on_boot", _refuse_recovery)
+        monkeypatch.setattr(serve_module, "consumer_reconcile_on_boot", _unexpected)
+        monkeypatch.setattr(serve_module, "compose_dispatch_chain", _unexpected)
+        monkeypatch.setattr(serve_module, "run_daemon", _unexpected)
+        monkeypatch.setattr(serve_module, "run_healthz_server", _unexpected)
+
+        state = SubscriptionState()
+        with pytest.raises(RuntimeError, match="durable FAILED readback refused"):
+            _asyncio.run(serve_module._run_serve(ServeConfig(), state))
+
+        assert reached == ["recovery"]
+        assert state.chain_ready is False
+
     def test_chain_ready_flips_true_after_reconciles(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
