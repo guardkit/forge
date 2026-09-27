@@ -888,17 +888,19 @@ the design:
    Every other password in the estate now travels as a file; the coordinator's
    `FORGE_NATS_URL` carries one because Forge's code reads its bus address from
    that single setting. Changing that is Forge's own work, not this bundle's.
-9. **The replacement release still needs its image and rehearsal proof.**
+9. **The replacement release still needs qualification and rehearsal proof.**
    Release `2026.09.26-3` already carries the Jarvis serving and state-directory
    fix at `4efff4f`; its exact front-door image passed the serving check during
    preparation. The earlier claim that it predates that fix was stale.
-   The manifest and examples now propose `2026.09.27-1` for the reviewed Forge
-   rollout and sandbox-admission changes. This is a source/metadata candidate,
-   not a built image. Publish its reviewed source, use the normal manifest
-   builder, then bind the operator scripts to the actual immutable image IDs
-   in that receipt and complete the throwaway rehearsal. The operator image
-   constants still name release 3 until that receipt exists; candidate metadata
-   does not qualify the replacement images or authorize rollout.
+   The normal published-source build of `2026.09.27-1` completed successfully
+   from Forge `3956c79eb53960e522f28fc809d110052eb58148`. Its receipt binds manifest
+   SHA-256 `91dd319387efde1cd33f8636ca85a5567139ac1ed196950a6b2803a8e9ab8eb2`,
+   records all five image roles, and reports a two-term sweep with no exceptions.
+   The operator constants now name the immutable Forge coordinator and publisher
+   image IDs recorded by that receipt. These are build facts only: independent
+   package/image qualification and the fresh throwaway rehearsals remain
+   outstanding, so the receipt and pin update do not by themselves authorize
+   rollout.
 10. **Codex's sign-off, and the owner's go.** Nothing here is rollout approval.
 
 ## Why the bus's image is not in the release manifest
