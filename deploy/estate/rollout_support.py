@@ -236,19 +236,23 @@ def stopped(c):
     for role, unit in sorted(c['units'].items()):
         result = run(['systemctl', '--user', 'show', unit, '--property=LoadState,ActiveState,SubState,MainPID,ControlPID', '--no-pager'])
         fields = dict(line.split('=', 1) for line in result.stdout.splitlines() if '=' in line)
-        settled = (fields.get('LoadState') in ('loaded', 'masked')
-                   and fields.get('ActiveState') == 'inactive')
+        settled = fields.get('LoadState') in ('loaded', 'masked')
         if role == 'watchdog_timer':
-            settled = settled and fields.get('SubState') == 'dead'
+            settled = (settled and fields.get('ActiveState') == 'inactive'
+                       and fields.get('SubState') == 'dead')
             # systemd timer objects do not define service process fields. Some
             # versions omit them and others render zero; a nonzero value is
             # still evidence of an incoherent observation.
             settled = settled and all(fields.get(key) in (None, '0') for key in ('MainPID', 'ControlPID'))
         else:
+            settled = settled and (fields.get('ActiveState'), fields.get('SubState')) in (
+                ('inactive', 'dead'),
+                ('failed', 'failed'),
+            )
             # Missing service PID fields are unknown, not implicit zero.
             settled = settled and fields.get('MainPID') == '0' and fields.get('ControlPID') == '0'
         if not settled:
-            refuse(f'unit {unit} is not proved inactive and settled; stop it through the authorized quiesce procedure')
+            refuse(f'unit {unit} is not proved stopped and settled; stop it through the authorized quiesce procedure')
         observations[role] = fields
     containers = {}
     for role, name in c['old_containers'].items():

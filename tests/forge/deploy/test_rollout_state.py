@@ -275,6 +275,20 @@ def test_stopped_accepts_actual_timer_shape_and_zero_pid_services(setup,monkeypa
     assert set(containers) == {'coordinator','memory','relay'}
 
 
+def test_stopped_accepts_failed_services_with_failed_substate_and_zero_pids(setup,monkeypatch):
+    c,_=setup
+    def unit_show(argv, **_kwargs):
+        if argv[3].endswith('.timer'):
+            return SimpleNamespace(stdout='LoadState=loaded\nActiveState=inactive\nSubState=dead\n')
+        return SimpleNamespace(stdout='LoadState=loaded\nActiveState=failed\nSubState=failed\nMainPID=0\nControlPID=0\n')
+    monkeypatch.setattr(r,'run',unit_show)
+    monkeypatch.setattr(r,'inspect',stopped_container)
+    observations, containers = r.stopped(c)
+    assert all(observations[role]['ActiveState'] == 'failed'
+               for role in r.UNIT_ROLES - {'watchdog_timer'})
+    assert set(containers) == {'coordinator','memory','relay'}
+
+
 @pytest.mark.parametrize('missing_or_live',[
     'MainPID=0\nControlPID=123\n',
     'MainPID=0\n',
@@ -287,7 +301,25 @@ def test_stopped_services_require_both_explicit_zero_pids(setup,monkeypatch,miss
             return SimpleNamespace(stdout='LoadState=loaded\nActiveState=inactive\nSubState=dead\n')
         return SimpleNamespace(stdout='LoadState=loaded\nActiveState=inactive\nSubState=dead\n'+missing_or_live)
     monkeypatch.setattr(r,'run',unit_show)
-    with pytest.raises(r.Refusal,match='not proved inactive'):r.stopped(c)
+    with pytest.raises(r.Refusal,match='not proved stopped'):r.stopped(c)
+
+
+@pytest.mark.parametrize('service_fields',[
+    'LoadState=loaded\nActiveState=inactive\nSubState=failed\nMainPID=0\nControlPID=0\n',
+    'LoadState=loaded\nActiveState=failed\nSubState=dead\nMainPID=0\nControlPID=0\n',
+    'LoadState=loaded\nActiveState=failed\nSubState=failed\nMainPID=4\nControlPID=0\n',
+    'LoadState=unknown\nActiveState=failed\nSubState=failed\nMainPID=0\nControlPID=0\n',
+    'LoadState=loaded\nActiveState=unknown\nSubState=failed\nMainPID=0\nControlPID=0\n',
+    'LoadState=loaded\nActiveState=failed\nSubState=unknown\nMainPID=0\nControlPID=0\n',
+])
+def test_stopped_refuses_incoherent_live_or_unknown_service_fields(setup,monkeypatch,service_fields):
+    c,_=setup
+    def unit_show(argv, **_kwargs):
+        if argv[3].endswith('.timer'):
+            return SimpleNamespace(stdout='LoadState=loaded\nActiveState=inactive\nSubState=dead\n')
+        return SimpleNamespace(stdout=service_fields)
+    monkeypatch.setattr(r,'run',unit_show)
+    with pytest.raises(r.Refusal,match='not proved stopped'):r.stopped(c)
 
 
 @pytest.mark.parametrize(('role','suffix'),[
@@ -314,7 +346,7 @@ def test_stopped_refuses_live_or_unknown_timer_fields(setup,monkeypatch,timer_fi
             return SimpleNamespace(stdout=timer_fields)
         return SimpleNamespace(stdout='LoadState=loaded\nActiveState=inactive\nSubState=dead\nMainPID=0\nControlPID=0\n')
     monkeypatch.setattr(r,'run',unit_show)
-    with pytest.raises(r.Refusal,match='not proved inactive'):r.stopped(c)
+    with pytest.raises(r.Refusal,match='not proved stopped'):r.stopped(c)
 
 
 def test_snapshot_failure_keeps_no_invalid_directory(setup,monkeypatch):
