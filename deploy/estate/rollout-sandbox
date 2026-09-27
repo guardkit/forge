@@ -388,7 +388,39 @@ class Rollout:
             require(effective.isdigit() and 0 < int(effective) < 65536 and int(effective) == int(published.rsplit(':',1)[1]),
                     f'effective forwarded {name} does not match the profile destination port; declare and forward the project port before stopping the sandbox')
 
+    def reviewed_image_settings(self):
+        # Read the accepted serialization, never source its shell. Keep this
+        # caller bound to the same platform/layer/runtime-config document that
+        # the unchanged transfer helper and installed template compare.
+        pattern = r"^IMAGE_IDENTITY_DOCUMENT_FORMAT='([^']+)'$"
+        formats = [re.search(pattern, source, re.MULTILINE) for source in
+                   (HANDOFF.read_text(), self.template.decode())]
+        require(all(formats) and formats[0][1] == formats[1][1],
+                'image identity formats disagree; reconcile the accepted helper and current template')
+        document = self.run(['docker','--context',self.config['docker_context'],
+            'image','inspect','--format',formats[0][1],self.config['runtime_image']]).stdout
+        # Match the helper's command-substitution and transport normalization;
+        # JSON escapes configuration line endings, so these are transport only.
+        document = document.rstrip('\n').replace('\r\n','\n').removesuffix('\r').rstrip('\n')
+        header, separator, body = document.partition('\n')
+        require(separator and header == 'forge-image-identity/2',
+                'reviewed immutable image identity is unreadable; keep units masked and inspect that image')
+        identity = json.loads(body)
+        require(isinstance(identity,dict) and set(identity) == {
+            'architecture','os','layers','env','entrypoint','cmd','user','workdir',
+            'labels','ports','volumes','stopsignal'} and isinstance(identity['labels'],dict),
+            'reviewed immutable image identity is incomplete; keep units masked and inspect that image')
+        labels = identity['labels']
+        # Never persist this document: its runtime configuration can contain
+        # environment values. Only its hash and the release labels leave here.
+        return {
+            'FORGE_IMAGE_IDENTITY':digest((document+'\n').encode()),
+            'FORGE_RELEASE_VERSION':labels.get('com.guardkit.release.version'),
+            'FORGE_RELEASE_MANIFEST_SHA256':labels.get('com.guardkit.release.manifest.sha256'),
+        }
+
     def handoff(self):
+        expected = self.reviewed_image_settings()  # Immutable host ID, never the mutable transfer tag.
         resolved = self.run(['docker','--context',self.config['docker_context'],'image','inspect','--format','{{.Id}}',self.s['release_image']]).stdout.strip()
         require(resolved == self.config['runtime_image'], 'release_image tag no longer resolves to the accepted host image; restore its exact release identity before proceeding')
         env = dict(self.env,FORGE_IMAGE=self.s['release_image'],SANDBOX_CLIENT='sbx')
@@ -400,6 +432,8 @@ class Rollout:
             if match and match[1] in names:
                 settings[match[1]] = match[2]
         require(set(settings) == set(names) and settings['FORGE_IMAGE'] == self.s['release_image'] and re.fullmatch(r'[0-9a-f]{64}',settings['FORGE_IMAGE_IDENTITY']) and re.fullmatch(r'[0-9a-f]{64}',settings['FORGE_RELEASE_MANIFEST_SHA256']) and re.fullmatch(r'[A-Za-z0-9_.-]+',settings['FORGE_RELEASE_VERSION']), 'image handoff did not return its complete identity settings; keep units masked and inspect the release')
+        require(all(settings[name] == value for name,value in expected.items()),
+                'image handoff identity or release labels differ from the reviewed immutable image; keep units masked and inspect the transfer tag')
         private_write(self.evidence/'bootstrap-image.env',''.join(name+'='+settings[name]+'\n' for name in names).encode())
         return settings
 
@@ -419,6 +453,8 @@ class Rollout:
                 require(out and out[0] == digest(data), f'installed file differs at {path}; reconcile without re-running legacy shutdown')
             require(Path(self.s['profile_source']).read_bytes() == profile['text'].encode(), 'producer profile differs from the installed profile; reconcile its routes')
             settings = previous['bootstrap_image_settings']
+            reviewed = self.reviewed_image_settings()
+            require(settings.get('FORGE_IMAGE') == self.s['release_image'] and all(settings.get(name) == value for name,value in reviewed.items()), 'existing installation identity differs from the reviewed immutable image; reconcile its receipt and runner settings')
             expected = {name:self.values[name] for name in self.forwarded_names if name in self.values}
             expected.update(settings)
             encoded = ''.join(name+'='+json.dumps(value.replace('$','$$'),ensure_ascii=False)+'\n' for name,value in sorted(expected.items()))
