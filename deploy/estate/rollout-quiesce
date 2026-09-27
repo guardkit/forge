@@ -51,10 +51,22 @@ def private_path(value, *, exists=False):
     if p.exists():need(p.is_file() and p.stat().st_nlink==1, f'private artifact {p} is not one unaliased regular file; preserve it and select a safe path')
     return p
 
+def effective_argv(identity):
+    """Return the process argv independent of Docker's CLI-only split point."""
+    entry=identity.get('entrypoint') or [];command=identity.get('command') or []
+    if isinstance(entry,str):entry=[entry]
+    need(isinstance(entry,list) and all(isinstance(x,str) for x in entry),'old entrypoint is not an explicit string argument list; reconcile its recorded runtime')
+    need(isinstance(command,list) and all(isinstance(x,str) for x in command),'old command is not an explicit string argument list; reconcile its recorded runtime')
+    return entry+command
+
 def stable_runtime(item):
     # Runtime endpoint IDs and assigned IPs disappear on stop. Only declarative
     # network identity/aliases/IPAM options participate in the reconstruction seal.
-    identity={k:v for k,v in item['service_identity'].items() if k!='container_id'}
+    # Docker create accepts one --entrypoint value, so a saved multi-element
+    # Entrypoint is reconstructed as that value plus Cmd. The engine launches the
+    # same concatenated argv; seal that argv while retaining every other identity.
+    identity={k:v for k,v in item['service_identity'].items() if k not in ('container_id','entrypoint','command')}
+    identity['effective_argv']=effective_argv(item['service_identity'])
     networks={k:{f:v.get(f) for f in ('Aliases','Links','IPAMConfig','DriverOpts')} for k,v in item['networks'].items()}
     for network in networks.values():
         network['Aliases']=sorted(a for a in network['Aliases'] or [] if a not in (item['service_identity']['container_id'],item['service_identity']['container_id'][:12]))
