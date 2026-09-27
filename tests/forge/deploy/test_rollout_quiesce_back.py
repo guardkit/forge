@@ -310,6 +310,66 @@ def named_volume(mode='rw',rw=True):
 def volume_runtime(mount):
     network='owned-primary';return {'image_id':r.RUNTIME,'repo_tags':[],'mounts':[mount],'networks':{network:{'Aliases':[],'Links':None,'IPAMConfig':None,'DriverOpts':None}},'port_bindings':{},'restart_policy':{},'network_mode':network,'env_names':[],'service_identity':{'name':'/owned-coordinator','container_id':'a'*64,'hostname':'owned-host','user':'','working_dir':'/app','entrypoint':['python'],'command':['-c','raise SystemExit(0)']}}
 
+def host_runtime(role):
+    argv={'coordinator':['forge','--config','/var/forge/forge.yaml','serve'],'memory':['python','-m','fleet_memory.mcp'],'relay':['faststream','run','fleet_memory.app:app']}[role]
+    entrypoint=argv[:1] if role=='coordinator' else []
+    return {'image_id':r.RUNTIME,'repo_tags':[],'mounts':[],'networks':{'host':{'Aliases':None,'Links':None,'IPAMConfig':None,'DriverOpts':None}},'port_bindings':{},'restart_policy':{'Name':'no','MaximumRetryCount':0},'network_mode':'host','env_names':[],'service_identity':{'name':'/owned-'+role,'container_id':'a'*64,'hostname':'owned-host','user':'','working_dir':'/app','entrypoint':entrypoint,'command':argv[len(entrypoint):]}}
+
+@pytest.mark.parametrize('role',['coordinator','memory','relay'])
+def test_actual_legacy_host_runtime_shape_passes_reconstruction_preflight(estate,monkeypatch,role):
+    recovery=b.Recovery(estate.args);events=[]
+    def docker(c,*args,**kwargs):
+        events.append(args)
+        if args[:2]==('image','inspect'):return SimpleNamespace(stdout=json.dumps([{'Id':r.RUNTIME}]))
+        pytest.fail('host preflight inspected a bridge or mutated a container: '+repr(args))
+    monkeypatch.setattr(r,'docker',docker)
+    recovery.validate_runtime(host_runtime(role))
+    assert events==[('image','inspect',r.RUNTIME)]
+
+def test_create_old_reconstructs_host_network_without_alias_or_publish_translation(estate,monkeypatch):
+    recovery=b.Recovery(estate.args);record=host_runtime('coordinator');created='b'*64;events=[]
+    recovery.doc={'format_version':1,'binding':recovery.binding,'rollback':{'stage':'stopped','created':{},'retired':[]}};journal=recovery.doc['rollback']
+    monkeypatch.setattr(recovery,'old_values',lambda *a:{})
+    def docker(c,*args,**kwargs):
+        events.append(args)
+        if args[:2]==('image','inspect'):return SimpleNamespace(stdout=json.dumps([{'Id':r.RUNTIME}]))
+        if args[0]=='ps':return SimpleNamespace(stdout='')
+        if args[0]=='create':return SimpleNamespace(stdout=created+'\n')
+        pytest.fail('unexpected host reconstruction operation: '+repr(args))
+    monkeypatch.setattr(r,'docker',docker)
+    monkeypatch.setattr(r,'inspect',lambda *a:{'Id':created,'Name':'/owned-coordinator','Image':r.RUNTIME,'State':{'Running':False},'NetworkSettings':{'Networks':{'host':{}}}})
+    monkeypatch.setattr(r,'previous_runtime',lambda *a:record)
+    assert recovery.create_old('coordinator',record,journal)==created
+    create=next(args for args in events if args[0]=='create')
+    assert create[create.index('--network')+1]=='host'
+    assert '--network-alias' not in create and '--publish' not in create
+    assert all(args[:2]!=('network','inspect') and args[:2]!=('network','connect') and args[0]!='start' for args in events)
+
+@pytest.mark.parametrize('case',['container','container-share','mixed','named-with-host','aliases','links','ipam','driver-options','published-port','malformed-port-bindings','missing-option','malformed-network-map','malformed-host-options'])
+def test_unsafe_or_malformed_host_network_shape_refuses_before_container_lookup(estate,monkeypatch,case):
+    record=host_runtime('memory')
+    if case=='container':record['network_mode']='container'
+    elif case=='container-share':record['network_mode']='container:0123456789ab'
+    elif case=='mixed':record['networks']['owned-extra']={'Aliases':None,'Links':None,'IPAMConfig':None,'DriverOpts':None}
+    elif case=='named-with-host':record['network_mode']='owned-primary';record['networks']['owned-primary']={'Aliases':None,'Links':None,'IPAMConfig':None,'DriverOpts':None}
+    elif case=='aliases':record['networks']['host']['Aliases']=['owned-memory']
+    elif case=='links':record['networks']['host']['Links']=['old:new']
+    elif case=='ipam':record['networks']['host']['IPAMConfig']={'IPv4Address':'127.0.0.2'}
+    elif case=='driver-options':record['networks']['host']['DriverOpts']={'x':'y'}
+    elif case=='published-port':record['port_bindings']={'8000/tcp':[{'HostIp':'127.0.0.1','HostPort':'28000'}]}
+    elif case=='malformed-port-bindings':record['port_bindings']=None
+    elif case=='missing-option':del record['networks']['host']['DriverOpts']
+    elif case=='malformed-network-map':record['networks']=[]
+    elif case=='malformed-host-options':record['networks']['host']=[]
+    recovery=b.Recovery(estate.args);events=[]
+    def docker(c,*args,**kwargs):
+        events.append(args)
+        if args[:2]==('image','inspect'):return SimpleNamespace(stdout=json.dumps([{'Id':r.RUNTIME}]))
+        pytest.fail('unsafe host shape reached network or container operation: '+repr(args))
+    monkeypatch.setattr(r,'docker',docker);monkeypatch.setattr(recovery,'old_values',lambda *a:pytest.fail('unsafe host shape reached private values'))
+    with pytest.raises(r.Refusal):recovery.create_old('memory',record,{'stage':'stopped','created':{},'retired':[]})
+    assert events==[('image','inspect',r.RUNTIME)]
+
 def test_three_representative_saved_roles_preserve_process_mount_and_runtime_identity():
     entry=['/bin/sh','-c','exec "$@"','owned-argv0'];network='owned-factory'
     bind_rw={'Type':'bind','Source':'/owned/source-rw','Destination':'/state','Mode':'rw','RW':True,'Propagation':'rprivate'}
