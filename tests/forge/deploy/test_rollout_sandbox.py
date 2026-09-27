@@ -21,6 +21,13 @@ spec = importlib.util.spec_from_loader(loader.name, loader)
 m = importlib.util.module_from_spec(spec)
 loader.exec_module(m)
 IMAGE = 'sha256:' + '1' * 64
+IDENTITY_DOCUMENT = 'forge-image-identity/2\n' + json.dumps({
+    'architecture':'amd64','os':'linux','layers':['sha256:'+'2'*64],
+    'env':['PRIVATE_IMAGE_SETTING=do-not-print'],'entrypoint':[],'cmd':['python'],
+    'user':'','workdir':'/app','labels':{'com.guardkit.release.version':'fixture',
+    'com.guardkit.release.manifest.sha256':'b'*64},'ports':{},'volumes':{},'stopsignal':'',
+},separators=(',',':'))
+IDENTITY = m.digest((IDENTITY_DOCUMENT+'\n').encode())
 
 
 @pytest.fixture
@@ -113,7 +120,7 @@ class Boundary:
                 if self.fault=='unmask':code=1
                 else:self.states[argv[3]]=False
         elif argv[0] == 'docker' and 'inspect' in argv:
-            out=IMAGE
+            out=IDENTITY_DOCUMENT+'\n' if argv[-2].startswith('forge-image-identity/2') else IMAGE
         elif argv[0] == 'docker':
             # Exercise the actual schema/rewrite payload without another Docker.
             original = json.loads(kwargs['input'])
@@ -127,7 +134,7 @@ class Boundary:
                 sys.stdin,sys.stdout=oldin,oldout
         elif argv[0] == 'bash':
             if self.fault == 'image': code=4
-            out='\n'.join('[hand-release-image]   '+k+'='+v for k,v in {'FORGE_IMAGE':'forge:fixture','FORGE_IMAGE_IDENTITY':'a'*64,'FORGE_RELEASE_VERSION':'fixture','FORGE_RELEASE_MANIFEST_SHA256':'b'*64}.items())
+            out='\n'.join('[hand-release-image]   '+k+'='+v for k,v in {'FORGE_IMAGE':'forge:fixture','FORGE_IMAGE_IDENTITY':IDENTITY,'FORGE_RELEASE_VERSION':'fixture','FORGE_RELEASE_MANIFEST_SHA256':'b'*64}.items())
         elif argv[:2] == ['sbx','version']:
             out='Client Version:  v0.42.1 abc123\nBuild Tags: cloud\nServer Version:  v0.42.1 abc123\n'
             if self.fault=='version':out=out.replace('Server Version:  v0.42.1','Server Version:  v0.43.0')
@@ -444,3 +451,115 @@ def test_normal_output_drives_real_template_receipts_and_custom_ports(inventory,
     actual_publishes=[x[-1] for x in b.argv() if x[:3]==['sbx','ports','owned-sandbox'] and '--publish' in x]
     assert '192.0.2.10:8925:9125' in actual_publishes
     assert '192.0.2.10:8924:9124' in actual_publishes
+
+
+@pytest.mark.parametrize('name,value',[
+    ('FORGE_IMAGE_IDENTITY','c'*64),
+    ('FORGE_RELEASE_VERSION','unreviewed'),
+    ('FORGE_RELEASE_MANIFEST_SHA256','c'*64),
+])
+def test_helper_settings_must_match_immutable_reviewed_image(inventory,monkeypatch,capsys,name,value):
+    config,path,args=inventory;b=Boundary(config,monkeypatch);original=b.run
+    def changed(argv,**kw):
+        result=original(argv,**kw)
+        if argv[0]=='bash':
+            lines=result.stdout.splitlines()
+            result.stdout='\n'.join('[hand-release-image]   '+name+'='+value if line.startswith('[hand-release-image]   '+name+'=') else line for line in lines)
+        return result
+    monkeypatch.setattr(m.subprocess,'run',changed)
+    assert m.main(args)==2
+    assert 'reviewed immutable image' in capsys.readouterr().err
+    assert not b.files and all(b.states.values())
+    assert not Path(config['sandbox']['bootstrap_env_file']).exists()
+    assert not (Path(config['sandbox']['evidence_dir'])/'bootstrap-image.env').exists()
+    assert not any(x[:3]==['systemctl','--user','unmask'] for x in b.argv())
+    inspections=[x for x in b.argv() if x[0]=='docker' and 'inspect' in x and x[-2].startswith('forge-image-identity/2')]
+    assert len(inspections)==1 and inspections[0][-1]==config['runtime_image']
+    assert all('PRIVATE_IMAGE_SETTING' not in p.read_text() for p in Path(config['sandbox']['evidence_dir']).glob('*') if p.is_file())
+
+
+@pytest.mark.parametrize('document',['','forge-image-identity/1\n{}','forge-image-identity/2\n{}','forge-image-identity/2\nnot-json'])
+def test_unreadable_immutable_identity_installs_nothing(inventory,monkeypatch,document):
+    config,path,args=inventory;b=Boundary(config,monkeypatch);original=b.run
+    def changed(argv,**kw):
+        result=original(argv,**kw)
+        if argv[0]=='docker' and 'inspect' in argv and argv[-2].startswith('forge-image-identity/2'):
+            result.stdout=document
+        return result
+    monkeypatch.setattr(m.subprocess,'run',changed)
+    assert m.main(args)==2
+    assert not b.files and all(b.states.values())
+    assert not any(x[0]=='bash' for x in b.argv())
+
+
+@pytest.mark.parametrize('racing,nested_style',[(False,'classic'),(True,'classic'),(False,'containerd')])
+def test_real_helper_binds_transfer_to_reviewed_identity(inventory,monkeypatch,tmp_path,racing,nested_style):
+    """Real helper and template, fake engines only; moving A's tag to B refuses."""
+    import shlex
+    spec=importlib.util.spec_from_file_location('handoff_consumer_template',Path(__file__).with_name('test_sandbox_bootstrap_from_the_release_image.py'))
+    bt=importlib.util.module_from_spec(spec);spec.loader.exec_module(bt)
+    config,path,args=inventory
+    config['runtime_image']=bt.ENGINE_ID;config['sandbox']['release_image']=bt.IMAGE
+    path.write_text(json.dumps(config));edit_env(config,{'FORGE_IMAGE':bt.ENGINE_ID})
+    engine_root=tmp_path/'fake-engine';engine_root.mkdir();fake=bt.sandbox.__wrapped__(engine_root)
+    engine=bt.an_engine(images={
+        'the-reviewed-release':bt.an_image(),
+        'the-unreviewed-image':bt.an_image(id_classic=bt.ANOTHER_IMAGE_ID,id_containerd=bt.ANOTHER_IMAGE_ID,env=['UNREVIEWED=changed']),
+    },tags={bt.IMAGE:'the-reviewed-release'},move_tag_to='the-unreviewed-image' if racing else None,move_tag_when='after-the-id')
+    bt._write_the_engine(fake,engine)
+    nested=dict(engine,style=nested_style);nested_table=tmp_path/'nested-table.json';nested_table.write_text(json.dumps(nested))
+    bindir=tmp_path/'bin';bindir.mkdir();client=shlex.quote(str(fake['client']))
+    (bindir/'docker').write_text('#!/bin/bash\nif [[ "${1:-}" == --context ]]; then shift 2; fi\nexec '+client+' "$@"\n')
+    (bindir/'sbx').write_text('#!/bin/bash\n[[ "${1:-}" == exec ]] || exit 90\nshift 2\n[[ "${1:-}" == docker ]] || exit 91\nshift\nexport STANDIN_TABLE='+shlex.quote(str(nested_table))+'\nexec '+client+' "$@"\n')
+    for script in bindir.iterdir():script.chmod(0o755)
+    real_run=subprocess.run
+    with monkeypatch.context() as local:
+        b=Boundary(config,local);boundary=b.run
+        def run(argv,**kw):
+            if (argv[0]=='docker' and 'inspect' in argv) or argv[0]=='bash':
+                b.calls.append((argv,kw));env=dict(kw['env'])
+                env.update({k:v for k,v in bt._settings(fake).items() if k.startswith('STANDIN_')})
+                env['PATH']=str(bindir)+':'+os.environ['PATH']
+                return real_run(argv,**dict(kw,env=env))
+            return boundary(argv,**kw)
+        local.setattr(m.subprocess,'run',run)
+        result=m.main(args)
+    receipt_path=Path(config['sandbox']['evidence_dir'])/'sandbox-installed.json'
+    inspections=bt._what_was_inspected(fake)
+    assert inspections[0]['question']=='the-identity-document' and inspections[0]['reference']==bt.ENGINE_ID
+    if racing:
+        assert result==2 and not receipt_path.exists() and not b.files
+        assert all(b.states.values())
+        assert not Path(config['sandbox']['bootstrap_env_file']).exists()
+        assert not any(x[:3]==['systemctl','--user','unmask'] for x in b.argv())
+        assert any(x['question']=='the-identity-document' and x['reference']==bt.ANOTHER_IMAGE_ID for x in inspections)
+        # The unchanged template also refuses B against the reviewed A identity.
+        refused=bt._run(fake,FORGE_IMAGE_IDENTITY=fake['identity'])
+        assert refused.returncode==2 and not bt._what_was_started(fake)
+    else:
+        assert result==0
+        receipt=json.loads(receipt_path.read_text())
+        assert b.files[config['sandbox']['script_path']]==fake['script'].read_bytes()
+        assert receipt['image']==bt.ENGINE_ID
+        assert receipt['bootstrap_image_settings']['FORGE_IMAGE_IDENTITY']==fake['identity']
+        bt._write_the_engine(fake,nested)
+        runs=bt.TestTheFoldersBothContainersShare._runs_of_a_started_bootstrap(fake,**receipt['bootstrap_image_settings'],SANDBOX_RECEIPTS_PATH=str(tmp_path/'template-receipts'))
+        assert len(runs)==2
+        expected=bt.an_image()['id_'+nested_style]
+        assert [x['resolved'] for x in bt._what_was_started(fake)]==[expected]*2
+        if nested_style=='containerd':assert expected!=bt.ENGINE_ID
+
+
+def test_repeat_does_not_trust_an_old_mismatched_identity_receipt(inventory,monkeypatch,capsys):
+    config,path,args=inventory;b=Boundary(config,monkeypatch)
+    assert m.main(args)==0
+    receipt_path=Path(config['sandbox']['evidence_dir'])/'sandbox-installed.json'
+    receipt=json.loads(receipt_path.read_text())
+    receipt['bootstrap_image_settings']['FORGE_IMAGE_IDENTITY']='c'*64
+    receipt_path.write_text(json.dumps(receipt))
+    runtime=Path(config['sandbox']['bootstrap_env_file'])
+    runtime.write_text(runtime.read_text().replace(IDENTITY,'c'*64))
+    before=len(b.calls)
+    assert m.main(args)==2
+    assert 'reviewed immutable image' in capsys.readouterr().err
+    assert not any(x[:3] in (['systemctl','--user','stop'],['systemctl','--user','unmask']) for x,_ in b.calls[before:])
