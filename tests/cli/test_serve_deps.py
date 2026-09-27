@@ -1168,6 +1168,111 @@ class TestSandboxOnlyCommonDispatch:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
+        "state",
+        [
+            BuildState.QUEUED,
+            BuildState.INTERRUPTED,
+            BuildState.PREPARING,
+            BuildState.RUNNING,
+            BuildState.FINALISING,
+        ],
+    )
+    async def test_production_boot_settles_strict_runless_rows_before_delivery(
+        self,
+        state: BuildState,
+        tmp_path: Path,
+        stub_client: _StubNatsClient,
+        persistence: SqliteLifecyclePersistence,
+    ) -> None:
+        from nats_core.envelope import EventType, MessageEnvelope
+
+        from forge.adapters.nats.pipeline_consumer import handle_message
+        from forge.cli._serve_production import (
+            _build_consumer_reconcile_seam,
+            _build_recovery_reconcile_seam,
+        )
+
+        feature_yaml = tmp_path / "feature.yaml"
+        feature_yaml.write_text("name: synthetic\n", encoding="utf-8")
+        config = self._strict_config(tmp_path)
+        now = datetime(2026, 9, 27, tzinfo=UTC)
+        persistence.connection.execute(
+            "INSERT INTO builds (build_id, feature_id, repo, branch, "
+            "feature_yaml_path, status, triggered_by, correlation_id, "
+            "queued_at, mode) VALUES (?, ?, ?, 'main', ?, ?, 'cli', ?, ?, "
+            "'mode-a')",
+            (
+                "build-d4-boot",
+                "FEAT-D4BOOT",
+                "example/plain",
+                str(feature_yaml),
+                state.value,
+                "corr-d4-boot",
+                now.isoformat(),
+            ),
+        )
+        persistence.connection.commit()
+
+        await _build_recovery_reconcile_seam(persistence, config)(stub_client)
+        await _build_consumer_reconcile_seam(
+            persistence, config, self._Starter()
+        )(stub_client)
+
+        row = persistence.connection.execute(
+            "SELECT status, error FROM builds WHERE build_id = 'build-d4-boot'"
+        ).fetchone()
+        assert row["status"] == BuildState.FAILED.value
+        assert "sandbox-required" in row["error"]
+        assert len(stub_client.published) == 1
+        assert b"sandbox-required" in stub_client.published[0][1]
+
+        payload = {
+            "feature_id": "FEAT-D4BOOT",
+            "repo": "example/plain",
+            "branch": "main",
+            "feature_yaml_path": str(feature_yaml),
+            "max_turns": 5,
+            "sdk_timeout_seconds": 1800,
+            "triggered_by": "cli",
+            "originating_adapter": "cli-wrapper",
+            "originating_user": "synthetic-user",
+            "correlation_id": "corr-d4-boot",
+            "requested_at": now.isoformat(),
+            "queued_at": now.isoformat(),
+            "mode": "mode-a",
+        }
+        envelope = MessageEnvelope(
+            message_id="msg-d4-boot",
+            timestamp=now,
+            version="1.0",
+            source_id="cli-wrapper",
+            event_type=EventType.BUILD_QUEUED,
+            correlation_id="corr-d4-boot",
+            payload=payload,
+        )
+
+        class Message:
+            def __init__(self) -> None:
+                self.data = envelope.model_dump_json().encode("utf-8")
+                self.acks = 0
+
+            async def ack(self) -> None:
+                self.acks += 1
+
+            async def nak(self) -> None:
+                raise AssertionError("terminal duplicate must not nak")
+
+        message = Message()
+        live_deps = build_pipeline_consumer_deps(
+            stub_client, config, persistence, async_task_starter=self._Starter()
+        )
+        await handle_message(message, live_deps)
+
+        assert message.acks == 1
+        assert len(stub_client.published) == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
         "state", [BuildState.QUEUED, BuildState.INTERRUPTED]
     )
     async def test_direct_runless_replay_is_failed_and_acked_before_conductor(
