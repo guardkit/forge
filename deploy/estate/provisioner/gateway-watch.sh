@@ -339,7 +339,7 @@ SLACK_VERDICT=""
 SLACK_SENTENCE=""
 
 check_slack() {
-    local body state last_event_at last_epoch age now
+    local body heartbeat state last_event_at last_epoch age now
 
     if [ ! -e "${HEARTBEAT_PATH}" ]; then
         SLACK_VERDICT="unknown"
@@ -352,13 +352,32 @@ check_slack() {
         SLACK_SENTENCE="the gateway's heartbeat at ${HEARTBEAT_PATH} could not be read, so how its Slack session is cannot be known from here."
         return
     fi
-    state="$(printf '%s' "${body}" | jq -r '.state // empty' 2>/dev/null)"
-    last_event_at="$(printf '%s' "${body}" | jq -r '.last_event_at // empty' 2>/dev/null)"
-    if [ -z "${state}" ] || [ -z "${last_event_at}" ]; then
+
+    # Parse the whole file in one pass. jq normally accepts a stream of JSON
+    # values, so slurping first is what lets this insist on exactly one complete
+    # heartbeat. Keep the contract narrow: the producer may add fields, but the
+    # two fields this watch acts on must have their documented types and the
+    # state must be one the producer can emit. Anything else is evidence this
+    # watch does not understand, never a healthy Slack session.
+    heartbeat="$(printf '%s' "${body}" | jq -cer -s '
+        if length == 1
+           and (.[0] | type == "object")
+           and (.[0].state | type == "string")
+           and ((.[0].state == "connected")
+                or (.[0].state == "connecting")
+                or (.[0].state == "disconnected"))
+           and (.[0].last_event_at | type == "string")
+        then .[0]
+        else empty
+        end
+    ' 2>/dev/null)"
+    if [ -z "${heartbeat}" ]; then
         SLACK_VERDICT="unknown"
-        SLACK_SENTENCE="the gateway's heartbeat at ${HEARTBEAT_PATH} is not in the shape this expects (a state and the time of its last event), so it could not be read."
+        SLACK_SENTENCE="the gateway's heartbeat at ${HEARTBEAT_PATH} is not one complete JSON object with a recognised state and a string time for its last event, so it could not be read."
         return
     fi
+    state="$(printf '%s' "${heartbeat}" | jq -r '.state')"
+    last_event_at="$(printf '%s' "${heartbeat}" | jq -r '.last_event_at')"
 
     last_epoch="$(iso_to_epoch "${last_event_at}")"
     if [ -z "${last_epoch}" ]; then
