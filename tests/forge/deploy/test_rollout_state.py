@@ -37,6 +37,18 @@ spec = importlib.util.spec_from_file_location('rollout_support', BUNDLE / 'rollo
 r = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(r)
 
+@pytest.fixture(autouse=True)
+def packaged_boot_transport(monkeypatch):
+    # The suite already runs inside the pinned runtime; subprocess executes the
+    # real pure boot code while only the Docker transport is replaced.
+    def execute(c, code, args=(), mounts=(), **kwargs):
+        assert code == r.BOOT_SQLITE_CODE, 'unexpected unmocked container operation'
+        root=Path(mounts[0].split('src=')[1].split(',')[0])
+        child=subprocess.run(['python','-c',code.replace('/copy/forge.db',str(root/'forge.db'))],capture_output=True,text=True)
+        if child.returncode: raise r.Refusal('packaged boot derivation failed')
+        return child.stdout
+    monkeypatch.setattr(r,'container_python',execute)
+
 def seed(path, version=16, build=False):
     db = connect_writer(path)
     original = migrations._MIGRATIONS
@@ -276,9 +288,14 @@ def test_previous_runtime_omits_secret_environment_values(setup,monkeypatch):
 
 def receipt_fixture(c,d,meta):
     migrated=r.sha256(d/'forge.db')
+    boot=d/'expected-boot.db';shutil.copyfile(d/'forge.db',boot)
+    child=subprocess.run(['python','-c',r.BOOT_SQLITE_CODE.replace('/copy/forge.db',str(boot))],capture_output=True,text=True)
+    assert child.returncode==0,child.stderr
+    startup=r.consolidated_logical_digest(boot);boot.unlink()
+    r.retain_migrated_artifact(d,d/'forge.db')
     mark={'format_version':1,'snapshot_sha256':meta['sha256'],'snapshot_created_at':meta['created_at'],
           'migrated_sha256':migrated,'source_schema_version':meta['schema_version'],'loaded_schema_version':16,
-          'loaded_logical_sha256':r.consolidated_logical_digest(d/'forge.db'),'startup_logical_sha256':r.consolidated_logical_digest(d/'forge.db')}
+          'loaded_logical_sha256':r.consolidated_logical_digest(d/'forge.db'),'startup_logical_sha256':startup}
     staging=d/'loaded-ledger';staging.mkdir()
     shutil.copyfile(d/'forge.db',staging/'forge.db');r.atomic_json(staging/r.MARK,mark)
     sources={role:r.manifest(c['sources'][role]) for role in ('evidence','threads')}
@@ -482,3 +499,83 @@ def test_normal_boot_wal_and_checkpoint_verify_but_data_change_refuses(setup,mon
         assert r.verify_containers(c,d,meta,receipt,False)['container_verification']
     finally:writer.close()
     assert r.sha256(d/'forge.db')==meta['sha256']
+
+
+def test_forged_self_consistent_startup_claim_refuses(setup):
+    c,d=setup;meta=snapshot_fixture(c,d);receipt=receipt_fixture(c,d,meta)
+    receipt['startup_logical_sha256']=receipt['mark']['startup_logical_sha256']='f'*64
+    marker=(json.dumps(receipt['mark'],sort_keys=True,indent=2)+'\n').encode()
+    import hashlib
+    for entry in receipt['manifests']['ledger']:
+        if entry['path']==r.MARK:entry.update(size=len(marker),sha256=hashlib.sha256(marker).hexdigest())
+    r.validate_receipt(c,meta,receipt)
+    with pytest.raises(r.Refusal,match='independently derived'):r.verify_derivation(c,d,receipt)
+
+@pytest.mark.parametrize('failure',['render','snapshot','incomplete'])
+def test_public_preflight_clears_success_before_refusal(setup,monkeypatch,failure):
+    c,d=setup;meta=snapshot_fixture(c,d);receipt=receipt_fixture(c,d,meta)
+    receipt['container_verification']={'verified_at':'old','services':{'coordinator':{'container_id':'stale'}}}
+    if failure=='incomplete':receipt.pop('mark')
+    r.atomic_json(d/'load-receipt.json',receipt)
+    def refuse(*a,**k):raise r.Refusal('preflight failed')
+    monkeypatch.setattr(r,'rendered',refuse if failure=='render' else lambda c:{})
+    if failure=='snapshot':(d/'forge.db').write_bytes(b'changed snapshot')
+    with pytest.raises(r.Refusal):r.load_volumes(c,d,verify=True)
+    assert r.read_json(d/'load-receipt.json')['container_verification'] is None
+
+def test_early_invalidation_preserves_unparseable_bytes_and_symlink_target(setup,tmp_path):
+    c,d=setup;snapshot_fixture(c,d);p=d/'load-receipt.json';p.write_bytes(b'{broken original')
+    with pytest.raises(r.Refusal,match='malformed'):r.invalidate_verification(d)
+    assert p.read_bytes()==b'{broken original'
+    p.unlink();other=tmp_path/'other.json';other.write_text('{"container_verification":{"old":true}}');p.symlink_to(other)
+    with pytest.raises(r.Refusal,match='symlink'):r.invalidate_verification(d)
+    assert json.loads(other.read_text())['container_verification']=={'old':True}
+
+def test_verify_plan_preserves_prior_attestation_even_on_failure(setup,monkeypatch):
+    c,d=setup;meta=snapshot_fixture(c,d);receipt=receipt_fixture(c,d,meta)
+    receipt['container_verification']={'old':True};r.atomic_json(d/'load-receipt.json',receipt)
+    before=r.manifest(d)
+    monkeypatch.setattr(r,'rendered',lambda c:(_ for _ in ()).throw(r.Refusal('wrong image')))
+    with pytest.raises(r.Refusal):r.load_volumes(c,d,plan=True,verify=True)
+    assert r.manifest(d)==before
+
+@pytest.mark.parametrize('change',['bytes','permissions','missing'])
+def test_retained_artifact_must_remain_original_private_bytes(setup,change):
+    c,d=setup;meta=snapshot_fixture(c,d);receipt=receipt_fixture(c,d,meta);p=d/r.MIGRATED_ARTIFACT
+    if change=='bytes':p.write_bytes(b'changed')
+    elif change=='permissions':p.chmod(0o644)
+    else:p.unlink()
+    with pytest.raises(r.Refusal):r.verify_derivation(c,d,receipt)
+
+def test_cli_configuration_failure_clears_success_before_config_read(setup,monkeypatch,tmp_path):
+    c,d=setup;meta=snapshot_fixture(c,d);receipt=receipt_fixture(c,d,meta)
+    receipt['container_verification']={'old':True};r.atomic_json(d/'load-receipt.json',receipt)
+    invalid=tmp_path/'invalid-config.json';invalid.write_text('{bad config')
+    monkeypatch.setattr(sys,'argv',['rollout-load-volumes','--config',str(invalid),'--snapshot',str(d),'--verify-containers'])
+    assert r.cli('load')==2
+    assert r.read_json(d/'load-receipt.json')['container_verification'] is None
+
+def test_derivation_plan_has_no_disposable_copy_or_container(setup,monkeypatch):
+    c,d=setup;meta=snapshot_fixture(c,d);receipt=receipt_fixture(c,d,meta)
+    before=r.manifest(d.parent)
+    monkeypatch.setattr(r,'container_python',lambda *a,**k:pytest.fail('plan launched derivation'))
+    r.verify_derivation(c,d,receipt,plan=True)
+    assert r.manifest(d.parent)==before
+
+
+def test_early_invalidation_refuses_unrelated_directory(tmp_path):
+    unrelated=tmp_path/'other';unrelated.mkdir();p=unrelated/'load-receipt.json'
+    original=b'{"container_verification":{"unrelated":true}}';p.write_bytes(original)
+    with pytest.raises(r.Refusal,match='dated snapshot'):r.invalidate_verification(unrelated)
+    assert p.read_bytes()==original
+
+
+def test_early_invalidation_refuses_hard_linked_malformed_object(setup,tmp_path):
+    import os
+    c,d=setup;snapshot_fixture(c,d)
+    original=b'{"container_verification":{"old":true},"incomplete":true}'
+    other=tmp_path/'original-input.json';other.write_bytes(original)
+    receipt=d/'load-receipt.json';os.link(other,receipt)
+    with pytest.raises(r.Refusal,match='hard link'):r.invalidate_verification(d)
+    assert other.read_bytes()==receipt.read_bytes()==original
+    assert other.stat().st_ino==receipt.stat().st_ino

@@ -25,6 +25,7 @@ import uuid
 from datetime import datetime, timezone
 
 MARK = 'ROLLOUT-SNAPSHOT.json'
+MIGRATED_ARTIFACT = 'migrated-forge.db'
 RUNTIME = 'sha256:f91d3e4b0f2a63e08dd9525d4ad3dff464a78d1cc0be05ca203760cc1b2a4798'
 UNIT_ROLES = {'gateway', 'frontdoor', 'watchdog_timer', 'watchdog_service', 'autobuild', 'runner', 'keeper', 'langgraph_sidecar', 'deploy_sidecar'}
 VOLUME_ROLES = {'ledger', 'settings', 'evidence', 'threads', 'relay_progress'}
@@ -480,11 +481,79 @@ def verify_loaded(c, receipt, model):
             refuse(f'volume {name} ledger or snapshot mark differs; reconcile it before retrying')
 
 
+def invalidate_verification(directory):
+    """Clear a safely addressed prior success before any fallible preflight.
+
+    Unparseable JSON/other top-level types cannot advertise a consumable success;
+    leave those original bytes intact and refuse. Never follow a receipt symlink.
+    """
+    directory = path(directory)
+    if not directory.is_dir() or not re.fullmatch(r'\d{8}T\d{6}Z(?:-[a-zA-Z0-9_-]+)?', directory.name):
+        refuse('verification target is not an explicit dated snapshot directory; select the intended snapshot before invalidating a receipt')
+    receipt_path = path(directory / 'load-receipt.json', exists=False)
+    if not receipt_path.exists(): return
+    if not directory.is_dir() or not receipt_path.is_file():
+        refuse('verification receipt is not a regular file in the explicit snapshot directory; select the intended snapshot')
+    if receipt_path.stat().st_nlink != 1:
+        refuse('verification receipt aliases another file through a hard link; preserve the original inputs and select an unaliased receipt')
+    try:
+        receipt = json.loads(receipt_path.read_text())
+    except (ValueError, UnicodeError):
+        refuse('verification receipt is malformed and has no valid attestation; preserve its original bytes and reconcile it')
+    if not isinstance(receipt, dict):
+        refuse('verification receipt is not an object and has no valid attestation; preserve its original bytes and reconcile it')
+    if receipt.get('container_verification') is not None:
+        receipt['container_verification'] = None
+        atomic_json(receipt_path, receipt)
+
+
+def retain_migrated_artifact(directory, source):
+    """Install a private, non-overwriting exact copy after successful volume load."""
+    destination = path(directory / MIGRATED_ARTIFACT, exists=False)
+    fd, temporary = tempfile.mkstemp(prefix='.migrated-', dir=directory)
+    try:
+        with os.fdopen(fd, 'wb') as target, open(source, 'rb') as original:
+            shutil.copyfileobj(original, target); target.flush(); os.fsync(target.fileno())
+        os.link(temporary, destination)  # fails closed if anything already owns this name
+        fd = os.open(directory, os.O_DIRECTORY)
+        try: os.fsync(fd)
+        finally: os.close(fd)
+    finally:
+        os.unlink(temporary)
+
+
+def verify_derivation(c, directory, receipt, plan=False):
+    artifact = path(directory / MIGRATED_ARTIFACT)
+    stat = artifact.stat()
+    if not artifact.is_file() or stat.st_uid != os.geteuid() or stat.st_mode & 0o777 != 0o600:
+        refuse('retained migrated artifact has incorrect ownership or permissions; reconcile its private original copy')
+    if sha256(artifact) != receipt['migrated_sha256']:
+        refuse('retained migrated artifact differs from the recorded loaded bytes; reconcile the original migration evidence')
+    if ledger_state(artifact, consolidated=True)['schema_version'] != 16:
+        refuse('retained migrated artifact has the wrong schema; reconcile the original migration evidence')
+    loaded = consolidated_logical_digest(artifact)
+    if loaded != receipt['loaded_logical_sha256']:
+        refuse('claimed loaded state differs from the retained migrated artifact; reconcile the receipt')
+    if plan: return  # preview cannot launch a derivation container or claim fresh proof
+    with tempfile.TemporaryDirectory(prefix='.verify-boot-', dir=directory.parent) as temporary:
+        temporary = Path(temporary)
+        shutil.copyfile(artifact, temporary / 'forge.db')
+        container_python(c, BOOT_SQLITE_CODE, mounts=[f'type=bind,src={temporary},dst=/copy'])
+        ledger_state(temporary / 'forge.db', consolidated=True)
+        startup = consolidated_logical_digest(temporary / 'forge.db')
+    if sha256(artifact) != receipt['migrated_sha256']:
+        refuse('retained migrated artifact changed during derivation; stop and reconcile the original migration evidence')
+    if startup != receipt['startup_logical_sha256']:
+        refuse('claimed startup state differs from independently derived normal boot; reconcile the receipt')
+
+
 def verify_containers(c, directory, metadata, receipt, plan):
-    mark = validate_receipt(c, metadata, receipt)
+    if not plan: invalidate_verification(directory)
     if not plan and receipt['container_verification'] is not None:
         receipt['container_verification'] = None
         atomic_json(directory / 'load-receipt.json', receipt)
+    mark = validate_receipt(c, metadata, receipt)
+    verify_derivation(c, directory, receipt, plan)
     results = {}
     for service in ('coordinator', 'answer-service', 'forge-publisher'):
         ids = compose(c, 'ps', '--all', '-q', service).stdout.split()
@@ -539,7 +608,9 @@ print(json.dumps({'main_sha256':main_sha,'logical_sha256':logical,'schema_versio
     return {'plan': plan, 'container_verification': results}
 
 def load_volumes(c, directory, plan=False, verify=False):
-    directory = path(directory); metadata = verify_snapshot(directory)
+    directory = path(directory)
+    if verify and not plan: invalidate_verification(directory)
+    metadata = verify_snapshot(directory)
     if metadata['project'] != c['project']: refuse('snapshot belongs to another Compose project; select its matching project')
     model = rendered(c)
     if verify:
@@ -551,7 +622,7 @@ def load_volumes(c, directory, plan=False, verify=False):
     if Path(sources['relay_progress']).name != 'relay-progress.json': refuse('relay source is not relay-progress.json; name only the relay progress file')
     # Planning performs no helper-container, receipt-reader probe, mkdir or volume creation.
     if plan:
-        return {'plan': True, 'snapshot_sha256': metadata['sha256'], 'source_schema': metadata['schema_version'], 'volumes': c['volumes'], 'actions': ['migrate a disposable copy with accepted runtime', 'refuse occupied volumes unless every byte matches the existing receipt', 'copy and compare every filename, size and SHA-256', 'verify real service snapshot marks later with --verify-containers'], 'not_copied': ['retained bus', 'Postgres', 'project and seed folders', 'chronicler and liveness files', 'gateway heartbeat']}
+        return {'plan': True, 'snapshot_sha256': metadata['sha256'], 'source_schema': metadata['schema_version'], 'volumes': c['volumes'], 'actions': ['migrate a disposable copy with accepted runtime', 'derive complete loaded and normal SQLite boot states', 'refuse occupied volumes unless every byte matches the existing receipt', 'copy and compare every filename, size and SHA-256', 'retain private migrated-forge.db beside the original snapshot', 'verify real service snapshot marks later with --verify-containers'], 'not_copied': ['retained bus', 'Postgres', 'project and seed folders', 'chronicler and liveness files', 'gateway heartbeat']}
     stopped(c)
     source_manifests = {role: manifest(sources[role]) for role in ('evidence', 'threads')}
     for role, filename in [('settings', 'forge.yaml'), ('relay_progress', 'relay-progress.json')]:
@@ -569,6 +640,7 @@ def load_volumes(c, directory, plan=False, verify=False):
     if receipt_path.exists():
         receipt = read_json(receipt_path)
         validate_receipt(c, metadata, receipt, source_manifests)
+        verify_derivation(c, directory, receipt)
         if receipt['container_verification'] is not None:
             receipt['container_verification'] = None
             atomic_json(receipt_path, receipt)
@@ -577,6 +649,8 @@ def load_volumes(c, directory, plan=False, verify=False):
         verify_loaded(c, receipt, model)
         return {'idempotent': True, 'snapshot_sha256': metadata['sha256'], 'container_verification': None,
                 'next_action': 'run --verify-containers against the actual closed-door services'}
+    if path(directory / MIGRATED_ARTIFACT, exists=False).exists():
+        refuse('a retained migrated artifact exists without a load receipt; preserve it and reconcile the interrupted load')
     if any(items for items in inventory.values()): refuse('a destination volume is occupied without a matching verified receipt; select empty new volumes')
     with tempfile.TemporaryDirectory(prefix='.load-', dir=directory.parent) as temporary:
         temp = Path(temporary)
@@ -635,6 +709,7 @@ def load_volumes(c, directory, plan=False, verify=False):
             receipt = {'format_version': 1, 'project': c['project'], 'snapshot_sha256': metadata['sha256'], 'migrated_sha256': mark['migrated_sha256'], 'runtime_image': c['runtime_image'], 'volumes': c['volumes'], 'manifests': expected, 'source_manifests': source_manifests, 'mark': mark, 'loaded_logical_sha256': loaded_logical, 'startup_logical_sha256': startup_logical, 'container_verification': None}
             validate_receipt(c, metadata, receipt, source_manifests)
             verify_loaded(c, receipt, model)
+            retain_migrated_artifact(directory, ledger)
             atomic_json(receipt_path, receipt)
         except BaseException:
             for name in reversed(created): docker(c, 'volume', 'rm', name, check=False)
@@ -663,4 +738,9 @@ def cli(command):
     parser.add_argument('--plan', action='store_true', help='read-only preview, creating no files, containers or volumes')
     if command == 'load': parser.add_argument('--verify-containers', action='store_true', help='read the snapshot mark in all three actual running services')
     args = parser.parse_args()
-    return main_guard(lambda: snapshot(config(args.config, args.env_file, args.project), args.snapshot, args.plan) if command == 'snapshot' else load_volumes(config(args.config, args.env_file, args.project), args.snapshot, args.plan, args.verify_containers))
+    def execute():
+        if command == 'load' and args.verify_containers and not args.plan:
+            invalidate_verification(args.snapshot)
+        c = config(args.config, args.env_file, args.project)
+        return snapshot(c, args.snapshot, args.plan) if command == 'snapshot' else load_volumes(c, args.snapshot, args.plan, args.verify_containers)
+    return main_guard(execute)
