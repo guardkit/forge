@@ -149,9 +149,38 @@ def test_failed_recheck_and_unknown_start_time_cannot_reuse_a_pass(probe) -> Non
         state.chmod(0o755)
 
     assert run().returncode == 0
-    unreadable = run(read=True, MOCK_STARTED_AT="unreadable")
-    assert unreadable.returncode == 1
-    assert "start time could not be read" in unreadable.stdout
+    for started_at in ("", " ", "unreadable"):
+        unreadable = run(read=True, MOCK_STARTED_AT=started_at)
+        assert unreadable.returncode == 1
+        assert "start time could not be read" in unreadable.stdout
+
+
+def test_wholly_unwritable_store_refuses_without_claiming_a_failed_check(probe) -> None:
+    run, state, _, _ = probe
+    assert run().returncode == 0
+    assert run(read=True).returncode == 0
+    receipt = state / "pre-resume.json"
+    saved = receipt.read_bytes()
+    receipt.chmod(0o444)
+    state.chmod(0o555)
+    try:
+        blocked = run("producer")
+        assert blocked.returncode == 2, blocked.stdout + blocked.stderr
+        assert "DID NOT START" in blocked.stderr
+        assert "no service item was checked" in blocked.stderr
+        assert receipt.read_bytes() == saved
+        refused = run(read=True)
+        assert refused.returncode == 1, refused.stdout + refused.stderr
+        assert "store is unusable" in refused.stdout
+        assert "not itself a later failed check" in refused.stdout
+    finally:
+        state.chmod(0o755)
+        receipt.chmod(0o644)
+
+    # The blocked attempt never reached an item, so restoring the store makes
+    # the still-current pass readable again; a subsequent real check supersedes it.
+    assert run(read=True).returncode == 0
+    assert run().returncode == 0
 
 
 def test_host_bus_mode_success_does_not_abort_on_a_helper_local(probe, tmp_path: Path) -> None:
