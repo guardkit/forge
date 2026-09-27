@@ -112,56 +112,92 @@ def marker_file(value):
     if not isinstance(value,dict):raise ValueError('present resume marker is not an object')
     return {'present':True,'value':value}
 
-def ledger_holders(root, proc='/proc'):
-    """Observe inode identities, never descriptor contents, environment or commands."""
-    import os, pathlib, stat
-    root=pathlib.Path(root);proc=pathlib.Path(proc);unknown=[];holders=[]
+def ledger_lease_proof(root):
+    """Prove no open DB/WAL/SHM description without inspecting any process."""
+    import ctypes, errno, fcntl, os, pathlib, signal, stat
+    root=pathlib.Path(root);names=('forge.db','forge.db-wal','forge.db-shm')
+    class Failure(Exception):
+        def __init__(self,kind,reason,number=None):self.kind=kind;self.reason=reason;self.number=number
+    class StatFS(ctypes.Structure):
+        _fields_=[('f_type',ctypes.c_long),('f_bsize',ctypes.c_long),('f_blocks',ctypes.c_ulong),('f_bfree',ctypes.c_ulong),('f_bavail',ctypes.c_ulong),('f_files',ctypes.c_ulong),('f_ffree',ctypes.c_ulong),('f_fsid',ctypes.c_int*2),('f_namelen',ctypes.c_long),('f_frsize',ctypes.c_long),('f_flags',ctypes.c_long),('f_spare',ctypes.c_long*4)]
+    allowed={0xEF53:'ext',0x58465342:'xfs',0x9123683E:'btrfs'};rootfd=None;root_identity=None
+    def filesystem(fd):
+        item=StatFS();libc=ctypes.CDLL(None,use_errno=True)
+        if libc.fstatfs(fd,ctypes.byref(item)):
+            number=ctypes.get_errno();raise Failure('unknown','filesystem identity is unreadable',number)
+        magic=item.f_type & ((1 << (ctypes.sizeof(ctypes.c_long)*8))-1)
+        if magic not in allowed:raise Failure('unsupported','ledger filesystem is not an allowlisted host-local type')
+        return {'name':allowed[magic],'magic':hex(magic)}
+    def identity(item):
+        return [item.st_dev,item.st_ino,item.st_size,item.st_mtime_ns,stat.S_IMODE(item.st_mode),item.st_uid,item.st_gid]
     def identities():
+        base=os.fstat(rootfd)
+        if identity(base)!=root_identity:raise Failure('identity','ledger volume root identity changed')
         result={}
-        for name in ('forge.db','forge.db-wal','forge.db-shm'):
-            path=root/name
-            try:item=path.lstat()
+        for name in names:
+            try:item=os.stat(name,dir_fd=rootfd,follow_symlinks=False)
             except FileNotFoundError:
-                if name=='forge.db':raise ValueError('current ledger is absent')
+                if name=='forge.db':raise Failure('identity','current ledger is absent')
                 continue
-            if not stat.S_ISREG(item.st_mode) or item.st_nlink!=1:raise ValueError('current ledger file identity is unsafe')
-            result[name]=[item.st_dev,item.st_ino]
+            if (not stat.S_ISREG(item.st_mode) or item.st_nlink!=1 or item.st_dev!=base.st_dev
+                    or item.st_uid!=os.geteuid() or item.st_gid!=os.getegid()
+                    or stat.S_IMODE(item.st_mode) not in (0o600,0o644)):
+                raise Failure('identity','current ledger file identity, ownership, mode or filesystem is unsafe')
+            result[name]=identity(item)
         return result
-    initial=identities();wanted={tuple(value):key for key,value in initial.items()}
-    namespace=os.readlink(str(proc/'self/ns/pid'));initial_namespace=os.readlink(str(proc/'1/ns/pid'))
-    if namespace!=initial_namespace:raise ValueError('complete selected PID namespace is unavailable')
-    seen=set()
-    for attempt in range(3):
-        processes={p.name:p for p in proc.iterdir() if p.name.isdecimal()}
-        for pid in sorted(set(processes)-seen,key=int):
-            process=processes[pid]
+    leases=[];descriptors=[];cleanup=[];oldmask=None;result={'format_version':1,'complete':False,'cleanup_complete':False}
+    try:
+        for constant in ('F_SETLEASE','F_GETLEASE','F_SETOWN'):
+            if not hasattr(fcntl,constant):raise Failure('unsupported','required Linux lease operation is unavailable')
+        oldmask=signal.pthread_sigmask(signal.SIG_BLOCK,{signal.SIGIO})
+        before=root.lstat()
+        if not stat.S_ISDIR(before.st_mode) or before.st_uid!=os.geteuid() or before.st_gid!=os.getegid() or stat.S_IMODE(before.st_mode)!=0o755:
+            raise Failure('identity','ledger volume root is not the exact owned mode-0755 directory')
+        rootfd=os.open(root,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_NONBLOCK);descriptors.append(rootfd)
+        opened_root=os.fstat(rootfd);root_identity=identity(opened_root)
+        if root_identity!=identity(before):raise Failure('identity','ledger volume root changed while it was opened')
+        fs=filesystem(rootfd);initial=identities();result.update(files=initial,filesystem=fs)
+        for name in sorted(initial):
+            try:fd=os.open(name,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=rootfd)
+            except OSError as e:
+                raise Failure('holder' if e.errno==errno.EAGAIN else 'unknown','ledger open conflicts with an existing lease' if e.errno==errno.EAGAIN else 'ledger cannot be opened safely',e.errno)
+            descriptors.append(fd);opened=os.fstat(fd)
+            if identity(opened)!=initial[name] or filesystem(fd)!=fs:
+                raise Failure('identity','ledger identity or filesystem changed while it was opened')
             try:
-                process_identity=process.stat().st_ino;descriptors=list((process/'fd').iterdir())
-            except FileNotFoundError:continue
-            except OSError:unknown.append({'pid':int(pid),'reason':'descriptor directory unreadable'});continue
-            for descriptor in descriptors:
-                try:opened=descriptor.stat()
-                except FileNotFoundError:continue
-                except OSError:unknown.append({'pid':int(pid),'reason':'descriptor identity unreadable'});continue
-                name=wanted.get((opened.st_dev,opened.st_ino))
-                if name:holders.append({'pid':int(pid),'fd':descriptor.name,'file':name})
+                fcntl.fcntl(fd,fcntl.F_SETOWN,os.getpid())
+                if hasattr(fcntl,'F_SETSIG'):fcntl.fcntl(fd,fcntl.F_SETSIG,signal.SIGIO)
+                fcntl.fcntl(fd,fcntl.F_SETLEASE,fcntl.F_WRLCK)
+            except OSError as e:
+                raise Failure('holder' if e.errno==errno.EAGAIN else 'unknown','ledger has an open holder' if e.errno==errno.EAGAIN else 'exclusive ledger lease is unavailable',e.errno)
+            leases.append(fd)
+        if identities()!=initial or identity(root.lstat())!=root_identity:
+            raise Failure('identity','ledger presence or identity changed during lease acquisition')
+        if signal.SIGIO in signal.sigpending():raise Failure('break','a new ledger open raced with holder proof')
+        if any(fcntl.fcntl(fd,fcntl.F_GETLEASE)!=fcntl.F_WRLCK for fd in leases):
+            raise Failure('break','a ledger lease break is pending')
+        result.update(complete=True,kind='clean',reason='every present owned local ledger inode was exclusively leased and stable')
+    except Failure as e:
+        result.update(complete=False,kind=e.kind,reason=e.reason)
+        if e.number is not None:result['errno']=e.number
+    except BaseException:
+        result.update(complete=False,kind='unknown',reason='unexpected lease proof failure')
+    finally:
+        for fd in reversed(leases):
+            try:fcntl.fcntl(fd,fcntl.F_SETLEASE,fcntl.F_UNLCK)
+            except BaseException:cleanup.append('lease release failed')
+        for fd in reversed(descriptors):
+            try:os.close(fd)
+            except BaseException:cleanup.append('descriptor close failed')
+        if oldmask is not None:
             try:
-                with (process/'maps').open() as maps:
-                    for line in maps:
-                        fields=line.split(None,5)
-                        if len(fields)<5:raise ValueError('process mapping identity is malformed')
-                        major,minor=fields[3].split(':');identity=(os.makedev(int(major,16),int(minor,16)),int(fields[4]))
-                        name=wanted.get(identity)
-                        if name:holders.append({'pid':int(pid),'mapping':True,'file':name})
-                if process.stat().st_ino!=process_identity:raise ValueError('process identity changed during census')
-            except FileNotFoundError:continue
-            except (OSError,ValueError):unknown.append({'pid':int(pid),'reason':'mapped-file identities unreadable or unstable'})
-            seen.add(pid)
-        if not ({p.name for p in proc.iterdir() if p.name.isdecimal()}-seen):break
-    else:unknown.append({'reason':'process census kept changing'})
-    if initial!=identities():unknown.append({'reason':'ledger identities changed during census'})
-    return {'format_version':1,'complete':not unknown,'holders':holders,'unknown':unknown,'files':initial,'pid_namespace':namespace,'processes_examined':len(seen)}
-
+                if signal.SIGIO in signal.sigpending():result.update(complete=False,kind='break',reason='a ledger lease break signal is pending')
+                while signal.SIGIO in signal.sigpending():signal.sigtimedwait({signal.SIGIO},0)
+                signal.pthread_sigmask(signal.SIG_SETMASK,oldmask)
+            except BaseException:cleanup.append('signal cleanup failed')
+        if cleanup:result.update(complete=False,kind='unknown',reason='lease proof cleanup is uncertain',cleanup_errors=cleanup)
+        result['cleanup_complete']=not cleanup
+    return result
 
 class Estate:
     def __init__(self,args):
@@ -302,13 +338,19 @@ class Estate:
         return host
     def current_holders(self):
         name=self.c['volumes']['ledger'];r.volume_identity(self.c,name,self.model())
-        code=inspect_source.getsource(ledger_holders)+"\nimport json;print(json.dumps(ledger_holders('/state')))"
-        args=['run','--rm','--name',self.c['project']+'-holder-census-'+uuid.uuid4().hex[:12],'--network','none','--pid','host','--cap-add','SYS_PTRACE','--read-only','--user','0:0','--tmpfs','/tmp','-e','PYTHONDONTWRITEBYTECODE=1','--mount',f'type=volume,src={name},dst=/state,readonly','--entrypoint','python',self.c['runtime_image'],'-c',code]
-        try:census=json.loads(r.docker(self.c,*args).stdout)
-        except Exception:r.refuse('complete current DB/WAL/SHM holder census is unavailable; keep authority stopped and obtain authorized process visibility')
-        need(isinstance(census,dict) and census.get('complete') is True and census.get('unknown')==[],'current DB/WAL/SHM holder census is incomplete; keep authority stopped and reconcile process visibility')
-        need(census.get('holders')==[],'current DB/WAL/SHM has an open holder; ask its explicit owner to stop it before proceeding')
-        return census
+        code=inspect_source.getsource(ledger_lease_proof)+"\nimport json;print(json.dumps(ledger_lease_proof('/state')))"
+        args=['run','--rm','--pull','never','--name',self.c['project']+'-holder-proof-'+uuid.uuid4().hex[:12],'--network','none','--read-only','--cap-drop','ALL','--security-opt','no-new-privileges:true','--user','1000:1000','-e','PYTHONDONTWRITEBYTECODE=1','--mount',f'type=volume,src={name},dst=/state,readonly','--entrypoint','python',self.c['runtime_image'],'-c',code]
+        try:proof=json.loads(r.docker(self.c,*args).stdout)
+        except Exception:r.refuse('current DB/WAL/SHM lease proof is unavailable; keep authority stopped and reconcile local storage access')
+        need(isinstance(proof,dict) and proof.get('format_version')==1 and proof.get('cleanup_complete') is True,'current DB/WAL/SHM lease proof is incomplete; keep authority stopped and reconcile local storage access')
+        need(proof.get('complete') is True,'current DB/WAL/SHM has a holder, changed identity, or unavailable lease proof; keep authority stopped and reconcile it')
+        files=proof.get('files');filesystem=proof.get('filesystem')
+        need(isinstance(files,dict) and 'forge.db' in files and set(files)<= {'forge.db','forge.db-wal','forge.db-shm'}
+            and all(isinstance(value,list) and len(value)==7 and all(type(x) is int for x in value)
+                and value[4] in (0o600,0o644) and value[5:]==[1000,1000] for value in files.values())
+            and filesystem in ({'name':'ext','magic':'0xef53'},{'name':'xfs','magic':'0x58465342'},{'name':'btrfs','magic':'0x9123683e'})
+            and proof.get('kind')=='clean','current DB/WAL/SHM lease proof has malformed positive evidence; keep authority stopped and reconcile it')
+        return proof
 
     def current_state(self):
         code='import pathlib,sqlite3,json,hashlib\nfrom contextlib import closing\nPath=pathlib.Path\nWORK_TABLES='+repr(r.WORK_TABLES)+'\n'+inspect_source.getsource(r.Refusal)+inspect_source.getsource(r.refuse)+inspect_source.getsource(r.path)+inspect_source.getsource(r.ledger_state)+inspect_source.getsource(r.logical_digest)+'''

@@ -283,43 +283,141 @@ def test_real_exit42_diagnostic_is_private_and_sanitized(estate):
     output=estate.snapshot/'diagnostic.json';r.atomic_json(output,events)
     assert output.stat().st_mode&0o777==0o600
 
-def test_exact_holder_algorithm_clean_and_idle_alias_in_owned_namespace(estate,tmp_path):
-    root=Path(estate.c['source_db']).parent
-    assert q.ledger_holders(root)['complete'] and not q.ledger_holders(root)['holders']
-    alias=tmp_path/'alias';alias.symlink_to(root,target_is_directory=True)
+def local_lease_fs(monkeypatch):
+    """Keep the real tmpfs lease syscalls; substitute only its FS-type label."""
+    import ctypes
+    actual=ctypes.CDLL
+    class Local:
+        def __init__(self,*args,**kwargs):self.lib=actual(*args,**kwargs)
+        def fstatfs(self,fd,item):
+            answer=self.lib.fstatfs(fd,item);item._obj.f_type=0xEF53;return answer
+    monkeypatch.setattr(ctypes,'CDLL',Local)
+
+def lease_root(tmp_path,mode=0o644,sidecars=True):
+    root=tmp_path/'lease-state';root.mkdir();root.chmod(0o755)
+    files=('forge.db','forge.db-wal','forge.db-shm') if sidecars else ('forge.db',)
+    for name in files:
+        item=root/name;item.write_bytes((name*512).encode()[:4096]);item.chmod(mode)
+    return root
+
+@pytest.mark.parametrize('mode',[0o600,0o644])
+@pytest.mark.parametrize('sidecars',[False,True])
+def test_exact_lease_algorithm_accepts_owned_modes_and_optional_sidecars(tmp_path,monkeypatch,mode,sidecars):
+    local_lease_fs(monkeypatch);proof=q.ledger_lease_proof(lease_root(tmp_path,mode,sidecars))
+    assert proof['complete'] and proof['cleanup_complete'] and proof['kind']=='clean'
+    assert sorted(proof['files'])==(['forge.db','forge.db-shm','forge.db-wal'] if sidecars else ['forge.db'])
+
+@pytest.mark.parametrize('opened',['forge.db','forge.db-wal','forge.db-shm'])
+@pytest.mark.parametrize('mode',['rb','r+b'])
+def test_lease_algorithm_refuses_each_readonly_or_writable_holder(tmp_path,monkeypatch,opened,mode):
+    local_lease_fs(monkeypatch);root=lease_root(tmp_path)
+    with (root/opened).open(mode):
+        proof=q.ledger_lease_proof(root)
+        assert not proof['complete'] and proof['kind']=='holder' and proof['errno']==11
+    assert q.ledger_lease_proof(root)['complete']
+
+def test_lease_algorithm_catches_idle_alias_holder(tmp_path,monkeypatch):
+    local_lease_fs(monkeypatch);root=lease_root(tmp_path);alias=tmp_path/'alias';alias.symlink_to(root,target_is_directory=True)
     with (alias/'forge.db').open('r+b'):
-        result=q.ledger_holders(root)
-        assert result['complete'] and any(row['file']=='forge.db' for row in result['holders'])
-    assert not q.ledger_holders(root)['holders']
+        proof=q.ledger_lease_proof(root)
+        assert not proof['complete'] and proof['kind']=='holder'
 
-def test_holder_unknown_permissions_is_not_absence(estate,monkeypatch):
-    original=Path.iterdir
-    def unreadable(p):
-        if str(p)=='/proc/1/fd':raise PermissionError('owned test visibility denied')
-        return original(p)
-    monkeypatch.setattr(Path,'iterdir',unreadable)
-    proof=q.ledger_holders(Path(estate.c['source_db']).parent)
-    assert not proof['complete'] and proof['unknown']
+@pytest.mark.parametrize('access',["read","copy","write"])
+def test_lease_algorithm_catches_mapping_after_original_fd_closed(tmp_path,monkeypatch,access):
+    import mmap
+    local_lease_fs(monkeypatch);root=lease_root(tmp_path);flags={'read':mmap.ACCESS_READ,'copy':mmap.ACCESS_COPY,'write':mmap.ACCESS_WRITE}
+    fd=os.open(root/'forge.db',os.O_RDONLY if access!='write' else os.O_RDWR)
+    mapped=mmap.mmap(fd,0,access=flags[access]);os.close(fd)
+    try:
+        proof=q.ledger_lease_proof(root)
+        assert not proof['complete'] and proof['kind']=='holder'
+    finally:mapped.close()
+    assert q.ledger_lease_proof(root)['complete']
 
-@pytest.mark.parametrize('proof',[{'complete':False,'unknown':[{'reason':'permission'}],'holders':[]},{'complete':True,'unknown':[],'holders':[{'pid':1,'file':'forge.db'}]}])
-def test_public_holder_gate_refuses_unknown_or_actual_holder_without_execution(estate,monkeypatch,proof):
-    monkeypatch.setattr(estate,'model',lambda:{});monkeypatch.setattr(r,'volume_identity',lambda *a:{})
+@pytest.mark.parametrize('unsafe_mode',[0o640,0o666])
+def test_lease_algorithm_refuses_unaccepted_file_mode(tmp_path,monkeypatch,unsafe_mode):
+    local_lease_fs(monkeypatch);root=lease_root(tmp_path);(root/'forge.db').chmod(unsafe_mode)
+    proof=q.ledger_lease_proof(root)
+    assert not proof['complete'] and proof['kind']=='identity'
+
+def test_lease_cleanup_failure_is_unknown_not_success(tmp_path,monkeypatch):
+    import fcntl
+    local_lease_fs(monkeypatch);root=lease_root(tmp_path,sidecars=False);actual=fcntl.fcntl
+    def fail_unlock(fd,operation,arg=0):
+        if operation==fcntl.F_SETLEASE and arg==fcntl.F_UNLCK:raise OSError(5,'owned cleanup failure')
+        return actual(fd,operation,arg)
+    monkeypatch.setattr(fcntl,'fcntl',fail_unlock)
+    proof=q.ledger_lease_proof(root)
+    assert not proof['complete'] and not proof['cleanup_complete'] and proof['kind']=='unknown'
+
+def test_lease_file_on_another_filesystem_is_identity_failure(tmp_path,monkeypatch):
+    import ctypes
+    root=lease_root(tmp_path,sidecars=False);actual=ctypes.CDLL;calls=0
+    class Mixed:
+        def __init__(self,*args,**kwargs):self.lib=actual(*args,**kwargs)
+        def fstatfs(self,fd,item):
+            nonlocal calls
+            answer=self.lib.fstatfs(fd,item);calls+=1;item._obj.f_type=0xEF53 if calls==1 else 0x58465342;return answer
+    monkeypatch.setattr(ctypes,'CDLL',Mixed)
+    proof=q.ledger_lease_proof(root)
+    assert not proof['complete'] and proof['kind']=='identity' and proof['cleanup_complete']
+
+def test_lease_permission_error_is_unknown(tmp_path,monkeypatch):
+    import errno
+    local_lease_fs(monkeypatch);root=lease_root(tmp_path,sidecars=False);actual=os.open
+    def denied(path,*args,**kwargs):
+        if path=='forge.db':raise PermissionError(errno.EACCES,'owned permission fixture')
+        return actual(path,*args,**kwargs)
+    monkeypatch.setattr(os,'open',denied)
+    proof=q.ledger_lease_proof(root)
+    assert not proof['complete'] and proof['kind']=='unknown' and proof['errno']==errno.EACCES
+
+def test_lease_presence_race_is_identity_failure(tmp_path,monkeypatch):
+    local_lease_fs(monkeypatch);root=lease_root(tmp_path);actual=os.stat;first=True
+    def appearing(path,*args,**kwargs):
+        nonlocal first
+        if path=='forge.db-shm' and kwargs.get('dir_fd') is not None and first:
+            first=False;raise FileNotFoundError(path)
+        return actual(path,*args,**kwargs)
+    monkeypatch.setattr(os,'stat',appearing)
+    proof=q.ledger_lease_proof(root)
+    assert not proof['complete'] and proof['kind']=='identity' and proof['cleanup_complete']
+
+def test_lease_break_state_is_never_accepted(tmp_path,monkeypatch):
+    import fcntl
+    local_lease_fs(monkeypatch);root=lease_root(tmp_path,sidecars=False);actual=fcntl.fcntl
+    def broken(fd,operation,arg=0):
+        answer=actual(fd,operation,arg)
+        return fcntl.F_UNLCK if operation==fcntl.F_GETLEASE else answer
+    monkeypatch.setattr(fcntl,'fcntl',broken)
+    proof=q.ledger_lease_proof(root)
+    assert not proof['complete'] and proof['kind']=='break' and proof['cleanup_complete']
+
+@pytest.mark.parametrize('proof',[
+    {'format_version':1,'complete':False,'cleanup_complete':True,'kind':'unknown','reason':'permission'},
+    {'format_version':1,'complete':False,'cleanup_complete':True,'kind':'holder','reason':'open holder'},
+    {'format_version':1,'complete':False,'cleanup_complete':False,'kind':'unknown','reason':'cleanup'},
+])
+def test_public_lease_gate_refuses_unknown_holder_or_cleanup_failure(estate,monkeypatch,proof):
+    monkeypatch.setattr(estate,'model',lambda:{})
+    monkeypatch.setattr(r,'volume_identity',lambda *a:{})
     def docker(c,*args,**kw):
-        assert args[args.index('--pid')+1]=='host' and args[args.index('--cap-add')+1]=='SYS_PTRACE'
-        assert '--privileged' not in args and '--read-only' in args and 'readonly' in args[args.index('--mount')+1]
+        assert args[0:4]==('run','--rm','--pull','never')
+        assert '--pid' not in args and '--cap-add' not in args and '--privileged' not in args
+        assert args[args.index('--cap-drop')+1]=='ALL'
+        assert args[args.index('--security-opt')+1]=='no-new-privileges:true'
+        assert args[args.index('--user')+1]=='1000:1000'
+        assert args[args.index('--network')+1]=='none' and '--read-only' in args
+        assert args[args.index('--mount')+1].endswith('dst=/state,readonly')
         return SimpleNamespace(stdout=json.dumps(proof))
     monkeypatch.setattr(r,'docker',docker)
     with pytest.raises(r.Refusal):estate.current_holders()
 
-
-def test_census_catches_mapped_ledger_with_original_fd_closed(estate):
-    import mmap
-    root=Path(estate.c['source_db']).parent;fd=os.open(root/'forge.db',os.O_RDWR)
-    with mmap.mmap(fd,0,access=mmap.ACCESS_WRITE,trackfd=False):
-        os.close(fd)
-        proof=q.ledger_holders(root)
-        assert proof['complete'] and any(item.get('mapping') and item['file']=='forge.db' for item in proof['holders'])
-    assert not q.ledger_holders(root)['holders']
+def test_public_lease_gate_accepts_complete_proof(estate,monkeypatch):
+    proof={'format_version':1,'complete':True,'cleanup_complete':True,'kind':'clean','files':{'forge.db':[1,2,3,4,0o644,1000,1000]},'filesystem':{'name':'ext','magic':'0xef53'}}
+    monkeypatch.setattr(estate,'model',lambda:{});monkeypatch.setattr(r,'volume_identity',lambda *a:{})
+    monkeypatch.setattr(r,'docker',lambda *a,**k:SimpleNamespace(stdout=json.dumps(proof)))
+    assert estate.current_holders()==proof
 
 @pytest.mark.parametrize('case',['valid','missing','contradictory','wrong-configuration','current-copy-changed'])
 def test_actual_h6_result_ingestion_tamper_boundary(estate,tmp_path,monkeypatch,case):
@@ -389,7 +487,7 @@ def public_marker_case(estate,monkeypatch,phase,shape,stage='settled'):
     monkeypatch.setattr(q.Estate,'systemctl',boundary('legacy-unit-stop'))
     monkeypatch.setattr(q.Estate,'monitor',boundary('reader-observation'))
     monkeypatch.setattr(q.Estate,'prepared_settings',boundary('prepared-settings'))
-    monkeypatch.setattr(q.Estate,'current_holders',lambda *a,**k:pytest.fail('forbidden host census must not execute'))
+    monkeypatch.setattr(q.Estate,'current_holders',lambda *a,**k:pytest.fail('holder proof must not execute before marker validation'))
     monkeypatch.setattr(r,'run',boundary('sandbox-stop'))
     monkeypatch.setattr(r,'inspect',boundary('old-container-access'))
     argv=['--config',str(estate.config_path),'--env-file',estate.c['env_file'],'--project',estate.c['project'],'--snapshot',str(estate.snapshot)]
