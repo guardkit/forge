@@ -112,9 +112,10 @@ def build_admission(
     candidates: set[str] = set()
     unresolved: list[str] = []
     ambiguous = False
+    exact_target = target if target in paths else None
 
     if target:
-        if target in paths:
+        if exact_target is not None:
             candidates.add(target)
         else:
             target_path = _path_identity(target)
@@ -132,17 +133,22 @@ def build_admission(
                 unresolved.append(repr(target))
 
     if supplied_path is not None:
-        matches = {
-            str(key)
-            for key, configured_path in paths.items()
-            if _path_identity(configured_path) == supplied_path
-        }
-        if len(matches) > 1:
-            ambiguous = True
-        elif matches:
-            candidates.update(matches)
+        if exact_target is not None:
+            configured_path = _path_identity(paths[exact_target])
+            if configured_path != supplied_path:
+                unresolved.append(repr(str(repo_path)))
         else:
-            unresolved.append(repr(str(repo_path)))
+            matches = {
+                str(key)
+                for key, configured_path in paths.items()
+                if _path_identity(configured_path) == supplied_path
+            }
+            if len(matches) > 1:
+                ambiguous = True
+            elif matches:
+                candidates.update(matches)
+            else:
+                unresolved.append(repr(str(repo_path)))
 
     shown = repr(target or (str(repo_path) if repo_path is not None else "<missing>"))
     if ambiguous or len(candidates) > 1:

@@ -904,6 +904,7 @@ async def admit_fix_build(
     task_id: str,
     fix_task_yaml: Path | str,
     repo_path: Path | str,
+    target_repo: str | None = None,
     correlation_id: str,
     publish: Callable[[str, bytes], Any],
     branch: str = "main",
@@ -938,6 +939,9 @@ async def admit_fix_build(
        :class:`FixPublishFailed` and the row deliberately stays.
 
     Args:
+        target_repo: The exact registered key when a named caller has already
+            resolved it. Direct path-only callers leave this unset and retain
+            the strict ambiguity refusal for shared alias paths.
         publish: ``(subject, body) -> None`` or an awaitable of the same. The
             transports differ — the CLI opens a one-shot connection, the
             daemon has a live client — so the caller brings its own.
@@ -974,7 +978,10 @@ async def admit_fix_build(
     # their task specification or preparing a branch. Repairs also need the
     # sandbox sidecar because that is where their branch is materialised.
     build_policy = build_admission(
-        config, repo_path=repo_path, require_sidecar=True
+        config,
+        target_repo=target_repo,
+        repo_path=repo_path,
+        require_sidecar=True,
     )
     if not build_policy.allowed:
         raise FixAdmissionRefused(
@@ -1316,6 +1323,7 @@ async def admit_fix_row(
         task_id=task_id,
         fix_task_yaml=fix_task_path,
         repo_path=repo_path,
+        target_repo=resolution.name,
         correlation_id=correlation_id,
         publish=publish,
         branch=branch,
