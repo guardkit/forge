@@ -334,16 +334,18 @@ class Rollout:
     def systemctl(self, *args, **kw):
         return self.run(['systemctl','--user',*args], **kw)
 
-    def properties(self, unit):
-        fields = ('LoadState','ActiveState','SubState','MainPID','ControlPID','UnitFileState','ExecStop','ExecStopPost')
+    def properties(self, unit, *, stop_hooks=False):
+        fields = ('LoadState','ActiveState','SubState','MainPID','ControlPID','UnitFileState')
+        if stop_hooks:
+            fields += ('ExecStop','ExecStopPost')
         out = self.systemctl('show',unit,*['--property='+x for x in fields]).stdout
         result = dict(line.split('=',1) for line in out.splitlines() if '=' in line)
         require(all(x in result for x in fields), f'unit state is unreadable for {unit}; inspect its complete systemd state')
         return result
 
     def empty_stop(self):
-        p = self.properties(self.units['runner'])
-        require(p['LoadState'] in ('loaded','masked') and p['ExecStop'] == '' and p['ExecStopPost'] == '',
+        p = self.properties(self.units['runner'],stop_hooks=True)
+        require(p['LoadState'] == 'loaded' and p['ExecStop'] == '' and p['ExecStopPost'] == '',
                 f'ExecStop or ExecStopPost is not proved empty for {self.units["runner"]}; fix the drop-in before stopping any unit')
         self.stop_proved = True
 
@@ -366,8 +368,9 @@ class Rollout:
     def status(self):
         try:
             result = self.sbx('ls','--json',check=False)
-            listing = json.loads(result.stdout)
-            require(isinstance(listing,list), 'status list has unknown shape')
+            document = json.loads(result.stdout)
+            require(isinstance(document,dict) and isinstance(document.get('sandboxes'),list), 'status list has unknown shape')
+            listing = document['sandboxes']
             matches = [x for x in listing if x.get('name') == self.s['name']]
             require(result.returncode == 0 and len(matches) == 1 and matches[0].get('status') == 'stopped', 'status is unknown or not stopped')
         except (ValueError,TypeError,AttributeError,Refusal):
@@ -439,9 +442,18 @@ class Rollout:
 
     def execute(self):
         print('While the sandbox is stopped, nobody may run sbx prune, sbx rm or sbx reset.',flush=True)
-        version = self.sbx('version').stdout
-        versions = dict(re.findall(r'^(Client|Server) Version:\s+(v[0-9.]+)(?:\s|$)',version,re.MULTILINE))
-        require(versions == {'Client':'v0.42.1','Server':'v0.42.1'}, 'sandbox client or server version is not the reviewed v0.42.1; verify its stopped-status contract first')
+        try:
+            version = json.loads(self.sbx('version','--json').stdout)
+            client = version['client']
+            server = version['server']
+            valid_version = (isinstance(version,dict) and isinstance(client,dict)
+                and isinstance(server,dict)
+                and client.get('version') == self.s['expected_sbx_version']
+                and server.get('state') == 'running'
+                and server.get('version') == self.s['expected_sbx_version'])
+        except (ValueError,TypeError,KeyError):
+            valid_version = False
+        require(valid_version, 'sandbox client or server version/state is not the reviewed running v0.42.1 contract; verify its stopped-status contract first')
         profile = self.profile()  # Parse/validate before touching any unit.
         self.validate_bootstrap_ports(profile)
         receipt = self.evidence / 'sandbox-installed.json'

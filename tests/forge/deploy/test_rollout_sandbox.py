@@ -104,11 +104,18 @@ class Boundary:
                 unit = argv[3]
                 stopped = self.states[unit]
                 runner = unit == self.config['units']['runner']
-                props = {'LoadState':'loaded','ActiveState':'inactive' if stopped else 'active',
+                props = {'LoadState':'masked' if stopped else 'loaded','ActiveState':'inactive' if stopped else 'active',
                     'SubState':'dead' if stopped else 'running','MainPID':'0' if stopped else '123',
                     'ControlPID':'0','UnitFileState':'masked' if stopped else 'disabled',
                     'ExecStop':'evil start' if self.fault == 'stop-hook' and runner else '',
                     'ExecStopPost':'evil start' if self.fault == 'post-hook' and runner else ''}
+                if stopped:
+                    props.pop('ExecStop')
+                    props.pop('ExecStopPost')
+                if self.fault == 'missing-stop-hook' and runner and not stopped:
+                    props.pop('ExecStop')
+                if self.fault == 'missing-post-hook' and runner and not stopped:
+                    props.pop('ExecStopPost')
                 if self.fault == 'control-pid' and not runner:
                     props['ControlPID']='77'
                 if self.fault == 'keeper-alive' and not runner:
@@ -136,8 +143,13 @@ class Boundary:
             if self.fault == 'image': code=4
             out='\n'.join('[hand-release-image]   '+k+'='+v for k,v in {'FORGE_IMAGE':'forge:fixture','FORGE_IMAGE_IDENTITY':IDENTITY,'FORGE_RELEASE_VERSION':'fixture','FORGE_RELEASE_MANIFEST_SHA256':'b'*64}.items())
         elif argv[:2] == ['sbx','version']:
-            out='Client Version:  v0.42.1 abc123\nBuild Tags: cloud\nServer Version:  v0.42.1 abc123\n'
-            if self.fault=='version':out=out.replace('Server Version:  v0.42.1','Server Version:  v0.43.0')
+            doc={'client':{'version':'v0.42.1','revision':'abc123','build_tags':'cloud'},
+                 'server':{'state':'running','version':'v0.42.1','revision':'abc123','api_version':'0.28.0'}}
+            if self.fault=='version':doc['server']['version']='v0.43.0'
+            if self.fault=='client-version':doc['client']['version']='v0.43.0'
+            if self.fault=='server-unknown':doc['server']['state']='unknown'
+            if self.fault=='version-missing':doc['server'].pop('version')
+            out='not-json' if self.fault=='version-malformed' else json.dumps(doc)
         elif argv[:2] == ['sbx','inspect']:
             out=json.dumps({'name':'owned-sandbox','sessions':1 if self.fault=='sessions' else 0})
         elif argv[:2] == ['sbx','stop']:
@@ -146,7 +158,12 @@ class Boundary:
             if self.fault == 'stop-timeout':raise subprocess.TimeoutExpired(argv,120)
         elif argv[:2] == ['sbx','ls']:
             status={'unknown':'mystery','empty':'','running':'running'}.get(self.fault,'stopped')
-            out=json.dumps([{'name':'owned-sandbox','status':status}])
+            rows=[{'name':'owned-sandbox','id':'fixture-id','agent':'docker','status':status}]
+            document={'sandboxes':rows}
+            if self.fault=='status-missing':document={}
+            if self.fault=='status-nonlist':document={'sandboxes':{}}
+            if self.fault=='status-duplicate':document['sandboxes'].append(dict(rows[0]))
+            out=json.dumps(document)
             if self.fault=='status-error': code=1;out='invalid'
             if self.fault=='status-timeout':raise subprocess.TimeoutExpired(argv,120)
         elif argv[:2] == ['sbx','exec']:
@@ -183,8 +200,9 @@ class Boundary:
 
 
 @pytest.mark.parametrize('fault',[
-    'version','stop-hook','post-hook','keeper-alive','control-pid','sessions','stop-fails','stop-timeout','status-timeout',
-    'unknown','empty','running','status-error','survivor','wake-fails',
+    'version','client-version','server-unknown','version-missing','version-malformed',
+    'stop-hook','post-hook','missing-stop-hook','missing-post-hook','keeper-alive','control-pid','sessions','stop-fails','stop-timeout','status-timeout',
+    'unknown','empty','running','status-error','status-missing','status-nonlist','status-duplicate','survivor','wake-fails',
     'same-boot','process','file-changed','receipt-changed','clone-changed','disk-unreadable','image',
 ])
 def test_refusal_installs_nothing(inventory,monkeypatch,capsys,fault):
@@ -196,11 +214,11 @@ def test_refusal_installs_nothing(inventory,monkeypatch,capsys,fault):
     assert Path(config['sandbox']['profile_source']).read_bytes()==original
     assert not any(x[:3]==['systemctl','--user','unmask'] for x in boundary.argv())
     assert not any(x[0]=='sbx' and any(y in x for y in ('rm','prune','reset','kill')) for x in boundary.argv())
-    if fault in ('stop-hook','post-hook'):
+    if fault in ('stop-hook','post-hook','missing-stop-hook','missing-post-hook'):
         assert not any(x[:3]==['systemctl','--user','stop'] for x in boundary.argv())
     if fault in ('keeper-alive','control-pid'):
         assert ['systemctl','--user','stop','owned-runner.service'] not in boundary.argv()
-    if fault in ('unknown','empty','running','status-error','stop-fails','stop-timeout','status-timeout'):
+    if fault in ('unknown','empty','running','status-error','status-missing','status-nonlist','status-duplicate','stop-fails','stop-timeout','status-timeout'):
         assert 'work may still be running' in capsys.readouterr().err
     if fault=='survivor':
         assert 'abc123' in capsys.readouterr().err
@@ -215,6 +233,7 @@ def test_success_order_exact_template_and_repeat(inventory,monkeypatch):
     assert calls.index(['systemctl','--user','mask','owned-keeper.service']) < calls.index(['systemctl','--user','stop','owned-runner.service']) < calls.index(['sbx','stop','owned-sandbox'])
     stop_index=calls.index(['systemctl','--user','stop','owned-runner.service'])
     assert calls[stop_index-1][:4]==['systemctl','--user','show','owned-runner.service']
+    assert calls[0] == ['sbx','version','--json']
     assert b.files[config['sandbox']['script_path']]==m.TEMPLATE.read_bytes()
     assert '--sandbox' in next(x for x in calls if x[:4]==['sbx','policy','allow','network'])
     assert all('DOCKER_HOST' not in kw['env'] for _,kw in b.calls)
