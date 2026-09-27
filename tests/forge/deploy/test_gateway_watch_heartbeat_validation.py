@@ -122,6 +122,31 @@ def _run_watch(
             id="time-trailing-junk-line",
         ),
         pytest.param(
+            json.dumps({"state": "connected", "last_event_at": "2026-09-26T15:59:55Z\n"}),
+            id="time-trailing-lf",
+        ),
+        pytest.param(
+            json.dumps({"state": "connected", "last_event_at": "2026-09-26T15:59:55Z\n\n"}),
+            id="time-trailing-lfs",
+        ),
+        pytest.param(
+            json.dumps(
+                {
+                    "state": "connected",
+                    "last_event_at": "2026-09-26T15:59:55.123456+00:00\n",
+                }
+            ),
+            id="producer-time-trailing-lf",
+        ),
+        pytest.param(
+            json.dumps({"state": "connected", "last_event_at": "2026-09-26\0T15:59:55Z"}),
+            id="time-embedded-nul",
+        ),
+        pytest.param(
+            json.dumps({"state": "connected", "last_event_at": "2026-09-26T15:59:55Z\0"}),
+            id="time-trailing-nul",
+        ),
+        pytest.param(
             '{"state":"connected","last_event_at":"2026-02-30T15:59:55Z"}',
             id="impossible-calendar-time",
         ),

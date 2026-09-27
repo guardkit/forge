@@ -223,19 +223,12 @@ iso_to_epoch() {
     ' 2>/dev/null
 }
 
-# Heartbeat times are data, not extracted log fragments. Validate the entire
-# scalar against the UTC form emitted by Jarvis before converting it. Keeping
-# this separate from iso_to_epoch preserves the log reader's established
-# extraction path.
-heartbeat_iso_to_epoch() {
+# The epoch has already been validated while it is still inside the parsed JSON.
+# Check the final jq-to-shell boundary as well: status, one value, digits only.
+heartbeat_epoch_for_shell() {
     local epoch
     if ! epoch="$(jq -nr --arg stamp "$1" '
-        ($stamp
-         | select(test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?(Z|\\+00:00)$"))
-         | sub("\\.[0-9]+"; "")
-         | sub("\\+00:00$"; "Z")) as $normal
-        | try ($normal | fromdateiso8601) catch empty
-        | select((strftime("%Y-%m-%dT%H:%M:%SZ")) == $normal)
+        $stamp | select(test("\\A[0-9]+\\z"))
     ' 2>/dev/null)" || [ -z "${epoch}" ]; then
         return 1
     fi
@@ -387,7 +380,15 @@ check_slack() {
                 or (.[0].state == "connecting")
                 or (.[0].state == "disconnected"))
            and (.[0].last_event_at | type == "string")
-        then .[0]
+        then .[0] as $heartbeat
+          | ($heartbeat.last_event_at
+             | select(test("\\A[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?(Z|\\+00:00)\\z"))
+             | sub("\\.[0-9]+"; "")
+             | sub("\\+00:00\\z"; "Z")) as $normal
+          | (try ($normal | fromdateiso8601) catch empty) as $epoch
+          | select(($epoch | strftime("%Y-%m-%dT%H:%M:%SZ")) == $normal)
+          | $heartbeat + {last_event_epoch: $epoch}
+          | .
         else empty
         end
     ' 2>/dev/null)" || [ -z "${heartbeat}" ]; then
@@ -396,11 +397,11 @@ check_slack() {
         return
     fi
     state="$(printf '%s' "${heartbeat}" | jq -r '.state')"
-    last_event_at="$(printf '%s' "${heartbeat}" | jq -r '.last_event_at')"
+    last_epoch="$(printf '%s' "${heartbeat}" | jq -r '.last_event_epoch')"
 
-    if ! last_epoch="$(heartbeat_iso_to_epoch "${last_event_at}")" || [ -z "${last_epoch}" ]; then
+    if ! last_epoch="$(heartbeat_epoch_for_shell "${last_epoch}")" || [ -z "${last_epoch}" ]; then
         SLACK_VERDICT="unknown"
-        SLACK_SENTENCE="the gateway's heartbeat at ${HEARTBEAT_PATH} says its last event was at '${last_event_at}', which is not a time this could read."
+        SLACK_SENTENCE="the gateway's heartbeat at ${HEARTBEAT_PATH} did not produce one numeric time for its last event, so it could not be read."
         return
     fi
     now="$(now_epoch)"
