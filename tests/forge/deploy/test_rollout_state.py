@@ -134,8 +134,10 @@ def test_load_plan_runs_no_container_or_write(setup,monkeypatch):
 def mock_load(monkeypatch):
     monkeypatch.setattr(r,'rendered',lambda c:{'volumes':{k:{'name':v} for k,v in c['volumes'].items()}})
     monkeypatch.setattr(r,'stopped',lambda c:None)
+    monkeypatch.setattr(r,'volume_identity',lambda *a: {})
+    monkeypatch.setattr(r,'verify_loaded',lambda *a: None)
     monkeypatch.setattr(r,'docker',lambda *a,**k:SimpleNamespace(stdout=''))
-    monkeypatch.setattr(r,'volume_inventory',lambda c:{k:None for k in r.VOLUME_ROLES})
+    monkeypatch.setattr(r,'volume_inventory',lambda c,model=None,identities=None:{k:None for k in r.VOLUME_ROLES})
 
 def test_migration_failure_keeps_snapshot_and_launches_no_apps_then_clean_retry(setup,monkeypatch):
     c,d=setup;snapshot_fixture(c,d,11); before=r.manifest(d)
@@ -164,12 +166,12 @@ def test_migration_failure_keeps_snapshot_and_launches_no_apps_then_clean_retry(
     assert result['loaded'] and result['snapshot_sha256']!=result['migrated_sha256']
     assert r.sha256(d/'forge.db')==result['snapshot_sha256']
     assert r.read_json(d/'load-receipt.json')['container_verification'] is None
-    monkeypatch.setattr(r,'volume_inventory',lambda c:{k:copies[v] for k,v in c['volumes'].items()})
+    monkeypatch.setattr(r,'volume_inventory',lambda c,model=None,identities=None:{k:copies[v] for k,v in c['volumes'].items()})
     assert r.load_volumes(c,d)['idempotent']
 
 def test_occupied_volume_refuses_before_migration(setup,monkeypatch):
     c,d=setup;snapshot_fixture(c,d);mock_load(monkeypatch)
-    monkeypatch.setattr(r,'volume_inventory',lambda c:{k:[{'path':'forge.db'}] for k in r.VOLUME_ROLES})
+    monkeypatch.setattr(r,'volume_inventory',lambda c,model=None,identities=None:{k:[{'path':'forge.db'}] for k in r.VOLUME_ROLES})
     monkeypatch.setattr(r,'container_python',lambda *a,**k:pytest.fail('must not migrate'))
     with pytest.raises(r.Refusal,match='occupied'):r.load_volumes(c,d)
 
@@ -182,11 +184,11 @@ def test_actual_compose_mount_resolution_refuses_different_volume(setup,monkeypa
 
 def test_readback_requires_real_running_container_and_identical_mark(setup,monkeypatch):
     c,d=setup;meta=snapshot_fixture(c,d)
-    receipt={'snapshot_sha256':meta['sha256'],'volumes':c['volumes'],'mark':{'snapshot_sha256':meta['sha256']}}
+    receipt=receipt_fixture(c,d,meta)
     monkeypatch.setattr(r,'compose',lambda *a:SimpleNamespace(stdout='actual-container'))
     monkeypatch.setattr(r,'inspect',lambda *a:{'Id':'actual-container','Image':r.RUNTIME,'State':{'Running':True},'Mounts':[{'Destination':'/var/lib/forge','Type':'volume','Name':c['volumes']['ledger']}]})
     monkeypatch.setattr(r,'docker',lambda *a,**k:SimpleNamespace(stdout='{}'))
-    with pytest.raises(r.Refusal,match='different snapshot mark'):r.verify_containers(c,d,meta,receipt,False)
+    with pytest.raises(r.Refusal,match='different ledger or snapshot mark'):r.verify_containers(c,d,meta,receipt,False)
     assert not (d/'load-receipt.json').exists()
 
 def test_unknown_holder_is_not_empty(tmp_path,monkeypatch):
@@ -216,9 +218,9 @@ def test_copy_rejects_changed_input_on_retry(setup,monkeypatch):
         p=Path(c['sources'][role]);source_manifests[role]=[{'path':name,'size':p.stat().st_size,'sha256':r.sha256(p)}]
     inventory={k:[] for k in r.VOLUME_ROLES}
     r.atomic_json(d/'load-receipt.json',{'project':c['project'],'runtime_image':c['runtime_image'],'snapshot_sha256':meta['sha256'],'volumes':c['volumes'],'manifests':inventory,'source_manifests':source_manifests})
-    monkeypatch.setattr(r,'volume_inventory',lambda c:inventory)
+    monkeypatch.setattr(r,'volume_inventory',lambda c,model=None,identities=None:inventory)
     Path(c['sources']['settings']).write_text('changed input')
-    with pytest.raises(r.Refusal,match='receipt or destination'):r.load_volumes(c,d)
+    with pytest.raises(r.Refusal,match='receipt'):r.load_volumes(c,d)
 
 def test_source_tree_symlink_refuses_before_migration(setup,monkeypatch):
     c,d=setup;snapshot_fixture(c,d);mock_load(monkeypatch)
@@ -254,3 +256,114 @@ def test_previous_runtime_omits_secret_environment_values(setup,monkeypatch):
     previous=r.previous_runtime(c,item)
     assert previous['env_names']==['FORGE_DB_PATH','PASSWORD']
     assert 'never-copy-this-secret' not in json.dumps(previous)
+
+
+def receipt_fixture(c,d,meta):
+    migrated=r.sha256(d/'forge.db')
+    mark={'format_version':1,'snapshot_sha256':meta['sha256'],'snapshot_created_at':meta['created_at'],
+          'migrated_sha256':migrated,'source_schema_version':meta['schema_version'],'loaded_schema_version':16}
+    staging=d/'loaded-ledger';staging.mkdir()
+    shutil.copyfile(d/'forge.db',staging/'forge.db');r.atomic_json(staging/r.MARK,mark)
+    sources={role:r.manifest(c['sources'][role]) for role in ('evidence','threads')}
+    for role,name in [('settings','forge.yaml'),('relay_progress','relay-progress.json')]:
+        p=Path(c['sources'][role]);sources[role]=[{'path':name,'size':p.stat().st_size,'sha256':r.sha256(p)}]
+    return {'format_version':1,'project':c['project'],'snapshot_sha256':meta['sha256'],'migrated_sha256':migrated,
+        'runtime_image':c['runtime_image'],'volumes':c['volumes'],'mark':mark,'manifests':dict(sources,ledger=r.manifest(staging)),
+        'source_manifests':sources,'container_verification':None}
+
+@pytest.mark.parametrize('value',['../source','innocent/../source','nested/../../source'])
+def test_parent_traversal_rejected_before_any_path_operation(tmp_path,value):
+    with pytest.raises(r.Refusal,match='traverses a parent'):r.path(tmp_path/value,exists=False)
+
+def test_multivalue_env_and_literal_shell_text_are_data(setup,tmp_path):
+    c,_=setup;p=tmp_path/'inventory.json';r.atomic_json(p,c)
+    sentinel=tmp_path/'must-not-exist'
+    with Path(c['env_file']).open('a') as f:
+        f.write('ROLLOUT_BUS_CONSUMERS=forge-serve forge-serve-planning\nSANDBOX_ENV_NAMES=ONE TWO THREE\n')
+        f.write('LITERAL=$(touch '+str(sentinel)+') ${NAME} `id`\n')
+    assert r.config(p)['runtime_image']==r.RUNTIME and not sentinel.exists()
+
+def test_snapshot_plan_preserves_pristine_wal_mode_snapshot(setup,monkeypatch):
+    c,d=setup;snapshot_fixture(c,d,11)
+    for suffix in ('-wal','-shm'):
+        p=Path(str(d/'forge.db')+suffix)
+        if p.exists():p.unlink()
+    before=r.manifest(d)
+    monkeypatch.setattr(r,'rendered',lambda c:{})
+    assert r.load_volumes(c,d,plan=True)['plan']
+    assert r.manifest(d)==before
+
+@pytest.mark.parametrize('missing',['format_version','mark','migrated_sha256','manifests','source_manifests'])
+def test_incomplete_receipt_cannot_authorize_empty_volumes(setup,missing):
+    c,d=setup;meta=snapshot_fixture(c,d);receipt=receipt_fixture(c,d,meta);receipt.pop(missing)
+    with pytest.raises(r.Refusal,match='incomplete'):r.validate_receipt(c,meta,receipt)
+
+def test_empty_or_forged_manifests_refuse(setup):
+    c,d=setup;meta=snapshot_fixture(c,d);receipt=receipt_fixture(c,d,meta)
+    receipt['manifests']['ledger']=[]
+    with pytest.raises(r.Refusal,match='ledger and snapshot mark'):r.validate_receipt(c,meta,receipt)
+    receipt=receipt | {'manifests':dict(receipt['manifests'],settings=[])}
+    with pytest.raises(r.Refusal,match='original source'):r.validate_receipt(c,meta,receipt)
+
+@pytest.mark.parametrize('changes',[{'Labels':{}},{'Driver':'nfs'},{'Options':{'type':'none','device':'/some/path','o':'bind'}},{'Scope':'global'}])
+def test_existing_volume_configuration_checked_before_mount(setup,monkeypatch,changes):
+    c,_=setup;name=c['volumes']['ledger'];model={'volumes':{'ledger':{'name':name}}}
+    item={'Name':name,'Driver':'local','Scope':'local','Options':None,'Labels':{'com.docker.compose.project':c['project'],'com.docker.compose.volume':'ledger'}}
+    item.update(changes)
+    monkeypatch.setattr(r,'docker',lambda *a,**k:SimpleNamespace(stdout=json.dumps([item])))
+    with pytest.raises(r.Refusal,match='ownership or storage'):r.volume_identity(c,name,model)
+
+def test_unchanged_bytes_with_wrong_permissions_refuse(setup,monkeypatch):
+    c,d=setup;meta=snapshot_fixture(c,d);receipt=receipt_fixture(c,d,meta)
+    monkeypatch.setattr(r,'volume_identity',lambda *a:{})
+    def unreadable(*a,**k):raise r.Refusal('ownership or mode differs')
+    monkeypatch.setattr(r,'container_python',unreadable)
+    with pytest.raises(r.Refusal,match='incorrect ownership and modes'):r.verify_loaded(c,receipt,{})
+
+def test_live_source_reader_keeps_committed_wal_visible(tmp_path):
+    p=seed(tmp_path/'wal.db',11)
+    c=connect_writer(p);c.execute('PRAGMA wal_autocheckpoint=0')
+    c.execute('INSERT INTO schema_version(version,applied_at) VALUES(12,"test")')
+    try:
+        assert Path(str(p)+'-wal').stat().st_size>0
+        assert r.ledger_state(p)['schema_version']==12
+        with pytest.raises(r.Refusal,match='nonempty WAL'):r.ledger_state(p,consolidated=True)
+    finally:c.close()
+
+def test_failed_actual_readback_clears_previous_verification(setup,monkeypatch):
+    c,d=setup;meta=snapshot_fixture(c,d);receipt=receipt_fixture(c,d,meta)
+    receipt['container_verification']={'services':{'coordinator':{'container_id':'removed'}}}
+    r.atomic_json(d/'load-receipt.json',receipt)
+    monkeypatch.setattr(r,'compose',lambda *a:SimpleNamespace(stdout=''))
+    with pytest.raises(r.Refusal,match='no unique actual container'):
+        r.verify_containers(c,d,meta,receipt,False)
+    assert r.read_json(d/'load-receipt.json')['container_verification'] is None
+
+def test_readback_code_uses_configured_user_and_creates_no_sidecars(setup,monkeypatch):
+    c,d=setup;meta=snapshot_fixture(c,d);receipt=receipt_fixture(c,d,meta)
+    target=d/'loaded-ledger'
+    for suffix in ('-wal','-shm'):
+        p=Path(str(target/'forge.db')+suffix)
+        if p.exists():p.unlink()
+    before=r.manifest(target);seen=[]
+    monkeypatch.setattr(r,'compose',lambda c,*args:SimpleNamespace(stdout=args[-1]))
+    def inspected(c,name):
+        return {'Id':name,'Image':r.PUBLISHER_RUNTIME if name=='forge-publisher' else r.RUNTIME,
+                'State':{'Running':True},'Mounts':[{'Destination':'/var/lib/forge','Type':'volume','Name':c['volumes']['ledger'],'RW':name=='coordinator'}]}
+    monkeypatch.setattr(r,'inspect',inspected)
+    def execute(c,*argv,**kwargs):
+        assert argv[0]=='exec' and '--user' not in argv
+        code=argv[-1].replace('/var/lib/forge/forge.db',str(target/'forge.db'))
+        child=subprocess.run(['python','-c',code],capture_output=True,text=True)
+        assert child.returncode==0,child.stderr
+        seen.append(argv[1]);return child
+    monkeypatch.setattr(r,'docker',execute)
+    assert len(r.verify_containers(c,d,meta,receipt,False)['container_verification'])==3
+    assert len(seen)==3 and r.manifest(target)==before
+
+def test_sibling_prefix_is_not_mistaken_for_source_root(setup,monkeypatch):
+    c,d=setup;sibling=Path(c['source_db']).parent.with_name('source-sibling');sibling.mkdir()
+    c['snapshot_root']=str(sibling)
+    monkeypatch.setattr(r,'docker',lambda *a,**k:SimpleNamespace(stdout=''))
+    assert r.snapshot(c,sibling/d.name,plan=True)['plan']
+    assert not list(sibling.iterdir())

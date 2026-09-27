@@ -45,11 +45,11 @@ def run(argv, *, input=None, check=True, env=None):
 
 def path(value, *, exists=True):
     p = Path(value)
-    if not p.is_absolute() or any(x.is_symlink() for x in (p, *p.parents)):
-        refuse(f'path {p} is relative or crosses a symlink; supply an absolute direct path')
+    if not p.is_absolute() or '..' in p.parts or any(x.is_symlink() for x in (p, *p.parents)):
+        refuse(f'path {p} is relative, traverses a parent or crosses a symlink; supply an absolute direct path')
     if exists and not p.exists():
         refuse(f'path {p} is missing; supply the intended existing path')
-    return p
+    return p.resolve()
 
 def read_json(p):
     return json.loads(path(p).read_text())
@@ -73,10 +73,13 @@ def atomic_json(p, value):
     finally:
         if os.path.exists(tmp): os.unlink(tmp)
 
-def ledger_state(p):
+def ledger_state(p, *, consolidated=False):
     p = path(p)
-    # mode=ro is required, not immutable: a stopped source can still have committed WAL.
-    with closing(sqlite3.connect(p.as_uri() + '?mode=ro', uri=True)) as db:
+    # Source readers MUST honor committed WAL; only a consolidated backup is immutable.
+    if consolidated and Path(str(p)+'-wal').exists() and Path(str(p)+'-wal').stat().st_size:
+        refuse(f'backup {p} has a nonempty WAL; recover the consolidated snapshot before retrying')
+    uri = p.as_uri() + ('?mode=ro&immutable=1' if consolidated else '?mode=ro')
+    with closing(sqlite3.connect(uri, uri=True)) as db:
         db.row_factory = sqlite3.Row
         db.execute('PRAGMA query_only=ON')
         if [r[0] for r in db.execute('PRAGMA integrity_check')] != ['ok']:
@@ -119,7 +122,7 @@ def verify_snapshot(directory):
     db = path(directory / 'forge.db')
     if metadata.get('format_version') != 1 or sha256(db) != metadata.get('sha256'):
         refuse(f'snapshot {directory} does not match its recorded hash; recover the untouched snapshot')
-    actual = ledger_state(db)
+    actual = ledger_state(db, consolidated=True)
     if any(metadata.get(k) != v for k, v in actual.items()):
         refuse(f'snapshot {directory} state differs from its metadata; recover the untouched snapshot')
     runtime = path(directory / 'previous-runtime.json')
@@ -141,9 +144,12 @@ def config(p, env_file=None, project=None):
         key, sep, value = line.partition('=')
         if not sep or not re.fullmatch(r'[A-Za-z_][A-Za-z_0-9]*', key.strip()):
             refuse('estate env file contains an invalid assignment; use plain environment assignments')
-        parsed = shlex.split(value, comments=True)
-        if len(parsed) > 1: refuse('estate env file has an ambiguous value; quote each complete value')
-        environment[key.strip()] = parsed[0] if parsed else ''
+        # Only the image identity is consumed here; leave the rest of dotenv data
+        # (spaces, ${NAME}, and quoted values) to Compose's existing parser.
+        if key.strip() == 'FORGE_IMAGE':
+            parsed = shlex.split(value, comments=True)
+            if len(parsed) != 1: refuse('FORGE_IMAGE is not one explicit image ID; correct the public env file')
+            environment[key.strip()] = parsed[0]
     if environment.get('FORGE_IMAGE') != c['runtime_image']:
         refuse('FORGE_IMAGE in the estate env file differs from the immutable migration image; use the same accepted image ID')
     if c['runtime_image'] != RUNTIME:
@@ -248,7 +254,7 @@ def snapshot(c, dest, plan=False):
         # parser accepts double-quoted paths with embedded quotes escaped.
         target = str(backup).replace('"', '""')
         run(['sqlite3', '-readonly', str(db), '.backup "' + target + '"'])
-        actual = ledger_state(backup)
+        actual = ledger_state(backup, consolidated=True)
         if actual != state or ledger_state(db) != state or fingerprint(db) != before:
             refuse(f'ledger {db} changed while being backed up; settle every writer and retry')
         no_holders(db); stopped(c)
@@ -326,14 +332,104 @@ def rendered(c):
 def volume_manifest(c, name):
     return json.loads(container_python(c, MANIFEST_CODE, ['/destination'], [f'type=volume,src={name},dst=/destination,readonly']))
 
-def volume_inventory(c):
+def volume_identity(c, name, model):
+    """Inspect ownership/configuration before mounting even an empty existing volume."""
+    keys = [k for k, v in model['volumes'].items() if v.get('name') == name]
+    if len(keys) != 1:
+        refuse(f'volume {name} has no unique Compose declaration; correct the volume mapping')
+    declared = model['volumes'][keys[0]]
+    if declared.get('driver', 'local') != 'local' or declared.get('driver_opts'):
+        refuse(f'volume {name} has unsupported storage options; use an ordinary local named state volume')
+    item = json.loads(docker(c, 'volume', 'inspect', name).stdout)[0]
+    labels = item.get('Labels') or {}
+    if (item.get('Name') != name or item.get('Driver') != 'local' or item.get('Scope') != 'local'
+            or item.get('Options') or labels.get('com.docker.compose.project') != c['project']
+            or labels.get('com.docker.compose.volume') != keys[0]):
+        refuse(f'volume {name} ownership or storage configuration differs; select this project\'s correctly labelled local volume')
+    return {k: item.get(k) for k in ('Name', 'Driver', 'Scope', 'Options', 'Labels', 'Mountpoint', 'CreatedAt')}
+
+def volume_inventory(c, model=None, identities=None):
+    model = model or rendered(c)
     names = set(docker(c, 'volume', 'ls', '--format', '{{.Name}}').stdout.splitlines())
-    return {role: (volume_manifest(c, name) if name in names else None) for role,name in c['volumes'].items()}
+    result = {}
+    for role, name in c['volumes'].items():
+        if name in names:
+            identity = volume_identity(c, name, model)
+            if identities is not None: identities[role] = identity
+            result[role] = volume_manifest(c, name)
+        else:
+            result[role] = None
+    return result
+
+def validate_receipt(c, metadata, receipt, sources=None):
+    required = {'format_version', 'project', 'snapshot_sha256', 'migrated_sha256',
+                'runtime_image', 'volumes', 'manifests', 'source_manifests', 'mark', 'container_verification'}
+    if not isinstance(receipt, dict) or not required <= receipt.keys():
+        refuse('load receipt is incomplete; reconcile the occupied state before retrying')
+    mark = receipt['mark']
+    expected_mark = {'format_version': 1, 'snapshot_sha256': metadata['sha256'],
+        'snapshot_created_at': metadata['created_at'], 'migrated_sha256': receipt['migrated_sha256'],
+        'source_schema_version': metadata['schema_version'], 'loaded_schema_version': 16}
+    if (type(receipt['format_version']) is not int or receipt['format_version'] != 1 or receipt['project'] != c['project']
+            or receipt['snapshot_sha256'] != metadata['sha256'] or receipt['runtime_image'] != c['runtime_image']
+            or receipt['volumes'] != c['volumes'] or mark != expected_mark
+            or not isinstance(receipt['migrated_sha256'], str)
+            or not re.fullmatch('[0-9a-f]{64}', receipt['migrated_sha256'])
+            or set(receipt['manifests']) != VOLUME_ROLES
+            or set(receipt['source_manifests']) != VOLUME_ROLES - {'ledger'}):
+        refuse('load receipt provenance differs from this snapshot and estate; reconcile it before retrying')
+    if sources is not None and sources != receipt['source_manifests']:
+        refuse('existing load receipt or destination bytes differ from the sources; reconcile them before retrying')
+    for role in VOLUME_ROLES - {'ledger'}:
+        if receipt['manifests'][role] != receipt['source_manifests'][role]:
+            refuse(f'load receipt {role} manifest differs from its original source; reconcile it before retrying')
+    entries = receipt['manifests']['ledger']
+    if not isinstance(entries, list) or {x.get('path') for x in entries} != {'forge.db', MARK} or len(entries) != 2:
+        refuse('load receipt does not contain the ledger and snapshot mark; perform a verified load before retrying')
+    record = next(x for x in entries if x['path'] == 'forge.db')
+    marker = next(x for x in entries if x['path'] == MARK)
+    marker_bytes = (json.dumps(mark, sort_keys=True, indent=2)+'\n').encode()
+    if (record.get('sha256') != receipt['migrated_sha256'] or type(record.get('size')) is not int or record['size'] <= 0
+            or marker.get('sha256') != hashlib.sha256(marker_bytes).hexdigest() or marker.get('size') != len(marker_bytes)):
+        refuse('load receipt ledger or mark hashes are inconsistent; reconcile it before retrying')
+    return mark
+
+VOLUME_ACCESS_CODE = r'''
+import pathlib,os,stat,sys,json,sqlite3,hashlib
+root=pathlib.Path('/destination'); uid=int(sys.argv[1])
+for p in [root,*root.rglob('*')]:
+ st=p.lstat()
+ if p.is_symlink() or not (p.is_file() or p.is_dir()): raise RuntimeError('nonregular entry')
+ if (st.st_uid,st.st_gid,stat.S_IMODE(st.st_mode)) != (uid,uid,0o755 if p.is_dir() else 0o644): raise RuntimeError('ownership or mode differs')
+if sys.argv[2]=='ledger':
+ p=root/'forge.db'
+ if (root/'forge.db-wal').exists() and (root/'forge.db-wal').stat().st_size: raise RuntimeError('unexpected WAL')
+ with p.open('rb') as f: digest=hashlib.file_digest(f,'sha256').hexdigest()
+ db=sqlite3.connect(p.as_uri()+'?mode=ro&immutable=1',uri=True)
+ assert db.execute('PRAGMA integrity_check').fetchall()==[('ok',)]
+ version=db.execute('SELECT max(version) FROM schema_version').fetchone()[0];db.close()
+ print(json.dumps({'sha256':digest,'schema_version':version,'mark':json.loads((root/'ROLLOUT-SNAPSHOT.json').read_text())}))
+else: print('{}')
+'''
+
+def verify_loaded(c, receipt, model):
+    for role, name in c['volumes'].items():
+        volume_identity(c, name, model)
+        uid = 10001 if role == 'threads' else (0 if role == 'relay_progress' else 1000)
+        try:
+            actual = json.loads(container_python(c, VOLUME_ACCESS_CODE, [str(uid), role],
+                [f'type=volume,src={name},dst=/destination,readonly']))
+        except Refusal:
+            refuse(f'volume {name} has unreadable data or incorrect ownership and modes; reconcile it before retrying')
+        if role == 'ledger' and actual != {'sha256': receipt['migrated_sha256'], 'schema_version': 16, 'mark': receipt['mark']}:
+            refuse(f'volume {name} ledger or snapshot mark differs; reconcile it before retrying')
+
 
 def verify_containers(c, directory, metadata, receipt, plan):
-    if receipt.get('snapshot_sha256') != metadata['sha256'] or receipt.get('volumes') != c['volumes']:
-        refuse('load receipt belongs to another snapshot or volume mapping; load the intended snapshot first')
-    mark = receipt['mark']
+    mark = validate_receipt(c, metadata, receipt)
+    if not plan and receipt['container_verification'] is not None:
+        receipt['container_verification'] = None
+        atomic_json(directory / 'load-receipt.json', receipt)
     results = {}
     for service in ('coordinator', 'answer-service', 'forge-publisher'):
         ids = compose(c, 'ps', '--all', '-q', service).stdout.split()
@@ -349,8 +445,20 @@ def verify_containers(c, directory, metadata, receipt, plan):
             refuse(f'{service} has a writable ledger mount; restore its read-only mount before verifying')
         if not item['State']['Running']: refuse(f'{service} is not running; start the closed-door estate then verify again')
         if plan: results[service] = 'would read snapshot mark'; continue
-        text = docker(c, 'exec', ids[0], 'python', '-c', 'from pathlib import Path; print(Path("/var/lib/forge/'+MARK+'").read_text())').stdout
-        if json.loads(text) != mark: refuse(f'{service} reads a different snapshot mark; keep the door closed and reconcile the mount')
+        code = ('import pathlib,json,hashlib,sqlite3; p=pathlib.Path("/var/lib/forge/forge.db"); '
+                'f=p.open("rb"); digest=hashlib.file_digest(f,"sha256").hexdigest(); f.close(); '
+                'wal=p.with_name(p.name+"-wal"); assert not wal.exists() or wal.stat().st_size==0, "ledger changed in WAL"; '
+                'db=sqlite3.connect(p.as_uri()+"?mode=ro&immutable=1",uri=True); '
+                'assert db.execute("PRAGMA integrity_check").fetchall()==[("ok",)]; '
+                'version=db.execute("SELECT max(version) FROM schema_version").fetchone()[0]; db.close(); '
+                'print(json.dumps({"sha256":digest,"schema_version":version,"mark":json.loads(p.with_name("'+MARK+'").read_text())}))')
+        # No --user override: execute as the actual configured service user.
+        try:
+            text = docker(c, 'exec', ids[0], 'python', '-c', code).stdout
+        except Refusal:
+            refuse(f'{service} cannot read its actual ledger and snapshot mark as its configured user; fix access before verifying')
+        if json.loads(text) != {'sha256': receipt['migrated_sha256'], 'schema_version': 16, 'mark': mark}:
+            refuse(f'{service} reads a different ledger or snapshot mark; keep the door closed and reconcile the mount')
         results[service] = {'container_id': item['Id'], 'snapshot_sha256': mark['snapshot_sha256']}
     if not plan:
         receipt['container_verification'] = {'verified_at': datetime.now(timezone.utc).isoformat(), 'services': results}
@@ -383,12 +491,19 @@ def load_volumes(c, directory, plan=False, verify=False):
         if docker(c, 'ps', '--all', '--filter', 'volume='+name, '--format', '{{.ID}}').stdout.strip():
             refuse(f'volume {name} is attached to a container; keep the estate stopped and remove its old attachment before loading')
     receipt_path = directory / 'load-receipt.json'
-    inventory = volume_inventory(c)
+    identities = {}
+    inventory = volume_inventory(c, model, identities)
     if receipt_path.exists():
         receipt = read_json(receipt_path)
-        if receipt.get('snapshot_sha256') == metadata['sha256'] and receipt.get('volumes') == c['volumes'] and receipt.get('manifests') == inventory and receipt.get('source_manifests') == source_manifests and receipt.get('runtime_image') == c['runtime_image'] and receipt.get('project') == c['project']:
-            return {'idempotent': True, 'snapshot_sha256': metadata['sha256'], 'container_verification': receipt.get('container_verification')}
-        refuse('existing load receipt or destination bytes differ; reconcile the occupied state before retrying')
+        validate_receipt(c, metadata, receipt, source_manifests)
+        if receipt['container_verification'] is not None:
+            receipt['container_verification'] = None
+            atomic_json(receipt_path, receipt)
+        if receipt['manifests'] != inventory:
+            refuse('existing load receipt or destination bytes differ; reconcile the occupied state before retrying')
+        verify_loaded(c, receipt, model)
+        return {'idempotent': True, 'snapshot_sha256': metadata['sha256'], 'container_verification': None,
+                'next_action': 'run --verify-containers against the actual closed-door services'}
     if any(items for items in inventory.values()): refuse('a destination volume is occupied without a matching verified receipt; select empty new volumes')
     with tempfile.TemporaryDirectory(prefix='.load-', dir=directory.parent) as temporary:
         temp = Path(temporary)
@@ -400,7 +515,7 @@ def load_volumes(c, directory, plan=False, verify=False):
             container_python(c, migrate, mounts=[f'type=bind,src={temp / "ledger"},dst=/copy'])
         except Refusal:
             refuse(f'migration of a disposable copy from {directory} failed; keep services stopped and reconcile the source schema before retrying')
-        migrated = ledger_state(ledger)
+        migrated = ledger_state(ledger, consolidated=True)
         if migrated['schema_version'] != 16: refuse('disposable migration did not reach schema 16; repair the selected runtime before retrying')
         if sha256(directory / 'forge.db') != metadata['sha256']: refuse('snapshot changed during disposable migration; stop and recover the original snapshot')
         mark = {'format_version': 1, 'snapshot_sha256': metadata['sha256'], 'snapshot_created_at': metadata['created_at'], 'migrated_sha256': sha256(ledger), 'source_schema_version': metadata['schema_version'], 'loaded_schema_version': 16}
@@ -426,11 +541,16 @@ def load_volumes(c, directory, plan=False, verify=False):
                     compose_key = next(key for key, spec in model['volumes'].items() if spec.get('name') == name)
                     docker(c, 'volume', 'create', '--label', 'com.docker.compose.project='+c['project'], '--label', 'com.docker.compose.volume='+compose_key, '--label', 'rollout.snapshot='+metadata['sha256'], name)
                     created.append(name)
+                current_identity = volume_identity(c, name, model)
+                if role in identities and identities[role] != current_identity:
+                    refuse(f'volume {name} was replaced during loading; keep services stopped and reconcile its ownership')
                 uid = 10001 if role == 'threads' else (0 if role == 'relay_progress' else 1000)
-                code = 'import pathlib,shutil,os; s=pathlib.Path("/source"); d=pathlib.Path("/destination"); assert not list(d.iterdir()), "occupied"; shutil.copytree(s,d,dirs_exist_ok=True); uid='+str(uid)+'; [(os.chown(p,uid,uid)) for p in [d,*d.rglob("*")]]; [(os.fsync(f.fileno())) for p in d.rglob("*") if p.is_file() for f in [p.open("rb")]]; fd=os.open(d,os.O_DIRECTORY); os.fsync(fd); os.close(fd)'
+                code = 'import pathlib,shutil,os; s=pathlib.Path("/source"); d=pathlib.Path("/destination"); assert not list(d.iterdir()), "occupied"; shutil.copytree(s,d,dirs_exist_ok=True); uid='+str(uid)+'; [(os.chown(p,uid,uid),os.chmod(p,0o755 if p.is_dir() else 0o644)) for p in [d,*d.rglob("*")]]; [(os.fsync(f.fileno())) for p in d.rglob("*") if p.is_file() for f in [p.open("rb")]]; fd=os.open(d,os.O_DIRECTORY); os.fsync(fd); os.close(fd)'
                 container_python(c, code, mounts=[f'type=bind,src={temp / role},dst=/source,readonly', f'type=volume,src={name},dst=/destination'])
                 if volume_manifest(c, name) != expected[role]: refuse(f'volume {name} differs from its source manifest; keep services stopped and reconcile the copy')
             receipt = {'format_version': 1, 'project': c['project'], 'snapshot_sha256': metadata['sha256'], 'migrated_sha256': mark['migrated_sha256'], 'runtime_image': c['runtime_image'], 'volumes': c['volumes'], 'manifests': expected, 'source_manifests': source_manifests, 'mark': mark, 'container_verification': None}
+            validate_receipt(c, metadata, receipt, source_manifests)
+            verify_loaded(c, receipt, model)
             atomic_json(receipt_path, receipt)
         except BaseException:
             for name in reversed(created): docker(c, 'volume', 'rm', name, check=False)
