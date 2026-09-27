@@ -227,10 +227,27 @@ def inspect(c, name):
 
 def stopped(c):
     observations = {}
+    # Validate the complete inventory before asking systemd about any member;
+    # a mixed service/timer mapping must not yield partial stopped evidence.
+    for role, unit in c['units'].items():
+        suffix = '.timer' if role == 'watchdog_timer' else '.service'
+        if not isinstance(unit, str) or not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_.@:-]*' + re.escape(suffix), unit):
+            refuse(f'unit {unit} has the wrong type for {role}; correct the complete stopped-service inventory')
     for role, unit in sorted(c['units'].items()):
         result = run(['systemctl', '--user', 'show', unit, '--property=LoadState,ActiveState,SubState,MainPID,ControlPID', '--no-pager'])
         fields = dict(line.split('=', 1) for line in result.stdout.splitlines() if '=' in line)
-        if fields.get('LoadState') not in ('loaded', 'masked') or fields.get('ActiveState') != 'inactive' or fields.get('MainPID') != '0' or fields.get('ControlPID') != '0':
+        settled = (fields.get('LoadState') in ('loaded', 'masked')
+                   and fields.get('ActiveState') == 'inactive')
+        if role == 'watchdog_timer':
+            settled = settled and fields.get('SubState') == 'dead'
+            # systemd timer objects do not define service process fields. Some
+            # versions omit them and others render zero; a nonzero value is
+            # still evidence of an incoherent observation.
+            settled = settled and all(fields.get(key) in (None, '0') for key in ('MainPID', 'ControlPID'))
+        else:
+            # Missing service PID fields are unknown, not implicit zero.
+            settled = settled and fields.get('MainPID') == '0' and fields.get('ControlPID') == '0'
+        if not settled:
             refuse(f'unit {unit} is not proved inactive and settled; stop it through the authorized quiesce procedure')
         observations[role] = fields
     containers = {}

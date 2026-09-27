@@ -79,7 +79,7 @@ def setup(tmp_path):
     settings = tmp_path/'forge.yaml'; settings.write_text('projects: {}\n'); sources['settings']=str(settings)
     relay = tmp_path/'relay-progress.json'; relay.write_text('{"messages":42}'); sources['relay_progress']=str(relay)
     c = dict(project='codex-state-test',docker_context='default',env_file=str(env),compose_files=[str(compose)],runtime_image=r.RUNTIME,
-        source_db=str(db),snapshot_root=str(root),forbidden_roots=[str(source)],units={x:x+'.service' for x in r.UNIT_ROLES},
+        source_db=str(db),snapshot_root=str(root),forbidden_roots=[str(source)],units={x:x+('.timer' if x=='watchdog_timer' else '.service') for x in r.UNIT_ROLES},
         old_containers={x:'old-'+x for x in ('coordinator','memory','relay')}, sources=sources,
         volumes={x:'codex-state-test-'+x for x in r.VOLUME_ROLES})
     destination = root/'20260927T081500Z'
@@ -256,10 +256,66 @@ def test_source_tree_symlink_refuses_before_migration(setup,monkeypatch):
     monkeypatch.setattr(r,'container_python',lambda *a,**k:pytest.fail('migration before source check'))
     with pytest.raises(r.Refusal,match='symlink'):r.load_volumes(c,d)
 
-def test_stopped_units_require_zero_control_pid(setup,monkeypatch):
+def stopped_container(_c, _name):
+    return {'State': {'Status': 'exited', 'Running': False, 'Pid': 0}}
+
+
+def test_stopped_accepts_actual_timer_shape_and_zero_pid_services(setup,monkeypatch):
     c,_=setup
-    monkeypatch.setattr(r,'run',lambda *a,**k:SimpleNamespace(stdout='LoadState=loaded\nActiveState=inactive\nMainPID=0\nControlPID=123\n'))
+    def unit_show(argv, **_kwargs):
+        unit = argv[3]
+        if unit.endswith('.timer'):
+            return SimpleNamespace(stdout='LoadState=loaded\nActiveState=inactive\nSubState=dead\nUnitFileState=linked\n')
+        return SimpleNamespace(stdout='MainPID=0\nControlPID=0\nLoadState=loaded\nActiveState=inactive\nSubState=dead\nUnitFileState=linked\n')
+    monkeypatch.setattr(r,'run',unit_show)
+    monkeypatch.setattr(r,'inspect',stopped_container)
+    observations, containers = r.stopped(c)
+    assert set(observations) == r.UNIT_ROLES
+    assert 'MainPID' not in observations['watchdog_timer']
+    assert set(containers) == {'coordinator','memory','relay'}
+
+
+@pytest.mark.parametrize('missing_or_live',[
+    'MainPID=0\nControlPID=123\n',
+    'MainPID=0\n',
+    'ControlPID=0\n',
+])
+def test_stopped_services_require_both_explicit_zero_pids(setup,monkeypatch,missing_or_live):
+    c,_=setup
+    def unit_show(argv, **_kwargs):
+        if argv[3].endswith('.timer'):
+            return SimpleNamespace(stdout='LoadState=loaded\nActiveState=inactive\nSubState=dead\n')
+        return SimpleNamespace(stdout='LoadState=loaded\nActiveState=inactive\nSubState=dead\n'+missing_or_live)
+    monkeypatch.setattr(r,'run',unit_show)
     with pytest.raises(r.Refusal,match='not proved inactive'):r.stopped(c)
+
+
+@pytest.mark.parametrize(('role','suffix'),[
+    ('watchdog_timer','.service'),
+    ('gateway','.timer'),
+])
+def test_stopped_refuses_role_unit_type_confusion_before_systemctl(setup,monkeypatch,role,suffix):
+    c,_=setup
+    c['units'][role] = role + suffix
+    monkeypatch.setattr(r,'run',lambda *a,**k:pytest.fail('systemctl called for wrong unit type'))
+    with pytest.raises(r.Refusal,match='wrong type'):r.stopped(c)
+
+
+@pytest.mark.parametrize('timer_fields',[
+    'LoadState=loaded\nActiveState=active\nSubState=waiting\n',
+    'LoadState=loaded\nActiveState=inactive\nSubState=dead\nMainPID=4\n',
+    'LoadState=unknown\nActiveState=inactive\nSubState=dead\n',
+    'LoadState=loaded\nActiveState=inactive\n',
+])
+def test_stopped_refuses_live_or_unknown_timer_fields(setup,monkeypatch,timer_fields):
+    c,_=setup
+    def unit_show(argv, **_kwargs):
+        if argv[3].endswith('.timer'):
+            return SimpleNamespace(stdout=timer_fields)
+        return SimpleNamespace(stdout='LoadState=loaded\nActiveState=inactive\nSubState=dead\nMainPID=0\nControlPID=0\n')
+    monkeypatch.setattr(r,'run',unit_show)
+    with pytest.raises(r.Refusal,match='not proved inactive'):r.stopped(c)
+
 
 def test_snapshot_failure_keeps_no_invalid_directory(setup,monkeypatch):
     c,d=setup
