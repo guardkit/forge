@@ -1,0 +1,570 @@
+#!/usr/bin/env python3
+"""Prepare and validate the rollout's private env file and coordinator settings."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from urllib.parse import urlparse
+
+IMAGE_NAMES = (
+    "FORGE_IMAGE",
+    "FORGE_PUBLISHER_IMAGE",
+    "FLEET_MEMORY_MCP_IMAGE",
+    "FLEET_MEMORY_RELAY_IMAGE",
+    "JARVIS_IMAGE",
+    "NATS_IMAGE",
+    "NATS_PROVISION_IMAGE",
+)
+ROUTE_NAMES = (
+    "FORGE_SANDBOX_SIDECAR_URL",
+    "FORGE_SANDBOX_RUNNER_URL",
+    "FORGE_PUBLISHER_URL",
+)
+NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+IMAGE_ID = re.compile(r"^sha256:[0-9a-f]{64}$")
+REFERENCE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+V4 = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
+
+TRANSFORMER = r'''
+import copy, hashlib, json, os, re, sys
+from pathlib import Path
+import yaml
+from forge.config.loader import load_config
+
+source, destination, metadata_path, evidence_source = map(Path, sys.argv[1:5])
+raw = yaml.safe_load(source.read_text(encoding="utf-8"))
+if not isinstance(raw, dict):
+    raise ValueError("the input settings document is not a mapping")
+original = copy.deepcopy(raw)
+planning = raw.get("planning")
+if not isinstance(planning, dict):
+    raise ValueError("planning is missing or is not a mapping")
+registrations = planning.get("target_repo_paths")
+if not isinstance(registrations, dict) or not registrations:
+    raise ValueError("planning.target_repo_paths is missing or empty")
+sandboxes = planning.get("sandboxes", {})
+if not isinstance(sandboxes, dict):
+    raise ValueError("planning.sandboxes is not a mapping")
+planning["enabled"] = False
+new_paths = {}
+used = set()
+for project, old_path in registrations.items():
+    if not isinstance(project, str) or not isinstance(old_path, str) or not old_path.startswith("/"):
+        raise ValueError("every registration must map a project name to an absolute path")
+    leaf = re.sub(r"[^A-Za-z0-9_.-]+", "-", project.rsplit("/", 1)[-1]).strip("-.")
+    if not leaf or leaf in used:
+        raise ValueError("registered project names do not produce unique container paths")
+    used.add(leaf)
+    new_paths[project] = f"/var/lib/forge/projects/{leaf}"
+planning["target_repo_paths"] = new_paths
+for project, entry in sandboxes.items():
+    if project not in registrations or not isinstance(entry, dict):
+        raise ValueError("every sandbox must be a mapping for a registered project")
+    entry["sidecar_url"] = "${FORGE_SANDBOX_SIDECAR_URL}"
+    entry["runner_url"] = "${FORGE_SANDBOX_RUNNER_URL}"
+deploy = raw.get("deploy")
+if not isinstance(deploy, dict):
+    raise ValueError("deploy is missing or is not a mapping")
+deploy["sidecar_url"] = "${FORGE_SANDBOX_SIDECAR_URL}"
+publication = raw.get("publication")
+if not isinstance(publication, dict):
+    raise ValueError("publication is missing or is not a mapping")
+publication["publisher_url"] = "${FORGE_PUBLISHER_URL}"
+permissions = raw.get("permissions")
+filesystem = permissions.get("filesystem") if isinstance(permissions, dict) else None
+allowlist = filesystem.get("allowlist") if isinstance(filesystem, dict) else None
+if not isinstance(allowlist, list):
+    raise ValueError("permissions.filesystem.allowlist is missing or is not a list")
+old_paths = {str(v): new_paths[k] for k, v in registrations.items()}
+replaced_evidence = 0
+new_allowlist = []
+for item in allowlist:
+    if item == str(evidence_source):
+        new_allowlist.append("/var/lib/forge-evidence")
+        replaced_evidence += 1
+    elif item in old_paths:
+        new_allowlist.append(old_paths[item])
+    else:
+        new_allowlist.append(item)
+if replaced_evidence != 1:
+    raise ValueError("the declared evidence source path must appear exactly once in the allowlist")
+filesystem["allowlist"] = new_allowlist
+
+def changed(path):
+    left, right = original, raw
+    for part in path:
+        left, right = left.get(part) if isinstance(left, dict) else None, right.get(part) if isinstance(right, dict) else None
+    return left, right
+
+allowed = {
+    ("planning", "enabled"),
+    ("planning", "target_repo_paths"),
+    ("planning", "sandboxes"),
+    ("deploy", "sidecar_url"),
+    ("publication", "publisher_url"),
+    ("permissions", "filesystem", "allowlist"),
+}
+def compare(a, b, path=()):
+    if path in allowed:
+        return
+    if type(a) is not type(b):
+        raise ValueError(f"an unapproved setting changed at {'.'.join(path)}")
+    if isinstance(a, dict):
+        if list(a) != list(b):
+            raise ValueError(f"an unapproved setting key changed at {'.'.join(path)}")
+        for key in a:
+            compare(a[key], b[key], path + (str(key),))
+    elif isinstance(a, list):
+        if len(a) != len(b):
+            raise ValueError(f"an unapproved setting list changed at {'.'.join(path)}")
+        for index, (left, right) in enumerate(zip(a, b)):
+            compare(left, right, path + (str(index),))
+    elif a != b:
+        raise ValueError(f"an unapproved setting changed at {'.'.join(path)}")
+compare(original, raw)
+text = yaml.safe_dump(raw, sort_keys=False, allow_unicode=True)
+destination.write_text(text, encoding="utf-8")
+config = load_config(destination, environ=os.environ)
+resolved_sandboxes = {
+    key: {"sidecar_url": value.sidecar_url, "runner_url": value.runner_url}
+    for key, value in config.planning.sandboxes.items()
+}
+metadata = {
+    "input_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+    "output_sha256": hashlib.sha256(destination.read_bytes()).hexdigest(),
+    "registrations": registrations,
+    "new_paths": new_paths,
+    "sandbox_projects": sorted(sandboxes),
+    "routes": {
+        "sandboxes": resolved_sandboxes,
+        "deploy_sidecar": config.deploy.sidecar_url,
+        "publisher": config.publication.publisher_url,
+    },
+}
+metadata_path.write_text(json.dumps(metadata, sort_keys=True), encoding="utf-8")
+'''
+
+
+class Refusal(Exception):
+    pass
+
+
+def refuse(message: str) -> "None":
+    raise Refusal(message.rstrip(".") + ".")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--plan", action="store_true")
+    parser.add_argument("--env-file", required=True, type=Path)
+    parser.add_argument("--env-output", required=True, type=Path)
+    parser.add_argument("--settings-input", required=True, type=Path)
+    parser.add_argument("--settings-output", required=True, type=Path)
+    parser.add_argument("--compose-file", required=True, type=Path)
+    parser.add_argument("--project", required=True)
+    parser.add_argument("--previous-runtime", required=True, type=Path)
+    parser.add_argument("--receipt", required=True, type=Path)
+    parser.add_argument("--evidence-source-path", required=True, type=Path)
+    parser.add_argument("--secret-env-file", action="append", default=[], type=Path)
+    parser.add_argument("--ack-registration-drift", action="append", default=[])
+    parser.add_argument("--machine-term", action="append", default=[])
+    return parser.parse_args()
+
+
+def read_env(path: Path) -> tuple[dict[str, str], bytes]:
+    try:
+        raw = path.read_bytes()
+        text = raw.decode("utf-8")
+    except Exception as exc:
+        refuse(f"cannot read env file {path} ({type(exc).__name__}); provide a readable UTF-8 file")
+    values: dict[str, str] = {}
+    for number, source_line in enumerate(text.splitlines(), 1):
+        line = source_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        if "=" not in line:
+            refuse(f"env file {path} line {number} is not NAME=VALUE; correct that line")
+        key, value = line.split("=", 1)
+        key, value = key.strip(), value.strip()
+        if not NAME.fullmatch(key):
+            refuse(f"env file {path} line {number} has an invalid name; correct that line")
+        if key in values:
+            refuse(f"env file {path} defines {key} twice; keep one explicit value")
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        values[key] = value
+    return values, raw
+
+
+def expand(values: dict[str, str]) -> dict[str, str]:
+    resolved: dict[str, str] = {}
+    active: set[str] = set()
+
+    def one(name: str) -> str:
+        if name in resolved:
+            return resolved[name]
+        if name in active:
+            refuse(f"env values contain a reference cycle at {name}; break the cycle")
+        if name not in values:
+            refuse(f"env value references unset {name}; set it in an explicit env input")
+        active.add(name)
+        value = REFERENCE.sub(lambda match: one(match.group(1)), values[name])
+        active.remove(name)
+        resolved[name] = value
+        return value
+
+    for key in values:
+        one(key)
+    return resolved
+
+
+def require(values: dict[str, str], name: str) -> str:
+    value = values.get(name, "").strip()
+    if not value:
+        refuse(f"required env name {name} is empty; set it in the explicit env input")
+    return value
+
+
+def endpoint(value: str, name: str, schemes: tuple[str, ...]) -> tuple[str, int, str]:
+    parsed = urlparse(value if "://" in value else f"//{value}")
+    if "://" in value and parsed.scheme not in schemes:
+        refuse(f"{name} has the wrong scheme; use one of {', '.join(schemes)}")
+    try:
+        port = parsed.port
+    except ValueError:
+        refuse(f"{name} has an invalid port; correct the explicit env value")
+    host = (parsed.hostname or "").lower()
+    if not host or port is None:
+        refuse(f"{name} must carry an explicit host and port; correct the env value")
+    if host in {"localhost", "0.0.0.0", "127.0.0.1", "::1"}:
+        refuse(f"{name} points at {host}; use the documented service or gateway route")
+    return host, port, parsed.path
+
+
+def validate_routes(env: dict[str, str], metadata: dict) -> dict:
+    gateway = require(env, "FACTORY_GATEWAY_ADDRESS")
+    if gateway in {"0.0.0.0", "127.0.0.1", "localhost"}:
+        refuse("FACTORY_GATEWAY_ADDRESS is not a private boundary address; set the proven gateway")
+    sidecar_host, sidecar_port, _ = endpoint(require(env, "FORGE_SANDBOX_SIDECAR_URL"), "FORGE_SANDBOX_SIDECAR_URL", ("http", "https"))
+    runner_host, runner_port, _ = endpoint(require(env, "FORGE_SANDBOX_RUNNER_URL"), "FORGE_SANDBOX_RUNNER_URL", ("http", "https"))
+    if sidecar_host != gateway.lower() or runner_host != gateway.lower():
+        refuse("sandbox helper and runner routes do not use FACTORY_GATEWAY_ADDRESS; correct the env file")
+    if sidecar_port != int(require(env, "FORGE_SANDBOX_SIDECAR_PORT")) or runner_port != int(require(env, "FORGE_SANDBOX_RUNNER_PORT")):
+        refuse("sandbox helper or runner URL disagrees with its declared port; correct the env file")
+    if require(env, "FORGE_AUTOBUILD_RUNNER_URL") != require(env, "FORGE_SANDBOX_RUNNER_URL"):
+        refuse("FORGE_AUTOBUILD_RUNNER_URL is not the documented sandbox runner route; make them equal")
+    pub_host, pub_port, _ = endpoint(require(env, "FORGE_PUBLISHER_URL"), "FORGE_PUBLISHER_URL", ("http", "https"))
+    if (pub_host, pub_port) != ("forge-publisher", 8711):
+        refuse("FORGE_PUBLISHER_URL is not the publisher service on its private network; use http://forge-publisher:8711")
+    answer_host, answer_port, answer_path = endpoint(require(env, "FORGE_TARGET_OWNER_URL"), "FORGE_TARGET_OWNER_URL", ("http", "https"))
+    if answer_host != gateway.lower() or answer_port != int(require(env, "FORGE_ANSWER_PORT")) or answer_path != "/recorded":
+        refuse("FORGE_TARGET_OWNER_URL is not the gateway answer-service route ending /recorded; correct it")
+    bus_names = ("FORGE_NATS_URL", "FLEET_MEMORY_BUS_ADDRESS", "JARVIS_NATS_URL", "FLEET_MEMORY_NATS_URL")
+    bus_routes = {name: endpoint(require(env, name), name, ("nats",)) for name in bus_names}
+    bus_hosts = {route[0] for route in bus_routes.values()}
+    monitor_host, _, _ = endpoint(require(env, "BUS_MONITORING_ADDRESS"), "BUS_MONITORING_ADDRESS", ())
+    if len(bus_hosts) != 1 or monitor_host not in bus_hosts:
+        refuse("bus client and monitoring routes do not name the same retained bus; correct the env inputs")
+    memory_host, memory_port, memory_path = endpoint(require(env, "FLEET_MEMORY_URL"), "FLEET_MEMORY_URL", ("http", "https"))
+    if (memory_host, memory_port, memory_path.rstrip("/")) != ("memory", 8005, "/mcp"):
+        refuse("FLEET_MEMORY_URL is not the memory service route on the factory network; use http://memory:8005/mcp/")
+    allowed_memory_hosts = {item.strip() for item in require(env, "FLEET_MEMORY_ALLOWED_HOSTS").split(",") if item.strip()}
+    expected_memory_hosts = {"memory:8005", f"{gateway}:{int(require(env, 'FLEET_MEMORY_PORT'))}"}
+    if allowed_memory_hosts != expected_memory_hosts:
+        refuse("FLEET_MEMORY_ALLOWED_HOSTS does not name exactly the factory service and gateway routes; correct it")
+    model_names = ("OPENAI_BASE_URL", "JARVIS_MODEL_SEAT_URL", "FLEET_MEMORY_EMBED_URL")
+    model_routes = {name: endpoint(require(env, name), name, ("http", "https")) for name in model_names}
+    if any(route[0] != gateway.lower() for route in model_routes.values()):
+        refuse("model and embedding routes do not use FACTORY_GATEWAY_ADDRESS; correct the env inputs")
+    pg_host, _, _ = endpoint(require(env, "FLEET_MEMORY_PG_DSN"), "FLEET_MEMORY_PG_DSN", ("postgresql", "postgres"))
+    if not pg_host:
+        refuse("FLEET_MEMORY_PG_DSN has no private-store host; correct the private env input")
+    if require(env, "FLEET_MEMORY_ENABLED") not in {"true", "false"}:
+        refuse("FLEET_MEMORY_ENABLED must explicitly say true or false; correct the public env input")
+    for name in ("FLEET_MEMORY_EMBED_MODEL", "FLEET_MEMORY_EMBED_DIMS"):
+        require(env, name)
+    expected_sidecar = require(env, "FORGE_SANDBOX_SIDECAR_URL")
+    expected_runner = require(env, "FORGE_SANDBOX_RUNNER_URL")
+    for project, routes in metadata["routes"]["sandboxes"].items():
+        if routes != {"sidecar_url": expected_sidecar, "runner_url": expected_runner}:
+            refuse(f"resolved sandbox routes for {project} differ from the section 7 routes; correct the settings")
+    if metadata["routes"]["deploy_sidecar"] != expected_sidecar or metadata["routes"]["publisher"] != require(env, "FORGE_PUBLISHER_URL"):
+        refuse("resolved deploy or publisher route differs from the section 7 route; correct the settings")
+    return {
+        "gateway_routes_match": True,
+        "sandbox_sidecar_port": sidecar_port,
+        "sandbox_runner_port": runner_port,
+        "publisher_private_service_match": True,
+        "answer_port": answer_port,
+        "bus_routes_match": True,
+        "memory_factory_service_match": True,
+        "model_gateway_routes_match": True,
+        "memory_store_route_valid": True,
+    }
+
+
+def previous_runtime(path: Path) -> tuple[dict, list[str], list[dict]]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        refuse(f"cannot read previous runtime {path} ({type(exc).__name__}); use rollout-snapshot output")
+    if not isinstance(data, dict):
+        refuse(f"previous runtime {path} is not a JSON object; recreate it with rollout-snapshot")
+    names = data.get("environment_names", data.get("env_names"))
+    if not isinstance(names, list) or not all(isinstance(item, str) and NAME.fullmatch(item) for item in names):
+        refuse(f"previous runtime {path} lacks environment_names as names only; recreate it with rollout-snapshot")
+    if any("=" in item for item in names) or "environment" in data:
+        refuse(f"previous runtime {path} carries environment values; recreate it with names only")
+    mounts = data.get("mounts")
+    if not isinstance(mounts, list) or not all(isinstance(item, dict) for item in mounts):
+        refuse(f"previous runtime {path} lacks its full mount list; recreate it with rollout-snapshot")
+    return data, names, mounts
+
+
+def docker_env(values: dict[str, str]) -> dict[str, str]:
+    base = {"PATH": os.environ.get("PATH", "/usr/bin:/bin")}
+    if "DOCKER_CONFIG" in os.environ:
+        base["DOCKER_CONFIG"] = os.environ["DOCKER_CONFIG"]
+    base.update(values)
+    return base
+
+
+def run(command: list[str], *, env: dict[str, str], input_bytes: bytes | None = None) -> bytes:
+    try:
+        result = subprocess.run(command, input=input_bytes, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, check=False)
+    except OSError as exc:
+        refuse(f"cannot run {command[0]} ({type(exc).__name__}); install it and retry")
+    if result.returncode:
+        refuse(f"{command[0]} refused the settings preparation with exit {result.returncode}; correct the named input and retry")
+    return result.stdout
+
+
+def atomic_write(path: Path, content: bytes, mode: int = 0o600) -> str:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists() and path.read_bytes() == content:
+        os.chmod(path, mode)
+        return "unchanged"
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, mode)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+    return "written"
+
+
+def validate_compose(rendered: dict, env: dict[str, str], old_paths: list[str], images: dict[str, str]) -> None:
+    services = rendered.get("services", {})
+    for name in ("coordinator", "answer-service", "forge-publisher"):
+        if name not in services:
+            refuse(f"rendered project lacks service {name}; correct --compose-file and env inputs")
+    expected_images = {
+        "coordinator": "FORGE_IMAGE",
+        "answer-service": "FORGE_IMAGE",
+        "forge-publisher": "FORGE_PUBLISHER_IMAGE",
+        "memory": "FLEET_MEMORY_MCP_IMAGE",
+        "memory-relay": "FLEET_MEMORY_RELAY_IMAGE",
+        "front-door": "JARVIS_IMAGE",
+        "bus-gateway": "JARVIS_IMAGE",
+        "nats": "NATS_IMAGE",
+    }
+    for service_name, image_name in expected_images.items():
+        if service_name in services and services[service_name].get("image") != images[image_name]:
+            refuse(f"rendered service {service_name} does not use immutable {image_name}; correct the env or project")
+    for service_name, service in services.items():
+        if service.get("build"):
+            refuse(f"rendered service {service_name} would build instead of use a tested image; remove its build rule")
+        image = service.get("image")
+        if image and not IMAGE_ID.fullmatch(str(image)):
+            refuse(f"rendered service {service_name} does not use an immutable image ID; correct the env or project")
+    coordinator_networks = set(services["coordinator"].get("networks", {}))
+    publisher_networks = set(services["forge-publisher"].get("networks", {}))
+    if not {"factory", "forge-publisher-net"}.issubset(coordinator_networks) or publisher_networks != {"forge-publisher-net"}:
+        refuse("rendered coordinator/publisher networks do not enforce the private publisher route; correct the project")
+    members = {name for name, service in services.items() if "forge-publisher-net" in set(service.get("networks", {}))}
+    if members != {"coordinator", "forge-publisher"} or services["forge-publisher"].get("ports"):
+        refuse("rendered publisher network or ports expose more than coordinator-to-publisher; correct the project")
+    gateway = env["FACTORY_GATEWAY_ADDRESS"]
+    for name, service in services.items():
+        for port in service.get("ports", []) or []:
+            host_ip = str(port.get("host_ip", "")) if isinstance(port, dict) else ""
+            if host_ip and host_ip != gateway:
+                refuse(f"rendered service {name} publishes outside FACTORY_GATEWAY_ADDRESS; correct the project")
+        for mount in service.get("volumes", []) or []:
+            if isinstance(mount, dict) and mount.get("type") == "bind" and str(mount.get("source")) in old_paths:
+                refuse(f"rendered service {name} binds an old registered project path; remove that bind")
+    published = services["answer-service"].get("ports", []) or []
+    if not any(isinstance(item, dict) and str(item.get("host_ip")) == gateway and int(item.get("target", 0)) == 8126 for item in published):
+        refuse("rendered answer service is not published only on the gateway route; correct the project")
+
+
+def main() -> int:
+    args = parse_args()
+    inputs = (args.env_file, args.settings_input, args.compose_file, args.previous_runtime, *args.secret_env_file)
+    for path in inputs:
+        if not path.is_file():
+            refuse(f"required input {path} is not a readable file; provide its explicit path")
+    if args.env_file.resolve() == args.env_output.resolve() or args.settings_input.resolve() == args.settings_output.resolve():
+        refuse("an output path equals its input path; choose new output paths so the old files stay unchanged")
+    if args.plan:
+        print(f"PLAN 1 read public env as data from {args.env_file} and private names from {len(args.secret_env_file)} secret file(s)")
+        print(f"PLAN 2 rewrite {args.settings_input} to {args.settings_output} with planning disabled and documented names/container paths")
+        print(f"PLAN 3 validate with the immutable FORGE_IMAGE, the real loader, and Compose project {args.compose_file}")
+        print(f"PLAN 4 compare registrations with {args.previous_runtime} and require exact drift acknowledgements")
+        print(f"PLAN 5 atomically write {args.env_output}, {args.settings_output}, and {args.receipt}")
+        return 0
+
+    public, public_bytes = read_env(args.env_file)
+    combined = dict(public)
+    secret_values: dict[str, str] = {}
+    for secret_path in args.secret_env_file:
+        secrets, _ = read_env(secret_path)
+        overlap = set(combined) & set(secrets)
+        if overlap and any(combined[name].strip() for name in overlap):
+            refuse(f"public and private env inputs both define {sorted(overlap)[0]}; keep the value in one explicit input")
+        secret_values.update(secrets)
+        combined.update(secrets)
+    resolved = expand(combined)
+    for secret in (value for value in secret_values.values() if len(value) >= 4):
+        if secret.encode() in public_bytes:
+            refuse(f"public env input {args.env_file} contains a private value; replace it with its env name")
+
+    docker = shutil.which("docker")
+    if not docker:
+        refuse("docker is not on PATH; install the operational Docker CLI and retry")
+    process_env = docker_env(resolved)
+    image_ids: dict[str, str] = {}
+    for name in IMAGE_NAMES:
+        image = require(resolved, name)
+        if not IMAGE_ID.fullmatch(image):
+            refuse(f"{name} is not an immutable local sha256 image ID; choose the tested image explicitly")
+        actual = run([docker, "image", "inspect", "--format", "{{.Id}}", image], env=process_env).decode().strip()
+        if actual != image:
+            refuse(f"{name} does not resolve to its declared image ID locally; load the exact tested image")
+        image_ids[name] = image
+
+    runtime, env_names, mounts = previous_runtime(args.previous_runtime)
+    if runtime.get("format_version") != 1:
+        refuse(f"previous runtime {args.previous_runtime} is not format_version 1; recreate it with rollout-snapshot")
+    if runtime.get("release_image_id") != resolved["FORGE_IMAGE"]:
+        refuse("previous runtime release_image_id differs from immutable FORGE_IMAGE; use artifacts from the same rollout")
+    with tempfile.TemporaryDirectory(prefix="rollout-settings-") as workspace:
+        work = Path(workspace)
+        transformed = work / "forge.yaml"
+        metadata_path = work / "metadata.json"
+        command = [
+            docker, "run", "--rm", "--network", "none", "--read-only",
+            "--user", f"{os.getuid()}:{os.getgid()}", "--tmpfs", "/tmp",
+            "--entrypoint", "python",
+        ]
+        for name in ROUTE_NAMES:
+            command.extend(["-e", f"{name}={require(resolved, name)}"])
+        command.extend([
+            "-v", f"{args.settings_input.resolve()}:/input/forge.yaml:ro",
+            "-v", f"{work}:/output", resolved["FORGE_IMAGE"], "-c", TRANSFORMER,
+            "/input/forge.yaml", "/output/forge.yaml", "/output/metadata.json",
+            str(args.evidence_source_path),
+        ])
+        run(command, env=process_env)
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            settings_bytes = transformed.read_bytes()
+        except Exception as exc:
+            refuse(f"the schema container did not produce complete output ({type(exc).__name__}); inspect the chosen image")
+
+        route_receipt = validate_routes(resolved, metadata)
+        registrations = metadata["registrations"]
+        destinations = {
+            str(item.get("Destination", item.get("destination", item.get("target", ""))))
+            for item in mounts
+        }
+        drift = sorted(project for project, path in registrations.items() if path not in destinations)
+        acknowledged = sorted(set(args.ack_registration_drift))
+        if acknowledged != drift:
+            refuse(f"registration drift is {drift} but acknowledgements are {acknowledged}; acknowledge each exact project and no other")
+        for project in sorted(registrations):
+            state = "sandbox configured" if project in metadata["sandbox_projects"] else "retained; unbuildable until sandbox"
+            prior = "bound" if registrations[project] in destinations else "not bound (acknowledged)"
+            print(f"registration {project}: {state}; previous runtime {prior}; new path {metadata['new_paths'][project]}")
+
+        sweep_terms = list(args.machine_term)
+        sweep_terms.extend(part for part in public.get("RELEASE_SWEEP_TERMS", "").split() if part)
+        forbidden = ["127.0.0.1", "0.0.0.0", "172.30.1.", "/home/"] + sweep_terms
+        decoded_settings = settings_bytes.decode("utf-8")
+        found = next((term for term in forbidden if term and term in decoded_settings), None)
+        if found:
+            refuse(f"rendered settings still contain machine term {found!r}; correct the input or explicit mapping")
+        if REFERENCE.search(decoded_settings):
+            known = set(REFERENCE.findall(decoded_settings))
+            unknown = known - set(ROUTE_NAMES)
+            if unknown:
+                refuse(f"rendered settings retain unsupported name {sorted(unknown)[0]}; add an explicit documented mapping")
+
+        compose_bytes = run(
+            [docker, "compose", "--project-name", args.project, "--env-file", str(args.env_file.resolve()), "-f", str(args.compose_file.resolve()), "config", "--format", "json"],
+            env=process_env,
+        )
+        try:
+            rendered = json.loads(compose_bytes)
+        except Exception as exc:
+            refuse(f"Compose did not return JSON ({type(exc).__name__}); use a supported Docker Compose and retry")
+        validate_compose(rendered, resolved, list(registrations.values()), image_ids)
+
+        env_status = atomic_write(args.env_output, public_bytes)
+        settings_status = atomic_write(args.settings_output, settings_bytes)
+        receipt = {
+            "schema": 1,
+            "env_input_sha256": hashlib.sha256(public_bytes).hexdigest(),
+            "env_output_sha256": hashlib.sha256(public_bytes).hexdigest(),
+            "settings_input_sha256": metadata["input_sha256"],
+            "settings_output_sha256": metadata["output_sha256"],
+            "project_file_sha256": hashlib.sha256(args.compose_file.read_bytes()).hexdigest(),
+            "previous_runtime_sha256": hashlib.sha256(args.previous_runtime.read_bytes()).hexdigest(),
+            "images": image_ids,
+            "routes": route_receipt,
+            "registrations": {
+                project: {
+                    "new_path": metadata["new_paths"][project],
+                    "previously_bound": registrations[project] in destinations,
+                    "sandbox_configured": project in metadata["sandbox_projects"],
+                }
+                for project in sorted(registrations)
+            },
+            "registration_drift_acknowledged": acknowledged,
+            "previous_runtime_environment_names": sorted(env_names),
+            "checks": ["forge.config.loader.load_config", "section-7-routes", "docker-compose-config", "machine-value-sweep"],
+        }
+        receipt_bytes = (json.dumps(receipt, indent=2, sort_keys=True) + "\n").encode()
+        receipt_status = atomic_write(args.receipt, receipt_bytes)
+    print(f"settings preparation complete: env {env_status}; settings {settings_status}; receipt {receipt_status}")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except Refusal as exc:
+        print(f"REFUSED: {exc}", file=sys.stderr)
+        raise SystemExit(2)
+    except KeyboardInterrupt:
+        print("REFUSED: settings preparation was interrupted; no partial output was installed.", file=sys.stderr)
+        raise SystemExit(2)
+    except Exception as exc:
+        print(f"REFUSED: settings preparation hit {type(exc).__name__}; inspect the explicit inputs and retry.", file=sys.stderr)
+        raise SystemExit(2)
