@@ -1892,6 +1892,108 @@ class TestSandboxOnlyRepairAdmission:
         assert admission.repo == REPO_KEY
         assert publisher.payloads[0]["repo"] == REPO_KEY
 
+    def test_named_repair_uses_the_exact_keys_sandbox_for_a_shared_path(
+        self,
+        repo_root: Path,
+        pool: SqliteLifecyclePersistence,
+        store: WorkQueueStore,
+    ) -> None:
+        unsandboxed_alias = "synthetic-owner/api-test"
+        config = make_config(
+            repo_root,
+            profiles={FIX_JOURNEY_PROFILE_NAME: {"max_review_cycles": 2}},
+            default_profile=FIX_JOURNEY_PROFILE_NAME,
+            sandbox=True,
+        )
+        config.publication.builds_may_run_inside_the_coordinator = False
+        config.planning.target_repo_paths[unsandboxed_alias] = str(repo_root)
+        seed_failed_build(pool)
+        queue_id = store.file_sentence(
+            correlation_id=fix_correlation_id(SOURCE_BUILD),
+            sentence="synthetic alias repair",
+            originating_user="synthetic-user",
+            target_repo=REPO_KEY,
+            kind="fix",
+            action="minted",
+        ).queue_id
+        publisher = Publisher()
+        sidecar = _RetainedCandidateSidecar(head(repo_root, "main"))
+        sidecar.shas["main"] = head(repo_root, "main")
+
+        admission = asyncio.run(
+            admit_fix_row(
+                config=config,
+                persistence=pool,
+                store=store,
+                queue_id=queue_id,
+                correlation_id=fix_correlation_id(SOURCE_BUILD),
+                sentence="synthetic alias repair",
+                target_repo=REPO_KEY,
+                publish=publisher,
+                profile=FIX_JOURNEY_PROFILE_NAME,
+                sidecar_post=sidecar,
+            )
+        )
+
+        assert admission.repo == REPO_KEY
+        assert publisher.payloads[0]["repo"] == REPO_KEY
+        assert {body["repo"] for _, body in sidecar.calls} == {REPO_KEY}
+
+    def test_unsandboxed_exact_alias_refuses_without_queue_or_build_side_effects(
+        self,
+        repo_root: Path,
+        pool: SqliteLifecyclePersistence,
+        store: WorkQueueStore,
+    ) -> None:
+        unsandboxed_alias = "synthetic-owner/api-test"
+        config = make_config(
+            repo_root,
+            profiles={FIX_JOURNEY_PROFILE_NAME: {"max_review_cycles": 2}},
+            default_profile=FIX_JOURNEY_PROFILE_NAME,
+            sandbox=True,
+        )
+        config.publication.builds_may_run_inside_the_coordinator = False
+        config.planning.target_repo_paths[unsandboxed_alias] = str(repo_root)
+        seed_failed_build(pool)
+        queue_id = store.file_sentence(
+            correlation_id=fix_correlation_id(SOURCE_BUILD),
+            sentence="synthetic unsandboxed alias repair",
+            originating_user="synthetic-user",
+            target_repo=unsandboxed_alias,
+            kind="fix",
+            action="minted",
+        ).queue_id
+        publisher = Publisher()
+        builds_before = [dict(row) for row in build_rows(pool)]
+        queue_before = [dict(row) for row in queue_rows(pool)]
+        events_before = [dict(row) for row in store.list_events(queue_id)]
+        branches_before = branches(repo_root)
+        status_before = porcelain_hash(repo_root)
+
+        with pytest.raises(FixAdmissionRefused) as caught:
+            asyncio.run(
+                admit_fix_row(
+                    config=config,
+                    persistence=pool,
+                    store=store,
+                    queue_id=queue_id,
+                    correlation_id=fix_correlation_id(SOURCE_BUILD),
+                    sentence="synthetic unsandboxed alias repair",
+                    target_repo=unsandboxed_alias,
+                    publish=publisher,
+                    profile=FIX_JOURNEY_PROFILE_NAME,
+                )
+            )
+
+        assert caught.value.reason == "sandbox-required"
+        assert "no registered sandbox" in caught.value.message
+        assert publisher.published == []
+        assert [dict(row) for row in build_rows(pool)] == builds_before
+        assert [dict(row) for row in queue_rows(pool)] == queue_before
+        assert [dict(row) for row in store.list_events(queue_id)] == events_before
+        assert branches(repo_root) == branches_before
+        assert porcelain_hash(repo_root) == status_before
+
     def test_work_queue_repair_refuses_before_scanning_a_missing_checkout(
         self,
         tmp_path: Path,

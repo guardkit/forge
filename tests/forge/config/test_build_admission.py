@@ -82,6 +82,86 @@ def test_strict_path_resolution_refuses_ambiguous_declared_paths() -> None:
     assert "ambiguous" in (decision.reason or "")
 
 
+def test_exact_key_disambiguates_its_matching_shared_path() -> None:
+    primary = "owner-a/project"
+    alias = "owner-b/project"
+    config = SimpleNamespace(
+        publication=SimpleNamespace(builds_may_run_inside_the_coordinator=False),
+        planning=SimpleNamespace(
+            target_repo_paths={primary: REWRITTEN, alias: REWRITTEN},
+            sandboxes={
+                primary: {
+                    "runner_url": "https://runner.example",
+                    "sidecar_url": "https://sidecar.example",
+                }
+            },
+        ),
+    )
+
+    decision = build_admission(
+        config,
+        target_repo=primary,
+        repo_path=REWRITTEN,
+        require_sidecar=True,
+    )
+
+    assert decision.allowed is True
+    assert decision.repo_key == primary
+
+
+def test_exact_alias_uses_only_its_own_sandbox_membership() -> None:
+    primary = "owner-a/project"
+    unsandboxed_alias = "owner-b/project"
+    config = SimpleNamespace(
+        publication=SimpleNamespace(builds_may_run_inside_the_coordinator=False),
+        planning=SimpleNamespace(
+            target_repo_paths={primary: REWRITTEN, unsandboxed_alias: REWRITTEN},
+            sandboxes={
+                primary: {
+                    "runner_url": "https://runner.example",
+                    "sidecar_url": "https://sidecar.example",
+                }
+            },
+        ),
+    )
+
+    decision = build_admission(
+        config,
+        target_repo=unsandboxed_alias,
+        repo_path=REWRITTEN,
+        require_sidecar=True,
+    )
+
+    assert decision.allowed is False
+    assert "no registered sandbox" in (decision.reason or "")
+
+
+@pytest.mark.parametrize("target", ["owner-a/project", "unknown/project"])
+def test_exact_or_unknown_key_cannot_contradict_the_supplied_path(target) -> None:
+    config = SimpleNamespace(
+        publication=SimpleNamespace(builds_may_run_inside_the_coordinator=False),
+        planning=SimpleNamespace(
+            target_repo_paths={
+                "owner-a/project": REWRITTEN,
+                "owner-b/project": "/var/lib/forge/projects/other",
+            },
+            sandboxes={
+                "owner-a/project": {"runner_url": "https://runner.example"},
+                "owner-b/project": {"runner_url": "https://runner.example"},
+            },
+        ),
+    )
+
+    decision = build_admission(
+        config,
+        target_repo=target,
+        repo_path="/var/lib/forge/projects/other",
+    )
+
+    assert decision.allowed is False
+    assert "consistently" in (decision.reason or "")
+
+
 def test_repair_requires_a_usable_sidecar_as_well_as_the_runner() -> None:
     config = SimpleNamespace(
         publication=SimpleNamespace(builds_may_run_inside_the_coordinator=False),
