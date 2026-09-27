@@ -668,6 +668,88 @@ class _NoopApprovalRepublisher:
         )
 
 
+async def _settle_strict_runless_builds_at_boot(
+    sqlite_pool: SqliteLifecyclePersistence,
+    forge_config: ForgeConfig,
+    emitter: Any,
+    builds: list[Any],
+) -> int:
+    """Terminally refuse runless rows proven by serialized boot ownership.
+
+    The caller supplies only rows whose prior coordinator ownership has ended.
+    Normal consumer delivery never calls this helper, so live no-gate
+    QUEUED/INTERRUPTED rows and PAUSED approval ownership remain untouched.
+    """
+    from forge.cli._conductor_outcome import fail_mode_c_build
+    from forge.config.build_admission import build_admission
+    from forge.lifecycle.state_machine import TERMINAL_STATES, BuildState
+    from forge.pipeline import BuildContext
+
+    settled = 0
+    for recovered in builds:
+        current = sqlite_pool.get_build_row(recovered.build_id)
+        if current is None or current.status in TERMINAL_STATES:
+            continue
+        admission = build_admission(forge_config, target_repo=current.repo)
+        if admission.allowed:
+            continue
+        policy_reason = admission.reason or "sandbox-required"
+        finalising_warning = str(current.error or "")
+        if not finalising_warning.startswith("finalising-interrupted:"):
+            finalising_warning = ""
+        durable_reason = (
+            f"{policy_reason}; {finalising_warning}"
+            if finalising_warning
+            else policy_reason
+        )
+        fail_mode_c_build(
+            sqlite_pool,
+            current.build_id,
+            summary=durable_reason,
+            what="sandbox BUILD admission refusal during serialized boot recovery",
+            log=logger,
+        )
+        try:
+            persisted = sqlite_pool.get_build_row(current.build_id)
+        except Exception as exc:  # noqa: BLE001 — startup must refuse safely
+            raise RuntimeError(
+                "sandbox BUILD admission could not verify durable FAILED "
+                f"state for runless build {current.build_id}: {exc}"
+            ) from exc
+        if (
+            persisted is None
+            or persisted.status is not BuildState.FAILED
+            or persisted.error != durable_reason
+        ):
+            observed = "missing" if persisted is None else (
+                f"status={persisted.status.value} error={persisted.error!r}"
+            )
+            raise RuntimeError(
+                "sandbox BUILD admission did not durably settle runless "
+                f"build {current.build_id} as FAILED ({observed}); refusing "
+                "startup before consumer attachment"
+            )
+        await emitter.emit_failed(
+            BuildContext(
+                feature_id=persisted.feature_id,
+                build_id=persisted.build_id,
+                correlation_id=persisted.correlation_id,
+                wave_total=1,
+            ),
+            failure_reason=durable_reason,
+            recoverable=False,
+            failed_task_id=persisted.task_id,
+        )
+        settled += 1
+        logger.error(
+            "forge-serve: boot recovery terminally refused runless build_id=%s "
+            "(%s)",
+            persisted.build_id,
+            durable_reason,
+        )
+    return settled
+
+
 def _build_recovery_reconcile_seam(
     sqlite_pool: SqliteLifecyclePersistence,
     forge_config: ForgeConfig,
@@ -677,7 +759,9 @@ def _build_recovery_reconcile_seam(
     Binds :func:`forge.lifecycle.recovery.reconcile_on_boot` to a
     :class:`PipelineFailurePublisher` built from the boot client and a no-op
     :class:`ApprovalRepublisher` (PAUSED approval re-emit suppressed — rearm
-    owns it). recovery.py stays unmodified.
+    owns it). Before live consumer attachment, strict BUILD policy settles
+    only rows this serialized pass proves runless. ``recovery.py`` stays
+    unmodified.
     """
 
     async def _recovery_reconcile_on_boot(client: Any) -> None:
@@ -687,10 +771,26 @@ def _build_recovery_reconcile_seam(
         from forge.lifecycle.recovery import (
             DEFAULT_STALE_QUEUED_THRESHOLD_SECONDS,
         )
+        from forge.lifecycle.state_machine import BuildState
 
-        publisher, _emitter = build_publisher_and_emitter(
+        publisher, emitter = build_publisher_and_emitter(
             client, config=forge_config.pipeline
         )
+        before_recovery = sqlite_pool.read_non_terminal_builds()
+        runless_before_recovery = [
+            build
+            for build in before_recovery
+            if build.status
+            in {
+                BuildState.INTERRUPTED,
+                BuildState.PREPARING,
+                BuildState.RUNNING,
+            }
+        ]
+        settled_before = await _settle_strict_runless_builds_at_boot(
+            sqlite_pool, forge_config, emitter, runless_before_recovery
+        )
+
         # FWD-003: sweep stale QUEUED rows (orphans whose build-queued
         # message is long gone) so they stop blocking exists_active_build.
         report = await _recovery_reconcile(
@@ -699,14 +799,29 @@ def _build_recovery_reconcile_seam(
             _NoopApprovalRepublisher(),
             stale_queued_threshold_seconds=DEFAULT_STALE_QUEUED_THRESHOLD_SECONDS,
         )
+        recovered_runless = []
+        for build in before_recovery:
+            # Let the existing FINALISING handler retain its PR-existence
+            # warning before policy settlement. A stale QUEUED row becomes
+            # eligible only when that handler actually moved it to
+            # INTERRUPTED. Neither case emits a competing recovery failure.
+            if build.status not in {BuildState.QUEUED, BuildState.FINALISING}:
+                continue
+            current = sqlite_pool.get_build_row(build.build_id)
+            if current is not None and current.status is BuildState.INTERRUPTED:
+                recovered_runless.append(current)
+        settled_after = await _settle_strict_runless_builds_at_boot(
+            sqlite_pool, forge_config, emitter, recovered_runless
+        )
         logger.info(
             "forge-serve: recovery reconcile complete (interrupted=%d "
             "paused_suppressed=%d skipped=%d stale_queued_interrupted=%d "
-            "failures=%d)",
+            "sandbox_refused_runless=%d failures=%d)",
             report.interrupted_count,
             report.paused_reissued_count,
             report.skipped_count,
             report.stale_queued_interrupted_count,
+            settled_before + settled_after,
             len(report.failures),
         )
 
@@ -726,10 +841,11 @@ def _build_consumer_reconcile_seam(
       fns are no-ops (rearm owns PAUSED; documented ownership boundary above).
     * redelivery drain DEFERRED — ``fetch_redeliveries`` returns an empty batch
       so no boot-time pull subscription collides with the daemon's own durable
-      attach (single-consumer rule, err 10100). Crash-mid-hop INTERRUPTED rows
-      heal on the first post-boot redelivery via ``dispatch_build``'s three-arm
-      INTERRUPTED→redispatch. The Branch-2 collaborators are wired correctly so
-      the machinery is honest and a future change may enable the boot drain.
+      attach (single-consumer rule, err 10100). The preceding recovery seam
+      settles strict-policy runless refusals before attachment; eligible
+      remaining INTERRUPTED rows heal on the first post-boot redelivery via
+      ``dispatch_build``. The Branch-2 collaborators remain wired so a future
+      change may enable the boot drain.
     """
 
     async def _consumer_reconcile_on_boot(client: Any) -> None:
@@ -866,44 +982,50 @@ class _RepoRoutedAsyncTaskStarter:
     """Dispatch each build to the runner that lives with its repository.
 
     SANDBOX FIRST (2026-09-07, rule 78). A build installs and runs a
-    repository's own code, so for a repository that has a sandbox it is
-    dispatched to the build runner INSIDE that sandbox, whose worktrees, venvs
-    and test runs exist only there. Every other repository is dispatched to
-    the one global runner exactly as before.
+    repository's own code. Repositories with a registered sandbox are sent to
+    that sandbox's runner. In compatibility mode other repositories retain the
+    global runner; when coordinator builds are disabled, missing, ambiguous or
+    unusable sandbox routes are refused.
 
-    The choice is per dispatch, not per boot, because one daemon serves every
-    repository and only some of them have a sandbox. The repository rides on
-    the dispatch itself (``context["repo"]``, which
-    :func:`forge.pipeline.dispatchers.autobuild_async.dispatch_autobuild_async`
-    puts there); a dispatch that names no repository, or names one with no
-    sandbox, goes to the global runner.
-
-    This class is only ever built when ``planning.sandboxes`` names at least
-    one repository — with the mapping empty the composition hands the
-    dispatcher the same single starter it always did, so nothing routes at all.
+    The choice is per dispatch because one daemon serves every repository.
+    The canonical repository identity rides on ``context["repo"]`` from
+    :func:`forge.pipeline.dispatchers.autobuild_async.dispatch_autobuild_async`.
+    The shared admission helper resolves that identity before a starter can be
+    selected, so strict mode never falls through to the global starter.
     """
 
-    __slots__ = ("_default", "_by_repo")
+    __slots__ = ("_default", "_by_repo", "_config")
 
     def __init__(
-        self, *, default: AsyncTaskStarter, by_repo: dict[str, AsyncTaskStarter]
+        self,
+        *,
+        default: AsyncTaskStarter,
+        by_repo: dict[str, AsyncTaskStarter],
+        forge_config: Any,
     ) -> None:
         self._default = default
         self._by_repo = dict(by_repo)
+        self._config = forge_config
 
     def _starter_for(self, context: "Mapping[str, Any]") -> AsyncTaskStarter:
         try:
             repo = str(context.get("repo") or "").strip()
         except AttributeError:  # pragma: no cover — a mapping is what is sent
-            return self._default
-        starter = self._by_repo.get(repo)
+            repo = ""
+        from forge.config.build_admission import build_admission
+
+        admission = build_admission(self._config, target_repo=repo)
+        if not admission.allowed:
+            raise RuntimeError(admission.reason or "sandbox-required")
+        canonical_repo = admission.repo_key or repo
+        starter = self._by_repo.get(canonical_repo)
         if starter is None:
             return self._default
         logger.info(
             "autobuild dispatch: %s has a sandbox, so this build runs on the "
             "build runner inside it — the repository's own code is never "
             "installed or run on the host",
-            repo,
+            canonical_repo,
         )
         return starter
 
@@ -927,17 +1049,18 @@ def build_repo_routed_async_task_starter(
 ) -> AsyncTaskStarter:
     """Return the starter the dispatch chain uses — routed only if it must be.
 
-    With ``planning.sandboxes`` empty (the default, and the estate's state
-    until an operator fills it in) this returns ``default_starter`` itself, so
-    the composition is byte for byte what it was before this lane. Otherwise
-    it builds one more middleware per sandboxed repository, each registered
-    against that sandbox's own runner address, and wraps them all in
-    :class:`_RepoRoutedAsyncTaskStarter`.
+    Compatibility mode with no sandbox registrations returns
+    ``default_starter`` unchanged. Otherwise this builds one middleware per
+    sandbox runner and wraps the starters in
+    :class:`_RepoRoutedAsyncTaskStarter`. Strict mode creates the wrapper even
+    when no usable routes exist so every attempted dispatch is refused.
     """
+    from forge.config.build_admission import builds_require_sandbox
     from forge.config.sandboxes import sandboxes_of
 
     sandboxes = sandboxes_of(forge_config)
-    if not sandboxes:
+    strict = builds_require_sandbox(forge_config)
+    if not sandboxes and not strict:
         return default_starter
     by_repo: dict[str, AsyncTaskStarter] = {}
     for repo, entry in sandboxes.items():
@@ -945,8 +1068,8 @@ def build_repo_routed_async_task_starter(
         if not runner_url:
             logger.warning(
                 "autobuild dispatch: %s has a sandbox (%s) but no runner "
-                "address, so its builds go to the global build runner — the "
-                "repository's code would run on the host. Set runner_url in "
+                "address. Strict BUILD admission will refuse it; compatibility "
+                "mode retains the global build runner. Set runner_url in "
                 "planning.sandboxes",
                 repo,
                 getattr(entry, "name", "?"),
@@ -963,10 +1086,12 @@ def build_repo_routed_async_task_starter(
             getattr(entry, "name", "?"),
             runner_url,
         )
-    if not by_repo:
+    if not by_repo and not strict:
         return default_starter
     return _RepoRoutedAsyncTaskStarter(
-        default=default_starter, by_repo=by_repo
+        default=default_starter,
+        by_repo=by_repo,
+        forge_config=forge_config,
     )
 
 

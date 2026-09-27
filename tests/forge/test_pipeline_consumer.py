@@ -852,6 +852,9 @@ class TestReconcileInFlightStates:
         sent_payload, ack_callback = mocks["dispatch_build"].await_args.args
         assert sent_payload.feature_id == "FEAT-A1B2"
         assert callable(ack_callback)
+        assert mocks["dispatch_build"].await_args.kwargs == {
+            "runless_replay": True
+        }
         # ack is deferred — only the state machine's terminal callback fires it.
         msg.ack.assert_not_called()
         assert report.restarted_in_flight == 1
@@ -1120,6 +1123,30 @@ class TestReconcileAllBranches:
 # ---------------------------------------------------------------------------
 
 
+class TestReconcileQueuedBranch:
+    """A previous-process QUEUED row is explicitly marked runless."""
+
+    @pytest.mark.asyncio
+    async def test_queued_redelivery_carries_the_runless_marker(
+        self, reconcile_factory, allowlist_root: Path
+    ) -> None:
+        yaml_path = allowlist_root / "feature.yaml"
+        msg = _make_msg(_envelope_bytes(_valid_payload_dict(yaml_path)))
+        deps, mocks = reconcile_factory(
+            state_by_key={("FEAT-A1B2", "corr-001"): "QUEUED"},
+            redelivery_batches=[[msg]],
+        )
+
+        report = await reconcile_on_boot(deps)
+
+        mocks["dispatch_build"].assert_awaited_once()
+        assert mocks["dispatch_build"].await_args.kwargs == {
+            "runless_replay": True
+        }
+        assert report.fresh_builds == 1
+        msg.ack.assert_not_called()
+
+
 class TestReconcileInterruptedBranch:
     """An INTERRUPTED row is restarted deliberately, not fallen into.
 
@@ -1157,6 +1184,9 @@ class TestReconcileInterruptedBranch:
         report = await reconcile_on_boot(deps)
 
         mocks["dispatch_build"].assert_awaited_once()
+        assert mocks["dispatch_build"].await_args.kwargs == {
+            "runless_replay": True
+        }
         assert report.restarted_interrupted == 1
         assert report.fresh_builds == 0
         assert report.restarted_in_flight == 0

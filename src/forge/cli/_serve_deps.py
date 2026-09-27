@@ -100,6 +100,7 @@ from forge.cli._serve_deps_forward_context import (
 from forge.cli._serve_deps_lifecycle import build_publisher_and_emitter
 from forge.cli._serve_deps_stage_log import build_stage_log_recorder
 from forge.cli._serve_deps_state_channel import build_autobuild_state_initialiser
+from forge.config.build_admission import build_admission
 from forge.config.models import ForgeConfig, PipelineConfig
 from forge.lifecycle.persistence import SqliteLifecyclePersistence
 from forge.lifecycle.state_machine import TERMINAL_STATES, BuildState
@@ -566,6 +567,31 @@ def _read_task_id(
     return getattr(row, "task_id", None) if row is not None else None
 
 
+def _read_build_identity(
+    sqlite_pool: SqliteLifecyclePersistence,
+    *,
+    feature_id: str,
+    correlation_id: str,
+) -> tuple[str, "BuildState"] | None:
+    """Return the existing identity, or ``None`` only after proving absence.
+
+    Read failures propagate so the caller can hold the delivery rather than
+    acknowledge a refusal for a potentially nonterminal existing build.
+    """
+    with sqlite_pool._reader() as cx:
+        row = cx.execute(
+            "SELECT build_id, status FROM builds WHERE feature_id = ? "
+            "AND correlation_id = ?",
+            (feature_id, correlation_id),
+        ).fetchone()
+    if row is None:
+        return None
+    build_id = row[0] if not hasattr(row, "keys") else row["build_id"]
+    raw = row[1] if not hasattr(row, "keys") else row["status"]
+    state = raw if isinstance(raw, BuildState) else BuildState(raw)
+    return str(build_id), state
+
+
 def _read_build_status(
     sqlite_pool: SqliteLifecyclePersistence,
     *,
@@ -898,6 +924,8 @@ def _build_dispatch_build(
         payload: "BuildQueuedPayload",
         ack_callback,
         register_observer=None,
+        *,
+        runless_replay: bool = False,
     ):
         """Persist + gate + dispatch one accepted ``BuildQueuedPayload``.
 
@@ -921,12 +949,122 @@ def _build_dispatch_build(
         closure the consumer passes when the lifecycle bridge is wired;
         it is invoked ONLY on the approve → launch path so no observer is
         live during the pause. ``None`` (no bridge) skips registration.
+        ``runless_replay`` is set only by boot reconciliation after it has
+        established that the previous process can no longer own the row;
+        normal delivery leaves it false so BUILD policy never cancels live or
+        paused work.
         """
         # Local import to avoid pinning this module's import surface to
         # nats_core when the deps factory is imported during CLI
         # ``--help`` paths (the dispatch closure is the only place the
         # payload type is exercised).
         from forge.lifecycle.persistence import DuplicateBuildError
+
+        # D4's authoritative BUILD boundary is before persistence, the
+        # approval gate and the conductor. It therefore also covers direct
+        # boot reconciliation, which calls this closure without handle_message.
+        build_policy = build_admission(forge_config, target_repo=payload.repo)
+        if not build_policy.allowed:
+            reason = build_policy.reason or "sandbox-required"
+            try:
+                existing = _read_build_identity(
+                    sqlite_pool,
+                    feature_id=payload.feature_id,
+                    correlation_id=payload.correlation_id,
+                )
+            except (AttributeError, sqlite3.Error) as exc:
+                # Do not escape into handle_message's generic dispatch-error
+                # fallback: that emits a failure and acknowledges the slot.
+                logger.error(
+                    "dispatch_build: identity read failed for feature_id=%s "
+                    "correlation_id=%s (%s); holding WITHOUT terminal event "
+                    "or ack",
+                    payload.feature_id,
+                    payload.correlation_id,
+                    exc,
+                )
+                return
+            build_id = ""
+            if existing is not None:
+                build_id, state = existing
+                if state in TERMINAL_STATES:
+                    logger.info(
+                        "dispatch_build: sandbox-policy replay reached terminal "
+                        "build_id=%s state=%s; acking idempotently",
+                        build_id,
+                        state.value,
+                    )
+                    await ack_callback()
+                    return
+                if not runless_replay:
+                    # BUILD admission is not cancellation. A normal delivery
+                    # cannot prove whether this existing row is owned by a
+                    # runner, conductor or approval pause. That includes
+                    # QUEUED/INTERRUPTED under the legacy no-gate path, whose
+                    # live runs do not advance the ledger. Preserve the row
+                    # and held slot; only boot reconciliation may explicitly
+                    # identify an old-process row as runless.
+                    logger.warning(
+                        "dispatch_build: sandbox policy refuses repository "
+                        "for existing build_id=%s state=%s, but the live/"
+                        "paused owner is preserved; holding the queue slot "
+                        "WITHOUT ack",
+                        build_id,
+                        state.value,
+                    )
+                    return
+                durable_reason = reason
+                fail_mode_c_build(
+                    sqlite_pool,
+                    build_id,
+                    summary=durable_reason,
+                    what="sandbox BUILD admission refusal during runless replay",
+                    log=logger,
+                )
+                try:
+                    persisted = sqlite_pool.get_build_row(build_id)
+                except Exception as exc:  # noqa: BLE001 — hold the delivery
+                    logger.error(
+                        "dispatch_build: could not verify durable FAILED "
+                        "state for runless build_id=%s (%s); holding WITHOUT "
+                        "terminal event or ack",
+                        build_id,
+                        exc,
+                    )
+                    return
+                if (
+                    persisted is None
+                    or persisted.status is not BuildState.FAILED
+                    or persisted.error != durable_reason
+                ):
+                    logger.error(
+                        "dispatch_build: runless build_id=%s did not durably "
+                        "reach FAILED; holding WITHOUT terminal event or ack",
+                        build_id,
+                    )
+                    return
+                reason = durable_reason
+            logger.error(
+                "dispatch_build: %s; refusing before row creation, gate, "
+                "observer, conductor or runner",
+                reason,
+            )
+            if lifecycle_emitter is not None:
+                from forge.pipeline import BuildContext
+
+                await lifecycle_emitter.emit_failed(
+                    BuildContext(
+                        feature_id=payload.feature_id,
+                        build_id=build_id,
+                        correlation_id=payload.correlation_id,
+                        wave_total=1,
+                    ),
+                    failure_reason=reason,
+                    recoverable=False,
+                    failed_task_id=None,
+                )
+            await ack_callback()
+            return
 
         if async_task_starter is None:
             raise RuntimeError(
