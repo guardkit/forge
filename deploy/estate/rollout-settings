@@ -39,6 +39,7 @@ import copy, hashlib, json, os, re, sys
 from pathlib import Path
 import yaml
 from forge.config.loader import load_config
+from forge.config.models import PublicationConfig
 
 source, destination, metadata_path, evidence_source = map(Path, sys.argv[1:5])
 raw = yaml.safe_load(source.read_text(encoding="utf-8"))
@@ -56,14 +57,22 @@ if not isinstance(sandboxes, dict):
     raise ValueError("planning.sandboxes is not a mapping")
 planning["enabled"] = False
 new_paths = {}
-used = set()
+source_paths_by_leaf = {}
+leaves_by_source_path = {}
 for project, old_path in registrations.items():
     if not isinstance(project, str) or not isinstance(old_path, str) or not old_path.startswith("/"):
         raise ValueError("every registration must map a project name to an absolute path")
     leaf = re.sub(r"[^A-Za-z0-9_.-]+", "-", project.rsplit("/", 1)[-1]).strip("-.")
-    if not leaf or leaf in used:
-        raise ValueError("registered project names do not produce unique container paths")
-    used.add(leaf)
+    if not leaf:
+        raise ValueError("every registered project name must produce a container path")
+    prior_source = source_paths_by_leaf.get(leaf)
+    if prior_source is not None and prior_source != old_path:
+        raise ValueError("registered project basenames collide across different source paths")
+    prior_leaf = leaves_by_source_path.get(old_path)
+    if prior_leaf is not None and prior_leaf != leaf:
+        raise ValueError("aliases for one source path produce different container basenames")
+    source_paths_by_leaf[leaf] = old_path
+    leaves_by_source_path[old_path] = leaf
     new_paths[project] = f"/var/lib/forge/projects/{leaf}"
 planning["target_repo_paths"] = new_paths
 for project, entry in sandboxes.items():
@@ -75,11 +84,24 @@ deploy = raw.get("deploy")
 if not isinstance(deploy, dict):
     raise ValueError("deploy is missing or is not a mapping")
 deploy["sidecar_url"] = "${FORGE_SANDBOX_SIDECAR_URL}"
-publication = raw.get("publication")
+publication_was_missing = "publication" not in raw
+if publication_was_missing:
+    canonical_publication = PublicationConfig()
+    if canonical_publication.enabled is not False:
+        raise ValueError("the canonical publication default is not safely disabled")
+    publication = {"enabled": canonical_publication.enabled}
+    raw["publication"] = publication
+else:
+    publication = raw.get("publication")
 if not isinstance(publication, dict):
     raise ValueError("publication is missing or is not a mapping")
 publication["publisher_url"] = "${FORGE_PUBLISHER_URL}"
 publication["builds_may_run_inside_the_coordinator"] = False
+safe_added_publication = {
+    "enabled": False,
+    "publisher_url": "${FORGE_PUBLISHER_URL}",
+    "builds_may_run_inside_the_coordinator": False,
+}
 permissions = raw.get("permissions")
 filesystem = permissions.get("filesystem") if isinstance(permissions, dict) else None
 allowlist = filesystem.get("allowlist") if isinstance(filesystem, dict) else None
@@ -116,6 +138,10 @@ allowed = {
     ("permissions", "filesystem", "allowlist"),
 }
 def compare(a, b, path=()):
+    if path == ("publication",) and publication_was_missing:
+        if a is not None or b != safe_added_publication:
+            raise ValueError("the added publication section differs from the safe canonical migration")
+        return
     if path in allowed:
         return
     if type(a) is not type(b):
@@ -127,7 +153,13 @@ def compare(a, b, path=()):
                 and set(b) - set(a) == {"builds_may_run_inside_the_coordinator"}
                 and not set(a) - set(b)
             )
-            if not added_build_policy:
+            added_safe_publication = (
+                path == ()
+                and publication_was_missing
+                and set(b) - set(a) == {"publication"}
+                and not set(a) - set(b)
+            )
+            if not (added_build_policy or added_safe_publication):
                 raise ValueError(f"an unapproved setting key changed at {'.'.join(path)}")
         for key in b:
             compare(a.get(key), b.get(key), path + (str(key),))

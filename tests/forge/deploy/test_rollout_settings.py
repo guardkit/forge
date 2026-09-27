@@ -310,6 +310,146 @@ def run(scenario, *extra):
     )
 
 
+def configure_legacy_alias_shape(scenario):
+    """Write the synthetic shape of the pre-publication live settings."""
+    settings = yaml.safe_load(scenario["settings_input"].read_text())
+    settings.pop("publication")
+
+    registrations = {}
+    alias_pairs = []
+    for number in range(1, 7):
+        shared_path = scenario["settings_input"].parent / f"legacy-repo-{number}"
+        left = f"owner-a/repo-{number}"
+        right = f"owner-b/repo-{number}"
+        registrations[left] = str(shared_path)
+        registrations[right] = str(shared_path)
+        alias_pairs.append((left, right, shared_path))
+    for number in range(1, 8):
+        project = f"owner-c/unique-{number}"
+        registrations[project] = str(
+            scenario["settings_input"].parent / f"legacy-unique-{number}"
+        )
+
+    sandbox_projects = tuple(registrations)[:9]
+    settings["planning"]["target_repo_paths"] = registrations
+    settings["planning"]["sandboxes"] = {
+        project: {
+            "name": f"synthetic-sandbox-{number}",
+            "sidecar_url": "http://127.0.0.1:8125",
+            "runner_url": "http://127.0.0.1:8124",
+        }
+        for number, project in enumerate(sandbox_projects, 1)
+    }
+    old_evidence = settings["permissions"]["filesystem"]["allowlist"][0]
+    settings["permissions"]["filesystem"]["allowlist"] = [
+        old_evidence,
+        str(alias_pairs[0][2]),
+        "/var/lib/deliberate-extra",
+    ]
+    scenario["settings_input"].write_text(
+        yaml.safe_dump(settings, sort_keys=False), encoding="utf-8"
+    )
+
+    runtime = json.loads(scenario["runtime"].read_text())
+    runtime["mounts"] = [
+        {"Type": "bind", "Source": path, "Destination": path}
+        for path in dict.fromkeys(registrations.values())
+    ]
+    scenario["runtime"].write_text(json.dumps(runtime), encoding="utf-8")
+
+    command = scenario["command"]
+    while "--ack-registration-drift" in command:
+        index = command.index("--ack-registration-drift")
+        del command[index : index + 2]
+    return registrations, alias_pairs, sandbox_projects
+
+
+def test_legacy_settings_add_safe_publication_and_preserve_alias_identity(scenario):
+    registrations, alias_pairs, sandbox_projects = configure_legacy_alias_shape(scenario)
+
+    result = run(scenario)
+
+    assert result.returncode == 0, result.stderr
+    rendered = yaml.safe_load(scenario["outputs"]["settings"].read_text())
+    rendered_paths = rendered["planning"]["target_repo_paths"]
+    assert len(rendered_paths) == 19
+    assert set(rendered_paths) == set(registrations)
+    assert len(set(rendered_paths.values())) == 13
+    for left, right, _ in alias_pairs:
+        assert rendered_paths[left] == rendered_paths[right]
+    assert set(rendered["planning"]["sandboxes"]) == set(sandbox_projects)
+    assert rendered["publication"] == {
+        "enabled": False,
+        "publisher_url": "${FORGE_PUBLISHER_URL}",
+        "builds_may_run_inside_the_coordinator": False,
+    }
+    assert rendered["permissions"]["filesystem"]["allowlist"][1] == (
+        "/var/lib/forge/projects/repo-1"
+    )
+
+    receipt = json.loads(scenario["outputs"]["receipt"].read_text())
+    assert set(receipt["registrations"]) == set(registrations)
+    assert {
+        project
+        for project, details in receipt["registrations"].items()
+        if details["sandbox_configured"]
+    } == set(sandbox_projects)
+    for left, right, _ in alias_pairs:
+        assert receipt["registrations"][left]["new_path"] == (
+            receipt["registrations"][right]["new_path"]
+        )
+
+
+def test_existing_publication_enabled_policy_is_preserved(scenario):
+    settings = yaml.safe_load(scenario["settings_input"].read_text())
+    settings["publication"]["enabled"] = True
+    scenario["settings_input"].write_text(
+        yaml.safe_dump(settings, sort_keys=False), encoding="utf-8"
+    )
+
+    result = run(scenario)
+
+    assert result.returncode == 0, result.stderr
+    rendered = yaml.safe_load(scenario["outputs"]["settings"].read_text())
+    assert rendered["publication"]["enabled"] is True
+
+
+@pytest.mark.parametrize(
+    "publication",
+    [None, [], {"enabled": False, "unknown_policy": True}],
+    ids=("null", "list", "unknown-field"),
+)
+def test_explicit_malformed_or_unknown_publication_still_refuses(scenario, publication):
+    settings = yaml.safe_load(scenario["settings_input"].read_text())
+    settings["publication"] = publication
+    scenario["settings_input"].write_text(
+        yaml.safe_dump(settings, sort_keys=False), encoding="utf-8"
+    )
+
+    result = run(scenario)
+
+    assert result.returncode == 2
+    assert not any(path.exists() for path in scenario["outputs"].values())
+
+
+def test_same_basename_from_different_source_paths_refuses(scenario):
+    settings = yaml.safe_load(scenario["settings_input"].read_text())
+    settings["planning"]["target_repo_paths"]["owner-a/repo"] = str(
+        scenario["settings_input"].parent / "first-repo"
+    )
+    settings["planning"]["target_repo_paths"]["owner-b/repo"] = str(
+        scenario["settings_input"].parent / "second-repo"
+    )
+    scenario["settings_input"].write_text(
+        yaml.safe_dump(settings, sort_keys=False), encoding="utf-8"
+    )
+
+    result = run(scenario)
+
+    assert result.returncode == 2
+    assert not any(path.exists() for path in scenario["outputs"].values())
+
+
 def test_real_loader_preserves_choices_rewrites_only_contract_fields_and_is_idempotent(scenario):
     first = run(scenario)
     assert first.returncode == 0, first.stderr
