@@ -14,7 +14,10 @@ from pathlib import Path
 from types import SimpleNamespace
 import pytest
 from forge.adapters.sqlite.connect import connect_writer
+from forge.gating.identity import derive_request_id
 from forge.lifecycle.migrations import apply_at_boot
+from forge.planning.run_store import SqlitePlanningRunStore
+from forge.planning.states import PlanningState
 HERE=Path(__file__).resolve().parents[3]/'deploy/estate'
 def module(name):
     loader=importlib.machinery.SourceFileLoader('test_'+name,str(HERE/name));spec=importlib.util.spec_from_loader(loader.name,loader);m=importlib.util.module_from_spec(spec);loader.exec_module(m);return m
@@ -821,3 +824,50 @@ def test_public_resume_crash_after_pair_is_idempotent_without_old_access(estate,
     result=json.loads(capsys.readouterr().out)
     assert result['resumed'] is True and result['idempotent'] is True
     assert events==[] and reads==[]
+
+def _terminal_planning_state(tmp_path, terminal):
+    db=tmp_path/(terminal.value.lower()+'.db');connection=connect_writer(db);apply_at_boot(connection)
+    store=SqlitePlanningRunStore(connection,target_terminal_enabled=True);correlation_id='terminal-'+terminal.value.lower()
+    assert store.record_queued(correlation_id,'fixture-user','fixture-approver','fixture request','cli') is None
+    assert store.transition(correlation_id,PlanningState.RUNNING,'fixture-worker') is None
+    request_id=derive_request_id(build_id='plan-'+correlation_id,stage_label='Build approval',attempt_count=0)
+    store.update_pending_approval_request_id(correlation_id,request_id)
+    assert store.transition(correlation_id,PlanningState.PAUSED,'gate-check') is None
+    if terminal not in {PlanningState.CANCELLED,PlanningState.TIMED_OUT}:
+        assert store.transition(correlation_id,PlanningState.RUNNING,'approval-system') is None
+    if terminal is PlanningState.BUILD_QUEUED:
+        assert store.transition(correlation_id,PlanningState.FEATURE_SPEC,'fixture-worker') is None
+        assert store.transition(correlation_id,PlanningState.FEATURE_PLAN,'fixture-worker') is None
+    assert store.transition(correlation_id,terminal,'fixture-worker') is None
+    row=dict(store.get_run(correlation_id));connection.close()
+    assert row['pending_approval_request_id']==request_id
+    assert row['completed_at'] is not None
+    return r.ledger_state(db)
+
+
+@pytest.mark.parametrize('terminal',[PlanningState.FAILED,PlanningState.CANCELLED,PlanningState.TIMED_OUT,PlanningState.PLANNED_HANDOFF,PlanningState.BUILD_QUEUED])
+def test_completed_terminal_planning_history_retains_reference_without_active_work(tmp_path,terminal):
+    state=_terminal_planning_state(tmp_path,terminal)
+    assert q.work_problems(state)==[]
+
+
+@pytest.mark.parametrize(('state','completed_at','request_id'),[
+    ('PAUSED','2026-09-27T21:54:00+00:00','plan-fixture:Build%20approval:0'),
+    ('FEATURE_PLAN','2026-09-27T21:54:00+00:00','plan-fixture:Build%20approval:0'),
+    ('FUTURE_TERMINAL','2026-09-27T21:54:00+00:00','plan-fixture:Build%20approval:0'),
+    ('FAILED',None,'plan-fixture:Build%20approval:0'),
+    ('FAILED','','plan-fixture:Build%20approval:0'),
+    ('FAILED','not-a-timestamp','plan-fixture:Build%20approval:0'),
+    ('FAILED','2026-09-27T21:54:00','plan-fixture:Build%20approval:0'),
+    ('FAILED','2026-09-27T22:54:00+01:00','plan-fixture:Build%20approval:0'),
+    ('FAILED','2026-09-27T21:54:00+00:00','not-a-canonical-reference'),
+    ('FAILED','2026-09-27T21:54:00+00:00',''),
+    ('FAILED','2026-09-27T21:54:00+00:00','plan%GG:stage:0'),
+    ('FAILED','2026-09-27T21:54:00+00:00',17),
+])
+def test_planning_approval_uncertainty_remains_active(state,completed_at,request_id):
+    observed={'work_state':{'planning_runs':{'status':'observed','rows':[{
+        'correlation_id':'fixture','state':state,'completed_at':completed_at,
+        'pending_approval_request_id':request_id,
+    }]}}}
+    assert q.work_problems(observed)==[{'table':'planning_runs','row':observed['work_state']['planning_runs']['rows'][0]}]

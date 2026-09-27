@@ -26,6 +26,9 @@ PRODUCERS = ('front-door','bus-gateway')
 RESUMED = 'ROLLOUT-RESUMED'
 ACTIVE_BUILDS = {'QUEUED','PREPARING','RUNNING','PAUSED','FINALISING'}
 ACTIVE_PLANS = {'QUEUED','RUNNING','PAUSED','FEATURE_SPEC','FEATURE_PLAN'}
+TERMINAL_PLANS = {'FAILED','CANCELLED','TIMED_OUT','PLANNED_HANDOFF','BUILD_QUEUED'}
+APPROVAL_REFERENCE = re.compile(
+    r'(?:[A-Za-z0-9_-]|%[0-9A-F]{2})+:(?:[A-Za-z0-9_-]|%[0-9A-F]{2})+:(?:0|[1-9][0-9]*)\Z')
 GUARD = '''import sys,types,importlib.abc
 class NoBrokerClient(importlib.abc.MetaPathFinder):
  def find_spec(self,name,path=None,target=None):
@@ -89,13 +92,32 @@ def stable_runtime(item):
     stable={k:item[k] for k in ('image_id','repo_tags','port_bindings','restart_policy','network_mode','env_names')}
     return stable | {'mounts':[stable_mount(m) for m in item['mounts']],'service_identity':identity,'networks':networks}
 
+def completed_terminal_planning_approval(row):
+    """Recognize only the exact completed history written by planning."""
+    request_id=row.get('pending_approval_request_id')
+    if (row.get('state') not in TERMINAL_PLANS or not isinstance(request_id,str)
+            or not APPROVAL_REFERENCE.fullmatch(request_id)):
+        return False
+    value=row.get('completed_at')
+    if not isinstance(value,str):return False
+    try:completed=datetime.fromisoformat(value)
+    except ValueError:return False
+    return (completed.tzinfo is not None
+        and completed.utcoffset()==timezone.utc.utcoffset(completed)
+        and completed.isoformat()==value)
+
 def work_problems(state):
     result=[];work=state['work_state']
     for table,record in work.items():
         if record.get('status')=='NOT-YET':continue
         for row in record['rows']:
             active = (table=='builds' and (row['status'] in ACTIVE_BUILDS or row.get('pending_approval_request_id'))
-                or table=='planning_runs' and (row['state'] in ACTIVE_PLANS or row.get('pending_approval_request_id'))
+                or table=='planning_runs' and (
+                    row.get('state') in ACTIVE_PLANS
+                    or row.get('state') not in ACTIVE_PLANS|TERMINAL_PLANS
+                    or 'pending_approval_request_id' not in row
+                    or row.get('pending_approval_request_id') is not None
+                        and not completed_terminal_planning_approval(row))
                 or table=='work_queue'
                 or table=='publication_records' and row.get('result')!='merged into the remote and running'
                 or table=='deployment_targets' and bool(row.get('holder_build')))
