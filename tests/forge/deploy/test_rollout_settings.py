@@ -72,6 +72,8 @@ def scenario(tmp_path: Path):
         "FLEET_MEMORY_BUS_ADDRESS": "nats://bus:14222",
         "JARVIS_NATS_URL": "nats://bus:14222",
         "BUS_MONITORING_ADDRESS": "bus:18222",
+        "NATS_PROVISION_ADDRESS": "nats://bus:14222",
+        "NATS_CLIENT_PORT": "14222",
         "FLEET_MEMORY_URL": "http://memory:8005/mcp/",
         "FLEET_MEMORY_PORT": "8005",
         "FLEET_MEMORY_ALLOWED_HOSTS": "memory:8005,${FACTORY_GATEWAY_ADDRESS}:8005",
@@ -92,7 +94,7 @@ def scenario(tmp_path: Path):
     secret = tmp_path / "private.env"
     secret.write_text(
         "FORGE_NATS_PASSWORD=not-a-real-password\n"
-        "FLEET_MEMORY_NATS_URL=nats://memory:not-a-real-password@bus:14222\n"
+        "FLEET_MEMORY_NATS_URL=nats://memory:not-a-real-password@192.0.2.44:14222\n"
         "FLEET_MEMORY_PG_DSN=postgresql://memory:not-a-real-password@pg:15432/memory\n",
         encoding="utf-8",
     )
@@ -128,6 +130,7 @@ def scenario(tmp_path: Path):
         "services": {
             "coordinator": {
                 "image": IMAGE,
+                "environment": {"FORGE_NATS_URL": "nats://forge:not-a-real-password@bus:14222"},
                 "networks": {"factory": None, "forge-publisher-net": None},
                 "volumes": [{"type": "volume", "source": "ledger", "target": "/var/lib/forge"}],
             },
@@ -145,6 +148,26 @@ def scenario(tmp_path: Path):
                 "image": IMAGE,
                 "networks": {"factory": None},
                 "ports": [{"host_ip": "192.0.2.44", "published": "18005", "target": 8005}],
+            },
+            "memory-relay": {
+                "image": IMAGE,
+                "environment": {"FLEET_MEMORY_BUS_ADDRESS": "nats://bus:14222"},
+                "networks": {"factory": None},
+            },
+            "front-door": {
+                "image": IMAGE,
+                "environment": {"JARVIS_NATS_URL": "nats://bus:14222"},
+                "networks": {"factory": None},
+            },
+            "bus-gateway": {
+                "image": IMAGE,
+                "environment": {"JARVIS_NATS_URL": "nats://bus:14222"},
+                "networks": {"factory": None},
+            },
+            "bus-ready": {
+                "image": IMAGE,
+                "environment": {"BUS_MONITORING_ADDRESS": "bus:18222"},
+                "networks": {"factory": None},
             },
         }
     }
@@ -227,6 +250,8 @@ raise SystemExit(93)
         "outputs": outputs,
         "settings_input": settings_input,
         "env_file": env_file,
+        "secret": secret,
+        "compose_file": compose_file,
         "runtime": runtime,
         "compose_json": Path(public_values["ROLLOUT_TEST_COMPOSE_JSON"]),
         "docker_log": Path(public_values["ROLLOUT_TEST_DOCKER_LOG"]),
@@ -344,4 +369,107 @@ def test_rendered_compose_must_not_bind_an_old_registered_project(scenario):
     result = run(scenario)
     assert result.returncode == 2
     assert "binds an old registered project path" in result.stderr
+    assert not any(path.exists() for path in scenario["outputs"].values())
+
+
+@pytest.mark.parametrize(
+    ("output_flag", "alias_kind", "input_key"),
+    [
+        ("--receipt", "direct", "settings_input"),
+        ("--env-output", "hardlink", "secret"),
+        ("--settings-output", "symlink", "compose_file"),
+        ("--receipt", "output-pair", "env"),
+    ],
+)
+def test_outputs_cannot_alias_any_input_or_each_other_before_effects(
+    scenario, output_flag, alias_kind, input_key
+):
+    flag_index = scenario["command"].index(output_flag) + 1
+    original_inputs = {
+        key: scenario[key].read_bytes()
+        for key in ("settings_input", "env_file", "secret", "compose_file", "runtime")
+    }
+    target = scenario["outputs"][input_key] if input_key in scenario["outputs"] else scenario[input_key]
+    output = Path(scenario["command"][flag_index])
+    if alias_kind == "direct":
+        scenario["command"][flag_index] = str(target)
+    elif alias_kind == "hardlink":
+        os.link(target, output)
+    elif alias_kind == "symlink":
+        output.symlink_to(target)
+    else:
+        scenario["command"][flag_index] = str(target)
+
+    result = run(scenario)
+
+    assert result.returncode == 2
+    assert result.stderr.startswith("REFUSED:") and "alias" in result.stderr
+    assert "Traceback" not in result.stderr
+    assert not scenario["docker_log"].exists()
+    assert all(scenario[key].read_bytes() == before for key, before in original_inputs.items())
+
+
+def test_bus_client_port_drift_refuses_before_writing(scenario):
+    scenario["env_file"].write_text(
+        scenario["env_file"].read_text().replace(
+            "JARVIS_NATS_URL=nats://bus:14222",
+            "JARVIS_NATS_URL=nats://bus:14223",
+        )
+    )
+    compose = json.loads(scenario["compose_json"].read_text())
+    compose["services"]["front-door"]["environment"]["JARVIS_NATS_URL"] = "nats://bus:14223"
+    compose["services"]["bus-gateway"]["environment"]["JARVIS_NATS_URL"] = "nats://bus:14223"
+    scenario["compose_json"].write_text(json.dumps(compose))
+
+    result = run(scenario)
+
+    assert result.returncode == 2
+    assert "declared internal bus host and client port" in result.stderr
+    assert not any(path.exists() for path in scenario["outputs"].values())
+
+
+def test_rendered_consumer_override_cannot_bypass_validated_route(scenario):
+    compose = json.loads(scenario["compose_json"].read_text())
+    compose["services"]["front-door"]["environment"]["JARVIS_NATS_URL"] = "nats://bus:14223"
+    scenario["compose_json"].write_text(json.dumps(compose))
+
+    result = run(scenario)
+
+    assert result.returncode == 2
+    assert "front-door does not consume the validated JARVIS_NATS_URL" in result.stderr
+    assert not any(path.exists() for path in scenario["outputs"].values())
+
+
+def test_ordered_compose_overlays_are_passed_to_actual_render(scenario):
+    overlay = scenario["compose_file"].with_name("safety-overlay.yaml")
+    overlay.write_text("services: {}\n")
+    insert_at = scenario["command"].index("--project")
+    scenario["command"][insert_at:insert_at] = ["--compose-file", str(overlay)]
+
+    result = run(scenario)
+
+    assert result.returncode == 0, result.stderr
+    calls = [json.loads(line) for line in scenario["docker_log"].read_text().splitlines()]
+    compose_call = next(call for call in calls if call and call[0] == "compose")
+    first = compose_call.index(str(scenario["compose_file"].resolve()))
+    second = compose_call.index(str(overlay.resolve()))
+    assert first < second
+    receipt = json.loads(scenario["outputs"]["receipt"].read_text())
+    assert [item["path"] for item in receipt["project_files"]] == [
+        str(scenario["compose_file"].resolve()),
+        str(overlay.resolve()),
+    ]
+
+
+def test_compose_file_env_authority_must_match_explicit_order(scenario):
+    overlay = scenario["compose_file"].with_name("external.yaml")
+    overlay.write_text("services: {}\n")
+    with scenario["env_file"].open("a") as stream:
+        stream.write("COMPOSE_FILE=compose.yaml:external.yaml\n")
+
+    result = run(scenario)
+
+    assert result.returncode == 2
+    assert "differ from COMPOSE_FILE" in result.stderr
+    assert not scenario["docker_log"].exists()
     assert not any(path.exists() for path in scenario["outputs"].values())
