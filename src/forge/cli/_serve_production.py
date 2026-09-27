@@ -668,6 +668,59 @@ class _NoopApprovalRepublisher:
         )
 
 
+async def _settle_strict_runless_builds_at_boot(
+    sqlite_pool: SqliteLifecyclePersistence,
+    forge_config: ForgeConfig,
+    emitter: Any,
+    builds: list[Any],
+) -> int:
+    """Terminally refuse runless rows proven by serialized boot ownership.
+
+    The caller supplies only rows whose prior coordinator ownership has ended.
+    Normal consumer delivery never calls this helper, so live no-gate
+    QUEUED/INTERRUPTED rows and PAUSED approval ownership remain untouched.
+    """
+    from forge.cli._conductor_outcome import fail_mode_c_build
+    from forge.config.build_admission import build_admission
+    from forge.lifecycle.state_machine import TERMINAL_STATES
+    from forge.pipeline import BuildContext
+
+    settled = 0
+    for recovered in builds:
+        current = sqlite_pool.get_build_row(recovered.build_id)
+        if current is None or current.status in TERMINAL_STATES:
+            continue
+        admission = build_admission(forge_config, target_repo=current.repo)
+        if admission.allowed:
+            continue
+        reason = fail_mode_c_build(
+            sqlite_pool,
+            current.build_id,
+            summary=admission.reason or "sandbox-required",
+            what="sandbox BUILD admission refusal during serialized boot recovery",
+            log=logger,
+        )
+        await emitter.emit_failed(
+            BuildContext(
+                feature_id=current.feature_id,
+                build_id=current.build_id,
+                correlation_id=current.correlation_id,
+                wave_total=1,
+            ),
+            failure_reason=reason,
+            recoverable=False,
+            failed_task_id=current.task_id,
+        )
+        settled += 1
+        logger.error(
+            "forge-serve: boot recovery terminally refused runless build_id=%s "
+            "(%s)",
+            current.build_id,
+            reason,
+        )
+    return settled
+
+
 def _build_recovery_reconcile_seam(
     sqlite_pool: SqliteLifecyclePersistence,
     forge_config: ForgeConfig,
@@ -677,7 +730,9 @@ def _build_recovery_reconcile_seam(
     Binds :func:`forge.lifecycle.recovery.reconcile_on_boot` to a
     :class:`PipelineFailurePublisher` built from the boot client and a no-op
     :class:`ApprovalRepublisher` (PAUSED approval re-emit suppressed — rearm
-    owns it). recovery.py stays unmodified.
+    owns it). Before live consumer attachment, strict BUILD policy settles
+    only rows this serialized pass proves runless. ``recovery.py`` stays
+    unmodified.
     """
 
     async def _recovery_reconcile_on_boot(client: Any) -> None:
@@ -687,10 +742,26 @@ def _build_recovery_reconcile_seam(
         from forge.lifecycle.recovery import (
             DEFAULT_STALE_QUEUED_THRESHOLD_SECONDS,
         )
+        from forge.lifecycle.state_machine import BuildState
 
-        publisher, _emitter = build_publisher_and_emitter(
+        publisher, emitter = build_publisher_and_emitter(
             client, config=forge_config.pipeline
         )
+        before_recovery = sqlite_pool.read_non_terminal_builds()
+        runless_before_recovery = [
+            build
+            for build in before_recovery
+            if build.status
+            in {
+                BuildState.INTERRUPTED,
+                BuildState.PREPARING,
+                BuildState.RUNNING,
+            }
+        ]
+        settled_before = await _settle_strict_runless_builds_at_boot(
+            sqlite_pool, forge_config, emitter, runless_before_recovery
+        )
+
         # FWD-003: sweep stale QUEUED rows (orphans whose build-queued
         # message is long gone) so they stop blocking exists_active_build.
         report = await _recovery_reconcile(
@@ -699,14 +770,29 @@ def _build_recovery_reconcile_seam(
             _NoopApprovalRepublisher(),
             stale_queued_threshold_seconds=DEFAULT_STALE_QUEUED_THRESHOLD_SECONDS,
         )
+        recovered_runless = []
+        for build in before_recovery:
+            # Let the existing FINALISING handler retain its PR-existence
+            # warning before policy settlement. A stale QUEUED row becomes
+            # eligible only when that handler actually moved it to
+            # INTERRUPTED. Neither case emits a competing recovery failure.
+            if build.status not in {BuildState.QUEUED, BuildState.FINALISING}:
+                continue
+            current = sqlite_pool.get_build_row(build.build_id)
+            if current is not None and current.status is BuildState.INTERRUPTED:
+                recovered_runless.append(current)
+        settled_after = await _settle_strict_runless_builds_at_boot(
+            sqlite_pool, forge_config, emitter, recovered_runless
+        )
         logger.info(
             "forge-serve: recovery reconcile complete (interrupted=%d "
             "paused_suppressed=%d skipped=%d stale_queued_interrupted=%d "
-            "failures=%d)",
+            "sandbox_refused_runless=%d failures=%d)",
             report.interrupted_count,
             report.paused_reissued_count,
             report.skipped_count,
             report.stale_queued_interrupted_count,
+            settled_before + settled_after,
             len(report.failures),
         )
 
@@ -726,10 +812,11 @@ def _build_consumer_reconcile_seam(
       fns are no-ops (rearm owns PAUSED; documented ownership boundary above).
     * redelivery drain DEFERRED — ``fetch_redeliveries`` returns an empty batch
       so no boot-time pull subscription collides with the daemon's own durable
-      attach (single-consumer rule, err 10100). Crash-mid-hop INTERRUPTED rows
-      heal on the first post-boot redelivery via ``dispatch_build``'s three-arm
-      INTERRUPTED→redispatch. The Branch-2 collaborators are wired correctly so
-      the machinery is honest and a future change may enable the boot drain.
+      attach (single-consumer rule, err 10100). The preceding recovery seam
+      settles strict-policy runless refusals before attachment; eligible
+      remaining INTERRUPTED rows heal on the first post-boot redelivery via
+      ``dispatch_build``. The Branch-2 collaborators remain wired so a future
+      change may enable the boot drain.
     """
 
     async def _consumer_reconcile_on_boot(client: Any) -> None:
