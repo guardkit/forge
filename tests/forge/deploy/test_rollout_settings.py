@@ -83,8 +83,6 @@ def scenario(tmp_path: Path):
         "FLEET_MEMORY_EMBED_DIMS": "768",
         "JARVIS_MODEL_SEAT_URL": "http://${FACTORY_GATEWAY_ADDRESS}:18080",
         "OPENAI_BASE_URL": "http://${FACTORY_GATEWAY_ADDRESS}:18080",
-        "ROLLOUT_TEST_COMPOSE_JSON": str(tmp_path / "compose.json"),
-        "ROLLOUT_TEST_DOCKER_LOG": str(tmp_path / "docker.log"),
     }
     env_file = tmp_path / "estate.env"
     env_file.write_text(
@@ -130,7 +128,14 @@ def scenario(tmp_path: Path):
         "services": {
             "coordinator": {
                 "image": IMAGE,
-                "environment": {"FORGE_NATS_URL": "nats://forge:not-a-real-password@bus:14222"},
+                "environment": {
+                    "FORGE_NATS_URL": "nats://forge:not-a-real-password@bus:14222",
+                    "FORGE_AUTOBUILD_RUNNER_URL": "http://192.0.2.44:18124",
+                    "FORGE_SANDBOX_SIDECAR_URL": "http://192.0.2.44:18125",
+                    "FORGE_SANDBOX_RUNNER_URL": "http://192.0.2.44:18124",
+                    "FORGE_PUBLISHER_URL": "http://forge-publisher:8711",
+                    "FLEET_MEMORY_EMBED_URL": "http://192.0.2.44:18080",
+                },
                 "networks": {"factory": None, "forge-publisher-net": None},
                 "volumes": [{"type": "volume", "source": "ledger", "target": "/var/lib/forge"}],
             },
@@ -146,22 +151,35 @@ def scenario(tmp_path: Path):
             },
             "memory": {
                 "image": IMAGE,
+                "environment": {
+                    "FLEET_MEMORY_MCP_ALLOWED_HOSTS": "memory:8005,192.0.2.44:8005",
+                    "FLEET_MEMORY_EMBED_URL": "http://192.0.2.44:18080",
+                },
                 "networks": {"factory": None},
                 "ports": [{"host_ip": "192.0.2.44", "published": "18005", "target": 8005}],
             },
             "memory-relay": {
                 "image": IMAGE,
-                "environment": {"FLEET_MEMORY_BUS_ADDRESS": "nats://bus:14222"},
+                "environment": {
+                    "FLEET_MEMORY_BUS_ADDRESS": "nats://bus:14222",
+                    "FLEET_MEMORY_EMBED_URL": "http://192.0.2.44:18080",
+                },
                 "networks": {"factory": None},
             },
             "front-door": {
                 "image": IMAGE,
-                "environment": {"JARVIS_NATS_URL": "nats://bus:14222"},
+                "environment": {
+                    "JARVIS_NATS_URL": "nats://bus:14222",
+                    "JARVIS_LLAMA_SWAP_BASE_URL": "http://192.0.2.44:18080",
+                },
                 "networks": {"factory": None},
             },
             "bus-gateway": {
                 "image": IMAGE,
-                "environment": {"JARVIS_NATS_URL": "nats://bus:14222"},
+                "environment": {
+                    "JARVIS_NATS_URL": "nats://bus:14222",
+                    "JARVIS_LLAMA_SWAP_BASE_URL": "http://192.0.2.44:18080",
+                },
                 "networks": {"factory": None},
             },
             "bus-ready": {
@@ -171,7 +189,8 @@ def scenario(tmp_path: Path):
             },
         }
     }
-    Path(public_values["ROLLOUT_TEST_COMPOSE_JSON"]).write_text(json.dumps(compose))
+    compose_json = tmp_path / "compose.json"
+    compose_json.write_text(json.dumps(compose))
     compose_file = tmp_path / "compose.yaml"
     compose_file.write_text("services: {}\n", encoding="utf-8")
 
@@ -183,13 +202,14 @@ def scenario(tmp_path: Path):
 import json, os, subprocess, sys
 from pathlib import Path
 args = sys.argv[1:]
-with open(os.environ["ROLLOUT_TEST_DOCKER_LOG"], "a", encoding="utf-8") as stream:
+root = Path(__file__).resolve().parent.parent
+with (root / "docker.log").open("a", encoding="utf-8") as stream:
     stream.write(json.dumps(args) + "\n")
 if args[:2] == ["image", "inspect"]:
     print(args[-1])
     raise SystemExit(0)
 if args and args[0] == "compose":
-    print(Path(os.environ["ROLLOUT_TEST_COMPOSE_JSON"]).read_text())
+    print((root / "compose.json").read_text())
     raise SystemExit(0)
 if args and args[0] == "run":
     mounts, child_env = {}, os.environ.copy()
@@ -253,8 +273,8 @@ raise SystemExit(93)
         "secret": secret,
         "compose_file": compose_file,
         "runtime": runtime,
-        "compose_json": Path(public_values["ROLLOUT_TEST_COMPOSE_JSON"]),
-        "docker_log": Path(public_values["ROLLOUT_TEST_DOCKER_LOG"]),
+        "compose_json": compose_json,
+        "docker_log": tmp_path / "docker.log",
         "old_one": old_one,
         "old_two": old_two,
     }
@@ -471,5 +491,63 @@ def test_compose_file_env_authority_must_match_explicit_order(scenario):
 
     assert result.returncode == 2
     assert "differ from COMPOSE_FILE" in result.stderr
+    assert not scenario["docker_log"].exists()
+    assert not any(path.exists() for path in scenario["outputs"].values())
+
+
+def test_rendered_coordinator_helper_override_refuses_before_outputs(scenario):
+    compose = json.loads(scenario["compose_json"].read_text())
+    compose["services"]["coordinator"]["environment"]["FORGE_SANDBOX_SIDECAR_URL"] = (
+        "http://192.0.2.99:19999"
+    )
+    scenario["compose_json"].write_text(json.dumps(compose))
+
+    result = run(scenario)
+
+    assert result.returncode == 2
+    assert "coordinator does not consume the validated FORGE_SANDBOX_SIDECAR_URL" in result.stderr
+    assert not any(path.exists() for path in scenario["outputs"].values())
+
+
+def test_single_quoted_env_reference_refuses_before_docker_or_outputs(scenario):
+    scenario["env_file"].write_text(
+        scenario["env_file"].read_text().replace(
+            "FORGE_SANDBOX_SIDECAR_URL=http://${FACTORY_GATEWAY_ADDRESS}:${FORGE_SANDBOX_SIDECAR_PORT}",
+            "FORGE_SANDBOX_SIDECAR_URL='http://${FACTORY_GATEWAY_ADDRESS}:${FORGE_SANDBOX_SIDECAR_PORT}'",
+        )
+    )
+
+    result = run(scenario)
+
+    assert result.returncode == 2
+    assert "single-quotes an env reference" in result.stderr
+    assert not scenario["docker_log"].exists()
+    assert not any(path.exists() for path in scenario["outputs"].values())
+
+
+def test_existing_regular_file_output_parent_refuses_before_effects(scenario):
+    blocker = scenario["outputs"]["env"].parent / "blocker"
+    blocker.write_text("keep-me\n")
+    index = scenario["command"].index("--settings-output") + 1
+    scenario["command"][index] = str(blocker / "forge.yaml")
+
+    result = run(scenario)
+
+    assert result.returncode == 2
+    assert "output parent" in result.stderr and "not a directory" in result.stderr
+    assert blocker.read_text() == "keep-me\n"
+    assert not scenario["docker_log"].exists()
+    assert not any(path.exists() for path in scenario["outputs"].values())
+
+
+def test_output_ancestor_collision_refuses_before_effects(scenario):
+    env_output = scenario["outputs"]["env"]
+    index = scenario["command"].index("--settings-output") + 1
+    scenario["command"][index] = str(env_output / "forge.yaml")
+
+    result = run(scenario)
+
+    assert result.returncode == 2
+    assert "ancestor or child" in result.stderr
     assert not scenario["docker_log"].exists()
     assert not any(path.exists() for path in scenario["outputs"].values())

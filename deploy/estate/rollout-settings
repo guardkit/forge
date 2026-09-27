@@ -153,6 +153,21 @@ metadata = {
 metadata_path.write_text(json.dumps(metadata, sort_keys=True), encoding="utf-8")
 '''
 
+LOADER_CHECKER = r'''
+import json, os, sys
+from forge.config.loader import load_config
+
+config = load_config(sys.argv[1], environ=os.environ)
+print(json.dumps({
+    "sandboxes": {
+        key: {"sidecar_url": value.sidecar_url, "runner_url": value.runner_url}
+        for key, value in config.planning.sandboxes.items()
+    },
+    "deploy_sidecar": config.deploy.sidecar_url,
+    "publisher": config.publication.publisher_url,
+}, sort_keys=True))
+'''
+
 
 class Refusal(Exception):
     pass
@@ -202,7 +217,13 @@ def read_env(path: Path) -> tuple[dict[str, str], bytes]:
         if key in values:
             refuse(f"env file {path} defines {key} twice; keep one explicit value")
         if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            quote = value[0]
             value = value[1:-1]
+            if quote == "'" and REFERENCE.search(value):
+                refuse(
+                    f"env file {path} line {number} single-quotes an env reference; "
+                    "Compose treats that reference as literal, so use an unquoted or double-quoted value"
+                )
         values[key] = value
     return values, raw
 
@@ -220,6 +241,7 @@ def paths_alias(left: Path, right: Path) -> bool:
 
 def validate_path_boundaries(inputs: tuple[Path, ...], outputs: tuple[Path, ...]) -> None:
     """Keep every generated artifact disjoint from every input and other output."""
+    resolved_outputs = tuple(output.resolve(strict=False) for output in outputs)
     for index, output in enumerate(outputs):
         if output.is_symlink():
             refuse(f"output {output} is a symbolic link; choose a plain output path")
@@ -231,6 +253,21 @@ def validate_path_boundaries(inputs: tuple[Path, ...], outputs: tuple[Path, ...]
         for prior in outputs[:index]:
             if paths_alias(output, prior):
                 refuse(f"output {output} aliases output {prior}; choose a distinct path for every artifact")
+        for other in resolved_outputs:
+            resolved = resolved_outputs[index]
+            if resolved != other and (resolved in other.parents or other in resolved.parents):
+                refuse(f"output {output} is an ancestor or child of another output; choose disjoint artifact paths")
+        parent = output.parent
+        while True:
+            if parent.is_symlink():
+                refuse(f"output parent {parent} is a symbolic link; choose a stable plain directory")
+            if parent.exists():
+                if not parent.is_dir():
+                    refuse(f"output parent {parent} is not a directory; correct every destination before writing")
+                break
+            if parent == parent.parent:
+                refuse(f"output parent {parent} cannot be created as a directory; correct the destination")
+            parent = parent.parent
 
 
 def expand(values: dict[str, str]) -> dict[str, str]:
@@ -381,26 +418,54 @@ def run(command: list[str], *, env: dict[str, str], input_bytes: bytes | None = 
     return result.stdout
 
 
-def atomic_write(path: Path, content: bytes, mode: int = 0o600) -> str:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists() and path.read_bytes() == content:
-        os.chmod(path, mode)
-        return "unchanged"
-    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+def install_artifacts(artifacts: tuple[tuple[Path, bytes], ...], mode: int = 0o600) -> tuple[str, ...]:
+    """Stage the complete output set before replacing any destination."""
+    staged: list[tuple[Path, str | None]] = []
+    statuses: list[str] = []
     try:
-        with os.fdopen(descriptor, "wb") as stream:
-            stream.write(content)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.chmod(temporary, mode)
-        os.replace(temporary, path)
+        for path, content in artifacts:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if path.exists() and path.read_bytes() == content:
+                staged.append((path, None))
+                statuses.append("unchanged")
+                continue
+            descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.chmod(temporary, mode)
+            staged.append((path, temporary))
+            statuses.append("written")
+        for path, temporary in staged:
+            if temporary is None:
+                os.chmod(path, mode)
+            else:
+                os.replace(temporary, path)
+        return tuple(statuses)
+    except Exception as exc:
+        refuse(
+            f"could not install the staged output set ({type(exc).__name__}); "
+            "one or more destinations may already have been replaced, so inspect all three outputs"
+        )
     finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
-    return "written"
+        for _, temporary in staged:
+            if temporary is not None and os.path.exists(temporary):
+                os.unlink(temporary)
 
 
-def validate_compose(rendered: dict, env: dict[str, str], old_paths: list[str], images: dict[str, str]) -> None:
+def service_environment(service: dict, service_name: str) -> dict[str, str]:
+    declared = service.get("environment", {})
+    if isinstance(declared, list):
+        declared = dict(item.split("=", 1) for item in declared if isinstance(item, str) and "=" in item)
+    if not isinstance(declared, dict):
+        refuse(f"rendered service {service_name} has an unreadable environment; correct the project")
+    return {str(key): str(value) for key, value in declared.items()}
+
+
+def validate_compose(
+    rendered: dict, env: dict[str, str], old_paths: list[str], images: dict[str, str]
+) -> dict[str, str]:
     services = rendered.get("services", {})
     for name in ("coordinator", "answer-service", "forge-publisher"):
         if name not in services:
@@ -424,23 +489,40 @@ def validate_compose(rendered: dict, env: dict[str, str], old_paths: list[str], 
         image = service.get("image")
         if image and not IMAGE_ID.fullmatch(str(image)):
             refuse(f"rendered service {service_name} does not use an immutable image ID; correct the env or project")
-    expected_bus_consumers = {
-        "coordinator": ("FORGE_NATS_URL",),
-        "memory-relay": ("FLEET_MEMORY_BUS_ADDRESS",),
-        "front-door": ("JARVIS_NATS_URL",),
-        "bus-gateway": ("JARVIS_NATS_URL",),
-        "bus-ready": ("BUS_MONITORING_ADDRESS",),
+    expected_consumers = {
+        "coordinator": {
+            "FORGE_NATS_URL": env["FORGE_NATS_URL"],
+            "FORGE_AUTOBUILD_RUNNER_URL": env["FORGE_AUTOBUILD_RUNNER_URL"],
+            "FORGE_SANDBOX_SIDECAR_URL": env["FORGE_SANDBOX_SIDECAR_URL"],
+            "FORGE_SANDBOX_RUNNER_URL": env["FORGE_SANDBOX_RUNNER_URL"],
+            "FORGE_PUBLISHER_URL": env["FORGE_PUBLISHER_URL"],
+            "FLEET_MEMORY_EMBED_URL": env["FLEET_MEMORY_EMBED_URL"],
+        },
+        "memory": {
+            "FLEET_MEMORY_MCP_ALLOWED_HOSTS": env["FLEET_MEMORY_ALLOWED_HOSTS"],
+            "FLEET_MEMORY_EMBED_URL": env["FLEET_MEMORY_EMBED_URL"],
+        },
+        "memory-relay": {
+            "FLEET_MEMORY_BUS_ADDRESS": env["FLEET_MEMORY_BUS_ADDRESS"],
+            "FLEET_MEMORY_EMBED_URL": env["FLEET_MEMORY_EMBED_URL"],
+        },
+        "front-door": {
+            "JARVIS_NATS_URL": env["JARVIS_NATS_URL"],
+            "JARVIS_LLAMA_SWAP_BASE_URL": env["JARVIS_MODEL_SEAT_URL"],
+        },
+        "bus-gateway": {
+            "JARVIS_NATS_URL": env["JARVIS_NATS_URL"],
+            "JARVIS_LLAMA_SWAP_BASE_URL": env["JARVIS_MODEL_SEAT_URL"],
+        },
+        "bus-ready": {"BUS_MONITORING_ADDRESS": env["BUS_MONITORING_ADDRESS"]},
+        "nats-provision": {"NATS_URL": env["NATS_PROVISION_ADDRESS"]},
     }
-    for service_name, names in expected_bus_consumers.items():
+    for service_name, expected in expected_consumers.items():
         if service_name not in services:
             continue
-        declared = services[service_name].get("environment", {})
-        if isinstance(declared, list):
-            declared = dict(item.split("=", 1) for item in declared if isinstance(item, str) and "=" in item)
-        if not isinstance(declared, dict):
-            refuse(f"rendered service {service_name} has an unreadable environment; correct the project")
-        for name in names:
-            if str(declared.get(name, "")) != env[name]:
+        declared = service_environment(services[service_name], service_name)
+        for name, value in expected.items():
+            if declared.get(name, "") != value:
                 refuse(f"rendered service {service_name} does not consume the validated {name}; correct the project")
     coordinator_networks = set(services["coordinator"].get("networks", {}))
     publisher_networks = set(services["forge-publisher"].get("networks", {}))
@@ -461,6 +543,7 @@ def validate_compose(rendered: dict, env: dict[str, str], old_paths: list[str], 
     published = services["answer-service"].get("ports", []) or []
     if not any(isinstance(item, dict) and str(item.get("host_ip")) == gateway and int(item.get("target", 0)) == 8126 for item in published):
         refuse("rendered answer service is not published only on the gateway route; correct the project")
+    return service_environment(services["coordinator"], "coordinator")
 
 
 def main() -> int:
@@ -476,7 +559,7 @@ def main() -> int:
         print(f"PLAN 2 rewrite {args.settings_input} to {args.settings_output} with planning disabled and documented names/container paths")
         print(f"PLAN 3 validate with the immutable FORGE_IMAGE, the real loader, and {len(args.compose_file)} ordered Compose file(s)")
         print(f"PLAN 4 compare registrations with {args.previous_runtime} and require exact drift acknowledgements")
-        print(f"PLAN 5 atomically write {args.env_output}, {args.settings_output}, and {args.receipt}")
+        print(f"PLAN 5 stage the complete output set, then replace {args.env_output}, {args.settings_output}, and {args.receipt}")
         return 0
 
     public, public_bytes = read_env(args.env_file)
@@ -547,6 +630,8 @@ def main() -> int:
         except Exception as exc:
             refuse(f"the schema container did not produce complete output ({type(exc).__name__}); inspect the chosen image")
 
+        # Reject malformed declared routes before rendering; the generated artifact is
+        # checked again below with the environment Compose gives the coordinator.
         route_receipt = validate_routes(resolved, metadata)
         registrations = metadata["registrations"]
         destinations = {
@@ -579,15 +664,35 @@ def main() -> int:
         for compose_file in args.compose_file:
             compose_command.extend(["-f", str(compose_file.resolve())])
         compose_command.extend(["config", "--format", "json"])
-        compose_bytes = run(compose_command, env=process_env)
+        private_process_env = docker_env({name: resolved[name] for name in secret_values})
+        compose_bytes = run(compose_command, env=private_process_env)
         try:
             rendered = json.loads(compose_bytes)
         except Exception as exc:
             refuse(f"Compose did not return JSON ({type(exc).__name__}); use a supported Docker Compose and retry")
-        validate_compose(rendered, resolved, list(registrations.values()), image_ids)
+        coordinator_env = validate_compose(rendered, resolved, list(registrations.values()), image_ids)
 
-        env_status = atomic_write(args.env_output, public_bytes)
-        settings_status = atomic_write(args.settings_output, settings_bytes)
+        loader_command = [
+            docker, "run", "--rm", "--network", "none", "--read-only",
+            "--user", f"{os.getuid()}:{os.getgid()}", "--tmpfs", "/tmp",
+            "--entrypoint", "python",
+        ]
+        for name in ROUTE_NAMES:
+            loader_command.extend(["-e", f"{name}={require(coordinator_env, name)}"])
+        loader_command.extend([
+            "-v", f"{transformed}:/input/forge.yaml:ro",
+            resolved["FORGE_IMAGE"], "-c", LOADER_CHECKER, "/input/forge.yaml",
+        ])
+        try:
+            metadata["routes"] = json.loads(run(loader_command, env=process_env))
+        except Exception as exc:
+            if isinstance(exc, Refusal):
+                raise
+            refuse(f"the rendered coordinator could not resolve generated settings ({type(exc).__name__}); correct the project")
+        effective_routes = dict(resolved)
+        effective_routes.update({name: coordinator_env[name] for name in ROUTE_NAMES})
+        route_receipt = validate_routes(effective_routes, metadata)
+
         receipt = {
             "schema": 1,
             "env_input_sha256": hashlib.sha256(public_bytes).hexdigest(),
@@ -614,7 +719,11 @@ def main() -> int:
             "checks": ["forge.config.loader.load_config", "section-7-routes", "docker-compose-config", "machine-value-sweep"],
         }
         receipt_bytes = (json.dumps(receipt, indent=2, sort_keys=True) + "\n").encode()
-        receipt_status = atomic_write(args.receipt, receipt_bytes)
+        env_status, settings_status, receipt_status = install_artifacts((
+            (args.env_output, public_bytes),
+            (args.settings_output, settings_bytes),
+            (args.receipt, receipt_bytes),
+        ))
     print(f"settings preparation complete: env {env_status}; settings {settings_status}; receipt {receipt_status}")
     return 0
 
