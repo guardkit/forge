@@ -301,10 +301,18 @@ check_the_bus() {
         --arg account "${ACCOUNT}" \
         --arg name "${CLIENT_NAME}" \
         --arg subject "${SUBJECT}" '
+        def valid_subs:
+            if .subscriptions_list != null then
+                .subscriptions_list | type == "array" and all(.[]; type == "string")
+            elif .subscriptions_list_detail != null then
+                .subscriptions_list_detail | type == "array"
+                    and all(.[]; type == "object" and (.subject | type == "string"))
+            else true end;
         def subs: (.subscriptions_list // ([(.subscriptions_list_detail // [])[] | .subject]));
         select(type == "object")
         | .connections as $c
-        | if ($c | type) != "array" then empty else
+        | if ($c | type) != "array" then empty
+          elif all($c[]; type == "object" and valid_subs) | not then empty else
             [ $c[] | select(.authorized_user == $account) ] as $mine
             | [ $mine[] | select((.name // "") == $name and (subs | index($subject))) ] as $gateway
             | [ $mine[] | select((.name // "") != "") ] as $named
