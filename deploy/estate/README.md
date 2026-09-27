@@ -738,6 +738,15 @@ The execution sequence is:
    runs the full `estate-check services`, `factory-hello`, and finally the Compose
    `gateway-watch` profile. The new watch has no host timer or service.
 
+Prepared-state final verification also requires complete visibility of processes
+holding the current ledger, WAL or shared-memory file. The tool runs its pinned
+helper with the host PID namespace and `SYS_PTRACE`, with no network and the
+ledger mounted read-only. It compares file identities; it does not read process
+commands, environment or descriptor contents, and it never kills a holder.
+Permission errors or incomplete observations refuse the operation. Establish
+that this access is permitted and works in the intended environment before the
+rehearsal; a quiet database or empty Docker volume filter is insufficient.
+
 The two recovery modes preserve different authorities. Before resume,
 `rollout-back --before-resume` requires both markers absent, unchanged recorded
 work, a valid snapshot and a quiescent current estate. It recreates the saved old
