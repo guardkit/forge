@@ -327,7 +327,7 @@ def test_lease_algorithm_catches_mapping_after_original_fd_closed(tmp_path,monke
     import mmap
     local_lease_fs(monkeypatch);root=lease_root(tmp_path);flags={'read':mmap.ACCESS_READ,'copy':mmap.ACCESS_COPY,'write':mmap.ACCESS_WRITE}
     fd=os.open(root/'forge.db',os.O_RDONLY if access!='write' else os.O_RDWR)
-    mapped=mmap.mmap(fd,0,access=flags[access]);os.close(fd)
+    mapped=mmap.mmap(fd,0,access=flags[access],trackfd=False);os.close(fd)
     try:
         proof=q.ledger_lease_proof(root)
         assert not proof['complete'] and proof['kind']=='holder'
