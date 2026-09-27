@@ -284,6 +284,12 @@ class Rollout:
         self.forwarded_names = self.values.get('SANDBOX_ENV_NAMES','').replace(',',' ').split()
         mandatory = {'FORGE_IMAGE','FORGE_IMAGE_IDENTITY','FORGE_RELEASE_VERSION','FORGE_RELEASE_MANIFEST_SHA256','FORGE_TARGET_OWNER_URL',*MEMORY_NAMES}
         require(set(self.forwarded_names) >= mandatory and all(re.fullmatch(r'[A-Z_][A-Z0-9_]*',x) for x in self.forwarded_names), 'SANDBOX_ENV_NAMES lacks required image, answer or memory names; fix the normal runner declaration')
+        # run.sh forwards only nonempty declared names. Match the template's
+        # receipt precedence at this boundary, not merely the rewritten profile.
+        self.forwarded_values = {name:self.values[name] for name in self.forwarded_names if self.values.get(name)}
+        effective_receipts = (self.forwarded_values.get('FORGE_RECEIPTS_DIR')
+                              or self.forwarded_values.get('SANDBOX_RECEIPTS_PATH'))
+        require(effective_receipts == s['receipts_path'], 'effective forwarded receipts path differs from sandbox.receipts_path or is missing; declare and forward the matching receipt setting before stopping the sandbox')
         if self.values['FLEET_MEMORY_ENABLED'] == 'true':
             require(all(self.values.get(name) for name in MEMORY_NAMES), 'enabled memory lacks explicit private values; supply all seven names through the named files')
         self.evidence = Path(s['evidence_dir'])
@@ -372,6 +378,16 @@ class Rollout:
         out = self.run(['docker','--context',self.config['docker_context'],'run','--rm','--pull=never','--network=none','--read-only','-i','--entrypoint','python',self.config['runtime_image'],'-c',PROFILE], input=json.dumps(payload)).stdout
         return json.loads(out)
 
+    def validate_bootstrap_ports(self, profile):
+        # Read the current bundled template's defaults. A project using another
+        # inner port must actually forward its matching setting through run.sh.
+        for name, published in zip(('SANDBOX_SIDECAR_PORT','SANDBOX_RUNNER_PORT'),profile['publish'][-2:]):
+            default = re.search(r'^\w+="\$\{' + name + r':-([0-9]+)\}"$',self.template.decode(),re.MULTILINE)
+            require(default is not None, f'current template default for {name} is unreadable; verify its listener contract before proceeding')
+            effective = self.forwarded_values.get(name) or default[1]
+            require(effective.isdigit() and 0 < int(effective) < 65536 and int(effective) == int(published.rsplit(':',1)[1]),
+                    f'effective forwarded {name} does not match the profile destination port; declare and forward the project port before stopping the sandbox')
+
     def handoff(self):
         resolved = self.run(['docker','--context',self.config['docker_context'],'image','inspect','--format','{{.Id}}',self.s['release_image']]).stdout.strip()
         require(resolved == self.config['runtime_image'], 'release_image tag no longer resolves to the accepted host image; restore its exact release identity before proceeding')
@@ -393,6 +409,7 @@ class Rollout:
         versions = dict(re.findall(r'^(Client|Server) Version:\s+(v[0-9.]+)(?:\s|$)',version,re.MULTILINE))
         require(versions == {'Client':'v0.42.1','Server':'v0.42.1'}, 'sandbox client or server version is not the reviewed v0.42.1; verify its stopped-status contract first')
         profile = self.profile()  # Parse/validate before touching any unit.
+        self.validate_bootstrap_ports(profile)
         receipt = self.evidence / 'sandbox-installed.json'
         if receipt.exists():
             previous = json_read(receipt)

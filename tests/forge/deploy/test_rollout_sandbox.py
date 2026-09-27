@@ -31,10 +31,10 @@ def inventory(tmp_path):
         'FORGE_TARGET_OWNER_URL=http://192.0.2.10:8900',
         'FORGE_SANDBOX_SIDECAR_URL=http://192.0.2.10:8925',
         'FORGE_SANDBOX_RUNNER_URL=http://192.0.2.10:8924',
-        'FLEET_MEMORY_ENABLED=false',
+        'FLEET_MEMORY_ENABLED=false','SANDBOX_RECEIPTS_PATH=/private/receipts',
         'SANDBOX_NAME=owned-sandbox','SANDBOX_BOOTSTRAP=/private/clone/deploy/sandbox-runner.sh',
         'SANDBOX_PROJECT_ENV_FILE='+str(tmp_path/'operational'/'bootstrap.env'),
-        'SANDBOX_ENV_NAMES=FORGE_IMAGE FORGE_IMAGE_IDENTITY FORGE_RELEASE_VERSION FORGE_RELEASE_MANIFEST_SHA256 FORGE_TARGET_OWNER_URL '+' '.join(m.MEMORY_NAMES),
+        'SANDBOX_ENV_NAMES=SANDBOX_RECEIPTS_PATH FORGE_IMAGE FORGE_IMAGE_IDENTITY FORGE_RELEASE_VERSION FORGE_RELEASE_MANIFEST_SHA256 FORGE_TARGET_OWNER_URL '+' '.join(m.MEMORY_NAMES),
     ])+'\n')
     source = tmp_path / 'project' / 'deploy' / 'profile.yaml'
     source.parent.mkdir(parents=True)
@@ -366,3 +366,81 @@ def test_normal_runner_private_values_are_not_evidence(inventory,monkeypatch):
     assert 'private-canary' in runtime.read_text()
     assert runtime.stat().st_mode & 0o777==0o600
     assert all('private-canary' not in p.read_text() for p in Path(config['sandbox']['evidence_dir']).glob('*') if p.is_file())
+
+
+
+def edit_env(config, changes, add_forward=(), remove_forward=()):
+    path=Path(config['env_file'])
+    values=dict(line.split('=',1) for line in path.read_text().splitlines())
+    for key,value in changes.items():
+        if value is None:values.pop(key,None)
+        else:values[key]=value
+    names=values['SANDBOX_ENV_NAMES'].split()
+    names=[x for x in names if x not in remove_forward]
+    names.extend(x for x in add_forward if x not in names)
+    values['SANDBOX_ENV_NAMES']=' '.join(names)
+    path.write_text(''.join(k+'='+v+'\n' for k,v in values.items()))
+
+
+@pytest.mark.parametrize('change,add,remove',[
+    ({'SANDBOX_RECEIPTS_PATH':None},(),()),
+    ({'SANDBOX_RECEIPTS_PATH':'/stale/receipts'},(),()),
+    ({},(),('SANDBOX_RECEIPTS_PATH',)),
+    ({'FORGE_RECEIPTS_DIR':'/stale/higher-priority'},('FORGE_RECEIPTS_DIR',),()),
+])
+def test_receipt_handoff_refuses_before_any_stop(inventory,monkeypatch,change,add,remove):
+    config,path,args=inventory;edit_env(config,change,add,remove)
+    b=Boundary(config,monkeypatch)
+    assert m.main(args)==2
+    assert not b.calls
+    assert not b.files
+
+
+@pytest.mark.parametrize('values,forward',[
+    ({},()),
+    ({'SANDBOX_SIDECAR_PORT':'9125','SANDBOX_RUNNER_PORT':'9124'},()),
+    ({'SANDBOX_SIDECAR_PORT':'8125','SANDBOX_RUNNER_PORT':'8124'},('SANDBOX_SIDECAR_PORT','SANDBOX_RUNNER_PORT')),
+    ({'SANDBOX_SIDECAR_PORT':'9125','SANDBOX_RUNNER_PORT':'wrong'},('SANDBOX_SIDECAR_PORT','SANDBOX_RUNNER_PORT')),
+])
+def test_custom_inner_ports_require_effective_forwarding(inventory,monkeypatch,values,forward):
+    config,path,args=inventory
+    profile=Path(config['sandbox']['profile_source'])
+    profile.write_text(profile.read_text().replace(':8125',':9125').replace(':8124',':9124'))
+    edit_env(config,values,forward)
+    b=Boundary(config,monkeypatch)
+    assert m.main(args)==2
+    assert not any(x[0]=='systemctl' or x[:2]==['sbx','stop'] for x in b.argv())
+    assert not b.files
+
+
+@pytest.mark.parametrize('high_priority',[False,True])
+def test_normal_output_drives_real_template_receipts_and_custom_ports(inventory,monkeypatch,tmp_path,high_priority):
+    config,path,args=inventory
+    desired=str(tmp_path/'preserved-receipts');config['sandbox']['receipts_path']=desired
+    path.write_text(json.dumps(config))
+    profile=Path(config['sandbox']['profile_source'])
+    profile.write_text(profile.read_text().replace(':8125',':9125').replace(':8124',':9124'))
+    values={'SANDBOX_RECEIPTS_PATH':desired,'SANDBOX_SIDECAR_PORT':'9125','SANDBOX_RUNNER_PORT':'9124'}
+    names=['SANDBOX_SIDECAR_PORT','SANDBOX_RUNNER_PORT']
+    if high_priority:
+        values.update(FORGE_RECEIPTS_DIR=desired,SANDBOX_RECEIPTS_PATH=str(tmp_path/'ignored-lower-priority'))
+        names.append('FORGE_RECEIPTS_DIR')
+    edit_env(config,values,names)
+    with monkeypatch.context() as local:
+        b=Boundary(config,local)
+        assert m.main(args)==0
+    forwarded={k:json.loads(v).replace('$$','$') for k,v in (line.split('=',1) for line in Path(config['sandbox']['bootstrap_env_file']).read_text().splitlines())}
+    spec=importlib.util.spec_from_file_location('rollout_consumer_template',Path(__file__).with_name('test_sandbox_bootstrap_from_the_release_image.py'))
+    template_tests=importlib.util.module_from_spec(spec);spec.loader.exec_module(template_tests)
+    consumer=tmp_path/'consumer';consumer.mkdir()
+    fake=template_tests.sandbox.__wrapped__(consumer)
+    # Only fake image identity settings differ; preserve actual generated path/port values.
+    extra={k:v for k,v in forwarded.items() if k not in {'FORGE_IMAGE','FORGE_IMAGE_IDENTITY','FORGE_RELEASE_VERSION','FORGE_RELEASE_MANIFEST_SHA256'}}
+    runs=template_tests.TestTheFoldersBothContainersShare._runs_of_a_started_bootstrap(fake,**extra)
+    assert len(runs)==2
+    assert all(desired+':'+desired+':rw' in run for run in runs)
+    assert '--publish 0.0.0.0:9125:9125' in runs[0]
+    assert '--publish 0.0.0.0:9124:9124' in runs[1]
+    actual_publishes=[x[-1] for x in b.argv() if x[:3]==['sbx','ports','owned-sandbox'] and '--publish' in x]
+    assert '192.0.2.10:8925:9125' in actual_publishes
+    assert '192.0.2.10:8924:9124' in actual_publishes
