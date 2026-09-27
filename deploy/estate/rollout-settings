@@ -443,7 +443,7 @@ def install_artifacts(artifacts: tuple[tuple[Path, bytes], ...], mode: int = 0o6
             else:
                 os.replace(temporary, path)
         return tuple(statuses)
-    except Exception as exc:
+    except (Exception, KeyboardInterrupt) as exc:
         refuse(
             f"could not install the staged output set ({type(exc).__name__}); "
             "one or more destinations may already have been replaced, so inspect all three outputs"
@@ -541,8 +541,20 @@ def validate_compose(
             if isinstance(mount, dict) and mount.get("type") == "bind" and str(mount.get("source")) in old_paths:
                 refuse(f"rendered service {name} binds an old registered project path; remove that bind")
     published = services["answer-service"].get("ports", []) or []
-    if not any(isinstance(item, dict) and str(item.get("host_ip")) == gateway and int(item.get("target", 0)) == 8126 for item in published):
-        refuse("rendered answer service is not published only on the gateway route; correct the project")
+    expected_answer_port = int(require(env, "FORGE_ANSWER_PORT"))
+    answer_mapping_matches = (
+        len(published) == 1
+        and isinstance(published[0], dict)
+        and str(published[0].get("host_ip")) == gateway
+        and int(published[0].get("target", 0)) == 8126
+        and int(published[0].get("published", 0)) == expected_answer_port
+        and str(published[0].get("protocol", "tcp")).lower() == "tcp"
+    )
+    if not answer_mapping_matches:
+        refuse(
+            "rendered answer service TCP publication does not match "
+            "FACTORY_GATEWAY_ADDRESS and the declared callback port; correct the project"
+        )
     return service_environment(services["coordinator"], "coordinator")
 
 
@@ -735,7 +747,10 @@ if __name__ == "__main__":
         print(f"REFUSED: {exc}", file=sys.stderr)
         raise SystemExit(2)
     except KeyboardInterrupt:
-        print("REFUSED: settings preparation was interrupted; no partial output was installed.", file=sys.stderr)
+        print(
+            "REFUSED: settings preparation was interrupted; inspect all three outputs before retrying.",
+            file=sys.stderr,
+        )
         raise SystemExit(2)
     except Exception as exc:
         print(f"REFUSED: settings preparation hit {type(exc).__name__}; inspect the explicit inputs and retry.", file=sys.stderr)
