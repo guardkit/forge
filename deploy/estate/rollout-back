@@ -177,7 +177,10 @@ class Recovery(q.Estate):
         for tag in record['repo_tags']:
             found=json.loads(r.docker(self.c,'image','inspect',tag).stdout)[0]['Id']
             q.need(found==image,f'recorded image {image} tag {tag} now resolves to {found}; keep the estate stopped and reconcile the moved tag')
-        q.need(record['network_mode'] not in ('host','container') and record['networks'],'previous network cannot be safely reconstructed; reconcile the saved runtime')
+        identity=record['service_identity'];argv=q.effective_argv(identity)
+        q.need(argv and (identity.get('entrypoint') or [argv[0]])[0],'previous process has no executable entrypoint or command; reconcile the saved runtime')
+        q.need(all(isinstance(identity.get(k,''),str) for k in ('name','hostname','user','working_dir')) and identity.get('name','').startswith('/'),'previous service identity cannot be represented exactly; reconcile the saved runtime')
+        q.need(record['network_mode'] not in ('host','container') and record['networks'] and record['network_mode'] in record['networks'],'previous primary network cannot be safely reconstructed; reconcile the saved runtime')
         for name,network in record['networks'].items():
             r.docker(self.c,'network','inspect',name)
             q.need(not network.get('Links') and not network.get('IPAMConfig') and not network.get('DriverOpts'),'saved network requires unsupported static options; keep both authorities stopped and reconcile exact reconstruction')
@@ -187,13 +190,15 @@ class Recovery(q.Estate):
             q.need(m['Type'] in ('bind','volume'),'previous mount type is unsupported; keep the estate stopped')
             if m['Type']=='bind':r.path(m['Source'])
             else:r.docker(self.c,'volume','inspect',m['Name'])
-    def create_old(self,role,record):
+    def create_old(self,role,record,journal):
         self.validate_runtime(record);values=self.old_values(role,record);identity=record['service_identity'];name=identity['name'].lstrip('/')
-        old=r.docker(self.c,'ps','--all','--filter','name=^/'+name+'$','--format','{{.ID}}').stdout.split()
-        if old:
-            item=r.inspect(self.c,old[0]);q.need(len(old)==1 and item['Id']==identity['container_id'] and not item['State']['Running'],f'old {role} name is occupied by another or running container; keep recovery stopped')
-            r.docker(self.c,'rm',item['Id'])
-        networks=list(record['networks']);cmd=['create','--name',name,'--network',networks[0]]
+        networks=[record['network_mode'],*[x for x in record['networks'] if x!=record['network_mode']]];created=journal['created'].get(role)
+        if created is None:
+            old=r.docker(self.c,'ps','--all','--filter','name=^/'+name+'$','--format','{{.ID}}').stdout.split()
+            if old:
+                item=r.inspect(self.c,old[0]);q.need(len(old)==1 and item['Id']==identity['container_id'] and not item['State']['Running'],f'old {role} name is occupied by another or running container; keep recovery stopped')
+                r.docker(self.c,'rm',item['Id'])
+        cmd=['create','--name',name,'--network',networks[0]]
         for key,flag in [('hostname','--hostname'),('user','--user'),('working_dir','--workdir')]:
             if identity.get(key):cmd += [flag,identity[key]]
         for key,value in record.get('labels',{}).items():cmd+=['--label',key+'='+value]
@@ -209,16 +214,23 @@ class Recovery(q.Estate):
         for key in record['env_names']:cmd+=['--env',key]
         entry=identity.get('entrypoint') or [];command=identity.get('command') or []
         if isinstance(entry,str):entry=[entry]
-        q.need(isinstance(command,list),'old command is not an explicit argument list; reconcile its recorded runtime')
-        if entry:cmd+=['--entrypoint',entry[0]]
+        q.effective_argv(identity)
+        cmd+=['--entrypoint',entry[0] if entry else '']
         for alias in record['networks'][networks[0]].get('Aliases') or []:
             if alias not in (identity['container_id'],identity['container_id'][:12]):cmd+=['--network-alias',alias]
-        created=r.docker(self.c,*cmd,record['image_id'],*entry[1:],*command,env={**self.env,**values}).stdout.strip()
+        if created is None:
+            created=r.docker(self.c,*cmd,record['image_id'],*entry[1:],*command,env={**self.env,**values}).stdout.strip()
+            q.need(re.fullmatch(r'[0-9a-f]{64}',created or '') and created!=identity['container_id'],f'new {role} container identity is absent, malformed or reuses the retired authority; keep recovery stopped')
+            journal['created'][role]=created;journal['stage']='recreating';self.save()
+        else:q.need(isinstance(created,str) and re.fullmatch(r'[0-9a-f]{64}',created) and created!=identity['container_id'],f'saved partial {role} container identity is unsafe; keep recovery stopped and reconcile its receipt')
+        actual=r.inspect(self.c,created)
+        q.need(actual['Id']==created and actual.get('Name')==identity['name'] and actual['Image']==record['image_id'] and not actual['State']['Running'],f'saved partial {role} container is absent, foreign, running or uses another image; keep recovery stopped')
         for network in networks[1:]:
-            command=['network','connect']
-            for alias in record['networks'][network].get('Aliases') or []:
-                if alias not in (identity['container_id'],identity['container_id'][:12]):command+=['--alias',alias]
-            r.docker(self.c,*command,network,created)
+            if network not in actual['NetworkSettings']['Networks']:
+                connect=['network','connect']
+                for alias in record['networks'][network].get('Aliases') or []:
+                    if alias not in (identity['container_id'],identity['container_id'][:12]):connect+=['--alias',alias]
+                r.docker(self.c,*connect,network,created)
         actual=r.inspect(self.c,created);q.need(actual['Image']==record['image_id'] and not actual['State']['Running'],'recreated runtime identity is not proved stopped; reconcile before authorizing it')
         q.need(q.stable_runtime(r.previous_runtime(self.c,actual))==q.stable_runtime(record),'recreated runtime mounts, ports, environment names or network identity differ; keep all authorities stopped')
         return actual['Id']
@@ -244,7 +256,7 @@ class Recovery(q.Estate):
         r.no_holders(old_db);self.remove_current()
         journal=self.doc.setdefault('rollback',{'stage':'stopped','created':{},'retired':[]});self.save()
         for role in ('memory','relay','coordinator'):
-            if role not in journal['created']:journal['created'][role]=self.create_old(role,self.doc['old_runtimes'][role]);self.save()
+            q.need(self.create_old(role,self.doc['old_runtimes'][role],journal)==journal['created'][role],f'recreated {role} identity differs from its partial receipt; keep recovery stopped')
         model=self.model()
         for role,name in self.c['volumes'].items():
             if role not in journal['retired']:

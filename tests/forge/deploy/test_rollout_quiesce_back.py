@@ -268,6 +268,47 @@ def test_network_transient_endpoint_fields_do_not_change_reconstruction():
     changed['networks']['internal']['Aliases']=['other']
     assert q.stable_runtime(item)!=q.stable_runtime(changed)
 
+def test_runtime_seal_accepts_docker_cli_entrypoint_partition_only():
+    base={'service_identity':{'container_id':'a'*64,'name':'/old','hostname':'old','user':'','working_dir':'/app','entrypoint':['/bin/sh','-c','exec "$@"','argv0'],'command':['python','-m','fleet_memory.mcp']},'networks':{'internal':{'Aliases':['old']}},'image_id':'x','repo_tags':[],'mounts':[],'port_bindings':{},'restart_policy':{},'network_mode':'internal','env_names':['ONE']}
+    recreated=json.loads(json.dumps(base));recreated['service_identity']['container_id']='b'*64
+    recreated['service_identity']['entrypoint']=['/bin/sh'];recreated['service_identity']['command']=['-c','exec "$@"','argv0','python','-m','fleet_memory.mcp']
+    assert q.stable_runtime(base)==q.stable_runtime(recreated)
+    recreated['service_identity']['command'][-1]='other.module'
+    assert q.stable_runtime(base)!=q.stable_runtime(recreated)
+
+def test_post_create_failure_journals_id_and_retry_reuses_only_that_container(estate,monkeypatch):
+    recovery=b.Recovery(estate.args);created='b'*64;old='a'*64;network='owned-primary'
+    record={'image_id':r.RUNTIME,'repo_tags':[],'mounts':[],'networks':{network:{'Aliases':['owned-memory'],'Links':None,'IPAMConfig':None,'DriverOpts':None}},'port_bindings':{},'restart_policy':{'Name':'no','MaximumRetryCount':0},'network_mode':network,'env_names':[],'service_identity':{'name':'/owned-memory','container_id':old,'hostname':'owned-host','user':'','working_dir':'/app','entrypoint':['/bin/sh','-c','exec "$@"','argv0'],'command':['python','-m','fleet_memory.mcp']}}
+    recovery.doc={'format_version':1,'binding':recovery.binding,'rollback':{'stage':'stopped','created':{},'retired':[]}}
+    journal=recovery.doc['rollback'];creates=[];inspection={'fail':True}
+    monkeypatch.setattr(recovery,'validate_runtime',lambda item:None);monkeypatch.setattr(recovery,'old_values',lambda *a:{})
+    def docker(c,*args,**kwargs):
+        if args[0]=='ps':return SimpleNamespace(stdout='')
+        if args[0]=='create':creates.append(args);return SimpleNamespace(stdout=created+'\n')
+        raise AssertionError(args)
+    monkeypatch.setattr(r,'docker',docker)
+    actual={'Id':created,'Name':'/owned-memory','Image':r.RUNTIME,'State':{'Running':False},'NetworkSettings':{'Networks':{network:{}}}}
+    def inspect(c,identifier):
+        assert identifier==created
+        if inspection['fail']:raise r.Refusal('owned post-create inspection failed')
+        return actual
+    monkeypatch.setattr(r,'inspect',inspect);monkeypatch.setattr(r,'previous_runtime',lambda *a:record)
+    with pytest.raises(r.Refusal,match='post-create inspection failed'):recovery.create_old('memory',record,journal)
+    assert journal['created']=={'memory':created} and r.read_json(recovery.receipt)['rollback']['created']=={'memory':created}
+    inspection['fail']=False
+    assert recovery.create_old('memory',record,journal)==created
+    assert len(creates)==1
+
+def test_partial_retry_never_adopts_container_with_another_identity(estate,monkeypatch):
+    recovery=b.Recovery(estate.args);created='b'*64;old='a'*64;network='owned-primary'
+    record={'image_id':r.RUNTIME,'repo_tags':[],'mounts':[],'networks':{network:{'Aliases':[],'Links':None,'IPAMConfig':None,'DriverOpts':None}},'port_bindings':{},'restart_policy':{},'network_mode':network,'env_names':[],'service_identity':{'name':'/owned-memory','container_id':old,'hostname':'owned-host','user':'','working_dir':'/app','entrypoint':['python'],'command':['-m','fleet_memory.mcp']}}
+    journal={'stage':'recreating','created':{'memory':created},'retired':[]};recovery.doc={'format_version':1,'binding':recovery.binding,'rollback':journal}
+    monkeypatch.setattr(recovery,'validate_runtime',lambda item:None);monkeypatch.setattr(recovery,'old_values',lambda *a:{})
+    monkeypatch.setattr(r,'docker',lambda *a,**k:pytest.fail('journaled retry created or removed a container'))
+    monkeypatch.setattr(r,'inspect',lambda *a:{'Id':'c'*64,'Name':'/owned-memory','Image':r.RUNTIME,'State':{'Running':False},'NetworkSettings':{'Networks':{network:{}}}})
+    with pytest.raises(r.Refusal,match='absent, foreign'):
+        recovery.create_old('memory',record,journal)
+
 @pytest.mark.parametrize('table,before,after',[
  ('publication_records',{'build_id':'b','result':'merged into the remote and running','j_commit':'old'},{'build_id':'b','result':'merged into the remote and running','j_commit':'new'}),
  ('deployment_targets',{'target':'low','counter':2,'holder_build':None},{'target':'low','counter':3,'holder_build':None}),
