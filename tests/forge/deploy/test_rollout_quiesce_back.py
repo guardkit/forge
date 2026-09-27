@@ -341,10 +341,26 @@ def test_named_volume_argument_preserves_plain_saved_mode(mode,rw,expected):
     assert b.volume_argument(named_volume(mode,rw))==expected
 
 @pytest.mark.parametrize('mode,rw',[('rw',True),('ro',False)])
-@pytest.mark.parametrize('destination',['/data/.hidden','/data/nested/sub-name_1'])
+@pytest.mark.parametrize('destination',['/data/.hidden','/data/nested/sub-name_1','/data/café','/data/😀'])
 def test_named_volume_argument_preserves_canonical_hidden_and_nested_paths(mode,rw,destination):
     mount=named_volume(mode,rw);mount['Destination']=destination
     assert b.volume_argument(mount)=='owned-volume:'+destination+':'+mode
+
+@pytest.mark.parametrize('escaped',[r'"/data/\ud800"',r'"/data/\udc00"',r'"/data/\udc80"'])
+@pytest.mark.parametrize('mode,rw',[('rw',True),('ro',False)])
+@pytest.mark.parametrize('journaled',[False,True])
+def test_named_volume_unencodable_destination_refuses_before_old_lookup(estate,monkeypatch,escaped,mode,rw,journaled):
+    recovery=b.Recovery(estate.args);mount=named_volume(mode,rw);mount['Destination']=json.loads(escaped);record=volume_runtime(mount);events=[]
+    journal={'stage':'stopped','created':{'coordinator':'b'*64} if journaled else {},'retired':[]};saved=json.loads(json.dumps(journal))
+    def docker(c,*args,**kwargs):
+        events.append(args)
+        if args[:2]==('image','inspect'):return SimpleNamespace(stdout=json.dumps([{'Id':r.RUNTIME}]))
+        if args[:2]==('network','inspect'):return SimpleNamespace(stdout='[]')
+        pytest.fail('encoding preflight reached old lookup or mutation: '+repr(args))
+    monkeypatch.setattr(r,'docker',docker);monkeypatch.setattr(recovery,'old_values',lambda *a:pytest.fail('read values after bad volume preflight'))
+    with pytest.raises(r.Refusal):recovery.create_old('coordinator',record,journal)
+    assert journal==saved
+    assert all(args[0] not in ('ps','inspect','rm','create','start') for args in events)
 
 @pytest.mark.parametrize('change',[
     {'Mode':'z'},
