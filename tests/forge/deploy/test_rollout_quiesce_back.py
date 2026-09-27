@@ -301,6 +301,92 @@ def test_bind_options_not_reconstructed_by_docker_mount_refuse(change):
     with pytest.raises(r.Refusal):q.stable_mount(mount)
 
 
+def named_volume(mode='rw',rw=True):
+    return {'Type':'volume','Name':'owned-volume','Source':'/var/lib/docker/volumes/owned-volume/_data','Destination':'/owned','Driver':'local','Mode':mode,'RW':rw,'Propagation':''}
+
+def volume_runtime(mount):
+    network='owned-primary';return {'image_id':r.RUNTIME,'repo_tags':[],'mounts':[mount],'networks':{network:{'Aliases':[],'Links':None,'IPAMConfig':None,'DriverOpts':None}},'port_bindings':{},'restart_policy':{},'network_mode':network,'env_names':[],'service_identity':{'name':'/owned-coordinator','container_id':'a'*64,'hostname':'owned-host','user':'','working_dir':'/app','entrypoint':['python'],'command':['-c','raise SystemExit(0)']}}
+
+def test_three_representative_saved_roles_preserve_process_mount_and_runtime_identity():
+    entry=['/bin/sh','-c','exec "$@"','owned-argv0'];network='owned-factory'
+    bind_rw={'Type':'bind','Source':'/owned/source-rw','Destination':'/state','Mode':'rw','RW':True,'Propagation':'rprivate'}
+    bind_ro={'Type':'bind','Source':'/owned/source-ro','Destination':'/fixture','Mode':'ro','RW':False,'Propagation':'rprivate'}
+    volume_rw=named_volume();volume_ro=dict(named_volume('ro',False),Name='owned-volume-ro',Source='/var/lib/docker/volumes/owned-volume-ro/_data',Destination='/owned-ro')
+    shapes={
+        'memory':{'user':'','workdir':'/app','command':['python','-m','owned.memory'],'mounts':[],'ports':{'8005/tcp':[{'HostIp':'127.0.0.1','HostPort':'28005'}]}},
+        'relay':{'user':'','workdir':'/app','command':['owned-stream','run'],'mounts':[bind_rw,bind_ro],'ports':{}},
+        'coordinator':{'user':'forge','workdir':'/home/forge','command':['--config','/owned/config','serve'],'mounts':[bind_rw,bind_ro,volume_rw,volume_ro],'ports':{}},
+    }
+    for role,shape in shapes.items():
+        identity={'container_id':'a'*64,'name':'/owned-'+role,'hostname':'owned-'+role+'-host','user':shape['user'],'working_dir':shape['workdir'],'entrypoint':entry,'command':shape['command']}
+        saved={'image_id':'sha256:'+'1'*64,'repo_tags':['owned:'+role],'mounts':json.loads(json.dumps(shape['mounts'])),'networks':{network:{'Aliases':['owned-'+role]}},'port_bindings':shape['ports'],'restart_policy':{'Name':'unless-stopped','MaximumRetryCount':0},'network_mode':network,'env_names':['OWNED_ONE','OWNED_TWO'],'service_identity':identity}
+        recreated=json.loads(json.dumps(saved));recreated['service_identity']['container_id']='b'*64
+        recreated['service_identity']['entrypoint']=[entry[0]];recreated['service_identity']['command']=entry[1:]+shape['command']
+        for mount in recreated['mounts']:
+            if mount['Type']=='bind':mount['Mode']=''
+            else:assert b.volume_argument(mount).endswith(':'+mount['Mode'])
+        seal=q.stable_runtime(saved)
+        assert seal==q.stable_runtime(recreated)
+        assert seal['service_identity']=={'name':'/owned-'+role,'hostname':'owned-'+role+'-host','user':shape['user'],'working_dir':shape['workdir'],'effective_argv':entry+shape['command']}
+        assert seal['image_id']==saved['image_id'] and seal['repo_tags']==saved['repo_tags'] and seal['port_bindings']==shape['ports']
+        assert seal['restart_policy']==saved['restart_policy'] and seal['network_mode']==network and seal['env_names']==saved['env_names']
+        changed=json.loads(json.dumps(recreated));changed['service_identity']['command'][-1]='changed';assert q.stable_runtime(saved)!=q.stable_runtime(changed)
+        if saved['mounts']:
+            changed=json.loads(json.dumps(recreated));changed['mounts'][0]['Source']='/changed';assert q.stable_runtime(saved)!=q.stable_runtime(changed)
+    assert [x['Mode'] for x in q.stable_runtime({'service_identity':{'container_id':'a'*64},'networks':{},'image_id':'x','repo_tags':[],'mounts':[volume_rw,volume_ro],'port_bindings':{},'restart_policy':{},'network_mode':'owned','env_names':[]})['mounts']]==['rw','ro']
+
+
+@pytest.mark.parametrize('mode,rw,expected',[('rw',True,'owned-volume:/owned:rw'),('ro',False,'owned-volume:/owned:ro')])
+def test_named_volume_argument_preserves_plain_saved_mode(mode,rw,expected):
+    assert b.volume_argument(named_volume(mode,rw))==expected
+
+@pytest.mark.parametrize('change',[
+    {'Mode':'z'},
+    {'Mode':'Z'},
+    {'Mode':'rw,z'},
+    {'Mode':''},
+    {'Mode':'rw','RW':False},
+    {'Mode':'ro','RW':True},
+    {'Propagation':'rprivate'},
+    {'Consistency':'cached'},
+    {'Name':'bad:name'},
+    {'Destination':'relative'},
+    {'Destination':'/bad:target'},
+])
+def test_named_volume_argument_refuses_changed_or_unrepresentable_flags(change):
+    mount=named_volume();mount.update(change)
+    with pytest.raises(r.Refusal):b.volume_argument(mount)
+
+@pytest.mark.parametrize('mode,rw',[('rw',True),('ro',False)])
+def test_create_old_uses_explicit_volume_syntax_and_preserves_mode(estate,monkeypatch,mode,rw):
+    recovery=b.Recovery(estate.args);created='b'*64;record=volume_runtime(named_volume(mode,rw));creates=[]
+    recovery.doc={'format_version':1,'binding':recovery.binding,'rollback':{'stage':'stopped','created':{},'retired':[]}};journal=recovery.doc['rollback']
+    monkeypatch.setattr(recovery,'validate_runtime',lambda item:None);monkeypatch.setattr(recovery,'old_values',lambda *a:{})
+    def docker(c,*args,**kwargs):
+        if args[0]=='ps':return SimpleNamespace(stdout='')
+        if args[0]=='create':creates.append(args);return SimpleNamespace(stdout=created+'\n')
+        raise AssertionError(args)
+    monkeypatch.setattr(r,'docker',docker)
+    actual={'Id':created,'Name':'/owned-coordinator','Image':r.RUNTIME,'State':{'Running':False},'NetworkSettings':{'Networks':{'owned-primary':{}}}}
+    monkeypatch.setattr(r,'inspect',lambda *a:actual);monkeypatch.setattr(r,'previous_runtime',lambda *a:record)
+    assert recovery.create_old('coordinator',record,journal)==created
+    command=creates[0]
+    assert command[command.index('--volume')+1]=='owned-volume:/owned:'+mode and '--mount' not in command
+
+@pytest.mark.parametrize('change',[{'Mode':'z'},{'Driver':'other'},{'Source':'/different'}])
+def test_named_volume_preflight_refuses_before_old_container_deletion(estate,monkeypatch,change):
+    recovery=b.Recovery(estate.args);mount=named_volume();mount.update(change);record=volume_runtime(mount);events=[]
+    def docker(c,*args,**kwargs):
+        events.append(args)
+        if args[:2]==('image','inspect'):return SimpleNamespace(stdout=json.dumps([{'Id':r.RUNTIME}]))
+        if args[:2]==('network','inspect'):return SimpleNamespace(stdout='[]')
+        if args[:2]==('volume','inspect'):return SimpleNamespace(stdout=json.dumps([{'Name':'owned-volume','Driver':'local','Mountpoint':'/var/lib/docker/volumes/owned-volume/_data'}]))
+        pytest.fail('preflight reached container mutation: '+repr(args))
+    monkeypatch.setattr(r,'docker',docker);monkeypatch.setattr(recovery,'old_values',lambda *a:pytest.fail('read values after bad volume preflight'))
+    with pytest.raises(r.Refusal):recovery.create_old('coordinator',record,{'stage':'stopped','created':{},'retired':[]})
+    assert all(args[0] not in ('ps','rm','create','start') for args in events)
+
+
 def test_post_create_failure_journals_id_and_retry_reuses_only_that_container(estate,monkeypatch):
     recovery=b.Recovery(estate.args);created='b'*64;old='a'*64;network='owned-primary'
     record={'image_id':r.RUNTIME,'repo_tags':[],'mounts':[],'networks':{network:{'Aliases':['owned-memory'],'Links':None,'IPAMConfig':None,'DriverOpts':None}},'port_bindings':{},'restart_policy':{'Name':'no','MaximumRetryCount':0},'network_mode':network,'env_names':[],'service_identity':{'name':'/owned-memory','container_id':old,'hostname':'owned-host','user':'','working_dir':'/app','entrypoint':['/bin/sh','-c','exec "$@"','argv0'],'command':['python','-m','fleet_memory.mcp']}}

@@ -156,6 +156,17 @@ def validate_h6(result,candidate,digest,configuration_sha256):
     except (KeyError,TypeError,ValueError,AttributeError):require(False)
     return result
 
+def volume_argument(mount):
+    """Represent one saved plain named-volume mode without changing its meaning."""
+    allowed={'Type','Name','Source','Destination','Driver','Mode','RW','Propagation'}
+    q.need(set(mount)==allowed and mount.get('Type')=='volume','saved named volume identity is incomplete or carries unsupported options; reconcile it before recovery')
+    q.need(all(isinstance(mount[k],str) and mount[k] for k in ('Name','Source','Destination','Driver','Mode')),'saved named volume identity is incomplete; reconcile it before recovery')
+    q.need(re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_.-]+',mount['Name']) and mount['Source'].startswith('/') and mount['Destination'].startswith('/') and ':' not in mount['Destination'] and not any(x in mount['Source']+mount['Destination'] for x in ('\n','\r')),'saved named volume cannot be represented safely by Docker --volume; reconcile it before recovery')
+    q.need(type(mount['RW']) is bool and mount['Mode']==('rw' if mount['RW'] else 'ro'),'saved named volume mode is unsupported or contradicts RW; reconcile its exact security semantics before recovery')
+    q.need(mount['Propagation']=='','saved named volume propagation is unsupported; reconcile its exact semantics before recovery')
+    return mount['Name']+':'+mount['Destination']+':'+mount['Mode']
+
+
 class Recovery(q.Estate):
     def __init__(self,args):super().__init__(args);self.back=self.c.get('back',{})
     def allowed_images(self,service,rendered):
@@ -188,8 +199,10 @@ class Recovery(q.Estate):
             q.need(all(x.get('HostPort') and x['HostPort']!='0' for x in bindings or []),'saved runtime uses an unspecified allocated port; reconcile its exact listener before recovery')
         for m in record['mounts']:
             q.need(m['Type'] in ('bind','volume'),'previous mount type is unsupported; keep the estate stopped')
-            if m['Type']=='bind':q.stable_mount(m);r.path(m['Source'])
-            else:r.docker(self.c,'volume','inspect',m['Name'])
+            if m['Type']=='bind':q.stable_mount(m);r.path(m['Source']);continue
+            volume_argument(m)
+            found=json.loads(r.docker(self.c,'volume','inspect',m['Name']).stdout)
+            q.need(isinstance(found,list) and len(found)==1 and found[0].get('Name')==m['Name'] and found[0].get('Driver')==m['Driver'] and found[0].get('Mountpoint')==m['Source'],'saved named volume name, driver or source no longer matches Docker; keep recovery stopped and reconcile it before removing any container')
     def create_old(self,role,record,journal):
         self.validate_runtime(record);values=self.old_values(role,record);identity=record['service_identity'];name=identity['name'].lstrip('/')
         networks=[record['network_mode'],*[x for x in record['networks'] if x!=record['network_mode']]];created=journal['created'].get(role)
@@ -205,9 +218,10 @@ class Recovery(q.Estate):
         policy=record['restart_policy'];restart=policy.get('Name')
         if restart:cmd+=['--restart',restart+(':'+str(policy['MaximumRetryCount']) if restart=='on-failure' and policy.get('MaximumRetryCount') else '')]
         for m in record['mounts']:
-            text='type='+m['Type']+',src='+str(m['Source'] if m['Type']=='bind' else m['Name'])+',dst='+m['Destination']
+            if m['Type']=='volume':cmd+=['--volume',volume_argument(m)];continue
+            text='type=bind,src='+str(m['Source'])+',dst='+m['Destination']
             if not m['RW']:text+=',readonly'
-            if m['Type']=='bind' and m.get('Propagation'):text+=',bind-propagation='+m['Propagation']
+            if m.get('Propagation'):text+=',bind-propagation='+m['Propagation']
             cmd+=['--mount',text]
         for port,bindings in (record['port_bindings'] or {}).items():
             for binding in bindings or []:cmd+=['--publish',(binding.get('HostIp') or '0.0.0.0')+':'+binding['HostPort']+':'+port]
