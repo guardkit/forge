@@ -158,6 +158,18 @@ def _run_watch(
             '{"state":"connected","last_event_at":"not-a-time"}',
             id="unreadable-time",
         ),
+        pytest.param(
+            '{"state":"con\0nected","last_event_at":"2026-09-26T15:59:55Z"}',
+            id="raw-nul-in-state",
+        ),
+        pytest.param(
+            '{"state":"connected","last_event_at":"2026-09-26\0T15:59:55Z"}',
+            id="raw-nul-in-time",
+        ),
+        pytest.param(
+            '{"state":"connected","last_event_at":"2026-09-26T15:59:55Z"}\0',
+            id="raw-nul-after-document",
+        ),
         pytest.param("", id="empty-file"),
     ],
 )
@@ -304,3 +316,35 @@ def test_known_unhealthy_states_remain_lost_and_alert_once(
     assert "Slack session    lost" in done.stdout
     assert len(messages) == 1
     assert "Slack session    lost" in messages[0]
+
+
+def test_heartbeat_document_whitespace_is_valid(tmp_path: Path) -> None:
+    done, messages = _run_watch(
+        tmp_path,
+        heartbeat_body=' \n{"state":"connected","last_event_at":"2026-09-26T15:59:55Z"}\n\t',
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert messages == []
+
+
+def test_heartbeat_read_failure_refuses_complete_output(tmp_path: Path) -> None:
+    real_cat = shutil.which("cat")
+    assert real_cat is not None
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    heartbeat = tmp_path / "heartbeat.json"
+    heartbeat.write_text('{"state":"connected","last_event_at":"2026-09-26T15:59:55Z"}')
+    wrapper = fake_bin / "cat"
+    wrapper.write_text(
+        f"""#!/bin/sh
+"{real_cat}" "$@"
+status=$?
+if [ "$1" = "{heartbeat}" ]; then exit 1; fi
+exit "$status"
+"""
+    )
+    wrapper.chmod(0o755)
+    done, messages = _run_watch(tmp_path, heartbeat_path=heartbeat, jq_bin_dir=fake_bin)
+    assert done.returncode == 10, done.stdout + done.stderr
+    assert "Slack session    unknown" in done.stdout
+    assert len(messages) == 1
