@@ -32,6 +32,9 @@ def inventory(tmp_path):
         'FORGE_SANDBOX_SIDECAR_URL=http://192.0.2.10:8925',
         'FORGE_SANDBOX_RUNNER_URL=http://192.0.2.10:8924',
         'FLEET_MEMORY_ENABLED=false',
+        'SANDBOX_NAME=owned-sandbox','SANDBOX_BOOTSTRAP=/private/clone/deploy/sandbox-runner.sh',
+        'SANDBOX_PROJECT_ENV_FILE='+str(tmp_path/'operational'/'bootstrap.env'),
+        'SANDBOX_ENV_NAMES=FORGE_IMAGE FORGE_IMAGE_IDENTITY FORGE_RELEASE_VERSION FORGE_RELEASE_MANIFEST_SHA256 FORGE_TARGET_OWNER_URL '+' '.join(m.MEMORY_NAMES),
     ])+'\n')
     source = tmp_path / 'project' / 'deploy' / 'profile.yaml'
     source.parent.mkdir(parents=True)
@@ -56,7 +59,7 @@ custom_choice:
         'sandbox':{'name':'owned-sandbox','clone_path':'/private/clone',
             'known_files':['known.txt'],'receipts_path':'/private/receipts',
             'script_path':'/private/clone/deploy/sandbox-runner.sh',
-            'profile_path':'/private/clone/deploy/profile.yaml','profile_source':str(source),
+            'profile_path':'/private/clone/deploy/profile.yaml','profile_source':str(source),'bootstrap_env_file':str(tmp_path/'operational'/'bootstrap.env'),
             'systemd_user_dir':str(tmp_path/'units'),'evidence_dir':str(tmp_path/'evidence'),
             'remote_ref':'origin/main','remote_name':'origin','declared_remote':'https://example.invalid/project.git','declaration_files':['README.md'],'release_image':'forge:fixture','expected_sbx_version':'v0.42.1',
             'legacy_dropins':[], 'legacy_command_markers':['legacy-bootstrap.sh','old-sidecar','old-runner'],
@@ -212,6 +215,10 @@ def test_success_order_exact_template_and_repeat(inventory,monkeypatch):
     assert handoff['env']['FORGE_IMAGE']=='forge:fixture'
     installed=json.loads((Path(config['sandbox']['evidence_dir'])/'sandbox-installed.json').read_text())
     assert installed['actual_memory_read_write']=='NOT-TESTED'
+    runtime_env=Path(config['sandbox']['bootstrap_env_file'])
+    assert runtime_env.stat().st_mode & 0o777==0o600
+    assert 'FORGE_IMAGE="forge:fixture"' in runtime_env.read_text()
+    assert installed['bootstrap_env_file']==str(runtime_env)
     b.calls.clear()
     assert m.main(args)==0
     assert not any(x[:2]==['sbx','stop'] for x in b.argv())
@@ -310,3 +317,52 @@ def test_staging_failure_replaces_neither_file(tmp_path):
     assert r.returncode!=0
     assert first.read_text()=='original'
     assert not list(tmp_path.glob('.rollout-*'))
+
+
+
+def test_documented_env_routes_expand_without_ambient_input(inventory,monkeypatch):
+    config,path,args=inventory
+    env=Path(config['env_file'])
+    text=env.read_text().replace('http://192.0.2.10:8900','http://${FACTORY_GATEWAY_ADDRESS}:${FORGE_ANSWER_PORT}/recorded')
+    text=text.replace('http://192.0.2.10:8925','http://${FACTORY_GATEWAY_ADDRESS}:${FORGE_SANDBOX_SIDECAR_PORT}')
+    text += 'FORGE_ANSWER_PORT=8900\nFORGE_SANDBOX_SIDECAR_PORT=8925\nEXTRA_MULTIWORD=FIRST SECOND THIRD\nROLLOUT_BUS_CONSUMERS=forge-serve forge-serve-planning\nPRIVATE_REF=${PRIVATE_VALUE}\n'
+    env.write_text(text)
+    private=env.parent/'secrets.env';private.write_text('PRIVATE_VALUE=private-canary\n');private.chmod(0o600)
+    monkeypatch.setenv('FACTORY_GATEWAY_ADDRESS','203.0.113.99')
+    b=Boundary(config,monkeypatch)
+    assert m.main([*args,'--secret-env-file',str(private)])==0
+    assert any('http://192.0.2.10:8900/recorded' in x for x in b.argv())
+    values=m.load_env(env,[private])
+    assert values['EXTRA_MULTIWORD']=='FIRST SECOND THIRD'
+    assert values['ROLLOUT_BUS_CONSUMERS']=='forge-serve forge-serve-planning'
+    assert all('private-canary' not in p.read_text() for p in Path(config['sandbox']['evidence_dir']).glob('*') if p.is_file())
+
+
+@pytest.mark.parametrize('extra',['CYCLE_A=${CYCLE_B}\nCYCLE_B=${CYCLE_A}\n','MISSING=${ABSENT_NAME}\n','DEFAULT=${NAME:-unsafe}\n'])
+def test_env_cycles_unset_and_shell_default_refuse(inventory,monkeypatch,extra):
+    config,path,args=inventory
+    with Path(config['env_file']).open('a') as f:f.write(extra)
+    monkeypatch.setattr(m.subprocess,'run',lambda *a,**k:pytest.fail('external call before env validation'))
+    assert m.main(args)==2
+
+
+def test_private_env_cannot_override_public_authority(inventory,monkeypatch):
+    config,path,args=inventory
+    private=Path(config['env_file']).with_name('secrets.env')
+    private.write_text('FACTORY_GATEWAY_ADDRESS=203.0.113.99\n');private.chmod(0o600)
+    monkeypatch.setattr(m.subprocess,'run',lambda *a,**k:pytest.fail('external call before env validation'))
+    assert m.main([*args,'--secret-env-file',str(private)])==2
+
+
+
+def test_normal_runner_private_values_are_not_evidence(inventory,monkeypatch):
+    config,path,args=inventory
+    env=Path(config['env_file'])
+    with env.open('a') as f:f.write('FLEET_MEMORY_PG_DSN=${PRIVATE_DSN}\n')
+    private=env.parent/'secrets.env';private.write_text('PRIVATE_DSN=postgres://fixture:private-canary@example.invalid/db\n');private.chmod(0o600)
+    b=Boundary(config,monkeypatch)
+    assert m.main([*args,'--secret-env-file',str(private)])==0
+    runtime=Path(config['sandbox']['bootstrap_env_file'])
+    assert 'private-canary' in runtime.read_text()
+    assert runtime.stat().st_mode & 0o777==0o600
+    assert all('private-canary' not in p.read_text() for p in Path(config['sandbox']['evidence_dir']).glob('*') if p.is_file())
