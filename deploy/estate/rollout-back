@@ -386,9 +386,9 @@ p=pathlib.Path('/out/current.db');print(json.dumps({'sha256':hashlib.sha256(p.re
             endpoint=json.loads(r.run(['docker','context','inspect','default']).stdout)
             q.need(isinstance(endpoint,list) and len(endpoint)==1 and endpoint[0].get('Endpoints',{}).get('docker',{}).get('Host')=='unix:///var/run/docker.sock','default Docker context does not select the qualified local endpoint; remain stopped')
             policy=q.load_script('publisher-host-policy')
-            policy.validate_declared(model,policy.binding(self.c['project']))
+            policy.validate_declared(model,policy.binding(self.c['project']),r.path(candidate_values['FORGE_PUBLISHER_SETTINGS_FILE']))
             policy_env={'PATH':os.environ.get('PATH','/usr/sbin:/usr/bin:/sbin:/bin'),'DOCKER_HOST':'unix:///var/run/docker.sock'}
-            r.run(['sudo','--',HERE/ 'publisher-host-policy','verify','--docker-host',policy_env['DOCKER_HOST'],'--env-file',r.path(self.args.candidate_env_file),'--project',self.c['project']],env=policy_env)
+            r.run(['sudo','--',Path('/usr/local/libexec/forge-publisher-host-policy'),'verify','--docker-host',policy_env['DOCKER_HOST'],'--env-file',r.path(self.args.candidate_env_file),'--project',self.c['project'],'--daemon-id',r.docker(self.c,'info','--format','{{.ID}}',env=clean).stdout.strip()],env=policy_env)
             r.docker(self.c,*cmd,'up','--no-deps','-d','memory','memory-relay','forge-publisher','answer-service','coordinator',env=clean)
             result['status']='compatible-current-release-started-with-admissions-closed';result['configuration'].update(env_file=self.args.candidate_env_file,candidate_override=str(override),candidate_override_sha256=r.sha256(override))
         except Exception:

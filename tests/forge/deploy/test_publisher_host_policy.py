@@ -4,6 +4,7 @@ import importlib.machinery
 import importlib.util
 import json
 import copy
+import tempfile
 import os
 from types import SimpleNamespace
 from pathlib import Path
@@ -302,9 +303,11 @@ def test_config_trust_refuses_foreign_paths(tmp_path, kind):
     with pytest.raises(m.Refusal):m.load_config(path)
 
 
-def declared_model(m,project="chosen-project"):
+def declared_model(m,project="chosen-project", settings=None):
     b=m.binding(project)
-    return {"name":project,"networks":{"forge-publisher-net":{"name":b["network"],"driver":"bridge","enable_ipv6":False,"driver_opts":{"com.docker.network.bridge.name":b["bridge"]}}},"services":{"coordinator":{"networks":{"factory":{},"forge-publisher-net":{}},"environment":{"FORGE_PUBLISHER_URL":"http://forge-publisher:8711"}},"forge-publisher":{"networks":{"forge-publisher-net":{}},"healthcheck":{"test":["CMD","curl","http://localhost:8711/healthz"]}}}}
+    if settings is None:
+        handle=tempfile.NamedTemporaryFile(delete=False);handle.write(b'{"host":"0.0.0.0","port":8711}');handle.close();settings=Path(handle.name)
+    return {"name":project,"networks":{"forge-publisher-net":{"name":b["network"],"driver":"bridge","enable_ipv6":False,"driver_opts":{"com.docker.network.bridge.name":b["bridge"]}}},"services":{"coordinator":{"networks":{"factory":{},"forge-publisher-net":{}},"environment":{"FORGE_PUBLISHER_URL":"http://forge-publisher:8711"}},"forge-publisher":{"volumes":[{"type":"bind","source":str(settings),"target":"/etc/forge-publisher/settings.json","read_only":True}],"networks":{"forge-publisher-net":{}},"healthcheck":{"test":["CMD","curl","http://localhost:8711/healthz"]}}}}
 
 
 @pytest.mark.parametrize("change", [lambda d:d.update(name="wrong-project"),lambda d:d["services"]["forge-publisher"].update(ports=["8711:8711"]),lambda d:d["networks"]["forge-publisher-net"]["driver_opts"].clear(),lambda d:d["networks"]["forge-publisher-net"].update(enable_ipv6=True)])
@@ -323,6 +326,9 @@ def installed_paths(m, monkeypatch, tmp_path):
     monkeypatch.setattr(m, 'lock', lambda bound: open(tmp_path/'lock','a'))
     monkeypatch.setattr(m, 'daemon_identity', lambda host:'daemon')
     monkeypatch.setattr(m, 'clean_docker_env', lambda host:{})
+    monkeypatch.setattr(m, 'systemd_paths', lambda:[m.UNIT.parent])
+    monkeypatch.setattr(m, 'loader_effective', lambda *a,**kw:None)
+    monkeypatch.setattr(m, 'verify_docker_dependency', lambda *a:None)
 
 
 @pytest.mark.parametrize('collision', ['config', 'helper', 'unit', 'dropin', 'table'])
@@ -409,3 +415,56 @@ def test_install_requires_stopped_publisher_even_with_owned_previous_policy(monk
     monkeypatch.setattr(m,"docker_json",lambda *a:[{"State":{"Running":True}}])
     monkeypatch.setattr(m,"atomic_write",lambda *a,**kw:pytest.fail("wrote while publisher running"))
     with pytest.raises(m.Refusal,match="stopped"):m.cmd_install(SimpleNamespace(project=b["project"],env_file=tmp_path/"env",docker_host=m.DOCKER_HOST,runtime_only=True))
+
+@pytest.mark.parametrize('collision',['instance','template-dropin','instance-dropin','prefix-dropin','type-dropin','alias','alternate-template'])
+def test_effective_loader_files_refuse_all_override_locations(tmp_path,collision):
+    m=load_helper();m.UNIT=tmp_path/'owned'/'forge-publisher-host-policy@.service';m.UNIT.parent.mkdir();m.UNIT.write_bytes(m.unit_bytes());b=m.binding('chosen-project')
+    alternate=tmp_path/'alternate';alternate.mkdir();instance=f"forge-publisher-host-policy@{b['suffix']}.service"
+    names={'instance':instance,'template-dropin':m.UNIT.name+'.d/override.conf','instance-dropin':instance+'.d/override.conf','prefix-dropin':'forge-publisher-.service.d/override.conf','type-dropin':'service.d/override.conf','alternate-template':m.UNIT.name}
+    if collision=='alias':(alternate/'other@.service').symlink_to(m.UNIT)
+    else:
+        path=alternate/names[collision];path.parent.mkdir(parents=True,exist_ok=True);path.write_text('[Service]\nExecStart=/bin/true\n')
+    with pytest.raises(m.Refusal):m.loader_files_preflight(b,[m.UNIT.parent,alternate])
+
+
+@pytest.mark.parametrize('changed',['none','argv','alias','dropin','fragment','requires','after'])
+def test_effective_loader_and_docker_dependency_are_read_back(monkeypatch,changed):
+    m=load_helper();b=m.binding('chosen-project');name=f"forge-publisher-host-policy@{b['suffix']}.service"
+    properties={'Id':name,'Names':name,'FragmentPath':str(m.UNIT),'DropInPaths':'','LoadState':'loaded','Type':'oneshot','RemainAfterExit':'yes','ExecStart':f"{{ path={m.HELPER} ; argv[]={m.HELPER} load-static --config {m.CONFIG_DIR}/{b['suffix']}.json ; ignore_errors=no ; }}"}
+    dependencies={'Requires':name,'After':name}
+    if changed=='argv':properties['ExecStart']='{ path=/bin/true ; argv[]=/bin/true ; }'
+    if changed=='alias':properties['Names']+=' alias.service'
+    if changed=='dropin':properties['DropInPaths']='/run/foreign.conf'
+    if changed=='fragment':properties['FragmentPath']='/run/foreign.service'
+    if changed in ('requires','after'):dependencies[changed.title()]=''
+    calls=[]
+    def run(argv,**kw):
+        calls.append(argv);assert argv[:2]==['systemctl','show']
+        data=dependencies if argv[2]=='docker.service' else properties
+        return SimpleNamespace(stdout='\n'.join(k+'='+v for k,v in data.items()),returncode=0)
+    monkeypatch.setattr(m,'run',run)
+    if changed=='none':m.loader_effective(b,installed=True);m.verify_docker_dependency(b)
+    else:
+        with pytest.raises(m.Refusal):m.loader_effective(b,installed=True);m.verify_docker_dependency(b)
+    assert calls and all(c[1]=='show' for c in calls)
+
+
+def test_runtime_only_installs_narrow_verifier_without_boot_dependency(monkeypatch,tmp_path):
+    m=load_helper();installed_paths(m,monkeypatch,tmp_path);m.HELPER.unlink();m.UNIT.unlink();b=m.binding('chosen-project')
+    monkeypatch.setattr(m,'validate_env',lambda *a:None);monkeypatch.setattr(m,'inspect_topology',lambda *a,**k:{'members':{},'network_id':''});monkeypatch.setattr(m,'nft_json',lambda table:None)
+    monkeypatch.setattr(m,'apply_policy',lambda *a:None);monkeypatch.setattr(m,'run',lambda *a,**k:pytest.fail('runtime-only install called systemd'))
+    m.cmd_install(SimpleNamespace(project=b['project'],env_file=tmp_path/'env',docker_host=m.DOCKER_HOST,runtime_only=True))
+    assert m.HELPER.read_bytes()==HELPER.read_bytes() and not m.UNIT.exists() and not list(m.DROPIN_DIR.iterdir())
+
+
+@pytest.mark.parametrize('changed',['none','source','bytes','writable'])
+def test_running_publisher_settings_identity_is_checked(monkeypatch,tmp_path,changed):
+    m=load_helper();settings=tmp_path/'settings.json';settings.write_text('{"host":"0.0.0.0","port":8711}')
+    container={'Mounts':[{'Type':'bind','Source':str(settings) if changed!='source' else str(tmp_path/'other.json'),'Destination':'/etc/forge-publisher/settings.json','RW':changed=='writable'}],'State':{'Running':True}}
+    monkeypatch.setattr(m,'docker_json',lambda *a:[container]);monkeypatch.setattr(m,'clean_docker_env',lambda host:{})
+    identity=m.settings_identity(settings)
+    if changed=='bytes':identity['sha256']='0'*64
+    monkeypatch.setattr(m,'run',lambda *a,**k:SimpleNamespace(stdout=json.dumps(identity)))
+    if changed=='none':m.verify_publisher_settings(m.DOCKER_HOST,'owned',settings)
+    else:
+        with pytest.raises(m.Refusal):m.verify_publisher_settings(m.DOCKER_HOST,'owned',settings)

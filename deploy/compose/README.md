@@ -149,9 +149,10 @@ There is one declared network, `factory`. It replaces the host network the
 coordinator runs on today.
 
 - The **coordinator** is on `factory` *and* on the publisher's own network. It
-  is the only thing that is on both, and that is the entire route to the
-  publisher: nothing else on `factory` can reach it, and neither can anything
-  on this machine, because the publisher publishes no port.
+  is the only service on both networks. Ordinary host access is blocked by the
+  required project-bound publisher OUTPUT policy; publishing no port alone does
+  not prevent host access to the bridge address. Forwarded, sandbox and LAN
+  origins still require the separate runtime qualification described by the estate.
 - The **answer service** is on `factory` only.
 - The **publisher** is on its own network only.
 

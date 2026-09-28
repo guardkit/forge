@@ -318,6 +318,15 @@ class Estate:
             self.values={k:re.sub(r'\$\{([A-Za-z_][A-Za-z0-9_]*)\}',lambda m:self.values.get(m[1],m[0]),v) for k,v in self.values.items()}
         need(self.values.get('FORGE_IMAGE')==self.c['runtime_image'],'public env selects another runtime image; select the reviewed phase env')
         self.env={k:v for k,v in os.environ.items() if k in ('PATH','HOME','DOCKER_CONFIG','XDG_RUNTIME_DIR')};self.env.update(self.values)
+        # The existing local inventory context has a fixed endpoint. Carry this
+        # non-secret binding to estate-check; other inventory contexts retain
+        # their original environment and remain outside publisher qualification.
+        if self.c['docker_context']=='default':
+            need(not any(self.env.get(k) for k in ('DOCKER_CONTEXT','DOCKER_TLS_VERIFY','DOCKER_CERT_PATH')),'public/private env overrides the local Docker identity; remove the conflicting endpoint settings')
+            need(self.env.get('DOCKER_HOST','unix:///var/run/docker.sock')=='unix:///var/run/docker.sock','inventory default context conflicts with public Docker endpoint')
+            self.env['DOCKER_HOST']='unix:///var/run/docker.sock'
+            self.env['FORGE_PUBLISHER_DOCKER_CONTEXT']='default'
+
         self.binding={k:self.c[k] for k in ('project','docker_context','runtime_image','source_db','snapshot_root','units','old_containers','volumes')}
         self.binding['sources']={k:v for k,v in self.c['sources'].items() if k!='settings'}
         self.binding['phases']={k:self.q[k] for k in ('original_env_file','original_settings','prepared_env_file','prepared_settings','settings_receipt')}
@@ -629,6 +638,7 @@ print('planning switch read back')
         self.watch_closed(required=True)
         self.producers_stopped();counts=self.monitor();quiet_counts(counts)
         r.load_volumes(self.c,self.snapshot,verify=True)
+        need(self.c['docker_context']=='default','publisher resume requires the supported local default Docker context')
         r.run([HERE/'estate-check','--read-pre-resume','--env-file',self.args.env_file,'--project',self.c['project'],'--for-image',self.c['runtime_image']],env=self.env)
         need(self.values.get('ROLLOUT_STATE_DIR')==str(self.snapshot),'pre-resume receipt is not in this snapshot; bind ROLLOUT_STATE_DIR before resuming')
         state=self.current_state();need(not work_problems(state),'current record has active work before resume; keep admissions closed')

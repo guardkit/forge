@@ -30,11 +30,15 @@ def probe(tmp_path: Path):
         tools / "docker",
         r"""#!/usr/bin/env python3
 import os, sys, json, hashlib
-args=sys.argv[1:]; text=' '.join(args); mode=os.environ.get('PROBE_CASE','good')
-if args[0]=='compose':
+args=sys.argv[1:]
+if args[:1]==['--host']: args=args[2:]
+text=' '.join(args); mode=os.environ.get('PROBE_CASE','good')
+if args[0]=='info': print('fixture')
+elif args[:2]==['context','inspect']:print(json.dumps([{'Endpoints':{'docker':{'Host':'unix:///var/run/docker.sock'}}}]))
+elif args[0]=='compose':
     if 'config' in args:
         project='codex-review'; bridge='fpb'+hashlib.sha256(project.encode()).hexdigest()[:12]
-        print(json.dumps({'name':project,'networks':{'forge-publisher-net':{'name':project+'_forge-publisher-net','driver':'bridge','enable_ipv6':False,'driver_opts':{'com.docker.network.bridge.name':bridge}}},'services':{'coordinator':{'networks':{'factory':{},'forge-publisher-net':{}},'environment':{'FORGE_PUBLISHER_URL':'http://forge-publisher:8711'}},'forge-publisher':{'networks':{'forge-publisher-net':{}},'healthcheck':{'test':['CMD','curl','http://localhost:8711/healthz']}}}}))
+        print(json.dumps({'name':project,'networks':{'forge-publisher-net':{'name':project+'_forge-publisher-net','driver':'bridge','enable_ipv6':False,'driver_opts':{'com.docker.network.bridge.name':bridge}}},'services':{'coordinator':{'networks':{'factory':{},'forge-publisher-net':{}},'environment':{'FORGE_PUBLISHER_URL':'http://forge-publisher:8711'}},'forge-publisher':{'volumes':[{'type':'bind','source':os.environ['REVIEW_SETTINGS_FILE'],'target':'/etc/forge-publisher/settings.json','read_only':True}],'networks':{'forge-publisher-net':{}},'healthcheck':{'test':['CMD','curl','http://localhost:8711/healthz']}}}}))
         raise SystemExit(0)
     service=args[-1]
     if service in ('coordinator','answer-service','memory-relay','forge-publisher'): print(service)
@@ -63,7 +67,7 @@ else: raise SystemExit(1)
     _executable(tools / "sudo", r"""#!/usr/bin/env python3
 import os, sys, pathlib
 assert os.getuid()==1000, 'must exercise ordinary operator sudo caller'
-a=sys.argv[1:]; assert a[0]=='--' and a[1].endswith('/publisher-host-policy') and a[2]=='verify'
+a=sys.argv[1:]; assert a[0]=='--' and a[1]=='/usr/local/libexec/forge-publisher-host-policy' and a[2]=='verify'
 assert a[a.index('--docker-host')+1]=='unix:///var/run/docker.sock'
 assert a[a.index('--project')+1]=='codex-review'
 assert '--require-members' in a
@@ -76,6 +80,8 @@ print('VERIFIED daemon=fixture bridge=fixture drop_packets='+str(n)+' drop_bytes
     _executable(tools / "curl", "#!/bin/sh\nprintf '000'\nexit 28\n")
     state = tmp_path / "state"
     state.mkdir()
+    settings_file = tmp_path / "publisher.json"
+    settings_file.write_text('{"host":"0.0.0.0","port":8711}')
     env_file = tmp_path / "probe.env"
     env_file.write_text(
         f"""BUS_MODE=external
@@ -90,7 +96,9 @@ NATS_PROVISION_IMAGE=mocked-not-executed
 BUS_SOURCE_VOLUME=mocked-not-mounted
 FLEET_MEMORY_URL=http://mock-memory
 MODEL_SEAT_URL=http://mock-model
-FORGE_PUBLISHER_URL=http://publisher
+FORGE_PUBLISHER_URL=http://forge-publisher:8711
+FORGE_PUBLISHER_BRIDGE=fpb{__import__('hashlib').sha256(b'codex-review').hexdigest()[:12]}
+FORGE_PUBLISHER_SETTINGS_FILE={settings_file}
 SANDBOX_NAME=codex-owned-fake-sandbox
 FACTORY_GATEWAY_ADDRESS=127.0.0.1
 FORGE_ANSWER_PORT=8126
@@ -101,6 +109,7 @@ COMPOSE_FILE=compose.yaml:compose.external-bus.yaml
     env = os.environ.copy()
     env["PATH"] = f"{tools}:{env['PATH']}"
     env["REVIEW_IMAGE"] = IMAGE
+    env["REVIEW_SETTINGS_FILE"] = str(settings_file)
     env["DOCKER_HOST"] = "unix:///var/run/docker.sock"
     for key in ("DOCKER_CONTEXT", "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH"): env.pop(key, None)
 
