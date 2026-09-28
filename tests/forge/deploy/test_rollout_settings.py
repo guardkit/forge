@@ -7,6 +7,7 @@ real ``forge.config.loader``. A separate operational receipt exercises real Comp
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import subprocess
 import sys
@@ -73,6 +74,7 @@ def scenario(tmp_path: Path):
         "FORGE_SANDBOX_RUNNER_URL": "http://${FACTORY_GATEWAY_ADDRESS}:${FORGE_SANDBOX_RUNNER_PORT}",
         "FORGE_AUTOBUILD_RUNNER_URL": "${FORGE_SANDBOX_RUNNER_URL}",
         "FORGE_PUBLISHER_URL": "http://forge-publisher:8711",
+        "FORGE_PUBLISHER_BRIDGE": "fpb" + hashlib.sha256(b"codex-settings-build-20260927").hexdigest()[:12],
         "FORGE_ANSWER_PORT": "18126",
         "FORGE_TARGET_OWNER_URL": "http://${FACTORY_GATEWAY_ADDRESS}:${FORGE_ANSWER_PORT}/recorded",
         "FORGE_NATS_URL": "nats://forge:${FORGE_NATS_PASSWORD}@bus:14222",
@@ -132,6 +134,7 @@ def scenario(tmp_path: Path):
         encoding="utf-8",
     )
     compose = {
+        "networks": {"forge-publisher-net": {"driver": "bridge", "enable_ipv6": False, "driver_opts": {"com.docker.network.bridge.name": public_values["FORGE_PUBLISHER_BRIDGE"]}}},
         "services": {
             "coordinator": {
                 "image": IMAGE,
@@ -153,6 +156,7 @@ def scenario(tmp_path: Path):
             },
             "forge-publisher": {
                 "image": IMAGE,
+                "healthcheck": {"test": ["CMD", "curl", "-f", "http://localhost:8711/healthz"]},
                 "networks": {"forge-publisher-net": None},
                 "volumes": [{"type": "volume", "source": "ledger", "target": "/var/lib/forge"}],
             },
@@ -1257,4 +1261,16 @@ runpy.run_path(script, run_name="__main__")
     assert "no partial output" not in result.stderr
     assert scenario["outputs"]["env"].is_file()
     assert not scenario["outputs"]["settings"].exists()
+    assert not scenario["outputs"]["receipt"].exists()
+
+
+@pytest.mark.parametrize("bridge", [None, "fpb000000000000"])
+def test_missing_or_wrong_project_bridge_refuses(scenario, bridge):
+    path = scenario["env_file"]
+    lines = [line for line in path.read_text().splitlines() if not line.startswith("FORGE_PUBLISHER_BRIDGE=")]
+    if bridge is not None: lines.append("FORGE_PUBLISHER_BRIDGE=" + bridge)
+    path.write_text("\n".join(lines) + "\n")
+    result = run(scenario)
+    assert result.returncode != 0
+    assert "FORGE_PUBLISHER_BRIDGE" in result.stderr
     assert not scenario["outputs"]["receipt"].exists()

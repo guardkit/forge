@@ -968,3 +968,55 @@ def test_canonical_planning_approval_reference_variants_are_history(tmp_path,bui
     row['pending_approval_request_id']=derive_request_id(
         build_id=build_id,stage_label=stage,attempt_count=2)
     assert q.work_problems(state)==[]
+
+
+@pytest.mark.parametrize('policy_case',['missing','changed'])
+def test_actual_back_after_refuses_current_policy_before_up(estate,monkeypatch,policy_case):
+    from .test_publisher_host_policy import load_helper, declared_model
+    recovery=b.Recovery(estate.args);recovery.phase='prepared';candidate='sha256:'+'1'*64
+    estate.args.candidate_image=candidate
+    candidate_env=estate.receipt.parent/'candidate.env';candidate_env.write_text(Path(estate.args.env_file).read_text().replace(r.RUNTIME,candidate));estate.args.candidate_env_file=str(candidate_env)
+    monkeypatch.setattr(recovery,'markers',lambda:{'fixture':'resumed'})
+    for name in ('record','close','settle','final','remove_current'):monkeypatch.setattr(recovery,name,lambda:None)
+    monkeypatch.setattr(recovery,'planning',lambda enabled:None);monkeypatch.setattr(recovery,'h6',lambda *a:{'passed':True})
+    model=declared_model(load_helper(),estate.c['project']);model['services']['coordinator']['image']=candidate;model['services']['answer-service']={'image':candidate}
+    calls=[]
+    def docker(c,*args,**kw):
+        calls.append(args)
+        assert 'up' not in args,'started after policy refusal'
+        return SimpleNamespace(stdout=json.dumps(model) if 'config' in args else '')
+    def run(argv,**kw):
+        if argv[:3]==['docker','context','inspect']:return SimpleNamespace(stdout=json.dumps([{'Endpoints':{'docker':{'Host':'unix:///var/run/docker.sock'}}}]))
+        assert str(argv[2]).endswith('publisher-host-policy') and argv[3]=='verify'
+        raise r.Refusal('current kernel policy '+policy_case)
+    monkeypatch.setattr(r,'docker',docker);monkeypatch.setattr(r,'run',run)
+    monkeypatch.setenv('DOCKER_HOST','unix:///var/run/docker.sock')
+    with pytest.raises(r.Refusal,match='current kernel policy '+policy_case):recovery.after()
+    assert r.read_json(recovery.snapshot/'rollback-reconciliation.json')['status']=='stopped-incompatible-or-unknown'
+
+
+from .test_rollout_closed_door_receipts import probe
+
+
+@pytest.mark.parametrize('policy_case',['missing','changed'])
+def test_resume_consumes_real_old_receipt_and_stops_before_markers(estate,probe,monkeypatch,policy_case):
+    run_probe,state,env_file,process_env=probe
+    assert run_probe().returncode==0
+    estate.phase='prepared';estate.doc={'format_version':1,'binding':estate.binding,'stage':'final'};estate.save()
+    monkeypatch.setattr(estate,'markers',lambda:None);monkeypatch.setattr(estate,'record',lambda:estate.doc)
+    monkeypatch.setattr(estate,'prepared_settings',lambda:None);monkeypatch.setattr(estate,'unit',lambda n:{})
+    monkeypatch.setattr(estate,'watch_closed',lambda **kw:None);monkeypatch.setattr(estate,'producers_stopped',lambda:None)
+    monkeypatch.setattr(estate,'monitor',lambda:q.reader_counts(monitor()));monkeypatch.setattr(r,'load_volumes',lambda *a,**kw:None)
+    monkeypatch.setattr(estate,'volume',lambda *a,**kw:pytest.fail('ledger marker written after policy loss'))
+    monkeypatch.setattr(estate,'planning',lambda *a,**kw:pytest.fail('planning enabled after policy loss'))
+    monkeypatch.setattr(r,'docker',lambda *a,**kw:SimpleNamespace(stdout=json.dumps([{'Id':r.RUNTIME}])))
+    actual_run=r.run
+    def reader(argv,**kw):
+        assert str(argv[0]).endswith('estate-check') and '--read-pre-resume' in argv
+        # Run the same actual reader with the pre-existing fixture estate binding.
+        command=[str(argv[0]),'--read-pre-resume','--env-file',str(env_file),'--project','codex-review']
+        return actual_run(command,env=process_env|{'POLICY_CASE':policy_case})
+    monkeypatch.setattr(r,'run',reader)
+    with pytest.raises(r.Refusal):estate.resume()
+    assert not (estate.snapshot/'resumed.json').exists()
+    assert (state/'pre-resume.json').exists()

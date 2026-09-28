@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import os
+import hashlib
 import re
 import shutil
 import socket
@@ -105,6 +106,7 @@ def _render(*extra: str, profiles: str | None = None) -> subprocess.CompletedPro
         for name in _ONLY_THESE_ARE_INHERITED
         if name in os.environ
     }
+    bare["FORGE_PUBLISHER_BRIDGE"] = "fpb" + hashlib.sha256(b"forge-estate-bundle-check").hexdigest()[:12]
     if profiles is not None:
         bare["COMPOSE_PROFILES"] = profiles
     return subprocess.run(

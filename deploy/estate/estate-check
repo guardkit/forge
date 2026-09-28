@@ -244,10 +244,16 @@ ask_the_bus_from() {
 # ---------------------------------------------------------------------------
 POLICY_SAID=""
 publisher_policy_verify() {
-    local members="${1:-}" command=("${HERE}/publisher-host-policy" verify --docker-host "${DOCKER_HOST:-}" --env-file "${ENV_FILE}" --project "${PROJECT}")
-    [ -n "${PROJECT}" ] || { POLICY_SAID="an explicit Compose project is required"; return 1; }
+    local members="${1:-}" rendered resolved
     [ "${DOCKER_HOST:-}" = "unix:///var/run/docker.sock" ] || { POLICY_SAID="DOCKER_HOST must explicitly name unix:///var/run/docker.sock"; return 1; }
     [[ "${ENV_FILE}" = /* ]] || { POLICY_SAID="the estate env path must be absolute"; return 1; }
+    [ -z "${DOCKER_CONTEXT:-}${DOCKER_TLS_VERIFY:-}${DOCKER_CERT_PATH:-}" ] || { POLICY_SAID="Docker context/TLS overrides are not qualified; unset them"; return 1; }
+    rendered="$(dc config --format json 2>/dev/null)" || { POLICY_SAID="the selected estate graph cannot be rendered"; return 1; }
+    resolved="$(printf '%s' "${rendered}" | python3 -c 'import json,sys; m=json.load(sys.stdin); n=m.get("name"); assert isinstance(n,str) and n; print(n)' 2>/dev/null)" || { POLICY_SAID="the effective Compose project is unreadable"; return 1; }
+    [ -z "${PROJECT}" ] || [ "${PROJECT}" = "${resolved}" ] || { POLICY_SAID="rendered and requested Compose projects differ"; return 1; }
+    PROJECT="${resolved}"
+    POLICY_SAID="$(printf '%s' "${rendered}" | "${HERE}/publisher-host-policy" describe --project "${PROJECT}" --compose-stdin 2>&1)" || return 1
+    local command=("${HERE}/publisher-host-policy" verify --docker-host "${DOCKER_HOST}" --env-file "${ENV_FILE}" --project "${PROJECT}")
     [ -z "${members}" ] || command+=(--require-members)
     if [ "${EUID}" -eq 0 ]; then
         POLICY_SAID="$("${command[@]}" 2>&1)"

@@ -31,6 +31,7 @@ project's layout: it reads one rendered compose document.
 from __future__ import annotations
 
 import os
+import hashlib
 import re
 import shutil
 import socket
@@ -81,6 +82,7 @@ def _rendered(*files: str) -> str:
         for name in _ONLY_THESE_ARE_INHERITED
         if name in os.environ
     }
+    bare["FORGE_PUBLISHER_BRIDGE"] = "fpb" + hashlib.sha256(b"forge-compose-bundle-check").hexdigest()[:12]
     chosen: list[str] = []
     for name in files or ("compose.yaml",):
         chosen += ["--file", name]
@@ -331,6 +333,6 @@ class TestTheExampleNamesTheReleaseThatExists:
     def test_the_compose_files_example_tag_names_it_too(self) -> None:
         version = self._version()
         compose = (BUNDLE / "compose.yaml").read_text()
-        assert f"FORGE_IMAGE=forge:{version}" in compose, (
+        assert "supported standalone up route. Follow ../estate/README.md" in compose and f"FORGE_IMAGE=forge:{version}" in (BUNDLE / ".env.example").read_text(), (
             f"compose.yaml's example tag does not name release {version}"
         )
