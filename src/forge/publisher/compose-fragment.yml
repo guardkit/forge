@@ -12,10 +12,9 @@
 #      record and writes nothing to it, ever. Why the folder and not the one
 #      file is written out below, where it is mounted;
 #   3. the publisher listens on every address INSIDE this container and
-#      publishes NO port. What can reach it is exactly what is on its network,
-#      and its network has the coordinator on it and nothing else. Why, and
-#      why the other two ways of doing this do not work, is written out below,
-#      where the network is declared;
+#      publishes NO port. Its network has the coordinator on it and nothing
+#      else. The required host OUTPUT policy also blocks ordinary host clients
+#      on the stable bridge; network membership alone does not block the host;
 #   4. it has no docker socket, no project checkout and no deploy step. It
 #      cannot build anything and cannot run a project's own program;
 #   5. the project's copy is reached through a READ-ONLY git address — the
@@ -74,9 +73,8 @@ services:
     #     and the condition "no sandbox can reach the publisher" is false;
     #   * IT LISTENS ON EVERY ADDRESS INSIDE ITS CONTAINER, NO PORT IS
     #     PUBLISHED, AND IT IS ON A NETWORK OF ITS OWN THAT ONLY THE
-    #     COORDINATOR SHARES. Then the set of things that can reach it is the
-    #     set of things on that network, which is one thing, and it is not
-    #     reachable from the host at all. That is what is written below.
+    #     COORDINATOR SHARES. The required publisher-host-policy then blocks
+    #     ordinary host traffic to port 8711 on this network's stable bridge.
     #
     # NO ``ports:`` KEY. Its absence is the point and it is said here so that
     # nobody adds one back as a convenience: a published port would put the
@@ -164,6 +162,9 @@ networks:
   # not made here, and that question is asked again after it is made.
   forge-publisher-net:
     driver: bridge
+    enable_ipv6: false
+    driver_opts:
+      com.docker.network.bridge.name: ${FORGE_PUBLISHER_BRIDGE:?derive the publisher bridge from the explicit Compose project with deploy/estate/publisher-host-policy describe}
 
 volumes:
   forge-publisher-state:

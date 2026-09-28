@@ -1,0 +1,480 @@
+#!/usr/bin/env python3
+"""Own the one nftables policy that blocks host access to the publisher.
+
+The policy is deliberately fixed.  Project identity selects its names; callers
+cannot supply rules, ports, interfaces, paths, or arbitrary Docker endpoints.
+"""
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from typing import Any
+
+PORT = 8711
+DOCKER_HOST = "unix:///var/run/docker.sock"
+CONFIG_DIR = Path("/etc/forge-publisher-policy")
+HELPER = Path("/usr/local/libexec/forge-publisher-host-policy")
+UNIT = Path("/etc/systemd/system/forge-publisher-host-policy@.service")
+DROPIN_DIR = Path("/etc/systemd/system/docker.service.d")
+LOCK_DIR = Path("/run/lock")
+PROJECT_RE = re.compile(r"[a-z0-9][a-z0-9_-]{1,62}")
+
+
+class Refusal(Exception):
+    pass
+
+
+def refuse(message: str) -> None:
+    raise Refusal(message)
+
+
+def binding(project: str) -> dict[str, str]:
+    if not PROJECT_RE.fullmatch(project):
+        refuse("project must be an explicit 2-63 character lower-case Compose project name")
+    suffix = hashlib.sha256(project.encode("utf-8")).hexdigest()[:12]
+    return {
+        "project": project,
+        "suffix": suffix,
+        "bridge": f"fpb{suffix}",
+        "table": f"forge_pub_{suffix}",
+        "network": f"{project}_forge-publisher-net",
+    }
+
+
+def nft_text(bound: dict[str, str]) -> str:
+    return (
+        f"table inet {bound['table']} {{\n"
+        "    chain host_output {\n"
+        "        type filter hook output priority -5; policy accept;\n"
+        f"        oifname \"{bound['bridge']}\" meta l4proto tcp tcp dport {PORT} ct direction reply return\n"
+        f"        oifname \"{bound['bridge']}\" meta l4proto tcp tcp dport {PORT} counter drop\n"
+        "    }\n"
+        "}\n"
+    )
+
+
+def specification(bound: dict[str, str]) -> dict[str, Any]:
+    spec = {
+        "family": "inet", "table": bound["table"], "chain": "host_output",
+        "hook": "output", "priority": -5, "policy": "accept",
+        "rules": [
+            ["oifname", bound["bridge"], "l4proto", "tcp", "dport", PORT,
+             "ct-direction", "reply", "return"],
+            ["oifname", bound["bridge"], "l4proto", "tcp", "dport", PORT,
+             "counter", "drop"],
+        ],
+    }
+    packed = json.dumps(spec, sort_keys=True, separators=(",", ":")).encode()
+    return {**spec, "sha256": hashlib.sha256(packed).hexdigest()}
+
+
+def clean_docker_env(host: str) -> dict[str, str]:
+    if host != DOCKER_HOST:
+        refuse(f"only the local rootful endpoint {DOCKER_HOST} is supported")
+    ambient = os.environ.get("DOCKER_HOST")
+    if ambient and ambient != host:
+        refuse("ambient DOCKER_HOST conflicts with --docker-host")
+    for name in ("DOCKER_CONTEXT", "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH"):
+        if os.environ.get(name):
+            refuse(f"{name} selects a different Docker endpoint; unset it")
+    env = {"PATH": os.environ.get("PATH", "/usr/sbin:/usr/bin:/sbin:/bin"), "DOCKER_HOST": host}
+    if os.environ.get("DOCKER_CONFIG"):
+        env["DOCKER_CONFIG"] = os.environ["DOCKER_CONFIG"]
+    return env
+
+
+def run(argv: list[str], *, input_text: str | None = None,
+        env: dict[str, str] | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
+    try:
+        result = subprocess.run(argv, input=input_text, text=True, capture_output=True,
+                                env=env, timeout=60, check=False)
+    except OSError as exc:
+        refuse(f"cannot run {Path(argv[0]).name} ({type(exc).__name__})")
+    if check and result.returncode:
+        refuse(f"{Path(argv[0]).name} refused the requested operation (exit {result.returncode})")
+    return result
+
+
+def docker_json(host: str, *args: str) -> Any:
+    result = run(["docker", "--host", host, *args], env=clean_docker_env(host))
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError:
+        refuse("Docker returned unreadable identity data")
+
+
+def read_env(path: Path) -> dict[str, str]:
+    if not path.is_absolute() or not path.is_file() or path.is_symlink():
+        refuse("--env-file must be an absolute regular file, without a symlink")
+    values: dict[str, str] = {}
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, sep, value = line.partition("=")
+        if not sep or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key.strip()):
+            refuse("estate env file contains an invalid assignment")
+        values[key.strip()] = value.strip().strip("'\"")
+    return values
+
+
+def validate_env(path: Path, bound: dict[str, str]) -> None:
+    values = read_env(path)
+    if values.get("FORGE_PUBLISHER_BRIDGE") != bound["bridge"]:
+        refuse("FORGE_PUBLISHER_BRIDGE does not match the explicit Compose project")
+    if values.get("FORGE_PUBLISHER_URL") != f"http://forge-publisher:{PORT}":
+        refuse("FORGE_PUBLISHER_URL must be http://forge-publisher:8711")
+    settings = values.get("FORGE_PUBLISHER_SETTINGS_FILE", "")
+    if not settings or not Path(settings).is_absolute():
+        refuse("FORGE_PUBLISHER_SETTINGS_FILE must name the absolute publisher settings file")
+    try:
+        payload = json.loads(Path(settings).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        refuse("publisher settings cannot be read as JSON")
+    if payload.get("host") != "0.0.0.0" or payload.get("port") != PORT:
+        refuse("publisher settings must listen on 0.0.0.0:8711")
+
+
+def daemon_identity(host: str) -> str:
+    info = docker_json(host, "info", "--format", "{{json .}}")
+    if not isinstance(info, dict) or not isinstance(info.get("ID"), str) or not info["ID"]:
+        refuse("Docker daemon did not return a stable ID")
+    if str(info.get("OSType", "")).lower() != "linux":
+        refuse("publisher policy supports only a Linux Docker daemon")
+    options = " ".join(str(x).lower() for x in info.get("SecurityOptions", []))
+    if "rootless" in options:
+        refuse("publisher policy does not support a rootless Docker daemon")
+    firewall = str(info.get("FirewallBackend", info.get("FirewallDriver", ""))).lower()
+    if firewall and "nft" not in firewall:
+        refuse("Docker is not using the qualified nftables backend")
+    return info["ID"]
+
+
+def inspect_topology(host: str, bound: dict[str, str], *, require_members: bool) -> dict[str, Any]:
+    listed = docker_json(
+        host, "network", "ls", "--filter", f"label=com.docker.compose.project={bound['project']}",
+        "--filter", "label=com.docker.compose.network=forge-publisher-net", "--format", "{{json .}}",
+    )
+    if listed in (None, "", []):
+        if require_members:
+            refuse("the owned publisher network is absent")
+        return {"network_id": "", "members": {}}
+    if not isinstance(listed, list) or len(listed) != 1:
+        refuse("publisher network identity is missing or ambiguous")
+    network_id = listed[0].get("ID") if isinstance(listed[0], dict) else None
+    if not network_id:
+        refuse("publisher network has no readable ID")
+    inspected = docker_json(host, "network", "inspect", network_id)
+    if not isinstance(inspected, list) or len(inspected) != 1:
+        refuse("publisher network inspection is ambiguous")
+    net = inspected[0]
+    labels = net.get("Labels") or {}
+    if net.get("Name") != bound["network"] or labels.get("com.docker.compose.project") != bound["project"] \
+            or labels.get("com.docker.compose.network") != "forge-publisher-net":
+        refuse("publisher network is not owned by the exact Compose project")
+    if (net.get("Options") or {}).get("com.docker.network.bridge.name") != bound["bridge"]:
+        refuse("publisher network uses the wrong Linux bridge")
+    if net.get("EnableIPv6") not in (False, None):
+        refuse("publisher network must have IPv6 disabled")
+    containers = net.get("Containers") or {}
+    roles: dict[str, str] = {}
+    for identifier in containers:
+        found = docker_json(host, "inspect", identifier)
+        if not isinstance(found, list) or len(found) != 1:
+            refuse("publisher network contains an unreadable member")
+        container = found[0]
+        service = (container.get("Config", {}).get("Labels") or {}).get("com.docker.compose.service", "")
+        project = (container.get("Config", {}).get("Labels") or {}).get("com.docker.compose.project", "")
+        if project != bound["project"] or service not in {"coordinator", "forge-publisher"} or service in roles:
+            refuse("publisher network contains an unexpected or duplicate member")
+        roles[service] = identifier
+        if service == "forge-publisher":
+            networks = set((container.get("NetworkSettings", {}).get("Networks") or {}).keys())
+            ports = container.get("NetworkSettings", {}).get("Ports") or {}
+            if networks != {bound["network"]} or any(value for value in ports.values()):
+                refuse("publisher has another network or a published port")
+    if require_members and set(roles) != {"coordinator", "forge-publisher"}:
+        refuse("running verification requires exact coordinator and publisher members")
+    return {"network_id": network_id, "members": roles}
+
+
+def nft_json(table: str) -> dict[str, Any] | None:
+    result = run(["nft", "-j", "list", "table", "inet", table], check=False)
+    if result.returncode:
+        return None
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        refuse("current kernel policy is unreadable")
+    if not isinstance(data, dict):
+        refuse("current kernel policy is unreadable")
+    return data
+
+
+def _match(expr: Any, left: dict[str, Any], right: Any) -> bool:
+    return expr == {"match": {"op": "==", "left": left, "right": right}}
+
+
+def verify_semantics(data: dict[str, Any] | None, bound: dict[str, str]) -> None:
+    if data is None:
+        refuse("the current kernel has no owned publisher policy")
+    entries = data.get("nftables")
+    if not isinstance(entries, list):
+        refuse("current kernel policy is not nftables JSON")
+    substantive = [entry for entry in entries if "metainfo" not in entry]
+    tables = [x["table"] for x in substantive if set(x) == {"table"}]
+    chains = [x["chain"] for x in substantive if set(x) == {"chain"}]
+    rules = [x["rule"] for x in substantive if set(x) == {"rule"}]
+    if len(tables) != 1 or len(chains) != 1 or len(rules) != 2 or len(substantive) != 4:
+        refuse("owned policy has missing or unexpected tables, chains, or rules")
+    table = {k: v for k, v in tables[0].items() if k not in {"handle"}}
+    chain = {k: v for k, v in chains[0].items() if k not in {"handle"}}
+    if table != {"family": "inet", "name": bound["table"]}:
+        refuse("owned policy has the wrong family or table")
+    expected_chain = {"family": "inet", "table": bound["table"], "name": "host_output",
+                      "type": "filter", "hook": "output", "prio": -5, "policy": "accept"}
+    if chain != expected_chain:
+        refuse("owned policy has the wrong chain, hook, priority, or default policy")
+    common = [
+        lambda x: _match(x, {"meta": {"key": "oifname"}}, bound["bridge"]),
+        lambda x: _match(x, {"meta": {"key": "l4proto"}}, "tcp"),
+        lambda x: _match(x, {"payload": {"protocol": "tcp", "field": "dport"}}, PORT),
+    ]
+    expected_tails = [
+        [lambda x: _match(x, {"ct": {"key": "direction"}}, "reply"), lambda x: x == {"return": None}],
+        [lambda x: x == {"counter": {"packets": x.get("counter", {}).get("packets", 0),
+                                      "bytes": x.get("counter", {}).get("bytes", 0)}} if isinstance(x, dict) and "counter" in x else False,
+         lambda x: x == {"drop": None}],
+    ]
+    for index, (rule, tail) in enumerate(zip(rules, expected_tails)):
+        if rule.get("family") != "inet" or rule.get("table") != bound["table"] or rule.get("chain") != "host_output":
+            refuse("owned policy rule is attached to the wrong chain")
+        expressions = rule.get("expr")
+        checks = common + tail
+        if not isinstance(expressions, list) or len(expressions) != len(checks) or not all(check(e) for check, e in zip(checks, expressions)):
+            refuse(f"owned policy rule {index + 1} has changed semantics")
+
+
+def transaction(bound: dict[str, str], *, old_exists: bool) -> str:
+    prefix = f"delete table inet {bound['table']}\n" if old_exists else ""
+    return prefix + nft_text(bound)
+
+
+def apply_policy(bound: dict[str, str]) -> None:
+    previous = run(["nft", "list", "table", "inet", bound["table"]], check=False)
+    old_exists = previous.returncode == 0
+    script = transaction(bound, old_exists=old_exists)
+    run(["nft", "-c", "-f", "-"], input_text=script)
+    run(["nft", "-f", "-"], input_text=script)
+    try:
+        verify_semantics(nft_json(bound["table"]), bound)
+    except Exception:
+        if old_exists:
+            restore = f"delete table inet {bound['table']}\n{previous.stdout}"
+            run(["nft", "-c", "-f", "-"], input_text=restore)
+            run(["nft", "-f", "-"], input_text=restore)
+        else:
+            run(["nft", "delete", "table", "inet", bound["table"]], check=False)
+        raise
+
+
+def canonical_config(bound: dict[str, str], daemon_id: str, host: str, persistent: bool) -> dict[str, Any]:
+    return {"format": 1, **bound, "port": PORT, "docker_host": host,
+            "daemon_id": daemon_id, "persistent": persistent,
+            "specification": specification(bound)}
+
+
+def atomic_write(path: Path, content: bytes, mode: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
+    if path.exists() and path.read_bytes() == content:
+        os.chmod(path, mode)
+        return
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(content); stream.flush(); os.fsync(stream.fileno())
+        os.chmod(temporary, mode)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def unit_bytes() -> bytes:
+    return ("[Unit]\nDescription=Forge publisher host policy %i\nBefore=docker.service\n\n"
+            "[Service]\nType=oneshot\nExecStart=/usr/local/libexec/forge-publisher-host-policy load-static --config /etc/forge-publisher-policy/%i.json\nRemainAfterExit=yes\n\n[Install]\nWantedBy=multi-user.target\n").encode()
+
+
+def dropin_bytes(suffix: str) -> bytes:
+    name = f"forge-publisher-host-policy@{suffix}.service"
+    return f"[Unit]\nRequires={name}\nAfter={name}\n".encode()
+
+
+def install_shared_artifact(path: Path, content: bytes, mode: int) -> None:
+    if path.exists() and path.read_bytes() != content:
+        refuse(f"shared artifact {path} has different bytes; migration is outside this helper")
+    atomic_write(path, content, mode)
+
+
+def lock(bound: dict[str, str]):
+    LOCK_DIR.mkdir(parents=True, exist_ok=True)
+    handle = open(LOCK_DIR / f"forge-publisher-policy-{bound['suffix']}.lock", "a", encoding="utf-8")
+    fcntl.flock(handle, fcntl.LOCK_EX)
+    return handle
+
+
+def load_config(path: Path) -> tuple[dict[str, str], dict[str, Any]]:
+    if not path.is_absolute() or not path.is_file() or path.is_symlink():
+        refuse("static policy config must be an absolute regular file without a symlink")
+    if path.stat().st_uid != 0 or path.stat().st_mode & 0o077:
+        refuse("static policy config must be root-owned and mode 0600")
+    try:
+        config = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        refuse("static policy config is not JSON")
+    if not isinstance(config, dict) or config.get("format") != 1:
+        refuse("static policy config has the wrong format")
+    bound = binding(str(config.get("project", "")))
+    expected = canonical_config(bound, str(config.get("daemon_id", "")), str(config.get("docker_host", "")), bool(config.get("persistent")))
+    if config != expected or path != CONFIG_DIR / f"{bound['suffix']}.json":
+        refuse("static policy config does not match its fixed project binding")
+    return bound, config
+
+
+def require_root() -> None:
+    if os.geteuid() != 0:
+        refuse("this operation requires root for the owned nftables table and boot files")
+
+
+def cmd_describe(args: argparse.Namespace) -> None:
+    bound = binding(args.project)
+    print(json.dumps({**bound, "FORGE_PUBLISHER_BRIDGE": bound["bridge"],
+                      "port": PORT, "specification_sha256": specification(bound)["sha256"]}, sort_keys=True))
+
+
+def cmd_install(args: argparse.Namespace) -> None:
+    require_root()
+    bound = binding(args.project); validate_env(args.env_file, bound)
+    daemon_id = daemon_identity(args.docker_host)
+    topology = inspect_topology(args.docker_host, bound, require_members=False)
+    config_path = CONFIG_DIR / f"{bound['suffix']}.json"
+    existing: dict[str, Any] | None = None
+    if config_path.exists():
+        _, existing = load_config(config_path)
+        if existing["daemon_id"] != daemon_id or existing["docker_host"] != args.docker_host:
+            refuse("existing policy is bound to a different Docker daemon")
+    publisher = topology["members"].get("forge-publisher")
+    if publisher and (existing is None or existing["bridge"] != bound["bridge"]):
+        details = docker_json(args.docker_host, "inspect", publisher)
+        if details[0].get("State", {}).get("Running"):
+            refuse("publisher must be stopped before initial install or bridge change")
+    persistent = not args.runtime_only
+    with lock(bound):
+        apply_policy(bound)
+        config = canonical_config(bound, daemon_id, args.docker_host, persistent)
+        atomic_write(config_path, (json.dumps(config, sort_keys=True, indent=2) + "\n").encode(), 0o600)
+        if persistent:
+            source = Path(__file__).read_bytes()
+            install_shared_artifact(HELPER, source, 0o755)
+            install_shared_artifact(UNIT, unit_bytes(), 0o644)
+            dropin = DROPIN_DIR / f"forge-publisher-host-policy-{bound['suffix']}.conf"
+            atomic_write(dropin, dropin_bytes(bound["suffix"]), 0o644)
+            run(["systemctl", "daemon-reload"])
+    print(f"INSTALLED project={bound['project']} daemon={daemon_id} bridge={bound['bridge']} policy={config['specification']['sha256']} boot={'PERSISTENT' if persistent else 'NOT CHECKED'}")
+
+
+def verify_from_config(bound: dict[str, str], config: dict[str, Any], args: argparse.Namespace,
+                       *, require_members: bool) -> dict[str, Any]:
+    if args.docker_host != config["docker_host"] or daemon_identity(args.docker_host) != config["daemon_id"]:
+        refuse("effective Docker endpoint or daemon ID differs from the installed binding")
+    validate_env(args.env_file, bound)
+    inspect_topology(args.docker_host, bound, require_members=require_members)
+    data = nft_json(bound["table"])
+    verify_semantics(data, bound)
+    return data
+
+
+def cmd_verify(args: argparse.Namespace) -> None:
+    bound = binding(args.project)
+    loaded_bound, config = load_config(CONFIG_DIR / f"{bound['suffix']}.json")
+    if loaded_bound != bound:
+        refuse("installed project binding differs from the requested project")
+    data = verify_from_config(bound, config, args, require_members=args.require_members)
+    rules = [entry["rule"] for entry in data["nftables"] if "rule" in entry]
+    counter = rules[1]["expr"][-2]["counter"]
+    print(f"VERIFIED project={bound['project']} daemon={config['daemon_id']} bridge={bound['bridge']} policy={config['specification']['sha256']} drop_packets={counter.get('packets', 0)} drop_bytes={counter.get('bytes', 0)} boot={'PERSISTENT' if config['persistent'] else 'NOT CHECKED'}")
+
+
+def cmd_load_static(args: argparse.Namespace) -> None:
+    require_root()
+    bound, _ = load_config(args.config)
+    with lock(bound):
+        apply_policy(bound)
+    print(f"LOADED project={bound['project']} bridge={bound['bridge']} policy={specification(bound)['sha256']}")
+
+
+def cmd_remove(args: argparse.Namespace) -> None:
+    require_root()
+    bound = binding(args.project)
+    _, config = load_config(CONFIG_DIR / f"{bound['suffix']}.json")
+    if args.docker_host != config["docker_host"] or daemon_identity(args.docker_host) != config["daemon_id"]:
+        refuse("effective Docker endpoint or daemon ID differs from the installed binding")
+    containers = docker_json(args.docker_host, "ps", "-a", "--filter",
+                             f"label=com.docker.compose.project={bound['project']}", "--filter",
+                             "label=com.docker.compose.service=forge-publisher", "--format", "{{json .}}")
+    if containers:
+        refuse("publisher container still exists; remove the exact project before its protection")
+    networks = docker_json(args.docker_host, "network", "ls", "--filter",
+                           f"label=com.docker.compose.project={bound['project']}", "--filter",
+                           "label=com.docker.compose.network=forge-publisher-net", "--format", "{{json .}}")
+    if networks:
+        refuse("owned publisher network still exists; remove the exact project before its protection")
+    with lock(bound):
+        if config["persistent"]:
+            dropin = DROPIN_DIR / f"forge-publisher-host-policy-{bound['suffix']}.conf"
+            if not dropin.exists() or dropin.read_bytes() != dropin_bytes(bound["suffix"]):
+                refuse("owned Docker dependency is missing or has changed; refusing ambiguous removal")
+            dropin.unlink(); run(["systemctl", "daemon-reload"])
+            shown = run(["systemctl", "show", "docker.service", "--property=Requires,After", "--no-pager"]).stdout
+            if f"forge-publisher-host-policy@{bound['suffix']}.service" in shown:
+                refuse("Docker still reports the project policy as a reverse requirement")
+            run(["systemctl", "reset-failed", f"forge-publisher-host-policy@{bound['suffix']}.service"], check=False)
+        data = nft_json(bound["table"])
+        verify_semantics(data, bound)
+        run(["nft", "delete", "table", "inet", bound["table"]])
+        (CONFIG_DIR / f"{bound['suffix']}.json").unlink()
+    print(f"REMOVED project={bound['project']}; shared helper and unit retained")
+
+
+def parser() -> argparse.ArgumentParser:
+    made = argparse.ArgumentParser(description=__doc__)
+    sub = made.add_subparsers(dest="command", required=True)
+    describe = sub.add_parser("describe"); describe.add_argument("--project", required=True); describe.set_defaults(func=cmd_describe)
+    for name, func in (("install", cmd_install), ("verify", cmd_verify), ("remove", cmd_remove)):
+        item = sub.add_parser(name); item.add_argument("--project", required=True)
+        item.add_argument("--docker-host", required=True); item.add_argument("--env-file", type=Path, required=name != "remove")
+        if name == "install": item.add_argument("--runtime-only", action="store_true")
+        if name == "verify": item.add_argument("--require-members", action="store_true")
+        item.set_defaults(func=func)
+    static = sub.add_parser("load-static"); static.add_argument("--config", type=Path, required=True); static.set_defaults(func=cmd_load_static)
+    return made
+
+
+def main() -> int:
+    try:
+        args = parser().parse_args(); args.func(args); return 0
+    except Refusal as exc:
+        print(f"publisher-host-policy: REFUSED — {exc}", file=sys.stderr); return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

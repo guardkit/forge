@@ -83,6 +83,7 @@ ITEMS=(
 "host|6|secret-files-present-and-private|every secret file the env file names exists and is readable by its own service's user and by nobody else"
 "host|7|every-setting-name-has-a-value|every setting name the composed files require has a value"
 "host|7b|bus-mode-and-the-files-agree|BUS_MODE says whose bus this estate runs against, and the compose profiles and files in force say the same thing - a half-set mode is the one state that could start a second bus beside a bus that is being kept"
+"host|7c|publisher-host-policy-is-current|the exact project-bound publisher OUTPUT policy is present in the current kernel on the selected local Docker daemon"
 "services|8|the-bus-answers|the bus answers at the address the env file gives"
 "services|8b|the-buses-storage-is-provisioned|the bus's key-value buckets and streams exist, asked of the bus itself"
 "services|8c|the-memory-service-answers|the memory service answers at the address the env file gives"
@@ -234,6 +235,27 @@ ask_the_bus_from() {
     [ -n "${from}" ] || return 2
     address="$(the_buss_monitoring_address)"
     docker exec "${from}" curl -sf --max-time 8 "http://${address}/${route}" 2>/dev/null
+}
+
+# ---------------------------------------------------------------------------
+# THE CURRENT PUBLISHER HOST POLICY. The helper checks the live kernel, exact
+# project-derived bridge, local endpoint and non-secret daemon ID. A saved
+# receipt or matching static file never substitutes for this read.
+# ---------------------------------------------------------------------------
+POLICY_SAID=""
+publisher_policy_verify() {
+    local members="${1:-}" command=("${HERE}/publisher-host-policy" verify --docker-host "${DOCKER_HOST:-}" --env-file "${ENV_FILE}" --project "${PROJECT}")
+    [ -n "${PROJECT}" ] || { POLICY_SAID="an explicit Compose project is required"; return 1; }
+    [ "${DOCKER_HOST:-}" = "unix:///var/run/docker.sock" ] || { POLICY_SAID="DOCKER_HOST must explicitly name unix:///var/run/docker.sock"; return 1; }
+    [[ "${ENV_FILE}" = /* ]] || { POLICY_SAID="the estate env path must be absolute"; return 1; }
+    [ -z "${members}" ] || command+=(--require-members)
+    if [ "${EUID}" -eq 0 ]; then
+        POLICY_SAID="$("${command[@]}" 2>&1)"
+    elif command -v sudo >/dev/null 2>&1; then
+        POLICY_SAID="$(sudo -- "${command[@]}" 2>&1)"
+    else
+        POLICY_SAID="sudo is unavailable for the narrow current-kernel read"; return 1
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -482,6 +504,13 @@ check_host() {
 
     # --- 7b ----------------------------------------------------------------
     check_the_bus_mode_and_the_files_agree
+
+    # --- 7c ----------------------------------------------------------------
+    if publisher_policy_verify; then
+        ok 7c "the exact project-bound publisher policy is present in the current kernel (${POLICY_SAID})."
+    else
+        fail 7c "the current project-bound publisher policy could not be verified: ${POLICY_SAID}. Install and verify it before any up command."
+    fi
 
     finish
 }
@@ -797,19 +826,42 @@ run_the_services_items() {
     fi
 
     # --- 8g ----------------------------------------------------------------
-    local publisher_url from_coordinator from_elsewhere
+    local publisher_url from_coordinator from_elsewhere publisher publisher_ip from_host
+    local policy_before policy_after policy_problem=""
     publisher_url="$(get FORGE_PUBLISHER_URL)"
+    if publisher_policy_verify members; then
+        policy_before="$(printf "%s" "${POLICY_SAID}" | sed -n "s/.*drop_packets=\([0-9][0-9]*\).*/\1/p")"
+    else
+        policy_problem="${POLICY_SAID}"
+    fi
+    publisher="$(container_of forge-publisher)"
+    publisher_ip="$(docker inspect "${publisher}" --format "{{(index .NetworkSettings.Networks \"${PROJECT}_forge-publisher-net\").IPAddress}}" 2>/dev/null)"
+    from_host=""
+    if [ "$(id -u)" = "1000" ] && [ -n "${publisher_ip}" ]; then
+        from_host="$(curl --noproxy "*" -s -o /dev/null --connect-timeout 2 --max-time 4 -w "%{http_code}" "http://${publisher_ip}:8711/healthz" 2>/dev/null)"
+    else
+        policy_problem="${policy_problem} ordinary host check requires UID 1000 and a readable publisher IPv4 address;"
+    fi
+    if publisher_policy_verify members; then
+        policy_after="$(printf "%s" "${POLICY_SAID}" | sed -n "s/.*drop_packets=\([0-9][0-9]*\).*/\1/p")"
+    else
+        policy_problem="${policy_problem} ${POLICY_SAID}"
+    fi
     if [ -z "${coordinator}" ] || [ -z "${answer}" ]; then
         fail 8g "the coordinator or the answer service is not running, so who can reach the publisher could not be established."
     else
-        from_coordinator="$(docker exec "${coordinator}" curl -s -o /dev/null --max-time 8 -w '%{http_code}' "${publisher_url}/healthz" 2>/dev/null)"
-        from_elsewhere="$(docker exec "${answer}" curl -s -o /dev/null --max-time 8 -w '%{http_code}' "${publisher_url}/healthz" 2>/dev/null)"
-        if [ "${from_coordinator}" = "200" ] && [ "${from_elsewhere}" != "200" ]; then
-            ok 8g "the publisher answers the coordinator (200 at ${publisher_url}) and refuses the answer service, which is on the factory network only — the coordinator is the only thing on both networks, and that is the whole route to the publisher. This is ONE forbidden direction; the design asks for every one of them, including from the local network and repeated after a restart, and README.md records that as a rollout precondition this check does not meet."
+        from_coordinator="$(docker exec "${coordinator}" curl -s -o /dev/null --max-time 8 -w "%{http_code}" "${publisher_url}/healthz" 2>/dev/null)"
+        from_elsewhere="$(docker exec "${answer}" curl -s -o /dev/null --max-time 8 -w "%{http_code}" "${publisher_url}/healthz" 2>/dev/null)"
+        if [ "${from_coordinator}" = "200" ] && [ "${from_elsewhere}" != "200" ] && [ "${from_host}" != "200" ] && [ -z "${policy_problem}" ] && [ -n "${policy_before}" ] && [ "${policy_after}" -gt "${policy_before}" ]; then
+            ok 8g "the publisher answers the coordinator, refuses the answer service, and an ordinary UID 1000 host GET to ${publisher_ip}:8711 was dropped by the current owned rule (counter ${policy_before} to ${policy_after}). The broader sandbox and LAN origin matrix remains a separate rollout gate."
         elif [ "${from_coordinator}" != "200" ]; then
-            fail 8g "the coordinator could not reach the publisher at ${publisher_url} (it said ${from_coordinator:-nothing}), so the merge word would have nothing to hand a joined commit to."
+            fail 8g "the coordinator could not reach the publisher at ${publisher_url} (it said ${from_coordinator:-nothing})."
+        elif [ "${from_elsewhere}" = "200" ]; then
+            fail 8g "the answer service CAN reach the publisher at ${publisher_url}."
+        elif [ "${from_host}" = "200" ]; then
+            fail 8g "an ordinary UID 1000 host request reached the publisher at ${publisher_ip}:8711."
         else
-            fail 8g "the answer service CAN reach the publisher at ${publisher_url}, and nothing but the coordinator should be able to. The publisher holds the one credential that can write to a project's remote."
+            fail 8g "the current host policy and its matching drop counter did not prove the ordinary host refusal: ${policy_problem:-counter did not increase}."
         fi
     fi
 
@@ -1851,6 +1903,10 @@ check_read_pre_resume() {
         trouble="${trouble} it is dated ${R_WRITTEN}, which is $(( -age )) seconds in the future of this machine's clock, so its age cannot be trusted;"
     elif [ "${age}" -gt "${max_age}" ]; then
         trouble="${trouble} it is ${age} seconds old and this env file allows ${max_age};"
+    fi
+
+    if ! publisher_policy_verify members; then
+        trouble="${trouble} current publisher host policy verification failed (${POLICY_SAID});"
     fi
 
     if [ -n "${trouble}" ]; then

@@ -6,6 +6,66 @@ This folder starts the factory's own services on a clean machine — a laptop or
 a cloud machine — from one set of files and one env file. It carries no
 machine's address, no home path, no checkout and no host network.
 
+## Supported first start and publisher host policy
+
+Use the complete estate only. Choose these values once; paths must be absolute,
+the project must be explicit, and this release supports only the local rootful
+Docker socket. Context, TLS, remote and rootless selections refuse.
+
+```bash
+export FACTORY_ESTATE_DIR=/absolute/release/deploy/estate
+export FACTORY_ESTATE_ENV=/absolute/operator/estate.env
+export FACTORY_ESTATE_PROJECT=chosen-project
+export DOCKER_HOST=unix:///var/run/docker.sock
+unset DOCKER_CONTEXT DOCKER_TLS_VERIFY DOCKER_CERT_PATH
+"$FACTORY_ESTATE_DIR/publisher-host-policy" describe --project "$FACTORY_ESTATE_PROJECT"
+# Put its FORGE_PUBLISHER_BRIDGE value in FACTORY_ESTATE_ENV and complete the
+# existing public settings, volumes, secrets and immutable image prerequisites.
+sudo "$FACTORY_ESTATE_DIR/publisher-host-policy" install --docker-host "$DOCKER_HOST" --env-file "$FACTORY_ESTATE_ENV" --project "$FACTORY_ESTATE_PROJECT"
+sudo "$FACTORY_ESTATE_DIR/publisher-host-policy" verify --docker-host "$DOCKER_HOST" --env-file "$FACTORY_ESTATE_ENV" --project "$FACTORY_ESTATE_PROJECT"
+sops exec-env "$NATS_SECRETS_FILE" '"$FACTORY_ESTATE_DIR/estate-check" host --env-file "$FACTORY_ESTATE_ENV" --project "$FACTORY_ESTATE_PROJECT"'
+```
+
+For local bus mode, after that successful preflight, use exactly:
+
+```bash
+sops exec-env "$NATS_SECRETS_FILE" 'docker compose --env-file "$FACTORY_ESTATE_ENV" --project-name "$FACTORY_ESTATE_PROJECT" -f "$FACTORY_ESTATE_DIR/compose.yaml" up -d'
+```
+
+For external bus mode, preserve the existing BUS_MODE, COMPOSE_FILE and profile
+contract and use exactly:
+
+```bash
+sops exec-env "$NATS_SECRETS_FILE" 'docker compose --env-file "$FACTORY_ESTATE_ENV" --project-name "$FACTORY_ESTATE_PROJECT" -f "$FACTORY_ESTATE_DIR/compose.yaml" -f "$FACTORY_ESTATE_DIR/compose.external-bus.yaml" up -d'
+```
+
+Sandbox participation remains the COMPOSE_PROFILES choice in that same env.
+These generic commands are clean-install walks. The signed cutover keeps its
+existing named service groups and admissions closed until its receipt and
+marker gates pass.
+
+The helper owns one inet OUTPUT table for the derived stable bridge and TCP
+8711. Its first ordered rule returns conntrack reply traffic, preserving
+publisher-initiated Git replies; its second counts and drops all other matching
+host output. It owns no FORWARD rule and no general firewall configuration.
+Persistent install writes a root-owned static binding and makes the owned target
+docker.service require its oneshot loader before Docker starts. A loader failure
+can therefore prevent that daemon and its containers from starting. The loader
+never queries Docker, and install or verify never cycles Docker, nftables or a
+loader unit. The explicitly authorised fixture-only --runtime-only form records
+boot NOT CHECKED and creates no Docker dependency.
+
+Before project removal, remove its publisher container, network and autostarting
+definition, then run publisher-host-policy remove with the same endpoint and
+project. Removal first clears only that project's Docker dependency, proves the
+reverse requirement is gone, and removes only its table and config. It retains
+a second project and the shared installed helper and unit template.
+
+The measured defect was an ordinary UID 1000 host request reaching TCP 8711.
+The host policy closes that path. Actual nft syntax/kernel install, host traffic,
+publisher Git egress, sandbox/LAN origin matrix, restart, daemon and machine boot
+qualification remain rollout gates after source review.
+
 **Forge owns it because Forge is the factory's coordinator.** The estate is
 what the coordinator needs around it in order to work, so the list of those
 parts belongs with the coordinator, in the same repository and at the same
@@ -56,17 +116,10 @@ in `../compose/`, and is referenced from here rather than copied.
    `../compose/settings.example.yaml`, fill in the project's `org/name` and its
    sandbox's name, and put it on the `forge-settings` volume as `forge.yaml`.
    Nothing writes that volume at run time; it is mounted read-only.
-6. **`sops exec-env "$NATS_SECRETS_FILE" './estate-check host'`.** Seven items,
-   one sentence each. It exits non-zero if any of them is not met. Run it the
-   way you are about to start the estate — one of the things it checks is that
-   the bus's eight account passwords have values, and they only do in the child
-   process.
-7. **Start it**, with the bus's account passwords passed in from a child
-   process:
-
-   ```
-   sops exec-env "$NATS_SECRETS_FILE" 'docker compose --env-file .env up -d'
-   ```
+6. **Install and verify the publisher host policy, then run host preflight**,
+   using the absolute env, explicit project and local Docker endpoint in the
+   supported first-start sequence above. It exits non-zero if any item is unmet.
+7. **Start the complete estate** with the exact local-bus command above.
 
    On a machine that looks after a project's sandbox, **change the env file's
    profiles line to `COMPOSE_PROFILES=local-bus,sandbox`** — do not pass
@@ -478,8 +531,8 @@ COMPOSE_FILE=compose.yaml:compose.external-bus.yaml
 BUS_EXTERNAL_NETWORK=<the network that bus is already on>
 ```
 
-Compose reads `COMPOSE_FILE` and `COMPOSE_PROFILES` out of the env file itself,
-so `docker compose --env-file .env up -d` stays the whole command in both modes.
+Compose reads `COMPOSE_FILE` and `COMPOSE_PROFILES` from the env, while the
+supported commands above still name the exact ordered estate files explicitly.
 `estate-check host` **refuses** (item 7b) if `BUS_MODE` and those settings
 disagree, because a half-set mode is the one state that could start a second bus
 beside the one being kept.
