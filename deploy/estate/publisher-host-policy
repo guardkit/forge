@@ -756,9 +756,17 @@ def cmd_remove(args: argparse.Namespace) -> None:
                 # Prove the requirement is gone. After= may still name the loader:
                 # the loader's own Before=docker.service keeps that ordering while
                 # it stays loaded, and ordering alone never requires the loader.
+                loader = f"forge-publisher-host-policy@{bound['suffix']}.service"
                 properties = systemd_properties("docker.service", "Requires,DropInPaths")
-                if f"forge-publisher-host-policy@{bound['suffix']}.service" in properties["Requires"].split() or str(dropin) in properties["DropInPaths"].split():
+                if loader in properties["Requires"].split() or str(dropin) in properties["DropInPaths"].split():
                     refuse("Docker reverse requirement removal is not proved")
+                if any(loader in value.split() for value in systemd_properties("docker.service", "Requisite,BindsTo,Wants,Upholds").values()):
+                    refuse("Docker still has another dependency on the policy loader")
+                # The instance is never enabled; only the owned drop-in pulls it in.
+                # With that gone nothing may pull it in at all, which also rules out
+                # indirect paths through any other unit.
+                if any(value.split() for value in systemd_properties(loader, "RequiredBy,RequisiteOf,BoundBy,WantedBy,UpheldBy").values()):
+                    refuse("another unit still pulls in the policy loader")
             except Exception:
                 atomic_write(dropin, dropin_bytes(bound["suffix"]), 0o644)
                 run(["systemctl", "daemon-reload"])
