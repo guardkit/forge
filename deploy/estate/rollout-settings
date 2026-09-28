@@ -9,6 +9,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -43,6 +44,7 @@ from forge.config.models import PublicationConfig
 
 source, destination, metadata_path, runtime_path = map(Path, sys.argv[1:5])
 evidence_source_text = sys.argv[5]
+operation = json.loads(sys.argv[6])
 
 def canonical_absolute(value, label):
     if not isinstance(value, str) or not value.startswith("/"):
@@ -52,6 +54,24 @@ def canonical_absolute(value, label):
     return Path(value)
 
 evidence_source = canonical_absolute(evidence_source_text, "the declared evidence source path")
+if not isinstance(operation, dict) or set(operation) != {
+    "add_evidence_permission", "retire_permissions", "evidence_mapping_proof"
+}:
+    raise ValueError("the host permission operation is malformed")
+add_evidence_permission = operation["add_evidence_permission"]
+retire_permissions = operation["retire_permissions"]
+mapping_proof = operation["evidence_mapping_proof"]
+if not isinstance(add_evidence_permission, bool):
+    raise ValueError("the evidence permission disposition is malformed")
+if not isinstance(retire_permissions, list):
+    raise ValueError("the retired permission dispositions are malformed")
+retire_permissions = [str(canonical_absolute(item, "a retired permission choice")) for item in retire_permissions]
+if len(retire_permissions) != len(set(retire_permissions)):
+    raise ValueError("a retired permission choice was supplied more than once")
+for index, left in enumerate(map(Path, retire_permissions)):
+    for right in map(Path, retire_permissions[index + 1:]):
+        if left in right.parents or right in left.parents:
+            raise ValueError("retired permission choices overlap and are ambiguous")
 raw = yaml.safe_load(source.read_text(encoding="utf-8"))
 if not isinstance(raw, dict):
     raise ValueError("the input settings document is not a mapping")
@@ -74,8 +94,10 @@ new_paths = {}
 source_paths_by_leaf = {}
 leaves_by_source_path = {}
 for project, old_path in registrations.items():
-    if not isinstance(project, str) or not isinstance(old_path, str) or not old_path.startswith("/"):
+    if not isinstance(project, str):
         raise ValueError("every registration must map a project name to an absolute path")
+    old_path = str(canonical_absolute(old_path, f"the registered path for {project}"))
+    registrations[project] = old_path
     leaf = re.sub(r"[^A-Za-z0-9_.-]+", "-", project.rsplit("/", 1)[-1]).strip("-.")
     if not leaf:
         raise ValueError("every registered project name must produce a container path")
@@ -121,19 +143,75 @@ filesystem = permissions.get("filesystem") if isinstance(permissions, dict) else
 allowlist = filesystem.get("allowlist") if isinstance(filesystem, dict) else None
 if not isinstance(allowlist, list):
     raise ValueError("permissions.filesystem.allowlist is missing or is not a list")
-old_paths = {str(v): new_paths[k] for k, v in registrations.items()}
-replaced_evidence = 0
-new_allowlist = []
-for item in allowlist:
-    if item == str(evidence_source):
-        new_allowlist.append("/var/lib/forge-evidence")
-        replaced_evidence += 1
-    elif item in old_paths:
-        new_allowlist.append(old_paths[item])
-    else:
-        new_allowlist.append(item)
-if replaced_evidence == 0:
-    evidence_mappings = []
+canonical_allowlist = [
+    str(canonical_absolute(item, "a filesystem permission")) for item in allowlist
+]
+if len(canonical_allowlist) != len(set(canonical_allowlist)):
+    raise ValueError("permissions.filesystem.allowlist contains a duplicate permission")
+unknown_retirements = sorted(set(retire_permissions) - set(canonical_allowlist))
+if unknown_retirements:
+    raise ValueError(f"retired permission choices are not exact existing entries: {unknown_retirements}")
+
+def covers(permission_text, path_text):
+    permission = Path(permission_text)
+    path = Path(path_text)
+    return path == permission or permission in path.parents
+
+aliases_by_path = {}
+for project, old_path in registrations.items():
+    aliases_by_path.setdefault(old_path, []).append(project)
+registration_coverage = {
+    project: {
+        "source_path": old_path,
+        "exact_aliases": aliases_by_path[old_path],
+        "before_permissions": [item for item in canonical_allowlist if covers(item, old_path)],
+    }
+    for project, old_path in registrations.items()
+}
+for choice in retire_permissions:
+    covered_projects = [project for project, old_path in registrations.items() if covers(choice, old_path)]
+    if covered_projects:
+        raise ValueError(
+            f"retired permission {choice} covers registered projects {covered_projects}"
+        )
+    if covers(choice, str(evidence_source)) or covers(choice, "/var/lib/forge-evidence"):
+        raise ValueError(f"retired permission {choice} covers the current evidence")
+    covered_new_projects = [
+        project for project, new_path in new_paths.items() if covers(choice, new_path)
+    ]
+    if covered_new_projects:
+        raise ValueError(
+            f"retired permission {choice} covers migrated registered projects {covered_new_projects}"
+        )
+
+canonical_evidence = "/var/lib/forge-evidence"
+replaced_evidence = canonical_allowlist.count(str(evidence_source))
+if replaced_evidence > 1:
+    raise ValueError("the declared evidence source path must appear exactly once in the allowlist")
+if add_evidence_permission and replaced_evidence:
+    raise ValueError("--add-evidence-permission is invalid when the exact evidence entry already exists")
+if add_evidence_permission:
+    if not isinstance(mapping_proof, dict):
+        raise ValueError("the explicit evidence permission lacks a host mapping proof")
+    required_proof = {
+        "bind_source", "bind_destination", "container_evidence", "evidence_source",
+        "bind_source_identity", "evidence_source_identity",
+    }
+    if set(mapping_proof) != required_proof:
+        raise ValueError("the host evidence mapping proof is malformed")
+    proof_source = canonical_absolute(mapping_proof["bind_source"], "the proved bind source")
+    proof_destination = canonical_absolute(mapping_proof["bind_destination"], "the proved bind destination")
+    proof_container = canonical_absolute(mapping_proof["container_evidence"], "the proved container evidence path")
+    proof_evidence = canonical_absolute(mapping_proof["evidence_source"], "the proved host evidence path")
+    if proof_evidence != evidence_source:
+        raise ValueError("the host evidence mapping proof names a different source")
+    try:
+        proof_relative = proof_evidence.relative_to(proof_source)
+    except ValueError as exc:
+        raise ValueError("the proved evidence source is outside its bind source") from exc
+    if proof_destination / proof_relative != proof_container:
+        raise ValueError("the host evidence mapping proof has an inconsistent destination")
+    matching_mounts = []
     for mount in runtime_mounts:
         mount_type = str(mount.get("Type", mount.get("type", ""))).lower()
         if mount_type != "bind":
@@ -145,36 +223,57 @@ if replaced_evidence == 0:
             mount.get("Destination", mount.get("destination", mount.get("target"))),
             "a previous-runtime bind destination",
         )
-        try:
-            relative_evidence = evidence_source.relative_to(bind_source)
-        except ValueError:
-            continue
-        evidence_mappings.append(
-            (bind_destination, bind_destination / relative_evidence)
-        )
-    if len(evidence_mappings) != 1:
-        raise ValueError("the declared evidence source must be beneath exactly one previous-runtime bind")
-    bind_destination, container_evidence = evidence_mappings[0]
-    covering_permissions = []
-    for item in allowlist:
-        try:
-            permission = canonical_absolute(item, "an evidence permission")
-        except ValueError:
-            continue
-        inside_mapped_bind = (
-            permission == bind_destination or bind_destination in permission.parents
-        )
-        covers_evidence = (
-            container_evidence == permission or permission in container_evidence.parents
-        )
-        if inside_mapped_bind and covers_evidence:
-            covering_permissions.append(permission)
-    if len(covering_permissions) != 1:
-        raise ValueError("the mapped evidence path must have exactly one existing container permission")
-    if "/var/lib/forge-evidence" not in new_allowlist:
-        new_allowlist.append("/var/lib/forge-evidence")
-elif replaced_evidence != 1:
-    raise ValueError("the declared evidence source path must appear exactly once in the allowlist")
+        if bind_source == proof_source and bind_destination == proof_destination:
+            matching_mounts.append(mount)
+    if len(matching_mounts) != 1:
+        raise ValueError("the host evidence mapping proof does not identify one previous-runtime bind")
+elif mapping_proof is not None:
+    raise ValueError("a host evidence mapping proof was supplied without an add disposition")
+
+new_allowlist = []
+def append_permission(item):
+    if item not in new_allowlist:
+        new_allowlist.append(item)
+
+for item in canonical_allowlist:
+    if item in retire_permissions:
+        continue
+    if item == str(evidence_source):
+        append_permission(canonical_evidence)
+        continue
+    covered_destinations = []
+    for project, old_path in registrations.items():
+        if covers(item, old_path) and new_paths[project] not in covered_destinations:
+            covered_destinations.append(new_paths[project])
+    if covered_destinations:
+        if covers(item, str(evidence_source)):
+            raise ValueError("one permission ambiguously covers registered projects and evidence")
+        for new_path in covered_destinations:
+            append_permission(new_path)
+    else:
+        append_permission(item)
+
+container_evidence_permissions = [
+    item for item in new_allowlist if covers(item, canonical_evidence)
+]
+if add_evidence_permission:
+    if container_evidence_permissions:
+        raise ValueError("--add-evidence-permission is invalid because an evidence permission already exists")
+    append_permission(canonical_evidence)
+elif replaced_evidence == 0 and not container_evidence_permissions:
+    raise ValueError(
+        "no evidence permission exists; pass --add-evidence-permission only after proving the host mapping"
+    )
+
+for project, details in registration_coverage.items():
+    after_permissions = [
+        item for item in new_allowlist if covers(item, new_paths[project])
+    ]
+    details["before_authorized"] = bool(details["before_permissions"])
+    details["after_permissions"] = after_permissions
+    details["after_authorized"] = bool(after_permissions)
+    if details["before_authorized"] != details["after_authorized"]:
+        raise ValueError(f"permission coverage changed for registered project {project}")
 filesystem["allowlist"] = new_allowlist
 
 def changed(path):
@@ -239,6 +338,12 @@ metadata = {
     "registrations": registrations,
     "new_paths": new_paths,
     "sandbox_projects": sorted(sandboxes),
+    "permission_choices": {
+        "add_evidence_permission": add_evidence_permission,
+        "retired_permissions": retire_permissions,
+        "evidence_mapping_proof": mapping_proof,
+    },
+    "registration_permission_coverage": registration_coverage,
     "routes": {
         "sandboxes": resolved_sandboxes,
         "deploy_sidecar": config.deploy.sidecar_url,
@@ -284,10 +389,121 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--previous-runtime", required=True, type=Path)
     parser.add_argument("--receipt", required=True, type=Path)
     parser.add_argument("--evidence-source-path", required=True, type=Path)
+    parser.add_argument(
+        "--add-evidence-permission",
+        action="store_true",
+        help="explicitly authorize adding /var/lib/forge-evidence after host mapping proof",
+    )
+    parser.add_argument(
+        "--retire-permission",
+        action="append",
+        default=[],
+        metavar="OLD",
+        help="retire one exact existing obsolete permission; repeat for each disposition",
+    )
     parser.add_argument("--secret-env-file", action="append", default=[], type=Path)
     parser.add_argument("--ack-registration-drift", action="append", default=[])
     parser.add_argument("--machine-term", action="append", default=[])
     return parser.parse_args()
+
+
+def canonical_host_path(value: Path | str, label: str) -> Path:
+    text = str(value)
+    if not text.startswith("/") or os.path.normpath(text) != text or str(Path(text)) != text:
+        refuse(f"{label} is not a canonical absolute path")
+    return Path(text)
+
+
+def mount_field(mount: dict, names: tuple[str, ...], label: str) -> object:
+    values = [mount[name] for name in names if name in mount and mount[name] is not None]
+    if not values:
+        refuse(f"a previous-runtime mount has no {label}")
+    if any(value != values[0] for value in values[1:]):
+        refuse(f"a previous-runtime mount has conflicting {label} fields")
+    return values[0]
+
+
+def safe_directory_identity(path: Path, label: str) -> dict[str, int]:
+    path = canonical_host_path(path, label)
+    current = Path(path.anchor)
+    try:
+        for part in path.parts[1:]:
+            current /= part
+            status = os.lstat(current)
+            if stat.S_ISLNK(status.st_mode):
+                refuse(f"{label} has symbolic-link component {current}")
+            if current != path and not stat.S_ISDIR(status.st_mode):
+                refuse(f"{label} has non-directory ancestor {current}")
+        final = os.lstat(path)
+    except FileNotFoundError:
+        refuse(f"{label} does not exist on the host")
+    except OSError as exc:
+        refuse(f"cannot inspect {label} ({type(exc).__name__}); prove a stable host path")
+    if not stat.S_ISDIR(final.st_mode):
+        refuse(f"{label} is not a host directory")
+    return {"device": final.st_dev, "inode": final.st_ino, "mode": stat.S_IFMT(final.st_mode)}
+
+
+def prove_evidence_mapping(evidence_source: Path, mounts: list[dict]) -> dict:
+    evidence_source = canonical_host_path(evidence_source, "the declared evidence source path")
+    parsed_mounts: list[tuple[int, str, Path, Path | None]] = []
+    candidates: list[tuple[int, Path, Path, Path]] = []
+    for index, mount in enumerate(mounts):
+        mount_type = str(mount_field(mount, ("Type", "type"), "type")).lower()
+        destination = canonical_host_path(
+            mount_field(mount, ("Destination", "destination", "target"), "destination"),
+            "a previous-runtime mount destination",
+        )
+        source_path = None
+        if mount_type == "bind":
+            source_path = canonical_host_path(
+                mount_field(mount, ("Source", "source"), "bind source"),
+                "a previous-runtime bind source",
+            )
+            try:
+                relative = evidence_source.relative_to(source_path)
+            except ValueError:
+                pass
+            else:
+                candidates.append((index, source_path, destination, destination / relative))
+        parsed_mounts.append((index, mount_type, destination, source_path))
+    if len(candidates) != 1:
+        refuse("the declared evidence source must be beneath exactly one previous-runtime bind")
+    selected_index, bind_source, bind_destination, container_evidence = candidates[0]
+    for index, _mount_type, destination, _source in parsed_mounts:
+        if index == selected_index:
+            continue
+        overlaps_evidence = (
+            destination == container_evidence
+            or destination in container_evidence.parents
+            or container_evidence in destination.parents
+        )
+        at_or_below_selected_bind = (
+            destination == bind_destination or bind_destination in destination.parents
+        )
+        if overlaps_evidence and at_or_below_selected_bind:
+            refuse(
+                f"previous-runtime mount destination {destination} shadows the mapped evidence path"
+            )
+    return {
+        "bind_source": str(bind_source),
+        "bind_destination": str(bind_destination),
+        "container_evidence": str(container_evidence),
+        "evidence_source": str(evidence_source),
+        "bind_source_identity": safe_directory_identity(bind_source, "the selected bind source"),
+        "evidence_source_identity": safe_directory_identity(evidence_source, "the declared evidence source path"),
+    }
+
+
+def verify_evidence_mapping_identity(proof: dict) -> None:
+    checks = (
+        ("bind_source", "bind_source_identity", "the selected bind source"),
+        ("evidence_source", "evidence_source_identity", "the declared evidence source path"),
+    )
+    for path_key, identity_key, label in checks:
+        current = safe_directory_identity(Path(proof[path_key]), label)
+        if current != proof[identity_key]:
+            refuse(f"{label} changed identity while settings were being transformed")
 
 
 def read_env(path: Path) -> tuple[dict[str, str], bytes]:
@@ -655,6 +871,19 @@ def validate_compose(
 
 def main() -> int:
     args = parse_args()
+    retire_permissions = [
+        str(canonical_host_path(item, "a retired permission choice"))
+        for item in args.retire_permission
+    ]
+    if len(retire_permissions) != len(set(retire_permissions)):
+        refuse("a retired permission choice was supplied more than once")
+    for index, left in enumerate(map(Path, retire_permissions)):
+        for right in map(Path, retire_permissions[index + 1:]):
+            if left in right.parents or right in left.parents:
+                refuse("retired permission choices overlap and are ambiguous")
+    args.evidence_source_path = canonical_host_path(
+        args.evidence_source_path, "the declared evidence source path"
+    )
     inputs = (args.env_file, args.settings_input, *args.compose_file, args.previous_runtime, *args.secret_env_file)
     for path in inputs:
         if not path.is_file():
@@ -665,7 +894,10 @@ def main() -> int:
         print(f"PLAN 1 read public env as data from {args.env_file} and private names from {len(args.secret_env_file)} secret file(s)")
         print(f"PLAN 2 rewrite {args.settings_input} to {args.settings_output} with planning disabled and documented names/container paths")
         print(f"PLAN 3 validate with the immutable FORGE_IMAGE, the real loader, and {len(args.compose_file)} ordered Compose file(s)")
-        print(f"PLAN 4 compare registrations with {args.previous_runtime} and require exact drift acknowledgements")
+        print(
+            f"PLAN 4 compare registrations with {args.previous_runtime}, require exact drift acknowledgements, "
+            f"add evidence permission={args.add_evidence_permission}, retire permissions={retire_permissions}"
+        )
         print(f"PLAN 5 stage the complete output set, then replace {args.env_output}, {args.settings_output}, and {args.receipt}")
         return 0
 
@@ -713,6 +945,19 @@ def main() -> int:
         refuse(f"previous runtime {args.previous_runtime} is not format_version 1; recreate it with rollout-snapshot")
     if runtime.get("release_image_id") != resolved["FORGE_IMAGE"]:
         refuse("previous runtime release_image_id differs from immutable FORGE_IMAGE; use artifacts from the same rollout")
+    mapping_proof = (
+        prove_evidence_mapping(args.evidence_source_path, mounts)
+        if args.add_evidence_permission
+        else None
+    )
+    operation = {
+        "add_evidence_permission": args.add_evidence_permission,
+        "retire_permissions": retire_permissions,
+        "evidence_mapping_proof": mapping_proof,
+    }
+    protected_input_hashes = {
+        path: hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs
+    }
     with tempfile.TemporaryDirectory(prefix="rollout-settings-") as workspace:
         work = Path(workspace)
         transformed = work / "forge.yaml"
@@ -729,12 +974,26 @@ def main() -> int:
             "-v", f"{args.previous_runtime.resolve()}:/input/previous-runtime.json:ro",
             "-v", f"{work}:/output", resolved["FORGE_IMAGE"], "-c", TRANSFORMER,
             "/input/forge.yaml", "/output/forge.yaml", "/output/metadata.json", "/input/previous-runtime.json",
-            str(args.evidence_source_path),
+            str(args.evidence_source_path), json.dumps(operation, sort_keys=True, separators=(",", ":")),
         ])
         run(command, env=process_env)
+        for path, expected_hash in protected_input_hashes.items():
+            if hashlib.sha256(path.read_bytes()).hexdigest() != expected_hash:
+                refuse(f"input {path} changed while settings were being transformed")
+        if mapping_proof is not None:
+            verify_evidence_mapping_identity(mapping_proof)
         try:
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
             settings_bytes = transformed.read_bytes()
+            expected_permission_choices = {
+                "add_evidence_permission": operation["add_evidence_permission"],
+                "retired_permissions": operation["retire_permissions"],
+                "evidence_mapping_proof": operation["evidence_mapping_proof"],
+            }
+            if metadata.get("permission_choices") != expected_permission_choices:
+                refuse("the schema container returned different permission dispositions")
+        except Refusal:
+            raise
         except Exception as exc:
             refuse(f"the schema container did not produce complete output ({type(exc).__name__}); inspect the chosen image")
 
@@ -819,9 +1078,12 @@ def main() -> int:
                     "new_path": metadata["new_paths"][project],
                     "previously_bound": registrations[project] in destinations,
                     "sandbox_configured": project in metadata["sandbox_projects"],
+                    **metadata["registration_permission_coverage"][project],
                 }
                 for project in sorted(registrations)
             },
+            "permission_choices": metadata["permission_choices"],
+            "registration_permission_coverage": metadata["registration_permission_coverage"],
             "registration_drift_acknowledged": acknowledged,
             "previous_runtime_environment_names": sorted(env_names),
             "checks": ["forge.config.loader.load_config", "section-7-routes", "docker-compose-config", "machine-value-sweep"],
