@@ -221,6 +221,24 @@ def validate_declared(model: Any, bound: dict[str, str], expected_settings: Path
         refuse("rendered coordinator publisher URL differs from the fixed port")
 
 
+def firewall_driver(field: str, value: Any) -> str:
+    if isinstance(value, str):
+        driver = value
+    elif field == "FirewallBackend" and isinstance(value, dict):
+        driver = value.get("Driver")
+        details = value.get("Info", [])
+        if not isinstance(details, list) or any(
+            not isinstance(row, list) or len(row) != 2 or any(not isinstance(item, str) for item in row)
+            for row in details
+        ):
+            refuse("Docker firewall backend details are malformed")
+    else:
+        refuse("Docker firewall backend identity is malformed")
+    if not isinstance(driver, str) or not driver:
+        refuse("Docker firewall backend driver is malformed")
+    return driver
+
+
 def daemon_identity(host: str) -> str:
     info = docker_json(host, "info", "--format", "{{json .}}")
     if not isinstance(info.get("ID"), str) or not info["ID"]:
@@ -230,7 +248,7 @@ def daemon_identity(host: str) -> str:
     if any(not isinstance(x, str) or "rootless" in x.lower() for x in info["SecurityOptions"]):
         refuse("publisher policy does not support a rootless or unknown Docker daemon")
     for field in ("FirewallBackend", "FirewallDriver"):
-        if field in info and info[field] != "iptables":
+        if field in info and firewall_driver(field, info[field]) != "iptables":
             refuse("Docker native nftables or unknown firewall backend is not qualified")
     version = run(["iptables", "--version"]).stdout.strip()
     if not re.fullmatch(r"iptables v1\.8\.\d+ \(nf_tables\)", version):

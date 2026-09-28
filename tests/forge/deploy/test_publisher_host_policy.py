@@ -242,12 +242,22 @@ def test_membership_ports_ipv6_and_running_state_refuse(monkeypatch, change):
     with pytest.raises(m.Refusal):m.inspect_topology(m.DOCKER_HOST,bound,require_members=True)
 
 
-@pytest.mark.parametrize("case", ["good-old-info", "good-iptables-info", "legacy", "native", "missing-chains", "native-table", "rootless", "unknown-info"])
+@pytest.mark.parametrize("case", [
+    "good-old-info", "good-iptables-info", "good-firewall-object", "good-firewall-object-info",
+    "legacy", "native", "native-object", "malformed-object", "malformed-object-info",
+    "conflicting-fields", "missing-chains", "native-table", "rootless", "unknown-info",
+])
 def test_positive_backend_qualification(monkeypatch, case):
     m=load_helper(); info={"ID":"daemon", "OSType":"linux", "SecurityOptions":["name=seccomp,profile=builtin"]}
     if case=="good-iptables-info":info["FirewallBackend"]="iptables"
+    if case=="good-firewall-object":info["FirewallBackend"]={"Driver":"iptables"}
+    if case=="good-firewall-object-info":info["FirewallBackend"]={"Driver":"iptables", "Info":[["EnableUserlandProxy","true"],["UserlandProxyPath","/usr/bin/docker-proxy"]]}
     if case=="native":info["FirewallBackend"]="nftables"
     if case=="unknown-info":info["FirewallBackend"]=""
+    if case=="native-object":info["FirewallBackend"]={"Driver":"nftables"}
+    if case=="malformed-object":info["FirewallBackend"]={}
+    if case=="malformed-object-info":info["FirewallBackend"]={"Driver":"iptables", "Info":"unreadable"}
+    if case=="conflicting-fields":info.update(FirewallBackend={"Driver":"iptables"}, FirewallDriver="nftables")
     if case=="rootless":info["SecurityOptions"].append("name=rootless")
     monkeypatch.setattr(m,"docker_json",lambda *a:info)
     def run(argv,**kw):
