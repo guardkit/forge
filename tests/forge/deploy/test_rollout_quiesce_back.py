@@ -288,6 +288,25 @@ def test_runtime_seal_accepts_only_plain_equivalent_bind_mode_spelling():
         changed=json.loads(json.dumps(recreated));changed['mounts'][0][field]=value
         assert q.stable_runtime(base)!=q.stable_runtime(changed)
 
+def test_runtime_seal_treats_complete_unique_mount_inventory_as_unordered():
+    base={'service_identity':{'container_id':'a'*64,'name':'/old'},'networks':{},'image_id':'x','repo_tags':[],'port_bindings':{},'restart_policy':{},'network_mode':'owned','env_names':[]}
+    mounts=[{'Type':'bind','Source':'/owned/source-'+str(index),'Destination':'/owned/destination-'+str(index),'Mode':'rw','RW':True,'Propagation':'rprivate'} for index in range(7)]
+    saved=dict(base,mounts=mounts);recreated=dict(base,mounts=list(reversed(json.loads(json.dumps(mounts)))))
+    assert q.stable_runtime(saved)==q.stable_runtime(recreated)
+    assert q.stable_runtime(saved)['mounts']==sorted(mounts,key=lambda mount:mount['Destination'])
+    changed=json.loads(json.dumps(recreated));changed['mounts'][0]['Source']='/different';assert q.stable_runtime(saved)!=q.stable_runtime(changed)
+    assert q.stable_runtime(saved)!=q.stable_runtime(dict(base,mounts=mounts[:-1]))
+    assert q.stable_runtime(saved)!=q.stable_runtime(dict(base,mounts=mounts+[dict(mounts[0],Destination='/owned/extra')]))
+
+@pytest.mark.parametrize('destination',['relative','//ambiguous','/not/../canonical','/trailing/','/contains\x00nul'])
+def test_mount_inventory_refuses_malformed_destination(destination):
+    with pytest.raises(r.Refusal,match='canonical absolute path'):
+        q.stable_mount_inventory([{'Type':'volume','Destination':destination}])
+
+def test_mount_inventory_refuses_duplicate_destination_before_sorting():
+    mounts=[{'Type':'volume','Destination':'/same','Name':'one'},{'Type':'bind','Source':'/owned/two','Destination':'/same','Mode':'rw','RW':True,'Propagation':'rprivate'}]
+    with pytest.raises(r.Refusal,match='ambiguous'):q.stable_mount_inventory(mounts)
+
 @pytest.mark.parametrize('mode,rw',[('ro',True),('rw',False),('z',True),('Z',False),('ro,z',False),('cached',True)])
 def test_bind_mode_with_other_or_contradictory_semantics_refuses(mode,rw):
     mount={'Type':'bind','Source':'/owned/source','Destination':'/target','Mode':mode,'RW':rw,'Propagation':'rprivate'}
