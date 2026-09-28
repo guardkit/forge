@@ -47,6 +47,37 @@ def nft_document(module, project="chosen-project"):
     ]}
 
 
+# Verbatim `nft -j list table` from the 28 September 2026 rehearsal guest
+# (Ubuntu 24.04, nftables v1.0.9) for scratch table claude_diag_a78 holding the
+# two owned rules.  nft lists them without the explicit `meta l4proto tcp`.
+CAPTURED_PROJECT = "codex-policy-qual-7bef3033-20260928"
+CAPTURED_SPECIFICATION_SHA256 = "2e8eede139d20dfca388e4df5d4d396d31185c70ac7d0f473c968cad08deda9e"
+CAPTURED_NFT_JSON = '{"nftables": [{"metainfo": {"version": "1.0.9", "release_name": "Old Doc Yak #3", "json_schema_version": 1}}, {"table": {"family": "inet", "name": "claude_diag_a78", "handle": 10}}, {"chain": {"family": "inet", "table": "claude_diag_a78", "name": "c", "handle": 1}}, {"rule": {"family": "inet", "table": "claude_diag_a78", "chain": "c", "handle": 2, "expr": [{"match": {"op": "==", "left": {"meta": {"key": "oifname"}}, "right": "fpb74d601cb0cea"}}, {"match": {"op": "==", "left": {"payload": {"protocol": "tcp", "field": "dport"}}, "right": 8711}}, {"match": {"op": "==", "left": {"ct": {"key": "direction"}}, "right": "reply"}}, {"return": null}]}}, {"rule": {"family": "inet", "table": "claude_diag_a78", "chain": "c", "handle": 3, "expr": [{"match": {"op": "==", "left": {"meta": {"key": "oifname"}}, "right": "fpb74d601cb0cea"}}, {"match": {"op": "==", "left": {"payload": {"protocol": "tcp", "field": "dport"}}, "right": 8711}}, {"counter": {"packets": 0, "bytes": 0}}, {"drop": null}]}}]}'
+
+
+def listed_document(module):
+    """The captured listing renamed to the owned binding; expressions untouched."""
+    bound = module.binding(CAPTURED_PROJECT)
+    document = json.loads(CAPTURED_NFT_JSON)
+    for entry in document["nftables"]:
+        if "table" in entry:
+            entry["table"]["name"] = bound["table"]
+        if "chain" in entry:
+            # The scratch chain was a plain chain; give it the owned base-chain identity.
+            entry["chain"].update(table=bound["table"], name="host_output", type="filter",
+                                  hook="output", prio=-5, policy="accept")
+        if "rule" in entry:
+            entry["rule"].update(table=bound["table"], chain="host_output")
+    return document
+
+
+def form_document(module, form):
+    """Return (document, index of the dport match) for the explicit or listed form."""
+    if form == "explicit":
+        return nft_document(module, CAPTURED_PROJECT), 2
+    return listed_document(module), 1
+
+
 def test_describe_is_filesystem_only_and_project_derived() -> None:
     result = subprocess.run(
         [sys.executable, str(HELPER), "describe", "--project", "forge-estate-example"],
@@ -531,3 +562,102 @@ def test_running_publisher_settings_identity_is_checked(monkeypatch,tmp_path,cha
     if changed=='none':m.verify_publisher_settings(m.DOCKER_HOST,'owned',settings)
     else:
         with pytest.raises(m.Refusal):m.verify_publisher_settings(m.DOCKER_HOST,'owned',settings)
+
+
+def test_real_nft_listing_without_l4proto_passes_readback() -> None:
+    m=load_helper();b=m.binding(CAPTURED_PROJECT);document=listed_document(m)
+    rules=[entry["rule"]["expr"] for entry in document["nftables"] if "rule" in entry]
+    assert all(expr[0]["match"]["right"]==b["bridge"] for expr in rules)
+    assert "l4proto" not in CAPTURED_NFT_JSON
+    m.verify_semantics(document,b)
+    document["nftables"][4]["rule"]["handle"]=999
+    document["nftables"][4]["rule"]["expr"][-2]["counter"]={"packets":99,"bytes":12345}
+    m.verify_semantics(document,b)
+
+
+def test_explicit_l4proto_listing_still_passes_readback() -> None:
+    m=load_helper();m.verify_semantics(nft_document(m,CAPTURED_PROJECT),m.binding(CAPTURED_PROJECT))
+
+
+def test_policy_text_and_fingerprint_are_unchanged() -> None:
+    m=load_helper();b=m.binding(CAPTURED_PROJECT)
+    assert m.specification(b)["sha256"]==CAPTURED_SPECIFICATION_SHA256
+    assert m.nft_text(b).count("meta l4proto tcp tcp dport 8711")==2
+
+
+def _insert(expr, index, value): expr.insert(index, value)
+
+
+def _swap(expr, i, j): expr[i], expr[j] = expr[j], expr[i]
+
+
+EXTRA_MATCH={"match":{"op":"==","left":{"meta":{"key":"iifname"}},"right":"lo"}}
+TCP_L4PROTO={"match":{"op":"==","left":{"meta":{"key":"l4proto"}},"right":"tcp"}}
+UDP_L4PROTO={"match":{"op":"==","left":{"meta":{"key":"l4proto"}},"right":"udp"}}
+# Each change receives a rule's expressions and the index of its dport match
+# (2 in the explicit form, 1 in the listed form).
+HEAD_CHANGES={
+    "udp-payload":lambda e,d:e[d]["match"]["left"]["payload"].update(protocol="udp"),
+    "sport":lambda e,d:e[d]["match"]["left"]["payload"].update(field="sport"),
+    "port-8712":lambda e,d:e[d]["match"].update(right=8712),
+    "not-equal-port":lambda e,d:e[d]["match"].update(op="!="),
+    "extra-payload-key":lambda e,d:e[d]["match"]["left"]["payload"].update(base="th"),
+    "wrong-bridge":lambda e,d:e[0]["match"].update(right="wrongbridge"),
+    "extra-match":lambda e,d:_insert(e,d+1,copy.deepcopy(EXTRA_MATCH)),
+    "extra-trailing":lambda e,d:e.append(copy.deepcopy(EXTRA_MATCH)),
+    "l4proto-udp":lambda e,d:e[1]["match"].update(right="udp") if d==2 else _insert(e,1,copy.deepcopy(UDP_L4PROTO)),
+    "l4proto-after-dport":lambda e,d:_swap(e,1,2) if d==2 else _insert(e,2,copy.deepcopy(TCP_L4PROTO)),
+    "dport-before-bridge":lambda e,d:_swap(e,0,d),
+    "tail-reordered":lambda e,d:_swap(e,-1,-2),
+    "reversed":lambda e,d:e.reverse(),
+}
+
+
+@pytest.mark.parametrize("rule", [3, 4], ids=["reply-rule", "drop-rule"])
+@pytest.mark.parametrize("change", list(HEAD_CHANGES.values()), ids=list(HEAD_CHANGES))
+@pytest.mark.parametrize("form", ["explicit", "listed"])
+def test_both_listing_forms_refuse_changed_rule_heads(form, change, rule) -> None:
+    m=load_helper();document,dport=form_document(m,form)
+    change(document["nftables"][rule]["rule"]["expr"],dport)
+    with pytest.raises(m.Refusal,match="changed semantics"):
+        m.verify_semantics(document,m.binding(CAPTURED_PROJECT))
+
+
+TAIL_CHANGES={
+    "reply-gains-counter":(3,lambda e:_insert(e,-1,{"counter":{"packets":0,"bytes":0}})),
+    "drop-loses-counter":(4,lambda e:e.pop(-2)),
+    "reply-becomes-drop":(3,lambda e:e.__setitem__(-1,{"drop":None})),
+    "drop-becomes-accept":(4,lambda e:e.__setitem__(-1,{"accept":None})),
+}
+
+
+@pytest.mark.parametrize("rule, change", list(TAIL_CHANGES.values()), ids=list(TAIL_CHANGES))
+@pytest.mark.parametrize("form", ["explicit", "listed"])
+def test_both_listing_forms_refuse_changed_rule_tails(form, rule, change) -> None:
+    m=load_helper();document,_=form_document(m,form)
+    change(document["nftables"][rule]["rule"]["expr"])
+    with pytest.raises(m.Refusal,match="changed semantics"):
+        m.verify_semantics(document,m.binding(CAPTURED_PROJECT))
+
+
+@pytest.mark.parametrize("form", ["explicit", "listed"])
+def test_install_succeeds_when_nft_lists_either_form_after_apply(monkeypatch,tmp_path,capsys,form):
+    m=load_helper();installed_paths(m,monkeypatch,tmp_path);b=m.binding(CAPTURED_PROJECT)
+    listing,_=form_document(m,form);state={"applied":False};scripts=[];calls=[]
+    monkeypatch.setattr(m,"validate_env",lambda *a:None)
+    monkeypatch.setattr(m,"inspect_topology",lambda *a,**k:{"members":{},"network_id":""})
+    monkeypatch.setattr(m,"nft_json",lambda table:copy.deepcopy(listing) if state["applied"] else None)
+    def run(argv,*,input_text=None,env=None,check=True):
+        calls.append(argv)
+        if argv==["nft","-f","-"]:scripts.append(input_text);state["applied"]=True
+        elif argv not in (["nft","-c","-f","-"],["systemctl","daemon-reload"]):raise AssertionError(argv)
+        return subprocess.CompletedProcess(argv,0,"","")
+    monkeypatch.setattr(m,"run",run)
+    m.cmd_install(SimpleNamespace(project=b["project"],env_file=tmp_path/"env",docker_host=m.DOCKER_HOST,runtime_only=False))
+    assert scripts==[m.nft_text(b)]
+    assert not any(argv[:2]==["nft","delete"] for argv in calls)
+    config=json.loads((m.CONFIG_DIR/f"{b['suffix']}.json").read_text())
+    assert config==m.canonical_config(b,"daemon",m.DOCKER_HOST,True)
+    assert config["specification"]["sha256"]==CAPTURED_SPECIFICATION_SHA256
+    assert (m.DROPIN_DIR/f"forge-publisher-host-policy-{b['suffix']}.conf").read_bytes()==m.dropin_bytes(b["suffix"])
+    assert f"policy={CAPTURED_SPECIFICATION_SHA256}" in capsys.readouterr().out
