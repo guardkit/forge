@@ -406,6 +406,20 @@ def configure_existing_exact_mapped_evidence(scenario):
     return host_parent, evidence_source
 
 
+def configure_existing_canonical_mapped_evidence(scenario):
+    host_parent, evidence_source = configure_parent_mapped_evidence(scenario)
+    settings = yaml.safe_load(scenario["settings_input"].read_text())
+    settings["permissions"]["filesystem"]["allowlist"] = [
+        "/var/lib/forge-evidence" if item == "/var/forge" else item
+        for item in settings["permissions"]["filesystem"]["allowlist"]
+    ]
+    scenario["settings_input"].write_text(
+        yaml.safe_dump(settings, sort_keys=False), encoding="utf-8"
+    )
+    scenario["command"].remove("--add-evidence-permission")
+    return host_parent, evidence_source
+
+
 def configure_complete_actual_shape(scenario):
     """Model the complete sanitized 19/6/9 legacy settings and permission shape."""
     registrations, alias_pairs, sandbox_projects = configure_legacy_alias_shape(scenario)
@@ -810,6 +824,57 @@ def test_existing_exact_evidence_still_allows_unrelated_retirement(scenario):
     receipt = json.loads(scenario["outputs"]["receipt"].read_text())
     assert receipt["permission_choices"]["add_evidence_permission"] is False
     assert receipt["permission_choices"]["retired_permissions"] == [obsolete]
+
+
+@pytest.mark.parametrize("permission", ["/var/forge", "/var/forge/receipts"])
+def test_existing_canonical_evidence_cannot_retire_runtime_mapped_path(scenario, permission):
+    configure_existing_canonical_mapped_evidence(scenario)
+    settings = yaml.safe_load(scenario["settings_input"].read_text())
+    settings["permissions"]["filesystem"]["allowlist"].append(permission)
+    scenario["settings_input"].write_text(yaml.safe_dump(settings, sort_keys=False))
+    scenario["command"].extend(["--retire-permission", permission])
+    previous = {name: f"previous-{name}\n".encode() for name in scenario["outputs"]}
+    for name, path in scenario["outputs"].items():
+        path.write_bytes(previous[name])
+
+    result = run(scenario)
+
+    assert result.returncode == 2
+    assert all(path.read_bytes() == previous[name] for name, path in scenario["outputs"].items())
+
+
+def test_existing_canonical_evidence_still_allows_unrelated_retirement(scenario):
+    configure_existing_canonical_mapped_evidence(scenario)
+    obsolete = "/home/synthetic-obsolete-permission"
+    settings = yaml.safe_load(scenario["settings_input"].read_text())
+    settings["permissions"]["filesystem"]["allowlist"].append(obsolete)
+    scenario["settings_input"].write_text(yaml.safe_dump(settings, sort_keys=False))
+    scenario["command"].extend(["--retire-permission", obsolete])
+
+    result = run(scenario)
+
+    assert result.returncode == 0, result.stderr
+    rendered = yaml.safe_load(scenario["outputs"]["settings"].read_text())
+    assert obsolete not in rendered["permissions"]["filesystem"]["allowlist"]
+    assert rendered["permissions"]["filesystem"]["allowlist"].count("/var/lib/forge-evidence") == 1
+
+
+@pytest.mark.parametrize("field", ["Source", "Destination"])
+def test_retirement_refuses_unusable_relevant_bind_metadata(scenario, field):
+    configure_existing_canonical_mapped_evidence(scenario)
+    settings = yaml.safe_load(scenario["settings_input"].read_text())
+    obsolete = "/home/synthetic-obsolete-permission"
+    settings["permissions"]["filesystem"]["allowlist"].append(obsolete)
+    scenario["settings_input"].write_text(yaml.safe_dump(settings, sort_keys=False))
+    scenario["command"].extend(["--retire-permission", obsolete])
+    runtime = json.loads(scenario["runtime"].read_text())
+    runtime["mounts"][-1][field] = "relative/unusable"
+    scenario["runtime"].write_text(json.dumps(runtime), encoding="utf-8")
+
+    result = run(scenario)
+
+    assert result.returncode == 2
+    assert not any(path.exists() for path in scenario["outputs"].values())
 
 
 def test_existing_publication_enabled_policy_is_preserved(scenario):

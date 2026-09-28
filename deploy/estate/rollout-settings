@@ -233,7 +233,7 @@ elif mapping_proof is not None:
 mapped_evidence_paths = []
 if add_evidence_permission:
     mapped_evidence_paths.append(str(proof_container))
-elif replaced_evidence:
+elif retire_permissions:
     for mount in runtime_mounts:
         mount_type = str(mount.get("Type", mount.get("type", ""))).lower()
         if mount_type != "bind":
@@ -242,13 +242,23 @@ elif replaced_evidence:
             bind_source = canonical_absolute(
                 mount.get("Source", mount.get("source")), "a previous-runtime bind source"
             )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "cannot safely evaluate retirement against an unusable previous-runtime bind source"
+            ) from exc
+        try:
+            relative_evidence = evidence_source.relative_to(bind_source)
+        except ValueError:
+            continue
+        try:
             bind_destination = canonical_absolute(
                 mount.get("Destination", mount.get("destination", mount.get("target"))),
                 "a previous-runtime bind destination",
             )
-            relative_evidence = evidence_source.relative_to(bind_source)
-        except (TypeError, ValueError):
-            continue
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "cannot safely evaluate retirement against an unusable previous-runtime bind destination"
+            ) from exc
         mapped_evidence_paths.append(str(bind_destination / relative_evidence))
 for choice in retire_permissions:
     if any(covers(choice, path) for path in mapped_evidence_paths):
