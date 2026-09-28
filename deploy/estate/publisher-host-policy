@@ -545,9 +545,19 @@ def systemd_properties(unit: str, names: str) -> dict[str, str]:
 
 def loader_effective(bound: dict[str, str], *, installed: bool) -> None:
     name = f"forge-publisher-host-policy@{bound['suffix']}.service"
+    identity = systemd_properties(name, "Id,Names,FragmentPath,DropInPaths,LoadState")
+    if identity["LoadState"] == "not-found":
+        absent = {
+            "Id": name,
+            "Names": name,
+            "FragmentPath": "",
+            "DropInPaths": "",
+            "LoadState": "not-found",
+        }
+        if not installed and identity == absent:
+            return
+        refuse("effective systemd loader has a conflicting absent identity")
     props = systemd_properties(name, "Id,Names,FragmentPath,DropInPaths,LoadState,Type,RemainAfterExit,ExecStart")
-    if not installed and props["LoadState"] == "not-found" and not props["FragmentPath"] and not props["DropInPaths"]:
-        return
     expected = f"{HELPER} load-static --config {CONFIG_DIR}/{bound['suffix']}.json"
     argv = re.findall(r"argv\[\]=(.*?) ;", props["ExecStart"])
     if props["Id"] != name or props["Names"].split() != [name] or props["FragmentPath"] != str(UNIT) or props["DropInPaths"] or props["LoadState"] != "loaded" or props["Type"] != "oneshot" or props["RemainAfterExit"] != "yes" or argv != [expected]:
