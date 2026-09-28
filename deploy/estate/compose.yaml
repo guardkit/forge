@@ -19,10 +19,12 @@
 # BRING IT UP (the passwords come from a child process, never from a file
 # here — see README.md):
 #
-#     cp .env.example .env            # then fill in the lines marked CHANGE THIS
-#     ./build-estate-images.sh        # the bus image, at its pinned commit
-#     sops exec-env "$NATS_SECRETS_FILE" './estate-check host'
-#     sops exec-env "$NATS_SECRETS_FILE" 'docker compose --env-file .env up -d'
+#     Choose absolute FACTORY_ESTATE_DIR/ENV, an explicit project, and
+#     DOCKER_HOST=unix:///var/run/docker.sock as README.md specifies.
+#     ./publisher-host-policy describe --project "$FACTORY_ESTATE_PROJECT"
+#     Install and verify the policy, then run estate-check host, using the same
+#     absolute env, project and local endpoint. Use README.md's exact ordered
+#     local or external bus-mode up command.
 #     ./estate-check services         # a clean shell: these need no password
 #     ./factory-hello
 #

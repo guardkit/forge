@@ -53,11 +53,9 @@ replaces the two host units that used to do that:
 
 A machine has one of these per project sandbox, which is why it is a file of
 its own rather than a fourth service in `compose.yaml`: a machine with no
-sandbox should not have to comment anything out. Bring the two up together:
-
-```
-docker compose --env-file .env -f compose.yaml -f compose.sandbox-runner.yaml up -d
-```
+sandbox should not have to comment anything out. The complete estate selects
+this file through COMPOSE_PROFILES. Follow ../estate/README.md; this is not a
+supported standalone startup route.
 
 **It is the only thing in this bundle that is given anything of the machine
 beyond Docker itself, and it is worth saying why that is allowed.** A sandbox
@@ -210,13 +208,12 @@ containerised coordinator ends up healthy and reaching nothing.
 
 ## Bring it up
 
-```
-cp .env.example .env
-# edit .env: the factory gateway address, the two sandbox ports, and the two
-# publisher file paths
-docker compose --env-file .env up -d
-docker compose ps
-```
+This Compose file is a component of the complete estate, not a supported
+standalone startup route. Follow ../estate/README.md. That route derives and
+installs the project-bound host policy, runs estate-check host, and then starts
+the exact ordered estate files for local or external bus mode. Sandbox
+participation remains COMPOSE_PROFILES in the estate env; do not replace it
+with a command-line --profile.
 
 **There is no longer a one-off ownership step before the first start.** It
 used to be here — a `chown 1000:1000` over the four coordinator volumes,

@@ -809,7 +809,7 @@ def service_environment(service: dict, service_name: str) -> dict[str, str]:
 
 
 def validate_compose(
-    rendered: dict, env: dict[str, str], old_paths: list[str], images: dict[str, str]
+    rendered: dict, env: dict[str, str], old_paths: list[str], images: dict[str, str], project: str
 ) -> dict[str, str]:
     services = rendered.get("services", {})
     for name in ("coordinator", "answer-service", "forge-publisher"):
@@ -876,6 +876,16 @@ def validate_compose(
     members = {name for name, service in services.items() if "forge-publisher-net" in set(service.get("networks", {}))}
     if members != {"coordinator", "forge-publisher"} or services["forge-publisher"].get("ports"):
         refuse("rendered publisher network or ports expose more than coordinator-to-publisher; correct the project")
+    expected_bridge = "fpb" + hashlib.sha256(project.encode("utf-8")).hexdigest()[:12]
+    if require(env, "FORGE_PUBLISHER_BRIDGE") != expected_bridge:
+        refuse("FORGE_PUBLISHER_BRIDGE does not match the explicit Compose project; derive it with publisher-host-policy describe")
+    publisher_network = (rendered.get("networks") or {}).get("forge-publisher-net") or {}
+    driver_opts = publisher_network.get("driver_opts") or publisher_network.get("driver_options") or {}
+    if publisher_network.get("driver", "bridge") != "bridge" or publisher_network.get("enable_ipv6") is not False or driver_opts.get("com.docker.network.bridge.name") != expected_bridge:
+        refuse("rendered publisher network lacks the fixed IPv4 bridge binding; correct the project")
+    health = services["forge-publisher"].get("healthcheck") or {}
+    if "localhost:8711/healthz" not in json.dumps(health, sort_keys=True):
+        refuse("rendered publisher healthcheck does not use its fixed port 8711")
     gateway = env["FACTORY_GATEWAY_ADDRESS"]
     for name, service in services.items():
         for port in service.get("ports", []) or []:
@@ -1071,7 +1081,7 @@ def main() -> int:
             rendered = json.loads(compose_bytes)
         except Exception as exc:
             refuse(f"Compose did not return JSON ({type(exc).__name__}); use a supported Docker Compose and retry")
-        coordinator_env = validate_compose(rendered, resolved, list(registrations.values()), image_ids)
+        coordinator_env = validate_compose(rendered, resolved, list(registrations.values()), image_ids, args.project)
 
         loader_command = [
             docker, "run", "--rm", "--network", "none", "--read-only",

@@ -24,8 +24,11 @@
 #   * THE FRONT DOOR (the Slack side) and the bus gateway — jarvis's own
 #     compose file, a later rollout row.
 #
-# BRING IT UP:    cp .env.example .env   # then fill in the three machine lines
-#                 docker compose --env-file .env up -d
+# STARTUP: this file is a component of the complete estate. It is not a
+# supported standalone up route. Follow ../estate/README.md: choose one
+# absolute estate env, explicit project and local Docker socket; install and
+# verify publisher-host-policy; run estate-check host; then use the ordered
+# estate Compose files for the selected bus mode.
 # TAKE IT DOWN:   docker compose down                  # keeps the volumes
 #                 docker compose down -v               # and removes them
 #
