@@ -29,17 +29,22 @@ def probe(tmp_path: Path):
     _executable(
         tools / "docker",
         r"""#!/usr/bin/env python3
-import os, sys
+import os, sys, json, hashlib
 args=sys.argv[1:]; text=' '.join(args); mode=os.environ.get('PROBE_CASE','good')
 if args[0]=='compose':
+    if 'config' in args:
+        project='codex-review'; bridge='fpb'+hashlib.sha256(project.encode()).hexdigest()[:12]
+        print(json.dumps({'name':project,'networks':{'forge-publisher-net':{'name':project+'_forge-publisher-net','driver':'bridge','enable_ipv6':False,'driver_opts':{'com.docker.network.bridge.name':bridge}}},'services':{'coordinator':{'networks':{'factory':{},'forge-publisher-net':{}},'environment':{'FORGE_PUBLISHER_URL':'http://forge-publisher:8711'}},'forge-publisher':{'networks':{'forge-publisher-net':{}},'healthcheck':{'test':['CMD','curl','http://localhost:8711/healthz']}}}}))
+        raise SystemExit(0)
     service=args[-1]
-    if service in ('coordinator','answer-service','memory-relay'): print(service)
+    if service in ('coordinator','answer-service','memory-relay','forge-publisher'): print(service)
     if service=='front-door' and mode=='producer': print('unexpected-front-door')
 elif args[:2]==['image','inspect']: print(os.environ['REVIEW_IMAGE'])
 elif args[0]=='inspect':
     if '.Image' in text: print(os.environ['REVIEW_IMAGE'])
     elif 'StartedAt' in text: print(os.environ.get('MOCK_STARTED_AT','2026-09-27T00:00:00Z'))
     elif 'com.docker.compose.project' in text: print('codex-review')
+    elif 'IPAddress' in text: print('192.0.2.2')
     elif 'NetworkSettings' in text: print('codex-review_factory')
 elif args[0]=='network': pass
 elif args[0]=='logs': print('memory: ON')
@@ -55,6 +60,20 @@ else: raise SystemExit(1)
 """,
     )
     _executable(tools / "sbx", "#!/bin/sh\ncase \"$1\" in ls) echo codex-owned-fake-sandbox;; exec) echo 200;; *) exit 1;; esac\n")
+    _executable(tools / "sudo", r"""#!/usr/bin/env python3
+import os, sys, pathlib
+assert os.getuid()==1000, 'must exercise ordinary operator sudo caller'
+a=sys.argv[1:]; assert a[0]=='--' and a[1].endswith('/publisher-host-policy') and a[2]=='verify'
+assert a[a.index('--docker-host')+1]=='unix:///var/run/docker.sock'
+assert a[a.index('--project')+1]=='codex-review'
+assert '--require-members' in a
+if os.environ.get('POLICY_CASE') in ('missing','changed'):
+    print('publisher-host-policy: REFUSED current kernel policy '+os.environ['POLICY_CASE'])
+    raise SystemExit(1)
+p=pathlib.Path(__file__).parent/'counter';n=int(p.read_text())+1 if p.exists() else 1;p.write_text(str(n))
+print('VERIFIED daemon=fixture bridge=fixture drop_packets='+str(n)+' drop_bytes=240')
+""")
+    _executable(tools / "curl", "#!/bin/sh\nprintf '000'\nexit 28\n")
     state = tmp_path / "state"
     state.mkdir()
     env_file = tmp_path / "probe.env"
@@ -82,6 +101,8 @@ COMPOSE_FILE=compose.yaml:compose.external-bus.yaml
     env = os.environ.copy()
     env["PATH"] = f"{tools}:{env['PATH']}"
     env["REVIEW_IMAGE"] = IMAGE
+    env["DOCKER_HOST"] = "unix:///var/run/docker.sock"
+    for key in ("DOCKER_CONTEXT", "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH"): env.pop(key, None)
 
     def run(mode: str = "good", read: bool = False, **extra: str):
         call_env = env | {"PROBE_CASE": mode} | extra
@@ -207,3 +228,21 @@ FACTORY_GATEWAY_ADDRESS=127.0.0.1
         assert done.returncode == 1, done.stdout + done.stderr
         assert "unbound variable" not in done.stderr
         assert "ok            7b" in done.stdout, done.stdout
+
+
+@pytest.mark.parametrize("policy_case", ["missing", "changed"])
+def test_consumed_passing_receipt_refuses_current_policy_loss(probe, policy_case):
+    run, state, _, _ = probe
+    assert run().returncode == 0
+    saved = (state / "pre-resume.json").read_bytes()
+    result = run(read=True, POLICY_CASE=policy_case)
+    assert result.returncode == 1
+    assert "current kernel policy " + policy_case in result.stdout
+    assert (state / "pre-resume.json").read_bytes() == saved
+
+
+@pytest.mark.parametrize("name,value", [("DOCKER_CONTEXT","foreign"),("DOCKER_HOST","tcp://remote:2375"),("DOCKER_TLS_VERIFY","1")])
+def test_privilege_boundary_does_not_hide_client_endpoint_conflicts(probe, name, value):
+    run, state, _, _ = probe
+    assert run().returncode == 0
+    assert run(read=True, **{name:value}).returncode == 1

@@ -1036,3 +1036,14 @@ habit, say — that value is what gets used and `.env` is silently ignored for
 it. That is also exactly how the bus's passwords reach the estate, which is why
 it is worth understanding rather than working around. Bring the estate up from
 a clean shell.
+
+
+Policy installation and replacement require the owned publisher to be stopped;
+the helper refuses a running publisher and never stops it automatically. Docker
+qualification requires readable active Docker iptables chains, iptables 1.8 using
+`nf_tables`, and nftables 1.0. It refuses the newer Docker native nftables backend,
+legacy iptables, conflicting backend evidence, and unreadable kernel state. This
+qualification also works before this project's network has been created, using
+Docker's existing filter chains. Repeating the static boot loader verifies an
+already exact owned table without replacing it. A runtime-only binding cannot be
+silently downgraded from an existing persistent installation.

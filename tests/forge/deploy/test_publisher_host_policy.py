@@ -3,6 +3,9 @@ from __future__ import annotations
 import importlib.machinery
 import importlib.util
 import json
+import copy
+import os
+from types import SimpleNamespace
 from pathlib import Path
 import subprocess
 import sys
@@ -98,10 +101,12 @@ def test_load_static_uses_no_docker(monkeypatch, tmp_path: Path) -> None:
     module = load_helper(); bound = module.binding("chosen-project")
     calls = []
     monkeypatch.setattr(module, "require_root", lambda: None)
-    monkeypatch.setattr(module, "load_config", lambda path: (bound, {"fixed": True}))
+    monkeypatch.setattr(module, "load_config", lambda path: (bound, {"persistent": True}))
     monkeypatch.setattr(module, "lock", lambda value: open(tmp_path / "lock", "a"))
     monkeypatch.setattr(module.fcntl, "flock", lambda *args: None)
-    monkeypatch.setattr(module, "apply_policy", lambda value: calls.append(("nft", value)))
+    monkeypatch.setattr(module, "apply_policy", lambda value, config: calls.append(("nft", value)))
+    monkeypatch.setattr(module, "persistence_preflight", lambda *args: None)
+    monkeypatch.setattr(module, "owned_policy", lambda *args: False)
     monkeypatch.setattr(module, "docker_json", lambda *args: (_ for _ in ()).throw(AssertionError("Docker called")))
     module.cmd_load_static(type("Args", (), {"config": Path("/etc/forge-publisher-policy/x.json")})())
     assert calls == [("nft", bound)]
@@ -109,18 +114,17 @@ def test_load_static_uses_no_docker(monkeypatch, tmp_path: Path) -> None:
 
 def test_failed_readback_restores_only_the_previous_owned_table(monkeypatch) -> None:
     module = load_helper(); bound = module.binding("chosen-project"); calls = []
-    previous = f"table inet {bound['table']} {{\n chain old {{ }}\n}}\n"
-
+    snapshots = iter([nft_document(module), {"nftables": []}])
     def fake_run(argv, *, input_text=None, env=None, check=True):
         calls.append((argv, input_text))
-        return subprocess.CompletedProcess(argv, 0, previous if argv[:2] == ["nft", "list"] else "", "")
-
+        return subprocess.CompletedProcess(argv, 0, "", "")
     monkeypatch.setattr(module, "run", fake_run)
-    monkeypatch.setattr(module, "nft_json", lambda table: {"nftables": []})
+    monkeypatch.setattr(module, "nft_json", lambda table: next(snapshots))
     with pytest.raises(module.Refusal):
-        module.apply_policy(bound)
+        module.apply_policy(bound, module.canonical_config(bound, "daemon", module.DOCKER_HOST, False))
     scripts = [body for argv, body in calls if argv[:3] == ["nft", "-f", "-"]]
-    assert scripts[-1] == f"delete table inet {bound['table']}\n{previous}"
+    assert len(scripts) == 2
+    assert scripts[-1] == module.transaction(bound, old_exists=True)
     assert "flush ruleset" not in "".join(body or "" for _, body in calls)
 
 
@@ -163,3 +167,245 @@ def test_removal_keeps_shared_artifacts_and_targets_only_owned_names() -> None:
     assert "shared helper and unit retained" in remove
     assert "delete\", \"table\", \"inet\", bound[\"table\"]" in remove
     assert "flush ruleset" not in source
+
+
+@pytest.mark.parametrize("output, count", [("", 0), ('{"ID":"one","Name":"n"}\n', 1), ('{"ID":"one","Name":"n"}\n{"ID":"two","Name":"m"}\n', 2)])
+def test_real_docker_list_stream_shape(monkeypatch, output, count):
+    m = load_helper()
+    monkeypatch.setattr(m, "clean_docker_env", lambda host: {})
+    monkeypatch.setattr(m, "run", lambda *a, **k: SimpleNamespace(stdout=output))
+    assert len(m.docker_rows(m.DOCKER_HOST, "network", "ls")) == count
+
+
+@pytest.mark.parametrize("output", ['[]', '{}', 'null', '{"ID":"one"}', '{"ID":"one","Name":"n"}\nnot-json', '\n', '{"ID":7,"Name":"n"}'])
+def test_malformed_list_data_is_not_absence(monkeypatch, output):
+    m = load_helper(); monkeypatch.setattr(m, "clean_docker_env", lambda host: {})
+    monkeypatch.setattr(m, "run", lambda *a, **k: SimpleNamespace(stdout=output))
+    with pytest.raises(m.Refusal): m.docker_rows(m.DOCKER_HOST, "network", "ls")
+
+
+@pytest.mark.parametrize("output", ['{}', '[]', '[null]', '[{},{}]', '{}\n{}'])
+def test_inspection_requires_one_object_array(monkeypatch, output):
+    m = load_helper(); monkeypatch.setattr(m, "clean_docker_env", lambda host: {})
+    monkeypatch.setattr(m, "run", lambda *a, **k: SimpleNamespace(stdout=output))
+    with pytest.raises(m.Refusal): m.docker_json(m.DOCKER_HOST, "network", "inspect", "id")
+
+
+def topology_boundary(m, monkeypatch, *, net_change=None, links_change=None, container_change=None, absent=False):
+    bound = m.binding("chosen-project")
+    net = {"Id": "network-id", "Name": bound["network"], "Driver": "bridge", "Scope": "local", "Internal": False, "EnableIPv6": False,
+           "Labels": {"com.docker.compose.project": bound["project"], "com.docker.compose.network": "forge-publisher-net"},
+           "Options": {"com.docker.network.bridge.name": bound["bridge"]}, "Containers": {"publisher-id": {"IPv6Address": ""}, "coordinator-id": {"IPv6Address": ""}}}
+    links = [{"ifname": bound["bridge"], "linkinfo": {"info_kind": "bridge"}}]
+    if net_change: net_change(net)
+    if links_change: links_change(links)
+    def fake_run(argv, **kw):
+        if argv[0] == "ip": return SimpleNamespace(stdout=json.dumps(links))
+        assert argv[:3] == ["docker", "--host", m.DOCKER_HOST]
+        args = argv[3:]
+        if args[:2] == ["network", "ls"]:
+            assert "--filter" not in args
+            return SimpleNamespace(stdout="" if absent else json.dumps({"ID": "network-id", "Name": net["Name"]}) + "\n")
+        if args[:2] == ["network", "inspect"]: return SimpleNamespace(stdout=json.dumps([net]))
+        if args[0] == "ps": return SimpleNamespace(stdout="" if absent else json.dumps({"ID":"publisher-id"}) + "\n")
+        if args[0] == "inspect":
+            role = "forge-publisher" if args[1] == "publisher-id" else "coordinator"
+            item = {"Config": {"Labels": {"com.docker.compose.project": bound["project"], "com.docker.compose.service": role}, "Healthcheck": {"Test": ["CMD", "curl", "http://localhost:8711/healthz"]}}, "State": {"Running": True}, "NetworkSettings": {"Networks": {bound["network"]: {}}, "Ports": {"8711/tcp": None}}, "HostConfig": {"PortBindings": {}, "PublishAllPorts": False}}
+            if container_change: container_change(item)
+            return SimpleNamespace(stdout=json.dumps([item]))
+        raise AssertionError(argv)
+    monkeypatch.setattr(m, "run", fake_run); monkeypatch.setattr(m, "clean_docker_env", lambda host: {})
+    return bound
+
+
+def test_real_list_caller_accepts_exact_owned_topology(monkeypatch):
+    m=load_helper(); bound=topology_boundary(m, monkeypatch)
+    assert set(m.inspect_topology(m.DOCKER_HOST,bound,require_members=True)["members"]) == {"coordinator","forge-publisher"}
+
+
+@pytest.mark.parametrize("change", [lambda n:n.update(Labels={}), lambda n:n.update(Driver="macvlan"), lambda n:n.update(EnableIPv6=True), lambda n:n.pop("EnableIPv6"), lambda n:n.update(Internal=True), lambda n:n.update(Containers=[]), lambda n:n["Options"].update({"com.docker.network.bridge.name":"foreign"}), lambda n:n["Containers"]["publisher-id"].update(IPv6Address="fd00::2/64")])
+def test_global_network_collisions_and_contracts_refuse(monkeypatch, change):
+    m=load_helper(); bound=topology_boundary(m, monkeypatch, net_change=change)
+    with pytest.raises(m.Refusal): m.inspect_topology(m.DOCKER_HOST,bound,require_members=False)
+
+
+@pytest.mark.parametrize("kind", ["foreign-interface", "non-bridge"])
+def test_interface_collision_refuses(monkeypatch, kind):
+    m=load_helper(); bound=topology_boundary(m, monkeypatch, absent=kind=="foreign-interface", links_change=(lambda links: links[0]["linkinfo"].update(info_kind="dummy")) if kind=="non-bridge" else None)
+    with pytest.raises(m.Refusal): m.inspect_topology(m.DOCKER_HOST,bound,require_members=False)
+
+
+@pytest.mark.parametrize("change", [lambda c:c["Config"]["Labels"].update({"com.docker.compose.project":"foreign"}), lambda c:c["NetworkSettings"]["Ports"].update({"8711/tcp":[{"HostPort":"8711"}]}), lambda c:c["NetworkSettings"]["Networks"].update(other={}), lambda c:c["NetworkSettings"].update(GlobalIPv6Address="fd00::1"), lambda c:c["State"].update(Running=False)])
+def test_membership_ports_ipv6_and_running_state_refuse(monkeypatch, change):
+    m=load_helper();bound=topology_boundary(m,monkeypatch,container_change=change)
+    with pytest.raises(m.Refusal):m.inspect_topology(m.DOCKER_HOST,bound,require_members=True)
+
+
+@pytest.mark.parametrize("case", ["good-old-info", "good-iptables-info", "legacy", "native", "missing-chains", "native-table", "rootless", "unknown-info"])
+def test_positive_backend_qualification(monkeypatch, case):
+    m=load_helper(); info={"ID":"daemon", "OSType":"linux", "SecurityOptions":["name=seccomp,profile=builtin"]}
+    if case=="good-iptables-info":info["FirewallBackend"]="iptables"
+    if case=="native":info["FirewallBackend"]="nftables"
+    if case=="unknown-info":info["FirewallBackend"]=""
+    if case=="rootless":info["SecurityOptions"].append("name=rootless")
+    monkeypatch.setattr(m,"docker_json",lambda *a:info)
+    def run(argv,**kw):
+        if argv==["iptables","--version"]:return SimpleNamespace(stdout="iptables v1.8.10 (legacy)" if case=="legacy" else "iptables v1.8.10 (nf_tables)")
+        if argv==["nft","--version"]:return SimpleNamespace(stdout="nftables v1.0.9 (Old Doc Yak)")
+        if argv[0]=="iptables":return SimpleNamespace(stdout="" if case=="missing-chains" else "-N DOCKER\n-N DOCKER-USER\n-A FORWARD -j DOCKER-USER\n")
+        if argv==["nft","-j","list","tables"]:return SimpleNamespace(stdout=json.dumps({"nftables":[{"table":{"family":"ip","name":"docker-bridges"}}] if case=="native-table" else []}))
+        raise AssertionError(argv)
+    monkeypatch.setattr(m,"run",run)
+    if case.startswith("good"): assert m.daemon_identity(m.DOCKER_HOST)=="daemon"
+    else:
+        with pytest.raises(m.Refusal):m.daemon_identity(m.DOCKER_HOST)
+
+
+@pytest.mark.parametrize("owned, changed", [(False,False),(True,True)])
+def test_foreign_or_changed_table_never_mutates(monkeypatch, owned, changed):
+    m=load_helper();bound=m.binding("chosen-project");data=nft_document(m)
+    if changed:data["nftables"][2]["chain"]["prio"]=0
+    monkeypatch.setattr(m,"nft_json",lambda table:data)
+    monkeypatch.setattr(m,"run",lambda *a,**k:pytest.fail("mutated foreign table"))
+    with pytest.raises(m.Refusal):m.apply_policy(bound,{"owned":True} if owned else None)
+
+
+def test_unreadable_table_inventory_is_not_absence(monkeypatch):
+    m=load_helper()
+    def run(argv,**kw):
+        if argv==["nft","-j","list","tables"]:raise m.Refusal("permission denied")
+        return SimpleNamespace(returncode=1)
+    monkeypatch.setattr(m,"run",run)
+    with pytest.raises(m.Refusal):m.nft_json("forge_pub_000000000000")
+
+
+@pytest.mark.parametrize("artifact", ["helper", "unit", "dropin"])
+def test_shared_collisions_checked_before_policy_apply(monkeypatch, tmp_path, artifact):
+    m=load_helper();bound=m.binding("chosen-project"); paths={"helper":tmp_path/"helper", "unit":tmp_path/"unit", "dropin":tmp_path/f"forge-publisher-host-policy-{bound['suffix']}.conf"}
+    monkeypatch.setattr(m,"HELPER",paths["helper"]);monkeypatch.setattr(m,"UNIT",paths["unit"]);monkeypatch.setattr(m,"DROPIN_DIR",tmp_path)
+    monkeypatch.setattr(m,"trusted_path",lambda path,**kw:path.exists())
+    paths[artifact].write_text("foreign")
+    with pytest.raises(m.Refusal):m.persistence_preflight(bound,True,None)
+    assert paths[artifact].read_text()=="foreign"
+
+
+def test_persistent_install_cannot_silently_become_runtime_only():
+    m=load_helper()
+    with pytest.raises(m.Refusal,match="transition"):m.persistence_preflight(m.binding("chosen-project"),False,{"persistent":True})
+
+
+@pytest.mark.parametrize("kind", ["symlink", "unowned", "public"])
+def test_config_trust_refuses_foreign_paths(tmp_path, kind):
+    m=load_helper();path=tmp_path/"config";path.write_text("{}")
+    if kind=="symlink":link=tmp_path/"link";link.symlink_to(path);path=link
+    if kind=="public":path.chmod(0o666)
+    with pytest.raises(m.Refusal):m.load_config(path)
+
+
+def declared_model(m,project="chosen-project"):
+    b=m.binding(project)
+    return {"name":project,"networks":{"forge-publisher-net":{"name":b["network"],"driver":"bridge","enable_ipv6":False,"driver_opts":{"com.docker.network.bridge.name":b["bridge"]}}},"services":{"coordinator":{"networks":{"factory":{},"forge-publisher-net":{}},"environment":{"FORGE_PUBLISHER_URL":"http://forge-publisher:8711"}},"forge-publisher":{"networks":{"forge-publisher-net":{}},"healthcheck":{"test":["CMD","curl","http://localhost:8711/healthz"]}}}}
+
+
+@pytest.mark.parametrize("change", [lambda d:d.update(name="wrong-project"),lambda d:d["services"]["forge-publisher"].update(ports=["8711:8711"]),lambda d:d["networks"]["forge-publisher-net"]["driver_opts"].clear(),lambda d:d["networks"]["forge-publisher-net"].update(enable_ipv6=True)])
+def test_declared_graph_refuses_before_first_network_exists(change):
+    m=load_helper();d=declared_model(m);m.validate_declared(d,m.binding("chosen-project"));change(d)
+    with pytest.raises(m.Refusal):m.validate_declared(d,m.binding("chosen-project"))
+
+
+def installed_paths(m, monkeypatch, tmp_path):
+    monkeypatch.setattr(m, 'CONFIG_DIR', tmp_path/'config');m.CONFIG_DIR.mkdir()
+    monkeypatch.setattr(m, 'HELPER', tmp_path/'helper');m.HELPER.write_bytes(HELPER.read_bytes())
+    monkeypatch.setattr(m, 'UNIT', tmp_path/'unit');m.UNIT.write_bytes(m.unit_bytes())
+    monkeypatch.setattr(m, 'DROPIN_DIR', tmp_path/'dropins');m.DROPIN_DIR.mkdir()
+    monkeypatch.setattr(m, 'trusted_path', lambda path, **kw: path.exists())
+    monkeypatch.setattr(m, 'require_root', lambda: None)
+    monkeypatch.setattr(m, 'lock', lambda bound: open(tmp_path/'lock','a'))
+    monkeypatch.setattr(m, 'daemon_identity', lambda host:'daemon')
+    monkeypatch.setattr(m, 'clean_docker_env', lambda host:{})
+
+
+@pytest.mark.parametrize('collision', ['config', 'helper', 'unit', 'dropin', 'table'])
+def test_install_preflights_all_collisions_before_writes(monkeypatch,tmp_path,collision):
+    m=load_helper();bound=m.binding('chosen-project');installed_paths(m,monkeypatch,tmp_path)
+    monkeypatch.setattr(m,'validate_env',lambda *args:None)
+    monkeypatch.setattr(m,'inspect_topology',lambda *a,**k:{'network_id':'','members':{}})
+    monkeypatch.setattr(m,'atomic_write',lambda *a,**k:pytest.fail('mutation before ownership refusal'))
+    monkeypatch.setattr(m,'apply_policy',lambda *a,**k:pytest.fail('policy changed before ownership refusal'))
+    monkeypatch.setattr(m,'nft_json',lambda table:nft_document(m) if collision=='table' else None)
+    if collision=='config':
+        (m.CONFIG_DIR/f"{bound['suffix']}.json").write_text('{}')
+        monkeypatch.setattr(m,'load_config',lambda path: (_ for _ in ()).throw(m.Refusal('foreign config')))
+    elif collision in ('helper','unit'):getattr(m,collision.upper()).write_text('foreign')
+    elif collision=='dropin':(m.DROPIN_DIR/f"forge-publisher-host-policy-{bound['suffix']}.conf").write_bytes(m.dropin_bytes(bound['suffix']))
+    with pytest.raises(m.Refusal):m.cmd_install(SimpleNamespace(project=bound['project'],env_file=tmp_path/'env',docker_host=m.DOCKER_HOST,runtime_only=False))
+
+
+@pytest.mark.parametrize('changed', [False,True])
+def test_removing_one_project_preserves_other_and_shared_artifacts(monkeypatch,tmp_path,changed):
+    m=load_helper();installed_paths(m,monkeypatch,tmp_path);bound=m.binding('chosen-project');other=m.binding('second-project')
+    configs={}
+    for b in (bound,other):
+        config=m.canonical_config(b,'daemon',m.DOCKER_HOST,True);path=m.CONFIG_DIR/f"{b['suffix']}.json";path.write_text(json.dumps(config));configs[path]=(b,config)
+        (m.DROPIN_DIR/f"forge-publisher-host-policy-{b['suffix']}.conf").write_bytes(m.dropin_bytes(b['suffix']))
+    monkeypatch.setattr(m,'load_config',lambda p:configs[p]);calls=[];data=nft_document(m)
+    if changed:data['nftables'][2]['chain']['prio']=0
+    monkeypatch.setattr(m,'nft_json',lambda table:data)
+    def run(argv,**kw):
+        calls.append(argv)
+        if argv[:3]==['docker','--host',m.DOCKER_HOST]:return SimpleNamespace(stdout='')
+        if argv[0]=='ip':return SimpleNamespace(stdout='[]')
+        if argv[:2]==['systemctl','show']:return SimpleNamespace(stdout='Requires=other.service\nAfter=other.service\n')
+        return SimpleNamespace(stdout='',returncode=0)
+    monkeypatch.setattr(m,'run',run)
+    args=SimpleNamespace(project=bound['project'],docker_host=m.DOCKER_HOST)
+    if changed:
+        with pytest.raises(m.Refusal):m.cmd_remove(args)
+        assert not any(a[0] in ('systemctl','nft') for a in calls)
+        assert (m.CONFIG_DIR/f"{bound['suffix']}.json").exists()
+    else:
+        m.cmd_remove(args)
+        assert not (m.CONFIG_DIR/f"{bound['suffix']}.json").exists()
+        assert calls.index(['systemctl','daemon-reload']) < calls.index(['nft','delete','table','inet',bound['table']])
+    assert (m.CONFIG_DIR/f"{other['suffix']}.json").exists()
+    assert (m.DROPIN_DIR/f"forge-publisher-host-policy-{other['suffix']}.conf").read_bytes()==m.dropin_bytes(other['suffix'])
+    assert m.HELPER.read_bytes()==HELPER.read_bytes() and m.UNIT.read_bytes()==m.unit_bytes()
+    assert not any('stop' in a or 'restart' in a for a in calls)
+
+
+@pytest.mark.parametrize("network_present", [False,True])
+def test_stranded_publisher_refuses_before_install_mutation(monkeypatch,tmp_path,network_present):
+    m=load_helper();bound=topology_boundary(m,monkeypatch,absent=not network_present,links_change=(lambda links:links.clear()) if not network_present else None)
+    base_run=m.run
+    def run(argv,**kw):
+        if argv[3:4]==["ps"]: return SimpleNamespace(stdout=json.dumps({"ID":"stranded-publisher"})+"\n")
+        if argv[3:5]==["inspect","stranded-publisher"]:return SimpleNamespace(stdout=json.dumps([{"State":{"Running":True},"Config":{"Labels":{"com.docker.compose.project":bound["project"],"com.docker.compose.service":"forge-publisher"}},"NetworkSettings":{"Networks":{"foreign":{}}}}]))
+        return base_run(argv,**kw)
+    monkeypatch.setattr(m,"run",run);monkeypatch.setattr(m,"require_root",lambda:None)
+    monkeypatch.setattr(m,"validate_env",lambda *a:None);monkeypatch.setattr(m,"daemon_identity",lambda *a:"daemon")
+    monkeypatch.setattr(m,"lock",lambda b:open(tmp_path/"lock","a"));monkeypatch.setattr(m,"atomic_write",lambda *a,**k:pytest.fail("wrote before stranded-publisher refusal"))
+    monkeypatch.setattr(m,"apply_policy",lambda *a:pytest.fail("mutated before stranded-publisher refusal"))
+    with pytest.raises(m.Refusal):m.cmd_install(SimpleNamespace(project=bound["project"],env_file=tmp_path/"env",docker_host=m.DOCKER_HOST,runtime_only=True))
+
+
+@pytest.mark.parametrize("state", ["owned", "changed"])
+def test_static_loader_existing_state_is_verified_without_docker_or_mutation(monkeypatch,tmp_path,state):
+    m=load_helper();b=m.binding("chosen-project");config=m.canonical_config(b,"daemon",m.DOCKER_HOST,True);data=nft_document(m)
+    if state=="changed":data["nftables"][2]["chain"]["prio"]=0
+    monkeypatch.setattr(m,"require_root",lambda:None);monkeypatch.setattr(m,"load_config",lambda p:(b,config));monkeypatch.setattr(m,"lock",lambda b:open(tmp_path/"lock","a"))
+    monkeypatch.setattr(m,"persistence_preflight",lambda *a:None);monkeypatch.setattr(m,"nft_json",lambda t:data)
+    monkeypatch.setattr(m,"run",lambda *a,**k:pytest.fail("static load invoked a command instead of using exact owned state"))
+    args=SimpleNamespace(config=tmp_path/"config")
+    if state=="changed":
+        with pytest.raises(m.Refusal):m.cmd_load_static(args)
+    else:m.cmd_load_static(args)
+
+
+def test_install_requires_stopped_publisher_even_with_owned_previous_policy(monkeypatch,tmp_path):
+    m=load_helper();installed_paths(m,monkeypatch,tmp_path);b=m.binding("chosen-project");config=m.canonical_config(b,"daemon",m.DOCKER_HOST,False)
+    path=m.CONFIG_DIR/f"{b['suffix']}.json";path.write_text(json.dumps(config))
+    monkeypatch.setattr(m,"validate_env",lambda *a:None);monkeypatch.setattr(m,"load_config",lambda p:(b,config));monkeypatch.setattr(m,"nft_json",lambda table:nft_document(m))
+    monkeypatch.setattr(m,"inspect_topology",lambda *a,**kw:{"members":{"forge-publisher":"publisher-id"}})
+    monkeypatch.setattr(m,"docker_json",lambda *a:[{"State":{"Running":True}}])
+    monkeypatch.setattr(m,"atomic_write",lambda *a,**kw:pytest.fail("wrote while publisher running"))
+    with pytest.raises(m.Refusal,match="stopped"):m.cmd_install(SimpleNamespace(project=b["project"],env_file=tmp_path/"env",docker_host=m.DOCKER_HOST,runtime_only=True))

@@ -381,6 +381,12 @@ p=pathlib.Path('/out/current.db');print(json.dumps({'sha256':hashlib.sha256(p.re
             clean={**self.env,'FORGE_IMAGE':candidate}
             model=json.loads(r.docker(self.c,*cmd,'config','--format','json',env=clean).stdout)
             q.need(model['services']['coordinator']['image']==candidate and model['services']['answer-service']['image']==candidate,'candidate rendered image differs; remain stopped')
+            q.need(self.c['docker_context']=='default','publisher policy requires the local default Docker context; remain stopped')
+            q.need(not any(os.environ.get(k) for k in ('DOCKER_CONTEXT','DOCKER_TLS_VERIFY','DOCKER_CERT_PATH')) and os.environ.get('DOCKER_HOST','unix:///var/run/docker.sock')=='unix:///var/run/docker.sock','Docker environment conflicts with the local policy binding; remain stopped')
+            endpoint=json.loads(r.run(['docker','context','inspect','default']).stdout)
+            q.need(isinstance(endpoint,list) and len(endpoint)==1 and endpoint[0].get('Endpoints',{}).get('docker',{}).get('Host')=='unix:///var/run/docker.sock','default Docker context does not select the qualified local endpoint; remain stopped')
+            policy=q.load_script('publisher-host-policy')
+            policy.validate_declared(model,policy.binding(self.c['project']))
             policy_env={'PATH':os.environ.get('PATH','/usr/sbin:/usr/bin:/sbin:/bin'),'DOCKER_HOST':'unix:///var/run/docker.sock'}
             r.run(['sudo','--',HERE/ 'publisher-host-policy','verify','--docker-host',policy_env['DOCKER_HOST'],'--env-file',r.path(self.args.candidate_env_file),'--project',self.c['project']],env=policy_env)
             r.docker(self.c,*cmd,'up','--no-deps','-d','memory','memory-relay','forge-publisher','answer-service','coordinator',env=clean)
