@@ -402,7 +402,7 @@ def test_removing_one_project_preserves_other_and_shared_artifacts(monkeypatch,t
         calls.append(argv)
         if argv[:3]==['docker','--host',m.DOCKER_HOST]:return SimpleNamespace(stdout='')
         if argv[0]=='ip':return SimpleNamespace(stdout='[]')
-        if argv[:2]==['systemctl','show']:return SimpleNamespace(stdout='Requires=other.service\nAfter=other.service\n')
+        if argv[:2]==['systemctl','show']:return SimpleNamespace(stdout=f"Requires=docker.socket forge-publisher-host-policy@{other['suffix']}.service\nDropInPaths={m.DROPIN_DIR}/forge-publisher-host-policy-{other['suffix']}.conf\n")
         return SimpleNamespace(stdout='',returncode=0)
     monkeypatch.setattr(m,'run',run)
     args=SimpleNamespace(project=bound['project'],docker_host=m.DOCKER_HOST)
@@ -661,3 +661,62 @@ def test_install_succeeds_when_nft_lists_either_form_after_apply(monkeypatch,tmp
     assert config["specification"]["sha256"]==CAPTURED_SPECIFICATION_SHA256
     assert (m.DROPIN_DIR/f"forge-publisher-host-policy-{b['suffix']}.conf").read_bytes()==m.dropin_bytes(b["suffix"])
     assert f"policy={CAPTURED_SPECIFICATION_SHA256}" in capsys.readouterr().out
+
+
+def remove_boundary(m,monkeypatch,tmp_path,show):
+    installed_paths(m,monkeypatch,tmp_path);b=m.binding('chosen-project')
+    config=m.canonical_config(b,'daemon',m.DOCKER_HOST,True);(m.CONFIG_DIR/f"{b['suffix']}.json").write_text(json.dumps(config))
+    dropin=m.DROPIN_DIR/f"forge-publisher-host-policy-{b['suffix']}.conf";dropin.write_bytes(m.dropin_bytes(b['suffix']))
+    monkeypatch.setattr(m,'load_config',lambda p:(b,config))
+    monkeypatch.setattr(m,'nft_json',lambda table:nft_document(m))
+    loader=f"forge-publisher-host-policy@{b['suffix']}.service";calls=[]
+    def run(argv,**kw):
+        calls.append(argv)
+        if argv[:3]==['docker','--host',m.DOCKER_HOST]:return SimpleNamespace(stdout='')
+        if argv[0]=='ip':return SimpleNamespace(stdout='[]')
+        if argv[:2]==['systemctl','show']:
+            assert not dropin.exists()
+            return SimpleNamespace(stdout=show(argv,loader,str(dropin)))
+        return SimpleNamespace(stdout='',returncode=0)
+    monkeypatch.setattr(m,'run',run)
+    return b,dropin,calls
+
+
+def real_docker_after_reload(argv,loader,dropin):
+    # Rehearsal state of docker.service once the drop-in is gone: the loader's
+    # own Before=docker.service still orders Docker after it, but nothing requires it.
+    real={'Requires':'docker.socket','DropInPaths':'','After':f'systemd-journald.socket {loader}'}
+    return ''.join(f"{name}={real[name]}\n" for name in argv[3].removeprefix('--property=').split(','))
+
+
+def test_remove_succeeds_when_only_loader_ordering_remains(monkeypatch,tmp_path,capsys):
+    m=load_helper();b,dropin,calls=remove_boundary(m,monkeypatch,tmp_path,real_docker_after_reload)
+    m.cmd_remove(SimpleNamespace(project=b['project'],docker_host=m.DOCKER_HOST))
+    assert ['systemctl','show','docker.service','--property=Requires,DropInPaths','--no-pager'] in calls
+    assert calls.count(['systemctl','daemon-reload'])==1
+    assert ['nft','delete','table','inet',b['table']] in calls
+    assert not dropin.exists() and not (m.CONFIG_DIR/f"{b['suffix']}.json").exists()
+    assert m.UNIT.read_bytes()==m.unit_bytes() and m.HELPER.read_bytes()==HELPER.read_bytes()
+    assert capsys.readouterr().out.startswith(f"REMOVED project={b['project']}")
+
+
+REMOVE_REFUSALS={
+    "requires-loader":lambda argv,loader,dropin:f"Requires=docker.socket {loader}\nDropInPaths=\n",
+    "dropin-listed":lambda argv,loader,dropin:f"Requires=docker.socket\nDropInPaths={dropin}\n",
+    "missing-property":lambda argv,loader,dropin:"Requires=docker.socket\n",
+    "extra-property":lambda argv,loader,dropin:f"Requires=docker.socket\nDropInPaths=\nAfter={loader}\n",
+    "malformed":lambda argv,loader,dropin:"Requires docker.socket\nDropInPaths\n",
+    "empty":lambda argv,loader,dropin:"",
+}
+
+
+@pytest.mark.parametrize("show", list(REMOVE_REFUSALS.values()), ids=list(REMOVE_REFUSALS))
+def test_remove_refuses_and_restores_dropin_unless_requirement_is_gone(monkeypatch,tmp_path,capsys,show):
+    m=load_helper();b,dropin,calls=remove_boundary(m,monkeypatch,tmp_path,show)
+    with pytest.raises(m.Refusal):m.cmd_remove(SimpleNamespace(project=b['project'],docker_host=m.DOCKER_HOST))
+    assert dropin.read_bytes()==m.dropin_bytes(b['suffix'])
+    reloads=[i for i,argv in enumerate(calls) if argv==['systemctl','daemon-reload']]
+    assert len(reloads)==2 and reloads[1]>calls.index(['systemctl','show','docker.service','--property=Requires,DropInPaths','--no-pager'])
+    assert not any(argv[0]=='nft' for argv in calls)
+    assert (m.CONFIG_DIR/f"{b['suffix']}.json").exists()
+    assert "REMOVED" not in capsys.readouterr().out
