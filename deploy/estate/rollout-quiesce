@@ -7,6 +7,7 @@ import importlib.util
 import inspect as inspect_source
 import json
 import os
+import posixpath
 from pathlib import Path
 import re
 import sqlite3
@@ -79,6 +80,21 @@ def stable_mount(mount):
     return result
 
 
+def stable_mount_inventory(mounts):
+    """Return the complete mount inventory in deterministic destination order."""
+    need(isinstance(mounts,list),'saved mount inventory is malformed; reconcile its exact semantics before recovery')
+    result=[];destinations=set()
+    for mount in mounts:
+        need(isinstance(mount,dict),'saved mount inventory contains a malformed entry; reconcile its exact semantics before recovery')
+        destination=mount.get('Destination')
+        need(isinstance(destination,str) and destination.startswith('/') and not destination.startswith('//')
+             and '\x00' not in destination and posixpath.normpath(destination)==destination,
+             'saved mount destination is not one canonical absolute path; reconcile its exact semantics before recovery')
+        need(destination not in destinations,'saved mount destinations are ambiguous; reconcile duplicate destinations before recovery')
+        destinations.add(destination);result.append(stable_mount(mount))
+    return sorted(result,key=lambda mount:mount['Destination'])
+
+
 def stable_runtime(item):
     # Runtime endpoint IDs and assigned IPs disappear on stop. Only declarative
     # network identity/aliases/IPAM options participate in the reconstruction seal.
@@ -91,7 +107,7 @@ def stable_runtime(item):
     for network in networks.values():
         network['Aliases']=sorted(a for a in network['Aliases'] or [] if a not in (item['service_identity']['container_id'],item['service_identity']['container_id'][:12]))
     stable={k:item[k] for k in ('image_id','repo_tags','port_bindings','restart_policy','network_mode','env_names')}
-    return stable | {'mounts':[stable_mount(m) for m in item['mounts']],'service_identity':identity,'networks':networks}
+    return stable | {'mounts':stable_mount_inventory(item['mounts']),'service_identity':identity,'networks':networks}
 
 def canonical_approval_component(value):
     try:decoded=unquote_to_bytes(value).decode('utf-8','strict')
