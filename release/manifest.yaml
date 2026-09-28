@@ -158,12 +158,14 @@ schema: 2
 # 2026.09.27-1 was built from published Forge 3956c79e. Its measured package
 # checks remain valid, but named repairs with legitimate shared-path aliases
 # require the later accepted admission correction before this rollout.
-# 2026.09.28-1 is a PREPARATION CANDIDATE, not a built release. The Forge pin
-# below contains that correction and the accepted operator integration. The
-# other five repository pins are unchanged. Source publication, the normal
-# manifest build, new-image qualification and full rehearsal remain pending.
+# 2026.09.28-1 was built from published Forge a545a86a. Release 2026.09.28-2
+# was built from published, reviewed Forge 7bef3033; the other five repository
+# pins and base are unchanged. Its normal five-image receipt binds compact build
+# manifest SHA-256 805f9f4cd87004080d03b758694c6b1805d9f580a35959158ab72014bd1f7672.
+# Image qualification passed in its measured packaging scope; full rehearsal
+# and rollout acceptance remain pending.
 # Preserve prior releases and their immutable image receipts.
-version: 2026.09.28-1
+version: 2026.09.28-2
 
 # The one image this repository's own operator scripts mean by "the release
 # image" (ops/forge-prod-recreate.sh reads this line). It is the same name as
@@ -256,12 +258,12 @@ images:
 #   role: build-context-root  — the Dockerfile and the main build context
 #   role: named-context       — supplied to the build as --build-context <name>=<clone>
 repositories:
-  # The first repository fetched. This reviewed source pin is local pending
-  # publication approval; the normal release build must fetch it from main.
+  # The first repository fetched. The normal release build fetched this exact
+  # reviewed source pin from public main.
   - name: forge
     url: https://github.com/guardkit/forge.git
     branch: main
-    commit: a545a86a435862b573b595e10346e4cb75d6e715
+    commit: 7bef3033f868ffeea8e480f0d29a2a4dc192aa88
     role: build-context-root
   - name: guardkit
     url: https://github.com/guardkit/guardkit.git

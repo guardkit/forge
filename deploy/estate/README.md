@@ -982,9 +982,9 @@ the design:
    Release `2026.09.26-3` already carries the Jarvis serving and state-directory
    fix at `4efff4f`; its exact front-door image passed the serving check during
    preparation. The earlier claim that it predates that fix was stale.
-   The normal published-source build of `2026.09.28-1` completed successfully
-   from Forge `a545a86a435862b573b595e10346e4cb75d6e715`. Its receipt binds manifest
-   SHA-256 `12cea07e35f25e5a867150b0045d7aee57a123da555e0c89d751abf183523477`,
+   The normal published-source build of `2026.09.28-2` completed successfully
+   from Forge `7bef3033f868ffeea8e480f0d29a2a4dc192aa88`. Its receipt binds manifest
+   SHA-256 `805f9f4cd87004080d03b758694c6b1805d9f580a35959158ab72014bd1f7672`,
    records all five image roles, and reports a two-term sweep with no exceptions.
    The operator constants now name the immutable Forge coordinator and publisher
    image IDs recorded by that receipt. These are build facts only: source and
