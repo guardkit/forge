@@ -407,11 +407,13 @@ def verify_semantics(data: dict[str, Any] | None, bound: dict[str, str]) -> None
                       "type": "filter", "hook": "output", "prio": -5, "policy": "accept"}
     if chain != expected_chain:
         refuse("owned policy has the wrong chain, hook, priority, or default policy")
-    common = [
-        lambda x: _match(x, {"meta": {"key": "oifname"}}, bound["bridge"]),
-        lambda x: _match(x, {"meta": {"key": "l4proto"}}, "tcp"),
-        lambda x: _match(x, {"payload": {"protocol": "tcp", "field": "dport"}}, PORT),
-    ]
+    oifname = lambda x: _match(x, {"meta": {"key": "oifname"}}, bound["bridge"])
+    l4proto = lambda x: _match(x, {"meta": {"key": "l4proto"}}, "tcp")
+    dport = lambda x: _match(x, {"payload": {"protocol": "tcp", "field": "dport"}}, PORT)
+    # nft_text writes an explicit "meta l4proto tcp", but nft (e.g. v1.0.9)
+    # lists the rule without it: the tcp dport payload match carries that
+    # protocol dependency implicitly.  Accept exactly these two listings.
+    heads = [[oifname, l4proto, dport], [oifname, dport]]
     expected_tails = [
         [lambda x: _match(x, {"ct": {"key": "direction"}}, "reply"), lambda x: x == {"return": None}],
         [lambda x: x == {"counter": {"packets": x.get("counter", {}).get("packets", 0),
@@ -424,8 +426,10 @@ def verify_semantics(data: dict[str, Any] | None, bound: dict[str, str]) -> None
         if set(rule) - {"family", "table", "chain", "handle", "expr"}:
             refuse("owned policy rule contains unexpected attributes")
         expressions = rule.get("expr")
-        checks = common + tail
-        if not isinstance(expressions, list) or len(expressions) != len(checks) or not all(check(e) for check, e in zip(checks, expressions)):
+        if not isinstance(expressions, list) or not any(
+            len(expressions) == len(head + tail) and all(check(e) for check, e in zip(head + tail, expressions))
+            for head in heads
+        ):
             refuse(f"owned policy rule {index + 1} has changed semantics")
 
 
