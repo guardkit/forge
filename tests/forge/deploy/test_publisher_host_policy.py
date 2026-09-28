@@ -437,12 +437,13 @@ def test_effective_loader_files_refuse_all_override_locations(tmp_path,collision
     with pytest.raises(m.Refusal):m.loader_files_preflight(b,[m.UNIT.parent,alternate])
 
 
-@pytest.mark.parametrize('changed',['none','argv','alias','dropin','fragment','requires','after'])
+@pytest.mark.parametrize('changed',['none','argv','missing-exec','alias','dropin','fragment','requires','after'])
 def test_effective_loader_and_docker_dependency_are_read_back(monkeypatch,changed):
     m=load_helper();b=m.binding('chosen-project');name=f"forge-publisher-host-policy@{b['suffix']}.service"
     properties={'Id':name,'Names':name,'FragmentPath':str(m.UNIT),'DropInPaths':'','LoadState':'loaded','Type':'oneshot','RemainAfterExit':'yes','ExecStart':f"{{ path={m.HELPER} ; argv[]={m.HELPER} load-static --config {m.CONFIG_DIR}/{b['suffix']}.json ; ignore_errors=no ; }}"}
     dependencies={'Requires':name,'After':name}
     if changed=='argv':properties['ExecStart']='{ path=/bin/true ; argv[]=/bin/true ; }'
+    if changed=='missing-exec':properties.pop('ExecStart')
     if changed=='alias':properties['Names']+=' alias.service'
     if changed=='dropin':properties['DropInPaths']='/run/foreign.conf'
     if changed=='fragment':properties['FragmentPath']='/run/foreign.service'
@@ -451,12 +452,64 @@ def test_effective_loader_and_docker_dependency_are_read_back(monkeypatch,change
     def run(argv,**kw):
         calls.append(argv);assert argv[:2]==['systemctl','show']
         data=dependencies if argv[2]=='docker.service' else properties
-        return SimpleNamespace(stdout='\n'.join(k+'='+v for k,v in data.items()),returncode=0)
+        requested=next(value.split('=',1)[1].split(',') for value in argv if value.startswith('--property='))
+        return SimpleNamespace(
+            stdout='\n'.join(key+'='+data[key] for key in requested if key in data), returncode=0
+        )
     monkeypatch.setattr(m,'run',run)
     if changed=='none':m.loader_effective(b,installed=True);m.verify_docker_dependency(b)
     else:
         with pytest.raises(m.Refusal):m.loader_effective(b,installed=True);m.verify_docker_dependency(b)
     assert calls and all(c[1]=='show' for c in calls)
+
+
+def test_absent_loader_accepts_recorded_sparse_systemctl_shape(monkeypatch):
+    m=load_helper();b=m.binding('chosen-project');name=f"forge-publisher-host-policy@{b['suffix']}.service"
+    recorded='''Type=
+RemainAfterExit=no
+Id={name}
+Names={name}
+LoadState=not-found
+FragmentPath=
+DropInPaths=
+'''.format(name=name)
+    observed=dict(line.split('=',1) for line in recorded.splitlines())
+    calls=[]
+    def run(argv,**kw):
+        calls.append(argv)
+        requested=next(value.split('=',1)[1].split(',') for value in argv if value.startswith('--property='))
+        return SimpleNamespace(
+            stdout='\n'.join(key+'='+observed[key] for key in requested if key in observed), returncode=0
+        )
+    monkeypatch.setattr(m,'run',run)
+    m.loader_effective(b,installed=False)
+    assert calls == [[
+        'systemctl','show',name,
+        '--property=Id,Names,FragmentPath,DropInPaths,LoadState','--no-pager',
+    ]]
+
+
+@pytest.mark.parametrize('changed',['alias','dropin','fragment','unknown-state'])
+def test_absent_loader_refuses_conflicting_or_unknown_identity(monkeypatch,changed):
+    m=load_helper();b=m.binding('chosen-project');name=f"forge-publisher-host-policy@{b['suffix']}.service"
+    properties={
+        'Id':name,
+        'Names':name,
+        'FragmentPath':'',
+        'DropInPaths':'',
+        'LoadState':'not-found',
+    }
+    if changed=='alias':properties['Names']+=' alias.service'
+    if changed=='dropin':properties['DropInPaths']='/run/foreign.conf'
+    if changed=='fragment':properties['FragmentPath']='/run/foreign.service'
+    if changed=='unknown-state':properties['LoadState']='error'
+    def run(argv,**kw):
+        requested=next(value.split('=',1)[1].split(',') for value in argv if value.startswith('--property='))
+        return SimpleNamespace(
+            stdout='\n'.join(key+'='+properties[key] for key in requested if key in properties), returncode=0
+        )
+    monkeypatch.setattr(m,'run',run)
+    with pytest.raises(m.Refusal):m.loader_effective(b,installed=False)
 
 
 def test_runtime_only_installs_narrow_verifier_without_boot_dependency(monkeypatch,tmp_path):
