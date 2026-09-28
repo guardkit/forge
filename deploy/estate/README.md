@@ -22,7 +22,7 @@ unset DOCKER_CONTEXT DOCKER_TLS_VERIFY DOCKER_CERT_PATH
 # Put its FORGE_PUBLISHER_BRIDGE value in FACTORY_ESTATE_ENV and complete the
 # existing public settings, volumes, secrets and immutable image prerequisites.
 sudo "$FACTORY_ESTATE_DIR/publisher-host-policy" install --docker-host "$DOCKER_HOST" --env-file "$FACTORY_ESTATE_ENV" --project "$FACTORY_ESTATE_PROJECT"
-sudo "$FACTORY_ESTATE_DIR/publisher-host-policy" verify --docker-host "$DOCKER_HOST" --env-file "$FACTORY_ESTATE_ENV" --project "$FACTORY_ESTATE_PROJECT"
+sudo /usr/local/libexec/forge-publisher-host-policy verify --docker-host "$DOCKER_HOST" --env-file "$FACTORY_ESTATE_ENV" --project "$FACTORY_ESTATE_PROJECT"
 sops exec-env "$NATS_SECRETS_FILE" '"$FACTORY_ESTATE_DIR/estate-check" host --env-file "$FACTORY_ESTATE_ENV" --project "$FACTORY_ESTATE_PROJECT"'
 ```
 
@@ -1047,3 +1047,13 @@ qualification also works before this project's network has been created, using
 Docker's existing filter chains. Repeating the static boot loader verifies an
 already exact owned table without replacing it. A runtime-only binding cannot be
 silently downgraded from an existing persistent installation.
+
+
+Both persistent and runtime-only installation place the exact verifier at the
+root-owned `/usr/local/libexec/forge-publisher-host-policy`. Runtime gates use
+that installed path through the existing operator privilege mechanism; they do
+not require a sudo grant to an operator-writable checkout. Runtime-only mode
+installs no Docker boot dependency. Effective Compose settings mounts and running
+settings identities must match the validated listener on port 8711. Persistent
+installation refuses systemd aliases, instance overrides and applicable drop-ins
+that could change the loader, and reads back Docker's requirement and ordering.

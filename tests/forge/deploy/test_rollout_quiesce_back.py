@@ -33,6 +33,8 @@ def estate(tmp_path):
     for folder in (old/'evidence',old/'threads'):folder.mkdir()
     (old/'relay-progress.json').write_text('{}');(old/'forge.yaml').write_text('planning:\n  enabled: false\n');(prepared/'forge.yaml').write_text('planning:\n  enabled: false\n')
     env='FORGE_IMAGE='+r.RUNTIME+'\nBUS_MODE=external\nBUS_EXTERNAL_NETWORK=none\nFORGE_NATS_URL=nats://fake.invalid:14222\nBUS_MONITORING_ADDRESS=fake.invalid:18222\nROLLOUT_BUS_STREAM=PIPELINE\nROLLOUT_BUS_CONSUMERS=forge-serve forge-serve-planning\n'
+    publisher_settings=tmp_path/'publisher.json';publisher_settings.write_text('{"host":"0.0.0.0","port":8711}')
+    env+='FORGE_PUBLISHER_SETTINGS_FILE='+str(publisher_settings)+'\n'
     for p in (old/'estate.env',prepared/'estate.env'):p.write_text(env)
     compose=tmp_path/'compose.json';compose.write_text('{}')
     c={'project':'codex-quiesce-test','runtime_image':r.RUNTIME,'docker_context':'default','source_db':str(db),'snapshot_root':str(snaproot),'units':{x:'owned-'+x+'.service' for x in r.UNIT_ROLES},'old_containers':{x:'owned-'+x for x in ('coordinator','memory','relay')},'volumes':{x:'owned-'+x for x in r.VOLUME_ROLES},'sources':{'settings':str(old/'forge.yaml'),'evidence':str(old/'evidence'),'threads':str(old/'threads'),'relay_progress':str(old/'relay-progress.json')},'env_file':str(old/'estate.env'),'compose_files':[str(compose)],'quiesce':{'receipt':str(tmp_path/'quiesce.json'),'original_env_file':str(old/'estate.env'),'prepared_env_file':str(prepared/'estate.env'),'original_settings':str(old/'forge.yaml'),'prepared_settings':str(prepared/'forge.yaml'),'settings_receipt':str(prepared/'receipt.json'),'actor':'fixture','release_tag':'fixture:release'}}
@@ -970,7 +972,7 @@ def test_canonical_planning_approval_reference_variants_are_history(tmp_path,bui
     assert q.work_problems(state)==[]
 
 
-@pytest.mark.parametrize('policy_case',['missing','changed'])
+@pytest.mark.parametrize('policy_case',['missing','changed','good'])
 def test_actual_back_after_refuses_current_policy_before_up(estate,monkeypatch,policy_case):
     from .test_publisher_host_policy import load_helper, declared_model
     recovery=b.Recovery(estate.args);recovery.phase='prepared';candidate='sha256:'+'1'*64
@@ -979,20 +981,26 @@ def test_actual_back_after_refuses_current_policy_before_up(estate,monkeypatch,p
     monkeypatch.setattr(recovery,'markers',lambda:{'fixture':'resumed'})
     for name in ('record','close','settle','final','remove_current'):monkeypatch.setattr(recovery,name,lambda:None)
     monkeypatch.setattr(recovery,'planning',lambda enabled:None);monkeypatch.setattr(recovery,'h6',lambda *a:{'passed':True})
-    model=declared_model(load_helper(),estate.c['project']);model['services']['coordinator']['image']=candidate;model['services']['answer-service']={'image':candidate}
+    model=declared_model(load_helper(),estate.c['project'],settings=Path(estate.values['FORGE_PUBLISHER_SETTINGS_FILE']));model['services']['coordinator']['image']=candidate;model['services']['answer-service']={'image':candidate}
     calls=[]
     def docker(c,*args,**kw):
         calls.append(args)
-        assert 'up' not in args,'started after policy refusal'
-        return SimpleNamespace(stdout=json.dumps(model) if 'config' in args else '')
+        assert 'up' not in args or policy_case=='good','started after policy refusal'
+        return SimpleNamespace(stdout=json.dumps(model) if 'config' in args else ('fixture' if 'info' in args else ''))
     def run(argv,**kw):
         if argv[:3]==['docker','context','inspect']:return SimpleNamespace(stdout=json.dumps([{'Endpoints':{'docker':{'Host':'unix:///var/run/docker.sock'}}}]))
-        assert str(argv[2]).endswith('publisher-host-policy') and argv[3]=='verify'
+        assert str(argv[2])=='/usr/local/libexec/forge-publisher-host-policy' and argv[3]=='verify'
+        assert set(kw['env'])=={'PATH','DOCKER_HOST'} and '--daemon-id' in argv
+        if policy_case=='good':return SimpleNamespace(returncode=0,stdout='VERIFIED daemon=fixture')
         raise r.Refusal('current kernel policy '+policy_case)
     monkeypatch.setattr(r,'docker',docker);monkeypatch.setattr(r,'run',run)
     monkeypatch.setenv('DOCKER_HOST','unix:///var/run/docker.sock')
-    with pytest.raises(r.Refusal,match='current kernel policy '+policy_case):recovery.after()
-    assert r.read_json(recovery.snapshot/'rollback-reconciliation.json')['status']=='stopped-incompatible-or-unknown'
+    if policy_case=='good':
+        assert recovery.after()['status']=='compatible-current-release-started-with-admissions-closed'
+        assert any('up' in args for args in calls)
+    else:
+        with pytest.raises(r.Refusal,match='current kernel policy '+policy_case):recovery.after()
+        assert r.read_json(recovery.snapshot/'rollback-reconciliation.json')['status']=='stopped-incompatible-or-unknown'
 
 
 from .test_rollout_closed_door_receipts import probe
@@ -1015,8 +1023,45 @@ def test_resume_consumes_real_old_receipt_and_stops_before_markers(estate,probe,
         assert str(argv[0]).endswith('estate-check') and '--read-pre-resume' in argv
         # Run the same actual reader with the pre-existing fixture estate binding.
         command=[str(argv[0]),'--read-pre-resume','--env-file',str(env_file),'--project','codex-review']
-        return actual_run(command,env=process_env|{'POLICY_CASE':policy_case})
+        return actual_run(command,env=kw['env']|{key:process_env[key] for key in ('PATH','REVIEW_IMAGE','REVIEW_SETTINGS_FILE','PYTHONPATH','PYTHONDONTWRITEBYTECODE') if key in process_env}|{'POLICY_CASE':policy_case})
     monkeypatch.setattr(r,'run',reader)
     with pytest.raises(r.Refusal):estate.resume()
     assert not (estate.snapshot/'resumed.json').exists()
     assert (state/'pre-resume.json').exists()
+
+
+@pytest.mark.parametrize('policy_case',['good','missing','changed'])
+def test_real_resume_keeps_constructor_environment_through_reader_and_markers(estate,probe,monkeypatch,policy_case):
+    run_probe,_,env_file,process_env=probe
+    # Build a coherent prepared inventory using the actual constructor. Only
+    # external commands are fake; resume passes e.env unchanged to the reader.
+    values=env_file.read_text().replace('FORGE_IMAGE=review-release','FORGE_IMAGE='+r.RUNTIME)
+    values=values.replace('ROLLOUT_STATE_DIR='+str(probe[1]),'ROLLOUT_STATE_DIR='+str(estate.snapshot))
+    for key in ('REVIEW_IMAGE','REVIEW_SETTINGS_FILE','PYTHONPATH','PYTHONDONTWRITEBYTECODE'):
+        if key in process_env:values+='\n'+key+'='+process_env[key]
+    env_file.write_text(values+'\n')
+    assert run_probe().returncode==0
+    values+='\nPOLICY_CASE='+policy_case+'\n';env_file.write_text(values)
+    config=estate.c;config['project']='codex-review';config['env_file']=str(env_file);config['sources']['settings']=estate.q['prepared_settings'];config['quiesce']['prepared_env_file']=str(env_file)
+    r.atomic_json(estate.config_path,config)
+    monkeypatch.setenv('PATH',process_env['PATH'])
+    args=SimpleNamespace(**(vars(estate.args)|{'env_file':str(env_file),'project':'codex-review'}));e=q.Estate(args)
+    assert e.env['DOCKER_HOST']=='unix:///var/run/docker.sock' and e.env['FORGE_PUBLISHER_DOCKER_CONTEXT']=='default'
+    e.doc={'format_version':1,'binding':e.binding,'stage':'final'};e.save();pair={};calls=[]
+    monkeypatch.setattr(e,'markers',lambda:pair.get('marker'));monkeypatch.setattr(e,'record',lambda:e.doc);monkeypatch.setattr(e,'prepared_settings',lambda:None)
+    monkeypatch.setattr(e,'watch_closed',lambda **kw:None);monkeypatch.setattr(e,'producers_stopped',lambda:None);monkeypatch.setattr(e,'monitor',lambda:q.reader_counts(monitor()))
+    monkeypatch.setattr(r,'load_volumes',lambda *a,**kw:None);monkeypatch.setattr(r,'verify_snapshot',lambda *a:{'sha256':'a'*64});monkeypatch.setattr(e,'current_state',lambda:{'work_state':{}})
+    monkeypatch.setattr(r,'docker',lambda *a,**kw:SimpleNamespace(stdout=json.dumps([{'Id':r.RUNTIME}])))
+    monkeypatch.setattr(e,'volume',lambda role,code,args=(),**kw:pair.update(marker=json.loads(args[0])))
+    monkeypatch.setattr(e,'planning',lambda enabled:calls.append('planning'));monkeypatch.setattr(e,'compose',lambda *a:calls.append('compose'));monkeypatch.setattr(e,'captured',lambda *a,**kw:None)
+    actual_run=r.run
+    def run(argv,**kw):
+        assert '--read-pre-resume' in argv and kw['env'] is e.env
+        calls.append('reader');return actual_run(argv,**kw)
+    monkeypatch.setattr(r,'run',run)
+    if policy_case=='good':
+        assert e.resume()['passed'] and (e.snapshot/'resumed.json').exists() and pair.get('marker')
+        assert calls.index('reader')<calls.index('planning')
+    else:
+        with pytest.raises(r.Refusal):e.resume()
+        assert not (e.snapshot/'resumed.json').exists() and not pair and calls==['reader']
