@@ -402,7 +402,10 @@ def test_removing_one_project_preserves_other_and_shared_artifacts(monkeypatch,t
         calls.append(argv)
         if argv[:3]==['docker','--host',m.DOCKER_HOST]:return SimpleNamespace(stdout='')
         if argv[0]=='ip':return SimpleNamespace(stdout='[]')
-        if argv[:2]==['systemctl','show']:return SimpleNamespace(stdout=f"Requires=docker.socket forge-publisher-host-policy@{other['suffix']}.service\nDropInPaths={m.DROPIN_DIR}/forge-publisher-host-policy-{other['suffix']}.conf\n")
+        if argv[:2]==['systemctl','show']:
+            # The second project's loader stays required through its own drop-in.
+            still=lambda units,loader:units['docker.service'].update(Requires=f"docker.socket forge-publisher-host-policy@{other['suffix']}.service",DropInPaths=f"{m.DROPIN_DIR}/forge-publisher-host-policy-{other['suffix']}.conf")
+            return SimpleNamespace(stdout=show_units(still)(argv,f"forge-publisher-host-policy@{bound['suffix']}.service",''))
         return SimpleNamespace(stdout='',returncode=0)
     monkeypatch.setattr(m,'run',run)
     args=SimpleNamespace(project=bound['project'],docker_host=m.DOCKER_HOST)
@@ -682,22 +685,51 @@ def remove_boundary(m,monkeypatch,tmp_path,show):
     return b,dropin,calls
 
 
-def real_docker_after_reload(argv,loader,dropin):
-    # Rehearsal state of docker.service once the drop-in is gone: the loader's
-    # own Before=docker.service still orders Docker after it, but nothing requires it.
-    real={'Requires':'docker.socket','DropInPaths':'','After':f'systemd-journald.socket {loader}'}
-    return ''.join(f"{name}={real[name]}\n" for name in argv[3].removeprefix('--property=').split(','))
+def real_units_after_removal(loader):
+    # Rehearsal state once the drop-in is gone: the loader's own
+    # Before=docker.service still orders Docker after it, but nothing pulls it in.
+    return {
+        'docker.service':{'Requires':'docker.socket','DropInPaths':'','After':f'systemd-journald.socket {loader}',
+                          'Requisite':'','BindsTo':'','Wants':'containerd.service network-online.target','Upholds':''},
+        loader:{'RequiredBy':'','RequisiteOf':'','BoundBy':'','WantedBy':'','UpheldBy':'','Before':'shutdown.target docker.service'},
+    }
+
+
+def show_units(change=None):
+    def show(argv,loader,dropin):
+        units=real_units_after_removal(loader)
+        if change:change(units,loader)
+        props=units[argv[2]]
+        return ''.join(f"{name}={props[name]}\n" for name in argv[3].removeprefix('--property=').split(',') if name in props)
+    return show
+
+
+real_docker_after_reload=show_units()
 
 
 def test_remove_succeeds_when_only_loader_ordering_remains(monkeypatch,tmp_path,capsys):
     m=load_helper();b,dropin,calls=remove_boundary(m,monkeypatch,tmp_path,real_docker_after_reload)
     m.cmd_remove(SimpleNamespace(project=b['project'],docker_host=m.DOCKER_HOST))
-    assert ['systemctl','show','docker.service','--property=Requires,DropInPaths','--no-pager'] in calls
+    loader=f"forge-publisher-host-policy@{b['suffix']}.service"
+    assert [argv for argv in calls if argv[:2]==['systemctl','show']]==[
+        ['systemctl','show','docker.service','--property=Requires,DropInPaths','--no-pager'],
+        ['systemctl','show','docker.service','--property=Requisite,BindsTo,Wants,Upholds','--no-pager'],
+        ['systemctl','show',loader,'--property=RequiredBy,RequisiteOf,BoundBy,WantedBy,UpheldBy','--no-pager'],
+    ]
     assert calls.count(['systemctl','daemon-reload'])==1
     assert ['nft','delete','table','inet',b['table']] in calls
     assert not dropin.exists() and not (m.CONFIG_DIR/f"{b['suffix']}.json").exists()
     assert m.UNIT.read_bytes()==m.unit_bytes() and m.HELPER.read_bytes()==HELPER.read_bytes()
     assert capsys.readouterr().out.startswith(f"REMOVED project={b['project']}")
+
+
+def set_unit(unit,prop,value):
+    # value None drops the property from systemctl's answer; {loader} names the instance.
+    def change(units,loader):
+        props=units['docker.service' if unit=='docker' else loader]
+        if value is None:del props[prop]
+        else:props[prop]=value.format(loader=loader)
+    return change
 
 
 REMOVE_REFUSALS={
@@ -707,6 +739,19 @@ REMOVE_REFUSALS={
     "extra-property":lambda argv,loader,dropin:f"Requires=docker.socket\nDropInPaths=\nAfter={loader}\n",
     "malformed":lambda argv,loader,dropin:"Requires docker.socket\nDropInPaths\n",
     "empty":lambda argv,loader,dropin:"",
+    # A foreign docker.service drop-in keeping another dependency on the loader.
+    "docker-requisite-loader":show_units(set_unit('docker','Requisite','{loader}')),
+    "docker-bindsto-loader":show_units(set_unit('docker','BindsTo','{loader}')),
+    "docker-wants-loader":show_units(set_unit('docker','Wants','containerd.service network-online.target {loader}')),
+    "docker-upholds-loader":show_units(set_unit('docker','Upholds','{loader}')),
+    "docker-dependencies-unreadable":show_units(set_unit('docker','Upholds',None)),
+    # Anything still pulling the loader in, directly or through another unit.
+    "loader-required-by":show_units(set_unit('loader','RequiredBy','other.service')),
+    "loader-requisite-of":show_units(set_unit('loader','RequisiteOf','other.service')),
+    "loader-bound-by":show_units(set_unit('loader','BoundBy','x.service')),
+    "loader-wanted-by":show_units(set_unit('loader','WantedBy','docker.service')),
+    "loader-upheld-by":show_units(set_unit('loader','UpheldBy','other.service')),
+    "loader-reverse-unreadable":show_units(set_unit('loader','UpheldBy',None)),
 }
 
 
