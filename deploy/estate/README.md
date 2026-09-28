@@ -705,6 +705,43 @@ output paths, while the other commands take a JSON inventory. Snapshot, load,
 quiesce and recovery also take the exact dated snapshot directory. Pass the env
 file and Compose project explicitly and consistently.
 
+`rollout-settings` makes permission migration choices explicit. Use
+`--add-evidence-permission` only when the old settings have no permission for
+`/var/lib/forge-evidence`: the command then proves on the host that
+`--evidence-source-path` is a real, non-symlink directory beneath one effective
+previous-runtime bind and that no recorded mount shadows it. Repeat
+`--retire-permission OLD` once for every exact obsolete permission to remove.
+Unknown, repeated, noncanonical, registration-covering and evidence-covering
+choices refuse the operation. Registered project permissions, including a
+permission on a parent of registered paths, become only the deduplicated current
+registered container paths; no permission on the whole projects root is added.
+The receipt records the choices, host source identities, exact aliases and each
+registration's before/after permission coverage.
+
+A synthetic invocation showing the interface is:
+
+```console
+deploy/estate/rollout-settings \
+  --env-file /srv/synthetic-rollout/estate.env \
+  --env-output /srv/synthetic-rollout/prepared.env \
+  --settings-input /srv/synthetic-rollout/forge.yaml \
+  --settings-output /srv/synthetic-rollout/prepared-forge.yaml \
+  --compose-file deploy/estate/compose.yaml \
+  --project synthetic-rollout \
+  --previous-runtime /srv/synthetic-rollout/previous-runtime.json \
+  --receipt /srv/synthetic-rollout/settings-receipt.json \
+  --evidence-source-path /srv/synthetic-state/receipts \
+  --add-evidence-permission \
+  --retire-permission /home/synthetic-forge-runtime \
+  --retire-permission /home/synthetic-owner/Projects/synthetic-forge \
+  --secret-env-file /srv/synthetic-rollout/private.env \
+  --ack-registration-drift synthetic/project
+```
+
+If the input allowlist instead contains the exact evidence source entry, omit
+`--add-evidence-permission`; the existing exact-entry replacement contract is
+used. Always pass every actual drift acknowledgement and retirement explicitly.
+
 Keep original and prepared inventories distinct. They name the same project,
 Docker context, immutable runtime image, old ledger, snapshot root, nine legacy
 units, three old containers and five distinct state volumes. The prepared
