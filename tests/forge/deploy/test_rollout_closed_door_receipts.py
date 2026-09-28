@@ -12,7 +12,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[3]
 CHECK = ROOT / "deploy" / "estate" / "estate-check"
-IMAGE = "sha256:b66c27888512e54adac5da6cd99b80f930919c950f47edb7d5598c9ddb75c5f0"
+IMAGE = "sha256:ecc1520cfd462ad559d27bef7ef569427f02edb7abd3ef05845a42a19eeee58a"
 
 
 def _executable(path: Path, text: str) -> None:

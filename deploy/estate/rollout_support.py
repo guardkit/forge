@@ -26,10 +26,10 @@ from datetime import datetime, timezone
 
 MARK = 'ROLLOUT-SNAPSHOT.json'
 MIGRATED_ARTIFACT = 'migrated-forge.db'
-RUNTIME = 'sha256:b66c27888512e54adac5da6cd99b80f930919c950f47edb7d5598c9ddb75c5f0'
+RUNTIME = 'sha256:ecc1520cfd462ad559d27bef7ef569427f02edb7abd3ef05845a42a19eeee58a'
 UNIT_ROLES = {'gateway', 'frontdoor', 'watchdog_timer', 'watchdog_service', 'autobuild', 'runner', 'keeper', 'langgraph_sidecar', 'deploy_sidecar'}
 VOLUME_ROLES = {'ledger', 'settings', 'evidence', 'threads', 'relay_progress'}
-PUBLISHER_RUNTIME = 'sha256:e13dfe4564b18e4158ee7c7836b5e71a07aee35aa0699a480e4a8cbd389104dd'
+PUBLISHER_RUNTIME = 'sha256:221ce91db0440fdda00f9c17099889e18c304cd9c480fc55e8971a05cbcf074c'
 WORK_TABLES = {'builds': 1, 'planning_runs': 3, 'work_queue': 10, 'publication_records': 15, 'deployment_targets': 16}
 
 class Refusal(Exception):

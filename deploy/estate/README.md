@@ -929,18 +929,14 @@ the design:
    Release `2026.09.26-3` already carries the Jarvis serving and state-directory
    fix at `4efff4f`; its exact front-door image passed the serving check during
    preparation. The earlier claim that it predates that fix was stale.
-   The normal published-source build of `2026.09.27-1` completed successfully
-   from Forge `3956c79eb53960e522f28fc809d110052eb58148`. Its receipt binds manifest
-   SHA-256 `91dd319387efde1cd33f8636ca85a5567139ac1ed196950a6b2803a8e9ab8eb2`,
+   The normal published-source build of `2026.09.28-1` completed successfully
+   from Forge `a545a86a435862b573b595e10346e4cb75d6e715`. Its receipt binds manifest
+   SHA-256 `12cea07e35f25e5a867150b0045d7aee57a123da555e0c89d751abf183523477`,
    records all five image roles, and reports a two-term sweep with no exceptions.
    The operator constants now name the immutable Forge coordinator and publisher
-   image IDs recorded by that receipt. Independent package checks passed in
-   their measured scopes, but the actual legacy configuration exposed a named
-   repair admission defect for projects with shared-path aliases. The accepted
-   source correction is pinned by candidate `2026.09.28-1`; that candidate has
-   not been published or built. Operator image constants deliberately remain
-   on the previous receipt until the normal build supplies new immutable IDs.
-   The replacement image must pass qualification and both fresh throwaway
+   image IDs recorded by that receipt. These are build facts only: source and
+   package checks remain evidence for their separately measured scopes, and the
+   replacement images still need qualification and both fresh throwaway
    rehearsals before rollout readiness can be claimed.
 10. **Codex's sign-off, and the owner's go.** Nothing here is rollout approval.
 
