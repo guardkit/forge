@@ -230,6 +230,30 @@ if add_evidence_permission:
 elif mapping_proof is not None:
     raise ValueError("a host evidence mapping proof was supplied without an add disposition")
 
+mapped_evidence_paths = []
+if add_evidence_permission:
+    mapped_evidence_paths.append(str(proof_container))
+elif replaced_evidence:
+    for mount in runtime_mounts:
+        mount_type = str(mount.get("Type", mount.get("type", ""))).lower()
+        if mount_type != "bind":
+            continue
+        try:
+            bind_source = canonical_absolute(
+                mount.get("Source", mount.get("source")), "a previous-runtime bind source"
+            )
+            bind_destination = canonical_absolute(
+                mount.get("Destination", mount.get("destination", mount.get("target"))),
+                "a previous-runtime bind destination",
+            )
+            relative_evidence = evidence_source.relative_to(bind_source)
+        except (TypeError, ValueError):
+            continue
+        mapped_evidence_paths.append(str(bind_destination / relative_evidence))
+for choice in retire_permissions:
+    if any(covers(choice, path) for path in mapped_evidence_paths):
+        raise ValueError(f"retired permission {choice} covers the current mapped evidence")
+
 new_allowlist = []
 def append_permission(item):
     if item not in new_allowlist:
