@@ -753,9 +753,11 @@ def cmd_remove(args: argparse.Namespace) -> None:
             dropin.unlink()
             try:
                 run(["systemctl", "daemon-reload"])
-                shown = run(["systemctl", "show", "docker.service", "--property=Requires,After", "--no-pager"]).stdout
-                properties = dict(line.split("=", 1) for line in shown.splitlines() if "=" in line)
-                if set(properties) != {"Requires", "After"} or any(f"forge-publisher-host-policy@{bound['suffix']}.service" in v.split() for v in properties.values()):
+                # Prove the requirement is gone. After= may still name the loader:
+                # the loader's own Before=docker.service keeps that ordering while
+                # it stays loaded, and ordering alone never requires the loader.
+                properties = systemd_properties("docker.service", "Requires,DropInPaths")
+                if f"forge-publisher-host-policy@{bound['suffix']}.service" in properties["Requires"].split() or str(dropin) in properties["DropInPaths"].split():
                     refuse("Docker reverse requirement removal is not proved")
             except Exception:
                 atomic_write(dropin, dropin_bytes(bound["suffix"]), 0o644)
