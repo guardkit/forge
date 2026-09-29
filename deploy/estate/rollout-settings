@@ -749,7 +749,10 @@ def docker_env(values: dict[str, str]) -> dict[str, str]:
     base = {"PATH": os.environ.get("PATH", "/usr/bin:/bin")}
     if "DOCKER_CONFIG" in os.environ:
         base["DOCKER_CONFIG"] = os.environ["DOCKER_CONFIG"]
-    base.update(values)
+    # The env file's temporary folder is a path inside the sandbox; the Docker
+    # CLI runs on this machine. Same names as rollout_support.SANDBOX_TEMP_NAMES,
+    # kept here because this command stands alone.
+    base.update({name: value for name, value in values.items() if name not in ("TMPDIR", "TMP", "TEMP")})
     return base
 
 

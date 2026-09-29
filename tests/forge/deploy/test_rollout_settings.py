@@ -216,6 +216,9 @@ args = sys.argv[1:]
 root = Path(__file__).resolve().parent.parent
 with (root / "docker.log").open("a", encoding="utf-8") as stream:
     stream.write(json.dumps(args) + "\n")
+with (root / "docker-env.log").open("a", encoding="utf-8") as stream:
+    temp = {name: os.environ.get(name) for name in ("TMPDIR", "TMP", "TEMP")}
+    stream.write(json.dumps({"args": args, "names": sorted(os.environ), "temp": temp}) + "\n")
 if args[:2] == ["image", "inspect"]:
     print(args[-1])
     raise SystemExit(0)
@@ -986,6 +989,27 @@ def test_host_environment_cannot_override_explicit_env_file_route(scenario):
     receipt = json.loads(scenario["outputs"]["receipt"].read_text())
     assert receipt["routes"]["gateway_routes_match"] is True
     assert "203.0.113.99" not in scenario["outputs"]["settings"].read_text()
+
+
+def test_docker_cli_is_never_handed_the_env_files_sandbox_temp_folder(scenario):
+    # TMPDIR in the estate env file is a path inside the sandbox; the Docker CLI
+    # runs on this machine, where that folder does not exist.
+    sandbox_tmp = "/nonexistent-sandbox-only/tmp"
+    with scenario["env_file"].open("a", encoding="utf-8") as stream:
+        stream.write("".join(f"{name}={sandbox_tmp}\n" for name in ("TMPDIR", "TMP", "TEMP")))
+    result = run(scenario)
+    assert result.returncode == 0, result.stderr
+    log = scenario["docker_log"].with_name("docker-env.log")
+    calls = [json.loads(line) for line in log.read_text().splitlines()]
+    assert {call["args"][0] for call in calls} >= {"image", "run", "compose"}
+    for call in calls:
+        assert call["temp"] == {"TMPDIR": None, "TMP": None, "TEMP": None}, call["args"]
+    # The env file's other values still reach the public-value Docker calls.
+    for call in calls:
+        if call["args"][0] != "compose":
+            assert {"FORGE_IMAGE", "FACTORY_GATEWAY_ADDRESS", "FORGE_NATS_URL"} <= set(call["names"]), call["args"]
+    # The sandbox's own copy is untouched: the env output still names it.
+    assert f"TMPDIR={sandbox_tmp}" in scenario["outputs"]["env"].read_text()
 
 
 def test_secret_values_never_reach_outputs_or_diagnostics(scenario):
