@@ -627,15 +627,18 @@ network and it does not repeat anything after a restart. That is recorded with
 the rollout preconditions below, and it is a gap in the **check**, not only in
 the firewall rule.
 
-**Item 9 has never run.** The design's ninth item is the answer service reached
-**from inside a sandbox**, at the factory gateway address the sandbox's own
-profile allows. It is the check that proves that route, and without it a
-project's deploy helper refuses every deploy that names a commit. The probe is
-written — it takes the sandbox's name from `.env` and asks from in there — but
+**Item 9 has run once, on release `2026.09.28-1`.** The design's ninth item is
+the answer service reached **from inside a sandbox**, at the factory gateway
+address the sandbox's own profile allows. It is the check that proves that
+route, and without it a project's deploy helper refuses every deploy that names
+a commit. The probe takes the sandbox's name from `.env` and asks from in there;
 on a machine with no sandbox of that name it prints *not checked here*, with
 the reason, and **counts as NOT PASSED**. The whole run then exits non-zero.
-An item that has not been checked is not a pass, and this bundle's gate is not
-met until it runs for real.
+It passed for real in the BEFORE rehearsal on 28 September 2026:
+`estate-check --pre-resume`, at 06:45 UTC and again at 06:48 UTC after a
+restart, asked from inside the throwaway sandbox that was running release image
+`forge:2026.09.28-1` (the operator's recorded `estate-check --pre-resume`
+receipts from that rehearsal). It has not run on `2026.09.28-2`.
 
 ## The closed-door check — `estate-check --pre-resume`
 
@@ -739,7 +742,8 @@ reader the bus does not hold is a **refusal** here and never a nought.
 The six `rollout-*` commands are host operator tools for this estate. Their
 source revision is separate from the immutable application images they run.
 Keep the reviewed tool revision, exact image IDs, private inputs and receipts
-together. Source acceptance does not authorize a live rollout: complete the
+together. The host policy helper's revision for these tools is `18d8f51`.
+Source acceptance does not authorize a live rollout: complete the
 required throwaway rehearsal and obtain the owner's rollout approval first.
 
 | Command | Responsibility |
@@ -946,8 +950,9 @@ filesystem is made of, so that list, hashed, is what is compared.
 Recorded here so nothing reads as finished that is not, from the build plan and
 the design:
 
-1. **Item 9 has not run** — the route from inside a sandbox to the answer
-   service (above).
+1. **Item 9 has not run on `2026.09.28-2`** — the route from inside a sandbox
+   to the answer service. It passed in the BEFORE rehearsal on `2026.09.28-1`
+   (above).
 2. **The per-route access policy is not enforced, and the check is weaker than
    the design asks.** The design requires each published port to name its
    listener, its destination port and its allowed source, and to refuse every
@@ -958,13 +963,20 @@ the design:
    it does; and **the check** — `estate-check services` proves one forbidden
    direction, makes no probe from the local network, and repeats nothing after
    a restart.
-3. **The images are named by tag, not by digest.** Section 3's item 4 and the
-   rollout table both say the bundle supplies the tested image *by digest* and
-   records the digest it replaces. `.env.example` names four tags, `estate-check`
-   item 4 looks for those tags, and its own sentence says so. A tag can be
-   moved; a digest cannot, and the whole point of the gate is that the tested
-   image is what runs. (The bus's base image *is* pinned by digest in
-   `estate-pins.conf`; it is the four release tags that are not.)
+3. **Whether image IDs meet the digest requirement is open until reviewed.**
+   Section 3's item 4 and the rollout table both say the bundle supplies the
+   tested image *by digest* and records the digest it replaces. `.env.example`
+   names release tags, `estate-check` item 4 looks for those tags, and its own
+   sentence says so. The rollout tools do not trust those tags: they bind
+   immutable local image IDs, `RUNTIME` for the coordinator and answer service
+   and `PUBLISHER_RUNTIME` for the publisher in `rollout_support.py`, and refuse
+   when `FORGE_IMAGE`, the rendered services or the running containers name any
+   other image, or when the release tag no longer resolves to it. In the
+   sandbox, `FORGE_IMAGE_IDENTITY` is a hash of the image's platform, layers and
+   runtime configuration, which the bootstrap checks again.
+   A local image ID is not a registry digest. Whether this satisfies the digest
+   requirement is a reviewer's decision, and it is recorded as open until that
+   review. (The bus's base image *is* pinned by digest in `estate-pins.conf`.)
 4. **The model seat has not been asked for real** — it is not in the bundle, so
    that part of the design's item 8 counts as not passed (above). The memory
    service and its relay joined the bundle on 25 September 2026 and are asked
