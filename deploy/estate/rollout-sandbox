@@ -7,7 +7,8 @@ script_path, profile_path, profile_source, systemd_user_dir, evidence_dir,
 remote_ref, remote_name, declared_remote, declaration_files, release_image,
 expected_sbx_version, legacy_dropins, legacy_command_markers, forbidden_values}.
 Routes come ONLY from the explicit env file: FACTORY_GATEWAY_ADDRESS,
-FORGE_TARGET_OWNER_URL, FORGE_SANDBOX_SIDECAR_URL, FORGE_SANDBOX_RUNNER_URL.
+FORGE_TARGET_OWNER_URL, FORGE_SANDBOX_SIDECAR_URL, FORGE_SANDBOX_RUNNER_URL,
+FLEET_MEMORY_PORT (the memory MCP's gateway publish port, as compose.yaml uses it).
 The producer profile retains all choices except gateway publish addresses,
 explicit allow-rule replacements, receipts_path and cwd. sandbox.allow_replacements
 maps old host:port entries to env variable NAMES holding replacement host:port.
@@ -168,9 +169,9 @@ for field,key in [('sidecar_publish','FORGE_SANDBOX_SIDECAR_URL'),('runner_publi
 replacements=c.get('allow_replacements',{})
 assert all(old in s['allow_network'] or env[key] in s['allow_network'] for old,key in replacements.items())
 rules=[env[replacements[x]] if x in replacements else x for x in s['allow_network']]
-answer=p['answer']; rules=list(dict.fromkeys(rules+[answer]))
-# Gateway rules are scoped to single ports; no wildcard/global answer rule.
-assert answer in rules and gateway not in rules
+answer=p['answer']; memory=p['memory_mcp']; rules=list(dict.fromkeys(rules+[answer,memory]))
+# Gateway rules are scoped to single ports; no wildcard/global answer or memory rule.
+assert answer in rules and memory in rules and answer!=memory and gateway not in rules
 assert all(x!='*' and '/' not in x for x in rules)
 s['allow_network']=rules; s['receipts_path']=c['receipts_path']; doc['cwd']=c['clone_path']
 parse_deploy_profile(doc)
@@ -251,8 +252,11 @@ class Rollout:
             require(Path(path).parent == self.dropin.parent and Path(path).suffix == '.conf' and Path(path) != self.dropin,
                     'legacy drop-in is outside the exact runner unit; fix the inventory')
         require(isinstance(s['forbidden_values'], list) and all(isinstance(x,str) and x for x in s['forbidden_values']), 'forbidden_values must list machine values to sweep; fix the inventory')
-        gateway = self.values['FACTORY_GATEWAY_ADDRESS']
-        address = ipaddress.ip_address(gateway)
+        gateway = self.values.get('FACTORY_GATEWAY_ADDRESS','')
+        try:
+            address = ipaddress.ip_address(gateway)
+        except ValueError:
+            raise Refusal('FACTORY_GATEWAY_ADDRESS is missing or not an IP address; name the sandbox boundary address in the env file') from None
         require(address.version == 4 and not address.is_loopback and not address.is_unspecified,
                 'gateway address is loopback or unspecified; name the sandbox boundary address')
         for key in ('FORGE_TARGET_OWNER_URL','FORGE_SANDBOX_SIDECAR_URL','FORGE_SANDBOX_RUNNER_URL'):
@@ -261,6 +265,12 @@ class Rollout:
                     f'{key} does not use the gateway with an explicit port; fix the env route')
         owner = urlsplit(self.values['FORGE_TARGET_OWNER_URL'])
         self.answer = f'{gateway}:{owner.port}'
+        # Same published port compose.yaml binds at the gateway for the memory MCP.
+        memory_port = self.values.get('FLEET_MEMORY_PORT','')
+        require(re.fullmatch(r'[1-9][0-9]{0,4}',memory_port) and int(memory_port) < 65536,
+                'FLEET_MEMORY_PORT is missing or not a port number; name the memory MCP gateway publish port in the env file')
+        self.memory_mcp = f'{gateway}:{int(memory_port)}'
+        require(self.memory_mcp != self.answer, 'FLEET_MEMORY_PORT equals the answer-service port; give the memory MCP its own gateway port')
         require(isinstance(s.get('allow_replacements',{}),dict), 'allow_replacements must map old rules to env names; fix the inventory')
         for old, name in s.get('allow_replacements',{}).items():
             require(isinstance(old,str) and isinstance(name,str) and re.fullmatch(r'[A-Z_][A-Z0-9_]*',name), 'allow replacement must name an env variable; fix the inventory')
@@ -396,7 +406,7 @@ class Rollout:
             raise Refusal(f'stopped status is unknown or not proved for {self.s["name"]}; work may still be running inside, so keep units masked and inspect before retrying') from None
 
     def profile(self):
-        payload = {'source':self.source,'sandbox':self.s,'env':{k:v for k,v in self.values.items() if k in {'FACTORY_GATEWAY_ADDRESS','FORGE_SANDBOX_SIDECAR_URL','FORGE_SANDBOX_RUNNER_URL'} or k in self.s.get('allow_replacements',{}).values()},'answer':self.answer}
+        payload = {'source':self.source,'sandbox':self.s,'env':{k:v for k,v in self.values.items() if k in {'FACTORY_GATEWAY_ADDRESS','FORGE_SANDBOX_SIDECAR_URL','FORGE_SANDBOX_RUNNER_URL'} or k in self.s.get('allow_replacements',{}).values()},'answer':self.answer,'memory_mcp':self.memory_mcp}
         out = self.run(['docker','--context',self.config['docker_context'],'run','--rm','--pull=never','--network=none','--read-only','-i','--entrypoint','python',self.config['runtime_image'],'-c',PROFILE], input=json.dumps(payload)).stdout
         return json.loads(out)
 
@@ -574,7 +584,7 @@ class Rollout:
             self.systemctl('daemon-reload',check=False)
             raise
         self.save('commands.json',self.events)
-        self.save('sandbox-installed.json',{'format_version':1,'project':self.args.project,'sandbox':self.s['name'],'image':self.config['runtime_image'],'template_sha256':digest(self.template),'profile_sha256':digest(profile['text'].encode()),'answer_rule':self.answer,'disk_before':before,'disk_after':after,'bootstrap_image_settings':image_settings,'bootstrap_env_file':str(self.bootstrap_env),'bootstrap_env_names':sorted(bootstrap),'remote_fetch_through_normal_entry':'NOT-TESTED','memory_forwarded_names':list(MEMORY_NAMES),'actual_memory_read_write':'NOT-TESTED'})
+        self.save('sandbox-installed.json',{'format_version':1,'project':self.args.project,'sandbox':self.s['name'],'image':self.config['runtime_image'],'template_sha256':digest(self.template),'profile_sha256':digest(profile['text'].encode()),'answer_rule':self.answer,'memory_mcp_rule':self.memory_mcp,'disk_before':before,'disk_after':after,'bootstrap_image_settings':image_settings,'bootstrap_env_file':str(self.bootstrap_env),'bootstrap_env_names':sorted(bootstrap),'remote_fetch_through_normal_entry':'NOT-TESTED','memory_forwarded_names':list(MEMORY_NAMES),'actual_memory_read_write':'NOT-TESTED'})
         self.complete = True
         print('Current template and producer profile installed and read back; units are unmasked but stopped; actual memory read/write and normal lifecycle checks remain required.')
 
@@ -592,7 +602,7 @@ def main(argv=None):
     try:
         rollout = Rollout(args)
         if args.plan:
-            print('Plan only: remote, systemd, sandbox, image and disk facts are NOT VERIFIED. Would validate profile in the pinned image; record clone, known-file hashes, receipt listing and process diagnostics; empty and prove both runner stop hooks; stop and mask keeper then runner; refuse held sessions; stop only '+rollout.s['name']+'; require positive stopped status; wake with our exec; refuse any running container or legacy process; compare every disk witness; hand in the release with the normal identity helper; add sandbox-scoped routes; install the current template byte-for-byte and rewrite producer profile paths/publish rules; remove legacy drop-ins; unmask both stopped units; record evidence.')
+            print('Plan only: remote, systemd, sandbox, image and disk facts are NOT VERIFIED. Would validate profile in the pinned image; record clone, known-file hashes, receipt listing and process diagnostics; empty and prove both runner stop hooks; stop and mask keeper then runner; refuse held sessions; stop only '+rollout.s['name']+'; require positive stopped status; wake with our exec; refuse any running container or legacy process; compare every disk witness; hand in the release with the normal identity helper; add sandbox-scoped routes (answer service '+rollout.answer+', memory MCP '+rollout.memory_mcp+'); install the current template byte-for-byte and rewrite producer profile paths/publish rules; remove legacy drop-ins; unmask both stopped units; record evidence.')
             return 0
         require(args.stop_legacy, 'one-time replacement requires --stop-legacy; inspect --plan before the attended rollout')
         rollout.execute()

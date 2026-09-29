@@ -38,7 +38,7 @@ def inventory(tmp_path):
         'FORGE_TARGET_OWNER_URL=http://192.0.2.10:8900',
         'FORGE_SANDBOX_SIDECAR_URL=http://192.0.2.10:8925',
         'FORGE_SANDBOX_RUNNER_URL=http://192.0.2.10:8924',
-        'FLEET_MEMORY_ENABLED=false','SANDBOX_RECEIPTS_PATH=/private/receipts',
+        'FLEET_MEMORY_ENABLED=false','FLEET_MEMORY_PORT=30822','SANDBOX_RECEIPTS_PATH=/private/receipts',
         'SANDBOX_NAME=owned-sandbox','SANDBOX_BOOTSTRAP=/private/clone/deploy/sandbox-runner.sh',
         'SANDBOX_PROJECT_ENV_FILE='+str(tmp_path/'operational'/'bootstrap.env'),
         'SANDBOX_ENV_NAMES=SANDBOX_RECEIPTS_PATH FORGE_IMAGE FORGE_IMAGE_IDENTITY FORGE_RELEASE_VERSION FORGE_RELEASE_MANIFEST_SHA256 FORGE_TARGET_OWNER_URL '+' '.join(m.MEMORY_NAMES),
@@ -310,11 +310,66 @@ def test_profile_preserves_choices_and_all_routes(inventory,monkeypatch):
     import yaml
     doc=yaml.safe_load(Path(config['sandbox']['profile_source']).read_text())
     assert doc['custom_choice']=={'keep':True}
-    assert doc['sandbox']['allow_network']==['example.test:443','192.0.2.10:8900']
+    assert doc['sandbox']['allow_network']==['example.test:443','192.0.2.10:8900','192.0.2.10:30822']
     assert doc['sandbox']['receipts_path']=='/private/receipts'
     assert doc['cwd']=='/private/clone'
     publishes=[x[-1] for x in b.argv() if x[:3]==['sbx','ports','owned-sandbox'] and '--publish' in x]
     assert len(publishes)==4 and all(x.startswith('192.0.2.10:') for x in publishes)
+
+
+@pytest.mark.parametrize('manual',[False,True])
+def test_memory_mcp_rule_is_one_gateway_port_beside_the_answer_rule(inventory,monkeypatch,manual):
+    config,path,args=inventory
+    if manual:
+        # A hand-written replacement for the same route must not duplicate it.
+        profile=Path(config['sandbox']['profile_source'])
+        profile.write_text(profile.read_text().replace('["example.test:443"]','["example.test:443", "legacy-memory.test:8005"]'))
+        config['sandbox']['allow_replacements']={'legacy-memory.test:8005':'MEMORY_ROUTE'}
+        path.write_text(json.dumps(config))
+        edit_env(config,{'MEMORY_ROUTE':'192.0.2.10:30822'})
+    b=Boundary(config,monkeypatch)
+    assert m.main(args)==0
+    import yaml
+    rules=yaml.safe_load(Path(config['sandbox']['profile_source']).read_text())['sandbox']['allow_network']
+    assert rules.count('192.0.2.10:30822')==1 and rules.count('192.0.2.10:8900')==1
+    assert [x for x in rules if x.startswith('192.0.2.10')]==(['192.0.2.10:30822','192.0.2.10:8900'] if manual else ['192.0.2.10:8900','192.0.2.10:30822'])
+    allowed=next(x for x in b.argv() if x[:4]==['sbx','policy','allow','network'])[-1].split(',')
+    assert allowed==rules
+    receipt=json.loads((Path(config['sandbox']['evidence_dir'])/'sandbox-installed.json').read_text())
+    assert receipt['answer_rule']=='192.0.2.10:8900' and receipt['memory_mcp_rule']=='192.0.2.10:30822'
+
+
+def test_plan_shows_answer_and_memory_mcp_rules(inventory):
+    config,path,args=inventory
+    result=subprocess.run([sys.executable,str(SCRIPT),*args,'--plan'],capture_output=True,text=True,env={'PATH':'/does-not-exist'})
+    assert result.returncode==0,result.stderr
+    assert 'answer service 192.0.2.10:8900' in result.stdout
+    assert 'memory MCP 192.0.2.10:30822' in result.stdout
+
+
+@pytest.mark.parametrize('change,message',[
+    ({'FLEET_MEMORY_PORT':None},'FLEET_MEMORY_PORT is missing or not a port number'),
+    ({'FLEET_MEMORY_PORT':''},'FLEET_MEMORY_PORT is missing or not a port number'),
+    ({'FLEET_MEMORY_PORT':'mcp'},'FLEET_MEMORY_PORT is missing or not a port number'),
+    ({'FLEET_MEMORY_PORT':'0'},'FLEET_MEMORY_PORT is missing or not a port number'),
+    ({'FLEET_MEMORY_PORT':'030822'},'FLEET_MEMORY_PORT is missing or not a port number'),
+    ({'FLEET_MEMORY_PORT':'65536'},'FLEET_MEMORY_PORT is missing or not a port number'),
+    ({'FLEET_MEMORY_PORT':'192.0.2.10:30822'},'FLEET_MEMORY_PORT is missing or not a port number'),
+    ({'FLEET_MEMORY_PORT':'8900'},'FLEET_MEMORY_PORT equals the answer-service port'),
+    ({'FACTORY_GATEWAY_ADDRESS':None},'FACTORY_GATEWAY_ADDRESS is missing or not an IP address'),
+    ({'FACTORY_GATEWAY_ADDRESS':'gateway.test'},'FACTORY_GATEWAY_ADDRESS is missing or not an IP address'),
+    ({'FACTORY_GATEWAY_ADDRESS':'192.0.2.10:30822'},'FACTORY_GATEWAY_ADDRESS is missing or not an IP address'),
+])
+@pytest.mark.parametrize('plan',[False,True])
+def test_bad_memory_mcp_route_refuses_before_anything_is_written(inventory,monkeypatch,capsys,tmp_path,change,message,plan):
+    config,path,args=inventory;edit_env(config,change)
+    monkeypatch.setattr(m.subprocess,'run',lambda *a,**k:pytest.fail('external call before route validation'))
+    before={p:p.read_bytes() for p in tmp_path.rglob('*') if p.is_file()}
+    assert m.main([*args,'--plan'] if plan else args)==2
+    error=capsys.readouterr().err
+    assert message in error
+    assert {p:p.read_bytes() for p in tmp_path.rglob('*') if p.is_file()}==before
+    assert not Path(config['sandbox']['evidence_dir']).exists()
 
 
 def test_actual_disk_payload_detects_same_size_receipt_and_named_file_changes(tmp_path):
