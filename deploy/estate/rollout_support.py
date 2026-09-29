@@ -32,6 +32,15 @@ VOLUME_ROLES = {'ledger', 'settings', 'evidence', 'threads', 'relay_progress'}
 PUBLISHER_RUNTIME = 'sha256:dd5281444ec7fbe6f13473331c693383d458819b72789a85815305471a0a604b'
 WORK_TABLES = {'builds': 1, 'planning_runs': 3, 'work_queue': 10, 'publication_records': 15, 'deployment_targets': 16}
 
+# Temporary-folder names an estate env file may set for the sandbox (TMPDIR is
+# a path INSIDE it, .env.example). A process on this machine must never be
+# handed them: mktemp there fails on a folder that exists only in the sandbox.
+# The sandbox still gets them from the env file itself, never from here.
+SANDBOX_TEMP_NAMES = ('TMPDIR', 'TMP', 'TEMP')
+
+def host_values(values):
+    return {k: v for k, v in values.items() if k not in SANDBOX_TEMP_NAMES}
+
 class Refusal(Exception):
     pass
 

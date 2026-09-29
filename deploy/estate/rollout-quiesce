@@ -317,7 +317,7 @@ class Estate:
         for _ in range(8):
             self.values={k:re.sub(r'\$\{([A-Za-z_][A-Za-z0-9_]*)\}',lambda m:self.values.get(m[1],m[0]),v) for k,v in self.values.items()}
         need(self.values.get('FORGE_IMAGE')==self.c['runtime_image'],'public env selects another runtime image; select the reviewed phase env')
-        self.env={k:v for k,v in os.environ.items() if k in ('PATH','HOME','DOCKER_CONFIG','XDG_RUNTIME_DIR')};self.env.update(self.values)
+        self.env={k:v for k,v in os.environ.items() if k in ('PATH','HOME','DOCKER_CONFIG','XDG_RUNTIME_DIR')};self.env.update(r.host_values(self.values))
         # The existing local inventory context has a fixed endpoint. Carry this
         # non-secret binding to estate-check; other inventory contexts retain
         # their original environment and remain outside publisher qualification.

@@ -1065,3 +1065,61 @@ def test_real_resume_keeps_constructor_environment_through_reader_and_markers(es
     else:
         with pytest.raises(r.Refusal):e.resume()
         assert not (e.snapshot/'resumed.json').exists() and not pair and calls==['reader']
+
+
+SANDBOX_TMP='/nonexistent-sandbox-only/tmp'
+TEMP_NAMES=('TMPDIR','TMP','TEMP')
+
+def resume_recording_children(estate,monkeypatch):
+    # The estate env file names temp folders that exist only inside the sandbox
+    # (29 September 2026: estate-check's mktemp failed on exactly this). Build
+    # the real constructor and resume; every host child is recorded at r.run,
+    # the one place rollout_support starts a process.
+    env_file=Path(estate.args.env_file)
+    env_file.write_text(env_file.read_text()+''.join(f'{name}={SANDBOX_TMP}\n' for name in TEMP_NAMES)+f'ROLLOUT_STATE_DIR={estate.snapshot}\n')
+    e=q.Estate(estate.args);e.phase='prepared'
+    assert all(e.values[name]==SANDBOX_TMP for name in TEMP_NAMES)
+    e.doc={'format_version':1,'binding':e.binding,'stage':'final'};e.save()
+    host_marker=e.snapshot/'resumed.json'
+    monkeypatch.setattr(e,'markers',lambda:r.read_json(host_marker) if host_marker.exists() else None)
+    monkeypatch.setattr(e,'record',lambda:e.doc);monkeypatch.setattr(e,'prepared_settings',lambda:None)
+    monkeypatch.setattr(e,'watch_closed',lambda **kw:None);monkeypatch.setattr(e,'producers_stopped',lambda:None);monkeypatch.setattr(e,'monitor',lambda:q.reader_counts(monitor()))
+    monkeypatch.setattr(e,'current_state',lambda:{'work_state':{}})
+    monkeypatch.setattr(r,'load_volumes',lambda *a,**kw:None);monkeypatch.setattr(r,'verify_snapshot',lambda *a:{'sha256':'a'*64});monkeypatch.setattr(r,'volume_identity',lambda *a,**kw:None)
+    children=[]
+    def child(argv,**kw):
+        argv=[str(x) for x in argv];children.append((argv,kw.get('env')))
+        if argv[:1]==['docker'] and 'inspect' in argv:out=json.dumps([{'Id':r.RUNTIME}])
+        elif argv[:1]==['docker'] and 'config' in argv:out='{}'
+        else:out=''
+        return SimpleNamespace(returncode=0,stdout=out,stderr='')
+    monkeypatch.setattr(r,'run',child)
+    assert e.resume()['passed']
+    return e,children
+
+def test_resume_hands_no_host_child_the_env_files_sandbox_temp_folder(estate,monkeypatch):
+    e,children=resume_recording_children(estate,monkeypatch)
+    commands=[argv for argv,_ in children]
+    assert any(a[0].endswith('estate-check') and '--read-pre-resume' in a for a in commands)
+    assert any(a[0].endswith('estate-check') and 'services' in a for a in commands)
+    assert any(a[0].endswith('factory-hello') for a in commands)
+    assert any(a[:1]==['docker'] and 'compose' in a and 'up' in a for a in commands)
+    assert any(a[:1]==['docker'] and 'run' in a and '--env' in a for a in commands)
+    for argv,env in children:
+        # env=None children inherit this process's own environment, never the file's.
+        seen=os.environ if env is None else env
+        for name in TEMP_NAMES:
+            assert seen.get(name)!=SANDBOX_TMP,(argv,name)
+            if env is not None:assert name not in env,(argv,name)
+    services=next(env for argv,env in children if argv[0].endswith('estate-check') and 'services' in argv)
+    assert services is e.env and services['FORGE_NATS_URL']=='nats://fake.invalid:14222' and 'TMPDIR' not in services
+
+def test_resume_children_keep_every_other_env_file_value(estate,monkeypatch):
+    e,children=resume_recording_children(estate,monkeypatch)
+    # The environment the constructor built before temp names were withheld.
+    before={k:v for k,v in os.environ.items() if k in ('PATH','HOME','DOCKER_CONFIG','XDG_RUNTIME_DIR')}
+    before.update(e.values);before.update(DOCKER_HOST='unix:///var/run/docker.sock',FORGE_PUBLISHER_DOCKER_CONTEXT='default')
+    assert set(before)-set(e.env)==set(TEMP_NAMES) and set(e.env)<=set(before)
+    expected={k:v for k,v in before.items() if k not in TEMP_NAMES}
+    given=[env for _,env in children if env is not None]
+    assert len(given)>=5 and all(env==expected for env in given)
