@@ -25,6 +25,17 @@ import rollout_support as r
 HERE = Path(__file__).resolve().parent
 SERVICES = ('front-door','bus-gateway','memory-relay','memory','forge-publisher','answer-service','coordinator')
 PRODUCERS = ('front-door','bus-gateway')
+# READINESS AFTER RESUME OPENS THE DOOR (rehearsal of 30 September 2026). The
+# services check ran 0.3 s after the containers started and failed three items
+# that passed 30 s later. So resume waits, bounded, for the signals those items
+# read. The slowest is Docker health: the coordinator's and the front door's
+# healthchecks first probe one interval (30 s) after start and every 30 s
+# after, and the front door's start period is 60 s, so one that starts within
+# its own declared period is healthy by the 90 s probe; the gateway was on the
+# bus 17 s after it started. 180 s is that 90 s twice over.
+READY_DEADLINE_SECONDS = 180
+READY_POLL_SECONDS = 3
+HEALTHCHECKED = ('coordinator','front-door')
 RESUMED = 'ROLLOUT-RESUMED'
 ACTIVE_BUILDS = {'QUEUED','PREPARING','RUNNING','PAUSED','FINALISING'}
 ACTIVE_PLANS = {'QUEUED','RUNNING','PAUSED','FEATURE_SPEC','FEATURE_PLAN'}
@@ -172,6 +183,15 @@ def quiet_counts(counts):
     for name,values in counts['readers'].items():
         need(values['num_pending']==values['num_ack_pending']==0,
              f'reader {name} has pending={values["num_pending"]} and unacknowledged={values["num_ack_pending"]}; leave admissions closed and let it settle')
+
+def gateway_connections(doc, account, name, subject):
+    """Count the bus gateway's OWN connections in a connz answer: the account AND
+    the client name AND the subscription on one connection, as estate-check item
+    8i asks, because the front door shares the account."""
+    def subjects(connection):
+        return connection.get('subscriptions_list') or [x.get('subject') for x in connection.get('subscriptions_list_detail') or []]
+    return sum(1 for connection in doc.get('connections') or []
+               if connection.get('authorized_user')==account and (connection.get('name') or '')==name and subject in subjects(connection))
 
 def marker_file(value):
     """Physical absence is different from any present, malformed artifact."""
@@ -628,6 +648,64 @@ print('planning switch read back')
         actual=self.volume('settings',code,environment=True).strip()
         need(actual==receipt['settings_output_sha256'],'current settings volume differs from the validated prepared file; keep admissions closed')
 
+    def readiness(self,ids,restarts):
+        """One observation of what resume opened: (not yet ready, never will be), each by service."""
+        waiting={};broken={}
+        for name,identifier in ids.items():
+            found=r.docker(self.c,'inspect',identifier,check=False)
+            try:item=json.loads(found.stdout)[0] if found.returncode==0 else None
+            except (ValueError,IndexError,TypeError):item=None
+            if not isinstance(item,dict):
+                broken[name]=f'{name} container {identifier[:12]} can no longer be inspected; it was removed or replaced after resume opened it';continue
+            state=item.get('State') or {}
+            if item.get('RestartCount')!=restarts[name]:
+                broken[name]=f'{name} has restarted since resume opened it (restart count {restarts[name]} then {item.get("RestartCount")}); read its log';continue
+            if not state.get('Running') or state.get('Restarting'):
+                waiting[name]=f'{name} is not running (Docker status {state.get("Status")})';continue
+            if name in HEALTHCHECKED:
+                health=(state.get('Health') or {}).get('Status')
+                if health is None:
+                    broken[name]=f'{name} has no Docker healthcheck although its compose file defines one, so it can never be seen healthy';continue
+                if health!='healthy':
+                    waiting[name]=f'{name} Docker health is {health}';continue
+            if name=='coordinator':
+                # Docker health asks only whether it answers at all; item 8e needs 200.
+                code=r.docker(self.c,'exec',identifier,'curl','-s','-o','/dev/null','--max-time','5','-w','%{http_code}','http://localhost:8080/healthz',check=False).stdout.strip()
+                if code!='200':waiting[name]=f'coordinator answered its health route with {code or "nothing"}; it answers 200 only once its subscription to the bus is live'
+            if name=='bus-gateway':
+                # No healthcheck and no port: the bus is asked, from inside the
+                # coordinator, as estate-check item 8i asks it in external mode.
+                if 'coordinator' in waiting or 'coordinator' in broken:
+                    waiting[name]='bus-gateway cannot be asked about until the coordinator it is asked from is ready';continue
+                address=self.values['BUS_MONITORING_ADDRESS'];account=self.values['JARVIS_NATS_USER']
+                client='bus-gateway-'+(self.values.get('FACTORY_INSTANCE') or 'factory');subject=self.values.get('GATEWAY_WATCH_SUBJECT') or 'agents.command.jarvis'
+                code='import json,sys,urllib.request\n'+inspect_source.getsource(gateway_connections)+"\ndoc=json.loads(urllib.request.urlopen('http://'+sys.argv[1]+'/connz?auth=1&subs=1',timeout=5).read().decode())\nprint(gateway_connections(doc,*sys.argv[2:5]))\n"
+                count=r.docker(self.c,'exec',ids['coordinator'],'python','-c',code,address,account,client,subject,check=False).stdout.strip()
+                if not (count.isdigit() and int(count)>0):
+                    waiting[name]=f"the bus at {address} holds no connection yet with the client name '{client}' and the subscription {subject} on the '{account}' account"+('' if count.isdigit() else ' (the bus could not be asked)')
+        return waiting,broken
+    def wait_ready(self,events):
+        """Wait, bounded by READY_DEADLINE_SECONDS, until the recreated coordinator
+        and the opened producers are ready to be checked; refuse naming what is not."""
+        opened=('coordinator',*PRODUCERS);items=self.service_ids(opened)
+        need(set(items)==set(opened),'resume opened '+', '.join(x for x in opened if x not in items)+' and no container exists for it; read the compose output in this receipt')
+        need(self.values.get('BUS_MONITORING_ADDRESS') and self.values.get('JARVIS_NATS_USER'),'the env file names no BUS_MONITORING_ADDRESS or JARVIS_NATS_USER, so whether the bus gateway is on the bus cannot be asked')
+        ids={name:items[name]['Id'] for name in opened};restarts={name:items[name].get('RestartCount') for name in opened}
+        event={'stage':'readiness-wait','waited_for':list(opened),'deadline_seconds':READY_DEADLINE_SECONDS,'started_at':now(),'polls':0,'ready':False}
+        events.append(event);started=time.monotonic()
+        try:
+            while True:
+                event['polls']+=1;waiting,broken=self.readiness(ids,restarts)
+                event['not_ready']={name:self.sanitize(text) for name,text in {**waiting,**broken}.items()}
+                need(not broken,'readiness-wait: '+'; '.join(broken.values())+'. The services check was not run.')
+                if not waiting:event['ready']=True;return
+                need(time.monotonic()-started<READY_DEADLINE_SECONDS,f'readiness-wait: after {READY_DEADLINE_SECONDS} s these were still not ready: '+'; '.join(waiting.values())+'. The services check was not run.')
+                time.sleep(READY_POLL_SECONDS)
+        except Exception as exc:
+            event['reason']=self.sanitize(str(exc));raise
+        finally:
+            event['seconds']=round(time.monotonic()-started,1);event['finished_at']=now()
+
     def resume(self):
         need(self.phase=='prepared','resume requires prepared settings and env; select the loader inventory')
         marker=self.markers();self.record()
@@ -658,6 +736,7 @@ d=os.open(p.parent,os.O_DIRECTORY);os.fsync(d);os.close(d);assert p.read_bytes()
         try:
             self.planning(True);self._diagnostic_stage='coordinator-recreate';self.compose('up','--no-deps','-d','--force-recreate','coordinator')
             self._diagnostic_stage='producer-open';self.compose('up','--no-deps','-d',*PRODUCERS)
+            self._diagnostic_stage='readiness-wait';self.wait_ready(result['commands'])
             self.captured([HERE/'estate-check','services','--env-file',self.args.env_file,'--project',self.c['project']],'estate-check services',result['commands'],env=self.env);result['services_check']='passed'
             self.captured([HERE/'factory-hello','--env-file',self.args.env_file,'--project',self.c['project']],'factory-hello',result['commands'],env=self.env);result['factory_hello']='completed'
             self._diagnostic_stage='gateway-watch-start';self.compose('--profile','watch','up','--no-deps','-d','gateway-watch');result['passed']=True
