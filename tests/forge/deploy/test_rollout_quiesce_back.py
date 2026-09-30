@@ -226,8 +226,9 @@ def test_resume_pair_precedes_settings_restart_and_post_checks(estate,monkeypatc
     monkeypatch.setattr(estate,'volume',volume)
     def planning(enabled):assert (estate.snapshot/'resumed.json').exists();events.append('planning')
     monkeypatch.setattr(estate,'planning',planning);monkeypatch.setattr(estate,'compose',lambda *a:events.append('watch' if 'gateway-watch' in a else 'compose'));monkeypatch.setattr(estate,'systemctl',lambda *a:events.append('watch'))
+    monkeypatch.setattr(estate,'wait_ready',lambda commands:events.append('ready'))
     monkeypatch.setattr(r,'run',lambda argv,**kw:events.append('hello' if str(argv[0]).endswith('factory-hello') else ('services' if 'services' in argv else 'pre-resume')))
-    assert estate.resume()['passed'];assert events.index('ledger-marker')<events.index('planning')<events.index('services')<events.index('hello')<events.index('watch')
+    assert estate.resume()['passed'];assert events.index('ledger-marker')<events.index('planning')<events.index('ready')<events.index('services')<events.index('hello')<events.index('watch')
 
 def test_fresh_process_import_guard_and_h6_source(tmp_path):
     code=q.GUARD+'\nimport runpy,sys\nrunpy.run_path(sys.argv[1])\nassert not any(n=="nats" or n.startswith("nats.") for n in sys.modules)\n'
@@ -242,7 +243,7 @@ def test_post_resume_failure_keeps_pair_and_records_failure(estate,monkeypatch,f
     monkeypatch.setattr(r,'docker',lambda *a,**k:SimpleNamespace(stdout=json.dumps([{'Id':r.RUNTIME}])))
     monkeypatch.setattr(estate,'volume',lambda role,code,args=(),**kw:pair.update(marker=json.loads(args[0])))
     monkeypatch.setattr(estate,'planning',lambda enabled:None);monkeypatch.setattr(estate,'compose',lambda *a:pytest.fail('watch enabled after failed gate') if 'gateway-watch' in a else None)
-    monkeypatch.setattr(estate,'systemctl',lambda *a:pytest.fail('invented host watch'))
+    monkeypatch.setattr(estate,'systemctl',lambda *a:pytest.fail('invented host watch'));monkeypatch.setattr(estate,'wait_ready',lambda commands:None)
     original_run=r.run;estate.private_values=['fixture-private-value']
     def check(argv,**kw):
         if failing_check in [str(x) for x in argv] or str(argv[0]).endswith(failing_check):
@@ -259,6 +260,77 @@ def test_post_resume_failure_keeps_pair_and_records_failure(estate,monkeypatch,f
         assert 'fixture-private-value' not in json.dumps(report)
         assert (estate.snapshot/'post-resume-check.json').stat().st_mode & 0o777==0o600
     assert estate.doc['stage']=='resumed'
+
+def ready_fakes(estate,monkeypatch,*,coordinator_after=1,gateway_after=1,stuck=None,restart=None):
+    """Resume up to the open door with fakes; the opened services become ready at a given poll."""
+    estate.phase='prepared';estate.doc={'format_version':1,'binding':estate.binding,'stage':'final'};estate.save();pair={}
+    monkeypatch.setattr(estate,'markers',lambda:pair.get('marker'));monkeypatch.setattr(estate,'record',lambda:estate.doc);monkeypatch.setattr(estate,'prepared_settings',lambda:None);monkeypatch.setattr(estate,'unit',lambda n:{});monkeypatch.setattr(estate,'watch_closed',lambda **kw:None);monkeypatch.setattr(estate,'producers_stopped',lambda:None);monkeypatch.setattr(estate,'monitor',lambda:q.reader_counts(monitor()));monkeypatch.setattr(r,'load_volumes',lambda *a,**k:None);monkeypatch.setattr(r,'verify_snapshot',lambda d:{'sha256':'a'*64});monkeypatch.setattr(estate,'current_state',lambda:{'work_state':{}});estate.values['ROLLOUT_STATE_DIR']=str(estate.snapshot)
+    monkeypatch.setattr(estate,'volume',lambda role,code,args=(),**kw:pair.update(marker=json.loads(args[0])));monkeypatch.setattr(estate,'planning',lambda enabled:None)
+    estate.values.update(JARVIS_NATS_USER='jarvis',FACTORY_INSTANCE='fixture')
+    seen={'polls':0,'services':0,'services_after_polls':None,'hello':0,'watch':0,'pair':pair};clock=[0.0]
+    monkeypatch.setattr(q,'time',SimpleNamespace(monotonic=lambda:clock[0],sleep=lambda seconds:clock.__setitem__(0,clock[0]+seconds)))
+    monkeypatch.setattr(estate,'compose',lambda *a:seen.__setitem__('watch',seen['watch']+1) if 'gateway-watch' in a else None)
+    ids={name:'id-'+name for name in ('coordinator','front-door','bus-gateway')}
+    monkeypatch.setattr(estate,'service_ids',lambda services:{name:{'Id':ids[name],'RestartCount':0} for name in services})
+    front_door={'authorized_user':'jarvis','name':'front-door-fixture','subscriptions_list':[]}
+    gateway={'authorized_user':'jarvis','name':'bus-gateway-fixture','subscriptions_list':['agents.command.jarvis']}
+    def docker(c,*args,**kwargs):
+        if args[:2]==('image','inspect'):return SimpleNamespace(stdout=json.dumps([{'Id':r.RUNTIME}]),returncode=0)
+        if args[0]=='inspect':
+            name=next(n for n,i in ids.items() if i==args[1])
+            if name=='coordinator':seen['polls']+=1
+            ready=seen['polls']>=coordinator_after if name=='coordinator' else name!=stuck
+            state={'Running':True,'Restarting':False,'Status':'running'}
+            if name in q.HEALTHCHECKED:state['Health']={'Status':'healthy' if ready else 'starting'}
+            return SimpleNamespace(stdout=json.dumps([{'Id':args[1],'State':state,'RestartCount':(restart or {}).get(name,0)}]),returncode=0)
+        if args[0]=='exec' and 'curl' in args:
+            assert args[1]==ids['coordinator'];return SimpleNamespace(stdout='200',returncode=0)
+        if args[0]=='exec' and 'python' in args:
+            assert args[1]==ids['coordinator'] and args[-4:]==('fake.invalid:18222','jarvis','bus-gateway-fixture','agents.command.jarvis')
+            on=stuck!='bus-gateway' and seen['polls']>=gateway_after
+            return SimpleNamespace(stdout=str(q.gateway_connections({'connections':[front_door]+([gateway] if on else [])},*args[-3:]))+'\n',returncode=0)
+        pytest.fail(f'unexpected docker call {args}')
+    monkeypatch.setattr(r,'docker',docker)
+    def run(argv,**kw):
+        if str(argv[0]).endswith('factory-hello'):seen['hello']+=1
+        elif 'services' in argv:seen['services']+=1;seen['services_after_polls']=seen['polls']
+    monkeypatch.setattr(r,'run',run)
+    return seen,clock
+
+def test_resume_waits_for_readiness_then_checks_services_once(estate,monkeypatch):
+    seen,clock=ready_fakes(estate,monkeypatch,coordinator_after=4,gateway_after=6)
+    assert estate.resume()['passed']
+    assert seen['services']==1 and seen['services_after_polls']==6 and seen['hello']==1 and seen['watch']==1 and clock[0]==5*q.READY_POLL_SECONDS
+    report=r.read_json(estate.snapshot/'post-resume-check.json')
+    assert report['passed'] and [e['stage'] for e in report['commands']]==['readiness-wait','estate-check services','factory-hello']
+    wait=report['commands'][0];assert wait['ready'] is True and wait['polls']==6 and wait['not_ready']=={} and wait['waited_for']==['coordinator','front-door','bus-gateway']
+
+@pytest.mark.parametrize('stuck,said',[('bus-gateway',"no connection yet with the client name 'bus-gateway-fixture'"),('front-door','front-door Docker health is starting')])
+def test_resume_refuses_with_readiness_reason_before_services_check(estate,monkeypatch,stuck,said):
+    seen,clock=ready_fakes(estate,monkeypatch,stuck=stuck)
+    with pytest.raises(r.Refusal,match=f'readiness-wait: after {q.READY_DEADLINE_SECONDS} s these were still not ready: '):estate.resume()
+    assert seen['services']==seen['hello']==seen['watch']==0
+    assert q.READY_DEADLINE_SECONDS<=clock[0]<q.READY_DEADLINE_SECONDS+q.READY_POLL_SECONDS
+    report=r.read_json(estate.snapshot/'post-resume-check.json')
+    assert not report['passed'] and report['services_check'] is None and report['cleanup']['current_authority_retained'] is True
+    assert report['failure']['stage']=='readiness-wait' and said in report['failure']['reason'] and 'services check was not run' in report['failure']['reason']
+    event=report['commands'][-1];assert event['stage']=='readiness-wait' and event['ready'] is False and set(event['not_ready'])=={stuck} and said in event['reason']
+    assert seen['pair']['marker']==r.read_json(estate.snapshot/'resumed.json') and estate.doc['stage']=='resumed'
+
+def test_resume_refuses_at_once_when_an_opened_service_restarts(estate,monkeypatch):
+    seen,clock=ready_fakes(estate,monkeypatch,restart={'bus-gateway':1})
+    with pytest.raises(r.Refusal,match='bus-gateway has restarted since resume opened it'):estate.resume()
+    assert seen['services']==0 and clock[0]==0
+    report=r.read_json(estate.snapshot/'post-resume-check.json');assert report['failure']['stage']=='readiness-wait' and report['commands'][-1]['polls']==1
+
+def test_gateway_is_counted_only_by_account_name_and_subscription_on_one_connection():
+    doc={'connections':[{'authorized_user':'jarvis','name':'front-door-x','subscriptions_list':['agents.command.jarvis']},
+                        {'authorized_user':'jarvis','name':'bus-gateway-x','subscriptions_list':[]},
+                        {'authorized_user':'other','name':'bus-gateway-x','subscriptions_list':['agents.command.jarvis']}]}
+    assert q.gateway_connections(doc,'jarvis','bus-gateway-x','agents.command.jarvis')==0
+    doc['connections'].append({'authorized_user':'jarvis','name':'bus-gateway-x','subscriptions_list_detail':[{'subject':'agents.command.jarvis'}]})
+    assert q.gateway_connections(doc,'jarvis','bus-gateway-x','agents.command.jarvis')==1
+    assert q.gateway_connections({},'jarvis','bus-gateway-x','agents.command.jarvis')==0
 
 def test_real_timer_has_no_service_pid_properties(estate,monkeypatch):
     monkeypatch.setattr(r,'run',lambda *a,**k:SimpleNamespace(stdout='LoadState=loaded\nActiveState=inactive\nSubState=dead\nUnitFileState=disabled\n'))
@@ -1053,7 +1125,7 @@ def test_real_resume_keeps_constructor_environment_through_reader_and_markers(es
     monkeypatch.setattr(r,'load_volumes',lambda *a,**kw:None);monkeypatch.setattr(r,'verify_snapshot',lambda *a:{'sha256':'a'*64});monkeypatch.setattr(e,'current_state',lambda:{'work_state':{}})
     monkeypatch.setattr(r,'docker',lambda *a,**kw:SimpleNamespace(stdout=json.dumps([{'Id':r.RUNTIME}])))
     monkeypatch.setattr(e,'volume',lambda role,code,args=(),**kw:pair.update(marker=json.loads(args[0])))
-    monkeypatch.setattr(e,'planning',lambda enabled:calls.append('planning'));monkeypatch.setattr(e,'compose',lambda *a:calls.append('compose'));monkeypatch.setattr(e,'captured',lambda *a,**kw:None)
+    monkeypatch.setattr(e,'planning',lambda enabled:calls.append('planning'));monkeypatch.setattr(e,'compose',lambda *a:calls.append('compose'));monkeypatch.setattr(e,'captured',lambda *a,**kw:None);monkeypatch.setattr(e,'wait_ready',lambda commands:calls.append('ready'))
     actual_run=r.run
     def run(argv,**kw):
         assert '--read-pre-resume' in argv and kw['env'] is e.env
@@ -1076,7 +1148,7 @@ def resume_recording_children(estate,monkeypatch):
     # the real constructor and resume; every host child is recorded at r.run,
     # the one place rollout_support starts a process.
     env_file=Path(estate.args.env_file)
-    env_file.write_text(env_file.read_text()+''.join(f'{name}={SANDBOX_TMP}\n' for name in TEMP_NAMES)+f'ROLLOUT_STATE_DIR={estate.snapshot}\n')
+    env_file.write_text(env_file.read_text()+''.join(f'{name}={SANDBOX_TMP}\n' for name in TEMP_NAMES)+f'ROLLOUT_STATE_DIR={estate.snapshot}\nJARVIS_NATS_USER=jarvis\n')
     e=q.Estate(estate.args);e.phase='prepared'
     assert all(e.values[name]==SANDBOX_TMP for name in TEMP_NAMES)
     e.doc={'format_version':1,'binding':e.binding,'stage':'final'};e.save()
@@ -1086,10 +1158,14 @@ def resume_recording_children(estate,monkeypatch):
     monkeypatch.setattr(e,'watch_closed',lambda **kw:None);monkeypatch.setattr(e,'producers_stopped',lambda:None);monkeypatch.setattr(e,'monitor',lambda:q.reader_counts(monitor()))
     monkeypatch.setattr(e,'current_state',lambda:{'work_state':{}})
     monkeypatch.setattr(r,'load_volumes',lambda *a,**kw:None);monkeypatch.setattr(r,'verify_snapshot',lambda *a:{'sha256':'a'*64});monkeypatch.setattr(r,'volume_identity',lambda *a,**kw:None)
+    monkeypatch.setattr(e,'service_ids',lambda services:{name:{'Id':'id-'+name,'RestartCount':0} for name in services})
     children=[]
     def child(argv,**kw):
         argv=[str(x) for x in argv];children.append((argv,kw.get('env')))
-        if argv[:1]==['docker'] and 'inspect' in argv:out=json.dumps([{'Id':r.RUNTIME}])
+        # The readiness wait's own children: what resume opened is ready at once.
+        if argv[:1]==['docker'] and argv[3:4]==['inspect'] and argv[-1].startswith('id-'):out=json.dumps([{'Id':argv[-1],'RestartCount':0,'State':{'Running':True,'Status':'running','Health':{'Status':'healthy'}}}])
+        elif argv[:1]==['docker'] and argv[3:4]==['exec']:out='200' if 'curl' in argv else '1'
+        elif argv[:1]==['docker'] and 'inspect' in argv:out=json.dumps([{'Id':r.RUNTIME}])
         elif argv[:1]==['docker'] and 'config' in argv:out='{}'
         else:out=''
         return SimpleNamespace(returncode=0,stdout=out,stderr='')
