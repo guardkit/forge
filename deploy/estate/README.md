@@ -829,7 +829,9 @@ The execution sequence is:
    all required sandbox, memory, retained-state and route checks.
 3. With prepared inputs, quiesce `--resume` revalidates its evidence and writes
    both durable resume markers **before** enabling planning or producers. It then
-   runs the full `estate-check services`, `factory-hello`, and finally the Compose
+   waits, for at most 180 s, until the recreated coordinator and the opened front
+   door and bus gateway are ready (recorded as the `readiness-wait` stage), runs
+   the full `estate-check services`, `factory-hello`, and finally the Compose
    `gateway-watch` profile. The new watch has no host timer or service.
 
 Prepared-state final verification also requires proof that the current ledger,
