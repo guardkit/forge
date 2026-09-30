@@ -313,7 +313,9 @@ class ProcessTable:
     executes nothing and holds nothing, so :meth:`members_of` leaves it out —
     and only when EVERY thread of it has ended, because a program whose first
     thread has exited while others run shows the same "ended" mark on its
-    number and is very much alive.
+    number and is very much alive. It is left out of the COUNT only: its start
+    time is still read by :meth:`started_at`, and whose group it is is decided
+    by that, before anything is counted (``DeployExecutor._alive``).
 
     Every method answers ``None`` rather than raising when it cannot tell, and
     the executor treats "cannot tell" as its own ending: it refuses, which
@@ -870,9 +872,9 @@ class DeployExecutor:
     def _alive(self, note: _Note) -> bool | None:
         """Is this command's process group still alive? ``None`` = cannot tell.
 
-        Identity, not a process number: every process in the recorded group
-        counts, and when the group leader is still there its start time has to
-        match, so a reused number is not mistaken for the command.
+        Identity, not a process number: the group has to be this command's
+        before anything in it is counted (:meth:`_the_number_is_somebody_elses`),
+        and then every process in it that has not ended counts.
 
         A note with no group is either a slot with nothing in it or a command
         that was being STARTED when this note was written. Those are not the
@@ -884,18 +886,42 @@ class DeployExecutor:
             return False
         if not self._table.available:
             return None
+        if self._the_number_is_somebody_elses(note):
+            return False
         members = self._table.members_of(note.group)
         if members is None:
             return None
-        if not members:
+        return bool(members)
+
+    def _the_number_is_somebody_elses(self, note: _Note) -> bool:
+        """Has the recorded group leader's number been given to another process?
+
+        ASKED OF THE LEADER'S NUMBER ITSELF, NEVER OF THE GROUP'S LIVE MEMBERS
+        (30 September 2026). :meth:`ProcessTable.members_of` leaves out a
+        process that has ended, and a leader that has ended is still the one
+        process whose start time says whose group this is. Asked of the live
+        members only, a reused number whose new holder had ended — with a live
+        child of that holder still in the group — skipped the start-time check,
+        and the group was adopted and then signalled as the command's own.
+
+        ``True`` when a process holds the leader's number, ended or not, with a
+        start time other than the one recorded. The kernel does not hand out a
+        number that is still in use as a process group, so the recorded group
+        must have emptied completely before the number was reused: nothing of
+        the command is left, and whatever is in a group of that number now is
+        somebody else's. It is not alive and it is never signalled.
+
+        ``False`` when the start times match, when none was recorded, or when
+        no process holds the number any more. A leader that is gone entirely is
+        the ordinary case of a group whose first process ended before the rest
+        of it; for the same kernel reason, while anything is left in the group
+        the number cannot have been reused, so what is left is the command's
+        and is counted by :meth:`members_of`, as it always was.
+        """
+        if not note.group or note.started_at is None:
             return False
-        if note.started_at is not None and note.group in members:
-            started = self._table.started_at(note.group)
-            if started is not None and started != note.started_at:
-                # The number was reused by something that is not our command.
-                # Anything else in "its" group is then somebody else's too.
-                return False
-        return True
+        started = self._table.started_at(note.group)
+        return started is not None and started != note.started_at
 
     def _targets_alive_with_no_note(self, files: "list[Path]") -> list[str]:
         """Targets a live deploy marker names that no note file accounts for.
@@ -956,6 +982,11 @@ class DeployExecutor:
             return True, ""
         deadline = self._clock() + self._stop_confirm_seconds
         for sig in (signal.SIGTERM, signal.SIGKILL):
+            # Looked at again before EVERY signal, not only by whoever decided
+            # to stop the command: the leader's number can have been reused
+            # since, and a signal to that group would be to somebody else's.
+            if self._the_number_is_somebody_elses(note):
+                return True, ""
             try:
                 os.killpg(note.group, sig)
             except ProcessLookupError:

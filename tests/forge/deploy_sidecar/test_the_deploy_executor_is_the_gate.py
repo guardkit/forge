@@ -574,6 +574,189 @@ class TestAnEndedProcessIsGone:
         assert ProcessTable(proc).members_of(700) == [701]
 
 
+class TestWhoseGroupItIsIsDecidedByItsLeader:
+    """The recorded leader's start time decides whose group it is, ended or not.
+
+    Leaving ended processes out of the COUNT must not leave the leader out of
+    the IDENTITY check. A note records group 700 whose leader started at A.
+    If the number 700 now belongs to a process that started at B — even one
+    that has ended and not been collected — the recorded group emptied before
+    the number was reused, and anything in a group 700 now is somebody else's:
+    it is not adopted and it is never signalled.
+    """
+
+    RECORDED = 4242  # A: when the command's own leader started
+    REUSED = 5555  # B: when whatever holds the number now started
+
+    @staticmethod
+    def _recording_killpg(monkeypatch, group: int) -> list[int]:
+        """Signals to ``group`` are recorded and never sent; others go through."""
+        sent: list[int] = []
+        real_killpg = os.killpg
+
+        def _record(pgid: int, sig: int) -> None:
+            if pgid != group:
+                # The successor's own command, stopped when it returns.
+                real_killpg(pgid, sig)
+                return
+            sent.append(sig)
+
+        monkeypatch.setattr(os, "killpg", _record)
+        return sent
+
+    def test_a_reused_ended_leader_with_a_live_child_is_not_adopted_or_signalled(
+        self, tmp_path, notes, workshop, TARGET, monkeypatch
+    ) -> None:
+        """Codex R1's counterexample, exactly."""
+        proc = tmp_path / "proc"
+        _fake_process(
+            proc, 700, group=700, state="Z", threads={700: "Z"}, started=self.REUSED
+        )
+        _fake_process(
+            proc, 701, group=700, state="S", threads={701: "S"}, started=self.REUSED
+        )
+        assert ProcessTable(proc).members_of(700) == [701]
+        sent = self._recording_killpg(monkeypatch, 700)
+        _write_note(
+            notes,
+            TARGET,
+            counter=41,
+            build="build-old",
+            group=700,
+            started_at=self.RECORDED,
+        )
+        executor = _executor(
+            notes, stop_confirm_seconds=0.5, process_table=ProcessTable(proc)
+        )
+        assert executor.reconcile()[TARGET] == "cleared"
+        answer = executor.run(_ask(TARGET, _quick(workshop), 42, "build-new", workshop))
+        assert answer.accepted is True, answer.sentence
+        assert answer.word == "the-deploy-command-ran"
+        assert sent == [], "somebody else's group was signalled"
+
+    def test_a_takeover_never_signals_a_group_whose_leader_was_reused(
+        self, tmp_path, notes, TARGET, monkeypatch
+    ) -> None:
+        """The stop itself looks again, whoever decided to stop the command."""
+        proc = tmp_path / "proc"
+        _fake_process(
+            proc, 700, group=700, state="Z", threads={700: "Z"}, started=self.REUSED
+        )
+        _fake_process(
+            proc, 701, group=700, state="S", threads={701: "S"}, started=self.REUSED
+        )
+        sent = self._recording_killpg(monkeypatch, 700)
+        _write_note(
+            notes,
+            TARGET,
+            counter=41,
+            build="build-old",
+            group=700,
+            started_at=self.RECORDED,
+        )
+        executor = _executor(
+            notes, stop_confirm_seconds=0.5, process_table=ProcessTable(proc)
+        )
+        note, _ = executor._read_note(TARGET)
+        assert executor._stop_and_confirm(note) == (True, "")
+        assert sent == []
+
+    def test_a_reused_live_leader_is_not_adopted_either(
+        self, tmp_path, notes, TARGET
+    ) -> None:
+        proc = tmp_path / "proc"
+        _fake_process(
+            proc, 700, group=700, state="S", threads={700: "S"}, started=self.REUSED
+        )
+        _write_note(
+            notes,
+            TARGET,
+            counter=41,
+            build="build-old",
+            group=700,
+            started_at=self.RECORDED,
+        )
+        executor = _executor(notes, process_table=ProcessTable(proc))
+        assert executor.reconcile()[TARGET] == "cleared"
+
+    def test_the_commands_own_ended_leader_and_nothing_else_is_confirmed_gone(
+        self, tmp_path, notes, workshop, TARGET, monkeypatch
+    ) -> None:
+        proc = tmp_path / "proc"
+        _fake_process(
+            proc, 700, group=700, state="Z", threads={700: "Z"}, started=self.RECORDED
+        )
+        sent = self._recording_killpg(monkeypatch, 700)
+        _write_note(
+            notes,
+            TARGET,
+            counter=41,
+            build="build-old",
+            group=700,
+            started_at=self.RECORDED,
+        )
+        executor = _executor(
+            notes, stop_confirm_seconds=0.5, process_table=ProcessTable(proc)
+        )
+        note, _ = executor._read_note(TARGET)
+        assert executor._alive(note) is False
+        assert executor._stop_and_confirm(note) == (True, "")
+        assert executor.reconcile()[TARGET] == "cleared"
+        answer = executor.run(_ask(TARGET, _quick(workshop), 42, "build-new", workshop))
+        assert answer.accepted is True, answer.sentence
+        # Its own group, told to stop once, and seen gone straight after.
+        assert sent == [signal.SIGTERM]
+
+    def test_the_commands_own_ended_leader_with_a_live_child_is_still_alive(
+        self, tmp_path, notes, workshop, TARGET, monkeypatch
+    ) -> None:
+        proc = tmp_path / "proc"
+        _fake_process(
+            proc, 700, group=700, state="Z", threads={700: "Z"}, started=self.RECORDED
+        )
+        _fake_process(
+            proc, 701, group=700, state="S", threads={701: "S"}, started=self.RECORDED
+        )
+        sent = self._recording_killpg(monkeypatch, 700)
+        _write_note(
+            notes,
+            TARGET,
+            counter=41,
+            build="build-old",
+            group=700,
+            started_at=self.RECORDED,
+        )
+        executor = _executor(
+            notes, stop_confirm_seconds=0.5, process_table=ProcessTable(proc)
+        )
+        assert executor.reconcile()[TARGET] == "occupied (adopted)"
+        # The child in this stand-in table never goes, so the takeover signals
+        # the command's own group and then refuses: nothing starts beside it.
+        answer = executor.run(_ask(TARGET, _quick(workshop), 42, "build-new", workshop))
+        assert answer.accepted is False, answer.sentence
+        assert answer.word == "the-old-command-could-not-be-confirmed-stopped"
+        assert sent == [signal.SIGTERM, signal.SIGKILL]
+
+    def test_a_leader_that_is_gone_leaves_the_rest_of_its_group_counted(
+        self, tmp_path, notes, TARGET
+    ) -> None:
+        """No process holds the number: nothing reused it, the group is ours."""
+        proc = tmp_path / "proc"
+        _fake_process(
+            proc, 701, group=700, state="S", threads={701: "S"}, started=self.RECORDED
+        )
+        _write_note(
+            notes,
+            TARGET,
+            counter=41,
+            build="build-old",
+            group=700,
+            started_at=self.RECORDED,
+        )
+        executor = _executor(notes, process_table=ProcessTable(proc))
+        assert executor.reconcile()[TARGET] == "occupied (adopted)"
+
+
 class TestTheOutrightKillHasTimeToWork:
     """SIGKILL is sent while there is still time to confirm it worked.
 
@@ -1571,6 +1754,7 @@ def _write_note(
     group: int,
     marker: str | None = None,
     phase: str = "running",
+    started_at: int | None = None,
 ):
     (notes / f"{_safe(target)}.json").write_text(
         json.dumps(
@@ -1580,7 +1764,7 @@ def _write_note(
                 "build": build,
                 "marker": marker or the_marker_for(target),
                 "group": group,
-                "started_at": None,
+                "started_at": started_at,
                 "started_wall": time.time(),
                 "limit": 60.0,
                 "highest_counter": counter,
@@ -1700,12 +1884,17 @@ def _fake_process(
     group: int,
     state: str,
     threads: dict[int, str] | None,
+    started: int = 4242,
 ) -> None:
     """One process in a stand-in for the kernel's table, in the kernel's shape."""
 
     def stat(number: int, mark: str) -> str:
         # state ppid pgrp session, fifteen more fields, then the start time.
-        return f"{number} (step) {mark} 1 {group} {group} " + "0 " * 15 + "4242 0 0\n"
+        return (
+            f"{number} (step) {mark} 1 {group} {group} "
+            + "0 " * 15
+            + f"{started} 0 0\n"
+        )
 
     where = proc / str(pid)
     where.mkdir(parents=True)
