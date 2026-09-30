@@ -766,14 +766,14 @@ def test_stale_restored_container_refuses_and_records_without_mutation(estate,mo
 
 def valid_h6():
     J='3'*40;target='fixture-target'
-    return {'format_version':1,'outcome':'handled-both','candidate_image_id':r.RUNTIME,'pristine_sha256':'a'*64,'working_pre_fixture_sha256':'a'*64,'configuration_sha256':'b'*64,'schema_version':16,'existing_rows_unchanged':True,'real_client_modules':[],'cleanup':'no owned worker remains','worker_group_empty':True,'worker_thread_stopped':True,'columns':{'builds':['build_id','status','mode','start_commit','target_branch'],'publication_records':['build_id','g_commit','j_commit','checked_json','turn','lines_json'],'deployment_targets':['target','counter','holder_build','holder_turn','running_commit']},'git':{'G':'1'*40,'tip':'2'*40,'J':J,'tree':'4'*40},'fixture_ids':{'build':'fixture-build','target':target},'publication':{'turn':4,'result':'published, deployment pending','g_commit':'1'*40,'j_commit':J,'checked':{'identity':J,'j_commit':J,'j_tree':'4'*40},'original_lines_preserved':True,'callbacks':{'publisher':0,'guardkit':0,'deploy':0,'stage_complete':1},'line_kinds':['done join','done merge-checks','done candidate-check','about to send','done send'],'before_sha256':'c'*64,'after_sha256':'d'*64,'send_result':{'found_by_looking':True,'published':True,'contains_j':True,'ran_on':J,'remote_now':J}},'deployment':{'N':41,'N_plus_1':42,'stale_fencing':{'renew':False,'record_running':False,'release':False},'stale_record_unchanged':True,'reconcile':{target:'occupied (adopted)'},'old_note':{'target':target,'counter':41,'highest_counter':41,'group':4,'phase':'running','build':'old'},'final_note':{'target':target,'highest_counter':42,'group':0,'counter':0,'phase':'','highest_build':'new'},'old_answers':[{'accepted':False,'word':'the-deploy-command-was-stopped-by-a-takeover'}],'successor':{'accepted':True,'exit_code':0,'word':'the-deploy-command-ran','output_tail':'DEPLOYED_IDENTITY='+J}}}
+    return {'format_version':1,'outcome':'handled-both','candidate_image_id':r.RUNTIME,'pristine_sha256':'a'*64,'working_pre_fixture_sha256':'a'*64,'configuration_sha256':'b'*64,'schema_version':16,'existing_rows_unchanged':True,'real_client_modules':[],'cleanup':'no owned worker remains','worker_group_empty':True,'worker_thread_stopped':True,'init':{'probe_pid':7,'pid1':'/sbin/docker-init'},'columns':{'builds':['build_id','status','mode','start_commit','target_branch'],'publication_records':['build_id','g_commit','j_commit','checked_json','turn','lines_json'],'deployment_targets':['target','counter','holder_build','holder_turn','running_commit']},'git':{'G':'1'*40,'tip':'2'*40,'J':J,'tree':'4'*40},'fixture_ids':{'build':'fixture-build','target':target},'publication':{'turn':4,'result':'published, deployment pending','g_commit':'1'*40,'j_commit':J,'checked':{'identity':J,'j_commit':J,'j_tree':'4'*40},'original_lines_preserved':True,'callbacks':{'publisher':0,'guardkit':0,'deploy':0,'stage_complete':1},'line_kinds':['done join','done merge-checks','done candidate-check','about to send','done send'],'before_sha256':'c'*64,'after_sha256':'d'*64,'send_result':{'found_by_looking':True,'published':True,'contains_j':True,'ran_on':J,'remote_now':J}},'deployment':{'N':41,'N_plus_1':42,'stale_fencing':{'renew':False,'record_running':False,'release':False},'stale_record_unchanged':True,'reconcile':{target:'occupied (adopted)'},'old_note':{'target':target,'counter':41,'highest_counter':41,'group':4,'phase':'running','build':'old'},'final_note':{'target':target,'highest_counter':42,'group':0,'counter':0,'phase':'','highest_build':'new'},'old_answers':[{'accepted':False,'word':'the-deploy-command-was-stopped-by-a-takeover'}],'successor':{'accepted':True,'exit_code':0,'word':'the-deploy-command-ran','output_tail':'DEPLOYED_IDENTITY='+J}}}
 
-@pytest.mark.parametrize('field',['publication','deployment','cleanup','worker_group_empty','existing_rows_unchanged','configuration_sha256','columns','git'])
+@pytest.mark.parametrize('field',['publication','deployment','cleanup','worker_group_empty','existing_rows_unchanged','configuration_sha256','columns','git','init'])
 def test_h6_missing_required_behavior_never_authorizes(field):
     proof=valid_h6();del proof[field]
     with pytest.raises(r.Refusal):b.validate_h6(proof,r.RUNTIME,'a'*64,'b'*64)
 
-@pytest.mark.parametrize('case',['replay','successor','counter','fencing','cleanup','rows','configuration'])
+@pytest.mark.parametrize('case',['replay','successor','counter','fencing','cleanup','rows','configuration','probe-was-pid1'])
 def test_h6_contradictory_behavior_never_authorizes(case):
     p=valid_h6()
     if case=='replay':p['publication']['callbacks']['publisher']=2
@@ -783,6 +783,7 @@ def test_h6_contradictory_behavior_never_authorizes(case):
     if case=='cleanup':p['worker_group_empty']=False
     if case=='rows':p['existing_rows_unchanged']=False
     if case=='configuration':p['configuration_sha256']='c'*64
+    if case=='probe-was-pid1':p['init']['probe_pid']=1
     with pytest.raises(r.Refusal):b.validate_h6(p,r.RUNTIME,'a'*64,'b'*64)
 
 def test_h6_complete_consistent_behavior_passes():
@@ -939,9 +940,11 @@ def test_actual_h6_result_ingestion_tamper_boundary(estate,tmp_path,monkeypatch,
     monkeypatch.setattr(e,'current_copy',lambda path:(pristine,{'sha256':digest}));monkeypatch.setattr(e,'model',lambda:{})
     def docker(c,*args,**kw):
         return SimpleNamespace(stdout=json.dumps([{'Id':r.RUNTIME}]) if args[:2]==('image','inspect') else '',stderr='',returncode=0)
-    monkeypatch.setattr(r,'docker',docker);monkeypatch.setattr(r,'inspect',lambda *a:{'Image':r.RUNTIME,'State':{'ExitCode':0}})
+    monkeypatch.setattr(r,'docker',docker);monkeypatch.setattr(r,'inspect',lambda *a:{'Image':r.RUNTIME,'HostConfig':{'Init':True},'State':{'ExitCode':0}})
     def captured(argv,stage,events,**kwargs):
-        if stage=='h6-create':state['configuration']=argv[-1];return SimpleNamespace(stdout='owned-candidate-id',returncode=0)
+        if stage=='h6-create':
+            assert '--init' in argv[:argv.index(r.RUNTIME)],argv
+            state['configuration']=argv[-1];return SimpleNamespace(stdout='owned-candidate-id',returncode=0)
         proof=valid_h6();proof.update(pristine_sha256=digest,working_pre_fixture_sha256=digest,configuration_sha256=state['configuration'])
         if case=='missing':del proof['deployment']
         if case=='contradictory':proof['publication']['callbacks']['publisher']=2
@@ -955,6 +958,37 @@ def test_actual_h6_result_ingestion_tamper_boundary(estate,tmp_path,monkeypatch,
         with pytest.raises(r.Refusal):e.h6(r.RUNTIME,directory)
         diagnostic=r.read_json(directory/'h6-diagnostic.json')
         assert diagnostic['status']=='refused' and diagnostic['cleanup']['container_removed']
+
+
+@pytest.mark.parametrize('init',[True,False])
+def test_h6_container_runs_with_an_init_and_the_diagnostic_says_so(estate,tmp_path,monkeypatch,init):
+    """The candidate's own executor may still count uncollected zombies; only an init at PID 1 keeps the takeover confirmable."""
+    e=b.Recovery(estate.args);directory=tmp_path/'probe-init';directory.mkdir();pristine=directory/'current.db';pristine.write_bytes(b'owned init bytes');digest=r.sha256(pristine);starts=[];state={}
+    monkeypatch.setattr(e,'current_copy',lambda path:(pristine,{'sha256':digest}));monkeypatch.setattr(e,'model',lambda:{})
+    monkeypatch.setattr(r,'docker',lambda c,*args,**kw:SimpleNamespace(stdout=json.dumps([{'Id':r.RUNTIME}]) if args[:2]==('image','inspect') else '',stderr='',returncode=0))
+    monkeypatch.setattr(r,'inspect',lambda *a:{'Image':r.RUNTIME,'HostConfig':{'Init':init},'State':{'ExitCode':0}})
+    def run(argv,**kwargs):
+        argv=[str(x) for x in argv];operation=argv[3]
+        if operation=='create':
+            options=argv[4:argv.index(r.RUNTIME)]
+            if init:assert '--init' in options,'H6 create lost --init: '+repr(options)
+            return SimpleNamespace(stdout='owned-candidate-id\n',stderr='',returncode=0)
+        assert operation=='start';starts.append(argv)
+        proof=valid_h6();proof.update(pristine_sha256=digest,working_pre_fixture_sha256=digest,configuration_sha256=state['configuration'])
+        (directory/'probe/h6-result.json').write_text(json.dumps(proof));return SimpleNamespace(stdout='',stderr='',returncode=0)
+    original=e.captured
+    def captured(argv,stage,events,**kwargs):
+        if stage=='h6-create':state['configuration']=str(argv[-1])
+        return original(argv,stage,events,**kwargs)
+    monkeypatch.setattr(e,'captured',captured);monkeypatch.setattr(r,'run',run)
+    if init:assert e.h6(r.RUNTIME,directory)['init']['probe_pid']>1
+    else:
+        with pytest.raises(r.Refusal,match='no init'):e.h6(r.RUNTIME,directory)
+        assert starts==[],'a container without an init was started'
+    diagnostic=r.read_json(directory/'h6-diagnostic.json')
+    create=next(event['command'] for event in diagnostic['commands'] if event['stage']=='h6-create')
+    assert '--init' in create[:create.index(r.RUNTIME)] and diagnostic['init'] is init
+    assert diagnostic['status']==('passed' if init else 'refused') and diagnostic['cleanup']['container_removed']
 
 
 def public_marker_case(estate,monkeypatch,phase,shape,stage='settled'):

@@ -864,7 +864,11 @@ routes. Without a candidate it leaves the estate stopped and writes a
 reconciliation record. A candidate requires an immutable image ID and explicit
 configuration changing only that image; its schema and actual publication and
 leftover-worker recovery must pass the built-in H6 probe against a throwaway copy
-of the current ledger. The old folder is not a recovery source after resume.
+of the current ledger. The probe's container runs with Docker's `--init`, so a
+candidate whose deploy executor still counts uncollected zombies sees the old
+command's orphans collected; the engine must provide docker-init, and the H6
+diagnostic's `h6-create` command and `init` field record it. The old folder is
+not a recovery source after resume.
 A failed post-resume check follows this current-state recovery path too.
 
 ## What is deliberately not here yet
