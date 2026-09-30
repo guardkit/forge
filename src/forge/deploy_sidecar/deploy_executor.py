@@ -24,7 +24,9 @@ c. **A higher counter while a command is alive does not start anything.** The
    every process in it is gone and confirms that, before it answers. If it
    cannot confirm within its limit it REFUSES: nothing new starts, and the
    build stays "published, deployment pending" with that reason. A second
-   command is never started beside a live one.
+   command is never started beside a live one. A process that has ended and
+   is only waiting for its parent to collect it is GONE: nothing of it can run
+   (see :class:`ProcessTable`).
 d. **Before a command is started, the note is written durably**: the target,
    the counter and build accepted, and the command's identity — its process
    group, the time it started, and a marker unique to this deploy that the
@@ -199,8 +201,15 @@ DEFAULT_COMMAND_SECONDS: float = 900.0
 #: starts.
 DEFAULT_STOP_CONFIRM_SECONDS: float = 60.0
 
-#: How long a polite stop is given before the group is killed outright.
+#: How long a polite stop is given before the group is killed outright — and
+#: never more than half of the stop-and-confirm limit, so the outright kill
+#: always has time left to be confirmed in.
 _GRACE_SECONDS: float = 5.0
+
+#: The kernel's marks for a process that has ended: ``Z`` a zombie, waiting
+#: for its parent to collect its exit status; ``X`` (``x`` on old kernels) on
+#: its way out of the table.
+_ENDED_STATES: frozenset[str] = frozenset({"Z", "X", "x"})
 
 #: THE WORD FOR A COMMAND A TAKEOVER STOPPED. It is its own word because it is
 #: its own thing: the command did not run to an end and its exit is the signal
@@ -283,10 +292,28 @@ def _target_in(marker: str) -> str:
 class ProcessTable:
     """What the kernel says about the processes that exist right now.
 
-    Three questions, and nothing else: which group does a process belong to,
-    when did it start, and what argument list was it started with. A process's
-    ENVIRONMENT is never opened — that is both this estate's rule and the
-    right shape, because an environment is where a credential would be.
+    Four questions, and nothing else: which group does a process belong to,
+    when did it start, what argument list was it started with, and has it
+    already ended. A process's ENVIRONMENT is never opened — that is both this
+    estate's rule and the right shape, because an environment is where a
+    credential would be.
+
+    A PROCESS THAT HAS ENDED IS NOT A MEMBER OF ANYTHING (30 September 2026).
+    A process that has exited stays in the kernel's table — in its group, with
+    its number — until its parent collects its exit status. Its parent is very
+    often gone: a takeover signals the whole group at once, so the shell a
+    deploy step runs in can die before the program it started, which is then
+    handed to the container's first process. The deploy helper IS that first
+    process (it is started with ``--entrypoint python``), and it never collects
+    anybody else's children, so that ended program stays in the table for as
+    long as the helper lives. Counting it made a stopped command one that could
+    never be confirmed gone: the H6 rehearsal on 30 September refused its
+    successor with "not confirmed gone within 5s" while nothing of the old
+    command could run, and even SIGKILL could not clear it. An ended process
+    executes nothing and holds nothing, so :meth:`members_of` leaves it out —
+    and only when EVERY thread of it has ended, because a program whose first
+    thread has exited while others run shows the same "ended" mark on its
+    number and is very much alive.
 
     Every method answers ``None`` rather than raising when it cannot tell, and
     the executor treats "cannot tell" as its own ending: it refuses, which
@@ -320,8 +347,12 @@ class ProcessTable:
             return None
 
     def _stat(self, pid: int) -> list[str] | None:
+        return self._stat_at(self._root / str(pid) / "stat")
+
+    @staticmethod
+    def _stat_at(path: Path) -> list[str] | None:
         try:
-            raw = (self._root / str(pid) / "stat").read_text(encoding="utf-8")
+            raw = path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
             return None
         # The second field is the program name in brackets and may itself
@@ -331,6 +362,33 @@ class ProcessTable:
         if close < 0:
             return None
         return raw[close + 2 :].split()
+
+    def has_ended(self, pid: int) -> bool:
+        """Has ``pid`` ended, leaving nothing behind but its exit status?
+
+        ``True`` only when the kernel marks the process and every one of its
+        threads as ended (a zombie, or on its way out). Anything the table
+        cannot show is ``False`` — the process is counted — so a doubt here
+        refuses more than it needs to and never less.
+        """
+        fields = self._stat(pid)
+        if not fields or fields[0] not in _ENDED_STATES:
+            return False
+        try:
+            threads = [
+                entry.name
+                for entry in (self._root / str(pid) / "task").iterdir()
+                if entry.name.isdigit()
+            ]
+        except OSError:
+            return False
+        if not threads:
+            return False
+        for thread in threads:
+            state = self._stat_at(self._root / str(pid) / "task" / thread / "stat")
+            if not state or state[0] not in _ENDED_STATES:
+                return False
+        return True
 
     def group_of(self, pid: int) -> int | None:
         """Which process group ``pid`` belongs to. ``None`` = cannot tell."""
@@ -366,13 +424,18 @@ class ProcessTable:
         return raw.replace(b"\0", b" ").decode("utf-8", errors="replace")
 
     def members_of(self, group: int) -> list[int] | None:
-        """Every process in ``group``. ``None`` = the table could not be read."""
+        """Every process in ``group`` that has not ended.
+
+        ``None`` = the table could not be read. A process that has ended and
+        is only waiting to be collected is not counted (see the class's own
+        note): nothing of it can run.
+        """
         pids = self._pids()
         if pids is None:
             return None
         found: list[int] = []
         for pid in pids:
-            if self.group_of(pid) == group:
+            if self.group_of(pid) == group and not self.has_ended(pid):
                 found.append(pid)
         return found
 
@@ -910,7 +973,15 @@ class DeployExecutor:
                         "started"
                     )
                 break
-            grace = _GRACE_SECONDS if sig is signal.SIGTERM else 0.0
+            # THE POLITE STOP GETS AT MOST HALF OF THE LIMIT. Given all of it,
+            # a limit no longer than the grace — the H6 probe's is 5s — sent
+            # SIGKILL at the very deadline, looked once, and refused: the one
+            # signal nothing can ignore was never given any time to work.
+            grace = (
+                min(_GRACE_SECONDS, self._stop_confirm_seconds / 2)
+                if sig is signal.SIGTERM
+                else 0.0
+            )
             until = min(self._clock() + grace, deadline)
             while self._clock() < until:
                 if self._alive(note) is False:

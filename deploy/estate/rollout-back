@@ -91,7 +91,7 @@ def h6_probe():
     def run_old():
         try:answers.append(first.run(DeployRequest(target=target,target_counter=N,build=old_build,cwd=str(root),script=str(slow),identity='old',identity_setting='DEPLOY_IDENTITY',timeout=100)).to_wire())
         except BaseException as e:failure.append(str(e))
-    thread=threading.Thread(target=run_old);thread.start();group=None;old_note=None;second_answer=None
+    thread=threading.Thread(target=run_old);thread.start();group=None;old_note=None;second_answer=None;settled=False
     try:
         deadline=time.monotonic()+15
         while time.monotonic()<deadline:
@@ -112,12 +112,18 @@ def h6_probe():
         second_answer=second.run(DeployRequest(target=target,target_counter=N+1,build=new_build,cwd=str(root),script=str(quick),identity=J,identity_setting='DEPLOY_IDENTITY')).to_wire()
         assert second_answer['accepted'] and second_answer['exit_code']==0,second_answer
         assert not ProcessTable().members_of(group),'old worker survived successor'
-        final_note=json.loads(next(notes.glob('*.json')).read_text());assert final_note['highest_counter']==N+1
+        final_note=json.loads(next(notes.glob('*.json')).read_text());assert final_note['highest_counter']==N+1;settled=True
     finally:
+        # members_of counts only what can still run: the fixture is PID 1 here and never collects the old command's orphaned zombies.
         if group and ProcessTable().members_of(group):os.killpg(group,signal.SIGTERM)
         thread.join(10)
         if group and ProcessTable().members_of(group):os.killpg(group,signal.SIGKILL);thread.join(5)
-        assert not thread.is_alive() and not failure and (not group or not ProcessTable().members_of(group)),'owned worker cleanup failed'
+        left=ProcessTable().members_of(group) if group else []
+        if thread.is_alive() or failure or left:
+            # A cleanup problem after an earlier failure is said beside it, never in place of it.
+            problem='owned worker cleanup failed: thread_alive=%s failure=%s group=%s left=%s'%(thread.is_alive(),failure,group,left)
+            if settled:raise AssertionError(problem)
+            print('h6: '+problem,file=sys.stderr)
     for table,original in before.items():
         after=collections.Counter(packed(row) for row in c.execute('SELECT * FROM "'+table+'"'))
         assert not original-after,'existing current rows changed in '+table
