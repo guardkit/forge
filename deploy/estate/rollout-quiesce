@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import sqlite3
 import stat
+import subprocess
 import uuid
 import sys
 import tempfile
@@ -33,8 +34,12 @@ PRODUCERS = ('front-door','bus-gateway')
 # after, and the front door's start period is 60 s, so one that starts within
 # its own declared period is healthy by the 90 s probe; the gateway was on the
 # bus 17 s after it started. 180 s is that 90 s twice over.
+# The 180 s is one deadline for the whole stage, container discovery included:
+# no subprocess in it may outlive what remains, and each probe (an inspect or
+# an exec whose own request gives up after 5 s) is also capped at 30 s.
 READY_DEADLINE_SECONDS = 180
 READY_POLL_SECONDS = 3
+READY_ASK_SECONDS = 30
 HEALTHCHECKED = ('coordinator','front-door')
 RESUMED = 'ROLLOUT-RESUMED'
 ACTIVE_BUILDS = {'QUEUED','PREPARING','RUNNING','PAUSED','FINALISING'}
@@ -439,7 +444,7 @@ class Estate:
     def compose(self,*args):
         cmd=['compose','--project-name',self.c['project'],'--env-file',self.args.env_file]
         for f in self.c['compose_files']:cmd+=['-f',str(r.path(f))]
-        return self.recorded_docker(*cmd,*args,env=self.env)
+        return self.recorded_docker(*cmd,*args,env=self.env,**self.ready_budget())
     def model(self):return json.loads(self.compose('config','--format','json').stdout)
     def helper(self,code,args=(),mounts=(),image=None,network='none',input=None,environment=False):
         cmd=['run','--rm','--network',network,'--read-only','--tmpfs','/tmp','-e','PYTHONDONTWRITEBYTECODE=1','--user','0:0']
@@ -526,7 +531,7 @@ print(json.dumps(state))
             need(service in model.get('services',{}),f'service {service} is absent from the actual graph; correct the phase Compose inputs')
             ids=self.compose('ps','--all','-q',service).stdout.split();need(len(ids)<=1,f'service {service} is ambiguous; reconcile its exact container identity')
             if ids:
-                item=r.inspect(self.c,ids[0]);labels=item['Config'].get('Labels',{})
+                item=r.inspect(self.c,ids[0],**self.ready_budget());labels=item['Config'].get('Labels',{})
                 need(labels.get('com.docker.compose.project')==self.c['project'] and labels.get('com.docker.compose.service')==service,f'container {ids[0]} has conflicting ownership; keep it untouched and reconcile')
                 need(item['Image'] in self.allowed_images(service,model['services'][service]['image']),f'{service} runs another image; reconcile the declared graph before mutation')
                 # Actual authoritative volume attachments must match the rendered graph.
@@ -648,11 +653,24 @@ print('planning switch read back')
         actual=self.volume('settings',code,environment=True).strip()
         need(actual==receipt['settings_output_sha256'],'current settings volume differs from the validated prepared file; keep admissions closed')
 
+    def ready_budget(self,cap=r.TIMEOUT_SECONDS):
+        """Subprocess keywords for a call inside the readiness wait: its own cap or
+        what remains of the wait's one deadline, whichever is less. Outside the
+        wait there is no deadline and the call keeps rollout_support's default."""
+        deadline=getattr(self,'_ready_deadline',None)
+        if deadline is None:return {}
+        remaining=deadline-time.monotonic()
+        need(remaining>0,f'readiness-wait: the {READY_DEADLINE_SECONDS} s deadline passed before asking {self._ready_asking}. The services check was not run.')
+        return {'timeout':min(cap,remaining)}
+    def ask(self,what,*args):
+        """One readiness probe: a docker call bounded by READY_ASK_SECONDS and the deadline."""
+        self._ready_asking=what
+        return r.docker(self.c,*args,check=False,**self.ready_budget(READY_ASK_SECONDS))
     def readiness(self,ids,restarts):
         """One observation of what resume opened: (not yet ready, never will be), each by service."""
         waiting={};broken={}
         for name,identifier in ids.items():
-            found=r.docker(self.c,'inspect',identifier,check=False)
+            found=self.ask(f'Docker about the {name} container {identifier[:12]}','inspect',identifier)
             try:item=json.loads(found.stdout)[0] if found.returncode==0 else None
             except (ValueError,IndexError,TypeError):item=None
             if not isinstance(item,dict):
@@ -670,7 +688,7 @@ print('planning switch read back')
                     waiting[name]=f'{name} Docker health is {health}';continue
             if name=='coordinator':
                 # Docker health asks only whether it answers at all; item 8e needs 200.
-                code=r.docker(self.c,'exec',identifier,'curl','-s','-o','/dev/null','--max-time','5','-w','%{http_code}','http://localhost:8080/healthz',check=False).stdout.strip()
+                code=self.ask('the coordinator for its health route','exec',identifier,'curl','-s','-o','/dev/null','--max-time','5','-w','%{http_code}','http://localhost:8080/healthz').stdout.strip()
                 if code!='200':waiting[name]=f'coordinator answered its health route with {code or "nothing"}; it answers 200 only once its subscription to the bus is live'
             if name=='bus-gateway':
                 # No healthcheck and no port: the bus is asked, from inside the
@@ -680,30 +698,44 @@ print('planning switch read back')
                 address=self.values['BUS_MONITORING_ADDRESS'];account=self.values['JARVIS_NATS_USER']
                 client='bus-gateway-'+(self.values.get('FACTORY_INSTANCE') or 'factory');subject=self.values.get('GATEWAY_WATCH_SUBJECT') or 'agents.command.jarvis'
                 code='import json,sys,urllib.request\n'+inspect_source.getsource(gateway_connections)+"\ndoc=json.loads(urllib.request.urlopen('http://'+sys.argv[1]+'/connz?auth=1&subs=1',timeout=5).read().decode())\nprint(gateway_connections(doc,*sys.argv[2:5]))\n"
-                count=r.docker(self.c,'exec',ids['coordinator'],'python','-c',code,address,account,client,subject,check=False).stdout.strip()
+                count=self.ask(f'the bus at {address}, from inside the coordinator, for its connections','exec',ids['coordinator'],'python','-c',code,address,account,client,subject).stdout.strip()
                 if not (count.isdigit() and int(count)>0):
                     waiting[name]=f"the bus at {address} holds no connection yet with the client name '{client}' and the subscription {subject} on the '{account}' account"+('' if count.isdigit() else ' (the bus could not be asked)')
         return waiting,broken
     def wait_ready(self,events):
-        """Wait, bounded by READY_DEADLINE_SECONDS, until the recreated coordinator
-        and the opened producers are ready to be checked; refuse naming what is not."""
-        opened=('coordinator',*PRODUCERS);items=self.service_ids(opened)
-        need(set(items)==set(opened),'resume opened '+', '.join(x for x in opened if x not in items)+' and no container exists for it; read the compose output in this receipt')
-        need(self.values.get('BUS_MONITORING_ADDRESS') and self.values.get('JARVIS_NATS_USER'),'the env file names no BUS_MONITORING_ADDRESS or JARVIS_NATS_USER, so whether the bus gateway is on the bus cannot be asked')
-        ids={name:items[name]['Id'] for name in opened};restarts={name:items[name].get('RestartCount') for name in opened}
+        """Wait, bounded by one READY_DEADLINE_SECONDS deadline taken before the
+        containers are even found, until the recreated coordinator and the opened
+        producers are ready to be checked; refuse naming what is not, or what
+        could not be asked in time, or readiness that arrived after the deadline."""
+        opened=('coordinator',*PRODUCERS)
         event={'stage':'readiness-wait','waited_for':list(opened),'deadline_seconds':READY_DEADLINE_SECONDS,'started_at':now(),'polls':0,'ready':False}
-        events.append(event);started=time.monotonic()
+        started=time.monotonic();deadline=self._ready_deadline=started+READY_DEADLINE_SECONDS
         try:
+            try:
+                need(self.values.get('BUS_MONITORING_ADDRESS') and self.values.get('JARVIS_NATS_USER'),'the env file names no BUS_MONITORING_ADDRESS or JARVIS_NATS_USER, so whether the bus gateway is on the bus cannot be asked')
+                self._ready_asking='Docker for the containers resume opened (compose config, compose ps and inspect)'
+                items=self.service_ids(opened)
+            # After discovery's own recorded commands, so this event stays the stage's last.
+            finally:events.append(event)
+            need(set(items)==set(opened),'resume opened '+', '.join(x for x in opened if x not in items)+' and no container exists for it; read the compose output in this receipt')
+            ids={name:items[name]['Id'] for name in opened};restarts={name:items[name].get('RestartCount') for name in opened}
             while True:
                 event['polls']+=1;waiting,broken=self.readiness(ids,restarts)
                 event['not_ready']={name:self.sanitize(text) for name,text in {**waiting,**broken}.items()}
                 need(not broken,'readiness-wait: '+'; '.join(broken.values())+'. The services check was not run.')
-                if not waiting:event['ready']=True;return
-                need(time.monotonic()-started<READY_DEADLINE_SECONDS,f'readiness-wait: after {READY_DEADLINE_SECONDS} s these were still not ready: '+'; '.join(waiting.values())+'. The services check was not run.')
-                time.sleep(READY_POLL_SECONDS)
+                late=time.monotonic()-deadline
+                if not waiting:
+                    need(late<=0,f'readiness-wait: readiness arrived after the deadline: what resume opened was first seen ready {late:.1f} s after its {READY_DEADLINE_SECONDS} s. The services check was not run.')
+                    event['ready']=True;return
+                if late<0:time.sleep(min(READY_POLL_SECONDS,-late))
+                need(time.monotonic()<deadline,f'readiness-wait: after {READY_DEADLINE_SECONDS} s these were still not ready: '+'; '.join(waiting.values())+'. The services check was not run.')
+        except subprocess.TimeoutExpired as exc:
+            failure=r.Refusal(f'readiness-wait: asking {self._ready_asking} got no answer within {exc.timeout:.1f} s, and the wait allows {READY_DEADLINE_SECONDS} s in all. The services check was not run.')
+            event['reason']=self.sanitize(str(failure));raise failure from None
         except Exception as exc:
             event['reason']=self.sanitize(str(exc));raise
         finally:
+            self._ready_deadline=self._ready_asking=None
             event['seconds']=round(time.monotonic()-started,1);event['finished_at']=now()
 
     def resume(self):
