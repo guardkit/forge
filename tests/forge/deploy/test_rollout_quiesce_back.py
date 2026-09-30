@@ -261,32 +261,43 @@ def test_post_resume_failure_keeps_pair_and_records_failure(estate,monkeypatch,f
         assert (estate.snapshot/'post-resume-check.json').stat().st_mode & 0o777==0o600
     assert estate.doc['stage']=='resumed'
 
-def ready_fakes(estate,monkeypatch,*,coordinator_after=1,gateway_after=1,stuck=None,restart=None):
-    """Resume up to the open door with fakes; the opened services become ready at a given poll."""
+def ready_fakes(estate,monkeypatch,*,coordinator_after=1,gateway_after=1,stuck=None,restart=None,discovery_seconds=0,probe_seconds=None,overrun=False):
+    """Resume up to the open door with fakes; the opened services become ready at a given poll.
+    The fake clock advances while containers are discovered and while each probe
+    (inspect, curl, connz) runs; a probe slower than the timeout it was given
+    times out at it, unless it overruns and answers late."""
     estate.phase='prepared';estate.doc={'format_version':1,'binding':estate.binding,'stage':'final'};estate.save();pair={}
     monkeypatch.setattr(estate,'markers',lambda:pair.get('marker'));monkeypatch.setattr(estate,'record',lambda:estate.doc);monkeypatch.setattr(estate,'prepared_settings',lambda:None);monkeypatch.setattr(estate,'unit',lambda n:{});monkeypatch.setattr(estate,'watch_closed',lambda **kw:None);monkeypatch.setattr(estate,'producers_stopped',lambda:None);monkeypatch.setattr(estate,'monitor',lambda:q.reader_counts(monitor()));monkeypatch.setattr(r,'load_volumes',lambda *a,**k:None);monkeypatch.setattr(r,'verify_snapshot',lambda d:{'sha256':'a'*64});monkeypatch.setattr(estate,'current_state',lambda:{'work_state':{}});estate.values['ROLLOUT_STATE_DIR']=str(estate.snapshot)
     monkeypatch.setattr(estate,'volume',lambda role,code,args=(),**kw:pair.update(marker=json.loads(args[0])));monkeypatch.setattr(estate,'planning',lambda enabled:None)
     estate.values.update(JARVIS_NATS_USER='jarvis',FACTORY_INSTANCE='fixture')
-    seen={'polls':0,'services':0,'services_after_polls':None,'hello':0,'watch':0,'pair':pair};clock=[0.0]
+    seen={'polls':0,'services':0,'services_after_polls':None,'hello':0,'watch':0,'pair':pair,'asked':[]};clock=[0.0]
     monkeypatch.setattr(q,'time',SimpleNamespace(monotonic=lambda:clock[0],sleep=lambda seconds:clock.__setitem__(0,clock[0]+seconds)))
     monkeypatch.setattr(estate,'compose',lambda *a:seen.__setitem__('watch',seen['watch']+1) if 'gateway-watch' in a else None)
     ids={name:'id-'+name for name in ('coordinator','front-door','bus-gateway')}
-    monkeypatch.setattr(estate,'service_ids',lambda services:{name:{'Id':ids[name],'RestartCount':0} for name in services})
+    def service_ids(services):
+        clock[0]+=discovery_seconds;return {name:{'Id':ids[name],'RestartCount':0} for name in services}
+    monkeypatch.setattr(estate,'service_ids',service_ids)
+    def took(kind,kwargs):
+        seconds=(probe_seconds or {}).get(kind,0);timeout=kwargs.get('timeout')
+        seen['asked'].append((kind,timeout,q.READY_DEADLINE_SECONDS-clock[0]))
+        if timeout is not None and seconds>timeout and not overrun:
+            clock[0]+=timeout;raise subprocess.TimeoutExpired(['docker',kind],timeout)
+        clock[0]+=seconds
     front_door={'authorized_user':'jarvis','name':'front-door-fixture','subscriptions_list':[]}
     gateway={'authorized_user':'jarvis','name':'bus-gateway-fixture','subscriptions_list':['agents.command.jarvis']}
     def docker(c,*args,**kwargs):
         if args[:2]==('image','inspect'):return SimpleNamespace(stdout=json.dumps([{'Id':r.RUNTIME}]),returncode=0)
         if args[0]=='inspect':
-            name=next(n for n,i in ids.items() if i==args[1])
+            took('inspect',kwargs);name=next(n for n,i in ids.items() if i==args[1])
             if name=='coordinator':seen['polls']+=1
             ready=seen['polls']>=coordinator_after if name=='coordinator' else name!=stuck
             state={'Running':True,'Restarting':False,'Status':'running'}
             if name in q.HEALTHCHECKED:state['Health']={'Status':'healthy' if ready else 'starting'}
             return SimpleNamespace(stdout=json.dumps([{'Id':args[1],'State':state,'RestartCount':(restart or {}).get(name,0)}]),returncode=0)
         if args[0]=='exec' and 'curl' in args:
-            assert args[1]==ids['coordinator'];return SimpleNamespace(stdout='200',returncode=0)
+            assert args[1]==ids['coordinator'];took('curl',kwargs);return SimpleNamespace(stdout='200',returncode=0)
         if args[0]=='exec' and 'python' in args:
-            assert args[1]==ids['coordinator'] and args[-4:]==('fake.invalid:18222','jarvis','bus-gateway-fixture','agents.command.jarvis')
+            assert args[1]==ids['coordinator'] and args[-4:]==('fake.invalid:18222','jarvis','bus-gateway-fixture','agents.command.jarvis');took('connz',kwargs)
             on=stuck!='bus-gateway' and seen['polls']>=gateway_after
             return SimpleNamespace(stdout=str(q.gateway_connections({'connections':[front_door]+([gateway] if on else [])},*args[-3:]))+'\n',returncode=0)
         pytest.fail(f'unexpected docker call {args}')
@@ -322,6 +333,71 @@ def test_resume_refuses_at_once_when_an_opened_service_restarts(estate,monkeypat
     with pytest.raises(r.Refusal,match='bus-gateway has restarted since resume opened it'):estate.resume()
     assert seen['services']==0 and clock[0]==0
     report=r.read_json(estate.snapshot/'post-resume-check.json');assert report['failure']['stage']=='readiness-wait' and report['commands'][-1]['polls']==1
+
+def assert_refused_before_services(estate,seen,said):
+    """A readiness refusal: nothing after it ran, and the receipt and markers say so."""
+    assert seen['services']==seen['hello']==seen['watch']==0
+    report=r.read_json(estate.snapshot/'post-resume-check.json')
+    assert not report['passed'] and report['services_check'] is None and report['cleanup']['current_authority_retained'] is True
+    assert report['failure']['stage']=='readiness-wait' and said in report['failure']['reason'] and 'services check was not run' in report['failure']['reason']
+    event=report['commands'][-1];assert event['stage']=='readiness-wait' and event['ready'] is False and said in event['reason']
+    assert seen['pair']['marker']==r.read_json(estate.snapshot/'resumed.json') and estate.doc['stage']=='resumed'
+    return event
+
+def test_every_probe_is_bounded_by_its_cap_and_what_remains(estate,monkeypatch):
+    # Slow probes within the deadline: ready at the sixth poll, 98 s in.
+    seen,clock=ready_fakes(estate,monkeypatch,coordinator_after=4,gateway_after=6,discovery_seconds=20,probe_seconds={'inspect':2,'curl':4,'connz':5})
+    assert estate.resume()['passed'] and seen['services']==1 and seen['services_after_polls']==6 and clock[0]==98
+    assert seen['asked'] and all(timeout==min(q.READY_ASK_SECONDS,remaining) for kind,timeout,remaining in seen['asked'])
+    wait=r.read_json(estate.snapshot/'post-resume-check.json')['commands'][0];assert wait['ready'] is True and wait['seconds']==98
+
+@pytest.mark.parametrize('probe_seconds,said,polls,ended',[
+    # A probe that hangs is cut at its own 30 s cap.
+    ({'curl':1000},'readiness-wait: asking the coordinator for its health route got no answer within 30.0 s',1,30),
+    # A slow probe still running at the deadline is cut there: seventh poll at 168 s, 12 s left.
+    ({'connz':25},'readiness-wait: asking the bus at fake.invalid:18222, from inside the coordinator, for its connections got no answer within 12.0 s',7,180)])
+def test_resume_refuses_naming_a_probe_that_outlives_its_budget(estate,monkeypatch,probe_seconds,said,polls,ended):
+    seen,clock=ready_fakes(estate,monkeypatch,stuck='bus-gateway',probe_seconds=probe_seconds)
+    with pytest.raises(r.Refusal,match='readiness-wait: asking '):estate.resume()
+    assert clock[0]==ended and assert_refused_before_services(estate,seen,said)['polls']==polls
+
+def test_resume_refuses_readiness_that_arrives_after_the_deadline(estate,monkeypatch):
+    # Subprocess timeouts are not exact: the seventh connz starts 168 s in with
+    # 12 s left and answers, ready, 13 s after the deadline.
+    seen,clock=ready_fakes(estate,monkeypatch,gateway_after=7,probe_seconds={'connz':25},overrun=True)
+    with pytest.raises(r.Refusal,match='readiness arrived after the deadline'):estate.resume()
+    assert clock[0]==193 and assert_refused_before_services(estate,seen,'first seen ready 13.0 s after')['polls']==7
+
+@pytest.mark.parametrize('discovery_seconds,ready',[(176,True),(179,False)])
+def test_discovery_counts_inside_the_deadline_and_the_last_sleep_is_capped(estate,monkeypatch,discovery_seconds,ready):
+    # Discovery takes 176 or 179 s; the first poll is not ready. From 176 s the
+    # 3 s sleep leaves a second poll at 179 s; from 179 s the sleep is 1 s and
+    # the deadline is reached with nothing seen ready, so there is no second poll.
+    seen,clock=ready_fakes(estate,monkeypatch,coordinator_after=2,discovery_seconds=discovery_seconds)
+    if ready:
+        assert estate.resume()['passed'] and seen['services_after_polls']==2 and clock[0]==179
+    else:
+        with pytest.raises(r.Refusal,match=f'readiness-wait: after {q.READY_DEADLINE_SECONDS} s these were still not ready: coordinator Docker health is starting'):estate.resume()
+        assert clock[0]==q.READY_DEADLINE_SECONDS and assert_refused_before_services(estate,seen,'coordinator Docker health is starting')['polls']==1
+
+def test_discovery_calls_get_what_remains_and_a_hang_is_a_named_refusal(estate,monkeypatch):
+    clock=[0.0];monkeypatch.setattr(q,'time',SimpleNamespace(monotonic=lambda:clock[0],sleep=lambda seconds:pytest.fail('no poll after failed discovery')))
+    estate.values.update(JARVIS_NATS_USER='jarvis');opened=('coordinator','front-door','bus-gateway');asked=[]
+    model={'services':{name:{'image':r.RUNTIME} for name in opened},'volumes':{}}
+    def run(argv,**kw):
+        argv=[str(x) for x in argv];asked.append((argv,kw.get('timeout'),q.READY_DEADLINE_SECONDS-clock[0]))
+        if 'config' in argv:clock[0]+=100;return SimpleNamespace(returncode=0,stdout=json.dumps(model),stderr='')
+        if 'ps' in argv:
+            if argv[-1]=='bus-gateway':clock[0]+=kw['timeout'];raise subprocess.TimeoutExpired(argv,kw['timeout'])
+            clock[0]+=10;return SimpleNamespace(returncode=0,stdout='id-'+argv[-1]+'\n',stderr='')
+        assert argv[3]=='inspect';clock[0]+=5;service=argv[-1][len('id-'):]
+        return SimpleNamespace(returncode=0,stdout=json.dumps([{'Id':argv[-1],'Image':r.RUNTIME,'Mounts':[],'Config':{'Labels':{'com.docker.compose.project':estate.c['project'],'com.docker.compose.service':service}}}]),stderr='')
+    monkeypatch.setattr(r,'run',run);events=[]
+    with pytest.raises(r.Refusal,match=r'asking Docker for the containers resume opened \(compose config, compose ps and inspect\) got no answer within 50.0 s'):estate.wait_ready(events)
+    # config 100 s, then ps (10 s) and inspect (5 s) of two services, leaving 50 s for the hanging ps.
+    assert [timeout for argv,timeout,remaining in asked]==[180,80,70,65,55,50] and all(timeout==min(r.TIMEOUT_SECONDS,remaining) for argv,timeout,remaining in asked)
+    assert events[-1]['stage']=='readiness-wait' and events[-1]['polls']==0 and 'got no answer within 50.0 s' in events[-1]['reason'] and events[-1]['seconds']==180
+    assert estate.ready_budget()=={}
 
 def test_gateway_is_counted_only_by_account_name_and_subscription_on_one_connection():
     doc={'connections':[{'authorized_user':'jarvis','name':'front-door-x','subscriptions_list':['agents.command.jarvis']},

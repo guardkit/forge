@@ -47,9 +47,11 @@ class Refusal(Exception):
 def refuse(message):
     raise Refusal(message)
 
-def run(argv, *, input=None, check=True, env=None):
+TIMEOUT_SECONDS = 180
+
+def run(argv, *, input=None, check=True, env=None, timeout=TIMEOUT_SECONDS):
     # Never print a failed command's stderr: Compose diagnostics can contain secrets.
-    result = subprocess.run([str(x) for x in argv], input=input, capture_output=True, text=True, timeout=180, env=env)
+    result = subprocess.run([str(x) for x in argv], input=input, capture_output=True, text=True, timeout=timeout, env=env)
     if check and result.returncode:
         refuse(f'{Path(str(argv[0])).name} could not complete the requested read or operation; inspect its private diagnostics and retry')
     return result
@@ -229,8 +231,8 @@ def config(p, env_file=None, project=None):
 def docker(c, *args, **kwargs):
     return run(['docker', '--context', c['docker_context'], *args], **kwargs)
 
-def inspect(c, name):
-    result = json.loads(docker(c, 'inspect', name).stdout)
+def inspect(c, name, **kwargs):
+    result = json.loads(docker(c, 'inspect', name, **kwargs).stdout)
     if len(result) != 1: refuse(f'container {name} is ambiguous; name exactly one container')
     return result[0]
 
