@@ -493,6 +493,123 @@ class TestATakeoverStopsAndConfirms:
 
 
 # ---------------------------------------------------------------------------
+# (c) GONE means nothing of it can run — the H6 rehearsal, 30 September 2026
+# ---------------------------------------------------------------------------
+
+
+class TestAnEndedProcessIsGone:
+    """A process that has ended and was never collected is not "still alive".
+
+    The H6 probe runs the executor as its container's first process, exactly as
+    the deploy helper runs. A takeover signals the old command's whole group at
+    once; when a parent in it died before its child, the child was handed to
+    that first process, which never collects anybody else's children. What was
+    left in the group was ended processes only, the table counted them, and the
+    successor was refused with "not confirmed gone within 5s" — flakily, because
+    whether a parent collected its child before dying was down to scheduling.
+    These tests make that state on purpose instead of waiting for it.
+    """
+
+    def test_a_zombie_is_not_a_member_of_its_group(self) -> None:
+        child = _a_zombie()
+        try:
+            assert ProcessTable().members_of(child.pid) == []
+        finally:
+            child.wait()
+
+    def test_a_takeover_whose_stopped_command_is_never_collected_is_accepted(
+        self, notes, workshop, TARGET
+    ) -> None:
+        """The H6 failure, made deterministic. Before, this was refused with
+        "the-old-command-could-not-be-confirmed-stopped".
+
+        The old command is alive when the successor's executor reconciles, and
+        dies to the takeover's SIGTERM — and nobody collects it, because the
+        only process that could (this test) does not until the end.
+        """
+        old = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(120)"],
+            start_new_session=True,
+        )
+        try:
+            _write_note(notes, TARGET, counter=41, build="build-old", group=old.pid)
+            executor = _executor(notes, stop_confirm_seconds=2.0)
+            assert executor.reconcile()[TARGET] == "occupied (adopted)"
+            answer = executor.run(
+                _ask(TARGET, _quick(workshop), 42, "build-new", workshop)
+            )
+            assert answer.accepted is True, answer.sentence
+            assert answer.word == "the-deploy-command-ran"
+            assert answer.exit_code == 0
+            assert _read_note(notes)["highest_counter"] == 42
+            # It really was stopped, and it really was never collected.
+            assert old.poll() == -signal.SIGTERM
+        finally:
+            if old.poll() is None:
+                _kill(old.pid)
+            old.wait()
+
+    def test_an_ended_first_thread_with_a_live_thread_is_still_alive(
+        self, tmp_path
+    ) -> None:
+        """A program whose first thread exited while another runs shows "Z"."""
+        proc = tmp_path / "proc"
+        _fake_process(proc, 700, group=700, state="Z", threads={700: "Z", 701: "S"})
+        assert ProcessTable(proc).members_of(700) == [700]
+
+    def test_an_ended_process_whose_threads_cannot_be_read_is_counted(
+        self, tmp_path
+    ) -> None:
+        """Cannot tell is never "gone"."""
+        proc = tmp_path / "proc"
+        _fake_process(proc, 700, group=700, state="Z", threads=None)
+        assert ProcessTable(proc).members_of(700) == [700]
+
+    def test_only_the_ended_members_of_a_group_are_left_out(self, tmp_path) -> None:
+        proc = tmp_path / "proc"
+        _fake_process(proc, 700, group=700, state="Z", threads={700: "Z"})
+        _fake_process(proc, 701, group=700, state="S", threads={701: "S"})
+        _fake_process(proc, 702, group=700, state="Z", threads={702: "Z"})
+        _fake_process(proc, 800, group=800, state="R", threads={800: "R"})
+        assert ProcessTable(proc).members_of(700) == [701]
+
+
+class TestTheOutrightKillHasTimeToWork:
+    """SIGKILL is sent while there is still time to confirm it worked.
+
+    With a stop-and-confirm limit no longer than the polite stop's grace — the
+    H6 probe's is 5s, the grace is 5s — SIGKILL used to go out at the very
+    deadline, the group was looked at once, and the answer was a refusal. The
+    polite stop now gets at most half of the limit.
+    """
+
+    def test_a_command_that_ignores_sigterm_is_killed_and_confirmed_in_time(
+        self, notes, workshop, TARGET, monkeypatch
+    ) -> None:
+        group = 2**22 - 2  # nobody's group; the signals are recorded, not sent
+        table = _DiesAfterSigkill(group, takes=0.3)
+        sent: list[int] = []
+        real_killpg = os.killpg
+
+        def _record(pgid: int, sig: int) -> None:
+            if pgid != group:
+                # The successor's own command, stopped when it returns.
+                real_killpg(pgid, sig)
+                return
+            sent.append(sig)
+            if sig == signal.SIGKILL:
+                table.killed_at = time.monotonic()
+
+        monkeypatch.setattr(os, "killpg", _record)
+        executor = _executor(notes, stop_confirm_seconds=2.0, process_table=table)
+        _write_note(notes, TARGET, counter=1, build="build-a", group=group)
+        answer = executor.run(_ask(TARGET, _quick(workshop), 2, "build-b", workshop))
+        assert sent == [signal.SIGTERM, signal.SIGKILL]
+        assert answer.accepted is True, answer.sentence
+        assert answer.word == "the-deploy-command-ran"
+
+
+# ---------------------------------------------------------------------------
 # (d) the note is written in two parts, and the window is the marker's to cover
 # ---------------------------------------------------------------------------
 
@@ -1540,6 +1657,86 @@ class _AliveOnly:
 
     def members_of(self, group: int):
         return [group] if group in self._groups else []
+
+    def started_at(self, pid: int):
+        return None
+
+    def carrying(self, fragment: str):
+        return []
+
+    def group_of(self, pid: int):
+        return pid
+
+    def command_of(self, pid: int):
+        return ""
+
+
+def _a_zombie() -> "subprocess.Popen[bytes]":
+    """A real process, in a group of its own, that has ended and is not collected.
+
+    This test process is its parent and does not wait for it until the test's
+    own ``finally`` does, so the kernel keeps it — ended — in its group, which
+    is the state the H6 probe's first process left the old command's orphans in.
+    """
+    child = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True)
+    deadline = time.monotonic() + 20.0
+    while time.monotonic() < deadline:
+        try:
+            raw = Path(f"/proc/{child.pid}/stat").read_text(encoding="utf-8")
+        except OSError:
+            raw = ""
+        if raw[raw.rfind(")") + 2 :].startswith("Z"):
+            return child
+        time.sleep(0.02)
+    child.kill()
+    child.wait()
+    raise AssertionError("the child never ended")
+
+
+def _fake_process(
+    proc: Path,
+    pid: int,
+    *,
+    group: int,
+    state: str,
+    threads: dict[int, str] | None,
+) -> None:
+    """One process in a stand-in for the kernel's table, in the kernel's shape."""
+
+    def stat(number: int, mark: str) -> str:
+        # state ppid pgrp session, fifteen more fields, then the start time.
+        return f"{number} (step) {mark} 1 {group} {group} " + "0 " * 15 + "4242 0 0\n"
+
+    where = proc / str(pid)
+    where.mkdir(parents=True)
+    (where / "stat").write_text(stat(pid, state), encoding="utf-8")
+    (where / "cmdline").write_bytes(b"")
+    if threads is None:
+        return
+    for tid, mark in threads.items():
+        (where / "task" / str(tid)).mkdir(parents=True)
+        (where / "task" / str(tid) / "stat").write_text(stat(tid, mark), encoding="utf-8")
+
+
+class _DiesAfterSigkill:
+    """A process table in which one group ignores SIGTERM and dies to SIGKILL.
+
+    It takes ``takes`` seconds to go after the SIGKILL, as a real process does.
+    """
+
+    available = True
+
+    def __init__(self, group: int, *, takes: float) -> None:
+        self._group = group
+        self._takes = takes
+        self.killed_at: float | None = None
+
+    def members_of(self, group: int):
+        if group != self._group:
+            return []
+        if self.killed_at is not None and time.monotonic() - self.killed_at >= self._takes:
+            return []
+        return [group]
 
     def started_at(self, pid: int):
         return None
