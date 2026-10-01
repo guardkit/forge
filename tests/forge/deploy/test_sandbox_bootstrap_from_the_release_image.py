@@ -675,10 +675,33 @@ class TestItStartsTwoContainersFromThatOneImage:
             ENGINE_ID,
         ]
 
-    def test_the_two_ports_are_published_inside_the_sandbox(self, sandbox, started):
-        runs = " || ".join(c for c in _calls(sandbox) if c.startswith("run "))
-        assert "--publish 0.0.0.0:8125:8125" in runs
-        assert "--publish 0.0.0.0:8124:8124" in runs
+    def test_the_two_ports_are_open_inside_the_sandbox(self, sandbox, started):
+        runs = [c for c in _calls(sandbox) if c.startswith("run ")]
+        helper = [c for c in runs if "--name forge-sandbox-helper" in c]
+        runner = [c for c in runs if "--name forge-sandbox-runner" in c]
+        assert len(helper) == 1 and len(runner) == 1
+        # The helper publishes its port from the bridge.
+        assert "--publish 0.0.0.0:8125:8125" in helper[0]
+        # The runner shares the sandbox's own network (release -3): it listens
+        # on the sandbox's port itself, so there is nothing to publish.
+        assert "--network host" in runner[0]
+        assert "--publish" not in runner[0]
+        assert "--host 0.0.0.0 --port 8124" in runner[0]
+
+    def test_only_the_runner_shares_the_sandboxs_network(self, sandbox, started):
+        """A test suite's own services are on the SANDBOX's loopback.
+
+        Release -3, found by the independent check of the first template fix:
+        api_test's suite starts Postgres with ``-p 127.0.0.1:<port>:5432`` and
+        connects to ``localhost:<port>``. On Docker's default bridge that
+        localhost is the runner itself, and every connection was refused. The
+        helper was not part of that finding and stays on the bridge.
+        """
+        runs = [c for c in _calls(sandbox) if c.startswith("run ")]
+        helper = [c for c in runs if "--name forge-sandbox-helper" in c]
+        runner = [c for c in runs if "--name forge-sandbox-runner" in c]
+        assert "--network host" in runner[0]
+        assert "--network" not in helper[0]
 
     def test_the_projects_own_clone_is_bound_read_write(self, sandbox, started):
         clone = str(sandbox["project"])
