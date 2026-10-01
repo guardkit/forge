@@ -373,6 +373,13 @@
 #     SANDBOX_RUNNER_RESTART_SECONDS
 #                            the pause before a container that died is started
 #                            again (default 5)
+#     SANDBOX_RUNNER_SETTLE_SECONDS
+#                            how long a newly started service is given to
+#                            answer as itself on its own port (the helper's
+#                            /healthz, the runner's /ok) before it is said not
+#                            to be up (default 60, an upper bound); one that
+#                            died, or that is running while something else has
+#                            its port, is named with its last lines
 #     SANDBOX_RUNNER_STOP_PATIENCE_SECONDS
 #                            how long a stop waits for the supervisor it
 #                            signalled to go before it calls it stuck (default
@@ -490,6 +497,13 @@ RESTART_SECONDS="${SANDBOX_RUNNER_RESTART_SECONDS:-5}"
 # this comfortably below the host side's own stop timeout
 # (SANDBOX_STOP_TIMEOUT_SECONDS out there, 45 seconds by default).
 STOP_PATIENCE_SECONDS="${SANDBOX_RUNNER_STOP_PATIENCE_SECONDS:-30}"
+# HOW LONG A NEWLY STARTED SERVICE IS GIVEN TO ANSWER AS ITSELF before it is
+# called not up (release -3, after the re-check of the network change). It is
+# an upper bound: the wait ends the moment the service answers. Sixty seconds
+# is well over both services' start-up on a sandbox (a few seconds each).
+SETTLE_SECONDS="${SANDBOX_RUNNER_SETTLE_SECONDS:-60}"
+#: How much of a dead container's own output is printed before it is removed.
+LAST_WORDS_LINES=20
 PREFIX="${SANDBOX_CONTAINER_PREFIX:-forge-sandbox}"
 HELPER_NAME="${PREFIX}-helper"
 RUNNER_NAME="${PREFIX}-runner"
@@ -1396,8 +1410,17 @@ the_engine_socket_for() {
 # the coordinator still comes in through the gateway and that rule. (Docker
 # ignores --publish on the host network, with a warning, so none is passed.)
 # The two ports must therefore be free in the sandbox: they differ from each
-# other, and a project that publishes one of them for itself would now collide
-# — the start fails loudly rather than quietly. Nothing in the factory reaches
+# other, and a project that publishes one of them for itself would now collide.
+# A collision does NOT stop the start by itself: `docker run` succeeds, and
+# then the service either exits with "Address already in use" or — the runner,
+# seen on a real sandbox — keeps running without ever listening, while what
+# took the port answers in its place. So the start-up, and the supervisor after
+# every restart, waits for each service to answer as itself on its own health
+# route before saying it is up, and says plainly which one did not and why;
+# and the supervisor prints a dead container's last lines before it removes it
+# and starts another (see say_why_it_stopped and wait_until_it_answers). It also means code a build runs can take a factory port
+# while the helper or the runner is being restarted — one more thing that code
+# can do inside the engine-socket risk accepted above, not a new kind of risk. Nothing in the factory reaches
 # either service by a bridge address: the helper never calls the runner nor the
 # runner the helper, and the helper's one outward call (FORGE_TARGET_OWNER_URL)
 # goes to the gateway address, which the sandbox routes the same way from its
@@ -1458,6 +1481,33 @@ start_runner() {
 # Start one, whatever state it is in: a container left behind by an earlier
 # supervisor is removed first, so what runs is always freshly made from the
 # checked image.
+# WHY A CONTAINER STOPPED, said before it is removed (release -3, after the
+# re-check of the network change). The supervisor removes a dead container
+# before it makes another, and with it the only record of why it died: until
+# this, a port taken by something else showed up as nothing but "is no longer
+# running; starting it again" every few seconds, for ever. So its exit status
+# and the last few lines of its OWN OUTPUT (what the service printed, as
+# `docker logs` keeps it — never `docker inspect` of its environment, so no
+# setting's value is ever asked for here) are printed first, bounded in lines
+# and in line length.
+say_why_it_stopped() {
+  local what="$1" name="$2" still="${3:-}" status="" words=""
+  if [[ -z "${still}" ]]; then
+    status="$("${DOCKER}" inspect --format '{{.State.ExitCode}}' "${name}" 2>/dev/null | tr -d '\r' | tail -1 || true)"
+    [[ "${status}" =~ ^-?[0-9]+$ ]] || status=""
+  fi
+  if words="$("${DOCKER}" logs --tail "${LAST_WORDS_LINES}" "${name}" 2>&1)"; then
+    if [[ -n "${still}" ]]; then
+      log "${what} (${name}): the last of its own output so far:"
+    else
+      log "${what} (${name}) stopped${status:+ with exit status ${status}}; the last of its own output, before it is removed:"
+    fi
+    printf '%s\n' "${words}" | tail -n "${LAST_WORDS_LINES}" | cut -c1-400 | sed 's/^/[sandbox-runner.sh]     | /'
+  else
+    log "${what} (${name}) stopped${status:+ with exit status ${status}}, and this sandbox's engine would not give its output: $(printf '%s' "${words}" | tr '\n' ' ' | cut -c1-300)"
+  fi
+}
+
 ensure_helper() {
   remove_container "${HELPER_NAME}"
   start_helper
@@ -1469,7 +1519,85 @@ ensure_runner() {
 
 ensure_helper
 ensure_runner
-log "both containers are up from ${IMAGE_REFERENCE}: ${HELPER_NAME} and ${RUNNER_NAME}"
+
+# "BOTH CONTAINERS ARE UP" ONLY WHEN THEY ARE (release -3, after the re-check of
+# the network change). `docker run --detach` succeeds as soon as a container is
+# made, so this line used to be printed over a service that had already failed.
+# And a running container is not proof either: on a real sandbox, with the
+# runner's port already taken, the runner's container stayed RUNNING for good —
+# its server simply never listened — while whatever had the port answered in
+# its place (1 October 2026). So each service must ANSWER AS ITSELF on its own
+# port, on its own health route — the helper's /healthz, the runner's /ok, the
+# same routes the estate's own check asks from outside — within
+# SETTLE_SECONDS. One that died is named with its last lines; one that is
+# running but does not answer as itself is named too, with what (if anything)
+# answers on its port instead.
+#
+# The question is asked with bash's own /dev/tcp and nothing else, so it needs
+# no program the sandbox might not have. It asks the sandbox's own address,
+# because both services share the sandbox's network.
+answers_as_itself() {
+  local port="$1" route="$2" expected="$3" host="${BIND}" reply=""
+  [[ "${host}" == "0.0.0.0" || "${host}" == "::" || -z "${host}" ]] && host="127.0.0.1"
+  reply="$(timeout 3 bash -c 'exec 3<>"/dev/tcp/$0/$1" || exit 1; printf "GET %s HTTP/1.0\r\nHost: %s\r\n\r\n" "$2" "$0" >&3; head -c 4096 <&3' "${host}" "${port}" "${route}" 2>/dev/null)" || true
+  WHAT_ANSWERED="$(printf '%s' "${reply}" | head -1 | tr -d '\r' | cut -c1-120)"
+  [[ -n "${reply}" && "${reply}" == *"${expected}"* ]]
+}
+
+# WAIT FOR ONE SERVICE: 0 it answers as itself, 1 its container died (and why
+# has been said), 3 it is running and does not answer as itself (said, with
+# what answers instead), 2 the engine would not say. Gives up after
+# SETTLE_SECONDS; returns as soon as it knows.
+WHAT_ANSWERED=""
+wait_until_it_answers() {
+  local what="$1" name="$2" port="$3" route="$4" expected="$5" waited=0 answer=0
+  while :; do
+    answer=0
+    container_running "${name}" || answer=$?
+    if ((answer == 1)); then
+      say_why_it_stopped "${what}" "${name}"
+      return 1
+    fi
+    if ((answer == 0)) && answers_as_itself "${port}" "${route}" "${expected}"; then
+      return 0
+    fi
+    if ((waited >= SETTLE_SECONDS)); then
+      if ((answer == 2)); then
+        log "this sandbox's own engine would not say whether ${what} (${name}) is running (${WHY_THE_ENGINE_WOULD_NOT_SAY})"
+        return 2
+      fi
+      if [[ -n "${WHAT_ANSWERED}" ]]; then
+        log "${what} (${name}) is running but, ${SETTLE_SECONDS}s after it was started, port ${port} does not answer as it: ${route} there says '${WHAT_ANSWERED}'. Something else in this sandbox has that port, so the factory cannot be reached through it. Free the port and stop and start the factory again."
+      else
+        log "${what} (${name}) is running but, ${SETTLE_SECONDS}s after it was started, nothing answers on port ${port} yet."
+      fi
+      say_why_it_stopped "${what}" "${name}" still-running
+      return 3
+    fi
+    nap 1
+    waited=$((waited + 1))
+  done
+}
+
+confirm_the_helper() {
+  wait_until_it_answers "the deploy helper" "${HELPER_NAME}" "${SIDECAR_PORT}" /healthz '"healthy"'
+}
+confirm_the_runner() {
+  wait_until_it_answers "the build runner" "${RUNNER_NAME}" "${RUNNER_PORT}" /ok '"ok":true'
+}
+
+helper_answer=0
+confirm_the_helper || helper_answer=$?
+runner_answer=0
+confirm_the_runner || runner_answer=$?
+if ((helper_answer == 0 && runner_answer == 0)); then
+  log "both containers are up from ${IMAGE_REFERENCE}: ${HELPER_NAME} answers on ${SIDECAR_PORT} and ${RUNNER_NAME} on ${RUNNER_PORT}, each as itself"
+else
+  not_up=()
+  ((helper_answer != 0)) && not_up+=("${HELPER_NAME}")
+  ((runner_answer != 0)) && not_up+=("${RUNNER_NAME}")
+  log "NOT both up: ${not_up[*]} did not come up answering as itself (the reason is above). A container that died is started again every ${RESTART_SECONDS}s, with its last lines printed each time; one that is running on a port something else has is not, because it has not died — that needs the port freed."
+fi
 
 # --- step 4: one supervisor, watching the two containers --------------------
 # A container that dies is made again from the same checked image after a short
@@ -1489,6 +1617,7 @@ watch_one() {
     return 0
   fi
   if ((answer == 1)); then
+    say_why_it_stopped "${what}" "${name}"
     log "${what} is no longer running; starting it again from ${IMAGE_REFERENCE}, the image that was checked"
     return 1
   fi
@@ -1498,7 +1627,9 @@ watch_one() {
 while ((STOPPING == 0)); do
   nap "${RESTART_SECONDS}"
   ((STOPPING == 1)) && break
-  watch_one "the deploy helper" "${HELPER_NAME}" || ensure_helper
+  # A container made again is checked the same way as at the start, so a
+  # port taken while it was down is said plainly rather than found later.
+  watch_one "the deploy helper" "${HELPER_NAME}" || { ensure_helper; confirm_the_helper || true; }
   ((STOPPING == 1)) && break
-  watch_one "the build runner" "${RUNNER_NAME}" || ensure_runner
+  watch_one "the build runner" "${RUNNER_NAME}" || { ensure_runner; confirm_the_runner || true; }
 done

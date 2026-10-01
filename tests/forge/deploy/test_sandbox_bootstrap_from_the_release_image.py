@@ -394,7 +394,32 @@ if verb == "run":
         }) + "\\n")
     (state / name).write_text("made\\n")
     (state / (name + ".running")).write_text("up\\n")
+    if name == os.environ.get("STANDIN_DIES_AT_ONCE", ""):
+        # Made, and gone a moment later, as a service whose port is taken is.
+        (state / (name + ".running")).unlink(missing_ok=True)
+        lines = ["start-up line %d of %s" % (n, name) for n in range(1, 31)]
+        lines.append("x" * 1000)
+        lines.append("OSError: [Errno 98] Address already in use")
+        (state / (name + ".logs")).write_text("\\n".join(lines) + "\\n")
+        (state / (name + ".exitcode")).write_text("1\\n")
     print("an-id-for-" + name)
+    sys.exit(0)
+
+if verb == "logs":
+    tail = None
+    if "--tail" in argv:
+        tail = int(argv[argv.index("--tail") + 1])
+    kept = state / (argv[-1] + ".logs")
+    lines = kept.read_text().splitlines() if kept.exists() else []
+    if tail is not None:
+        lines = lines[-tail:]
+    for line in lines:
+        print(line)
+    sys.exit(0)
+
+if verb == "inspect":
+    kept = state / (argv[-1] + ".exitcode")
+    print(kept.read_text().strip() if kept.exists() else "0")
     sys.exit(0)
 
 sys.exit(0)
@@ -524,6 +549,8 @@ def _settings(sandbox, **extra):
         # Recorded by the OTHER kind of engine; checked here against this one.
         "FORGE_IMAGE_IDENTITY": sandbox["identity"],
         "SANDBOX_RUNNER_RESTART_SECONDS": "1",
+        # No start-up settling wait unless a test is about it (release -3).
+        "SANDBOX_RUNNER_SETTLE_SECONDS": "0",
         # The project's declared git identity, which every start needs since
         # release -3 (item 6). A test about it takes these away or changes them.
         "GIT_AUTHOR_NAME": PROJECT_AUTHOR_NAME,
@@ -2674,3 +2701,162 @@ class TestTheChainIsFollowedExactlyAsDeepAsGitFollowsIt:
         depth_six = only_in(stores[6])
         assert git("-C", str(clone), "cat-file", "-e", depth_five).returncode == 0
         assert git("-C", str(clone), "cat-file", "-e", depth_six).returncode != 0
+
+
+# ---------------------------------------------------------------------------
+class TestAContainerThatDiesSaysWhy:
+    """A service that cannot start says so, plainly, before it is replaced.
+
+    Release -3, the re-check of the network change: on the sandbox's own
+    network a service whose port is already taken exits within moments. The
+    start-up still printed "both containers are up", and the supervisor's only
+    word was "is no longer running; starting it again" every few seconds — it
+    removed the container, and with it the one log that said why.
+    """
+
+    @staticmethod
+    def _run_until(sandbox, condition, **extra):
+        process = subprocess.Popen(
+            ["bash", str(sandbox["script"])],
+            env=_settings(sandbox, **extra),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        try:
+            for _ in range(200):
+                if condition():
+                    break
+                time.sleep(0.1)
+        finally:
+            process.terminate()
+            said = process.communicate(timeout=60)[0]
+        return said
+
+    @staticmethod
+    def _calls_starting(sandbox, verb, name):
+        return [
+            c for c in _calls(sandbox)
+            if c.startswith(verb + " ") and f"{name}" in c.split()
+            or (c.startswith(verb + " ") and f"--name {name}" in c)
+        ]
+
+    def test_one_that_dies_at_start_is_named_with_its_last_lines(self, sandbox):
+        said = self._run_until(
+            sandbox,
+            lambda: len(self._calls_starting(sandbox, "logs", "forge-sandbox-runner")) >= 2,
+            STANDIN_DIES_AT_ONCE="forge-sandbox-runner",
+            SANDBOX_RUNNER_SETTLE_SECONDS="1",
+        )
+        assert "both containers are up" not in said
+        not_up = [line for line in said.splitlines() if "NOT both up" in line]
+        assert not_up and "forge-sandbox-runner" in not_up[0]
+        assert "Address already in use" in said
+        assert "(forge-sandbox-runner) stopped with exit status 1" in said
+        # Bounded: the last twenty lines only, and no long line printed whole.
+        assert "start-up line 10 of forge-sandbox-runner" not in said
+        assert "start-up line 30 of forge-sandbox-runner" in said
+        assert "x" * 401 not in said
+        # Never the environment: only its output and its exit status are asked.
+        inspected = [c for c in _calls(sandbox) if c.startswith("inspect ")]
+        assert inspected and all("{{.State.ExitCode}}" in c for c in inspected)
+
+    def test_the_supervisor_says_why_before_it_replaces_one(self, sandbox):
+        said = self._run_until(
+            sandbox,
+            lambda: len(self._calls_starting(sandbox, "run", "forge-sandbox-runner")) >= 3,
+            STANDIN_DIES_AT_ONCE="forge-sandbox-runner",
+        )
+        calls = _calls(sandbox)
+        runs = [i for i, c in enumerate(calls) if c.startswith("run ") and "--name forge-sandbox-runner" in c]
+        reads = [i for i, c in enumerate(calls) if c.startswith("logs ") and c.endswith(" forge-sandbox-runner")]
+        assert len(runs) >= 3, calls
+        # Between every start of the dead runner and the next one, its output
+        # was read: nothing was thrown away unread.
+        for this, following in zip(runs, runs[1:]):
+            assert any(this < r < following for r in reads), calls
+        assert said.count("Address already in use") >= 2
+        assert "the build runner is no longer running" in said
+
+    @staticmethod
+    def _a_listener(answers: dict[str, str]):
+        """A small HTTP server on a free loopback port: route -> body, else 404."""
+        import http.server
+        import threading
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802 - the library's name
+                body = answers.get(self.path)
+                self.send_response(200 if body is not None else 404)
+                self.end_headers()
+                self.wfile.write((body or "<html>not this</html>").encode())
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        return server
+
+    def test_both_up_is_said_only_when_both_answer_as_themselves(self, sandbox):
+        helper = self._a_listener({"/healthz": '{"status": "healthy"}'})
+        runner = self._a_listener({"/ok": '{"ok":true}'})
+        try:
+            said = self._run_until(
+                sandbox,
+                lambda: len([c for c in _calls(sandbox) if c.startswith("ps ")]) >= 8,
+                SANDBOX_RUNNER_SETTLE_SECONDS="2",
+                SANDBOX_RUNNER_BIND="127.0.0.1",
+                SANDBOX_SIDECAR_PORT=str(helper.server_address[1]),
+                SANDBOX_RUNNER_PORT=str(runner.server_address[1]),
+            )
+        finally:
+            helper.shutdown()
+            runner.shutdown()
+        assert "both containers are up" in said
+        assert "each as itself" in said
+        assert "NOT both up" not in said
+
+    def test_a_port_something_else_has_is_named_not_called_up(self, sandbox):
+        """What the real sandbox showed: the runner kept running, never listened,
+        and whatever had its port answered in its place."""
+        helper = self._a_listener({"/healthz": '{"status": "healthy"}'})
+        squatter = self._a_listener({})
+        try:
+            def the_supervisor_has_begun():
+                # The start-up's verdict is printed before the supervisor's
+                # first look round, so one listing after the runner's output
+                # was read means the verdict has been said.
+                calls = _calls(sandbox)
+                reads = [i for i, c in enumerate(calls) if c.startswith("logs ")]
+                return bool(reads) and any(
+                    c.startswith("ps ") for c in calls[reads[0] + 1:]
+                )
+
+            said = self._run_until(
+                sandbox,
+                the_supervisor_has_begun,
+                SANDBOX_RUNNER_SETTLE_SECONDS="1",
+                SANDBOX_RUNNER_BIND="127.0.0.1",
+                SANDBOX_SIDECAR_PORT=str(helper.server_address[1]),
+                SANDBOX_RUNNER_PORT=str(squatter.server_address[1]),
+            )
+        finally:
+            helper.shutdown()
+            squatter.shutdown()
+        assert "both containers are up" not in said
+        assert "(forge-sandbox-runner) is running but" in said
+        assert "does not answer as it" in said
+        assert "404" in said
+        assert "Something else in this sandbox has that port" in said
+        not_up = [line for line in said.splitlines() if "NOT both up" in line]
+        assert not_up and "forge-sandbox-runner" in not_up[0]
+        assert "forge-sandbox-helper" not in not_up[0]
+
+    def test_the_note_no_longer_says_a_clash_fails_loudly(self):
+        flat = " ".join(BOOTSTRAP.read_text().replace("#", " ").split())
+        assert "the start fails loudly rather than quietly" not in flat
+        assert (
+            "can take a factory port while the helper or the runner is being restarted"
+            in flat
+        )
