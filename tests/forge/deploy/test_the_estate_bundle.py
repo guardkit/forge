@@ -1793,6 +1793,14 @@ class TestTheComposeFileGivesEachServiceItsOwnName:
             "write it in, so it would go into the container's own layer"
         )
 
+    def test_the_gateway_is_given_slack_planning_intake(self, rendered: str) -> None:
+        """The gateway turns a sentence typed in the planning channel by the named
+        member into a planning request. Without both settings it starts with intake
+        switched off and ignores the sentence (live switch, 1 October 2026)."""
+        gateway = _service_block(rendered, "bus-gateway")
+        assert "JARVIS_SLACK_PLANNING_CHANNEL_ID:" in gateway, gateway
+        assert "JARVIS_SLACK_PLANNING_ORIGINATOR_USER_ID:" in gateway, gateway
+
     def test_the_front_door_is_not_given_the_gateways_volume(
         self, rendered: str
     ) -> None:
