@@ -2531,3 +2531,41 @@ class TestTheRunnersEngineIsRecordedAsAKnownRisk:
         assert "before stage 4d" in flat
         assert "docker group" in flat
         assert "the boundary the factory relies on is the SANDBOX" in flat
+
+
+# ---------------------------------------------------------------------------
+class TestAFreshInstallForwardsWhatTheBootstrapNeeds:
+    """Both example env files hand in the names the release -3 bootstrap needs.
+
+    The bootstrap now refuses to start without a settings file and a declared
+    git identity. Those arrive only if the host side forwards their NAMES
+    (SANDBOX_ENV_NAMES); on 1 October they were added to the live machine by
+    hand. A fresh install starts from these two files, which must agree.
+    """
+
+    NEEDED = {
+        "FORGE_CONFIG_PATH",
+        "GIT_AUTHOR_NAME",
+        "GIT_AUTHOR_EMAIL",
+        "GIT_COMMITTER_NAME",
+        "GIT_COMMITTER_EMAIL",
+    }
+
+    @staticmethod
+    def _names(relative: str) -> set[str]:
+        root = Path(templates.__file__).resolve().parents[4]
+        for line in (root / relative).read_text().splitlines():
+            if line.startswith("SANDBOX_ENV_NAMES="):
+                return set(line.split("=", 1)[1].split())
+        raise AssertionError(f"no SANDBOX_ENV_NAMES in {relative}")
+
+    @pytest.mark.parametrize(
+        "relative", ["deploy/estate/.env.example", "deploy/compose/.env.example"]
+    )
+    def test_the_names_are_forwarded(self, relative):
+        assert self.NEEDED <= self._names(relative)
+
+    def test_the_two_files_still_agree(self):
+        assert self._names("deploy/estate/.env.example") == self._names(
+            "deploy/compose/.env.example"
+        )
