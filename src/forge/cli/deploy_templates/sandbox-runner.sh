@@ -413,13 +413,17 @@
 #                            note of a deploy command that is still running
 #     SANDBOX_DOCKER         the Docker client in here (default docker)
 #     SANDBOX_DOCKER_SOCKET  THE SANDBOX'S OWN engine socket (default
-#                            /var/run/docker.sock), bound into the helper so a
-#                            project's own deploy can run in here, which is
-#                            what the helper is for. The helper is also given
-#                            the GROUP that owns that socket in this sandbox,
-#                            because a bound socket a container's user cannot
-#                            open is no socket at all. Nothing of the machine
-#                            outside is ever bound in
+#                            /var/run/docker.sock), bound into BOTH containers:
+#                            the helper so a project's own deploy can run in
+#                            here, which is what the helper is for, and (since
+#                            release -3, 1 October 2026) the runner so a
+#                            project's own tests can start the services they
+#                            need. Each is also given the GROUP that owns that
+#                            socket in this sandbox, because a bound socket a
+#                            container's user cannot open is no socket at all.
+#                            Nothing of the machine outside is ever bound in.
+#                            Why the runner has it, and what that gives away,
+#                            is written beside the_engine_socket_for below
 #     SANDBOX_CONTAINER_ENV_NAMES
 #                            extra setting names, space or comma separated, to
 #                            hand to both containers on top of the factory's
@@ -1058,7 +1062,7 @@ export FORGE_DEPLOY_NOTES_DIR="${NOTES_ROOT}"
 # FORGE_CONFIG_PATH names one (read-only, below), the folders the clone
 # borrows its git objects from (read-only, below), the project's git identity
 # (read-only, as /etc/gitconfig, below), and the sandbox's own engine socket
-# (the helper's alone, added at its start). Every one of them is in
+# (both containers', added at each one's start). Every one of them is in
 # this sandbox. Nothing of the machine outside is bound into anything here —
 # no checkout of the factory's code, no home folder, no settings file of the
 # machine's. (The one FORGE_CONFIG_PATH names is a file IN this sandbox, and
@@ -1256,34 +1260,73 @@ fi
 # drift from this file.
 printf '%s\n' "${RUNNER_GRAPH_CONFIG}" > "${RUNNER_CONFIG_FILE}"
 
+# THE SANDBOX'S OWN ENGINE, FOR BOTH CONTAINERS (the runner since 1 October
+# 2026, release -3). Worked out afresh at every start, because a container the
+# supervisor makes again should get whatever socket and group the sandbox has
+# now. Fills ENGINE_SOCKET_ARGUMENTS for the container named.
+#
+# WHAT IS GIVEN. THE SANDBOX'S OWN engine socket, never the machine's: nothing
+# of the machine outside is bound into anything here. AND THE GROUP THAT OWNS
+# IT. Binding the socket is not enough: it is owner-and-group only, and the
+# container runs as a plain user who is in none of this sandbox's groups.
+# Without the group the socket is there, the client is there, and every call
+# answers "permission denied while trying to connect to the docker API" —
+# which is what happened the first time this was run, 24 September 2026. The
+# group added is whichever group owns the socket in this sandbox, read from
+# the socket itself; nothing else about the container changes.
+#
+# WHY THE RUNNER HAS IT TOO, AND WHAT THAT GIVES AWAY. Until release -3 only
+# the deploy helper was given the engine: its job is to run a project's own
+# deploy, and a deploy ordinarily brings containers up in here. The runner was
+# given none — not as a recorded security decision (no note anywhere gives
+# one; stage 4d simply listed the helper's need), and before stage 4d both
+# services ran as plain processes of the sandbox's own user, which could reach
+# this engine. On 1 October that gap stopped the first real feature: the
+# runner is where a build runs the project's own checks, api_test's test suite
+# starts its database as a container, and with no engine no test could run —
+# the build ran for an hour and a half and its checker verified nothing. A
+# factory that cannot run a project's own tests cannot build it, and which
+# projects' tests need containers is the project's business, not this file's.
+#
+# What the socket gives the runner, said plainly: control of THIS SANDBOX's
+# engine, which is as good as being this sandbox's administrator — it can start
+# a container that mounts any folder of the sandbox, and it can stop, replace
+# or look inside the helper. That is accepted, for these reasons:
+#   - the boundary the factory relies on is the SANDBOX (its own kernel, its own
+#     engine, its own network allow-list), not the wall between these two
+#     containers. Both already share the clone read-write, every shared folder
+#     and the same settings by name, so the runner can already change what the
+#     helper will run; the engine adds no secret it did not have;
+#   - it reaches nothing outside: it is not the machine's engine, nor the
+#     sandbox daemon's socket, and a container started through it is still
+#     inside this sandbox and under its network rules;
+#   - it restores what the runner could do before stage 4d, which is what the
+#     builds that did run in a sandbox were proven with.
+# What would change this: a sandbox shared by more than one project, or
+# anything of value in here that the runner should not reach. Neither is so.
+ENGINE_SOCKET_ARGUMENTS=()
+the_engine_socket_for() {
+  local who="$1" socket_group=""
+  ENGINE_SOCKET_ARGUMENTS=()
+  if [[ ! -S "${DOCKER_SOCKET}" ]]; then
+    log "note: there is no engine socket at ${DOCKER_SOCKET} in this sandbox, so ${who} is started without one; a project whose deploy or tests run containers will say so when it runs"
+    return 0
+  fi
+  ENGINE_SOCKET_ARGUMENTS=(--volume "${DOCKER_SOCKET}:/var/run/docker.sock")
+  socket_group="$(stat -c '%g' "${DOCKER_SOCKET}" 2>/dev/null || true)"
+  if [[ -n "${socket_group}" && "${socket_group}" =~ ^[0-9]+$ ]]; then
+    ENGINE_SOCKET_ARGUMENTS+=(--group-add "${socket_group}")
+    log "${who} is given this sandbox's engine socket and group ${socket_group}, the group that owns it; without the group the socket would be bound and unusable"
+  else
+    log "note: the group owning ${DOCKER_SOCKET} could not be read, so ${who} is started without it; anything it runs that needs containers will say permission denied if the container's user cannot reach the socket"
+  fi
+}
+
 start_helper() {
   log "starting the deploy helper from ${IMAGE_REFERENCE} on ${BIND}:${SIDECAR_PORT}"
-  local socket_mount=()
-  if [[ -S "${DOCKER_SOCKET}" ]]; then
-    # THE SANDBOX'S OWN engine, not the machine's. The helper's job is to run
-    # a project's own vetted deploy and merge scripts, and a project's deploy
-    # ordinarily brings containers up in here.
-    socket_mount=(--volume "${DOCKER_SOCKET}:/var/run/docker.sock")
-    # AND THE GROUP THAT OWNS IT. Binding the socket is not enough: it is
-    # owner-and-group only, and the container runs as a plain user who is in
-    # none of this sandbox's groups. Without this the socket is there, the
-    # client is there, and every call answers "permission denied while trying
-    # to connect to the docker API" — which is what happened the first time
-    # this was run, 24 September 2026. The group added is whichever group owns
-    # the socket in this sandbox, read from the socket itself; nothing else
-    # about the container changes, and the runner container, which is given no
-    # socket, is given no group either.
-    local socket_group
-    socket_group="$(stat -c '%g' "${DOCKER_SOCKET}" 2>/dev/null || true)"
-    if [[ -n "${socket_group}" && "${socket_group}" =~ ^[0-9]+$ ]]; then
-      socket_mount+=(--group-add "${socket_group}")
-      log "the helper is given group ${socket_group}, the group that owns this sandbox's engine socket; without it the socket would be bound and unusable"
-    else
-      log "note: the group owning ${DOCKER_SOCKET} could not be read, so the helper is started without it; a project's deploy that runs containers will say permission denied if the container's user cannot reach the socket"
-    fi
-  else
-    log "note: there is no engine socket at ${DOCKER_SOCKET} in this sandbox, so the helper is started without one; a project whose deploy runs containers will say so when it runs"
-  fi
+  # The helper's job is to run a project's own vetted deploy and merge
+  # scripts, and a project's deploy ordinarily brings containers up in here.
+  the_engine_socket_for "the deploy helper"
   "${DOCKER}" run --detach \
     --name "${HELPER_NAME}" \
     --user "${CONTAINER_USER}" \
@@ -1293,7 +1336,7 @@ start_helper() {
     --env "FORGE_DEPLOY_SIDECAR_HOST=${BIND}" \
     ${ENV_ARGUMENTS[@]+"${ENV_ARGUMENTS[@]}"} \
     "${MOUNTS[@]}" \
-    ${socket_mount[@]+"${socket_mount[@]}"} \
+    ${ENGINE_SOCKET_ARGUMENTS[@]+"${ENGINE_SOCKET_ARGUMENTS[@]}"} \
     --workdir "${REPO_ROOT}" \
     --entrypoint python \
     "${IMAGE_REFERENCE}" \
@@ -1303,6 +1346,10 @@ start_helper() {
 
 start_runner() {
   log "starting the build runner from ${IMAGE_REFERENCE} on ${BIND}:${RUNNER_PORT}"
+  # The runner is where a build runs the project's own checks, and a project's
+  # test suite may start its services as containers (see above for why the
+  # runner is given the engine, and what that gives away).
+  the_engine_socket_for "the build runner"
   "${DOCKER}" run --detach \
     --name "${RUNNER_NAME}" \
     --user "${CONTAINER_USER}" \
@@ -1310,6 +1357,7 @@ start_runner() {
     --publish "${BIND}:${RUNNER_PORT}:${RUNNER_PORT}" \
     ${ENV_ARGUMENTS[@]+"${ENV_ARGUMENTS[@]}"} \
     "${MOUNTS[@]}" \
+    ${ENGINE_SOCKET_ARGUMENTS[@]+"${ENGINE_SOCKET_ARGUMENTS[@]}"} \
     --volume "${RUNNER_CONFIG_FILE}:${RUNNER_CONFIG_IN_CONTAINER}:ro" \
     --workdir "${REPO_ROOT}" \
     --entrypoint langgraph \

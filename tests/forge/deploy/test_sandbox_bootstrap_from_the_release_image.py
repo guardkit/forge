@@ -924,9 +924,52 @@ class TestTheFoldersBothContainersShare:
         assert len(helper) == 1 and len(runner) == 1
         assert f"--volume {socket_path}:/var/run/docker.sock" in helper[0]
         assert f"--group-add {group}" in helper[0]
-        # The runner is given no socket, so it is given no group either.
-        assert "--group-add" not in runner[0]
-        assert "docker.sock" not in runner[0]
+
+    def test_the_runner_is_given_the_same_engine_socket_and_group(
+        self, sandbox, tmp_path
+    ):
+        """A project's own tests may need containers, and they run in the runner.
+
+        Release -3, item 7, found on the live day (1 October 2026): the runner
+        was started with no engine, api_test's test suite starts its database
+        as a container, so no test could run and the build's checker verified
+        nothing for an hour and a half. Until then this test asserted the
+        opposite — that the runner was given no socket — which recorded what
+        stage 4d did, not a reason for it; the reasoning for giving it now is
+        written in the bootstrap beside the_engine_socket_for.
+        """
+        socket_path = tmp_path / "an-engine.sock"
+        subprocess.run(
+            [
+                "python3",
+                "-c",
+                "import socket,sys\n"
+                "s=socket.socket(socket.AF_UNIX)\n"
+                "s.bind(sys.argv[1])\n",
+                str(socket_path),
+            ],
+            check=True,
+            timeout=30,
+        )
+        group = socket_path.stat().st_gid
+        runs = self._runs_of_a_started_bootstrap(
+            sandbox, SANDBOX_DOCKER_SOCKET=str(socket_path)
+        )
+        runner = [call for call in runs if "--name forge-sandbox-runner" in call]
+        assert len(runner) == 1
+        assert f"--volume {socket_path}:/var/run/docker.sock" in runner[0]
+        assert f"--group-add {group}" in runner[0]
+
+    def test_with_no_socket_in_the_sandbox_neither_is_given_one(
+        self, sandbox, tmp_path
+    ):
+        runs = self._runs_of_a_started_bootstrap(
+            sandbox, SANDBOX_DOCKER_SOCKET=str(tmp_path / "no-socket-here")
+        )
+        assert len(runs) == 2
+        for call in runs:
+            assert "docker.sock" not in call
+            assert "--group-add" not in call
 
     def test_a_receipts_root_that_cannot_be_made_is_refused_by_name(
         self, sandbox, tmp_path
