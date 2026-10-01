@@ -11,20 +11,60 @@ gate refused it.
 This is the fact sheet the coach is shown (design
 ``planning-coach-design-2026-09-13.md`` §4a): for each route path the request
 names, the sibling routes in the same file, whether each declares an
-authentication dependency, and what shape it returns. Deterministic —
-``git grep`` for the path's first segment, then Python's own ``ast`` for the
-file it lands in. It says only what it can prove: a file that is not Python
-is named with its routes and the sentence "whether those routes require
-authentication was not read", never a guess.
+authentication dependency, and what shape it returns. Deterministic — a
+literal search for the path's first segment, then Python's own ``ast`` for
+the file it lands in. It says only what it can prove: a file that is not
+Python is named with its routes and the sentence "whether those routes
+require authentication was not read", never a guess.
 
-The stack question, answered in one line (Rich's rule): on a non-Python
-repository this returns the sibling route literals ``git grep`` finds and
-says the authentication and shape facts were not read. It never claims
-them.
+WIDENED (1 October 2026, release -3 item 10). On 1 October the planner's
+checker let through an invented ``is_deleted`` column and its migration,
+although the repository already soft-deletes its users with ``deleted_at``.
+Routes alone could never have said so. The sheet now also names the data
+models and migrations the request's words touch:
 
-Never raises: like the inventory and the spec-words finder beside it, this
-must never be able to stop a planning run. ``None`` when there is nothing to
-say, so the dispatch is byte for byte what it is today.
+* a DATA-MODEL file is one the project declares as such, or — when it
+  declares nothing — one whose path carries a model word (``model``,
+  ``entity``, ``schema``, ``table``…) as a whole word. In a Python file the
+  classes whose name, or whose own string setting, is one of the request's
+  words are read with ``ast`` and their own fields listed exactly as written.
+  A file in any other language is named, and the sheet says its fields were
+  not read;
+* a MIGRATION file is one the project declares as such, or one whose path
+  carries a migration word. Only file names are reported — the ones whose
+  names carry one of the request's words — and how many there are.
+
+Where the project says where those live: an optional ``repository_facts:``
+block in its own ``.guardkit/config.yaml`` (the file the factory already
+reads for ``toolchain:``, ``memory:`` and ``specification:``)::
+
+    repository_facts:
+      data_models: ["src/**/models.py"]
+      migrations: ["alembic/versions"]
+
+Patterns read exactly as the ``specification: paths:`` ones do. Nothing here
+knows any framework's or tool's name; the path words are plain English.
+
+WHERE THE REPOSITORY IS READ (1 October 2026). It used to be ``git grep`` and
+a file read at the coordinator's ``repo_path``. In the containerised
+coordinator that path does not exist, and the function, built never to raise,
+quietly said nothing, so the checker ran with no facts at all. Now every read
+goes through a :class:`RepositoryReader`: :class:`LocalCheckoutReader` for a
+repository the coordinator holds itself, and the sandbox helper's read-only
+``/code`` routes for a repository that has a sandbox (built by
+:meth:`forge.planning.sidecar_git_runner.SidecarGitRunner.code_reader`). The
+driver picks the reader exactly the way its git runner routes every other
+call for that repository.
+
+SILENCE IS THE BUG. A repository that cannot be read is no longer "nothing to
+say": :func:`read_repository_facts` answers with an explicit unavailable state
+and its reason, and its :attr:`RepositoryFacts.text` — what the coach is shown
+— begins ``Repository facts unavailable:``. The driver puts the same reason
+on the card the person approves.
+
+Still never raises: a fact sheet must never be able to stop a planning run.
+``None`` text when the request has no words to look for, or the repository
+has nothing to say about them.
 """
 
 from __future__ import annotations
@@ -32,10 +72,24 @@ from __future__ import annotations
 import ast
 import re
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Protocol, Sequence
 
-__all__ = ["RouteFact", "routes_in_python_file", "what_the_repository_already_does"]
+__all__ = [
+    "DECLARATION_KEY",
+    "LocalCheckoutReader",
+    "ModelFact",
+    "RepositoryFacts",
+    "RepositoryReader",
+    "RepositoryUnreadable",
+    "RouteFact",
+    "UNAVAILABLE_PREFIX",
+    "models_in_python_file",
+    "read_repository_facts",
+    "routes_in_python_file",
+    "what_the_repository_already_does",
+]
 
 _ROUTE_PATH = re.compile(r"(?<![\w/])/(?:[A-Za-z0-9_{}-]+/)*[A-Za-z0-9_{}-]+")
 _HTTP_METHODS = frozenset({"get", "post", "put", "patch", "delete", "api_route", "route"})
@@ -69,20 +123,134 @@ def _route_paths_in(request_text: str) -> list[str]:
     return paths
 
 
-def _git_grep_files(repo_path: str, needle: str) -> list[str]:
-    try:
-        completed = subprocess.run(
-            ["git", "-c", "safe.directory=*", "-C", str(repo_path), "grep", "-l", "-F", needle],
-            capture_output=True,
-            text=True,
-            timeout=20,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return []
-    if completed.returncode != 0:
-        return []
-    return [line.strip() for line in completed.stdout.splitlines() if line.strip()]
+
+# ---------------------------------------------------------------------------
+# Reading the repository
+# ---------------------------------------------------------------------------
+
+
+class RepositoryUnreadable(Exception):
+    """The repository could not be read. The message is one plain clause
+    saying why, written for the card a person reads."""
+
+
+class RepositoryReader(Protocol):
+    """The three reads the fact sheet makes, wherever the repository is."""
+
+    #: Plain words naming where the repository is read from.
+    where: str
+
+    def list_files(self) -> list[str]:
+        """Every file the repository tracks. Raises
+        :class:`RepositoryUnreadable` when the repository cannot be read."""
+
+    def files_mentioning(self, text: str, *, ignore_case: bool = False) -> list[str]:
+        """The tracked files whose text contains ``text`` literally. Raises
+        :class:`RepositoryUnreadable` when the repository cannot be read."""
+
+    def read_text(self, path: str) -> str | None:
+        """One tracked file's text; ``None`` when that one file cannot be
+        served (too large, not text). Raises :class:`RepositoryUnreadable`
+        when the repository itself cannot be read."""
+
+
+class LocalCheckoutReader:
+    """A checkout the coordinator holds itself, read with ``git``."""
+
+    def __init__(self, repo_path: str, *, timeout_s: float = 20.0) -> None:
+        self._root = Path(str(repo_path))
+        self._timeout_s = timeout_s
+        self.where = f"the checkout at {self._root}"
+
+    def _git(self, *args: str) -> subprocess.CompletedProcess[str]:
+        if not self._root.is_dir():
+            raise RepositoryUnreadable(
+                f"there is no checkout at {self._root} where the planner runs"
+            )
+        try:
+            return subprocess.run(
+                ["git", "-c", "safe.directory=*", "-C", str(self._root), *args],
+                capture_output=True,
+                text=True,
+                timeout=self._timeout_s,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise RepositoryUnreadable(
+                f"git could not read {self.where} ({type(exc).__name__})"
+            ) from exc
+
+    def list_files(self) -> list[str]:
+        completed = self._git("ls-files", "-z")
+        if completed.returncode != 0:
+            raise RepositoryUnreadable(
+                f"git could not list {self.where}: "
+                + (completed.stderr.strip().splitlines() or ["no reason given"])[0][:200]
+            )
+        return [p for p in completed.stdout.split("\0") if p]
+
+    def files_mentioning(self, text: str, *, ignore_case: bool = False) -> list[str]:
+        args = ["grep", "-l", "-F"] + (["-i"] if ignore_case else []) + ["-e", text]
+        completed = self._git(*args)
+        # git grep answers 1 for "no match": that is an answer, not a failure.
+        if completed.returncode == 1 and not completed.stderr.strip():
+            return []
+        if completed.returncode != 0:
+            raise RepositoryUnreadable(
+                f"git could not search {self.where}: "
+                + (completed.stderr.strip().splitlines() or ["no reason given"])[0][:200]
+            )
+        return [line.strip() for line in completed.stdout.splitlines() if line.strip()]
+
+    def read_text(self, path: str) -> str | None:
+        if not self._root.is_dir():
+            raise RepositoryUnreadable(
+                f"there is no checkout at {self._root} where the planner runs"
+            )
+        try:
+            data = (self._root / path).read_bytes()
+        except OSError:
+            return None
+        if len(data) > _MAX_READ_BYTES or b"\0" in data[:8192]:
+            return None
+        return data.decode("utf-8", errors="replace")
+
+
+# ---------------------------------------------------------------------------
+# The answer
+# ---------------------------------------------------------------------------
+
+#: How the coach's sheet begins when the repository could not be read. The
+#: card line, the receipt and the coach all carry the same reason.
+UNAVAILABLE_PREFIX: str = "Repository facts unavailable: "
+
+#: What follows the reason on the coach's sheet. Absence of facts is not a
+#: fact: a reader must not take "nothing said" as "nothing there".
+_UNAVAILABLE_TAIL: str = (
+    " Nothing on this sheet says what the repository already has, and that "
+    "is not evidence that it has nothing: do not add tables, columns, routes "
+    "or files the request does not name on the strength of this silence."
+)
+
+
+@dataclass(frozen=True)
+class RepositoryFacts:
+    """The fact sheet, or the plain reason there is none.
+
+    ``sheet`` is ``None`` when there was nothing to say. ``unavailable`` is the
+    reason the repository could not be read, and is ``None`` when it was.
+    """
+
+    sheet: str | None
+    unavailable: str | None = None
+    where: str = ""
+
+    @property
+    def text(self) -> str | None:
+        """What the coach and the deterministic reviewers are given."""
+        if self.unavailable:
+            return f"{UNAVAILABLE_PREFIX}{self.unavailable}.{_UNAVAILABLE_TAIL}"
+        return self.sheet
 
 
 #: Extensions that are documentation or configuration, never a route table.
@@ -220,50 +388,442 @@ def _sentences_for(file: str, facts: list[RouteFact]) -> str:
     return " ".join(parts)
 
 
-def what_the_repository_already_does(repo_path: str, request_text: str) -> str | None:
-    """The fact sheet, or ``None`` when the request names no route the
-    repository has anything to say about."""
+
+
+# ---------------------------------------------------------------------------
+# The words a request uses
+# ---------------------------------------------------------------------------
+
+_WORD = re.compile(r"[A-Za-z][A-Za-z0-9_]{2,}")
+
+#: Words that say nothing about WHAT the repository holds: the request's
+#: grammar and the vocabulary of asking for an endpoint. A model named after
+#: one of these would still be a true fact; leaving them out only keeps the
+#: search short.
+_STOP_WORDS = frozenset(
+    {
+        "the", "and", "for", "that", "this", "with", "from", "into", "onto",
+        "each", "per", "all", "any", "are", "was", "were", "has", "have",
+        "had", "not", "its", "their", "them", "they", "then", "than", "when",
+        "which", "who", "what", "where", "how", "why", "should", "would",
+        "could", "can", "will", "shall", "must", "may", "might", "new",
+        "add", "adds", "get", "post", "put", "patch", "make", "use", "using",
+        "only", "also", "last", "first", "oldest", "newest", "one", "two",
+        "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+        "endpoint", "endpoints", "route", "routes", "api", "return",
+        "returns", "returned", "returning", "give", "gives", "show", "shows",
+        "list", "lists", "number", "count", "please", "want", "need", "our",
+        "your", "you", "there", "here", "about", "like", "such", "other",
+        "same", "some", "more", "most", "less", "least", "very", "just",
+        "but", "nor", "yet", "both", "either", "neither", "via", "over",
+        "under", "after", "before", "between", "within", "without", "http",
+        "https", "json", "response", "request", "field", "fields",
+    }
+)
+
+_MAX_REQUEST_WORDS = 20
+
+
+def _request_words(request_text: str) -> list[str]:
+    """The request's content words, lower case, in order, without repeats."""
+    words: list[str] = []
+    for match in _WORD.findall(request_text or ""):
+        for part in re.split(r"_+", match.lower()):
+            if len(part) >= 3 and part not in _STOP_WORDS and part not in words:
+                words.append(part)
+    return words[:_MAX_REQUEST_WORDS]
+
+
+def _forms(word: str) -> set[str]:
+    """A word, and its plain singular and plural, so ``users`` finds ``User``
+    and ``user`` finds ``users``. Spelling only — no dictionary, no guess."""
+    word = word.lower()
+    forms = {word, word + "s"}
+    if word.endswith("ies") and len(word) > 4:
+        forms.add(word[:-3] + "y")
+    elif word.endswith(("ses", "xes", "ches", "shes")) and len(word) > 4:
+        forms.add(word[:-2])
+    elif word.endswith("s") and not word.endswith("ss") and len(word) > 3:
+        forms.add(word[:-1])
+    if word.endswith("y") and len(word) > 3:
+        forms.add(word[:-1] + "ies")
+    return forms
+
+
+def _path_words(path: str) -> set[str]:
+    return {word for word in re.split(r"[^a-z0-9]+", path.lower()) if word}
+
+
+# ---------------------------------------------------------------------------
+# Data models and migrations
+# ---------------------------------------------------------------------------
+
+#: Whole path words that name a file as a data model, best first. Plain
+#: English, the same in every stack.
+#: ("table" is left out on purpose: it is too often a plain word in a file
+#: name — ``add-deleted-at-column-to-users-table.feature`` — to name a model.)
+_MODEL_WORDS_FIRST = frozenset({"model", "models", "entity", "entities", "orm"})
+_MODEL_WORDS_THEN = frozenset({"schema", "schemas"})
+#: Whole path words that name a file as a migration.
+_MIGRATION_WORDS = frozenset({"migration", "migrations", "migrate"})
+#: Path words that name a file as a test or a fixture — never the model itself.
+_TEST_WORDS = frozenset({"test", "tests", "spec", "specs", "fixture", "fixtures", "mock", "mocks"})
+#: A migration may be written in a data format; only prose is ruled out.
+_PROSE = (".md", ".markdown", ".rst", ".txt", ".adoc", ".log")
+
+_MAX_MODEL_FILES = 5
+_MAX_MODEL_CLASSES = 6
+_MAX_FIELDS_PER_CLASS = 40
+_MAX_FIELD_CHARS = 110
+_MAX_MIGRATION_NAMES = 10
+_MAX_SHEET_CHARS = 6000
+_MAX_READ_BYTES = 262_144
+_MAX_NOUN_SEARCHES = 2
+
+#: Where a project declares its own data-model and migration paths: the file
+#: it already declares its toolchain, memory and specification in.
+DECLARATION_KEY = "repository_facts"
+
+
+@dataclass(frozen=True)
+class ModelFact:
+    """One data-model class, as its own body writes it."""
+
+    name: str
+    bases: tuple[str, ...]
+    settings: tuple[str, ...]
+    fields: tuple[str, ...]
+
+
+def _one_line(node: ast.AST) -> str:
+    text = " ".join(ast.unparse(node).split())
+    return text if len(text) <= _MAX_FIELD_CHARS else text[: _MAX_FIELD_CHARS - 1] + "…"
+
+
+def models_in_python_file(source: str, words: Sequence[str]) -> list[ModelFact]:
+    """The classes in ``source`` that the request's ``words`` name.
+
+    A class is named when its own name, or a string its own body sets (a
+    table or collection name, whatever the framework calls it), is one of the
+    words in singular or plural. Its fields are the assignments written in
+    its own body, verbatim; methods and inherited fields are not listed.
+    """
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return []
+    wanted: set[str] = set()
+    for word in words:
+        wanted |= _forms(word)
+    found: list[ModelFact] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ClassDef):
+            continue
+        settings: list[str] = []
+        fields: list[str] = []
+        named = node.name.lower() in wanted
+        for stmt in node.body:
+            if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+                target = stmt.target.id
+                value = stmt.value
+            elif (
+                isinstance(stmt, ast.Assign)
+                and len(stmt.targets) == 1
+                and isinstance(stmt.targets[0], ast.Name)
+            ):
+                target = stmt.targets[0].id
+                value = stmt.value
+            else:
+                continue
+            if target.startswith("__") and target.endswith("__"):
+                if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                    settings.append(_one_line(stmt))
+                    if value.value.lower() in wanted:
+                        named = True
+                continue
+            if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                if value.value.lower() in wanted:
+                    named = True
+            fields.append(_one_line(stmt))
+        if named and fields:
+            found.append(
+                ModelFact(
+                    name=node.name,
+                    bases=tuple(_one_line(base) for base in node.bases),
+                    settings=tuple(settings[:5]),
+                    fields=tuple(fields[:_MAX_FIELDS_PER_CLASS]),
+                )
+            )
+            if len(found) >= _MAX_MODEL_CLASSES:
+                break
+    return found
+
+
+def _model_sentence(file: str, fact: ModelFact) -> str:
+    head = f"`{file}` declares class {fact.name}"
+    if fact.bases:
+        head += f"({', '.join(fact.bases)})"
+    parts = [head + "."]
+    if fact.settings:
+        parts.append("Its own settings: " + "; ".join(fact.settings) + ".")
+    parts.append(
+        "The fields written in its own body: " + "; ".join(fact.fields) + "."
+    )
+    parts.append("Fields it inherits were not read.")
+    return " ".join(parts)
+
+
+def _declared_paths(
+    reader: RepositoryReader, tracked: Sequence[str]
+) -> tuple[tuple[str, ...] | None, tuple[str, ...] | None, str | None]:
+    """``(data_models, migrations, note)`` from the project's own declaration.
+
+    ``None`` for a list the project does not declare. ``note`` is one sentence
+    when the declaration is there and could not be read.
+    """
+    from forge.planning.declared_memory import DECLARATION_PATH, _parse
+
+    if DECLARATION_PATH not in set(tracked):
+        return None, None, None
+    text = reader.read_text(DECLARATION_PATH)
+    if text is None:
+        return None, None, None
+    data, why = _parse(text)
+    if data is None:
+        return None, None, (
+            f"The project's `{DECLARATION_PATH}` could not be read ({why}), so "
+            "data-model and migration files were found by their path words."
+        )
+    block = data.get(DECLARATION_KEY)
+    if block is None:
+        return None, None, None
+    if not isinstance(block, dict):
+        return None, None, (
+            f"The project's `{DECLARATION_PATH}` has a `{DECLARATION_KEY}` "
+            "block that is not a mapping, so data-model and migration files "
+            "were found by their path words."
+        )
+
+    def _patterns(key: str) -> tuple[str, ...] | None:
+        value = block.get(key)
+        if isinstance(value, str) and value.strip():
+            return (value.strip(),)
+        if isinstance(value, list):
+            cleaned = tuple(str(v).strip() for v in value if isinstance(v, str) and v.strip())
+            return cleaned or None
+        return None
+
+    return _patterns("data_models"), _patterns("migrations"), None
+
+
+def _matches(path: str, patterns: tuple[str, ...]) -> bool:
+    from forge.pipeline.merge_ready_checkpoint import path_is_specification
+
+    # The one place a path is compared with a project's declared patterns;
+    # the specification fence reads its own declaration through it.
+    return path_is_specification(path, patterns)
+
+
+def _model_sheets(
+    reader: RepositoryReader,
+    tracked: Sequence[str],
+    declared: tuple[str, ...] | None,
+    words: Sequence[str],
+    route_nouns: Sequence[str],
+) -> list[str]:
+    if declared is not None:
+        candidates = [f for f in tracked if _matches(f, declared)]
+    else:
+        candidates = []
+        for f in tracked:
+            if f.lower().endswith(_NOT_SOURCE):
+                continue
+            pw = _path_words(f)
+            if pw & _TEST_WORDS:
+                continue
+            if pw & (_MODEL_WORDS_FIRST | _MODEL_WORDS_THEN):
+                candidates.append(f)
+    if not candidates:
+        return []
+    all_forms: set[str] = set()
+    for word in words:
+        all_forms |= _forms(word)
+    route_forms: set[str] = set()
+    for noun in route_nouns:
+        route_forms |= _forms(noun)
+    mentioned: dict[str, str] = {}
+    for noun in list(route_nouns)[:_MAX_NOUN_SEARCHES]:
+        for f in reader.files_mentioning(noun, ignore_case=True):
+            mentioned.setdefault(f, noun)
+
+    def _rank(f: str) -> tuple[int, int, str]:
+        pw = _path_words(f)
+        if pw & route_forms:
+            first = 0
+        elif pw & all_forms:
+            first = 1
+        elif f in mentioned:
+            first = 2
+        else:
+            first = 3
+        return (first, 0 if pw & _MODEL_WORDS_FIRST else 1, f)
+
+    sheets: list[str] = []
+    for f in sorted(candidates, key=_rank)[:_MAX_MODEL_FILES]:
+        if f.endswith((".py", ".pyi")):
+            source = reader.read_text(f)
+            if source is None:
+                continue
+            for fact in models_in_python_file(source, words):
+                sheets.append(_model_sentence(f, fact))
+            continue
+        pw = _path_words(f)
+        named_by_path = sorted(pw & all_forms)
+        if named_by_path:
+            why = f"its path names {', '.join(named_by_path)}"
+        elif f in mentioned:
+            why = f"it mentions {mentioned[f]}"
+        else:
+            continue
+        sheets.append(
+            f"`{f}` looks like a data-model file by its path, and {why}. It is "
+            "not Python, so what it declares was not read."
+        )
+    return sheets
+
+
+def _migration_sheet(
+    tracked: Sequence[str], declared: tuple[str, ...] | None, words: Sequence[str]
+) -> str | None:
+    if declared is not None:
+        migrations = [f for f in tracked if _matches(f, declared)]
+        if not migrations:
+            return (
+                "The project declares its migrations at "
+                + ", ".join(f"`{p}`" for p in declared)
+                + ", and no tracked file is there."
+            )
+        how = "declared by the project at " + ", ".join(f"`{p}`" for p in declared)
+    else:
+        migrations = [
+            f
+            for f in tracked
+            if not f.lower().endswith(_PROSE)
+            and _path_words(f) & _MIGRATION_WORDS
+            and not _path_words(f) & _TEST_WORDS
+        ]
+        if not migrations:
+            return None
+        folders = sorted({f.rsplit("/", 1)[0] if "/" in f else "." for f in migrations})
+        how = "found by their path, under " + ", ".join(f"`{d}`" for d in folders[:3])
+        if len(folders) > 3:
+            how += f" and {len(folders) - 3} more folder(s)"
+    all_forms: set[str] = set()
+    for word in words:
+        all_forms |= _forms(word)
+    named = sorted(f for f in migrations if _path_words(f.rsplit("/", 1)[-1]) & all_forms)
+    sentence = f"The repository has {len(migrations)} migration file(s), {how}."
+    if named:
+        shown = ", ".join(f"`{f}`" for f in named[:_MAX_MIGRATION_NAMES])
+        more = f" and {len(named) - _MAX_MIGRATION_NAMES} more" if len(named) > _MAX_MIGRATION_NAMES else ""
+        sentence += f" Those whose names carry the request's words: {shown}{more}."
+    else:
+        sentence += " None of their names carries the request's words."
+    sentence += " Their contents were not read."
+    return sentence
+
+
+# ---------------------------------------------------------------------------
+# The sheet
+# ---------------------------------------------------------------------------
+
+
+def _route_sheets(reader: RepositoryReader, paths: Sequence[str]) -> list[str]:
+    sheets: list[str] = []
+    seen_files: set[str] = set()
+    for path in paths:
+        first = "/" + path.lstrip("/").split("/")[0]
+        if len(first) < 3:
+            continue
+        files = [f for f in reader.files_mentioning(f'"{first}') if _looks_like_routes(f)]
+        if not files:
+            # Same filter on the wider search: a documentation file that
+            # mentions the path is not a file that defines it.
+            files = [
+                f for f in reader.files_mentioning(f'"{first}/') if _looks_like_routes(f)
+            ]
+        for file in files[:_MAX_FILES]:
+            if file in seen_files:
+                continue
+            seen_files.add(file)
+            source = reader.read_text(file)
+            if source is None:
+                continue
+            if file.endswith(".py"):
+                facts = routes_in_python_file(source)
+                if facts:
+                    sheets.append(_sentences_for(file, facts))
+            else:
+                literals = sorted(
+                    {m for m in _ROUTE_PATH.findall(source) if m.startswith(first)}
+                )[:_MAX_ROUTES_PER_FILE]
+                if literals:
+                    sheets.append(
+                        f"`{file}` mentions {', '.join(literals)}. This file is not "
+                        "Python, so whether those routes require authentication "
+                        "and what they return was not read."
+                    )
+    return sheets
+
+
+def _bounded(text: str) -> str:
+    if len(text) <= _MAX_SHEET_CHARS:
+        return text
+    return text[: _MAX_SHEET_CHARS - 60].rstrip() + f"\n(The sheet was cut at {_MAX_SHEET_CHARS} characters.)"
+
+
+def read_repository_facts(reader: RepositoryReader, request_text: str) -> RepositoryFacts:
+    """The fact sheet for ``request_text``, read through ``reader``.
+
+    Never raises. A repository that cannot be read answers with
+    :attr:`RepositoryFacts.unavailable` set to the reason, never with an
+    empty sheet that looks like "nothing there".
+    """
+    where = str(getattr(reader, "where", "") or "the repository")
     try:
         paths = _route_paths_in(request_text)
-        if not paths:
-            return None
-        root = Path(repo_path)
-        sheets: list[str] = []
-        seen_files: set[str] = set()
+        words = _request_words(request_text)
+        if not paths and not words:
+            return RepositoryFacts(None, where=where)
+        tracked = reader.list_files()
+        sheets = _route_sheets(reader, paths)
+        route_nouns: list[str] = []
         for path in paths:
-            first = "/" + path.lstrip("/").split("/")[0]
-            if len(first) < 3:
-                continue
-            files = [f for f in _git_grep_files(str(root), f'"{first}') if _looks_like_routes(f)]
-            if not files:
-                # Same filter on the wider search: a documentation file that
-                # mentions the path is not a file that defines it.
-                files = [
-                    f for f in _git_grep_files(str(root), f'"{first}/')
-                    if _looks_like_routes(f)
-                ]
-            for file in files[:_MAX_FILES]:
-                if file in seen_files:
-                    continue
-                seen_files.add(file)
-                try:
-                    source = (root / file).read_text(encoding="utf-8", errors="replace")
-                except OSError:
-                    continue
-                if file.endswith(".py"):
-                    facts = routes_in_python_file(source)
-                    if facts:
-                        sheets.append(_sentences_for(file, facts))
-                else:
-                    literals = sorted(
-                        {m for m in _ROUTE_PATH.findall(source) if m.startswith(first)}
-                    )[:_MAX_ROUTES_PER_FILE]
-                    if literals:
-                        sheets.append(
-                            f"`{file}` mentions {', '.join(literals)}. This file is not "
-                            "Python, so whether those routes require authentication "
-                            "and what they return was not read."
-                        )
-        return "\n".join(sheets) if sheets else None
-    except Exception:  # noqa: BLE001 — a fact sheet must never stop a planning run
-        return None
+            noun = path.lstrip("/").split("/")[0].lower()
+            if re.search(r"[a-z]", noun) and "{" not in noun and noun not in route_nouns:
+                route_nouns.append(noun)
+        all_words = list(dict.fromkeys([*route_nouns, *words]))
+        models, migrations, note = _declared_paths(reader, tracked)
+        if note:
+            sheets.append(note)
+        sheets.extend(_model_sheets(reader, tracked, models, all_words, route_nouns))
+        migration = _migration_sheet(tracked, migrations, all_words)
+        if migration:
+            sheets.append(migration)
+        return RepositoryFacts(_bounded("\n".join(sheets)) if sheets else None, where=where)
+    except RepositoryUnreadable as exc:
+        return RepositoryFacts(None, unavailable=str(exc) or f"{where} could not be read", where=where)
+    except Exception as exc:  # noqa: BLE001 — a fact sheet must never stop a planning run
+        # Even a fault in this reader is said, never swallowed into silence.
+        return RepositoryFacts(
+            None,
+            unavailable=f"reading {where} failed ({type(exc).__name__}: {str(exc)[:160]})",
+            where=where,
+        )
+
+
+def what_the_repository_already_does(repo_path: str, request_text: str) -> str | None:
+    """The coach's sheet for a checkout the coordinator holds itself: the
+    facts, the unavailable sentence when the checkout cannot be read, or
+    ``None`` when there is nothing to say."""
+    return read_repository_facts(LocalCheckoutReader(repo_path), request_text).text

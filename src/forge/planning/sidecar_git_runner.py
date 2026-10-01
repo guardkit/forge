@@ -62,6 +62,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "CLOSURE_REFUSED_SENTENCE",
     "RepoRoutedGitRunner",
+    "SidecarCodeReader",
     "SidecarGitOpResult",
     "SidecarGitRunner",
 ]
@@ -119,6 +120,95 @@ def _urllib_post(url: str, body: dict[str, Any], timeout: float) -> tuple[int, A
     return status, decoded
 
 
+#: How long one read of the code door may take for the planner's fact sheet.
+#: Shorter than the git reads: a sheet is a dozen small reads, and a helper
+#: that does not answer should be named on the card quickly, not after an hour.
+_DEFAULT_CODE_READ_TIMEOUT_S: float = 30.0
+
+
+class SidecarCodeReader:
+    """The planner's fact sheet reading a sandboxed repository through the
+    helper's read-only code door (``/code/list-files``, ``/code/search``,
+    ``/code/read-file``), on the factory's own clone inside the sandbox.
+
+    A :class:`~forge.planning.repository_facts.RepositoryReader`. It rides
+    the same address, repository key and HTTP seam as the
+    :class:`SidecarGitRunner` that builds it (release -3 item 10, 1 October
+    2026): before this, the sheet read the coordinator's own ``repo_path``,
+    which in the containerised coordinator does not exist. A helper that
+    cannot be reached, or that refuses a listing or a search, raises
+    :class:`~forge.planning.repository_facts.RepositoryUnreadable` with the
+    reason, which the sheet turns into its explicit unavailable state. One
+    file the door will not serve (too large, not text) is ``None``.
+    """
+
+    def __init__(
+        self,
+        base_url: str,
+        *,
+        repo: str,
+        post: HttpPost = _urllib_post,
+        timeout_s: float = _DEFAULT_CODE_READ_TIMEOUT_S,
+    ) -> None:
+        self._base_url = base_url.rstrip("/")
+        self._repo = repo
+        self._post = post
+        self._timeout_s = timeout_s
+        self.where = f"{repo} through the sandbox helper at {self._base_url}"
+
+    def _answer(self, route: str, body: dict[str, Any]) -> tuple[int, Any]:
+        from forge.planning.repository_facts import RepositoryUnreadable
+
+        url = f"{self._base_url}{route}"
+        try:
+            return self._post(url, {"repo": self._repo, **body}, self._timeout_s)
+        except Exception as exc:  # noqa: BLE001 — transport boundary
+            raise RepositoryUnreadable(
+                f"the sandbox helper at {self._base_url} could not be reached "
+                f"for {route} ({type(exc).__name__}: {str(exc)[:160]})"
+            ) from exc
+
+    def _refused(self, route: str, status: int, decoded: Any) -> Exception:
+        from forge.planning.repository_facts import RepositoryUnreadable
+
+        error = decoded.get("error") if isinstance(decoded, dict) else decoded
+        return RepositoryUnreadable(
+            f"the sandbox helper at {self._base_url} answered {status} to "
+            f"{route} for {self._repo}: {str(error)[:200]}"
+        )
+
+    def list_files(self) -> list[str]:
+        route = "/code/list-files"
+        status, decoded = self._answer(route, {})
+        if status != 200 or not isinstance(decoded, dict):
+            raise self._refused(route, status, decoded)
+        return [str(path) for path in decoded.get("files") or []]
+
+    def files_mentioning(self, text: str, *, ignore_case: bool = False) -> list[str]:
+        route = "/code/search"
+        status, decoded = self._answer(
+            route,
+            {"pattern": text, "fixed_string": True, "case_insensitive": bool(ignore_case)},
+        )
+        if status != 200 or not isinstance(decoded, dict):
+            raise self._refused(route, status, decoded)
+        found: list[str] = []
+        for match in decoded.get("matches") or []:
+            path = str((match or {}).get("path") or "")
+            if path and path not in found:
+                found.append(path)
+        return found
+
+    def read_text(self, path: str) -> str | None:
+        status, decoded = self._answer("/code/read-file", {"path": path})
+        if status == 200 and isinstance(decoded, dict) and not decoded.get("partial"):
+            content = decoded.get("content")
+            return content if isinstance(content, str) else None
+        if 400 <= status < 500:
+            return None  # this one file is not served; the repository still is
+        raise self._refused("/code/read-file", status, decoded)
+
+
 class SidecarGitRunner:
     """The :class:`~forge.planning.handoff.GitRunner` protocol over the
     sandbox sidecar's git routes, for ONE repository.
@@ -161,6 +251,11 @@ class SidecarGitRunner:
     def supports_declared_checks(self) -> bool:
         """This runner takes the declared form, never a closure."""
         return True
+
+    def code_reader(self) -> SidecarCodeReader:
+        """A reader of this repository's tracked files through the helper's
+        read-only code door — what the planner's fact sheet reads."""
+        return SidecarCodeReader(self._base_url, repo=self._repo, post=self._post)
 
     # -- the wire ----------------------------------------------------------
 
