@@ -1293,22 +1293,36 @@ printf '%s\n' "${RUNNER_GRAPH_CONFIG}" > "${RUNNER_CONFIG_FILE}"
 # factory that cannot run a project's own tests cannot build it, and which
 # projects' tests need containers is the project's business, not this file's.
 #
-# What the socket gives the runner, said plainly: control of THIS SANDBOX's
-# engine, which is as good as being this sandbox's administrator — it can start
-# a container that mounts any folder of the sandbox, and it can stop, replace
-# or look inside the helper. That is accepted, for these reasons:
-#   - the boundary the factory relies on is the SANDBOX (its own kernel, its own
-#     engine, its own network allow-list), not the wall between these two
-#     containers. Both already share the clone read-write, every shared folder
-#     and the same settings by name, so the runner can already change what the
-#     helper will run; the engine adds no secret it did not have;
-#   - it reaches nothing outside: it is not the machine's engine, nor the
-#     sandbox daemon's socket, and a container started through it is still
-#     inside this sandbox and under its network rules;
-#   - it restores what the runner could do before stage 4d, which is what the
-#     builds that did run in a sandbox were proven with.
-# What would change this: a sandbox shared by more than one project, or
-# anything of value in here that the runner should not reach. Neither is so.
+# What the socket gives the runner, said plainly (rewritten after the
+# independent check of the first release -3 template, which found the first
+# version of this note overstated the case). The socket is control of THIS
+# SANDBOX's engine, which is as good as being this sandbox's administrator.
+# Code a build runs — the project's tests, and the model-written code they
+# exercise — can start a container that mounts any folder of the sandbox, can
+# stop, replace or look inside the helper, and can STOP OR REPLACE THE
+# PROJECT'S OWN DEPLOYMENT running in this same engine, without the merge word
+# that is the only thing meant to change it. Before this, the runner could not
+# do that: the helper reads the deploy settings it acts on at the commit the
+# work was recorded as starting from, not from the shared working copy, so the
+# runner's write access to the clone did not reach the deployment. The socket
+# does.
+#
+# It is accepted, as a KNOWN RISK that the coordinator records in the plan of
+# record, for these reasons and no others:
+#   - it restores the position before stage 4d, when the runner ran as the
+#     sandbox's own user, who is in the sandbox's docker group (checked on a
+#     real sandbox on 1 October 2026: uid 1000, groups include docker) and
+#     could do all of the above;
+#   - the boundary the factory relies on is the SANDBOX — its own kernel, its
+#     own engine, its own network allow-list — and not the wall between these
+#     two containers. The socket reaches nothing outside: not the machine's
+#     engine, not the sandbox daemon's socket, and a container started through
+#     it is still inside this sandbox and under its network rules;
+#   - without it a project whose tests need containers cannot be built at all.
+# What would change this: a sandbox shared by more than one project, or a
+# deployment in here that must be protected from the build. The way to close
+# the deployment risk is to take the deployment out of the build's engine, not
+# to take the engine away from the tests.
 ENGINE_SOCKET_ARGUMENTS=()
 the_engine_socket_for() {
   local who="$1" socket_group=""
