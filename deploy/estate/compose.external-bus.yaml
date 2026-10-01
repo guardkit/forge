@@ -102,6 +102,15 @@ services:
       - factory
       - retained-bus
 
+  # The watch asks the bus's monitoring page (BUS_MONITORING_ADDRESS, nats:8222)
+  # who is connected, so it must be on the bus's network too. Without this it
+  # cannot resolve the bus, calls the bus connection unknown and posts an alarm on
+  # every look (seen on the live switch, 1 October 2026).
+  gateway-watch:
+    networks:
+      - factory
+      - retained-bus
+
 networks:
   # THE RETAINED BUS'S OWN NETWORK, DECLARED AS ONE THAT ALREADY EXISTS.
   #
