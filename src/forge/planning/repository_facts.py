@@ -40,7 +40,7 @@ reads for ``toolchain:``, ``memory:`` and ``specification:``)::
 
     repository_facts:
       data_models: ["src/**/models.py"]
-      migrations: ["alembic/versions"]
+      migrations: ["db/changes"]
 
 Patterns read exactly as the ``specification: paths:`` ones do. Nothing here
 knows any framework's or tool's name; the path words are plain English.
@@ -116,11 +116,18 @@ class RouteFact:
         return f"RouteFact({self.method} {self.path}, auth={self.auth!r}, returns={self.returns!r})"
 
 
+#: How many of the request's route paths the sheet looks at. A sentence
+#: names one or two; past this a pasted list would only cost searches.
+_MAX_ROUTE_PATHS = 3
+
+
 def _route_paths_in(request_text: str) -> list[str]:
     paths: list[str] = []
     for match in _ROUTE_PATH.findall(request_text or ""):
         if len(match) > 3 and re.search(r"[A-Za-z]", match) and match not in paths:
             paths.append(match)
+            if len(paths) >= _MAX_ROUTE_PATHS:
+                break
     return paths
 
 
@@ -514,6 +521,13 @@ _MAX_FIELDS_PER_CLASS = 40
 _MAX_FIELD_CHARS = 110
 _MAX_MIGRATION_NAMES = 10
 _MAX_SHEET_CHARS = 6000
+#: Each section's share of the sheet, so one long section can never push
+#: another out: the routes cannot crowd out the models that would have shown
+#: ``deleted_at``. They add up to the whole.
+_ROUTE_SECTION_CHARS = 2400
+_MODEL_SECTION_CHARS = 2400
+_MIGRATION_SECTION_CHARS = 600
+_NOTE_SECTION_CHARS = 600
 _MAX_READ_BYTES = 262_144
 _MAX_NOUN_SEARCHES = 2
 
@@ -667,13 +681,22 @@ def _model_sheets(
     declared: tuple[str, ...] | None,
     words: Sequence[str],
     route_nouns: Sequence[str],
+    test_folders: tuple[str, ...] = (),
 ) -> list[str]:
     if declared is not None:
         candidates = [f for f in tracked if _matches(f, declared)]
+        if not candidates:
+            return [
+                "The project declares its data models at "
+                + ", ".join(f"`{p}`" for p in declared)
+                + ", and no tracked file is there, so no model was read."
+            ]
     else:
         candidates = []
         for f in tracked:
             if f.lower().endswith(_NOT_SOURCE):
+                continue
+            if f.startswith(test_folders):
                 continue
             pw = _path_words(f)
             if pw & _TEST_WORDS:
@@ -775,20 +798,30 @@ def _migration_sheet(
 # ---------------------------------------------------------------------------
 
 
-def _route_sheets(reader: RepositoryReader, paths: Sequence[str]) -> list[str]:
+def _route_sheets(
+    reader: RepositoryReader, paths: Sequence[str], test_folders: tuple[str, ...] = ()
+) -> list[str]:
+    """Route facts for the request's paths. One search per first segment —
+    ``/users/a`` and ``/users/b`` are the same search — and never a file
+    in the repository's own test folders, which mention routes without
+    defining them."""
+
+    def _candidate(f: str) -> bool:
+        return _looks_like_routes(f) and not f.startswith(test_folders)
+
     sheets: list[str] = []
     seen_files: set[str] = set()
+    seen_firsts: set[str] = set()
     for path in paths:
         first = "/" + path.lstrip("/").split("/")[0]
-        if len(first) < 3:
+        if len(first) < 3 or first in seen_firsts:
             continue
-        files = [f for f in reader.files_mentioning(f'"{first}') if _looks_like_routes(f)]
+        seen_firsts.add(first)
+        files = [f for f in reader.files_mentioning(f'"{first}') if _candidate(f)]
         if not files:
             # Same filter on the wider search: a documentation file that
             # mentions the path is not a file that defines it.
-            files = [
-                f for f in reader.files_mentioning(f'"{first}/') if _looks_like_routes(f)
-            ]
+            files = [f for f in reader.files_mentioning(f'"{first}/') if _candidate(f)]
         for file in files[:_MAX_FILES]:
             if file in seen_files:
                 continue
@@ -813,7 +846,42 @@ def _route_sheets(reader: RepositoryReader, paths: Sequence[str]) -> list[str]:
     return sheets
 
 
+def _test_folders(tracked: Sequence[str]) -> tuple[str, ...]:
+    """The repository's own test folders, found by the factory's existing
+    test-root discovery run over the listing — never a list of names here."""
+    try:
+        from forge.planning.target_terminal_tools import (
+            discover_test_roots_from_listing,
+            folders_holding_tests,
+        )
+
+        return folders_holding_tests(discover_test_roots_from_listing(tracked))
+    except Exception:  # noqa: BLE001 — a fact sheet must never stop a planning run
+        return ()
+
+
+def _section(lines: Sequence[str], cap: int, what: str) -> str:
+    """``lines`` joined, held to ``cap`` characters by whole lines; what was
+    left out is said, never silently dropped."""
+    kept: list[str] = []
+    used = 0
+    for index, line in enumerate(lines):
+        extra = len(line) + (1 if kept else 0)
+        if used + extra > cap - 120:
+            left = len(lines) - index
+            if not kept:
+                kept.append(line[: cap - 140].rstrip() + "…")
+                left -= 1
+            if left:
+                kept.append(f"({left} more line(s) about {what} were left out to keep the sheet short.)")
+            break
+        kept.append(line)
+        used += extra
+    return "\n".join(kept)
+
+
 def _bounded(text: str) -> str:
+    """The last wall: the sections' own caps add up to this already."""
     if len(text) <= _MAX_SHEET_CHARS:
         return text
     return text[: _MAX_SHEET_CHARS - 60].rstrip() + f"\n(The sheet was cut at {_MAX_SHEET_CHARS} characters.)"
@@ -833,7 +901,8 @@ def read_repository_facts(reader: RepositoryReader, request_text: str) -> Reposi
         if not paths and not words:
             return RepositoryFacts(None, where=where)
         tracked = reader.list_files()
-        sheets = _route_sheets(reader, paths)
+        test_folders = _test_folders(tracked)
+        route_lines = _route_sheets(reader, paths, test_folders)
         route_nouns: list[str] = []
         for path in paths:
             noun = path.lstrip("/").split("/")[0].lower()
@@ -841,13 +910,26 @@ def read_repository_facts(reader: RepositoryReader, request_text: str) -> Reposi
                 route_nouns.append(noun)
         all_words = list(dict.fromkeys([*route_nouns, *words]))
         models, migrations, note = _declared_paths(reader, tracked)
-        if note:
-            sheets.append(note)
-        sheets.extend(_model_sheets(reader, tracked, models, all_words, route_nouns))
+        model_lines = _model_sheets(
+            reader, tracked, models, all_words, route_nouns, test_folders
+        )
         migration = _migration_sheet(tracked, migrations, all_words)
-        if migration:
-            sheets.append(migration)
-        return RepositoryFacts(_bounded("\n".join(sheets)) if sheets else None, where=where)
+        notes = [note] if note else []
+        cuts = list(getattr(reader, "cuts", None) or [])
+        if cuts:
+            # A cut-short answer is never passed off as a whole one.
+            notes.append(
+                "Some of what this sheet read was cut short, so it may be "
+                "missing facts: " + "; ".join(dict.fromkeys(cuts)) + "."
+            )
+        sections = [
+            _section(route_lines, _ROUTE_SECTION_CHARS, "routes"),
+            _section(model_lines, _MODEL_SECTION_CHARS, "data models"),
+            _section([migration] if migration else [], _MIGRATION_SECTION_CHARS, "migrations"),
+            _section(notes, _NOTE_SECTION_CHARS, "what was cut short"),
+        ]
+        sheet = "\n".join(section for section in sections if section)
+        return RepositoryFacts(_bounded(sheet) if sheet else None, where=where)
     except RepositoryUnreadable as exc:
         return RepositoryFacts(None, unavailable=str(exc) or f"{where} could not be read", where=where)
     except Exception as exc:  # noqa: BLE001 — a fact sheet must never stop a planning run
