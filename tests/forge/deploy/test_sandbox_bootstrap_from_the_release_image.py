@@ -487,7 +487,13 @@ def sandbox(tmp_path):
 
     home = tmp_path / "home"
     home.mkdir()
+    # The sandbox's own settings file, which every start needs since release
+    # -3 (item 4). A test about it takes it away or names another.
+    settings = tmp_path / "sandbox-settings" / "forge.yaml"
+    settings.parent.mkdir()
+    settings.write_text("planning: {}\n")
     made = {
+        "settings_file": settings,
         "project": project,
         "script": project / "deploy" / "sandbox-runner.sh",
         "client": client,
@@ -522,6 +528,7 @@ def _settings(sandbox, **extra):
         # release -3 (item 6). A test about it takes these away or changes them.
         "GIT_AUTHOR_NAME": PROJECT_AUTHOR_NAME,
         "GIT_AUTHOR_EMAIL": PROJECT_AUTHOR_EMAIL,
+        "FORGE_CONFIG_PATH": str(sandbox["settings_file"]),
     }
     env.update(extra)
     return {name: value for name, value in env.items() if value is not None}
@@ -2207,7 +2214,7 @@ class TestTheSettingsFileIsShared:
     """
 
     def test_the_named_file_is_bound_read_only_into_both(self, sandbox, tmp_path):
-        settings = tmp_path / "sandbox-settings" / "forge.yaml"
+        settings = tmp_path / "another-settings-folder" / "forge.yaml"
         settings.parent.mkdir()
         settings.write_text("planning: {}\n")
         helper, runner = _the_two_starts(sandbox, FORGE_CONFIG_PATH=str(settings))
@@ -2272,11 +2279,17 @@ class TestTheSettingsFileIsShared:
             _calls(sandbox)
         )
 
-    def test_unset_binds_no_settings_file(self, sandbox):
-        helper, runner = _the_two_starts(sandbox)
-        for call in (helper, runner):
-            assert "--env FORGE_CONFIG_PATH" not in call
-            assert "forge.yaml" not in call
+    def test_unset_is_refused(self, sandbox):
+        """No settings file named at all is a refusal, not a quiet default.
+
+        The independent check of the first release -3 template: with the
+        setting unset the bootstrap started both containers, and the helper
+        then could not find the project it was asked about.
+        """
+        result = _run(sandbox, FORGE_CONFIG_PATH=None)
+        assert result.returncode == 2, result.stdout
+        assert "FORGE_CONFIG_PATH is not set" in result.stdout
+        assert not any(line.startswith("run ") for line in _calls(sandbox))
 
 
 # ---------------------------------------------------------------------------
@@ -2368,11 +2381,15 @@ class TestTheGitObjectsTheCloneBorrowsAreShared:
                 for before, word in zip(words, words[1:])
                 if before == "--volume" and word.endswith(":ro")
             ]
-            # The runner's own graph declaration and the project's git
-            # identity (release -3, item 6) are the only read-only files either
-            # of them is given when nothing is borrowed.
+            # The runner's own graph declaration, the project's git identity
+            # (release -3, item 6) and the sandbox's settings file (item 4) are
+            # the only read-only files either of them is given when nothing is
+            # borrowed.
+            settings = str(sandbox["settings_file"])
             assert all(
-                "langgraph.json" in word or word.endswith(":/etc/gitconfig:ro")
+                "langgraph.json" in word
+                or word.endswith(":/etc/gitconfig:ro")
+                or word == f"{settings}:{settings}:ro"
                 for word in read_only
             ), read_only
 
