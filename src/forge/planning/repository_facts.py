@@ -282,6 +282,9 @@ class RepositoryFacts:
     sheet: str | None
     unavailable: str | None = None
     where: str = ""
+    #: Set when the repository was read in part: what was read is on the
+    #: sheet, and the sheet's notes say what was not.
+    partial: str | None = None
 
     @property
     def text(self) -> str | None:
@@ -682,15 +685,18 @@ def _model_sheets(
     words: Sequence[str],
     route_nouns: Sequence[str],
     test_folders: tuple[str, ...] = (),
+    into: list[str] | None = None,
 ) -> list[str]:
+    sheets: list[str] = into if into is not None else []
     if declared is not None:
         candidates = [f for f in tracked if _matches(f, declared)]
         if not candidates:
-            return [
+            sheets.append(
                 "The project declares its data models at "
                 + ", ".join(f"`{p}`" for p in declared)
                 + ", and no tracked file is there, so no model was read."
-            ]
+            )
+            return sheets
     else:
         candidates = []
         for f in tracked:
@@ -704,7 +710,7 @@ def _model_sheets(
             if pw & (_MODEL_WORDS_FIRST | _MODEL_WORDS_THEN):
                 candidates.append(f)
     if not candidates:
-        return []
+        return sheets
     all_forms: set[str] = set()
     for word in words:
         all_forms |= _forms(word)
@@ -728,7 +734,6 @@ def _model_sheets(
             first = 3
         return (first, 0 if pw & _MODEL_WORDS_FIRST else 1, f)
 
-    sheets: list[str] = []
     for f in sorted(candidates, key=_rank)[:_MAX_MODEL_FILES]:
         if f.endswith((".py", ".pyi")):
             source = reader.read_text(f)
@@ -799,7 +804,10 @@ def _migration_sheet(
 
 
 def _route_sheets(
-    reader: RepositoryReader, paths: Sequence[str], test_folders: tuple[str, ...] = ()
+    reader: RepositoryReader,
+    paths: Sequence[str],
+    test_folders: tuple[str, ...] = (),
+    into: list[str] | None = None,
 ) -> list[str]:
     """Route facts for the request's paths. One search per first segment —
     ``/users/a`` and ``/users/b`` are the same search — and never a file
@@ -809,7 +817,7 @@ def _route_sheets(
     def _candidate(f: str) -> bool:
         return _looks_like_routes(f) and not f.startswith(test_folders)
 
-    sheets: list[str] = []
+    sheets: list[str] = into if into is not None else []
     seen_files: set[str] = set()
     seen_firsts: set[str] = set()
     for path in paths:
@@ -900,36 +908,59 @@ def read_repository_facts(reader: RepositoryReader, request_text: str) -> Reposi
         words = _request_words(request_text)
         if not paths and not words:
             return RepositoryFacts(None, where=where)
+        begin = getattr(reader, "begin", None)
+        if callable(begin):
+            begin()
         tracked = reader.list_files()
         test_folders = _test_folders(tracked)
-        route_lines = _route_sheets(reader, paths, test_folders)
         route_nouns: list[str] = []
         for path in paths:
             noun = path.lstrip("/").split("/")[0].lower()
             if re.search(r"[a-z]", noun) and "{" not in noun and noun not in route_nouns:
                 route_nouns.append(noun)
         all_words = list(dict.fromkeys([*route_nouns, *words]))
-        models, migrations, note = _declared_paths(reader, tracked)
-        model_lines = _model_sheets(
-            reader, tracked, models, all_words, route_nouns, test_folders
-        )
-        migration = _migration_sheet(tracked, migrations, all_words)
-        notes = [note] if note else []
+        # What is read is KEPT: a helper that stops answering part-way leaves
+        # every fact already read on the sheet, and the notes say the rest
+        # could not be read.
+        route_lines: list[str] = []
+        model_lines: list[str] = []
+        migration: str | None = None
+        notes: list[str] = []
+        stopped: str | None = None
+        try:
+            _route_sheets(reader, paths, test_folders, into=route_lines)
+            models, migrations, note = _declared_paths(reader, tracked)
+            if note:
+                notes.append(note)
+            _model_sheets(
+                reader, tracked, models, all_words, route_nouns, test_folders, into=model_lines
+            )
+            migration = _migration_sheet(tracked, migrations, all_words)
+        except RepositoryUnreadable as exc:
+            stopped = str(exc) or f"{where} could not be read"
         cuts = list(getattr(reader, "cuts", None) or [])
         if cuts:
             # A cut-short answer is never passed off as a whole one.
             notes.append(
-                "Some of what this sheet read was cut short, so it may be "
+                "Some of what this sheet read was incomplete, so it may be "
                 "missing facts: " + "; ".join(dict.fromkeys(cuts)) + "."
+            )
+        if stopped:
+            if not route_lines and not model_lines and not migration:
+                return RepositoryFacts(None, unavailable=stopped, where=where)
+            notes.append(
+                f"The rest of the repository could not be read ({stopped}), so "
+                "this sheet is incomplete."
             )
         sections = [
             _section(route_lines, _ROUTE_SECTION_CHARS, "routes"),
             _section(model_lines, _MODEL_SECTION_CHARS, "data models"),
             _section([migration] if migration else [], _MIGRATION_SECTION_CHARS, "migrations"),
-            _section(notes, _NOTE_SECTION_CHARS, "what was cut short"),
+            _section(notes, _NOTE_SECTION_CHARS, "what was incomplete"),
         ]
         sheet = "\n".join(section for section in sections if section)
-        return RepositoryFacts(_bounded(sheet) if sheet else None, where=where)
+        partial = stopped or ("; ".join(dict.fromkeys(cuts)) if cuts else None)
+        return RepositoryFacts(_bounded(sheet) if sheet else None, where=where, partial=partial)
     except RepositoryUnreadable as exc:
         return RepositoryFacts(None, unavailable=str(exc) or f"{where} could not be read", where=where)
     except Exception as exc:  # noqa: BLE001 — a fact sheet must never stop a planning run
