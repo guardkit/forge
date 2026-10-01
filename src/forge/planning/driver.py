@@ -99,7 +99,11 @@ from forge.planning.planner import (
     plan_next_step,
 )
 from forge.planning.assumption_review import review_assumptions
-from forge.planning.repository_facts import what_the_repository_already_does
+from forge.planning.repository_facts import (
+    LocalCheckoutReader,
+    RepositoryFacts,
+    read_repository_facts,
+)
 from forge.planning.task_traceability import review_task_traceability
 from forge.planning.revision import (
     CYCLE_CAP,
@@ -824,6 +828,14 @@ _PROVABILITY_REWRITTEN_CARD_LINE = (
     "The machine rewrote {n} of the worked examples so they can be proven "
     "(they described the database or the code rather than what a caller "
     "sees). What changed: {changes}."
+)
+
+#: The spec card's line when the planner could not read the repository
+#: (release -3 item 10, 1 October 2026). Plain words; the reason is the
+#: reader's own clause.
+_REPOSITORY_FACTS_UNAVAILABLE_CARD_LINE = (
+    "The machine could not read the repository while writing this, so nothing "
+    "checked it against what the repository already has ({reason})."
 )
 
 #: The card's line when examples are still unprovable after the round — or
@@ -2900,7 +2912,7 @@ class PlanningRunDriver:
                 # The coach's ground truth (2026-09-13): the sentence, word for
                 # word, and what the repository already does for its words.
                 request_text=self._request_text_of(row),
-                repository_facts=self._repository_facts_for(correlation_id, repo_path, row),
+                repository_facts=await self._repository_facts_for(correlation_id, repo_path, row),
             )
         except Exception as exc:  # noqa: BLE001 — dispatch boundary
             await self._fail_leg(
@@ -3282,20 +3294,75 @@ class PlanningRunDriver:
         except (KeyError, IndexError, TypeError):
             return str(getattr(row, "request_text", "") or "")
 
-    def _repository_facts_for(self, correlation_id: str, repo_path: str, row: Any) -> str | None:
-        """The fact sheet for this run, made once and kept for the leg.
+    async def _repository_facts_for(
+        self, correlation_id: str, repo_path: str, row: Any
+    ) -> str | None:
+        """The fact sheet's text for this run, made once and kept for the leg.
 
-        Read by ordinary code from the repository at ``repo_path`` (the same
-        checkout the spec-words finder reads). ``None`` when the request
-        names no route the repository has anything to say about, so the
-        dispatch is byte for byte what it was.
+        What the coach and the deterministic reviewers are given: the facts,
+        or — when the repository could not be read — the explicit
+        "Repository facts unavailable: <reason>" sentence (1 October 2026,
+        release -3 item 10). ``None`` only when the request has nothing to
+        look for or the repository has nothing to say about it, so the
+        dispatch is then byte for byte what it was.
         """
-        cache: dict[str, str | None] = self.__dict__.setdefault("_repository_facts_cache", {})
+        return (await self._repository_facts_state(correlation_id, repo_path, row)).text
+
+    async def _repository_facts_state(
+        self, correlation_id: str, repo_path: str, row: Any
+    ) -> RepositoryFacts:
+        """The whole answer, cached per run so the coach, the reviewers and
+        the card all see the same sheet. Read off the event loop: a sandboxed
+        repository is a dozen small HTTP reads."""
+        cache: dict[str, RepositoryFacts] = self.__dict__.setdefault(
+            "_repository_facts_cache", {}
+        )
         if correlation_id not in cache:
-            cache[correlation_id] = what_the_repository_already_does(
-                repo_path, self._request_text_of(row)
+            reader = self._repository_reader_for(repo_path)
+            facts = await asyncio.to_thread(
+                read_repository_facts, reader, self._request_text_of(row)
             )
+            if facts.unavailable:
+                logger.warning(
+                    "planning driver: run %s — the planner's repository facts "
+                    "are UNAVAILABLE (%s); the coach is told so, and so is the card",
+                    correlation_id,
+                    facts.unavailable,
+                )
+            cache[correlation_id] = facts
         return cache[correlation_id]
+
+    def _repository_reader_for(self, repo_path: str) -> Any:
+        """Where the fact sheet reads the repository: wherever every other
+        planning call for ``repo_path`` goes.
+
+        A sandboxed repository's git runner (its helper's
+        :class:`~forge.planning.sidecar_git_runner.SidecarGitRunner`, reached
+        through the routed runner exactly as the spec branch's own writes
+        are) offers a ``code_reader`` over the helper's read-only ``/code``
+        routes, on the factory's own clone inside the sandbox — the copy the
+        builds see. Every other repository is read from the checkout the
+        coordinator holds, as before. There is deliberately no fallback from
+        one to the other: a helper that cannot be reached is said on the
+        card, not papered over with a checkout that may be a different copy.
+        """
+        runner = self._deps.git_runner
+        route = getattr(runner, "runner_for_path", None)
+        if callable(route):
+            runner = route(repo_path)
+        make = getattr(runner, "code_reader", None)
+        if callable(make):
+            return make()
+        return LocalCheckoutReader(repo_path)
+
+    def _repository_facts_card_line(self, correlation_id: str) -> str | None:
+        """The card's one line when the planner could not read the
+        repository; ``None`` when it could (or never had to)."""
+        cache = self.__dict__.get("_repository_facts_cache") or {}
+        facts = cache.get(correlation_id)
+        if facts is None or not facts.unavailable:
+            return None
+        return _REPOSITORY_FACTS_UNAVAILABLE_CARD_LINE.format(reason=facts.unavailable)
 
     async def _review_assumptions_on_branch(
         self,
@@ -3362,7 +3429,7 @@ class PlanningRunDriver:
         deps = self._deps
         request_text = self._request_text_of(row)
         try:
-            facts = self._repository_facts_for(correlation_id, repo_path, row)
+            facts = await self._repository_facts_for(correlation_id, repo_path, row)
             review = await self._review_assumptions_on_branch(
                 draft, repo_path=repo_path, branch=branch, request_text=request_text, repository_facts=facts
             )
@@ -3766,6 +3833,17 @@ class PlanningRunDriver:
             card["what_happened"] = f"{card.get('what_happened', '')} {added}".strip()
             final["card"] = card
             provability["card_line"] = added
+        unavailable_line = self._repository_facts_card_line(correlation_id)
+        if unavailable_line is not None:
+            # Silence was the bug (1 October 2026, release -3 item 10): the
+            # person approving the spec is told the checker never saw the
+            # repository, and why. Receipted on the draft row beside the card.
+            card = dict(final.get("card") or {})
+            card["what_happened"] = (
+                f"{card.get('what_happened', '')} {unavailable_line}".strip()
+            )
+            final["card"] = card
+            final["repository_facts_unavailable"] = unavailable_line
         final["provability"] = provability
         self._record_spec_draft(correlation_id, final, note_from_machine=False)
         return final
@@ -5095,7 +5173,7 @@ class PlanningRunDriver:
                 # repository already does for the words it uses. Absent, the
                 # wire is byte for byte what it was.
                 request_text=self._request_text_of(row),
-                repository_facts=self._repository_facts_for(
+                repository_facts=await self._repository_facts_for(
                     correlation_id, repo_path, row
                 ),
                 **extra,
@@ -5464,7 +5542,7 @@ class PlanningRunDriver:
             )
             return files, receipt
         try:
-            facts = self._repository_facts_for(correlation_id, repo_path, row)
+            facts = await self._repository_facts_for(correlation_id, repo_path, row)
             review = review_task_traceability(
                 files,
                 request_text=request_text,
