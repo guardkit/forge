@@ -79,8 +79,8 @@
 #
 # WHAT IT EXITS WITH. 0 after a clean stop, or after a warm-up that only
 # checked the image. 2 when it refused at the door — no image named, an image
-# it cannot vouch for, no Docker client, a shared folder it cannot make, a
-# settings file that is named and not there, a borrowed git objects folder that
+# it cannot vouch for, no Docker client, a shared folder it cannot make, no
+# settings file named or one that is not there, a borrowed git objects folder that
 # is not there, no git identity declared for the project, an unknown word. 4 when a supervisor of this checkout is ALREADY running in
 # this sandbox and this start was therefore refused: nothing was started, and
 # the non-zero status is there so anything reading a status rather than the
@@ -170,14 +170,17 @@
 #       file). A sandbox that names a settings file now has that very file in
 #       both containers, at the same path, read-only — neither service writes
 #       its settings, and a container that could would be changing what the
-#       next one reads. Set and missing, or set and unreadable, is a refusal
-#       naming the setting: a name with nothing under it is the outcome this
-#       table exists to prevent. Unset, nothing is bound and the factory's own
-#       defaults apply, as before. WHERE THE FILE COMES FROM is not this
-#       script's business: it is a file of this sandbox, written by whatever
-#       installs the sandbox, and its paths must be the paths INSIDE the
+#       next one reads. UNSET is a refusal too (the independent check of the
+#       first release -3 template): with no settings file the helper cannot
+#       find the project it is asked about at all, so a sandbox started
+#       without one only fails later and less clearly. Set and missing, or set
+#       and unreadable, is a refusal naming the setting: a name with nothing
+#       under it is the outcome this table exists to prevent. WHERE THE FILE
+#       COMES FROM is decided by the release -3 upgrade design: it is
+#       generated at install time by deploy/estate/rollout-sandbox, as a file
+#       of this sandbox whose repository paths are the paths INSIDE the
 #       sandbox (the coordinator's own settings name its own paths, which are
-#       not these).
+#       not these). This script only checks it is there and shares it.
 #
 #   the git objects the project's clone BORROWS (.git/objects/info/alternates)
 #       SHARED MOUNT, READ-ONLY, at the path the alternates file names (1
@@ -337,6 +340,12 @@
 #   already-present path, which makes every one of these checks before it says
 #   there is nothing to carry. Where the estate pulls from a registry instead,
 #   nothing here changes.
+#
+#   REQUIRED — the sandbox's own settings file (release -3, 1 October 2026):
+#     FORGE_CONFIG_PATH      a file IN this sandbox, generated at install time,
+#                            whose repository paths are this sandbox's own.
+#                            Shared read-only with both containers; unset,
+#                            missing or unreadable is a refusal
 #
 #   REQUIRED — the project's git identity (release -3, 1 October 2026):
 #     GIT_AUTHOR_NAME, GIT_AUTHOR_EMAIL
@@ -1063,8 +1072,8 @@ fi
 export FORGE_DEPLOY_NOTES_DIR="${NOTES_ROOT}"
 
 # THE MOUNTS, and there are these kinds and no more: the project's own clone,
-# the three shared folders above, the factory's settings file when
-# FORGE_CONFIG_PATH names one (read-only, below), the folders the clone
+# the three shared folders above, the factory's settings file that
+# FORGE_CONFIG_PATH names (read-only, below), the folders the clone
 # borrows its git objects from (read-only, below), the project's git identity
 # (read-only, as /etc/gitconfig, below), and the sandbox's own engine socket
 # (both containers', added at each one's start). Every one of them is in
@@ -1088,12 +1097,15 @@ log "folders shared by both containers: ${REPO_ROOT} (the project's clone), ${RE
 # SANDBOX_CONTAINER_USER says otherwise. Only whether the file is there and
 # readable is asked: its contents are never read or printed here.
 CONFIG_PATH="${FORGE_CONFIG_PATH:-}"
+if [[ -z "${CONFIG_PATH}" ]]; then
+  refuse "FORGE_CONFIG_PATH is not set. Both of the factory's containers read their settings from the file it names, and the deploy helper finds the project it works on through it, so neither can do its job without one. Name the sandbox's own settings file (the one installed into this sandbox, whose repository paths are the paths inside it) in the settings the host side hands this sandbox. Refusing to start."
+fi
 if [[ -n "${CONFIG_PATH}" ]]; then
   if [[ "${CONFIG_PATH}" != /* ]]; then
     refuse "FORGE_CONFIG_PATH names '${CONFIG_PATH}', which is not a full path. Both of the factory's containers are given that file at the path the setting names, so it has to be one path that means the same thing in this sandbox and in them. Name it from the root (/...). Refusing to start."
   fi
   if [[ ! -f "${CONFIG_PATH}" ]]; then
-    refuse "FORGE_CONFIG_PATH names ${CONFIG_PATH}, and there is no such file in this sandbox. Both of the factory's containers are told to read their settings from there, and the deploy helper finds the project it works on through it, so starting them without it would leave them pointing at nothing. Put the sandbox's settings file there (its repository paths must be the paths inside this sandbox), or leave the setting out. Refusing to start."
+    refuse "FORGE_CONFIG_PATH names ${CONFIG_PATH}, and there is no such file in this sandbox. Both of the factory's containers are told to read their settings from there, and the deploy helper finds the project it works on through it, so starting them without it would leave them pointing at nothing. Put the sandbox's settings file there (its repository paths must be the paths inside this sandbox). Refusing to start."
   fi
   if [[ ! -r "${CONFIG_PATH}" ]]; then
     refuse "FORGE_CONFIG_PATH names ${CONFIG_PATH}, and this sandbox's own user cannot read it. Both of the factory's containers run as that user and are told to read their settings from there. Refusing to start."
