@@ -579,6 +579,110 @@ def verify_derivation(c, directory, receipt, plan=False):
         refuse('claimed startup state differs from independently derived normal boot; reconcile the receipt')
 
 
+# The release coordinator reconciles stale builds when it starts: a build left
+# INTERRUPTED by the old runtime becomes FAILED with a "sandbox-required:"
+# reason, stamping its times (seen on the live record, 1 October 2026: 28 rows).
+# That is the only start-up write accepted beyond the schema migration. Every
+# other table, the schema and every other build row must be identical.
+BOOT_RECONCILE_FROM, BOOT_RECONCILE_TO = 'INTERRUPTED', 'FAILED'
+BOOT_RECONCILE_COLUMNS = frozenset({'status', 'started_at', 'completed_at', 'error'})
+BOOT_RECONCILE_REASON = 'sandbox-required:'
+
+def boot_reconciled_builds(expected, actual):
+    """Return the build ids the coordinator's start-up reconciliation changed.
+
+    `expected` and `actual` are paths to complete SQLite ledgers on the host.
+    Refuses on any difference other than INTERRUPTED -> FAILED build rows whose
+    changed columns are within BOOT_RECONCILE_COLUMNS and whose new error starts
+    with BOOT_RECONCILE_REASON. No row content is returned or printed.
+    """
+    def opened(p):
+        return closing(sqlite3.connect(path(p).as_uri()+'?mode=ro&immutable=1', uri=True))
+    def packed(value):
+        return json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=True)
+    def encode(value):
+        return {'blob': value.hex()} if isinstance(value, bytes) else value
+    with opened(expected) as a, opened(actual) as b:
+        for db in (a, b): db.execute('BEGIN')
+        schema = 'SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name,tbl_name'
+        if a.execute(schema).fetchall() != b.execute(schema).fetchall():
+            refuse('the started ledger schema differs from the loaded one; keep the door closed and reconcile its state')
+        for name in ('application_id', 'user_version', 'encoding', 'auto_vacuum'):
+            if a.execute('PRAGMA '+name).fetchone() != b.execute('PRAGMA '+name).fetchone():
+                refuse('the started ledger header differs from the loaded one; keep the door closed and reconcile its state')
+        changed = []
+        for (table,) in a.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").fetchall():
+            quoted = '"' + table.replace('"', '""') + '"'
+            ca, cb = a.execute('SELECT * FROM '+quoted), b.execute('SELECT * FROM '+quoted)
+            cols = [d[0] for d in ca.description]
+            if cols != [d[0] for d in cb.description]:
+                refuse(f'the started ledger table {table} has different columns; keep the door closed and reconcile its state')
+            rows_a, rows_b = ca.fetchall(), cb.fetchall()
+            if table != 'builds':
+                if sorted(packed([encode(v) for v in x]) for x in rows_a) != sorted(packed([encode(v) for v in x]) for x in rows_b):
+                    refuse(f'the started ledger table {table} differs from the loaded one; keep the door closed and reconcile its state')
+                continue
+            key = cols.index('build_id')
+            ka, kb = {x[key]: x for x in rows_a}, {x[key]: x for x in rows_b}
+            if len(ka) != len(rows_a) or len(kb) != len(rows_b) or ka.keys() != kb.keys():
+                refuse('the started ledger has added, removed or duplicated builds; keep the door closed and reconcile its state')
+            for build_id in sorted(ka):
+                old, new = dict(zip(cols, ka[build_id])), dict(zip(cols, kb[build_id]))
+                if old == new: continue
+                diff = {c for c in cols if old[c] != new[c]}
+                if (old['status'] != BOOT_RECONCILE_FROM or new['status'] != BOOT_RECONCILE_TO
+                        or not diff <= BOOT_RECONCILE_COLUMNS
+                        or not isinstance(new.get('error'), str) or not new['error'].startswith(BOOT_RECONCILE_REASON)):
+                    refuse('a started ledger build differs other than by start-up reconciliation; keep the door closed and reconcile its state')
+                changed.append(build_id)
+    return changed
+
+def work_state_boot_reconciled(baseline, current):
+    """True when two ledger_state work_state values differ only by start-up reconciliation."""
+    if set(baseline) != set(current): return False
+    for table in baseline:
+        if table == 'builds': continue
+        if baseline[table] != current[table]: return False
+    a, b = baseline.get('builds'), current.get('builds')
+    if a is None or b is None or {k: v for k, v in a.items() if k != 'rows'} != {k: v for k, v in b.items() if k != 'rows'}:
+        return False
+    ra, rb = {x['build_id']: x for x in a.get('rows', [])}, {x['build_id']: x for x in b.get('rows', [])}
+    if len(ra) != len(a.get('rows', [])) or len(rb) != len(b.get('rows', [])) or ra.keys() != rb.keys(): return False
+    for build_id, old in ra.items():
+        new = rb[build_id]
+        if old == new: continue
+        if (set(old) != set(new) or old.get('status') != BOOT_RECONCILE_FROM or new.get('status') != BOOT_RECONCILE_TO
+                or not {k for k in old if old[k] != new[k]} <= BOOT_RECONCILE_COLUMNS):
+            return False
+    return True
+
+def started_ledger_reconciliation(c, directory, receipt, container_id):
+    """Copy the running coordinator's ledger and compare it with the independently derived start-up state.
+
+    Returns the reconciled build ids, or None when the copy's logical digest equals
+    neither accepted digest after removing the reconciliation (it refuses on any other
+    difference). The copy and the derivation stay in a private temporary folder that is
+    removed afterwards.
+    """
+    artifact = path(directory / MIGRATED_ARTIFACT)
+    code = r"""import base64,sqlite3,sys
+src=sqlite3.connect('file:/var/lib/forge/forge.db?mode=ro',uri=True);dst=sqlite3.connect(':memory:')
+src.backup(dst);src.close()
+assert dst.execute('PRAGMA integrity_check').fetchall()==[('ok',)]
+sys.stdout.write(base64.b64encode(dst.serialize()).decode())
+"""
+    import base64
+    with tempfile.TemporaryDirectory(prefix='.verify-started-', dir=directory.parent) as temporary:
+        temporary = Path(temporary)
+        (temporary / 'started.db').write_bytes(base64.b64decode(docker(c, 'exec', container_id, 'python', '-c', code).stdout))
+        os.chmod(temporary / 'started.db', 0o600)
+        derived = temporary / 'derived'; derived.mkdir()
+        shutil.copyfile(artifact, derived / 'forge.db')
+        container_python(c, BOOT_SQLITE_CODE, mounts=[f'type=bind,src={derived},dst=/copy'])
+        if consolidated_logical_digest(derived / 'forge.db') != receipt['startup_logical_sha256']:
+            refuse('claimed startup state differs from independently derived normal boot; reconcile the receipt')
+        return boot_reconciled_builds(derived / 'forge.db', temporary / 'started.db') or None
+
 def verify_containers(c, directory, metadata, receipt, plan):
     if not plan: invalidate_verification(directory)
     if not plan and receipt['container_verification'] is not None:
@@ -627,13 +731,22 @@ print(json.dumps({'main_sha256':main_sha,'logical_sha256':logical,'schema_versio
         except Refusal:
             refuse(f'{service} cannot read its actual ledger and snapshot mark as its configured user; fix access before verifying')
         actual = json.loads(text)
-        if (actual.get('schema_version') != 16 or actual.get('mark') != mark
-                or actual.get('logical_sha256') not in {receipt['loaded_logical_sha256'], receipt['startup_logical_sha256']}):
+        if actual.get('schema_version') != 16 or actual.get('mark') != mark:
             refuse(f'{service} reads a different ledger or snapshot mark; keep the door closed and reconcile its state')
+        reconciled = None
+        if actual.get('logical_sha256') not in {receipt['loaded_logical_sha256'], receipt['startup_logical_sha256']}:
+            if service != 'coordinator' and 'coordinator' in results and results['coordinator'].get('boot_reconciled_builds') is not None \
+                    and actual['logical_sha256'] == results['coordinator']['logical_sha256']:
+                reconciled = results['coordinator']['boot_reconciled_builds']
+            else:
+                reconciled = started_ledger_reconciliation(c, directory, receipt, ids[0])
+                if reconciled is None:
+                    refuse(f'{service} reads a different ledger or snapshot mark; keep the door closed and reconcile its state')
         if results and actual['logical_sha256'] != next(iter(results.values()))['logical_sha256']:
             refuse('the three services observed different ledger states; keep the door closed and repeat verification after startup settles')
         results[service] = {'container_id': item['Id'], 'snapshot_sha256': mark['snapshot_sha256'],
                             'logical_sha256': actual['logical_sha256'], 'main_sha256': actual['main_sha256']}
+        if reconciled is not None: results[service]['boot_reconciled_builds'] = reconciled
     if not plan:
         receipt['container_verification'] = {'verified_at': datetime.now(timezone.utc).isoformat(), 'services': results}
         atomic_json(directory / 'load-receipt.json', receipt)
