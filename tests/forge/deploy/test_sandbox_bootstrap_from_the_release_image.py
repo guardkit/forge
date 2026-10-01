@@ -501,6 +501,11 @@ def sandbox(tmp_path):
     return made
 
 
+#: The identity the throwaway project declares for its builds.
+PROJECT_AUTHOR_NAME = "A Throwaway Project"
+PROJECT_AUTHOR_EMAIL = "throwaway-project@example.invalid"
+
+
 def _settings(sandbox, **extra):
     env = {
         "PATH": os.environ["PATH"],
@@ -513,9 +518,13 @@ def _settings(sandbox, **extra):
         # Recorded by the OTHER kind of engine; checked here against this one.
         "FORGE_IMAGE_IDENTITY": sandbox["identity"],
         "SANDBOX_RUNNER_RESTART_SECONDS": "1",
+        # The project's declared git identity, which every start needs since
+        # release -3 (item 6). A test about it takes these away or changes them.
+        "GIT_AUTHOR_NAME": PROJECT_AUTHOR_NAME,
+        "GIT_AUTHOR_EMAIL": PROJECT_AUTHOR_EMAIL,
     }
     env.update(extra)
-    return env
+    return {name: value for name, value in env.items() if value is not None}
 
 
 def _run(sandbox, *arguments, **extra):
@@ -2293,6 +2302,131 @@ class TestTheGitObjectsTheCloneBorrowsAreShared:
                 for before, word in zip(words, words[1:])
                 if before == "--volume" and word.endswith(":ro")
             ]
-            # The runner's own graph declaration is the only read-only file
-            # either of them is given when nothing is borrowed.
-            assert all("langgraph.json" in word for word in read_only), read_only
+            # The runner's own graph declaration and the project's git
+            # identity (release -3, item 6) are the only read-only files either
+            # of them is given when nothing is borrowed.
+            assert all(
+                "langgraph.json" in word or word.endswith(":/etc/gitconfig:ro")
+                for word in read_only
+            ), read_only
+
+
+# ---------------------------------------------------------------------------
+def _the_identity_file(call: str) -> Path:
+    """The sandbox file a start line binds as the container's /etc/gitconfig."""
+    words = call.split()
+    for before, word in zip(words, words[1:]):
+        if before == "--volume" and word.endswith(":/etc/gitconfig:ro"):
+            return Path(word[: -len(":/etc/gitconfig:ro")])
+    raise AssertionError(f"no git identity bound in: {call}")
+
+
+class TestTheProjectsGitIdentityReachesGitWhateverItsEnvironment:
+    """Both containers' git commits as the project, even launched with a short list.
+
+    Release -3, item 6, found on the live day (1 October 2026): a build's first
+    checkpoint commit failed inside the runner with "Author identity unknown",
+    although GIT_AUTHOR_NAME and the rest had been handed in. The runner
+    launches the build system with a short NAMED list of settings
+    (forge/launch_environment.py), and no GIT_ name is on it. So the identity
+    is a file git reads as its system settings, whatever the environment.
+    """
+
+    def test_it_is_bound_read_only_into_both_as_the_system_settings(self, sandbox):
+        helper, runner = _the_two_starts(sandbox)
+        assert _the_identity_file(helper) == _the_identity_file(runner)
+        identity = _the_identity_file(helper)
+        answer = subprocess.run(
+            ["git", "config", "--file", str(identity), "--get", "user.email"],
+            capture_output=True, text=True, timeout=30, check=True,
+        )
+        assert answer.stdout.strip() == PROJECT_AUTHOR_EMAIL
+
+    def test_a_commit_with_an_emptied_environment_uses_it(self, sandbox, tmp_path):
+        """What GuardKit's checkpoint does, with nothing of the GIT_ names left.
+
+        ``env -i`` keeps none of the caller's settings; GIT_CONFIG_SYSTEM
+        stands in for the mount (a test cannot write /etc/gitconfig), and the
+        HOME given has no settings of its own, so the identity can only have
+        come from the file the bootstrap wrote.
+        """
+        name = 'A "Quoted" Project; with # and \\ in it'
+        email = "quoted-project@example.invalid"
+        helper, _runner = _the_two_starts(
+            sandbox, GIT_AUTHOR_NAME=name, GIT_AUTHOR_EMAIL=email
+        )
+        identity = _the_identity_file(helper)
+        repository = tmp_path / "a-repository"
+        empty_home = tmp_path / "a-home-with-no-git-settings"
+        empty_home.mkdir()
+        clean = [
+            "env", "-i",
+            f"PATH={os.environ['PATH']}",
+            f"HOME={empty_home}",
+            f"GIT_CONFIG_SYSTEM={identity}",
+            "GIT_CONFIG_GLOBAL=/dev/null",
+        ]
+        subprocess.run([*clean, "git", "init", "-q", str(repository)], check=True, timeout=30)
+        made = subprocess.run(
+            [*clean, "git", "-C", str(repository), "commit", "-q", "--allow-empty",
+             "-m", "a checkpoint"],
+            capture_output=True, text=True, timeout=30,
+        )
+        assert made.returncode == 0, made.stderr
+        who = subprocess.run(
+            [*clean, "git", "-C", str(repository), "log", "-1",
+             "--format=%an|%ae|%cn|%ce"],
+            capture_output=True, text=True, timeout=30, check=True,
+        )
+        assert who.stdout.strip() == f"{name}|{email}|{name}|{email}"
+
+    def test_a_committer_named_separately_is_kept_apart(self, sandbox):
+        helper, _runner = _the_two_starts(
+            sandbox,
+            GIT_COMMITTER_NAME="The Factory",
+            GIT_COMMITTER_EMAIL="factory@example.invalid",
+        )
+        identity = _the_identity_file(helper)
+
+        def read(key):
+            return subprocess.run(
+                ["git", "config", "--file", str(identity), "--get", key],
+                capture_output=True, text=True, timeout=30, check=True,
+            ).stdout.strip()
+
+        assert read("user.email") == PROJECT_AUTHOR_EMAIL
+        assert read("committer.email") == "factory@example.invalid"
+        assert read("committer.name") == "The Factory"
+
+    @pytest.mark.parametrize("missing", ["GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL"])
+    def test_no_declared_identity_is_refused(self, sandbox, missing):
+        result = _run(sandbox, **{missing: None})
+        assert result.returncode == 2, result.stdout
+        assert "GIT_AUTHOR_NAME" in result.stdout
+        assert "GIT_AUTHOR_EMAIL" in result.stdout
+        assert not any(line.startswith("run ") for line in _calls(sandbox))
+
+    def test_a_line_break_in_the_identity_is_refused(self, sandbox):
+        result = _run(sandbox, GIT_AUTHOR_NAME="two\nlines")
+        assert result.returncode == 2, result.stdout
+        assert "GIT_AUTHOR_NAME" in result.stdout
+        assert not any(line.startswith("run ") for line in _calls(sandbox))
+
+    def test_the_identity_is_never_printed(self, sandbox):
+        process = subprocess.Popen(
+            ["bash", str(sandbox["script"])],
+            env=_settings(sandbox),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        try:
+            for _ in range(100):
+                if len([c for c in _calls(sandbox) if c.startswith("run ")]) >= 2:
+                    break
+                time.sleep(0.1)
+        finally:
+            process.terminate()
+            said = process.communicate(timeout=30)[0]
+        assert PROJECT_AUTHOR_EMAIL not in said
+        assert PROJECT_AUTHOR_EMAIL not in " ".join(_calls(sandbox))

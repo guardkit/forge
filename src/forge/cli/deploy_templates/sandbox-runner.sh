@@ -77,8 +77,9 @@
 #
 # WHAT IT EXITS WITH. 0 after a clean stop, or after a warm-up that only
 # checked the image. 2 when it refused at the door — no image named, an image
-# it cannot vouch for, no Docker client, a shared folder it cannot make, an
-# unknown word. 4 when a supervisor of this checkout is ALREADY running in
+# it cannot vouch for, no Docker client, a shared folder it cannot make, a
+# settings file that is named and not there, a borrowed git objects folder that
+# is not there, no git identity declared for the project, an unknown word. 4 when a supervisor of this checkout is ALREADY running in
 # this sandbox and this start was therefore refused: nothing was started, and
 # the non-zero status is there so anything reading a status rather than the
 # words sees a refusal and not a success. 1 when the containers would not go.
@@ -200,6 +201,39 @@
 #       A clone that is already self-contained has no alternates file, and
 #       then nothing is bound.
 #
+#   the git identity a build commits as (written below, from GIT_AUTHOR_NAME,
+#   GIT_AUTHOR_EMAIL and, when they differ, GIT_COMMITTER_NAME and
+#   GIT_COMMITTER_EMAIL)
+#       THE SANDBOX'S OWN FILESYSTEM, bound read-only into BOTH containers as
+#       their git's SYSTEM settings file, /etc/gitconfig (1 October 2026,
+#       release -3, found on the live day). The build's first checkpoint
+#       commit failed inside the runner with "Author identity unknown ...
+#       unable to auto-detect email address (got 'forge@<container>.(none)')",
+#       although the four GIT_ names had been handed in. They never reached
+#       git: the runner launches the build system with a short named list of
+#       settings (forge/launch_environment.py, LAUNCH_SETTINGS), no GIT_ name
+#       is on it, and everything the build system runs git with inherits that
+#       list. So the identity is put where git looks whatever its environment
+#       says:
+#         - NOT a GIT_ setting, nor GIT_CONFIG_GLOBAL — those are settings, and
+#           the named list drops them exactly as it dropped these;
+#         - NOT ~/.gitconfig — HOME inside a container is whatever the image
+#           says the container's user's home is, and a user the image does not
+#           know (SANDBOX_CONTAINER_USER can name any) gets / instead;
+#         - /etc/gitconfig, which git reads for every user, from every folder,
+#           under any environment the factory launches with (only
+#           GIT_CONFIG_NOSYSTEM switches it off, and nothing here sets it).
+#           The release image ships no file there (checked on 2026.09.28-2),
+#           so this replaces nothing; an image that one day ships one would
+#           have it covered by this, and this note is where to look.
+#       The identity is the PROJECT's: the names above, as the host side hands
+#       them in from the project's own settings. Never this sandbox's or the
+#       machine's own git settings, which say who set the machine up, not who
+#       the project's builds commit as. None declared is a refusal: a build
+#       that cannot commit fails an hour in, and the identity a container
+#       would make up for itself is not anybody's. Written fresh at every
+#       start, so it can never drift from the settings it came from.
+#
 #   this script's lock and process record
 #       NEITHER. They belong to the bootstrap, which is not in a container at
 #       all, and nothing in a container reads them.
@@ -301,6 +335,17 @@
 #   already-present path, which makes every one of these checks before it says
 #   there is nothing to carry. Where the estate pulls from a registry instead,
 #   nothing here changes.
+#
+#   REQUIRED — the project's git identity (release -3, 1 October 2026):
+#     GIT_AUTHOR_NAME, GIT_AUTHOR_EMAIL
+#                            who the project's builds commit as. Written into
+#                            the file both containers' git reads as its system
+#                            settings (see the table above for why it is a
+#                            file and not a setting). Not handed in is a
+#                            refusal: this sandbox's own git identity is never
+#                            used in its place
+#     GIT_COMMITTER_NAME, GIT_COMMITTER_EMAIL
+#                            optional; the author when not named
 #
 #   CHECKED WHEN SET (and recommended):
 #     FORGE_RELEASE_VERSION  must equal the image's com.guardkit.release.version
@@ -1011,8 +1056,9 @@ export FORGE_DEPLOY_NOTES_DIR="${NOTES_ROOT}"
 # THE MOUNTS, and there are these kinds and no more: the project's own clone,
 # the three shared folders above, the factory's settings file when
 # FORGE_CONFIG_PATH names one (read-only, below), the folders the clone
-# borrows its git objects from (read-only, below), and the sandbox's own engine
-# socket (the helper's alone, added at its start). Every one of them is in
+# borrows its git objects from (read-only, below), the project's git identity
+# (read-only, as /etc/gitconfig, below), and the sandbox's own engine socket
+# (the helper's alone, added at its start). Every one of them is in
 # this sandbox. Nothing of the machine outside is bound into anything here —
 # no checkout of the factory's code, no home folder, no settings file of the
 # machine's. (The one FORGE_CONFIG_PATH names is a file IN this sandbox, and
@@ -1113,6 +1159,53 @@ follow_the_alternates "$(the_clones_git_folder)/objects" 1
 if ((${#BORROWED_OBJECTS[@]} > 0)); then
   log "the project's clone borrows git objects from ${BORROWED_OBJECTS[*]}; each is shared with both containers, read-only, at the same path"
 fi
+
+# THE GIT IDENTITY BOTH CONTAINERS COMMIT AS (1 October 2026, release -3). The
+# table at the top says why it is a file mounted as /etc/gitconfig and not a
+# setting. The values are the project's, as handed in by name; they are written
+# into the file and never into a log line. A committer not named separately is
+# the author, which is what git itself does with one identity.
+AUTHOR_NAME="${GIT_AUTHOR_NAME:-}"
+AUTHOR_EMAIL="${GIT_AUTHOR_EMAIL:-}"
+COMMITTER_NAME="${GIT_COMMITTER_NAME:-${AUTHOR_NAME}}"
+COMMITTER_EMAIL="${GIT_COMMITTER_EMAIL:-${AUTHOR_EMAIL}}"
+if [[ -z "${AUTHOR_NAME}" || -z "${AUTHOR_EMAIL}" ]]; then
+  refuse "no git identity was declared for this project: GIT_AUTHOR_NAME and GIT_AUTHOR_EMAIL must both be handed in (GIT_COMMITTER_NAME and GIT_COMMITTER_EMAIL too, if the committer is someone else). A build commits its work as it goes, and inside the factory's containers git has no identity of its own, so every build would fail at its first commit. Name the project's identity in the settings the host side hands this sandbox (SANDBOX_ENV_NAMES). This sandbox's own git settings are not used on purpose: they say who set the machine up. Refusing to start."
+fi
+for name in GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL; do
+  if [[ "${!name:-}" =~ [[:cntrl:]] ]]; then
+    refuse "${name} has a control character in it (a line break or a tab, for instance), which no git identity can hold and which would break the settings file it is written into. Refusing to start."
+  fi
+done
+
+# A value written the way git's own settings files quote one: inside double
+# quotes, with a backslash or a double quote escaped, so a name with a #, a ;
+# or a quote in it is read back exactly as it was handed in.
+git_settings_value() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  printf '"%s"' "${value}"
+}
+
+GIT_IDENTITY_FILE="${STATE_ROOT}/gitconfig"
+GIT_IDENTITY_IN_CONTAINER="/etc/gitconfig"
+{
+  printf '# Written by deploy/sandbox-runner.sh at every start, from the project'"'"'s\n'
+  printf '# declared identity (GIT_AUTHOR_*, GIT_COMMITTER_*). Bound read-only into\n'
+  printf '# the factory'"'"'s two containers as %s. Do not edit: it is\n' "${GIT_IDENTITY_IN_CONTAINER}"
+  printf '# replaced at the next start.\n'
+  printf '[user]\n\tname = %s\n\temail = %s\n' \
+    "$(git_settings_value "${AUTHOR_NAME}")" "$(git_settings_value "${AUTHOR_EMAIL}")"
+  printf '[committer]\n\tname = %s\n\temail = %s\n' \
+    "$(git_settings_value "${COMMITTER_NAME}")" "$(git_settings_value "${COMMITTER_EMAIL}")"
+} > "${GIT_IDENTITY_FILE}.tmp"
+# Readable by the containers' user whoever SANDBOX_CONTAINER_USER names: an
+# identity is not a secret, and a file git cannot read is no identity at all.
+chmod 0644 "${GIT_IDENTITY_FILE}.tmp"
+mv "${GIT_IDENTITY_FILE}.tmp" "${GIT_IDENTITY_FILE}"
+MOUNTS+=(--volume "${GIT_IDENTITY_FILE}:${GIT_IDENTITY_IN_CONTAINER}:ro")
+log "the project's declared git identity is given to both containers as their git's system settings (${GIT_IDENTITY_IN_CONTAINER}, read-only), which git reads whatever environment a build is launched with"
 
 # --- step 4: the settings the two containers are given, BY NAME -------------
 # `--env NAME` hands the value this script's own environment holds under that
