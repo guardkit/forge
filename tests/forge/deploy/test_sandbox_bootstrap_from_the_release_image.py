@@ -2586,3 +2586,88 @@ class TestAFreshInstallForwardsWhatTheBootstrapNeeds:
         assert self._names("deploy/estate/.env.example") == self._names(
             "deploy/compose/.env.example"
         )
+
+
+# ---------------------------------------------------------------------------
+def _a_chain_of_borrowing(tmp_path: Path, project: Path, files: int) -> list[Path]:
+    """The clone's own alternates file, then ``files - 1`` more, one per store.
+
+    The clone's file is at depth 0 (git's own count). Returns the stores in
+    order; store i is named by the alternates file at depth i.
+    """
+    stores = [tmp_path / f"store-{i}" / "objects" for i in range(files)]
+    for store in stores:
+        (store / "info").mkdir(parents=True)
+    info = project / ".git" / "objects" / "info"
+    info.mkdir(parents=True, exist_ok=True)
+    (info / "alternates").write_text(f"{stores[0]}\n")
+    for here, there in zip(stores, stores[1:]):
+        (here / "info" / "alternates").write_text(f"{there}\n")
+    return stores
+
+
+class TestTheChainIsFollowedExactlyAsDeepAsGitFollowsIt:
+    """git reads alternates files at depths 0 to 5 and ignores a seventh.
+
+    The independent check of the first release -3 template found the
+    bootstrap counted the clone's own file as depth 1, so it refused a chain
+    git itself reads. In git's source (object-file.c, link_alt_odb_entries)
+    the repository's own file is depth 0 and ``if (depth > 5)`` stops it.
+    """
+
+    def test_six_files_in_a_chain_are_followed_and_every_store_is_bound(
+        self, sandbox, tmp_path
+    ):
+        stores = _a_chain_of_borrowing(tmp_path, sandbox["project"], 6)
+        helper, runner = _the_two_starts(sandbox)
+        for call in (helper, runner):
+            for store in stores:
+                assert f"--volume {store}:{store}:ro" in call
+
+    def test_a_seventh_file_is_refused(self, sandbox, tmp_path):
+        stores = _a_chain_of_borrowing(tmp_path, sandbox["project"], 7)
+        # Store 6 is named by the depth-6 file, which git ignores.
+        (stores[-1] / "info" / "alternates").write_text("")
+        result = _run(sandbox)
+        assert result.returncode == 2, result.stdout
+        assert "more than six alternates files" in result.stdout
+        assert str(stores[5] / "info" / "alternates") in result.stdout
+        assert not any(line.startswith("run ") for line in _calls(sandbox))
+
+    def test_git_itself_still_stops_at_the_same_place(self, tmp_path):
+        """The measurement the bootstrap's limit rests on, repeated with real git.
+
+        A clone borrowing through a chain of bare stores reaches the store
+        named by the depth-5 file and not the one named by the depth-6 file.
+        If a git ever counts differently, this fails and the limit above has
+        to follow it.
+        """
+        def git(*arguments, **how):
+            return subprocess.run(
+                ["git", *arguments], capture_output=True, text=True, timeout=30, **how
+            )
+
+        stores = [tmp_path / f"s{i}.git" for i in range(7)]
+        for store in stores:
+            assert git("init", "-q", "--bare", str(store)).returncode == 0
+        clone = tmp_path / "clone"
+        assert git("init", "-q", str(clone)).returncode == 0
+        (clone / ".git" / "objects" / "info" / "alternates").write_text(
+            f"{stores[0] / 'objects'}\n"
+        )
+        for here, there in zip(stores, stores[1:]):
+            (here / "objects" / "info" / "alternates").write_text(
+                f"{there / 'objects'}\n"
+            )
+
+        def only_in(store: Path) -> str:
+            made = git(
+                f"--git-dir={store}", "hash-object", "-w", "--stdin",
+                input=f"only in {store.name}\n",
+            )
+            return made.stdout.strip()
+
+        depth_five = only_in(stores[5])
+        depth_six = only_in(stores[6])
+        assert git("-C", str(clone), "cat-file", "-e", depth_five).returncode == 0
+        assert git("-C", str(clone), "cat-file", "-e", depth_six).returncode != 0
