@@ -2496,3 +2496,38 @@ class TestTheProjectsGitIdentityReachesGitWhateverItsEnvironment:
             said = process.communicate(timeout=30)[0]
         assert PROJECT_AUTHOR_EMAIL not in said
         assert PROJECT_AUTHOR_EMAIL not in " ".join(_calls(sandbox))
+
+
+# ---------------------------------------------------------------------------
+class TestTheRunnersEngineIsRecordedAsAKnownRisk:
+    """The note beside the runner's socket says what it really gives away.
+
+    The independent check of the first release -3 template found the note
+    claimed the runner "can already change what the helper will run" through
+    the shared clone. It cannot: the helper reads its deploy settings at the
+    recorded commit. What the socket really adds is the power to stop or
+    replace the project's deployment in the same engine without the merge
+    word, and the note has to say so.
+    """
+
+    NOTE = BOOTSTRAP.read_text().split("What the socket gives the runner", 1)[1].split(
+        "ENGINE_SOCKET_ARGUMENTS=()", 1
+    )[0]
+
+    def test_the_overstated_claim_is_gone(self):
+        flat = " ".join(self.NOTE.replace("#", " ").split())
+        assert "can already change what the helper will run" not in flat
+
+    def test_it_names_the_deployment_risk_and_the_merge_word(self):
+        flat = " ".join(self.NOTE.replace("#", " ").split())
+        assert "STOP OR REPLACE THE PROJECT'S OWN DEPLOYMENT" in flat
+        assert "without the merge word" in flat
+        assert "recorded commit" in flat or "commit the work was recorded" in flat
+
+    def test_it_says_it_is_a_known_risk_and_what_it_restores(self):
+        flat = " ".join(self.NOTE.replace("#", " ").split())
+        assert "KNOWN RISK" in flat
+        assert "plan of record" in flat
+        assert "before stage 4d" in flat
+        assert "docker group" in flat
+        assert "the boundary the factory relies on is the SANDBOX" in flat
