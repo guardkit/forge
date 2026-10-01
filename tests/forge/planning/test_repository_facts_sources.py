@@ -430,3 +430,217 @@ async def test_the_plan_writer_is_told_when_only_the_descriptor_could_not_read(h
         "nothing checked it against what the repository already has (the "
         "helper refused the search)."
     )
+
+
+# ---------------------------------------------------------------------------
+# The coach's findings (release -3 item 10, fix pass)
+# ---------------------------------------------------------------------------
+
+import contextlib  # noqa: E402
+
+from forge.planning.repository_facts import RepositoryUnreadable  # noqa: E402
+
+
+@contextlib.contextmanager
+def _serving(clone: Path):
+    """The helper's real server over ``clone``; yields its address."""
+    cfg = ForgeConfig.model_validate(
+        {
+            "permissions": {"filesystem": {"allowlist": ["/tmp"]}},
+            "planning": {"target_repo_paths": {REPO_KEY: str(clone)}},
+        }
+    )
+    srv = build_server(port=0, config_loader=lambda: cfg)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    host, port = srv.server_address[:2]
+    try:
+        yield f"http://{host}:{port}"
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+#: 250 lines mentioning the route — more than the helper's 200-line cap —
+#: in a file that sorts BEFORE the router (the coach's reproducer).
+NOISY_CLIENT = "".join(f'URL_{i} = "/users/thing-{i}"\n' for i in range(250))
+
+ROUTER_UNDER_SRC = '''
+from fastapi import APIRouter
+
+router = APIRouter(prefix="/users")
+
+
+@router.get("/count-today")
+async def count_today() -> int:
+    ...
+'''
+
+
+def test_a_search_cut_at_the_helpers_cap_still_finds_the_router(tmp_path: Path) -> None:
+    clone = _repo(
+        tmp_path / "clone",
+        {"a/client_api.py": NOISY_CLIENT, "src/users/router.py": ROUTER_UNDER_SRC},
+    )
+    with _serving(clone) as url:
+        reader = SidecarCodeReader(url, repo=REPO_KEY)
+        sheet = read_repository_facts(reader, "Add GET /users/created-per-day").text or ""
+    assert "`src/users/router.py` defines GET /users/count-today." in sheet
+    # The folder that was itself still over the cap is SAID, not passed off.
+    assert "Some of what this sheet read was cut short" in sheet
+    assert "cut short in `a/`" in sheet
+
+
+def test_a_where_does_it_appear_search_that_stays_cut_is_unreadable(tmp_path: Path) -> None:
+    clone = _repo(tmp_path / "clone", {"a/client_api.py": NOISY_CLIENT})
+    with _serving(clone) as url:
+        reader = SidecarCodeReader(url, repo=REPO_KEY)
+        with pytest.raises(RepositoryUnreadable, match="cut short"):
+            reader.places_mentioning("/users")
+
+
+def test_a_timed_out_search_and_a_cut_listing_are_said() -> None:
+    """The helper's own flags, answered by a stand-in on the wire."""
+
+    def post(url: str, body: dict, timeout: float) -> tuple[int, dict]:
+        if url.endswith("/code/list-files"):
+            return 200, {"files": ["src/a.py"], "capped": True, "total_tracked": 9000}
+        return 200, {"matches": [], "timed_out": True, "files_searched": 17, "capped": False}
+
+    reader = SidecarCodeReader("http://helper", repo=REPO_KEY, post=post)
+    sheet = read_repository_facts(reader, "Add GET /users/created-per-day").text or ""
+    assert "the helper listed only the first 1 of 9000 tracked files" in sheet
+    assert "stopped at the helper's time limit after 17 file(s)" in sheet
+    reasons: list[str] = []
+    descriptor = PlanningRunDriver._build_target_repo_descriptor(
+        REPO_KEY, COORDINATOR_PATH, "", reader=reader, unavailable=reasons
+    )
+    assert "repository_inventory" not in descriptor
+    assert "the helper listed only the first 1 of 9000 tracked files" in reasons
+
+
+def test_the_readers_wire_waits_longer_than_the_helpers_own_walls() -> None:
+    from forge.deploy_sidecar.service import (
+        CODE_GIT_TIMEOUT_SECONDS,
+        CODE_SEARCH_TIMEOUT_SECONDS,
+    )
+
+    reader = SidecarCodeReader("http://helper", repo=REPO_KEY)
+    assert reader._timeout_s > CODE_GIT_TIMEOUT_SECONDS + CODE_SEARCH_TIMEOUT_SECONDS
+
+
+def _long_router(prefix: str) -> str:
+    routes = "".join(
+        f'@router.get("/a-rather-long-and-descriptive-route-name-number-{i}")\n'
+        f"async def r{i}() -> SomeRatherLongResponseModelName{i}:\n    ...\n\n"
+        for i in range(12)
+    )
+    return f'from fastapi import APIRouter\nrouter = APIRouter(prefix="{prefix}")\n\n' + routes
+
+
+def test_long_route_facts_never_push_the_model_facts_out(tmp_path: Path) -> None:
+    checkout = _repo(
+        tmp_path / "checkout",
+        {
+            "src/users/router.py": _long_router("/users"),
+            "src/users/api_v2.py": _long_router("/users"),
+            "src/users/views.py": _long_router("/users"),
+            "src/users/models.py": MODELS,
+        },
+    )
+    sheet = read_repository_facts(LocalCheckoutReader(str(checkout)), SENTENCE).text or ""
+    assert len(sheet) <= 6000
+    assert "deleted_at: Mapped[datetime | None]" in sheet
+    assert "more line(s) about routes were left out to keep the sheet short" in sheet
+
+
+def test_route_paths_are_capped_and_one_first_segment_is_searched_once(tmp_path: Path) -> None:
+    checkout = _repo(tmp_path / "checkout", {"src/users/router.py": ROUTER})
+
+    class Counting(LocalCheckoutReader):
+        searched: list[str] = []
+
+        def files_mentioning(self, text: str, *, ignore_case: bool = False) -> list[str]:
+            self.searched.append(text)
+            return super().files_mentioning(text, ignore_case=ignore_case)
+
+    reader = Counting(str(checkout))
+    read_repository_facts(
+        reader,
+        "Add /users/a and /users/b, then /orders/x, /items/y and /carts/z.",
+    )
+    route_searches = [t for t in reader.searched if t.startswith('"/')]
+    assert route_searches.count('"/users') == 1
+    assert '"/carts' not in route_searches  # the fourth path is past the cap
+
+
+def test_a_declared_model_path_that_matches_nothing_is_said(tmp_path: Path) -> None:
+    checkout = _repo(
+        tmp_path / "checkout",
+        {
+            ".guardkit/config.yaml": "repository_facts:\n  data_models: [\"app/entities/**\"]\n",
+            "src/users/models.py": MODELS,
+        },
+    )
+    sheet = read_repository_facts(LocalCheckoutReader(str(checkout)), SENTENCE).text or ""
+    assert (
+        "The project declares its data models at `app/entities/**`, and no "
+        "tracked file is there, so no model was read."
+    ) in sheet
+
+
+def test_files_in_the_repositorys_test_folders_are_not_read_as_route_files(tmp_path: Path) -> None:
+    checkout = _repo(
+        tmp_path / "checkout",
+        {
+            "src/users/router.py": ROUTER,
+            "tests/test_api_documentation.py": 'DOCS = "/users/count-today"\n',
+            # Not Python: before the fix its route literals reached the sheet.
+            "tests/users/users_api_client.ts": 'get("/users/count-today");\n',
+        },
+    )
+    sheet = read_repository_facts(LocalCheckoutReader(str(checkout)), SENTENCE).text or ""
+    assert "src/users/router.py" in sheet
+    assert "tests/" not in sheet
+
+
+RULES = "rules:\n  - id: R-1\n    rule: Routers stay thin; queries live in the data layer.\n"
+
+
+def test_the_rules_file_and_the_test_folders_come_through_the_helper(tmp_path: Path) -> None:
+    clone = _repo(
+        tmp_path / "clone",
+        {
+            "docs/architecture-rules.yaml": RULES,
+            "src/users/router.py": ROUTER,
+            "tests/users/test_router.py": "def test_it():\n    pass\n",
+            "tests/health/test_health.py": "def test_it():\n    pass\n",
+        },
+    )
+    assert not Path(COORDINATOR_PATH).exists()
+    with _serving(clone) as url:
+        reasons: list[str] = []
+        descriptor = PlanningRunDriver._build_target_repo_descriptor(
+            REPO_KEY,
+            COORDINATOR_PATH,
+            "",
+            reader=SidecarCodeReader(url, repo=REPO_KEY),
+            unavailable=reasons,
+        )
+    assert reasons == []
+    assert descriptor["test_roots"] == ["tests/health", "tests/users"]
+    assert [r["id"] for r in descriptor["architecture_rules"]["rules"]] == ["R-1"]
+
+    # The control: the coordinator's own path has neither.
+    before = PlanningRunDriver._build_target_repo_descriptor(REPO_KEY, COORDINATOR_PATH, "")
+    assert before["test_roots"] == [] and "architecture_rules" not in before
+
+
+def test_an_unreachable_helper_is_said_for_the_rules_and_the_test_folders() -> None:
+    url = f"http://127.0.0.1:{_closed_port()}"
+    reasons: list[str] = []
+    descriptor = PlanningRunDriver._build_target_repo_descriptor(
+        REPO_KEY, COORDINATOR_PATH, "", reader=SidecarCodeReader(url, repo=REPO_KEY), unavailable=reasons
+    )
+    assert descriptor["test_roots"] == []
+    assert any("for /code/list-files" in r for r in reasons)
+    assert any("for /code/read-file" in r for r in reasons)

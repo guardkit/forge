@@ -9831,7 +9831,12 @@ class PlanningRunDriver:
         return "\n".join(header) + "\n" + body
 
     @staticmethod
-    def _read_architecture_rules(repo_path: str) -> dict[str, Any] | None:
+    def _read_architecture_rules(
+        repo_path: str,
+        *,
+        reader: Any = None,
+        unavailable: list[str] | None = None,
+    ) -> dict[str, Any] | None:
         """Read the target repo's own written architecture rules, if it has any.
 
         A repository may keep its rules in one file — api_test keeps
@@ -9847,6 +9852,12 @@ class PlanningRunDriver:
         byte-for-byte what it was before this existed. A file that cannot be read
         or is the wrong shape is a logged warning and ``None`` as well: a rules
         file must never be able to stop a planning run.
+
+        For a repository read through its sandbox helper (``reader`` is not a
+        local checkout reader; release -3 item 10), the file is read with the
+        helper's ``/code/read-file`` on the factory's own clone. A helper that
+        cannot be reached is not "no rules file": its reason is appended to
+        ``unavailable`` so the plan-writer is told.
         """
 
         def _clip(text: str) -> str:
@@ -9855,11 +9866,29 @@ class PlanningRunDriver:
                 return text
             return text[: _MAX_ARCHITECTURE_RULE_CHARS - 1].rstrip() + "\u2026"
 
-        path = Path(repo_path) / _ARCHITECTURE_RULES_REL
+        path: Any = Path(repo_path) / _ARCHITECTURE_RULES_REL
         try:
-            if not path.is_file():
-                return None
-            data = yaml.safe_load(path.read_text(encoding="utf-8"))
+            if reader is not None and not isinstance(reader, LocalCheckoutReader):
+                path = f"{_ARCHITECTURE_RULES_REL} ({getattr(reader, 'where', 'the helper')})"
+                try:
+                    text = reader.read_text(_ARCHITECTURE_RULES_REL)
+                except RepositoryUnreadable as exc:
+                    logger.warning(
+                        "target_repo_descriptor: could not read the target "
+                        "repo's architecture rules (%s); planning without them, "
+                        "and the plan-writer is told so",
+                        exc,
+                    )
+                    if unavailable is not None:
+                        unavailable.append(str(exc))
+                    return None
+                if text is None:
+                    return None
+                data = yaml.safe_load(text)
+            else:
+                if not path.is_file():
+                    return None
+                data = yaml.safe_load(path.read_text(encoding="utf-8"))
         except Exception as exc:  # noqa: BLE001 — never fail a plan over this
             logger.warning(
                 "target_repo_descriptor: could not read the target repo's "
@@ -9990,6 +10019,19 @@ class PlanningRunDriver:
                     unavailable.append(str(exc))
                 return None
             path = getattr(reader, "where", repo_path)
+            cut = getattr(reader, "listing_cut", None)
+            if isinstance(cut, str) and cut:
+                # A cut listing sent as the inventory would read as the whole
+                # repository; it is said instead.
+                logger.warning(
+                    "target_repo_descriptor: %s (%s); planning without the "
+                    "repository inventory, and the plan-writer is told so",
+                    cut,
+                    path,
+                )
+                if unavailable is not None:
+                    unavailable.append(cut)
+                return None
             files = sorted(
                 entry
                 for entry in tracked
@@ -10223,39 +10265,67 @@ class PlanningRunDriver:
         from forge.planning.target_terminal_tools import (
             TargetTestRootsUnresolved,
             discover_target_test_roots,
+            discover_test_roots_from_listing,
             shallow_discover_test_roots,
         )
 
-        try:
-            test_roots = discover_target_test_roots(repo_path)
-        except TargetTestRootsUnresolved as exc:
-            # Degraded path: guardkit absent from the interpreter. Production
-            # images always ship guardkit (the Dockerfile asserts the import),
-            # so this only fires in a guardkit-less env where the real
-            # ``feature validate`` oracle cannot run either. Fall back to
-            # forge's own discovery so the descriptor is still built and the run
-            # reaches the oracle (the last line of defense) rather than crashing
-            # — log LOUDLY.
-            #
-            # The old fallback returned bare ``["tests"]`` / ``["test"]``, which
-            # is the ROUND-10 DEFECT SHAPE: a bare ``tests`` root is a prefix of
-            # every ``tests/<x>`` path, so the in-session containment gate waves
-            # through an invented subdirectory. The replacement reproduces
-            # guardkit's per-suite Python shape AND the TypeScript shapes, so the
-            # degraded answer has the same geometry as the healthy one.
-            logger.warning(
-                "target_repo_descriptor: guardkit test-root discovery "
-                "unavailable (%s); falling back to forge's own shallow "
-                "discovery — the roots are shape-correct but are not the "
-                "oracle's own answer",
-                exc,
-            )
-            test_roots = shallow_discover_test_roots(repo_path)
+        # Every read below goes through the planner's repository reader
+        # (1 October 2026, release -3 item 10): the sandbox helper for a
+        # sandboxed repository, the checkout otherwise. When the repository
+        # cannot be read the reason goes back through ``unavailable``; the
+        # descriptor gains no field its schema does not define, and the plan
+        # leg says it on the plan-writer's ``repository_facts`` instead.
+        reader = reader or LocalCheckoutReader(
+            repo_path, timeout_s=_REPO_INVENTORY_GIT_TIMEOUT_SECONDS
+        )
+        reasons: list[str] = []
+        if not isinstance(reader, LocalCheckoutReader):
+            # No checkout here to walk: the same discovery runs over the
+            # helper's listing of the factory's own clone.
+            try:
+                test_roots = discover_test_roots_from_listing(reader.list_files())
+            except RepositoryUnreadable as exc:
+                logger.warning(
+                    "target_repo_descriptor: could not discover the test "
+                    "folders (%s); the plan-writer is told so",
+                    exc,
+                )
+                reasons.append(str(exc))
+                test_roots = []
+        else:
+            try:
+                test_roots = discover_target_test_roots(repo_path)
+            except TargetTestRootsUnresolved as exc:
+                # Degraded path: guardkit absent from the interpreter. Production
+                # images always ship guardkit (the Dockerfile asserts the import),
+                # so this only fires in a guardkit-less env where the real
+                # ``feature validate`` oracle cannot run either. Fall back to
+                # forge's own discovery so the descriptor is still built and the
+                # run reaches the oracle (the last line of defense) rather than
+                # crashing — log LOUDLY.
+                #
+                # The old fallback returned bare ``["tests"]`` / ``["test"]``,
+                # which is the ROUND-10 DEFECT SHAPE: a bare ``tests`` root is a
+                # prefix of every ``tests/<x>`` path, so the in-session
+                # containment gate waves through an invented subdirectory. The
+                # replacement reproduces guardkit's per-suite Python shape AND
+                # the TypeScript shapes, so the degraded answer has the same
+                # geometry as the healthy one.
+                logger.warning(
+                    "target_repo_descriptor: guardkit test-root discovery "
+                    "unavailable (%s); falling back to forge's own shallow "
+                    "discovery — the roots are shape-correct but are not the "
+                    "oracle's own answer",
+                    exc,
+                )
+                test_roots = shallow_discover_test_roots(repo_path)
         descriptor: dict[str, Any] = {"repo": target_repo, "test_roots": test_roots}
         # The repo's own architecture rules, when it keeps a rules file. Before
         # this, the plan-writer was never shown them, and two features built the
         # week of 2026-08-24 drifted from rules nobody had told it about.
-        architecture_rules = PlanningRunDriver._read_architecture_rules(repo_path)
+        architecture_rules = PlanningRunDriver._read_architecture_rules(
+            repo_path, reader=reader, unavailable=reasons
+        )
         if architecture_rules is not None:
             descriptor["architecture_rules"] = architecture_rules
         # What the repository ALREADY contains. Before this, the seat was told
@@ -10265,17 +10335,6 @@ class PlanningRunDriver:
         # born. Same shape of cure as the rules above: present only when the
         # repository can be read, absent otherwise, and planning unchanged when
         # it is absent (see :meth:`_read_repository_inventory`).
-        #
-        # Both reads go through the planner's repository reader (1 October
-        # 2026, release -3 item 10): the sandbox helper for a sandboxed
-        # repository, the checkout otherwise. When the repository cannot be
-        # read the reason goes back through ``unavailable``; the descriptor
-        # gains no field its schema does not define, and the plan leg says it
-        # on the plan-writer's ``repository_facts`` instead.
-        reader = reader or LocalCheckoutReader(
-            repo_path, timeout_s=_REPO_INVENTORY_GIT_TIMEOUT_SECONDS
-        )
-        reasons: list[str] = []
         repository_inventory = PlanningRunDriver._read_repository_inventory(
             repo_path, reader=reader, unavailable=reasons
         )

@@ -121,14 +121,23 @@ def _urllib_post(url: str, body: dict[str, Any], timeout: float) -> tuple[int, A
 
 
 #: How long one read of the code door may take for the planner's fact sheet.
-#: Shorter than the git reads: a sheet is a dozen small reads, and a helper
-#: that does not answer should be named on the card quickly, not after an hour.
-_DEFAULT_CODE_READ_TIMEOUT_S: float = 30.0
+#: ABOVE the helper's own walls, so the two never race and a slow answer is
+#: the helper's own "timed out" rather than a socket giving up first: its git
+#: listing may take up to 60 seconds and a search walks for up to 30 more
+#: (``CODE_GIT_TIMEOUT_SECONDS``, ``CODE_SEARCH_TIMEOUT_SECONDS``).
+_DEFAULT_CODE_READ_TIMEOUT_S: float = 100.0
+
+#: How many matching lines one search asks for — the helper's own ceiling.
+_SEARCH_MAX_RESULTS: int = 200
+
+#: How many narrower searches (one per top-level folder) a cut-short search
+#: may be re-asked as, before the answer is reported as cut.
+_MAX_NARROWER_SEARCHES: int = 12
 
 
 class SidecarCodeReader:
-    """The planner's fact sheet reading a sandboxed repository through the
-    helper's read-only code door (``/code/list-files``, ``/code/search``,
+    """The planner's reading of a sandboxed repository through the helper's
+    read-only code door (``/code/list-files``, ``/code/search``,
     ``/code/read-file``), on the factory's own clone inside the sandbox.
 
     A :class:`~forge.planning.repository_facts.RepositoryReader`. It rides
@@ -140,6 +149,17 @@ class SidecarCodeReader:
     :class:`~forge.planning.repository_facts.RepositoryUnreadable` with the
     reason, which the sheet turns into its explicit unavailable state. One
     file the door will not serve (too large, not text) is ``None``.
+
+    A CUT-SHORT ANSWER IS NEVER TAKEN FOR A WHOLE ONE. The helper caps a
+    search at 200 matching lines and 30 seconds, and a listing at 5,000
+    files, and says so (``capped``, ``timed_out``). A search that was capped
+    is asked again one top-level folder at a time, from the folder it was cut
+    in onward (the helper walks files in sorted order, so everything before
+    that point was searched); whatever is STILL cut is written to
+    :attr:`cuts` in plain words, which the fact sheet prints. A listing that
+    was cut sets :attr:`listing_cut`. :meth:`places_mentioning` raises
+    instead, because a "where this already appears" pointer that missed the
+    source is worse than none.
     """
 
     def __init__(
@@ -155,6 +175,11 @@ class SidecarCodeReader:
         self._post = post
         self._timeout_s = timeout_s
         self.where = f"{repo} through the sandbox helper at {self._base_url}"
+        #: Plain sentences, one per answer that came back cut short.
+        self.cuts: list[str] = []
+        #: The sentence when the listing itself was cut, else ``None``.
+        self.listing_cut: str | None = None
+        self._listing: list[str] | None = None
 
     def _answer(self, route: str, body: dict[str, Any]) -> tuple[int, Any]:
         from forge.planning.repository_facts import RepositoryUnreadable
@@ -178,38 +203,108 @@ class SidecarCodeReader:
         )
 
     def list_files(self) -> list[str]:
+        """Every tracked file — asked once per reader and kept."""
+        if self._listing is not None:
+            return list(self._listing)
         route = "/code/list-files"
         status, decoded = self._answer(route, {})
         if status != 200 or not isinstance(decoded, dict):
             raise self._refused(route, status, decoded)
-        return [str(path) for path in decoded.get("files") or []]
+        files = [str(path) for path in decoded.get("files") or []]
+        if decoded.get("capped"):
+            self.listing_cut = (
+                f"the helper listed only the first {len(files)} of "
+                f"{decoded.get('total_tracked', 'more')} tracked files"
+            )
+            self.cuts.append(self.listing_cut)
+        self._listing = files
+        return list(files)
 
-    def files_mentioning(self, text: str, *, ignore_case: bool = False) -> list[str]:
+    def _search_once(self, body: dict[str, Any]) -> dict[str, Any]:
         route = "/code/search"
-        status, decoded = self._answer(
-            route,
-            {"pattern": text, "fixed_string": True, "case_insensitive": bool(ignore_case)},
-        )
+        status, decoded = self._answer(route, body)
         if status != 200 or not isinstance(decoded, dict):
             raise self._refused(route, status, decoded)
+        return decoded
+
+    def _search(self, text: str, *, ignore_case: bool) -> tuple[list[dict[str, Any]], str | None]:
+        """Every match for ``text``, and the sentence saying what was cut
+        (``None`` when the answer is whole)."""
+        body: dict[str, Any] = {
+            "pattern": text,
+            "fixed_string": True,
+            "case_insensitive": bool(ignore_case),
+            "max_results": _SEARCH_MAX_RESULTS,
+        }
+        first = self._search_once(body)
+        matches = [m for m in first.get("matches") or [] if isinstance(m, dict)]
+        if first.get("timed_out"):
+            return matches, (
+                f'the search for `{text}` stopped at the helper\'s time limit '
+                f"after {first.get('files_searched', 'some')} file(s), so the "
+                "rest of the repository was not searched"
+            )
+        if not first.get("capped") or not matches:
+            return matches, None
+        # Cut at the line cap. Everything before the file it was cut in was
+        # searched (sorted walk); search each top-level folder from that one
+        # on, by itself.
+        last = str(matches[-1].get("path") or "")
+        tracked = self.list_files()
+        last_top = last.split("/", 1)[0] if "/" in last else ""
+        tops = sorted({p.split("/", 1)[0] for p in tracked if "/" in p and p.split("/", 1)[0] >= last_top})
+        loose = [p for p in tracked if "/" not in p and p > last]
+        seen = {(m.get("path"), m.get("line")) for m in matches}
+        cut: str | None = None
+        if len(tops) > _MAX_NARROWER_SEARCHES:
+            cut = (
+                f'the search for `{text}` was cut short at {_SEARCH_MAX_RESULTS} '
+                f"matching lines, so files after `{last}` were not searched"
+            )
+            tops = tops[:_MAX_NARROWER_SEARCHES]
+        for top in tops:
+            answer = self._search_once({**body, "under": top})
+            for m in answer.get("matches") or []:
+                key = (m.get("path"), m.get("line"))
+                if isinstance(m, dict) and key not in seen:
+                    seen.add(key)
+                    matches.append(m)
+            if answer.get("capped") or answer.get("timed_out"):
+                cut = cut or (
+                    f'the search for `{text}` was cut short in `{top}/` (the '
+                    f"helper answers at most {_SEARCH_MAX_RESULTS} matching "
+                    "lines in 30 seconds), so some of its files were not searched"
+                )
+        if loose and cut is None:
+            cut = (
+                f'the search for `{text}` was cut short, so '
+                + ", ".join(f"`{p}`" for p in loose[:3])
+                + (" and others" if len(loose) > 3 else "")
+                + " at the top of the repository were not searched"
+            )
+        return matches, cut
+
+    def files_mentioning(self, text: str, *, ignore_case: bool = False) -> list[str]:
+        matches, cut = self._search(text, ignore_case=ignore_case)
+        if cut:
+            self.cuts.append(cut)
         found: list[str] = []
-        for match in decoded.get("matches") or []:
-            path = str((match or {}).get("path") or "")
+        for match in matches:
+            path = str(match.get("path") or "")
             if path and path not in found:
                 found.append(path)
         return found
 
     def places_mentioning(self, text: str) -> list[str]:
-        route = "/code/search"
-        status, decoded = self._answer(
-            route, {"pattern": text, "fixed_string": True, "max_results": 200}
-        )
-        if status != 200 or not isinstance(decoded, dict):
-            raise self._refused(route, status, decoded)
+        from forge.planning.repository_facts import RepositoryUnreadable
+
+        matches, cut = self._search(text, ignore_case=False)
+        if cut:
+            raise RepositoryUnreadable(cut)
         places: list[str] = []
-        for match in decoded.get("matches") or []:
-            path = str((match or {}).get("path") or "")
-            line = (match or {}).get("line")
+        for match in matches:
+            path = str(match.get("path") or "")
+            line = match.get("line")
             if path and line is not None and f"{path}:{line}" not in places:
                 places.append(f"{path}:{line}")
         return places
