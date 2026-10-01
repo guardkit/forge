@@ -1307,6 +1307,43 @@ class SqliteLifecyclePersistence:
         name = row["memory_project"] if isinstance(row, sqlite3.Row) else row[0]
         return str(name) if name else None
 
+    def read_planning_repository_unavailable(self, correlation_id: str | None) -> str | None:
+        """The plain line the planning run recorded when its planner could not
+        read the repository, or ``None`` (release -3 item 10, 1 October 2026).
+
+        Written by the plan leg on its approved ``feature-plan`` record and
+        read here so the build gate's card can say it. Read-only and
+        forgiving, like the starting-point and memory readers beside it: no
+        planning run, no such record, or a ledger that cannot answer is
+        ``None`` — the gate card is then exactly what it always was.
+        """
+        if not correlation_id:
+            return None
+        try:
+            row = self._cx.execute(
+                """
+                SELECT details_json
+                  FROM planning_run_events
+                 WHERE correlation_id = ?
+                   AND stage_label = 'feature-plan'
+                   AND status = 'approved'
+                 ORDER BY id DESC
+                 LIMIT 1
+                """,
+                (correlation_id,),
+            ).fetchone()
+        except sqlite3.Error:
+            return None
+        if row is None:
+            return None
+        raw = row["details_json"] if isinstance(row, sqlite3.Row) else row[0]
+        try:
+            details = json.loads(raw) if raw else {}
+        except (TypeError, ValueError):
+            return None
+        line = details.get("repository_unavailable") if isinstance(details, dict) else None
+        return str(line) if isinstance(line, str) and line.strip() else None
+
     def read_memory_project(self, build_id: str) -> str | None:
         """Which memory this build belongs to, or ``None`` for "not recorded".
 

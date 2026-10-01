@@ -48,6 +48,7 @@ from forge.config.models import PlanningConfig, TargetTerminalConfig
 from forge.gating.identity import derive_request_id
 from forge.lifecycle import migrations
 from forge.planning import driver as driver_module
+from forge.planning import repository_facts as repository_facts_module
 from forge.planning.driver import (
     BuildTriggerResult,
     PlanningDriverDeps,
@@ -4072,7 +4073,7 @@ def test_a_git_that_times_out_warns_and_does_not_raise(
     def _slow(*args: Any, **kwargs: Any) -> Any:
         raise subprocess.TimeoutExpired(cmd="git ls-files", timeout=10)
 
-    monkeypatch.setattr(driver_module.subprocess, "run", _slow)
+    monkeypatch.setattr(repository_facts_module.subprocess, "run", _slow)
 
     with caplog.at_level(logging.WARNING):
         descriptor = PlanningRunDriver._build_target_repo_descriptor(
@@ -4101,7 +4102,7 @@ def test_the_git_command_is_an_argument_list_with_no_shell(
         seen["kwargs"] = kwargs
         return real_run(cmd, **kwargs)
 
-    monkeypatch.setattr(driver_module.subprocess, "run", _record)
+    monkeypatch.setattr(repository_facts_module.subprocess, "run", _record)
     PlanningRunDriver._read_repository_inventory(str(repo))
 
     assert seen["cmd"] == [
@@ -7688,3 +7689,106 @@ async def test_failed_exact_re_review_stops_normalized_plan_before_commit(
         "did not mark the rewritten tree" in message
         for _, message, _ in h.ctx["notifications"]
     )
+
+
+# ---------------------------------------------------------------------------
+# Release -3 item 10, follow-up: the plan leg reads the repository where
+# every other planning call for it goes, and when it cannot, the plan-writer,
+# the plan's own record and so the build gate card all say so.
+# ---------------------------------------------------------------------------
+
+
+def _helper_over(clone: Path):
+    """The sandbox helper's real server over ``clone``; returns (url, stop)."""
+    import threading
+
+    from forge.config.models import ForgeConfig
+    from forge.deploy_sidecar.service import build_server
+
+    cfg = ForgeConfig.model_validate(
+        {
+            "permissions": {"filesystem": {"allowlist": ["/tmp"]}},
+            "planning": {"target_repo_paths": {TARGET_REPO: str(clone)}},
+        }
+    )
+    srv = build_server(port=0, config_loader=lambda: cfg)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    host, port = srv.server_address[:2]
+
+    def stop() -> None:
+        srv.shutdown()
+        srv.server_close()
+
+    return f"http://{host}:{port}", stop
+
+
+@pytest.mark.asyncio
+async def test_the_plan_writers_inventory_comes_from_the_sandbox_helper(
+    store: SqlitePlanningRunStore, tmp_path: Path
+) -> None:
+    """The plan-writer's inventory is the sandbox clone's, read through the
+    helper — a file only that clone tracks is on it — and nothing says the
+    repository could not be read."""
+    from forge.planning.sidecar_git_runner import SidecarCodeReader
+
+    repo = tmp_path / "api_test"
+    _init_repo_with_a_stats_route(repo)
+    clone = tmp_path / "sandbox-clone"
+    _init_repo_with_a_stats_route(clone)
+    (clone / "src" / "only_in_the_sandbox_clone.py").write_text("x = 1\n")
+    _git(clone, "add", "-A")
+    _git(clone, "commit", "-qm", "the clone's own file")
+    url, stop = _helper_over(clone)
+    try:
+        git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+        git.code_reader = lambda: SidecarCodeReader(url, repo=TARGET_REPO)  # type: ignore[attr-defined]
+        _queue(store)
+        h = _make_driver(store, git_runner=git, repo_path=str(repo))
+        await h.driver.drive(CID)
+    finally:
+        stop()
+
+    counters = h.ctx["counters"]
+    assert counters["plan"] == 1
+    inventory = counters["last_descriptor"]["repository_inventory"]["files"]
+    assert "src/only_in_the_sandbox_clone.py" in inventory
+    assert "could not read" not in json.dumps(_leg_details(store, "feature-plan"))
+    assert "unavailable" not in (counters["last_repository_facts"] or "")
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_repository_reaches_the_plan_writer_and_the_build_gate_record(
+    store: SqlitePlanningRunStore, tmp_path: Path
+) -> None:
+    """The helper does not answer: the plan-writer's repository_facts begins
+    "Repository facts unavailable:", and the plan's approved record carries
+    the plain card line the build gate reads off the same ledger."""
+    import socket
+
+    from forge.lifecycle.persistence import SqliteLifecyclePersistence
+    from forge.planning.sidecar_git_runner import SidecarCodeReader
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        url = f"http://127.0.0.1:{sock.getsockname()[1]}"
+    repo = tmp_path / "api_test"
+    _init_repo_with_a_stats_route(repo)
+    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    git.code_reader = lambda: SidecarCodeReader(url, repo=TARGET_REPO)  # type: ignore[attr-defined]
+    _queue(store)
+    h = _make_driver(store, git_runner=git, repo_path=str(repo))
+    await h.driver.drive(CID)
+
+    counters = h.ctx["counters"]
+    assert counters["plan"] == 1
+    assert (counters["last_repository_facts"] or "").startswith(
+        f"Repository facts unavailable: the sandbox helper at {url} could not be reached"
+    )
+    assert "repository_inventory" not in counters["last_descriptor"]
+    line = _leg_details(store, "feature-plan")["repository_unavailable"]
+    assert line.startswith(
+        "The machine could not read the repository while writing this, so nothing "
+        f"checked it against what the repository already has (the sandbox helper at {url}"
+    )
+    ledger = SqliteLifecyclePersistence(connection=store._connection)
+    assert ledger.read_planning_repository_unavailable(CID) == line

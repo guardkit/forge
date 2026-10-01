@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
+from typing import Callable
 
 from forge.gating.models import (
     CalibrationAdjustment,
@@ -44,6 +45,7 @@ __all__ = [
     "EmptyPriorsReader",
     "EmptyRulesReader",
     "degraded_dispatch_gate_model",
+    "degraded_dispatch_gate_model_saying",
     "degraded_recovery_decision",
 ]
 
@@ -91,6 +93,29 @@ def degraded_dispatch_gate_model(prompt: str) -> str:
     truthful degraded :class:`GateDecision`.
     """
     return _DEGRADED_RESPONSE_BODY
+
+
+def degraded_dispatch_gate_model_saying(extra: str) -> "Callable[[str], str]":
+    """The same static decision, with one more plain sentence on the card.
+
+    Used by the pre-dispatch gate when the planning run behind the build
+    recorded something the person tapping the gate must see — today, that
+    the planner could not read the repository (release -3 item 10). The mode
+    and threshold are unchanged; only the rationale the card renders grows.
+    """
+    body = json.dumps(
+        {
+            "mode": GateMode.MANDATORY_HUMAN_APPROVAL.value,
+            "rationale": f"{DEGRADED_RATIONALE} {extra.strip()}".strip(),
+            "threshold_applied": None,
+            "relevant_prior_ids": [],
+        }
+    )
+
+    def _model(prompt: str) -> str:
+        return body
+
+    return _model
 
 
 class EmptyPriorsReader:

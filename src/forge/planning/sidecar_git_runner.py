@@ -199,6 +199,21 @@ class SidecarCodeReader:
                 found.append(path)
         return found
 
+    def places_mentioning(self, text: str) -> list[str]:
+        route = "/code/search"
+        status, decoded = self._answer(
+            route, {"pattern": text, "fixed_string": True, "max_results": 200}
+        )
+        if status != 200 or not isinstance(decoded, dict):
+            raise self._refused(route, status, decoded)
+        places: list[str] = []
+        for match in decoded.get("matches") or []:
+            path = str((match or {}).get("path") or "")
+            line = (match or {}).get("line")
+            if path and line is not None and f"{path}:{line}" not in places:
+                places.append(f"{path}:{line}")
+        return places
+
     def read_text(self, path: str) -> str | None:
         status, decoded = self._answer("/code/read-file", {"path": path})
         if status == 200 and isinstance(decoded, dict) and not decoded.get("partial"):

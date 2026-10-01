@@ -48,6 +48,7 @@ from forge.gating.degraded import (
     EmptyAdjustmentsReader,
     EmptyRulesReader,
     degraded_dispatch_gate_model,
+    degraded_dispatch_gate_model_saying,
 )
 from forge.gating.wrappers import GateOutcome, await_and_dispatch, gate_check
 from forge.lifecycle.persistence import (
@@ -372,6 +373,17 @@ async def maybe_gate_build(
         correlation_id=correlation_id or "",
         wave_total=1,
     )
+    # The card the person taps says, in plain words, when the plan behind
+    # this build was written without the repository (release -3 item 10):
+    # the planning run recorded the line on its approved plan.
+    reasoning_model_call = degraded_dispatch_gate_model
+    reader = getattr(sqlite_pool, "read_planning_repository_unavailable", None)
+    try:
+        unavailable_line = reader(correlation_id) if callable(reader) else None
+    except Exception:  # noqa: BLE001 — a card line must never stop the gate
+        unavailable_line = None
+    if isinstance(unavailable_line, str) and unavailable_line.strip():
+        reasoning_model_call = degraded_dispatch_gate_model_saying(unavailable_line)
     deps = make_gate_check_deps(
         parts,
         priors_reader=parts.priors_reader,
@@ -379,7 +391,7 @@ async def maybe_gate_build(
         rules_reader=EmptyRulesReader(),
         repository=gate_repository,
         state_machine=gate_state_machine,
-        reasoning_model_call=degraded_dispatch_gate_model,
+        reasoning_model_call=reasoning_model_call,
         ctx=ctx,
         clock=clock,
     )
