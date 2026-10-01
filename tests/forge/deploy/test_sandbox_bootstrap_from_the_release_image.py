@@ -394,7 +394,11 @@ if verb == "run":
         }) + "\\n")
     (state / name).write_text("made\\n")
     (state / (name + ".running")).write_text("up\\n")
-    if name == os.environ.get("STANDIN_DIES_AT_ONCE", ""):
+    once = state / (name + ".died-once")
+    dies_once = name == os.environ.get("STANDIN_DIES_ONCE", "") and not once.exists()
+    if dies_once:
+        once.write_text("it died the first time it was started\\n")
+    if dies_once or name == os.environ.get("STANDIN_DIES_AT_ONCE", ""):
         # Made, and gone a moment later, as a service whose port is taken is.
         (state / (name + ".running")).unlink(missing_ok=True)
         lines = ["start-up line %d of %s" % (n, name) for n in range(1, 31)]
@@ -2852,6 +2856,112 @@ class TestAContainerThatDiesSaysWhy:
         not_up = [line for line in said.splitlines() if "NOT both up" in line]
         assert not_up and "forge-sandbox-runner" in not_up[0]
         assert "forge-sandbox-helper" not in not_up[0]
+
+    @staticmethod
+    def _a_silent_listener():
+        """A loopback port that takes every connection and never says a word."""
+        import socket
+        import threading
+
+        server = socket.socket()
+        server.bind(("127.0.0.1", 0))
+        server.listen(16)
+        held = []
+
+        def accept_and_hold():
+            while True:
+                try:
+                    connection, _ = server.accept()
+                except OSError:
+                    return
+                held.append(connection)
+
+        threading.Thread(target=accept_and_hold, daemon=True).start()
+        return server, held
+
+    def test_a_port_that_takes_the_connection_and_says_nothing_is_reported_in_time(
+        self, sandbox
+    ):
+        """Codex round 2: the wait counted its one-second pauses and not the
+        three-second probes, so a silent port stretched the bound fourfold."""
+        helper = self._a_listener({"/healthz": '{"status": "healthy"}'})
+        silent, held = self._a_silent_listener()
+        settle = 6
+        started = time.monotonic()
+        try:
+            def the_verdict_is_out():
+                calls = _calls(sandbox)
+                reads = [i for i, c in enumerate(calls)
+                         if c.startswith("logs ") and c.endswith(" forge-sandbox-runner")]
+                return bool(reads) and any(c.startswith("ps ") for c in calls[reads[0] + 1:])
+
+            said = self._run_until(
+                sandbox,
+                the_verdict_is_out,
+                SANDBOX_RUNNER_SETTLE_SECONDS=str(settle),
+                SANDBOX_RUNNER_BIND="127.0.0.1",
+                SANDBOX_SIDECAR_PORT=str(helper.server_address[1]),
+                SANDBOX_RUNNER_PORT=str(silent.getsockname()[1]),
+            )
+            elapsed = time.monotonic() - started
+        finally:
+            helper.shutdown()
+            silent.close()
+            for connection in held:
+                connection.close()
+        # The bound, with room for the bootstrap's own start and one second of
+        # the clock's granularity; counted pauses made this about four times it.
+        assert elapsed < settle + 6, elapsed
+        assert "takes the connection and sends nothing back" in said
+        not_up = [line for line in said.splitlines() if "NOT both up" in line]
+        assert not_up and "forge-sandbox-runner" in not_up[0]
+
+    def test_a_restart_into_a_silent_port_holds_up_the_other_no_longer_than_the_bound(
+        self, sandbox
+    ):
+        """The supervisor still looks at the other container, within the bound.
+
+        The runner dies once at start-up and is made again by the supervisor,
+        this time into a port that takes connections and answers nothing. The
+        check of the remade runner may hold up the next look at the helper for
+        at most the bound, once.
+        """
+        helper = self._a_listener({"/healthz": '{"status": "healthy"}'})
+        silent, held = self._a_silent_listener()
+        settle = 4
+        seen = {}
+        try:
+            def the_helper_is_looked_at_after_the_remake():
+                calls = _calls(sandbox)
+                runs = [i for i, c in enumerate(calls)
+                        if c.startswith("run ") and "--name forge-sandbox-runner" in c]
+                if len(runs) < 2:
+                    return False
+                seen.setdefault("remade", time.monotonic())
+                after = calls[runs[1] + 1:]
+                if any(c.startswith("ps ") and "forge-sandbox-helper" in c
+                       and "-a" not in c.split() for c in after):
+                    seen.setdefault("helper-looked-at", time.monotonic())
+                    return True
+                return False
+
+            said = self._run_until(
+                sandbox,
+                the_helper_is_looked_at_after_the_remake,
+                STANDIN_DIES_ONCE="forge-sandbox-runner",
+                SANDBOX_RUNNER_SETTLE_SECONDS=str(settle),
+                SANDBOX_RUNNER_BIND="127.0.0.1",
+                SANDBOX_SIDECAR_PORT=str(helper.server_address[1]),
+                SANDBOX_RUNNER_PORT=str(silent.getsockname()[1]),
+            )
+        finally:
+            helper.shutdown()
+            silent.close()
+            for connection in held:
+                connection.close()
+        assert "helper-looked-at" in seen, said
+        assert seen["helper-looked-at"] - seen["remade"] < settle + 3, seen
+        assert "takes the connection and sends nothing back" in said
 
     def test_the_note_no_longer_says_a_clash_fails_loudly(self):
         flat = " ".join(BOOTSTRAP.read_text().replace("#", " ").split())

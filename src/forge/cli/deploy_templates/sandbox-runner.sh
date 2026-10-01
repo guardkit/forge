@@ -501,6 +501,11 @@ STOP_PATIENCE_SECONDS="${SANDBOX_RUNNER_STOP_PATIENCE_SECONDS:-30}"
 # called not up (release -3, after the re-check of the network change). It is
 # an upper bound: the wait ends the moment the service answers. Sixty seconds
 # is well over both services' start-up on a sandbox (a few seconds each).
+# The bound is WALL-CLOCK time, every probe included (Codex round 2: the first
+# version counted only its one-second pauses, so a port that took connections
+# and never answered stretched sixty seconds to about four minutes). The wait
+# can overrun it only by the one question to this sandbox's engine that may
+# already be under way when the time runs out.
 SETTLE_SECONDS="${SANDBOX_RUNNER_SETTLE_SECONDS:-60}"
 #: How much of a dead container's own output is printed before it is removed.
 LAST_WORDS_LINES=20
@@ -1536,21 +1541,34 @@ ensure_runner
 # The question is asked with bash's own /dev/tcp and nothing else, so it needs
 # no program the sandbox might not have. It asks the sandbox's own address,
 # because both services share the sandbox's network.
+#
+# Each probe is given at most PROBE_SECONDS, and never more than the wait has
+# left (the caller says how long that is), so a port that takes the connection
+# and then says nothing costs the wait real seconds that are counted, not free
+# ones. Such a port is reported as exactly that.
 answers_as_itself() {
-  local port="$1" route="$2" expected="$3" host="${BIND}" reply=""
+  local port="$1" route="$2" expected="$3" allowed="$4" host="${BIND}" reply="" outcome=0
   [[ "${host}" == "0.0.0.0" || "${host}" == "::" || -z "${host}" ]] && host="127.0.0.1"
-  reply="$(timeout 3 bash -c 'exec 3<>"/dev/tcp/$0/$1" || exit 1; printf "GET %s HTTP/1.0\r\nHost: %s\r\n\r\n" "$2" "$0" >&3; head -c 4096 <&3' "${host}" "${port}" "${route}" 2>/dev/null)" || true
+  reply="$(timeout "${allowed}" bash -c 'exec 3<>"/dev/tcp/$0/$1" || exit 1; printf "GET %s HTTP/1.0\r\nHost: %s\r\n\r\n" "$2" "$0" >&3; head -c 4096 <&3' "${host}" "${port}" "${route}" 2>/dev/null)" || outcome=$?
   WHAT_ANSWERED="$(printf '%s' "${reply}" | head -1 | tr -d '\r' | cut -c1-120)"
+  if [[ -z "${WHAT_ANSWERED}" && "${outcome}" == 124 ]]; then
+    WHAT_ANSWERED="(something takes the connection and sends nothing back within ${allowed}s)"
+  fi
   [[ -n "${reply}" && "${reply}" == *"${expected}"* ]]
 }
+PROBE_SECONDS=3
 
 # WAIT FOR ONE SERVICE: 0 it answers as itself, 1 its container died (and why
 # has been said), 3 it is running and does not answer as itself (said, with
-# what answers instead), 2 the engine would not say. Gives up after
-# SETTLE_SECONDS; returns as soon as it knows.
+# what answers instead), 2 the engine would not say. Gives up when
+# SETTLE_SECONDS of wall-clock time have passed, probes included; returns as
+# soon as it knows.
 WHAT_ANSWERED=""
+seconds_now() { date +%s; }
 wait_until_it_answers() {
-  local what="$1" name="$2" port="$3" route="$4" expected="$5" waited=0 answer=0
+  local what="$1" name="$2" port="$3" route="$4" expected="$5" answer=0
+  local deadline=$(( $(seconds_now) + SETTLE_SECONDS )) left=0 allowed=0
+  WHAT_ANSWERED=""
   while :; do
     answer=0
     container_running "${name}" || answer=$?
@@ -1558,10 +1576,15 @@ wait_until_it_answers() {
       say_why_it_stopped "${what}" "${name}"
       return 1
     fi
-    if ((answer == 0)) && answers_as_itself "${port}" "${route}" "${expected}"; then
-      return 0
+    left=$(( deadline - $(seconds_now) ))
+    if ((answer == 0 && left > 0)); then
+      allowed=$(( left < PROBE_SECONDS ? left : PROBE_SECONDS ))
+      if answers_as_itself "${port}" "${route}" "${expected}" "${allowed}"; then
+        return 0
+      fi
     fi
-    if ((waited >= SETTLE_SECONDS)); then
+    left=$(( deadline - $(seconds_now) ))
+    if ((left <= 0)); then
       if ((answer == 2)); then
         log "this sandbox's own engine would not say whether ${what} (${name}) is running (${WHY_THE_ENGINE_WOULD_NOT_SAY})"
         return 2
@@ -1575,7 +1598,6 @@ wait_until_it_answers() {
       return 3
     fi
     nap 1
-    waited=$((waited + 1))
   done
 }
 
@@ -1629,6 +1651,12 @@ while ((STOPPING == 0)); do
   ((STOPPING == 1)) && break
   # A container made again is checked the same way as at the start, so a
   # port taken while it was down is said plainly rather than found later.
+  # That check holds up the look at the OTHER container for at most
+  # SETTLE_SECONDS, once per restart, and only when the one made again comes
+  # up running without answering as itself: one that answers ends the wait at
+  # once, one that dies again ends it within a second, and one that stays up
+  # not answering is never restarted again (it has not died), so the delay
+  # cannot repeat round after round.
   watch_one "the deploy helper" "${HELPER_NAME}" || { ensure_helper; confirm_the_helper || true; }
   ((STOPPING == 1)) && break
   watch_one "the build runner" "${RUNNER_NAME}" || { ensure_runner; confirm_the_runner || true; }
