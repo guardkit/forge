@@ -372,6 +372,15 @@ class SidecarCodeReader:
             last = str(matches[-1].get("path") or "")
             head = (under + "/") if under else ""
             inside = [p for p in self.list_files() if p.startswith(head)]
+            if self.listing_cut is not None:
+                # The helper's search walks every tracked file, but its
+                # listing stops at 5,000: files past the listing can never be
+                # proven recovered, so this search stays marked partial.
+                gaps.append(
+                    f"the search in {where} was cut short and the file list "
+                    "used to finish it was itself incomplete, so some files "
+                    "may not have been searched"
+                )
             folders: dict[str, list[str]] = {}
             files: list[str] = []
             for path in inside:
