@@ -88,6 +88,7 @@ __all__ = [
     "models_in_python_file",
     "read_repository_facts",
     "routes_in_python_file",
+    "unavailable_text",
     "what_the_repository_already_does",
 ]
 
@@ -135,7 +136,7 @@ class RepositoryUnreadable(Exception):
 
 
 class RepositoryReader(Protocol):
-    """The three reads the fact sheet makes, wherever the repository is."""
+    """The reads the planner makes, wherever the repository is."""
 
     #: Plain words naming where the repository is read from.
     where: str
@@ -148,6 +149,10 @@ class RepositoryReader(Protocol):
         """The tracked files whose text contains ``text`` literally. Raises
         :class:`RepositoryUnreadable` when the repository cannot be read."""
 
+    def places_mentioning(self, text: str) -> list[str]:
+        """Every ``path:line`` whose text contains ``text`` literally. Raises
+        :class:`RepositoryUnreadable` when the repository cannot be read."""
+
     def read_text(self, path: str) -> str | None:
         """One tracked file's text; ``None`` when that one file cannot be
         served (too large, not text). Raises :class:`RepositoryUnreadable`
@@ -155,24 +160,40 @@ class RepositoryReader(Protocol):
 
 
 class LocalCheckoutReader:
-    """A checkout the coordinator holds itself, read with ``git``."""
+    """A checkout the coordinator holds itself, read with ``git``.
 
-    def __init__(self, repo_path: str, *, timeout_s: float = 20.0) -> None:
+    ``timeout_s`` bounds the listing, ``search_timeout_s`` each search. A
+    directory without its own ``.git`` is refused rather than read: ``git -C``
+    walks UP to find a repository, so a plain directory inside somebody
+    else's checkout would otherwise answer with that checkout's files.
+    """
+
+    def __init__(
+        self, repo_path: str, *, timeout_s: float = 10.0, search_timeout_s: float = 30.0
+    ) -> None:
         self._root = Path(str(repo_path))
         self._timeout_s = timeout_s
+        self._search_timeout_s = search_timeout_s
         self.where = f"the checkout at {self._root}"
 
-    def _git(self, *args: str) -> subprocess.CompletedProcess[str]:
+    def _check_root(self) -> None:
         if not self._root.is_dir():
             raise RepositoryUnreadable(
                 f"there is no checkout at {self._root} where the planner runs"
             )
+        if not (self._root / ".git").exists():
+            raise RepositoryUnreadable(f"{self._root} is not a git repository (no .git)")
+
+    def _git(self, *args: str, timeout: float) -> subprocess.CompletedProcess[str]:
+        self._check_root()
         try:
             return subprocess.run(
                 ["git", "-c", "safe.directory=*", "-C", str(self._root), *args],
                 capture_output=True,
                 text=True,
-                timeout=self._timeout_s,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout,
                 check=False,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
@@ -180,33 +201,43 @@ class LocalCheckoutReader:
                 f"git could not read {self.where} ({type(exc).__name__})"
             ) from exc
 
+    @staticmethod
+    def _first_line(stderr: str) -> str:
+        return (" ".join((stderr or "").split()) or "no reason given")[:200]
+
     def list_files(self) -> list[str]:
-        completed = self._git("ls-files", "-z")
+        completed = self._git("ls-files", "-z", timeout=self._timeout_s)
         if completed.returncode != 0:
             raise RepositoryUnreadable(
-                f"git could not list {self.where}: "
-                + (completed.stderr.strip().splitlines() or ["no reason given"])[0][:200]
+                f"listing the tracked files of {self.where} failed (git exited "
+                f"{completed.returncode}: {self._first_line(completed.stderr)})"
             )
         return [p for p in completed.stdout.split("\0") if p]
 
-    def files_mentioning(self, text: str, *, ignore_case: bool = False) -> list[str]:
-        args = ["grep", "-l", "-F"] + (["-i"] if ignore_case else []) + ["-e", text]
-        completed = self._git(*args)
+    def _grep(self, *args: str) -> list[str]:
+        completed = self._git("grep", *args, timeout=self._search_timeout_s)
         # git grep answers 1 for "no match": that is an answer, not a failure.
         if completed.returncode == 1 and not completed.stderr.strip():
             return []
         if completed.returncode != 0:
             raise RepositoryUnreadable(
-                f"git could not search {self.where}: "
-                + (completed.stderr.strip().splitlines() or ["no reason given"])[0][:200]
+                f"searching {self.where} failed (git exited "
+                f"{completed.returncode}: {self._first_line(completed.stderr)})"
             )
-        return [line.strip() for line in completed.stdout.splitlines() if line.strip()]
+        return [line for line in completed.stdout.splitlines() if line.strip()]
+
+    def files_mentioning(self, text: str, *, ignore_case: bool = False) -> list[str]:
+        args = ["-l", "-F"] + (["-i"] if ignore_case else []) + ["-e", text]
+        return [line.strip() for line in self._grep(*args)]
+
+    def places_mentioning(self, text: str) -> list[str]:
+        return [
+            ":".join(line.split(":", 2)[:2])
+            for line in self._grep("-n", "--fixed-strings", "--", text)
+        ]
 
     def read_text(self, path: str) -> str | None:
-        if not self._root.is_dir():
-            raise RepositoryUnreadable(
-                f"there is no checkout at {self._root} where the planner runs"
-            )
+        self._check_root()
         try:
             data = (self._root / path).read_bytes()
         except OSError:
@@ -249,8 +280,14 @@ class RepositoryFacts:
     def text(self) -> str | None:
         """What the coach and the deterministic reviewers are given."""
         if self.unavailable:
-            return f"{UNAVAILABLE_PREFIX}{self.unavailable}.{_UNAVAILABLE_TAIL}"
+            return unavailable_text(self.unavailable)
         return self.sheet
+
+
+def unavailable_text(reason: str) -> str:
+    """The sentence a coach or plan-writer is given in place of facts it could
+    not have, with the reason the repository could not be read."""
+    return f"{UNAVAILABLE_PREFIX}{reason}.{_UNAVAILABLE_TAIL}"
 
 
 #: Extensions that are documentation or configuration, never a route table.

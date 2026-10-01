@@ -341,3 +341,92 @@ def test_a_non_python_repository_yields_only_provable_facts(tmp_path: Path) -> N
     assert "declares class" not in sheet
     assert "requireAuth" not in sheet
     assert "README" not in sheet
+
+
+# ---------------------------------------------------------------------------
+# The plan-writer's repository inventory and the search for the
+# specification's words go the same way (release -3 item 10, follow-up). On
+# 1 October both read the coordinator's missing checkout and went quiet:
+# "planning without the repository inventory".
+# ---------------------------------------------------------------------------
+
+SPEC = "Feature: users\n  Scenario: count\n    When I send GET /users/count-today\n"
+
+
+def test_the_inventory_and_the_specs_words_are_read_through_the_helper(helper: str) -> None:
+    reasons: list[str] = []
+    descriptor = PlanningRunDriver._build_target_repo_descriptor(
+        REPO_KEY,
+        COORDINATOR_PATH,
+        SPEC,
+        reader=SidecarCodeReader(helper, repo=REPO_KEY),
+        unavailable=reasons,
+    )
+    assert reasons == []
+    assert "src/users/models.py" in descriptor["repository_inventory"]["files"]
+    places = [p for row in descriptor["where_the_specs_words_already_appear"] for p in row["already_in"]]
+    assert any(p.startswith("src/users/router.py:") for p in places)
+
+    # The control: what the descriptor read before — the coordinator's own
+    # path — has nothing at it, and now says so instead of going quiet.
+    control: list[str] = []
+    before = PlanningRunDriver._build_target_repo_descriptor(
+        REPO_KEY, COORDINATOR_PATH, SPEC, unavailable=control
+    )
+    assert "repository_inventory" not in before
+    assert control and control[0] == f"there is no checkout at {COORDINATOR_PATH} where the planner runs"
+
+
+def test_an_unreachable_helper_is_said_for_the_inventory_and_the_words() -> None:
+    url = f"http://127.0.0.1:{_closed_port()}"
+    reasons: list[str] = []
+    descriptor = PlanningRunDriver._build_target_repo_descriptor(
+        REPO_KEY, COORDINATOR_PATH, SPEC,
+        reader=SidecarCodeReader(url, repo=REPO_KEY),
+        unavailable=reasons,
+    )
+    assert "repository_inventory" not in descriptor
+    assert "where_the_specs_words_already_appear" not in descriptor
+    assert any("could not be reached for /code/list-files" in r for r in reasons)
+    assert any("could not be reached for /code/search" in r for r in reasons)
+    # No field the plan-writer's schema does not define.
+    assert set(descriptor) <= {"repo", "test_roots", "architecture_rules"}
+
+
+@pytest.mark.asyncio
+async def test_the_plan_writer_is_told_when_only_the_descriptor_could_not_read(helper: str) -> None:
+    """The fact sheet read fine, the specification's words could not be
+    searched: the plan-writer's repository_facts carries both."""
+    from forge.planning.repository_facts import RepositoryUnreadable
+
+    class _SearchRefused(SidecarCodeReader):
+        def places_mentioning(self, text: str) -> list[str]:
+            raise RepositoryUnreadable("the helper refused the search")
+
+    reader = _SearchRefused(helper, repo=REPO_KEY)
+    reasons: list[str] = []
+    PlanningRunDriver._build_target_repo_descriptor(
+        REPO_KEY, COORDINATOR_PATH, SPEC, reader=reader, unavailable=reasons
+    )
+    assert reasons == ["the helper refused the search"]
+
+    driver = PlanningRunDriver(
+        SimpleNamespace(git_runner=SimpleNamespace(code_reader=lambda: reader))  # type: ignore[arg-type]
+    )
+    driver._descriptor_unavailable = {"cid-1": reasons[0]}
+    given = await driver._plan_repository_facts(
+        "cid-1", COORDINATOR_PATH, {"request_text": SENTENCE}
+    )
+    assert given is not None
+    assert "`src/users/models.py` declares class User(Base)." in given
+    assert given.endswith(
+        "Repository facts unavailable: the helper refused the search. Nothing on "
+        "this sheet says what the repository already has, and that is not "
+        "evidence that it has nothing: do not add tables, columns, routes or "
+        "files the request does not name on the strength of this silence."
+    )
+    assert driver._repository_unavailable_line("cid-1") == (
+        "The machine could not read the repository while writing this, so "
+        "nothing checked it against what the repository already has (the "
+        "helper refused the search)."
+    )
