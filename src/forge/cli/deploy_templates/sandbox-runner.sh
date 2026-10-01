@@ -1118,11 +1118,24 @@ fi
 # the top says why. This reads the clone's own alternates file the way git
 # does — one folder per line, blank lines and lines starting with # ignored, a
 # relative line taken from the objects folder that holds the file, and the
-# borrowed folder's own alternates followed in turn, up to the depth git itself
-# follows (five) — and binds every folder it names, read-only, into both
+# borrowed folder's own alternates followed in turn, exactly as deep as git
+# itself follows them — and binds every folder it names, read-only, into both
 # containers at the same path. A folder already inside the clone is already
 # shared and is not bound twice. Nothing in the clone is changed. Only the
 # alternates file is read; no object is.
+#
+# HOW DEEP GIT GOES, counted the way git counts it (corrected after the
+# independent check of the first release -3 template, which counted from 1 and
+# so refused one level too early). In git's own source (object-file.c, the
+# function link_alt_odb_entries) the repository's own alternates file is read
+# at depth 0, each borrowed folder's file one deeper, and a file read deeper
+# than 5 is ignored with "ignoring alternate object stores, nesting too deep"
+# — the line is `if (depth > 5)`. So six files in a chain are followed (depths
+# 0 to 5) and a seventh is not. Measured with git 2.43 on 1 October 2026: a
+# clone reached the store named by the depth-5 file and not the one named by
+# the depth-6 file, and a test below repeats that measurement against whatever
+# git it runs with. Here the clone's own file is depth 0 and a file at depth 6
+# or beyond is a refusal: git in this sandbox cannot read what it names either.
 the_clones_git_folder() {
   local dotgit="${REPO_ROOT}/.git" pointer="" common=""
   # A clone whose .git is a FILE (a linked worktree, or a separated git folder)
@@ -1149,7 +1162,7 @@ follow_the_alternates() {
   local objects="$1" depth="$2" list="$1/info/alternates" line="" target="" seen=""
   [[ -f "${list}" ]] || return 0
   if ((depth > 5)); then
-    refuse "the project's clone borrows git objects through more than five alternates files in a chain (the last one is ${list}), which is deeper than git itself will follow, so git in this sandbox cannot read this clone either. Make the clone self-contained or shorten the chain. Refusing to start."
+    refuse "the project's clone borrows git objects through more than six alternates files in a chain (the seventh is ${list}), which is deeper than git itself will follow, so git in this sandbox cannot read what that file names either. Make the clone self-contained or shorten the chain. Refusing to start."
   fi
   if [[ ! -r "${list}" ]]; then
     refuse "the project's clone has an alternates file at ${list} that this sandbox's own user cannot read, so nothing here can tell which folders its git objects are borrowed from. Refusing to start."
@@ -1176,7 +1189,7 @@ follow_the_alternates() {
   done < "${list}"
 }
 
-follow_the_alternates "$(the_clones_git_folder)/objects" 1
+follow_the_alternates "$(the_clones_git_folder)/objects" 0
 if ((${#BORROWED_OBJECTS[@]} > 0)); then
   log "the project's clone borrows git objects from ${BORROWED_OBJECTS[*]}; each is shared with both containers, read-only, at the same path"
 fi
