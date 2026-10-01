@@ -157,6 +157,25 @@
 #       THE SANDBOX'S OWN FILESYSTEM, bound read-only into the runner alone.
 #       Written fresh at every start, so it can never drift from this file.
 #
+#   the factory's settings file, FORGE_CONFIG_PATH
+#       SHARED MOUNT, READ-ONLY, at the path the setting names (1 October
+#       2026, release -3, found on the live day). Until then this script handed
+#       both containers the NAME and never the FILE: the deploy helper was told
+#       to read its settings from a path that existed in the sandbox and not in
+#       its container, so it could not resolve the project it was asked about
+#       (it finds a repository through planning.target_repo_paths in that
+#       file). A sandbox that names a settings file now has that very file in
+#       both containers, at the same path, read-only — neither service writes
+#       its settings, and a container that could would be changing what the
+#       next one reads. Set and missing, or set and unreadable, is a refusal
+#       naming the setting: a name with nothing under it is the outcome this
+#       table exists to prevent. Unset, nothing is bound and the factory's own
+#       defaults apply, as before. WHERE THE FILE COMES FROM is not this
+#       script's business: it is a file of this sandbox, written by whatever
+#       installs the sandbox, and its paths must be the paths INSIDE the
+#       sandbox (the coordinator's own settings name its own paths, which are
+#       not these).
+#
 #   this script's lock and process record
 #       NEITHER. They belong to the bootstrap, which is not in a container at
 #       all, and nothing in a container reads them.
@@ -912,6 +931,20 @@ share_a_folder() {
   MOUNTS+=(--volume "${path}:${path}:rw")
 }
 
+# A FILE OR FOLDER OF THIS SANDBOX'S THAT BOTH CONTAINERS READ AND NEITHER
+# WRITES, bound read-only at the path it already has in here, so a setting or
+# a file that names that path means the same thing inside a container as it
+# does in the sandbox. A path with a colon in it cannot be said to Docker's
+# --volume at all (the colon is its separator), so it is refused by name
+# rather than handed over to be misread as two paths.
+share_read_only() {
+  local what="$1" path="$2"
+  if [[ "${path}" == *:* ]]; then
+    refuse "${what} names ${path}, which has a colon in it, and a path with a colon cannot be bound into a container (Docker reads the colon as the end of the path). Name a path without one. Refusing to start."
+  fi
+  MOUNTS+=(--volume "${path}:${path}:ro")
+}
+
 # The receipts root. Whichever name the machine used for it wins, and the
 # factory's own name is what crosses into the containers.
 RECEIPTS_ROOT="${FORGE_RECEIPTS_DIR:-${SANDBOX_RECEIPTS_PATH:-}}"
@@ -951,17 +984,42 @@ if [[ -z "${NOTES_ROOT}" ]]; then
 fi
 export FORGE_DEPLOY_NOTES_DIR="${NOTES_ROOT}"
 
-# THE MOUNTS, and there are four kinds and no more: the project's own clone,
-# the three shared folders above, and the sandbox's own engine socket (the
-# helper's alone, added at its start). Every one of them belongs to this
-# sandbox. Nothing of the machine outside is bound into anything here — no
-# checkout of the factory's code, no home folder, no settings file. That is
-# the change stage 4d was.
+# THE MOUNTS, and there are these kinds and no more: the project's own clone,
+# the three shared folders above, the factory's settings file when
+# FORGE_CONFIG_PATH names one (read-only, below), and the sandbox's own engine
+# socket (the helper's alone, added at its start). Every one of them belongs
+# to this sandbox. Nothing of the machine outside is bound into anything here
+# — no checkout of the factory's code, no home folder, no settings file of the
+# machine's (the one FORGE_CONFIG_PATH names is a file IN this sandbox). That
+# is the change stage 4d was.
 MOUNTS=(--volume "${REPO_ROOT}:${REPO_ROOT}:rw")
 share_a_folder "${RECEIPTS_SETTING}" "${RECEIPTS_ROOT}"
 share_a_folder "${WORKTREE_SETTING}" "${WORKTREE_BASE}"
 share_a_folder "${NOTES_SETTING}" "${NOTES_ROOT}"
 log "folders shared by both containers: ${REPO_ROOT} (the project's clone), ${RECEIPTS_ROOT} (receipts), ${WORKTREE_BASE} (a build's worktrees), ${NOTES_ROOT} (the deploy helper's executor notes)"
+
+# THE FACTORY'S SETTINGS FILE (1 October 2026, release -3). The table at the
+# top says why: both containers were handed the name FORGE_CONFIG_PATH and
+# neither was given the file, so the helper could not find the project it was
+# asked about. The file itself is bound now, read-only, at the path the name
+# says. The checks are made here, before anything starts, and from this
+# script's own user — which is the containers' user too unless
+# SANDBOX_CONTAINER_USER says otherwise. Only whether the file is there and
+# readable is asked: its contents are never read or printed here.
+CONFIG_PATH="${FORGE_CONFIG_PATH:-}"
+if [[ -n "${CONFIG_PATH}" ]]; then
+  if [[ "${CONFIG_PATH}" != /* ]]; then
+    refuse "FORGE_CONFIG_PATH names '${CONFIG_PATH}', which is not a full path. Both of the factory's containers are given that file at the path the setting names, so it has to be one path that means the same thing in this sandbox and in them. Name it from the root (/...). Refusing to start."
+  fi
+  if [[ ! -f "${CONFIG_PATH}" ]]; then
+    refuse "FORGE_CONFIG_PATH names ${CONFIG_PATH}, and there is no such file in this sandbox. Both of the factory's containers are told to read their settings from there, and the deploy helper finds the project it works on through it, so starting them without it would leave them pointing at nothing. Put the sandbox's settings file there (its repository paths must be the paths inside this sandbox), or leave the setting out. Refusing to start."
+  fi
+  if [[ ! -r "${CONFIG_PATH}" ]]; then
+    refuse "FORGE_CONFIG_PATH names ${CONFIG_PATH}, and this sandbox's own user cannot read it. Both of the factory's containers run as that user and are told to read their settings from there. Refusing to start."
+  fi
+  share_read_only "FORGE_CONFIG_PATH" "${CONFIG_PATH}"
+  log "the factory's settings file named by FORGE_CONFIG_PATH is shared with both containers, read-only, at the same path"
+fi
 
 # --- step 4: the settings the two containers are given, BY NAME -------------
 # `--env NAME` hands the value this script's own environment holds under that
