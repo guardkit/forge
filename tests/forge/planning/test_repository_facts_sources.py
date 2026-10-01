@@ -31,6 +31,7 @@ from forge.planning.driver import PlanningRunDriver
 from forge.planning.repository_facts import (
     UNAVAILABLE_PREFIX,
     LocalCheckoutReader,
+    RepositoryUnreadable,
     models_in_python_file,
     read_repository_facts,
 )
@@ -387,8 +388,12 @@ def test_an_unreachable_helper_is_said_for_the_inventory_and_the_words() -> None
     )
     assert "repository_inventory" not in descriptor
     assert "where_the_specs_words_already_appear" not in descriptor
-    assert any("could not be reached for /code/list-files" in r for r in reasons)
-    assert any("could not be reached for /code/search" in r for r in reasons)
+    # The first failure on the wire makes the helper unavailable for the rest
+    # of the pass: every later read says the same thing at once.
+    assert reasons and all(
+        r.startswith(f"the sandbox helper at {url} could not be reached for /code/list-files")
+        for r in reasons
+    )
     # No field the plan-writer's schema does not define.
     assert set(descriptor) <= {"repo", "test_roots", "architecture_rules"}
 
@@ -397,7 +402,6 @@ def test_an_unreachable_helper_is_said_for_the_inventory_and_the_words() -> None
 async def test_the_plan_writer_is_told_when_only_the_descriptor_could_not_read(helper: str) -> None:
     """The fact sheet read fine, the specification's words could not be
     searched: the plan-writer's repository_facts carries both."""
-    from forge.planning.repository_facts import RepositoryUnreadable
 
     class _SearchRefused(SidecarCodeReader):
         def places_mentioning(self, text: str) -> list[str]:
@@ -438,7 +442,6 @@ async def test_the_plan_writer_is_told_when_only_the_descriptor_could_not_read(h
 
 import contextlib  # noqa: E402
 
-from forge.planning.repository_facts import RepositoryUnreadable  # noqa: E402
 
 
 @contextlib.contextmanager
@@ -485,17 +488,22 @@ def test_a_search_cut_at_the_helpers_cap_still_finds_the_router(tmp_path: Path) 
         reader = SidecarCodeReader(url, repo=REPO_KEY)
         sheet = read_repository_facts(reader, "Add GET /users/created-per-day").text or ""
     assert "`src/users/router.py` defines GET /users/count-today." in sheet
-    # The folder that was itself still over the cap is SAID, not passed off.
-    assert "Some of what this sheet read was cut short" in sheet
-    assert "cut short in `a/`" in sheet
+    # Everything the cap left out was recovered (the file it fell inside was
+    # read whole), so nothing is reported missing.
+    assert "incomplete" not in sheet
 
 
-def test_a_where_does_it_appear_search_that_stays_cut_is_unreadable(tmp_path: Path) -> None:
-    clone = _repo(tmp_path / "clone", {"a/client_api.py": NOISY_CLIENT})
+def test_a_search_that_cannot_be_recovered_keeps_what_it_found_and_says_so(tmp_path: Path) -> None:
+    """Sixty files of ten matches each at the top of the repository: the cap
+    falls in the twentieth, and recovering the other forty is more than one
+    search may spend. The places found are kept; the answer says it is
+    incomplete."""
+    files = {f"f{n:02d}.py": "".join(f'U = "/users/{n}-{i}"\n' for i in range(10)) for n in range(60)}
+    clone = _repo(tmp_path / "clone", files)
     with _serving(clone) as url:
-        reader = SidecarCodeReader(url, repo=REPO_KEY)
-        with pytest.raises(RepositoryUnreadable, match="cut short"):
-            reader.places_mentioning("/users")
+        places = SidecarCodeReader(url, repo=REPO_KEY).places_mentioning("/users")
+    assert len(places) >= 200
+    assert places.cut is not None and "too many pieces to recover" in places.cut and "were not searched" in places.cut
 
 
 def test_a_timed_out_search_and_a_cut_listing_are_said() -> None:
@@ -641,6 +649,137 @@ def test_an_unreachable_helper_is_said_for_the_rules_and_the_test_folders() -> N
     descriptor = PlanningRunDriver._build_target_repo_descriptor(
         REPO_KEY, COORDINATOR_PATH, "", reader=SidecarCodeReader(url, repo=REPO_KEY), unavailable=reasons
     )
-    assert descriptor["test_roots"] == []
-    assert any("for /code/list-files" in r for r in reasons)
-    assert any("for /code/read-file" in r for r in reasons)
+    assert descriptor["test_roots"] == [] and "architecture_rules" not in descriptor
+    # Said for the test folders AND the rules, without a second wait.
+    assert len(reasons) >= 2
+    assert all("could not be reached for /code/list-files" in r for r in reasons)
+
+
+# ---------------------------------------------------------------------------
+# Review round 1 (Codex R1, R2) and the re-check coach's three findings
+# ---------------------------------------------------------------------------
+
+
+def test_a_cap_inside_a_root_level_file_is_recovered_not_dropped(tmp_path: Path) -> None:
+    """Codex R1: the only file sits at the top of the repository and holds
+    250 matches; the helper stops at 200 inside it. The rest of the file is
+    searched here, whole, and nothing is reported missing because nothing
+    is."""
+    clone = _repo(tmp_path / "clone", {"client_api.py": NOISY_CLIENT})
+    with _serving(clone) as url:
+        places = SidecarCodeReader(url, repo=REPO_KEY).places_mentioning("/users")
+    assert len(places) == 250
+    assert places.cut is None
+
+
+def test_a_term_past_the_helpers_500_characters_is_still_found(tmp_path: Path) -> None:
+    """Codex R2: the helper searches only the first 500 characters of a line.
+    The long line's file is read whole here, so the term is found."""
+    long_line = "x" * 600 + ' "/users/hidden-route"\n'
+    clone = _repo(tmp_path / "clone", {"src/users/long.py": "A = 1\n" + long_line})
+    with _serving(clone) as url:
+        places = SidecarCodeReader(url, repo=REPO_KEY).places_mentioning("hidden-route")
+    assert list(places) == ["src/users/long.py:2"] and places.cut is None
+
+
+def test_long_lines_that_cannot_all_be_listed_are_said(tmp_path: Path) -> None:
+    lines = "".join("y" * 600 + "\n" for _ in range(210))
+    clone = _repo(tmp_path / "clone", {"src/blob.py": lines, "src/users/router.py": ROUTER_UNDER_SRC})
+    with _serving(clone) as url:
+        places = SidecarCodeReader(url, repo=REPO_KEY).places_mentioning("count-today")
+    assert "src/users/router.py:7" in places
+    assert places.cut is not None and "longer than 500 characters" in places.cut
+
+
+def test_folders_are_resumed_by_the_helpers_full_path_order(tmp_path: Path) -> None:
+    """Re-check 1 (the coach's orderdemo): the helper walks ``api-client/``
+    BEFORE ``api/`` (full paths, sorted), so a cap inside ``api-client/``
+    must still lead to ``api/`` being searched."""
+    clone = _repo(
+        tmp_path / "clone",
+        {
+            "a/client.py": "".join(f'U{i} = "/users/x{i}"\n' for i in range(150)),
+            "api-client/client.py": "".join(f'V{i} = "/users/y{i}"\n' for i in range(100)),
+            "api/routes.py": 'router = APIRouter(prefix="/users")\n@router.get("/count-today")\nasync def f(): ...\n',
+        },
+    )
+    with _serving(clone) as url:
+        sheet = read_repository_facts(
+            SidecarCodeReader(url, repo=REPO_KEY), "Add GET /users/created-per-day"
+        ).text or ""
+    assert "`api/routes.py` defines GET /users/count-today." in sheet
+
+
+def test_a_partly_searched_spec_word_keeps_its_places_and_is_not_unreadable(tmp_path: Path) -> None:
+    """Re-check 2: a word the helper could not search in full keeps what was
+    found and is named as partly read; the other words are kept too, and
+    nothing says the repository could not be read."""
+    files = {f"tests/f{n:02d}.py": "".join(f"full_name_{i} = 1\n" for i in range(10)) for n in range(60)}
+    files["src/users/models.py"] = MODELS + "\nfull_name = 1\n"
+    files["src/users/router.py"] = ROUTER_UNDER_SRC
+    clone = _repo(tmp_path / "clone", files)
+    spec = "Feature: x\n  Scenario: y\n    Given the full_name and /users/count-today\n"
+    reasons: list[str] = []
+    partial: list[str] = []
+    with _serving(clone) as url:
+        descriptor = PlanningRunDriver._build_target_repo_descriptor(
+            REPO_KEY, COORDINATOR_PATH, spec,
+            reader=SidecarCodeReader(url, repo=REPO_KEY),
+            unavailable=reasons, partial=partial,
+        )
+    assert reasons == []
+    words = {row["words"]: row["already_in"] for row in descriptor["where_the_specs_words_already_appear"]}
+    assert "/users/count-today" in words
+    assert "full_name" in words
+    assert partial and partial[0].startswith("where `full_name` already appears was only partly searched")
+
+
+def test_a_hung_helper_is_waited_on_once_per_run_and_within_the_allowance() -> None:
+    """Re-check 3 (the coach's hung.py): every request times out. The first
+    failure makes the helper unavailable for the rest of the run, so the
+    description and the fact sheet together cost ONE wait, and that wait is
+    never longer than the allowance."""
+    from forge.planning.sidecar_git_runner import FACT_GATHERING_BUDGET_S
+
+    calls: list[tuple[str, float]] = []
+
+    def post(url: str, body: dict, timeout: float) -> tuple[int, dict]:
+        calls.append((url.rsplit("/", 1)[-1], timeout))
+        raise TimeoutError("timed out")
+
+    reader = SidecarCodeReader("http://h:1", repo=REPO_KEY, post=post)
+    driver = PlanningRunDriver(
+        SimpleNamespace(git_runner=SimpleNamespace(code_reader=lambda: reader))  # type: ignore[arg-type]
+    )
+    shared = driver._repository_reader_for(COORDINATOR_PATH, "cid-1")
+    assert driver._repository_reader_for(COORDINATOR_PATH, "cid-1") is shared
+    reasons: list[str] = []
+    PlanningRunDriver._build_target_repo_descriptor(
+        REPO_KEY, COORDINATOR_PATH, "Given deleted_at and /users/x\n", reader=shared, unavailable=reasons
+    )
+    facts = read_repository_facts(shared, "Add GET /users/created-per-day counting deleted_at")
+    assert len(calls) == 1
+    assert calls[0][1] <= FACT_GATHERING_BUDGET_S
+    assert facts.unavailable is not None and "could not be reached" in facts.unavailable
+    assert (facts.text or "").startswith("Repository facts unavailable:")
+
+
+def test_the_allowance_running_out_keeps_what_was_read() -> None:
+    """A slow helper: the clock passes the allowance part-way. The facts read
+    before that stay on the sheet and the sheet says the rest was not read."""
+    now = [0.0]
+
+    def post(url: str, body: dict, timeout: float) -> tuple[int, dict]:
+        now[0] += 50.0
+        if url.endswith("/code/list-files"):
+            return 200, {"files": ["src/users/router.py", "src/users/models.py"]}
+        if url.endswith("/code/search"):
+            return 200, {"matches": [{"path": "src/users/router.py", "line": 3}]}
+        return 200, {"content": ROUTER_UNDER_SRC if "router" in body["path"] else MODELS}
+
+    reader = SidecarCodeReader("http://h:1", repo=REPO_KEY, post=post, clock=lambda: now[0])
+    facts = read_repository_facts(reader, "Add GET /users/created-per-day")
+    assert facts.unavailable is None
+    assert "`src/users/router.py` defines GET /users/count-today." in (facts.text or "")
+    assert "allowance for reading the repository" in (facts.text or "")
+    assert facts.partial is not None

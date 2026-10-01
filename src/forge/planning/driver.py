@@ -3323,7 +3323,7 @@ class PlanningRunDriver:
             "_repository_facts_cache", {}
         )
         if correlation_id not in cache:
-            reader = self._repository_reader_for(repo_path)
+            reader = self._repository_reader_for(repo_path, correlation_id)
             facts = await asyncio.to_thread(
                 read_repository_facts, reader, self._request_text_of(row)
             )
@@ -3337,7 +3337,7 @@ class PlanningRunDriver:
             cache[correlation_id] = facts
         return cache[correlation_id]
 
-    def _repository_reader_for(self, repo_path: str) -> Any:
+    def _repository_reader_for(self, repo_path: str, correlation_id: str | None = None) -> Any:
         """Where the fact sheet reads the repository: wherever every other
         planning call for ``repo_path`` goes.
 
@@ -3350,15 +3350,24 @@ class PlanningRunDriver:
         coordinator holds, as before. There is deliberately no fallback from
         one to the other: a helper that cannot be reached is said on the
         card, not papered over with a checkout that may be a different copy.
+
+        With ``correlation_id`` the reader is kept for the run, so a helper
+        found unreachable once is not waited on again by every later read of
+        the same run (release -3 item 10, review round 1).
         """
+        cache: dict[tuple[str, str], Any] = self.__dict__.setdefault("_repository_readers", {})
+        key = (str(correlation_id), str(repo_path))
+        if correlation_id is not None and key in cache:
+            return cache[key]
         runner = self._deps.git_runner
         route = getattr(runner, "runner_for_path", None)
         if callable(route):
             runner = route(repo_path)
         make = getattr(runner, "code_reader", None)
-        if callable(make):
-            return make()
-        return LocalCheckoutReader(repo_path)
+        reader = make() if callable(make) else LocalCheckoutReader(repo_path)
+        if correlation_id is not None:
+            cache[key] = reader
+        return reader
 
     async def _plan_repository_facts(
         self, correlation_id: str, repo_path: str, row: Any
@@ -3369,11 +3378,19 @@ class PlanningRunDriver:
         "Repository facts unavailable: <reason>" sentence (release -3 item
         10). Said once: a sheet already unavailable is not repeated."""
         facts = await self._repository_facts_state(correlation_id, repo_path, row)
+        parts = [facts.text] if facts.text else []
         reason = (self.__dict__.get("_descriptor_unavailable") or {}).get(correlation_id)
-        if not reason or facts.unavailable:
-            return facts.text
-        said = unavailable_text(reason)
-        return f"{facts.text}\n{said}" if facts.text else said
+        if reason and not facts.unavailable:
+            parts.append(unavailable_text(reason))
+        partly = (self.__dict__.get("_descriptor_partial") or {}).get(correlation_id)
+        if partly:
+            # Read in part is not "could not be read": said as what it is.
+            parts.append(
+                "Repository facts partly read: "
+                + "; ".join(dict.fromkeys(partly))
+                + ". What was found is listed; it may not be everything."
+            )
+        return "\n".join(parts) if parts else None
 
     def _repository_unavailable_line(self, correlation_id: str) -> str | None:
         """The plain line for the build gate: the fact sheet's reason, else the
@@ -5152,17 +5169,23 @@ class PlanningRunDriver:
             )
             return None
         descriptor_unavailable: list[str] = []
+        descriptor_partial: list[str] = []
         target_repo_descriptor = await asyncio.to_thread(
             self._build_target_repo_descriptor,
             target_repo,
             repo_path,
             spec_feature,
-            reader=self._repository_reader_for(repo_path),
+            reader=self._repository_reader_for(repo_path, correlation_id),
             unavailable=descriptor_unavailable,
+            partial=descriptor_partial,
         )
         if descriptor_unavailable:
             self.__dict__.setdefault("_descriptor_unavailable", {})[correlation_id] = (
                 descriptor_unavailable[0]
+            )
+        if descriptor_partial:
+            self.__dict__.setdefault("_descriptor_partial", {})[correlation_id] = list(
+                descriptor_partial
             )
         # WHERE the specification sits, beside WHAT it says (2026-08-22). These
         # are the same paths the stamp normalizer uses further down; they are
@@ -10089,6 +10112,7 @@ class PlanningRunDriver:
         *,
         reader: Any = None,
         unavailable: list[str] | None = None,
+        partial: list[str] | None = None,
     ) -> list[dict[str, Any]] | None:
         """Where this feature's own words already occur in the repository.
 
@@ -10122,6 +10146,12 @@ class PlanningRunDriver:
         helper's ``/code/search`` for a sandboxed repository, ``git grep`` on
         the checkout otherwise. A repository that cannot be read is ``None``
         with its reason appended to ``unavailable``, never a quiet "not found".
+
+        WHAT WAS READ IS KEPT (release -3 item 10, review round 1). A word
+        whose search came back incomplete (the helper's caps) keeps the
+        places it found and is named in ``partial`` in plain words; it is not
+        "the repository could not be read". A helper that stops answering
+        part-way keeps every word already looked up.
         """
         reader = reader or LocalCheckoutReader(repo_path)
         try:
@@ -10155,7 +10185,10 @@ class PlanningRunDriver:
                 return None
 
             found: list[dict[str, Any]] = []
+            stopped: str | None = None
             for word in words:
+                if stopped:
+                    break
                 # The word as the specification wrote it, and the two other
                 # shapes a repository commonly spells the same name in. A route
                 # written /users/count-today is a function named count_today
@@ -10164,7 +10197,18 @@ class PlanningRunDriver:
                 spellings = {word, tail, tail.replace("-", "_"), tail.replace("_", "-")}
                 places: list[str] = []
                 for spelling in sorted(s for s in spellings if len(s) > 3):
-                    for path_and_line in reader.places_mentioning(spelling):
+                    try:
+                        answer = reader.places_mentioning(spelling)
+                    except RepositoryUnreadable as exc:
+                        stopped = str(exc)
+                        break
+                    cut = getattr(answer, "cut", None)
+                    if cut and partial is not None:
+                        partial.append(
+                            f"where `{spelling}` already appears was only partly "
+                            f"searched ({cut})"
+                        )
+                    for path_and_line in answer:
                         if any(
                             path_and_line.startswith(prefix)
                             for prefix in _REPO_INVENTORY_SKIP_PREFIXES
@@ -10196,6 +10240,16 @@ class PlanningRunDriver:
                     found.append(
                         {"words": word, "already_in": places[:_MAX_PLACES_PER_SPEC_WORD]}
                     )
+            if stopped:
+                logger.warning(
+                    "target_repo_descriptor: stopped looking for the "
+                    "specification's words in %s (%s); the words already looked "
+                    "up are kept, and the plan-writer is told the rest",
+                    getattr(reader, "where", repo_path),
+                    stopped,
+                )
+                if unavailable is not None:
+                    unavailable.append(stopped)
             return found or None
         except RepositoryUnreadable as exc:
             logger.warning(
@@ -10229,6 +10283,7 @@ class PlanningRunDriver:
         *,
         reader: Any = None,
         unavailable: list[str] | None = None,
+        partial: list[str] | None = None,
     ) -> dict[str, Any]:
         """Build the 008 ``target_repo_descriptor`` honestly from what forge knows.
 
@@ -10279,6 +10334,9 @@ class PlanningRunDriver:
             repo_path, timeout_s=_REPO_INVENTORY_GIT_TIMEOUT_SECONDS
         )
         reasons: list[str] = []
+        begin = getattr(reader, "begin", None)
+        if callable(begin):
+            begin()  # one time allowance for the whole description
         if not isinstance(reader, LocalCheckoutReader):
             # No checkout here to walk: the same discovery runs over the
             # helper's listing of the factory's own clone.
@@ -10345,7 +10403,7 @@ class PlanningRunDriver:
         # when the specification has distinctive words AND the repository
         # already has them; absent, the plan is byte for byte what it is today.
         already_there = PlanningRunDriver._where_the_specs_words_already_appear(
-            repo_path, spec_feature, reader=reader, unavailable=reasons
+            repo_path, spec_feature, reader=reader, unavailable=reasons, partial=partial
         )
         if already_there:
             descriptor["where_the_specs_words_already_appear"] = already_there

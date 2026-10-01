@@ -62,6 +62,8 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "CLOSURE_REFUSED_SENTENCE",
     "RepoRoutedGitRunner",
+    "FACT_GATHERING_BUDGET_S",
+    "PartialPlaces",
     "SidecarCodeReader",
     "SidecarGitOpResult",
     "SidecarGitRunner",
@@ -120,19 +122,38 @@ def _urllib_post(url: str, body: dict[str, Any], timeout: float) -> tuple[int, A
     return status, decoded
 
 
-#: How long one read of the code door may take for the planner's fact sheet.
-#: ABOVE the helper's own walls, so the two never race and a slow answer is
-#: the helper's own "timed out" rather than a socket giving up first: its git
-#: listing may take up to 60 seconds and a search walks for up to 30 more
-#: (``CODE_GIT_TIMEOUT_SECONDS``, ``CODE_SEARCH_TIMEOUT_SECONDS``).
+#: How long one read of the code door may take. ABOVE the helper's own walls,
+#: so the two never race and a slow answer is the helper's own "timed out"
+#: rather than a socket giving up first: its git listing may take up to 60
+#: seconds and a search walks for up to 30 more (``CODE_GIT_TIMEOUT_SECONDS``,
+#: ``CODE_SEARCH_TIMEOUT_SECONDS``). Never longer than what is left of
+#: :data:`FACT_GATHERING_BUDGET_S`.
 _DEFAULT_CODE_READ_TIMEOUT_S: float = 100.0
+
+#: The whole of one fact-gathering pass — the fact sheet, or the plan-writer's
+#: repository description — may spend at most this long on the helper. Two
+#: minutes: a healthy pass on api_test takes a fraction of a second, and the
+#: planner must say "could not read" well before a person wonders why
+#: planning has stalled (a hung helper used to cost five 100-second waits).
+FACT_GATHERING_BUDGET_S: float = 120.0
 
 #: How many matching lines one search asks for — the helper's own ceiling.
 _SEARCH_MAX_RESULTS: int = 200
 
-#: How many narrower searches (one per top-level folder) a cut-short search
-#: may be re-asked as, before the answer is reported as cut.
-_MAX_NARROWER_SEARCHES: int = 12
+#: The helper searches only this much of any one line
+#: (``CODE_SEARCH_MAX_LINE_CHARS``); a line past it is "partly searched".
+_HELPER_LINE_CHARS: int = 500
+
+#: How many further requests one search may spend recovering what the
+#: helper's caps left out, before the rest is reported as not searched.
+_MAX_RECOVERY_REQUESTS: int = 24
+
+
+class PartialPlaces(list):  # type: ignore[type-arg]
+    """``path:line`` places, with :attr:`cut` set to a plain sentence when
+    the search could not be completed — what WAS found is kept."""
+
+    cut: str | None = None
 
 
 class SidecarCodeReader:
@@ -143,23 +164,29 @@ class SidecarCodeReader:
     A :class:`~forge.planning.repository_facts.RepositoryReader`. It rides
     the same address, repository key and HTTP seam as the
     :class:`SidecarGitRunner` that builds it (release -3 item 10, 1 October
-    2026): before this, the sheet read the coordinator's own ``repo_path``,
-    which in the containerised coordinator does not exist. A helper that
-    cannot be reached, or that refuses a listing or a search, raises
-    :class:`~forge.planning.repository_facts.RepositoryUnreadable` with the
-    reason, which the sheet turns into its explicit unavailable state. One
-    file the door will not serve (too large, not text) is ``None``.
+    2026).
 
-    A CUT-SHORT ANSWER IS NEVER TAKEN FOR A WHOLE ONE. The helper caps a
-    search at 200 matching lines and 30 seconds, and a listing at 5,000
-    files, and says so (``capped``, ``timed_out``). A search that was capped
-    is asked again one top-level folder at a time, from the folder it was cut
-    in onward (the helper walks files in sorted order, so everything before
-    that point was searched); whatever is STILL cut is written to
-    :attr:`cuts` in plain words, which the fact sheet prints. A listing that
-    was cut sets :attr:`listing_cut`. :meth:`places_mentioning` raises
-    instead, because a "where this already appears" pointer that missed the
-    source is worse than none.
+    NEVER A PARTIAL ANSWER AS A WHOLE ONE, NEVER WHAT WAS READ THROWN AWAY.
+    The helper cuts a search at 200 matching lines and 30 seconds, searches
+    only the first 500 characters of a line, and cuts a listing at 5,000
+    files, and says so (``capped``, ``timed_out``,
+    ``long_lines_partly_searched``). Every cut is either recovered or said:
+
+    * a capped search is covered again piece by piece, by the helper's own
+      walk order (full paths, sorted): every folder not proven complete is
+      searched again by itself, and every file not proven complete — the one
+      the cap fell inside included, even at the top of the repository — is
+      read whole and searched here;
+    * lines past 500 characters are found with one search for long lines,
+      and those files are read whole and searched here;
+    * whatever cannot be recovered within :data:`_MAX_RECOVERY_REQUESTS` is
+      a plain sentence: in :attr:`cuts` for the fact sheet's notes, and on
+      the :class:`PartialPlaces` answer of :meth:`places_mentioning`.
+
+    A helper that fails on the wire once is unavailable for the rest of this
+    reader's life (one planning run) and every later read says so at once;
+    each pass started with :meth:`begin` may spend at most
+    :data:`FACT_GATHERING_BUDGET_S`.
     """
 
     def __init__(
@@ -169,29 +196,56 @@ class SidecarCodeReader:
         repo: str,
         post: HttpPost = _urllib_post,
         timeout_s: float = _DEFAULT_CODE_READ_TIMEOUT_S,
+        clock: Callable[[], float] | None = None,
     ) -> None:
+        import time
+
         self._base_url = base_url.rstrip("/")
         self._repo = repo
         self._post = post
         self._timeout_s = timeout_s
+        self._clock = clock or time.monotonic
         self.where = f"{repo} through the sandbox helper at {self._base_url}"
-        #: Plain sentences, one per answer that came back cut short.
+        #: Plain sentences, one per answer that came back incomplete.
         self.cuts: list[str] = []
         #: The sentence when the listing itself was cut, else ``None``.
         self.listing_cut: str | None = None
         self._listing: list[str] | None = None
+        self._dead: str | None = None
+        self._deadline: float | None = None
+        self._long_line_files: tuple[list[str], str | None] | None = None
+
+    def begin(self, budget_s: float = FACT_GATHERING_BUDGET_S) -> None:
+        """Start one fact-gathering pass with its own time budget. A helper
+        already found unreachable stays so."""
+        self._deadline = self._clock() + budget_s
+
+    # -- the wire ----------------------------------------------------------
 
     def _answer(self, route: str, body: dict[str, Any]) -> tuple[int, Any]:
         from forge.planning.repository_facts import RepositoryUnreadable
 
+        if self._dead is not None:
+            raise RepositoryUnreadable(self._dead)
+        timeout = self._timeout_s
+        if self._deadline is not None:
+            left = self._deadline - self._clock()
+            if left <= 0:
+                raise RepositoryUnreadable(
+                    f"the planner's {int(FACT_GATHERING_BUDGET_S)}-second allowance "
+                    f"for reading the repository through the sandbox helper at "
+                    f"{self._base_url} ran out"
+                )
+            timeout = min(timeout, left)
         url = f"{self._base_url}{route}"
         try:
-            return self._post(url, {"repo": self._repo, **body}, self._timeout_s)
+            return self._post(url, {"repo": self._repo, **body}, timeout)
         except Exception as exc:  # noqa: BLE001 — transport boundary
-            raise RepositoryUnreadable(
+            self._dead = (
                 f"the sandbox helper at {self._base_url} could not be reached "
                 f"for {route} ({type(exc).__name__}: {str(exc)[:160]})"
-            ) from exc
+            )
+            raise RepositoryUnreadable(self._dead) from exc
 
     def _refused(self, route: str, status: int, decoded: Any) -> Exception:
         from forge.planning.repository_facts import RepositoryUnreadable
@@ -227,86 +281,141 @@ class SidecarCodeReader:
             raise self._refused(route, status, decoded)
         return decoded
 
-    def _search(self, text: str, *, ignore_case: bool) -> tuple[list[dict[str, Any]], str | None]:
-        """Every match for ``text``, and the sentence saying what was cut
-        (``None`` when the answer is whole)."""
+    # -- searching, and covering what the helper's caps left out ------------
+
+    def _files_with_long_lines(self) -> tuple[list[str], str | None]:
+        """The tracked files holding a line the helper only partly searches,
+        found once per reader; and a sentence when that list is incomplete."""
+        if self._long_line_files is None:
+            answer = self._search_once(
+                {"pattern": f".{{{_HELPER_LINE_CHARS}}}", "max_results": _SEARCH_MAX_RESULTS}
+            )
+            files = list(
+                dict.fromkeys(str(m.get("path") or "") for m in answer.get("matches") or [])
+            )
+            gap = None
+            if answer.get("capped") or answer.get("timed_out"):
+                gap = (
+                    "more files hold lines longer than "
+                    f"{_HELPER_LINE_CHARS} characters than could be listed"
+                )
+            self._long_line_files = ([f for f in files if f], gap)
+        return self._long_line_files
+
+    def _search(self, text: str, *, ignore_case: bool) -> tuple[list[dict[str, Any]], list[str]]:
+        """Every match for ``text`` — recovered where the helper cut — and the
+        plain sentences saying what could still not be searched."""
         body: dict[str, Any] = {
             "pattern": text,
             "fixed_string": True,
             "case_insensitive": bool(ignore_case),
             "max_results": _SEARCH_MAX_RESULTS,
         }
-        first = self._search_once(body)
-        matches = [m for m in first.get("matches") or [] if isinstance(m, dict)]
-        if first.get("timed_out"):
-            return matches, (
-                f'the search for `{text}` stopped at the helper\'s time limit '
-                f"after {first.get('files_searched', 'some')} file(s), so the "
-                "rest of the repository was not searched"
-            )
-        if not first.get("capped") or not matches:
-            return matches, None
-        # Cut at the line cap. Everything before the file it was cut in was
-        # searched (sorted walk); search each top-level folder from that one
-        # on, by itself.
-        last = str(matches[-1].get("path") or "")
-        tracked = self.list_files()
-        last_top = last.split("/", 1)[0] if "/" in last else ""
-        tops = sorted({p.split("/", 1)[0] for p in tracked if "/" in p and p.split("/", 1)[0] >= last_top})
-        loose = [p for p in tracked if "/" not in p and p > last]
-        seen = {(m.get("path"), m.get("line")) for m in matches}
-        cut: str | None = None
-        if len(tops) > _MAX_NARROWER_SEARCHES:
-            cut = (
-                f'the search for `{text}` was cut short at {_SEARCH_MAX_RESULTS} '
-                f"matching lines, so files after `{last}` were not searched"
-            )
-            tops = tops[:_MAX_NARROWER_SEARCHES]
-        for top in tops:
-            answer = self._search_once({**body, "under": top})
-            for m in answer.get("matches") or []:
-                key = (m.get("path"), m.get("line"))
-                if isinstance(m, dict) and key not in seen:
-                    seen.add(key)
-                    matches.append(m)
-            if answer.get("capped") or answer.get("timed_out"):
-                cut = cut or (
-                    f'the search for `{text}` was cut short in `{top}/` (the '
-                    f"helper answers at most {_SEARCH_MAX_RESULTS} matching "
-                    "lines in 30 seconds), so some of its files were not searched"
+        needle = text.lower() if ignore_case else text
+        found: dict[tuple[str, int], dict[str, Any]] = {}
+        gaps: list[str] = []
+        unrecovered: list[str] = []
+        read_whole: set[str] = set()
+        spent = [0]
+
+        def add(matches: Any) -> None:
+            for m in matches or []:
+                if isinstance(m, dict) and m.get("path") and m.get("line") is not None:
+                    found.setdefault((str(m["path"]), int(m["line"])), m)
+
+        def budget_left() -> bool:
+            return spent[0] < _MAX_RECOVERY_REQUESTS
+
+        def read_and_search(path: str) -> None:
+            if path in read_whole:
+                return
+            if not budget_left():
+                unrecovered.append(f"`{path}`")
+                return
+            spent[0] += 1
+            content = self.read_text(path)
+            if content is None:
+                gaps.append(f"`{path}` could not be searched in full (too large or not text)")
+                return
+            read_whole.add(path)
+            for number, line in enumerate(content.split("\n"), start=1):
+                hay = line.lower() if ignore_case else line
+                if needle in hay:
+                    found.setdefault((path, number), {"path": path, "line": number, "text": line[:200]})
+
+        def cover(under: str | None) -> None:
+            answer = self._search_once({**body, **({"under": under} if under else {})})
+            add(answer.get("matches"))
+            where = f"`{under}/`" if under else "the repository"
+            if int(answer.get("long_lines_partly_searched") or 0):
+                files, gap = self._files_with_long_lines()
+                for path in files:
+                    if under is None or path.startswith(under + "/"):
+                        read_and_search(path)
+                if gap:
+                    gaps.append(f"in {where}, {gap}, so some long lines were checked only in part")
+            if answer.get("timed_out"):
+                gaps.append(
+                    f"the search in {where} stopped at the helper's time limit after "
+                    f"{answer.get('files_searched', 'some')} file(s)"
                 )
-        if loose and cut is None:
-            cut = (
-                f'the search for `{text}` was cut short, so '
-                + ", ".join(f"`{p}`" for p in loose[:3])
-                + (" and others" if len(loose) > 3 else "")
-                + " at the top of the repository were not searched"
+                return
+            if not answer.get("capped"):
+                return
+            matches = [m for m in answer.get("matches") or [] if isinstance(m, dict)]
+            if not matches:
+                gaps.append(f"the search in {where} was cut short")
+                return
+            # The helper walks full paths in sorted order: everything that
+            # sorts before the file it stopped in was searched; that file
+            # and everything after it was not.
+            last = str(matches[-1].get("path") or "")
+            head = (under + "/") if under else ""
+            inside = [p for p in self.list_files() if p.startswith(head)]
+            folders: dict[str, list[str]] = {}
+            files: list[str] = []
+            for path in inside:
+                rest = path[len(head):]
+                if "/" in rest:
+                    folders.setdefault(head + rest.split("/", 1)[0], []).append(path)
+                else:
+                    files.append(path)
+            for folder, members in sorted(folders.items()):
+                if max(members) < last:
+                    continue  # searched whole before the cut
+                if not budget_left():
+                    unrecovered.append(f"`{folder}/`")
+                    continue
+                spent[0] += 1
+                cover(folder)
+            for path in files:
+                if path >= last:
+                    read_and_search(path)
+
+        cover(None)
+        if unrecovered:
+            shown = ", ".join(unrecovered[:3])
+            more = f" and {len(unrecovered) - 3} more" if len(unrecovered) > 3 else ""
+            gaps.append(
+                f"{len(unrecovered)} part(s) of the repository past the helper's "
+                f"cap were not searched ({shown}{more}) — too many pieces to recover"
             )
-        return matches, cut
+        ordered = [found[key] for key in sorted(found)]
+        sentences = [f"the search for `{text}`: {gap}" for gap in dict.fromkeys(gaps)]
+        return ordered, sentences
 
     def files_mentioning(self, text: str, *, ignore_case: bool = False) -> list[str]:
-        matches, cut = self._search(text, ignore_case=ignore_case)
-        if cut:
-            self.cuts.append(cut)
-        found: list[str] = []
-        for match in matches:
-            path = str(match.get("path") or "")
-            if path and path not in found:
-                found.append(path)
-        return found
+        matches, gaps = self._search(text, ignore_case=ignore_case)
+        self.cuts.extend(gaps)
+        return list(dict.fromkeys(str(m.get("path")) for m in matches if m.get("path")))
 
     def places_mentioning(self, text: str) -> list[str]:
-        from forge.planning.repository_facts import RepositoryUnreadable
-
-        matches, cut = self._search(text, ignore_case=False)
-        if cut:
-            raise RepositoryUnreadable(cut)
-        places: list[str] = []
-        for match in matches:
-            path = str(match.get("path") or "")
-            line = match.get("line")
-            if path and line is not None and f"{path}:{line}" not in places:
-                places.append(f"{path}:{line}")
+        matches, gaps = self._search(text, ignore_case=False)
+        places = PartialPlaces(
+            dict.fromkeys(f"{m.get('path')}:{m.get('line')}" for m in matches)
+        )
+        if gaps:
+            places.cut = "; ".join(gaps)
         return places
 
     def read_text(self, path: str) -> str | None:
