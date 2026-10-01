@@ -852,6 +852,12 @@ services:
       OPENAI_API_KEY: ${JARVIS_MODEL_SEAT_KEY:?name the model seat's key in the env file - a local seat takes any value and the client library refuses to be built without one}
       JARVIS_SLACK_CHANNEL_ID: ${JARVIS_SLACK_CHANNEL_ID:?name the Slack channel the front door posts in, in the env file}
       JARVIS_SLACK_OPERATOR_USER_IDS: ${JARVIS_SLACK_OPERATOR_USER_IDS:?name the Slack member ids allowed to approve and merge, in the env file}
+      # WHERE SLACK PLANNING REQUESTS ARE TAKEN FROM, and whose. A sentence typed
+      # in this channel by this member becomes a planning request on the bus.
+      # Without both, the gateway starts with planning intake switched off and a
+      # typed request is silently ignored (the live switch, 1 October 2026).
+      JARVIS_SLACK_PLANNING_CHANNEL_ID: ${JARVIS_SLACK_PLANNING_CHANNEL_ID:?name the Slack channel planning requests are typed in, in the env file}
+      JARVIS_SLACK_PLANNING_ORIGINATOR_USER_ID: ${JARVIS_SLACK_PLANNING_ORIGINATOR_USER_ID:?name the Slack member id whose sentences become planning requests, in the env file}
       JARVIS_LOG_LEVEL: ${JARVIS_LOG_LEVEL:-INFO}
       # WHERE IT WRITES DOWN HOW SLACK IS (26 September 2026, build item E3-j2).
       #
