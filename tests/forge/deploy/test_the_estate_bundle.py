@@ -1822,6 +1822,15 @@ class TestTheWatchIsInTheProjectOnlyWhenAsked:
         block = _service_block(rendered_with_the_watch, "gateway-watch")
         assert "gateway-watch.sh" in block, block
 
+    def test_on_an_external_bus_it_joins_the_buses_network(self) -> None:
+        """The watch asks the bus's monitoring page who is connected. On an external
+        bus that page is only on the retained bus's network, so without it the watch
+        cannot resolve the bus and alarms on every look (live switch, 1 October 2026)."""
+        if shutil.which("docker") is None:
+            pytest.skip("docker is not installed here, so there is nothing to render")
+        block = _service_block(_rendered(*_EXTERNAL_BUS, profiles="watch"), "gateway-watch")
+        assert "retained-bus" in block and "factory" in block, block
+
     def test_it_is_told_the_same_name_the_gateway_sends(
         self, rendered_with_the_watch: str
     ) -> None:
