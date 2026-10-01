@@ -89,8 +89,8 @@ class Invoice(Base):
 '''
 
 
-def _repo(root: Path, files: dict[str, str]) -> Path:
-    root.mkdir(parents=True)
+def _repo(root: Path, files: dict[str, str], *, exist_ok: bool = False) -> Path:
+    root.mkdir(parents=True, exist_ok=exist_ok)
     subprocess.run(["git", "init", "-q", str(root)], check=True)
     for rel, text in files.items():
         target = root / rel
@@ -783,3 +783,38 @@ def test_the_allowance_running_out_keeps_what_was_read() -> None:
     assert "`src/users/router.py` defines GET /users/count-today." in (facts.text or "")
     assert "allowance for reading the repository" in (facts.text or "")
     assert facts.partial is not None
+
+
+def test_a_capped_search_finished_from_a_capped_listing_stays_partial(tmp_path: Path) -> None:
+    """Codex round 2, R3: 5,000 non-matching files under ``a/`` fill the
+    helper's listing, so ``y/`` and ``z/`` are not on it; the search walks
+    every tracked file and stops at 200 matches inside ``y/client_api.py``.
+    Nothing past the listing can be proven searched, so the answer is
+    partial — and the spec word is marked partly searched."""
+    root = tmp_path / "clone"
+    (root / "a").mkdir(parents=True)
+    for n in range(5000):
+        (root / "a" / f"f{n:04d}.txt").write_text("nothing\n", encoding="utf-8")
+    _repo(
+        root,
+        {"y/client_api.py": NOISY_CLIENT, "z/router.py": 'X = "/users/z"\n'},
+        exist_ok=True,
+    )
+    with _serving(root) as url:
+        reader = SidecarCodeReader(url, repo=REPO_KEY)
+        places = reader.places_mentioning("/users")
+        assert reader.listing_cut is not None
+        assert "z/router.py:1" in places or places.cut is not None
+        assert places.cut is not None and "file list" in places.cut
+
+        partial: list[str] = []
+        reasons: list[str] = []
+        PlanningRunDriver._where_the_specs_words_already_appear(
+            COORDINATOR_PATH,
+            "Given /users\n",
+            reader=SidecarCodeReader(url, repo=REPO_KEY),
+            unavailable=reasons,
+            partial=partial,
+        )
+    assert reasons == []
+    assert any(p.startswith("where `/users` already appears was only partly searched") for p in partial)
