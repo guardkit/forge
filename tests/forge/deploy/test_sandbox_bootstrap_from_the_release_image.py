@@ -687,28 +687,31 @@ class TestItStartsTwoContainersFromThatOneImage:
         helper = [c for c in runs if "--name forge-sandbox-helper" in c]
         runner = [c for c in runs if "--name forge-sandbox-runner" in c]
         assert len(helper) == 1 and len(runner) == 1
-        # The helper publishes its port from the bridge.
-        assert "--publish 0.0.0.0:8125:8125" in helper[0]
-        # The runner shares the sandbox's own network (release -3): it listens
-        # on the sandbox's port itself, so there is nothing to publish.
-        assert "--network host" in runner[0]
-        assert "--publish" not in runner[0]
+        # Both share the sandbox's own network (release -3): each listens on
+        # the sandbox's port itself, so there is nothing to publish.
+        for call in (helper[0], runner[0]):
+            assert "--network host" in call
+            assert "--publish" not in call
+        assert "--env FORGE_DEPLOY_SIDECAR_PORT=8125" in helper[0]
+        assert "--env FORGE_DEPLOY_SIDECAR_HOST=0.0.0.0" in helper[0]
         assert "--host 0.0.0.0 --port 8124" in runner[0]
 
-    def test_only_the_runner_shares_the_sandboxs_network(self, sandbox, started):
-        """A test suite's own services are on the SANDBOX's loopback.
+    def test_both_share_the_sandboxs_network(self, sandbox, started):
+        """A project's own services are on the SANDBOX's loopback.
 
-        Release -3, found by the independent check of the first template fix:
-        api_test's suite starts Postgres with ``-p 127.0.0.1:<port>:5432`` and
-        connects to ``localhost:<port>``. On Docker's default bridge that
-        localhost is the runner itself, and every connection was refused. The
-        helper was not part of that finding and stays on the bridge.
+        Release -3. The runner, found by the independent check of the first
+        template fix: api_test's suite starts Postgres with
+        ``-p 127.0.0.1:<port>:5432`` and connects to ``localhost:<port>``. The
+        helper, the next pass: api_test's deploy brings the product up on
+        127.0.0.1:8901 and checks ``http://localhost:8901/health``. On
+        Docker's default bridge that localhost is the container itself, and
+        every connection was refused, for both.
         """
         runs = [c for c in _calls(sandbox) if c.startswith("run ")]
         helper = [c for c in runs if "--name forge-sandbox-helper" in c]
         runner = [c for c in runs if "--name forge-sandbox-runner" in c]
         assert "--network host" in runner[0]
-        assert "--network" not in helper[0]
+        assert "--network host" in helper[0]
 
     def test_the_projects_own_clone_is_bound_read_write(self, sandbox, started):
         clone = str(sandbox["project"])

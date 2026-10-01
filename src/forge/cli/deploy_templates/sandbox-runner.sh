@@ -64,11 +64,10 @@
 #      that one image, each with its own start command, the project's own clone
 #      bound read-write at the path it already lives at, the shared folders
 #      bound into BOTH at the same path, and the factory's settings passed in
-#      BY NAME. The two ports the host side expects are open inside the
-#      sandbox, on every interface in here — the helper's published from its
-#      container, the runner's listened on directly because the runner shares
-#      the sandbox's own network — so the sandbox's own publish rule forwards
-#      them out as it already does.
+#      BY NAME. Both containers share the sandbox's own network, so the two
+#      ports the host side expects are listened on directly, on every
+#      interface in here, and the sandbox's own publish rule forwards them out
+#      as it already does.
 #   5. Supervises them: one supervisor (a lock, so a second start refuses with
 #      exit 4), and a container that dies is started again after a short pause.
 #   6. `stop` ends the supervisor it can prove is this script's, then stops and
@@ -367,9 +366,8 @@
 #     SANDBOX_RUNNER_BIND    the address both services listen on INSIDE the
 #                            sandbox (default 0.0.0.0 — the sandbox's own
 #                            publish rule is what limits who can reach them).
-#                            The helper publishes its port there; the runner,
-#                            which shares the sandbox's own network since
-#                            release -3, listens there directly
+#                            Both share the sandbox's own network since
+#                            release -3, so each listens there directly
 #     SANDBOX_SIDECAR_PORT   the helper's port inside the sandbox (8125)
 #     SANDBOX_RUNNER_PORT    the runner's port inside the sandbox (8124)
 #     SANDBOX_RUNNER_RESTART_SECONDS
@@ -1344,6 +1342,10 @@ printf '%s\n' "${RUNNER_GRAPH_CONFIG}" > "${RUNNER_CONFIG_FILE}"
 #     engine, not the sandbox daemon's socket, and a container started through
 #     it is still inside this sandbox and under its network rules;
 #   - without it a project whose tests need containers cannot be built at all.
+# The same goes for the network the two containers share (below): on the
+# sandbox's own network the build's code can also reach anything listening on
+# the sandbox's loopback, the product's own published ports included — which,
+# again, the sandbox's own user always could.
 # What would change this: a sandbox shared by more than one project, or a
 # deployment in here that must be protected from the build. The way to close
 # the deployment risk is to take the deployment out of the build's engine, not
@@ -1366,8 +1368,44 @@ the_engine_socket_for() {
   fi
 }
 
+# BOTH CONTAINERS SHARE THE SANDBOX'S OWN NETWORK (release -3, 1 October 2026;
+# the runner after the independent check of the first release -3 template, the
+# helper in the next pass, for the same reason). Giving the two containers the
+# engine (above) was not enough on its own. A project starts its services the
+# ordinary way — publishing them on 127.0.0.1 of the engine's host, which in
+# here is the SANDBOX — and then looks for them on localhost:
+#   - api_test's test suite, run by the RUNNER, starts Postgres with
+#     `docker run -p 127.0.0.1:<port>:5432` and connects to localhost:<port>;
+#   - api_test's deploy, run by the HELPER, brings the product up published on
+#     127.0.0.1:8901 and then checks http://localhost:8901/health, and so do
+#     its live gates.
+# On Docker's default bridge "localhost" inside a container is that container
+# itself, so the database and the product were up and every connection to them
+# was refused (reproduced on a real sandbox for both). So both containers are
+# started on the sandbox's own network (`--network host`, which in here means
+# THIS SANDBOX's network, never the machine's): localhost in them is the
+# sandbox's localhost, which is where every suite and deploy that ran in a
+# sandbox before stage 4d was written to look, because that is where the two
+# services used to run.
+#
+# WHAT ELSE THAT CHANGES, AND WHY IT IS ALL RIGHT. On the host network there is
+# nothing to publish: each service listens on ${BIND} of the sandbox ITSELF, at
+# its own port (the helper ${SIDECAR_PORT}, the runner ${RUNNER_PORT}) — the
+# same sandbox ports the old --publish rules forwarded to — so the sandbox's
+# own publish rule reaches them exactly as before and nothing outside changes:
+# the coordinator still comes in through the gateway and that rule. (Docker
+# ignores --publish on the host network, with a warning, so none is passed.)
+# The two ports must therefore be free in the sandbox: they differ from each
+# other, and a project that publishes one of them for itself would now collide
+# — the start fails loudly rather than quietly. Nothing in the factory reaches
+# either service by a bridge address: the helper never calls the runner nor the
+# runner the helper, and the helper's one outward call (FORGE_TARGET_OWNER_URL)
+# goes to the gateway address, which the sandbox routes the same way from its
+# own network as from a bridge. Nothing here uses host.docker.internal. The
+# network allow-list is the sandbox's, and applies to both as to everything in
+# here.
 start_helper() {
-  log "starting the deploy helper from ${IMAGE_REFERENCE} on ${BIND}:${SIDECAR_PORT}"
+  log "starting the deploy helper from ${IMAGE_REFERENCE} on this sandbox's own network, ${BIND}:${SIDECAR_PORT}"
   # The helper's job is to run a project's own vetted deploy and merge
   # scripts, and a project's deploy ordinarily brings containers up in here.
   the_engine_socket_for "the deploy helper"
@@ -1375,7 +1413,7 @@ start_helper() {
     --name "${HELPER_NAME}" \
     --user "${CONTAINER_USER}" \
     --no-healthcheck \
-    --publish "${BIND}:${SIDECAR_PORT}:${SIDECAR_PORT}" \
+    --network host \
     --env "FORGE_DEPLOY_SIDECAR_PORT=${SIDECAR_PORT}" \
     --env "FORGE_DEPLOY_SIDECAR_HOST=${BIND}" \
     ${ENV_ARGUMENTS[@]+"${ENV_ARGUMENTS[@]}"} \
@@ -1388,40 +1426,12 @@ start_helper() {
     >/dev/null
 }
 
-# THE RUNNER SHARES THE SANDBOX'S OWN NETWORK (release -3, 1 October 2026,
-# found by the independent check of the first release -3 template). Giving
-# the runner the engine (above) was not enough on its own. A project's test
-# suite starts its services the ordinary way — api_test's starts Postgres
-# with `docker run -p 127.0.0.1:<port>:5432` and then connects to
-# localhost:<port> — and a container published on 127.0.0.1 is reachable on
-# the SANDBOX's loopback, not on the loopback of another container. On
-# Docker's default bridge "localhost" inside the runner is the runner itself,
-# so the suite's database was up and every connection to it was refused (the
-# check reproduced exactly that). So the runner is started on the sandbox's
-# own network (`--network host`, which in here means THIS SANDBOX's network,
-# never the machine's): localhost in the runner is the sandbox's localhost,
-# which is where every test suite that ran in a sandbox before stage 4d was
-# written to look, because that is where the runner used to run.
-#
-# WHAT ELSE THAT CHANGES, AND WHY IT IS ALL RIGHT. On the host network there is
-# nothing to publish: the runner listens on ${BIND}:${RUNNER_PORT} of the
-# sandbox ITSELF, which is the same sandbox port the old --publish rule
-# forwarded to, so the sandbox's own publish rule reaches it exactly as before
-# and nothing outside changes. (Docker ignores --publish on the host network,
-# with a warning, so it is not passed.) The runner's port must therefore be
-# free in the sandbox: the helper publishes a different one, and a project
-# that publishes the runner's port for itself would now collide — the start
-# fails loudly rather than quietly. Nothing in the factory reaches the runner
-# by a bridge address: the coordinator comes in through the sandbox's publish
-# rule, and the helper never calls the runner. The network allow-list is the
-# sandbox's, and applies to the runner as it applies to everything in here.
-# The helper stays on the bridge: this pass was about tests, and the helper
-# was not changed.
 start_runner() {
   log "starting the build runner from ${IMAGE_REFERENCE} on this sandbox's own network, ${BIND}:${RUNNER_PORT}"
   # The runner is where a build runs the project's own checks, and a project's
   # test suite may start its services as containers (see above for why the
-  # runner is given the engine, and what that gives away).
+  # runner is given the engine, and what that gives away, and why both
+  # containers share the sandbox's own network).
   the_engine_socket_for "the build runner"
   "${DOCKER}" run --detach \
     --name "${RUNNER_NAME}" \
