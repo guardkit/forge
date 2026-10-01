@@ -2202,3 +2202,97 @@ class TestTheSettingsFileIsShared:
         for call in (helper, runner):
             assert "--env FORGE_CONFIG_PATH" not in call
             assert "forge.yaml" not in call
+
+
+# ---------------------------------------------------------------------------
+class TestTheGitObjectsTheCloneBorrowsAreShared:
+    """A clone that borrows its history must be able to read it in both containers.
+
+    Release -3, item 5, found on the live day (1 October 2026): a sandbox made
+    with ``sbx create --clone`` borrows every git object from the checkout it
+    was made from, mounted read-only in the sandbox, and says so in
+    ``.git/objects/info/alternates``. The clone was bound into both
+    containers and the folder it borrows from was not, so git inside them
+    answered "unable to normalize alternate object path". The stand-in here
+    is only the alternates file and the folders it names: what is checked is
+    which folders the bootstrap binds, read-only and at the same path.
+    """
+
+    @staticmethod
+    def _borrowing(project: Path, *lines: str) -> Path:
+        info = project / ".git" / "objects" / "info"
+        info.mkdir(parents=True, exist_ok=True)
+        (info / "alternates").write_text("".join(line + "\n" for line in lines))
+        return info / "alternates"
+
+    def test_the_borrowed_folder_is_bound_read_only_into_both(
+        self, sandbox, tmp_path
+    ):
+        source = tmp_path / "run" / "sandbox" / "source" / ".git" / "objects"
+        source.mkdir(parents=True)
+        self._borrowing(sandbox["project"], str(source))
+        helper, runner = _the_two_starts(sandbox)
+        for call in (helper, runner):
+            assert f"--volume {source}:{source}:ro" in call
+
+    def test_a_relative_line_is_taken_from_the_objects_folder(
+        self, sandbox, tmp_path
+    ):
+        source = tmp_path / "elsewhere" / "objects"
+        source.mkdir(parents=True)
+        objects = sandbox["project"] / ".git" / "objects"
+        self._borrowing(sandbox["project"], os.path.relpath(source, objects))
+        helper, runner = _the_two_starts(sandbox)
+        for call in (helper, runner):
+            assert f"--volume {source}:{source}:ro" in call
+
+    def test_a_chain_is_followed_and_comments_are_skipped(self, sandbox, tmp_path):
+        first = tmp_path / "first" / "objects"
+        second = tmp_path / "second" / "objects"
+        first.mkdir(parents=True)
+        second.mkdir(parents=True)
+        (first / "info").mkdir()
+        (first / "info" / "alternates").write_text(f"# a comment\n\n{second}\n")
+        self._borrowing(sandbox["project"], "# borrowed by sbx", str(first))
+        helper, runner = _the_two_starts(sandbox)
+        for call in (helper, runner):
+            assert f"--volume {first}:{first}:ro" in call
+            assert f"--volume {second}:{second}:ro" in call
+            assert "# a comment" not in call
+
+    def test_a_borrowed_folder_that_is_not_there_is_refused(
+        self, sandbox, tmp_path
+    ):
+        missing = tmp_path / "run" / "sandbox" / "source" / ".git" / "objects"
+        self._borrowing(sandbox["project"], str(missing))
+        result = _run(sandbox)
+        assert result.returncode == 2, result.stdout
+        assert str(missing) in result.stdout
+        assert "alternates" in result.stdout
+        assert not any(line.startswith("run ") for line in _calls(sandbox))
+
+    def test_a_clone_whose_git_folder_is_elsewhere(self, sandbox, tmp_path):
+        """A .git FILE (a separated git folder) is followed to its objects."""
+        gitdir = tmp_path / "separate-git-folder"
+        source = tmp_path / "borrowed" / "objects"
+        source.mkdir(parents=True)
+        (gitdir / "objects" / "info").mkdir(parents=True)
+        (gitdir / "objects" / "info" / "alternates").write_text(f"{source}\n")
+        (sandbox["project"] / ".git").write_text(f"gitdir: {gitdir}\n")
+        helper, runner = _the_two_starts(sandbox)
+        for call in (helper, runner):
+            assert f"--volume {source}:{source}:ro" in call
+
+    def test_a_self_contained_clone_binds_nothing_more(self, sandbox):
+        (sandbox["project"] / ".git" / "objects" / "info").mkdir(parents=True)
+        helper, runner = _the_two_starts(sandbox)
+        for call in (helper, runner):
+            words = call.split()
+            read_only = [
+                word
+                for before, word in zip(words, words[1:])
+                if before == "--volume" and word.endswith(":ro")
+            ]
+            # The runner's own graph declaration is the only read-only file
+            # either of them is given when nothing is borrowed.
+            assert all("langgraph.json" in word for word in read_only), read_only

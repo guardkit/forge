@@ -176,6 +176,30 @@
 #       sandbox (the coordinator's own settings name its own paths, which are
 #       not these).
 #
+#   the git objects the project's clone BORROWS (.git/objects/info/alternates)
+#       SHARED MOUNT, READ-ONLY, at the path the alternates file names (1
+#       October 2026, release -3, found on the live day). A sandbox made with
+#       `sbx create --clone` does not copy the project's history: its clone
+#       borrows every object from the checkout the sandbox was made from,
+#       which sbx mounts read-only at /run/sandbox/source, and says so in one
+#       line of .git/objects/info/alternates. The clone is bound into both
+#       containers; the folder it borrows from was not, so inside them every
+#       git command that needed an old object failed with "unable to normalize
+#       alternate object path". So the folders that file names (and any they
+#       name in turn, as far as git itself follows) are bound read-only into
+#       both, at the same path, before anything starts; a borrowed folder that
+#       is not in this sandbox is a refusal, because git is already broken in
+#       here without it.
+#       WHY A MOUNT AND NOT A SELF-CONTAINED CLONE. The other cure — copy every
+#       borrowed object into the clone (`git repack -a -d`, as was done by hand
+#       on 1 October) — changes the project's repository, which this script
+#       never does; it copies the project's whole history onto a sandbox disk
+#       that is already the tightest thing in here; and it is one-way. The
+#       mount changes nothing, costs nothing, is read-only (git never writes to
+#       a store it borrows from), and leaves the clone exactly as sbx made it.
+#       A clone that is already self-contained has no alternates file, and
+#       then nothing is bound.
+#
 #   this script's lock and process record
 #       NEITHER. They belong to the bootstrap, which is not in a container at
 #       all, and nothing in a container reads them.
@@ -986,12 +1010,14 @@ export FORGE_DEPLOY_NOTES_DIR="${NOTES_ROOT}"
 
 # THE MOUNTS, and there are these kinds and no more: the project's own clone,
 # the three shared folders above, the factory's settings file when
-# FORGE_CONFIG_PATH names one (read-only, below), and the sandbox's own engine
-# socket (the helper's alone, added at its start). Every one of them belongs
-# to this sandbox. Nothing of the machine outside is bound into anything here
-# — no checkout of the factory's code, no home folder, no settings file of the
-# machine's (the one FORGE_CONFIG_PATH names is a file IN this sandbox). That
-# is the change stage 4d was.
+# FORGE_CONFIG_PATH names one (read-only, below), the folders the clone
+# borrows its git objects from (read-only, below), and the sandbox's own engine
+# socket (the helper's alone, added at its start). Every one of them is in
+# this sandbox. Nothing of the machine outside is bound into anything here —
+# no checkout of the factory's code, no home folder, no settings file of the
+# machine's. (The one FORGE_CONFIG_PATH names is a file IN this sandbox, and
+# the borrowed objects are the PROJECT's own history, which sbx already put in
+# the sandbox read-only when it was made.) That is the change stage 4d was.
 MOUNTS=(--volume "${REPO_ROOT}:${REPO_ROOT}:rw")
 share_a_folder "${RECEIPTS_SETTING}" "${RECEIPTS_ROOT}"
 share_a_folder "${WORKTREE_SETTING}" "${WORKTREE_BASE}"
@@ -1019,6 +1045,73 @@ if [[ -n "${CONFIG_PATH}" ]]; then
   fi
   share_read_only "FORGE_CONFIG_PATH" "${CONFIG_PATH}"
   log "the factory's settings file named by FORGE_CONFIG_PATH is shared with both containers, read-only, at the same path"
+fi
+
+# THE GIT OBJECTS THE CLONE BORROWS (1 October 2026, release -3). The table at
+# the top says why. This reads the clone's own alternates file the way git
+# does — one folder per line, blank lines and lines starting with # ignored, a
+# relative line taken from the objects folder that holds the file, and the
+# borrowed folder's own alternates followed in turn, up to the depth git itself
+# follows (five) — and binds every folder it names, read-only, into both
+# containers at the same path. A folder already inside the clone is already
+# shared and is not bound twice. Nothing in the clone is changed. Only the
+# alternates file is read; no object is.
+the_clones_git_folder() {
+  local dotgit="${REPO_ROOT}/.git" pointer="" common=""
+  # A clone whose .git is a FILE (a linked worktree, or a separated git folder)
+  # keeps its objects where that file points, and a linked worktree's objects
+  # are in the common folder its commondir names.
+  if [[ -f "${dotgit}" ]]; then
+    IFS= read -r pointer < "${dotgit}" || true
+    pointer="${pointer%$'\r'}"
+    pointer="${pointer#gitdir: }"
+    [[ "${pointer}" == /* ]] || pointer="${REPO_ROOT}/${pointer}"
+    dotgit="${pointer}"
+    if [[ -r "${dotgit}/commondir" ]]; then
+      IFS= read -r common < "${dotgit}/commondir" || true
+      common="${common%$'\r'}"
+      [[ "${common}" == /* ]] || common="${dotgit}/${common}"
+      dotgit="${common}"
+    fi
+  fi
+  printf '%s' "${dotgit}"
+}
+
+BORROWED_OBJECTS=()
+follow_the_alternates() {
+  local objects="$1" depth="$2" list="$1/info/alternates" line="" target="" seen=""
+  [[ -f "${list}" ]] || return 0
+  if ((depth > 5)); then
+    refuse "the project's clone borrows git objects through more than five alternates files in a chain (the last one is ${list}), which is deeper than git itself will follow, so git in this sandbox cannot read this clone either. Make the clone self-contained or shorten the chain. Refusing to start."
+  fi
+  if [[ ! -r "${list}" ]]; then
+    refuse "the project's clone has an alternates file at ${list} that this sandbox's own user cannot read, so nothing here can tell which folders its git objects are borrowed from. Refusing to start."
+  fi
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    line="${line%$'\r'}"
+    [[ -z "${line}" || "${line}" == \#* ]] && continue
+    if [[ "${line}" == \"* ]]; then
+      refuse "${list} names a borrowed git objects folder in quotes (${line}); this script reads only plain paths, and will not guess what a quoted one means. Refusing to start."
+    fi
+    [[ "${line}" == /* ]] || line="${objects}/${line}"
+    target="$(realpath -m "${line}")"
+    if [[ ! -d "${target}" || ! -r "${target}" || ! -x "${target}" ]]; then
+      refuse "the project's clone borrows its git objects from ${target} (its ${list} says so), and that folder is not readable in this sandbox. Git cannot read this clone's history without it, here or in either of the factory's containers. Refusing to start."
+    fi
+    for seen in ${BORROWED_OBJECTS[@]+"${BORROWED_OBJECTS[@]}"}; do
+      [[ "${seen}" == "${target}" ]] && continue 2
+    done
+    BORROWED_OBJECTS+=("${target}")
+    if [[ "${target}/" != "${REPO_ROOT}/"* ]]; then
+      share_read_only "the project's clone's alternates file (${list})" "${target}"
+    fi
+    follow_the_alternates "${target}" $((depth + 1))
+  done < "${list}"
+}
+
+follow_the_alternates "$(the_clones_git_folder)/objects" 1
+if ((${#BORROWED_OBJECTS[@]} > 0)); then
+  log "the project's clone borrows git objects from ${BORROWED_OBJECTS[*]}; each is shared with both containers, read-only, at the same path"
 fi
 
 # --- step 4: the settings the two containers are given, BY NAME -------------
