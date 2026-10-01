@@ -544,7 +544,7 @@ def test_normal_output_drives_real_template_receipts_and_custom_ports(inventory,
     assert len(runs)==2
     assert all(desired+':'+desired+':rw' in run for run in runs)
     assert '--publish 0.0.0.0:9125:9125' in runs[0]
-    assert '--publish 0.0.0.0:9124:9124' in runs[1]
+    assert '--network host' in runs[1] and '--publish' not in runs[1] and '--host 0.0.0.0 --port 9124' in runs[1]
     actual_publishes=[x[-1] for x in b.argv() if x[:3]==['sbx','ports','owned-sandbox'] and '--publish' in x]
     assert '192.0.2.10:8925:9125' in actual_publishes
     assert '192.0.2.10:8924:9124' in actual_publishes
