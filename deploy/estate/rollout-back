@@ -289,7 +289,7 @@ class Recovery(q.Estate):
         current=self.current_state();self.doc['rollback_comparison']={'snapshot':metadata['work_state'],'current':current['work_state']};self.save()
         receipt=r.read_json(self.snapshot/'load-receipt.json');r.validate_receipt(self.c,metadata,receipt);r.verify_derivation(self.c,self.snapshot,receipt)
         baseline=r.ledger_state(self.snapshot/r.MIGRATED_ARTIFACT,consolidated=True)['work_state']
-        q.need(current['work_state']==baseline,'current publication, target, build, planning or open-queue facts differ from the migrated snapshot; preserve current authority and reconcile the changed work')
+        q.need(current['work_state']==baseline or r.work_state_boot_reconciled(baseline,current['work_state']),'current publication, target, build, planning or open-queue facts differ from the migrated snapshot; preserve current authority and reconcile the changed work')
         actual_mark=json.loads(self.volume('ledger',"import pathlib;print(pathlib.Path('/state/ROLLOUT-SNAPSHOT.json').read_text())"))
         q.need(actual_mark==receipt['mark'],'current ledger snapshot mark differs; preserve current authority and reconcile its provenance')
         old_db=r.path(self.c['source_db']);q.need(old_db.stat().st_nlink==1 and not os.path.samefile(old_db,self.snapshot/'forge.db') and not any(ch in str(old_db) for ch in '\n\r\"'),'old ledger aliases another file or has an unsafe backup name; preserve the snapshot and reconcile its exact path')
