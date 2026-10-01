@@ -100,3 +100,65 @@ def test_work_state_accepts_only_the_reconciliation():
     other = work(after); other['work_queue']['count'] = 1
     assert not r.work_state_boot_reconciled(work(WB), other)
     assert not r.work_state_boot_reconciled(work(WB), work(after[:1]))
+
+
+class Done:
+    def __init__(self, stdout): self.stdout = stdout
+
+
+def staged(tmp_path, monkeypatch):
+    """A snapshot folder whose retained artifact is BASE; the start-up derivation changes nothing."""
+    snap = tmp_path / 'snapshots' / 'snap'; snap.mkdir(parents=True)
+    artifact = ledger(snap / r.MIGRATED_ARTIFACT, BASE)
+    monkeypatch.setattr(r, 'container_python', lambda *a, **k: None)
+    return snap, {'startup_logical_sha256': r.consolidated_logical_digest(artifact)}
+
+
+def test_a_copy_of_the_observed_reconciled_state_is_accepted(tmp_path, monkeypatch):
+    snap, receipt = staged(tmp_path, monkeypatch)
+    copy = ledger(tmp_path / 'copy.db', RECONCILED)
+    assert r.reconcile_started_copy({}, snap, receipt, copy, r.consolidated_logical_digest(copy)) == ['b1', 'b3']
+    assert sorted(p.name for p in snap.parent.iterdir()) == ['snap']   # the derivation folder is removed
+
+
+def test_a_copy_that_is_not_the_observed_state_is_refused(tmp_path, monkeypatch):
+    """Codex R2: the services observed state A; a later copy of valid state B must not stand in for it."""
+    snap, receipt = staged(tmp_path, monkeypatch)
+    observed = r.consolidated_logical_digest(ledger(tmp_path / 'a.db', [BASE[0], BASE[1], ('b3', 'FAILED', None, None, 'other', 'F3')]))
+    copy = ledger(tmp_path / 'copy.db', RECONCILED)
+    with pytest.raises(r.Refusal, match='changed between the observation and its copy'):
+        r.reconcile_started_copy({}, snap, receipt, copy, observed)
+
+
+def test_a_failed_build_with_another_reason_is_refused_end_to_end(tmp_path, monkeypatch):
+    """Codex R1: the full predicate, not the work-state summary, decides."""
+    snap, receipt = staged(tmp_path, monkeypatch)
+    copy = ledger(tmp_path / 'copy.db', [('b1', 'FAILED', None, '2026-10-01', 'stale-queued: other', 'F1'), BASE[1], BASE[2]])
+    with pytest.raises(r.Refusal):
+        r.reconcile_started_copy({}, snap, receipt, copy, r.consolidated_logical_digest(copy))
+
+
+def test_an_unchanged_copy_is_not_a_reconciliation(tmp_path, monkeypatch):
+    snap, receipt = staged(tmp_path, monkeypatch)
+    copy = ledger(tmp_path / 'copy.db', BASE)
+    with pytest.raises(r.Refusal, match='without a reconciled build'):
+        r.reconcile_started_copy({}, snap, receipt, copy, r.consolidated_logical_digest(copy))
+
+
+def test_a_derivation_that_differs_from_the_receipt_is_refused(tmp_path, monkeypatch):
+    snap, receipt = staged(tmp_path, monkeypatch)
+    copy = ledger(tmp_path / 'copy.db', RECONCILED)
+    with pytest.raises(r.Refusal, match='independently derived normal boot'):
+        r.reconcile_started_copy({}, snap, {'startup_logical_sha256': '0' * 64}, copy, r.consolidated_logical_digest(copy))
+
+
+def test_the_running_coordinator_copy_is_bound_to_the_observation(tmp_path, monkeypatch):
+    import base64
+    snap, receipt = staged(tmp_path, monkeypatch)
+    src = sqlite3.connect(ledger(tmp_path / 'started.db', RECONCILED))
+    monkeypatch.setattr(r, 'docker', lambda c, *a, **k: Done(base64.b64encode(src.serialize()).decode()))
+    good = r.consolidated_logical_digest(tmp_path / 'started.db')
+    assert r.started_ledger_reconciliation({}, snap, receipt, 'cid', good) == ['b1', 'b3']
+    with pytest.raises(r.Refusal, match='changed between the observation and its copy'):
+        r.started_ledger_reconciliation({}, snap, receipt, 'cid', '1' * 64)
+    assert sorted(p.name for p in snap.parent.iterdir()) == ['snap']

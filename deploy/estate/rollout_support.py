@@ -656,15 +656,30 @@ def work_state_boot_reconciled(baseline, current):
             return False
     return True
 
-def started_ledger_reconciliation(c, directory, receipt, container_id):
-    """Copy the running coordinator's ledger and compare it with the independently derived start-up state.
+def reconcile_started_copy(c, directory, receipt, copy, observed_logical):
+    """Accept a started ledger copy only as the observed state plus start-up reconciliation.
 
-    Returns the reconciled build ids, or None when the copy's logical digest equals
-    neither accepted digest after removing the reconciliation (it refuses on any other
-    difference). The copy and the derivation stay in a private temporary folder that is
-    removed afterwards.
+    `copy` is a complete host copy of the started ledger. Its logical digest must equal
+    the digest the caller observed in place (so the copy is the state that was read),
+    the start-up state is derived independently from the retained migrated artifact,
+    and the two must differ only by boot_reconciled_builds. Returns the reconciled
+    build ids; refuses otherwise.
     """
-    artifact = path(directory / MIGRATED_ARTIFACT)
+    if consolidated_logical_digest(copy) != observed_logical:
+        refuse('the started ledger changed between the observation and its copy; keep the door closed and verify again')
+    with tempfile.TemporaryDirectory(prefix='.verify-derived-', dir=directory.parent) as temporary:
+        derived = Path(temporary)
+        shutil.copyfile(path(directory / MIGRATED_ARTIFACT), derived / 'forge.db')
+        container_python(c, BOOT_SQLITE_CODE, mounts=[f'type=bind,src={derived},dst=/copy'])
+        if consolidated_logical_digest(derived / 'forge.db') != receipt['startup_logical_sha256']:
+            refuse('claimed startup state differs from independently derived normal boot; reconcile the receipt')
+        changed = boot_reconciled_builds(derived / 'forge.db', copy)
+    if not changed:
+        refuse('the started ledger differs from the start-up state without a reconciled build; keep the door closed and reconcile its state')
+    return changed
+
+def started_ledger_reconciliation(c, directory, receipt, container_id, observed_logical):
+    """Copy the running coordinator's ledger and accept it only as start-up reconciliation."""
     code = r"""import base64,sqlite3,sys
 src=sqlite3.connect('file:/var/lib/forge/forge.db?mode=ro',uri=True);dst=sqlite3.connect(':memory:')
 src.backup(dst);src.close()
@@ -673,15 +688,10 @@ sys.stdout.write(base64.b64encode(dst.serialize()).decode())
 """
     import base64
     with tempfile.TemporaryDirectory(prefix='.verify-started-', dir=directory.parent) as temporary:
-        temporary = Path(temporary)
-        (temporary / 'started.db').write_bytes(base64.b64decode(docker(c, 'exec', container_id, 'python', '-c', code).stdout))
-        os.chmod(temporary / 'started.db', 0o600)
-        derived = temporary / 'derived'; derived.mkdir()
-        shutil.copyfile(artifact, derived / 'forge.db')
-        container_python(c, BOOT_SQLITE_CODE, mounts=[f'type=bind,src={derived},dst=/copy'])
-        if consolidated_logical_digest(derived / 'forge.db') != receipt['startup_logical_sha256']:
-            refuse('claimed startup state differs from independently derived normal boot; reconcile the receipt')
-        return boot_reconciled_builds(derived / 'forge.db', temporary / 'started.db') or None
+        started = Path(temporary) / 'started.db'
+        started.write_bytes(base64.b64decode(docker(c, 'exec', container_id, 'python', '-c', code).stdout))
+        os.chmod(started, 0o600)
+        return reconcile_started_copy(c, directory, receipt, started, observed_logical)
 
 def verify_containers(c, directory, metadata, receipt, plan):
     if not plan: invalidate_verification(directory)
@@ -739,9 +749,7 @@ print(json.dumps({'main_sha256':main_sha,'logical_sha256':logical,'schema_versio
                     and actual['logical_sha256'] == results['coordinator']['logical_sha256']:
                 reconciled = results['coordinator']['boot_reconciled_builds']
             else:
-                reconciled = started_ledger_reconciliation(c, directory, receipt, ids[0])
-                if reconciled is None:
-                    refuse(f'{service} reads a different ledger or snapshot mark; keep the door closed and reconcile its state')
+                reconciled = started_ledger_reconciliation(c, directory, receipt, ids[0], actual['logical_sha256'])
         if results and actual['logical_sha256'] != next(iter(results.values()))['logical_sha256']:
             refuse('the three services observed different ledger states; keep the door closed and repeat verification after startup settles')
         results[service] = {'container_id': item['Id'], 'snapshot_sha256': mark['snapshot_sha256'],
