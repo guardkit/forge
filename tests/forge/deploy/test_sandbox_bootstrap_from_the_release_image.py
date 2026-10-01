@@ -2105,3 +2105,100 @@ class TestTwoDifferentConfigurationsAreTwoDifferentIdentities:
         )
         assert result.returncode == 0, result.stdout
         assert sandbox["identity"] in result.stdout
+
+
+# ---------------------------------------------------------------------------
+def _the_two_starts(sandbox, **extra):
+    """Start the bootstrap, wait for both containers, return the helper's and
+    the runner's start lines (in that order), then stop it again."""
+    runs = TestTheFoldersBothContainersShare._runs_of_a_started_bootstrap(
+        sandbox, **extra
+    )
+    helper = [call for call in runs if "--name forge-sandbox-helper" in call]
+    runner = [call for call in runs if "--name forge-sandbox-runner" in call]
+    assert len(helper) == 1 and len(runner) == 1, runs
+    return helper[0], runner[0]
+
+
+class TestTheSettingsFileIsShared:
+    """The file FORGE_CONFIG_PATH names reaches both containers, or nothing starts.
+
+    Release -3, item 4, found on the live day (1 October 2026): the live
+    sandbox carried FORGE_CONFIG_PATH from its creation, the bootstrap handed
+    both containers that NAME, and neither container had the FILE — so the
+    deploy helper could not find the project it was asked about. Every
+    offline test passed, because none of them asked whether a path handed in
+    by name had anything under it.
+    """
+
+    def test_the_named_file_is_bound_read_only_into_both(self, sandbox, tmp_path):
+        settings = tmp_path / "sandbox-settings" / "forge.yaml"
+        settings.parent.mkdir()
+        settings.write_text("planning: {}\n")
+        helper, runner = _the_two_starts(sandbox, FORGE_CONFIG_PATH=str(settings))
+        for call in (helper, runner):
+            # The same path inside as in the sandbox, and read-only: neither
+            # service writes its own settings.
+            assert f"--volume {settings}:{settings}:ro" in call
+            assert "--env FORGE_CONFIG_PATH" in call
+
+    def test_a_named_file_that_is_not_there_is_refused_by_name(
+        self, sandbox, tmp_path
+    ):
+        missing = tmp_path / "nowhere" / "forge.yaml"
+        result = _run(sandbox, FORGE_CONFIG_PATH=str(missing))
+        assert result.returncode == 2, result.stdout
+        assert "FORGE_CONFIG_PATH" in result.stdout
+        assert str(missing) in result.stdout
+        # Never handed in with nothing under it: nothing was started at all.
+        assert not any(line.startswith("run ") for line in _calls(sandbox))
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root reads every file")
+    def test_a_named_file_this_user_cannot_read_is_refused(self, sandbox, tmp_path):
+        unreadable = tmp_path / "forge.yaml"
+        unreadable.write_text("planning: {}\n")
+        unreadable.chmod(0)
+        try:
+            result = _run(sandbox, FORGE_CONFIG_PATH=str(unreadable))
+        finally:
+            unreadable.chmod(0o600)
+        assert result.returncode == 2, result.stdout
+        assert "FORGE_CONFIG_PATH" in result.stdout
+        assert "cannot read" in result.stdout
+        assert not any(line.startswith("run ") for line in _calls(sandbox))
+
+    def test_a_path_that_is_not_full_is_refused(self, sandbox):
+        result = _run(sandbox, FORGE_CONFIG_PATH="relative/forge.yaml")
+        assert result.returncode == 2, result.stdout
+        assert "FORGE_CONFIG_PATH" in result.stdout
+        assert "not a full path" in result.stdout
+        assert not any(line.startswith("run ") for line in _calls(sandbox))
+
+    def test_the_contents_are_never_printed(self, sandbox, tmp_path):
+        settings = tmp_path / "forge.yaml"
+        settings.write_text("a-value-that-must-never-be-written-down: 1\n")
+        process = subprocess.Popen(
+            ["bash", str(sandbox["script"])],
+            env=_settings(sandbox, FORGE_CONFIG_PATH=str(settings)),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        try:
+            for _ in range(100):
+                if len([c for c in _calls(sandbox) if c.startswith("run ")]) >= 2:
+                    break
+                time.sleep(0.1)
+        finally:
+            process.terminate()
+            said = process.communicate(timeout=30)[0]
+        assert "a-value-that-must-never-be-written-down" not in said
+        assert "a-value-that-must-never-be-written-down" not in " ".join(
+            _calls(sandbox)
+        )
+
+    def test_unset_binds_no_settings_file(self, sandbox):
+        helper, runner = _the_two_starts(sandbox)
+        for call in (helper, runner):
+            assert "--env FORGE_CONFIG_PATH" not in call
+            assert "forge.yaml" not in call
