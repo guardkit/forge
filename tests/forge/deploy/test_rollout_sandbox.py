@@ -543,7 +543,7 @@ def test_normal_output_drives_real_template_receipts_and_custom_ports(inventory,
     runs=template_tests.TestTheFoldersBothContainersShare._runs_of_a_started_bootstrap(fake,**extra)
     assert len(runs)==2
     assert all(desired+':'+desired+':rw' in run for run in runs)
-    assert '--publish 0.0.0.0:9125:9125' in runs[0]
+    assert '--network host' in runs[0] and '--publish' not in runs[0] and '--env FORGE_DEPLOY_SIDECAR_PORT=9125' in runs[0]
     assert '--network host' in runs[1] and '--publish' not in runs[1] and '--host 0.0.0.0 --port 9124' in runs[1]
     actual_publishes=[x[-1] for x in b.argv() if x[:3]==['sbx','ports','owned-sandbox'] and '--publish' in x]
     assert '192.0.2.10:8925:9125' in actual_publishes
