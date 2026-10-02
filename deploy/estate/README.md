@@ -761,7 +761,7 @@ read-only root, every capability dropped and no new privileges — that volume's
 only writer — after any earlier record has been invalidated. The coordinator mounts
 the volume **read-only** and, when `FORGE_PUBLICATION_FACTS_FILE` names the
 record, reads it **at every merge word**. It acts on a record only while it was
-written for its own container, after its own start, and within a day; anything
+written for its own container and for exactly its current start (PID 1's start as the kernel counts it, re-read by the check just before writing), after that start, and within a day; anything
 else reads as "nobody has looked", so publication stays off and the merge word
 says why. Because a record is never newer than a start that comes after it, the
 coordinator's boot log says publication is off and says why the facts are not
@@ -915,6 +915,52 @@ command's orphans collected; the engine must provide docker-init, and the H6
 diagnostic's `h6-create` command and `init` field record it. The old folder is
 not a recovery source after resume.
 A failed post-resume check follows this current-state recovery path too.
+
+## Taking a new release on a containerised estate
+
+An estate that the rollout tools have already moved onto the containers is
+upgraded in place: the record, the bus, memory and every volume stay where they
+are, and only the programs change. The full procedure, with its checks and
+rehearsal, is the runbook "Upgrading the live factory from release 2026.09.28-2
+to release -3". This is the short version.
+
+**What you need.** Two inventories for the same estate, one per release, each
+naming its `release` (it must be in the reviewed `RELEASES` table in
+`rollout_support.py`) and the same `upgrade` block: the release it leaves
+(`from`) and the one it goes to (`to`), each with its env and Compose files and
+their SHA-256, a new private receipt, the upgrade's own snapshot folder, the
+switch's snapshot that holds the resume markers, and this release's own
+closed-door folder (its env's `ROLLOUT_STATE_DIR`). The markers are only read;
+no upgrade step writes them.
+
+**The order.** The door is shut from step 1 to step 7; Slack is quiet in between.
+
+| # | Command | What it does | Its own time limit |
+| --- | --- | --- | --- |
+| 1 | `rollout-quiesce --close` (old release's inventory) | records every container, the volumes, the settings and the sandbox as they are, then stops the gateway watch and both producers | 600 s |
+| 2 | `rollout-quiesce --settle` | two quiet bus readings 20 s apart and no active work | 300 s |
+| 3 | `rollout-quiesce --final` | stops the sandbox supervisor first (it must exit 0, or prove nothing runs inside), then the rest; proves the ledger still; keeps a copy of it; turns planning off | 900 s |
+| 4 | `rollout-sandbox --upgrade` | puts the new release into the sandbox and records what it installed | see its own help |
+| 5 | `rollout-quiesce --switch` (new release's inventory) | checks the sandbox holds the new release, then brings the new release up with the door shut and planning off | 1,500 s |
+| 6 | the closed-door check: `estate-check --pre-resume` then `--read-pre-resume`, with the new release's env | writes and reads this release's closed-door receipt | — |
+| 7 | `rollout-quiesce --open` | starts nothing until that receipt passes; then planning on, producers, readiness, services check, hello, watch | 600 s, plus up to 300 s to shut the door again if it fails |
+| 8 | `estate-check --publication-facts` | the machine's answers that let a merge publish and deploy; run once the door is open | — |
+
+Each limit is the step's true maximum: every command a step runs gets only what
+is left of it. Give the step recorder a minute more than the limit, because a
+step killed from outside cannot shut the door again.
+
+**The ways back.**
+- Before step 1 nothing has changed.
+- Failed at steps 1–3: `--switch` with the old release's inventory, then its
+  closed-door check, then its `--open`.
+- Failed at step 4: `rollout-sandbox --upgrade --back`, then the same three.
+- Failed at step 5 or later: `rollout-back --upgrade-back` with the new
+  release's inventory (limit 3,300 s). It stops the new release, proves with
+  the old release's coordinator that it can read what the new one wrote (H6),
+  puts the sandbox back and brings the old release up with the door shut. Then
+  the old release's closed-door check and `--open`. Until that proof has passed,
+  the old release's own steps refuse to touch the record.
 
 ## What is deliberately not here yet
 

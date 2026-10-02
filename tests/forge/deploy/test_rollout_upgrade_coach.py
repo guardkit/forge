@@ -221,3 +221,18 @@ def test_an_unrecorded_container_of_release_3_points_to_back(up):
     stray = w.create('memory', V3, running=False)
     with pytest.raises(r.Refusal, match='no --close recorded it, so it ran after the upgrade began: go back with rollout-back --upgrade-back'):up.estate(V2).switch()
     assert stray in w.containers
+
+
+# ----------------------------------------------------------- re-check L1: a stale sandbox receipt
+
+def test_a_second_forward_pass_without_reinstalling_release_3_refuses_with_nothing_started(up):
+    # After BACK the sandbox holds release -2 again while rollout-sandbox --upgrade's
+    # release -3 receipt is still there: --switch must refuse before anything starts.
+    w = up.world; forward_to_switch(up); passing_h6(w); back(up).upgrade_back()
+    w.write_pre_resume(up.doors[V2], r.RELEASES[V2]['runtime']); up.estate(V2).open()
+    for mode in ('close', 'settle', 'final'):getattr(up.estate(V2), mode)()
+    mark = len(w.events)
+    with pytest.raises(r.Refusal, match="does not have the SHA-256 recorded for release .*, so nothing was started"):up.estate(V3).switch()
+    assert not events_since(w, mark, 'up') and not events_since(w, mark, 'rm') and not running_services(w)
+    w.install_release_3_in_sandbox(up.evidence, up.bootstrap[V3])
+    assert up.estate(V3).switch()['passed']
