@@ -190,6 +190,8 @@ class Boundary:
                     import base64
                     self.files[item['path']]=base64.b64decode(item['data'])
                 out='installed-and-read-back'
+            elif args[:2]==['test','-f']:
+                if self.fault in ('no-settings','settings-is-a-folder'):code=1
             elif args[:2]==['test','-r']:
                 if self.fault=='no-settings':code=1
             elif args[0]=='sha256sum':
@@ -532,6 +534,10 @@ def test_normal_output_drives_real_template_receipts_and_custom_ports(inventory,
     if high_priority:
         values.update(FORGE_RECEIPTS_DIR=desired,SANDBOX_RECEIPTS_PATH=str(tmp_path/'ignored-lower-priority'))
         names.append('FORGE_RECEIPTS_DIR')
+    # A real settings file at the path the installer forwards, so the real
+    # start-up script below is handed exactly what the installer wrote.
+    settings=tmp_path/'sandbox-settings'/'forge.yaml';settings.parent.mkdir();settings.write_text('planning: {}\n')
+    values['FORGE_CONFIG_PATH']=str(settings)
     edit_env(config,values,names)
     with monkeypatch.context() as local:
         b=Boundary(config,local)
@@ -542,9 +548,8 @@ def test_normal_output_drives_real_template_receipts_and_custom_ports(inventory,
     consumer=tmp_path/'consumer';consumer.mkdir()
     fake=template_tests.sandbox.__wrapped__(consumer)
     # Only fake image identity settings differ; preserve actual generated path/port values.
-    # The template harness supplies its own real settings file, so the fixture's
-    # made-up FORGE_CONFIG_PATH (a path only the fake sandbox knows) is left out.
-    extra={k:v for k,v in forwarded.items() if k not in {'FORGE_IMAGE','FORGE_IMAGE_IDENTITY','FORGE_RELEASE_VERSION','FORGE_RELEASE_MANIFEST_SHA256','FORGE_CONFIG_PATH'}}
+    extra={k:v for k,v in forwarded.items() if k not in {'FORGE_IMAGE','FORGE_IMAGE_IDENTITY','FORGE_RELEASE_VERSION','FORGE_RELEASE_MANIFEST_SHA256'}}
+    assert extra['FORGE_CONFIG_PATH']==str(settings)
     runs=template_tests.TestTheFoldersBothContainersShare._runs_of_a_started_bootstrap(fake,**extra)
     assert len(runs)==2
     assert all(desired+':'+desired+':rw' in run for run in runs)
@@ -677,8 +682,9 @@ def test_refuses_without_the_settings_and_identity_the_start_up_script_needs(inv
     assert not any(x[0] in ('systemctl','bash') or x[:2]==['sbx','stop'] for x in b.argv())
 
 
-def test_refuses_when_the_sandbox_has_no_settings_file(inventory,monkeypatch):
-    config,path,args=inventory;b=Boundary(config,monkeypatch);b.fault='no-settings'
+@pytest.mark.parametrize('fault',['no-settings','settings-is-a-folder'])
+def test_refuses_when_the_sandbox_has_no_settings_file(inventory,monkeypatch,fault):
+    config,path,args=inventory;b=Boundary(config,monkeypatch);b.fault=fault
     assert m.main(args)==2
     assert not b.files
     assert not any(x[0]=='bash' or x[:2]==['sbx','stop'] for x in b.argv())
