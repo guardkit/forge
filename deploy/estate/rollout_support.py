@@ -723,14 +723,17 @@ def reconcile_started_copy(c, directory, receipt, copy, observed_logical):
         refuse('the started ledger differs from the start-up state without a reconciled build; keep the door closed and reconcile its state')
     return changed
 
-def started_ledger_reconciliation(c, directory, receipt, container_id, observed_logical):
-    """Copy the running coordinator's ledger and accept it only as start-up reconciliation."""
-    code = r"""import base64,sqlite3,sys
+# Run inside the coordinator: a consistent copy of its ledger, as base64 on stdout.
+STARTED_COPY_CODE = r"""import base64,sqlite3,sys
 src=sqlite3.connect('file:/var/lib/forge/forge.db?mode=ro',uri=True);dst=sqlite3.connect(':memory:')
 src.backup(dst);src.close()
 assert dst.execute('PRAGMA integrity_check').fetchall()==[('ok',)]
 sys.stdout.write(base64.b64encode(dst.serialize()).decode())
 """
+
+def started_ledger_reconciliation(c, directory, receipt, container_id, observed_logical):
+    """Copy the running coordinator's ledger and accept it only as start-up reconciliation."""
+    code = STARTED_COPY_CODE
     import base64
     with tempfile.TemporaryDirectory(prefix='.verify-started-', dir=directory.parent) as temporary:
         started = Path(temporary) / 'started.db'
