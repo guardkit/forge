@@ -190,6 +190,7 @@ from forge.pipeline.publication_record import (
     STEP_SEND,
     PublicationRecordStore,
 )
+from forge.pipeline.publication_facts import the_machine_now
 from forge.pipeline.publication_switch import (
     publication_is_switched_on,
     why_publication_is_off,
@@ -485,12 +486,20 @@ class MergeExecutorDeps:
     #: where a project declares what it deploys and what an identity is for
     #: it. Central code never invents either.
     deployment_target: Callable[[str, Path], Any] | None = None
-    #: WHAT SOMEBODY WHO LOOKED AT THE MACHINE REPORTS — the stand-in for the
-    #: three conditions of section G that no settings file can establish
+    #: WHAT SOMEBODY WHO LOOKED AT THE MACHINE REPORTS — the answers to the
+    #: conditions of section G that no settings file can establish
     #: (:class:`~forge.pipeline.publication_activation.WhatTheMachineSays`).
-    #: Left unset, those three questions answer "nobody has looked", the
-    #: activation check refuses, and publication stays off. That is where
-    #: publication stands today, and it is the safe side.
+    #: Left unset, those questions answer "nobody has looked", the activation
+    #: check refuses, and publication stays off — the safe side.
+    #:
+    #: IT MAY BE A READER (release -3, TC8): a zero-argument callable that
+    #: returns the answers when asked. These deps are built ONCE, when the
+    #: coordinator starts, so a plain value would be the answers at boot for
+    #: ever. A reader is called afresh on EVERY merge word, once, before the
+    #: press asks whether publication is on; both the verdict and its reason
+    #: then come from that one read. Production passes
+    #: :func:`~forge.pipeline.publication_facts.read_publication_facts`, which
+    #: reads the file ``estate-check --publication-facts`` writes.
     what_the_machine_says: Any = None
 
 
@@ -4486,9 +4495,13 @@ async def execute_merge_deploy(
             # anywhere, nothing is deployed, and the record stops at "checked"
             # with the reason said in plain words.
             # ------------------------------------------------------------------
-            if not publication_is_switched_on(
-                deps.config, deps.what_the_machine_says
-            ):
+            # THE MACHINE'S ANSWERS, READ NOW, ONCE FOR THIS MERGE WORD
+            # (release -3, TC8). A reader is called here rather than at boot,
+            # so facts written after the coordinator started count at the
+            # next merge word, and facts gone stale stop counting. The switch
+            # and the reason below are asked of the same read.
+            machine_now = the_machine_now(deps.what_the_machine_says)
+            if not publication_is_switched_on(deps.config, machine_now):
                 if store is not None and not store.record(
                     build_id=build_id,
                     turn=turn,
@@ -4515,9 +4528,7 @@ async def execute_merge_deploy(
                 # is switched off" on its own tells somebody nothing they can
                 # act on; the reason names the setting that is not set, or the
                 # one of section G's five conditions that does not hold.
-                why_off = why_publication_is_off(
-                    deps.config, deps.what_the_machine_says
-                )
+                why_off = why_publication_is_off(deps.config, machine_now)
                 if both_kinds_ran:
                     detail = (
                         f"{named} was joined onto {target_branch} at "

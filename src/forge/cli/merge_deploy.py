@@ -174,6 +174,7 @@ async def _arun(
         execute_merge_deploy,
     )
     from forge.pipeline.merge_offer import read_baseline_failing
+    from forge.pipeline.publication_facts import read_publication_facts
 
     pool = _open_pool(_resolve_db_path())
     row = _resolve_build_row(pool, feature_id, build_id)
@@ -245,6 +246,12 @@ async def _arun(
             guardkit_run=guardkit_run,
             git_surface=git_surface,
             deploy_dispatcher=dispatcher,
+            # RELEASE -3, TC8: the machine's answers for publication come
+            # from the facts 'estate-check --publication-facts' wrote, read
+            # when this press asks — the same reader the coordinator's
+            # listener uses. With FORGE_PUBLICATION_FACTS_FILE unset it
+            # answers None, which is what this command passed before.
+            what_the_machine_says=read_publication_facts,
         )
         decided_by = config.approval.expected_approver or os.environ.get(
             "USER", "operator"
