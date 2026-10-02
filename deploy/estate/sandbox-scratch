@@ -1,0 +1,701 @@
+#!/usr/bin/env python3
+"""Look at a sandbox's scratch folders, and copy one of them to the host.
+
+    sandbox-scratch --sandbox NAME --clone PATH --report
+    sandbox-scratch --sandbox NAME --clone PATH --copy FOLDER --to NEW_HOST_FOLDER
+
+WHY THIS EXISTS. A sandbox's build folder fills up: September's scratch under
+the clone's .guardkit/tmp, the old runner's folders, and the working copies of
+builds that failed. The runner refuses a build when the free space on that disk
+falls below its floor, and before this tool the only way to make room was by
+hand, with nothing recording what was moved or proving it arrived whole.
+
+TWO THINGS ONLY, AND NEITHER CHANGES THE SANDBOX.
+
+  --report   free space on the clone's disk, the sandbox's root disk and
+             Docker's disk; the size of every top-level folder under
+             <clone>/.guardkit/tmp and under the sandbox's /tmp; and whether
+             each holds a registered git worktree (which is never copied).
+
+  --copy     copies ONE top-level folder from one of those two places into a
+             host folder that must not exist yet, and checks the copy file by
+             file against a record of the source taken first. It ends with
+             "verified copy: <n> entries" or with the exact difference.
+
+THIS TOOL NEVER REMOVES ANYTHING (release -3, after the third review of its
+design). It has no option that removes, renames or re-permissions anything in
+the sandbox, and it makes no claim that nothing else was writing to the folder
+while it was read: a folder that changed while it was being read shows up as a
+mismatch, both sides are kept, and the copy may be retried into a new folder.
+Freeing the space in the sandbox is a separate, separately reviewed change.
+
+WHAT IT REFUSES, before anything is created anywhere:
+  * factory-runtime - it holds the live factory's receipts, deploy notes, its
+    temporary folder and the builds' worktrees;
+  * a folder holding a registered git worktree, of the clone or of any other
+    repository: a worktree is git's, not scratch;
+  * a folder that holds the clone itself or the other place scratch lives;
+  * anything that is not a top-level folder of those two places;
+  * a folder holding anything other than files, folders and symbolic links
+    (sockets, pipes, devices), or anything this sandbox's user cannot read;
+  * a host destination that already exists - it is made with one mkdir, never
+    merged into.
+
+HOW THE COPY TRAVELS. As a tar stream on the standard output of 'sbx exec', so
+nothing depends on a folder the host and the sandbox happen to share. The host
+side unpacks it itself, member by member, and writes only into folders it has
+just made: a name that climbs out ('..'), starts at '/', or passes through a
+symbolic link is refused rather than followed. Ownership in the stream is
+ignored and set-id bits are dropped.
+
+WHAT IT WRITES ON THE HOST, beside the copy:
+  <to>.source-manifest.json   every entry of the source, as read in the sandbox
+                              before the copy: path, type, size, mode, mtime_ns,
+                              and SHA-256 for files (link text for links)
+  <to>.copy-manifest.json     the same, rebuilt from the copied files on the
+                              host, plus the verdict, every difference, and the
+                              commands this run made
+
+Exit codes: 0 report shown or copy verified; 1 the copy does not match or did
+not complete (both sides kept); 2 refused before anything was copied.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+from pathlib import Path, PurePosixPath
+import stat
+import subprocess
+import sys
+import tarfile
+
+#: The folder no copy may take, by name. Everything the live factory is doing
+#: right now lives in it (2.3 of the release -3 upgrade runbook).
+FACTORY_RUNTIME = 'factory-runtime'
+#: Where a clone keeps its scratch, relative to the clone.
+CLONE_SCRATCH = '.guardkit/tmp'
+
+# ---------------------------------------------------------------------------
+# THE CODE THAT RUNS INSIDE THE SANDBOX. It is sent as 'python3 -c' over
+# 'sbx exec', and it only READS: it opens files for reading, lists folders and
+# asks git for its worktree list. The same text is also executed on the host,
+# so that the copy's manifest is rebuilt by exactly the code that built the
+# source's - two implementations of "what is in this folder" could disagree
+# about a symlink or a mode and report a mismatch that is not there.
+# ---------------------------------------------------------------------------
+COMMON = r'''
+import hashlib, json, os, stat, subprocess, sys
+
+def sha256_of(path):
+    digest = hashlib.sha256()
+    fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError('changed into something other than a file while being read: ' + path)
+        while True:
+            block = os.read(fd, 1 << 20)
+            if not block:
+                break
+            digest.update(block)
+    finally:
+        os.close(fd)
+    return digest.hexdigest()
+
+def entries(top):
+    """Every entry under top, sorted, never following a symbolic link.
+
+    Yields (relative path, absolute path, lstat). An entry that cannot be
+    listed raises: a folder this user cannot read is a folder this tool cannot
+    vouch for."""
+    def walk(rel):
+        here = os.path.join(top, rel) if rel else top
+        for name in sorted(os.listdir(here)):
+            child_rel = name if not rel else rel + '/' + name
+            child = os.path.join(top, child_rel)
+            info = os.lstat(child)
+            yield child_rel, child, info
+            if stat.S_ISDIR(info.st_mode):
+                yield from walk(child_rel)
+    yield from walk('')
+
+def kind(mode):
+    if stat.S_ISREG(mode):
+        return 'file'
+    if stat.S_ISDIR(mode):
+        return 'dir'
+    if stat.S_ISLNK(mode):
+        return 'link'
+    return None
+
+def manifest(top):
+    rows = []
+    for rel, path, info in entries(top):
+        what = kind(info.st_mode)
+        if what is None:
+            raise ValueError('it holds ' + rel + ', which is not a file, a folder or a symbolic link')
+        row = {'path': rel, 'type': what, 'mode': stat.S_IMODE(info.st_mode),
+               'mtime_ns': info.st_mtime_ns,
+               'size': info.st_size if what != 'dir' else 0}
+        if what == 'file':
+            row['sha256'] = sha256_of(path)
+        elif what == 'link':
+            row['target'] = os.readlink(path)
+        rows.append(row)
+    return rows
+'''
+
+SANDBOX = COMMON + r'''
+def registered_worktrees(clone):
+    """The clone's own worktree list, as git keeps it."""
+    out = subprocess.run(['git', '-C', clone, 'worktree', 'list', '--porcelain'],
+                         capture_output=True, text=True, timeout=120)
+    if out.returncode != 0:
+        raise RuntimeError('git could not list the clone\'s worktrees at ' + clone)
+    return [line[len('worktree '):] for line in out.stdout.splitlines() if line.startswith('worktree ')]
+
+def gitlink_worktree(path):
+    """A '.git' FILE that points at <repository>/worktrees/<name>: a worktree
+    registered with some repository, possibly not this clone."""
+    try:
+        with open(path, 'rb') as stream:
+            first = stream.read(4096).split(b'\n', 1)[0].decode('utf-8', 'surrogateescape')
+    except OSError:
+        return None
+    if not first.startswith('gitdir:'):
+        return None
+    target = first[len('gitdir:'):].strip()
+    target = os.path.normpath(os.path.join(os.path.dirname(path), target))
+    if os.path.basename(os.path.dirname(target)) == 'worktrees' and os.path.isdir(target):
+        return target
+    return None
+
+def inside(path, folder):
+    path, folder = os.path.normpath(path), os.path.normpath(folder)
+    return path == folder or path.startswith(folder.rstrip('/') + '/')
+
+def look_at(folder, worktrees):
+    """Size, entry count, worktrees and anything unreadable or unsupported."""
+    found = {'size': 0, 'entries': 0, 'worktrees': [w for w in worktrees if inside(w, folder)],
+             'unsupported': [], 'unreadable': []}
+    def broken(error):
+        found['unreadable'].append(getattr(error, 'filename', None) or str(error))
+    for root, dirs, files in os.walk(folder, onerror=broken, followlinks=False):
+        for name in dirs + files:
+            path = os.path.join(root, name)
+            try:
+                info = os.lstat(path)
+            except OSError as error:
+                broken(error)
+                continue
+            found['entries'] += 1
+            if not stat.S_ISDIR(info.st_mode):
+                found['size'] += info.st_size
+            if kind(info.st_mode) is None:
+                found['unsupported'].append(path)
+            elif name == '.git' and stat.S_ISREG(info.st_mode):
+                linked = gitlink_worktree(path)
+                if linked and os.path.dirname(path) not in found['worktrees']:
+                    found['worktrees'].append(os.path.dirname(path) + ' (registered at ' + linked + ')')
+            elif stat.S_ISREG(info.st_mode) and not os.access(path, os.R_OK):
+                found['unreadable'].append(path)
+    return found
+
+def disk(path):
+    try:
+        info = os.statvfs(path)
+        return {'path': path, 'free': info.f_bavail * info.f_frsize,
+                'total': info.f_blocks * info.f_frsize, 'device': os.stat(path).st_dev}
+    except OSError as error:
+        return {'path': path, 'error': str(error)}
+
+def dockers_root():
+    try:
+        out = subprocess.run(['docker', 'info', '--format', '{{.DockerRootDir}}'],
+                             capture_output=True, text=True, timeout=60)
+        if out.returncode == 0 and out.stdout.strip().startswith('/'):
+            return out.stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return '/var/lib/docker' if os.path.isdir('/var/lib/docker') else None
+
+def report(args):
+    clone, roots = args['clone'], args['roots']
+    try:
+        worktrees, worktree_problem = registered_worktrees(clone), None
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+        worktrees, worktree_problem = [], str(error)
+    docker = dockers_root()
+    result = {'disks': {'clone': disk(clone), 'root': disk('/'),
+                        'docker': disk(docker) if docker else {'path': None, 'error': 'Docker did not say where it keeps its storage'}},
+              'worktree_problem': worktree_problem, 'roots': []}
+    for root in roots:
+        listing = {'root': root, 'exists': os.path.isdir(root), 'folders': [], 'other': []}
+        if listing['exists']:
+            for name in sorted(os.listdir(root)):
+                path = os.path.join(root, name)
+                info = os.lstat(path)
+                if stat.S_ISDIR(info.st_mode):
+                    listing['folders'].append(dict(look_at(path, worktrees), name=name))
+                else:
+                    listing['other'].append({'name': name, 'size': info.st_size})
+        result['roots'].append(listing)
+    return result
+
+def refuse(why):
+    # While streaming, standard output IS the copy, so a refusal goes to the
+    # error stream and the exit code says the stream is not a copy.
+    if ARGS['action'] == 'stream':
+        print('refused: ' + why, file=sys.stderr)
+        sys.exit(3)
+    print(json.dumps({'ok': False, 'refusal': why}))
+    sys.exit(0)
+
+def the_folder(args):
+    """Resolve and check the one folder a copy may take, or refuse."""
+    clone, roots, asked = args['clone'], args['roots'], args['folder']
+    if '/' not in asked:
+        if asked in ('', '.', '..'):
+            refuse('"' + asked + '" is not a folder name')
+        found = [os.path.join(root, asked) for root in roots if os.path.lexists(os.path.join(root, asked))]
+        if not found:
+            refuse('there is no folder called ' + asked + ' directly under ' + ' or '.join(roots))
+        if len(found) > 1:
+            refuse('there is a ' + asked + ' under both ' + ' and '.join(roots) + '; name the one you mean by its full path')
+        folder = found[0]
+    else:
+        folder = os.path.normpath(asked)
+    root = next((r for r in roots if os.path.dirname(folder) == os.path.normpath(r)), None)
+    if root is None or os.path.basename(folder) in ('', '.', '..'):
+        refuse(folder + ' is not a top-level folder under ' + ' or '.join(roots) + ', the only two places this tool copies from')
+    if not os.path.lexists(folder):
+        refuse('there is no ' + folder + ' in the sandbox')
+    if not stat.S_ISDIR(os.lstat(folder).st_mode):
+        refuse(folder + ' is not a folder (a symbolic link or a file is never followed or copied)')
+    if os.path.basename(folder) == FACTORY_RUNTIME:
+        refuse(folder + ' is factory-runtime: it holds the live factory\'s receipts, deploy notes, its temporary folder and the builds\' worktrees, and is never copied or touched by this tool')
+    for held in [clone] + [r for r in roots if r != root]:
+        if inside(held, folder):
+            refuse(folder + ' holds ' + held + ', which is the clone or the other scratch place, not scratch of its own')
+    try:
+        worktrees = registered_worktrees(clone)
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+        refuse('the clone\'s registered worktrees could not be read (' + str(error) + '), so ' + folder + ' cannot be shown to hold none')
+    found = look_at(folder, worktrees)
+    if found['worktrees']:
+        refuse(folder + ' holds a registered git worktree (' + '; '.join(found['worktrees'][:3]) + '). A worktree belongs to git, not to scratch; it is never copied by this tool')
+    if found['unsupported']:
+        refuse(folder + ' holds ' + found['unsupported'][0] + ', which is not a file, a folder or a symbolic link')
+    if found['unreadable']:
+        refuse('this sandbox\'s user cannot read ' + found['unreadable'][0] + ', so a copy of ' + folder + ' could not be shown to be whole')
+    return folder
+
+def check(args):
+    folder = the_folder(args)
+    try:
+        rows = manifest(folder)
+    except (OSError, ValueError) as error:
+        refuse('the record of ' + folder + ' could not be made: ' + str(error))
+    print(json.dumps({'ok': True, 'folder': folder, 'manifest': rows}))
+
+def stream(args):
+    """Write the folder as a tar stream on standard output, nothing else.
+
+    Entries are added one by one, never by following a link, and a file is
+    sent at the size it had when opened: if it grew, the extra is not sent, and
+    if it shrank the stream stops with an error. Either way the host's
+    comparison catches it."""
+    import tarfile
+    folder = the_folder(args)
+    out = tarfile.open(fileobj=sys.stdout.buffer, mode='w|', format=tarfile.PAX_FORMAT)
+    for rel, path, info in entries(folder):
+        member = tarfile.TarInfo(rel)
+        member.mode, member.mtime = stat.S_IMODE(info.st_mode), info.st_mtime
+        member.uid = member.gid = 0
+        member.uname = member.gname = ''
+        what = kind(info.st_mode)
+        if what == 'dir':
+            member.type = tarfile.DIRTYPE
+            out.addfile(member)
+        elif what == 'link':
+            member.type, member.linkname = tarfile.SYMTYPE, os.readlink(path)
+            out.addfile(member)
+        elif what == 'file':
+            fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+            with os.fdopen(fd, 'rb') as source:
+                opened = os.fstat(source.fileno())
+                if not stat.S_ISREG(opened.st_mode):
+                    raise OSError(rel + ' changed into something other than a file while being read')
+                member.type, member.size = tarfile.REGTYPE, opened.st_size
+                out.addfile(member, source)
+        else:
+            raise OSError(rel + ' is not a file, a folder or a symbolic link')
+    out.close()
+    sys.stdout.buffer.flush()
+
+ARGS = json.loads(sys.argv[1])
+FACTORY_RUNTIME = ARGS['factory_runtime']
+{'report': lambda a: print(json.dumps(report(a))), 'check': check, 'stream': stream}[ARGS['action']](ARGS)
+'''
+
+# The host's copy of the manifest code: the same text, executed here.
+_HOST = {}
+exec(compile(COMMON, '<sandbox-scratch common>', 'exec'), _HOST)
+manifest = _HOST['manifest']
+
+
+class Refusal(Exception):
+    pass
+
+
+def gib(value):
+    return f'{value / 1024 ** 3:.1f} GiB'
+
+
+def size(value):
+    for unit, scale in (('GiB', 1024 ** 3), ('MiB', 1024 ** 2), ('KiB', 1024)):
+        if value >= scale:
+            return f'{value / scale:.1f} {unit}'
+    return f'{value} B'
+
+
+def entries_said(count):
+    return f'{count} entry' if count == 1 else f'{count} entries'
+
+
+class Scratch:
+    def __init__(self, args):
+        if not args.clone.startswith('/'):
+            raise Refusal(f'--clone must name the clone by its full path inside the sandbox, not {args.clone!r}')
+        if not args.sandbox_tmp.startswith('/'):
+            raise Refusal(f'--sandbox-tmp must be a full path, not {args.sandbox_tmp!r}')
+        self.name = args.sandbox
+        self.clone = os.path.normpath(args.clone)
+        self.roots = [os.path.join(self.clone, CLONE_SCRATCH), os.path.normpath(args.sandbox_tmp)]
+        #: Every command this run made, with the code it sent replaced by its
+        #: hash: the record of what was asked of the sandbox.
+        self.commands = []
+        #: The host folders this sandbox shares (from 'sbx ls --json').
+        self.workspaces = []
+
+    def running(self):
+        """Refuse unless the sandbox is already running.
+
+        'sbx exec' STARTS a stopped sandbox, and starting one starts whatever
+        it starts on its own - a factory's runner, for one. A tool that only
+        reads must not do that, so it asks first and refuses."""
+        argv = ['sbx', 'ls', '--json']
+        self.commands.append(argv)
+        try:
+            done = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=120)
+            listing = json.loads(done.stdout)['sandboxes']
+            status = [s.get('status') for s in listing if s.get('name') == self.name]
+            mine = [s for s in listing if s.get('name') == self.name]
+            self.workspaces = [workspace_path(w) for w in (mine[0].get('workspaces') or [])] if mine else []
+        except (OSError, subprocess.TimeoutExpired, ValueError, KeyError, TypeError, AttributeError):
+            raise Refusal('the sbx tool did not say which sandboxes are running, so nothing was asked of '
+                          f'{self.name} (asking would start it if it were stopped)') from None
+        if not all(isinstance(w, str) and w.startswith('/') for w in self.workspaces):
+            raise Refusal(f'the sbx tool listed folders shared with {self.name} that this tool cannot read, '
+                          'so a destination cannot be shown to be outside them')
+        if status != ['running']:
+            said = status[0] if status else 'not on this machine'
+            raise Refusal(f'the sandbox {self.name} is {said}, not running; this tool only reads, and asking '
+                          'a stopped sandbox anything would start it')
+
+    def inside(self, action, *, folder=None, streaming=False, timeout=3600):
+        payload = json.dumps({'action': action, 'clone': self.clone, 'roots': self.roots,
+                              'folder': folder, 'factory_runtime': FACTORY_RUNTIME})
+        argv = ['sbx', 'exec', self.name, 'python3', '-c', SANDBOX, payload]
+        self.commands.append(argv[:5] + ['<code sha256:' + hashlib.sha256(SANDBOX.encode()).hexdigest() + '>', payload])
+        if streaming:
+            try:
+                return subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            except OSError:
+                raise Refusal('the sbx tool could not be run on this machine') from None
+        try:
+            done = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout)
+        except OSError:
+            raise Refusal('the sbx tool could not be run on this machine') from None
+        except subprocess.TimeoutExpired:
+            raise Refusal(f'the sandbox {self.name} did not answer within {timeout} seconds') from None
+        if done.returncode != 0:
+            said = done.stderr.decode(errors='replace').strip().splitlines()[-1:] or ['nothing']
+            raise Refusal(f'the sandbox {self.name} could not be asked (sbx exec exited {done.returncode}: {said[0]})')
+        try:
+            return json.loads(done.stdout)
+        except ValueError:
+            raise Refusal(f'the sandbox {self.name} gave an answer this tool cannot read') from None
+
+    # -- --report ----------------------------------------------------------
+    def report(self):
+        self.running()
+        found = self.inside('report')
+        print(f'sandbox-scratch report for the sandbox {self.name} (read only: nothing was changed)\n')
+        print('Free space')
+        labels = {'clone': "the clone's disk", 'root': "the sandbox's root disk", 'docker': "Docker's disk"}
+        seen = {}
+        for key in ('clone', 'root', 'docker'):
+            d = found['disks'][key]
+            if 'error' in d:
+                print(f'  {labels[key]}: could not be read ({d["error"]})')
+                continue
+            same = seen.get(d['device'])
+            note = f' (the same disk as {same})' if same else ''
+            seen.setdefault(d['device'], labels[key])
+            print(f'  {labels[key]} ({shown(d["path"])}): {gib(d["free"])} free of {gib(d["total"])}{note}')
+        if found['worktree_problem']:
+            print(f"\nThe clone's registered worktrees could not be read ({found['worktree_problem']}), "
+                  'so no folder below can be shown to hold none, and --copy will refuse.')
+        for listing in found['roots']:
+            print(f'\nFolders under {shown(listing["root"])}')
+            if not listing['exists']:
+                print('  (there is no such folder in this sandbox)')
+                continue
+            if not listing['folders']:
+                print('  (none)')
+            for f in listing['folders']:
+                notes = []
+                path = os.path.join(listing['root'], f['name'])
+                held = [h for h in [self.clone] + self.roots
+                        if h != listing['root'] and (h == path or h.startswith(path + '/'))]
+                if held:
+                    notes.append('holds ' + ' and '.join(held) + ', the clone or the other scratch place, so it is never copied')
+                if f['name'] == FACTORY_RUNTIME and listing['root'] == self.roots[0]:
+                    notes.append('the live factory\'s own folder; never copied')
+                if f['worktrees']:
+                    notes.append('holds a registered worktree, so it is never copied: ' + '; '.join(f['worktrees'][:3])
+                                 + (f' and {len(f["worktrees"]) - 3} more' if len(f['worktrees']) > 3 else ''))
+                if f['unsupported']:
+                    notes.append(f'holds {entries_said(len(f["unsupported"]))} that {"is" if len(f["unsupported"]) == 1 else "are"} not a file, a folder or a link, so it cannot be copied')
+                if f['unreadable']:
+                    notes.append(f'{entries_said(len(f["unreadable"]))} this sandbox\'s user cannot read, so the size is a lower bound and it cannot be copied')
+                print(f'  {size(f["size"]):>10}  {entries_said(f["entries"]):>13}  {shown(f["name"])}' + ''.join(f'\n{"":29}{shown(n)}' for n in notes))
+            if listing['other']:
+                total = sum(o['size'] for o in listing['other'])
+                print(f'  {size(total):>10}  {entries_said(len(listing["other"])):>13}  directly in this folder, not in a folder of their own (this tool copies folders only)')
+        return 0
+
+    # -- --copy --------------------------------------------------------------
+    def copy(self, folder, to):
+        destination = Path(os.path.abspath(to))
+        manifests = [Path(str(destination) + suffix) for suffix in ('.source-manifest.json', '.copy-manifest.json')]
+        # The destination is checked FIRST, before the sandbox is asked anything,
+        # and made with one mkdir later: an existing folder is a refusal, never a
+        # merge into it.
+        for path in (destination, *manifests):
+            if os.path.lexists(path):
+                raise Refusal(f'{path} already exists on this host; name a new folder (nothing has been copied)')
+        self.running()
+        # A destination inside a folder the sandbox shares would be written
+        # where the sandbox can see it and write to it - inside the clone, into
+        # the very source being copied (the coach of TC7 did exactly that).
+        for shared in self.workspaces:
+            if within(destination, shared):
+                raise Refusal(f'{destination} is inside {shared}, a folder the sandbox {self.name} shares with '
+                              'this host; choose a host folder the sandbox cannot see (nothing has been copied)')
+        checked = self.inside('check', folder=folder)
+        if not checked.get('ok'):
+            raise Refusal(checked.get('refusal') or 'the sandbox refused without saying why')
+        source, rows = checked['folder'], checked['manifest']
+        destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            os.mkdir(destination, 0o700)
+        except FileExistsError:
+            raise Refusal(f'{destination} appeared on this host while the source was being recorded; name a new folder (nothing has been copied)') from None
+        os.chmod(destination, 0o700)
+        record = {'sandbox': self.name, 'source': source, 'destination': str(destination),
+                  'recorded_at': dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+                  'entries': rows}
+        write_new(manifests[0], record)
+
+        problem = self.receive(source, destination)
+        copied = manifest(str(destination))
+        # THE SOURCE IS RECORDED AGAIN AFTER THE STREAM (TC7 coach, finding 1).
+        # The copy can only match the record taken before it; a file appended
+        # after it had streamed, or a file added after its folder had been
+        # listed, would match that record and still not be what the folder now
+        # holds. So a third record, read-only like the first, must agree too:
+        # before and after on type, size, mtime_ns, SHA-256 and link text, and
+        # the copy with both on everything but times.
+        after = self.inside('check', folder=source)
+        differences = compare(rows, copied)
+        if not after.get('ok'):
+            differences.append('the source could not be recorded again after the copy: '
+                               + (after.get('refusal') or 'the sandbox refused without saying why'))
+            after_rows = None
+        else:
+            after_rows = after['manifest']
+            differences += compare(rows, after_rows, sides=('before the copy', 'after the copy'),
+                                   fields=('type', 'size', 'mtime_ns', 'sha256', 'target'))
+        if problem:
+            differences.insert(0, problem)
+        verdict = 'verified copy' if not differences else 'copy does not match'
+        write_new(manifests[1], {
+            'sandbox': self.name, 'source': source, 'destination': str(destination),
+            'checked_at': dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+            'verdict': verdict, 'differences': differences, 'entries': copied,
+            'source_after_entries': after_rows, 'commands': self.commands})
+        if differences:
+            print(f'copy does not match: {shown(source)} in the sandbox {self.name} and {destination} on this host differ.')
+            for line in differences[:20]:
+                print('  ' + shown(line))
+            if len(differences) > 20:
+                print(f'  ... and {len(differences) - 20} more, all in {manifests[1]}')
+            print('Both are kept: nothing was removed from either side. If the source was still being '
+                  'written to, copy it again into a new folder once it is quiet.')
+            return 1
+        print(f'verified copy: {entries_said(len(rows))}, from {shown(source)} in the sandbox {self.name} '
+              f'to {destination}. The source read the same before and after the copy; the manifests are '
+              f'{manifests[0].name} and {manifests[1].name} beside the copy.')
+        return 0
+
+    def receive(self, source, destination):
+        """Unpack the sandbox's tar stream into destination, safely, or say why not."""
+        process = self.inside('stream', folder=source, streaming=True)
+        problem = None
+        try:
+            with tarfile.open(fileobj=process.stdout, mode='r|') as stream:
+                problem = unpack(stream, destination)
+        except (tarfile.TarError, OSError, EOFError) as error:
+            problem = f'the copy did not complete: {error}'
+        finally:
+            if process.stdout:
+                # Drain whatever is left so the sandbox side can finish, then wait.
+                for _ in iter(lambda: process.stdout.read(1 << 20), b''):
+                    pass
+            said = process.stderr.read().decode(errors='replace').strip().splitlines()[-1:] if process.stderr else []
+            code = process.wait()
+        if code != 0 and problem is None:
+            problem = f'the copy did not complete: sbx exec exited {code} ({said[0] if said else "it said nothing"})'
+        return problem
+
+
+def write_new(path, document):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+    with os.fdopen(fd, 'w') as stream:
+        json.dump(document, stream, indent=1, sort_keys=True)
+        stream.write('\n')
+
+
+def unpack(stream, destination):
+    """Write each member under destination, refusing anything that could land
+    outside it. Returns None, or the first reason the stream was refused.
+
+    The rule that makes this safe: a member is written only into a folder this
+    function has just made itself. Symbolic links are made but never written
+    through, because no later member's parent can be one."""
+    made = {''}
+    written = set()
+    folders = []
+    for member in stream:
+        name = member.name
+        parts = PurePosixPath(name).parts
+        if (not name or name.startswith('/') or any(p in ('', '.', '..') for p in parts)
+                or '/'.join(parts) != name.rstrip('/')):
+            return f'the stream named {name!r}, which is not a plain relative path; the copy stopped there'
+        name = '/'.join(parts)
+        parent = '/'.join(parts[:-1])
+        if parent not in made or name in written:
+            return f'the stream put {name!r} somewhere this copy did not make, or twice; the copy stopped there'
+        path = destination / name
+        mode = stat.S_IMODE(member.mode) & 0o777
+        if member.isdir():
+            os.mkdir(path, 0o700)
+            made.add(name)
+            folders.append((path, mode | 0o700, member.mtime))
+        elif member.issym():
+            os.symlink(member.linkname, path)
+            os.utime(path, (member.mtime, member.mtime), follow_symlinks=False)
+        elif member.isreg():
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+            with os.fdopen(fd, 'wb') as out:
+                data = stream.extractfile(member)
+                for block in iter(lambda: data.read(1 << 20), b''):
+                    out.write(block)
+                os.fchmod(out.fileno(), mode)
+            os.utime(path, (member.mtime, member.mtime))
+        else:
+            return f'the stream held {name!r}, which is not a file, a folder or a symbolic link; the copy stopped there'
+        written.add(name)
+    # Folder modes and times last: writing into a folder changes its time, and
+    # a read-only folder could not have been written into.
+    for path, mode, mtime in reversed(folders):
+        os.chmod(path, mode)
+        os.utime(path, (mtime, mtime))
+    return None
+
+
+def compare(source, copy, *, sides=('the source record', 'the copy'),
+            fields=('type', 'size', 'sha256', 'target')):
+    """Every way two records differ, on the fields given. By default the copy
+    against the source: path, type, size, SHA-256 and link text (a copy's
+    times are set from the stream, which need not carry nanoseconds)."""
+    before = {row['path']: row for row in source}
+    after = {row['path']: row for row in copy}
+    first, second = sides
+    differences = []
+    for path in sorted(before.keys() - after.keys()):
+        differences.append(f'{path}: in {first}, missing from {second}')
+    for path in sorted(after.keys() - before.keys()):
+        differences.append(f'{path}: in {second}, not in {first}')
+    for path in sorted(before.keys() & after.keys()):
+        a, b = before[path], after[path]
+        for field in fields:
+            if a.get(field) != b.get(field):
+                differences.append(f'{path}: {field} was {a.get(field)} in {first} and is {b.get(field)} in {second}')
+    return differences
+
+
+def workspace_path(entry):
+    """'/path' or '/path:ro' as 'sbx ls --json' lists a shared folder."""
+    if isinstance(entry, str) and entry.rsplit(':', 1)[-1] in ('ro', 'rw') and ':' in entry:
+        return entry.rsplit(':', 1)[0]
+    return entry
+
+
+def within(path, folder):
+    """Is path at or under folder, after resolving every symbolic link of both?"""
+    path, folder = os.path.realpath(path), os.path.realpath(folder)
+    return path == folder or path.startswith(folder.rstrip('/') + '/')
+
+
+def shown(text):
+    """A name as it may safely be printed: one line, nothing invisible."""
+    text = str(text)
+    if text.isprintable():
+        return text
+    return ascii(text)[1:-1]
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('--sandbox', required=True, help='the sandbox, by name')
+    parser.add_argument('--clone', required=True, help="the clone's full path inside the sandbox")
+    parser.add_argument('--sandbox-tmp', default='/tmp',
+                        help="the sandbox's own temporary folder (default /tmp)")
+    action = parser.add_mutually_exclusive_group(required=True)
+    action.add_argument('--report', action='store_true', help='free space and scratch folders; changes nothing')
+    action.add_argument('--copy', metavar='FOLDER',
+                        help='one top-level scratch folder, by name or full path inside the sandbox')
+    parser.add_argument('--to', metavar='NEW_HOST_FOLDER', help='with --copy: a host folder that does not exist yet')
+    args = parser.parse_args(argv)
+    try:
+        scratch = Scratch(args)
+        if args.report:
+            if args.to:
+                raise Refusal('--to belongs with --copy; a report copies nothing')
+            return scratch.report()
+        if not args.to:
+            raise Refusal('--copy needs --to, a new folder on this host for the copy')
+        return scratch.copy(args.copy, args.to)
+    except Refusal as refusal:
+        message = str(refusal)
+        print('Refusing: ' + message + ('' if message.endswith('.') else '.'), file=sys.stderr)
+        return 2
+
+
+if __name__ == '__main__':
+    sys.exit(main())

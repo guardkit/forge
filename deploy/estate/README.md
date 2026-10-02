@@ -951,6 +951,31 @@ a sandbox's reports its manifest — so the same bytes carried across come back
 under a different name. What both report identically is the list of layers the
 filesystem is made of, so that list, hashed, is what is compared.
 
+## Room on a sandbox's build disk
+
+    ./sandbox-scratch --sandbox <name> --clone <clone path in the sandbox> --report
+    ./sandbox-scratch --sandbox <name> --clone <clone path> --copy <folder> --to <new host folder>
+
+The build runner refuses a build when the free space where its worktrees go is
+below its floor, and a sandbox sets that floor in its own settings file.
+`estate-check services` item **9b** asks the runner itself, inside its own
+container, what it would answer: below the floor is **not passed**; within
+10 GiB above it is a pass marked **WARNING**. The item is only in the full
+services check; the closed-door record keeps exactly the items it always had.
+
+`sandbox-scratch --report` shows free space on the clone's disk, the sandbox's
+root disk and Docker's disk, and the size of every top-level folder under the
+clone's `.guardkit/tmp` and the sandbox's `/tmp`, marking the ones that hold a
+registered git worktree. `--copy` copies one such folder, as a tar stream over
+`sbx exec`, into a host folder that must not exist yet, and checks it file by
+file against a record of the source taken first: it ends with
+`verified copy: <n> entries` or names every difference and keeps both.
+
+**It never removes anything, and asks nothing of a stopped sandbox** (asking
+would start it). It refuses `factory-runtime`, any folder holding a registered
+worktree, anything outside the two places, and an existing destination.
+Freeing the space inside the sandbox is a separate change of its own.
+
 ## The rollout preconditions this bundle does not meet
 
 Recorded here so nothing reads as finished that is not, from the build plan and
