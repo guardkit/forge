@@ -324,9 +324,22 @@ def test_switch_refuses_a_reader_digest_that_is_neither_recorded_nor_a_reconcili
 
 def test_switch_never_starts_sandbox_runner_when_the_clones_template_is_not_the_releases(up):
     shut(up); up.world.install_release_3_in_sandbox(up.evidence, up.bootstrap[V3]); up.world.restore_release_2_in_sandbox(); mark = len(up.world.events)
-    with pytest.raises(r.Refusal, match="the clone's bootstrap does not have the SHA-256 recorded for release"):up.estate(V3).switch()
-    assert ('up', 'sandbox-runner', V3) not in up.world.events[mark:] and not up.world.running('sandbox-runner')
+    with pytest.raises(r.Refusal, match="the clone's bootstrap does not have the SHA-256 recorded for release .*, so nothing was started"):up.estate(V3).switch()
+    # Refused before anything started or was removed, so the way back is still WB-B, not WB-C.
+    assert not events_since(up.world, mark, 'up') and not events_since(up.world, mark, 'rm') and not running_services(up.world)
     assert stopped_door(up.world)
+
+
+def test_switch_refuses_before_starting_anything_when_the_sandbox_image_is_another_release(up):
+    shut(up); up.world.install_release_3_in_sandbox(up.evidence, up.bootstrap[V3]); mark = len(up.world.events)
+    up.world.inner_images['forge:' + V3] = up.world.inner_images['forge:' + V2]
+    original = up.world.sbx
+    def sbx(args):
+        code, out, err = original(args)
+        return (code, out.replace(' ' + V3, ' ' + V2), err) if args[2:5] == ['docker', 'image', 'inspect'] else (code, out, err)
+    up.world.sbx = sbx
+    with pytest.raises(r.Refusal, match="the image the bootstrap names is not release .*'s, so nothing was started"):up.estate(V3).switch()
+    assert not events_since(up.world, mark, 'up') and not events_since(up.world, mark, 'rm')
 
 
 def test_switch_refuses_a_settings_change_other_than_planning_before_starting_anything(up):
