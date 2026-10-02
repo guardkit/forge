@@ -2149,6 +2149,39 @@ def http_code(out):
     return code if len(code) == 3 and code.isdigit() else None
 
 
+def process_start(pid):
+    """(boot time, start ticks, ticks per second) of a host process, read from
+    the kernel exactly as the coordinator reads its own PID 1 — the same three
+    integers, so the record can be bound to ONE start by equality."""
+    try:
+        stat = open(f"/proc/{int(pid)}/stat", encoding="utf-8").read()
+        ticks = int(stat[stat.rindex(")") + 2:].split()[19])
+        boot = None
+        for line in open("/proc/stat", encoding="utf-8"):
+            if line.startswith("btime "):
+                boot = int(line.split()[1])
+                break
+        per_second = int(os.sysconf("SC_CLK_TCK"))
+    except (OSError, ValueError, IndexError, TypeError):
+        return None
+    if not boot or ticks <= 0 or per_second <= 0:
+        return None
+    return boot, ticks, per_second
+
+
+def start_of(container):
+    """The coordinator's start identity: Docker's StartedAt and PID, and PID 1's
+    kernel start. Refuses when any of it cannot be read."""
+    state = container.get("State") or {}
+    pid = state.get("Pid")
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        refuse("the coordinator's process id could not be read.")
+    start = process_start(pid)
+    if start is None:
+        refuse("the coordinator's PID 1 start could not be read from this machine's kernel.")
+    return {"started_at": state.get("StartedAt", ""), "pid": pid, "kernel": start}
+
+
 def main():
     global WRITTEN
     project = os.environ.get("PF_PROJECT", "")
@@ -2185,6 +2218,7 @@ def main():
         started_epoch = parsed.timestamp()
     except ValueError:
         refuse(f"the coordinator's start time ({started_text!r}) could not be read.")
+    first_start = start_of(coordinator)
     facts_mount = mount_source(coordinator, FACTS_TARGET)
     if (not facts_mount or facts_mount.get("Name") != facts_volume
             or facts_mount.get("RW") is not False):
@@ -2502,10 +2536,27 @@ def main():
         "coordinator_image_id": coordinator_image,
         "coordinator_started_at": started_text,
         "coordinator_started_at_epoch": started_epoch,
+        "coordinator_pid1_start": {
+            "boot_time_epoch": first_start["kernel"][0],
+            "start_ticks": first_start["kernel"][1],
+            "ticks_per_second": first_start["kernel"][2],
+        },
         "machine": machine,
         "said": said,
     }
-    if record["written_at_epoch"] <= started_epoch:
+    # THE SAME START, RE-READ IMMEDIATELY BEFORE THE WRITE. A coordinator that
+    # restarted while this look ran is not the one the answers were gathered
+    # for, and a record naming its old start must not be written at all.
+    again = inspected(coordinator_short)
+    if not again or again[0].get("Id") != coordinator_id \
+            or not (again[0].get("State") or {}).get("Running") \
+            or start_of(again[0]) != first_start:
+        refuse("the coordinator restarted (or stopped) while this check was looking, "
+               "so what was found is not about the coordinator now running. Run the "
+               "check again.")
+    boot, ticks, per_second = first_start["kernel"]
+    if record["written_at_epoch"] <= started_epoch \
+            or record["written_at_epoch"] <= boot + ticks / per_second:
         refuse("this machine's clock says the record would be no newer than the coordinator's start.")
     code, _ = run(*helper, (f"set -e; umask 022; cat > /facts/.{FACTS_NAME}.new; "
                             f"chmod 0644 /facts/.{FACTS_NAME}.new; "

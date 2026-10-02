@@ -761,7 +761,7 @@ read-only root, every capability dropped and no new privileges — that volume's
 only writer — after any earlier record has been invalidated. The coordinator mounts
 the volume **read-only** and, when `FORGE_PUBLICATION_FACTS_FILE` names the
 record, reads it **at every merge word**. It acts on a record only while it was
-written for its own container, after its own start, and within a day; anything
+written for its own container and for exactly its current start (PID 1's start as the kernel counts it, re-read by the check just before writing), after that start, and within a day; anything
 else reads as "nobody has looked", so publication stays off and the merge word
 says why. Because a record is never newer than a start that comes after it, the
 coordinator's boot log says publication is off and says why the facts are not

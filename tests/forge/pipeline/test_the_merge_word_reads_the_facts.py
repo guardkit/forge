@@ -29,7 +29,6 @@ from forge.lifecycle.persistence import SqliteLifecyclePersistence
 from forge.pipeline.merge_executor import MergeExecutorDeps, execute_merge_deploy
 from forge.pipeline.publication_facts import (
     FACTS_FILE_ENV,
-    ThisCoordinator,
     read_publication_facts,
 )
 from tests.forge.pipeline.test_merge_executor import (  # noqa: F401 - fixtures
@@ -44,7 +43,7 @@ from tests.forge.pipeline.test_merge_executor import (  # noqa: F401 - fixtures
     repo_root,
 )
 from tests.forge.pipeline.test_publication_facts import (
-    CONTAINER,
+    ASKING,
     STARTED,
     facts,
 )
@@ -59,7 +58,7 @@ def _reader(path: Path) -> Any:
     return functools.partial(
         read_publication_facts,
         environ={FACTS_FILE_ENV: str(path)},
-        who_is_asking=lambda: ThisCoordinator(CONTAINER, STARTED),
+        who_is_asking=lambda: ASKING,
         now=lambda: STARTED + 300,
     )
 

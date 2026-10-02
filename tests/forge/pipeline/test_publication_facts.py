@@ -47,7 +47,14 @@ from forge.pipeline.publication_switch import (
 
 CONTAINER = "c0ffee" + "0" * 58
 ANOTHER = "beef" + "1" * 60
-STARTED = 1_790_000_000.0
+#: The coordinator's PID 1 start, as the kernel counts it: boot time, start
+#: ticks since boot, ticks per second. STARTED is the same moment in seconds.
+TPS = int(os.sysconf("SC_CLK_TCK"))
+BOOT = 1_789_000_000
+TICKS = 1_000_000 * TPS
+STARTED = BOOT + TICKS / TPS
+PID1_START = {"boot_time_epoch": BOOT, "start_ticks": TICKS, "ticks_per_second": TPS}
+ASKING = ThisCoordinator(CONTAINER, STARTED, BOOT, TICKS, TPS)
 
 EVERY_WALL_STANDS = {
     "a_sandbox_can_write_the_coordinators_settings_file": False,
@@ -75,6 +82,7 @@ def facts(
         "coordinator_image_id": "sha256:" + "a" * 64,
         "coordinator_started_at": "2026-09-21T00:00:00Z",
         "coordinator_started_at_epoch": STARTED,
+        "coordinator_pid1_start": dict(PID1_START),
         "machine": dict(EVERY_WALL_STANDS if machine is None else machine),
         "said": {},
     }
@@ -86,7 +94,7 @@ def a_reader(
     path: Path,
     *,
     now: float = STARTED + 120,
-    asking: ThisCoordinator = ThisCoordinator(CONTAINER, STARTED),
+    asking: ThisCoordinator = ASKING,
     **kwargs: Any,
 ) -> Any:
     """The production reader, told where the file is, who asks, and when."""
@@ -227,7 +235,35 @@ class TestAnythingElseIsNobodyHasLooked:
             ),
             pytest.param(
                 facts(),
-                ThisCoordinator(None, STARTED),
+                ThisCoordinator(CONTAINER, STARTED + 30, BOOT, TICKS + 30 * TPS, TPS),
+                None,
+                "not the one running now",
+                id="restarted-after-the-look",
+            ),
+            pytest.param(
+                facts(written=STARTED + 90),
+                ThisCoordinator(CONTAINER, STARTED + 30, BOOT, TICKS + 30 * TPS, TPS),
+                None,
+                "not the one running now",
+                id="old-start-restart-then-write",
+            ),
+            pytest.param(
+                facts(),
+                ThisCoordinator(CONTAINER, STARTED, BOOT + 1, TICKS, TPS),
+                None,
+                "not the one running now",
+                id="clock-stepped",
+            ),
+            pytest.param(
+                facts(coordinator_pid1_start=None),
+                None,
+                None,
+                "which start of the coordinator",
+                id="no-start-identity",
+            ),
+            pytest.param(
+                facts(),
+                ThisCoordinator(None, STARTED, BOOT, TICKS, TPS),
                 None,
                 "could not tell which container",
                 id="not-in-a-container",
@@ -355,6 +391,7 @@ class TestWhoIsAsking:
 
         assert asking.container_id == CONTAINER
         assert asking.started_at_epoch == pytest.approx(1_790_000_000 + 12345)
+        assert asking.start_identity == (1_790_000_000, ticks, os.sysconf("SC_CLK_TCK"))
 
     def test_outside_a_container_nothing_is_claimed(self, tmp_path: Path) -> None:
         proc = tmp_path / "proc"
@@ -465,7 +502,7 @@ class TestWhereTheFactsStandAtBoot:
         path = tmp_path / "f.json"
         ask = {
             "environ": {FACTS_FILE_ENV: str(path)},
-            "who_is_asking": lambda: ThisCoordinator(CONTAINER, STARTED),
+            "who_is_asking": lambda: ASKING,
             "now": lambda: STARTED + 120,
         }
         assert "there is no publication facts file" in where_the_facts_stand(**ask)
@@ -474,3 +511,44 @@ class TestWhereTheFactsStandAtBoot:
         write(path, facts())
         assert where_the_facts_stand(**ask).startswith("publication facts: present and fresh")
 
+
+
+
+class TestOnlyTheWritersWholeNumbersAreTimes:
+    """Codex R3: NaN, infinity, floats, bools and strings are not times."""
+
+    WRITTEN = f'"written_at_epoch": {int(STARTED) + 60}'
+    TICKED = f'"start_ticks": {TICKS}'
+
+    @pytest.mark.parametrize(
+        "replace, by",
+        [
+            pytest.param(WRITTEN, '"written_at_epoch": NaN', id="NaN"),
+            pytest.param(WRITTEN, '"written_at_epoch": Infinity', id="Infinity"),
+            pytest.param(WRITTEN, '"written_at_epoch": -Infinity', id="minus-Infinity"),
+            pytest.param(WRITTEN, '"written_at_epoch": 1e400', id="overflow-to-inf"),
+            pytest.param(WRITTEN, f'"written_at_epoch": {STARTED + 60.5}', id="float"),
+            pytest.param(WRITTEN, '"written_at_epoch": true', id="bool"),
+            pytest.param(WRITTEN, f'"written_at_epoch": "{int(STARTED) + 60}"', id="string"),
+            pytest.param(WRITTEN, WRITTEN + ', "x": NaN', id="NaN-elsewhere"),
+            pytest.param(TICKED, '"start_ticks": NaN', id="NaN-start"),
+            pytest.param(TICKED, f'"start_ticks": {TICKS}.0', id="float-start"),
+        ],
+    )
+    def test_it_is_refused_through_the_activation_gate(
+        self, tmp_path: Path, config_on: ForgeConfig, replace: str, by: str
+    ) -> None:
+        raw = json.dumps(facts())
+        assert raw.count(replace) == 1
+        path = tmp_path / "f.json"
+        path.write_text(raw.replace(replace, by))
+        reader = a_reader(path)
+
+        assert not publication_is_switched_on(config_on, reader)
+        assert "nobody has looked" in why_publication_is_off(config_on, reader)
+
+    def test_the_valid_record_beside_them_is_on(
+        self, tmp_path: Path, config_on: ForgeConfig
+    ) -> None:
+        reader = a_reader(write(tmp_path / "f.json", facts()))
+        assert publication_is_switched_on(config_on, reader)
