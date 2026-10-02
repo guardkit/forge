@@ -221,9 +221,29 @@ def test_final_stops_the_supervisor_first_then_writes_the_backup_and_turns_plann
 
 def test_final_refuses_when_the_supervisor_exits_3_and_stops_nothing_else(up):
     w = up.world; up.estate(V2).close(); up.estate(V2).settle(); w.supervisor_stop_exit = 3
-    with pytest.raises(r.Refusal, match='sandbox-runner exited 3, not 0'):up.estate(V2).final()
+    with pytest.raises(r.Refusal, match='sandbox-runner exited 3: its stop of the work inside the sandbox did not succeed; and inside the sandbox there is still '+PREFIX+'-helper, '+PREFIX+'-runner'):up.estate(V2).final()
     assert running_services(w).keys() == {'coordinator', 'answer-service', 'memory', 'memory-relay', 'forge-publisher'}
     assert planning(w) is True and not (up.usnap / 'current-forge.db').exists()
+
+
+@pytest.mark.parametrize('code', [1, 2, 137])
+def test_a_supervisor_that_exited_non_zero_with_nothing_inside_does_not_block_final(up, code):
+    # Coach S2/S3b: a supervisor that crashed or refused at start must not block every
+    # way forward and back, once it is proved nothing runs inside the sandbox.
+    w = up.world; w.stop(w.running('sandbox-runner')[0], code)
+    up.estate(V2).close(); up.estate(V2).settle()
+    final = up.estate(V2).final()
+    assert final['supervisor']['exit'] == code and 'nothing runs inside the sandbox' in final['supervisor']['accepted_because']
+    if code == 2:assert final['supervisor']['meaning'].startswith('it refused before starting anything')
+    assert not running_services(w) and planning(w) is False
+
+
+@pytest.mark.parametrize('inside', ['record_live', 'lock_held'])
+def test_a_non_zero_supervisor_with_a_live_supervisor_inside_still_refuses(up, inside):
+    w = up.world; w.stop(w.running('sandbox-runner')[0], 1); w.supervision[inside] = True
+    up.estate(V2).close(); up.estate(V2).settle()
+    with pytest.raises(r.Refusal, match='sandbox-runner exited 1: it ended without its own clean stop .* nothing else was stopped'):up.estate(V2).final()
+    assert running_services(w)['coordinator'] == V2
 
 
 def test_a_second_final_never_overwrites_the_first_backup(up):
@@ -392,7 +412,7 @@ def test_open_refuses_each_unusable_closed_door_receipt_and_starts_nothing(up, r
     if receipt == 'other-release':w.write_pre_resume(up.doors[V3], r.RELEASES[V2]['runtime'])
     if receipt == 'not-fully-checked':w.write_pre_resume(up.doors[V3], V3_ENTRY['runtime'], status='passed-with-items-not-checked')
     mark = len(w.events)
-    with pytest.raises(r.Refusal, match='estate-check could not complete'):up.estate(V3).open()
+    with pytest.raises(r.Refusal, match="closed-door receipt in .* cannot be acted on"):up.estate(V3).open()
     door_still_shut(up, mark)
 
 

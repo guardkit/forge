@@ -101,6 +101,7 @@ class World:
         self.marker = None
         self.pre_resume_written = {}
         self.h6_containers = {}
+        self.supervision = {'record_present': False, 'record_live': False, 'lock_held': False}  # inside the sandbox
         self.h6_result = None        # callable(create_argv) -> (exit, result dict) for the H6 probe
         self.sandbox_back = None     # callable(argv) -> (exit, stderr) for rollout-sandbox --upgrade --back
 
@@ -184,7 +185,8 @@ class World:
 
     def stop(self, c, code=0):
         c['State'].update(Running=False, Status='exited', ExitCode=code, Pid=0, FinishedAt=stamp())
-        if c['service'] == 'sandbox-runner':
+        # run.sh exits 3 when the work inside would not stop: it is still in there.
+        if c['service'] == 'sandbox-runner' and code != 3:
             self.inner = {}
 
     def up(self, release, services, force):
@@ -417,6 +419,9 @@ class World:
                     return 1, '', 'No such file'
                 lines.append(sha(self.sandbox_files[p]) + '  ' + p)
             return 0, '\n'.join(lines) + '\n', ''
+        if rest[:2] == ['python3', '-c'] and '.forge-runner' in rest[2]:
+            assert rest[3] == SCRIPT
+            return 0, json.dumps(self.supervision), ''
         if rest[:2] == ['docker', 'ps']:
             return 0, '\n'.join(self.inner), ''
         if rest[:3] == ['docker', 'image', 'inspect']:

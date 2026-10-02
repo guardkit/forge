@@ -92,7 +92,37 @@ def refuse(message):
 
 TIMEOUT_SECONDS = 180
 
+# ONE TIME LIMIT FOR A WHOLE MODE (release -3 upgrade runbook, after the coach's
+# review of 2 October 2026). run-step kills a step at its own limit with SIGKILL,
+# which nothing can clean up after, so each upgrade mode bounds itself: every
+# command it runs gets at most what remains of the mode's limit, and none starts
+# once the limit has passed. The runbook then sets run-step's limit above it.
+DEADLINE = None
+DEADLINE_WHAT = None
+
+class deadline:
+    """Bound every command run inside to `seconds` from now (or less, inside an
+    outer limit). replace=True starts a fresh limit, for clean-up after a failure."""
+    def __init__(self, seconds, what, *, replace=False):
+        self.seconds, self.what, self.replace = seconds, what, replace
+    def __enter__(self):
+        global DEADLINE, DEADLINE_WHAT
+        self.previous = (DEADLINE, DEADLINE_WHAT)
+        end = time.monotonic() + self.seconds
+        if self.replace or DEADLINE is None or end < DEADLINE:
+            DEADLINE, DEADLINE_WHAT = end, self.what
+        return self
+    def __exit__(self, *exc):
+        global DEADLINE, DEADLINE_WHAT
+        DEADLINE, DEADLINE_WHAT = self.previous
+        return False
+
 def run(argv, *, input=None, check=True, env=None, timeout=TIMEOUT_SECONDS):
+    if DEADLINE is not None:
+        remaining = DEADLINE - time.monotonic()
+        if remaining <= 0:
+            refuse(f'{DEADLINE_WHAT} reached its own time limit before {Path(str(argv[0])).name} could run; nothing more was started, so read its receipt for where it stopped')
+        timeout = min(timeout, remaining)
     # Never print a failed command's stderr: Compose diagnostics can contain secrets.
     result = subprocess.run([str(x) for x in argv], input=input, capture_output=True, text=True, timeout=timeout, env=env)
     if check and result.returncode:
