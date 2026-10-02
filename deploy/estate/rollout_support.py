@@ -47,6 +47,16 @@ RELEASES = {
         'jarvis': 'sha256:ab27492852cbcafc348a73759921fd2b190fe03059dac6154358554e93204da5',
         'schema': 16,
     },
+    # Release -3, built 2 October 2026 from Forge release/2026.10.02-1 at
+    # 0705d106 (manifest sha256 3da966ca...726ce); the same record format.
+    '2026.10.02-1': {
+        'runtime': 'sha256:19d0eca6f08c81f19747110de8efd86b8c1632d87ba0f92bf92348e32438b209',
+        'publisher': 'sha256:2a6bbbf625fbf1efe1acf071d8edf7c85eec29e3fc70e216c0b25659a6312aec',
+        'memory': 'sha256:f4f1fb8d7fecf0a4ba6e941ae3a89db04b45efc264c43a28fdc19e6c855f6913',
+        'relay': 'sha256:2900db8a3b2d3ed3355f339f710fb1da440f2066d5761434a9444309a9fbdc82',
+        'jarvis': 'sha256:5f8dd833aa4431cd247593ea305c9cd39a7ef5ebb639feadd6805678fde8142e',
+        'schema': 16,
+    },
 }
 # The inventories of the 30 September switch name no release: they were all
 # written for this one, so an inventory without 'release' still means it.
