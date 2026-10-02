@@ -154,14 +154,14 @@ networks:
   # network off from outside would leave a publisher that can be asked to send
   # and can never send.
   #
-  # WHAT IS NOT SETTLED HERE, and is named rather than papered over. The
-  # publisher also has to READ each project's copy, at the read-only address
-  # in its settings; for a project built in a sandbox that address is the
-  # sandbox's own git service. Putting that service on this network would put
-  # the sandbox within reach of the publisher and undo the whole arrangement,
-  # so it must be reached some other way — one direction only, publisher to
-  # the copy. Which way is a rollout decision about the real machine, it is
-  # not made here, and that question is asked again after it is made.
+  # HOW THE PUBLISHER READS A SANDBOX'S COPY (2 October 2026). Not by putting
+  # the sandbox on this network. The sandbox's own read-only git daemon (port
+  # 9418 inside it) is published on the factory's gateway address with
+  # 'sbx ports <sandbox> --publish <gateway address>:<port>:9418', the same
+  # way its helper is, and the project's "source" in the publisher's settings
+  # is git://<gateway address>:<port>/<repository folder name>. The publisher
+  # reaches that address through the host, one direction only; the daemon
+  # serves fetches and refuses pushes.
   forge-publisher-net:
     driver: bridge
     enable_ipv6: false
