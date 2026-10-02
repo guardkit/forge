@@ -277,6 +277,17 @@ class TestTheSandboxRunnerAddsNothingOfThisMachine:
                 f"binary and the daemon's socket:\n{head}"
             )
 
+    def test_it_carries_its_sandbox_s_supervisor_label(
+        self, rendered_with_the_sandbox_runner: str
+    ) -> None:
+        """Release -3 TC6 (b): the project's wrapper finds the Compose
+        supervisor by this label and then starts neither old host unit."""
+        block = rendered_with_the_sandbox_runner.split("sandbox-runner:", 1)[1]
+        assert "com.guardkit.sandbox-supervisor: my-project-deploy" in block, (
+            "the sandbox runner does not carry com.guardkit.sandbox-supervisor="
+            "<SANDBOX_NAME>, so a hand-run wrapper cannot tell it is there"
+        )
+
     def test_docker_waits_longer_than_the_stop_inside_the_sandbox(
         self, rendered_with_the_sandbox_runner: str
     ) -> None:

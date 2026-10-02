@@ -103,7 +103,31 @@ exit 0
 
 FAKE_SYSTEMCTL = """#!/usr/bin/env bash
 # A stand-in for systemctl. Writes down what it was asked and does nothing.
+# A question ('show') is written to its own log and answered from
+# SYSTEMCTL_MASKED (a comma-separated list of masked units) or fails when
+# SYSTEMCTL_SHOW_STATUS says so; every other call goes to SYSTEMCTL_LOG.
+if [ "$2" = "show" ]; then
+  printf '%s\\n' "$*" >> "${SYSTEMCTL_QUERY_LOG:-/dev/null}"
+  [ "${SYSTEMCTL_SHOW_STATUS:-0}" = 0 ] || exit "${SYSTEMCTL_SHOW_STATUS}"
+  unit="${@: -1}"
+  case ",${SYSTEMCTL_MASKED:-}," in
+    *",${unit},"*) printf 'masked\\n' ;;
+    *) printf 'disabled\\n' ;;
+  esac
+  exit 0
+fi
 printf '%s\\n' "$*" >> "$SYSTEMCTL_LOG"
+exit 0
+"""
+
+FAKE_DOCKER = """#!/usr/bin/env bash
+# A stand-in for the host's docker. Writes down what it was asked and lists
+# DOCKER_PS (container IDs) for a 'ps', or fails with DOCKER_STATUS.
+printf '%s\\n' "$*" >> "$DOCKER_LOG"
+[ "${DOCKER_STATUS:-0}" = 0 ] || exit "${DOCKER_STATUS}"
+if [ "$1" = "ps" ] && [ -n "${DOCKER_PS:-}" ]; then
+  printf '%s\\n' "${DOCKER_PS}"
+fi
 exit 0
 """
 
@@ -144,6 +168,7 @@ def wrapper_repo(estate: Path, tmp_path: Path) -> tuple[Path, Path]:
     fake_bin.mkdir()
     _write_fake(fake_bin, "sbx", FAKE_SBX)
     _write_fake(fake_bin, "systemctl", FAKE_SYSTEMCTL)
+    _write_fake(fake_bin, "docker", FAKE_DOCKER)
     return repo, fake_bin
 
 
@@ -159,6 +184,8 @@ def _drive_wrapper(wrapper_repo, tmp_path: Path, **env: str):
         "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
         "SBX_LOG": str(sbx_log),
         "SYSTEMCTL_LOG": str(systemctl_log),
+        "SYSTEMCTL_QUERY_LOG": str(tmp_path / "systemctl-queries.log"),
+        "DOCKER_LOG": str(tmp_path / "docker.log"),
         "SBX_LS": "",
         "SANDBOX_NAME": "bench-one-deploy",
         "SANDBOX_MEMORY": "6g",
@@ -361,6 +388,84 @@ class TestTheWrapperRefusesInOneSentence:
         assert "no such file" in result.stdout
         assert [line for line in sbx if line.startswith("create ")] == []
         assert systemctl == []
+
+class TestTheWrapperLeavesTheComposeSupervisorAlone:
+    """Release -3 TC6 (b): a hand-run wrapper must not start the host units on a
+    machine whose estate looks after the sandbox with its Compose supervisor
+    (the runner unit's stop step would end that supervisor and both of the
+    factory's containers, then restart against it every five seconds)."""
+
+    KEEPER = "forge-sandbox-keeper@bench-one-deploy"
+    RUNNER = "forge-sandbox-runner@bench-one-deploy"
+
+    def test_the_two_questions_are_asked_exactly(self, wrapper_repo, estate, tmp_path):
+        result, _, _ = _drive_wrapper(wrapper_repo, tmp_path, **_factory_env(estate, tmp_path))
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert _log_lines(tmp_path / "docker.log") == [
+            "ps -a -q --filter label=com.guardkit.sandbox-supervisor=bench-one-deploy"
+        ]
+        assert _log_lines(tmp_path / "systemctl-queries.log") == [
+            f"--user show -p UnitFileState --value {self.KEEPER}",
+            f"--user show -p UnitFileState --value {self.RUNNER}",
+        ]
+
+    @pytest.mark.parametrize("masked", ["keeper", "runner", "both"])
+    def test_a_masked_unit_is_never_started(self, wrapper_repo, estate, tmp_path, masked):
+        units = {"keeper": [self.KEEPER], "runner": [self.RUNNER], "both": [self.KEEPER, self.RUNNER]}[masked]
+        result, sbx, systemctl = _drive_wrapper(
+            wrapper_repo, tmp_path, SYSTEMCTL_MASKED=",".join(units), **_factory_env(estate, tmp_path)
+        )
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        for unit in units:
+            assert f"--user start {unit}" not in systemctl
+            assert f"{unit} is masked" in result.stdout
+        assert len(systemctl) == 2 - len(units)
+        assert [line for line in sbx if line.startswith("exec ")], "the deploy still runs"
+
+    def test_a_labelled_supervisor_container_prevents_both_starts_and_the_deploy_still_runs(
+        self, wrapper_repo, estate, tmp_path
+    ):
+        result, sbx, systemctl = _drive_wrapper(
+            wrapper_repo,
+            tmp_path,
+            SBX_LS="bench-one-deploy   running",
+            DOCKER_PS="0123456789ab",
+            **_factory_env(estate, tmp_path),
+        )
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert systemctl == []
+        assert "Compose supervisor looks after this sandbox" in result.stdout
+        assert [line for line in sbx if line.startswith("exec ")] != []
+
+    def test_a_labelled_container_also_stops_the_keeper_of_a_plain_sandbox(self, wrapper_repo, tmp_path):
+        result, _, systemctl = _drive_wrapper(wrapper_repo, tmp_path, DOCKER_PS="0123456789ab")
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert systemctl == []
+
+    @pytest.mark.parametrize("which", ["docker", "systemctl"])
+    def test_a_question_that_cannot_be_answered_starts_and_deploys_nothing(
+        self, wrapper_repo, estate, tmp_path, which
+    ):
+        failure = {"docker": {"DOCKER_STATUS": "1"}, "systemctl": {"SYSTEMCTL_SHOW_STATUS": "1"}}[which]
+        result, sbx, systemctl = _drive_wrapper(
+            wrapper_repo, tmp_path, **failure, **_factory_env(estate, tmp_path)
+        )
+
+        assert result.returncode == 2
+        assert "FATAL" in result.stdout and "Nothing was started and nothing was deployed" in result.stdout
+        assert systemctl == []
+        assert sbx == [], "nothing created, no policy changed, no deploy"
+
+    def test_with_neither_condition_both_starts_happen_as_today(self, wrapper_repo, estate, tmp_path):
+        result, _, systemctl = _drive_wrapper(wrapper_repo, tmp_path, **_factory_env(estate, tmp_path))
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert systemctl == [f"--user start {self.KEEPER}", f"--user start {self.RUNNER}"]
+
 
 # ---------------------------------------------------------------------------
 # The bootstrap inside the sandbox: deploy/sandbox-runner.sh
