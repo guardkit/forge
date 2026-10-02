@@ -580,7 +580,11 @@ def test_normal_boot_wal_and_checkpoint_verify_but_data_change_refuses(setup,mon
         assert r.verify_containers(c,d,meta,receipt,False)['container_verification']['coordinator']['logical_sha256']==startup
         before=writer.execute('SELECT applied_at FROM schema_version WHERE version=1').fetchone()[0]
         writer.execute('UPDATE schema_version SET applied_at=? WHERE version=1',('unapproved',));writer.commit()
-        with pytest.raises(r.Refusal,match='different ledger'):r.verify_containers(c,d,meta,receipt,False)
+        # Since d2bfa71b (1 October 2026) an unexpected started state is copied out
+        # and compared with an independently derived start-up state, which accepts
+        # only the coordinator's INTERRUPTED -> FAILED reconciliation of builds.
+        # Any other change is refused naming the table that changed.
+        with pytest.raises(r.Refusal,match='started ledger table schema_version differs from the loaded one'):r.verify_containers(c,d,meta,receipt,False)
         assert r.read_json(d/'load-receipt.json')['container_verification'] is None
         writer.execute('UPDATE schema_version SET applied_at=? WHERE version=1',(before,));writer.commit()
         writer.execute('PRAGMA wal_checkpoint(TRUNCATE)')
