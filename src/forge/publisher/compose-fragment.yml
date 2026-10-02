@@ -2,9 +2,12 @@
 # stage that wrote it, and the image beside it is not built by it either.
 #
 # READ THE SIX THINGS THIS FRAGMENT IS SAYING. The publisher itself refuses to
-# start unless its credential file is readable by its own user alone and it is
-# on exactly one network (forge/src/forge/publisher/__main__.py), and
-# publication stays off until it has passed that check:
+# start unless its credential file is a regular file owned by its UID with no
+# group or other access (other containers running as the same UID are not ruled
+# out by that) and it has exactly one non-loopback interface (which network is
+# decided here and checked by the host firewall check, not by the publisher)
+# (forge/src/forge/publisher/__main__.py), and publication stays off until it
+# has passed that check:
 #
 #   1. the credential file is mounted READ-ONLY, into this service and into
 #      nothing else. It is not in the coordinator's settings, not in the
@@ -81,8 +84,10 @@ services:
     # it for a send. To look at it by hand at rollout, join its network from a
     # throwaway container instead of publishing a port.
     #
-    # The sandbox is NOT on this network. The publisher refuses to start if it
-    # finds itself on more than this one network, or on the host's.
+    # The sandbox is NOT on this network. The publisher refuses to start unless
+    # it has exactly one non-loopback interface; that count cannot tell which
+    # network it is on or who else is there, so this file and the host firewall
+    # check (publisher-host-policy verify) are what keep it on this network.
     networks:
       - forge-publisher-net
     volumes:

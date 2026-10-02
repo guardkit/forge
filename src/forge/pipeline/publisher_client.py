@@ -171,9 +171,11 @@ SELF_CHECK_PASSED: str = "passed"
 def the_publishers_self_check(config: Any, *, timeout: float = 10.0) -> Any:
     """Ask the publisher's health route whether it passed its start-up check.
 
-    The publisher refuses to start unless its credential file is readable by
-    its own user alone and it is on exactly its own network; its health route
-    says ``"self_check": "passed"`` when it did. Anything else — no publisher
+    The publisher refuses to start, and its health route re-checks on every
+    request, that its credential file is a regular file owned by its UID with no
+    group or other access and that it has exactly one non-loopback interface
+    (not which network: the compose file and the host firewall check decide
+    that); the route says ``"self_check": "passed"`` when both hold. Anything else — no publisher
     configured, one that does not answer, an answer without that word — is
     "nobody could ask", which keeps publication off. Never raises.
     """
