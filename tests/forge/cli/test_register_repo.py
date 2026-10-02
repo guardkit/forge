@@ -1463,7 +1463,19 @@ exit 0
 FAKE_SYSTEMCTL = """#!/usr/bin/env bash
 # A stand-in for systemctl. It writes down what it was asked to do and does
 # nothing: no unit is started, stopped or reloaded by any test in this file.
+# The wrapper's question whether a unit is masked is answered "disabled" and
+# not written down, so the log holds only what the wrapper did.
+if [ "$2" = "show" ]; then
+  printf 'disabled\\n'
+  exit 0
+fi
 printf '%s\\n' "$*" >> "$SYSTEMCTL_LOG"
+exit 0
+"""
+
+FAKE_DOCKER = """#!/usr/bin/env bash
+# A stand-in for the machine's docker: the wrapper only asks whether a
+# Compose sandbox supervisor exists, and here none does.
 exit 0
 """
 
@@ -1482,7 +1494,8 @@ def wrapper_repo(_isolate, tmp_path):
     fake_bin.mkdir()
     (fake_bin / "sbx").write_text(FAKE_SBX, encoding="utf-8")
     (fake_bin / "systemctl").write_text(FAKE_SYSTEMCTL, encoding="utf-8")
-    for name in ("sbx", "systemctl"):
+    (fake_bin / "docker").write_text(FAKE_DOCKER, encoding="utf-8")
+    for name in ("sbx", "systemctl", "docker"):
         (fake_bin / name).chmod(0o755)
     return repo, fake_bin
 

@@ -275,6 +275,15 @@ class TestTheEstateRenders:
         assert "sandbox-runner:" not in rendered
         assert "sandbox-runner:" in rendered_with_the_sandbox
 
+    def test_the_sandbox_service_carries_its_supervisor_label(
+        self, rendered_with_the_sandbox: str
+    ) -> None:
+        """Release -3 TC6 (b): the estate's rendered supervisor names its
+        sandbox in a label, so the project's hand-run deploy wrapper can see it
+        and start neither old host unit on top of it."""
+        block = _service_block(rendered_with_the_sandbox, "sandbox-runner")
+        assert "com.guardkit.sandbox-supervisor: my-project-deploy" in block
+
 
 class TestTheTwoBusModes:
     """WHOSE BUS IS IT (26 September 2026, build item E1).

@@ -49,6 +49,16 @@ services:
 
     restart: unless-stopped
 
+    # WHICH SANDBOX THIS SUPERVISOR LOOKS AFTER, readable from the machine's
+    # own Docker engine (release -3, 1 October 2026). The project's sandbox
+    # deploy wrapper (forge's deploy_templates/sandbox-deploy.sh) looks for a
+    # container with this label, in any state, before it starts the two old
+    # host units; when one exists it starts neither, because the runner
+    # unit's stop step would end THIS supervisor and both of the factory's
+    # containers in the sandbox with it, and then restart against it.
+    labels:
+      com.guardkit.sandbox-supervisor: ${SANDBOX_NAME:?name the project's sandbox in the env file}
+
     # NO HEALTH PROBE. The release image carries one of its own — it curls the
     # coordinator's /healthz — and this service serves nothing at all, so the
     # inherited probe would mark it unhealthy for ever, from the first minute,
