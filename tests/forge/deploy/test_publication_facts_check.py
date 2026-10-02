@@ -29,6 +29,7 @@ from forge.config.models import ForgeConfig
 from forge.pipeline.publication_facts import (
     FACTS_FILE_ENV,
     ThisCoordinator,
+    process_start,
     read_publication_facts,
 )
 from forge.pipeline.publication_switch import (
@@ -78,7 +79,13 @@ def coordinator():
     if case != "facts_not_mounted":
         mounts.append(mount(os.environ["FACTS_SOURCE"], "/var/lib/forge-publication-facts",
                             case == "facts_mounted_rw", P + "_publication-facts"))
-    state = "garbage" if case == "coordinator_state_garbage" else {"Running": True, "StartedAt": started}
+    seen = pathlib.Path(os.environ["DOCKER_LOG"]).with_suffix(".coordinator-inspections")
+    times = int(seen.read_text()) + 1 if seen.exists() else 1
+    seen.write_text(str(times))
+    pid, when = int(os.environ["COORD_PID"]), started
+    if case == "restart_while_looking" and times > 1:
+        pid, when = int(os.environ["COORD_PID_AFTER"]), os.environ["STARTED_AT_AFTER"]
+    state = "garbage" if case == "coordinator_state_garbage" else {"Running": True, "StartedAt": when, "Pid": pid}
     return {"Id": C, "Name": "/" + P + "-coordinator-1", "Image": "sha256:" + "a" * 64,
             "State": state, "Mounts": mounts}
 
@@ -225,8 +232,24 @@ print("VERIFIED daemon=fixture bridge=fixture drop_packets=1 drop_bytes=60")
 '''
 
 
+@pytest.fixture(scope="module")
+def pid_ones():
+    """The coordinator's PID 1, stood in for by a real process so its kernel
+    start is read exactly as the check and the coordinator read it; and a
+    second one, standing in for the coordinator after a restart. Started a
+    little over a second before any check runs, because the record's time is
+    in whole seconds and must be later than the start."""
+    first = subprocess.Popen(["sleep", "600"])
+    time.sleep(0.05)
+    second = subprocess.Popen(["sleep", "600"])
+    time.sleep(1.1)
+    yield first, second
+    first.kill()
+    second.kill()
+
+
 @pytest.fixture()
-def look(tmp_path: Path):
+def look(tmp_path: Path, pid_ones):
     if shutil.which("python3") is None:
         pytest.skip("the check needs python3")
     tools = tmp_path / "tools"
@@ -264,6 +287,7 @@ FORGE_ANSWER_PORT=8126
         folder.mkdir(parents=True)
     link = tmp_path / "an-innocent-looking-link"
     link.symlink_to(settings_dir)
+    first, second = pid_ones
     started_epoch = int(time.time()) - 3600
     started_at = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(started_epoch)) + ".123456789Z"
     log = tmp_path / "docker.log"
@@ -277,6 +301,9 @@ FORGE_ANSWER_PORT=8126
             "PROJECT": PROJECT,
             "CRED_FILE": str(credential),
             "STARTED_AT": started_at,
+            "STARTED_AT_AFTER": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + ".5Z",
+            "COORD_PID": str(first.pid),
+            "COORD_PID_AFTER": str(second.pid),
             "SETTINGS_SOURCE": str(settings_dir),
             "LEDGER_SOURCE": str(ledger_dir),
             "FACTS_SOURCE": str(facts_source),
@@ -297,6 +324,8 @@ FORGE_ANSWER_PORT=8126
     def record() -> dict:
         return json.loads((facts_dir / "publication-facts.json").read_text())
 
+    run.coordinator_pid = first.pid  # type: ignore[attr-defined]
+    run.restarted_pid = second.pid  # type: ignore[attr-defined]
     return run, record, facts_dir, started_epoch, credential
 
 
@@ -338,20 +367,35 @@ def test_what_the_check_writes_is_what_the_coordinator_acts_on(look, tmp_path: P
         }
     )
     environ = {FACTS_FILE_ENV: str(facts_dir / "publication-facts.json")}
+
+    def as_seen_by(pid: int) -> ThisCoordinator:
+        boot, ticks, per_second = process_start(Path("/proc"), str(pid))
+        return ThisCoordinator(COORDINATOR, boot + ticks / per_second, boot, ticks, per_second)
+
     this_one = functools.partial(
-        read_publication_facts,
-        environ=environ,
-        who_is_asking=lambda: ThisCoordinator(COORDINATOR, float(started_epoch)),
+        read_publication_facts, environ=environ,
+        who_is_asking=lambda: as_seen_by(run.coordinator_pid),
     )
     assert publication_is_switched_on(config, this_one)
+    recorded = json.loads((facts_dir / "publication-facts.json").read_text())
+    assert recorded["coordinator_pid1_start"]["start_ticks"] == as_seen_by(run.coordinator_pid).start_ticks
 
     restarted = functools.partial(
-        read_publication_facts,
-        environ=environ,
-        who_is_asking=lambda: ThisCoordinator(COORDINATOR, time.time() + 1),
+        read_publication_facts, environ=environ,
+        who_is_asking=lambda: as_seen_by(run.restarted_pid),
     )
     assert not publication_is_switched_on(config, restarted)
-    assert "at or before this coordinator started" in why_publication_is_off(config, restarted)
+    assert "not the one running now" in why_publication_is_off(config, restarted)
+
+
+def test_a_restart_while_looking_writes_nothing(look) -> None:
+    """Codex R1: the start is re-read immediately before the write; a
+    coordinator that restarted during the look gets no record at all."""
+    run, _, facts_dir, _, _ = look
+    done = run("restart_while_looking")
+    assert done.returncode == 2, done.stdout + done.stderr
+    assert "restarted (or stopped) while this check was looking" in done.stderr
+    assert not (facts_dir / "publication-facts.json").exists()
 
 
 def test_an_earlier_record_is_invalidated_before_looking(look) -> None:
