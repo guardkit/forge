@@ -63,6 +63,8 @@ from forge.pipeline.publication_activation import WhatTheMachineSays
 __all__ = [
     "DEFAULT_MAX_AGE_SECONDS",
     "FACTS_FILE_ENV",
+    "REFRESH_THE_CHECK",
+    "where_the_facts_stand",
     "FACTS_FORMAT",
     "MACHINE_ANSWER_NAMES",
     "ThisCoordinator",
@@ -99,6 +101,18 @@ MACHINE_ANSWER_NAMES: tuple[str, ...] = (
     "a_sandbox_can_reach_the_publisher",
     "only_the_coordinator_is_on_the_publishers_network",
     "the_credential_file_can_be_read_by_them",
+)
+
+#: What a person reads when the machine check is missing or out of date, and
+#: the exact command that refreshes it. Nothing in the estate re-runs the
+#: check by itself: it needs the host's Docker, the sandbox daemon and root on
+#: the host to read the publisher's kernel policy, and no container holds all
+#: three, deliberately. So the merge word says so plainly instead.
+REFRESH_THE_CHECK = (
+    "The machine check is out of date: publication needs a look at this machine "
+    "taken after the coordinator last started and less than a day ago. Refresh "
+    "it on the host, from the estate bundle, with: "
+    "deploy/estate/estate-check --env-file <the estate's env file> --publication-facts"
 )
 
 _CONTAINER_ID = re.compile(r"^[0-9a-f]{64}$")
@@ -171,7 +185,9 @@ def this_coordinator(proc: Path = Path("/proc")) -> ThisCoordinator:
 
 def _nobody_has_looked(why: str) -> WhatTheMachineSays:
     """Every machine answer unknown, and the reason said."""
-    return WhatTheMachineSays(why_nobody_has_looked=why)
+    return WhatTheMachineSays(
+        why_nobody_has_looked=f"nobody has looked at this machine for this coordinator: {why}"
+    )
 
 
 def _when(epoch: float) -> str:
@@ -216,7 +232,7 @@ def read_publication_facts(
 def _read(
     path: Path, asking: ThisCoordinator, now: float, max_age_seconds: int
 ) -> WhatTheMachineSays:
-    rerun = "Run 'estate-check --publication-facts' on the estate that is running."
+    rerun = REFRESH_THE_CHECK
     if not path.is_file():
         return _nobody_has_looked(
             f"there is no publication facts file at {path}: nobody has run "
@@ -253,7 +269,7 @@ def _read(
             f"the publication facts at {path} were written for the "
             f"coordinator container {record['coordinator_container_id'][:12]} "
             f"and this is {asking.container_id[:12]}: a different container "
-            f"is a different estate, image or start. {rerun}"
+            f"is a different estate or image. {rerun}"
         )
     if asking.started_at_epoch is None:
         return _nobody_has_looked(
@@ -342,3 +358,32 @@ def the_machine_now(value: Any) -> WhatTheMachineSays | None:
     return _nobody_has_looked(
         "the machine's answers were given in a shape nothing reads"
     )
+
+
+def where_the_facts_stand(
+    *,
+    environ: Mapping[str, str] | None = None,
+    who_is_asking: Callable[[], ThisCoordinator] = this_coordinator,
+    now: Callable[[], float] = time.time,
+) -> str:
+    """ONE plain line saying whether the machine's answers are there and fresh.
+
+    Said at the coordinator's boot beside the publication line, so whoever
+    started it learns at once that the check has to be run again — a record
+    can never be newer than a start that came after it. Never raises.
+    """
+    try:
+        said = read_publication_facts(
+            environ=environ, who_is_asking=who_is_asking, now=now
+        )
+    except Exception as exc:  # noqa: BLE001 - a boot line never stops a boot
+        return f"publication facts: could not be read ({type(exc).__name__})"
+    if said is None:
+        return (
+            f"publication facts: none are configured ({FACTS_FILE_ENV} is not "
+            "set), so nobody's look at this machine is read and publication "
+            "stays off"
+        )
+    if said.why_nobody_has_looked:
+        return f"publication facts: not usable — {said.why_nobody_has_looked}"
+    return f"publication facts: present and fresh ({said.looked_at_by})"

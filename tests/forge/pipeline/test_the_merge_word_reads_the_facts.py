@@ -222,3 +222,53 @@ class TestBothProductionCallersPassTheReader:
 
         assert len(seen) == 1
         assert seen[0].what_the_machine_says is read_publication_facts
+
+
+class TestTheRunningCoordinatorsListenerGetsTheReader:
+    @pytest.mark.asyncio
+    async def test_the_composed_dispatch_chain_attaches_a_press_with_the_reader(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Through the production composition itself — bind_production_dispatch_chain
+        and its _compose — not the helper alone: the merge-word listener the
+        running coordinator attaches must be given the facts reader."""
+        from unittest.mock import MagicMock
+
+        from forge.adapters.sqlite import connect as sqlite_connect
+        from forge.cli import _serve_daemon, _serve_deps_gating
+        from forge.cli import serve as serve_module
+        from forge.lifecycle import migrations
+        from forge.pipeline import merge_executor
+
+        attached: list[MergeExecutorDeps] = []
+
+        class _Listener:
+            def __init__(self, deps: MergeExecutorDeps) -> None:
+                attached.append(deps)
+
+            async def attach(self, _client: Any) -> None:
+                return None
+
+        monkeypatch.setattr(merge_executor, "MergeApprovalConsumer", _Listener)
+        cx = sqlite_connect.connect_writer(tmp_path / "forge.db")
+        migrations.apply_at_boot(cx)
+        persistence = SqliteLifecyclePersistence(connection=cx)
+        config = ForgeConfig.model_validate(
+            {
+                "permissions": {"filesystem": {"allowlist": ["/tmp"]}},
+                "merge_executor": {"enabled": True},
+            }
+        )
+        previous = _serve_daemon.dispatch_payload
+        try:
+            compose = serve_module.bind_production_dispatch_chain(
+                forge_config=config, sqlite_pool=persistence
+            )
+            await compose(MagicMock(name="nats-client"))
+        finally:
+            _serve_daemon.dispatch_payload = previous
+            _serve_deps_gating._reset_for_tests()
+            cx.close()
+
+        assert len(attached) == 1
+        assert attached[0].what_the_machine_says is read_publication_facts
