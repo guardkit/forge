@@ -120,8 +120,7 @@ class Boundary:
                 if self.fault=='unit-stop-error':code=1
                 if self.fault=='unit-stop-timeout':raise subprocess.TimeoutExpired(argv,120)
             elif verb == 'unmask':
-                if self.fault=='unmask':code=1
-                else:self.states[argv[3]]=False
+                self.states[argv[3]]=False
         elif argv[0] == 'busctl':
             field=argv[-1]
             out='a(sasbttttuii) 0\n'
@@ -189,6 +188,7 @@ class Boundary:
                     import base64
                     self.files[item['path']]=base64.b64decode(item['data'])
                 out='installed-and-read-back'
+                if self.fault=='lost-mask':self.states[self.config['units']['runner']]=False
             elif args[0]=='sha256sum':
                 out=m.digest(self.files[args[1]])+'  '+args[1]
             elif args[0]=='ps':
@@ -400,16 +400,29 @@ def test_actual_install_payload_writes_template_exactly(tmp_path):
     assert path.read_bytes()==data and path.stat().st_mode & 0o777==0o755
 
 
-def test_unmask_failure_restores_masks_without_old_bootstrap(inventory,monkeypatch,capsys):
-    config,path,args=inventory;b=Boundary(config,monkeypatch);b.fault='unmask'
-    assert m.main(args)==2
+def test_stop_legacy_leaves_both_units_masked_and_says_so(inventory,monkeypatch):
+    """Release -3 TC6 (a): after a successful install both old units show masked."""
+    config,path,args=inventory;b=Boundary(config,monkeypatch)
+    assert m.main(args)==0
     assert all(b.states.values())
+    assert not any(x[:3]==['systemctl','--user','unmask'] for x in b.argv())
+    receipt=json.loads((Path(config['sandbox']['evidence_dir'])/'sandbox-installed.json').read_text())
+    assert receipt['legacy_units']=='masked'
+    last_shows=[x for x in b.argv() if x[:3]==['systemctl','--user','show']][-2:]
+    assert {x[3] for x in last_shows}=={'owned-runner.service','owned-keeper.service'}
+
+
+def test_a_unit_that_lost_its_mask_is_an_incomplete_install(inventory,monkeypatch,capsys):
+    config,path,args=inventory;b=Boundary(config,monkeypatch);b.fault='lost-mask'
+    assert m.main(args)==2
+    assert all(b.states.values()), 'the failure path masks both again'
     assert b.files[config['sandbox']['script_path']]==m.TEMPLATE.read_bytes()
     dropin=Path(config['sandbox']['systemd_user_dir'])/'owned-runner.service.d/zzzz-rollout-empty-stop.conf'
     assert dropin.read_text()==m.EMPTY_STOP
     error=capsys.readouterr().err
     assert 'installation may be incomplete' in error
     assert 'nothing has been replaced' not in error
+    assert not (Path(config['sandbox']['evidence_dir'])/'sandbox-installed.json').exists()
 
 
 def test_staging_failure_replaces_neither_file(tmp_path):

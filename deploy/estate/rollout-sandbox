@@ -573,20 +573,16 @@ class Rollout:
             Path(path).unlink(missing_ok=True)
         self.dropin.unlink()
         self.systemctl('daemon-reload')
-        try:
-            for unit in self.units.values():
-                self.systemctl('unmask',unit)
-        except Refusal:
-            # No stop: both were already settled. Masking cannot run a broken hook.
-            for unit in self.units.values():
-                self.systemctl('mask',unit,check=False)
-            private_write(self.dropin,EMPTY_STOP.encode())
-            self.systemctl('daemon-reload',check=False)
-            raise
+        # Both old units STAY MASKED (release -3 TC6): the estate's Compose
+        # supervisor looks after this sandbox now, and an unmasked runner unit
+        # started by a hand-run wrapper would stop that supervisor and both
+        # containers through its own stop step. Never unmasked here.
+        for unit in self.units.values():
+            self.stopped(unit)
         self.save('commands.json',self.events)
-        self.save('sandbox-installed.json',{'format_version':1,'project':self.args.project,'sandbox':self.s['name'],'image':self.config['runtime_image'],'template_sha256':digest(self.template),'profile_sha256':digest(profile['text'].encode()),'answer_rule':self.answer,'memory_mcp_rule':self.memory_mcp,'disk_before':before,'disk_after':after,'bootstrap_image_settings':image_settings,'bootstrap_env_file':str(self.bootstrap_env),'bootstrap_env_names':sorted(bootstrap),'remote_fetch_through_normal_entry':'NOT-TESTED','memory_forwarded_names':list(MEMORY_NAMES),'actual_memory_read_write':'NOT-TESTED'})
+        self.save('sandbox-installed.json',{'format_version':1,'project':self.args.project,'sandbox':self.s['name'],'image':self.config['runtime_image'],'template_sha256':digest(self.template),'profile_sha256':digest(profile['text'].encode()),'answer_rule':self.answer,'memory_mcp_rule':self.memory_mcp,'disk_before':before,'disk_after':after,'bootstrap_image_settings':image_settings,'bootstrap_env_file':str(self.bootstrap_env),'bootstrap_env_names':sorted(bootstrap),'legacy_units':'masked','remote_fetch_through_normal_entry':'NOT-TESTED','memory_forwarded_names':list(MEMORY_NAMES),'actual_memory_read_write':'NOT-TESTED'})
         self.complete = True
-        print('Current template and producer profile installed and read back; units are unmasked but stopped; actual memory read/write and normal lifecycle checks remain required.')
+        print('Current template and producer profile installed and read back; both old host units stay masked and stopped; actual memory read/write and normal lifecycle checks remain required.')
 
 
 def main(argv=None):
@@ -602,7 +598,7 @@ def main(argv=None):
     try:
         rollout = Rollout(args)
         if args.plan:
-            print('Plan only: remote, systemd, sandbox, image and disk facts are NOT VERIFIED. Would validate profile in the pinned image; record clone, known-file hashes, receipt listing and process diagnostics; empty and prove both runner stop hooks; stop and mask keeper then runner; refuse held sessions; stop only '+rollout.s['name']+'; require positive stopped status; wake with our exec; refuse any running container or legacy process; compare every disk witness; hand in the release with the normal identity helper; add sandbox-scoped routes (answer service '+rollout.answer+', memory MCP '+rollout.memory_mcp+'); install the current template byte-for-byte and rewrite producer profile paths/publish rules; remove legacy drop-ins; unmask both stopped units; record evidence.')
+            print('Plan only: remote, systemd, sandbox, image and disk facts are NOT VERIFIED. Would validate profile in the pinned image; record clone, known-file hashes, receipt listing and process diagnostics; empty and prove both runner stop hooks; stop and mask keeper then runner; refuse held sessions; stop only '+rollout.s['name']+'; require positive stopped status; wake with our exec; refuse any running container or legacy process; compare every disk witness; hand in the release with the normal identity helper; add sandbox-scoped routes (answer service '+rollout.answer+', memory MCP '+rollout.memory_mcp+'); install the current template byte-for-byte and rewrite producer profile paths/publish rules; remove legacy drop-ins; leave both old units masked and stopped (never unmasked); record evidence.')
             return 0
         require(args.stop_legacy, 'one-time replacement requires --stop-legacy; inspect --plan before the attended rollout')
         rollout.execute()
