@@ -1128,3 +1128,47 @@ class TestLifecycleBridgeWireupComposition:
             "legacy ack_callback redelivery-storm path — got: "
             f"{sorted(tables)!r}"
         )
+
+
+class TestThePublicationFactsAreSaidAtBoot:
+    """Release -3, TC8: the boot log says whether the machine's answers for
+    publication are there and fresh, beside the unchanged publication line."""
+
+    def test_a_missing_facts_file_is_named_at_boot(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        serve_config,
+        fake_forge_config,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        import logging
+
+        from forge.cli import _serve_production as serve_production
+        from forge.cli import serve as serve_module
+
+        monkeypatch.setenv(
+            "FORGE_PUBLICATION_FACTS_FILE", str(tmp_path / "not-yet.json")
+        )
+        monkeypatch.setattr(
+            serve_module,
+            "_build_async_subagent_middleware",
+            MagicMock(return_value=_FakeMiddleware(tool_names=("start_async_task",))),
+        )
+        monkeypatch.setattr(
+            serve_module,
+            "bind_production_dispatch_chain",
+            lambda **kw: lambda client: None,
+        )
+
+        with caplog.at_level(logging.INFO):
+            serve_production.bind_production_serve(serve_config, fake_forge_config)
+
+        said = [
+            record.getMessage()
+            for record in caplog.records
+            if "publication at boot" in record.getMessage()
+        ]
+        assert any("publication is OFF" in line for line in said), said
+        assert any("publication facts: not usable" in line for line in said), said
+        assert any("there is no publication facts file" in line for line in said), said

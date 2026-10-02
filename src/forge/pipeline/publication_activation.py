@@ -167,11 +167,19 @@ class TheVerdict:
                 "every one of the things publication needs was checked "
                 "and holds"
             )
-        said = "; ".join(answer.said for answer in self.refusals)
-        said = said or "the activation check could not be run"
         if self.why_nobody_has_looked:
-            return f"{self.why_nobody_has_looked}; {said}"
-        return said
+            # The reason nobody's look could be used says everything the
+            # machine questions would each say ("nobody has looked …"), and
+            # what to do about it, once. Only the refusals that the settings
+            # alone decide are added after it.
+            settings_said = [
+                answer.said
+                for answer in self.refusals
+                if answer.provable_here or answer.holds is False
+            ]
+            return "; ".join([self.why_nobody_has_looked, *settings_said])
+        said = "; ".join(answer.said for answer in self.refusals)
+        return said or "the activation check could not be run"
 
     def to_wire(self) -> dict[str, Any]:
         return {

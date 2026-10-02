@@ -421,3 +421,56 @@ class TestTheBootLineStillSaysOff:
         line = say_where_publication_stands_at_boot(config_on)
         assert line.startswith("publication is OFF")
         assert "nobody has looked" in line
+
+
+class TestItSaysPlainlyWhatToRun:
+    """Nothing in the estate re-runs the check, so a stale or missing record
+    must say so in the merge word's sentence, with the command that refreshes it."""
+
+    @pytest.mark.parametrize(
+        "record, now",
+        [
+            (None, None),
+            (facts(written=STARTED - 1), None),
+            (facts(), STARTED + 60 + DEFAULT_MAX_AGE_SECONDS + 1),
+        ],
+        ids=["missing", "before-the-start", "too-old"],
+    )
+    def test_the_sentence_names_the_refresh_command(
+        self, tmp_path: Path, config_on: ForgeConfig, record: Any, now: float | None
+    ) -> None:
+        from forge.pipeline.publication_facts import REFRESH_THE_CHECK
+
+        path = tmp_path / "f.json"
+        if record is not None:
+            write(path, record)
+        reader = a_reader(path, **({"now": now} if now is not None else {}))
+        sentence = why_publication_is_off(config_on, reader)
+        assert "The machine check is out of date" in sentence
+        assert "estate-check --env-file <the estate's env file> --publication-facts" in sentence
+        assert sentence.count(REFRESH_THE_CHECK) == 1
+        # said once, not once per machine question
+        assert sentence.count("nobody has looked") == 1
+
+
+class TestWhereTheFactsStandAtBoot:
+    def test_unset_says_none_are_configured(self) -> None:
+        from forge.pipeline.publication_facts import where_the_facts_stand
+
+        assert "none are configured" in where_the_facts_stand(environ={})
+
+    def test_missing_and_stale_and_fresh_are_told_apart(self, tmp_path: Path) -> None:
+        from forge.pipeline.publication_facts import where_the_facts_stand
+
+        path = tmp_path / "f.json"
+        ask = {
+            "environ": {FACTS_FILE_ENV: str(path)},
+            "who_is_asking": lambda: ThisCoordinator(CONTAINER, STARTED),
+            "now": lambda: STARTED + 120,
+        }
+        assert "there is no publication facts file" in where_the_facts_stand(**ask)
+        write(path, facts(written=STARTED - 5))
+        assert "at or before this coordinator started" in where_the_facts_stand(**ask)
+        write(path, facts())
+        assert where_the_facts_stand(**ask).startswith("publication facts: present and fresh")
+
