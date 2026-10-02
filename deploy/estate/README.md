@@ -916,52 +916,6 @@ diagnostic's `h6-create` command and `init` field record it. The old folder is
 not a recovery source after resume.
 A failed post-resume check follows this current-state recovery path too.
 
-## Taking a new release on a containerised estate
-
-An estate that the rollout tools have already moved onto the containers is
-upgraded in place: the record, the bus, memory and every volume stay where they
-are, and only the programs change. The full procedure, with its checks and
-rehearsal, is the runbook "Upgrading the live factory from release 2026.09.28-2
-to release -3". This is the short version.
-
-**What you need.** Two inventories for the same estate, one per release, each
-naming its `release` (it must be in the reviewed `RELEASES` table in
-`rollout_support.py`) and the same `upgrade` block: the release it leaves
-(`from`) and the one it goes to (`to`), each with its env and Compose files and
-their SHA-256, a new private receipt, the upgrade's own snapshot folder, the
-switch's snapshot that holds the resume markers, and this release's own
-closed-door folder (its env's `ROLLOUT_STATE_DIR`). The markers are only read;
-no upgrade step writes them.
-
-**The order.** The door is shut from step 1 to step 7; Slack is quiet in between.
-
-| # | Command | What it does | Its own time limit |
-| --- | --- | --- | --- |
-| 1 | `rollout-quiesce --close` (old release's inventory) | records every container, the volumes, the settings and the sandbox as they are, then stops the gateway watch and both producers | 600 s |
-| 2 | `rollout-quiesce --settle` | two quiet bus readings 20 s apart and no active work | 300 s |
-| 3 | `rollout-quiesce --final` | stops the sandbox supervisor first (it must exit 0, or prove nothing runs inside), then the rest; proves the ledger still; keeps a copy of it; turns planning off | 900 s |
-| 4 | `rollout-sandbox --upgrade` | puts the new release into the sandbox and records what it installed | see its own help |
-| 5 | `rollout-quiesce --switch` (new release's inventory) | checks the sandbox holds the new release, then brings the new release up with the door shut and planning off | 1,500 s |
-| 6 | the closed-door check: `estate-check --pre-resume` then `--read-pre-resume`, with the new release's env | writes and reads this release's closed-door receipt | — |
-| 7 | `rollout-quiesce --open` | starts nothing until that receipt passes; then planning on, producers, readiness, services check, hello, watch | 600 s, plus up to 300 s to shut the door again if it fails |
-| 8 | `estate-check --publication-facts` | the machine's answers that let a merge publish and deploy; run once the door is open | — |
-
-Each limit is the step's true maximum: every command a step runs gets only what
-is left of it. Give the step recorder a minute more than the limit, because a
-step killed from outside cannot shut the door again.
-
-**The ways back.**
-- Before step 1 nothing has changed.
-- Failed at steps 1–3: `--switch` with the old release's inventory, then its
-  closed-door check, then its `--open`.
-- Failed at step 4: `rollout-sandbox --upgrade --back`, then the same three.
-- Failed at step 5 or later: `rollout-back --upgrade-back` with the new
-  release's inventory (limit 3,300 s). It stops the new release, proves with
-  the old release's coordinator that it can read what the new one wrote (H6),
-  puts the sandbox back and brings the old release up with the door shut. Then
-  the old release's closed-door check and `--open`. Until that proof has passed,
-  the old release's own steps refuse to touch the record.
-
 ## What is deliberately not here yet
 
 - **The model seats**, including the embedding service memory uses. They are
@@ -1042,31 +996,6 @@ a sandbox's reports its manifest — so the same bytes carried across come back
 under a different name. What both report identically is the list of layers the
 filesystem is made of, so that list, hashed, is what is compared.
 
-## Room on a sandbox's build disk
-
-    ./sandbox-scratch --sandbox <name> --clone <clone path in the sandbox> --report
-    ./sandbox-scratch --sandbox <name> --clone <clone path> --copy <folder> --to <new host folder>
-
-The build runner refuses a build when the free space where its worktrees go is
-below its floor, and a sandbox sets that floor in its own settings file.
-`estate-check services` item **9b** asks the runner itself, inside its own
-container, what it would answer: below the floor is **not passed**; within
-10 GiB above it is a pass marked **WARNING**. The item is only in the full
-services check; the closed-door record keeps exactly the items it always had.
-
-`sandbox-scratch --report` shows free space on the clone's disk, the sandbox's
-root disk and Docker's disk, and the size of every top-level folder under the
-clone's `.guardkit/tmp` and the sandbox's `/tmp`, marking the ones that hold a
-registered git worktree. `--copy` copies one such folder, as a tar stream over
-`sbx exec`, into a host folder that must not exist yet, and checks it file by
-file against a record of the source taken first: it ends with
-`verified copy: <n> entries` or names every difference and keeps both.
-
-**It never removes anything, and asks nothing of a stopped sandbox** (asking
-would start it). It refuses `factory-runtime`, any folder holding a registered
-worktree, anything outside the two places, and an existing destination.
-Freeing the space inside the sandbox is a separate change of its own.
-
 ## The rollout preconditions this bundle does not meet
 
 Recorded here so nothing reads as finished that is not, from the build plan and
@@ -1090,10 +1019,8 @@ the design:
    tested image *by digest* and records the digest it replaces. `.env.example`
    names release tags, `estate-check` item 4 looks for those tags, and its own
    sentence says so. The rollout tools do not trust those tags: they bind
-   immutable local image IDs, one reviewed entry per release in the `RELEASES`
-   table of `rollout_support.py` (the coordinator and answer service, the
-   publisher, memory, its relay and jarvis; an inventory names its `release`),
-   and refuse
+   immutable local image IDs, `RUNTIME` for the coordinator and answer service
+   and `PUBLISHER_RUNTIME` for the publisher in `rollout_support.py`, and refuse
    when `FORGE_IMAGE`, the rendered services or the running containers name any
    other image, or when the release tag no longer resolves to it. In the
    sandbox, `FORGE_IMAGE_IDENTITY` is a hash of the image's platform, layers and
