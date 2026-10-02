@@ -1,9 +1,9 @@
-"""The machine's answers for publication, read from the check's record (TC8).
+"""The machine's answers for publication, read from the check's record (the GitHub publishing gate, 2 October 2026).
 
-Release -3 of the factory: ``estate-check --publication-facts`` LOOKS at the
+2 October 2026 of the factory: ``estate-check --publication-facts`` LOOKS at the
 machine and writes a record; the coordinator reads it on every merge word
 through :func:`forge.pipeline.publication_facts.read_publication_facts`. These
-tests hold the reader to the runbook's TC8 (c):
+tests hold the reader to the publishing gate:
 
 * with ``FORGE_PUBLICATION_FACTS_FILE`` unset, behaviour is exactly today's;
 * a missing, malformed, foreign, stale, too-old or future record reads as

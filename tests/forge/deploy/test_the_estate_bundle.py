@@ -278,7 +278,7 @@ class TestTheEstateRenders:
     def test_the_sandbox_service_carries_its_supervisor_label(
         self, rendered_with_the_sandbox: str
     ) -> None:
-        """Release -3 TC6 (b): the estate's rendered supervisor names its
+        """1 October 2026: the estate's rendered supervisor names its
         sandbox in a label, so the project's hand-run deploy wrapper can see it
         and start neither old host unit on top of it."""
         block = _service_block(rendered_with_the_sandbox, "sandbox-runner")

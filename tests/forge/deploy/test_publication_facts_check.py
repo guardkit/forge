@@ -1,6 +1,6 @@
-"""``estate-check --publication-facts`` LOOKS, then writes what it found (TC8).
+"""``estate-check --publication-facts`` LOOKS, then writes what it found (the GitHub publishing gate, 2 October 2026).
 
-Release -3, upgrade runbook section 3, TC8 (b). The check answers the questions
+2 October 2026, the GitHub publishing gate. The check answers the questions
 publication needs that only the machine can answer, by asking Docker and the
 sandbox tool, and writes one record into the publication-facts volume through
 a network-less, read-only-root helper container. The coordinator reads that

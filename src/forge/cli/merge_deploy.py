@@ -246,7 +246,7 @@ async def _arun(
             guardkit_run=guardkit_run,
             git_surface=git_surface,
             deploy_dispatcher=dispatcher,
-            # RELEASE -3, TC8: the machine's answers for publication come
+            # THE GITHUB PUBLISHING GATE (2 October 2026): the machine's answers for publication come
             # from the facts 'estate-check --publication-facts' wrote, read
             # when this press asks — the same reader the coordinator's
             # listener uses. With FORGE_PUBLICATION_FACTS_FILE unset it

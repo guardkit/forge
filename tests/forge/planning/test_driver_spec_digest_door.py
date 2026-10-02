@@ -226,7 +226,7 @@ class RecordingGitRunner:
     def __init__(self) -> None:
         self.tree_calls: list[dict[str, Any]] = []
         self._branch_files: dict[str, dict[str, str]] = {}
-        #: What the planner's fact sheet reads (release -3 item 10): by
+        #: What the planner's fact sheet reads (the 1 October planner fix): by
         #: default a readable, empty repository. A test that needs the
         #: repository unreachable puts its own reader here.
         self.reader: Any = _EmptyRepository()
@@ -3117,7 +3117,7 @@ async def test_a_reviewer_that_cannot_read_never_stops_the_run(
 
 
 # ---------------------------------------------------------------------------
-# The planner's repository facts reach the coach and the card (release -3
+# The planner's repository facts reach the coach and the card (2 October 2026
 # item 10, 1 October 2026). On 1 October the containerised coordinator had no
 # checkout at its repo_path, the fact sheet said nothing, and nothing said
 # that it had said nothing.

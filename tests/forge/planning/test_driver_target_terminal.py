@@ -7692,7 +7692,7 @@ async def test_failed_exact_re_review_stops_normalized_plan_before_commit(
 
 
 # ---------------------------------------------------------------------------
-# Release -3 item 10, follow-up: the plan leg reads the repository where
+# the 1 October planner fix, follow-up: the plan leg reads the repository where
 # every other planning call for it goes, and when it cannot, the plan-writer,
 # the plan's own record and so the build gate card all say so.
 # ---------------------------------------------------------------------------

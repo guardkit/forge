@@ -100,7 +100,7 @@ def degraded_dispatch_gate_model_saying(extra: str) -> "Callable[[str], str]":
 
     Used by the pre-dispatch gate when the planning run behind the build
     recorded something the person tapping the gate must see — today, that
-    the planner could not read the repository (release -3 item 10). The mode
+    the planner could not read the repository (the 1 October planner fix). The mode
     and threshold are unchanged; only the rationale the card renders grows.
     """
     body = json.dumps(

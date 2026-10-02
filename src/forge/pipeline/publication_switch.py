@@ -54,7 +54,7 @@ from forge.pipeline.publication_facts import the_machine_now
 logger = logging.getLogger(__name__)
 
 #: The machine's answers, ``None`` (nobody has looked), or a zero-argument
-#: reader that returns one of those two when asked (release -3, TC8).
+#: reader that returns one of those two when asked (2 October 2026, the GitHub publishing gate).
 TheMachine = (
     WhatTheMachineSays | Callable[[], WhatTheMachineSays | None] | None
 )
@@ -87,7 +87,7 @@ def the_activation_check(
     """Ask section G's questions. Never raises.
 
     ``machine`` may be the answers themselves, ``None``, or a zero-argument
-    reader of them (release -3, TC8), which is called here, afresh. A caller
+    reader of them (2 October 2026, the GitHub publishing gate), which is called here, afresh. A caller
     asking more than one question about the same moment — the merge press —
     resolves it once itself (:func:`~forge.pipeline.publication_facts.the_machine_now`)
     and passes the answers, so the verdict and its reason come from one read.

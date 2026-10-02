@@ -836,7 +836,7 @@ _PROVABILITY_REWRITTEN_CARD_LINE = (
 PLAN_REPOSITORY_UNAVAILABLE_KEY = "repository_unavailable"
 
 #: The spec card's line when the planner could not read the repository
-#: (release -3 item 10, 1 October 2026). Plain words; the reason is the
+#: (the 1 October planner fix, 1 October 2026). Plain words; the reason is the
 #: reader's own clause.
 _REPOSITORY_FACTS_UNAVAILABLE_CARD_LINE = (
     "The machine could not read the repository while writing this, so nothing "
@@ -3323,7 +3323,7 @@ class PlanningRunDriver:
         What the coach and the deterministic reviewers are given: the facts,
         or — when the repository could not be read — the explicit
         "Repository facts unavailable: <reason>" sentence (1 October 2026,
-        release -3 item 10). ``None`` only when the request has nothing to
+        the 1 October planner fix). ``None`` only when the request has nothing to
         look for or the repository has nothing to say about it, so the
         dispatch is then byte for byte what it was.
         """
@@ -3369,7 +3369,7 @@ class PlanningRunDriver:
 
         With ``correlation_id`` the reader is kept for the run, so a helper
         found unreachable once is not waited on again by every later read of
-        the same run (release -3 item 10, review round 1).
+        the same run (the 1 October planner fix, review round 1).
         """
         cache: dict[tuple[str, str], Any] = self.__dict__.setdefault("_repository_readers", {})
         key = (str(correlation_id), str(repo_path))
@@ -3391,7 +3391,7 @@ class PlanningRunDriver:
         """What the plan-writer's coach is given as ``repository_facts``: the
         fact sheet, plus — when the descriptor's inventory or the search for
         the specification's words could not read the repository — the same
-        "Repository facts unavailable: <reason>" sentence (release -3 item
+        "Repository facts unavailable: <reason>" sentence (2 October 2026 item
         10). Said once: a sheet already unavailable is not repeated."""
         facts = await self._repository_facts_state(correlation_id, repo_path, row)
         parts = [facts.text] if facts.text else []
@@ -3911,7 +3911,7 @@ class PlanningRunDriver:
             provability["card_line"] = added
         unavailable_line = self._repository_facts_card_line(correlation_id)
         if unavailable_line is not None:
-            # Silence was the bug (1 October 2026, release -3 item 10): the
+            # Silence was the bug (1 October 2026, the 1 October planner fix): the
             # person approving the spec is told the checker never saw the
             # repository, and why. Receipted on the draft row beside the card.
             card = dict(final.get("card") or {})
@@ -6908,7 +6908,7 @@ class PlanningRunDriver:
             details["semantic_review"] = semantic_review
         unavailable_line = self._repository_unavailable_line(correlation_id)
         if unavailable_line is not None:
-            # Read by the build gate (release -3 item 10): the card the person
+            # Read by the build gate (the 1 October planner fix): the card the person
             # taps to start the build says the plan was written without the
             # repository, in the same words as the spec card.
             details[PLAN_REPOSITORY_UNAVAILABLE_KEY] = unavailable_line
@@ -9905,7 +9905,7 @@ class PlanningRunDriver:
         file must never be able to stop a planning run.
 
         For a repository read through its sandbox helper (``reader`` is not a
-        local checkout reader; release -3 item 10), the file is read with the
+        local checkout reader; the 1 October planner fix), the file is read with the
         helper's ``/code/read-file`` on the factory's own clone. A helper that
         cannot be reached is not "no rules file": its reason is appended to
         ``unavailable`` so the plan-writer is told.
@@ -10045,7 +10045,7 @@ class PlanningRunDriver:
         * Everything is sorted, so two runs on the same tree produce the same
           bytes.
 
-        WHICH COPY (1 October 2026, release -3 item 10): ``reader`` is the
+        WHICH COPY (1 October 2026, the 1 October planner fix): ``reader`` is the
         planner's repository reader — for a repository with a sandbox, the
         helper's read-only ``/code/list-files`` on the factory's own clone;
         otherwise the checkout at ``repo_path``. In the containerised
@@ -10068,7 +10068,7 @@ class PlanningRunDriver:
             try:
                 tracked = reader.list_files()
             except RepositoryUnreadable as exc:
-                # Said, not swallowed (release -3 item 10, 1 October 2026):
+                # Said, not swallowed (the 1 October planner fix, 1 October 2026):
                 # the reason goes back to the descriptor, which tells the
                 # plan-writer the inventory is missing and why.
                 logger.warning(
@@ -10182,12 +10182,12 @@ class PlanningRunDriver:
         it is today. Never raises: like the inventory beside it, this must never
         be able to stop a planning run.
 
-        Read through ``reader`` (1 October 2026, release -3 item 10): the
+        Read through ``reader`` (1 October 2026, the 1 October planner fix): the
         helper's ``/code/search`` for a sandboxed repository, ``git grep`` on
         the checkout otherwise. A repository that cannot be read is ``None``
         with its reason appended to ``unavailable``, never a quiet "not found".
 
-        WHAT WAS READ IS KEPT (release -3 item 10, review round 1). A word
+        WHAT WAS READ IS KEPT (the 1 October planner fix, review round 1). A word
         whose search came back incomplete (the helper's caps) keeps the
         places it found and is named in ``partial`` in plain words; it is not
         "the repository could not be read". A helper that stops answering
@@ -10365,7 +10365,7 @@ class PlanningRunDriver:
         )
 
         # Every read below goes through the planner's repository reader
-        # (1 October 2026, release -3 item 10): the sandbox helper for a
+        # (1 October 2026, the 1 October planner fix): the sandbox helper for a
         # sandboxed repository, the checkout otherwise. When the repository
         # cannot be read the reason goes back through ``unavailable``; the
         # descriptor gains no field its schema does not define, and the plan

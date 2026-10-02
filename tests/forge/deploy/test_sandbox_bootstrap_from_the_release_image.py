@@ -553,10 +553,10 @@ def _settings(sandbox, **extra):
         # Recorded by the OTHER kind of engine; checked here against this one.
         "FORGE_IMAGE_IDENTITY": sandbox["identity"],
         "SANDBOX_RUNNER_RESTART_SECONDS": "1",
-        # No start-up settling wait unless a test is about it (release -3).
+        # No start-up settling wait unless a test is about it (2 October 2026).
         "SANDBOX_RUNNER_SETTLE_SECONDS": "0",
         # The project's declared git identity, which every start needs since
-        # release -3 (item 6). A test about it takes these away or changes them.
+        # 2 October 2026 (item 6). A test about it takes these away or changes them.
         "GIT_AUTHOR_NAME": PROJECT_AUTHOR_NAME,
         "GIT_AUTHOR_EMAIL": PROJECT_AUTHOR_EMAIL,
         "FORGE_CONFIG_PATH": str(sandbox["settings_file"]),
@@ -718,7 +718,7 @@ class TestItStartsTwoContainersFromThatOneImage:
         helper = [c for c in runs if "--name forge-sandbox-helper" in c]
         runner = [c for c in runs if "--name forge-sandbox-runner" in c]
         assert len(helper) == 1 and len(runner) == 1
-        # Both share the sandbox's own network (release -3): each listens on
+        # Both share the sandbox's own network (2 October 2026): each listens on
         # the sandbox's port itself, so there is nothing to publish.
         for call in (helper[0], runner[0]):
             assert "--network host" in call
@@ -730,7 +730,7 @@ class TestItStartsTwoContainersFromThatOneImage:
     def test_both_share_the_sandboxs_network(self, sandbox, started):
         """A project's own services are on the SANDBOX's loopback.
 
-        Release -3. The runner, found by the independent check of the first
+        2 October 2026. The runner, found by the independent check of the first
         template fix: api_test's suite starts Postgres with
         ``-p 127.0.0.1:<port>:5432`` and connects to ``localhost:<port>``. The
         helper, the next pass: api_test's deploy brings the product up on
@@ -994,7 +994,7 @@ class TestTheFoldersBothContainersShare:
     ):
         """A project's own tests may need containers, and they run in the runner.
 
-        Release -3, item 7, found on the live day (1 October 2026): the runner
+        2 October 2026, item 7, found on the live day (1 October 2026): the runner
         was started with no engine, api_test's test suite starts its database
         as a container, so no test could run and the build's checker verified
         nothing for an hour and a half. Until then this test asserted the
@@ -2239,7 +2239,7 @@ def _the_two_starts(sandbox, **extra):
 class TestTheSettingsFileIsShared:
     """The file FORGE_CONFIG_PATH names reaches both containers, or nothing starts.
 
-    Release -3, item 4, found on the live day (1 October 2026): the live
+    2 October 2026, item 4, found on the live day (1 October 2026): the live
     sandbox carried FORGE_CONFIG_PATH from its creation, the bootstrap handed
     both containers that NAME, and neither container had the FILE — so the
     deploy helper could not find the project it was asked about. Every
@@ -2316,7 +2316,7 @@ class TestTheSettingsFileIsShared:
     def test_unset_is_refused(self, sandbox):
         """No settings file named at all is a refusal, not a quiet default.
 
-        The independent check of the first release -3 template: with the
+        The independent check of the first 2 October 2026 template: with the
         setting unset the bootstrap started both containers, and the helper
         then could not find the project it was asked about.
         """
@@ -2330,7 +2330,7 @@ class TestTheSettingsFileIsShared:
 class TestTheGitObjectsTheCloneBorrowsAreShared:
     """A clone that borrows its history must be able to read it in both containers.
 
-    Release -3, item 5, found on the live day (1 October 2026): a sandbox made
+    2 October 2026, item 5, found on the live day (1 October 2026): a sandbox made
     with ``sbx create --clone`` borrows every git object from the checkout it
     was made from, mounted read-only in the sandbox, and says so in
     ``.git/objects/info/alternates``. The clone was bound into both
@@ -2416,7 +2416,7 @@ class TestTheGitObjectsTheCloneBorrowsAreShared:
                 if before == "--volume" and word.endswith(":ro")
             ]
             # The runner's own graph declaration, the project's git identity
-            # (release -3, item 6) and the sandbox's settings file (item 4) are
+            # (2 October 2026, item 6) and the sandbox's settings file (item 4) are
             # the only read-only files either of them is given when nothing is
             # borrowed.
             settings = str(sandbox["settings_file"])
@@ -2441,7 +2441,7 @@ def _the_identity_file(call: str) -> Path:
 class TestTheProjectsGitIdentityReachesGitWhateverItsEnvironment:
     """Both containers' git commits as the project, even launched with a short list.
 
-    Release -3, item 6, found on the live day (1 October 2026): a build's first
+    2 October 2026, item 6, found on the live day (1 October 2026): a build's first
     checkpoint commit failed inside the runner with "Author identity unknown",
     although GIT_AUTHOR_NAME and the rest had been handed in. The runner
     launches the build system with a short NAMED list of settings
@@ -2553,7 +2553,7 @@ class TestTheProjectsGitIdentityReachesGitWhateverItsEnvironment:
 class TestTheRunnersEngineIsRecordedAsAKnownRisk:
     """The note beside the runner's socket says what it really gives away.
 
-    The independent check of the first release -3 template found the note
+    The independent check of the first 2 October 2026 template found the note
     claimed the runner "can already change what the helper will run" through
     the shared clone. It cannot: the helper reads its deploy settings at the
     recorded commit. What the socket really adds is the power to stop or
@@ -2586,7 +2586,7 @@ class TestTheRunnersEngineIsRecordedAsAKnownRisk:
 
 # ---------------------------------------------------------------------------
 class TestAFreshInstallForwardsWhatTheBootstrapNeeds:
-    """Both example env files hand in the names the release -3 bootstrap needs.
+    """Both example env files hand in the names the 2 October 2026 bootstrap needs.
 
     The bootstrap now refuses to start without a settings file and a declared
     git identity. Those arrive only if the host side forwards their NAMES
@@ -2643,7 +2643,7 @@ def _a_chain_of_borrowing(tmp_path: Path, project: Path, files: int) -> list[Pat
 class TestTheChainIsFollowedExactlyAsDeepAsGitFollowsIt:
     """git reads alternates files at depths 0 to 5 and ignores a seventh.
 
-    The independent check of the first release -3 template found the
+    The independent check of the first 2 October 2026 template found the
     bootstrap counted the clone's own file as depth 1, so it refused a chain
     git itself reads. In git's source (object-file.c, link_alt_odb_entries)
     the repository's own file is depth 0 and ``if (depth > 5)`` stops it.
@@ -2711,7 +2711,7 @@ class TestTheChainIsFollowedExactlyAsDeepAsGitFollowsIt:
 class TestAContainerThatDiesSaysWhy:
     """A service that cannot start says so, plainly, before it is replaced.
 
-    Release -3, the re-check of the network change: on the sandbox's own
+    2 October 2026, the re-check of the network change: on the sandbox's own
     network a service whose port is already taken exits within moments. The
     start-up still printed "both containers are up", and the supervisor's only
     word was "is no longer running; starting it again" every few seconds — it

@@ -492,7 +492,7 @@ class MergeExecutorDeps:
     #: Left unset, those questions answer "nobody has looked", the activation
     #: check refuses, and publication stays off — the safe side.
     #:
-    #: IT MAY BE A READER (release -3, TC8): a zero-argument callable that
+    #: IT MAY BE A READER (2 October 2026, the GitHub publishing gate): a zero-argument callable that
     #: returns the answers when asked. These deps are built ONCE, when the
     #: coordinator starts, so a plain value would be the answers at boot for
     #: ever. A reader is called afresh on EVERY merge word, once, before the
@@ -4496,7 +4496,7 @@ async def execute_merge_deploy(
             # with the reason said in plain words.
             # ------------------------------------------------------------------
             # THE MACHINE'S ANSWERS, READ NOW, ONCE FOR THIS MERGE WORD
-            # (release -3, TC8). A reader is called here rather than at boot,
+            # (2 October 2026, the GitHub publishing gate). A reader is called here rather than at boot,
             # so facts written after the coordinator started count at the
             # next merge word, and facts gone stale stop counting. The switch
             # and the reason below are asked of the same read.

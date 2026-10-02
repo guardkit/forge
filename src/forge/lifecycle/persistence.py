@@ -1309,7 +1309,7 @@ class SqliteLifecyclePersistence:
 
     def read_planning_repository_unavailable(self, correlation_id: str | None) -> str | None:
         """The plain line the planning run recorded when its planner could not
-        read the repository, or ``None`` (release -3 item 10, 1 October 2026).
+        read the repository, or ``None`` (the 1 October planner fix, 1 October 2026).
 
         Written by the plan leg on its approved ``feature-plan`` record and
         read here so the build gate's card can say it. Read-only and

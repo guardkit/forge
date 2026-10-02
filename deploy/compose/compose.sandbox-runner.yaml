@@ -50,7 +50,7 @@ services:
     restart: unless-stopped
 
     # WHICH SANDBOX THIS SUPERVISOR LOOKS AFTER, readable from the machine's
-    # own Docker engine (release -3, 1 October 2026). The project's sandbox
+    # own Docker engine (2 October 2026, 1 October 2026). The project's sandbox
     # deploy wrapper (forge's deploy_templates/sandbox-deploy.sh) looks for a
     # container with this label, in any state, before it starts the two old
     # host units; when one exists it starts neither, because the runner

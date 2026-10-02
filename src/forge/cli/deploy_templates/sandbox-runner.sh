@@ -161,7 +161,7 @@
 #
 #   the factory's settings file, FORGE_CONFIG_PATH
 #       SHARED MOUNT, READ-ONLY, at the path the setting names (1 October
-#       2026, release -3, found on the live day). Until then this script handed
+#       2026, 2 October 2026, found on the live day). Until then this script handed
 #       both containers the NAME and never the FILE: the deploy helper was told
 #       to read its settings from a path that existed in the sandbox and not in
 #       its container, so it could not resolve the project it was asked about
@@ -170,20 +170,21 @@
 #       both containers, at the same path, read-only — neither service writes
 #       its settings, and a container that could would be changing what the
 #       next one reads. UNSET is a refusal too (the independent check of the
-#       first release -3 template): with no settings file the helper cannot
+#       first 2 October 2026 template): with no settings file the helper cannot
 #       find the project it is asked about at all, so a sandbox started
 #       without one only fails later and less clearly. Set and missing, or set
 #       and unreadable, is a refusal naming the setting: a name with nothing
 #       under it is the outcome this table exists to prevent. WHERE THE FILE
-#       COMES FROM is decided by the release -3 upgrade design: it is
-#       generated at install time by deploy/estate/rollout-sandbox, as a file
-#       of this sandbox whose repository paths are the paths INSIDE the
-#       sandbox (the coordinator's own settings name its own paths, which are
-#       not these). This script only checks it is there and shares it.
+#       COMES FROM: the project's setup puts it in the sandbox, as a file whose
+#       repository paths are the paths INSIDE the sandbox (the coordinator's
+#       own settings name its own paths, which are not these), and names it in
+#       FORGE_CONFIG_PATH. deploy/estate/rollout-sandbox refuses to install
+#       this script into a sandbox that does not have it. This script only
+#       checks it is there and shares it.
 #
 #   the git objects the project's clone BORROWS (.git/objects/info/alternates)
 #       SHARED MOUNT, READ-ONLY, at the path the alternates file names (1
-#       October 2026, release -3, found on the live day). A sandbox made with
+#       October 2026, 2 October 2026, found on the live day). A sandbox made with
 #       `sbx create --clone` does not copy the project's history: its clone
 #       borrows every object from the checkout the sandbox was made from,
 #       which sbx mounts read-only at /run/sandbox/source, and says so in one
@@ -210,7 +211,7 @@
 #   GIT_COMMITTER_EMAIL)
 #       THE SANDBOX'S OWN FILESYSTEM, bound read-only into BOTH containers as
 #       their git's SYSTEM settings file, /etc/gitconfig (1 October 2026,
-#       release -3, found on the live day). The build's first checkpoint
+#       2 October 2026, found on the live day). The build's first checkpoint
 #       commit failed inside the runner with "Author identity unknown ...
 #       unable to auto-detect email address (got 'forge@<container>.(none)')",
 #       although the four GIT_ names had been handed in. They never reached
@@ -340,13 +341,13 @@
 #   there is nothing to carry. Where the estate pulls from a registry instead,
 #   nothing here changes.
 #
-#   REQUIRED — the sandbox's own settings file (release -3, 1 October 2026):
+#   REQUIRED — the sandbox's own settings file (2 October 2026, 1 October 2026):
 #     FORGE_CONFIG_PATH      a file IN this sandbox, generated at install time,
 #                            whose repository paths are this sandbox's own.
 #                            Shared read-only with both containers; unset,
 #                            missing or unreadable is a refusal
 #
-#   REQUIRED — the project's git identity (release -3, 1 October 2026):
+#   REQUIRED — the project's git identity (2 October 2026, 1 October 2026):
 #     GIT_AUTHOR_NAME, GIT_AUTHOR_EMAIL
 #                            who the project's builds commit as. Written into
 #                            the file both containers' git reads as its system
@@ -367,7 +368,7 @@
 #                            sandbox (default 0.0.0.0 — the sandbox's own
 #                            publish rule is what limits who can reach them).
 #                            Both share the sandbox's own network since
-#                            release -3, so each listens there directly
+#                            2 October 2026, so each listens there directly
 #     SANDBOX_SIDECAR_PORT   the helper's port inside the sandbox (8125)
 #     SANDBOX_RUNNER_PORT    the runner's port inside the sandbox (8124)
 #     SANDBOX_RUNNER_RESTART_SECONDS
@@ -435,7 +436,7 @@
 #                            /var/run/docker.sock), bound into BOTH containers:
 #                            the helper so a project's own deploy can run in
 #                            here, which is what the helper is for, and (since
-#                            release -3, 1 October 2026) the runner so a
+#                            2 October 2026, 1 October 2026) the runner so a
 #                            project's own tests can start the services they
 #                            need. Each is also given the GROUP that owns that
 #                            socket in this sandbox, because a bound socket a
@@ -498,7 +499,7 @@ RESTART_SECONDS="${SANDBOX_RUNNER_RESTART_SECONDS:-5}"
 # (SANDBOX_STOP_TIMEOUT_SECONDS out there, 45 seconds by default).
 STOP_PATIENCE_SECONDS="${SANDBOX_RUNNER_STOP_PATIENCE_SECONDS:-30}"
 # HOW LONG A NEWLY STARTED SERVICE IS GIVEN TO ANSWER AS ITSELF before it is
-# called not up (release -3, after the re-check of the network change). It is
+# called not up (2 October 2026, after the re-check of the network change). It is
 # an upper bound: the wait ends the moment the service answers. Sixty seconds
 # is well over both services' start-up on a sandbox (a few seconds each).
 # The bound is WALL-CLOCK time, every probe included (Codex round 2: the first
@@ -1105,7 +1106,7 @@ share_a_folder "${WORKTREE_SETTING}" "${WORKTREE_BASE}"
 share_a_folder "${NOTES_SETTING}" "${NOTES_ROOT}"
 log "folders shared by both containers: ${REPO_ROOT} (the project's clone), ${RECEIPTS_ROOT} (receipts), ${WORKTREE_BASE} (a build's worktrees), ${NOTES_ROOT} (the deploy helper's executor notes)"
 
-# THE FACTORY'S SETTINGS FILE (1 October 2026, release -3). The table at the
+# THE FACTORY'S SETTINGS FILE (1 October 2026, 2 October 2026). The table at the
 # top says why: both containers were handed the name FORGE_CONFIG_PATH and
 # neither was given the file, so the helper could not find the project it was
 # asked about. The file itself is bound now, read-only, at the path the name
@@ -1131,7 +1132,7 @@ if [[ -n "${CONFIG_PATH}" ]]; then
   log "the factory's settings file named by FORGE_CONFIG_PATH is shared with both containers, read-only, at the same path"
 fi
 
-# THE GIT OBJECTS THE CLONE BORROWS (1 October 2026, release -3). The table at
+# THE GIT OBJECTS THE CLONE BORROWS (1 October 2026, 2 October 2026). The table at
 # the top says why. This reads the clone's own alternates file the way git
 # does — one folder per line, blank lines and lines starting with # ignored, a
 # relative line taken from the objects folder that holds the file, and the
@@ -1142,7 +1143,7 @@ fi
 # alternates file is read; no object is.
 #
 # HOW DEEP GIT GOES, counted the way git counts it (corrected after the
-# independent check of the first release -3 template, which counted from 1 and
+# independent check of the first 2 October 2026 template, which counted from 1 and
 # so refused one level too early). In git's own source (object-file.c, the
 # function link_alt_odb_entries) the repository's own alternates file is read
 # at depth 0, each borrowed folder's file one deeper, and a file read deeper
@@ -1211,7 +1212,7 @@ if ((${#BORROWED_OBJECTS[@]} > 0)); then
   log "the project's clone borrows git objects from ${BORROWED_OBJECTS[*]}; each is shared with both containers, read-only, at the same path"
 fi
 
-# THE GIT IDENTITY BOTH CONTAINERS COMMIT AS (1 October 2026, release -3). The
+# THE GIT IDENTITY BOTH CONTAINERS COMMIT AS (1 October 2026, 2 October 2026). The
 # table at the top says why it is a file mounted as /etc/gitconfig and not a
 # setting. The values are the project's, as handed in by name; they are written
 # into the file and never into a log line. A committer not named separately is
@@ -1308,7 +1309,7 @@ fi
 printf '%s\n' "${RUNNER_GRAPH_CONFIG}" > "${RUNNER_CONFIG_FILE}"
 
 # THE SANDBOX'S OWN ENGINE, FOR BOTH CONTAINERS (the runner since 1 October
-# 2026, release -3). Worked out afresh at every start, because a container the
+# 2026, 2 October 2026). Worked out afresh at every start, because a container the
 # supervisor makes again should get whatever socket and group the sandbox has
 # now. Fills ENGINE_SOCKET_ARGUMENTS for the container named.
 #
@@ -1322,7 +1323,7 @@ printf '%s\n' "${RUNNER_GRAPH_CONFIG}" > "${RUNNER_CONFIG_FILE}"
 # group added is whichever group owns the socket in this sandbox, read from
 # the socket itself; nothing else about the container changes.
 #
-# WHY THE RUNNER HAS IT TOO, AND WHAT THAT GIVES AWAY. Until release -3 only
+# WHY THE RUNNER HAS IT TOO, AND WHAT THAT GIVES AWAY. Until 2 October 2026 only
 # the deploy helper was given the engine: its job is to run a project's own
 # deploy, and a deploy ordinarily brings containers up in here. The runner was
 # given none — not as a recorded security decision (no note anywhere gives
@@ -1336,7 +1337,7 @@ printf '%s\n' "${RUNNER_GRAPH_CONFIG}" > "${RUNNER_CONFIG_FILE}"
 # projects' tests need containers is the project's business, not this file's.
 #
 # What the socket gives the runner, said plainly (rewritten after the
-# independent check of the first release -3 template, which found the first
+# independent check of the first 2 October 2026 template, which found the first
 # version of this note overstated the case). The socket is control of THIS
 # SANDBOX's engine, which is as good as being this sandbox's administrator.
 # Code a build runs — the project's tests, and the model-written code they
@@ -1387,8 +1388,8 @@ the_engine_socket_for() {
   fi
 }
 
-# BOTH CONTAINERS SHARE THE SANDBOX'S OWN NETWORK (release -3, 1 October 2026;
-# the runner after the independent check of the first release -3 template, the
+# BOTH CONTAINERS SHARE THE SANDBOX'S OWN NETWORK (2 October 2026, 1 October 2026;
+# the runner after the independent check of the first 2 October 2026 template, the
 # helper in the next pass, for the same reason). Giving the two containers the
 # engine (above) was not enough on its own. A project starts its services the
 # ordinary way — publishing them on 127.0.0.1 of the engine's host, which in
@@ -1486,7 +1487,7 @@ start_runner() {
 # Start one, whatever state it is in: a container left behind by an earlier
 # supervisor is removed first, so what runs is always freshly made from the
 # checked image.
-# WHY A CONTAINER STOPPED, said before it is removed (release -3, after the
+# WHY A CONTAINER STOPPED, said before it is removed (2 October 2026, after the
 # re-check of the network change). The supervisor removes a dead container
 # before it makes another, and with it the only record of why it died: until
 # this, a port taken by something else showed up as nothing but "is no longer
@@ -1525,7 +1526,7 @@ ensure_runner() {
 ensure_helper
 ensure_runner
 
-# "BOTH CONTAINERS ARE UP" ONLY WHEN THEY ARE (release -3, after the re-check of
+# "BOTH CONTAINERS ARE UP" ONLY WHEN THEY ARE (2 October 2026, after the re-check of
 # the network change). `docker run --detach` succeeds as soon as a container is
 # made, so this line used to be printed over a service that had already failed.
 # And a running container is not proof either: on a real sandbox, with the
