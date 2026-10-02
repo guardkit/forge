@@ -567,9 +567,11 @@ def test_route_paths_are_capped_and_one_first_segment_is_searched_once(tmp_path:
     class Counting(LocalCheckoutReader):
         searched: list[str] = []
 
-        def files_mentioning(self, text: str, *, ignore_case: bool = False) -> list[str]:
+        def files_mentioning(
+            self, text: str, *, ignore_case: bool = False, relevant=None
+        ) -> list[str]:
             self.searched.append(text)
-            return super().files_mentioning(text, ignore_case=ignore_case)
+            return super().files_mentioning(text, ignore_case=ignore_case, relevant=relevant)
 
     reader = Counting(str(checkout))
     read_repository_facts(
@@ -818,3 +820,68 @@ def test_a_capped_search_finished_from_a_capped_listing_stays_partial(tmp_path: 
         )
     assert reasons == []
     assert any(p.startswith("where `/users` already appears was only partly searched") for p in partial)
+
+
+# ---------------------------------------------------------------------------
+# Codex round 3, R4: a file the sheet chose to read and the helper refused is
+# said by name and reason — "could not read" when nothing else was learned,
+# "read only in part" when other facts remain.
+# ---------------------------------------------------------------------------
+
+#: A users model over the helper's 262,144-byte limit for one file.
+HUGE_MODELS = MODELS + "\n# " + "x" * 270_000 + "\n"
+
+
+def test_a_refused_model_with_nothing_else_read_is_unavailable(tmp_path: Path) -> None:
+    clone = _repo(tmp_path / "clone", {"src/users/models.py": HUGE_MODELS})
+    with _serving(clone) as url:
+        facts = read_repository_facts(SidecarCodeReader(url, repo=REPO_KEY), "Show users")
+    assert facts.sheet is None
+    assert facts.unavailable is not None
+    assert facts.unavailable.startswith(
+        "the files that matter for this request could not be read: "
+        "`src/users/models.py` could not be read (the helper answered 400:"
+    )
+    assert (facts.text or "").startswith("Repository facts unavailable: the files that matter")
+
+
+def test_a_refused_model_beside_a_readable_route_is_partial(tmp_path: Path) -> None:
+    clone = _repo(
+        tmp_path / "clone",
+        {"src/users/models.py": HUGE_MODELS, "src/users/router.py": ROUTER_UNDER_SRC},
+    )
+    with _serving(clone) as url:
+        facts = read_repository_facts(
+            SidecarCodeReader(url, repo=REPO_KEY), "Show users at /users/count-today"
+        )
+    assert facts.unavailable is None
+    sheet = facts.text or ""
+    assert "`src/users/router.py` defines GET /users/count-today." in sheet
+    assert "Not read, so this sheet is incomplete: `src/users/models.py` could not be read" in sheet
+    assert facts.partial is not None and "src/users/models.py" in facts.partial
+
+
+def test_a_local_checkout_says_why_a_file_was_not_read(tmp_path: Path) -> None:
+    checkout = _repo(tmp_path / "checkout", {"src/users/models.py": HUGE_MODELS})
+    facts = read_repository_facts(LocalCheckoutReader(str(checkout)), "Show users")
+    assert facts.unavailable is not None
+    assert "over the 262144-byte limit for one file" in facts.unavailable
+
+
+def test_a_tracked_rules_file_the_helper_refuses_is_said(tmp_path: Path) -> None:
+    clone = _repo(
+        tmp_path / "clone",
+        {"docs/architecture-rules.yaml": RULES + "# " + "x" * 270_000 + "\n", "src/a.py": "x = 1\n"},
+    )
+    reasons: list[str] = []
+    partial: list[str] = []
+    with _serving(clone) as url:
+        descriptor = PlanningRunDriver._build_target_repo_descriptor(
+            REPO_KEY, COORDINATOR_PATH, "",
+            reader=SidecarCodeReader(url, repo=REPO_KEY),
+            unavailable=reasons, partial=partial,
+        )
+    assert "architecture_rules" not in descriptor and reasons == []
+    assert partial and partial[0].startswith(
+        "the architecture rules file `docs/architecture-rules.yaml` could not be read (the helper answered 400:"
+    )

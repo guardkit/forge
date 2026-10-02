@@ -210,6 +210,8 @@ class SidecarCodeReader:
         self.cuts: list[str] = []
         #: The sentence when the listing itself was cut, else ``None``.
         self.listing_cut: str | None = None
+        #: Why each file the helper would not serve was refused, by path.
+        self.refused: dict[str, str] = {}
         self._listing: list[str] | None = None
         self._dead: str | None = None
         self._deadline: float | None = None
@@ -302,7 +304,13 @@ class SidecarCodeReader:
             self._long_line_files = ([f for f in files if f], gap)
         return self._long_line_files
 
-    def _search(self, text: str, *, ignore_case: bool) -> tuple[list[dict[str, Any]], list[str]]:
+    def _search(
+        self,
+        text: str,
+        *,
+        ignore_case: bool,
+        relevant: Callable[[str], bool] | None = None,
+    ) -> tuple[list[dict[str, Any]], list[str]]:
         """Every match for ``text`` — recovered where the helper cut — and the
         plain sentences saying what could still not be searched."""
         body: dict[str, Any] = {
@@ -329,6 +337,8 @@ class SidecarCodeReader:
         def read_and_search(path: str) -> None:
             if path in read_whole:
                 return
+            if relevant is not None and not relevant(path):
+                return  # the caller would set it aside anyway
             if not budget_left():
                 unrecovered.append(f"`{path}`")
                 return
@@ -392,6 +402,8 @@ class SidecarCodeReader:
             for folder, members in sorted(folders.items()):
                 if max(members) < last:
                     continue  # searched whole before the cut
+                if relevant is not None and not any(relevant(m) for m in members):
+                    continue  # nothing in it the caller would use
                 if not budget_left():
                     unrecovered.append(f"`{folder}/`")
                     continue
@@ -413,8 +425,17 @@ class SidecarCodeReader:
         sentences = [f"the search for `{text}`: {gap}" for gap in dict.fromkeys(gaps)]
         return ordered, sentences
 
-    def files_mentioning(self, text: str, *, ignore_case: bool = False) -> list[str]:
-        matches, gaps = self._search(text, ignore_case=ignore_case)
+    def files_mentioning(
+        self,
+        text: str,
+        *,
+        ignore_case: bool = False,
+        relevant: Callable[[str], bool] | None = None,
+    ) -> list[str]:
+        """The files whose text holds ``text``. ``relevant``, when given, says
+        which files the caller can use: what the helper's caps left out is
+        recovered — and reported missing — only for those."""
+        matches, gaps = self._search(text, ignore_case=ignore_case, relevant=relevant)
         self.cuts.extend(gaps)
         return list(dict.fromkeys(str(m.get("path")) for m in matches if m.get("path")))
 
@@ -433,7 +454,11 @@ class SidecarCodeReader:
             content = decoded.get("content")
             return content if isinstance(content, str) else None
         if 400 <= status < 500:
-            return None  # this one file is not served; the repository still is
+            # This one file is not served; the repository still is. The
+            # helper's reason is kept so the sheet can say it.
+            error = decoded.get("error") if isinstance(decoded, dict) else decoded
+            self.refused[path] = f"the helper answered {status}: {str(error or 'no reason given')[:200]}"
+            return None
         raise self._refused("/code/read-file", status, decoded)
 
 
