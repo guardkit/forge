@@ -194,6 +194,7 @@ class Publisher:
             state_dir=self._state,
             credential=self._credential,
             timeout_seconds=self._settings.git_timeout_seconds,
+            known_hosts=self._settings.known_hosts_file,
         )
 
     # -- the one thing it does ---------------------------------------------

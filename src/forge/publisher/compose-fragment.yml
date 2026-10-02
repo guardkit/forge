@@ -101,6 +101,10 @@ services:
       # THE ONE FILE THE CREDENTIAL IS IN. Read-only, and mounted nowhere else
       # in this estate.
       - ${FORGE_PUBLISHER_CREDENTIAL_FILE}:/etc/forge-publisher/credential:ro
+      # THE PINNED HOST KEYS for a remote reached over SSH (its settings then
+      # say "known_hosts_file": "/etc/forge-publisher/known_hosts"). Not a
+      # secret. Unset, an empty file stands in, and an SSH remote is refused.
+      - ${FORGE_PUBLISHER_KNOWN_HOSTS_FILE:-/dev/null}:/etc/forge-publisher/known_hosts:ro
       # THE LEDGER'S FOLDER, READ-ONLY — the folder, and not the one file.
       #
       # WHY THE FOLDER (22 September 2026, the stage's reviewer, who tried it

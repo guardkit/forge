@@ -35,6 +35,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from forge.publisher.credential import an_ssh_address
+
 __all__ = [
     "ProjectRoute",
     "PublisherSettings",
@@ -72,6 +74,9 @@ class PublisherSettings:
     #: 0 means "let the kernel pick", which is what a test and a bench want.
     port: int = 0
     git_timeout_seconds: float = 180.0
+    #: The pinned host keys for remotes reached over SSH, as a file. Never
+    #: fetched at run time; needed only when a remote is an SSH address.
+    known_hosts_file: str = ""
 
     def route(self, project: str) -> ProjectRoute | None:
         return self.projects.get(str(project or "").strip())
@@ -93,6 +98,7 @@ class PublisherSettings:
             },
             "host": self.host,
             "port": self.port,
+            "known_hosts_file": self.known_hosts_file,
         }
 
 
@@ -161,6 +167,12 @@ def load_settings(path: str | Path) -> PublisherSettings:
             "'git_timeout_seconds' in the publisher's settings must be a "
             "number of seconds greater than zero"
         )
+    known_hosts = _text(decoded, "known_hosts_file", where="the settings", required=False)
+    if not known_hosts and any(an_ssh_address(r.remote) for r in projects.values()):
+        raise SettingsRefused(
+            "a project's remote is an SSH address, so the publisher's settings "
+            "need 'known_hosts_file': the file holding that host's pinned key"
+        )
     return PublisherSettings(
         credential_file=_text(decoded, "credential_file", where="the settings"),
         ledger=_text(decoded, "ledger", where="the settings"),
@@ -170,4 +182,5 @@ def load_settings(path: str | Path) -> PublisherSettings:
         or "127.0.0.1",
         port=int(port),
         git_timeout_seconds=float(timeout),
+        known_hosts_file=known_hosts,
     )

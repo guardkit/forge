@@ -181,21 +181,22 @@ class TestWhatTheBundlePromises:
         assert "network_mode: host" not in rendered
 
     def test_nothing_binds_a_folder_off_this_machine(self, rendered: str) -> None:
-        """Binds are allowed only for the two files a machine supplies.
+        """Binds are allowed only for the publisher's files a machine supplies.
 
-        The publisher's settings file and its credential file are supplied by
+        The publisher's settings file, its credential file and its pinned host keys are supplied by
         the machine at paths the env file names. Everything else is a named
         volume, because a bind is a path and a path belongs to a machine.
         """
         allowed_targets = (
             "/etc/forge-publisher/settings.json",
             "/etc/forge-publisher/credential",
+            "/etc/forge-publisher/known_hosts",
         )
         blocks = rendered.split("- type: bind")
         for block in blocks[1:]:
             head = block[:400]
             assert any(target in head for target in allowed_targets), (
-                "the bundle binds something other than the publisher's own two "
+                "the bundle binds something other than the publisher's own "
                 f"files:\n{head}"
             )
 
@@ -267,6 +268,7 @@ class TestTheSandboxRunnerAddsNothingOfThisMachine:
         allowed_targets = (
             "/etc/forge-publisher/settings.json",
             "/etc/forge-publisher/credential",
+            "/etc/forge-publisher/known_hosts",
             "/usr/bin/sbx",
             "/sandboxd/sandboxd.sock",
         )

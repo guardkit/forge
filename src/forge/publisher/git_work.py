@@ -49,7 +49,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-from forge.publisher.credential import Credential, the_environment_git_is_given
+from forge.publisher.credential import (
+    Credential,
+    an_ssh_address,
+    the_environment_git_is_given,
+)
 from forge.publisher.settings import ProjectRoute
 
 logger = logging.getLogger(__name__)
@@ -205,8 +209,12 @@ class TheProjectsCommits:
         state_dir: Path,
         credential: Credential | None,
         timeout_seconds: float = 180.0,
+        known_hosts: str = "",
     ) -> None:
         self._route = route
+        # Over SSH the credential is a key and the host is checked against
+        # the pinned file; otherwise git asks for the token as before.
+        self._known_hosts = known_hosts if an_ssh_address(route.remote) else None
         self._state = Path(state_dir)
         self._credential = credential
         self._timeout = float(timeout_seconds)
@@ -227,7 +235,10 @@ class TheProjectsCommits:
     def _git(self, *args: str, timeout: float | None = None) -> GitSaid:
         """One git command in the publisher's own repository. Never raises."""
         environment = the_environment_git_is_given(
-            self._credential, state_dir=self._state, home=self._state
+            self._credential,
+            state_dir=self._state,
+            home=self._state,
+            known_hosts=self._known_hosts,
         )
         try:
             done = subprocess.run(  # noqa: S603 - fixed argv, no shell
@@ -261,7 +272,10 @@ class TheProjectsCommits:
             return GitSaid(ok=True)
         self._where.parent.mkdir(parents=True, exist_ok=True)
         environment = the_environment_git_is_given(
-            self._credential, state_dir=self._state, home=self._state
+            self._credential,
+            state_dir=self._state,
+            home=self._state,
+            known_hosts=self._known_hosts,
         )
         try:
             done = subprocess.run(  # noqa: S603 - fixed argv, no shell
@@ -364,7 +378,10 @@ class TheProjectsCommits:
     def is_in(self, ancestor: str, descendant: str) -> bool | None:
         """Is ``ancestor`` part of ``descendant``? ``None`` = git could not say."""
         environment = the_environment_git_is_given(
-            self._credential, state_dir=self._state, home=self._state
+            self._credential,
+            state_dir=self._state,
+            home=self._state,
+            known_hosts=self._known_hosts,
         )
         try:
             done = subprocess.run(  # noqa: S603 - fixed argv, no shell
