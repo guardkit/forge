@@ -737,6 +737,40 @@ whose durable is `DEFAULT_DURABLE_NAME = "forge-serve"`
 `forge-consumer` would be reading a reader that is not there — which is why a
 reader the bus does not hold is a **refusal** here and never a nought.
 
+## What only the machine can say about publication — `estate-check --publication-facts`
+
+Added in release -3. Publication (the merge word sending the joined commit to
+the project's remote, then deploying) is on only when the coordinator's
+`publication.enabled` setting is true **and** every condition of the activation
+check holds. Five of those answers are facts about this machine that no
+settings file can establish, so this mode **looks**, just now, and writes what it
+found:
+
+| Question | What is looked at |
+|---|---|
+| can a sandbox reach the coordinator's settings, or the ledger? | every sandbox's workspaces (`sbx ls --json`), and the mounts of every container inside each running sandbox, against the folders Docker mounts into the coordinator at `/etc/forge` and `/var/lib/forge` |
+| can a sandbox reach the publisher? | the publisher must answer the coordinator; then from inside each running sandbox, the answer service must answer (so the sandbox can make a request at all) and the publisher's own address must not, by the sandbox's default route or directly; the current publisher host policy must verify. With no sandbox running this is unknown |
+| is the coordinator the only thing on the publisher's network? | `docker network inspect`: exactly the coordinator and the publisher, and the publisher publishes no port |
+| can anything but the publisher read its credential? | no other container on this machine mounts the file or a folder holding it, no sandbox workspace contains it, and only its owner, `FORGE_PUBLISHER_UID`, has any access. The file is never opened |
+
+The record goes into the `publication-facts` volume, written by a throwaway
+helper container with no network and a read-only root — that volume's only
+writer — after any earlier record has been invalidated. The coordinator mounts
+the volume **read-only** and, when `FORGE_PUBLICATION_FACTS_FILE` names the
+record, reads it **at every merge word**. It acts on a record only while it was
+written for its own container, after its own start, and within a day; anything
+else reads as "nobody has looked", so publication stays off and the merge word
+says why. Because a record is never newer than a start that comes after it, the
+coordinator's boot line always says publication is off; run this check after
+every coordinator start, then
+`docker exec <coordinator> python -m forge.pipeline.publication_status`, which
+asks the same question with the same reader as the next merge word.
+
+Exit status: 0 every answer is the one publication needs; 1 the record was
+written and at least one answer is not; 2 nothing was looked at or written.
+An env file without `FORGE_PUBLICATION_FACTS_FILE` (every one before release
+-3) still renders and runs; the coordinator then behaves exactly as before.
+
 ## Preparing and operating the rollout tools
 
 The six `rollout-*` commands are host operator tools for this estate. Their
