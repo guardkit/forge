@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-"""Replace a legacy sandbox bootstrap after a proved whole-sandbox stop.
+"""Replace a legacy sandbox bootstrap after a proved whole-sandbox stop
+(--stop-legacy), or take a new release into a sandbox the containerised
+supervisor already looks after (--upgrade, and --upgrade --back to put the
+saved previous installation back). An upgrade runs with the Compose
+sandbox-runner stopped (exit 0) and never stops the sandbox, moves a port or
+policy rule, or unmasks a unit; it saves the previous template, profile,
+settings file, bootstrap env and clone-local git identity to
+<evidence_dir>/previous-installation/ (0600, with hashes) before changing
+anything, and writes sandbox-installed.json format 2 with a previous block.
 
 Private inventory: common project/env_file/runtime_image/docker_context and units
 runner/keeper, plus sandbox:{name, clone_path, known_files, receipts_path,
@@ -65,7 +73,16 @@ def json_read(path):
 def private_write(path, data, mode=0o600):
     path = Path(path)
     require(not path.is_symlink(), f'{path} is a symlink; choose a private regular file')
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # Every folder made here is private, not only the last one (an upgrade's
+    # previous-installation/ would otherwise make evidence_dir 0755).
+    missing = []
+    folder = path.parent
+    while not folder.exists():
+        missing.append(folder)
+        folder = folder.parent
+    for folder in reversed(missing):
+        folder.mkdir(mode=0o700)
+        os.chmod(folder, 0o700)
     fd, temp = tempfile.mkstemp(prefix='.rollout-', dir=path.parent)
     try:
         with os.fdopen(fd, 'wb') as stream:
@@ -259,6 +276,89 @@ assert float(cfg.resource_preflight.min_available_disk_gb)==float(p['floor'])
 assert cfg.routine.seat==chosen.get('seat') and cfg.routine.timeout_multiplier==chosen.get('timeout_multiplier')
 print(json.dumps({'text':text,'seat':chosen.get('seat'),'timeout_multiplier':chosen.get('timeout_multiplier'),'coordinator_settings_sha256':hashlib.sha256(raw).hexdigest()}))
 '''
+
+
+# Release -3 TC4: what an upgrade reads inside the sandbox before it changes
+# anything. Stdlib only, read-only: the installed files (bytes, hash, mode),
+# the clone-local git identity, and whether the template's supervisor is still
+# alive (its lock held, or its process record naming a process born when the
+# record says). Values come back to the tool only; they are never printed.
+STATE = r'''
+import base64,errno,fcntl,hashlib,json,os,pathlib,subprocess,sys
+c=json.loads(sys.argv[1])
+def read(name):
+ p=pathlib.Path(name)
+ if not os.path.lexists(p): return None
+ assert p.is_file() and not p.is_symlink()
+ d=p.read_bytes()
+ return {'sha256':hashlib.sha256(d).hexdigest(),'data':base64.b64encode(d).decode(),'mode':p.stat().st_mode&0o777}
+files={k:read(v) for k,v in c['files'].items()}
+def get(key):
+ r=subprocess.run(['git','-C',c['clone'],'config','--local','--get-all',key],capture_output=True,text=True)
+ if r.returncode==1 and not r.stdout: return None
+ assert r.returncode==0
+ values=r.stdout.splitlines(); assert len(values)==1
+ return values[0]
+identity={k:get(k) for k in ('user.name','user.email')}
+root=os.path.dirname(os.path.dirname(c['script']))
+state=pathlib.Path(os.path.expanduser('~'))/'.forge-runner'/hashlib.sha256(root.encode()).hexdigest()
+record=state/'supervisor'; lock=state/'lock'; live=False; held=False
+if record.exists():
+ parts=record.read_text().split()
+ if len(parts)>=2 and parts[0].isdigit():
+  try:
+   stat=pathlib.Path('/proc/'+parts[0]+'/stat').read_text()
+   live=stat.rsplit(') ',1)[1].split()[19]==parts[1]
+  except (OSError,IndexError):
+   live=False
+if lock.exists():
+ fd=os.open(lock,os.O_RDONLY)
+ try:
+  try: fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB); fcntl.flock(fd,fcntl.LOCK_UN)
+  except OSError as e:
+   if e.errno not in (errno.EAGAIN,errno.EACCES): raise
+   held=True
+ finally: os.close(fd)
+parent=pathlib.Path(c['files']['settings']).parent
+folder={'exists':parent.is_dir(),'mode':parent.stat().st_mode&0o777 if parent.is_dir() else None}
+print(json.dumps({'files':files,'identity':identity,'settings_folder':folder,'supervisor':{'record_present':record.exists(),'record_live':live,'lock_held':held}}))
+'''
+
+# Sets (value) or unsets (null) the clone-local user.name/user.email, values on
+# stdin only, and reads them back. Used to move the identity aside (U4b) and to
+# put it back.
+IDENTITY = r'''
+import hashlib,json,subprocess,sys
+p=json.load(sys.stdin)
+def git(*a):
+ return subprocess.run(['git','-C',p['clone'],'config','--local',*a],capture_output=True,text=True)
+for key,value in p['set'].items():
+ assert key in ('user.name','user.email')
+ if value is None:
+  r=git('--unset-all',key); assert r.returncode in (0,5)
+ else:
+  r=git('--replace-all',key,value); assert r.returncode==0
+out={}
+for key,value in p['set'].items():
+ r=git('--get-all',key)
+ got=None if r.returncode==1 and not r.stdout else r.stdout.rstrip('\n')
+ assert got==value
+ out[key]=None if got is None else hashlib.sha256(got.encode()).hexdigest()
+print(json.dumps(out))
+'''
+
+# The routes two profile texts declare, read in the runtime image (which has
+# YAML). An upgrade refuses to move any of them.
+ROUTES = r'''
+import json,sys,yaml
+p=json.load(sys.stdin)
+def routes(text):
+ doc=yaml.safe_load(text) or {}; s=doc.get('sandbox') or {}
+ return {'publish':list(s.get('publish') or []),'sidecar_publish':s.get('sidecar_publish'),'runner_publish':s.get('runner_publish'),'allow_network':list(s.get('allow_network') or [])}
+print(json.dumps({'installed':routes(p['installed']),'new':routes(p['new'])}))
+'''
+
+GIT_IDENTITY_NAMES = ('GIT_AUTHOR_NAME','GIT_AUTHOR_EMAIL','GIT_COMMITTER_NAME','GIT_COMMITTER_EMAIL')
 
 
 class Rollout:
@@ -579,8 +679,7 @@ class Rollout:
         private_write(self.evidence/'bootstrap-image.env',''.join(name+'='+settings[name]+'\n' for name in names).encode())
         return settings
 
-    def execute(self):
-        print('While the sandbox is stopped, nobody may run sbx prune, sbx rm or sbx reset.',flush=True)
+    def require_sbx_version(self):
         try:
             version = json.loads(self.sbx('version','--json').stdout)
             client = version['client']
@@ -593,6 +692,10 @@ class Rollout:
         except (ValueError,TypeError,KeyError):
             valid_version = False
         require(valid_version, 'sandbox client or server version/state is not the reviewed running v0.42.1 contract; verify its stopped-status contract first')
+
+    def execute(self):
+        print('While the sandbox is stopped, nobody may run sbx prune, sbx rm or sbx reset.',flush=True)
+        self.require_sbx_version()
         profile = self.profile()  # Parse/validate before touching any unit.
         self.validate_bootstrap_ports(profile)
         settings = self.sandbox_settings()  # Generated and loaded before touching any unit.
@@ -698,6 +801,319 @@ class Rollout:
         print('Current template and producer profile installed and read back; both old host units stay masked and stopped; actual memory read/write and normal lifecycle checks remain required.')
 
 
+    # ---------------------------------------------------------------------
+    # Release -3 TC4: --upgrade and --upgrade --back. The sandbox already
+    # runs the containerised supervisor; nothing here stops the sandbox,
+    # moves a port or a policy rule, or unmasks a unit.
+    # ---------------------------------------------------------------------
+
+    def validate_upgrade_inputs(self):
+        args = self.args
+        require(args.previous_receipt, '--upgrade needs --previous-receipt naming the installed sandbox-installed.json; name it explicitly')
+        receipt = Path(args.previous_receipt)
+        require(receipt.is_file() and not receipt.is_symlink(), f'previous receipt {receipt} is not a regular file; name the installed sandbox-installed.json')
+        require(receipt.resolve() != (self.evidence/'sandbox-installed.json').resolve(),
+                'the previous receipt is the one this upgrade would write; give the upgrade its own evidence_dir')
+        self.previous_receipt_path = receipt
+        self.previous_receipt_bytes = receipt.read_bytes()
+        previous = json.loads(self.previous_receipt_bytes)
+        require(isinstance(previous,dict) and previous.get('format_version') in (1,2) and previous.get('project') == args.project and previous.get('sandbox') == self.s['name'],
+                'previous receipt is for another project or sandbox; name the receipt of this installation')
+        require(all(isinstance(previous.get(k),str) and re.fullmatch(r'[0-9a-f]{64}',previous[k]) for k in ('template_sha256','profile_sha256')),
+                'previous receipt lacks the installed template and profile hashes; reconcile it first')
+        image = previous.get('bootstrap_image_settings')
+        require(isinstance(image,dict) and isinstance(image.get('FORGE_IMAGE'),str) and re.fullmatch(r'[0-9a-f]{64}',str(image.get('FORGE_IMAGE_IDENTITY',''))),
+                'previous receipt does not name the previous release image and its identity; reconcile it first')
+        require(isinstance(previous.get('bootstrap_env_file'),str) and PurePosixPath(previous['bootstrap_env_file']).is_absolute(),
+                'previous receipt does not name its bootstrap env file; reconcile it first')
+        require(Path(previous['bootstrap_env_file']).resolve() != self.bootstrap_env.resolve(),
+                "sandbox.bootstrap_env_file is the previous release's own file; the upgrade writes a new one and never rewrites the way back's")
+        self.previous = previous
+        self.previous_dir = self.evidence/'previous-installation'
+        default = re.search(r'^PREFIX="\$\{SANDBOX_CONTAINER_PREFIX:-([A-Za-z0-9_.-]+)\}"$',self.template.decode(),re.MULTILINE)
+        require(default is not None, 'current template container prefix is unreadable; verify its container names before upgrading')
+        self.prefix = self.forwarded_values.get('SANDBOX_CONTAINER_PREFIX') or default[1]
+        require(re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]*',self.prefix), 'SANDBOX_CONTAINER_PREFIX is not a container name prefix; fix the forwarded value')
+        self.sandbox_docker = self.forwarded_values.get('SANDBOX_DOCKER') or 'docker'
+        if not args.back:
+            for name in GIT_IDENTITY_NAMES:
+                require(name in self.forwarded_names, f'{name} is not in SANDBOX_ENV_NAMES; the release -3 template refuses to start without the project git identity, so add the name')
+                require(self.values.get(name), f'{name} has no value in the explicit env files; the release -3 template refuses to start without the project git identity, so supply it')
+
+    def compose_supervisor(self, *, allow_absent):
+        context = self.config['docker_context']
+        ids = self.run(['docker','--context',context,'ps','-a','--no-trunc',
+                        '--filter','label=com.docker.compose.project='+self.args.project,
+                        '--filter','label=com.docker.compose.service=sandbox-runner','--format','{{.ID}}']).stdout.split()
+        if not ids:
+            require(allow_absent, f'no sandbox-runner container of project {self.args.project} exists, so its clean stop cannot be proved; stop it with the closed-door step (exit 0) first')
+            return {'present':False}
+        seen = []
+        for identifier in ids:
+            try:
+                state = json.loads(self.run(['docker','--context',context,'container','inspect','--format','{{json .State}}',identifier]).stdout)
+            except ValueError:
+                state = None
+            require(isinstance(state,dict) and state.get('Running') is False and state.get('Restarting') is False and state.get('Status') == 'exited',
+                    f'the Compose sandbox-runner {identifier[:12]} is not stopped; stop it with the closed-door step first, so its own template stops the work inside')
+            require(state.get('ExitCode') == 0,
+                    f'the Compose sandbox-runner {identifier[:12]} exited {state.get("ExitCode")}, not 0, so the stop inside the sandbox is not proved; inspect it before upgrading')
+            seen.append({'id':identifier,'exit_code':0,'finished_at':state.get('FinishedAt')})
+        return {'present':True,'containers':seen}
+
+    def factory_containers_absent(self):
+        names = self.inside(self.sandbox_docker,'ps','-a','--no-trunc',
+                            '--filter',f'name=^{self.prefix}-helper$','--filter',f'name=^{self.prefix}-runner$',
+                            '--format','{{.Names}}').stdout.split()
+        require(not names, f'{", ".join(names)} still exists inside {self.s["name"]}; the previous supervisor\'s stop did not finish, so inspect it before upgrading')
+
+    def sandbox_state(self):
+        files = {'template':self.s['script_path'],'profile':self.s['profile_path'],'settings':str(self.settings_path)}
+        out = self.inside('python3','-c',STATE,json.dumps({'files':files,'clone':self.s['clone_path'],'script':self.s['script_path']})).stdout
+        state = json.loads(out)
+        require(isinstance(state,dict) and set(state.get('files',{})) == set(files) and set(state.get('identity',{})) == {'user.name','user.email'},
+                'the sandbox state is unreadable; inspect the clone before upgrading')
+        supervisor = state['supervisor']
+        require(not supervisor['record_live'] and not supervisor['lock_held'],
+                f'a supervisor of {self.s["script_path"]} is still running inside {self.s["name"]}; stop it with its own template first')
+        folder = state['settings_folder']
+        if folder['exists'] and folder['mode'] & 0o022:
+            raise Refusal(f'the settings folder {self.settings_path.parent} inside {self.s["name"]} is writable by others (mode {folder["mode"]:o}); make it 0755 before upgrading')
+        return state
+
+    def units_masked(self, *, mask):
+        for unit in self.units.values():
+            if mask and self.properties(unit)['UnitFileState'] not in ('masked','masked-runtime'):
+                self.systemctl('mask',unit)
+            self.stopped(unit)
+
+    def previous_image_present(self):
+        image = self.previous['bootstrap_image_settings']
+        fmt = re.search(r"^IMAGE_IDENTITY_DOCUMENT_FORMAT='([^']+)'$",HANDOFF.read_text(),re.MULTILINE)
+        require(fmt is not None, 'image identity format is unreadable; reconcile the accepted helper')
+        result = self.inside(self.sandbox_docker,'image','inspect','--format',fmt[1],image['FORGE_IMAGE'],check=False)
+        document = result.stdout.rstrip('\n').replace('\r\n','\n').removesuffix('\r').rstrip('\n')
+        require(result.returncode == 0 and document.startswith('forge-image-identity/2\n') and digest((document+'\n').encode()) == image['FORGE_IMAGE_IDENTITY'],
+                f'the previous release image {image["FORGE_IMAGE"]} is not in {self.s["name"]}\'s engine with its recorded identity; hand it in again before going back')
+
+    def set_identity(self, values):
+        out = self.inside('python3','-c',IDENTITY,input=json.dumps({'clone':self.s['clone_path'],'set':values})).stdout
+        return json.loads(out)
+
+    def routes_unchanged(self, installed, new):
+        out = self.run(['docker','--context',self.config['docker_context'],'run','--rm','--pull=never','--network=none','--read-only','-i','--entrypoint','python',self.config['runtime_image'],'-c',ROUTES],
+                       input=json.dumps({'installed':installed,'new':new})).stdout
+        routes = json.loads(out)
+        require(routes['installed'] == routes['new'], "the producer profile's publish or allow entries differ from the installed profile's; an upgrade does not move routes, so reconcile the profile first")
+
+    def bootstrap_text(self, image_settings):
+        bootstrap = {name:self.values[name] for name in self.forwarded_names if name in self.values}
+        bootstrap.update(image_settings)
+        bootstrap['FORGE_CONFIG_PATH'] = str(self.settings_path)
+        return bootstrap, ''.join(name+'='+json.dumps(value.replace('$','$$'),ensure_ascii=False)+'\n' for name,value in sorted(bootstrap.items()))
+
+    def bootstrap_settings_file(self, data):
+        """The settings file a bootstrap env names (FORGE_CONFIG_PATH) and its
+        hash inside the sandbox, so --switch can check the release it starts
+        reads the file it was installed with. Never the file's content."""
+        named = None
+        for line in data.decode().splitlines():
+            key, sep, value = line.partition('=')
+            if sep and key == 'FORGE_CONFIG_PATH':
+                try:
+                    named = json.loads(value).replace('$$','$')
+                except ValueError:
+                    named = value
+        if not named:
+            return None
+        out = self.inside('sha256sum',named,check=False)
+        fields = out.stdout.split()
+        return {'path':named,'sha256':fields[0] if out.returncode == 0 and fields else None}
+
+    def read_back(self, expected):
+        for path, data in expected:
+            out = self.inside('sha256sum',path).stdout.split()
+            require(out and out[0] == digest(data), f'installed file differs at {path} after writing; reconcile with --upgrade --back')
+
+    def upgrade_plan(self):
+        settings = self.sandbox_settings()
+        bootstrap, _ = self.bootstrap_text({'FORGE_IMAGE':'','FORGE_IMAGE_IDENTITY':'','FORGE_RELEASE_VERSION':'','FORGE_RELEASE_MANIFEST_SHA256':''})
+        print('Plan only (--upgrade): nothing is changed. Would require the previous receipt\'s template and profile hashes in the clone, the Compose sandbox-runner stopped with exit 0, no '+self.prefix+'-helper or '+self.prefix+'-runner container and no live supervisor inside '+self.s['name']+'; mask both old units if needed; save the previous template, profile, settings file, bootstrap env and clone-local git identity to '+str(self.previous_dir)+' (0600, with hashes); unset the clone-local identity; hand in '+self.s['release_image']+'; write the settings file below; install the current template; write the new bootstrap env at '+str(self.bootstrap_env)+'. Never sbx stop, sbx ports, sbx policy or systemctl unmask.')
+        print('Previous receipt: template '+self.previous['template_sha256']+', profile '+self.previous['profile_sha256']+', release '+str(self.previous['bootstrap_image_settings'].get('FORGE_RELEASE_VERSION'))+'; current template '+digest(self.template))
+        print('Generated sandbox settings for '+str(self.settings_path)+' (sha256 '+settings['sha256']+', from coordinator settings '+settings['coordinator_settings_sha256']+'):')
+        print(settings['text'].rstrip('\n'))
+        print('Repository keys mapped to the clone: '+', '.join(k+' -> '+self.s['clone_path'] for k in self.s['repo_keys']))
+        print('Routine seat (the coordinator\'s): '+str(settings['seat'])+'; timeout multiplier: '+str(settings['timeout_multiplier'])+'; worktree disk floor: '+str(self.s['worktree_disk_floor_gb'])+' GiB')
+        print('New bootstrap env names (values not shown): '+' '.join(sorted(bootstrap)))
+        print('Git identity names present with values: '+' '.join(name for name in GIT_IDENTITY_NAMES if name in bootstrap and self.values.get(name)))
+
+    def execute_upgrade(self):
+        self.require_sbx_version()
+        previous = self.previous
+        require(not (self.previous_dir/'previous.json').exists(),
+                f'a previous installation is already saved at {self.previous_dir}; this upgrade has run before, so use --upgrade --back or reconcile that folder first')
+        profile = self.profile()
+        self.validate_bootstrap_ports(profile)
+        settings = self.sandbox_settings()
+        supervisor = self.compose_supervisor(allow_absent=False)
+        # The first exec may wake a sandbox that slept after the supervisor
+        # stopped; nothing old runs inside to be woken (runbook 2.8).
+        self.factory_containers_absent()
+        state = self.sandbox_state()
+        installed = state['files']
+        require(installed['template'] and installed['template']['sha256'] == previous['template_sha256'],
+                f'the clone\'s {self.s["script_path"]} is not the template the previous receipt installed; reconcile before upgrading')
+        require(installed['profile'] and installed['profile']['sha256'] == previous['profile_sha256'],
+                f'the clone\'s {self.s["profile_path"]} is not the profile the previous receipt installed; reconcile before upgrading')
+        installed_profile = base64.b64decode(installed['profile']['data'])
+        new_profile = profile['text'].encode()
+        self.routes_unchanged(installed_profile.decode(),profile['text'])
+        profile_changed = installed_profile != new_profile
+        self.units_masked(mask=True)
+        old_bootstrap = Path(previous['bootstrap_env_file'])
+        require(old_bootstrap.is_file() and not old_bootstrap.is_symlink(), f'the previous bootstrap env {old_bootstrap} is missing; reconcile before upgrading')
+        old_bootstrap_bytes = old_bootstrap.read_bytes()
+        previous_settings_file = self.bootstrap_settings_file(old_bootstrap_bytes)
+        source_bytes = Path(self.s['profile_source']).read_bytes()
+        identity = state['identity']
+        # Save everything the way back needs, values never printed, then the
+        # manifest last: its presence means the saved copies are complete.
+        saved = {}
+        for key, name in (('template','sandbox-runner.sh'),('profile','profile.yaml'),('settings','settings.yaml')):
+            item = installed[key]
+            if item is None:
+                saved[key] = None
+                continue
+            data = base64.b64decode(item['data'])
+            private_write(self.previous_dir/name,data)
+            saved[key] = {'path':{'template':self.s['script_path'],'profile':self.s['profile_path'],'settings':str(self.settings_path)}[key],'saved':name,'sha256':digest(data),'mode':item['mode']}
+        identity_bytes = (json.dumps(identity,sort_keys=True)+'\n').encode()
+        private_write(self.previous_dir/'git-identity.json',identity_bytes)
+        private_write(self.previous_dir/'bootstrap.env',old_bootstrap_bytes)
+        private_write(self.previous_dir/'profile-source.yaml',source_bytes)
+        template_new = self.template
+        manifest = {
+            'format_version':1,'project':self.args.project,'sandbox':self.s['name'],
+            'saved_at':dt.datetime.now(dt.timezone.utc).isoformat(),
+            'previous_receipt':{'path':str(self.previous_receipt_path),'sha256':digest(self.previous_receipt_bytes)},
+            'release':{k:previous['bootstrap_image_settings'].get(k) for k in ('FORGE_IMAGE','FORGE_IMAGE_IDENTITY','FORGE_RELEASE_VERSION','FORGE_RELEASE_MANIFEST_SHA256')},
+            'files':saved,
+            'git_identity':{'saved':'git-identity.json','sha256':digest(identity_bytes),'values_sha256':{k:(None if v is None else digest(v.encode())) for k,v in identity.items()}},
+            'bootstrap_env':{'path':str(old_bootstrap),'sha256':digest(old_bootstrap_bytes),'saved':'bootstrap.env'},
+            'profile_source':{'path':self.s['profile_source'],'sha256':digest(source_bytes),'saved':'profile-source.yaml','after_sha256':digest(new_profile)},
+            'planned':{'template_sha256':digest(template_new),'profile_sha256':digest(new_profile),'settings_sha256':settings['sha256']},
+        }
+        private_write(self.previous_dir/'previous.json',(json.dumps(manifest,sort_keys=True,indent=2)+'\n').encode())
+        self.replacement_started = True
+        # U4b: a clone-local identity would override the release's system-level
+        # one and hide whether release -3's own mechanism works.
+        identity_after = self.set_identity({'user.name':None,'user.email':None})
+        image_settings = self.handoff()
+        items = [self.settings_item(settings['text']),{'path':self.s['script_path'],'root':self.s['clone_path'],'data':base64.b64encode(template_new).decode(),'mode':0o755}]
+        if profile_changed:
+            items.append({'path':self.s['profile_path'],'root':self.s['clone_path'],'data':base64.b64encode(new_profile).decode(),'mode':0o644})
+        self.inside('python3','-c',INSTALL,input=json.dumps(items))
+        if profile_changed and source_bytes != new_profile:
+            private_write(Path(self.s['profile_source']),new_profile,0o644)
+        bootstrap, encoded = self.bootstrap_text(image_settings)
+        private_write(self.bootstrap_env,encoded.encode())
+        require(self.bootstrap_env.read_bytes() == encoded.encode(), 'new bootstrap env readback differs; reconcile with --upgrade --back')
+        self.read_back([(self.s['script_path'],template_new),(self.s['profile_path'],new_profile),(str(self.settings_path),settings['text'].encode())])
+        require(old_bootstrap.read_bytes() == old_bootstrap_bytes, 'the previous bootstrap env changed during the upgrade; reconcile before going on')
+        self.units_masked(mask=False)
+        self.save('commands.json',self.events)
+        self.save('sandbox-installed.json',{
+            'format_version':2,'project':self.args.project,'sandbox':self.s['name'],'image':self.config['runtime_image'],
+            'template_sha256':digest(template_new),'profile_sha256':digest(new_profile),
+            'profile_reinstalled':profile_changed,
+            'profile_reinstall_reason':'producer profile bytes changed; routes unchanged' if profile_changed else 'unchanged; not reinstalled',
+            'answer_rule':self.answer,'memory_mcp_rule':self.memory_mcp,
+            'bootstrap_image_settings':image_settings,'bootstrap_env_file':str(self.bootstrap_env),'bootstrap_env_sha256':digest(encoded.encode()),
+            'bootstrap_env_names':sorted(bootstrap),
+            'settings_path':str(self.settings_path),'settings_sha256':settings['sha256'],'coordinator_settings_sha256':settings['coordinator_settings_sha256'],
+            'routine_seat':settings['seat'],'worktree_disk_floor_gb':self.s['worktree_disk_floor_gb'],
+            'legacy_units':'masked','clone_local_git_identity':{'saved':True,'after':identity_after},
+            'compose_supervisor':supervisor,
+            'previous':{'receipt':manifest['previous_receipt'],'release':manifest['release'],
+                        'template_sha256':previous['template_sha256'],'profile_sha256':previous['profile_sha256'],
+                        'settings':saved['settings'] and {'path':saved['settings']['path'],'sha256':saved['settings']['sha256']},
+                        'bootstrap_env':{'path':str(old_bootstrap),'sha256':digest(old_bootstrap_bytes)},
+                        'bootstrap_settings_file':previous_settings_file,
+                        'saved_in':str(self.previous_dir),'manifest_sha256':digest((self.previous_dir/'previous.json').read_bytes())},
+        })
+        self.complete = True
+        print('Upgraded '+self.s['name']+': settings file, template'+(' and profile' if profile_changed else '')+' installed and read back; new bootstrap env written at '+str(self.bootstrap_env)+'; clone-local git identity moved aside; both old units masked; the previous installation is saved in '+str(self.previous_dir)+'.')
+
+    def execute_back(self):
+        self.require_sbx_version()
+        previous = self.previous
+        supervisor = self.compose_supervisor(allow_absent=True)
+        self.factory_containers_absent()
+        state = self.sandbox_state()
+        self.previous_image_present()
+        manifest_path = self.previous_dir/'previous.json'
+        restored = {}
+        if manifest_path.exists():
+            manifest = json_read(manifest_path)
+            require(manifest.get('project') == self.args.project and manifest.get('sandbox') == self.s['name'] and manifest.get('previous_receipt',{}).get('sha256') == digest(self.previous_receipt_bytes),
+                    'the saved previous installation belongs to another receipt; reconcile it first')
+            items = []
+            for key in ('settings','template','profile'):
+                entry = manifest['files'].get(key)
+                if entry is None:
+                    restored[key] = 'none saved; left as it is'
+                    continue
+                data = (self.previous_dir/entry['saved']).read_bytes()
+                require(digest(data) == entry['sha256'], f'the saved copy of {entry["path"]} does not match its recorded hash; reconcile the saved folder')
+                item = {'path':entry['path'],'root':str(PurePosixPath(entry['path']).parent),'data':base64.b64encode(data).decode(),'mode':entry['mode']}
+                items.append(item)
+                restored[key] = {'path':entry['path'],'sha256':entry['sha256']}
+            identity_bytes = (self.previous_dir/'git-identity.json').read_bytes()
+            require(digest(identity_bytes) == manifest['git_identity']['sha256'], 'the saved clone-local git identity does not match its recorded hash; reconcile the saved folder')
+            identity = json.loads(identity_bytes)
+            old_bootstrap = Path(manifest['bootstrap_env']['path'])
+            require(old_bootstrap.is_file() and digest(old_bootstrap.read_bytes()) == manifest['bootstrap_env']['sha256'],
+                    f'the previous release\'s bootstrap env {old_bootstrap} no longer has its recorded hash; the way back would start on other settings, so reconcile it first')
+            source = manifest['profile_source']
+            saved_source = (self.previous_dir/source['saved']).read_bytes()
+            require(digest(saved_source) == source['sha256'], 'the saved producer profile does not match its recorded hash; reconcile the saved folder')
+            self.replacement_started = True
+            self.inside('python3','-c',INSTALL,input=json.dumps(items))
+            values_after = self.set_identity(identity)
+            require(values_after == manifest['git_identity']['values_sha256'], 'the clone-local git identity did not read back as saved; reconcile it')
+            current_source = Path(source['path']).read_bytes()
+            if digest(current_source) == source['after_sha256'] and current_source != saved_source:
+                private_write(Path(source['path']),saved_source,0o644)
+                restored['profile_source'] = 'restored'
+            self.read_back([(item['path'],base64.b64decode(item['data'])) for item in items])
+            bootstrap_hash = manifest['bootstrap_env']['sha256']
+            template_hash = manifest['files']['template']['sha256']
+            restored['git_identity'] = values_after
+        else:
+            # Nothing was saved, so nothing was changed: prove the clone still
+            # holds the previous installation.
+            files = state['files']
+            require(files['template'] and files['template']['sha256'] == previous['template_sha256'] and files['profile'] and files['profile']['sha256'] == previous['profile_sha256'],
+                    'no previous installation was saved and the clone no longer holds the previous template and profile; reconcile by hand')
+            old_bootstrap = Path(previous['bootstrap_env_file'])
+            require(old_bootstrap.is_file(), f'the previous release\'s bootstrap env {old_bootstrap} is missing; reconcile it first')
+            bootstrap_hash = digest(old_bootstrap.read_bytes())
+            template_hash = previous['template_sha256']
+            restored = {'note':'nothing had been changed; the previous installation was verified in place'}
+        self.save('commands-back.json',self.events)
+        self.save('sandbox-restored.json',{
+            'format_version':1,'project':self.args.project,'sandbox':self.s['name'],
+            'restored_release':previous['bootstrap_image_settings'].get('FORGE_RELEASE_VERSION'),
+            'restored_image':previous['bootstrap_image_settings'].get('FORGE_IMAGE'),
+            'template_sha256':template_hash,'bootstrap_env_file':str(old_bootstrap),'bootstrap_env_sha256':bootstrap_hash,
+            'bootstrap_settings_file':self.bootstrap_settings_file(old_bootstrap.read_bytes()),
+            'restored':restored,'compose_supervisor':supervisor,
+            'restored_at':dt.datetime.now(dt.timezone.utc).isoformat(),
+        })
+        self.complete = True
+        print('Put back the previous installation of '+self.s['name']+' (release '+str(previous['bootstrap_image_settings'].get('FORGE_RELEASE_VERSION'))+', template '+template_hash+'); its bootstrap env is unchanged; both old units left as they are.')
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__,formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--config',required=True)
@@ -705,20 +1121,38 @@ def main(argv=None):
     parser.add_argument('--project',required=True)
     parser.add_argument('--secret-env-file',action='append',default=[],help='private literal env input, repeatable; cannot override public names')
     parser.add_argument('--stop-legacy',action='store_true',help='perform the one-time legacy stop, verify, and replacement')
+    parser.add_argument('--upgrade',action='store_true',help='take a new release into a sandbox the containerised supervisor already looks after (its supervisor stopped first)')
+    parser.add_argument('--back',action='store_true',help='with --upgrade: put the saved previous installation back')
+    parser.add_argument('--previous-receipt',help='with --upgrade: the installed sandbox-installed.json')
     parser.add_argument('--plan',action='store_true')
     args = parser.parse_args(argv)
     rollout = None
     try:
+        require(not (args.upgrade and args.stop_legacy), '--upgrade and --stop-legacy are different operations; choose one')
+        require(not args.back or args.upgrade, '--back goes with --upgrade; say --upgrade --back')
         rollout = Rollout(args)
+        if args.upgrade:
+            rollout.validate_upgrade_inputs()
+            if args.plan and args.back:
+                print('Plan only (--upgrade --back): nothing is changed. Would require the Compose sandbox-runner stopped with exit 0 (or removed), no helper or runner container and no live supervisor inside '+rollout.s['name']+', and the previous release image '+rollout.previous['bootstrap_image_settings']['FORGE_IMAGE']+' in its engine by identity; check every copy saved in '+str(rollout.previous_dir)+' against its hash and the previous bootstrap env against its recorded hash; put back the template, profile, settings file and clone-local git identity byte for byte; record sandbox-restored.json. Never sbx stop, sbx ports, sbx policy or systemctl unmask.')
+                return 0
+            if args.plan:
+                rollout.upgrade_plan()
+                return 0
+            if args.back:
+                rollout.execute_back()
+            else:
+                rollout.execute_upgrade()
+            return 0
         if args.plan:
             print('Plan only: remote, systemd, sandbox, image and disk facts are NOT VERIFIED. Would validate profile in the pinned image; record clone, known-file hashes, receipt listing and process diagnostics; empty and prove both runner stop hooks; stop and mask keeper then runner; refuse held sessions; stop only '+rollout.s['name']+'; require positive stopped status; wake with our exec; refuse any running container or legacy process; compare every disk witness; hand in the release with the normal identity helper; write the sandbox settings file at '+str(rollout.settings_path)+' (generated from the coordinator\'s settings, loaded in the image with an empty environment); add sandbox-scoped routes (answer service '+rollout.answer+', memory MCP '+rollout.memory_mcp+'); install the current template byte-for-byte and rewrite producer profile paths/publish rules; remove legacy drop-ins; leave both old units masked and stopped (never unmasked); record evidence.')
             return 0
-        require(args.stop_legacy, 'one-time replacement requires --stop-legacy; inspect --plan before the attended rollout')
+        require(args.stop_legacy, 'one-time replacement requires --stop-legacy (or --upgrade for a sandbox already on the containerised supervisor); inspect --plan before the attended rollout')
         rollout.execute()
         return 0
     except (Refusal,OSError,ValueError,KeyError,TypeError,AttributeError) as exc:
         if rollout and not args.plan:
-            if rollout.replacement_started and not rollout.complete:
+            if rollout.replacement_started and not rollout.complete and not args.upgrade:
                 # A transport/filesystem failure can interrupt a multi-file install;
                 # keep the current lifecycle if present, and fence all starts.
                 for unit in rollout.units.values():
@@ -732,10 +1166,20 @@ def main(argv=None):
                 except (Refusal,OSError):
                     pass
             try:
-                rollout.save('commands-failed.json',rollout.events)
+                if rollout.events or not args.upgrade:
+                    rollout.save('commands-back-failed.json' if args.back else 'commands-failed.json',rollout.events)
             except OSError:
                 pass
         message = str(exc) if isinstance(exc,Refusal) else 'required inventory or evidence is unreadable; inspect the named private config and retain the stopped posture before retrying'
+        if rollout and args.upgrade:
+            if rollout.replacement_started and not rollout.complete:
+                message += ('; the way back was part-way, so run --upgrade --back again once this is fixed' if args.back
+                            else '; the upgrade is part-way: the previous installation is saved in '+str(rollout.previous_dir)+', and --upgrade --back puts it back')
+            elif not args.plan:
+                message += '; nothing in the sandbox was changed'
+            suffix = '' if message.endswith(('?','.','!')) else '.'
+            print('Refusing: '+message.replace('\n',' ')+suffix,file=sys.stderr)
+            return 2
         if rollout and rollout.replacement_started and not rollout.complete:
             message += '; current-template/profile installation may be incomplete, so reconcile the private evidence before unmasking either unit'
         elif rollout and not rollout.replacement_started:
