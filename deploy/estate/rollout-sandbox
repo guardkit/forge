@@ -493,8 +493,10 @@ class Rollout:
         require(valid_version, 'sandbox client or server version/state is not the reviewed running v0.42.1 contract; verify its stopped-status contract first')
         profile = self.profile()  # Parse/validate before touching any unit.
         self.validate_bootstrap_ports(profile)
-        settings = self.inside('test','-r',self.values['FORGE_CONFIG_PATH'],check=False)
-        require(settings.returncode == 0, f'{self.s["name"]} has no readable settings file at FORGE_CONFIG_PATH ({self.values["FORGE_CONFIG_PATH"]}); the sandbox start-up script will not start without it, so put it in the sandbox first. Nothing was changed')
+        settings_path = self.values['FORGE_CONFIG_PATH']
+        is_file = self.inside('test','-f',settings_path,check=False).returncode == 0
+        readable = is_file and self.inside('test','-r',settings_path,check=False).returncode == 0
+        require(readable, f'{self.s["name"]} has no readable settings file (a regular file) at FORGE_CONFIG_PATH ({settings_path}); the sandbox start-up script will not start without it, so put it in the sandbox first. Nothing was changed')
         receipt = self.evidence / 'sandbox-installed.json'
         if receipt.exists():
             previous = json_read(receipt)
