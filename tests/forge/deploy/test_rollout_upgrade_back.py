@@ -111,7 +111,7 @@ def test_a_refusing_sandbox_step_stops_before_release_2_starts_and_says_why(up):
 
 def test_an_immediate_open_without_rc2_refuses_on_the_missing_release_2_receipt(up):
     w = up.world; opened_on_3(up); passing_h6(w); back(up).upgrade_back(); mark = len(w.events)
-    with pytest.raises(r.Refusal, match='estate-check could not complete'):up.estate(V2).open()
+    with pytest.raises(r.Refusal, match="closed-door receipt in .* cannot be acted on"):up.estate(V2).open()
     assert ('read-pre-resume', 'closed-door-release-2', r.RELEASES[V2]['runtime']) in w.events[mark:]
     assert stopped_door(w) and planning(w) is False and not events_since(w, mark, 'up')
     w.write_pre_resume(up.doors[V2], r.RELEASES[V2]['runtime'])   # RC2

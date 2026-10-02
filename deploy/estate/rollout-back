@@ -475,6 +475,9 @@ class Recovery(q.Estate):
 
     def upgrade_back(self):
         q.need(self.upgrade and self.side=='to','--upgrade-back takes the inventory of the release being left (the upgrade block\'s to side)')
+        with r.deadline(q.MODE_LIMITS['upgrade-back'],'--upgrade-back'):return self.upgrade_back_steps()
+
+    def upgrade_back_steps(self):
         self.markers();self.record()
         frm=self.upgrade['from'];release=frm['release']
         previous=self.upgrade.get('sandbox_previous_receipt')
@@ -492,7 +495,11 @@ class Recovery(q.Estate):
             stage='recorded-inputs';self.from_sources_unchanged();self.settings_invariant()
             stage='h6';directory=self.snapshot/('h6-back-'+uuid.uuid4().hex);directory.mkdir(mode=0o700)
             entry=r.RELEASES[release]
-            result['h6']=self.h6(entry['runtime'],directory,schema=entry['schema'],source=other)
+            try:result['h6']=self.h6(entry['runtime'],directory,schema=entry['schema'],source=other)
+            finally:
+                # The record of the proof is what lets release `from` touch this record
+                # again (rollout-quiesce h6_gate); a refusal is recorded too.
+                self.doc.setdefault('back_h6',[]).append({'at':q.now(),'release':release,'passed':'h6' in result,'directory':str(directory)});self.save()
             stage='remove-left-release';result['removed']=self.remove_left_release(release)
             stage='sandbox-back';self.sandbox_back(previous,result['commands'])
             stage='switch';switched=other.switch()

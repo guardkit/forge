@@ -15,9 +15,11 @@ import os
 import posixpath
 from pathlib import Path
 import re
+import signal
 import sqlite3
 import stat
 import subprocess
+import threading
 import uuid
 import sys
 import tempfile
@@ -46,6 +48,45 @@ SUPERVISOR_STOP_SECONDS = 240
 BUS_READY_WAIT_SECONDS = 300
 SANDBOX_START_WAIT_SECONDS = 300
 POLICY_HELPER = Path('/usr/local/libexec/forge-publisher-host-policy')
+# THE TIME LIMIT OF EACH UPGRADE MODE, in seconds (coach's review, 2 October
+# 2026). Each mode bounds every command it runs by what remains of its limit
+# (rollout_support.deadline), so these are true maxima; run-step's own limit for
+# a step must be above them, because run-step ends a step with SIGKILL, after
+# which nothing can shut the door again. --open adds up to 'open-clean-up' to
+# shut the door after a failure. rollout-back --upgrade-back's limit contains its
+# own close, settle, final and switch.
+MODE_LIMITS = {'close':600,'settle':300,'final':900,'switch':1500,'open':600,'open-clean-up':300,'upgrade-back':3300}
+LIMITS_HELP = ('TIME LIMITS of the upgrade modes; each stops itself at its limit, so give run-step a minute more: '
+               '--close 600 s, --settle 300 s, --final 900 s, --switch 1500 s, --open 600 s plus up to 300 s to shut the door again after a failure '
+               '(900 s), rollout-back --upgrade-back 3300 s.')
+# What run.sh's exit code says (deploy/compose/sandbox-runner/run.sh).
+SUPERVISOR_EXITS = {2:'it refused before starting anything (a setting or the sandbox client was missing)',
+                    3:'its stop of the work inside the sandbox did not succeed'}
+# The template's own state for a clone (sandbox-runner.sh: STATE_ROOT is
+# ~/.forge-runner/<sha256 of the clone root>, holding 'supervisor' (pid and start
+# time) and 'lock'). Read-only; the same reading rollout-sandbox --upgrade makes.
+SUPERVISION_CODE = r'''import errno,fcntl,hashlib,json,os,pathlib,sys
+root=os.path.dirname(os.path.dirname(os.path.abspath(sys.argv[1])))
+state=pathlib.Path(os.path.expanduser('~'))/'.forge-runner'/hashlib.sha256(root.encode()).hexdigest()
+record=state/'supervisor';lock=state/'lock';live=False;held=False
+if record.exists():
+ parts=record.read_text().split()
+ if len(parts)>=2 and parts[0].isdigit():
+  try:live=pathlib.Path('/proc/'+parts[0]+'/stat').read_text().rsplit(') ',1)[1].split()[19]==parts[1]
+  except (OSError,IndexError):live=False
+if lock.exists():
+ fd=os.open(lock,os.O_RDONLY)
+ try:
+  try:fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB);fcntl.flock(fd,fcntl.LOCK_UN)
+  except OSError as e:
+   if e.errno not in (errno.EAGAIN,errno.EACCES):raise
+   held=True
+ finally:os.close(fd)
+print(json.dumps({'record_present':record.exists(),'record_live':live,'lock_held':held}))
+'''
+
+class Interrupted(BaseException):
+    """A stop signal arrived while --open was opening the door."""
 # Digests of the coordinator's settings file, never its values (runbook 2.6). The
 # canonical digest leaves out planning.enabled, the one value the tools write;
 # 'rewritten' is the SHA-256 the planning switch's own writer (yaml.safe_dump,
@@ -631,7 +672,7 @@ print(json.dumps(state))
             need(not r.inspect(self.c,item['Id'])['State']['Running'],'gateway-watch is still monitoring the rollout window; stop its exact container before proceeding')
 
     def close(self):
-        if self.upgrade:return self.upgrade_close()
+        if self.upgrade:return self.limited('close',self.upgrade_close)
         marker=self.markers()
         if marker:need(self.phase=='prepared','resumed estate requires prepared inputs; do not access or reopen old state')
         if self.receipt.exists():self.record()
@@ -660,12 +701,15 @@ print(json.dumps(state))
         marker=self.markers()
         if marker:need(self.phase=='prepared','resumed estate requires prepared inputs; do not access or reopen old state')
         self.record();need(self.doc.get('stage') in ('closed','settled','final','resumed'),'admissions closure is not recorded; run --close first')
+        self.h6_gate()
         if self.phase=='prepared':
             self.watch_closed();self.producers_stopped()
         else:
             for role in ('gateway','frontdoor','autobuild','watchdog_timer','watchdog_service'):self.unit_stopped(self.c['units'][role])
             for role in ('watchdog_timer','watchdog_service','autobuild'):need(self.unit(self.c['units'][role])['UnitFileState'] in ('masked','masked-runtime'),f'{role} is not masked; repeat --close')
     def settle(self):
+        return self.limited('settle',self.settle_steps)
+    def settle_steps(self):
         self.closed();observations=[]
         for index in range(2):
             count=self.monitor();quiet_counts(count);state=self.state();need(not work_problems(state),'record still has active work; leave admissions closed and settle the named rows')
@@ -673,7 +717,7 @@ print(json.dumps(state))
             if index==0:time.sleep(20)
         self.doc['observations']+=observations;self.doc['stage']='settled';self.save();return {'settled':observations}
     def final(self):
-        if self.upgrade:return self.upgrade_final()
+        if self.upgrade:return self.limited('final',self.upgrade_final)
         self.closed();need(self.doc['stage'] in ('settled','final'),'two quiet observations are missing; run --settle before stopping writers')
         if self.phase=='original':
             command=[HERE/'rollout-sandbox','--config',self.config_path,'--env-file',self.args.env_file,'--project',self.c['project'],'--stop-legacy']
@@ -926,6 +970,31 @@ d=os.open(p.parent,os.O_DIRECTORY);os.fsync(d);os.close(d);assert p.read_bytes()
     def not_upgrade(self,mode):
         need(not self.upgrade,f'--{mode} belongs to the switch from the old set-up and this is an upgrade inventory; an upgrade uses --close, --settle, --final, --switch and --open')
 
+    def limited(self,mode,function):
+        """Run an upgrade mode inside its own time limit (MODE_LIMITS)."""
+        if not self.upgrade:return function()
+        with r.deadline(MODE_LIMITS[mode],'--'+mode):return function()
+
+    def h6_gate(self):
+        """Once release `to` has been started on this record, release `from` neither runs
+        on it nor reads it until rollout-back --upgrade-back's H6 proof passed after that."""
+        if not self.upgrade or self.side!='from':return
+        to=self.upgrade['to']['release']
+        started=[x['started_at'] for x in self.doc.get('switches',[]) if x.get('release')==to and x.get('started_release')]
+        if not started:return
+        last=max(started)
+        proved=[x for x in self.doc.get('back_h6',[]) if x.get('passed') and x.get('at','')>last]
+        need(proved,f'release {to} was started on this record at {last}, and release {self.release} has not been proved able to handle what it wrote; use rollout-back --upgrade-back with release {to}\'s inventory, whose H6 proof must pass before release {self.release} touches the record. Nothing was changed')
+
+    def own_containers(self,containers):
+        """Only this inventory's own release's containers are ever recorded: a --close must
+        never make another release's containers removable as if they had been recorded."""
+        own={}
+        for identifier,item in containers.items():
+            expected=self.release_images(item['service'])
+            if expected is not None and item['image']==expected:own[identifier]=dict(item,recorded_by=self.release)
+        return own
+
     def upgrade_markers(self):
         """The switch's two resume markers, read from its own snapshot and never written.
 
@@ -1133,15 +1202,31 @@ p=pathlib.Path('/out/current.db');print(json.dumps({'sha256':hashlib.sha256(p.re
         after=r.inspect(self.c,item['Id'])
         need(not after['State'].get('Running'),'sandbox-runner did not stop; nothing else was stopped. Read its log before retrying')
         code=after['State'].get('ExitCode')
-        need(code==0,f'sandbox-runner exited {code}, not 0: its stop of the work inside the sandbox did not succeed, so nothing else was stopped. Read its log and stop the sandbox\'s work before retrying')
-        return {'supervisor':item['Id'],'exit':code}
+        if code==0:return {'supervisor':item['Id'],'exit':0}
+        # Any other exit is accepted only once it is proved that nothing runs inside
+        # the sandbox; otherwise a supervisor that crashed or refused to start would
+        # block every way forward and back for good.
+        meaning=SUPERVISOR_EXITS.get(code,'it ended without its own clean stop (killed or crashed)')
+        inside=self.inside_supervision()
+        busy=inside['containers']+(['a live supervisor process'] if inside['record_live'] else [])+(['the supervisor\'s lock held'] if inside['lock_held'] else [])
+        need(not busy,f'sandbox-runner exited {code}: {meaning}; and inside the sandbox there is still {", ".join(busy)}, so nothing else was stopped. Stop the bootstrap\'s work inside the sandbox (its stop word, as the supervisor\'s log says), then run this step again')
+        return {'supervisor':item['Id'],'exit':code,'meaning':meaning,'accepted_because':'nothing runs inside the sandbox: no helper or runner container, no live supervisor and no held lock','inside':inside}
+
+    def inside_supervision(self):
+        facts=self.sandbox_facts()
+        wanted={facts['prefix']+'-helper',facts['prefix']+'-runner'}
+        names=sorted(x for x in self.sbx('exec',facts['name'],'docker','ps','--all','--format','{{.Names}}').stdout.split() if x in wanted)
+        state=json.loads(self.sbx('exec',facts['name'],'python3','-c',SUPERVISION_CODE,facts['script']).stdout)
+        need(isinstance(state,dict) and all(type(state.get(k)) is bool for k in ('record_live','lock_held')),'the sandbox did not say whether its supervisor still runs; look inside it')
+        return {'containers':names,'record_live':state['record_live'],'lock_held':state['lock_held'],'record_present':bool(state.get('record_present'))}
 
     def upgrade_close(self):
         self.markers()
         need(self.snapshot.is_dir() and not self.snapshot.is_symlink(),'the upgrade snapshot folder does not exist; the preparation step creates it')
-        containers=self.project_containers()
-        if self.receipt.exists():
-            self.record()
+        containers=self.own_containers(self.project_containers())
+        again=self.receipt.exists()
+        if again:
+            self.record();self.h6_gate()
             known=self.doc.setdefault('containers',{})
             for identifier,item in containers.items():known.setdefault(identifier,item)
             self.save()
@@ -1159,6 +1244,9 @@ p=pathlib.Path('/out/current.db');print(json.dumps({'sha256':hashlib.sha256(p.re
                       'sandbox':{self.release:sandbox} if sandbox else {},'stage':'recorded','observations':[]}
             self.save()
         self.watch_closed(stop=True);self.stop_current(PRODUCERS)
+        # A later close may follow an open that was cut off (run-step's SIGKILL leaves
+        # the door open and planning on); it leaves the door shut AND planning off.
+        if again:self.planning(False)
         self.doc['stage']='closed';self.doc['closed_phase']='prepared';self.save()
         return {'closed':True,'receipt':str(self.receipt),'recorded_containers':len(self.doc['containers']),'notice':'No session may run forge queue until this upgrade opens the door again.'}
 
@@ -1231,25 +1319,39 @@ p=pathlib.Path('/out/current.db');print(json.dumps({'sha256':hashlib.sha256(p.re
     def switch(self):
         """Bring this inventory's release up with the door shut and planning off (TC2)."""
         need(self.upgrade,'--switch belongs to an upgrade inventory; this one has no upgrade block')
-        self.markers();self.record()
+        return self.limited('switch',self.switch_run)
+
+    def switch_run(self):
+        self.markers();self.record();self.h6_gate()
         if self.side=='to':need(self.doc.get('stage')=='final',f'release {self.release} is brought up only after --final stopped release {self.upgrade["from"]["release"]}; run --final with that inventory first')
         else:need(self.doc.get('stage') in ('closed','settled','final'),'the door is not recorded shut; run --close first')
         result={'format_version':1,'release':self.release,'started_at':now(),'passed':False,'commands':[]}
         destination=private_path(self.snapshot/('switched-'+self.release+'.json'))
+        # Recorded before anything starts and saved again the moment this release's
+        # first container starts, so even a switch cut off by SIGKILL is on record.
+        self._switch_entry={'release':self.release,'started_at':result['started_at'],'passed':None,'started_release':False}
+        self.doc.setdefault('switches',[]).append(self._switch_entry);self.save()
         self._diagnostic_events=result['commands'];self._diagnostic_stage='switch-preflight'
         try:
             self.switch_steps(result);result['passed']=True
+            # The stage says what runs now: a later --switch to the other release needs
+            # its own --close, --settle and --final again first.
+            self.doc['stage']='switched';self.doc['switched_release']=self.release
         except Exception as exc:
             result['failure']={'stage':self._diagnostic_stage,'reason':self.sanitize(str(exc))};raise
         finally:
             self._diagnostic_events=None;result['finished_at']=now();r.atomic_json(destination,result)
-            self.doc.setdefault('switches',[]).append({k:result.get(k) for k in ('release','started_at','finished_at','passed','bus_ready')});self.save()
+            self._switch_entry.update({k:result.get(k) for k in ('finished_at','passed','bus_ready')});self.save()
         return result
 
     def switch_steps(self,result):
         def stage(name):self._diagnostic_stage=name
         since=datetime.now(timezone.utc)
         stage('door-shut');self.watch_closed();self.producers_stopped()
+        # A cancel before --final restarts a coordinator that is still running: never
+        # under active work. After --final the record was already proved quiet.
+        stage('active-work');problems=work_problems(self.state())
+        need(not problems,'the record shows active work ('+', '.join(sorted({x['table'] for x in problems}))+'), and --switch restarts the coordinator; let it finish with the door shut (--settle passes once it has), then run --switch again. Nothing was started')
         stage('render');model=self.model();self.check_release_images(model)
         policy=load_script('publisher-host-policy')
         policy.validate_declared(model,policy.binding(self.c['project']),r.path(self.values['FORGE_PUBLISHER_SETTINGS_FILE']))
@@ -1267,10 +1369,13 @@ p=pathlib.Path('/out/current.db');print(json.dumps({'sha256':hashlib.sha256(p.re
             expected=self.release_images(item['service'])
             if expected is None or item['image']==expected:continue
             live=r.inspect(self.c,identifier)
-            need(not live['State'].get('Running'),f'{item["service"]} is running on another release\'s image; to leave a release that is running, use rollout-back --upgrade-back. Nothing was started')
-            need(identifier in recorded,f'{item["service"]} container {identifier[:12]} is on another release and was not recorded at --close; leave it and reconcile. Nothing was started')
+            need(not live['State'].get('Running'),f'{item["service"]} is running on another release\'s image; '+('to leave release '+self.upgrade['to']['release']+' while it runs, use rollout-back --upgrade-back' if self.side=='from' else 'stop release '+self.upgrade['from']['release']+' first with its --close, --settle and --final')+'. Nothing was started')
+            other=self.upgrade['to' if self.side=='from' else 'from']['release']
+            need(identifier in recorded,f'{item["service"]} container {identifier[:12]} is on release {other} and no --close recorded it'
+                 +(', so it ran after the upgrade began: go back with rollout-back --upgrade-back. ' if self.side=='from' else f'; run --close with release {other}\'s inventory so its containers are recorded. ')+'Nothing was started')
             r.docker(self.c,'rm',identifier);removed.append(identifier)
         result['removed']=removed
+        self._switch_entry['started_release']=True;self.save()
         stage('bus-ready');ready=self.run_bus_ready(since);result['bus_ready']={k:ready[k] for k in ('id','started_at','finished_at')}
         stage('closed-door-start');items=self.closed_door_items(model)
         starting=[s for s in LONG_RUNNING if s in model['services'] and s not in ('coordinator',SUPERVISOR) and not (items.get(s) and items[s]['State'].get('Running') and items[s]['Image']==self.release_images(s))]
@@ -1296,7 +1401,10 @@ p=pathlib.Path('/out/current.db');print(json.dumps({'sha256':hashlib.sha256(p.re
     def open_door(self):
         """Open the door on this release; nothing is started before its closed-door receipt passes."""
         need(self.upgrade,'--open belongs to an upgrade inventory; this one has no upgrade block')
-        self.markers();self.record()
+        with r.deadline(MODE_LIMITS['open'],'--open'):return self.open_steps()
+
+    def open_steps(self):
+        self.markers();self.record();self.h6_gate()
         switched=[x for x in self.doc.get('switches',[]) if x.get('release')==self.release and x.get('passed')]
         need(switched,f'release {self.release} has not been brought up with the door shut; run --switch for it first. Nothing was started')
         since=datetime.fromisoformat(switched[-1]['started_at'])
@@ -1309,10 +1417,15 @@ p=pathlib.Path('/out/current.db');print(json.dumps({'sha256':hashlib.sha256(p.re
             counts=self.monitor();quiet_counts(counts);need(not work_problems(self.state()),'record has active work with the door shut; leave it shut and settle the named rows')
             if index==0:time.sleep(20)
         need(self.c['docker_context']=='default','publisher resume requires the supported local default Docker context')
-        r.run([HERE/'estate-check','--read-pre-resume','--env-file',self.args.env_file,'--project',self.c['project'],'--for-image',self.entry['runtime']],env=self.env)
+        self.closed_door_receipt()
         need(self.values.get('ROLLOUT_STATE_DIR')==str(self.closed_door),'the closed-door receipt is not in this release\'s own folder; bind ROLLOUT_STATE_DIR to closed_door_dir')
         result={'format_version':1,'release':self.release,'started_at':now(),'services_check':None,'factory_hello':None,'passed':False,'commands':[],'markers':'untouched'}
         destination=private_path(self.snapshot/('opened-'+self.release+'.json'))
+        # A stop signal (or Ctrl-C) while the door is opening must still shut it again.
+        # SIGKILL cannot be caught: run-step's limit must be above MODE_LIMITS.
+        main=threading.current_thread() is threading.main_thread()
+        def interrupted(signum,frame):raise Interrupted(f'signal {signum}')
+        previous=signal.signal(signal.SIGTERM,interrupted) if main else None
         self._diagnostic_events=result['commands'];self._diagnostic_stage='planning-enable'
         try:
             self.planning(True);self._diagnostic_stage='coordinator-recreate';self.compose('up','--no-deps','-d','--force-recreate','coordinator')
@@ -1321,13 +1434,36 @@ p=pathlib.Path('/out/current.db');print(json.dumps({'sha256':hashlib.sha256(p.re
             self.captured([HERE/'estate-check','services','--env-file',self.args.env_file,'--project',self.c['project']],'estate-check services',result['commands'],env=self.env);result['services_check']='passed'
             self.captured([HERE/'factory-hello','--env-file',self.args.env_file,'--project',self.c['project']],'factory-hello',result['commands'],env=self.env);result['factory_hello']='completed'
             self._diagnostic_stage='gateway-watch-start';self.compose('--profile','watch','up','--no-deps','-d','gateway-watch');result['passed']=True
-        except Exception as exc:
-            result['failure']={'stage':result['commands'][-1]['stage'] if result['commands'] else self._diagnostic_stage,'reason':self.sanitize(str(exc))}
-            self._diagnostic_events=None;result['cleanup']=self.shut_again()
+            self.doc['stage']='opened';self.doc['opened_release']=self.release;self.save()
+        except BaseException as exc:
+            ignored={}
+            if main:ignored={number:signal.signal(number,signal.SIG_IGN) for number in (signal.SIGTERM,signal.SIGINT)}
+            try:
+                result['failure']={'stage':result['commands'][-1]['stage'] if result['commands'] else self._diagnostic_stage,'reason':self.sanitize(str(exc) or type(exc).__name__)}
+                self._diagnostic_events=None
+                with r.deadline(MODE_LIMITS['open-clean-up'],'--open clean-up',replace=True):result['cleanup']=self.shut_again()
+            finally:
+                for number,handler in ignored.items():signal.signal(number,handler)
+            if isinstance(exc,Interrupted):
+                raise r.Refusal('--open was stopped by a signal while it opened the door; the producers and the watch were stopped again and planning set off as opened-'+self.release+'.json records') from None
             raise
         finally:
+            if main and previous is not None and signal.getsignal(signal.SIGTERM) is interrupted:signal.signal(signal.SIGTERM,previous)
             self._diagnostic_events=None;result['finished_at']=now();r.atomic_json(destination,result)
         return result
+
+    def closed_door_receipt(self):
+        """This release's closed-door receipt must pass estate-check's own reader. Its
+        words are kept privately when it does not, and the refusal says where."""
+        events=[]
+        try:
+            self.captured([HERE/'estate-check','--read-pre-resume','--env-file',self.args.env_file,'--project',self.c['project'],'--for-image',self.entry['runtime']],'closed-door receipt',events,env=self.env)
+        except Exception:
+            diagnostic=private_path(self.snapshot/('open-refused-'+self.release+'.json'))
+            r.atomic_json(diagnostic,{'format_version':1,'release':self.release,'at':now(),'closed_door_dir':str(self.closed_door),'commands':events})
+            said=[line.strip() for line in (events[-1].get('stderr','') if events else '').splitlines() if line.strip()]
+            r.refuse(f'release {self.release}\'s closed-door receipt in {self.closed_door} cannot be acted on'+(f' (estate-check: {said[-1][:300]})' if said else '')
+                     +f'; its words are kept in {diagnostic}. Nothing was started. With the producers stopped and this release up, write it with this release\'s env: estate-check --pre-resume --for-image {self.entry["runtime"]}, then --read-pre-resume, then run --open again')
 
     def shut_again(self):
         """After a failed open: producers and watch stopped, planning off, each said separately."""
@@ -1359,7 +1495,7 @@ p=pathlib.Path('/out/current.db');print(json.dumps({'sha256':hashlib.sha256(p.re
         return result
 
 def arguments(argv=None,back=False):
-    p=r.Parser(description=__doc__);p.add_argument('--config',required=True);p.add_argument('--env-file',required=True);p.add_argument('--project',required=True);p.add_argument('--snapshot',required=True);p.add_argument('--secret-env-file',action='append',default=[]);p.add_argument('--plan',action='store_true')
+    p=r.Parser(description=__doc__,epilog=LIMITS_HELP);p.add_argument('--config',required=True);p.add_argument('--env-file',required=True);p.add_argument('--project',required=True);p.add_argument('--snapshot',required=True);p.add_argument('--secret-env-file',action='append',default=[]);p.add_argument('--plan',action='store_true')
     if not back:
         modes=p.add_mutually_exclusive_group(required=True)
         for mode in ('close','settle','final','switch','open','resume','reopen'):modes.add_argument('--'+mode,action='store_const',const=mode,dest='mode')
