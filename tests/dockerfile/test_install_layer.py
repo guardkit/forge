@@ -1013,6 +1013,9 @@ def test_the_runtime_image_carries_the_pinned_compose_plugin() -> None:
     version = re.search(r"^ARG\s+DOCKER_COMPOSE_VERSION=(\S+)", dockerfile, re.MULTILINE)
     digest = re.search(r"^ARG\s+DOCKER_COMPOSE_SHA256=([0-9a-f]{64})\s*$", dockerfile, re.MULTILINE)
     assert version and digest, "the compose plugin's version and sha256 must be pinned in ARGs"
+    assert version.group(1) == "5.5.0", "the plugin must match the sandboxes' Compose version"
+    assert digest.group(1) == "ff42489f5a9b879d5d117c5ffea6defc27390b3286da8ad52cbc9c6ab5df590e", (
+        "the sha256 must be the one Docker publishes for docker-compose-linux-aarch64 v5.5.0")
     assert "/usr/local/lib/docker/cli-plugins/docker-compose" in dockerfile
     assert 'sha256sum --check --strict' in dockerfile.split("DOCKER_COMPOSE_SHA256=", 1)[1]
 
