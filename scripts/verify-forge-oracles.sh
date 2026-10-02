@@ -534,5 +534,11 @@ for daemon in dockerd containerd containerd-shim-runc-v2 runc ctr docker-proxy d
 done
 '
 echo "  OK  docker      no daemon, shim or runtime in the image — the client only"
+COMPOSE_IN_IMAGE="$(docker run --rm --entrypoint docker "${IMAGE}" compose version)"
+[ -n "${COMPOSE_IN_IMAGE}" ] || {
+    echo "FAILED: docker compose in ${IMAGE} printed no version: a project suite that brings a stack up with docker compose would fail in the build runner (2 October 2026)." >&2
+    exit 1
+}
+echo "  OK  compose     the compose plugin answers in the image (${COMPOSE_IN_IMAGE}), for a project's own suite or deploy"
 
 echo "forge oracle verification PASSED for ${IMAGE}"

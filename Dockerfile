@@ -312,6 +312,22 @@ RUN curl -fsSL "https://download.docker.com/linux/static/stable/aarch64/docker-$
     && test ! -e /usr/local/bin/containerd \
     && test ! -e /usr/local/bin/runc
 
+# 2 October 2026: the Compose plugin too. A project's own test suite may bring a
+# whole stack up with `docker compose` (api_test's round-trip smoke does), and
+# the build runner runs that suite in this image against the sandbox's engine.
+# Without the plugin `docker compose` is "unknown command", that test can never
+# pass, and the build's checker rejected every task of the first live feature on
+# 2 October. One static plugin binary, pinned to the version the sandboxes run
+# and verified against the sha256 Docker publishes for it; still no daemon.
+ARG DOCKER_COMPOSE_VERSION=5.5.0
+ARG DOCKER_COMPOSE_SHA256=ff42489f5a9b879d5d117c5ffea6defc27390b3286da8ad52cbc9c6ab5df590e
+RUN mkdir -p /usr/local/lib/docker/cli-plugins \
+    && curl -fsSL "https://github.com/docker/compose/releases/download/v${DOCKER_COMPOSE_VERSION}/docker-compose-linux-aarch64" \
+        -o /usr/local/lib/docker/cli-plugins/docker-compose \
+    && echo "${DOCKER_COMPOSE_SHA256}  /usr/local/lib/docker/cli-plugins/docker-compose" | sha256sum --check --strict - \
+    && chmod 0755 /usr/local/lib/docker/cli-plugins/docker-compose \
+    && docker compose version | grep -q "${DOCKER_COMPOSE_VERSION}"
+
 # 2026-08-15 — HISTORICAL REASON, LIVE PACKAGE. guardkit deleted the DCL spec
 # track outright (guardkit b138d92c) and forge's W1-S2 leg went with it, so
 # nothing shells the vendored checker any more. ``nodejs`` and the flag below

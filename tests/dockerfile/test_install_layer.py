@@ -1003,3 +1003,16 @@ def test_healthz_port_dockerfile_match() -> None:
 # placeholder kept so a future contributor sees the intent rather than
 # silently dropping the import.)
 _ = os.name
+
+
+def test_the_runtime_image_carries_the_pinned_compose_plugin() -> None:
+    """2 October 2026: a project's suite ran `docker compose` in the build runner
+    and the image had only the bare client, so every task was rejected."""
+    import pathlib, re
+    dockerfile = (pathlib.Path(__file__).resolve().parents[2] / "Dockerfile").read_text()
+    version = re.search(r"^ARG\s+DOCKER_COMPOSE_VERSION=(\S+)", dockerfile, re.MULTILINE)
+    digest = re.search(r"^ARG\s+DOCKER_COMPOSE_SHA256=([0-9a-f]{64})\s*$", dockerfile, re.MULTILINE)
+    assert version and digest, "the compose plugin's version and sha256 must be pinned in ARGs"
+    assert "/usr/local/lib/docker/cli-plugins/docker-compose" in dockerfile
+    assert 'sha256sum --check --strict' in dockerfile.split("DOCKER_COMPOSE_SHA256=", 1)[1]
+
