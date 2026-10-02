@@ -10,11 +10,13 @@ shares. It prints the address it bound to on one line so that whatever
 started it can find the port when the kernel picked one, and then serves
 until it is stopped.
 
-IT REFUSES TO START (2 October 2026) unless its start-up self-check passes:
-its credential file is readable by its own user alone, and it is attached to
-exactly one network besides loopback (its own; never the host's). Its health
-route then reports ``"self_check": "passed"``, which is what the coordinator
-asks before publication can switch on.
+IT REFUSES TO START (2 October 2026) unless its self-check passes: the
+credential file is a regular file owned by the publisher's UID with no group or
+other access, and it has exactly one network interface besides loopback. The
+health route runs the check again on every request and reports
+``"self_check": "passed"`` only then; the coordinator asks that before
+publication can switch on. What the check does NOT prove is written at
+:func:`why_it_will_not_start`.
 
 IT PRINTS NO CREDENTIAL, and it cannot: the only thing it holds is a
 :class:`~forge.publisher.credential.Credential`, which shows itself as
@@ -47,15 +49,24 @@ THE_INTERFACES = Path("/sys/class/net")
 def why_it_will_not_start(
     settings: PublisherSettings, *, interfaces: Path = THE_INTERFACES
 ) -> str | None:
-    """The start-up self-check. ``None`` when it passes, else why not.
+    """The self-check. ``None`` when it passes, else why not.
 
-    Two things, and the publisher does not start without both:
+    Run at start (the publisher does not start without it) and again on every
+    health-route request, so "passed" is never an old answer.
 
-    * its credential file is a file owned by its own user, which nobody else
-      can read or write;
-    * it is attached to exactly ONE network besides loopback. Host networking
-      shows the host's interfaces here, so it fails; so does a second network.
-      Which network that one is, is fixed by the compose file.
+    WHAT IT PROVES, and no more:
+
+    * the credential file is a regular file owned by the publisher's UID with
+      no group or other access;
+    * the publisher has exactly one network interface besides loopback.
+
+    WHAT IT DOES NOT PROVE. Several estate containers and the host login share
+    UID 1000, so "its own UID" is not "the publisher only": another container
+    running as that UID and given the same file could read it. One interface
+    does not say WHICH network that is or who else is on it (a host with a
+    single interface would also pass). Network membership and reachability
+    are checked by ``publisher-host-policy verify`` and by estate-check (items
+    7c and 8g); publication does not depend on those checks.
     """
     where = Path(settings.credential_file).expanduser()
     try:
@@ -84,8 +95,8 @@ def why_it_will_not_start(
         return f"its network interfaces could not be listed ({type(exc).__name__})"
     if len(names) != 1:
         return (
-            f"it is attached to {len(names)} networks, not exactly its own one "
-            "(host networking, or another network added beside its own)"
+            f"it has {len(names)} network interfaces besides loopback, not "
+            "exactly one"
         )
     return None
 
@@ -123,7 +134,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"the publisher will not start: {refused}", file=sys.stderr)
         return 2
     publisher = Publisher(settings)
-    publisher.passed_its_self_check = True
+    publisher.self_check = lambda: why_it_will_not_start(settings)
     logger.info("publisher: settings %s", json.dumps(settings.without_secrets()))
     if not publisher.holds_a_credential:
         logger.warning(

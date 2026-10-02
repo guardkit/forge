@@ -9,17 +9,27 @@ these holds:
    coordinator's, the runner's launch list or any sandbox's. Read here, from
    the settings. A credential file that is not named at all is a refusal, not
    a pass: with no path there is nothing to search for;
-3. **the publisher passed its start-up self-check** — it refuses to start
-   unless its credential file is readable by its own user alone and it is
-   attached to exactly one network (its own, never the host's). The
-   coordinator asks the publisher's health route, which reports the check
+3. **the publisher passed its self-check** — the credential file is a regular
+   file owned by the publisher's UID with no group or other access, and the
+   publisher has exactly one network interface besides loopback. It will not
+   start without that, and its health route runs the check again on every
+   request; the coordinator asks that route
    (:func:`forge.pipeline.publisher_client.the_publishers_self_check`).
 
-SIMPLER THAN IT WAS (2 October 2026). This used to ask five questions only the
-real machine could answer, filled in by a separate check that wrote a file the
-coordinator read and that went out of date after a day or any restart. The
-publisher now checks the two facts that matter about itself when it starts,
-and will not start without them.
+WHAT THIS NO LONGER PROVES (2 October 2026). It replaced a separate check
+(``estate-check --publication-facts``) whose written answers expired. That
+check looked at things this one does not, and publication no longer depends
+on them: whether a sandbox can reach the coordinator's settings or the ledger;
+whether any other container mounts the credential file; which containers are
+on the publisher's network and whether a sandbox can reach the publisher; and
+that the answers were fresh. The self-check also has limits of its own:
+several estate containers and the host login share UID 1000, so "owned by the
+publisher's UID" is not "readable by the publisher only"; one interface does
+not say which network it is or who else is on it. Network membership and
+reachability are still checked by ``publisher-host-policy verify`` and by
+estate-check items 7c and 8g, but publication does not wait on them. The
+sandbox's git export the publisher reads from is unauthenticated and readable
+by anything that can reach the gateway address.
 
 IT FAILS CLOSED. A publisher that cannot be asked is not a pass: the answer is
 "unknown", and unknown keeps publication off with the reason said.
@@ -203,9 +213,9 @@ def _the_credential_is_named_in_no_other_settings(true: WhatIsTrue) -> Answer:
 def _the_publisher_passed_its_self_check(true: WhatIsTrue) -> Answer:
     name = "the-publisher-passed-its-self-check"
     question = (
-        "did the publisher start only after finding its credential file "
-        "readable by its own user alone, and itself on exactly its own "
-        "network?"
+        "does the publisher find its credential file owned by its own UID "
+        "with no group or other access, and itself with exactly one network "
+        "interface besides loopback?"
     )
     passed = true.machine.the_publisher_passed_its_self_check
     if passed is None:
@@ -223,9 +233,10 @@ def _the_publisher_passed_its_self_check(true: WhatIsTrue) -> Answer:
             name,
             question,
             False,
-            "the publisher is running without having passed its start-up "
-            "self-check, so it is not known that its credential is its own "
-            "and that only its own network reaches it",
+            "the publisher is running without having passed its "
+            "self-check (its credential file owned by its own UID with no "
+            "group or other access, and one network interface besides "
+            "loopback)",
         )
     return Answer(
         name,
