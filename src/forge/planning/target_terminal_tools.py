@@ -493,7 +493,7 @@ def shallow_discover_test_roots(repo_path: Path | str) -> list[str]:
 def discover_test_roots_from_listing(paths: Sequence[str]) -> list[str]:
     """The test roots of a repository known only by its tracked-file listing.
 
-    For a repository read through its sandbox helper (release -3 item 10,
+    For a repository read through its sandbox helper (the 1 October planner fix,
     1 October 2026) there is no checkout here for the discovery above to
     walk, and it used to answer ``[]`` in silence. Rather than re-implement
     the discovery's rules over strings, this lays the listing out as an empty

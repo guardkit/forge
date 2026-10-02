@@ -472,10 +472,10 @@ def compose_merge_executor_deps(
 ) -> Any:
     """The merge press's deps, as the coordinator's merge-word listener has them.
 
-    RELEASE -3, TC8: the press is given the machine's answers for publication
+    THE GITHUB PUBLISHING GATE (2 October 2026): the press is given the machine's answers for publication
     as a READER, :func:`~forge.pipeline.publication_facts.read_publication_facts`,
     which the press calls on every merge word. With
-    ``FORGE_PUBLICATION_FACTS_FILE`` unset (every estate before release -3)
+    ``FORGE_PUBLICATION_FACTS_FILE`` unset (every estate before 2 October 2026)
     the reader answers ``None`` — exactly what this listener passed before —
     so publication stays off, as it always has; with it set, the facts
     ``estate-check --publication-facts`` wrote are read at each merge word and

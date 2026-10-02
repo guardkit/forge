@@ -1,6 +1,6 @@
-"""The merge press reads the machine's answers on EVERY merge word (TC8).
+"""The merge press reads the machine's answers on EVERY merge word (the GitHub publishing gate, 2 October 2026).
 
-The press's deps are built once, when the coordinator starts. Release -3 gives
+The press's deps are built once, when the coordinator starts. 2 October 2026 gives
 them a READER of the facts ``estate-check --publication-facts`` wrote, rather
 than a value, and the press calls it at each merge word. So:
 

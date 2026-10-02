@@ -1,6 +1,6 @@
 """Say what the next merge word would decide about publication.
 
-Release -3, TC8. Run inside the coordinator's container::
+The GitHub publishing gate (2 October 2026). Run inside the coordinator's container::
 
     docker exec <coordinator> python -m forge.pipeline.publication_status
 

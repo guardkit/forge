@@ -39,7 +39,7 @@ the honest split, and it is written here rather than left to be discovered:
   readability half of question 6. Each of those is a fact about mounts, users
   and networks that no amount of reading a settings file establishes. They
   are asked of :class:`WhatTheMachineSays`: a thing that reports what
-  somebody looked at. Since release -3 the coordinator gets one from the
+  somebody looked at. Since 2 October 2026 the coordinator gets one from the
   record ``estate-check --publication-facts`` writes after looking, read at
   every merge word (:mod:`forge.pipeline.publication_facts`). With no such
   record — or one that is stale, or for another coordinator — every one of
@@ -101,7 +101,7 @@ class WhatTheMachineSays:
     looked_at_by: str | None = None
 
     #: WHY NOBODY HAS LOOKED, when a reader of the machine's answers found
-    #: nothing it could act on (release -3, TC8): no facts file, a file
+    #: nothing it could act on (2 October 2026, the GitHub publishing gate): no facts file, a file
     #: written before this coordinator started, for another coordinator, too
     #: old, or not the record the check writes. Every answer above is then
     #: ``None``, the check refuses as it always has, and this reason is said

@@ -390,7 +390,7 @@ class TestTheWrapperRefusesInOneSentence:
         assert systemctl == []
 
 class TestTheWrapperLeavesTheComposeSupervisorAlone:
-    """Release -3 TC6 (b): a hand-run wrapper must not start the host units on a
+    """1 October 2026: a hand-run wrapper must not start the host units on a
     machine whose estate looks after the sandbox with its Compose supervisor
     (the runner unit's stop step would end that supervisor and both of the
     factory's containers, then restart against it every five seconds)."""

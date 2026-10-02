@@ -374,7 +374,7 @@ async def maybe_gate_build(
         wave_total=1,
     )
     # The card the person taps says, in plain words, when the plan behind
-    # this build was written without the repository (release -3 item 10):
+    # this build was written without the repository (the 1 October planner fix):
     # the planning run recorded the line on its approved plan.
     reasoning_model_call = degraded_dispatch_gate_model
     reader = getattr(sqlite_pool, "read_planning_repository_unavailable", None)

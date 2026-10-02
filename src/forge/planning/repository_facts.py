@@ -17,7 +17,7 @@ the file it lands in. It says only what it can prove: a file that is not
 Python is named with its routes and the sentence "whether those routes
 require authentication was not read", never a guess.
 
-WIDENED (1 October 2026, release -3 item 10). On 1 October the planner's
+WIDENED (1 October 2026, the 1 October planner fix). On 1 October the planner's
 checker let through an invented ``is_deleted`` column and its migration,
 although the repository already soft-deletes its users with ``deleted_at``.
 Routes alone could never have said so. The sheet now also names the data

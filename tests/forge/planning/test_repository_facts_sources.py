@@ -1,6 +1,6 @@
 """Where the planner's fact sheet reads the repository, what it says about the
 data models and migrations a request touches, and what it says when it cannot
-read the repository at all (release -3 item 10, 1 October 2026).
+read the repository at all (the 1 October planner fix, 1 October 2026).
 
 On 1 October the containerised coordinator had no checkout at its
 ``repo_path``; the sheet, built never to raise, quietly said nothing, and the
@@ -346,7 +346,7 @@ def test_a_non_python_repository_yields_only_provable_facts(tmp_path: Path) -> N
 
 # ---------------------------------------------------------------------------
 # The plan-writer's repository inventory and the search for the
-# specification's words go the same way (release -3 item 10, follow-up). On
+# specification's words go the same way (the 1 October planner fix, follow-up). On
 # 1 October both read the coordinator's missing checkout and went quiet:
 # "planning without the repository inventory".
 # ---------------------------------------------------------------------------
@@ -437,7 +437,7 @@ async def test_the_plan_writer_is_told_when_only_the_descriptor_could_not_read(h
 
 
 # ---------------------------------------------------------------------------
-# The coach's findings (release -3 item 10, fix pass)
+# The coach's findings (the 1 October planner fix, fix pass)
 # ---------------------------------------------------------------------------
 
 import contextlib  # noqa: E402

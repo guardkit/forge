@@ -739,7 +739,7 @@ reader the bus does not hold is a **refusal** here and never a nought.
 
 ## What only the machine can say about publication — `estate-check --publication-facts`
 
-Added in release -3. Publication (the merge word sending the joined commit to
+Added in 2 October 2026. Publication (the merge word sending the joined commit to
 the project's remote, then deploying) is on only when the coordinator's
 `publication.enabled` setting is true **and** every condition of the activation
 check holds. Five of those answers are facts about this machine that no

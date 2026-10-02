@@ -163,7 +163,7 @@ class SidecarCodeReader:
 
     A :class:`~forge.planning.repository_facts.RepositoryReader`. It rides
     the same address, repository key and HTTP seam as the
-    :class:`SidecarGitRunner` that builds it (release -3 item 10, 1 October
+    :class:`SidecarGitRunner` that builds it (the 1 October planner fix, 1 October
     2026).
 
     NEVER A PARTIAL ANSWER AS A WHOLE ONE, NEVER WHAT WAS READ THROWN AWAY.

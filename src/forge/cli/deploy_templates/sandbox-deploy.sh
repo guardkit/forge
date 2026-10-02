@@ -344,7 +344,7 @@ run_deploy_inside() {
 }
 
 # --- step 3, first: who looks after this sandbox? ---------------------------
-# (Release -3 upgrade design, 2.4 and TC6, 1 October 2026.) On a machine whose
+# (1 October 2026.) On a machine whose
 # estate runs the sandbox's supervisor as a Compose container, the two host
 # units must never start: the runner unit's stop step would end the LIVE
 # Compose supervisor (its process record names the same script), take both of

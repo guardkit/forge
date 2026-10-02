@@ -20,7 +20,7 @@
 #                                 publication needs and only the machine can
 #                                 answer, and write what was found where the
 #                                 coordinator reads it at each merge word
-#                                 (release -3, TC8)
+#                                 (2 October 2026, the GitHub publishing gate)
 #
 # Each item prints ONE plain sentence saying what was looked for, where, and
 # what to do about it. Anything that is not a pass — a failure, or an item this
@@ -1938,12 +1938,12 @@ check_read_pre_resume() {
 }
 
 # ---------------------------------------------------------------------------
-# THE MACHINE'S ANSWERS FOR PUBLICATION (release -3, TC8).
+# THE MACHINE'S ANSWERS FOR PUBLICATION (2 October 2026, the GitHub publishing gate).
 #
 # WHY THIS EXISTS. Publication is on only when the coordinator's setting says
 # so AND every condition of the activation check holds. Four of those
 # conditions, and half of a fifth, are facts about mounts, networks and users
-# that no settings file can establish, and until release -3 nothing gave the
+# that no settings file can establish, and until 2 October 2026 nothing gave the
 # coordinator an answer to them — so publication could never switch on. This
 # mode LOOKS, and writes what it found where the coordinator reads it at each
 # merge word. Nobody's word stands in for the look: every answer below comes

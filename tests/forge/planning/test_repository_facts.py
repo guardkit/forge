@@ -103,7 +103,7 @@ def test_a_non_python_file_is_named_but_not_guessed_about(tmp_path: Path) -> Non
 
 def test_nothing_here_can_raise(tmp_path: Path) -> None:
     """Never raises — and since 1 October 2026 a missing checkout is SAID,
-    not passed off as "nothing to say" (release -3 item 10)."""
+    not passed off as "nothing to say" (the 1 October planner fix)."""
     sheet = what_the_repository_already_does(str(tmp_path / "missing"), SENTENCE)
     assert sheet is not None
     assert sheet.startswith("Repository facts unavailable: there is no checkout at ")

@@ -1204,7 +1204,7 @@ def bind_production_serve(config: ServeConfig, forge_config: ForgeConfig) -> Non
     # on, or that it is off and which condition failed. It decides nothing and
     # sends nothing — the press asks again, and that answer is what governs.
     say_where_publication_stands_at_boot(forge_config)
-    # RELEASE -3, TC8: and whether the machine's answers for publication are
+    # THE GITHUB PUBLISHING GATE (2 October 2026): and whether the machine's answers for publication are
     # there and fresh. At boot they never are — a record cannot be newer than
     # a start that came after it — so this line says what to run, rather than
     # leaving it to be found at the first merge word.

@@ -369,7 +369,7 @@ class TestPauseEmitsDualEnvelopeInOrder:
 
 
 # ---------------------------------------------------------------------------
-# Release -3 item 10 — the build gate card says when the plan was written
+# the 1 October planner fix — the build gate card says when the plan was written
 # without the repository. The planning run's approved plan record carries the
 # plain line on the same ledger; the gate's card text (the rationale Jarvis
 # renders as the card's body) carries it too.

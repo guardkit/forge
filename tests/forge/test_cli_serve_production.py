@@ -1131,7 +1131,7 @@ class TestLifecycleBridgeWireupComposition:
 
 
 class TestThePublicationFactsAreSaidAtBoot:
-    """Release -3, TC8: the boot log says whether the machine's answers for
+    """The GitHub publishing gate (2 October 2026): the boot log says whether the machine's answers for
     publication are there and fresh, beside the unchanged publication line."""
 
     def test_a_missing_facts_file_is_named_at_boot(

@@ -1,6 +1,6 @@
 """The machine's answers for publication, read from a file a check wrote.
 
-Release -3, TC8 (upgrade runbook of 1 October 2026, section 3, and 2.9).
+The GitHub publishing gate (2 October 2026).
 
 WHAT THIS IS FOR. Publication is on only if ``publication.enabled`` is true
 AND every one of section G's questions holds
@@ -74,8 +74,8 @@ __all__ = [
     "this_coordinator",
 ]
 
-#: The one environment name that says where the facts are. Only release -3's
-#: compose file declares it for the coordinator, and only release -3's env
+#: The one environment name that says where the facts are. Only the 2 October 2026 version's
+#: compose file declares it for the coordinator, and only the 2 October 2026 version's env
 #: file sets it, so a release -2 env file stays valid and behaves as before.
 FACTS_FILE_ENV = "FORGE_PUBLICATION_FACTS_FILE"
 
@@ -241,7 +241,7 @@ def read_publication_facts(
     """What the last look at the machine found, if it may be acted on now.
 
     Returns ``None`` when ``FORGE_PUBLICATION_FACTS_FILE`` is not set, which
-    is exactly what every production caller passed before release -3. In
+    is exactly what every production caller passed before 2 October 2026. In
     every other case it returns a :class:`WhatTheMachineSays`: the recorded
     answers when the record is complete, fresh and for this coordinator, and
     otherwise every answer ``None`` with the reason in

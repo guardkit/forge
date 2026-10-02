@@ -41,7 +41,8 @@ def inventory(tmp_path):
         'FLEET_MEMORY_ENABLED=false','FLEET_MEMORY_PORT=30822','SANDBOX_RECEIPTS_PATH=/private/receipts',
         'SANDBOX_NAME=owned-sandbox','SANDBOX_BOOTSTRAP=/private/clone/deploy/sandbox-runner.sh',
         'SANDBOX_PROJECT_ENV_FILE='+str(tmp_path/'operational'/'bootstrap.env'),
-        'SANDBOX_ENV_NAMES=SANDBOX_RECEIPTS_PATH FORGE_IMAGE FORGE_IMAGE_IDENTITY FORGE_RELEASE_VERSION FORGE_RELEASE_MANIFEST_SHA256 FORGE_TARGET_OWNER_URL '+' '.join(m.MEMORY_NAMES),
+        'FORGE_CONFIG_PATH=/private/settings/forge.yaml','GIT_AUTHOR_NAME=fixture','GIT_AUTHOR_EMAIL=fixture@example.invalid',
+        'SANDBOX_ENV_NAMES=SANDBOX_RECEIPTS_PATH FORGE_IMAGE FORGE_IMAGE_IDENTITY FORGE_RELEASE_VERSION FORGE_RELEASE_MANIFEST_SHA256 FORGE_TARGET_OWNER_URL FORGE_CONFIG_PATH GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL '+' '.join(m.MEMORY_NAMES),
     ])+'\n')
     source = tmp_path / 'project' / 'deploy' / 'profile.yaml'
     source.parent.mkdir(parents=True)
@@ -189,6 +190,8 @@ class Boundary:
                     import base64
                     self.files[item['path']]=base64.b64decode(item['data'])
                 out='installed-and-read-back'
+            elif args[:2]==['test','-r']:
+                if self.fault=='no-settings':code=1
             elif args[0]=='sha256sum':
                 out=m.digest(self.files[args[1]])+'  '+args[1]
             elif args[0]=='ps':
@@ -539,7 +542,9 @@ def test_normal_output_drives_real_template_receipts_and_custom_ports(inventory,
     consumer=tmp_path/'consumer';consumer.mkdir()
     fake=template_tests.sandbox.__wrapped__(consumer)
     # Only fake image identity settings differ; preserve actual generated path/port values.
-    extra={k:v for k,v in forwarded.items() if k not in {'FORGE_IMAGE','FORGE_IMAGE_IDENTITY','FORGE_RELEASE_VERSION','FORGE_RELEASE_MANIFEST_SHA256'}}
+    # The template harness supplies its own real settings file, so the fixture's
+    # made-up FORGE_CONFIG_PATH (a path only the fake sandbox knows) is left out.
+    extra={k:v for k,v in forwarded.items() if k not in {'FORGE_IMAGE','FORGE_IMAGE_IDENTITY','FORGE_RELEASE_VERSION','FORGE_RELEASE_MANIFEST_SHA256','FORGE_CONFIG_PATH'}}
     runs=template_tests.TestTheFoldersBothContainersShare._runs_of_a_started_bootstrap(fake,**extra)
     assert len(runs)==2
     assert all(desired+':'+desired+':rw' in run for run in runs)
@@ -660,3 +665,20 @@ def test_repeat_does_not_trust_an_old_mismatched_identity_receipt(inventory,monk
     assert m.main(args)==2
     assert 'reviewed immutable image' in capsys.readouterr().err
     assert not any(x[:3] in (['systemctl','--user','stop'],['systemctl','--user','unmask']) for x,_ in b.calls[before:])
+
+
+@pytest.mark.parametrize('name',['FORGE_CONFIG_PATH','GIT_AUTHOR_NAME','GIT_AUTHOR_EMAIL'])
+def test_refuses_without_the_settings_and_identity_the_start_up_script_needs(inventory,monkeypatch,name):
+    """The start-up script refuses without these; the installer refuses first, changing nothing."""
+    config,path,args=inventory;b=Boundary(config,monkeypatch)
+    edit_env(config,{name:None},remove_forward=(name,))
+    assert m.main(args)==2
+    assert not b.files and not any(b.states.values())
+    assert not any(x[0] in ('systemctl','bash') or x[:2]==['sbx','stop'] for x in b.argv())
+
+
+def test_refuses_when_the_sandbox_has_no_settings_file(inventory,monkeypatch):
+    config,path,args=inventory;b=Boundary(config,monkeypatch);b.fault='no-settings'
+    assert m.main(args)==2
+    assert not b.files
+    assert not any(x[0]=='bash' or x[:2]==['sbx','stop'] for x in b.argv())
