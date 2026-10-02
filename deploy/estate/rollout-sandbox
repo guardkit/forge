@@ -5,8 +5,9 @@ supervisor already looks after (--upgrade, and --upgrade --back to put the
 saved previous installation back). An upgrade runs with the Compose
 sandbox-runner stopped (exit 0) and never stops the sandbox, moves a port or
 policy rule, or unmasks a unit; it saves the previous template, profile,
-settings file, bootstrap env and clone-local git identity to
-<evidence_dir>/previous-installation/ (0600, with hashes) before changing
+settings file and clone-local git identity to
+<evidence_dir>/previous-installation/ (0600, with hashes; the previous
+bootstrap env, which carries secrets, by its hash only) before changing
 anything, and writes sandbox-installed.json format 2 with a previous block.
 
 Private inventory: common project/env_file/runtime_image/docker_context and units
@@ -297,8 +298,10 @@ def get(key):
  r=subprocess.run(['git','-C',c['clone'],'config','--local','--get-all',key],capture_output=True,text=True)
  if r.returncode==1 and not r.stdout: return None
  assert r.returncode==0
- values=r.stdout.splitlines(); assert len(values)==1
+ values=r.stdout.splitlines()
+ if len(values)!=1: multiple.append(key); return None
  return values[0]
+multiple=[]
 identity={k:get(k) for k in ('user.name','user.email')}
 root=os.path.dirname(os.path.dirname(c['script']))
 state=pathlib.Path(os.path.expanduser('~'))/'.forge-runner'/hashlib.sha256(root.encode()).hexdigest()
@@ -321,7 +324,9 @@ if lock.exists():
  finally: os.close(fd)
 parent=pathlib.Path(c['files']['settings']).parent
 folder={'exists':parent.is_dir(),'mode':parent.stat().st_mode&0o777 if parent.is_dir() else None}
-print(json.dumps({'files':files,'identity':identity,'settings_folder':folder,'supervisor':{'record_present':record.exists(),'record_live':live,'lock_held':held}}))
+runner_states=pathlib.Path(os.path.expanduser('~'))/'.forge-runner'
+in_state=pathlib.Path(c['files']['settings']).resolve().is_relative_to(runner_states.resolve())
+print(json.dumps({'files':files,'identity':identity,'identity_multiple':multiple,'settings_in_runner_state':in_state,'settings_folder':folder,'supervisor':{'record_present':record.exists(),'record_live':live,'lock_held':held}}))
 '''
 
 # Sets (value) or unsets (null) the clone-local user.name/user.email, values on
@@ -474,6 +479,8 @@ class Rollout:
         require(isinstance(path,str) and PurePosixPath(path).is_absolute() and '..' not in PurePosixPath(path).parts and len(PurePosixPath(path).parts) > 2 and PurePosixPath(path).name.endswith(('.yaml','.yml')),
                 'sandbox.settings_path is not an absolute .yaml file path; name the sandbox settings file explicitly')
         self.settings_path = PurePosixPath(path)
+        require('.forge-runner' not in self.settings_path.parts,
+                "sandbox.settings_path is inside the template's own state folders (~/.forge-runner/<hash>/, its lock, process record and launch declaration); choose a path outside them")
         # Outside the clone and every shared folder: no build's read-write
         # mount, git clean or scratch tool may reach it.
         shared = {'sandbox.clone_path':s['clone_path'],'sandbox.receipts_path':s['receipts_path']}
@@ -661,10 +668,13 @@ class Rollout:
             'FORGE_RELEASE_MANIFEST_SHA256':labels.get('com.guardkit.release.manifest.sha256'),
         }
 
-    def handoff(self):
-        expected = self.reviewed_image_settings()  # Immutable host ID, never the mutable transfer tag.
+    def release_tag_resolves(self):
         resolved = self.run(['docker','--context',self.config['docker_context'],'image','inspect','--format','{{.Id}}',self.s['release_image']]).stdout.strip()
         require(resolved == self.config['runtime_image'], 'release_image tag no longer resolves to the accepted host image; restore its exact release identity before proceeding')
+
+    def handoff(self):
+        expected = self.reviewed_image_settings()  # Immutable host ID, never the mutable transfer tag.
+        self.release_tag_resolves()
         env = dict(self.env,FORGE_IMAGE=self.s['release_image'],SANDBOX_CLIENT='sbx')
         result = self.run(['bash',str(HANDOFF),self.s['name']],env=env,timeout=1000)
         names = ('FORGE_IMAGE','FORGE_IMAGE_IDENTITY','FORGE_RELEASE_VERSION','FORGE_RELEASE_MANIFEST_SHA256')
@@ -876,6 +886,8 @@ class Rollout:
         supervisor = state['supervisor']
         require(not supervisor['record_live'] and not supervisor['lock_held'],
                 f'a supervisor of {self.s["script_path"]} is still running inside {self.s["name"]}; stop it with its own template first')
+        require(not state['settings_in_runner_state'],
+                f'sandbox.settings_path is inside the template\'s own state folders (~/.forge-runner) in {self.s["name"]}; choose a path outside them')
         folder = state['settings_folder']
         if folder['exists'] and folder['mode'] & 0o022:
             raise Refusal(f'the settings folder {self.settings_path.parent} inside {self.s["name"]} is writable by others (mode {folder["mode"]:o}); make it 0755 before upgrading')
@@ -938,7 +950,7 @@ class Rollout:
     def upgrade_plan(self):
         settings = self.sandbox_settings()
         bootstrap, _ = self.bootstrap_text({'FORGE_IMAGE':'','FORGE_IMAGE_IDENTITY':'','FORGE_RELEASE_VERSION':'','FORGE_RELEASE_MANIFEST_SHA256':''})
-        print('Plan only (--upgrade): nothing is changed. Would require the previous receipt\'s template and profile hashes in the clone, the Compose sandbox-runner stopped with exit 0, no '+self.prefix+'-helper or '+self.prefix+'-runner container and no live supervisor inside '+self.s['name']+'; mask both old units if needed; save the previous template, profile, settings file, bootstrap env and clone-local git identity to '+str(self.previous_dir)+' (0600, with hashes); unset the clone-local identity; hand in '+self.s['release_image']+'; write the settings file below; install the current template; write the new bootstrap env at '+str(self.bootstrap_env)+'. Never sbx stop, sbx ports, sbx policy or systemctl unmask.')
+        print('Plan only (--upgrade): nothing is changed. Would require the previous receipt\'s template and profile hashes in the clone, the Compose sandbox-runner stopped with exit 0, no '+self.prefix+'-helper or '+self.prefix+'-runner container and no live supervisor inside '+self.s['name']+'; mask both old units if needed; save the previous template, profile, settings file and clone-local git identity to '+str(self.previous_dir)+' (0600, with hashes; the previous bootstrap env by hash only); unset the clone-local identity; hand in '+self.s['release_image']+'; write the settings file below; install the current template; write the new bootstrap env at '+str(self.bootstrap_env)+'. Never sbx stop, sbx ports, sbx policy or systemctl unmask.')
         print('Previous receipt: template '+self.previous['template_sha256']+', profile '+self.previous['profile_sha256']+', release '+str(self.previous['bootstrap_image_settings'].get('FORGE_RELEASE_VERSION'))+'; current template '+digest(self.template))
         print('Generated sandbox settings for '+str(self.settings_path)+' (sha256 '+settings['sha256']+', from coordinator settings '+settings['coordinator_settings_sha256']+'):')
         print(settings['text'].rstrip('\n'))
@@ -955,11 +967,17 @@ class Rollout:
         profile = self.profile()
         self.validate_bootstrap_ports(profile)
         settings = self.sandbox_settings()
+        # Read-only, and asked again by handoff(): a wrong tag refuses here,
+        # before any unit, file or identity is touched.
+        self.reviewed_image_settings()
+        self.release_tag_resolves()
         supervisor = self.compose_supervisor(allow_absent=False)
         # The first exec may wake a sandbox that slept after the supervisor
         # stopped; nothing old runs inside to be woken (runbook 2.8).
         self.factory_containers_absent()
         state = self.sandbox_state()
+        require(not state['identity_multiple'],
+                'the clone has more than one local '+' and '.join(state['identity_multiple'])+' set, so it cannot be saved and put back as one value; leave one value (or none) with git config --local and run the upgrade again')
         installed = state['files']
         require(installed['template'] and installed['template']['sha256'] == previous['template_sha256'],
                 f'the clone\'s {self.s["script_path"]} is not the template the previous receipt installed; reconcile before upgrading')
@@ -989,7 +1007,6 @@ class Rollout:
             saved[key] = {'path':{'template':self.s['script_path'],'profile':self.s['profile_path'],'settings':str(self.settings_path)}[key],'saved':name,'sha256':digest(data),'mode':item['mode']}
         identity_bytes = (json.dumps(identity,sort_keys=True)+'\n').encode()
         private_write(self.previous_dir/'git-identity.json',identity_bytes)
-        private_write(self.previous_dir/'bootstrap.env',old_bootstrap_bytes)
         private_write(self.previous_dir/'profile-source.yaml',source_bytes)
         template_new = self.template
         manifest = {
@@ -999,7 +1016,9 @@ class Rollout:
             'release':{k:previous['bootstrap_image_settings'].get(k) for k in ('FORGE_IMAGE','FORGE_IMAGE_IDENTITY','FORGE_RELEASE_VERSION','FORGE_RELEASE_MANIFEST_SHA256')},
             'files':saved,
             'git_identity':{'saved':'git-identity.json','sha256':digest(identity_bytes),'values_sha256':{k:(None if v is None else digest(v.encode())) for k,v in identity.items()}},
-            'bootstrap_env':{'path':str(old_bootstrap),'sha256':digest(old_bootstrap_bytes),'saved':'bootstrap.env'},
+            # Hash only: that file carries secret values, and --back never
+            # rewrites it, it only checks it is unchanged.
+            'bootstrap_env':{'path':str(old_bootstrap),'sha256':digest(old_bootstrap_bytes)},
             'profile_source':{'path':self.s['profile_source'],'sha256':digest(source_bytes),'saved':'profile-source.yaml','after_sha256':digest(new_profile)},
             'planned':{'template_sha256':digest(template_new),'profile_sha256':digest(new_profile),'settings_sha256':settings['sha256']},
         }
@@ -1053,6 +1072,7 @@ class Rollout:
         self.previous_image_present()
         manifest_path = self.previous_dir/'previous.json'
         restored = {}
+        left_settings = None
         if manifest_path.exists():
             manifest = json_read(manifest_path)
             require(manifest.get('project') == self.args.project and manifest.get('sandbox') == self.s['name'] and manifest.get('previous_receipt',{}).get('sha256') == digest(self.previous_receipt_bytes),
@@ -1061,7 +1081,12 @@ class Rollout:
             for key in ('settings','template','profile'):
                 entry = manifest['files'].get(key)
                 if entry is None:
-                    restored[key] = 'none saved; left as it is'
+                    if key == 'settings':
+                        left_settings = str(self.settings_path)
+                        restored[key] = ('there was no settings file before the upgrade, so the generated file '+str(self.settings_path)
+                                         +' and its folder are left in place; release -2 never reads it (its bootstrap env names its own file)')
+                    else:
+                        restored[key] = 'none saved; left as it is'
                     continue
                 data = (self.previous_dir/entry['saved']).read_bytes()
                 require(digest(data) == entry['sha256'], f'the saved copy of {entry["path"]} does not match its recorded hash; reconcile the saved folder')
@@ -1088,7 +1113,8 @@ class Rollout:
             self.read_back([(item['path'],base64.b64decode(item['data'])) for item in items])
             bootstrap_hash = manifest['bootstrap_env']['sha256']
             template_hash = manifest['files']['template']['sha256']
-            restored['git_identity'] = values_after
+            restored['git_identity'] = {'values_sha256':values_after,
+                'note':"the clone-local user.name and user.email values are restored exactly; the clone's .git/config file itself may differ in layout"}
         else:
             # Nothing was saved, so nothing was changed: prove the clone still
             # holds the previous installation.
@@ -1111,7 +1137,8 @@ class Rollout:
             'restored_at':dt.datetime.now(dt.timezone.utc).isoformat(),
         })
         self.complete = True
-        print('Put back the previous installation of '+self.s['name']+' (release '+str(previous['bootstrap_image_settings'].get('FORGE_RELEASE_VERSION'))+', template '+template_hash+'); its bootstrap env is unchanged; both old units left as they are.')
+        print('Put back the previous installation of '+self.s['name']+' (release '+str(previous['bootstrap_image_settings'].get('FORGE_RELEASE_VERSION'))+', template '+template_hash+'); its bootstrap env is unchanged; the clone-local git identity values are restored exactly; both old units left as they are.'
+              +(' The generated settings file '+left_settings+' and its folder are left in place: there was none before, and release -2 never reads it.' if left_settings else ''))
 
 
 def main(argv=None):
@@ -1134,7 +1161,7 @@ def main(argv=None):
         if args.upgrade:
             rollout.validate_upgrade_inputs()
             if args.plan and args.back:
-                print('Plan only (--upgrade --back): nothing is changed. Would require the Compose sandbox-runner stopped with exit 0 (or removed), no helper or runner container and no live supervisor inside '+rollout.s['name']+', and the previous release image '+rollout.previous['bootstrap_image_settings']['FORGE_IMAGE']+' in its engine by identity; check every copy saved in '+str(rollout.previous_dir)+' against its hash and the previous bootstrap env against its recorded hash; put back the template, profile, settings file and clone-local git identity byte for byte; record sandbox-restored.json. Never sbx stop, sbx ports, sbx policy or systemctl unmask.')
+                print('Plan only (--upgrade --back): nothing is changed. Would require the Compose sandbox-runner stopped with exit 0 (or removed), no helper or runner container and no live supervisor inside '+rollout.s['name']+', and the previous release image '+rollout.previous['bootstrap_image_settings']['FORGE_IMAGE']+' in its engine by identity; check every copy saved in '+str(rollout.previous_dir)+' against its hash and the previous bootstrap env against its recorded hash; put back the template, profile and settings file byte for byte (a generated settings file with no earlier one is left in place; release -2 never reads it) and the clone-local git identity values exactly; record sandbox-restored.json. Never sbx stop, sbx ports, sbx policy or systemctl unmask.')
                 return 0
             if args.plan:
                 rollout.upgrade_plan()

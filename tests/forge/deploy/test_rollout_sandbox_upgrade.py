@@ -44,6 +44,7 @@ IDENTITY_DOCUMENT = 'forge-image-identity/2\n' + json.dumps({
     'com.guardkit.release.manifest.sha256':'b'*64},'ports':{},'volumes':{},'stopsignal':'',
 },separators=(',',':'))
 IDENTITY = m.digest((IDENTITY_DOCUMENT+'\n').encode())
+SECRET_CANARY = 'previous-release-secret-canary'
 OLD_TEMPLATE = b'#!/bin/bash\n# the previous release template\n'
 GIT_NAMES = ('GIT_AUTHOR_NAME','GIT_AUTHOR_EMAIL','GIT_COMMITTER_NAME','GIT_COMMITTER_EMAIL')
 GIT_VALUES = {'GIT_AUTHOR_NAME':'Project Builder','GIT_AUTHOR_EMAIL':'builder@example.invalid',
@@ -136,7 +137,8 @@ def estate(tmp_path):
     script=clone/'deploy'/'sandbox-runner.sh';script.write_bytes(OLD_TEMPLATE);script.chmod(0o755)
     run1=tmp_path/'run-1';(run1/'sandbox-evidence').mkdir(parents=True,mode=0o700)
     old_bootstrap=run1/'sandbox-bootstrap.env'
-    old_bootstrap.write_text('FORGE_IMAGE="forge:previous"\nFORGE_CONFIG_PATH="'+str(clone)+'/.guardkit/tmp/factory-runtime/forge.yaml"\n')
+    old_bootstrap.write_text('FORGE_IMAGE="forge:previous"\nFORGE_CONFIG_PATH="'+str(clone)+'/.guardkit/tmp/factory-runtime/forge.yaml"\n'
+                             'GUARDKIT_NATS_PASSWORD="'+SECRET_CANARY+'"\n')
     old_bootstrap.chmod(0o600)
     previous={'format_version':1,'project':'owned-project','sandbox':'owned-sandbox','image':'sha256:'+'9'*64,
         'template_sha256':m.digest(OLD_TEMPLATE),'profile_sha256':m.digest(installed.encode()),
@@ -203,7 +205,7 @@ class Machine:
                 if self.fault=='supervisor-exit-3':state.update(ExitCode=3)
                 out=json.dumps(state)
             elif verb[:2]==['image','inspect']:
-                out=IDENTITY_DOCUMENT+'\n' if verb[3].startswith('forge-image-identity/2') else IMAGE
+                out=IDENTITY_DOCUMENT+'\n' if verb[3].startswith('forge-image-identity/2') else ('sha256:'+'7'*64 if self.fault=='wrong-tag' else IMAGE)
             elif verb[0]=='run':
                 payload=argv[argv.index('-c')+1]
                 extra=[]
@@ -295,7 +297,8 @@ def test_an_already_masked_unit_is_not_masked_again(estate,monkeypatch):
     assert not any(c[:3]==['systemctl','--user','mask'] for c in machine.calls)
 
 
-def test_the_clone_local_identity_is_unset_and_back_restores_it(estate,monkeypatch):
+def test_the_clone_local_identity_is_unset_and_back_restores_its_values_exactly(estate,monkeypatch):
+    # Values, not the .git/config bytes: git may lay the file out differently.
     e=estate;machine=Machine(e,monkeypatch)
     assert m.main(e['args'])==0
     for key in CLONE_IDENTITY:
@@ -560,3 +563,85 @@ def test_a_settings_folder_others_can_write_refuses_before_anything_changes(esta
     e=estate;machine=Machine(e,monkeypatch)
     e['settings_path'].parent.mkdir(parents=True);e['settings_path'].parent.chmod(0o775)
     _refused_and_unchanged(e,machine,e['args'],capsys,'is writable by others (mode 775)')
+
+
+# ---------------------------------------------------------------------------
+# Fix pass after the coach's review (2 October 2026)
+# ---------------------------------------------------------------------------
+
+
+def test_no_secret_bearing_env_file_is_copied_into_the_evidence(estate,monkeypatch):
+    e=estate;machine=Machine(e,monkeypatch)
+    old=e['old_bootstrap'].read_bytes()
+    assert m.main(e['args'])==0
+    assert m.main([*e['args'],'--back'])==0
+    evidence=Path(e['config']['sandbox']['evidence_dir'])
+    files=[p for p in evidence.rglob('*') if p.is_file()]
+    assert files and not (evidence/'previous-installation'/'bootstrap.env').exists()
+    for path in files:
+        data=path.read_bytes()
+        assert data!=old and SECRET_CANARY.encode() not in data, path
+    manifest=json.loads((evidence/'previous-installation'/'previous.json').read_text())
+    assert manifest['bootstrap_env']=={'path':str(e['old_bootstrap']),'sha256':m.digest(old)}
+
+
+def test_back_says_plainly_that_a_generated_settings_file_is_left(estate,monkeypatch,capsys):
+    e=estate;machine=Machine(e,monkeypatch)
+    assert m.main(e['args'])==0
+    capsys.readouterr()
+    assert m.main([*e['args'],'--back'])==0
+    out=capsys.readouterr().out
+    assert 'The generated settings file '+str(e['settings_path'])+' and its folder are left in place' in out
+    assert 'release -2 never reads it' in out
+    restored=json.loads((Path(e['config']['sandbox']['evidence_dir'])/'sandbox-restored.json').read_text())
+    assert 'left in place' in restored['restored']['settings'] and 'release -2 never reads it' in restored['restored']['settings']
+    assert 'restored exactly' in restored['restored']['git_identity']['note']
+    assert e['settings_path'].exists()
+
+
+def test_a_wrong_release_tag_refuses_before_any_change(estate,monkeypatch,capsys):
+    e=estate;machine=Machine(e,monkeypatch);machine.fault='wrong-tag'
+    _refused_and_unchanged(e,machine,e['args'],capsys,'release_image tag no longer resolves')
+    assert not any(c[:3]==['systemctl','--user','mask'] for c in machine.calls)
+
+
+def test_two_clone_local_names_refuse_with_a_plain_sentence(estate,monkeypatch,capsys):
+    e=estate;machine=Machine(e,monkeypatch)
+    git(e['clone'],'config','--local','--add','user.name','Second Name')
+    error=_refused_and_unchanged(e,machine,e['args'],capsys,'more than one local user.name')
+    assert 'sbx refused' not in error
+    assert not any(c[:3]==['systemctl','--user','mask'] for c in machine.calls)
+
+
+def test_a_settings_path_in_the_template_state_folders_refuses(estate,monkeypatch,capsys):
+    e=estate
+    e['config']['sandbox']['settings_path']=str(e['home']/'.forge-runner'/'abc'/'forge.yaml')
+    e['inventory'].write_text(json.dumps(e['config']))
+    monkeypatch.setattr(m.subprocess,'run',lambda *a,**k:pytest.fail('external call before settings validation'))
+    assert m.main(e['args'])==2
+    assert "template's own state folders" in capsys.readouterr().err
+
+
+def test_a_settings_path_reaching_the_state_folders_through_a_link_refuses(estate,monkeypatch,capsys):
+    e=estate;machine=Machine(e,monkeypatch)
+    state=e['home']/'.forge-runner'/'abc';state.mkdir(parents=True)
+    link=e['tmp']/'agent-link';link.symlink_to(state)
+    e['config']['sandbox']['settings_path']=str(link/'forge.yaml')
+    e['inventory'].write_text(json.dumps(e['config']))
+    _refused_and_unchanged(e,machine,e['args'],capsys,"template's own state folders")
+
+
+def test_the_receipt_carries_what_switch_reads(estate,monkeypatch):
+    """rollout-quiesce --switch (TC2) reads format 2 and four keys; each must mean
+    what it hashes there: the clone's bootstrap, the bootstrap env file on this
+    machine, and the settings file FORGE_CONFIG_PATH names."""
+    e=estate;machine=Machine(e,monkeypatch)
+    assert m.main(e['args'])==0
+    receipt=json.loads((Path(e['config']['sandbox']['evidence_dir'])/'sandbox-installed.json').read_text())
+    assert receipt['format_version']==2 and receipt['image']==e['config']['runtime_image']
+    assert receipt['template_sha256']==m.digest((e['clone']/'deploy'/'sandbox-runner.sh').read_bytes())
+    env_file=Path(e['config']['sandbox']['bootstrap_env_file'])
+    assert receipt['bootstrap_env_sha256']==m.digest(env_file.read_bytes())
+    named=[json.loads(v) for k,_,v in (l.partition('=') for l in env_file.read_text().splitlines()) if k=='FORGE_CONFIG_PATH']
+    assert named==[str(e['settings_path'])]
+    assert receipt['settings_sha256']==m.digest(e['settings_path'].read_bytes())
