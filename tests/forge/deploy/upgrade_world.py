@@ -100,6 +100,9 @@ class World:
         self.inner = {}  # name -> image inside the sandbox
         self.marker = None
         self.pre_resume_written = {}
+        self.h6_containers = {}
+        self.h6_result = None        # callable(create_argv) -> (exit, result dict) for the H6 probe
+        self.sandbox_back = None     # callable(argv) -> (exit, stderr) for rollout-sandbox --upgrade --back
 
     # ---------------------------------------------------------------- release
     def images(self, release):
@@ -238,6 +241,12 @@ class World:
                 return self.read_pre_resume(argv, env)
             self.events.append(('estate-check', argv[1]))
             return (1, '', 'item failed') if self.fail.get('services') else (0, 'passed', '')
+        if name == 'rollout-sandbox':
+            self.events.append(('rollout-sandbox', tuple(a for a in argv if a in ('--upgrade', '--back')), argv[argv.index('--previous-receipt') + 1] if '--previous-receipt' in argv else None))
+            code, err = self.sandbox_back(argv) if self.sandbox_back else (0, '')
+            if code == 0:
+                self.restore_release_2_in_sandbox()
+            return code, '', err
         if name == 'factory-hello':
             self.events.append(('factory-hello',))
             return (42, '', 'hello failed') if self.fail.get('hello') else (0, 'hello', '')
@@ -301,6 +310,14 @@ class World:
                 ids = [c['Id'] for c in self.containers.values() if c['State']['Running'] and any(m['Name'] == volume for m in c['Mounts'])]
                 return 0, '\n'.join(ids), ''
             return 0, '\n'.join(self.containers), ''
+        if args[0] == 'inspect' and args[1] in self.h6_containers:
+            return 0, json.dumps([self.h6_containers[args[1]]]), ''
+        if args[0] == 'create':
+            return self.h6_create(args)
+        if args[0] == 'start' and args[1] == '--attach':
+            return self.h6_start(args[2])
+        if args[0] == 'rm' and args[1] == '--force':
+            self.h6_containers.pop(args[2], None); return 0, '', ''
         if args[0] == 'inspect':
             if args[1] not in self.containers:
                 return 1, '', 'No such object'
@@ -409,6 +426,27 @@ class World:
             names = rest[4:]
             return 0, '\n'.join('/' + n + ' ' + self.inner_images[self.inner[n]] for n in names) + '\n', ''
         raise AssertionError('unexpected sbx ' + repr(rest))
+
+    # ---------------------------------------------------------------- the H6 probe container
+    def h6_create(self, args):
+        image = args[args.index('-c') - 1]
+        mounts = [args[i + 1] for i, a in enumerate(args) if a == '--mount']
+        cid = 'h6-' + str(len(self.h6_containers))
+        probe = Path(next(m for m in mounts if 'dst=/probe' in m).split('src=')[1].split(',')[0])
+        pristine = Path(next(m for m in mounts if 'dst=/pristine.db' in m).split('src=')[1].split(',')[0])
+        tail = args[args.index('-c') + 2:]
+        self.h6_containers[cid] = {'Id': cid, 'Image': image, 'HostConfig': {'Init': '--init' in args}, 'State': {'ExitCode': None},
+                                   'probe': str(probe), 'pristine': str(pristine), 'argv': tail}
+        self.events.append(('h6-create', image, tail[4]))
+        return 0, cid + '\n', ''
+
+    def h6_start(self, cid):
+        c = self.h6_containers[cid]
+        code, result = self.h6_result(c)
+        c['State']['ExitCode'] = code
+        if result is not None:
+            Path(c['probe'], 'h6-result.json').write_text(json.dumps(result))
+        return code, '', '' if code == 0 else 'probe refused: schema or protocol'
 
     # ---------------------------------------------------------------- what TC4 does at U4
     def install_release_3_in_sandbox(self, evidence_dir, bootstrap_env):
