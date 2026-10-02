@@ -63,6 +63,8 @@ from forge.launch_environment import build_launch_env
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "discover_test_roots_from_listing",
+    "folders_holding_tests",
     "NORMALIZER_MODULE_CANDIDATES",
     "TEST_ROOT_DISCOVERY_MODULE_CANDIDATES",
     "NORMALIZER_EXIT_PARTIAL",
@@ -486,6 +488,59 @@ def shallow_discover_test_roots(repo_path: Path | str) -> list[str]:
         roots.extend(f"tests/{name}" for name in _eligible_subdir_names(tests_dir))
     roots.extend(discover_ts_shape_test_roots(root))
     return sorted(set(roots))
+
+
+def discover_test_roots_from_listing(paths: Sequence[str]) -> list[str]:
+    """The test roots of a repository known only by its tracked-file listing.
+
+    For a repository read through its sandbox helper (release -3 item 10,
+    1 October 2026) there is no checkout here for the discovery above to
+    walk, and it used to answer ``[]`` in silence. Rather than re-implement
+    the discovery's rules over strings, this lays the listing out as an empty
+    skeleton (each tracked file as an empty file, so every directory that
+    holds a tracked file exists) in a temporary folder and runs the SAME
+    discovery on it: guardkit's own :func:`discover_target_test_roots`, or
+    the shallow fallback when guardkit is not importable. Both decide by
+    which directories and file names exist, which the skeleton reproduces.
+
+    A path that is absolute or climbs out with ``..`` is skipped. Never
+    raises; an empty listing is ``[]``.
+    """
+    with tempfile.TemporaryDirectory(prefix="forge-test-roots-") as scratch:
+        root = Path(scratch)
+        for rel in paths:
+            rel = str(rel or "")
+            parts = rel.split("/")
+            if not rel or rel.startswith("/") or ".." in parts or "" in parts:
+                continue
+            target = root.joinpath(*parts)
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.touch()
+            except OSError:
+                continue
+        try:
+            return discover_target_test_roots(root)
+        except TargetTestRootsUnresolved:
+            return shallow_discover_test_roots(root)
+
+
+def folders_holding_tests(test_roots: Sequence[str]) -> tuple[str, ...]:
+    """The folders that hold tests, by the discovery's own shapes: each root,
+    and — for a root that is an immediate subfolder of a top-level folder
+    (``tests/users``, ``test/unit``) — that top-level folder too, since the
+    discovery found the root by looking inside it. A colocated ``__tests__``
+    root names only itself."""
+    prefixes: list[str] = []
+    for root in test_roots:
+        root = str(root).strip("/")
+        if not root:
+            continue
+        prefixes.append(root + "/")
+        parts = root.split("/")
+        if len(parts) == 2 and parts[1] != "__tests__":
+            prefixes.append(parts[0] + "/")
+    return tuple(dict.fromkeys(prefixes))
 
 
 class TargetTestRootsUnresolved(RuntimeError):

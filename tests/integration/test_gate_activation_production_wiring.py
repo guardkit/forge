@@ -369,6 +369,80 @@ class TestPauseEmitsDualEnvelopeInOrder:
 
 
 # ---------------------------------------------------------------------------
+# Release -3 item 10 — the build gate card says when the plan was written
+# without the repository. The planning run's approved plan record carries the
+# plain line on the same ledger; the gate's card text (the rationale Jarvis
+# renders as the card's body) carries it too.
+# ---------------------------------------------------------------------------
+
+_UNREAD_LINE = (
+    "The machine could not read the repository while writing this, so nothing "
+    "checked it against what the repository already has (the sandbox helper "
+    "at http://127.0.0.1:9 could not be reached for /code/list-files)."
+)
+
+
+def _record_plan(pool: SqliteLifecyclePersistence, details: dict[str, Any]) -> None:
+    from forge.planning.run_store import SqlitePlanningRunStore
+
+    planning = SqlitePlanningRunStore(pool.connection, target_terminal_enabled=True)
+    planning.record_queued(
+        correlation_id=CORRELATION_ID,
+        originating_user=RICH,
+        expected_approver=RICH,
+        request_text="add a GET /stats endpoint",
+        triggered_by="jarvis",
+        target_repo="guardkit/forge",
+    )
+    planning._record_event(
+        correlation_id=CORRELATION_ID,
+        stage_label="feature-plan",
+        status="approved",
+        actor_identity="planning-driver",
+        details_json=json.dumps(details),
+    )
+
+
+class TestTheGateCardSaysTheRepositoryWasNotRead:
+    @pytest.mark.asyncio
+    async def test_the_line_from_the_plan_is_on_the_build_gate_card(
+        self, nats: OrderRecordingNats, pool: SqliteLifecyclePersistence
+    ) -> None:
+        from forge.gating.degraded import DEGRADED_RATIONALE
+
+        _record_plan(pool, {"feature_id": FEATURE_ID, "repository_unavailable": _UNREAD_LINE})
+        build_id = _seed_queued(pool)
+        repo, sm = build_sqlite_gate_adapters(pool, clock=FixedClock())
+        gate_task = _start_gate(_build_parts(nats), pool, repo, sm, build_id)
+        await _drive_response(
+            nats, build_id=build_id, request_id=_request_id(build_id), decision="approve"
+        )
+        assert await asyncio.wait_for(gate_task, timeout=5.0) is GateOutcome.RESUMED
+
+        request = _payloads(nats, _request_subject(build_id))[0]
+        assert request["details"]["rationale"] == f"{DEGRADED_RATIONALE} {_UNREAD_LINE}"
+        paused = _payloads(nats, _paused_subject())[0]
+        assert _UNREAD_LINE in paused["rationale"]
+
+    @pytest.mark.asyncio
+    async def test_a_plan_that_read_the_repository_leaves_the_card_as_it_was(
+        self, nats: OrderRecordingNats, pool: SqliteLifecyclePersistence
+    ) -> None:
+        from forge.gating.degraded import DEGRADED_RATIONALE
+
+        _record_plan(pool, {"feature_id": FEATURE_ID})
+        build_id = _seed_queued(pool)
+        repo, sm = build_sqlite_gate_adapters(pool, clock=FixedClock())
+        gate_task = _start_gate(_build_parts(nats), pool, repo, sm, build_id)
+        await _drive_response(
+            nats, build_id=build_id, request_id=_request_id(build_id), decision="approve"
+        )
+        assert await asyncio.wait_for(gate_task, timeout=5.0) is GateOutcome.RESUMED
+        request = _payloads(nats, _request_subject(build_id))[0]
+        assert request["details"]["rationale"] == DEGRADED_RATIONALE
+
+
+# ---------------------------------------------------------------------------
 # AC-2 — approve resumes exactly once
 # ---------------------------------------------------------------------------
 

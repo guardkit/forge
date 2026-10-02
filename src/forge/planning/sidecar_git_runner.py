@@ -62,6 +62,9 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "CLOSURE_REFUSED_SENTENCE",
     "RepoRoutedGitRunner",
+    "FACT_GATHERING_BUDGET_S",
+    "PartialPlaces",
+    "SidecarCodeReader",
     "SidecarGitOpResult",
     "SidecarGitRunner",
 ]
@@ -119,6 +122,346 @@ def _urllib_post(url: str, body: dict[str, Any], timeout: float) -> tuple[int, A
     return status, decoded
 
 
+#: How long one read of the code door may take. ABOVE the helper's own walls,
+#: so the two never race and a slow answer is the helper's own "timed out"
+#: rather than a socket giving up first: its git listing may take up to 60
+#: seconds and a search walks for up to 30 more (``CODE_GIT_TIMEOUT_SECONDS``,
+#: ``CODE_SEARCH_TIMEOUT_SECONDS``). Never longer than what is left of
+#: :data:`FACT_GATHERING_BUDGET_S`.
+_DEFAULT_CODE_READ_TIMEOUT_S: float = 100.0
+
+#: The whole of one fact-gathering pass — the fact sheet, or the plan-writer's
+#: repository description — may spend at most this long on the helper. Two
+#: minutes: a healthy pass on api_test takes a fraction of a second, and the
+#: planner must say "could not read" well before a person wonders why
+#: planning has stalled (a hung helper used to cost five 100-second waits).
+FACT_GATHERING_BUDGET_S: float = 120.0
+
+#: How many matching lines one search asks for — the helper's own ceiling.
+_SEARCH_MAX_RESULTS: int = 200
+
+#: The helper searches only this much of any one line
+#: (``CODE_SEARCH_MAX_LINE_CHARS``); a line past it is "partly searched".
+_HELPER_LINE_CHARS: int = 500
+
+#: How many further requests one search may spend recovering what the
+#: helper's caps left out, before the rest is reported as not searched.
+_MAX_RECOVERY_REQUESTS: int = 24
+
+
+class PartialPlaces(list):  # type: ignore[type-arg]
+    """``path:line`` places, with :attr:`cut` set to a plain sentence when
+    the search could not be completed — what WAS found is kept."""
+
+    cut: str | None = None
+
+
+class SidecarCodeReader:
+    """The planner's reading of a sandboxed repository through the helper's
+    read-only code door (``/code/list-files``, ``/code/search``,
+    ``/code/read-file``), on the factory's own clone inside the sandbox.
+
+    A :class:`~forge.planning.repository_facts.RepositoryReader`. It rides
+    the same address, repository key and HTTP seam as the
+    :class:`SidecarGitRunner` that builds it (release -3 item 10, 1 October
+    2026).
+
+    NEVER A PARTIAL ANSWER AS A WHOLE ONE, NEVER WHAT WAS READ THROWN AWAY.
+    The helper cuts a search at 200 matching lines and 30 seconds, searches
+    only the first 500 characters of a line, and cuts a listing at 5,000
+    files, and says so (``capped``, ``timed_out``,
+    ``long_lines_partly_searched``). Every cut is either recovered or said:
+
+    * a capped search is covered again piece by piece, by the helper's own
+      walk order (full paths, sorted): every folder not proven complete is
+      searched again by itself, and every file not proven complete — the one
+      the cap fell inside included, even at the top of the repository — is
+      read whole and searched here;
+    * lines past 500 characters are found with one search for long lines,
+      and those files are read whole and searched here;
+    * whatever cannot be recovered within :data:`_MAX_RECOVERY_REQUESTS` is
+      a plain sentence: in :attr:`cuts` for the fact sheet's notes, and on
+      the :class:`PartialPlaces` answer of :meth:`places_mentioning`.
+
+    A helper that fails on the wire once is unavailable for the rest of this
+    reader's life (one planning run) and every later read says so at once;
+    each pass started with :meth:`begin` may spend at most
+    :data:`FACT_GATHERING_BUDGET_S`.
+    """
+
+    def __init__(
+        self,
+        base_url: str,
+        *,
+        repo: str,
+        post: HttpPost = _urllib_post,
+        timeout_s: float = _DEFAULT_CODE_READ_TIMEOUT_S,
+        clock: Callable[[], float] | None = None,
+    ) -> None:
+        import time
+
+        self._base_url = base_url.rstrip("/")
+        self._repo = repo
+        self._post = post
+        self._timeout_s = timeout_s
+        self._clock = clock or time.monotonic
+        self.where = f"{repo} through the sandbox helper at {self._base_url}"
+        #: Plain sentences, one per answer that came back incomplete.
+        self.cuts: list[str] = []
+        #: The sentence when the listing itself was cut, else ``None``.
+        self.listing_cut: str | None = None
+        #: Why each file the helper would not serve was refused, by path.
+        self.refused: dict[str, str] = {}
+        self._listing: list[str] | None = None
+        self._dead: str | None = None
+        self._deadline: float | None = None
+        self._long_line_files: tuple[list[str], str | None] | None = None
+
+    def begin(self, budget_s: float = FACT_GATHERING_BUDGET_S) -> None:
+        """Start one fact-gathering pass with its own time budget. A helper
+        already found unreachable stays so."""
+        self._deadline = self._clock() + budget_s
+
+    # -- the wire ----------------------------------------------------------
+
+    def _answer(self, route: str, body: dict[str, Any]) -> tuple[int, Any]:
+        from forge.planning.repository_facts import RepositoryUnreadable
+
+        if self._dead is not None:
+            raise RepositoryUnreadable(self._dead)
+        timeout = self._timeout_s
+        if self._deadline is not None:
+            left = self._deadline - self._clock()
+            if left <= 0:
+                raise RepositoryUnreadable(
+                    f"the planner's {int(FACT_GATHERING_BUDGET_S)}-second allowance "
+                    f"for reading the repository through the sandbox helper at "
+                    f"{self._base_url} ran out"
+                )
+            timeout = min(timeout, left)
+        url = f"{self._base_url}{route}"
+        try:
+            return self._post(url, {"repo": self._repo, **body}, timeout)
+        except Exception as exc:  # noqa: BLE001 — transport boundary
+            self._dead = (
+                f"the sandbox helper at {self._base_url} could not be reached "
+                f"for {route} ({type(exc).__name__}: {str(exc)[:160]})"
+            )
+            raise RepositoryUnreadable(self._dead) from exc
+
+    def _refused(self, route: str, status: int, decoded: Any) -> Exception:
+        from forge.planning.repository_facts import RepositoryUnreadable
+
+        error = decoded.get("error") if isinstance(decoded, dict) else decoded
+        return RepositoryUnreadable(
+            f"the sandbox helper at {self._base_url} answered {status} to "
+            f"{route} for {self._repo}: {str(error)[:200]}"
+        )
+
+    def list_files(self) -> list[str]:
+        """Every tracked file — asked once per reader and kept."""
+        if self._listing is not None:
+            return list(self._listing)
+        route = "/code/list-files"
+        status, decoded = self._answer(route, {})
+        if status != 200 or not isinstance(decoded, dict):
+            raise self._refused(route, status, decoded)
+        files = [str(path) for path in decoded.get("files") or []]
+        if decoded.get("capped"):
+            self.listing_cut = (
+                f"the helper listed only the first {len(files)} of "
+                f"{decoded.get('total_tracked', 'more')} tracked files"
+            )
+            self.cuts.append(self.listing_cut)
+        self._listing = files
+        return list(files)
+
+    def _search_once(self, body: dict[str, Any]) -> dict[str, Any]:
+        route = "/code/search"
+        status, decoded = self._answer(route, body)
+        if status != 200 or not isinstance(decoded, dict):
+            raise self._refused(route, status, decoded)
+        return decoded
+
+    # -- searching, and covering what the helper's caps left out ------------
+
+    def _files_with_long_lines(self) -> tuple[list[str], str | None]:
+        """The tracked files holding a line the helper only partly searches,
+        found once per reader; and a sentence when that list is incomplete."""
+        if self._long_line_files is None:
+            answer = self._search_once(
+                {"pattern": f".{{{_HELPER_LINE_CHARS}}}", "max_results": _SEARCH_MAX_RESULTS}
+            )
+            files = list(
+                dict.fromkeys(str(m.get("path") or "") for m in answer.get("matches") or [])
+            )
+            gap = None
+            if answer.get("capped") or answer.get("timed_out"):
+                gap = (
+                    "more files hold lines longer than "
+                    f"{_HELPER_LINE_CHARS} characters than could be listed"
+                )
+            self._long_line_files = ([f for f in files if f], gap)
+        return self._long_line_files
+
+    def _search(
+        self,
+        text: str,
+        *,
+        ignore_case: bool,
+        relevant: Callable[[str], bool] | None = None,
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        """Every match for ``text`` — recovered where the helper cut — and the
+        plain sentences saying what could still not be searched."""
+        body: dict[str, Any] = {
+            "pattern": text,
+            "fixed_string": True,
+            "case_insensitive": bool(ignore_case),
+            "max_results": _SEARCH_MAX_RESULTS,
+        }
+        needle = text.lower() if ignore_case else text
+        found: dict[tuple[str, int], dict[str, Any]] = {}
+        gaps: list[str] = []
+        unrecovered: list[str] = []
+        read_whole: set[str] = set()
+        spent = [0]
+
+        def add(matches: Any) -> None:
+            for m in matches or []:
+                if isinstance(m, dict) and m.get("path") and m.get("line") is not None:
+                    found.setdefault((str(m["path"]), int(m["line"])), m)
+
+        def budget_left() -> bool:
+            return spent[0] < _MAX_RECOVERY_REQUESTS
+
+        def read_and_search(path: str) -> None:
+            if path in read_whole:
+                return
+            if relevant is not None and not relevant(path):
+                return  # the caller would set it aside anyway
+            if not budget_left():
+                unrecovered.append(f"`{path}`")
+                return
+            spent[0] += 1
+            content = self.read_text(path)
+            if content is None:
+                gaps.append(f"`{path}` could not be searched in full (too large or not text)")
+                return
+            read_whole.add(path)
+            for number, line in enumerate(content.split("\n"), start=1):
+                hay = line.lower() if ignore_case else line
+                if needle in hay:
+                    found.setdefault((path, number), {"path": path, "line": number, "text": line[:200]})
+
+        def cover(under: str | None) -> None:
+            answer = self._search_once({**body, **({"under": under} if under else {})})
+            add(answer.get("matches"))
+            where = f"`{under}/`" if under else "the repository"
+            if int(answer.get("long_lines_partly_searched") or 0):
+                files, gap = self._files_with_long_lines()
+                for path in files:
+                    if under is None or path.startswith(under + "/"):
+                        read_and_search(path)
+                if gap:
+                    gaps.append(f"in {where}, {gap}, so some long lines were checked only in part")
+            if answer.get("timed_out"):
+                gaps.append(
+                    f"the search in {where} stopped at the helper's time limit after "
+                    f"{answer.get('files_searched', 'some')} file(s)"
+                )
+                return
+            if not answer.get("capped"):
+                return
+            matches = [m for m in answer.get("matches") or [] if isinstance(m, dict)]
+            if not matches:
+                gaps.append(f"the search in {where} was cut short")
+                return
+            # The helper walks full paths in sorted order: everything that
+            # sorts before the file it stopped in was searched; that file
+            # and everything after it was not.
+            last = str(matches[-1].get("path") or "")
+            head = (under + "/") if under else ""
+            inside = [p for p in self.list_files() if p.startswith(head)]
+            if self.listing_cut is not None:
+                # The helper's search walks every tracked file, but its
+                # listing stops at 5,000: files past the listing can never be
+                # proven recovered, so this search stays marked partial.
+                gaps.append(
+                    f"the search in {where} was cut short and the file list "
+                    "used to finish it was itself incomplete, so some files "
+                    "may not have been searched"
+                )
+            folders: dict[str, list[str]] = {}
+            files: list[str] = []
+            for path in inside:
+                rest = path[len(head):]
+                if "/" in rest:
+                    folders.setdefault(head + rest.split("/", 1)[0], []).append(path)
+                else:
+                    files.append(path)
+            for folder, members in sorted(folders.items()):
+                if max(members) < last:
+                    continue  # searched whole before the cut
+                if relevant is not None and not any(relevant(m) for m in members):
+                    continue  # nothing in it the caller would use
+                if not budget_left():
+                    unrecovered.append(f"`{folder}/`")
+                    continue
+                spent[0] += 1
+                cover(folder)
+            for path in files:
+                if path >= last:
+                    read_and_search(path)
+
+        cover(None)
+        if unrecovered:
+            shown = ", ".join(unrecovered[:3])
+            more = f" and {len(unrecovered) - 3} more" if len(unrecovered) > 3 else ""
+            gaps.append(
+                f"{len(unrecovered)} part(s) of the repository past the helper's "
+                f"cap were not searched ({shown}{more}) — too many pieces to recover"
+            )
+        ordered = [found[key] for key in sorted(found)]
+        sentences = [f"the search for `{text}`: {gap}" for gap in dict.fromkeys(gaps)]
+        return ordered, sentences
+
+    def files_mentioning(
+        self,
+        text: str,
+        *,
+        ignore_case: bool = False,
+        relevant: Callable[[str], bool] | None = None,
+    ) -> list[str]:
+        """The files whose text holds ``text``. ``relevant``, when given, says
+        which files the caller can use: what the helper's caps left out is
+        recovered — and reported missing — only for those."""
+        matches, gaps = self._search(text, ignore_case=ignore_case, relevant=relevant)
+        self.cuts.extend(gaps)
+        return list(dict.fromkeys(str(m.get("path")) for m in matches if m.get("path")))
+
+    def places_mentioning(self, text: str) -> list[str]:
+        matches, gaps = self._search(text, ignore_case=False)
+        places = PartialPlaces(
+            dict.fromkeys(f"{m.get('path')}:{m.get('line')}" for m in matches)
+        )
+        if gaps:
+            places.cut = "; ".join(gaps)
+        return places
+
+    def read_text(self, path: str) -> str | None:
+        status, decoded = self._answer("/code/read-file", {"path": path})
+        if status == 200 and isinstance(decoded, dict) and not decoded.get("partial"):
+            content = decoded.get("content")
+            return content if isinstance(content, str) else None
+        if 400 <= status < 500:
+            # This one file is not served; the repository still is. The
+            # helper's reason is kept so the sheet can say it.
+            error = decoded.get("error") if isinstance(decoded, dict) else decoded
+            self.refused[path] = f"the helper answered {status}: {str(error or 'no reason given')[:200]}"
+            return None
+        raise self._refused("/code/read-file", status, decoded)
+
+
 class SidecarGitRunner:
     """The :class:`~forge.planning.handoff.GitRunner` protocol over the
     sandbox sidecar's git routes, for ONE repository.
@@ -161,6 +504,11 @@ class SidecarGitRunner:
     def supports_declared_checks(self) -> bool:
         """This runner takes the declared form, never a closure."""
         return True
+
+    def code_reader(self) -> SidecarCodeReader:
+        """A reader of this repository's tracked files through the helper's
+        read-only code door — what the planner's fact sheet reads."""
+        return SidecarCodeReader(self._base_url, repo=self._repo, post=self._post)
 
     # -- the wire ----------------------------------------------------------
 

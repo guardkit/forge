@@ -48,7 +48,6 @@ import logging
 import math
 import os
 import re
-import subprocess
 import tempfile
 import time
 from dataclasses import dataclass, field
@@ -99,7 +98,13 @@ from forge.planning.planner import (
     plan_next_step,
 )
 from forge.planning.assumption_review import review_assumptions
-from forge.planning.repository_facts import what_the_repository_already_does
+from forge.planning.repository_facts import (
+    LocalCheckoutReader,
+    RepositoryFacts,
+    RepositoryUnreadable,
+    read_repository_facts,
+    unavailable_text,
+)
 from forge.planning.task_traceability import review_task_traceability
 from forge.planning.revision import (
     CYCLE_CAP,
@@ -825,6 +830,34 @@ _PROVABILITY_REWRITTEN_CARD_LINE = (
     "(they described the database or the code rather than what a caller "
     "sees). What changed: {changes}."
 )
+
+#: Where the plan leg's approved record carries that line for the build gate
+#: (:func:`forge.cli._serve_gate_activation.maybe_gate_build` reads it).
+PLAN_REPOSITORY_UNAVAILABLE_KEY = "repository_unavailable"
+
+#: The spec card's line when the planner could not read the repository
+#: (release -3 item 10, 1 October 2026). Plain words; the reason is the
+#: reader's own clause.
+_REPOSITORY_FACTS_UNAVAILABLE_CARD_LINE = (
+    "The machine could not read the repository while writing this, so nothing "
+    "checked it against what the repository already has ({reason})."
+)
+
+#: The cards' line when the planner read the repository only in part (a file
+#: it chose was refused, or an answer was cut short and could not be
+#: recovered). What was read was used; the reason is shortened for a card.
+_REPOSITORY_FACTS_PARTIAL_CARD_LINE = (
+    "The machine could read the repository only in part while writing this, "
+    "so some of what it already has may not have been checked ({reason})."
+)
+
+
+def _partial_card_line(reason: str) -> str:
+    text = " ".join(str(reason).split())
+    if len(text) > 300:
+        text = text[:299].rstrip() + "\u2026"
+    return _REPOSITORY_FACTS_PARTIAL_CARD_LINE.format(reason=text)
+
 
 #: The card's line when examples are still unprovable after the round — or
 #: when the checker refused the machine's rewrite, so the card opens on the
@@ -2900,7 +2933,7 @@ class PlanningRunDriver:
                 # The coach's ground truth (2026-09-13): the sentence, word for
                 # word, and what the repository already does for its words.
                 request_text=self._request_text_of(row),
-                repository_facts=self._repository_facts_for(correlation_id, repo_path, row),
+                repository_facts=await self._repository_facts_for(correlation_id, repo_path, row),
             )
         except Exception as exc:  # noqa: BLE001 — dispatch boundary
             await self._fail_leg(
@@ -3282,20 +3315,130 @@ class PlanningRunDriver:
         except (KeyError, IndexError, TypeError):
             return str(getattr(row, "request_text", "") or "")
 
-    def _repository_facts_for(self, correlation_id: str, repo_path: str, row: Any) -> str | None:
-        """The fact sheet for this run, made once and kept for the leg.
+    async def _repository_facts_for(
+        self, correlation_id: str, repo_path: str, row: Any
+    ) -> str | None:
+        """The fact sheet's text for this run, made once and kept for the leg.
 
-        Read by ordinary code from the repository at ``repo_path`` (the same
-        checkout the spec-words finder reads). ``None`` when the request
-        names no route the repository has anything to say about, so the
-        dispatch is byte for byte what it was.
+        What the coach and the deterministic reviewers are given: the facts,
+        or — when the repository could not be read — the explicit
+        "Repository facts unavailable: <reason>" sentence (1 October 2026,
+        release -3 item 10). ``None`` only when the request has nothing to
+        look for or the repository has nothing to say about it, so the
+        dispatch is then byte for byte what it was.
         """
-        cache: dict[str, str | None] = self.__dict__.setdefault("_repository_facts_cache", {})
+        return (await self._repository_facts_state(correlation_id, repo_path, row)).text
+
+    async def _repository_facts_state(
+        self, correlation_id: str, repo_path: str, row: Any
+    ) -> RepositoryFacts:
+        """The whole answer, cached per run so the coach, the reviewers and
+        the card all see the same sheet. Read off the event loop: a sandboxed
+        repository is a dozen small HTTP reads."""
+        cache: dict[str, RepositoryFacts] = self.__dict__.setdefault(
+            "_repository_facts_cache", {}
+        )
         if correlation_id not in cache:
-            cache[correlation_id] = what_the_repository_already_does(
-                repo_path, self._request_text_of(row)
+            reader = self._repository_reader_for(repo_path, correlation_id)
+            facts = await asyncio.to_thread(
+                read_repository_facts, reader, self._request_text_of(row)
             )
+            if facts.unavailable:
+                logger.warning(
+                    "planning driver: run %s — the planner's repository facts "
+                    "are UNAVAILABLE (%s); the coach is told so, and so is the card",
+                    correlation_id,
+                    facts.unavailable,
+                )
+            cache[correlation_id] = facts
         return cache[correlation_id]
+
+    def _repository_reader_for(self, repo_path: str, correlation_id: str | None = None) -> Any:
+        """Where the fact sheet reads the repository: wherever every other
+        planning call for ``repo_path`` goes.
+
+        A sandboxed repository's git runner (its helper's
+        :class:`~forge.planning.sidecar_git_runner.SidecarGitRunner`, reached
+        through the routed runner exactly as the spec branch's own writes
+        are) offers a ``code_reader`` over the helper's read-only ``/code``
+        routes, on the factory's own clone inside the sandbox — the copy the
+        builds see. Every other repository is read from the checkout the
+        coordinator holds, as before. There is deliberately no fallback from
+        one to the other: a helper that cannot be reached is said on the
+        card, not papered over with a checkout that may be a different copy.
+
+        With ``correlation_id`` the reader is kept for the run, so a helper
+        found unreachable once is not waited on again by every later read of
+        the same run (release -3 item 10, review round 1).
+        """
+        cache: dict[tuple[str, str], Any] = self.__dict__.setdefault("_repository_readers", {})
+        key = (str(correlation_id), str(repo_path))
+        if correlation_id is not None and key in cache:
+            return cache[key]
+        runner = self._deps.git_runner
+        route = getattr(runner, "runner_for_path", None)
+        if callable(route):
+            runner = route(repo_path)
+        make = getattr(runner, "code_reader", None)
+        reader = make() if callable(make) else LocalCheckoutReader(repo_path)
+        if correlation_id is not None:
+            cache[key] = reader
+        return reader
+
+    async def _plan_repository_facts(
+        self, correlation_id: str, repo_path: str, row: Any
+    ) -> str | None:
+        """What the plan-writer's coach is given as ``repository_facts``: the
+        fact sheet, plus — when the descriptor's inventory or the search for
+        the specification's words could not read the repository — the same
+        "Repository facts unavailable: <reason>" sentence (release -3 item
+        10). Said once: a sheet already unavailable is not repeated."""
+        facts = await self._repository_facts_state(correlation_id, repo_path, row)
+        parts = [facts.text] if facts.text else []
+        reason = (self.__dict__.get("_descriptor_unavailable") or {}).get(correlation_id)
+        if reason and not facts.unavailable:
+            parts.append(unavailable_text(reason))
+        partly = (self.__dict__.get("_descriptor_partial") or {}).get(correlation_id)
+        if partly:
+            # Read in part is not "could not be read": said as what it is.
+            parts.append(
+                "Repository facts partly read: "
+                + "; ".join(dict.fromkeys(partly))
+                + ". What was found is listed; it may not be everything."
+            )
+        return "\n".join(parts) if parts else None
+
+    def _repository_unavailable_line(self, correlation_id: str) -> str | None:
+        """The plain line for the build gate: the fact sheet's state, else the
+        plan-writer's descriptor's (its inventory, rules, test folders or the
+        specification's words) — "could not read" before "read only in
+        part"; ``None`` when everything the planner reads was read."""
+        cache = self.__dict__.get("_repository_facts_cache") or {}
+        facts = cache.get(correlation_id)
+        if facts is not None and facts.unavailable:
+            return _REPOSITORY_FACTS_UNAVAILABLE_CARD_LINE.format(reason=facts.unavailable)
+        reason = (self.__dict__.get("_descriptor_unavailable") or {}).get(correlation_id)
+        if reason:
+            return _REPOSITORY_FACTS_UNAVAILABLE_CARD_LINE.format(reason=reason)
+        if facts is not None and facts.partial:
+            return _partial_card_line(facts.partial)
+        partly = (self.__dict__.get("_descriptor_partial") or {}).get(correlation_id)
+        if partly:
+            return _partial_card_line("; ".join(dict.fromkeys(partly)))
+        return None
+
+    def _repository_facts_card_line(self, correlation_id: str) -> str | None:
+        """The card's one line when the planner could not read the
+        repository; ``None`` when it could (or never had to)."""
+        cache = self.__dict__.get("_repository_facts_cache") or {}
+        facts = cache.get(correlation_id)
+        if facts is None:
+            return None
+        if facts.unavailable:
+            return _REPOSITORY_FACTS_UNAVAILABLE_CARD_LINE.format(reason=facts.unavailable)
+        if facts.partial:
+            return _partial_card_line(facts.partial)
+        return None
 
     async def _review_assumptions_on_branch(
         self,
@@ -3362,7 +3505,7 @@ class PlanningRunDriver:
         deps = self._deps
         request_text = self._request_text_of(row)
         try:
-            facts = self._repository_facts_for(correlation_id, repo_path, row)
+            facts = await self._repository_facts_for(correlation_id, repo_path, row)
             review = await self._review_assumptions_on_branch(
                 draft, repo_path=repo_path, branch=branch, request_text=request_text, repository_facts=facts
             )
@@ -3766,6 +3909,17 @@ class PlanningRunDriver:
             card["what_happened"] = f"{card.get('what_happened', '')} {added}".strip()
             final["card"] = card
             provability["card_line"] = added
+        unavailable_line = self._repository_facts_card_line(correlation_id)
+        if unavailable_line is not None:
+            # Silence was the bug (1 October 2026, release -3 item 10): the
+            # person approving the spec is told the checker never saw the
+            # repository, and why. Receipted on the draft row beside the card.
+            card = dict(final.get("card") or {})
+            card["what_happened"] = (
+                f"{card.get('what_happened', '')} {unavailable_line}".strip()
+            )
+            final["card"] = card
+            final["repository_facts_unavailable"] = unavailable_line
         final["provability"] = provability
         self._record_spec_draft(correlation_id, final, note_from_machine=False)
         return final
@@ -5041,9 +5195,25 @@ class PlanningRunDriver:
                 f"(spec_files={sorted(spec_files)})",
             )
             return None
-        target_repo_descriptor = self._build_target_repo_descriptor(
-            target_repo, repo_path, spec_feature
+        descriptor_unavailable: list[str] = []
+        descriptor_partial: list[str] = []
+        target_repo_descriptor = await asyncio.to_thread(
+            self._build_target_repo_descriptor,
+            target_repo,
+            repo_path,
+            spec_feature,
+            reader=self._repository_reader_for(repo_path, correlation_id),
+            unavailable=descriptor_unavailable,
+            partial=descriptor_partial,
         )
+        if descriptor_unavailable:
+            self.__dict__.setdefault("_descriptor_unavailable", {})[correlation_id] = (
+                descriptor_unavailable[0]
+            )
+        if descriptor_partial:
+            self.__dict__.setdefault("_descriptor_partial", {})[correlation_id] = list(
+                descriptor_partial
+            )
         # WHERE the specification sits, beside WHAT it says (2026-08-22). These
         # are the same paths the stamp normalizer uses further down; they are
         # computed HERE, before the dispatch, because the plan-writer needs them
@@ -5095,7 +5265,7 @@ class PlanningRunDriver:
                 # repository already does for the words it uses. Absent, the
                 # wire is byte for byte what it was.
                 request_text=self._request_text_of(row),
-                repository_facts=self._repository_facts_for(
+                repository_facts=await self._plan_repository_facts(
                     correlation_id, repo_path, row
                 ),
                 **extra,
@@ -5464,7 +5634,7 @@ class PlanningRunDriver:
             )
             return files, receipt
         try:
-            facts = self._repository_facts_for(correlation_id, repo_path, row)
+            facts = await self._repository_facts_for(correlation_id, repo_path, row)
             review = review_task_traceability(
                 files,
                 request_text=request_text,
@@ -6736,6 +6906,12 @@ class PlanningRunDriver:
             details["stamp_normalizer"] = stamp_receipt
         if semantic_review is not None:
             details["semantic_review"] = semantic_review
+        unavailable_line = self._repository_unavailable_line(correlation_id)
+        if unavailable_line is not None:
+            # Read by the build gate (release -3 item 10): the card the person
+            # taps to start the build says the plan was written without the
+            # repository, in the same words as the spec card.
+            details[PLAN_REPOSITORY_UNAVAILABLE_KEY] = unavailable_line
         deps.store._record_event(
             correlation_id=correlation_id,
             stage_label=_FEATURE_PLAN_STAGE,
@@ -9705,7 +9881,13 @@ class PlanningRunDriver:
         return "\n".join(header) + "\n" + body
 
     @staticmethod
-    def _read_architecture_rules(repo_path: str) -> dict[str, Any] | None:
+    def _read_architecture_rules(
+        repo_path: str,
+        *,
+        reader: Any = None,
+        unavailable: list[str] | None = None,
+        partial: list[str] | None = None,
+    ) -> dict[str, Any] | None:
         """Read the target repo's own written architecture rules, if it has any.
 
         A repository may keep its rules in one file — api_test keeps
@@ -9721,6 +9903,12 @@ class PlanningRunDriver:
         byte-for-byte what it was before this existed. A file that cannot be read
         or is the wrong shape is a logged warning and ``None`` as well: a rules
         file must never be able to stop a planning run.
+
+        For a repository read through its sandbox helper (``reader`` is not a
+        local checkout reader; release -3 item 10), the file is read with the
+        helper's ``/code/read-file`` on the factory's own clone. A helper that
+        cannot be reached is not "no rules file": its reason is appended to
+        ``unavailable`` so the plan-writer is told.
         """
 
         def _clip(text: str) -> str:
@@ -9729,11 +9917,41 @@ class PlanningRunDriver:
                 return text
             return text[: _MAX_ARCHITECTURE_RULE_CHARS - 1].rstrip() + "\u2026"
 
-        path = Path(repo_path) / _ARCHITECTURE_RULES_REL
+        path: Any = Path(repo_path) / _ARCHITECTURE_RULES_REL
         try:
-            if not path.is_file():
-                return None
-            data = yaml.safe_load(path.read_text(encoding="utf-8"))
+            if reader is not None and not isinstance(reader, LocalCheckoutReader):
+                path = f"{_ARCHITECTURE_RULES_REL} ({getattr(reader, 'where', 'the helper')})"
+                try:
+                    if _ARCHITECTURE_RULES_REL not in set(reader.list_files()):
+                        return None  # the repository keeps no rules file
+                    text = reader.read_text(_ARCHITECTURE_RULES_REL)
+                except RepositoryUnreadable as exc:
+                    logger.warning(
+                        "target_repo_descriptor: could not read the target "
+                        "repo's architecture rules (%s); planning without them, "
+                        "and the plan-writer is told so",
+                        exc,
+                    )
+                    if unavailable is not None:
+                        unavailable.append(str(exc))
+                    return None
+                if text is None:
+                    # Not there is not the same as there and refused: a
+                    # tracked rules file the helper would not serve is said.
+                    why = (getattr(reader, "refused", None) or {}).get(
+                        _ARCHITECTURE_RULES_REL, "it was not served"
+                    )
+                    if partial is not None:
+                        partial.append(
+                            f"the architecture rules file `{_ARCHITECTURE_RULES_REL}` "
+                            f"could not be read ({why})"
+                        )
+                    return None
+                data = yaml.safe_load(text)
+            else:
+                if not path.is_file():
+                    return None
+                data = yaml.safe_load(path.read_text(encoding="utf-8"))
         except Exception as exc:  # noqa: BLE001 — never fail a plan over this
             logger.warning(
                 "target_repo_descriptor: could not read the target repo's "
@@ -9789,7 +10007,12 @@ class PlanningRunDriver:
         return {"source_file": _ARCHITECTURE_RULES_REL, "rules": rules}
 
     @staticmethod
-    def _read_repository_inventory(repo_path: str) -> dict[str, Any] | None:
+    def _read_repository_inventory(
+        repo_path: str,
+        *,
+        reader: Any = None,
+        unavailable: list[str] | None = None,
+    ) -> dict[str, Any] | None:
         """Read what the target repository already contains, for the plan seat.
 
         The plan-writer is handed the specification's words and a small
@@ -9822,63 +10045,56 @@ class PlanningRunDriver:
         * Everything is sorted, so two runs on the same tree produce the same
           bytes.
 
-        Honest about WHICH copy this reads: it is the checkout forge itself can
-        see. For a repository that has a sandbox, that is the host's copy of the
-        same repository rather than the sandbox's private clone — the same
-        approximation :meth:`_read_architecture_rules` already makes, and
-        accurate for the shape of the tree, which is what the seat needs.
-        Asking the repository's sidecar instead is a later step, if it ever
-        proves to matter.
+        WHICH COPY (1 October 2026, release -3 item 10): ``reader`` is the
+        planner's repository reader — for a repository with a sandbox, the
+        helper's read-only ``/code/list-files`` on the factory's own clone;
+        otherwise the checkout at ``repo_path``. In the containerised
+        coordinator that checkout does not exist, and this used to answer
+        ``None`` with a log line nobody read, so the plan-writer planned
+        without the inventory and was never told.
 
         Anything that goes wrong — no path, no git, not a git repository, a
-        timeout, a non-zero exit, an unreadable tree — is ``None``, one plain
-        WARNING line naming what happened, no key in the descriptor, and
-        planning exactly as it is today. Like the rules file, an inventory must
-        never be able to stop a planning run, which is why the whole reader sits
-        inside one try/except.
+        timeout, a non-zero exit, a helper that cannot be reached — is
+        ``None`` and one plain WARNING line; the reason is also appended to
+        ``unavailable`` when the caller passes it, and the descriptor then
+        tells the plan-writer the repository could not be read. An inventory
+        must never be able to stop a planning run, which is why the whole
+        reader sits inside one try/except.
         """
         try:
-            path = Path(repo_path)
-            # `git -C` walks UP to find a repository, so a plain directory
-            # inside somebody else's checkout would otherwise answer with that
-            # checkout's files. The repository's own marker is asked for first
-            # (a file for a worktree, a directory for a normal clone).
-            if not (path / ".git").exists():
-                logger.warning(
-                    "target_repo_descriptor: %s is not a git repository (no "
-                    ".git); planning without the repository inventory",
-                    path,
-                )
-                return None
-            completed = subprocess.run(
-                [
-                    "git",
-                    "-c",
-                    "safe.directory=*",
-                    "-C",
-                    str(path),
-                    "ls-files",
-                    "-z",
-                ],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=_REPO_INVENTORY_GIT_TIMEOUT_SECONDS,
-                check=False,
+            reader = reader or LocalCheckoutReader(
+                repo_path, timeout_s=_REPO_INVENTORY_GIT_TIMEOUT_SECONDS
             )
-            if completed.returncode != 0:
+            try:
+                tracked = reader.list_files()
+            except RepositoryUnreadable as exc:
+                # Said, not swallowed (release -3 item 10, 1 October 2026):
+                # the reason goes back to the descriptor, which tells the
+                # plan-writer the inventory is missing and why.
                 logger.warning(
-                    "target_repo_descriptor: listing the tracked files of %s "
-                    "failed (git exited %d: %s); planning without the "
-                    "repository inventory",
-                    path,
-                    completed.returncode,
-                    " ".join((completed.stderr or "").split())[:200],
+                    "target_repo_descriptor: could not list the tracked files "
+                    "of %s (%s); planning without the repository inventory, "
+                    "and the plan-writer is told so",
+                    getattr(reader, "where", repo_path),
+                    exc,
                 )
+                if unavailable is not None:
+                    unavailable.append(str(exc))
                 return None
-
-            tracked = [entry for entry in completed.stdout.split("\0") if entry]
+            path = getattr(reader, "where", repo_path)
+            cut = getattr(reader, "listing_cut", None)
+            if isinstance(cut, str) and cut:
+                # A cut listing sent as the inventory would read as the whole
+                # repository; it is said instead.
+                logger.warning(
+                    "target_repo_descriptor: %s (%s); planning without the "
+                    "repository inventory, and the plan-writer is told so",
+                    cut,
+                    path,
+                )
+                if unavailable is not None:
+                    unavailable.append(cut)
+                return None
             files = sorted(
                 entry
                 for entry in tracked
@@ -9923,11 +10139,20 @@ class PlanningRunDriver:
                 repo_path,
                 exc,
             )
+            if unavailable is not None:
+                unavailable.append(
+                    f"listing the repository's files failed ({type(exc).__name__})"
+                )
             return None
 
     @staticmethod
     def _where_the_specs_words_already_appear(
-        repo_path: str, spec_feature: str
+        repo_path: str,
+        spec_feature: str,
+        *,
+        reader: Any = None,
+        unavailable: list[str] | None = None,
+        partial: list[str] | None = None,
     ) -> list[dict[str, Any]] | None:
         """Where this feature's own words already occur in the repository.
 
@@ -9956,7 +10181,19 @@ class PlanningRunDriver:
         the descriptor simply has no such key and planning is byte for byte what
         it is today. Never raises: like the inventory beside it, this must never
         be able to stop a planning run.
+
+        Read through ``reader`` (1 October 2026, release -3 item 10): the
+        helper's ``/code/search`` for a sandboxed repository, ``git grep`` on
+        the checkout otherwise. A repository that cannot be read is ``None``
+        with its reason appended to ``unavailable``, never a quiet "not found".
+
+        WHAT WAS READ IS KEPT (release -3 item 10, review round 1). A word
+        whose search came back incomplete (the helper's caps) keeps the
+        places it found and is named in ``partial`` in plain words; it is not
+        "the repository could not be read". A helper that stops answering
+        part-way keeps every word already looked up.
         """
+        reader = reader or LocalCheckoutReader(repo_path)
         try:
             # The specification's OWN words, not the file's furniture. A
             # .feature carries a generated header ("# Generated by
@@ -9988,7 +10225,10 @@ class PlanningRunDriver:
                 return None
 
             found: list[dict[str, Any]] = []
+            stopped: str | None = None
             for word in words:
+                if stopped:
+                    break
                 # The word as the specification wrote it, and the two other
                 # shapes a repository commonly spells the same name in. A route
                 # written /users/count-today is a function named count_today
@@ -9997,29 +10237,18 @@ class PlanningRunDriver:
                 spellings = {word, tail, tail.replace("-", "_"), tail.replace("_", "-")}
                 places: list[str] = []
                 for spelling in sorted(s for s in spellings if len(s) > 3):
-                    completed = subprocess.run(
-                        [
-                            "git",
-                            "-c",
-                            "safe.directory=*",
-                            "-C",
-                            str(repo_path),
-                            "grep",
-                            "-n",
-                            "--fixed-strings",
-                            "--",
-                            spelling,
-                        ],
-                        capture_output=True,
-                        text=True,
-                        timeout=30,
-                        check=False,
-                    )
-                    # git grep exits 1 when it found nothing: not an error.
-                    if completed.returncode not in (0, 1):
-                        continue
-                    for line in completed.stdout.splitlines():
-                        path_and_line = ":".join(line.split(":", 2)[:2])
+                    try:
+                        answer = reader.places_mentioning(spelling)
+                    except RepositoryUnreadable as exc:
+                        stopped = str(exc)
+                        break
+                    cut = getattr(answer, "cut", None)
+                    if cut and partial is not None:
+                        partial.append(
+                            f"where `{spelling}` already appears was only partly "
+                            f"searched ({cut})"
+                        )
+                    for path_and_line in answer:
                         if any(
                             path_and_line.startswith(prefix)
                             for prefix in _REPO_INVENTORY_SKIP_PREFIXES
@@ -10051,7 +10280,28 @@ class PlanningRunDriver:
                     found.append(
                         {"words": word, "already_in": places[:_MAX_PLACES_PER_SPEC_WORD]}
                     )
+            if stopped:
+                logger.warning(
+                    "target_repo_descriptor: stopped looking for the "
+                    "specification's words in %s (%s); the words already looked "
+                    "up are kept, and the plan-writer is told the rest",
+                    getattr(reader, "where", repo_path),
+                    stopped,
+                )
+                if unavailable is not None:
+                    unavailable.append(stopped)
             return found or None
+        except RepositoryUnreadable as exc:
+            logger.warning(
+                "target_repo_descriptor: could not look for the "
+                "specification's words in %s (%s); planning without them, and "
+                "the plan-writer is told so",
+                getattr(reader, "where", repo_path),
+                exc,
+            )
+            if unavailable is not None:
+                unavailable.append(str(exc))
+            return None
         except Exception as exc:  # noqa: BLE001 — never fail a plan over this
             logger.warning(
                 "target_repo_descriptor: could not look for the "
@@ -10059,11 +10309,21 @@ class PlanningRunDriver:
                 repo_path,
                 exc,
             )
+            if unavailable is not None:
+                unavailable.append(
+                    f"searching the repository failed ({type(exc).__name__})"
+                )
             return None
 
     @staticmethod
     def _build_target_repo_descriptor(
-        target_repo: str, repo_path: str, spec_feature: str = ""
+        target_repo: str,
+        repo_path: str,
+        spec_feature: str = "",
+        *,
+        reader: Any = None,
+        unavailable: list[str] | None = None,
+        partial: list[str] | None = None,
     ) -> dict[str, Any]:
         """Build the 008 ``target_repo_descriptor`` honestly from what forge knows.
 
@@ -10100,39 +10360,70 @@ class PlanningRunDriver:
         from forge.planning.target_terminal_tools import (
             TargetTestRootsUnresolved,
             discover_target_test_roots,
+            discover_test_roots_from_listing,
             shallow_discover_test_roots,
         )
 
-        try:
-            test_roots = discover_target_test_roots(repo_path)
-        except TargetTestRootsUnresolved as exc:
-            # Degraded path: guardkit absent from the interpreter. Production
-            # images always ship guardkit (the Dockerfile asserts the import),
-            # so this only fires in a guardkit-less env where the real
-            # ``feature validate`` oracle cannot run either. Fall back to
-            # forge's own discovery so the descriptor is still built and the run
-            # reaches the oracle (the last line of defense) rather than crashing
-            # — log LOUDLY.
-            #
-            # The old fallback returned bare ``["tests"]`` / ``["test"]``, which
-            # is the ROUND-10 DEFECT SHAPE: a bare ``tests`` root is a prefix of
-            # every ``tests/<x>`` path, so the in-session containment gate waves
-            # through an invented subdirectory. The replacement reproduces
-            # guardkit's per-suite Python shape AND the TypeScript shapes, so the
-            # degraded answer has the same geometry as the healthy one.
-            logger.warning(
-                "target_repo_descriptor: guardkit test-root discovery "
-                "unavailable (%s); falling back to forge's own shallow "
-                "discovery — the roots are shape-correct but are not the "
-                "oracle's own answer",
-                exc,
-            )
-            test_roots = shallow_discover_test_roots(repo_path)
+        # Every read below goes through the planner's repository reader
+        # (1 October 2026, release -3 item 10): the sandbox helper for a
+        # sandboxed repository, the checkout otherwise. When the repository
+        # cannot be read the reason goes back through ``unavailable``; the
+        # descriptor gains no field its schema does not define, and the plan
+        # leg says it on the plan-writer's ``repository_facts`` instead.
+        reader = reader or LocalCheckoutReader(
+            repo_path, timeout_s=_REPO_INVENTORY_GIT_TIMEOUT_SECONDS
+        )
+        reasons: list[str] = []
+        begin = getattr(reader, "begin", None)
+        if callable(begin):
+            begin()  # one time allowance for the whole description
+        if not isinstance(reader, LocalCheckoutReader):
+            # No checkout here to walk: the same discovery runs over the
+            # helper's listing of the factory's own clone.
+            try:
+                test_roots = discover_test_roots_from_listing(reader.list_files())
+            except RepositoryUnreadable as exc:
+                logger.warning(
+                    "target_repo_descriptor: could not discover the test "
+                    "folders (%s); the plan-writer is told so",
+                    exc,
+                )
+                reasons.append(str(exc))
+                test_roots = []
+        else:
+            try:
+                test_roots = discover_target_test_roots(repo_path)
+            except TargetTestRootsUnresolved as exc:
+                # Degraded path: guardkit absent from the interpreter. Production
+                # images always ship guardkit (the Dockerfile asserts the import),
+                # so this only fires in a guardkit-less env where the real
+                # ``feature validate`` oracle cannot run either. Fall back to
+                # forge's own discovery so the descriptor is still built and the
+                # run reaches the oracle (the last line of defense) rather than
+                # crashing — log LOUDLY.
+                #
+                # The old fallback returned bare ``["tests"]`` / ``["test"]``,
+                # which is the ROUND-10 DEFECT SHAPE: a bare ``tests`` root is a
+                # prefix of every ``tests/<x>`` path, so the in-session
+                # containment gate waves through an invented subdirectory. The
+                # replacement reproduces guardkit's per-suite Python shape AND
+                # the TypeScript shapes, so the degraded answer has the same
+                # geometry as the healthy one.
+                logger.warning(
+                    "target_repo_descriptor: guardkit test-root discovery "
+                    "unavailable (%s); falling back to forge's own shallow "
+                    "discovery — the roots are shape-correct but are not the "
+                    "oracle's own answer",
+                    exc,
+                )
+                test_roots = shallow_discover_test_roots(repo_path)
         descriptor: dict[str, Any] = {"repo": target_repo, "test_roots": test_roots}
         # The repo's own architecture rules, when it keeps a rules file. Before
         # this, the plan-writer was never shown them, and two features built the
         # week of 2026-08-24 drifted from rules nobody had told it about.
-        architecture_rules = PlanningRunDriver._read_architecture_rules(repo_path)
+        architecture_rules = PlanningRunDriver._read_architecture_rules(
+            repo_path, reader=reader, unavailable=reasons, partial=partial
+        )
         if architecture_rules is not None:
             descriptor["architecture_rules"] = architecture_rules
         # What the repository ALREADY contains. Before this, the seat was told
@@ -10142,7 +10433,9 @@ class PlanningRunDriver:
         # born. Same shape of cure as the rules above: present only when the
         # repository can be read, absent otherwise, and planning unchanged when
         # it is absent (see :meth:`_read_repository_inventory`).
-        repository_inventory = PlanningRunDriver._read_repository_inventory(repo_path)
+        repository_inventory = PlanningRunDriver._read_repository_inventory(
+            repo_path, reader=reader, unavailable=reasons
+        )
         if repository_inventory is not None:
             descriptor["repository_inventory"] = repository_inventory
         # Names were not enough (FEAT-19C4): the writer knew the router file
@@ -10150,10 +10443,12 @@ class PlanningRunDriver:
         # when the specification has distinctive words AND the repository
         # already has them; absent, the plan is byte for byte what it is today.
         already_there = PlanningRunDriver._where_the_specs_words_already_appear(
-            repo_path, spec_feature
+            repo_path, spec_feature, reader=reader, unavailable=reasons, partial=partial
         )
         if already_there:
             descriptor["where_the_specs_words_already_appear"] = already_there
+        if reasons and unavailable is not None:
+            unavailable.extend(reasons)
         return descriptor
 
     def _has_leg_event(self, correlation_id: str, stage_label: str) -> bool:
