@@ -207,33 +207,61 @@ print(json.dumps({'text':text,'rules':rules,'publish':s['publish']+[s['sidecar_p
 # Atomic installation with byte-for-byte readback. The current template is the
 # only new bootstrap ever written; a rollback never reinstalls the old script.
 INSTALL = r'''
-import base64,hashlib,json,os,pathlib,sys,tempfile
+import base64,json,os,pathlib,stat,sys
 items=json.load(sys.stdin); staged=[]
+def overlap(a,b):
+ a=pathlib.PurePosixPath(a); b=pathlib.PurePosixPath(b)
+ return a==b or a.is_relative_to(b) or b.is_relative_to(a)
+def same(a,b): return (a.st_dev,a.st_ino)==(b.st_dev,b.st_ino)
 try:
  # Validate every destination and stage every byte before replacing any file.
  for item in items:
-  path=pathlib.Path(item['path']); root=pathlib.Path(item['root']); data=base64.b64decode(item['data'],validate=True)
-  if item.get('parent_mode') is not None and not path.parent.exists():
-   # The sandbox settings folder: made once, owner-writable only.
-   os.makedirs(path.parent,mode=item['parent_mode']); os.chmod(path.parent,item['parent_mode'])
-  assert path.is_absolute() and path.parent.is_dir() and not path.is_symlink()
-  assert item.get('parent_mode') is None or path.parent.stat().st_mode & 0o022 == 0
-  assert path.parent.resolve().is_relative_to(root.resolve())
-  fd,tmp=tempfile.mkstemp(prefix='.rollout-',dir=path.parent)
-  staged.append((path,tmp,data))
-  with os.fdopen(fd,'wb') as f: f.write(data); f.flush(); os.fsync(f.fileno())
-  os.chmod(tmp,item['mode'])
-  assert pathlib.Path(tmp).read_bytes()==data
- for path,tmp,data in staged:
-  os.replace(tmp,path)
-  assert path.read_bytes()==data
-  fd=os.open(path.parent,os.O_RDONLY|os.O_DIRECTORY)
-  try: os.fsync(fd)
+  path=pathlib.Path(item['path']); data=base64.b64decode(item['data'],validate=True)
+  assert path.is_absolute() and path.name not in ('','.','..')
+  if item.get('parent_mode') is not None:
+   # The sandbox settings folder: made one component at a time, owner-writable only.
+   built=pathlib.Path('/')
+   for part in path.parent.parts[1:]:
+    built=built/part
+    if not os.path.lexists(built):
+     os.mkdir(built,item['parent_mode']); os.chmod(built,item['parent_mode'])
+  # Every check is on the RESOLVED folder, and every write goes through one
+  # descriptor of it, so a link made after the check cannot redirect a byte.
+  parent=os.path.realpath(path.parent)
+  assert os.path.isdir(parent)
+  assert pathlib.Path(parent).is_relative_to(os.path.realpath(os.path.expanduser(item['root'])))
+  if item.get('real_parent') is not None: assert parent==item['real_parent']
+  for excluded in item.get('excluded',[]):
+   assert not overlap(os.path.join(parent,path.name),os.path.realpath(os.path.expanduser(excluded)))
+  dfd=os.open(parent,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+  entry=[dfd,os.fstat(dfd),parent,path,None,data]; staged.append(entry)
+  if item.get('parent_mode') is not None: assert entry[1].st_mode & 0o022 == 0
+  try: assert stat.S_ISREG(os.lstat(path.name,dir_fd=dfd).st_mode)
+  except FileNotFoundError: pass
+  entry[4]='.rollout-'+os.urandom(8).hex()
+  fd=os.open(entry[4],os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=dfd)
+  try:
+   view=memoryview(data)
+   while view: view=view[os.write(fd,view):]
+   os.fsync(fd); os.fchmod(fd,item['mode'])
   finally: os.close(fd)
+  fd=os.open(entry[4],os.O_RDONLY|os.O_NOFOLLOW,dir_fd=dfd)
+  try: assert b''.join(iter(lambda:os.read(fd,1048576),b''))==data
+  finally: os.close(fd)
+ for dfd,seen,parent,path,tmp,data in staged:
+  assert os.path.realpath(path.parent)==parent and same(os.stat(parent),seen)
+  os.replace(tmp,path.name,src_dir_fd=dfd,dst_dir_fd=dfd)
+  fd=os.open(path.name,os.O_RDONLY|os.O_NOFOLLOW,dir_fd=dfd)
+  try: assert b''.join(iter(lambda:os.read(fd,1048576),b''))==data
+  finally: os.close(fd)
+  os.fsync(dfd)
  print('installed-and-read-back')
 finally:
- for path,tmp,data in staged:
-  if os.path.exists(tmp): os.unlink(tmp)
+ for dfd,seen,parent,path,tmp,data in staged:
+  if tmp:
+   try: os.unlink(tmp,dir_fd=dfd)
+   except FileNotFoundError: pass
+  os.close(dfd)
 '''
 
 
@@ -289,7 +317,7 @@ import base64,errno,fcntl,hashlib,json,os,pathlib,subprocess,sys
 c=json.loads(sys.argv[1])
 def read(name):
  p=pathlib.Path(name)
- if not os.path.lexists(p): return None
+ if not os.path.lexists(p) or (name==c['files']['settings'] and p.is_symlink()): return None
  assert p.is_file() and not p.is_symlink()
  d=p.read_bytes()
  return {'sha256':hashlib.sha256(d).hexdigest(),'data':base64.b64encode(d).decode(),'mode':p.stat().st_mode&0o777}
@@ -322,11 +350,16 @@ if lock.exists():
    if e.errno not in (errno.EAGAIN,errno.EACCES): raise
    held=True
  finally: os.close(fd)
-parent=pathlib.Path(c['files']['settings']).parent
+parent=pathlib.Path(os.path.realpath(c['files']['settings'])).parent
 folder={'exists':parent.is_dir(),'mode':parent.stat().st_mode&0o777 if parent.is_dir() else None}
-runner_states=pathlib.Path(os.path.expanduser('~'))/'.forge-runner'
-in_state=pathlib.Path(c['files']['settings']).resolve().is_relative_to(runner_states.resolve())
-print(json.dumps({'files':files,'identity':identity,'identity_multiple':multiple,'settings_in_runner_state':in_state,'settings_folder':folder,'supervisor':{'record_present':record.exists(),'record_live':live,'lock_held':held}}))
+# The settings destination and every excluded root, RESOLVED here, where the
+# links are: a parent that links into the clone or a shared folder overlaps.
+def overlap(a,b):
+ a=pathlib.PurePosixPath(a); b=pathlib.PurePosixPath(b)
+ return a==b or a.is_relative_to(b) or b.is_relative_to(a)
+target=os.path.realpath(c['files']['settings'])
+overlaps=sorted(name for name,root in c['excluded'].items() if overlap(target,os.path.realpath(os.path.expanduser(root))))
+print(json.dumps({'files':files,'identity':identity,'identity_multiple':multiple,'settings_overlaps':overlaps,'settings_is_link':os.path.islink(c['files']['settings']),'settings_real_parent':os.path.dirname(target),'settings_folder':folder,'supervisor':{'record_present':record.exists(),'record_live':live,'lock_held':held}}))
 '''
 
 # Sets (value) or unsets (null) the clone-local user.name/user.email, values on
@@ -486,7 +519,11 @@ class Rollout:
         shared = {'sandbox.clone_path':s['clone_path'],'sandbox.receipts_path':s['receipts_path']}
         shared.update({name:value for name,value in self.forwarded_values.items()
                        if name != 'FORGE_CONFIG_PATH' and value.startswith('/') and not any(c in value for c in ' :,')})
+        shared['the template state folders (~/.forge-runner)'] = '~/.forge-runner'
+        self.excluded_roots = shared
         for name, folder in shared.items():
+            if folder.startswith('~'):
+                continue
             require(not self.settings_path.is_relative_to(PurePosixPath(folder)) and not PurePosixPath(folder).is_relative_to(self.settings_path),
                     f'sandbox.settings_path is inside {name}, a folder the sandbox shares or builds write; choose a path on the sandbox root filesystem outside the clone and every shared folder')
         keys = s.get('repo_keys')
@@ -529,8 +566,11 @@ class Rollout:
         result['sha256'] = digest(text.encode())
         return result
 
-    def settings_item(self, text):
-        return {'path':str(self.settings_path),'root':str(self.settings_path.parent),'data':base64.b64encode(text.encode()).decode(),'mode':0o644,'parent_mode':0o755}
+    def settings_item(self, text, real_parent=None):
+        # The excluded roots travel with the item: the install step resolves
+        # them inside the sandbox and refuses an overlap at write time too.
+        return {'path':str(self.settings_path),'root':str(self.settings_path.parent),'data':base64.b64encode(text.encode()).decode(),'mode':0o644,'parent_mode':0o755,
+                'excluded':sorted(set(self.excluded_roots.values())),'real_parent':real_parent}
 
     def run(self, argv, *, input=None, check=True, timeout=120, env=None):
         try:
@@ -879,15 +919,16 @@ class Rollout:
 
     def sandbox_state(self):
         files = {'template':self.s['script_path'],'profile':self.s['profile_path'],'settings':str(self.settings_path)}
-        out = self.inside('python3','-c',STATE,json.dumps({'files':files,'clone':self.s['clone_path'],'script':self.s['script_path']})).stdout
+        out = self.inside('python3','-c',STATE,json.dumps({'files':files,'clone':self.s['clone_path'],'script':self.s['script_path'],'excluded':self.excluded_roots})).stdout
         state = json.loads(out)
         require(isinstance(state,dict) and set(state.get('files',{})) == set(files) and set(state.get('identity',{})) == {'user.name','user.email'},
                 'the sandbox state is unreadable; inspect the clone before upgrading')
         supervisor = state['supervisor']
         require(not supervisor['record_live'] and not supervisor['lock_held'],
                 f'a supervisor of {self.s["script_path"]} is still running inside {self.s["name"]}; stop it with its own template first')
-        require(not state['settings_in_runner_state'],
-                f'sandbox.settings_path is inside the template\'s own state folders (~/.forge-runner) in {self.s["name"]}; choose a path outside them')
+        require(not state['settings_overlaps'],
+                f'sandbox.settings_path resolves inside {self.s["name"]} to {state["settings_real_parent"]}, which overlaps '+', '.join(state['settings_overlaps'])+'; builds could change it through that folder, so choose a path whose real location is outside the clone and every shared folder')
+        require(not state['settings_is_link'], f'sandbox.settings_path is itself a link inside {self.s["name"]}; name the real file')
         folder = state['settings_folder']
         if folder['exists'] and folder['mode'] & 0o022:
             raise Refusal(f'the settings folder {self.settings_path.parent} inside {self.s["name"]} is writable by others (mode {folder["mode"]:o}); make it 0755 before upgrading')
@@ -1028,7 +1069,7 @@ class Rollout:
         # one and hide whether release -3's own mechanism works.
         identity_after = self.set_identity({'user.name':None,'user.email':None})
         image_settings = self.handoff()
-        items = [self.settings_item(settings['text']),{'path':self.s['script_path'],'root':self.s['clone_path'],'data':base64.b64encode(template_new).decode(),'mode':0o755}]
+        items = [self.settings_item(settings['text'],state['settings_real_parent']),{'path':self.s['script_path'],'root':self.s['clone_path'],'data':base64.b64encode(template_new).decode(),'mode':0o755}]
         if profile_changed:
             items.append({'path':self.s['profile_path'],'root':self.s['clone_path'],'data':base64.b64encode(new_profile).decode(),'mode':0o644})
         self.inside('python3','-c',INSTALL,input=json.dumps(items))

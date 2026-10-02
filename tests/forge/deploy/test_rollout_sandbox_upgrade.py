@@ -628,7 +628,7 @@ def test_a_settings_path_reaching_the_state_folders_through_a_link_refuses(estat
     link=e['tmp']/'agent-link';link.symlink_to(state)
     e['config']['sandbox']['settings_path']=str(link/'forge.yaml')
     e['inventory'].write_text(json.dumps(e['config']))
-    _refused_and_unchanged(e,machine,e['args'],capsys,"template's own state folders")
+    _refused_and_unchanged(e,machine,e['args'],capsys,'overlaps the template state folders (~/.forge-runner)')
 
 
 def test_the_receipt_carries_what_switch_reads(estate,monkeypatch):
@@ -645,3 +645,80 @@ def test_the_receipt_carries_what_switch_reads(estate,monkeypatch):
     named=[json.loads(v) for k,_,v in (l.partition('=') for l in env_file.read_text().splitlines()) if k=='FORGE_CONFIG_PATH']
     assert named==[str(e['settings_path'])]
     assert receipt['settings_sha256']==m.digest(e['settings_path'].read_bytes())
+
+
+# ---------------------------------------------------------------------------
+# Codex tools review round 1, R2: the settings boundary is checked on RESOLVED
+# paths inside the sandbox, before installing and again at write time.
+# ---------------------------------------------------------------------------
+
+
+def _link_settings_into(e, target):
+    target.mkdir(parents=True,exist_ok=True)
+    link=e['tmp']/'agent-settings-link';link.symlink_to(target)
+    e['config']['sandbox']['settings_path']=str(link/'forge.yaml')
+    e['inventory'].write_text(json.dumps(e['config']))
+    return link
+
+
+@pytest.mark.parametrize('where,name',[
+    ('clone','sandbox.clone_path'),
+    ('receipts','sandbox.receipts_path'),
+    ('worktrees','FORGE_AUTOBUILD_WORKTREE_BASE'),
+])
+def test_a_symlinked_parent_into_the_clone_or_a_shared_folder_refuses(estate,monkeypatch,capsys,where,name):
+    e=estate
+    worktrees=e['tmp']/'worktrees';worktrees.mkdir()
+    env=Path(e['config']['env_file'])
+    env.write_text(env.read_text().replace('SANDBOX_ENV_NAMES=','SANDBOX_ENV_NAMES=FORGE_AUTOBUILD_WORKTREE_BASE ')
+                   +'FORGE_AUTOBUILD_WORKTREE_BASE='+str(worktrees)+'\n')
+    folder={'clone':e['clone']/'.guardkit'/'settings','receipts':Path(e['config']['sandbox']['receipts_path'])/'settings','worktrees':worktrees/'settings'}[where]
+    _link_settings_into(e,folder)
+    machine=Machine(e,monkeypatch)
+    error=_refused_and_unchanged(e,machine,e['args'],capsys,'which overlaps ')
+    assert name in error.split('which overlaps ',1)[1]
+    assert not (folder/'forge.yaml').exists()
+    assert not any(c[:3]==['systemctl','--user','mask'] for c in machine.calls)
+
+
+def test_a_plain_settings_path_is_accepted(estate,monkeypatch):
+    e=estate;machine=Machine(e,monkeypatch)
+    assert m.main(e['args'])==0
+    assert e['settings_path'].is_file() and not any(p.is_symlink() for p in [e['settings_path'],*e['settings_path'].parents])
+
+
+def _install(item):
+    return REAL_RUN([sys.executable,'-c',m.INSTALL],input=json.dumps([item]),text=True,capture_output=True)
+
+
+def test_the_install_step_refuses_an_excluded_root_reached_through_a_link(tmp_path):
+    clone=tmp_path/'clone';(clone/'inside').mkdir(parents=True);(clone/'inside').chmod(0o755)
+    link=tmp_path/'settings-link';link.symlink_to(clone/'inside')
+    item={'path':str(link/'forge.yaml'),'root':str(link),'data':base64.b64encode(b'x: 1\n').decode(),
+          'mode':0o644,'parent_mode':0o755,'excluded':[str(clone)],'real_parent':None}
+    r=_install(item)
+    assert r.returncode!=0
+    assert list((clone/'inside').iterdir())==[]
+
+
+def test_the_install_step_refuses_a_link_made_after_the_check(tmp_path):
+    """The check resolved the folder to A; by write time it is a link to B."""
+    checked=tmp_path/'agent'/'.forge-sandbox';checked.mkdir(parents=True)
+    elsewhere=tmp_path/'clone'/'inside';elsewhere.mkdir(parents=True);elsewhere.chmod(0o755)
+    real_parent=str(checked)
+    checked.rmdir();checked.symlink_to(elsewhere)
+    item={'path':str(checked/'forge.yaml'),'root':str(checked),'data':base64.b64encode(b'x: 1\n').decode(),
+          'mode':0o644,'parent_mode':0o755,'excluded':[],'real_parent':real_parent}
+    r=_install(item)
+    assert r.returncode!=0
+    assert list(elsewhere.iterdir())==[]
+
+
+def test_the_install_step_writes_a_plain_path_through_one_descriptor(tmp_path):
+    target=tmp_path/'agent'/'.forge-sandbox'/'owned'/'forge.yaml'
+    item={'path':str(target),'root':str(target.parent),'data':base64.b64encode(b'x: 1\n').decode(),
+          'mode':0o644,'parent_mode':0o755,'excluded':[str(tmp_path/'clone')],'real_parent':str(target.parent)}
+    r=_install(item)
+    assert r.returncode==0,r.stderr
+    assert target.read_bytes()==b'x: 1\n' and target.stat().st_mode&0o777==0o644
+    assert not [p for p in target.parent.iterdir() if p.name.startswith('.rollout-')]
