@@ -40,7 +40,8 @@ with open(os.environ['FAKE_SBX_LOG'], 'a') as log:
 name = os.environ.get('FAKE_SBX_NAME', 'fake-sandbox')
 status = os.environ.get('FAKE_SBX_STATUS', 'running')
 if args[:2] == ['ls', '--json']:
-    print(json.dumps({'sandboxes': [{'name': name, 'status': status}]}))
+    shared = json.loads(os.environ.get('FAKE_SBX_WORKSPACES', '[]'))
+    print(json.dumps({'sandboxes': [{'name': name, 'status': status, 'workspaces': shared}]}))
     raise SystemExit(0)
 if args[:1] == ['ls']:
     print('SANDBOX   AGENT   STATUS   PORTS   WORKSPACE')
@@ -63,6 +64,28 @@ if mutate and '"action": "stream"' in ' '.join(rest):
     # of the source and the copy of it.
     with open(mutate, 'ab') as stream:
         stream.write(b'written by somebody else during the copy')
+midstream = os.environ.get('FAKE_SBX_MIDSTREAM')
+if midstream and '"action": "stream"' in ' '.join(rest):
+    # A slow stream with a writer part-way through it: once enough of the
+    # stream has gone out to be past the first file, that file is appended to
+    # and a new file is added beside it - both after the folder was listed.
+    plan = json.loads(midstream)
+    producer = subprocess.Popen(rest, stdout=subprocess.PIPE)
+    sent, changed = 0, False
+    while True:
+        block = producer.stdout.read(65536)
+        if not block:
+            break
+        sys.stdout.buffer.write(block)
+        sent += len(block)
+        if not changed and sent >= plan['after_bytes']:
+            with open(plan['append'], 'ab') as stream:
+                stream.write(b'appended after it had streamed')
+            with open(plan['add'], 'wb') as stream:
+                stream.write(b'added after the folder was listed')
+            changed = True
+    sys.stdout.buffer.flush()
+    raise SystemExit(producer.wait())
 if rest[:2] == ['docker', 'exec']:
     # The build runner's own container: run its code here, with the runner's
     # environment as the test sets it.
@@ -70,6 +93,10 @@ if rest[:2] == ['docker', 'exec']:
         print('Error: No such container', file=sys.stderr)
         raise SystemExit(1)
     code = rest[rest.index('-c') + 1]
+    if os.environ.get('FAKE_RUNNER_NO_INODES'):
+        code = ('import forge.subagents.autobuild_worktree_lifecycle as l\n'
+                '_c = l._capacity\n'
+                'l._capacity = lambda p: dict(_c(p), available_inodes=0)\n') + code
     env = dict(os.environ, PYTHONPATH=os.environ['FAKE_RUNNER_PYTHONPATH'])
     os.execve(os.environ['FAKE_RUNNER_PYTHON'], [os.environ['FAKE_RUNNER_PYTHON'], '-c', code], env)
 os.execvp(rest[0], rest)
@@ -304,6 +331,60 @@ def test_a_source_that_changes_during_the_copy_is_reported_and_both_are_kept(san
     assert any("hello.txt" in line for line in record["differences"])
 
 
+def test_a_change_after_a_file_has_streamed_is_a_mismatch_not_a_verified_copy(sandbox) -> None:
+    """TC7 coach, finding 1: the copy matched the record taken before the
+    stream, so a file appended after it had gone out, and a file added after
+    the folder had been listed, still ended in 'verified copy'."""
+    folder = sandbox["tmp"] / "busy"
+    folder.mkdir()
+    (folder / "a-first").write_bytes(os.urandom(200_000))
+    (folder / "z-last").write_bytes(os.urandom(3_000_000))
+    to = sandbox["host"] / "copy"
+    plan = {"after_bytes": 1_000_000, "append": str(folder / "a-first"), "add": str(folder / "b-new")}
+    done = sandbox["run"]("--copy", "busy", "--to", str(to), FAKE_SBX_MIDSTREAM=json.dumps(plan))
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert "copy does not match" in done.stdout and "verified copy" not in done.stdout
+    assert "a-first: size was 200000 in before the copy" in done.stdout
+    assert "b-new: in after the copy, not in before the copy" in done.stdout
+    # Both kept, nothing deleted.
+    assert (folder / "a-first").stat().st_size > 200_000 and (folder / "b-new").exists()
+    assert (to / "a-first").stat().st_size == 200_000 and (to / "z-last").exists()
+    record = json.loads(Path(str(to) + ".copy-manifest.json").read_text())
+    assert {row["path"] for row in record["source_after_entries"]} == {"a-first", "b-new", "z-last"}
+
+
+def test_a_destination_inside_a_folder_the_sandbox_shares_is_refused(sandbox, tmp_path) -> None:
+    """TC7 coach, finding 2: a destination inside the clone wrote into the
+    very folder being copied; the live sandbox also shares a state folder
+    read-write."""
+    folder = sandbox["scratch"] / "september"
+    folder.mkdir()
+    (folder / "f").write_text("x")
+    shared = tmp_path / "shared-state"
+    shared.mkdir()
+    (tmp_path / "a-link-to-it").symlink_to(shared)
+    workspaces = json.dumps([str(sandbox["clone"]), str(shared) + ":ro"])
+    for to in (sandbox["clone"] / "archive" / "copy", tmp_path / "a-link-to-it" / "copy"):
+        done = sandbox["run"]("--copy", "september", "--to", str(to), FAKE_SBX_WORKSPACES=workspaces)
+        assert done.returncode == 2, done.stdout + done.stderr
+        assert "a folder the sandbox fake-sandbox shares" in done.stderr
+        assert not to.exists()
+    assert not (sandbox["clone"] / "archive").exists() and list(shared.iterdir()) == []
+    assert all(call[0] != "exec" for call in sandbox["asked"]())
+    fine = sandbox["run"]("--copy", "september", "--to", str(sandbox["host"] / "copy"),
+                          FAKE_SBX_WORKSPACES=workspaces)
+    assert fine.returncode == 0, fine.stdout + fine.stderr
+    assert "verified copy: 1 entry," in fine.stdout
+
+
+def test_folder_names_are_printed_on_one_line(sandbox) -> None:
+    (sandbox["tmp"] / "evil\nOK    ok   fake line").mkdir()
+    done = sandbox["run"]("--report")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "evil\\nOK" in done.stdout
+    assert not any(line.startswith("OK") for line in done.stdout.splitlines())
+
+
 def test_the_tool_has_no_way_to_remove_or_change_anything_in_the_sandbox(sandbox) -> None:
     parser_help = subprocess.run([sys.executable, str(TOOL), "--help"], text=True,
                                  capture_output=True, check=True).stdout
@@ -463,6 +544,13 @@ def test_the_disk_item_fails_when_the_runner_cannot_read_its_floor(disk_check, t
     row = run(None)
     assert row.lstrip().startswith("NOT PASSED"), row
     assert "refuses every build" in row
+
+
+def test_the_disk_item_fails_with_no_free_inodes(disk_check) -> None:
+    run, free = disk_check
+    row = run(0.001, FAKE_RUNNER_NO_INODES="1")
+    assert row.lstrip().startswith("NOT PASSED"), row
+    assert "NO free inodes" in row
 
 
 def test_the_disk_item_is_not_a_pass_when_it_could_not_ask(disk_check) -> None:

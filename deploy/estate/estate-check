@@ -958,6 +958,8 @@ print("probed=" + str(found.get("probed_path", "")))
 capacity = found.get("capacity") or {}
 if "available_bytes" in capacity:
     print("free=" + str(capacity["available_bytes"]))
+if "available_inodes" in capacity:
+    print("inodes=" + str(capacity["available_inodes"]))
 '
 
 # One answer out of the runner's 'name=value' lines.
@@ -965,7 +967,7 @@ the_runner_said() { printf '%s\n' "$2" | sed -n "s/^$1=//p" | head -1; }
 in_gib() { awk -v b="$1" 'BEGIN { printf "%.1f GiB", b / 1073741824 }'; }
 
 check_the_sandbox_build_disk() {
-    local name runner status out free floor from settings probed problem unasked where
+    local name runner status out free floor from settings probed problem unasked where inodes
     name="$(get SANDBOX_NAME)"
     runner="$(get SANDBOX_CONTAINER_PREFIX)"
     runner="${runner:-forge-sandbox}-runner"
@@ -986,7 +988,7 @@ check_the_sandbox_build_disk() {
     free="$(the_runner_said free "${out}")"; floor="$(the_runner_said floor "${out}")"
     from="$(the_runner_said from "${out}")"; settings="$(the_runner_said settings "${out}")"
     probed="$(the_runner_said probed "${out}")"; problem="$(the_runner_said problem "${out}")"
-    unasked="$(the_runner_said unasked "${out}")"
+    unasked="$(the_runner_said unasked "${out}")"; inodes="$(the_runner_said inodes "${out}")"
     if [ -z "${out}" ]; then
         unchecked 9b "the build runner '${runner}' in the sandbox '${name}' did not answer, so the disk a build writes to could not be asked about. Is the runner running?"
         return
@@ -1008,7 +1010,13 @@ check_the_sandbox_build_disk() {
         override) where="the floor FORGE_AUTOBUILD_MIN_AVAILABLE_BYTES sets in the runner's environment, which overrides the settings file" ;;
         *)        where="the code's default floor, because the runner found no settings file" ;;
     esac
-    if [ "${free}" -lt "${floor}" ]; then
+    # The runner refuses a build on either count, so this does too: no free
+    # inodes is a full disk however many bytes are left.
+    if ! [[ "${inodes}" =~ ^[0-9]+$ ]]; then
+        unchecked 9b "the build runner in the sandbox '${name}' could not say how many files can still be made where its worktrees go (${probed}), and it refuses a build when that is none."
+    elif [ "${inodes}" -le 0 ]; then
+        fail 9b "inside the sandbox '${name}', ${probed} has $(in_gib "${free}") free but NO free inodes, so no file can be made there and the runner will refuse the next build before making its worktree. Copy scratch out with sandbox-scratch --report and --copy; freeing the space in the sandbox is a separate, reviewed step."
+    elif [ "${free}" -lt "${floor}" ]; then
         fail 9b "inside the sandbox '${name}', ${probed} has $(in_gib "${free}") free, BELOW ${where} ($(in_gib "${floor}")). The runner will refuse the next build before making its worktree. Copy scratch out with sandbox-scratch --report and --copy; freeing the space in the sandbox is a separate, reviewed step."
     elif [ "${free}" -lt $((floor + SANDBOX_DISK_WARNING_BYTES)) ]; then
         ok_with_a_warning 9b "inside the sandbox '${name}', ${probed} has $(in_gib "${free}") free, above ${where} ($(in_gib "${floor}")) but by less than 10 GiB. Builds still run; see what is filling it with sandbox-scratch --report."
