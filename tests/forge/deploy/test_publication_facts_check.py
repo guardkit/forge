@@ -42,8 +42,6 @@ PROJECT = "codex-review"
 COORDINATOR = "c" * 64
 PUBLISHER = "d" * 64
 OTHER = "e" * 64
-SETTINGS_SOURCE = f"/var/lib/docker/volumes/{PROJECT}_forge-settings/_data"
-LEDGER_SOURCE = f"/var/lib/docker/volumes/{PROJECT}_forge-ledger/_data"
 
 
 def _executable(path: Path, text: str) -> None:
@@ -78,16 +76,21 @@ def coordinator():
         mount(os.environ["SETTINGS_SOURCE"], "/etc/forge", False, P + "_forge-settings"),
     ]
     if case != "facts_not_mounted":
-        mounts.append(mount("/var/lib/docker/volumes/x/_data", "/var/lib/forge-publication-facts",
-                            False, P + "_publication-facts"))
+        mounts.append(mount(os.environ["FACTS_SOURCE"], "/var/lib/forge-publication-facts",
+                            case == "facts_mounted_rw", P + "_publication-facts"))
+    state = "garbage" if case == "coordinator_state_garbage" else {"Running": True, "StartedAt": started}
     return {"Id": C, "Name": "/" + P + "-coordinator-1", "Image": "sha256:" + "a" * 64,
-            "State": {"Running": True, "StartedAt": started}, "Mounts": mounts}
+            "State": state, "Mounts": mounts}
 
 def publisher():
     ports = {"8711/tcp": [{"HostPort": "8711"}]} if case == "publisher_publishes" else {}
+    networks = {P + "_forge-publisher-net": {"IPAddress": "192.0.2.9"}}
+    if case == "second_network_reachable":
+        networks["somebody-elses-net"] = {"IPAddress": "198.51.100.7"}
+    mode = "host" if case == "publisher_host_mode" else P + "_forge-publisher-net"
     return {"Id": D, "Name": "/" + P + "-forge-publisher-1",
-            "HostConfig": {"PortBindings": ports},
-            "NetworkSettings": {"Networks": {P + "_forge-publisher-net": {"IPAddress": "192.0.2.9"}}},
+            "HostConfig": {"PortBindings": ports, "NetworkMode": mode},
+            "NetworkSettings": {"Networks": networks},
             "Mounts": [mount(cred, "/etc/forge-publisher/credential", False, kind="bind"),
                        mount(os.environ["LEDGER_SOURCE"], "/var/lib/forge", False, P + "_forge-ledger")]}
 
@@ -95,6 +98,8 @@ def other():
     mounts = [mount("/srv/other", "/data", True, kind="bind")]
     if case == "credential_mounted_elsewhere":
         mounts.append(mount(str(pathlib.Path(cred).parent), "/secrets", False, kind="bind"))
+    if case == "facts_held_elsewhere":
+        mounts.append(mount(os.environ["FACTS_SOURCE"], "/facts", True, P + "_publication-facts"))
     return {"Id": E, "Name": "/" + P + "-answer-service-1", "Mounts": mounts}
 
 BY_ID = {C: coordinator, "coordinator": coordinator, D: publisher, "forge-publisher": publisher, E: other}
@@ -138,6 +143,8 @@ elif args[0] == "run":
     stdin = sys.stdin.read()
     assert "--network" in args and args[args.index("--network") + 1] == "none", args
     assert "--read-only" in args, args
+    assert args[args.index("--cap-drop") + 1] == "ALL", args
+    assert args[args.index("--security-opt") + 1] == "no-new-privileges", args
     assert "-v" in args and args[args.index("-v") + 1] == P + "_publication-facts:/facts", args
     if case == "helper_fails":
         raise SystemExit(1)
@@ -163,6 +170,10 @@ if args[:2] == ["ls", "--json"]:
         workspaces.append(os.path.dirname(os.environ["SETTINGS_SOURCE"]) + ":ro")
     if case == "workspace_reaches_credential":
         workspaces.append(os.path.dirname(os.environ["CRED_FILE"]))
+    if case == "workspace_reaches_facts":
+        workspaces.append(os.path.dirname(os.environ["FACTS_SOURCE"]) + ":ro")
+    if case == "workspace_links_to_settings":
+        workspaces.append(os.environ["LINK_TO_SETTINGS"])
     status = "stopped" if case == "nothing_running" else "running"
     print(json.dumps({"sandboxes": [
         {"name": "project-deploy", "status": status, "workspaces": workspaces},
@@ -183,7 +194,16 @@ elif args[0] == "exec":
             print("000" if case == "sandbox_cannot_make_requests" else "200")
         elif ":8711/" in url:
             direct = "--noproxy" in rest
-            print("200" if (case == "sandbox_reaches" and direct) else "000")
+            if case == "sandbox_reaches" and direct:
+                print("200")
+            elif case.startswith("direct_") and direct and "192.0.2.9" in url:
+                print(case.split("_")[1])
+            elif case == "proxy_answers_for_itself" and not direct:
+                print("403")
+            elif case == "second_network_reachable" and direct and "198.51.100.7" in url:
+                print("200")
+            else:
+                print("000")
         else:
             print("000")
     else:
@@ -237,6 +257,13 @@ FACTORY_GATEWAY_ADDRESS=127.0.0.1
 FORGE_ANSWER_PORT=8126
 """
     )
+    settings_dir = tmp_path / "volumes" / "settings" / "_data"
+    ledger_dir = tmp_path / "volumes" / "ledger" / "_data"
+    facts_source = tmp_path / "volumes" / "facts" / "_data"
+    for folder in (settings_dir, ledger_dir, facts_source):
+        folder.mkdir(parents=True)
+    link = tmp_path / "an-innocent-looking-link"
+    link.symlink_to(settings_dir)
     started_epoch = int(time.time()) - 3600
     started_at = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(started_epoch)) + ".123456789Z"
     log = tmp_path / "docker.log"
@@ -250,19 +277,21 @@ FORGE_ANSWER_PORT=8126
             "PROJECT": PROJECT,
             "CRED_FILE": str(credential),
             "STARTED_AT": started_at,
-            "SETTINGS_SOURCE": SETTINGS_SOURCE,
-            "LEDGER_SOURCE": LEDGER_SOURCE,
+            "SETTINGS_SOURCE": str(settings_dir),
+            "LEDGER_SOURCE": str(ledger_dir),
+            "FACTS_SOURCE": str(facts_source),
+            "LINK_TO_SETTINGS": str(link),
             "REVIEW_SETTINGS_FILE": str(settings_file),
         }
     )
     for key in ("DOCKER_CONTEXT", "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH"):
         env.pop(key, None)
 
-    def run(case: str = "good") -> subprocess.CompletedProcess[str]:
+    def run(case: str = "good", **extra: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             ["bash", str(CHECK), "--env-file", str(env_file), "--project", PROJECT,
              "--publication-facts"],
-            text=True, capture_output=True, env=env | {"CASE": case}, timeout=60,
+            text=True, capture_output=True, env=env | {"CASE": case} | extra, timeout=60,
         )
 
     def record() -> dict:
@@ -351,7 +380,14 @@ def test_an_earlier_record_is_invalidated_before_looking(look) -> None:
         ("publisher_publishes", "only_the_coordinator_is_on_the_publishers_network", False),
         ("credential_mounted_elsewhere", "the_credential_file_can_be_read_by_them", True),
         ("workspace_reaches_credential", "the_credential_file_can_be_read_by_them", True),
-        ("sbx_unreadable", "a_sandbox_can_see_the_ledger", None),
+        ("workspace_links_to_settings", "a_sandbox_can_write_the_coordinators_settings_file", True),
+        ("second_network_reachable", "a_sandbox_can_reach_the_publisher", True),
+        ("second_network_reachable", "only_the_coordinator_is_on_the_publishers_network", False),
+        ("direct_401", "a_sandbox_can_reach_the_publisher", True),
+        ("direct_404", "a_sandbox_can_reach_the_publisher", True),
+        ("direct_503", "a_sandbox_can_reach_the_publisher", True),
+        ("publisher_host_mode", "a_sandbox_can_reach_the_publisher", True),
+        ("publisher_host_mode", "only_the_coordinator_is_on_the_publishers_network", False),
     ],
 )
 def test_each_answer_comes_from_looking(look, case: str, name: str, value) -> None:
@@ -376,6 +412,11 @@ def test_a_credential_others_can_read_is_found(look) -> None:
         ("release_two_compose", "declare no publication-facts volume"),
         ("no_volume", "does not exist yet"),
         ("facts_not_mounted", "does not mount"),
+        ("facts_mounted_rw", "does not mount"),
+        ("facts_held_elsewhere", "also mount(s)"),
+        ("workspace_reaches_facts", "reaches the facts volume"),
+        ("sbx_unreadable", "did not list its sandboxes"),
+        ("coordinator_state_garbage", "before any record was written"),
     ],
 )
 def test_nothing_is_written_when_there_is_nowhere_to_write(look, case: str, words: str) -> None:
@@ -384,3 +425,21 @@ def test_nothing_is_written_when_there_is_nowhere_to_write(look, case: str, word
     assert done.returncode == 2, done.stdout + done.stderr
     assert words in done.stderr
     assert not (facts_dir / "publication-facts.json").exists()
+
+
+def test_a_proxy_answering_for_itself_is_not_the_publisher(look) -> None:
+    """By the default route only the publisher's own 200 counts: a proxy that
+    refuses the request (403) has not put the sandbox through to it."""
+    run, record, _, _, _ = look
+    done = run("proxy_answers_for_itself")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert record()["machine"]["a_sandbox_can_reach_the_publisher"] is False
+
+
+def test_a_credential_owned_by_another_user_is_found(look) -> None:
+    run, record, _, _, _ = look
+    done = run(FORGE_PUBLISHER_UID=str(os.getuid() + 1))
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert record()["machine"]["the_credential_file_can_be_read_by_them"] is True
+    assert "is owned by uid" in done.stdout
+
