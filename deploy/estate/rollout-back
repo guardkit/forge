@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Recover one estate before resume, or retain current authority after resume."""
+"""Recover one estate before resume, or retain current authority after resume.
+
+--upgrade-back puts an upgraded estate back on the release it left, with the door
+shut and planning off (release -3 upgrade runbook, TC3)."""
 from __future__ import annotations
 import importlib.machinery
 import importlib.util
@@ -12,6 +15,7 @@ import shutil
 import sys
 import tempfile
 import uuid
+from types import SimpleNamespace
 sys.dont_write_bytecode=True
 HERE=Path(__file__).resolve().parent
 loader=importlib.machinery.SourceFileLoader('rollout_quiesce',str(HERE/'rollout-quiesce'))
@@ -30,7 +34,9 @@ def h6_probe():
     from forge.pipeline.publication_record import PublicationRecordStore
     from forge.pipeline.deployment_lock import DeploymentLockStore
     from forge.deploy_sidecar.deploy_executor import DeployExecutor,DeployRequest,ProcessTable
-    root=pathlib.Path(sys.argv[1]);pristine=pathlib.Path(sys.argv[2]);wanted=sys.argv[3];image=sys.argv[4]
+    # argv: probe folder, pristine copy, its sha256, the candidate image, the ledger schema the
+    # candidate's release reaches (rollout_support.RELEASES), and the configuration hash last.
+    root=pathlib.Path(sys.argv[1]);pristine=pathlib.Path(sys.argv[2]);wanted=sys.argv[3];image=sys.argv[4];schema=int(sys.argv[5]);configuration_sha256=sys.argv[6]
     # The candidate's executor may predate zombie-aware group checks, so an init must be PID 1 to reap the old command's orphans.
     assert os.getpid()!=1,'probe is PID 1; the H6 container must run with --init'
     try:pid1=pathlib.Path('/proc/1/cmdline').read_bytes().split(b'\0')[0].decode(errors='replace')
@@ -39,7 +45,7 @@ def h6_probe():
     assert sha(pristine)==wanted,'pristine current copy changed'
     cx=sqlite3.connect(pristine.as_uri()+'?mode=ro&immutable=1',uri=True)
     assert cx.execute('PRAGMA quick_check').fetchall()==[('ok',)]
-    assert cx.execute('SELECT max(version) FROM schema_version').fetchone()[0]==16
+    assert cx.execute('SELECT max(version) FROM schema_version').fetchone()[0]==schema
     required={'publication_records':'build_id feature_id repo decided_by decided_at target_branch g_commit build_tip j_commit attempt result checked_json lease_holder lease_expires_at turn lines_json created_at updated_at',
               'deployment_targets':'target counter holder_build holder_turn holder_name granted_at expires_at running_commit running_identity running_build running_at created_at updated_at',
               'builds':'build_id feature_id repo branch feature_yaml_path status triggered_by correlation_id queued_at mode start_commit target_branch'}
@@ -134,17 +140,21 @@ def h6_probe():
         if table not in ('builds','stage_log','publication_records','deployment_targets'):assert after==original,'unrelated rows added in '+table
     c.close();assert sha(pristine)==wanted
     assert not any(n=='nats' or n.startswith('nats.') for n in sys.modules)
-    result={'format_version':1,'outcome':'handled-both','candidate_image_id':image,'configuration_sha256':sys.argv[5],'pristine_sha256':wanted,'working_pre_fixture_sha256':pre_fixture,'schema_version':16,'columns':columns,'fixture_ids':{'build':build,'target':target},'git':{'G':G,'tip':tip,'J':J,'tree':tree},'publication':{'before_sha256':hashlib.sha256(publication_before.encode()).hexdigest(),'after_sha256':hashlib.sha256(publication_after.encode()).hexdigest(),'turn':record.turn,'result':record.result,'g_commit':record.g_commit,'j_commit':record.j_commit,'checked':record.checked,'original_lines_preserved':True,'line_kinds':[x.kind+' '+x.step for x in record.lines],'send_result':send.detail,'callbacks':callbacks},'deployment':{'N':N,'N_plus_1':grant.counter,'stale_fencing':fencing,'stale_record_unchanged':True,'reconcile':reconciled,'old_note':old_note,'old_answers':answers,'successor':second_answer,'final_note':final_note},'cleanup':'no owned worker remains','existing_rows_unchanged':True,'worker_group_empty':True,'worker_thread_stopped':True,'real_client_modules':[],'init':{'probe_pid':os.getpid(),'pid1':pid1}}
+    result={'format_version':1,'outcome':'handled-both','candidate_image_id':image,'configuration_sha256':configuration_sha256,'pristine_sha256':wanted,'working_pre_fixture_sha256':pre_fixture,'schema_version':schema,'columns':columns,'fixture_ids':{'build':build,'target':target},'git':{'G':G,'tip':tip,'J':J,'tree':tree},'publication':{'before_sha256':hashlib.sha256(publication_before.encode()).hexdigest(),'after_sha256':hashlib.sha256(publication_after.encode()).hexdigest(),'turn':record.turn,'result':record.result,'g_commit':record.g_commit,'j_commit':record.j_commit,'checked':record.checked,'original_lines_preserved':True,'line_kinds':[x.kind+' '+x.step for x in record.lines],'send_result':send.detail,'callbacks':callbacks},'deployment':{'N':N,'N_plus_1':grant.counter,'stale_fencing':fencing,'stale_record_unchanged':True,'reconcile':reconciled,'old_note':old_note,'old_answers':answers,'successor':second_answer,'final_note':final_note},'cleanup':'no owned worker remains','existing_rows_unchanged':True,'worker_group_empty':True,'worker_thread_stopped':True,'real_client_modules':[],'init':{'probe_pid':os.getpid(),'pid1':pid1}}
     (root/'h6-result.json').write_text(json.dumps(result,sort_keys=True,indent=2)+'\n');print(json.dumps(result))
 
 
-def validate_h6(result,candidate,digest,configuration_sha256):
-    """Every required observation is explicit; a summary string grants nothing."""
+def validate_h6(result,candidate,digest,configuration_sha256,schema=None):
+    """Every required observation is explicit; a summary string grants nothing.
+
+    schema is the ledger schema the candidate's release reaches; by default the
+    switch release's, which is what every caller before release -3 meant."""
+    schema=r.RELEASES[r.SWITCH_RELEASE]['schema'] if schema is None else schema
     def require(value):q.need(value,'H6 behavioral proof is incomplete or contradictory; preserve current authority and inspect the private probe result')
     try:
         require(type(result['format_version']) is int and result['format_version']==1 and result['outcome']=='handled-both')
         require(result['candidate_image_id']==candidate and result['pristine_sha256']==digest and result['working_pre_fixture_sha256']==digest and result['configuration_sha256']==configuration_sha256)
-        require(type(result['schema_version']) is int and result['schema_version']==16 and result['existing_rows_unchanged'] is True and result['real_client_modules']==[])
+        require(type(result['schema_version']) is int and result['schema_version']==schema and result['existing_rows_unchanged'] is True and result['real_client_modules']==[])
         require(result['cleanup']=='no owned worker remains' and result['worker_group_empty'] is True and result['worker_thread_stopped'] is True)
         require(type(result['init']['probe_pid']) is int and result['init']['probe_pid']>1)
         needed={'builds':{'build_id','status','mode','start_commit','target_branch'},'publication_records':{'build_id','g_commit','j_commit','checked_json','turn','lines_json'},'deployment_targets':{'target','counter','holder_build','holder_turn','running_commit'}}
@@ -196,7 +206,9 @@ def reconstruction_networks(record):
 class Recovery(q.Estate):
     def __init__(self,args):super().__init__(args);self.back=self.c.get('back',{})
     def allowed_images(self,service,rendered):
-        images={rendered}
+        # An upgrade's graph may be half switched: every service may run either
+        # release's image (q.Estate.allowed_images); after-resume adds one candidate.
+        images=super().allowed_images(service,rendered)
         if getattr(self,'_after_candidate',None) and service in ('coordinator','answer-service'):images.add(self._after_candidate)
         return images
     def remove_current(self):
@@ -276,6 +288,7 @@ class Recovery(q.Estate):
         q.need(q.stable_runtime(r.previous_runtime(self.c,actual))==q.stable_runtime(record),'recreated runtime mounts, ports, environment names or network identity differ; keep all authorities stopped')
         return actual['Id']
     def before(self):
+        self.not_upgrade('before-resume')
         q.need(self.markers() is None,'work has resumed or markers are ambiguous; the snapshot can never replace current authority')
         self.record()
         if self.doc.get('restored'):
@@ -320,18 +333,13 @@ class Recovery(q.Estate):
             self.doc['rollback']['stage']='restored-start-failed-stopped';self.save();raise
         self.doc['restored']=True;self.doc['restored_ids']=journal['created'];self.save()
         return {'restored':True,'ids':journal['created'],'next':'Use --reopen only after verifying the restored estate; the retired alarm stays masked.'}
-    def current_copy(self,directory):
-        output=directory/'current.db'
-        code='''import pathlib,sqlite3,hashlib,json
-p=pathlib.Path('/state/forge.db');wal=p.with_name(p.name+'-wal');active=wal.exists() and wal.stat().st_size>0
-source=sqlite3.connect(p.as_uri()+('?mode=ro' if active else '?mode=ro&immutable=1'),uri=True);target=sqlite3.connect('/out/current.db');source.backup(target);target.close();source.close()
-p=pathlib.Path('/out/current.db');print(json.dumps({'sha256':hashlib.sha256(p.read_bytes()).hexdigest(),'size':p.stat().st_size}))
-'''
-        name=self.c['volumes']['ledger'];r.volume_identity(self.c,name,self.model())
-        observed=json.loads(self.helper(code,mounts=[f'type=volume,src={name},dst=/state,readonly',f'type=bind,src={directory},dst=/out']))
-        q.need(r.sha256(output)==observed['sha256'],'current-copy hash differs; retain stopped authority and retry the copy')
-        return output,observed
-    def h6(self,candidate,directory):
+    def h6(self,candidate,directory,*,schema=None,source=None):
+        """The H6 probe in the candidate image against a copy of the current ledger.
+
+        schema: the ledger schema the candidate's release reaches (default: this
+        inventory's release). source: the estate whose env and Compose inputs the
+        candidate would run with (default: this one, or the candidate env file)."""
+        schema=r.release(self.c)[1]['schema'] if schema is None else schema
         report={'format_version':1,'stage':'candidate-image','candidate_image_id':candidate,'status':'running','commands':[],'cleanup':{'container_removed':False},'started_at':q.now()};cid=None
         destination=q.private_path(directory/'h6-diagnostic.json')
         def docker(stage,*args):
@@ -341,15 +349,15 @@ p=pathlib.Path('/out/current.db');print(json.dumps({'sha256':hashlib.sha256(p.re
             q.need(re.fullmatch(r'sha256:[0-9a-f]{64}',candidate),'compatibility candidate must be an immutable image ID; do not supply a tag')
             q.need(json.loads(r.docker(self.c,'image','inspect',candidate).stdout)[0]['Id']==candidate,'compatibility image is not locally available by ID; leave the estate stopped')
             report['stage']='current-copy';pristine,observation=self.current_copy(directory);report['pristine_sha256']=observation['sha256']
-            env_file=self.args.candidate_env_file or self.args.env_file
-            model=self.model()
-            configuration={'project':self.c['project'],'candidate_image_id':candidate,'env_file':str(r.path(env_file)),'env_sha256':r.sha256(env_file),'compose_files':[{'path':str(r.path(p)),'sha256':r.sha256(p)} for p in self.c['compose_files']],'volumes':self.c['volumes'],'networks':{k:{'name':v.get('name',k),'external':bool(v.get('external',False))} for k,v in model.get('networks',{}).items()},'planning_enabled':False}
+            env_file=source.args.env_file if source else (self.args.candidate_env_file or self.args.env_file)
+            model=(source or self).model();compose_files=(source or self).c['compose_files']
+            configuration={'project':self.c['project'],'candidate_image_id':candidate,'env_file':str(r.path(env_file)),'env_sha256':r.sha256(env_file),'compose_files':[{'path':str(r.path(p)),'sha256':r.sha256(p)} for p in compose_files],'volumes':self.c['volumes'],'networks':{k:{'name':v.get('name',k),'external':bool(v.get('external',False))} for k,v in model.get('networks',{}).items()},'planning_enabled':False}
             import hashlib
             configuration_sha256=hashlib.sha256(json.dumps(configuration,sort_keys=True,separators=(',',':')).encode()).hexdigest();report['configuration']=configuration;report['configuration_sha256']=configuration_sha256
             working=directory/'probe';working.mkdir(mode=0o700);os.chmod(working,0o777)
             name=self.c['project']+'-h6-'+uuid.uuid4().hex[:12]
             code=q.GUARD+'\n'+inspect_source.getsource(h6_probe)+'\nh6_probe()\n'
-            cid=docker('h6-create','create','--init','--name',name,'--network','none','--read-only','--tmpfs','/tmp','-e','PYTHONDONTWRITEBYTECODE=1','--mount',f'type=bind,src={working},dst=/probe','--mount',f'type=bind,src={pristine},dst=/pristine.db,readonly','--entrypoint','python',candidate,'-c',code,'/probe','/pristine.db',observation['sha256'],candidate,configuration_sha256).stdout.strip()
+            cid=docker('h6-create','create','--init','--name',name,'--network','none','--read-only','--tmpfs','/tmp','-e','PYTHONDONTWRITEBYTECODE=1','--mount',f'type=bind,src={working},dst=/probe','--mount',f'type=bind,src={pristine},dst=/pristine.db,readonly','--entrypoint','python',candidate,'-c',code,'/probe','/pristine.db',observation['sha256'],candidate,str(schema),configuration_sha256).stdout.strip()
             created=r.inspect(self.c,cid);report['container_id']=cid;report['init']=created.get('HostConfig',{}).get('Init') is True
             q.need(created['Image']==candidate,'H6 container image differs from the chosen ID; leave the estate stopped')
             q.need(report['init'],'H6 container has no init to reap the old command\'s orphaned processes; leave the estate stopped')
@@ -357,7 +365,7 @@ p=pathlib.Path('/out/current.db');print(json.dumps({'sha256':hashlib.sha256(p.re
             report['child_exit']=r.inspect(self.c,cid)['State']['ExitCode'];q.need(report['child_exit']==0,'candidate H6 child refused; inspect its private stage and diagnostics and remain stopped')
             report['stage']='h6-result-validation';result=r.read_json(q.private_path(working/'h6-result.json',exists=True))
             q.need(r.sha256(pristine)==observation['sha256'],'H6 pristine current copy changed; preserve stopped authority')
-            validate_h6(result,candidate,observation['sha256'],configuration_sha256)
+            validate_h6(result,candidate,observation['sha256'],configuration_sha256,schema)
             report['status']='passed';report['result']=result
         except Exception as exc:
             report['status']='refused';report['reason']=self.sanitize(str(exc))
@@ -375,6 +383,7 @@ p=pathlib.Path('/out/current.db');print(json.dumps({'sha256':hashlib.sha256(p.re
         q.need(report['cleanup']['container_removed'],'H6 disposable container cleanup is unproved; leave the estate stopped and reconcile the recorded container')
         return result
     def after(self):
+        self.not_upgrade('after-resume')
         marker=self.markers();q.need(marker is not None,'after-resume recovery requires two matching markers; classify authority before touching any graph')
         q.need(self.phase=='prepared','after-resume recovery requires current prepared inventory; no old folder will be accessed')
         self._after_candidate=self.args.candidate_image
@@ -418,8 +427,94 @@ p=pathlib.Path('/out/current.db');print(json.dumps({'sha256':hashlib.sha256(p.re
         finally:r.atomic_json(destination,result)
         return result
 
+    # ------------------------------------------------------------------------
+    # THE WAY BACK AFTER AN UPGRADE'S SWITCH (release -3 upgrade runbook, TC3,
+    # procedure WB-C). Run with the inventory of the release being left. It ends
+    # exactly where rollout-quiesce --switch ends for the release it goes back
+    # to: that release up on the same volumes, the door shut, planning off.
+    # Opening is that release's own closed-door check, then its --open.
+    # ------------------------------------------------------------------------
+    def from_estate(self):
+        """The release being returned to, seen through this inventory: its env and
+        compose files from the upgrade block, the same receipt and volumes."""
+        frm=self.upgrade['from']
+        values,_=q.load_script('rollout-settings').read_env(r.path(frm['env_file']))
+        c=json.loads(json.dumps(self.c))
+        c.update(release=frm['release'],runtime_image=r.RELEASES[frm['release']]['runtime'],env_file=frm['env_file'],compose_files=[x['path'] for x in frm['compose_files']])
+        c['upgrade']=dict(self.upgrade,closed_door_dir=values.get('ROLLOUT_STATE_DIR',''))
+        return q.Estate(SimpleNamespace(**{**vars(self.args),'env_file':frm['env_file']}),config=c)
+
+    def from_sources_unchanged(self):
+        q.need(self.side_hashes('from')==self.doc['sources']['from'],'the env or compose files of the release being returned to differ from those recorded at --close; nothing more is changed. Put them back as recorded first')
+
+    def remove_left_release(self,release):
+        """Remove the stopped containers that are not on the release being returned to."""
+        recorded=self.doc.get('containers',{});removed=[]
+        for identifier,item in self.project_containers().items():
+            expected=self.release_images(item['service'],release)
+            if expected is None or item['image']==expected:continue
+            live=r.inspect(self.c,identifier)
+            q.need(not live['State'].get('Running'),f'{item["service"]} is still running; nothing was removed. Stop it through --final first')
+            q.need(identifier in recorded,f'{item["service"]} container {identifier[:12]} was not recorded at --close; leave it and reconcile')
+            r.docker(self.c,'rm',identifier);removed.append({'id':identifier,'service':item['service'],'image':item['image']})
+        return removed
+
+    def sandbox_back(self,previous,events):
+        """rollout-sandbox --upgrade --back: the saved release's template, profile, settings
+        file and clone-local identity, back byte for byte (runbook TC4)."""
+        command=[HERE/'rollout-sandbox','--config',self.config_path,'--env-file',self.args.env_file,'--project',self.c['project']]
+        for p in self.args.secret_env_file:command+=['--secret-env-file',p]
+        command+=['--upgrade','--back','--previous-receipt',previous]
+        try:
+            return self.captured(command,'rollout-sandbox --upgrade --back',events,env=self.env,timeout=1800).returncode
+        except Exception:
+            event=events[-1] if events else {}
+            lines=[line[len('Refusing: '):].strip() for line in event.get('stderr','').splitlines() if line.startswith('Refusing: ')]
+            if lines:raise r.Refusal('rollout-sandbox --upgrade --back refused: '+lines[-1][:8192]) from None
+            raise r.Refusal('rollout-sandbox --upgrade --back did not finish and the sandbox may be part-way; read its evidence in upgrade-back.json and run it again before going on') from None
+
+    def upgrade_back(self):
+        q.need(self.upgrade and self.side=='to','--upgrade-back takes the inventory of the release being left (the upgrade block\'s to side)')
+        with r.deadline(q.MODE_LIMITS['upgrade-back'],'--upgrade-back'):return self.upgrade_back_steps()
+
+    def upgrade_back_steps(self):
+        self.markers();self.record()
+        frm=self.upgrade['from'];release=frm['release']
+        previous=self.upgrade.get('sandbox_previous_receipt')
+        q.need(isinstance(previous,str) and previous.startswith('/'),'the upgrade block names no sandbox_previous_receipt, which rollout-sandbox --upgrade --back needs; name the earlier installation receipt')
+        self.from_sources_unchanged()
+        other=self.from_estate()
+        q.need(other.closed_door!=self.closed_door,'both releases name the same closed-door folder; each keeps its own')
+        result={'format_version':1,'mode':'upgrade-back','leaving':self.release,'returning_to':release,'started_at':q.now(),'status':'running','commands':[]}
+        destination=q.private_path(self.snapshot/'upgrade-back.json');stage='close'
+        try:
+            self.close();stage='settle';self.settle();stage='final';final=self.final()
+            result['final']={k:final[k] for k in ('at','release','backup')}
+            # Checked again now that everything is stopped, and before anything of the
+            # release being returned to is touched.
+            stage='recorded-inputs';self.from_sources_unchanged();self.settings_invariant()
+            stage='h6';directory=self.snapshot/('h6-back-'+uuid.uuid4().hex);directory.mkdir(mode=0o700)
+            entry=r.RELEASES[release]
+            try:result['h6']=self.h6(entry['runtime'],directory,schema=entry['schema'],source=other)
+            finally:
+                # The record of the proof is what lets release `from` touch this record
+                # again (rollout-quiesce h6_gate); a refusal is recorded too.
+                self.doc.setdefault('back_h6',[]).append({'at':q.now(),'release':release,'passed':'h6' in result,'directory':str(directory)});self.save()
+            stage='remove-left-release';result['removed']=self.remove_left_release(release)
+            stage='sandbox-back';self.sandbox_back(previous,result['commands'])
+            stage='switch';switched=other.switch()
+            result['switch']={'passed':switched['passed'],'receipt':str(self.snapshot/('switched-'+release+'.json'))}
+            self.record()
+            result['status']='returned-with-the-door-shut'
+            result['next']=f'write release {release}\'s closed-door receipt with its own env (estate-check --pre-resume, then --read-pre-resume), then rollout-quiesce --open with its inventory'
+        except Exception as exc:
+            result['status']='refused';result['failure']={'stage':stage,'reason':self.sanitize(str(exc))};raise
+        finally:
+            result['finished_at']=q.now();r.atomic_json(destination,result)
+        return result
+
 def main(argv=None):
-    p=q.arguments(back=True);m=p.add_mutually_exclusive_group(required=True);m.add_argument('--before-resume',action='store_const',const='before',dest='mode');m.add_argument('--after-resume',action='store_const',const='after',dest='mode');p.add_argument('--candidate-image');p.add_argument('--candidate-env-file')
+    p=q.arguments(back=True);m=p.add_mutually_exclusive_group(required=True);m.add_argument('--before-resume',action='store_const',const='before',dest='mode');m.add_argument('--after-resume',action='store_const',const='after',dest='mode');m.add_argument('--upgrade-back',action='store_const',const='upgrade_back',dest='mode');p.add_argument('--candidate-image');p.add_argument('--candidate-env-file')
     args=p.parse_args(argv)
     def execute():
         q.need(args.mode=='after' or not (args.candidate_image or args.candidate_env_file),'candidate options belong only to after-resume recovery; select the intended authority mode')

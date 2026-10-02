@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Close, settle, stop, prove and resume one explicitly inventoried estate."""
+"""Close, settle, stop, prove and resume one explicitly inventoried estate.
+
+An inventory with an upgrade block moves an estate that is already resumed from one
+reviewed release to another: --close, --settle, --final, then --switch (bring the
+release up with the door shut) and --open (open it once its closed-door receipt
+passes). Release -3 upgrade runbook, TC2."""
 from __future__ import annotations
 import argparse
 import importlib.machinery
@@ -10,9 +15,11 @@ import os
 import posixpath
 from pathlib import Path
 import re
+import signal
 import sqlite3
 import stat
 import subprocess
+import threading
 import uuid
 import sys
 import tempfile
@@ -26,6 +33,90 @@ import rollout_support as r
 HERE = Path(__file__).resolve().parent
 SERVICES = ('front-door','bus-gateway','memory-relay','memory','forge-publisher','answer-service','coordinator')
 PRODUCERS = ('front-door','bus-gateway')
+# THE CLOSED-DOOR SERVICES of an upgrade (release -3 runbook, TC2), in two kinds
+# that every check treats separately. The long-running ones must be RUNNING on
+# the release's image. bus-ready is a one-shot (restart "no"; its consumers wait
+# for service_completed_successfully): it must have EXITED 0 on its expected
+# image in this release's run, and while it runs it has proven nothing yet.
+LONG_RUNNING = ('coordinator','answer-service','memory','memory-relay','forge-publisher','sandbox-runner')
+ONE_SHOT = 'bus-ready'
+SUPERVISOR = 'sandbox-runner'
+LEDGER_READERS = ('coordinator','answer-service','forge-publisher')
+# run.sh's own worst-case stop is 195 s (compose.sandbox-runner.yaml); Docker
+# is given 240 s, and the client a minute beyond that.
+SUPERVISOR_STOP_SECONDS = 240
+BUS_READY_WAIT_SECONDS = 300
+SANDBOX_START_WAIT_SECONDS = 300
+POLICY_HELPER = Path('/usr/local/libexec/forge-publisher-host-policy')
+# THE TIME LIMIT OF EACH UPGRADE MODE, in seconds (coach's review, 2 October
+# 2026). Each mode bounds every command it runs by what remains of its limit
+# (rollout_support.deadline), so these are true maxima; run-step's own limit for
+# a step must be above them, because run-step ends a step with SIGKILL, after
+# which nothing can shut the door again. --open adds up to 'open-clean-up' to
+# shut the door after a failure. rollout-back --upgrade-back's limit contains its
+# own close, settle, final and switch.
+MODE_LIMITS = {'close':600,'settle':300,'final':900,'switch':1500,'open':600,'open-clean-up':300,'upgrade-back':3300}
+LIMITS_HELP = ('TIME LIMITS of the upgrade modes; each stops itself at its limit, so give run-step a minute more: '
+               '--close 600 s, --settle 300 s, --final 900 s, --switch 1500 s, --open 600 s plus up to 300 s to shut the door again after a failure '
+               '(900 s), rollout-back --upgrade-back 3300 s.')
+# What run.sh's exit code says (deploy/compose/sandbox-runner/run.sh).
+SUPERVISOR_EXITS = {2:'it refused before starting anything (a setting or the sandbox client was missing)',
+                    3:'its stop of the work inside the sandbox did not succeed'}
+# The template's own state for a clone (sandbox-runner.sh: STATE_ROOT is
+# ~/.forge-runner/<sha256 of the clone root>, holding 'supervisor' (pid and start
+# time) and 'lock'). Read-only; the same reading rollout-sandbox --upgrade makes.
+SUPERVISION_CODE = r'''import errno,fcntl,hashlib,json,os,pathlib,sys
+root=os.path.dirname(os.path.dirname(os.path.abspath(sys.argv[1])))
+state=pathlib.Path(os.path.expanduser('~'))/'.forge-runner'/hashlib.sha256(root.encode()).hexdigest()
+record=state/'supervisor';lock=state/'lock';live=False;held=False
+if record.exists():
+ parts=record.read_text().split()
+ if len(parts)>=2 and parts[0].isdigit():
+  try:live=pathlib.Path('/proc/'+parts[0]+'/stat').read_text().rsplit(') ',1)[1].split()[19]==parts[1]
+  except (OSError,IndexError):live=False
+if lock.exists():
+ fd=os.open(lock,os.O_RDONLY)
+ try:
+  try:fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB);fcntl.flock(fd,fcntl.LOCK_UN)
+  except OSError as e:
+   if e.errno not in (errno.EAGAIN,errno.EACCES):raise
+   held=True
+ finally:os.close(fd)
+print(json.dumps({'record_present':record.exists(),'record_live':live,'lock_held':held}))
+'''
+
+class Interrupted(BaseException):
+    """A stop signal arrived while --open was opening the door."""
+# Digests of the coordinator's settings file, never its values (runbook 2.6). The
+# canonical digest leaves out planning.enabled, the one value the tools write;
+# 'rewritten' is the SHA-256 the planning switch's own writer (yaml.safe_dump,
+# sort_keys=False, as planning() below) would give with planning.enabled set to
+# the wanted value, or to the file's own value when none is wanted.
+SETTINGS_DIGEST_CODE = '''import copy,hashlib,json,pathlib,sys,yaml
+p=pathlib.Path('/state/forge.yaml');assert p.is_file() and not p.is_symlink()
+data=p.read_bytes();x=yaml.safe_load(data.decode())
+assert isinstance(x,dict) and isinstance(x.get('planning'),dict)
+enabled=x['planning'].get('enabled')
+y=json.loads(json.dumps(x,default=str));y['planning'].pop('enabled',None)
+wanted=json.loads(sys.argv[1])['planning_enabled'] if len(sys.argv)>1 else enabled
+z=copy.deepcopy(x);z['planning']['enabled']=wanted
+print(json.dumps({'sha256':hashlib.sha256(data).hexdigest(),'planning_enabled':enabled,
+ 'canonical_sha256':hashlib.sha256(json.dumps(y,sort_keys=True,separators=(',',':'),ensure_ascii=True).encode()).hexdigest(),
+ 'rewritten_sha256':hashlib.sha256(yaml.safe_dump(z,sort_keys=False).encode()).hexdigest()}))
+'''
+# Run inside each ledger reader as its configured user, after logical_digest's source.
+READER_CODE = r'''
+p=pathlib.Path('/var/lib/forge/forge.db');wal=p.with_name(p.name+'-wal');active=wal.exists() and wal.stat().st_size>0
+db=sqlite3.connect(p.as_uri()+('?mode=ro' if active else '?mode=ro&immutable=1'),uri=True);db.execute('PRAGMA query_only=ON');db.execute('BEGIN')
+version=db.execute('SELECT max(version) FROM schema_version').fetchone()[0];logical=logical_digest(db);db.close()
+print(json.dumps({'logical_sha256':logical,'schema_version':version}))
+'''
+
+def docker_time(value):
+    """Docker's RFC 3339 time (nanoseconds, Z) as an aware datetime."""
+    m=re.fullmatch(r'(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d+))?(Z|[+-]\d\d:\d\d)',value or '')
+    need(m,f'Docker reported an unreadable time {value!r}; inspect the container')
+    return datetime.fromisoformat(m[1]+'.'+(m[2] or '')[:6].ljust(6,'0')+('+00:00' if m[3]=='Z' else m[3]))
 # READINESS AFTER RESUME OPENS THE DOOR (rehearsal of 30 September 2026). The
 # services check ran 0.3 s after the containers started and failed three items
 # that passed 30 s later. So resume waits, bounded, for the signals those items
@@ -304,13 +395,18 @@ def ledger_lease_proof(root):
     return result
 
 class Estate:
-    def __init__(self,args):
-        self.args=args;self.config_path=r.path(args.config);self.c=r.read_json(self.config_path)
+    def __init__(self,args,config=None):
+        # config: an already-read inventory, for rollout-back's derived view of the
+        # other release in an upgrade; normally the file --config names.
+        self.args=args;self.config_path=r.path(args.config);self.c=r.read_json(self.config_path) if config is None else config
+        self.upgrade=self.c.get('upgrade')
+        if self.upgrade is not None:
+            self.upgrade_inputs(args);return
         self.q=self.c['quiesce'];self.snapshot=r.path(args.snapshot,exists=False)
         need(re.fullmatch(r'\d{8}T\d{6}Z(?:-[A-Za-z0-9_-]+)?',self.snapshot.name),'snapshot is not a dated path; name its exact future or existing directory')
         need(self.snapshot.parent==r.path(self.c['snapshot_root']),'snapshot is outside the declared root; select its dated child')
         need(args.project==self.c['project'] and args.env_file==self.c['env_file'],'explicit env or project conflicts with inventory; select the intended phase inventory')
-        need(re.fullmatch(r'[a-z0-9][a-z0-9_-]+',args.project) and self.c['runtime_image']==r.RUNTIME,'estate project or runtime identity is invalid; use the accepted explicit release')
+        need(re.fullmatch(r'[a-z0-9][a-z0-9_-]+',args.project) and self.c['runtime_image']==r.release(self.c)[1]['runtime'],'estate project or runtime identity is invalid; use the accepted explicit release')
         need(set(self.c['volumes'])==r.VOLUME_ROLES and len(set(self.c['volumes'].values()))==5,'five distinct state volumes are required; correct the explicit inventory')
         need(set(self.c['units'])==r.UNIT_ROLES and set(self.c['old_containers'])=={'coordinator','memory','relay'} and len(set(self.c['units'].values()))==len(r.UNIT_ROLES) and len(set(self.c['old_containers'].values()))==3,'legacy identities are incomplete or repeated; name exactly the distinct recorded units and three containers')
         need(all(re.fullmatch('[a-zA-Z0-9][a-zA-Z0-9_.-]+',name) for name in self.c['volumes'].values()),'state volume name is invalid; use five explicit named volumes')
@@ -333,6 +429,17 @@ class Estate:
         need(old != prepared,'phase env paths are missing or ambiguous; declare distinct original and prepared inputs')
         self.phase='original' if old else 'prepared'
         need(self.c['sources']['settings']==self.q[self.phase+'_settings'],'settings source differs from the declared phase; select the matching original or prepared inventory')
+        self.environment(args)
+
+        self.binding={k:self.c[k] for k in ('project','docker_context','runtime_image','source_db','snapshot_root','units','old_containers','volumes')}
+        self.binding['sources']={k:v for k,v in self.c['sources'].items() if k!='settings'}
+        self.binding['phases']={k:self.q[k] for k in ('original_env_file','original_settings','prepared_env_file','prepared_settings','settings_receipt')}
+        self.binding['snapshot']=str(self.snapshot)
+        self.doc=None
+
+    def environment(self,args):
+        """Public env values, then the private files' names, with ${NAME} expanded; the
+        host child environment withholds the sandbox-only temporary folders."""
         renderer=load_script('rollout-settings');public,_=renderer.read_env(r.path(args.env_file));self.values=dict(public);self.private_values=[]
         for filename in args.secret_env_file:
             p=private_path(filename,exists=True);need(p.stat().st_mode & 0o077==0,'private env file is exposed to other users; set mode0600 before proceeding')
@@ -351,12 +458,6 @@ class Estate:
             need(self.env.get('DOCKER_HOST','unix:///var/run/docker.sock')=='unix:///var/run/docker.sock','inventory default context conflicts with public Docker endpoint')
             self.env['DOCKER_HOST']='unix:///var/run/docker.sock'
             self.env['FORGE_PUBLISHER_DOCKER_CONTEXT']='default'
-
-        self.binding={k:self.c[k] for k in ('project','docker_context','runtime_image','source_db','snapshot_root','units','old_containers','volumes')}
-        self.binding['sources']={k:v for k,v in self.c['sources'].items() if k!='settings'}
-        self.binding['phases']={k:self.q[k] for k in ('original_env_file','original_settings','prepared_env_file','prepared_settings','settings_receipt')}
-        self.binding['snapshot']=str(self.snapshot)
-        self.doc=None
 
     def save(self):
         private_path(self.receipt);r.atomic_json(self.receipt,self.doc)
@@ -441,10 +542,10 @@ class Estate:
             self.doc['restored_verification']={'at':now(),'passed':False,'reason':self.sanitize(str(exc))};self.save()
             r.refuse('restored authority no longer matches its receipt; inspect the private reconciliation evidence and do not recreate or restart it automatically')
 
-    def compose(self,*args):
+    def compose(self,*args,timeout=None):
         cmd=['compose','--project-name',self.c['project'],'--env-file',self.args.env_file]
         for f in self.c['compose_files']:cmd+=['-f',str(r.path(f))]
-        return self.recorded_docker(*cmd,*args,env=self.env,**self.ready_budget())
+        return self.recorded_docker(*cmd,*args,env=self.env,**({'timeout':timeout} if timeout else self.ready_budget()))
     def model(self):return json.loads(self.compose('config','--format','json').stdout)
     def helper(self,code,args=(),mounts=(),image=None,network='none',input=None,environment=False):
         cmd=['run','--rm','--network',network,'--read-only','--tmpfs','/tmp','-e','PYTHONDONTWRITEBYTECODE=1','--user','0:0']
@@ -459,6 +560,7 @@ class Estate:
         name=self.c['volumes'][role];r.volume_identity(self.c,name,self.model())
         return self.helper(code,args,[f'type=volume,src={name},dst=/state'+('' if write else ',readonly')],environment=environment)
     def markers(self):
+        if getattr(self,'upgrade',None):return self.upgrade_markers()
         try:host_record=marker_file(private_path(self.snapshot/'resumed.json'))
         except Exception:r.refuse('host resume marker is present but unsafe or unreadable; preserve it and reconcile before touching old authority')
         ledger_record={'present':False}
@@ -524,7 +626,11 @@ print(json.dumps(state))
     def unit_stopped(self,name):
         p=self.unit(name);need(p['ActiveState'] in ('inactive','failed') and p['MainPID']==p['ControlPID']=='0',f'unit {name} still has a process; settle it before proceeding');return p
     def systemctl(self,*args):r.run(['systemctl','--user',*args])
-    def allowed_images(self,service,rendered):return {rendered}
+    def allowed_images(self,service,rendered):
+        images={rendered}
+        # An upgrade's graph may hold either release's containers, or both at once.
+        if getattr(self,'upgrade',None):images|={x for x in (self.release_images(service,self.upgrade[side]['release']) for side in ('from','to')) if x}
+        return images
     def service_ids(self,services=SERVICES):
         model=self.model();result={}
         for service in services:
@@ -566,6 +672,7 @@ print(json.dumps(state))
             need(not r.inspect(self.c,item['Id'])['State']['Running'],'gateway-watch is still monitoring the rollout window; stop its exact container before proceeding')
 
     def close(self):
+        if self.upgrade:return self.limited('close',self.upgrade_close)
         marker=self.markers()
         if marker:need(self.phase=='prepared','resumed estate requires prepared inputs; do not access or reopen old state')
         if self.receipt.exists():self.record()
@@ -594,12 +701,15 @@ print(json.dumps(state))
         marker=self.markers()
         if marker:need(self.phase=='prepared','resumed estate requires prepared inputs; do not access or reopen old state')
         self.record();need(self.doc.get('stage') in ('closed','settled','final','resumed'),'admissions closure is not recorded; run --close first')
+        self.h6_gate()
         if self.phase=='prepared':
             self.watch_closed();self.producers_stopped()
         else:
             for role in ('gateway','frontdoor','autobuild','watchdog_timer','watchdog_service'):self.unit_stopped(self.c['units'][role])
             for role in ('watchdog_timer','watchdog_service','autobuild'):need(self.unit(self.c['units'][role])['UnitFileState'] in ('masked','masked-runtime'),f'{role} is not masked; repeat --close')
     def settle(self):
+        return self.limited('settle',self.settle_steps)
+    def settle_steps(self):
         self.closed();observations=[]
         for index in range(2):
             count=self.monitor();quiet_counts(count);state=self.state();need(not work_problems(state),'record still has active work; leave admissions closed and settle the named rows')
@@ -607,6 +717,7 @@ print(json.dumps(state))
             if index==0:time.sleep(20)
         self.doc['observations']+=observations;self.doc['stage']='settled';self.save();return {'settled':observations}
     def final(self):
+        if self.upgrade:return self.limited('final',self.upgrade_final)
         self.closed();need(self.doc['stage'] in ('settled','final'),'two quiet observations are missing; run --settle before stopping writers')
         if self.phase=='original':
             command=[HERE/'rollout-sandbox','--config',self.config_path,'--env-file',self.args.env_file,'--project',self.c['project'],'--stop-legacy']
@@ -739,6 +850,7 @@ print('planning switch read back')
             event['seconds']=round(time.monotonic()-started,1);event['finished_at']=now()
 
     def resume(self):
+        self.not_upgrade('resume')
         need(self.phase=='prepared','resume requires prepared settings and env; select the loader inventory')
         marker=self.markers();self.record()
         if marker:return {'resumed':True,'idempotent':True,'notice':'Markers already establish current authority; no restore or automatic producer retry is permitted.'}
@@ -778,6 +890,7 @@ d=os.open(p.parent,os.O_DIRECTORY);os.fsync(d);os.close(d);assert p.read_bytes()
             self._diagnostic_events=None;result['finished_at']=now();private_path(self.snapshot/'post-resume-check.json');r.atomic_json(self.snapshot/'post-resume-check.json',result)
         return result
     def reopen(self):
+        self.not_upgrade('reopen')
         need(self.markers() is None,'work has resumed; legacy producers must remain retired and only forward-or-stopped recovery is permitted')
         self.record()
         if self.doc.get('restored'):self.verify_restored()
@@ -796,6 +909,571 @@ d=os.open(p.parent,os.O_DIRECTORY);os.fsync(d);os.close(d);assert p.read_bytes()
             if old['UnitFileState']=='enabled':self.systemctl('enable',name)
             if old['ActiveState']=='active':self.systemctl('start',name)
         return {'reopened':True,'retired_alarm':'remains masked'}
+    # ------------------------------------------------------------------------
+    # UPGRADE MODES: one resumed containerised estate, moved between two reviewed
+    # releases with the door shut (release -3 upgrade runbook, TC2, 2 October
+    # 2026). The switch of 30 September left resume markers in its own snapshot;
+    # an upgrade reads them there and never writes them, never writes the
+    # switch's close receipt, and never touches a legacy unit, container or the
+    # old ledger folder. Its own receipt is the upgrade block's 'receipt'.
+    # ------------------------------------------------------------------------
+    def upgrade_inputs(self,args):
+        c=self.c;u=self.upgrade
+        need(isinstance(u,dict) and {'from','to','receipt','snapshot','authority_snapshot','closed_door_dir'}<=set(u),'the upgrade block is incomplete; name from, to, receipt, snapshot, authority_snapshot and closed_door_dir')
+        need('release' in c,'an upgrade inventory names its own release; add release to the inventory')
+        self.release,self.entry=r.release(c)
+        for side in ('from','to'):
+            s=u[side]
+            need(isinstance(s,dict) and isinstance(s.get('release'),str) and s['release'] in r.RELEASES,f'the upgrade block\'s {side} side does not name a release in the reviewed table; correct the upgrade block')
+            need(isinstance(s.get('env_file'),str) and re.fullmatch('[0-9a-f]{64}',str(s.get('env_sha256'))) and isinstance(s.get('compose_files'),list) and s['compose_files']
+                 and all(isinstance(x,dict) and isinstance(x.get('path'),str) and re.fullmatch('[0-9a-f]{64}',str(x.get('sha256'))) for x in s['compose_files']),
+                 f'the upgrade block\'s {side} side must name its env file and its compose files, each with its SHA-256; correct the upgrade block')
+        need(u['from']['release']!=u['to']['release'],'the upgrade block names the same release on both sides; name the release it leaves and the one it goes to')
+        need(self.release in (u['from']['release'],u['to']['release']),f'this inventory names release {self.release}, which is neither side of the upgrade; use the inventory of one of the two releases')
+        self.side='from' if self.release==u['from']['release'] else 'to'
+        mine=u[self.side]
+        need(re.fullmatch(r'[a-z0-9][a-z0-9_-]+',args.project) and args.project==c['project'],'explicit project conflicts with the inventory; select the intended inventory')
+        need(args.env_file==c['env_file']==mine['env_file'],f'the env file differs between the command line, the inventory and the upgrade block\'s {self.side} side; use the env file of release {self.release}')
+        need(c['compose_files']==[x['path'] for x in mine['compose_files']],f'the inventory\'s compose files differ from the upgrade block\'s {self.side} side; use the compose files of release {self.release}')
+        need(c['runtime_image']==self.entry['runtime'],'estate project or runtime identity is invalid; use the accepted explicit release')
+        need(set(c['volumes'])==r.VOLUME_ROLES and len(set(c['volumes'].values()))==5 and all(re.fullmatch('[a-zA-Z0-9][a-zA-Z0-9_.-]+',name) for name in c['volumes'].values()),'five distinct state volumes are required; correct the explicit inventory')
+        self.side_hashes(self.side)
+        self.snapshot=r.path(args.snapshot,exists=False);root=r.path(c['snapshot_root'])
+        dated=lambda p:re.fullmatch(r'\d{8}T\d{6}Z(?:-[A-Za-z0-9_-]+)?',p.name)
+        need(dated(self.snapshot) and self.snapshot.parent==root,'snapshot is not a dated child of the declared root; select the upgrade\'s dated folder')
+        need(str(self.snapshot)==u['snapshot'],'--snapshot differs from the upgrade block\'s snapshot; select the upgrade\'s own folder')
+        self.authority=r.path(u['authority_snapshot'],exists=False)
+        need(dated(self.authority) and self.authority.parent==root and self.authority!=self.snapshot,'authority_snapshot is not the switch\'s dated snapshot beside this one; name the folder that holds the resume markers')
+        self.closed_door=r.path(u['closed_door_dir'],exists=False)
+        self.receipt=private_path(u['receipt'])
+        switch_receipt=(c.get('quiesce') or {}).get('receipt')
+        need(not switch_receipt or Path(switch_receipt)!=self.receipt,'the upgrade receipt is the switch\'s close receipt; name a new private receipt so the switch\'s stays exactly as it was')
+        need(not any(p==self.receipt or p in self.receipt.parents for p in (self.snapshot,self.authority)),'the upgrade receipt lies inside a snapshot folder; choose a private path outside both')
+        self.sandbox_evidence=private_path(self.receipt.with_name(self.receipt.name+'.rollout-sandbox-command.json'))
+        self.phase='prepared';self.q=c.get('quiesce') or {}
+        self.environment(args)
+        need(self.values.get('ROLLOUT_STATE_DIR')==str(self.closed_door),f'ROLLOUT_STATE_DIR in the env file is not release {self.release}\'s closed_door_dir; each release keeps its closed-door receipt in its own folder')
+        # The same for both inventories, so either release's tools read one receipt.
+        self.binding={'kind':'upgrade',**{k:c[k] for k in ('project','docker_context','snapshot_root','volumes')},
+                      'upgrade':{k:u[k] for k in ('from','to','receipt','snapshot','authority_snapshot')}}
+        self.doc=None
+
+    def side_hashes(self,side):
+        """The env and compose files of one side, hashed now; refuses when they differ from the block."""
+        s=self.upgrade[side]
+        actual={'release':s['release'],'env_file':s['env_file'],'env_sha256':r.sha256(r.path(s['env_file'])),
+                'compose_files':[{'path':x['path'],'sha256':r.sha256(r.path(x['path']))} for x in s['compose_files']]}
+        need(actual['env_sha256']==s['env_sha256'] and actual['compose_files']==[{'path':x['path'],'sha256':x['sha256']} for x in s['compose_files']],
+             f'release {s["release"]}\'s env or compose files no longer have the SHA-256 the upgrade recorded; put them back as they were reviewed, or review and record the change, before going on')
+        return actual
+
+    def not_upgrade(self,mode):
+        need(not self.upgrade,f'--{mode} belongs to the switch from the old set-up and this is an upgrade inventory; an upgrade uses --close, --settle, --final, --switch and --open')
+
+    def limited(self,mode,function):
+        """Run an upgrade mode inside its own time limit (MODE_LIMITS)."""
+        if not self.upgrade:return function()
+        with r.deadline(MODE_LIMITS[mode],'--'+mode):return function()
+
+    def h6_gate(self):
+        """Once release `to` has been started on this record, release `from` neither runs
+        on it nor reads it until rollout-back --upgrade-back's H6 proof passed after that."""
+        if not self.upgrade or self.side!='from':return
+        to=self.upgrade['to']['release']
+        started=[x['started_at'] for x in self.doc.get('switches',[]) if x.get('release')==to and x.get('started_release')]
+        if not started:return
+        last=max(started)
+        proved=[x for x in self.doc.get('back_h6',[]) if x.get('passed') and x.get('at','')>last]
+        need(proved,f'release {to} was started on this record at {last}, and release {self.release} has not been proved able to handle what it wrote; use rollout-back --upgrade-back with release {to}\'s inventory, whose H6 proof must pass before release {self.release} touches the record. Nothing was changed')
+
+    def own_containers(self,containers):
+        """Only this inventory's own release's containers are ever recorded: a --close must
+        never make another release's containers removable as if they had been recorded."""
+        own={}
+        for identifier,item in containers.items():
+            expected=self.release_images(item['service'])
+            if expected is not None and item['image']==expected:own[identifier]=dict(item,recorded_by=self.release)
+        return own
+
+    def upgrade_markers(self):
+        """The switch's two resume markers, read from its own snapshot and never written.
+
+        They are checked against the release they name, not this inventory's: they
+        say which release the estate was resumed on, which an upgrade does not change."""
+        try:host_record=marker_file(private_path(self.authority/'resumed.json'))
+        except Exception:r.refuse('the switch\'s host resume marker is present but unsafe or unreadable; preserve it and reconcile before an upgrade')
+        ledger_record={'present':False}
+        if self.volume_exists():
+            code="import json\n"+inspect_source.getsource(marker_file)+"\nprint(json.dumps(marker_file('/state/ROLLOUT-RESUMED')))"
+            try:ledger_record=json.loads(self.volume('ledger',code))
+            except Exception:r.refuse('the ledger resume marker is unsafe or unreadable; preserve current authority and reconcile the original pair')
+        need(isinstance(ledger_record,dict) and type(ledger_record.get('present')) is bool,'ledger marker presence is unknown; preserve current authority and reconcile')
+        need(host_record['present']==ledger_record['present'],'resume marker exists in only one place; keep the estate as it is and reconcile both original markers')
+        need(host_record['present'],'this estate has no resume markers, so it was never resumed; an upgrade takes an estate the switch resumed')
+        host=host_record['value']
+        need(host==ledger_record.get('value') and host.get('format_version')==1 and host.get('project')==self.c['project'] and host.get('snapshot')==str(self.authority),'resume markers disagree, or name another project or snapshot; keep current authority and reconcile them')
+        required={'snapshot_sha256','release_tag','image_id','actor','at','work_state','close_receipt_sha256'}
+        named=str(host.get('release_tag','')).rpartition(':')[2]
+        need(required<=host.keys() and named in r.RELEASES and host['image_id']==r.RELEASES[named]['runtime'],'resume markers name a release that is not in the reviewed table, or another image than that release\'s; retain current authority and reconcile them')
+        need(host['snapshot_sha256']==r.read_json(self.authority/'metadata.json')['sha256'],'resume marker names another snapshot; retain current authority and reconcile its provenance')
+        datetime.fromisoformat(host['at'])
+        return host
+
+    def release_images(self,service,release=None):
+        return r.release_image(release or self.release,service,self.values if (release or self.release)==self.release else self.other_values())
+    def other_values(self):
+        """The other side's public env values (its provisioning image only is read)."""
+        if getattr(self,'_other_values',None) is None:
+            other=self.upgrade['to' if self.side=='from' else 'from']
+            self._other_values,_=load_script('rollout-settings').read_env(r.path(other['env_file']))
+        return self._other_values
+
+    def check_release_images(self,model):
+        """Every rendered service that a release names runs this release's image."""
+        services=model.get('services',{})
+        for service in (*LONG_RUNNING,ONE_SHOT,'gateway-watch',*PRODUCERS):
+            if service not in services:
+                need(service in (SUPERVISOR,'gateway-watch'),f'service {service} is absent from the rendered graph; correct the release\'s Compose inputs');continue
+            expected=self.release_images(service)
+            need(isinstance(expected,str) and re.fullmatch(r'sha256:[0-9a-f]{64}',expected),f'release {self.release} names no immutable image for {service}; correct the env file\'s provisioning image or the release table')
+            need(services[service].get('image')==expected,f'{service} does not render release {self.release}\'s image from the reviewed table; correct the env image IDs')
+
+    def project_containers(self):
+        """Every container of this Compose project, by ID: service, image, name and state."""
+        ids=r.docker(self.c,'ps','--all','--filter','label=com.docker.compose.project='+self.c['project'],'--format','{{.ID}}').stdout.split()
+        result={}
+        for identifier in ids:
+            item=r.inspect(self.c,identifier);labels=item['Config'].get('Labels') or {}
+            need(labels.get('com.docker.compose.project')==self.c['project'] and labels.get('com.docker.compose.service'),f'container {identifier} has unclear ownership; leave it untouched and reconcile')
+            result[item['Id']]={'service':labels['com.docker.compose.service'],'image':item['Image'],'name':item.get('Name'),'status':item['State'].get('Status')}
+        return result
+
+    def volume_record(self):
+        names=r.docker(self.c,'volume','ls','--filter','label=com.docker.compose.project='+self.c['project'],'--format','{{.Name}}').stdout.split()
+        items=json.loads(r.docker(self.c,'volume','inspect',*names).stdout) if names else []
+        result={item['Name']:{'Mountpoint':item.get('Mountpoint'),'CreatedAt':item.get('CreatedAt')} for item in items}
+        need(set(self.c['volumes'].values())<=set(result),'a state volume the inventory names does not belong to this project; reconcile the volume mapping')
+        return result
+
+    def settings_digests(self,wanted=None):
+        """Digests of the settings volume's forge.yaml, never its values (runbook 2.6)."""
+        args=[json.dumps(wanted)] if wanted is not None else []
+        return json.loads(self.volume('settings',SETTINGS_DIGEST_CODE,args))
+
+    def settings_invariant(self):
+        """The settings file is U1's apart from planning.enabled, the one value the tools write."""
+        recorded=self.doc['settings'];actual=self.settings_digests({'planning_enabled':recorded['planning_enabled']})
+        need(actual['canonical_sha256']==recorded['canonical_sha256'] and recorded['sha256'] in (actual['sha256'],actual['rewritten_sha256']),
+             'the coordinator\'s settings file differs from the one recorded at --close in more than planning.enabled; an upgrade never changes the settings, so nothing is started. Find what changed it and put it back')
+        return actual
+
+    def sandbox_facts(self):
+        """What this release's supervisor runs inside its sandbox, from its own env files."""
+        name=self.values.get('SANDBOX_NAME','');script=self.values.get('SANDBOX_BOOTSTRAP','');bootstrap=self.values.get('SANDBOX_PROJECT_ENV_FILE','')
+        need(re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]*',name) and script and not script.startswith('-') and bootstrap,'the env file does not name the sandbox, its bootstrap and its bootstrap env file; the sandbox supervisor cannot be checked')
+        bootstrap=r.path(bootstrap)
+        values,_=load_script('rollout-settings').read_env(bootstrap)
+        settings=values.get('FORGE_CONFIG_PATH') or None
+        need(settings is None or (settings.startswith('/') and not settings.startswith('-')),'the bootstrap env names a relative FORGE_CONFIG_PATH; name the sandbox settings file by its absolute path')
+        prefix=values.get('SANDBOX_CONTAINER_PREFIX') or self.values.get('SANDBOX_CONTAINER_PREFIX') or 'forge-sandbox'
+        return {'name':name,'script':script,'bootstrap_env_file':str(bootstrap),'settings_path':settings,'prefix':prefix,'image':values.get('FORGE_IMAGE')}
+
+    def sbx(self,*argv):
+        env={'PATH':os.environ.get('PATH','/usr/local/bin:/usr/bin:/bin'),'LANG':'C.UTF-8'}
+        for key in ('HOME','USER','XDG_RUNTIME_DIR','DBUS_SESSION_BUS_ADDRESS'):
+            if key in os.environ:env[key]=os.environ[key]
+        events=getattr(self,'_diagnostic_events',None)
+        if events is None:return r.run(['sbx',*argv],env=env)
+        return self.captured(['sbx',*argv],self._diagnostic_stage,events,env=env)
+
+    def sandbox_hashes(self):
+        """SHA-256 of the clone's bootstrap and the sandbox settings file (read inside the
+        sandbox) and of the bootstrap env file (on this machine)."""
+        facts=self.sandbox_facts();files=[facts['script']]+([facts['settings_path']] if facts['settings_path'] else [])
+        seen={}
+        for line in self.sbx('exec',facts['name'],'sha256sum','--',*files).stdout.splitlines():
+            digest,_,name=line.partition('  ')
+            if re.fullmatch('[0-9a-f]{64}',digest):seen[name.strip()]=digest
+        need(all(x in seen for x in files),'the sandbox did not report the hash of its bootstrap or settings file; check the sandbox answers and both files exist')
+        return {'template_sha256':seen[facts['script']],'bootstrap_env_file':facts['bootstrap_env_file'],'bootstrap_env_sha256':r.sha256(facts['bootstrap_env_file']),
+                'settings_path':facts['settings_path'],'settings_sha256':seen.get(facts['settings_path']) if facts['settings_path'] else None}
+
+    def expected_sandbox(self):
+        """The three hashes recorded for this release: at --close for the release that
+        was running, or in the installation receipt rollout-sandbox --upgrade wrote."""
+        recorded=(self.doc.get('sandbox') or {}).get(self.release)
+        if recorded:return recorded
+        need(self.release==self.upgrade['to']['release'],f'no sandbox installation is recorded for release {self.release}; run --close with its inventory first')
+        need(isinstance(self.c.get('sandbox'),dict) and isinstance(self.c['sandbox'].get('evidence_dir'),str),'the inventory names no sandbox.evidence_dir, where rollout-sandbox --upgrade writes its installation receipt; name it')
+        receipt=r.read_json(private_path(Path(self.c['sandbox']['evidence_dir'])/'sandbox-installed.json',exists=True))
+        hexes=all(isinstance(receipt.get(k),str) and re.fullmatch('[0-9a-f]{64}',receipt[k]) for k in ('template_sha256','bootstrap_env_sha256','settings_sha256'))
+        need(receipt.get('format_version')==2 and receipt.get('image')==self.entry['runtime'] and hexes,f'the sandbox installation receipt is not rollout-sandbox --upgrade\'s for release {self.release}; run that step before --switch')
+        return {k:receipt[k] for k in ('template_sha256','bootstrap_env_sha256','settings_sha256')}
+
+    def one_container(self,service,*,profile=()):
+        ids=self.compose(*profile,'ps','--all','-q',service).stdout.split()
+        need(len(ids)<=1,f'service {service} has more than one container; reconcile its exact identity')
+        return r.inspect(self.c,ids[0]) if ids else None
+
+    def closed_door_items(self,model):
+        services=[s for s in LONG_RUNNING if s in model.get('services',{})]
+        return self.service_ids(services)
+
+    def require_on_release(self,model,items):
+        """Every long-running closed-door service running on this release's image."""
+        for service in (s for s in LONG_RUNNING if s in model.get('services',{})):
+            item=items.get(service)
+            need(item and item['State'].get('Running') and item['Image']==self.release_images(service),f'{service} is not running on release {self.release}; run --switch for this release first. Nothing was started')
+
+    def bus_ready(self):
+        item=self.one_container(ONE_SHOT)
+        if item is None:return None
+        state=item['State']
+        return {'id':item['Id'],'image':item['Image'],'running':bool(state.get('Running')) or state.get('Status') in ('created','restarting'),'status':state.get('Status'),'exit':state.get('ExitCode'),'started_at':state.get('StartedAt'),'finished_at':state.get('FinishedAt')}
+
+    def judge_bus_ready(self,ready,since):
+        """bus-ready is a one-shot: proven only once it has exited 0 on its image in this run."""
+        need(ready is not None,'bus-ready has no container; run --switch for this release')
+        need(not ready['running'],'bus-ready is still running its comparison against the bus, so it has proven nothing yet; wait for it to finish and run this step again')
+        need(ready['image']==self.release_images(ONE_SHOT),f'bus-ready ran another image than release {self.release}\'s provisioning image; run --switch for this release')
+        need(ready['status']=='exited' and ready['exit']==0,f'bus-ready exited {ready["exit"]}: the bus differs from the pinned definitions or could not be read. Read its log; the door stays shut')
+        need(docker_time(ready['started_at'])>=since,'bus-ready last ran before this release was brought up; run --switch for this release')
+        return ready
+
+    def run_bus_ready(self,since):
+        self.compose('up','-d','--no-deps',ONE_SHOT)
+        deadline=time.monotonic()+BUS_READY_WAIT_SECONDS
+        while True:
+            ready=self.bus_ready()
+            if ready is None or not ready['running'] or time.monotonic()>=deadline:break
+            time.sleep(READY_POLL_SECONDS)
+        need(ready is None or not ready['running'],f'bus-ready was still running after {BUS_READY_WAIT_SECONDS} s; the door stays shut. Read its log, then run --switch again')
+        return self.judge_bus_ready(ready,since)
+
+    def load_settings(self):
+        """This release's image loads the current settings file with the estate env."""
+        code=GUARD+"import pathlib; from forge.config.loader import load_config; load_config(pathlib.Path('/state/forge.yaml')); print('loaded')"
+        self.volume('settings',code,environment=True)
+
+    def policy_verify(self,*,require_members):
+        need(self.c['docker_context']=='default','the publisher policy is bound to the local default Docker context; use it')
+        env={'PATH':os.environ.get('PATH','/usr/sbin:/usr/bin:/sbin:/bin'),'DOCKER_HOST':'unix:///var/run/docker.sock'}
+        daemon=r.docker(self.c,'info','--format','{{.ID}}').stdout.strip()
+        argv=['sudo','-n','--',POLICY_HELPER,'verify','--docker-host',env['DOCKER_HOST'],'--env-file',r.path(self.args.env_file),'--project',self.c['project'],'--daemon-id',daemon]
+        if require_members:argv.append('--require-members')
+        events=getattr(self,'_diagnostic_events',None)
+        if events is None:return r.run(argv,env=env)
+        return self.captured(argv,self._diagnostic_stage,events,env=env)
+
+    def current_copy(self,directory):
+        output=directory/'current.db'
+        code='''import pathlib,sqlite3,hashlib,json
+p=pathlib.Path('/state/forge.db');wal=p.with_name(p.name+'-wal');active=wal.exists() and wal.stat().st_size>0
+source=sqlite3.connect(p.as_uri()+('?mode=ro' if active else '?mode=ro&immutable=1'),uri=True);target=sqlite3.connect('/out/current.db');source.backup(target);target.close();source.close()
+p=pathlib.Path('/out/current.db');print(json.dumps({'sha256':hashlib.sha256(p.read_bytes()).hexdigest(),'size':p.stat().st_size}))
+'''
+        name=self.c['volumes']['ledger'];r.volume_identity(self.c,name,self.model())
+        observed=json.loads(self.helper(code,mounts=[f'type=volume,src={name},dst=/state,readonly',f'type=bind,src={directory},dst=/out']))
+        need(r.sha256(output)==observed['sha256'],'current-copy hash differs; retain stopped authority and retry the copy')
+        return output,observed
+
+    def ledger_backup(self,name):
+        """A consistent copy of the current ledger, taken through a read-only mount, kept
+        private in the upgrade snapshot. Never overwrites an earlier one."""
+        destination=private_path(self.snapshot/name)
+        need(not destination.exists(),f'{destination} already exists; an earlier backup is never overwritten')
+        with tempfile.TemporaryDirectory(prefix='.ledger-backup-',dir=self.snapshot) as temporary:
+            copy,observed=self.current_copy(Path(temporary))
+            staged=Path(temporary)/'owned.db'
+            with open(copy,'rb') as source,open(os.open(staged,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600),'wb') as target:
+                target.write(source.read());target.flush();os.fsync(target.fileno())
+            os.link(staged,destination)
+        need(r.sha256(destination)==observed['sha256'],'the ledger backup differs from what was read; keep the estate stopped and take it again')
+        return {'path':str(destination),'sha256':observed['sha256'],'ledger_state':r.ledger_state(destination,consolidated=True),'logical_sha256':r.consolidated_logical_digest(destination)}
+
+    def stop_supervisor(self,model):
+        """Stop the sandbox supervisor first and require exit 0: run.sh exits 0 only once the
+        work inside the sandbox has stopped (3 means that stop failed, run.sh:287, :381)."""
+        if SUPERVISOR not in model.get('services',{}):return {'supervisor':'none in this estate'}
+        item=self.service_ids((SUPERVISOR,)).get(SUPERVISOR)
+        if item is None:return {'supervisor':'no container'}
+        if item['State'].get('Running'):
+            self.compose('stop','--timeout',str(SUPERVISOR_STOP_SECONDS),SUPERVISOR,timeout=SUPERVISOR_STOP_SECONDS+60)
+        after=r.inspect(self.c,item['Id'])
+        need(not after['State'].get('Running'),'sandbox-runner did not stop; nothing else was stopped. Read its log before retrying')
+        code=after['State'].get('ExitCode')
+        if code==0:return {'supervisor':item['Id'],'exit':0}
+        # Any other exit is accepted only once it is proved that nothing runs inside
+        # the sandbox; otherwise a supervisor that crashed or refused to start would
+        # block every way forward and back for good.
+        meaning=SUPERVISOR_EXITS.get(code,'it ended without its own clean stop (killed or crashed)')
+        inside=self.inside_supervision()
+        busy=inside['containers']+(['a live supervisor process'] if inside['record_live'] else [])+(['the supervisor\'s lock held'] if inside['lock_held'] else [])
+        need(not busy,f'sandbox-runner exited {code}: {meaning}; and inside the sandbox there is still {", ".join(busy)}, so nothing else was stopped. Stop the bootstrap\'s work inside the sandbox (its stop word, as the supervisor\'s log says), then run this step again')
+        return {'supervisor':item['Id'],'exit':code,'meaning':meaning,'accepted_because':'nothing runs inside the sandbox: no helper or runner container, no live supervisor and no held lock','inside':inside}
+
+    def inside_supervision(self):
+        facts=self.sandbox_facts()
+        wanted={facts['prefix']+'-helper',facts['prefix']+'-runner'}
+        names=sorted(x for x in self.sbx('exec',facts['name'],'docker','ps','--all','--format','{{.Names}}').stdout.split() if x in wanted)
+        state=json.loads(self.sbx('exec',facts['name'],'python3','-c',SUPERVISION_CODE,facts['script']).stdout)
+        need(isinstance(state,dict) and all(type(state.get(k)) is bool for k in ('record_live','lock_held')),'the sandbox did not say whether its supervisor still runs; look inside it')
+        return {'containers':names,'record_live':state['record_live'],'lock_held':state['lock_held'],'record_present':bool(state.get('record_present'))}
+
+    def upgrade_close(self):
+        self.markers()
+        need(self.snapshot.is_dir() and not self.snapshot.is_symlink(),'the upgrade snapshot folder does not exist; the preparation step creates it')
+        containers=self.own_containers(self.project_containers())
+        again=self.receipt.exists()
+        if again:
+            self.record();self.h6_gate()
+            known=self.doc.setdefault('containers',{})
+            for identifier,item in containers.items():known.setdefault(identifier,item)
+            self.save()
+        else:
+            need(self.side=='from',f'an upgrade starts from release {self.upgrade["from"]["release"]}, the one running; close with its inventory')
+            model=self.model()
+            settings=self.settings_digests()
+            # Only a file in the tools' own written form can be proved unchanged after
+            # the planning switch rewrites it; refuse now rather than at --switch.
+            need(settings['rewritten_sha256']==settings['sha256'],'the coordinator\'s settings file is not in the form the planning switch writes, so it could not be proved unchanged after --final turns planning off; nothing was stopped. Rewrite it through the planning switch first')
+            sandbox=self.sandbox_hashes() if SUPERVISOR in model.get('services',{}) else None
+            self.doc={'format_version':1,'kind':'upgrade','binding':self.binding,'created_at':now(),'release_at_close':self.release,
+                      'containers':containers,'settings':{k:settings[k] for k in ('sha256','canonical_sha256','planning_enabled')},
+                      'volumes':self.volume_record(),'sources':{side:self.side_hashes(side) for side in ('from','to')},
+                      'sandbox':{self.release:sandbox} if sandbox else {},'stage':'recorded','observations':[]}
+            self.save()
+        self.watch_closed(stop=True);self.stop_current(PRODUCERS)
+        # A later close may follow an open that was cut off (run-step's SIGKILL leaves
+        # the door open and planning on); it leaves the door shut AND planning off.
+        if again:self.planning(False)
+        self.doc['stage']='closed';self.doc['closed_phase']='prepared';self.save()
+        return {'closed':True,'receipt':str(self.receipt),'recorded_containers':len(self.doc['containers']),'notice':'No session may run forge queue until this upgrade opens the door again.'}
+
+    def upgrade_final(self):
+        self.closed();need(self.doc['stage'] in ('settled','final'),'two quiet observations are missing; run --settle before stopping writers')
+        model=self.model();supervisor=self.stop_supervisor(model)
+        self.stop_current(SERVICES)
+        attachments=r.docker(self.c,'ps','--filter','volume='+self.c['volumes']['ledger'],'--format','{{.ID}}').stdout.strip();need(not attachments,'a running container still attaches the current ledger; stop its explicit writer before proceeding')
+        holders_before=self.current_holders();first=self.current_state();time.sleep(20);holders_after=self.current_holders();state=self.current_state();need(first==state,'current ledger changed after graph stop; find its remaining writer')
+        self.doc['current_holder_proof']={'before':holders_before,'after':holders_after}
+        need(not work_problems(state),'stopped record still contains active work; reconcile it without cancelling or discarding anything')
+        count=self.monitor();quiet_counts(count)
+        name='current-forge.db' if not (self.snapshot/'current-forge.db').exists() else 'current-forge-'+datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')+'.db'
+        backup=self.ledger_backup(name)
+        need(backup['logical_sha256']==state['logical_sha256'],'the ledger changed between the stillness proof and its backup; find the remaining writer')
+        self.planning(False)
+        final={'at':now(),'release':self.release,'state':state,'counts':count,'supervisor':supervisor,'backup':backup,'planning_enabled':False}
+        self.doc['stage']='final';self.doc['final_phase']='prepared';self.doc['final']=final;self.doc.setdefault('finals',[]).append(final);self.save()
+        return final
+
+    def ledger_readers(self,baseline):
+        """The three ledger readers agree, and see the baseline or exactly its start-up reconciliation."""
+        code='import pathlib,json,sqlite3,hashlib\n'+inspect_source.getsource(r.logical_digest)+READER_CODE
+        seen={}
+        for service in LEDGER_READERS:
+            item=self.service_ids((service,))[service]
+            out=json.loads(self.recorded_docker('exec',item['Id'],'python','-c',code).stdout)
+            need(out.get('schema_version')==self.entry['schema'],f'{service} reads a ledger at schema {out.get("schema_version")}, not release {self.release}\'s {self.entry["schema"]}; keep the door shut and reconcile')
+            seen[service]={'container_id':item['Id'],'logical_sha256':out['logical_sha256']}
+        digests={x['logical_sha256'] for x in seen.values()}
+        need(len(digests)==1,'the three services observed different ledger states; keep the door shut and run --switch again once start-up has settled')
+        digest=digests.pop()
+        if digest==baseline['logical_sha256']:return {'services':seen,'reconciled':[]}
+        import base64
+        with tempfile.TemporaryDirectory(prefix='.switch-started-',dir=self.snapshot) as temporary:
+            started=Path(temporary)/'started.db'
+            # Not recorded: its output is the ledger itself.
+            started.write_bytes(base64.b64decode(r.docker(self.c,'exec',seen['coordinator']['container_id'],'python','-c',r.STARTED_COPY_CODE).stdout));os.chmod(started,0o600)
+            need(r.consolidated_logical_digest(started)==digest,'the started ledger changed between its reading and its copy; keep the door shut and run --switch again')
+            changed=r.boot_reconciled_builds(baseline['path'],started)
+        need(changed,'the started ledger differs from the recorded one without a reconciled build; keep the door shut and reconcile its state')
+        return {'services':seen,'reconciled':changed}
+
+    def start_supervisor(self,model):
+        """Start sandbox-runner only on this release's own bootstrap, env and settings."""
+        item=self.service_ids((SUPERVISOR,)).get(SUPERVISOR)
+        facts=self.sandbox_facts()
+        if not (item and item['State'].get('Running') and item['Image']==self.release_images(SUPERVISOR)):
+            expected=self.expected_sandbox();actual=self.sandbox_hashes()
+            for key,what in (('template_sha256','the clone\'s bootstrap'),('bootstrap_env_sha256','the bootstrap env file'),('settings_sha256','the sandbox settings file')):
+                need(actual[key]==expected[key],f'{what} does not have the SHA-256 recorded for release {self.release}, so sandbox-runner was not started; install this release in the sandbox (or restore it) first. The rest is up with the door shut')
+            self.compose('up','-d','--no-deps',SUPERVISOR)
+            item=self.service_ids((SUPERVISOR,))[SUPERVISOR]
+        restarts=item.get('RestartCount');deadline=time.monotonic()+SANDBOX_START_WAIT_SECONDS
+        wanted={facts['prefix']+'-helper',facts['prefix']+'-runner'}
+        while True:
+            now_item=r.inspect(self.c,item['Id'])
+            need(now_item['State'].get('Running') and now_item.get('RestartCount')==restarts,'sandbox-runner stopped or restarted while its sandbox services were starting; read its log. The door stays shut')
+            names={x for x in self.sbx('exec',facts['name'],'docker','ps','--format','{{.Names}}').stdout.split() if x.startswith(facts['prefix']+'-')}
+            if names==wanted or time.monotonic()>=deadline:break
+            time.sleep(READY_POLL_SECONDS)
+        need(names==wanted,f'inside the sandbox, the running {facts["prefix"]}- containers are {sorted(names)}, not exactly the helper and the runner; the door stays shut')
+        need(facts['image'] and not facts['image'].startswith('-'),'the bootstrap env names no FORGE_IMAGE; the sandbox services\' image cannot be checked')
+        image=self.sbx('exec',facts['name'],'docker','image','inspect','--format','{{.Id}} {{index .Config.Labels "com.guardkit.release.version"}}',facts['image']).stdout.split()
+        need(len(image)==2 and image[1]==self.release,f'inside the sandbox, the image the bootstrap names is not release {self.release}\'s; the door stays shut')
+        running=self.sbx('exec',facts['name'],'docker','inspect','--format','{{.Name}} {{.Image}}',*sorted(wanted)).stdout.split()
+        need(running==[x for name in sorted(wanted) for x in ('/'+name,image[0])],f'inside the sandbox, the helper and runner do not both run release {self.release}\'s image; the door stays shut')
+        return {'supervisor':item['Id'],'restarts':restarts,'inside':sorted(wanted),'image':image[0]}
+
+    def switch(self):
+        """Bring this inventory's release up with the door shut and planning off (TC2)."""
+        need(self.upgrade,'--switch belongs to an upgrade inventory; this one has no upgrade block')
+        return self.limited('switch',self.switch_run)
+
+    def switch_run(self):
+        self.markers();self.record();self.h6_gate()
+        if self.side=='to':need(self.doc.get('stage')=='final',f'release {self.release} is brought up only after --final stopped release {self.upgrade["from"]["release"]}; run --final with that inventory first')
+        else:need(self.doc.get('stage') in ('closed','settled','final'),'the door is not recorded shut; run --close first')
+        result={'format_version':1,'release':self.release,'started_at':now(),'passed':False,'commands':[]}
+        destination=private_path(self.snapshot/('switched-'+self.release+'.json'))
+        # Recorded before anything starts and saved again the moment this release's
+        # first container starts, so even a switch cut off by SIGKILL is on record.
+        self._switch_entry={'release':self.release,'started_at':result['started_at'],'passed':None,'started_release':False}
+        self.doc.setdefault('switches',[]).append(self._switch_entry);self.save()
+        self._diagnostic_events=result['commands'];self._diagnostic_stage='switch-preflight'
+        try:
+            self.switch_steps(result);result['passed']=True
+            # The stage says what runs now: a later --switch to the other release needs
+            # its own --close, --settle and --final again first.
+            self.doc['stage']='switched';self.doc['switched_release']=self.release
+        except Exception as exc:
+            result['failure']={'stage':self._diagnostic_stage,'reason':self.sanitize(str(exc))};raise
+        finally:
+            self._diagnostic_events=None;result['finished_at']=now();r.atomic_json(destination,result)
+            self._switch_entry.update({k:result.get(k) for k in ('finished_at','passed','bus_ready')});self.save()
+        return result
+
+    def switch_steps(self,result):
+        def stage(name):self._diagnostic_stage=name
+        since=datetime.now(timezone.utc)
+        stage('door-shut');self.watch_closed();self.producers_stopped()
+        # A cancel before --final restarts a coordinator that is still running: never
+        # under active work. After --final the record was already proved quiet.
+        stage('active-work');problems=work_problems(self.state())
+        need(not problems,'the record shows active work ('+', '.join(sorted({x['table'] for x in problems}))+'), and --switch restarts the coordinator; let it finish with the door shut (--settle passes once it has), then run --switch again. Nothing was started')
+        stage('render');model=self.model();self.check_release_images(model)
+        policy=load_script('publisher-host-policy')
+        policy.validate_declared(model,policy.binding(self.c['project']),r.path(self.values['FORGE_PUBLISHER_SETTINGS_FILE']))
+        # Checked before anything starts, and again after the tools' own write below.
+        stage('settings-invariant');self.settings_invariant()
+        stage('settings-load');self.load_settings()
+        stage('policy-verify');self.policy_verify(require_members=False)
+        stage('baseline')
+        if self.doc.get('stage')=='final':baseline=self.doc['final']['backup']
+        else:baseline=self.ledger_backup('switch-start-'+self.release+'-'+since.strftime('%Y%m%dT%H%M%S%fZ')+'.db')
+        result['baseline']={k:baseline[k] for k in ('path','sha256','logical_sha256')}
+        stage('remove-other-release')
+        recorded=self.doc.get('containers',{});removed=[]
+        for identifier,item in self.project_containers().items():
+            expected=self.release_images(item['service'])
+            if expected is None or item['image']==expected:continue
+            live=r.inspect(self.c,identifier)
+            need(not live['State'].get('Running'),f'{item["service"]} is running on another release\'s image; '+('to leave release '+self.upgrade['to']['release']+' while it runs, use rollout-back --upgrade-back' if self.side=='from' else 'stop release '+self.upgrade['from']['release']+' first with its --close, --settle and --final')+'. Nothing was started')
+            other=self.upgrade['to' if self.side=='from' else 'from']['release']
+            need(identifier in recorded,f'{item["service"]} container {identifier[:12]} is on release {other} and no --close recorded it'
+                 +(', so it ran after the upgrade began: go back with rollout-back --upgrade-back. ' if self.side=='from' else f'; run --close with release {other}\'s inventory so its containers are recorded. ')+'Nothing was started')
+            r.docker(self.c,'rm',identifier);removed.append(identifier)
+        result['removed']=removed
+        self._switch_entry['started_release']=True;self.save()
+        stage('bus-ready');ready=self.run_bus_ready(since);result['bus_ready']={k:ready[k] for k in ('id','started_at','finished_at')}
+        stage('closed-door-start');items=self.closed_door_items(model)
+        starting=[s for s in LONG_RUNNING if s in model['services'] and s not in ('coordinator',SUPERVISOR) and not (items.get(s) and items[s]['State'].get('Running') and items[s]['Image']==self.release_images(s))]
+        # The coordinator is created by the forced recreation below, after planning is
+        # written off, so it never starts on this release with planning on.
+        if starting:self.compose('up','-d','--no-deps',*starting)
+        result['started']=starting
+        stage('planning-off');self.planning(False);written=datetime.now(timezone.utc)
+        stage('coordinator-recreate');self.compose('up','-d','--no-deps','--force-recreate','coordinator')
+        coordinator=self.service_ids(('coordinator',))['coordinator']
+        need(coordinator['State'].get('Running') and coordinator['Image']==self.entry['runtime'] and docker_time(coordinator['State'].get('StartedAt'))>written,'the coordinator was not started on this release after planning was written off; the door stays shut')
+        result['coordinator']={'id':coordinator['Id'],'started_at':coordinator['State'].get('StartedAt'),'planning_written_at':written.isoformat()}
+        stage('settings-invariant-after');self.settings_invariant()
+        stage('volumes');current=self.volume_record()
+        for name,identity in self.doc['volumes'].items():
+            need(current.get(name)==identity,f'volume {name} is not the one recorded at --close (name, mount point and creation time); the door stays shut. Reconcile it')
+        stage('ledger-readers');result['readers']=self.ledger_readers(baseline)
+        stage('policy-verify-members');self.policy_verify(require_members=True)
+        if SUPERVISOR in model['services']:stage('sandbox-runner');result['sandbox']=self.start_supervisor(model)
+        stage('door-still-shut');self.watch_closed();self.producers_stopped()
+        self.require_on_release(model,self.closed_door_items(model))
+
+    def open_door(self):
+        """Open the door on this release; nothing is started before its closed-door receipt passes."""
+        need(self.upgrade,'--open belongs to an upgrade inventory; this one has no upgrade block')
+        with r.deadline(MODE_LIMITS['open'],'--open'):return self.open_steps()
+
+    def open_steps(self):
+        self.markers();self.record();self.h6_gate()
+        switched=[x for x in self.doc.get('switches',[]) if x.get('release')==self.release and x.get('passed')]
+        need(switched,f'release {self.release} has not been brought up with the door shut; run --switch for it first. Nothing was started')
+        since=datetime.fromisoformat(switched[-1]['started_at'])
+        # Steps 1-5 change nothing (runbook TC2, in resume()'s order).
+        model=self.model()
+        self.require_on_release(model,self.closed_door_items(model))
+        self.judge_bus_ready(self.bus_ready(),since)
+        self.producers_stopped();self.watch_closed(required=True)
+        for index in range(2):
+            counts=self.monitor();quiet_counts(counts);need(not work_problems(self.state()),'record has active work with the door shut; leave it shut and settle the named rows')
+            if index==0:time.sleep(20)
+        need(self.c['docker_context']=='default','publisher resume requires the supported local default Docker context')
+        self.closed_door_receipt()
+        need(self.values.get('ROLLOUT_STATE_DIR')==str(self.closed_door),'the closed-door receipt is not in this release\'s own folder; bind ROLLOUT_STATE_DIR to closed_door_dir')
+        result={'format_version':1,'release':self.release,'started_at':now(),'services_check':None,'factory_hello':None,'passed':False,'commands':[],'markers':'untouched'}
+        destination=private_path(self.snapshot/('opened-'+self.release+'.json'))
+        # A stop signal (or Ctrl-C) while the door is opening must still shut it again.
+        # SIGKILL cannot be caught: run-step's limit must be above MODE_LIMITS.
+        main=threading.current_thread() is threading.main_thread()
+        def interrupted(signum,frame):raise Interrupted(f'signal {signum}')
+        previous=signal.signal(signal.SIGTERM,interrupted) if main else None
+        self._diagnostic_events=result['commands'];self._diagnostic_stage='planning-enable'
+        try:
+            self.planning(True);self._diagnostic_stage='coordinator-recreate';self.compose('up','--no-deps','-d','--force-recreate','coordinator')
+            self._diagnostic_stage='producer-open';self.compose('up','--no-deps','-d',*PRODUCERS)
+            self._diagnostic_stage='readiness-wait';self.wait_ready(result['commands'])
+            self.captured([HERE/'estate-check','services','--env-file',self.args.env_file,'--project',self.c['project']],'estate-check services',result['commands'],env=self.env);result['services_check']='passed'
+            self.captured([HERE/'factory-hello','--env-file',self.args.env_file,'--project',self.c['project']],'factory-hello',result['commands'],env=self.env);result['factory_hello']='completed'
+            self._diagnostic_stage='gateway-watch-start';self.compose('--profile','watch','up','--no-deps','-d','gateway-watch');result['passed']=True
+            self.doc['stage']='opened';self.doc['opened_release']=self.release;self.save()
+        except BaseException as exc:
+            ignored={}
+            if main:ignored={number:signal.signal(number,signal.SIG_IGN) for number in (signal.SIGTERM,signal.SIGINT)}
+            try:
+                result['failure']={'stage':result['commands'][-1]['stage'] if result['commands'] else self._diagnostic_stage,'reason':self.sanitize(str(exc) or type(exc).__name__)}
+                self._diagnostic_events=None
+                with r.deadline(MODE_LIMITS['open-clean-up'],'--open clean-up',replace=True):result['cleanup']=self.shut_again()
+            finally:
+                for number,handler in ignored.items():signal.signal(number,handler)
+            if isinstance(exc,Interrupted):
+                raise r.Refusal('--open was stopped by a signal while it opened the door; the producers and the watch were stopped again and planning set off as opened-'+self.release+'.json records') from None
+            raise
+        finally:
+            if main and previous is not None and signal.getsignal(signal.SIGTERM) is interrupted:signal.signal(signal.SIGTERM,previous)
+            self._diagnostic_events=None;result['finished_at']=now();r.atomic_json(destination,result)
+        return result
+
+    def closed_door_receipt(self):
+        """This release's closed-door receipt must pass estate-check's own reader. Its
+        words are kept privately when it does not, and the refusal says where."""
+        events=[]
+        try:
+            self.captured([HERE/'estate-check','--read-pre-resume','--env-file',self.args.env_file,'--project',self.c['project'],'--for-image',self.entry['runtime']],'closed-door receipt',events,env=self.env)
+        except Exception:
+            diagnostic=private_path(self.snapshot/('open-refused-'+self.release+'.json'))
+            r.atomic_json(diagnostic,{'format_version':1,'release':self.release,'at':now(),'closed_door_dir':str(self.closed_door),'commands':events})
+            said=[line.strip() for line in (events[-1].get('stderr','') if events else '').splitlines() if line.strip()]
+            r.refuse(f'release {self.release}\'s closed-door receipt in {self.closed_door} cannot be acted on'+(f' (estate-check: {said[-1][:300]})' if said else '')
+                     +f'; its words are kept in {diagnostic}. Nothing was started. With the producers stopped and this release up, write it with this release\'s env: estate-check --pre-resume --for-image {self.entry["runtime"]}, then --read-pre-resume, then run --open again')
+
+    def shut_again(self):
+        """After a failed open: producers and watch stopped, planning off, each said separately."""
+        cleanup={}
+        for name,step in (('producers_stopped',lambda:self.stop_current(PRODUCERS)),('watch_stopped',lambda:self.watch_closed(stop=True)),('planning_enabled_false',lambda:self.planning(False))):
+            try:step();cleanup[name]=True
+            except Exception as exc:cleanup[name]=False;cleanup[name+'_reason']=self.sanitize(str(exc))
+        return cleanup
+
+    def open(self):return self.open_door()
     def plan(self,mode):
         # Do not create helper containers, SQLite sidecars, or E2 probe files.
         # Facts needing an execution namespace are explicitly unknown in preview.
@@ -810,13 +1488,17 @@ d=os.open(p.parent,os.O_DIRECTORY);os.fsync(d);os.close(d);assert p.read_bytes()
                 observations['historical_snapshot_work']=metadata['work_state']
                 observations['work']={'status':'UNKNOWN','action':'read current volume during execution; snapshot facts are historical only'}
         except Exception:observations['work']={'status':'UNKNOWN','action':'inspect the declared phase input before execution'}
-        return {'plan':True,'mode':mode,'phase':self.phase,'observations':observations,'notice':'No state, helper container, receipt-store probe, marker, unit or application changed; no session may run forge queue.'}
+        result={'plan':True,'mode':mode,'phase':self.phase,'observations':observations,'notice':'No state, helper container, receipt-store probe, marker, unit or application changed; no session may run forge queue.'}
+        if self.upgrade:
+            result['upgrade']={'release':self.release,'side':self.side,'from':self.upgrade['from']['release'],'to':self.upgrade['to']['release'],
+                               'receipt':str(self.receipt),'closed_door_dir':str(self.closed_door),'markers':'read from '+str(self.authority)+', never written'}
+        return result
 
 def arguments(argv=None,back=False):
-    p=r.Parser(description=__doc__);p.add_argument('--config',required=True);p.add_argument('--env-file',required=True);p.add_argument('--project',required=True);p.add_argument('--snapshot',required=True);p.add_argument('--secret-env-file',action='append',default=[]);p.add_argument('--plan',action='store_true')
+    p=r.Parser(description=__doc__,epilog=LIMITS_HELP);p.add_argument('--config',required=True);p.add_argument('--env-file',required=True);p.add_argument('--project',required=True);p.add_argument('--snapshot',required=True);p.add_argument('--secret-env-file',action='append',default=[]);p.add_argument('--plan',action='store_true')
     if not back:
         modes=p.add_mutually_exclusive_group(required=True)
-        for mode in ('close','settle','final','resume','reopen'):modes.add_argument('--'+mode,action='store_const',const=mode,dest='mode')
+        for mode in ('close','settle','final','switch','open','resume','reopen'):modes.add_argument('--'+mode,action='store_const',const=mode,dest='mode')
     return p
 
 def main(argv=None):
