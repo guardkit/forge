@@ -42,15 +42,22 @@ nothing here names a language, a host or a product.
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Callable
 
 from forge.pipeline.publication_activation import (
     TheVerdict,
     WhatTheMachineSays,
     run_the_activation_check,
 )
+from forge.pipeline.publication_facts import the_machine_now
 
 logger = logging.getLogger(__name__)
+
+#: The machine's answers, ``None`` (nobody has looked), or a zero-argument
+#: reader that returns one of those two when asked (release -3, TC8).
+TheMachine = (
+    WhatTheMachineSays | Callable[[], WhatTheMachineSays | None] | None
+)
 
 __all__ = [
     "PUBLICATION_IS_OFF_SENTENCE",
@@ -75,14 +82,21 @@ def _the_setting_says_on(config: Any) -> bool:
 
 
 def the_activation_check(
-    config: Any = None, machine: WhatTheMachineSays | None = None
+    config: Any = None, machine: TheMachine = None
 ) -> TheVerdict:
-    """Ask section G's questions. Never raises."""
-    return run_the_activation_check(config, machine)
+    """Ask section G's questions. Never raises.
+
+    ``machine`` may be the answers themselves, ``None``, or a zero-argument
+    reader of them (release -3, TC8), which is called here, afresh. A caller
+    asking more than one question about the same moment — the merge press —
+    resolves it once itself (:func:`~forge.pipeline.publication_facts.the_machine_now`)
+    and passes the answers, so the verdict and its reason come from one read.
+    """
+    return run_the_activation_check(config, the_machine_now(machine))
 
 
 def publication_is_switched_on(
-    config: Any = None, machine: WhatTheMachineSays | None = None
+    config: Any = None, machine: TheMachine = None
 ) -> bool:
     """Is publication on: the setting says so AND every condition holds."""
     if not _the_setting_says_on(config):
@@ -99,7 +113,7 @@ def publication_is_switched_on(
 
 
 def why_publication_is_off(
-    config: Any = None, machine: WhatTheMachineSays | None = None
+    config: Any = None, machine: TheMachine = None
 ) -> str:
     """One plain sentence saying why nothing was published."""
     if not _the_setting_says_on(config):
@@ -111,7 +125,7 @@ def why_publication_is_off(
 
 
 def say_where_publication_stands_at_boot(
-    config: Any = None, machine: WhatTheMachineSays | None = None
+    config: Any = None, machine: TheMachine = None
 ) -> str:
     """ONE LINE, said when the coordinator starts. Never raises.
 

@@ -38,10 +38,13 @@ the honest split, and it is written here rather than left to be discovered:
   reach the publisher, and what else is on the publisher's network) and the
   readability half of question 6. Each of those is a fact about mounts, users
   and networks that no amount of reading a settings file establishes. They
-  are asked of :class:`WhatTheMachineSays`, which is the stand-in: a thing
-  that reports what somebody looked at. Nothing supplies one today, so today
-  the check **refuses**, which is the safe side and is exactly where the
-  design says publication stands ("still gated").
+  are asked of :class:`WhatTheMachineSays`: a thing that reports what
+  somebody looked at. Since release -3 the coordinator gets one from the
+  record ``estate-check --publication-facts`` writes after looking, read at
+  every merge word (:mod:`forge.pipeline.publication_facts`). With no such
+  record — or one that is stale, or for another coordinator — every one of
+  these answers is "nobody has looked" and the check **refuses**, which is
+  the safe side.
 
 WHY IT FAILS CLOSED. An unanswered question is not a pass. If the machine has
 told us nothing about a wall, the check says so by name and publication stays
@@ -97,6 +100,15 @@ class WhatTheMachineSays:
     #: sandbox's mounts on <machine>, <date>", or "a stand-in, in a test".
     looked_at_by: str | None = None
 
+    #: WHY NOBODY HAS LOOKED, when a reader of the machine's answers found
+    #: nothing it could act on (release -3, TC8): no facts file, a file
+    #: written before this coordinator started, for another coordinator, too
+    #: old, or not the record the check writes. Every answer above is then
+    #: ``None``, the check refuses as it always has, and this reason is said
+    #: first in the sentence a person reads, so "nobody has looked" names
+    #: what to do about it.
+    why_nobody_has_looked: str | None = None
+
 
 @dataclass(frozen=True)
 class WhatIsTrue:
@@ -139,6 +151,9 @@ class TheVerdict:
 
     all_hold: bool
     answers: tuple[Answer, ...] = field(default_factory=tuple)
+    #: Why the machine's answers were not available, when a reader said so
+    #: (:attr:`WhatTheMachineSays.why_nobody_has_looked`).
+    why_nobody_has_looked: str | None = None
 
     @property
     def refusals(self) -> tuple[Answer, ...]:
@@ -152,12 +167,24 @@ class TheVerdict:
                 "every one of the things publication needs was checked "
                 "and holds"
             )
+        if self.why_nobody_has_looked:
+            # The reason nobody's look could be used says everything the
+            # machine questions would each say ("nobody has looked …"), and
+            # what to do about it, once. Only the refusals that the settings
+            # alone decide are added after it.
+            settings_said = [
+                answer.said
+                for answer in self.refusals
+                if answer.provable_here or answer.holds is False
+            ]
+            return "; ".join([self.why_nobody_has_looked, *settings_said])
         said = "; ".join(answer.said for answer in self.refusals)
         return said or "the activation check could not be run"
 
     def to_wire(self) -> dict[str, Any]:
         return {
             "all_hold": self.all_hold,
+            "why_nobody_has_looked": self.why_nobody_has_looked,
             "sentence": self.sentence,
             "answers": [answer.to_wire() for answer in self.answers],
         }
@@ -574,6 +601,9 @@ def run_the_activation_check(
             ),
         )
     answers = tuple(question(true) for question in THE_QUESTIONS)
+    why = getattr(true.machine, "why_nobody_has_looked", None)
     return TheVerdict(
-        all_hold=all(answer.holds is True for answer in answers), answers=answers
+        all_hold=all(answer.holds is True for answer in answers),
+        answers=answers,
+        why_nobody_has_looked=why if isinstance(why, str) and why else None,
     )

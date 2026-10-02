@@ -16,6 +16,11 @@
 #   estate-check --read-pre-resume  read that record and say whether it may be
 #                                 acted on: this estate, this image, recent
 #                                 enough, and a pass
+#   estate-check --publication-facts  LOOK at the machine for the questions
+#                                 publication needs and only the machine can
+#                                 answer, and write what was found where the
+#                                 coordinator reads it at each merge word
+#                                 (release -3, TC8)
 #
 # Each item prints ONE plain sentence saying what was looked for, where, and
 # what to do about it. Anything that is not a pass — a failure, or an item this
@@ -60,11 +65,12 @@ while [ $# -gt 0 ]; do
         host|services)      MODE="$1"; shift ;;
         --pre-resume)       MODE="pre-resume"; shift ;;
         --read-pre-resume)  MODE="read-pre-resume"; shift ;;
+        --publication-facts) MODE="publication-facts"; shift ;;
         --env-file)    ENV_FILE="${2:?--env-file needs a file}"; shift 2 ;;
         --project)     PROJECT="${2:?--project needs a name}"; shift 2 ;;
         --for-image)   EXPECT_IMAGE="${2:?--for-image needs a tag or an image id}"; shift 2 ;;
         --items)       MODE="items"; shift ;;
-        --help|-h)     sed -n '2,47p' "${BASH_SOURCE[0]}"; exit 0 ;;
+        --help|-h)     sed -n '2,52p' "${BASH_SOURCE[0]}"; exit 0 ;;
         *)             printf 'estate-check: unknown argument "%s". Try --help.\n' "$1" >&2; exit 2 ;;
     esac
 done
@@ -2059,9 +2065,618 @@ check_read_pre_resume() {
     exit 0
 }
 
+# ---------------------------------------------------------------------------
+# THE MACHINE'S ANSWERS FOR PUBLICATION (release -3, TC8).
+#
+# WHY THIS EXISTS. Publication is on only when the coordinator's setting says
+# so AND every condition of the activation check holds. Four of those
+# conditions, and half of a fifth, are facts about mounts, networks and users
+# that no settings file can establish, and until release -3 nothing gave the
+# coordinator an answer to them — so publication could never switch on. This
+# mode LOOKS, and writes what it found where the coordinator reads it at each
+# merge word. Nobody's word stands in for the look: every answer below comes
+# from something this mode asked of Docker or the sandbox tool just now.
+#
+# WHAT IT LOOKS AT, one question at a time:
+#
+#   can a sandbox write the coordinator's settings file / see the ledger?
+#       every sandbox's workspaces (sbx ls --json), running or stopped, and the
+#       mounts of every container inside each RUNNING sandbox (docker inspect,
+#       run inside it), compared with the folders Docker really mounts into the
+#       coordinator at /etc/forge and /var/lib/forge. A path that contains, or
+#       sits inside, one of those is a reach. A stopped sandbox is judged by its
+#       workspaces alone: its containers can only see what its workspaces give
+#       it. Any reach counts, read-only or not — a read-only view of the
+#       settings is still a view nobody should have
+#   can a sandbox reach the publisher?
+#       the publisher must answer the coordinator (so it is up and a probe
+#       means something); then from inside every RUNNING sandbox, one request
+#       to the answer service it is allowed to reach (so the sandbox can make a
+#       request at all), and two to EVERY address the publisher has, on every
+#       network it is on — once the way the sandbox's tools go by default
+#       (where only the publisher's own 200 counts, because a proxy answers for
+#       itself), once directly, where ANY answer at all is a reach. A
+#       publisher sharing the host's or another container's network stack is a
+#       reach. The current publisher host policy must verify too. With no
+#       sandbox running, nothing could be asked, and that is unknown
+#   is the coordinator the only thing on the publisher's network?
+#       the publisher must be on its own network and no other, not in host
+#       mode; docker network inspect of that network: its members must be
+#       exactly the coordinator and the publisher; it must publish no port
+#   can the publisher's credential file be read by anything but the publisher?
+#       the file Docker mounts into the publisher as its credential: no other
+#       container on this machine may mount it or a folder holding it, no
+#       sandbox's workspace may contain it, and it must be readable by its
+#       owner alone, the publisher's user (FORGE_PUBLISHER_UID). Nothing opens
+#       it; only its owner and mode are read
+#
+# WHAT IT WRITES. One record, publication-facts.json, in the publication-facts
+# volume, which the coordinator mounts READ-ONLY. It is written by a throwaway
+# helper container with no network and a read-only root, which is the only
+# thing that ever writes that volume. The record names the coordinator
+# container it was made for, that coordinator's start and image, and the time
+# it was written; the coordinator acts on it only while it is for its own
+# container, newer than its own start, and fresh. An earlier record is
+# invalidated before anything is looked at, so an interrupted or failed look
+# can never leave an older pass in place.
+#
+# Before anything is written it also refuses when any container but the
+# coordinator mounts the facts volume, or any sandbox's workspace reaches it:
+# a record something else could write is not a look. Paths are compared with
+# symbolic links followed.
+#
+# An answer that could not be established is written as unknown, never as a
+# pass, and the coordinator refuses publication on it by name.
+#
+# EXIT: 0 every answer is the one publication needs; 1 the record was written
+# and at least one answer is not; 2 nothing was written — a refusal, or the
+# check stopping part-way, never reads as a written record.
+#
+# RUN IT AFTER EVERY COORDINATOR START, AND AT LEAST DAILY. The coordinator
+# acts on a record only when it was written after its own start and within a
+# day. No container in this estate can run it for you: it needs the host's
+# Docker, the sandbox daemon AND root on the host to read the publisher's
+# kernel policy, and no service here holds all three, deliberately.
+# ---------------------------------------------------------------------------
+check_publication_facts() {
+    printf 'estate-check --publication-facts — what only the machine can say about publication (env file: %s)\n\n' "${ENV_FILE}"
+
+    local coordinator publisher policy_ok="yes" policy_said=""
+    if publisher_policy_verify members; then
+        policy_said="${POLICY_SAID}"
+    else
+        policy_ok="no"
+        policy_said="${POLICY_SAID}"
+    fi
+    if ! compose_says config --format json; then
+        printf 'estate-check: this estate would not render here (%s), so nothing was looked at and no record was written.\n' "${COMPOSE_RENDER_PROBLEM}" >&2
+        exit 2
+    fi
+    # Only two names are taken out of the render — the project and the real
+    # name of the publication-facts volume — and nothing in it is printed.
+    local names project facts_volume
+    names="$(printf '%s' "${COMPOSE_SAID}" | python3 -c '
+import json, sys
+m = json.load(sys.stdin)
+print(m.get("name") or "")
+print(((m.get("volumes") or {}).get("publication-facts") or {}).get("name") or "")
+' 2>/dev/null)" || names=""
+    project="$(printf '%s\n' "${names}" | sed -n 1p)"
+    facts_volume="$(printf '%s\n' "${names}" | sed -n 2p)"
+    [ -n "${project}" ] || project="${PROJECT}"
+    coordinator="$(container_of coordinator)"
+    publisher="$(container_of forge-publisher)"
+
+    PF_FACTS_VOLUME="${facts_volume}" \
+    PF_COORDINATOR="${coordinator}" \
+    PF_PUBLISHER="${publisher}" \
+    PF_PROJECT="${project}" \
+    PF_POLICY_OK="${policy_ok}" \
+    PF_POLICY_SAID="${policy_said}" \
+    PF_GATEWAY="$(get FACTORY_GATEWAY_ADDRESS)" \
+    PF_ANSWER_PORT="$(get FORGE_ANSWER_PORT)" \
+    PF_PUBLISHER_UID="$(get FORGE_PUBLISHER_UID)" \
+    python3 - <<'PUBLICATION_FACTS_PY'
+import json, os, subprocess, sys, time
+from datetime import datetime, timezone
+
+FACTS_TARGET = "/var/lib/forge-publication-facts"
+FACTS_NAME = "publication-facts.json"
+SETTINGS_TARGET = "/etc/forge"
+LEDGER_TARGET = "/var/lib/forge"
+CREDENTIAL_TARGET = "/etc/forge-publisher/credential"
+PUBLISHER_PORT = 8711
+
+# EXIT 2 MEANS NOTHING WAS WRITTEN, and every way out before the write — a
+# refusal or a crash — takes it. Exit 1 is only reachable once a record is
+# in the volume.
+WRITTEN = False
+
+
+class Refused(Exception):
+    pass
+
+
+def refuse(sentence):
+    raise Refused(sentence)
+
+
+def run(*argv, stdin=None, timeout=90):
+    try:
+        done = subprocess.run(list(argv), capture_output=True, text=True,
+                              input=stdin, timeout=timeout)
+        return done.returncode, done.stdout
+    except (OSError, subprocess.SubprocessError):
+        return 127, ""
+
+
+def inspected(*ids, inside=None):
+    """docker inspect, here or inside a sandbox; a list, or None if unreadable."""
+    if not ids:
+        return []
+    argv = ["docker", "inspect", *ids]
+    if inside:
+        argv = ["sbx", "exec", inside, "--", *argv]
+    code, out = run(*argv)
+    if code != 0:
+        return None
+    try:
+        found = json.loads(out)
+    except ValueError:
+        return None
+    return found if isinstance(found, list) else None
+
+
+def real(path):
+    """The path with every symbolic link this machine can resolve followed,
+    so a link to a folder is compared as the folder it points at."""
+    path = str(path or "")
+    if not path.startswith("/"):
+        return path
+    return os.path.realpath(path)
+
+
+def reaches(a, b):
+    """Does path a contain b, sit inside it, or equal it — links followed?"""
+    a = real(a).rstrip("/") or "/"
+    b = real(b).rstrip("/") or "/"
+    if not a.startswith("/") or not b.startswith("/"):
+        return False
+    if a == "/" or b == "/":
+        return True
+    return a == b or b.startswith(a + "/") or a.startswith(b + "/")
+
+
+def mount_source(container, target):
+    for mount in (container or {}).get("Mounts") or []:
+        if mount.get("Destination") == target:
+            return mount
+    return None
+
+
+def answer(found, unknown):
+    """True when something was found, None when it could not be told, else False."""
+    if found:
+        return True
+    if unknown:
+        return None
+    return False
+
+
+def workspace_path(entry):
+    text = str(entry)
+    for suffix in (":ro", ":rw"):
+        if text.endswith(suffix):
+            return text[: -len(suffix)]
+    return text
+
+
+def http_code(out):
+    """The three-digit status curl printed, or None when it printed none."""
+    code = out.strip()[-3:]
+    return code if len(code) == 3 and code.isdigit() else None
+
+
+def main():
+    global WRITTEN
+    project = os.environ.get("PF_PROJECT", "")
+    facts_volume = os.environ.get("PF_FACTS_VOLUME", "")
+    if not project:
+        refuse("the estate's compose project could not be worked out.")
+    if not facts_volume:
+        refuse("this estate's compose files declare no publication-facts volume, so "
+               "the coordinator has nowhere to read facts from (a release before -3?).")
+    if run("docker", "volume", "inspect", facts_volume)[0] != 0:
+        refuse(f"the volume {facts_volume} does not exist yet; start the estate first.")
+
+    coordinator_short = os.environ.get("PF_COORDINATOR", "")
+    if not coordinator_short:
+        refuse("the coordinator is not running in this estate, and the record is about one running coordinator.")
+    found = inspected(coordinator_short)
+    if not found:
+        refuse("the coordinator's container could not be inspected.")
+    coordinator = found[0]
+    if not (coordinator.get("State") or {}).get("Running"):
+        refuse("the coordinator's container is not running.")
+    coordinator_id = coordinator.get("Id", "")
+    coordinator_image = coordinator.get("Image", "")
+    started_text = (coordinator.get("State") or {}).get("StartedAt", "")
+    try:
+        trimmed = started_text.replace("Z", "+00:00")
+        if "." in trimmed:
+            head, rest = trimmed.split(".", 1)
+            digits = rest[: len(rest) - len(rest.lstrip("0123456789"))]
+            trimmed = f"{head}.{digits[:6]}{rest[len(digits):]}"
+        parsed = datetime.fromisoformat(trimmed)
+        if parsed.tzinfo is None:
+            raise ValueError("no zone")
+        started_epoch = parsed.timestamp()
+    except ValueError:
+        refuse(f"the coordinator's start time ({started_text!r}) could not be read.")
+    facts_mount = mount_source(coordinator, FACTS_TARGET)
+    if (not facts_mount or facts_mount.get("Name") != facts_volume
+            or facts_mount.get("RW") is not False):
+        refuse(f"the coordinator does not mount {facts_volume} read-only at {FACTS_TARGET}, "
+               "so it could not read a record written there (or could write one itself).")
+    facts_path = facts_mount.get("Source") or ""
+
+    # THE HELPER: the facts volume's only writer. Root only because a fresh
+    # volume's folder belongs to root; every capability dropped, no new
+    # privileges, no network, a read-only root, and nothing mounted but the
+    # volume itself.
+    helper = ["docker", "run", "--rm", "-i", "--network", "none", "--read-only",
+              "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+              "--user", "0:0", "--entrypoint", "/bin/sh",
+              "-v", f"{facts_volume}:/facts", coordinator_image, "-c"]
+
+    # AN EARLIER RECORD IS INVALIDATED BEFORE ANYTHING IS LOOKED AT.
+    code, _ = run(*helper, f"set -e; if [ -e /facts/{FACTS_NAME} ]; then "
+                  f"mv -f /facts/{FACTS_NAME} /facts/{FACTS_NAME}.invalidated; fi")
+    if code != 0:
+        refuse(f"the earlier record in {facts_volume} could not be invalidated, so no "
+               "new look was started and the earlier bytes may still be there.")
+    print(f"Any earlier record in {facts_volume} has been invalidated before this look.\n")
+
+    said = {}
+
+    # --- every container on this machine, once -----------------------------
+    code, out = run("docker", "ps", "-aq")
+    everything = inspected(*out.split()) if code == 0 else None
+
+    # --- the sandboxes ------------------------------------------------------
+    code, out = run("sbx", "ls", "--json")
+    sandboxes = None
+    if code == 0:
+        try:
+            listed = json.loads(out)
+            sandboxes = listed.get("sandboxes") if isinstance(listed, dict) else None
+            if not isinstance(sandboxes, list):
+                sandboxes = None
+        except ValueError:
+            sandboxes = None
+    running = [s for s in (sandboxes or []) if s.get("status") == "running"]
+
+    # NOBODY BUT THE COORDINATOR AND THE HELPER MAY HOLD THE FACTS VOLUME, and
+    # no sandbox may reach it: a record anything else could write is not a
+    # look. Asked before any answer is written.
+    if everything is None:
+        refuse("the containers on this machine could not be listed, so nothing can "
+               "show that only the coordinator holds the facts volume.")
+    holders = [c.get("Name", "?").lstrip("/") for c in everything
+               if c.get("Id") != coordinator_id
+               and any(m.get("Name") == facts_volume
+                       or (facts_path and reaches(m.get("Source", ""), facts_path))
+                       for m in c.get("Mounts") or [])]
+    if holders:
+        refuse(f"{', '.join(holders)} also mount(s) {facts_volume}; only the coordinator "
+               "(read-only) and this check's own helper may, or the record could be "
+               "written by something that did not look.")
+    if sandboxes is None:
+        refuse("the sandbox tool did not list its sandboxes, so nothing can show that "
+               "no sandbox reaches the facts volume.")
+    if facts_path:
+        for sandbox in sandboxes:
+            for entry in sandbox.get("workspaces") or []:
+                if reaches(workspace_path(entry), facts_path):
+                    refuse(f"sandbox {sandbox.get('name', '?')}'s workspace "
+                           f"{workspace_path(entry)} reaches the facts volume "
+                           f"{facts_path}, so a build could write the record itself.")
+
+    inner_mounts = {}  # sandbox -> list of (container, source) or None
+    for sandbox in running:
+        name = sandbox.get("name", "")
+        code, out = run("sbx", "exec", name, "--", "docker", "ps", "-aq")
+        if code != 0:
+            inner_mounts[name] = None
+            continue
+        found = inspected(*out.split(), inside=name)
+        if found is None:
+            inner_mounts[name] = None
+            continue
+        inner_mounts[name] = [
+            (c.get("Name", "?").lstrip("/"), m.get("Source", ""))
+            for c in found for m in (c.get("Mounts") or [])
+        ]
+
+    def sandbox_reach(host_path, what, *, inside_too=True):
+        hits, unknown = [], []
+        if not host_path:
+            return hits, [f"Docker did not say which folder is mounted as {what}"]
+        for sandbox in sandboxes:
+            name = sandbox.get("name", "?")
+            for entry in sandbox.get("workspaces") or []:
+                if reaches(workspace_path(entry), host_path):
+                    hits.append(f"sandbox {name}'s workspace {workspace_path(entry)}")
+        if inside_too:
+            for name, mounts in inner_mounts.items():
+                if mounts is None:
+                    unknown.append(f"the containers inside sandbox {name} could not be read")
+                    continue
+                for container, source in mounts:
+                    if reaches(source, host_path):
+                        hits.append(f"container {container} inside sandbox {name} mounts {source}")
+        return hits, unknown
+
+    def sentence(found, unknown, fine, *, found_words="reached by"):
+        if found:
+            return f"{found_words}: {'; '.join(found)}"
+        if unknown:
+            return f"could not be established: {'; '.join(unknown)}"
+        return fine
+
+    settings_path = (mount_source(coordinator, SETTINGS_TARGET) or {}).get("Source")
+    ledger_path = (mount_source(coordinator, LEDGER_TARGET) or {}).get("Source")
+    looked_in = (f"{len(sandboxes)} sandbox(es) listed, {len(running)} running "
+                 "and asked for their containers' mounts")
+
+    hits, unknown = sandbox_reach(settings_path, SETTINGS_TARGET)
+    settings_answer = answer(hits, unknown)
+    said["a_sandbox_can_write_the_coordinators_settings_file"] = sentence(
+        hits, unknown,
+        f"no sandbox reaches the coordinator's settings folder {settings_path} ({looked_in})")
+
+    hits, unknown = sandbox_reach(ledger_path, LEDGER_TARGET)
+    ledger_answer = answer(hits, unknown)
+    said["a_sandbox_can_see_the_ledger"] = sentence(
+        hits, unknown, f"no sandbox reaches the ledger folder {ledger_path} ({looked_in})")
+
+    # --- the publisher: its networks, and every address it has --------------
+    publisher_short = os.environ.get("PF_PUBLISHER", "")
+    found = inspected(publisher_short) if publisher_short else None
+    publisher = found[0] if found else None
+    network = f"{project}_forge-publisher-net"
+    publisher_networks = {}
+    network_mode = ""
+    if publisher:
+        publisher_networks = (publisher.get("NetworkSettings") or {}).get("Networks") or {}
+        network_mode = str((publisher.get("HostConfig") or {}).get("NetworkMode") or "")
+    addresses = sorted({
+        address
+        for settings in publisher_networks.values()
+        for address in ((settings or {}).get("IPAddress"), (settings or {}).get("GlobalIPv6Address"))
+        if address
+    })
+
+    reached, unknown = [], []
+    if os.environ.get("PF_POLICY_OK") != "yes":
+        unknown.append("the current publisher host policy did not verify ("
+                       + os.environ.get("PF_POLICY_SAID", "") + ")")
+    if not publisher or not addresses:
+        unknown.append("the publisher is not running, or has no address on any network")
+    if network_mode == "host" or network_mode.startswith("container:"):
+        reached.append(f"the publisher shares another network stack ({network_mode}), "
+                       "so whatever reaches that reaches it")
+    if publisher:
+        code, out = run("docker", "exec", coordinator_short, "curl", "-s", "-o", "/dev/null",
+                        "--max-time", "8", "-w", "%{http_code}",
+                        f"http://forge-publisher:{PUBLISHER_PORT}/healthz")
+        if http_code(out) != "200":
+            unknown.append("the publisher did not answer the coordinator, so a refused "
+                           "probe from a sandbox would prove nothing")
+    if not running:
+        unknown.append("no sandbox is running, so nothing could be asked from inside one")
+    gateway = os.environ.get("PF_GATEWAY", "")
+    answer_port = os.environ.get("PF_ANSWER_PORT", "")
+    asked = 0
+    if not unknown:
+        for sandbox in running:
+            name = sandbox.get("name", "?")
+            code, out = run("sbx", "exec", name, "--", "curl", "-s", "-o", "/dev/null",
+                            "--max-time", "10", "-w", "%{http_code}",
+                            f"http://{gateway}:{answer_port}/recorded?build=a-build-nobody-ever-queued")
+            if http_code(out) != "200":
+                unknown.append(f"sandbox {name} could not reach the answer service it is "
+                               "allowed to reach, so its refused probe would prove nothing")
+                continue
+            for address in addresses:
+                host = f"[{address}]" if ":" in address else address
+                url = f"http://{host}:{PUBLISHER_PORT}/healthz"
+                # By the sandbox's default route, which may be a proxy: only the
+                # publisher's own answer counts, since a proxy answers for itself.
+                code, out = run("sbx", "exec", name, "--", "curl", "-s", "-o", "/dev/null",
+                                "--connect-timeout", "5", "--max-time", "10",
+                                "-w", "%{http_code}", url)
+                said_by_default = http_code(out)
+                if said_by_default is None:
+                    unknown.append(f"sandbox {name} printed no answer for {url}")
+                elif said_by_default == "200":
+                    reached.append(f"sandbox {name} reached {url}")
+                # Directly, past any proxy: ANY answer at all means a connection
+                # was made to the publisher, whatever status it gave.
+                code, out = run("sbx", "exec", name, "--", "curl", "-s", "-o", "/dev/null",
+                                "--noproxy", "*", "--connect-timeout", "5", "--max-time", "10",
+                                "-w", "%{http_code}", url)
+                said_directly = http_code(out)
+                if said_directly is None:
+                    unknown.append(f"sandbox {name} printed no answer for {url} directly")
+                elif said_directly != "000":
+                    reached.append(f"sandbox {name} reached {url} directly (HTTP {said_directly})")
+            asked += 1
+    reach_answer = answer(reached, unknown)
+    said["a_sandbox_can_reach_the_publisher"] = sentence(
+        reached, unknown,
+        f"the publisher answered the coordinator and refused all {asked} running "
+        f"sandbox(es) at every address it has ({', '.join(addresses)}), each sandbox "
+        "able to reach the answer service; the publisher host policy verified",
+        found_words="REACHED")
+
+    # --- who is on the publisher's network, and is it its only one ----------
+    network_answer, why = None, ""
+    code, out = run("docker", "network", "inspect", network)
+    try:
+        members = (json.loads(out)[0].get("Containers") or {}) if code == 0 else None
+    except (ValueError, IndexError, AttributeError):
+        members = None
+    if members is None or not publisher:
+        why = f"the network {network} or the publisher could not be inspected"
+    else:
+        expected = {coordinator_id, publisher.get("Id", "")}
+        extra = sorted((v or {}).get("Name", k[:12]) for k, v in members.items() if k not in expected)
+        missing = sorted(expected - set(members))
+        other_networks = sorted(set(publisher_networks) - {network})
+        ports = (publisher.get("HostConfig") or {}).get("PortBindings") or {}
+        published = {k: v for k, v in ports.items() if v}
+        wrong_mode = network_mode in ("host", "none") or network_mode.startswith("container:")
+        if extra or missing or published or other_networks or wrong_mode or network not in publisher_networks:
+            network_answer = False
+            why = "; ".join(filter(None, [
+                f"also on it: {', '.join(extra)}" if extra else "",
+                f"missing from it: {len(missing)} of the coordinator and the publisher" if missing else "",
+                f"the publisher is also on {', '.join(other_networks)}" if other_networks else "",
+                f"the publisher's network mode is {network_mode}" if wrong_mode else "",
+                f"the publisher is not on {network}" if network not in publisher_networks else "",
+                f"the publisher publishes {', '.join(sorted(published))}" if published else ""]))
+        else:
+            network_answer = True
+            why = (f"the publisher is on {network} alone, which holds the coordinator and "
+                   "the publisher and nothing else, and the publisher publishes no port")
+    said["only_the_coordinator_is_on_the_publishers_network"] = why
+
+    # --- the publisher's credential file ------------------------------------
+    found_by, unknown = [], []
+    credential_path = (mount_source(publisher, CREDENTIAL_TARGET) or {}).get("Source") if publisher else None
+    want_uid = os.environ.get("PF_PUBLISHER_UID", "").strip()
+    if not credential_path:
+        unknown.append("Docker did not say which file is mounted as the publisher's credential")
+    else:
+        for c in everything:
+            if c.get("Id") == publisher.get("Id"):
+                continue
+            for m in c.get("Mounts") or []:
+                if reaches(m.get("Source", ""), credential_path):
+                    found_by.append(f"container {c.get('Name', '?').lstrip('/')} mounts {m.get('Source')}")
+        hits, _ = sandbox_reach(credential_path, CREDENTIAL_TARGET, inside_too=False)
+        found_by += hits
+        owner = mode = None
+        try:
+            st = os.stat(credential_path)
+            owner, mode = st.st_uid, st.st_mode & 0o777
+        except PermissionError:
+            code, out = run("sudo", "-n", "stat", "-L", "-c", "%u %a", credential_path)
+            parts = out.split()
+            if code == 0 and len(parts) == 2 and parts[0].isdigit():
+                try:
+                    owner, mode = int(parts[0]), int(parts[1], 8)
+                except ValueError:
+                    owner = mode = None
+        except OSError:
+            pass
+        if owner is None:
+            unknown.append(f"the owner and mode of {credential_path} could not be read")
+        else:
+            if mode & 0o077:
+                found_by.append(f"{credential_path} has mode {mode:o}, so users other than its owner have access")
+            if not want_uid:
+                unknown.append("the env file names no FORGE_PUBLISHER_UID to compare the owner with")
+            elif str(owner) != want_uid:
+                found_by.append(f"{credential_path} is owned by uid {owner} and the publisher runs as {want_uid}")
+    credential_answer = answer(found_by, unknown)
+    said["the_credential_file_can_be_read_by_them"] = sentence(
+        found_by, unknown,
+        f"{credential_path} is mounted into the publisher alone, no sandbox reaches it, "
+        f"and only its owner, uid {want_uid}, has any access",
+        found_words="readable")
+
+    machine = {
+        "a_sandbox_can_write_the_coordinators_settings_file": settings_answer,
+        "a_sandbox_can_see_the_ledger": ledger_answer,
+        "a_sandbox_can_reach_the_publisher": reach_answer,
+        "only_the_coordinator_is_on_the_publishers_network": network_answer,
+        "the_credential_file_can_be_read_by_them": credential_answer,
+    }
+    needed = {name: (name == "only_the_coordinator_is_on_the_publishers_network")
+              for name in machine}
+    good = 0
+    for name, value in machine.items():
+        if value is None:
+            label = "not checked  "
+        elif value == needed[name]:
+            label = "ok           "
+            good += 1
+        else:
+            label = "NOT PASSED   "
+        print(f"  {label}{name.replace('_', ' ')}: {said[name]}")
+
+    now = time.time()
+    record = {
+        "format": "forge-publication-facts/1",
+        "what_this_is": ("what estate-check --publication-facts found when it looked at "
+                         "the machine for the questions publication needs and only the "
+                         "machine can answer"),
+        "written_at": datetime.fromtimestamp(int(now), timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "written_at_epoch": int(now),
+        "compose_project": project,
+        "coordinator_container_id": coordinator_id,
+        "coordinator_image_id": coordinator_image,
+        "coordinator_started_at": started_text,
+        "coordinator_started_at_epoch": started_epoch,
+        "machine": machine,
+        "said": said,
+    }
+    if record["written_at_epoch"] <= started_epoch:
+        refuse("this machine's clock says the record would be no newer than the coordinator's start.")
+    code, _ = run(*helper, (f"set -e; umask 022; cat > /facts/.{FACTS_NAME}.new; "
+                            f"chmod 0644 /facts/.{FACTS_NAME}.new; "
+                            f"mv -f /facts/.{FACTS_NAME}.new /facts/{FACTS_NAME}"),
+                  stdin=json.dumps(record, indent=2) + "\n")
+    if code != 0:
+        refuse(f"the record could not be written into {facts_volume}.")
+    WRITTEN = True
+    print(f"\nThe record is written in {facts_volume} as {FACTS_NAME}, for coordinator "
+          f"container {coordinator_id[:12]} (started {started_text}), at {record['written_at']}. "
+          "The coordinator reads it at the next merge word; "
+          "'docker exec <coordinator> python -m forge.pipeline.publication_status' says what it will decide.")
+    if good == len(machine):
+        print("PASSED — every answer is the one publication needs, and each was looked at just now.")
+        return 0
+    print(f"NOT PASSED — {good} of {len(machine)} answers are the ones publication needs. "
+          "The record says so, and publication stays off, naming each one.")
+    return 1
+
+
+try:
+    sys.exit(main())
+except Refused as why:
+    print(f"estate-check: {why} Nothing was written.", file=sys.stderr)
+    sys.exit(2)
+except SystemExit:
+    raise
+except BaseException as exc:  # a crash must never read as "record written"
+    if WRITTEN:
+        print(f"estate-check: the record was written, then the check stopped "
+              f"({type(exc).__name__}); treat it as NOT PASSED.", file=sys.stderr)
+        sys.exit(1)
+    print(f"estate-check: the check stopped ({type(exc).__name__}) before any record "
+          "was written. Nothing was written.", file=sys.stderr)
+    sys.exit(2)
+PUBLICATION_FACTS_PY
+    exit $?
+}
+
 case "${MODE}" in
-    host)            check_host ;;
-    services)        check_services ;;
-    pre-resume)      check_pre_resume ;;
-    read-pre-resume) check_read_pre_resume ;;
+    host)              check_host ;;
+    services)          check_services ;;
+    pre-resume)        check_pre_resume ;;
+    read-pre-resume)   check_read_pre_resume ;;
+    publication-facts) check_publication_facts ;;
 esac
