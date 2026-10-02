@@ -349,7 +349,6 @@ def _refused_and_unchanged(e,machine,args,capsys,expected):
 
 @pytest.mark.parametrize('fault,expected',[
     ('supervisor-running','is not stopped'),
-    ('supervisor-exit-3','exited 3, not 0'),
     ('no-supervisor','no sandbox-runner container'),
 ])
 def test_a_running_or_unclean_supervisor_refuses(estate,monkeypatch,capsys,fault,expected):
@@ -628,7 +627,7 @@ def test_a_settings_path_reaching_the_state_folders_through_a_link_refuses(estat
     link=e['tmp']/'agent-link';link.symlink_to(state)
     e['config']['sandbox']['settings_path']=str(link/'forge.yaml')
     e['inventory'].write_text(json.dumps(e['config']))
-    _refused_and_unchanged(e,machine,e['args'],capsys,"template's own state folders")
+    _refused_and_unchanged(e,machine,e['args'],capsys,'overlaps the template state folders (~/.forge-runner)')
 
 
 def test_the_receipt_carries_what_switch_reads(estate,monkeypatch):
@@ -645,3 +644,150 @@ def test_the_receipt_carries_what_switch_reads(estate,monkeypatch):
     named=[json.loads(v) for k,_,v in (l.partition('=') for l in env_file.read_text().splitlines()) if k=='FORGE_CONFIG_PATH']
     assert named==[str(e['settings_path'])]
     assert receipt['settings_sha256']==m.digest(e['settings_path'].read_bytes())
+
+
+# ---------------------------------------------------------------------------
+# Codex tools review round 1, R2: the settings boundary is checked on RESOLVED
+# paths inside the sandbox, before installing and again at write time.
+# ---------------------------------------------------------------------------
+
+
+def _link_settings_into(e, target):
+    target.mkdir(parents=True,exist_ok=True)
+    link=e['tmp']/'agent-settings-link';link.symlink_to(target)
+    e['config']['sandbox']['settings_path']=str(link/'forge.yaml')
+    e['inventory'].write_text(json.dumps(e['config']))
+    return link
+
+
+@pytest.mark.parametrize('where,name',[
+    ('clone','sandbox.clone_path'),
+    ('receipts','sandbox.receipts_path'),
+    ('worktrees','FORGE_AUTOBUILD_WORKTREE_BASE'),
+])
+def test_a_symlinked_parent_into_the_clone_or_a_shared_folder_refuses(estate,monkeypatch,capsys,where,name):
+    e=estate
+    worktrees=e['tmp']/'worktrees';worktrees.mkdir()
+    env=Path(e['config']['env_file'])
+    env.write_text(env.read_text().replace('SANDBOX_ENV_NAMES=','SANDBOX_ENV_NAMES=FORGE_AUTOBUILD_WORKTREE_BASE ')
+                   +'FORGE_AUTOBUILD_WORKTREE_BASE='+str(worktrees)+'\n')
+    folder={'clone':e['clone']/'.guardkit'/'settings','receipts':Path(e['config']['sandbox']['receipts_path'])/'settings','worktrees':worktrees/'settings'}[where]
+    _link_settings_into(e,folder)
+    machine=Machine(e,monkeypatch)
+    error=_refused_and_unchanged(e,machine,e['args'],capsys,'which overlaps ')
+    assert name in error.split('which overlaps ',1)[1]
+    assert not (folder/'forge.yaml').exists()
+    assert not any(c[:3]==['systemctl','--user','mask'] for c in machine.calls)
+
+
+def test_a_plain_settings_path_is_accepted(estate,monkeypatch):
+    e=estate;machine=Machine(e,monkeypatch)
+    assert m.main(e['args'])==0
+    assert e['settings_path'].is_file() and not any(p.is_symlink() for p in [e['settings_path'],*e['settings_path'].parents])
+
+
+def _install(item):
+    return REAL_RUN([sys.executable,'-c',m.INSTALL],input=json.dumps([item]),text=True,capture_output=True)
+
+
+def test_the_install_step_refuses_an_excluded_root_reached_through_a_link(tmp_path):
+    clone=tmp_path/'clone';(clone/'inside').mkdir(parents=True);(clone/'inside').chmod(0o755)
+    link=tmp_path/'settings-link';link.symlink_to(clone/'inside')
+    item={'path':str(link/'forge.yaml'),'root':str(link),'data':base64.b64encode(b'x: 1\n').decode(),
+          'mode':0o644,'parent_mode':0o755,'excluded':[str(clone)],'real_parent':None}
+    r=_install(item)
+    assert r.returncode!=0
+    assert list((clone/'inside').iterdir())==[]
+
+
+def test_the_install_step_refuses_a_link_made_after_the_check(tmp_path):
+    """The check resolved the folder to A; by write time it is a link to B."""
+    checked=tmp_path/'agent'/'.forge-sandbox';checked.mkdir(parents=True)
+    elsewhere=tmp_path/'clone'/'inside';elsewhere.mkdir(parents=True);elsewhere.chmod(0o755)
+    real_parent=str(checked)
+    checked.rmdir();checked.symlink_to(elsewhere)
+    item={'path':str(checked/'forge.yaml'),'root':str(checked),'data':base64.b64encode(b'x: 1\n').decode(),
+          'mode':0o644,'parent_mode':0o755,'excluded':[],'real_parent':real_parent}
+    r=_install(item)
+    assert r.returncode!=0
+    assert list(elsewhere.iterdir())==[]
+
+
+def test_the_install_step_writes_a_plain_path_through_one_descriptor(tmp_path):
+    target=tmp_path/'agent'/'.forge-sandbox'/'owned'/'forge.yaml'
+    item={'path':str(target),'root':str(target.parent),'data':base64.b64encode(b'x: 1\n').decode(),
+          'mode':0o644,'parent_mode':0o755,'excluded':[str(tmp_path/'clone')],'real_parent':str(target.parent)}
+    r=_install(item)
+    assert r.returncode==0,r.stderr
+    assert target.read_bytes()==b'x: 1\n' and target.stat().st_mode&0o777==0o644
+    assert not [p for p in target.parent.iterdir() if p.name.startswith('.rollout-')]
+
+
+# ---------------------------------------------------------------------------
+# Re-check M1: the same supervisor-exit rule as rollout-quiesce --final, and
+# one overall time limit.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize('back',[False,True])
+def test_a_non_zero_supervisor_exit_is_accepted_when_nothing_runs_inside(estate,monkeypatch,back):
+    e=estate;machine=Machine(e,monkeypatch)
+    if back:
+        assert m.main(e['args'])==0
+    machine.fault='supervisor-exit-3'
+    assert m.main([*e['args'],*(['--back'] if back else [])])==0
+    name='sandbox-restored.json' if back else 'sandbox-installed.json'
+    receipt=json.loads((Path(e['config']['sandbox']['evidence_dir'])/name).read_text())
+    seen=receipt['compose_supervisor']['containers'][0]
+    assert seen['exit_code']==3 and 'did not succeed' in seen['meaning']
+    assert seen['accepted_because'].startswith('nothing runs inside the sandbox')
+
+
+@pytest.mark.parametrize('back',[False,True])
+@pytest.mark.parametrize('inside',['container','lock'])
+def test_a_non_zero_supervisor_exit_with_work_inside_refuses_in_quiesce_s_words(estate,monkeypatch,capsys,back,inside):
+    e=estate;machine=Machine(e,monkeypatch)
+    if back:
+        assert m.main(e['args'])==0
+    capsys.readouterr()
+    machine.fault='supervisor-exit-3'
+    before=snapshot(e)
+    lock=None
+    if inside=='container':
+        machine.inner_containers=['owned-runner']
+    else:
+        state=e['home']/'.forge-runner'/hashlib.sha256(str(e['clone']).encode()).hexdigest()
+        state.mkdir(parents=True,exist_ok=True)
+        lock=open(state/'lock','w');fcntl.flock(lock,fcntl.LOCK_EX)
+    try:
+        assert m.main([*e['args'],*(['--back'] if back else [])])==2
+    finally:
+        if lock:lock.close()
+    error=capsys.readouterr().err
+    busy='owned-runner' if inside=='container' else "the supervisor's lock held"
+    assert ('sandbox-runner exited 3: its stop of the work inside the sandbox did not succeed; and inside the sandbox there is still '
+            +busy+', so nothing was changed. Stop the bootstrap\'s work inside the sandbox (its stop word, as the supervisor\'s log says), then run this step again') in error
+    assert snapshot(e)==before
+
+
+def test_the_upgrade_has_one_overall_time_limit(estate,monkeypatch,capsys):
+    e=estate;machine=Machine(e,monkeypatch)
+    clock=[1000.0]
+    monkeypatch.setattr(m.time,'monotonic',lambda:clock[0])
+    real=machine.run
+    def slow(argv,**kw):
+        assert kw['timeout']<=m.UPGRADE_LIMIT_SECONDS-(clock[0]-1000.0)+1e-6
+        if argv[:2]==['sbx','version']:clock[0]+=m.UPGRADE_LIMIT_SECONDS
+        return real(argv,**kw)
+    monkeypatch.setattr(m.subprocess,'run',slow)
+    before=snapshot(e)
+    assert m.main(e['args'])==2
+    assert 'reached its own time limit of 1500 seconds' in capsys.readouterr().err
+    assert snapshot(e)==before
+    assert len(machine.calls)==1
+
+
+def test_the_limit_is_stated_in_help(capsys):
+    with pytest.raises(SystemExit):
+        m.main(['--help'])
+    assert '1500 seconds overall' in ' '.join(capsys.readouterr().out.split())
