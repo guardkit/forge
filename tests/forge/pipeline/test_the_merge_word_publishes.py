@@ -707,7 +707,7 @@ class TestWithPublicationOffNothingIsSentAndTheReasonIsSaid:
 
         assert outcome.result == "publication-pending"
         assert "publication is switched off" in outcome.detail
-        assert "without having passed its start-up self-check" in outcome.detail
+        assert "without having passed its self-check" in outcome.detail
         assert publisher.asked == []
 
     @pytest.mark.asyncio

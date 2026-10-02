@@ -746,12 +746,28 @@ is true **and** three things hold, asked again at every merge word:
 - `publication.builds_may_run_inside_the_coordinator` is false;
 - `publication.publisher_credential_file` names the publisher's credential
   file, and no other coordinator, runner or sandbox setting names it;
-- the publisher passed its start-up self-check. The publisher will not start
-  unless its credential file is owned by its own user and readable by nobody
-  else, and it is attached to exactly one network (its own, never host
-  networking). Its health route then says `"self_check": "passed"`, and the
-  coordinator asks that route. A publisher that does not answer keeps
-  publication off, and the merge word says why.
+- the publisher passed its self-check: its credential file is a regular file
+  owned by the publisher's UID with no group or other access, and it has
+  exactly one network interface besides loopback. The publisher will not
+  start without this, and its health route runs the check again on every
+  request and says `"self_check": "passed"` only then. The coordinator asks
+  that route; a publisher that does not answer keeps publication off, and the
+  merge word says why.
+
+What the self-check does **not** prove. Several estate containers and the host
+login share UID 1000, so "owned by the publisher's UID" is not "readable by the
+publisher only". One interface does not say which network it is or who else is
+on it. Network membership and reachability are checked by
+`publisher-host-policy verify` and by `estate-check` items 7c and 8g, but
+publication does not depend on them. The sandbox's git export that the
+publisher reads from is unauthenticated: anything that can reach the gateway
+address can read it.
+
+What the removed `estate-check --publication-facts` checked and nothing now
+checks before publishing: whether a sandbox can reach the coordinator's
+settings or the ledger; whether any other container mounts the credential
+file; which containers are on the publisher's network and whether a sandbox
+can reach the publisher; and that those answers were fresh.
 
 ## Preparing and operating the rollout tools
 

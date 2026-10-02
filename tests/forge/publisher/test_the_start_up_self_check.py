@@ -1,8 +1,12 @@
-"""The publisher will not start unless its credential is its own and it is on
-exactly its own network; its health route reports that, and the coordinator
-asks the health route before publication can switch on (2 October 2026).
+"""The publisher's self-check, its health route, and the coordinator asking it.
 
-Nothing here starts a container: the network check is pointed at a folder
+What the check proves: the credential file is a regular file owned by the
+publisher's UID with no group or other access, and there is exactly one
+network interface besides loopback. It does not prove which network that is,
+who else is on it, or that no other container running as the same UID can
+read the file. It runs at start and again on every health request.
+
+Nothing here starts a container: the interface count is pointed at a folder
 standing in for ``/sys/class/net``.
 """
 
@@ -75,18 +79,19 @@ class TestTheSelfCheck:
         )
         assert said and "not to the publisher's own user" in said
 
-    def test_host_networking_refuses(self, tmp_path: Path) -> None:
+    def test_several_interfaces_refuse(self, tmp_path: Path) -> None:
+        """Like the host's own list. A host with ONE interface would pass."""
         said = entry.why_it_will_not_start(
             _settings(tmp_path),
             interfaces=_interfaces(tmp_path, "eth0", "docker0", "wlan0"),
         )
-        assert said and "attached to 3 networks" in said
+        assert said and "3 network interfaces besides loopback" in said
 
-    def test_a_second_network_refuses(self, tmp_path: Path) -> None:
+    def test_a_second_interface_refuses(self, tmp_path: Path) -> None:
         said = entry.why_it_will_not_start(
             _settings(tmp_path), interfaces=_interfaces(tmp_path, "eth0", "eth1")
         )
-        assert said and "attached to 2 networks" in said
+        assert said and "2 network interfaces besides loopback" in said
 
     def test_main_refuses_to_start(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
@@ -125,13 +130,31 @@ class TestTheCoordinatorAsksTheHealthRoute:
         self, a_running_publisher
     ) -> None:
         publisher, url = a_running_publisher
-        publisher.passed_its_self_check = True
+        publisher.self_check = lambda: None
         config = a_config(publisher_url=url)
         said = publisher_client.the_publishers_self_check(config)
         assert said.the_publisher_passed_its_self_check is True
         assert publication_is_switched_on(
             config, lambda: publisher_client.the_publishers_self_check(config)
         ) is True
+
+    def test_the_check_is_run_again_on_every_health_request(
+        self, a_running_publisher, tmp_path: Path
+    ) -> None:
+        """"passed" cannot go stale: a mode changed after start turns it off."""
+        publisher, url = a_running_publisher
+        settings = publisher.settings
+        interfaces = _interfaces(tmp_path, "eth0")
+        publisher.self_check = lambda: entry.why_it_will_not_start(
+            settings, interfaces=interfaces
+        )
+        config = a_config(publisher_url=url)
+        assert publisher_client.the_publishers_self_check(config).the_publisher_passed_its_self_check is True
+        Path(settings.credential_file).chmod(0o640)
+        assert publisher_client.the_publishers_self_check(config).the_publisher_passed_its_self_check is False
+        Path(settings.credential_file).chmod(0o600)
+        (interfaces / "eth1").mkdir()
+        assert publisher_client.the_publishers_self_check(config).the_publisher_passed_its_self_check is False
 
     def test_a_publisher_that_never_ran_the_check_keeps_it_off(
         self, a_running_publisher
@@ -164,7 +187,7 @@ class TestTheCoordinatorAsksTheHealthRoute:
         from forge.config.models import ForgeConfig
 
         publisher, url = a_running_publisher
-        publisher.passed_its_self_check = True
+        publisher.self_check = lambda: None
         config = ForgeConfig.model_validate(
             {
                 "permissions": {"filesystem": {"allowlist": ["/tmp"]}},
