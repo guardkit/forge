@@ -26,64 +26,11 @@ from datetime import datetime, timezone
 
 MARK = 'ROLLOUT-SNAPSHOT.json'
 MIGRATED_ARTIFACT = 'migrated-forge.db'
+RUNTIME = 'sha256:1eaa3360b280cadebb308363aa2bfae06ddb852b25b1b8c7cd603cfa62ec0316'
 UNIT_ROLES = {'gateway', 'frontdoor', 'watchdog_timer', 'watchdog_service', 'autobuild', 'runner', 'keeper', 'langgraph_sidecar', 'deploy_sidecar'}
 VOLUME_ROLES = {'ledger', 'settings', 'evidence', 'threads', 'relay_progress'}
+PUBLISHER_RUNTIME = 'sha256:dd5281444ec7fbe6f13473331c693383d458819b72789a85815305471a0a604b'
 WORK_TABLES = {'builds': 1, 'planning_runs': 3, 'work_queue': 10, 'publication_records': 15, 'deployment_targets': 16}
-
-# THE REVIEWED RELEASES, by release version. These tools accept an image only
-# as part of one release's entry here, so moving a containerised estate from
-# one release to the next (and back) can name both at once. Until 2 October
-# 2026 there was one pinned coordinator image and one publisher image, which
-# could only ever describe a single release (release -3 upgrade runbook, TC1).
-# An entry is added by its own reviewed change once its images exist, as
-# cafffa64 did for 2026.09.28-2. 'schema' is the ledger schema the release's
-# migrations reach; the H6 probe and its check expect exactly that.
-RELEASES = {
-    '2026.09.28-2': {
-        'runtime': 'sha256:1eaa3360b280cadebb308363aa2bfae06ddb852b25b1b8c7cd603cfa62ec0316',
-        'publisher': 'sha256:dd5281444ec7fbe6f13473331c693383d458819b72789a85815305471a0a604b',
-        'memory': 'sha256:ea3e73cb46e05e249d5bc93fb78fd3b56740a8b6371a90203aefce4b662c41e5',
-        'relay': 'sha256:a65ca9f97f6ae8c5724afff62e688e679ce44c99404952f8bc90afbb1f42fe6e',
-        'jarvis': 'sha256:ab27492852cbcafc348a73759921fd2b190fe03059dac6154358554e93204da5',
-        'schema': 16,
-    },
-    # Release -3, built 2 October 2026 from Forge release/2026.10.02-1 at
-    # 0705d106 (manifest sha256 3da966ca...726ce); the same record format.
-    '2026.10.02-1': {
-        'runtime': 'sha256:19d0eca6f08c81f19747110de8efd86b8c1632d87ba0f92bf92348e32438b209',
-        'publisher': 'sha256:2a6bbbf625fbf1efe1acf071d8edf7c85eec29e3fc70e216c0b25659a6312aec',
-        'memory': 'sha256:f4f1fb8d7fecf0a4ba6e941ae3a89db04b45efc264c43a28fdc19e6c855f6913',
-        'relay': 'sha256:2900db8a3b2d3ed3355f339f710fb1da440f2066d5761434a9444309a9fbdc82',
-        'jarvis': 'sha256:5f8dd833aa4431cd247593ea305c9cd39a7ef5ebb639feadd6805678fde8142e',
-        'schema': 16,
-    },
-}
-# The inventories of the 30 September switch name no release: they were all
-# written for this one, so an inventory without 'release' still means it.
-SWITCH_RELEASE = '2026.09.28-2'
-# Kept as names for the switch-era tests and README; no check reads them.
-RUNTIME = RELEASES[SWITCH_RELEASE]['runtime']
-PUBLISHER_RUNTIME = RELEASES[SWITCH_RELEASE]['publisher']
-# Which entry field each service runs. bus-ready and gateway-watch run the
-# bus provisioning image, which the estate env names (NATS_PROVISION_IMAGE)
-# and which is not a Forge release image, so it is not in the table.
-SERVICE_IMAGE_ROLES = {'coordinator': 'runtime', 'answer-service': 'runtime', 'sandbox-runner': 'runtime',
-                       'forge-publisher': 'publisher', 'memory': 'memory', 'memory-relay': 'relay',
-                       'front-door': 'jarvis', 'bus-gateway': 'jarvis'}
-
-def release(c):
-    """Return (version, entry) for the release an inventory names."""
-    name = c.get('release', SWITCH_RELEASE)
-    if not isinstance(name, str) or name not in RELEASES:
-        refuse(f'release {name} is not in the reviewed release table; name a reviewed release, or add its entry in its own reviewed change first')
-    return name, RELEASES[name]
-
-def release_image(name, service, values=None):
-    """The image one service runs in a named release; None for a service no release names."""
-    if service in ('bus-ready', 'gateway-watch'):
-        return (values or {}).get('NATS_PROVISION_IMAGE')
-    role = SERVICE_IMAGE_ROLES.get(service)
-    return RELEASES[name][role] if role else None
 
 # Temporary-folder names an estate env file may set for the sandbox (TMPDIR is
 # a path INSIDE it, .env.example). A process on this machine must never be
@@ -102,37 +49,7 @@ def refuse(message):
 
 TIMEOUT_SECONDS = 180
 
-# ONE TIME LIMIT FOR A WHOLE MODE (release -3 upgrade runbook, after the coach's
-# review of 2 October 2026). run-step kills a step at its own limit with SIGKILL,
-# which nothing can clean up after, so each upgrade mode bounds itself: every
-# command it runs gets at most what remains of the mode's limit, and none starts
-# once the limit has passed. The runbook then sets run-step's limit above it.
-DEADLINE = None
-DEADLINE_WHAT = None
-
-class deadline:
-    """Bound every command run inside to `seconds` from now (or less, inside an
-    outer limit). replace=True starts a fresh limit, for clean-up after a failure."""
-    def __init__(self, seconds, what, *, replace=False):
-        self.seconds, self.what, self.replace = seconds, what, replace
-    def __enter__(self):
-        global DEADLINE, DEADLINE_WHAT
-        self.previous = (DEADLINE, DEADLINE_WHAT)
-        end = time.monotonic() + self.seconds
-        if self.replace or DEADLINE is None or end < DEADLINE:
-            DEADLINE, DEADLINE_WHAT = end, self.what
-        return self
-    def __exit__(self, *exc):
-        global DEADLINE, DEADLINE_WHAT
-        DEADLINE, DEADLINE_WHAT = self.previous
-        return False
-
 def run(argv, *, input=None, check=True, env=None, timeout=TIMEOUT_SECONDS):
-    if DEADLINE is not None:
-        remaining = DEADLINE - time.monotonic()
-        if remaining <= 0:
-            refuse(f'{DEADLINE_WHAT} reached its own time limit before {Path(str(argv[0])).name} could run; nothing more was started, so read its receipt for where it stopped')
-        timeout = min(timeout, remaining)
     # Never print a failed command's stderr: Compose diagnostics can contain secrets.
     result = subprocess.run([str(x) for x in argv], input=input, capture_output=True, text=True, timeout=timeout, env=env)
     if check and result.returncode:
@@ -298,9 +215,8 @@ def config(p, env_file=None, project=None):
             environment[key.strip()] = parsed[0]
     if environment.get('FORGE_IMAGE') != c['runtime_image']:
         refuse('FORGE_IMAGE in the estate env file differs from the immutable migration image; use the same accepted image ID')
-    name, entry = release(c)
-    if c['runtime_image'] != entry['runtime']:
-        refuse(f'runtime_image is not the accepted immutable image of release {name}; use that release\'s reviewed image ID')
+    if c['runtime_image'] != RUNTIME:
+        refuse('runtime_image is not the accepted immutable migration image; use the reviewed release image ID')
     if set(c['units']) != UNIT_ROLES or set(c['old_containers']) != {'coordinator', 'memory', 'relay'}:
         refuse('stopped-service inventory is incomplete; explicitly name every required unit and old container')
     if len(set(c['units'].values())) != len(UNIT_ROLES): refuse('unit inventory repeats a unit; name every distinct stopped service')
@@ -482,8 +398,7 @@ def rendered(c):
         source = mounts[0]['source']
         if model['volumes'][source].get('name') != expected:
             refuse(f'{service} record volume differs from {expected}; correct the actual Compose configuration')
-    name, entry = release(c)
-    for service, expected_image in [('coordinator', entry['runtime']), ('answer-service', entry['runtime']), ('forge-publisher', entry['publisher'])]:
+    for service, expected_image in [('coordinator', RUNTIME), ('answer-service', RUNTIME), ('forge-publisher', PUBLISHER_RUNTIME)]:
         if model['services'][service].get('image') != expected_image:
             refuse(f'{service} does not select the accepted immutable image; correct the estate env image ID')
     if model['services']['coordinator'].get('environment', {}).get('FORGE_DB_PATH') != '/var/lib/forge/forge.db':
@@ -763,17 +678,14 @@ def reconcile_started_copy(c, directory, receipt, copy, observed_logical):
         refuse('the started ledger differs from the start-up state without a reconciled build; keep the door closed and reconcile its state')
     return changed
 
-# Run inside the coordinator: a consistent copy of its ledger, as base64 on stdout.
-STARTED_COPY_CODE = r"""import base64,sqlite3,sys
+def started_ledger_reconciliation(c, directory, receipt, container_id, observed_logical):
+    """Copy the running coordinator's ledger and accept it only as start-up reconciliation."""
+    code = r"""import base64,sqlite3,sys
 src=sqlite3.connect('file:/var/lib/forge/forge.db?mode=ro',uri=True);dst=sqlite3.connect(':memory:')
 src.backup(dst);src.close()
 assert dst.execute('PRAGMA integrity_check').fetchall()==[('ok',)]
 sys.stdout.write(base64.b64encode(dst.serialize()).decode())
 """
-
-def started_ledger_reconciliation(c, directory, receipt, container_id, observed_logical):
-    """Copy the running coordinator's ledger and accept it only as start-up reconciliation."""
-    code = STARTED_COPY_CODE
     import base64
     with tempfile.TemporaryDirectory(prefix='.verify-started-', dir=directory.parent) as temporary:
         started = Path(temporary) / 'started.db'
@@ -796,7 +708,7 @@ def verify_containers(c, directory, metadata, receipt, plan):
         mounts = [m for m in item['Mounts'] if m['Destination'] == '/var/lib/forge']
         if len(mounts) != 1 or mounts[0]['Type'] != 'volume' or mounts[0].get('Name') != c['volumes']['ledger']:
             refuse(f'{service} actual container mounts another ledger; correct its mount before verifying')
-        expected_image = release(c)[1]['publisher' if service == 'forge-publisher' else 'runtime']
+        expected_image = PUBLISHER_RUNTIME if service == 'forge-publisher' else RUNTIME
         if item.get('Image') != expected_image:
             refuse(f'{service} runs a different immutable image; recreate the closed-door service with the accepted release')
         if service != 'coordinator' and mounts[0].get('RW') is not False:
@@ -829,7 +741,7 @@ print(json.dumps({'main_sha256':main_sha,'logical_sha256':logical,'schema_versio
         except Refusal:
             refuse(f'{service} cannot read its actual ledger and snapshot mark as its configured user; fix access before verifying')
         actual = json.loads(text)
-        if actual.get('schema_version') != release(c)[1]['schema'] or actual.get('mark') != mark:
+        if actual.get('schema_version') != 16 or actual.get('mark') != mark:
             refuse(f'{service} reads a different ledger or snapshot mark; keep the door closed and reconcile its state')
         reconciled = None
         if actual.get('logical_sha256') not in {receipt['loaded_logical_sha256'], receipt['startup_logical_sha256']}:
