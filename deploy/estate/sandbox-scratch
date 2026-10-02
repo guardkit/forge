@@ -272,8 +272,6 @@ def the_folder(args):
         refuse(folder + ' is not a top-level folder under ' + ' or '.join(roots) + ', the only two places this tool copies from')
     if not os.path.lexists(folder):
         refuse('there is no ' + folder + ' in the sandbox')
-    if os.path.realpath(os.path.dirname(folder)) != os.path.realpath(root):
-        refuse(folder + ' reaches outside ' + root + ' through a symbolic link')
     if not stat.S_ISDIR(os.lstat(folder).st_mode):
         refuse(folder + ' is not a folder (a symbolic link or a file is never followed or copied)')
     if os.path.basename(folder) == FACTORY_RUNTIME:
@@ -379,6 +377,8 @@ class Scratch:
         #: Every command this run made, with the code it sent replaced by its
         #: hash: the record of what was asked of the sandbox.
         self.commands = []
+        #: The host folders this sandbox shares (from 'sbx ls --json').
+        self.workspaces = []
 
     def running(self):
         """Refuse unless the sandbox is already running.
@@ -392,9 +392,14 @@ class Scratch:
             done = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=120)
             listing = json.loads(done.stdout)['sandboxes']
             status = [s.get('status') for s in listing if s.get('name') == self.name]
+            mine = [s for s in listing if s.get('name') == self.name]
+            self.workspaces = [workspace_path(w) for w in (mine[0].get('workspaces') or [])] if mine else []
         except (OSError, subprocess.TimeoutExpired, ValueError, KeyError, TypeError, AttributeError):
             raise Refusal('the sbx tool did not say which sandboxes are running, so nothing was asked of '
                           f'{self.name} (asking would start it if it were stopped)') from None
+        if not all(isinstance(w, str) and w.startswith('/') for w in self.workspaces):
+            raise Refusal(f'the sbx tool listed folders shared with {self.name} that this tool cannot read, '
+                          'so a destination cannot be shown to be outside them')
         if status != ['running']:
             said = status[0] if status else 'not on this machine'
             raise Refusal(f'the sandbox {self.name} is {said}, not running; this tool only reads, and asking '
@@ -440,12 +445,12 @@ class Scratch:
             same = seen.get(d['device'])
             note = f' (the same disk as {same})' if same else ''
             seen.setdefault(d['device'], labels[key])
-            print(f'  {labels[key]} ({d["path"]}): {gib(d["free"])} free of {gib(d["total"])}{note}')
+            print(f'  {labels[key]} ({shown(d["path"])}): {gib(d["free"])} free of {gib(d["total"])}{note}')
         if found['worktree_problem']:
             print(f"\nThe clone's registered worktrees could not be read ({found['worktree_problem']}), "
                   'so no folder below can be shown to hold none, and --copy will refuse.')
         for listing in found['roots']:
-            print(f'\nFolders under {listing["root"]}')
+            print(f'\nFolders under {shown(listing["root"])}')
             if not listing['exists']:
                 print('  (there is no such folder in this sandbox)')
                 continue
@@ -467,7 +472,7 @@ class Scratch:
                     notes.append(f'holds {entries_said(len(f["unsupported"]))} that {"is" if len(f["unsupported"]) == 1 else "are"} not a file, a folder or a link, so it cannot be copied')
                 if f['unreadable']:
                     notes.append(f'{entries_said(len(f["unreadable"]))} this sandbox\'s user cannot read, so the size is a lower bound and it cannot be copied')
-                print(f'  {size(f["size"]):>10}  {entries_said(f["entries"]):>13}  {f["name"]}' + ''.join(f'\n{"":29}{n}' for n in notes))
+                print(f'  {size(f["size"]):>10}  {entries_said(f["entries"]):>13}  {shown(f["name"])}' + ''.join(f'\n{"":29}{shown(n)}' for n in notes))
             if listing['other']:
                 total = sum(o['size'] for o in listing['other'])
                 print(f'  {size(total):>10}  {entries_said(len(listing["other"])):>13}  directly in this folder, not in a folder of their own (this tool copies folders only)')
@@ -484,6 +489,13 @@ class Scratch:
             if os.path.lexists(path):
                 raise Refusal(f'{path} already exists on this host; name a new folder (nothing has been copied)')
         self.running()
+        # A destination inside a folder the sandbox shares would be written
+        # where the sandbox can see it and write to it - inside the clone, into
+        # the very source being copied (the coach of TC7 did exactly that).
+        for shared in self.workspaces:
+            if within(destination, shared):
+                raise Refusal(f'{destination} is inside {shared}, a folder the sandbox {self.name} shares with '
+                              'this host; choose a host folder the sandbox cannot see (nothing has been copied)')
         checked = self.inside('check', folder=folder)
         if not checked.get('ok'):
             raise Refusal(checked.get('refusal') or 'the sandbox refused without saying why')
@@ -501,7 +513,23 @@ class Scratch:
 
         problem = self.receive(source, destination)
         copied = manifest(str(destination))
+        # THE SOURCE IS RECORDED AGAIN AFTER THE STREAM (TC7 coach, finding 1).
+        # The copy can only match the record taken before it; a file appended
+        # after it had streamed, or a file added after its folder had been
+        # listed, would match that record and still not be what the folder now
+        # holds. So a third record, read-only like the first, must agree too:
+        # before and after on type, size, mtime_ns, SHA-256 and link text, and
+        # the copy with both on everything but times.
+        after = self.inside('check', folder=source)
         differences = compare(rows, copied)
+        if not after.get('ok'):
+            differences.append('the source could not be recorded again after the copy: '
+                               + (after.get('refusal') or 'the sandbox refused without saying why'))
+            after_rows = None
+        else:
+            after_rows = after['manifest']
+            differences += compare(rows, after_rows, sides=('before the copy', 'after the copy'),
+                                   fields=('type', 'size', 'mtime_ns', 'sha256', 'target'))
         if problem:
             differences.insert(0, problem)
         verdict = 'verified copy' if not differences else 'copy does not match'
@@ -509,19 +537,19 @@ class Scratch:
             'sandbox': self.name, 'source': source, 'destination': str(destination),
             'checked_at': dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
             'verdict': verdict, 'differences': differences, 'entries': copied,
-            'commands': self.commands})
+            'source_after_entries': after_rows, 'commands': self.commands})
         if differences:
-            print(f'copy does not match: {source} in the sandbox {self.name} and {destination} on this host differ.')
+            print(f'copy does not match: {shown(source)} in the sandbox {self.name} and {destination} on this host differ.')
             for line in differences[:20]:
-                print('  ' + line)
+                print('  ' + shown(line))
             if len(differences) > 20:
                 print(f'  ... and {len(differences) - 20} more, all in {manifests[1]}')
             print('Both are kept: nothing was removed from either side. If the source was still being '
                   'written to, copy it again into a new folder once it is quiet.')
             return 1
-        print(f'verified copy: {len(rows)} entries, from {source} in the sandbox {self.name} '
-              f'to {destination}. The source is unchanged; the manifests are {manifests[0].name} '
-              f'and {manifests[1].name} beside the copy.')
+        print(f'verified copy: {entries_said(len(rows))}, from {shown(source)} in the sandbox {self.name} '
+              f'to {destination}. The source read the same before and after the copy; the manifests are '
+              f'{manifests[0].name} and {manifests[1].name} beside the copy.')
         return 0
 
     def receive(self, source, destination):
@@ -600,22 +628,46 @@ def unpack(stream, destination):
     return None
 
 
-def compare(source, copy):
-    """Every way the copy differs from the source record: path, type, size,
-    SHA-256 and link text. Modes and times are recorded, not compared."""
+def compare(source, copy, *, sides=('the source record', 'the copy'),
+            fields=('type', 'size', 'sha256', 'target')):
+    """Every way two records differ, on the fields given. By default the copy
+    against the source: path, type, size, SHA-256 and link text (a copy's
+    times are set from the stream, which need not carry nanoseconds)."""
     before = {row['path']: row for row in source}
     after = {row['path']: row for row in copy}
+    first, second = sides
     differences = []
     for path in sorted(before.keys() - after.keys()):
-        differences.append(f'{path}: in the source record, missing from the copy')
+        differences.append(f'{path}: in {first}, missing from {second}')
     for path in sorted(after.keys() - before.keys()):
-        differences.append(f'{path}: in the copy, not in the source record')
+        differences.append(f'{path}: in {second}, not in {first}')
     for path in sorted(before.keys() & after.keys()):
         a, b = before[path], after[path]
-        for field in ('type', 'size', 'sha256', 'target'):
+        for field in fields:
             if a.get(field) != b.get(field):
-                differences.append(f'{path}: {field} was {a.get(field)} in the source record and is {b.get(field)} in the copy')
+                differences.append(f'{path}: {field} was {a.get(field)} in {first} and is {b.get(field)} in {second}')
     return differences
+
+
+def workspace_path(entry):
+    """'/path' or '/path:ro' as 'sbx ls --json' lists a shared folder."""
+    if isinstance(entry, str) and entry.rsplit(':', 1)[-1] in ('ro', 'rw') and ':' in entry:
+        return entry.rsplit(':', 1)[0]
+    return entry
+
+
+def within(path, folder):
+    """Is path at or under folder, after resolving every symbolic link of both?"""
+    path, folder = os.path.realpath(path), os.path.realpath(folder)
+    return path == folder or path.startswith(folder.rstrip('/') + '/')
+
+
+def shown(text):
+    """A name as it may safely be printed: one line, nothing invisible."""
+    text = str(text)
+    if text.isprintable():
+        return text
+    return ascii(text)[1:-1]
 
 
 def main(argv=None):
