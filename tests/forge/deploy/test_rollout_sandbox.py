@@ -28,6 +28,28 @@ IDENTITY_DOCUMENT = 'forge-image-identity/2\n' + json.dumps({
     'com.guardkit.release.manifest.sha256':'b'*64},'ports':{},'volumes':{},'stopsignal':'',
 },separators=(',',':'))
 IDENTITY = m.digest((IDENTITY_DOCUMENT+'\n').encode())
+REAL_RUN = subprocess.run
+SETTINGS_PATH = '/home/agent/.forge-sandbox/owned-sandbox/forge.yaml'
+#: The coordinator's own settings, as the estate's settings volume holds them:
+#: its own clone paths, addresses written as ${NAME}, and one sandbox entry for
+#: another sandbox, none of which may reach the sandbox's file.
+COORDINATOR_SETTINGS = """permissions:
+  filesystem:
+    allowlist: [/var/lib/forge/projects]
+planning:
+  enabled: true
+  target_repo_paths:
+    owned/project: /var/lib/forge/projects/owned
+    mirror/project: /var/lib/forge/projects/owned
+    other/project: /var/lib/forge/projects/other
+  sandboxes:
+    owned/project: {name: owned-sandbox, sidecar_url: '${FORGE_SANDBOX_SIDECAR_URL}', runner_url: '${FORGE_SANDBOX_RUNNER_URL}'}
+    mirror/project: {name: owned-sandbox, sidecar_url: '${FORGE_SANDBOX_SIDECAR_URL}', runner_url: '${FORGE_SANDBOX_RUNNER_URL}'}
+    other/project: {name: other-sandbox, sidecar_url: '${FORGE_SANDBOX_SIDECAR_URL}', runner_url: '${FORGE_SANDBOX_RUNNER_URL}'}
+routine:
+  seat: fixture-coder-seat
+  timeout_multiplier: 2.5
+"""
 
 
 @pytest.fixture
@@ -41,8 +63,11 @@ def inventory(tmp_path):
         'FLEET_MEMORY_ENABLED=false','FLEET_MEMORY_PORT=30822','SANDBOX_RECEIPTS_PATH=/private/receipts',
         'SANDBOX_NAME=owned-sandbox','SANDBOX_BOOTSTRAP=/private/clone/deploy/sandbox-runner.sh',
         'SANDBOX_PROJECT_ENV_FILE='+str(tmp_path/'operational'/'bootstrap.env'),
-        'SANDBOX_ENV_NAMES=SANDBOX_RECEIPTS_PATH FORGE_IMAGE FORGE_IMAGE_IDENTITY FORGE_RELEASE_VERSION FORGE_RELEASE_MANIFEST_SHA256 FORGE_TARGET_OWNER_URL '+' '.join(m.MEMORY_NAMES),
+        'SANDBOX_ENV_NAMES=SANDBOX_RECEIPTS_PATH FORGE_IMAGE FORGE_IMAGE_IDENTITY FORGE_RELEASE_VERSION FORGE_RELEASE_MANIFEST_SHA256 FORGE_TARGET_OWNER_URL FORGE_CONFIG_PATH '+' '.join(m.MEMORY_NAMES),
     ])+'\n')
+    coordinator = tmp_path / 'coordinator-settings' / 'forge.yaml'
+    coordinator.parent.mkdir()
+    coordinator.write_text(COORDINATOR_SETTINGS)
     source = tmp_path / 'project' / 'deploy' / 'profile.yaml'
     source.parent.mkdir(parents=True)
     source.write_text('''env_id: fixture
@@ -63,7 +88,9 @@ custom_choice:
         'project':'owned-project','env_file':str(env),'runtime_image':IMAGE,
         'docker_context':'explicit-test','forbidden_roots':[str(tmp_path/'project')],
         'units':{'runner':'owned-runner.service','keeper':'owned-keeper.service'},
+        'volumes':{'settings':'owned-project_forge-settings'},
         'sandbox':{'name':'owned-sandbox','clone_path':'/private/clone',
+            'settings_path':SETTINGS_PATH,'repo_keys':['owned/project','mirror/project'],'worktree_disk_floor_gb':8,
             'known_files':['known.txt'],'receipts_path':'/private/receipts',
             'script_path':'/private/clone/deploy/sandbox-runner.sh',
             'profile_path':'/private/clone/deploy/profile.yaml','profile_source':str(source),'bootstrap_env_file':str(tmp_path/'operational'/'bootstrap.env'),
@@ -131,8 +158,23 @@ class Boundary:
             if self.fault == 'wrong-hook-type' and field == 'ExecStop':out='s ""\n'
             if self.fault == 'hook-error' and field == 'ExecStop':code=1
             if self.fault == 'hook-timeout' and field == 'ExecStop':raise subprocess.TimeoutExpired(argv,120)
+        elif argv[0] == 'docker' and argv[3:5] == ['volume','inspect']:
+            labels={'com.docker.compose.project':'other-project' if self.fault=='foreign-volume' else 'owned-project'}
+            out=json.dumps([] if self.fault=='missing-volume' else [{'Name':argv[5],'Labels':labels}])
+            if self.fault=='missing-volume':code=1
         elif argv[0] == 'docker' and 'inspect' in argv:
             out=IDENTITY_DOCUMENT+'\n' if argv[-2].startswith('forge-image-identity/2') else IMAGE
+        elif argv[0] == 'docker' and m.SETTINGS in argv:
+            # The real generator and the real load_config, on the fixture's
+            # coordinator settings in place of the read-only volume mount.
+            assert argv[argv.index(m.SETTINGS)+1] == '/coordinator-settings/forge.yaml'
+            assert 'type=volume,src='+self.config['volumes']['settings']+',dst=/coordinator-settings,readonly' in argv
+            source=Path(self.config['env_file']).parent/'coordinator-settings'/'forge.yaml'
+            done=REAL_RUN([sys.executable,'-c',m.SETTINGS,str(source)],input=kwargs['input'],capture_output=True,text=True,
+                          env={'PATH':os.environ['PATH'],'PYTHONPATH':str(ROOT/'src'),'FORGE_SANDBOX_SIDECAR_URL':'http://leak.invalid'})
+            assert done.returncode==0,done.stderr
+            self.generated=done.stdout
+            out=done.stdout
         elif argv[0] == 'docker':
             # Exercise the actual schema/rewrite payload without another Docker.
             original = json.loads(kwargs['input'])
@@ -552,7 +594,10 @@ def test_normal_output_drives_real_template_receipts_and_custom_ports(inventory,
     consumer=tmp_path/'consumer';consumer.mkdir()
     fake=template_tests.sandbox.__wrapped__(consumer)
     # Only fake image identity settings differ; preserve actual generated path/port values.
-    extra={k:v for k,v in forwarded.items() if k not in {'FORGE_IMAGE','FORGE_IMAGE_IDENTITY','FORGE_RELEASE_VERSION','FORGE_RELEASE_MANIFEST_SHA256'}}
+    # The settings file's path is the sandbox's own (it does not exist on this
+    # machine); the consumer fixture supplies a real file in its place.
+    assert forwarded['FORGE_CONFIG_PATH']==SETTINGS_PATH
+    extra={k:v for k,v in forwarded.items() if k not in {'FORGE_IMAGE','FORGE_IMAGE_IDENTITY','FORGE_RELEASE_VERSION','FORGE_RELEASE_MANIFEST_SHA256','FORGE_CONFIG_PATH'}}
     runs=template_tests.TestTheFoldersBothContainersShare._runs_of_a_started_bootstrap(fake,**extra)
     assert len(runs)==2
     assert all(desired+':'+desired+':rw' in run for run in runs)
@@ -626,7 +671,7 @@ def test_real_helper_binds_transfer_to_reviewed_identity(inventory,monkeypatch,t
     with monkeypatch.context() as local:
         b=Boundary(config,local);boundary=b.run
         def run(argv,**kw):
-            if (argv[0]=='docker' and 'inspect' in argv) or argv[0]=='bash':
+            if (argv[0]=='docker' and 'inspect' in argv and 'volume' not in argv) or argv[0]=='bash':
                 b.calls.append((argv,kw));env=dict(kw['env'])
                 env.update({k:v for k,v in bt._settings(fake).items() if k.startswith('STANDIN_')})
                 env['PATH']=str(bindir)+':'+os.environ['PATH']
@@ -673,3 +718,129 @@ def test_repeat_does_not_trust_an_old_mismatched_identity_receipt(inventory,monk
     assert m.main(args)==2
     assert 'reviewed immutable image' in capsys.readouterr().err
     assert not any(x[:3] in (['systemctl','--user','stop'],['systemctl','--user','unmask']) for x,_ in b.calls[before:])
+
+
+# ---------------------------------------------------------------------------
+# Release -3 TC5: the sandbox's own settings file
+# ---------------------------------------------------------------------------
+
+
+def _installed_settings(boundary):
+    import yaml
+    return yaml.safe_load(boundary.files[SETTINGS_PATH].decode())
+
+
+def test_settings_file_is_generated_installed_and_named_in_the_bootstrap_env(inventory,monkeypatch):
+    config,path,args=inventory;b=Boundary(config,monkeypatch)
+    assert m.main(args)==0
+    doc=_installed_settings(b)
+    assert doc['planning']=={'target_repo_paths':{'owned/project':'/private/clone','mirror/project':'/private/clone'}}
+    assert doc['permissions']=={'filesystem':{'allowlist':['/private/clone']}}
+    # The routine seat and its multiplier are the coordinator's own.
+    assert doc['routine']=={'seat':'fixture-coder-seat','timeout_multiplier':2.5}
+    # The floor is the inventory's, not the code's 20 GiB default.
+    assert doc['resource_preflight']=={'min_available_disk_gb':8}
+    runtime=Path(config['sandbox']['bootstrap_env_file']).read_text()
+    assert 'FORGE_CONFIG_PATH="'+SETTINGS_PATH+'"\n' in runtime
+    receipt=json.loads((Path(config['sandbox']['evidence_dir'])/'sandbox-installed.json').read_text())
+    assert receipt['settings_path']==SETTINGS_PATH
+    assert receipt['settings_sha256']==m.digest(b.files[SETTINGS_PATH])
+    assert receipt['routine_seat']=='fixture-coder-seat' and receipt['worktree_disk_floor_gb']==8
+    assert 'FORGE_CONFIG_PATH' in receipt['bootstrap_env_names']
+    install=next(json.loads(kw['input']) for x,kw in b.calls if x[0]=='sbx' and m.INSTALL in x)
+    item=next(i for i in install if i['path']==SETTINGS_PATH)
+    assert item['mode']==0o644 and item['parent_mode']==0o755 and item['root']==str(Path(SETTINGS_PATH).parent)
+
+
+def test_generated_settings_load_with_an_empty_environment_and_carry_no_name(inventory,monkeypatch,tmp_path):
+    from forge.config.loader import load_config
+    config,path,args=inventory;b=Boundary(config,monkeypatch)
+    assert m.main(args)==0
+    text=b.files[SETTINGS_PATH].decode()
+    assert '${' not in text and 'leak.invalid' not in text and '/var/lib/forge' not in text
+    assert 'sandboxes' not in text and 'other/project' not in text
+    copy=tmp_path/'generated.yaml';copy.write_text(text)
+    loaded=load_config(copy,environ={})
+    assert loaded.routine.seat=='fixture-coder-seat'
+    assert loaded.resource_preflight.min_available_disk_gb==8
+    # The settings run is a throwaway, network-less, read-only container with
+    # the coordinator's volume mounted read-only and nothing of the estate env.
+    run=next(x for x in b.argv() if x[0]=='docker' and m.SETTINGS in x)
+    assert '--network=none' in run and '--read-only' in run and '--rm' in run
+    assert not any(x in ('-e','--env','--env-file') for x in run)
+
+
+def _refuses_before_any_unit(config,args,monkeypatch,capsys):
+    b=Boundary(config,monkeypatch)
+    assert m.main(args)==2
+    assert not any(x[0] in ('systemctl','busctl') or x[:2]==['sbx','stop'] for x in b.argv())
+    assert not b.files
+    return capsys.readouterr().err
+
+
+def test_a_repository_key_not_mapped_to_this_sandbox_refuses(inventory,monkeypatch,capsys):
+    config,path,args=inventory
+    config['sandbox']['repo_keys']=['owned/project','other/project'];path.write_text(json.dumps(config))
+    error=_refuses_before_any_unit(config,args,monkeypatch,capsys)
+    assert 'other/project' in error and 'owned-sandbox' in error
+
+
+@pytest.mark.parametrize('fault',['missing-volume','foreign-volume'])
+def test_a_missing_or_foreign_settings_volume_refuses(inventory,monkeypatch,capsys,fault):
+    config,path,args=inventory
+    b=Boundary(config,monkeypatch);b.fault=fault
+    assert m.main(args)==2
+    assert not any(x[0]=='docker' and m.SETTINGS in x for x in b.argv()), 'a mount must never create the volume'
+    assert not any(x[0]=='systemctl' for x in b.argv())
+
+
+@pytest.mark.parametrize('where,env',[
+    ('/private/clone/.guardkit/forge.yaml',{}),
+    ('/private/receipts/forge.yaml',{}),
+    ('/private/scratch/settings/forge.yaml',{'TMPDIR':'/private/scratch'}),
+    ('/private/worktrees/forge.yaml',{'FORGE_AUTOBUILD_WORKTREE_BASE':'/private/worktrees'}),
+])
+def test_a_settings_path_inside_the_clone_or_a_shared_folder_refuses(inventory,monkeypatch,capsys,where,env):
+    config,path,args=inventory
+    config['sandbox']['settings_path']=where;path.write_text(json.dumps(config))
+    edit_env(config,env,tuple(env))
+    monkeypatch.setattr(m.subprocess,'run',lambda *a,**k:pytest.fail('external call before settings validation'))
+    assert m.main(args)==2
+    assert 'sandbox.settings_path is inside' in capsys.readouterr().err
+
+
+@pytest.mark.parametrize('change,remove,message',[
+    ({},('FORGE_CONFIG_PATH',),'FORGE_CONFIG_PATH is not in SANDBOX_ENV_NAMES'),
+    ({'FORGE_CONFIG_PATH':'/private/clone/.guardkit/tmp/factory-runtime/forge.yaml'},(),'names another file'),
+])
+def test_forge_config_path_must_be_forwarded_and_name_the_generated_file(inventory,monkeypatch,capsys,change,remove,message):
+    config,path,args=inventory;edit_env(config,change,(),remove)
+    monkeypatch.setattr(m.subprocess,'run',lambda *a,**k:pytest.fail('external call before settings validation'))
+    assert m.main(args)==2
+    assert message in capsys.readouterr().err
+
+
+@pytest.mark.parametrize('key,value',[('repo_keys',[]),('repo_keys',['not-a-key']),('worktree_disk_floor_gb',0),('worktree_disk_floor_gb',True),('settings_path','relative/forge.yaml'),('settings_path','/forge.yaml')])
+def test_bad_settings_inventory_keys_refuse_before_anything(inventory,monkeypatch,key,value):
+    config,path,args=inventory
+    config['sandbox'][key]=value;path.write_text(json.dumps(config))
+    monkeypatch.setattr(m.subprocess,'run',lambda *a,**k:pytest.fail('external call before settings validation'))
+    assert m.main(args)==2
+
+
+def test_install_payload_makes_the_settings_folder_and_reads_back(tmp_path):
+    import base64
+    target=tmp_path/'agent'/'.forge-sandbox'/'owned-sandbox'/'forge.yaml'
+    item={'path':str(target),'root':str(target.parent),'data':base64.b64encode(b'planning: {}\n').decode(),'mode':0o644,'parent_mode':0o755}
+    r=REAL_RUN([sys.executable,'-c',m.INSTALL],input=json.dumps([item]),text=True,capture_output=True)
+    assert r.returncode==0,r.stderr
+    assert target.read_bytes()==b'planning: {}\n'
+    assert target.stat().st_mode & 0o777==0o644 and target.parent.stat().st_mode & 0o777==0o755
+
+
+def test_repeat_checks_the_installed_settings_file_too(inventory,monkeypatch,capsys):
+    config,path,args=inventory;b=Boundary(config,monkeypatch)
+    assert m.main(args)==0
+    b.files[SETTINGS_PATH]=b'changed by hand\n'
+    assert m.main(args)==2
+    assert 'installed file differs at '+SETTINGS_PATH in capsys.readouterr().err
