@@ -96,6 +96,7 @@ ITEMS=(
 "services|8h|the-front-door-answers|the Slack front door answers its own health route inside the estate, and the threads it saves are in a volume it can write rather than in the container - it publishes no port, because Slack is dialled out to and never heard from"
 "services|8i|the-bus-gateway-is-on-the-bus|the bus gateway's OWN connection is on the bus, asked of the BUS itself rather than of the gateway - its account AND the client name it sends for itself AND its subscription, all three on one connection, because the front door shares its account and the account alone would report a stopped gateway as healthy"
 "services|9|the-answer-service-from-inside-a-sandbox|the coordinator's answer service answers FROM INSIDE a sandbox at the address the sandbox profile allows"
+"services|9b|the-sandbox-build-disk-has-room|inside the sandbox, the free space on the filesystem that holds a build's worktree folder is above the disk floor the sandbox's own settings file sets - below it fails, and within 10 GiB above it warns"
 "pre-resume|10|the-producers-are-stopped|the two things that can bring work in are really stopped - no front-door and no bus-gateway container in this estate, the legacy host units inactive if they are on this machine, and nothing waiting or unconfirmed on the bus's two durable readers"
 "pre-resume|10b|the-running-release-is-the-one-this-rollout-names|what is running is the release this rollout is FOR - the image the rollout names is resolved to an image id and compared with the image id the coordinator is really running, and a difference refuses the phase by name"
 )
@@ -276,6 +277,10 @@ publisher_policy_verify() {
 PASSES=0
 FAILURES=0
 UNCHECKED=0
+#: Items that passed with a warning. They ARE passes - the gate is met - and
+#: are counted among them; the count is said at the end so a warning is not
+#: lost in the list.
+WARNINGS=0
 # Items this MODE deliberately leaves out, which is a different thing from an
 # item that could not be checked. Only the closed-door mode has any, and it has
 # exactly two: the items that ask a producer, while the producers are
@@ -291,6 +296,7 @@ _record() { RESULTS+=("$1|$2|$3"); }
 
 ok()        { PASSES=$((PASSES+1));     printf '  ok            %-4s %s\n' "$1" "$2"; _record "$1" ok "$2"; }
 fail()      { FAILURES=$((FAILURES+1)); printf '  NOT PASSED    %-4s %s\n' "$1" "$2"; _record "$1" failed "$2"; }
+ok_with_a_warning() { PASSES=$((PASSES+1)); WARNINGS=$((WARNINGS+1)); printf '  ok, WARNING   %-4s %s\n' "$1" "$2"; _record "$1" ok "$2"; }
 unchecked() { UNCHECKED=$((UNCHECKED+1)); printf '  not checked   %-4s not checked here: %s\n' "$1" "$2"; _record "$1" not-checked "$2"; }
 
 # NOT CHECKED ON PURPOSE, BY THIS MODE. Said differently from 'not checked',
@@ -307,6 +313,7 @@ finish() {
     if [ "${FAILURES}" -eq 0 ] && [ "${UNCHECKED}" -eq 0 ]; then
         printf 'PASSED — %s items, all of them, and every one of them asked something.\n' "${PASSES}"
         [ "${DELIBERATE}" -eq 0 ] || printf '%s item(s) were left out of this mode on purpose, and are listed above with where they are checked instead.\n' "${DELIBERATE}"
+        [ "${WARNINGS}" -eq 0 ] || printf '%s of them passed with a WARNING, marked above: nothing is wrong yet, and that is what to look at next.\n' "${WARNINGS}"
         exit 0
     fi
     printf 'NOT PASSED — %s items asked something and passed, %s failed, %s could not be checked on this machine.\n' \
@@ -762,7 +769,7 @@ run_the_services_items() {
         for row in "${ITEMS[@]}"; do
             IFS='|' read -r m n name sentence <<< "${row}"
             case "${m}" in
-                services) ;;
+                services) [ "${phase}" = "closed-door" ] && [ "${n}" = "9b" ] && continue ;;
                 pre-resume) [ "${phase}" = "closed-door" ] || continue ;;
                 *) continue ;;
             esac
@@ -894,7 +901,120 @@ run_the_services_items() {
 
     # --- 9 -----------------------------------------------------------------
     check_from_inside_a_sandbox
+
+    # --- 9b ----------------------------------------------------------------
+    # Only in the full check. The closed-door record holds exactly the items it
+    # has always held, and a full disk does not change whether the door is shut.
+    [ "${phase}" = "closed-door" ] || check_the_sandbox_build_disk
     return 0
+}
+
+# ---------------------------------------------------------------------------
+# 9b. THE DISK A BUILD WRITES TO, INSIDE THE SANDBOX (release -3, item 8).
+#
+# The build runner refuses a build before it makes the build's worktree when the
+# free space on that folder's filesystem is below its floor. Until this item,
+# nothing said so before a build had already been refused: on 1 October the
+# floor was the coordinator machine's 20 GiB, the sandbox's build disk had 31 GB
+# free, and the first sign would have been a refused build. A sandbox now
+# declares its own floor in its own settings file.
+#
+# IT ASKS THE RUNNER ITSELF, inside its own container, with the runner's own
+# code: where its worktree folder is, which settings file it reads, and the
+# floor it would hold a build to. Re-deriving any of those here - from an env
+# file on this machine, or from the sandbox's shell, whose settings path was the
+# host share's on 1 October - would be a second answer that can disagree with
+# the one that refuses builds. Nothing is read from the container's environment
+# but those answers (it holds secrets), and only numbers and paths come back.
+#
+# Below the floor fails: the next build will be refused. Within 10 GiB above it
+# passes with a WARNING: about forty failed builds' worktrees at 0.25 GB each,
+# and the time to copy scratch out with sandbox-scratch. A sandbox that is not
+# running is not asked at all, because 'sbx exec' would start it.
+# ---------------------------------------------------------------------------
+SANDBOX_DISK_WARNING_BYTES=$((10 * 1024 * 1024 * 1024))
+
+THE_RUNNERS_OWN_DISK_ANSWER='
+import os
+try:
+    from forge.subagents import autobuild_runner as runner
+    from forge.subagents.autobuild_worktree_lifecycle import inspect_worktree_capacity
+except Exception as error:
+    print("unasked=the runner in there has no worktree disk floor to ask about (" + type(error).__name__ + ")")
+    raise SystemExit(0)
+override = os.environ.get(runner.FORGE_AUTOBUILD_MIN_AVAILABLE_BYTES_ENV, "").strip()
+settings = runner._forge_config_file()
+print("settings=" + (str(settings) if settings else ""))
+print("from=" + ("override" if override else "settings" if settings else "default"))
+try:
+    floor = runner._worktree_min_available_bytes()
+except Exception as error:
+    print("problem=" + " ".join(str(error).split()))
+    raise SystemExit(0)
+found = inspect_worktree_capacity(runner._worktree_base_dir(), min_available_bytes=floor)
+print("floor=" + str(floor))
+print("base=" + str(found.get("base", "")))
+print("probed=" + str(found.get("probed_path", "")))
+capacity = found.get("capacity") or {}
+if "available_bytes" in capacity:
+    print("free=" + str(capacity["available_bytes"]))
+'
+
+# One answer out of the runner's 'name=value' lines.
+the_runner_said() { printf '%s\n' "$2" | sed -n "s/^$1=//p" | head -1; }
+in_gib() { awk -v b="$1" 'BEGIN { printf "%.1f GiB", b / 1073741824 }'; }
+
+check_the_sandbox_build_disk() {
+    local name runner status out free floor from settings probed problem unasked where
+    name="$(get SANDBOX_NAME)"
+    runner="$(get SANDBOX_CONTAINER_PREFIX)"
+    runner="${runner:-forge-sandbox}-runner"
+    if [ -z "${name}" ]; then
+        unchecked 9b "the env file names no sandbox (SANDBOX_NAME is empty), so the disk a build writes to could not be asked about."
+        return
+    fi
+    if ! command -v sbx >/dev/null 2>&1; then
+        unchecked 9b "the sandbox tool is not on this machine, so the disk a build writes to in '${name}' could not be asked about."
+        return
+    fi
+    status="$(sbx ls 2>/dev/null | awk -v n="${name}" '$1 == n { print $3 }')"
+    if [ "${status}" != "running" ]; then
+        unchecked 9b "the sandbox '${name}' is ${status:-not on this machine}, not running, so its build disk was not asked about (asking would start it)."
+        return
+    fi
+    out="$(sbx exec "${name}" docker exec "${runner}" python -c "${THE_RUNNERS_OWN_DISK_ANSWER}" 2>/dev/null)"
+    free="$(the_runner_said free "${out}")"; floor="$(the_runner_said floor "${out}")"
+    from="$(the_runner_said from "${out}")"; settings="$(the_runner_said settings "${out}")"
+    probed="$(the_runner_said probed "${out}")"; problem="$(the_runner_said problem "${out}")"
+    unasked="$(the_runner_said unasked "${out}")"
+    if [ -z "${out}" ]; then
+        unchecked 9b "the build runner '${runner}' in the sandbox '${name}' did not answer, so the disk a build writes to could not be asked about. Is the runner running?"
+        return
+    fi
+    if [ -n "${unasked}" ]; then
+        unchecked 9b "${unasked}, in the sandbox '${name}'."
+        return
+    fi
+    if [ -n "${problem}" ]; then
+        fail 9b "the build runner in the sandbox '${name}' cannot read its own worktree disk floor, so it refuses every build: ${problem}."
+        return
+    fi
+    if ! [[ "${free}" =~ ^[0-9]+$ ]] || ! [[ "${floor}" =~ ^[0-9]+$ ]]; then
+        unchecked 9b "the build runner in the sandbox '${name}' could not read the free space where its worktrees go (${probed:-an unnamed folder}), so the floor could not be compared with anything."
+        return
+    fi
+    case "${from}" in
+        settings) where="the floor in the sandbox's settings file ${settings}" ;;
+        override) where="the floor FORGE_AUTOBUILD_MIN_AVAILABLE_BYTES sets in the runner's environment, which overrides the settings file" ;;
+        *)        where="the code's default floor, because the runner found no settings file" ;;
+    esac
+    if [ "${free}" -lt "${floor}" ]; then
+        fail 9b "inside the sandbox '${name}', ${probed} has $(in_gib "${free}") free, BELOW ${where} ($(in_gib "${floor}")). The runner will refuse the next build before making its worktree. Copy scratch out with sandbox-scratch --report and --copy; freeing the space in the sandbox is a separate, reviewed step."
+    elif [ "${free}" -lt $((floor + SANDBOX_DISK_WARNING_BYTES)) ]; then
+        ok_with_a_warning 9b "inside the sandbox '${name}', ${probed} has $(in_gib "${free}") free, above ${where} ($(in_gib "${floor}")) but by less than 10 GiB. Builds still run; see what is filling it with sandbox-scratch --report."
+    else
+        ok 9b "inside the sandbox '${name}', ${probed} has $(in_gib "${free}") free, more than 10 GiB above ${where} ($(in_gib "${floor}")), asked of the build runner '${runner}' itself."
+    fi
 }
 
 # THE SLACK FRONT DOOR. Where Rich approves a spec, taps a build gate and says
