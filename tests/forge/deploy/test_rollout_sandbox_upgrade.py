@@ -349,7 +349,6 @@ def _refused_and_unchanged(e,machine,args,capsys,expected):
 
 @pytest.mark.parametrize('fault,expected',[
     ('supervisor-running','is not stopped'),
-    ('supervisor-exit-3','exited 3, not 0'),
     ('no-supervisor','no sandbox-runner container'),
 ])
 def test_a_running_or_unclean_supervisor_refuses(estate,monkeypatch,capsys,fault,expected):
@@ -722,3 +721,73 @@ def test_the_install_step_writes_a_plain_path_through_one_descriptor(tmp_path):
     assert r.returncode==0,r.stderr
     assert target.read_bytes()==b'x: 1\n' and target.stat().st_mode&0o777==0o644
     assert not [p for p in target.parent.iterdir() if p.name.startswith('.rollout-')]
+
+
+# ---------------------------------------------------------------------------
+# Re-check M1: the same supervisor-exit rule as rollout-quiesce --final, and
+# one overall time limit.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize('back',[False,True])
+def test_a_non_zero_supervisor_exit_is_accepted_when_nothing_runs_inside(estate,monkeypatch,back):
+    e=estate;machine=Machine(e,monkeypatch)
+    if back:
+        assert m.main(e['args'])==0
+    machine.fault='supervisor-exit-3'
+    assert m.main([*e['args'],*(['--back'] if back else [])])==0
+    name='sandbox-restored.json' if back else 'sandbox-installed.json'
+    receipt=json.loads((Path(e['config']['sandbox']['evidence_dir'])/name).read_text())
+    seen=receipt['compose_supervisor']['containers'][0]
+    assert seen['exit_code']==3 and 'did not succeed' in seen['meaning']
+    assert seen['accepted_because'].startswith('nothing runs inside the sandbox')
+
+
+@pytest.mark.parametrize('back',[False,True])
+@pytest.mark.parametrize('inside',['container','lock'])
+def test_a_non_zero_supervisor_exit_with_work_inside_refuses_in_quiesce_s_words(estate,monkeypatch,capsys,back,inside):
+    e=estate;machine=Machine(e,monkeypatch)
+    if back:
+        assert m.main(e['args'])==0
+    capsys.readouterr()
+    machine.fault='supervisor-exit-3'
+    before=snapshot(e)
+    lock=None
+    if inside=='container':
+        machine.inner_containers=['owned-runner']
+    else:
+        state=e['home']/'.forge-runner'/hashlib.sha256(str(e['clone']).encode()).hexdigest()
+        state.mkdir(parents=True,exist_ok=True)
+        lock=open(state/'lock','w');fcntl.flock(lock,fcntl.LOCK_EX)
+    try:
+        assert m.main([*e['args'],*(['--back'] if back else [])])==2
+    finally:
+        if lock:lock.close()
+    error=capsys.readouterr().err
+    busy='owned-runner' if inside=='container' else "the supervisor's lock held"
+    assert ('sandbox-runner exited 3: its stop of the work inside the sandbox did not succeed; and inside the sandbox there is still '
+            +busy+', so nothing was changed. Stop the bootstrap\'s work inside the sandbox (its stop word, as the supervisor\'s log says), then run this step again') in error
+    assert snapshot(e)==before
+
+
+def test_the_upgrade_has_one_overall_time_limit(estate,monkeypatch,capsys):
+    e=estate;machine=Machine(e,monkeypatch)
+    clock=[1000.0]
+    monkeypatch.setattr(m.time,'monotonic',lambda:clock[0])
+    real=machine.run
+    def slow(argv,**kw):
+        assert kw['timeout']<=m.UPGRADE_LIMIT_SECONDS-(clock[0]-1000.0)+1e-6
+        if argv[:2]==['sbx','version']:clock[0]+=m.UPGRADE_LIMIT_SECONDS
+        return real(argv,**kw)
+    monkeypatch.setattr(m.subprocess,'run',slow)
+    before=snapshot(e)
+    assert m.main(e['args'])==2
+    assert 'reached its own time limit of 1500 seconds' in capsys.readouterr().err
+    assert snapshot(e)==before
+    assert len(machine.calls)==1
+
+
+def test_the_limit_is_stated_in_help(capsys):
+    with pytest.raises(SystemExit):
+        m.main(['--help'])
+    assert '1500 seconds overall' in ' '.join(capsys.readouterr().out.split())

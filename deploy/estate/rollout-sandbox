@@ -9,6 +9,9 @@ settings file and clone-local git identity to
 <evidence_dir>/previous-installation/ (0600, with hashes; the previous
 bootstrap env, which carries secrets, by its hash only) before changing
 anything, and writes sandbox-installed.json format 2 with a previous block.
+--upgrade and --upgrade --back each have one overall time limit
+(UPGRADE_LIMIT_SECONDS, 1500): every command they run is bounded by what is
+left of it, and none is started after it.
 
 Private inventory: common project/env_file/runtime_image/docker_context and units
 runner/keeper, plus sandbox:{name, clone_path, known_files, receipts_path,
@@ -42,6 +45,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -396,6 +400,16 @@ def routes(text):
 print(json.dumps({'installed':routes(p['installed']),'new':routes(p['new'])}))
 '''
 
+# The meaning of a supervisor exit other than 0, word for word as rollout-quiesce
+# --final says it (run.sh: 2 refused before starting, 3 its stop failed).
+SUPERVISOR_EXITS = {2:'it refused before starting anything (a setting or the sandbox client was missing)',
+                    3:'its stop of the work inside the sandbox did not succeed'}
+
+# One overall time limit for --upgrade and --upgrade --back (and their plans):
+# every command is bounded by what is left of it, and none is started after it.
+# Below the 1,800 s the runbook's recorder and rollout-back give this step.
+UPGRADE_LIMIT_SECONDS = 1500
+
 GIT_IDENTITY_NAMES = ('GIT_AUTHOR_NAME','GIT_AUTHOR_EMAIL','GIT_COMMITTER_NAME','GIT_COMMITTER_EMAIL')
 
 
@@ -573,6 +587,12 @@ class Rollout:
                 'excluded':sorted(set(self.excluded_roots.values())),'real_parent':real_parent}
 
     def run(self, argv, *, input=None, check=True, timeout=120, env=None):
+        deadline = getattr(self,'deadline',None)
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise Refusal(f'the upgrade reached its own time limit of {UPGRADE_LIMIT_SECONDS} seconds before {Path(argv[0]).name} could run; nothing more was started, so read its evidence for where it stopped')
+            timeout = min(timeout, remaining)
         try:
             result = subprocess.run(argv, input=input, text=True, capture_output=True,
                                     env=env or self.env, timeout=timeout)
@@ -906,10 +926,28 @@ class Rollout:
                 state = None
             require(isinstance(state,dict) and state.get('Running') is False and state.get('Restarting') is False and state.get('Status') == 'exited',
                     f'the Compose sandbox-runner {identifier[:12]} is not stopped; stop it with the closed-door step first, so its own template stops the work inside')
-            require(state.get('ExitCode') == 0,
-                    f'the Compose sandbox-runner {identifier[:12]} exited {state.get("ExitCode")}, not 0, so the stop inside the sandbox is not proved; inspect it before upgrading')
-            seen.append({'id':identifier,'exit_code':0,'finished_at':state.get('FinishedAt')})
+            code = state.get('ExitCode')
+            if code == 0:
+                seen.append({'id':identifier,'exit_code':0,'finished_at':state.get('FinishedAt')})
+                continue
+            # The same rule as rollout-quiesce --final: any other exit is accepted
+            # only once it is proved that nothing runs inside the sandbox.
+            meaning = SUPERVISOR_EXITS.get(code,'it ended without its own clean stop (killed or crashed)')
+            inside = self.inside_supervision()
+            busy = inside['containers']+(['a live supervisor process'] if inside['record_live'] else [])+(['the supervisor\'s lock held'] if inside['lock_held'] else [])
+            require(not busy,f'sandbox-runner exited {code}: {meaning}; and inside the sandbox there is still {", ".join(busy)}, so nothing was changed. Stop the bootstrap\'s work inside the sandbox (its stop word, as the supervisor\'s log says), then run this step again')
+            seen.append({'id':identifier,'exit_code':code,'finished_at':state.get('FinishedAt'),'meaning':meaning,
+                         'accepted_because':'nothing runs inside the sandbox: no helper or runner container, no live supervisor and no held lock','inside':inside})
         return {'present':True,'containers':seen}
+
+    def inside_supervision(self):
+        names = sorted(self.inside(self.sandbox_docker,'ps','-a','--no-trunc',
+                                   '--filter',f'name=^{self.prefix}-helper$','--filter',f'name=^{self.prefix}-runner$',
+                                   '--format','{{.Names}}').stdout.split())
+        supervisor = self.read_state()['supervisor']
+        require(isinstance(supervisor,dict) and all(type(supervisor.get(k)) is bool for k in ('record_live','lock_held')),
+                'the sandbox did not say whether its supervisor still runs; look inside it')
+        return {'containers':names,'record_live':supervisor['record_live'],'lock_held':supervisor['lock_held'],'record_present':bool(supervisor.get('record_present'))}
 
     def factory_containers_absent(self):
         names = self.inside(self.sandbox_docker,'ps','-a','--no-trunc',
@@ -917,11 +955,17 @@ class Rollout:
                             '--format','{{.Names}}').stdout.split()
         require(not names, f'{", ".join(names)} still exists inside {self.s["name"]}; the previous supervisor\'s stop did not finish, so inspect it before upgrading')
 
-    def sandbox_state(self):
+    def read_state(self):
         files = {'template':self.s['script_path'],'profile':self.s['profile_path'],'settings':str(self.settings_path)}
         out = self.inside('python3','-c',STATE,json.dumps({'files':files,'clone':self.s['clone_path'],'script':self.s['script_path'],'excluded':self.excluded_roots})).stdout
         state = json.loads(out)
-        require(isinstance(state,dict) and set(state.get('files',{})) == set(files) and set(state.get('identity',{})) == {'user.name','user.email'},
+        require(isinstance(state,dict) and set(state.get('files',{})) == set(files),'the sandbox state is unreadable; inspect the clone before upgrading')
+        return state
+
+    def sandbox_state(self):
+        files = {'template','profile','settings'}
+        state = self.read_state()
+        require(set(state.get('identity',{})) == {'user.name','user.email'},
                 'the sandbox state is unreadable; inspect the clone before upgrading')
         supervisor = state['supervisor']
         require(not supervisor['record_live'] and not supervisor['lock_held'],
@@ -1189,7 +1233,7 @@ def main(argv=None):
     parser.add_argument('--project',required=True)
     parser.add_argument('--secret-env-file',action='append',default=[],help='private literal env input, repeatable; cannot override public names')
     parser.add_argument('--stop-legacy',action='store_true',help='perform the one-time legacy stop, verify, and replacement')
-    parser.add_argument('--upgrade',action='store_true',help='take a new release into a sandbox the containerised supervisor already looks after (its supervisor stopped first)')
+    parser.add_argument('--upgrade',action='store_true',help='take a new release into a sandbox the containerised supervisor already looks after (its supervisor stopped first). --upgrade and --upgrade --back each run within '+str(UPGRADE_LIMIT_SECONDS)+' seconds overall: every command is bounded by what is left, and none is started after it')
     parser.add_argument('--back',action='store_true',help='with --upgrade: put the saved previous installation back')
     parser.add_argument('--previous-receipt',help='with --upgrade: the installed sandbox-installed.json')
     parser.add_argument('--plan',action='store_true')
@@ -1200,6 +1244,7 @@ def main(argv=None):
         require(not args.back or args.upgrade, '--back goes with --upgrade; say --upgrade --back')
         rollout = Rollout(args)
         if args.upgrade:
+            rollout.deadline = time.monotonic() + UPGRADE_LIMIT_SECONDS
             rollout.validate_upgrade_inputs()
             if args.plan and args.back:
                 print('Plan only (--upgrade --back): nothing is changed. Would require the Compose sandbox-runner stopped with exit 0 (or removed), no helper or runner container and no live supervisor inside '+rollout.s['name']+', and the previous release image '+rollout.previous['bootstrap_image_settings']['FORGE_IMAGE']+' in its engine by identity; check every copy saved in '+str(rollout.previous_dir)+' against its hash and the previous bootstrap env against its recorded hash; put back the template, profile and settings file byte for byte (a generated settings file with no earlier one is left in place; release -2 never reads it) and the clone-local git identity values exactly; record sandbox-restored.json. Never sbx stop, sbx ports, sbx policy or systemctl unmask.')
