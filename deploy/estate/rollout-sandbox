@@ -5,7 +5,12 @@ Private inventory: common project/env_file/runtime_image/docker_context and unit
 runner/keeper, plus sandbox:{name, clone_path, known_files, receipts_path,
 script_path, profile_path, profile_source, systemd_user_dir, evidence_dir,
 remote_ref, remote_name, declared_remote, declaration_files, release_image,
-expected_sbx_version, legacy_dropins, legacy_command_markers, forbidden_values}.
+expected_sbx_version, legacy_dropins, legacy_command_markers, forbidden_values,
+settings_path, repo_keys, worktree_disk_floor_gb} and volumes.settings (the
+coordinator's settings volume, read only through a read-only helper container).
+The sandbox's own settings file (release -3 TC5) is generated from the
+coordinator's settings and holds only what the in-sandbox helper and runner
+read; FORGE_CONFIG_PATH in the bootstrap env names it.
 Routes come ONLY from the explicit env file: FACTORY_GATEWAY_ADDRESS,
 FORGE_TARGET_OWNER_URL, FORGE_SANDBOX_SIDECAR_URL, FORGE_SANDBOX_RUNNER_URL,
 FLEET_MEMORY_PORT (the memory MCP's gateway publish port, as compose.yaml uses it).
@@ -190,7 +195,11 @@ try:
  # Validate every destination and stage every byte before replacing any file.
  for item in items:
   path=pathlib.Path(item['path']); root=pathlib.Path(item['root']); data=base64.b64decode(item['data'],validate=True)
+  if item.get('parent_mode') is not None and not path.parent.exists():
+   # The sandbox settings folder: made once, owner-writable only.
+   os.makedirs(path.parent,mode=item['parent_mode']); os.chmod(path.parent,item['parent_mode'])
   assert path.is_absolute() and path.parent.is_dir() and not path.is_symlink()
+  assert item.get('parent_mode') is None or path.parent.stat().st_mode & 0o022 == 0
   assert path.parent.resolve().is_relative_to(root.resolve())
   fd,tmp=tempfile.mkstemp(prefix='.rollout-',dir=path.parent)
   staged.append((path,tmp,data))
@@ -207,6 +216,48 @@ try:
 finally:
  for path,tmp,data in staged:
   if os.path.exists(tmp): os.unlink(tmp)
+'''
+
+
+# The sandbox's own settings file (release -3 TC5), generated in the runtime
+# image from the coordinator's settings (mounted read-only) and checked there
+# with load_config and an EMPTY environment, so no ${NAME} can hide in it. It
+# carries only what the in-sandbox helper and runner read: the repository map
+# (each key to the sandbox's own clone), the routine seat and its timeout
+# multiplier, the filesystem allowlist and the worktree disk floor.
+SETTINGS = r'''
+import hashlib,json,os,pathlib,sys,tempfile,yaml
+p=json.load(sys.stdin); src=pathlib.Path(sys.argv[1])
+assert src.is_file() and not src.is_symlink()
+raw=src.read_bytes(); doc=yaml.safe_load(raw)
+assert isinstance(doc,dict)
+planning=doc.get('planning') or {}; sandboxes=planning.get('sandboxes') or {}
+assert isinstance(sandboxes,dict)
+unmapped=[k for k in p['repo_keys'] if not isinstance(sandboxes.get(k),dict) or sandboxes[k].get('name')!=p['sandbox']]
+if unmapped:
+ print(json.dumps({'unmapped':unmapped})); sys.exit(0)
+routine=doc.get('routine') or {}
+assert isinstance(routine,dict)
+chosen={k:routine[k] for k in ('seat','timeout_multiplier') if routine.get(k) is not None}
+out={'planning':{'target_repo_paths':{k:p['clone_path'] for k in p['repo_keys']}}}
+if chosen: out['routine']=chosen
+out['resource_preflight']={'min_available_disk_gb':p['floor']}
+out['permissions']={'filesystem':{'allowlist':[p['clone_path']]}}
+text=yaml.safe_dump(out,sort_keys=False)
+assert '${' not in text
+os.environ.clear()
+from forge.config.loader import load_config
+fd,t=tempfile.mkstemp(suffix='.yaml')
+try:
+ with os.fdopen(fd,'w') as f: f.write(text)
+ cfg=load_config(pathlib.Path(t),environ={})
+finally:
+ os.unlink(t)
+assert dict(cfg.planning.target_repo_paths)==out['planning']['target_repo_paths']
+assert [str(x) for x in cfg.permissions.filesystem.allowlist]==[p['clone_path']]
+assert float(cfg.resource_preflight.min_available_disk_gb)==float(p['floor'])
+assert cfg.routine.seat==chosen.get('seat') and cfg.routine.timeout_multiplier==chosen.get('timeout_multiplier')
+print(json.dumps({'text':text,'seat':chosen.get('seat'),'timeout_multiplier':chosen.get('timeout_multiplier'),'coordinator_settings_sha256':hashlib.sha256(raw).hexdigest()}))
 '''
 
 
@@ -302,6 +353,7 @@ class Rollout:
         require(effective_receipts == s['receipts_path'], 'effective forwarded receipts path differs from sandbox.receipts_path or is missing; declare and forward the matching receipt setting before stopping the sandbox')
         if self.values['FLEET_MEMORY_ENABLED'] == 'true':
             require(all(self.values.get(name) for name in MEMORY_NAMES), 'enabled memory lacks explicit private values; supply all seven names through the named files')
+        self.validate_settings_inputs()
         self.evidence = Path(s['evidence_dir'])
         forbidden = [ROOT.resolve(),Path(s['profile_source']).resolve().parent]
         forbidden += [Path(x).resolve() for x in c['forbidden_roots']]
@@ -314,6 +366,64 @@ class Rollout:
         self.stop_proved = False
         self.replacement_started = False
         self.complete = False
+
+    def validate_settings_inputs(self):
+        """The sandbox settings file's inventory keys (release -3 TC5)."""
+        s = self.s
+        path = s.get('settings_path')
+        require(isinstance(path,str) and PurePosixPath(path).is_absolute() and '..' not in PurePosixPath(path).parts and len(PurePosixPath(path).parts) > 2 and PurePosixPath(path).name.endswith(('.yaml','.yml')),
+                'sandbox.settings_path is not an absolute .yaml file path; name the sandbox settings file explicitly')
+        self.settings_path = PurePosixPath(path)
+        # Outside the clone and every shared folder: no build's read-write
+        # mount, git clean or scratch tool may reach it.
+        shared = {'sandbox.clone_path':s['clone_path'],'sandbox.receipts_path':s['receipts_path']}
+        shared.update({name:value for name,value in self.forwarded_values.items()
+                       if name != 'FORGE_CONFIG_PATH' and value.startswith('/') and not any(c in value for c in ' :,')})
+        for name, folder in shared.items():
+            require(not self.settings_path.is_relative_to(PurePosixPath(folder)) and not PurePosixPath(folder).is_relative_to(self.settings_path),
+                    f'sandbox.settings_path is inside {name}, a folder the sandbox shares or builds write; choose a path on the sandbox root filesystem outside the clone and every shared folder')
+        keys = s.get('repo_keys')
+        require(isinstance(keys,list) and keys and len(set(keys)) == len(keys) and all(isinstance(x,str) and re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+',x) for x in keys),
+                'sandbox.repo_keys must list distinct org/name repository keys; name the repositories this sandbox builds')
+        floor = s.get('worktree_disk_floor_gb')
+        require(isinstance(floor,(int,float)) and not isinstance(floor,bool) and floor > 0,
+                'sandbox.worktree_disk_floor_gb must be a positive number of GiB; name the worktree disk floor')
+        volume = self.config.get('volumes',{}).get('settings') if isinstance(self.config.get('volumes'),dict) else None
+        require(isinstance(volume,str) and re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_.-]+',volume),
+                "volumes.settings does not name the coordinator's settings volume; name it in the private inventory")
+        self.settings_volume = volume
+        require('FORGE_CONFIG_PATH' in self.forwarded_names,
+                'FORGE_CONFIG_PATH is not in SANDBOX_ENV_NAMES, so the sandbox services would never be told where their settings file is; add the name')
+        require(self.values.get('FORGE_CONFIG_PATH','') in ('',str(self.settings_path)),
+                'FORGE_CONFIG_PATH in the env file names another file than sandbox.settings_path; leave it unset or name the same file')
+
+    def sandbox_settings(self):
+        """Generate and validate the sandbox settings file; changes nothing."""
+        context = self.config['docker_context']
+        try:
+            listing = json.loads(self.run(['docker','--context',context,'volume','inspect',self.settings_volume]).stdout)
+        except ValueError:
+            listing = None
+        require(isinstance(listing,list) and len(listing) == 1 and listing[0].get('Name') == self.settings_volume
+                and (listing[0].get('Labels') or {}).get('com.docker.compose.project') == self.args.project,
+                f"the coordinator's settings volume {self.settings_volume} is missing or not this project's; name the estate's own settings volume")
+        payload = {'repo_keys':self.s['repo_keys'],'sandbox':self.s['name'],'clone_path':self.s['clone_path'],'floor':self.s['worktree_disk_floor_gb']}
+        out = self.run(['docker','--context',context,'run','--rm','--pull=never','--network=none','--read-only',
+                        '--tmpfs','/tmp:rw,noexec,nosuid','--user','0:0','--cap-drop','ALL','--cap-add','DAC_OVERRIDE',
+                        '--security-opt','no-new-privileges',
+                        '--mount',f'type=volume,src={self.settings_volume},dst=/coordinator-settings,readonly',
+                        '-i','--entrypoint','python',self.config['runtime_image'],'-c',SETTINGS,'/coordinator-settings/forge.yaml'],
+                       input=json.dumps(payload)).stdout
+        result = json.loads(out)
+        require('unmapped' not in result,
+                "sandbox.repo_keys names repositories the coordinator's planning.sandboxes does not give to "+self.s['name']+': '+', '.join(result.get('unmapped',[]))+'; name only this sandbox\'s repositories')
+        text = result['text']
+        require(isinstance(text,str) and '${' not in text, 'generated sandbox settings still hold a ${NAME}; the file would not load in the sandbox')
+        result['sha256'] = digest(text.encode())
+        return result
+
+    def settings_item(self, text):
+        return {'path':str(self.settings_path),'root':str(self.settings_path.parent),'data':base64.b64encode(text.encode()).decode(),'mode':0o644,'parent_mode':0o755}
 
     def run(self, argv, *, input=None, check=True, timeout=120, env=None):
         try:
@@ -485,19 +595,21 @@ class Rollout:
         require(valid_version, 'sandbox client or server version/state is not the reviewed running v0.42.1 contract; verify its stopped-status contract first')
         profile = self.profile()  # Parse/validate before touching any unit.
         self.validate_bootstrap_ports(profile)
+        settings = self.sandbox_settings()  # Generated and loaded before touching any unit.
         receipt = self.evidence / 'sandbox-installed.json'
         if receipt.exists():
             previous = json_read(receipt)
             require(previous.get('project') == self.args.project and previous.get('sandbox') == self.s['name'] and previous.get('image') == self.config['runtime_image'] and previous.get('template_sha256') == digest(self.template), 'installation receipt differs from this rollout; reconcile the existing installation')
-            for path, data in ((self.s['script_path'],self.template),(self.s['profile_path'],profile['text'].encode())):
+            for path, data in ((self.s['script_path'],self.template),(self.s['profile_path'],profile['text'].encode()),(str(self.settings_path),settings['text'].encode())):
                 out = self.inside('sha256sum',path).stdout.split()
                 require(out and out[0] == digest(data), f'installed file differs at {path}; reconcile without re-running legacy shutdown')
             require(Path(self.s['profile_source']).read_bytes() == profile['text'].encode(), 'producer profile differs from the installed profile; reconcile its routes')
-            settings = previous['bootstrap_image_settings']
+            image_settings = previous['bootstrap_image_settings']
             reviewed = self.reviewed_image_settings()
-            require(settings.get('FORGE_IMAGE') == self.s['release_image'] and all(settings.get(name) == value for name,value in reviewed.items()), 'existing installation identity differs from the reviewed immutable image; reconcile its receipt and runner settings')
+            require(image_settings.get('FORGE_IMAGE') == self.s['release_image'] and all(image_settings.get(name) == value for name,value in reviewed.items()), 'existing installation identity differs from the reviewed immutable image; reconcile its receipt and runner settings')
             expected = {name:self.values[name] for name in self.forwarded_names if name in self.values}
-            expected.update(settings)
+            expected.update(image_settings)
+            expected['FORGE_CONFIG_PATH'] = str(self.settings_path)
             encoded = ''.join(name+'='+json.dumps(value.replace('$','$$'),ensure_ascii=False)+'\n' for name,value in sorted(expected.items()))
             require(self.bootstrap_env.read_bytes() == encoded.encode(), 'normal runner env file differs from explicit inputs; reconcile it before starting the sandbox service')
             print('Sandbox replacement already matches the current template and profile; legacy shutdown was not repeated.')
@@ -558,7 +670,7 @@ class Rollout:
                 self.sbx('ports',self.s['name'],'--unpublish',old)
             self.sbx('ports',self.s['name'],'--publish',new)
         # Never start a service here. Only the reviewed template can be exposed.
-        items = [{'path':self.s['script_path'],'root':self.s['clone_path'],'data':base64.b64encode(self.template).decode(),'mode':0o755}, {'path':self.s['profile_path'],'root':self.s['clone_path'],'data':base64.b64encode(profile['text'].encode()).decode(),'mode':0o644}]
+        items = [self.settings_item(settings['text']), {'path':self.s['script_path'],'root':self.s['clone_path'],'data':base64.b64encode(self.template).decode(),'mode':0o755}, {'path':self.s['profile_path'],'root':self.s['clone_path'],'data':base64.b64encode(profile['text'].encode()).decode(),'mode':0o644}]
         self.replacement_started = True
         self.inside('python3','-c',INSTALL,input=json.dumps(items))
         private_write(Path(self.s['profile_source']),profile['text'].encode(),0o644)
@@ -566,6 +678,7 @@ class Rollout:
         # normal run.sh forwards only SANDBOX_ENV_NAMES, unchanged by this tool.
         bootstrap = {name:self.values[name] for name in self.forwarded_names if name in self.values}
         bootstrap.update(image_settings)
+        bootstrap['FORGE_CONFIG_PATH'] = str(self.settings_path)
         encoded = ''.join(name+'='+json.dumps(value.replace('$','$$'),ensure_ascii=False)+'\n' for name,value in sorted(bootstrap.items()))
         private_write(self.bootstrap_env,encoded.encode())
         require(self.bootstrap_env.read_bytes() == encoded.encode(), 'normal runner env file readback differs; reconcile the private operational output')
@@ -580,7 +693,7 @@ class Rollout:
         for unit in self.units.values():
             self.stopped(unit)
         self.save('commands.json',self.events)
-        self.save('sandbox-installed.json',{'format_version':1,'project':self.args.project,'sandbox':self.s['name'],'image':self.config['runtime_image'],'template_sha256':digest(self.template),'profile_sha256':digest(profile['text'].encode()),'answer_rule':self.answer,'memory_mcp_rule':self.memory_mcp,'disk_before':before,'disk_after':after,'bootstrap_image_settings':image_settings,'bootstrap_env_file':str(self.bootstrap_env),'bootstrap_env_names':sorted(bootstrap),'legacy_units':'masked','remote_fetch_through_normal_entry':'NOT-TESTED','memory_forwarded_names':list(MEMORY_NAMES),'actual_memory_read_write':'NOT-TESTED'})
+        self.save('sandbox-installed.json',{'format_version':1,'project':self.args.project,'sandbox':self.s['name'],'image':self.config['runtime_image'],'template_sha256':digest(self.template),'profile_sha256':digest(profile['text'].encode()),'answer_rule':self.answer,'memory_mcp_rule':self.memory_mcp,'disk_before':before,'disk_after':after,'bootstrap_image_settings':image_settings,'bootstrap_env_file':str(self.bootstrap_env),'bootstrap_env_names':sorted(bootstrap),'settings_path':str(self.settings_path),'settings_sha256':settings['sha256'],'coordinator_settings_sha256':settings['coordinator_settings_sha256'],'routine_seat':settings['seat'],'worktree_disk_floor_gb':self.s['worktree_disk_floor_gb'],'legacy_units':'masked','remote_fetch_through_normal_entry':'NOT-TESTED','memory_forwarded_names':list(MEMORY_NAMES),'actual_memory_read_write':'NOT-TESTED'})
         self.complete = True
         print('Current template and producer profile installed and read back; both old host units stay masked and stopped; actual memory read/write and normal lifecycle checks remain required.')
 
@@ -598,7 +711,7 @@ def main(argv=None):
     try:
         rollout = Rollout(args)
         if args.plan:
-            print('Plan only: remote, systemd, sandbox, image and disk facts are NOT VERIFIED. Would validate profile in the pinned image; record clone, known-file hashes, receipt listing and process diagnostics; empty and prove both runner stop hooks; stop and mask keeper then runner; refuse held sessions; stop only '+rollout.s['name']+'; require positive stopped status; wake with our exec; refuse any running container or legacy process; compare every disk witness; hand in the release with the normal identity helper; add sandbox-scoped routes (answer service '+rollout.answer+', memory MCP '+rollout.memory_mcp+'); install the current template byte-for-byte and rewrite producer profile paths/publish rules; remove legacy drop-ins; leave both old units masked and stopped (never unmasked); record evidence.')
+            print('Plan only: remote, systemd, sandbox, image and disk facts are NOT VERIFIED. Would validate profile in the pinned image; record clone, known-file hashes, receipt listing and process diagnostics; empty and prove both runner stop hooks; stop and mask keeper then runner; refuse held sessions; stop only '+rollout.s['name']+'; require positive stopped status; wake with our exec; refuse any running container or legacy process; compare every disk witness; hand in the release with the normal identity helper; write the sandbox settings file at '+str(rollout.settings_path)+' (generated from the coordinator\'s settings, loaded in the image with an empty environment); add sandbox-scoped routes (answer service '+rollout.answer+', memory MCP '+rollout.memory_mcp+'); install the current template byte-for-byte and rewrite producer profile paths/publish rules; remove legacy drop-ins; leave both old units masked and stopped (never unmasked); record evidence.')
             return 0
         require(args.stop_legacy, 'one-time replacement requires --stop-legacy; inspect --plan before the attended rollout')
         rollout.execute()
