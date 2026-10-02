@@ -35,6 +35,11 @@
 #      last session ends. When the sandbox carries the factory, start the
 #      runner unit too: it holds deploy/sandbox-runner.sh open inside the
 #      sandbox, which brings up the factory's two services there.
+#      NOT on a machine whose estate looks after the sandbox with its Compose
+#      supervisor: a masked unit is skipped, and a container on this machine's
+#      Docker engine labelled com.guardkit.sandbox-supervisor=<SANDBOX_NAME>
+#      skips both. If either question cannot be answered, nothing is started
+#      or deployed (exit 2). Asked before step 1.
 #   4. Run deploy/deploy.sh inside the sandbox and exit with its exit code,
 #      unchanged, so a failing deploy still fails the stage.
 #
@@ -338,8 +343,64 @@ run_deploy_inside() {
   return "${rc}"
 }
 
+# --- step 3, first: who looks after this sandbox? ---------------------------
+# (Release -3 upgrade design, 2.4 and TC6, 1 October 2026.) On a machine whose
+# estate runs the sandbox's supervisor as a Compose container, the two host
+# units must never start: the runner unit's stop step would end the LIVE
+# Compose supervisor (its process record names the same script), take both of
+# the factory's containers in the sandbox down with it, and then restart every
+# five seconds against it. Two questions, asked before anything is created,
+# started or deployed:
+#   (a) is a unit masked? A masked unit is skipped, with a sentence;
+#   (b) does this machine's Docker engine hold a container, in any state,
+#       labelled com.guardkit.sandbox-supervisor=<this sandbox>? Then BOTH
+#       unit starts are skipped; the deploy itself still runs.
+# A question that cannot be answered (systemctl or docker failing) is a
+# refusal, exit 2, before any unit starts and before any deploy. With neither
+# condition this script starts both units exactly as it always has.
+SUPERVISOR_LABEL="com.guardkit.sandbox-supervisor"
+SUPERVISOR_CONTAINER="absent"
+KEEPER_STATE="unmasked"
+RUNNER_STATE="unmasked"
+
+# Sets UNIT_STATE to "masked" or "unmasked"; never prints into a capture, so
+# its refusal is always seen.
+UNIT_STATE=""
+unit_file_state() {
+  local unit="$1" state
+  if ! state="$(systemctl --user show -p UnitFileState --value "${unit}" 2>/dev/null)"; then
+    log "FATAL: systemctl would not say whether ${unit} is masked, so it cannot be told whether the estate's Compose supervisor looks after ${SANDBOX_NAME}. Starting the unit on top of that supervisor would take the factory's containers down. Nothing was started and nothing was deployed. Refusing."
+    exit 2
+  fi
+  case "${state}" in
+    masked|masked-runtime) UNIT_STATE="masked" ;;
+    *) UNIT_STATE="unmasked" ;;
+  esac
+}
+
+who_looks_after_the_sandbox() {
+  local found
+  if ! found="$(docker ps -a -q --filter "label=${SUPERVISOR_LABEL}=${SANDBOX_NAME}" 2>/dev/null)"; then
+    log "FATAL: this machine's Docker engine would not say whether a container labelled ${SUPERVISOR_LABEL}=${SANDBOX_NAME} exists, so it cannot be told whether the estate's Compose supervisor looks after this sandbox. Starting the host units on top of that supervisor would take the factory's containers down. Nothing was started and nothing was deployed. Refusing."
+    exit 2
+  fi
+  if [[ -n "${found}" ]]; then
+    SUPERVISOR_CONTAINER="present"
+  fi
+  unit_file_state "${KEEPER_UNIT}"
+  KEEPER_STATE="${UNIT_STATE}"
+  if carries_the_factory; then
+    unit_file_state "${RUNNER_UNIT}"
+    RUNNER_STATE="${UNIT_STATE}"
+  fi
+}
+
 main() {
   log "repo_root=${REPO_ROOT} sandbox=${SANDBOX_NAME}"
+
+  # Asked before anything is created, started or deployed, so a refusal here
+  # changes nothing.
+  who_looks_after_the_sandbox
 
   if sandbox_exists; then
     log "sandbox ${SANDBOX_NAME} already exists"
@@ -353,12 +414,24 @@ main() {
     allow_network
   fi
 
-  log "starting the keeper so the sandbox stays awake: ${KEEPER_UNIT}"
-  systemctl --user start "${KEEPER_UNIT}"
+  if [[ "${SUPERVISOR_CONTAINER}" == present ]]; then
+    log "a container labelled ${SUPERVISOR_LABEL}=${SANDBOX_NAME} is on this machine's Docker engine: the estate's Compose supervisor looks after this sandbox, so neither ${KEEPER_UNIT} nor ${RUNNER_UNIT} is started"
+  else
+    if [[ "${KEEPER_STATE}" == masked ]]; then
+      log "${KEEPER_UNIT} is masked: the estate's Compose supervisor looks after this sandbox, so the keeper is not started"
+    else
+      log "starting the keeper so the sandbox stays awake: ${KEEPER_UNIT}"
+      systemctl --user start "${KEEPER_UNIT}"
+    fi
 
-  if carries_the_factory; then
-    log "starting the factory's services inside the sandbox: ${RUNNER_UNIT}"
-    systemctl --user start "${RUNNER_UNIT}"
+    if carries_the_factory; then
+      if [[ "${RUNNER_STATE}" == masked ]]; then
+        log "${RUNNER_UNIT} is masked: the estate's Compose supervisor looks after this sandbox, so the runner unit is not started"
+      else
+        log "starting the factory's services inside the sandbox: ${RUNNER_UNIT}"
+        systemctl --user start "${RUNNER_UNIT}"
+      fi
+    fi
   fi
 
   local rc=0
