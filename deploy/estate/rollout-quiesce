@@ -310,7 +310,7 @@ class Estate:
         need(re.fullmatch(r'\d{8}T\d{6}Z(?:-[A-Za-z0-9_-]+)?',self.snapshot.name),'snapshot is not a dated path; name its exact future or existing directory')
         need(self.snapshot.parent==r.path(self.c['snapshot_root']),'snapshot is outside the declared root; select its dated child')
         need(args.project==self.c['project'] and args.env_file==self.c['env_file'],'explicit env or project conflicts with inventory; select the intended phase inventory')
-        need(re.fullmatch(r'[a-z0-9][a-z0-9_-]+',args.project) and self.c['runtime_image']==r.RUNTIME,'estate project or runtime identity is invalid; use the accepted explicit release')
+        need(re.fullmatch(r'[a-z0-9][a-z0-9_-]+',args.project) and self.c['runtime_image']==r.release(self.c)[1]['runtime'],'estate project or runtime identity is invalid; use the accepted explicit release')
         need(set(self.c['volumes'])==r.VOLUME_ROLES and len(set(self.c['volumes'].values()))==5,'five distinct state volumes are required; correct the explicit inventory')
         need(set(self.c['units'])==r.UNIT_ROLES and set(self.c['old_containers'])=={'coordinator','memory','relay'} and len(set(self.c['units'].values()))==len(r.UNIT_ROLES) and len(set(self.c['old_containers'].values()))==3,'legacy identities are incomplete or repeated; name exactly the distinct recorded units and three containers')
         need(all(re.fullmatch('[a-zA-Z0-9][a-zA-Z0-9_.-]+',name) for name in self.c['volumes'].values()),'state volume name is invalid; use five explicit named volumes')

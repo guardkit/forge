@@ -974,8 +974,10 @@ the design:
    tested image *by digest* and records the digest it replaces. `.env.example`
    names release tags, `estate-check` item 4 looks for those tags, and its own
    sentence says so. The rollout tools do not trust those tags: they bind
-   immutable local image IDs, `RUNTIME` for the coordinator and answer service
-   and `PUBLISHER_RUNTIME` for the publisher in `rollout_support.py`, and refuse
+   immutable local image IDs, one reviewed entry per release in the `RELEASES`
+   table of `rollout_support.py` (the coordinator and answer service, the
+   publisher, memory, its relay and jarvis; an inventory names its `release`),
+   and refuse
    when `FORGE_IMAGE`, the rendered services or the running containers name any
    other image, or when the release tag no longer resolves to it. In the
    sandbox, `FORGE_IMAGE_IDENTITY` is a hash of the image's platform, layers and
