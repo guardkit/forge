@@ -74,7 +74,7 @@ import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol, Sequence
+from typing import Any, Protocol, Sequence
 
 __all__ = [
     "DECLARATION_KEY",
@@ -152,8 +152,12 @@ class RepositoryReader(Protocol):
         """Every file the repository tracks. Raises
         :class:`RepositoryUnreadable` when the repository cannot be read."""
 
-    def files_mentioning(self, text: str, *, ignore_case: bool = False) -> list[str]:
-        """The tracked files whose text contains ``text`` literally. Raises
+    def files_mentioning(
+        self, text: str, *, ignore_case: bool = False, relevant: Any = None
+    ) -> list[str]:
+        """The tracked files whose text contains ``text`` literally.
+        ``relevant`` (optional) names the files the caller can use, so a
+        reader that must recover a cut answer recovers only those. Raises
         :class:`RepositoryUnreadable` when the repository cannot be read."""
 
     def places_mentioning(self, text: str) -> list[str]:
@@ -162,8 +166,10 @@ class RepositoryReader(Protocol):
 
     def read_text(self, path: str) -> str | None:
         """One tracked file's text; ``None`` when that one file cannot be
-        served (too large, not text). Raises :class:`RepositoryUnreadable`
-        when the repository itself cannot be read."""
+        served (too large, not text) — and then the reason is kept in the
+        reader's ``refused`` mapping, by path, so a caller can say it.
+        Raises :class:`RepositoryUnreadable` when the repository itself
+        cannot be read."""
 
 
 class LocalCheckoutReader:
@@ -182,6 +188,8 @@ class LocalCheckoutReader:
         self._timeout_s = timeout_s
         self._search_timeout_s = search_timeout_s
         self.where = f"the checkout at {self._root}"
+        #: Why each file that could not be served was refused, by path.
+        self.refused: dict[str, str] = {}
 
     def _check_root(self) -> None:
         if not self._root.is_dir():
@@ -233,7 +241,9 @@ class LocalCheckoutReader:
             )
         return [line for line in completed.stdout.splitlines() if line.strip()]
 
-    def files_mentioning(self, text: str, *, ignore_case: bool = False) -> list[str]:
+    def files_mentioning(
+        self, text: str, *, ignore_case: bool = False, relevant: Any = None
+    ) -> list[str]:
         args = ["-l", "-F"] + (["-i"] if ignore_case else []) + ["-e", text]
         return [line.strip() for line in self._grep(*args)]
 
@@ -247,11 +257,25 @@ class LocalCheckoutReader:
         self._check_root()
         try:
             data = (self._root / path).read_bytes()
-        except OSError:
+        except OSError as exc:
+            self.refused[path] = f"it could not be opened ({type(exc).__name__})"
             return None
-        if len(data) > _MAX_READ_BYTES or b"\0" in data[:8192]:
+        if len(data) > _MAX_READ_BYTES:
+            self.refused[path] = (
+                f"it is {len(data)} bytes, over the {_MAX_READ_BYTES}-byte limit for one file"
+            )
+            return None
+        if b"\0" in data[:8192]:
+            self.refused[path] = "it is not text"
             return None
         return data.decode("utf-8", errors="replace")
+
+
+def _not_read(reader: Any, path: str) -> str:
+    """One plain sentence for a file the reader would not serve, with its
+    reason when the reader kept one."""
+    why = (getattr(reader, "refused", None) or {}).get(path)
+    return f"`{path}` could not be read ({why or 'it was not served'})"
 
 
 # ---------------------------------------------------------------------------
@@ -628,7 +652,7 @@ def _model_sentence(file: str, fact: ModelFact) -> str:
 
 
 def _declared_paths(
-    reader: RepositoryReader, tracked: Sequence[str]
+    reader: RepositoryReader, tracked: Sequence[str], unread: list[str] | None = None
 ) -> tuple[tuple[str, ...] | None, tuple[str, ...] | None, str | None]:
     """``(data_models, migrations, note)`` from the project's own declaration.
 
@@ -641,7 +665,13 @@ def _declared_paths(
         return None, None, None
     text = reader.read_text(DECLARATION_PATH)
     if text is None:
-        return None, None, None
+        if unread is not None:
+            unread.append(_not_read(reader, DECLARATION_PATH))
+        return None, None, (
+            f"The project's declarations could not be read: "
+            f"{_not_read(reader, DECLARATION_PATH)}, so data-model and "
+            "migration files were found by their path words."
+        )
     data, why = _parse(text)
     if data is None:
         return None, None, (
@@ -686,6 +716,7 @@ def _model_sheets(
     route_nouns: Sequence[str],
     test_folders: tuple[str, ...] = (),
     into: list[str] | None = None,
+    unread: list[str] | None = None,
 ) -> list[str]:
     sheets: list[str] = into if into is not None else []
     if declared is not None:
@@ -718,8 +749,11 @@ def _model_sheets(
     for noun in route_nouns:
         route_forms |= _forms(noun)
     mentioned: dict[str, str] = {}
+    candidate_set = set(candidates)
     for noun in list(route_nouns)[:_MAX_NOUN_SEARCHES]:
-        for f in reader.files_mentioning(noun, ignore_case=True):
+        for f in reader.files_mentioning(
+            noun, ignore_case=True, relevant=candidate_set.__contains__
+        ):
             mentioned.setdefault(f, noun)
 
     def _rank(f: str) -> tuple[int, int, str]:
@@ -738,6 +772,8 @@ def _model_sheets(
         if f.endswith((".py", ".pyi")):
             source = reader.read_text(f)
             if source is None:
+                if unread is not None:
+                    unread.append(_not_read(reader, f))
                 continue
             for fact in models_in_python_file(source, words):
                 sheets.append(_model_sentence(f, fact))
@@ -808,6 +844,7 @@ def _route_sheets(
     paths: Sequence[str],
     test_folders: tuple[str, ...] = (),
     into: list[str] | None = None,
+    unread: list[str] | None = None,
 ) -> list[str]:
     """Route facts for the request's paths. One search per first segment —
     ``/users/a`` and ``/users/b`` are the same search — and never a file
@@ -825,17 +862,25 @@ def _route_sheets(
         if len(first) < 3 or first in seen_firsts:
             continue
         seen_firsts.add(first)
-        files = [f for f in reader.files_mentioning(f'"{first}') if _candidate(f)]
+        files = [
+            f for f in reader.files_mentioning(f'"{first}', relevant=_candidate) if _candidate(f)
+        ]
         if not files:
             # Same filter on the wider search: a documentation file that
             # mentions the path is not a file that defines it.
-            files = [f for f in reader.files_mentioning(f'"{first}/') if _candidate(f)]
+            files = [
+                f
+                for f in reader.files_mentioning(f'"{first}/', relevant=_candidate)
+                if _candidate(f)
+            ]
         for file in files[:_MAX_FILES]:
             if file in seen_files:
                 continue
             seen_files.add(file)
             source = reader.read_text(file)
             if source is None:
+                if unread is not None:
+                    unread.append(_not_read(reader, file))
                 continue
             if file.endswith(".py"):
                 facts = routes_in_python_file(source)
@@ -926,14 +971,18 @@ def read_repository_facts(reader: RepositoryReader, request_text: str) -> Reposi
         model_lines: list[str] = []
         migration: str | None = None
         notes: list[str] = []
+        # Files the sheet chose to read and the reader would not serve: each
+        # is said by name and reason, never skipped as if it were not there.
+        unread: list[str] = []
         stopped: str | None = None
         try:
-            _route_sheets(reader, paths, test_folders, into=route_lines)
-            models, migrations, note = _declared_paths(reader, tracked)
+            _route_sheets(reader, paths, test_folders, into=route_lines, unread=unread)
+            models, migrations, note = _declared_paths(reader, tracked, unread)
             if note:
                 notes.append(note)
             _model_sheets(
-                reader, tracked, models, all_words, route_nouns, test_folders, into=model_lines
+                reader, tracked, models, all_words, route_nouns, test_folders,
+                into=model_lines, unread=unread,
             )
             migration = _migration_sheet(tracked, migrations, all_words)
         except RepositoryUnreadable as exc:
@@ -945,6 +994,18 @@ def read_repository_facts(reader: RepositoryReader, request_text: str) -> Reposi
                 "Some of what this sheet read was incomplete, so it may be "
                 "missing facts: " + "; ".join(dict.fromkeys(cuts)) + "."
             )
+        unread = list(dict.fromkeys(unread))
+        if unread and not route_lines and not model_lines and not migration and not stopped:
+            # The files that mattered could not be read and nothing else was
+            # learned: that is "could not read", not "nothing there".
+            return RepositoryFacts(
+                None,
+                unavailable="the files that matter for this request could not be read: "
+                + "; ".join(unread),
+                where=where,
+            )
+        if unread:
+            notes.insert(0, "Not read, so this sheet is incomplete: " + "; ".join(unread) + ".")
         if stopped:
             if not route_lines and not model_lines and not migration:
                 return RepositoryFacts(None, unavailable=stopped, where=where)
@@ -959,7 +1020,7 @@ def read_repository_facts(reader: RepositoryReader, request_text: str) -> Reposi
             _section(notes, _NOTE_SECTION_CHARS, "what was incomplete"),
         ]
         sheet = "\n".join(section for section in sections if section)
-        partial = stopped or ("; ".join(dict.fromkeys(cuts)) if cuts else None)
+        partial = "; ".join([*([stopped] if stopped else []), *unread, *dict.fromkeys(cuts)]) or None
         return RepositoryFacts(_bounded(sheet) if sheet else None, where=where, partial=partial)
     except RepositoryUnreadable as exc:
         return RepositoryFacts(None, unavailable=str(exc) or f"{where} could not be read", where=where)

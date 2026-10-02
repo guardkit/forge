@@ -843,6 +843,22 @@ _REPOSITORY_FACTS_UNAVAILABLE_CARD_LINE = (
     "checked it against what the repository already has ({reason})."
 )
 
+#: The cards' line when the planner read the repository only in part (a file
+#: it chose was refused, or an answer was cut short and could not be
+#: recovered). What was read was used; the reason is shortened for a card.
+_REPOSITORY_FACTS_PARTIAL_CARD_LINE = (
+    "The machine could read the repository only in part while writing this, "
+    "so some of what it already has may not have been checked ({reason})."
+)
+
+
+def _partial_card_line(reason: str) -> str:
+    text = " ".join(str(reason).split())
+    if len(text) > 300:
+        text = text[:299].rstrip() + "\u2026"
+    return _REPOSITORY_FACTS_PARTIAL_CARD_LINE.format(reason=text)
+
+
 #: The card's line when examples are still unprovable after the round — or
 #: when the checker refused the machine's rewrite, so the card opens on the
 #: draft as first written (rule 45, the spec's own words). The titles are
@@ -3393,25 +3409,36 @@ class PlanningRunDriver:
         return "\n".join(parts) if parts else None
 
     def _repository_unavailable_line(self, correlation_id: str) -> str | None:
-        """The plain line for the build gate: the fact sheet's reason, else the
-        plan-writer's descriptor's (its inventory or the specification's
-        words); ``None`` when everything the planner reads was read."""
-        line = self._repository_facts_card_line(correlation_id)
-        if line is not None:
-            return line
+        """The plain line for the build gate: the fact sheet's state, else the
+        plan-writer's descriptor's (its inventory, rules, test folders or the
+        specification's words) — "could not read" before "read only in
+        part"; ``None`` when everything the planner reads was read."""
+        cache = self.__dict__.get("_repository_facts_cache") or {}
+        facts = cache.get(correlation_id)
+        if facts is not None and facts.unavailable:
+            return _REPOSITORY_FACTS_UNAVAILABLE_CARD_LINE.format(reason=facts.unavailable)
         reason = (self.__dict__.get("_descriptor_unavailable") or {}).get(correlation_id)
-        if not reason:
-            return None
-        return _REPOSITORY_FACTS_UNAVAILABLE_CARD_LINE.format(reason=reason)
+        if reason:
+            return _REPOSITORY_FACTS_UNAVAILABLE_CARD_LINE.format(reason=reason)
+        if facts is not None and facts.partial:
+            return _partial_card_line(facts.partial)
+        partly = (self.__dict__.get("_descriptor_partial") or {}).get(correlation_id)
+        if partly:
+            return _partial_card_line("; ".join(dict.fromkeys(partly)))
+        return None
 
     def _repository_facts_card_line(self, correlation_id: str) -> str | None:
         """The card's one line when the planner could not read the
         repository; ``None`` when it could (or never had to)."""
         cache = self.__dict__.get("_repository_facts_cache") or {}
         facts = cache.get(correlation_id)
-        if facts is None or not facts.unavailable:
+        if facts is None:
             return None
-        return _REPOSITORY_FACTS_UNAVAILABLE_CARD_LINE.format(reason=facts.unavailable)
+        if facts.unavailable:
+            return _REPOSITORY_FACTS_UNAVAILABLE_CARD_LINE.format(reason=facts.unavailable)
+        if facts.partial:
+            return _partial_card_line(facts.partial)
+        return None
 
     async def _review_assumptions_on_branch(
         self,
@@ -9859,6 +9886,7 @@ class PlanningRunDriver:
         *,
         reader: Any = None,
         unavailable: list[str] | None = None,
+        partial: list[str] | None = None,
     ) -> dict[str, Any] | None:
         """Read the target repo's own written architecture rules, if it has any.
 
@@ -9894,6 +9922,8 @@ class PlanningRunDriver:
             if reader is not None and not isinstance(reader, LocalCheckoutReader):
                 path = f"{_ARCHITECTURE_RULES_REL} ({getattr(reader, 'where', 'the helper')})"
                 try:
+                    if _ARCHITECTURE_RULES_REL not in set(reader.list_files()):
+                        return None  # the repository keeps no rules file
                     text = reader.read_text(_ARCHITECTURE_RULES_REL)
                 except RepositoryUnreadable as exc:
                     logger.warning(
@@ -9906,6 +9936,16 @@ class PlanningRunDriver:
                         unavailable.append(str(exc))
                     return None
                 if text is None:
+                    # Not there is not the same as there and refused: a
+                    # tracked rules file the helper would not serve is said.
+                    why = (getattr(reader, "refused", None) or {}).get(
+                        _ARCHITECTURE_RULES_REL, "it was not served"
+                    )
+                    if partial is not None:
+                        partial.append(
+                            f"the architecture rules file `{_ARCHITECTURE_RULES_REL}` "
+                            f"could not be read ({why})"
+                        )
                     return None
                 data = yaml.safe_load(text)
             else:
@@ -10382,7 +10422,7 @@ class PlanningRunDriver:
         # this, the plan-writer was never shown them, and two features built the
         # week of 2026-08-24 drifted from rules nobody had told it about.
         architecture_rules = PlanningRunDriver._read_architecture_rules(
-            repo_path, reader=reader, unavailable=reasons
+            repo_path, reader=reader, unavailable=reasons, partial=partial
         )
         if architecture_rules is not None:
             descriptor["architecture_rules"] = architecture_rules

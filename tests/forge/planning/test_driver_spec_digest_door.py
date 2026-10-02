@@ -211,7 +211,9 @@ class _EmptyRepository:
     def list_files(self) -> list[str]:
         return []
 
-    def files_mentioning(self, text: str, *, ignore_case: bool = False) -> list[str]:
+    def files_mentioning(
+        self, text: str, *, ignore_case: bool = False, relevant: Any = None
+    ) -> list[str]:
         return []
 
     def read_text(self, path: str) -> str | None:
@@ -3233,3 +3235,116 @@ async def test_a_sandboxed_repository_is_read_through_its_helper_for_the_coach(
     assert "deleted_at: Mapped[datetime | None] = mapped_column(nullable=True)" in given
     what_happened = _digest_cards(h)[0].payload["details"]["summary"]["what_happened"]
     assert "could not read the repository" not in what_happened
+
+
+# ---------------------------------------------------------------------------
+# Codex round 3, R4: a file the sheet chose and the helper refused reaches the
+# coach and the card — "could not read" alone, "only in part" beside facts.
+# ---------------------------------------------------------------------------
+
+
+def _helper_over_files(tmp_path: Path, files: dict[str, str]):
+    import subprocess
+    import threading
+
+    from forge.config.models import ForgeConfig
+    from forge.deploy_sidecar.service import build_server
+
+    clone = tmp_path / "clone"
+    for rel, text in files.items():
+        (clone / rel).parent.mkdir(parents=True, exist_ok=True)
+        (clone / rel).write_text(text, encoding="utf-8")
+    subprocess.run(["git", "init", "-q", str(clone)], check=True)
+    subprocess.run(["git", "-C", str(clone), "add", "-A"], check=True)
+    subprocess.run(
+        ["git", "-C", str(clone), "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "seed"],
+        check=True,
+    )
+    cfg = ForgeConfig.model_validate(
+        {
+            "permissions": {"filesystem": {"allowlist": ["/tmp"]}},
+            "planning": {"target_repo_paths": {TARGET_REPO: str(clone)}},
+        }
+    )
+    srv = build_server(port=0, config_loader=lambda: cfg)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    host, port = srv.server_address[:2]
+    return f"http://{host}:{port}", srv
+
+
+_HUGE_USERS_MODEL = (
+    "class User:\n    __tablename__ = 'users'\n    deleted_at: Mapped[datetime | None] = mapped_column()\n# "
+    + "x" * 270_000
+    + "\n"
+)
+
+
+async def _drive_with_helper_files(store, tmp_path: Path, files: dict[str, str], sentence: str):
+    from forge.planning.sidecar_git_runner import SidecarCodeReader
+
+    url, srv = _helper_over_files(tmp_path, files)
+    try:
+        git = RecordingGitRunner()
+        git.reader = SidecarCodeReader(url, repo=TARGET_REPO)
+        store.record_queued(
+            correlation_id=CID,
+            originating_user=ORIGINATOR,
+            expected_approver=ORIGINATOR,
+            request_text=sentence,
+            triggered_by="jarvis",
+            target_repo=TARGET_REPO,
+        )
+        h = _make_driver(store, subscriber_factory=SharedScriptFactory([_answer("approve")]), git=git)
+        await h.driver.drive(CID)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+    return h
+
+
+@pytest.mark.asyncio
+async def test_a_refused_model_and_nothing_else_is_could_not_read_on_coach_and_card(
+    store: SqlitePlanningRunStore, tmp_path: Path
+) -> None:
+    h = await _drive_with_helper_files(
+        store, tmp_path, {"src/users/models.py": _HUGE_USERS_MODEL}, "Show users"
+    )
+    given = h.ctx["dispatches"][0]["repository_facts"] or ""
+    assert given.startswith(
+        "Repository facts unavailable: the files that matter for this request "
+        "could not be read: `src/users/models.py` could not be read (the helper answered 400:"
+    )
+    what_happened = _digest_cards(h)[0].payload["details"]["summary"]["what_happened"]
+    assert "The machine could not read the repository while writing this" in what_happened
+    assert "src/users/models.py" in what_happened
+    plan = [d for status, d in _events(store, "feature-plan") if status == "approved"]
+    assert plan and plan[-1]["repository_unavailable"].startswith(
+        "The machine could not read the repository while writing this"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_refused_model_beside_other_facts_is_partly_read_on_coach_and_card(
+    store: SqlitePlanningRunStore, tmp_path: Path
+) -> None:
+    router = (
+        'from fastapi import APIRouter\nrouter = APIRouter(prefix="/users")\n\n'
+        '@router.get("/count-today")\nasync def f() -> int: ...\n'
+    )
+    h = await _drive_with_helper_files(
+        store,
+        tmp_path,
+        {"src/users/models.py": _HUGE_USERS_MODEL, "src/users/router.py": router},
+        'Show users at /users/count-today',
+    )
+    given = h.ctx["dispatches"][0]["repository_facts"] or ""
+    assert "defines GET /users/count-today" in given
+    assert "Not read, so this sheet is incomplete: `src/users/models.py` could not be read" in given
+    what_happened = _digest_cards(h)[0].payload["details"]["summary"]["what_happened"]
+    assert "The machine could read the repository only in part while writing this" in what_happened
+    assert "could not read the repository" not in what_happened
+    # And the plan's record the build gate card reads carries the same state.
+    plan = [d for status, d in _events(store, "feature-plan") if status == "approved"]
+    assert plan and plan[-1]["repository_unavailable"].startswith(
+        "The machine could read the repository only in part while writing this"
+    )
