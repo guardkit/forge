@@ -214,7 +214,11 @@ class TheProjectsCommits:
         self._route = route
         # Over SSH the credential is a key and the host is checked against
         # the pinned file; otherwise git asks for the token as before.
-        self._known_hosts = known_hosts if an_ssh_address(route.remote) else None
+        # An SSH remote ALWAYS takes the pinned-host path: with no file named,
+        # an empty one stands in and every host is refused.
+        self._known_hosts = (
+            (known_hosts or "/dev/null") if an_ssh_address(route.remote) else None
+        )
         self._state = Path(state_dir)
         self._credential = credential
         self._timeout = float(timeout_seconds)

@@ -50,6 +50,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "CREDENTIAL_IS_NOT_SHOWN",
     "Credential",
+    "a_remote_the_publisher_takes",
     "an_ssh_address",
     "CredentialRefusal",
     "read_the_credential",
@@ -213,13 +214,25 @@ def the_askpass_program(credential: Credential, *, state_dir: Path) -> Path:
         return program
 
 
-#: ``ssh://...`` or the short form ``user@host:path``.
-_AN_SSH_ADDRESS = re.compile(r"^(?:ssh://|[A-Za-z0-9._-]+@[A-Za-z0-9.-]+:(?!//))")
+#: The two SSH forms the publisher recognises: ``ssh://user@host/path`` and
+#: ``user@host:path``. Every other way git can spell an SSH address is
+#: refused by the settings (:func:`a_remote_the_publisher_takes`), so no SSH
+#: remote can slip past the pinned-host path.
+_AN_SSH_ADDRESS = re.compile(
+    r"^(?:ssh://[A-Za-z0-9._-]+@[A-Za-z0-9._-]+(?::[0-9]+)?/\S+"
+    r"|[A-Za-z0-9._-]+@[A-Za-z0-9._-]+:(?!/)\S+)$"
+)
 
 
 def an_ssh_address(address: str) -> bool:
     """Is this remote reached over SSH (its credential then being a key)?"""
     return bool(_AN_SSH_ADDRESS.match(str(address or "").strip()))
+
+
+def a_remote_the_publisher_takes(address: str) -> bool:
+    """An ``https://`` address (a token) or a recognised SSH form (a key)."""
+    text = str(address or "").strip()
+    return text.startswith("https://") or an_ssh_address(text)
 
 
 def _the_ssh_command(credential: Credential, known_hosts: str) -> str:
@@ -275,7 +288,7 @@ def the_environment_git_is_given(
         "LC_ALL": "C",
     }
     if credential is not None and credential.held:
-        if known_hosts:
+        if known_hosts is not None:
             given["GIT_SSH_COMMAND"] = _the_ssh_command(credential, known_hosts)
         else:
             given["GIT_ASKPASS"] = str(

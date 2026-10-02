@@ -44,7 +44,9 @@ THE_MADE_UP_KEY = "-----BEGIN OPENSSH PRIVATE KEY-----\nTESTONLY-not-a-key\n"
     "address, ssh",
     [
         ("git@example.invalid:owner/repo.git", True),
+        ("git@build_host.example:owner/repo.git", True),
         ("ssh://git@example.invalid/owner/repo.git", True),
+        ("ssh://git@example.invalid:2222/owner/repo.git", True),
         ("https://example.invalid/owner/repo.git", False),
         ("git://10.0.0.1:9418/repo", False),
         ("/srv/remote.git", False),
@@ -52,6 +54,84 @@ THE_MADE_UP_KEY = "-----BEGIN OPENSSH PRIVATE KEY-----\nTESTONLY-not-a-key\n"
 )
 def test_which_addresses_are_ssh(address: str, ssh: bool) -> None:
     assert an_ssh_address(address) is ssh
+
+
+def _settings_with_remote(tmp_path: Path, remote: str) -> Path:
+    settings = tmp_path / "settings.json"
+    settings.write_text(
+        json.dumps(
+            {
+                "credential_file": "/k",
+                "ledger": "/l",
+                "state_dir": "/s",
+                "known_hosts_file": "/etc/forge-publisher/known_hosts",
+                "projects": {"p": {"source": "git://10.0.0.1:9418/p", "remote": remote}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    return settings
+
+
+@pytest.mark.parametrize(
+    "remote",
+    [
+        "example.org:owner/repo.git",  # SSH without a user: not a form it takes
+        "git+ssh://git@example.org/owner/repo.git",
+        "ssh+git://git@example.org/owner/repo.git",
+        "SSH://git@example.org/owner/repo.git",
+        "ssh://example.org/owner/repo.git",
+        "file:///srv/repo.git",
+        "git://example.org/owner/repo.git",
+        "http://example.org/owner/repo.git",
+        "/srv/repo.git",
+    ],
+)
+def test_any_other_remote_form_is_refused(tmp_path: Path, remote: str) -> None:
+    with pytest.raises(SettingsRefused, match="https:// address .* or an SSH address"):
+        load_settings(_settings_with_remote(tmp_path, remote))
+
+
+@pytest.mark.parametrize(
+    "remote",
+    [
+        "https://example.org/owner/repo.git",
+        "git@example.org:owner/repo.git",
+        "ssh://git@example.org/owner/repo.git",
+    ],
+)
+def test_the_two_kinds_it_takes(tmp_path: Path, remote: str) -> None:
+    loaded = load_settings(_settings_with_remote(tmp_path, remote))
+    assert loaded.projects["p"].source == "git://10.0.0.1:9418/p"
+
+
+def test_a_recognised_ssh_remote_always_takes_the_pinned_host_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Even with no known-hosts file named, git never gets the token path."""
+    from forge.publisher import git_work
+
+    key = tmp_path / "key"
+    key.write_text(THE_MADE_UP_KEY, encoding="utf-8")
+    seen: list[dict] = []
+
+    def capture(*_args, env=None, **_kwargs):
+        seen.append(env)
+        raise OSError("not run in this test")
+
+    monkeypatch.setattr(git_work.subprocess, "run", capture)
+    commits = git_work.TheProjectsCommits(
+        ProjectRoute(name="p", source="git://h/p", remote="git@example.org:o/p.git"),
+        state_dir=tmp_path,
+        credential=Credential(THE_MADE_UP_KEY, path=key),
+        known_hosts="",
+    )
+    commits.where_the_remotes_branch_is("main")
+    assert seen
+    for env in seen:
+        assert "GIT_ASKPASS" not in env
+        assert "UserKnownHostsFile=/dev/null" in env["GIT_SSH_COMMAND"]
+        assert "StrictHostKeyChecking=yes" in env["GIT_SSH_COMMAND"]
 
 
 def test_the_environment_over_ssh(tmp_path: Path) -> None:

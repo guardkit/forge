@@ -35,7 +35,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from forge.publisher.credential import an_ssh_address
+from forge.publisher.credential import a_remote_the_publisher_takes, an_ssh_address
 
 __all__ = [
     "ProjectRoute",
@@ -150,10 +150,18 @@ def load_settings(path: str | Path) -> PublisherSettings:
         readable = str(name).strip()
         if not readable:
             raise SettingsRefused("a project in 'projects' has no name")
+        remote = _text(block, "remote", where=f"projects.{readable}")
+        if not a_remote_the_publisher_takes(remote):
+            raise SettingsRefused(
+                f"the remote of project '{readable}' must be an https:// address "
+                "(pushed with a token) or an SSH address written as "
+                "user@host:path or ssh://user@host/path (pushed with a deploy "
+                "key); any other form is refused"
+            )
         projects[readable] = ProjectRoute(
             name=readable,
             source=_text(block, "source", where=f"projects.{readable}"),
-            remote=_text(block, "remote", where=f"projects.{readable}"),
+            remote=remote,
         )
     port = decoded.get("port", 0)
     if isinstance(port, bool) or not isinstance(port, int) or port < 0:
