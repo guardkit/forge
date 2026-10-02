@@ -749,25 +749,36 @@ found:
 | Question | What is looked at |
 |---|---|
 | can a sandbox reach the coordinator's settings, or the ledger? | every sandbox's workspaces (`sbx ls --json`), and the mounts of every container inside each running sandbox, against the folders Docker mounts into the coordinator at `/etc/forge` and `/var/lib/forge` |
-| can a sandbox reach the publisher? | the publisher must answer the coordinator; then from inside each running sandbox, the answer service must answer (so the sandbox can make a request at all) and the publisher's own address must not, by the sandbox's default route or directly; the current publisher host policy must verify. With no sandbox running this is unknown |
-| is the coordinator the only thing on the publisher's network? | `docker network inspect`: exactly the coordinator and the publisher, and the publisher publishes no port |
+| can a sandbox reach the publisher? | the publisher must answer the coordinator; then from inside each running sandbox, the answer service must answer (so the sandbox can make a request at all), and **every** address the publisher has, on every network, must not — by the sandbox's default route (where only the publisher's own 200 counts, since a proxy answers for itself) or directly (where any answer at all is a reach). A publisher in host mode is a reach. The current publisher host policy must verify. With no sandbox running this is unknown |
+| is the coordinator the only thing on the publisher's network? | the publisher is on its own network and no other, not in host mode; `docker network inspect` shows exactly the coordinator and the publisher; the publisher publishes no port |
 | can anything but the publisher read its credential? | no other container on this machine mounts the file or a folder holding it, no sandbox workspace contains it, and only its owner, `FORGE_PUBLISHER_UID`, has any access. The file is never opened |
 
-The record goes into the `publication-facts` volume, written by a throwaway
-helper container with no network and a read-only root — that volume's only
-writer — after any earlier record has been invalidated. The coordinator mounts
+Paths are compared with symbolic links followed. Before writing anything the
+check also refuses if any container but the coordinator mounts the
+`publication-facts` volume, or any sandbox workspace reaches it. The record goes
+into that volume, written by a throwaway helper container with no network, a
+read-only root, every capability dropped and no new privileges — that volume's
+only writer — after any earlier record has been invalidated. The coordinator mounts
 the volume **read-only** and, when `FORGE_PUBLICATION_FACTS_FILE` names the
 record, reads it **at every merge word**. It acts on a record only while it was
 written for its own container, after its own start, and within a day; anything
 else reads as "nobody has looked", so publication stays off and the merge word
 says why. Because a record is never newer than a start that comes after it, the
-coordinator's boot line always says publication is off; run this check after
-every coordinator start, then
+coordinator's boot log says publication is off and says why the facts are not
+usable.
+
+**Nothing re-runs this check by itself.** It needs the host's Docker, the
+sandbox daemon and root on the host (to read the publisher's kernel policy), and
+no container in this estate holds all three — deliberately; none was given more
+to make it possible. So run it after every coordinator start and at least once
+a day. When it is out of date, the merge word stops at "publication pending" and
+its sentence says so, with this command. After running it,
 `docker exec <coordinator> python -m forge.pipeline.publication_status`, which
 asks the same question with the same reader as the next merge word.
 
 Exit status: 0 every answer is the one publication needs; 1 the record was
-written and at least one answer is not; 2 nothing was looked at or written.
+written and at least one answer is not; 2 nothing was written (a refusal, or the
+check stopping part-way).
 An env file without `FORGE_PUBLICATION_FACTS_FILE` (every one before release
 -3) still renders and runs; the coordinator then behaves exactly as before.
 
