@@ -68,6 +68,7 @@ __all__ = [
     "FACTS_FORMAT",
     "MACHINE_ANSWER_NAMES",
     "ThisCoordinator",
+    "process_start",
     "read_publication_facts",
     "the_machine_now",
     "this_coordinator",
@@ -121,16 +122,41 @@ _CONTAINER_ID_IN_A_PATH = re.compile(r"/containers/([0-9a-f]{64})/")
 
 @dataclass(frozen=True)
 class ThisCoordinator:
-    """Which coordinator is asking, and when it started.
+    """Which coordinator is asking, and exactly which start of it.
 
     ``container_id`` is the full id of the container this process runs in,
     or ``None`` when that cannot be told (not in a container at all).
-    ``started_at_epoch`` is when PID 1 of that container started, in seconds
-    since the epoch, or ``None`` when it cannot be read.
+
+    THE START IDENTITY is PID 1 of that container as the kernel counts it:
+    ``boot_time_epoch`` (``btime`` in ``/proc/stat``, whole seconds),
+    ``start_ticks`` (field 22 of ``/proc/1/stat``, clock ticks since boot) and
+    ``ticks_per_second``. These are integers the kernel keeps, and the check
+    that writes the facts reads the very same three for the same process from
+    the host, so a record is bound to ONE start by exact equality — no
+    tolerance is needed, and none is allowed. Any restart gives PID 1 a new
+    start-tick count; a stepped wall clock changes ``btime`` and so refuses
+    too, which is the safe side. ``started_at_epoch`` is the same moment in
+    seconds, derived from the three. Any of them ``None`` means it could not
+    be read.
     """
 
     container_id: str | None
     started_at_epoch: float | None
+    boot_time_epoch: int | None = None
+    start_ticks: int | None = None
+    ticks_per_second: int | None = None
+
+    @property
+    def start_identity(self) -> tuple[int, int, int] | None:
+        parts = (self.boot_time_epoch, self.start_ticks, self.ticks_per_second)
+        if any(not _a_positive_integer(part) for part in parts):
+            return None
+        return parts  # type: ignore[return-value]
+
+
+def _a_positive_integer(value: Any) -> bool:
+    """A strictly positive int, and not a bool, float, NaN, inf or string."""
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
 
 def _the_container_id(mountinfo: str) -> str | None:
@@ -148,10 +174,10 @@ def _the_container_id(mountinfo: str) -> str | None:
     return next(iter(found))
 
 
-def _pid1_started_at(proc: Path) -> float | None:
-    """When PID 1 of this container started, from ``/proc``. Never raises."""
+def process_start(proc: Path, pid: str = "1") -> tuple[int, int, int] | None:
+    """(boot time, start ticks, ticks per second) of one process. Never raises."""
     try:
-        stat = (proc / "1" / "stat").read_text(encoding="utf-8")
+        stat = (proc / pid / "stat").read_text(encoding="utf-8")
         # The command name is in brackets and may itself contain spaces or
         # brackets, so the fields are counted from after the LAST ')'.
         after = stat[stat.rindex(")") + 2 :].split()
@@ -163,24 +189,35 @@ def _pid1_started_at(proc: Path) -> float | None:
             if line.startswith("btime "):
                 boot = int(line.split()[1])
                 break
-        if boot is None:
+        per_second = int(os.sysconf("SC_CLK_TCK"))
+        if boot is None or ticks <= 0 or boot <= 0 or per_second <= 0:
             return None
-        per_second = os.sysconf("SC_CLK_TCK")
-        return boot + ticks / per_second
+        return boot, ticks, per_second
     except (OSError, ValueError, IndexError):
         return None
 
 
-def this_coordinator(proc: Path = Path("/proc")) -> ThisCoordinator:
+def this_coordinator(proc: Path = Path("/proc"), pid: str = "1") -> ThisCoordinator:
     """Who is asking: this container's id, and its PID 1's start. Never raises."""
     try:
         mountinfo = (proc / "self" / "mountinfo").read_text(encoding="utf-8")
     except OSError:
         mountinfo = ""
+    start = process_start(proc, pid)
+    if start is None:
+        return ThisCoordinator(_the_container_id(mountinfo), None)
+    boot, ticks, per_second = start
     return ThisCoordinator(
         container_id=_the_container_id(mountinfo),
-        started_at_epoch=_pid1_started_at(proc),
+        started_at_epoch=boot + ticks / per_second,
+        boot_time_epoch=boot,
+        start_ticks=ticks,
+        ticks_per_second=per_second,
     )
+
+
+def _refuse_a_constant(name: str) -> Any:
+    raise ValueError(f"{name} is not a number this record may carry")
 
 
 def _nobody_has_looked(why: str) -> WhatTheMachineSays:
@@ -239,7 +276,9 @@ def _read(
             f"the check that looks at the machine for this coordinator. {rerun}"
         )
     try:
-        record = json.loads(path.read_text(encoding="utf-8"))
+        record = json.loads(
+            path.read_text(encoding="utf-8"), parse_constant=_refuse_a_constant
+        )
     except (OSError, UnicodeDecodeError) as exc:
         return _nobody_has_looked(
             f"the publication facts file at {path} could not be read "
@@ -257,7 +296,7 @@ def _read(
             f"coordinator can act on: {problem}. {rerun}"
         )
 
-    written = float(record["written_at_epoch"])
+    written = record["written_at_epoch"]
     if asking.container_id is None:
         return _nobody_has_looked(
             "this process could not tell which container it is running in, "
@@ -271,10 +310,23 @@ def _read(
             f"and this is {asking.container_id[:12]}: a different container "
             f"is a different estate or image. {rerun}"
         )
-    if asking.started_at_epoch is None:
+    identity = asking.start_identity
+    if identity is None or asking.started_at_epoch is None:
         return _nobody_has_looked(
             "this coordinator's start time could not be read, so the "
-            "publication facts cannot be shown to be newer than it"
+            "publication facts cannot be shown to be about this start of it"
+        )
+    recorded = record["coordinator_pid1_start"]
+    recorded_identity = (
+        recorded["boot_time_epoch"],
+        recorded["start_ticks"],
+        recorded["ticks_per_second"],
+    )
+    if recorded_identity != identity:
+        return _nobody_has_looked(
+            f"the publication facts at {path} were written for a start of this "
+            "coordinator that is not the one running now (it has restarted "
+            f"since, or the machine's clock was stepped). {rerun}"
         )
     if written <= asking.started_at_epoch:
         return _nobody_has_looked(
@@ -312,9 +364,14 @@ def _what_is_wrong_with(record: Any) -> str | None:
         return "it is not a JSON object"
     if record.get("format") != FACTS_FORMAT:
         return f"its format is {record.get('format')!r}, not {FACTS_FORMAT!r}"
-    epoch = record.get("written_at_epoch")
-    if isinstance(epoch, bool) or not isinstance(epoch, (int, float)) or epoch <= 0:
-        return "it carries no time it was written"
+    if not _a_positive_integer(record.get("written_at_epoch")):
+        return "it carries no time it was written, as a whole number of seconds"
+    start = record.get("coordinator_pid1_start")
+    if not isinstance(start, dict) or not all(
+        _a_positive_integer(start.get(name))
+        for name in ("boot_time_epoch", "start_ticks", "ticks_per_second")
+    ):
+        return "it does not say which start of the coordinator it was written for"
     if not isinstance(record.get("written_at"), str):
         return "it carries no readable time it was written"
     container = record.get("coordinator_container_id")
