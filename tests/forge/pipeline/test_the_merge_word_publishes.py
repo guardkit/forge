@@ -64,17 +64,9 @@ from tests.forge.pipeline.test_merge_executor import (  # noqa: F401 - fixtures
     repo_root,
 )
 
-#: A machine somebody has looked at and found every wall standing. Without
-#: one of these, publication cannot switch on at all — which is where the
-#: estate is today, and the safe side.
-EVERY_WALL_STANDS = WhatTheMachineSays(
-    a_sandbox_can_write_the_coordinators_settings_file=False,
-    a_sandbox_can_see_the_ledger=False,
-    a_sandbox_can_reach_the_publisher=False,
-    the_credential_file_can_be_read_by_them=False,
-    only_the_coordinator_is_on_the_publishers_network=True,
-    looked_at_by="a stand-in, in a test",
-)
+#: The publisher said it passed its start-up self-check. Without this,
+#: publication cannot switch on at all — the safe side.
+EVERY_WALL_STANDS = WhatTheMachineSays(the_publisher_passed_its_self_check=True)
 
 
 @pytest.fixture
@@ -696,7 +688,7 @@ class TestWithPublicationOffNothingIsSentAndTheReasonIsSaid:
         assert publisher.asked == []
 
     @pytest.mark.asyncio
-    async def test_the_setting_is_on_but_a_wall_is_down(
+    async def test_the_setting_is_on_but_the_publisher_failed_its_self_check(
         self,
         config_with_publication_on: ForgeConfig,
         pool: SqliteLifecyclePersistence,  # noqa: F811
@@ -708,30 +700,24 @@ class TestWithPublicationOffNothingIsSentAndTheReasonIsSaid:
             config_with_publication_on,
             pool,
             publisher=publisher,
-            machine=WhatTheMachineSays(
-                a_sandbox_can_write_the_coordinators_settings_file=False,
-                a_sandbox_can_see_the_ledger=True,
-                a_sandbox_can_reach_the_publisher=False,
-                the_credential_file_can_be_read_by_them=False,
-                only_the_coordinator_is_on_the_publishers_network=True,
-            ),
+            machine=WhatTheMachineSays(the_publisher_passed_its_self_check=False),
         )
 
         outcome = await _press(deps, repo_root)
 
         assert outcome.result == "publication-pending"
         assert "publication is switched off" in outcome.detail
-        assert "a sandbox can see the ledger" in outcome.detail
+        assert "without having passed its start-up self-check" in outcome.detail
         assert publisher.asked == []
 
     @pytest.mark.asyncio
-    async def test_nobody_has_looked_at_the_machine_at_all(
+    async def test_the_publisher_could_not_be_asked(
         self,
         config_with_publication_on: ForgeConfig,
         pool: SqliteLifecyclePersistence,  # noqa: F811
         repo_root: Path,  # noqa: F811
     ) -> None:
-        """Which is where the estate stands today: publication stays off."""
+        """Nobody could ask the publisher: publication stays off."""
         publisher = _APublisherThatSays([_published("c" * 40)])
         deps, _deploy, _joins, _bus = _deps(
             config_with_publication_on, pool, publisher=publisher, machine=None
@@ -740,7 +726,7 @@ class TestWithPublicationOffNothingIsSentAndTheReasonIsSaid:
         outcome = await _press(deps, repo_root)
 
         assert outcome.result == "publication-pending"
-        assert "nobody has looked" in outcome.detail
+        assert "could not be asked whether it passed" in outcome.detail
         assert publisher.asked == []
 
 

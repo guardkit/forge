@@ -169,6 +169,9 @@ class Publisher:
         # Requests for DIFFERENT projects are unaffected — they are different
         # repositories and different locks.
         self._one_at_a_time: dict[str, threading.Lock] = {}
+        #: Set by the process entry point once its start-up self-check passed
+        #: (:func:`forge.publisher.__main__.why_it_will_not_start`).
+        self.passed_its_self_check = False
         self._handing_out_locks = threading.Lock()
 
     # -- the pieces --------------------------------------------------------
@@ -565,7 +568,11 @@ class PublisherHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler contract
         try:
             if self.path.split("?", 1)[0] == "/healthz":
-                self._answer(200, {"status": "healthy"})
+                passed = self.server.publisher.passed_its_self_check  # type: ignore[attr-defined]
+                self._answer(
+                    200,
+                    {"status": "healthy", "self_check": "passed" if passed else "not run"},
+                )
                 return
             self._answer(404, {"error": f"no such path: {self.path}"})
         except Exception:  # noqa: BLE001 - never crash the service

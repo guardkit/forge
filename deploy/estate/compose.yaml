@@ -1142,23 +1142,6 @@ services:
       FLEET_MEMORY_EMBED_URL: ${FLEET_MEMORY_EMBED_URL:?name the embedding service's address in the env file}
       FLEET_MEMORY_EMBED_MODEL: ${FLEET_MEMORY_EMBED_MODEL:?name the embedding model in the env file}
       FLEET_MEMORY_EMBED_DIMS: ${FLEET_MEMORY_EMBED_DIMS:?name how many dimensions that model returns in the env file}
-      # THE MACHINE'S ANSWERS FOR PUBLICATION (2 October 2026, the GitHub publishing gate). Where the
-      # coordinator reads what 'estate-check --publication-facts' found when it
-      # looked at the machine — read afresh at every merge word, never once at
-      # boot. OPTIONAL ON PURPOSE: an env file that does not set it (every one
-      # before 2 October 2026) leaves it empty, and the coordinator then behaves
-      # exactly as before — nobody has looked, so publication stays off. Only
-      # the 2 October 2026 version's env file sets it, to
-      # /var/lib/forge-publication-facts/publication-facts.json. It adds no
-      # settings field: the settings file is the same for both releases.
-      FORGE_PUBLICATION_FACTS_FILE: ${FORGE_PUBLICATION_FACTS_FILE:-}
-    volumes:
-      # The facts themselves, READ-ONLY. Nothing in this estate writes this
-      # volume but the throwaway, network-less helper container that
-      # 'estate-check --publication-facts' starts; the coordinator can only
-      # read what that look found. A named volume, not a folder on this
-      # machine, so the coordinator still binds nothing out of anybody's disk.
-      - publication-facts:/var/lib/forge-publication-facts:ro
     secrets:
       - source: memory-database-address
         target: memory_database_address
@@ -1203,15 +1186,6 @@ volumes:
   # nothing in it a cutover has to move or could lose. 'down -v' removes it, the
   # same as the bus's store.
   gateway-state:
-
-  # WHAT THE MACHINE SAYS FOR PUBLICATION (2 October 2026, the GitHub publishing gate). One small record,
-  # written ONLY by the network-less, read-only-root helper container that
-  # 'estate-check --publication-facts' starts after it has looked, and read
-  # ONLY by the coordinator, which mounts it read-only. It starts empty, and an
-  # empty volume means nobody has looked, so publication stays off. Nothing in
-  # it needs carrying across a release: a record is good for one coordinator
-  # start only, so every new start needs a new look. 'down -v' removes it.
-  publication-facts:
 
   # THE BUS'S OWN CONFIG AND PROVISIONING SCRIPTS, at the pinned commit.
   #
