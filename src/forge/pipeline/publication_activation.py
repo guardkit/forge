@@ -1,55 +1,28 @@
-"""Publication cannot be switched on until the isolation is proven.
+"""Publication cannot be switched on until three things hold.
 
-One-true-copy design pass, item 1, third revision section G:
+Publication (the merge word sending the joined commit to the project's remote,
+then deploying) is on only when ``publication.enabled`` is set AND every one of
+these holds:
 
-    *The switch that turns publication on runs a check first and refuses, in
-    plain words, unless all of these hold. Nothing in the coordinator can
-    start a build or a project check inside itself. No sandbox can write the
-    coordinator's settings file or see the ledger. No sandbox can reach the
-    publisher. The publisher's credential is not in the coordinator's, the
-    runner's or any sandbox's settings. The check is run again each time the
-    coordinator starts; if it fails, publication goes off and every merge word
-    reports "publication is switched off: …" with the reason, never a merge.*
+1. **nothing is built inside the coordinator** — a setting, read here;
+2. **the publisher's credential file is named in no other settings** — the
+   coordinator's, the runner's launch list or any sandbox's. Read here, from
+   the settings. A credential file that is not named at all is a refusal, not
+   a pass: with no path there is nothing to search for;
+3. **the publisher passed its start-up self-check** — it refuses to start
+   unless its credential file is readable by its own user alone and it is
+   attached to exactly one network (its own, never the host's). The
+   coordinator asks the publisher's health route, which reports the check
+   (:func:`forge.pipeline.publisher_client.the_publishers_self_check`).
 
-SIX NAMED QUESTIONS, each one testable on its own. They are questions and
-not assertions: each is asked of what is true, and each answers **yes**, **no**
-or **it cannot be told from here** — and the third is a refusal, because a
-wall nobody has looked at is not a wall.
+SIMPLER THAN IT WAS (2 October 2026). This used to ask five questions only the
+real machine could answer, filled in by a separate check that wrote a file the
+coordinator read and that went out of date after a day or any restart. The
+publisher now checks the two facts that matter about itself when it starts,
+and will not start without them.
 
-The new one — fifth in the order they are asked — was added on 22 September
-2026, with the way "no sandbox can reach the publisher" is actually made
-true. The publisher listens on every address inside its own container and
-publishes no port; what can reach it is therefore exactly what is on its
-network, so the network is counted, and the answer publication needs is "the
-coordinator, and nothing else".
-
-WHICH ONES CAN BE PROVEN ON THIS MACHINE, AND WHICH ONLY AT ROLLOUT. This is
-the honest split, and it is written here rather than left to be discovered:
-
-* **provable here, from the settings alone** — question 1 (the setting that
-  permits builds inside the coordinator) and the settings half of question 6
-  (the credential file is named, and named in no other settings). Both are
-  read off a configuration object, so a test can make them true and false at
-  will. **A credential file that is not named at all is a refusal**, not a
-  pass: with no path there is nothing to search for, and a search that found
-  nothing because it looked for nothing is not an all-clear;
-* **only at rollout, on the real machine** — questions 2, 3, 4 and 5 (whether
-  a sandbox can write the coordinator's settings file, see the ledger or
-  reach the publisher, and what else is on the publisher's network) and the
-  readability half of question 6. Each of those is a fact about mounts, users
-  and networks that no amount of reading a settings file establishes. They
-  are asked of :class:`WhatTheMachineSays`: a thing that reports what
-  somebody looked at. Since 2 October 2026 the coordinator gets one from the
-  record ``estate-check --publication-facts`` writes after looking, read at
-  every merge word (:mod:`forge.pipeline.publication_facts`). With no such
-  record — or one that is stale, or for another coordinator — every one of
-  these answers is "nobody has looked" and the check **refuses**, which is
-  the safe side.
-
-WHY IT FAILS CLOSED. An unanswered question is not a pass. If the machine has
-told us nothing about a wall, the check says so by name and publication stays
-off. It is never possible for publication to switch on because a probe was
-missing.
+IT FAILS CLOSED. A publisher that cannot be asked is not a pass: the answer is
+"unknown", and unknown keeps publication off with the reason said.
 
 Nothing here names a language, a test runner, a hosting provider or a
 product.
@@ -75,38 +48,14 @@ __all__ = [
 
 @dataclass(frozen=True)
 class WhatTheMachineSays:
-    """What somebody who looked at the machine reports back.
+    """What the publisher said about its own start-up self-check.
 
-    Every field is ``True``, ``False`` or ``None``. ``None`` means **nobody
-    has looked**, and the check treats it as a refusal rather than a pass.
-    This is the stand-in the design asks for: at rollout it is filled in by
-    looking at the real mounts, users and networks; in a test it is filled in
-    by hand, one field at a time, which is how each question is proven to
-    refuse on its own.
+    ``True`` it passed, ``False`` it is running without having passed,
+    ``None`` nobody could ask it — which is a refusal, never a pass.
     """
 
-    a_sandbox_can_write_the_coordinators_settings_file: bool | None = None
-    a_sandbox_can_see_the_ledger: bool | None = None
-    a_sandbox_can_reach_the_publisher: bool | None = None
-    the_credential_file_can_be_read_by_them: bool | None = None
-    #: Is the coordinator the ONLY thing on the publisher's network besides
-    #: the publisher itself? The publisher listens on every address inside its
-    #: own container and publishes no port, so what can reach it is exactly
-    #: what shares that network — which makes "who else is on it" the thing
-    #: that has to be counted. ``True`` is the answer publication needs.
-    only_the_coordinator_is_on_the_publishers_network: bool | None = None
-
-    #: Where the answers came from, for the record. Free text: "looked at the
-    #: sandbox's mounts on <machine>, <date>", or "a stand-in, in a test".
-    looked_at_by: str | None = None
-
-    #: WHY NOBODY HAS LOOKED, when a reader of the machine's answers found
-    #: nothing it could act on (2 October 2026, the GitHub publishing gate): no facts file, a file
-    #: written before this coordinator started, for another coordinator, too
-    #: old, or not the record the check writes. Every answer above is then
-    #: ``None``, the check refuses as it always has, and this reason is said
-    #: first in the sentence a person reads, so "nobody has looked" names
-    #: what to do about it.
+    the_publisher_passed_its_self_check: bool | None = None
+    #: Why the publisher could not be asked, said in the refusal.
     why_nobody_has_looked: str | None = None
 
 
@@ -128,8 +77,6 @@ class Answer:
     question: str
     holds: bool | None
     said: str
-    #: Can this question be settled on this machine, from the settings alone?
-    provable_here: bool
 
     @property
     def refuses(self) -> bool:
@@ -141,7 +88,6 @@ class Answer:
             "question": self.question,
             "holds": self.holds,
             "said": self.said,
-            "provable_here": self.provable_here,
         }
 
 
@@ -151,9 +97,6 @@ class TheVerdict:
 
     all_hold: bool
     answers: tuple[Answer, ...] = field(default_factory=tuple)
-    #: Why the machine's answers were not available, when a reader said so
-    #: (:attr:`WhatTheMachineSays.why_nobody_has_looked`).
-    why_nobody_has_looked: str | None = None
 
     @property
     def refusals(self) -> tuple[Answer, ...]:
@@ -167,24 +110,12 @@ class TheVerdict:
                 "every one of the things publication needs was checked "
                 "and holds"
             )
-        if self.why_nobody_has_looked:
-            # The reason nobody's look could be used says everything the
-            # machine questions would each say ("nobody has looked …"), and
-            # what to do about it, once. Only the refusals that the settings
-            # alone decide are added after it.
-            settings_said = [
-                answer.said
-                for answer in self.refusals
-                if answer.provable_here or answer.holds is False
-            ]
-            return "; ".join([self.why_nobody_has_looked, *settings_said])
         said = "; ".join(answer.said for answer in self.refusals)
         return said or "the activation check could not be run"
 
     def to_wire(self) -> dict[str, Any]:
         return {
             "all_hold": self.all_hold,
-            "why_nobody_has_looked": self.why_nobody_has_looked,
             "sentence": self.sentence,
             "answers": [answer.to_wire() for answer in self.answers],
         }
@@ -207,151 +138,49 @@ def _nothing_is_built_inside_the_coordinator(true: WhatIsTrue) -> Answer:
             name,
             question,
             None,
-            (
-                "it cannot be told whether the coordinator may build inside "
-                "itself: the setting that permits it was not readable"
-            ),
-            provable_here=True,
+            "it cannot be told whether the coordinator may build inside "
+            "itself: the setting that permits it was not readable",
         )
     if allowed:
         return Answer(
             name,
             question,
             False,
-            (
-                "the coordinator may still start builds and project checks "
-                "inside itself, and a build that runs in there can write the "
-                "very record the publisher trusts. Switch that setting off, "
-                "and give every project a sandbox of its own, before "
-                "publication is switched on"
-            ),
-            provable_here=True,
+            "the coordinator may still start builds and project checks "
+            "inside itself, and a build that runs in there can write the "
+            "very record the publisher trusts. Switch that setting off, "
+            "and give every project a sandbox of its own, before "
+            "publication is switched on",
         )
     return Answer(
         name,
         question,
         True,
         "the coordinator refuses to build or check inside itself",
-        provable_here=True,
     )
 
 
-def _machine_question(
-    name: str,
-    question: str,
-    *,
-    answer: bool | None,
-    when_true: str,
-    when_false: str,
-    when_unknown: str,
-) -> Answer:
-    """One of the three questions only the real machine can settle.
-
-    ``answer`` is what somebody who looked reported. ``True`` means the thing
-    the question asks about IS possible, which is the wrong way round for
-    publication, so it is the refusal.
-    """
-    if answer is None:
-        return Answer(name, question, None, when_unknown, provable_here=False)
-    if answer:
-        return Answer(name, question, False, when_false, provable_here=False)
-    return Answer(name, question, True, when_true, provable_here=False)
-
-
-def _no_sandbox_can_write_the_settings_file(true: WhatIsTrue) -> Answer:
-    return _machine_question(
-        "no-sandbox-can-write-the-coordinators-settings-file",
-        "can a sandbox write the coordinator's settings file?",
-        answer=true.machine.a_sandbox_can_write_the_coordinators_settings_file,
-        when_true="no sandbox can write the coordinator's settings file",
-        when_false=(
-            "a sandbox can write the coordinator's settings file, so a build "
-            "in there could change which projects are registered and which "
-            "paths are allowed. Move that file out of a sandbox's reach "
-            "before publication is switched on"
-        ),
-        when_unknown=(
-            "nobody has looked at whether a sandbox can write the "
-            "coordinator's settings file, and an unexamined wall is not a "
-            "wall. This one can only be settled on the real machine, at "
-            "rollout"
-        ),
-    )
-
-
-def _no_sandbox_can_see_the_ledger(true: WhatIsTrue) -> Answer:
-    return _machine_question(
-        "no-sandbox-can-see-the-ledger",
-        "can a sandbox see the ledger?",
-        answer=true.machine.a_sandbox_can_see_the_ledger,
-        when_true="no sandbox can see the ledger",
-        when_false=(
-            "a sandbox can see the ledger, which is the record the publisher "
-            "trusts; a build in there could forge a passed record. Take the "
-            "ledger out of every sandbox's reach before publication is "
-            "switched on"
-        ),
-        when_unknown=(
-            "nobody has looked at whether a sandbox can see the ledger. This "
-            "one can only be settled on the real machine, at rollout"
-        ),
-    )
-
-
-def _no_sandbox_can_reach_the_publisher(true: WhatIsTrue) -> Answer:
-    return _machine_question(
-        "no-sandbox-can-reach-the-publisher",
-        "can a sandbox reach the publisher?",
-        answer=true.machine.a_sandbox_can_reach_the_publisher,
-        when_true="no sandbox can reach the publisher",
-        when_false=(
-            "a sandbox can reach the publisher, so a build in there could ask "
-            "for a send. Bind the publisher where no sandbox can reach it "
-            "before publication is switched on"
-        ),
-        when_unknown=(
-            "nobody has looked at whether a sandbox can reach the publisher. "
-            "This one can only be settled on the real machine, at rollout"
-        ),
-    )
-
-
-def _the_credential_is_out_of_their_reach(true: WhatIsTrue) -> Answer:
-    """The one question with a half that IS provable here.
-
-    The settings half — is the credential file named in the coordinator's
-    settings, the runner's launch list or any sandbox's settings? — is read
-    off the configuration and settled here. The readability half needs the
-    machine.
-    """
-    name = "the-credential-is-out-of-their-reach"
+def _the_credential_is_named_in_no_other_settings(true: WhatIsTrue) -> Answer:
+    name = "the-credential-is-named-in-no-other-settings"
     question = (
-        "is the publisher's credential file named in, or readable from, the "
-        "coordinator's, the runner's or any sandbox's settings?"
+        "is the publisher's credential file named in the coordinator's, the "
+        "runner's or any sandbox's settings?"
     )
     # WITHOUT THE PATH THERE IS NO SEARCH, so there is no answer, so there is
-    # no pass. The settings half of this question is "is this exact path named
-    # anywhere else?", and with no path to look for, the search trivially
-    # finds nothing — which reads like an all-clear and is not one. The
-    # readability half cannot stand in for it either: it is about a file
-    # nobody has named. The path is what makes the question askable, so its
-    # absence is a refusal, and the refusal names the setting to set.
+    # no pass: a search for nothing finds nothing, which is not an all-clear.
     if not true.the_credential_file:
         return Answer(
             name,
             question,
             False,
-            (
-                "the publisher's credential file is not named at all "
-                "(publication.publisher_credential_file is not set), so there "
-                "is no path to look for in the coordinator's settings, the "
-                "runner's launch list or any sandbox's settings, and this "
-                "question cannot be answered. Set "
-                "publication.publisher_credential_file to the path of the one "
-                "file the publisher's credential is in, before publication is "
-                "switched on"
-            ),
-            provable_here=True,
+            "the publisher's credential file is not named at all "
+            "(publication.publisher_credential_file is not set), so there "
+            "is no path to look for in the coordinator's settings, the "
+            "runner's launch list or any sandbox's settings, and this "
+            "question cannot be answered. Set "
+            "publication.publisher_credential_file to the path of the one "
+            "file the publisher's credential is in, before publication is "
+            "switched on",
         )
     if true.where_the_credential_file_is_named:
         named = ", ".join(true.where_the_credential_file_is_named)
@@ -359,107 +188,58 @@ def _the_credential_is_out_of_their_reach(true: WhatIsTrue) -> Answer:
             name,
             question,
             False,
-            (
-                f"the publisher's credential file is named in {named}. It "
-                "belongs to the publisher and to nothing else; take it out of "
-                "those settings before publication is switched on"
-            ),
-            provable_here=True,
-        )
-    readable = true.machine.the_credential_file_can_be_read_by_them
-    if readable is None:
-        return Answer(
-            name,
-            question,
-            None,
-            (
-                "the credential file is named in no settings but the "
-                "coordinator's own note of where the publisher's is, and "
-                "nobody has looked at whether it can be READ by the "
-                "coordinator, the runner or a sandbox. That half can only be "
-                "settled on the real machine, at rollout"
-            ),
-            provable_here=False,
-        )
-    if readable:
-        return Answer(
-            name,
-            question,
-            False,
-            (
-                "the publisher's credential file can be read by the "
-                "coordinator, the runner or a sandbox. Give it to the "
-                "publisher's own user and to nobody else before publication "
-                "is switched on"
-            ),
-            provable_here=False,
+            f"the publisher's credential file is named in {named}. It "
+            "belongs to the publisher and to nothing else; take it out of "
+            "those settings before publication is switched on",
         )
     return Answer(
         name,
         question,
         True,
-        (
-            "the publisher's credential file is named in no other settings "
-            "and cannot be read by the coordinator, the runner or any sandbox"
-        ),
-        provable_here=False,
+        "the publisher's credential file is named in no other settings",
     )
 
 
-def _only_the_coordinator_is_on_the_publishers_network(true: WhatIsTrue) -> Answer:
-    """Who else can reach the publisher, counted rather than assumed.
-
-    The publisher listens on every address INSIDE its own container and
-    publishes no port to the host, so the set of things that can reach it is
-    exactly the set of things on its network. "No sandbox can reach it" is
-    the property; this is the way it is made true and the way it is checked —
-    count what is on that network, and find the coordinator and nothing else.
-
-    A STAND-IN HERE. Nothing in this process can see a container network, so
-    like the three walls above it is asked of :class:`WhatTheMachineSays` and
-    answers "nobody has looked" — a refusal — until somebody looks at the
-    real machine at rollout.
-    """
-    return _machine_question(
-        "only-the-coordinator-is-on-the-publishers-network",
-        "is the coordinator the only thing on the publisher's network?",
-        # The field reads the RIGHT way round (True = the good answer), and
-        # _machine_question reads the wrong way round (True = the refusal),
-        # so it is turned over here rather than at the call site.
-        answer=(
-            None
-            if true.machine.only_the_coordinator_is_on_the_publishers_network is None
-            else not true.machine.only_the_coordinator_is_on_the_publishers_network
-        ),
-        when_true=(
-            "the publisher's network has the coordinator on it and nothing "
-            "else, and no port of the publisher's is published anywhere"
-        ),
-        when_false=(
-            "something other than the coordinator is on the publisher's "
-            "network, and anything that can reach the publisher can ask for a "
-            "send. Put the publisher on a network of its own, shared with the "
-            "coordinator alone and with no sandbox, before publication is "
-            "switched on"
-        ),
-        when_unknown=(
-            "nobody has counted what is on the publisher's network. The "
-            "publisher listens on every address inside its own container, so "
-            "what shares that network is exactly what can reach it, and an "
-            "uncounted network is not a wall. This one can only be settled on "
-            "the real machine, at rollout"
-        ),
+def _the_publisher_passed_its_self_check(true: WhatIsTrue) -> Answer:
+    name = "the-publisher-passed-its-self-check"
+    question = (
+        "did the publisher start only after finding its credential file "
+        "readable by its own user alone, and itself on exactly its own "
+        "network?"
+    )
+    passed = true.machine.the_publisher_passed_its_self_check
+    if passed is None:
+        why = true.machine.why_nobody_has_looked or "nobody asked it"
+        return Answer(
+            name,
+            question,
+            None,
+            f"the publisher could not be asked whether it passed its "
+            f"start-up self-check ({why}), and an unanswered question is not "
+            "a pass",
+        )
+    if not passed:
+        return Answer(
+            name,
+            question,
+            False,
+            "the publisher is running without having passed its start-up "
+            "self-check, so it is not known that its credential is its own "
+            "and that only its own network reaches it",
+        )
+    return Answer(
+        name,
+        question,
+        True,
+        "the publisher passed its start-up self-check",
     )
 
 
 #: The questions, in the order they are asked and reported.
 THE_QUESTIONS = (
     _nothing_is_built_inside_the_coordinator,
-    _no_sandbox_can_write_the_settings_file,
-    _no_sandbox_can_see_the_ledger,
-    _no_sandbox_can_reach_the_publisher,
-    _only_the_coordinator_is_on_the_publishers_network,
-    _the_credential_is_out_of_their_reach,
+    _the_credential_is_named_in_no_other_settings,
+    _the_publisher_passed_its_self_check,
 )
 
 
@@ -475,11 +255,10 @@ def _text(value: Any) -> str:
 def _names_the_credential_file(config: Any, credential_file: str) -> tuple[str, ...]:
     """Every settings block that names the publisher's credential file.
 
-    Looked for, by exact path, in the three places the design names: the
-    coordinator's own settings (anywhere but the one field that records where
-    the publisher's file is, which is a note of a path and not a copy of a
-    secret), the list of settings a build is launched with, and every
-    sandbox's declared settings.
+    Looked for, by exact path, in the coordinator's own settings (anywhere but
+    the one field that records where the publisher's file is, which is a note
+    of a path and not a copy of a secret), the list of settings a build is
+    launched with, and every sandbox's declared settings.
     """
     found: list[str] = []
     wanted = _text(credential_file)
@@ -520,9 +299,6 @@ def _names_the_credential_file(config: Any, credential_file: str) -> tuple[str, 
                 found.append(f"{said}.{field_name}")
 
     publication = getattr(config, "publication", None)
-    # The coordinator's note of WHERE the publisher's credential file is, is
-    # a path and not a credential: the check has to know the path to look for
-    # it anywhere else, so that one field is not itself a finding.
     _looks_at(publication, "publication", skip={"publisher_credential_file"})
     planning = getattr(config, "planning", None)
     _looks_at(planning, "planning", skip={"sandboxes"})
@@ -541,17 +317,12 @@ def _names_the_credential_file(config: Any, credential_file: str) -> tuple[str, 
 def what_is_true_here(
     config: Any, machine: WhatTheMachineSays | None = None
 ) -> WhatIsTrue:
-    """Gather the facts the questions are asked of.
-
-    The settings are read off ``config``; the machine's answers come from
-    ``machine``, which is ``None`` when nobody has looked — and then every
-    machine question refuses by name.
-    """
+    """Gather the facts the questions are asked of."""
     publication = getattr(config, "publication", None)
     allowed = getattr(publication, "builds_may_run_inside_the_coordinator", None)
     if not isinstance(allowed, bool):
         # No setting at all reads as "the old behaviour": the coordinator
-        # builds inside itself, which is what every forge does today.
+        # builds inside itself.
         allowed = True
     credential_file = _text(
         getattr(publication, "publisher_credential_file", None)
@@ -571,11 +342,7 @@ def what_is_true_here(
 def run_the_activation_check(
     config: Any, machine: WhatTheMachineSays | None = None
 ) -> TheVerdict:
-    """Ask them all, and say plainly which of them refuse.
-
-    Never raises: a configuration of an unexpected shape reads as "it cannot
-    be told from here", which is a refusal, which is the safe side.
-    """
+    """Ask them all, and say plainly which of them refuse. Never raises."""
     try:
         true = what_is_true_here(config, machine)
     except Exception as exc:  # noqa: BLE001 - an unreadable config is a refusal
@@ -592,18 +359,13 @@ def run_the_activation_check(
                     "the-settings-could-not-be-read",
                     "can the settings the check reads be read at all?",
                     None,
-                    (
-                        "the settings the activation check reads could not be "
-                        f"read ({type(exc).__name__}), so publication stays off"
-                    ),
-                    provable_here=True,
+                    "the settings the activation check reads could not be "
+                    f"read ({type(exc).__name__}), so publication stays off",
                 ),
             ),
         )
     answers = tuple(question(true) for question in THE_QUESTIONS)
-    why = getattr(true.machine, "why_nobody_has_looked", None)
     return TheVerdict(
         all_hold=all(answer.holds is True for answer in answers),
         answers=answers,
-        why_nobody_has_looked=why if isinstance(why, str) and why else None,
     )

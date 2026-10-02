@@ -37,9 +37,7 @@
 
 # The publisher, composed in from the fragment that already describes it —
 # its own network, its own credential file, no published port. Its text is
-# NOT copied here: this is the same file the rollout reads, and the six
-# conditions written at the top of it are the conditions the activation check
-# refuses without.
+# NOT copied here: this is the same file the rollout reads.
 include:
   - path: ../../src/forge/publisher/compose-fragment.yml
 

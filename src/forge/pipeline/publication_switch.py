@@ -15,7 +15,7 @@ every caller asks the same question:
 1. **a setting turns it on.** ``publication.enabled`` is False by default, so
    a forge that says nothing publishes nothing;
 2. **the activation check passes.** Turning the setting on is not permission:
-   section G's conditions are asked
+   its three conditions are asked
    (:mod:`forge.pipeline.publication_activation`) and publication stays off,
    with the reason in plain words, unless every one of them holds. The check
    is asked again on every press and at every coordinator start, so a
@@ -49,12 +49,11 @@ from forge.pipeline.publication_activation import (
     WhatTheMachineSays,
     run_the_activation_check,
 )
-from forge.pipeline.publication_facts import the_machine_now
 
 logger = logging.getLogger(__name__)
 
-#: The machine's answers, ``None`` (nobody has looked), or a zero-argument
-#: reader that returns one of those two when asked (2 October 2026, the GitHub publishing gate).
+#: The publisher's answer, ``None`` (nobody asked), or a zero-argument reader
+#: that asks it (:func:`forge.pipeline.publisher_client.the_publishers_self_check`).
 TheMachine = (
     WhatTheMachineSays | Callable[[], WhatTheMachineSays | None] | None
 )
@@ -64,6 +63,7 @@ __all__ = [
     "publication_is_switched_on",
     "say_where_publication_stands_at_boot",
     "the_activation_check",
+    "the_machine_now",
     "why_publication_is_off",
 ]
 
@@ -75,6 +75,21 @@ PUBLICATION_IS_OFF_SENTENCE: str = (
 )
 
 
+def the_machine_now(value: TheMachine) -> WhatTheMachineSays | None:
+    """The answers for ONE question: a reader is called afresh. Never raises."""
+    if value is None or isinstance(value, WhatTheMachineSays):
+        return value
+    try:
+        answer = value() if callable(value) else None
+    except Exception as exc:  # noqa: BLE001 - a reader that broke has not looked
+        answer = WhatTheMachineSays(
+            why_nobody_has_looked=f"asking it failed ({type(exc).__name__})"
+        )
+    if answer is None or isinstance(answer, WhatTheMachineSays):
+        return answer
+    return WhatTheMachineSays(why_nobody_has_looked="its answer was not readable")
+
+
 def _the_setting_says_on(config: Any) -> bool:
     """``publication.enabled``, and nothing looser."""
     publication = getattr(config, "publication", None)
@@ -84,13 +99,13 @@ def _the_setting_says_on(config: Any) -> bool:
 def the_activation_check(
     config: Any = None, machine: TheMachine = None
 ) -> TheVerdict:
-    """Ask section G's questions. Never raises.
+    """Ask the activation check's questions. Never raises.
 
     ``machine`` may be the answers themselves, ``None``, or a zero-argument
-    reader of them (2 October 2026, the GitHub publishing gate), which is called here, afresh. A caller
-    asking more than one question about the same moment — the merge press —
-    resolves it once itself (:func:`~forge.pipeline.publication_facts.the_machine_now`)
-    and passes the answers, so the verdict and its reason come from one read.
+    reader of them, which is called here, afresh. A caller asking more than
+    one question about the same moment — the merge press — resolves it once
+    itself (:func:`the_machine_now`) and passes the answers, so the verdict
+    and its reason come from one read.
     """
     return run_the_activation_check(config, the_machine_now(machine))
 

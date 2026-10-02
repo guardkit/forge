@@ -25,7 +25,7 @@ Make-merge-work build spec (2026-08-24). Two halves:
 
 THE PRESS STOPS AT "PUBLISHED" (the one-true-copy design, 2026-09-21, and its
 publisher stage, 2026-09-22). With publication switched off — which is the
-default, and what every forge does until section G's five conditions hold —
+default, and what every forge does until the activation check's three conditions hold —
 nothing is sent to the remote and nothing is deployed: the result is
 "publication pending" and the sentence says why publication is off. With it
 on, the press asks the PUBLISHER — a separate process holding the one
@@ -190,9 +190,9 @@ from forge.pipeline.publication_record import (
     STEP_SEND,
     PublicationRecordStore,
 )
-from forge.pipeline.publication_facts import the_machine_now
 from forge.pipeline.publication_switch import (
     publication_is_switched_on,
+    the_machine_now,
     why_publication_is_off,
 )
 from forge.pipeline.publisher_client import ask_the_publisher, the_remote_moved
@@ -486,20 +486,12 @@ class MergeExecutorDeps:
     #: where a project declares what it deploys and what an identity is for
     #: it. Central code never invents either.
     deployment_target: Callable[[str, Path], Any] | None = None
-    #: WHAT SOMEBODY WHO LOOKED AT THE MACHINE REPORTS — the answers to the
-    #: conditions of section G that no settings file can establish
+    #: WHAT THE PUBLISHER SAYS ABOUT ITS START-UP SELF-CHECK
     #: (:class:`~forge.pipeline.publication_activation.WhatTheMachineSays`).
-    #: Left unset, those questions answer "nobody has looked", the activation
-    #: check refuses, and publication stays off — the safe side.
-    #:
-    #: IT MAY BE A READER (2 October 2026, the GitHub publishing gate): a zero-argument callable that
-    #: returns the answers when asked. These deps are built ONCE, when the
-    #: coordinator starts, so a plain value would be the answers at boot for
-    #: ever. A reader is called afresh on EVERY merge word, once, before the
-    #: press asks whether publication is on; both the verdict and its reason
-    #: then come from that one read. Production passes
-    #: :func:`~forge.pipeline.publication_facts.read_publication_facts`, which
-    #: reads the file ``estate-check --publication-facts`` writes.
+    #: Left unset, nobody asked, the activation check refuses, and
+    #: publication stays off — the safe side. It may be a zero-argument
+    #: reader, called afresh on EVERY merge word; production passes
+    #: :func:`~forge.pipeline.publisher_client.the_publishers_self_check`.
     what_the_machine_says: Any = None
 
 
@@ -1152,7 +1144,7 @@ async def execute_merge_deploy(
     5. with publication switched off, the record stops at "checked", the
        result is "publication pending" and the sentence says WHY publication
        is off — either that no setting turns it on, or which of section G's
-       five conditions does not hold;
+       three conditions does not hold;
     6. with publication switched on, the publisher is asked to send J to the
        recorded target branch. It is a separate process holding the one
        credential that can write to a remote; this request carries none. On
@@ -4490,17 +4482,17 @@ async def execute_merge_deploy(
 
             # ------------------------------------------------------------------
             # IS PUBLICATION SWITCHED ON? Two things have to be true: a setting
-            # says so, and the activation check's five conditions all hold
+            # says so, and the activation check's three conditions all hold
             # (the design's section G). With either missing, nothing is sent
             # anywhere, nothing is deployed, and the record stops at "checked"
             # with the reason said in plain words.
             # ------------------------------------------------------------------
-            # THE MACHINE'S ANSWERS, READ NOW, ONCE FOR THIS MERGE WORD
-            # (2 October 2026, the GitHub publishing gate). A reader is called here rather than at boot,
-            # so facts written after the coordinator started count at the
-            # next merge word, and facts gone stale stop counting. The switch
-            # and the reason below are asked of the same read.
-            machine_now = the_machine_now(deps.what_the_machine_says)
+            # THE PUBLISHER'S ANSWER, ASKED NOW, ONCE FOR THIS MERGE WORD
+            # (in a thread: it is a network call). The switch and the reason
+            # below are asked of the same answer.
+            machine_now = await asyncio.to_thread(
+                the_machine_now, deps.what_the_machine_says
+            )
             if not publication_is_switched_on(deps.config, machine_now):
                 if store is not None and not store.record(
                     build_id=build_id,
@@ -4527,7 +4519,7 @@ async def execute_merge_deploy(
                 # WHY IT IS OFF, in the sentence a person reads. "Publication
                 # is switched off" on its own tells somebody nothing they can
                 # act on; the reason names the setting that is not set, or the
-                # one of section G's five conditions that does not hold.
+                # one of the activation check's three conditions that does not hold.
                 why_off = why_publication_is_off(deps.config, machine_now)
                 if both_kinds_ran:
                     detail = (

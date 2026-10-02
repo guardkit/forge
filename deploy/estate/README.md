@@ -737,50 +737,21 @@ whose durable is `DEFAULT_DURABLE_NAME = "forge-serve"`
 `forge-consumer` would be reading a reader that is not there — which is why a
 reader the bus does not hold is a **refusal** here and never a nought.
 
-## What only the machine can say about publication — `estate-check --publication-facts`
+## When publication is on
 
-Added in 2 October 2026. Publication (the merge word sending the joined commit to
-the project's remote, then deploying) is on only when the coordinator's
-`publication.enabled` setting is true **and** every condition of the activation
-check holds. Five of those answers are facts about this machine that no
-settings file can establish, so this mode **looks**, just now, and writes what it
-found:
+Publication (the merge word sending the joined commit to the project's remote,
+then deploying) is on only when the coordinator's `publication.enabled` setting
+is true **and** three things hold, asked again at every merge word:
 
-| Question | What is looked at |
-|---|---|
-| can a sandbox reach the coordinator's settings, or the ledger? | every sandbox's workspaces (`sbx ls --json`), and the mounts of every container inside each running sandbox, against the folders Docker mounts into the coordinator at `/etc/forge` and `/var/lib/forge` |
-| can a sandbox reach the publisher? | the publisher must answer the coordinator; then from inside each running sandbox, the answer service must answer (so the sandbox can make a request at all), and **every** address the publisher has, on every network, must not — by the sandbox's default route (where only the publisher's own 200 counts, since a proxy answers for itself) or directly (where any answer at all is a reach). A publisher in host mode is a reach. The current publisher host policy must verify. With no sandbox running this is unknown |
-| is the coordinator the only thing on the publisher's network? | the publisher is on its own network and no other, not in host mode; `docker network inspect` shows exactly the coordinator and the publisher; the publisher publishes no port |
-| can anything but the publisher read its credential? | no other container on this machine mounts the file or a folder holding it, no sandbox workspace contains it, and only its owner, `FORGE_PUBLISHER_UID`, has any access. The file is never opened |
-
-Paths are compared with symbolic links followed. Before writing anything the
-check also refuses if any container but the coordinator mounts the
-`publication-facts` volume, or any sandbox workspace reaches it. The record goes
-into that volume, written by a throwaway helper container with no network, a
-read-only root, every capability dropped and no new privileges — that volume's
-only writer — after any earlier record has been invalidated. The coordinator mounts
-the volume **read-only** and, when `FORGE_PUBLICATION_FACTS_FILE` names the
-record, reads it **at every merge word**. It acts on a record only while it was
-written for its own container and for exactly its current start (PID 1's start as the kernel counts it, re-read by the check just before writing), after that start, and within a day; anything
-else reads as "nobody has looked", so publication stays off and the merge word
-says why. Because a record is never newer than a start that comes after it, the
-coordinator's boot log says publication is off and says why the facts are not
-usable.
-
-**Nothing re-runs this check by itself.** It needs the host's Docker, the
-sandbox daemon and root on the host (to read the publisher's kernel policy), and
-no container in this estate holds all three — deliberately; none was given more
-to make it possible. So run it after every coordinator start and at least once
-a day. When it is out of date, the merge word stops at "publication pending" and
-its sentence says so, with this command. After running it,
-`docker exec <coordinator> python -m forge.pipeline.publication_status`, which
-asks the same question with the same reader as the next merge word.
-
-Exit status: 0 every answer is the one publication needs; 1 the record was
-written and at least one answer is not; 2 nothing was written (a refusal, or the
-check stopping part-way).
-An env file without `FORGE_PUBLICATION_FACTS_FILE` (every one before release
--3) still renders and runs; the coordinator then behaves exactly as before.
+- `publication.builds_may_run_inside_the_coordinator` is false;
+- `publication.publisher_credential_file` names the publisher's credential
+  file, and no other coordinator, runner or sandbox setting names it;
+- the publisher passed its start-up self-check. The publisher will not start
+  unless its credential file is owned by its own user and readable by nobody
+  else, and it is attached to exactly one network (its own, never host
+  networking). Its health route then says `"self_check": "passed"`, and the
+  coordinator asks that route. A publisher that does not answer keeps
+  publication off, and the merge word says why.
 
 ## Preparing and operating the rollout tools
 

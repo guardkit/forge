@@ -1,9 +1,10 @@
 # The publisher as a service, for the rollout to paste in. NOT STARTED by the
 # stage that wrote it, and the image beside it is not built by it either.
 #
-# READ THE SIX THINGS THIS FRAGMENT IS SAYING, because each one is one of the
-# conditions the activation check refuses without
-# (forge/src/forge/pipeline/publication_activation.py):
+# READ THE SIX THINGS THIS FRAGMENT IS SAYING. The publisher itself refuses to
+# start unless its credential file is readable by its own user alone and it is
+# on exactly one network (forge/src/forge/publisher/__main__.py), and
+# publication stays off until it has passed that check:
 #
 #   1. the credential file is mounted READ-ONLY, into this service and into
 #      nothing else. It is not in the coordinator's settings, not in the
@@ -22,9 +23,7 @@
 #      copy itself for a project built here. There is no writable path into
 #      any project's copy anywhere in this fragment;
 #   6. nothing else is on the publisher's network. That is condition 3 said as
-#      a thing somebody can count, and it is the activation check's question
-#      "only-the-coordinator-is-on-the-publishers-network" — which can only be
-#      answered by looking at the real machine at rollout.
+#      a thing somebody can count.
 #
 # The two addresses per project live in the settings file, not here, because
 # they are settings and not plumbing. That settings file must say that the
@@ -82,9 +81,8 @@ services:
     # it for a send. To look at it by hand at rollout, join its network from a
     # throwaway container instead of publishing a port.
     #
-    # The sandbox is NOT on this network, and the activation check's question
-    # "only-the-coordinator-is-on-the-publishers-network" is the check of
-    # that, asked of the real machine at rollout.
+    # The sandbox is NOT on this network. The publisher refuses to start if it
+    # finds itself on more than this one network, or on the host's.
     networks:
       - forge-publisher-net
     volumes:

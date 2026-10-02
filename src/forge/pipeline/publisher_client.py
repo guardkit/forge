@@ -36,10 +36,12 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "PUBLISHER_COULD_NOT_BE_REACHED",
+    "SELF_CHECK_PASSED",
     "THERE_IS_NO_PUBLISHER",
     "THE_REMOTE_MOVED",
     "ask_the_publisher",
     "the_publishers_address",
+    "the_publishers_self_check",
     "the_remote_moved",
 ]
 
@@ -158,3 +160,44 @@ async def ask_the_publisher(config: Any, request: dict[str, Any]) -> dict[str, A
             "Name one in the coordinator's settings",
         )
     return await asyncio.to_thread(_ask, url, dict(request), _timeout(config))
+
+
+#: What the publisher's health route says when it passed its start-up
+#: self-check. Written out here as well as in the publisher's own service,
+#: because the coordinator does not import the publisher; a test pins the two.
+SELF_CHECK_PASSED: str = "passed"
+
+
+def the_publishers_self_check(config: Any, *, timeout: float = 10.0) -> Any:
+    """Ask the publisher's health route whether it passed its start-up check.
+
+    The publisher refuses to start unless its credential file is readable by
+    its own user alone and it is on exactly its own network; its health route
+    says ``"self_check": "passed"`` when it did. Anything else — no publisher
+    configured, one that does not answer, an answer without that word — is
+    "nobody could ask", which keeps publication off. Never raises.
+    """
+    from forge.pipeline.publication_activation import WhatTheMachineSays
+
+    url = the_publishers_address(config)
+    if url is None:
+        return WhatTheMachineSays(
+            why_nobody_has_looked="no publisher is configured "
+            "(publication.publisher_url is not set)"
+        )
+    try:
+        with urllib.request.urlopen(  # noqa: S310 - an address from settings
+            url.rstrip("/") + "/healthz", timeout=timeout
+        ) as answered:
+            said = json.loads(answered.read().decode("utf-8"))
+    except Exception as exc:  # noqa: BLE001 - not answering is "nobody asked"
+        return WhatTheMachineSays(
+            why_nobody_has_looked=f"it did not answer ({type(exc).__name__})"
+        )
+    if not isinstance(said, dict) or "self_check" not in said:
+        return WhatTheMachineSays(
+            why_nobody_has_looked="its health answer does not report the check"
+        )
+    return WhatTheMachineSays(
+        the_publisher_passed_its_self_check=said["self_check"] == SELF_CHECK_PASSED
+    )

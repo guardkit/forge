@@ -46,8 +46,8 @@ from forge.cli._serve_config import ServeConfig
 from forge.config.models import ForgeConfig
 from forge.lifecycle.migrations import apply_at_boot
 from forge.lifecycle.persistence import SqliteLifecyclePersistence
-from forge.pipeline.publication_facts import where_the_facts_stand
 from forge.pipeline.publication_switch import say_where_publication_stands_at_boot
+from forge.pipeline.publisher_client import the_publishers_self_check
 from forge.lifecycle_bridge import (
     LifecycleBridge,
     LifecycleBridgeWireup,  # noqa: F401  (re-exported via wireup parts contract)
@@ -1203,12 +1203,9 @@ def bind_production_serve(config: ServeConfig, forge_config: ForgeConfig) -> Non
     # by pressing merge. This is ONE line saying either that publication is
     # on, or that it is off and which condition failed. It decides nothing and
     # sends nothing — the press asks again, and that answer is what governs.
-    say_where_publication_stands_at_boot(forge_config)
-    # THE GITHUB PUBLISHING GATE (2 October 2026): and whether the machine's answers for publication are
-    # there and fresh. At boot they never are — a record cannot be newer than
-    # a start that came after it — so this line says what to run, rather than
-    # leaving it to be found at the first merge word.
-    logger.info("publication at boot: %s", where_the_facts_stand())
+    say_where_publication_stands_at_boot(
+        forge_config, lambda: the_publishers_self_check(forge_config)
+    )
 
     # Step 1.5 — validate ``autobuild_runner_url`` is set
     # (TASK-FORGE-FRR-F010I/J). The in-process ASGI fallback path

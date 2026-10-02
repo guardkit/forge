@@ -472,21 +472,16 @@ def compose_merge_executor_deps(
 ) -> Any:
     """The merge press's deps, as the coordinator's merge-word listener has them.
 
-    THE GITHUB PUBLISHING GATE (2 October 2026): the press is given the machine's answers for publication
-    as a READER, :func:`~forge.pipeline.publication_facts.read_publication_facts`,
-    which the press calls on every merge word. With
-    ``FORGE_PUBLICATION_FACTS_FILE`` unset (every estate before 2 October 2026)
-    the reader answers ``None`` — exactly what this listener passed before —
-    so publication stays off, as it always has; with it set, the facts
-    ``estate-check --publication-facts`` wrote are read at each merge word and
-    publication can switch on without a restart. Nobody's word stands in for
-    the check.
+    The press is given a reader that asks the publisher, on every merge word,
+    whether it passed its start-up self-check
+    (:func:`~forge.pipeline.publisher_client.the_publishers_self_check`). A
+    publisher that does not answer keeps publication off.
     """
     from forge.pipeline.merge_executor import (
         MergeExecutorDeps,
         build_in_daemon_deploy_dispatcher,
     )
-    from forge.pipeline.publication_facts import read_publication_facts
+    from forge.pipeline.publisher_client import the_publishers_self_check
 
     return MergeExecutorDeps(
         config=forge_config,
@@ -499,7 +494,9 @@ def compose_merge_executor_deps(
             nats_client=nats_client,
             db_path=db_path,
         ),
-        what_the_machine_says=read_publication_facts,
+        what_the_machine_says=functools.partial(
+            the_publishers_self_check, forge_config
+        ),
     )
 
 

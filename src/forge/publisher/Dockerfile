@@ -31,10 +31,9 @@
 # file says, and NO port of its is published. What can reach it is therefore
 # exactly what is on its network, and its network has the coordinator on it
 # and nothing else — the compose fragment beside this file says why, and why
-# the other two arrangements do not work. "No sandbox can reach the publisher"
-# and "only the coordinator is on the publisher's network" are two of the
-# conditions the activation check refuses without
-# (forge/src/forge/pipeline/publication_activation.py).
+# the other two arrangements do not work. The publisher refuses to start unless
+# it is on exactly one network and its credential file is its user's alone
+# (forge/src/forge/publisher/__main__.py).
 # ---------------------------------------------------------------------------
 
 ARG PYTHON_BASE_DIGEST=sha256:2e256d0381371566ed96980584957ed31297f437569b79b0e5f7e17f2720e53a
