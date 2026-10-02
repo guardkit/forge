@@ -462,6 +462,47 @@ def compose_merge_git_surface(forge_config: Any) -> Any | None:
     return surface_for
 
 
+def compose_merge_executor_deps(
+    *,
+    forge_config: Any,
+    sqlite_pool: Any,
+    pipeline_publisher: Any,
+    nats_client: Any,
+    db_path: Any,
+) -> Any:
+    """The merge press's deps, as the coordinator's merge-word listener has them.
+
+    RELEASE -3, TC8: the press is given the machine's answers for publication
+    as a READER, :func:`~forge.pipeline.publication_facts.read_publication_facts`,
+    which the press calls on every merge word. With
+    ``FORGE_PUBLICATION_FACTS_FILE`` unset (every estate before release -3)
+    the reader answers ``None`` — exactly what this listener passed before —
+    so publication stays off, as it always has; with it set, the facts
+    ``estate-check --publication-facts`` wrote are read at each merge word and
+    publication can switch on without a restart. Nobody's word stands in for
+    the check.
+    """
+    from forge.pipeline.merge_executor import (
+        MergeExecutorDeps,
+        build_in_daemon_deploy_dispatcher,
+    )
+    from forge.pipeline.publication_facts import read_publication_facts
+
+    return MergeExecutorDeps(
+        config=forge_config,
+        pool=sqlite_pool,
+        pipeline_publisher=pipeline_publisher,
+        guardkit_run=compose_merge_guardkit_run(forge_config),
+        git_surface=compose_merge_git_surface(forge_config),
+        deploy_dispatcher=build_in_daemon_deploy_dispatcher(
+            config=forge_config,
+            nats_client=nats_client,
+            db_path=db_path,
+        ),
+        what_the_machine_says=read_publication_facts,
+    )
+
+
 def compose_merge_offer_git_head(forge_config: Any) -> Any | None:
     """Read main's commit where the repository lives, for the merge card's pin.
 
@@ -960,24 +1001,15 @@ def bind_production_dispatch_chain(
                 from forge.adapters.nats.envelope_subscribe import (
                     EnvelopeSubscribeClient,
                 )
-                from forge.pipeline.merge_executor import (
-                    MergeApprovalConsumer,
-                    MergeExecutorDeps,
-                    build_in_daemon_deploy_dispatcher,
-                )
+                from forge.pipeline.merge_executor import MergeApprovalConsumer
 
                 _merge_consumer = MergeApprovalConsumer(
-                    MergeExecutorDeps(
-                        config=forge_config,
-                        pool=sqlite_pool,
+                    compose_merge_executor_deps(
+                        forge_config=forge_config,
+                        sqlite_pool=sqlite_pool,
                         pipeline_publisher=publisher,
-                        guardkit_run=compose_merge_guardkit_run(forge_config),
-                        git_surface=compose_merge_git_surface(forge_config),
-                        deploy_dispatcher=build_in_daemon_deploy_dispatcher(
-                            config=forge_config,
-                            nats_client=client,
-                            db_path=db_path,
-                        ),
+                        nats_client=client,
+                        db_path=db_path,
                     )
                 )
                 await _merge_consumer.attach(EnvelopeSubscribeClient(client))
