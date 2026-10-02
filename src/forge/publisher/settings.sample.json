@@ -7,10 +7,12 @@
   "host": "0.0.0.0",
   "port": 8711,
   "git_timeout_seconds": 180,
+  "_known_hosts_file": "Needed only when a remote is an SSH address (git@host:owner/repo.git): the pinned host keys, mounted read-only from FORGE_PUBLISHER_KNOWN_HOSTS_FILE. The credential file is then the deploy key itself.",
+  "known_hosts_file": "/etc/forge-publisher/known_hosts",
   "projects": {
     "the-project-name-as-registered": {
       "source": "the read-only git address the joined commit is brought out of (the sandbox's git daemon, or the project's copy)",
-      "remote": "the address of the remote named origin, WITHOUT any credential in it"
+      "remote": "the address of the remote named origin, WITHOUT any credential in it: an SSH address (git@host:owner/repo.git) to push with a deploy key, or an https address to push with a token"
     }
   }
 }

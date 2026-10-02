@@ -37,6 +37,8 @@ from __future__ import annotations
 
 import logging
 import os
+import re
+import shlex
 import stat
 import sys
 import threading
@@ -48,6 +50,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "CREDENTIAL_IS_NOT_SHOWN",
     "Credential",
+    "an_ssh_address",
     "CredentialRefusal",
     "read_the_credential",
     "the_askpass_program",
@@ -210,8 +213,43 @@ def the_askpass_program(credential: Credential, *, state_dir: Path) -> Path:
         return program
 
 
+#: ``ssh://...`` or the short form ``user@host:path``.
+_AN_SSH_ADDRESS = re.compile(r"^(?:ssh://|[A-Za-z0-9._-]+@[A-Za-z0-9.-]+:(?!//))")
+
+
+def an_ssh_address(address: str) -> bool:
+    """Is this remote reached over SSH (its credential then being a key)?"""
+    return bool(_AN_SSH_ADDRESS.match(str(address or "").strip()))
+
+
+def _the_ssh_command(credential: Credential, known_hosts: str) -> str:
+    """The ssh git runs: this one key, this one pinned host list, nothing else.
+
+    No agent, no person's configuration, no other key, and a host whose key
+    is not in the pinned file is refused rather than trusted on first sight.
+    """
+    return " ".join(
+        [
+            "ssh",
+            "-F", "/dev/null",
+            "-i", shlex.quote(credential.file),
+            "-o", "IdentitiesOnly=yes",
+            "-o", "IdentityAgent=none",
+            "-o", "BatchMode=yes",
+            "-o", "StrictHostKeyChecking=yes",
+            "-o", "UpdateHostKeys=no",
+            "-o", "UserKnownHostsFile=" + shlex.quote(known_hosts),
+            "-o", "GlobalKnownHostsFile=/dev/null",
+        ]
+    )
+
+
 def the_environment_git_is_given(
-    credential: Credential | None, *, state_dir: Path, home: Path
+    credential: Credential | None,
+    *,
+    state_dir: Path,
+    home: Path,
+    known_hosts: str | None = None,
 ) -> dict[str, str]:
     """The WHOLE environment the publisher's git commands are given.
 
@@ -222,6 +260,10 @@ def the_environment_git_is_given(
     ``HOME`` is the publisher's own private folder, so git reads no person's
     configuration and finds no person's stored credentials: the only
     credential in reach is the one named file.
+
+    ``known_hosts`` is given for a remote reached over SSH: the credential
+    file is then a private key, handed to ssh by its PATH, and there is no
+    program to ask for a password.
     """
     given = {
         "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
@@ -233,5 +275,10 @@ def the_environment_git_is_given(
         "LC_ALL": "C",
     }
     if credential is not None and credential.held:
-        given["GIT_ASKPASS"] = str(the_askpass_program(credential, state_dir=state_dir))
+        if known_hosts:
+            given["GIT_SSH_COMMAND"] = _the_ssh_command(credential, known_hosts)
+        else:
+            given["GIT_ASKPASS"] = str(
+                the_askpass_program(credential, state_dir=state_dir)
+            )
     return given
