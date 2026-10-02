@@ -1290,14 +1290,24 @@ p=pathlib.Path('/out/current.db');print(json.dumps({'sha256':hashlib.sha256(p.re
         need(changed,'the started ledger differs from the recorded one without a reconciled build; keep the door shut and reconcile its state')
         return {'services':seen,'reconciled':changed}
 
+    def sandbox_checks(self,then):
+        """The sandbox holds this release: the clone's bootstrap, the bootstrap env and the
+        sandbox settings have the hashes recorded for it, and the image the bootstrap
+        names is, inside the sandbox, labelled with this release."""
+        facts=self.sandbox_facts();expected=self.expected_sandbox();actual=self.sandbox_hashes()
+        for key,what in (('template_sha256','the clone\'s bootstrap'),('bootstrap_env_sha256','the bootstrap env file'),('settings_sha256','the sandbox settings file')):
+            need(actual[key]==expected[key],f'{what} does not have the SHA-256 recorded for release {self.release}, so {then}; install this release in the sandbox (rollout-sandbox --upgrade) or restore it (--upgrade --back) first')
+        need(facts['image'] and not facts['image'].startswith('-'),'the bootstrap env names no FORGE_IMAGE; the sandbox services\' image cannot be checked')
+        image=self.sbx('exec',facts['name'],'docker','image','inspect','--format','{{.Id}} {{index .Config.Labels "com.guardkit.release.version"}}',facts['image']).stdout.split()
+        need(len(image)==2 and image[1]==self.release,f'inside the sandbox, the image the bootstrap names is not release {self.release}\'s, so {then}; hand this release\'s image in first')
+        return {'hashes':actual,'image':image[0]}
+
     def start_supervisor(self,model):
         """Start sandbox-runner only on this release's own bootstrap, env and settings."""
         item=self.service_ids((SUPERVISOR,)).get(SUPERVISOR)
         facts=self.sandbox_facts()
         if not (item and item['State'].get('Running') and item['Image']==self.release_images(SUPERVISOR)):
-            expected=self.expected_sandbox();actual=self.sandbox_hashes()
-            for key,what in (('template_sha256','the clone\'s bootstrap'),('bootstrap_env_sha256','the bootstrap env file'),('settings_sha256','the sandbox settings file')):
-                need(actual[key]==expected[key],f'{what} does not have the SHA-256 recorded for release {self.release}, so sandbox-runner was not started; install this release in the sandbox (or restore it) first. The rest is up with the door shut')
+            self.sandbox_checks('sandbox-runner was not started. The rest is up with the door shut')
             self.compose('up','-d','--no-deps',SUPERVISOR)
             item=self.service_ids((SUPERVISOR,))[SUPERVISOR]
         restarts=item.get('RestartCount');deadline=time.monotonic()+SANDBOX_START_WAIT_SECONDS
@@ -1359,6 +1369,10 @@ p=pathlib.Path('/out/current.db');print(json.dumps({'sha256':hashlib.sha256(p.re
         stage('settings-invariant');self.settings_invariant()
         stage('settings-load');self.load_settings()
         stage('policy-verify');self.policy_verify(require_members=False)
+        # The sandbox must already hold this release before anything starts: found only
+        # once the new coordinator is up, a mismatch would need the way back with H6.
+        if SUPERVISOR in model['services']:
+            stage('sandbox-preflight');result['sandbox_preflight']=self.sandbox_checks('nothing was started')
         stage('baseline')
         if self.doc.get('stage')=='final':baseline=self.doc['final']['backup']
         else:baseline=self.ledger_backup('switch-start-'+self.release+'-'+since.strftime('%Y%m%dT%H%M%S%fZ')+'.db')
