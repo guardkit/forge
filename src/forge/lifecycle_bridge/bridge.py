@@ -727,6 +727,9 @@ class LifecycleBridge:
                     getattr(answer, "reason", ""),
                     getattr(answer, "remaining", None),
                 )
+                # Not confirmed (an unreachable runner reads the same): a
+                # later cancel must be able to ask again.
+                self._cancel_in_flight.discard(feature_id)
             return CancelResult(
                 feature_id=feature_id,
                 invoked=True,
