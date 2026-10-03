@@ -78,6 +78,7 @@ References:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sqlite3
 from datetime import datetime, timezone
@@ -1586,23 +1587,49 @@ def _build_dispatch_build(
     return dispatch_build
 
 
+#: How long a launch waits before asking the lifecycle bridge again when it
+#: refused this build's observer because an earlier build of the same
+#: feature is still finishing (its stop not yet confirmed). Tests shorten it.
+OBSERVER_BUSY_RETRY_SECONDS: float = 5.0
+
+
 async def _safe_register_observer(register_observer, build_id: str) -> None:
-    """Invoke the R1 deferred bridge-registration closure, never raising.
+    """Invoke the R1 deferred bridge-registration closure; wait if refused.
 
     Registration is best-effort (the bridge owns its own observability and
     the legacy ack path still works), so a raising ``register_observer``
     must not abort the launch — mirrors the consumer's pre-relocation
     ``register_ack_handle`` guard.
+
+    A *refusal* is different: the bridge answers ``False`` when another
+    build of the same feature still has a live observer (it tracks one per
+    feature, and the earlier build may still be waiting for its runner to
+    confirm the stop). Launching then would leave this build with no
+    observer and no acknowledgement, so the launch waits here, asking again
+    every :data:`OBSERVER_BUSY_RETRY_SECONDS`, until the earlier observer
+    has finished. The build keeps its message un-acked meanwhile; shutdown
+    cancels the wait with the dispatch task.
     """
-    try:
-        await register_observer()
-    except Exception as exc:  # noqa: BLE001 — best-effort registration
-        logger.warning(
-            "dispatch_build: deferred observer registration raised (%s) for "
-            "build_id=%s; continuing with legacy ack_callback fallback",
-            exc,
+    while True:
+        try:
+            accepted = await register_observer()
+        except Exception as exc:  # noqa: BLE001 — best-effort registration
+            logger.warning(
+                "dispatch_build: deferred observer registration raised (%s) for "
+                "build_id=%s; continuing with legacy ack_callback fallback",
+                exc,
+                build_id,
+            )
+            return
+        if accepted is not False:
+            return
+        logger.info(
+            "dispatch_build: build_id=%s waits to launch — an earlier build of "
+            "the same feature is still finishing; asking again in %ss",
             build_id,
+            OBSERVER_BUSY_RETRY_SECONDS,
         )
+        await asyncio.sleep(OBSERVER_BUSY_RETRY_SECONDS)
 
 
 def _build_publish_build_failed(
