@@ -3998,7 +3998,7 @@ def _build_failed_snapshot(
     return snapshot
 
 
-async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
+async def _running_wave_body(state: AutobuildRunnerState) -> dict[str, Any]:
     """Invoke ``guardkit autobuild`` against the resolved local checkout.
 
     TASK-ABW-001 — replaces the previous lifecycle-stub body with the
@@ -4066,6 +4066,8 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
             )
         )
     feature_id = feature_id_raw.strip()
+    if _stop_asked_before_spawn(payload):
+        return _snapshot_update(_cancelled_before_spawn(payload, None))
 
     # The missing-repo decision lives entirely in the resolver (the runner's
     # tests patch _resolve_repo_path, so an early guard here would bypass the
@@ -4315,6 +4317,8 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
         ",".join(sorted(launch_env)),
     )
 
+    if _stop_asked_before_spawn(payload):
+        return _snapshot_update(_cancelled_before_spawn(payload, worktree_path))
     try:
         proc = await asyncio.create_subprocess_exec(
             *argv,
@@ -4348,6 +4352,10 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
     # own on cancel, timeout or wedge, or the runner's stop route — reaches
     # its whole tree and everything carrying its owner marker, not one pid.
     owned_build = build_processes.register(receipt_build_id, proc.pid)
+    if owned_build.stop_requested:
+        # Asked to stop while the child was being spawned: stop it now; the
+        # build finishes CANCELLED below once everything it owns is gone.
+        await _stop_owned_once(owned_build, proc)
 
     stage_complete_count = 0
     # Coach-score state (TASK-UBS1C-001).
@@ -4850,6 +4858,45 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
         success_counts.source,
     )
     return _snapshot_update(snapshot)
+
+
+async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
+    """The ``running_wave`` node: :func:`_running_wave_body`, then forget the run.
+
+    Whatever way the body ends — a terminal, a cancellation, an unexpected
+    error — this runner stops keeping the build's process record and any
+    stop asked for it before its child existed.
+    """
+    payload = _extract_launch_payload(list(state.get("messages", [])))
+    build_id = str(payload.get("build_id") or "")
+    try:
+        return await _running_wave_body(state)
+    finally:
+        if build_id:
+            build_processes.forget(build_id)
+
+
+def _stop_asked_before_spawn(payload: Mapping[str, Any]) -> bool:
+    build_id = str(payload.get("build_id") or "")
+    return bool(build_id) and build_processes.stop_pending(build_id)
+
+
+def _cancelled_before_spawn(
+    payload: Mapping[str, Any], worktree_path: Path | None
+) -> dict[str, Any]:
+    """The CANCELLED snapshot of a build stopped before GuardKit was spawned."""
+    logger.warning(
+        "autobuild_runner: build %s was asked to stop before its GuardKit "
+        "child was spawned; finishing cancelled without spawning it",
+        payload.get("build_id"),
+    )
+    cancelled = _build_snapshot(payload, lifecycle="cancelled")
+    cancelled["error_message"] = (
+        "the build was stopped on request before it started any process"
+    )
+    if worktree_path is not None:
+        cancelled["worktree_path"] = str(worktree_path)
+    return cancelled
 
 
 #: How often a stop that cannot yet confirm every owned process gone says so.
