@@ -24,7 +24,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 import yaml
-from nats.js.api import ConsumerConfig
+from nats.js.api import ConsumerConfig, DeliverPolicy
 from nats.js.errors import NotFoundError
 from pydantic import ValidationError
 
@@ -129,7 +129,13 @@ class _JS:
         if self.existing_limit is None:
             raise NotFoundError()
         info = Mock()
-        info.config = ConsumerConfig(max_ack_pending=self.existing_limit)
+        # A hand-made durable: its deliver policy differs from the daemon's.
+        info.config = ConsumerConfig(
+            durable_name=DURABLE,
+            deliver_policy=DeliverPolicy.NEW,
+            filter_subject=BUILD_QUEUED_SUBJECT_FILTER,
+            max_ack_pending=self.existing_limit,
+        )
         return info
 
     refuse_update: Exception | None = None
@@ -193,6 +199,8 @@ class TestAttachUsesTheLimit:
         assert [c.max_ack_pending for c in js.added] == [8]
         assert js.added[0].durable_name == DURABLE
         assert js.added[0].filter_subject == BUILD_QUEUED_SUBJECT_FILTER
+        # Only the limit changes: the live deliver policy is sent back as is.
+        assert js.added[0].deliver_policy == DeliverPolicy.NEW
 
     @pytest.mark.asyncio
     async def test_existing_durable_with_the_same_limit_is_left_alone(self) -> None:
@@ -224,6 +232,30 @@ class TestAttachUsesTheLimit:
         assert "pipeline.max_concurrent_builds" in errors[0]
         assert "it is 1 on the broker, configured 2" in errors[0]
         assert "deliver policy can not be updated" in errors[0]
+
+
+    @pytest.mark.asyncio
+    async def test_refused_downshift_does_not_bind(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from nats.js.errors import ServerError
+
+        from forge.cli._serve_daemon import BuildLimitNotApplied, _attach_consumer
+
+        js = _JS(_Sub(), existing_limit=8)
+        js.refuse_update = ServerError(
+            code=500, err_code=10012, description="update refused"
+        )
+        caplog.set_level(logging.ERROR, logger="forge.cli._serve_daemon")
+        with pytest.raises(BuildLimitNotApplied):
+            await _attach_consumer(_Client(js), DURABLE, max_ack_pending=1)
+        assert js.subscribed is None, "never bound at 8 when 1 is configured"
+        errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(errors) == 1
+        assert "pipeline.max_concurrent_builds" in errors[0]
+        assert "it is 8 on the broker, configured 1" in errors[0]
+        assert "update refused" in errors[0]
+        assert "NOT binding" in errors[0]
 
 
 # ---------------------------------------------------------------------------

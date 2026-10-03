@@ -299,48 +299,87 @@ class TestExistingDurableFollowsTheSetting:
             await nc.close()
 
 
-class TestRefusedUpdate:
+async def _hand_made_durable(js: Any, limit: int) -> None:
+    """A durable made by hand with a deliver policy the daemon does not use."""
+    from nats.js.api import AckPolicy, ConsumerConfig, DeliverPolicy
+
+    await js.add_consumer(
+        PIPELINE_STREAM_NAME,
+        ConsumerConfig(
+            durable_name=DURABLE,
+            deliver_policy=DeliverPolicy.NEW,
+            ack_policy=AckPolicy.EXPLICIT,
+            filter_subject="pipeline.build-queued.*",
+            max_ack_pending=limit,
+        ),
+    )
+
+
+class TestUpdateKeepsOtherSettings:
     @pytest.mark.asyncio
-    async def test_uneditable_durable_is_bound_unchanged_with_an_error(
-        self, estate_broker: _Broker, caplog: pytest.LogCaptureFixture
+    async def test_hand_made_durable_is_downshifted_8_to_1(
+        self, estate_broker: _Broker
     ) -> None:
-        import logging
-
-        from nats.js.api import AckPolicy, ConsumerConfig, DeliverPolicy
-
         nc = await _connect(estate_broker.url)
         try:
             js = await _fresh_stream(nc)
-            # A durable made by hand with a deliver policy the daemon's own
-            # config does not use; the broker will not edit deliver policy.
-            await js.add_consumer(
-                PIPELINE_STREAM_NAME,
-                ConsumerConfig(
-                    durable_name=DURABLE,
-                    deliver_policy=DeliverPolicy.NEW,
-                    ack_policy=AckPolicy.EXPLICIT,
-                    filter_subject="pipeline.build-queued.*",
-                    max_ack_pending=1,
-                ),
-            )
-            caplog.set_level(logging.ERROR, logger="forge.cli._serve_daemon")
-            sub = await _attach_consumer(nc, DURABLE, max_ack_pending=2)
+            await _hand_made_durable(js, 8)
+
+            sub = await _attach_consumer(nc, DURABLE, max_ack_pending=1)
 
             info = await js.consumer_info(PIPELINE_STREAM_NAME, DURABLE)
-            assert info.config.max_ack_pending == 1, "left as the broker had it"
-            errors = [
-                r.getMessage() for r in caplog.records if r.levelno == logging.ERROR
-            ]
-            assert len(errors) == 1
-            assert "pipeline.max_concurrent_builds" in errors[0]
-            assert "it is 1 on the broker, configured 2" in errors[0]
-            assert "deliver policy" in errors[0]
-
-            # The bound subscription works: a new build is handed out.
-            await _publish_builds(js, 1)
-            assert len(await _drain(sub)) == 1
+            assert info.config.max_ack_pending == 1
+            assert str(getattr(info.config.deliver_policy, "value", info.config.deliver_policy)) == "new"
+            await _publish_builds(js, 3)
+            assert len(await _drain(sub)) == 1, "one build at a time"
         finally:
             await nc.close()
+
+    @pytest.mark.asyncio
+    async def test_refused_downshift_takes_no_builds(
+        self, estate_broker: _Broker, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from nats.js.client import JetStreamContext
+        from nats.js.errors import ServerError
+
+        setup = await _connect(estate_broker.url)
+        try:
+            js = await _fresh_stream(setup)
+            await _hand_made_durable(js, 8)
+            await _publish_builds(js, 2)
+
+            async def _refuse(self: Any, stream: str, config: Any = None, **kw: Any) -> Any:
+                raise ServerError(
+                    code=500, err_code=10012, description="forced refusal for the test"
+                )
+
+            # Every later update is refused, as a broker that will not edit.
+            monkeypatch.setattr(JetStreamContext, "add_consumer", _refuse)
+            dispatched: list[Any] = []
+
+            async def _dispatch(msg: Any) -> None:
+                dispatched.append(msg)
+
+            monkeypatch.setattr(_serve_daemon, "dispatch_payload", _dispatch)
+            config = ServeConfig(nats_url=estate_broker.url, max_concurrent_builds=1)
+            client = await _connect(estate_broker.url)
+            daemon = asyncio.create_task(
+                run_daemon(config, SubscriptionState(), client=client)
+            )
+            await asyncio.sleep(2.5)  # first attempt plus one backoff retry
+            daemon.cancel()
+            try:
+                await asyncio.wait_for(daemon, timeout=10)
+            except asyncio.CancelledError:
+                pass
+
+            assert dispatched == []
+            info = await js.consumer_info(PIPELINE_STREAM_NAME, DURABLE)
+            assert info.config.max_ack_pending == 8
+            assert info.num_ack_pending == 0
+            assert info.num_pending == 2, "no build was taken"
+        finally:
+            await setup.close()
 
 
 class TestRestartAndRedelivery:
