@@ -112,13 +112,22 @@ class _GitCalls:
     be told apart by the directory the command is run in. Every call whose
     working directory is the path forge-prod was given is a call the press made
     on this side, and there must be none of those.
+
+    A ``git -C <path>`` names its directory in the command rather than as the
+    working directory, so that path is recorded too (3 October 2026): the
+    press's read of ``deploy/profile.yaml`` went to the path on this side that
+    way, and this recorder, watching the working directory only, missed it.
     """
 
     def __init__(self) -> None:
         self.cwds: list[str] = []
 
-    def record(self, cwd: Any) -> None:
+    def record(self, cwd: Any, argv: Any = None) -> None:
         self.cwds.append(str(cwd))
+        words = [str(word) for word in argv] if isinstance(argv, (list, tuple)) else []
+        for at, word in enumerate(words[:-1]):
+            if word == "-C":
+                self.cwds.append(words[at + 1])
 
     def any_in(self, where: Path) -> list[str]:
         root = str(where)
@@ -135,11 +144,11 @@ class _RecordingSubprocess:
         return getattr(subprocess, name)
 
     def run(self, *args: Any, **kwargs: Any) -> Any:
-        self._calls.record(kwargs.get("cwd"))
+        self._calls.record(kwargs.get("cwd"), args[0] if args else kwargs.get("args"))
         return subprocess.run(*args, **kwargs)
 
     def Popen(self, *args: Any, **kwargs: Any) -> Any:  # noqa: N802 — the stdlib name
-        self._calls.record(kwargs.get("cwd"))
+        self._calls.record(kwargs.get("cwd"), args[0] if args else kwargs.get("args"))
         return subprocess.Popen(*args, **kwargs)
 
 
@@ -153,7 +162,7 @@ class _RecordingAsyncio:
         return getattr(asyncio, name)
 
     def create_subprocess_exec(self, *args: Any, **kwargs: Any) -> Any:
-        self._calls.record(kwargs.get("cwd"))
+        self._calls.record(kwargs.get("cwd"), args)
         return asyncio.create_subprocess_exec(*args, **kwargs)
 
 
@@ -255,7 +264,9 @@ def _receipts_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return root
 
 
-def _build_row(pool: SqliteLifecyclePersistence, repo: str = REPO) -> None:
+def _build_row(
+    pool: SqliteLifecyclePersistence, repo: str = REPO, start_commit: str = "0" * 40
+) -> None:
     pool.connection.execute(
         "INSERT OR IGNORE INTO builds (build_id, feature_id, repo, branch, "
         "feature_yaml_path, status, triggered_by, correlation_id, queued_at, "
@@ -267,7 +278,7 @@ def _build_row(pool: SqliteLifecyclePersistence, repo: str = REPO) -> None:
             repo,
             f"autobuild/{FEATURE_ID}",
             CORRELATION,
-            "0" * 40,
+            start_commit,
         ),
     )
     pool.connection.commit()
@@ -359,11 +370,12 @@ async def _press(
     repo: str,
     repo_root: Path,
     merge: _FakeMergeCommand,
-    deploy: _FakeDeploy,
+    deploy: Any,
     expect_main_sha: str,
     publisher: _FakePublisher | None = None,
+    start_commit: str = "0" * 40,
 ) -> Any:
-    _build_row(pool, repo)
+    _build_row(pool, repo, start_commit)
     deps = MergeExecutorDeps(
         config=config,
         pool=pool,
@@ -531,6 +543,97 @@ class TestTheWholePressRunsWhereTheRepositoryLives:
         )
         # Its git ran here, in its own checkout, which is where it lives.
         assert git_calls.any_in(plain_checkout)
+
+
+class TestTheProjectsDeployProfileIsReadWhereTheRepositoryLives:
+    """FEAT-E592, 3 October 2026: the merge word stopped at the candidate check
+    with "deploy profile not found: <the path this side was given>", because
+    the press and the deploy legs read ``deploy/profile.yaml`` out of a copy
+    this side does not have. Both now read the committed file in the sandbox.
+
+    The press here is given the REAL in-daemon deploy dispatcher, so the
+    candidate leg reads the profile exactly as production does; only the deploy
+    stage beneath it is a recorder, so no script and no driver is run.
+    """
+
+    _PROFILE = {
+        "env_id": "apitest",
+        "compose": {"file": "docker-compose.yml", "script": "deploy/sandbox-deploy.sh"},
+        "identity": {"setting": "DEPLOY_IDENTITY", "reported_as": "DEPLOYED_IDENTITY"},
+    }
+
+    @pytest.mark.asyncio
+    async def test_the_candidate_check_passes_with_nothing_on_this_side(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+        clone: Path,
+        on_this_side: Path,
+        git_calls: _GitCalls,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        _receipts_env: Path,
+    ) -> None:
+        import yaml
+
+        from forge.pipeline.merge_executor import build_in_daemon_deploy_dispatcher
+
+        # The project's own profile, committed in the clone in the sandbox and
+        # nowhere else; the build is recorded as starting from that commit.
+        (clone / "deploy").mkdir()
+        (clone / "deploy" / "profile.yaml").write_text(
+            yaml.safe_dump(self._PROFILE), encoding="utf-8"
+        )
+        _git(clone, "add", "deploy/profile.yaml")
+        _git(clone, "commit", "-q", "-m", "the project's deploy profile")
+        _git(clone, "rebase", "-q", "main", f"autobuild/{FEATURE_ID}")
+        _git(clone, "checkout", "-q", "main")
+        _git(clone, "push", "-q", "origin", "main")
+        started_at = _git(clone, "rev-parse", "main")
+        tip = _git(clone, "rev-parse", f"autobuild/{FEATURE_ID}")
+        assert not on_this_side.exists()
+
+        legs: list[dict[str, Any]] = []
+        fake_leg = _FakeDeploy()
+
+        async def _stage(deploy_cfg: Any, profile: Any, **kwargs: Any) -> Any:
+            legs.append({"profile": profile, **kwargs})
+            return await fake_leg(**kwargs)
+
+        monkeypatch.setattr("forge.deploy.composition.dispatch_deploy_stage", _stage)
+        dispatcher = build_in_daemon_deploy_dispatcher(
+            config=config, nats_client=object(), db_path=tmp_path / "forge.db"
+        )
+
+        outcome = await _press(
+            config=config,
+            pool=pool,
+            repo=REPO,
+            repo_root=on_this_side,
+            merge=_FakeMergeCommand(tip),
+            deploy=dispatcher,
+            expect_main_sha=started_at,
+            start_commit=started_at,
+        )
+
+        # Past the candidate check: nothing published, so publication waits.
+        assert outcome.result == "publication-pending", outcome.detail
+        assert outcome.gate_before_merge["checks_passed"] == 8
+        check = legs[0]
+        assert check["leg"] == "candidate_check"
+        # The profile the leg was composed from is the one in the clone ...
+        assert check["profile"].env_id == "apitest"
+        # ... and the press read it there too: the identity the project
+        # declares was handed to the check under the project's own setting.
+        assert set(check["identity_env"] or {}) == {"DEPLOY_IDENTITY"}
+        assert check["candidate_cwd"] == str(clone / ".forge-candidates" / FEATURE_ID)
+        # With an identity on record, the cleanup names the candidate it removes,
+        # and that leg's profile came from the sandbox as well.
+        assert [leg["leg"] for leg in legs] == ["candidate_check", "candidate_down"]
+        assert legs[1]["profile"].env_id == "apitest"
+        # Not one git command, and no profile read, on this side.
+        assert git_calls.any_in(on_this_side) == []
+        assert not on_this_side.exists()
 
 
 class TestTheCompositionOnlyRoutesWhatItShould:

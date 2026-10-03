@@ -144,6 +144,32 @@ class TestTheTwoHalvesOfTheSeamAgree:
         assert (other / "keep.txt").is_file()
 
 
+class TestTheProjectsOwnFileIsReadInThere:
+    """The press reads ``deploy/profile.yaml`` at a commit through this venue
+    (3 October 2026, FEAT-E592), so the two halves must agree on that too."""
+
+    @pytest.mark.asyncio
+    async def test_a_file_at_a_commit_reads_the_same_on_both_sides(
+        self, git: SidecarCandidateGit, clone: Path
+    ) -> None:
+        from forge.deploy.candidate_tree import read_file_at_commit
+
+        tip = _git(clone, "rev-parse", f"autobuild/{FEATURE_ID}")
+
+        there = await git.read_file_at_commit(tip, "feature.txt")
+        here = await read_file_at_commit(clone, tip, "feature.txt")
+        assert there == here
+        assert there.found is True and there.content == "the feature\n"
+        # Not in that commit is an answer, not a refusal.
+        absent = await git.read_file_at_commit("main", "feature.txt")
+        assert absent.ok is True and absent.found is False
+        # A commit the clone does not have is a refusal, in git's words.
+        missing = await git.read_file_at_commit("b" * 40, "feature.txt")
+        assert missing.ok is False and "does not have the commit" in str(
+            missing.refusal
+        )
+
+
 class TestASidecarThatCannotBeReached:
     """Never a crash: an honest answer, and the press says what it could not do."""
 
@@ -160,6 +186,8 @@ class TestASidecarThatCannotBeReached:
         assert await git.is_ancestor("main", "main") is None
         assert await git.ensure_candidate_trees_excluded() is None
         assert await git.remove_candidate_tree(FEATURE_ID) is False
+        unread = await git.read_file_at_commit("main", "deploy/profile.yaml")
+        assert unread.ok is False and "127.0.0.1:1" in str(unread.refusal)
 
     @pytest.mark.asyncio
     async def test_a_lay_out_raises_with_the_address_in_the_sentence(self) -> None:
