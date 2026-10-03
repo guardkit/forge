@@ -124,6 +124,7 @@ from forge.planning.work_queue_commands import (
     notifier_takes_parent_request_id,
 )
 from forge.planning.work_queue_store import (
+    BUILD_REJECTED_ACTION,
     WorkQueueStore,
     database_file,
     same_database,
@@ -240,12 +241,13 @@ DID_NOT_LAND: str = "did not land"
 MERGE_DECLINED: str = "merge declined"
 NOT_PUBLISHED: str = "not published"
 NO_MERGE_CARD: str = "no merge card"
+BUILD_REFUSED: str = "build refused"
 
 #: The answers that will not turn into "landed" without someone acting, so a
 #: row waiting on one is never left waiting silently: the loop asks "hold or
 #: go" once. Work that lands afterwards still lets the row go.
 WILL_NOT_LAND_ON_ITS_OWN: frozenset[str] = frozenset(
-    {DID_NOT_LAND, MERGE_DECLINED, NOT_PUBLISHED, NO_MERGE_CARD}
+    {DID_NOT_LAND, MERGE_DECLINED, NOT_PUBLISHED, NO_MERGE_CARD, BUILD_REFUSED}
 )
 
 #: How long a build that finished clean may wait for its merge card to be
@@ -616,8 +618,13 @@ def work_landing(
     - ``BUILT_NOTHING`` — no build under this correlation id and none
       promised: a question, or a planning run that ended without handing a
       build over. Nothing is coming, so nothing is waited for.
+    - ``BUILD_REFUSED`` — no build row, and the pipeline noted on the queue
+      row that it refused the build before writing one (an originator not
+      approved, a feature file outside the allowed folders, the sandbox
+      policy). Nothing more will come of it.
     - ``NOT_LANDED_YET`` — a planning run that handed a build over before the
-      build was written.
+      build was written, and no refusal noted: the build is queued and not
+      yet delivered.
     - ``LANDED`` — published, as above.
     - ``DID_NOT_LAND`` — the build failed, was cancelled or never ran; or the
       merge executor reported the merge FAILED and nothing was published.
@@ -652,6 +659,8 @@ def work_landing(
             raise
         build = None
     if build is None:
+        if _build_was_refused(connection, correlation_id):
+            return BUILD_REFUSED
         if _planning_state(connection, correlation_id) == (
             PlanningState.BUILD_QUEUED.value
         ):
@@ -690,6 +699,27 @@ def work_landing(
         ):
             return NO_MERGE_CARD
     return NOT_LANDED_YET
+
+
+def _build_was_refused(connection: sqlite3.Connection, correlation_id: str) -> bool:
+    """True when the queue row under this correlation id carries the
+    pipeline's note that its build was refused before it started."""
+    try:
+        row = connection.execute(
+            """
+            SELECT 1
+              FROM work_queue_events AS event
+              JOIN work_queue ON work_queue.id = event.queue_id
+             WHERE work_queue.correlation_id = ? AND event.action = ?
+             LIMIT 1
+            """,
+            (correlation_id, BUILD_REJECTED_ACTION),
+        ).fetchone()
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower():
+            return False
+        raise
+    return row is not None
 
 
 def _planning_state(connection: sqlite3.Connection, correlation_id: str) -> str | None:
@@ -1177,7 +1207,15 @@ class WorkQueueLoop:
             )
             # A row Rich himself rejected did not fail; the question names
             # what he did, so he is not told a machine failure stopped it.
-            if answer == MERGE_DECLINED:
+            if answer == BUILD_REFUSED:
+                why = first_sentence(
+                    self._store.build_rejection_reason(
+                        str(antecedent["correlation_id"])
+                    )
+                    or "no reason was given"
+                )
+                what_happened = f"'s build was refused before it started ({why})"
+            elif answer == MERGE_DECLINED:
                 what_happened = "was not merged (you said no at its merge card)"
             elif answer == NOT_PUBLISHED:
                 what_happened = "was approved for merge but not published"
@@ -1187,8 +1225,9 @@ class WorkQueueLoop:
                 what_happened = f"was {REJECTED_BY_OWNER}"
             else:
                 what_happened = "failed"
+            joiner = "" if what_happened.startswith("'") else " "
             message = (
-                f"#{int(after_id)} {what_happened} and #{queue_id} was "
+                f"#{int(after_id)}{joiner}{what_happened} and #{queue_id} was "
                 f"waiting on it — hold or go?"
             )
             logger.info("work queue: %s", message)
@@ -1951,6 +1990,7 @@ __all__ = [
     "Admission",
     "BLOCKED_ACTION",
     "BUILD_FAILURE_STATES",
+    "BUILD_REFUSED",
     "BUILT_NOTHING",
     "DID_NOT_LAND",
     "LANDED",

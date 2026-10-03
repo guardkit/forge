@@ -56,6 +56,13 @@ from typing import Any, Callable, Iterable, Iterator, Sequence
 #: anything.
 OPEN_STATUSES: tuple[str, ...] = ("QUEUED", "ADMITTED")
 
+#: The event written on a row whose build the pipeline refused before it
+#: wrote any build row (see :meth:`WorkQueueStore.record_build_rejection`).
+BUILD_REJECTED_ACTION: str = "build_rejected"
+
+#: Who writes that event: the build pipeline, not a person.
+BUILD_REJECTED_ACTOR: str = "forge-pipeline"
+
 #: Closed statuses, in the vocabulary the schema's CHECK allows.
 CLOSED_STATUSES: tuple[str, ...] = ("DONE", "WITHDRAWN", "BLOCKED")
 
@@ -653,6 +660,59 @@ class WorkQueueStore:
                 details=details,
             )
 
+    def record_build_rejection(
+        self,
+        correlation_id: str,
+        reason: str,
+        *,
+        actor_identity: str = BUILD_REJECTED_ACTOR,
+    ) -> bool:
+        """Note on a queue row that its build was refused before it started.
+
+        The pipeline refuses some builds before it writes any build row — an
+        originator that is not approved, a feature file outside the allowed
+        folders, a repository the sandbox policy will not build. Without a
+        note, nothing durable says so, and a row told to wait "after" this one
+        would wait for ever. This writes one ``build_rejected`` event, with
+        the reason, on the row filed under ``correlation_id``; the take-next
+        loop reads it and asks "hold or go".
+
+        A no-op returning False when no row was filed under that correlation
+        id (a build queued directly, not through the queue), and when the row
+        already carries the note (a redelivered refusal says nothing new).
+        """
+        row = self.get_by_correlation_id(correlation_id)
+        if row is None:
+            return False
+        queue_id = int(row["id"])
+        if self.has_event(queue_id, BUILD_REJECTED_ACTION):
+            return False
+        self.record_event(
+            queue_id=queue_id,
+            action=BUILD_REJECTED_ACTION,
+            actor_identity=actor_identity,
+            details={"reason": reason},
+        )
+        return True
+
+    def build_rejection_reason(self, correlation_id: str) -> str | None:
+        """The reason the row's build was refused before it started, or None."""
+        row = self.get_by_correlation_id(correlation_id)
+        if row is None:
+            return None
+        for event in reversed(self.list_events(int(row["id"]))):
+            if str(event["action"]) != BUILD_REJECTED_ACTION:
+                continue
+            details: Any = {}
+            if event["details_json"]:
+                try:
+                    details = json.loads(str(event["details_json"]))
+                except ValueError:
+                    details = {}
+            reason = details.get("reason") if isinstance(details, dict) else None
+            return str(reason or "no reason was given")
+        return None
+
     def _record_event(
         self,
         *,
@@ -838,6 +898,8 @@ class WorkQueueStore:
 
 
 __all__ = [
+    "BUILD_REJECTED_ACTION",
+    "BUILD_REJECTED_ACTOR",
     "CLOSED_STATUSES",
     "FiledRow",
     "KINDS",

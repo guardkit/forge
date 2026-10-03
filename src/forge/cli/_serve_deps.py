@@ -692,6 +692,7 @@ def _build_dispatch_build(
     gate_clock: Callable[[], datetime] | None = None,
     conductor_router: Callable[..., Any] | None = None,
     ack_guard: Any = None,
+    record_build_rejection: Callable[[str, str], Any] | None = None,
 ):
     """Return the production ``dispatch_build`` closure.
 
@@ -1060,6 +1061,17 @@ def _build_dispatch_build(
                 "observer, conductor or runner",
                 reason,
             )
+            if existing is None:
+                # No build row will ever exist for this delivery: note the
+                # refusal on the sentence's queue row so a row waiting "after"
+                # it is asked "hold or go" rather than left waiting.
+                from forge.adapters.nats.pipeline_consumer import (
+                    note_build_rejection,
+                )
+
+                note_build_rejection(
+                    record_build_rejection, payload.correlation_id, reason
+                )
             if lifecycle_emitter is not None:
                 from forge.pipeline import BuildContext
 
@@ -1560,6 +1572,30 @@ def _build_publish_build_failed(
     return publish_build_failed
 
 
+def _work_queue_rejection_recorder(
+    sqlite_pool: Any,
+) -> Callable[[str, str], bool]:
+    """``(correlation_id, reason)`` that notes a refused build on its queue row.
+
+    Uses the lifecycle pool's own connection — the work queue lives in the same
+    Forge database — and leaves the connection's row factory as it found it.
+    """
+
+    def _record(correlation_id: str, reason: str) -> bool:
+        from forge.planning.work_queue_store import WorkQueueStore
+
+        connection = sqlite_pool.connection
+        previous = connection.row_factory
+        try:
+            return WorkQueueStore(connection).record_build_rejection(
+                correlation_id, reason
+            )
+        finally:
+            connection.row_factory = previous
+
+    return _record
+
+
 def build_pipeline_consumer_deps(
     client: Any,
     forge_config: ForgeConfig,
@@ -1574,6 +1610,7 @@ def build_pipeline_consumer_deps(
     gate_clock: Callable[[], datetime] | None = None,
     conductor_router: Callable[..., Any] | None = None,
     ack_guard: Any = None,
+    record_build_rejection: Callable[[str, str], Any] | None = None,
 ) -> PipelineConsumerDeps:
     """Compose the production :class:`PipelineConsumerDeps` for ``forge serve``.
 
@@ -1700,6 +1737,11 @@ def build_pipeline_consumer_deps(
         )
 
     # 3. Build the four field closures.
+    # A build refused before its row is written is noted on the sentence's
+    # work-queue row (the same Forge database), so nothing waits on it for
+    # ever. Production takes the default; a test may hand in its own.
+    if record_build_rejection is None:
+        record_build_rejection = _work_queue_rejection_recorder(sqlite_pool)
     is_duplicate_terminal = _build_is_duplicate_terminal(sqlite_pool)
     dispatch_build = _build_dispatch_build(
         sqlite_pool=sqlite_pool,
@@ -1714,6 +1756,7 @@ def build_pipeline_consumer_deps(
         gate_clock=gate_clock,
         conductor_router=conductor_router,
         ack_guard=ack_guard,
+        record_build_rejection=record_build_rejection,
     )
     publish_build_failed = _build_publish_build_failed(
         publisher,
@@ -1727,6 +1770,7 @@ def build_pipeline_consumer_deps(
         publish_build_failed=publish_build_failed,
         register_ack_handle=register_ack_handle,
         ack_guard=ack_guard,
+        record_build_rejection=record_build_rejection,
     )
     logger.info(
         "build_pipeline_consumer_deps: composed PipelineConsumerDeps "
