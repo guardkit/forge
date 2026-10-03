@@ -410,3 +410,38 @@ def docker_available() -> bool:
         )
     except (OSError, subprocess.TimeoutExpired):
         return False
+
+
+@contextmanager
+def throwaway_broker() -> Iterator[str]:
+    """A real, throwaway JetStream broker on a loopback port."""
+    done = subprocess.run(
+        [
+            "docker", "run", "--detach", "--rm",
+            "--label", "forge.test=concurrent-builds",
+            "--publish", "127.0.0.1::4222",
+            "nats:2.11-alpine", "-js",
+        ],
+        capture_output=True, text=True, check=True, timeout=60,
+    )
+    container = done.stdout.strip()
+    try:
+        port = subprocess.run(
+            ["docker", "port", container, "4222/tcp"],
+            capture_output=True, text=True, check=True, timeout=30,
+        ).stdout.split()[0].rpartition(":")[2]
+
+        def _up() -> bool:
+            try:
+                with socket.create_connection(("127.0.0.1", int(port)), timeout=1):
+                    return True
+            except OSError:
+                return False
+
+        wait_for(_up, 30, "the throwaway broker never listened")
+        time.sleep(0.5)
+        yield f"nats://127.0.0.1:{port}"
+    finally:
+        subprocess.run(
+            ["docker", "rm", "--force", container], capture_output=True, timeout=60
+        )
