@@ -1533,3 +1533,88 @@ def test_list_files_on_branch_reads_that_branch_not_the_checked_out_tree(
         assert ask(bad_branch)[0] == 400
     for bad_under in ("/etc", "../x", "", None):
         assert ask("autobuild/FEAT-X", bad_under)[0] == 400
+
+
+# ---------------------------------------------------------------------------
+# FEAT-FFEC (3 October 2026): the plan check refuses a task that names
+# another task with no order between them
+# ---------------------------------------------------------------------------
+
+_FFEC_FIXTURE = (
+    Path(__file__).resolve().parents[1] / "planning" / "fixtures" / "ffec_c9c3714c"
+)
+_FFEC_YAML = ".guardkit/features/FEAT-FFEC.yaml"
+
+
+def _ffec_files(*, ordered: bool) -> dict[str, str]:
+    """The FEAT-FFEC plan files exactly as the writer committed them
+    (c9c3714c), or with TASK-FFEC-002's need for TASK-FFEC-003 declared and
+    the waves reordered."""
+    import yaml
+
+    files = {
+        str(p.relative_to(_FFEC_FIXTURE)): p.read_text(encoding="utf-8")
+        for p in sorted(_FFEC_FIXTURE.rglob("*"))
+        if p.is_file() and p.name != "README.md"
+    }
+    if ordered:
+        data = yaml.safe_load(files[_FFEC_YAML])
+        for task in data["tasks"]:
+            if task["id"] == "TASK-FFEC-002":
+                task["dependencies"] = ["TASK-FFEC-001", "TASK-FFEC-003"]
+        data["orchestration"]["parallel_groups"] = [
+            ["TASK-FFEC-001"], ["TASK-FFEC-003"], ["TASK-FFEC-002"], ["TASK-FFEC-004"]
+        ]
+        files[_FFEC_YAML] = yaml.safe_dump(data, sort_keys=False)
+    return files
+
+
+def test_live_guardkit_feature_validate_refuses_an_unordered_task_reference(
+    cfg: ForgeConfig, tmp_path: Path, repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The plan leg's ``feature-validate`` check, run by the sidecar with
+    guardkit's real ``feature validate``: the FEAT-FFEC plan as committed is
+    refused, nothing lands on the branch, and guardkit's sentence reaches the
+    check's detail (which the driver puts on the failed leg). The same plan
+    with the need declared and the waves reordered commits."""
+    checkout = live_guardkit_checkout(Path(__file__))
+    if checkout is None:
+        pytest.skip("no live guardkit checkout is reachable")
+    loader = checkout / "guardkit" / "orchestrator" / "feature_loader.py"
+    if "def validate_task_references" not in loader.read_text(encoding="utf-8"):
+        pytest.skip("the live guardkit checkout has no task-reference check yet")
+    wrapper = _live_guardkit_wrapper(tmp_path)
+    if wrapper is None:
+        pytest.skip("no live guardkit CLI is reachable")
+    monkeypatch.setenv(GUARDKIT_PATH_ENV, str(wrapper))
+    check = {"name": "feature-validate", "args": {"feature_id": "FEAT-FFEC"}}
+
+    status, body = _write(cfg, tmp_path, files=_ffec_files(ordered=False), checks=[check])
+
+    assert status == 200, body
+    assert body["status"] == "failed" and body["sha"] is None
+    validate = _by_name(body)["feature-validate"]
+    assert validate["ran"] and not validate["passed"]
+    assert (
+        "TASK-FFEC-002's task file refers to TASK-FFEC-003, but neither depends "
+        "on the other, so they can run together or in either order."
+    ) in validate["detail"]
+    assert _no_commit_landed(repo)
+
+    status, body = _write(
+        cfg,
+        tmp_path,
+        files=_ffec_files(ordered=True),
+        checks=[check],
+        branch="planning/run-0002",
+    )
+
+    assert status == 200, body
+    assert _by_name(body)["feature-validate"]["passed"], body
+    assert body["status"] == "success"
+    import yaml
+
+    committed = yaml.safe_load(git_show(repo, "planning/run-0002", _FFEC_YAML) or "")
+    assert committed["orchestration"]["parallel_groups"] == [
+        ["TASK-FFEC-001"], ["TASK-FFEC-003"], ["TASK-FFEC-002"], ["TASK-FFEC-004"]
+    ]
