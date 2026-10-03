@@ -62,8 +62,19 @@ STANDIN = textwrap.dedent(
         "env": dict(os.environ),
         "config": config.read_text() if config.exists() else None,
     }}
+    if (out / "inner").exists():
+        # guardkit's own feature-mode worktree, as a real build leaves it.
+        import subprocess
+        subprocess.run(
+            ["git", "worktree", "add", ".guardkit/worktrees/" + feature,
+             "-b", "autobuild/" + feature],
+            capture_output=True,
+        )
+    (out / (feature + "." + (os.environ.get("GUARDKIT_RUN_OWNER") or "x") + ".owner")).write_text(os.getcwd())
     (out / (feature + ".started")).write_text(json.dumps(record))
     print("a stand-in for guardkit, building " + feature, flush=True)
+    if (out / "exit-code").exists():
+        sys.exit(int((out / "exit-code").read_text()))
     wanted = int((out / "together").read_text()) if (out / "together").exists() else 0
     deadline = time.time() + {patience}
     while time.time() < deadline:
@@ -391,3 +402,143 @@ def test_overlapping_builds_of_two_projects_each_carry_their_own_memory(
     assert b["env"]["GUARDKIT_MEMORY_PROJECT"] == "gadget_memory"
     # They really did overlap: each waited for the other to start.
     assert os.path.exists(factory.out / "FEAT-A.started")
+
+
+# ---------------------------------------------------------------------------
+# The same feature twice in one runner: a running build is never swept
+# ---------------------------------------------------------------------------
+
+
+def test_a_second_build_of_a_feature_leaves_the_running_ones_worktree_alone(
+    factory: _Factory,
+) -> None:
+    """Inside a sandbox there is no ledger, so the same-feature sweep cannot
+    ask it whether an earlier build is still running. A build running in this
+    runner is running, whatever the ledger says, and its worktree is never
+    swept out from under it."""
+    factory.repository("widget", "planning/a")
+    (factory.out / "inner").write_text("yes")
+
+    async def scenario() -> tuple[dict, dict]:
+        first = asyncio.create_task(
+            _build(_payload("build-FEAT-A-1", "FEAT-A", "widget", branch="planning/a"))
+        )
+        await factory.started("FEAT-A")
+        (factory.out / "FEAT-A.started").unlink()
+        second = asyncio.create_task(
+            _build(_payload("build-FEAT-A-2", "FEAT-A", "widget", branch="planning/a"))
+        )
+        try:
+            # Either the second build's child starts, or the build ends first
+            # (refused); then the first build's worktree is looked at.
+            owner = factory.out / "FEAT-A.build-FEAT-A-2.owner"
+            for _ in range(400):
+                if owner.exists() or second.done():
+                    break
+                await asyncio.sleep(0.05)
+            first_still_there = (factory.worktrees / "build-FEAT-A-1").is_dir()
+        finally:
+            factory.release()
+        return await first, await second, first_still_there
+
+    first, second, first_still_there = asyncio.run(scenario())
+
+    assert first_still_there, "the running build's worktree was swept"
+    # The second build was not refused over it either: it went ahead.
+    assert (factory.out / "FEAT-A.build-FEAT-A-2.owner").exists(), second
+    assert first["lifecycle"] != "failed", first
+    assert second["lifecycle"] != "failed", second
+
+
+def test_sweeping_a_finished_builds_worktree_does_not_stall_other_builds(
+    factory: _Factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Deleting a kept worktree and copying its evidence take as long as the
+    tree is big, and every build in a runner shares one event loop. They run
+    off it: while a deliberately slow removal runs for one build, a stand-in
+    for another build keeps ticking."""
+    factory.repository("widget", "planning/a")
+    (factory.out / "inner").write_text("yes")
+    (factory.out / "exit-code").write_text("1")
+    first = asyncio.run(
+        _build(_payload("build-FEAT-A-1", "FEAT-A", "widget", branch="planning/a"))
+    )
+    assert first["lifecycle"] == "failed"
+    kept = factory.worktrees / "build-FEAT-A-1"
+    assert kept.is_dir(), "the failed build's worktree should be kept"
+    (factory.out / "exit-code").unlink()
+    (factory.out / "inner").unlink()
+    factory.release()
+
+    import time as _time
+
+    real_rmtree = shutil.rmtree
+
+    def slow_rmtree(path: Any, *args: Any, **kwargs: Any) -> Any:
+        if Path(str(path)) == kept:
+            _time.sleep(1.0)
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(runner_module.shutil, "rmtree", slow_rmtree)
+
+    async def scenario() -> tuple[dict, int]:
+        ticks = 0
+        stop = asyncio.Event()
+
+        async def another_build() -> None:
+            nonlocal ticks
+            while not stop.is_set():
+                ticks += 1
+                await asyncio.sleep(0.01)
+
+        beat = asyncio.create_task(another_build())
+        try:
+            second = await _build(
+                _payload("build-FEAT-A-2", "FEAT-A", "widget", branch="planning/a")
+            )
+        finally:
+            stop.set()
+            await beat
+        return second, ticks
+
+    second, ticks = asyncio.run(scenario())
+
+    assert not kept.exists(), f"the finished build's worktree was not swept: {second}"
+    # A one-second removal on the loop would allow almost no ticks.
+    assert ticks >= 30, ticks
+
+
+def test_exporting_a_builds_receipts_does_not_stall_other_builds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same for the success path's receipt export."""
+    import time as _time
+
+    def slow_export(worktree: Path, build_id: str) -> Any:
+        _time.sleep(1.0)
+        return runner_module.ReceiptExport(ok=False)
+
+    monkeypatch.setattr(runner_module, "_export_receipts", slow_export)
+
+    async def scenario() -> int:
+        ticks = 0
+        stop = asyncio.Event()
+
+        async def another_build() -> None:
+            nonlocal ticks
+            while not stop.is_set():
+                ticks += 1
+                await asyncio.sleep(0.01)
+
+        beat = asyncio.create_task(another_build())
+        try:
+            kept = await runner_module._finalize_success_worktree(
+                tmp_path, tmp_path / "wt", "build-FEAT-A-1"
+            )
+            assert kept is None
+        finally:
+            stop.set()
+            await beat
+        return ticks
+
+    assert asyncio.run(scenario()) >= 30
