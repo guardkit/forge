@@ -974,15 +974,18 @@ class TestProductionBootBindsReconcileSeams:
         # §"Broker posture": the durable ConsumerConfig pins ack_wait to
         # ACK_WAIT_SECONDS (1h) so a paused build's un-acked build-queued
         # message is not redelivered every 30s (server default).
-        from forge.adapters.nats.pipeline_consumer import ACK_WAIT_SECONDS
+        # The wait is now a keyword with the contract value as its default
+        # (broker tests pass a short one); production's single caller,
+        # run_daemon, must not pass it.
+        import inspect
 
-        daemon_src = (
-            Path(__file__).resolve().parent.parent.parent
-            / "src"
-            / "forge"
-            / "cli"
-            / "_serve_daemon.py"
-        )
-        source = daemon_src.read_text(encoding="utf-8")
-        assert "ack_wait=ACK_WAIT_SECONDS" in source
+        from forge.adapters.nats.pipeline_consumer import ACK_WAIT_SECONDS
+        from forge.cli import _serve_daemon
+
+        signature = inspect.signature(_serve_daemon._attach_consumer)
+        assert signature.parameters["ack_wait_seconds"].default == ACK_WAIT_SECONDS
+        daemon_src = inspect.getsource(_serve_daemon.run_daemon)
+        assert "ack_wait_seconds" not in daemon_src
+        attach_src = inspect.getsource(_serve_daemon._attach_consumer)
+        assert "ack_wait=ack_wait_seconds" in attach_src
         assert ACK_WAIT_SECONDS >= 3600

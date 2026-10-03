@@ -159,6 +159,14 @@ class _FakeJetStream:
         self._sub = sub
         self.pull_subscribe_kwargs: dict[str, Any] | None = None
 
+    async def consumer_info(self, stream: str, durable: str) -> Any:
+        # The daemon reads the live durable before binding so it can apply
+        # the configured build limit. "Not found" means pull_subscribe
+        # creates it, which is what these tests model.
+        from nats.js.errors import NotFoundError
+
+        raise NotFoundError()
+
     async def pull_subscribe(self, **kwargs: Any) -> _FakeSubscription:
         self.pull_subscribe_kwargs = kwargs
         return self._sub
