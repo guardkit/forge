@@ -181,16 +181,18 @@ class TestWhatTheBundlePromises:
         assert "network_mode: host" not in rendered
 
     def test_nothing_binds_a_folder_off_this_machine(self, rendered: str) -> None:
-        """Binds are allowed only for the publisher's files a machine supplies.
+        """Binds are allowed only for files and the one folder a machine supplies.
 
         The publisher's settings file, its credential file and its pinned host keys are supplied by
-        the machine at paths the env file names. Everything else is a named
-        volume, because a bind is a path and a path belongs to a machine.
+        the machine at paths the env file names, and so is the build receipts
+        folder the coordinator reads failure packs from. Everything else is a
+        named volume, because a bind is a path and a path belongs to a machine.
         """
         allowed_targets = (
             "/etc/forge-publisher/settings.json",
             "/etc/forge-publisher/credential",
             "/etc/forge-publisher/known_hosts",
+            "/var/lib/forge-evidence",
         )
         blocks = rendered.split("- type: bind")
         for block in blocks[1:]:
@@ -204,6 +206,66 @@ class TestWhatTheBundlePromises:
         """One crossing of the sandbox boundary, and it is named as such."""
         assert rendered.count("mode: ingress") == 1
         assert "target: 8126" in rendered
+
+    def test_the_coordinator_reads_receipts_from_the_folder_the_runner_writes(
+        self, rendered: str
+    ) -> None:
+        """3 October 2026: no failed build had filed its repair job since the
+        containers went live. A build's runner in its sandbox writes failure
+        packs to a folder on the machine, and the coordinator was looking in a
+        named volume nothing else wrote. So the coordinator's receipts path is
+        now that folder, bound from the setting the env file names, and is not
+        made empty when the folder is missing."""
+        coordinator = rendered.split("\n  coordinator:", 1)[1].split("\n  answer-service:", 1)[0]
+        assert "FORGE_RECEIPTS_DIR: /var/lib/forge-evidence" in coordinator
+        binds = coordinator.split("- type: bind")[1:]
+        receipts = [block[:400] for block in binds if "target: /var/lib/forge-evidence" in block[:400]]
+        assert len(receipts) == 1, (
+            "the coordinator does not bind the receipts folder at "
+            "/var/lib/forge-evidence, so it cannot see a failed build's pack"
+        )
+        assert "source: /srv/forge-state/receipts" in receipts[0], (
+            "the receipts folder is not the one .env.example names in "
+            "FORGE_RECEIPTS_HOST_DIR"
+        )
+        assert "create_host_path: false" in receipts[0], (
+            "a missing receipts folder would be made empty and the coordinator "
+            "would quietly read nothing again"
+        )
+        assert "source: forge-evidence" not in coordinator, (
+            "the coordinator still mounts the named volume nothing else writes"
+        )
+
+    def test_a_missing_receipts_folder_setting_refuses_by_name(self) -> None:
+        if shutil.which("docker") is None:
+            pytest.skip("docker is not installed here, so there is nothing to render")
+        example = (BUNDLE / ".env.example").read_text()
+        assert "\nFORGE_RECEIPTS_HOST_DIR=" in example
+        without = "".join(
+            line
+            for line in example.splitlines(keepends=True)
+            if not line.startswith("FORGE_RECEIPTS_HOST_DIR=")
+        )
+        env = {
+            name: os.environ[name]
+            for name in _ONLY_THESE_ARE_INHERITED
+            if name in os.environ
+        }
+        env["FORGE_PUBLISHER_BRIDGE"] = "fpb" + hashlib.sha256(b"forge-compose-bundle-check").hexdigest()[:12]
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as scratch:
+            env_file = Path(scratch) / "without-receipts.env"
+            env_file.write_text(without)
+            done = subprocess.run(
+                [
+                    "docker", "compose", "--project-name", "forge-compose-bundle-check",
+                    "--env-file", str(env_file), "--file", "compose.yaml", "config",
+                ],
+                cwd=BUNDLE, env=env, capture_output=True, text=True, timeout=120,
+            )
+        assert done.returncode != 0
+        assert "FORGE_RECEIPTS_HOST_DIR" in done.stderr
 
     def test_the_settings_volume_is_read_only(self, rendered: str) -> None:
         block = rendered.split("source: forge-settings", 1)
@@ -269,6 +331,7 @@ class TestTheSandboxRunnerAddsNothingOfThisMachine:
             "/etc/forge-publisher/settings.json",
             "/etc/forge-publisher/credential",
             "/etc/forge-publisher/known_hosts",
+            "/var/lib/forge-evidence",
             "/usr/bin/sbx",
             "/sandboxd/sandboxd.sock",
         )

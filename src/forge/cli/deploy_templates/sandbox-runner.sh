@@ -251,10 +251,12 @@
 #       NEITHER, and never: it stays with the coordinator, out on the machine,
 #       and nothing in this sandbox opens it (rule 72).
 #
-#   the coordinator's evidence volume (/var/lib/forge-evidence)
-#       NOT HERE AT ALL. That is a volume of the coordinator's own container
-#       out on the machine, where it is what FORGE_RECEIPTS_DIR names. Inside a
-#       sandbox the receipts root above is that folder.
+#   the coordinator's evidence folder (/var/lib/forge-evidence)
+#       NOT HERE AT ALL. That is where the coordinator's own container, out on
+#       the machine, sees the machine's receipts folder (bound from
+#       FORGE_RECEIPTS_HOST_DIR since 3 October 2026), and it is what
+#       FORGE_RECEIPTS_DIR names there. Inside a sandbox the receipts root
+#       above is that folder.
 #
 # WHAT IT NEVER DOES. It never mounts a checkout of the factory's code, makes a
 # virtual environment, installs a package or fetches source. It never opens the
