@@ -2433,6 +2433,16 @@ def _claim_repository(repo_path: Path, *, shared_checkout: bool) -> str | None:
     return None
 
 
+def _running_in_this_runner(build_id: str) -> bool:
+    """Whether a build with this ID is running in this runner right now."""
+    with _RUNNER_SHARED_LOCK:
+        return any(
+            claim.build_id == build_id
+            for claims in _ACTIVE_BUILDS_BY_REPO.values()
+            for claim in claims
+        )
+
+
 async def _materialise_worktree(
     repo_path: Path, branch: str, build_id: str
 ) -> Path:
@@ -3370,7 +3380,11 @@ async def _finalize_success_worktree(
     forensics posture; the F3 preflight prune does not delete directories,
     and a kept tree never regresses a succeeded build).
     """
-    result = _export_receipts(worktree_path, receipt_build_id or build_id)
+    # Off the event loop (3 October 2026, concurrent builds): the export copies
+    # whole folders, and every other build in this runner shares the loop.
+    result = await asyncio.to_thread(
+        _export_receipts, worktree_path, receipt_build_id or build_id
+    )
     if not result.ok:
         logger.warning(
             "autobuild_runner: keeping worktree %s — receipts were not "
@@ -3765,7 +3779,15 @@ async def _sweep_prior_build_residue_impl(
         # positively says "live" withholds the sweep (see
         # :func:`_prior_build_status`).
         status = _prior_build_status(prior_build_id)
-        if status in _LIVE_BUILD_STATUSES:
+        # A build running in THIS runner is live whatever the ledger says
+        # (3 October 2026, concurrent builds): inside a sandbox there is no
+        # ledger to read, so the answer above is None there, and two builds of
+        # one feature can now overlap in one runner.
+        if status not in _LIVE_BUILD_STATUSES and _running_in_this_runner(
+            prior_build_id
+        ):
+            status = "RUNNING in this runner"
+        if status in _LIVE_BUILD_STATUSES or status == "RUNNING in this runner":
             logger.warning(
                 "autobuild_runner: requeue sweep — prior build %s is still "
                 "LIVE (ledger status=%s); its residue at %s is left ENTIRELY "
@@ -3870,7 +3892,9 @@ async def _sweep_prior_build_residue_impl(
                 prior_build_id,
                 _receipts_root(),
             )
-        _export_prior_build_evidence(
+        # Off the event loop, like the removal below: it copies the tree.
+        await asyncio.to_thread(
+            _export_prior_build_evidence,
             outer_root,
             prior_build_id,
             feature_id,
@@ -3930,7 +3954,10 @@ async def _sweep_prior_build_residue_impl(
             )
 
         try:
-            shutil.rmtree(outer_root, ignore_errors=False)
+            # Off the event loop (3 October 2026, concurrent builds): a whole
+            # kept worktree can take seconds to delete, and every other build
+            # in this runner shares the loop.
+            await asyncio.to_thread(shutil.rmtree, outer_root, ignore_errors=False)
         except FileNotFoundError as exc:
             if outer_root.exists():
                 # A FileNotFoundError with the root STILL PRESENT is a
@@ -4120,8 +4147,13 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
     holds a repository or a reservation.
     """
     payload = _extract_launch_payload(list(state.get("messages", [])))
+    # The same name the build's worktree is given, so the same-feature sweep
+    # can tell a running build's worktree by it.
     claim = _BuildClaim(
-        str(payload.get("build_id") or payload.get("feature_id") or "unnamed build")
+        str(
+            payload.get("build_id")
+            or f"build-{str(payload.get('feature_id') or '').strip()}-pending"
+        )
     )
     token = _CURRENT_BUILD_CLAIM.set(claim)
     try:
@@ -4836,7 +4868,10 @@ async def _run_one_build(state: AutobuildRunnerState) -> dict[str, Any]:
         # destination read-back that would claim an earlier run's leftovers.
         receipts_result: ReceiptExport | None = None
         if worktree_path is not None:
-            receipts_result = _export_receipts(worktree_path, receipt_build_id)
+            # Off the event loop, as on the success path.
+            receipts_result = await asyncio.to_thread(
+                _export_receipts, worktree_path, receipt_build_id
+            )
         manifest_path = _write_failure_manifest(
             build_id=receipt_build_id,
             payload=payload,
