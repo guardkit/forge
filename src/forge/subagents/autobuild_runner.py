@@ -2455,9 +2455,26 @@ async def _materialise_worktree(
     base = _worktree_base_dir()
     from forge.subagents.autobuild_worktree_lifecycle import inspect_worktree_capacity
 
-    capacity = inspect_worktree_capacity(
-        base, min_available_bytes=_worktree_min_available_bytes()
-    )
+    # A RESERVATION, NOT A LOOK (3 October 2026, concurrent builds). The free
+    # space other builds running in this runner have reserved counts as spent,
+    # and this build reserves its own floor in the same step, so two builds
+    # starting together cannot both pass on room for one. Released with the
+    # build's claim. A call outside a build's node reserves nothing.
+    min_available_bytes = _worktree_min_available_bytes()
+    claim = _CURRENT_BUILD_CLAIM.get()
+    with _RUNNER_SHARED_LOCK:
+        reserved_by_others = sum(
+            reserved
+            for holder, reserved in _DISK_RESERVATIONS.items()
+            if holder is not claim
+        )
+        capacity = inspect_worktree_capacity(
+            base,
+            min_available_bytes=min_available_bytes,
+            reserved_bytes=reserved_by_others,
+        )
+        if capacity.get("ok") and claim is not None:
+            _DISK_RESERVATIONS[claim] = min_available_bytes
     if not capacity.get("ok"):
         raise WorktreeMaterialisationError(
             "autobuild worktree capacity preflight refused the build before "
