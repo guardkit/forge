@@ -892,19 +892,34 @@ def _retained_candidate(repo_root: Path, tmp_path: Path) -> tuple[Path, str]:
 class _RetainedCandidateSidecar:
     """A sandbox clone visible only through the deployed Git route shapes."""
 
-    def __init__(self, candidate_commit: str) -> None:
+    def __init__(
+        self,
+        candidate_commit: str,
+        *,
+        tracked: dict[str, str] | None = None,
+        listing_refused: bool = False,
+    ) -> None:
         self.candidate_commit = candidate_commit
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.written: dict[str, str] = {}
         self.shas: dict[str, str | None] = {
             f"autobuild/{FEATURE_ID}": candidate_commit,
         }
+        #: The clone's tracked files and their text (the /code routes).
+        self.tracked = dict(tracked or {})
+        self.listing_refused = listing_refused
 
     def __call__(
         self, url: str, body: dict[str, Any], timeout: float
     ) -> tuple[int, Any]:
-        route = url.split("/git/", 1)[1]
+        route = url.split("/git/", 1)[1] if "/git/" in url else url.split("/code/", 1)[1]
         self.calls.append((route, body))
+        if route == "list-files":
+            if self.listing_refused:
+                return 400, {"error": "the repository is not a directory on this box"}
+            return 200, {"files": sorted(self.tracked), "capped": False}
+        if route == "read-file":
+            return 200, {"content": self.tracked.get(body["path"]), "partial": False}
         if route == "rev-parse":
             ref = body["ref"]
             short = ref.removeprefix("refs/heads/")
@@ -914,7 +929,7 @@ class _RetainedCandidateSidecar:
                 f"id: {FEATURE_ID}\n"
                 if body["branch"] == f"refs/heads/autobuild/{FEATURE_ID}"
                 and body["file_path"] == f".guardkit/features/{FEATURE_ID}.yaml"
-                else None
+                else self.tracked.get(body["file_path"])
             )
             return 200, {"content": content}
         if route == "worktree-add":
@@ -1050,27 +1065,116 @@ class TestABuildFailureRepairsItsRetainedCandidate:
         assert admission.branch == "repair/TASK-FEAT44A8FIX1"
         routes = [route for route, _ in sidecar.calls]
         assert routes == [
+            "list-files",  # the features folder, read in the sandbox
+            "rev-parse",  # is repair/TASK-FEAT44A8FIX1 already taken?
             "rev-parse",
             "read-file-from-branch",
+            "list-files",  # the task folder and the gate evidence
             "rev-parse",
             "rev-parse",
             "worktree-add",
             "worktree-remove",
             "prepare-branch-and-write-tree",
         ]
-        contract_read = sidecar.calls[1][1]
+        contract_read = sidecar.calls[3][1]
         assert contract_read == {
             "repo": REPO_KEY,
             "branch": f"refs/heads/autobuild/{FEATURE_ID}",
             "file_path": f".guardkit/features/{FEATURE_ID}.yaml",
         }
-        cut = sidecar.calls[4][1]
+        cut = sidecar.calls[7][1]
         assert cut["repo"] == REPO_KEY
         assert cut["base_ref"] == "a" * 40
-        assert sidecar.calls[6][1]["expected_head"] == "a" * 40
+        assert sidecar.calls[9][1]["expected_head"] == "a" * 40
         assert YAML_FILE in sidecar.written
         assert "parent_feature: FEAT-44A8" in sidecar.written[YAML_FILE]
         assert branches(repo_root) == ["main"]
+
+    def _sandbox_admission(
+        self,
+        pool: SqliteLifecyclePersistence,
+        store: WorkQueueStore,
+        repo_root: Path,
+        tmp_path: Path,
+        sidecar: "_RetainedCandidateSidecar",
+    ) -> Any:
+        seed_failed_build(pool)
+        config = make_config(
+            repo_root,
+            profiles={"attended": {}, FIX_JOURNEY_PROFILE_NAME: {"max_review_cycles": 2}},
+            sandbox=True,
+        )
+        receipts = tmp_path / "receipts"
+        _failure_manifest(
+            receipts,
+            worktree=tmp_path / "not-mounted-on-coordinator" / SOURCE_BUILD,
+            subprocess_ran=True,
+            worktree_kept=True,
+        )
+        return self._admit(
+            config=config,
+            pool=pool,
+            store=store,
+            receipts_root=receipts,
+            sidecar_post=sidecar,
+        )
+
+    def test_a_sandboxed_repair_reads_its_folder_review_evidence_and_number_there(
+        self,
+        pool: SqliteLifecyclePersistence,
+        store: WorkQueueStore,
+        repo_root: Path,
+        tmp_path: Path,
+    ) -> None:
+        """3 October 2026: the coordinator's checkout of a sandboxed repository
+        is not there, so these were silently empty (every repair FIX1, no
+        folder, no review id, no evidence). They are read in the sandbox."""
+        task = "tasks/backlog/add-the-thing/TASK-44A8-001-add-the-thing.md"
+        evidence = f"qa/gates/evidence/{FEATURE_ID}-local-20260907T083219Z/EVIDENCE.yaml"
+        sidecar = _RetainedCandidateSidecar(
+            "a" * 40,
+            tracked={
+                task: f"---\nid: TASK-44A8-001\nfeature_id: {FEATURE_ID}\n"
+                "parent_review: TASK-REV-44A8\n---\n# Add the thing\n",
+                evidence: EVIDENCE_TEXT,
+            },
+        )
+        sidecar.shas["repair/TASK-FEAT44A8FIX1"] = "older-repair"
+
+        admission = self._sandbox_admission(pool, store, repo_root, tmp_path, sidecar)
+
+        assert admission.branch == "repair/TASK-FEAT44A8FIX2"
+        task_file = "tasks/backlog/add-the-thing/TASK-FEAT44A8FIX2-repair.md"
+        front, body = _frontmatter_and_body(sidecar.written[task_file])
+        assert front["parent_review"] == "TASK-REV-44A8"
+        assert f"- Gate evidence: {evidence}" in body
+        assert "hurl-twins::delete-existing-user::40: expected HTTP 204" in body
+        assert "Could not be read" not in body
+        assert not any(str(repo_root) in repr(b) for _, b in sidecar.calls)
+
+    def test_what_the_sandbox_could_not_serve_is_said_in_the_task_file(
+        self,
+        pool: SqliteLifecyclePersistence,
+        store: WorkQueueStore,
+        repo_root: Path,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        sidecar = _RetainedCandidateSidecar("a" * 40, listing_refused=True)
+
+        with caplog.at_level("WARNING", logger="forge.pipeline.fix_admission"):
+            admission = self._sandbox_admission(
+                pool, store, repo_root, tmp_path, sidecar
+            )
+
+        _, body = _frontmatter_and_body(sidecar.written[admission.task_file_path])
+        assert (
+            f"- Could not be read: the files in the sandbox's clone of {REPO_KEY} "
+            "(the sandbox helper answered 400: the repository is not a directory "
+            "on this box)"
+        ) in body
+        assert f"- Could not be read: the gate evidence for {FEATURE_ID}" in body
+        assert "could not read the files in the sandbox's clone" in caplog.text
 
     def test_missing_candidate_after_coding_fails_closed_without_a_branch(
         self,

@@ -450,6 +450,10 @@ class RepairTaskFacts:
     gate_evidence_path: str | None = None
     failure_pack_path: str | None = None
     parent_review: str | None = None
+    #: Plain sentences, one per record that could not be read (a sandboxed
+    #: repository's clone, read through its helper). Said in the task file
+    #: rather than silently left out.
+    not_read: tuple[str, ...] = ()
 
 
 def repair_task_relpath(folder: str, task_id: str) -> str:
@@ -545,6 +549,7 @@ def render_repair_task_file(facts: RepairTaskFacts) -> str:
         report_line,
         f"- Gate evidence: {facts.gate_evidence_path or 'not recorded'}",
         f"- Failure pack: {facts.failure_pack_path or 'none was recorded for this build'}",
+        *(f"- Could not be read: {sentence}" for sentence in facts.not_read),
     ]
 
     if facts.failed_checks:
@@ -691,17 +696,23 @@ def _parse_gate_evidence(text: str) -> tuple[int, list[FailedCheck]]:
 
 
 def _parent_review_on_branch(
-    repo: Path, base_branch: str, feature_id: str, folder: str, files_on_base: Iterable[str]
+    read: Callable[[str, str], str | None],
+    base_branch: str,
+    feature_id: str,
+    folder: str,
+    files_on_base: Iterable[str],
 ) -> str | None:
-    """The ``parent_review`` the feature's own task files carry, when they do."""
-    from forge.pipeline.repair_branch import read_branch_file
+    """The ``parent_review`` the feature's own task files carry, when they do.
 
+    ``read(branch, path)`` is the file on that branch — host git for a
+    repository on this side, the sandbox helper for one in a sandbox.
+    """
     head = f"tasks/backlog/{folder}/"
     for path in sorted(files_on_base):
         name = Path(path).name.upper()
         if not (path.startswith(head) and name.startswith("TASK-") and name.endswith(".MD")):
             continue
-        front = _frontmatter(read_branch_file(repo, base_branch, path) or "")
+        front = _frontmatter(read(base_branch, path) or "")
         declared = front.get("feature_id")
         if declared not in (None, feature_id):
             continue
@@ -722,6 +733,7 @@ def gather_repair_facts(
     minted: Mapping[str, Any] | None = None,
     receipts_root: Path | str | None = None,
     files_on_base: Iterable[str] | None = None,
+    clone: "_SandboxClone | None" = None,
 ) -> RepairTaskFacts:
     """Read what the records say about the failure; never raise for a missing one.
 
@@ -731,14 +743,21 @@ def gather_repair_facts(
     names the checks that failed with what they expected and saw; the queue
     row's filing note (``minted``) gives the failure pack and why the row was
     filed; the feature's own task files on the base branch give the review id.
+
+    ``clone`` is set for a repository in a sandbox: the checkout and the
+    evidence are read there, through the helper, and whatever could not be
+    read is named in :attr:`RepairTaskFacts.not_read`.
     """
-    from forge.pipeline.repair_branch import list_branch_files
+    from forge.pipeline.repair_branch import list_branch_files, read_branch_file
 
     repo = Path(repo_path)
     note = dict(minted or {})
-    files = list(files_on_base) if files_on_base is not None else list_branch_files(
-        repo, base_branch, "tasks"
-    )
+    if files_on_base is not None:
+        files = list(files_on_base)
+    elif clone is not None:
+        files = clone.tracked_under("tasks/")
+    else:
+        files = list_branch_files(repo, base_branch, "tasks")
     folder = repair_task_folder(feature_id, files)
 
     result = detail = merged_sha = None
@@ -762,7 +781,11 @@ def gather_repair_facts(
                     checks_total = _int(gate.get("checks_total"))
                     checks_passed = _int(gate.get("checks_passed"))
 
-    evidence_path, evidence_text = _newest_gate_evidence(repo, feature_id)
+    evidence_path, evidence_text = (
+        clone.newest_gate_evidence(feature_id)
+        if clone is not None
+        else _newest_gate_evidence(repo, feature_id)
+    )
     if evidence_text:
         passed_count, from_evidence = _parse_gate_evidence(evidence_text)
         if from_evidence:
@@ -791,8 +814,15 @@ def gather_repair_facts(
         gate_evidence_path=evidence_path,
         failure_pack_path=_text(note.get("failure_pack_path")),
         parent_review=_parent_review_on_branch(
-            repo, base_branch, feature_id, folder, files
+            clone.read_on_branch
+            if clone is not None
+            else (lambda branch, path: read_branch_file(repo, branch, path)),
+            base_branch,
+            feature_id,
+            folder,
+            files,
         ),
+        not_read=tuple(clone.not_read) if clone is not None else (),
     )
 
 
@@ -834,7 +864,14 @@ def materialise_repair_task(
     )
 
     repo = Path(repo_path)
-    files_on_base = list_branch_files(repo, base_branch, "tasks")
+    # A sandboxed repository's checkout is not on this side (the coordinator's
+    # path for it may not exist at all), so it is read where it is.
+    clone = _SandboxClone(sidecar, post=post) if sidecar is not None else None
+    files_on_base = (
+        clone.tracked_under("tasks/")
+        if clone is not None
+        else list_branch_files(repo, base_branch, "tasks")
+    )
     folder = repair_task_folder(feature_id, files_on_base)
     facts = gather_repair_facts(
         repo_path=repo,
@@ -846,6 +883,7 @@ def materialise_repair_task(
         minted=minted,
         receipts_root=receipts_root,
         files_on_base=files_on_base,
+        clone=clone,
     )
     task_relpath = repair_task_relpath(folder, task_id)
     files = {
@@ -1254,8 +1292,16 @@ async def admit_fix_row(
             permanent=True,
         )
 
+    sidecar = _sidecar_for(config, resolution.name)
     task_id = _task_id_already_on_row(store, queue_id) or mint_fix_task_id(
-        parent_feature, existing=existing_fix_task_ids(repo_path)
+        parent_feature,
+        existing=(
+            existing_fix_task_ids_in_sandbox(
+                _SandboxClone(sidecar, post=sidecar_post), parent_feature
+            )
+            if sidecar is not None
+            else existing_fix_task_ids(repo_path)
+        ),
     )
     name = _one_line(sentence)
     fix_task_path = features_dir(repo_path) / f"{task_id}.yaml"
@@ -1269,7 +1315,6 @@ async def admit_fix_row(
     # used. And a repository with a sandbox keeps the clone the build runs on
     # INSIDE it, so the branch is cut there, through the sidecar, or the
     # conductor cannot find it.
-    sidecar = _sidecar_for(config, resolution.name)
     repair_base = await resolve_repair_base(
         minted=minted,
         branch=branch,
@@ -1823,6 +1868,133 @@ def _sidecar_for(config: Any, repo_key: str | None) -> tuple[str, str] | None:
     return (str(url), str(repo_key)) if url else None
 
 
+class _SandboxClone:
+    """What a repair reads of a sandboxed repository, asked of its helper.
+
+    The coordinator's path for such a repository need not exist on this side
+    (3 October 2026: /var/lib/forge/projects/… in the container), so host git
+    and the filesystem read nothing there. These reads go to the sandbox
+    helper's existing routes by the repository's KEY — ``/code/list-files``
+    and ``/code/read-file`` (the clone's tracked files, as the planner's
+    repository facts read them), ``/git/read-file-from-branch`` and
+    ``/git/rev-parse``. Never raises: anything that cannot be read is logged
+    and kept as a plain sentence in :attr:`not_read`.
+    """
+
+    def __init__(
+        self, sidecar: tuple[str, str], *, post: Any = None, timeout_s: float = 30.0
+    ) -> None:
+        from forge.planning.sidecar_git_runner import _urllib_post
+
+        self._url = str(sidecar[0]).rstrip("/")
+        self._repo = str(sidecar[1])
+        self._post = post or _urllib_post
+        self._timeout_s = timeout_s
+        self._tracked: list[str] | None = None
+        self.not_read: list[str] = []
+
+    def _not_read(self, sentence: str) -> None:
+        logger.warning("fix admission: could not read %s", sentence)
+        self.not_read.append(sentence)
+
+    def _ask(self, route: str, body: dict[str, Any], what: str) -> dict[str, Any] | None:
+        try:
+            status, decoded = self._post(
+                f"{self._url}{route}", {"repo": self._repo, **body}, self._timeout_s
+            )
+        except Exception as exc:  # noqa: BLE001 — transport boundary
+            self._not_read(
+                f"{what} (the sandbox helper at {self._url} could not be reached: "
+                f"{type(exc).__name__}: {str(exc)[:160]})"
+            )
+            return None
+        if status != 200 or not isinstance(decoded, dict):
+            said = decoded.get("error") if isinstance(decoded, dict) else decoded
+            self._not_read(
+                f"{what} (the sandbox helper answered {status}: {str(said)[:200]})"
+            )
+            return None
+        return decoded
+
+    def tracked_under(self, prefix: str) -> list[str]:
+        """The clone's tracked files under ``prefix``, listed once."""
+        if self._tracked is None:
+            answer = self._ask(
+                "/code/list-files", {}, f"the files in the sandbox's clone of {self._repo}"
+            )
+            self._tracked = [str(p) for p in (answer or {}).get("files") or []]
+            if answer and answer.get("capped"):
+                self._not_read(
+                    f"every file in the sandbox's clone of {self._repo} (the "
+                    f"helper listed only the first {len(self._tracked)})"
+                )
+        return [path for path in self._tracked if path.startswith(prefix)]
+
+    def read_on_branch(self, branch: str, path: str) -> str | None:
+        answer = self._ask(
+            "/git/read-file-from-branch",
+            {"branch": branch, "file_path": path},
+            f"{path} on {branch}",
+        )
+        content = (answer or {}).get("content")
+        return content if isinstance(content, str) else None
+
+    def branch_exists(self, branch: str) -> bool | None:
+        """Whether ``branch`` is in the clone; ``None`` when it could not be asked."""
+        answer = self._ask(
+            "/git/rev-parse", {"ref": f"refs/heads/{branch}"}, f"whether {branch} exists"
+        )
+        return None if answer is None else bool(answer.get("sha"))
+
+    def newest_gate_evidence(self, feature_id: str) -> tuple[str | None, str | None]:
+        """As :func:`_newest_gate_evidence`, from the clone's tracked files."""
+        head = "/".join(GATE_EVIDENCE_DIR_PARTS) + f"/{feature_id}-"
+        runs = sorted(
+            path
+            for path in self.tracked_under(head)
+            if path.count("/") == len(GATE_EVIDENCE_DIR_PARTS) + 1
+            and path.endswith("/" + GATE_EVIDENCE_NAME)
+        )
+        if not runs:
+            self._not_read(
+                f"the gate evidence for {feature_id} (none is tracked under "
+                f"{'/'.join(GATE_EVIDENCE_DIR_PARTS)}/ in the sandbox's clone, "
+                "and the helper serves tracked files only)"
+            )
+            return None, None
+        answer = self._ask("/code/read-file", {"path": runs[-1]}, runs[-1])
+        if answer is None:
+            return None, None
+        text = answer.get("content")
+        if answer.get("partial") or not isinstance(text, str):
+            self._not_read(f"{runs[-1]} (the helper did not serve all of it)")
+            return None, None
+        return runs[-1], text
+
+
+def existing_fix_task_ids_in_sandbox(clone: _SandboxClone, feature_id: str) -> set[str]:
+    """:func:`existing_fix_task_ids` for a repository in a sandbox.
+
+    The fix-task files tracked in the clone's features folder, and every
+    repair of this feature whose ``repair/<task id>`` branch is already in the
+    clone — found by asking for the next id's branch until one is free.
+    """
+    from forge.pipeline.repair_branch import repair_branch_name
+
+    head = "/".join(FEATURES_DIR_PARTS) + "/"
+    names = {
+        Path(path).stem.upper()
+        for path in clone.tracked_under(head + "TASK-")
+        if path.count("/") == len(FEATURES_DIR_PARTS)
+        and path.endswith((".yaml", ".yml"))
+    }
+    while True:
+        candidate = mint_fix_task_id(feature_id, existing=names)
+        if not clone.branch_exists(repair_branch_name(candidate)):
+            return names
+        names.add(candidate)
+
+
 def _sanitise_segment(segment: str) -> str:
     """Replace any character outside ``[A-Za-z0-9._-]`` with ``_``."""
     return "".join(c if c.isalnum() or c in "._-" else "_" for c in segment)
@@ -1908,6 +2080,7 @@ __all__ = [
     "admit_fix_build",
     "admit_fix_row",
     "existing_fix_task_ids",
+    "existing_fix_task_ids_in_sandbox",
     "features_dir",
     "fix_task_yaml_relpath",
     "fix_task_yaml_text",
