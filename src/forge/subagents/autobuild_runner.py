@@ -4298,7 +4298,12 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
     # them belongs to.
     declared_settings = _launch_settings_for_build(payload)
     launch_env = build_launch_env(
-        memory_project=memory_project, declared=declared_settings
+        memory_project=memory_project,
+        declared=declared_settings,
+        # Which build this child belongs to (3 October 2026, concurrent
+        # builds): its test containers are named after it and a stop finds its
+        # processes by it. From the payload's build ID, never inherited.
+        run_owner=payload.get("build_id") or None,
     )
     logger.info(
         "autobuild_runner: launching subprocess feature_id=%s cwd=%s "
