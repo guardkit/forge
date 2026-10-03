@@ -15,8 +15,10 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import socket
 import subprocess
 import sys
+import tempfile
 import uuid
 from pathlib import Path
 
@@ -110,14 +112,18 @@ class TestStopReachesEverythingTheBuildOwns:
             "time.sleep(600)\n"
         )
         pid_file = estate.root / "orphan.pid"
-        subprocess.run(
-            [sys.executable, "-c", script, str(pid_file)],
-            env={**os.environ, "GUARDKIT_RUN_OWNER": build_id},
-            check=True,
-        )
-        wait_for(pid_file.exists, 10, "the orphan never started")
-        orphan = int(pid_file.read_text())
         try:
+            subprocess.run(
+                [sys.executable, "-c", script, str(pid_file)],
+                env={**os.environ, "GUARDKIT_RUN_OWNER": build_id},
+                check=True,
+            )
+            wait_for(
+                lambda: pid_file.exists() and pid_file.read_text().strip(),
+                10,
+                "the orphan never started",
+            )
+            orphan = int(pid_file.read_text())
             report = asyncio.run(build_processes.stop_build(build_id))
             assert report.stopped, report.as_json()
             assert not Path(f"/proc/{orphan}").exists() or (
@@ -125,6 +131,7 @@ class TestStopReachesEverythingTheBuildOwns:
             )
         finally:
             kill_marked([build_id])
+            build_processes.forget(build_id)
 
     def test_a_reused_process_number_is_never_signalled(self, estate):
         """Recorded (pid, start time) pairs: a new process with an old number is safe."""
@@ -180,16 +187,44 @@ class TestFixtureContainers:
         finally:
             remove_test_containers([build_id, other_id])
 
-    def test_an_engine_that_cannot_answer_is_not_stopped(self, estate, monkeypatch):
+    def test_an_engine_that_is_there_but_errors_is_not_stopped(
+        self, estate, monkeypatch
+    ):
+        """Reachable endpoint, refusing engine: "cannot confirm", place held."""
         from forge import build_processes
 
         broken = estate.root / "broken-engine"
         broken.write_text("#!/bin/sh\necho 'engine down' >&2\nexit 1\n")
         broken.chmod(0o755)
-        monkeypatch.setenv("FORGE_FIXTURE_ENGINE", str(broken))
-        report = asyncio.run(build_processes.still_running(_build_id()))
+        endpoint = Path(tempfile.mkdtemp()) / "engine.sock"
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(str(endpoint))
+        listener.listen(4)
+        try:
+            monkeypatch.setenv("FORGE_FIXTURE_ENGINE", str(broken))
+            monkeypatch.setenv("DOCKER_HOST", f"unix://{endpoint}")
+            report = asyncio.run(build_processes.still_running(_build_id()))
+        finally:
+            listener.close()
         assert not report.confirmed
         assert not report.stopped
+
+
+class TestNoEngineHere:
+    def test_no_engine_socket_means_no_containers(self, monkeypatch, tmp_path):
+        """A client with no engine behind it must not hold a place for ever."""
+        from forge import build_processes
+
+        monkeypatch.setenv("DOCKER_HOST", f"unix://{tmp_path}/no-engine.sock")
+        report = asyncio.run(build_processes.still_running(_build_id()))
+        assert report.confirmed and report.stopped, report.as_json()
+
+    def test_no_client_means_no_containers(self, monkeypatch, tmp_path):
+        from forge import build_processes
+
+        monkeypatch.setenv("FORGE_FIXTURE_ENGINE", str(tmp_path / "no-such-client"))
+        report = asyncio.run(build_processes.still_running(_build_id()))
+        assert report.confirmed and report.stopped, report.as_json()
 
 
 def _graph_input(feature_id: str, build_id: str, branch: str) -> dict:
@@ -256,3 +291,33 @@ class TestTheRunnerNodeStopsTheWholeBuild:
             assert float(later[f]) > float(first[f]), f"{f} stopped writing"
         # A's worktree is kept for its evidence.
         assert list((estate.root / "worktrees").glob(f"*{ids['FEAT-A2']}*"))
+
+
+class TestAStopAskedBeforeTheSpawn:
+    """The build is asked to stop while still in the steps before the spawn."""
+
+    def test_the_build_never_spawns_guardkit_and_ends_cancelled(
+        self, estate, monkeypatch
+    ):
+        for name, value in estate.env().items():
+            monkeypatch.setenv(name, value)
+        from forge import build_processes
+        from forge.subagents import autobuild_runner as ar
+
+        build_id = _build_id()
+        estate.add_build("FEAT-P1", build_id, branch="p1")
+        real_materialise = ar._materialise_worktree
+        answers = []
+
+        async def _cancel_meanwhile(*args, **kwargs):
+            answers.append((await build_processes.stop_build(build_id)).as_json())
+            return await real_materialise(*args, **kwargs)
+
+        monkeypatch.setattr(ar, "_materialise_worktree", _cancel_meanwhile)
+        result = asyncio.run(
+            ar._build_runner_graph().ainvoke(_graph_input("FEAT-P1", build_id, "p1"))
+        )
+        assert answers == [{"build_id": build_id, "stopped": True, "pending": True}]
+        assert result["async_tasks"]["FEAT-P1"]["lifecycle"] == "cancelled"
+        assert not (estate.records / "FEAT-P1.pids").exists(), "GuardKit was spawned"
+        assert not build_processes.stop_pending(build_id), "the request outlived the run"
