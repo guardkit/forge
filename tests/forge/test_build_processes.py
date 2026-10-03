@@ -217,6 +217,7 @@ class TestFixtureContainers:
             assert after.stopped, after.as_json()
             assert not container_running(mine)
         finally:
+            monkeypatch.delenv("DOCKER_HOST", raising=False)
             remove_test_containers([build_id])
 
 
