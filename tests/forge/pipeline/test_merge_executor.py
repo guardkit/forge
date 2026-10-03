@@ -4023,3 +4023,175 @@ class TestDurableRetainedCandidateIdentity:
         assert "offered branch moved" in outcome.detail
         assert gk.calls == [] and dp.calls == []
         assert outer.is_dir() and inner.is_dir()
+
+
+# ---------------------------------------------------------------------------
+# The "who's merging" hold is put down when the press has really finished
+# (3 October 2026). It used to be taken and never put down, so every press held
+# its build for the whole lease however it ended, and a retry of FEAT-E592 was
+# refused because of it. It is put down only when every step the press
+# dispatched gave its own answer; after a cancellation or a lost connection it
+# is kept, because the merge may still be running in the sandbox.
+# ---------------------------------------------------------------------------
+
+
+ANOTHER_PROCESS = 424242
+
+
+def _the_hold(pool: SqliteLifecyclePersistence) -> Any:
+    from forge.pipeline.publication_record import PublicationRecordStore
+
+    return PublicationRecordStore(pool.connection).read(BUILD_ID)
+
+
+async def _a_press_from_another_process(
+    deps: MergeExecutorDeps, repo_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> Any:
+    """The same merge word, given again by a coordinator in another process."""
+    import forge.pipeline.merge_executor as merge_executor
+
+    with monkeypatch.context() as patched:
+        patched.setattr(merge_executor.os, "getpid", lambda: ANOTHER_PROCESS)
+        return await _run_executor(deps, repo_root)
+
+
+class _AMergeThatIsCancelled:
+    """The press is cancelled while the merge command is running."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    async def __call__(self, **kwargs: Any) -> GuardKitResult:
+        self.calls.append(kwargs)
+        raise asyncio.CancelledError()
+
+
+def _no_answer_came_back(status: str) -> _FakeGuardKit:
+    """The sandbox could not be reached, or the command ran out of time: no
+    report, so nobody knows whether the merge ran."""
+
+    class _NoReport(_FakeGuardKit):
+        async def __call__(self, **kwargs: Any) -> GuardKitResult:
+            self.calls.append(kwargs)
+            return GuardKitResult(
+                status=status,  # type: ignore[arg-type]
+                subcommand="autobuild merge",
+                duration_secs=0.1,
+                stdout_tail="",
+                stderr=(
+                    "the deploy sidecar could not be reached, so the merge "
+                    "did not run: timed out"
+                ),
+                exit_code=1,
+            )
+
+    return _NoReport()
+
+
+class TestTheHoldIsPutDownOnlyWhenThePressHasFinished:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "guardkit, result",
+        [
+            (
+                lambda: _FakeGuardKit(
+                    status="failed",
+                    report={"outcome": "refused", "refusal_reason": "it conflicts"},
+                ),
+                "merge-refused",
+            ),
+            (lambda: _JoinsForReal(verify_ok=False), "merged-verify-failed"),
+            (lambda: _JoinsForReal(), "publication-pending"),
+        ],
+        ids=["refused-join", "red-checks", "checked-publication-off"],
+    )
+    async def test_a_settled_ending_puts_the_hold_down(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+        repo_root: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        guardkit: Any,
+        result: str,
+    ) -> None:
+        deps, _publisher, _gk, _dp = _deps(config, pool, guardkit=guardkit())
+
+        outcome = await _run_executor(deps, repo_root)
+
+        assert outcome.result == result, outcome.detail
+        held = _the_hold(pool)
+        assert held.lease_holder is None
+        assert held.lease_expires_at is None
+        # A press from another process is not refused by a hold.
+        again = await _a_press_from_another_process(deps, repo_root, monkeypatch)
+        assert "another worker" not in again.detail
+        assert _the_hold(pool).turn == held.turn + 1
+
+    @pytest.mark.asyncio
+    async def test_a_refusal_before_anything_was_dispatched_puts_it_down(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+        repo_root: Path,
+    ) -> None:
+        from forge.pipeline.publication_record import PublicationRecordStore
+
+        # No target branch on the build's record: refused before the join.
+        _ensure_build(pool, build_id=BUILD_ID, feature_id=FEATURE_ID, target_branch="")
+        deps, _publisher, gk, _dp = _deps(config, pool)
+
+        outcome = await _run_executor(deps, repo_root)
+
+        assert outcome.result == "merge-refused"
+        assert gk.calls == []
+        assert _the_hold(pool).lease_holder is None
+        grant = PublicationRecordStore(pool.connection).take_lease(
+            build_id=BUILD_ID, holder="another-worker", now=_utcnow()
+        )
+        assert grant is not None
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_press_keeps_the_hold_and_a_second_worker_is_refused(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+        repo_root: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import os
+
+        deps, _publisher, _gk, _dp = _deps(
+            config, pool, guardkit=_AMergeThatIsCancelled()  # type: ignore[arg-type]
+        )
+
+        with pytest.raises(asyncio.CancelledError):
+            await _run_executor(deps, repo_root)
+
+        assert _the_hold(pool).lease_holder == f"merge-press:{os.getpid()}"
+        again = await _a_press_from_another_process(deps, repo_root, monkeypatch)
+        assert again.result == "merge-refused"
+        assert "another worker" in again.detail
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", ["failed", "timeout"])
+    async def test_a_merge_whose_answer_never_came_back_keeps_the_hold(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+        repo_root: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        status: str,
+    ) -> None:
+        import os
+
+        deps, _publisher, _gk, _dp = _deps(
+            config, pool, guardkit=_no_answer_came_back(status)
+        )
+
+        outcome = await _run_executor(deps, repo_root)
+
+        assert outcome.result == "merge-refused"
+        assert _the_hold(pool).lease_holder == f"merge-press:{os.getpid()}"
+        again = await _a_press_from_another_process(deps, repo_root, monkeypatch)
+        assert again.result == "merge-refused"
+        assert "another worker" in again.detail

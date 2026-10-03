@@ -587,6 +587,27 @@ class PublicationRecordStore:
             assignments={"lease_expires_at": (now + timedelta(seconds=ttl)).isoformat()},
         )
 
+    def release_lease(
+        self, *, build_id: str, turn: int, holder: str, now: datetime
+    ) -> bool:
+        """Put this worker's lease down, so the next merge word need not wait.
+
+        Added 3 October 2026: a lease was only ever taken, so every press
+        held its build for the whole lease however it ended, and a retry a
+        few minutes later was refused. Only the holder can put it down, and
+        only on its own turn — the same condition every other write carries,
+        plus the holder's name — so a worker that has been replaced changes
+        nothing. The turn number is left as it is: the next worker's take
+        raises it. ``False`` (never an exception) when nothing was changed.
+        """
+        return self._write(
+            build_id=build_id,
+            turn=turn,
+            now=now,
+            assignments={"lease_holder": None, "lease_expires_at": None},
+            holder=holder,
+        )
+
     # -- writing (always against the writer's own turn) ---------------------
 
     def _write(
@@ -597,12 +618,14 @@ class PublicationRecordStore:
         now: datetime,
         assignments: dict[str, Any],
         lines_json: str | None = None,
+        holder: str | None = None,
     ) -> bool:
         """One conditional UPDATE. ``False`` means the writer was replaced.
 
         The condition is in the same statement as the write, which is what
         makes it safe: there is no moment between checking the turn number and
-        changing the row for a replaced worker to act in.
+        changing the row for a replaced worker to act in. ``holder``, when
+        given, is part of the same condition.
         """
         sets = dict(assignments)
         if lines_json is not None:
@@ -610,13 +633,17 @@ class PublicationRecordStore:
         sets["updated_at"] = now.isoformat()
         columns = ", ".join(f"{name} = ?" for name in sets)
         values = list(sets.values()) + [str(build_id), int(turn)]
+        held_by = ""
+        if holder is not None:
+            held_by = " AND lease_holder = ?"
+            values.append(str(holder))
         try:
             with self._transaction():
                 changed = self._cx.execute(
                     f"""
                     UPDATE publication_records
                        SET {columns}
-                     WHERE build_id = ? AND turn = ?
+                     WHERE build_id = ? AND turn = ?{held_by}
                     """,
                     values,
                 ).rowcount
