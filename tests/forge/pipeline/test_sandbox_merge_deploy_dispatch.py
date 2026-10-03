@@ -156,6 +156,9 @@ async def test_a_sandbox_repository_gets_its_entry_and_the_sandbox_live_gate(
     assert isinstance(invoker, SidecarLiveGateInvoker)
     assert invoker.base_url == SANDBOX_SIDECAR
     assert invoker.repo_path == repos[REPO_WITH]
+    # Its deploy records go to a folder of the coordinator's own, beside its
+    # ledger, never under the path that holds nothing (3 October 2026).
+    assert call["deploy_record_root"] == str(tmp_path / "deploy-records" / "api_test")
 
 
 @pytest.mark.asyncio
@@ -172,6 +175,9 @@ async def test_a_repository_without_a_sandbox_is_composed_exactly_as_before(
     invoker = call["live_gate_invoker"]
     assert isinstance(invoker, RepoDriverLiveGateInvoker)
     assert invoker.repo_path == repos[REPO_WITHOUT]
+    assert call["deploy_record_root"] == str(
+        repos[REPO_WITHOUT] / config.deploy.deploy_record_dir
+    )
 
 
 @pytest.mark.asyncio

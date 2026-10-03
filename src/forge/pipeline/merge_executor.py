@@ -1292,6 +1292,18 @@ async def execute_merge_deploy(
     from forge.config.sandboxes import sandbox_for
 
     scripts_from_the_commit = sandbox_for(deps.config, repo) is not None
+
+    def _deployed_in() -> str | None:
+        """Where this repository's checks and deploys run, as a card says it.
+
+        A repository with a sandbox runs all of them in there (3 October
+        2026). The path this coordinator was given for it holds nothing, so
+        the profile cannot be read there and the card used to say nowhere at
+        all. Every other repository is decided from its profile, as before.
+        """
+        if scripts_from_the_commit:
+            return "docker-sandbox"
+        return deployed_in_for(repo_root)
     # WHERE this repository's git happens (sandbox first, rule 89): inside its
     # sandbox when it has one, in this container when it has not. Chosen once,
     # used by every git operation the press makes, so they cannot disagree.
@@ -1585,7 +1597,7 @@ async def execute_merge_deploy(
             checks_passed=gate.get("checks_passed"),
             checks_total=gate.get("checks_total"),
             # Where the check ran, when it ran: the sandbox, or nowhere named.
-            deployed_in=deployed_in_for(repo_root) if gate.get("ran") else None,
+            deployed_in=_deployed_in() if gate.get("ran") else None,
             gate_before_merge=_gate_for_report(),
         )
 
@@ -2570,7 +2582,7 @@ async def execute_merge_deploy(
             ),
             checks_passed=checks_passed,
             checks_total=checks_total,
-            deployed_in=deployed_in_for(repo_root),
+            deployed_in=_deployed_in(),
             gate_before_merge=_gate_for_report() if gate_began else None,
         )
 
@@ -3639,7 +3651,7 @@ async def execute_merge_deploy(
                 ),
                 checks_passed=gate.get("checks_passed"),
                 checks_total=gate.get("checks_total"),
-                deployed_in=deployed_in_for(repo_root) if gate.get("ran") else None,
+                deployed_in=_deployed_in() if gate.get("ran") else None,
                 gate_before_merge=_gate_for_report(),
             )
 
@@ -4718,7 +4730,7 @@ async def execute_merge_deploy(
                     detail=detail,
                     checks_passed=checks_passed,
                     checks_total=checks_total,
-                    deployed_in=deployed_in_for(repo_root) if gate.get("ran") else None,
+                    deployed_in=_deployed_in() if gate.get("ran") else None,
                     gate_before_merge=_gate_for_report(),
                 )
 
@@ -5203,6 +5215,18 @@ def build_in_daemon_deploy_dispatcher(
         # The daemon container has no docker; force the sidecar surface on a
         # COPY (the stage reads only the config it is passed).
         deploy_cfg = config.deploy.model_copy(update={"execution_surface": "sidecar"})
+        # WHERE THE DEPLOY RECORDS ARE WRITTEN. For a repository with a
+        # sandbox, the path this coordinator was given for it holds nothing
+        # (the only copy is the sandbox's own clone), and writing records
+        # under it made a pretend project folder in the coordinator's state
+        # (3 October 2026). Those records go into a folder of the
+        # coordinator's own instead, beside its ledger, named for the
+        # repository. Every other repository's records go where they always
+        # have.
+        if sandbox is not None:
+            deploy_record_root = Path(db_path).parent / "deploy-records" / Path(str(repo)).name
+        else:
+            deploy_record_root = repo_root / deploy_cfg.deploy_record_dir
         return await dispatch_deploy_stage(
             deploy_cfg,
             profile,
@@ -5212,7 +5236,7 @@ def build_in_daemon_deploy_dispatcher(
             runbook_publisher=runbook_publisher,
             deploy_publisher=deploy_publisher,
             live_gate_invoker=invoker,
-            deploy_record_root=str(repo_root / deploy_cfg.deploy_record_dir),
+            deploy_record_root=str(deploy_record_root),
             dry_run=dry_run,
             target_repo=repo,
             target_repo_root=str(repo_root),
