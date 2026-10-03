@@ -1411,6 +1411,32 @@ REMOTE_TIP = "b" * 40
 STALE_MAIN = "c" * 40
 
 
+def _record_merge_report(pool: SqliteLifecyclePersistence, result: str) -> None:
+    """The source build's merge report, on its record as the executor writes it."""
+    from forge.lifecycle.metrics import (
+        MERGE_REPORT_STAGE_LABEL,
+        MERGE_REPORT_TARGET_IDENTIFIER,
+    )
+    from forge.lifecycle.persistence import StageLogEntry
+
+    at = datetime(2026, 10, 3, 20, 0, tzinfo=UTC)
+    pool.record_stage(
+        StageLogEntry(
+            build_id=SOURCE_BUILD,
+            stage_label=MERGE_REPORT_STAGE_LABEL,
+            target_kind="local_tool",
+            target_identifier=MERGE_REPORT_TARGET_IDENTIFIER,
+            status="FAILED",
+            started_at=at,
+            completed_at=at,
+            duration_secs=0.0,
+            # The free-text detail quotes the other word on purpose: the
+            # decision is read from ``result``, never searched for in here.
+            details={"result": result, "detail": "not merged-verify-failed"},
+        )
+    )
+
+
 def _file_sourced_row(store: WorkQueueStore, source: str) -> int:
     return store.file_sentence(
         correlation_id=fix_correlation_id(SOURCE_BUILD),
@@ -1456,8 +1482,11 @@ class TestAPostMergeRepairStartsFromTheRemote:
         source: str = SOURCE_MERGE_REPORT,
         sidecar: Any = None,
         sandbox: bool = True,
+        merge_ending: str | None = "merged-deploy-failed",
     ) -> Any:
         seed_failed_build(pool)
+        if merge_ending is not None:
+            _record_merge_report(pool, merge_ending)
         config = make_config(
             repo_root,
             profiles={"attended": {}, FIX_JOURNEY_PROFILE_NAME: {"max_review_cycles": 2}},
@@ -1479,16 +1508,24 @@ class TestAPostMergeRepairStartsFromTheRemote:
             )
         )
 
+    @pytest.mark.parametrize(
+        "merge_ending",
+        ["merged-deploy-failed", None],
+        ids=["published-then-deploy-failed", "no-report-recorded"],
+    )
     def test_it_is_cut_from_the_fetched_remote_commit_when_local_main_is_behind(
         self,
         pool: SqliteLifecyclePersistence,
         store: WorkQueueStore,
         repo_root: Path,
         tmp_path: Path,
+        merge_ending: str | None,
     ) -> None:
         sidecar = self._sidecar(remote={"branch": "main", "commit": REMOTE_TIP})
 
-        admission = self._admit(pool, store, repo_root, tmp_path, sidecar=sidecar)
+        admission = self._admit(
+            pool, store, repo_root, tmp_path, sidecar=sidecar, merge_ending=merge_ending
+        )
 
         routes = [route for route, _ in sidecar.calls]
         fetched = routes.index("remote-start-point")
@@ -1516,35 +1553,71 @@ class TestAPostMergeRepairStartsFromTheRemote:
         assert admission.branch == "repair/TASK-FEAT44A8FIX1"
 
     @pytest.mark.parametrize(
-        "remote",
+        "remote, permanent, said",
         [
-            OSError("connection reset"),
-            {"refusal": "the remote named 'origin' could not be reached"},
-            {"branch": "trunk", "commit": REMOTE_TIP},
+            (OSError("connection reset"), False, "The queue will try again"),
+            (
+                {"refusal": "the remote named 'origin' could not be reached"},
+                False,
+                "The queue will try again",
+            ),
+            (
+                {"branch": "trunk", "commit": REMOTE_TIP},
+                True,
+                "a decision for a person",
+            ),
         ],
         ids=["transport-failure", "remote-unreachable", "default-branch-moved"],
     )
-    def test_a_remote_that_cannot_be_read_refuses_for_now_and_writes_nothing(
+    def test_a_remote_that_cannot_be_read_refuses_and_writes_nothing(
         self,
         pool: SqliteLifecyclePersistence,
         store: WorkQueueStore,
         repo_root: Path,
         tmp_path: Path,
         remote: Any,
+        permanent: bool,
+        said: str,
     ) -> None:
+        """A remote that could not be read is tried again; a default branch
+        that moved is a decision for a person, so that refusal is final."""
         sidecar = self._sidecar(remote=remote)
 
         with pytest.raises(FixAdmissionRefused) as caught:
             self._admit(pool, store, repo_root, tmp_path, sidecar=sidecar)
 
         assert caught.value.reason == "repair-base"
-        assert caught.value.permanent is False
-        assert "The queue will try again" in caught.value.message
+        assert caught.value.permanent is permanent
+        assert said in caught.value.message
         routes = [route for route, _ in sidecar.calls]
         assert "worktree-add" not in routes
         assert "list-files-on-branch" not in routes
         assert sidecar.written == {}
         assert len(build_rows(pool)) == 1
+
+    def test_checks_that_failed_after_the_join_repair_the_features_own_branch(
+        self,
+        pool: SqliteLifecyclePersistence,
+        store: WorkQueueStore,
+        repo_root: Path,
+        tmp_path: Path,
+    ) -> None:
+        """Joined but the checks after the join failed, so nothing was
+        published: neither main has the feature's code. The repair is cut
+        from the feature's own branch, as a candidate-refused one is."""
+        sidecar = self._sidecar(remote={"branch": "main", "commit": REMOTE_TIP})
+
+        admission = self._admit(
+            pool, store, repo_root, tmp_path,
+            sidecar=sidecar, merge_ending="merged-verify-failed",
+        )
+
+        routes = [route for route, _ in sidecar.calls]
+        assert "remote-start-point" not in routes
+        listing = sidecar.calls[routes.index("list-files-on-branch")][1]
+        assert listing["branch"] == f"autobuild/{FEATURE_ID}"
+        assert sidecar.calls[routes.index("worktree-add")][1]["base_ref"] == "a" * 40
+        assert admission.branch == "repair/TASK-FEAT44A8FIX1"
 
     def test_a_candidate_refused_repair_keeps_its_own_branch_and_fetches_nothing(
         self,
