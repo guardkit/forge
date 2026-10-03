@@ -3369,12 +3369,19 @@ def build_conductor_supervisor_factory(
             else _AlsoTheSandboxTree(inner=worktree_allowlist, tree=tree)
         )
         leg_read_allowlist = read_allowlist if tree is None else [Path(tree)]
+        # The same tree for the forward context, or a follow-up review loses
+        # every artefact the work leg wrote in the sandbox's tree.
+        context_builder = forward_context_builder
+        if tree is not None and hasattr(forward_context_builder, "widened"):
+            context_builder = forward_context_builder.widened(
+                lambda inner: _AlsoTheSandboxTree(inner=inner, tree=tree)
+            )
         mode_kwargs = _mode_kwargs(
             pool=pool,
             config=config,
             base_branch=base_branch,
             worktree_allowlist=allowlist,
-            forward_context_builder=forward_context_builder,
+            forward_context_builder=context_builder,
             failure_pack_source_reader=failure_pack_source_reader,
             receipts_root=receipts_root,
         )
@@ -3400,7 +3407,7 @@ def build_conductor_supervisor_factory(
             build_row_reader=pool.get_build_row,
             read_allowlist=leg_read_allowlist,
             worktree_allowlist=allowlist,
-            forward_context_builder=forward_context_builder,
+            forward_context_builder=context_builder,
             stage_log_writer=stage_log_writer,
             subprocess_runner=_runner_for(build_id),
             fix_task_yaml_in_worktree=tree is not None,
@@ -3439,7 +3446,7 @@ def build_conductor_supervisor_factory(
             mode_kwargs.get("fix_task_context_builder"), pool=pool
         )
         return _build(
-            forward_context_builder=forward_context_builder,
+            forward_context_builder=context_builder,
             async_task_starter=_ModeAOnlySeam("async_task_starter"),
             stage_log_recorder=_ModeAOnlySeam("stage_log_recorder"),
             state_channel=_ModeAOnlySeam("state_channel"),

@@ -868,6 +868,89 @@ class TestTheSupervisorFactoryUsesTheChooser:
         assert made[1]["read_allowlist"] == [Path("/work")]
         assert made[1]["fix_task_yaml_in_worktree"] is False
 
+    def test_a_sandboxed_work_legs_artefact_reaches_the_follow_up_review(
+        self, pool: SqliteLifecyclePersistence, sidecar: Any, plain_checkout: Path
+    ) -> None:
+        """Codex round 1, R3: the forward context kept the coordinator's roots,
+        so a follow-up review lost every file the work leg wrote in the
+        sandbox's tree. A plain build keeps the very builder it was given."""
+        from forge.cli._serve_conductor import build_conductor_supervisor_factory
+        from forge.cli._serve_deps_forward_context import (
+            ForgeConfigWorktreeAllowlist,
+        )
+        from forge.lifecycle.modes import BuildMode
+        from forge.pipeline.forward_context_builder import (
+            ApprovedStageEntry,
+            ForwardContextBuilder,
+        )
+        from forge.pipeline.stage_taxonomy import StageClass
+
+        sandboxed_tree = "/sandbox/own/clone/.forge/worktrees/" + BUILD_ID
+        report = sandboxed_tree + "/.claude/task-work/TASK-FIX-1/result.md"
+        plain_build = "build-FEAT-SBX1-20260907180000"
+        _row(pool, REPO_KEY)
+        pool.record_worktree_path(BUILD_ID, sandboxed_tree)
+        _row(pool, PLAIN_KEY, build_id=plain_build)
+
+        class _Reader:
+            def get_approved_stage_entry(self, **_kw: Any) -> Any:
+                return None
+
+            def get_all_approved_stage_entries(self, **_kw: Any) -> Any:
+                return [
+                    ApprovedStageEntry(
+                        gate_decision="approved",
+                        artefact_paths=(report,),
+                        artefact_text=None,
+                    )
+                ]
+
+        configured = ForwardContextBuilder(
+            _Reader(),
+            ForgeConfigWorktreeAllowlist(
+                allowed_roots=tuple(sidecar.config.permissions.filesystem.allowlist)
+            ),
+        )
+        made: list[dict[str, Any]] = []
+
+        def _dispatcher_spy(**kwargs: Any) -> Any:
+            made.append(kwargs)
+            return object()
+
+        import forge.pipeline.dispatchers.conductor_subprocess as mod
+
+        real = mod.make_conductor_subprocess_dispatcher
+        mod.make_conductor_subprocess_dispatcher = _dispatcher_spy  # type: ignore[assignment]
+        try:
+            factory = build_conductor_supervisor_factory(
+                pool=pool,
+                config=sidecar.config,
+                forward_context_builder=configured,
+                worktree_allowlist=object(),
+                read_allowlist=[Path("/work")],
+                subprocess_runner=object(),
+                subprocess_runner_for_build=lambda _b: object(),
+            )
+            factory(BUILD_ID)
+            factory(plain_build)
+        finally:
+            mod.make_conductor_subprocess_dispatcher = real  # type: ignore[assignment]
+
+        def follow_up(builder: Any, build_id: str) -> list[str]:
+            return [
+                entry.value
+                for entry in builder.build_for(
+                    stage=StageClass.TASK_REVIEW,
+                    build_id=build_id,
+                    feature_id=None,
+                    mode=BuildMode.MODE_C,
+                )
+            ]
+
+        assert follow_up(configured, BUILD_ID) == []  # the configured roots alone
+        assert follow_up(made[0]["forward_context_builder"], BUILD_ID) == [report]
+        assert made[1]["forward_context_builder"] is configured
+
 
 # ---------------------------------------------------------------------------
 # Rule 75, driven the whole way: the chosen runner, a real socket, a real
