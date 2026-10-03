@@ -134,6 +134,21 @@ class TestTaskIdBinding:
 
         assert dispatch.calls[0]["fix_task_yaml"] == "/work/tasks/fix-task.yaml"
 
+    @pytest.mark.asyncio
+    async def test_a_sandboxed_leg_is_pointed_at_the_yaml_in_its_own_tree(
+        self,
+    ) -> None:
+        """3 October 2026: the coordinator's path for the YAML does not exist
+        in the sandbox. The repair branch carries it in the journey's tree."""
+        dispatch = _RecordingDispatch()
+        adapter = _adapter(dispatch, fix_task_yaml_in_worktree=True)
+
+        await adapter(stage=StageClass.TASK_REVIEW, build_id=BUILD_ID)
+
+        assert dispatch.calls[0]["fix_task_yaml"] == (
+            "/work/build-FEAT-FIX007/.guardkit/features/TASK-FIX007.yaml"
+        )
+
 
 class TestTheKwargsSeam:
     """Item 2 — the call that would have raised ``TypeError``."""
