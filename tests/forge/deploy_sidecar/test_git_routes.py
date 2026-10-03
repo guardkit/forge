@@ -39,6 +39,7 @@ from forge.deploy_sidecar.service import (
     GIT_CHECK_PATH_ARGS,
     build_server,
     process_git_read_file_request,
+    process_git_list_files_on_branch_request,
     process_git_rev_parse_request,
     process_git_write_tree_request,
     resolve_check_command,
@@ -1497,3 +1498,38 @@ def test_live_gherkin_normalizer_and_the_two_schema_checks_through_the_route(
     assert not bar["passed"]
     assert bar["detail"].startswith("qa/pass-bar-x.yaml: guardkit qa validate pass-bar ")
     assert _no_commit_landed(repo, "planning/run-0002")
+
+
+def test_list_files_on_branch_reads_that_branch_not_the_checked_out_tree(
+    cfg: ForgeConfig, repo: Path
+) -> None:
+    """3 October 2026: a repair's base can be a feature's autobuild branch,
+    whose task files the clone's checked-out tree does not have."""
+
+    def git(*args: str) -> None:
+        subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True)
+
+    start = git_rev_parse(repo, "HEAD")
+    git("checkout", "-q", "-b", "autobuild/FEAT-X")
+    (repo / "tasks" / "backlog" / "feat-x").mkdir(parents=True)
+    (repo / "tasks" / "backlog" / "feat-x" / "TASK-X-001-a.md").write_text("a\n")
+    git("add", "tasks")
+    git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "tasks")
+    git("checkout", "-q", start)
+
+    def ask(branch: Any, under: Any = "tasks") -> tuple[int, dict[str, Any]]:
+        return process_git_list_files_on_branch_request(
+            {"repo": REPO_KEY, "branch": branch, "under": under}, config=cfg
+        )
+
+    assert ask("autobuild/FEAT-X") == (
+        200,
+        {"files": ["tasks/backlog/feat-x/TASK-X-001-a.md"]},
+    )
+    assert not (repo / "tasks").exists()  # nothing was checked out or written
+    assert ask(start) == (200, {"files": []})
+    assert ask("no-such-branch") == (200, {"files": None})
+    for bad_branch in ("-x", "a b", None):
+        assert ask(bad_branch)[0] == 400
+    for bad_under in ("/etc", "../x", "", None):
+        assert ask("autobuild/FEAT-X", bad_under)[0] == 400

@@ -217,8 +217,8 @@ class FixAdmissionRefused(Exception):
         reason: A short machine word for the caller to map onto its own
             exit code — one of ``cap``, ``task-id``, ``fix-task-yaml``,
             ``parent-feature``, ``repo-not-allowed``, ``repo-unknown``,
-            ``no-source-build``, ``repair-base``, ``repair-task`` or
-            ``duplicate``.
+            ``no-source-build``, ``repair-base``, ``repair-task``,
+            ``repair-number`` or ``duplicate``.
         permanent: Whether trying again changes anything. A repository the
             configuration does not know, a budget profile with no cap, a row
             that names no build, a fix-task file that will not parse: every
@@ -755,7 +755,7 @@ def gather_repair_facts(
     if files_on_base is not None:
         files = list(files_on_base)
     elif clone is not None:
-        files = clone.tracked_under("tasks/")
+        files = clone.files_on_branch(base_branch, "tasks")
     else:
         files = list_branch_files(repo, base_branch, "tasks")
     folder = repair_task_folder(feature_id, files)
@@ -868,7 +868,7 @@ def materialise_repair_task(
     # path for it may not exist at all), so it is read where it is.
     clone = _SandboxClone(sidecar, post=post) if sidecar is not None else None
     files_on_base = (
-        clone.tracked_under("tasks/")
+        clone.files_on_branch(base_branch, "tasks")
         if clone is not None
         else list_branch_files(repo, base_branch, "tasks")
     )
@@ -1876,9 +1876,10 @@ class _SandboxClone:
     and the filesystem read nothing there. These reads go to the sandbox
     helper's existing routes by the repository's KEY — ``/code/list-files``
     and ``/code/read-file`` (the clone's tracked files, as the planner's
-    repository facts read them), ``/git/read-file-from-branch`` and
-    ``/git/rev-parse``. Never raises: anything that cannot be read is logged
-    and kept as a plain sentence in :attr:`not_read`.
+    repository facts read them), ``/git/list-files-on-branch``,
+    ``/git/read-file-from-branch`` and ``/git/rev-parse``. Never raises:
+    anything that cannot be read is logged and kept as a plain sentence in
+    :attr:`not_read`.
     """
 
     def __init__(
@@ -1936,8 +1937,32 @@ class _SandboxClone:
             {"branch": branch, "file_path": path},
             f"{path} on {branch}",
         )
-        content = (answer or {}).get("content")
-        return content if isinstance(content, str) else None
+        if answer is None:
+            return None
+        content = answer.get("content")
+        if not isinstance(content, str):
+            self._not_read(f"{path} on {branch} (the helper found no such file there)")
+            return None
+        return content
+
+    def files_on_branch(self, branch: str, under: str) -> list[str]:
+        """The files on ``branch`` under the folder ``under`` — the branch's
+        own, not the clone's checked-out tree, which may be another branch."""
+        answer = self._ask(
+            "/git/list-files-on-branch",
+            {"branch": branch, "under": under},
+            f"the files under {under}/ on {branch}",
+        )
+        if answer is None:
+            return []
+        files = answer.get("files")
+        if not isinstance(files, list):
+            self._not_read(
+                f"the files under {under}/ on {branch} (the sandbox's clone has "
+                "no such branch)"
+            )
+            return []
+        return [str(path) for path in files]
 
     def branch_exists(self, branch: str) -> bool | None:
         """Whether ``branch`` is in the clone; ``None`` when it could not be asked."""
@@ -1990,7 +2015,18 @@ def existing_fix_task_ids_in_sandbox(clone: _SandboxClone, feature_id: str) -> s
     }
     while True:
         candidate = mint_fix_task_id(feature_id, existing=names)
-        if not clone.branch_exists(repair_branch_name(candidate)):
+        exists = clone.branch_exists(repair_branch_name(candidate))
+        if exists is None:
+            # Unknown is not free: taking the number could write over a
+            # repair that already rides that branch.
+            raise FixAdmissionRefused(
+                "Nothing was queued: the next repair number for "
+                f"{feature_id} could not be established, because "
+                f"{clone.not_read[-1]}. It will be tried again.",
+                reason="repair-number",
+                permanent=False,
+            )
+        if not exists:
             return names
         names.add(candidate)
 
