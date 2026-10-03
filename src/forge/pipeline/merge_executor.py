@@ -1080,16 +1080,22 @@ def _the_profile_at(repo_root: Path | str, commit: str | None) -> tuple[Any, str
     never its working tree. Returns ``(profile, None)`` or ``(None, why)``;
     never raises — a file out of a project this factory did not write is input.
     """
-    import yaml
-
     from forge.deploy.candidate_tree import read_file_at_commit_sync
-    from forge.deploy.profile import parse_deploy_profile
 
     at = str(commit or "").strip() or "HEAD"
     try:
         answer = read_file_at_commit_sync(Path(repo_root), at, DEPLOY_PROFILE_PATH)
     except Exception as exc:  # noqa: BLE001 — a read, never a crash
         return None, f"{type(exc).__name__}: {exc}"
+    return _the_profile_out_of(answer, at)
+
+
+def _the_profile_out_of(answer: Any, at: str) -> tuple[Any, str | None]:
+    """The profile in one read's answer, or why not. Never raises."""
+    import yaml
+
+    from forge.deploy.profile import parse_deploy_profile
+
     if answer.refusal:
         return None, str(answer.refusal)
     if not answer.found or answer.content is None:
@@ -1100,6 +1106,30 @@ def _the_profile_at(repo_root: Path | str, commit: str | None) -> tuple[Any, str
         ), None
     except Exception as exc:  # noqa: BLE001 — a project's own file is input
         return None, f"{DEPLOY_PROFILE_PATH} at {at} cannot be used: {exc}"
+
+
+async def _the_profile_where_it_lives(
+    git: Any, repo_root: Path | str, commit: str | None
+) -> tuple[Any, str | None]:
+    """The deploy profile at ``commit``, read where the repository lives.
+
+    SANDBOX FIRST FOR THE PROFILE TOO (3 October 2026, FEAT-E592). A venue that
+    can read a file at a commit — the sandbox's, whose clone is the only copy
+    of a sandboxed repository — is asked, through the same reader and with the
+    same "committed HEAD when no commit is recorded" rule. Every other venue
+    is this container, and the copy here is read exactly as before
+    (:func:`_the_profile_at`). Returns ``(profile, None)`` or ``(None, why)``;
+    never raises.
+    """
+    reader = getattr(git, "read_file_at_commit", None)
+    if reader is None:
+        return _the_profile_at(repo_root, commit)
+    at = str(commit or "").strip() or "HEAD"
+    try:
+        answer = await reader(at, DEPLOY_PROFILE_PATH)
+    except Exception as exc:  # noqa: BLE001 — a read, never a crash
+        return None, f"{type(exc).__name__}: {exc}"
+    return _the_profile_out_of(answer, at)
 
 
 # ---------------------------------------------------------------------------
@@ -1545,7 +1575,7 @@ async def execute_merge_deploy(
             f"{why}; nothing was merged and the branch is kept."
         )
 
-    def _the_identity_a_teardown_must_name() -> tuple[dict[str, str] | None, str]:
+    async def _the_identity_a_teardown_must_name() -> tuple[dict[str, str] | None, str]:
         """``({setting: identity}, "")`` for a teardown, or ``(None, why not)``.
 
         ONE BUILD'S CLEANUP MUST NEVER TOUCH ANOTHER'S CANDIDATE (25 September
@@ -1562,7 +1592,7 @@ async def execute_merge_deploy(
         that the project itself made its candidate out of. Both the setting
         and the value belong to the project; this carries them as text.
         """
-        declaration = _how_the_project_wants_the_identity()
+        declaration = await _how_the_project_wants_the_identity()
         if declaration is None:
             return None, (
                 "this project declares no identity for the thing that is "
@@ -1592,7 +1622,7 @@ async def execute_merge_deploy(
         could belong to another build's check.
         """
         nonlocal candidate_standing
-        identity_env, why_not = _the_identity_a_teardown_must_name()
+        identity_env, why_not = await _the_identity_a_teardown_must_name()
         if identity_env is None:
             sentence = (
                 f"the candidate for {feature_id} was left in place because its "
@@ -1762,14 +1792,14 @@ async def execute_merge_deploy(
             ),
         }
 
-    def _how_the_project_wants_the_identity() -> Any:
+    async def _how_the_project_wants_the_identity() -> Any:
         """This project's identity declaration, or ``None``.
 
         The same answer the deploy leg works from, asked earlier: the check has
         to be handed the identity so it can pin what it checked, and it has to
         be read back under the marker the project declared.
         """
-        known = _the_target_and_how_it_wants_the_identity()
+        known = await _the_target_and_how_it_wants_the_identity()
         if known is None:
             return None
         _, declaration = known
@@ -1821,7 +1851,7 @@ async def execute_merge_deploy(
         # its identity can honestly be captured. Handing it here lets the
         # project pin what it checked under a name nothing else can be given,
         # and report the artifact's own identity back.
-        declaration = _how_the_project_wants_the_identity()
+        declaration = await _how_the_project_wants_the_identity()
         identity_env: dict[str, str] | None = None
         if declaration is not None:
             handed = fixed_identity(
@@ -2376,7 +2406,7 @@ async def execute_merge_deploy(
         _start_commit_memo.append(recorded)
         return recorded
 
-    def _the_target_and_how_it_wants_the_identity() -> tuple[str, Any] | None:
+    async def _the_target_and_how_it_wants_the_identity() -> tuple[str, Any] | None:
         """This project's deployment target, and its identity declaration.
 
         Both come from the PROJECT: the target is the project and the
@@ -2409,7 +2439,7 @@ async def execute_merge_deploy(
                 )
                 return None
         at = _the_recorded_start_commit()
-        profile, why_not = _the_profile_at(repo_root, at)
+        profile, why_not = await _the_profile_where_it_lives(git, repo_root, at)
         if profile is None:
             logger.warning(
                 "merge-executor: %s's %s could not be read at %s (%s), so "
@@ -2520,7 +2550,7 @@ async def execute_merge_deploy(
                     "with, and nothing is deployed without one"
                 ),
             )
-        known = _the_target_and_how_it_wants_the_identity()
+        known = await _the_target_and_how_it_wants_the_identity()
         if known is None:
             return _published_deployment_pending(
                 j_commit=j_commit,
@@ -4970,7 +5000,8 @@ def build_in_daemon_deploy_dispatcher(
             RepoDriverLiveGateInvoker,
             SidecarLiveGateInvoker,
         )
-        from forge.deploy.profile import load_deploy_profile
+        from forge.deploy.profile import DeployProfileError, load_deploy_profile
+        from forge.deploy.sidecar_git import SidecarCandidateGit
         from forge.persistence.migrations import runbook as runbook_migration
         from forge.persistence.repositories.runbook import RunbookRepository
 
@@ -4980,7 +5011,6 @@ def build_in_daemon_deploy_dispatcher(
                 "dispatcher — the deploy stage cannot persist its runbooks"
             )
         repo_root = Path(repo_root)
-        profile = load_deploy_profile(repo_root / "deploy" / "profile.yaml")
         # SANDBOX FIRST (2026-09-07, rule 85). A repository that has a sandbox
         # is deployed and gated INSIDE it: the stage's scripts go to the deploy
         # sidecar in there, and the live gate's driver goes with them, because
@@ -4989,8 +5019,11 @@ def build_in_daemon_deploy_dispatcher(
         # sandbox — every repository until an operator fills the map in — takes
         # exactly the path it took before this lane.
         sandbox = sandbox_for(config, repo)
-        spec = profile.live_gate
-        invoker = None
+        profile = (
+            load_deploy_profile(repo_root / "deploy" / "profile.yaml")
+            if sandbox is None
+            else None
+        )
         # WHAT THE PROJECT DECLARED FOR THIS BUILD, read once. The live check
         # needs it, and since 23 September 2026 so does the deploy step: its
         # environment is built from the factory's named list plus these, never
@@ -4998,6 +5031,27 @@ def build_in_daemon_deploy_dispatcher(
         build_memory, build_declared, build_started_at = _the_builds_declarations(
             db_path, build_id
         )
+        if profile is None:
+            # THE PROFILE IS READ IN THE SANDBOX TOO (3 October 2026). Its
+            # clone is the only copy of this repository; the path this
+            # coordinator was given for it holds nothing, and reading there
+            # stopped FEAT-E592's merge at the candidate check with "deploy
+            # profile not found". It is read the way the press reads it — the
+            # committed file at the commit this build is recorded as starting
+            # from, which is also where the helper reads the project's own
+            # declarations — through the sandbox's sidecar.
+            profile, why_not = await _the_profile_where_it_lives(
+                SidecarCandidateGit(str(sandbox.sidecar_url), repo=str(repo)),
+                repo_root,
+                build_started_at,
+            )
+            if profile is None:
+                raise DeployProfileError(
+                    f"{repo}'s {DEPLOY_PROFILE_PATH} could not be read in the "
+                    f"sandbox {getattr(sandbox, 'name', '')}: {why_not}"
+                )
+        spec = profile.live_gate
+        invoker = None
         if spec is not None and sandbox is not None:
             # WHAT THE PROJECT DECLARED FOR THIS BUILD, off the ledger and
             # sent with the gate's request (22 September 2026). The live check

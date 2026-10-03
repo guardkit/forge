@@ -23,7 +23,18 @@ operation                        route
 ``remove_candidate_tree``        ``POST /git/candidate-tree-remove``
 ``add_working_folder``           ``POST /git/worktree-add``
 ``remove_working_folder``        ``POST /git/worktree-remove``
+``read_file_at_commit``          ``POST /git/read-file-at-commit``
 ===============================  =========================================
+
+THE PROJECT'S OWN DEPLOY PROFILE IS READ IN THERE TOO (3 October 2026). The
+press reads ``deploy/profile.yaml`` at a commit to learn the deployment target
+and how the project wants the identity handed over, and the deploy legs read
+it to compose the stage. Both used to read it out of the copy on this side,
+which for a repository whose clone is in its sandbox is no copy at all: the
+first merge word to reach the candidate check (FEAT-E592) stopped with
+"deploy profile not found". The read needed no new route either —
+``/git/read-file-at-commit`` has served the project's own memory since 21
+September, through the same reader the in-container venue runs.
 
 THE LAST TWO NEEDED NO NEW ROUTE (22 September 2026, the merge word's join).
 The merge is now done in a working folder of its own, made at the commit being
@@ -57,6 +68,7 @@ from typing import Any
 from forge.deploy.candidate_tree import (
     CandidateTreeError,
     CandidateTreeLayout,
+    FileAtCommit,
     RemoteStartPoint,
     WorkingFolder,
 )
@@ -216,6 +228,30 @@ class SidecarCandidateGit:
             )
             return None
         return bool(answer)
+
+    async def read_file_at_commit(self, commit: str, file_path: str) -> FileAtCommit:
+        """``file_path`` exactly as it is at ``commit`` in the sandbox's clone.
+
+        A sandbox that could not be reached, or that refused the request, is a
+        refusal in its own words — never "the file is not there", because the
+        sentence a person is shown turns on that difference. Never raises.
+        """
+        decoded, why = await self._ok(
+            "/git/read-file-at-commit",
+            {"repo": self._repo, "commit": str(commit), "file_path": str(file_path)},
+            timeout=self._read_timeout_s,
+        )
+        if decoded is None:
+            logger.error(
+                "sandbox git: read %s at %s: %s", file_path, commit, why
+            )
+            return FileAtCommit(refusal=str(why))
+        answer = FileAtCommit.from_wire(decoded)
+        if not answer.ok:
+            logger.warning(
+                "sandbox git: read %s at %s: %s", file_path, commit, answer.refusal
+            )
+        return answer
 
     async def ensure_candidate_trees_excluded(self) -> bool | None:
         """Nothing to do on its own here.
