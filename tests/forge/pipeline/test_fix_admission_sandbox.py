@@ -60,8 +60,10 @@ class FakeSidecar:
         self.shas: dict[str, str | None] = {"autobuild/FEAT-BD8F": "17497a2a"}
 
     def __call__(self, url: str, body: dict[str, Any], timeout: float) -> tuple[int, Any]:
-        route = url.rsplit("/git/", 1)[1]
+        route = url.rsplit("/git/", 1)[1] if "/git/" in url else url.rsplit("/code/", 1)[1]
         self.calls.append((route, body))
+        if route in ("list-files-on-branch", "list-files"):
+            return 200, {"files": []}
         if route == "rev-parse":
             ref = body["ref"]
             short = ref.removeprefix("refs/heads/")
@@ -104,12 +106,23 @@ class TestTheTaskRidesTheSidecar:
         assert prepared.branch == "repair/TASK-FEATBD8FFIX1"
         assert prepared.commit == "abc123"
         routes = [r for r, _ in fake.calls]
-        assert routes == ["rev-parse", "rev-parse", "worktree-add", "worktree-remove", "prepare-branch-and-write-tree"]
-        cut = fake.calls[2][1]
+        # The base branch's task folder and the clone's gate evidence are read
+        # in the sandbox first (3 October 2026), then the branch is cut.
+        assert routes == [
+            "list-files-on-branch",
+            "list-files",
+            "rev-parse",
+            "rev-parse",
+            "worktree-add",
+            "worktree-remove",
+            "prepare-branch-and-write-tree",
+        ]
+        assert fake.calls[0][1]["branch"] == "autobuild/FEAT-BD8F"
+        cut = fake.calls[4][1]
         assert cut["base_ref"] == "17497a2a"
         assert cut["repo"] == "guardkit/api_test"
-        written = fake.calls[4][1]["files"]
-        assert fake.calls[4][1]["expected_head"] == "17497a2a"
+        written = fake.calls[6][1]["files"]
+        assert fake.calls[6][1]["expected_head"] == "17497a2a"
         assert set(written) == {
             ".guardkit/features/TASK-FEATBD8FFIX1.yaml",
             prepared.task_file_path,
@@ -119,4 +132,4 @@ class TestTheTaskRidesTheSidecar:
         # Nothing the coordinator knows the repository by was sent as a path
         # for the sandbox to act on.
         assert not any(str(repo) in repr(body) for _, body in fake.calls)
-        assert fake.calls[3][1]["path"] == f"{SANDBOX_TREES}/repair-TASK-FEATBD8FFIX1"
+        assert fake.calls[5][1]["path"] == f"{SANDBOX_TREES}/repair-TASK-FEATBD8FFIX1"
