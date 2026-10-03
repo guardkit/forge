@@ -58,6 +58,10 @@ class StopAnswer:
     stopped: bool
     remaining: Any = None
     reason: str = ""
+    #: The runner has no stop route (an older runner image): it can neither
+    #: stop the build this way nor confirm a stop.
+    route_missing: bool = False
+    runner_url: str = ""
 
 
 #: ``async (feature_id, correlation_id, cancelled) -> StopAnswer | None``.
@@ -92,6 +96,13 @@ async def ask_runner_to_stop(
                 f"the build runner at {runner_url} could not be reached "
                 f"({type(exc).__name__}: {exc})"
             ),
+        )
+    if response.status_code == 404:
+        return StopAnswer(
+            stopped=False,
+            reason=f"the build runner at {runner_url} has no stop route (older runner image)",
+            route_missing=True,
+            runner_url=runner_url,
         )
     if response.status_code != 200:
         return StopAnswer(
@@ -141,12 +152,24 @@ class AckAfterStop:
     ) -> StopAnswer | None:
         """Ask once. ``None`` = not applicable. Never raises."""
         try:
-            return await self._check(feature_id, correlation_id, cancelled)
+            answer = await self._check(feature_id, correlation_id, cancelled)
         except Exception as exc:  # noqa: BLE001 — a failed check holds the place
             return StopAnswer(
                 stopped=False,
                 reason=f"the stop check raised {type(exc).__name__}: {exc}",
             )
+        if answer is not None and answer.route_missing:
+            # An older runner image cannot be asked; holding the place for
+            # ever would stall every build behind it, and that runner never
+            # had anything better than the old acknowledgement.
+            logger.warning(
+                "build stop: older runner image at %s has no stop route; "
+                "acknowledging feature_id=%s as before, unconfirmed",
+                answer.runner_url,
+                feature_id,
+            )
+            return None
+        return answer
 
     def _say_held(
         self, feature_id: str, correlation_id: str, answer: StopAnswer, where: str

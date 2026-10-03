@@ -231,7 +231,24 @@ def _runner_stop_canceller(
                 build_id,
             )
             return False
-        answer = asyncio.run(ask_runner_to_stop(url, build_id))
+        try:
+            answer = asyncio.run(ask_runner_to_stop(url, build_id))
+        except Exception as exc:  # noqa: BLE001 — best-effort: never strand the CLI cancel
+            logger.warning(
+                "cancel_async_task: stop request failed for build %s (%s: %s) "
+                "— row transition proceeds; the build may still be running",
+                build_id,
+                type(exc).__name__,
+                exc,
+            )
+            return False
+        if answer.route_missing:
+            logger.warning(
+                "cancel_async_task: older runner image at %s has no stop "
+                "route; interrupting the run instead",
+                url,
+            )
+            return interrupt(task_id)
         if answer.stopped:
             logger.info(
                 "cancel_async_task: build %s stopped by its runner at %s",
