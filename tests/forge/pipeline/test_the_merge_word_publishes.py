@@ -1733,3 +1733,106 @@ class TestTheDeployBlockIsComposedFromTheCommittedDeclaration:
         # Nowhere does the uncommitted name appear, on any leg.
         said = json.dumps(deploy.calls, default=str)
         assert "WORKTREE_ONLY" not in said
+
+
+class TestTheHoldIsPutDownWhenThePublishedPressHasFinished:
+    """3 October 2026: the "who's merging" hold is put down when every step the
+    press dispatched gave its own answer, so the next merge word need not wait
+    out the lease. A send whose answer was lost may have landed, so then the
+    hold is kept."""
+
+    def _another_worker_takes_it(self, pool: SqliteLifecyclePersistence) -> Any:  # noqa: F811
+        from datetime import UTC, datetime
+
+        return PublicationRecordStore(pool.connection).take_lease(
+            build_id=BUILD_ID, holder="merge-press:another-process", now=datetime.now(UTC)
+        )
+
+    @pytest.mark.asyncio
+    async def test_after_merged_and_running_another_worker_takes_it_at_once(
+        self,
+        config_with_publication_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> None:
+        deps = _deps_that_can_deploy(
+            config_with_publication_on,
+            pool,
+            publisher=_APublisherThatSays([_published("c" * 40)]),
+            deploy=_ADeployStepThatSays(),
+        )
+
+        outcome = await _press(deps, repo_root)
+
+        assert outcome.result == "merged-into-the-remote-and-running", outcome.detail
+        held = _record(pool)
+        assert held.lease_holder is None
+        grant = self._another_worker_takes_it(pool)
+        assert grant is not None and grant.turn == held.turn + 1
+
+    @pytest.mark.asyncio
+    async def test_after_published_deployment_pending_another_worker_takes_it(
+        self,
+        config_with_publication_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> None:
+        publisher = _APublisherThatSays([_published("c" * 40)])
+        deps, _deploy, _joins, _bus = _deps(
+            config_with_publication_on, pool, publisher=publisher
+        )
+
+        outcome = await _press(deps, repo_root)
+
+        assert outcome.result == "published-deployment-pending"
+        held = _record(pool)
+        assert held.lease_holder is None
+        grant = self._another_worker_takes_it(pool)
+        assert grant is not None and grant.turn == held.turn + 1
+
+    @pytest.mark.asyncio
+    async def test_a_publisher_that_refused_in_its_own_words_puts_it_down(
+        self,
+        config_with_publication_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> None:
+        publisher = _APublisherThatSays(
+            [_some_other_refusal("there-is-no-credential", "it holds none.")]
+        )
+        deps, _deploy, _joins, _bus = _deps(
+            config_with_publication_on, pool, publisher=publisher
+        )
+
+        outcome = await _press(deps, repo_root)
+
+        assert outcome.result == "publication-pending"
+        assert _record(pool).lease_holder is None
+        assert self._another_worker_takes_it(pool) is not None
+
+    @pytest.mark.asyncio
+    async def test_a_send_whose_answer_was_lost_keeps_the_hold(
+        self,
+        config_with_publication_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> None:
+        async def the_line_dropped(_config: Any, _request: dict[str, Any]) -> dict[str, Any]:
+            raise ConnectionResetError("the connection went away mid-send")
+
+        deps, _deploy, _joins, _bus = _deps(
+            config_with_publication_on, pool, publisher=the_line_dropped
+        )
+
+        outcome = await _press(deps, repo_root)
+
+        assert outcome.result == "publication-pending"
+        assert _record(pool).lease_holder is not None
+        assert self._another_worker_takes_it(pool) is None
+        # The send record the queue reads is exactly as it always was.
+        send = [
+            line for line in _record(pool).lines
+            if line.step == STEP_SEND and line.kind == "done"
+        ][-1]
+        assert send.detail["published"] is False
+        assert send.detail["contains_j"] is False
