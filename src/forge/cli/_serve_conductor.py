@@ -3187,25 +3187,22 @@ class _AlsoTheSandboxTree:
         return candidate == self.tree or candidate.startswith(self.tree + os.sep)
 
 
-def _allowlist_for_build(
-    pool: Any, config: Any, build_id: str, worktree_allowlist: Any
-) -> Any:
-    """``worktree_allowlist``, widened to the build's recorded sandbox tree.
+def _sandbox_tree(pool: Any, config: Any, build_id: str) -> str | None:
+    """The build's recorded journey tree when its repository has a sandbox.
 
-    Unchanged for a repository without a sandbox, or a row with no tree yet.
+    ``None`` for a repository without a sandbox, or a row with no tree yet.
     """
     from forge.config.sandboxes import sandbox_for
 
     try:
         row = pool.get_build_row(build_id)
-    except Exception:  # noqa: BLE001 — the configured roots still apply
-        return worktree_allowlist
+    except Exception:  # noqa: BLE001 — then nothing is widened
+        return None
     tree = str(getattr(row, "worktree_path", "") or "").strip() if row else ""
     if not tree or sandbox_for(config, str(getattr(row, "repo", "") or "")) is None:
-        return worktree_allowlist
-    return _AlsoTheSandboxTree(
-        inner=worktree_allowlist, tree=os.path.normpath(os.path.abspath(tree))
-    )
+        return None
+    return os.path.normpath(os.path.abspath(tree))
+
 
 
 def build_conductor_supervisor_factory(
@@ -3360,7 +3357,18 @@ def build_conductor_supervisor_factory(
         )
 
     def supervisor_factory(build_id: str) -> Any:
-        allowlist = _allowlist_for_build(pool, config, build_id, worktree_allowlist)
+        # A SANDBOXED BUILD'S OWN TREE (3 October 2026). The coordinator's
+        # roots name paths the sandbox does not have, so for such a build the
+        # recorded tree is also allowed here, and it is the root its legs'
+        # context documents are read under in the sandbox, which drops every
+        # document outside the roots it is sent.
+        tree = _sandbox_tree(pool, config, build_id)
+        allowlist = (
+            worktree_allowlist
+            if tree is None
+            else _AlsoTheSandboxTree(inner=worktree_allowlist, tree=tree)
+        )
+        leg_read_allowlist = read_allowlist if tree is None else [Path(tree)]
         mode_kwargs = _mode_kwargs(
             pool=pool,
             config=config,
@@ -3390,11 +3398,12 @@ def build_conductor_supervisor_factory(
         leg_budgets = budget_kwargs.get("budget_guards")
         dispatcher = make_conductor_subprocess_dispatcher(
             build_row_reader=pool.get_build_row,
-            read_allowlist=read_allowlist,
+            read_allowlist=leg_read_allowlist,
             worktree_allowlist=allowlist,
             forward_context_builder=forward_context_builder,
             stage_log_writer=stage_log_writer,
             subprocess_runner=_runner_for(build_id),
+            fix_task_yaml_in_worktree=tree is not None,
             timeout_seconds_by_stage=stage_timeouts,
             leg_model=resolved_leg_model,
             leg_budgets=leg_budgets,

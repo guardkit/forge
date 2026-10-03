@@ -281,6 +281,7 @@ def make_conductor_subprocess_dispatcher(
     leg_budgets: Any = None,
     with_nats_streaming: bool = True,
     receipts_root: "Path | str | None" = None,
+    fix_task_yaml_in_worktree: bool = False,
 ) -> Callable[..., Awaitable[Any]]:
     """Build the ``subprocess_dispatcher`` the conductor's Supervisor calls.
 
@@ -399,6 +400,16 @@ def make_conductor_subprocess_dispatcher(
         fix_task_yaml = (
             getattr(row, "feature_yaml_path", None) if row is not None else None
         )
+        if fix_task_yaml_in_worktree and fix_task_yaml and task_id:
+            # A leg that runs in a sandbox cannot see the coordinator's path
+            # for the YAML (3 October 2026). The repair branch carries it at
+            # the same place in every tree, so the leg is pointed at the copy
+            # in the journey's own tree, where it runs.
+            raw_tree = getattr(row, "worktree_path", None)
+            if raw_tree:
+                from forge.pipeline.fix_admission import fix_task_yaml_relpath
+
+                fix_task_yaml = str(Path(raw_tree) / fix_task_yaml_relpath(str(task_id)))
         build_correlation_id = (
             getattr(row, "correlation_id", "") if row is not None else ""
         )

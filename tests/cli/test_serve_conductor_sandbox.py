@@ -391,7 +391,7 @@ class TestTheCoordinatorsPathIsNotTheSandboxs:
         clone: Path,
         plain_checkout: Path,
     ) -> None:
-        from forge.cli._serve_conductor import _allowlist_for_build
+        from forge.cli._serve_conductor import _AlsoTheSandboxTree, _sandbox_tree
         from forge.cli._serve_deps_forward_context import (
             ForgeConfigWorktreeAllowlist,
         )
@@ -409,19 +409,16 @@ class TestTheCoordinatorsPathIsNotTheSandboxs:
             str(plain_checkout / ".forge" / "worktrees" / "x"),
         )
 
-        widened = _allowlist_for_build(pool, config, BUILD_ID, configured)
+        sandbox_tree = _sandbox_tree(pool, config, BUILD_ID)
+        assert sandbox_tree == str(tree)
+        widened = _AlsoTheSandboxTree(inner=configured, tree=sandbox_tree)
         report = tree / ".claude" / "reviews" / "r.md"
         assert configured.is_allowed(BUILD_ID, str(report)) is False
         assert widened.is_allowed(BUILD_ID, str(report)) is True
         assert widened.is_allowed(BUILD_ID, str(clone / "elsewhere")) is False
         assert widened.is_allowed(BUILD_ID, str(tree) + "-sibling") is False
         # A repository without a sandbox keeps exactly the configured roots.
-        assert (
-            _allowlist_for_build(
-                pool, config, "build-FEAT-SBX1-20260907180000", configured
-            )
-            is configured
-        )
+        assert _sandbox_tree(pool, config, "build-FEAT-SBX1-20260907180000") is None
 
 
 # ---------------------------------------------------------------------------
@@ -824,6 +821,52 @@ class TestTheSupervisorFactoryUsesTheChooser:
 
         assert asked == [BUILD_ID]
         assert made[0]["subprocess_runner"] is chosen
+
+    def test_a_sandboxed_build_sends_its_own_tree_as_the_legs_roots(
+        self, pool: SqliteLifecyclePersistence, sidecar: Any, plain_checkout: Path
+    ) -> None:
+        """3 October 2026: the coordinator's read roots name paths the sandbox
+        does not have, so the sandbox dropped every context document. A
+        sandboxed build sends its recorded tree; a plain one is unchanged."""
+        from forge.cli._serve_conductor import build_conductor_supervisor_factory
+
+        sandboxed_tree = "/sandbox/own/clone/.forge/worktrees/" + BUILD_ID
+        plain_build = "build-FEAT-SBX1-20260907180000"
+        _row(pool, REPO_KEY)
+        pool.record_worktree_path(BUILD_ID, sandboxed_tree)
+        _row(pool, PLAIN_KEY, build_id=plain_build)
+        pool.record_worktree_path(
+            plain_build, str(plain_checkout / ".forge" / "worktrees" / plain_build)
+        )
+        made: list[dict[str, Any]] = []
+
+        def _dispatcher_spy(**kwargs: Any) -> Any:
+            made.append(kwargs)
+            return object()
+
+        import forge.pipeline.dispatchers.conductor_subprocess as mod
+
+        real = mod.make_conductor_subprocess_dispatcher
+        mod.make_conductor_subprocess_dispatcher = _dispatcher_spy  # type: ignore[assignment]
+        try:
+            factory = build_conductor_supervisor_factory(
+                pool=pool,
+                config=sidecar.config,
+                forward_context_builder=object(),
+                worktree_allowlist=object(),
+                read_allowlist=[Path("/work")],
+                subprocess_runner=object(),
+                subprocess_runner_for_build=lambda _b: object(),
+            )
+            factory(BUILD_ID)
+            factory(plain_build)
+        finally:
+            mod.make_conductor_subprocess_dispatcher = real  # type: ignore[assignment]
+
+        assert made[0]["read_allowlist"] == [Path(sandboxed_tree)]
+        assert made[0]["fix_task_yaml_in_worktree"] is True
+        assert made[1]["read_allowlist"] == [Path("/work")]
+        assert made[1]["fix_task_yaml_in_worktree"] is False
 
 
 # ---------------------------------------------------------------------------
