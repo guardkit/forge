@@ -692,23 +692,36 @@ async def still_running(build_id: str) -> StopReport:
     )
 
 
-async def stop_build(build_id: str, *, remember: bool = True) -> StopReport:
+#: Why a build is asked to stop. ``cancel``: stop its current run here, or —
+#: none yet — remember the request so a run waiting for a job slot never
+#: starts. ``relaunch``: stop its current run (the factory is about to launch
+#: it again), remember nothing. ``ack``: the factory confirming before an
+#: acknowledgement — never touches a run registered here, remembers nothing;
+#: with no run registered it stops whatever still carries the build's marker
+#: or label (leftovers of a run that has ended).
+STOP_PURPOSES: tuple[str, ...] = ("cancel", "relaunch", "ack")
+
+
+async def stop_build(build_id: str, *, purpose: str = "cancel") -> StopReport:
     """Stop one build's processes and fixtures here, then report what is left.
 
-    When this process is running the build, its node is told the stop was
-    requested (so it finishes as cancelled, not failed) and the stop starts
-    from the child it spawned. Otherwise only the marker and the label say
-    what is the build's — the answer is the same after a runner restart.
+    When this process is running the build (and the purpose is not ``ack``),
+    its node is told the stop was requested (so it finishes as cancelled, not
+    failed) and the stop starts from the child it spawned. Otherwise only the
+    marker and the label say what is the build's — the answer is the same
+    after a runner restart. See :data:`STOP_PURPOSES`.
     """
+    if purpose not in STOP_PURPOSES:
+        raise ValueError(f"unknown stop purpose {purpose!r}")
     entry = _BUILDS.get(build_id)
+    if entry is not None and purpose == "ack":
+        # A check never stops a run, nor asks one to stop.
+        return await still_running(build_id)
     if entry is not None:
         entry.stop_requested = True
-    elif remember:
+    elif purpose == "cancel":
         # Nothing registered here yet: the run may be waiting for a job slot.
         # Remember the request so it never spawns; it finishes CANCELLED.
-        # (The factory's confirmation before an acknowledgement passes
-        # remember=False: confirming a finished build must not cancel a
-        # later run of it.)
         _STOP_PENDING[build_id] = time.monotonic()
     remaining = await stop_owned(
         build_id,
@@ -718,7 +731,7 @@ async def stop_build(build_id: str, *, remember: bool = True) -> StopReport:
     if not remaining:
         await remove_fixture_containers(build_id)
     report = await still_running(build_id)
-    if entry is None and remember:
+    if entry is None and purpose == "cancel":
         report = StopReport(
             build_id=report.build_id,
             processes=report.processes,

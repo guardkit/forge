@@ -67,31 +67,34 @@ class StopAnswer:
     runner_url: str = ""
 
 
-#: ``async (feature_id, correlation_id) -> StopAnswer | None``. ``None`` means
-#: there is nothing to ask about (no build recorded, or an older runner).
-StopCheck = Callable[[str, str], Awaitable["StopAnswer | None"]]
+#: ``async (feature_id, correlation_id, purpose) -> StopAnswer | None``.
+#: ``None`` means there is nothing to ask about (no build recorded, or an older
+#: runner). ``purpose`` as for :func:`ask_runner_to_stop`.
+StopCheck = Callable[[str, str, str], Awaitable["StopAnswer | None"]]
 
 
-def stop_route_url(runner_url: str, build_id: str, *, remember: bool = True) -> str:
+def stop_route_url(runner_url: str, build_id: str, *, purpose: str = "cancel") -> str:
     url = f"{runner_url.rstrip('/')}/forge/builds/{quote(build_id, safe='')}/stop"
-    return url if remember else url + "?remember=0"
+    return f"{url}?for={purpose}"
 
 
 async def ask_runner_to_stop(
     runner_url: str,
     build_id: str,
     *,
-    remember: bool = True,
+    purpose: str = "cancel",
     timeout_seconds: float = _STOP_REQUEST_TIMEOUT_SECONDS,
 ) -> StopAnswer:
     """``POST`` the runner's stop route for ``build_id``. Never raises.
 
-    ``remember=False`` is a confirmation (before an acknowledgement): it stops
-    whatever is left but does not cancel a run of the build not yet started.
+    ``purpose`` is ``cancel``, ``relaunch`` (stop the current run before the
+    build is launched again) or ``ack`` (a confirmation before an
+    acknowledgement, which never stops a run) — see
+    ``forge.build_processes.STOP_PURPOSES``.
     """
     import httpx
 
-    url = stop_route_url(runner_url, build_id, remember=remember)
+    url = stop_route_url(runner_url, build_id, purpose=purpose)
     try:
         async with httpx.AsyncClient(timeout=timeout_seconds) as client:
             response = await client.post(url)
@@ -154,10 +157,11 @@ class AckAfterStop:
         self._held: dict[tuple[str, str], asyncio.Task[None]] = {}
 
     async def confirm(
-        self, feature_id: str, correlation_id: str) -> StopAnswer | None:
+        self, feature_id: str, correlation_id: str, *, purpose: str = "ack"
+    ) -> StopAnswer | None:
         """Ask once. ``None`` = not applicable. Never raises."""
         try:
-            answer = await self._check(feature_id, correlation_id)
+            answer = await self._check(feature_id, correlation_id, purpose)
         except Exception as exc:  # noqa: BLE001 — a failed check holds the place
             return StopAnswer(
                 stopped=False,
@@ -198,10 +202,11 @@ class AckAfterStop:
         correlation_id: str,
         *,
         where: str,
+        purpose: str = "ack",
     ) -> None:
         """Return only when the build is confirmed stopped (or not applicable)."""
         while True:
-            answer = await self.confirm(feature_id, correlation_id)
+            answer = await self.confirm(feature_id, correlation_id, purpose=purpose)
             if answer is None or answer.stopped:
                 return
             self._say_held(feature_id, correlation_id, answer, where)
@@ -214,10 +219,14 @@ class AckAfterStop:
         ack: Callable[[], Awaitable[Any]],
         *,
         where: str,
+        purpose: str = "ack",
     ) -> bool:
         """Ack now if stopped (or not applicable); otherwise hold and return False.
 
         A held acknowledgement is completed later by a supervised task.
+        ``ack`` is whatever must wait for the confirmed stop: the
+        acknowledgement itself, or (``purpose="relaunch"``) the rest of a
+        recovered build's dispatch.
         """
         key = (feature_id, correlation_id)
         if key in self._held:
@@ -229,7 +238,7 @@ class AckAfterStop:
                 correlation_id,
             )
             return False
-        answer = await self.confirm(feature_id, correlation_id)
+        answer = await self.confirm(feature_id, correlation_id, purpose=purpose)
         if answer is None or answer.stopped:
             await ack()
             return True
@@ -239,7 +248,7 @@ class AckAfterStop:
             try:
                 await asyncio.sleep(self._recheck_seconds)
                 await self.wait_until_stopped(
-                    feature_id, correlation_id, where=where
+                    feature_id, correlation_id, where=where, purpose=purpose
                 )
                 logger.info(
                     "build stop: %s — feature_id=%s correlation_id=%s is "

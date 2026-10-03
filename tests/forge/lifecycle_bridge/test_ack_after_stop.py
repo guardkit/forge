@@ -259,8 +259,8 @@ def test_a_cancel_that_cannot_reach_the_runner_can_be_retried(
 
     async def _stopper(feature_id: str, correlation_id: str) -> Any:
         return await build_runner_stop_check(
-            sqlite_pool=pool, default_url=where["url"], remember=True
-        )(feature_id, correlation_id)
+            sqlite_pool=pool, default_url=where["url"]
+        )(feature_id, correlation_id, "cancel")
 
     bridge = LifecycleBridge(registry=BridgeRegistry(connection=cx), build_stopper=_stopper)
     bridge.attach(
