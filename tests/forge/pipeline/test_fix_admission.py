@@ -899,6 +899,7 @@ class _RetainedCandidateSidecar:
         tracked: dict[str, str] | None = None,
         on_branch: dict[str, dict[str, str]] | None = None,
         listing_refused: bool = False,
+        first_listing_fails: bool = False,
         unanswered_refs: set[str] | None = None,
     ) -> None:
         self.candidate_commit = candidate_commit
@@ -912,7 +913,11 @@ class _RetainedCandidateSidecar:
         #: Each branch's own files (the /git routes), which the checked-out
         #: tree does not show.
         self.on_branch = {k: dict(v) for k, v in (on_branch or {}).items()}
+        #: Every listing after the first one (the numbering's) is refused.
         self.listing_refused = listing_refused
+        #: Only the first listing (the numbering's) fails.
+        self.first_listing_fails = first_listing_fails
+        self.listings = 0
         self.unanswered_refs = set(unanswered_refs or ())
 
     def __call__(
@@ -921,7 +926,10 @@ class _RetainedCandidateSidecar:
         route = url.split("/git/", 1)[1] if "/git/" in url else url.split("/code/", 1)[1]
         self.calls.append((route, body))
         if route == "list-files":
-            if self.listing_refused:
+            self.listings += 1
+            if self.first_listing_fails and self.listings == 1:
+                raise OSError("connection reset")
+            if self.listing_refused and self.listings > 1:
                 return 400, {"error": "the repository is not a directory on this box"}
             return 200, {"files": sorted(self.tracked), "capped": False}
         if route == "read-file":
@@ -1226,6 +1234,45 @@ class TestABuildFailureRepairsItsRetainedCandidate:
         )
         assert "connection reset" in caught.value.message
         assert sidecar.written == {}
+
+    def test_a_failed_task_file_listing_refuses_rather_than_reusing(
+        self,
+        pool: SqliteLifecyclePersistence,
+        store: WorkQueueStore,
+        repo_root: Path,
+        tmp_path: Path,
+    ) -> None:
+        """Codex round 2, R4: FIX1's task YAML is there but has no repair
+        branch; a failed listing must not read as "no task files"."""
+        existing = {".guardkit/features/TASK-FEAT44A8FIX1.yaml": "id: x\n"}
+        sidecar = _RetainedCandidateSidecar(
+            "a" * 40, tracked=existing, first_listing_fails=True
+        )
+
+        with pytest.raises(FixAdmissionRefused) as caught:
+            self._sandbox_admission(pool, store, repo_root, tmp_path, sidecar)
+
+        assert caught.value.reason == "repair-number"
+        assert caught.value.permanent is False
+        assert "connection reset" in caught.value.message
+        assert sidecar.written == {}
+        assert [route for route, _ in sidecar.calls] == ["list-files"]
+
+    def test_an_existing_task_file_without_a_branch_takes_the_next_number(
+        self,
+        pool: SqliteLifecyclePersistence,
+        store: WorkQueueStore,
+        repo_root: Path,
+        tmp_path: Path,
+    ) -> None:
+        sidecar = _RetainedCandidateSidecar(
+            "a" * 40,
+            tracked={".guardkit/features/TASK-FEAT44A8FIX1.yaml": "id: x\n"},
+        )
+
+        admission = self._sandbox_admission(pool, store, repo_root, tmp_path, sidecar)
+
+        assert admission.branch == "repair/TASK-FEAT44A8FIX2"
 
     def test_missing_candidate_after_coding_fails_closed_without_a_branch(
         self,
