@@ -827,6 +827,40 @@ class TestItStartsTwoContainersFromThatOneImage:
         # By name only: the values stay in the sandbox's own environment.
         assert "=1800" not in runner and "=7200" not in runner
 
+    def test_the_build_systems_concurrency_settings_reach_the_runner(self, sandbox):
+        """How many tasks at once, whether tasks touching one area wait, and
+        each model's own limits (3 October 2026, concurrent builds). Set on the
+        machine, they reach the runner by name, like the two time limits."""
+        names = {
+            "GUARDKIT_MAX_PARALLEL_TASKS": "1",
+            "GUARDKIT_WAVE_SAME_AREA": "serial",
+            "GUARDKIT_PLAYER_MODEL_LIMITS": "a-model=2",
+            "FORGE_MAX_CONCURRENT_BUILDS": "4",
+        }
+        _helper, runner = _the_two_starts(sandbox, **names)
+        for name in names:
+            assert f"--env {name}" in runner, f"{name} was not handed to the runner"
+
+    def test_the_runner_serves_as_many_builds_at_once_as_it_is_told(self, sandbox):
+        """The runner is ``langgraph dev``, which runs ONE build at a time
+        unless told otherwise. FORGE_MAX_CONCURRENT_BUILDS tells it."""
+        _helper, runner = _the_two_starts(sandbox, FORGE_MAX_CONCURRENT_BUILDS="4")
+        assert " dev " in runner
+        assert "--n-jobs-per-worker 4" in runner
+
+    def test_unset_the_runner_serves_one_build_at_a_time_as_today(self, sandbox):
+        _helper, runner = _the_two_starts(sandbox)
+        assert "--n-jobs-per-worker 1" in runner
+
+    @pytest.mark.parametrize("value", ["0", "-2", "four", "1.5", " 3"])
+    def test_a_build_count_that_is_not_a_whole_number_is_refused(
+        self, sandbox, value
+    ):
+        result = _run(sandbox, FORGE_MAX_CONCURRENT_BUILDS=value)
+        assert result.returncode == 2, result.stdout
+        assert "FORGE_MAX_CONCURRENT_BUILDS" in result.stdout
+        assert not any(line.startswith("run ") for line in _calls(sandbox))
+
     def test_a_project_can_name_settings_of_its_own(self, sandbox):
         process = subprocess.Popen(
             ["bash", str(sandbox["script"])],
@@ -2633,6 +2667,19 @@ class TestAFreshInstallForwardsWhatTheBootstrapNeeds:
     )
     def test_the_names_are_forwarded(self, relative):
         assert self.NEEDED <= self._names(relative)
+
+    @pytest.mark.parametrize(
+        "relative", ["deploy/estate/.env.example", "deploy/compose/.env.example"]
+    )
+    def test_how_much_runs_at_once_is_forwarded(self, relative):
+        """3 October 2026, concurrent builds: set on the machine, these reach
+        the sandbox, and from there the runner and the build."""
+        assert {
+            "FORGE_MAX_CONCURRENT_BUILDS",
+            "GUARDKIT_MAX_PARALLEL_TASKS",
+            "GUARDKIT_WAVE_SAME_AREA",
+            "GUARDKIT_PLAYER_MODEL_LIMITS",
+        } <= self._names(relative)
 
     def test_the_two_files_still_agree(self):
         assert self._names("deploy/estate/.env.example") == self._names(

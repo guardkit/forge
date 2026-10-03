@@ -632,6 +632,16 @@ FACTORY_ENV_NAMES=(
   # than in a project's SANDBOX_CONTAINER_ENV_NAMES.
   GUARDKIT_SDK_TIMEOUT
   GUARDKIT_AUTOBUILD_TASK_TIMEOUT_FLOOR
+  # HOW MUCH RUNS AT ONCE (3 October 2026, concurrent builds). The first three
+  # are the build system's own: how many of one build's tasks run at once,
+  # whether tasks touching one area wait for each other, and each model's own
+  # limit. Unset keeps the build system's defaults. The last is the factory's:
+  # how many builds the runner serves at once (see start_runner). All four
+  # are the factory's settings, not a project's.
+  GUARDKIT_MAX_PARALLEL_TASKS
+  GUARDKIT_WAVE_SAME_AREA
+  GUARDKIT_PLAYER_MODEL_LIMITS
+  FORGE_MAX_CONCURRENT_BUILDS
   FORGE_SIDECAR_IN_SANDBOX
   OPENAI_BASE_URL
   OPENAI_API_KEY
@@ -1142,6 +1152,20 @@ if [[ -n "${CONFIG_PATH}" ]]; then
   log "the factory's settings file named by FORGE_CONFIG_PATH is shared with both containers, read-only, at the same path"
 fi
 
+# HOW MANY BUILDS THE RUNNER SERVES AT ONCE (3 October 2026, concurrent
+# builds). The runner is `langgraph dev`, which runs ONE build at a time and
+# queues the rest unless it is told a number of job slots. That number is
+# FORGE_MAX_CONCURRENT_BUILDS, set to the same value as the factory's
+# pipeline.max_concurrent_builds; unset is one, exactly as before. It is also
+# what keeps a stopped build's slot held until its processes are gone, so a
+# value that is not a whole number of at least one is refused here, before
+# anything starts, rather than handed to the server to guess at.
+RUNNER_JOB_SLOTS="${FORGE_MAX_CONCURRENT_BUILDS:-1}"
+if [[ ! "${RUNNER_JOB_SLOTS}" =~ ^[1-9][0-9]*$ ]]; then
+  refuse "FORGE_MAX_CONCURRENT_BUILDS is '${RUNNER_JOB_SLOTS}', which is not a whole number of at least 1. It is how many builds this sandbox's runner works on at once; leave it unset for one at a time. Refusing to start."
+fi
+log "the build runner will work on up to ${RUNNER_JOB_SLOTS} build(s) at once (FORGE_MAX_CONCURRENT_BUILDS)"
+
 # THE GIT OBJECTS THE CLONE BORROWS (1 October 2026, 2 October 2026). The table at
 # the top says why. This reads the clone's own alternates file the way git
 # does — one folder per line, blank lines and lines starting with # ignored, a
@@ -1488,6 +1512,7 @@ start_runner() {
     --config "${RUNNER_CONFIG_IN_CONTAINER}" \
     --host "${BIND}" \
     --port "${RUNNER_PORT}" \
+    --n-jobs-per-worker "${RUNNER_JOB_SLOTS}" \
     --no-browser \
     --no-reload \
     --allow-blocking \
