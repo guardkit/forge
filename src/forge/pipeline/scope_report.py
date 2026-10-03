@@ -502,6 +502,9 @@ class ScopeReport:
     capabilities_the_request_did_not_name: list[str] = field(default_factory=list)
     #: The comparison with the sentence was taken at all.
     routes_read: bool = False
+    #: What the branch was held against: the commit the build started from,
+    #: or the branch name used when the record named none.
+    compared_against: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """The receipt, exactly as it is written to disk and put on the row."""
@@ -524,6 +527,7 @@ class ScopeReport:
                 self.capabilities_the_request_did_not_name
             ),
             "routes_read": self.routes_read,
+            "compared_against": self.compared_against,
         }
 
 

@@ -106,9 +106,11 @@ MERGE_AGENT_ID: str = "merge-deploy-executor"
 #: ``source_id`` on every envelope this module emits (the forge identity).
 SOURCE_ID: str = "forge"
 
-#: What a routine build's branch is held against when the scope pass asks
-#: what it changed. The same branch the merge word merges into, and the same
-#: one :func:`git_rev_parse_main` pins the offer to.
+#: What a build's branch is held against when the scope pass asks what it
+#: changed AND the record names no commit the build started from. The same
+#: branch the merge word merges into, and the same one
+#: :func:`git_rev_parse_main` pins the offer to. Normally the scope pass uses
+#: the recorded start commit instead (see :func:`run_the_scope_pass`).
 MERGE_BASE_REF: str = "main"
 
 #: How the scope pass says where it found the person's own sentence, in
@@ -1166,28 +1168,49 @@ def run_the_scope_pass(
     head = branch_to_merge(feature_id, merge_branch)
     request, source, why_not = request_behind_the_build(pool, row)
 
+    # WHAT THE BRANCH IS HELD AGAINST (3 October 2026). The commit this build
+    # started from, as the record has it, so the count is the build's own
+    # files and nothing else. Against the literal 'main' the sandbox's clone
+    # answered with its own local main, which nothing moves forward, and the
+    # card for FEAT-651C counted 69 files, 40 of them an earlier cleanup.
+    # Only when the record names no start does it fall back to 'main', and it
+    # says so here and on the report.
+    from forge.cli._serve_conductor import _the_builds_start_commit
+
+    base = _the_builds_start_commit(pool, build_id)
+    if base is None:
+        base = MERGE_BASE_REF
+        logger.info(
+            "the scope pass: the record names no commit %s started from, so "
+            "its branch is held against %s instead, which may count files "
+            "that are not the build's own",
+            build_id,
+            MERGE_BASE_REF,
+        )
+
     sandbox = sandbox_for(config, repo_key)
     try:
         if sandbox is not None:
             reading = read_branch_scope_in_sandbox(
                 sandbox=sandbox,
                 repo=repo_key,
-                base=MERGE_BASE_REF,
+                base=base,
                 head=head,
                 feature_id=feature_id,
             )
         else:
             reading = read_branch_scope(
                 repo_root=Path(repo_root_raw),
-                base=MERGE_BASE_REF,
+                base=base,
                 head=head,
                 feature_id=feature_id,
             )
     except Exception as exc:  # noqa: BLE001 — a reader never stops a card
         report = unread_scope(
-            f"what {head} changed against {MERGE_BASE_REF} could not be read "
+            f"what {head} changed against {base} could not be read "
             f"({type(exc).__name__}: {exc})"
         )
+        report.compared_against = base
         write_scope_report(build_id, report)
         return report
 
@@ -1197,6 +1220,7 @@ def run_the_scope_pass(
         request_source=source,
         request_why_not=why_not,
     )
+    report.compared_against = base
     write_scope_report(build_id, report)
     return report
 
