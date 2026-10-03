@@ -42,6 +42,7 @@ PARENT = {
     "ANTHROPIC_BASE_URL": "http://localhost:9000",
     "GUARDKIT_TIMEOUT_MULTIPLIER": "4.0",
     "GUARDKIT_AUTOBUILD_TASK_TIMEOUT_FLOOR": "900",
+    "GUARDKIT_SDK_TIMEOUT": "1800",
     "GUARDKIT_ARCH_CONFORMANCE_BLOCKING": "1",
     "GUARDKIT_ZERO_TEST_BLOCKING": "1",
     "GUARDKIT_BOOT_SMOKE_BLOCKING": "1",
@@ -167,6 +168,21 @@ def test_the_values_that_do_come_through_are_the_parents_own() -> None:
     assert env["FORGE_GUARDKIT_PATH"] == "/opt/venv/bin/guardkit"
     assert env["GUARDKIT_HARNESS"] == "langgraph"
     assert env["FLEET_MEMORY_PG_DSN"] == "postgresql://somewhere/memory"
+
+
+def test_both_time_limits_the_machine_sets_reach_the_build() -> None:
+    """The base time for one attempt, and the time for one task.
+
+    3 October 2026: the machine's settings had set both since 18 September,
+    but this list carried only the second, so every build ran each attempt on
+    the build system's shorter default. Both names are written out here rather
+    than imported from the build system, which this repository does not depend
+    on.
+    """
+    env = build_launch_env(parent=PARENT, memory_project="widget_shop")
+
+    assert env["GUARDKIT_SDK_TIMEOUT"] == "1800"
+    assert env["GUARDKIT_AUTOBUILD_TASK_TIMEOUT_FLOOR"] == "900"
 
 
 def test_a_setting_the_parent_does_not_have_stays_unset() -> None:

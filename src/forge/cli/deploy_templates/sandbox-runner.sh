@@ -622,6 +622,16 @@ FACTORY_ENV_NAMES=(
   FACTORY_GATEWAY_ADDRESS
   FORGE_GUARDKIT_PATH
   GUARDKIT_HARNESS
+  # HOW LONG ONE ATTEMPT AT A TASK, AND ONE TASK, MAY TAKE (3 October 2026).
+  # The machine's settings have set both since 18 September, and the host side
+  # hands both into this sandbox, but this list left them out — so from the
+  # move to containers on 1 October every build ran on the build system's own
+  # defaults (1,200 and 3,000 seconds) instead. The runner's own supervision
+  # reads the second one too, so the two stay in step. They are the build
+  # system's own settings, not a project's, so they belong on this list rather
+  # than in a project's SANDBOX_CONTAINER_ENV_NAMES.
+  GUARDKIT_SDK_TIMEOUT
+  GUARDKIT_AUTOBUILD_TASK_TIMEOUT_FLOOR
   FORGE_SIDECAR_IN_SANDBOX
   OPENAI_BASE_URL
   OPENAI_API_KEY
