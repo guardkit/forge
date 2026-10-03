@@ -60,6 +60,7 @@ rather than the daemon acking unconditionally.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 import signal
 from typing import Any, Awaitable, Callable, Protocol, runtime_checkable
@@ -118,6 +119,16 @@ MAX_ACK_PENDING: int = 1
 # ---------------------------------------------------------------------------
 # Type surface
 # ---------------------------------------------------------------------------
+
+
+class BuildLimitNotApplied(RuntimeError):
+    """The broker would hand out more builds than configured and refused the fix.
+
+    Raised by :func:`_attach_consumer` instead of binding a durable whose
+    ``max_ack_pending`` is above ``pipeline.max_concurrent_builds`` when the
+    broker refuses to lower it. :func:`run_daemon` treats it like any other
+    attach failure: log, wait with backoff, try again.
+    """
 
 
 @runtime_checkable
@@ -272,11 +283,15 @@ async def _attach_consumer(
     out until fewer than the new limit are outstanding. Any error other
     than "consumer absent" from reading the durable propagates to
     :func:`run_daemon`, which treats it like a broker error and retries the
-    attach. If the broker refuses the *update* (for example a durable made
-    by hand with a deliver policy that cannot be edited), an ERROR names
-    the setting, both values and the broker's reason, and the existing
-    durable is bound unchanged — today's behaviour — rather than retrying
-    forever.
+    attach. The update starts from the durable's live settings and changes
+    only ``max_ack_pending``, so a field the broker will not edit (such as a
+    hand-made durable's deliver policy) is never part of it. If the broker
+    still refuses, an ERROR names the setting, both values and the reason.
+    When the broker's value is at or below the configured one the durable is
+    bound unchanged (fewer places is safe). When it is above, the attach
+    raises :class:`BuildLimitNotApplied` instead of binding, so no build is
+    taken at a limit higher than configured; :func:`run_daemon` retries with
+    its usual backoff.
 
     Args:
         client: Connected NATS client.
@@ -313,25 +328,60 @@ async def _attach_consumer(
     except NotFoundError:
         live = None  # pull_subscribe below creates it with ``config``.
     if live is not None:
-        live_limit = getattr(getattr(live, "config", None), "max_ack_pending", None)
+        live_config = getattr(live, "config", None)
+        live_limit = getattr(live_config, "max_ack_pending", None)
         if live_limit != max_ack_pending:
-            try:
-                await js.add_consumer(PIPELINE_STREAM_NAME, config)
-            except APIError as exc:
-                # The broker refused the update (for example a durable made
-                # by hand with a different deliver policy, which cannot be
-                # edited). Keep today's behaviour — bind the durable as it
-                # is — and say plainly that the setting did not take effect.
-                logger.error(
-                    "forge-serve: could not apply pipeline.max_concurrent_builds "
-                    "to consumer '%s': it is %s on the broker, configured %d; "
-                    "the broker refused the update (%s). Binding the existing "
-                    "durable unchanged, so builds run at the broker's value.",
-                    durable_name,
-                    live_limit,
-                    max_ack_pending,
-                    getattr(exc, "description", None) or exc,
+            # Change ONLY the limit, starting from the durable's own live
+            # settings, so a field the broker will not edit (deliver policy,
+            # for one) is never part of the request.
+            if dataclasses.is_dataclass(live_config) and not isinstance(
+                live_config, type
+            ):
+                update = dataclasses.replace(
+                    live_config, max_ack_pending=max_ack_pending
                 )
+            else:
+                update = config
+            try:
+                await js.add_consumer(PIPELINE_STREAM_NAME, update)
+            except APIError as exc:
+                reason = getattr(exc, "description", None) or exc
+                if isinstance(live_limit, int) and live_limit <= max_ack_pending:
+                    # Fewer places than configured is safe: bind as it is.
+                    logger.error(
+                        "forge-serve: could not apply "
+                        "pipeline.max_concurrent_builds to consumer '%s': it "
+                        "is %s on the broker, configured %d; the broker "
+                        "refused the update (%s). Binding the existing "
+                        "durable unchanged, so at most %s builds run at once.",
+                        durable_name,
+                        live_limit,
+                        max_ack_pending,
+                        reason,
+                        live_limit,
+                    )
+                else:
+                    # More places than configured would exceed the limit the
+                    # owner set. Do not bind: no build is taken until the
+                    # update succeeds (run_daemon retries with backoff).
+                    logger.error(
+                        "forge-serve: could not apply "
+                        "pipeline.max_concurrent_builds to consumer '%s': it "
+                        "is %s on the broker, configured %d; the broker "
+                        "refused the update (%s). NOT binding, because that "
+                        "would run more builds at once than configured; no "
+                        "builds are taken until this succeeds.",
+                        durable_name,
+                        live_limit,
+                        max_ack_pending,
+                        reason,
+                    )
+                    raise BuildLimitNotApplied(
+                        f"consumer '{durable_name}' allows {live_limit} builds "
+                        f"at once but pipeline.max_concurrent_builds is "
+                        f"{max_ack_pending}, and the broker refused the "
+                        f"update ({reason})"
+                    ) from exc
             else:
                 logger.info(
                     "forge-serve: build limit on consumer '%s' changed from %s "
@@ -600,6 +650,7 @@ async def run_daemon(
 
 __all__ = [
     "BUILD_QUEUED_SUBJECT_FILTER",
+    "BuildLimitNotApplied",
     "DispatchFn",
     "MAX_ACK_PENDING",
     "NatsConnectFn",

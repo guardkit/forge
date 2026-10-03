@@ -570,6 +570,13 @@ class _BudgetFakePool:
     def clear_budget_breach(self, build_id: str, cleared_at: str) -> None:
         self.cleared.append((build_id, cleared_at))
 
+    def _reader(self) -> Any:
+        """No other builds of the feature (the one-build-per-feature check)."""
+        from contextlib import nullcontext
+
+        no_rows = SimpleNamespace(fetchall=lambda: [], fetchone=lambda: None)
+        return nullcontext(SimpleNamespace(execute=lambda *a, **k: no_rows))
+
 
 class _NoopContextBuilder:
     def build_for(self, *, stage: Any, build_id: str, feature_id: str) -> list[Any]:
