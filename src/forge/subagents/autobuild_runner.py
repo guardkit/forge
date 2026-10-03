@@ -4708,7 +4708,6 @@ async def _run_one_build(state: AutobuildRunnerState) -> dict[str, Any]:
             proc.pid,
         )
         await _stop_owned_shielded(owned_build, proc, feature_id=feature_id)
-        build_processes.unregister(owned_build)
         try:
             await asyncio.wait_for(proc.wait(), timeout=5.0)
         except (asyncio.TimeoutError, asyncio.CancelledError):
@@ -4739,7 +4738,6 @@ async def _run_one_build(state: AutobuildRunnerState) -> dict[str, Any]:
             feature_id,
         )
         if await _stop_owned_shielded(owned_build, proc, feature_id=feature_id):
-            build_processes.unregister(owned_build)
             raise asyncio.CancelledError()
         try:
             await asyncio.wait_for(proc.wait(), timeout=5.0)
@@ -4797,9 +4795,7 @@ async def _run_one_build(state: AutobuildRunnerState) -> dict[str, Any]:
             owned_build, proc, feature_id=feature_id
         )
         if interrupted:
-            build_processes.unregister(owned_build)
             raise asyncio.CancelledError()
-    build_processes.unregister(owned_build)
     if stop_requested and not timed_out:
         # The runner's stop route asked for this build to stop (a cancel).
         # It finishes CANCELLED through the normal terminal path; the worktree
@@ -5056,11 +5052,92 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
     """
     payload = _extract_launch_payload(list(state.get("messages", [])))
     build_id = str(payload.get("build_id") or "")
+    if not build_id:
+        return await _running_wave_body(state)
+    await _stop_an_earlier_run_of(payload, build_id)
+    entry = build_processes.begin(build_id)
     try:
         return await _running_wave_body(state)
     finally:
-        if build_id:
-            build_processes.forget(build_id)
+        build_processes.end(entry)
+
+
+async def _stop_an_earlier_run_of(payload: Mapping[str, Any], build_id: str) -> None:
+    """A relaunch of a build still running here stops the original first.
+
+    The factory relaunches a build it found INTERRUPTED after its own restart
+    (boot recovery, a redelivery), but this runner may still be running the
+    original run of the same build — the coordinator restarted, the runner
+    did not. Two runs of one build would share its worktree and its owner
+    marker. So the original is stopped (everything it owns, fixtures too,
+    confirmed gone) and this run waits until it has ended. The original ends
+    CANCELLED on its own thread, which nothing watches any more: the factory
+    watches the relaunch. Its worktree is kept, moved aside, so the relaunch
+    can lay down its own (see :func:`_move_aside_superseded_worktree`).
+    """
+    old = build_processes.lookup(build_id)
+    if old is None:
+        return
+    logger.warning(
+        "autobuild_runner: build %s is being relaunched while its earlier run "
+        "is still running in this runner; stopping the earlier run first",
+        build_id,
+    )
+    await build_processes.stop_build(build_id)
+    loop = asyncio.get_running_loop()
+    last_report = loop.time()
+    while build_processes.lookup(build_id) is old:
+        if loop.time() - last_report >= OWNED_STOP_REPORT_SECONDS:
+            last_report = loop.time()
+            logger.error(
+                "autobuild_runner: the relaunch of build %s is still waiting "
+                "for its earlier run here to end",
+                build_id,
+            )
+        await asyncio.sleep(0.2)
+    await _move_aside_superseded_worktree(payload, build_id)
+
+
+async def _move_aside_superseded_worktree(
+    payload: Mapping[str, Any], build_id: str
+) -> None:
+    """Keep the stopped run's worktree, under a name the relaunch does not use.
+
+    ``git worktree move`` to ``<build_id>.superseded-<UTC stamp>`` and repair
+    any inner worktrees nested in it, so the tree stays a registered, intact
+    worktree. The relaunch's own same-feature sweep then treats it like any
+    earlier build of the feature: evidence exported first, then cleared. A
+    move that fails leaves the tree where it is (the relaunch then fails
+    loudly on it, as any collision does).
+    """
+    path = _worktree_base_dir() / build_id
+    if not path.exists():
+        return
+    repo_path = _resolve_repo_path(payload)
+    if repo_path is None:
+        return
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    target = path.with_name(f"{build_id}.superseded-{stamp}")
+    code, output = await _run_git(
+        ["worktree", "move", str(path), str(target)], cwd=repo_path
+    )
+    if code != 0:
+        logger.error(
+            "autobuild_runner: could not move the stopped run's worktree %s "
+            "aside (exit=%s): %s",
+            path,
+            code,
+            output,
+        )
+        return
+    inner = sorted(str(p) for p in (target / ".guardkit" / "worktrees").glob("*"))
+    if inner:
+        await _run_git(["worktree", "repair", *inner], cwd=repo_path)
+    logger.warning(
+        "autobuild_runner: the stopped run's worktree of build %s is kept at %s",
+        build_id,
+        target,
+    )
 
 
 def _stop_asked_before_spawn(payload: Mapping[str, Any]) -> bool:
@@ -5115,66 +5192,55 @@ async def _stop_owned_until_gone(
 ) -> None:
     """Stop everything the build owns and do not return until it is all gone.
 
-    Keeps reading and SIGKILLing, saying which processes remain every
-    :data:`OWNED_STOP_REPORT_SECONDS`, for as long as it takes: releasing the
-    build's place while something it started can still write or call the
-    model is the fault this exists to close. Then this build's labelled
-    fixture containers are removed. Never raises (a cancel is the caller's).
+    Processes AND this build's labelled fixture containers: keeps reading,
+    SIGKILLing and removing, saying what remains every
+    :data:`OWNED_STOP_REPORT_SECONDS`, for as long as it takes — and an engine
+    that cannot be asked counts as "not yet gone". Releasing the build's place
+    while something it started can still write, serve or call the model is the
+    fault this exists to close, whatever the build's terminal class. Never
+    raises (a cancel is the caller's).
     """
     first = True
-    last_report = asyncio.get_running_loop().time()
+    loop = asyncio.get_running_loop()
+    last_report = loop.time()
     while True:
+        remaining: Any
         try:
             if first:
-                remaining = await _stop_owned_once(owned, proc)
+                processes = await _stop_owned_once(owned, proc)
             else:
-                remaining = await build_processes.stop_owned(
+                processes = await build_processes.stop_owned(
                     owned.build_id,
                     recorded=owned.recorded,
                     grace_seconds=0.0,
                 )
-        except Exception as exc:  # noqa: BLE001 — keep stopping regardless
-            logger.warning(
-                "autobuild_runner: owned-process stop raised for build %s "
-                "(%s: %s); trying again",
-                owned.build_id,
-                type(exc).__name__,
-                exc,
+            containers = (
+                await build_processes.remove_fixture_containers(owned.build_id)
+                if not processes
+                else []
             )
-            remaining = [build_processes.OwnedProcess(pid=-1, starttime=-1)]
+            remaining = {"processes": build_processes.describe(processes)}
+            if containers is None:
+                remaining["containers"] = "the container engine cannot be asked"
+            elif containers:
+                remaining["containers"] = containers
+            done = not processes and containers == []
+        except Exception as exc:  # noqa: BLE001 — keep stopping regardless
+            remaining = f"the stop raised {type(exc).__name__}: {exc}"
+            done = False
         first = False
-        if not remaining:
-            break
-        now = asyncio.get_running_loop().time()
-        if now - last_report >= OWNED_STOP_REPORT_SECONDS:
-            last_report = now
+        if done:
+            return
+        if loop.time() - last_report >= OWNED_STOP_REPORT_SECONDS:
+            last_report = loop.time()
             logger.error(
-                "autobuild_runner: build %s (feature_id=%s) still has "
-                "processes that will not go; the build's place stays held "
-                "until they do: %s",
+                "autobuild_runner: build %s (feature_id=%s) is not yet "
+                "confirmed stopped; the build's place stays held until it is: %s",
                 owned.build_id,
                 feature_id,
-                build_processes.describe(remaining),
+                remaining,
             )
         await asyncio.sleep(1.0)
-    try:
-        left = await build_processes.remove_fixture_containers(owned.build_id)
-    except Exception as exc:  # noqa: BLE001 — the ack guard re-checks
-        left = None
-        logger.warning(
-            "autobuild_runner: removing build %s's fixture containers raised "
-            "(%s: %s)",
-            owned.build_id,
-            type(exc).__name__,
-            exc,
-        )
-    if left:
-        logger.warning(
-            "autobuild_runner: build %s's fixture containers remain after "
-            "removal: %s",
-            owned.build_id,
-            left,
-        )
 
 
 async def _stop_owned_shielded(

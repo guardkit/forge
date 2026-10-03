@@ -47,7 +47,6 @@ import logging
 import os
 import shutil
 import signal
-import socket
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -71,7 +70,8 @@ __all__ = [
     "stop_build",
     "stop_owned",
     "stop_pending",
-    "forget",
+    "begin",
+    "end",
     "unregister",
 ]
 
@@ -445,39 +445,28 @@ async def stop_owned(
 # ---------------------------------------------------------------------------
 
 
-def _engine() -> str | None:
-    """The engine's client, or ``None`` when there is no engine here at all.
+#: Where the engine listens when ``DOCKER_HOST`` names nowhere else.
+_DEFAULT_ENGINE_SOCKET: str = "/var/run/docker.sock"
 
-    No client, or a client whose engine endpoint is not there (no socket at
-    the path, nothing listening on the address), means no fixture container
-    can have been started from here: "no containers", never a place held for
-    ever. An engine that is there but refuses or errors stays "cannot
-    confirm" (the caller's ``None``).
+
+def _engine() -> str | None:
+    """The engine's client, or ``None`` when this runner has no engine at all.
+
+    Only an explicitly fixture-free runner answers "no containers" without
+    asking: no client, or no ``DOCKER_HOST`` and no socket at the default
+    path (the runner was started without any engine, so no build here can
+    have started a fixture). Any engine that is configured is asked, and an
+    engine that cannot be asked — permission, timeout, outage — is "cannot
+    confirm" (the caller's ``None``), which keeps the build's place held.
     """
     client = shutil.which(os.environ.get("FORGE_FIXTURE_ENGINE", "docker"))
-    if client is None or not _engine_endpoint_reachable():
+    if client is None:
+        return None
+    if not os.environ.get("DOCKER_HOST", "").strip() and not os.path.exists(
+        _DEFAULT_ENGINE_SOCKET
+    ):
         return None
     return client
-
-
-def _engine_endpoint_reachable() -> bool:
-    host = os.environ.get("DOCKER_HOST", "").strip() or "unix:///var/run/docker.sock"
-    try:
-        if host.startswith("unix://"):
-            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-                sock.settimeout(2.0)
-                sock.connect(host[len("unix://") :])
-            return True
-        if host.startswith("tcp://"):
-            address = host[len("tcp://") :].split("/", 1)[0]
-            name, _, port = address.rpartition(":")
-            with socket.create_connection((name, int(port)), timeout=2.0):
-                return True
-    except (OSError, ValueError):
-        return False
-    # Any other kind of endpoint (ssh://, a named context) is the client's to
-    # judge: asked, and a failure there is "cannot confirm".
-    return True
 
 
 def _engine_ids(build_id: str, *, include_stopped: bool) -> list[str] | None:
@@ -583,18 +572,38 @@ _STOP_PENDING: dict[str, float] = {}
 _STOP_PENDING_SECONDS: float = 24 * 3600.0
 
 
-def stop_pending(build_id: str) -> bool:
-    """True when a stop was asked for this build before its child existed."""
+def _pending(build_id: str) -> bool:
     now = time.monotonic()
     for stale in [b for b, at in _STOP_PENDING.items() if now - at > _STOP_PENDING_SECONDS]:
         del _STOP_PENDING[stale]
     return build_id in _STOP_PENDING
 
 
-def forget(build_id: str) -> None:
-    """The run of ``build_id`` here has ended: drop what is kept for it."""
+def stop_pending(build_id: str) -> bool:
+    """True when this build's current run here has been asked to stop."""
+    entry = _BUILDS.get(build_id)
+    return (entry is not None and entry.stop_requested) or _pending(build_id)
+
+
+def begin(build_id: str) -> OwnedBuild:
+    """A run of ``build_id`` starts here: its record, before any child exists.
+
+    A stop asked for while the run waited for a job slot becomes this run's
+    own stop request. The caller makes sure no earlier run of the same build
+    is still registered (see the runner node's relaunch guard).
+    """
+    entry = OwnedBuild(build_id=build_id, root=None)
+    entry.stop_requested = _pending(build_id)
     _STOP_PENDING.pop(build_id, None)
-    _BUILDS.pop(build_id, None)
+    _BUILDS[build_id] = entry
+    return entry
+
+
+def end(entry: OwnedBuild) -> None:
+    """That run has ended: drop its record and any stop asked for it."""
+    if _BUILDS.get(entry.build_id) is entry:
+        del _BUILDS[entry.build_id]
+        _STOP_PENDING.pop(entry.build_id, None)
 
 
 def register(build_id: str, pid: int) -> OwnedBuild:
@@ -609,12 +618,14 @@ def register(build_id: str, pid: int) -> OwnedBuild:
     stat = _read_stat(pid) if isinstance(pid, int) else None
     if stat is not None and stat.ppid == os.getpid():
         root = OwnedProcess(pid=pid, starttime=stat.starttime)
-    entry = OwnedBuild(build_id=build_id, root=root)
+    entry = _BUILDS.get(build_id)
+    if entry is None:
+        entry = begin(build_id)
+    entry.root = root
     if root is not None:
         entry.recorded.add(root)
     # A stop asked for while the child was being spawned is honoured now.
-    entry.stop_requested = stop_pending(build_id)
-    _BUILDS[build_id] = entry
+    entry.stop_requested = entry.stop_requested or _pending(build_id)
     return entry
 
 
@@ -681,7 +692,7 @@ async def still_running(build_id: str) -> StopReport:
     )
 
 
-async def stop_build(build_id: str) -> StopReport:
+async def stop_build(build_id: str, *, remember: bool = True) -> StopReport:
     """Stop one build's processes and fixtures here, then report what is left.
 
     When this process is running the build, its node is told the stop was
@@ -692,10 +703,12 @@ async def stop_build(build_id: str) -> StopReport:
     entry = _BUILDS.get(build_id)
     if entry is not None:
         entry.stop_requested = True
-    else:
-        # Nothing registered here yet: the run may be waiting for a job slot
-        # or in its steps before the spawn. Remember the request so it never
-        # spawns; it finishes CANCELLED.
+    elif remember:
+        # Nothing registered here yet: the run may be waiting for a job slot.
+        # Remember the request so it never spawns; it finishes CANCELLED.
+        # (The factory's confirmation before an acknowledgement passes
+        # remember=False: confirming a finished build must not cancel a
+        # later run of it.)
         _STOP_PENDING[build_id] = time.monotonic()
     remaining = await stop_owned(
         build_id,
@@ -705,7 +718,7 @@ async def stop_build(build_id: str) -> StopReport:
     if not remaining:
         await remove_fixture_containers(build_id)
     report = await still_running(build_id)
-    if entry is None:
+    if entry is None and remember:
         report = StopReport(
             build_id=report.build_id,
             processes=report.processes,
