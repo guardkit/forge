@@ -2974,6 +2974,12 @@ GIT_REMOTE_START_POINT_ROUTE: str = "/git/remote-start-point"
 #: changes no checked-out branch and touches no working folder.
 GIT_READ_FILE_AT_COMMIT_ROUTE: str = "/git/read-file-at-commit"
 
+#: The files ON A BRANCH under one folder (3 October 2026). ``/code/list-files``
+#: lists the clone's checked-out tree, which is not the branch a repair is cut
+#: from when that is a feature's own autobuild branch. Read-only:
+#: ``git ls-tree -r --name-only -z <branch> -- <under>``.
+GIT_LIST_FILES_ON_BRANCH_ROUTE: str = "/git/list-files-on-branch"
+
 #: The checks the sidecar knows how to run — the closed list.
 GIT_CHECK_NAMES: tuple[str, ...] = PRE_COMMIT_CHECK_NAMES
 
@@ -3828,6 +3834,43 @@ def process_git_rev_parse_request(
         return 500, {"error": f"sidecar git error: {type(exc).__name__}: {exc}"}
     sha = result.stdout.strip() if result.returncode == 0 else ""
     return 200, {"sha": sha or None}
+
+
+def process_git_list_files_on_branch_request(
+    payload: Any, *, config: ForgeConfig
+) -> tuple[int, dict[str, Any]]:
+    """``{repo, branch, under}`` → ``{files}``: the paths on ``branch`` under
+    the folder ``under``, sorted; ``files`` is ``null`` when the branch names
+    no commit. One fixed argument list, no shell, nothing written. Never
+    raises."""
+    if not isinstance(payload, dict):
+        return 400, {"error": "request body must be a JSON object"}
+    repo_path, error = _resolve_repo_key(payload, config)
+    if error or repo_path is None:
+        return 400, {"error": error}
+    branch = payload.get("branch")
+    error = _ref_error(branch, what="branch") or _relative_path_error(
+        payload.get("under"), what="under"
+    )
+    if error:
+        return 400, {"error": error}
+    try:
+        result = subprocess.run(  # noqa: S603 — fixed argv, no shell
+            [
+                "git", "-C", str(repo_path), "ls-tree", "-r", "--name-only", "-z",
+                str(branch) if str(branch).endswith("}") else f"{branch}^{{commit}}",
+                "--", str(payload["under"]),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=GIT_REV_PARSE_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return 500, {"error": f"sidecar git error: {type(exc).__name__}: {exc}"}
+    if result.returncode != 0:
+        return 200, {"files": None}
+    return 200, {"files": sorted(p for p in result.stdout.split("\0") if p)}
 
 
 def process_git_remote_start_point_request(
@@ -6688,6 +6731,7 @@ class DeploySidecarHandler(BaseHTTPRequestHandler):
                 GIT_WRITE_TREE_ROUTE,
                 GIT_READ_FILE_ROUTE,
                 GIT_REV_PARSE_ROUTE,
+                GIT_LIST_FILES_ON_BRANCH_ROUTE,
                 GIT_REMOTE_START_POINT_ROUTE,
                 GIT_READ_FILE_AT_COMMIT_ROUTE,
                 GIT_IS_ANCESTOR_ROUTE,
@@ -6743,6 +6787,10 @@ class DeploySidecarHandler(BaseHTTPRequestHandler):
                 )
             elif route == GIT_REV_PARSE_ROUTE:
                 status, body = process_git_rev_parse_request(payload, config=config)
+            elif route == GIT_LIST_FILES_ON_BRANCH_ROUTE:
+                status, body = process_git_list_files_on_branch_request(
+                    payload, config=config
+                )
             elif route == GIT_REMOTE_START_POINT_ROUTE:
                 status, body = process_git_remote_start_point_request(
                     payload, config=config
@@ -6970,6 +7018,7 @@ __all__ = [
     "GIT_READ_FILE_AT_COMMIT_ROUTE",
     "GIT_REMOTE_START_POINT_ROUTE",
     "GIT_REV_PARSE_ROUTE",
+    "GIT_LIST_FILES_ON_BRANCH_ROUTE",
     "GIT_AUTOBUILD_WORKTREE_INSPECT_ROUTE",
     "GIT_AUTOBUILD_WORKTREE_RETIRE_ROUTE",
     "GIT_CHECK_NAMES",
@@ -6985,6 +7034,7 @@ __all__ = [
     "process_git_write_tree_request",
     "process_git_read_file_request",
     "process_git_rev_parse_request",
+    "process_git_list_files_on_branch_request",
     "process_git_remote_start_point_request",
     "process_git_read_file_at_commit_request",
     "process_git_autobuild_worktree_inspect_request",

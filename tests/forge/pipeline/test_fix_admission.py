@@ -897,7 +897,9 @@ class _RetainedCandidateSidecar:
         candidate_commit: str,
         *,
         tracked: dict[str, str] | None = None,
+        on_branch: dict[str, dict[str, str]] | None = None,
         listing_refused: bool = False,
+        unanswered_refs: set[str] | None = None,
     ) -> None:
         self.candidate_commit = candidate_commit
         self.calls: list[tuple[str, dict[str, Any]]] = []
@@ -905,9 +907,13 @@ class _RetainedCandidateSidecar:
         self.shas: dict[str, str | None] = {
             f"autobuild/{FEATURE_ID}": candidate_commit,
         }
-        #: The clone's tracked files and their text (the /code routes).
+        #: The clone's CHECKED-OUT tree and its text (the /code routes).
         self.tracked = dict(tracked or {})
+        #: Each branch's own files (the /git routes), which the checked-out
+        #: tree does not show.
+        self.on_branch = {k: dict(v) for k, v in (on_branch or {}).items()}
         self.listing_refused = listing_refused
+        self.unanswered_refs = set(unanswered_refs or ())
 
     def __call__(
         self, url: str, body: dict[str, Any], timeout: float
@@ -920,6 +926,17 @@ class _RetainedCandidateSidecar:
             return 200, {"files": sorted(self.tracked), "capped": False}
         if route == "read-file":
             return 200, {"content": self.tracked.get(body["path"]), "partial": False}
+        if route == "list-files-on-branch":
+            if self.listing_refused:
+                return 400, {"error": "the repository is not a directory on this box"}
+            files = self.on_branch.get(body["branch"].removeprefix("refs/heads/"))
+            if files is None and body["branch"].removeprefix("refs/heads/") not in self.shas:
+                return 200, {"files": None}
+            return 200, {
+                "files": sorted(p for p in files or {} if p.startswith(body["under"] + "/"))
+            }
+        if route == "rev-parse" and body["ref"] in self.unanswered_refs:
+            raise OSError("connection reset")
         if route == "rev-parse":
             ref = body["ref"]
             short = ref.removeprefix("refs/heads/")
@@ -929,7 +946,9 @@ class _RetainedCandidateSidecar:
                 f"id: {FEATURE_ID}\n"
                 if body["branch"] == f"refs/heads/autobuild/{FEATURE_ID}"
                 and body["file_path"] == f".guardkit/features/{FEATURE_ID}.yaml"
-                else self.tracked.get(body["file_path"])
+                else self.on_branch.get(
+                    body["branch"].removeprefix("refs/heads/"), {}
+                ).get(body["file_path"])
             )
             return 200, {"content": content}
         if route == "worktree-add":
@@ -1069,7 +1088,8 @@ class TestABuildFailureRepairsItsRetainedCandidate:
             "rev-parse",  # is repair/TASK-FEAT44A8FIX1 already taken?
             "rev-parse",
             "read-file-from-branch",
-            "list-files",  # the task folder and the gate evidence
+            "list-files-on-branch",  # the task folder, on the repair's base
+            "list-files",  # the gate evidence, in the checked-out tree
             "rev-parse",
             "rev-parse",
             "worktree-add",
@@ -1082,10 +1102,10 @@ class TestABuildFailureRepairsItsRetainedCandidate:
             "branch": f"refs/heads/autobuild/{FEATURE_ID}",
             "file_path": f".guardkit/features/{FEATURE_ID}.yaml",
         }
-        cut = sidecar.calls[7][1]
+        cut = sidecar.calls[8][1]
         assert cut["repo"] == REPO_KEY
         assert cut["base_ref"] == "a" * 40
-        assert sidecar.calls[9][1]["expected_head"] == "a" * 40
+        assert sidecar.calls[10][1]["expected_head"] == "a" * 40
         assert YAML_FILE in sidecar.written
         assert "parent_feature: FEAT-44A8" in sidecar.written[YAML_FILE]
         assert branches(repo_root) == ["main"]
@@ -1131,12 +1151,16 @@ class TestABuildFailureRepairsItsRetainedCandidate:
         folder, no review id, no evidence). They are read in the sandbox."""
         task = "tasks/backlog/add-the-thing/TASK-44A8-001-add-the-thing.md"
         evidence = f"qa/gates/evidence/{FEATURE_ID}-local-20260907T083219Z/EVIDENCE.yaml"
+        # The feature's task files are on its autobuild branch, the repair's
+        # base, and NOT in the clone's checked-out tree (main).
         sidecar = _RetainedCandidateSidecar(
             "a" * 40,
-            tracked={
-                task: f"---\nid: TASK-44A8-001\nfeature_id: {FEATURE_ID}\n"
-                "parent_review: TASK-REV-44A8\n---\n# Add the thing\n",
-                evidence: EVIDENCE_TEXT,
+            tracked={evidence: EVIDENCE_TEXT},
+            on_branch={
+                f"autobuild/{FEATURE_ID}": {
+                    task: f"---\nid: TASK-44A8-001\nfeature_id: {FEATURE_ID}\n"
+                    "parent_review: TASK-REV-44A8\n---\n# Add the thing\n",
+                }
             },
         )
         sidecar.shas["repair/TASK-FEAT44A8FIX1"] = "older-repair"
@@ -1174,7 +1198,34 @@ class TestABuildFailureRepairsItsRetainedCandidate:
             "on this box)"
         ) in body
         assert f"- Could not be read: the gate evidence for {FEATURE_ID}" in body
+        assert (
+            f"- Could not be read: the files under tasks/ on autobuild/{FEATURE_ID}"
+        ) in body
         assert "could not read the files in the sandbox's clone" in caplog.text
+
+    def test_an_unanswered_repair_number_lookup_refuses_rather_than_reusing(
+        self,
+        pool: SqliteLifecyclePersistence,
+        store: WorkQueueStore,
+        repo_root: Path,
+        tmp_path: Path,
+    ) -> None:
+        """Unknown is not free: an unanswered lookup of repair/<id> could hide
+        a repair that already rides it, so nothing is queued this time."""
+        sidecar = _RetainedCandidateSidecar(
+            "a" * 40, unanswered_refs={"refs/heads/repair/TASK-FEAT44A8FIX1"}
+        )
+
+        with pytest.raises(FixAdmissionRefused) as caught:
+            self._sandbox_admission(pool, store, repo_root, tmp_path, sidecar)
+
+        assert caught.value.reason == "repair-number"
+        assert caught.value.permanent is False
+        assert "next repair number for FEAT-44A8 could not be established" in (
+            caught.value.message
+        )
+        assert "connection reset" in caught.value.message
+        assert sidecar.written == {}
 
     def test_missing_candidate_after_coding_fails_closed_without_a_branch(
         self,
