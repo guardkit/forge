@@ -79,8 +79,10 @@ import os
 import re
 import shutil
 import sqlite3
+import threading
 import uuid
 from collections.abc import Mapping
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -2339,6 +2341,108 @@ def _worktree_min_available_bytes() -> int:
     return int(floor_gb * 1024**3)
 
 
+# ---------------------------------------------------------------------------
+# WHAT THE BUILDS IN ONE RUNNER SHARE (3 October 2026, concurrent builds)
+# ---------------------------------------------------------------------------
+#
+# A runner given several job slots (``--n-jobs-per-worker``) runs several
+# builds in this one process. Two things they share need more than a look:
+#
+# * THE REPOSITORY'S SHARED CHECKOUT. A launch that names no branch runs in it
+#   rather than in a worktree of its own (the legacy path below). Beside any
+#   other build of the same repository that would be two builds in one folder,
+#   so it is refused (R4 in the design). Every build says which repository it
+#   is building while it runs, so the check has something to look at.
+# * FREE DISK SPACE. The worktree check used to look at free space and nothing
+#   else, so two builds starting together could each see room for one and both
+#   start. Each started build now RESERVES the floor it was checked against,
+#   and a start counts the other builds' reservations as already spent.
+#
+# Both are held by the build's own claim, created when the build's node starts
+# and released in its ``finally`` however the build ends. They are this
+# process's own: a runner that restarts has no builds running, and holds
+# nothing.
+
+#: Guards the two tables below. Held only for a few dictionary operations and
+#: one free-space reading, never across an ``await``.
+_RUNNER_SHARED_LOCK = threading.Lock()
+
+#: Repository checkout (resolved) -> the claims of the builds now running on it.
+_ACTIVE_BUILDS_BY_REPO: dict[Path, set["_BuildClaim"]] = {}
+
+#: A running build's claim -> the bytes of free space reserved for it.
+_DISK_RESERVATIONS: dict["_BuildClaim", int] = {}
+
+
+class _BuildClaim:
+    """What one running build holds in this runner, released when it ends."""
+
+    __slots__ = ("build_id", "repo")
+
+    def __init__(self, build_id: str) -> None:
+        self.build_id = build_id
+        self.repo: Path | None = None
+
+    def release(self) -> None:
+        with _RUNNER_SHARED_LOCK:
+            if self.repo is not None:
+                builds = _ACTIVE_BUILDS_BY_REPO.get(self.repo)
+                if builds is not None:
+                    builds.discard(self)
+                    if not builds:
+                        del _ACTIVE_BUILDS_BY_REPO[self.repo]
+                self.repo = None
+            _DISK_RESERVATIONS.pop(self, None)
+
+
+#: The claim of the build this task is running, set by
+#: :func:`_node_running_wave`. ``None`` outside a build's node (a direct call
+#: in a test), where nothing is claimed or reserved.
+_CURRENT_BUILD_CLAIM: ContextVar[_BuildClaim | None] = ContextVar(
+    "forge_autobuild_current_build_claim", default=None
+)
+
+
+def _claim_repository(repo_path: Path, *, shared_checkout: bool) -> str | None:
+    """Record that this build is working on ``repo_path``; ``None`` when it may.
+
+    Returns the plain reason a launch that would run in the repository's
+    SHARED checkout is refused while another build of the same repository is
+    running in this runner. A build that has its own worktree is never refused
+    here; it is recorded so a later shared-checkout launch can see it.
+    """
+    claim = _CURRENT_BUILD_CLAIM.get()
+    key = Path(repo_path).resolve()
+    with _RUNNER_SHARED_LOCK:
+        others = sorted(
+            other.build_id
+            for other in _ACTIVE_BUILDS_BY_REPO.get(key, set())
+            if other is not claim
+        )
+        if shared_checkout and others:
+            return (
+                f"refusing to run this build in the shared checkout {key}: "
+                f"another build of this repository is running in this runner "
+                f"({', '.join(others)}), and a launch that names no branch would "
+                "run in the same folder. Launch it with its branch so it gets a "
+                "worktree of its own."
+            )
+        if claim is not None and claim.repo is None:
+            claim.repo = key
+            _ACTIVE_BUILDS_BY_REPO.setdefault(key, set()).add(claim)
+    return None
+
+
+def _running_in_this_runner(build_id: str) -> bool:
+    """Whether a build with this ID is running in this runner right now."""
+    with _RUNNER_SHARED_LOCK:
+        return any(
+            claim.build_id == build_id
+            for claims in _ACTIVE_BUILDS_BY_REPO.values()
+            for claim in claims
+        )
+
+
 async def _materialise_worktree(
     repo_path: Path, branch: str, build_id: str
 ) -> Path:
@@ -2361,9 +2465,26 @@ async def _materialise_worktree(
     base = _worktree_base_dir()
     from forge.subagents.autobuild_worktree_lifecycle import inspect_worktree_capacity
 
-    capacity = inspect_worktree_capacity(
-        base, min_available_bytes=_worktree_min_available_bytes()
-    )
+    # A RESERVATION, NOT A LOOK (3 October 2026, concurrent builds). The free
+    # space other builds running in this runner have reserved counts as spent,
+    # and this build reserves its own floor in the same step, so two builds
+    # starting together cannot both pass on room for one. Released with the
+    # build's claim. A call outside a build's node reserves nothing.
+    min_available_bytes = _worktree_min_available_bytes()
+    claim = _CURRENT_BUILD_CLAIM.get()
+    with _RUNNER_SHARED_LOCK:
+        reserved_by_others = sum(
+            reserved
+            for holder, reserved in _DISK_RESERVATIONS.items()
+            if holder is not claim
+        )
+        capacity = inspect_worktree_capacity(
+            base,
+            min_available_bytes=min_available_bytes,
+            reserved_bytes=reserved_by_others,
+        )
+        if capacity.get("ok") and claim is not None:
+            _DISK_RESERVATIONS[claim] = min_available_bytes
     if not capacity.get("ok"):
         raise WorktreeMaterialisationError(
             "autobuild worktree capacity preflight refused the build before "
@@ -3259,7 +3380,11 @@ async def _finalize_success_worktree(
     forensics posture; the F3 preflight prune does not delete directories,
     and a kept tree never regresses a succeeded build).
     """
-    result = _export_receipts(worktree_path, receipt_build_id or build_id)
+    # Off the event loop (3 October 2026, concurrent builds): the export copies
+    # whole folders, and every other build in this runner shares the loop.
+    result = await asyncio.to_thread(
+        _export_receipts, worktree_path, receipt_build_id or build_id
+    )
     if not result.ok:
         logger.warning(
             "autobuild_runner: keeping worktree %s — receipts were not "
@@ -3654,7 +3779,15 @@ async def _sweep_prior_build_residue_impl(
         # positively says "live" withholds the sweep (see
         # :func:`_prior_build_status`).
         status = _prior_build_status(prior_build_id)
-        if status in _LIVE_BUILD_STATUSES:
+        # A build running in THIS runner is live whatever the ledger says
+        # (3 October 2026, concurrent builds): inside a sandbox there is no
+        # ledger to read, so the answer above is None there, and two builds of
+        # one feature can now overlap in one runner.
+        if status not in _LIVE_BUILD_STATUSES and _running_in_this_runner(
+            prior_build_id
+        ):
+            status = "RUNNING in this runner"
+        if status in _LIVE_BUILD_STATUSES or status == "RUNNING in this runner":
             logger.warning(
                 "autobuild_runner: requeue sweep — prior build %s is still "
                 "LIVE (ledger status=%s); its residue at %s is left ENTIRELY "
@@ -3759,7 +3892,9 @@ async def _sweep_prior_build_residue_impl(
                 prior_build_id,
                 _receipts_root(),
             )
-        _export_prior_build_evidence(
+        # Off the event loop, like the removal below: it copies the tree.
+        await asyncio.to_thread(
+            _export_prior_build_evidence,
             outer_root,
             prior_build_id,
             feature_id,
@@ -3819,7 +3954,10 @@ async def _sweep_prior_build_residue_impl(
             )
 
         try:
-            shutil.rmtree(outer_root, ignore_errors=False)
+            # Off the event loop (3 October 2026, concurrent builds): a whole
+            # kept worktree can take seconds to delete, and every other build
+            # in this runner shares the loop.
+            await asyncio.to_thread(shutil.rmtree, outer_root, ignore_errors=False)
         except FileNotFoundError as exc:
             if outer_root.exists():
                 # A FileNotFoundError with the root STILL PRESENT is a
@@ -3999,6 +4137,33 @@ def _build_failed_snapshot(
 
 
 async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
+    """Run one build (:func:`_run_one_build`) holding its claim in this runner.
+
+    3 October 2026, concurrent builds: a runner with several job slots runs
+    several builds in this process, and what they share — the repository's
+    shared checkout and the free disk space — is claimed per build (see
+    :class:`_BuildClaim`). The claim is made here and released in ``finally``
+    however the build ends, so a finished, failed or cancelled build never
+    holds a repository or a reservation.
+    """
+    payload = _extract_launch_payload(list(state.get("messages", [])))
+    # The same name the build's worktree is given, so the same-feature sweep
+    # can tell a running build's worktree by it.
+    claim = _BuildClaim(
+        str(
+            payload.get("build_id")
+            or f"build-{str(payload.get('feature_id') or '').strip()}-pending"
+        )
+    )
+    token = _CURRENT_BUILD_CLAIM.set(claim)
+    try:
+        return await _run_one_build(state)
+    finally:
+        _CURRENT_BUILD_CLAIM.reset(token)
+        claim.release()
+
+
+async def _run_one_build(state: AutobuildRunnerState) -> dict[str, Any]:
     """Invoke ``guardkit autobuild`` against the resolved local checkout.
 
     TASK-ABW-001 — replaces the previous lifecycle-stub body with the
@@ -4114,6 +4279,9 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
         base_branch = branch
         payload_branch = branch
         build_id = str(payload.get("build_id") or f"build-{feature_id}-pending")
+        # Recorded so a later launch with no branch can see this build is
+        # working on the repository (never refused: it gets its own worktree).
+        _claim_repository(repo_path, shared_checkout=False)
         if not await _local_branch_exists(repo_path, branch):
             return _snapshot_update(
                 _build_failed_snapshot(
@@ -4168,6 +4336,14 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
             repo_path,
         )
     else:
+        # R4 (3 October 2026, concurrent builds): the shared checkout is one
+        # folder, so this path is refused while another build of the same
+        # repository is running in this runner.
+        shared_refusal = _claim_repository(repo_path, shared_checkout=True)
+        if shared_refusal is not None:
+            return _snapshot_update(
+                _build_failed_snapshot(payload, reason=shared_refusal)
+            )
         run_cwd = repo_path
         logger.info(
             "autobuild_runner: legacy shared-checkout mode feature_id=%s cwd=%s "
@@ -4298,7 +4474,12 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
     # them belongs to.
     declared_settings = _launch_settings_for_build(payload)
     launch_env = build_launch_env(
-        memory_project=memory_project, declared=declared_settings
+        memory_project=memory_project,
+        declared=declared_settings,
+        # Which build this child belongs to (3 October 2026, concurrent
+        # builds): its test containers are named after it and a stop finds its
+        # processes by it. From the payload's build ID, never inherited.
+        run_owner=payload.get("build_id") or None,
     )
     logger.info(
         "autobuild_runner: launching subprocess feature_id=%s cwd=%s "
@@ -4687,7 +4868,10 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
         # destination read-back that would claim an earlier run's leftovers.
         receipts_result: ReceiptExport | None = None
         if worktree_path is not None:
-            receipts_result = _export_receipts(worktree_path, receipt_build_id)
+            # Off the event loop, as on the success path.
+            receipts_result = await asyncio.to_thread(
+                _export_receipts, worktree_path, receipt_build_id
+            )
         manifest_path = _write_failure_manifest(
             build_id=receipt_build_id,
             payload=payload,

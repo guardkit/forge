@@ -1160,6 +1160,12 @@ async def rearm_paused_gates(
                     snap=snap,
                     resume_launcher=resume_launcher,
                     repo=getattr(build_row, "repo", None),
+                    # R4 (3 October 2026, concurrent builds): and its recorded
+                    # branch, also a required column, so the resumed build gets
+                    # its own worktree like a fresh dispatch. Without it the
+                    # runner took the repository's shared checkout, and two
+                    # resumed builds of one repository would share one folder.
+                    branch=getattr(build_row, "branch", None),
                 ),
                 name=f"rearm-gate-{snap.build_id}",
             )
@@ -1229,6 +1235,7 @@ async def _rearm_dispatch(
     snap: "PausedBuildSnapshot",
     resume_launcher: Callable[..., Any],
     repo: str | None = None,
+    branch: str | None = None,
 ) -> "GateOutcome":
     """Await the re-armed decision and launch on approve.
 
@@ -1245,6 +1252,11 @@ async def _rearm_dispatch(
     daemon's environment default. It is forwarded verbatim (``None`` only when
     the caller could not read a row, which the sweep already treats as corrupt
     state).
+
+    ``branch`` is the row's ``builds.branch``, threaded the same way (R4,
+    3 October 2026): with it the runner cuts the resumed build its own
+    worktree, as it does for a fresh dispatch, instead of running it in the
+    repository's shared checkout.
     """
     outcome, _decision = await await_and_dispatch(
         deps=deps,
@@ -1267,5 +1279,6 @@ async def _rearm_dispatch(
             feature_id=snap.feature_id,
             correlation_id=snap.correlation_id,
             repo=repo,
+            branch=branch,
         )
     return outcome
