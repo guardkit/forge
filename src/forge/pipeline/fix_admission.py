@@ -203,10 +203,18 @@ class PreparedBranch:
 
 @dataclass(frozen=True, slots=True)
 class RepairBase:
-    """The branch a repair is cut from and its pinned commit, when required."""
+    """The branch a repair is cut from and its pinned commit, when required.
+
+    ``expected_commit`` is a retained candidate: the branch's own tip must be
+    exactly that commit. ``pinned_commit`` is where the remote has the branch
+    now (a post-merge repair of a sandboxed repository): the repair is read
+    and cut at that commit, not at the clone's local branch, which nothing
+    brings up to date.
+    """
 
     branch: str
     expected_commit: str | None = None
+    pinned_commit: str | None = None
 
 
 class FixAdmissionRefused(Exception):
@@ -734,6 +742,7 @@ def gather_repair_facts(
     receipts_root: Path | str | None = None,
     files_on_base: Iterable[str] | None = None,
     clone: "_SandboxClone | None" = None,
+    read_ref: str | None = None,
 ) -> RepairTaskFacts:
     """Read what the records say about the failure; never raise for a missing one.
 
@@ -747,17 +756,22 @@ def gather_repair_facts(
     ``clone`` is set for a repository in a sandbox: the checkout and the
     evidence are read there, through the helper, and whatever could not be
     read is named in :attr:`RepairTaskFacts.not_read`.
+
+    ``read_ref`` is where the base's files are read when that is not the
+    branch's own tip (a commit pinned from the remote); ``base_branch`` is
+    then only the name the task file says.
     """
     from forge.pipeline.repair_branch import list_branch_files, read_branch_file
 
     repo = Path(repo_path)
     note = dict(minted or {})
+    ref = read_ref or base_branch
     if files_on_base is not None:
         files = list(files_on_base)
     elif clone is not None:
-        files = clone.files_on_branch(base_branch, "tasks")
+        files = clone.files_on_branch(ref, "tasks")
     else:
-        files = list_branch_files(repo, base_branch, "tasks")
+        files = list_branch_files(repo, ref, "tasks")
     folder = repair_task_folder(feature_id, files)
 
     result = detail = merged_sha = None
@@ -817,7 +831,7 @@ def gather_repair_facts(
             clone.read_on_branch
             if clone is not None
             else (lambda branch, path: read_branch_file(repo, branch, path)),
-            base_branch,
+            ref,
             feature_id,
             folder,
             files,
@@ -839,6 +853,7 @@ def materialise_repair_task(
     receipts_root: Path | str | None = None,
     sidecar: tuple[str, str] | None = None,
     post: Any = None,
+    pinned_commit: str | None = None,
 ) -> PreparedBranch:
     """Put the task file and the YAML on ``repair/<task id>``, cut from ``base_branch``.
 
@@ -857,6 +872,12 @@ def materialise_repair_task(
     ``expected_base_commit`` pins a retained candidate across admission and
     branch creation. A moved base ref or an existing repair branch with no
     candidate ancestry is refused before any files are written.
+
+    ``pinned_commit`` (sandboxed repositories only, 3 October 2026) is the
+    commit the remote has ``base_branch`` at, fetched by admission: the task
+    folder is read there and the branch is cut there, because the clone's
+    local ``base_branch`` is not kept up to date and can be many merges
+    behind.
     """
     from forge.pipeline.repair_branch import (
         list_branch_files,
@@ -867,8 +888,11 @@ def materialise_repair_task(
     # A sandboxed repository's checkout is not on this side (the coordinator's
     # path for it may not exist at all), so it is read where it is.
     clone = _SandboxClone(sidecar, post=post) if sidecar is not None else None
+    if pinned_commit is not None and clone is None:
+        raise ValueError("a pinned base commit is only read through a sandbox")
+    read_ref = pinned_commit or base_branch
     files_on_base = (
-        clone.files_on_branch(base_branch, "tasks")
+        clone.files_on_branch(read_ref, "tasks")
         if clone is not None
         else list_branch_files(repo, base_branch, "tasks")
     )
@@ -884,6 +908,7 @@ def materialise_repair_task(
         receipts_root=receipts_root,
         files_on_base=files_on_base,
         clone=clone,
+        read_ref=read_ref,
     )
     task_relpath = repair_task_relpath(folder, task_id)
     files = {
@@ -905,6 +930,7 @@ def materialise_repair_task(
             files=files,
             message=f"repair task for {subject}: {name}",
             expected_base_commit=expected_base_commit,
+            pinned_commit=pinned_commit,
             post=post,
         )
     else:
@@ -1329,9 +1355,14 @@ async def admit_fix_row(
     base_branch = repair_base.branch
     if base_branch != branch or sidecar is not None:
         logger.info(
-            "fix admission: %s's repair branch is cut from %s%s",
+            "fix admission: %s's repair branch is cut from %s%s%s",
             task_id,
             base_branch,
+            (
+                f" at {repair_base.pinned_commit}, where the remote has it now,"
+                if repair_base.pinned_commit
+                else ""
+            ),
             f" in the sandbox behind {sidecar[0]}" if sidecar else "",
         )
 
@@ -1351,6 +1382,7 @@ async def admit_fix_row(
             receipts_root=receipts_root,
             sidecar=sidecar,
             post=sidecar_post,
+            pinned_commit=repair_base.pinned_commit,
         )
         _record_repair_branch(
             store,
@@ -1808,11 +1840,29 @@ async def resolve_repair_base(
     sidecar: tuple[str, str] | None,
     sidecar_post: Any = None,
 ) -> RepairBase:
-    """Choose the repair base, preserving a verified build-failed candidate."""
-    from forge.pipeline.fix_row_producer import SOURCE_BUILD_FAILED
+    """Choose the repair base, preserving a verified build-failed candidate.
+
+    A repair of a merge whose checks went red, in a sandboxed repository, is
+    cut from where the remote has the target branch NOW (3 October 2026):
+    the sandbox clone's own ``main`` is not updated by anything, so on that
+    day it was dozens of merges behind GitHub's and a repair cut from it would
+    have been working on an old tree.
+    """
+    from forge.pipeline.fix_row_producer import (
+        SOURCE_BUILD_FAILED,
+        SOURCE_MERGE_REPORT,
+    )
 
     chosen = choose_repair_base(minted, branch, parent_feature)
     source = str((minted or {}).get("source") or "")
+    if source == SOURCE_MERGE_REPORT and sidecar is not None:
+        return await _remote_target_base(
+            source_build_id=source_build_id,
+            source_build=source_build,
+            branch=chosen,
+            sidecar=sidecar,
+            sidecar_post=sidecar_post,
+        )
     if source != SOURCE_BUILD_FAILED:
         return RepairBase(branch=chosen)
     return await _retained_candidate_base(
@@ -1825,6 +1875,47 @@ async def resolve_repair_base(
         sidecar_post=sidecar_post,
         fallback_branch=branch,
     )
+
+
+async def _remote_target_base(
+    *,
+    source_build_id: str,
+    source_build: Any,
+    branch: str,
+    sidecar: tuple[str, str],
+    sidecar_post: Any,
+) -> RepairBase:
+    """Fetch the remote's target branch in the sandbox and pin where it is.
+
+    The same fetch the merge word makes before it joins
+    (:func:`forge.pipeline.merge_join.target_branch_now`), through the
+    sandbox helper's existing ``/git/remote-start-point`` route. The branch is
+    the one the failed build recorded when its work started, or ``branch``
+    for a build with nothing recorded. When the remote cannot be read the
+    repair is not queued this time and the queue tries again; it never falls
+    back to the clone's local branch, which is the stale tree this avoids.
+    """
+    from forge.deploy.sidecar_git import SidecarCandidateGit
+    from forge.pipeline.merge_join import target_branch_now
+    from forge.planning.sidecar_git_runner import _urllib_post
+
+    recorded = str(getattr(source_build, "target_branch", "") or "") or branch
+    sidecar_url, repo_key = sidecar
+    git = SidecarCandidateGit(
+        sidecar_url, repo=repo_key, post=sidecar_post or _urllib_post
+    )
+    where = await target_branch_now(git, recorded_branch=recorded)
+    if not where.ok:
+        raise FixAdmissionRefused(
+            f"Nothing was queued this time: the repair of {source_build_id} is "
+            f"cut from the remote's {recorded} as it is now, and that could not "
+            f"be read ({where.refusal}). The sandbox's own copy of {recorded} is "
+            "not used instead because nothing keeps it up to date. The queue "
+            "will try again.",
+            reason=REPAIR_BASE_REASON,
+            permanent=False,
+        )
+    return RepairBase(branch=str(where.branch), pinned_commit=str(where.commit))
 
 
 def choose_repair_base(

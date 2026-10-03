@@ -7,6 +7,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
 from forge.pipeline.fix_admission import (
     _sidecar_for,
     choose_repair_base,
@@ -133,3 +135,58 @@ class TestTheTaskRidesTheSidecar:
         # for the sandbox to act on.
         assert not any(str(repo) in repr(body) for _, body in fake.calls)
         assert fake.calls[5][1]["path"] == f"{SANDBOX_TREES}/repair-TASK-FEATBD8FFIX1"
+
+
+class TestAPinnedRemoteCommit:
+    """A post-merge repair is read and cut at the commit the remote has main
+    at, not at the clone's own main, which nothing updates (3 October 2026)."""
+
+    def _materialise(self, tmp_path: Path, fake: FakeSidecar) -> Any:
+        repo = tmp_path / "api_test"
+        repo.mkdir(exist_ok=True)
+        return materialise_repair_task(
+            repo_path=repo,
+            task_id="TASK-FEATBD8FFIX1",
+            feature_id="FEAT-BD8F",
+            name="FEAT-BD8F was merged but the checks after it went red",
+            base_branch="main",
+            source_build_id="build-FEAT-BD8F-20260913171308",
+            minted={"source": SOURCE_MERGE_REPORT},
+            receipts_root=tmp_path / "receipts",
+            sidecar=("http://127.0.0.1:8925", "guardkit/api_test"),
+            post=fake,
+            pinned_commit="9753535b",
+        )
+
+    def test_the_branch_is_cut_from_the_pinned_commit_not_local_main(
+        self, tmp_path: Path
+    ) -> None:
+        fake = FakeSidecar()
+        fake.shas.update({"main": "1e58166", "9753535b": "9753535b"})
+
+        self._materialise(tmp_path, fake)
+
+        listing = next(body for route, body in fake.calls if route == "list-files-on-branch")
+        assert listing["branch"] == "9753535b"
+        cut = next(body for route, body in fake.calls if route == "worktree-add")
+        assert cut["base_ref"] == "9753535b"
+        written = next(
+            body for route, body in fake.calls if route == "prepare-branch-and-write-tree"
+        )
+        assert written["expected_head"] == "9753535b"
+        assert {"repo": "guardkit/api_test", "ref": "refs/heads/main"} not in [
+            body for _, body in fake.calls
+        ]
+
+    def test_a_pinned_commit_the_clone_does_not_have_cuts_nothing(
+        self, tmp_path: Path
+    ) -> None:
+        from forge.pipeline.repair_branch import RepairBranchError
+
+        fake = FakeSidecar()
+        fake.shas["main"] = "1e58166"
+
+        with pytest.raises(RepairBranchError, match="is not in the factory's clone"):
+            self._materialise(tmp_path, fake)
+
+        assert "worktree-add" not in [route for route, _ in fake.calls]
