@@ -49,6 +49,11 @@ class TestFindingTheSandbox:
         assert _sidecar_for(SimpleNamespace(planning=SimpleNamespace(sandboxes={"r": {"sidecar_url": "x"}})), None) is None
 
 
+#: Where the sandbox keeps its clone's working folders — not where the
+#: coordinator knows the repository (``tmp_path / "api_test"`` below).
+SANDBOX_TREES = "/sandbox/own/clone/api_test/.forge/worktrees"
+
+
 class FakeSidecar:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict[str, Any]]] = []
@@ -62,9 +67,17 @@ class FakeSidecar:
             short = ref.removeprefix("refs/heads/")
             return 200, {"sha": self.shas.get(ref, self.shas.get(short))}
         if route == "worktree-add":
+            # As the real route does: the sandbox's clone has a path of its
+            # own, so only a folder NAME can be acted on; a path from the
+            # coordinator's side is refused (3 October 2026, #91).
+            if body.get("path") or not body.get("leaf"):
+                return 400, {"error": f"'path' {body.get('path')!r} is not a journey worktree of this repository"}
             self.shas[body["branch"]] = "base0"
-            return 200, {"status": "success", "path": body["path"], "reused": False, "detail": ""}
+            path = f"{SANDBOX_TREES}/{body['leaf']}"
+            return 200, {"status": "success", "path": path, "reused": False, "detail": ""}
         if route == "worktree-remove":
+            if not str(body.get("path")).startswith(f"{SANDBOX_TREES}/"):
+                return 400, {"error": f"'path' {body.get('path')!r} is not a journey worktree of this repository"}
             return 200, {"status": "success", "path": body["path"], "detail": ""}
         if route == "prepare-branch-and-write-tree":
             return 200, {"status": "success", "sha": "abc123", "checks": [], "detail": ""}
@@ -103,3 +116,7 @@ class TestTheTaskRidesTheSidecar:
         }
         assert "parent_feature: FEAT-BD8F" in written[".guardkit/features/TASK-FEATBD8FFIX1.yaml"]
         assert not (repo / ".git").exists()
+        # Nothing the coordinator knows the repository by was sent as a path
+        # for the sandbox to act on.
+        assert not any(str(repo) in repr(body) for _, body in fake.calls)
+        assert fake.calls[3][1]["path"] == f"{SANDBOX_TREES}/repair-TASK-FEATBD8FFIX1"
