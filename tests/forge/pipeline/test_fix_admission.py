@@ -921,7 +921,7 @@ class _RetainedCandidateSidecar:
             self.shas[body["branch"]] = self.candidate_commit
             return 200, {
                 "status": "success",
-                "path": body["path"],
+                "path": f"/sandbox/clone/.forge/worktrees/{body['leaf']}",
                 "reused": False,
                 "detail": "",
             }
