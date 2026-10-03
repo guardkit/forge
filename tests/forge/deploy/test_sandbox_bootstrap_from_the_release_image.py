@@ -809,6 +809,24 @@ class TestItStartsTwoContainersFromThatOneImage:
             output = process.communicate(timeout=30)[0]
         assert secret not in output
 
+    def test_the_two_time_limits_reach_the_runner(self, sandbox):
+        """The base time for one attempt, and the time for one task.
+
+        3 October 2026: the machine's settings had set both since 18 September
+        and the host side handed both into the sandbox, but this script's list
+        left them out, so from 1 October every build ran on the build system's
+        shorter defaults. They are handed in by name like everything else.
+        """
+        helper, runner = _the_two_starts(
+            sandbox,
+            GUARDKIT_SDK_TIMEOUT="1800",
+            GUARDKIT_AUTOBUILD_TASK_TIMEOUT_FLOOR="7200",
+        )
+        for name in ("GUARDKIT_SDK_TIMEOUT", "GUARDKIT_AUTOBUILD_TASK_TIMEOUT_FLOOR"):
+            assert f"--env {name}" in runner, f"{name} was not handed to the runner"
+        # By name only: the values stay in the sandbox's own environment.
+        assert "=1800" not in runner and "=7200" not in runner
+
     def test_a_project_can_name_settings_of_its_own(self, sandbox):
         process = subprocess.Popen(
             ["bash", str(sandbox["script"])],

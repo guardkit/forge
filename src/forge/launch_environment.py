@@ -210,6 +210,12 @@ LAUNCH_SETTINGS: tuple[tuple[str, str], ...] = (
         "the build system's per-task timeout floor, mirrored by the same "
         "supervision for the same reason",
     ),
+    (
+        "GUARDKIT_SDK_TIMEOUT",
+        "the base of the time one attempt at a task is given; the machine's "
+        "settings have set it since 18 September 2026, and leaving it off "
+        "this list quietly put every build back on the shorter default",
+    ),
     # --- the switches the owner turned on ----------------------------------
     # These three are a class of their own, and the reason they are named here
     # is a fault this list caused on the day it was written. Each one is a
