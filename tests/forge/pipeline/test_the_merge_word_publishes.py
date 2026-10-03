@@ -60,6 +60,7 @@ from tests.forge.pipeline.test_merge_executor import (  # noqa: F401 - fixtures
     _JoinsForReal,
     _legs,
     _receipts_env,
+    _the_kept_hold_runs_out,
     pool,
     repo_root,
 )
@@ -541,6 +542,8 @@ class TestPickingUpASendWhoseAnswerWasLost:
         )
         first = await _press(deps, repo_root)
         assert first.result == "publication-pending"
+        # The send's answer was lost, so the hold was kept; it runs out.
+        _the_kept_hold_runs_out(pool)
 
         # Press two: a publisher that would refuse everything, so that a send
         # is impossible. It must never be asked.
@@ -582,6 +585,7 @@ class TestPickingUpASendWhoseAnswerWasLost:
             config_with_publication_on, pool, publisher=publisher
         )
         await _press(deps, repo_root)
+        _the_kept_hold_runs_out(pool)
 
         sends_again = _APublisherThatSays([_published("e" * 40)])
         deps_two, _deploy_two, _joins_two, _bus_two = _deps(
@@ -612,6 +616,7 @@ class TestPickingUpASendWhoseAnswerWasLost:
             config_with_publication_on, pool, publisher=publisher
         )
         await _press(deps, repo_root)
+        _the_kept_hold_runs_out(pool)
         on_top = _somebody_else_lands_work(repo_root, "on-top")
 
         never = _APublisherThatSays([_some_other_refusal("x", "never.")])
@@ -762,6 +767,7 @@ class TestNothingHalfCheckedIsEverSent:
         with pytest.raises(KeyboardInterrupt):
             await _press(deps, repo_root)
         assert publisher.asked == []
+        _the_kept_hold_runs_out(pool)
 
         deps_two, deploy_two, joins_two, _bus = _deps(
             config_with_publication_on, pool, publisher=publisher
@@ -1436,6 +1442,7 @@ class TestAReusedJoinIsCheckedWhenTheBuildSystemCan:
         )
         with pytest.raises(KeyboardInterrupt):
             await _press(deps, repo_root)
+        _the_kept_hold_runs_out(pool)
 
     @pytest.mark.asyncio
     async def test_a_build_system_that_has_it_is_asked_and_its_pass_is_used(
@@ -1836,3 +1843,59 @@ class TestTheHoldIsPutDownWhenThePublishedPressHasFinished:
         ][-1]
         assert send.detail["published"] is False
         assert send.detail["contains_j"] is False
+
+    @pytest.mark.asyncio
+    async def test_after_a_deploy_that_failed_another_worker_takes_it(
+        self,
+        config_with_publication_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> None:
+        deps = _deps_that_can_deploy(
+            config_with_publication_on,
+            pool,
+            publisher=_APublisherThatSays([_published("c" * 40)]),
+            deploy=_ADeployStepThatSays(reports="j-somebodyelse@0000"),
+        )
+
+        outcome = await _press(deps, repo_root)
+
+        assert outcome.result == "merged-deploy-failed"
+        assert _record(pool).lease_holder is None
+        assert self._another_worker_takes_it(pool) is not None
+
+    @pytest.mark.asyncio
+    async def test_a_retry_of_a_build_already_published_puts_it_down(
+        self,
+        config_with_publication_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> None:
+        """FEAT-E592 on 3 October: published, deploy pending, then pressed
+        again. The retry reads the remote, finds the work there, and ends
+        published again — and the hold does not outlive it."""
+
+        def send_for_real(request: dict[str, Any]) -> None:
+            _git(repo_root, "push", "-q", "origin", f"{request['j_commit']}:main")
+
+        first_deps, _deploy, _joins, _bus = _deps(
+            config_with_publication_on,
+            pool,
+            publisher=_APublisherThatSays(
+                [_published("f" * 40)], before_answering=send_for_real
+            ),
+        )
+        first = await _press(first_deps, repo_root)
+        assert first.result == "published-deployment-pending"
+
+        retry_publisher = _APublisherThatSays([_published("f" * 40)])
+        retry_deps, _deploy, _joins, _bus = _deps(
+            config_with_publication_on, pool, publisher=retry_publisher
+        )
+        retry = await _press(retry_deps, repo_root)
+
+        assert retry.result == "published-deployment-pending", retry.detail
+        assert "another worker" not in retry.detail
+        assert retry_publisher.asked == []  # found by looking, not sent again
+        assert _record(pool).lease_holder is None
+        assert self._another_worker_takes_it(pool) is not None

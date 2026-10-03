@@ -750,6 +750,11 @@ async def test_a_merge_that_landed_is_never_run_twice(
     )
     assert first.result == "merged-verify-failed"
     assert _merge_step_rows(pool) == ["GATED"]
+    # The merge command died without an answer, so the first press kept its
+    # hold (3 October 2026); the next merge word comes once it has run out.
+    from tests.forge.pipeline.test_merge_executor import _the_kept_hold_runs_out
+
+    _the_kept_hold_runs_out(pool, BUILD_ID)
 
     _write_guardkit(tmp_path, monkeypatch, MERGES_AND_ECHOES)
     second, _, _ = await _press_merge(
