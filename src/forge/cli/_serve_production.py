@@ -213,26 +213,26 @@ def build_runner_stop_check(
     sqlite_pool: SqliteLifecyclePersistence,
     default_url: str,
     runner_url_for_feature: "Callable[[str], str] | None" = None,
+    remember: bool = False,
 ) -> "StopCheck":
     """The production :data:`StopCheck`: ask the build's own runner.
 
-    The build is the newest ``builds`` row for the identity. It is asked about
-    when the caller says it was cancelled, or (``cancelled`` unknown) when its
-    row says CANCELLED; any other build is "not applicable" and is
-    acknowledged exactly as before. The runner is the one the build was
-    dispatched to: the sandbox's runner for a repository that has one, the
-    global runner otherwise (the same answer the watchers use).
+    The build is the newest ``builds`` row for the identity, whatever its
+    status: every terminal acknowledgement waits until the build's runner says
+    nothing it owns is left (for a build that ended in the ordinary way it
+    says so at once). The runner is the one the build was dispatched to: the
+    sandbox's runner for a repository that has one, the global runner
+    otherwise (the same answer the watchers use). ``remember=True`` makes the
+    question a cancel (a run not yet started never starts); the confirmation
+    before an acknowledgement leaves it ``False``.
     """
-    from forge.lifecycle.state_machine import BuildState
     from forge.lifecycle_bridge.build_stop import StopAnswer, ask_runner_to_stop
 
-    async def _check(
-        feature_id: str, correlation_id: str, cancelled: bool | None
-    ) -> StopAnswer | None:
+    async def _check(feature_id: str, correlation_id: str) -> StopAnswer | None:
         try:
             with sqlite_pool._reader() as cx:
                 row = cx.execute(
-                    "SELECT build_id, status FROM builds WHERE feature_id = ? "
+                    "SELECT build_id FROM builds WHERE feature_id = ? "
                     "AND correlation_id = ? ORDER BY queued_at DESC, rowid DESC "
                     "LIMIT 1",
                     (feature_id, correlation_id),
@@ -247,16 +247,12 @@ def build_runner_stop_check(
             # about.
             return None
         build_id = row[0] if not hasattr(row, "keys") else row["build_id"]
-        status = row[1] if not hasattr(row, "keys") else row["status"]
-        status = status.value if isinstance(status, BuildState) else str(status)
-        if cancelled is None and status != BuildState.CANCELLED.value:
-            return None
         url = (
             runner_url_for_feature(feature_id)
             if runner_url_for_feature is not None
             else default_url
         )
-        return await ask_runner_to_stop(url, str(build_id))
+        return await ask_runner_to_stop(url, str(build_id), remember=remember)
 
     return _check
 
@@ -612,15 +608,21 @@ def _build_lifecycle_bridge_wireup_parts(
     # for that runner to confirm the stop. One check serves both.
     from forge.lifecycle_bridge.build_stop import AckAfterStop
 
-    stop_check = build_runner_stop_check(
+    ack_guard = AckAfterStop(
+        build_runner_stop_check(
+            sqlite_pool=sqlite_pool,
+            default_url=autobuild_runner_url,
+            runner_url_for_feature=runner_url_for_feature,
+        )
+    )
+    # The cancel itself: the same question, remembered by the runner so a
+    # run of the build still waiting for a job slot never starts.
+    _stop_build = build_runner_stop_check(
         sqlite_pool=sqlite_pool,
         default_url=autobuild_runner_url,
         runner_url_for_feature=runner_url_for_feature,
+        remember=True,
     )
-    ack_guard = AckAfterStop(stop_check)
-
-    async def _stop_build(feature_id: str, correlation_id: str) -> Any:
-        return await stop_check(feature_id, correlation_id, True)
 
     registry = BridgeRegistry(connection=connection)
     bridge = LifecycleBridge(registry=registry, build_stopper=_stop_build)

@@ -586,7 +586,6 @@ class LifecycleBridgeWireup:
         # build's runner must confirm that everything the build owns is gone.
         # ``None`` (unit tiers) acknowledges as before.
         self._ack_guard = ack_guard
-        self._interrupted_runs: set[str] = set()
         # Per-feature budget-detection state (one session per observer task).
         # Created at observer start when a detector is wired, dropped in the
         # observer's ``finally`` — so the review-cycle count resets on bridge
@@ -1149,10 +1148,6 @@ class LifecycleBridgeWireup:
 
         if snapshot is None:
             return False
-        if getattr(snapshot, "status", None) == "interrupted":
-            # Remembered for the no-terminal path: an interrupted run's
-            # acknowledgement waits for its runner's confirmed stop.
-            self._interrupted_runs.add(feature_id)
 
         return await self._replay_run_state_snapshot(
             snapshot=snapshot,
@@ -1284,12 +1279,7 @@ class LifecycleBridgeWireup:
             )
             return False
 
-        await self._on_terminal(
-            handle,
-            feature_id,
-            context.correlation_id,
-            cancelled=isinstance(terminal_event, BuildCancelledPayload),
-        )
+        await self._on_terminal(handle, feature_id, context.correlation_id)
         logger.info(
             "wireup._replay_run_state_snapshot: synthesised terminal "
             "envelope (%s) from run_status=%s for feature_id=%s "
@@ -1521,12 +1511,7 @@ class LifecycleBridgeWireup:
                     # fire-and-forget, so a slow offer can never delay
                     # _on_terminal's ack/detach.
                     self._spawn_merge_offer(event)
-                    await self._on_terminal(
-                        handle,
-                        feature_id,
-                        correlation_id,
-                        cancelled=isinstance(event, BuildCancelledPayload),
-                    )
+                    await self._on_terminal(handle, feature_id, correlation_id)
                     return (True, True)
                 # TASK-FRR-PEB-011 AC-2/AC-3: terminal envelope
                 # publish failed (transient broker error / network
@@ -1804,8 +1789,6 @@ class LifecycleBridgeWireup:
         handle: BuildAckHandle,
         feature_id: str,
         correlation_id: str,
-        *,
-        cancelled: bool | None = False,
     ) -> None:
         """Run the terminal-arrival sequence (AC-4).
 
@@ -1821,13 +1804,13 @@ class LifecycleBridgeWireup:
         Both calls are guarded so a transient transport error in either
         cannot leave the observer loop unable to exit.
 
-        A CANCELLED terminal (``cancelled=True``; ``None`` = the check reads
-        the build's row) is acknowledged only once the build's runner
-        confirms that everything the build owns is gone (3 October 2026).
-        Until then the acknowledgement is held by the guard's one checker
-        for this build, which asks again every 30 seconds; the registry row
-        stays, and a factory restart leaves the message unacknowledged for
-        the consumer to ask about again.
+        Every terminal, whatever its class, is acknowledged only once the
+        build's runner confirms that nothing the build owns is left (3 October
+        2026; at once for a build that ended in the ordinary way). Until then
+        the acknowledgement is held by the guard's one checker for this build,
+        which asks again every 30 seconds; the registry row stays, and a
+        factory restart leaves the message unacknowledged for the consumer to
+        ask about again.
         """
 
         async def _ack_and_detach() -> None:
@@ -1854,13 +1837,12 @@ class LifecycleBridgeWireup:
                     correlation_id,
                 )
 
-        if cancelled is not False and self._ack_guard is not None:
+        if self._ack_guard is not None:
             await self._ack_guard.ack_when_stopped(
                 feature_id,
                 correlation_id,
                 _ack_and_detach,
-                cancelled=cancelled,
-                where="the cancelled build's terminal",
+                where="the build's terminal",
             )
             return
         await _ack_and_detach()
@@ -2224,16 +2206,7 @@ class LifecycleBridgeWireup:
         )
         published = await self._publish_event(payload, feature_id)
         if published:
-            # An interrupted run (or a row already CANCELLED, which the check
-            # reads) is acknowledged only after its runner confirms the stop.
-            interrupted = feature_id in self._interrupted_runs
-            self._interrupted_runs.discard(feature_id)
-            await self._on_terminal(
-                handle,
-                feature_id,
-                context.correlation_id,
-                cancelled=True if interrupted else None,
-            )
+            await self._on_terminal(handle, feature_id, context.correlation_id)
         else:
             logger.warning(
                 "wireup: synthetic build-failed publish FAILED for "
