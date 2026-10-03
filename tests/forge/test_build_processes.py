@@ -122,7 +122,7 @@ class TestStopReachesEverythingTheBuildOwns:
                 "the orphan never started",
             )
             orphan = int(pid_file.read_text())
-            report = asyncio.run(build_processes.stop_build(build_id, remember=False))
+            report = asyncio.run(build_processes.stop_build(build_id, purpose="ack"))
             assert report.stopped, report.as_json()
             assert not Path(f"/proc/{orphan}").exists() or (
                 build_processes.snapshot_process(orphan) is None
@@ -207,13 +207,13 @@ class TestFixtureContainers:
         try:
             # The engine goes away (its socket is not there any more).
             monkeypatch.setenv("DOCKER_HOST", f"unix://{tmp_path}/engine-gone.sock")
-            during = asyncio.run(build_processes.stop_build(build_id, remember=False))
+            during = asyncio.run(build_processes.stop_build(build_id, purpose="ack"))
             assert not during.confirmed and not during.stopped, during.as_json()
             # It comes back: the fixture was there all along, is found and
             # removed, and only now is the build stopped.
             monkeypatch.delenv("DOCKER_HOST")
             assert container_running(mine)
-            after = asyncio.run(build_processes.stop_build(build_id, remember=False))
+            after = asyncio.run(build_processes.stop_build(build_id, purpose="ack"))
             assert after.stopped, after.as_json()
             assert not container_running(mine)
         finally:
@@ -408,3 +408,31 @@ class TestCleanupIsConfirmedWhateverTheTerminal:
         assert fixture_alive and held, "the run ended with its fixture still up"
         assert result["async_tasks"][feature]["lifecycle"] == "failed"
         assert not container_running(fixture)
+
+
+class TestACheckNeverStopsARun:
+    """Review round 2 (R3): a confirmation before an acknowledgement
+    (purpose "ack") never asks a run registered here to stop and never
+    signals it; it answers "not stopped" while that run lives."""
+
+    def test_the_registered_run_is_untouched(self, estate):
+        from forge import build_processes
+
+        build_id = _build_id()
+        child = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(600)"],
+            env={**os.environ, "GUARDKIT_RUN_OWNER": build_id},
+            start_new_session=True,
+        )
+        try:
+            entry = build_processes.begin(build_id)
+            build_processes.register(build_id, child.pid)
+            report = asyncio.run(build_processes.stop_build(build_id, purpose="ack"))
+            assert not report.stopped
+            assert entry.stop_requested is False
+            assert child.poll() is None, "a check signalled the run"
+            assert not build_processes.stop_pending(build_id)
+        finally:
+            build_processes.end(entry)
+            child.kill()
+            child.wait()
