@@ -147,6 +147,45 @@ class TestAStopAskedWhileQueuedForASlot:
         assert estate.started("FEAT-QB") is None, "GuardKit was spawned for B"
 
 
+class TestARelaunchStopsTheOriginalFirst:
+    """Review R3: a coordinator-only restart relaunches a build still running.
+
+    The runner and the build's child stay up; the factory, restarted, launches
+    the same build again (a fresh thread and run, the same build ID). The
+    runner stops the original first — every process gone — and only then lets
+    the relaunch spawn, which completes in a worktree of its own while the
+    original's worktree is kept aside.
+    """
+
+    def test_the_relaunch_waits_for_the_original_and_completes(self, estate):
+        build_id = _build_id()
+        estate.add_build("FEAT-RL", build_id, branch="rl", relaunch_run_seconds=1)
+
+        async def _go(url: str) -> dict[str, Any]:
+            first = await _launch(url, "FEAT-RL", build_id, "rl")
+            recorded = await asyncio.to_thread(estate.pids, "FEAT-RL")
+            second = await _launch(url, "FEAT-RL", build_id, "rl")
+            first_lifecycle = await _final_lifecycle(first, "FEAT-RL")
+            second_lifecycle = await _final_lifecycle(second, "FEAT-RL")
+            return {
+                "first": first_lifecycle,
+                "second": second_lifecycle,
+                "first_alive_after": [p for p, s in recorded if proc_alive(p, s)],
+            }
+
+        with real_runner(estate, "relaunch", jobs=2) as runner:
+            seen = asyncio.run(_go(runner.url))
+        relaunch = json.loads((estate.records / "FEAT-RL.relaunch.started").read_text())
+        # At the instant the relaunch spawned, none of the original's
+        # processes (child, grandchild, separate-session) was alive.
+        assert relaunch["others_alive"] == {"FEAT-RL": []}
+        assert seen["first_alive_after"] == []
+        assert seen["first"] == "cancelled"
+        assert seen["second"] == "completed", seen
+        kept = list((estate.root / "worktrees").glob(f"{build_id}.superseded-*"))
+        assert kept, "the original run's worktree was not kept"
+
+
 class TestOtherBuildsInTheSameRunnerAreUntouched:
     def test_b_and_c_keep_running_and_keep_their_files(self, estate):
         ids = {f: _build_id() for f in ("FEAT-SA", "FEAT-SB", "FEAT-SC")}
@@ -436,7 +475,12 @@ class TestThePlaceIsReleasedOnlyAfterTheStop:
 
                 bridge = LifecycleBridge(
                     registry=BridgeRegistry(connection=cx),
-                    build_stopper=lambda f, c: _check()(f, c, True),
+                    build_stopper=build_runner_stop_check(
+                        sqlite_pool=pool,
+                        default_url=x_url,
+                        runner_url_for_feature=lambda f: urls[f],
+                        remember=True,
+                    ),
                 )
                 bridge.attach(
                     BuildContext(
@@ -462,9 +506,7 @@ class TestThePlaceIsReleasedOnlyAfterTheStop:
                 )
                 handle = AsyncMock()
                 handle.ack = AsyncMock(side_effect=stored_ack["a"])
-                await wireup._on_terminal(
-                    handle, a_feature, a_payload.correlation_id, cancelled=True
-                )
+                await wireup._on_terminal(handle, a_feature, a_payload.correlation_id)
                 assert guard1.held() == [(a_feature, a_payload.correlation_id)]
                 # A is really redelivered (ack_wait 3 s) and still held by the
                 # one checker; B is never delivered.
