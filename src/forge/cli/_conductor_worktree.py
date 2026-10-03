@@ -791,9 +791,10 @@ async def prepare_journey_worktree(
     checkout = Path(_normalise(checkout_raw))
     # 2b — does this repository have a sandbox? A repository listed in
     # planning.sandboxes has its tree cut inside that sandbox, on the
-    # factory's own clone at this same path, so the checkout is NOT expected
-    # to be readable here — forge-prod does not mount it any more. Only a
-    # repository without a sandbox is checked on this host.
+    # factory's own clone (at whatever path the sandbox keeps it), so the
+    # checkout is NOT expected to be readable here — forge-prod does not
+    # mount it any more. Only a repository without a sandbox is checked on
+    # this host.
     sandbox = _sandbox_for(config, repo)
     if sandbox is None and not (checkout / ".git").exists():
         return _refuse(
@@ -841,7 +842,6 @@ async def prepare_journey_worktree(
             sandbox=sandbox,
             repo=str(repo),
             build_id=build_id,
-            worktree=target,
             branch=branch,
             base_ref=base_ref,
             post=post,
@@ -875,7 +875,6 @@ async def _cut_in_sandbox(
     sandbox: Any,
     repo: str,
     build_id: str,
-    worktree: Path,
     branch: str,
     base_ref: str,
     post: Any = None,
@@ -884,7 +883,7 @@ async def _cut_in_sandbox(
     """Ask the sidecar inside ``repo``'s sandbox to cut the journey's tree.
 
     One POST to ``/git/worktree-add`` with the repository's key, the tree's
-    path, the branch and its base. The sidecar runs the very same function
+    name (the build id), the branch and its base. The sidecar runs the very same function
     this module runs in the container, on the factory's clone, so there is
     one statement of what a journey tree is and not two. A refusal comes back
     as a plain sentence and becomes this writer's refusal unchanged.
@@ -897,9 +896,15 @@ async def _cut_in_sandbox(
 
     sender = post if post is not None else _urllib_post
     url = f"{str(sandbox.sidecar_url).rstrip('/')}{GIT_WORKTREE_ADD_ROUTE}"
+    # Only the tree's NAME crosses, as the merge word's own folder does. The
+    # sandbox keeps its clone at a path of its own, which need not be the
+    # path this side's map names (3 October 2026: the containerised
+    # coordinator knows it as /var/lib/forge/projects/…), so the sandbox puts
+    # the tree under its clone and says where; that answer is what is
+    # recorded, and what every later call into the sandbox names.
     body = {
         "repo": repo,
-        "path": str(worktree),
+        "leaf": build_id,
         "branch": branch,
         "base_ref": base_ref,
     }

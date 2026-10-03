@@ -308,6 +308,123 @@ class TestTheJourneyWorktreeIsCutInTheSandbox:
 
 
 # ---------------------------------------------------------------------------
+# 3 October 2026 — the coordinator knows the repository by another path
+# ---------------------------------------------------------------------------
+
+
+def _coordinator_config(
+    tmp_path: Path, clone: Path, plain_checkout: Path, sidecar_url: str
+) -> ForgeConfig:
+    """What the containerised coordinator has: the sandboxed repository mapped
+    to a path of its own (/var/lib/forge/projects/… live) that does not exist
+    here, while the sidecar's settings keep the real clone's path."""
+    raw = _raw_config(clone, plain_checkout, sidecar_url)
+    own = tmp_path / "coordinator-view" / "api_test"
+    raw["planning"]["target_repo_paths"][REPO_KEY] = str(own)
+    raw["permissions"]["filesystem"]["allowlist"] = [str(own.parent)]
+    return ForgeConfig.model_validate(raw)
+
+
+class TestTheCoordinatorsPathIsNotTheSandboxs:
+    """Repair #91 (FEAT-D586) was refused because the coordinator's path was
+    sent to the sandbox. Every call into the sandbox now names the key and,
+    for a tree, the name; the tree's path comes back from the sandbox."""
+
+    def test_the_journey_tree_is_cut_under_the_sandboxs_clone_and_recorded(
+        self,
+        tmp_path: Path,
+        pool: SqliteLifecyclePersistence,
+        sidecar: Any,
+        clone: Path,
+        plain_checkout: Path,
+    ) -> None:
+        config = _coordinator_config(tmp_path, clone, plain_checkout, sidecar.url)
+        _row(pool, REPO_KEY)
+
+        outcome = asyncio.run(prepare_journey_worktree(pool, config, BUILD_ID))
+
+        assert isinstance(outcome, WorktreeReady), getattr(outcome, "reason", "")
+        tree = clone / ".forge" / "worktrees" / BUILD_ID
+        assert Path(outcome.path) == tree and (tree / ".git").exists()
+        assert pool.get_build_row(BUILD_ID).worktree_path == str(tree)
+        assert not (tmp_path / "coordinator-view").exists()
+
+    def test_a_leg_names_the_repository_by_its_key_from_the_row(
+        self,
+        tmp_path: Path,
+        pool: SqliteLifecyclePersistence,
+        sidecar: Any,
+        clone: Path,
+        plain_checkout: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import forge.adapters.guardkit.run_via_sidecar as door
+
+        config = _coordinator_config(tmp_path, clone, plain_checkout, sidecar.url)
+        _row(pool, REPO_KEY)
+        tree = clone / ".forge" / "worktrees" / BUILD_ID
+        sent: list[dict[str, Any]] = []
+
+        def _capture(url: str, body: dict[str, Any], *, timeout: float) -> Any:
+            sent.append(body)
+            return 200, {"exit_code": 0, "stdout": "", "stderr_tail": ""}
+
+        monkeypatch.setattr(door, "_post", _capture)
+        choose = make_conductor_guardkit_run_chooser(
+            pool=pool, config=config, in_container_run=object()
+        )
+
+        asyncio.run(
+            choose(BUILD_ID)(
+                subcommand="task-review", args=[], repo_path=tree, timeout_seconds=5
+            )
+        )
+
+        assert sent and sent[0]["repo"] == REPO_KEY
+        assert sent[0]["cwd"] == str(tree)
+
+    def test_the_sandbox_tree_is_allowed_for_that_build_only(
+        self,
+        tmp_path: Path,
+        pool: SqliteLifecyclePersistence,
+        sidecar: Any,
+        clone: Path,
+        plain_checkout: Path,
+    ) -> None:
+        from forge.cli._serve_conductor import _allowlist_for_build
+        from forge.cli._serve_deps_forward_context import (
+            ForgeConfigWorktreeAllowlist,
+        )
+
+        config = _coordinator_config(tmp_path, clone, plain_checkout, sidecar.url)
+        configured = ForgeConfigWorktreeAllowlist(
+            allowed_roots=tuple(config.permissions.filesystem.allowlist)
+        )
+        _row(pool, REPO_KEY)
+        tree = clone / ".forge" / "worktrees" / BUILD_ID
+        pool.record_worktree_path(BUILD_ID, str(tree))
+        _row(pool, PLAIN_KEY, build_id="build-FEAT-SBX1-20260907180000")
+        pool.record_worktree_path(
+            "build-FEAT-SBX1-20260907180000",
+            str(plain_checkout / ".forge" / "worktrees" / "x"),
+        )
+
+        widened = _allowlist_for_build(pool, config, BUILD_ID, configured)
+        report = tree / ".claude" / "reviews" / "r.md"
+        assert configured.is_allowed(BUILD_ID, str(report)) is False
+        assert widened.is_allowed(BUILD_ID, str(report)) is True
+        assert widened.is_allowed(BUILD_ID, str(clone / "elsewhere")) is False
+        assert widened.is_allowed(BUILD_ID, str(tree) + "-sibling") is False
+        # A repository without a sandbox keeps exactly the configured roots.
+        assert (
+            _allowlist_for_build(
+                pool, config, "build-FEAT-SBX1-20260907180000", configured
+            )
+            is configured
+        )
+
+
+# ---------------------------------------------------------------------------
 # Rule 77 — the receipts are exported inside the sandbox
 # ---------------------------------------------------------------------------
 
@@ -802,8 +919,10 @@ class TestALegRunsInTheSandbox:
             )
         )
 
+        # The key comes off the build row (3 October 2026), so a stray path
+        # is the sandbox's to refuse — and it does, as a failed result.
         assert result.status == "failed"
-        assert "does not know which repository" in (result.stderr or "")
+        assert "on no other path" in (result.stderr or "")
 
 
 # ---------------------------------------------------------------------------

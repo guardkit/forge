@@ -549,6 +549,7 @@ def build_sidecar_leg_run(
     base_url: str,
     repo_paths: Mapping[str, str],
     http_timeout_margin: float = HTTP_TIMEOUT_MARGIN_SECONDS,
+    repo: str | None = None,
 ) -> Callable[..., Awaitable[GuardKitResult]]:
     """Return a fix-journey ``guardkit_run`` that works through the sidecar.
 
@@ -591,6 +592,12 @@ def build_sidecar_leg_run(
             repository a worktree belongs to.
         http_timeout_margin: Seconds added to the leg's own wall before the
             socket gives up, so the sidecar's timeout always fires first.
+        repo: The repository's key, when the caller already knows it (the
+            conductor reads it off the build row). The journey worktree is
+            then the sandbox's own path, which need not lie under the path
+            ``repo_paths`` names on this side (3 October 2026: the
+            containerised coordinator knows the repository as
+            /var/lib/forge/projects/…), so the key is not worked out from it.
     """
     endpoint = f"{base_url.rstrip('/')}{LEG_ENDPOINT}"
     known_paths = dict(repo_paths)
@@ -620,7 +627,7 @@ def build_sidecar_leg_run(
                 f"{subcommand!r}"
             )
 
-        repo_key = _resolve_repo_key_for_worktree(repo_path, known_paths)
+        repo_key = repo or _resolve_repo_key_for_worktree(repo_path, known_paths)
         if repo_key is None:
             known = ", ".join(sorted(known_paths)) or "(none configured)"
             return _failed_result(

@@ -3045,12 +3045,16 @@ def make_conductor_guardkit_run_chooser(
         getattr(getattr(config, "planning", None), "target_repo_paths", None) or {}
     )
 
-    def _factory(base_url: str) -> Any:
+    def _factory(base_url: str, repo: str) -> Any:
         if build_sidecar_run is not None:
             return build_sidecar_run(base_url=base_url, repo_paths=repo_paths)
         from forge.adapters.guardkit.run_via_sidecar import build_sidecar_leg_run
 
-        return build_sidecar_leg_run(base_url=base_url, repo_paths=repo_paths)
+        # The key comes off the build row: the recorded worktree is the
+        # sandbox's own path, which need not sit under this side's map.
+        return build_sidecar_leg_run(
+            base_url=base_url, repo_paths=repo_paths, repo=repo
+        )
 
     runners: dict[str, Any] = {}
 
@@ -3072,7 +3076,7 @@ def make_conductor_guardkit_run_chooser(
         if entry is None:
             return in_container_run
         if repo not in runners:
-            runners[repo] = _factory(str(entry.sidecar_url))
+            runners[repo] = _factory(str(entry.sidecar_url), repo)
             logger.info(
                 "conductor composition: %s has a sandbox (%s), so its fix "
                 "journey's legs run inside it through the sidecar at %s, with "
@@ -3156,6 +3160,52 @@ def with_the_gate_evidence(
         return updated
 
     return build
+
+
+@dataclasses.dataclass(frozen=True)
+class _AlsoTheSandboxTree:
+    """The configured allowlist, and this build's own tree in its sandbox.
+
+    A sandboxed repository's journey tree is where the sandbox put it — its
+    own path, which need not lie under any root this side's
+    ``permissions.filesystem.allowlist`` names (3 October 2026: the
+    containerised coordinator knows the repository as /var/lib/forge/projects/…
+    while the sandbox keeps it elsewhere). The tree and what the legs write in
+    it are then allowed by the record, not by the configured roots.
+    """
+
+    inner: Any
+    tree: str
+
+    def is_allowed(self, build_id: str, path: str) -> bool:
+        if self.inner is not None and self.inner.is_allowed(build_id, path):
+            return True
+        try:
+            candidate = os.path.normpath(os.path.abspath(str(path)))
+        except (TypeError, ValueError):
+            return False
+        return candidate == self.tree or candidate.startswith(self.tree + os.sep)
+
+
+def _allowlist_for_build(
+    pool: Any, config: Any, build_id: str, worktree_allowlist: Any
+) -> Any:
+    """``worktree_allowlist``, widened to the build's recorded sandbox tree.
+
+    Unchanged for a repository without a sandbox, or a row with no tree yet.
+    """
+    from forge.config.sandboxes import sandbox_for
+
+    try:
+        row = pool.get_build_row(build_id)
+    except Exception:  # noqa: BLE001 — the configured roots still apply
+        return worktree_allowlist
+    tree = str(getattr(row, "worktree_path", "") or "").strip() if row else ""
+    if not tree or sandbox_for(config, str(getattr(row, "repo", "") or "")) is None:
+        return worktree_allowlist
+    return _AlsoTheSandboxTree(
+        inner=worktree_allowlist, tree=os.path.normpath(os.path.abspath(tree))
+    )
 
 
 def build_conductor_supervisor_factory(
@@ -3310,11 +3360,12 @@ def build_conductor_supervisor_factory(
         )
 
     def supervisor_factory(build_id: str) -> Any:
+        allowlist = _allowlist_for_build(pool, config, build_id, worktree_allowlist)
         mode_kwargs = _mode_kwargs(
             pool=pool,
             config=config,
             base_branch=base_branch,
-            worktree_allowlist=worktree_allowlist,
+            worktree_allowlist=allowlist,
             forward_context_builder=forward_context_builder,
             failure_pack_source_reader=failure_pack_source_reader,
             receipts_root=receipts_root,
@@ -3340,7 +3391,7 @@ def build_conductor_supervisor_factory(
         dispatcher = make_conductor_subprocess_dispatcher(
             build_row_reader=pool.get_build_row,
             read_allowlist=read_allowlist,
-            worktree_allowlist=worktree_allowlist,
+            worktree_allowlist=allowlist,
             forward_context_builder=forward_context_builder,
             stage_log_writer=stage_log_writer,
             subprocess_runner=_runner_for(build_id),
