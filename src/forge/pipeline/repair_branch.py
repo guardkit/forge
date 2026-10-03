@@ -517,7 +517,6 @@ def materialise_repair_branch_via_sidecar(
     sidecar_url: str,
     *,
     repo: str,
-    repo_root: Path | str,
     task_id: str,
     base_branch: str,
     expected_base_commit: str | None = None,
@@ -607,23 +606,27 @@ def materialise_repair_branch_via_sidecar(
             )
     if created:
         # The worktree route is the one that can cut a branch from a named
-        # base; the tree itself is not wanted, so it goes straight back.
-        path = str(Path(repo_root) / ".forge" / "worktrees" / f"{REPAIR_WORKTREE_PREFIX}{task_id}")
+        # base; the tree itself is not wanted, so it goes straight back. Only
+        # the folder's NAME is sent, as the merge word does: the sandbox keeps
+        # its clone at a path of its own, which need not be the path this
+        # side knows the repository by (3 October 2026, the containerised
+        # coordinator sent /var/lib/forge/projects/… and was refused), so the
+        # sandbox builds the path and the removal uses the path it answered.
         cut = call(
             "/git/worktree-add",
             {
                 "repo": repo,
-                "path": path,
+                "leaf": f"{REPAIR_WORKTREE_PREFIX}{task_id}",
                 "branch": branch,
                 "base_ref": expected_base_commit or base_commit,
             },
         )
-        if cut.get("status") != "success":
+        if cut.get("status") != "success" or not cut.get("path"):
             raise RepairBranchError(
                 f"the sandbox's git could not cut {branch} from {base_branch}: "
                 f"{cut.get('detail') or 'no reason given'}"
             )
-        call("/git/worktree-remove", {"repo": repo, "path": path})
+        call("/git/worktree-remove", {"repo": repo, "path": str(cut["path"])})
     written = call(
         "/git/prepare-branch-and-write-tree",
         {

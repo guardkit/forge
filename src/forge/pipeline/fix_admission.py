@@ -862,7 +862,6 @@ def materialise_repair_task(
         result = materialise_repair_branch_via_sidecar(
             sidecar_url,
             repo=repo_key,
-            repo_root=repo,
             task_id=task_id,
             base_branch=base_branch,
             files=files,

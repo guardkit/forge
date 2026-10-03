@@ -18,7 +18,11 @@ from forge.pipeline.repair_branch import (
 )
 
 REPO = "guardkit/api_test"
-ROOT = Path("/home/rich/Projects/api_test")
+#: Where the SANDBOX keeps its clone. The coordinator knows the repository by
+#: a different path (3 October 2026: /var/lib/forge/projects/api_test in the
+#: container), so nothing this side knows may be sent as a path to act on.
+SANDBOX_ROOT = Path("/sandbox/own/clone/api_test")
+SANDBOX_TREES = SANDBOX_ROOT / ".forge" / "worktrees"
 FILES = {
     ".guardkit/features/TASK-FEATBD8FFIX1.yaml": "id: TASK-FEATBD8FFIX1\n",
     "tasks/backlog/feat-bd8f/TASK-FEATBD8FFIX1-repair.md": "# repair\n",
@@ -55,10 +59,17 @@ class FakeSidecar:
                 in self.ancestors,
             }
         if route == "worktree-add":
+            # As the real route does: a folder NAME is put under this side's
+            # own clone; a path anywhere else is refused (LAW 10).
+            path = str(SANDBOX_TREES / body["leaf"]) if body.get("leaf") and not body.get("path") else body.get("path")
+            if Path(str(path)).parent != SANDBOX_TREES:
+                return 400, {"error": f"'path' {path!r} is not a journey worktree of this repository"}
             if self.cut_status == "success":
                 self.shas[body["branch"]] = "base0000"
-            return 200, {"status": self.cut_status, "path": body["path"], "reused": False, "detail": "" if self.cut_status == "success" else "no such base"}
+            return 200, {"status": self.cut_status, "path": path, "reused": False, "detail": "" if self.cut_status == "success" else "no such base"}
         if route == "worktree-remove":
+            if Path(str(body.get("path"))).parent != SANDBOX_TREES:
+                return 400, {"error": f"'path' {body.get('path')!r} is not a journey worktree of this repository"}
             return 200, {"status": "success", "path": body["path"], "detail": ""}
         if route == "prepare-branch-and-write-tree":
             if self.write_status == "success":
@@ -77,7 +88,6 @@ def _run(
     return materialise_repair_branch_via_sidecar(
         "http://127.0.0.1:8925/",
         repo=REPO,
-        repo_root=ROOT,
         task_id="TASK-FEATBD8FFIX1",
         base_branch=base,
         expected_base_commit=expected_base_commit,
@@ -95,8 +105,10 @@ def test_a_new_branch_is_cut_from_the_base_then_written() -> None:
     cut = fake.calls[2][1]
     assert cut["base_ref"] == "17497a2a"
     assert cut["branch"] == "repair/TASK-FEATBD8FFIX1"
-    assert cut["path"] == str(ROOT / ".forge" / "worktrees" / "repair-TASK-FEATBD8FFIX1")
-    assert fake.calls[3][1]["path"] == cut["path"]
+    # Only the folder's name crosses; the sandbox says where it put it, and
+    # the removal names exactly that.
+    assert cut["leaf"] == "repair-TASK-FEATBD8FFIX1" and "path" not in cut
+    assert fake.calls[3][1]["path"] == str(SANDBOX_TREES / "repair-TASK-FEATBD8FFIX1")
     written = fake.calls[4][1]
     assert written["files"] == FILES and written["checks"] == []
     assert written["expected_head"] == "17497a2a"
@@ -183,7 +195,7 @@ def test_a_dead_sidecar_is_a_plain_refusal() -> None:
 
     with pytest.raises(RepairBranchError, match="could not be reached at http://127.0.0.1:8925/git/rev-parse"):
         materialise_repair_branch_via_sidecar(
-            "http://127.0.0.1:8925", repo=REPO, repo_root=ROOT, task_id="T", base_branch="main",
+            "http://127.0.0.1:8925", repo=REPO, task_id="T", base_branch="main",
             files=FILES, message="m", post=dead,
         )
 
@@ -192,6 +204,6 @@ def test_no_files_is_refused_before_any_call() -> None:
     fake = FakeSidecar(shas={"main": "x"})
     with pytest.raises(RepairBranchError, match="no files"):
         materialise_repair_branch_via_sidecar(
-            "http://s", repo=REPO, repo_root=ROOT, task_id="T", base_branch="main", files={}, message="m", post=fake,
+            "http://s", repo=REPO, task_id="T", base_branch="main", files={}, message="m", post=fake,
         )
     assert fake.calls == []
