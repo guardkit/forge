@@ -103,10 +103,15 @@ from forge.pipeline.fix_admission import (
 from forge.pipeline.merge_executor import (
     MERGE_DECISION_TARGET_IDENTIFIER,
     MERGE_REPORT_TARGET_IDENTIFIER,
+    RESULT_WORD_MERGED_AND_RUNNING,
+    RESULT_WORD_PUBLICATION_PENDING,
+    RESULT_WORD_PUBLISHED_DEPLOYMENT_PENDING,
 )
 from forge.pipeline.merge_offer import MERGE_OFFER_TARGET_IDENTIFIER
 from forge.pipeline.publication_record import (
     LINE_DONE,
+    RESULT_MERGED_AND_RUNNING,
+    RESULT_PUBLISHED_DEPLOYMENT_PENDING,
     STEP_SEND,
     PublicationRecordStore,
 )
@@ -233,6 +238,32 @@ NOT_LANDED_YET: str = "not landed yet"
 BUILT_NOTHING: str = "built nothing"
 DID_NOT_LAND: str = "did not land"
 MERGE_DECLINED: str = "merge declined"
+NOT_PUBLISHED: str = "not published"
+NO_MERGE_CARD: str = "no merge card"
+
+#: The answers that will not turn into "landed" without someone acting, so a
+#: row waiting on one is never left waiting silently: the loop asks "hold or
+#: go" once. Work that lands afterwards still lets the row go.
+WILL_NOT_LAND_ON_ITS_OWN: frozenset[str] = frozenset(
+    {DID_NOT_LAND, MERGE_DECLINED, NOT_PUBLISHED, NO_MERGE_CARD}
+)
+
+#: How long a build that finished clean may wait for its merge card to be
+#: offered before the queue asks "hold or go" about the row waiting on it.
+#: The offer normally follows within seconds; it writes nothing when it
+#: declines to offer (a build with failed tasks), so the only sign is time.
+#: Ten minutes is long enough never to ask the moment a build finishes.
+MERGE_CARD_GRACE_SECONDS: int = 10 * 60
+
+#: Publication record results, and merge report result words, that mean the
+#: joined commit is on the remote. A later press that finds the work already
+#: there by looking writes one of these and no new send line.
+_LANDED_RECORD_RESULTS: frozenset[str] = frozenset(
+    {RESULT_PUBLISHED_DEPLOYMENT_PENDING, RESULT_MERGED_AND_RUNNING}
+)
+_LANDED_REPORT_WORDS: frozenset[str] = frozenset(
+    {RESULT_WORD_PUBLISHED_DEPLOYMENT_PENDING, RESULT_WORD_MERGED_AND_RUNNING}
+)
 
 #: How a run that ended badly is described in the row's closing reason.
 _FAILURE_WORDS: Mapping[str, str] = {
@@ -320,6 +351,23 @@ def _count_not_in(
             return 0
         raise
     return int(row[0]) if row else 0
+
+
+def _work_is_written(connection: sqlite3.Connection, correlation_id: str) -> bool:
+    """True when a planning run or a build exists under this correlation id."""
+    for table in ("planning_runs", "builds"):
+        try:
+            row = connection.execute(
+                f"SELECT 1 FROM {table} WHERE correlation_id = ? LIMIT 1",
+                (correlation_id,),
+            ).fetchone()
+        except sqlite3.OperationalError as exc:
+            if "no such table" in str(exc).lower():
+                continue
+            raise
+        if row is not None:
+            return True
+    return False
 
 
 def _correlation_ids_in(
@@ -475,8 +523,11 @@ def count_in_flight(
     queue row, its planning run and the build that run hands over all carry.
     It is in flight when any of these is true of it:
 
-    - its queue row is ADMITTED: the queue has given it a place, whether or
-      not its planning run or repair build has been written yet;
+    - its queue row is ADMITTED and the work it starts — the planning run, or
+      a repair's build — has not been written yet: the queue has given it a
+      place and nothing else carries it. Once the run or build exists it
+      speaks for itself, so a repair whose build was marked INTERRUPTED is not
+      counted through its still-admitted row;
     - it has a planning run in an active state;
     - it has a build in an active state;
     - it has a build whose merge card is still waiting for Rich's word.
@@ -501,7 +552,13 @@ def count_in_flight(
     happening for them, and when boot recovery re-cards one it becomes PAUSED
     and counts from then on.
     """
-    pieces = _correlation_ids_in(connection, "work_queue", "status", ("ADMITTED",))
+    pieces = {
+        correlation_id
+        for correlation_id in _correlation_ids_in(
+            connection, "work_queue", "status", ("ADMITTED",)
+        )
+        if not _work_is_written(connection, correlation_id)
+    }
     pieces |= _correlation_ids_in(
         connection, "planning_runs", "state", sorted(PLANNING_ACTIVE_STATES)
     )
@@ -534,16 +591,25 @@ def paused_repositories(connection: sqlite3.Connection) -> set[str]:
     return {str(row[0]) for row in rows if row[0]}
 
 
-def work_landing(connection: sqlite3.Connection, correlation_id: str) -> str:
+def work_landing(
+    connection: sqlite3.Connection,
+    correlation_id: str,
+    *,
+    merge_executor_enabled: bool = True,
+    now: datetime | None = None,
+) -> str:
     """Has the work under one correlation id landed? Read from the record.
 
-    "Landed" is the merge executor's own durable answer: its send step for
-    the work's build is written down as done with ``published`` true, which
-    it only writes when the remote said it holds the joined commit
-    (``pipeline/merge_executor.py``, the send). Nothing short of that is
-    landed — not the queue row closing DONE (a feature row closes when its
-    planning run hands the build over, before the build has run), and not
-    Rich pressing merge (the decision is written before the merge runs).
+    "Landed" is the merge executor's own durable answer that the remote holds
+    the joined commit: its send step written down as done with ``published``
+    true, or — for work a later press found already on the remote by looking,
+    which writes no new send line — a publication record or merge report
+    whose result says it was published (``pipeline/merge_executor.py``).
+    Nothing short of that is landed: not the queue row closing DONE (a
+    feature row closes when its planning run hands the build over, before the
+    build has run), and not Rich pressing merge (the decision is written
+    before the merge runs). Landed is checked first, so work that lands after
+    the queue asked about it still lets the waiting row go.
 
     The answers, in the order they are decided:
 
@@ -551,22 +617,34 @@ def work_landing(connection: sqlite3.Connection, correlation_id: str) -> str:
       promised: a question, or a planning run that ended without handing a
       build over. Nothing is coming, so nothing is waited for.
     - ``NOT_LANDED_YET`` — a planning run that handed a build over before the
-      build was written; and a build that is not published yet (see below).
-    - ``LANDED`` — the send is recorded done and published.
+      build was written.
+    - ``LANDED`` — published, as above.
     - ``DID_NOT_LAND`` — the build failed, was cancelled or never ran; or the
       merge executor reported the merge FAILED and nothing was published.
     - ``MERGE_DECLINED`` — Rich said no at the merge card.
-    - ``NOT_LANDED_YET`` — everything else: building, finished with its
-      merge card waiting (answered in time or not), approved and waiting for
-      the repository's merge or running its checks, or joined and checked
-      and not yet sent. Every one of those can still land.
+    - ``NOT_PUBLISHED`` — the merge executor's newest report says
+      "publication pending": checked and not sent, because the publisher
+      refused or could not be reached, the attempts ran out, or publication
+      is switched off. It will not land without someone acting.
+    - ``LANDED`` — the merge executor is switched off
+      (``merge_executor_enabled`` false) and the build finished COMPLETE: no
+      merge card is ever offered, so finishing is as far as the work goes,
+      which is the queue's behaviour from before.
+    - ``NO_MERGE_CARD`` — the merge executor is on, the build finished
+      COMPLETE, and no merge card has been offered for
+      :data:`MERGE_CARD_GRACE_SECONDS` since it finished (the offer refuses a
+      build with failed tasks and writes nothing durable when it does).
+    - ``NOT_LANDED_YET`` — everything else: building, finished and waiting
+      for its card, at its merge card (answered in time or not), approved and
+      waiting for the repository's merge or running its checks, or sending.
+      Every one of those can still land on its own.
 
     The newest build under the correlation id is the one read.
     """
     try:
         build = connection.execute(
-            "SELECT build_id, status FROM builds WHERE correlation_id = ? "
-            "ORDER BY queued_at DESC LIMIT 1",
+            "SELECT build_id, status, completed_at, queued_at FROM builds "
+            "WHERE correlation_id = ? ORDER BY queued_at DESC LIMIT 1",
             (correlation_id,),
         ).fetchone()
     except sqlite3.OperationalError as exc:
@@ -580,14 +658,37 @@ def work_landing(connection: sqlite3.Connection, correlation_id: str) -> str:
             return NOT_LANDED_YET
         return BUILT_NOTHING
     build_id = str(build[0])
-    if _send_was_published(connection, build_id):
+    status = str(build[1])
+    report = _latest_stage(connection, build_id, MERGE_REPORT_ROW)
+    report_says = _report_result(report)
+    if (
+        _was_published(connection, build_id)
+        or report_says in _LANDED_REPORT_WORDS
+    ):
         return LANDED
-    if str(build[1]) in BUILD_FAILURE_STATES:
+    if status in BUILD_FAILURE_STATES:
         return DID_NOT_LAND
-    if _latest_stage_status(connection, build_id, MERGE_DECISION_ROW) == "SKIPPED":
+    decision = _latest_stage(connection, build_id, MERGE_DECISION_ROW)
+    if decision is not None and str(decision[0]) == "SKIPPED":
         return MERGE_DECLINED
-    if _latest_stage_status(connection, build_id, MERGE_REPORT_ROW) == "FAILED":
+    if report is not None and str(report[0]) == "FAILED":
         return DID_NOT_LAND
+    if report_says == RESULT_WORD_PUBLICATION_PENDING:
+        return NOT_PUBLISHED
+    if status == "COMPLETE" and not merge_executor_enabled:
+        return LANDED
+    if (
+        status == "COMPLETE"
+        and merge_executor_enabled
+        and _latest_stage(connection, build_id, MERGE_OFFER_ROW) is None
+    ):
+        finished = _read_time(build[2] or build[3])
+        moment = now or datetime.now(timezone.utc)
+        if (
+            finished is not None
+            and (moment - finished).total_seconds() >= MERGE_CARD_GRACE_SECONDS
+        ):
+            return NO_MERGE_CARD
     return NOT_LANDED_YET
 
 
@@ -605,9 +706,12 @@ def _planning_state(connection: sqlite3.Connection, correlation_id: str) -> str 
     return str(row[0]) if row else None
 
 
-def _send_was_published(connection: sqlite3.Connection, build_id: str) -> bool:
-    """True when the build's publication record says the send landed."""
+def _was_published(connection: sqlite3.Connection, build_id: str) -> bool:
+    """True when the build's publication record says the work is on the remote:
+    a send recorded done and published, or a result that says published."""
     record = PublicationRecordStore(connection).read(build_id)
+    if record.result in _LANDED_RECORD_RESULTS:
+        return True
     return any(
         line.kind == LINE_DONE
         and line.step == STEP_SEND
@@ -616,13 +720,13 @@ def _send_was_published(connection: sqlite3.Connection, build_id: str) -> bool:
     )
 
 
-def _latest_stage_status(
+def _latest_stage(
     connection: sqlite3.Connection, build_id: str, target_identifier: str
-) -> str | None:
-    """The status on the newest stage row of one kind for a build, or None."""
+) -> tuple[str, str | None] | None:
+    """(status, details) of the newest stage row of one kind for a build."""
     try:
         row = connection.execute(
-            "SELECT status FROM stage_log WHERE build_id = ? "
+            "SELECT status, details_json FROM stage_log WHERE build_id = ? "
             "AND target_identifier = ? ORDER BY id DESC LIMIT 1",
             (build_id, target_identifier),
         ).fetchone()
@@ -630,7 +734,23 @@ def _latest_stage_status(
         if "no such table" in str(exc).lower():
             return None
         raise
-    return str(row[0]) if row else None
+    if row is None:
+        return None
+    return str(row[0]), (str(row[1]) if row[1] is not None else None)
+
+
+def _report_result(report: tuple[str, str | None] | None) -> str | None:
+    """The result word on a merge report row (``result`` in its details)."""
+    if report is None or not report[1]:
+        return None
+    try:
+        details = json.loads(report[1])
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(details, Mapping):
+        return None
+    word = details.get("result")
+    return str(word) if word else None
 
 
 # ---------------------------------------------------------------------------
@@ -663,6 +783,7 @@ class WorkQueueLoop:
         run_events: Callable[[str], Sequence[Mapping[str, Any] | sqlite3.Row]]
         | None = None,
         in_flight_database: sqlite3.Connection | None = None,
+        merge_executor_enabled: bool = True,
     ) -> None:
         """Wire the loop to the store and to the rest of the estate.
 
@@ -681,6 +802,11 @@ class WorkQueueLoop:
             with ValueError before the loop ever runs: a count taken on
             another file would be outside the admission's transaction, and
             the limit would be a guess.
+        merge_executor_enabled:
+            Whether the merge executor is switched on
+            (``merge_executor.enabled``). Off, no merge card is ever offered,
+            so a row waiting "after" another goes once that one's build
+            finished COMPLETE. On, it waits for the work to be published.
         planning_run:
             Reads one planning run by correlation id — the loop polls it to
             know when an admitted row has finished.
@@ -763,6 +889,7 @@ class WorkQueueLoop:
         self._merge_cards = merge_cards
         self._merge_offer_hold_seconds = merge_offer_hold_seconds
         self._run_events = run_events
+        self._merge_executor_enabled = merge_executor_enabled
         # What the loop has already said, so it does not say it every ten
         # seconds: the number it was last holding at, the set of repair
         # rows it last reported as waiting, and the set of merge cards it
@@ -1025,7 +1152,9 @@ class WorkQueueLoop:
 
         That is an antecedent that failed or was withdrawn in the queue, and
         one whose row closed DONE but whose build then failed, was cancelled,
-        failed to merge, or was turned down at the merge card.
+        failed to merge, was turned down at the merge card, was approved but
+        not published, or finished with no merge card offered — every state
+        that will not land without someone acting. Each is asked once.
         """
         for row in self._store.list_open():
             after_id = row["after_id"]
@@ -1035,7 +1164,7 @@ class WorkQueueLoop:
             if antecedent is None:
                 continue
             answer = self._antecedent_says(antecedent)
-            if answer not in (DID_NOT_LAND, MERGE_DECLINED):
+            if answer not in WILL_NOT_LAND_ON_ITS_OWN:
                 continue
             queue_id = int(row["id"])
             if self._store.has_event(queue_id, "hold_or_go"):
@@ -1050,6 +1179,10 @@ class WorkQueueLoop:
             # what he did, so he is not told a machine failure stopped it.
             if answer == MERGE_DECLINED:
                 what_happened = "was not merged (you said no at its merge card)"
+            elif answer == NOT_PUBLISHED:
+                what_happened = "was approved for merge but not published"
+            elif answer == NO_MERGE_CARD:
+                what_happened = "finished but no merge card was offered for it"
             elif closed_word(antecedent) == REJECTED_BY_OWNER:
                 what_happened = f"was {REJECTED_BY_OWNER}"
             else:
@@ -1513,7 +1646,7 @@ class WorkQueueLoop:
         answer = self._antecedent_says(antecedent)
         if answer in (LANDED, BUILT_NOTHING):
             return True
-        if answer in (DID_NOT_LAND, MERGE_DECLINED):
+        if answer in WILL_NOT_LAND_ON_ITS_OWN:
             return self._go_was_given(int(row["id"]))
         return False
 
@@ -1536,7 +1669,12 @@ class WorkQueueLoop:
             return NOT_LANDED_YET
         correlation_id = str(antecedent["correlation_id"])
         try:
-            return work_landing(self._store.connection, correlation_id)
+            return work_landing(
+                self._store.connection,
+                correlation_id,
+                merge_executor_enabled=self._merge_executor_enabled,
+                now=self._clock(),
+            )
         except sqlite3.Error as exc:
             logger.warning(
                 "work queue: could not read whether #%s's work has landed "
@@ -1816,8 +1954,12 @@ __all__ = [
     "BUILT_NOTHING",
     "DID_NOT_LAND",
     "LANDED",
+    "MERGE_CARD_GRACE_SECONDS",
     "MERGE_DECLINED",
     "NOT_LANDED_YET",
+    "NOT_PUBLISHED",
+    "NO_MERGE_CARD",
+    "WILL_NOT_LAND_ON_ITS_OWN",
     "BUILD_SUCCESS_STATES",
     "BUILD_TERMINAL_STATES",
     "BUILD_WRITTEN_STATE",

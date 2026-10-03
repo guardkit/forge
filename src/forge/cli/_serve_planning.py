@@ -1492,6 +1492,11 @@ async def compose_planning_consumer_and_dispatch(
             # transaction, so it must read the queue's own database; the loop
             # refuses to start if it does not.
             in_flight_database=pool,
+            # With the merge executor off no merge card is ever offered, so a
+            # row waiting "after" another goes once that build is COMPLETE.
+            merge_executor_enabled=bool(
+                getattr(getattr(config, "merge_executor", None), "enabled", False)
+            ),
             planning_run=store.get_run,
             # The run's own events, so a run Rich rejected at the spec card closes as
             # "rejected by you" rather than "blocked" (2026-09-06; the reject is only

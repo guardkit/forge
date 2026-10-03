@@ -39,11 +39,19 @@ from forge.lifecycle.persistence import SqliteLifecyclePersistence, StageLogEntr
 from forge.pipeline.merge_executor import (
     MERGE_REPORT_STAGE_LABEL,
     MERGE_REPORT_TARGET_IDENTIFIER,
+    RESULT_WORD_MERGED_AND_RUNNING,
+    RESULT_WORD_PUBLICATION_PENDING,
+    RESULT_WORD_PUBLISHED_DEPLOYMENT_PENDING,
 )
-from forge.pipeline.publication_record import STEP_SEND, PublicationRecordStore
+from forge.pipeline.publication_record import (
+    RESULT_PUBLISHED_DEPLOYMENT_PENDING,
+    STEP_SEND,
+    PublicationRecordStore,
+)
 from forge.planning.states import PlanningState
 from forge.planning.work_queue_loop import (
     LOOP_ACTOR,
+    MERGE_CARD_GRACE_SECONDS,
     Admission,
     WorkQueueLoop,
     count_in_flight,
@@ -163,14 +171,15 @@ def _insert_build_for(
     status: str,
     *,
     correlation_id: str,
+    completed_at: str | None = None,
 ) -> None:
     cx.execute(
         """
         INSERT INTO builds (
             build_id, feature_id, repo, branch, feature_yaml_path, status,
             triggered_by, correlation_id, queued_at, max_turns,
-            sdk_timeout_seconds, mode
-        ) VALUES (?, ?, ?, ?, ?, ?, 'cli', ?, ?, 50, 3600, 'mode-b')
+            sdk_timeout_seconds, mode, completed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, 'cli', ?, ?, 50, 3600, 'mode-b', ?)
         """,
         (
             build_id,
@@ -181,6 +190,7 @@ def _insert_build_for(
             status,
             correlation_id,
             START.isoformat(),
+            completed_at,
         ),
     )
 
@@ -281,6 +291,41 @@ class TestTheCountAndTheAdmissionAreOneStep:
         _insert_build_for(cx, "build-A", "RUNNING", correlation_id="corr-A")
 
         assert count_in_flight(cx) == 2
+
+    def test_an_admitted_row_stops_counting_once_its_work_is_written(
+        self, db_path: Path
+    ) -> None:
+        """Once the run or the build exists it speaks for itself: a repair
+        whose build was marked INTERRUPTED stays uncounted although its row is
+        still admitted, and so does a row whose run has handed over."""
+        cx = _open(db_path)
+        store = WorkQueueStore(cx)
+        repair = file_row(store, "corr-fix", kind="fix")
+        feature = file_row(store, "corr-feature")
+        store.admit(repair, actor_identity=LOOP_ACTOR)
+        store.admit(feature, actor_identity=LOOP_ACTOR)
+        _insert_build_for(cx, "build-fix", "INTERRUPTED", correlation_id="corr-fix")
+        _insert_run(cx, "corr-feature", PlanningState.BUILD_QUEUED.value)
+
+        assert count_in_flight(cx) == 0
+
+    def test_an_admission_inside_someone_elses_transaction_is_refused(
+        self, db_path: Path
+    ) -> None:
+        cx = _open(db_path)
+        store = WorkQueueStore(cx)
+        queue_id = file_row(store, "corr-A")
+        cx.execute("BEGIN")  # deferred: holds no write lock
+        try:
+            with pytest.raises(RuntimeError, match="BEGIN IMMEDIATE"):
+                store.admit(
+                    queue_id,
+                    actor_identity=LOOP_ACTOR,
+                    max_in_flight=1,
+                    count_in_flight=lambda: 0,
+                )
+        finally:
+            cx.execute("ROLLBACK")
 
     def test_a_build_and_its_open_merge_card_count_once(
         self, db_path: Path
@@ -405,6 +450,7 @@ def _record_stage(
     label: str,
     target: str,
     status: str,
+    details: dict[str, Any] | None = None,
 ) -> None:
     SqliteLifecyclePersistence(connection=cx).record_stage(
         StageLogEntry(
@@ -417,8 +463,20 @@ def _record_stage(
             started_at=START,
             completed_at=START,
             duration_secs=0.0,
-            details={},
+            details=details or {},
         )
+    )
+
+
+def _report(cx: sqlite3.Connection, build_id: str, *, status: str, result: str) -> None:
+    """The merge executor's outcome report, with its result word."""
+    _record_stage(
+        cx,
+        build_id,
+        label=MERGE_REPORT_STAGE_LABEL,
+        target=MERGE_REPORT_TARGET_IDENTIFIER,
+        status=status,
+        details={"result": result},
     )
 
 
@@ -457,7 +515,6 @@ _STAGES: tuple[str, ...] = (
     "at its merge card",
     "approved, waiting for the merge lock",
     "merging",
-    "joined and checked, not yet published",
 )
 
 
@@ -484,10 +541,7 @@ def _bring_a_to(cx: sqlite3.Connection, store: WorkQueueStore, a_id: int, stage:
     _answer_merge_card(cx, "build-A", answered_at=START, decision="approve")
     if stage == "approved, waiting for the merge lock":
         return
-    if stage == "merging":
-        _send(cx, "build-A", published=None)
-        return
-    _send(cx, "build-A", published=False)
+    _send(cx, "build-A", published=None)
 
 
 class TestAfterWaitsForTheWorkToLand:
@@ -534,6 +588,111 @@ class TestAfterWaitsForTheWorkToLand:
         assert await loop.take_next() == b_id
 
     @pytest.mark.asyncio
+    async def test_work_a_later_press_found_on_the_remote_has_landed(
+        self, db_path: Path
+    ) -> None:
+        """A press that finds the work already published writes a result, not
+        a new send line; that result is enough."""
+        cx, store, a_id, b_id, _c_id = self._queue(db_path)
+        _bring_a_to(cx, store, a_id, "approved, waiting for the merge lock")
+        record = PublicationRecordStore(cx)
+        grant = record.take_lease(build_id="build-A", holder="press", now=START)
+        assert grant is not None
+        assert record.record(
+            build_id="build-A",
+            turn=grant.turn,
+            now=START,
+            result=RESULT_PUBLISHED_DEPLOYMENT_PENDING,
+        )
+        loop = a_loop(cx, limit=2, clock=FakeClock(), hold_seconds=A_DAY)
+
+        assert await loop.take_next() == b_id
+
+    @pytest.mark.asyncio
+    async def test_a_report_saying_merged_and_running_has_landed(
+        self, db_path: Path
+    ) -> None:
+        cx, store, a_id, b_id, _c_id = self._queue(db_path)
+        _bring_a_to(cx, store, a_id, "approved, waiting for the merge lock")
+        _report(cx, "build-A", status="PASSED", result=RESULT_WORD_MERGED_AND_RUNNING)
+        loop = a_loop(cx, limit=2, clock=FakeClock(), hold_seconds=A_DAY)
+
+        assert await loop.take_next() == b_id
+
+    @pytest.mark.asyncio
+    async def test_work_that_lands_after_the_question_still_lets_b_go(
+        self, db_path: Path
+    ) -> None:
+        cx, store, a_id, b_id, c_id = self._queue(db_path)
+        _bring_a_to(cx, store, a_id, "merging")
+        _report(
+            cx, "build-A", status="GATED", result=RESULT_WORD_PUBLICATION_PENDING
+        )
+        notifier = Notifier()
+        loop = a_loop(
+            cx, limit=3, clock=FakeClock(), notifier=notifier, hold_seconds=A_DAY
+        )
+        await loop.ask_hold_or_go()
+        assert len(notifier.messages) == 1
+        assert await loop.take_next() == c_id
+
+        # The next press publishes it; nobody said "go".
+        _report(
+            cx,
+            "build-A",
+            status="PASSED",
+            result=RESULT_WORD_PUBLISHED_DEPLOYMENT_PENDING,
+        )
+        await loop.ask_hold_or_go()
+        assert len(notifier.messages) == 1
+        assert await loop.take_next() == b_id
+
+    @pytest.mark.asyncio
+    async def test_with_the_merge_executor_off_a_complete_build_is_enough(
+        self, db_path: Path
+    ) -> None:
+        """No merge card is ever offered, so finishing is as far as A goes —
+        the queue's behaviour from before."""
+        cx, store, a_id, b_id, _c_id = self._queue(db_path)
+        _bring_a_to(cx, store, a_id, "building")
+        cx.execute("UPDATE builds SET status = 'COMPLETE' WHERE build_id = 'build-A'")
+        loop = a_loop(cx, limit=2, clock=FakeClock(), merge_executor_enabled=False)
+
+        assert await loop.take_next() == b_id
+
+    @pytest.mark.asyncio
+    async def test_a_complete_build_with_no_card_is_asked_about_after_ten_minutes(
+        self, db_path: Path
+    ) -> None:
+        cx, store, a_id, b_id, c_id = self._queue(db_path)
+        _bring_a_to(cx, store, a_id, "building")
+        cx.execute(
+            "UPDATE builds SET status = 'COMPLETE', completed_at = ? "
+            "WHERE build_id = 'build-A'",
+            (START.isoformat(),),
+        )
+        clock = FakeClock()
+        notifier = Notifier()
+        loop = a_loop(cx, limit=3, clock=clock, notifier=notifier)
+
+        # Just finished: the card may be on its way; nothing is asked.
+        await loop.ask_hold_or_go()
+        assert notifier.messages == []
+        assert await loop.take_next() == c_id
+        clock.advance(MERGE_CARD_GRACE_SECONDS - 1)
+        await loop.ask_hold_or_go()
+        assert notifier.messages == []
+
+        clock.advance(1)
+        await loop.ask_hold_or_go()
+        await loop.ask_hold_or_go()
+        assert notifier.messages == [
+            f"#{a_id} finished but no merge card was offered for it and "
+            f"#{b_id} was waiting on it — hold or go?"
+        ]
+        assert _statuses(cx)["corr-B"] == "QUEUED"
+
+    @pytest.mark.asyncio
     async def test_a_repair_lands_the_same_way(self, db_path: Path) -> None:
         """A repair's work is its build; B waits for that build's publication."""
         cx, store, a_id, b_id, c_id = self._queue(db_path, a_kind="fix")
@@ -565,7 +724,14 @@ class TestAfterWaitsForTheWorkToLand:
 
     @pytest.mark.parametrize(
         "what_happened",
-        ("merge declined", "build failed", "build cancelled", "merge failed"),
+        (
+            "merge declined",
+            "build failed",
+            "build cancelled",
+            "merge failed",
+            "publication pending",
+            "publication switched off",
+        ),
     )
     @pytest.mark.asyncio
     async def test_a_that_did_not_land_asks_hold_or_go(
@@ -592,13 +758,27 @@ class TestAfterWaitsForTheWorkToLand:
                 _answer_merge_card(
                     cx, "build-A", answered_at=START, decision="approve"
                 )
-                _record_stage(
-                    cx,
-                    "build-A",
-                    label=MERGE_REPORT_STAGE_LABEL,
-                    target=MERGE_REPORT_TARGET_IDENTIFIER,
-                    status="FAILED",
-                )
+                if what_happened == "merge failed":
+                    _report(
+                        cx, "build-A", status="FAILED", result="merged-verify-failed"
+                    )
+                elif what_happened == "publication pending":
+                    # The publisher refused, could not be reached, or the
+                    # attempts ran out: checked, not sent.
+                    _report(
+                        cx,
+                        "build-A",
+                        status="GATED",
+                        result=RESULT_WORD_PUBLICATION_PENDING,
+                    )
+                else:
+                    # Publication switched off: both checks ran and passed.
+                    _report(
+                        cx,
+                        "build-A",
+                        status="PASSED",
+                        result=RESULT_WORD_PUBLICATION_PENDING,
+                    )
         notifier = Notifier()
         loop = a_loop(
             cx, limit=2, clock=FakeClock(), notifier=notifier, hold_seconds=A_DAY
@@ -618,6 +798,25 @@ class TestAfterWaitsForTheWorkToLand:
         # Go: B is taken once someone puts it next.
         store.promote(b_id, actor_identity=USER)
         assert await loop.take_next() == b_id
+
+    @pytest.mark.asyncio
+    async def test_an_unpublished_merge_is_said_plainly(
+        self, db_path: Path
+    ) -> None:
+        cx, store, a_id, b_id, _c_id = self._queue(db_path)
+        _bring_a_to(cx, store, a_id, "merging")
+        _report(
+            cx, "build-A", status="GATED", result=RESULT_WORD_PUBLICATION_PENDING
+        )
+        notifier = Notifier()
+        loop = a_loop(cx, limit=2, clock=FakeClock(), notifier=notifier)
+
+        await loop.ask_hold_or_go()
+
+        assert notifier.messages == [
+            f"#{a_id} was approved for merge but not published and "
+            f"#{b_id} was waiting on it — hold or go?"
+        ]
 
     @pytest.mark.asyncio
     async def test_a_declined_merge_is_said_as_his_answer_not_as_a_failure(
