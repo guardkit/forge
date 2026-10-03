@@ -196,6 +196,8 @@ class TestYamlRoundTrip:
                 "progress_interval_seconds": 90,
                 "build_queue_subject": "pipeline.build-queued.team-a",
                 "approved_originators": ["terminal", "slack"],
+                # How many builds may hold a place at once (default 1).
+                "max_concurrent_builds": 1,
             },
             "approval": {
                 "default_wait_seconds": 300,
