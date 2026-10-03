@@ -2006,10 +2006,25 @@ def existing_fix_task_ids_in_sandbox(clone: _SandboxClone, feature_id: str) -> s
     """
     from forge.pipeline.repair_branch import repair_branch_name
 
+    def unknown() -> FixAdmissionRefused:
+        # Unknown is not free: taking the number could write over a repair
+        # whose task file or branch is already there.
+        return FixAdmissionRefused(
+            "Nothing was queued: the next repair number for "
+            f"{feature_id} could not be established, because "
+            f"{clone.not_read[-1]}. It will be tried again.",
+            reason="repair-number",
+            permanent=False,
+        )
+
     head = "/".join(FEATURES_DIR_PARTS) + "/"
+    before = len(clone.not_read)
+    listed = clone.tracked_under(head + "TASK-")
+    if len(clone.not_read) > before:  # a failed or cut listing is not empty
+        raise unknown()
     names = {
         Path(path).stem.upper()
-        for path in clone.tracked_under(head + "TASK-")
+        for path in listed
         if path.count("/") == len(FEATURES_DIR_PARTS)
         and path.endswith((".yaml", ".yml"))
     }
@@ -2017,15 +2032,7 @@ def existing_fix_task_ids_in_sandbox(clone: _SandboxClone, feature_id: str) -> s
         candidate = mint_fix_task_id(feature_id, existing=names)
         exists = clone.branch_exists(repair_branch_name(candidate))
         if exists is None:
-            # Unknown is not free: taking the number could write over a
-            # repair that already rides that branch.
-            raise FixAdmissionRefused(
-                "Nothing was queued: the next repair number for "
-                f"{feature_id} could not be established, because "
-                f"{clone.not_read[-1]}. It will be tried again.",
-                reason="repair-number",
-                permanent=False,
-            )
+            raise unknown()
         if not exists:
             return names
         names.add(candidate)
