@@ -592,6 +592,79 @@ def _read_build_identity(
     return str(build_id), state
 
 
+def _queue_order_key(queued_at: Any, correlation_id: str) -> tuple[datetime, str]:
+    """Order builds of one feature by when they were queued (then correlation).
+
+    ``queued_at`` is a stored ISO-8601 string or a ``datetime``; a value
+    without a timezone is read as UTC, matching how rows are written.
+    """
+    value = (
+        queued_at
+        if isinstance(queued_at, datetime)
+        else datetime.fromisoformat(str(queued_at))
+    )
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return (value, correlation_id)
+
+
+def _another_build_of_feature_goes_first(
+    sqlite_pool: SqliteLifecyclePersistence,
+    payload: Any,
+    started: set[str],
+) -> tuple[bool, str | None]:
+    """Decide whether another build of this feature keeps it (one at a time).
+
+    The lifecycle bridge tracks one live build per feature, so only one
+    build of a feature may be active at once. Another ACTIVE build of the
+    same feature with a different correlation goes first when:
+
+    * it is past QUEUED (an approval card, a runner or the merge step owns
+      it already);
+    * it is still QUEUED but this daemon already let it through (``started``
+      holds the correlations it let through for this feature); or
+    * it is still QUEUED, not yet let through (a row written ahead by the
+      CLI or the fix journey), and was queued earlier than this one.
+
+    Synchronous on purpose: the caller runs it and then writes its own row
+    with no ``await`` in between, so within the daemon's single event loop
+    the check and the write cannot interleave with another dispatch.
+
+    Returns:
+        ``(refuse, own_build_id)`` — ``own_build_id`` is this delivery's own
+        row when one was written ahead and is still QUEUED, else ``None``.
+        A delivery whose own row is already past QUEUED, or that this
+        daemon already let through, is a redelivery: it returns
+        ``(False, None)`` and the existing duplicate handling decides.
+    """
+    from forge.lifecycle.persistence import ACTIVE_STATES
+
+    active_values = tuple(s.value for s in ACTIVE_STATES)
+    placeholders = ",".join("?" * len(active_values))
+    with sqlite_pool._reader() as cx:
+        rows = cx.execute(
+            "SELECT build_id, correlation_id, status, queued_at FROM builds "
+            f"WHERE feature_id = ? AND status IN ({placeholders})",
+            (payload.feature_id, *active_values),
+        ).fetchall()
+    own = [r for r in rows if r[1] == payload.correlation_id]
+    others = [r for r in rows if r[1] != payload.correlation_id]
+    own_build_id: str | None = None
+    if own:
+        if own[0][2] != BuildState.QUEUED.value or payload.correlation_id in started:
+            return False, None
+        own_build_id = str(own[0][0])
+        mine = _queue_order_key(own[0][3], payload.correlation_id)
+    else:
+        mine = _queue_order_key(payload.queued_at, payload.correlation_id)
+    for _build_id, correlation_id, status, queued_at in others:
+        if status != BuildState.QUEUED.value or correlation_id in started:
+            return True, own_build_id
+        if _queue_order_key(queued_at, correlation_id) < mine:
+            return True, own_build_id
+    return False, own_build_id
+
+
 def _read_build_status(
     sqlite_pool: SqliteLifecyclePersistence,
     *,
@@ -922,6 +995,11 @@ def _build_dispatch_build(
             return None
         return await launch(**launch_kwargs)
 
+    # Correlations this daemon has let through, per feature, for the
+    # one-build-per-feature check below. Only ever compared against rows
+    # that are still ACTIVE, so finished builds never block anything.
+    started_by_feature: dict[str, set[str]] = {}
+
     async def dispatch_build(
         payload: "BuildQueuedPayload",
         ack_callback,
@@ -1096,6 +1174,62 @@ def _build_dispatch_build(
                 "lives in TASK-FW10-008 (Supervisor + AsyncSubAgentMiddleware); "
                 "tests should pass a fake starter via the kwarg."
             )
+
+        # One build of a feature at a time (the lifecycle bridge tracks one
+        # live build per feature). Every intake reaches this point, and with
+        # several build places two builds of one feature could otherwise run
+        # side by side. The check below and the row write after it have NO
+        # await between them, so they cannot interleave with another
+        # dispatch on this event loop. First come wins; rows written ahead
+        # by the CLI or the fix journey go in the order they were queued.
+        started = started_by_feature.setdefault(payload.feature_id, set())
+        try:
+            refuse, own_build_id = _another_build_of_feature_goes_first(
+                sqlite_pool, payload, started
+            )
+        except (AttributeError, sqlite3.Error, ValueError) as exc:
+            logger.error(
+                "dispatch_build: could not check other builds of feature_id=%s "
+                "(%s); holding WITHOUT terminal event or ack",
+                payload.feature_id,
+                exc,
+            )
+            return
+        if not refuse:
+            started.add(payload.correlation_id)
+        else:
+            reason = f"another build of {payload.feature_id} is already in progress"
+            logger.warning(
+                "dispatch_build: %s; refusing correlation_id=%s",
+                reason,
+                payload.correlation_id,
+            )
+            if own_build_id is not None:
+                # Its row was written ahead; close it so it never counts as
+                # active work again.
+                reason = fail_mode_c_build(
+                    sqlite_pool,
+                    own_build_id,
+                    summary=reason,
+                    what="a second build of the same feature",
+                    log=logger,
+                )
+            if lifecycle_emitter is not None:
+                from forge.pipeline import BuildContext
+
+                await lifecycle_emitter.emit_failed(
+                    BuildContext(
+                        feature_id=payload.feature_id,
+                        build_id=own_build_id or "",
+                        correlation_id=payload.correlation_id,
+                        wave_total=1,
+                    ),
+                    failure_reason=reason,
+                    recoverable=False,
+                    failed_task_id=None,
+                )
+            await ack_callback()
+            return
 
         try:
             build_id = sqlite_pool.record_pending_build(payload)
