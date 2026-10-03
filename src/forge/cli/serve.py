@@ -2702,7 +2702,11 @@ async def _run_ack_watchdog(
                     report.pending_seq,
                     report.detail,
                 )
-            elif report.status == "held" and report.num_ack_pending >= limit:
+            elif (
+                report.status == "held"
+                and limit > 1
+                and report.num_ack_pending >= limit
+            ):
                 logger.info(
                     "forge-serve: ack-slot watchdog — all places taken: %d "
                     "outstanding of build limit %d (at least one is a real "

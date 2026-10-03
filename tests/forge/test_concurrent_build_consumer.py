@@ -132,7 +132,11 @@ class _JS:
         info.config = ConsumerConfig(max_ack_pending=self.existing_limit)
         return info
 
+    refuse_update: Exception | None = None
+
     async def add_consumer(self, stream: str, config: ConsumerConfig) -> Any:
+        if self.refuse_update is not None:
+            raise self.refuse_update
         self.added.append(config)
         self.existing_limit = config.max_ack_pending
         return Mock()
@@ -197,6 +201,29 @@ class TestAttachUsesTheLimit:
             ServeConfig(max_concurrent_builds=2), _Client(js), lambda: js.subscribed
         )
         assert js.added == []
+
+
+    @pytest.mark.asyncio
+    async def test_refused_update_binds_unchanged_and_says_why(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from nats.js.errors import ServerError
+
+        js = _JS(_Sub(), existing_limit=1)
+        js.refuse_update = ServerError(
+            code=500, err_code=10012, description="deliver policy can not be updated"
+        )
+        caplog.set_level(logging.ERROR, logger="forge.cli._serve_daemon")
+        await _run_until(
+            ServeConfig(max_concurrent_builds=2), _Client(js), lambda: js.subscribed
+        )
+        assert js.subscribed is not None, "the existing durable is still bound"
+        assert js.existing_limit == 1
+        errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(errors) == 1
+        assert "pipeline.max_concurrent_builds" in errors[0]
+        assert "it is 1 on the broker, configured 2" in errors[0]
+        assert "deliver policy can not be updated" in errors[0]
 
 
 # ---------------------------------------------------------------------------
@@ -334,6 +361,100 @@ class TestHealthWithSeveralOutstanding:
         report = await inspect_ack_slot(js, STREAM, DURABLE)
 
         assert "3 outstanding" in report.detail
+
+
+class TestFloorAtOrPastDelivered:
+    """Outstanding > 0 but no range to search: the old single probe decides."""
+
+    @pytest.mark.asyncio
+    async def test_present_is_held(self) -> None:
+        js = AsyncMock()
+        js.consumer_info.return_value = _info(pending=1, floor=20, delivered=20)
+        js.get_msg.return_value = object()
+
+        report = await inspect_ack_slot(js, STREAM, DURABLE)
+
+        assert report.status == "held"
+        assert report.pending_seq == 20
+        js.get_msg.assert_awaited_once_with(STREAM, seq=20)
+
+    @pytest.mark.asyncio
+    async def test_gone_is_phantom(self) -> None:
+        js = AsyncMock()
+        js.consumer_info.return_value = _info(pending=1, floor=21, delivered=20)
+        js.get_msg.side_effect = NotFoundError()
+
+        report = await inspect_ack_slot(js, STREAM, DURABLE)
+
+        assert report.status == "phantom"
+        assert report.pending_seq == 20
+        js.get_msg.assert_awaited_once_with(STREAM, seq=20)
+
+    @pytest.mark.asyncio
+    async def test_probe_error_is_unknown(self) -> None:
+        js = AsyncMock()
+        js.consumer_info.return_value = _info(pending=1, floor=20, delivered=20)
+        js.get_msg.side_effect = TimeoutError("slow")
+
+        report = await inspect_ack_slot(js, STREAM, DURABLE)
+
+        assert report.status == "unknown"
+
+
+async def _one_watchdog_tick(
+    monkeypatch: pytest.MonkeyPatch, info: Mock, limit: int
+) -> None:
+    from forge.cli import serve
+
+    js = AsyncMock()
+    js.consumer_info.return_value = info
+    js.get_msg.return_value = _found(12)
+    client = Mock()
+    client.jetstream = Mock(return_value=js)
+    state = SubscriptionState()
+    fired = asyncio.Event()
+    real_set = state.set_ack_slot
+
+    async def _record(status: str) -> None:
+        await real_set(status)
+        fired.set()
+
+    monkeypatch.setattr(state, "set_ack_slot", _record)
+    task = asyncio.create_task(
+        serve._run_ack_watchdog(
+            client, ServeConfig(max_concurrent_builds=limit), state, 0.01
+        )
+    )
+    try:
+        await asyncio.wait_for(fired.wait(), timeout=2)
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
+class TestAllPlacesTakenLine:
+    @pytest.mark.asyncio
+    async def test_limit_one_adds_no_new_line(
+        self, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        caplog.set_level(logging.DEBUG, logger="forge.cli.serve")
+        await _one_watchdog_tick(
+            monkeypatch, _info(pending=1, floor=10, delivered=12), limit=1
+        )
+        assert "all places taken" not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_limit_two_full_is_reported(
+        self, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        caplog.set_level(logging.INFO, logger="forge.cli.serve")
+        await _one_watchdog_tick(
+            monkeypatch, _info(pending=2, floor=10, delivered=14), limit=2
+        )
+        assert "all places taken: 2 outstanding of build limit 2" in caplog.text
 
 
 class TestWatchdogText:

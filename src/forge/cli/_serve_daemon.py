@@ -270,8 +270,13 @@ async def _attach_consumer(
     update because only editable fields change). Builds already holding a
     place keep it: lowering the limit only stops new messages being handed
     out until fewer than the new limit are outstanding. Any error other
-    than "consumer absent" propagates to :func:`run_daemon`, which treats
-    it like a broker error and retries the attach.
+    than "consumer absent" from reading the durable propagates to
+    :func:`run_daemon`, which treats it like a broker error and retries the
+    attach. If the broker refuses the *update* (for example a durable made
+    by hand with a deliver policy that cannot be edited), an ERROR names
+    the setting, both values and the broker's reason, and the existing
+    durable is bound unchanged — today's behaviour — rather than retrying
+    forever.
 
     Args:
         client: Connected NATS client.
@@ -283,7 +288,7 @@ async def _attach_consumer(
             the parameter exists so broker tests can use a short wait.
     """
     from nats.js.api import AckPolicy, ConsumerConfig, DeliverPolicy
-    from nats.js.errors import NotFoundError
+    from nats.js.errors import APIError, NotFoundError
 
     js = client.jetstream()
     config = ConsumerConfig(
@@ -310,14 +315,31 @@ async def _attach_consumer(
     if live is not None:
         live_limit = getattr(getattr(live, "config", None), "max_ack_pending", None)
         if live_limit != max_ack_pending:
-            await js.add_consumer(PIPELINE_STREAM_NAME, config)
-            logger.info(
-                "forge-serve: build limit on consumer '%s' changed from %s to "
-                "%d (pipeline.max_concurrent_builds)",
-                durable_name,
-                live_limit,
-                max_ack_pending,
-            )
+            try:
+                await js.add_consumer(PIPELINE_STREAM_NAME, config)
+            except APIError as exc:
+                # The broker refused the update (for example a durable made
+                # by hand with a different deliver policy, which cannot be
+                # edited). Keep today's behaviour — bind the durable as it
+                # is — and say plainly that the setting did not take effect.
+                logger.error(
+                    "forge-serve: could not apply pipeline.max_concurrent_builds "
+                    "to consumer '%s': it is %s on the broker, configured %d; "
+                    "the broker refused the update (%s). Binding the existing "
+                    "durable unchanged, so builds run at the broker's value.",
+                    durable_name,
+                    live_limit,
+                    max_ack_pending,
+                    getattr(exc, "description", None) or exc,
+                )
+            else:
+                logger.info(
+                    "forge-serve: build limit on consumer '%s' changed from %s "
+                    "to %d (pipeline.max_concurrent_builds)",
+                    durable_name,
+                    live_limit,
+                    max_ack_pending,
+                )
     return await js.pull_subscribe(
         subject=BUILD_QUEUED_SUBJECT_FILTER,
         durable=durable_name,
