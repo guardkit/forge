@@ -1,0 +1,79 @@
+id: FEAT-FFEC
+name: "Get Users Created Per Day"
+description: "Add endpoint returning user creation counts for the last 7 days"
+created: "2026-07-09T14:32:00Z"
+status: planned
+complexity: 4
+estimated_tasks: 4
+
+tasks:
+  - id: TASK-FFEC-001
+    name: "Implement creation statistics query"
+    file_path: "tasks/backlog/get-users-created-per-day/TASK-FFEC-001-implement-creation-statistics-query.md"
+    complexity: 4
+    dependencies: []
+    status: pending
+    implementation_mode: task-work
+    estimated_minutes: 60
+
+  - id: TASK-FFEC-002
+    name: "Add endpoint to router"
+    file_path: "tasks/backlog/get-users-created-per-day/TASK-FFEC-002-add-endpoint-to-router.md"
+    complexity: 3
+    dependencies:
+      - TASK-FFEC-001
+    status: pending
+    implementation_mode: direct
+    estimated_minutes: 30
+
+  - id: TASK-FFEC-003
+    name: "Create response schemas"
+    file_path: "tasks/backlog/get-users-created-per-day/TASK-FFEC-003-create-response-schemas.md"
+    complexity: 3
+    dependencies:
+      - TASK-FFEC-001
+    status: pending
+    implementation_mode: direct
+    estimated_minutes: 30
+
+  - id: TASK-FFEC-004
+    name: "Add integration tests"
+    file_path: "tasks/backlog/get-users-created-per-day/TASK-FFEC-004-add-integration-tests.md"
+    complexity: 4
+    dependencies:
+      - TASK-FFEC-002
+      - TASK-FFEC-003
+    status: pending
+    implementation_mode: task-work
+    estimated_minutes: 60
+
+orchestration:
+  parallel_groups:
+    - - TASK-FFEC-001
+    - - TASK-FFEC-002
+      - TASK-FFEC-003
+    - - TASK-FFEC-004
+  estimated_duration_minutes: 180
+  recommended_parallel: 2
+scenario_owners:
+  "A request to the endpoint returns exactly seven days of counts ordered oldest to newest": TASK-FFEC-002
+  "The endpoint includes today and the six preceding days": TASK-FFEC-002
+  "The endpoint does not include data older than six days before today": TASK-FFEC-002
+  "Soft-deleted users are included in the daily counts": TASK-FFEC-002
+  "Days with no user creations are returned with a count of zero": TASK-FFEC-002
+# feature_files: the repo-relative path(s) at which this feature's
+# specification is committed on the target branch, supplied with the
+# planning request. The scenario universe is explicit, never inferred.
+feature_files:
+  - "features/get-users-created-per-day/get-users-created-per-day.feature"
+scenarios:
+  "A request to the endpoint returns exactly seven days of counts ordered oldest to newest":
+    verifier: "hurl"
+  "The endpoint includes today and the six preceding days":
+    verifier: "hurl"
+  "The endpoint does not include data older than six days before today":
+    verifier: "hurl"
+  "Soft-deleted users are included in the daily counts":
+    verifier: "hurl"
+  "Days with no user creations are returned with a count of zero":
+    verifier: "hurl"
