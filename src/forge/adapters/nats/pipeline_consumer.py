@@ -222,6 +222,34 @@ class PipelineConsumerDeps:
     # once its runner confirms everything it owns is gone. ``None`` acks at
     # once, as before.
     ack_guard: Any = None
+    # A build refused before any build row is written (3 October 2026) —
+    # ``(correlation_id, reason) -> Any``, in production the work queue's
+    # ``record_build_rejection``. It notes the refusal on the sentence's queue
+    # row, so a row waiting "after" it is asked "hold or go" instead of
+    # waiting for ever. ``None`` notes nothing, as before.
+    record_build_rejection: Callable[[str, str], Any] | None = None
+
+
+def note_build_rejection(
+    record: Callable[[str, str], Any] | None, correlation_id: str, reason: str
+) -> None:
+    """Note a build refused before its row was written; never raises.
+
+    The note is a courtesy to the work queue: losing it must never cost the
+    refusal itself, its acknowledgement or its failure event.
+    """
+    if record is None:
+        return
+    try:
+        record(correlation_id, reason)
+    except Exception as exc:  # noqa: BLE001 — a note never stops a refusal
+        logger.warning(
+            "pipeline_consumer: could not note the refused build for "
+            "correlation_id=%s on the work queue (%s: %s)",
+            correlation_id,
+            type(exc).__name__,
+            exc,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -495,6 +523,11 @@ async def handle_message(msg: _MsgLike, deps: PipelineConsumerDeps) -> None:
             payload.originating_adapter,
             payload.triggered_by,
         )
+        note_build_rejection(
+            deps.record_build_rejection,
+            payload.correlation_id,
+            f"it was sent by {originator}, which is not approved to start builds",
+        )
         await msg.ack()
         await _safe_publish_failure(
             deps,
@@ -516,6 +549,12 @@ async def handle_message(msg: _MsgLike, deps: PipelineConsumerDeps) -> None:
             "feature_id=%s; rejecting",
             payload.feature_yaml_path,
             payload.feature_id,
+        )
+        note_build_rejection(
+            deps.record_build_rejection,
+            payload.correlation_id,
+            f"its feature file {payload.feature_yaml_path} is outside the "
+            "folders builds may read",
         )
         await msg.ack()
         await _safe_publish_failure(
