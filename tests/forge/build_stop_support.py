@@ -61,8 +61,13 @@ FAKE_GUARDKIT = textwrap.dedent(
             return False
         return now == start and state not in ("Z", "X")
 
+    # A second launch of the same build (a relaunch) records under its own
+    # name, and first says whether the first launch's processes were alive.
+    relaunch = os.path.exists(os.path.join(records, feature + ".pids"))
+    name = feature + (".relaunch" if relaunch else "")
+    must_be_gone = spec.get("must_be_gone", []) + ([feature] if relaunch else [])
     others = {{}}
-    for other in spec.get("must_be_gone", []):
+    for other in must_be_gone:
         try:
             recorded = json.load(open(os.path.join(records, other + ".pids")))
         except OSError:
@@ -93,14 +98,16 @@ FAKE_GUARDKIT = textwrap.dedent(
     ]
     time.sleep(0.3)
     pids = [os.getpid()] + [p.pid for p in procs]
-    tmp = os.path.join(records, feature + ".pids.tmp")
+    tmp = os.path.join(records, name + ".pids.tmp")
     json.dump([[p, starttime(p)[1]] for p in pids], open(tmp, "w"))
-    os.replace(tmp, os.path.join(records, feature + ".pids"))
-    tmp = os.path.join(records, feature + ".started.tmp")
+    os.replace(tmp, os.path.join(records, name + ".pids"))
+    tmp = os.path.join(records, name + ".started.tmp")
     json.dump({{"at": time.time(), "others_alive": others}}, open(tmp, "w"))
-    os.replace(tmp, os.path.join(records, feature + ".started"))
+    os.replace(tmp, os.path.join(records, name + ".started"))
     print("== guardkit autobuild start ==", flush=True)
-    time.sleep(spec.get("run_seconds", 600))
+    time.sleep(
+        spec.get("relaunch_run_seconds", 600) if relaunch else spec.get("run_seconds", 600)
+    )
     for p in procs:
         p.kill()
     sys.exit(spec.get("exit", 0))
