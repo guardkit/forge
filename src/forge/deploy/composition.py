@@ -277,6 +277,11 @@ async def dispatch_deploy_stage(
     * ``"candidate_check"`` — :meth:`DeployStageRunner.candidate_check`, with
       ``candidate_cwd`` as the candidate's working directory (the feature
       branch's laid-out tree);
+    * ``candidate_cwd`` on any of the three legs below is where that leg runs
+      the project's own steps. The merge press sends it only for a repository
+      with a sandbox, as the tree laid out at the commit the leg is about (3
+      October 2026; see :meth:`DeployStageRunner.promote`). Absent ⇒ the
+      profile's ``cwd``, as before;
     * ``"promote"`` — :meth:`DeployStageRunner.promote`, with ``prior_events``
       the events the candidate leg already published for this run;
     * ``"candidate_down"`` — :meth:`DeployStageRunner.candidate_down`;
@@ -353,6 +358,7 @@ async def dispatch_deploy_stage(
             ask_env=dict(ask_env or {}),
             memory_project=memory_project,
             launch_settings=tuple(launch_settings),
+            scripts_cwd=candidate_cwd,
         )
     if leg == "promote":
         return await runner.promote(
@@ -373,6 +379,7 @@ async def dispatch_deploy_stage(
             memory_project=memory_project,
             launch_settings=tuple(launch_settings),
             identity_env=identity_env,
+            scripts_cwd=candidate_cwd,
         )
     if leg == "candidate_down":
         return await runner.candidate_down(
@@ -392,6 +399,7 @@ async def dispatch_deploy_stage(
             # says so, and the press dispatches no teardown at all for a
             # project that declares no identity.
             identity_env=identity_env,
+            scripts_cwd=candidate_cwd,
         )
     raise ValueError(
         f"unknown deploy leg {leg!r} — expected 'deploy', 'candidate_check', "

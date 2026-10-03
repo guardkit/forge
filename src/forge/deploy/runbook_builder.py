@@ -193,9 +193,12 @@ def build_deploy_runbook(
             (``<checkout>/.forge-candidates/<FEAT-id>``), so the repository's
             own deploy script — found relative to that directory, and
             anchoring itself to it — builds the candidate from the exact
-            commit the merge will land. The promote leg never passes it: it
-            runs from the checkout and re-tags the image the candidate built.
-            ``None`` ⇒ the profile's ``cwd``, exactly as before.
+            commit the merge will land. The promote leg passes it only for a
+            repository with a sandbox, whose clone's working copy nothing
+            keeps up to date: there it is the tree of the joined commit being
+            deployed, so the script that re-tags the image the candidate built
+            is the one that ships with it. ``None`` ⇒ the profile's ``cwd``,
+            exactly as before.
         deploy_ownership: WHO OWNS THE DEPLOYMENT TARGET this step changes
             (23 September 2026; the design's fourth revision H and fifth
             revision I and J). The deployment target, that target's own
@@ -362,6 +365,7 @@ def build_revert_runbook(
     rollback_image_ref: str,
     now: datetime,
     inside_sandbox: bool = False,
+    cwd_override: str | None = None,
 ) -> Runbook:
     """Render the REVERT runbook (O-32) — re-deploy the kept ``:rollback-*`` tag.
 
@@ -389,9 +393,15 @@ def build_revert_runbook(
         inside_sandbox: True when this step runs INSIDE the repository's own
             sandbox — the settings that say how to make that sandbox are not
             threaded onto it (:func:`sandbox_env`).
+        cwd_override: The working directory the step runs in instead of the
+            profile's ``cwd`` — for a repository with a sandbox, the tree laid
+            out at the commit being deployed, so the script that reverts is
+            the one that took the snapshot (see
+            :meth:`~forge.deploy.stage.DeployStageRunner.promote`). ``None`` ⇒
+            the profile's ``cwd``, exactly as before.
     """
     compose_params: dict[str, Any] = {
-        "cwd": profile.cwd,
+        "cwd": cwd_override if cwd_override is not None else profile.cwd,
         "compose_file": profile.compose.file,
         "compose_profile": profile.compose.profile,
         "rollback_image_ref": rollback_image_ref,
@@ -424,6 +434,7 @@ def build_read_only_runbook(
     inside_sandbox: bool = False,
     memory_project: str | None = None,
     launch_settings: Sequence[str] | None = None,
+    cwd_override: str | None = None,
 ) -> Runbook:
     """Render a runbook that ASKS the project something and changes nothing.
 
@@ -453,9 +464,14 @@ def build_read_only_runbook(
         launch_settings: the setting NAMES the project declared — both carried
             onto the step so the child's environment is built rather than
             copied (the environment door).
+        cwd_override: The working directory the step runs in instead of the
+            profile's ``cwd`` — for a repository with a sandbox, the tree laid
+            out at the commit about to be deployed, so the step that answers
+            is the one that ships with that commit. ``None`` ⇒ the profile's
+            ``cwd``, exactly as before.
     """
     compose_params: dict[str, Any] = {
-        "cwd": profile.cwd,
+        "cwd": cwd_override if cwd_override is not None else profile.cwd,
         "compose_file": profile.compose.file,
         "compose_profile": profile.compose.profile,
         "extra_env": _merged_env(profile, extra_env, inside_sandbox=inside_sandbox),
@@ -491,6 +507,7 @@ def build_candidate_teardown_runbook(
     extra_env: dict[str, str],
     now: datetime,
     inside_sandbox: bool = False,
+    cwd_override: str | None = None,
 ) -> Runbook:
     """Render the candidate-teardown runbook (S2F) — a single ``deploy_compose``.
 
@@ -520,9 +537,14 @@ def build_candidate_teardown_runbook(
         inside_sandbox: True when this step runs INSIDE the repository's own
             sandbox — the settings that say how to make that sandbox are not
             threaded onto it (:func:`sandbox_env`).
+        cwd_override: The working directory the step runs in instead of the
+            profile's ``cwd`` — for a repository with a sandbox, the tree laid
+            out at the candidate's own commit, so the script that takes the
+            candidate down is the one that stood it up. ``None`` ⇒ the
+            profile's ``cwd``, exactly as before.
     """
     compose_params: dict[str, Any] = {
-        "cwd": profile.cwd,
+        "cwd": cwd_override if cwd_override is not None else profile.cwd,
         "compose_file": profile.compose.file,
         "compose_profile": profile.compose.profile,
         "candidate_down": True,

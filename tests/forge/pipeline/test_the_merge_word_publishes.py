@@ -1131,6 +1131,34 @@ class TestTheDeployPutsLiveExactlyWhatWasChecked:
         assert deploy.handed_to_the_check[-1]["DEPLOY_IDENTITY"] == owns["identity"]
 
     @pytest.mark.asyncio
+    async def test_a_repository_without_a_sandbox_runs_its_legs_where_it_always_did(
+        self,
+        config_with_publication_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> None:
+        """Only the check is sent to a laid-out tree; every other leg is sent
+        nowhere in particular, exactly as before (3 October 2026: the legs of
+        a repository WITH a sandbox now run from a tree of their commit)."""
+        publisher = _APublisherThatSays([_published("c" * 40)])
+        deploy = _ADeployStepThatSays()
+        deps = _deps_that_can_deploy(
+            config_with_publication_on, pool, publisher=publisher, deploy=deploy
+        )
+
+        outcome = await _press(deps, repo_root)
+
+        assert outcome.result == "merged-into-the-remote-and-running", outcome.detail
+        legs = [call.get("leg") for call in deploy.calls]
+        assert legs == ["candidate_check", "what_is_running", "promote", "candidate_down"]
+        assert [("candidate_cwd" in call) for call in deploy.calls] == [
+            True,
+            False,
+            False,
+            False,
+        ]
+
+    @pytest.mark.asyncio
     async def test_a_second_press_says_something_is_running_there_now(
         self,
         config_with_publication_on: ForgeConfig,

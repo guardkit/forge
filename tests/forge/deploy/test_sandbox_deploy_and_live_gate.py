@@ -669,6 +669,83 @@ class TestTheLiveGateRunsInsideTheSandbox:
         assert "deploy/profile.yaml declares" in answer.detail["error"]
 
 
+class TestAPassingGateIsReadWhereverTheHelperRanIt:
+    """3 October 2026: FEAT-E592's deploy worked and its live checks passed
+    9 of 9 inside the sandbox, and the press rolled it back.
+
+    The invoker asked the helper to run the gate in the COORDINATOR's own path
+    for the repository — empty, since the coordinator moved into a container.
+    The helper honours a requested directory only when it is a laid-out tree,
+    so it ran the gate in its own clone and said so; the invoker saw two
+    different paths and threw the pass away as "the gate could not run".
+    """
+
+    def test_a_gate_asked_to_run_in_this_sides_path_is_read_from_the_clone(
+        self, clone: Path, sidecar: Any, tmp_path: Path
+    ) -> None:
+        coordinators_path = tmp_path / "var" / "lib" / "forge" / "projects" / "api_test"
+        assert not coordinators_path.exists()
+        invoker = SidecarLiveGateInvoker(
+            base_url=sidecar.url,
+            repo=REPO_KEY,
+            repo_path=coordinators_path,
+            driver_argv=DRIVER,
+            timeout_seconds=120,
+            extra_env={"API_TEST_BASE_URL": "http://localhost:8901"},
+            by_hand=True,
+        )
+
+        answer = invoker.invoke(feature=FEATURE_ID, target="apitest-sbx")
+
+        assert answer.verdict == "pass", answer.detail
+        assert answer.gate_ids == ("health",)
+        # Where it really ran, as the helper said: its own clone.
+        assert Path(answer.detail["cwd"]).resolve() == clone.resolve()
+
+    def test_a_tree_that_was_asked_for_and_not_used_is_still_refused(
+        self, clone: Path, tmp_path: Path
+    ) -> None:
+        """The guard the comparison was there for stays: a check asked to run
+        in a candidate's tree that ran somewhere else checked the wrong tree."""
+        import http.server
+
+        class _AHelperThatRanItElsewhere(http.server.BaseHTTPRequestHandler):
+            def do_POST(self) -> None:  # noqa: N802 — the library's own name
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                body = json.dumps(
+                    {"exit_code": 0, "stdout": "{}", "cwd": str(clone)}
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args: Any) -> None:  # noqa: D102 — quiet
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), _AHelperThatRanItElsewhere)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            host, port = server.server_address[:2]
+            invoker = SidecarLiveGateInvoker(
+                base_url=f"http://{host}:{port}",
+                repo=REPO_KEY,
+                repo_path=clone / ".forge-candidates" / FEATURE_ID,
+                driver_argv=DRIVER,
+                timeout_seconds=5,
+                by_hand=True,
+            )
+
+            answer = invoker.invoke(feature=FEATURE_ID, target="apitest-sbx")
+        finally:
+            server.shutdown()
+            server.server_close()
+
+        assert answer.verdict == "instrument_fail"
+        assert "is not the tree that was asked about" in answer.detail["error"]
+
+
 # ---------------------------------------------------------------------------
 # The environment the venue can use (2026-09-09)
 # ---------------------------------------------------------------------------

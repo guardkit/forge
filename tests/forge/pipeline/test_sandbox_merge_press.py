@@ -28,6 +28,7 @@ import json
 import sqlite3
 import subprocess
 import threading
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -978,3 +979,399 @@ class TestTheFetchWordsThemselves:
 
         assert sandbox_merge_words(object(), REPO, plain_checkout) is None
         assert sandbox_merge_words(None, REPO, plain_checkout) is None
+
+
+# ---------------------------------------------------------------------------
+# Every deploy leg runs the project's own steps at the commit it is about
+# ---------------------------------------------------------------------------
+
+#: The project's deploy step, as it ships with a commit. It writes one line per
+#: run to a log beside the test — which version ran, in which mode, and where —
+#: and answers each mode the way the project's identity block says it will.
+_NEW_DEPLOY_STEP = """#!/bin/sh
+mode=deploy
+[ "${{CANDIDATE:-}}" = 1 ] && mode=candidate
+[ "${{PROMOTE:-}}" = 1 ] && mode=promote
+[ "${{RUNNING_IDENTITY:-}}" = 1 ] && mode=ask
+[ "${{CANDIDATE_DOWN:-}}" = 1 ] && mode=down
+[ "${{REVERT:-}}" = 1 ] && mode=revert
+echo "new $mode $(pwd)" >> {log}
+case "$mode" in
+  candidate) echo "CHECKED_ARTIFACT=artifact-of-${{DEPLOY_IDENTITY}}" ;;
+  ask) echo "RUNNING_IDENTITY=none" ;;
+  promote) echo "DEPLOYED_IDENTITY=${{DEPLOY_IDENTITY}}" ;;
+esac
+exit 0
+"""
+
+#: The same step months earlier, as the clone's working copy still has it. It
+#: knows none of the modes — like api_test's July script on 3 October 2026,
+#: which took the read-only question for a plain deploy.
+_OLD_DEPLOY_STEP = """#!/bin/sh
+echo "old deploy $(pwd)" >> {log}
+exit 0
+"""
+
+_NEW_HEALTH_CHECK = """#!/bin/sh
+echo "new health $(pwd)" >> {log}
+exit 0
+"""
+
+_OLD_HEALTH_CHECK = """#!/bin/sh
+echo "old health $(pwd)" >> {log}
+exit 0
+"""
+
+#: The project's own live checks, as they ship with a commit and as the working
+#: copy still has them. Both pass; each writes down which version ran, where.
+_NEW_LIVE_GATE = """#!/usr/bin/env python3
+import json, os
+with open("LOGFILE", "a") as log:
+    log.write("new gate " + os.getcwd() + "\\n")
+print(json.dumps({"run_id": "run-gate", "verdict": "pass", "evidence_index_ref": "",
+                  "gates": [{"gate_id": "health", "exit_code": 0, "assertions": [
+                      {"id": "health::status", "status": "pass"}]}]}))
+"""
+
+_OLD_LIVE_GATE = _NEW_LIVE_GATE.replace('"new gate "', '"old gate "')
+
+_A_DEPLOYABLE_PROFILE = {
+    "env_id": "live",
+    "compose": {"file": "docker-compose.yml", "script": "deploy/deploy.sh"},
+    "identity": {
+        "setting": "DEPLOY_IDENTITY",
+        "reported_as": "DEPLOYED_IDENTITY",
+        "checked_as": "CHECKED_ARTIFACT",
+        "artifact_setting": "DEPLOY_ARTIFACT",
+        "asked_with": "RUNNING_IDENTITY",
+        "running_as": "RUNNING_IDENTITY",
+    },
+    "health_checks": [{"cmd": "deploy/healthcheck.sh"}],
+    "live_gate": {"driver": ["python3", "qa/gate.py"], "timeout_seconds": 60},
+    "candidate": {"env": {"CANDIDATE_PORT": "8902"}, "keep": False},
+    "rollback_image_ref": "the-project:rollback",
+}
+
+
+class TestEveryDeployLegRunsTheStepsOfItsOwnCommit:
+    """3 October 2026: the live app went down because the press asked the
+    project what it was running with a deploy script from July.
+
+    A repository with a sandbox is deployed out of the sandbox's own clone, and
+    nothing keeps that clone's working copy up to date. The candidate check
+    already ran from a tree laid out at the commit being checked; every other
+    leg ran the project's scripts out of the working copy. So here the working
+    copy is left at an old commit whose deploy step knows none of the modes,
+    and the whole press is driven through the REAL deploy dispatcher, the REAL
+    deploy stage, and a REAL deploy helper with its real executor — so every
+    one of the project's steps is really run, and writes down which version of
+    itself ran and where. Not one line may come from the working copy.
+    """
+
+    @staticmethod
+    def _write(path: Path, text: str, *, executable: bool = False) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        if executable:
+            path.chmod(0o755)
+
+    def _commit_the_steps(
+        self,
+        clone: Path,
+        *,
+        deploy: str,
+        health: str,
+        gate: str,
+        log: Path,
+        message: str,
+    ) -> str:
+        import yaml
+
+        self._write(
+            clone / "deploy" / "profile.yaml", yaml.safe_dump(_A_DEPLOYABLE_PROFILE)
+        )
+        self._write(
+            clone / "deploy" / "deploy.sh", deploy.format(log=log), executable=True
+        )
+        self._write(
+            clone / "deploy" / "healthcheck.sh",
+            health.format(log=log),
+            executable=True,
+        )
+        self._write(clone / "qa" / "gate.py", gate.replace("LOGFILE", str(log)))
+        _git(clone, "add", "deploy", "qa")
+        _git(clone, "commit", "-q", "-m", message)
+        return _git(clone, "rev-parse", "HEAD")
+
+    def _a_clone_left_behind(self, clone: Path, log: Path) -> tuple[str, str]:
+        """``(old, started_at)``: main carries the steps as they ship now, the
+        build starts there, and the clone's working copy is left months back."""
+        old = self._commit_the_steps(
+            clone,
+            deploy=_OLD_DEPLOY_STEP,
+            health=_OLD_HEALTH_CHECK,
+            gate=_OLD_LIVE_GATE,
+            log=log,
+            message="the deploy steps, in July",
+        )
+        started_at = self._commit_the_steps(
+            clone,
+            deploy=_NEW_DEPLOY_STEP,
+            health=_NEW_HEALTH_CHECK,
+            gate=_NEW_LIVE_GATE,
+            log=log,
+            message="the deploy steps, as they ship now",
+        )
+        _git(clone, "push", "-q", "origin", "main")
+        _git(clone, "rebase", "-q", "main", f"autobuild/{FEATURE_ID}")
+        # THE STALE WORKING COPY: the clone is left where it was months ago.
+        _git(clone, "checkout", "-q", "--detach", old)
+        assert "old deploy" in (clone / "deploy" / "deploy.sh").read_text()
+        return old, started_at
+
+    @staticmethod
+    def _config(helper_url: str, on_this_side: Path) -> ForgeConfig:
+        return ForgeConfig.model_validate(
+            {
+                "permissions": {"filesystem": {"allowlist": ["/tmp"]}},
+                "planning": {
+                    "target_repo_paths": {REPO: str(on_this_side)},
+                    "sandboxes": {
+                        REPO: {
+                            "name": "api-test-factory",
+                            "sidecar_url": helper_url,
+                            "runner_url": "http://127.0.0.1:8924",
+                        }
+                    },
+                },
+                "approval": {"expected_approver": "rich"},
+                "merge_executor": {"enabled": True},
+                "deploy": {"enabled": True, "run_live_gate": True},
+                "publication": {
+                    "enabled": True,
+                    "publisher_url": "http://127.0.0.1:1",
+                    "builds_may_run_inside_the_coordinator": False,
+                    "publisher_credential_file": "/etc/forge-publisher/credential",
+                },
+            }
+        )
+
+    @staticmethod
+    async def _press_it(
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+        clone: Path,
+        on_this_side: Path,
+        tmp_path: Path,
+        started_at: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> Any:
+        """The whole press, with the real dispatcher and stage beneath it.
+
+        The publisher really sends: the joined commit goes to the clone's bare
+        "remote", so a later press that reads the remote finds it there."""
+        from forge.pipeline.merge_executor import build_in_daemon_deploy_dispatcher
+        from forge.pipeline.publication_activation import WhatTheMachineSays
+        from tests.forge._a_stand_in_coordinator import a_coordinator_that_recorded
+        from tests.forge.pipeline.test_merge_executor import _JoinsForReal
+
+        class _Bus:
+            async def publish(self, *args: Any, **kwargs: Any) -> None:
+                return None
+
+        async def _the_publisher(_config: Any, request: dict[str, Any]) -> dict[str, Any]:
+            _git(clone, "push", "-q", "origin", f"{request['j_commit']}:refs/heads/main")
+            return {
+                "published": True,
+                "remote_now": request["j_commit"],
+                "contains_j": True,
+                "refusal": None,
+                "refusal_kind": None,
+            }
+
+        _build_row(pool, REPO, started_at)
+        deps = MergeExecutorDeps(
+            config=config,
+            pool=pool,
+            pipeline_publisher=_FakePublisher(),
+            guardkit_run=_JoinsForReal(feature_id=FEATURE_ID),
+            deploy_dispatcher=build_in_daemon_deploy_dispatcher(
+                config=config, nats_client=_Bus(), db_path=tmp_path / "forge.db"
+            ),
+            git_surface=compose_merge_git_surface(config),
+            publisher=_the_publisher,
+            what_the_machine_says=WhatTheMachineSays(
+                the_publisher_passed_its_self_check=True
+            ),
+        )
+        with a_coordinator_that_recorded({BUILD_ID: started_at}, monkeypatch):
+            return await execute_merge_deploy(
+                deps=deps,
+                build_id=BUILD_ID,
+                feature_id=FEATURE_ID,
+                repo=REPO,
+                repo_root=on_this_side,
+                expect_main_sha=started_at,
+                correlation_id=CORRELATION,
+                decided_by="rich",
+            )
+
+    @staticmethod
+    def _which_ran(log: Path, clone: Path) -> list[str]:
+        """The modes the project's own steps ran in, each checked to be the
+        version that ships with the commit, run in that commit's tree."""
+        ran = log.read_text(encoding="utf-8").splitlines()
+        tree = str(clone / ".forge-candidates" / FEATURE_ID)
+        # NOT ONE STEP CAME FROM THE WORKING COPY ...
+        assert not [line for line in ran if line.startswith("old ")], ran
+        # ... and every one ran in the tree of the joined commit.
+        assert ran and all(line.endswith(f" {tree}") for line in ran), ran
+        return [line.split(" ")[1] for line in ran]
+
+    @pytest.fixture
+    def a_helper_that_deploys(
+        self, clone: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The helper in the sandbox, WITH the executor a real deploy goes through.
+
+        Yields its address and the coordinator's answer to "who owns this
+        target", which a test can change when the target's counter moves.
+        """
+        from forge.deploy_sidecar.deploy_executor import DeployExecutor
+        from forge.deploy_sidecar.service import SIDECAR_IN_SANDBOX_ENV
+
+        monkeypatch.setenv(SIDECAR_IN_SANDBOX_ENV, "1")
+        sidecar_config = ForgeConfig.model_validate(
+            {
+                "permissions": {"filesystem": {"allowlist": [str(clone.parent)]}},
+                "planning": {"target_repo_paths": {REPO: str(clone)}},
+            }
+        )
+        # The counter the press's lock grants a fresh target, and this build.
+        owner = {"counter": 1, "build": BUILD_ID}
+        executor = DeployExecutor(
+            notes_root=tmp_path / "executor-notes",
+            ask_the_coordinator=lambda target: dict(owner),
+        )
+        executor.reconcile()
+        srv = build_server(
+            port=0, config_loader=lambda: sidecar_config, deploy_executor=executor
+        )
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        host, port = srv.server_address[:2]
+        try:
+            yield f"http://{host}:{port}", owner
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    @pytest.mark.asyncio
+    async def test_every_step_runs_at_the_commit_and_a_passing_gate_is_kept(
+        self,
+        a_helper_that_deploys: tuple[str, dict[str, Any]],
+        pool: SqliteLifecyclePersistence,
+        clone: Path,
+        on_this_side: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        _receipts_env: Path,
+    ) -> None:
+        from forge.pipeline.publication_record import (
+            RESULT_MERGED_AND_RUNNING,
+            PublicationRecordStore,
+        )
+
+        log = tmp_path / "which-steps-ran.log"
+        old, started_at = self._a_clone_left_behind(clone, log)
+        config = self._config(a_helper_that_deploys[0], on_this_side)
+        # The coordinator's own path for the repository holds nothing.
+        assert not on_this_side.exists()
+
+        outcome = await self._press_it(
+            config, pool, clone, on_this_side, tmp_path, started_at, monkeypatch
+        )
+
+        assert outcome.result == "merged-into-the-remote-and-running", outcome.detail
+        assert (
+            PublicationRecordStore(pool.connection).read(BUILD_ID).result
+            == RESULT_MERGED_AND_RUNNING
+        )
+        # Every leg is there: the check with its health check and live gate,
+        # the question, the promote with its health check, the candidate's
+        # teardown and the live gate on what is now live — which PASSED and
+        # was read as a pass, so nothing was rolled back. (The press's own
+        # cleanup asks for the teardown once more under the same run, and the
+        # stage turns that repeat away before any step runs.)
+        assert self._which_ran(log, clone) == [
+            "candidate",
+            "health",
+            "gate",
+            "ask",
+            "promote",
+            "health",
+            "down",
+            "gate",
+        ]
+        # The tree goes when the press ends, as it always did.
+        assert not (clone / ".forge-candidates" / FEATURE_ID).exists()
+        # And the clone's working copy was left exactly where it was.
+        assert _git(clone, "rev-parse", "HEAD") == old
+
+    @pytest.mark.asyncio
+    async def test_a_press_that_picks_up_a_published_join_lays_its_tree_out_again(
+        self,
+        a_helper_that_deploys: tuple[str, dict[str, Any]],
+        pool: SqliteLifecyclePersistence,
+        clone: Path,
+        on_this_side: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        _receipts_env: Path,
+    ) -> None:
+        """The pick-up runs no check, so no tree is standing when it deploys.
+        It lays the joined commit's tree out for itself rather than running
+        the project's steps from the working copy."""
+        from forge.pipeline.deployment_lock import DeploymentLockStore
+
+        log = tmp_path / "which-steps-ran.log"
+        _, started_at = self._a_clone_left_behind(clone, log)
+        helper_url, owner = a_helper_that_deploys
+        config = self._config(helper_url, on_this_side)
+        # Another build holds the target, so the first press publishes and
+        # deploys nothing.
+        lock = DeploymentLockStore(pool.connection)
+        target = f"{REPO}::live"
+        held = lock.grant(
+            target=target,
+            build_id="another-build",
+            turn=1,
+            holder="somebody-else",
+            now=datetime.now(UTC),
+        )
+        assert held is not None
+
+        first = await self._press_it(
+            config, pool, clone, on_this_side, tmp_path, started_at, monkeypatch
+        )
+
+        assert first.result == "published-deployment-pending", first.detail
+        assert "holds the deployment lock" in first.detail
+        assert not (clone / ".forge-candidates" / FEATURE_ID).exists()
+        log.write_text("", encoding="utf-8")
+        # The other build lets go; this build's grant is the target's second.
+        assert lock.release(target=target, counter=held.counter, now=datetime.now(UTC))
+        owner["counter"] = held.counter + 1
+
+        again = await self._press_it(
+            config, pool, clone, on_this_side, tmp_path, started_at, monkeypatch
+        )
+
+        assert again.result == "merged-into-the-remote-and-running", again.detail
+        assert self._which_ran(log, clone) == [
+            "ask",
+            "promote",
+            "health",
+            "down",
+            "gate",
+        ]
+        assert not (clone / ".forge-candidates" / FEATURE_ID).exists()

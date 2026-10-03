@@ -882,6 +882,7 @@ class DeployStageRunner:
         correlation_id: str,
         deploy_run_id: str,
         identity_env: dict[str, str] | None = None,
+        scripts_cwd: str | None = None,
     ) -> DeployStageResult:
         """Tear the standing candidate down on its own — for a run that stops
         between the two legs. Never raises; ``outcome="failed"`` with
@@ -890,7 +891,11 @@ class DeployStageRunner:
         ``identity_env`` is the same setting the CHECK was handed, so a project
         whose candidate belongs to one check rather than to a shared name can
         take down the right one. It is REQUIRED: with none, this leg refuses
-        and removes nothing (:data:`A_TEARDOWN_WITH_NO_NAME`)."""
+        and removes nothing (:data:`A_TEARDOWN_WITH_NO_NAME`).
+
+        ``scripts_cwd`` is where the project's own teardown step runs: for a
+        repository with a sandbox, the tree laid out at the candidate's own
+        commit (see :meth:`promote`). ``None`` ⇒ the profile's ``cwd``."""
         profile = self._profile_for_run(profile)
         if profile.candidate is None:
             return DeployStageResult(
@@ -920,6 +925,7 @@ class DeployStageRunner:
             correlation_id=correlation_id,
             deploy_run_id=deploy_run_id,
             identity_env=identity_env,
+            cwd=scripts_cwd,
         )
         return DeployStageResult(
             outcome="complete" if torn_down else "failed",
@@ -938,6 +944,7 @@ class DeployStageRunner:
         ask_env: dict[str, str],
         memory_project: str | None = None,
         launch_settings: tuple[str, ...] = (),
+        scripts_cwd: str | None = None,
     ) -> DeployStageResult:
         """ASK THE TARGET what it is running. Read-only; nothing is changed.
 
@@ -961,6 +968,10 @@ class DeployStageRunner:
         contract, and the press cannot tell — which is said plainly rather than
         guarded against, because guarding would mean knowing what the project
         does.
+
+        ``scripts_cwd`` is where the project's step runs: for a repository
+        with a sandbox, the tree laid out at the commit about to be deployed
+        (see :meth:`promote`). ``None`` ⇒ the profile's ``cwd``, as before.
         """
         profile = self._profile_for_run(profile)
         runbook = build_read_only_runbook(
@@ -972,6 +983,7 @@ class DeployStageRunner:
             inside_sandbox=self._runs_inside_the_sandbox(),
             memory_project=memory_project,
             launch_settings=launch_settings,
+            cwd_override=scripts_cwd,
         )
         try:
             run_result = await self._run_runbook(runbook, correlation_id)
@@ -1034,6 +1046,7 @@ class DeployStageRunner:
         memory_project: str | None = None,
         launch_settings: tuple[str, ...] = (),
         identity_env: dict[str, str] | None = None,
+        scripts_cwd: str | None = None,
     ) -> DeployStageResult:
         """Leg two: the live name comes up on the image the candidate built.
 
@@ -1062,6 +1075,22 @@ class DeployStageRunner:
         project's own deploy step printed — because the caller has to read the
         identity the step reported back out of it and compare it, as text,
         with the identity it handed over.
+
+        ``scripts_cwd`` (3 October 2026) is the working directory of every
+        project step this leg runs — the deploy, its health checks, the
+        candidate teardown after it, the live gate's driver and, when the gate
+        fails, the revert. The merge press passes it only for a repository
+        with a sandbox: there the project's clone is the factory's own, and
+        nothing keeps its working copy up to date, so a step run from it is
+        whatever happened to be checked out last. On 3 October that was a
+        deploy script from July, which did not know the read-only question,
+        took it for a plain deploy and brought down the live app on
+        September's code. So the press lays the tree of the joined commit out
+        (the same lay-out the candidate check uses) and every step runs from
+        it: the script that deploys a commit is the one that ships with it,
+        and the revert is the same script that just took the rollback
+        snapshot, which is the one that knows where it put it. ``None`` ⇒ the
+        profile's ``cwd``, byte for byte what it was.
         """
         profile = self._profile_for_run(profile)
         events: list[str] = list(prior_events)
@@ -1102,6 +1131,7 @@ class DeployStageRunner:
                         correlation_id=correlation_id,
                         deploy_run_id=deploy_run_id,
                         identity_env=identity_env_for_teardown,
+                        cwd=scripts_cwd,
                     )
                     candidate_word = "torn-down" if torn else "standing"
                 failed = await self._fail_before_start(
@@ -1142,6 +1172,7 @@ class DeployStageRunner:
                 target=profile.env_id,
                 now=self._clock(),
                 compose_extra_env=promote_extra_env,
+                cwd_override=scripts_cwd,
                 inside_sandbox=self._runs_inside_the_sandbox(),
                 deploy_ownership=deploy_ownership,
                 memory_project=memory_project,
@@ -1231,6 +1262,7 @@ class DeployStageRunner:
                         correlation_id=correlation_id,
                         deploy_run_id=deploy_run_id,
                         identity_env=identity_env_for_teardown,
+                        cwd=scripts_cwd,
                     )
                     candidate_word = "torn-down" if torn else "standing"
 
@@ -1247,6 +1279,7 @@ class DeployStageRunner:
                     feat_id=feat_id,
                     task_id=task_id,
                     events=events,
+                    driver_cwd_override=scripts_cwd,
                 )
                 verdict = gate.verdict
                 live_gate_runbook_id = gate.runbook_id
@@ -1290,6 +1323,7 @@ class DeployStageRunner:
                         deploy_runbook_id=deploy_runbook.runbook_id,
                         live_gate_runbook_id=live_gate_runbook_id,
                         events=events,
+                        cwd=scripts_cwd,
                     )
                 )
 
@@ -1485,7 +1519,10 @@ class DeployStageRunner:
         cannot be moved does not run the gate at all: the runbook step fails
         with the reason on record, because a gate that ran in the checkout
         instead would check main's registry against the branch's build — the
-        defect the candidate check exists to catch. ``None`` (the promote leg,
+        defect the candidate check exists to catch. The promote leg passes it
+        too for a repository with a sandbox — the joined commit's tree, so the
+        gate run against the deployed commit is that commit's own (see
+        :meth:`promote`). ``None`` (the promote leg of every other repository,
         a plain deploy) leaves the invoker where it was composed: the checkout.
         """
         gate_runbook = build_live_gate_runbook(
@@ -1655,6 +1692,12 @@ class DeployStageRunner:
         summary["candidate_cwd"] = candidate_cwd
         summary["evidence_index_ref"] = None
         summary["candidate_output"] = ""
+        # THE CANDIDATE COMES DOWN BY THE SCRIPT THAT STOOD IT UP — in a
+        # sandbox (3 October 2026). There the checkout is a clone nothing keeps
+        # up to date, so its teardown step can be months older than the tree
+        # the candidate was built from. Every other repository keeps the
+        # profile's own working directory for the teardown, as it always had.
+        teardown_cwd = candidate_cwd if self._runs_inside_the_sandbox() else None
 
         # --- candidate deploy (separate -cand project) ---
         cand_runbook = build_deploy_runbook(
@@ -1686,6 +1729,7 @@ class DeployStageRunner:
                 correlation_id=correlation_id,
                 deploy_run_id=deploy_run_id,
                 identity_env=identity_env,
+                cwd=teardown_cwd,
             )
             # This is the words the merge report says the candidate stopped
             # at, so when the step never ran the sidecar's own reason travels
@@ -1741,6 +1785,7 @@ class DeployStageRunner:
                     correlation_id=correlation_id,
                     deploy_run_id=deploy_run_id,
                     identity_env=identity_env,
+                    cwd=teardown_cwd,
                 )
                 failed = await self._candidate_failed_result(
                     profile,
@@ -1770,6 +1815,7 @@ class DeployStageRunner:
         correlation_id: str,
         deploy_run_id: str,
         identity_env: dict[str, str] | None = None,
+        cwd: str | None = None,
     ) -> bool:
         """Tear the candidate down (best-effort, never raises).
 
@@ -1787,6 +1833,8 @@ class DeployStageRunner:
         belong to another build's check — which was driven: one build's ending
         removed three builds' candidates and their data. So with no identity
         the candidate is left standing and a person removes it by hand.
+
+        ``cwd`` is where the teardown step runs; ``None`` ⇒ the profile's.
         """
         assert profile.candidate is not None
         if not _names_one_candidate(identity_env):
@@ -1811,6 +1859,7 @@ class DeployStageRunner:
             extra_env=teardown_env,
             now=self._clock(),
             inside_sandbox=self._runs_inside_the_sandbox(),
+            cwd_override=cwd,
         )
         try:
             run_result = await self._run_runbook(teardown_runbook, correlation_id)
@@ -1986,6 +2035,7 @@ class DeployStageRunner:
         deploy_runbook_id: str,
         live_gate_runbook_id: str | None,
         events: list[str],
+        cwd: str | None = None,
     ) -> DeployStageResult:
         """[O-32] Roll back a build whose live-gate verdict was not "pass".
 
@@ -1995,6 +2045,9 @@ class DeployStageRunner:
         a profile with no rollback ref, and a revert re-deploy that itself fails
         — both return ``outcome="failed"`` with ``failed_step="revert"`` and a
         DeployFailed naming the cause.
+
+        ``cwd`` is where the revert step runs — the promote's own working
+        directory (see :meth:`promote`); ``None`` ⇒ the profile's.
         """
         rollback_ref = profile.rollback_ref
         when = self._clock()
@@ -2052,6 +2105,7 @@ class DeployStageRunner:
             rollback_image_ref=rollback_ref,
             now=self._clock(),
             inside_sandbox=self._runs_inside_the_sandbox(),
+            cwd_override=cwd,
         )
         run_result = await self._run_runbook(revert_runbook, correlation_id)
         executed = self._repo.load_runbook(
