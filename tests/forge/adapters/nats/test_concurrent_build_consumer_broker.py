@@ -299,6 +299,50 @@ class TestExistingDurableFollowsTheSetting:
             await nc.close()
 
 
+class TestRefusedUpdate:
+    @pytest.mark.asyncio
+    async def test_uneditable_durable_is_bound_unchanged_with_an_error(
+        self, estate_broker: _Broker, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import logging
+
+        from nats.js.api import AckPolicy, ConsumerConfig, DeliverPolicy
+
+        nc = await _connect(estate_broker.url)
+        try:
+            js = await _fresh_stream(nc)
+            # A durable made by hand with a deliver policy the daemon's own
+            # config does not use; the broker will not edit deliver policy.
+            await js.add_consumer(
+                PIPELINE_STREAM_NAME,
+                ConsumerConfig(
+                    durable_name=DURABLE,
+                    deliver_policy=DeliverPolicy.NEW,
+                    ack_policy=AckPolicy.EXPLICIT,
+                    filter_subject="pipeline.build-queued.*",
+                    max_ack_pending=1,
+                ),
+            )
+            caplog.set_level(logging.ERROR, logger="forge.cli._serve_daemon")
+            sub = await _attach_consumer(nc, DURABLE, max_ack_pending=2)
+
+            info = await js.consumer_info(PIPELINE_STREAM_NAME, DURABLE)
+            assert info.config.max_ack_pending == 1, "left as the broker had it"
+            errors = [
+                r.getMessage() for r in caplog.records if r.levelno == logging.ERROR
+            ]
+            assert len(errors) == 1
+            assert "pipeline.max_concurrent_builds" in errors[0]
+            assert "it is 1 on the broker, configured 2" in errors[0]
+            assert "deliver policy" in errors[0]
+
+            # The bound subscription works: a new build is handed out.
+            await _publish_builds(js, 1)
+            assert len(await _drain(sub)) == 1
+        finally:
+            await nc.close()
+
+
 class TestRestartAndRedelivery:
     @pytest.mark.asyncio
     async def test_held_builds_survive_a_restart_and_redeliver_after_ack_wait(

@@ -238,29 +238,17 @@ async def inspect_ack_slot(js, stream: str, durable: str) -> AckSlotReport:
     )
     if start_seq > delivered_seq:
         # The broker says something is outstanding yet its ack floor is at or
-        # past everything delivered. That reading contradicts itself, so it
-        # is not evidence of a phantom.
-        logger.warning(
-            "ack-slot inspect: consumer '%s' on '%s' reports %d ack-pending "
-            "with ack floor %d at or past delivered %d; reporting "
-            "status=unknown — no cure will be attempted",
-            durable,
+        # past everything delivered, so the range is empty. Fall back to the
+        # single probe at the delivered position — exactly the one-place check
+        # this module made before several places existed.
+        return await _probe_delivered(
+            js,
             stream,
-            num_ack_pending,
-            floor_seq,
+            durable,
             delivered_seq,
-        )
-        return AckSlotReport(
-            status="unknown",
-            pending_seq=delivered_seq,
             num_ack_pending=num_ack_pending,
             num_waiting=num_waiting,
             num_pending=num_pending,
-            detail=(
-                f"consumer '{durable}' reports {num_ack_pending} ack-pending "
-                f"but its ack floor ({floor_seq}) is not below its delivered "
-                f"position ({delivered_seq}) — cannot classify"
-            ),
         )
 
     # 4. Probe the stream for the first build message from the ack floor on.
@@ -339,6 +327,81 @@ async def inspect_ack_slot(js, stream: str, durable: str) -> AckSlotReport:
             f"consumer '{durable}' has {outstanding}; the build message at "
             f"sequence {found_seq} still exists in stream '{stream}' — a "
             "legitimate in-flight or redeliverable build; leave it alone"
+        ),
+    )
+
+
+async def _probe_delivered(
+    js,
+    stream: str,
+    durable: str,
+    pending_seq: int,
+    *,
+    num_ack_pending: int,
+    num_waiting: int,
+    num_pending: int,
+) -> AckSlotReport:
+    """Classify by probing the single delivered sequence (the one-place check).
+
+    Present ⇒ ``held``; :class:`NotFoundError` ⇒ ``phantom``; any other error
+    ⇒ ``unknown``. Used only when the ack floor and delivered position leave
+    no range to search.
+    """
+    try:
+        await js.get_msg(stream, seq=pending_seq)
+    except NotFoundError:
+        logger.error(
+            "ack-slot inspect: PHANTOM ack on consumer '%s' (stream '%s') — "
+            "the ack-pending message at seq=%d is gone from the stream",
+            durable,
+            stream,
+            pending_seq,
+        )
+        return AckSlotReport(
+            status="phantom",
+            pending_seq=pending_seq,
+            num_ack_pending=num_ack_pending,
+            num_waiting=num_waiting,
+            num_pending=num_pending,
+            detail=(
+                f"consumer '{durable}' holds the ack slot for stream sequence "
+                f"{pending_seq}, but that message no longer exists in stream "
+                f"'{stream}' (purged or deleted) — this is a phantom ack and "
+                "dispatch is wedged; safe to cure by deleting the consumer"
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001 — absence-of-failure: never claim phantom
+        logger.warning(
+            "ack-slot inspect: get_msg(%s, seq=%d) failed (%s: %s); reporting "
+            "status=unknown — no cure will be attempted",
+            stream,
+            pending_seq,
+            type(exc).__name__,
+            exc,
+        )
+        return AckSlotReport(
+            status="unknown",
+            pending_seq=pending_seq,
+            num_ack_pending=num_ack_pending,
+            num_waiting=num_waiting,
+            num_pending=num_pending,
+            detail=(
+                f"consumer '{durable}' holds the ack slot for stream sequence "
+                f"{pending_seq}, but probing stream '{stream}' for that message "
+                f"failed ({type(exc).__name__}: {exc})"
+            ),
+        )
+    return AckSlotReport(
+        status="held",
+        pending_seq=pending_seq,
+        num_ack_pending=num_ack_pending,
+        num_waiting=num_waiting,
+        num_pending=num_pending,
+        detail=(
+            f"consumer '{durable}' holds the ack slot for stream sequence "
+            f"{pending_seq}, and that message still exists in stream "
+            f"'{stream}' — a legitimate in-flight or redeliverable build; "
+            "leave it alone"
         ),
     )
 
