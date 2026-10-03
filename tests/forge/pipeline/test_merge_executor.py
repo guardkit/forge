@@ -73,6 +73,24 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _the_kept_hold_runs_out(
+    pool: SqliteLifecyclePersistence, build_id: str = BUILD_ID
+) -> None:
+    """The hold a killed or unanswered press kept lapses on its own.
+
+    3 October 2026: every press is a worker of its own, so the next merge
+    word — even from the same process — picks the build up only once the
+    hold has run out, as a coordinator restarted after a crash always had to.
+    """
+    from datetime import timedelta
+
+    pool.connection.execute(
+        "UPDATE publication_records SET lease_expires_at = ? WHERE build_id = ?",
+        ((_utcnow() - timedelta(seconds=1)).isoformat(), build_id),
+    )
+    pool.connection.commit()
+
+
 # ---------------------------------------------------------------------------
 # Fixtures + fakes
 # ---------------------------------------------------------------------------
@@ -1362,6 +1380,7 @@ class TestExecutorSequencing:
         assert MERGE_STEP_MERGE_TARGET_IDENTIFIER in _stage_ids(pool)
         j_left = _git(repo_root, "rev-parse", f"factory-integration/{FEATURE_ID}")
 
+        _the_kept_hold_runs_out(pool)
         # The next merge word picks it up: the join is found, not made again,
         # and the press runs on to the checks.
         deps, publisher, gk, dp = _deps(config, pool)
@@ -1407,6 +1426,7 @@ class TestExecutorSequencing:
         with pytest.raises(KeyboardInterrupt):
             await _run_executor(deps, repo_root)
 
+        _the_kept_hold_runs_out(pool)
         deps, publisher, gk, dp = _deps(config, pool)
         outcome = await _run_executor(deps, repo_root)
         assert outcome.result == "publication-pending"
@@ -4035,24 +4055,10 @@ class TestDurableRetainedCandidateIdentity:
 # ---------------------------------------------------------------------------
 
 
-ANOTHER_PROCESS = 424242
-
-
 def _the_hold(pool: SqliteLifecyclePersistence) -> Any:
     from forge.pipeline.publication_record import PublicationRecordStore
 
     return PublicationRecordStore(pool.connection).read(BUILD_ID)
-
-
-async def _a_press_from_another_process(
-    deps: MergeExecutorDeps, repo_root: Path, monkeypatch: pytest.MonkeyPatch
-) -> Any:
-    """The same merge word, given again by a coordinator in another process."""
-    import forge.pipeline.merge_executor as merge_executor
-
-    with monkeypatch.context() as patched:
-        patched.setattr(merge_executor.os, "getpid", lambda: ANOTHER_PROCESS)
-        return await _run_executor(deps, repo_root)
 
 
 class _AMergeThatIsCancelled:
@@ -4110,7 +4116,6 @@ class TestTheHoldIsPutDownOnlyWhenThePressHasFinished:
         config: ForgeConfig,
         pool: SqliteLifecyclePersistence,
         repo_root: Path,
-        monkeypatch: pytest.MonkeyPatch,
         guardkit: Any,
         result: str,
     ) -> None:
@@ -4122,10 +4127,44 @@ class TestTheHoldIsPutDownOnlyWhenThePressHasFinished:
         held = _the_hold(pool)
         assert held.lease_holder is None
         assert held.lease_expires_at is None
-        # A press from another process is not refused by a hold.
-        again = await _a_press_from_another_process(deps, repo_root, monkeypatch)
+        # The next press is a worker of its own, and no hold refuses it.
+        again = await _run_executor(deps, repo_root)
         assert "another worker" not in again.detail
         assert _the_hold(pool).turn == held.turn + 1
+
+    @pytest.mark.asyncio
+    async def test_a_candidate_check_that_gave_its_verdict_puts_it_down(
+        self, config: ForgeConfig, pool: SqliteLifecyclePersistence, repo_root: Path
+    ) -> None:
+        deps, _publisher, _gk, _dp = _deps(
+            config, pool, guardkit=_JoinsForReal(),
+            deploy=_FakeDeploy(candidate_outcome="failed"),
+        )
+
+        outcome = await _run_executor(deps, repo_root)
+
+        assert outcome.result == "candidate-refused"
+        assert _the_hold(pool).lease_holder is None
+
+    @pytest.mark.asyncio
+    async def test_a_candidate_check_that_gave_no_verdict_keeps_it(
+        self, config: ForgeConfig, pool: SqliteLifecyclePersistence, repo_root: Path
+    ) -> None:
+        """Something went wrong with the check itself: not a settled ending."""
+        deps, _publisher, _gk, _dp = _deps(
+            config, pool, guardkit=_JoinsForReal(),
+            deploy=_FakeDeploy(
+                candidate_outcome="failed",
+                gate={"verdict": None, "failed_checks": []},
+            ),
+        )
+
+        outcome = await _run_executor(deps, repo_root)
+
+        assert outcome.result == "candidate-refused"
+        assert _the_hold(pool).lease_holder is not None
+        again = await _run_executor(deps, repo_root)
+        assert "another worker" in again.detail
 
     @pytest.mark.asyncio
     async def test_a_refusal_before_anything_was_dispatched_puts_it_down(
@@ -4151,13 +4190,14 @@ class TestTheHoldIsPutDownOnlyWhenThePressHasFinished:
         assert grant is not None
 
     @pytest.mark.asyncio
-    async def test_a_cancelled_press_keeps_the_hold_and_a_second_worker_is_refused(
+    async def test_a_cancelled_press_keeps_the_hold_against_the_same_process(
         self,
         config: ForgeConfig,
         pool: SqliteLifecyclePersistence,
         repo_root: Path,
-        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        """In the container the coordinator is always process 1, so its next
+        press must not count as the same worker as the cancelled one."""
         import os
 
         deps, _publisher, _gk, _dp = _deps(
@@ -4167,8 +4207,10 @@ class TestTheHoldIsPutDownOnlyWhenThePressHasFinished:
         with pytest.raises(asyncio.CancelledError):
             await _run_executor(deps, repo_root)
 
-        assert _the_hold(pool).lease_holder == f"merge-press:{os.getpid()}"
-        again = await _a_press_from_another_process(deps, repo_root, monkeypatch)
+        assert str(_the_hold(pool).lease_holder).startswith(
+            f"merge-press:{os.getpid()}:"
+        )
+        again = await _run_executor(deps, repo_root)
         assert again.result == "merge-refused"
         assert "another worker" in again.detail
 
@@ -4179,7 +4221,6 @@ class TestTheHoldIsPutDownOnlyWhenThePressHasFinished:
         config: ForgeConfig,
         pool: SqliteLifecyclePersistence,
         repo_root: Path,
-        monkeypatch: pytest.MonkeyPatch,
         status: str,
     ) -> None:
         import os
@@ -4191,7 +4232,10 @@ class TestTheHoldIsPutDownOnlyWhenThePressHasFinished:
         outcome = await _run_executor(deps, repo_root)
 
         assert outcome.result == "merge-refused"
-        assert _the_hold(pool).lease_holder == f"merge-press:{os.getpid()}"
-        again = await _a_press_from_another_process(deps, repo_root, monkeypatch)
+        assert str(_the_hold(pool).lease_holder).startswith(
+            f"merge-press:{os.getpid()}:"
+        )
+        # A second press from the SAME process is still refused.
+        again = await _run_executor(deps, repo_root)
         assert again.result == "merge-refused"
         assert "another worker" in again.detail

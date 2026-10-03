@@ -1308,22 +1308,29 @@ async def execute_merge_deploy(
     # on the lease so that a second worker finding a live lease leaves the
     # build alone, and so that a takeover says who it took over from.
     #
-    # THE NAME IS THE PROCESS, not this one press. A press that runs again in
-    # the same coordinator — the ordinary "it refused, fix the cause, press it
-    # again" — is the same worker coming back, and it takes its own record up
-    # rather than being told somebody else holds it. A worker in ANOTHER
-    # process is a different name and is left alone until the lease runs out,
-    # which is exactly the rule. Nothing about the name is a credential.
-    worker_name = f"merge-press:{os.getpid()}"
-    # THE HOLD IS PUT DOWN ONLY WHEN THE PRESS HAS REALLY FINISHED (3 October
+    # THE NAME IS THIS ONE PRESS (3 October 2026), not the process. It used
+    # to be the process alone, and in the container the coordinator is
+    # always process 1, so the coordinator's next press counted as the same
+    # worker and took over a hold that had been kept on purpose because the
+    # last press's merge might still be running. So each press has a name of
+    # its own: the process and a short random part. A press that ended
+    # settled puts its hold down (below), so pressing again after a refusal
+    # is not made to wait; one whose ending is unknown keeps it until the
+    # lease runs out. Nothing reads the name back, and it is not a credential.
+    worker_name = f"merge-press:{os.getpid()}:{uuid.uuid4().hex[:8]}"
+    # THE HOLD IS PUT DOWN WHEN THE PRESS HAS REALLY FINISHED (3 October
     # 2026). The lease used to be taken and never put down, so every press
     # held its build for the whole lease however it ended, and a retry of
     # FEAT-E592 at 15:15 was refused because of it. The turn number fences
     # writes to the record, not a merge already sent into a sandbox, so the
-    # hold is put down only on an ending where every step this press
-    # dispatched gave its own answer — ``press_settled`` is set at exactly
-    # those endings. A cancellation, a lost connection, a timeout or an
-    # answer nobody can read leaves it unset, and the hold lapses as before.
+    # hold is put down only on the endings marked with ``_settled`` below,
+    # where nothing the press started is left running that a second press
+    # could collide with. Most of those are endings where every step that
+    # was dispatched gave its own answer; the exceptions are named where
+    # they are marked (a promote whose connection was lost, a question to the
+    # target that went unanswered). A cancellation, a merge with no answer, a
+    # send whose answer was lost, a timeout, or a check that gave no verdict
+    # leaves it unset, and the hold lapses as before.
     # ``held_turn`` is the turn this press took the lease on; 0 = none.
     press_settled = False
     held_turn = 0
@@ -1773,7 +1780,6 @@ async def execute_merge_deploy(
             )
             sentence = candidate_refused_sentence(feature_id, detail=gate["refusal"])
             return _refused_before_merge(sentence)
-        # From here the checks ran and gave their verdict: a settled ending.
         if names and isinstance(total, int) and isinstance(passed, int):
             gate["refusal"] = None
             sentence = candidate_refused_sentence(
@@ -1786,6 +1792,7 @@ async def execute_merge_deploy(
             # words, or that the gate reported none. One added line, never a
             # dump — the whole list is on the report.
             saw = what_the_gate_saw(summary)
+            # The checks ran and named what failed: a settled ending.
             return _settled(
                 _refused_before_merge(f"{sentence} {saw}" if saw else sentence)
             )
@@ -1797,9 +1804,10 @@ async def execute_merge_deploy(
         # The names were not reported, but the gate may still have said what
         # it saw; when it did, that is the only thing there is to go on.
         saw = what_the_gate_saw(summary) if summary.get("failed_assertions") else ""
-        return _settled(
-            _refused_before_merge(f"{sentence} {saw}" if saw else sentence)
-        )
+        refused = _refused_before_merge(f"{sentence} {saw}" if saw else sentence)
+        # Settled only when the check gave a verdict. With none, something
+        # went wrong with the check itself and the hold is kept.
+        return _settled(refused) if verdict is not None else refused
 
     def _replaced_here() -> MergeDeployOutcome:
         """A write changed no row: this worker has been replaced. Stop at once.
@@ -2285,7 +2293,9 @@ async def execute_merge_deploy(
                 ),
             },
         )
-        # Every step this ending dispatched gave its own answer.
+        # A settled ending: nothing was deployed by this press, or its deploy
+        # command stopped. One case got no answer of its own — the question
+        # to the target about what is running — and that is only a read.
         if already_running:
             return _settled(MergeDeployOutcome(
                 result=RESULT_WORD_PUBLISHED_DEPLOYMENT_PENDING,
@@ -3078,7 +3088,13 @@ async def execute_merge_deploy(
                         )
                     ),
                 )
-            # From here the deploy step gave its own answer: a settled ending.
+            # A SETTLED ENDING, KNOWINGLY. A promote whose connection to the
+            # sandbox was lost comes back here as "did not finish" too, and the
+            # hold is put down on it like any other failed deploy. That is
+            # kept on purpose: what stops a second deploy racing one that may
+            # still be running is the deployment lock and the target's own
+            # counter, which a takeover raises and the deploy step checks, not
+            # this hold. (A promote that raised, above, keeps the hold.)
             if deployed is None or outcome_word != "complete":
                 return _settled(_deploy_failed(
                     j_commit=j_commit,
