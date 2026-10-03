@@ -146,11 +146,12 @@ def _make_payload(
     mode: Any = None,
     task_id: str | None = None,
     profile: str | None = None,
+    branch: str = "main",
 ) -> SimpleNamespace:
     payload = SimpleNamespace(
         feature_id=feature_id,
         repo="guardkit/forge",
-        branch="main",
+        branch=branch,
         feature_yaml_path="/srv/forge/features/test/test.yaml",
         max_turns=5,
         sdk_timeout_seconds=1800,
@@ -277,16 +278,20 @@ class _FakeResumeLauncher:
         feature_id: str,
         correlation_id: str | None,
         repo: str | None = None,
+        branch: str | None = None,
     ) -> None:
         # ``repo`` is the SECOND-REPO thread: the rearm sweep reads it off the
         # restored builds row and hands it to the launch, so a re-armed build
-        # never falls through to the daemon's environment default.
+        # never falls through to the daemon's environment default. ``branch``
+        # rides the same way (3 October 2026, R4): without it a resumed build
+        # ran in the repository's shared checkout instead of its own worktree.
         self.calls.append(
             {
                 "build_id": build_id,
                 "feature_id": feature_id,
                 "correlation_id": correlation_id,
                 "repo": repo,
+                "branch": branch,
             }
         )
 
@@ -301,6 +306,7 @@ async def _seed_paused_via_first_session(
     mode: Any = None,
     task_id: str | None = None,
     profile: str | None = None,
+    branch: str = "main",
 ) -> str:
     """Run the live gate to a genuine PAUSED row, then kill the frame.
 
@@ -315,6 +321,7 @@ async def _seed_paused_via_first_session(
             mode=mode,
             task_id=task_id,
             profile=profile,
+            branch=branch,
         )
     )
     repo, sm = build_sqlite_gate_adapters(pool, clock=FixedClock())
@@ -493,6 +500,9 @@ class TestPostRestartApproveLaunches:
                 # Threaded from the restored builds row (_make_payload's repo),
                 # NOT left None for FORGE_DEFAULT_REPO to fill in.
                 "repo": "guardkit/forge",
+                # And its recorded branch, so the resumed build gets its own
+                # worktree like a fresh one (R4, 3 October 2026).
+                "branch": "main",
             }
         ]
         # Exactly one build-resumed on the wire (real decision/responder).
@@ -500,6 +510,68 @@ class TestPostRestartApproveLaunches:
         assert len(resumed) == 1
         assert resumed[0]["decision"] == "approve"
         assert resumed[0]["responder"] == RICH
+
+
+class TestTwoPausedBuildsOfOneRepositoryResumeOnTheirOwnBranches:
+    """R4, concurrent builds (3 October 2026).
+
+    Two features of one repository may build at once, each in its own
+    worktree — but only if the launch names the build's branch. The resume
+    after a restart used to name the repository and not the branch, so the
+    runner took its shared-checkout path, and two resumed builds of one
+    repository would have shared one folder. The branch is a required column
+    of the build's record, read here the same way the repository is.
+    """
+
+    @pytest.mark.asyncio
+    async def test_each_resumed_launch_names_its_own_recorded_branch(
+        self, nats: EventLogNats, pool: SqliteLifecyclePersistence
+    ) -> None:
+        first = await _seed_paused_via_first_session(
+            nats,
+            pool,
+            feature_id="FEAT-RGATE-A",
+            correlation_id="corr-gate-restart-A",
+            branch="planning/corr-gate-restart-A",
+        )
+        second = await _seed_paused_via_first_session(
+            nats,
+            pool,
+            feature_id="FEAT-RGATE-B",
+            correlation_id="corr-gate-restart-B",
+            branch="planning/corr-gate-restart-B",
+        )
+        # The daemon restarts with both builds waiting at their cards.
+        nats.reset_wire()
+        parts2 = _build_parts(nats)
+        _serve_deps_gating.bind_gate_parts(parts2)
+        repo2, sm2 = build_sqlite_gate_adapters(pool, clock=FixedClock())
+        launcher = _FakeResumeLauncher()
+
+        tasks = await rearm_paused_gates(
+            parts=parts2,
+            sqlite_pool=pool,
+            gate_repository=repo2,
+            gate_state_machine=sm2,
+            resume_launcher=launcher,
+            client=nats,
+            clock=FixedClock(),
+        )
+        assert len(tasks) == 2
+        for build_id in (first, second):
+            await nats.deliver_response(
+                build_id=build_id,
+                request_id=_request_id(build_id, 0),
+                decision="approve",
+            )
+        outcomes = await asyncio.wait_for(asyncio.gather(*tasks), timeout=5.0)
+
+        assert outcomes == [GateOutcome.RESUMED, GateOutcome.RESUMED]
+        launched = {call["build_id"]: call for call in launcher.calls}
+        assert set(launched) == {first, second}
+        assert launched[first]["repo"] == launched[second]["repo"] == "guardkit/forge"
+        assert launched[first]["branch"] == "planning/corr-gate-restart-A"
+        assert launched[second]["branch"] == "planning/corr-gate-restart-B"
 
 
 # ---------------------------------------------------------------------------
