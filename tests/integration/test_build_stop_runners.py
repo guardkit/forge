@@ -475,12 +475,7 @@ class TestThePlaceIsReleasedOnlyAfterTheStop:
 
                 bridge = LifecycleBridge(
                     registry=BridgeRegistry(connection=cx),
-                    build_stopper=build_runner_stop_check(
-                        sqlite_pool=pool,
-                        default_url=x_url,
-                        runner_url_for_feature=lambda f: urls[f],
-                        remember=True,
-                    ),
+                    build_stopper=lambda f, c: _check()(f, c, "cancel"),
                 )
                 bridge.attach(
                     BuildContext(
