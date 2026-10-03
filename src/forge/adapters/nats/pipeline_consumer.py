@@ -8,7 +8,11 @@ Responsibilities (per TASK-NFI-007):
 - Build the durable pull-consumer :class:`~nats.js.api.ConsumerConfig` exactly as
   specified in API contract §2.2 (``durable="forge-consumer"``,
   ``max_ack_pending=1``, ``ack_wait=1h``, ``deliver_policy=ALL``,
-  ``ack_policy=EXPLICIT``, ``max_deliver=-1``).
+  ``ack_policy=EXPLICIT``, ``max_deliver=-1``). Note: ``forge serve`` does
+  not use this config or :func:`start_pipeline_consumer`; its durable is
+  ``forge-serve``, attached by ``forge.cli._serve_daemon._attach_consumer``
+  with ``max_ack_pending`` set to the configured build limit
+  (``pipeline.max_concurrent_builds``, default 1).
 - Validate every incoming :class:`~nats_core.events.BuildQueuedPayload` and
   reject malformed payloads, unrecognised originators, and ``feature_yaml_path``
   values outside the configured filesystem allowlist by acking the JetStream
@@ -30,7 +34,9 @@ production wiring binds them to the concrete adapters in
 ADR / contract anchors:
 
 - API contract: ``docs/design/contracts/API-nats-pipeline-events.md``
-- Sequential-build constraint: ADR-ARCH-014 (``max_ack_pending=1``)
+- Build limit: ``max_ack_pending`` is the configured number of builds that
+  may hold a place at once (``pipeline.max_concurrent_builds``); the default
+  of 1 is ADR-ARCH-014's one build at a time.
 - Terminal-only ack semantics: ADR-SP-013
 - Crash recovery: :func:`reconcile_on_boot` (added in TASK-NFI-009).
 """
@@ -219,6 +225,10 @@ class PipelineConsumerDeps:
 
 def build_consumer_config() -> ConsumerConfig:
     """Return the durable pull-consumer config exactly as pinned by §2.2.
+
+    Not used by ``forge serve``, whose durable (``forge-serve``) is attached
+    by ``forge.cli._serve_daemon._attach_consumer`` with the configured
+    build limit. Left at ``max_ack_pending=1`` as the contract text records.
 
     Notes:
         ``filter_subject`` is set to the same subject as ``pull_subscribe``'s
@@ -591,9 +601,10 @@ async def handle_message(msg: _MsgLike, deps: PipelineConsumerDeps) -> None:
     except Exception as exc:
         # TASK-FW10-009 / Group C "dispatch error contained": the state
         # machine raised out of the dispatch path before reaching a
-        # terminal transition. We MUST stop the message from blocking
-        # the consumer (``max_ack_pending=1`` per ADR-ARCH-014) so the
-        # next delivered build is processed. Approach:
+        # terminal transition. We MUST stop the message from holding
+        # one of the consumer's build places (``max_ack_pending``, the
+        # configured build limit) so the next build can be delivered.
+        # Approach:
         #
         #   1. Log at WARNING with the failed identity for triage.
         #   2. Publish a terminal ``build-failed`` envelope (TASK-FORGE-

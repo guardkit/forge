@@ -205,6 +205,19 @@ class PipelineConfig(BaseModel):
             "events from any other originator are rejected."
         ),
     )
+    max_concurrent_builds: int = Field(
+        default=1,
+        ge=1,
+        description=(
+            "How many builds may hold a place on the build consumer at once. "
+            "It sets the consumer's max_ack_pending: the broker hands out at "
+            "most this many build messages that have not yet been "
+            "acknowledged, and a build keeps its place until it finishes "
+            "(including while it waits at the pre-build approval card). The "
+            "default of 1 keeps one build at a time. There is no upper limit "
+            "here; set the runner job slots to the same number."
+        ),
+    )
 
 
 class ApprovalConfig(BaseModel):
