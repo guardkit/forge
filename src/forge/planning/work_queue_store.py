@@ -43,6 +43,7 @@ References
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -94,6 +95,29 @@ def valid_queue_id(value: Any) -> int | None:
     return value
 
 
+def database_file(connection: sqlite3.Connection) -> str:
+    """The full path of the file a connection's main database lives in.
+
+    An empty string for a database held only in memory, which has no file
+    and is never the same database as any other connection's.
+    """
+    for row in connection.execute("PRAGMA database_list").fetchall():
+        if str(row[1]) == "main":
+            path = str(row[2] or "")
+            return os.path.realpath(path) if path else ""
+    return ""
+
+
+def same_database(
+    first: sqlite3.Connection, second: sqlite3.Connection
+) -> bool:
+    """True when two connections read and write the one database file."""
+    if first is second:
+        return True
+    first_file = database_file(first)
+    return bool(first_file) and first_file == database_file(second)
+
+
 @dataclass(frozen=True, slots=True)
 class FiledRow:
     """The answer to "file this sentence".
@@ -135,6 +159,21 @@ class WorkQueueStore:
         self._clock = clock or (lambda: datetime.now(timezone.utc))
 
     # -- reads ----------------------------------------------------------
+
+    @property
+    def connection(self) -> sqlite3.Connection:
+        """The connection this store reads and writes.
+
+        It is the forge's own database, where the planning runs, the builds,
+        the merge cards and the publication records are kept too; the
+        take-next loop reads those through it, so what it counts and what it
+        claims are read in the one place.
+        """
+        return self._connection
+
+    def database_file(self) -> str:
+        """The file this store's database lives in (see :func:`database_file`)."""
+        return database_file(self._connection)
 
     def get(self, queue_id: Any) -> sqlite3.Row | None:
         """Return one row by id, open or closed; None when there is no such id.
@@ -379,7 +418,8 @@ class WorkQueueStore:
         """Make one row wait for another. False when the wait cannot be made.
 
         Only the ``after_id`` column moves: the waiting row keeps its place in
-        the order and is simply not taken until its antecedent is DONE.
+        the order and is simply not taken until its antecedent's work has
+        landed (the take-next loop decides that; see its ``_is_eligible``).
 
         Refused, with nothing written and nothing recorded, when either id
         names no row, when the row is closed, when a row is asked to wait for
@@ -433,16 +473,43 @@ class WorkQueueStore:
 
     # -- admission (the take-next loop) ---------------------------------
 
-    def admit(self, queue_id: Any, *, actor_identity: str) -> bool:
+    def admit(
+        self,
+        queue_id: Any,
+        *,
+        actor_identity: str,
+        max_in_flight: int | None = None,
+        count_in_flight: Callable[[], int] | None = None,
+    ) -> bool:
         """Mark a QUEUED row ADMITTED — the loop is about to start its run.
 
         Compare-and-swap on QUEUED, so two loops (or a loop racing a drop)
         can never both admit the same row. False when the row was not QUEUED.
+
+        **Room and the claim are one step.** Given ``max_in_flight`` and
+        ``count_in_flight``, the count is taken inside the same
+        ``BEGIN IMMEDIATE`` transaction as the claim, and the row is admitted
+        only when the count is below the limit; otherwise nothing is written
+        and the answer is False. ``BEGIN IMMEDIATE`` takes the database's one
+        write lock before the count is read, so no other admitter — another
+        loop, another process, or anything else writing a planning run or a
+        build — can change what was counted until this claim has committed.
+        Two admitters can no longer both see the last place free and both take
+        it. The count must read this store's own database for that to hold;
+        the loop checks so when it is wired (``in_flight_database``).
         """
+        if (max_in_flight is None) != (count_in_flight is None):
+            raise ValueError(
+                "admit() takes max_in_flight and count_in_flight together, "
+                "or neither"
+            )
         checked = valid_queue_id(queue_id)
         if checked is None:
             return False
         with self._transaction():
+            if count_in_flight is not None and max_in_flight is not None:
+                if count_in_flight() >= max_in_flight:
+                    return False
             cursor = self._connection.execute(
                 """
                 UPDATE work_queue
@@ -770,5 +837,7 @@ __all__ = [
     "OPEN_STATUSES",
     "RANK_EPSILON",
     "WorkQueueStore",
+    "database_file",
+    "same_database",
     "valid_queue_id",
 ]

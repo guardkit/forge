@@ -1488,6 +1488,10 @@ async def compose_planning_consumer_and_dispatch(
             count_in_flight=lambda: count_in_flight(
                 pool, merge_offer_hold_seconds=merge_hold_seconds
             ),
+            # The count is taken again inside the queue's admission
+            # transaction, so it must read the queue's own database; the loop
+            # refuses to start if it does not.
+            in_flight_database=pool,
             planning_run=store.get_run,
             # The run's own events, so a run Rich rejected at the spec card closes as
             # "rejected by you" rather than "blocked" (2026-09-06; the reject is only
