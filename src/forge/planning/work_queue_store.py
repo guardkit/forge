@@ -506,6 +506,14 @@ class WorkQueueStore:
         checked = valid_queue_id(queue_id)
         if checked is None:
             return False
+        if count_in_flight is not None and self._connection.in_transaction:
+            # The count and the claim must run under this store's own BEGIN
+            # IMMEDIATE; joining a transaction someone else opened (perhaps a
+            # deferred one, holding no write lock) would let the count go stale.
+            raise RuntimeError(
+                "admit() with a count must open its own BEGIN IMMEDIATE "
+                "transaction; this connection is already inside one"
+            )
         with self._transaction():
             if count_in_flight is not None and max_in_flight is not None:
                 if count_in_flight() >= max_in_flight:
