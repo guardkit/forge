@@ -15,6 +15,7 @@ waiting, and nobody is asked.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Iterator
 from datetime import UTC, datetime
@@ -156,12 +157,31 @@ def _a_handed_over_with_b_after_it(
     return store, a_id, b_id, c_id
 
 
+def _another_build_of_the_feature_is_running(
+    persistence: SqliteLifecyclePersistence, feature_yaml: Path
+) -> None:
+    """An earlier build of FEAT-REFUSED, unrelated to the queue, is running."""
+    from nats_core.events import BuildQueuedPayload
+
+    other = json.loads(_message(feature_yaml, "corr-other-running").data)["payload"]
+    other["queued_at"] = other["requested_at"] = "2026-10-02T09:00:00+00:00"
+    build_id = persistence.record_pending_build(
+        BuildQueuedPayload.model_validate(other)
+    )
+    persistence.connection.execute(
+        "UPDATE builds SET status = 'RUNNING' WHERE build_id = ?", (build_id,)
+    )
+
+
 @pytest.mark.parametrize(
     ("how", "words"),
     [
         ("originator", "it was sent by cli-wrapper, which is not approved"),
         ("path", "is outside the folders builds may read"),
         ("sandbox", "sandbox-required"),
+        # 3 October 2026, round 2 (R6): another build of the same feature is
+        # already running, so this one is refused before its row is written.
+        ("same-feature", "another build of FEAT-REFUSED is already in progress"),
     ],
 )
 @pytest.mark.asyncio
@@ -170,10 +190,13 @@ async def test_a_refused_build_asks_hold_or_go_once(
 ) -> None:
     store, a_id, b_id, c_id = _a_handed_over_with_b_after_it(cx)
     config, feature_yaml = _config(tmp_path, how)
+    persistence = SqliteLifecyclePersistence(connection=cx)
+    if how == "same-feature":
+        _another_build_of_the_feature_is_running(persistence, feature_yaml)
     deps = build_pipeline_consumer_deps(
         _StubNatsClient(),
         config,
-        SqliteLifecyclePersistence(connection=cx),
+        persistence,
         async_task_starter=_Starter(),
     )
 
@@ -181,7 +204,12 @@ async def test_a_refused_build_asks_hold_or_go_once(
     await handle_message(refused, deps)
 
     assert refused.acks == 1
-    assert cx.execute("SELECT COUNT(*) FROM builds").fetchone()[0] == 0
+    assert (
+        cx.execute(
+            "SELECT COUNT(*) FROM builds WHERE correlation_id = ?", (CID_A,)
+        ).fetchone()[0]
+        == 0
+    )
     assert store.has_event(a_id, BUILD_REJECTED_ACTION)
 
     notifier = Notifier()
@@ -198,6 +226,13 @@ async def test_a_refused_build_asks_hold_or_go_once(
     # Held: unrelated work goes ahead; B goes once someone puts it next.
     assert await loop.take_next() == c_id
     assert store.get(b_id)["status"] == "QUEUED"
+    if how == "same-feature":
+        # The other running build counts as work in flight (limit 2, with C);
+        # it finishes before B is put next.
+        cx.execute(
+            "UPDATE builds SET status = 'COMPLETE' WHERE correlation_id = ?",
+            ("corr-other-running",),
+        )
     store.promote(b_id, actor_identity=USER)
     assert await loop.take_next() == b_id
 

@@ -1214,6 +1214,17 @@ def _build_dispatch_build(
                     what="a second build of the same feature",
                     log=logger,
                 )
+            else:
+                # No build row will ever exist for this delivery: note the
+                # refusal on the sentence's queue row so a row waiting "after"
+                # it is asked "hold or go" rather than left waiting.
+                from forge.adapters.nats.pipeline_consumer import (
+                    note_build_rejection,
+                )
+
+                note_build_rejection(
+                    record_build_rejection, payload.correlation_id, reason
+                )
             if lifecycle_emitter is not None:
                 from forge.pipeline import BuildContext
 
