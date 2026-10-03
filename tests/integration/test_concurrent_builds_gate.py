@@ -357,3 +357,140 @@ async def test_two_builds_of_one_feature_one_goes_ahead(
             await asyncio.wait_for(daemon, timeout=5)
         except asyncio.CancelledError:
             pass
+
+
+# ---------------------------------------------------------------------------
+# R4 round 2: the earlier build's observer outlives its terminal row
+# ---------------------------------------------------------------------------
+
+
+class _BlockedStop:
+    """Stand-in for the stop confirmation: the first build's runner has not
+    confirmed its stop until ``confirm`` is set; any other build is
+    confirmed at once."""
+
+    def __init__(self, blocked_correlation: str) -> None:
+        self.blocked = blocked_correlation
+        self.confirm = asyncio.Event()
+
+    async def ack_when_stopped(
+        self, feature_id: str, correlation_id: str, ack: Any, *, where: str
+    ) -> None:
+        if correlation_id == self.blocked:
+            await self.confirm.wait()
+        await ack()
+
+
+@pytest.mark.asyncio
+async def test_a_later_build_waits_for_the_earlier_observer_to_finish(
+    nats: OrderRecordingNats,  # noqa: F811 — imported fixture
+    pool: Any,  # noqa: F811 — imported fixture
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from forge.cli import _serve_deps
+    from forge.lifecycle_bridge.bridge import LifecycleBridge
+    from forge.lifecycle_bridge.translation import StreamEventTranslator
+    from forge.lifecycle_bridge.wireup import LifecycleBridgeWireup
+    from forge.persistence.migrations import lifecycle_bridge_registry
+    from forge.persistence.repositories.bridge_registry import BridgeRegistry
+
+    lifecycle_bridge_registry.apply(pool.connection)
+    monkeypatch.setattr(_serve_deps, "OBSERVER_BUSY_RETRY_SECONDS", 0.05)
+    first, second = EARLY, LATE
+    stop = _BlockedStop(first[0])
+    wireup = LifecycleBridgeWireup(
+        bridge=LifecycleBridge(registry=BridgeRegistry(connection=pool.connection)),
+        translator=StreamEventTranslator(),
+        publisher=object(),
+        stream_source=object(),
+        ack_guard=stop,
+    )
+    # The run itself is not under test: each observer waits for its build to
+    # be told it reached terminal, then runs the REAL terminal sequence
+    # (_on_terminal: stop confirmation, ack, detach).
+    terminal: dict[str, asyncio.Event] = {
+        first[0]: asyncio.Event(),
+        second[0]: asyncio.Event(),
+    }
+
+    async def _observer(context: Any, handle: Any) -> None:
+        await terminal[context.correlation_id].wait()
+        await wireup._on_terminal(handle, context.feature_id, context.correlation_id)
+
+    monkeypatch.setattr(wireup, "_observer_loop", _observer)
+
+    cfg = _forge_config()
+    parts = _build_parts(nats, forge_config=cfg)
+    _serve_deps_gating.bind_gate_parts(parts)
+    repo, sm = build_sqlite_gate_adapters(pool, clock=FixedClock())
+    starter = _FakeStarter()
+    deps = build_pipeline_consumer_deps(
+        nats,
+        cfg,
+        pool,
+        async_task_starter=starter,
+        register_ack_handle=wireup.register_ack_handle,
+        gate_repository=repo,
+        gate_state_machine=sm,
+        gate_clock=FixedClock(),
+    )
+    monkeypatch.setattr(
+        _serve_daemon, "dispatch_payload", make_handle_message_dispatcher(deps)
+    )
+    msgs = {
+        corr: _Msg(_envelope(SAME, corr, queued_at), f"pipeline.build-queued.{SAME}")
+        for corr, queued_at in (first, second)
+    }
+    build_1 = derive_build_id(SAME, first[1])
+    build_2 = derive_build_id(SAME, second[1])
+    launched = lambda: [launch["build_id"] for launch in starter.launches]  # noqa: E731
+    sub = _Sub([msgs[first[0]]])
+    daemon = asyncio.create_task(
+        run_daemon_with_limit(_Client(_JS(sub)), max_concurrent_builds=2)
+    )
+    try:
+        # Build 1: card, approval, launch, observer.
+        await _drive_response(
+            nats, build_id=build_1, request_id=_request_id(build_1), decision="approve"
+        )
+        await _wait_until(lambda: launched() == [build_1], what="build 1 launches")
+
+        # Build 1 ends: its row is terminal, but its runner has not confirmed
+        # the stop, so its observer is still live and its message unacked.
+        pool.connection.execute(
+            "UPDATE builds SET status = 'COMPLETE' WHERE build_id = ?", (build_1,)
+        )
+        terminal[first[0]].set()
+        await asyncio.sleep(0.1)
+        assert msgs[first[0]].acks == 0
+
+        # Build 2 of the same feature arrives, passes the row check (build 1
+        # is terminal), is approved — and does NOT launch while build 1's
+        # observer is still finishing.
+        sub._msgs.append(msgs[second[0]])
+        await _drive_response(
+            nats, build_id=build_2, request_id=_request_id(build_2), decision="approve"
+        )
+        await asyncio.sleep(0.5)
+        assert launched() == [build_1], "build 2 must wait for build 1's observer"
+        assert msgs[second[0]].acks == 0
+
+        # The stop is confirmed: build 1 is acknowledged and its observer
+        # ends; build 2 then launches with its own observer.
+        stop.confirm.set()
+        await _wait_until(lambda: launched() == [build_1, build_2], what="build 2 launches")
+        assert msgs[first[0]].acks == 1
+        assert wireup._observer_correlations[SAME] == second[0]
+
+        # Build 2 reaches terminal and is acknowledged once.
+        terminal[second[0]].set()
+        await _wait_until(lambda: msgs[second[0]].acks == 1, what="build 2 acked")
+        await asyncio.sleep(0.1)
+        assert msgs[first[0]].acks == 1
+        assert msgs[second[0]].acks == 1
+    finally:
+        daemon.cancel()
+        try:
+            await asyncio.wait_for(daemon, timeout=5)
+        except asyncio.CancelledError:
+            pass

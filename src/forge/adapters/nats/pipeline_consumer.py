@@ -782,9 +782,12 @@ def _make_deferred_registration(
     works) — the same non-fatal posture the pre-relocation call had.
     """
 
-    async def _register() -> None:
+    async def _register() -> bool | None:
+        # Passes on the registry's answer: ``False`` means it refused this
+        # build because another build of the feature still has a live
+        # observer; the caller then waits instead of launching.
         try:
-            await register_ack_handle(feature_id, correlation_id, handle)
+            return await register_ack_handle(feature_id, correlation_id, handle)
         except Exception as reg_exc:  # noqa: BLE001 — non-fatal registration
             logger.warning(
                 "pipeline_consumer: deferred register_ack_handle raised (%s) "
@@ -794,6 +797,7 @@ def _make_deferred_registration(
                 feature_id,
                 correlation_id,
             )
+            return None
 
     return _register
 

@@ -595,6 +595,9 @@ class LifecycleBridgeWireup:
         # supervisor queries answered from the bridge's in-memory dict
         # never traverse this map.
         self._observers: dict[str, asyncio.Task[None]] = {}
+        # The correlation each feature's observer was started for, so a
+        # redelivery of the same build can be told from a different build.
+        self._observer_correlations: dict[str, str] = {}
         # Per-feature handle book-keeping so the observer can ack on
         # terminal arrival even when the consumer's own reference has
         # been released.
@@ -621,7 +624,7 @@ class LifecycleBridgeWireup:
         feature_id: str,
         correlation_id: str,
         handle: BuildAckHandle,
-    ) -> None:
+    ) -> bool:
         """Implement :data:`InFlightAckRegistry` for the pipeline consumer.
 
         AC-1: This is the consumer-bridge boundary. Inbound
@@ -647,6 +650,12 @@ class LifecycleBridgeWireup:
                 JetStream ``Msg``. The wireup retains a reference so
                 the observer's terminal-arrival ack does not race the
                 consumer's local reference cleanup.
+
+        Returns:
+            ``True`` when the build is attached (or is a redelivery of the
+            build already attached); ``False`` when a different build of the
+            same feature still has a live observer, in which case nothing is
+            attached and the caller must not launch yet.
 
         Raises:
             ValueError: If ``feature_id`` or ``correlation_id`` is empty.
@@ -674,22 +683,38 @@ class LifecycleBridgeWireup:
                 "be a BuildAckHandle (got None)"
             )
 
-        # Idempotency: a second registration for the same feature_id is
-        # a benign re-dispatch (consumer redelivery, supervisor
-        # re-attach). Keep the first observer running and drop the
-        # second handle silently — the consumer's flag-based ack
+        # Idempotency: a second registration for the same build (same
+        # feature_id AND correlation_id) is a benign re-dispatch (consumer
+        # redelivery, supervisor re-attach). Keep the first observer running
+        # and drop the second handle — the consumer's flag-based ack
         # idempotency means whichever handle wins ack() is fine.
+        #
+        # A DIFFERENT build of the same feature while that observer is still
+        # live (for example the earlier build is waiting for its runner to
+        # confirm the stop) is refused with ``False``: one observer per
+        # feature, and dropping it silently would strand the new build. The
+        # caller waits and asks again rather than launching.
         if feature_id in self._observers:
             existing = self._observers[feature_id]
             if not existing.done():
+                if self._observer_correlations.get(feature_id) == correlation_id:
+                    logger.info(
+                        "wireup.register_ack_handle: feature_id=%s already "
+                        "has a live observer; ignoring duplicate registration "
+                        "(correlation_id=%s)",
+                        feature_id,
+                        correlation_id,
+                    )
+                    return True
                 logger.info(
-                    "wireup.register_ack_handle: feature_id=%s already "
-                    "has a live observer; ignoring duplicate registration "
-                    "(correlation_id=%s)",
+                    "wireup.register_ack_handle: feature_id=%s still has a "
+                    "live observer for correlation_id=%s; refusing "
+                    "correlation_id=%s until it finishes",
                     feature_id,
+                    self._observer_correlations.get(feature_id),
                     correlation_id,
                 )
-                return
+                return False
 
         # Build the context the bridge expects. ``thread_id`` and
         # ``run_id`` are not yet known at registration time — they are
@@ -727,6 +752,7 @@ class LifecycleBridgeWireup:
             name=f"lifecycle-bridge-observer-{feature_id}",
         )
         self._observers[feature_id] = task
+        self._observer_correlations[feature_id] = correlation_id
         logger.info(
             "wireup.register_ack_handle: attached feature_id=%s "
             "correlation_id=%s; observer task scheduled "
@@ -735,6 +761,7 @@ class LifecycleBridgeWireup:
             correlation_id,
             deadline_at.isoformat(),
         )
+        return True
 
     # ------------------------------------------------------------------
     # Observer task — per-build SSE consumer loop
