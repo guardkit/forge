@@ -1103,7 +1103,9 @@ class TestEveryDeployLegRunsTheStepsOfItsOwnCommit:
         _git(clone, "commit", "-q", "-m", message)
         return _git(clone, "rev-parse", "HEAD")
 
-    def _a_clone_left_behind(self, clone: Path, log: Path) -> tuple[str, str]:
+    def _a_clone_left_behind(
+        self, clone: Path, log: Path, *, deploy: str = _NEW_DEPLOY_STEP
+    ) -> tuple[str, str]:
         """``(old, started_at)``: main carries the steps as they ship now, the
         build starts there, and the clone's working copy is left months back."""
         old = self._commit_the_steps(
@@ -1116,7 +1118,7 @@ class TestEveryDeployLegRunsTheStepsOfItsOwnCommit:
         )
         started_at = self._commit_the_steps(
             clone,
-            deploy=_NEW_DEPLOY_STEP,
+            deploy=deploy,
             health=_NEW_HEALTH_CHECK,
             gate=_NEW_LIVE_GATE,
             log=log,
@@ -1165,6 +1167,7 @@ class TestEveryDeployLegRunsTheStepsOfItsOwnCommit:
         tmp_path: Path,
         started_at: str,
         monkeypatch: pytest.MonkeyPatch,
+        publisher: Any = None,
     ) -> Any:
         """The whole press, with the real dispatcher and stage beneath it.
 
@@ -1199,7 +1202,7 @@ class TestEveryDeployLegRunsTheStepsOfItsOwnCommit:
                 config=config, nats_client=_Bus(), db_path=tmp_path / "forge.db"
             ),
             git_surface=compose_merge_git_surface(config),
-            publisher=_the_publisher,
+            publisher=publisher or _the_publisher,
             what_the_machine_says=WhatTheMachineSays(
                 the_publisher_passed_its_self_check=True
             ),
@@ -1375,3 +1378,163 @@ class TestEveryDeployLegRunsTheStepsOfItsOwnCommit:
             "gate",
         ]
         assert not (clone / ".forge-candidates" / FEATURE_ID).exists()
+
+    @staticmethod
+    def _the_clone_can_no_longer_lay_a_tree_out(
+        monkeypatch: pytest.MonkeyPatch, *, after: int = 0
+    ) -> list[str]:
+        """From the ``after``-th lay-out on, the helper cannot lay a tree out.
+
+        The helper's own route is left real; only the lay-out it calls refuses,
+        in the words a real failure carries. Returns the commits it was asked
+        to lay out, refused or not.
+        """
+        from forge.deploy import candidate_tree
+
+        real = candidate_tree.materialise_candidate_tree
+        asked: list[str] = []
+
+        async def _lay_out(repo_root: Any, feature_id: str, sha: str) -> Any:
+            asked.append(str(sha))
+            if len(asked) > after:
+                raise candidate_tree.CandidateTreeError(
+                    f"git archive {sha} failed: the clone could not be read"
+                )
+            return await real(repo_root, feature_id, sha)
+
+        monkeypatch.setattr(candidate_tree, "materialise_candidate_tree", _lay_out)
+        return asked
+
+    @pytest.mark.asyncio
+    async def test_a_deploy_whose_tree_cannot_be_laid_out_asks_and_deploys_nothing(
+        self,
+        a_helper_that_deploys: tuple[str, dict[str, Any]],
+        pool: SqliteLifecyclePersistence,
+        clone: Path,
+        on_this_side: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        _receipts_env: Path,
+    ) -> None:
+        """No tree of the joined commit, no question and no promote — and
+        never the working copy's steps instead."""
+        from forge.pipeline.deployment_lock import DeploymentLockStore
+
+        log = tmp_path / "which-steps-ran.log"
+        _, started_at = self._a_clone_left_behind(clone, log)
+        config = self._config(a_helper_that_deploys[0], on_this_side)
+        # The first press publishes and deploys nothing: the target is held.
+        lock = DeploymentLockStore(pool.connection)
+        target = f"{REPO}::live"
+        held = lock.grant(
+            target=target,
+            build_id="another-build",
+            turn=1,
+            holder="somebody-else",
+            now=datetime.now(UTC),
+        )
+        assert held is not None
+        first = await self._press_it(
+            config, pool, clone, on_this_side, tmp_path, started_at, monkeypatch
+        )
+        assert first.result == "published-deployment-pending", first.detail
+        assert lock.release(target=target, counter=held.counter, now=datetime.now(UTC))
+        log.write_text("", encoding="utf-8")
+        # The pick-up has to lay the joined commit's tree out, and cannot.
+        asked = self._the_clone_can_no_longer_lay_a_tree_out(monkeypatch)
+
+        again = await self._press_it(
+            config, pool, clone, on_this_side, tmp_path, started_at, monkeypatch
+        )
+
+        assert again.result == "published-deployment-pending", again.detail
+        assert "could not be laid out" in again.detail
+        assert "was not asked what it is running and nothing was deployed" in (
+            again.detail
+        )
+        # It was asked for the joined commit's tree, once ...
+        assert len(asked) == 1
+        # ... and not one of the project's steps ran: no question, no promote,
+        # and nothing out of the working copy instead.
+        assert log.read_text(encoding="utf-8") == ""
+        # The target was never taken for this build.
+        assert lock.read(target).counter == held.counter
+
+    @pytest.mark.asyncio
+    async def test_a_candidate_whose_tree_cannot_be_laid_out_is_left_standing_and_said(
+        self,
+        a_helper_that_deploys: tuple[str, dict[str, Any]],
+        pool: SqliteLifecyclePersistence,
+        clone: Path,
+        on_this_side: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        _receipts_env: Path,
+    ) -> None:
+        """The cleanup that cannot have the candidate's own tree leaves the
+        candidate where it is and says so, rather than run the working copy's
+        teardown step — which may not know the teardown at all.
+
+        Driven the one way the press reaches it: the remote moves under the
+        send, the first attempt's candidate does not come down (its teardown
+        step fails) and its tree is removed, the next attempt's tree cannot be
+        laid out, and at the end the cleanup cannot lay out the first
+        candidate's tree again either.
+        """
+        log = tmp_path / "which-steps-ran.log"
+        a_teardown_that_fails = _NEW_DEPLOY_STEP.replace(
+            "exit 0\n", '[ "$mode" = down ] && exit 1\nexit 0\n'
+        )
+        _, started_at = self._a_clone_left_behind(
+            clone, log, deploy=a_teardown_that_fails
+        )
+        config = self._config(a_helper_that_deploys[0], on_this_side)
+        bare = _git(clone, "remote", "get-url", "origin")
+        asked = self._the_clone_can_no_longer_lay_a_tree_out(monkeypatch, after=1)
+
+        async def _the_remote_moves(_config: Any, request: dict[str, Any]) -> dict[str, Any]:
+            # Somebody else lands work on the remote under the send.
+            other = tmp_path / "somebody-else"
+            subprocess.run(
+                ["git", "clone", "-q", bare, str(other)],
+                check=True,
+                capture_output=True,
+                env=_GIT_ENV,
+            )
+            (other / "elsewhere.txt").write_text("their work\n", encoding="utf-8")
+            _git(other, "add", "elsewhere.txt")
+            _git(other, "commit", "-q", "-m", "somebody else's work")
+            _git(other, "push", "-q", "origin", "main")
+            return {
+                "published": False,
+                "remote_now": _git(other, "rev-parse", "main"),
+                "contains_j": False,
+                "refusal": "the remote moved under the send",
+                "refusal_kind": "the-remote-moved",
+            }
+
+        outcome = await self._press_it(
+            config,
+            pool,
+            clone,
+            on_this_side,
+            tmp_path,
+            started_at,
+            monkeypatch,
+            publisher=_the_remote_moves,
+        )
+
+        assert outcome.result == "candidate-refused", outcome.detail
+        # The first attempt's tree, the second attempt's (refused), and the
+        # first candidate's tree again at the cleanup (refused).
+        assert len(asked) == 3 and asked[2] == asked[0] != asked[1], asked
+        # The check ran from the first tree, and its teardown was tried there
+        # and failed; nothing at all ran from the working copy, and nothing
+        # ran after the cleanup could not lay the candidate's tree out.
+        assert self._which_ran(log, clone) == ["candidate", "health", "gate", "down"]
+        left = _receipt(_receipts_env, "merge_deploy_cleanup.json")
+        assert left["candidate_torn_down"] is False
+        sentence = left["candidate_left_standing"]
+        assert "was left in place because the tree of" in sentence
+        assert "could not be laid out" in sentence
+        assert "remove it by hand" in sentence
