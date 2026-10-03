@@ -995,6 +995,16 @@ def _build_dispatch_build(
                         build_id,
                         state.value,
                     )
+                    if ack_guard is not None:
+                        # A CANCELLED build's slot waits for its runner's
+                        # confirmed stop (3 October 2026).
+                        await ack_guard.ack_when_stopped(
+                            payload.feature_id,
+                            payload.correlation_id,
+                            ack_callback,
+                            where="dispatch_build sandbox-policy terminal",
+                        )
+                        return
                     await ack_callback()
                     return
                 if not runless_replay:

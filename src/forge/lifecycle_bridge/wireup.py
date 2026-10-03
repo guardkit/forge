@@ -586,6 +586,7 @@ class LifecycleBridgeWireup:
         # build's runner must confirm that everything the build owns is gone.
         # ``None`` (unit tiers) acknowledges as before.
         self._ack_guard = ack_guard
+        self._interrupted_runs: set[str] = set()
         # Per-feature budget-detection state (one session per observer task).
         # Created at observer start when a detector is wired, dropped in the
         # observer's ``finally`` — so the review-cycle count resets on bridge
@@ -1148,6 +1149,10 @@ class LifecycleBridgeWireup:
 
         if snapshot is None:
             return False
+        if getattr(snapshot, "status", None) == "interrupted":
+            # Remembered for the no-terminal path: an interrupted run's
+            # acknowledgement waits for its runner's confirmed stop.
+            self._interrupted_runs.add(feature_id)
 
         return await self._replay_run_state_snapshot(
             snapshot=snapshot,
@@ -1800,7 +1805,7 @@ class LifecycleBridgeWireup:
         feature_id: str,
         correlation_id: str,
         *,
-        cancelled: bool = False,
+        cancelled: bool | None = False,
     ) -> None:
         """Run the terminal-arrival sequence (AC-4).
 
@@ -1816,41 +1821,49 @@ class LifecycleBridgeWireup:
         Both calls are guarded so a transient transport error in either
         cannot leave the observer loop unable to exit.
 
-        A CANCELLED terminal (``cancelled=True``) is acknowledged only once
-        the build's runner confirms that everything the build owns is gone
-        (3 October 2026). Until then this waits, asking again every 30
-        seconds; the registry row stays, and a factory restart leaves the
-        message unacknowledged for the consumer to ask about again.
+        A CANCELLED terminal (``cancelled=True``; ``None`` = the check reads
+        the build's row) is acknowledged only once the build's runner
+        confirms that everything the build owns is gone (3 October 2026).
+        Until then the acknowledgement is held by the guard's one checker
+        for this build, which asks again every 30 seconds; the registry row
+        stays, and a factory restart leaves the message unacknowledged for
+        the consumer to ask about again.
         """
-        if cancelled and self._ack_guard is not None:
-            await self._ack_guard.wait_until_stopped(
+
+        async def _ack_and_detach() -> None:
+            try:
+                await handle.ack()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "wireup._on_terminal: handle.ack() raised (%s) for "
+                    "feature_id=%s correlation_id=%s; leaving registry row "
+                    "in place for recover_in_flight",
+                    exc,
+                    feature_id,
+                    correlation_id,
+                )
+                return
+            try:
+                self._bridge.detach(feature_id, correlation_id=correlation_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "wireup._on_terminal: bridge.detach raised (%s) for "
+                    "feature_id=%s correlation_id=%s; row may be stale",
+                    exc,
+                    feature_id,
+                    correlation_id,
+                )
+
+        if cancelled is not False and self._ack_guard is not None:
+            await self._ack_guard.ack_when_stopped(
                 feature_id,
                 correlation_id,
-                cancelled=True,
+                _ack_and_detach,
+                cancelled=cancelled,
                 where="the cancelled build's terminal",
             )
-        try:
-            await handle.ack()
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "wireup._on_terminal: handle.ack() raised (%s) for "
-                "feature_id=%s correlation_id=%s; leaving registry row "
-                "in place for recover_in_flight",
-                exc,
-                feature_id,
-                correlation_id,
-            )
             return
-        try:
-            self._bridge.detach(feature_id, correlation_id=correlation_id)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "wireup._on_terminal: bridge.detach raised (%s) for "
-                "feature_id=%s correlation_id=%s; row may be stale",
-                exc,
-                feature_id,
-                correlation_id,
-            )
+        await _ack_and_detach()
 
     def _spawn_merge_offer(self, event: PipelineEvent) -> None:
         """Fire the merge-offer hook for a published terminal, detached.
@@ -2211,7 +2224,16 @@ class LifecycleBridgeWireup:
         )
         published = await self._publish_event(payload, feature_id)
         if published:
-            await self._on_terminal(handle, feature_id, context.correlation_id)
+            # An interrupted run (or a row already CANCELLED, which the check
+            # reads) is acknowledged only after its runner confirms the stop.
+            interrupted = feature_id in self._interrupted_runs
+            self._interrupted_runs.discard(feature_id)
+            await self._on_terminal(
+                handle,
+                feature_id,
+                context.correlation_id,
+                cancelled=True if interrupted else None,
+            )
         else:
             logger.warning(
                 "wireup: synthetic build-failed publish FAILED for "
@@ -2295,6 +2317,10 @@ class LifecycleBridgeWireup:
         # (e.g. test fixtures) starts from a clean state.
         self._observers.clear()
         self._handles.clear()
+        # Held acknowledgements of cancelled builds stay unacknowledged; the
+        # next process's consumer asks again when the message comes back.
+        if self._ack_guard is not None:
+            await self._ack_guard.shutdown()
         self._bridge.shutdown()
         logger.info(
             "wireup.shutdown: drained %d observer task(s)",

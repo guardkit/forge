@@ -693,7 +693,31 @@ class LifecycleBridge:
                     "runner_stop_failed", feature_id,
                 )
                 raise
-            if not getattr(answer, "stopped", False):
+            if getattr(answer, "route_missing", False):
+                # An older runner image has no stop route: interrupt the run
+                # as before; its cancel handler kills what it can.
+                logger.warning(
+                    "lifecycle_bridge.request_cancel feature_id=%s older "
+                    "runner image (no stop route); interrupting the run",
+                    feature_id,
+                )
+                try:
+                    client = self._sdk_client
+                    if client is None:
+                        from langgraph_sdk import get_client
+
+                        client = get_client(url=answer.runner_url)
+                    await client.runs.cancel(
+                        entry.thread_id, entry.run_id, action="interrupt"
+                    )
+                except Exception:
+                    self._cancel_in_flight.discard(feature_id)
+                    logger.exception(
+                        "lifecycle_bridge.request_cancel feature_id=%s "
+                        "sdk_cancel_failed", feature_id,
+                    )
+                    raise
+            elif not getattr(answer, "stopped", False):
                 # The place stays held: the acknowledgement of this build
                 # asks the runner again before it lets the place go.
                 logger.warning(
