@@ -591,10 +591,17 @@ only_the_line_endings() {
 # read-only. It holds no path and no value belonging to any machine, and no
 # project's anything: it is the factory's own launch declaration, four lines
 # long, and it is here so that the runner needs nothing of the outside world.
+# Beside the graph it serves one route of the factory's own (3 October 2026):
+# stop a build and say when everything it owns is gone (see
+# forge.subagents.runner_http). A cancel asks it, and so does the factory
+# before it lets a cancelled build's place go.
 RUNNER_GRAPH_CONFIG='{
     "dependencies": ["forge"],
     "graphs": {
         "autobuild_runner": "forge.subagents.autobuild_runner:graph"
+    },
+    "http": {
+        "app": "forge.subagents.runner_http:app"
     }
 }'
 RUNNER_CONFIG_FILE="${STATE_ROOT}/langgraph.json"
@@ -1489,7 +1496,23 @@ start_helper() {
     >/dev/null
 }
 
+# FIXTURE CONTAINERS LEFT BY A RUNNER THAT IS GONE (3 October 2026). A runner
+# restart kills every process inside it, but the containers a build's tests
+# started live on this sandbox's engine and carry on. They carry GuardKit's
+# fixture label, and before a runner starts no build can be running, so every
+# one of them is removed here. Never anything without that label.
+remove_leftover_fixtures() {
+  local ids=""
+  ids="$("${DOCKER}" ps --all --quiet --filter "label=guardkit.fixture.owner" 2>/dev/null | tr -d '\r' || true)"
+  if [[ -n "${ids}" ]]; then
+    log "removing $(printf '%s\n' "${ids}" | wc -l | tr -d ' ') fixture container(s) a build left behind before this runner starts"
+    # shellcheck disable=SC2086 # one id per word, by construction
+    "${DOCKER}" rm --force ${ids} >/dev/null 2>&1 || log "note: not every leftover fixture container could be removed"
+  fi
+}
+
 start_runner() {
+  remove_leftover_fixtures
   log "starting the build runner from ${IMAGE_REFERENCE} on this sandbox's own network, ${BIND}:${RUNNER_PORT}"
   # The runner is where a build runs the project's own checks, and a project's
   # test suite may start its services as containers (see above for why the
