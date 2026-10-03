@@ -369,3 +369,102 @@ def test_a_restart_relaunch_stops_the_original_first(
         assert "publish_build_cancelled" not in seen["published"]
     else:
         assert not (estate.records / f"{FEATURE}.relaunch.started").exists()
+
+
+# ---------------------------------------------------------------------------
+# After the held stop: an error releases the place; a failed identity clear
+# holds (coach finding on the recovered-dispatch continuation)
+# ---------------------------------------------------------------------------
+
+
+class _HeldThenStopped:
+    """A runner that cannot confirm the stop at first, then can."""
+
+    def __init__(self, held_answers: int = 2) -> None:
+        self.calls = 0
+        self._held = held_answers
+
+    async def __call__(self, feature_id: str, correlation_id: str, purpose: str = "ack"):
+        from forge.lifecycle_bridge.build_stop import StopAnswer
+
+        self.calls += 1
+        if self.calls <= self._held:
+            return StopAnswer(stopped=False, reason="the original is still running")
+        return StopAnswer(stopped=True)
+
+
+def _recovered_deps(nats: Any, pool: Any, check: Any) -> tuple[Any, str, bytes]:  # noqa: F811
+    from forge.lifecycle_bridge.build_stop import AckAfterStop
+
+    _serve_deps_gating._reset_for_tests()
+    cfg = _open_config()
+    _serve_deps_gating.bind_gate_parts(_build_parts(nats, forge_config=cfg))
+    repo, sm = build_sqlite_gate_adapters(pool, clock=FixedClock())
+    deps = build_pipeline_consumer_deps(
+        nats,
+        cfg,
+        pool,
+        async_task_starter=object(),
+        gate_repository=repo,
+        gate_state_machine=sm,
+        gate_clock=FixedClock(),
+        ack_guard=AckAfterStop(check, recheck_seconds=0.1),
+    )
+    correlation = f"corr-cont-{uuid.uuid4().hex[:8]}"
+    data = _envelope(correlation)
+    payload = BuildQueuedPayload.model_validate(json.loads(data)["payload"])
+    build_id = pool.record_pending_build(payload)
+    # Boot recovery's verdict on a build whose run it could not see.
+    pool.connection.execute(
+        "UPDATE builds SET status = 'INTERRUPTED' WHERE build_id = ?", (build_id,)
+    )
+    return deps, build_id, data
+
+
+@pytest.mark.parametrize("failure", ["gate-raises", "identity-clear-fails"])
+def test_after_a_held_stop_an_error_releases_and_a_failed_clear_holds(
+    nats, pool, monkeypatch, failure  # noqa: F811 — imported fixtures
+) -> None:
+    from forge.adapters.nats.pipeline_consumer import handle_message
+    from forge.cli import _serve_gate_activation
+
+    check = _HeldThenStopped()
+    deps, build_id, data = _recovered_deps(nats, pool, check)
+    gate_calls: list[str] = []
+
+    async def _gate_down(**kwargs: Any) -> Any:
+        gate_calls.append(kwargs["build_id"])
+        raise RuntimeError("gate transport down")
+
+    monkeypatch.setattr(_serve_gate_activation, "maybe_gate_build", _gate_down)
+    if failure == "identity-clear-fails":
+        pool.connection.execute("DROP TABLE async_tasks")
+    msg = _Msg(data)
+
+    async def _go() -> None:
+        await handle_message(msg, deps)
+        assert msg.acks == 0 and check.calls == 1, "the stop was not held"
+        deadline = asyncio.get_running_loop().time() + 10
+        while check.calls <= 2 or deps.ack_guard.held():
+            assert asyncio.get_running_loop().time() < deadline
+            await asyncio.sleep(0.05)
+        await asyncio.sleep(0.5)  # a second ack or publish would land here
+        await deps.ack_guard.shutdown()
+
+    try:
+        asyncio.run(_go())
+    finally:
+        _serve_deps_gating._reset_for_tests()
+    failed = nats.published.get(f"pipeline.build-failed.{FEATURE}", [])
+    if failure == "gate-raises":
+        # The continuation ran and raised: the build is reported failed once
+        # and its place released once.
+        assert gate_calls == [build_id]
+        assert len(failed) == 1, failed
+        assert msg.acks == 1
+    else:
+        # The original's identity could not be cleared: no continuation, no
+        # report, no acknowledgement — the redelivery tries again.
+        assert gate_calls == []
+        assert failed == []
+        assert msg.acks == 0

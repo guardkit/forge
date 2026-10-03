@@ -1032,19 +1032,61 @@ def _build_dispatch_build(
                     "DELETE FROM async_tasks WHERE build_id = ?", (build_id,)
                 )
             except sqlite3.Error as exc:
-                logger.warning(
+                # Carrying on would let the relaunch's observer find the
+                # stopped original's thread. Hold instead: the message stays
+                # unacknowledged and its redelivery tries again.
+                logger.error(
                     "dispatch_build: could not clear the stopped original's "
-                    "identity for build_id=%s (%s)",
+                    "identity for build_id=%s (%s); holding the message "
+                    "WITHOUT ack so its redelivery tries again",
                     build_id,
                     exc,
                 )
-            await dispatch_build(
-                payload,
-                ack_callback,
-                register_observer,
-                runless_replay=runless_replay,
-                _original_stopped=True,
-            )
+                return
+            try:
+                await dispatch_build(
+                    payload,
+                    ack_callback,
+                    register_observer,
+                    runless_replay=runless_replay,
+                    _original_stopped=True,
+                )
+            except Exception as exc:  # noqa: BLE001 — mirror the consumer
+                # This continuation runs inside the stop guard, outside
+                # handle_message's own protection, so do here what that
+                # protection does: say the build failed, then release its
+                # place. Otherwise the row (already moved on by the gate)
+                # would hold the place until the next restart.
+                logger.warning(
+                    "dispatch_build: recovered build build_id=%s raised after "
+                    "its original was stopped (%s); publishing build-failed "
+                    "and acking",
+                    build_id,
+                    exc,
+                )
+                if lifecycle_emitter is not None:
+                    from forge.pipeline import BuildContext
+
+                    try:
+                        await lifecycle_emitter.emit_failed(
+                            BuildContext(
+                                feature_id=payload.feature_id,
+                                build_id=build_id,
+                                correlation_id=payload.correlation_id,
+                                wave_total=1,
+                            ),
+                            failure_reason=f"{exc.__class__.__name__}: {exc}",
+                            recoverable=False,
+                            failed_task_id=None,
+                        )
+                    except Exception as emit_exc:  # noqa: BLE001
+                        logger.warning(
+                            "dispatch_build: build-failed publish raised (%s) "
+                            "for build_id=%s",
+                            emit_exc,
+                            build_id,
+                        )
+                await ack_callback()
 
         logger.info(
             "dispatch_build: recovered build build_id=%s — stopping its "
