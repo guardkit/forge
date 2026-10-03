@@ -14,11 +14,18 @@ criteria):
   forever (AC: starts and stays running until SIGTERM).
 * The pull subscription uses ``durable=DEFAULT_DURABLE_NAME`` exactly,
   on the shared :data:`PIPELINE_STREAM_NAME` stream, with explicit ack
-  policy and ``max_ack_pending=1`` so the broker never holds more than
-  one un-acked envelope per durable (ADR-ARCH-014, TASK-FW10-001 §2).
-  Editing this field on a live consumer is rejected by JetStream — the
-  rollout note in TASK-FW10-001 calls for ``nats consumer rm`` of the
-  existing durable before deploying.
+  policy and ``max_ack_pending`` set to the configured build limit
+  (``pipeline.max_concurrent_builds`` in ``forge.yaml``, default 1). The
+  broker never hands out more than that many un-acked build messages, so
+  that number is how many builds can hold a place at once. With the
+  default of 1 this is the one-build-at-a-time behaviour of ADR-ARCH-014.
+  ``pull_subscribe`` binds an existing durable without changing it, so
+  :func:`_attach_consumer` reads the live value first and updates the
+  durable in place when it differs (no ``nats consumer rm`` needed).
+* Each fetched message is dispatched in its own task, kept in a set, and
+  the loop goes straight back to fetching. A build waiting at its
+  pre-build approval card therefore never stops the next build from being
+  fetched; the broker's limit still bounds how many are outstanding.
 * :class:`SubscriptionState.live` flips to ``True`` only after the
   pull subscription is bound; it flips to ``False`` on broker loss
   and again at clean shutdown.
@@ -78,9 +85,9 @@ BUILD_QUEUED_SUBJECT_FILTER: str = "pipeline.build-queued.*"
 #: the outbound lifecycle events.
 PIPELINE_STREAM_NAME: str = "PIPELINE"
 
-#: How many messages to fetch per pull. Kept at 1 to mirror the
-#: sequential-build constraint (ADR-ARCH-014) — a fanned-out batch would
-#: defeat the work-queue semantics that make D2 safe.
+#: How many messages to fetch per pull. Kept at 1 so each fetch claims one
+#: build place at a time; the broker's ``max_ack_pending`` (the configured
+#: build limit) decides how many can be outstanding, not the batch size.
 PULL_BATCH_SIZE: int = 1
 
 #: Timeout (seconds) for one ``fetch`` call. Short so the loop returns
@@ -97,11 +104,14 @@ RECONNECT_MAX_BACKOFF: float = 30.0
 #: budget under the documented 10 s AC even if the broker is hung.
 SHUTDOWN_TIMEOUT_SECONDS: float = 5.0
 
-#: Maximum number of un-acked messages JetStream is allowed to hold for
-#: this durable at any time (ADR-ARCH-014; TASK-FW10-001 §2). With
-#: ``max_ack_pending=1`` the broker enforces strict serial processing
-#: per replica, which is the precondition for the in-flight crash-
-#: recovery rules in :mod:`forge.adapters.nats.pipeline_consumer`.
+#: The default build limit: how many un-acked build messages JetStream may
+#: hand out for this durable when ``forge.yaml`` does not say otherwise.
+#: The live value is ``ServeConfig.max_concurrent_builds`` (from
+#: ``pipeline.max_concurrent_builds``). The default of 1 keeps today's one
+#: build at a time (ADR-ARCH-014); a higher number lets that many builds
+#: hold a place at once, and crash recovery in
+#: :mod:`forge.adapters.nats.pipeline_consumer` then handles each of the
+#: outstanding messages on restart.
 MAX_ACK_PENDING: int = 1
 
 
@@ -180,8 +190,8 @@ async def _default_dispatch(msg: _MsgLike) -> None:
        daemon's "available" property; not acking would jam the durable.
 
     A malformed envelope is logged at WARNING and still acked — leaving
-    it unacked would block the queue's single ack slot
-    (``max_ack_pending=1``) and the daemon would stop making progress.
+    it unacked would hold one of the consumer's build places
+    (``max_ack_pending``) forever.
 
     The function MUST NOT raise — a failure here would propagate into
     :func:`_process_message`'s ``except Exception`` branch which would
@@ -231,23 +241,49 @@ deploy_stage_runner: Any | None = None
 # ---------------------------------------------------------------------------
 
 
-async def _attach_consumer(client: Any, durable_name: str) -> Any:
+async def _attach_consumer(
+    client: Any,
+    durable_name: str,
+    *,
+    max_ack_pending: int = MAX_ACK_PENDING,
+    ack_wait_seconds: float = ACK_WAIT_SECONDS,
+) -> Any:
     """Bind the shared durable pull subscription on ``client``.
 
     Imports :mod:`nats.js.api` lazily so this module's import surface
     stays small. The :class:`~nats.js.api.ConsumerConfig` mirrors the
     one used by :mod:`forge.adapters.nats.pipeline_consumer` for explicit
     ack semantics; differences are scoped to the durable name and the
-    subject filter. Critically, ``max_ack_pending`` is set to
-    :data:`MAX_ACK_PENDING` (= 1) so the broker enforces strict serial
-    processing per replica (ADR-ARCH-014; TASK-FW10-001 §2). This is
-    the precondition for the in-flight crash-recovery rules implemented
-    in :func:`forge.adapters.nats.pipeline_consumer.reconcile_on_boot`:
-    if the broker were allowed to hold multiple un-acked messages the
-    "redelivery on restart" guarantee could silently widen into a
-    multi-build replay storm.
+    subject filter.
+
+    ``max_ack_pending`` is the build limit: the broker hands out at most
+    that many un-acked build messages, and each build keeps its message
+    un-acked until it finishes, so it is the number of builds that can
+    hold a place at once. The default of 1 is strict one-at-a-time
+    processing (ADR-ARCH-014).
+
+    nats-py's ``pull_subscribe`` creates the durable when it is missing
+    but binds an existing one *without* changing it, so a changed limit
+    would silently not apply. Before binding, this reads the live durable;
+    if its ``max_ack_pending`` differs, the durable is updated in place
+    with ``add_consumer`` on the same name (the broker accepts this as an
+    update because only editable fields change). Builds already holding a
+    place keep it: lowering the limit only stops new messages being handed
+    out until fewer than the new limit are outstanding. Any error other
+    than "consumer absent" propagates to :func:`run_daemon`, which treats
+    it like a broker error and retries the attach.
+
+    Args:
+        client: Connected NATS client.
+        durable_name: The shared durable name (Contract C).
+        max_ack_pending: The configured build limit (at least 1).
+        ack_wait_seconds: How long the broker waits for an ack before
+            redelivering. Production always uses
+            :data:`~forge.adapters.nats.pipeline_consumer.ACK_WAIT_SECONDS`;
+            the parameter exists so broker tests can use a short wait.
     """
     from nats.js.api import AckPolicy, ConsumerConfig, DeliverPolicy
+    from nats.js.errors import NotFoundError
 
     js = client.jetstream()
     config = ConsumerConfig(
@@ -255,7 +291,7 @@ async def _attach_consumer(client: Any, durable_name: str) -> Any:
         deliver_policy=DeliverPolicy.ALL,
         ack_policy=AckPolicy.EXPLICIT,
         filter_subject=BUILD_QUEUED_SUBJECT_FILTER,
-        max_ack_pending=MAX_ACK_PENDING,
+        max_ack_pending=max_ack_pending,
         # TASK-GATE-D659 (contract §2.2 / plan "Broker posture"): pin
         # ``ack_wait`` to 1h. Without it nats-py falls back to the 30s
         # server default, so a build paused at the pre-dispatch approval
@@ -263,9 +299,25 @@ async def _attach_consumer(client: Any, durable_name: str) -> Any:
         # every 30s (a redelivery storm against the held queue slot).
         # The pause holds the slot un-acked for the full approval window
         # per FEAT-FORGE-010; ``ack_wait`` MUST exceed
-        # ``approval.max_wait_seconds`` (operator guidance).
-        ack_wait=ACK_WAIT_SECONDS,
+        # ``approval.max_wait_seconds`` (operator guidance). Production
+        # never passes ``ack_wait_seconds``, so the 1h default applies.
+        ack_wait=ack_wait_seconds,
     )
+    try:
+        live = await js.consumer_info(PIPELINE_STREAM_NAME, durable_name)
+    except NotFoundError:
+        live = None  # pull_subscribe below creates it with ``config``.
+    if live is not None:
+        live_limit = getattr(getattr(live, "config", None), "max_ack_pending", None)
+        if live_limit != max_ack_pending:
+            await js.add_consumer(PIPELINE_STREAM_NAME, config)
+            logger.info(
+                "forge-serve: build limit on consumer '%s' changed from %s to "
+                "%d (pipeline.max_concurrent_builds)",
+                durable_name,
+                live_limit,
+                max_ack_pending,
+            )
     return await js.pull_subscribe(
         subject=BUILD_QUEUED_SUBJECT_FILTER,
         durable=durable_name,
@@ -297,8 +349,8 @@ async def _process_message(msg: _MsgLike) -> None:
       up).
     * Any other exception is the E3.1 isolation path: the dispatcher
       raised before completing terminal-state handling, so we ack the
-      message ourselves to release the durable's single ack slot
-      (``max_ack_pending=1``), then log. Logging happens **after** the
+      message ourselves to release its build place on the durable
+      (``max_ack_pending``), then log. Logging happens **after** the
       ack — see TASK-FW10-001 AC-003 — because the queue-slot release
       is the load-bearing side effect; the log line is observability.
 
@@ -338,23 +390,49 @@ async def _consume_forever(
 ) -> None:
     """Pull loop — fetches one message at a time until ``stop_event``.
 
+    Each message is handed to :func:`_process_message` in its own task,
+    kept in a set until it finishes, and the loop goes straight back to
+    fetching. It does not wait for a dispatch to return: dispatch waits on
+    the pre-build approval card, and one unanswered card must not stop the
+    next build from being fetched and presenting its own card. The broker
+    bounds the number of tasks, because it hands out no more un-acked
+    messages than the configured build limit (``max_ack_pending``).
+
+    Each task keeps the per-message handling of :func:`_process_message`
+    unchanged. When the loop ends — stop requested, cancellation, or a
+    broker error — the outstanding tasks are cancelled and awaited, so
+    their messages stay un-acked for redelivery, exactly as cancelling the
+    one awaited dispatch did before.
+
     A bare ``asyncio.TimeoutError`` from ``fetch`` is the no-message
     signal and is silently absorbed. Any other exception (broker loss,
     network blip) propagates to the caller, which marks the state
     not-live and triggers reconnect.
     """
-    while not stop_event.is_set():
-        try:
-            msgs = await sub.fetch(PULL_BATCH_SIZE, timeout=PULL_TIMEOUT_SECONDS)
-        except asyncio.TimeoutError:
-            # No messages this tick — yield to let stop_event flip.
-            await asyncio.sleep(0)
-            continue
-        for msg in msgs:
-            if stop_event.is_set():
-                # Leave un-acked messages for redelivery (E2.1).
-                return
-            await _process_message(msg)
+    in_flight: set[asyncio.Task[None]] = set()
+    try:
+        while not stop_event.is_set():
+            try:
+                msgs = await sub.fetch(PULL_BATCH_SIZE, timeout=PULL_TIMEOUT_SECONDS)
+            except asyncio.TimeoutError:
+                # No messages this tick — yield to let stop_event flip.
+                await asyncio.sleep(0)
+                continue
+            for msg in msgs:
+                if stop_event.is_set():
+                    # Leave un-acked messages for redelivery (E2.1).
+                    return
+                task = asyncio.create_task(
+                    _process_message(msg), name="forge-serve-dispatch"
+                )
+                in_flight.add(task)
+                task.add_done_callback(in_flight.discard)
+    finally:
+        if in_flight:
+            pending = list(in_flight)
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
 
 
 # ---------------------------------------------------------------------------
@@ -448,7 +526,11 @@ async def run_daemon(
                     pending_client = None
                 else:
                     iteration_client = await nats_connect(config.nats_url)
-                sub = await _attach_consumer(iteration_client, config.durable_name)
+                sub = await _attach_consumer(
+                    iteration_client,
+                    config.durable_name,
+                    max_ack_pending=config.max_concurrent_builds,
+                )
                 await state.set_live(True)
                 # Successful attach resets the backoff so the next outage
                 # starts from RECONNECT_INITIAL_BACKOFF rather than the

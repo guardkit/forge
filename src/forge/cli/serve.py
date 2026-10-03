@@ -2549,15 +2549,22 @@ async def _ack_slot_boot_check(
     try:
         js = client.jetstream()
         report = await inspect_ack_slot(js, stream, durable)
-        logger.info("forge-serve: ack-slot boot check — %s", report.detail)
+        logger.info(
+            "forge-serve: ack-slot boot check (build limit %d) — %s",
+            config.max_concurrent_builds,
+            report.detail,
+        )
 
         if report.status == "phantom":
             logger.error(
                 "forge-serve: PHANTOM ack at boot — consumer '%s' (stream "
-                "'%s') holds the ack slot for gone sequence %s; curing by "
-                "deleting the wedged consumer",
+                "'%s') has %d outstanding of build limit %d and none of those "
+                "build messages exists any more (delivered up to sequence %s); "
+                "curing by deleting the wedged consumer",
                 durable,
                 stream,
+                report.num_ack_pending,
+                config.max_concurrent_builds,
                 report.pending_seq,
             )
             cured = await cure_phantom(js, stream, durable)
@@ -2595,8 +2602,12 @@ async def _ack_slot_boot_check(
             )
         elif report.status == "held":
             logger.info(
-                "forge-serve: ack-slot boot check — held (legitimate); leaving "
-                "the slot alone"
+                "forge-serve: ack-slot boot check — held (legitimate): %d "
+                "outstanding of build limit %d; leaving them alone. If one of "
+                "several outstanding builds is a phantom it cannot be singled "
+                "out and that place stays lost until cleared by hand.",
+                report.num_ack_pending,
+                config.max_concurrent_builds,
             )
         elif report.status == "unknown":
             logger.warning(
@@ -2658,12 +2669,17 @@ async def _run_ack_watchdog(
 
     stream = PIPELINE_STREAM_NAME
     durable = config.durable_name
+    limit = config.max_concurrent_builds
     logger.info(
         "forge-serve: ack-slot watchdog armed — inspecting consumer '%s' on "
-        "stream '%s' every %ds (alarm-only; never cures mid-run)",
+        "stream '%s' every %ss against build limit %d (alarm-only; never "
+        "cures mid-run). Known limit: with several builds outstanding, a "
+        "single phantom among real held builds cannot be singled out; it "
+        "shows only as fewer free places than the limit.",
         durable,
         stream,
         interval_seconds,
+        limit,
     )
     while True:
         try:
@@ -2673,15 +2689,26 @@ async def _run_ack_watchdog(
             if report.status == "phantom":
                 logger.error(
                     "forge-serve: ack-slot watchdog — PHANTOM ACK WEDGE on "
-                    "consumer '%s' (stream '%s'): the ack slot is held for "
-                    "gone sequence %s and no ack can release it. Dispatch is "
-                    "jammed. This watchdog does NOT cure mid-run (would "
+                    "consumer '%s' (stream '%s'): %d outstanding of build "
+                    "limit %d, and none of those build messages exists any "
+                    "more (delivered up to sequence %s); no ack can release "
+                    "those places. This watchdog does NOT cure mid-run (would "
                     "invalidate the live subscription) — restart the daemon to "
                     "trigger the boot cure. detail: %s",
                     durable,
                     stream,
+                    report.num_ack_pending,
+                    limit,
                     report.pending_seq,
                     report.detail,
+                )
+            elif report.status == "held" and report.num_ack_pending >= limit:
+                logger.info(
+                    "forge-serve: ack-slot watchdog — all places taken: %d "
+                    "outstanding of build limit %d (at least one is a real "
+                    "held build; a phantom among them cannot be singled out)",
+                    report.num_ack_pending,
+                    limit,
                 )
             elif report.status == "absent":
                 logger.warning(
@@ -2898,6 +2925,22 @@ def _resolve_forge_config_for_serve(ctx: click.Context) -> Any:
     )
 
 
+def _apply_build_limit(config: ServeConfig, forge_config: Any) -> None:
+    """Copy ``pipeline.max_concurrent_builds`` from ``forge.yaml`` onto ``config``.
+
+    The daemon reads the build limit from :class:`ServeConfig`; the value
+    lives in ``forge.yaml``. A configuration without the setting (or a test
+    stub that is not a real :class:`ForgeConfig`) leaves the default of 1.
+    """
+    limit = getattr(getattr(forge_config, "pipeline", None), "max_concurrent_builds", None)
+    if isinstance(limit, int) and not isinstance(limit, bool) and limit >= 1:
+        config.max_concurrent_builds = limit
+    logger.info(
+        "forge-serve: build limit is %d (pipeline.max_concurrent_builds)",
+        config.max_concurrent_builds,
+    )
+
+
 @click.command(name="serve")
 @click.pass_context
 def serve_cmd(ctx: click.Context) -> None:
@@ -2914,6 +2957,7 @@ def serve_cmd(ctx: click.Context) -> None:
     # logger. TASK-FORGE-FRR-002.
     _configure_logging(config.log_level)
     forge_config = _resolve_forge_config_for_serve(ctx)
+    _apply_build_limit(config, forge_config)
     # Bind the production dispatch-chain composer (TASK-FIX-F010)
     # before ``_run_serve`` enters its boot order. The wrapper opens
     # the SQLite writer connection, builds the middleware, and rebinds

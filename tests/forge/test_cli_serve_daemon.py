@@ -21,7 +21,9 @@ TASK-FW10-001 seam contract:
 * ``_process_message`` DOES ack on the ``except Exception`` failure
   path — releasing the durable's single ack slot keeps the daemon
   available (E3.1).
-* The pull-subscribe ``ConsumerConfig`` sets ``max_ack_pending=1``.
+* The pull-subscribe ``ConsumerConfig`` sets ``max_ack_pending=1`` by
+  default (the configured build limit; see
+  ``tests/forge/test_concurrent_build_consumer.py`` for other values).
 """
 
 from __future__ import annotations
@@ -106,6 +108,14 @@ class _FakeJetStream:
     def __init__(self, sub: _FakeSubscription) -> None:
         self._sub = sub
         self.pull_subscribe_kwargs: dict[str, Any] | None = None
+
+    async def consumer_info(self, stream: str, durable: str) -> Any:
+        # The daemon reads the live durable before binding so it can apply
+        # the configured build limit. "Not found" means pull_subscribe
+        # creates it, which is what these tests model.
+        from nats.js.errors import NotFoundError
+
+        raise NotFoundError()
 
     async def pull_subscribe(self, **kwargs: Any) -> _FakeSubscription:
         self.pull_subscribe_kwargs = kwargs
@@ -775,11 +785,10 @@ class TestMaxAckPendingIsOne:
         assert cfg.max_ack_pending == _serve_daemon.MAX_ACK_PENDING
 
     def test_module_constant_is_one(self) -> None:
-        # The constant is the source of truth for the ConsumerConfig
-        # field; freezing it at 1 keeps the rollout note honest
-        # (existing durable must be ``nats consumer rm``-ed before the
-        # value is changed because JetStream rejects edits to this
-        # field on a live consumer).
+        # The constant is the DEFAULT build limit; the live value comes from
+        # pipeline.max_concurrent_builds, and _attach_consumer updates an
+        # existing durable in place when it differs. The default of 1
+        # keeps one build at a time.
         assert _serve_daemon.MAX_ACK_PENDING == 1
 
 
