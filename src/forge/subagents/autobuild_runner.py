@@ -5070,20 +5070,26 @@ async def _stop_an_earlier_run_of(payload: Mapping[str, Any], build_id: str) -> 
     original run of the same build — the coordinator restarted, the runner
     did not. Two runs of one build would share its worktree and its owner
     marker. So the original is stopped (everything it owns, fixtures too,
-    confirmed gone) and this run waits until it has ended. The original ends
-    CANCELLED on its own thread, which nothing watches any more: the factory
-    watches the relaunch. Its worktree is kept, moved aside, so the relaunch
+    confirmed gone) and this run waits until it has ended. The factory itself
+    stops the original before it relaunches a recovered build and clears the
+    original's identity, so it watches the relaunch, never the original; this
+    guard is the runner's own backstop. The original ends CANCELLED on its
+    own thread. Its worktree is kept, moved aside, so the relaunch
     can lay down its own (see :func:`_move_aside_superseded_worktree`).
     """
     old = build_processes.lookup(build_id)
     if old is None:
+        # Nothing of an earlier run is running here; its kept worktree, if
+        # any (a relaunch after the factory stopped the original itself, or
+        # after the runner restarted), still has to make way.
+        await _move_aside_superseded_worktree(payload, build_id)
         return
     logger.warning(
         "autobuild_runner: build %s is being relaunched while its earlier run "
         "is still running in this runner; stopping the earlier run first",
         build_id,
     )
-    await build_processes.stop_build(build_id)
+    await build_processes.stop_build(build_id, purpose="relaunch")
     loop = asyncio.get_running_loop()
     last_report = loop.time()
     while build_processes.lookup(build_id) is old:
