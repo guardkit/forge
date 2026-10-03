@@ -4,9 +4,11 @@
 #
 # This file is Forge's part of the estate bundle: the coordinator, its
 # read-only answer service, and the publisher composed in from its own
-# fragment. It carries NO machine's address, NO home path, NO host network
-# and NO bind of a folder on anybody's disk. Every address in it is a NAME,
-# filled in from the env file beside it (start from .env.example).
+# fragment. It carries NO machine's address, NO home path and NO host
+# network. Every address in it is a NAME, filled in from the env file beside it
+# (start from .env.example). It binds ONE folder of the machine's, the build
+# receipts folder, and the env file names that too (see the coordinator's
+# volumes below for why).
 #
 # WHAT IS DELIBERATELY NOT IN THIS FILE, and where each one comes from:
 #
@@ -65,7 +67,8 @@ services:
       # THE RECORD. One file on the ledger volume, which this service is the
       # only writer of.
       FORGE_DB_PATH: /var/lib/forge/forge.db
-      # WHERE A BUILD'S RECEIPTS GO — the evidence volume, not beside the code.
+      # WHERE A BUILD'S RECEIPTS ARE — the receipts folder bound below, not
+      # beside the code.
       FORGE_RECEIPTS_DIR: /var/lib/forge-evidence
       FORGE_HEALTHZ_PORT: "8080"
       FORGE_LOG_LEVEL: ${FORGE_LOG_LEVEL:-info}
@@ -88,8 +91,20 @@ services:
       # the fix for the old arrangement, where the settings file sat in the
       # same writable folder as the record.
       - forge-settings:/etc/forge:ro
-      # THE EVIDENCE. The coordinator reads it; a build's runner writes it.
-      - forge-evidence:/var/lib/forge-evidence
+      # THE EVIDENCE: the machine's own build receipts folder, BOUND, not a
+      # named volume (3 October 2026). A build's runner inside a project's
+      # sandbox writes each build's receipts, its failure pack included, into
+      # a folder on the machine. The coordinator has to read that same folder:
+      # it is where a failed build's repair job is filed from. While this was
+      # the named volume 'forge-evidence', which only this container mounts,
+      # the coordinator looked in an empty place and no failed build filed its
+      # repair job. The env file names the folder; nothing here does. A folder
+      # that is not there stops the start rather than being made empty.
+      - type: bind
+        source: ${FORGE_RECEIPTS_HOST_DIR:?name the folder a build's runner writes its receipts to in the env file - the coordinator reads failure packs from there}
+        target: /var/lib/forge-evidence
+        bind:
+          create_host_path: false
       # THIS SERVICE'S OWN SMALL STATE.
       - forge-home:/home/forge/.forge
     networks:
@@ -205,7 +220,12 @@ volumes:
   #   forge-ledger           written by: the coordinator, and nothing else
   #   forge-settings         written by: NOBODY at run time - the machine puts
   #                                      the settings file on it before start
-  #   forge-evidence         written by: a build's runner inside its sandbox
+  #   forge-evidence         NO LONGER MOUNTED (3 October 2026): the receipts
+  #                                      folder is bound instead, see the
+  #                                      coordinator above. Still declared so
+  #                                      the entries it holds are not lost;
+  #                                      copy them into the bound folder once,
+  #                                      without overwriting, at the upgrade
   #   forge-home             written by: the coordinator (its own small state)
   #   forge-publisher-state  written by: the publisher - declared by the
   #                                      included fragment, not here

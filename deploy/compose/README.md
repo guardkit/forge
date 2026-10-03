@@ -165,7 +165,7 @@ their own compose files. They are named here by address, never started here.
 |---|---|---|
 | `forge-ledger` | the record and the companion files beside it | the coordinator |
 | `forge-settings` | the coordinator's settings file | nobody at run time — the machine puts it there before start |
-| `forge-evidence` | the receipts and records a build writes | a build's runner inside its sandbox |
+| `forge-evidence` | no longer mounted (3 October 2026): the coordinator binds the machine's build receipts folder, `FORGE_RECEIPTS_HOST_DIR`, at the same place instead, because that folder is where a build's runner in its sandbox writes; the volume is kept so its old entries are not lost | — |
 | `forge-home` | the coordinator's own small state | the coordinator |
 | `forge-publisher-state` | the publisher's own copies of projects' commits | the publisher (declared by the included fragment) |
 | `nats-jetstream` | the bus's own store | the bus (declared by the bus's own compose file) |
