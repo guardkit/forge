@@ -691,6 +691,7 @@ def _build_dispatch_build(
     gate_state_machine: Any = None,
     gate_clock: Callable[[], datetime] | None = None,
     conductor_router: Callable[..., Any] | None = None,
+    ack_guard: Any = None,
 ):
     """Return the production ``dispatch_build`` closure.
 
@@ -1105,6 +1106,17 @@ def _build_dispatch_build(
                     status.value,
                     exc,
                 )
+                if ack_guard is not None:
+                    # A CANCELLED build's slot is released only once its
+                    # runner confirms everything it owns is gone (3 October
+                    # 2026); any other terminal acks at once, as before.
+                    await ack_guard.ack_when_stopped(
+                        payload.feature_id,
+                        payload.correlation_id,
+                        ack_callback,
+                        where="dispatch_build duplicate TERMINAL",
+                    )
+                    return
                 await ack_callback()
                 return
             # Is the pre-dispatch approval gate wired this boot? The
@@ -1551,6 +1563,7 @@ def build_pipeline_consumer_deps(
     gate_state_machine: Any = None,
     gate_clock: Callable[[], datetime] | None = None,
     conductor_router: Callable[..., Any] | None = None,
+    ack_guard: Any = None,
 ) -> PipelineConsumerDeps:
     """Compose the production :class:`PipelineConsumerDeps` for ``forge serve``.
 
@@ -1690,6 +1703,7 @@ def build_pipeline_consumer_deps(
         gate_state_machine=gate_state_machine,
         gate_clock=gate_clock,
         conductor_router=conductor_router,
+        ack_guard=ack_guard,
     )
     publish_build_failed = _build_publish_build_failed(
         publisher,
@@ -1702,6 +1716,7 @@ def build_pipeline_consumer_deps(
         dispatch_build=dispatch_build,
         publish_build_failed=publish_build_failed,
         register_ack_handle=register_ack_handle,
+        ack_guard=ack_guard,
     )
     logger.info(
         "build_pipeline_consumer_deps: composed PipelineConsumerDeps "

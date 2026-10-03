@@ -146,6 +146,112 @@ def _langgraph_interrupt_canceller(
     return _cancel
 
 
+def _sandbox_runner_url(repo: str) -> str | None:
+    """The runner inside ``repo``'s sandbox, when the settings file names one.
+
+    Best effort: the settings file is the one ``FORGE_CONFIG_PATH`` names, or
+    ``forge.yaml`` here; anything unreadable means "the global runner".
+    """
+    try:
+        from forge.config.loader import load_config
+        from forge.config.sandboxes import sandbox_for
+
+        path = Path(os.environ.get("FORGE_CONFIG_PATH") or "forge.yaml")
+        if not path.exists():
+            return None
+        entry = sandbox_for(load_config(path), repo)
+    except Exception as exc:  # noqa: BLE001 — best effort, said once
+        logger.warning(
+            "cancel_async_task: could not read which runner holds %s's "
+            "builds (%s: %s); asking the global runner",
+            repo,
+            type(exc).__name__,
+            exc,
+        )
+        return None
+    url = str(getattr(entry, "runner_url", "") or "").strip()
+    return url or None
+
+
+def _runner_stop_canceller(
+    persistence: SqliteLifecyclePersistence,
+    runner_url: str | None = None,
+) -> Callable[[str], bool]:
+    """Production canceller: ask the build's runner to stop the build.
+
+    Stopping a cancelled build (3 October 2026): a cancel no longer
+    interrupts the run — that marked it interrupted at once while the
+    build's own processes carried on. It asks the build's runner
+    (``POST /forge/builds/{build_id}/stop``), which stops everything the
+    build owns and answers when it is gone; the build then finishes
+    CANCELLED through the normal path, and its place is released only after
+    the runner confirms the stop again.
+
+    The build is found from the task (``async_tasks.task_id``); its runner is
+    its repository's sandbox runner when there is one, else
+    ``FORGE_AUTOBUILD_RUNNER_URL``. A task with no recorded build falls back
+    to the interrupt, whose cancel handler in the runner now also stops
+    everything the build owns before it lets the run go. Best effort, as
+    before: a failure is logged and returns ``False``.
+    """
+    from forge.lifecycle_bridge.build_stop import ask_runner_to_stop
+
+    interrupt = _langgraph_interrupt_canceller(runner_url)
+
+    def _cancel(task_id: str) -> bool:
+        try:
+            row = persistence.connection.execute(
+                "SELECT a.build_id, b.repo FROM async_tasks a "
+                "LEFT JOIN builds b ON b.build_id = a.build_id "
+                "WHERE a.task_id = ? LIMIT 1",
+                (task_id,),
+            ).fetchone()
+        except Exception as exc:  # noqa: BLE001 — fall back, said once
+            logger.warning(
+                "cancel_async_task: could not read the build of task %s "
+                "(%s: %s); interrupting the run instead",
+                task_id,
+                type(exc).__name__,
+                exc,
+            )
+            row = None
+        if row is None or not row[0]:
+            return interrupt(task_id)
+        build_id, repo = str(row[0]), str(row[1] or "")
+        url = (
+            (_sandbox_runner_url(repo) if repo else None)
+            or runner_url
+            or os.environ.get("FORGE_AUTOBUILD_RUNNER_URL")
+        )
+        if not url:
+            logger.warning(
+                "cancel_async_task: FORGE_AUTOBUILD_RUNNER_URL not set — "
+                "stop NOT requested for build %s (row transition proceeds; "
+                "the build, if running, continues)",
+                build_id,
+            )
+            return False
+        answer = asyncio.run(ask_runner_to_stop(url, build_id))
+        if answer.stopped:
+            logger.info(
+                "cancel_async_task: build %s stopped by its runner at %s",
+                build_id,
+                url,
+            )
+            return True
+        logger.warning(
+            "cancel_async_task: build %s is not yet confirmed stopped by its "
+            "runner at %s (%s; remaining=%s); its place stays held until it is",
+            build_id,
+            url,
+            answer.reason or "not stopped",
+            answer.remaining,
+        )
+        return False
+
+    return _cancel
+
+
 def _noop_synthetic_injector(_payload: object) -> None:
     """No-op synthetic-injector for :class:`SqlitePauseRejectResolver`."""
     return None
@@ -281,9 +387,10 @@ def build_cli_runtime(
             synthetic_injector=synthetic_injector or _noop_synthetic_injector,
         ),
         async_task_canceller=AsyncTaskCanceller(
-            # FEAT-FCT: the production default issues a real langgraph
-            # interrupt (was the _noop_async_call register-2b gap).
-            async_task_canceller or _langgraph_interrupt_canceller()
+            # FEAT-FCT: the production default reaches the running build (was
+            # the _noop_async_call register-2b gap). Since 3 October 2026 it
+            # asks the build's runner to stop everything the build owns.
+            async_task_canceller or _runner_stop_canceller(persistence)
         ),
         async_task_updater=AsyncTaskUpdater(async_task_updater or _noop_async_call),
         build_canceller=SqliteBuildCanceller(persistence),
