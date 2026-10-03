@@ -1319,6 +1319,17 @@ class TestEveryDeployLegRunsTheStepsOfItsOwnCommit:
         assert not (clone / ".forge-candidates" / FEATURE_ID).exists()
         # And the clone's working copy was left exactly where it was.
         assert _git(clone, "rev-parse", "HEAD") == old
+        # THE CARD SAYS WHERE IT RAN, AND NOTHING WAS WRITTEN ON THIS SIDE
+        # (3 October 2026). The words come from the repository having a
+        # sandbox, not from a profile at the coordinator's path, which holds
+        # nothing; and the deploy records went to a folder of the
+        # coordinator's own beside its ledger, not under that path.
+        assert outcome.deployed_in == "docker-sandbox"
+        assert not on_this_side.exists()
+        records = tmp_path / "deploy-records" / "api_test"
+        assert list(records.rglob("deploy-record-*.md")), (
+            "the deploy record was not written to the coordinator's own folder"
+        )
 
     @pytest.mark.asyncio
     async def test_a_press_that_picks_up_a_published_join_lays_its_tree_out_again(

@@ -1998,6 +1998,20 @@ class DeployStageRunner:
                 deploy_run_id,
             )
             return
+        # A REPOSITORY WITH A SANDBOX gets no note (3 October 2026). Its root
+        # here is a path this coordinator holds nothing at, so writing the
+        # note made a pretend project folder; and nothing reads these notes
+        # yet, because automatic demotion is not built. The failed check is
+        # already in the rollback record.
+        if self._runs_inside_the_sandbox():
+            logger.info(
+                "MG-5: no demotion note was written for %s (run=%s): it is "
+                "deployed in its sandbox, and nothing reads these notes yet "
+                "because automatic demotion is not built",
+                self._target_repo or profile.env_id,
+                deploy_run_id,
+            )
+            return
         lane = self._target_repo or profile.env_id
         try:
             path = write_demotion_event(

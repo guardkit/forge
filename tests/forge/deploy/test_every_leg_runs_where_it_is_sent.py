@@ -239,6 +239,13 @@ class TestALegSentToATreeRunsEveryStepThere:
             ("CANDIDATE_DOWN", the_tree),
             ("REVERT", the_tree),
         ]
+        # NOTHING WRITTEN AT THE COORDINATOR'S PATH FOR IT (3 October 2026).
+        # For a repository in a sandbox that path holds nothing; the
+        # demotion note that used to land in its qa/ folder is not written.
+        coordinators_path = tmp_path / "widget-shop"
+        assert not (coordinators_path / "qa").exists()
+        assert not list(coordinators_path.rglob("demotion-*.yaml"))
+        assert not list(coordinators_path.rglob("deploy-record-*.md"))
 
 
 class TestALegSentNowhereRunsWhereItAlwaysDid:

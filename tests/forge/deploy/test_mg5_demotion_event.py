@@ -135,6 +135,7 @@ def _runner(
     verdict: str = "fail",
     target_repo: str | None = "appmilla/api_test",
     target_repo_root: str | None = None,
+    sandbox: Any | None = None,
 ) -> DeployStageRunner:
     return DeployStageRunner(
         repository=repository,
@@ -149,6 +150,7 @@ def _runner(
         clock=lambda: FIXED,
         target_repo=target_repo,
         target_repo_root=target_repo_root,
+        sandbox=sandbox,
     )
 
 
@@ -365,3 +367,54 @@ class TestMg5DemotionEdge:
         # No org/name key ⇒ the lane is the deploy env_id (still a valid lane).
         assert doc["lane"] == "study-tutor-prod"
         assert doc["verdict"] == "environment_fail"
+
+
+class TestASandboxedRepositoryGetsNoNote:
+    """3 October 2026: for a repository deployed in its sandbox, the root
+    this stage is handed is a path the coordinator holds nothing at, and
+    writing the note there made a pretend project folder. Nothing reads these
+    notes yet (automatic demotion is not built), so none is written and one
+    plain sentence says so. The revert itself is unchanged."""
+
+    @pytest.mark.asyncio
+    async def test_a_failed_check_writes_no_note_and_says_why(
+        self, repository, runbook_publisher, tmp_path, caplog
+    ) -> None:
+        from types import SimpleNamespace
+
+        repo_root = tmp_path / "projects" / "api_test"
+        runner = _runner(
+            repository,
+            runbook_publisher,
+            _RecordingDeployPublisher(),
+            tmp_path,
+            verdict="fail",
+            target_repo="appmilla/api_test",
+            target_repo_root=str(repo_root),
+            sandbox=SimpleNamespace(
+                name="api-test-factory",
+                sidecar_url="http://127.0.0.1:9",
+                runner_url="http://127.0.0.1:9",
+            ),
+        )
+
+        with caplog.at_level("INFO", logger="forge.deploy.stage"):
+            result = await runner.run_deploy(
+                _profile(),
+                correlation_id="corr-sbx",
+                deploy_run_id="deployrun-sbx",
+                feature="FEAT-SBX1",
+                feat_id="FEAT-SBX1",
+            )
+
+        assert result.outcome == "reverted"
+        assert result.verdict == "fail"
+        assert not repo_root.exists(), (
+            "a sandboxed deploy made a folder at the coordinator's path for it"
+        )
+        assert not list(tmp_path.rglob("demotion-*.yaml"))
+        assert any(
+            "no demotion note was written" in record.getMessage()
+            and "automatic demotion is not built" in record.getMessage()
+            for record in caplog.records
+        )
