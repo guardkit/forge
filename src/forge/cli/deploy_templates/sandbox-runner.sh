@@ -1472,7 +1472,23 @@ start_helper() {
     >/dev/null
 }
 
+# FIXTURE CONTAINERS LEFT BY A RUNNER THAT IS GONE (3 October 2026). A runner
+# restart kills every process inside it, but the containers a build's tests
+# started live on this sandbox's engine and carry on. They carry GuardKit's
+# fixture label, and before a runner starts no build can be running, so every
+# one of them is removed here. Never anything without that label.
+remove_leftover_fixtures() {
+  local ids=""
+  ids="$("${DOCKER}" ps --all --quiet --filter "label=guardkit.fixture.owner" 2>/dev/null | tr -d '\r' || true)"
+  if [[ -n "${ids}" ]]; then
+    log "removing $(printf '%s\n' "${ids}" | wc -l | tr -d ' ') fixture container(s) a build left behind before this runner starts"
+    # shellcheck disable=SC2086 # one id per word, by construction
+    "${DOCKER}" rm --force ${ids} >/dev/null 2>&1 || log "note: not every leftover fixture container could be removed"
+  fi
+}
+
 start_runner() {
+  remove_leftover_fixtures
   log "starting the build runner from ${IMAGE_REFERENCE} on this sandbox's own network, ${BIND}:${RUNNER_PORT}"
   # The runner is where a build runs the project's own checks, and a project's
   # test suite may start its services as containers (see above for why the
