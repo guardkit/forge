@@ -216,6 +216,12 @@ class PipelineConsumerDeps:
     dispatch_build: DispatchBuild
     publish_build_failed: PublishBuildFailed
     register_ack_handle: InFlightAckRegistry | None = None
+    # Stopping a cancelled build (3 October 2026) — an
+    # :class:`~forge.lifecycle_bridge.build_stop.AckAfterStop`. When wired, a
+    # duplicate of a CANCELLED build is acknowledged (its place released) only
+    # once its runner confirms everything it owns is gone. ``None`` acks at
+    # once, as before.
+    ack_guard: Any = None
 
 
 # ---------------------------------------------------------------------------
@@ -532,6 +538,14 @@ async def handle_message(msg: _MsgLike, deps: PipelineConsumerDeps) -> None:
             payload.feature_id,
             payload.correlation_id,
         )
+        if deps.ack_guard is not None:
+            await deps.ack_guard.ack_when_stopped(
+                payload.feature_id,
+                payload.correlation_id,
+                msg.ack,
+                where="pipeline_consumer duplicate terminal",
+            )
+            return
         await msg.ack()
         return
 
@@ -1092,6 +1106,18 @@ async def _reconcile_one_redelivery(
             feature_id,
             correlation_id,
         )
+        ack_guard = getattr(deps.consumer_deps, "ack_guard", None)
+        if ack_guard is not None:
+            # A CANCELLED build's message is acknowledged only once its
+            # runner confirms everything it owns is gone (3 October 2026).
+            if await ack_guard.ack_when_stopped(
+                feature_id,
+                correlation_id,
+                msg.ack,
+                where="reconcile_on_boot terminal",
+            ):
+                report.acked_terminal += 1
+            return
         await msg.ack()
         report.acked_terminal += 1
         return
