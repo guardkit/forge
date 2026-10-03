@@ -58,7 +58,7 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Literal, Protocol, runtime_checkable
 
@@ -425,6 +425,14 @@ class ForwardContextBuilder:
     ) -> None:
         self._reader = stage_log_reader
         self._allowlist = worktree_allowlist
+
+    def widened(
+        self, widen: Callable[[WorktreeAllowlist], WorktreeAllowlist]
+    ) -> "ForwardContextBuilder":
+        """The same builder with its allowlist widened by ``widen`` — for one
+        build whose tree is in a sandbox, at a path the configured roots do
+        not name (3 October 2026)."""
+        return ForwardContextBuilder(self._reader, widen(self._allowlist))
 
     def build_for(
         self,
