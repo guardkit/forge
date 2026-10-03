@@ -1,8 +1,8 @@
 """Two or more builds in one runner, through the runner's REAL launch path.
 
 3 October 2026, concurrent builds (design ``factory-concurrent-builds-design-
-2026-10-03``, rows "Child settings", "Restart with paused builds (R4)" and "Memory and
-integration under overlap"). Once a runner serves
+2026-10-03``, rows "Child settings", "Restart with paused builds (R4)", "Disk
+reservation" and "Memory and integration under overlap"). Once a runner serves
 several build runs at once (``--n-jobs-per-worker``), two builds share one
 process: its free-space check, its view of which checkout is in use, and the
 settings each child is handed.
@@ -300,6 +300,52 @@ def test_a_launch_with_no_branch_still_runs_when_nothing_else_is(
     snapshot = asyncio.run(_build(_payload("build-FEAT-B-1", "FEAT-B", "widget")))
 
     assert factory.child("FEAT-B") is not None, snapshot
+
+
+# ---------------------------------------------------------------------------
+# Disk: free space is reserved, not just observed
+# ---------------------------------------------------------------------------
+
+
+def test_two_builds_with_room_for_one_start_one_and_refuse_the_other(
+    factory: _Factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    factory.repository("widget", "planning/a", "planning/b")
+    factory.worktrees.mkdir()
+    free = shutil.disk_usage(factory.worktrees).free
+    # Room for one build's floor, not two: free is one and a half floors.
+    floor = int(free / 1.5)
+    monkeypatch.setenv("FORGE_AUTOBUILD_MIN_AVAILABLE_BYTES", str(floor))
+
+    async def scenario() -> tuple[dict, dict]:
+        first = asyncio.create_task(
+            _build(_payload("build-FEAT-A-1", "FEAT-A", "widget", branch="planning/a"))
+        )
+        await factory.started("FEAT-A")
+        try:
+            second = await asyncio.wait_for(
+                _build(_payload("build-FEAT-B-1", "FEAT-B", "widget", branch="planning/b")),
+                CHILD_PATIENCE_SECONDS + 10,
+            )
+        finally:
+            factory.release()
+        return await first, second
+
+    first, second = asyncio.run(scenario())
+
+    assert factory.child("FEAT-B") is None, "both builds started"
+    assert second["lifecycle"] == "failed"
+    assert "autobuild worktree capacity preflight refused the build" in second[
+        "error_message"
+    ]
+    assert first["lifecycle"] != "failed", first
+
+    # And the reservation goes with the build: the next one starts.
+    factory.release()
+    third = asyncio.run(
+        _build(_payload("build-FEAT-C-1", "FEAT-C", "widget", branch="planning/b"))
+    )
+    assert factory.child("FEAT-C") is not None, third
 
 
 # ---------------------------------------------------------------------------

@@ -87,8 +87,15 @@ def _capacity(path: Path) -> dict[str, int] | None:
     }
 
 
-def inspect_worktree_capacity(base: Path, *, min_available_bytes: int) -> dict[str, Any]:
-    """Check the filesystem that will hold ``base`` before creating anything."""
+def inspect_worktree_capacity(
+    base: Path, *, min_available_bytes: int, reserved_bytes: int = 0
+) -> dict[str, Any]:
+    """Check the filesystem that will hold ``base`` before creating anything.
+
+    ``reserved_bytes`` is free space already reserved by other builds running
+    beside this one (3 October 2026, concurrent builds); it is counted as
+    spent. Zero, the default, is the check as it always was.
+    """
     probe = base.expanduser()
     while not probe.exists() and probe != probe.parent:
         probe = probe.parent
@@ -98,6 +105,7 @@ def inspect_worktree_capacity(base: Path, *, min_available_bytes: int) -> dict[s
         "base": str(base.expanduser()),
         "probed_path": str(probe),
         "min_available_bytes": int(min_available_bytes),
+        "reserved_bytes": int(reserved_bytes),
         "capacity": capacity,
     }
     if min_available_bytes <= 0:
@@ -106,10 +114,15 @@ def inspect_worktree_capacity(base: Path, *, min_available_bytes: int) -> dict[s
         report["detail"] = "worktree filesystem capacity could not be read"
     elif capacity["available_inodes"] <= 0:
         report["detail"] = "worktree filesystem has no available inodes"
-    elif capacity["available_bytes"] < min_available_bytes:
+    elif capacity["available_bytes"] - reserved_bytes < min_available_bytes:
+        held = (
+            f" ({reserved_bytes} of them reserved by other builds running now)"
+            if reserved_bytes
+            else ""
+        )
         report["detail"] = (
-            f"worktree filesystem has {capacity['available_bytes']} available bytes, "
-            f"below the required {min_available_bytes}"
+            f"worktree filesystem has {capacity['available_bytes']} available bytes"
+            f"{held}, below the required {min_available_bytes}"
         )
     else:
         report.update(ok=True, detail="worktree filesystem capacity is sufficient")
