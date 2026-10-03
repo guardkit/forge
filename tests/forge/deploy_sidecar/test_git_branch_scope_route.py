@@ -175,6 +175,35 @@ class TestWhatComesBack:
         assert "src/unrelated.py" not in body["name_status"]
 
 
+    def test_a_recorded_start_commit_is_accepted_as_the_base(
+        self, cfg: ForgeConfig, repo: Path
+    ) -> None:
+        """3 October 2026: the coordinator now sends the commit the build
+        started from, not the word 'main'. A cleanup that landed on the
+        remote before the build began, and that this clone's own main never
+        saw, is then not counted as the build's."""
+        _git(repo, "checkout", "-b", "cleanup", "main")
+        _write(repo, "docs/cleanup.md", "# an earlier cleanup\n")
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-m", "an earlier cleanup outside the plan")
+        start = _git(repo, "rev-parse", "HEAD").strip()
+        _git(repo, "checkout", "-b", "autobuild/FEAT-BSC2", start)
+        _write(repo, "src/users/router.py", "# the users router, changed\n")
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-m", "what the build wrote")
+        _git(repo, "checkout", "main")
+
+        status, body = _ask(cfg, base=start, head="autobuild/FEAT-BSC2")
+        assert status == 200, body
+        assert body["error"] is None
+        assert "src/users/router.py" in body["name_status"]
+        assert "docs/cleanup.md" not in body["name_status"]
+
+        status, body = _ask(cfg, base="main", head="autobuild/FEAT-BSC2")
+        assert status == 200, body
+        assert "docs/cleanup.md" in body["name_status"]
+
+
 class TestWhenThereIsNothingToRead:
     def test_a_branch_that_is_not_there_answers_200_and_says_so(
         self, cfg: ForgeConfig

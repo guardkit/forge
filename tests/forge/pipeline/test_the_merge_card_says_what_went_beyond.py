@@ -330,6 +330,164 @@ class TestTheScopePassOnARealBranch:
         )
 
 
+def _a_stale_main_and_a_cleanup(root: Path) -> str:
+    """Local main left at the plan of record, a cleanup commit outside the
+    plan after it (on the remote, say), and the build's branch cut from that
+    cleanup. Returns the cleanup commit: the one the build started from."""
+    _git(root, "checkout", "-q", "-b", "cleanup", "main")
+    _write(root, "docs/cleanup.md", "# an earlier cleanup outside the plan\n")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "an earlier cleanup")
+    start = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    _git(root, "branch", "-q", "-D", BRANCH)
+    _git(root, "checkout", "-q", "-b", BRANCH, start)
+    _write(
+        root,
+        "src/users/router.py",
+        "# the users router\n@router.get('/users/created-per-day')\n",
+    )
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "what the build wrote")
+    _git(root, "checkout", "-q", "main")
+    return start
+
+
+def _record_the_start(pool: SqliteLifecyclePersistence, commit: str) -> None:
+    pool.connection.execute(
+        "UPDATE builds SET start_commit = ?, target_branch = 'main' "
+        "WHERE build_id = ?",
+        (commit, BUILD_ID),
+    )
+    pool.connection.commit()
+
+
+class TestTheBranchIsHeldAgainstWhereTheBuildStarted:
+    """3 October 2026: in the sandbox's clone the local main is stale, so
+    FEAT-651C's card counted 69 files, 40 of them an earlier cleanup. The
+    scope pass now compares against the commit the build started from."""
+
+    def test_an_earlier_cleanup_is_not_counted_as_the_build_s(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+        repo_root: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        start = _a_stale_main_and_a_cleanup(repo_root)
+        _insert_build(pool)
+        _insert_planning_run(pool)
+        _record_the_start(pool, start)
+        receipts = tmp_path / "receipts"
+        (receipts / BUILD_ID).mkdir(parents=True)
+        monkeypatch.setenv("FORGE_RECEIPTS_DIR", str(receipts))
+
+        report = run_the_scope_pass(
+            config=config,
+            pool=pool,
+            build_id=BUILD_ID,
+            feature_id=FEATURE_ID,
+            row=pool.get_build_row(BUILD_ID),
+        )
+
+        assert report is not None and report.read is True
+        assert report.files_changed == 1
+        assert "docs/cleanup.md" not in report.files_the_plan_did_not_name
+        assert "docs/cleanup.md" not in report.files_allowed_as_scaffolding
+        assert report.compared_against == start
+        kept = json.loads(
+            (receipts / BUILD_ID / SCOPE_REPORT_NAME).read_text(encoding="utf-8")
+        )
+        assert kept["compared_against"] == start
+
+    def test_with_no_recorded_start_it_falls_back_to_main_and_says_so(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+        repo_root: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        _a_stale_main_and_a_cleanup(repo_root)
+        _insert_build(pool)
+        _insert_planning_run(pool)
+        receipts = tmp_path / "receipts"
+        (receipts / BUILD_ID).mkdir(parents=True)
+        monkeypatch.setenv("FORGE_RECEIPTS_DIR", str(receipts))
+
+        with caplog.at_level("INFO", logger="forge.pipeline.merge_offer"):
+            report = run_the_scope_pass(
+                config=config,
+                pool=pool,
+                build_id=BUILD_ID,
+                feature_id=FEATURE_ID,
+                row=pool.get_build_row(BUILD_ID),
+            )
+
+        assert report is not None and report.read is True
+        assert report.compared_against == "main"
+        assert report.files_changed == 2
+        assert any(
+            "names no commit" in record.getMessage() and BUILD_ID in record.getMessage()
+            for record in caplog.records
+        )
+
+    def test_a_sandboxed_repository_is_asked_about_the_recorded_commit(
+        self,
+        pool: SqliteLifecyclePersistence,
+        repo_root: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from forge.pipeline import branch_scope
+
+        _insert_build(pool)
+        _insert_planning_run(pool)
+        start = "c" * 40
+        _record_the_start(pool, start)
+        monkeypatch.setenv("FORGE_RECEIPTS_DIR", str(tmp_path / "receipts"))
+        sandboxed = ForgeConfig.model_validate(
+            {
+                "permissions": {"filesystem": {"allowlist": ["/tmp"]}},
+                "planning": {
+                    "target_repo_paths": {REPO: str(tmp_path / "not-on-this-side")},
+                    "sandboxes": {
+                        REPO: {
+                            "name": "api-test-factory",
+                            "sidecar_url": "http://127.0.0.1:9",
+                            "runner_url": "http://127.0.0.1:9",
+                        }
+                    },
+                },
+                "merge_executor": {"enabled": True},
+            }
+        )
+        asked: list[dict[str, Any]] = []
+
+        def _the_sidecar(**kwargs: Any) -> Any:
+            asked.append(kwargs)
+            return branch_scope.BranchScopeReading()
+
+        monkeypatch.setattr(branch_scope, "read_branch_scope_in_sandbox", _the_sidecar)
+
+        report = run_the_scope_pass(
+            config=sandboxed,
+            pool=pool,
+            build_id=BUILD_ID,
+            feature_id=FEATURE_ID,
+            row=pool.get_build_row(BUILD_ID),
+        )
+
+        assert [call["base"] for call in asked] == [start]
+        assert report is not None and report.compared_against == start
+
+
 class TestTheCardAndTheDurableRow:
     def test_the_card_says_what_went_beyond_the_plan_and_the_request(
         self,
