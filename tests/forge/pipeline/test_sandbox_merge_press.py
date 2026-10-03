@@ -562,36 +562,25 @@ class TestTheProjectsDeployProfileIsReadWhereTheRepositoryLives:
         "identity": {"setting": "DEPLOY_IDENTITY", "reported_as": "DEPLOYED_IDENTITY"},
     }
 
-    @pytest.mark.asyncio
-    async def test_the_candidate_check_passes_with_nothing_on_this_side(
-        self,
-        config: ForgeConfig,
-        pool: SqliteLifecyclePersistence,
-        clone: Path,
-        on_this_side: Path,
-        git_calls: _GitCalls,
-        monkeypatch: pytest.MonkeyPatch,
-        tmp_path: Path,
-        _receipts_env: Path,
-    ) -> None:
+    @staticmethod
+    def _commit_the_profile(clone: Path, profile: dict[str, Any], message: str) -> str:
+        """Commit ``profile`` as the project's deploy profile on the clone's main."""
         import yaml
 
-        from forge.pipeline.merge_executor import build_in_daemon_deploy_dispatcher
-
-        # The project's own profile, committed in the clone in the sandbox and
-        # nowhere else; the build is recorded as starting from that commit.
-        (clone / "deploy").mkdir()
+        (clone / "deploy").mkdir(exist_ok=True)
         (clone / "deploy" / "profile.yaml").write_text(
-            yaml.safe_dump(self._PROFILE), encoding="utf-8"
+            yaml.safe_dump(profile), encoding="utf-8"
         )
         _git(clone, "add", "deploy/profile.yaml")
-        _git(clone, "commit", "-q", "-m", "the project's deploy profile")
-        _git(clone, "rebase", "-q", "main", f"autobuild/{FEATURE_ID}")
-        _git(clone, "checkout", "-q", "main")
-        _git(clone, "push", "-q", "origin", "main")
-        started_at = _git(clone, "rev-parse", "main")
-        tip = _git(clone, "rev-parse", f"autobuild/{FEATURE_ID}")
-        assert not on_this_side.exists()
+        _git(clone, "commit", "-q", "-m", message)
+        return _git(clone, "rev-parse", "HEAD")
+
+    @staticmethod
+    def _the_real_dispatcher(
+        config: ForgeConfig, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> tuple[Any, list[dict[str, Any]]]:
+        """The production deploy dispatcher, with only the stage beneath it a recorder."""
+        from forge.pipeline.merge_executor import build_in_daemon_deploy_dispatcher
 
         legs: list[dict[str, Any]] = []
         fake_leg = _FakeDeploy()
@@ -604,6 +593,31 @@ class TestTheProjectsDeployProfileIsReadWhereTheRepositoryLives:
         dispatcher = build_in_daemon_deploy_dispatcher(
             config=config, nats_client=object(), db_path=tmp_path / "forge.db"
         )
+        return dispatcher, legs
+
+    @pytest.mark.asyncio
+    async def test_the_candidate_check_passes_with_nothing_on_this_side(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+        clone: Path,
+        on_this_side: Path,
+        git_calls: _GitCalls,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        _receipts_env: Path,
+    ) -> None:
+        # The project's own profile, committed in the clone in the sandbox and
+        # nowhere else; the build is recorded as starting from that commit.
+        self._commit_the_profile(clone, self._PROFILE, "the project's deploy profile")
+        _git(clone, "rebase", "-q", "main", f"autobuild/{FEATURE_ID}")
+        _git(clone, "checkout", "-q", "main")
+        _git(clone, "push", "-q", "origin", "main")
+        started_at = _git(clone, "rev-parse", "main")
+        tip = _git(clone, "rev-parse", f"autobuild/{FEATURE_ID}")
+        assert not on_this_side.exists()
+
+        dispatcher, legs = self._the_real_dispatcher(config, monkeypatch, tmp_path)
 
         outcome = await _press(
             config=config,
@@ -634,6 +648,63 @@ class TestTheProjectsDeployProfileIsReadWhereTheRepositoryLives:
         # Not one git command, and no profile read, on this side.
         assert git_calls.any_in(on_this_side) == []
         assert not on_this_side.exists()
+
+    @pytest.mark.asyncio
+    async def test_the_profile_is_read_at_the_recorded_start_not_at_the_clones_head(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+        clone: Path,
+        on_this_side: Path,
+        git_calls: _GitCalls,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        _receipts_env: Path,
+    ) -> None:
+        """The clone's HEAD has moved past the commit this build is recorded as
+        starting from, and the profile differs between the two. The press and
+        every deploy leg read it at the recorded start, never at the HEAD."""
+        started_at = self._commit_the_profile(
+            clone, self._PROFILE, "the project's deploy profile"
+        )
+        _git(clone, "rebase", "-q", "main", f"autobuild/{FEATURE_ID}")
+        _git(clone, "checkout", "-q", "main")
+        _git(clone, "push", "-q", "origin", "main")
+        tip = _git(clone, "rev-parse", f"autobuild/{FEATURE_ID}")
+        # Afterwards, in the clone only: a different environment and a
+        # different identity setting, at what is now its HEAD.
+        moved = self._commit_the_profile(
+            clone,
+            {
+                **self._PROFILE,
+                "env_id": "moved-on",
+                "identity": {"setting": "SOME_LATER_SETTING", "reported_as": "LATER"},
+            },
+            "a later change to the deploy profile",
+        )
+        assert _git(clone, "rev-parse", "HEAD") == moved != started_at
+        dispatcher, legs = self._the_real_dispatcher(config, monkeypatch, tmp_path)
+
+        outcome = await _press(
+            config=config,
+            pool=pool,
+            repo=REPO,
+            repo_root=on_this_side,
+            merge=_FakeMergeCommand(tip),
+            deploy=dispatcher,
+            expect_main_sha=started_at,
+            start_commit=started_at,
+        )
+
+        assert outcome.result == "publication-pending", outcome.detail
+        assert [leg["leg"] for leg in legs] == ["candidate_check", "candidate_down"]
+        # The dispatcher composed both legs from the profile at the start ...
+        assert [leg["profile"].env_id for leg in legs] == ["apitest", "apitest"]
+        # ... and the press handed the identity under the setting declared at
+        # the start, not the one the clone's HEAD now names.
+        assert set(legs[0]["identity_env"] or {}) == {"DEPLOY_IDENTITY"}
+        assert set(legs[1]["identity_env"] or {}) == {"DEPLOY_IDENTITY"}
+        assert git_calls.any_in(on_this_side) == []
 
 
 class TestTheCompositionOnlyRoutesWhatItShould:
