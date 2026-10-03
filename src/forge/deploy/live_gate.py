@@ -655,9 +655,11 @@ class SidecarLiveGateInvoker:
     Args:
         base_url: The sandbox sidecar's address, e.g. ``http://127.0.0.1:8925``.
         repo: The ``org/name`` key the sidecar resolves the repository by.
-        repo_path: The working directory the driver runs in, as the SANDBOX
-            sees it — the clone's own path, which is the same path the
-            repository map names.
+        repo_path: The working directory the driver is asked to run in. A
+            laid-out candidate tree is honoured by the helper and must be
+            where the driver ran; any other path (this side's path for the
+            repository, which is not the clone's) is ignored there, and the
+            helper runs the driver in its own clone and says where.
         driver_argv: The per-target driver command from the profile. The
             sidecar checks it against the profile's own declaration and
             refuses anything else.
@@ -849,8 +851,23 @@ class SidecarLiveGateInvoker:
                 f"result: {answer!r}"
             )
         ran_in = answer.get("cwd")
-        if not isinstance(ran_in, str) or not _same_place(
-            str(self._repo_path), ran_in
+        # WHERE IT RAN IS THE HELPER'S TO SAY, unless a tree was asked for (3
+        # October 2026). The helper honours a requested directory in one case
+        # only — a laid-out candidate tree — and otherwise runs the driver in
+        # its own clone of the repository and says so. The path this side
+        # holds for a sandboxed repository is the coordinator's, not the
+        # clone's (since the coordinator moved into a container they differ),
+        # so requiring the two to match turned every passing gate run outside
+        # a tree into "the gate could not run", and the deploy it had just
+        # passed was rolled back. A tree that was asked for and not used is
+        # still refused, exactly as before: that is the check that the tree
+        # checked is the tree asked about. The same rule the script runner
+        # applies (:func:`forge.deploy.sidecar_runner.candidate_tree_not_honoured`).
+        from forge.deploy.sidecar_runner import names_a_candidate_tree
+
+        asked_for_a_tree = names_a_candidate_tree(str(self._repo_path))
+        if not isinstance(ran_in, str) or not ran_in.strip() or (
+            asked_for_a_tree and not _same_place(str(self._repo_path), ran_in)
         ):
             return _instrument(
                 f"the live gate was asked to run in {self._repo_path} and the "

@@ -1270,7 +1270,28 @@ async def execute_merge_deploy(
     deploy_run_id = str(uuid.uuid4())
     task_id = _deploy_task_id(feature_id)
     tree_path: Path | None = None
+    # The commit the laid-out tree is a tree OF, and the commit the standing
+    # candidate was checked at — so a later leg knows which scripts belong to it.
+    tree_commit: str | None = None
+    candidate_commit: str | None = None
     candidate_standing = False
+    # THE PROJECT'S OWN STEPS RUN FROM A TREE AT THE RIGHT COMMIT, in a sandbox
+    # (3 October 2026). A repository with a sandbox is deployed out of the
+    # sandbox's own clone, and nothing keeps that clone's working copy up to
+    # date: merges are joined in working folders of their own and published to
+    # the remote, and the copy stays wherever it was. The candidate check
+    # always ran from a tree laid out at the commit being checked, but every
+    # other leg — the "what is running" question, the promote with its health
+    # checks, live gate and revert, and the candidate's teardown — ran the
+    # project's scripts out of that working copy. On 3 October it held a deploy
+    # script from July that did not know the question, took it for a plain
+    # deploy, and put September's code live, which crashed. So for a
+    # repository with a sandbox every leg runs from a tree of the commit it is
+    # about, laid out the way the check's is. Every other repository's legs run
+    # exactly where they always have.
+    from forge.config.sandboxes import sandbox_for
+
+    scripts_from_the_commit = sandbox_for(deps.config, repo) is not None
     # WHERE this repository's git happens (sandbox first, rule 89): inside its
     # sandbox when it has one, in this container when it has not. Chosen once,
     # used by every git operation the press makes, so they cannot disagree.
@@ -1635,8 +1656,29 @@ async def execute_merge_deploy(
             gate["candidate_left_standing"] = sentence
             logger.warning("merge-executor: %s", sentence)
             return
+        # BY THE SCRIPT THAT STOOD IT UP (3 October 2026): for a repository
+        # with a sandbox, the teardown runs from the tree of the commit the
+        # candidate was checked at, never from the clone's working copy — whose
+        # step may not know the teardown at all and do something else instead.
+        scripts_cwd, no_scripts = await _the_scripts_at(candidate_commit)
+        if no_scripts:
+            sentence = (
+                f"the candidate for {feature_id} was left in place because "
+                f"{no_scripts}; remove it by hand with this project's own "
+                f"teardown step, handing it the identity "
+                f"{next(iter(identity_env.values()))}. Nothing was removed "
+                f"automatically, because the teardown step in the working copy "
+                f"may be older than the candidate and not know how."
+            )
+            gate["candidate_left_standing"] = sentence
+            logger.warning("merge-executor: %s", sentence)
+            return
         try:
-            result = await _dispatch("candidate_down", identity_env=identity_env)
+            result = await _dispatch(
+                "candidate_down",
+                identity_env=identity_env,
+                **({"candidate_cwd": scripts_cwd} if scripts_cwd else {}),
+            )
         except Exception as exc:  # noqa: BLE001 — cleanup never costs a report
             logger.warning(
                 "merge-executor: tearing the candidate for %s down raised "
@@ -1743,7 +1785,7 @@ async def execute_merge_deploy(
         laid-out tree are left exactly where they are, because the new holder
         settles them by looking.
         """
-        nonlocal candidate_standing, tree_path
+        nonlocal candidate_standing, tree_path, tree_commit
         logger.error(
             "merge-executor: %s's publication record has moved on — this "
             "worker has been replaced and stops without tidying up",
@@ -1751,6 +1793,7 @@ async def execute_merge_deploy(
         )
         candidate_standing = False
         tree_path = None
+        tree_commit = None
         return MergeDeployOutcome(
             result="merge-refused",
             status="FAILED",
@@ -1807,12 +1850,13 @@ async def execute_merge_deploy(
 
     async def _lay_the_tree_out(sha: str) -> MergeDeployOutcome | None:
         """Lay out the exact tree of ``sha`` for the live check. None = it is there."""
-        nonlocal tree_path
+        nonlocal tree_path, tree_commit
         excluded_now: bool | None = None
         try:
             excluded_now = await git.ensure_candidate_trees_excluded()
             laid_out = await git.materialise_candidate_tree(feature_id, str(sha))
             tree_path = Path(laid_out.path)
+            tree_commit = str(sha)
             if excluded_now is None:
                 excluded_now = laid_out.exclude_written
             if not gate["candidate_tree"]:
@@ -1836,6 +1880,39 @@ async def execute_merge_deploy(
         gate["exclude_written_now"] = excluded_now
         return None
 
+    async def _the_scripts_at(sha: str | None) -> tuple[str | None, str | None]:
+        """Where a leg about ``sha`` runs the project's own steps.
+
+        ``(None, None)`` for a repository without a sandbox: its legs run
+        where they always have, and nothing is laid out for them. For one with
+        a sandbox, ``(path, None)`` — the tree of ``sha``, laid out with the
+        very operation the check uses (the one already there when it is of
+        ``sha``) — or ``(None, why not)``, and the caller then runs nothing
+        rather than fall back to a working copy nobody keeps up to date.
+        """
+        nonlocal tree_path, tree_commit
+        if not scripts_from_the_commit:
+            return None, None
+        wanted = str(sha or "").strip()
+        if not wanted:
+            return None, (
+                "no commit is recorded for it, so there is no tree to run the "
+                "project's own steps from"
+            )
+        if tree_path is not None and tree_commit == wanted:
+            return str(tree_path), None
+        try:
+            await git.ensure_candidate_trees_excluded()
+            laid_out = await git.materialise_candidate_tree(feature_id, wanted)
+        except CandidateTreeError as exc:
+            return None, (
+                f"the tree of {wanted[:10]} could not be laid out to run the "
+                f"project's own steps from ({exc})"
+            )
+        tree_path = Path(laid_out.path)
+        tree_commit = wanted
+        return str(tree_path), None
+
     async def _run_the_candidate_check(sha: str) -> MergeDeployOutcome | None:
         """Run the registered live checks against the laid-out tree of ``sha``.
 
@@ -1844,7 +1921,7 @@ async def execute_merge_deploy(
         on the JOINED commit and only there: checking the build's own branch
         was not enough once the remote could have moved under it.
         """
-        nonlocal candidate_standing
+        nonlocal candidate_standing, candidate_commit
         # THE IDENTITY IS HANDED TO THE CHECK, not only to the deploy (24
         # September 2026). The check is the only moment at which the thing that
         # was checked certainly still exists, so it is the only moment at which
@@ -1952,6 +2029,7 @@ async def execute_merge_deploy(
         if c_outcome != "complete":
             return _candidate_refusal(checked, summary)
         candidate_standing = str(c_detail.get("candidate") or "standing") == "standing"
+        candidate_commit = str(sha)
         return None
 
     def _publication_store() -> Any:
@@ -2256,7 +2334,9 @@ async def execute_merge_deploy(
             )
             return None
 
-    async def _what_the_target_says(*, target: str, declaration: Any) -> Any:
+    async def _what_the_target_says(
+        *, target: str, declaration: Any, scripts_cwd: str | None = None
+    ) -> Any:
         """Ask the project, read-only, what it is running on ``target``.
 
         Added 23 September 2026, after the second review of the executor stage.
@@ -2286,6 +2366,7 @@ async def execute_merge_deploy(
             asked = await _dispatch(
                 "what_is_running",
                 ask_env={declaration.asked_with: "1"},
+                **({"candidate_cwd": scripts_cwd} if scripts_cwd else {}),
             )
         except Exception as exc:  # noqa: BLE001 — a question, never a crash
             logger.warning(
@@ -2651,6 +2732,31 @@ async def execute_merge_deploy(
                 ),
             )
 
+        # THE STEPS THAT ASK AND DEPLOY ARE THE ONES THAT SHIP WITH J (3
+        # October 2026). For a repository with a sandbox, the question and the
+        # promote both run from J's own tree — the one the check ran in, still
+        # laid out, or laid out again on a pick-up — never from the clone's
+        # working copy. A tree that cannot be laid out is a deploy not made.
+        scripts_cwd, no_scripts = await _the_scripts_at(j_commit)
+        if no_scripts:
+            return _published_deployment_pending(
+                j_commit=j_commit,
+                target_branch=target_branch,
+                g_commit=g_commit,
+                remote_now=remote_now,
+                checks_passed=checks_passed,
+                checks_total=checks_total,
+                what_was_checked=what_was_checked,
+                attempt=attempt,
+                turn=turn,
+                store=store,
+                why_not_deployed=(
+                    f"{repo}'s own deploy steps run from a tree of the commit "
+                    f"being deployed, and {no_scripts}; so {target} was not "
+                    "asked what it is running and nothing was deployed"
+                ),
+            )
+
         grant = lock.grant(
             target=target,
             build_id=build_id,
@@ -2688,7 +2794,7 @@ async def execute_merge_deploy(
             # remote and running". The ledger is a record of what this press
             # did; only the project can say what is there now.
             observed = await _what_the_target_says(
-                target=target, declaration=declaration
+                target=target, declaration=declaration, scripts_cwd=scripts_cwd
             )
             if observed.word == "no-answer":
                 return _published_deployment_pending(
@@ -2879,7 +2985,8 @@ async def execute_merge_deploy(
                 return _replaced_here()
 
             try:
-                deployed = await _dispatch("promote", deploy_ownership=ownership)
+                where = {"candidate_cwd": scripts_cwd} if scripts_cwd else {}
+                deployed = await _dispatch("promote", deploy_ownership=ownership, **where)
             except Exception as exc:  # noqa: BLE001 — a refusal, never a crash
                 why = (
                     f"the deploy of {identity.text} to {target} raised "
@@ -3357,12 +3464,13 @@ async def execute_merge_deploy(
         else is removed: the joined commit and the working folder of every
         attempt stay under the names their own attempt gave them.
         """
-        nonlocal tree_path
+        nonlocal tree_path, tree_commit
         if candidate_standing:
             await _tear_down_candidate()
         if tree_path is not None:
             await git.remove_candidate_tree(feature_id, str(tree_path))
             tree_path = None
+            tree_commit = None
         where = await target_branch_now(git, recorded_branch=recorded_branch)
         if not where.ok:
             return _cannot_join(
