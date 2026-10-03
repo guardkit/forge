@@ -1001,12 +1001,72 @@ def _build_dispatch_build(
     # that are still ACTIVE, so finished builds never block anything.
     started_by_feature: dict[str, set[str]] = {}
 
+    async def _stop_the_recovered_original_first(
+        payload: "BuildQueuedPayload",
+        ack_callback,
+        register_observer,
+        *,
+        runless_replay: bool,
+        build_id: str,
+    ) -> bool:
+        """A recovered (INTERRUPTED) build: stop its original run first.
+
+        Review round 2 (4 October 2026). Recovery marks a RUNNING row
+        INTERRUPTED without stopping its run, and after a coordinator-only
+        restart that run may still be alive in its runner. So before this
+        build is given a card, refused or acknowledged, its runner is asked
+        to stop it (``purpose="relaunch"``: the current run, nothing
+        remembered) and the rest of this dispatch waits — the message
+        unacknowledged, re-asked every 30 s — until nothing of it is left.
+        Then the original's identity (its ``async_tasks`` row) is cleared, so
+        the relaunch's observer can only resolve the relaunch's own thread
+        and run, and the dispatch continues exactly as it would have.
+        ``True`` means this took the dispatch over.
+        """
+        if ack_guard is None:
+            return False
+
+        async def _continue() -> None:
+            try:
+                sqlite_pool.connection.execute(
+                    "DELETE FROM async_tasks WHERE build_id = ?", (build_id,)
+                )
+            except sqlite3.Error as exc:
+                logger.warning(
+                    "dispatch_build: could not clear the stopped original's "
+                    "identity for build_id=%s (%s)",
+                    build_id,
+                    exc,
+                )
+            await dispatch_build(
+                payload,
+                ack_callback,
+                register_observer,
+                runless_replay=runless_replay,
+                _original_stopped=True,
+            )
+
+        logger.info(
+            "dispatch_build: recovered build build_id=%s — stopping its "
+            "original run before anything else",
+            build_id,
+        )
+        await ack_guard.ack_when_stopped(
+            payload.feature_id,
+            payload.correlation_id,
+            _continue,
+            where="dispatch_build recovered INTERRUPTED build",
+            purpose="relaunch",
+        )
+        return True
+
     async def dispatch_build(
         payload: "BuildQueuedPayload",
         ack_callback,
         register_observer=None,
         *,
         runless_replay: bool = False,
+        _original_stopped: bool = False,
     ):
         """Persist + gate + dispatch one accepted ``BuildQueuedPayload``.
 
@@ -1086,6 +1146,18 @@ def _build_dispatch_build(
                         )
                         return
                     await ack_callback()
+                    return
+                if (
+                    state == BuildState.INTERRUPTED
+                    and not _original_stopped
+                    and await _stop_the_recovered_original_first(
+                        payload,
+                        ack_callback,
+                        register_observer,
+                        runless_replay=runless_replay,
+                        build_id=build_id,
+                    )
+                ):
                     return
                 if not runless_replay:
                     # BUILD admission is not cancellation. A normal delivery
@@ -1330,6 +1402,18 @@ def _build_dispatch_build(
                 from forge.lifecycle.identifiers import derive_build_id
 
                 build_id = derive_build_id(payload.feature_id, payload.queued_at)
+                if (
+                    status == BuildState.INTERRUPTED
+                    and not _original_stopped
+                    and await _stop_the_recovered_original_first(
+                        payload,
+                        ack_callback,
+                        register_observer,
+                        runless_replay=runless_replay,
+                        build_id=build_id,
+                    )
+                ):
+                    return
                 logger.info(
                     "dispatch_build: duplicate %s build feature_id=%s "
                     "correlation_id=%s build_id=%s (%s); re-dispatching into "

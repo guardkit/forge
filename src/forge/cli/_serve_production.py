@@ -213,7 +213,6 @@ def build_runner_stop_check(
     sqlite_pool: SqliteLifecyclePersistence,
     default_url: str,
     runner_url_for_feature: "Callable[[str], str] | None" = None,
-    remember: bool = False,
 ) -> "StopCheck":
     """The production :data:`StopCheck`: ask the build's own runner.
 
@@ -222,13 +221,14 @@ def build_runner_stop_check(
     nothing it owns is left (for a build that ended in the ordinary way it
     says so at once). The runner is the one the build was dispatched to: the
     sandbox's runner for a repository that has one, the global runner
-    otherwise (the same answer the watchers use). ``remember=True`` makes the
-    question a cancel (a run not yet started never starts); the confirmation
-    before an acknowledgement leaves it ``False``.
+    otherwise (the same answer the watchers use). ``purpose`` says why
+    (``ack``, ``relaunch`` or ``cancel``; see ``ask_runner_to_stop``).
     """
     from forge.lifecycle_bridge.build_stop import StopAnswer, ask_runner_to_stop
 
-    async def _check(feature_id: str, correlation_id: str) -> StopAnswer | None:
+    async def _check(
+        feature_id: str, correlation_id: str, purpose: str = "ack"
+    ) -> StopAnswer | None:
         try:
             with sqlite_pool._reader() as cx:
                 row = cx.execute(
@@ -252,7 +252,7 @@ def build_runner_stop_check(
             if runner_url_for_feature is not None
             else default_url
         )
-        return await ask_runner_to_stop(url, str(build_id), remember=remember)
+        return await ask_runner_to_stop(url, str(build_id), purpose=purpose)
 
     return _check
 
@@ -608,21 +608,17 @@ def _build_lifecycle_bridge_wireup_parts(
     # for that runner to confirm the stop. One check serves both.
     from forge.lifecycle_bridge.build_stop import AckAfterStop
 
-    ack_guard = AckAfterStop(
-        build_runner_stop_check(
-            sqlite_pool=sqlite_pool,
-            default_url=autobuild_runner_url,
-            runner_url_for_feature=runner_url_for_feature,
-        )
-    )
-    # The cancel itself: the same question, remembered by the runner so a
-    # run of the build still waiting for a job slot never starts.
-    _stop_build = build_runner_stop_check(
+    stop_check = build_runner_stop_check(
         sqlite_pool=sqlite_pool,
         default_url=autobuild_runner_url,
         runner_url_for_feature=runner_url_for_feature,
-        remember=True,
     )
+    ack_guard = AckAfterStop(stop_check)
+    # The cancel itself: the same question, for=cancel, which the runner
+    # remembers so a run of the build still waiting for a job slot never
+    # starts.
+    async def _stop_build(feature_id: str, correlation_id: str) -> Any:
+        return await stop_check(feature_id, correlation_id, "cancel")
 
     registry = BridgeRegistry(connection=connection)
     bridge = LifecycleBridge(registry=registry, build_stopper=_stop_build)

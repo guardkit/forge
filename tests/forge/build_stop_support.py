@@ -151,7 +151,8 @@ class Estate:
     def add_build(
         self, feature_id: str, build_id: str, *, branch: str, **spec: Any
     ) -> None:
-        _git(self.repo, "branch", branch)
+        if branch != "main":
+            _git(self.repo, "branch", branch)
         self.plan[feature_id] = {"build_id": build_id, **spec}
         self.plan["_records"] = str(self.records)
         (self.guardkit.parent / "plan.json").write_text(json.dumps(self.plan))
@@ -452,3 +453,36 @@ def throwaway_broker() -> Iterator[str]:
         subprocess.run(
             ["docker", "rm", "--force", container], capture_output=True, timeout=60
         )
+
+
+def refusing_engine(root: Path) -> tuple[Path, Path]:
+    """A real engine client whose ``rm`` is refused while a file exists."""
+    refuse = root / "refuse-rm"
+    refuse.write_text("on")
+    wrapper = root / "engine-refusing-rm"
+    wrapper.write_text(
+        "#!/bin/sh\n"
+        f'if [ "$1" = "rm" ] && [ -e "{refuse}" ]; then\n'
+        "  echo 'removal refused' >&2; exit 1\n"
+        "fi\n"
+        'exec docker "$@"\n'
+    )
+    wrapper.chmod(0o755)
+    return wrapper, refuse
+
+
+def marked_alive(build_id: str) -> list[int]:
+    """Live processes carrying this build's owner marker."""
+    needle = f"GUARDKIT_RUN_OWNER={build_id}".encode()
+    found = []
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        try:
+            entries = Path(f"/proc/{name}/environ").read_bytes().split(b"\0")
+            state = Path(f"/proc/{name}/stat").read_text().rpartition(")")[2].split()[0]
+        except OSError:
+            continue
+        if needle in entries and state not in ("Z", "X"):
+            found.append(int(name))
+    return found

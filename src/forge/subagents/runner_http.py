@@ -43,10 +43,12 @@ async def _stop(request: Request) -> JSONResponse:
     build_id = str(request.path_params.get("build_id") or "").strip()
     if not build_id:
         return JSONResponse({"error": "a build id is required"}, status_code=400)
-    # ``remember=0``: the factory confirming before an acknowledgement — stop
-    # whatever is left, but do not cancel a run of this build not yet started.
-    remember = request.query_params.get("remember", "1").lower() not in ("0", "false")
-    report = await build_processes.stop_build(build_id, remember=remember)
+    # ``for``: why (see build_processes.STOP_PURPOSES) — cancel (default),
+    # relaunch, or ack (a check that never stops a run).
+    purpose = request.query_params.get("for", "cancel")
+    if purpose not in build_processes.STOP_PURPOSES:
+        return JSONResponse({"error": f"unknown purpose {purpose!r}"}, status_code=400)
+    report = await build_processes.stop_build(build_id, purpose=purpose)
     if report.stopped:
         logger.info("runner stop route: build %s — nothing it owns is alive", build_id)
     else:
