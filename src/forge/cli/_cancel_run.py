@@ -21,6 +21,7 @@ hardening:
 
 from __future__ import annotations
 
+import asyncio
 import sys
 from pathlib import Path
 from typing import Any
@@ -28,10 +29,11 @@ from typing import Any
 import click
 
 from forge.cli._cancel_gate_inject import try_inject_paused_cancel
+from forge.cli._recorded_run import interrupt_recorded_run
 from forge.cli._db_resolve import resolve_db_path
 from forge.cli._responder import config_expected_approver, resolve_responder
 from forge.cli.runtime import build_cli_runtime
-from forge.lifecycle.state_machine import BuildState
+from forge.lifecycle.state_machine import TERMINAL_STATES, BuildState
 
 __all__ = ["execute_cancel"]
 
@@ -92,6 +94,16 @@ def execute_cancel(
     ):
         click.echo(f"forge cancel: {build.build_id} — synthetic reject injected.")
         return
+
+    # A build that may be running: send its recorded run the ordinary
+    # interrupt on the runner it was launched on (its repository's sandbox
+    # runner from the configuration this command was given, else the global
+    # runner); the runner's own cancel handler stops everything it owns.
+    # Best effort — the cancel itself proceeds either way.
+    if build.status not in TERMINAL_STATES:
+        asyncio.run(
+            interrupt_recorded_run(runtime.persistence, ctx.obj, build.build_id)
+        )
 
     outcome = runtime.cli_steering_handler.handle_cancel(
         build_id=build.build_id,
