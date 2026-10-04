@@ -679,9 +679,16 @@ class WorkQueueStore:
 
         A no-op returning False when no row was filed under that correlation
         id (a build queued directly, not through the queue), and when the row
-        already carries the note (a redelivered refusal says nothing new).
+        already carries the note (a redelivered refusal says nothing new), and
+        on a database that has no work queue at all. Any other failure raises,
+        so the caller can hold the refusal and try again.
         """
-        row = self.get_by_correlation_id(correlation_id)
+        try:
+            row = self.get_by_correlation_id(correlation_id)
+        except sqlite3.OperationalError as exc:
+            if "no such table" in str(exc).lower():
+                return False
+            raise
         if row is None:
             return False
         queue_id = int(row["id"])

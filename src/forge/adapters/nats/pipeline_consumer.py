@@ -232,24 +232,33 @@ class PipelineConsumerDeps:
 
 def note_build_rejection(
     record: Callable[[str, str], Any] | None, correlation_id: str, reason: str
-) -> None:
-    """Note a build refused before its row was written; never raises.
+) -> bool:
+    """Note a build refused before its row was written. Never raises.
 
-    The note is a courtesy to the work queue: losing it must never cost the
-    refusal itself, its acknowledgement or its failure event.
+    Returns whether the refusal may now be acknowledged: True when the note
+    was written, was already there, or there was nothing to note it on (no
+    recorder wired, no queue row filed under this correlation id). False when
+    writing it FAILED — a locked database, say. Then the caller must not
+    acknowledge: the message comes back, and its redelivery writes the note
+    (one per row, however often it is tried). Acknowledging instead would lose
+    the only durable sign of the refusal, and a row waiting "after" this one
+    would wait for ever.
     """
     if record is None:
-        return
+        return True
     try:
         record(correlation_id, reason)
-    except Exception as exc:  # noqa: BLE001 — a note never stops a refusal
+    except Exception as exc:  # noqa: BLE001 — answered as "hold", never raised
         logger.warning(
             "pipeline_consumer: could not note the refused build for "
-            "correlation_id=%s on the work queue (%s: %s)",
+            "correlation_id=%s on the work queue (%s: %s); holding the "
+            "message WITHOUT ack so its redelivery writes the note",
             correlation_id,
             type(exc).__name__,
             exc,
         )
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -523,11 +532,12 @@ async def handle_message(msg: _MsgLike, deps: PipelineConsumerDeps) -> None:
             payload.originating_adapter,
             payload.triggered_by,
         )
-        note_build_rejection(
+        if not note_build_rejection(
             deps.record_build_rejection,
             payload.correlation_id,
             f"it was sent by {originator}, which is not approved to start builds",
-        )
+        ):
+            return
         await msg.ack()
         await _safe_publish_failure(
             deps,
@@ -550,12 +560,13 @@ async def handle_message(msg: _MsgLike, deps: PipelineConsumerDeps) -> None:
             payload.feature_yaml_path,
             payload.feature_id,
         )
-        note_build_rejection(
+        if not note_build_rejection(
             deps.record_build_rejection,
             payload.correlation_id,
             f"its feature file {payload.feature_yaml_path} is outside the "
             "folders builds may read",
-        )
+        ):
+            return
         await msg.ack()
         await _safe_publish_failure(
             deps,
