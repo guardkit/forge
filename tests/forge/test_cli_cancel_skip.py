@@ -171,6 +171,15 @@ def _patch_runtime(
     monkeypatch.setattr(cancel_run_module, "build_cli_runtime", lambda *_a, **_kw: fake)
     monkeypatch.setattr(skip_module, "build_cli_runtime", lambda *_a, **_kw: fake)
 
+    # The fake ledger records no run, so there is nothing to interrupt (the
+    # real interrupt is covered by tests/forge/cli/test_interrupt_recorded_run.py).
+    async def _nothing_to_interrupt(*_a: object, **_kw: object) -> bool:
+        return True
+
+    monkeypatch.setattr(
+        cancel_run_module, "interrupt_recorded_run", _nothing_to_interrupt
+    )
+
 
 # ---------------------------------------------------------------------------
 # AC-001 / AC-002 / AC-003 — exports and registration

@@ -44,9 +44,13 @@ OTHER = "example/plain"
 class _StandInRunner:
     def __init__(self) -> None:
         self.cancelled: list[str] = []
+        #: True: the runner restarted and knows no thread (answers 404).
+        self.forgot = False
 
         async def _runs(request: Request) -> JSONResponse:
             thread = request.path_params["thread"]
+            if self.forgot:
+                return JSONResponse({"detail": "Thread not found"}, status_code=404)
             return JSONResponse(
                 [{"run_id": f"run-of-{thread}", "thread_id": thread, "status": "running"}]
             )
@@ -276,4 +280,199 @@ def test_boot_settlement_holds_a_build_whose_interrupt_could_not_be_sent(
     assert _settle() == 1
     assert pool.get_build_row(build_id).status is BuildState.FAILED
     assert runners["global"].cancelled == [thread]
+    pool.connection.close()
+
+
+def _cancel_command(db_path: Path, feature: str, *extra: str) -> Any:
+    from click.testing import CliRunner
+
+    from forge.cli.main import main
+
+    return CliRunner().invoke(main, [*extra, "cancel", feature, "--db", str(db_path)])
+
+
+def _running(pool: SqliteLifecyclePersistence, feature: str, repo: str) -> tuple[str, str]:
+    build_id, thread = _launched(pool, feature, repo)
+    pool.connection.execute(
+        "UPDATE builds SET status = 'RUNNING' WHERE build_id = ?", (build_id,)
+    )
+    return build_id, thread
+
+
+@pytest.fixture
+def quiet_bus(monkeypatch) -> list[str]:
+    notices: list[str] = []
+    monkeypatch.setattr(
+        "forge.cli.queue.publish", lambda subject, body: notices.append(subject)
+    )
+    return notices
+
+
+def test_forge_cancel_with_an_unreachable_runner_cancels_nothing(
+    tmp_path, monkeypatch, quiet_bus
+) -> None:
+    from forge.lifecycle.state_machine import BuildState
+
+    db_path = tmp_path / "forge.db"
+    pool = _ledger(db_path)
+    build_id, _ = _running(pool, "FEAT-UNR1", OTHER)
+    pool.connection.close()
+    monkeypatch.setenv("FORGE_AUTOBUILD_RUNNER_URL", f"http://127.0.0.1:{_free_port()}")
+    monkeypatch.delenv("FORGE_CONFIG_PATH", raising=False)
+    monkeypatch.chdir(tmp_path)
+    result = _cancel_command(db_path, "FEAT-UNR1")
+    assert result.exit_code == 2
+    assert "could not reach its runner; nothing was cancelled — try again" in result.output
+    after = _ledger(db_path)
+    assert after.get_build_row(build_id).status is BuildState.RUNNING
+    after.connection.close()
+
+
+def test_forge_cancel_without_config_uses_forge_config_path(
+    runners, tmp_path, monkeypatch, quiet_bus
+) -> None:
+    db_path = tmp_path / "forge.db"
+    pool = _ledger(db_path)
+    _, thread = _running(pool, "FEAT-ENV1", REPO)
+    pool.connection.close()
+    monkeypatch.setenv("FORGE_AUTOBUILD_RUNNER_URL", runners["global_url"])
+    monkeypatch.setenv(
+        "FORGE_CONFIG_PATH", str(_config_file(tmp_path, runners["project_url"]))
+    )
+    work = tmp_path / "elsewhere"
+    work.mkdir()
+    monkeypatch.chdir(work)  # no ./forge.yaml, no --config
+    result = _cancel_command(db_path, "FEAT-ENV1")
+    assert result.exit_code == 0, result.output
+    assert runners["project"].cancelled == [thread]
+    assert runners["global"].cancelled == []
+
+
+def test_forge_cancel_after_the_runner_restarted_still_cancels(
+    runners, tmp_path, monkeypatch, quiet_bus
+) -> None:
+    """The right runner no longer knows the thread (404): nothing to stop."""
+    from forge.lifecycle.state_machine import BuildState
+
+    db_path = tmp_path / "forge.db"
+    pool = _ledger(db_path)
+    build_id, _ = _running(pool, "FEAT-RST1", OTHER)
+    pool.connection.close()
+    runners["global"].forgot = True
+    monkeypatch.setenv("FORGE_AUTOBUILD_RUNNER_URL", runners["global_url"])
+    monkeypatch.delenv("FORGE_CONFIG_PATH", raising=False)
+    monkeypatch.chdir(tmp_path)
+    result = _cancel_command(db_path, "FEAT-RST1")
+    assert result.exit_code == 0, result.output
+    after = _ledger(db_path)
+    assert after.get_build_row(build_id).status is BuildState.CANCELLED
+    after.connection.close()
+
+
+def _recovered_dispatch(tmp_path: Path, monkeypatch, outcome: str, starter: Any):
+    """Production consumer deps over a recovered (INTERRUPTED) build whose
+    earlier run the ledger recorded; the gate answers ``outcome``."""
+    from forge.adapters.nats.pipeline_consumer import PipelineConsumerDeps  # noqa: F401
+    from forge.cli import _serve_deps_gating, _serve_gate_activation
+    from forge.cli._serve_deps import build_pipeline_consumer_deps
+    from forge.gating.sqlite_adapters import build_sqlite_gate_adapters
+    from tests.integration.test_gate_activation_production_wiring import (
+        FixedClock,
+        OrderRecordingNats,
+        _build_parts,
+    )
+
+    nats = OrderRecordingNats()
+    pool = _ledger(tmp_path / "forge.db")
+    cfg = _plain_config()
+    _serve_deps_gating._reset_for_tests()
+    _serve_deps_gating.bind_gate_parts(_build_parts(nats, forge_config=cfg))
+    repo, sm = build_sqlite_gate_adapters(pool, clock=FixedClock())
+    deps = build_pipeline_consumer_deps(
+        nats,
+        cfg,
+        pool,
+        async_task_starter=starter,
+        gate_repository=repo,
+        gate_state_machine=sm,
+        gate_clock=FixedClock(),
+    )
+    payload = _payload("FEAT-REC1", OTHER)
+    build_id, thread = _launched(pool, "FEAT-REC1", OTHER)
+    pool.connection.execute(
+        "UPDATE builds SET status = 'INTERRUPTED' WHERE build_id = ?", (build_id,)
+    )
+
+    async def _gate(**_: Any) -> Any:
+        return getattr(_serve_gate_activation.GateOutcome, outcome)
+
+    monkeypatch.setattr(_serve_gate_activation, "maybe_gate_build", _gate)
+    return nats, pool, deps, build_id, thread
+
+
+def _plain_config() -> Any:
+    from forge.config.models import ForgeConfig
+
+    return ForgeConfig.model_validate(
+        {"permissions": {"filesystem": {"allowlist": ["/srv/forge"]}}}
+    )
+
+
+class _Msg:
+    def __init__(self, data: bytes) -> None:
+        self.data = data
+        self.acks = 0
+
+    async def ack(self) -> None:
+        self.acks += 1
+
+
+def _message_for(pool: SqliteLifecyclePersistence, build_id: str) -> bytes:
+    from nats_core.envelope import EventType, MessageEnvelope
+
+    row = pool.get_build_row(build_id)
+    payload = _payload(row.feature_id, row.repo).model_copy(
+        update={"correlation_id": row.correlation_id, "queued_at": row.queued_at}
+    )
+    return (
+        MessageEnvelope(
+            source_id="forge-cli",
+            event_type=EventType.BUILD_QUEUED,
+            correlation_id=row.correlation_id,
+            payload=payload.model_dump(mode="json"),
+        )
+        .model_dump_json()
+        .encode()
+    )
+
+
+@pytest.mark.parametrize("outcome", ["CANCELLED", "RESUMED"])
+def test_a_recovered_build_is_held_when_its_earlier_run_cannot_be_interrupted(
+    tmp_path, monkeypatch, outcome
+) -> None:
+    """The card is rejected (CANCELLED), or approved and the relaunch fails
+    (RESUMED): the earlier run cannot be reached, so the message is not
+    acknowledged, nothing is reported failed, and its identity is kept."""
+    from forge.adapters.nats.pipeline_consumer import handle_message
+    from forge.cli import _serve_deps_gating
+
+    class _FailingStarter:
+        async def astart_async_task(self, **_: Any) -> str:
+            raise RuntimeError("the relaunch could not be submitted")
+
+    monkeypatch.setenv("FORGE_AUTOBUILD_RUNNER_URL", f"http://127.0.0.1:{_free_port()}")
+    nats, pool, deps, build_id, thread = _recovered_dispatch(
+        tmp_path, monkeypatch, outcome, _FailingStarter()
+    )
+    msg = _Msg(_message_for(pool, build_id))
+    try:
+        asyncio.run(handle_message(msg, deps))
+    finally:
+        _serve_deps_gating._reset_for_tests()
+    assert msg.acks == 0
+    assert nats.published.get("pipeline.build-failed.FEAT-REC1", []) == []
+    kept = pool.connection.execute(
+        "SELECT task_id FROM async_tasks WHERE build_id = ?", (build_id,)
+    ).fetchall()
+    assert [r[0] for r in kept] == [thread]
     pool.connection.close()

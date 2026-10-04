@@ -46,6 +46,7 @@ from forge.persistence.migrations import (
     lifecycle_bridge_registry as bridge_migration,
 )
 from tests.forge.build_stop_support import (
+    free_port,
     container_running,
     docker_available,
     kill_marked,
@@ -520,7 +521,9 @@ def test_a_declined_relaunch_interrupts_the_original(
     assert not (estate.records / f"{FEATURE}.relaunch.started").exists()
 
 
-@pytest.mark.parametrize("ending", ["reject", "approve-launch-fails"])
+@pytest.mark.parametrize(
+    "ending", ["reject", "approve-launch-fails", "reject-runner-unreachable"]
+)
 def test_a_rearmed_card_after_a_second_restart_interrupts_the_original(
     nats, pool, tmp_path, monkeypatch, ending  # noqa: F811 — imported fixtures
 ) -> None:
@@ -585,13 +588,29 @@ def test_a_rearmed_card_after_a_second_restart_interrupts_the_original(
             clock=FixedClock(),
             forge_config=cfg,
         )
+        if ending == "reject-runner-unreachable":
+            # The runner cannot be reached when the card is refused: the
+            # re-arm keeps trying, and the original keeps running meanwhile.
+            from forge.cli import _serve_gate_activation
+
+            monkeypatch.setattr(
+                _serve_gate_activation, "REARM_INTERRUPT_RETRY_SECONDS", 0.5
+            )
+            monkeypatch.setenv(
+                "FORGE_AUTOBUILD_RUNNER_URL", f"http://127.0.0.1:{free_port()}"
+            )
         await _approve_or_reject(
-            nats, pool, build_id, "reject" if ending == "reject" else "approve"
+            nats, pool, build_id, "approve" if ending.startswith("approve") else "reject"
         )
+        if ending == "reject-runner-unreachable":
+            await asyncio.sleep(10.0)
+            assert not all(t.done() for t in rearmed), "the re-arm gave up"
+            assert any(proc_alive(p, s) for p, s in original)
+            monkeypatch.setenv("FORGE_AUTOBUILD_RUNNER_URL", url)
         await asyncio.wait_for(
-            asyncio.gather(*rearmed, return_exceptions=True), timeout=30
+            asyncio.gather(*rearmed, return_exceptions=True), timeout=60
         )
-        assert launches == ([] if ending == "reject" else [build_id])
+        assert launches == ([build_id] if ending.startswith("approve") else [])
         deadline = asyncio.get_running_loop().time() + 30
         while any(proc_alive(p, s) for p, s in original):
             assert asyncio.get_running_loop().time() < deadline, "original still runs"
