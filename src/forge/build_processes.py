@@ -30,10 +30,10 @@ then confirm every recorded pair is gone. A zombie counts as gone: it holds no
 files, no connections and no CPU, and in a container whose first process is
 the runner nothing else will reap it.
 
-``still_running`` is the stateless question the factory asks before it lets a
-cancelled build's place go: is any process carrying this build's marker, or
-any fixture container carrying its label, still alive here? An engine that
-cannot be asked is "cannot confirm", never "stopped".
+The runner node does not finish a stopped build — and so does not give back
+its job slot — until every owned process AND the build's labelled fixture
+containers are confirmed gone; an engine that cannot be asked counts as "not
+yet gone". That job slot is the fence: nothing else waits on the runner.
 
 This module also holds the one copy of :func:`signal_process_group`, which the
 one-shot GuardKit adapter (``adapters/guardkit/run.py``) uses for its own
@@ -59,17 +59,14 @@ __all__ = [
     "OWNER_MARKER",
     "OwnedBuild",
     "OwnedProcess",
-    "StopReport",
     "build_stop_grace_seconds",
     "find_owned",
     "lookup",
     "register",
     "remove_fixture_containers",
     "signal_process_group",
-    "still_running",
-    "stop_build",
     "stop_owned",
-    "stop_pending",
+    "stop_run",
     "begin",
     "end",
     "unregister",
@@ -457,7 +454,7 @@ def _engine() -> str | None:
     path (the runner was started without any engine, so no build here can
     have started a fixture). Any engine that is configured is asked, and an
     engine that cannot be asked — permission, timeout, outage — is "cannot
-    confirm" (the caller's ``None``), which keeps the build's place held.
+    confirm" (the caller's ``None``), so a stopping build keeps waiting.
     """
     client = shutil.which(os.environ.get("FORGE_FIXTURE_ENGINE", "docker"))
     if client is None:
@@ -550,8 +547,8 @@ async def remove_fixture_containers(build_id: str) -> list[str] | None:
 class OwnedBuild:
     """A build whose child this process spawned, while it runs.
 
-    Plain data only: the runner's HTTP route and the build's node may run on
-    different event loops, so nothing here is an asyncio object.
+    Plain data only (nothing here is an asyncio object): one run may stop
+    another run of the same build from a different task.
     """
 
     build_id: str
@@ -562,48 +559,21 @@ class OwnedBuild:
 
 _BUILDS: dict[str, OwnedBuild] = {}
 
-#: Builds asked to stop before this process registered their child (queued for
-#: a job slot, or still in the steps before the spawn), with when they were
-#: asked. The run's node finishes them CANCELLED without spawning anything,
-#: and clears the entry when it ends. An entry for a build that never runs
-#: here again (the factory asks the same route before it lets a cancelled
-#: build's place go) is forgotten after a day.
-_STOP_PENDING: dict[str, float] = {}
-_STOP_PENDING_SECONDS: float = 24 * 3600.0
-
-
-def _pending(build_id: str) -> bool:
-    now = time.monotonic()
-    for stale in [b for b, at in _STOP_PENDING.items() if now - at > _STOP_PENDING_SECONDS]:
-        del _STOP_PENDING[stale]
-    return build_id in _STOP_PENDING
-
-
-def stop_pending(build_id: str) -> bool:
-    """True when this build's current run here has been asked to stop."""
-    entry = _BUILDS.get(build_id)
-    return (entry is not None and entry.stop_requested) or _pending(build_id)
-
-
 def begin(build_id: str) -> OwnedBuild:
     """A run of ``build_id`` starts here: its record, before any child exists.
 
-    A stop asked for while the run waited for a job slot becomes this run's
-    own stop request. The caller makes sure no earlier run of the same build
-    is still registered (see the runner node's relaunch guard).
+    The caller makes sure no earlier run of the same build is still
+    registered (see the runner node's relaunch guard).
     """
     entry = OwnedBuild(build_id=build_id, root=None)
-    entry.stop_requested = _pending(build_id)
-    _STOP_PENDING.pop(build_id, None)
     _BUILDS[build_id] = entry
     return entry
 
 
 def end(entry: OwnedBuild) -> None:
-    """That run has ended: drop its record and any stop asked for it."""
+    """That run has ended: drop its record."""
     if _BUILDS.get(entry.build_id) is entry:
         del _BUILDS[entry.build_id]
-        _STOP_PENDING.pop(entry.build_id, None)
 
 
 def register(build_id: str, pid: int) -> OwnedBuild:
@@ -624,8 +594,6 @@ def register(build_id: str, pid: int) -> OwnedBuild:
     entry.root = root
     if root is not None:
         entry.recorded.add(root)
-    # A stop asked for while the child was being spawned is honoured now.
-    entry.stop_requested = entry.stop_requested or _pending(build_id)
     return entry
 
 
@@ -638,106 +606,15 @@ def lookup(build_id: str) -> OwnedBuild | None:
     return _BUILDS.get(build_id)
 
 
-@dataclass(frozen=True, slots=True)
-class StopReport:
-    """The answer to "is everything this build owns gone?"."""
+async def stop_run(entry: OwnedBuild) -> list[OwnedProcess]:
+    """Ask that run to stop and stop its processes; the ones still alive.
 
-    build_id: str
-    processes: tuple[OwnedProcess, ...] = ()
-    containers: tuple[str, ...] = ()
-    confirmed: bool = True
-    reason: str = ""
-    #: The stop was remembered for a run not (yet) started here.
-    pending: bool = False
-
-    @property
-    def stopped(self) -> bool:
-        return self.confirmed and not self.processes and not self.containers
-
-    def as_json(self) -> dict[str, Any]:
-        answer: dict[str, Any] = {"build_id": self.build_id, "stopped": self.stopped}
-        if self.pending:
-            answer["pending"] = True
-        if not self.stopped:
-            answer["remaining"] = {
-                "processes": describe(self.processes),
-                "containers": list(self.containers),
-            }
-            if self.reason:
-                answer["reason"] = self.reason
-        return answer
-
-
-async def still_running(build_id: str) -> StopReport:
-    """Stateless: is anything carrying this build's marker or label alive here?"""
-    entry = _BUILDS.get(build_id)
-    roots = sorted(entry.recorded, key=lambda p: p.pid) if entry else []
-    processes = find_owned(build_id, roots=roots)
-    if entry is not None:
-        processes |= {p for p in entry.recorded if is_alive(p)}
-    containers = await asyncio.to_thread(
-        _engine_ids, build_id, include_stopped=False
-    )
-    if containers is None:
-        return StopReport(
-            build_id=build_id,
-            processes=tuple(sorted(processes, key=lambda p: p.pid)),
-            confirmed=False,
-            reason="the container engine could not be asked about fixtures",
-        )
-    return StopReport(
-        build_id=build_id,
-        processes=tuple(sorted(processes, key=lambda p: p.pid)),
-        containers=tuple(containers),
-    )
-
-
-#: Why a build is asked to stop. ``cancel``: stop its current run here, or —
-#: none yet — remember the request so a run waiting for a job slot never
-#: starts. ``relaunch``: stop its current run (the factory is about to launch
-#: it again), remember nothing. ``ack``: the factory confirming before an
-#: acknowledgement — never touches a run registered here, remembers nothing;
-#: with no run registered it stops whatever still carries the build's marker
-#: or label (leftovers of a run that has ended).
-STOP_PURPOSES: tuple[str, ...] = ("cancel", "relaunch", "ack")
-
-
-async def stop_build(build_id: str, *, purpose: str = "cancel") -> StopReport:
-    """Stop one build's processes and fixtures here, then report what is left.
-
-    When this process is running the build (and the purpose is not ``ack``),
-    its node is told the stop was requested (so it finishes as cancelled, not
-    failed) and the stop starts from the child it spawned. Otherwise only the
-    marker and the label say what is the build's — the answer is the same
-    after a runner restart. See :data:`STOP_PURPOSES`.
+    The run's node, seeing ``stop_requested``, finishes CANCELLED once
+    everything it owns — processes and fixtures — is confirmed gone.
     """
-    if purpose not in STOP_PURPOSES:
-        raise ValueError(f"unknown stop purpose {purpose!r}")
-    entry = _BUILDS.get(build_id)
-    if entry is not None and purpose == "ack":
-        # A check never stops a run, nor asks one to stop.
-        return await still_running(build_id)
-    if entry is not None:
-        entry.stop_requested = True
-    elif purpose == "cancel":
-        # Nothing registered here yet: the run may be waiting for a job slot.
-        # Remember the request so it never spawns; it finishes CANCELLED.
-        _STOP_PENDING[build_id] = time.monotonic()
-    remaining = await stop_owned(
-        build_id,
-        roots=[entry.root] if entry is not None and entry.root is not None else (),
-        recorded=entry.recorded if entry is not None else None,
+    entry.stop_requested = True
+    return await stop_owned(
+        entry.build_id,
+        roots=[entry.root] if entry.root is not None else (),
+        recorded=entry.recorded,
     )
-    if not remaining:
-        await remove_fixture_containers(build_id)
-    report = await still_running(build_id)
-    if entry is None and purpose == "cancel":
-        report = StopReport(
-            build_id=report.build_id,
-            processes=report.processes,
-            containers=report.containers,
-            confirmed=report.confirmed,
-            reason=report.reason,
-            pending=True,
-        )
-    return report
