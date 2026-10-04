@@ -631,3 +631,36 @@ def test_the_checkpoint_words_carry_the_shared_sentence() -> None:
     assert merge_card_words(
         feature_id="FEAT-CARD", branch="autobuild/FEAT-CARD", after_deploy_check_skip=None
     ) == merge_card_words(feature_id="FEAT-CARD", branch="autobuild/FEAT-CARD")
+
+
+
+@pytest.mark.asyncio
+async def test_a_prepared_build_s_checkpoint_card_names_where_its_plan_came_from(
+    persistence: SqliteLifecyclePersistence, tmp_path: Path
+) -> None:
+    """The same one line the routine card carries (4 October 2026)."""
+    build_id = persistence.record_pending_build(_payload())
+    persistence.connection.execute(
+        "UPDATE builds SET source_commit = ?, branch = 'feature/prepared' "
+        "WHERE build_id = ?",
+        ("ab12" * 10, build_id),
+    )
+    persistence.connection.commit()
+
+    words = await _checkpoint_card(persistence, tmp_path, build_id)
+
+    line = (
+        "The spec and plan were written elsewhere and supplied at ab12ab12ab12 "
+        "on feature/prepared; this card counts only what the build changed."
+    )
+    assert line in words
+    assert words.replace(f"{line} ", "", 1) == _card_as_it_was()
+
+
+@pytest.mark.asyncio
+async def test_a_planned_build_s_checkpoint_card_is_byte_for_byte_unchanged(
+    persistence: SqliteLifecyclePersistence, tmp_path: Path
+) -> None:
+    build_id = persistence.record_pending_build(_payload())
+
+    assert await _checkpoint_card(persistence, tmp_path, build_id) == _card_as_it_was()
