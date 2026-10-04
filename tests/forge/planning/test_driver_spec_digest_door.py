@@ -3515,8 +3515,21 @@ async def test_assumptions_and_examples_share_one_rewrite_not_two(
     dispatches = h.ctx["dispatches"]
     assert len(dispatches) == 2, "one shared machine round, never two"
     note = dispatches[1]["validate_feedback"]
-    assert note.startswith("The reviewer found 1 assumption(s) that add something the request did not ask for")
-    assert note.endswith(_EXAMPLE_NOTE)
+    assert note.startswith("The reviewer found 1 assumption(s) that add something the request did not ask for:\n- ASSUM-002: ")
+    assert (
+        "\n\nThese worked examples look like things the request does not mention:\n"
+        f'- "{_PADDED_TITLE}" (another request method)\n\n'
+    ) in note
+    assert note.endswith(
+        "\n\nRemove these assumptions and every worked example that depends on them. "
+        "Remove each worked example listed above unless the request needs it; if you "
+        "keep one, quote the words of the request that need it in its # Why: line. "
+        "Remove any assumption written only for an example you remove. Do not add "
+        "other assumptions or examples of the same kind. Change nothing else."
+    )
+    # One closing instruction, not two that contradict each other.
+    assert note.count("Change nothing else.") == 1
+    assert "Keep every other worked example exactly as it is." not in note
     superseded = [d["spec_draft"] for status, d in _events(store, _DRAFT_STAGE) if status == "superseded"]
     assert len(superseded) == 1
     assert superseded[0]["author"] == "planning-driver (assumption review)"
@@ -3652,3 +3665,65 @@ async def test_a_sandboxed_projects_list_is_read_through_its_helper(
     assert len(h.ctx["dispatches"]) == 2
     assert h.ctx["dispatches"][1]["validate_feedback"] == _EXAMPLE_NOTE
     assert _digest_cards(h)[0].payload["details"]["summary"]["what_happened"].endswith(_REMOVED_LINE)
+
+
+@pytest.mark.asyncio
+async def test_an_assumption_review_that_cannot_read_still_sends_the_flagged_examples_back(
+    store: SqlitePlanningRunStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The card never names as kept an example the writer was never asked about."""
+    _queue(store)
+
+    async def boom(*_: object, **__: object) -> None:
+        raise RuntimeError("the branch read fell over")
+
+    h = _make_driver(
+        store,
+        subscriber_factory=SharedScriptFactory([_answer("approve")]),
+        spec_replies=[_padded(), _spec_reply()],
+        git=_declaring_git(),
+    )
+    monkeypatch.setattr(type(h.driver), "_review_assumptions_on_branch", boom, raising=True)
+    await h.driver.drive(CID)
+
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+    assert len(h.ctx["dispatches"]) == 2
+    assert h.ctx["dispatches"][1]["validate_feedback"] == _EXAMPLE_NOTE
+    card = _digest_cards(h)[0].payload["details"]["summary"]
+    assert card["what_happened"] == f"{_ROUND_ONE_TEXT} {_REMOVED_LINE}"
+    drafted = [d["spec_draft"] for status, d in _events(store, _DRAFT_STAGE) if status == "drafted"]
+    assert drafted[-1]["example_review"]["card_lines"] == [_REMOVED_LINE]
+
+
+@pytest.mark.asyncio
+async def test_a_slow_spec_writer_does_not_use_up_the_sandbox_reading_allowance(
+    store: SqlitePlanningRunStore, tmp_path: Path
+) -> None:
+    """The fact sheet starts the helper reader's 120-second allowance before
+    the first spec dispatch; the writer then takes minutes. The project's list
+    is read after that, with an allowance of its own, so the check still runs."""
+    from forge.planning.sidecar_git_runner import SidecarCodeReader
+
+    url, srv = _helper_over_files(tmp_path, {".guardkit/config.yaml": _SPEC_EXAMPLES_CONFIG})
+    try:
+        git = RecordingGitRunner()
+        _queue(store)
+        h = _make_driver(
+            store,
+            subscriber_factory=SharedScriptFactory([_answer("approve")]),
+            spec_replies=[_padded(), _spec_reply()],
+            git=git,
+        )
+        # Each spec dispatch takes 200 seconds on this clock.
+        git.reader = SidecarCodeReader(
+            url, repo=TARGET_REPO, clock=lambda: 200.0 * len(h.ctx["dispatches"])
+        )
+        await h.driver.drive(CID)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+    assert len(h.ctx["dispatches"]) == 2
+    assert h.ctx["dispatches"][1]["validate_feedback"] == _EXAMPLE_NOTE
+    what_happened = _digest_cards(h)[0].payload["details"]["summary"]["what_happened"]
+    assert what_happened.endswith(_REMOVED_LINE)
