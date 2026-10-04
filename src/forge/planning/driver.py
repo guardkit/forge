@@ -82,11 +82,7 @@ from forge.planning.checkpoint import (
     build_planning_approval_envelope,
     checkpoint_product_docs,
 )
-from forge.planning.declared_memory import (
-    DECLARATION_PATH,
-    read_declared_launch_settings,
-    read_declared_memory,
-)
+from forge.planning.declared_memory import read_declarations_at_commit
 from forge.planning.escalation import (
     EscalationOutcome,
     EscalationPolicy,
@@ -2600,75 +2596,32 @@ class PlanningRunDriver:
             )
             return str(recorded_name), tuple(recorded_settings)
 
-        runner = deps.git_runner
-        read = getattr(runner, "read_file_at_commit", None)
-        if read is None:
-            await self._fail_leg(
-                correlation_id,
-                "target-terminal-enter",
-                (
-                    "the git runner wired for this factory cannot read a file "
-                    "at a commit, so there is no way to tell which memory this "
-                    "work belongs to"
-                ),
-            )
-            return None
-        try:
-            answer = await read(repo_path, start_commit, DECLARATION_PATH)
-        except Exception as exc:  # noqa: BLE001 — boundary, never crash the run
-            await self._fail_leg(
-                correlation_id,
-                "target-terminal-enter",
-                (
-                    f"{target_repo}'s {DECLARATION_PATH} could not be read at "
-                    f"the commit this work starts from ({start_commit}): "
-                    f"{type(exc).__name__}: {exc}"
-                ),
-            )
-            return None
-
-        content = getattr(answer, "content", None)
-        found = bool(getattr(answer, "found", False))
-        unreadable = getattr(answer, "refusal", None)
-
-        declared = read_declared_memory(
+        # The read itself is shared with the build admission of a feature
+        # planned elsewhere (4 October 2026), so both refuse in the same words
+        # and neither keeps a copy of it.
+        declarations = await read_declarations_at_commit(
+            deps.git_runner,
             repo=target_repo,
+            repo_path=repo_path,
             commit=start_commit,
-            content=content,
-            found=found,
-            unreadable_because=unreadable,
         )
-        if not declared.ok:
+        if not declarations.ok:
             await self._fail_leg(
                 correlation_id,
                 "target-terminal-enter",
-                declared.refusal or "the project's memory name could not be read",
+                declarations.refusal
+                or "the project's memory name could not be read",
             )
             return None
 
-        wanted = read_declared_launch_settings(
-            repo=target_repo,
-            commit=start_commit,
-            content=content,
-            found=found,
-            unreadable_because=unreadable,
-        )
-        if not wanted.ok:
-            await self._fail_leg(
-                correlation_id,
-                "target-terminal-enter",
-                wanted.refusal
-                or "the settings this project asked for could not be read",
-            )
-            return None
-
-        name = str(declared.project)
+        name = str(declarations.memory_project)
+        wanted_names = declarations.launch_settings
         recorder = getattr(deps.store, "record_memory_project", None)
         if recorder is not None:
             recorder(correlation_id, memory_project=name)
         settings_recorder = getattr(deps.store, "record_launch_settings", None)
         if settings_recorder is not None:
-            settings_recorder(correlation_id, names=list(wanted.names))
+            settings_recorder(correlation_id, names=list(wanted_names))
         logger.info(
             "planning driver: run %s belongs to the memory %s, the name %s "
             "declares at %s, and asks to be launched with %s",
@@ -2678,9 +2631,9 @@ class PlanningRunDriver:
             start_commit,
             # NAMES ONLY, never values — and this is central code, which does
             # not know or care what tool a name belongs to.
-            ", ".join(wanted.names) or "nothing beyond the factory's own list",
+            ", ".join(wanted_names) or "nothing beyond the factory's own list",
         )
-        return name, tuple(wanted.names)
+        return name, tuple(wanted_names)
 
     async def _feature_spec_leg(self, row: Any, correlation_id: str) -> bool:
         """FEATURE_SPEC leg: write the spec, show it to a person, then advance.

@@ -62,6 +62,7 @@ import shutil
 import subprocess
 import tarfile
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
@@ -80,6 +81,8 @@ __all__ = [
     "REMOTE_NAME",
     "REMOTE_TIMEOUT_SECONDS",
     "RemoteStartPoint",
+    "answered_as_ordinary",
+    "answered_for_branch",
     "candidate_tree_path",
     "candidate_trees_root",
     "ensure_candidate_trees_excluded",
@@ -228,6 +231,13 @@ class RemoteStartPoint:
     branch: str | None = None
     commit: str | None = None
     refusal: str | None = None
+    # The commit of a NAMED branch, from the same call (4 October 2026, a
+    # prepared feature through the normal build route). A feature planned
+    # elsewhere is queued on its own branch; admission needs both the default
+    # branch (where the work will be merged) and the commit that branch names
+    # (what will be built). Only set when a branch was asked for; for the
+    # default branch itself it is the same commit as ``commit``.
+    branch_commit: str | None = None
 
     @property
     def ok(self) -> bool:
@@ -235,8 +245,19 @@ class RemoteStartPoint:
         return bool(self.branch and self.commit and not self.refusal)
 
     def to_wire(self) -> dict[str, Any]:
-        """The answer as the sandbox's helper service sends it."""
-        return {"branch": self.branch, "commit": self.commit, "refusal": self.refusal}
+        """The answer as the sandbox's helper service sends it.
+
+        ``branch_commit`` is sent only when there is one, so an answer to a
+        caller that asked for no branch is exactly what it always was.
+        """
+        wire: dict[str, Any] = {
+            "branch": self.branch,
+            "commit": self.commit,
+            "refusal": self.refusal,
+        }
+        if self.branch_commit:
+            wire["branch_commit"] = self.branch_commit
+        return wire
 
     @classmethod
     def from_wire(cls, decoded: Any) -> "RemoteStartPoint":
@@ -254,7 +275,50 @@ class RemoteStartPoint:
             return cls(refusal="the answer named no branch and gave no reason")
         if not isinstance(commit, str) or not commit.strip():
             return cls(refusal="the answer named no commit and gave no reason")
-        return cls(branch=branch.strip(), commit=commit.strip())
+        branch_commit = decoded.get("branch_commit")
+        return cls(
+            branch=branch.strip(),
+            commit=commit.strip(),
+            branch_commit=(
+                branch_commit.strip()
+                if isinstance(branch_commit, str) and branch_commit.strip()
+                else None
+            ),
+        )
+
+
+def answered_for_branch(
+    answer: RemoteStartPoint, branch: str | None
+) -> RemoteStartPoint:
+    """``answer``, or a refusal when a named branch was asked for and not answered.
+
+    A helper service older than the ``branch`` input ignores it and answers
+    the default branch alone. Taking that as an answer about the named branch
+    would build the wrong commit, so a caller that asked for one and got no
+    ``branch_commit`` back is told so in plain words instead.
+    """
+    if not branch or not answer.ok or answer.branch_commit:
+        return answer
+    return RemoteStartPoint(
+        refusal=(
+            f"the answer did not say which commit the branch '{branch}' is at; "
+            f"the sandbox's helper service may be older than this factory"
+        )
+    )
+
+
+def answered_as_ordinary(answer: "FileAtCommit", asked: bool) -> "FileAtCommit":
+    """``answer``, or a refusal when an ordinary-file check was asked for and
+    not confirmed (the same reasoning as :func:`answered_for_branch`)."""
+    if not asked or not answer.ok or not answer.found or answer.ordinary:
+        return answer
+    return FileAtCommit(
+        refusal=(
+            "the answer did not confirm the file is an ordinary file rather "
+            "than a symbolic link; the sandbox's helper service may be older "
+            "than this factory"
+        )
+    )
 
 
 def _git_said(done: "subprocess.CompletedProcess[str]") -> str:
@@ -294,9 +358,27 @@ def _run_git(
     )
 
 
-def _fetch_remote_start_point_sync(repo_root: Path) -> RemoteStartPoint:
-    """The four steps, in order, each one's failure ending it with a sentence."""
+def _fetch_remote_start_point_sync(
+    repo_root: Path, branch: str | None = None
+) -> RemoteStartPoint:
+    """The four steps, in order, each one's failure ending it with a sentence.
+
+    ``branch`` (4 October 2026) names one more branch to fetch in the same
+    call and answer the commit of, as ``branch_commit``. The remote is asked
+    about it in the same ``ls-remote`` that asks for the default branch, so a
+    branch the remote does not have is said in plain words rather than as a
+    failed fetch; then both are fetched together. Without ``branch`` every git
+    command is exactly the one it always was.
+    """
     where = str(repo_root)
+    wanted = (branch or "").strip() or None
+    if wanted is not None and not _REMOTE_BRANCH_PATTERN.match(wanted):
+        return RemoteStartPoint(
+            refusal=(
+                f"the branch name {wanted!r} is not one this factory will pass "
+                f"to git"
+            )
+        )
     try:
         named = _run_git(repo_root, "remote", "get-url", REMOTE_NAME)
         if named.returncode != 0:
@@ -308,7 +390,14 @@ def _fetch_remote_start_point_sync(repo_root: Path) -> RemoteStartPoint:
                 )
             )
 
-        asked = _run_git(repo_root, "ls-remote", "--symref", REMOTE_NAME, "HEAD")
+        asked = _run_git(
+            repo_root,
+            "ls-remote",
+            "--symref",
+            REMOTE_NAME,
+            "HEAD",
+            *([f"refs/heads/{wanted}"] if wanted is not None else []),
+        )
         if asked.returncode != 0:
             return RemoteStartPoint(
                 refusal=(
@@ -337,12 +426,33 @@ def _fetch_remote_start_point_sync(repo_root: Path) -> RemoteStartPoint:
                 )
             )
 
+        refspecs = [f"+refs/heads/{branch}:refs/remotes/{REMOTE_NAME}/{branch}"]
+        if wanted is not None and wanted != branch:
+            listed = {
+                parts[1]
+                for parts in (
+                    line.split("\t", 1) for line in (asked.stdout or "").splitlines()
+                )
+                if len(parts) == 2
+            }
+            if f"refs/heads/{wanted}" not in listed:
+                return RemoteStartPoint(
+                    refusal=(
+                        f"the remote named '{REMOTE_NAME}' has no branch called "
+                        f"'{wanted}', so there is nothing to build from it. "
+                        f"Push that branch, then ask again."
+                    )
+                )
+            refspecs.append(
+                f"+refs/heads/{wanted}:refs/remotes/{REMOTE_NAME}/{wanted}"
+            )
+
         fetched = _run_git(
             repo_root,
             "fetch",
             "--no-tags",
             REMOTE_NAME,
-            f"+refs/heads/{branch}:refs/remotes/{REMOTE_NAME}/{branch}",
+            *refspecs,
         )
         if fetched.returncode != 0:
             return RemoteStartPoint(
@@ -368,7 +478,29 @@ def _fetch_remote_start_point_sync(repo_root: Path) -> RemoteStartPoint:
                     f"at: {_git_said(read)}"
                 )
             )
-        return RemoteStartPoint(branch=branch, commit=commit)
+        if wanted is None:
+            return RemoteStartPoint(branch=branch, commit=commit)
+        if wanted == branch:
+            return RemoteStartPoint(branch=branch, commit=commit, branch_commit=commit)
+        named = _run_git(
+            repo_root,
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            f"refs/remotes/{REMOTE_NAME}/{wanted}^{{commit}}",
+        )
+        named_commit = (named.stdout or "").strip()
+        if named.returncode != 0 or not named_commit:
+            return RemoteStartPoint(
+                refusal=(
+                    f"the branch '{wanted}' was fetched from the remote named "
+                    f"'{REMOTE_NAME}' but git could not say which commit it is "
+                    f"at: {_git_said(named)}"
+                )
+            )
+        return RemoteStartPoint(
+            branch=branch, commit=commit, branch_commit=named_commit
+        )
     except OSError as exc:
         return RemoteStartPoint(
             refusal=f"git could not be run in {where}: {type(exc).__name__}: {exc}"
@@ -383,15 +515,20 @@ def _fetch_remote_start_point_sync(repo_root: Path) -> RemoteStartPoint:
         )
 
 
-async def fetch_remote_start_point(repo_root: Path | str) -> RemoteStartPoint:
+async def fetch_remote_start_point(
+    repo_root: Path | str, branch: str | None = None
+) -> RemoteStartPoint:
     """Fetch ``origin``'s default branch and say which commit it is at.
 
     Never raises: everything that can go wrong comes back as ``refusal`` with
     one plain sentence in it. Nothing this does changes the branch the copy
     has checked out or writes anything into its working folder — it updates
-    one remote-tracking ref and reads it.
+    one remote-tracking ref and reads it (two, when ``branch`` names another
+    branch, whose commit then comes back as ``branch_commit``).
     """
-    return await asyncio.to_thread(_fetch_remote_start_point_sync, Path(repo_root))
+    return await asyncio.to_thread(
+        _fetch_remote_start_point_sync, Path(repo_root), branch
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -438,6 +575,13 @@ class FileAtCommit:
     content: str | None = None
     found: bool = False
     refusal: str | None = None
+    # True only when the caller asked for an ordinary file and the reader
+    # checked the commit's tree entry and found one (4 October 2026). A
+    # symbolic link stored in git reads back as its target's NAME, so a
+    # document declared as binding could otherwise be satisfied by a link's
+    # text. A caller that asked is told by this flag that the check was made —
+    # a helper too old to make it never sets it.
+    ordinary: bool = False
 
     @property
     def ok(self) -> bool:
@@ -445,12 +589,19 @@ class FileAtCommit:
         return self.refusal is None
 
     def to_wire(self) -> dict[str, Any]:
-        """The answer as the sandbox's helper service sends it."""
-        return {
+        """The answer as the sandbox's helper service sends it.
+
+        ``ordinary`` is sent only when the check was asked for and made, so an
+        answer to every other caller is exactly what it always was.
+        """
+        wire: dict[str, Any] = {
             "content": self.content,
             "found": self.found,
             "refusal": self.refusal,
         }
+        if self.ordinary:
+            wire["ordinary"] = True
+        return wire
 
     @classmethod
     def from_wire(cls, decoded: Any) -> "FileAtCommit":
@@ -468,11 +619,45 @@ class FileAtCommit:
             return cls(
                 refusal="the answer said the file is there but sent no contents"
             )
-        return cls(content=content, found=True)
+        return cls(content=content, found=True, ordinary=decoded.get("ordinary") is True)
+
+
+#: The tree-entry modes git gives an ordinary file (plain and executable).
+#: A symbolic link is ``120000``; a submodule is ``160000``.
+_ORDINARY_FILE_MODES: frozenset[str] = frozenset({"100644", "100755"})
+
+
+def _tree_entry_mode(
+    repo_root: Path, commit: str, file_path: str
+) -> tuple[str | None, str | None]:
+    """``(mode, None)`` for ``file_path``'s entry at ``commit``, or ``(None, why)``.
+
+    ``git ls-tree <commit> -- <path>`` prints ``<mode> <type> <id>\t<path>``.
+    No entry is ``(None, None)``.
+    """
+    listed = _run_git(
+        repo_root,
+        "ls-tree",
+        f"{commit}^{{commit}}",
+        "--",
+        file_path,
+        timeout=READ_AT_COMMIT_TIMEOUT_SECONDS,
+    )
+    if listed.returncode != 0:
+        return None, _git_said(listed)
+    for line in (listed.stdout or "").splitlines():
+        meta, _, name = line.partition("\t")
+        if name == file_path:
+            return (meta.split() or [None])[0], None
+    return None, None
 
 
 def read_file_at_commit_sync(
-    repo_root: Path, commit: str, file_path: str
+    repo_root: Path,
+    commit: str,
+    file_path: str,
+    *,
+    ordinary_file_only: bool = False,
 ) -> FileAtCommit:
     """The three steps, in order: is the commit here, is the file, read it.
 
@@ -482,6 +667,12 @@ def read_file_at_commit_sync(
     composes what it sends read a project's declarations through this one
     function, so they cannot come to disagree about what the project said at
     a commit.
+
+    ``ordinary_file_only`` (4 October 2026): the commit's tree entry for the
+    path is checked first, and a symbolic link is refused in plain words
+    rather than read — ``git show`` would otherwise hand back the link's
+    target name as if it were the file. A successful read then says
+    ``ordinary=True``. Without it, nothing extra is asked of git.
     """
     where = str(repo_root)
     try:
@@ -524,6 +715,26 @@ def read_file_at_commit_sync(
                 )
             )
 
+        if ordinary_file_only:
+            mode, why = _tree_entry_mode(repo_root, commit, file_path)
+            if why is not None:
+                return FileAtCommit(
+                    refusal=(
+                        f"git could not say what kind of file {file_path} is at "
+                        f"{commit} in {where}: {why}"
+                    )
+                )
+            if mode == "120000":
+                return FileAtCommit(
+                    refusal=(
+                        f"{file_path} at {commit} is a symbolic link, not an "
+                        f"ordinary file; a document the project's builds are "
+                        f"held to must be the file itself"
+                    )
+                )
+            if mode not in _ORDINARY_FILE_MODES:
+                return FileAtCommit(found=False)
+
         shown = _run_git(
             repo_root,
             "show",
@@ -537,7 +748,9 @@ def read_file_at_commit_sync(
                     f"{_git_said(shown)}"
                 )
             )
-        return FileAtCommit(content=shown.stdout or "", found=True)
+        return FileAtCommit(
+            content=shown.stdout or "", found=True, ordinary=ordinary_file_only
+        )
     except OSError as exc:
         return FileAtCommit(
             refusal=f"git could not be run in {where}: {type(exc).__name__}: {exc}"
@@ -552,17 +765,28 @@ def read_file_at_commit_sync(
 
 
 async def read_file_at_commit(
-    repo_root: Path | str, commit: str, file_path: str
+    repo_root: Path | str,
+    commit: str,
+    file_path: str,
+    *,
+    ordinary_file_only: bool = False,
 ) -> FileAtCommit:
     """Read ``file_path`` exactly as it is at ``commit``.
 
     Never raises, never writes, never touches the working folder and never
     changes the branch the copy has checked out: it is ``git show`` and two
-    plumbing probes. "The file is not in that commit" is an answer, not a
+    plumbing probes (three with ``ordinary_file_only``, which refuses a
+    symbolic link). "The file is not in that commit" is an answer, not a
     refusal; "the commit is not in this copy" is a refusal.
     """
     return await asyncio.to_thread(
-        read_file_at_commit_sync, Path(repo_root), str(commit), str(file_path)
+        partial(
+            read_file_at_commit_sync,
+            Path(repo_root),
+            str(commit),
+            str(file_path),
+            ordinary_file_only=ordinary_file_only,
+        )
     )
 
 
@@ -788,12 +1012,16 @@ class CandidateGit(Protocol):
     async def rev_parse(self, ref: str) -> str | None:
         """The commit (or tree) ``ref`` names, or ``None``."""
 
-    async def fetch_remote_start_point(self) -> RemoteStartPoint:
+    async def fetch_remote_start_point(
+        self, branch: str | None = None
+    ) -> RemoteStartPoint:
         """Fetch the remote named ``origin`` and say where its default branch is.
 
         The starting rule's one operation (one true copy, item 1): the answer
         is a branch and a commit, or a plain-sentence refusal. It never raises,
         never changes a checked-out branch and never touches a working folder.
+        ``branch`` also fetches that branch and answers its commit as
+        ``branch_commit``.
         """
 
     async def is_ancestor(self, ancestor: str, descendant: str) -> bool | None:
@@ -871,8 +1099,10 @@ class InContainerCandidateGit:
     async def rev_parse(self, ref: str) -> str | None:
         return await git_rev_parse(self._repo_root, ref)
 
-    async def fetch_remote_start_point(self) -> RemoteStartPoint:
-        return await fetch_remote_start_point(self._repo_root)
+    async def fetch_remote_start_point(
+        self, branch: str | None = None
+    ) -> RemoteStartPoint:
+        return await fetch_remote_start_point(self._repo_root, branch)
 
     async def is_ancestor(self, ancestor: str, descendant: str) -> bool | None:
         return await git_is_ancestor(self._repo_root, ancestor, descendant)

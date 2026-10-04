@@ -119,7 +119,9 @@ class WorktreeGitRunner:
             command=command, cwd=cwd, timeout=self._op_timeout_s
         )
 
-    async def fetch_remote_start_point(self, repo_path: str) -> RemoteStartPoint:
+    async def fetch_remote_start_point(
+        self, repo_path: str, branch: str | None = None
+    ) -> RemoteStartPoint:
         """Fetch this copy's remote ``origin`` and say where its default branch is.
 
         The starting rule's one operation (one true copy, item 1,
@@ -127,16 +129,23 @@ class WorktreeGitRunner:
         a branch and a commit, or one plain sentence saying why there is
         nothing to start from. Never raises; nothing it does changes the
         branch the copy has checked out or touches its working folder.
+        ``branch`` (4 October 2026) also fetches that branch in the same call
+        and answers its commit as ``branch_commit``.
         """
         repo = Path(repo_path)
         if not repo.is_dir():
             return RemoteStartPoint(
                 refusal=f"there is no copy of this project at {repo_path}"
             )
-        return await fetch_remote_start_point(repo)
+        return await fetch_remote_start_point(repo, branch)
 
     async def read_file_at_commit(
-        self, repo_path: str, commit: str, file_path: str
+        self,
+        repo_path: str,
+        commit: str,
+        file_path: str,
+        *,
+        ordinary_file_only: bool = False,
     ) -> FileAtCommit:
         """Read one file exactly as it is at ``commit`` in this copy.
 
@@ -144,14 +153,16 @@ class WorktreeGitRunner:
         out of the COMMIT the work starts from, never out of the working folder
         and never off the branch the copy has checked out. "The file is not in
         that commit" is an answer; "the commit is not in this copy" is a
-        refusal. Never raises.
+        refusal. Never raises. ``ordinary_file_only`` refuses a symbolic link.
         """
         repo = Path(repo_path)
         if not repo.is_dir():
             return FileAtCommit(
                 refusal=f"there is no copy of this project at {repo_path}"
             )
-        return await read_file_at_commit(repo, commit, file_path)
+        return await read_file_at_commit(
+            repo, commit, file_path, ordinary_file_only=ordinary_file_only
+        )
 
     async def prepare_branch_and_write(
         self,

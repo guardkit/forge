@@ -44,6 +44,7 @@ file — the project's own ``.guardkit/config.yaml`` — out of one commit.
 
 from __future__ import annotations
 
+import posixpath
 import re
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -56,7 +57,9 @@ from forge.launch_environment import (
 )
 
 __all__ = [
+    "BINDING_DOCUMENTS_FIELD",
     "DECLARATION_PATH",
+    "DeclarationsAtCommit",
     "DeclaredLaunchSettings",
     "DeclaredMemory",
     "LAUNCH_KEY",
@@ -68,6 +71,8 @@ __all__ = [
     "PROJECT_KEY",
     "SETTINGS_KEY",
     "THE_TWO_LINES",
+    "read_declarations_at_commit",
+    "read_declared_binding_documents",
     "read_declared_launch_settings",
     "read_declared_memory",
 ]
@@ -454,3 +459,172 @@ def read_declared_launch_settings(
         if name not in names:
             names.append(name)
     return DeclaredLaunchSettings(names=tuple(names), declared=True)
+
+
+# ---------------------------------------------------------------------------
+# Both questions, read once at one commit, for every caller (4 October 2026)
+# ---------------------------------------------------------------------------
+#
+# The planning door used to hold this read itself. A feature planned elsewhere
+# and queued straight to a build has no planning run, yet its build needs the
+# same two answers out of the same file, refused in the same words. So the
+# read lives here and both callers use it: the planning door at the commit its
+# work starts from, and the build admission at the commit it admits. Neither
+# keeps a copy of it.
+
+
+@dataclass(frozen=True)
+class DeclarationsAtCommit:
+    """The memory name and setting names declared at one commit, or why not.
+
+    ``content`` is the file's text when it was read, so a caller that needs
+    one more answer out of the same file (the binding documents) does not read
+    it a second time.
+    """
+
+    memory_project: str | None = None
+    launch_settings: tuple[str, ...] = ()
+    content: str | None = None
+    found: bool = False
+    refusal: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.refusal is None and bool(self.memory_project)
+
+
+async def read_declarations_at_commit(
+    runner: Any, *, repo: str, repo_path: str, commit: str
+) -> DeclarationsAtCommit:
+    """Read ``.guardkit/config.yaml`` at ``commit`` and answer both questions.
+
+    ``runner`` is the git runner for this repository (the sandbox's for a
+    sandboxed project, the coordinator's otherwise); it must offer
+    ``read_file_at_commit``. Every refusal is the sentence the planning door
+    has always shown: a runner that cannot read at a commit, a read that
+    raised, a project that declares no memory or one that is not allowed, a
+    setting name this factory keeps for itself, a file that could not be read.
+    Never raises.
+    """
+    read = getattr(runner, "read_file_at_commit", None)
+    if read is None:
+        return DeclarationsAtCommit(
+            refusal=(
+                "the git runner wired for this factory cannot read a file "
+                "at a commit, so there is no way to tell which memory this "
+                "work belongs to"
+            )
+        )
+    try:
+        answer = await read(repo_path, commit, DECLARATION_PATH)
+    except Exception as exc:  # noqa: BLE001 — boundary, never crash the caller
+        return DeclarationsAtCommit(
+            refusal=(
+                f"{repo}'s {DECLARATION_PATH} could not be read at "
+                f"the commit this work starts from ({commit}): "
+                f"{type(exc).__name__}: {exc}"
+            )
+        )
+
+    content = getattr(answer, "content", None)
+    found = bool(getattr(answer, "found", False))
+    unreadable = getattr(answer, "refusal", None)
+
+    declared = read_declared_memory(
+        repo=repo,
+        commit=commit,
+        content=content,
+        found=found,
+        unreadable_because=unreadable,
+    )
+    if not declared.ok:
+        return DeclarationsAtCommit(
+            content=content,
+            found=found,
+            refusal=declared.refusal or "the project's memory name could not be read",
+        )
+    wanted = read_declared_launch_settings(
+        repo=repo,
+        commit=commit,
+        content=content,
+        found=found,
+        unreadable_because=unreadable,
+    )
+    if not wanted.ok:
+        return DeclarationsAtCommit(
+            content=content,
+            found=found,
+            refusal=(
+                wanted.refusal
+                or "the settings this project asked for could not be read"
+            ),
+        )
+    return DeclarationsAtCommit(
+        memory_project=str(declared.project),
+        launch_settings=tuple(wanted.names),
+        content=content,
+        found=found,
+    )
+
+
+#: Where a project names the documents its builds are held to: the list the
+#: builder (GuardKit's Player) already reads. One list for every role, not a
+#: second one (project-initialisation design, 4 October 2026).
+BINDING_DOCUMENTS_FIELD: str = "autobuild.player.required_documents"
+
+
+def read_declared_binding_documents(
+    content: str | None,
+) -> tuple[tuple[str, ...], str | None]:
+    """``(paths, None)`` — the binding documents the file declares — or ``((), why)``.
+
+    Read the way GuardKit's own selector reads the list: absent is "none", a
+    list of non-empty repository-relative paths is the answer, anything else is
+    refused. Each path is normalised (``./a`` is ``a``) and one that would
+    leave the repository is refused. Never raises.
+    """
+    if not content:
+        return (), None
+    data, why_not = _parse(content)
+    if why_not is not None:
+        return (), f"{DECLARATION_PATH} could not be read: {why_not}"
+    assert data is not None
+    autobuild = data.get("autobuild")
+    if autobuild is None:
+        return (), None
+    if not isinstance(autobuild, dict):
+        return (), f"`autobuild` in {DECLARATION_PATH} is not a set of settings"
+    player = autobuild.get("player")
+    if player is None:
+        return (), None
+    if not isinstance(player, dict):
+        return (), f"`autobuild.player` in {DECLARATION_PATH} is not a set of settings"
+    raw = player.get("required_documents")
+    if raw is None:
+        return (), None
+    if not isinstance(raw, list):
+        return (), (
+            f"`{BINDING_DOCUMENTS_FIELD}` in {DECLARATION_PATH} is not a list "
+            f"of repository paths"
+        )
+    paths: list[str] = []
+    for index, value in enumerate(raw):
+        if not isinstance(value, str) or not value.strip():
+            return (), (
+                f"`{BINDING_DOCUMENTS_FIELD}[{index}]` in {DECLARATION_PATH} "
+                f"is not a repository path"
+            )
+        normal = posixpath.normpath(value.strip())
+        if (
+            value.strip().startswith("/")
+            or normal == ".."
+            or normal.startswith("../")
+            or normal == "."
+        ):
+            return (), (
+                f"`{BINDING_DOCUMENTS_FIELD}[{index}]` in {DECLARATION_PATH} "
+                f"({value!r}) is not a path inside the repository"
+            )
+        if normal not in paths:
+            paths.append(normal)
+    return tuple(paths), None

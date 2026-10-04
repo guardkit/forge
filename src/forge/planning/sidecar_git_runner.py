@@ -51,7 +51,12 @@ from typing import Any
 from pydantic import Field
 
 from forge.adapters.git.models import GitOpResult
-from forge.deploy.candidate_tree import FileAtCommit, RemoteStartPoint
+from forge.deploy.candidate_tree import (
+    FileAtCommit,
+    RemoteStartPoint,
+    answered_as_ordinary,
+    answered_for_branch,
+)
 from forge.planning.handoff import (
     PreCommitCheckOutcome,
     PreCommitChecks,
@@ -534,17 +539,23 @@ class SidecarGitRunner:
 
     # -- the protocol --------------------------------------------------------
 
-    async def fetch_remote_start_point(self, repo_path: str) -> RemoteStartPoint:
+    async def fetch_remote_start_point(
+        self, repo_path: str, branch: str | None = None
+    ) -> RemoteStartPoint:
         """The starting rule's operation, run on the clone inside the sandbox.
 
         ``{repo}`` to ``/git/remote-start-point``; the answer is a branch and
         a commit, or one plain sentence. A sandbox that could not be reached
         is itself a refusal, so the driver never has to tell "no answer" from
-        "no remote". Never raises.
+        "no remote". Never raises. ``branch`` is sent only when given, and its
+        commit comes back as ``branch_commit``.
         """
+        body: dict[str, Any] = {"repo": self._repo}
+        if branch:
+            body["branch"] = str(branch)
         answer = await self._call(
             "/git/remote-start-point",
-            {"repo": self._repo},
+            body,
             timeout=self._read_timeout_s,
         )
         if isinstance(answer, Exception):
@@ -556,13 +567,18 @@ class SidecarGitRunner:
             sentence = self._refusal_sentence(status, decoded)
             logger.error("fetch_remote_start_point: %s", sentence)
             return RemoteStartPoint(refusal=sentence)
-        start = RemoteStartPoint.from_wire(decoded)
+        start = answered_for_branch(RemoteStartPoint.from_wire(decoded), branch)
         if not start.ok:
             logger.warning("fetch_remote_start_point: %s", start.refusal)
         return start
 
     async def read_file_at_commit(
-        self, repo_path: str, commit: str, file_path: str
+        self,
+        repo_path: str,
+        commit: str,
+        file_path: str,
+        *,
+        ordinary_file_only: bool = False,
     ) -> FileAtCommit:
         """One file out of one commit, read on the clone inside the sandbox.
 
@@ -570,11 +586,19 @@ class SidecarGitRunner:
         file_path}`` to ``/git/read-file-at-commit``. A sandbox that could not
         be reached is a refusal in its own words, never "the project declares
         nothing" — the sentence a person is shown turns on that difference.
-        Never raises.
+        Never raises. ``ordinary_file_only`` is sent only when asked for, and
+        an answer that does not confirm the check was made is a refusal.
         """
+        body: dict[str, Any] = {
+            "repo": self._repo,
+            "commit": commit,
+            "file_path": file_path,
+        }
+        if ordinary_file_only:
+            body["ordinary_file_only"] = True
         answer = await self._call(
             "/git/read-file-at-commit",
-            {"repo": self._repo, "commit": commit, "file_path": file_path},
+            body,
             timeout=self._read_timeout_s,
         )
         if isinstance(answer, Exception):
@@ -586,7 +610,7 @@ class SidecarGitRunner:
             sentence = self._refusal_sentence(status, decoded)
             logger.error("read_file_at_commit: %s", sentence)
             return FileAtCommit(refusal=sentence)
-        read = FileAtCommit.from_wire(decoded)
+        read = answered_as_ordinary(FileAtCommit.from_wire(decoded), ordinary_file_only)
         if not read.ok:
             logger.warning("read_file_at_commit: %s", read.refusal)
         return read
@@ -885,19 +909,33 @@ class RepoRoutedGitRunner:
         """Only a per-repository answer is meaningful: ask ``runner_for``."""
         return False
 
-    async def fetch_remote_start_point(self, repo_path: str) -> RemoteStartPoint:
-        """The starting rule's operation, routed exactly as the others are."""
-        return await self.runner_for_path(repo_path).fetch_remote_start_point(
-            repo_path
-        )
+    async def fetch_remote_start_point(
+        self, repo_path: str, branch: str | None = None
+    ) -> RemoteStartPoint:
+        """The starting rule's operation, routed exactly as the others are.
+
+        ``branch`` is passed on only when given, so a runner that predates it
+        is called exactly as before."""
+        runner = self.runner_for_path(repo_path)
+        if branch:
+            return await runner.fetch_remote_start_point(repo_path, branch)
+        return await runner.fetch_remote_start_point(repo_path)
 
     async def read_file_at_commit(
-        self, repo_path: str, commit: str, file_path: str
+        self,
+        repo_path: str,
+        commit: str,
+        file_path: str,
+        *,
+        ordinary_file_only: bool = False,
     ) -> FileAtCommit:
         """One file out of one commit, routed exactly as the others are."""
-        return await self.runner_for_path(repo_path).read_file_at_commit(
-            repo_path, commit, file_path
-        )
+        runner = self.runner_for_path(repo_path)
+        if ordinary_file_only:
+            return await runner.read_file_at_commit(
+                repo_path, commit, file_path, ordinary_file_only=True
+            )
+        return await runner.read_file_at_commit(repo_path, commit, file_path)
 
     async def prepare_branch_and_write(
         self,

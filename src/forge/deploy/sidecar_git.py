@@ -71,6 +71,7 @@ from forge.deploy.candidate_tree import (
     FileAtCommit,
     RemoteStartPoint,
     WorkingFolder,
+    answered_for_branch,
 )
 from forge.planning.sidecar_git_runner import HttpPost, _urllib_post
 
@@ -182,23 +183,29 @@ class SidecarCandidateGit:
         sha = decoded.get("sha")
         return str(sha) if isinstance(sha, str) and sha else None
 
-    async def fetch_remote_start_point(self) -> RemoteStartPoint:
+    async def fetch_remote_start_point(
+        self, branch: str | None = None
+    ) -> RemoteStartPoint:
         """Fetch the sandbox clone's remote ``origin`` and say where its
         default branch is (one true copy, item 1).
 
         A sandbox that could not be reached, or that answered anything but a
         starting point, is itself a refusal in plain words — the caller never
-        has to tell "no answer" from "no remote".
+        has to tell "no answer" from "no remote". ``branch`` is sent only when
+        given, and its commit comes back as ``branch_commit``.
         """
+        body: dict[str, Any] = {"repo": self._repo}
+        if branch:
+            body["branch"] = str(branch)
         decoded, why = await self._ok(
             "/git/remote-start-point",
-            {"repo": self._repo},
+            body,
             timeout=self._read_timeout_s,
         )
         if decoded is None:
             logger.error("sandbox git: remote start point: %s", why)
             return RemoteStartPoint(refusal=str(why))
-        answer = RemoteStartPoint.from_wire(decoded)
+        answer = answered_for_branch(RemoteStartPoint.from_wire(decoded), branch)
         if not answer.ok:
             logger.warning("sandbox git: remote start point: %s", answer.refusal)
         return answer
