@@ -47,16 +47,6 @@ logger = logging.getLogger(__name__)
 #: relays verbatim) so a transport failure is not mistaken for a script failure.
 SIDECAR_TRANSPORT_EXIT_CODE = 1
 
-#: THE ANSWER WAS LOST (4 October 2026). Said inside the sentence when the
-#: request may have reached the sidecar but no readable answer came back — the
-#: connection failed or dropped, the wait ran out, or what came back was not an
-#: answer. The script may then have run, and may still be running, so this is
-#: not "the step failed": nobody knows. A refusal the sidecar sent (an HTTP
-#: error, a refused deploy) is an answer and does not carry it. Each sentence
-#: still opens with "sidecar " so the stage reads it as the sidecar's own.
-THE_ANSWER_WAS_LOST: str = "the-answer-was-lost"
-_LOST: str = f"[{THE_ANSWER_WAS_LOST}]"
-
 
 class SidecarScriptRunner:
     """A ``_run_script_step``-compatible callable that POSTs to the sidecar.
@@ -189,24 +179,21 @@ class SidecarScriptRunner:
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             return (
                 SIDECAR_TRANSPORT_EXIT_CODE,
-                f"sidecar unreachable at {self._base_url} {_LOST}: {exc}",
+                f"sidecar unreachable at {self._base_url}: {exc}",
             )
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             return (
                 SIDECAR_TRANSPORT_EXIT_CODE,
-                f"sidecar returned a non-JSON response {_LOST}: {exc}",
+                f"sidecar returned a non-JSON response: {exc}",
             )
         except Exception as exc:  # noqa: BLE001 — never raise past the boundary
             logger.warning("sidecar script runner unexpected error: %s", exc)
-            return (
-                SIDECAR_TRANSPORT_EXIT_CODE,
-                f"sidecar client error {_LOST}: {exc}",
-            )
+            return (SIDECAR_TRANSPORT_EXIT_CODE, f"sidecar client error: {exc}")
 
         if not isinstance(parsed, dict) or "exit_code" not in parsed:
             return (
                 SIDECAR_TRANSPORT_EXIT_CODE,
-                f"sidecar response missing exit_code {_LOST}: {parsed!r}",
+                f"sidecar response missing exit_code: {parsed!r}",
             )
         # A DEPLOY THE EXECUTOR REFUSED is not a script that went red and not a
         # transport failure: nothing ran. It comes back as a non-zero exit with
@@ -222,7 +209,7 @@ class SidecarScriptRunner:
         if not isinstance(exit_code, int) or isinstance(exit_code, bool):
             return (
                 SIDECAR_TRANSPORT_EXIT_CODE,
-                f"sidecar returned a non-integer exit_code {_LOST}: {exit_code!r}",
+                f"sidecar returned a non-integer exit_code: {exit_code!r}",
             )
         not_honoured = candidate_tree_not_honoured(cwd, parsed)
         if not_honoured is not None:

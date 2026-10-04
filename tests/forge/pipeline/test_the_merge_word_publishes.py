@@ -1846,26 +1846,6 @@ class TestTheHoldIsPutDownWhenThePublishedPressHasFinished:
         assert send.detail["contains_j"] is False
 
     @pytest.mark.asyncio
-    async def test_after_a_deploy_that_failed_another_worker_takes_it(
-        self,
-        config_with_publication_on: ForgeConfig,
-        pool: SqliteLifecyclePersistence,  # noqa: F811
-        repo_root: Path,  # noqa: F811
-    ) -> None:
-        deps = _deps_that_can_deploy(
-            config_with_publication_on,
-            pool,
-            publisher=_APublisherThatSays([_published("c" * 40)]),
-            deploy=_ADeployStepThatSays(reports="j-somebodyelse@0000"),
-        )
-
-        outcome = await _press(deps, repo_root)
-
-        assert outcome.result == "merged-deploy-failed"
-        assert _record(pool).lease_holder is None
-        assert self._another_worker_takes_it(pool) is not None
-
-    @pytest.mark.asyncio
     async def test_a_retry_of_a_build_already_published_puts_it_down(
         self,
         config_with_publication_on: ForgeConfig,
@@ -1917,32 +1897,70 @@ class _APromoteThroughTheSidecar(_AProjectWithATarget):
         return await super().__call__(**kwargs)
 
 
-class TestALostPromoteKeepsTheHold:
-    """A promote whose connection to the sandbox dropped may still be running,
-    and the deployment lock is put down on every ending, so it is the hold
-    that keeps a second press out. A promote that failed in its own words is a
-    settled ending, and the hold is put down."""
+class _APromoteThatReverted(_AProjectWithATarget):
+    """The promote ran, the check after the deploy failed and a revert ran:
+    the two shapes ``DeployStageRunner._run_revert`` hands back."""
+
+    def __init__(self, revert_worked: bool) -> None:
+        super().__init__()
+        self.revert_worked = revert_worked
+
+    async def __call__(self, **kwargs: Any) -> Any:
+        from types import SimpleNamespace
+
+        if kwargs.get("leg") == "promote":
+            self.calls.append(kwargs)
+            if self.revert_worked:
+                return SimpleNamespace(
+                    outcome="reverted", verdict="fail", failed_step=None,
+                    events=("DeployReverted",),
+                    detail={"rollback_image_ref": "x:rollback-1", "candidate": "torn-down"},
+                )
+            return SimpleNamespace(
+                outcome="failed", verdict="fail", failed_step="revert", events=(),
+                detail={
+                    "reason": "revert_failed",
+                    "rollback_image_ref": "x:rollback-1",
+                    "candidate": "torn-down",
+                },
+            )
+        return await super().__call__(**kwargs)
+
+
+class TestAPromoteThatDidNotCompleteKeepsTheHold:
+    """A promote that did not report complete — its answer lost, failed in
+    its own words, reverted (the coach's G2), or deployed something other
+    than what it was handed — may have left something running or changing
+    on the target, and the deployment lock is put down on every ending. So
+    the hold is kept and a second press is refused until it lapses."""
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        "answer, kept",
-        [
-            (None, True),
-            ({"exit_code": 1, "output_tail": "the deploy script went red"}, False),
-        ],
-        ids=["answer-lost", "failed-in-its-own-words"],
+        "how",
+        ["answer-lost", "failed-in-its-own-words", "reverted", "revert-failed",
+         "reported-another-identity"],
     )
-    async def test_the_promote_decides_whether_the_hold_is_put_down(
+    async def test_the_hold_is_kept_and_a_second_press_is_refused(
         self,
         config_with_publication_on: ForgeConfig,
         pool: SqliteLifecyclePersistence,  # noqa: F811
         repo_root: Path,  # noqa: F811
-        answer: dict[str, Any] | None,
-        kept: bool,
+        how: str,
     ) -> None:
-        sidecar = ASidecarThat(answer)
+        sidecar = ASidecarThat(
+            None if how == "answer-lost"
+            else {"exit_code": 1, "output_tail": "the deploy script went red"}
+        )
         try:
-            deploy = _APromoteThroughTheSidecar(sidecar)
+            deploy = {
+                "answer-lost": lambda: _APromoteThroughTheSidecar(sidecar),
+                "failed-in-its-own-words": lambda: _APromoteThroughTheSidecar(sidecar),
+                "reverted": lambda: _APromoteThatReverted(revert_worked=True),
+                "revert-failed": lambda: _APromoteThatReverted(revert_worked=False),
+                "reported-another-identity": lambda: _ADeployStepThatSays(
+                    reports="j-somebodyelse@0000"
+                ),
+            }[how]()
             deps = _deps_that_can_deploy(
                 config_with_publication_on,
                 pool,
@@ -1954,9 +1972,9 @@ class TestALostPromoteKeepsTheHold:
 
             assert outcome.result == "merged-deploy-failed", outcome.detail
             assert [c.get("leg") for c in deploy.calls].count("promote") == 1
-            assert (_record(pool).lease_holder is not None) is kept
+            assert _record(pool).lease_holder is not None
             again = await _press(deps, repo_root)
-            assert ("another worker" in again.detail) is kept
+            assert "another worker" in again.detail
             # The send step's record the queue reads is as it always was.
             send = [
                 line for line in _record(pool).lines
