@@ -146,6 +146,7 @@ class WorktreeGitRunner:
         file_path: str,
         *,
         ordinary_file_only: bool = False,
+        raw: bool = False,
     ) -> FileAtCommit:
         """Read one file exactly as it is at ``commit`` in this copy.
 
@@ -153,12 +154,21 @@ class WorktreeGitRunner:
         out of the COMMIT the work starts from, never out of the working folder
         and never off the branch the copy has checked out. "The file is not in
         that commit" is an answer; "the commit is not in this copy" is a
-        refusal. Never raises. ``ordinary_file_only`` refuses a symbolic link.
+        refusal. Never raises. ``ordinary_file_only`` refuses a symbolic link;
+        ``raw`` reads the exact committed bytes and reports the entry's mode.
         """
         repo = Path(repo_path)
         if not repo.is_dir():
             return FileAtCommit(
                 refusal=f"there is no copy of this project at {repo_path}"
+            )
+        if raw:
+            return await read_file_at_commit(
+                repo,
+                commit,
+                file_path,
+                ordinary_file_only=ordinary_file_only,
+                raw=True,
             )
         return await read_file_at_commit(
             repo, commit, file_path, ordinary_file_only=ordinary_file_only

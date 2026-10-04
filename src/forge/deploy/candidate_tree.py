@@ -82,6 +82,7 @@ __all__ = [
     "REMOTE_TIMEOUT_SECONDS",
     "RemoteStartPoint",
     "answered_as_ordinary",
+    "answered_as_raw",
     "answered_for_branch",
     "candidate_tree_path",
     "candidate_trees_root",
@@ -303,6 +304,21 @@ def answered_for_branch(
         refusal=(
             f"the answer did not say which commit the branch '{branch}' is at; "
             f"the sandbox's helper service may be older than this factory"
+        )
+    )
+
+
+def answered_as_raw(answer: "FileAtCommit", asked: bool) -> "FileAtCommit":
+    """``answer``, or a refusal when a raw read was asked for and the answer
+    found the file without saying what kind of entry it is — a helper service
+    older than the raw read, whose text may have been altered on the way."""
+    if not asked or not answer.ok or not answer.found or answer.mode:
+        return answer
+    return FileAtCommit(
+        refusal=(
+            "the answer did not say what kind of file this is or confirm its "
+            "exact bytes; the sandbox's helper service may be older than this "
+            "factory"
         )
     )
 
@@ -582,11 +598,25 @@ class FileAtCommit:
     # text. A caller that asked is told by this flag that the check was made —
     # a helper too old to make it never sets it.
     ordinary: bool = False
+    # The commit's tree-entry mode for the path (``100644``, ``100755``,
+    # ``120000`` for a symbolic link, ``040000`` for a folder, ``160000`` for a
+    # submodule), set only by a RAW read (4 October 2026, the one reading rule
+    # for a project's documents). A raw read of a link answers ``found`` with
+    # the link's target NAME as ``content`` and this mode, so a caller follows a
+    # link only when the reader says the entry IS one. A folder or submodule
+    # answers ``found=False`` with its mode. A helper too old to make a raw read
+    # never sets it.
+    mode: str | None = None
 
     @property
     def ok(self) -> bool:
         """True when the read was made, whether or not the file was there."""
         return self.refusal is None
+
+    @property
+    def is_link(self) -> bool:
+        """True when a raw read found a symbolic link at the path."""
+        return self.found and self.mode == _LINK_MODE
 
     def to_wire(self) -> dict[str, Any]:
         """The answer as the sandbox's helper service sends it.
@@ -601,6 +631,8 @@ class FileAtCommit:
         }
         if self.ordinary:
             wire["ordinary"] = True
+        if self.mode is not None:
+            wire["mode"] = self.mode
         return wire
 
     @classmethod
@@ -613,18 +645,132 @@ class FileAtCommit:
             return cls(refusal=refusal.strip())
         found = bool(decoded.get("found"))
         content = decoded.get("content")
+        raw_mode = decoded.get("mode")
+        mode = raw_mode if isinstance(raw_mode, str) and raw_mode else None
         if not found:
-            return cls(found=False)
+            return cls(found=False, mode=mode)
         if not isinstance(content, str):
             return cls(
                 refusal="the answer said the file is there but sent no contents"
             )
-        return cls(content=content, found=True, ordinary=decoded.get("ordinary") is True)
+        return cls(
+            content=content,
+            found=True,
+            ordinary=decoded.get("ordinary") is True,
+            mode=mode,
+        )
 
 
 #: The tree-entry modes git gives an ordinary file (plain and executable).
 #: A symbolic link is ``120000``; a submodule is ``160000``.
 _ORDINARY_FILE_MODES: frozenset[str] = frozenset({"100644", "100755"})
+
+#: The tree-entry mode of a symbolic link.
+_LINK_MODE: str = "120000"
+
+
+def _tree_entry(
+    repo_root: Path, commit: str, file_path: str
+) -> tuple[str | None, str | None, str | None]:
+    """``(mode, object id, None)`` for ``file_path``'s entry at ``commit``,
+    ``(None, None, None)`` when there is none, or ``(None, None, why)``."""
+    listed = _run_git(
+        repo_root,
+        "ls-tree",
+        "-z",
+        f"{commit}^{{commit}}",
+        "--",
+        file_path,
+        timeout=READ_AT_COMMIT_TIMEOUT_SECONDS,
+    )
+    if listed.returncode != 0:
+        return None, None, _git_said(listed)
+    # ``-z``: names are not quoted, entries end in NUL.
+    for line in (listed.stdout or "").split("\0"):
+        meta, _, name = line.partition("\t")
+        if name == file_path:
+            fields = meta.split()
+            if len(fields) >= 3:
+                return fields[0], fields[2], None
+    return None, None, None
+
+
+def _read_raw_at_commit_sync(
+    repo_root: Path, commit: str, file_path: str
+) -> FileAtCommit:
+    """The RAW read: the tree entry's mode, then the blob's exact bytes.
+
+    The one reading rule for a project's documents (4 October 2026): the bytes
+    are ``git cat-file blob`` of the entry's object, decoded strictly as UTF-8
+    (invalid UTF-8 is refused) with line endings kept, so the text's UTF-8
+    encoding is the committed bytes exactly. A link answers its target's name
+    with ``mode`` ``120000``; a folder or submodule answers ``found=False``
+    with its mode; no entry answers ``found=False``. Only this read uses bytes:
+    every other read of this module is unchanged.
+    """
+    where = str(repo_root)
+    mode, oid, why = _tree_entry(repo_root, commit, file_path)
+    if why is not None:
+        return FileAtCommit(
+            refusal=(
+                f"git could not say what kind of file {file_path} is at "
+                f"{commit} in {where}: {why}"
+            )
+        )
+    if mode is None or oid is None:
+        return FileAtCommit(found=False)
+    if mode not in _ORDINARY_FILE_MODES and mode != _LINK_MODE:
+        return FileAtCommit(found=False, mode=mode)
+    sized = _run_git(
+        repo_root, "cat-file", "-s", oid, timeout=READ_AT_COMMIT_TIMEOUT_SECONDS
+    )
+    try:
+        size = int((sized.stdout or "").strip()) if sized.returncode == 0 else -1
+    except ValueError:
+        size = -1
+    if size < 0:
+        return FileAtCommit(
+            refusal=(
+                f"git could not say how big {file_path} is at {commit} in "
+                f"{where}: {_git_said(sized)}"
+            )
+        )
+    if size > MAX_FILE_AT_COMMIT_BYTES:
+        return FileAtCommit(
+            refusal=(
+                f"{file_path} at {commit} is {size} bytes, larger than the "
+                f"{MAX_FILE_AT_COMMIT_BYTES} this factory will read"
+            )
+        )
+    shown = subprocess.run(  # noqa: S603 — fixed argv, no shell
+        ["git", "-C", str(repo_root), "cat-file", "blob", oid],
+        capture_output=True,
+        timeout=READ_AT_COMMIT_TIMEOUT_SECONDS,
+        check=False,
+    )
+    if shown.returncode != 0:
+        said = (shown.stderr or b"").decode("utf-8", "replace").strip()
+        return FileAtCommit(
+            refusal=(
+                f"{file_path} could not be read at {commit} in {where}: "
+                f"{said or f'exit code {shown.returncode}'}"
+            )
+        )
+    try:
+        text = (shown.stdout or b"").decode("utf-8")
+    except UnicodeDecodeError as exc:
+        return FileAtCommit(
+            refusal=(
+                f"{file_path} at {commit} is not UTF-8 text (invalid byte at "
+                f"position {exc.start})"
+            )
+        )
+    return FileAtCommit(
+        content=text,
+        found=True,
+        ordinary=mode in _ORDINARY_FILE_MODES,
+        mode=mode,
+    )
 
 
 def _tree_entry_mode(
@@ -658,6 +804,7 @@ def read_file_at_commit_sync(
     file_path: str,
     *,
     ordinary_file_only: bool = False,
+    raw: bool = False,
 ) -> FileAtCommit:
     """The three steps, in order: is the commit here, is the file, read it.
 
@@ -673,6 +820,11 @@ def read_file_at_commit_sync(
     rather than read — ``git show`` would otherwise hand back the link's
     target name as if it were the file. A successful read then says
     ``ordinary=True``. Without it, nothing extra is asked of git.
+
+    ``raw`` (4 October 2026, the one reading rule for a project's documents):
+    after the commit check, the read is :func:`_read_raw_at_commit_sync` —
+    exact bytes, strict UTF-8, and the entry's ``mode`` reported. It takes
+    precedence over ``ordinary_file_only``; the caller judges the mode.
     """
     where = str(repo_root)
     try:
@@ -691,6 +843,9 @@ def read_file_at_commit_sync(
                     f"commit {commit}, so nothing can be read out of it"
                 )
             )
+
+        if raw:
+            return _read_raw_at_commit_sync(repo_root, commit, file_path)
 
         sized = _run_git(
             repo_root,
@@ -770,6 +925,7 @@ async def read_file_at_commit(
     file_path: str,
     *,
     ordinary_file_only: bool = False,
+    raw: bool = False,
 ) -> FileAtCommit:
     """Read ``file_path`` exactly as it is at ``commit``.
 
@@ -786,6 +942,7 @@ async def read_file_at_commit(
             str(commit),
             str(file_path),
             ordinary_file_only=ordinary_file_only,
+            raw=raw,
         )
     )
 

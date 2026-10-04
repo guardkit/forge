@@ -31,7 +31,7 @@ The narrow contract:
     POST /git/rev-parse {repo, ref} -> {sha|null}
     POST /git/remote-start-point {repo, branch?}
               -> {branch|null, commit|null, refusal|null, branch_commit?}
-    POST /git/read-file-at-commit {repo, commit, file_path, ordinary_file_only?}
+    POST /git/read-file-at-commit {repo, commit, file_path, ordinary_file_only?, raw?}
               -> {content|null, found, refusal|null, ordinary?}
     POST /git/is-ancestor {repo, ancestor, descendant} -> {is_ancestor|null}
     POST /git/candidate-tree {repo, feature_id, sha}
@@ -3956,6 +3956,10 @@ def process_git_read_file_at_commit_request(
     # checked and a symbolic link is refused, so a binding document cannot be
     # satisfied by a link's target name. Absent, the read is unchanged.
     ordinary_file_only = payload.get("ordinary_file_only") is True
+    # The RAW read (4 October 2026, the one reading rule for a project's
+    # documents): the entry's mode reported and the blob's exact bytes, strict
+    # UTF-8. Absent, the read is unchanged.
+    raw = payload.get("raw") is True
     from forge.deploy.candidate_tree import read_file_at_commit
 
     try:
@@ -3965,6 +3969,7 @@ def process_git_read_file_at_commit_request(
                 str(commit),
                 str(file_path),
                 ordinary_file_only=ordinary_file_only,
+                raw=raw,
             )
         )
     except Exception as exc:  # noqa: BLE001 — never raise past the boundary

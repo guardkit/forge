@@ -55,6 +55,7 @@ from forge.deploy.candidate_tree import (
     FileAtCommit,
     RemoteStartPoint,
     answered_as_ordinary,
+    answered_as_raw,
     answered_for_branch,
 )
 from forge.planning.handoff import (
@@ -579,6 +580,7 @@ class SidecarGitRunner:
         file_path: str,
         *,
         ordinary_file_only: bool = False,
+        raw: bool = False,
     ) -> FileAtCommit:
         """One file out of one commit, read on the clone inside the sandbox.
 
@@ -596,6 +598,11 @@ class SidecarGitRunner:
         }
         if ordinary_file_only:
             body["ordinary_file_only"] = True
+        if raw:
+            # The exact committed bytes and the entry's mode (4 October 2026);
+            # sent only when asked for, and an answer that found the file
+            # without saying its mode is a refusal.
+            body["raw"] = True
         answer = await self._call(
             "/git/read-file-at-commit",
             body,
@@ -611,6 +618,7 @@ class SidecarGitRunner:
             logger.error("read_file_at_commit: %s", sentence)
             return FileAtCommit(refusal=sentence)
         read = answered_as_ordinary(FileAtCommit.from_wire(decoded), ordinary_file_only)
+        read = answered_as_raw(read, raw)
         if not read.ok:
             logger.warning("read_file_at_commit: %s", read.refusal)
         return read
@@ -928,9 +936,18 @@ class RepoRoutedGitRunner:
         file_path: str,
         *,
         ordinary_file_only: bool = False,
+        raw: bool = False,
     ) -> FileAtCommit:
         """One file out of one commit, routed exactly as the others are."""
         runner = self.runner_for_path(repo_path)
+        if raw:
+            return await runner.read_file_at_commit(
+                repo_path,
+                commit,
+                file_path,
+                ordinary_file_only=ordinary_file_only,
+                raw=True,
+            )
         if ordinary_file_only:
             return await runner.read_file_at_commit(
                 repo_path, commit, file_path, ordinary_file_only=True
