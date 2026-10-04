@@ -82,7 +82,15 @@ from forge.planning.checkpoint import (
     build_planning_approval_envelope,
     checkpoint_product_docs,
 )
-from forge.planning.declared_memory import read_declarations_at_commit
+from forge.planning.declared_memory import (
+    read_declarations_at_commit,
+    read_declared_binding_documents,
+)
+from forge.planning.project_documents import (
+    ProjectDocument,
+    context_texts,
+    read_project_documents_at_commit,
+)
 from forge.planning.escalation import (
     EscalationOutcome,
     EscalationPolicy,
@@ -214,6 +222,15 @@ _AUTH_CONFIRM_STAGE = "qa-pass-bars-auth-confirm"
 #: persisted card instead of re-dispatching the spec-writer and rewriting the
 #: spec underneath a card the owner is still reading.
 _SPEC_DRAFT_STAGE = "feature-spec-draft"
+
+#: Durable stage label for THE PROJECT'S DOCUMENTS as the door read them
+#: (project initialisation design, 4 October 2026): the instruction files and
+#: binding documents, read at the starting commit, with path, hash, size,
+#: commit and text. Written once, at the door, and only for a project that
+#: declares binding documents; every later spec and plan call sends exactly
+#: what it holds, so a re-drive never reads them again. Status ``recorded``,
+#: never ``approved``: it is a record, not any leg's sentinel.
+_PROJECT_DOCUMENTS_STAGE = "project-documents"
 
 #: Durable stage label for the SPEC DIGEST REVIEW DOOR — the one pause of the
 #: machine chain (the product-docs pause, absorbed and moved to where there is
@@ -2431,7 +2448,13 @@ class PlanningRunDriver:
            same commit, the same parse: the NAMES the project declares beyond
            the factory's own list (22 September 2026). A project that asks for
            nothing gets nothing extra; one that asks for a name this factory
-           keeps for itself is refused, naming it.
+           keeps for itself is refused, naming it;
+        4. **which documents is its work held to?** (4 October 2026) The same
+           file names them in ``autobuild.player.required_documents``; each is
+           read AT that commit, with the repository's instruction files, and
+           recorded for the spec and plan writers. A missing document, a
+           symbolic link or documents over the budget are refused. A project
+           that names none has nothing read.
 
         Every part is idempotent: a run that already has these facts recorded
         fetches nothing and reads nothing, and keeps exactly what it started
@@ -2614,6 +2637,19 @@ class PlanningRunDriver:
             )
             return None
 
+        # THE PROJECT'S OWN DOCUMENTS (project initialisation design, 4 October
+        # 2026), out of the same file at the same commit, read and recorded
+        # BEFORE the memory name and settings. So a run whose memory name is
+        # recorded has always had its documents decided: recorded when the
+        # project declares any, nothing when it declares none.
+        if not await self._read_and_record_project_documents(
+            correlation_id,
+            repo_path=repo_path,
+            start_commit=start_commit,
+            config_text=declarations.content,
+        ):
+            return None
+
         name = str(declarations.memory_project)
         wanted_names = declarations.launch_settings
         recorder = getattr(deps.store, "record_memory_project", None)
@@ -2634,6 +2670,108 @@ class PlanningRunDriver:
             ", ".join(wanted_names) or "nothing beyond the factory's own list",
         )
         return name, tuple(wanted_names)
+
+    async def _read_and_record_project_documents(
+        self,
+        correlation_id: str,
+        *,
+        repo_path: str,
+        start_commit: str,
+        config_text: str | None,
+    ) -> bool:
+        """Read the project's documents at the starting commit and record them.
+
+        True to carry on (recorded, or nothing declared); False after failing
+        the run in plain words. Opt-in, as GuardKit's is: a project whose
+        ``autobuild.player.required_documents`` is absent or empty has nothing
+        read and nothing recorded, so every request it sends is what it was.
+        A run that already has its documents recorded reads nothing again.
+        """
+        if self._project_documents_event(correlation_id) is not None:
+            return True
+        declared, why = read_declared_binding_documents(config_text)
+        documents: tuple[ProjectDocument, ...] = ()
+        if why is None and declared:
+            documents, why = await read_project_documents_at_commit(
+                self._deps.git_runner,
+                repo_path=repo_path,
+                commit=start_commit,
+                declared=declared,
+            )
+        if why is not None:
+            await self._fail_leg(correlation_id, "target-terminal-enter", why)
+            return False
+        if not declared:
+            return True
+        self._deps.store._record_event(
+            correlation_id=correlation_id,
+            stage_label=_PROJECT_DOCUMENTS_STAGE,
+            status="recorded",
+            actor_identity="planning-driver",
+            details_json=json.dumps(
+                {"project_documents": [d.to_record() for d in documents]}
+            ),
+        )
+        logger.info(
+            "planning driver: run %s will give the spec and plan writers %d "
+            "project document(s) read at %s: %s",
+            correlation_id,
+            len(documents),
+            start_commit,
+            ", ".join(f"{d.path} ({d.bytes} bytes)" for d in documents),
+        )
+        return True
+
+    def _project_documents_event(self, correlation_id: str) -> Any | None:
+        """The run's recorded project-documents row, or ``None``."""
+        latest = None
+        for event in self._deps.store.list_events(correlation_id):
+            if (
+                event["stage_label"] == _PROJECT_DOCUMENTS_STAGE
+                and event["status"] == "recorded"
+            ):
+                latest = event
+        return latest
+
+    def _recorded_project_documents(
+        self, correlation_id: str
+    ) -> tuple[tuple[ProjectDocument, ...], str | None]:
+        """What the door recorded, to send as it is: ``(documents, None)``.
+
+        ``((), None)`` when nothing was recorded (the project declares no
+        binding documents). ``((), why)`` when the record does not hold
+        together — sending nothing in its place would quietly drop a document
+        the project said its work is held to.
+        """
+        event = self._project_documents_event(correlation_id)
+        if event is None:
+            return (), None
+        broken = (
+            "the project documents recorded for this run at its start could "
+            "not be read back intact, so they cannot be given to the writers"
+        )
+        try:
+            records = json.loads(event["details_json"] or "{}").get(
+                "project_documents"
+            )
+        except (json.JSONDecodeError, ValueError, AttributeError):
+            return (), broken
+        if not isinstance(records, list) or not records:
+            return (), broken
+        documents = [ProjectDocument.from_record(record) for record in records]
+        if any(document is None for document in documents):
+            return (), broken
+        return tuple(d for d in documents if d is not None), None
+
+    @staticmethod
+    def _project_documents_receipt(
+        documents: tuple[ProjectDocument, ...],
+    ) -> dict[str, Any]:
+        """What a writer's receipt records about the documents it was sent."""
+        return {
+            "status": "sent",
+            "documents": [document.receipt() for document in documents],
+        }
 
     async def _feature_spec_leg(self, row: Any, correlation_id: str) -> bool:
         """FEATURE_SPEC leg: write the spec, show it to a person, then advance.
