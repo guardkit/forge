@@ -285,3 +285,33 @@ def test_the_requeue_sweep_deletes_a_prior_prepared_builds_branch(
     assert _git(repo, "branch", "--list", prior_branch) == ""
     assert _git(repo, "branch", "--list", SOURCE_BRANCH) == ""
     assert not outer.exists()
+
+
+def test_the_sweep_clears_a_prior_branch_left_with_no_worktree_at_all(
+    clone: tuple[Path, str], tmp_path: Path, monkeypatch
+) -> None:
+    """A prior prepared build's runner was stopped after it made its own
+    branch and before GuardKit made any worktree: only the branch is left. A
+    branch of another feature, and of a build still running, are left alone."""
+    repo, admitted = clone
+    monkeypatch.setenv(ar.FORGE_AUTOBUILD_WORKTREE_BASE_ENV, str(tmp_path / "wt"))
+    monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(tmp_path / "receipts"))
+    prior_branch = "forge/source/build-FEAT-AB12-20261003080000"
+    other_feature = "forge/source/build-FEAT-CD34-20261003080000"
+    live_branch = "forge/source/build-FEAT-AB12-20261003070000"
+    _git(repo, "branch", prior_branch, admitted)
+    _git(repo, "branch", other_feature, admitted)
+    _git(repo, "branch", live_branch, admitted)
+    monkeypatch.setattr(
+        ar,
+        "_prior_build_status",
+        lambda build_id: "RUNNING" if build_id.endswith("070000") else None,
+    )
+
+    calls: list[dict[str, Any]] = []
+    result = _run(repo, _payload(admitted), calls)
+
+    assert _lifecycle(result) == "completed"
+    assert _git(repo, "branch", "--list", prior_branch) == ""
+    assert _git(repo, "branch", "--list", other_feature) != ""
+    assert _git(repo, "branch", "--list", live_branch) != ""
