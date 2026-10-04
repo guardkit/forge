@@ -283,6 +283,12 @@ class BuildRow(BaseModel):
     # historical row, or a build queued by hand), which is not the same fact as
     # ``"[]"``: the project was read and asked for nothing extra.
     launch_settings: str | None = None
+    # The exact commit a PREPARED feature was admitted at (``schema_v17.sql``,
+    # 4 October 2026): a feature planned elsewhere, queued straight to a build
+    # with no planning run. Equal to ``start_commit`` for such a build, and the
+    # runner builds exactly it. ``None`` for every other build, which launches
+    # exactly as it always has.
+    source_commit: str | None = None
 
 
 class BuildStartPoint(BaseModel):
@@ -414,6 +420,7 @@ def _row_to_build_row(row: sqlite3.Row | tuple[Any, ...]) -> BuildRow:
             "target_branch",
             "memory_project",
             "launch_settings",
+            "source_commit",
         )
         data = dict(zip(keys, row, strict=False))
 
@@ -456,6 +463,7 @@ def _row_to_build_row(row: sqlite3.Row | tuple[Any, ...]) -> BuildRow:
         target_branch=data.get("target_branch"),
         memory_project=data.get("memory_project"),
         launch_settings=data.get("launch_settings"),
+        source_commit=data.get("source_commit"),
     )
 
 
@@ -759,6 +767,7 @@ class SqliteLifecyclePersistence:
         *,
         mode: BuildMode | str | None = None,
         profile: str | None = None,
+        admitted: Any = None,
     ) -> str:
         """Insert a fresh ``builds`` row in state ``QUEUED``.
 
@@ -794,6 +803,15 @@ class SqliteLifecyclePersistence:
                 is omitted, but ``BuildQueuedPayload`` carries no profile
                 field today (option §2(b) is barred) so the CLI passes it
                 explicitly.
+            admitted: The facts a prepared feature's admission established
+                (4 October 2026; :class:`forge.pipeline.prepared_admission.
+                AdmittedBuild`, read here by attribute so this layer does not
+                import it): ``start_commit``, ``target_branch``,
+                ``source_commit``, ``memory_project`` and ``launch_settings``.
+                Given only for a build with no planning run behind it; the row
+                then records those facts instead of copying "nothing" from a
+                planning run that does not exist. ``None`` (every other caller)
+                copies from the planning run exactly as before.
 
         Returns:
             The derived ``build_id``.
@@ -843,6 +861,14 @@ class SqliteLifecyclePersistence:
             if records_start_point
             else (None, None)
         )
+        # A PREPARED feature (4 October 2026): no planning run, so its own
+        # admission fetched the remote and read the declarations at the commit
+        # it admitted. Those facts are recorded here, at the same single INSERT
+        # site, by the same columns — one admitted revision for the build, its
+        # declarations, its deploy settings and its merge card.
+        if admitted is not None and records_start_point:
+            start_commit = getattr(admitted, "start_commit", None) or None
+            target_branch = getattr(admitted, "target_branch", None) or None
         columns = (
             "build_id, feature_id, repo, branch, feature_yaml_path, "
             "status, triggered_by, originating_adapter, "
@@ -883,7 +909,11 @@ class SqliteLifecyclePersistence:
         if records_memory_project:
             columns += ", memory_project"
             placeholders += ", ?"
-            values.append(self._planning_memory_project(correlation_id))
+            values.append(
+                (getattr(admitted, "memory_project", None) or None)
+                if admitted is not None
+                else self._planning_memory_project(correlation_id)
+            )
         # And the NAMES the project said its own builds need
         # (``schema_v14.sql``), by the same rule, out of the same file at the
         # same commit, from the same planning run. Names only; the launch takes
@@ -894,7 +924,20 @@ class SqliteLifecyclePersistence:
         if self._builds_record_the_launch_settings():
             columns += ", launch_settings"
             placeholders += ", ?"
-            values.append(self._planning_launch_settings(correlation_id))
+            values.append(
+                json.dumps(
+                    [str(name).strip() for name in getattr(admitted, "launch_settings", ())]
+                )
+                if admitted is not None
+                else self._planning_launch_settings(correlation_id)
+            )
+        # The exact commit a prepared feature was admitted at
+        # (``schema_v17.sql``). Only an admission writes it; it is what tells
+        # the runner to build that commit rather than a branch that may move.
+        if admitted is not None and self._builds_record_the_source_commit():
+            columns += ", source_commit"
+            placeholders += ", ?"
+            values.append(getattr(admitted, "source_commit", None) or None)
 
         try:
             self._cx.execute("BEGIN IMMEDIATE;")
@@ -1259,6 +1302,66 @@ class SqliteLifecyclePersistence:
             start_commit=str(commit),
             target_branch=str(branch),
         )
+
+    def has_planning_run(self, correlation_id: str | None) -> bool:
+        """Is there a planning run filed under ``correlation_id``?
+
+        The dispatch path asks this before it admits a build (4 October 2026):
+        a build with a planning run copies that run's facts, and one without
+        is a prepared feature whose own admission establishes them. Forgiving
+        like its siblings: a ledger that cannot answer reads as "there is one",
+        so a read fault never sends a planned build down the prepared route.
+        """
+        if not correlation_id:
+            return False
+        try:
+            row = self._cx.execute(
+                "SELECT 1 FROM planning_runs WHERE correlation_id = ? LIMIT 1",
+                (correlation_id,),
+            ).fetchone()
+        except sqlite3.Error:
+            return True
+        return row is not None
+
+    def _builds_record_the_source_commit(self) -> bool:
+        """Does this ledger have ``builds.source_commit`` (``schema_v17``)?
+
+        Asked once per facade and remembered, exactly as its siblings are.
+        """
+        cached = getattr(self, "_source_commit_column", None)
+        if cached is not None:
+            return bool(cached)
+        try:
+            names = {
+                row[1] for row in self._cx.execute("PRAGMA table_info(builds);")
+            }
+        except sqlite3.Error:
+            names = set()
+        answer = "source_commit" in names
+        self._source_commit_column = answer
+        return answer
+
+    def read_source_commit(self, build_id: str) -> str | None:
+        """The exact commit this prepared build was admitted at, or ``None``.
+
+        The launch path reads this and hands it to the runner, which then
+        builds exactly that commit. ``None`` — a planned build, a build queued
+        by hand, a historical row, a ledger without the column — means the
+        runner launches exactly as it always has.
+        """
+        if not self._builds_record_the_source_commit():
+            return None
+        try:
+            row = self._cx.execute(
+                "SELECT source_commit FROM builds WHERE build_id = ?",
+                (build_id,),
+            ).fetchone()
+        except sqlite3.Error:
+            return None
+        if row is None:
+            return None
+        sha = row["source_commit"] if isinstance(row, sqlite3.Row) else row[0]
+        return str(sha) if sha else None
 
     def _builds_record_the_memory_project(self) -> bool:
         """Does this ledger have ``builds.memory_project`` (``schema_v13``)?
