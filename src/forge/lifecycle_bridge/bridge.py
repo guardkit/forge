@@ -61,7 +61,6 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "AckHandle",
     "BuildContext",
-    "BuildStopper",
     "CancelResult",
     "DEADLINE_SECONDS",
     "DeadlineHandler",
@@ -89,11 +88,6 @@ DEADLINE_SECONDS: float = 300.0
 #: Wired by :class:`forge.lifecycle_bridge.wireup.LifecycleBridgeWireup`
 #: in production; tests pass an :class:`unittest.mock.AsyncMock`.
 DeadlineHandler = Callable[["BuildContext"], Awaitable[None]]
-
-#: ``async (feature_id, correlation_id) -> answer`` — asks the build's runner to
-#: stop everything the build owns (``POST /forge/builds/{build_id}/stop``) and
-#: returns its answer (:class:`forge.lifecycle_bridge.build_stop.StopAnswer`).
-BuildStopper = Callable[[str, str], Awaitable[object]]
 
 
 # ---------------------------------------------------------------------------
@@ -249,7 +243,6 @@ class LifecycleBridge:
         sdk_client: LangGraphCancelClient | None = None,
         deadline_handler: DeadlineHandler | None = None,
         deadline_seconds: float | None = None,
-        build_stopper: BuildStopper | None = None,
     ) -> None:
         if not isinstance(registry, BridgeRegistry):
             raise TypeError(
@@ -272,11 +265,6 @@ class LifecycleBridge:
         # T2-era callers (and unit tests that exercise attach/detach
         # only) can construct the bridge without a live SDK.
         self._sdk_client: LangGraphCancelClient | None = sdk_client
-        # Stopping a cancelled build (3 October 2026): when wired, a cancel
-        # asks the build's runner to stop everything the build owns instead
-        # of interrupting the run (which marked the run interrupted at once
-        # and let the place go while the build's processes carried on).
-        self._build_stopper: BuildStopper | None = build_stopper
         # Cancel-in-flight idempotency guard (AC-5). Tracked in-memory
         # rather than as a registry column because the only consumer is
         # ``request_cancel`` and the in-memory set is reset on process
@@ -672,70 +660,6 @@ class LifecycleBridge:
                 feature_id=feature_id,
                 invoked=False,
                 reason="no-registry-row",
-            )
-
-        if self._build_stopper is not None:
-            self._cancel_in_flight.add(feature_id)
-            logger.info(
-                "lifecycle_bridge.request_cancel feature_id=%s status=invoking "
-                "route=runner-stop thread_id=%s run_id=%s correlation_id=%s",
-                feature_id,
-                entry.thread_id,
-                entry.run_id,
-                entry.correlation_id,
-            )
-            try:
-                answer = await self._build_stopper(feature_id, entry.correlation_id)
-            except Exception:
-                self._cancel_in_flight.discard(feature_id)
-                logger.exception(
-                    "lifecycle_bridge.request_cancel feature_id=%s "
-                    "runner_stop_failed", feature_id,
-                )
-                raise
-            if getattr(answer, "route_missing", False):
-                # An older runner image has no stop route: interrupt the run
-                # as before; its cancel handler kills what it can.
-                logger.warning(
-                    "lifecycle_bridge.request_cancel feature_id=%s older "
-                    "runner image (no stop route); interrupting the run",
-                    feature_id,
-                )
-                try:
-                    client = self._sdk_client
-                    if client is None:
-                        from langgraph_sdk import get_client
-
-                        client = get_client(url=answer.runner_url)
-                    await client.runs.cancel(
-                        entry.thread_id, entry.run_id, action="interrupt"
-                    )
-                except Exception:
-                    self._cancel_in_flight.discard(feature_id)
-                    logger.exception(
-                        "lifecycle_bridge.request_cancel feature_id=%s "
-                        "sdk_cancel_failed", feature_id,
-                    )
-                    raise
-            elif not getattr(answer, "stopped", False):
-                # The place stays held: the acknowledgement of this build
-                # asks the runner again before it lets the place go.
-                logger.warning(
-                    "lifecycle_bridge.request_cancel feature_id=%s the runner "
-                    "has not yet confirmed the stop (%s; remaining=%s)",
-                    feature_id,
-                    getattr(answer, "reason", ""),
-                    getattr(answer, "remaining", None),
-                )
-                # Not confirmed (an unreachable runner reads the same): a
-                # later cancel must be able to ask again.
-                self._cancel_in_flight.discard(feature_id)
-            return CancelResult(
-                feature_id=feature_id,
-                invoked=True,
-                reason="invoked",
-                thread_id=entry.thread_id,
-                run_id=entry.run_id,
             )
 
         if self._sdk_client is None:

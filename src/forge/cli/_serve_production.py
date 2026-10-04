@@ -67,7 +67,6 @@ from forge.persistence.repositories.bridge_registry import BridgeRegistry
 from forge.pipeline.dispatchers.autobuild_async import AsyncTaskStarter
 
 if TYPE_CHECKING:  # pragma: no cover - import-time only
-    from forge.lifecycle_bridge.build_stop import AckAfterStop, StopCheck
     from forge.lifecycle_bridge.wireup import (
         BuildIdResolver,
         BuildStateRecorder,
@@ -201,60 +200,6 @@ class LifecycleBridgeWireupParts:
     # constructions publish no classified terminal, and a missing recorder is
     # a quiet no-op, never a hole in an enforcement path.
     terminal_class_recorder: "TerminalClassRecorder | None" = None
-    # Stopping a cancelled build (3 October 2026) — every acknowledgement of a
-    # cancelled build first asks the build's runner whether everything the
-    # build owns is gone. Optional so unit-tier parts constructions keep
-    # acknowledging exactly as before.
-    ack_guard: "AckAfterStop | None" = None
-
-
-def build_runner_stop_check(
-    *,
-    sqlite_pool: SqliteLifecyclePersistence,
-    default_url: str,
-    runner_url_for_feature: "Callable[[str], str] | None" = None,
-) -> "StopCheck":
-    """The production :data:`StopCheck`: ask the build's own runner.
-
-    The build is the newest ``builds`` row for the identity, whatever its
-    status: every terminal acknowledgement waits until the build's runner says
-    nothing it owns is left (for a build that ended in the ordinary way it
-    says so at once). The runner is the one the build was dispatched to: the
-    sandbox's runner for a repository that has one, the global runner
-    otherwise (the same answer the watchers use). ``purpose`` says why
-    (``ack``, ``relaunch`` or ``cancel``; see ``ask_runner_to_stop``).
-    """
-    from forge.lifecycle_bridge.build_stop import StopAnswer, ask_runner_to_stop
-
-    async def _check(
-        feature_id: str, correlation_id: str, purpose: str = "ack"
-    ) -> StopAnswer | None:
-        try:
-            with sqlite_pool._reader() as cx:
-                row = cx.execute(
-                    "SELECT build_id FROM builds WHERE feature_id = ? "
-                    "AND correlation_id = ? ORDER BY queued_at DESC, rowid DESC "
-                    "LIMIT 1",
-                    (feature_id, correlation_id),
-                ).fetchone()
-        except sqlite3.Error as exc:
-            return StopAnswer(
-                stopped=False,
-                reason=f"the build's row could not be read ({exc})",
-            )
-        if row is None:
-            # No build was recorded, so none was launched under an id to ask
-            # about.
-            return None
-        build_id = row[0] if not hasattr(row, "keys") else row["build_id"]
-        url = (
-            runner_url_for_feature(feature_id)
-            if runner_url_for_feature is not None
-            else default_url
-        )
-        return await ask_runner_to_stop(url, str(build_id), purpose=purpose)
-
-    return _check
 
 
 def build_feature_runner_url_resolver(
@@ -603,25 +548,8 @@ def _build_lifecycle_bridge_wireup_parts(
         default_url=autobuild_runner_url,
     )
 
-    # Stopping a cancelled build (3 October 2026): a cancel asks the build's
-    # runner to stop it, and every acknowledgement of a cancelled build waits
-    # for that runner to confirm the stop. One check serves both.
-    from forge.lifecycle_bridge.build_stop import AckAfterStop
-
-    stop_check = build_runner_stop_check(
-        sqlite_pool=sqlite_pool,
-        default_url=autobuild_runner_url,
-        runner_url_for_feature=runner_url_for_feature,
-    )
-    ack_guard = AckAfterStop(stop_check)
-    # The cancel itself: the same question, for=cancel, which the runner
-    # remembers so a run of the build still waiting for a job slot never
-    # starts.
-    async def _stop_build(feature_id: str, correlation_id: str) -> Any:
-        return await stop_check(feature_id, correlation_id, "cancel")
-
     registry = BridgeRegistry(connection=connection)
-    bridge = LifecycleBridge(registry=registry, build_stopper=_stop_build)
+    bridge = LifecycleBridge(registry=registry)
     translator = StreamEventTranslator()
     if runner_url_for_feature is None:
         stream_source = langgraph_stream_source(runner_url=autobuild_runner_url)
@@ -688,7 +616,6 @@ def _build_lifecycle_bridge_wireup_parts(
         build_id_resolver=build_id_resolver,
         build_mode_reader=build_mode_reader,
         terminal_class_recorder=terminal_class_recorder,
-        ack_guard=ack_guard,
     )
 
 
@@ -906,7 +833,6 @@ def _build_consumer_reconcile_seam(
     sqlite_pool: SqliteLifecyclePersistence,
     forge_config: ForgeConfig,
     async_task_starter: AsyncTaskStarter | None,
-    ack_guard: "AckAfterStop | None" = None,
 ) -> Any:
     """Return the production ``consumer_reconcile_on_boot`` closure (§D4.4).
 
@@ -935,9 +861,6 @@ def _build_consumer_reconcile_seam(
             forge_config,
             sqlite_pool,
             async_task_starter=async_task_starter,
-            # A CANCELLED row's redelivery is acknowledged only once its
-            # runner confirms the build's processes are gone (3 October 2026).
-            ack_guard=ack_guard,
         )
 
         async def _fetch_redeliveries() -> list[Any]:
@@ -1432,10 +1355,7 @@ def bind_production_serve(config: ServeConfig, forge_config: ForgeConfig) -> Non
         sqlite_pool, forge_config
     )
     serve_module.consumer_reconcile_on_boot = _build_consumer_reconcile_seam(
-        sqlite_pool,
-        forge_config,
-        async_task_starter,
-        ack_guard=bridge_wireup_parts.ack_guard,
+        sqlite_pool, forge_config, async_task_starter
     )
 
     # Step 8 — close any previous binding's writer connection cleanly.

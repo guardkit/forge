@@ -113,7 +113,6 @@ from forge.lifecycle_bridge.translation import (
 from forge.pipeline.build_ack_handle import BuildAckHandle
 
 if TYPE_CHECKING:  # pragma: no cover - import-time only
-    from forge.lifecycle_bridge.build_stop import AckAfterStop
     from forge.lifecycle_bridge.budget_observer import (
         BudgetBreachObserver,
         BudgetObserverSession,
@@ -506,7 +505,6 @@ class LifecycleBridgeWireup:
         build_mode_reader: "BuildModeReader | None" = None,
         terminal_class_recorder: "TerminalClassRecorder | None" = None,
         merge_offer_hook: Callable[[PipelineEvent], Awaitable[None]] | None = None,
-        ack_guard: "AckAfterStop | None" = None,
     ) -> None:
         if not isinstance(bridge, LifecycleBridge):
             raise TypeError(
@@ -581,11 +579,6 @@ class LifecycleBridgeWireup:
         # is a strict no-op — byte-identical to the pre-lane observer.
         self._merge_offer_hook = merge_offer_hook
         self._merge_offer_tasks: set[asyncio.Task[None]] = set()
-        # Stopping a cancelled build (3 October 2026): before a CANCELLED
-        # terminal is acknowledged — which releases the build's place — the
-        # build's runner must confirm that everything the build owns is gone.
-        # ``None`` (unit tiers) acknowledges as before.
-        self._ack_guard = ack_guard
         # Per-feature budget-detection state (one session per observer task).
         # Created at observer start when a detector is wired, dropped in the
         # observer's ``finally`` — so the review-cycle count resets on bridge
@@ -690,8 +683,8 @@ class LifecycleBridgeWireup:
         # idempotency means whichever handle wins ack() is fine.
         #
         # A DIFFERENT build of the same feature while that observer is still
-        # live (for example the earlier build is waiting for its runner to
-        # confirm the stop) is refused with ``False``: one observer per
+        # live (the earlier build has not reached its terminal yet) is
+        # refused with ``False``: one observer per
         # feature, and dropping it silently would strand the new build. The
         # caller waits and asks again rather than launching.
         if feature_id in self._observers:
@@ -1830,49 +1823,29 @@ class LifecycleBridgeWireup:
 
         Both calls are guarded so a transient transport error in either
         cannot leave the observer loop unable to exit.
-
-        Every terminal, whatever its class, is acknowledged only once the
-        build's runner confirms that nothing the build owns is left (3 October
-        2026; at once for a build that ended in the ordinary way). Until then
-        the acknowledgement is held by the guard's one checker for this build,
-        which asks again every 30 seconds; the registry row stays, and a
-        factory restart leaves the message unacknowledged for the consumer to
-        ask about again.
         """
-
-        async def _ack_and_detach() -> None:
-            try:
-                await handle.ack()
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "wireup._on_terminal: handle.ack() raised (%s) for "
-                    "feature_id=%s correlation_id=%s; leaving registry row "
-                    "in place for recover_in_flight",
-                    exc,
-                    feature_id,
-                    correlation_id,
-                )
-                return
-            try:
-                self._bridge.detach(feature_id, correlation_id=correlation_id)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "wireup._on_terminal: bridge.detach raised (%s) for "
-                    "feature_id=%s correlation_id=%s; row may be stale",
-                    exc,
-                    feature_id,
-                    correlation_id,
-                )
-
-        if self._ack_guard is not None:
-            await self._ack_guard.ack_when_stopped(
+        try:
+            await handle.ack()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "wireup._on_terminal: handle.ack() raised (%s) for "
+                "feature_id=%s correlation_id=%s; leaving registry row "
+                "in place for recover_in_flight",
+                exc,
                 feature_id,
                 correlation_id,
-                _ack_and_detach,
-                where="the build's terminal",
             )
             return
-        await _ack_and_detach()
+        try:
+            self._bridge.detach(feature_id, correlation_id=correlation_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "wireup._on_terminal: bridge.detach raised (%s) for "
+                "feature_id=%s correlation_id=%s; row may be stale",
+                exc,
+                feature_id,
+                correlation_id,
+            )
 
     def _spawn_merge_offer(self, event: PipelineEvent) -> None:
         """Fire the merge-offer hook for a published terminal, detached.
@@ -2317,10 +2290,6 @@ class LifecycleBridgeWireup:
         # (e.g. test fixtures) starts from a clean state.
         self._observers.clear()
         self._handles.clear()
-        # Held acknowledgements of cancelled builds stay unacknowledged; the
-        # next process's consumer asks again when the message comes back.
-        if self._ack_guard is not None:
-            await self._ack_guard.shutdown()
         self._bridge.shutdown()
         logger.info(
             "wireup.shutdown: drained %d observer task(s)",
