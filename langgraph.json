@@ -4,8 +4,5 @@
         "orchestrator": "./src/forge/agent.py:agent",
         "autobuild_runner": "./src/forge/subagents/autobuild_runner.py:graph"
     },
-    "http": {
-        "app": "forge.subagents.runner_http:app"
-    },
     "env": ".env"
 }

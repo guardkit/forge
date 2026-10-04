@@ -273,10 +273,10 @@ def real_runner(
     name: str,
     *,
     jobs: int = 1,
-    app: str | None = "forge.subagents.runner_http:app",
+    app: str | None = None,
     extra_env: dict[str, str] | None = None,
 ) -> Iterator[Runner]:
-    """A real ``langgraph dev`` runner with ``jobs`` job slots and the stop route."""
+    """A real ``langgraph dev`` runner with ``jobs`` job slots."""
     home = estate.root / f"runner-{name}"
     home.mkdir()
     config: dict[str, Any] = {
@@ -340,14 +340,6 @@ def real_runner(
         except OSError:
             pass
         process.wait(timeout=30)
-
-
-def post_stop(runner_url: str, build_id: str, timeout: float = 120.0) -> dict[str, Any]:
-    request = urllib.request.Request(
-        f"{runner_url}/forge/builds/{build_id}/stop", method="POST", data=b""
-    )
-    with urllib.request.urlopen(request, timeout=timeout) as reply:
-        return json.loads(reply.read())
 
 
 def start_fixture_container(build_id: str) -> str:
@@ -418,41 +410,6 @@ def docker_available() -> bool:
         )
     except (OSError, subprocess.TimeoutExpired):
         return False
-
-
-@contextmanager
-def throwaway_broker() -> Iterator[str]:
-    """A real, throwaway JetStream broker on a loopback port."""
-    done = subprocess.run(
-        [
-            "docker", "run", "--detach", "--rm",
-            "--label", "forge.test=concurrent-builds",
-            "--publish", "127.0.0.1::4222",
-            "nats:2.11-alpine", "-js",
-        ],
-        capture_output=True, text=True, check=True, timeout=60,
-    )
-    container = done.stdout.strip()
-    try:
-        port = subprocess.run(
-            ["docker", "port", container, "4222/tcp"],
-            capture_output=True, text=True, check=True, timeout=30,
-        ).stdout.split()[0].rpartition(":")[2]
-
-        def _up() -> bool:
-            try:
-                with socket.create_connection(("127.0.0.1", int(port)), timeout=1):
-                    return True
-            except OSError:
-                return False
-
-        wait_for(_up, 30, "the throwaway broker never listened")
-        time.sleep(0.5)
-        yield f"nats://127.0.0.1:{port}"
-    finally:
-        subprocess.run(
-            ["docker", "rm", "--force", container], capture_output=True, timeout=60
-        )
 
 
 def refusing_engine(root: Path) -> tuple[Path, Path]:

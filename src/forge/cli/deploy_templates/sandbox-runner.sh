@@ -591,17 +591,10 @@ only_the_line_endings() {
 # read-only. It holds no path and no value belonging to any machine, and no
 # project's anything: it is the factory's own launch declaration, four lines
 # long, and it is here so that the runner needs nothing of the outside world.
-# Beside the graph it serves one route of the factory's own (3 October 2026):
-# stop a build and say when everything it owns is gone (see
-# forge.subagents.runner_http). A cancel asks it, and so does the factory
-# before it lets a cancelled build's place go.
 RUNNER_GRAPH_CONFIG='{
     "dependencies": ["forge"],
     "graphs": {
         "autobuild_runner": "forge.subagents.autobuild_runner:graph"
-    },
-    "http": {
-        "app": "forge.subagents.runner_http:app"
     }
 }'
 RUNNER_CONFIG_FILE="${STATE_ROOT}/langgraph.json"

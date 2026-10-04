@@ -4234,8 +4234,6 @@ async def _run_one_build(state: AutobuildRunnerState) -> dict[str, Any]:
             )
         )
     feature_id = feature_id_raw.strip()
-    if _stop_asked_before_spawn(payload):
-        return _snapshot_update(_cancelled_before_spawn(payload, None))
 
     # The missing-repo decision lives entirely in the resolver (the runner's
     # tests patch _resolve_repo_path, so an early guard here would bypass the
@@ -4501,8 +4499,6 @@ async def _run_one_build(state: AutobuildRunnerState) -> dict[str, Any]:
         ",".join(sorted(launch_env)),
     )
 
-    if _stop_asked_before_spawn(payload):
-        return _snapshot_update(_cancelled_before_spawn(payload, worktree_path))
     try:
         proc = await asyncio.create_subprocess_exec(
             *argv,
@@ -4533,12 +4529,12 @@ async def _run_one_build(state: AutobuildRunnerState) -> dict[str, Any]:
 
     # WHAT THIS BUILD OWNS (3 October 2026). The child is recorded as the root
     # of the build's processes, under the build's id, so a stop — this node's
-    # own on cancel, timeout or wedge, or the runner's stop route — reaches
+    # own on cancel, timeout or wedge, or a relaunch of the same build — reaches
     # its whole tree and everything carrying its owner marker, not one pid.
     owned_build = build_processes.register(receipt_build_id, proc.pid)
     if owned_build.stop_requested:
-        # Asked to stop while the child was being spawned: stop it now; the
-        # build finishes CANCELLED below once everything it owns is gone.
+        # Superseded by a relaunch while the child was being spawned: stop it
+        # now; it finishes CANCELLED below once everything it owns is gone.
         await _stop_owned_once(owned_build, proc)
 
     stage_complete_count = 0
@@ -4786,7 +4782,7 @@ async def _run_one_build(state: AutobuildRunnerState) -> dict[str, Any]:
         # never has to. Never raises (see build_monitor.clear_in_flight).
         build_monitor.clear_in_flight(in_flight_path)
 
-    # A STOP ASKED FOR FROM OUTSIDE, or the monitor's own kill, ends here only
+    # A STOP BY A RELAUNCH OF THIS BUILD, or the monitor's own kill, ends here only
     # once every process the build owns is confirmed gone — the job slot this
     # run holds is the runner's local fence (3 October 2026).
     stop_requested = owned_build.stop_requested
@@ -4797,9 +4793,9 @@ async def _run_one_build(state: AutobuildRunnerState) -> dict[str, Any]:
         if interrupted:
             raise asyncio.CancelledError()
     if stop_requested and not timed_out:
-        # The runner's stop route asked for this build to stop (a cancel).
-        # It finishes CANCELLED through the normal terminal path; the worktree
-        # and receipts are kept, as for every build that did not succeed.
+        # A relaunch of this build stopped this run (see
+        # _stop_an_earlier_run_of). It finishes CANCELLED on its own thread;
+        # the worktree and receipts are kept.
         logger.warning(
             "autobuild_runner: build stopped on request feature_id=%s "
             "build_id=%s — every process it owned is confirmed gone; "
@@ -5047,8 +5043,7 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
     """The ``running_wave`` node: :func:`_running_wave_body`, then forget the run.
 
     Whatever way the body ends — a terminal, a cancellation, an unexpected
-    error — this runner stops keeping the build's process record and any
-    stop asked for it before its child existed.
+    error — this runner stops keeping the build's process record.
     """
     payload = _extract_launch_payload(list(state.get("messages", [])))
     build_id = str(payload.get("build_id") or "")
@@ -5070,12 +5065,11 @@ async def _stop_an_earlier_run_of(payload: Mapping[str, Any], build_id: str) -> 
     original run of the same build — the coordinator restarted, the runner
     did not. Two runs of one build would share its worktree and its owner
     marker. So the original is stopped (everything it owns, fixtures too,
-    confirmed gone) and this run waits until it has ended. The factory itself
-    stops the original before it relaunches a recovered build and clears the
-    original's identity, so it watches the relaunch, never the original; this
-    guard is the runner's own backstop. The original ends CANCELLED on its
-    own thread. Its worktree is kept, moved aside, so the relaunch
-    can lay down its own (see :func:`_move_aside_superseded_worktree`).
+    confirmed gone) and this run waits until it has ended. The factory
+    clears the original's identity before it relaunches a recovered build, so
+    it watches the relaunch, never the original. The original ends CANCELLED
+    on its own thread. Its worktree is kept, moved aside, so the relaunch can
+    lay down its own (see :func:`_move_aside_superseded_worktree`).
     """
     old = build_processes.lookup(build_id)
     if old is None:
@@ -5089,7 +5083,7 @@ async def _stop_an_earlier_run_of(payload: Mapping[str, Any], build_id: str) -> 
         "is still running in this runner; stopping the earlier run first",
         build_id,
     )
-    await build_processes.stop_build(build_id, purpose="relaunch")
+    await build_processes.stop_run(old)
     loop = asyncio.get_running_loop()
     last_report = loop.time()
     while build_processes.lookup(build_id) is old:
@@ -5146,29 +5140,6 @@ async def _move_aside_superseded_worktree(
     )
 
 
-def _stop_asked_before_spawn(payload: Mapping[str, Any]) -> bool:
-    build_id = str(payload.get("build_id") or "")
-    return bool(build_id) and build_processes.stop_pending(build_id)
-
-
-def _cancelled_before_spawn(
-    payload: Mapping[str, Any], worktree_path: Path | None
-) -> dict[str, Any]:
-    """The CANCELLED snapshot of a build stopped before GuardKit was spawned."""
-    logger.warning(
-        "autobuild_runner: build %s was asked to stop before its GuardKit "
-        "child was spawned; finishing cancelled without spawning it",
-        payload.get("build_id"),
-    )
-    cancelled = _build_snapshot(payload, lifecycle="cancelled")
-    cancelled["error_message"] = (
-        "the build was stopped on request before it started any process"
-    )
-    if worktree_path is not None:
-        cancelled["worktree_path"] = str(worktree_path)
-    return cancelled
-
-
 #: How often a stop that cannot yet confirm every owned process gone says so.
 OWNED_STOP_REPORT_SECONDS: float = 30.0
 
@@ -5201,10 +5172,10 @@ async def _stop_owned_until_gone(
     Processes AND this build's labelled fixture containers: keeps reading,
     SIGKILLing and removing, saying what remains every
     :data:`OWNED_STOP_REPORT_SECONDS`, for as long as it takes — and an engine
-    that cannot be asked counts as "not yet gone". Releasing the build's place
-    while something it started can still write, serve or call the model is the
-    fault this exists to close, whatever the build's terminal class. Never
-    raises (a cancel is the caller's).
+    that cannot be asked counts as "not yet gone". The run's job slot is not
+    given back while something the build started can still write, serve or
+    call the model, whatever the build's terminal class. Never raises (a
+    cancel is the caller's).
     """
     first = True
     loop = asyncio.get_running_loop()
@@ -5241,7 +5212,7 @@ async def _stop_owned_until_gone(
             last_report = loop.time()
             logger.error(
                 "autobuild_runner: build %s (feature_id=%s) is not yet "
-                "confirmed stopped; the build's place stays held until it is: %s",
+                "confirmed stopped; its job slot stays held until it is: %s",
                 owned.build_id,
                 feature_id,
                 remaining,
