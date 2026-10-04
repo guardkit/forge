@@ -3348,3 +3348,307 @@ async def test_a_refused_model_beside_other_facts_is_partly_read_on_coach_and_ca
     assert plan and plan[-1]["repository_unavailable"].startswith(
         "The machine could read the repository only in part while writing this"
     )
+
+
+# ---------------------------------------------------------------------------
+# The spec example check (4 October 2026): worked examples about something the
+# request does not mention, by the words the PROJECT declares in its own
+# .guardkit/config.yaml. It shares the assumption review's one rewrite, and
+# the card names what was removed and what was kept.
+# ---------------------------------------------------------------------------
+
+_PADDED_TITLE = "A POST request to the version endpoint is rejected"
+
+_PADDED_FEATURE = FEATURE_TEXT + (
+    "\n"
+    "  @negative\n"
+    f"  Scenario: {_PADDED_TITLE}\n"
+    "    Given the service is running\n"
+    "    When a POST request is sent to the version endpoint\n"
+    "    Then the request is refused\n"
+)
+_PADDED_DIGEST = DIGEST_YAML.replace(
+    "assumptions:\n",
+    f"- title: {_PADDED_TITLE}\n"
+    "  tags:\n"
+    "  - '@negative'\n"
+    "  sentence: Sending the version endpoint a POST is refused.\n"
+    "assumptions:\n",
+)
+#: The writer kept the example and quoted the request in its # Why: line.
+_PADDED_KEPT_FEATURE = _PADDED_FEATURE.replace(
+    f"  @negative\n  Scenario: {_PADDED_TITLE}\n",
+    f'  # Why: the request says "a GET /version endpoint"\n  @negative\n  Scenario: {_PADDED_TITLE}\n',
+)
+
+_SPEC_EXAMPLES_CONFIG = (
+    "memory:\n"
+    "  project: scratch_project\n"
+    "spec_examples:\n"
+    "  not_asked_for:\n"
+    "    - name: another request method\n"
+    '      example_words: ["POST request*", "non-GET", "405"]\n'
+    '      request_words: ["POST", "other methods"]\n'
+)
+
+_EXAMPLE_NOTE = (
+    "These worked examples look like things the request does not mention:\n"
+    f'- "{_PADDED_TITLE}" (another request method)\n'
+    "\n"
+    "Remove each one unless the request needs it. If you keep one, quote the words of "
+    "the request that need it in its # Why: line. Remove any assumption written only "
+    "for an example you remove. Do not add other examples of the same kind. Keep every "
+    "other worked example exactly as it is."
+)
+_REMOVED_LINE = (
+    f'Removed as not asked for: "{_PADDED_TITLE}". If one of them was needed, send a note.'
+)
+_KEPT_LINE = (
+    f'Not asked for, but kept: "{_PADDED_TITLE}" (another request method). If you '
+    "approve, it will be built; to drop it, send a note."
+)
+
+
+class _DeclaringRepository(_EmptyRepository):
+    """A readable repository whose only file the planner reads is the
+    project's own declaration."""
+
+    def __init__(self, config: str) -> None:
+        self._config = config
+
+    def read_text(self, path: str) -> str | None:
+        return self._config if path == ".guardkit/config.yaml" else None
+
+
+def _declaring_git(config: str = _SPEC_EXAMPLES_CONFIG) -> RecordingGitRunner:
+    git = RecordingGitRunner()
+    git.reader = _DeclaringRepository(config)
+    return git
+
+
+def _padded() -> Any:
+    return _spec_reply(feature=_PADDED_FEATURE, digest=_PADDED_DIGEST)
+
+
+@pytest.mark.asyncio
+async def test_a_padded_example_goes_back_once_and_the_card_names_what_was_removed(
+    store: SqlitePlanningRunStore,
+) -> None:
+    _queue(store)
+    h = _make_driver(
+        store,
+        subscriber_factory=SharedScriptFactory([_answer("approve")]),
+        spec_replies=[_padded(), _spec_reply()],
+        git=_declaring_git(),
+    )
+    await h.driver.drive(CID)
+
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+    dispatches = h.ctx["dispatches"]
+    assert len(dispatches) == 2
+    assert dispatches[1]["validate_feedback"] == _EXAMPLE_NOTE
+    superseded = [d["spec_draft"] for status, d in _events(store, _DRAFT_STAGE) if status == "superseded"]
+    assert superseded[0]["author"] == "planning-driver (spec example check)"
+    assert superseded[0]["flagged_examples"] == [_PADDED_TITLE]
+    assert superseded[0]["flagged_assumptions"] == []
+    cards = _digest_cards(h)
+    assert len(cards) == 1
+    card = cards[0].payload["details"]["summary"]
+    assert card["what_happened"] == f"{_ROUND_ONE_TEXT} {_REMOVED_LINE}"
+    assert card["worked_examples"] == FEATURE_TEXT
+    drafted = [d["spec_draft"] for status, d in _events(store, _DRAFT_STAGE) if status == "drafted"]
+    receipt = drafted[-1]["example_review"]
+    assert receipt["checked"] is True
+    assert receipt["first"]["flagged"] == [{"title": _PADDED_TITLE, "kinds": ["another request method"]}]
+    assert receipt["final"]["flagged"] == []
+    assert receipt["card_lines"] == [_REMOVED_LINE]
+
+
+@pytest.mark.asyncio
+async def test_a_padded_example_the_writer_keeps_with_a_reason_is_named_and_the_card_still_goes(
+    store: SqlitePlanningRunStore,
+) -> None:
+    _queue(store)
+    kept = _spec_reply(feature=_PADDED_KEPT_FEATURE, digest=_PADDED_DIGEST)
+    h = _make_driver(
+        store,
+        subscriber_factory=SharedScriptFactory([_answer("approve")]),
+        spec_replies=[_padded(), kept],
+        git=_declaring_git(),
+    )
+    await h.driver.drive(CID)
+
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+    assert len(h.ctx["dispatches"]) == 2
+    cards = _digest_cards(h)
+    assert len(cards) == 1
+    card = cards[0].payload["details"]["summary"]
+    assert card["what_happened"] == f"{_ROUND_ONE_TEXT} {_KEPT_LINE}"
+    assert card["worked_examples"] == _PADDED_KEPT_FEATURE
+
+
+@pytest.mark.asyncio
+async def test_assumptions_and_examples_share_one_rewrite_not_two(
+    store: SqlitePlanningRunStore,
+) -> None:
+    _queue(store)
+    both = _spec_reply(
+        feature=_PADDED_FEATURE,
+        digest=_PADDED_DIGEST.replace(
+            "  basis: common practice; the input did not say\n",
+            "  basis: common practice; the input did not say\n"
+            "- id: ASSUM-002\n"
+            "  text: The endpoint requires authentication\n"
+            "  basis: Not stated in input; common security practice for analytics endpoints\n",
+        ),
+        assumptions=_INVENTING_ASSUMPTIONS,
+    )
+    h = _make_driver(
+        store,
+        subscriber_factory=SharedScriptFactory([_answer("approve")]),
+        spec_replies=[both, _spec_reply()],
+        git=_declaring_git(),
+    )
+    await h.driver.drive(CID)
+
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+    dispatches = h.ctx["dispatches"]
+    assert len(dispatches) == 2, "one shared machine round, never two"
+    note = dispatches[1]["validate_feedback"]
+    assert note.startswith("The reviewer found 1 assumption(s) that add something the request did not ask for")
+    assert note.endswith(_EXAMPLE_NOTE)
+    superseded = [d["spec_draft"] for status, d in _events(store, _DRAFT_STAGE) if status == "superseded"]
+    assert len(superseded) == 1
+    assert superseded[0]["author"] == "planning-driver (assumption review)"
+    assert superseded[0]["flagged_assumptions"] == ["ASSUM-002"]
+    assert superseded[0]["flagged_examples"] == [_PADDED_TITLE]
+    what_happened = _digest_cards(h)[0].payload["details"]["summary"]["what_happened"]
+    assert what_happened == (
+        f"{_ROUND_ONE_TEXT} The machine's reviewer removed 1 assumption(s) the request "
+        f"did not ask for (authentication). {_REMOVED_LINE}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_checker_refused_rewrite_opens_on_the_first_draft_and_names_what_was_kept(
+    store: SqlitePlanningRunStore,
+) -> None:
+    _queue(store)
+    h = _make_driver(
+        store,
+        subscriber_factory=SharedScriptFactory([_answer("approve")]),
+        spec_replies=[_padded(), _not_ok_reply("'feedback_resolved' must be met")],
+        git=_declaring_git(),
+    )
+    await h.driver.drive(CID)
+
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+    assert len(h.ctx["dispatches"]) == 2
+    card = _digest_cards(h)[0].payload["details"]["summary"]
+    assert card["worked_examples"] == _PADDED_FEATURE
+    assert card["what_happened"] == f"{_ROUND_ONE_TEXT} {_KEPT_LINE}"
+    assert not [m for _, m, lvl in h.ctx["notifications"] if lvl == "error"]
+
+
+@pytest.mark.asyncio
+async def test_an_example_the_owner_asked_for_in_a_note_is_never_sent_back(
+    store: SqlitePlanningRunStore,
+) -> None:
+    _queue(store)
+    h = _make_driver(
+        store,
+        subscriber_factory=SharedScriptFactory(
+            [_answer("reject", notes="Also show that a POST is refused."), _answer("approve", attempt=1)]
+        ),
+        spec_replies=[_spec_reply(), _padded()],
+        git=_declaring_git(),
+    )
+    await h.driver.drive(CID)
+
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+    dispatches = h.ctx["dispatches"]
+    assert len(dispatches) == 2, "the owner's round only; no machine round"
+    assert dispatches[1]["validate_feedback"] == "Also show that a POST is refused."
+    cards = _digest_cards(h)
+    assert len(cards) == 2
+    second = cards[1].payload["details"]["summary"]
+    assert second["worked_examples"] == _PADDED_FEATURE
+    assert "not asked for" not in second["what_happened"].lower()
+
+
+@pytest.mark.asyncio
+async def test_no_declared_list_leaves_the_card_exactly_as_today(
+    store: SqlitePlanningRunStore,
+) -> None:
+    """The same padded spec, from a project that declares nothing: one
+    dispatch, the card word for word as before, and the record says why
+    there was no check."""
+    _queue(store)
+    h = _make_driver(
+        store,
+        subscriber_factory=SharedScriptFactory([_answer("approve")]),
+        spec_replies=[_padded()],
+    )
+    await h.driver.drive(CID)
+
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+    assert len(h.ctx["dispatches"]) == 1
+    card = _digest_cards(h)[0].payload["details"]["summary"]
+    assert card["what_happened"] == _ROUND_ONE_TEXT
+    drafted = [d["spec_draft"] for status, d in _events(store, _DRAFT_STAGE) if status == "drafted"]
+    assert [status for status, _ in _events(store, _DRAFT_STAGE)] == ["drafted"]
+    receipt = drafted[-1]["example_review"]
+    assert receipt["checked"] is False
+    assert receipt["unreadable"] is None
+    assert receipt["not_checked"] == "`.guardkit/config.yaml` was not read (it was not served)"
+
+
+@pytest.mark.asyncio
+async def test_a_declared_list_that_cannot_be_read_is_said_on_the_card(
+    store: SqlitePlanningRunStore,
+) -> None:
+    _queue(store)
+    h = _make_driver(
+        store,
+        subscriber_factory=SharedScriptFactory([_answer("approve")]),
+        spec_replies=[_padded()],
+        git=_declaring_git("spec_examples:\n  not_asked_for: outage\n"),
+    )
+    await h.driver.drive(CID)
+
+    assert len(h.ctx["dispatches"]) == 1
+    card = _digest_cards(h)[0].payload["details"]["summary"]
+    assert card["what_happened"] == (
+        f"{_ROUND_ONE_TEXT} The project's list of examples it does not want unless "
+        "asked for could not be read (has no `not_asked_for` list), so the worked "
+        "examples were not checked against it."
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_sandboxed_projects_list_is_read_through_its_helper(
+    store: SqlitePlanningRunStore, tmp_path: Path
+) -> None:
+    """The list is read where the builds read the repository: the helper's
+    read-only route, over a real socket, on the factory's own clone."""
+    from forge.planning.sidecar_git_runner import SidecarCodeReader
+
+    url, srv = _helper_over_files(tmp_path, {".guardkit/config.yaml": _SPEC_EXAMPLES_CONFIG})
+    try:
+        git = RecordingGitRunner()
+        git.reader = SidecarCodeReader(url, repo=TARGET_REPO)
+        _queue(store)
+        h = _make_driver(
+            store,
+            subscriber_factory=SharedScriptFactory([_answer("approve")]),
+            spec_replies=[_padded(), _spec_reply()],
+            git=git,
+        )
+        await h.driver.drive(CID)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+    assert len(h.ctx["dispatches"]) == 2
+    assert h.ctx["dispatches"][1]["validate_feedback"] == _EXAMPLE_NOTE
+    assert _digest_cards(h)[0].payload["details"]["summary"]["what_happened"].endswith(_REMOVED_LINE)
