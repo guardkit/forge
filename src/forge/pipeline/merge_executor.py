@@ -1951,7 +1951,7 @@ async def execute_merge_deploy(
         ``sha``) — or ``(None, why not)``, and the caller then runs nothing
         rather than fall back to a working copy nobody keeps up to date.
         """
-        nonlocal tree_path, tree_commit
+        nonlocal tree_path, tree_commit, a_leg_did_not_complete
         if not scripts_from_the_commit:
             return None, None
         wanted = str(sha or "").strip()
@@ -1966,6 +1966,9 @@ async def execute_merge_deploy(
             await git.ensure_candidate_trees_excluded()
             laid_out = await git.materialise_candidate_tree(feature_id, wanted)
         except CandidateTreeError as exc:
+            # A lay-out whose answer was lost comes back as this error too, and
+            # it may still be writing the tree in the sandbox: keep the hold.
+            a_leg_did_not_complete = True
             return None, (
                 f"the tree of {wanted[:10]} could not be laid out to run the "
                 f"project's own steps from ({exc})"
@@ -5088,7 +5091,9 @@ async def execute_merge_deploy(
             )
         _write_receipt("autobuild_worktree_cleanup.json", retired)
         if retired.get("status") != "removed":
-            a_leg_did_not_complete = True
+            # Gone already is done; anything else may not have finished.
+            if retired.get("status") != "already-gone":
+                a_leg_did_not_complete = True
             logger.warning(
                 "merge-executor: retained autobuild worktree for %s was kept: %s",
                 build_id,
