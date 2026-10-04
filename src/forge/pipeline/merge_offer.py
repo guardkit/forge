@@ -44,6 +44,7 @@ import asyncio
 import inspect
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -62,6 +63,8 @@ from forge.receipts import receipts_root
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "AFTER_DEPLOY_CHECK_STAGE",
+    "AfterDeployCheckSkip",
     "CHECK_COULD_NOT_RUN",
     "CHECK_RAN",
     "CODE_CHECKS_FOR_ANOTHER_FEATURE",
@@ -76,16 +79,27 @@ __all__ = [
     "MERGE_OFFER_STAGE_LABEL",
     "MERGE_OFFER_TARGET_IDENTIFIER",
     "MergeOfferService",
+    "NO_AFTER_DEPLOY_CHECK_SENTENCE",
     "NO_CHECK_DECLARED",
     "NO_NOT_CHECKED_LIST",
+    "SKIP_NO_ENDPOINT_NAMED",
+    "SKIP_NO_PASS_BARS",
+    "SKIP_NO_REGISTRY",
+    "SKIP_NO_TEMPLATE",
+    "SKIP_PLACEHOLDER_IN_ADDRESS",
+    "SKIP_UNSUPPORTED_METHOD",
     "WhatWasChecked",
+    "after_deploy_check_skip_for",
     "approval_subject_for",
     "branch_to_merge",
+    "card_line_about_the_after_deploy_check",
     "default_merge_branch",
     "git_rev_parse_main",
     "merge_request_id",
+    "placeholders_in",
     "read_baseline_failing",
     "read_what_was_checked",
+    "read_after_deploy_check_skip",
     "request_behind_the_build",
     "run_the_scope_pass",
     "what_was_checked",
@@ -1123,6 +1137,264 @@ def _read_request_text(pool: Any, correlation_id: str) -> str | None:
     return text or None
 
 
+# ---------------------------------------------------------------------------
+# When planning registered no after-deploy check (4 October 2026)
+# ---------------------------------------------------------------------------
+#
+# Planning tries to register an after-deploy check for each feature on its
+# own: it reads the address the spec named, fills the project's own check
+# template and adds it to the project's own check list. When it cannot, it
+# records why on the planning run and carries on, which is right; but nothing
+# ever read that record, so a merge card for a PATCH or DELETE feature looked
+# exactly like one for a feature that had its check. Both merge cards now
+# carry one sentence when that happened. It says only what planning did, never
+# that no other check exists: a project may supply its own (a check of its own
+# under qa/gates/ listed in qa/gates/registry.yaml, or Hurl files under
+# qa/twins/).
+
+#: The planning step that registers (or skips) the after-deploy check.
+AFTER_DEPLOY_CHECK_STAGE: str = "qa-feature-gate"
+
+#: Why planning registered no after-deploy check, as recorded on the skip.
+SKIP_UNSUPPORTED_METHOD: str = "unsupported_method"
+SKIP_PLACEHOLDER_IN_ADDRESS: str = "placeholder_in_address"
+SKIP_NO_ENDPOINT_NAMED: str = "no_endpoint_named"
+SKIP_NO_PASS_BARS: str = "no_pass_bars"
+SKIP_NO_TEMPLATE: str = "no_template"
+SKIP_NO_REGISTRY: str = "no_registry"
+
+#: The one sentence both merge cards carry, with the reason in plain words.
+NO_AFTER_DEPLOY_CHECK_SENTENCE: str = (
+    "Planning did not register an after-deploy check for this feature "
+    "automatically (reason: {reason})."
+)
+
+#: What a record written before reason codes existed said when the spec
+#: named no GET address, and the plain words for it.
+_OLD_NO_ADDRESS_TEXT: str = "no derivable endpoint"
+_OLD_NO_ADDRESS_WORDS: str = "no address it could check was found"
+
+
+def placeholders_in(path: str) -> list[str]:
+    """The ``{name}`` placeholders in an address, in order, as written.
+
+    An address with a placeholder cannot be checked as it stands: the check
+    sends it exactly as written, and the server sees a literal ``{user_id}``.
+    """
+    return [f"{{{name}}}" for name in re.findall(r"\{([^{}/]*)", str(path or ""))]
+
+
+def _plain_reason(details: Mapping[str, Any]) -> str:
+    """The recorded reason, in the words the card uses."""
+    code = str(details.get("reason_code") or "").strip()
+    address = details.get("address")
+    method = path = ""
+    if isinstance(address, Mapping):
+        method = str(address.get("method") or "").strip().upper()
+        path = str(address.get("path") or "").strip()
+    if code == SKIP_UNSUPPORTED_METHOD:
+        if method:
+            return f"only GET addresses are supported, and this one is {method}"
+        return "only GET addresses are supported"
+    if code == SKIP_PLACEHOLDER_IN_ADDRESS:
+        names = placeholders_in(path)
+        if len(names) == 1:
+            return f"the address has a placeholder, {names[0]}"
+        if names:
+            return (
+                "the address has placeholders, "
+                f"{', '.join(names[:-1])} and {names[-1]}"
+            )
+        return "the address has a placeholder"
+    if code == SKIP_NO_ENDPOINT_NAMED:
+        return "the spec named no address"
+    if code == SKIP_NO_PASS_BARS:
+        return "the plan registered no pass bars"
+    if code == SKIP_NO_TEMPLATE:
+        return "the project has no gate template"
+    if code == SKIP_NO_REGISTRY:
+        return "the project has no gate registry"
+    # A record from before the reason codes, or a code this reader does not
+    # know: the one old wording that is not plain gets plain words, and any
+    # other text is passed on exactly as it was recorded.
+    text = str(details.get("reason") or "").strip()
+    if text.startswith(_OLD_NO_ADDRESS_TEXT):
+        return _OLD_NO_ADDRESS_WORDS
+    return text or "none was recorded"
+
+
+@dataclass(frozen=True)
+class AfterDeployCheckSkip:
+    """Planning's record that it registered no after-deploy check.
+
+    ``reason_code``, ``feature_id`` and ``address`` are ``None`` on records
+    written before 4 October 2026, which carry only the free-text reason.
+    """
+
+    planning_run: str
+    reason: str
+    reason_code: str | None = None
+    feature_id: str | None = None
+    address: Mapping[str, Any] | None = None
+
+    @property
+    def sentence(self) -> str:
+        return NO_AFTER_DEPLOY_CHECK_SENTENCE.format(reason=self.reason)
+
+
+def _planning_run_behind(pool: Any, row: Any) -> str | None:
+    """The planning run a build came from, or ``None`` (and why, logged).
+
+    The same join :func:`request_behind_the_build` makes: a routine build's
+    ``correlation_id`` is the planning run's own, and a repair build's
+    ``fix-build-<parent build id>`` goes one hop to the parent's row.
+    """
+    from forge.pipeline.fix_row_producer import source_build_id_from_correlation_id
+
+    build_id = str(getattr(row, "build_id", "") or "")
+    correlation_id = str(getattr(row, "correlation_id", "") or "").strip()
+    if not correlation_id:
+        logger.info(
+            "the after-deploy check: %s carries no correlation id, so no "
+            "planning record was read and the merge card says nothing about it",
+            build_id,
+        )
+        return None
+    parent_build = source_build_id_from_correlation_id(correlation_id)
+    if not parent_build:
+        return correlation_id
+    parent_row = pool.get_build_row(parent_build)
+    parent_correlation = str(
+        getattr(parent_row, "correlation_id", "") or ""
+    ).strip() if parent_row is not None else ""
+    if not parent_correlation:
+        logger.info(
+            "the after-deploy check: the build repair %s belongs to (%s) is "
+            "not in the record or carries no correlation id, so no planning "
+            "record was read and the merge card says nothing about it",
+            build_id,
+            parent_build,
+        )
+        return None
+    return parent_correlation
+
+
+def _read_after_deploy_check_event(pool: Any, correlation_id: str) -> str | None:
+    """The latest ``qa-feature-gate`` record's details for one planning run."""
+    from forge.adapters.sqlite.connect import read_only_connect
+
+    statement = (
+        "SELECT details_json FROM planning_run_events "
+        "WHERE correlation_id = ? AND stage_label = ? AND status = 'approved' "
+        "ORDER BY id DESC LIMIT 1"
+    )
+    params = (correlation_id, AFTER_DEPLOY_CHECK_STAGE)
+    db_path = getattr(pool, "db_path", None)
+    if db_path is None or str(db_path) in ("", ":memory:"):
+        found = pool.connection.execute(statement, params).fetchone()
+    else:
+        cx = read_only_connect(db_path)
+        try:
+            found = cx.execute(statement, params).fetchone()
+        finally:
+            cx.close()
+    if found is None:
+        return None
+    raw = found[0] if not isinstance(found, dict) else found.get("details_json")
+    return str(raw) if raw else ""
+
+
+def read_after_deploy_check_skip(pool: Any, row: Any) -> AfterDeployCheckSkip | None:
+    """Planning's record that it registered no after-deploy check, or ``None``.
+
+    ``None`` when a check was registered, when there is no planning record
+    to read, and when the record cannot be read at all; in each of the last
+    two the reason is logged and the merge card is exactly what it was. The
+    one reader both merge cards use. Never raises.
+    """
+    build_id = str(getattr(row, "build_id", "") or "")
+    try:
+        correlation_id = _planning_run_behind(pool, row)
+        if correlation_id is None:
+            return None
+        raw = _read_after_deploy_check_event(pool, correlation_id)
+        if raw is None:
+            logger.info(
+                "the after-deploy check: planning run %s (behind %s) has no "
+                "record of the step, so the merge card says nothing about it",
+                correlation_id,
+                build_id,
+            )
+            return None
+        details = json.loads(raw) if raw else {}
+        if not isinstance(details, Mapping) or details.get("skipped") is not True:
+            return None
+        address = details.get("address")
+        return AfterDeployCheckSkip(
+            planning_run=correlation_id,
+            reason=_plain_reason(details),
+            reason_code=str(details.get("reason_code") or "") or None,
+            feature_id=str(details.get("feature_id") or "") or None,
+            address=dict(address) if isinstance(address, Mapping) else None,
+        )
+    except Exception as exc:  # noqa: BLE001 — a reader never stops a card
+        logger.warning(
+            "the after-deploy check: planning's record for %s could not be "
+            "read (%s: %s) — the merge card says nothing about it",
+            build_id,
+            type(exc).__name__,
+            exc,
+        )
+        return None
+
+
+def after_deploy_check_skip_for(
+    reader: Callable[[Any, Any], AfterDeployCheckSkip | None],
+    pool: Any,
+    build_id: str,
+    row: Any = None,
+) -> AfterDeployCheckSkip | None:
+    """Ask ``reader`` about one build; any failure is logged and gives ``None``.
+
+    Both merge cards call this, so a reader that falls over (or a build row
+    that cannot be read) costs either card nothing but the one sentence.
+    """
+    try:
+        if row is None:
+            row = pool.get_build_row(build_id)
+        if row is None:
+            logger.info(
+                "the after-deploy check: %s has no build row, so no planning "
+                "record was read and the merge card says nothing about it",
+                build_id,
+            )
+            return None
+        skip = reader(pool, row)
+    except Exception as exc:  # noqa: BLE001 — a reader never stops a card
+        logger.warning(
+            "the after-deploy check: planning's record for %s could not be "
+            "read (%s: %s) — the merge card says nothing about it",
+            build_id,
+            type(exc).__name__,
+            exc,
+        )
+        return None
+    if skip is not None:
+        logger.info(
+            "the after-deploy check: planning run %s registered none for %s "
+            "(reason code %s) — the merge card says so",
+            skip.planning_run,
+            build_id,
+            skip.reason_code or "not recorded",
+        )
+    return skip
+
+
+def card_line_about_the_after_deploy_check(skip: AfterDeployCheckSkip | None) -> str:
+    """The sentence both merge cards carry, or ``""`` (the card unchanged)."""
+    return skip.sentence if skip is not None else ""
+
+
 def run_the_scope_pass(
     *,
     config: Any,
@@ -1268,6 +1540,10 @@ class MergeOfferService:
         scope_pass: Injectable ``(config, pool, build_id, feature_id, row) ->
             report | None`` seam; defaults to :func:`run_the_scope_pass`. It
             runs git, so it is called off the event loop.
+        after_deploy_check_reader: Injectable ``(pool, row) ->
+            AfterDeployCheckSkip | None`` seam; defaults to
+            :func:`read_after_deploy_check_skip`. Anything it does, including
+            raising, costs the card nothing but that one sentence.
         clock: Wall-clock seam for the stage row / paused_at stamps.
     """
 
@@ -1284,6 +1560,9 @@ class MergeOfferService:
         scope_pass: Callable[..., Any] = run_the_scope_pass,
         git_surface: Callable[[str, Path], Any | None] | None = None,
         clock: Callable[[], datetime] = _utcnow,
+        after_deploy_check_reader: Callable[
+            [Any, Any], AfterDeployCheckSkip | None
+        ] = read_after_deploy_check_skip,
     ) -> None:
         self._config = config
         self._pool = pool
@@ -1295,6 +1574,7 @@ class MergeOfferService:
         self._scope_pass = scope_pass
         self._git_surface = git_surface
         self._clock = clock
+        self._after_deploy_check_reader = after_deploy_check_reader
 
     async def maybe_offer(self, event: Any) -> None:
         """The wireup's fire-and-forget hook — never raises past itself."""
@@ -1353,6 +1633,11 @@ class MergeOfferService:
         # stop "nothing was reported" reading like "nothing was wrong".
         checked = await self._read_what_was_checked(event)
 
+        # WHEN PLANNING REGISTERED NO AFTER-DEPLOY CHECK (4 October 2026).
+        # One sentence, read from planning's own record of the step, and
+        # nothing at all when a check was registered or nothing can be read.
+        no_check = self._read_the_after_deploy_check(event)
+
         def _words(branch: str, merge_branch: str | None) -> str:
             from forge.cli._serve_gate_activation import card_line_about_scope
 
@@ -1384,6 +1669,9 @@ class MergeOfferService:
             # reading a paragraph.
             lines = [" ".join(opening)]
             lines.extend(line for line in checked.lines if line)
+            about_the_check = card_line_about_the_after_deploy_check(no_check)
+            if about_the_check:
+                lines.append(about_the_check)
             lines.append(
                 "Approve = merge into main, deploy to the sandbox and run the "
                 "checks; the branch is kept either way. Reject = nothing "
@@ -1467,6 +1755,18 @@ class MergeOfferService:
             )
         return what_was_checked(
             record, code_checks, why_not, code_checks_for_another
+        )
+
+    def _read_the_after_deploy_check(
+        self, event: Any
+    ) -> AfterDeployCheckSkip | None:
+        """Planning's record that it registered no after-deploy check, or None.
+
+        Never raises: a build row or record that cannot be read is logged and
+        the card is exactly the card it was before this sentence existed.
+        """
+        return after_deploy_check_skip_for(
+            self._after_deploy_check_reader, self._pool, event.build_id
         )
 
     async def _take_the_scope_pass(self, event: Any) -> Any | None:

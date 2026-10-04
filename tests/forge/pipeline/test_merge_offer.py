@@ -753,3 +753,307 @@ class TestRetainedCandidateIdentity:
         ] == str(inner)
         assert pool.get_build_row(build_id).worktree_path == str(outer)
         assert outer.is_dir() and inner.is_dir()
+
+
+# ---------------------------------------------------------------------------
+# When planning registered no after-deploy check (4 October 2026)
+#
+# Planning records on its own run when it could not register a feature's
+# after-deploy check (a PATCH address, a placeholder in the address, no
+# address named, and so on). The routine card now says so in one sentence,
+# read from that record; when a check was registered, or nothing can be
+# read, the card is byte for byte what it was.
+# ---------------------------------------------------------------------------
+
+from forge.pipeline.merge_offer import (  # noqa: E402
+    NO_AFTER_DEPLOY_CHECK_SENTENCE,
+    read_after_deploy_check_skip,
+    what_was_checked,
+)
+
+_APPROVE_LINE = (
+    "Approve = merge into main, deploy to the sandbox and run the checks; "
+    "the branch is kept either way. Reject = nothing changes."
+)
+
+_PATCH_SKIP = {
+    "skipped": True,
+    "reason": "the spec names PATCH /users/{user_id}/deactivate; only a GET "
+    "address can be checked automatically — no gate registered",
+    "reason_code": "unsupported_method",
+    "feature_id": FEATURE_ID,
+    "address": {"method": "PATCH", "path": "/users/{user_id}/deactivate"},
+}
+
+_PATCH_SENTENCE = (
+    "Planning did not register an after-deploy check for this feature "
+    "automatically (reason: only GET addresses are supported, and this one "
+    "is PATCH)."
+)
+
+
+def _record_planning_run(pool: SqliteLifecyclePersistence, correlation_id: str) -> None:
+    pool.connection.execute(
+        "INSERT INTO planning_runs (correlation_id, state, originating_user, "
+        "expected_approver, request_text, target_repo, triggered_by, "
+        "originating_adapter, parent_request_id, queued_at) VALUES "
+        "(?, 'BUILD_QUEUED', 'rich', 'rich', 'a sentence', ?, 'jarvis', "
+        "'slack', NULL, '2026-10-04T00:00:00Z')",
+        (correlation_id, REPO),
+    )
+    pool.connection.commit()
+
+
+def _record_gate_step(
+    pool: SqliteLifecyclePersistence, correlation_id: str, details: dict[str, Any]
+) -> None:
+    pool.connection.execute(
+        "INSERT INTO planning_run_events (correlation_id, stage_label, status, "
+        "actor_identity, details_json, recorded_at) VALUES "
+        "(?, 'qa-feature-gate', 'approved', 'planning-driver', ?, "
+        "'2026-10-04T00:00:00Z')",
+        (correlation_id, json.dumps(details)),
+    )
+    pool.connection.commit()
+
+
+def _card_service(
+    config: ForgeConfig,
+    pool: SqliteLifecyclePersistence,
+    recorder: _Recorder,
+    **kwargs: Any,
+) -> MergeOfferService:
+    """The routine card's service with the scope pass and the finished-feature
+    reading pinned, so the only thing that can differ is this sentence."""
+
+    async def _git_head(_repo_root: Path) -> str | None:
+        return "mainsha1234"
+
+    return MergeOfferService(
+        config=config,
+        pool=pool,
+        pipeline_publisher=SimpleNamespace(
+            publish_build_paused=recorder.publish_build_paused
+        ),
+        raw_publish=recorder.raw_publish,
+        git_head=_git_head,
+        git_surface=lambda _repo, _root: _CandidatePins(),
+        finished_feature_reader=lambda *_a, **_k: (
+            None,
+            None,
+            "nothing was exported for this build",
+        ),
+        scope_pass=lambda **_k: None,
+        **kwargs,
+    )
+
+
+def _card_as_it_was() -> str:
+    """The routine card before this sentence existed, built from its parts."""
+    checked = what_was_checked(None, None, "nothing was exported for this build")
+    lines = [f"{FEATURE_ID} built — 5 of 5 tasks passed."]
+    lines.extend(line for line in checked.lines if line)
+    lines.append(_APPROVE_LINE)
+    return "\n".join(lines)
+
+
+async def _routine_card(config, pool, **kwargs: Any) -> str:
+    recorder = _Recorder()
+    await _card_service(config, pool, recorder, **kwargs).maybe_offer(_event())
+    paused = [payload for kind, payload in recorder.events if kind == "paused"]
+    assert len(paused) == 1
+    return paused[0].rationale
+
+
+class TestTheAfterDeployCheckSentenceOnTheRoutineCard:
+    @pytest.mark.asyncio
+    async def test_a_skip_puts_the_sentence_with_its_reason_on_the_card(
+        self, config, pool
+    ) -> None:
+        _insert_build(pool)
+        _record_planning_run(pool, CORRELATION)
+        _record_gate_step(pool, CORRELATION, _PATCH_SKIP)
+
+        words = await _routine_card(config, pool)
+
+        lines = words.split("\n")
+        assert lines[-2] == _PATCH_SENTENCE
+        assert lines[-1] == _APPROVE_LINE
+        # Only the sentence was added; every other line is as it was.
+        assert "\n".join(lines[:-2] + lines[-1:]) == _card_as_it_was()
+        # It says what planning did, never that no other check exists.
+        assert "no check" not in words.lower()
+
+    @pytest.mark.asyncio
+    async def test_a_registered_gate_leaves_the_card_byte_for_byte(
+        self, config, pool
+    ) -> None:
+        _insert_build(pool)
+        _record_planning_run(pool, CORRELATION)
+        _record_gate_step(
+            pool,
+            CORRELATION,
+            {
+                "feature_id": FEATURE_ID,
+                "gate_file": "qa/gates/active_count_gate.py",
+                "endpoint": {"method": "GET", "path": "/users/active-count"},
+            },
+        )
+
+        assert await _routine_card(config, pool) == _card_as_it_was()
+
+    @pytest.mark.asyncio
+    async def test_an_older_free_text_record_still_gives_a_sentence(
+        self, config, pool
+    ) -> None:
+        _insert_build(pool)
+        _record_planning_run(pool, CORRELATION)
+        _record_gate_step(
+            pool,
+            CORRELATION,
+            {"skipped": True, "reason": "no derivable endpoint — no gate registered"},
+        )
+
+        words = await _routine_card(config, pool)
+
+        assert words.split("\n")[-2] == (
+            "Planning did not register an after-deploy check for this feature "
+            "automatically (reason: no address it could check was found)."
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_repair_build_finds_its_parent_s_planning_run(
+        self, config, pool
+    ) -> None:
+        parent = "build-FEAT-MO1-20260823"
+        _insert_build(pool, build_id=parent)
+        _insert_build(pool, correlation_id=f"fix-{parent}")
+        _record_planning_run(pool, CORRELATION)
+        _record_gate_step(pool, CORRELATION, _PATCH_SKIP)
+
+        words = await _routine_card(config, pool)
+
+        assert words.split("\n")[-2] == _PATCH_SENTENCE
+
+    @pytest.mark.asyncio
+    async def test_no_planning_record_leaves_the_card_and_says_why_in_the_log(
+        self, config, pool, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        _insert_build(pool)
+
+        with caplog.at_level("INFO", logger="forge.pipeline.merge_offer"):
+            words = await _routine_card(config, pool)
+
+        assert words == _card_as_it_was()
+        assert any(
+            "has no record of the step" in r.getMessage() for r in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_reader_that_raises_leaves_the_card_and_is_logged(
+        self, config, pool, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        _insert_build(pool)
+        _record_planning_run(pool, CORRELATION)
+        _record_gate_step(pool, CORRELATION, _PATCH_SKIP)
+
+        def _falls_over(_pool: Any, _row: Any) -> Any:
+            raise RuntimeError("the ledger is locked")
+
+        with caplog.at_level("WARNING", logger="forge.pipeline.merge_offer"):
+            words = await _routine_card(
+                config, pool, after_deploy_check_reader=_falls_over
+            )
+
+        assert words == _card_as_it_was()
+        warned = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert any("could not be read" in r.getMessage() for r in warned)
+
+    def test_an_unreadable_record_gives_nothing_and_is_logged(
+        self, pool, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The shared reader itself never raises: a record that is not JSON
+        is a logged warning and no sentence."""
+        _insert_build(pool)
+        _record_planning_run(pool, CORRELATION)
+        pool.connection.execute(
+            "INSERT INTO planning_run_events (correlation_id, stage_label, "
+            "status, details_json, recorded_at) VALUES (?, 'qa-feature-gate', "
+            "'approved', '{not json', '2026-10-04T00:00:00Z')",
+            (CORRELATION,),
+        )
+        pool.connection.commit()
+
+        with caplog.at_level("WARNING", logger="forge.pipeline.merge_offer"):
+            skip = read_after_deploy_check_skip(pool, pool.get_build_row(BUILD_ID))
+
+        assert skip is None
+        assert any("could not be read" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize(
+    "details,reason",
+    [
+        (_PATCH_SKIP, "only GET addresses are supported, and this one is PATCH"),
+        (
+            {
+                "skipped": True,
+                "reason_code": "placeholder_in_address",
+                "address": {"method": "GET", "path": "/users/{user_id}"},
+            },
+            "the address has a placeholder, {user_id}",
+        ),
+        (
+            {
+                "skipped": True,
+                "reason_code": "placeholder_in_address",
+                "address": {"method": "GET", "path": "/orgs/{org_id}/users/{user_id}"},
+            },
+            "the address has placeholders, {org_id} and {user_id}",
+        ),
+        (
+            {"skipped": True, "reason_code": "no_endpoint_named", "address": None},
+            "the spec named no address",
+        ),
+        (
+            {"skipped": True, "reason_code": "no_pass_bars"},
+            "the plan registered no pass bars",
+        ),
+        (
+            {"skipped": True, "reason_code": "no_template"},
+            "the project has no gate template",
+        ),
+        (
+            {"skipped": True, "reason_code": "no_registry"},
+            "the project has no gate registry",
+        ),
+        # older records: the one jargon wording gets plain words, any other
+        # text is passed on exactly as it was recorded
+        (
+            {"skipped": True, "reason": "no derivable endpoint — no gate registered"},
+            "no address it could check was found",
+        ),
+        (
+            {
+                "skipped": True,
+                "reason": "the plan registered no pass bars — no gate "
+                "pass_bar_ref to anchor; no gate registered",
+            },
+            "the plan registered no pass bars — no gate pass_bar_ref to "
+            "anchor; no gate registered",
+        ),
+    ],
+)
+def test_the_reason_words(
+    pool: SqliteLifecyclePersistence, details: dict[str, Any], reason: str
+) -> None:
+    _insert_build(pool)
+    _record_planning_run(pool, CORRELATION)
+    _record_gate_step(pool, CORRELATION, details)
+
+    skip = read_after_deploy_check_skip(pool, pool.get_build_row(BUILD_ID))
+
+    assert skip is not None
+    assert skip.reason == reason
+    assert skip.planning_run == CORRELATION
+    assert skip.sentence == NO_AFTER_DEPLOY_CHECK_SENTENCE.format(reason=reason)

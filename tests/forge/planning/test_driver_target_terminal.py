@@ -2946,7 +2946,7 @@ async def test_f2_derivable_seed_registers_gate_as_one_commit_before_build(
 
 @pytest.mark.asyncio
 async def test_f2_underivable_seed_honest_skip_build_still_queues(
-    store: SqlitePlanningRunStore, tmp_path: Path
+    store: SqlitePlanningRunStore, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """(2) A non-endpoint (underivable) seed → an HONEST skip event, the build
     STILL queues, and ZERO target-repo gate writes (even though the surface is
@@ -2964,7 +2964,8 @@ async def test_f2_underivable_seed_honest_skip_build_still_queues(
         plan_result_factory=_plan_result_native_versions,
     )
 
-    await h.driver.drive(CID)
+    with caplog.at_level(logging.INFO, logger="forge.planning.driver"):
+        await h.driver.drive(CID)
 
     run = store.get_run(CID)
     assert run["state"] == PlanningState.BUILD_QUEUED.value
@@ -2978,7 +2979,20 @@ async def test_f2_underivable_seed_honest_skip_build_still_queues(
     # The leg recorded an HONEST skip (idempotency label present, skipped detail).
     ev = _leg_event_details_of(store, "qa-feature-gate")
     assert ev.get("skipped") is True
-    assert "no derivable endpoint" in ev.get("reason", "")
+    # Since 4 October 2026 the record says WHY in a code the merge cards read,
+    # which address the spec named (none here) and which feature it is about.
+    assert ev["reason_code"] == "no_endpoint_named"
+    assert ev["address"] is None
+    feature_id = _leg_details(store, "feature-plan")["feature_id"]
+    assert feature_id and ev["feature_id"] == feature_id
+    assert ev["reason"]
+    # The skip is logged as a warning, not as information.
+    skipped = [
+        r for r in caplog.records if "feature gate skipped" in r.getMessage()
+    ]
+    assert len(skipped) == 1
+    assert skipped[0].levelno == logging.WARNING
+    assert "no_endpoint_named" in skipped[0].getMessage()
 
 
 def _with_digest_endpoint(result: Any, method: str, path: str) -> Any:
@@ -3024,7 +3038,7 @@ async def test_f2_digest_endpoint_gates_what_the_prose_cannot_derive(
         spec_result=_with_digest_endpoint(
             _spec_result_with_seed(_UNDERIVABLE_SEED_AUTHLESS),
             "GET",
-            "/users/{user_id}",
+            "/users/active-count",
         ),
         plan_result_factory=_plan_result_native_versions,
         pass_bar_validate_fn=_schema_pass_bar_oracle,
@@ -3044,9 +3058,53 @@ async def test_f2_digest_endpoint_gates_what_the_prose_cannot_derive(
     assert gate.returncode == 0, gate.stderr
     assert '"gate_id": "nightly-report",' in gate.stdout
     assert (
-        '"request": {"method": "GET", "path": "/users/{user_id}"},' in gate.stdout
+        '"request": {"method": "GET", "path": "/users/active-count"},'
+        in gate.stdout
     )
     compile(gate.stdout, "nightly_report_gate.py", "exec")
+
+
+@pytest.mark.asyncio
+async def test_f2_digest_address_with_a_placeholder_is_skipped_with_its_reason(
+    store: SqlitePlanningRunStore, tmp_path: Path
+) -> None:
+    """A GET address with ``{user_id}`` in it is skipped, not written as a
+    check: the filled check sends the address exactly as written, so the
+    server sees a literal ``{user_id}`` and the check can never pass (FEAT-E613,
+    24 August 2026, answered 400 and was rewritten by hand). The record names
+    the reason, the address and the feature; the build still queues."""
+    repo = tmp_path / "api_test"
+    _init_scratch_repo(repo)
+    _seed_gate_surface(repo)
+    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    _queue(store)
+    h = _make_driver(
+        store,
+        git_runner=git,
+        repo_path=str(repo),
+        spec_result=_with_digest_endpoint(
+            _spec_result_with_seed(_UNDERIVABLE_SEED_AUTHLESS),
+            "GET",
+            "/users/{user_id}",
+        ),
+        plan_result_factory=_plan_result_native_versions,
+        pass_bar_validate_fn=_schema_pass_bar_oracle,
+        gate_registry_validate_fn=_schema_gate_registry_oracle,
+    )
+
+    await h.driver.drive(CID)
+
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+    assert h.ctx["counters"]["gate_registry_validate"] == 0
+    assert h.ctx["counters"]["build_trigger"] == 1
+    assert _show_on_branch(repo, "qa/gates/nightly_report_gate.py").returncode != 0
+    reg_data = yaml.safe_load(_show_on_branch(repo, "qa/gates/registry.yaml").stdout)
+    assert {g["id"] for g in reg_data["gates"]} == {"health", "stats", "version"}
+    ev = _leg_event_details_of(store, "qa-feature-gate")
+    assert ev.get("skipped") is True
+    assert ev["reason_code"] == "placeholder_in_address"
+    assert ev["address"] == {"method": "GET", "path": "/users/{user_id}"}
+    assert ev["feature_id"] == _leg_details(store, "feature-plan")["feature_id"]
 
 
 @pytest.mark.asyncio
@@ -3079,11 +3137,23 @@ async def test_f2_digest_endpoint_absent_leaves_the_prose_path_exactly_as_it_was
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "method,path",
+    [
+        ("POST", "/users"),
+        # FEAT-2FDE, 4 October 2026: the spec named this address correctly
+        # and it was refused for its method. The method is the reason given,
+        # even though the address also has a placeholder.
+        ("PATCH", "/users/{user_id}/deactivate"),
+    ],
+)
 async def test_f2_digest_endpoint_non_get_does_not_widen_the_gate(
-    store: SqlitePlanningRunStore, tmp_path: Path
+    store: SqlitePlanningRunStore, tmp_path: Path, method: str, path: str
 ) -> None:
     """A digest naming POST is not a wider gate — forge does not know POST's
-    happy-path status, so it skips honestly rather than guessing one."""
+    happy-path status, so it skips honestly rather than guessing one. The
+    skip record names the reason, the address the spec named and the
+    feature."""
     repo = tmp_path / "api_test"
     _init_scratch_repo(repo)
     _seed_gate_surface(repo)
@@ -3094,7 +3164,7 @@ async def test_f2_digest_endpoint_non_get_does_not_widen_the_gate(
         git_runner=git,
         repo_path=str(repo),
         spec_result=_with_digest_endpoint(
-            _spec_result_with_seed(_UNDERIVABLE_SEED_AUTHLESS), "POST", "/users"
+            _spec_result_with_seed(_UNDERIVABLE_SEED_AUTHLESS), method, path
         ),
         plan_result_factory=_plan_result_native_versions,
     )
@@ -3105,7 +3175,10 @@ async def test_f2_digest_endpoint_non_get_does_not_widen_the_gate(
     assert h.ctx["counters"]["gate_registry_validate"] == 0
     ev = _leg_event_details_of(store, "qa-feature-gate")
     assert ev.get("skipped") is True
-    assert "no derivable endpoint" in ev.get("reason", "")
+    assert ev["reason_code"] == "unsupported_method"
+    assert ev["address"] == {"method": method, "path": path}
+    feature_id = _leg_details(store, "feature-plan")["feature_id"]
+    assert feature_id and ev["feature_id"] == feature_id
 
 
 @pytest.mark.asyncio
@@ -3137,6 +3210,38 @@ async def test_f2_missing_template_honest_skip(
     ev = _leg_event_details_of(store, "qa-feature-gate")
     assert ev.get("skipped") is True
     assert "no qa/gates/feature_behaviour_gate.py" in ev.get("reason", "")
+    assert ev["reason_code"] == "no_template"
+    assert ev["address"] == {"method": "GET", "path": "/version"}
+    assert ev["feature_id"] == _leg_details(store, "feature-plan")["feature_id"]
+
+
+@pytest.mark.asyncio
+async def test_f2_missing_registry_skip_names_its_reason(
+    store: SqlitePlanningRunStore, tmp_path: Path
+) -> None:
+    """A template but no gate registry on the branch → honest skip whose record
+    says ``no_registry`` and names the address it would have checked."""
+    repo = tmp_path / "api_test"
+    _init_scratch_repo(repo)
+    _seed_gate_surface(repo, template=True, registry=False)
+    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    _queue(store)
+    h = _make_driver(
+        store,
+        git_runner=git,
+        repo_path=str(repo),
+        spec_result=_spec_result_with_seed(_ROUND19_SEED_AUTHLESS),
+        plan_result_factory=_plan_result_native_versions,
+    )
+
+    await h.driver.drive(CID)
+
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+    ev = _leg_event_details_of(store, "qa-feature-gate")
+    assert ev.get("skipped") is True
+    assert ev["reason_code"] == "no_registry"
+    assert ev["address"] == {"method": "GET", "path": "/version"}
+    assert ev["feature_id"] == _leg_details(store, "feature-plan")["feature_id"]
 
 
 @pytest.mark.asyncio
@@ -3389,6 +3494,46 @@ def test_feature_gate_endpoint_from_digest_negatives(digest: str) -> None:
     """Anything short of an explicit rooted GET yields None, so the caller falls
     through to the prose regex and then to an honest skip — never a guessed gate."""
     assert PlanningRunDriver._feature_gate_endpoint_from_digest(digest) is None
+
+
+@pytest.mark.parametrize(
+    "digest,criteria,expected",
+    [
+        # the digest's address, whatever its method, upper-cased
+        (
+            "endpoint:\n  method: patch\n  path: /users/{user_id}/deactivate\n",
+            [],
+            {"method": "PATCH", "path": "/users/{user_id}/deactivate"},
+        ),
+        # the digest wins over the criteria
+        (
+            "endpoint:\n  method: DELETE\n  path: /users/{user_id}\n",
+            [{"text": "A POST request to /users", "class": "machine"}],
+            {"method": "DELETE", "path": "/users/{user_id}"},
+        ),
+        # no digest field: the first machine criterion of any verb
+        (
+            "feature: x\n",
+            [
+                {"text": "A GET request to /skip", "class": "operator"},
+                {"text": "A DELETE request to /users/42", "class": "machine"},
+            ],
+            {"method": "DELETE", "path": "/users/42"},
+        ),
+        # nothing named anywhere
+        ("", [{"text": "Deactivating a user succeeds", "class": "machine"}], None),
+        # an unrooted digest path names nothing
+        ("endpoint:\n  method: PATCH\n  path: users/1\n", [], None),
+        ("not: [valid", "not-a-list", None),
+    ],
+)
+def test_feature_gate_address_named_reads_any_method(
+    digest: str, criteria: Any, expected: dict[str, str] | None
+) -> None:
+    """Read only to say why no gate was registered — never to register one."""
+    assert (
+        PlanningRunDriver._feature_gate_address_named(digest, criteria) == expected
+    )
 
 
 def test_derive_feature_gate_endpoint_none_when_no_machine_get() -> None:

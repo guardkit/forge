@@ -62,6 +62,16 @@ from forge.lifecycle.identifiers import validate_feature_id
 from forge.pipeline.dispatchers.specialist import (
     FINAL_PLAN_REVIEW_FEEDBACK,
 )
+from forge.pipeline.merge_offer import (
+    AFTER_DEPLOY_CHECK_STAGE,
+    SKIP_NO_ENDPOINT_NAMED,
+    SKIP_NO_PASS_BARS,
+    SKIP_NO_REGISTRY,
+    SKIP_NO_TEMPLATE,
+    SKIP_PLACEHOLDER_IN_ADDRESS,
+    SKIP_UNSUPPORTED_METHOD,
+    placeholders_in,
+)
 from forge.pipeline.stage_names import plain_stage_name
 from forge.pipeline.stage_taxonomy import StageClass
 from forge.planning.checkpoint import (
@@ -187,7 +197,8 @@ _QA_PASS_BARS_STAGE = "qa-pass-bars"
 #: never re-fills the gate. An HONEST skip (non-endpoint feature, or a repo that
 #: has not adopted the qa/gates/ surface) ALSO records this label (a skipped
 #: detail), so a re-drive of a legitimately-skipped run is a clean no-op too.
-_QA_FEATURE_GATE_STAGE = "qa-feature-gate"
+#: The merge cards read the same label (one constant, so the two never drift).
+_QA_FEATURE_GATE_STAGE = AFTER_DEPLOY_CHECK_STAGE
 
 #: Durable stage label for the AUTH-CONFIRMATION DOOR — the owner's one-tap
 #: answer to a pass-bar seed flagged ``auth_surface_bearing`` (SPL-007 §A.2's
@@ -8883,10 +8894,15 @@ class PlanningRunDriver:
         trigger.
 
         SKIP-vs-FAIL law (BINDING):
-          (a) no machine criterion yields a GET ``{method,path}`` → honest
-              ``skipped`` leg event ("no derivable endpoint — no gate
-              registered") and CONTINUE to the build (non-endpoint features are
-              legitimate);
+          (a) neither the digest nor a machine criterion yields a GET
+              ``{method,path}`` → honest ``skipped`` leg event and CONTINUE to
+              the build (non-endpoint features are legitimate). The record
+              says which: the spec named an address with another method
+              (``unsupported_method``, with that address) or named none
+              (``no_endpoint_named``). A GET address with a ``{placeholder}``
+              in it is skipped too (``placeholder_in_address``): the filled
+              check would send the placeholder as written and could never
+              pass (FEAT-E613, 24 August 2026);
           (b) the target repo carries no ``qa/gates/feature_behaviour_gate.py``
               template or no ``qa/gates/registry.yaml`` on the branch → the same
               honest skip (the repo has not adopted the F4 gate surface);
@@ -8896,6 +8912,12 @@ class PlanningRunDriver:
               the bars leg's confirmation door is the single place that
               question is asked, and a rejected / unanswered door fails the
               bars leg first — so no auth handling is re-implemented here.
+
+        Every skip record carries ``reason_code``, the ``address`` the spec
+        named (or None) and the ``feature_id`` beside the free-text
+        ``reason``, and is logged as a warning: both merge cards read it
+        (:func:`forge.pipeline.merge_offer.read_after_deploy_check_skip`) and
+        say in one sentence that planning registered no after-deploy check.
 
         Idempotent: a durable ``qa-feature-gate`` event (approved, whether a real
         registration OR an honest skip) short-circuits a re-drive. Returns True
@@ -8938,6 +8960,11 @@ class PlanningRunDriver:
             seed.get("criteria") if isinstance(seed, Mapping) else None
         ) or []
 
+        # The feature id is read BEFORE any skip, so every skip record names
+        # the feature it is about (4 October 2026).
+        plan_details = self._leg_event_details(correlation_id, _FEATURE_PLAN_STAGE)
+        feature_id = str(plan_details.get("feature_id") or "")
+
         # The digest's optional endpoint field first (the spec author stated it
         # outright); the criterion-prose regex stays as the fallback so every
         # feature that registers a gate today still registers one.
@@ -8945,13 +8972,37 @@ class PlanningRunDriver:
             spec_details.get("digest")
         ) or self._derive_feature_gate_endpoint(criteria)
         if endpoint is None:
+            named = self._feature_gate_address_named(
+                spec_details.get("digest"), criteria
+            )
+            if named is not None and named["method"] != "GET":
+                return self._skip_feature_gate(
+                    correlation_id,
+                    f"the spec names {named['method']} {named['path']}; only a "
+                    "GET address can be checked automatically — no gate "
+                    "registered",
+                    reason_code=SKIP_UNSUPPORTED_METHOD,
+                    feature_id=feature_id,
+                    address=named,
+                )
             return self._skip_feature_gate(
                 correlation_id,
-                "no derivable endpoint — no gate registered",
+                "the spec names no address to check — no gate registered",
+                reason_code=SKIP_NO_ENDPOINT_NAMED,
+                feature_id=feature_id,
+                address=None,
+            )
+        if placeholders_in(endpoint["path"]) or "}" in endpoint["path"]:
+            return self._skip_feature_gate(
+                correlation_id,
+                f"the address GET {endpoint['path']} has a placeholder the "
+                "check would send as written, so it could never pass — no "
+                "gate registered",
+                reason_code=SKIP_PLACEHOLDER_IN_ADDRESS,
+                feature_id=feature_id,
+                address=endpoint,
             )
 
-        plan_details = self._leg_event_details(correlation_id, _FEATURE_PLAN_STAGE)
-        feature_id = str(plan_details.get("feature_id") or "")
         plan_sha = str(plan_details.get("sha") or "")
         branch = str(plan_details.get("branch") or f"planning/{correlation_id}")
         if not feature_id or not plan_sha:
@@ -8972,6 +9023,9 @@ class PlanningRunDriver:
                 correlation_id,
                 "the plan registered no pass bars — no gate pass_bar_ref to "
                 "anchor; no gate registered",
+                reason_code=SKIP_NO_PASS_BARS,
+                feature_id=feature_id,
+                address=endpoint,
             )
         pass_bar_ref = bar_files[0]
 
@@ -8994,6 +9048,9 @@ class PlanningRunDriver:
                 f"the target repo carries no {_FEATURE_GATE_TEMPLATE_REL} "
                 "template on the branch — the F4 gate surface is not adopted; "
                 "no gate registered",
+                reason_code=SKIP_NO_TEMPLATE,
+                feature_id=feature_id,
+                address=endpoint,
             )
         registry_raw = await deps.git_runner.read_file_from_branch(
             repo_path=repo_path, branch=branch, file_path=_GATE_REGISTRY_REL
@@ -9003,6 +9060,9 @@ class PlanningRunDriver:
                 correlation_id,
                 f"the target repo carries no {_GATE_REGISTRY_REL} on the branch "
                 "— the F4 gate surface is not adopted; no gate registered",
+                reason_code=SKIP_NO_REGISTRY,
+                feature_id=feature_id,
+                address=endpoint,
             )
 
         # Derive the slug + snake filename deterministically from the seed.
@@ -9136,7 +9196,15 @@ class PlanningRunDriver:
         )
         return True
 
-    def _skip_feature_gate(self, correlation_id: str, reason: str) -> bool:
+    def _skip_feature_gate(
+        self,
+        correlation_id: str,
+        reason: str,
+        *,
+        reason_code: str,
+        feature_id: str,
+        address: Mapping[str, str] | None,
+    ) -> bool:
         """Record an HONEST skipped ``qa-feature-gate`` leg event and CONTINUE.
 
         A non-endpoint feature (or a repo that has not adopted the qa/gates/
@@ -9144,10 +9212,26 @@ class PlanningRunDriver:
         durable label (so a re-drive is a clean no-op) with a ``skipped`` detail
         and return True so the caller proceeds to the B3 build trigger. Zero
         target-repo writes.
+
+        The record carries the free-text ``reason`` as before, plus (since 4
+        October 2026) a ``reason_code``, the ``address`` the spec named (or
+        None) and the ``feature_id``, which is what both merge cards read to
+        say why no after-deploy check was registered. Older records carry only
+        ``skipped`` and ``reason`` and stay readable. Logged as a WARNING: a
+        feature reaching its merge card with no after-deploy check of planning's
+        making is worth seeing in the log, though it never stops the run.
         """
-        logger.info(
-            "planning driver: run %s feature gate skipped — %s",
+        logger.warning(
+            "planning driver: run %s feature gate skipped (%s, feature %s, "
+            "address %s) — %s",
             correlation_id,
+            reason_code,
+            feature_id or "not recorded",
+            (
+                f"{address.get('method')} {address.get('path')}"
+                if address
+                else "none named"
+            ),
             reason,
         )
         self._deps.store._record_event(
@@ -9155,9 +9239,47 @@ class PlanningRunDriver:
             stage_label=_QA_FEATURE_GATE_STAGE,
             status="approved",
             actor_identity="planning-driver",
-            details_json=json.dumps({"skipped": True, "reason": reason}),
+            details_json=json.dumps(
+                {
+                    "skipped": True,
+                    "reason": reason,
+                    "reason_code": reason_code,
+                    "feature_id": feature_id or None,
+                    "address": dict(address) if address else None,
+                }
+            ),
         )
         return True
+
+    @staticmethod
+    def _feature_gate_address_named(
+        digest_text: Any, criteria: Any
+    ) -> dict[str, str] | None:
+        """The address the spec names, whatever its method, or None.
+
+        Read only to say WHY no gate was registered, never to register one:
+        the digest's optional ``endpoint`` field first (any method, a rooted
+        path), then the first machine criterion matching the criterion
+        grammar with any verb. The method comes back upper-cased.
+        """
+        try:
+            obj = yaml.safe_load(str(digest_text or ""))
+        except yaml.YAMLError:
+            obj = None
+        endpoint = obj.get("endpoint") if isinstance(obj, Mapping) else None
+        if isinstance(endpoint, Mapping):
+            method = str(endpoint.get("method") or "").strip().upper()
+            path = str(endpoint.get("path") or "").strip()
+            if method and path.startswith("/"):
+                return {"method": method, "path": path}
+        if isinstance(criteria, list):
+            for crit in criteria:
+                if not isinstance(crit, Mapping) or str(crit.get("class")) != "machine":
+                    continue
+                match = _FEATURE_GATE_ENDPOINT_RE.search(str(crit.get("text") or ""))
+                if match is not None:
+                    return {"method": match.group("method"), "path": match.group("path")}
+        return None
 
     @staticmethod
     def _feature_gate_endpoint_from_digest(digest_text: Any) -> dict[str, str] | None:

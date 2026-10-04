@@ -406,3 +406,228 @@ async def test_the_feature_id_falls_back_to_the_build_row(
 
     assert publisher.paused[0].feature_id == "FEAT-CARD"
     assert publisher.paused[0].build_id == "merge-FEAT-CARD"
+
+
+# ---------------------------------------------------------------------------
+# When planning registered no after-deploy check (4 October 2026)
+#
+# The checkpoint card reads the same record, through the same reader, as the
+# routine card, and says the same sentence. A registered check, no record,
+# or a reader that falls over leaves the card byte for byte as it was.
+# ---------------------------------------------------------------------------
+
+_PATCH_SENTENCE = (
+    "Planning did not register an after-deploy check for this feature "
+    "automatically (reason: only GET addresses are supported, and this one "
+    "is PATCH)."
+)
+_APPROVE_SENTENCE = (
+    "Approve = check the candidate in the sandbox, merge the branch into "
+    "main and promote it."
+)
+
+
+def _record_planning_run(pool: SqliteLifecyclePersistence, correlation_id: str) -> None:
+    pool.connection.execute(
+        "INSERT INTO planning_runs (correlation_id, state, originating_user, "
+        "expected_approver, request_text, target_repo, triggered_by, "
+        "originating_adapter, parent_request_id, queued_at) VALUES "
+        "(?, 'BUILD_QUEUED', 'rich', 'rich', 'a sentence', ?, 'jarvis', "
+        "'slack', NULL, '2026-10-04T00:00:00Z')",
+        (correlation_id, REPO),
+    )
+    pool.connection.commit()
+
+
+def _record_gate_step(
+    pool: SqliteLifecyclePersistence, correlation_id: str, details: dict[str, Any]
+) -> None:
+    pool.connection.execute(
+        "INSERT INTO planning_run_events (correlation_id, stage_label, status, "
+        "actor_identity, details_json, recorded_at) VALUES "
+        "(?, 'qa-feature-gate', 'approved', 'planning-driver', ?, "
+        "'2026-10-04T00:00:00Z')",
+        (correlation_id, json.dumps(details)),
+    )
+    pool.connection.commit()
+
+
+_PATCH_SKIP = {
+    "skipped": True,
+    "reason": "the spec names PATCH /users/{user_id}/deactivate; only a GET "
+    "address can be checked automatically — no gate registered",
+    "reason_code": "unsupported_method",
+    "feature_id": "FEAT-CARD",
+    "address": {"method": "PATCH", "path": "/users/{user_id}/deactivate"},
+}
+
+
+def _repair_payload(parent_build_id: str) -> SimpleNamespace:
+    payload = _payload()
+    payload.correlation_id = f"fix-{parent_build_id}"
+    payload.queued_at = datetime(2026, 7, 31, 12, 0, 0, tzinfo=UTC)
+    return payload
+
+
+async def _checkpoint_card(
+    pool: SqliteLifecyclePersistence, tmp_path: Path, build_id: str, **kwargs: Any
+) -> str:
+    pool.record_merge_branch(build_id, "repair/TASK-CARDFIX1")
+    service, publisher, _raw = _offer_service(pool, tmp_path)
+    publish_card = make_merge_card_publisher(
+        offer_service=service,
+        sqlite_pool=pool,
+        clock=lambda: datetime(2026, 9, 9, 9, 8, tzinfo=UTC),
+        **kwargs,
+    )
+    await publish_card(
+        build_id=build_id,
+        feature_id="FEAT-CARD",
+        branch="repair/TASK-CARDFIX1",
+        gates=_gates(),
+    )
+    assert len(publisher.paused) == 1
+    return publisher.paused[0].rationale
+
+
+def _card_as_it_was() -> str:
+    """The checkpoint card before this sentence existed."""
+    return merge_card_words(
+        feature_id="FEAT-CARD", branch="repair/TASK-CARDFIX1", gates=_gates()
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_skip_puts_the_sentence_on_the_checkpoint_card(
+    persistence: SqliteLifecyclePersistence, tmp_path: Path
+) -> None:
+    build_id = persistence.record_pending_build(_payload())
+    _record_planning_run(persistence, CORRELATION)
+    _record_gate_step(persistence, CORRELATION, _PATCH_SKIP)
+
+    words = await _checkpoint_card(persistence, tmp_path, build_id)
+
+    assert f"{_PATCH_SENTENCE} {_APPROVE_SENTENCE}" in words
+    # Only the sentence was added; the rest is the card as it was.
+    assert words.replace(f"{_PATCH_SENTENCE} ", "", 1) == _card_as_it_was()
+
+
+@pytest.mark.asyncio
+async def test_a_repair_build_s_checkpoint_card_finds_its_parent_s_planning_run(
+    persistence: SqliteLifecyclePersistence, tmp_path: Path
+) -> None:
+    """The checkpoint card is the repair journey's card, so this is its usual
+    case: ``fix-<parent build id>`` goes one hop to the parent's row."""
+    parent = persistence.record_pending_build(_payload())
+    build_id = persistence.record_pending_build(_repair_payload(parent))
+    assert build_id != parent
+    _record_planning_run(persistence, CORRELATION)
+    _record_gate_step(persistence, CORRELATION, _PATCH_SKIP)
+
+    words = await _checkpoint_card(persistence, tmp_path, build_id)
+
+    assert _PATCH_SENTENCE in words
+
+
+@pytest.mark.asyncio
+async def test_an_older_free_text_record_gives_the_checkpoint_card_a_sentence(
+    persistence: SqliteLifecyclePersistence, tmp_path: Path
+) -> None:
+    build_id = persistence.record_pending_build(_payload())
+    _record_planning_run(persistence, CORRELATION)
+    _record_gate_step(
+        persistence,
+        CORRELATION,
+        {"skipped": True, "reason": "no derivable endpoint — no gate registered"},
+    )
+
+    words = await _checkpoint_card(persistence, tmp_path, build_id)
+
+    assert (
+        "Planning did not register an after-deploy check for this feature "
+        "automatically (reason: no address it could check was found)." in words
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_registered_gate_leaves_the_checkpoint_card_byte_for_byte(
+    persistence: SqliteLifecyclePersistence, tmp_path: Path
+) -> None:
+    build_id = persistence.record_pending_build(_payload())
+    _record_planning_run(persistence, CORRELATION)
+    _record_gate_step(
+        persistence,
+        CORRELATION,
+        {
+            "feature_id": "FEAT-CARD",
+            "gate_file": "qa/gates/active_count_gate.py",
+            "endpoint": {"method": "GET", "path": "/users/active-count"},
+        },
+    )
+
+    assert await _checkpoint_card(persistence, tmp_path, build_id) == _card_as_it_was()
+
+
+@pytest.mark.asyncio
+async def test_no_planning_record_leaves_the_checkpoint_card_and_is_logged(
+    persistence: SqliteLifecyclePersistence,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    build_id = persistence.record_pending_build(_payload())
+
+    with caplog.at_level("INFO", logger="forge.pipeline.merge_offer"):
+        words = await _checkpoint_card(persistence, tmp_path, build_id)
+
+    assert words == _card_as_it_was()
+    assert any("has no record of the step" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_a_reader_error_leaves_the_checkpoint_card_and_is_logged(
+    persistence: SqliteLifecyclePersistence,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    build_id = persistence.record_pending_build(_payload())
+    _record_planning_run(persistence, CORRELATION)
+    _record_gate_step(persistence, CORRELATION, _PATCH_SKIP)
+
+    def _falls_over(_pool: Any, _row: Any) -> Any:
+        raise RuntimeError("the ledger is locked")
+
+    with caplog.at_level("WARNING", logger="forge.pipeline.merge_offer"):
+        words = await _checkpoint_card(
+            persistence, tmp_path, build_id, after_deploy_check_reader=_falls_over
+        )
+
+    assert words == _card_as_it_was()
+    assert any(
+        r.levelname == "WARNING" and "could not be read" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+def test_the_checkpoint_words_carry_the_shared_sentence() -> None:
+    """``merge_card_words`` puts the reader's sentence just before what the
+    merge word does, and nothing at all when there is no skip."""
+    from forge.pipeline.merge_offer import AfterDeployCheckSkip
+
+    skip = AfterDeployCheckSkip(
+        planning_run=CORRELATION,
+        reason="the address has a placeholder, {user_id}",
+        reason_code="placeholder_in_address",
+    )
+    words = merge_card_words(
+        feature_id="FEAT-CARD",
+        branch="autobuild/FEAT-CARD",
+        after_deploy_check_skip=skip,
+    )
+    assert (
+        "Planning did not register an after-deploy check for this feature "
+        "automatically (reason: the address has a placeholder, {user_id}). "
+        f"{_APPROVE_SENTENCE}" in words
+    )
+    assert merge_card_words(
+        feature_id="FEAT-CARD", branch="autobuild/FEAT-CARD", after_deploy_check_skip=None
+    ) == merge_card_words(feature_id="FEAT-CARD", branch="autobuild/FEAT-CARD")
