@@ -965,6 +965,7 @@ class LifecycleBridgeWireup:
             # Drop ourselves from the live observer set so a future
             # registration for the same feature_id can succeed.
             self._observers.pop(feature_id, None)
+            self._observer_correlations.pop(feature_id, None)
             # The ack handle goes with us — EXCEPT after a mode-c
             # stand-down, where the build is still running and the
             # conductor will take the handle at its close-out. Dropping it
