@@ -633,6 +633,7 @@ def merge_card_words(
     gates: Any = None,
     scope: Any = None,
     after_deploy_check_skip: Any = None,
+    supplied_plan: str = "",
 ) -> str:
     """The sentences on the face of the merge-ready checkpoint's card.
 
@@ -669,15 +670,20 @@ def merge_card_words(
             sentence with the recorded reason; ``None`` — a check was
             registered, or nothing could be read — leaves the card byte for
             byte as it was.
+        supplied_plan: The one sentence a PREPARED build's card carries
+            (:func:`forge.pipeline.merge_offer.card_line_about_the_supplied_plan`,
+            the routine card's own line): where its spec and plan were
+            supplied. ``""`` — every other build — leaves the card byte for
+            byte as it was (4 October 2026).
     """
     detail = str(getattr(gates, "detail", "") or "").strip().rstrip(".")
     deferred = str(getattr(gates, "deferred_detail", "") or "").strip()
     named = feature_id or "this repair"
     checked = detail or "the checks this repository declares came back green"
-    sentences = [
-        f"{named} is ready to merge on branch {branch}.",
-        f"What was checked: {checked}.",
-    ]
+    sentences = [f"{named} is ready to merge on branch {branch}."]
+    if supplied_plan:
+        sentences.append(supplied_plan)
+    sentences.append(f"What was checked: {checked}.")
     tests = card_line_about_tests(getattr(gates, "test_changes", None))
     if tests:
         sentences.append(tests)
@@ -794,6 +800,7 @@ def make_merge_card_publisher(
     """
     from forge.pipeline.merge_offer import (
         after_deploy_check_skip_for,
+        card_line_about_the_supplied_plan,
         read_after_deploy_check_skip,
         run_the_scope_pass,
     )
@@ -856,6 +863,14 @@ def make_merge_card_publisher(
         no_check = after_deploy_check_skip_for(
             read_the_check, sqlite_pool, build_id, row
         )
+        # A prepared build reaches this card only if it was queued as a fix
+        # journey with no row written ahead (the fix journey's own admission
+        # writes its row first, with no source commit). The line is the
+        # routine card's, so both cards say the same thing (4 October 2026).
+        try:
+            supplied = card_line_about_the_supplied_plan(row)
+        except Exception:  # noqa: BLE001 — a reader never stops a card
+            supplied = ""
 
         def _words(merge_target: str, _merge_branch: str | None) -> str:
             if gated_branch is not None and gated_branch != merge_target:
@@ -873,6 +888,7 @@ def make_merge_card_publisher(
                 gates=gates,
                 scope=scope,
                 after_deploy_check_skip=no_check,
+                supplied_plan=supplied,
             )
 
         logger.info(
