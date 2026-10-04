@@ -874,13 +874,21 @@ def _build_consumer_reconcile_seam(
             ReconcileDeps,
             reconcile_on_boot as _consumer_reconcile,
         )
-        from forge.cli._serve_deps import build_pipeline_consumer_deps
+        from forge.cli._serve_deps import (
+            build_pipeline_consumer_deps,
+            build_prepared_build_admission,
+        )
 
         consumer_deps = build_pipeline_consumer_deps(
             client,
             forge_config,
             sqlite_pool,
             async_task_starter=async_task_starter,
+            # A feature planned elsewhere is admitted here too (4 October
+            # 2026), so a delivery this composition ever dispatches with no
+            # planning run and no row is checked exactly as the live
+            # consumer checks it, never let through unadmitted.
+            prepared_build_admission=build_prepared_build_admission(forge_config),
         )
 
         async def _fetch_redeliveries() -> list[Any]:

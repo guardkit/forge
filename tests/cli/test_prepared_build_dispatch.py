@@ -411,3 +411,30 @@ async def test_an_unregistered_repository_is_refused_by_name(
 
     assert _row(persistence) is None
     assert "someone/else is not registered" in rejections[0][1]
+
+
+@pytest.mark.asyncio
+async def test_the_boot_reconcile_composition_wires_the_admission_too(
+    monkeypatch: pytest.MonkeyPatch,
+    forge_config: ForgeConfig,
+    persistence: SqliteLifecyclePersistence,
+) -> None:
+    """The boot-time reconcile builds its own consumer deps; the admission is
+    wired there as well, so it never fails open on that path."""
+    from forge.cli import _serve_deps
+    from forge.cli._serve_production import _build_consumer_reconcile_seam
+
+    seen: dict[str, Any] = {}
+    real = _serve_deps.build_pipeline_consumer_deps
+
+    def _capture(*args: Any, **kwargs: Any) -> Any:
+        seen.update(kwargs)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(_serve_deps, "build_pipeline_consumer_deps", _capture)
+
+    await _build_consumer_reconcile_seam(
+        persistence, forge_config, _RecordingStarter()
+    )(_StubNatsClient())
+
+    assert callable(seen.get("prepared_build_admission"))
