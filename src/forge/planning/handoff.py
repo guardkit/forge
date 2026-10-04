@@ -281,7 +281,9 @@ class GitRunner(Protocol):
     Tests inject recording fakes to verify invocation counts and arguments.
     """
 
-    async def fetch_remote_start_point(self, repo_path: str) -> Any:
+    async def fetch_remote_start_point(
+        self, repo_path: str, branch: str | None = None
+    ) -> Any:
         """Fetch the copy's remote ``origin`` and say where its default branch is.
 
         The starting rule's one operation (one true copy, item 1,
@@ -289,7 +291,9 @@ class GitRunner(Protocol):
         :class:`~forge.deploy.candidate_tree.RemoteStartPoint`: a branch and a
         commit, or one plain sentence saying why there is nothing to start
         from. It never raises, never changes a checked-out branch and never
-        touches a working folder.
+        touches a working folder. ``branch`` (4 October 2026) also fetches that
+        branch in the same call and answers its commit as ``branch_commit``;
+        a prepared feature's admission is the caller that names one.
         """
         ...
 

@@ -29,10 +29,10 @@ The narrow contract:
                                           detail, note}], detail}
     POST /git/read-file-from-branch {repo, branch, file_path} -> {content|null}
     POST /git/rev-parse {repo, ref} -> {sha|null}
-    POST /git/remote-start-point {repo}
-              -> {branch|null, commit|null, refusal|null}
-    POST /git/read-file-at-commit {repo, commit, file_path}
-              -> {content|null, found, refusal|null}
+    POST /git/remote-start-point {repo, branch?}
+              -> {branch|null, commit|null, refusal|null, branch_commit?}
+    POST /git/read-file-at-commit {repo, commit, file_path, ordinary_file_only?}
+              -> {content|null, found, refusal|null, ordinary?}
     POST /git/is-ancestor {repo, ancestor, descendant} -> {is_ancestor|null}
     POST /git/candidate-tree {repo, feature_id, sha}
               -> {path, tree, exclude_written}
@@ -3889,16 +3889,28 @@ def process_git_remote_start_point_request(
     is. A remote that is missing, unreachable or nameless is NOT a 4xx: it is
     a 200 carrying ``refusal``, because it is an answer about the project
     rather than a fault in the request. Never raises.
+
+    An optional ``branch`` (4 October 2026, a prepared feature's admission)
+    also fetches that branch from the same remote and answers its commit as
+    ``branch_commit``; a branch the remote does not have is a 200 refusal, an
+    unusable name a 400. Without it the answer is exactly what it always was.
     """
     if not isinstance(payload, dict):
         return 400, {"error": "request body must be a JSON object"}
     repo_path, error = _resolve_repo_key(payload, config)
     if error or repo_path is None:
         return 400, {"error": error}
+    branch = payload.get("branch")
+    if branch is not None:
+        error = _ref_error(branch, what="branch")
+        if error:
+            return 400, {"error": error}
     from forge.deploy.candidate_tree import fetch_remote_start_point
 
     try:
-        answer = _run_coroutine(fetch_remote_start_point(repo_path))
+        answer = _run_coroutine(
+            fetch_remote_start_point(repo_path, str(branch) if branch else None)
+        )
     except Exception as exc:  # noqa: BLE001 — never raise past the boundary
         return 500, {"error": f"sidecar git error: {type(exc).__name__}: {exc}"}
     logger.info(
@@ -3940,11 +3952,20 @@ def process_git_read_file_at_commit_request(
     error = _relative_path_error(file_path, what="file_path")
     if error:
         return 400, {"error": error}
+    # An ordinary file only (4 October 2026): the commit's tree entry is
+    # checked and a symbolic link is refused, so a binding document cannot be
+    # satisfied by a link's target name. Absent, the read is unchanged.
+    ordinary_file_only = payload.get("ordinary_file_only") is True
     from forge.deploy.candidate_tree import read_file_at_commit
 
     try:
         answer = _run_coroutine(
-            read_file_at_commit(repo_path, str(commit), str(file_path))
+            read_file_at_commit(
+                repo_path,
+                str(commit),
+                str(file_path),
+                ordinary_file_only=ordinary_file_only,
+            )
         )
     except Exception as exc:  # noqa: BLE001 — never raise past the boundary
         return 500, {"error": f"sidecar git error: {type(exc).__name__}: {exc}"}
