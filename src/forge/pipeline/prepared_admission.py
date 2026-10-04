@@ -272,34 +272,48 @@ def _resolve_link(from_file: str, target: str) -> str | None:
     return normal
 
 
-#: The guide's Integration Contracts heading, as the specialist planner's own
-#: emitter finds it (``qa/leak_sweep_emit.py``): ``## §4 Integration
-#: Contracts``, ``## §4`` or ``## Integration Contracts``, at any level of two
-#: or more.
+#: The guide's Integration Contracts heading, read EXACTLY as the specialist
+#: planner's own emitter reads it (specialist-agent
+#: ``src/specialist_agent/qa/leak_sweep_emit.py``, ``_INTEGRATION_SECTION_RE``
+#: and ``_extract_integration_section``): case-sensitive, ``## §4 Integration
+#: Contracts`` or a bare ``## §4`` first, at any level of two or more. One
+#: addition: GuardKit's ``/feature-plan`` documents the heading with a colon,
+#: ``## §4: Integration Contracts`` (installer/core/commands/feature-plan.md),
+#: which the specialist pattern does not match. That mismatch between the two
+#: producers is noted for their owners; here the colon form counts as the same
+#: heading, so a guide either producer wrote is read.
 _INTEGRATION_HEADING_RE = re.compile(
-    r"^##+\s*(?:(?:§\s*)?4\s*(?:Integration\s+Contracts?)?|Integration\s+Contracts?)\s*$",
-    re.MULTILINE | re.IGNORECASE,
+    r"^##+\s*(?:§\s*)?4\s*:?\s*(?:Integration\s+Contracts?)?\s*$",
+    re.MULTILINE,
 )
+#: Only when no such heading exists: ``## Integration Contracts`` (the
+#: emitter's fallback, also case-sensitive).
+_INTEGRATION_FALLBACK_RE = re.compile(
+    r"^##+\s*Integration\s+Contracts?\s*$", re.MULTILINE
+)
+#: The section runs to the next heading of level two or more, as the emitter's.
 _SECTION_RE = re.compile(r"^##+", re.MULTILINE)
-_ROUTE_LINE_RE = re.compile(r"^\s*-?\s*route:\s*\S", re.MULTILINE | re.IGNORECASE)
+#: The emitter's own route pattern (``_ROUTE_RE``, which is case-insensitive),
+#: with a route that is only spaces not counted, as the emitter skips it.
+_ROUTE_LINE_RE = re.compile(r"(?i)^\s*[-]?\s*route:\s*\S", re.MULTILINE)
 
 
 def guide_claims_routes(guide_text: str) -> bool:
     """Does the guide's Integration Contracts section declare a ``route:``?
 
-    The section is ``## §4 Integration Contracts`` or ``## Integration
-    Contracts`` at any heading level of two or more, up to the next heading of
-    two or more; a ``route:`` line inside it (optionally a YAML list item) is
-    the producers' own signal that they wrote ``qa/leak-sweep.yaml``
-    (specialist-agent ``qa/leak_sweep_emit.py``).
+    Only the FIRST matching heading's section is read, exactly as the
+    specialist emitter reads it; a ``route:`` line in it is that producer's own
+    signal that it wrote ``qa/leak-sweep.yaml``.
     """
-    for heading in _INTEGRATION_HEADING_RE.finditer(guide_text):
-        rest = guide_text[heading.end():]
-        following = _SECTION_RE.search(rest)
-        body = rest[: following.start()] if following else rest
-        if _ROUTE_LINE_RE.search(body):
-            return True
-    return False
+    heading = _INTEGRATION_HEADING_RE.search(guide_text)
+    if heading is None:
+        heading = _INTEGRATION_FALLBACK_RE.search(guide_text)
+    if heading is None:
+        return False
+    rest = guide_text[heading.end():]
+    following = _SECTION_RE.search(rest)
+    body = rest[: following.start()] if following else rest
+    return _ROUTE_LINE_RE.search(body) is not None
 
 
 async def check_supplied_bundle(

@@ -557,9 +557,32 @@ def test_the_integration_contracts_rule_matches_the_producers() -> None:
     assert guide_claims_routes("## §4 Integration Contracts\n- route: /a\n")
     assert guide_claims_routes("### Integration Contracts\nroute: /a\n## Next\n")
     assert guide_claims_routes("## §4\n  - route: /a\n")
+    assert guide_claims_routes("## 4 Integration Contract\nROUTE: /a\n")
     assert not guide_claims_routes("## Integration Contracts\nnone\n## B\nroute: /b\n")
     assert not guide_claims_routes("# Integration Contracts\nroute: /a\n")
     assert not guide_claims_routes("## Overview\nroute: /a\n")
+    assert not guide_claims_routes("## §4 Integration Contracts\nroute:   \n")
+
+
+def test_guardkits_colon_form_counts_as_the_heading() -> None:
+    assert guide_claims_routes("## §4: Integration Contracts\n- route: /a\n")
+
+
+def test_the_heading_is_case_sensitive_like_the_emitter() -> None:
+    assert not guide_claims_routes("## integration contracts\nroute: /a\n")
+    assert not guide_claims_routes("## §4 INTEGRATION CONTRACTS\nroute: /a\n")
+
+
+def test_only_the_first_matching_section_is_read() -> None:
+    first_empty = (
+        "## §4 Integration Contracts\nnone here\n"
+        "## Other\n\n## §4 Integration Contracts\n- route: /late\n"
+    )
+    assert not guide_claims_routes(first_empty)
+    # The fallback heading is read only when no §4 heading exists at all.
+    assert not guide_claims_routes(
+        "## §4\nnothing\n## Integration Contracts\nroute: /a\n"
+    )
 
 
 def test_only_relative_markdown_links_are_collected() -> None:
