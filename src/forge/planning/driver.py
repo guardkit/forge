@@ -634,7 +634,11 @@ DIGEST (the plain-language list a person reads).
 
 On a REWRITE round the two optional arguments carry the owner's note VERBATIM
 (``validate_feedback``) and the prior artifact set (``revision_of``). A
-first-round dispatch passes neither."""
+first-round dispatch passes neither.
+
+``context`` (4 October 2026) is passed, on every call, only for a project that
+declares binding documents: the texts the door recorded, each after one line
+naming its path. A project that declares none is called without it."""
 
 DispatchFeaturePlanFn = Callable[..., Awaitable[Any]]
 """``async (*, plan_run_id, correlation_id, feature_id, spec_feature,
@@ -670,7 +674,12 @@ sent both since 2026-09-13; the plan leg sent neither, which is why a plan that
 moved the web address or added a login requirement nobody asked for could still
 be scored a good plan. Both are OPTIONAL on both sides, so the two images may be
 redeployed in either order, and a run with no sentence on its row sends the set
-that shipped before this existed."""
+that shipped before this existed.
+
+4 October 2026 (project initialisation): ``context`` carries the same project
+documents the spec leg is sent, on every plan call, only for a project that
+declares binding documents. Optional on both sides (specialist-agent fcec409):
+an older plan writer ignores it, so the plan receipt says "sent"."""
 
 
 def _reject_word_split(note: str) -> tuple[bool, str]:
@@ -3068,6 +3077,17 @@ class PlanningRunDriver:
             else None
         )
 
+        # The project's documents, exactly as the door recorded them, on EVERY
+        # spec call, rewrites included. Sent only when there are some, so a
+        # project that declares none sends the call it always sent.
+        documents, broken = self._recorded_project_documents(correlation_id)
+        if broken is not None:
+            await self._fail_leg(correlation_id, _FEATURE_SPEC_STAGE, broken)
+            return None
+        project_context: dict[str, Any] = (
+            {"context": context_texts(documents)} if documents else {}
+        )
+
         try:
             result = await deps.dispatch_feature_spec(
                 plan_run_id=plan_run_id,
@@ -3083,6 +3103,7 @@ class PlanningRunDriver:
                 # word, and what the repository already does for its words.
                 request_text=self._request_text_of(row),
                 repository_facts=await self._repository_facts_for(correlation_id, repo_path, row),
+                **project_context,
             )
         except Exception as exc:  # noqa: BLE001 — dispatch boundary
             await self._fail_leg(
@@ -3367,6 +3388,9 @@ class PlanningRunDriver:
             "assumption_count": len(digest_obj.get("assumptions") or []),
             "cycle": len(notes) + 1,
         }
+        if documents:
+            # Which files, which versions, were given to the spec writer.
+            draft["project_documents"] = self._project_documents_receipt(documents)
         if rewrite is not None:
             # Persisted on the draft row, not on the card: the door's opening
             # notification reads it, and a restart that re-opens the draft
@@ -5550,6 +5574,16 @@ class PlanningRunDriver:
             spec_feature_paths,
         )
 
+        # The project's documents, exactly as the door recorded them — the same
+        # texts the spec writer was given — on every plan call. Sent only when
+        # there are some: a project that declares none sends the call it always
+        # sent. An older plan writer ignores the field, so the receipt says
+        # "sent", not "used".
+        documents, broken = self._recorded_project_documents(correlation_id)
+        if broken is not None:
+            await self._fail_leg(correlation_id, _FEATURE_PLAN_STAGE, broken)
+            return None
+
         async def _ask_the_plan_writer(
             *, note: str | None = None, prior: Mapping[str, str] | None = None
         ) -> Any:
@@ -5568,6 +5602,8 @@ class PlanningRunDriver:
                 extra["validate_feedback"] = note
             if prior is not None:
                 extra["revision_of"] = dict(prior)
+            if documents:
+                extra["context"] = context_texts(documents)
             return await deps.dispatch_feature_plan(
                 plan_run_id=plan_run_id,
                 correlation_id=correlation_id,
@@ -7223,6 +7259,10 @@ class PlanningRunDriver:
             details["stamp_normalizer"] = stamp_receipt
         if semantic_review is not None:
             details["semantic_review"] = semantic_review
+        documents, _broken = self._recorded_project_documents(correlation_id)
+        if documents:
+            # Which files, which versions, were given to the plan writer.
+            details["project_documents"] = self._project_documents_receipt(documents)
         unavailable_line = self._repository_unavailable_line(correlation_id)
         if unavailable_line is not None:
             # Read by the build gate (the 1 October planner fix): the card the person

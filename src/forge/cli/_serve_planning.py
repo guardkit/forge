@@ -177,6 +177,7 @@ def build_feature_spec_command_args(
     validate_feedback: str | None = None,
     request_text: str | None = None,
     repository_facts: str | None = None,
+    context: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     """Exact ``po_feature_spec`` (007) wire args. See the CONTRACT note above.
 
@@ -206,7 +207,19 @@ def build_feature_spec_command_args(
         args["request_text"] = str(request_text)
     if repository_facts is not None and str(repository_facts).strip():
         args["repository_facts"] = str(repository_facts)
+    # The project's own documents (project initialisation design, 4 October
+    # 2026): the instruction files and binding documents read at the commit the
+    # work starts from, each after one line naming its path — the spec mode's
+    # existing ``context`` list. Absent or empty, the wire is what it was.
+    documents = _context_documents(context)
+    if documents:
+        args["context"] = documents
     return args
+
+
+def _context_documents(context: Sequence[str] | None) -> list[str]:
+    """The non-blank context texts, in order; empty means "send nothing"."""
+    return [str(text) for text in (context or ()) if str(text).strip()]
 
 
 def build_feature_plan_command_args(
@@ -221,6 +234,7 @@ def build_feature_plan_command_args(
     repository_facts: str | None = None,
     revision_of: dict[str, str] | None = None,
     validate_feedback: str | None = None,
+    context: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     """Exact ``architect_feature_plan`` (008) wire args. See the CONTRACT note above.
 
@@ -285,6 +299,13 @@ def build_feature_plan_command_args(
         args["revision_of"] = dict(revision_of)
     if validate_feedback is not None and str(validate_feedback).strip():
         args["validate_feedback"] = validate_feedback
+    # The same project documents the spec leg sends, under the same name
+    # (4 October 2026). The plan mode takes an optional ``context`` from
+    # specialist-agent fcec409; an older plan writer ignores the field. Absent
+    # or empty, the wire is what it was.
+    documents = _context_documents(context)
+    if documents:
+        args["context"] = documents
     return args
 
 
@@ -1026,6 +1047,7 @@ async def compose_planning_consumer_and_dispatch(
             validate_feedback: str | None = None,
             request_text: str | None = None,
             repository_facts: str | None = None,
+            context: Sequence[str] | None = None,
         ) -> Any:
             return await dispatch_specialist_stage(
                 stage=StageClass.FEATURE_SPEC,
@@ -1041,6 +1063,7 @@ async def compose_planning_consumer_and_dispatch(
                     validate_feedback=validate_feedback,
                     request_text=request_text,
                     repository_facts=repository_facts,
+                    context=context,
                 ),
             )
 
@@ -1058,6 +1081,7 @@ async def compose_planning_consumer_and_dispatch(
             repository_facts: str | None = None,
             revision_of: dict[str, str] | None = None,
             validate_feedback: str | None = None,
+            context: Sequence[str] | None = None,
         ) -> Any:
             return await dispatch_specialist_stage(
                 stage=StageClass.FEATURE_PLAN,
@@ -1078,6 +1102,7 @@ async def compose_planning_consumer_and_dispatch(
                     repository_facts=repository_facts,
                     revision_of=revision_of,
                     validate_feedback=validate_feedback,
+                    context=context,
                 ),
             )
 
