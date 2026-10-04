@@ -4499,6 +4499,20 @@ async def _run_one_build(state: AutobuildRunnerState) -> dict[str, Any]:
         ",".join(sorted(launch_env)),
     )
 
+    # A build's clean-up under way in this runner (another build's cancel,
+    # timeout or wedge): its place may already have been given to this one, so
+    # this one waits for it to finish before starting anything.
+    loop = asyncio.get_running_loop()
+    last_report = loop.time()
+    while build_processes.cleanup_in_progress():
+        if loop.time() - last_report >= OWNED_STOP_REPORT_SECONDS:
+            last_report = loop.time()
+            logger.warning(
+                "autobuild_runner: build %s waits to start until another "
+                "build's clean-up in this runner has finished",
+                receipt_build_id,
+            )
+        await asyncio.sleep(0.2)
     current_run = build_processes.lookup(receipt_build_id)
     if current_run is not None and current_run.stop_requested:
         # Superseded by a relaunch before its child existed: never start it.
@@ -5182,47 +5196,48 @@ async def _stop_owned_until_gone(
     call the model, whatever the build's terminal class. Never raises (a
     cancel is the caller's).
     """
-    first = True
-    loop = asyncio.get_running_loop()
-    last_report = loop.time()
-    while True:
-        remaining: Any
-        try:
-            if first:
-                processes = await _stop_owned_once(owned, proc)
-            else:
-                processes = await build_processes.stop_owned(
-                    owned.build_id,
-                    recorded=owned.recorded,
-                    grace_seconds=0.0,
+    with build_processes.cleaning_up():
+        first = True
+        loop = asyncio.get_running_loop()
+        last_report = loop.time()
+        while True:
+            remaining: Any
+            try:
+                if first:
+                    processes = await _stop_owned_once(owned, proc)
+                else:
+                    processes = await build_processes.stop_owned(
+                        owned.build_id,
+                        recorded=owned.recorded,
+                        grace_seconds=0.0,
+                    )
+                containers = (
+                    await build_processes.remove_fixture_containers(owned.build_id)
+                    if not processes
+                    else []
                 )
-            containers = (
-                await build_processes.remove_fixture_containers(owned.build_id)
-                if not processes
-                else []
-            )
-            remaining = {"processes": build_processes.describe(processes)}
-            if containers is None:
-                remaining["containers"] = "the container engine cannot be asked"
-            elif containers:
-                remaining["containers"] = containers
-            done = not processes and containers == []
-        except Exception as exc:  # noqa: BLE001 — keep stopping regardless
-            remaining = f"the stop raised {type(exc).__name__}: {exc}"
-            done = False
-        first = False
-        if done:
-            return
-        if loop.time() - last_report >= OWNED_STOP_REPORT_SECONDS:
-            last_report = loop.time()
-            logger.error(
-                "autobuild_runner: build %s (feature_id=%s) is not yet "
-                "confirmed stopped; its job slot stays held until it is: %s",
-                owned.build_id,
-                feature_id,
-                remaining,
-            )
-        await asyncio.sleep(1.0)
+                remaining = {"processes": build_processes.describe(processes)}
+                if containers is None:
+                    remaining["containers"] = "the container engine cannot be asked"
+                elif containers:
+                    remaining["containers"] = containers
+                done = not processes and containers == []
+            except Exception as exc:  # noqa: BLE001 — keep stopping regardless
+                remaining = f"the stop raised {type(exc).__name__}: {exc}"
+                done = False
+            first = False
+            if done:
+                return
+            if loop.time() - last_report >= OWNED_STOP_REPORT_SECONDS:
+                last_report = loop.time()
+                logger.error(
+                    "autobuild_runner: build %s (feature_id=%s) is not yet "
+                    "confirmed stopped; its job slot stays held until it is: %s",
+                    owned.build_id,
+                    feature_id,
+                    remaining,
+                )
+            await asyncio.sleep(1.0)
 
 
 async def _stop_owned_shielded(

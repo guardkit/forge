@@ -49,8 +49,9 @@ import shutil
 import signal
 import subprocess
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +66,8 @@ __all__ = [
     "register",
     "remove_fixture_containers",
     "signal_process_group",
+    "cleaning_up",
+    "cleanup_in_progress",
     "stop_owned",
     "stop_run",
     "begin",
@@ -598,6 +601,28 @@ def register(build_id: str, pid: int) -> OwnedBuild:
 
 def lookup(build_id: str) -> OwnedBuild | None:
     return _BUILDS.get(build_id)
+
+
+#: How many builds' clean-ups (cancel, timeout, wedge, or the sweep after a
+#: finish) are under way in this runner process. While any is, a new run
+#: waits before it spawns its GuardKit child: the place the factory gave it
+#: may be one an earlier build let go while its processes were still going.
+_CLEANUPS_IN_PROGRESS: int = 0
+
+
+@contextmanager
+def cleaning_up() -> Iterator[None]:
+    """Count one build's clean-up as under way for as long as it lasts."""
+    global _CLEANUPS_IN_PROGRESS
+    _CLEANUPS_IN_PROGRESS += 1
+    try:
+        yield
+    finally:
+        _CLEANUPS_IN_PROGRESS -= 1
+
+
+def cleanup_in_progress() -> bool:
+    return _CLEANUPS_IN_PROGRESS > 0
 
 
 async def stop_run(entry: OwnedBuild) -> list[OwnedProcess]:
