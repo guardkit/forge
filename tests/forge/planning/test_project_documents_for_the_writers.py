@@ -32,12 +32,23 @@ import hashlib
 import json
 import sqlite3
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
-from forge.deploy.candidate_tree import FileAtCommit
+from forge.adapters.sqlite import connect as sqlite_connect
+from forge.cli._serve_planning import (
+    build_feature_plan_command_args,
+    build_feature_spec_command_args,
+)
+from forge.config.models import PlanningConfig, TargetTerminalConfig
+from forge.deploy.candidate_tree import FileAtCommit, RemoteStartPoint
 from forge.lifecycle import migrations
+from forge.pipeline.dispatchers.specialist import build_specialist_command
+from forge.pipeline.stage_taxonomy import StageClass
+from forge.planning.driver import PlanningDriverDeps, PlanningRunDriver
+from forge.planning.gate_adapters import build_planning_gate_adapters
 from forge.planning.project_documents import (
     PROJECT_DOCUMENTS_BUDGET_BYTES,
     ProjectDocument,
@@ -46,6 +57,8 @@ from forge.planning.project_documents import (
 )
 from forge.planning.run_store import SqlitePlanningRunStore
 from forge.planning.states import PlanningState
+from forge.planning.target_terminal_tools import ToolOutcome
+from tests.forge.planning import test_driver_spec_digest_door as door
 from tests.forge.planning import test_memory_name_at_the_door as at_the_door
 
 _DOCUMENTS_STAGE = "project-documents"
@@ -430,3 +443,323 @@ async def test_documents_over_the_budget_fail_the_run_at_the_door(
     assert ledger.get_run(at_the_door.CID)["state"] == PlanningState.FAILED.value
     assert str(PROJECT_DOCUMENTS_BUDGET_BYTES) in h.errors[0]
     assert f"{DECLARED[1]} ({len(big)} bytes)" in h.errors[0]
+
+
+# ---------------------------------------------------------------------------
+# The whole chain: what the spec writer and the plan writer are sent
+# ---------------------------------------------------------------------------
+
+
+class _DocsGitRunner(door.RecordingGitRunner):
+    """The digest-door stand-in, whose commit also carries the project's files."""
+
+    def __init__(self, tree: _Tree) -> None:
+        super().__init__()
+        self.tree = tree
+
+    async def fetch_remote_start_point(self, repo_path: str) -> Any:
+        return RemoteStartPoint(branch="main", commit=START)
+
+    async def read_file_at_commit(  # type: ignore[override]
+        self,
+        repo_path: str,
+        commit: str,
+        file_path: str,
+        *,
+        ordinary_file_only: bool = False,
+    ) -> Any:
+        return await self.tree.read_file_at_commit(
+            repo_path, commit, file_path, ordinary_file_only=ordinary_file_only
+        )
+
+
+def _chain(
+    store: SqlitePlanningRunStore,
+    tree: _Tree,
+    *,
+    answers: list[Any],
+    on_spec: Any = None,
+) -> SimpleNamespace:
+    """A driver whose spec and plan writers record every keyword they get."""
+    from datetime import UTC, datetime
+
+    def clock() -> datetime:
+        return datetime.now(UTC)
+
+    repository, state_machine = build_planning_gate_adapters(store, clock=clock)
+    calls: dict[str, list[dict[str, Any]]] = {"po": [], "spec": [], "plan": []}
+    notifications: list[tuple[str, str, str]] = []
+
+    async def dispatch_po(**kwargs: Any) -> Any:
+        calls["po"].append(kwargs)
+        return SimpleNamespace(
+            outcome=SimpleNamespace(value="completed"),
+            coach_score=0.9,
+            criterion_breakdown=[],
+            detection_findings=(),
+            role_output={"title": "docs", "problem_statement": "ship a thing"},
+            reason=None,
+        )
+
+    async def dispatch_spec(**kwargs: Any) -> Any:
+        calls["spec"].append(kwargs)
+        if on_spec is not None:
+            on_spec(len(calls["spec"]))
+        return door._spec_reply()
+
+    async def dispatch_plan(**kwargs: Any) -> Any:
+        calls["plan"].append(kwargs)
+        return door._plan_reply(kwargs["feature_id"])
+
+    async def ok(*_args: Any) -> ToolOutcome:
+        return ToolOutcome(ok=True)
+
+    async def dispatch_build_trigger(**_: Any) -> Any:
+        from forge.planning.driver import BuildTriggerResult
+
+        return BuildTriggerResult(queued=True, build_id="build-1")
+
+    async def publish_notification(cid: str, message: str, level: str) -> None:
+        notifications.append((cid, message, level))
+
+    cfg = PlanningConfig(
+        enabled=True,
+        target_repo_paths={door.TARGET_REPO: "/srv/repos/api_test"},
+        target_terminal=TargetTerminalConfig(enabled=True),
+        originator_wait_seconds=3600,
+    )
+    git = _DocsGitRunner(tree)
+    driver = PlanningRunDriver(
+        PlanningDriverDeps(
+            store=store,
+            repository=repository,
+            state_machine=state_machine,
+            approval_publisher=door.FakePublisher(),
+            subscriber_factory=door.SharedScriptFactory(answers),
+            dispatch_product_owner=dispatch_po,
+            second_opinion_provider=door.FakeSecondOpinion(),
+            git_runner=git,
+            planning_config=cfg,
+            clock=clock,
+            publish_notification=publish_notification,
+            dispatch_feature_spec=dispatch_spec,
+            dispatch_feature_plan=dispatch_plan,
+            normalize_feature_spec=ok,
+            validate_feature_plan=ok,
+            validate_pass_bar=ok,
+            validate_gate_registry=ok,
+            dispatch_build_trigger=dispatch_build_trigger,
+        )
+    )
+    return SimpleNamespace(
+        driver=driver, calls=calls, notifications=notifications, tree=tree
+    )
+
+
+@pytest.fixture
+def chain_store(tmp_path: Path) -> SqlitePlanningRunStore:
+    cx = sqlite_connect.connect_writer(tmp_path / "chain.db")
+    migrations.apply_at_boot(cx)
+    return SqlitePlanningRunStore(cx, target_terminal_enabled=True)
+
+
+def _declared_tree() -> _Tree:
+    return _Tree(
+        {
+            ".guardkit/config.yaml": DECLARES_DOCUMENTS,
+            "AGENTS.md": AGENTS,
+            DECLARED[0]: MISSION_V1,
+            DECLARED[1]: TECH_V1,
+        },
+        links={"CLAUDE.md": "AGENTS.md"},
+    )
+
+
+def _events(store: SqlitePlanningRunStore, stage: str) -> list[dict[str, Any]]:
+    return [
+        json.loads(event["details_json"] or "{}")
+        for event in store.list_events(door.CID)
+        if event["stage_label"] == stage
+    ]
+
+
+def _drafted(store: SqlitePlanningRunStore) -> list[dict[str, Any]]:
+    return [
+        json.loads(event["details_json"])
+        for event in store.list_events(door.CID)
+        if event["stage_label"] == door._DRAFT_STAGE and event["status"] == "drafted"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_both_writers_get_the_documents_on_every_call_and_say_so(
+    chain_store: SqlitePlanningRunStore,
+) -> None:
+    """First spec call, the rewrite after the owner's note, and the plan call
+    all carry the same texts — the ones read at the start commit, even though
+    the project changes after the first spec call — and both receipts record
+    path, hash, size and commit."""
+    tree = _declared_tree()
+
+    def the_project_moves_on(call: int) -> None:
+        if call == 1:
+            tree.files[DECLARED[0]] = MISSION_V1 + "\nChanged after the start.\n"
+
+    door._queue(chain_store)
+    h = _chain(
+        chain_store,
+        tree,
+        answers=[
+            door._answer("reject", notes="the second example should be a 404"),
+            door._answer("approve", attempt=1),
+        ],
+        on_spec=the_project_moves_on,
+    )
+    await h.driver.drive(door.CID)
+
+    assert chain_store.get_run(door.CID)["state"] == PlanningState.BUILD_QUEUED.value
+    expected = [
+        f"File: AGENTS.md\n{AGENTS}",
+        f"File: {DECLARED[0]}\n{MISSION_V1}",
+        f"File: {DECLARED[1]}\n{TECH_V1}",
+    ]
+    first, rewrite = h.calls["spec"]
+    assert first["context"] == expected
+    assert rewrite["validate_feedback"] == "the second example should be a 404"
+    assert rewrite["context"] == expected
+    assert [call["context"] for call in h.calls["plan"]] == [expected]
+    # Nothing was read again after the door: every project-file read came first.
+    paths_read = [path for _commit, path, _ordinary in tree.reads]
+    assert paths_read.count(DECLARED[0]) == 1
+
+    receipt = [
+        {
+            "path": "AGENTS.md",
+            "sha256": _sha(AGENTS),
+            "bytes": len(AGENTS),
+            "commit": START,
+        },
+        {
+            "path": DECLARED[0],
+            "sha256": _sha(MISSION_V1),
+            "bytes": len(MISSION_V1),
+            "commit": START,
+        },
+        {
+            "path": DECLARED[1],
+            "sha256": _sha(TECH_V1),
+            "bytes": len(TECH_V1),
+            "commit": START,
+        },
+    ]
+    # The first draft and the rewrite: one ``drafted`` row each.
+    drafts = _drafted(chain_store)
+    assert len(drafts) == 2
+    for draft in drafts:
+        assert draft["spec_draft"]["project_documents"] == {
+            "status": "sent",
+            "documents": receipt,
+        }
+    (plan_row,) = _events(chain_store, "feature-plan")
+    assert plan_row["project_documents"] == {"status": "sent", "documents": receipt}
+    # Recorded once, at the door, before the product-owner was asked anything.
+    labels = [event["stage_label"] for event in chain_store.list_events(door.CID)]
+    assert labels.count(_DOCUMENTS_STAGE) == 1
+    assert labels.index(_DOCUMENTS_STAGE) < labels.index("product_owner")
+
+
+@pytest.mark.asyncio
+async def test_a_project_that_declares_nothing_sends_what_it_always_sent(
+    chain_store: SqlitePlanningRunStore,
+) -> None:
+    tree = _Tree(
+        {".guardkit/config.yaml": DECLARES_NOTHING, "AGENTS.md": AGENTS}
+    )
+    door._queue(chain_store)
+    h = _chain(chain_store, tree, answers=[door._answer("approve")])
+
+    await h.driver.drive(door.CID)
+
+    assert chain_store.get_run(door.CID)["state"] == PlanningState.BUILD_QUEUED.value
+    assert all("context" not in call for call in h.calls["spec"] + h.calls["plan"])
+    # Only the settings file was read: not even the instruction file.
+    assert [path for _c, path, _o in tree.reads] == [".guardkit/config.yaml"] * len(
+        tree.reads
+    )
+    assert _events(chain_store, _DOCUMENTS_STAGE) == []
+    drafts = _drafted(chain_store)
+    assert drafts and all("project_documents" not in d["spec_draft"] for d in drafts)
+    (plan_row,) = _events(chain_store, "feature-plan")
+    assert "project_documents" not in plan_row
+
+
+@pytest.mark.parametrize(
+    ("change", "said"),
+    [
+        (lambda t: t.files.pop(DECLARED[1]), "no such file"),
+        (lambda t: t.links.__setitem__(DECLARED[1], "../x.md") or t.files.pop(DECLARED[1]), "symbolic link"),
+        (
+            lambda t: t.files.__setitem__(
+                DECLARED[1], "z" * PROJECT_DOCUMENTS_BUDGET_BYTES
+            ),
+            str(PROJECT_DOCUMENTS_BUDGET_BYTES),
+        ),
+    ],
+    ids=["missing", "symbolic-link", "over-budget"],
+)
+@pytest.mark.asyncio
+async def test_a_refusal_stops_the_run_before_any_model_is_asked(
+    chain_store: SqlitePlanningRunStore, change: Any, said: str
+) -> None:
+    tree = _declared_tree()
+    change(tree)
+    door._queue(chain_store)
+    h = _chain(chain_store, tree, answers=[door._answer("approve")])
+
+    await h.driver.drive(door.CID)
+
+    assert chain_store.get_run(door.CID)["state"] == PlanningState.FAILED.value
+    assert h.calls == {"po": [], "spec": [], "plan": []}
+    errors = [message for _cid, message, level in h.notifications if level == "error"]
+    assert len(errors) == 1 and said in errors[0]
+    assert _events(chain_store, _DOCUMENTS_STAGE) == []
+
+
+# ---------------------------------------------------------------------------
+# The wire
+# ---------------------------------------------------------------------------
+
+
+def test_the_generic_dispatcher_keeps_context_on_the_wire() -> None:
+    texts = [f"File: {DECLARED[0]}\n{MISSION_V1}"]
+    _command, spec_args = build_specialist_command(
+        StageClass.FEATURE_SPEC,
+        request_text=None,
+        context_entries=[],
+        extra_command_args=build_feature_spec_command_args(
+            from_input="the input", context=texts
+        ),
+    )
+    assert spec_args["context"] == texts
+
+    _command, plan_args = build_specialist_command(
+        StageClass.FEATURE_PLAN,
+        request_text=None,
+        context_entries=[],
+        extra_command_args=build_feature_plan_command_args(
+            feature_id="FEAT-1",
+            spec_feature="Feature: x\n",
+            spec_summary="# s\n",
+            target_repo_descriptor={"repo": "o/r", "test_roots": []},
+            context=texts,
+        ),
+    )
+    assert plan_args["context"] == texts
+
+    _command, plain = build_specialist_command(
+        StageClass.FEATURE_SPEC,
+        request_text=None,
+        context_entries=[],
+        extra_command_args=build_feature_spec_command_args(from_input="the input"),
+    )
+    assert "context" not in plain

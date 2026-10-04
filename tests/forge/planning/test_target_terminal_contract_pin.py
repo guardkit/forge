@@ -23,7 +23,10 @@ against them; these pins MUST track them byte-for-byte):
          optional      = spec_assumptions, spec_feature_paths, revision_of,
                          validate_feedback, and (2026-09-15) request_text,
                          repository_facts — the planning coach's two
-                         ground-truth documents, optional on both sides
+                         ground-truth documents, optional on both sides —
+                         and (specialist-agent fcec409, 4 October 2026)
+                         context, the project's own documents, with the spec
+                         mode's shape
          TARGET_REPO_DESCRIPTOR_SCHEMA required = {"repo", "test_roots"}
 
 ``spec_feature_paths`` (2026-08-22) is OPTIONAL on both sides deliberately. The
@@ -84,6 +87,24 @@ def test_feature_spec_wire_args_are_exactly_from_input() -> None:
     args = build_feature_spec_command_args(from_input="the approved input content")
     assert set(args) == _FEATURE_SPEC_REQUIRED
     assert args["from_input"] == "the approved input content"
+    # A project that declares no documents sends nothing more: no context, an
+    # empty one or a blank one are all the call that shipped.
+    for nothing in (None, [], ["", "   "]):
+        assert build_feature_spec_command_args(
+            from_input="the approved input content", context=nothing
+        ) == {"from_input": "the approved input content"}
+
+
+def test_feature_spec_context_rides_when_documents_are_declared() -> None:
+    """The project's own documents (project initialisation design, 4 October
+    2026) ride as the spec mode's existing ``context`` list, in order, word for
+    word, and nothing else changes."""
+    texts = ["File: AGENTS.md\n# Agents\n", "File: docs/mission.md\n# Mission\n"]
+    args = build_feature_spec_command_args(
+        from_input="the approved input content", context=texts
+    )
+    assert set(args) == _FEATURE_SPEC_REQUIRED | {"context"}
+    assert args["context"] == texts
 
 
 def test_feature_spec_revision_args_ride_only_on_a_rewrite() -> None:
@@ -146,6 +167,29 @@ def test_feature_plan_wire_args_are_exactly_the_required_four() -> None:
         "repo": "guardkit/api_test",
         "test_roots": ["tests/health", "tests/users"],
     }
+    for nothing in (None, [], ["  "]):
+        assert build_feature_plan_command_args(
+            feature_id="FEAT-BEEF",
+            spec_feature="Feature: x\n",
+            spec_summary="# summary\n",
+            target_repo_descriptor={"repo": "guardkit/api_test", "test_roots": []},
+            context=nothing,
+        ).keys() == _FEATURE_PLAN_REQUIRED
+
+
+def test_feature_plan_context_rides_when_documents_are_declared() -> None:
+    """The same texts the spec leg sends, under the same name; optional on both
+    sides, so an older plan writer ignores it."""
+    texts = ["File: docs/mission.md\n# Mission\n"]
+    args = build_feature_plan_command_args(
+        feature_id="FEAT-BEEF",
+        spec_feature="Feature: x\n",
+        spec_summary="# summary\n",
+        target_repo_descriptor={"repo": "guardkit/api_test", "test_roots": []},
+        context=texts,
+    )
+    assert set(args) == _FEATURE_PLAN_REQUIRED | {"context"}
+    assert args["context"] == texts
 
 
 def test_feature_plan_wire_args_include_spec_assumptions_when_present() -> None:
