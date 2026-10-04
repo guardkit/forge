@@ -961,3 +961,41 @@ class TestTheHostWrapperIsStillServed:
         assert exit_code != 0
         assert "sidecar refused (HTTP 400)" in output
         assert key in output
+
+
+@pytest.mark.asyncio
+async def test_a_promote_whose_answer_was_lost_says_so_in_what_the_step_said(
+    repository: RunbookRepository,
+    runbook_publisher: AsyncMock,
+    clone: Path,
+    tmp_path: Path,
+) -> None:
+    """4 October 2026, Codex's review: a promote whose connection to the
+    sidecar failed may have run. The real runner says so in its sentence, and
+    the stage hands that sentence to the press in ``deploy_output``, which is
+    where the press decides whether the merge word's hold can be put down."""
+    from forge.deploy.sidecar_runner import THE_ANSWER_WAS_LOST
+
+    profile = load_deploy_profile(clone / "deploy" / "profile.yaml")
+    stage = _stage(
+        repository=repository,
+        runbook_publisher=runbook_publisher,
+        clone=clone,
+        tmp_path=tmp_path,
+        sidecar_url="http://127.0.0.1:9",  # nothing listens here
+        sandbox=None,
+        invoker=None,
+    )
+
+    promoted = await stage.promote(
+        profile,
+        correlation_id="c",
+        deploy_run_id="run-lost-1",
+        feature=FEATURE_ID,
+        feat_id=FEATURE_ID,
+    )
+
+    assert promoted.outcome == "failed"
+    said = promoted.detail["deploy_output"]
+    assert said.startswith("sidecar unreachable at http://127.0.0.1:9 ")
+    assert f"[{THE_ANSWER_WAS_LOST}]" in said

@@ -4094,6 +4094,75 @@ def _no_answer_came_back(status: str) -> _FakeGuardKit:
     return _NoReport()
 
 
+class ASidecarThat:
+    """A real HTTP sidecar on a loopback port, so a leg's answer goes through
+    the real transport-result conversion (:class:`SidecarScriptRunner`).
+
+    ``answer=None`` takes the request and drops the connection without
+    answering: the script may have run, and nobody knows (4 October 2026,
+    Codex's review). A dict is sent back as the sidecar's own answer.
+    """
+
+    def __init__(self, answer: dict[str, Any] | None) -> None:
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        class _Handler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:  # noqa: N802 — the stdlib's name
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                if answer is None:
+                    self.close_connection = True
+                    return
+                body = json.dumps(answer).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_args: Any) -> None:
+                return
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def run_the_leg(self, leg: str) -> Any:
+        """Send one script through the real runner; the stage's result shape."""
+        from forge.deploy.sidecar_runner import SidecarScriptRunner
+
+        host, port = self.server.server_address[:2]
+        runner = SidecarScriptRunner(base_url=f"http://{host}:{port}", repo=REPO)
+        exit_code, output = runner(
+            cwd="/sandbox/clone", script="deploy/deploy.sh", env_file=None, timeout=5
+        )
+        return SimpleNamespace(
+            outcome="complete" if exit_code == 0 else "failed",
+            verdict=None,
+            failed_step=None if exit_code == 0 else leg,
+            events=(),
+            detail={"deploy_output": output, "candidate": "torn-down"},
+        )
+
+    def close(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+
+
+class _ATeardownThroughTheSidecar(_FakeDeploy):
+    """Every leg as :class:`_FakeDeploy`, except the candidate teardown, which
+    goes through the real runner to ``sidecar``."""
+
+    def __init__(self, sidecar: ASidecarThat) -> None:
+        super().__init__()
+        self.sidecar = sidecar
+
+    async def __call__(self, **kwargs: Any) -> Any:
+        if kwargs.get("leg") == "candidate_down":
+            self.calls.append(kwargs)
+            return self.sidecar.run_the_leg("candidate_down")
+        return await super().__call__(**kwargs)
+
+
 class TestTheHoldIsPutDownOnlyWhenThePressHasFinished:
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -4239,3 +4308,44 @@ class TestTheHoldIsPutDownOnlyWhenThePressHasFinished:
         again = await _run_executor(deps, repo_root)
         assert again.result == "merge-refused"
         assert "another worker" in again.detail
+
+
+class TestALostTeardownKeepsTheHold:
+    """Codex's review, 4 October 2026: the clean-up's candidate teardown is a
+    step that changes something. If it failed or its answer was lost, it may
+    still be running, so the hold is kept even after a settled ending."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "answer, kept",
+        [
+            (None, True),
+            ({"exit_code": 1, "output_tail": "the teardown went red"}, True),
+            ({"exit_code": 0, "output_tail": "the candidate is down"}, False),
+        ],
+        ids=["answer-lost", "failed-in-its-own-words", "torn-down"],
+    )
+    async def test_the_teardown_decides_whether_the_hold_is_put_down(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+        repo_root: Path,
+        answer: dict[str, Any] | None,
+        kept: bool,
+    ) -> None:
+        sidecar = ASidecarThat(answer)
+        try:
+            deploy = _ATeardownThroughTheSidecar(sidecar)
+            deps, _publisher, _gk, _dp = _deps(
+                config, pool, guardkit=_JoinsForReal(), deploy=deploy
+            )
+
+            outcome = await _run_executor(deps, repo_root)
+
+            assert outcome.result == "publication-pending", outcome.detail
+            assert "candidate_down" in _legs(deploy)
+            assert (_the_hold(pool).lease_holder is not None) is kept
+            again = await _run_executor(deps, repo_root)
+            assert ("another worker" in again.detail) is kept
+        finally:
+            sidecar.close()
