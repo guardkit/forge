@@ -843,6 +843,64 @@ _SAME_LIST_NOTIFICATION = (
 _CHANGED_LIST_CARD_LINE = "What changed since your note: {changes}."
 
 # ---------------------------------------------------------------------------
+# The possible contradiction (4 October 2026, the owner: "yes make the change so
+# it's a warning on the card"). The spec writer no longer refuses a spec over a
+# pair its reviewer says cannot both be true; it writes the pair to
+# ``coherence_warning.json`` beside the spec, and the card shows it in its own
+# section. It is never added to ``what_happened``, so that paragraph stays
+# exactly as it was, and the extra section has a bounded length of its own.
+# ---------------------------------------------------------------------------
+
+#: The file the spec writer puts beside the spec when its reviewer named a pair.
+_COHERENCE_WARNING_FILE = "coherence_warning.json"
+#: At most this many pairs are shown; the rest are counted ("And N more.").
+_POSSIBLE_CONTRADICTION_SHOWN = 2
+#: Per-field cuts. With two pairs these keep the whole text under 1,400
+#: characters by construction (the longest possible text is about 1,330).
+_POSSIBLE_CONTRADICTION_TITLE_CHARS = 150
+_POSSIBLE_CONTRADICTION_REASON_CHARS = 250
+_POSSIBLE_CONTRADICTION_MAX_CHARS = 1399
+
+_POSSIBLE_CONTRADICTION_OPENING = (
+    "Possible contradiction, found by the machine's reviewer and not checked "
+    "by a person:"
+)
+_POSSIBLE_CONTRADICTION_CLOSING = (
+    "If they really conflict, send a note; otherwise approve as usual."
+)
+
+
+def _cut_for_card(text: Any, limit: int) -> str:
+    words = " ".join(str(text or "").split())
+    if len(words) <= limit:
+        return words
+    return words[: limit - 1].rstrip() + "…"
+
+
+def _possible_contradiction_text(pairs: Sequence[Mapping[str, Any]]) -> str:
+    """The card's words for the pairs: at most two, then "And N more."."""
+    sentences: list[str] = []
+    for pair in pairs[:_POSSIBLE_CONTRADICTION_SHOWN]:
+        first = _cut_for_card(pair.get("first"), _POSSIBLE_CONTRADICTION_TITLE_CHARS)
+        second = _cut_for_card(pair.get("second"), _POSSIBLE_CONTRADICTION_TITLE_CHARS)
+        reason = _cut_for_card(pair.get("why"), _POSSIBLE_CONTRADICTION_REASON_CHARS)
+        sentence = f'"{first}" and "{second}".'
+        if reason:
+            sentence += f' Its reason: "{reason}".'
+        if sentences:
+            sentence = "Also " + sentence
+        sentences.append(sentence)
+    more = len(pairs) - _POSSIBLE_CONTRADICTION_SHOWN
+    if more > 0:
+        sentences.append(f"And {more} more.")
+    text = " ".join(
+        [_POSSIBLE_CONTRADICTION_OPENING, *sentences, _POSSIBLE_CONTRADICTION_CLOSING]
+    )
+    # Defensive only: the cuts above already keep it shorter.
+    return text[:_POSSIBLE_CONTRADICTION_MAX_CHARS]
+
+
+# ---------------------------------------------------------------------------
 # The worked examples are checked for provability BEFORE the spec card
 # (Part K of the rewrite-on-refusal lane, 2026-09-07, on Rich's decision).
 #
@@ -3282,6 +3340,14 @@ class PlanningRunDriver:
             # re-reads it rather than re-deriving it from a branch that has
             # moved on. A renderer never sees it.
             draft["rewrite"] = rewrite
+        # THE POSSIBLE CONTRADICTION (4 October 2026). Read from THIS reply, so
+        # a rewrite always carries its own (or none). Saved on the draft row so
+        # a restart replays it; the card gets it in _open_the_card_with.
+        coherence_warning = self._capture_coherence_warning(
+            role_output, correlation_id
+        )
+        if coherence_warning is not None:
+            draft["coherence_warning"] = coherence_warning
         if record:
             self._record_spec_draft(
                 correlation_id, draft, note_from_machine=note_from_machine
@@ -4135,6 +4201,17 @@ class PlanningRunDriver:
             final["card"] = card
         if example_receipt is not None:
             final["example_review"] = example_receipt
+        # The possible contradiction gets a field of its own, never a line in
+        # what_happened (4 October 2026). No warning: the card is unchanged.
+        warning = final.get("coherence_warning")
+        if isinstance(warning, Mapping) and warning.get("possible_contradiction"):
+            card = dict(final.get("card") or {})
+            card["possible_contradiction"] = str(warning["possible_contradiction"])
+            final["card"] = card
+        elif "possible_contradiction" in (final.get("card") or {}):
+            card = dict(final.get("card") or {})
+            card.pop("possible_contradiction", None)
+            final["card"] = card
         unavailable_line = self._repository_facts_card_line(correlation_id)
         if unavailable_line is not None:
             # Silence was the bug (1 October 2026, the 1 October planner fix): the
@@ -10008,6 +10085,63 @@ class PlanningRunDriver:
                     repo_path=repo_path, branch=branch, file_path=rel
                 )
         return feature, summary, assumptions
+
+    @staticmethod
+    def _capture_coherence_warning(
+        role_output: Mapping[str, Any], correlation_id: str
+    ) -> dict[str, Any] | None:
+        """The possible contradiction the spec writer recorded, or ``None``.
+
+        Reads ``coherence_warning.json`` from the reply (a tolerated extra,
+        never committed). ``None`` when there is no file, when every pair was
+        dropped because the spec changed after the check, or when the file
+        cannot be read: a bad file is logged and never fails the leg.
+        """
+        raw: Any = None
+        for name, content in role_output.items():
+            if str(name).rsplit("/", 1)[-1] == _COHERENCE_WARNING_FILE:
+                raw = content
+                break
+        if raw is None:
+            return None
+        try:
+            record = json.loads(raw) if isinstance(raw, (str, bytes)) else raw
+            if not isinstance(record, Mapping):
+                raise ValueError("not a JSON object")
+            entries = record.get("pairs") or []
+            if not isinstance(entries, list):
+                raise ValueError("'pairs' is not a list")
+            pairs: list[dict[str, str]] = []
+            for entry in entries:
+                if not isinstance(entry, Mapping):
+                    raise ValueError("a pair is not an object")
+                first = str(entry.get("first") or "").strip()
+                second = str(entry.get("second") or "").strip()
+                if not first or not second:
+                    raise ValueError("a pair is missing a side")
+                pairs.append(
+                    {
+                        "first": first,
+                        "second": second,
+                        "why": str(entry.get("why") or "").strip(),
+                    }
+                )
+        except (ValueError, TypeError) as exc:
+            logger.warning(
+                "planning driver: run %s — the spec writer's %s could not be "
+                "read (%s); the card shows no possible contradiction",
+                correlation_id,
+                _COHERENCE_WARNING_FILE,
+                exc,
+            )
+            return None
+        if not pairs:
+            return None
+        return {
+            "pairs": pairs,
+            "spec_changed_after_check": bool(record.get("spec_changed_after_check")),
+            "possible_contradiction": _possible_contradiction_text(pairs),
+        }
 
     @staticmethod
     def _capture_pass_bar_seed(role_output: Mapping[str, Any]) -> str | None:

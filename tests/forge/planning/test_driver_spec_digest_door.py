@@ -3727,3 +3727,234 @@ async def test_a_slow_spec_writer_does_not_use_up_the_sandbox_reading_allowance(
     assert h.ctx["dispatches"][1]["validate_feedback"] == _EXAMPLE_NOTE
     what_happened = _digest_cards(h)[0].payload["details"]["summary"]["what_happened"]
     assert what_happened.endswith(_REMOVED_LINE)
+
+
+# ---------------------------------------------------------------------------
+# The possible contradiction (4 October 2026, the owner: "yes make the change so
+# it's a warning on the card"). The spec writer no longer refuses over a pair
+# its reviewer says cannot both be true: it writes coherence_warning.json beside
+# the spec, and the card carries the pair in a field of its own.
+# ---------------------------------------------------------------------------
+
+_KEY_TITLE = "Version endpoint returns the running build"
+_ASSUMPTION_TEXT = "The version string comes from the build metadata."
+_WARNING_PAIR = {
+    "first": _KEY_TITLE,
+    "second": _ASSUMPTION_TEXT,
+    "why": "One example reads the build, the assumption reads the metadata.",
+}
+_EXPECTED_WARNING = (
+    "Possible contradiction, found by the machine's reviewer and not checked by "
+    f'a person: "{_KEY_TITLE}" and "{_ASSUMPTION_TEXT}". Its reason: "One '
+    'example reads the build, the assumption reads the metadata.". If they '
+    "really conflict, send a note; otherwise approve as usual."
+)
+
+
+def _warned_reply(record: Any) -> Any:
+    reply = _spec_reply()
+    reply.role_output["coherence_warning.json"] = (
+        record if isinstance(record, str) else json.dumps(record)
+    )
+    return reply
+
+
+def _warning(pairs: list[dict[str, str]] | None = None) -> dict[str, Any]:
+    return {
+        "pairs": [_WARNING_PAIR] if pairs is None else pairs,
+        "dropped_after_repair": [],
+        "spec_changed_after_check": False,
+    }
+
+
+async def _one_card(store: SqlitePlanningRunStore, reply: Any) -> tuple[_Harness, dict]:
+    _queue(store)
+    h = _make_driver(
+        store,
+        subscriber_factory=SharedScriptFactory([_answer("approve")]),
+        spec_replies=[reply],
+    )
+    await h.driver.drive(CID)
+    return h, _digest_cards(h)[0].payload["details"]["summary"]
+
+
+async def _todays_card(tmp_path: Path) -> dict:
+    cx = sqlite_connect.connect_writer(tmp_path / "today.db")
+    migrations.apply_at_boot(cx)
+    other = SqlitePlanningRunStore(cx, target_terminal_enabled=True)
+    _h, summary = await _one_card(other, _spec_reply())
+    return summary
+
+
+@pytest.mark.asyncio
+async def test_the_possible_contradiction_rides_the_card_and_the_draft_row(
+    store: SqlitePlanningRunStore, tmp_path: Path
+) -> None:
+    h, summary = await _one_card(store, _warned_reply(_warning()))
+
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+    assert summary["possible_contradiction"] == _EXPECTED_WARNING
+    # The opening paragraph is exactly what it is without a warning.
+    today = await _todays_card(tmp_path)
+    assert summary["what_happened"] == today["what_happened"]
+    assert {k: v for k, v in summary.items() if k != "possible_contradiction"} == today
+
+    # Kept on the draft row, so a restart replays it.
+    drafted = [d for status, d in _events(store, _DRAFT_STAGE) if status == "drafted"]
+    record = drafted[-1]["spec_draft"]
+    assert record["card"]["possible_contradiction"] == _EXPECTED_WARNING
+    assert record["coherence_warning"]["pairs"] == [_WARNING_PAIR]
+    # Never committed: only the spec files reach the branch.
+    assert "coherence_warning.json" not in record["spec_files"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "extra",
+    [
+        None,
+        {
+            "pairs": [],
+            "dropped_after_repair": [
+                {**_WARNING_PAIR, "reason": "the spec changed after the check"}
+            ],
+            "spec_changed_after_check": True,
+        },
+    ],
+    ids=["no file", "every pair dropped"],
+)
+async def test_no_warning_leaves_the_card_exactly_as_today(
+    store: SqlitePlanningRunStore, tmp_path: Path, extra: Any
+) -> None:
+    reply = _spec_reply() if extra is None else _warned_reply(extra)
+    _h, summary = await _one_card(store, reply)
+    assert "possible_contradiction" not in summary
+    assert summary == await _todays_card(tmp_path)
+    drafted = [d for status, d in _events(store, _DRAFT_STAGE) if status == "drafted"]
+    assert "coherence_warning" not in drafted[-1]["spec_draft"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "{not json",
+        json.dumps(["a list"]),
+        json.dumps({"pairs": "two"}),
+        json.dumps({"pairs": [{"first": "only one side"}]}),
+    ],
+)
+async def test_a_bad_warning_file_gives_no_field_and_the_leg_carries_on(
+    store: SqlitePlanningRunStore, bad: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level("WARNING"):
+        _h, summary = await _one_card(store, _warned_reply(bad))
+    assert "possible_contradiction" not in summary
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+    assert "coherence_warning.json could not be read" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_a_rewrite_after_a_note_carries_its_own_warning_or_none(
+    store: SqlitePlanningRunStore,
+) -> None:
+    """The value comes from each reply. A note's rewrite without a pair drops
+    the field; a rewrite with a different pair shows that pair."""
+    other_pair = {
+        "first": "Version endpoint rejects an unknown format",
+        "second": _ASSUMPTION_TEXT,
+        "why": "",
+    }
+    _queue(store)
+    h = _make_driver(
+        store,
+        subscriber_factory=SharedScriptFactory(
+            [
+                _answer("reject", notes="say which build"),
+                _answer("reject", notes="and the format", attempt=1),
+                _answer("approve", attempt=2),
+            ]
+        ),
+        spec_replies=[
+            _warned_reply(_warning()),
+            _spec_reply(),
+            _warned_reply(_warning([other_pair])),
+        ],
+    )
+    await h.driver.drive(CID)
+
+    first, second, third = (
+        card.payload["details"]["summary"] for card in _digest_cards(h)
+    )
+    assert first["possible_contradiction"] == _EXPECTED_WARNING
+    assert "possible_contradiction" not in second
+    assert third["possible_contradiction"] == (
+        "Possible contradiction, found by the machine's reviewer and not checked "
+        'by a person: "Version endpoint rejects an unknown format" and '
+        f'"{_ASSUMPTION_TEXT}". If they really conflict, send a note; otherwise '
+        "approve as usual."
+    )
+    drafted = [d for status, d in _events(store, _DRAFT_STAGE) if status == "drafted"]
+    assert [("coherence_warning" in d["spec_draft"]) for d in drafted] == [
+        True,
+        False,
+        True,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_restart_replays_the_possible_contradiction(
+    store: SqlitePlanningRunStore,
+) -> None:
+    _queue(store)
+    publisher = FakePublisher()
+    git = RecordingGitRunner()
+    boot1 = _make_driver(
+        store,
+        subscriber_factory=SharedScriptFactory([]),
+        publisher=publisher,
+        git=git,
+        spec_replies=[_warned_reply(_warning())],
+    )
+    task = asyncio.create_task(boot1.driver.drive(CID))
+    for _ in range(600):
+        await asyncio.sleep(0.01)
+        if _digest_cards(boot1):
+            break
+    assert _digest_cards(boot1)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    boot2 = _make_driver(
+        store,
+        subscriber_factory=SharedScriptFactory([_answer("approve")]),
+        publisher=publisher,
+        git=git,
+    )
+    await boot2.driver.drive(CID)
+    assert len(boot2.ctx["dispatches"]) == 0
+    cards = _digest_cards(boot2)
+    assert [c.payload["details"]["summary"]["possible_contradiction"] for c in cards] == [
+        _EXPECTED_WARNING,
+        _EXPECTED_WARNING,
+    ]
+
+
+def test_two_pairs_are_shown_then_and_n_more_under_1400_characters() -> None:
+    from forge.planning.driver import _possible_contradiction_text
+
+    pairs = [
+        {"first": "F" * 400, "second": "S" * 400, "why": "W" * 900} for _ in range(5)
+    ]
+    text = _possible_contradiction_text(pairs)
+    assert len(text) < 1400
+    assert text.startswith(
+        "Possible contradiction, found by the machine's reviewer and not checked "
+        "by a person:"
+    )
+    assert text.count("Its reason:") == 2
+    assert "And 3 more." in text
+    assert text.endswith("If they really conflict, send a note; otherwise approve as usual.")
