@@ -1346,8 +1346,10 @@ async def execute_merge_deploy(
     # ``held_turn`` is the turn this press took the lease on; 0 = none.
     press_settled = False
     held_turn = 0
-    # Set when a deploy-stage leg did not report complete, and never cleared.
-    # The clean-up's teardown counts too: the hold is decided after it.
+    # Set when a deploy-stage leg did not report complete, or a clean-up the
+    # press sent into the sandbox (a candidate tree, a join's working folder,
+    # the retained worktree) was not confirmed done; never cleared. The final
+    # clean-up counts too: the hold is decided after it.
     a_leg_did_not_complete = False
 
     def _settled(outcome: MergeDeployOutcome) -> MergeDeployOutcome:
@@ -1618,8 +1620,15 @@ async def execute_merge_deploy(
             task_id=task_id,
             **extra,
         )
-        # Complete, or no stage at all (deploy switched off: nothing ran).
-        if result is None or getattr(result, "outcome", None) == "complete":
+        # Complete, or no stage at all (deploy switched off: nothing ran). A
+        # promote that went live but could not take its candidate down still
+        # says "complete", with the candidate "standing": not complete here.
+        # (The candidate check leaves its candidate standing on purpose.)
+        standing = (getattr(result, "detail", None) or {}).get("candidate") == "standing"
+        if result is None or (
+            getattr(result, "outcome", None) == "complete"
+            and not (standing and leg != "candidate_check")
+        ):
             a_leg_did_not_complete = before
         return result
 
@@ -1751,12 +1760,14 @@ async def execute_merge_deploy(
 
     async def _cleanup() -> None:
         """On every ending: the candidate down if still standing, the tree gone."""
-        nonlocal tree_path
+        nonlocal tree_path, a_leg_did_not_complete
         if candidate_standing:
             await _tear_down_candidate()
         removed: bool | None = None
         if tree_path is not None:
             removed = await git.remove_candidate_tree(feature_id, str(tree_path))
+            if not removed:
+                a_leg_did_not_complete = True
             if removed:
                 logger.info(
                     "merge-executor: removed the candidate tree for %s at %s",
@@ -3525,11 +3536,12 @@ async def execute_merge_deploy(
         else is removed: the joined commit and the working folder of every
         attempt stay under the names their own attempt gave them.
         """
-        nonlocal tree_path, tree_commit
+        nonlocal tree_path, tree_commit, a_leg_did_not_complete
         if candidate_standing:
             await _tear_down_candidate()
         if tree_path is not None:
-            await git.remove_candidate_tree(feature_id, str(tree_path))
+            if not await git.remove_candidate_tree(feature_id, str(tree_path)):
+                a_leg_did_not_complete = True
             tree_path = None
             tree_commit = None
         where = await target_branch_now(git, recorded_branch=recorded_branch)
@@ -4981,6 +4993,7 @@ async def execute_merge_deploy(
         own attempt named, which is what "kept until the record's end" was
         protecting — a folder is scaffolding, a commit is the work.
         """
+        nonlocal a_leg_did_not_complete
         retired: list[dict[str, Any]] = []
         highest = int(getattr(record, "attempt", 0) or 0) if record is not None else 0
         for attempt_number in range(1, max(highest, 1) + 1):
@@ -4988,6 +5001,7 @@ async def execute_merge_deploy(
             try:
                 removed = await git.remove_working_folder(folder)
             except Exception as exc:  # noqa: BLE001 — never costs a result
+                a_leg_did_not_complete = True
                 retired.append(
                     {
                         "attempt": attempt_number,
@@ -4997,6 +5011,8 @@ async def execute_merge_deploy(
                     }
                 )
                 continue
+            if not removed:
+                a_leg_did_not_complete = True
             retired.append(
                 {
                     "attempt": attempt_number,
@@ -5072,6 +5088,7 @@ async def execute_merge_deploy(
             )
         _write_receipt("autobuild_worktree_cleanup.json", retired)
         if retired.get("status") != "removed":
+            a_leg_did_not_complete = True
             logger.warning(
                 "merge-executor: retained autobuild worktree for %s was kept: %s",
                 build_id,

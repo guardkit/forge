@@ -1984,3 +1984,141 @@ class TestAPromoteThatDidNotCompleteKeepsTheHold:
             assert send.detail["contains_j"] is True
         finally:
             sidecar.close()
+
+
+class _ASidecarForTheRealPromote:
+    """A loopback sidecar for the REAL deploy stage's promote (Codex round 2,
+    R1, 4 October 2026). The deploy step answers with the identity it was
+    handed and the health check passes; the candidate teardown's request is
+    taken and never answered."""
+
+    def __init__(self) -> None:
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        self.teardowns = 0
+        sidecar = self
+
+        class _Handler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:  # noqa: N802 — the stdlib's name
+                body = json.loads(
+                    self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                )
+                if (body.get("env") or {}).get("CANDIDATE_DOWN") == "1":
+                    sidecar.teardowns += 1
+                    self.close_connection = True
+                    return
+                deploy = body.get("deploy") or {}
+                said = (
+                    f"DEPLOYED_IDENTITY={deploy.get('identity')}\n" if deploy else "ok\n"
+                )
+                answer = json.dumps({"exit_code": 0, "output_tail": said}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(answer)))
+                self.end_headers()
+                self.wfile.write(answer)
+
+            def log_message(self, *_args: Any) -> None:
+                return
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        host, port = self.server.server_address[:2]
+        self.url = f"http://{host}:{port}"
+
+    def close(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+
+
+class _APromoteThroughTheRealStage(_AProjectWithATarget):
+    """The project with a target, except that its promote is the real
+    :meth:`DeployStageRunner.promote`, talking to ``sidecar`` through the real
+    script runner. Every other leg, the final teardown included, completes."""
+
+    def __init__(self, sidecar: _ASidecarForTheRealPromote, tmp_path: Path) -> None:
+        import sqlite3
+        from unittest.mock import AsyncMock
+
+        from forge.config.models import DeployStageConfig
+        from forge.deploy.live_gate import DryRunBrokerInspector
+        from forge.deploy.reservation import InProcessReservationLease
+        from forge.deploy.stage import DeployStageRunner
+        from forge.persistence.migrations.runbook import apply
+        from forge.persistence.repositories.runbook import RunbookRepository
+        from tests.forge.deploy.test_candidate_check_and_promote_legs import (
+            RecordingDeployPublisher,
+            _Invoker,
+        )
+
+        super().__init__()
+        connection = sqlite3.connect(str(tmp_path / "runbooks.db"))
+        apply(connection)
+        self.stage = DeployStageRunner(
+            repository=RunbookRepository(connection=connection),
+            runbook_publisher=AsyncMock(),
+            deploy_publisher=RecordingDeployPublisher(),
+            reservation=InProcessReservationLease(),
+            live_gate_invoker=_Invoker(),
+            broker_inspector=DryRunBrokerInspector(),
+            config=DeployStageConfig(
+                execution_surface="sidecar", sidecar_url=sidecar.url
+            ),
+            deploy_record_root=str(tmp_path / "records"),
+            dry_run=False,
+            target_repo=REPO,
+        )
+        self.promoted: Any = None
+
+    async def __call__(self, **kwargs: Any) -> Any:
+        from tests.forge.deploy.test_candidate_check_and_promote_legs import _profile
+
+        if kwargs.get("leg") != "promote":
+            return await super().__call__(**kwargs)
+        self.calls.append(kwargs)
+        self.promoted = await self.stage.promote(
+            _profile(),
+            correlation_id=kwargs["correlation_id"],
+            deploy_run_id=kwargs["deploy_run_id"],
+            feature=kwargs["feature_id"],
+            deploy_ownership=kwargs.get("deploy_ownership"),
+        )
+        return self.promoted
+
+
+class TestAPromoteWhoseOwnTeardownWasNotAnsweredKeepsTheHold:
+    """Codex round 2, R1: the real promote goes live and its live check
+    passes, so it says "complete" — but its own candidate teardown was not
+    answered, and it says the candidate is still "standing". The final
+    clean-up then succeeds. The hold is kept and a second press is refused."""
+
+    @pytest.mark.asyncio
+    async def test_the_hold_is_kept_and_a_second_press_is_refused(
+        self,
+        config_with_publication_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+        tmp_path: Path,
+    ) -> None:
+        sidecar = _ASidecarForTheRealPromote()
+        try:
+            deploy = _APromoteThroughTheRealStage(sidecar, tmp_path)
+            deps = _deps_that_can_deploy(
+                config_with_publication_on,
+                pool,
+                publisher=_APublisherThatSays([_published("c" * 40)]),
+                deploy=deploy,
+            )
+
+            outcome = await _press(deps, repo_root)
+
+            assert outcome.result == "merged-into-the-remote-and-running", outcome.detail
+            assert deploy.promoted.outcome == "complete"
+            assert deploy.promoted.detail["candidate"] == "standing"
+            assert sidecar.teardowns == 1
+            assert _record(pool).lease_holder is not None
+            again = await _press(deps, repo_root)
+            assert "another worker" in again.detail
+        finally:
+            sidecar.close()
