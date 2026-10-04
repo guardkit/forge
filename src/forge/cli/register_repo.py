@@ -691,6 +691,19 @@ def _read_repo_config_dict(repo: Path) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+def _declared_documents_missing(repo: Path, config_text: str) -> list[str]:
+    """The declared binding documents this checkout does not have, in order.
+
+    Read with the same reader the build admission uses, so registration and
+    admission cannot disagree about what the project declared. A file that
+    cannot be read declares nothing here; admission says why at build time.
+    """
+    from forge.planning.declared_memory import read_declared_binding_documents
+
+    documents, _why = read_declared_binding_documents(config_text or None)
+    return [path for path in documents if not (repo / path).is_file()]
+
+
 def _guardkit_is_importable() -> bool:
     """Is guardkit's declaration loader importable in this interpreter?
 
@@ -1372,6 +1385,22 @@ def register_repo_cmd(
         repo_lines = _write_memory_project(repo_lines, identifier)
         repo_changed = True
         steps.append(Step("memory", "added", f"project: {identifier}"))
+
+    # ---- the documents the project's builds are held to (4 October 2026).
+    # Registration stays mechanical: it never writes, templates or seeds these.
+    # It only says which ones the project declares
+    # (autobuild.player.required_documents) and this checkout lacks, so the
+    # gap is seen now rather than at the first build. A warning; nothing is
+    # written and the exit code does not change.
+    missing_documents = _declared_documents_missing(repo, repo_text)
+    if missing_documents:
+        steps.append(
+            Step(
+                "documents",
+                "warn",
+                "; ".join(f"declared but missing: {path}" for path in missing_documents),
+            )
+        )
 
     if repo_changed and not dry_run:
         repo_config.parent.mkdir(parents=True, exist_ok=True)

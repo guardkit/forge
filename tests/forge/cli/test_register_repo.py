@@ -1939,3 +1939,83 @@ def test_the_host_port_is_read_from_every_shape_a_publish_rule_takes():
         ("8080", "9000:8080", "127.0.0.1:8911:8901")
     ) == ["8080", "9000", "8911"]
     assert register_repo._host_ports_of(()) == []
+
+
+# ---------------------------------------------------------------------------
+# The documents a project's builds are held to (4 October 2026)
+# ---------------------------------------------------------------------------
+#
+# Registration stays mechanical: it never writes a project document. It only
+# reports, in one warning step, each binding document the project declares
+# (autobuild.player.required_documents) that the checkout does not have.
+
+_DECLARES_TWO = (
+    "toolchain:\n  test: pytest\n"
+    "memory:\n  project: bench_one\n"
+    "autobuild:\n  player:\n    required_documents:\n"
+    "      - docs/constitution/mission.md\n"
+    "      - docs/constitution/tech-stack.md\n"
+)
+
+
+def _tree_digest(root: Path) -> dict[str, str]:
+    return {
+        str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted(root.rglob("*"))
+        if path.is_file() and ".git" not in path.parts
+    }
+
+
+def test_declared_but_missing_documents_are_warned_and_nothing_is_written(
+    _isolate, tmp_path
+):
+    repo = _make_repo(_isolate, "bench-one", toolchain=_DECLARES_TWO)
+    (repo / "docs" / "constitution").mkdir(parents=True)
+    (repo / "docs" / "constitution" / "mission.md").write_text("m\n", encoding="utf-8")
+    config = _write_config(tmp_path)
+    before = _tree_digest(repo)
+
+    result = _run(config, str(repo), "--json")
+
+    assert result.exit_code == 0, result.output
+    assert _status_of(result, "documents") == ["warn"]
+    (detail,) = [d for name, _, d in _steps(result) if name == "documents"]
+    assert detail == "declared but missing: docs/constitution/tech-stack.md"
+    # Nothing was created, templated or seeded in the repository.
+    assert _tree_digest(repo) == before
+    assert not (repo / "docs" / "constitution" / "tech-stack.md").exists()
+
+
+def test_each_missing_document_is_named(_isolate, tmp_path):
+    repo = _make_repo(_isolate, "bench-one", toolchain=_DECLARES_TWO)
+    config = _write_config(tmp_path)
+
+    result = _run(config, str(repo), "--json")
+
+    assert result.exit_code == 0, result.output
+    (detail,) = [d for name, _, d in _steps(result) if name == "documents"]
+    assert detail == (
+        "declared but missing: docs/constitution/mission.md; "
+        "declared but missing: docs/constitution/tech-stack.md"
+    )
+
+
+def test_no_warning_when_every_declared_document_is_there_or_none_is_declared(
+    _isolate, tmp_path
+):
+    repo = _make_repo(_isolate, "bench-one", toolchain=_DECLARES_TWO)
+    (repo / "docs" / "constitution").mkdir(parents=True)
+    for name in ("mission.md", "tech-stack.md"):
+        (repo / "docs" / "constitution" / name).write_text("x\n", encoding="utf-8")
+    other = _make_repo(
+        _isolate, "bench-two", toolchain="toolchain:\n  test: pytest\n"
+    )
+    config = _write_config(tmp_path)
+
+    present = _run(config, str(repo), "--json")
+    undeclared = _run(config, str(other), "--json")
+
+    assert present.exit_code == 0, present.output
+    assert undeclared.exit_code == 0, undeclared.output
+    assert _status_of(present, "documents") == []
+    assert _status_of(undeclared, "documents") == []
