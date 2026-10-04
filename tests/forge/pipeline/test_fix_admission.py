@@ -69,6 +69,8 @@ from forge.pipeline.fix_admission import (
 )
 from forge.pipeline.fix_row_producer import (
     SOURCE_BUILD_FAILED,
+    SOURCE_CANDIDATE_REFUSED,
+    SOURCE_MERGE_REPORT,
     fix_correlation_id,
     make_failure_pack_source_reader,
 )
@@ -901,8 +903,12 @@ class _RetainedCandidateSidecar:
         listing_refused: bool = False,
         first_listing_fails: bool = False,
         unanswered_refs: set[str] | None = None,
+        remote: dict[str, Any] | Exception | None = None,
     ) -> None:
         self.candidate_commit = candidate_commit
+        #: What ``/git/remote-start-point`` answers: a starting point, an
+        #: exception the transport raises, or (None) no such route.
+        self.remote = remote
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.written: dict[str, str] = {}
         self.shas: dict[str, str | None] = {
@@ -959,6 +965,10 @@ class _RetainedCandidateSidecar:
                 ).get(body["file_path"])
             )
             return 200, {"content": content}
+        if route == "remote-start-point" and self.remote is not None:
+            if isinstance(self.remote, Exception):
+                raise self.remote
+            return 200, dict(self.remote)
         if route == "worktree-add":
             self.shas[body["branch"]] = self.candidate_commit
             return 200, {
@@ -1390,6 +1400,286 @@ class TestABuildFailureRepairsItsRetainedCandidate:
             commit_count(repo_root, "main") + 1
         )
         assert not branch_exists(repo_root, f"autobuild/{FEATURE_ID}")
+
+
+# ---------------------------------------------------------------------------
+# A post-merge repair starts from where the remote is now (3 October 2026)
+# ---------------------------------------------------------------------------
+
+#: Where GitHub has main now, and where the sandbox clone's own main was left.
+REMOTE_TIP = "b" * 40
+STALE_MAIN = "c" * 40
+
+
+def _record_merge_report(pool: SqliteLifecyclePersistence, result: str) -> None:
+    """The source build's merge report, on its record as the executor writes it."""
+    from forge.lifecycle.metrics import (
+        MERGE_REPORT_STAGE_LABEL,
+        MERGE_REPORT_TARGET_IDENTIFIER,
+    )
+    from forge.lifecycle.persistence import StageLogEntry
+
+    at = datetime(2026, 10, 3, 20, 0, tzinfo=UTC)
+    pool.record_stage(
+        StageLogEntry(
+            build_id=SOURCE_BUILD,
+            stage_label=MERGE_REPORT_STAGE_LABEL,
+            target_kind="local_tool",
+            target_identifier=MERGE_REPORT_TARGET_IDENTIFIER,
+            status="FAILED",
+            started_at=at,
+            completed_at=at,
+            duration_secs=0.0,
+            # The free-text detail quotes the other word on purpose: the
+            # decision is read from ``result``, never searched for in here.
+            details={"result": result, "detail": "not merged-verify-failed"},
+        )
+    )
+
+
+def _file_sourced_row(store: WorkQueueStore, source: str) -> int:
+    return store.file_sentence(
+        correlation_id=fix_correlation_id(SOURCE_BUILD),
+        sentence="FEAT-44A8 was merged but the checks after it went red",
+        originating_user="rich",
+        target_repo=REPO_KEY,
+        kind="fix",
+        action="minted",
+        extra_details={"source": source, "source_build_id": SOURCE_BUILD},
+    ).queue_id
+
+
+class TestAPostMergeRepairStartsFromTheRemote:
+    """The sandbox clone's local main is updated by nothing (it was dozens of
+    merges behind GitHub on 3 October), so a repair of a merge that went red
+    is read and cut at the commit the remote has main at now, fetched the way
+    the merge word fetches. Every other kind of repair keeps its base."""
+
+    TASK = "tasks/backlog/add-the-thing/TASK-44A8-001-add-the-thing.md"
+
+    def _sidecar(self, **kwargs: Any) -> "_RetainedCandidateSidecar":
+        sidecar = _RetainedCandidateSidecar("a" * 40, **kwargs)
+        sidecar.shas["main"] = STALE_MAIN
+        sidecar.shas[REMOTE_TIP] = REMOTE_TIP
+        sidecar.on_branch = {
+            # The stale main does not have the merged feature's task folder;
+            # the remote's main does.
+            "main": {},
+            REMOTE_TIP: {
+                self.TASK: f"---\nid: TASK-44A8-001\nfeature_id: {FEATURE_ID}\n"
+                "parent_review: TASK-REV-44A8\n---\n# Add the thing\n",
+            },
+        }
+        return sidecar
+
+    def _admit(
+        self,
+        pool: SqliteLifecyclePersistence,
+        store: WorkQueueStore,
+        repo_root: Path,
+        tmp_path: Path,
+        *,
+        source: str = SOURCE_MERGE_REPORT,
+        sidecar: Any = None,
+        sandbox: bool = True,
+        merge_ending: str | None = "merged-deploy-failed",
+    ) -> Any:
+        seed_failed_build(pool)
+        if merge_ending is not None:
+            _record_merge_report(pool, merge_ending)
+        config = make_config(
+            repo_root,
+            profiles={"attended": {}, FIX_JOURNEY_PROFILE_NAME: {"max_review_cycles": 2}},
+            sandbox=sandbox,
+        )
+        return asyncio.run(
+            admit_fix_row(
+                config=config,
+                persistence=pool,
+                store=store,
+                queue_id=_file_sourced_row(store, source),
+                correlation_id=fix_correlation_id(SOURCE_BUILD),
+                sentence="FEAT-44A8 was merged but the checks after it went red",
+                target_repo=REPO_KEY,
+                publish=Publisher(),
+                profile=FIX_JOURNEY_PROFILE_NAME,
+                receipts_root=tmp_path / "receipts",
+                sidecar_post=sidecar,
+            )
+        )
+
+    @pytest.mark.parametrize(
+        "merge_ending",
+        ["merged-deploy-failed", None],
+        ids=["published-then-deploy-failed", "no-report-recorded"],
+    )
+    def test_it_is_cut_from_the_fetched_remote_commit_when_local_main_is_behind(
+        self,
+        pool: SqliteLifecyclePersistence,
+        store: WorkQueueStore,
+        repo_root: Path,
+        tmp_path: Path,
+        merge_ending: str | None,
+    ) -> None:
+        sidecar = self._sidecar(remote={"branch": "main", "commit": REMOTE_TIP})
+
+        admission = self._admit(
+            pool, store, repo_root, tmp_path, sidecar=sidecar, merge_ending=merge_ending
+        )
+
+        routes = [route for route, _ in sidecar.calls]
+        fetched = routes.index("remote-start-point")
+        assert fetched < routes.index("list-files-on-branch")
+        assert fetched < routes.index("worktree-add")
+        assert sidecar.calls[fetched][1] == {"repo": REPO_KEY}
+        listing = sidecar.calls[routes.index("list-files-on-branch")][1]
+        assert listing["branch"] == REMOTE_TIP
+        cut = sidecar.calls[routes.index("worktree-add")][1]
+        assert cut["base_ref"] == REMOTE_TIP
+        written = sidecar.calls[routes.index("prepare-branch-and-write-tree")][1]
+        assert written["expected_head"] == REMOTE_TIP
+        # The task folder and review id are the remote main's, not the stale
+        # clone's (which has no folder for the feature at all).
+        task_file = "tasks/backlog/add-the-thing/TASK-FEAT44A8FIX1-repair.md"
+        assert admission.task_file_path == task_file
+        front, _ = _frontmatter_and_body(sidecar.written[task_file])
+        assert front["parent_review"] == "TASK-REV-44A8"
+        assert not any(
+            body.get("branch") in ("main", "refs/heads/main")
+            for route, body in sidecar.calls
+            if route in ("list-files-on-branch", "read-file-from-branch")
+        )
+        # The conductor still gets the prepared repair branch.
+        assert admission.branch == "repair/TASK-FEAT44A8FIX1"
+
+    @pytest.mark.parametrize(
+        "remote, permanent, said",
+        [
+            (OSError("connection reset"), False, "The queue will try again"),
+            (
+                {"refusal": "the remote named 'origin' could not be reached"},
+                False,
+                "The queue will try again",
+            ),
+            (
+                {"branch": "trunk", "commit": REMOTE_TIP},
+                True,
+                "a decision for a person",
+            ),
+        ],
+        ids=["transport-failure", "remote-unreachable", "default-branch-moved"],
+    )
+    def test_a_remote_that_cannot_be_read_refuses_and_writes_nothing(
+        self,
+        pool: SqliteLifecyclePersistence,
+        store: WorkQueueStore,
+        repo_root: Path,
+        tmp_path: Path,
+        remote: Any,
+        permanent: bool,
+        said: str,
+    ) -> None:
+        """A remote that could not be read is tried again; a default branch
+        that moved is a decision for a person, so that refusal is final."""
+        sidecar = self._sidecar(remote=remote)
+
+        with pytest.raises(FixAdmissionRefused) as caught:
+            self._admit(pool, store, repo_root, tmp_path, sidecar=sidecar)
+
+        assert caught.value.reason == "repair-base"
+        assert caught.value.permanent is permanent
+        assert said in caught.value.message
+        routes = [route for route, _ in sidecar.calls]
+        assert "worktree-add" not in routes
+        assert "list-files-on-branch" not in routes
+        assert sidecar.written == {}
+        assert len(build_rows(pool)) == 1
+
+    def test_checks_that_failed_after_the_join_repair_the_features_own_branch(
+        self,
+        pool: SqliteLifecyclePersistence,
+        store: WorkQueueStore,
+        repo_root: Path,
+        tmp_path: Path,
+    ) -> None:
+        """Joined but the checks after the join failed, so nothing was
+        published: neither main has the feature's code. The repair is cut
+        from the feature's own branch, as a candidate-refused one is."""
+        sidecar = self._sidecar(remote={"branch": "main", "commit": REMOTE_TIP})
+
+        admission = self._admit(
+            pool, store, repo_root, tmp_path,
+            sidecar=sidecar, merge_ending="merged-verify-failed",
+        )
+
+        routes = [route for route, _ in sidecar.calls]
+        assert "remote-start-point" not in routes
+        listing = sidecar.calls[routes.index("list-files-on-branch")][1]
+        assert listing["branch"] == f"autobuild/{FEATURE_ID}"
+        assert sidecar.calls[routes.index("worktree-add")][1]["base_ref"] == "a" * 40
+        assert admission.branch == "repair/TASK-FEAT44A8FIX1"
+
+    def test_a_candidate_refused_repair_keeps_its_own_branch_and_fetches_nothing(
+        self,
+        pool: SqliteLifecyclePersistence,
+        store: WorkQueueStore,
+        repo_root: Path,
+        tmp_path: Path,
+    ) -> None:
+        sidecar = self._sidecar(remote={"branch": "main", "commit": REMOTE_TIP})
+
+        self._admit(
+            pool, store, repo_root, tmp_path,
+            source=SOURCE_CANDIDATE_REFUSED, sidecar=sidecar,
+        )
+
+        routes = [route for route, _ in sidecar.calls]
+        assert "remote-start-point" not in routes
+        listing = sidecar.calls[routes.index("list-files-on-branch")][1]
+        assert listing["branch"] == f"autobuild/{FEATURE_ID}"
+        assert sidecar.calls[routes.index("worktree-add")][1]["base_ref"] == "a" * 40
+
+    def test_a_build_failed_repair_before_coding_keeps_main_and_fetches_nothing(
+        self,
+        pool: SqliteLifecyclePersistence,
+        store: WorkQueueStore,
+        repo_root: Path,
+        tmp_path: Path,
+    ) -> None:
+        _failure_manifest(
+            tmp_path / "receipts",
+            worktree=None,
+            subprocess_ran=False,
+            worktree_kept=False,
+        )
+        sidecar = self._sidecar(remote={"branch": "main", "commit": REMOTE_TIP})
+
+        self._admit(
+            pool, store, repo_root, tmp_path,
+            source=SOURCE_BUILD_FAILED, sidecar=sidecar,
+        )
+
+        routes = [route for route, _ in sidecar.calls]
+        assert "remote-start-point" not in routes
+        listing = sidecar.calls[routes.index("list-files-on-branch")][1]
+        assert listing["branch"] == "main"
+        assert sidecar.calls[routes.index("worktree-add")][1]["base_ref"] == STALE_MAIN
+
+    def test_a_repository_without_a_sandbox_is_cut_from_its_local_main_as_before(
+        self,
+        pool: SqliteLifecyclePersistence,
+        store: WorkQueueStore,
+        repo_root: Path,
+        tmp_path: Path,
+    ) -> None:
+        admission = self._admit(pool, store, repo_root, tmp_path, sandbox=False)
+
+        assert commit_count(repo_root, admission.branch) == (
+            commit_count(repo_root, "main") + 1
+        )
+        assert git(
+            repo_root, "merge-base", "--is-ancestor", "main", admission.branch
+        ).returncode == 0
 
 
 # ---------------------------------------------------------------------------

@@ -73,6 +73,24 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _the_kept_hold_runs_out(
+    pool: SqliteLifecyclePersistence, build_id: str = BUILD_ID
+) -> None:
+    """The hold a killed or unanswered press kept lapses on its own.
+
+    3 October 2026: every press is a worker of its own, so the next merge
+    word — even from the same process — picks the build up only once the
+    hold has run out, as a coordinator restarted after a crash always had to.
+    """
+    from datetime import timedelta
+
+    pool.connection.execute(
+        "UPDATE publication_records SET lease_expires_at = ? WHERE build_id = ?",
+        ((_utcnow() - timedelta(seconds=1)).isoformat(), build_id),
+    )
+    pool.connection.commit()
+
+
 # ---------------------------------------------------------------------------
 # Fixtures + fakes
 # ---------------------------------------------------------------------------
@@ -1362,6 +1380,7 @@ class TestExecutorSequencing:
         assert MERGE_STEP_MERGE_TARGET_IDENTIFIER in _stage_ids(pool)
         j_left = _git(repo_root, "rev-parse", f"factory-integration/{FEATURE_ID}")
 
+        _the_kept_hold_runs_out(pool)
         # The next merge word picks it up: the join is found, not made again,
         # and the press runs on to the checks.
         deps, publisher, gk, dp = _deps(config, pool)
@@ -1407,6 +1426,7 @@ class TestExecutorSequencing:
         with pytest.raises(KeyboardInterrupt):
             await _run_executor(deps, repo_root)
 
+        _the_kept_hold_runs_out(pool)
         deps, publisher, gk, dp = _deps(config, pool)
         outcome = await _run_executor(deps, repo_root)
         assert outcome.result == "publication-pending"
@@ -4023,3 +4043,199 @@ class TestDurableRetainedCandidateIdentity:
         assert "offered branch moved" in outcome.detail
         assert gk.calls == [] and dp.calls == []
         assert outer.is_dir() and inner.is_dir()
+
+
+# ---------------------------------------------------------------------------
+# The "who's merging" hold is put down when the press has really finished
+# (3 October 2026). It used to be taken and never put down, so every press held
+# its build for the whole lease however it ended, and a retry of FEAT-E592 was
+# refused because of it. It is put down only when every step the press
+# dispatched gave its own answer; after a cancellation or a lost connection it
+# is kept, because the merge may still be running in the sandbox.
+# ---------------------------------------------------------------------------
+
+
+def _the_hold(pool: SqliteLifecyclePersistence) -> Any:
+    from forge.pipeline.publication_record import PublicationRecordStore
+
+    return PublicationRecordStore(pool.connection).read(BUILD_ID)
+
+
+class _AMergeThatIsCancelled:
+    """The press is cancelled while the merge command is running."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    async def __call__(self, **kwargs: Any) -> GuardKitResult:
+        self.calls.append(kwargs)
+        raise asyncio.CancelledError()
+
+
+def _no_answer_came_back(status: str) -> _FakeGuardKit:
+    """The sandbox could not be reached, or the command ran out of time: no
+    report, so nobody knows whether the merge ran."""
+
+    class _NoReport(_FakeGuardKit):
+        async def __call__(self, **kwargs: Any) -> GuardKitResult:
+            self.calls.append(kwargs)
+            return GuardKitResult(
+                status=status,  # type: ignore[arg-type]
+                subcommand="autobuild merge",
+                duration_secs=0.1,
+                stdout_tail="",
+                stderr=(
+                    "the deploy sidecar could not be reached, so the merge "
+                    "did not run: timed out"
+                ),
+                exit_code=1,
+            )
+
+    return _NoReport()
+
+
+class TestTheHoldIsPutDownOnlyWhenThePressHasFinished:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "guardkit, result",
+        [
+            (
+                lambda: _FakeGuardKit(
+                    status="failed",
+                    report={"outcome": "refused", "refusal_reason": "it conflicts"},
+                ),
+                "merge-refused",
+            ),
+            (lambda: _JoinsForReal(verify_ok=False), "merged-verify-failed"),
+            (lambda: _JoinsForReal(), "publication-pending"),
+        ],
+        ids=["refused-join", "red-checks", "checked-publication-off"],
+    )
+    async def test_a_settled_ending_puts_the_hold_down(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+        repo_root: Path,
+        guardkit: Any,
+        result: str,
+    ) -> None:
+        deps, _publisher, _gk, _dp = _deps(config, pool, guardkit=guardkit())
+
+        outcome = await _run_executor(deps, repo_root)
+
+        assert outcome.result == result, outcome.detail
+        held = _the_hold(pool)
+        assert held.lease_holder is None
+        assert held.lease_expires_at is None
+        # The next press is a worker of its own, and no hold refuses it.
+        again = await _run_executor(deps, repo_root)
+        assert "another worker" not in again.detail
+        assert _the_hold(pool).turn == held.turn + 1
+
+    @pytest.mark.asyncio
+    async def test_a_candidate_check_that_gave_its_verdict_puts_it_down(
+        self, config: ForgeConfig, pool: SqliteLifecyclePersistence, repo_root: Path
+    ) -> None:
+        deps, _publisher, _gk, _dp = _deps(
+            config, pool, guardkit=_JoinsForReal(),
+            deploy=_FakeDeploy(candidate_outcome="failed"),
+        )
+
+        outcome = await _run_executor(deps, repo_root)
+
+        assert outcome.result == "candidate-refused"
+        assert _the_hold(pool).lease_holder is None
+
+    @pytest.mark.asyncio
+    async def test_a_candidate_check_that_gave_no_verdict_keeps_it(
+        self, config: ForgeConfig, pool: SqliteLifecyclePersistence, repo_root: Path
+    ) -> None:
+        """Something went wrong with the check itself: not a settled ending."""
+        deps, _publisher, _gk, _dp = _deps(
+            config, pool, guardkit=_JoinsForReal(),
+            deploy=_FakeDeploy(
+                candidate_outcome="failed",
+                gate={"verdict": None, "failed_checks": []},
+            ),
+        )
+
+        outcome = await _run_executor(deps, repo_root)
+
+        assert outcome.result == "candidate-refused"
+        assert _the_hold(pool).lease_holder is not None
+        again = await _run_executor(deps, repo_root)
+        assert "another worker" in again.detail
+
+    @pytest.mark.asyncio
+    async def test_a_refusal_before_anything_was_dispatched_puts_it_down(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+        repo_root: Path,
+    ) -> None:
+        from forge.pipeline.publication_record import PublicationRecordStore
+
+        # No target branch on the build's record: refused before the join.
+        _ensure_build(pool, build_id=BUILD_ID, feature_id=FEATURE_ID, target_branch="")
+        deps, _publisher, gk, _dp = _deps(config, pool)
+
+        outcome = await _run_executor(deps, repo_root)
+
+        assert outcome.result == "merge-refused"
+        assert gk.calls == []
+        assert _the_hold(pool).lease_holder is None
+        grant = PublicationRecordStore(pool.connection).take_lease(
+            build_id=BUILD_ID, holder="another-worker", now=_utcnow()
+        )
+        assert grant is not None
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_press_keeps_the_hold_against_the_same_process(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+        repo_root: Path,
+    ) -> None:
+        """In the container the coordinator is always process 1, so its next
+        press must not count as the same worker as the cancelled one."""
+        import os
+
+        deps, _publisher, _gk, _dp = _deps(
+            config, pool, guardkit=_AMergeThatIsCancelled()  # type: ignore[arg-type]
+        )
+
+        with pytest.raises(asyncio.CancelledError):
+            await _run_executor(deps, repo_root)
+
+        assert str(_the_hold(pool).lease_holder).startswith(
+            f"merge-press:{os.getpid()}:"
+        )
+        again = await _run_executor(deps, repo_root)
+        assert again.result == "merge-refused"
+        assert "another worker" in again.detail
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", ["failed", "timeout"])
+    async def test_a_merge_whose_answer_never_came_back_keeps_the_hold(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+        repo_root: Path,
+        status: str,
+    ) -> None:
+        import os
+
+        deps, _publisher, _gk, _dp = _deps(
+            config, pool, guardkit=_no_answer_came_back(status)
+        )
+
+        outcome = await _run_executor(deps, repo_root)
+
+        assert outcome.result == "merge-refused"
+        assert str(_the_hold(pool).lease_holder).startswith(
+            f"merge-press:{os.getpid()}:"
+        )
+        # A second press from the SAME process is still refused.
+        again = await _run_executor(deps, repo_root)
+        assert again.result == "merge-refused"
+        assert "another worker" in again.detail
