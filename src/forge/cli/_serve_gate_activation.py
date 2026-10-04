@@ -1071,6 +1071,23 @@ async def rearm_paused_gates(
                     snap.build_id,
                 )
                 continue
+            # A recovered build's card: its recorded run (which may still be
+            # going after a factory-only restart) is interrupted before the
+            # card is shown again. If that cannot be sent, the card is not
+            # re-armed this boot: the build stays PAUSED and its message held,
+            # and the next boot tries again. A build never launched has no
+            # recorded run, and this is a no-op.
+            from forge.cli._recorded_run import interrupt_recorded_run
+
+            if not await interrupt_recorded_run(
+                sqlite_pool, forge_config, snap.build_id
+            ):
+                logger.error(
+                    "rearm_paused_gates: the earlier run of build_id=%s could "
+                    "not be interrupted; its card is not re-armed this boot",
+                    snap.build_id,
+                )
+                continue
             try:
                 recovery_envelope = build_recovery_approval_envelope(build_row)
             except ValueError as exc:  # pragma: no cover - guarded by list scan
@@ -1168,7 +1185,6 @@ async def rearm_paused_gates(
                     # resumed builds of one repository would share one folder.
                     branch=getattr(build_row, "branch", None),
                     sqlite_pool=sqlite_pool,
-                    forge_config=forge_config,
                 ),
                 name=f"rearm-gate-{snap.build_id}",
             )
@@ -1232,10 +1248,6 @@ async def rearm_paused_gates(
     return tasks
 
 
-#: How often a re-armed card's refusal retries an interrupt it could not send.
-REARM_INTERRUPT_RETRY_SECONDS: float = 30.0
-
-
 async def _rearm_dispatch(
     *,
     deps: Any,
@@ -1244,7 +1256,6 @@ async def _rearm_dispatch(
     repo: str | None = None,
     branch: str | None = None,
     sqlite_pool: Any = None,
-    forge_config: Any = None,
 ) -> "GateOutcome":
     """Await the re-armed decision and launch on approve.
 
@@ -1276,24 +1287,6 @@ async def _rearm_dispatch(
         attempt_count=snap.attempt_count,
         artefact_paths=snap.artefact_paths,
     )
-    # A re-armed card can belong to a recovered build whose earlier run may
-    # still be going after a factory-only restart (its async_tasks row says
-    # so; a build never launched has none, and both steps are then no-ops).
-    if sqlite_pool is not None and not outcome_launches(outcome):
-        from forge.cli._recorded_run import interrupt_recorded_run
-
-        # Until the interrupt can be sent, this task keeps trying: the earlier
-        # run must not be left going unasked once its card is refused.
-        while not await interrupt_recorded_run(
-            sqlite_pool, forge_config, snap.build_id
-        ):
-            logger.error(
-                "rearm_paused_gates: the earlier run of build_id=%s could not "
-                "be interrupted; trying again in %ss",
-                snap.build_id,
-                REARM_INTERRUPT_RETRY_SECONDS,
-            )
-            await asyncio.sleep(REARM_INTERRUPT_RETRY_SECONDS)
     if outcome_launches(outcome):
         logger.info(
             "rearm_paused_gates: build_id=%s approved post-restart "
@@ -1319,7 +1312,7 @@ async def _rearm_dispatch(
             from forge.cli._recorded_run import launch_replacing_recorded_run
 
             if not await launch_replacing_recorded_run(
-                sqlite_pool, forge_config, snap.build_id, _launch
+                sqlite_pool, snap.build_id, _launch
             ):
                 # Nothing launched and the earlier run's identity is kept: the
                 # build is picked up again by the next boot's recovery.
