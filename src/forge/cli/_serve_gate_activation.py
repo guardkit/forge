@@ -1071,6 +1071,23 @@ async def rearm_paused_gates(
                     snap.build_id,
                 )
                 continue
+            # A recovered build's card: its recorded run (which may still be
+            # going after a factory-only restart) is interrupted before the
+            # card is shown again. If that cannot be sent, the card is not
+            # re-armed this boot: the build stays PAUSED and its message held,
+            # and the next boot tries again. A build never launched has no
+            # recorded run, and this is a no-op.
+            from forge.cli._recorded_run import interrupt_recorded_run
+
+            if not await interrupt_recorded_run(
+                sqlite_pool, forge_config, snap.build_id
+            ):
+                logger.error(
+                    "rearm_paused_gates: the earlier run of build_id=%s could "
+                    "not be interrupted; its card is not re-armed this boot",
+                    snap.build_id,
+                )
+                continue
             try:
                 recovery_envelope = build_recovery_approval_envelope(build_row)
             except ValueError as exc:  # pragma: no cover - guarded by list scan
@@ -1168,7 +1185,6 @@ async def rearm_paused_gates(
                     # resumed builds of one repository would share one folder.
                     branch=getattr(build_row, "branch", None),
                     sqlite_pool=sqlite_pool,
-                    forge_config=forge_config,
                 ),
                 name=f"rearm-gate-{snap.build_id}",
             )
@@ -1240,7 +1256,6 @@ async def _rearm_dispatch(
     repo: str | None = None,
     branch: str | None = None,
     sqlite_pool: Any = None,
-    forge_config: Any = None,
 ) -> "GateOutcome":
     """Await the re-armed decision and launch on approve.
 
@@ -1272,13 +1287,6 @@ async def _rearm_dispatch(
         attempt_count=snap.attempt_count,
         artefact_paths=snap.artefact_paths,
     )
-    # A re-armed card can belong to a recovered build whose earlier run may
-    # still be going after a factory-only restart (its async_tasks row says
-    # so; a build never launched has none, and both steps are then no-ops).
-    if sqlite_pool is not None and not outcome_launches(outcome):
-        from forge.cli._recorded_run import interrupt_recorded_run
-
-        await interrupt_recorded_run(sqlite_pool, forge_config, snap.build_id)
     if outcome_launches(outcome):
         logger.info(
             "rearm_paused_gates: build_id=%s approved post-restart "
@@ -1286,25 +1294,31 @@ async def _rearm_dispatch(
             snap.build_id,
             outcome.value,
         )
-        if sqlite_pool is not None:
-            # The earlier run's identity goes before the relaunch, so the
-            # relaunch's observer binds the relaunch's own thread and run.
-            try:
-                sqlite_pool.connection.execute(
-                    "DELETE FROM async_tasks WHERE build_id = ?", (snap.build_id,)
-                )
-            except Exception as exc:  # noqa: BLE001 — no table, no earlier run
-                logger.warning(
-                    "rearm_paused_gates: could not clear the earlier run's "
-                    "identity for build_id=%s (%s)",
+
+        async def _launch() -> None:
+            await resume_launcher(
+                build_id=snap.build_id,
+                feature_id=snap.feature_id,
+                correlation_id=snap.correlation_id,
+                repo=repo,
+                branch=branch,
+            )
+
+        if sqlite_pool is None:
+            await _launch()
+        else:
+            # A recovered build is relaunched in place of its recorded run,
+            # exactly as dispatch_build relaunches one (one code path).
+            from forge.cli._recorded_run import launch_replacing_recorded_run
+
+            if not await launch_replacing_recorded_run(
+                sqlite_pool, snap.build_id, _launch
+            ):
+                # Nothing launched and the earlier run's identity is kept: the
+                # build is picked up again by the next boot's recovery.
+                logger.error(
+                    "rearm_paused_gates: build_id=%s was approved but not "
+                    "relaunched; held for the next boot's recovery",
                     snap.build_id,
-                    exc,
                 )
-        await resume_launcher(
-            build_id=snap.build_id,
-            feature_id=snap.feature_id,
-            correlation_id=snap.correlation_id,
-            repo=repo,
-            branch=branch,
-        )
     return outcome
