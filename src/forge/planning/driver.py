@@ -877,8 +877,14 @@ def _cut_for_card(text: Any, limit: int) -> str:
     return words[: limit - 1].rstrip() + "…"
 
 
-def _possible_contradiction_text(pairs: Sequence[Mapping[str, Any]]) -> str:
-    """The card's words for the pairs: at most two, then "And N more."."""
+def _possible_contradiction_text(
+    pairs: Sequence[Mapping[str, Any]], pair_count: int | None = None
+) -> str:
+    """The card's words for the pairs: at most two, then "And N more.".
+
+    ``pair_count`` is the total the spec writer found, before its file's own
+    cap; without it the pairs in the file are all that can be counted.
+    """
     sentences: list[str] = []
     for pair in pairs[:_POSSIBLE_CONTRADICTION_SHOWN]:
         first = _cut_for_card(pair.get("first"), _POSSIBLE_CONTRADICTION_TITLE_CHARS)
@@ -890,7 +896,8 @@ def _possible_contradiction_text(pairs: Sequence[Mapping[str, Any]]) -> str:
         if sentences:
             sentence = "Also " + sentence
         sentences.append(sentence)
-    more = len(pairs) - _POSSIBLE_CONTRADICTION_SHOWN
+    total = max(len(pairs), pair_count or 0)
+    more = total - _POSSIBLE_CONTRADICTION_SHOWN
     if more > 0:
         sentences.append(f"And {more} more.")
     text = " ".join(
@@ -10137,10 +10144,19 @@ class PlanningRunDriver:
             return None
         if not pairs:
             return None
+        # The total before the file's own 3-pair cap. A value that is not a
+        # whole number is ignored and the pairs in the file are counted.
+        raw_count = record.get("pair_count")
+        pair_count = (
+            raw_count
+            if isinstance(raw_count, int) and not isinstance(raw_count, bool)
+            else None
+        )
         return {
             "pairs": pairs,
+            "pair_count": max(len(pairs), pair_count or 0),
             "spec_changed_after_check": bool(record.get("spec_changed_after_check")),
-            "possible_contradiction": _possible_contradiction_text(pairs),
+            "possible_contradiction": _possible_contradiction_text(pairs, pair_count),
         }
 
     @staticmethod

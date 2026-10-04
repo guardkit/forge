@@ -3958,3 +3958,27 @@ def test_two_pairs_are_shown_then_and_n_more_under_1400_characters() -> None:
     assert text.count("Its reason:") == 2
     assert "And 3 more." in text
     assert text.endswith("If they really conflict, send a note; otherwise approve as usual.")
+
+
+def test_and_n_more_counts_every_pair_found_not_only_those_in_the_file() -> None:
+    """Coach follow-up 2: the spec writer's file keeps at most three pairs and
+    records the total as pair_count; the card counts from that total."""
+    from forge.planning.driver import PlanningRunDriver
+
+    pairs = [
+        {"first": f"Example {n}", "second": _ASSUMPTION_TEXT, "why": ""}
+        for n in range(1, 4)
+    ]
+    reply = _warned_reply({**_warning(pairs), "pair_count": 5})
+    warning = PlanningRunDriver._capture_coherence_warning(reply.role_output, CID)
+    assert warning is not None
+    assert warning["pair_count"] == 5
+    assert "And 3 more." in warning["possible_contradiction"]
+
+    # An older file without the count, or a count that is not a number, counts
+    # the pairs in the file.
+    for record in (_warning(pairs), {**_warning(pairs), "pair_count": "five"}):
+        reply = _warned_reply(record)
+        warning = PlanningRunDriver._capture_coherence_warning(reply.role_output, CID)
+        assert "And 1 more." in warning["possible_contradiction"]
+        assert warning["pair_count"] == 3
