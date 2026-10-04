@@ -100,7 +100,10 @@ from forge.cli._serve_deps_forward_context import (
 )
 from forge.cli._serve_deps_lifecycle import build_publisher_and_emitter
 from forge.cli._serve_deps_stage_log import build_stage_log_recorder
-from forge.cli._recorded_run import interrupt_recorded_run
+from forge.cli._recorded_run import (
+    interrupt_recorded_run,
+    launch_replacing_recorded_run,
+)
 from forge.cli._serve_deps_state_channel import build_autobuild_state_initialiser
 from forge.config.build_admission import build_admission
 from forge.config.models import ForgeConfig, PipelineConfig
@@ -1006,35 +1009,6 @@ def _build_dispatch_build(
     # that are still ACTIVE, so finished builds never block anything.
     started_by_feature: dict[str, set[str]] = {}
 
-    def _earlier_run_of(build_id: str) -> tuple[bool, str | None]:
-        """A recovered (INTERRUPTED) build's earlier run: ``(readable, thread)``.
-
-        After a factory-only restart that run may still be going in its
-        runner. Its thread is read now so that, on approval, its row can be
-        deleted just before the relaunch (the relaunch's observer then binds
-        the relaunch's own thread and run; the runner stops the earlier run
-        before the relaunch proceeds), and, if the relaunch does not happen,
-        the earlier run can be interrupted instead. ``readable=False``: the
-        ledger could not be read, and the caller holds the message without
-        acknowledging it so its redelivery tries again.
-        """
-        try:
-            row = sqlite_pool.connection.execute(
-                "SELECT task_id FROM async_tasks WHERE build_id = ? "
-                "ORDER BY started_at DESC, rowid DESC LIMIT 1",
-                (build_id,),
-            ).fetchone()
-        except sqlite3.Error as exc:
-            logger.error(
-                "dispatch_build: could not read the earlier run of build_id=%s "
-                "(%s); holding the message WITHOUT ack so its redelivery tries "
-                "again",
-                build_id,
-                exc,
-            )
-            return False, None
-        return True, (str(row[0]) if row is not None else None)
-
     async def dispatch_build(
         payload: "BuildQueuedPayload",
         ack_callback,
@@ -1075,10 +1049,9 @@ def _build_dispatch_build(
         # payload type is exercised).
         from forge.lifecycle.persistence import DuplicateBuildError
 
-        # A recovered (INTERRUPTED) build being relaunched, and its earlier
-        # run's thread (see _earlier_run_of).
+        # A recovered (INTERRUPTED) build is relaunched in place of the run
+        # the ledger recorded for it (see launch_replacing_recorded_run).
         recovered = False
-        earlier_thread: str | None = None
 
         # D4's authoritative BUILD boundary is before persistence, the
         # approval gate and the conductor. It therefore also covers direct
@@ -1354,11 +1327,7 @@ def _build_dispatch_build(
                 from forge.lifecycle.identifiers import derive_build_id
 
                 build_id = derive_build_id(payload.feature_id, payload.queued_at)
-                if status == BuildState.INTERRUPTED:
-                    readable, earlier_thread = _earlier_run_of(build_id)
-                    if not readable:
-                        return
-                    recovered = True
+                recovered = status == BuildState.INTERRUPTED
                 logger.info(
                     "dispatch_build: duplicate %s build feature_id=%s "
                     "correlation_id=%s build_id=%s (%s); re-dispatching into "
@@ -1576,25 +1545,9 @@ def _build_dispatch_build(
                 build_id,
                 outcome.value,
             )
-            if recovered:
-                # The earlier run's row goes just before the relaunch, so the
-                # relaunch's observer binds the relaunch's own thread and run.
-                try:
-                    sqlite_pool.connection.execute(
-                        "DELETE FROM async_tasks WHERE build_id = ?", (build_id,)
-                    )
-                except sqlite3.Error as exc:
-                    logger.error(
-                        "dispatch_build: could not clear the earlier run's "
-                        "identity for build_id=%s (%s); holding the message "
-                        "WITHOUT ack",
-                        build_id,
-                        exc,
-                    )
-                    return
-            if register_observer is not None:
-                await _safe_register_observer(register_observer, build_id)
-            try:
+            async def _register_and_launch() -> None:
+                if register_observer is not None:
+                    await _safe_register_observer(register_observer, build_id)
                 await launch_or_conduct(
                     ack_callback=ack_callback,
                     build_id=build_id,
@@ -1604,16 +1557,13 @@ def _build_dispatch_build(
                     repo=payload.repo,
                     budget=budget_entry,
                 )
-            except Exception:
-                if recovered:
-                    await interrupt_recorded_run(
-                        sqlite_pool,
-                        forge_config,
-                        build_id,
-                        thread_id=earlier_thread,
-                        repo=payload.repo,
-                    )
-                raise
+
+            if not recovered:
+                await _register_and_launch()
+            elif not await launch_replacing_recorded_run(
+                sqlite_pool, forge_config, build_id, _register_and_launch
+            ):
+                return
         else:
             # Gate terminal (reject / expiry / hard-stop) — the build never
             # started; ack the slot so the next queued build proceeds and
@@ -1639,13 +1589,7 @@ def _build_dispatch_build(
                 outcome.value,
             )
             if recovered:
-                await interrupt_recorded_run(
-                    sqlite_pool,
-                    forge_config,
-                    build_id,
-                    thread_id=earlier_thread,
-                    repo=payload.repo,
-                )
+                await interrupt_recorded_run(sqlite_pool, forge_config, build_id)
             await ack_callback()
 
     return dispatch_build

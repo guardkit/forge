@@ -1286,25 +1286,24 @@ async def _rearm_dispatch(
             snap.build_id,
             outcome.value,
         )
-        if sqlite_pool is not None:
-            # The earlier run's identity goes before the relaunch, so the
-            # relaunch's observer binds the relaunch's own thread and run.
-            try:
-                sqlite_pool.connection.execute(
-                    "DELETE FROM async_tasks WHERE build_id = ?", (snap.build_id,)
-                )
-            except Exception as exc:  # noqa: BLE001 — no table, no earlier run
-                logger.warning(
-                    "rearm_paused_gates: could not clear the earlier run's "
-                    "identity for build_id=%s (%s)",
-                    snap.build_id,
-                    exc,
-                )
-        await resume_launcher(
-            build_id=snap.build_id,
-            feature_id=snap.feature_id,
-            correlation_id=snap.correlation_id,
-            repo=repo,
-            branch=branch,
-        )
+
+        async def _launch() -> None:
+            await resume_launcher(
+                build_id=snap.build_id,
+                feature_id=snap.feature_id,
+                correlation_id=snap.correlation_id,
+                repo=repo,
+                branch=branch,
+            )
+
+        if sqlite_pool is None:
+            await _launch()
+        else:
+            # A recovered build is relaunched in place of its recorded run,
+            # exactly as dispatch_build relaunches one (one code path).
+            from forge.cli._recorded_run import launch_replacing_recorded_run
+
+            await launch_replacing_recorded_run(
+                sqlite_pool, forge_config, snap.build_id, _launch
+            )
     return outcome

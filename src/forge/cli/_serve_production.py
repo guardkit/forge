@@ -700,7 +700,18 @@ async def _settle_strict_runless_builds_at_boot(
         # then stops everything it owns.
         from forge.cli._recorded_run import interrupt_recorded_run
 
-        await interrupt_recorded_run(sqlite_pool, forge_config, current.build_id)
+        if not await interrupt_recorded_run(
+            sqlite_pool, forge_config, current.build_id
+        ):
+            # The interrupt could not be sent: its run may still be going, so
+            # its place is not let go. The row stays unsettled (its message
+            # unacknowledged) and the next boot or redelivery tries again.
+            logger.error(
+                "forge-serve: boot recovery could not interrupt the run of "
+                "refused build_id=%s; leaving it unsettled for a retry",
+                current.build_id,
+            )
+            continue
         finalising_warning = str(current.error or "")
         if not finalising_warning.startswith("finalising-interrupted:"):
             finalising_warning = ""
