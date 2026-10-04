@@ -1472,6 +1472,69 @@ class TestEveryDeployLegRunsTheStepsOfItsOwnCommit:
         assert lock.read(target).counter == held.counter
 
     @pytest.mark.asyncio
+    async def test_a_pick_up_whose_lay_out_answer_was_lost_keeps_the_hold(
+        self,
+        a_helper_that_deploys: tuple[str, dict[str, Any]],
+        pool: SqliteLifecyclePersistence,
+        clone: Path,
+        on_this_side: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        _receipts_env: Path,
+    ) -> None:
+        """The coach's G4, 4 October 2026: the pick-up's request to lay the
+        joined commit's tree out is sent and the connection drops. The sandbox
+        may still be writing that tree, so although the press ends "published,
+        deployment pending" the hold is kept and the next press is refused."""
+        from forge.deploy.sidecar_git import SidecarCandidateGit
+        from forge.pipeline.deployment_lock import DeploymentLockStore
+
+        log = tmp_path / "which-steps-ran.log"
+        _, started_at = self._a_clone_left_behind(clone, log)
+        config = self._config(a_helper_that_deploys[0], on_this_side)
+        lock = DeploymentLockStore(pool.connection)
+        target = f"{REPO}::live"
+        held = lock.grant(
+            target=target,
+            build_id="another-build",
+            turn=1,
+            holder="somebody-else",
+            now=datetime.now(UTC),
+        )
+        first = await self._press_it(
+            config, pool, clone, on_this_side, tmp_path, started_at, monkeypatch
+        )
+        assert first.result == "published-deployment-pending", first.detail
+        assert lock.release(target=target, counter=held.counter, now=datetime.now(UTC))
+        # From here, the sandbox takes the lay-out request and the connection
+        # drops before any answer comes back.
+        real_call = SidecarCandidateGit._call
+        dropped: list[str] = []
+
+        async def _call(self: Any, route: str, body: dict[str, Any], *, timeout: float) -> Any:
+            if route == "/git/candidate-tree":
+                dropped.append(route)
+                return ConnectionResetError("the connection dropped mid-request")
+            return await real_call(self, route, body, timeout=timeout)
+
+        monkeypatch.setattr(SidecarCandidateGit, "_call", _call)
+
+        again = await self._press_it(
+            config, pool, clone, on_this_side, tmp_path, started_at, monkeypatch
+        )
+
+        assert again.result == "published-deployment-pending", again.detail
+        assert "could not be laid out" in again.detail
+        assert dropped == ["/git/candidate-tree"]
+        from forge.pipeline.publication_record import PublicationRecordStore
+
+        assert PublicationRecordStore(pool.connection).read(BUILD_ID).lease_holder
+        third = await self._press_it(
+            config, pool, clone, on_this_side, tmp_path, started_at, monkeypatch
+        )
+        assert "another worker" in third.detail
+
+    @pytest.mark.asyncio
     async def test_a_candidate_whose_tree_cannot_be_laid_out_is_left_standing_and_said(
         self,
         a_helper_that_deploys: tuple[str, dict[str, Any]],

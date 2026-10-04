@@ -2122,3 +2122,149 @@ class TestAPromoteWhoseOwnTeardownWasNotAnsweredKeepsTheHold:
             assert "another worker" in again.detail
         finally:
             sidecar.close()
+
+
+class _ASurfaceWhoseCleanUpsSay:
+    """This container's git, except for the clean-up answers a test names:
+    ``folder`` for a join's working-folder removal (``"false"`` or
+    ``"raises"``), ``retired`` for the retained worktree's retirement status,
+    and ``tree_removals`` for the first candidate-tree removals, in order."""
+
+    def __new__(cls, repo_root: Path, **says: Any) -> Any:
+        from forge.deploy.candidate_tree import InContainerCandidateGit
+
+        class _Surface(InContainerCandidateGit):
+            async def remove_working_folder(self, path: str) -> bool:
+                if says.get("folder") == "raises":
+                    raise ConnectionResetError("the removal's answer was lost")
+                if says.get("folder") == "false":
+                    return False
+                return await super().remove_working_folder(path)
+
+            async def retire_autobuild_worktree(
+                self, build_id: str, path: str, expected: dict[str, Any]
+            ) -> dict[str, Any]:
+                return {"status": says.get("retired") or "removed", "path": path}
+
+            async def remove_candidate_tree(
+                self, feature_id: str, path: str | None = None
+            ) -> bool:
+                queued = says.get("tree_removals") or []
+                if queued:
+                    return queued.pop(0)
+                return await super().remove_candidate_tree(feature_id, path)
+
+        return _Surface(repo_root)
+
+
+class TestEverySandboxCleanUpIsGuarded:
+    """The coach's recommendation on 899ff50d: one test for each clean-up flag
+    that no test guarded. A clean-up the press could not confirm keeps the
+    hold, and a second press is refused; one that finished releases it."""
+
+    @staticmethod
+    def _with_surface(deps: MergeExecutorDeps, surface: Any) -> MergeExecutorDeps:
+        import dataclasses
+
+        return dataclasses.replace(deps, git_surface=lambda _repo, _root: surface)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("folder", ["false", "raises"])
+    async def test_a_join_folder_that_was_not_removed_keeps_the_hold(
+        self,
+        config_with_publication_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+        folder: str,
+    ) -> None:
+        deps = self._with_surface(
+            _deps_that_can_deploy(
+                config_with_publication_on,
+                pool,
+                publisher=_APublisherThatSays([_published("c" * 40)]),
+                deploy=_ADeployStepThatSays(),
+            ),
+            _ASurfaceWhoseCleanUpsSay(repo_root, folder=folder),
+        )
+
+        outcome = await _press(deps, repo_root)
+
+        assert outcome.result == "merged-into-the-remote-and-running", outcome.detail
+        assert _record(pool).lease_holder is not None
+        assert "another worker" in (await _press(deps, repo_root)).detail
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "status, kept",
+        [("kept", True), ("already-gone", False), ("removed", False)],
+    )
+    async def test_the_retained_worktree_decides_whether_the_hold_is_put_down(
+        self,
+        config_with_publication_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+        status: str,
+        kept: bool,
+    ) -> None:
+        deps = self._with_surface(
+            _deps_that_can_deploy(
+                config_with_publication_on,
+                pool,
+                publisher=_APublisherThatSays([_published("c" * 40)]),
+                deploy=_ADeployStepThatSays(),
+            ),
+            _ASurfaceWhoseCleanUpsSay(repo_root, retired=status),
+        )
+        sha = _git(repo_root, "rev-parse", f"autobuild/{FEATURE_ID}")
+        _ensure_build(pool, build_id=BUILD_ID, feature_id=FEATURE_ID)
+
+        outcome = await execute_merge_deploy(
+            deps=deps,
+            build_id=BUILD_ID,
+            feature_id=FEATURE_ID,
+            repo=REPO,
+            repo_root=repo_root,
+            expect_main_sha=MAIN_SHA,
+            correlation_id=CORRELATION,
+            decided_by="rich",
+            expected_candidate_sha=sha,
+            expected_candidate_tree=_git(repo_root, "rev-parse", f"{sha}^{{tree}}"),
+            worktree_retention={"path": "/retained/worktree"},
+        )
+
+        assert outcome.result == "merged-into-the-remote-and-running", outcome.detail
+        assert (_record(pool).lease_holder is not None) is kept
+        assert ("another worker" in (await _press(deps, repo_root)).detail) is kept
+
+    @pytest.mark.asyncio
+    async def test_a_tree_not_removed_before_another_attempt_keeps_the_hold(
+        self,
+        config_with_publication_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> None:
+        landed: list[str] = []
+
+        def another_hand(_request: dict[str, Any]) -> None:
+            if not landed:
+                landed.append(_somebody_else_lands_work(repo_root, "between"))
+
+        deps, _deploy, _joins, _bus = _deps(
+            config_with_publication_on,
+            pool,
+            publisher=_APublisherThatSays(
+                [_the_remote_moved(), _published("d" * 40)],
+                before_answering=another_hand,
+            ),
+        )
+        removals = [False]
+        deps = self._with_surface(
+            deps, _ASurfaceWhoseCleanUpsSay(repo_root, tree_removals=removals)
+        )
+
+        outcome = await _press(deps, repo_root)
+
+        assert outcome.result == "published-deployment-pending", outcome.detail
+        assert removals == []  # the between-attempts removal said False
+        assert _record(pool).lease_holder is not None
+        assert "another worker" in (await _press(deps, repo_root)).detail
