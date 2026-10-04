@@ -931,6 +931,16 @@ _ASSUMPTION_REVIEW_AUTHOR = "planning-driver (assumption review)"
 #: review's author is stamped and the row lists both.
 _EXAMPLE_REVIEW_AUTHOR = "planning-driver (spec example check)"
 
+#: The one closing instruction when the assumption review and the spec example
+#: check both send something back in the shared rewrite.
+_SHARED_REVIEW_NOTE_CLOSING = (
+    "Remove these assumptions and every worked example that depends on them. "
+    "Remove each worked example listed above unless the request needs it; if you "
+    "keep one, quote the words of the request that need it in its # Why: line. "
+    "Remove any assumption written only for an example you remove. Do not add "
+    "other assumptions or examples of the same kind. Change nothing else."
+)
+
 #: The spec card's line when the project's ``spec_examples:`` block is there
 #: and could not be read. Silence would hide the mistake: the person is told
 #: the examples were not checked, and why.
@@ -3536,6 +3546,7 @@ class PlanningRunDriver:
         examples = await self._check_the_examples_first(
             correlation_id, draft, repo_path=repo_path, request_text=request_text, notes=notes
         )
+        review_failed: str | None = None
         try:
             facts = await self._repository_facts_for(correlation_id, repo_path, row)
             review = await self._review_assumptions_on_branch(
@@ -3544,23 +3555,32 @@ class PlanningRunDriver:
         except Exception as exc:  # noqa: BLE001 — a reviewer must never stop a run
             # Same posture as the provability check beside it: a reviewer that
             # cannot read is a reviewer that says so, not a failed planning run.
-            # The card opens exactly as it would have without this step.
+            # The card opens exactly as it would have without this step —
+            # unless worked examples were flagged: they still go through the
+            # one rewrite, so the card never names as "kept" an example the
+            # writer was never asked about.
             logger.warning(
                 "planning driver: run %s — the assumption review could not run "
-                "(%s: %s); the card opens as written",
+                "(%s: %s); %s",
                 correlation_id,
                 type(exc).__name__,
                 str(exc)[:160],
+                "the flagged worked examples still go back once"
+                if examples is not None and examples.findings
+                else "the card opens as written",
             )
-            draft["assumption_review"] = {
-                "checked": False,
-                "round": 0,
-                "rewritten": False,
-                "removed": [],
-                "still_flagged": [],
-                "not_checked": f"the review could not run ({type(exc).__name__})",
-            }
-            return draft
+            review_failed = f"the review could not run ({type(exc).__name__})"
+            if examples is None or not examples.findings:
+                draft["assumption_review"] = {
+                    "checked": False,
+                    "round": 0,
+                    "rewritten": False,
+                    "removed": [],
+                    "still_flagged": [],
+                    "not_checked": review_failed,
+                }
+                return draft
+            facts, review = None, None
         receipt: dict[str, Any] = {
             "checked": review is not None,
             "round": 0,
@@ -3569,7 +3589,9 @@ class PlanningRunDriver:
             "still_flagged": [],
             "repository_facts": facts,
         }
-        if review is None:
+        if review_failed is not None:
+            receipt["not_checked"] = review_failed
+        elif review is None:
             receipt["not_checked"] = "the committed spec has no assumptions manifest to read"
         else:
             receipt["first"] = review.receipt()
@@ -3580,15 +3602,14 @@ class PlanningRunDriver:
             return draft
 
         # ONE note for both reviewers, so the writer is asked no more times
-        # than before the example check existed.
-        note = "\n\n".join(
-            part
-            for part in (
-                review.note() if flagged and review is not None else "",
-                examples.note() if flagged_examples and examples is not None else "",
-            )
-            if part
-        )
+        # than before the example check existed. Each alone is its own note,
+        # word for word; both together share one closing instruction.
+        if flagged and flagged_examples and review is not None and examples is not None:
+            note = self._shared_review_note(review, examples)
+        elif flagged and review is not None:
+            note = review.note()
+        else:
+            note = examples.note() if examples is not None else ""
         author = _ASSUMPTION_REVIEW_AUTHOR if flagged else _EXAMPLE_REVIEW_AUTHOR
         receipt.update({"round": 1, "author": author, "note": note, "flagged": flagged})
         if flagged_examples:
@@ -3657,8 +3678,12 @@ class PlanningRunDriver:
             return draft
         if rewritten is None:
             return None  # the spec leg already failed the run loudly
-        second = await self._review_assumptions_on_branch(
-            rewritten, repo_path=repo_path, branch=branch, request_text=request_text, repository_facts=facts
+        second = (
+            None
+            if review_failed is not None
+            else await self._review_assumptions_on_branch(
+                rewritten, repo_path=repo_path, branch=branch, request_text=request_text, repository_facts=facts
+            )
         )
         still = list(second.flagged_ids) if second is not None else []
         removed = [assumption_id for assumption_id in flagged if assumption_id not in still]
@@ -3793,6 +3818,19 @@ class PlanningRunDriver:
             }
         )
         return lines, receipt
+
+    @staticmethod
+    def _shared_review_note(review: Any, examples: ExampleReview) -> str:
+        """The one note when both the assumption review and the spec example
+        check flagged something: both lists, then ONE closing instruction,
+        so neither reviewer's ask contradicts the other's."""
+        lines = [
+            f"The reviewer found {len(review.flagged_ids)} assumption(s) that add "
+            "something the request did not ask for:"
+        ]
+        lines += [f"- {finding.assumption_id}: {finding.sentence}" for finding in review.findings]
+        lines += ["", *examples.listed(), "", _SHARED_REVIEW_NOTE_CLOSING]
+        return "\n".join(lines)
 
     @staticmethod
     def _card_with_assumption_warnings(
