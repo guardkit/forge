@@ -369,3 +369,133 @@ def test_a_relaunch_whose_earlier_identity_cannot_be_cleared_is_held(
     assert gate_calls == []
     assert msg.acks == 0
     assert nats.published.get(f"pipeline.build-failed.{FEATURE}", []) == []
+
+
+def _envelope_at(correlation_id: str, queued_at: datetime) -> bytes:
+    payload = BuildQueuedPayload(
+        feature_id=FEATURE,
+        repo="example/example",
+        branch="main",
+        feature_yaml_path=f"/srv/forge/features/{FEATURE}/{FEATURE}.yaml",
+        triggered_by="cli",
+        originating_adapter="cli-wrapper",
+        correlation_id=correlation_id,
+        requested_at=queued_at,
+        queued_at=queued_at,
+    )
+    return (
+        MessageEnvelope(
+            source_id="forge-cli",
+            event_type=EventType.BUILD_QUEUED,
+            correlation_id=correlation_id,
+            payload=payload.model_dump(mode="json"),
+        )
+        .model_dump_json()
+        .encode("utf-8")
+    )
+
+
+def test_an_interrupted_build_still_goes_first_after_a_restart(
+    nats, pool, monkeypatch  # noqa: F811 — imported fixtures
+) -> None:
+    """Coach finding 1: after a factory-only restart build c1 is INTERRUPTED
+    (its run may still be going). A second build c2 of the feature is refused;
+    c1's redelivery is not — it is relaunched through the gate."""
+    from forge.adapters.nats.pipeline_consumer import handle_message
+    from forge.cli import _serve_gate_activation
+
+    _serve_deps_gating._reset_for_tests()
+    cfg = _open_config()
+    _serve_deps_gating.bind_gate_parts(_build_parts(nats, forge_config=cfg))
+    repo, sm = build_sqlite_gate_adapters(pool, clock=FixedClock())
+    deps = build_pipeline_consumer_deps(
+        nats,
+        cfg,
+        pool,
+        async_task_starter=object(),
+        gate_repository=repo,
+        gate_state_machine=sm,
+        gate_clock=FixedClock(),
+    )
+    c1 = _envelope_at("corr-first", QUEUED_AT)
+    c2 = _envelope_at("corr-second", datetime(2026, 10, 4, 9, 5, 0, tzinfo=UTC))
+    c1_build = pool.record_pending_build(
+        BuildQueuedPayload.model_validate(json.loads(c1)["payload"])
+    )
+    pool.connection.execute(
+        "UPDATE builds SET status = 'INTERRUPTED' WHERE build_id = ?", (c1_build,)
+    )
+    gated: list[str] = []
+
+    async def _gate(**kwargs: Any) -> Any:
+        gated.append(kwargs["build_id"])
+        return _serve_gate_activation.HOLD_SLOT
+
+    monkeypatch.setattr(_serve_gate_activation, "maybe_gate_build", _gate)
+    second, first = _Msg(c2), _Msg(c1)
+    try:
+        asyncio.run(handle_message(second, deps))
+        asyncio.run(handle_message(first, deps))
+    finally:
+        _serve_deps_gating._reset_for_tests()
+    assert second.acks == 1, "c2 should have been refused while c1 is recovering"
+    assert gated == [c1_build], gated
+    assert first.acks == 0
+    failed = [
+        json.loads(b)["payload"]
+        for b in nats.published.get(f"pipeline.build-failed.{FEATURE}", [])
+    ]
+    assert len(failed) == 1 and "already in progress" in str(failed[0])
+
+
+def test_a_declined_relaunch_interrupts_the_original(
+    nats, pool, tmp_path, monkeypatch  # noqa: F811 — imported fixtures
+) -> None:
+    """Coach finding 2: after a factory-only restart the relaunch's card is
+    declined. The original run, still going, is interrupted (the runner's
+    fence then stops everything it owns) and the message is acknowledged."""
+    from forge.adapters.nats.pipeline_consumer import handle_message
+
+    bridge_migration.apply(pool.connection)
+    estate = make_estate(tmp_path / "estate")
+    correlation = f"corr-decline-{uuid.uuid4().hex[:8]}"
+    build_id = derive_build_id(FEATURE, QUEUED_AT)
+    estate.add_build(FEATURE, build_id, branch="main")
+
+    async def _go(url: str) -> dict[str, Any]:
+        # The factory's runner address, as forge serve has it.
+        monkeypatch.setenv("FORGE_AUTOBUILD_RUNNER_URL", url)
+        one = _Coordinator(nats, pool, url, _open_config())
+        first = _Msg(_envelope(correlation))
+        tasks = [asyncio.ensure_future(handle_message(first, one.deps))]
+        await _approve_or_reject(nats, pool, build_id, "approve")
+        original = await asyncio.to_thread(estate.pids, FEATURE)
+        await _wait_until(lambda: one.resolved, timeout=30, what="process 1 observes")
+        await one.restart()
+        await _boot_recovery(pool)
+
+        second = _Msg(_envelope(correlation))
+        two = _Coordinator(nats, pool, url, _open_config())
+        tasks.append(asyncio.ensure_future(handle_message(second, two.deps)))
+        await _approve_or_reject(nats, pool, build_id, "reject")
+        await _wait_until(lambda: second.acks >= 1, timeout=60, what="the ack")
+        deadline = asyncio.get_running_loop().time() + 30
+        while any(proc_alive(p, s) for p, s in original):
+            assert asyncio.get_running_loop().time() < deadline, "original still runs"
+            await asyncio.sleep(0.2)
+        seen = {"acks": second.acks}
+        await two.wireup.shutdown()
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        return seen
+
+    try:
+        with real_runner(estate, "decline", jobs=2) as runner:
+            seen = asyncio.run(asyncio.wait_for(_go(runner.url), timeout=180))
+    finally:
+        kill_recorded(estate)
+        kill_marked([build_id])
+        _serve_deps_gating._reset_for_tests()
+    assert seen["acks"] == 1
+    assert not (estate.records / f"{FEATURE}.relaunch.started").exists()

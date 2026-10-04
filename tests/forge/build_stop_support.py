@@ -1,8 +1,8 @@
 """Real processes and real runners for the build-stopping checks (3 October 2026).
 
 Nothing here is a stand-in for the runner: the runners are real
-``langgraph dev`` servers serving the real ``autobuild_runner`` graph and the
-runner's real stop route, and a build's processes are real processes. The one
+``langgraph dev`` servers serving the real ``autobuild_runner`` graph, and a
+build's processes are real processes. The one
 stand-in is GuardKit itself — a small script, named by ``FORGE_GUARDKIT_PATH``,
 that starts the kinds of process a real build starts:
 
@@ -75,6 +75,15 @@ FAKE_GUARDKIT = textwrap.dedent(
             continue
         others[other] = [p for p, s in recorded if alive(p, s)]
 
+    fixtures = {{}}
+    for other in spec.get("fixtures_must_be_gone", []):
+        listed = subprocess.run(
+            ["docker", "ps", "--quiet", "--filter",
+             "label=guardkit.fixture.owner=" + other],
+            capture_output=True, text=True,
+        )
+        fixtures[other] = listed.stdout.split() if listed.returncode == 0 else "unknown"
+
     beat = (
         "import os, time\\n"
         "while True:\\n"
@@ -88,7 +97,11 @@ FAKE_GUARDKIT = textwrap.dedent(
         "    time.sleep(1)\\n"
     )
     procs = [
-        subprocess.Popen([sys.executable, "-c", beat]),
+        subprocess.Popen(
+            [sys.executable, "-c", beat],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        ),
         subprocess.Popen(
             [sys.executable, "-c", stubborn],
             start_new_session=True,
@@ -102,14 +115,18 @@ FAKE_GUARDKIT = textwrap.dedent(
     json.dump([[p, starttime(p)[1]] for p in pids], open(tmp, "w"))
     os.replace(tmp, os.path.join(records, name + ".pids"))
     tmp = os.path.join(records, name + ".started.tmp")
-    json.dump({{"at": time.time(), "others_alive": others}}, open(tmp, "w"))
+    json.dump(
+        {{"at": time.time(), "others_alive": others, "fixtures_alive": fixtures}},
+        open(tmp, "w"),
+    )
     os.replace(tmp, os.path.join(records, name + ".started"))
     print("== guardkit autobuild start ==", flush=True)
     time.sleep(
         spec.get("relaunch_run_seconds", 600) if relaunch else spec.get("run_seconds", 600)
     )
-    for p in procs:
-        p.kill()
+    if not spec.get("leave_behind"):
+        for p in procs:
+            p.kill()
     sys.exit(spec.get("exit", 0))
     """
 )

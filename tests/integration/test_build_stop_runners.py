@@ -29,8 +29,12 @@ from tests.forge.build_stop_support import (
     kill_recorded,
     launch_message,
     make_estate,
+    docker_available,
     proc_alive,
     real_runner,
+    refusing_engine,
+    remove_test_containers,
+    start_fixture_container,
     wait_for,
 )
 
@@ -84,20 +88,34 @@ async def _interrupt(launched: dict) -> None:
 
 
 class TestTheRunnerSlotIsAFence:
-    def test_a_queued_build_starts_only_after_the_stopped_builds_processes_are_gone(
-        self, estate
+    @pytest.mark.skipif(not docker_available(), reason="needs docker and busybox:1.36")
+    def test_a_queued_build_starts_only_after_the_stopped_builds_processes_and_fixture_are_gone(
+        self, estate, tmp_path
     ):
         a_id, b_id = _build_id(), _build_id()
         estate.add_build("FEAT-RA", a_id, branch="ra")
-        estate.add_build("FEAT-RB", b_id, branch="rb", must_be_gone=["FEAT-RA"])
+        estate.add_build(
+            "FEAT-RB",
+            b_id,
+            branch="rb",
+            must_be_gone=["FEAT-RA"],
+            fixtures_must_be_gone=[a_id],
+        )
+        wrapper, refuse = refusing_engine(tmp_path)
 
         async def _go(url: str) -> None:
             a = await _launch(url, "FEAT-RA", a_id, "ra")
             await asyncio.to_thread(estate.pids, "FEAT-RA")
+            await asyncio.to_thread(start_fixture_container, a_id)
             b = await _launch(url, "FEAT-RB", b_id, "rb")
             await asyncio.sleep(2.0)
             assert estate.started("FEAT-RB") is None, "B started beside A in one slot"
             await _interrupt(a)
+            # A's processes go, but its fixture cannot be removed yet: the
+            # slot stays held.
+            await asyncio.sleep(4.0)
+            assert estate.started("FEAT-RB") is None, "B started with A's fixture up"
+            refuse.unlink()
             await asyncio.to_thread(
                 wait_for,
                 lambda: estate.started("FEAT-RB") is not None,
@@ -106,12 +124,19 @@ class TestTheRunnerSlotIsAFence:
             )
             await _interrupt(b)
 
-        with real_runner(estate, "slot") as runner:
-            asyncio.run(_go(runner.url))
+        try:
+            with real_runner(
+                estate, "slot", extra_env={"FORGE_FIXTURE_ENGINE": str(wrapper)}
+            ) as runner:
+                asyncio.run(_go(runner.url))
+        finally:
+            remove_test_containers([a_id])
         # At the instant B started, none of A's processes was alive — not its
         # child, not its grandchild, not the SIGTERM-ignoring process in a
-        # session of its own.
-        assert estate.started("FEAT-RB")["others_alive"] == {"FEAT-RA": []}
+        # session of its own — and A's fixture was gone.
+        started = estate.started("FEAT-RB")
+        assert started["others_alive"] == {"FEAT-RA": []}
+        assert started["fixtures_alive"] == {a_id: []}
 
 
 class TestARelaunchStopsTheOriginalFirst:
