@@ -1340,6 +1340,8 @@ class TestExecutorSequencing:
         deps, publisher, gk, dp = _deps(config, pool, guardkit=joiner, deploy=red)
         first = await _run_executor(deps, repo_root)
         assert first.result == "candidate-refused"
+        # A failed candidate check keeps the hold (4 October 2026); it runs out.
+        _the_kept_hold_runs_out(pool)
 
         deps, publisher, gk, dp = _deps(config, pool, guardkit=joiner)
         second = await _run_executor(deps, repo_root)
@@ -4152,13 +4154,16 @@ class _ATeardownThroughTheSidecar(_FakeDeploy):
     """Every leg as :class:`_FakeDeploy`, except the candidate teardown, which
     goes through the real runner to ``sidecar``."""
 
-    def __init__(self, sidecar: ASidecarThat) -> None:
+    def __init__(self, sidecar: ASidecarThat, *, raises: bool = False) -> None:
         super().__init__()
         self.sidecar = sidecar
+        self.raises = raises
 
     async def __call__(self, **kwargs: Any) -> Any:
         if kwargs.get("leg") == "candidate_down":
             self.calls.append(kwargs)
+            if self.raises:
+                raise ConnectionError("the teardown request went nowhere")
             return self.sidecar.run_the_leg("candidate_down")
         return await super().__call__(**kwargs)
 
@@ -4202,30 +4207,25 @@ class TestTheHoldIsPutDownOnlyWhenThePressHasFinished:
         assert _the_hold(pool).turn == held.turn + 1
 
     @pytest.mark.asyncio
-    async def test_a_candidate_check_that_gave_its_verdict_puts_it_down(
-        self, config: ForgeConfig, pool: SqliteLifecyclePersistence, repo_root: Path
+    @pytest.mark.parametrize(
+        "gate",
+        [None, {"verdict": None, "failed_checks": []}],
+        ids=["red-with-a-verdict", "no-verdict"],
+    )
+    async def test_a_candidate_check_that_failed_keeps_it(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+        repo_root: Path,
+        gate: dict[str, Any] | None,
     ) -> None:
+        """The coach's G1, 4 October 2026: a failed candidate check is a
+        deploy-stage leg that did not complete, and the stage may have torn
+        its candidate down (or not) on the way, so the hold is kept whatever
+        verdict came back."""
         deps, _publisher, _gk, _dp = _deps(
             config, pool, guardkit=_JoinsForReal(),
-            deploy=_FakeDeploy(candidate_outcome="failed"),
-        )
-
-        outcome = await _run_executor(deps, repo_root)
-
-        assert outcome.result == "candidate-refused"
-        assert _the_hold(pool).lease_holder is None
-
-    @pytest.mark.asyncio
-    async def test_a_candidate_check_that_gave_no_verdict_keeps_it(
-        self, config: ForgeConfig, pool: SqliteLifecyclePersistence, repo_root: Path
-    ) -> None:
-        """Something went wrong with the check itself: not a settled ending."""
-        deps, _publisher, _gk, _dp = _deps(
-            config, pool, guardkit=_JoinsForReal(),
-            deploy=_FakeDeploy(
-                candidate_outcome="failed",
-                gate={"verdict": None, "failed_checks": []},
-            ),
+            deploy=_FakeDeploy(candidate_outcome="failed", gate=gate),
         )
 
         outcome = await _run_executor(deps, repo_root)
@@ -4312,18 +4312,19 @@ class TestTheHoldIsPutDownOnlyWhenThePressHasFinished:
 
 class TestALostTeardownKeepsTheHold:
     """Codex's review, 4 October 2026: the clean-up's candidate teardown is a
-    step that changes something. If it failed or its answer was lost, it may
-    still be running, so the hold is kept even after a settled ending."""
+    deploy-stage leg. Unless it reports complete it may still be running, so
+    the hold is kept even after an ending that was otherwise clean."""
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        "answer, kept",
+        "answer, raises, kept",
         [
-            (None, True),
-            ({"exit_code": 1, "output_tail": "the teardown went red"}, True),
-            ({"exit_code": 0, "output_tail": "the candidate is down"}, False),
+            (None, False, True),
+            ({"exit_code": 1, "output_tail": "the teardown went red"}, False, True),
+            (None, True, True),
+            ({"exit_code": 0, "output_tail": "the candidate is down"}, False, False),
         ],
-        ids=["answer-lost", "failed-in-its-own-words", "torn-down"],
+        ids=["answer-lost", "failed-in-its-own-words", "raised", "torn-down"],
     )
     async def test_the_teardown_decides_whether_the_hold_is_put_down(
         self,
@@ -4331,11 +4332,12 @@ class TestALostTeardownKeepsTheHold:
         pool: SqliteLifecyclePersistence,
         repo_root: Path,
         answer: dict[str, Any] | None,
+        raises: bool,
         kept: bool,
     ) -> None:
         sidecar = ASidecarThat(answer)
         try:
-            deploy = _ATeardownThroughTheSidecar(sidecar)
+            deploy = _ATeardownThroughTheSidecar(sidecar, raises=raises)
             deps, _publisher, _gk, _dp = _deps(
                 config, pool, guardkit=_JoinsForReal(), deploy=deploy
             )
