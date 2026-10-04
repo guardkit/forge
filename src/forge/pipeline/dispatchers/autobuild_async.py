@@ -344,6 +344,7 @@ async def dispatch_autobuild_async(
     budget: "dict[str, Any] | None" = None,
     memory_project: str | None = None,
     launch_settings: "Sequence[str] | None" = None,
+    source_commit: str | None = None,
 ) -> AutobuildDispatchHandle:
     """Dispatch ``feature_id``'s autobuild as a long-running async subagent.
 
@@ -465,6 +466,12 @@ async def dispatch_autobuild_async(
             row. Names only — a value never travels — and the runner takes each
             value from its own settings, and only if it has one. Nothing
             declared omits the key entirely.
+        source_commit: The exact commit a PREPARED feature was admitted at
+            (4 October 2026: a feature planned elsewhere and queued straight
+            to a build). Threaded as ``payload["source_commit"]`` when set, so
+            the runner builds exactly that commit on a build-owned branch and
+            runs GuardKit's own feature check first. ``None`` (every planned
+            or hand-queued build) omits the key, and the launch is unchanged.
 
     Returns:
         :class:`AutobuildDispatchHandle` carrying the minted ``task_id``
@@ -606,6 +613,12 @@ async def dispatch_autobuild_async(
     # ever carried a value across this wire.
     if launch_settings:
         launch_payload["launch_settings"] = [str(name) for name in launch_settings]
+    # The exact commit a prepared feature was admitted at (4 October 2026), by
+    # the same one-hop truthy-guard convention: a runner inside a sandbox
+    # cannot read the ledger, so the commit travels with the launch. Absent for
+    # every other build, whose launch bytes are unchanged.
+    if source_commit:
+        launch_payload["source_commit"] = str(source_commit)
     # TASK-FORGE-FRR-F010G: prefer the async launch path. The deepagents
     # middleware's sync path raises on ``url=None`` (the autobuild_runner
     # registration shape) while the async path tolerates ``url=None`` and

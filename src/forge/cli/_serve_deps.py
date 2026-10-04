@@ -82,7 +82,7 @@ import asyncio
 import logging
 import sqlite3
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Callable, Sequence
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Sequence
 
 from forge.adapters.nats.pipeline_consumer import PipelineConsumerDeps
 from forge.adapters.nats.pipeline_publisher import PipelinePublisher
@@ -129,6 +129,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "BudgetBreachDispatchRefused",
     "build_pipeline_consumer_deps",
+    "build_prepared_build_admission",
     "build_serve_resume_launcher",
     "is_terminal_status",
 ]
@@ -291,6 +292,7 @@ def _build_resume_launcher(
     async_task_starter: AsyncTaskStarter | None,
     memory_project_reader: Callable[[str], str | None] | None = None,
     launch_settings_reader: Callable[[str], "Sequence[str]"] | None = None,
+    source_commit_reader: Callable[[str], str | None] | None = None,
 ) -> Callable[..., Any]:
     """Return the launch closure — ``dispatch_build`` minus ``record_pending_build``.
 
@@ -353,6 +355,31 @@ def _build_resume_launcher(
             if launch_settings_reader is not None and build_id
             else ()
         )
+        # The exact commit a prepared feature was admitted at (4 October
+        # 2026), off the same row by the same rule: a resume builds the commit
+        # its first launch was admitted at. ``None`` launches as before.
+        source_commit = (
+            source_commit_reader(build_id)
+            if source_commit_reader is not None and build_id
+            else None
+        )
+        if source_commit:
+            return await dispatch_autobuild_async(
+                build_id=build_id,
+                feature_id=feature_id,
+                correlation_id=correlation_id,
+                forward_context_builder=forward_context_builder,
+                async_task_starter=async_task_starter,
+                stage_log_recorder=stage_log_recorder,
+                state_channel=state_channel,
+                lifecycle_emitter=lifecycle_emitter,
+                branch=branch,
+                repo=repo,
+                budget=budget,
+                memory_project=memory_project,
+                launch_settings=launch_settings,
+                source_commit=source_commit,
+            )
         return await dispatch_autobuild_async(
             build_id=build_id,
             feature_id=feature_id,
@@ -451,6 +478,9 @@ def build_serve_resume_launcher(
         # row (22 September 2026). An absent read, or a row from before this
         # existed, is an empty list: the factory's own list and nothing else.
         getattr(sqlite_pool, "read_launch_settings", None),
+        # The exact commit a prepared feature was admitted at (4 October
+        # 2026); a resumed prepared build builds that commit, never the branch.
+        getattr(sqlite_pool, "read_source_commit", None),
     )
 
     async def guarded_launch(
@@ -775,6 +805,7 @@ def _build_dispatch_build(
     gate_clock: Callable[[], datetime] | None = None,
     conductor_router: Callable[..., Any] | None = None,
     record_build_rejection: Callable[[str, str], Any] | None = None,
+    prepared_build_admission: Callable[[Any], Awaitable[Any]] | None = None,
 ):
     """Return the production ``dispatch_build`` closure.
 
@@ -816,6 +847,18 @@ def _build_dispatch_build(
     the same call sequence (asserted by the flag-off call-sequence test).
     The one addition is the §4.3 mode-c guard on the launch arm, which
     reads ``builds.mode`` and changes no launch byte for a routine build.
+
+    ``prepared_build_admission`` (4 October 2026, a prepared feature through
+    the normal build route) is ``async (payload) -> AdmissionAnswer``. It is
+    asked only for a delivery with NO planning run and NO build row yet — a
+    feature planned elsewhere and queued straight to a build — and runs before
+    the row is written: it fetches the project's remote, reads the
+    declarations at the queued branch's commit and checks the supplied files
+    there. A refusal ends the delivery like any other refusal before a row
+    (noted on the queue row, ``build-failed``, acknowledged); the admitted
+    facts are recorded on the row. ``None`` admits nothing and records
+    nothing, exactly as before. Nothing on this route calls a planning
+    capability.
     """
     launch = _build_resume_launcher(
         forward_context_builder,
@@ -833,6 +876,9 @@ def _build_dispatch_build(
         # row (22 September 2026). An absent read, or a row from before this
         # existed, is an empty list: the factory's own list and nothing else.
         getattr(sqlite_pool, "read_launch_settings", None),
+        # The exact commit a prepared feature was admitted at (4 October
+        # 2026). ``None`` for every other build, whose launch is unchanged.
+        getattr(sqlite_pool, "read_source_commit", None),
     )
     clock = gate_clock or _utc_now
 
@@ -1202,6 +1248,88 @@ def _build_dispatch_build(
                 "tests should pass a fake starter via the kwarg."
             )
 
+        # A PREPARED FEATURE (4 October 2026): a build with no planning run and
+        # no row yet was planned elsewhere and queued straight here. Its start,
+        # target, memory and settings are established now, before the row is
+        # written, at the one commit it will be built from. It runs before the
+        # one-build-per-feature check below because it awaits the project's
+        # remote, and that check and the row write must have no await between
+        # them. A build that has a planning run, or whose row already exists
+        # (a redelivery, or a row the CLI or the fix journey wrote ahead), is
+        # not touched: it keeps copying its facts exactly as before.
+        admitted = None
+        if prepared_build_admission is not None:
+            try:
+                prepared = not getattr(
+                    sqlite_pool, "has_planning_run", lambda _cid: True
+                )(payload.correlation_id) and (
+                    _read_build_identity(
+                        sqlite_pool,
+                        feature_id=payload.feature_id,
+                        correlation_id=payload.correlation_id,
+                    )
+                    is None
+                )
+            except (AttributeError, sqlite3.Error) as exc:
+                logger.error(
+                    "dispatch_build: could not tell whether feature_id=%s "
+                    "correlation_id=%s was planned here (%s); holding WITHOUT "
+                    "terminal event or ack",
+                    payload.feature_id,
+                    payload.correlation_id,
+                    exc,
+                )
+                return
+            if prepared:
+                answer = await prepared_build_admission(payload)
+                if not getattr(answer, "ok", False):
+                    reason = str(
+                        getattr(answer, "refusal", None)
+                        or "the prepared feature could not be admitted"
+                    )
+                    logger.warning(
+                        "dispatch_build: prepared feature_id=%s "
+                        "correlation_id=%s refused before row creation: %s",
+                        payload.feature_id,
+                        payload.correlation_id,
+                        reason,
+                    )
+                    from forge.adapters.nats.pipeline_consumer import (
+                        note_build_rejection,
+                    )
+
+                    if not note_build_rejection(
+                        record_build_rejection, payload.correlation_id, reason
+                    ):
+                        # The note could not be written: hold WITHOUT ack, so
+                        # the redelivery writes it.
+                        return
+                    if lifecycle_emitter is not None:
+                        from forge.pipeline import BuildContext
+
+                        await lifecycle_emitter.emit_failed(
+                            BuildContext(
+                                feature_id=payload.feature_id,
+                                build_id="",
+                                correlation_id=payload.correlation_id,
+                                wave_total=1,
+                            ),
+                            failure_reason=reason,
+                            recoverable=False,
+                            failed_task_id=None,
+                        )
+                    await ack_callback()
+                    return
+                admitted = answer.admitted
+                logger.info(
+                    "dispatch_build: prepared feature_id=%s admitted at %s "
+                    "(target %s, memory %s)",
+                    payload.feature_id,
+                    admitted.source_commit,
+                    admitted.target_branch,
+                    admitted.memory_project,
+                )
+
         # One build of a feature at a time (the lifecycle bridge tracks one
         # live build per feature). Every intake reaches this point, and with
         # several build places two builds of one feature could otherwise run
@@ -1273,7 +1401,12 @@ def _build_dispatch_build(
             return
 
         try:
-            build_id = sqlite_pool.record_pending_build(payload)
+            if admitted is not None:
+                build_id = sqlite_pool.record_pending_build(
+                    payload, admitted=admitted
+                )
+            else:
+                build_id = sqlite_pool.record_pending_build(payload)
         except DuplicateBuildError as exc:
             # R2 refined to THREE arms (plan §D4.5, arch-review C2): the
             # consumer's ``is_duplicate_terminal`` filter already screened the
@@ -1773,6 +1906,71 @@ def _build_publish_build_failed(
     return publish_build_failed
 
 
+def build_prepared_build_admission(
+    forge_config: ForgeConfig,
+    *,
+    git_runner: Any = None,
+) -> Callable[[Any], Awaitable[Any]]:
+    """``async (payload) -> AdmissionAnswer`` for a feature planned elsewhere.
+
+    4 October 2026 (project initialisation, Part 6). The repository's checkout
+    is looked up exactly as the planning door looks it up
+    (``planning.target_repo_paths``), and the git runner is composed exactly as
+    the planning door's is (:func:`forge.cli._serve_planning.
+    compose_planning_git_runner`): the sandbox's sidecar for a sandboxed
+    repository, the coordinator's own runner otherwise. ``git_runner`` lets a
+    test hand in its own.
+    """
+    from forge.pipeline.prepared_admission import (
+        AdmissionAnswer,
+        admit_prepared_build,
+    )
+
+    runners: list[Any] = [git_runner] if git_runner is not None else []
+
+    def _runner() -> Any:
+        # Composed on first use, so composing the daemon never depends on it.
+        if not runners:
+            from forge.adapters.git.planning_runner import WorktreeGitRunner
+            from forge.cli._serve_planning import compose_planning_git_runner
+
+            composed, _resolver = compose_planning_git_runner(
+                forge_config.planning, worktree_runner_factory=WorktreeGitRunner
+            )
+            runners.append(composed)
+        return runners[0]
+
+    async def admit(payload: Any) -> Any:
+        repo = str(payload.repo)
+        repo_path = (forge_config.planning.target_repo_paths or {}).get(repo)
+        if not repo_path:
+            return AdmissionAnswer(
+                refusal=(
+                    f"the repository {repo} is not registered with this "
+                    f"factory (planning.target_repo_paths), so a feature "
+                    f"planned elsewhere cannot be admitted for it"
+                )
+            )
+        try:
+            runner = _runner()
+        except Exception as exc:  # noqa: BLE001 — a refusal, never a crash
+            return AdmissionAnswer(
+                refusal=(
+                    f"the git runner for {repo} could not be set up: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+            )
+        return await admit_prepared_build(
+            runner,
+            repo=repo,
+            repo_path=str(repo_path),
+            feature_id=str(payload.feature_id),
+            branch=str(payload.branch),
+        )
+
+    return admit
+
+
 def _work_queue_rejection_recorder(
     sqlite_pool: Any,
 ) -> Callable[[str, str], bool]:
@@ -1811,6 +2009,7 @@ def build_pipeline_consumer_deps(
     gate_clock: Callable[[], datetime] | None = None,
     conductor_router: Callable[..., Any] | None = None,
     record_build_rejection: Callable[[str, str], Any] | None = None,
+    prepared_build_admission: Callable[[Any], Awaitable[Any]] | None = None,
 ) -> PipelineConsumerDeps:
     """Compose the production :class:`PipelineConsumerDeps` for ``forge serve``.
 
@@ -1863,6 +2062,11 @@ def build_pipeline_consumer_deps(
             byte-for-byte today's: every accepted build goes straight to
             the routine autobuild launch. See
             :func:`_build_dispatch_build`.
+        prepared_build_admission: Optional ``async (payload) ->
+            AdmissionAnswer`` for a build with no planning run (a feature
+            planned elsewhere). Production passes
+            :func:`build_prepared_build_admission`; ``None`` admits nothing
+            and records nothing, as before. See :func:`_build_dispatch_build`.
 
     Returns:
         A fully wired
@@ -1956,6 +2160,7 @@ def build_pipeline_consumer_deps(
         gate_clock=gate_clock,
         conductor_router=conductor_router,
         record_build_rejection=record_build_rejection,
+        prepared_build_admission=prepared_build_admission,
     )
     publish_build_failed = _build_publish_build_failed(
         publisher,

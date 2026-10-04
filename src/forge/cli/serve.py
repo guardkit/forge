@@ -602,6 +602,7 @@ def bind_production_dispatch_chain(
     from forge.cli import _serve_deps_gating, _serve_gate_activation
     from forge.cli._serve_deps import (
         build_pipeline_consumer_deps,
+        build_prepared_build_admission,
         build_serve_resume_launcher,
     )
     from forge.cli._serve_deps_lifecycle import build_publisher_and_emitter
@@ -1036,6 +1037,10 @@ def bind_production_dispatch_chain(
             gate_state_machine=gate_state_machine,
             gate_clock=_gate_wall_clock,
             conductor_router=conductor_router,
+            # A feature planned elsewhere (4 October 2026): admitted at the
+            # commit its branch names, through the planning door's own git
+            # runner, before its row is written.
+            prepared_build_admission=build_prepared_build_admission(forge_config),
         )
         dispatcher = make_handle_message_dispatcher(deps)
         # Rebind the daemon's dispatch seam BEFORE the consumer's first
