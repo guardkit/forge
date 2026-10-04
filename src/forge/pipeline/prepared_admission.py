@@ -276,14 +276,13 @@ def _resolve_link(from_file: str, target: str) -> str | None:
 #: planner's own emitter reads it (specialist-agent
 #: ``src/specialist_agent/qa/leak_sweep_emit.py``, ``_INTEGRATION_SECTION_RE``
 #: and ``_extract_integration_section``): case-sensitive, ``## §4 Integration
-#: Contracts`` or a bare ``## §4`` first, at any level of two or more. One
-#: addition: GuardKit's ``/feature-plan`` documents the heading with a colon,
+#: Contracts`` or a bare ``## §4`` first, at any level of two or more.
+#: GuardKit's ``/feature-plan`` template writes the heading with a colon,
 #: ``## §4: Integration Contracts`` (installer/core/commands/feature-plan.md),
-#: which the specialist pattern does not match. That mismatch between the two
-#: producers is noted for their owners; here the colon form counts as the same
-#: heading, so a guide either producer wrote is read.
+#: which neither reader recognises; that is noted for the producers' owners
+#: and deliberately not papered over here.
 _INTEGRATION_HEADING_RE = re.compile(
-    r"^##+\s*(?:§\s*)?4\s*:?\s*(?:Integration\s+Contracts?)?\s*$",
+    r"^##+\s*(?:§\s*)?4\s*(?:Integration\s+Contracts?)?\s*$",
     re.MULTILINE,
 )
 #: Only when no such heading exists: ``## Integration Contracts`` (the

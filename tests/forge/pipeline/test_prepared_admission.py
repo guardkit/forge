@@ -564,8 +564,10 @@ def test_the_integration_contracts_rule_matches_the_producers() -> None:
     assert not guide_claims_routes("## §4 Integration Contracts\nroute:   \n")
 
 
-def test_guardkits_colon_form_counts_as_the_heading() -> None:
-    assert guide_claims_routes("## §4: Integration Contracts\n- route: /a\n")
+def test_guardkits_colon_form_is_not_recognised_like_the_emitter() -> None:
+    # GuardKit's template writes this form; the specialist emitter does not
+    # recognise it, and neither does admission (noted for the producers).
+    assert not guide_claims_routes("## §4: Integration Contracts\n- route: /a\n")
 
 
 def test_the_heading_is_case_sensitive_like_the_emitter() -> None:
