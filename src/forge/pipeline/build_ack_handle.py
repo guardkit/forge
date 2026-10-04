@@ -227,8 +227,12 @@ def make_msg_ack_handle(msg: _AckNakMsg) -> MsgBuildAckHandle:
 # exposing the dict directly so the bridge can swap the storage
 # backend (in-memory dict, Redis, SQLite mirror) without touching the
 # consumer's call site.
-InFlightAckRegistry = Callable[[str, str, BuildAckHandle], Awaitable[None]]
-"""``async (feature_id, correlation_id, handle) -> None``.
+InFlightAckRegistry = Callable[[str, str, BuildAckHandle], Awaitable[bool | None]]
+"""``async (feature_id, correlation_id, handle) -> bool | None``.
+
+``False`` means the registry refused the handle because another build of the
+same feature is still being observed; the launch then waits and asks again.
+``True`` or ``None`` means it was taken.
 
 Registers ``handle`` against the identity tuple in the bridge's
 in-flight store. Implementations MUST be idempotent for the same

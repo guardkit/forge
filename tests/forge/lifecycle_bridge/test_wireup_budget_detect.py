@@ -802,6 +802,10 @@ class _GatePoolAdapter:
     def clear_budget_breach(self, build_id: str, cleared_at: str) -> None:
         self._persistence.clear_budget_breach(build_id, cleared_at)
 
+    def _reader(self):
+        # The one-build-per-feature check reads the REAL database too.
+        return self._persistence._reader()
+
 
 def _requeue_dispatch(persistence: SqliteLifecyclePersistence, starter):
     """The REAL ``dispatch_build`` closure, gate-unwired (legacy branch)."""

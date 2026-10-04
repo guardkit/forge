@@ -78,6 +78,7 @@ References:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sqlite3
 from datetime import datetime, timezone
@@ -99,6 +100,7 @@ from forge.cli._serve_deps_forward_context import (
 )
 from forge.cli._serve_deps_lifecycle import build_publisher_and_emitter
 from forge.cli._serve_deps_stage_log import build_stage_log_recorder
+from forge.cli._recorded_run import interrupt_recorded_run
 from forge.cli._serve_deps_state_channel import build_autobuild_state_initialiser
 from forge.config.build_admission import build_admission
 from forge.config.models import ForgeConfig, PipelineConfig
@@ -592,6 +594,84 @@ def _read_build_identity(
     return str(build_id), state
 
 
+def _queue_order_key(queued_at: Any, correlation_id: str) -> tuple[datetime, str]:
+    """Order builds of one feature by when they were queued (then correlation).
+
+    ``queued_at`` is a stored ISO-8601 string or a ``datetime``; a value
+    without a timezone is read as UTC, matching how rows are written.
+    """
+    value = (
+        queued_at
+        if isinstance(queued_at, datetime)
+        else datetime.fromisoformat(str(queued_at))
+    )
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return (value, correlation_id)
+
+
+def _another_build_of_feature_goes_first(
+    sqlite_pool: SqliteLifecyclePersistence,
+    payload: Any,
+    started: set[str],
+) -> tuple[bool, str | None]:
+    """Decide whether another build of this feature keeps it (one at a time).
+
+    The lifecycle bridge tracks one live build per feature, so only one
+    build of a feature may be active at once. Another ACTIVE build of the
+    same feature with a different correlation goes first when:
+
+    * it is past QUEUED (an approval card, a runner or the merge step owns
+      it already);
+    * it is still QUEUED but this daemon already let it through (``started``
+      holds the correlations it let through for this feature); or
+    * it is still QUEUED, not yet let through (a row written ahead by the
+      CLI or the fix journey), and was queued earlier than this one.
+
+    Synchronous on purpose: the caller runs it and then writes its own row
+    with no ``await`` in between, so within the daemon's single event loop
+    the check and the write cannot interleave with another dispatch.
+
+    Returns:
+        ``(refuse, own_build_id)`` — ``own_build_id`` is this delivery's own
+        row when one was written ahead and is still QUEUED, else ``None``.
+        A delivery whose own row is already past QUEUED, or that this
+        daemon already let through, is a redelivery: it returns
+        ``(False, None)`` and the existing duplicate handling decides.
+    """
+    from forge.lifecycle.persistence import ACTIVE_STATES
+
+    # INTERRUPTED counts too: after a factory-only restart such a build's
+    # original run may still be going, and its redelivery relaunches it (own
+    # row: the duplicate handling decides; another build's: it goes first).
+    active_values = tuple(s.value for s in ACTIVE_STATES) + (
+        BuildState.INTERRUPTED.value,
+    )
+    placeholders = ",".join("?" * len(active_values))
+    with sqlite_pool._reader() as cx:
+        rows = cx.execute(
+            "SELECT build_id, correlation_id, status, queued_at FROM builds "
+            f"WHERE feature_id = ? AND status IN ({placeholders})",
+            (payload.feature_id, *active_values),
+        ).fetchall()
+    own = [r for r in rows if r[1] == payload.correlation_id]
+    others = [r for r in rows if r[1] != payload.correlation_id]
+    own_build_id: str | None = None
+    if own:
+        if own[0][2] != BuildState.QUEUED.value or payload.correlation_id in started:
+            return False, None
+        own_build_id = str(own[0][0])
+        mine = _queue_order_key(own[0][3], payload.correlation_id)
+    else:
+        mine = _queue_order_key(payload.queued_at, payload.correlation_id)
+    for _build_id, correlation_id, status, queued_at in others:
+        if status != BuildState.QUEUED.value or correlation_id in started:
+            return True, own_build_id
+        if _queue_order_key(queued_at, correlation_id) < mine:
+            return True, own_build_id
+    return False, own_build_id
+
+
 def _read_build_status(
     sqlite_pool: SqliteLifecyclePersistence,
     *,
@@ -691,6 +771,7 @@ def _build_dispatch_build(
     gate_state_machine: Any = None,
     gate_clock: Callable[[], datetime] | None = None,
     conductor_router: Callable[..., Any] | None = None,
+    record_build_rejection: Callable[[str, str], Any] | None = None,
 ):
     """Return the production ``dispatch_build`` closure.
 
@@ -920,6 +1001,40 @@ def _build_dispatch_build(
             return None
         return await launch(**launch_kwargs)
 
+    # Correlations this daemon has let through, per feature, for the
+    # one-build-per-feature check below. Only ever compared against rows
+    # that are still ACTIVE, so finished builds never block anything.
+    started_by_feature: dict[str, set[str]] = {}
+
+    def _earlier_run_of(build_id: str) -> tuple[bool, str | None]:
+        """A recovered (INTERRUPTED) build's earlier run: ``(readable, thread)``.
+
+        After a factory-only restart that run may still be going in its
+        runner. Its thread is read now so that, on approval, its row can be
+        deleted just before the relaunch (the relaunch's observer then binds
+        the relaunch's own thread and run; the runner stops the earlier run
+        before the relaunch proceeds), and, if the relaunch does not happen,
+        the earlier run can be interrupted instead. ``readable=False``: the
+        ledger could not be read, and the caller holds the message without
+        acknowledging it so its redelivery tries again.
+        """
+        try:
+            row = sqlite_pool.connection.execute(
+                "SELECT task_id FROM async_tasks WHERE build_id = ? "
+                "ORDER BY started_at DESC, rowid DESC LIMIT 1",
+                (build_id,),
+            ).fetchone()
+        except sqlite3.Error as exc:
+            logger.error(
+                "dispatch_build: could not read the earlier run of build_id=%s "
+                "(%s); holding the message WITHOUT ack so its redelivery tries "
+                "again",
+                build_id,
+                exc,
+            )
+            return False, None
+        return True, (str(row[0]) if row is not None else None)
+
     async def dispatch_build(
         payload: "BuildQueuedPayload",
         ack_callback,
@@ -959,6 +1074,11 @@ def _build_dispatch_build(
         # ``--help`` paths (the dispatch closure is the only place the
         # payload type is exercised).
         from forge.lifecycle.persistence import DuplicateBuildError
+
+        # A recovered (INTERRUPTED) build being relaunched, and its earlier
+        # run's thread (see _earlier_run_of).
+        recovered = False
+        earlier_thread: str | None = None
 
         # D4's authoritative BUILD boundary is before persistence, the
         # approval gate and the conductor. It therefore also covers direct
@@ -1049,6 +1169,20 @@ def _build_dispatch_build(
                 "observer, conductor or runner",
                 reason,
             )
+            if existing is None:
+                # No build row will ever exist for this delivery: note the
+                # refusal on the sentence's queue row so a row waiting "after"
+                # it is asked "hold or go" rather than left waiting.
+                from forge.adapters.nats.pipeline_consumer import (
+                    note_build_rejection,
+                )
+
+                if not note_build_rejection(
+                    record_build_rejection, payload.correlation_id, reason
+                ):
+                    # The note could not be written: hold WITHOUT ack, so
+                    # the redelivery writes it.
+                    return
             if lifecycle_emitter is not None:
                 from forge.pipeline import BuildContext
 
@@ -1073,6 +1207,76 @@ def _build_dispatch_build(
                 "lives in TASK-FW10-008 (Supervisor + AsyncSubAgentMiddleware); "
                 "tests should pass a fake starter via the kwarg."
             )
+
+        # One build of a feature at a time (the lifecycle bridge tracks one
+        # live build per feature). Every intake reaches this point, and with
+        # several build places two builds of one feature could otherwise run
+        # side by side. The check below and the row write after it have NO
+        # await between them, so they cannot interleave with another
+        # dispatch on this event loop. First come wins; rows written ahead
+        # by the CLI or the fix journey go in the order they were queued.
+        started = started_by_feature.setdefault(payload.feature_id, set())
+        try:
+            refuse, own_build_id = _another_build_of_feature_goes_first(
+                sqlite_pool, payload, started
+            )
+        except (AttributeError, sqlite3.Error, ValueError) as exc:
+            logger.error(
+                "dispatch_build: could not check other builds of feature_id=%s "
+                "(%s); holding WITHOUT terminal event or ack",
+                payload.feature_id,
+                exc,
+            )
+            return
+        if not refuse:
+            started.add(payload.correlation_id)
+        else:
+            reason = f"another build of {payload.feature_id} is already in progress"
+            logger.warning(
+                "dispatch_build: %s; refusing correlation_id=%s",
+                reason,
+                payload.correlation_id,
+            )
+            if own_build_id is not None:
+                # Its row was written ahead; close it so it never counts as
+                # active work again.
+                reason = fail_mode_c_build(
+                    sqlite_pool,
+                    own_build_id,
+                    summary=reason,
+                    what="a second build of the same feature",
+                    log=logger,
+                )
+            else:
+                # No build row will ever exist for this delivery: note the
+                # refusal on the sentence's queue row so a row waiting "after"
+                # it is asked "hold or go" rather than left waiting.
+                from forge.adapters.nats.pipeline_consumer import (
+                    note_build_rejection,
+                )
+
+                if not note_build_rejection(
+                    record_build_rejection, payload.correlation_id, reason
+                ):
+                    # The note could not be written: hold WITHOUT ack, so
+                    # the redelivery writes it.
+                    return
+            if lifecycle_emitter is not None:
+                from forge.pipeline import BuildContext
+
+                await lifecycle_emitter.emit_failed(
+                    BuildContext(
+                        feature_id=payload.feature_id,
+                        build_id=own_build_id or "",
+                        correlation_id=payload.correlation_id,
+                        wave_total=1,
+                    ),
+                    failure_reason=reason,
+                    recoverable=False,
+                    failed_task_id=None,
+                )
+            await ack_callback()
+            return
 
         try:
             build_id = sqlite_pool.record_pending_build(payload)
@@ -1150,6 +1354,11 @@ def _build_dispatch_build(
                 from forge.lifecycle.identifiers import derive_build_id
 
                 build_id = derive_build_id(payload.feature_id, payload.queued_at)
+                if status == BuildState.INTERRUPTED:
+                    readable, earlier_thread = _earlier_run_of(build_id)
+                    if not readable:
+                        return
+                    recovered = True
                 logger.info(
                     "dispatch_build: duplicate %s build feature_id=%s "
                     "correlation_id=%s build_id=%s (%s); re-dispatching into "
@@ -1367,17 +1576,44 @@ def _build_dispatch_build(
                 build_id,
                 outcome.value,
             )
+            if recovered:
+                # The earlier run's row goes just before the relaunch, so the
+                # relaunch's observer binds the relaunch's own thread and run.
+                try:
+                    sqlite_pool.connection.execute(
+                        "DELETE FROM async_tasks WHERE build_id = ?", (build_id,)
+                    )
+                except sqlite3.Error as exc:
+                    logger.error(
+                        "dispatch_build: could not clear the earlier run's "
+                        "identity for build_id=%s (%s); holding the message "
+                        "WITHOUT ack",
+                        build_id,
+                        exc,
+                    )
+                    return
             if register_observer is not None:
                 await _safe_register_observer(register_observer, build_id)
-            await launch_or_conduct(
-                ack_callback=ack_callback,
-                build_id=build_id,
-                feature_id=payload.feature_id,
-                correlation_id=payload.correlation_id,
-                branch=payload.branch,
-                repo=payload.repo,
-                budget=budget_entry,
-            )
+            try:
+                await launch_or_conduct(
+                    ack_callback=ack_callback,
+                    build_id=build_id,
+                    feature_id=payload.feature_id,
+                    correlation_id=payload.correlation_id,
+                    branch=payload.branch,
+                    repo=payload.repo,
+                    budget=budget_entry,
+                )
+            except Exception:
+                if recovered:
+                    await interrupt_recorded_run(
+                        sqlite_pool,
+                        forge_config,
+                        build_id,
+                        thread_id=earlier_thread,
+                        repo=payload.repo,
+                    )
+                raise
         else:
             # Gate terminal (reject / expiry / hard-stop) — the build never
             # started; ack the slot so the next queued build proceeds and
@@ -1402,28 +1638,62 @@ def _build_dispatch_build(
                 build_id,
                 outcome.value,
             )
+            if recovered:
+                await interrupt_recorded_run(
+                    sqlite_pool,
+                    forge_config,
+                    build_id,
+                    thread_id=earlier_thread,
+                    repo=payload.repo,
+                )
             await ack_callback()
 
     return dispatch_build
 
 
+#: How long a launch waits before asking the lifecycle bridge again when it
+#: refused this build's observer because an earlier build of the same
+#: feature is still finishing (its observer not yet done). Tests shorten it.
+OBSERVER_BUSY_RETRY_SECONDS: float = 5.0
+
+
 async def _safe_register_observer(register_observer, build_id: str) -> None:
-    """Invoke the R1 deferred bridge-registration closure, never raising.
+    """Invoke the R1 deferred bridge-registration closure; wait if refused.
 
     Registration is best-effort (the bridge owns its own observability and
     the legacy ack path still works), so a raising ``register_observer``
     must not abort the launch — mirrors the consumer's pre-relocation
     ``register_ack_handle`` guard.
+
+    A *refusal* is different: the bridge answers ``False`` when another
+    build of the same feature still has a live observer (it tracks one per
+    feature, and the earlier build's observer may still be finishing its
+    terminal). Launching then would leave this build with no
+    observer and no acknowledgement, so the launch waits here, asking again
+    every :data:`OBSERVER_BUSY_RETRY_SECONDS`, until the earlier observer
+    has finished. The build keeps its message un-acked meanwhile; shutdown
+    cancels the wait with the dispatch task.
     """
-    try:
-        await register_observer()
-    except Exception as exc:  # noqa: BLE001 — best-effort registration
-        logger.warning(
-            "dispatch_build: deferred observer registration raised (%s) for "
-            "build_id=%s; continuing with legacy ack_callback fallback",
-            exc,
+    while True:
+        try:
+            accepted = await register_observer()
+        except Exception as exc:  # noqa: BLE001 — best-effort registration
+            logger.warning(
+                "dispatch_build: deferred observer registration raised (%s) for "
+                "build_id=%s; continuing with legacy ack_callback fallback",
+                exc,
+                build_id,
+            )
+            return
+        if accepted is not False:
+            return
+        logger.info(
+            "dispatch_build: build_id=%s waits to launch — an earlier build of "
+            "the same feature is still finishing; asking again in %ss",
             build_id,
+            OBSERVER_BUSY_RETRY_SECONDS,
         )
+        await asyncio.sleep(OBSERVER_BUSY_RETRY_SECONDS)
 
 
 def _build_publish_build_failed(
@@ -1538,6 +1808,30 @@ def _build_publish_build_failed(
     return publish_build_failed
 
 
+def _work_queue_rejection_recorder(
+    sqlite_pool: Any,
+) -> Callable[[str, str], bool]:
+    """``(correlation_id, reason)`` that notes a refused build on its queue row.
+
+    Uses the lifecycle pool's own connection — the work queue lives in the same
+    Forge database — and leaves the connection's row factory as it found it.
+    """
+
+    def _record(correlation_id: str, reason: str) -> bool:
+        from forge.planning.work_queue_store import WorkQueueStore
+
+        connection = sqlite_pool.connection
+        previous = connection.row_factory
+        try:
+            return WorkQueueStore(connection).record_build_rejection(
+                correlation_id, reason
+            )
+        finally:
+            connection.row_factory = previous
+
+    return _record
+
+
 def build_pipeline_consumer_deps(
     client: Any,
     forge_config: ForgeConfig,
@@ -1551,6 +1845,7 @@ def build_pipeline_consumer_deps(
     gate_state_machine: Any = None,
     gate_clock: Callable[[], datetime] | None = None,
     conductor_router: Callable[..., Any] | None = None,
+    record_build_rejection: Callable[[str, str], Any] | None = None,
 ) -> PipelineConsumerDeps:
     """Compose the production :class:`PipelineConsumerDeps` for ``forge serve``.
 
@@ -1677,6 +1972,11 @@ def build_pipeline_consumer_deps(
         )
 
     # 3. Build the four field closures.
+    # A build refused before its row is written is noted on the sentence's
+    # work-queue row (the same Forge database), so nothing waits on it for
+    # ever. Production takes the default; a test may hand in its own.
+    if record_build_rejection is None:
+        record_build_rejection = _work_queue_rejection_recorder(sqlite_pool)
     is_duplicate_terminal = _build_is_duplicate_terminal(sqlite_pool)
     dispatch_build = _build_dispatch_build(
         sqlite_pool=sqlite_pool,
@@ -1690,6 +1990,7 @@ def build_pipeline_consumer_deps(
         gate_state_machine=gate_state_machine,
         gate_clock=gate_clock,
         conductor_router=conductor_router,
+        record_build_rejection=record_build_rejection,
     )
     publish_build_failed = _build_publish_build_failed(
         publisher,
@@ -1702,6 +2003,7 @@ def build_pipeline_consumer_deps(
         dispatch_build=dispatch_build,
         publish_build_failed=publish_build_failed,
         register_ack_handle=register_ack_handle,
+        record_build_rejection=record_build_rejection,
     )
     logger.info(
         "build_pipeline_consumer_deps: composed PipelineConsumerDeps "
