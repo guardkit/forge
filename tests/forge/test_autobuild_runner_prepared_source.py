@@ -93,7 +93,13 @@ class _Proc:
         return None
 
 
-def _stub(calls: list[dict[str, Any]], *, validate_code: int = 0, validate_out: bytes = b"{}"):
+def _stub(
+    calls: list[dict[str, Any]],
+    *,
+    validate_code: int = 0,
+    validate_out: bytes = b"{}",
+    build_code: int = 0,
+):
     real = asyncio.create_subprocess_exec
 
     async def _exec(*args: Any, **kwargs: Any) -> Any:
@@ -104,7 +110,7 @@ def _stub(calls: list[dict[str, Any]], *, validate_code: int = 0, validate_out: 
             calls.append({"argv": list(args), "cwd": cwd, "head": head})
             if len(args) > 2 and args[1] == "feature" and args[2] == "validate":
                 return _Proc(validate_code, validate_out)
-            return _Proc(0, b"guardkit running\n")
+            return _Proc(build_code, b"guardkit running\n")
         return await real(*args, **kwargs)
 
     return _exec
@@ -194,8 +200,10 @@ def test_a_failed_feature_validate_stops_the_build_with_guardkits_words(
     joined = " ".join(r.getMessage() for r in caplog.records)
     assert "guardkit feature validate refused FEAT-AB12" in joined
     assert "Task file not found: tasks/backlog/x/TASK-AB12-001.md" in joined
-    # Kept for forensics, like every other failed build's worktree.
+    # Kept for forensics, like every other failed build's worktree; the
+    # build's own branch goes anyway (the kept tree is detached at the commit).
     assert (tmp_path / "wt" / BUILD_ID).exists()
+    assert _git(repo, "branch", "--list", SOURCE_BRANCH) == ""
 
 
 def test_a_commit_missing_from_the_clone_is_refused_without_fetching(
@@ -232,3 +240,48 @@ def test_without_a_source_commit_the_launch_is_unchanged(
     assert build["argv"][-2:] == ["--base-branch", QUEUED_BRANCH]
     assert _lifecycle(result) == "completed"
     assert _git(repo, "branch", "--list", "forge/source/*") == ""
+
+
+def test_a_failed_build_deletes_its_own_branch_and_keeps_its_worktree(
+    clone: tuple[Path, str], tmp_path: Path, monkeypatch
+) -> None:
+    repo, admitted = clone
+    monkeypatch.setenv(ar.FORGE_AUTOBUILD_WORKTREE_BASE_ENV, str(tmp_path / "wt"))
+    monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(tmp_path / "receipts"))
+
+    calls: list[dict[str, Any]] = []
+    result = _run(repo, _payload(admitted), calls, build_code=1)
+
+    assert _lifecycle(result) == "failed"
+    assert len(calls) == 2  # validate, then the build that failed
+    assert (tmp_path / "wt" / BUILD_ID).exists()
+    assert _git(repo, "branch", "--list", SOURCE_BRANCH) == ""
+
+
+def test_the_requeue_sweep_deletes_a_prior_prepared_builds_branch(
+    clone: tuple[Path, str], tmp_path: Path, monkeypatch
+) -> None:
+    """A prior prepared build of the same feature left its kept worktree (with
+    GuardKit's inner tree on autobuild/<feature>) and, from before this rule,
+    its own branch. The fresh dispatch's sweep clears both."""
+    repo, admitted = clone
+    base = tmp_path / "wt"
+    monkeypatch.setenv(ar.FORGE_AUTOBUILD_WORKTREE_BASE_ENV, str(base))
+    monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(tmp_path / "receipts"))
+    prior = "build-FEAT-AB12-20261003090000"
+    prior_branch = f"forge/source/{prior}"
+    _git(repo, "branch", prior_branch, admitted)
+    outer = base / prior
+    base.mkdir()
+    _git(repo, "worktree", "add", "-q", "--detach", str(outer), admitted)
+    inner = outer / ".guardkit" / "worktrees" / FEATURE
+    inner.parent.mkdir(parents=True)
+    _git(repo, "worktree", "add", "-q", "-b", f"autobuild/{FEATURE}", str(inner), admitted)
+
+    calls: list[dict[str, Any]] = []
+    result = _run(repo, _payload(admitted), calls)
+
+    assert _lifecycle(result) == "completed"
+    assert _git(repo, "branch", "--list", prior_branch) == ""
+    assert _git(repo, "branch", "--list", SOURCE_BRANCH) == ""
+    assert not outer.exists()

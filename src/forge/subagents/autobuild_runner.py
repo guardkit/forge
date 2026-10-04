@@ -2183,10 +2183,13 @@ async def _make_source_branch(
 
 
 async def _delete_source_branch(repo_path: Path, branch: str | None) -> None:
-    """Delete a prepared build's own branch. Best effort, never raises."""
+    """Delete a prepared build's own branch if it is there. Best effort, never
+    raises; a branch already gone is nothing to do."""
     if not branch or not branch.startswith(SOURCE_BRANCH_PREFIX):
         return
     try:
+        if not await _local_branch_exists(repo_path, branch):
+            return
         code, output = await _run_git(["branch", "-D", branch], cwd=repo_path)
     except Exception as exc:  # noqa: BLE001 — clean-up never fails a build
         code, output = -1, f"{type(exc).__name__}: {exc}"
@@ -2522,11 +2525,14 @@ _DISK_RESERVATIONS: dict["_BuildClaim", int] = {}
 class _BuildClaim:
     """What one running build holds in this runner, released when it ends."""
 
-    __slots__ = ("build_id", "repo")
+    __slots__ = ("build_id", "repo", "source_branch")
 
     def __init__(self, build_id: str) -> None:
         self.build_id = build_id
         self.repo: Path | None = None
+        # A prepared build's own ``forge/source/<build_id>`` and the clone it
+        # is in (4 October 2026), deleted when the build ends however it ends.
+        self.source_branch: tuple[Path, str] | None = None
 
     def release(self) -> None:
         with _RUNNER_SHARED_LOCK:
@@ -4107,6 +4113,10 @@ async def _sweep_prior_build_residue_impl(
                 branch,
             )
 
+        # A prior PREPARED build's own branch (4 October 2026) goes with its
+        # leftovers; a prior build that had none has nothing to delete.
+        await _delete_source_branch(repo_path, _source_branch_for(prior_build_id))
+
         try:
             # Off the event loop (3 October 2026, concurrent builds): a whole
             # kept worktree can take seconds to delete, and every other build
@@ -4318,6 +4328,23 @@ async def _running_wave_body(state: AutobuildRunnerState) -> dict[str, Any]:
     finally:
         _CURRENT_BUILD_CLAIM.reset(token)
         claim.release()
+        # A PREPARED build's own branch goes on EVERY exit — success, failure,
+        # a refused feature check, cancel, timeout, wedge (4 October 2026).
+        # Nothing needs it once the build has ended: a kept worktree is
+        # detached at the commit itself, the merge press works from the
+        # recorded commits, and a relaunch makes the branch again at the same
+        # admitted commit.
+        if claim.source_branch is not None:
+            repo_of_branch, branch = claim.source_branch
+            try:
+                await asyncio.shield(_delete_source_branch(repo_of_branch, branch))
+            except BaseException as exc:  # noqa: BLE001 — clean-up only
+                logger.warning(
+                    "autobuild_runner: could not delete %s after the build "
+                    "ended (%s); a later sweep of this feature deletes it",
+                    branch,
+                    type(exc).__name__,
+                )
 
 
 async def _run_one_build(state: AutobuildRunnerState) -> dict[str, Any]:
@@ -4465,6 +4492,9 @@ async def _run_one_build(state: AutobuildRunnerState) -> dict[str, Any]:
             )
         source_branch = _source_branch_for(build_id)
         base_branch = source_branch
+        current_claim = _CURRENT_BUILD_CLAIM.get()
+        if current_claim is not None:
+            current_claim.source_branch = (repo_path, source_branch)
         try:
             worktree_path = await _materialise_worktree(
                 repo_path, source_branch, build_id
