@@ -44,6 +44,7 @@ ADR / contract anchors:
 from __future__ import annotations
 
 import logging
+import posixpath
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Protocol, runtime_checkable
@@ -338,6 +339,41 @@ def _path_inside_allowlist(candidate: str, allowlist: list[Path]) -> bool:
     return False
 
 
+def _resolve_feature_yaml_path(
+    payload: BuildQueuedPayload, forge_config: ForgeConfig
+) -> tuple[str | None, str | None]:
+    """``(path to check, None)`` or ``(None, plain reason)`` (4 October 2026).
+
+    Jarvis sends ``feature_yaml_path`` relative to the repository. Resolved
+    against this coordinator's own working folder it meant nothing, and the
+    runner never read it: it builds ``.guardkit/features/<feature_id>.yaml``.
+    So a relative path is resolved against the repository's REGISTERED
+    checkout (``planning.target_repo_paths[repo]``, the same map the runner
+    uses) and must be exactly that file; anything else is refused in plain
+    words. An absolute path (the factory's own planning trigger, ``forge
+    queue``, the fix journey) is returned unchanged and goes to the allowlist
+    check exactly as before.
+    """
+    raw = payload.feature_yaml_path
+    if Path(raw).is_absolute():
+        return raw, None
+    wanted = f".guardkit/features/{payload.feature_id}.yaml"
+    if posixpath.normpath(raw.replace("\\", "/")) != wanted:
+        return None, (
+            f"its feature file {raw} is not {wanted}, the one file a build of "
+            f"{payload.feature_id} reads"
+        )
+    planning = getattr(forge_config, "planning", None)
+    paths = getattr(planning, "target_repo_paths", None) or {}
+    checkout = paths.get(payload.repo)
+    if not checkout:
+        return None, (
+            f"its repository {payload.repo} is not registered with this "
+            f"factory, so there is no checkout to read {raw} from"
+        )
+    return str(Path(checkout) / wanted), None
+
+
 def _failure_payload(
     *,
     feature_id: str,
@@ -430,7 +466,11 @@ async def handle_message(msg: _MsgLike, deps: PipelineConsumerDeps) -> None:
     3. *``feature_yaml_path`` outside allowlist* → ack + ``build-failed``
        with :data:`REASON_PATH_OUTSIDE_ALLOWLIST`. ``..`` traversal is
        rejected because :func:`_path_inside_allowlist` calls
-       :meth:`Path.resolve` before :meth:`Path.is_relative_to`.
+       :meth:`Path.resolve` before :meth:`Path.is_relative_to`. A relative
+       path is first resolved against the repository's registered checkout
+       and must be ``.guardkit/features/<feature_id>.yaml``; any other
+       relative path, or one for an unregistered repository, is refused the
+       same way with its own plain reason (4 October 2026).
     4. *Duplicate already-terminal build* → ack + idempotent skip. No build
        is started, no event is published.
     5. *Accepted build* → :meth:`PipelineConsumerDeps.dispatch_build` is
@@ -545,9 +585,40 @@ async def handle_message(msg: _MsgLike, deps: PipelineConsumerDeps) -> None:
         )
         return
 
-    # --- 3. Path allowlist -----------------------------------------------
+    # --- 3. The one feature file, then the path allowlist ----------------
+    # A relative path is resolved against the repository's registered
+    # checkout and must be the file the runner builds (4 October 2026); the
+    # allowlist then checks the resolved path. An absolute path is unchanged.
+    feature_yaml_path, wrong_file = _resolve_feature_yaml_path(
+        payload, deps.forge_config
+    )
+    if wrong_file is not None or feature_yaml_path is None:
+        reason = wrong_file or "its feature file could not be resolved"
+        logger.warning(
+            "pipeline_consumer: feature_yaml_path=%r refused for "
+            "feature_id=%s: %s",
+            payload.feature_yaml_path,
+            payload.feature_id,
+            reason,
+        )
+        if not note_build_rejection(
+            deps.record_build_rejection, payload.correlation_id, reason
+        ):
+            return
+        await msg.ack()
+        await _safe_publish_failure(
+            deps,
+            _failure_payload(
+                feature_id=payload.feature_id,
+                build_id=payload.feature_id,
+                reason=f"the build was refused: {reason}",
+            ),
+            payload.feature_id,
+            correlation_id=envelope.correlation_id,
+        )
+        return
     allowlist = deps.forge_config.permissions.filesystem.allowlist
-    if not _path_inside_allowlist(payload.feature_yaml_path, allowlist):
+    if not _path_inside_allowlist(feature_yaml_path, allowlist):
         logger.warning(
             "pipeline_consumer: feature_yaml_path=%r outside allowlist for "
             "feature_id=%s; rejecting",
@@ -557,7 +628,7 @@ async def handle_message(msg: _MsgLike, deps: PipelineConsumerDeps) -> None:
         if not note_build_rejection(
             deps.record_build_rejection,
             payload.correlation_id,
-            f"its feature file {payload.feature_yaml_path} is outside the "
+            f"its feature file {feature_yaml_path} is outside the "
             "folders builds may read",
         ):
             return
