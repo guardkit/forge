@@ -6,10 +6,12 @@ runs, cancel a run) over real loopback HTTP, and record what they were asked:
 one is the global runner (``FORGE_AUTOBUILD_RUNNER_URL``), the other the
 repository's sandbox runner named in ``planning.sandboxes``.
 
-* R9: ``forge cancel``'s production canceller interrupts a sandboxed build's
-  run on its PROJECT runner, and a build without a sandbox on the global one.
+* R9: the whole ``forge --config <file> cancel`` command interrupts a RUNNING
+  sandboxed build's run on its PROJECT runner (from the configuration the
+  command was given), and a build without a sandbox on the global one.
 * R8: strict-policy boot settlement interrupts a refused build's recorded run
-  before settling it FAILED.
+  before settling it FAILED, and leaves it unsettled when the interrupt cannot
+  be sent.
 """
 
 from __future__ import annotations
@@ -169,25 +171,43 @@ def _config_file(tmp_path: Path, project_url: str) -> Path:
 def test_forge_cancel_interrupts_the_build_on_its_own_runner(
     runners, tmp_path, monkeypatch
 ) -> None:
-    from forge.cli.runtime import build_cli_runtime
+    """The whole ``forge --config <file> cancel`` command, a RUNNING build."""
+    from click.testing import CliRunner
+
+    from forge.cli.main import main
+    from forge.lifecycle.state_machine import BuildState
 
     db_path = tmp_path / "forge.db"
     pool = _ledger(db_path)
-    _, sandboxed_thread = _launched(pool, "FEAT-SBX1", REPO)
-    _, plain_thread = _launched(pool, "FEAT-PLN1", OTHER)
+    sandboxed_build, sandboxed_thread = _launched(pool, "FEAT-SBX1", REPO)
+    plain_build, plain_thread = _launched(pool, "FEAT-PLN1", OTHER)
+    for build_id in (sandboxed_build, plain_build):
+        pool.connection.execute(
+            "UPDATE builds SET status = 'RUNNING' WHERE build_id = ?", (build_id,)
+        )
     pool.connection.close()
+    config = _config_file(tmp_path, runners["project_url"])
     monkeypatch.setenv("FORGE_AUTOBUILD_RUNNER_URL", runners["global_url"])
-    monkeypatch.setenv(
-        "FORGE_CONFIG_PATH", str(_config_file(tmp_path, runners["project_url"]))
+    monkeypatch.delenv("FORGE_CONFIG_PATH", raising=False)
+    # The cancelled notice goes to the bus; no bus here, so it is recorded.
+    notices: list[str] = []
+    monkeypatch.setattr(
+        "forge.cli.queue.publish", lambda subject, body: notices.append(subject)
     )
+    monkeypatch.chdir(tmp_path / "..")  # no forge.yaml in the working folder
 
-    runtime = build_cli_runtime(db_path)
-    canceller = runtime.cli_steering_handler.async_task_canceller
-    assert canceller.cancel_async_task(sandboxed_thread) is True
-    assert canceller.cancel_async_task(plain_thread) is True
+    for feature in ("FEAT-SBX1", "FEAT-PLN1"):
+        result = CliRunner().invoke(
+            main,
+            ["--config", str(config), "cancel", feature, "--db", str(db_path)],
+        )
+        assert result.exit_code == 0, result.output
 
     assert runners["project"].cancelled == [sandboxed_thread]
     assert runners["global"].cancelled == [plain_thread]
+    after = _ledger(db_path)
+    assert after.get_build_row(sandboxed_build).status is BuildState.CANCELLED
+    after.connection.close()
 
 
 def test_boot_settlement_interrupts_a_refused_builds_recorded_run(
@@ -215,6 +235,45 @@ def test_boot_settlement_interrupts_a_refused_builds_recorded_run(
         )
     )
     assert settled == 1
+    assert pool.get_build_row(build_id).status is BuildState.FAILED
+    assert runners["global"].cancelled == [thread]
+    pool.connection.close()
+
+
+def test_boot_settlement_holds_a_build_whose_interrupt_could_not_be_sent(
+    runners, tmp_path, monkeypatch
+) -> None:
+    """Review R8: the runner cannot be reached, so the refused build is not
+    settled (its place not let go); the next attempt reaches it and settles."""
+    from forge.cli._serve_production import _settle_strict_runless_builds_at_boot
+    from forge.config.models import ForgeConfig
+    from forge.lifecycle.state_machine import BuildState
+
+    pool = _ledger(tmp_path / "forge.db")
+    build_id, thread = _launched(pool, "FEAT-STR2", OTHER)
+    pool.connection.execute(
+        "UPDATE builds SET status = 'RUNNING' WHERE build_id = ?", (build_id,)
+    )
+    strict = ForgeConfig.model_validate(
+        {
+            "permissions": {"filesystem": {"allowlist": ["/srv/forge"]}},
+            "publication": {"builds_may_run_inside_the_coordinator": False},
+        }
+    )
+
+    def _settle() -> int:
+        return asyncio.run(
+            _settle_strict_runless_builds_at_boot(
+                pool, strict, AsyncMock(), [pool.get_build_row(build_id)]
+            )
+        )
+
+    monkeypatch.setenv("FORGE_AUTOBUILD_RUNNER_URL", f"http://127.0.0.1:{_free_port()}")
+    assert _settle() == 0
+    assert pool.get_build_row(build_id).status is BuildState.RUNNING
+
+    monkeypatch.setenv("FORGE_AUTOBUILD_RUNNER_URL", runners["global_url"])
+    assert _settle() == 1
     assert pool.get_build_row(build_id).status is BuildState.FAILED
     assert runners["global"].cancelled == [thread]
     pool.connection.close()

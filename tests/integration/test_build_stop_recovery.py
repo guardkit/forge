@@ -330,18 +330,28 @@ def test_a_restart_relaunch_is_observed_on_its_own_run(
 def test_a_relaunch_whose_earlier_identity_cannot_be_cleared_is_held(
     nats, pool, monkeypatch  # noqa: F811 — imported fixtures
 ) -> None:
+    """The card is approved but the earlier run's identity cannot be cleared:
+    nothing is launched and the message is held for its redelivery."""
     from forge.adapters.nats.pipeline_consumer import handle_message
     from forge.cli import _serve_gate_activation
+    from forge.cli._serve_deps_state_channel import (
+        build_autobuild_state_initialiser,
+    )
 
     _serve_deps_gating._reset_for_tests()
     cfg = _open_config()
     _serve_deps_gating.bind_gate_parts(_build_parts(nats, forge_config=cfg))
     repo, sm = build_sqlite_gate_adapters(pool, clock=FixedClock())
+
+    class _NoLaunch:
+        async def astart_async_task(self, **_: Any) -> str:
+            raise AssertionError("nothing may launch")
+
     deps = build_pipeline_consumer_deps(
         nats,
         cfg,
         pool,
-        async_task_starter=object(),
+        async_task_starter=_NoLaunch(),
         gate_repository=repo,
         gate_state_machine=sm,
         gate_clock=FixedClock(),
@@ -349,24 +359,33 @@ def test_a_relaunch_whose_earlier_identity_cannot_be_cleared_is_held(
     data = _envelope(f"corr-clear-{uuid.uuid4().hex[:8]}")
     payload = BuildQueuedPayload.model_validate(json.loads(data)["payload"])
     build_id = pool.record_pending_build(payload)
+    build_autobuild_state_initialiser(pool).initialise_autobuild_state(
+        build_id=build_id,
+        feature_id=FEATURE,
+        task_id="thread-earlier",
+        correlation_id=payload.correlation_id,
+        lifecycle="starting",
+        wave_index=0,
+        task_index=0,
+    )
     # Boot recovery's verdict on a build whose run it could not see.
     pool.connection.execute(
         "UPDATE builds SET status = 'INTERRUPTED' WHERE build_id = ?", (build_id,)
     )
-    pool.connection.execute("DROP TABLE async_tasks")
-    gate_calls: list[str] = []
+    pool.connection.execute(
+        "CREATE TRIGGER refuse_delete BEFORE DELETE ON async_tasks "
+        "BEGIN SELECT RAISE(ABORT, 'refused'); END"
+    )
 
-    async def _gate(**kwargs: Any) -> Any:
-        gate_calls.append(kwargs["build_id"])
-        raise AssertionError("no gate while the identity is not cleared")
+    async def _approved(**_: Any) -> Any:
+        return _serve_gate_activation.GateOutcome.RESUMED
 
-    monkeypatch.setattr(_serve_gate_activation, "maybe_gate_build", _gate)
+    monkeypatch.setattr(_serve_gate_activation, "maybe_gate_build", _approved)
     msg = _Msg(data)
     try:
         asyncio.run(handle_message(msg, deps))
     finally:
         _serve_deps_gating._reset_for_tests()
-    assert gate_calls == []
     assert msg.acks == 0
     assert nats.published.get(f"pipeline.build-failed.{FEATURE}", []) == []
 
@@ -501,12 +520,14 @@ def test_a_declined_relaunch_interrupts_the_original(
     assert not (estate.records / f"{FEATURE}.relaunch.started").exists()
 
 
-def test_a_rejected_rearmed_card_after_a_second_restart_interrupts_the_original(
-    nats, pool, tmp_path, monkeypatch  # noqa: F811 — imported fixtures
+@pytest.mark.parametrize("ending", ["reject", "approve-launch-fails"])
+def test_a_rearmed_card_after_a_second_restart_interrupts_the_original(
+    nats, pool, tmp_path, monkeypatch, ending  # noqa: F811 — imported fixtures
 ) -> None:
     """Review R10: restart (the recovered build's card is shown and left
-    PAUSED), restart again, and the re-armed card is rejected: the original
-    run, still going, is interrupted and the runner's fence stops it."""
+    PAUSED), restart again, and the re-armed card is rejected — or approved
+    and the relaunch fails: either way the original run, still going, is
+    interrupted and the runner's fence stops it."""
     from forge.adapters.nats.pipeline_consumer import handle_message
     from forge.cli._serve_gate_activation import rearm_paused_gates
 
@@ -548,8 +569,11 @@ def test_a_rejected_rearmed_card_after_a_second_restart_interrupts_the_original(
         _serve_deps_gating.bind_gate_parts(parts)
         repo, sm = build_sqlite_gate_adapters(pool, clock=FixedClock())
 
-        async def _no_launch(**_: Any) -> None:
-            raise AssertionError("a rejected card launches nothing")
+        launches: list[str] = []
+
+        async def _no_launch(**kwargs: Any) -> None:
+            launches.append(kwargs["build_id"])
+            raise RuntimeError("the relaunch could not be submitted")
 
         rearmed = await rearm_paused_gates(
             parts=parts,
@@ -561,8 +585,13 @@ def test_a_rejected_rearmed_card_after_a_second_restart_interrupts_the_original(
             clock=FixedClock(),
             forge_config=cfg,
         )
-        await _approve_or_reject(nats, pool, build_id, "reject")
-        await asyncio.wait_for(asyncio.gather(*rearmed), timeout=30)
+        await _approve_or_reject(
+            nats, pool, build_id, "reject" if ending == "reject" else "approve"
+        )
+        await asyncio.wait_for(
+            asyncio.gather(*rearmed, return_exceptions=True), timeout=30
+        )
+        assert launches == ([] if ending == "reject" else [build_id])
         deadline = asyncio.get_running_loop().time() + 30
         while any(proc_alive(p, s) for p, s in original):
             assert asyncio.get_running_loop().time() < deadline, "original still runs"

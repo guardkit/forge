@@ -139,6 +139,58 @@ class TestTheRunnerSlotIsAFence:
         assert started["fixtures_alive"] == {a_id: []}
 
 
+class TestASpareSlotWaitsForAnotherBuildsCleanUp:
+    """Review R11: with two job slots, a build started while another build's
+    clean-up is still going does not spawn until that clean-up ends."""
+
+    @pytest.mark.skipif(not docker_available(), reason="needs docker and busybox:1.36")
+    def test_b_waits_in_the_spare_slot_until_a_is_cleaned_up(self, estate, tmp_path):
+        a_id, b_id = _build_id(), _build_id()
+        estate.add_build("FEAT-XA", a_id, branch="xa")
+        estate.add_build(
+            "FEAT-XB",
+            b_id,
+            branch="xb",
+            must_be_gone=["FEAT-XA"],
+            fixtures_must_be_gone=[a_id],
+        )
+        wrapper, refuse = refusing_engine(tmp_path)
+
+        async def _go(url: str) -> None:
+            a = await _launch(url, "FEAT-XA", a_id, "xa")
+            await asyncio.to_thread(estate.pids, "FEAT-XA")
+            await asyncio.to_thread(start_fixture_container, a_id)
+            await _interrupt(a)
+            await asyncio.sleep(1.0)
+            # A's clean-up is under way (its fixture cannot be removed yet);
+            # B gets the spare slot but must not start anything.
+            b = await _launch(url, "FEAT-XB", b_id, "xb")
+            await asyncio.sleep(4.0)
+            assert estate.started("FEAT-XB") is None, "B started during A's clean-up"
+            refuse.unlink()
+            await asyncio.to_thread(
+                wait_for,
+                lambda: estate.started("FEAT-XB") is not None,
+                60,
+                "B never started after A's clean-up",
+            )
+            await _interrupt(b)
+
+        try:
+            with real_runner(
+                estate,
+                "spare",
+                jobs=2,
+                extra_env={"FORGE_FIXTURE_ENGINE": str(wrapper)},
+            ) as runner:
+                asyncio.run(_go(runner.url))
+        finally:
+            remove_test_containers([a_id])
+        started = estate.started("FEAT-XB")
+        assert started["others_alive"] == {"FEAT-XA": []}
+        assert started["fixtures_alive"] == {a_id: []}
+
+
 class TestARelaunchStopsTheOriginalFirst:
     """Review R3: a coordinator-only restart relaunches a build still running.
 
