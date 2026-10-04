@@ -53,6 +53,7 @@ from tests.forge.pipeline.test_merge_executor import (  # noqa: F401 - fixtures
     FEATURE_ID,
     MAIN_SHA,
     REPO,
+    ASidecarThat,
     _ensure_build,
     _FakeDeploy,
     _FakePublisher,
@@ -1899,3 +1900,69 @@ class TestTheHoldIsPutDownWhenThePublishedPressHasFinished:
         assert retry_publisher.asked == []  # found by looking, not sent again
         assert _record(pool).lease_holder is None
         assert self._another_worker_takes_it(pool) is not None
+
+
+class _APromoteThroughTheSidecar(_AProjectWithATarget):
+    """The project with a target, except that its promote goes through the
+    real runner to ``sidecar`` (4 October 2026, Codex's review)."""
+
+    def __init__(self, sidecar: ASidecarThat) -> None:
+        super().__init__()
+        self.sidecar = sidecar
+
+    async def __call__(self, **kwargs: Any) -> Any:
+        if kwargs.get("leg") == "promote":
+            self.calls.append(kwargs)
+            return self.sidecar.run_the_leg("promote")
+        return await super().__call__(**kwargs)
+
+
+class TestALostPromoteKeepsTheHold:
+    """A promote whose connection to the sandbox dropped may still be running,
+    and the deployment lock is put down on every ending, so it is the hold
+    that keeps a second press out. A promote that failed in its own words is a
+    settled ending, and the hold is put down."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "answer, kept",
+        [
+            (None, True),
+            ({"exit_code": 1, "output_tail": "the deploy script went red"}, False),
+        ],
+        ids=["answer-lost", "failed-in-its-own-words"],
+    )
+    async def test_the_promote_decides_whether_the_hold_is_put_down(
+        self,
+        config_with_publication_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+        answer: dict[str, Any] | None,
+        kept: bool,
+    ) -> None:
+        sidecar = ASidecarThat(answer)
+        try:
+            deploy = _APromoteThroughTheSidecar(sidecar)
+            deps = _deps_that_can_deploy(
+                config_with_publication_on,
+                pool,
+                publisher=_APublisherThatSays([_published("c" * 40)]),
+                deploy=deploy,
+            )
+
+            outcome = await _press(deps, repo_root)
+
+            assert outcome.result == "merged-deploy-failed", outcome.detail
+            assert [c.get("leg") for c in deploy.calls].count("promote") == 1
+            assert (_record(pool).lease_holder is not None) is kept
+            again = await _press(deps, repo_root)
+            assert ("another worker" in again.detail) is kept
+            # The send step's record the queue reads is as it always was.
+            send = [
+                line for line in _record(pool).lines
+                if line.step == STEP_SEND and line.kind == "done"
+            ][0]
+            assert send.detail["published"] is True
+            assert send.detail["contains_j"] is True
+        finally:
+            sidecar.close()

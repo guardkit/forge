@@ -141,6 +141,7 @@ from forge.deploy.candidate_tree import (
     CandidateTreeError,
     InContainerCandidateGit,
 )
+from forge.deploy.sidecar_runner import THE_ANSWER_WAS_LOST
 from forge.deploy.stage import assertion_in_words
 from forge.lifecycle.persistence import StageLogEntry
 from forge.pipeline.check_join import (
@@ -1337,15 +1338,22 @@ async def execute_merge_deploy(
     # writes to the record, not a merge already sent into a sandbox, so the
     # hold is put down only on the endings marked with ``_settled`` below,
     # where nothing the press started is left running that a second press
-    # could collide with. Most of those are endings where every step that
-    # was dispatched gave its own answer; the exceptions are named where
-    # they are marked (a promote whose connection was lost, a question to the
-    # target that went unanswered). A cancellation, a merge with no answer, a
-    # send whose answer was lost, a timeout, or a check that gave no verdict
-    # leaves it unset, and the hold lapses as before.
+    # could collide with. Those are endings where every step that changes
+    # something gave its own answer; the one exception, a question to the
+    # target about what is running, is only a read. A cancellation, a merge
+    # with no answer, a send whose answer was lost, a timeout, or a check that
+    # gave no verdict leaves it unset, and the hold lapses as before.
     # ``held_turn`` is the turn this press took the lease on; 0 = none.
     press_settled = False
     held_turn = 0
+    # AN ANSWER WAS LOST (4 October 2026, Codex's review). Once a step that
+    # changes something has been sent and its answer did not come back — a
+    # promote whose connection to the sandbox dropped, or a candidate
+    # teardown that failed or was not answered — that step may still be
+    # running, and nothing later in the press can make the ending settled
+    # again. This never goes back to False, and the clean-up at the very end
+    # can set it, so the hold is decided after the clean-up has run.
+    an_answer_was_lost = False
 
     def _settled(outcome: MergeDeployOutcome) -> MergeDeployOutcome:
         """Mark ``outcome`` as an ending where nothing this press started can
@@ -1681,7 +1689,7 @@ async def execute_merge_deploy(
         nothing would have to find candidates by looking, and what it found
         could belong to another build's check.
         """
-        nonlocal candidate_standing
+        nonlocal candidate_standing, an_answer_was_lost
         identity_env, why_not = await _the_identity_a_teardown_must_name()
         if identity_env is None:
             sentence = (
@@ -1726,6 +1734,7 @@ async def execute_merge_deploy(
                 type(exc).__name__,
                 exc,
             )
+            an_answer_was_lost = True
             return
         outcome_word = getattr(result, "outcome", None)
         if result is not None and outcome_word != "complete":
@@ -1735,6 +1744,9 @@ async def execute_merge_deploy(
                 feature_id,
                 outcome_word,
             )
+            # Failed, or its answer was lost: either way the teardown may
+            # still be running, so the hold is kept.
+            an_answer_was_lost = True
             return
         candidate_standing = False
 
@@ -2663,6 +2675,7 @@ async def execute_merge_deploy(
            with the one it was handed, AS TEXT. A mismatch is a FAILED deploy;
         7. record R and release the lock.
         """
+        nonlocal an_answer_was_lost
         lock = _deployment_lock_store()
         if lock is None:
             return _published_deployment_pending(
@@ -3100,14 +3113,14 @@ async def execute_merge_deploy(
                         )
                     ),
                 )
-            # A SETTLED ENDING, KNOWINGLY. A promote whose connection to the
-            # sandbox was lost comes back here as "did not finish" too, and the
-            # hold is put down on it like any other failed deploy. That is
-            # kept on purpose: what stops a second deploy racing one that may
-            # still be running is the deployment lock and the target's own
-            # counter, which a takeover raises and the deploy step checks, not
-            # this hold. (A promote that raised, above, keeps the hold.)
+            # A promote whose connection to the sandbox was lost also comes
+            # back here as "did not finish", and the sidecar runner says so in
+            # its sentence. That deploy may still be running, so the hold is
+            # kept; one that failed in its own words is a settled ending. (A
+            # promote that raised, above, keeps the hold too.)
             if deployed is None or outcome_word != "complete":
+                if THE_ANSWER_WAS_LOST in said:
+                    an_answer_was_lost = True
                 return _settled(_deploy_failed(
                     j_commit=j_commit,
                     target=target,
@@ -5083,10 +5096,16 @@ async def execute_merge_deploy(
             )
     # THE HOLD IS PUT DOWN, on a settled ending only, now that everything the
     # press started has finished and been tidied up. Never on a cancellation
-    # or a crash (those do not reach here), never by a replaced worker, and a
-    # release that cannot be written is logged and lapses on its own, like
-    # the deployment lock's.
-    if held_turn and press_settled and outcome.failed_step != "record":
+    # or a crash (those do not reach here), never by a replaced worker, never
+    # once an answer was lost (a promote or a teardown, including the clean-up
+    # just run), and a release that cannot be written is logged and lapses on
+    # its own, like the deployment lock's.
+    if (
+        held_turn
+        and press_settled
+        and not an_answer_was_lost
+        and outcome.failed_step != "record"
+    ):
         try:
             release_store = _publication_store()
             if release_store is not None and not release_store.release_lease(
