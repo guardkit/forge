@@ -285,32 +285,69 @@ def test_a_refusal_for_work_the_queue_never_filed_writes_nothing(
     assert cx.execute("SELECT COUNT(*) FROM work_queue_events").fetchone()[0] == 0
 
 
+@pytest.mark.parametrize("how", ["originator", "path", "sandbox", "same-feature"])
 @pytest.mark.asyncio
-async def test_a_note_that_cannot_be_written_never_costs_the_refusal(
-    tmp_path: Path,
+async def test_a_note_that_cannot_be_written_holds_the_refusal_for_redelivery(
+    tmp_path: Path, cx: sqlite3.Connection, how: str
 ) -> None:
-    """The note is a courtesy: the refusal is still acknowledged and still
-    reported when the queue cannot be written."""
-    from unittest.mock import AsyncMock
+    """Round 3 (R6): a locked database must not lose the refusal. The message
+    is left unacknowledged and nothing is reported; its redelivery writes the
+    note once, is acknowledged, and the waiting row is asked once."""
+    store, a_id, b_id, _c_id = _a_handed_over_with_b_after_it(cx)
+    config, feature_yaml = _config(tmp_path, how)
+    persistence = SqliteLifecyclePersistence(connection=cx)
+    if how == "same-feature":
+        _another_build_of_the_feature_is_running(persistence, feature_yaml)
+    failures = {"left": 1}
 
-    from forge.adapters.nats.pipeline_consumer import PipelineConsumerDeps
+    def locked_once(correlation_id: str, reason: str) -> bool:
+        if failures["left"]:
+            failures["left"] -= 1
+            raise sqlite3.OperationalError("database is locked")
+        return WorkQueueStore(cx).record_build_rejection(correlation_id, reason)
 
-    config, feature_yaml = _config(tmp_path, "originator")
-
-    def broken(correlation_id: str, reason: str) -> None:
-        raise sqlite3.OperationalError("database is locked")
-
-    publish_failed = AsyncMock()
-    deps = PipelineConsumerDeps(
-        forge_config=config,
-        is_duplicate_terminal=AsyncMock(return_value=False),
-        dispatch_build=AsyncMock(),
-        publish_build_failed=publish_failed,
-        record_build_rejection=broken,
+    client = _StubNatsClient()
+    deps = build_pipeline_consumer_deps(
+        client,
+        config,
+        persistence,
+        async_task_starter=_Starter(),
+        record_build_rejection=locked_once,
     )
-    refused = _message(feature_yaml, CID_A)
 
-    await handle_message(refused, deps)
+    held = _message(feature_yaml, CID_A)
+    await handle_message(held, deps)
 
-    assert refused.acks == 1
-    publish_failed.assert_awaited_once()
+    assert held.acks == 0
+    assert not store.has_event(a_id, BUILD_REJECTED_ACTION)
+    assert client.published == []
+
+    redelivered = _message(feature_yaml, CID_A)
+    await handle_message(redelivered, deps)
+
+    assert redelivered.acks == 1
+    noted = [
+        event
+        for event in store.list_events(a_id)
+        if event["action"] == BUILD_REJECTED_ACTION
+    ]
+    assert len(noted) == 1
+
+    notifier = Notifier()
+    loop = a_loop(cx, limit=2, clock=FakeClock(), notifier=notifier)
+    await loop.ask_hold_or_go()
+    await loop.ask_hold_or_go()
+    assert len(notifier.messages) == 1
+    assert notifier.messages[0].endswith(
+        f"and #{b_id} was waiting on it — hold or go?"
+    )
+
+
+def test_a_database_with_no_work_queue_has_nothing_to_note(tmp_path: Path) -> None:
+    """No queue at all is "nothing to note", not a failure: the refusal is
+    acknowledged as before."""
+    bare = sqlite_connect.connect_writer(tmp_path / "bare.db")
+    try:
+        assert WorkQueueStore(bare).record_build_rejection("corr-x", "refused") is False
+    finally:
+        bare.close()
