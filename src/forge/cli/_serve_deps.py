@@ -1049,9 +1049,24 @@ def _build_dispatch_build(
         # payload type is exercised).
         from forge.lifecycle.persistence import DuplicateBuildError
 
-        # A recovered (INTERRUPTED) build is relaunched in place of the run
-        # the ledger recorded for it (see launch_replacing_recorded_run).
+        # A recovered (INTERRUPTED) build: its recorded run is interrupted
+        # before anything else, then relaunched in place of it (see
+        # launch_replacing_recorded_run).
         recovered = False
+
+        async def _interrupted_first(build_id: str) -> bool:
+            """Interrupt a recovered build's recorded run before its card,
+            refusal or relaunch. ``False``: it could not be sent; show no
+            card, hold the message (no ack) — the redelivery tries again."""
+            if await interrupt_recorded_run(sqlite_pool, forge_config, build_id):
+                return True
+            logger.error(
+                "dispatch_build: the earlier run of recovered build_id=%s "
+                "could not be interrupted; no card, holding the message "
+                "WITHOUT ack",
+                build_id,
+            )
+            return False
 
         # D4's authoritative BUILD boundary is before persistence, the
         # approval gate and the conductor. It therefore also covers direct
@@ -1088,6 +1103,12 @@ def _build_dispatch_build(
                         state.value,
                     )
                     await ack_callback()
+                    return
+                if (
+                    runless_replay
+                    and state == BuildState.INTERRUPTED
+                    and not await _interrupted_first(build_id)
+                ):
                     return
                 if not runless_replay:
                     # BUILD admission is not cancellation. A normal delivery
@@ -1328,6 +1349,8 @@ def _build_dispatch_build(
 
                 build_id = derive_build_id(payload.feature_id, payload.queued_at)
                 recovered = status == BuildState.INTERRUPTED
+                if recovered and not await _interrupted_first(build_id):
+                    return
                 logger.info(
                     "dispatch_build: duplicate %s build feature_id=%s "
                     "correlation_id=%s build_id=%s (%s); re-dispatching into "
@@ -1561,7 +1584,7 @@ def _build_dispatch_build(
             if not recovered:
                 await _register_and_launch()
             elif not await launch_replacing_recorded_run(
-                sqlite_pool, forge_config, build_id, _register_and_launch
+                sqlite_pool, build_id, _register_and_launch
             ):
                 return
         else:
@@ -1588,17 +1611,6 @@ def _build_dispatch_build(
                 build_id,
                 outcome.value,
             )
-            if recovered and not await interrupt_recorded_run(
-                sqlite_pool, forge_config, build_id
-            ):
-                # The earlier run may still be going and could not be told to
-                # stop: hold its place (no ack); the redelivery tries again.
-                logger.error(
-                    "dispatch_build: the earlier run of build_id=%s could not "
-                    "be interrupted; holding the message WITHOUT ack",
-                    build_id,
-                )
-                return
             await ack_callback()
 
     return dispatch_build
