@@ -46,7 +46,6 @@ from forge.persistence.migrations import (
     lifecycle_bridge_registry as bridge_migration,
 )
 from tests.forge.build_stop_support import (
-    free_port,
     container_running,
     docker_available,
     kill_marked,
@@ -232,7 +231,7 @@ async def _boot_recovery(pool: Any) -> None:
 
 
 def test_a_restart_relaunch_is_observed_on_its_own_run(
-    nats, pool, tmp_path  # noqa: F811 — imported fixtures
+    nats, pool, tmp_path, monkeypatch  # noqa: F811 — imported fixtures
 ) -> None:
     from forge.adapters.nats.pipeline_consumer import handle_message
 
@@ -246,6 +245,8 @@ def test_a_restart_relaunch_is_observed_on_its_own_run(
 
     async def _go(url: str) -> dict[str, Any]:
         seen: dict[str, Any] = {}
+        # The factory's runner address, as forge serve has it.
+        monkeypatch.setenv("FORGE_AUTOBUILD_RUNNER_URL", url)
 
         # --- coordinator process 1: dispatch, approve, launch -------------
         one = _Coordinator(nats, pool, url, _open_config())
@@ -326,69 +327,6 @@ def test_a_restart_relaunch_is_observed_on_its_own_run(
     assert "publish_build_cancelled" not in seen["published"]
     assert seen["acks"] == 1 and seen["first_acks"] == 0
     assert seen["at_ack_marked"] == [] and seen["at_ack_fixture"] is False
-
-
-def test_a_relaunch_whose_earlier_identity_cannot_be_cleared_is_held(
-    nats, pool, monkeypatch  # noqa: F811 — imported fixtures
-) -> None:
-    """The card is approved but the earlier run's identity cannot be cleared:
-    nothing is launched and the message is held for its redelivery."""
-    from forge.adapters.nats.pipeline_consumer import handle_message
-    from forge.cli import _serve_gate_activation
-    from forge.cli._serve_deps_state_channel import (
-        build_autobuild_state_initialiser,
-    )
-
-    _serve_deps_gating._reset_for_tests()
-    cfg = _open_config()
-    _serve_deps_gating.bind_gate_parts(_build_parts(nats, forge_config=cfg))
-    repo, sm = build_sqlite_gate_adapters(pool, clock=FixedClock())
-
-    class _NoLaunch:
-        async def astart_async_task(self, **_: Any) -> str:
-            raise AssertionError("nothing may launch")
-
-    deps = build_pipeline_consumer_deps(
-        nats,
-        cfg,
-        pool,
-        async_task_starter=_NoLaunch(),
-        gate_repository=repo,
-        gate_state_machine=sm,
-        gate_clock=FixedClock(),
-    )
-    data = _envelope(f"corr-clear-{uuid.uuid4().hex[:8]}")
-    payload = BuildQueuedPayload.model_validate(json.loads(data)["payload"])
-    build_id = pool.record_pending_build(payload)
-    build_autobuild_state_initialiser(pool).initialise_autobuild_state(
-        build_id=build_id,
-        feature_id=FEATURE,
-        task_id="thread-earlier",
-        correlation_id=payload.correlation_id,
-        lifecycle="starting",
-        wave_index=0,
-        task_index=0,
-    )
-    # Boot recovery's verdict on a build whose run it could not see.
-    pool.connection.execute(
-        "UPDATE builds SET status = 'INTERRUPTED' WHERE build_id = ?", (build_id,)
-    )
-    pool.connection.execute(
-        "CREATE TRIGGER refuse_delete BEFORE DELETE ON async_tasks "
-        "BEGIN SELECT RAISE(ABORT, 'refused'); END"
-    )
-
-    async def _approved(**_: Any) -> Any:
-        return _serve_gate_activation.GateOutcome.RESUMED
-
-    monkeypatch.setattr(_serve_gate_activation, "maybe_gate_build", _approved)
-    msg = _Msg(data)
-    try:
-        asyncio.run(handle_message(msg, deps))
-    finally:
-        _serve_deps_gating._reset_for_tests()
-    assert msg.acks == 0
-    assert nats.published.get(f"pipeline.build-failed.{FEATURE}", []) == []
 
 
 def _envelope_at(correlation_id: str, queued_at: datetime) -> bytes:
@@ -521,9 +459,7 @@ def test_a_declined_relaunch_interrupts_the_original(
     assert not (estate.records / f"{FEATURE}.relaunch.started").exists()
 
 
-@pytest.mark.parametrize(
-    "ending", ["reject", "approve-launch-fails", "reject-runner-unreachable"]
-)
+@pytest.mark.parametrize("ending", ["reject", "approve-launch-fails"])
 def test_a_rearmed_card_after_a_second_restart_interrupts_the_original(
     nats, pool, tmp_path, monkeypatch, ending  # noqa: F811 — imported fixtures
 ) -> None:
@@ -588,25 +524,9 @@ def test_a_rearmed_card_after_a_second_restart_interrupts_the_original(
             clock=FixedClock(),
             forge_config=cfg,
         )
-        if ending == "reject-runner-unreachable":
-            # The runner cannot be reached when the card is refused: the
-            # re-arm keeps trying, and the original keeps running meanwhile.
-            from forge.cli import _serve_gate_activation
-
-            monkeypatch.setattr(
-                _serve_gate_activation, "REARM_INTERRUPT_RETRY_SECONDS", 0.5
-            )
-            monkeypatch.setenv(
-                "FORGE_AUTOBUILD_RUNNER_URL", f"http://127.0.0.1:{free_port()}"
-            )
         await _approve_or_reject(
             nats, pool, build_id, "approve" if ending.startswith("approve") else "reject"
         )
-        if ending == "reject-runner-unreachable":
-            await asyncio.sleep(10.0)
-            assert not all(t.done() for t in rearmed), "the re-arm gave up"
-            assert any(proc_alive(p, s) for p, s in original)
-            monkeypatch.setenv("FORGE_AUTOBUILD_RUNNER_URL", url)
         await asyncio.wait_for(
             asyncio.gather(*rearmed, return_exceptions=True), timeout=60
         )

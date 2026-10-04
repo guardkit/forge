@@ -46,6 +46,8 @@ class _StandInRunner:
         self.cancelled: list[str] = []
         #: True: the runner restarted and knows no thread (answers 404).
         self.forgot = False
+        #: Called (in the server's thread) as each cancel arrives.
+        self.probe: Any = None
 
         async def _runs(request: Request) -> JSONResponse:
             thread = request.path_params["thread"]
@@ -56,6 +58,8 @@ class _StandInRunner:
             )
 
         async def _cancel(request: Request) -> JSONResponse:
+            if self.probe is not None:
+                self.probe()
             self.cancelled.append(request.path_params["thread"])
             return JSONResponse({})
 
@@ -369,53 +373,11 @@ def test_forge_cancel_after_the_runner_restarted_still_cancels(
     after.connection.close()
 
 
-def _recovered_dispatch(tmp_path: Path, monkeypatch, outcome: str, starter: Any):
-    """Production consumer deps over a recovered (INTERRUPTED) build whose
-    earlier run the ledger recorded; the gate answers ``outcome``."""
-    from forge.adapters.nats.pipeline_consumer import PipelineConsumerDeps  # noqa: F401
-    from forge.cli import _serve_deps_gating, _serve_gate_activation
-    from forge.cli._serve_deps import build_pipeline_consumer_deps
-    from forge.gating.sqlite_adapters import build_sqlite_gate_adapters
-    from tests.integration.test_gate_activation_production_wiring import (
-        FixedClock,
-        OrderRecordingNats,
-        _build_parts,
-    )
-
-    nats = OrderRecordingNats()
-    pool = _ledger(tmp_path / "forge.db")
-    cfg = _plain_config()
-    _serve_deps_gating._reset_for_tests()
-    _serve_deps_gating.bind_gate_parts(_build_parts(nats, forge_config=cfg))
-    repo, sm = build_sqlite_gate_adapters(pool, clock=FixedClock())
-    deps = build_pipeline_consumer_deps(
-        nats,
-        cfg,
-        pool,
-        async_task_starter=starter,
-        gate_repository=repo,
-        gate_state_machine=sm,
-        gate_clock=FixedClock(),
-    )
-    payload = _payload("FEAT-REC1", OTHER)
-    build_id, thread = _launched(pool, "FEAT-REC1", OTHER)
-    pool.connection.execute(
-        "UPDATE builds SET status = 'INTERRUPTED' WHERE build_id = ?", (build_id,)
-    )
-
-    async def _gate(**_: Any) -> Any:
-        return getattr(_serve_gate_activation.GateOutcome, outcome)
-
-    monkeypatch.setattr(_serve_gate_activation, "maybe_gate_build", _gate)
-    return nats, pool, deps, build_id, thread
-
-
-def _plain_config() -> Any:
-    from forge.config.models import ForgeConfig
-
-    return ForgeConfig.model_validate(
-        {"permissions": {"filesystem": {"allowlist": ["/srv/forge"]}}}
-    )
+# ---------------------------------------------------------------------------
+# Review R12 / R10: a recovered build's run is interrupted before its card,
+# through the REAL approval gate (first restart: dispatch_build; second
+# restart: rearm_paused_gates).
+# ---------------------------------------------------------------------------
 
 
 class _Msg:
@@ -427,52 +389,347 @@ class _Msg:
         self.acks += 1
 
 
-def _message_for(pool: SqliteLifecyclePersistence, build_id: str) -> bytes:
-    from nats_core.envelope import EventType, MessageEnvelope
+class _Recovery:
+    """A ledger holding one recovered build whose run it recorded, the real
+    gate parts over the in-memory bus double, and production consumer deps."""
 
-    row = pool.get_build_row(build_id)
-    payload = _payload(row.feature_id, row.repo).model_copy(
-        update={"correlation_id": row.correlation_id, "queued_at": row.queued_at}
-    )
-    return (
-        MessageEnvelope(
-            source_id="forge-cli",
-            event_type=EventType.BUILD_QUEUED,
-            correlation_id=row.correlation_id,
-            payload=payload.model_dump(mode="json"),
+    FEATURE = "FEAT-REC1"
+
+    def __init__(self, tmp_path: Path, starter: Any = None) -> None:
+        from tests.integration.test_gate_activation_production_wiring import (
+            OrderRecordingNats,
         )
-        .model_dump_json()
-        .encode()
+
+        self.db_path = tmp_path / "forge.db"
+        self.nats = OrderRecordingNats()
+        self.pool = _ledger(self.db_path)
+        self.payload = _payload(self.FEATURE, OTHER)
+        self.build_id = self.pool.record_pending_build(self.payload)
+        build_autobuild_state_initialiser(self.pool).initialise_autobuild_state(
+            build_id=self.build_id,
+            feature_id=self.FEATURE,
+            task_id="thread-original",
+            correlation_id=self.payload.correlation_id,
+            lifecycle="starting",
+            wave_index=0,
+            task_index=0,
+        )
+        # Boot recovery's verdict on a build whose run it could not see.
+        self.pool.connection.execute(
+            "UPDATE builds SET status = 'INTERRUPTED' WHERE build_id = ?",
+            (self.build_id,),
+        )
+        self.starter = starter
+        self.boot()
+
+    def boot(self) -> None:
+        """A (new) coordinator process: fresh gate parts and consumer deps."""
+        from forge.cli import _serve_deps_gating
+        from forge.cli._serve_deps import build_pipeline_consumer_deps
+        from forge.gating.sqlite_adapters import build_sqlite_gate_adapters
+        from tests.integration.test_gate_activation_production_wiring import (
+            FixedClock,
+            _build_parts,
+        )
+
+        _serve_deps_gating._reset_for_tests()
+        self.cfg = _plain_config()
+        self.parts = _build_parts(self.nats, forge_config=self.cfg)
+        _serve_deps_gating.bind_gate_parts(self.parts)
+        self.repo, self.sm = build_sqlite_gate_adapters(self.pool, clock=FixedClock())
+        self.deps = build_pipeline_consumer_deps(
+            self.nats,
+            self.cfg,
+            self.pool,
+            async_task_starter=self.starter or object(),
+            gate_repository=self.repo,
+            gate_state_machine=self.sm,
+            gate_clock=FixedClock(),
+        )
+
+    def message(self) -> _Msg:
+        from nats_core.envelope import EventType, MessageEnvelope
+
+        return _Msg(
+            MessageEnvelope(
+                source_id="forge-cli",
+                event_type=EventType.BUILD_QUEUED,
+                correlation_id=self.payload.correlation_id,
+                payload=self.payload.model_dump(mode="json"),
+            )
+            .model_dump_json()
+            .encode()
+        )
+
+    def status(self) -> str:
+        import sqlite3
+
+        cx = sqlite3.connect(self.db_path)
+        try:
+            return cx.execute(
+                "SELECT status FROM builds WHERE build_id = ?", (self.build_id,)
+            ).fetchone()[0]
+        finally:
+            cx.close()
+
+    def cards(self) -> int:
+        return len(self.nats.published.get(f"pipeline.build-paused.{self.FEATURE}", []))
+
+    async def answer(self, decision: str) -> None:
+        from tests.integration.test_gate_activation_production_wiring import (
+            _drive_response,
+        )
+
+        deadline = asyncio.get_running_loop().time() + 30
+        while True:
+            row = self.pool.connection.execute(
+                "SELECT pending_approval_request_id FROM builds WHERE build_id = ?",
+                (self.build_id,),
+            ).fetchone()
+            if row and row[0]:
+                break
+            assert asyncio.get_running_loop().time() < deadline, "no card"
+            await asyncio.sleep(0.05)
+        await _drive_response(
+            self.nats, build_id=self.build_id, request_id=row[0], decision=decision
+        )
+
+    async def rearm(self) -> list[Any]:
+        from forge.cli._serve_gate_activation import rearm_paused_gates
+        from tests.integration.test_gate_activation_production_wiring import (
+            FixedClock,
+        )
+
+        async def _launch(**_: Any) -> None:
+            raise AssertionError("not launched in these checks")
+
+        return await rearm_paused_gates(
+            parts=self.parts,
+            sqlite_pool=self.pool,
+            gate_repository=self.repo,
+            gate_state_machine=self.sm,
+            resume_launcher=_launch,
+            client=self.nats,
+            clock=FixedClock(),
+            forge_config=self.cfg,
+        )
+
+
+@pytest.fixture
+def recovery(tmp_path: Path) -> Iterator[_Recovery]:
+    from forge.cli import _serve_deps_gating
+
+    made = _Recovery(tmp_path)
+    yield made
+    _serve_deps_gating._reset_for_tests()
+    made.pool.connection.close()
+
+
+def _plain_config() -> Any:
+    from forge.config.models import ForgeConfig
+
+    return ForgeConfig.model_validate(
+        {"permissions": {"filesystem": {"allowlist": ["/srv/forge"]}}}
     )
 
 
-@pytest.mark.parametrize("outcome", ["CANCELLED", "RESUMED"])
-def test_a_recovered_build_is_held_when_its_earlier_run_cannot_be_interrupted(
-    tmp_path, monkeypatch, outcome
+def _dead_url() -> str:
+    return f"http://127.0.0.1:{_free_port()}"
+
+
+def test_first_restart_reject_interrupts_before_the_card(
+    runners, recovery, monkeypatch
 ) -> None:
-    """The card is rejected (CANCELLED), or approved and the relaunch fails
-    (RESUMED): the earlier run cannot be reached, so the message is not
-    acknowledged, nothing is reported failed, and its identity is kept."""
+    from forge.adapters.nats.pipeline_consumer import handle_message
+
+    seen: list[str] = []
+    runners["global"].probe = lambda: seen.append(recovery.status())
+    monkeypatch.setenv("FORGE_AUTOBUILD_RUNNER_URL", runners["global_url"])
+    msg = recovery.message()
+
+    async def _go() -> None:
+        task = asyncio.ensure_future(handle_message(msg, recovery.deps))
+        await recovery.answer("reject")
+        await asyncio.wait_for(task, timeout=30)
+
+    asyncio.run(_go())
+    assert runners["global"].cancelled == ["thread-original"]
+    # The interrupt went out while the build was still INTERRUPTED — before
+    # its card, and so before the rejection wrote CANCELLED.
+    assert seen == ["INTERRUPTED"]
+    assert recovery.status() == "CANCELLED"
+    assert msg.acks == 1
+
+
+def test_first_restart_unreachable_runner_shows_no_card_until_it_answers(
+    runners, recovery, monkeypatch
+) -> None:
+    from forge.adapters.nats.pipeline_consumer import handle_message
+
+    monkeypatch.setenv("FORGE_AUTOBUILD_RUNNER_URL", _dead_url())
+    held = recovery.message()
+    asyncio.run(handle_message(held, recovery.deps))
+    assert held.acks == 0 and recovery.cards() == 0
+    assert recovery.status() == "INTERRUPTED"
+
+    # The runner answers again; the redelivery shows the card.
+    monkeypatch.setenv("FORGE_AUTOBUILD_RUNNER_URL", runners["global_url"])
+    again = recovery.message()
+
+    async def _go() -> None:
+        task = asyncio.ensure_future(handle_message(again, recovery.deps))
+        deadline = asyncio.get_running_loop().time() + 30
+        while recovery.cards() == 0:
+            assert asyncio.get_running_loop().time() < deadline, "no card"
+            await asyncio.sleep(0.05)
+        await recovery.answer("reject")
+        await asyncio.wait_for(task, timeout=30)
+
+    asyncio.run(_go())
+    assert runners["global"].cancelled == ["thread-original"]
+    assert again.acks == 1
+
+
+def _paused_after_a_first_restart(recovery: _Recovery) -> None:
+    """The recovered build's card is shown (PAUSED), then the coordinator
+    restarts with the card unanswered."""
+    from forge.adapters.nats.pipeline_consumer import handle_message
+
+    async def _go() -> None:
+        task = asyncio.ensure_future(handle_message(recovery.message(), recovery.deps))
+        deadline = asyncio.get_running_loop().time() + 30
+        while recovery.status() != "PAUSED":
+            assert asyncio.get_running_loop().time() < deadline, "no card"
+            await asyncio.sleep(0.05)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(_go())
+    recovery.boot()
+
+
+def test_second_restart_reject_interrupts_before_the_rearmed_card(
+    runners, recovery, monkeypatch
+) -> None:
+    monkeypatch.setenv("FORGE_AUTOBUILD_RUNNER_URL", runners["global_url"])
+    _paused_after_a_first_restart(recovery)
+    seen: list[str] = []
+    runners["global"].probe = lambda: seen.append(recovery.status())
+    cards_before = recovery.cards()
+
+    async def _go() -> None:
+        tasks = await recovery.rearm()
+        assert len(tasks) == 1
+        await recovery.answer("reject")
+        await asyncio.wait_for(asyncio.gather(*tasks), timeout=30)
+
+    asyncio.run(_go())
+    assert recovery.cards() == cards_before + 1
+    assert seen == ["PAUSED"], seen
+    assert recovery.status() == "CANCELLED"
+
+
+def test_second_restart_unreachable_runner_rearms_no_card_until_it_answers(
+    runners, recovery, monkeypatch
+) -> None:
+    monkeypatch.setenv("FORGE_AUTOBUILD_RUNNER_URL", runners["global_url"])
+    _paused_after_a_first_restart(recovery)
+    cards_before = recovery.cards()
+
+    monkeypatch.setenv("FORGE_AUTOBUILD_RUNNER_URL", _dead_url())
+    assert asyncio.run(recovery.rearm()) == []
+    assert recovery.cards() == cards_before
+    assert recovery.status() == "PAUSED"
+
+    # The next boot reaches the runner and re-arms the card.
+    recovery.boot()
+    monkeypatch.setenv("FORGE_AUTOBUILD_RUNNER_URL", runners["global_url"])
+
+    async def _go() -> None:
+        tasks = await recovery.rearm()
+        assert len(tasks) == 1
+        await recovery.answer("reject")
+        await asyncio.wait_for(asyncio.gather(*tasks), timeout=30)
+
+    asyncio.run(_go())
+    assert recovery.cards() == cards_before + 1
+
+
+def test_a_cancelled_relaunch_puts_the_original_identity_back(
+    runners, tmp_path, monkeypatch
+) -> None:
+    """Review R10: the coordinator's dispatch is cancelled (a shutdown) while
+    the approved relaunch is still being submitted: the earlier run's row is
+    restored, never lost."""
     from forge.adapters.nats.pipeline_consumer import handle_message
     from forge.cli import _serve_deps_gating
 
-    class _FailingStarter:
-        async def astart_async_task(self, **_: Any) -> str:
-            raise RuntimeError("the relaunch could not be submitted")
+    submitting = asyncio.Event()
 
-    monkeypatch.setenv("FORGE_AUTOBUILD_RUNNER_URL", f"http://127.0.0.1:{_free_port()}")
-    nats, pool, deps, build_id, thread = _recovered_dispatch(
-        tmp_path, monkeypatch, outcome, _FailingStarter()
-    )
-    msg = _Msg(_message_for(pool, build_id))
+    class _BlockedStarter:
+        async def astart_async_task(self, **_: Any) -> str:
+            submitting.set()
+            await asyncio.sleep(3600)
+            return "never"
+
+    monkeypatch.setenv("FORGE_AUTOBUILD_RUNNER_URL", runners["global_url"])
+    made = _Recovery(tmp_path, starter=_BlockedStarter())
+
+    async def _go() -> None:
+        task = asyncio.ensure_future(handle_message(made.message(), made.deps))
+        await made.answer("approve")
+        await asyncio.wait_for(submitting.wait(), timeout=30)
+        rows = made.pool.connection.execute(
+            "SELECT task_id FROM async_tasks WHERE build_id = ?", (made.build_id,)
+        ).fetchall()
+        assert rows == [], "the earlier identity should be cleared for the relaunch"
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
     try:
-        asyncio.run(handle_message(msg, deps))
+        asyncio.run(_go())
+        rows = made.pool.connection.execute(
+            "SELECT task_id FROM async_tasks WHERE build_id = ?", (made.build_id,)
+        ).fetchall()
+        assert [r[0] for r in rows] == ["thread-original"]
     finally:
         _serve_deps_gating._reset_for_tests()
-    assert msg.acks == 0
-    assert nats.published.get("pipeline.build-failed.FEAT-REC1", []) == []
-    kept = pool.connection.execute(
-        "SELECT task_id FROM async_tasks WHERE build_id = ?", (build_id,)
-    ).fetchall()
-    assert [r[0] for r in kept] == [thread]
-    pool.connection.close()
+        made.pool.connection.close()
+
+
+def test_an_approved_relaunch_whose_earlier_identity_cannot_be_cleared_is_held(
+    runners, tmp_path, monkeypatch
+) -> None:
+    """Approved through the real gate, but the earlier run's identity cannot be
+    cleared: nothing is launched and the message is held for its redelivery."""
+    from forge.adapters.nats.pipeline_consumer import handle_message
+    from forge.cli import _serve_deps_gating
+
+    class _NoLaunch:
+        async def astart_async_task(self, **_: Any) -> str:
+            raise AssertionError("nothing may launch")
+
+    monkeypatch.setenv("FORGE_AUTOBUILD_RUNNER_URL", runners["global_url"])
+    made = _Recovery(tmp_path, starter=_NoLaunch())
+    made.pool.connection.execute(
+        "CREATE TRIGGER refuse_delete BEFORE DELETE ON async_tasks "
+        "BEGIN SELECT RAISE(ABORT, 'refused'); END"
+    )
+    msg = made.message()
+
+    async def _go() -> None:
+        task = asyncio.ensure_future(handle_message(msg, made.deps))
+        await made.answer("approve")
+        await asyncio.wait_for(task, timeout=30)
+
+    try:
+        asyncio.run(_go())
+        assert msg.acks == 0
+        assert made.nats.published.get(f"pipeline.build-failed.{made.FEATURE}", []) == []
+        rows = made.pool.connection.execute(
+            "SELECT task_id FROM async_tasks WHERE build_id = ?", (made.build_id,)
+        ).fetchall()
+        assert [r[0] for r in rows] == ["thread-original"]
+    finally:
+        _serve_deps_gating._reset_for_tests()
+        made.pool.connection.close()

@@ -257,6 +257,14 @@ class TestSentinelThreading:
             lambda _row: recovery_envelope,
         )
 
+        # The stand-in ledger records no earlier run: nothing to interrupt.
+        async def _nothing_to_interrupt(*_a: Any, **_kw: Any) -> bool:
+            return True
+
+        monkeypatch.setattr(
+            "forge.cli._recorded_run.interrupt_recorded_run", _nothing_to_interrupt
+        )
+
         tasks = await rearm_paused_gates(
             parts=parts,
             sqlite_pool=_Pool(),  # type: ignore[arg-type]
