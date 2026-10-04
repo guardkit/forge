@@ -264,8 +264,10 @@ class TestBootLogEmitsAppliedCount:
         # added by the executor stage for the deployment_targets table — one
         # row per deployment target holding that target's OWN counter, who
         # holds the lock and until when, and what is running on it now by
-        # commit and by the identity the running thing reported).
-        assert "applied 16" in applied_lines[0], applied_lines[0]
+        # commit and by the identity the running thing reported; schema_v17.sql
+        # added on 4 October 2026 for the builds.source_commit column — the
+        # exact commit a feature planned elsewhere was admitted at).
+        assert "applied 17" in applied_lines[0], applied_lines[0]
 
 
 # ---------------------------------------------------------------------------

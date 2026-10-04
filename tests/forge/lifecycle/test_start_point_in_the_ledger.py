@@ -262,3 +262,72 @@ def test_a_build_that_is_not_there_reads_as_not_recorded(
 
     assert start.recorded is False
     assert start.sentence == "not recorded"
+
+
+# ---------------------------------------------------------------------------
+# A prepared feature: admitted facts instead of a planning run's (4 October 2026)
+# ---------------------------------------------------------------------------
+
+
+def test_the_migration_adds_source_commit_to_builds(tmp_path: Path) -> None:
+    cx = sqlite_connect.connect_writer(tmp_path / "fresh.db")
+    try:
+        version = lifecycle_migrations.apply_at_boot(cx)
+        builds = {row[1] for row in cx.execute("PRAGMA table_info(builds);")}
+    finally:
+        cx.close()
+
+    assert version >= 17
+    assert "source_commit" in builds
+
+
+def test_a_prepared_build_records_its_admitted_facts(
+    persistence: SqliteLifecyclePersistence,
+) -> None:
+    from types import SimpleNamespace
+
+    admitted = SimpleNamespace(
+        start_commit=COMMIT,
+        target_branch="main",
+        source_commit=COMMIT,
+        memory_project="synthetic_project",
+        launch_settings=("PROJECT_REGION",),
+    )
+    now = datetime.now(UTC)
+    payload = BuildQueuedPayload(
+        feature_id="FEAT-STRT",
+        repo="guardkit/api_test",
+        branch="feature/prepared",
+        feature_yaml_path=".guardkit/features/FEAT-STRT.yaml",
+        triggered_by="forge-internal",
+        correlation_id="corr-prepared",
+        requested_at=now,
+        queued_at=now,
+    )
+
+    assert persistence.has_planning_run("corr-prepared") is False
+    build_id = persistence.record_pending_build(payload, admitted=admitted)
+
+    start = persistence.read_start_point(build_id)
+    assert start.recorded and start.start_commit == COMMIT
+    assert start.target_branch == "main"
+    assert persistence.read_source_commit(build_id) == COMMIT
+    assert persistence.read_memory_project(build_id) == "synthetic_project"
+    assert persistence.read_launch_settings(build_id) == ("PROJECT_REGION",)
+    row = persistence.get_build_row(build_id)
+    assert row is not None and row.source_commit == COMMIT
+    assert row.branch == "feature/prepared"
+
+
+def test_a_planned_build_has_no_source_commit(
+    persistence: SqliteLifecyclePersistence,
+) -> None:
+    store = _store(persistence)
+    _queue_run(store)
+    store.record_start_point(CID, start_commit=COMMIT, target_branch="main")
+
+    assert persistence.has_planning_run(CID) is True
+    build_id = _queue_build(persistence)
+
+    assert persistence.read_source_commit(build_id) is None
+    assert persistence.read_start_point(build_id).start_commit == COMMIT
