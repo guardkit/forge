@@ -644,6 +644,11 @@ FACTORY_ENV_NAMES=(
   GUARDKIT_WAVE_SAME_AREA
   GUARDKIT_PLAYER_MODEL_LIMITS
   FORGE_MAX_CONCURRENT_BUILDS
+  # FREE SPACE FOR CONCURRENT BUILDS (4 October 2026): the floor that must
+  # stay free after a build starts, and the small amount each running build
+  # reserves (default one gibibyte). The factory's settings, not a project's.
+  FORGE_AUTOBUILD_MIN_AVAILABLE_BYTES
+  FORGE_AUTOBUILD_PER_BUILD_RESERVE_BYTES
   FORGE_SIDECAR_IN_SANDBOX
   OPENAI_BASE_URL
   OPENAI_API_KEY
