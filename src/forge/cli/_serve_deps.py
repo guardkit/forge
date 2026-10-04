@@ -100,6 +100,7 @@ from forge.cli._serve_deps_forward_context import (
 )
 from forge.cli._serve_deps_lifecycle import build_publisher_and_emitter
 from forge.cli._serve_deps_stage_log import build_stage_log_recorder
+from forge.cli._recorded_run import interrupt_recorded_run
 from forge.cli._serve_deps_state_channel import build_autobuild_state_initialiser
 from forge.config.build_admission import build_admission
 from forge.config.models import ForgeConfig, PipelineConfig
@@ -1034,31 +1035,6 @@ def _build_dispatch_build(
             return False, None
         return True, (str(row[0]) if row is not None else None)
 
-    async def _interrupt_earlier_run(repo: str, thread_id: str | None) -> None:
-        """Best effort: interrupt a recovered build's earlier run.
-
-        Used when the relaunch does not happen (the card is declined, expires
-        or is stopped, or the launch fails), so a run the factory no longer
-        holds a place for does not carry on. The runner's own cancel handler
-        then stops everything that run owns.
-        """
-        if not thread_id:
-            return
-        from forge.cli.runtime import _langgraph_interrupt_canceller
-        from forge.config.sandboxes import sandbox_for
-
-        entry = sandbox_for(forge_config, repo) if forge_config is not None else None
-        url = str(getattr(entry, "runner_url", "") or "").strip() or None
-        interrupted = await asyncio.to_thread(
-            _langgraph_interrupt_canceller(url), thread_id
-        )
-        logger.warning(
-            "dispatch_build: the relaunch did not happen; earlier run on "
-            "thread %s %s",
-            thread_id,
-            "interrupted" if interrupted else "could NOT be interrupted",
-        )
-
     async def dispatch_build(
         payload: "BuildQueuedPayload",
         ack_callback,
@@ -1630,7 +1606,13 @@ def _build_dispatch_build(
                 )
             except Exception:
                 if recovered:
-                    await _interrupt_earlier_run(payload.repo, earlier_thread)
+                    await interrupt_recorded_run(
+                        sqlite_pool,
+                        forge_config,
+                        build_id,
+                        thread_id=earlier_thread,
+                        repo=payload.repo,
+                    )
                 raise
         else:
             # Gate terminal (reject / expiry / hard-stop) — the build never
@@ -1657,7 +1639,13 @@ def _build_dispatch_build(
                 outcome.value,
             )
             if recovered:
-                await _interrupt_earlier_run(payload.repo, earlier_thread)
+                await interrupt_recorded_run(
+                    sqlite_pool,
+                    forge_config,
+                    build_id,
+                    thread_id=earlier_thread,
+                    repo=payload.repo,
+                )
             await ack_callback()
 
     return dispatch_build

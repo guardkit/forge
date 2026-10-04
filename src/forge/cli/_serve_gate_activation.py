@@ -965,6 +965,7 @@ async def rearm_paused_gates(
     resume_launcher: Callable[..., Any],
     client: Any,
     clock: Callable[[], datetime],
+    forge_config: Any = None,
 ) -> list["asyncio.Task[Any]"]:
     """Re-arm every PAUSED build's approval round-trip after a daemon restart.
 
@@ -1166,6 +1167,8 @@ async def rearm_paused_gates(
                     # runner took the repository's shared checkout, and two
                     # resumed builds of one repository would share one folder.
                     branch=getattr(build_row, "branch", None),
+                    sqlite_pool=sqlite_pool,
+                    forge_config=forge_config,
                 ),
                 name=f"rearm-gate-{snap.build_id}",
             )
@@ -1236,6 +1239,8 @@ async def _rearm_dispatch(
     resume_launcher: Callable[..., Any],
     repo: str | None = None,
     branch: str | None = None,
+    sqlite_pool: Any = None,
+    forge_config: Any = None,
 ) -> "GateOutcome":
     """Await the re-armed decision and launch on approve.
 
@@ -1267,6 +1272,13 @@ async def _rearm_dispatch(
         attempt_count=snap.attempt_count,
         artefact_paths=snap.artefact_paths,
     )
+    # A re-armed card can belong to a recovered build whose earlier run may
+    # still be going after a factory-only restart (its async_tasks row says
+    # so; a build never launched has none, and both steps are then no-ops).
+    if sqlite_pool is not None and not outcome_launches(outcome):
+        from forge.cli._recorded_run import interrupt_recorded_run
+
+        await interrupt_recorded_run(sqlite_pool, forge_config, snap.build_id)
     if outcome_launches(outcome):
         logger.info(
             "rearm_paused_gates: build_id=%s approved post-restart "
@@ -1274,6 +1286,20 @@ async def _rearm_dispatch(
             snap.build_id,
             outcome.value,
         )
+        if sqlite_pool is not None:
+            # The earlier run's identity goes before the relaunch, so the
+            # relaunch's observer binds the relaunch's own thread and run.
+            try:
+                sqlite_pool.connection.execute(
+                    "DELETE FROM async_tasks WHERE build_id = ?", (snap.build_id,)
+                )
+            except Exception as exc:  # noqa: BLE001 — no table, no earlier run
+                logger.warning(
+                    "rearm_paused_gates: could not clear the earlier run's "
+                    "identity for build_id=%s (%s)",
+                    snap.build_id,
+                    exc,
+                )
         await resume_launcher(
             build_id=snap.build_id,
             feature_id=snap.feature_id,

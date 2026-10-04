@@ -1,0 +1,112 @@
+"""Interrupt the run the ledger recorded for a build (best effort).
+
+After a factory-only restart a build's run can still be going in its runner
+while the factory no longer holds a place for it: boot settlement refuses it,
+or a recovered build's card is declined, expires or is stopped. Nothing else
+would ever tell that run to stop. This sends it the ordinary
+``runs.cancel(action="interrupt")`` on the runner it was launched on — the
+repository's sandbox runner when it has one, else the global runner — and the
+runner's own cancel handler then stops everything the build owns. No
+confirmation is awaited; a missing row, a run that has already ended or an
+unreachable runner is logged and is not an error.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from typing import Any
+
+logger = logging.getLogger(__name__)
+
+__all__ = ["interrupt_recorded_run", "runner_url_for_repo"]
+
+
+def runner_url_for_repo(forge_config: Any, repo: str | None) -> str | None:
+    """The runner a build of ``repo`` is launched on.
+
+    The repository's sandbox runner (``planning.sandboxes``, as the launch
+    routes it), else ``FORGE_AUTOBUILD_RUNNER_URL``.
+    """
+    if forge_config is not None and repo:
+        from forge.config.sandboxes import sandbox_for
+
+        entry = sandbox_for(forge_config, repo)
+        url = str(getattr(entry, "runner_url", "") or "").strip()
+        if url:
+            return url
+    return os.environ.get("FORGE_AUTOBUILD_RUNNER_URL") or None
+
+
+def _recorded(sqlite_pool: Any, build_id: str) -> tuple[str | None, str | None]:
+    """``(thread_id, repo)`` the ledger recorded for ``build_id``."""
+    row = sqlite_pool.connection.execute(
+        "SELECT a.task_id, b.repo FROM builds b LEFT JOIN async_tasks a "
+        "ON a.build_id = b.build_id WHERE b.build_id = ? "
+        "ORDER BY a.started_at DESC LIMIT 1",
+        (build_id,),
+    ).fetchone()
+    if row is None:
+        return None, None
+    return (str(row[0]) if row[0] else None), (str(row[1]) if row[1] else None)
+
+
+async def interrupt_recorded_run(
+    sqlite_pool: Any,
+    forge_config: Any,
+    build_id: str,
+    *,
+    thread_id: str | None = None,
+    repo: str | None = None,
+) -> bool:
+    """Interrupt ``build_id``'s recorded run; ``True`` when one was interrupted.
+
+    ``thread_id``/``repo`` may be given when the caller already read them
+    (the row may be gone by then). Never raises.
+    """
+    try:
+        if thread_id is None or repo is None:
+            recorded_thread, recorded_repo = _recorded(sqlite_pool, build_id)
+            thread_id = thread_id or recorded_thread
+            repo = repo or recorded_repo
+        if not thread_id:
+            return False
+        url = runner_url_for_repo(forge_config, repo)
+        if not url:
+            logger.warning(
+                "interrupt_recorded_run: no runner address for build_id=%s "
+                "(repo=%s); its run, if any, is not interrupted",
+                build_id,
+                repo,
+            )
+            return False
+        from langgraph_sdk import get_client
+
+        client = get_client(url=url)
+        runs = await client.runs.list(thread_id, limit=1)
+        if not runs:
+            return False
+        run = runs[0]
+        run_id = run.get("run_id") if isinstance(run, dict) else getattr(run, "run_id", None)
+        status = run.get("status") if isinstance(run, dict) else getattr(run, "status", None)
+        if not run_id or status not in ("pending", "running"):
+            return False
+        await client.runs.cancel(thread_id, run_id, action="interrupt")
+    except Exception as exc:  # noqa: BLE001 — best effort, said once
+        logger.warning(
+            "interrupt_recorded_run: could not interrupt the run of build_id=%s "
+            "(%s: %s)",
+            build_id,
+            type(exc).__name__,
+            exc,
+        )
+        return False
+    logger.warning(
+        "interrupt_recorded_run: interrupted the run of build_id=%s "
+        "(thread %s, run %s) on %s",
+        build_id,
+        thread_id,
+        run_id,
+        url,
+    )
+    return True

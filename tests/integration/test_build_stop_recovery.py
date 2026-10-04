@@ -499,3 +499,80 @@ def test_a_declined_relaunch_interrupts_the_original(
         _serve_deps_gating._reset_for_tests()
     assert seen["acks"] == 1
     assert not (estate.records / f"{FEATURE}.relaunch.started").exists()
+
+
+def test_a_rejected_rearmed_card_after_a_second_restart_interrupts_the_original(
+    nats, pool, tmp_path, monkeypatch  # noqa: F811 — imported fixtures
+) -> None:
+    """Review R10: restart (the recovered build's card is shown and left
+    PAUSED), restart again, and the re-armed card is rejected: the original
+    run, still going, is interrupted and the runner's fence stops it."""
+    from forge.adapters.nats.pipeline_consumer import handle_message
+    from forge.cli._serve_gate_activation import rearm_paused_gates
+
+    bridge_migration.apply(pool.connection)
+    estate = make_estate(tmp_path / "estate")
+    correlation = f"corr-rearm-{uuid.uuid4().hex[:8]}"
+    build_id = derive_build_id(FEATURE, QUEUED_AT)
+    estate.add_build(FEATURE, build_id, branch="main")
+
+    async def _go(url: str) -> bool:
+        monkeypatch.setenv("FORGE_AUTOBUILD_RUNNER_URL", url)
+        one = _Coordinator(nats, pool, url, _open_config())
+        tasks = [asyncio.ensure_future(handle_message(_Msg(_envelope(correlation)), one.deps))]
+        await _approve_or_reject(nats, pool, build_id, "approve")
+        original = await asyncio.to_thread(estate.pids, FEATURE)
+        await _wait_until(lambda: one.resolved, timeout=30, what="process 1 observes")
+        await one.restart()
+        await _boot_recovery(pool)
+
+        # Process 2: the recovered build's card is shown, then process 2 dies.
+        two = _Coordinator(nats, pool, url, _open_config())
+        tasks.append(
+            asyncio.ensure_future(handle_message(_Msg(_envelope(correlation)), two.deps))
+        )
+        deadline = asyncio.get_running_loop().time() + 30
+        while _row(pool, build_id)[0] != "PAUSED":
+            assert asyncio.get_running_loop().time() < deadline, "no PAUSED card"
+            await asyncio.sleep(0.05)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await two.restart()
+        assert any(proc_alive(p, s) for p, s in original), "original should still run"
+
+        # Process 3: re-arms the card; it is rejected.
+        _serve_deps_gating._reset_for_tests()
+        cfg = _open_config()
+        parts = _build_parts(nats, forge_config=cfg)
+        _serve_deps_gating.bind_gate_parts(parts)
+        repo, sm = build_sqlite_gate_adapters(pool, clock=FixedClock())
+
+        async def _no_launch(**_: Any) -> None:
+            raise AssertionError("a rejected card launches nothing")
+
+        rearmed = await rearm_paused_gates(
+            parts=parts,
+            sqlite_pool=pool,
+            gate_repository=repo,
+            gate_state_machine=sm,
+            resume_launcher=_no_launch,
+            client=nats,
+            clock=FixedClock(),
+            forge_config=cfg,
+        )
+        await _approve_or_reject(nats, pool, build_id, "reject")
+        await asyncio.wait_for(asyncio.gather(*rearmed), timeout=30)
+        deadline = asyncio.get_running_loop().time() + 30
+        while any(proc_alive(p, s) for p, s in original):
+            assert asyncio.get_running_loop().time() < deadline, "original still runs"
+            await asyncio.sleep(0.2)
+        return True
+
+    try:
+        with real_runner(estate, "rearm", jobs=2) as runner:
+            assert asyncio.run(asyncio.wait_for(_go(runner.url), timeout=180))
+    finally:
+        kill_recorded(estate)
+        kill_marked([build_id])
+        _serve_deps_gating._reset_for_tests()

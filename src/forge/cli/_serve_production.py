@@ -695,6 +695,12 @@ async def _settle_strict_runless_builds_at_boot(
         if admission.allowed:
             continue
         policy_reason = admission.reason or "sandbox-required"
+        # Its run may still be going (a factory-only restart): send it the
+        # ordinary interrupt before its place is let go; the runner's fence
+        # then stops everything it owns.
+        from forge.cli._recorded_run import interrupt_recorded_run
+
+        await interrupt_recorded_run(sqlite_pool, forge_config, current.build_id)
         finalising_warning = str(current.error or "")
         if not finalising_warning.startswith("finalising-interrupted:"):
             finalising_warning = ""
