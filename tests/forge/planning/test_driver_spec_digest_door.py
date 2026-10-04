@@ -3982,3 +3982,49 @@ def test_and_n_more_counts_every_pair_found_not_only_those_in_the_file() -> None
         warning = PlanningRunDriver._capture_coherence_warning(reply.role_output, CID)
         assert "And 1 more." in warning["possible_contradiction"]
         assert warning["pair_count"] == 3
+
+
+# ---------------------------------------------------------------------------
+# The request as one side (4 October 2026, the better coherence check). The
+# spec writer may now name the request itself as one side of a pair, written as
+# ``the request: "<text>"``. This file is exactly what the spec writer's own
+# connected test writes for the saved B9 draft (specialist-agent
+# tests/fixtures/coherence_better_check/b9_request_coherence_warning.json); it
+# reaches the card through the real draft and card path, with no Forge change.
+# ---------------------------------------------------------------------------
+
+_B9_REQUEST_WARNING = Path(__file__).parent / "fixtures" / "b9_request_coherence_warning.json"
+
+
+@pytest.mark.asyncio
+async def test_a_pair_against_the_request_reaches_the_card_whole(
+    store: SqlitePlanningRunStore, tmp_path: Path
+) -> None:
+    record = json.loads(_B9_REQUEST_WARNING.read_text(encoding="utf-8"))
+    pair = record["pairs"][0]
+    assert pair["first"].startswith('the request: "') and pair["first"].endswith('"')
+    assert len(pair["first"]) <= 150  # the spec writer keeps the whole side within the cap
+
+    h, summary = await _one_card(store, _warned_reply(record))
+
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+    # The request side is shown whole: no cut, its closing quote kept.
+    assert summary["possible_contradiction"] == (
+        "Possible contradiction, found by the machine's reviewer and not checked "
+        f'by a person: "{pair["first"]}" and "{pair["second"]}". Its reason: '
+        f'"{pair["why"]}". If they really conflict, send a note; otherwise '
+        "approve as usual."
+    )
+    assert 'the request: "Add a GET /users/created-per-day endpoint' in summary[
+        "possible_contradiction"
+    ]
+    assert "…" not in summary["possible_contradiction"]
+    assert "And " not in summary["possible_contradiction"]  # pair_count is 1
+    assert len(summary["possible_contradiction"]) < 1400
+    # Every other card field is exactly today's.
+    today = await _todays_card(tmp_path)
+    assert {k: v for k, v in summary.items() if k != "possible_contradiction"} == today
+
+    drafted = [d for status, d in _events(store, _DRAFT_STAGE) if status == "drafted"]
+    assert drafted[-1]["spec_draft"]["coherence_warning"]["pairs"] == [pair]
+    assert drafted[-1]["spec_draft"]["coherence_warning"]["pair_count"] == 1
