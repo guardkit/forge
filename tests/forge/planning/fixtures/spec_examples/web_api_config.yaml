@@ -1,0 +1,38 @@
+# A web-API project's own .guardkit/config.yaml, as the measured declaration of
+# 4 October 2026 would write it: the words are the project's, not Forge's.
+# Other blocks a real project has sit beside it and are ignored by the check.
+memory:
+  project: scratch_project
+spec_examples:
+  not_asked_for:
+    - name: another request method
+      example_words: ["POST request*", "PUT request*", "PATCH request*", "DELETE request*",
+                      "HEAD request*", "OPTIONS request*", "CONNECT request*", "TRACE request*",
+                      "non-GET", "* method not allowed", "unsupported method*", "invalid method*", "405"]
+      request_words: ["POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "other methods"]
+    - name: another web address
+      example_words: ["invalid * path*", "unknown * path*", "non-existent * path*", "incorrect * path*",
+                      "wrong * path*", "invalid * endpoint*", "unknown * endpoint*", "non-existent * endpoint*",
+                      "incorrect * endpoint*", "invalid * url*", "unknown * url*", "invalid * route*", "unknown * route*"]
+      request_words: ["other path*", "different endpoint", "unknown path*", "invalid path*"]
+    - name: query parameters, filters or date ranges
+      example_words: ["parameter*", "query string*", "filter*", "date range*", "custom range",
+                      "different range", "requested range", "start date", "end date",
+                      "larger window", "custom window", "window larger than", "window longer than"]
+      request_words: ["parameter*", "query", "filter*", "date range*", "optional", "limit", "offset",
+                      "search*", "match*"]
+    - name: a dependency being down
+      example_words: ["database * unavailab*", "data store * unavailab*", "data source * unavailab*",
+                      "data access layer * unavailab*", "audit log * unavailab*", "repository * unavailab*",
+                      "dependenc* * unavailab*", "service is * unavailab*", "services are * unavailab*", "service unavailability",
+                      "unavailability of", "endpoint is unavailable", "is down", "outage*", "unreachable",
+                      "cannot connect", "connection lost", "connection refused", "connection fail*",
+                      "database failure", "timed out", "timeout*"]
+      request_words: ["unavailab*", "outage*", "is down", "ready", "readiness", "health*"]
+    - name: response times
+      example_words: ["within * second*", "within * ms", "within * millisecond*", "response time*",
+                      "latency", "acceptable time", "quickly"]
+    - name: many requests at once or heavy load
+      example_words: ["concurren*", "simultaneous*", "at the same time", "in parallel", "many * requests",
+                      "multiple * requests", "large number of", "large user set*", "under load", "heavy load",
+                      "high volume"]
