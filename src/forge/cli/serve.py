@@ -909,6 +909,7 @@ def bind_production_dispatch_chain(
                     resume_launcher=resume_launcher,
                     client=client,
                     clock=_gate_wall_clock,
+                    forge_config=forge_config,
                 )
             except Exception as exc:  # noqa: BLE001 — DDR-007 boot protection
                 logger.error(
