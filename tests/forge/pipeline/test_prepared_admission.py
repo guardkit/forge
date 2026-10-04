@@ -422,6 +422,21 @@ async def test_a_broken_relative_link_is_refused_naming_the_link(
 
 
 @pytest.mark.asyncio
+async def test_a_link_to_a_folder_is_refused(
+    project: Project, runner: WorktreeGitRunner
+) -> None:
+    files = bundle()
+    task_path = f"{TASK_DIR}/{TASKS[0]}-do-the-thing.md"
+    files[task_path] += "\nThe [constitution](../../../docs/constitution) folder.\n"
+    project.commit_on(BRANCH, files)
+
+    answer = await _admit(project, runner)
+
+    assert not answer.ok
+    assert "docs/constitution" in (answer.refusal or "")
+
+
+@pytest.mark.asyncio
 async def test_back_quoted_paths_urls_and_anchors_are_not_checked(
     project: Project, runner: WorktreeGitRunner
 ) -> None:
