@@ -1262,9 +1262,12 @@ def _build_dispatch_build(
                     note_build_rejection,
                 )
 
-                note_build_rejection(
+                if not note_build_rejection(
                     record_build_rejection, payload.correlation_id, reason
-                )
+                ):
+                    # The note could not be written: hold WITHOUT ack, so
+                    # the redelivery writes it.
+                    return
             if lifecycle_emitter is not None:
                 from forge.pipeline import BuildContext
 
@@ -1337,9 +1340,12 @@ def _build_dispatch_build(
                     note_build_rejection,
                 )
 
-                note_build_rejection(
+                if not note_build_rejection(
                     record_build_rejection, payload.correlation_id, reason
-                )
+                ):
+                    # The note could not be written: hold WITHOUT ack, so
+                    # the redelivery writes it.
+                    return
             if lifecycle_emitter is not None:
                 from forge.pipeline import BuildContext
 
