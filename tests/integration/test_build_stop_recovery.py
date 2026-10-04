@@ -1,29 +1,26 @@
 """A coordinator-only restart while a build's original run is still alive.
 
-Review round 2 (4 October 2026), findings R2 and R3, through the PRODUCTION
-path: ``handle_message`` → ``dispatch_build`` → the real approval gate → the
-real async-task starter (deepagents middleware, as ``forge serve`` builds it)
-launching onto a real ``langgraph dev`` runner; the real identity provider
-(``async_tasks`` + ``runs.list``), the real stream source and translator in
-the lifecycle bridge, and the real :class:`AckAfterStop` asking the runner's
-real stop route. GuardKit is the stand-in script; the approval card's
-transport is the in-memory NATS double the gate tests use.
+Through the PRODUCTION path: ``handle_message`` → ``dispatch_build`` → the real
+approval gate → the real async-task starter (deepagents middleware, as
+``forge serve`` builds it) launching onto a real ``langgraph dev`` runner; the
+real identity provider (``async_tasks`` + ``runs.list``), the real stream
+source and translator in the lifecycle bridge. GuardKit is the stand-in
+script; the approval card's transport is the in-memory NATS double the gate
+tests use.
 
 Process 1 dispatches the build, it is approved and launched; a labelled
 fixture container is started for it and its removal is refused for a while.
-Then the coordinator restarts (its watcher dies, boot recovery marks the row
+The coordinator restarts (its watcher dies, boot recovery marks the row
 INTERRUPTED) while the runner — and the original child and fixture — carry
-on. The redelivered message reaches process 2:
+on. The redelivered message reaches process 2, which clears the original's
+identity and relaunches on approval. The runner stops the original first and
+the relaunch does not spawn until the original's processes and fixture are
+gone; the replacement is observed on its OWN thread and run, completes, and
+the message is acknowledged once; the original's cancelled terminal is never
+published and never acknowledges.
 
-* approve: nothing happens (no card, no ack) until the original's processes
-  AND fixture are gone; then the card; on approval the replacement launches,
-  is observed on its OWN thread and run, completes, and the message is
-  acknowledged once; the original's cancelled terminal is never published,
-  never acknowledges and never stops the replacement.
-* reject: the same hold; the rejection's acknowledgement comes only once the
-  original's processes and fixture are gone.
-* policy refusal (boot replay under a policy that refuses the repository):
-  the same hold before the refusal's acknowledgement.
+And when the original's identity cannot be cleared, nothing is launched and
+the message is held for its redelivery.
 """
 
 from __future__ import annotations
@@ -67,7 +64,6 @@ from .test_gate_activation_production_wiring import (  # noqa: F401 — fixtures
     OrderRecordingNats,
     _build_parts,
     _drive_response,
-    _paused_subject,
     _row,
     _wait_until,
     nats,
@@ -142,15 +138,6 @@ def _envelope(correlation_id: str) -> bytes:
     )
 
 
-def _strict_config() -> ForgeConfig:
-    return ForgeConfig.model_validate(
-        {
-            "permissions": {"filesystem": {"allowlist": ["/srv/forge"]}},
-            "publication": {"builds_may_run_inside_the_coordinator": False},
-        }
-    )
-
-
 def _open_config() -> ForgeConfig:
     return ForgeConfig.model_validate(
         {"permissions": {"filesystem": {"allowlist": ["/srv/forge"]}}}
@@ -164,11 +151,9 @@ class _Coordinator:
         from forge.cli._serve_production import (
             _build_async_tasks_identity_provider,
             _resolve_async_task_starter,
-            build_runner_stop_check,
         )
         from forge.cli.serve import _build_async_subagent_middleware
         from forge.lifecycle_bridge.bridge import LifecycleBridge
-        from forge.lifecycle_bridge.build_stop import AckAfterStop
         from forge.lifecycle_bridge.run_state_source import (
             langgraph_run_state_fetcher,
         )
@@ -180,10 +165,6 @@ class _Coordinator:
         _serve_deps_gating._reset_for_tests()
         _serve_deps_gating.bind_gate_parts(_build_parts(nats, forge_config=cfg))
         repo, sm = build_sqlite_gate_adapters(pool, clock=FixedClock())
-        self.guard = AckAfterStop(
-            build_runner_stop_check(sqlite_pool=pool, default_url=url),
-            recheck_seconds=0.5,
-        )
         self.publisher = _Publisher()
         identity = _build_async_tasks_identity_provider(
             sqlite_pool=pool, autobuild_runner_url=url
@@ -203,7 +184,6 @@ class _Coordinator:
             stream_source=langgraph_stream_source(runner_url=url),
             identity_provider=_identity,
             run_state_fetcher=langgraph_run_state_fetcher(runner_url=url),
-            ack_guard=self.guard,
         )
         starter = _resolve_async_task_starter(
             _build_async_subagent_middleware(autobuild_runner_url=url)
@@ -217,7 +197,6 @@ class _Coordinator:
             gate_repository=repo,
             gate_state_machine=sm,
             gate_clock=FixedClock(),
-            ack_guard=self.guard,
         )
 
     async def restart(self) -> None:
@@ -251,10 +230,11 @@ async def _boot_recovery(pool: Any) -> None:
     await reconcile_on_boot(pool, AsyncMock(), AsyncMock())
 
 
-@pytest.mark.parametrize("ending", ["approve", "reject", "policy"])
-def test_a_restart_relaunch_stops_the_original_first(
-    nats, pool, tmp_path, ending  # noqa: F811 — imported fixtures
+def test_a_restart_relaunch_is_observed_on_its_own_run(
+    nats, pool, tmp_path  # noqa: F811 — imported fixtures
 ) -> None:
+    from forge.adapters.nats.pipeline_consumer import handle_message
+
     bridge_migration.apply(pool.connection)
     estate = make_estate(tmp_path / "estate")
     correlation = f"corr-restart-{uuid.uuid4().hex[:8]}"
@@ -269,8 +249,6 @@ def test_a_restart_relaunch_stops_the_original_first(
         # --- coordinator process 1: dispatch, approve, launch -------------
         one = _Coordinator(nats, pool, url, _open_config())
         first = _Msg(_envelope(correlation))
-        from forge.adapters.nats.pipeline_consumer import handle_message
-
         # The gate waits for the card's answer inside the dispatch, so each
         # delivery runs as its own task, as the daemon runs it.
         tasks = [asyncio.ensure_future(handle_message(first, one.deps))]
@@ -284,45 +262,26 @@ def test_a_restart_relaunch_stops_the_original_first(
         await one.restart()
         await _boot_recovery(pool)
         assert _row(pool, build_id)[0] == "INTERRUPTED"
-        cards_before = len(nats.published.get(_paused_subject(FEATURE), []))
 
         def _at_ack() -> None:
             seen["at_ack_marked"] = marked_alive(build_id)
             seen["at_ack_fixture"] = container_running(fixture["id"])
 
         second = _Msg(_envelope(correlation), on_ack=_at_ack)
-        two = _Coordinator(
-            nats, pool, url, _strict_config() if ending == "policy" else _open_config()
-        )
-        if ending == "policy":
-            # Boot replay of the recovered row under a policy that refuses it.
-            tasks.append(
-                asyncio.ensure_future(
-                    two.deps.dispatch_build(
-                        BuildQueuedPayload.model_validate(
-                            json.loads(second.data)["payload"]
-                        ),
-                        second.ack,
-                        runless_replay=True,
-                    )
-                )
-            )
-        else:
-            tasks.append(asyncio.ensure_future(handle_message(second, two.deps)))
+        two = _Coordinator(nats, pool, url, _open_config())
+        tasks.append(asyncio.ensure_future(handle_message(second, two.deps)))
+        await _approve_or_reject(nats, pool, build_id, "approve")
 
-        # Held: the original's processes are stopped, its fixture cannot be
-        # removed yet, so nothing else happens — no card, no acknowledgement.
+        # The runner stops the original first; its fixture cannot be removed
+        # yet, so the relaunch does not spawn.
         await asyncio.sleep(4.0)
-        seen["held_acks"] = second.acks
-        seen["held_cards"] = len(nats.published.get(_paused_subject(FEATURE), [])) - cards_before
-        seen["held_fixture"] = container_running(fixture["id"])
         seen["original_gone"] = [p for p, s in original if proc_alive(p, s)] == []
+        seen["held_fixture"] = container_running(fixture["id"])
+        seen["relaunched_while_held"] = (
+            estate.records / f"{FEATURE}.relaunch.started"
+        ).exists()
 
         refuse.unlink()  # the fixture can go now
-        if ending in ("approve", "reject"):
-            await _approve_or_reject(
-                nats, pool, build_id, "approve" if ending == "approve" else "reject"
-            )
         await _wait_until(lambda: second.acks >= 1, timeout=90, what="the ack")
         await asyncio.sleep(2.0)  # a second acknowledgement would land here
         seen["acks"] = second.acks
@@ -330,7 +289,6 @@ def test_a_restart_relaunch_stops_the_original_first(
         seen["original_identity"] = original_identity
         seen["observed"] = list(two.resolved)
         seen["published"] = [name for name, _ in two.publisher.published]
-        await two.guard.shutdown()
         await two.wireup.shutdown()
         for task in tasks:
             task.cancel()
@@ -351,50 +309,29 @@ def test_a_restart_relaunch_stops_the_original_first(
         remove_test_containers([build_id])
         _serve_deps_gating._reset_for_tests()
 
-    # Held while anything of the original was alive.
+    # The runner stopped the original and held the relaunch while the
+    # original's fixture was up.
     assert seen["original_gone"]
     assert seen["held_fixture"], "the fixture should still have been up"
-    assert seen["held_acks"] == 0 and seen["held_cards"] == 0
-    # Acknowledged once, and only when nothing of the original was left.
+    assert not seen["relaunched_while_held"]
+    # The replacement ran — on its own thread — after every process of the
+    # original was gone, completed, and was acknowledged once.
+    relaunch = json.loads((estate.records / f"{FEATURE}.relaunch.started").read_text())
+    assert relaunch["others_alive"] == {FEATURE: []}
+    assert seen["observed"] and all(
+        ident[0] != seen["original_identity"][0] for ident in seen["observed"]
+    ), seen
+    assert "publish_build_complete" in seen["published"], seen["published"]
+    assert "publish_build_cancelled" not in seen["published"]
     assert seen["acks"] == 1 and seen["first_acks"] == 0
     assert seen["at_ack_marked"] == [] and seen["at_ack_fixture"] is False
-    if ending == "approve":
-        # The replacement ran — on its own thread — and completed.
-        relaunch = json.loads((estate.records / f"{FEATURE}.relaunch.started").read_text())
-        assert relaunch["others_alive"] == {FEATURE: []}
-        assert seen["observed"] and all(
-            ident[0] != seen["original_identity"][0] for ident in seen["observed"]
-        ), seen
-        assert "publish_build_complete" in seen["published"], seen["published"]
-        assert "publish_build_cancelled" not in seen["published"]
-    else:
-        assert not (estate.records / f"{FEATURE}.relaunch.started").exists()
 
 
-# ---------------------------------------------------------------------------
-# After the held stop: an error releases the place; a failed identity clear
-# holds (coach finding on the recovered-dispatch continuation)
-# ---------------------------------------------------------------------------
-
-
-class _HeldThenStopped:
-    """A runner that cannot confirm the stop at first, then can."""
-
-    def __init__(self, held_answers: int = 2) -> None:
-        self.calls = 0
-        self._held = held_answers
-
-    async def __call__(self, feature_id: str, correlation_id: str, purpose: str = "ack"):
-        from forge.lifecycle_bridge.build_stop import StopAnswer
-
-        self.calls += 1
-        if self.calls <= self._held:
-            return StopAnswer(stopped=False, reason="the original is still running")
-        return StopAnswer(stopped=True)
-
-
-def _recovered_deps(nats: Any, pool: Any, check: Any) -> tuple[Any, str, bytes]:  # noqa: F811
-    from forge.lifecycle_bridge.build_stop import AckAfterStop
+def test_a_relaunch_whose_earlier_identity_cannot_be_cleared_is_held(
+    nats, pool, monkeypatch  # noqa: F811 — imported fixtures
+) -> None:
+    from forge.adapters.nats.pipeline_consumer import handle_message
+    from forge.cli import _serve_gate_activation
 
     _serve_deps_gating._reset_for_tests()
     cfg = _open_config()
@@ -408,63 +345,27 @@ def _recovered_deps(nats: Any, pool: Any, check: Any) -> tuple[Any, str, bytes]:
         gate_repository=repo,
         gate_state_machine=sm,
         gate_clock=FixedClock(),
-        ack_guard=AckAfterStop(check, recheck_seconds=0.1),
     )
-    correlation = f"corr-cont-{uuid.uuid4().hex[:8]}"
-    data = _envelope(correlation)
+    data = _envelope(f"corr-clear-{uuid.uuid4().hex[:8]}")
     payload = BuildQueuedPayload.model_validate(json.loads(data)["payload"])
     build_id = pool.record_pending_build(payload)
     # Boot recovery's verdict on a build whose run it could not see.
     pool.connection.execute(
         "UPDATE builds SET status = 'INTERRUPTED' WHERE build_id = ?", (build_id,)
     )
-    return deps, build_id, data
-
-
-@pytest.mark.parametrize("failure", ["gate-raises", "identity-clear-fails"])
-def test_after_a_held_stop_an_error_releases_and_a_failed_clear_holds(
-    nats, pool, monkeypatch, failure  # noqa: F811 — imported fixtures
-) -> None:
-    from forge.adapters.nats.pipeline_consumer import handle_message
-    from forge.cli import _serve_gate_activation
-
-    check = _HeldThenStopped()
-    deps, build_id, data = _recovered_deps(nats, pool, check)
+    pool.connection.execute("DROP TABLE async_tasks")
     gate_calls: list[str] = []
 
-    async def _gate_down(**kwargs: Any) -> Any:
+    async def _gate(**kwargs: Any) -> Any:
         gate_calls.append(kwargs["build_id"])
-        raise RuntimeError("gate transport down")
+        raise AssertionError("no gate while the identity is not cleared")
 
-    monkeypatch.setattr(_serve_gate_activation, "maybe_gate_build", _gate_down)
-    if failure == "identity-clear-fails":
-        pool.connection.execute("DROP TABLE async_tasks")
+    monkeypatch.setattr(_serve_gate_activation, "maybe_gate_build", _gate)
     msg = _Msg(data)
-
-    async def _go() -> None:
-        await handle_message(msg, deps)
-        assert msg.acks == 0 and check.calls == 1, "the stop was not held"
-        deadline = asyncio.get_running_loop().time() + 10
-        while check.calls <= 2 or deps.ack_guard.held():
-            assert asyncio.get_running_loop().time() < deadline
-            await asyncio.sleep(0.05)
-        await asyncio.sleep(0.5)  # a second ack or publish would land here
-        await deps.ack_guard.shutdown()
-
     try:
-        asyncio.run(_go())
+        asyncio.run(handle_message(msg, deps))
     finally:
         _serve_deps_gating._reset_for_tests()
-    failed = nats.published.get(f"pipeline.build-failed.{FEATURE}", [])
-    if failure == "gate-raises":
-        # The continuation ran and raised: the build is reported failed once
-        # and its place released once.
-        assert gate_calls == [build_id]
-        assert len(failed) == 1, failed
-        assert msg.acks == 1
-    else:
-        # The original's identity could not be cleared: no continuation, no
-        # report, no acknowledgement — the redelivery tries again.
-        assert gate_calls == []
-        assert failed == []
-        assert msg.acks == 0
+    assert gate_calls == []
+    assert msg.acks == 0
+    assert nats.published.get(f"pipeline.build-failed.{FEATURE}", []) == []

@@ -751,10 +751,6 @@ def bind_production_dispatch_chain(
                 # Make-merge-work (2026-08-24) — the merge card rides the
                 # terminal seam; None (flag off) keeps the seam a no-op.
                 merge_offer_hook=merge_offer_hook,
-                # Stopping a cancelled build (3 October 2026) — a CANCELLED
-                # terminal is acknowledged only once its runner confirms the
-                # build's processes are gone.
-                ack_guard=getattr(bridge_wireup_parts, "ack_guard", None),
             )
             register_ack_handle = wireup.register_ack_handle
             take_ack_handle = wireup.take_ack_handle
@@ -1039,7 +1035,6 @@ def bind_production_dispatch_chain(
             gate_state_machine=gate_state_machine,
             gate_clock=_gate_wall_clock,
             conductor_router=conductor_router,
-            ack_guard=getattr(bridge_wireup_parts, "ack_guard", None),
         )
         dispatcher = make_handle_message_dispatcher(deps)
         # Rebind the daemon's dispatch seam BEFORE the consumer's first

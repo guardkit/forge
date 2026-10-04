@@ -765,7 +765,6 @@ def _build_dispatch_build(
     gate_state_machine: Any = None,
     gate_clock: Callable[[], datetime] | None = None,
     conductor_router: Callable[..., Any] | None = None,
-    ack_guard: Any = None,
     record_build_rejection: Callable[[str, str], Any] | None = None,
 ):
     """Return the production ``dispatch_build`` closure.
@@ -1001,105 +1000,32 @@ def _build_dispatch_build(
     # that are still ACTIVE, so finished builds never block anything.
     started_by_feature: dict[str, set[str]] = {}
 
-    async def _stop_the_recovered_original_first(
-        payload: "BuildQueuedPayload",
-        ack_callback,
-        register_observer,
-        *,
-        runless_replay: bool,
-        build_id: str,
-    ) -> bool:
-        """A recovered (INTERRUPTED) build: stop its original run first.
+    def _clear_the_recovered_originals_identity(build_id: str) -> bool:
+        """Before a recovered (INTERRUPTED) build is launched again.
 
-        Review round 2 (4 October 2026). Recovery marks a RUNNING row
-        INTERRUPTED without stopping its run, and after a coordinator-only
-        restart that run may still be alive in its runner. So before this
-        build is given a card, refused or acknowledged, its runner is asked
-        to stop it (``purpose="relaunch"``: the current run, nothing
-        remembered) and the rest of this dispatch waits — the message
-        unacknowledged, re-asked every 30 s — until nothing of it is left.
-        Then the original's identity (its ``async_tasks`` row) is cleared, so
-        the relaunch's observer can only resolve the relaunch's own thread
-        and run, and the dispatch continues exactly as it would have.
-        ``True`` means this took the dispatch over.
+        Its earlier run's ``async_tasks`` row (same feature and correlation,
+        kept by boot recovery) would otherwise be what the relaunch's
+        observer — registered before the launch — resolves, so it would
+        watch the earlier run instead of the relaunch. Deleting it makes the
+        observer wait for the row the launch writes for the relaunch. (The
+        runner itself stops an earlier run of the same build still running
+        there before the relaunch proceeds.) ``False``: the row could not be
+        deleted, and the caller holds the message without acknowledging it,
+        so its redelivery tries again.
         """
-        if ack_guard is None:
+        try:
+            sqlite_pool.connection.execute(
+                "DELETE FROM async_tasks WHERE build_id = ?", (build_id,)
+            )
+        except sqlite3.Error as exc:
+            logger.error(
+                "dispatch_build: could not clear the earlier run's identity "
+                "for build_id=%s (%s); holding the message WITHOUT ack so its "
+                "redelivery tries again",
+                build_id,
+                exc,
+            )
             return False
-
-        async def _continue() -> None:
-            try:
-                sqlite_pool.connection.execute(
-                    "DELETE FROM async_tasks WHERE build_id = ?", (build_id,)
-                )
-            except sqlite3.Error as exc:
-                # Carrying on would let the relaunch's observer find the
-                # stopped original's thread. Hold instead: the message stays
-                # unacknowledged and its redelivery tries again.
-                logger.error(
-                    "dispatch_build: could not clear the stopped original's "
-                    "identity for build_id=%s (%s); holding the message "
-                    "WITHOUT ack so its redelivery tries again",
-                    build_id,
-                    exc,
-                )
-                return
-            try:
-                await dispatch_build(
-                    payload,
-                    ack_callback,
-                    register_observer,
-                    runless_replay=runless_replay,
-                    _original_stopped=True,
-                )
-            except Exception as exc:  # noqa: BLE001 — mirror the consumer
-                # This continuation runs inside the stop guard, outside
-                # handle_message's own protection, so do here what that
-                # protection does: say the build failed, then release its
-                # place. Otherwise the row (already moved on by the gate)
-                # would hold the place until the next restart.
-                logger.warning(
-                    "dispatch_build: recovered build build_id=%s raised after "
-                    "its original was stopped (%s); publishing build-failed "
-                    "and acking",
-                    build_id,
-                    exc,
-                )
-                if lifecycle_emitter is not None:
-                    from forge.pipeline import BuildContext
-
-                    try:
-                        await lifecycle_emitter.emit_failed(
-                            BuildContext(
-                                feature_id=payload.feature_id,
-                                build_id=build_id,
-                                correlation_id=payload.correlation_id,
-                                wave_total=1,
-                            ),
-                            failure_reason=f"{exc.__class__.__name__}: {exc}",
-                            recoverable=False,
-                            failed_task_id=None,
-                        )
-                    except Exception as emit_exc:  # noqa: BLE001
-                        logger.warning(
-                            "dispatch_build: build-failed publish raised (%s) "
-                            "for build_id=%s",
-                            emit_exc,
-                            build_id,
-                        )
-                await ack_callback()
-
-        logger.info(
-            "dispatch_build: recovered build build_id=%s — stopping its "
-            "original run before anything else",
-            build_id,
-        )
-        await ack_guard.ack_when_stopped(
-            payload.feature_id,
-            payload.correlation_id,
-            _continue,
-            where="dispatch_build recovered INTERRUPTED build",
-            purpose="relaunch",
-        )
         return True
 
     async def dispatch_build(
@@ -1108,7 +1034,6 @@ def _build_dispatch_build(
         register_observer=None,
         *,
         runless_replay: bool = False,
-        _original_stopped: bool = False,
     ):
         """Persist + gate + dispatch one accepted ``BuildQueuedPayload``.
 
@@ -1177,29 +1102,7 @@ def _build_dispatch_build(
                         build_id,
                         state.value,
                     )
-                    if ack_guard is not None:
-                        # A CANCELLED build's slot waits for its runner's
-                        # confirmed stop (3 October 2026).
-                        await ack_guard.ack_when_stopped(
-                            payload.feature_id,
-                            payload.correlation_id,
-                            ack_callback,
-                            where="dispatch_build sandbox-policy terminal",
-                        )
-                        return
                     await ack_callback()
-                    return
-                if (
-                    state == BuildState.INTERRUPTED
-                    and not _original_stopped
-                    and await _stop_the_recovered_original_first(
-                        payload,
-                        ack_callback,
-                        register_observer,
-                        runless_replay=runless_replay,
-                        build_id=build_id,
-                    )
-                ):
                     return
                 if not runless_replay:
                     # BUILD admission is not cancellation. A normal delivery
@@ -1388,17 +1291,6 @@ def _build_dispatch_build(
                     status.value,
                     exc,
                 )
-                if ack_guard is not None:
-                    # A CANCELLED build's slot is released only once its
-                    # runner confirms everything it owns is gone (3 October
-                    # 2026); any other terminal acks at once, as before.
-                    await ack_guard.ack_when_stopped(
-                        payload.feature_id,
-                        payload.correlation_id,
-                        ack_callback,
-                        where="dispatch_build duplicate TERMINAL",
-                    )
-                    return
                 await ack_callback()
                 return
             # Is the pre-dispatch approval gate wired this boot? The
@@ -1446,14 +1338,7 @@ def _build_dispatch_build(
                 build_id = derive_build_id(payload.feature_id, payload.queued_at)
                 if (
                     status == BuildState.INTERRUPTED
-                    and not _original_stopped
-                    and await _stop_the_recovered_original_first(
-                        payload,
-                        ack_callback,
-                        register_observer,
-                        runless_replay=runless_replay,
-                        build_id=build_id,
-                    )
+                    and not _clear_the_recovered_originals_identity(build_id)
                 ):
                     return
                 logger.info(
@@ -1907,7 +1792,6 @@ def build_pipeline_consumer_deps(
     gate_state_machine: Any = None,
     gate_clock: Callable[[], datetime] | None = None,
     conductor_router: Callable[..., Any] | None = None,
-    ack_guard: Any = None,
     record_build_rejection: Callable[[str, str], Any] | None = None,
 ) -> PipelineConsumerDeps:
     """Compose the production :class:`PipelineConsumerDeps` for ``forge serve``.
@@ -2053,7 +1937,6 @@ def build_pipeline_consumer_deps(
         gate_state_machine=gate_state_machine,
         gate_clock=gate_clock,
         conductor_router=conductor_router,
-        ack_guard=ack_guard,
         record_build_rejection=record_build_rejection,
     )
     publish_build_failed = _build_publish_build_failed(
@@ -2067,7 +1950,6 @@ def build_pipeline_consumer_deps(
         dispatch_build=dispatch_build,
         publish_build_failed=publish_build_failed,
         register_ack_handle=register_ack_handle,
-        ack_guard=ack_guard,
         record_build_rejection=record_build_rejection,
     )
     logger.info(
