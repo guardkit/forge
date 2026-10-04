@@ -696,8 +696,9 @@ def _declared_document_warnings(repo: Path, config_text: str) -> list[str]:
 
     Read with the same reader the build admission uses, so registration and
     admission cannot disagree about what the project declared. A document
-    that is a symbolic link is named as one (``lstat``: builds refuse a link,
-    whatever it points at); one that is not in the checkout is named as
+    that is a symbolic link, or is reached through a folder that is one, is
+    named (``lstat`` on every component: builds refuse a link, whatever it
+    points at); one that is not in the checkout is named as
     missing. A file that cannot be read declares nothing here; admission says
     why at build time.
     """
@@ -706,10 +707,26 @@ def _declared_document_warnings(repo: Path, config_text: str) -> list[str]:
     documents, _why = read_declared_binding_documents(config_text or None)
     warnings: list[str] = []
     for path in documents:
-        target = repo / path
-        if target.is_symlink():
+        parts = Path(path).parts
+        # Every component, not only the file: a folder on the way that is a
+        # link (``docs -> ../real``) is a link too, and in git the document is
+        # then not a file under that folder at all.
+        linked = next(
+            (
+                "/".join(parts[:index])
+                for index in range(1, len(parts) + 1)
+                if (repo.joinpath(*parts[:index])).is_symlink()
+            ),
+            None,
+        )
+        if linked == path:
             warnings.append(f"declared document is a link, which builds refuse: {path}")
-        elif not target.is_file():
+        elif linked is not None:
+            warnings.append(
+                f"declared document is reached through a link ({linked}), "
+                f"which builds refuse: {path}"
+            )
+        elif not (repo / path).is_file():
             warnings.append(f"declared but missing: {path}")
     return warnings
 

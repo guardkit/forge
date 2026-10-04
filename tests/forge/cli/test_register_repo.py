@@ -2042,3 +2042,30 @@ def test_a_declared_document_that_is_a_link_is_warned_and_nothing_is_written(
     )
     assert _tree_digest(repo) == before
     assert (repo / "docs" / "constitution" / "mission.md").is_symlink()
+
+
+def test_a_declared_document_reached_through_a_linked_folder_is_warned(
+    _isolate, tmp_path
+):
+    repo = _make_repo(_isolate, "bench-one", toolchain=_DECLARES_TWO)
+    real = repo / "real-docs" / "constitution"
+    real.mkdir(parents=True)
+    for name in ("mission.md", "tech-stack.md"):
+        (real / name).write_text("x\n", encoding="utf-8")
+    shutil_docs = repo / "docs"
+    for child in shutil_docs.iterdir():
+        child.unlink()
+    shutil_docs.rmdir()
+    (repo / "docs").symlink_to("real-docs")
+    config = _write_config(tmp_path)
+
+    result = _run(config, str(repo), "--json")
+
+    assert result.exit_code == 0, result.output
+    (detail,) = [d for name, _, d in _steps(result) if name == "documents"]
+    assert detail == (
+        "declared document is reached through a link (docs), which builds "
+        "refuse: docs/constitution/mission.md; "
+        "declared document is reached through a link (docs), which builds "
+        "refuse: docs/constitution/tech-stack.md"
+    )
