@@ -1175,9 +1175,19 @@ def run_the_scope_pass(
     # card for FEAT-651C counted 69 files, 40 of them an earlier cleanup.
     # Only when the record names no start does it fall back to 'main', and it
     # says so here and on the report.
-    from forge.cli._serve_conductor import _the_builds_start_commit
-
-    base = _the_builds_start_commit(pool, build_id)
+    base: str | None = None
+    try:
+        point = pool.read_start_point(build_id)
+        if getattr(point, "recorded", False):
+            base = str(getattr(point, "start_commit", None) or "").strip() or None
+    except Exception as exc:  # noqa: BLE001 — a reader never stops a card
+        logger.warning(
+            "the scope pass: the commit %s started from could not be read off "
+            "the record (%s: %s)",
+            build_id,
+            type(exc).__name__,
+            exc,
+        )
     if base is None:
         base = MERGE_BASE_REF
         logger.info(

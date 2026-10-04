@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Prepare and validate the rollout's private env file and coordinator settings."""
+"""Prepare and validate the rollout's private env file and coordinator settings.
+
+NOTE (3 October 2026): this tool predates the coordinator's receipts folder
+bind and the extra memory allowed name, and will refuse the current bundle.
+The one-page upgrade does not use it.
+"""
 
 from __future__ import annotations
 

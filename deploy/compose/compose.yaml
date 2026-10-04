@@ -213,26 +213,25 @@ networks:
     driver: bridge
 
 volumes:
-  # THE SIX VOLUMES OF THE DESIGN'S TABLE, each with ONE writer. Four are
+  # THE VOLUMES OF THE DESIGN'S TABLE, each with ONE writer. Three are
   # declared here because Forge owns them; the other two are named so the
   # table can be read in one place, with the file that declares each.
   #
   #   forge-ledger           written by: the coordinator, and nothing else
   #   forge-settings         written by: NOBODY at run time - the machine puts
   #                                      the settings file on it before start
-  #   forge-evidence         NO LONGER MOUNTED (3 October 2026): the receipts
-  #                                      folder is bound instead, see the
-  #                                      coordinator above. Still declared so
-  #                                      the entries it holds are not lost;
-  #                                      copy them into the bound folder once,
-  #                                      without overwriting, at the upgrade
   #   forge-home             written by: the coordinator (its own small state)
   #   forge-publisher-state  written by: the publisher - declared by the
   #                                      included fragment, not here
   #   nats-jetstream         written by: the bus - declared by the bus's own
   #                                      compose file, which the estate
   #                                      bundle composes alongside this one
+  #
+  # THE OLD EVIDENCE VOLUME, forge-evidence, is no longer used (3 October
+  # 2026): the coordinator binds the machine's receipts folder instead (see
+  # the coordinator above). Nothing here removes it; it is left on the
+  # machine, and at the upgrade its entries are copied into that folder once,
+  # without overwriting anything already there.
   forge-ledger:
   forge-settings:
-  forge-evidence:
   forge-home:
