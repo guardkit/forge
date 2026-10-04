@@ -62,7 +62,11 @@ from forge.lifecycle.state_machine import (
     transition_chain,
 )
 from forge.pipeline import BuildContext
-from forge.pipeline.merge_offer import approval_subject_for, merge_request_id
+from forge.pipeline.merge_offer import (
+    approval_subject_for,
+    card_line_about_the_after_deploy_check,
+    merge_request_id,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from nats_core.envelope import MessageEnvelope
@@ -623,7 +627,12 @@ def card_line_about_scope(report: Any) -> str:
 
 
 def merge_card_words(
-    *, feature_id: str, branch: str, gates: Any = None, scope: Any = None
+    *,
+    feature_id: str,
+    branch: str,
+    gates: Any = None,
+    scope: Any = None,
+    after_deploy_check_skip: Any = None,
 ) -> str:
     """The sentences on the face of the merge-ready checkpoint's card.
 
@@ -653,6 +662,13 @@ def merge_card_words(
             :func:`card_line_about_scope`). ``None`` means nobody counted,
             and the card is then byte for byte the card that shipped before
             the scope pass existed.
+        after_deploy_check_skip: Planning's record that it registered no
+            after-deploy check for this feature (read by
+            :func:`forge.pipeline.merge_offer.read_after_deploy_check_skip`,
+            the same reader the routine card uses). It adds the one shared
+            sentence with the recorded reason; ``None`` — a check was
+            registered, or nothing could be read — leaves the card byte for
+            byte as it was.
     """
     detail = str(getattr(gates, "detail", "") or "").strip().rstrip(".")
     deferred = str(getattr(gates, "deferred_detail", "") or "").strip()
@@ -677,6 +693,9 @@ def merge_card_words(
             "on this branch here; they are run against the candidate in the "
             "sandbox before anything is merged."
         )
+    about_the_check = card_line_about_the_after_deploy_check(after_deploy_check_skip)
+    if about_the_check:
+        sentences.append(about_the_check)
     sentences.append(
         "Approve = check the candidate in the sandbox, merge the branch into "
         "main and promote it."
@@ -692,6 +711,7 @@ def make_merge_card_publisher(
     clock: Callable[[], datetime],
     config: Any = None,
     scope_pass: Callable[..., Any] | None = None,
+    after_deploy_check_reader: Callable[[Any, Any], Any] | None = None,
 ) -> Callable[..., Any]:
     """Compose the merge card's ``publish_card`` seam (design pass §c.2).
 
@@ -758,6 +778,11 @@ def make_merge_card_publisher(
         scope_pass: Injectable ``(config, pool, build_id, feature_id, row) ->
             report | None`` seam; defaults to
             :func:`~forge.pipeline.merge_offer.run_the_scope_pass`.
+        after_deploy_check_reader: Injectable ``(pool, row) -> skip | None``
+            seam; defaults to
+            :func:`~forge.pipeline.merge_offer.read_after_deploy_check_skip`,
+            the reader the routine card uses, so both cards say the same
+            sentence when planning registered no after-deploy check.
 
     Returns:
         ``async (*, build_id, feature_id, rationale, branch, gates) ->
@@ -767,10 +792,19 @@ def make_merge_card_publisher(
         nothing because there is no verdict to return; it raises
         :class:`MergeCardNotPublished` when no card went out.
     """
-    from forge.pipeline.merge_offer import run_the_scope_pass
+    from forge.pipeline.merge_offer import (
+        after_deploy_check_skip_for,
+        read_after_deploy_check_skip,
+        run_the_scope_pass,
+    )
     from forge.pipeline.merge_ready_checkpoint import MERGE_READY_CHECKPOINT_LABEL
 
     take_the_scope_pass = scope_pass if scope_pass is not None else run_the_scope_pass
+    read_the_check = (
+        after_deploy_check_reader
+        if after_deploy_check_reader is not None
+        else read_after_deploy_check_skip
+    )
 
     async def _scope_of(build_id: str, feature_id: str, row: Any) -> Any:
         """Read this branch once against its plan and against the request.
@@ -819,6 +853,9 @@ def make_merge_card_publisher(
         )
         gated_branch = str(branch or "").strip() or None
         scope = await _scope_of(build_id, resolved_feature, row)
+        no_check = after_deploy_check_skip_for(
+            read_the_check, sqlite_pool, build_id, row
+        )
 
         def _words(merge_target: str, _merge_branch: str | None) -> str:
             if gated_branch is not None and gated_branch != merge_target:
@@ -835,6 +872,7 @@ def make_merge_card_publisher(
                 branch=merge_target,
                 gates=gates,
                 scope=scope,
+                after_deploy_check_skip=no_check,
             )
 
         logger.info(
