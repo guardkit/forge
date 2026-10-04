@@ -88,7 +88,7 @@ class TestStopReachesEverythingTheBuildOwns:
                 await child.wait()
                 return recorded, remaining
             finally:
-                build_processes.unregister(owned)
+                build_processes.end(owned)
 
         recorded, remaining = asyncio.run(_go())
         assert remaining == []
@@ -162,7 +162,7 @@ class TestStopReachesEverythingTheBuildOwns:
             # trusted as a build's root.
             owned = build_processes.register("build-not-mine", os.getppid())
             assert owned.root is None
-            build_processes.unregister(owned)
+            build_processes.end(owned)
         finally:
             bystander.kill()
             bystander.wait()
@@ -359,3 +359,33 @@ class TestCleanupIsConfirmedWhateverTheTerminal:
         assert fixture_alive and held, "the run ended with its fixture still up"
         assert result["async_tasks"][feature]["lifecycle"] == "failed"
         assert not container_running(fixture)
+
+
+@pytest.mark.parametrize("exit_code", [0, 3])
+def test_leftovers_of_a_normal_finish_are_stopped_before_the_node_ends(
+    estate, monkeypatch, exit_code
+):
+    """Coach finding 3: not only a stop — every finish sweeps what is left."""
+    for name, value in estate.env().items():
+        monkeypatch.setenv(name, value)
+    from forge.subagents import autobuild_runner as ar
+
+    build_id = _build_id()
+    feature = f"FEAT-N{exit_code}"
+    estate.add_build(
+        feature,
+        build_id,
+        branch=feature.lower(),
+        run_seconds=1,
+        exit=exit_code,
+        leave_behind=True,
+    )
+    asyncio.run(
+        ar._build_runner_graph().ainvoke(
+            _graph_input(feature, build_id, feature.lower())
+        )
+    )
+    recorded = estate.pids(feature)
+    # The grandchild and the SIGTERM-ignoring process in its own session,
+    # both left running by GuardKit's normal exit, are gone.
+    assert [p for p, s in recorded if proc_alive(p, s)] == []
