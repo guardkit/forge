@@ -4351,3 +4351,51 @@ class TestALostTeardownKeepsTheHold:
             assert ("another worker" in again.detail) is kept
         finally:
             sidecar.close()
+
+
+class _ATreeRemovalWhoseAnswerIsLost(InContainerCandidateGit):
+    """This container's git for everything, except that removing the laid-out
+    candidate tree goes to a sandbox's sidecar through the real
+    :class:`SidecarCandidateGit`, and that sidecar drops the connection."""
+
+    def __init__(self, repo_root: Path, sidecar: ASidecarThat) -> None:
+        from forge.deploy.sidecar_git import SidecarCandidateGit
+
+        super().__init__(repo_root)
+        host, port = sidecar.server.server_address[:2]
+        self._sandbox = SidecarCandidateGit(f"http://{host}:{port}", repo=REPO)
+        self.removals: list[bool] = []
+
+    async def remove_candidate_tree(self, feature_id: str, path: str | None = None) -> bool:
+        removed = await self._sandbox.remove_candidate_tree(feature_id, path)
+        self.removals.append(removed)
+        return removed
+
+
+class TestALostSandboxCleanUpKeepsTheHold:
+    """Codex round 2, R2, 4 October 2026: the press's own clean-ups in the
+    sandbox (the laid-out candidate tree, a join's working folder, the
+    retained worktree) change files there too. One whose answer was lost may
+    not have finished, so the hold is kept even after a clean ending."""
+
+    @pytest.mark.asyncio
+    async def test_a_lost_tree_removal_keeps_the_hold_and_a_second_press_is_refused(
+        self, config: ForgeConfig, pool: SqliteLifecyclePersistence, repo_root: Path
+    ) -> None:
+        import dataclasses
+
+        sidecar = ASidecarThat(None)
+        try:
+            git = _ATreeRemovalWhoseAnswerIsLost(repo_root, sidecar)
+            deps, _publisher, _gk, _dp = _deps(config, pool, guardkit=_JoinsForReal())
+            deps = dataclasses.replace(deps, git_surface=lambda _repo, _root: git)
+
+            outcome = await _run_executor(deps, repo_root)
+
+            assert outcome.result == "publication-pending", outcome.detail
+            assert git.removals == [False]
+            assert _the_hold(pool).lease_holder is not None
+            again = await _run_executor(deps, repo_root)
+            assert "another worker" in again.detail
+        finally:
+            sidecar.close()
