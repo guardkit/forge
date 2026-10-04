@@ -2113,6 +2113,151 @@ async def _local_branch_exists(repo_path: Path, branch: str) -> bool:
     return code == 0
 
 
+#: The build-owned local branch a PREPARED feature is built from (4 October
+#: 2026): ``forge/source/<build_id>``, made at the admitted commit. GuardKit's
+#: ``--base-branch`` must name a LOCAL branch (``refs/heads/<name>``), and the
+#: queued branch may move after admission, so the build makes its own.
+SOURCE_BRANCH_PREFIX: str = "forge/source/"
+
+#: A commit as admission recorded it: hexadecimal, abbreviated or full.
+_SOURCE_COMMIT_PATTERN = re.compile(r"^[0-9a-f]{7,64}$")
+
+#: What a build id must look like before it is part of a branch name.
+_SOURCE_BRANCH_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._\-]*$")
+
+#: How long GuardKit's own feature check may take before the build is stopped.
+FEATURE_VALIDATE_TIMEOUT_SECONDS: float = 300.0
+
+
+def _source_commit_for_build(payload: Mapping[str, Any]) -> str | None:
+    """The exact commit a prepared feature was admitted at, or ``None``.
+
+    ``None`` — the key absent, as for every planned or hand-queued build —
+    means the launch is today's, byte for byte.
+    """
+    raw = payload.get("source_commit")
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    return raw.strip()
+
+
+def _source_branch_for(build_id: str) -> str:
+    return f"{SOURCE_BRANCH_PREFIX}{build_id}"
+
+
+async def _make_source_branch(
+    repo_path: Path, build_id: str, source_commit: str
+) -> str | None:
+    """Make ``forge/source/<build_id>`` at ``source_commit``; ``None`` or why not.
+
+    LOCAL git only: the commit must already be in the build clone (admission
+    fetched it). A commit that is not there is refused, never fetched. Forced,
+    so a relaunch of the same build puts the branch back at the same commit.
+    """
+    if not _SOURCE_COMMIT_PATTERN.match(source_commit):
+        return (
+            f"the admitted commit {source_commit!r} is not a commit this runner "
+            "will pass to git"
+        )
+    if not _SOURCE_BRANCH_ID_PATTERN.match(build_id):
+        return f"the build id {build_id!r} cannot be part of a branch name"
+    code, _ = await _run_git(
+        ["rev-parse", "--verify", "--quiet", f"{source_commit}^{{commit}}"],
+        cwd=repo_path,
+    )
+    if code != 0:
+        return (
+            f"the commit {source_commit} this feature was admitted at is not in "
+            f"{repo_path} — refusing to fetch (the runner reads local refs only)"
+        )
+    branch = _source_branch_for(build_id)
+    code, output = await _run_git(
+        ["branch", "--force", branch, source_commit], cwd=repo_path
+    )
+    if code != 0:
+        return (
+            f"could not make the branch {branch} at {source_commit} in "
+            f"{repo_path} (exit={code}): {output}"
+        )
+    return None
+
+
+async def _delete_source_branch(repo_path: Path, branch: str | None) -> None:
+    """Delete a prepared build's own branch. Best effort, never raises."""
+    if not branch or not branch.startswith(SOURCE_BRANCH_PREFIX):
+        return
+    try:
+        code, output = await _run_git(["branch", "-D", branch], cwd=repo_path)
+    except Exception as exc:  # noqa: BLE001 — clean-up never fails a build
+        code, output = -1, f"{type(exc).__name__}: {exc}"
+    if code != 0:
+        logger.warning(
+            "autobuild_runner: could not delete the build's own branch %s "
+            "(exit=%s): %s — not fatal",
+            branch,
+            code,
+            output,
+        )
+
+
+async def _guardkit_feature_validate(
+    guardkit_path: Path,
+    feature_id: str,
+    *,
+    cwd: Path,
+    env: Mapping[str, str],
+) -> str | None:
+    """Run ``guardkit feature validate <id> --json`` in ``cwd``; ``None`` or why not.
+
+    GuardKit's own full check of the feature it is about to build (task files,
+    schema, the ledger lint), run in the worktree at the admitted commit before
+    ``guardkit autobuild feature``. A failure stops the build with GuardKit's
+    own words.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            str(guardkit_path),
+            "feature",
+            "validate",
+            feature_id,
+            "--json",
+            cwd=str(cwd),
+            env=dict(env),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+    except (OSError, FileNotFoundError) as exc:
+        return f"guardkit feature validate could not be started: {exc!r}"
+    try:
+        out_bytes, _ = await asyncio.wait_for(
+            proc.communicate(), timeout=FEATURE_VALIDATE_TIMEOUT_SECONDS
+        )
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        return (
+            f"guardkit feature validate {feature_id} did not finish within "
+            f"{FEATURE_VALIDATE_TIMEOUT_SECONDS:.0f} seconds"
+        )
+    if proc.returncode == 0:
+        return None
+    said = out_bytes.decode("utf-8", errors="replace").strip()
+    try:
+        decoded = json.loads(said)
+    except ValueError:
+        decoded = None
+    if isinstance(decoded, dict):
+        errors = [str(e) for e in decoded.get("errors") or [] if str(e).strip()]
+        message = str(decoded.get("error_message") or "").strip()
+        said = "; ".join([*([message] if message else []), *errors]) or said
+    return (
+        f"guardkit feature validate refused {feature_id} at the admitted commit "
+        f"(exit={proc.returncode}): {said[-2000:] or 'no output'}"
+    )
+
+
 def _feature_task_ids(repo_path: Path, feature_id: str) -> list[str] | None:
     """Return the task ids declared in ``.guardkit/features/<feature_id>.yaml``.
 
@@ -3372,6 +3517,7 @@ async def _finalize_success_worktree(
     build_id: str,
     *,
     receipt_build_id: str | None = None,
+    source_branch: str | None = None,
 ) -> dict[str, Any] | None:
     """Success-path worktree finalization: export receipts, THEN remove.
 
@@ -3431,18 +3577,24 @@ async def _finalize_success_worktree(
         )
         return identity
 
-    await _remove_worktree(repo_path, worktree_path)
+    if source_branch is not None:
+        await _remove_worktree(repo_path, worktree_path, source_branch=source_branch)
+    else:
+        await _remove_worktree(repo_path, worktree_path)
     return None
 
 
-async def _remove_worktree(repo_path: Path, worktree_path: Path) -> None:
+async def _remove_worktree(
+    repo_path: Path, worktree_path: Path, *, source_branch: str | None = None
+) -> None:
     """Best-effort worktree removal — called ONLY on the success path.
 
     On failure the worktree is deliberately KEPT (see DEFECT #19: loud
     failures carry their own forensics), so this helper is never invoked
     there. A cleanup failure on the success path is logged at WARNING and
     swallowed — a leftover worktree does not regress a build that already
-    succeeded.
+    succeeded. ``source_branch`` — a prepared build's own
+    ``forge/source/<build_id>`` (4 October 2026) — is deleted with it.
     """
     code, output = await _run_git(
         ["worktree", "remove", "--force", str(worktree_path)],
@@ -3456,6 +3608,8 @@ async def _remove_worktree(repo_path: Path, worktree_path: Path) -> None:
             code,
             output,
         )
+        return
+    await _delete_source_branch(repo_path, source_branch)
 
 
 # ---------------------------------------------------------------------------
@@ -4277,7 +4431,60 @@ async def _run_one_build(state: AutobuildRunnerState) -> dict[str, Any]:
     # path so that launch is byte-identical. Set below and consumed when the
     # guardkit argv is assembled.
     base_branch: str | None = None
-    if isinstance(branch_raw, str) and branch_raw.strip():
+    # A PREPARED feature (4 October 2026): admission recorded the exact commit
+    # it was supplied at. The build makes its own local branch there, builds
+    # in a worktree at it and passes that branch as the base, so a queued
+    # branch that moves after admission changes nothing. Absent (every planned
+    # or hand-queued build), both arms below are exactly as before.
+    source_commit = _source_commit_for_build(payload)
+    source_branch: str | None = None
+    if source_commit is not None:
+        build_id = str(payload.get("build_id") or f"build-{feature_id}-pending")
+        if isinstance(branch_raw, str) and branch_raw.strip():
+            payload_branch = branch_raw.strip()
+        _claim_repository(repo_path, shared_checkout=False)
+        try:
+            await _sweep_prior_build_residue(
+                repo_path, feature_id, current_build_id=build_id
+            )
+        except PriorBuildSweepError as exc:
+            return _snapshot_update(
+                _build_failed_snapshot(
+                    payload,
+                    reason=(
+                        "refusing the fresh dispatch: a prior same-feature "
+                        f"build's residue could not be swept — {exc}"
+                    ),
+                )
+            )
+        await _sweep_build_refs(repo_path, feature_id)
+        refused = await _make_source_branch(repo_path, build_id, source_commit)
+        if refused is not None:
+            return _snapshot_update(
+                _build_failed_snapshot(payload, reason=refused)
+            )
+        source_branch = _source_branch_for(build_id)
+        base_branch = source_branch
+        try:
+            worktree_path = await _materialise_worktree(
+                repo_path, source_branch, build_id
+            )
+        except WorktreeMaterialisationError as exc:
+            await _delete_source_branch(repo_path, source_branch)
+            return _snapshot_update(
+                _build_failed_snapshot(payload, reason=str(exc))
+            )
+        run_cwd = worktree_path
+        logger.info(
+            "autobuild_runner: prepared feature_id=%s builds the admitted "
+            "commit %s on its own branch %s in worktree %s (queued branch %s)",
+            feature_id,
+            source_commit,
+            source_branch,
+            worktree_path,
+            payload_branch,
+        )
+    elif isinstance(branch_raw, str) and branch_raw.strip():
         branch = branch_raw.strip()
         base_branch = branch
         payload_branch = branch
@@ -4498,6 +4705,23 @@ async def _run_one_build(state: AutobuildRunnerState) -> dict[str, Any]:
         # different, without a single value reaching a log.
         ",".join(sorted(launch_env)),
     )
+
+    # GuardKit's own full check of a PREPARED feature, in the worktree at the
+    # admitted commit, before it is built (4 October 2026). In addition to
+    # admission's own checks, never instead of them. A failure stops the build
+    # with GuardKit's words; the worktree is kept for forensics.
+    if source_commit is not None and worktree_path is not None:
+        refused = await _guardkit_feature_validate(
+            guardkit_path, feature_id, cwd=worktree_path, env=launch_env
+        )
+        if refused is not None:
+            return _snapshot_update(
+                _build_failed_snapshot(
+                    payload,
+                    reason=_with_worktree_forensics(refused, worktree_path),
+                    worktree_path=worktree_path,
+                )
+            )
 
     # A build's clean-up under way in this runner (another build's cancel,
     # timeout or wedge): its place may already have been given to this one, so
@@ -5017,12 +5241,21 @@ async def _run_one_build(state: AutobuildRunnerState) -> dict[str, Any]:
     if worktree_path is not None:
         # FEAT-DRC: export the build's receipts BEFORE removal; on export
         # failure the worktree is kept (see _finalize_success_worktree).
-        retained_worktree = await _finalize_success_worktree(
-            repo_path,
-            worktree_path,
-            build_id,
-            receipt_build_id=receipt_build_id,
-        )
+        if source_branch is not None:
+            retained_worktree = await _finalize_success_worktree(
+                repo_path,
+                worktree_path,
+                build_id,
+                receipt_build_id=receipt_build_id,
+                source_branch=source_branch,
+            )
+        else:
+            retained_worktree = await _finalize_success_worktree(
+                repo_path,
+                worktree_path,
+                build_id,
+                receipt_build_id=receipt_build_id,
+            )
     else:
         retained_worktree = None
     # Compute aggregate_coach_score from the decision-bearing turns.
