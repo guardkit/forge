@@ -1016,6 +1016,15 @@ class TestTheAfterDeployCheckSentenceOnTheRoutineCard:
             "the spec named no address",
         ),
         (
+            {
+                "skipped": True,
+                "reason_code": "unsupported_address",
+                "address": {"method": "GET", "path": "/users?active=true"},
+            },
+            "the address /users?active=true has characters a check cannot "
+            "send as written",
+        ),
+        (
             {"skipped": True, "reason_code": "no_pass_bars"},
             "the plan registered no pass bars",
         ),

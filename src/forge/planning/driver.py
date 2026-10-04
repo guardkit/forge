@@ -69,6 +69,7 @@ from forge.pipeline.merge_offer import (
     SKIP_NO_REGISTRY,
     SKIP_NO_TEMPLATE,
     SKIP_PLACEHOLDER_IN_ADDRESS,
+    SKIP_UNSUPPORTED_ADDRESS,
     SKIP_UNSUPPORTED_METHOD,
     placeholders_in,
 )
@@ -365,10 +366,26 @@ _GATE_TEMPLATE_REQUEST_LITERAL = (
 #: never match; the leading ``\bA `` anchors the SPL criterion phrasing. Only a
 #: GET yields a v1 gate (expect_status 200); any other verb, a missing path, or a
 #: non-match yields None → an honest skip (never a guessed success status).
+#:
+#: The path is the WHOLE address as written — everything up to the next space,
+#: less closing sentence punctuation — never a partial match (4 October 2026,
+#: Codex R5). The earlier pattern stopped at the last word boundary and at the
+#: first dot, so ``/users/{user_id}`` was read as ``/users/{user_id`` and
+#: ``/v1.0/users/{user_id}`` as ``/v1``: a check against an address nobody
+#: named. :data:`_FEATURE_GATE_PLAIN_PATH_RE` then decides whether that whole
+#: address is one a check can send as written.
 _FEATURE_GATE_ENDPOINT_RE = re.compile(
-    r"\bA (?P<method>GET|POST|PUT|PATCH|DELETE) request to "
-    r"(?P<path>/[A-Za-z0-9_/{}-]*)\b"
+    r"\bA (?P<method>GET|POST|PUT|PATCH|DELETE) request to (?P<path>/\S*)"
 )
+
+#: Closing punctuation that ends a criterion sentence, not the address in it.
+_FEATURE_GATE_PATH_TRAILING = ".,;:!?)]\"'"
+
+#: A whole address a derived check can send exactly as written: a rooted path
+#: of letters, digits and ``_ . ~ / -`` (plus ``{}`` so a placeholder is seen
+#: whole and skipped by name, never cut short). Anything else in the address
+#: — a query string, an encoded character — is not checked automatically.
+_FEATURE_GATE_PLAIN_PATH_RE = re.compile(r"/[A-Za-z0-9_.~/{}-]+")
 
 
 class _FeatureGateFillError(Exception):
@@ -8898,7 +8915,9 @@ class PlanningRunDriver:
               ``{method,path}`` → honest ``skipped`` leg event and CONTINUE to
               the build (non-endpoint features are legitimate). The record
               says which: the spec named an address with another method
-              (``unsupported_method``, with that address) or named none
+              (``unsupported_method``, with that address), named a GET
+              address a check cannot send as written, such as one with a
+              query string (``unsupported_address``), or named none
               (``no_endpoint_named``). A GET address with a ``{placeholder}``
               in it is skipped too (``placeholder_in_address``): the filled
               check would send the placeholder as written and could never
@@ -8982,6 +9001,15 @@ class PlanningRunDriver:
                     "GET address can be checked automatically — no gate "
                     "registered",
                     reason_code=SKIP_UNSUPPORTED_METHOD,
+                    feature_id=feature_id,
+                    address=named,
+                )
+            if named is not None:
+                return self._skip_feature_gate(
+                    correlation_id,
+                    f"the spec names GET {named['path']}, which a check cannot "
+                    "send as written — no gate registered",
+                    reason_code=SKIP_UNSUPPORTED_ADDRESS,
                     feature_id=feature_id,
                     address=named,
                 )
@@ -9276,10 +9304,28 @@ class PlanningRunDriver:
             for crit in criteria:
                 if not isinstance(crit, Mapping) or str(crit.get("class")) != "machine":
                     continue
-                match = _FEATURE_GATE_ENDPOINT_RE.search(str(crit.get("text") or ""))
-                if match is not None:
-                    return {"method": match.group("method"), "path": match.group("path")}
+                named = PlanningRunDriver._address_in_criterion(
+                    str(crit.get("text") or "")
+                )
+                if named is not None:
+                    return named
         return None
+
+    @staticmethod
+    def _address_in_criterion(text: str) -> dict[str, str] | None:
+        """The method and the WHOLE address one criterion names, or None.
+
+        The whole address up to the next space, less closing sentence
+        punctuation, so ``/users/{user_id}.`` is ``/users/{user_id}`` and
+        ``/v1.0/users`` is ``/v1.0/users`` — never a partial match.
+        """
+        match = _FEATURE_GATE_ENDPOINT_RE.search(text)
+        if match is None:
+            return None
+        path = match.group("path").rstrip(_FEATURE_GATE_PATH_TRAILING)
+        if len(path) < 2:
+            return None
+        return {"method": match.group("method"), "path": path}
 
     @staticmethod
     def _feature_gate_endpoint_from_digest(digest_text: Any) -> dict[str, str] | None:
@@ -9341,11 +9387,18 @@ class PlanningRunDriver:
         matches AND the verb is GET (the sole verb whose happy-path status forge
         knows: 200). Any other verb, a missing path, wrong case, or mid-sentence
         prose returns None (skip — forge never guesses a success status).
+
+        The path is the whole address as written, and it must be one a check
+        can send as written (:data:`_FEATURE_GATE_PLAIN_PATH_RE`); a partial
+        match is never returned as if it were the endpoint. A placeholder is
+        returned whole, and the leg then skips it by name.
         """
-        match = _FEATURE_GATE_ENDPOINT_RE.search(text)
-        if match is None or match.group("method") != "GET":
+        named = PlanningRunDriver._address_in_criterion(text)
+        if named is None or named["method"] != "GET":
             return None
-        return {"method": "GET", "path": match.group("path")}
+        if _FEATURE_GATE_PLAIN_PATH_RE.fullmatch(named["path"]) is None:
+            return None
+        return {"method": "GET", "path": named["path"]}
 
     @staticmethod
     def _fill_feature_gate(
