@@ -107,6 +107,62 @@ class TestTheLeaseAndTheTurnNumber:
         assert store.renew_lease(build_id=BUILD, turn=grant.turn, now=_now()) is True
         assert store.read(BUILD).turn == grant.turn
 
+    def test_a_lease_put_down_is_taken_by_another_worker_at_once(
+        self, store: PublicationRecordStore
+    ) -> None:
+        """3 October 2026: the hold no longer has to be waited out."""
+        grant = store.take_lease(build_id=BUILD, holder="worker-a", now=_now())
+        assert (
+            store.release_lease(
+                build_id=BUILD, turn=grant.turn, holder="worker-a", now=_now()
+            )
+            is True
+        )
+        record = store.read(BUILD)
+        assert record.lease_holder is None
+        assert record.lease_expires_at is None
+        assert record.turn == grant.turn
+        second = store.take_lease(build_id=BUILD, holder="worker-b", now=_now())
+        assert second is not None
+        assert second.turn == grant.turn + 1
+
+    def test_only_the_holder_on_its_own_turn_can_put_it_down(
+        self, store: PublicationRecordStore
+    ) -> None:
+        first = store.take_lease(
+            build_id=BUILD, holder="worker-a", now=_now(), seconds=60
+        )
+        later = _now() + timedelta(seconds=120)
+        second = store.take_lease(build_id=BUILD, holder="worker-b", now=later)
+
+        # The replaced worker, on its old turn: nothing changes.
+        assert (
+            store.release_lease(
+                build_id=BUILD, turn=first.turn, holder="worker-a", now=later
+            )
+            is False
+        )
+        # Somebody else, on the current turn: nothing changes either.
+        assert (
+            store.release_lease(
+                build_id=BUILD, turn=second.turn, holder="worker-a", now=later
+            )
+            is False
+        )
+        record = store.read(BUILD)
+        assert record.lease_holder == "worker-b"
+        assert record.turn == second.turn
+        assert store.take_lease(build_id=BUILD, holder="worker-c", now=later) is None
+
+    def test_a_build_with_no_record_has_nothing_to_put_down(
+        self, store: PublicationRecordStore
+    ) -> None:
+        assert (
+            store.release_lease(build_id=BUILD, turn=1, holder="worker-a", now=_now())
+            is False
+        )
+        assert store.read(BUILD).recorded is False
+
 
 class TestAReplacedWorkersNextWriteChangesNoRow:
     def test_every_kind_of_write_is_refused_on_an_old_turn(

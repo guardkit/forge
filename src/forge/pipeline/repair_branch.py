@@ -524,6 +524,7 @@ def materialise_repair_branch_via_sidecar(
     message: str,
     post: Any = None,
     timeout_s: float = 120.0,
+    pinned_commit: str | None = None,
 ) -> RepairBranchResult:
     """Put ``files`` on ``repair/<task id>`` in the FACTORY'S clone, cut from
     ``base_branch`` there, through the deploy sidecar's own git routes.
@@ -545,6 +546,11 @@ def materialise_repair_branch_via_sidecar(
     ``post`` is the one HTTP seam, injectable so a test needs no socket.
     ``expected_base_commit`` applies the same exact-ref and ancestry checks as
     the local materialiser.
+
+    ``pinned_commit`` is the commit the remote has ``base_branch`` at, fetched
+    into the clone just before (a post-merge repair, 3 October 2026). The
+    branch is then cut from that commit rather than from the clone's local
+    ``base_branch``, which nothing brings up to date.
     """
     from forge.planning.sidecar_git_runner import _urllib_post
 
@@ -573,8 +579,18 @@ def materialise_repair_branch_via_sidecar(
         sha = answer.get("sha")
         return str(sha) if sha else None
 
-    base_ref = f"refs/heads/{base_branch}"
-    base_commit = sha_of(base_ref)
+    if pinned_commit is not None and expected_base_commit is not None:
+        raise ValueError("a repair base is either a retained candidate or pinned, not both")
+    if pinned_commit is not None:
+        base_commit = sha_of(pinned_commit)
+        if base_commit != pinned_commit:
+            raise RepairBranchError(
+                f"the commit {pinned_commit} the remote has {base_branch!r} at "
+                f"is not in the factory's clone of {repo} to cut the repair "
+                "branch from"
+            )
+    else:
+        base_commit = sha_of(f"refs/heads/{base_branch}")
     if base_commit is None:
         raise RepairBranchError(
             f"there is no branch called {base_branch!r} in the factory's clone "
