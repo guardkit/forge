@@ -238,6 +238,82 @@ def test_an_example_the_owner_asked_for_in_a_note_is_not_flagged(web_api_kinds) 
     assert _flags(told_not_to) == {"A POST request to the endpoint is rejected": (METHOD,)}
 
 
+def test_the_request_and_each_note_are_read_separately(web_api_kinds) -> None:
+    """A request with no closing full stop must not swallow the note after
+    it into its "Do not" sentence."""
+    feature = _feature(("A request for a different date range is rejected", ["When a date range is sent"]))
+    request = "Add GET /users/created-per-day. Do not write scenarios about date ranges"
+    told_not_to = review_examples(feature, request_text=request, kinds=web_api_kinds)
+    assert set(_flags(told_not_to)) == {"A request for a different date range is rejected"}
+    asked = review_examples(
+        feature, request_text=request, notes=["Please include one date range example."], kinds=web_api_kinds
+    )
+    assert asked.findings == []
+
+
+def test_a_listed_drop_and_a_word_ending_in_nt_license_nothing(web_api_kinds) -> None:
+    feature = _feature(
+        ("A POST request to the endpoint is rejected", ["When POST is sent"]),
+        ("Concurrent requests return consistent counts", ["When ten requests arrive at once"]),
+    )
+    notes = ["Two changes:\n- Drop the POST example\n- keep the rest", "It doesn't need concurrent handling."]
+    review = review_examples(feature, request_text=CREATED_PER_DAY, notes=notes, kinds=web_api_kinds)
+    assert set(_flags(review)) == {
+        "A POST request to the endpoint is rejected",
+        "Concurrent requests return consistent counts",
+    }
+    licensed = review_examples(
+        feature, request_text=CREATED_PER_DAY, notes=["Two changes:\n- keep the POST example"], kinds=web_api_kinds
+    )
+    assert set(_flags(licensed)) == {"Concurrent requests return consistent counts"}
+
+
+def test_a_hard_line_break_does_not_end_a_do_not_sentence(web_api_kinds) -> None:
+    """Measured cards 2940 and 2961 were typed with hard line breaks; the
+    "Do not" sentence runs across them."""
+    request = (
+        "Add a GET /users/created-per-day endpoint. Do not write scenarios about rejecting\n"
+        "unauthenticated requests, about other day counts, or about date ranges."
+    )
+    feature = _feature(("A request for a different date range is rejected", ["When a date range is sent"]))
+    assert set(_flags(review_examples(feature, request_text=request, kinds=web_api_kinds))) == {
+        "A request for a different date range is rejected"
+    }
+
+
+def _kind(*example_words: str):
+    words = example_words_from(
+        {"spec_examples": {"not_asked_for": [{"name": "k", "example_words": list(example_words)}]}}
+    )
+    assert words.kinds is not None
+    return words.kinds
+
+
+def test_a_star_on_its_own_spans_at_most_two_words() -> None:
+    kinds = _kind("database * unavailab*")
+    for text, flagged in (
+        ("Given the database is unavailable", True),
+        ("Given the database is briefly unavailable", True),
+        ("Given the database is very briefly unavailable", False),
+        ("Given the database and the cache and the queue are unavailable", False),
+    ):
+        review = review_examples(_feature(("One", [text])), request_text="Add GET /x.", kinds=kinds)
+        assert bool(review.findings) is flagged, text
+
+
+def test_a_phrase_ends_on_a_word_boundary() -> None:
+    kinds = _kind("405", "outage*")
+    for text, flagged in (
+        ("Then the reply is 405", True),
+        ("Then the reply carries id 4051", False),
+        ("Then the reply carries id x405", False),
+        ("Given an outage of the store", True),
+        ("Given outages", True),
+    ):
+        review = review_examples(_feature(("One", [text])), request_text="Add GET /x.", kinds=kinds)
+        assert bool(review.findings) is flagged, text
+
+
 def test_comments_and_tags_are_not_read() -> None:
     feature = (
         "Feature: f\n"

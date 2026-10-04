@@ -59,15 +59,23 @@ __all__ = [
 DECLARATION_KEY = "spec_examples"
 _KINDS_KEY = "not_asked_for"
 
-#: A word that makes the next three words negative ("takes no parameters").
-_NEGATION = re.compile(r"(no|not|without|never|nor|none)", re.IGNORECASE)
+#: A word that makes the next three words negative ("takes no parameters"),
+#: any word ending in n't ("doesn't") among them.
+_NEGATION = re.compile(r"(no|not|without|never|nor|none|\w+n['\u2019]t)", re.IGNORECASE)
 
 #: A sentence that tells the writer what NOT to do ("Do not write scenarios
 #: about date ranges") licenses nothing it names.
 _NEGATED_SENTENCE = re.compile(r"(do not|don't|never|no|drop|remove)\b", re.IGNORECASE)
 
-#: How a sentence ends, for finding the sentence a phrase is in.
-_SENTENCE_END = re.compile(r"[.!?]\s")
+#: How a sentence ends, for finding the sentence a phrase is in: a full
+#: stop, question or exclamation mark before a space, a blank line, or a line
+#: break before a list item. Not every line break: a request typed with hard
+#: line breaks ("Do not write scenarios about rejecting / unauthenticated
+#: requests, ... or about date ranges.") is still one sentence.
+_SENTENCE_END = re.compile(r"[.!?]\s|\n\s*\n|\n(?=\s*(?:[-*\u2022]|\d+[.)])\s)")
+
+#: A list marker at the start of a sentence ("- Drop the POST example").
+_BULLET = re.compile(r"^(?:[-*\u2022]|\d+[.)])\s*")
 
 #: The punctuation stripped from a word before asking if it is a negation.
 _EDGE_PUNCTUATION = ",.;:()\"“”"
@@ -191,6 +199,11 @@ def read_example_words(reader: Any) -> ExampleWords:
     from forge.planning.declared_memory import DECLARATION_PATH, _parse
 
     try:
+        # A sandbox reader's time allowance is per pass: the fact sheet's
+        # pass may have started minutes ago, before the spec writer ran.
+        begin = getattr(reader, "begin", None)
+        if callable(begin):
+            begin()
         text = reader.read_text(DECLARATION_PATH)
     except Exception as exc:  # noqa: BLE001 — a reader that fails is no check, said
         why = (str(exc) or type(exc).__name__)[:200]
@@ -217,7 +230,7 @@ def _uses(phrases: Sequence[str], text: str) -> bool:
             if any(_NEGATION.fullmatch(word.strip(_EDGE_PUNCTUATION)) for word in before):
                 continue
             sentence = _SENTENCE_END.split(text[: match.start()])[-1].strip().lower()
-            if _NEGATED_SENTENCE.match(sentence):
+            if _NEGATED_SENTENCE.match(_BULLET.sub("", sentence)):
                 continue
             return True
     return False
@@ -269,12 +282,16 @@ class ExampleReview:
     def flagged_titles(self) -> list[str]:
         return [finding.title for finding in self.findings]
 
+    def listed(self) -> list[str]:
+        """The note's list: each flagged example, word for word, and its kinds."""
+        lines = ["These worked examples look like things the request does not mention:"]
+        return lines + [f"- {finding.quoted}" for finding in self.findings]
+
     def note(self) -> str:
         """The machine's note to the spec writer. It never orders removal
         outright: the words can be wrong, so the writer may keep what the
         request needs, and says why in the example's own ``# Why:`` line."""
-        lines = ["These worked examples look like things the request does not mention:"]
-        lines += [f"- {finding.quoted}" for finding in self.findings]
+        lines = self.listed()
         lines += [
             "",
             "Remove each one unless the request needs it. If you keep one, quote "
@@ -328,11 +345,17 @@ def review_examples(
     and neither the request nor any note uses its request words. So an
     example the owner asked for in a note is never flagged.
     """
-    request = " ".join(" ".join([request_text or "", *[str(n) for n in notes]]).split())
+    # The request and each note are read separately, so one cannot end or
+    # negate a sentence of the other.
+    asked = [str(text) for text in (request_text, *notes) if text]
     review = ExampleReview()
     for title, text in worked_examples_in(feature_text):
         review.titles.append(title)
-        found = tuple(kind.name for kind in kinds if kind.in_example(text) and not kind.in_request(request))
+        found = tuple(
+            kind.name
+            for kind in kinds
+            if kind.in_example(text) and not any(kind.in_request(said) for said in asked)
+        )
         if found:
             review.findings.append(ExampleFinding(title, found))
     return review
