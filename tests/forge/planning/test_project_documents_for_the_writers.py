@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import posixpath
 import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
@@ -37,6 +38,7 @@ from typing import Any
 
 import pytest
 
+from forge.adapters.git.planning_runner import WorktreeGitRunner
 from forge.adapters.sqlite import connect as sqlite_connect
 from forge.cli._serve_planning import (
     build_feature_plan_command_args,
@@ -47,6 +49,11 @@ from forge.deploy.candidate_tree import FileAtCommit, RemoteStartPoint
 from forge.lifecycle import migrations
 from forge.pipeline.dispatchers.specialist import build_specialist_command
 from forge.pipeline.stage_taxonomy import StageClass
+from forge.planning.declared_memory import (
+    DeclaredPath,
+    DeclaredProjectDocuments,
+    read_declared_project_documents,
+)
 from forge.planning.driver import PlanningDriverDeps, PlanningRunDriver
 from forge.planning.gate_adapters import build_planning_gate_adapters
 from forge.planning.project_documents import (
@@ -85,27 +92,40 @@ def _sha(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# A committed tree, as the shared reader sees it
+# A committed tree, as the shared reader's raw read sees it
 # ---------------------------------------------------------------------------
 
 
 class _Tree:
-    """A stand-in for one repository's committed tree behind the shared reader.
+    """A stand-in for one repository's committed tree behind the raw read.
 
-    ``files`` maps a path to its text; ``links`` maps a path to a symbolic
-    link's target name. It answers exactly as the host reader and the sidecar
-    route do: an ordinary-file read of a link is refused, a plain read of a link
-    hands back the target's NAME, a missing path is ``found=False``.
+    ``files`` maps a path to its text; ``links`` maps a path (a file or a
+    folder) to a symbolic link's target name; ``broken`` maps a path to a
+    refusal. It answers as the host reader and the sidecar route do for a raw
+    read: a link is ``found`` with its target name and mode ``120000``, a
+    folder is ``found=False`` with mode ``040000``, nothing is ``found=False``.
+    A plain read (the settings file) answers the text as before.
     """
 
     def __init__(
         self,
         files: dict[str, str],
         links: dict[str, str] | None = None,
+        broken: dict[str, str] | None = None,
     ) -> None:
         self.files = dict(files)
         self.links = dict(links or {})
+        self.broken = dict(broken or {})
         self.reads: list[tuple[str, str, bool]] = []
+
+    def _mode(self, path: str) -> str | None:
+        if path in self.links:
+            return "120000"
+        if path in self.files:
+            return "100644"
+        if any(p.startswith(path + "/") for p in [*self.files, *self.links]):
+            return "040000"
+        return None
 
     async def read_file_at_commit(
         self,
@@ -114,127 +134,246 @@ class _Tree:
         file_path: str,
         *,
         ordinary_file_only: bool = False,
+        raw: bool = False,
     ) -> FileAtCommit:
-        self.reads.append((commit, file_path, ordinary_file_only))
-        if file_path in self.links:
-            if ordinary_file_only:
-                return FileAtCommit(
-                    refusal=(
-                        f"{file_path} at {commit} is a symbolic link, not an "
-                        f"ordinary file; a document the project's builds are "
-                        f"held to must be the file itself"
-                    )
-                )
-            return FileAtCommit(content=self.links[file_path], found=True)
-        if file_path not in self.files:
+        self.reads.append((commit, file_path, raw))
+        if file_path in self.broken:
+            return FileAtCommit(refusal=self.broken[file_path])
+        if not raw:
+            if file_path not in self.files:
+                return FileAtCommit(found=False)
+            return FileAtCommit(content=self.files[file_path], found=True)
+        mode = self._mode(file_path)
+        if mode is None:
             return FileAtCommit(found=False)
+        if mode == "040000":
+            return FileAtCommit(found=False, mode=mode)
+        if mode == "120000":
+            return FileAtCommit(content=self.links[file_path], found=True, mode=mode)
         return FileAtCommit(
-            content=self.files[file_path], found=True, ordinary=ordinary_file_only
+            content=self.files[file_path], found=True, ordinary=True, mode=mode
         )
 
 
 DECLARED = ("docs/constitution/mission.md", "docs/constitution/tech-stack.md")
 
 
+def _declared(
+    documents: tuple[str, ...] = DECLARED, instructions: tuple[str, ...] = ()
+) -> DeclaredProjectDocuments:
+    return DeclaredProjectDocuments(
+        instructions=tuple(
+            DeclaredPath(spelling=p, path=posixpath.normpath(p)) for p in instructions
+        ),
+        documents=tuple(
+            DeclaredPath(spelling=p, path=posixpath.normpath(p)) for p in documents
+        ),
+    )
+
+
+async def _read(tree: Any, declared: DeclaredProjectDocuments) -> tuple[Any, Any]:
+    return await read_project_documents_at_commit(
+        tree, repo_path="/r", commit=START, declared=declared
+    )
+
+
 # ---------------------------------------------------------------------------
-# The reader
+# What is declared (the opt-in, and GuardKit's allowed keys)
+# ---------------------------------------------------------------------------
+
+
+def test_nothing_is_judged_unless_binding_documents_are_declared() -> None:
+    """A malformed ``autobuild.player`` block without required_documents is
+    not this rule's business."""
+    for text in (
+        "memory:\n  project: p\n",
+        "autobuild:\n  player:\n    surprise: 1\n    instructions: nope\n",
+        "autobuild:\n  player:\n    required_documents: []\n    surprise: 1\n",
+        "autobuild: 7\n",
+    ):
+        assert read_declared_project_documents(text) == (DeclaredProjectDocuments(), None)
+
+
+def test_an_unknown_player_key_is_refused_when_documents_are_declared() -> None:
+    declared, why = read_declared_project_documents(
+        "autobuild:\n  player:\n    required_documents: [a.md]\n    surprise: 1\n"
+    )
+    assert declared == DeclaredProjectDocuments()
+    assert why is not None and "surprise" in why and "required_documents" in why
+
+
+def test_the_declared_lists_keep_their_spelling_and_order() -> None:
+    declared, why = read_declared_project_documents(
+        "autobuild:\n"
+        "  player:\n"
+        "    skills: [skills/a]\n"
+        "    instructions: [./docs/how-we-work.md, AGENTS.md]\n"
+        "    required_documents: [docs/b.md, ./docs/a.md]\n"
+    )
+    assert why is None
+    assert [(d.spelling, d.path) for d in declared.instructions] == [
+        ("./docs/how-we-work.md", "docs/how-we-work.md"),
+        ("AGENTS.md", "AGENTS.md"),
+    ]
+    assert [(d.spelling, d.path) for d in declared.documents] == [
+        ("docs/b.md", "docs/b.md"),
+        ("./docs/a.md", "docs/a.md"),
+    ]
+    _, why = read_declared_project_documents(
+        "autobuild:\n  player:\n    required_documents: [a.md]\n    skills: nope\n"
+    )
+    assert why is not None and "autobuild.player.skills" in why
+    _, why = read_declared_project_documents(
+        "autobuild:\n  player:\n    required_documents: [../a.md]\n"
+    )
+    assert why is not None and "not a path inside the repository" in why
+
+
+# ---------------------------------------------------------------------------
+# The reader: order, de-duplication, links, failures, budget
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_nothing_declared_reads_nothing() -> None:
     tree = _Tree({"AGENTS.md": AGENTS})
-    documents, why = await read_project_documents_at_commit(
-        tree, repo_path="/r", commit=START, declared=()
-    )
-    assert (documents, why) == ((), None)
+    assert await _read(tree, _declared(documents=())) == ((), None)
     assert tree.reads == []
 
 
 @pytest.mark.asyncio
-async def test_instruction_files_first_then_documents_in_declared_order() -> None:
+async def test_declared_instructions_then_conventional_files_then_documents() -> None:
     tree = _Tree(
         {
+            "docs/how-we-work.md": "# How we work\n",
             "AGENTS.md": AGENTS,
             ".claude/CLAUDE.md": "# Claude\n",
             DECLARED[0]: MISSION_V1,
             DECLARED[1]: TECH_V1,
         }
     )
-    documents, why = await read_project_documents_at_commit(
-        tree, repo_path="/r", commit=START, declared=(DECLARED[1], DECLARED[0])
+    documents, why = await _read(
+        tree,
+        _declared(
+            documents=(DECLARED[1], DECLARED[0]),
+            instructions=("./docs/how-we-work.md", ".claude/CLAUDE.md"),
+        ),
     )
     assert why is None
     assert [d.path for d in documents] == [
+        "./docs/how-we-work.md",  # the declared spelling is the label
+        ".claude/CLAUDE.md",  # declared, so not repeated among the conventional
         "AGENTS.md",
-        ".claude/CLAUDE.md",
         DECLARED[1],
         DECLARED[0],
     ]
-    mission = documents[3]
-    assert mission.receipt() == {
+    assert documents[4].receipt() == {
         "path": DECLARED[0],
         "sha256": _sha(MISSION_V1),
         "bytes": len(MISSION_V1.encode("utf-8")),
         "commit": START,
     }
-    # Every read was AT the commit the work starts from.
-    assert {commit for commit, _path, _ordinary in tree.reads} == {START}
-    # Each declared document was read as an ordinary file.
-    assert (START, DECLARED[0], True) in tree.reads
+    # Every read was a raw read AT the commit the work starts from.
+    assert {(commit, raw) for commit, _path, raw in tree.reads} == {(START, True)}
 
 
 @pytest.mark.asyncio
-async def test_instruction_files_resolving_to_one_file_count_once() -> None:
-    """CLAUDE.md is a link to AGENTS.md: delivered once, under AGENTS.md. A
-    link that leaves the repository, and a dangling one, are skipped."""
+async def test_a_declared_instruction_that_is_missing_is_refused() -> None:
+    tree = _Tree({DECLARED[0]: MISSION_V1})
+    documents, why = await _read(
+        tree, _declared(documents=(DECLARED[0],), instructions=("docs/how.md",))
+    )
+    assert documents == ()
+    assert why is not None and "docs/how.md" in why and "instructions" in why
+
+
+@pytest.mark.asyncio
+async def test_files_resolving_to_one_target_count_once_under_the_first_name() -> None:
     tree = _Tree(
         {"AGENTS.md": AGENTS, DECLARED[0]: MISSION_V1},
-        links={
-            "CLAUDE.md": "AGENTS.md",
-            ".claude/CLAUDE.md": "../../outside/CLAUDE.md",
-        },
+        links={"CLAUDE.md": "AGENTS.md"},
     )
-    documents, why = await read_project_documents_at_commit(
-        tree, repo_path="/r", commit=START, declared=(DECLARED[0],)
-    )
+    documents, why = await _read(tree, _declared(documents=(DECLARED[0],)))
     assert why is None
     assert [d.path for d in documents] == ["AGENTS.md", DECLARED[0]]
-    assert documents[0].text == AGENTS
     assert sum(d.bytes for d in documents) == len(AGENTS) + len(MISSION_V1)
 
-    dangling = _Tree(
-        {DECLARED[0]: MISSION_V1}, links={"AGENTS.md": "docs/not-there.md"}
-    )
-    documents, why = await read_project_documents_at_commit(
-        dangling, repo_path="/r", commit=START, declared=(DECLARED[0],)
-    )
+    # An instruction file linked to a declared document: once, first name.
+    tree = _Tree({DECLARED[0]: MISSION_V1}, links={"AGENTS.md": DECLARED[0]})
+    documents, why = await _read(tree, _declared(documents=(DECLARED[0],)))
     assert why is None
-    assert [d.path for d in documents] == [DECLARED[0]]
+    assert [(d.path, d.text) for d in documents] == [("AGENTS.md", MISSION_V1)]
 
 
 @pytest.mark.asyncio
-async def test_a_linked_instruction_file_inside_the_repository_is_followed() -> None:
+async def test_a_chain_of_links_and_a_linked_folder_are_followed_inside_the_commit() -> None:
     tree = _Tree(
-        {"docs/agents/AGENTS.md": AGENTS, DECLARED[0]: MISSION_V1},
-        links={"CLAUDE.md": "docs/agents/AGENTS.md"},
+        {"shared/claude/CLAUDE.md": "# Claude\n", "docs/agents.md": AGENTS, DECLARED[0]: MISSION_V1},
+        links={
+            ".claude": "shared/claude",  # a linked FOLDER
+            "AGENTS.md": "docs/a1.md",  # a chain: AGENTS.md -> a1 -> a2 -> agents.md
+            "docs/a1.md": "a2.md",
+            "docs/a2.md": "../docs/agents.md",
+        },
     )
-    documents, why = await read_project_documents_at_commit(
-        tree, repo_path="/r", commit=START, declared=(DECLARED[0],)
-    )
+    documents, why = await _read(tree, _declared(documents=(DECLARED[0],)))
     assert why is None
     assert [(d.path, d.text) for d in documents] == [
-        ("CLAUDE.md", AGENTS),
+        ("AGENTS.md", AGENTS),
+        (".claude/CLAUDE.md", "# Claude\n"),
         (DECLARED[0], MISSION_V1),
     ]
+
+
+@pytest.mark.parametrize(
+    ("links", "files", "said"),
+    [
+        ({"AGENTS.md": "../outside/AGENTS.md"}, {}, "outside the repository"),
+        ({"AGENTS.md": "/etc/passwd"}, {}, "outside the repository"),
+        ({".claude": "../../elsewhere"}, {}, "outside the repository"),
+        ({"AGENTS.md": "docs/not-there.md"}, {}, "target is not a file"),
+        ({"AGENTS.md": "CLAUDE.md", "CLAUDE.md": "AGENTS.md"}, {}, "a loop"),
+    ],
+    ids=["outside", "absolute", "linked-folder-outside", "missing-target", "loop"],
+)
+@pytest.mark.asyncio
+async def test_an_instruction_link_that_cannot_be_followed_refuses_the_run(
+    links: dict[str, str], files: dict[str, str], said: str
+) -> None:
+    tree = _Tree({DECLARED[0]: MISSION_V1, **files}, links=links)
+    documents, why = await _read(tree, _declared(documents=(DECLARED[0],)))
+    assert documents == ()
+    assert why is not None and said in why
+
+
+@pytest.mark.asyncio
+async def test_an_instruction_file_that_cannot_be_read_refuses_the_run() -> None:
+    tree = _Tree(
+        {"AGENTS.md": AGENTS, DECLARED[0]: MISSION_V1},
+        broken={"AGENTS.md": "the sandbox sidecar could not be reached"},
+    )
+    documents, why = await _read(tree, _declared(documents=(DECLARED[0],)))
+    assert documents == ()
+    assert why is not None and "AGENTS.md" in why and "could not be reached" in why
+
+
+@pytest.mark.asyncio
+async def test_an_answer_that_does_not_say_the_mode_is_refused() -> None:
+    """A reader that ignored the raw read (no mode) is never trusted."""
+
+    class _OldReader:
+        async def read_file_at_commit(self, *_a: Any, **_k: Any) -> FileAtCommit:
+            return FileAtCommit(content=MISSION_V1, found=True)
+
+    documents, why = await _read(_OldReader(), _declared(documents=(DECLARED[0],)))
+    assert documents == ()
+    assert why is not None and "exact bytes" in why
 
 
 @pytest.mark.asyncio
 async def test_a_missing_document_is_refused_by_name() -> None:
     tree = _Tree({DECLARED[0]: MISSION_V1})
-    documents, why = await read_project_documents_at_commit(
-        tree, repo_path="/r", commit=START, declared=DECLARED
-    )
+    documents, why = await _read(tree, _declared())
     assert documents == ()
     assert why is not None
     assert DECLARED[1] in why
@@ -248,9 +387,7 @@ async def test_a_symbolic_link_document_is_refused() -> None:
         {"docs/real-mission.md": MISSION_V1},
         links={DECLARED[0]: "../real-mission.md"},
     )
-    documents, why = await read_project_documents_at_commit(
-        tree, repo_path="/r", commit=START, declared=(DECLARED[0],)
-    )
+    documents, why = await _read(tree, _declared(documents=(DECLARED[0],)))
     assert documents == ()
     assert why is not None
     assert DECLARED[0] in why and "symbolic link" in why
@@ -260,15 +397,11 @@ async def test_a_symbolic_link_document_is_refused() -> None:
 async def test_over_the_budget_is_refused_naming_every_file_and_size() -> None:
     at_limit = "x" * (PROJECT_DOCUMENTS_BUDGET_BYTES - len(AGENTS))
     tree = _Tree({"AGENTS.md": AGENTS, DECLARED[0]: at_limit})
-    documents, why = await read_project_documents_at_commit(
-        tree, repo_path="/r", commit=START, declared=(DECLARED[0],)
-    )
+    documents, why = await _read(tree, _declared(documents=(DECLARED[0],)))
     assert why is None and sum(d.bytes for d in documents) == PROJECT_DOCUMENTS_BUDGET_BYTES
 
     tree.files[DECLARED[0]] = at_limit + "x"
-    documents, why = await read_project_documents_at_commit(
-        tree, repo_path="/r", commit=START, declared=(DECLARED[0],)
-    )
+    documents, why = await _read(tree, _declared(documents=(DECLARED[0],)))
     assert documents == ()
     assert why is not None
     assert str(PROJECT_DOCUMENTS_BUDGET_BYTES) in why
@@ -294,6 +427,127 @@ def test_a_recorded_document_whose_text_was_changed_does_not_come_back() -> None
     )
     record["text"] = MISSION_V1 + "edited\n"
     assert ProjectDocument.from_record(record) is None
+
+
+# ---------------------------------------------------------------------------
+# The exact committed bytes, through real git (the host reader)
+# ---------------------------------------------------------------------------
+
+
+def _commit_bytes(tmp_path: Path, files: dict[str, bytes], links: dict[str, str] | None = None) -> tuple[Path, str]:
+    repo = tmp_path / "bytes-repo"
+    repo.mkdir()
+    at_the_door._git(repo, "init", "-q", "-b", "main")
+    at_the_door._git(repo, "config", "core.autocrlf", "false")
+    for rel, data in files.items():
+        (repo / rel).parent.mkdir(parents=True, exist_ok=True)
+        (repo / rel).write_bytes(data)
+    for rel, target in (links or {}).items():
+        (repo / rel).parent.mkdir(parents=True, exist_ok=True)
+        (repo / rel).symlink_to(target)
+    at_the_door._git(repo, "add", "-A")
+    at_the_door._git(repo, "commit", "-qm", "bytes")
+    return repo, at_the_door._git(repo, "rev-parse", "HEAD")
+
+
+@pytest.mark.asyncio
+async def test_line_endings_are_kept_and_hashed_as_committed(tmp_path: Path) -> None:
+    crlf = b"# Mission\r\n\r\nServe the shop.\r\n"
+    lone_cr = b"# Tech\rone line\r"
+    unicode = "# Agents — café\n".encode("utf-8")
+    repo, sha = _commit_bytes(
+        tmp_path,
+        {DECLARED[0]: crlf, DECLARED[1]: lone_cr, "AGENTS.md": unicode},
+    )
+    runner = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+
+    documents, why = await read_project_documents_at_commit(
+        runner, repo_path=str(repo), commit=sha, declared=_declared()
+    )
+
+    assert why is None
+    by_path = {d.path: d for d in documents}
+    for path, data in ((DECLARED[0], crlf), (DECLARED[1], lone_cr), ("AGENTS.md", unicode)):
+        assert by_path[path].text.encode("utf-8") == data
+        assert by_path[path].sha256 == hashlib.sha256(data).hexdigest()
+        assert by_path[path].bytes == len(data)
+
+
+@pytest.mark.asyncio
+async def test_invalid_utf8_is_refused(tmp_path: Path) -> None:
+    repo, sha = _commit_bytes(
+        tmp_path, {DECLARED[0]: b"# Mission\n\xff\xfe not text\n"}
+    )
+    runner = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+
+    documents, why = await read_project_documents_at_commit(
+        runner, repo_path=str(repo), commit=sha, declared=_declared(documents=(DECLARED[0],))
+    )
+
+    assert documents == ()
+    assert why is not None and DECLARED[0] in why and "not UTF-8 text" in why
+
+
+@pytest.mark.asyncio
+async def test_the_budget_counts_raw_bytes(tmp_path: Path) -> None:
+    """Multi-byte characters count by their bytes: 16,385 three-byte
+    characters are 49,155 bytes, over the 49,152-byte budget."""
+    text = "—" * (PROJECT_DOCUMENTS_BUDGET_BYTES // 3 + 1)
+    repo, sha = _commit_bytes(tmp_path, {DECLARED[0]: text.encode("utf-8")})
+    runner = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+
+    documents, why = await read_project_documents_at_commit(
+        runner, repo_path=str(repo), commit=sha, declared=_declared(documents=(DECLARED[0],))
+    )
+
+    assert len(text) < PROJECT_DOCUMENTS_BUDGET_BYTES
+    assert documents == ()
+    assert why is not None and f"({len(text.encode('utf-8'))} bytes)" in why
+
+
+@pytest.mark.asyncio
+async def test_real_links_chains_and_linked_folders(tmp_path: Path) -> None:
+    repo, sha = _commit_bytes(
+        tmp_path,
+        {
+            "shared/claude/CLAUDE.md": b"# Claude\n",
+            "docs/agents.md": AGENTS.encode(),
+            DECLARED[0]: MISSION_V1.encode(),
+        },
+        links={
+            ".claude": "shared/claude",
+            "AGENTS.md": "docs/a1.md",
+            "docs/a1.md": "agents.md",
+            "CLAUDE.md": "AGENTS.md",
+        },
+    )
+    runner = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+
+    documents, why = await read_project_documents_at_commit(
+        runner, repo_path=str(repo), commit=sha, declared=_declared(documents=(DECLARED[0],))
+    )
+
+    assert why is None
+    assert [(d.path, d.text) for d in documents] == [
+        ("AGENTS.md", AGENTS),
+        (".claude/CLAUDE.md", "# Claude\n"),
+        (DECLARED[0], MISSION_V1),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_real_link_out_of_the_repository_is_refused(tmp_path: Path) -> None:
+    repo, sha = _commit_bytes(
+        tmp_path, {DECLARED[0]: MISSION_V1.encode()}, links={"AGENTS.md": "../../etc/hosts"}
+    )
+    runner = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+
+    documents, why = await read_project_documents_at_commit(
+        runner, repo_path=str(repo), commit=sha, declared=_declared(documents=(DECLARED[0],))
+    )
+
+    assert documents == ()
+    assert why is not None and "AGENTS.md" in why and "outside the repository" in why
 
 
 # ---------------------------------------------------------------------------
@@ -467,9 +721,10 @@ class _DocsGitRunner(door.RecordingGitRunner):
         file_path: str,
         *,
         ordinary_file_only: bool = False,
+        raw: bool = False,
     ) -> Any:
         return await self.tree.read_file_at_commit(
-            repo_path, commit, file_path, ordinary_file_only=ordinary_file_only
+            repo_path, commit, file_path, ordinary_file_only=ordinary_file_only, raw=raw
         )
 
 
@@ -704,8 +959,16 @@ async def test_a_project_that_declares_nothing_sends_what_it_always_sent(
             ),
             str(PROJECT_DOCUMENTS_BUDGET_BYTES),
         ),
+        (
+            lambda t: t.files.__setitem__(
+                ".guardkit/config.yaml",
+                DECLARES_DOCUMENTS + "    surprise: [x]\n",
+            ),
+            "surprise",
+        ),
+        (lambda t: t.broken.__setitem__("AGENTS.md", "sidecar unreachable"), "sidecar unreachable"),
     ],
-    ids=["missing", "symbolic-link", "over-budget"],
+    ids=["missing", "symbolic-link", "over-budget", "unknown-player-key", "unreadable-instruction"],
 )
 @pytest.mark.asyncio
 async def test_a_refusal_stops_the_run_before_any_model_is_asked(
@@ -763,3 +1026,48 @@ def test_the_generic_dispatcher_keeps_context_on_the_wire() -> None:
         extra_command_args=build_feature_spec_command_args(from_input="the input"),
     )
     assert "context" not in plain
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_player_key_without_documents_is_not_refused(
+    chain_store: SqlitePlanningRunStore,
+) -> None:
+    tree = _Tree(
+        {
+            ".guardkit/config.yaml": DECLARES_NOTHING
+            + "autobuild:\n  player:\n    surprise: [x]\n",
+            "AGENTS.md": AGENTS,
+        }
+    )
+    door._queue(chain_store)
+    h = _chain(chain_store, tree, answers=[door._answer("approve")])
+
+    await h.driver.drive(door.CID)
+
+    assert chain_store.get_run(door.CID)["state"] == PlanningState.BUILD_QUEUED.value
+    assert all("context" not in call for call in h.calls["spec"] + h.calls["plan"])
+
+
+@pytest.mark.asyncio
+async def test_a_run_past_the_door_before_documents_were_read_says_so_once(
+    chain_store: SqlitePlanningRunStore, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A run whose memory name was recorded before this change has no
+    documents record: nothing is read now (a re-drive never moves a run onto
+    what its project says today), its writers are sent none, and one log line
+    says so."""
+    tree = _declared_tree()
+    door._queue(chain_store)
+    chain_store.record_start_point(door.CID, start_commit=START, target_branch="main")
+    chain_store.record_memory_project(door.CID, memory_project="widget_shop")
+    chain_store.record_launch_settings(door.CID, names=[])
+    h = _chain(chain_store, tree, answers=[door._answer("approve")])
+
+    with caplog.at_level("INFO", logger="forge.planning.driver"):
+        await h.driver.drive(door.CID)
+
+    assert chain_store.get_run(door.CID)["state"] == PlanningState.BUILD_QUEUED.value
+    assert all("context" not in call for call in h.calls["spec"] + h.calls["plan"])
+    assert not any(raw for _c, _p, raw in tree.reads)
+    said = [r for r in caplog.records if "has no project documents recorded" in r.getMessage()]
+    assert len(said) == 1

@@ -1,45 +1,52 @@
 """The project's own documents, read at one commit for the planning writers.
 
-Project initialisation design, 4 October 2026, Part 3. A project names the
-documents its builds are held to in ``autobuild.player.required_documents``
-(the list GuardKit's Player already reads). The factory's spec writer and plan
-writer now receive the same documents, as text, read AT THE COMMIT THE WORK
-STARTS FROM — never the working folder, never a later commit — together with
-the repository instruction files GuardKit adds automatically (``AGENTS.md``,
-``CLAUDE.md``, ``.claude/CLAUDE.md``).
+Project initialisation design, 4 October 2026, Part 3, and its paragraph "One
+reading rule for every role". A project names the documents its builds are
+held to in ``autobuild.player.required_documents`` (the list GuardKit's Player
+already reads). The factory's spec writer and plan writer receive the same
+documents, as text, read AT THE COMMIT THE WORK STARTS FROM, under the same
+rule GuardKit applies for the Coach, so every role is given the same bytes:
 
-Opt-in, exactly as GuardKit's Coach delivery is: a project that declares no
-binding documents has nothing read and nothing sent, not even its instruction
-files, so its requests stay byte for byte what they were.
+1. *What is read, in order:* ``autobuild.player.instructions`` in declared
+   order; then ``AGENTS.md``, ``CLAUDE.md``, ``.claude/CLAUDE.md`` when present
+   and not already included; then ``required_documents`` in declared order.
+   Nothing is read unless ``required_documents`` is present and non-empty, and
+   then the ``autobuild.player`` block is held to GuardKit's allowed keys.
+2. *Bytes:* the raw committed bytes, decoded strictly as UTF-8 (invalid UTF-8
+   is refused), line endings kept; hash and size are of those bytes, and the
+   :data:`PROJECT_DOCUMENTS_BUDGET_BYTES` budget is the sum of raw sizes after
+   de-duplication.
+3. *Links:* a ``required_documents`` entry must be an ordinary file; a link is
+   refused. An instruction file may be a link: it is resolved inside the commit
+   the way a filesystem would (each path component, linked folders included,
+   chains of at most :data:`MAX_LINK_STEPS`); a target outside the repository,
+   a missing target or a loop is refused. Files that come to one target are
+   included once, under the first name.
+4. *Failures:* an instruction file that is absent is simply not included —
+   except one the project declared, which is refused; any other failure to read
+   an included file refuses the run. Labels keep the declared spelling.
 
-Rules, each refused before any model is asked anything:
-
-* a declared document must be present at that commit and be an ordinary file —
-  a symbolic link is refused by the shared committed-file reader's tree-mode
-  check (``read_file_at_commit(..., ordinary_file_only=True)``), so every role
-  reads the same bytes;
-* the instruction files plus the documents must come to at most
-  :data:`PROJECT_DOCUMENTS_BUDGET_BYTES`, the same figure GuardKit uses for the
-  Coach. A binding document silently cut short is worse than a refusal.
-
-An instruction file is optional. When it is a symbolic link it is followed
-only to a target inside the repository at that commit, and skipped otherwise;
-files that come to one target are delivered once, under the first name found.
-
-Nothing here raises: the answer is the documents, or one plain sentence.
+Every read is the shared committed-file reader's RAW read (``raw=True``), which
+reports the tree entry's mode; a link is followed only when the reader says
+the entry is one. Nothing here raises: the answer is the documents, or one
+plain sentence.
 """
 
 from __future__ import annotations
 
 import hashlib
-import posixpath
+from collections import deque
 from dataclasses import dataclass
 from typing import Any
 
-from forge.planning.declared_memory import BINDING_DOCUMENTS_FIELD
+from forge.planning.declared_memory import (
+    BINDING_DOCUMENTS_FIELD,
+    DeclaredProjectDocuments,
+)
 
 __all__ = [
     "INSTRUCTION_FILES",
+    "MAX_LINK_STEPS",
     "PROJECT_DOCUMENTS_BUDGET_BYTES",
     "ProjectDocument",
     "context_texts",
@@ -55,10 +62,23 @@ PROJECT_DOCUMENTS_BUDGET_BYTES: int = 48 * 1024
 #: in its order.
 INSTRUCTION_FILES: tuple[str, ...] = ("AGENTS.md", "CLAUDE.md", ".claude/CLAUDE.md")
 
+#: The most symbolic links one instruction file's path may pass through.
+MAX_LINK_STEPS: int = 8
+
+_ORDINARY_MODES = frozenset({"100644", "100755"})
+_LINK_MODE = "120000"
+_FOLDER_MODE = "040000"
+_INSTRUCTIONS_FIELD = "autobuild.player.instructions"
+
 
 @dataclass(frozen=True)
 class ProjectDocument:
-    """One document as read at one commit: its path, hash, size and text."""
+    """One document as read at one commit: its label, hash, size and text.
+
+    ``path`` is the name the document was included under, spelled as declared.
+    ``bytes`` and ``sha256`` are of the committed bytes, which are exactly the
+    text's UTF-8 encoding because the text was decoded strictly.
+    """
 
     path: str
     sha256: str
@@ -110,77 +130,155 @@ def context_texts(documents: tuple[ProjectDocument, ...] | list[ProjectDocument]
     return [f"File: {document.path}\n{document.text}" for document in documents]
 
 
-async def _read(
-    runner: Any, repo_path: str, commit: str, path: str, *, ordinary: bool
-) -> tuple[Any, str | None]:
-    """``(answer, None)`` or ``(None, why)`` — the reader asked once, never raising."""
-    read = getattr(runner, "read_file_at_commit", None)
-    if read is None:
-        return None, (
-            "the git runner wired for this factory cannot read a file at a "
-            "commit, so the project's documents cannot be read"
-        )
-    try:
-        if ordinary:
-            answer = await read(repo_path, commit, path, ordinary_file_only=True)
-        else:
-            answer = await read(repo_path, commit, path)
-    except Exception as exc:  # noqa: BLE001 — boundary
-        return None, f"{path} could not be read at {commit}: {type(exc).__name__}: {exc}"
-    return answer, None
+class _Refused(Exception):
+    """One plain sentence: why the documents cannot be given to the writers."""
 
 
-def _content(answer: Any) -> str:
-    content = getattr(answer, "content", None)
-    return content if isinstance(content, str) else ""
+class _Reader:
+    """The raw committed-file read, at one commit, refusing every failure."""
 
+    def __init__(self, runner: Any, repo_path: str, commit: str) -> None:
+        self._read = getattr(runner, "read_file_at_commit", None)
+        self._repo_path = repo_path
+        self.commit = commit
+        self.short = commit[:12]
 
-def _inside(path: str) -> bool:
-    return not (
-        path.startswith("/") or path in ("", ".", "..") or path.startswith("../")
-    )
+    async def __call__(self, path: str) -> Any:
+        if self._read is None:
+            raise _Refused(
+                "the git runner wired for this factory cannot read a file at a "
+                "commit, so the project's documents cannot be read"
+            )
+        try:
+            answer = await self._read(self._repo_path, self.commit, path, raw=True)
+        except Exception as exc:  # noqa: BLE001 — boundary
+            raise _Refused(
+                f"{path} could not be read at {self.short}: "
+                f"{type(exc).__name__}: {exc}"
+            ) from None
+        refusal = getattr(answer, "refusal", None)
+        if refusal:
+            raise _Refused(f"{path} could not be read at {self.short}: {refusal}")
+        found = bool(getattr(answer, "found", False))
+        mode = getattr(answer, "mode", None)
+        if found and not mode:
+            raise _Refused(
+                f"{path} could not be read at {self.short}: the reader did not "
+                f"say what kind of file it is or confirm its exact bytes"
+            )
+        if found and not isinstance(getattr(answer, "content", None), str):
+            raise _Refused(f"{path} could not be read at {self.short}: no contents")
+        return answer
 
 
 async def _instruction_file(
-    runner: Any, repo_path: str, commit: str, name: str
+    read: _Reader, spelling: str, path: str, *, declared: bool
 ) -> tuple[str, str] | None:
-    """``(resolved path, text)`` for one instruction file, or ``None`` to skip it.
+    """``(resolved path, text)`` for one instruction file, or ``None`` when an
+    undeclared one is absent. Resolved like a filesystem, inside the commit."""
+    pending: deque[str] = deque(path.split("/"))
+    resolved: list[str] = []
+    steps = 0
+    where = f"{_INSTRUCTIONS_FIELD}" if declared else "the repository's instruction files"
 
-    An ordinary file is read as it is. One whose ordinary-file read is refused
-    but whose plain read finds it is a symbolic link stored in git (its plain
-    read is the target's name): it is followed once, to an ordinary file inside
-    the repository, and skipped otherwise.
-    """
-    answer, why = await _read(runner, repo_path, commit, name, ordinary=True)
-    if why is not None or answer is None:
-        return None
-    if getattr(answer, "refusal", None) is None:
-        if getattr(answer, "found", False):
-            return name, _content(answer)
-        return None
-    plain, why = await _read(runner, repo_path, commit, name, ordinary=False)
-    if (
-        why is not None
-        or plain is None
-        or getattr(plain, "refusal", None)
-        or not getattr(plain, "found", False)
-    ):
-        return None
-    target = _content(plain).strip()
-    if not target or "\n" in target or target.startswith("/"):
-        return None
-    resolved = posixpath.normpath(posixpath.join(posixpath.dirname(name), target))
-    if not _inside(resolved):
-        return None
-    followed, why = await _read(runner, repo_path, commit, resolved, ordinary=True)
-    if (
-        why is not None
-        or followed is None
-        or getattr(followed, "refusal", None)
-        or not getattr(followed, "found", False)
-    ):
-        return None
-    return resolved, _content(followed)
+    def absent() -> None:
+        if steps:
+            raise _Refused(
+                f"the instruction file {spelling} is a symbolic link whose "
+                f"target is not a file at {read.short}"
+            )
+        if declared:
+            raise _Refused(
+                f"the project declares {spelling} in {_INSTRUCTIONS_FIELD}, but "
+                f"there is no such file at the commit this work starts from "
+                f"({read.short}). Commit it, or take it off the list, then ask "
+                f"again."
+            )
+
+    while pending:
+        part = pending.popleft()
+        if part in ("", "."):
+            continue
+        if part == "..":
+            if not resolved:
+                raise _Refused(
+                    f"the instruction file {spelling} ({where}) leads outside "
+                    f"the repository at {read.short}"
+                )
+            resolved.pop()
+            continue
+        candidate = "/".join([*resolved, part])
+        answer = await read(candidate)
+        found = bool(answer.found)
+        mode = answer.mode
+        if found and mode == _LINK_MODE:
+            steps += 1
+            if steps > MAX_LINK_STEPS:
+                raise _Refused(
+                    f"the instruction file {spelling} passes through more than "
+                    f"{MAX_LINK_STEPS} symbolic links at {read.short} (a loop?)"
+                )
+            target = str(answer.content)
+            if not target or target.startswith("/"):
+                raise _Refused(
+                    f"the instruction file {spelling} is a symbolic link to "
+                    f"{target!r}, which is outside the repository"
+                )
+            pending.extendleft(reversed(target.split("/")))
+            continue
+        last = not pending
+        if not last:
+            if not found and mode == _FOLDER_MODE:
+                resolved.append(part)
+                continue
+            absent()
+            return None
+        if not found:
+            if mode is not None:
+                raise _Refused(
+                    f"the instruction file {spelling} is not an ordinary file "
+                    f"at {read.short} (git mode {mode})"
+                )
+            absent()
+            return None
+        if mode not in _ORDINARY_MODES:
+            raise _Refused(
+                f"the instruction file {spelling} is not an ordinary file at "
+                f"{read.short} (git mode {mode})"
+            )
+        return candidate, str(answer.content)
+    raise _Refused(f"the instruction file {spelling} names no file")
+
+
+async def _binding_document(read: _Reader, spelling: str, path: str) -> str:
+    """The text of one declared binding document, which must be an ordinary file."""
+    answer = await read(path)
+    if answer.found and answer.mode == _LINK_MODE:
+        raise _Refused(
+            f"the project's binding document {spelling} (declared in "
+            f"{BINDING_DOCUMENTS_FIELD}) is a symbolic link at the commit this "
+            f"work starts from ({read.short}); a document the project's builds "
+            f"are held to must be the file itself"
+        )
+    if not answer.found:
+        if answer.mode is not None:
+            raise _Refused(
+                f"the project's binding document {spelling} (declared in "
+                f"{BINDING_DOCUMENTS_FIELD}) is not an ordinary file at "
+                f"{read.short} (git mode {answer.mode})"
+            )
+        raise _Refused(
+            f"the project declares {spelling} in {BINDING_DOCUMENTS_FIELD}, but "
+            f"there is no such file at the commit this work starts from "
+            f"({read.short}). Commit it, or take it off the list, then ask again."
+        )
+    if answer.mode not in _ORDINARY_MODES:
+        raise _Refused(
+            f"the project's binding document {spelling} (declared in "
+            f"{BINDING_DOCUMENTS_FIELD}) is not an ordinary file at "
+            f"{read.short} (git mode {answer.mode})"
+        )
+    return str(answer.content)
 
 
 async def read_project_documents_at_commit(
@@ -188,64 +286,47 @@ async def read_project_documents_at_commit(
     *,
     repo_path: str,
     commit: str,
-    declared: tuple[str, ...],
+    declared: DeclaredProjectDocuments,
 ) -> tuple[tuple[ProjectDocument, ...], str | None]:
-    """Read the instruction files and the ``declared`` documents at ``commit``.
+    """Read what ``declared`` names, by the one reading rule, at ``commit``.
 
-    ``declared`` is the project's binding-document list, already parsed (by
-    :func:`~forge.planning.declared_memory.read_declared_binding_documents`).
-    Empty means nothing declared: nothing is read and ``((), None)`` comes back.
-
-    Returns ``(documents, None)`` — instruction files first, then the declared
-    documents in their declared order — or ``((), why)``.
+    ``declared`` comes from
+    :func:`~forge.planning.declared_memory.read_declared_project_documents`;
+    no binding documents means nothing declared: nothing is read and
+    ``((), None)`` comes back. Otherwise ``(documents, None)`` in the rule's
+    order, or ``((), why)``.
     """
-    if not declared:
+    if not declared.documents:
         return (), None
-    short = commit[:12]
-
-    # The declared documents are read FIRST: each must be an ordinary file, and
-    # a helper too old to confirm that refuses here, before any instruction
-    # file's link check could be misled by it.
-    documents: dict[str, str] = {}
-    for path in declared:
-        answer, why = await _read(runner, repo_path, commit, path, ordinary=True)
-        if why is None and answer is not None:
-            why = getattr(answer, "refusal", None)
-        if why:
-            return (), (
-                f"the project's binding document {path} (declared in "
-                f"{BINDING_DOCUMENTS_FIELD}) cannot be used at the commit this "
-                f"work starts from ({short}): {why}"
+    read = _Reader(runner, repo_path, commit)
+    included: list[tuple[str, str, str]] = []  # (label, resolved, text)
+    try:
+        for entry in declared.instructions:
+            found = await _instruction_file(
+                read, entry.spelling, entry.path, declared=True
             )
-        if not getattr(answer, "found", False):
-            return (), (
-                f"the project declares {path} in {BINDING_DOCUMENTS_FIELD}, but "
-                f"there is no such file at the commit this work starts from "
-                f"({short}). Commit it, or take it off the list, then ask again."
-            )
-        documents[path] = _content(answer)
+            if found is not None:
+                included.append((entry.spelling, *found))
+        listed = {entry.path for entry in declared.instructions}
+        for name in INSTRUCTION_FILES:
+            if name in listed:
+                continue
+            found = await _instruction_file(read, name, name, declared=False)
+            if found is not None:
+                included.append((name, *found))
+        for entry in declared.documents:
+            text = await _binding_document(read, entry.spelling, entry.path)
+            included.append((entry.spelling, entry.path, text))
+    except _Refused as refused:
+        return (), str(refused)
 
     delivered: list[ProjectDocument] = []
     seen: set[str] = set()
-    for name in INSTRUCTION_FILES:
-        if name in documents:
-            # Declared as binding too: held to the document rules (read above),
-            # delivered in the instruction files' place.
-            resolved, text = name, documents[name]
-        else:
-            found = await _instruction_file(runner, repo_path, commit, name)
-            if found is None:
-                continue
-            resolved, text = found
+    for label, resolved, text in included:
         if resolved in seen:
             continue
         seen.add(resolved)
-        delivered.append(ProjectDocument.of(name, text, commit))
-    for path, text in documents.items():
-        if path in seen:
-            continue
-        seen.add(path)
-        delivered.append(ProjectDocument.of(path, text, commit))
+        delivered.append(ProjectDocument.of(label, text, commit))
 
     total = sum(document.bytes for document in delivered)
     if total > PROJECT_DOCUMENTS_BUDGET_BYTES:

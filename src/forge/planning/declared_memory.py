@@ -62,6 +62,9 @@ __all__ = [
     "DeclarationsAtCommit",
     "DeclaredLaunchSettings",
     "DeclaredMemory",
+    "DeclaredPath",
+    "DeclaredProjectDocuments",
+    "PLAYER_ALLOWED_KEYS",
     "LAUNCH_KEY",
     "MAX_DECLARATION_BYTES",
     "MAX_DECLARATION_DEPTH",
@@ -75,6 +78,7 @@ __all__ = [
     "read_declared_binding_documents",
     "read_declared_launch_settings",
     "read_declared_memory",
+    "read_declared_project_documents",
 ]
 
 
@@ -628,3 +632,96 @@ def read_declared_binding_documents(
         if normal not in paths:
             paths.append(normal)
     return tuple(paths), None
+
+
+#: The keys GuardKit's Player loader allows in ``autobuild.player``
+#: (guardkit ``orchestrator/harness/selector.py`` ``_PLAYER_PATH_FIELDS``).
+PLAYER_ALLOWED_KEYS: frozenset[str] = frozenset(
+    {"skills", "memory", "instructions", "protected_paths", "required_documents"}
+)
+
+
+@dataclass(frozen=True)
+class DeclaredPath:
+    """One declared path: as the project spelled it, and normalised to read."""
+
+    spelling: str
+    path: str
+
+
+@dataclass(frozen=True)
+class DeclaredProjectDocuments:
+    """``autobuild.player.instructions`` and ``required_documents``, in order."""
+
+    instructions: tuple[DeclaredPath, ...] = ()
+    documents: tuple[DeclaredPath, ...] = ()
+
+
+def read_declared_project_documents(
+    content: str | None,
+) -> tuple[DeclaredProjectDocuments, str | None]:
+    """What the one reading rule reads, as declared — or ``(empty, why)``.
+
+    Opt-in exactly as GuardKit is (the one reading rule, 4 October 2026):
+    unless ``autobuild.player.required_documents`` is present and non-empty
+    the answer is empty and nothing about the block is judged — a malformed
+    block is not this rule's business. When it is present, the
+    ``autobuild.player`` block is held to GuardKit's own checks: only its
+    allowed keys, and every path list a list of non-empty repository paths.
+    The two lists read here must also stay inside the repository. Spellings
+    are kept for labels. Never raises.
+    """
+    empty = DeclaredProjectDocuments()
+    if not content:
+        return empty, None
+    data, why_not = _parse(content)
+    if why_not is not None or data is None:
+        return empty, None
+    autobuild = data.get("autobuild")
+    player = autobuild.get("player") if isinstance(autobuild, dict) else None
+    declared = player.get("required_documents") if isinstance(player, dict) else None
+    if not declared:
+        return empty, None
+    assert isinstance(player, dict)
+    unknown = sorted(str(key) for key in set(player) - PLAYER_ALLOWED_KEYS)
+    if unknown:
+        return empty, (
+            f"`autobuild.player` in {DECLARATION_PATH} has unknown keys "
+            f"{unknown}; the allowed keys are {sorted(PLAYER_ALLOWED_KEYS)}"
+        )
+    lists: dict[str, tuple[DeclaredPath, ...]] = {}
+    for key in sorted(PLAYER_ALLOWED_KEYS):
+        raw = player.get(key)
+        if raw is None:
+            lists[key] = ()
+            continue
+        field = f"autobuild.player.{key}"
+        if not isinstance(raw, list):
+            return empty, (
+                f"`{field}` in {DECLARATION_PATH} is not a list of repository "
+                f"paths"
+            )
+        paths: list[DeclaredPath] = []
+        for index, value in enumerate(raw):
+            if not isinstance(value, str) or not value.strip():
+                return empty, (
+                    f"`{field}[{index}]` in {DECLARATION_PATH} is not a "
+                    f"repository path"
+                )
+            normal = posixpath.normpath(value)
+            if value.startswith("/") or (
+                key in ("instructions", "required_documents")
+                and (normal in (".", "..") or normal.startswith("../"))
+            ):
+                return empty, (
+                    f"`{field}[{index}]` in {DECLARATION_PATH} ({value!r}) is "
+                    f"not a path inside the repository"
+                )
+            paths.append(DeclaredPath(spelling=value, path=normal))
+        lists[key] = tuple(paths)
+    return (
+        DeclaredProjectDocuments(
+            instructions=lists["instructions"], documents=lists["required_documents"]
+        ),
+        None,
+    )
