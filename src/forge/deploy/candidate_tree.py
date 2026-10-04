@@ -692,6 +692,21 @@ def read_file_at_commit_sync(
                 )
             )
 
+        # A FILE, not a folder (4 October 2026, coach finding). ``cat-file -s``
+        # answers for a folder too (its tree object has a size) and ``git show``
+        # then prints the folder's listing as if it were the file, so a folder
+        # used to read back as "found". The object's type is asked first: only
+        # a blob is a file. No such path, and a folder, are both "not there".
+        typed = _run_git(
+            repo_root,
+            "cat-file",
+            "-t",
+            f"{commit}:{file_path}",
+            timeout=READ_AT_COMMIT_TIMEOUT_SECONDS,
+        )
+        if typed.returncode != 0 or (typed.stdout or "").strip() != "blob":
+            return FileAtCommit(found=False)
+
         sized = _run_git(
             repo_root,
             "cat-file",
@@ -700,8 +715,8 @@ def read_file_at_commit_sync(
             timeout=READ_AT_COMMIT_TIMEOUT_SECONDS,
         )
         if sized.returncode != 0:
-            # git says much the same for "no such path in that commit" and for
-            # "that path is a folder"; either way the file is not there.
+            # The blob was there a moment ago; whatever git now says, the
+            # file cannot be read as one.
             return FileAtCommit(found=False)
         try:
             size = int((sized.stdout or "").strip())
