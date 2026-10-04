@@ -1,5 +1,9 @@
 """Internal standard-library support for the rollout commands; not an application entry point.
 
+NOTE (3 October 2026): these rollout tools predate the coordinator's receipts
+folder bind and the extra memory allowed name, and will refuse the current
+bundle. The one-page upgrade does not use them.
+
 Artifact format 1: metadata.json describes the untouched forge.db and full work_state;
 previous-runtime.json contains environment NAMES only. ROLLOUT-SNAPSHOT.json binds
 both the original and migrated hashes. load-receipt.json never asserts service

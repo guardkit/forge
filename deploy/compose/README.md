@@ -57,8 +57,11 @@ sandbox should not have to comment anything out. The complete estate selects
 this file through COMPOSE_PROFILES. Follow ../estate/README.md; this is not a
 supported standalone startup route.
 
-**It is the only thing in this bundle that is given anything of the machine
-beyond Docker itself, and it is worth saying why that is allowed.** A sandbox
+**It is given more of the machine than anything else in this bundle, and it is
+worth saying why that is allowed.** (The others are file and folder binds the
+env file names: the coordinator's build receipts folder,
+`FORGE_RECEIPTS_HOST_DIR`, and the publisher's settings, credential and host
+keys files.) A sandbox
 is a small machine of its own, and the thing that makes sandboxes is the
 *sandbox daemon*, which runs on the host. There is no more to containerise
 about it than about the Docker daemon underneath this whole file. So the
@@ -165,7 +168,7 @@ their own compose files. They are named here by address, never started here.
 |---|---|---|
 | `forge-ledger` | the record and the companion files beside it | the coordinator |
 | `forge-settings` | the coordinator's settings file | nobody at run time — the machine puts it there before start |
-| `forge-evidence` | no longer mounted (3 October 2026): the coordinator binds the machine's build receipts folder, `FORGE_RECEIPTS_HOST_DIR`, at the same place instead, because that folder is where a build's runner in its sandbox writes; the volume is kept so its old entries are not lost | — |
+| `forge-evidence` | no longer used or declared (3 October 2026): the coordinator binds the machine's build receipts folder, `FORGE_RECEIPTS_HOST_DIR`, at the same place instead, because that folder is where a build's runner in its sandbox writes. The old volume is left on the machine, and its entries are copied into that folder once, without overwriting, at the upgrade | — |
 | `forge-home` | the coordinator's own small state | the coordinator |
 | `forge-publisher-state` | the publisher's own copies of projects' commits | the publisher (declared by the included fragment) |
 | `nats-jetstream` | the bus's own store | the bus (declared by the bus's own compose file) |
