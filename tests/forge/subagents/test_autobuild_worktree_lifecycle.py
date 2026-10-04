@@ -258,3 +258,25 @@ def test_git_invisible_special_entry_after_offer_preserves_owned_tree(
     assert inspect_autobuild_worktree(
         repo=repo, base=base, build_id=BUILD_ID, path=outer
     )["ok"] is False
+
+
+def test_a_prepared_builds_own_branch_goes_with_its_retired_worktree(
+    tmp_path: Path,
+) -> None:
+    """A prepared feature's build makes ``forge/source/<build_id>`` at the
+    admitted commit (4 October 2026); retiring its worktree deletes it. A
+    build without one reports exactly what it always did."""
+    repo, base, outer, _inner = _repo_with_nested(tmp_path)
+    _git(repo, "branch", f"forge/source/{BUILD_ID}", "main")
+    offered = inspect_autobuild_worktree(
+        repo=repo, base=base, build_id=BUILD_ID, path=outer
+    )
+    offered["cleanup_registrations"] = offered["nested_registrations"]
+
+    result = retire_autobuild_worktree(
+        repo=repo, base=base, build_id=BUILD_ID, path=outer, expected=offered
+    )
+
+    assert result["status"] == "removed", result
+    assert result["source_branch_removed"] == f"forge/source/{BUILD_ID}"
+    assert _git(repo, "branch", "--list", f"forge/source/{BUILD_ID}") == ""

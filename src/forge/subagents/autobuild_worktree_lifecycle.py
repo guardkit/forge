@@ -479,4 +479,14 @@ def retire_autobuild_worktree(
         detail="offer-pinned nested worktrees and outer worktree removed",
         after_capacity=_capacity(Path(str(before["base"]))),
     )
+    # A prepared feature's build makes its own local branch at the commit it
+    # was admitted at (``forge/source/<build_id>``, 4 October 2026); it goes
+    # with the worktree. Best effort: a branch that is not there, or cannot be
+    # deleted, changes nothing about the removal.
+    source = f"forge/source/{build_id}"
+    code, _ = _git(repo, "rev-parse", "--verify", "--quiet", f"refs/heads/{source}")
+    if code == 0:
+        deleted, _raw = _git(repo, "branch", "-D", source)
+        if deleted == 0:
+            report["source_branch_removed"] = source
     return report
