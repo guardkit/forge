@@ -22,6 +22,7 @@ hardening:
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -36,6 +37,19 @@ from forge.cli.runtime import build_cli_runtime
 from forge.lifecycle.state_machine import TERMINAL_STATES, BuildState
 
 __all__ = ["execute_cancel"]
+
+
+def _selected_config(ctx: Any) -> Any:
+    """The configuration this command was given (``--config`` / ./forge.yaml),
+    else the one ``FORGE_CONFIG_PATH`` names; ``None`` when there is none."""
+    if getattr(ctx, "obj", None) is not None:
+        return ctx.obj
+    path = os.environ.get("FORGE_CONFIG_PATH")
+    if not path or not Path(path).exists():
+        return None
+    from forge.config.loader import load_config
+
+    return load_config(Path(path))
 
 
 def execute_cancel(
@@ -100,10 +114,17 @@ def execute_cancel(
     # runner from the configuration this command was given, else the global
     # runner); the runner's own cancel handler stops everything it owns.
     # Best effort — the cancel itself proceeds either way.
-    if build.status not in TERMINAL_STATES:
-        asyncio.run(
-            interrupt_recorded_run(runtime.persistence, ctx.obj, build.build_id)
+    if build.status not in TERMINAL_STATES and not asyncio.run(
+        interrupt_recorded_run(
+            runtime.persistence, _selected_config(ctx), build.build_id
         )
+    ):
+        click.echo(
+            f"forge cancel: {build.build_id} — could not reach its runner; "
+            "nothing was cancelled — try again.",
+            err=True,
+        )
+        sys.exit(2)
 
     outcome = runtime.cli_steering_handler.handle_cancel(
         build_id=build.build_id,

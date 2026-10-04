@@ -110,6 +110,17 @@ async def interrupt_recorded_run(
             return True
         await client.runs.cancel(thread_id, run_id, action="interrupt")
     except Exception as exc:  # noqa: BLE001 — best effort, said once
+        status_code = getattr(getattr(exc, "response", None), "status_code", None)
+        if status_code in (404, 409):
+            # The right runner does not know the thread or run (it restarted)
+            # or the run already finished: there is nothing to interrupt.
+            logger.info(
+                "interrupt_recorded_run: no run to interrupt for build_id=%s "
+                "(the runner answered %s)",
+                build_id,
+                status_code,
+            )
+            return True
         logger.warning(
             "interrupt_recorded_run: could not interrupt the run of build_id=%s "
             "(%s: %s)",
@@ -141,14 +152,22 @@ async def launch_replacing_recorded_run(
     observer binds the relaunch's own thread and run (the runner stops the
     earlier run of the same build before the relaunch proceeds). If the
     launch raises, the earlier run — which may still be going after a
-    factory-only restart — is interrupted and the error re-raised. A build
-    with no recorded run is simply launched. ``False``: the earlier run's
-    identity could not be read or cleared, nothing was launched, and the
-    caller holds the build's message without acknowledging it.
+    factory-only restart — is interrupted and the error re-raised; if that
+    interrupt cannot be sent, the earlier run's rows are put back and
+    ``False`` returned instead. A build with no recorded run is simply
+    launched. ``False``: the caller holds the build's message without
+    acknowledging it (nothing launched, or the relaunch failed with the
+    earlier run unreachable).
     """
     try:
         thread_id, repo = _recorded(sqlite_pool, build_id)
+        kept: list[tuple[list[str], tuple[Any, ...]]] = []
         if thread_id:
+            cursor = sqlite_pool.connection.execute(
+                "SELECT * FROM async_tasks WHERE build_id = ?", (build_id,)
+            )
+            columns = [d[0] for d in cursor.description]
+            kept = [(columns, tuple(row)) for row in cursor.fetchall()]
             sqlite_pool.connection.execute(
                 "DELETE FROM async_tasks WHERE build_id = ?", (build_id,)
             )
@@ -164,9 +183,24 @@ async def launch_replacing_recorded_run(
     try:
         await launch()
     except Exception:
-        if thread_id:
-            await interrupt_recorded_run(
-                sqlite_pool, forge_config, build_id, thread_id=thread_id, repo=repo
+        if thread_id and not await interrupt_recorded_run(
+            sqlite_pool, forge_config, build_id, thread_id=thread_id, repo=repo
+        ):
+            # The earlier run may still be going and could not be told to
+            # stop: put its identity back and hold the message, so the next
+            # delivery tries again.
+            for columns, values in kept:
+                sqlite_pool.connection.execute(
+                    f"INSERT OR REPLACE INTO async_tasks ({', '.join(columns)}) "
+                    f"VALUES ({', '.join('?' * len(values))})",
+                    values,
+                )
+            logger.error(
+                "launch_replacing_recorded_run: the relaunch of build_id=%s "
+                "failed and its earlier run could not be interrupted; its "
+                "identity is restored and the message held WITHOUT ack",
+                build_id,
             )
+            return False
         raise
     return True
