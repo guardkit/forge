@@ -1588,8 +1588,17 @@ def _build_dispatch_build(
                 build_id,
                 outcome.value,
             )
-            if recovered:
-                await interrupt_recorded_run(sqlite_pool, forge_config, build_id)
+            if recovered and not await interrupt_recorded_run(
+                sqlite_pool, forge_config, build_id
+            ):
+                # The earlier run may still be going and could not be told to
+                # stop: hold its place (no ack); the redelivery tries again.
+                logger.error(
+                    "dispatch_build: the earlier run of build_id=%s could not "
+                    "be interrupted; holding the message WITHOUT ack",
+                    build_id,
+                )
+                return
             await ack_callback()
 
     return dispatch_build

@@ -704,11 +704,14 @@ async def _settle_strict_runless_builds_at_boot(
             sqlite_pool, forge_config, current.build_id
         ):
             # The interrupt could not be sent: its run may still be going, so
-            # its place is not let go. The row stays unsettled (its message
-            # unacknowledged) and the next boot or redelivery tries again.
+            # its place is not let go. The row stays unsettled and its message
+            # unacknowledged. Only the next boot tries again; until then (and
+            # for as long as the runner stays unreachable) a build of a
+            # refused repository keeps its place until `forge cancel` is run.
             logger.error(
                 "forge-serve: boot recovery could not interrupt the run of "
-                "refused build_id=%s; leaving it unsettled for a retry",
+                "refused build_id=%s; it keeps its place until the next boot "
+                "reaches its runner or `forge cancel` is run for it",
                 current.build_id,
             )
             continue

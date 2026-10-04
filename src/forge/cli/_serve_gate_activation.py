@@ -1232,6 +1232,10 @@ async def rearm_paused_gates(
     return tasks
 
 
+#: How often a re-armed card's refusal retries an interrupt it could not send.
+REARM_INTERRUPT_RETRY_SECONDS: float = 30.0
+
+
 async def _rearm_dispatch(
     *,
     deps: Any,
@@ -1278,7 +1282,18 @@ async def _rearm_dispatch(
     if sqlite_pool is not None and not outcome_launches(outcome):
         from forge.cli._recorded_run import interrupt_recorded_run
 
-        await interrupt_recorded_run(sqlite_pool, forge_config, snap.build_id)
+        # Until the interrupt can be sent, this task keeps trying: the earlier
+        # run must not be left going unasked once its card is refused.
+        while not await interrupt_recorded_run(
+            sqlite_pool, forge_config, snap.build_id
+        ):
+            logger.error(
+                "rearm_paused_gates: the earlier run of build_id=%s could not "
+                "be interrupted; trying again in %ss",
+                snap.build_id,
+                REARM_INTERRUPT_RETRY_SECONDS,
+            )
+            await asyncio.sleep(REARM_INTERRUPT_RETRY_SECONDS)
     if outcome_launches(outcome):
         logger.info(
             "rearm_paused_gates: build_id=%s approved post-restart "
@@ -1303,7 +1318,14 @@ async def _rearm_dispatch(
             # exactly as dispatch_build relaunches one (one code path).
             from forge.cli._recorded_run import launch_replacing_recorded_run
 
-            await launch_replacing_recorded_run(
+            if not await launch_replacing_recorded_run(
                 sqlite_pool, forge_config, snap.build_id, _launch
-            )
+            ):
+                # Nothing launched and the earlier run's identity is kept: the
+                # build is picked up again by the next boot's recovery.
+                logger.error(
+                    "rearm_paused_gates: build_id=%s was approved but not "
+                    "relaunched; held for the next boot's recovery",
+                    snap.build_id,
+                )
     return outcome
