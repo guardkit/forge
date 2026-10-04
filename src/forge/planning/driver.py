@@ -84,7 +84,7 @@ from forge.planning.checkpoint import (
 )
 from forge.planning.declared_memory import (
     read_declarations_at_commit,
-    read_declared_binding_documents,
+    read_declared_project_documents,
 )
 from forge.planning.project_documents import (
     ProjectDocument,
@@ -2626,6 +2626,7 @@ class PlanningRunDriver:
                 correlation_id,
                 recorded_name,
             )
+            self._say_once_when_no_documents_are_recorded(correlation_id)
             return str(recorded_name), tuple(recorded_settings)
 
         # The read itself is shared with the build admission of a feature
@@ -2698,9 +2699,9 @@ class PlanningRunDriver:
         """
         if self._project_documents_event(correlation_id) is not None:
             return True
-        declared, why = read_declared_binding_documents(config_text)
+        declared, why = read_declared_project_documents(config_text)
         documents: tuple[ProjectDocument, ...] = ()
-        if why is None and declared:
+        if why is None and declared.documents:
             documents, why = await read_project_documents_at_commit(
                 self._deps.git_runner,
                 repo_path=repo_path,
@@ -2710,7 +2711,7 @@ class PlanningRunDriver:
         if why is not None:
             await self._fail_leg(correlation_id, "target-terminal-enter", why)
             return False
-        if not declared:
+        if not declared.documents:
             return True
         self._deps.store._record_event(
             correlation_id=correlation_id,
@@ -2730,6 +2731,28 @@ class PlanningRunDriver:
             ", ".join(f"{d.path} ({d.bytes} bytes)" for d in documents),
         )
         return True
+
+    def _say_once_when_no_documents_are_recorded(self, correlation_id: str) -> None:
+        """One log line for a run past the door with no documents record.
+
+        Documents are read and recorded before the memory name, so such a run
+        either declares none or passed the door before documents were read (4
+        October 2026). Either way its writers are sent none, and nothing is
+        read now: a re-drive never moves a run onto what its project says
+        today. Said once per run per process.
+        """
+        said: set[str] = self.__dict__.setdefault("_no_documents_said", set())
+        if correlation_id in said:
+            return
+        if self._project_documents_event(correlation_id) is not None:
+            return
+        said.add(correlation_id)
+        logger.info(
+            "planning driver: run %s has no project documents recorded (its "
+            "project declares none, or its door ran before documents were "
+            "read); its spec and plan writers are sent none",
+            correlation_id,
+        )
 
     def _project_documents_event(self, correlation_id: str) -> Any | None:
         """The run's recorded project-documents row, or ``None``."""
