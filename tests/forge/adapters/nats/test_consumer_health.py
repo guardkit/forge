@@ -14,7 +14,9 @@ Test map:
 * :class:`TestInspectUnknown` — delivered None, consumer_info raises, and
   get_msg raising a non-NotFound error all ⇒ ``unknown`` (never phantom, never
   a cure).
-* :class:`TestPendingSeqArithmetic` — ``pending_seq == delivered.stream_seq``.
+* :class:`TestPendingSeqArithmetic` — with one outstanding message,
+  ``pending_seq == delivered.stream_seq`` (the probe asks for the next build
+  message from ``ack_floor + 1``, skipping foreign subjects).
 * :class:`TestCurePhantom` — delete called with (stream, durable); error ⇒
   ``False`` without raising; success ⇒ ``True``.
 """
@@ -58,11 +60,24 @@ class _FakeConsumerInfo:
         num_waiting: int | None = 0,
         num_pending: int | None = 0,
         delivered: _FakeSequenceInfo | None = None,
+        ack_floor: _FakeSequenceInfo | None = None,
     ) -> None:
         self.num_ack_pending = num_ack_pending
         self.num_waiting = num_waiting
         self.num_pending = num_pending
         self.delivered = delivered
+        self.ack_floor = ack_floor
+
+
+class _FakeRawMsg:
+    """Minimal stand-in for ``nats.js.api.RawStreamMsg`` (only seq used)."""
+
+    def __init__(self, seq: int) -> None:
+        self.seq = seq
+
+
+#: The probe looks for the next build-queued message from ack_floor + 1.
+FILTER = "pipeline.build-queued.*"
 
 
 def _make_js(
@@ -146,8 +161,9 @@ class TestInspectHeld:
                 num_waiting=1,
                 num_pending=0,
                 delivered=_FakeSequenceInfo(42),
+                ack_floor=_FakeSequenceInfo(40),
             ),
-            get_msg=object(),  # any non-exception return ⇒ message exists
+            get_msg=_FakeRawMsg(42),  # the held build message still exists
         )
 
         report = await inspect_ack_slot(js, STREAM, DURABLE)
@@ -155,7 +171,9 @@ class TestInspectHeld:
         assert report.status == "held"
         assert report.pending_seq == 42
         assert report.num_ack_pending == 1
-        js.get_msg.assert_awaited_once_with(STREAM, seq=42)
+        js.get_msg.assert_awaited_once_with(
+            STREAM, seq=41, subject=FILTER, next=True
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -172,6 +190,7 @@ class TestInspectPhantom:
                 num_waiting=1,
                 num_pending=0,
                 delivered=_FakeSequenceInfo(100),
+                ack_floor=_FakeSequenceInfo(99),
             ),
             get_msg=NotFoundError(),
         )
@@ -180,7 +199,9 @@ class TestInspectPhantom:
 
         assert report.status == "phantom"
         assert report.pending_seq == 100
-        js.get_msg.assert_awaited_once_with(STREAM, seq=100)
+        js.get_msg.assert_awaited_once_with(
+            STREAM, seq=100, subject=FILTER, next=True
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -257,6 +278,7 @@ class TestInspectUnknown:
                 num_ack_pending=1,
                 num_waiting=1,
                 delivered=_FakeSequenceInfo(11),
+                ack_floor=_FakeSequenceInfo(10),
             ),
             get_msg=TimeoutError("request timed out"),
         )
@@ -266,7 +288,9 @@ class TestInspectUnknown:
         # A non-NotFound API error must never be classified as phantom.
         assert report.status == "unknown"
         assert report.pending_seq == 11
-        js.get_msg.assert_awaited_once_with(STREAM, seq=11)
+        js.get_msg.assert_awaited_once_with(
+            STREAM, seq=11, subject=FILTER, next=True
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -283,21 +307,27 @@ class TestPendingSeqArithmetic:
     async def test_pending_seq_is_delivered_stream_seq(
         self, delivered_seq: int, expected_pending: int
     ) -> None:
-        # With max_ack_pending=1 the single outstanding message IS the
-        # last-delivered one. NOT ack_floor+1 (multi-subject streams put
-        # foreign consumed sequences in that gap — live-proven 2026-07-27).
+        # With one outstanding message it IS the last-delivered one. The
+        # gap after the ack floor can hold foreign subjects' sequences
+        # (live-proven 2026-07-27), so the probe asks for the next message
+        # on the build subject only; with a foreign gap it lands on the
+        # delivered one.
         js = _make_js(
             consumer_info=_FakeConsumerInfo(
                 num_ack_pending=1,
                 delivered=_FakeSequenceInfo(delivered_seq),
+                ack_floor=_FakeSequenceInfo(0),
             ),
-            get_msg=object(),  # present ⇒ held; we only assert the seq
+            get_msg=_FakeRawMsg(delivered_seq),
         )
 
         report = await inspect_ack_slot(js, STREAM, DURABLE)
 
+        assert report.status == "held"
         assert report.pending_seq == expected_pending
-        js.get_msg.assert_awaited_once_with(STREAM, seq=expected_pending)
+        js.get_msg.assert_awaited_once_with(
+            STREAM, seq=1, subject=FILTER, next=True
+        )
 
 
 # ---------------------------------------------------------------------------

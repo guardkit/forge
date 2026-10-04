@@ -19,6 +19,7 @@ from __future__ import annotations
 from forge.launch_environment import (
     GUARDKIT_FACTORY_LAUNCH_ENV,
     GUARDKIT_MEMORY_PROJECT_ENV,
+    GUARDKIT_RUN_OWNER_ENV,
     LAUNCH_SETTINGS,
     SETTINGS_DELIBERATELY_NOT_PASSED,
     build_launch_env,
@@ -43,6 +44,9 @@ PARENT = {
     "GUARDKIT_TIMEOUT_MULTIPLIER": "4.0",
     "GUARDKIT_AUTOBUILD_TASK_TIMEOUT_FLOOR": "900",
     "GUARDKIT_SDK_TIMEOUT": "1800",
+    "GUARDKIT_MAX_PARALLEL_TASKS": "2",
+    "GUARDKIT_WAVE_SAME_AREA": "parallel",
+    "GUARDKIT_PLAYER_MODEL_LIMITS": "another-model=4",
     "GUARDKIT_ARCH_CONFORMANCE_BLOCKING": "1",
     "GUARDKIT_ZERO_TEST_BLOCKING": "1",
     "GUARDKIT_BOOT_SMOKE_BLOCKING": "1",
@@ -133,7 +137,9 @@ def test_what_is_left_out_is_named_too() -> None:
 
 
 def test_the_launch_environment_is_exactly_the_list() -> None:
-    env = build_launch_env(parent=PARENT, memory_project="widget_shop")
+    env = build_launch_env(
+        parent=PARENT, memory_project="widget_shop", run_owner="build-FEAT-W-1"
+    )
 
     expected = set(launch_setting_names())
     assert set(env) == expected
@@ -310,3 +316,45 @@ def test_the_answer_is_a_new_dictionary_every_time() -> None:
     second = build_launch_env(parent=PARENT, memory_project="widget_shop")
 
     assert second["PATH"] == "/opt/venv/bin:/usr/bin"
+
+
+# ---------------------------------------------------------------------------
+# Concurrent builds (3 October 2026)
+# ---------------------------------------------------------------------------
+
+#: The build system's own concurrency settings. Written out here rather than
+#: imported from the build system, which this repository does not depend on.
+CONCURRENCY_SETTINGS = {
+    "GUARDKIT_MAX_PARALLEL_TASKS": "1",
+    "GUARDKIT_WAVE_SAME_AREA": "serial",
+    "GUARDKIT_PLAYER_MODEL_LIMITS": "a-model=2",
+}
+
+
+def test_the_build_systems_concurrency_settings_reach_the_build() -> None:
+    """How many tasks at once, whether two tasks in one area wait for each
+    other, and each model's own limit. Set on the machine, they reach the
+    build; unset, the build system keeps its own defaults."""
+    env = build_launch_env(parent={**PARENT, **CONCURRENCY_SETTINGS})
+    for name, value in CONCURRENCY_SETTINGS.items():
+        assert env[name] == value
+
+    unset = build_launch_env(
+        parent={k: v for k, v in PARENT.items() if k not in CONCURRENCY_SETTINGS}
+    )
+    for name in CONCURRENCY_SETTINGS:
+        assert name not in unset
+
+
+def test_the_run_owner_is_the_build_and_never_inherited() -> None:
+    """Which build this child belongs to, so its test fixtures carry the
+    build's own name and a stop can find every process it started. Decided
+    from the record like the memory name; one the launching process happens
+    to hold never decides it."""
+    parent = {**PARENT, GUARDKIT_RUN_OWNER_ENV: "somebody-elses-build"}
+
+    handed = build_launch_env(parent=parent, run_owner="build-FEAT-A-1")
+    none_given = build_launch_env(parent=parent)
+
+    assert handed[GUARDKIT_RUN_OWNER_ENV] == "build-FEAT-A-1"
+    assert GUARDKIT_RUN_OWNER_ENV not in none_given

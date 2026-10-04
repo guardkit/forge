@@ -111,6 +111,11 @@ class ServeConfig(BaseModel):
             fails fast at boot when the URL is missing (the in-process
             ASGI fallback path raises ``'NoneType' object is not
             callable`` on every dispatch otherwise).
+        max_concurrent_builds: How many builds may hold a place on the
+            build consumer at once; becomes the durable's
+            ``max_ack_pending``. Copied from ``forge.yaml``'s
+            ``pipeline.max_concurrent_builds`` by ``forge serve`` at boot.
+            Defaults to 1 (one build at a time, today's behaviour).
     """
 
     model_config = ConfigDict(extra="forbid", frozen=False)
@@ -128,6 +133,7 @@ class ServeConfig(BaseModel):
     autobuild_runner_url: str | None = Field(
         default=DEFAULT_AUTOBUILD_RUNNER_URL
     )
+    max_concurrent_builds: int = Field(default=1, ge=1)
 
     @classmethod
     def from_env(

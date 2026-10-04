@@ -102,6 +102,7 @@ __all__ = [
     "DECLARED_NAME_PATTERN",
     "GUARDKIT_FACTORY_LAUNCH_ENV",
     "GUARDKIT_MEMORY_PROJECT_ENV",
+    "GUARDKIT_RUN_OWNER_ENV",
     "LAUNCH_SETTINGS",
     "MAX_DECLARED_SETTINGS",
     "MAX_DECLARED_NAME_LENGTH",
@@ -130,6 +131,20 @@ GUARDKIT_MEMORY_PROJECT_ENV: str = "GUARDKIT_MEMORY_PROJECT"
 #: was handed, and runs with memory OFF when it was handed none. Every launch
 #: built here sets it, because every launch built here is a factory launch.
 GUARDKIT_FACTORY_LAUNCH_ENV: str = "GUARDKIT_FACTORY_LAUNCH"
+
+#: The setting that says WHICH BUILD a launch belongs to, added 3 October 2026
+#: for concurrent builds. With several builds in one sandbox, the build system
+#: names each build's test containers after it (so two builds never delete each
+#: other's database), copies it into the separate environment its start-up
+#: probe runs in, and a stop finds every process the build left running by it.
+#: Decided from the build's own record (its build ID), like the memory name,
+#: and never inherited.
+GUARDKIT_RUN_OWNER_ENV: str = "GUARDKIT_RUN_OWNER"
+
+#: The three settings decided per launch rather than taken from the parent.
+_DECIDED_PER_LAUNCH: frozenset[str] = frozenset(
+    {GUARDKIT_MEMORY_PROJECT_ENV, GUARDKIT_FACTORY_LAUNCH_ENV, GUARDKIT_RUN_OWNER_ENV}
+)
 
 
 #: Every setting a build is launched with, and why each one is there. The order
@@ -216,6 +231,27 @@ LAUNCH_SETTINGS: tuple[tuple[str, str], ...] = (
         "settings have set it since 18 September 2026, and leaving it off "
         "this list quietly put every build back on the shorter default",
     ),
+    # --- how much of one build runs at once (3 October 2026) ---------------
+    # Concurrent builds. Each is the build system's own setting, unset on this
+    # estate today, and unset keeps the build system's own default exactly. They
+    # are named here so that setting one on the machine reaches a build, rather
+    # than being quietly dropped by this list the way the time limits were.
+    (
+        "GUARDKIT_MAX_PARALLEL_TASKS",
+        "how many of one build's tasks run at once; with several builds "
+        "running, the owner may want each to take fewer, and a comparison of "
+        "build concurrency sets it to one so it measures builds, not tasks",
+    ),
+    (
+        "GUARDKIT_WAVE_SAME_AREA",
+        "whether two tasks of one build that touch the same part of the code "
+        "wait for each other; the build system's own choice when unset",
+    ),
+    (
+        "GUARDKIT_PLAYER_MODEL_LIMITS",
+        "how many calls each model may take at once from one build, so "
+        "several builds together do not crowd the one model seat",
+    ),
     # --- the switches the owner turned on ----------------------------------
     # These three are a class of their own, and the reason they are named here
     # is a fault this list caused on the day it was written. Each one is a
@@ -259,6 +295,12 @@ LAUNCH_SETTINGS: tuple[tuple[str, str], ...] = (
         "says a FACTORY launched this, so the build system uses only the name "
         "handed over above and never the declaration in the folder it happens "
         "to be pointed at; handed no name, it runs with memory off",
+    ),
+    (
+        GUARDKIT_RUN_OWNER_ENV,
+        "WHICH BUILD this is, from the build's own record: the build system "
+        "names its test containers after it so two builds never share or "
+        "remove each other's, and a stop finds this build's processes by it",
     ),
     (
         "FLEET_MEMORY_ENABLED",
@@ -447,6 +489,7 @@ def build_launch_env(
     parent: Mapping[str, str] | None = None,
     memory_project: str | None = None,
     declared: Sequence[str] | Iterable[str] | None = None,
+    run_owner: str | None = None,
 ) -> dict[str, str]:
     """The environment a build is launched with: the named list and nothing else.
 
@@ -470,6 +513,10 @@ def build_launch_env(
             with a warning; the door refuses such a name in plain words long
             before a launch, and this is the second fence rather than the
             first.
+        run_owner: The build this launch belongs to — its build ID, from the
+            build's own record (3 October 2026, concurrent builds). Set as
+            :data:`GUARDKIT_RUN_OWNER_ENV` when given; ``None`` leaves it
+            unset, and a value the parent happens to hold is never used.
 
     Returns:
         A new dictionary. A name the parent does not have is simply absent: an
@@ -479,7 +526,7 @@ def build_launch_env(
     source: Mapping[str, str] = os.environ if parent is None else parent
     env: dict[str, str] = {}
     for name, _reason in LAUNCH_SETTINGS:
-        if name in (GUARDKIT_MEMORY_PROJECT_ENV, GUARDKIT_FACTORY_LAUNCH_ENV):
+        if name in _DECIDED_PER_LAUNCH:
             continue  # decided below, never inherited
         value = source.get(name)
         if value is not None:
@@ -503,4 +550,6 @@ def build_launch_env(
     env[GUARDKIT_FACTORY_LAUNCH_ENV] = "1"
     if memory_project and str(memory_project).strip():
         env[GUARDKIT_MEMORY_PROJECT_ENV] = str(memory_project).strip()
+    if run_owner and str(run_owner).strip():
+        env[GUARDKIT_RUN_OWNER_ENV] = str(run_owner).strip()
     return env

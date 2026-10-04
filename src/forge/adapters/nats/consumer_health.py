@@ -3,45 +3,57 @@
 Background — the phantom-ack wedge (FEAT-PAC):
 
 The daemon's pull consumer (stream ``PIPELINE``, durable ``forge-serve`` by
-default) runs with ``max_ack_pending=1`` — deliberately strict serialization
-(ADR-ARCH-014). The ack for an accepted build is DEFERRED to the terminal
-publish (ADR-SP-013), so a daemon death in that window strands the single
-ack-pending slot. Pull consumers redeliver only on pulls, so all dispatch then
-jams silently. When the stranded message is later PURGED from the stream, the
-consumer keeps ``num_ack_pending == 1`` forever against a message that no longer
-exists — a *phantom ack* that no ack can ever release. Neither boot reconcile
-sees it (both read live/SQLite state, not the JetStream ack floor), so the wedge
-survived two restarts and 25h live before manual broker surgery cleared it.
+default) runs with ``max_ack_pending`` set to the configured build limit
+(``pipeline.max_concurrent_builds``, default 1 — strict one-at-a-time, as
+ADR-ARCH-014 had it). The ack for an accepted build is DEFERRED to the
+terminal publish (ADR-SP-013), so a daemon death in that window strands an
+ack-pending place. Pull consumers redeliver only on pulls, so dispatch can
+then jam silently. When a stranded message is later PURGED from the stream,
+some broker versions keep counting it as ack-pending forever against a
+message that no longer exists — a *phantom ack* that no ack can ever release.
+Neither boot reconcile sees it (both read live/SQLite state, not the
+JetStream ack floor), so the wedge survived two restarts and 25h live before
+manual broker surgery cleared it. (nats-server 2.11 clears the outstanding
+ack itself when the message is deleted or purged; 2.10 does not after
+``delete_msg``.)
 
 The discriminator (the load-bearing idea):
 
-With ``max_ack_pending=1`` the ack-pending set is a singleton — and the single
-outstanding message is exactly the LAST-DELIVERED one, so its stream sequence is
-recoverable from ``consumer_info`` alone::
+Every outstanding message was delivered after the consumer's ack floor and no
+later than its delivered watermark, so its stream sequence lies in::
 
-    pending_seq = delivered.stream_seq
+    ack_floor.stream_seq < seq <= delivered.stream_seq
 
-(:class:`~nats.js.api.ConsumerInfo.delivered` is an Optional
-:class:`~nats.js.api.SequenceInfo`; guard ``None``. NOT ``ack_floor + 1``: on a
-multi-subject stream the sequences between the consumer's ack floor and its
-delivered watermark belong to other subjects' consumed messages, so ``+1`` can
-point at a legitimately-deleted foreign message and misclassify a real held ack
-as a phantom — live-proven 2026-07-27 against a gate-paused build.) Then a single honest probe
-tells legitimate from phantom:
+(both are Optional :class:`~nats.js.api.SequenceInfo` on
+:class:`~nats.js.api.ConsumerInfo`.) The range also holds other subjects'
+messages — the stream is multi-subject, and a gate-paused build was once
+nearly misread as a phantom because ``ack_floor + 1`` pointed at a consumed
+jarvis-side message (live-proven 2026-07-27). So a single honest probe asks
+the stream for the first message on the consumer's own filter subject
+(``pipeline.build-queued.*``) at or after ``ack_floor + 1`` — JetStream's
+"next by subject" get:
 
-- ``js.get_msg('PIPELINE', seq=pending_seq)`` **succeeds** → the held message
-  still exists → a LEGITIMATE long-held ack (an in-flight or redeliverable
-  build). NEVER cure this: deleting the durable would drop its position and,
-  under ``DeliverPolicy.ALL``, replay history.
-- ``get_msg`` raises :class:`~nats.js.errors.NotFoundError` → the message is GONE
-  (purge or ``delete_msg`` hole) → **PHANTOM**: no ack can ever release the slot.
-  Cure by deleting the consumer.
+- a build message is found inside the range → at least one outstanding build
+  still exists → ``held``. NEVER cure: deleting the durable would drop real
+  held builds and, under ``DeliverPolicy.ALL``, replay history.
+- nothing is found, or only a message after the delivered watermark (waiting
+  work, not outstanding) → every outstanding message is GONE → **PHANTOM**:
+  no ack can ever release those places. Cure by deleting the consumer.
+
+With one outstanding message (the default limit) this gives exactly the old
+single-slot answer: the only build message in the range is the last-delivered
+one. Known limit with several outstanding: if one of them is a phantom and
+the others are real, the probe finds a real one and reports ``held``; the
+phantom cannot be singled out, so that one place stays lost until it is
+cleared by hand or every real build finishes. The watchdog shows the
+outstanding count against the configured limit so the loss is visible.
+Already-acknowledged build messages that the stream still keeps also read as
+``held`` — the safe direction (never a false phantom).
 
 The idle signature alone (``ack_pending>0 + waiting>0 + no deliveries for N
 min``) is IDENTICAL for a legitimate hours-long build and the phantom, so it may
-alarm but must NEVER auto-cure. ``get_msg`` is the only honest discriminator,
-and it is robust where a ``first_seq`` floor comparison would miss a single
-``delete_msg`` hole.
+alarm but must NEVER auto-cure. The stream probe is the only honest
+discriminator.
 
 Absence-of-failure discipline: any API error while inspecting yields ``unknown``
 (logged WARNING), never ``phantom`` — an inspection failure must never be
@@ -61,26 +73,32 @@ from nats.js.errors import NotFoundError
 
 logger = logging.getLogger(__name__)
 
+#: The build consumer's filter subject, used when the consumer's own config
+#: does not name one. Matches ``forge.cli._serve_daemon.BUILD_QUEUED_SUBJECT_FILTER``.
+DEFAULT_BUILD_SUBJECT_FILTER = "pipeline.build-queued.*"
+
 AckSlotStatus = Literal["healthy", "held", "phantom", "unknown", "absent"]
 
 
 @dataclass
 class AckSlotReport:
-    """The outcome of inspecting the consumer's single ack-pending slot.
+    """The outcome of inspecting the consumer's ack-pending build places.
 
     Attributes:
-        status: One of ``"healthy"`` (slot free — nothing ack-pending),
-            ``"held"`` (a real message occupies the slot — a legitimate
-            long-held ack), ``"phantom"`` (the ack-pending message is gone from
-            the stream — the wedge; safe to cure), ``"unknown"`` (the
-            inspection could not reach a verdict — an API error or a missing
-            ack-floor; never cured), or ``"absent"`` (the durable consumer does
+        status: One of ``"healthy"`` (nothing ack-pending — every place
+            free), ``"held"`` (at least one outstanding build message still
+            exists — a legitimate long-held ack), ``"phantom"`` (every
+            ack-pending message is gone from the stream — the wedge; safe to
+            cure), ``"unknown"`` (the inspection could not reach a verdict —
+            an API error or a missing delivered position; never cured), or
+            ``"absent"`` (the durable consumer does
             not exist — no ack slot at all; normal pre-first-attach and right
             after a cure deleted it).
-        pending_seq: The stream sequence of the ack-pending message
-            (``delivered.stream_seq`` — the singleton outstanding message is the
-            last-delivered one under ``max_ack_pending=1``), or ``None`` when
-            the slot is free or the sequence could not be derived.
+        pending_seq: For ``held``, the stream sequence of the outstanding
+            build message the probe found (with one outstanding message, the
+            last-delivered one). For ``phantom`` and probe errors, the
+            delivered watermark (``delivered.stream_seq``). ``None`` when
+            nothing is outstanding or the sequence could not be derived.
         num_ack_pending: ``ConsumerInfo.num_ack_pending`` (``0``/``None`` ⇒ free).
         num_waiting: ``ConsumerInfo.num_waiting`` (a parked pull is idle-good).
         num_pending: ``ConsumerInfo.num_pending`` (undelivered stream backlog).
@@ -96,11 +114,11 @@ class AckSlotReport:
 
 
 async def inspect_ack_slot(js, stream: str, durable: str) -> AckSlotReport:
-    """Inspect the durable's single ack-pending slot and classify it.
+    """Inspect the durable's ack-pending build places and classify them.
 
-    Reads ``consumer_info`` once, then — only when a slot is occupied — derives
-    the pending sequence and probes the stream with a single ``get_msg`` to tell
-    a legitimate held message from a phantom. Follows absence-of-failure
+    Reads ``consumer_info`` once, then — only when something is ack-pending —
+    probes the stream once with a "next by subject" ``get_msg`` from
+    ``ack_floor + 1`` to tell legitimately held builds from phantoms. Follows absence-of-failure
     discipline throughout: any API error yields ``unknown`` (logged), never a
     false ``phantom``, so an inspection hiccup can never trigger a cure.
 
@@ -178,21 +196,12 @@ async def inspect_ack_slot(js, stream: str, durable: str) -> AckSlotReport:
             ),
         )
 
-    # 3. Slot occupied ⇒ derive the pending sequence from the DELIVERED
-    #    watermark. With max_ack_pending=1 the single outstanding message is
-    #    exactly the last-delivered one, so pending_seq =
-    #    delivered.stream_seq. NOT ack_floor.stream_seq + 1: on a
-    #    MULTI-SUBJECT stream the sequences between the consumer's ack floor
-    #    and its delivered watermark belong to OTHER subjects (other
-    #    consumers' consumed-and-removed messages), so ack_floor+1 can point
-    #    at a legitimately-deleted foreign message and misclassify a REAL
-    #    held ack as a phantom. Live-proven 2026-07-27: a gate-paused build
-    #    held seq 653 while ack_floor+1 = 649 was a consumed jarvis-side
-    #    message already gone from the stream — the +1 formula would have
-    #    cured (deleted the consumer under) a legitimately paused build.
-    #    delivered is Optional; without it we cannot name the sequence to
-    #    probe, so we cannot honestly classify — report unknown, never
-    #    phantom.
+    # 3. Something is outstanding ⇒ name the range it must lie in. Every
+    #    outstanding message was delivered after the ack floor and no later
+    #    than the delivered watermark. Without the watermark we cannot bound
+    #    the range, so we cannot honestly classify — report unknown, never
+    #    phantom. A missing ack floor only widens the search (start at 1),
+    #    which can only turn a phantom into "held", never the reverse.
     delivered = info.delivered
     if delivered is None or delivered.stream_seq is None:
         logger.warning(
@@ -215,17 +224,135 @@ async def inspect_ack_slot(js, stream: str, durable: str) -> AckSlotReport:
             ),
         )
 
-    pending_seq = delivered.stream_seq
+    delivered_seq = delivered.stream_seq
+    ack_floor = getattr(info, "ack_floor", None)
+    floor_seq = getattr(ack_floor, "stream_seq", None) or 0
+    start_seq = floor_seq + 1
+    consumer_config = getattr(info, "config", None)
+    subject_filter = getattr(consumer_config, "filter_subject", None)
+    if not isinstance(subject_filter, str) or not subject_filter:
+        subject_filter = DEFAULT_BUILD_SUBJECT_FILTER
+    outstanding = (
+        f"{num_ack_pending} outstanding (stream sequences "
+        f"{start_seq}..{delivered_seq})"
+    )
+    if start_seq > delivered_seq:
+        # The broker says something is outstanding yet its ack floor is at or
+        # past everything delivered, so the range is empty. Fall back to the
+        # single probe at the delivered position — exactly the one-place check
+        # this module made before several places existed.
+        return await _probe_delivered(
+            js,
+            stream,
+            durable,
+            delivered_seq,
+            num_ack_pending=num_ack_pending,
+            num_waiting=num_waiting,
+            num_pending=num_pending,
+        )
 
-    # 4. Probe the stream for the held message. Present ⇒ legitimate hold;
-    #    NotFoundError ⇒ phantom; any other error ⇒ unknown (never phantom).
+    # 4. Probe the stream for the first build message from the ack floor on.
+    #    Found inside the range ⇒ held; NotFoundError, or the first one lies
+    #    beyond the delivered watermark ⇒ phantom; any other error ⇒ unknown
+    #    (never phantom).
+    try:
+        found = await js.get_msg(
+            stream, seq=start_seq, subject=subject_filter, next=True
+        )
+    except NotFoundError:
+        found = None
+    except Exception as exc:  # noqa: BLE001 — absence-of-failure: never claim phantom
+        logger.warning(
+            "ack-slot inspect: get_msg(%s, next %s from seq=%d) failed (%s: %s); "
+            "reporting status=unknown — an API error is not a phantom, so no "
+            "cure will be attempted",
+            stream,
+            subject_filter,
+            start_seq,
+            type(exc).__name__,
+            exc,
+        )
+        return AckSlotReport(
+            status="unknown",
+            pending_seq=delivered_seq,
+            num_ack_pending=num_ack_pending,
+            num_waiting=num_waiting,
+            num_pending=num_pending,
+            detail=(
+                f"consumer '{durable}' has {outstanding}, but probing stream "
+                f"'{stream}' for those build messages failed "
+                f"({type(exc).__name__}: {exc}) — cannot confirm whether they "
+                "are legitimate holds or phantoms"
+            ),
+        )
+
+    found_seq = getattr(found, "seq", None) if found is not None else None
+    if found is not None and not isinstance(found_seq, int):
+        # A message came back but its sequence is unreadable: it exists, so
+        # take the safe reading (held) and name the watermark.
+        found_seq = delivered_seq
+
+    if found_seq is None or found_seq > delivered_seq:
+        logger.error(
+            "ack-slot inspect: PHANTOM ack on consumer '%s' (stream '%s') — "
+            "%s, and no build message in that range still exists in the "
+            "stream; those places are wedged and no ack can release them",
+            durable,
+            stream,
+            outstanding,
+        )
+        return AckSlotReport(
+            status="phantom",
+            pending_seq=delivered_seq,
+            num_ack_pending=num_ack_pending,
+            num_waiting=num_waiting,
+            num_pending=num_pending,
+            detail=(
+                f"consumer '{durable}' has {outstanding}, but none of those "
+                f"build messages exists in stream '{stream}' any more (purged "
+                "or deleted) — this is a phantom ack and dispatch is wedged; "
+                "safe to cure by deleting the consumer"
+            ),
+        )
+
+    # A build message is still present in the range ⇒ at least one real,
+    # legitimately held build. Never cure this.
+    return AckSlotReport(
+        status="held",
+        pending_seq=found_seq,
+        num_ack_pending=num_ack_pending,
+        num_waiting=num_waiting,
+        num_pending=num_pending,
+        detail=(
+            f"consumer '{durable}' has {outstanding}; the build message at "
+            f"sequence {found_seq} still exists in stream '{stream}' — a "
+            "legitimate in-flight or redeliverable build; leave it alone"
+        ),
+    )
+
+
+async def _probe_delivered(
+    js,
+    stream: str,
+    durable: str,
+    pending_seq: int,
+    *,
+    num_ack_pending: int,
+    num_waiting: int,
+    num_pending: int,
+) -> AckSlotReport:
+    """Classify by probing the single delivered sequence (the one-place check).
+
+    Present ⇒ ``held``; :class:`NotFoundError` ⇒ ``phantom``; any other error
+    ⇒ ``unknown``. Used only when the ack floor and delivered position leave
+    no range to search.
+    """
     try:
         await js.get_msg(stream, seq=pending_seq)
     except NotFoundError:
         logger.error(
             "ack-slot inspect: PHANTOM ack on consumer '%s' (stream '%s') — "
-            "the ack-pending message at seq=%d is gone from the stream; the "
-            "single ack slot is wedged and no ack can release it",
+            "the ack-pending message at seq=%d is gone from the stream",
             durable,
             stream,
             pending_seq,
@@ -240,15 +367,13 @@ async def inspect_ack_slot(js, stream: str, durable: str) -> AckSlotReport:
                 f"consumer '{durable}' holds the ack slot for stream sequence "
                 f"{pending_seq}, but that message no longer exists in stream "
                 f"'{stream}' (purged or deleted) — this is a phantom ack and "
-                "the dispatch queue is wedged; safe to cure by deleting the "
-                "consumer"
+                "dispatch is wedged; safe to cure by deleting the consumer"
             ),
         )
     except Exception as exc:  # noqa: BLE001 — absence-of-failure: never claim phantom
         logger.warning(
             "ack-slot inspect: get_msg(%s, seq=%d) failed (%s: %s); reporting "
-            "status=unknown — an API error is not a phantom, so no cure will "
-            "be attempted",
+            "status=unknown — no cure will be attempted",
             stream,
             pending_seq,
             type(exc).__name__,
@@ -263,12 +388,9 @@ async def inspect_ack_slot(js, stream: str, durable: str) -> AckSlotReport:
             detail=(
                 f"consumer '{durable}' holds the ack slot for stream sequence "
                 f"{pending_seq}, but probing stream '{stream}' for that message "
-                f"failed ({type(exc).__name__}: {exc}) — cannot confirm whether "
-                "it is a legitimate hold or a phantom"
+                f"failed ({type(exc).__name__}: {exc})"
             ),
         )
-
-    # Message present ⇒ a real, legitimately held ack. Never cure this.
     return AckSlotReport(
         status="held",
         pending_seq=pending_seq,
@@ -278,8 +400,8 @@ async def inspect_ack_slot(js, stream: str, durable: str) -> AckSlotReport:
         detail=(
             f"consumer '{durable}' holds the ack slot for stream sequence "
             f"{pending_seq}, and that message still exists in stream "
-            f"'{stream}' — this is a legitimate in-flight or redeliverable "
-            "build; leave it alone"
+            f"'{stream}' — a legitimate in-flight or redeliverable build; "
+            "leave it alone"
         ),
     )
 

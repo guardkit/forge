@@ -74,6 +74,7 @@ from forge.adapters.guardkit.context_resolver import resolve_context_flags
 from forge.launch_environment import build_launch_env
 from forge.adapters.guardkit.models import GuardKitResult, GuardKitWarning
 from forge.adapters.guardkit.parser import parse_guardkit_output
+from forge.build_processes import signal_process_group
 
 logger = logging.getLogger(__name__)
 
@@ -251,65 +252,10 @@ def _resolve_guardkit_binary() -> tuple[str | None, list[str]]:
 # ---------------------------------------------------------------------------
 
 
-def _signal_process_group(proc: Any, sig: int) -> None:
-    """Signal the child's whole process group, never just the child.
-
-    The spawn runs with ``start_new_session=True``, so the child LEADS a
-    group of its own and this call cannot reach the forge daemon. That
-    pairing is the point: a ``guardkit`` leg spawns its own children (a
-    test runner, a harness), and ``Process.terminate()`` reaches exactly
-    one pid — the grandchildren survive, keep working, and keep the
-    child's pipes open.
-
-    **The pgid is the child's pid, and it is NOT read back from the
-    kernel.** ``start_new_session=True`` makes the child both session and
-    group leader, so ``pgid == pid`` by construction — and a process
-    group outlives its dead leader. The escalation step depends on
-    exactly that: by the time SIGKILL runs, the child is usually already
-    dead from the group SIGTERM *and reaped* by asyncio's child watcher,
-    so ``os.getpgid(pid)`` raises :class:`ProcessLookupError` and a
-    getpgid-first implementation signals NOTHING — not the group, not
-    even the child. That is the one case the SIGTERM → grace → SIGKILL
-    ladder exists for (a grandchild that ignored SIGTERM), so reading the
-    pgid back would disarm the ladder precisely when it matters.
-
-    A :class:`ProcessLookupError` from :func:`os.killpg` therefore means
-    what it says: **no process remains in the group** — nothing to signal.
-    (The pid is not reused while the child is unreaped, and after that the
-    window is the kill ladder's few seconds; the estate accepts that
-    residual over an escalation that never fires.) The child-alone
-    fallback is for the cases where a *group* signal is impossible but a
-    process may still be there: a platform with no :func:`os.killpg`, or a
-    permission/OS error from the group call. A failure to signal is
-    logged, never raised: this is the teardown half of a boundary whose
-    contract is "never raises".
-    """
-    pid = getattr(proc, "pid", None)
-    if pid is None:  # pragma: no cover — asyncio always sets pid
-        return
-    if hasattr(os, "killpg"):
-        try:
-            os.killpg(pid, sig)
-            return
-        except ProcessLookupError:
-            # The whole group is gone — nothing to signal, nothing to say.
-            return
-        except OSError as exc:
-            # PermissionError is an OSError subclass; one clause covers
-            # both, and the group signal failing is the only thing that
-            # makes the child-alone fallback below worth trying.
-            logger.warning(
-                "guardkit adapter: could not signal process group of pid=%s "
-                "(%s: %s) — falling back to the child alone; any "
-                "grandchildren it started may survive",
-                pid,
-                type(exc).__name__,
-                exc,
-            )
-    try:
-        proc.send_signal(sig)
-    except (ProcessLookupError, OSError):  # pragma: no cover — race only
-        return
+# The one copy lives beside the long-running build's stop (3 October 2026), so
+# the two never drift; the old name is kept because this module's callers and
+# tests use it.
+_signal_process_group = signal_process_group
 
 
 async def _bounded_post_kill_read(proc: Any) -> tuple[bytes, bytes, bool]:

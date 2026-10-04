@@ -8,7 +8,11 @@ Responsibilities (per TASK-NFI-007):
 - Build the durable pull-consumer :class:`~nats.js.api.ConsumerConfig` exactly as
   specified in API contract §2.2 (``durable="forge-consumer"``,
   ``max_ack_pending=1``, ``ack_wait=1h``, ``deliver_policy=ALL``,
-  ``ack_policy=EXPLICIT``, ``max_deliver=-1``).
+  ``ack_policy=EXPLICIT``, ``max_deliver=-1``). Note: ``forge serve`` does
+  not use this config or :func:`start_pipeline_consumer`; its durable is
+  ``forge-serve``, attached by ``forge.cli._serve_daemon._attach_consumer``
+  with ``max_ack_pending`` set to the configured build limit
+  (``pipeline.max_concurrent_builds``, default 1).
 - Validate every incoming :class:`~nats_core.events.BuildQueuedPayload` and
   reject malformed payloads, unrecognised originators, and ``feature_yaml_path``
   values outside the configured filesystem allowlist by acking the JetStream
@@ -30,7 +34,9 @@ production wiring binds them to the concrete adapters in
 ADR / contract anchors:
 
 - API contract: ``docs/design/contracts/API-nats-pipeline-events.md``
-- Sequential-build constraint: ADR-ARCH-014 (``max_ack_pending=1``)
+- Build limit: ``max_ack_pending`` is the configured number of builds that
+  may hold a place at once (``pipeline.max_concurrent_builds``); the default
+  of 1 is ADR-ARCH-014's one build at a time.
 - Terminal-only ack semantics: ADR-SP-013
 - Crash recovery: :func:`reconcile_on_boot` (added in TASK-NFI-009).
 """
@@ -210,6 +216,43 @@ class PipelineConsumerDeps:
     dispatch_build: DispatchBuild
     publish_build_failed: PublishBuildFailed
     register_ack_handle: InFlightAckRegistry | None = None
+    # A build refused before any build row is written (3 October 2026) —
+    # ``(correlation_id, reason) -> Any``, in production the work queue's
+    # ``record_build_rejection``. It notes the refusal on the sentence's queue
+    # row, so a row waiting "after" it is asked "hold or go" instead of
+    # waiting for ever. ``None`` notes nothing, as before.
+    record_build_rejection: Callable[[str, str], Any] | None = None
+
+
+def note_build_rejection(
+    record: Callable[[str, str], Any] | None, correlation_id: str, reason: str
+) -> bool:
+    """Note a build refused before its row was written. Never raises.
+
+    Returns whether the refusal may now be acknowledged: True when the note
+    was written, was already there, or there was nothing to note it on (no
+    recorder wired, no queue row filed under this correlation id). False when
+    writing it FAILED — a locked database, say. Then the caller must not
+    acknowledge: the message comes back, and its redelivery writes the note
+    (one per row, however often it is tried). Acknowledging instead would lose
+    the only durable sign of the refusal, and a row waiting "after" this one
+    would wait for ever.
+    """
+    if record is None:
+        return True
+    try:
+        record(correlation_id, reason)
+    except Exception as exc:  # noqa: BLE001 — answered as "hold", never raised
+        logger.warning(
+            "pipeline_consumer: could not note the refused build for "
+            "correlation_id=%s on the work queue (%s: %s); holding the "
+            "message WITHOUT ack so its redelivery writes the note",
+            correlation_id,
+            type(exc).__name__,
+            exc,
+        )
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -219,6 +262,10 @@ class PipelineConsumerDeps:
 
 def build_consumer_config() -> ConsumerConfig:
     """Return the durable pull-consumer config exactly as pinned by §2.2.
+
+    Not used by ``forge serve``, whose durable (``forge-serve``) is attached
+    by ``forge.cli._serve_daemon._attach_consumer`` with the configured
+    build limit. Left at ``max_ack_pending=1`` as the contract text records.
 
     Notes:
         ``filter_subject`` is set to the same subject as ``pull_subscribe``'s
@@ -479,6 +526,12 @@ async def handle_message(msg: _MsgLike, deps: PipelineConsumerDeps) -> None:
             payload.originating_adapter,
             payload.triggered_by,
         )
+        if not note_build_rejection(
+            deps.record_build_rejection,
+            payload.correlation_id,
+            f"it was sent by {originator}, which is not approved to start builds",
+        ):
+            return
         await msg.ack()
         await _safe_publish_failure(
             deps,
@@ -501,6 +554,13 @@ async def handle_message(msg: _MsgLike, deps: PipelineConsumerDeps) -> None:
             payload.feature_yaml_path,
             payload.feature_id,
         )
+        if not note_build_rejection(
+            deps.record_build_rejection,
+            payload.correlation_id,
+            f"its feature file {payload.feature_yaml_path} is outside the "
+            "folders builds may read",
+        ):
+            return
         await msg.ack()
         await _safe_publish_failure(
             deps,
@@ -591,9 +651,10 @@ async def handle_message(msg: _MsgLike, deps: PipelineConsumerDeps) -> None:
     except Exception as exc:
         # TASK-FW10-009 / Group C "dispatch error contained": the state
         # machine raised out of the dispatch path before reaching a
-        # terminal transition. We MUST stop the message from blocking
-        # the consumer (``max_ack_pending=1`` per ADR-ARCH-014) so the
-        # next delivered build is processed. Approach:
+        # terminal transition. We MUST stop the message from holding
+        # one of the consumer's build places (``max_ack_pending``, the
+        # configured build limit) so the next build can be delivered.
+        # Approach:
         #
         #   1. Log at WARNING with the failed identity for triage.
         #   2. Publish a terminal ``build-failed`` envelope (TASK-FORGE-
@@ -718,9 +779,12 @@ def _make_deferred_registration(
     works) — the same non-fatal posture the pre-relocation call had.
     """
 
-    async def _register() -> None:
+    async def _register() -> bool | None:
+        # Passes on the registry's answer: ``False`` means it refused this
+        # build because another build of the feature still has a live
+        # observer; the caller then waits instead of launching.
         try:
-            await register_ack_handle(feature_id, correlation_id, handle)
+            return await register_ack_handle(feature_id, correlation_id, handle)
         except Exception as reg_exc:  # noqa: BLE001 — non-fatal registration
             logger.warning(
                 "pipeline_consumer: deferred register_ack_handle raised (%s) "
@@ -730,6 +794,7 @@ def _make_deferred_registration(
                 feature_id,
                 correlation_id,
             )
+            return None
 
     return _register
 

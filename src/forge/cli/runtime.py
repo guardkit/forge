@@ -68,6 +68,8 @@ def _noop_async_call(*_args: object, **_kwargs: object) -> None:
 
 def _langgraph_interrupt_canceller(
     runner_url: str | None = None,
+    *,
+    runner_url_for_task: Callable[[str], str | None] | None = None,
 ) -> Callable[[str], bool]:
     """Production canceller for the ``cancel_async_task`` seam (FEAT-FCT).
 
@@ -88,7 +90,13 @@ def _langgraph_interrupt_canceller(
     """
 
     def _cancel(task_id: str) -> bool:
-        url = runner_url or os.environ.get("FORGE_AUTOBUILD_RUNNER_URL")
+        # The build's own runner first (its repository's sandbox runner, as
+        # the launch routed it), then the configured global one.
+        url = (
+            runner_url
+            or (runner_url_for_task(task_id) if runner_url_for_task else None)
+            or os.environ.get("FORGE_AUTOBUILD_RUNNER_URL")
+        )
         if not url:
             logger.warning(
                 "cancel_async_task: FORGE_AUTOBUILD_RUNNER_URL not set — "
@@ -144,6 +152,46 @@ def _langgraph_interrupt_canceller(
             return False
 
     return _cancel
+
+
+def _project_runner_url_for_task(
+    persistence: SqliteLifecyclePersistence,
+) -> Callable[[str], str | None]:
+    """The runner a task's build was launched on, when it is a sandbox's.
+
+    Reads the build's repository from the ledger and its sandbox runner from
+    the settings file (``FORGE_CONFIG_PATH``, else ``forge.yaml`` here);
+    ``None`` (the global runner) when either cannot be read.
+    """
+
+    def _resolve(task_id: str) -> str | None:
+        try:
+            row = persistence.connection.execute(
+                "SELECT b.repo FROM async_tasks a JOIN builds b "
+                "ON b.build_id = a.build_id WHERE a.task_id = ? LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if row is None or not row[0]:
+                return None
+            from forge.config.loader import load_config
+            from forge.config.sandboxes import sandbox_for
+
+            path = Path(os.environ.get("FORGE_CONFIG_PATH") or "forge.yaml")
+            if not path.exists():
+                return None
+            entry = sandbox_for(load_config(path), str(row[0]))
+        except Exception as exc:  # noqa: BLE001 — fall back to the global runner
+            logger.warning(
+                "cancel_async_task: could not resolve the project runner for "
+                "task_id=%s (%s: %s); using the global runner",
+                task_id,
+                type(exc).__name__,
+                exc,
+            )
+            return None
+        return str(getattr(entry, "runner_url", "") or "").strip() or None
+
+    return _resolve
 
 
 def _noop_synthetic_injector(_payload: object) -> None:
@@ -283,7 +331,10 @@ def build_cli_runtime(
         async_task_canceller=AsyncTaskCanceller(
             # FEAT-FCT: the production default issues a real langgraph
             # interrupt (was the _noop_async_call register-2b gap).
-            async_task_canceller or _langgraph_interrupt_canceller()
+            async_task_canceller
+            or _langgraph_interrupt_canceller(
+                runner_url_for_task=_project_runner_url_for_task(persistence)
+            )
         ),
         async_task_updater=AsyncTaskUpdater(async_task_updater or _noop_async_call),
         build_canceller=SqliteBuildCanceller(persistence),

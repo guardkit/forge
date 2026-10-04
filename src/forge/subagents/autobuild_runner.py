@@ -79,8 +79,10 @@ import os
 import re
 import shutil
 import sqlite3
+import threading
 import uuid
 from collections.abc import Mapping
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -101,7 +103,7 @@ from langgraph.graph.message import add_messages
 from pydantic import BaseModel, ConfigDict, Field
 from typing_extensions import NotRequired, Required, TypedDict
 
-from forge import receipts as _receipts
+from forge import build_processes, receipts as _receipts
 from forge.subagents import build_monitor
 from forge.subagents.autobuild_worktree_lifecycle import inspect_autobuild_worktree
 from forge.launch_environment import build_launch_env
@@ -2339,6 +2341,108 @@ def _worktree_min_available_bytes() -> int:
     return int(floor_gb * 1024**3)
 
 
+# ---------------------------------------------------------------------------
+# WHAT THE BUILDS IN ONE RUNNER SHARE (3 October 2026, concurrent builds)
+# ---------------------------------------------------------------------------
+#
+# A runner given several job slots (``--n-jobs-per-worker``) runs several
+# builds in this one process. Two things they share need more than a look:
+#
+# * THE REPOSITORY'S SHARED CHECKOUT. A launch that names no branch runs in it
+#   rather than in a worktree of its own (the legacy path below). Beside any
+#   other build of the same repository that would be two builds in one folder,
+#   so it is refused (R4 in the design). Every build says which repository it
+#   is building while it runs, so the check has something to look at.
+# * FREE DISK SPACE. The worktree check used to look at free space and nothing
+#   else, so two builds starting together could each see room for one and both
+#   start. Each started build now RESERVES the floor it was checked against,
+#   and a start counts the other builds' reservations as already spent.
+#
+# Both are held by the build's own claim, created when the build's node starts
+# and released in its ``finally`` however the build ends. They are this
+# process's own: a runner that restarts has no builds running, and holds
+# nothing.
+
+#: Guards the two tables below. Held only for a few dictionary operations and
+#: one free-space reading, never across an ``await``.
+_RUNNER_SHARED_LOCK = threading.Lock()
+
+#: Repository checkout (resolved) -> the claims of the builds now running on it.
+_ACTIVE_BUILDS_BY_REPO: dict[Path, set["_BuildClaim"]] = {}
+
+#: A running build's claim -> the bytes of free space reserved for it.
+_DISK_RESERVATIONS: dict["_BuildClaim", int] = {}
+
+
+class _BuildClaim:
+    """What one running build holds in this runner, released when it ends."""
+
+    __slots__ = ("build_id", "repo")
+
+    def __init__(self, build_id: str) -> None:
+        self.build_id = build_id
+        self.repo: Path | None = None
+
+    def release(self) -> None:
+        with _RUNNER_SHARED_LOCK:
+            if self.repo is not None:
+                builds = _ACTIVE_BUILDS_BY_REPO.get(self.repo)
+                if builds is not None:
+                    builds.discard(self)
+                    if not builds:
+                        del _ACTIVE_BUILDS_BY_REPO[self.repo]
+                self.repo = None
+            _DISK_RESERVATIONS.pop(self, None)
+
+
+#: The claim of the build this task is running, set by
+#: :func:`_node_running_wave`. ``None`` outside a build's node (a direct call
+#: in a test), where nothing is claimed or reserved.
+_CURRENT_BUILD_CLAIM: ContextVar[_BuildClaim | None] = ContextVar(
+    "forge_autobuild_current_build_claim", default=None
+)
+
+
+def _claim_repository(repo_path: Path, *, shared_checkout: bool) -> str | None:
+    """Record that this build is working on ``repo_path``; ``None`` when it may.
+
+    Returns the plain reason a launch that would run in the repository's
+    SHARED checkout is refused while another build of the same repository is
+    running in this runner. A build that has its own worktree is never refused
+    here; it is recorded so a later shared-checkout launch can see it.
+    """
+    claim = _CURRENT_BUILD_CLAIM.get()
+    key = Path(repo_path).resolve()
+    with _RUNNER_SHARED_LOCK:
+        others = sorted(
+            other.build_id
+            for other in _ACTIVE_BUILDS_BY_REPO.get(key, set())
+            if other is not claim
+        )
+        if shared_checkout and others:
+            return (
+                f"refusing to run this build in the shared checkout {key}: "
+                f"another build of this repository is running in this runner "
+                f"({', '.join(others)}), and a launch that names no branch would "
+                "run in the same folder. Launch it with its branch so it gets a "
+                "worktree of its own."
+            )
+        if claim is not None and claim.repo is None:
+            claim.repo = key
+            _ACTIVE_BUILDS_BY_REPO.setdefault(key, set()).add(claim)
+    return None
+
+
+def _running_in_this_runner(build_id: str) -> bool:
+    """Whether a build with this ID is running in this runner right now."""
+    with _RUNNER_SHARED_LOCK:
+        return any(
+            claim.build_id == build_id
+            for claims in _ACTIVE_BUILDS_BY_REPO.values()
+            for claim in claims
+        )
+
+
 async def _materialise_worktree(
     repo_path: Path, branch: str, build_id: str
 ) -> Path:
@@ -2361,9 +2465,26 @@ async def _materialise_worktree(
     base = _worktree_base_dir()
     from forge.subagents.autobuild_worktree_lifecycle import inspect_worktree_capacity
 
-    capacity = inspect_worktree_capacity(
-        base, min_available_bytes=_worktree_min_available_bytes()
-    )
+    # A RESERVATION, NOT A LOOK (3 October 2026, concurrent builds). The free
+    # space other builds running in this runner have reserved counts as spent,
+    # and this build reserves its own floor in the same step, so two builds
+    # starting together cannot both pass on room for one. Released with the
+    # build's claim. A call outside a build's node reserves nothing.
+    min_available_bytes = _worktree_min_available_bytes()
+    claim = _CURRENT_BUILD_CLAIM.get()
+    with _RUNNER_SHARED_LOCK:
+        reserved_by_others = sum(
+            reserved
+            for holder, reserved in _DISK_RESERVATIONS.items()
+            if holder is not claim
+        )
+        capacity = inspect_worktree_capacity(
+            base,
+            min_available_bytes=min_available_bytes,
+            reserved_bytes=reserved_by_others,
+        )
+        if capacity.get("ok") and claim is not None:
+            _DISK_RESERVATIONS[claim] = min_available_bytes
     if not capacity.get("ok"):
         raise WorktreeMaterialisationError(
             "autobuild worktree capacity preflight refused the build before "
@@ -3259,7 +3380,11 @@ async def _finalize_success_worktree(
     forensics posture; the F3 preflight prune does not delete directories,
     and a kept tree never regresses a succeeded build).
     """
-    result = _export_receipts(worktree_path, receipt_build_id or build_id)
+    # Off the event loop (3 October 2026, concurrent builds): the export copies
+    # whole folders, and every other build in this runner shares the loop.
+    result = await asyncio.to_thread(
+        _export_receipts, worktree_path, receipt_build_id or build_id
+    )
     if not result.ok:
         logger.warning(
             "autobuild_runner: keeping worktree %s — receipts were not "
@@ -3654,7 +3779,15 @@ async def _sweep_prior_build_residue_impl(
         # positively says "live" withholds the sweep (see
         # :func:`_prior_build_status`).
         status = _prior_build_status(prior_build_id)
-        if status in _LIVE_BUILD_STATUSES:
+        # A build running in THIS runner is live whatever the ledger says
+        # (3 October 2026, concurrent builds): inside a sandbox there is no
+        # ledger to read, so the answer above is None there, and two builds of
+        # one feature can now overlap in one runner.
+        if status not in _LIVE_BUILD_STATUSES and _running_in_this_runner(
+            prior_build_id
+        ):
+            status = "RUNNING in this runner"
+        if status in _LIVE_BUILD_STATUSES or status == "RUNNING in this runner":
             logger.warning(
                 "autobuild_runner: requeue sweep — prior build %s is still "
                 "LIVE (ledger status=%s); its residue at %s is left ENTIRELY "
@@ -3759,7 +3892,9 @@ async def _sweep_prior_build_residue_impl(
                 prior_build_id,
                 _receipts_root(),
             )
-        _export_prior_build_evidence(
+        # Off the event loop, like the removal below: it copies the tree.
+        await asyncio.to_thread(
+            _export_prior_build_evidence,
             outer_root,
             prior_build_id,
             feature_id,
@@ -3819,7 +3954,10 @@ async def _sweep_prior_build_residue_impl(
             )
 
         try:
-            shutil.rmtree(outer_root, ignore_errors=False)
+            # Off the event loop (3 October 2026, concurrent builds): a whole
+            # kept worktree can take seconds to delete, and every other build
+            # in this runner shares the loop.
+            await asyncio.to_thread(shutil.rmtree, outer_root, ignore_errors=False)
         except FileNotFoundError as exc:
             if outer_root.exists():
                 # A FileNotFoundError with the root STILL PRESENT is a
@@ -3998,7 +4136,37 @@ def _build_failed_snapshot(
     return snapshot
 
 
-async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
+async def _running_wave_body(state: AutobuildRunnerState) -> dict[str, Any]:
+    """Run one build (:func:`_run_one_build`) holding its claim in this runner.
+
+    Called by :func:`_node_running_wave`, which forgets the run's process
+    record afterwards; this layer holds the repository and disk claim.
+
+    3 October 2026, concurrent builds: a runner with several job slots runs
+    several builds in this process, and what they share — the repository's
+    shared checkout and the free disk space — is claimed per build (see
+    :class:`_BuildClaim`). The claim is made here and released in ``finally``
+    however the build ends, so a finished, failed or cancelled build never
+    holds a repository or a reservation.
+    """
+    payload = _extract_launch_payload(list(state.get("messages", [])))
+    # The same name the build's worktree is given, so the same-feature sweep
+    # can tell a running build's worktree by it.
+    claim = _BuildClaim(
+        str(
+            payload.get("build_id")
+            or f"build-{str(payload.get('feature_id') or '').strip()}-pending"
+        )
+    )
+    token = _CURRENT_BUILD_CLAIM.set(claim)
+    try:
+        return await _run_one_build(state)
+    finally:
+        _CURRENT_BUILD_CLAIM.reset(token)
+        claim.release()
+
+
+async def _run_one_build(state: AutobuildRunnerState) -> dict[str, Any]:
     """Invoke ``guardkit autobuild`` against the resolved local checkout.
 
     TASK-ABW-001 — replaces the previous lifecycle-stub body with the
@@ -4114,6 +4282,9 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
         base_branch = branch
         payload_branch = branch
         build_id = str(payload.get("build_id") or f"build-{feature_id}-pending")
+        # Recorded so a later launch with no branch can see this build is
+        # working on the repository (never refused: it gets its own worktree).
+        _claim_repository(repo_path, shared_checkout=False)
         if not await _local_branch_exists(repo_path, branch):
             return _snapshot_update(
                 _build_failed_snapshot(
@@ -4168,6 +4339,14 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
             repo_path,
         )
     else:
+        # R4 (3 October 2026, concurrent builds): the shared checkout is one
+        # folder, so this path is refused while another build of the same
+        # repository is running in this runner.
+        shared_refusal = _claim_repository(repo_path, shared_checkout=True)
+        if shared_refusal is not None:
+            return _snapshot_update(
+                _build_failed_snapshot(payload, reason=shared_refusal)
+            )
         run_cwd = repo_path
         logger.info(
             "autobuild_runner: legacy shared-checkout mode feature_id=%s cwd=%s "
@@ -4298,7 +4477,12 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
     # them belongs to.
     declared_settings = _launch_settings_for_build(payload)
     launch_env = build_launch_env(
-        memory_project=memory_project, declared=declared_settings
+        memory_project=memory_project,
+        declared=declared_settings,
+        # Which build this child belongs to (3 October 2026, concurrent
+        # builds): its test containers are named after it and a stop finds its
+        # processes by it. From the payload's build ID, never inherited.
+        run_owner=payload.get("build_id") or None,
     )
     logger.info(
         "autobuild_runner: launching subprocess feature_id=%s cwd=%s "
@@ -4315,6 +4499,12 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
         ",".join(sorted(launch_env)),
     )
 
+    current_run = build_processes.lookup(receipt_build_id)
+    if current_run is not None and current_run.stop_requested:
+        # Superseded by a relaunch before its child existed: never start it.
+        cancelled = _build_snapshot(payload, lifecycle="cancelled")
+        cancelled["error_message"] = "superseded by a relaunch before it started"
+        return _snapshot_update(cancelled)
     try:
         proc = await asyncio.create_subprocess_exec(
             *argv,
@@ -4322,6 +4512,10 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
             env=launch_env,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
+            # The child LEADS its own session and process group (3 October
+            # 2026), so its ordinary descendants share one group the stop can
+            # signal, and that group is never the runner's own.
+            start_new_session=True,
         )
     except (OSError, FileNotFoundError) as exc:
         # Spawn failed AFTER a worktree may have been created — keep it for
@@ -4338,6 +4532,16 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
                 worktree_path=worktree_path,
             )
         )
+
+    # WHAT THIS BUILD OWNS (3 October 2026). The child is recorded as the root
+    # of the build's processes, under the build's id, so a stop — this node's
+    # own on cancel, timeout or wedge, or a relaunch of the same build — reaches
+    # its whole tree and everything carrying its owner marker, not one pid.
+    owned_build = build_processes.register(receipt_build_id, proc.pid)
+    if owned_build.stop_requested:
+        # Superseded by a relaunch while the child was being spawned: stop it
+        # now; it finishes CANCELLED below once everything it owns is gone.
+        await _stop_owned_once(owned_build, proc)
 
     stage_complete_count = 0
     # Coach-score state (TASK-UBS1C-001).
@@ -4460,17 +4664,18 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
                 continue
             wedge_verdict = verdict
             logger.warning(
-                "autobuild_runner: WEDGED feature_id=%s — %s; killing "
-                "guardkit subprocess pid=%s (the worktree is KEPT and the "
-                "failure pack carries the resume command)",
+                "autobuild_runner: WEDGED feature_id=%s — %s; stopping every "
+                "process the build owns, from guardkit subprocess pid=%s (the "
+                "worktree is KEPT and the failure pack carries the resume "
+                "command)",
                 feature_id,
                 verdict.reason(),
                 proc.pid,
             )
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
+            # One pass here; the node confirms every owned process is gone
+            # once the child is reaped (below), because this watch is
+            # cancelled the moment the child exits.
+            await _stop_owned_once(owned_build, proc)
             return
 
     watch_task: Any = None
@@ -4491,22 +4696,26 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
         # re-raise lets langgraph record the interrupt; no snapshot is
         # emitted, and the worktree survives (removal is success-path-only)
         # so the build's receipts are preserved.
+        #
+        # THE RUNNER SLOT IS THE SECOND FENCE (3 October 2026). The run's job
+        # slot is returned only when this handler finishes, so it does not
+        # finish — nor re-raise — until every process the build owns is
+        # confirmed gone. The stop is shielded: a second cancel cannot cut it
+        # short, and one that arrives is absorbed until the stop completes.
         logger.warning(
             "autobuild_runner: run cancelled (interrupt) feature_id=%s — "
-            "killing guardkit subprocess pid=%s",
+            "stopping every process the build owns, from guardkit subprocess "
+            "pid=%s",
             feature_id,
             proc.pid,
         )
-        try:
-            proc.kill()
-        except ProcessLookupError:
-            pass
+        await _stop_owned_shielded(owned_build, proc, feature_id=feature_id)
         try:
             await asyncio.wait_for(proc.wait(), timeout=5.0)
         except (asyncio.TimeoutError, asyncio.CancelledError):
             logger.warning(
                 "autobuild_runner: subprocess not confirmed dead after "
-                "kill() on cancel — pid=%s feature_id=%s",
+                "the stop on cancel — pid=%s feature_id=%s",
                 proc.pid,
                 feature_id,
             )
@@ -4526,14 +4735,12 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
             watch_task.cancel()
         logger.warning(
             "autobuild_runner: subprocess timeout after %.1fs feature_id=%s "
-            "— killing process",
+            "— stopping every process the build owns",
             timeout_seconds,
             feature_id,
         )
-        try:
-            proc.kill()
-        except ProcessLookupError:
-            pass
+        if await _stop_owned_shielded(owned_build, proc, feature_id=feature_id):
+            raise asyncio.CancelledError()
         try:
             await asyncio.wait_for(proc.wait(), timeout=5.0)
         except asyncio.TimeoutError:
@@ -4580,6 +4787,36 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
         # reader's staleness fence would eventually catch it; this means it
         # never has to. Never raises (see build_monitor.clear_in_flight).
         build_monitor.clear_in_flight(in_flight_path)
+
+    # A STOP BY A RELAUNCH OF THIS BUILD, or the monitor's own kill, ends here only
+    # once every process the build owns is confirmed gone — the job slot this
+    # run holds is the runner's local fence (3 October 2026).
+    # Every finish, not only a stop: whatever the build left behind (a
+    # process that outlived its child, a fixture) goes before the slot does.
+    # With nothing left this returns at once.
+    stop_requested = owned_build.stop_requested
+    if await _stop_owned_shielded(owned_build, proc, feature_id=feature_id):
+        raise asyncio.CancelledError()
+    if stop_requested and not timed_out:
+        # A relaunch of this build stopped this run (see
+        # _stop_an_earlier_run_of). It finishes CANCELLED on its own thread;
+        # the worktree and receipts are kept.
+        logger.warning(
+            "autobuild_runner: build stopped on request feature_id=%s "
+            "build_id=%s — every process it owned is confirmed gone; "
+            "finishing cancelled (worktree %s kept)",
+            feature_id,
+            receipt_build_id,
+            worktree_path,
+        )
+        cancelled = _build_snapshot(payload, lifecycle="cancelled")
+        cancelled["error_message"] = (
+            "the build was stopped on request; every process it owned is "
+            "confirmed gone (worktree and receipts kept)"
+        )
+        if worktree_path is not None:
+            cancelled["worktree_path"] = str(worktree_path)
+        return _snapshot_update(cancelled)
 
     exit_code = proc.returncode if proc.returncode is not None else -1
 
@@ -4687,7 +4924,10 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
         # destination read-back that would claim an earlier run's leftovers.
         receipts_result: ReceiptExport | None = None
         if worktree_path is not None:
-            receipts_result = _export_receipts(worktree_path, receipt_build_id)
+            # Off the event loop, as on the success path.
+            receipts_result = await asyncio.to_thread(
+                _export_receipts, worktree_path, receipt_build_id
+            )
         manifest_path = _write_failure_manifest(
             build_id=receipt_build_id,
             payload=payload,
@@ -4802,6 +5042,209 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
         success_counts.source,
     )
     return _snapshot_update(snapshot)
+
+
+async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
+    """The ``running_wave`` node: :func:`_running_wave_body`, then forget the run.
+
+    Whatever way the body ends — a terminal, a cancellation, an unexpected
+    error — this runner stops keeping the build's process record.
+    """
+    payload = _extract_launch_payload(list(state.get("messages", [])))
+    build_id = str(payload.get("build_id") or "")
+    if not build_id:
+        return await _running_wave_body(state)
+    await _stop_an_earlier_run_of(payload, build_id)
+    entry = build_processes.begin(build_id)
+    try:
+        return await _running_wave_body(state)
+    finally:
+        build_processes.end(entry)
+
+
+async def _stop_an_earlier_run_of(payload: Mapping[str, Any], build_id: str) -> None:
+    """A relaunch of a build still running here stops the original first.
+
+    The factory relaunches a build it found INTERRUPTED after its own restart
+    (boot recovery, a redelivery), but this runner may still be running the
+    original run of the same build — the coordinator restarted, the runner
+    did not. Two runs of one build would share its worktree and its owner
+    marker. So the original is stopped (everything it owns, fixtures too,
+    confirmed gone) and this run waits until it has ended. The factory
+    clears the original's identity before it relaunches a recovered build, so
+    it watches the relaunch, never the original. The original ends CANCELLED
+    on its own thread. Its worktree is kept, moved aside, so the relaunch can
+    lay down its own (see :func:`_move_aside_superseded_worktree`).
+    """
+    old = build_processes.lookup(build_id)
+    if old is None:
+        # Nothing of an earlier run is running here; its kept worktree, if
+        # any (a relaunch after the factory stopped the original itself, or
+        # after the runner restarted), still has to make way.
+        await _move_aside_superseded_worktree(payload, build_id)
+        return
+    logger.warning(
+        "autobuild_runner: build %s is being relaunched while its earlier run "
+        "is still running in this runner; stopping the earlier run first",
+        build_id,
+    )
+    await build_processes.stop_run(old)
+    loop = asyncio.get_running_loop()
+    last_report = loop.time()
+    while build_processes.lookup(build_id) is old:
+        if loop.time() - last_report >= OWNED_STOP_REPORT_SECONDS:
+            last_report = loop.time()
+            logger.error(
+                "autobuild_runner: the relaunch of build %s is still waiting "
+                "for its earlier run here to end",
+                build_id,
+            )
+        await asyncio.sleep(0.2)
+    await _move_aside_superseded_worktree(payload, build_id)
+
+
+async def _move_aside_superseded_worktree(
+    payload: Mapping[str, Any], build_id: str
+) -> None:
+    """Keep the stopped run's worktree, under a name the relaunch does not use.
+
+    ``git worktree move`` to ``<build_id>.superseded-<UTC stamp>`` and repair
+    any inner worktrees nested in it, so the tree stays a registered, intact
+    worktree. The relaunch's own same-feature sweep then treats it like any
+    earlier build of the feature: evidence exported first, then cleared. A
+    move that fails leaves the tree where it is (the relaunch then fails
+    loudly on it, as any collision does).
+    """
+    path = _worktree_base_dir() / build_id
+    if not path.exists():
+        return
+    repo_path = _resolve_repo_path(payload)
+    if repo_path is None:
+        return
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    target = path.with_name(f"{build_id}.superseded-{stamp}")
+    code, output = await _run_git(
+        ["worktree", "move", str(path), str(target)], cwd=repo_path
+    )
+    if code != 0:
+        logger.error(
+            "autobuild_runner: could not move the stopped run's worktree %s "
+            "aside (exit=%s): %s",
+            path,
+            code,
+            output,
+        )
+        return
+    inner = sorted(str(p) for p in (target / ".guardkit" / "worktrees").glob("*"))
+    if inner:
+        await _run_git(["worktree", "repair", *inner], cwd=repo_path)
+    logger.warning(
+        "autobuild_runner: the stopped run's worktree of build %s is kept at %s",
+        build_id,
+        target,
+    )
+
+
+#: How often a stop that cannot yet confirm every owned process gone says so.
+OWNED_STOP_REPORT_SECONDS: float = 30.0
+
+
+async def _stop_owned_once(
+    owned: build_processes.OwnedBuild, proc: Any
+) -> list[build_processes.OwnedProcess]:
+    """One stop pass over everything the build owns (TERM, grace, KILL).
+
+    A child that could not be recorded as the build's root (a stand-in
+    process object) is killed by itself, as before 3 October 2026.
+    """
+    if owned.root is None and getattr(proc, "returncode", None) is None:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+    return await build_processes.stop_owned(
+        owned.build_id,
+        roots=[owned.root] if owned.root is not None else (),
+        recorded=owned.recorded,
+    )
+
+
+async def _stop_owned_until_gone(
+    owned: build_processes.OwnedBuild, proc: Any, *, feature_id: str
+) -> None:
+    """Stop everything the build owns and do not return until it is all gone.
+
+    Processes AND this build's labelled fixture containers: keeps reading,
+    SIGKILLing and removing, saying what remains every
+    :data:`OWNED_STOP_REPORT_SECONDS`, for as long as it takes — and an engine
+    that cannot be asked counts as "not yet gone". The run's job slot is not
+    given back while something the build started can still write, serve or
+    call the model, whatever the build's terminal class. Never raises (a
+    cancel is the caller's).
+    """
+    first = True
+    loop = asyncio.get_running_loop()
+    last_report = loop.time()
+    while True:
+        remaining: Any
+        try:
+            if first:
+                processes = await _stop_owned_once(owned, proc)
+            else:
+                processes = await build_processes.stop_owned(
+                    owned.build_id,
+                    recorded=owned.recorded,
+                    grace_seconds=0.0,
+                )
+            containers = (
+                await build_processes.remove_fixture_containers(owned.build_id)
+                if not processes
+                else []
+            )
+            remaining = {"processes": build_processes.describe(processes)}
+            if containers is None:
+                remaining["containers"] = "the container engine cannot be asked"
+            elif containers:
+                remaining["containers"] = containers
+            done = not processes and containers == []
+        except Exception as exc:  # noqa: BLE001 — keep stopping regardless
+            remaining = f"the stop raised {type(exc).__name__}: {exc}"
+            done = False
+        first = False
+        if done:
+            return
+        if loop.time() - last_report >= OWNED_STOP_REPORT_SECONDS:
+            last_report = loop.time()
+            logger.error(
+                "autobuild_runner: build %s (feature_id=%s) is not yet "
+                "confirmed stopped; its job slot stays held until it is: %s",
+                owned.build_id,
+                feature_id,
+                remaining,
+            )
+        await asyncio.sleep(1.0)
+
+
+async def _stop_owned_shielded(
+    owned: build_processes.OwnedBuild, proc: Any, *, feature_id: str
+) -> bool:
+    """:func:`_stop_owned_until_gone`, which a cancellation cannot cut short.
+
+    The run's job slot is returned when the node finishes, so the node must
+    not finish while the build's processes live. A cancellation that arrives
+    meanwhile is absorbed until the stop is confirmed; ``True`` says one
+    arrived, and the caller then lets it through.
+    """
+    stop = asyncio.ensure_future(
+        _stop_owned_until_gone(owned, proc, feature_id=feature_id)
+    )
+    cancelled = False
+    while not stop.done():
+        try:
+            await asyncio.shield(stop)
+        except asyncio.CancelledError:
+            cancelled = True
+    return cancelled
 
 
 def _node_completed(state: AutobuildRunnerState) -> dict[str, Any]:
@@ -5137,6 +5580,10 @@ def _route_after_running_wave(state: AutobuildRunnerState) -> str:
     lifecycle = snapshot.get("lifecycle") if isinstance(snapshot, Mapping) else None
     if lifecycle == "failed":
         return "failed"
+    if lifecycle == "cancelled":
+        # A build stopped on request is already terminal: straight to the
+        # finalize guard, which sees the terminal lifecycle and adds nothing.
+        return "cancelled"
     return "completed"
 
 
@@ -5209,7 +5656,7 @@ def _build_runner_graph() -> Any:
         sg.add_conditional_edges(
             "running_wave",
             _route_after_running_wave,
-            {"completed": "completed", "failed": "failed"},
+            {"completed": "completed", "failed": "failed", "cancelled": "finalize"},
         )
         sg.add_edge("completed", "finalize")
         sg.add_edge("failed", "finalize")
