@@ -247,12 +247,15 @@ class TestDispatchAutobuildSignature:
         # three — a launch without it is byte-identical to the one before it.
         # and ``launch_settings`` beside it on 2026-09-22 — the NAMES the
         # project declared its own builds need, read at the same commit.
+        # ``source_commit`` on 2026-10-04 — the exact commit a feature planned
+        # elsewhere was admitted at, which the runner builds.
         additive_data_kwargs = [
             "branch",
             "repo",
             "budget",
             "memory_project",
             "launch_settings",
+            "source_commit",
         ]
         assert kw_only == collaborators + additive_data_kwargs, (
             f"dispatch_autobuild_async must expose exactly the five collaborator "
