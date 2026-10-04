@@ -3181,6 +3181,136 @@ async def test_f2_digest_endpoint_non_get_does_not_widen_the_gate(
     assert feature_id and ev["feature_id"] == feature_id
 
 
+def _seed_with_criterion(text: str) -> str:
+    """The non-endpoint seed with its one machine criterion replaced by ``text``
+    (no digest endpoint, so the address can only come from this prose)."""
+    old = "  text: The nightly report job runs to completion each midnight\n"
+    assert old in _UNDERIVABLE_SEED_AUTHLESS
+    return _UNDERIVABLE_SEED_AUTHLESS.replace(old, f"  text: '{text}'\n")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "criterion,reason_code,address",
+    [
+        # a placeholder at the very end of the address
+        (
+            "A GET request to /users/{user_id} returns the user",
+            "placeholder_in_address",
+            "/users/{user_id}",
+        ),
+        # ... and at the end of the sentence, before its full stop
+        (
+            "Users are found by A GET request to /users/{user_id}.",
+            "placeholder_in_address",
+            "/users/{user_id}",
+        ),
+        # a placeholder after a dotted segment (read as /v1 before R5)
+        (
+            "A GET request to /v1.0/users/{user_id} returns the user",
+            "placeholder_in_address",
+            "/v1.0/users/{user_id}",
+        ),
+        (
+            "A GET request to /api/v2.1/orgs/{org_id}/users returns them",
+            "placeholder_in_address",
+            "/api/v2.1/orgs/{org_id}/users",
+        ),
+        # an address a check cannot send as written (read as /users before R5)
+        (
+            "A GET request to /users?active=true returns active users",
+            "unsupported_address",
+            "/users?active=true",
+        ),
+        # the method still decides first, with the whole address recorded
+        (
+            "A PATCH request to /v1.0/users/{user_id}/deactivate succeeds",
+            "unsupported_method",
+            "/v1.0/users/{user_id}/deactivate",
+        ),
+    ],
+)
+async def test_f2_prose_address_is_read_whole_and_skipped_with_its_reason(
+    store: SqlitePlanningRunStore,
+    tmp_path: Path,
+    criterion: str,
+    reason_code: str,
+    address: str,
+) -> None:
+    """Codex R5 (4 October 2026): the address in a criterion is the WHOLE
+    address, never a partial match. A placeholder at the end, or after a
+    dotted segment, is skipped by name with the exact address recorded, and no
+    gate is written."""
+    repo = tmp_path / "api_test"
+    _init_scratch_repo(repo)
+    _seed_gate_surface(repo)
+    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    _queue(store)
+    h = _make_driver(
+        store,
+        git_runner=git,
+        repo_path=str(repo),
+        spec_result=_spec_result_with_seed(_seed_with_criterion(criterion)),
+        plan_result_factory=_plan_result_native_versions,
+        pass_bar_validate_fn=_schema_pass_bar_oracle,
+        gate_registry_validate_fn=_schema_gate_registry_oracle,
+    )
+
+    await h.driver.drive(CID)
+
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+    assert h.ctx["counters"]["gate_registry_validate"] == 0
+    assert h.ctx["counters"]["build_trigger"] == 1
+    assert _show_on_branch(repo, "qa/gates/nightly_report_gate.py").returncode != 0
+    reg_data = yaml.safe_load(_show_on_branch(repo, "qa/gates/registry.yaml").stdout)
+    assert {g["id"] for g in reg_data["gates"]} == {"health", "stats", "version"}
+    ev = _leg_event_details_of(store, "qa-feature-gate")
+    assert ev.get("skipped") is True
+    assert ev["reason_code"] == reason_code
+    method = criterion.split(" request to ")[0].split()[-1]
+    assert ev["address"] == {"method": method, "path": address}
+    assert ev["feature_id"] == _leg_details(store, "feature-plan")["feature_id"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "criterion,path",
+    [
+        # positive controls: whole, plain GET addresses still register
+        ("A GET request to /v1.0/version returns the version", "/v1.0/version"),
+        ("The version is served by A GET request to /version.", "/version"),
+        ("A GET request to /users/active-count returns both counts", "/users/active-count"),
+    ],
+)
+async def test_f2_prose_plain_get_address_registers_the_whole_address(
+    store: SqlitePlanningRunStore, tmp_path: Path, criterion: str, path: str
+) -> None:
+    repo = tmp_path / "api_test"
+    _init_scratch_repo(repo)
+    _seed_gate_surface(repo)
+    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    _queue(store)
+    h = _make_driver(
+        store,
+        git_runner=git,
+        repo_path=str(repo),
+        spec_result=_spec_result_with_seed(_seed_with_criterion(criterion)),
+        plan_result_factory=_plan_result_native_versions,
+        pass_bar_validate_fn=_schema_pass_bar_oracle,
+        gate_registry_validate_fn=_schema_gate_registry_oracle,
+    )
+
+    await h.driver.drive(CID)
+
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+    ev = _leg_event_details_of(store, "qa-feature-gate")
+    assert ev.get("skipped") is not True, ev
+    assert ev["endpoint"] == {"method": "GET", "path": path}
+    gate = _show_on_branch(repo, "qa/gates/nightly_report_gate.py")
+    assert gate.returncode == 0, gate.stderr
+    assert f'"request": {{"method": "GET", "path": "{path}"}},' in gate.stdout
+
+
 @pytest.mark.asyncio
 async def test_f2_missing_template_honest_skip(
     store: SqlitePlanningRunStore, tmp_path: Path
@@ -3415,6 +3545,18 @@ def _leg_event_details_of(
             "A GET request to /users/{id}/profile succeeds",
             {"method": "GET", "path": "/users/{id}/profile"},
         ),
+        # the WHOLE address (Codex R5): a final placeholder is not cut short,
+        # a dotted segment is kept, and sentence punctuation is not the path
+        (
+            "A GET request to /users/{user_id} succeeds",
+            {"method": "GET", "path": "/users/{user_id}"},
+        ),
+        (
+            "A GET request to /v1.0/users/{user_id}.",
+            {"method": "GET", "path": "/v1.0/users/{user_id}"},
+        ),
+        ("A GET request to /version.", {"method": "GET", "path": "/version"}),
+        ("(A GET request to /stats)", {"method": "GET", "path": "/stats"}),
     ],
 )
 def test_derive_get_endpoint_positive(text: str, expected: dict[str, str]) -> None:
@@ -3434,6 +3576,10 @@ def test_derive_get_endpoint_positive(text: str, expected: dict[str, str]) -> No
         "The /version response contains exactly three fields",  # no verb phrase
         "GET /version",  # missing the 'A … request to' frame
         "",  # empty
+        # never a partial match passed off as the endpoint (Codex R5)
+        "A GET request to /users?active=true returns active users",
+        "A GET request to /caf%C3%A9 returns the menu",
+        "A GET request to / returns the home page",
     ],
 )
 def test_derive_get_endpoint_adversarial_negatives(text: str) -> None:

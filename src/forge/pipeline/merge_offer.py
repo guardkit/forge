@@ -87,6 +87,7 @@ __all__ = [
     "SKIP_NO_REGISTRY",
     "SKIP_NO_TEMPLATE",
     "SKIP_PLACEHOLDER_IN_ADDRESS",
+    "SKIP_UNSUPPORTED_ADDRESS",
     "SKIP_UNSUPPORTED_METHOD",
     "WhatWasChecked",
     "after_deploy_check_skip_for",
@@ -1157,6 +1158,7 @@ AFTER_DEPLOY_CHECK_STAGE: str = "qa-feature-gate"
 
 #: Why planning registered no after-deploy check, as recorded on the skip.
 SKIP_UNSUPPORTED_METHOD: str = "unsupported_method"
+SKIP_UNSUPPORTED_ADDRESS: str = "unsupported_address"
 SKIP_PLACEHOLDER_IN_ADDRESS: str = "placeholder_in_address"
 SKIP_NO_ENDPOINT_NAMED: str = "no_endpoint_named"
 SKIP_NO_PASS_BARS: str = "no_pass_bars"
@@ -1196,6 +1198,13 @@ def _plain_reason(details: Mapping[str, Any]) -> str:
         if method:
             return f"only GET addresses are supported, and this one is {method}"
         return "only GET addresses are supported"
+    if code == SKIP_UNSUPPORTED_ADDRESS:
+        if path:
+            return (
+                f"the address {path} has characters a check cannot send as "
+                "written"
+            )
+        return "the address has characters a check cannot send as written"
     if code == SKIP_PLACEHOLDER_IN_ADDRESS:
         names = placeholders_in(path)
         if len(names) == 1:
