@@ -3888,10 +3888,70 @@ async def _sweep_prior_build_residue(
         ) from exc
 
 
+async def _sweep_prior_source_branches(
+    repo_path: Path, feature_id: str, *, current_build_id: str
+) -> None:
+    """Delete ``forge/source/<prior build>`` for this feature's ended builds.
+
+    The branch is found by name — ``forge/source/build-<feature_id>-<when>``,
+    the build id :func:`forge.lifecycle.identifiers.derive_build_id` makes —
+    so it is cleared even when the prior build owns no worktree and no
+    ``autobuild/*`` branch (its runner was stopped before GuardKit made one).
+    The current build's own branch, and a prior build still live in the ledger
+    or in this runner, are left alone. Best effort: discovery that fails
+    touches nothing, and a delete that fails is logged.
+    """
+    prefix = f"{SOURCE_BRANCH_PREFIX}build-{feature_id}-"
+    try:
+        code, output = await _run_git(
+            ["for-each-ref", "--format=%(refname:short)", f"refs/heads/{prefix}*"],
+            cwd=repo_path,
+        )
+    except Exception as exc:  # noqa: BLE001 — discovery is not destruction
+        logger.warning(
+            "autobuild_runner: requeue sweep — could not list prior builds' "
+            "own branches in %s (%s: %s); nothing was touched",
+            repo_path,
+            type(exc).__name__,
+            exc,
+        )
+        return
+    if code != 0:
+        return
+    for branch in (line.strip() for line in output.splitlines()):
+        if not branch.startswith(prefix):
+            continue
+        prior_build_id = branch[len(SOURCE_BRANCH_PREFIX) :]
+        if prior_build_id == current_build_id:
+            continue
+        status = _prior_build_status(prior_build_id)
+        if status in _LIVE_BUILD_STATUSES or _running_in_this_runner(prior_build_id):
+            logger.info(
+                "autobuild_runner: requeue sweep — prior build %s is still "
+                "live; its branch %s is left alone",
+                prior_build_id,
+                branch,
+            )
+            continue
+        await _delete_source_branch(repo_path, branch)
+        logger.info(
+            "autobuild_runner: requeue sweep — prior build %s: its own branch "
+            "%s was cleared",
+            prior_build_id,
+            branch,
+        )
+
+
 async def _sweep_prior_build_residue_impl(
     repo_path: Path, feature_id: str, *, current_build_id: str
 ) -> None:
     """Body of :func:`_sweep_prior_build_residue` (see its docstring)."""
+    # A prior PREPARED build's own branch first (4 October 2026): a runner
+    # killed before GuardKit made any worktree leaves the branch and nothing
+    # else, so it is found by name, not through the worktrees below.
+    await _sweep_prior_source_branches(
+        repo_path, feature_id, current_build_id=current_build_id
+    )
     try:
         base = _worktree_base_dir().resolve()
     except OSError:  # pragma: no cover — unresolvable base ⇒ nothing to sweep
