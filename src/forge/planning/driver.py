@@ -98,6 +98,12 @@ from forge.planning.planner import (
     plan_next_step,
 )
 from forge.planning.assumption_review import review_assumptions
+from forge.planning.example_review import (
+    ExampleReview,
+    ExampleWords,
+    read_example_words,
+    review_examples,
+)
 from forge.planning.repository_facts import (
     LocalCheckoutReader,
     RepositoryFacts,
@@ -918,6 +924,20 @@ _MACHINE_NOTE_AUTHOR = "planning-driver (stamp normalizer refusal)"
 #: planning coach §4c) — a different reviewer from the stamp normalizer, and
 #: the record must say which.
 _ASSUMPTION_REVIEW_AUTHOR = "planning-driver (assumption review)"
+
+#: The author stamped on the shared rewrite when only the SPEC EXAMPLE CHECK
+#: (4 October 2026) asked for it: worked examples about something the request
+#: does not mention. When assumptions were flagged too, the assumption
+#: review's author is stamped and the row lists both.
+_EXAMPLE_REVIEW_AUTHOR = "planning-driver (spec example check)"
+
+#: The spec card's line when the project's ``spec_examples:`` block is there
+#: and could not be read. Silence would hide the mistake: the person is told
+#: the examples were not checked, and why.
+_EXAMPLE_WORDS_UNREADABLE_CARD_LINE = (
+    "The project's list of examples it does not want unless asked for could "
+    "not be read ({reason}), so the worked examples were not checked against it."
+)
 
 #: The author stamped on the one note the PLAN review sends (2026-09-15,
 #: planner fix design section 2g) — the plan read against the request before
@@ -3496,6 +3516,11 @@ class PlanningRunDriver:
         with the finding under it, so the person's touch is a decision rather
         than a proofread. Never a third try; never a new touch.
 
+        The spec example check (4 October 2026) shares this one round: worked
+        examples about something the request and the owner's notes do not
+        mention, by the words the project declares, go back in the same note,
+        and :meth:`_open_the_card_with` names what was removed and what kept.
+
         ``draft`` is a committed draft WITHOUT a row yet; this writes none —
         the provability step that follows writes the draft row. Returns the
         draft the rest of the leg continues with, its ``assumption_review``
@@ -3504,6 +3529,13 @@ class PlanningRunDriver:
         """
         deps = self._deps
         request_text = self._request_text_of(row)
+        # THE SPEC EXAMPLE CHECK (4 October 2026) shares this step's one
+        # rewrite: an example about something the request does not mention,
+        # by the project's own declared words, goes back with the flagged
+        # assumptions in the same note. No list declared, no check.
+        examples = await self._check_the_examples_first(
+            correlation_id, draft, repo_path=repo_path, request_text=request_text, notes=notes
+        )
         try:
             facts = await self._repository_facts_for(correlation_id, repo_path, row)
             review = await self._review_assumptions_on_branch(
@@ -3539,23 +3571,37 @@ class PlanningRunDriver:
         }
         if review is None:
             receipt["not_checked"] = "the committed spec has no assumptions manifest to read"
-            draft["assumption_review"] = receipt
-            return draft
-        receipt["first"] = review.receipt()
-        if not review.findings:
+        else:
+            receipt["first"] = review.receipt()
+        flagged = list(review.flagged_ids) if review is not None else []
+        flagged_examples = examples.flagged_titles if examples is not None else []
+        if not flagged and not flagged_examples:
             draft["assumption_review"] = receipt
             return draft
 
-        note = review.note()
-        flagged = list(review.flagged_ids)
-        receipt.update({"round": 1, "author": _ASSUMPTION_REVIEW_AUTHOR, "note": note, "flagged": flagged})
+        # ONE note for both reviewers, so the writer is asked no more times
+        # than before the example check existed.
+        note = "\n\n".join(
+            part
+            for part in (
+                review.note() if flagged and review is not None else "",
+                examples.note() if flagged_examples and examples is not None else "",
+            )
+            if part
+        )
+        author = _ASSUMPTION_REVIEW_AUTHOR if flagged else _EXAMPLE_REVIEW_AUTHOR
+        receipt.update({"round": 1, "author": author, "note": note, "flagged": flagged})
+        if flagged_examples:
+            receipt["flagged_examples"] = list(flagged_examples)
         logger.info(
-            "planning driver: run %s — %d assumption(s) add what the request did "
-            "not ask for; the machine sends them back to the spec writer once "
-            "(round 1) before the card: %s",
+            "planning driver: run %s — %d assumption(s) and %d worked example(s) "
+            "add what the request did not ask for; the machine sends them back "
+            "to the spec writer once (round 1) before the card: %s %s",
             correlation_id,
             len(flagged),
+            len(flagged_examples),
             flagged,
+            flagged_examples,
         )
         deps.store._record_event(
             correlation_id=correlation_id,
@@ -3570,8 +3616,9 @@ class PlanningRunDriver:
                         "sha": draft.get("sha"),
                         "scenario_count": draft.get("scenario_count"),
                         "superseded_by_note": note,
-                        "author": _ASSUMPTION_REVIEW_AUTHOR,
+                        "author": author,
                         "flagged_assumptions": flagged,
+                        **({"flagged_examples": list(flagged_examples)} if flagged_examples else {}),
                     }
                 }
             ),
@@ -3589,7 +3636,7 @@ class PlanningRunDriver:
                 fail_on_refusal=False,
                 record=False,
                 previous_card=draft.get("card") or {},
-                machine_author=_ASSUMPTION_REVIEW_AUTHOR,
+                machine_author=author,
             )
         except _MachineNoteRefused as refused_round:
             receipt["refused_by_checker"] = True
@@ -3604,7 +3651,8 @@ class PlanningRunDriver:
                 correlation_id,
                 refused_round.dispatch_reason,
             )
-            draft["card"] = self._card_with_assumption_warnings(draft.get("card") or {}, review, flagged)
+            if flagged and review is not None:
+                draft["card"] = self._card_with_assumption_warnings(draft.get("card") or {}, review, flagged)
             draft["assumption_review"] = receipt
             return draft
         if rewritten is None:
@@ -3645,6 +3693,106 @@ class PlanningRunDriver:
             len(still),
         )
         return final
+
+    # ------------------------------------------------------------------ #
+    # The worked examples are checked against the request before the card
+    # (4 October 2026), by the words the project itself declares
+    # ------------------------------------------------------------------ #
+
+    async def _example_words_for(self, correlation_id: str, repo_path: str) -> ExampleWords:
+        """The project's ``spec_examples:`` list, read once per run.
+
+        Read the way the fact sheet reads the same file: through
+        :meth:`_repository_reader_for`, so a sandboxed repository is read on
+        the factory's own clone through the helper's read-only route. Off the
+        event loop, and never raises: a list that cannot be read is no check.
+        """
+        cache: dict[str, ExampleWords] = self.__dict__.setdefault("_example_words_cache", {})
+        if correlation_id not in cache:
+            try:
+                reader = self._repository_reader_for(repo_path, correlation_id)
+                words = await asyncio.to_thread(read_example_words, reader)
+            except Exception as exc:  # noqa: BLE001 — a reviewer must never stop a run
+                words = ExampleWords(
+                    None, not_checked=f"the project's list could not be read ({type(exc).__name__})"
+                )
+            if words.kinds is None:
+                logger.info(
+                    "planning driver: run %s — the worked examples are not checked "
+                    "against a project list (%s)",
+                    correlation_id,
+                    words.not_checked,
+                )
+            cache[correlation_id] = words
+        return cache[correlation_id]
+
+    async def _check_the_examples_first(
+        self,
+        correlation_id: str,
+        draft: Mapping[str, Any],
+        *,
+        repo_path: str,
+        request_text: str,
+        notes: Sequence[str],
+    ) -> ExampleReview | None:
+        """The first draft's examples held against the request and the
+        owner's notes so far; ``None`` when the project declares no list.
+
+        What the card is later measured against is kept for the run, so
+        :meth:`_open_the_card_with` can name what the rewrite removed and
+        what it kept, whichever draft the card finally opens on.
+        """
+        words = await self._example_words_for(correlation_id, repo_path)
+        first = None
+        if words.kinds is not None:
+            feature_text = str((draft.get("card") or {}).get("worked_examples") or "")
+            first = review_examples(
+                feature_text, request_text=request_text, notes=notes, kinds=words.kinds
+            )
+        self.__dict__.setdefault("_example_review_runs", {})[correlation_id] = {
+            "words": words,
+            "request_text": request_text,
+            "notes": [str(note) for note in notes],
+            "first": first,
+        }
+        return first
+
+    def _example_review_lines(
+        self, correlation_id: str, card: Mapping[str, Any]
+    ) -> tuple[list[str], dict[str, Any] | None]:
+        """The card's lines about the examples, and the run's receipt.
+
+        The final card is checked again: an example flagged at first and gone
+        now was removed; one flagged now was kept. A list that is there and
+        could not be read is said in one line. No list: no lines, and the
+        receipt says why there was no check."""
+        state = (self.__dict__.get("_example_review_runs") or {}).get(correlation_id)
+        if state is None:
+            return [], None
+        words: ExampleWords = state["words"]
+        receipt: dict[str, Any] = {"checked": words.kinds is not None, **words.receipt()}
+        if words.unreadable:
+            line = _EXAMPLE_WORDS_UNREADABLE_CARD_LINE.format(reason=words.unreadable)
+            receipt["card_lines"] = [line]
+            return [line], receipt
+        if words.kinds is None:
+            return [], receipt
+        first: ExampleReview | None = state["first"]
+        final = review_examples(
+            str(card.get("worked_examples") or ""),
+            request_text=state["request_text"],
+            notes=state["notes"],
+            kinds=words.kinds,
+        )
+        lines = final.card_lines(first)
+        receipt.update(
+            {
+                "first": first.receipt() if first is not None else None,
+                "final": final.receipt(),
+                "card_lines": lines,
+            }
+        )
+        return lines, receipt
 
     @staticmethod
     def _card_with_assumption_warnings(
@@ -3909,6 +4057,18 @@ class PlanningRunDriver:
             card["what_happened"] = f"{card.get('what_happened', '')} {added}".strip()
             final["card"] = card
             provability["card_line"] = added
+        # THE SPEC EXAMPLE CHECK's lines (4 October 2026): what the rewrite
+        # removed and what it kept, named, so a possible loss shows as well.
+        example_lines, example_receipt = self._example_review_lines(
+            correlation_id, final.get("card") or {}
+        )
+        if example_lines:
+            card = dict(final.get("card") or {})
+            added = " ".join(example_lines)
+            card["what_happened"] = f"{card.get('what_happened', '')} {added}".strip()
+            final["card"] = card
+        if example_receipt is not None:
+            final["example_review"] = example_receipt
         unavailable_line = self._repository_facts_card_line(correlation_id)
         if unavailable_line is not None:
             # Silence was the bug (1 October 2026, the 1 October planner fix): the
