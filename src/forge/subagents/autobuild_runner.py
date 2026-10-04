@@ -4499,6 +4499,12 @@ async def _run_one_build(state: AutobuildRunnerState) -> dict[str, Any]:
         ",".join(sorted(launch_env)),
     )
 
+    current_run = build_processes.lookup(receipt_build_id)
+    if current_run is not None and current_run.stop_requested:
+        # Superseded by a relaunch before its child existed: never start it.
+        cancelled = _build_snapshot(payload, lifecycle="cancelled")
+        cancelled["error_message"] = "superseded by a relaunch before it started"
+        return _snapshot_update(cancelled)
     try:
         proc = await asyncio.create_subprocess_exec(
             *argv,
@@ -4785,13 +4791,12 @@ async def _run_one_build(state: AutobuildRunnerState) -> dict[str, Any]:
     # A STOP BY A RELAUNCH OF THIS BUILD, or the monitor's own kill, ends here only
     # once every process the build owns is confirmed gone — the job slot this
     # run holds is the runner's local fence (3 October 2026).
+    # Every finish, not only a stop: whatever the build left behind (a
+    # process that outlived its child, a fixture) goes before the slot does.
+    # With nothing left this returns at once.
     stop_requested = owned_build.stop_requested
-    if wedge_verdict is not None or stop_requested:
-        interrupted = await _stop_owned_shielded(
-            owned_build, proc, feature_id=feature_id
-        )
-        if interrupted:
-            raise asyncio.CancelledError()
+    if await _stop_owned_shielded(owned_build, proc, feature_id=feature_id):
+        raise asyncio.CancelledError()
     if stop_requested and not timed_out:
         # A relaunch of this build stopped this run (see
         # _stop_an_earlier_run_of). It finishes CANCELLED on its own thread;
@@ -5152,7 +5157,7 @@ async def _stop_owned_once(
     A child that could not be recorded as the build's root (a stand-in
     process object) is killed by itself, as before 3 October 2026.
     """
-    if owned.root is None:
+    if owned.root is None and getattr(proc, "returncode", None) is None:
         try:
             proc.kill()
         except ProcessLookupError:

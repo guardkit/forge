@@ -69,7 +69,6 @@ __all__ = [
     "stop_run",
     "begin",
     "end",
-    "unregister",
 ]
 
 #: The environment entry every process a build starts carries. Set per build by
@@ -595,11 +594,6 @@ def register(build_id: str, pid: int) -> OwnedBuild:
     if root is not None:
         entry.recorded.add(root)
     return entry
-
-
-def unregister(entry: OwnedBuild) -> None:
-    if _BUILDS.get(entry.build_id) is entry:
-        del _BUILDS[entry.build_id]
 
 
 def lookup(build_id: str) -> OwnedBuild | None:

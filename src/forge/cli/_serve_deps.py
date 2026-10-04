@@ -640,7 +640,12 @@ def _another_build_of_feature_goes_first(
     """
     from forge.lifecycle.persistence import ACTIVE_STATES
 
-    active_values = tuple(s.value for s in ACTIVE_STATES)
+    # INTERRUPTED counts too: after a factory-only restart such a build's
+    # original run may still be going, and its redelivery relaunches it (own
+    # row: the duplicate handling decides; another build's: it goes first).
+    active_values = tuple(s.value for s in ACTIVE_STATES) + (
+        BuildState.INTERRUPTED.value,
+    )
     placeholders = ",".join("?" * len(active_values))
     with sqlite_pool._reader() as cx:
         rows = cx.execute(
@@ -1000,33 +1005,59 @@ def _build_dispatch_build(
     # that are still ACTIVE, so finished builds never block anything.
     started_by_feature: dict[str, set[str]] = {}
 
-    def _clear_the_recovered_originals_identity(build_id: str) -> bool:
-        """Before a recovered (INTERRUPTED) build is launched again.
+    def _earlier_run_of(build_id: str) -> tuple[bool, str | None]:
+        """A recovered (INTERRUPTED) build's earlier run: ``(readable, thread)``.
 
-        Its earlier run's ``async_tasks`` row (same feature and correlation,
-        kept by boot recovery) would otherwise be what the relaunch's
-        observer — registered before the launch — resolves, so it would
-        watch the earlier run instead of the relaunch. Deleting it makes the
-        observer wait for the row the launch writes for the relaunch. (The
-        runner itself stops an earlier run of the same build still running
-        there before the relaunch proceeds.) ``False``: the row could not be
-        deleted, and the caller holds the message without acknowledging it,
-        so its redelivery tries again.
+        After a factory-only restart that run may still be going in its
+        runner. Its thread is read now so that, on approval, its row can be
+        deleted just before the relaunch (the relaunch's observer then binds
+        the relaunch's own thread and run; the runner stops the earlier run
+        before the relaunch proceeds), and, if the relaunch does not happen,
+        the earlier run can be interrupted instead. ``readable=False``: the
+        ledger could not be read, and the caller holds the message without
+        acknowledging it so its redelivery tries again.
         """
         try:
-            sqlite_pool.connection.execute(
-                "DELETE FROM async_tasks WHERE build_id = ?", (build_id,)
-            )
+            row = sqlite_pool.connection.execute(
+                "SELECT task_id FROM async_tasks WHERE build_id = ? "
+                "ORDER BY started_at DESC, rowid DESC LIMIT 1",
+                (build_id,),
+            ).fetchone()
         except sqlite3.Error as exc:
             logger.error(
-                "dispatch_build: could not clear the earlier run's identity "
-                "for build_id=%s (%s); holding the message WITHOUT ack so its "
-                "redelivery tries again",
+                "dispatch_build: could not read the earlier run of build_id=%s "
+                "(%s); holding the message WITHOUT ack so its redelivery tries "
+                "again",
                 build_id,
                 exc,
             )
-            return False
-        return True
+            return False, None
+        return True, (str(row[0]) if row is not None else None)
+
+    async def _interrupt_earlier_run(repo: str, thread_id: str | None) -> None:
+        """Best effort: interrupt a recovered build's earlier run.
+
+        Used when the relaunch does not happen (the card is declined, expires
+        or is stopped, or the launch fails), so a run the factory no longer
+        holds a place for does not carry on. The runner's own cancel handler
+        then stops everything that run owns.
+        """
+        if not thread_id:
+            return
+        from forge.cli.runtime import _langgraph_interrupt_canceller
+        from forge.config.sandboxes import sandbox_for
+
+        entry = sandbox_for(forge_config, repo) if forge_config is not None else None
+        url = str(getattr(entry, "runner_url", "") or "").strip() or None
+        interrupted = await asyncio.to_thread(
+            _langgraph_interrupt_canceller(url), thread_id
+        )
+        logger.warning(
+            "dispatch_build: the relaunch did not happen; earlier run on "
+            "thread %s %s",
+            thread_id,
+            "interrupted" if interrupted else "could NOT be interrupted",
+        )
 
     async def dispatch_build(
         payload: "BuildQueuedPayload",
@@ -1067,6 +1098,11 @@ def _build_dispatch_build(
         # ``--help`` paths (the dispatch closure is the only place the
         # payload type is exercised).
         from forge.lifecycle.persistence import DuplicateBuildError
+
+        # A recovered (INTERRUPTED) build being relaunched, and its earlier
+        # run's thread (see _earlier_run_of).
+        recovered = False
+        earlier_thread: str | None = None
 
         # D4's authoritative BUILD boundary is before persistence, the
         # approval gate and the conductor. It therefore also covers direct
@@ -1342,11 +1378,11 @@ def _build_dispatch_build(
                 from forge.lifecycle.identifiers import derive_build_id
 
                 build_id = derive_build_id(payload.feature_id, payload.queued_at)
-                if (
-                    status == BuildState.INTERRUPTED
-                    and not _clear_the_recovered_originals_identity(build_id)
-                ):
-                    return
+                if status == BuildState.INTERRUPTED:
+                    readable, earlier_thread = _earlier_run_of(build_id)
+                    if not readable:
+                        return
+                    recovered = True
                 logger.info(
                     "dispatch_build: duplicate %s build feature_id=%s "
                     "correlation_id=%s build_id=%s (%s); re-dispatching into "
@@ -1564,17 +1600,38 @@ def _build_dispatch_build(
                 build_id,
                 outcome.value,
             )
+            if recovered:
+                # The earlier run's row goes just before the relaunch, so the
+                # relaunch's observer binds the relaunch's own thread and run.
+                try:
+                    sqlite_pool.connection.execute(
+                        "DELETE FROM async_tasks WHERE build_id = ?", (build_id,)
+                    )
+                except sqlite3.Error as exc:
+                    logger.error(
+                        "dispatch_build: could not clear the earlier run's "
+                        "identity for build_id=%s (%s); holding the message "
+                        "WITHOUT ack",
+                        build_id,
+                        exc,
+                    )
+                    return
             if register_observer is not None:
                 await _safe_register_observer(register_observer, build_id)
-            await launch_or_conduct(
-                ack_callback=ack_callback,
-                build_id=build_id,
-                feature_id=payload.feature_id,
-                correlation_id=payload.correlation_id,
-                branch=payload.branch,
-                repo=payload.repo,
-                budget=budget_entry,
-            )
+            try:
+                await launch_or_conduct(
+                    ack_callback=ack_callback,
+                    build_id=build_id,
+                    feature_id=payload.feature_id,
+                    correlation_id=payload.correlation_id,
+                    branch=payload.branch,
+                    repo=payload.repo,
+                    budget=budget_entry,
+                )
+            except Exception:
+                if recovered:
+                    await _interrupt_earlier_run(payload.repo, earlier_thread)
+                raise
         else:
             # Gate terminal (reject / expiry / hard-stop) — the build never
             # started; ack the slot so the next queued build proceeds and
@@ -1599,6 +1656,8 @@ def _build_dispatch_build(
                 build_id,
                 outcome.value,
             )
+            if recovered:
+                await _interrupt_earlier_run(payload.repo, earlier_thread)
             await ack_callback()
 
     return dispatch_build
@@ -1606,7 +1665,7 @@ def _build_dispatch_build(
 
 #: How long a launch waits before asking the lifecycle bridge again when it
 #: refused this build's observer because an earlier build of the same
-#: feature is still finishing (its stop not yet confirmed). Tests shorten it.
+#: feature is still finishing (its observer not yet done). Tests shorten it.
 OBSERVER_BUSY_RETRY_SECONDS: float = 5.0
 
 
@@ -1620,8 +1679,8 @@ async def _safe_register_observer(register_observer, build_id: str) -> None:
 
     A *refusal* is different: the bridge answers ``False`` when another
     build of the same feature still has a live observer (it tracks one per
-    feature, and the earlier build may still be waiting for its runner to
-    confirm the stop). Launching then would leave this build with no
+    feature, and the earlier build's observer may still be finishing its
+    terminal). Launching then would leave this build with no
     observer and no acknowledgement, so the launch waits here, asking again
     every :data:`OBSERVER_BUSY_RETRY_SECONDS`, until the earlier observer
     has finished. The build keeps its message un-acked meanwhile; shutdown
