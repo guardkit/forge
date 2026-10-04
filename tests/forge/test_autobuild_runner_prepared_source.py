@@ -315,3 +315,44 @@ def test_the_sweep_clears_a_prior_branch_left_with_no_worktree_at_all(
     assert _git(repo, "branch", "--list", prior_branch) == ""
     assert _git(repo, "branch", "--list", other_feature) != ""
     assert _git(repo, "branch", "--list", live_branch) != ""
+
+
+def test_a_cancel_during_the_branch_delete_lets_it_finish_then_is_raised(
+    tmp_path: Path, monkeypatch
+) -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    finished: list[str] = []
+
+    async def _fake_build(_state: Any) -> dict[str, Any]:
+        claim = ar._CURRENT_BUILD_CLAIM.get()
+        assert claim is not None
+        claim.source_branch = (tmp_path, SOURCE_BRANCH)
+        return {"ok": True}
+
+    async def _slow_delete(_repo: Path, branch: str | None) -> None:
+        started.set()
+        await release.wait()
+        finished.append(str(branch))
+
+    monkeypatch.setattr(ar, "_run_one_build", _fake_build)
+    monkeypatch.setattr(ar, "_delete_source_branch", _slow_delete)
+    description = "RUN_AUTOBUILD subagent=autobuild_runner payload=" + json.dumps(
+        {"build_id": BUILD_ID, "feature_id": FEATURE}
+    )
+
+    async def _scenario() -> None:
+        task = asyncio.ensure_future(
+            ar._running_wave_body({"messages": [HumanMessage(content=description)]})
+        )
+        await started.wait()
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()  # the delete is still being allowed to finish
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(_scenario())
+
+    assert finished == [SOURCE_BRANCH]

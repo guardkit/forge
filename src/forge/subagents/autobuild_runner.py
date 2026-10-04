@@ -4396,15 +4396,28 @@ async def _running_wave_body(state: AutobuildRunnerState) -> dict[str, Any]:
         # admitted commit.
         if claim.source_branch is not None:
             repo_of_branch, branch = claim.source_branch
-            try:
-                await asyncio.shield(_delete_source_branch(repo_of_branch, branch))
-            except BaseException as exc:  # noqa: BLE001 — clean-up only
-                logger.warning(
-                    "autobuild_runner: could not delete %s after the build "
-                    "ended (%s); a later sweep of this feature deletes it",
-                    branch,
-                    type(exc).__name__,
-                )
+            # Shielded, so a cancel arriving now cannot stop the delete half
+            # way; if one does arrive, the delete is allowed to finish and the
+            # cancel is then raised, never swallowed.
+            deleting = asyncio.ensure_future(
+                _delete_source_branch(repo_of_branch, branch)
+            )
+            cancelled: asyncio.CancelledError | None = None
+            while not deleting.done():
+                try:
+                    await asyncio.shield(deleting)
+                except asyncio.CancelledError as exc:
+                    cancelled = exc
+                except Exception as exc:  # noqa: BLE001 — clean-up only
+                    logger.warning(
+                        "autobuild_runner: could not delete %s after the build "
+                        "ended (%s); a later sweep of this feature deletes it",
+                        branch,
+                        type(exc).__name__,
+                    )
+                    break
+            if cancelled is not None:
+                raise cancelled
 
 
 async def _run_one_build(state: AutobuildRunnerState) -> dict[str, Any]:
