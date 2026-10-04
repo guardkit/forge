@@ -88,13 +88,19 @@ def _capacity(path: Path) -> dict[str, int] | None:
 
 
 def inspect_worktree_capacity(
-    base: Path, *, min_available_bytes: int, reserved_bytes: int = 0
+    base: Path,
+    *,
+    min_available_bytes: int,
+    reserved_bytes: int = 0,
+    own_reserve_bytes: int = 0,
 ) -> dict[str, Any]:
     """Check the filesystem that will hold ``base`` before creating anything.
 
-    ``reserved_bytes`` is free space already reserved by other builds running
-    beside this one (3 October 2026, concurrent builds); it is counted as
-    spent. Zero, the default, is the check as it always was.
+    ``min_available_bytes`` is the floor: free space that must REMAIN after
+    this build starts. ``reserved_bytes`` is what other builds running beside
+    this one have reserved, and ``own_reserve_bytes`` what this build will
+    reserve (4 October 2026, concurrent builds); both count as spent. Zero
+    for both, the default, is the check as it always was.
     """
     probe = base.expanduser()
     while not probe.exists() and probe != probe.parent:
@@ -106,6 +112,7 @@ def inspect_worktree_capacity(
         "probed_path": str(probe),
         "min_available_bytes": int(min_available_bytes),
         "reserved_bytes": int(reserved_bytes),
+        "own_reserve_bytes": int(own_reserve_bytes),
         "capacity": capacity,
     }
     if min_available_bytes <= 0:
@@ -114,16 +121,23 @@ def inspect_worktree_capacity(
         report["detail"] = "worktree filesystem capacity could not be read"
     elif capacity["available_inodes"] <= 0:
         report["detail"] = "worktree filesystem has no available inodes"
-    elif capacity["available_bytes"] - reserved_bytes < min_available_bytes:
-        held = (
-            f" ({reserved_bytes} of them reserved by other builds running now)"
-            if reserved_bytes
-            else ""
-        )
-        report["detail"] = (
-            f"worktree filesystem has {capacity['available_bytes']} available bytes"
-            f"{held}, below the required {min_available_bytes}"
-        )
+    elif (
+        capacity["available_bytes"] - reserved_bytes - own_reserve_bytes
+        < min_available_bytes
+    ):
+        if reserved_bytes or own_reserve_bytes:
+            left = capacity["available_bytes"] - reserved_bytes - own_reserve_bytes
+            report["detail"] = (
+                f"worktree filesystem has {capacity['available_bytes']} available "
+                f"bytes; other builds running now reserve {reserved_bytes} and this "
+                f"build reserves {own_reserve_bytes}, which would leave {left}, "
+                f"below the {min_available_bytes} that must stay free"
+            )
+        else:
+            report["detail"] = (
+                f"worktree filesystem has {capacity['available_bytes']} available "
+                f"bytes, below the required {min_available_bytes}"
+            )
     else:
         report.update(ok=True, detail="worktree filesystem capacity is sufficient")
     return report
