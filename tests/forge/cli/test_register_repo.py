@@ -2019,3 +2019,26 @@ def test_no_warning_when_every_declared_document_is_there_or_none_is_declared(
     assert undeclared.exit_code == 0, undeclared.output
     assert _status_of(present, "documents") == []
     assert _status_of(undeclared, "documents") == []
+
+
+def test_a_declared_document_that_is_a_link_is_warned_and_nothing_is_written(
+    _isolate, tmp_path
+):
+    repo = _make_repo(_isolate, "bench-one", toolchain=_DECLARES_TWO)
+    (repo / "docs" / "constitution").mkdir(parents=True)
+    (repo / "docs" / "constitution" / "real.md").write_text("m\n", encoding="utf-8")
+    (repo / "docs" / "constitution" / "mission.md").symlink_to("real.md")
+    (repo / "docs" / "constitution" / "tech-stack.md").write_text("t\n", encoding="utf-8")
+    config = _write_config(tmp_path)
+    before = _tree_digest(repo)
+
+    result = _run(config, str(repo), "--json")
+
+    assert result.exit_code == 0, result.output
+    (detail,) = [d for name, _, d in _steps(result) if name == "documents"]
+    assert detail == (
+        "declared document is a link, which builds refuse: "
+        "docs/constitution/mission.md"
+    )
+    assert _tree_digest(repo) == before
+    assert (repo / "docs" / "constitution" / "mission.md").is_symlink()
