@@ -1066,3 +1066,49 @@ def test_the_reason_words(
     assert skip.reason == reason
     assert skip.planning_run == CORRELATION
     assert skip.sentence == NO_AFTER_DEPLOY_CHECK_SENTENCE.format(reason=reason)
+
+
+# ---------------------------------------------------------------------------
+# A prepared feature's card names where its spec and plan came from
+# (4 October 2026, project initialisation Part 6)
+# ---------------------------------------------------------------------------
+
+
+class TestThePreparedFeatureLineOnTheRoutineCard:
+    @pytest.mark.asyncio
+    async def test_a_prepared_build_gets_one_line_naming_the_commit_and_branch(
+        self, config, pool
+    ) -> None:
+        _insert_build(pool)
+        pool.connection.execute(
+            "UPDATE builds SET source_commit = ?, start_commit = ?, "
+            "target_branch = 'main', branch = 'feature/prepared' WHERE build_id = ?",
+            ("ab12" * 10, "ab12" * 10, BUILD_ID),
+        )
+        pool.connection.commit()
+
+        words = await _routine_card(config, pool)
+
+        lines = words.split("\n")
+        expected = (
+            "The spec and plan were written elsewhere and supplied at "
+            "ab12ab12ab12 on feature/prepared; this card counts only what the "
+            "build changed."
+        )
+        assert lines[1] == expected
+        # Only that line was added; every other line is as it was.
+        assert "\n".join(lines[:1] + lines[2:]) == _card_as_it_was()
+
+    @pytest.mark.asyncio
+    async def test_a_planned_build_s_card_is_byte_for_byte_unchanged(
+        self, config, pool
+    ) -> None:
+        _insert_build(pool)
+        pool.connection.execute(
+            "UPDATE builds SET start_commit = ?, target_branch = 'main' "
+            "WHERE build_id = ?",
+            ("a" * 40, BUILD_ID),
+        )
+        pool.connection.commit()
+
+        assert await _routine_card(config, pool) == _card_as_it_was()

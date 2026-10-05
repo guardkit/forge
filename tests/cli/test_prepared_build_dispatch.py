@@ -411,3 +411,54 @@ async def test_an_unregistered_repository_is_refused_by_name(
 
     assert _row(persistence) is None
     assert "someone/else is not registered" in rejections[0][1]
+
+
+@pytest.mark.asyncio
+async def test_the_boot_reconcile_composition_wires_the_admission_too(
+    monkeypatch: pytest.MonkeyPatch,
+    forge_config: ForgeConfig,
+    persistence: SqliteLifecyclePersistence,
+) -> None:
+    """The boot-time reconcile builds its own consumer deps; the admission is
+    wired there as well, so it never fails open on that path."""
+    from forge.cli import _serve_deps
+    from forge.cli._serve_production import _build_consumer_reconcile_seam
+
+    seen: dict[str, Any] = {}
+    real = _serve_deps.build_pipeline_consumer_deps
+
+    def _capture(*args: Any, **kwargs: Any) -> Any:
+        seen.update(kwargs)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(_serve_deps, "build_pipeline_consumer_deps", _capture)
+
+    await _build_consumer_reconcile_seam(
+        persistence, forge_config, _RecordingStarter()
+    )(_StubNatsClient())
+
+    assert callable(seen.get("prepared_build_admission"))
+
+
+@pytest.mark.asyncio
+async def test_a_prepared_payload_marked_mode_c_is_refused(
+    tmp_path: Path,
+    project: Project,
+    forge_config: ForgeConfig,
+    persistence: SqliteLifecyclePersistence,
+) -> None:
+    """A prepared feature is a whole feature, not a single-task fix."""
+    project.commit_on(BRANCH, bundle())
+    client, starter, rejections = _StubNatsClient(), _RecordingStarter(), []
+    deps = _deps(
+        client, forge_config, persistence, starter, _admission(forge_config, tmp_path), rejections
+    )
+
+    async def _ack() -> None:
+        return None
+
+    await deps.dispatch_build(_payload(mode="mode-c", task_id="TASK-AB12-001"), _ack)
+
+    assert _row(persistence) is None
+    assert starter.calls == []
+    assert "single-task fix (mode-c)" in rejections[0][1]

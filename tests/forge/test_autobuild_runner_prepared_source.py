@@ -93,7 +93,13 @@ class _Proc:
         return None
 
 
-def _stub(calls: list[dict[str, Any]], *, validate_code: int = 0, validate_out: bytes = b"{}"):
+def _stub(
+    calls: list[dict[str, Any]],
+    *,
+    validate_code: int = 0,
+    validate_out: bytes = b"{}",
+    build_code: int = 0,
+):
     real = asyncio.create_subprocess_exec
 
     async def _exec(*args: Any, **kwargs: Any) -> Any:
@@ -104,7 +110,7 @@ def _stub(calls: list[dict[str, Any]], *, validate_code: int = 0, validate_out: 
             calls.append({"argv": list(args), "cwd": cwd, "head": head})
             if len(args) > 2 and args[1] == "feature" and args[2] == "validate":
                 return _Proc(validate_code, validate_out)
-            return _Proc(0, b"guardkit running\n")
+            return _Proc(build_code, b"guardkit running\n")
         return await real(*args, **kwargs)
 
     return _exec
@@ -194,8 +200,10 @@ def test_a_failed_feature_validate_stops_the_build_with_guardkits_words(
     joined = " ".join(r.getMessage() for r in caplog.records)
     assert "guardkit feature validate refused FEAT-AB12" in joined
     assert "Task file not found: tasks/backlog/x/TASK-AB12-001.md" in joined
-    # Kept for forensics, like every other failed build's worktree.
+    # Kept for forensics, like every other failed build's worktree; the
+    # build's own branch goes anyway (the kept tree is detached at the commit).
     assert (tmp_path / "wt" / BUILD_ID).exists()
+    assert _git(repo, "branch", "--list", SOURCE_BRANCH) == ""
 
 
 def test_a_commit_missing_from_the_clone_is_refused_without_fetching(
@@ -232,3 +240,119 @@ def test_without_a_source_commit_the_launch_is_unchanged(
     assert build["argv"][-2:] == ["--base-branch", QUEUED_BRANCH]
     assert _lifecycle(result) == "completed"
     assert _git(repo, "branch", "--list", "forge/source/*") == ""
+
+
+def test_a_failed_build_deletes_its_own_branch_and_keeps_its_worktree(
+    clone: tuple[Path, str], tmp_path: Path, monkeypatch
+) -> None:
+    repo, admitted = clone
+    monkeypatch.setenv(ar.FORGE_AUTOBUILD_WORKTREE_BASE_ENV, str(tmp_path / "wt"))
+    monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(tmp_path / "receipts"))
+
+    calls: list[dict[str, Any]] = []
+    result = _run(repo, _payload(admitted), calls, build_code=1)
+
+    assert _lifecycle(result) == "failed"
+    assert len(calls) == 2  # validate, then the build that failed
+    assert (tmp_path / "wt" / BUILD_ID).exists()
+    assert _git(repo, "branch", "--list", SOURCE_BRANCH) == ""
+
+
+def test_the_requeue_sweep_deletes_a_prior_prepared_builds_branch(
+    clone: tuple[Path, str], tmp_path: Path, monkeypatch
+) -> None:
+    """A prior prepared build of the same feature left its kept worktree (with
+    GuardKit's inner tree on autobuild/<feature>) and, from before this rule,
+    its own branch. The fresh dispatch's sweep clears both."""
+    repo, admitted = clone
+    base = tmp_path / "wt"
+    monkeypatch.setenv(ar.FORGE_AUTOBUILD_WORKTREE_BASE_ENV, str(base))
+    monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(tmp_path / "receipts"))
+    prior = "build-FEAT-AB12-20261003090000"
+    prior_branch = f"forge/source/{prior}"
+    _git(repo, "branch", prior_branch, admitted)
+    outer = base / prior
+    base.mkdir()
+    _git(repo, "worktree", "add", "-q", "--detach", str(outer), admitted)
+    inner = outer / ".guardkit" / "worktrees" / FEATURE
+    inner.parent.mkdir(parents=True)
+    _git(repo, "worktree", "add", "-q", "-b", f"autobuild/{FEATURE}", str(inner), admitted)
+
+    calls: list[dict[str, Any]] = []
+    result = _run(repo, _payload(admitted), calls)
+
+    assert _lifecycle(result) == "completed"
+    assert _git(repo, "branch", "--list", prior_branch) == ""
+    assert _git(repo, "branch", "--list", SOURCE_BRANCH) == ""
+    assert not outer.exists()
+
+
+def test_the_sweep_clears_a_prior_branch_left_with_no_worktree_at_all(
+    clone: tuple[Path, str], tmp_path: Path, monkeypatch
+) -> None:
+    """A prior prepared build's runner was stopped after it made its own
+    branch and before GuardKit made any worktree: only the branch is left. A
+    branch of another feature, and of a build still running, are left alone."""
+    repo, admitted = clone
+    monkeypatch.setenv(ar.FORGE_AUTOBUILD_WORKTREE_BASE_ENV, str(tmp_path / "wt"))
+    monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(tmp_path / "receipts"))
+    prior_branch = "forge/source/build-FEAT-AB12-20261003080000"
+    other_feature = "forge/source/build-FEAT-CD34-20261003080000"
+    live_branch = "forge/source/build-FEAT-AB12-20261003070000"
+    _git(repo, "branch", prior_branch, admitted)
+    _git(repo, "branch", other_feature, admitted)
+    _git(repo, "branch", live_branch, admitted)
+    monkeypatch.setattr(
+        ar,
+        "_prior_build_status",
+        lambda build_id: "RUNNING" if build_id.endswith("070000") else None,
+    )
+
+    calls: list[dict[str, Any]] = []
+    result = _run(repo, _payload(admitted), calls)
+
+    assert _lifecycle(result) == "completed"
+    assert _git(repo, "branch", "--list", prior_branch) == ""
+    assert _git(repo, "branch", "--list", other_feature) != ""
+    assert _git(repo, "branch", "--list", live_branch) != ""
+
+
+def test_a_cancel_during_the_branch_delete_lets_it_finish_then_is_raised(
+    tmp_path: Path, monkeypatch
+) -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    finished: list[str] = []
+
+    async def _fake_build(_state: Any) -> dict[str, Any]:
+        claim = ar._CURRENT_BUILD_CLAIM.get()
+        assert claim is not None
+        claim.source_branch = (tmp_path, SOURCE_BRANCH)
+        return {"ok": True}
+
+    async def _slow_delete(_repo: Path, branch: str | None) -> None:
+        started.set()
+        await release.wait()
+        finished.append(str(branch))
+
+    monkeypatch.setattr(ar, "_run_one_build", _fake_build)
+    monkeypatch.setattr(ar, "_delete_source_branch", _slow_delete)
+    description = "RUN_AUTOBUILD subagent=autobuild_runner payload=" + json.dumps(
+        {"build_id": BUILD_ID, "feature_id": FEATURE}
+    )
+
+    async def _scenario() -> None:
+        task = asyncio.ensure_future(
+            ar._running_wave_body({"messages": [HumanMessage(content=description)]})
+        )
+        await started.wait()
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()  # the delete is still being allowed to finish
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(_scenario())
+
+    assert finished == [SOURCE_BRANCH]

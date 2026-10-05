@@ -39,7 +39,10 @@ def h6_probe():
     assert sha(pristine)==wanted,'pristine current copy changed'
     cx=sqlite3.connect(pristine.as_uri()+'?mode=ro&immutable=1',uri=True)
     assert cx.execute('PRAGMA quick_check').fetchall()==[('ok',)]
-    assert cx.execute('SELECT max(version) FROM schema_version').fetchone()[0]==16
+    # The ledger's own schema version, reported and checked by validate_h6
+    # against rollout_support.LEDGER_SCHEMA_VERSION ("Teach it version 17").
+    schema=cx.execute('SELECT max(version) FROM schema_version').fetchone()[0]
+    assert type(schema) is int,'ledger records no schema version'
     required={'publication_records':'build_id feature_id repo decided_by decided_at target_branch g_commit build_tip j_commit attempt result checked_json lease_holder lease_expires_at turn lines_json created_at updated_at',
               'deployment_targets':'target counter holder_build holder_turn holder_name granted_at expires_at running_commit running_identity running_build running_at created_at updated_at',
               'builds':'build_id feature_id repo branch feature_yaml_path status triggered_by correlation_id queued_at mode start_commit target_branch'}
@@ -134,7 +137,7 @@ def h6_probe():
         if table not in ('builds','stage_log','publication_records','deployment_targets'):assert after==original,'unrelated rows added in '+table
     c.close();assert sha(pristine)==wanted
     assert not any(n=='nats' or n.startswith('nats.') for n in sys.modules)
-    result={'format_version':1,'outcome':'handled-both','candidate_image_id':image,'configuration_sha256':sys.argv[5],'pristine_sha256':wanted,'working_pre_fixture_sha256':pre_fixture,'schema_version':16,'columns':columns,'fixture_ids':{'build':build,'target':target},'git':{'G':G,'tip':tip,'J':J,'tree':tree},'publication':{'before_sha256':hashlib.sha256(publication_before.encode()).hexdigest(),'after_sha256':hashlib.sha256(publication_after.encode()).hexdigest(),'turn':record.turn,'result':record.result,'g_commit':record.g_commit,'j_commit':record.j_commit,'checked':record.checked,'original_lines_preserved':True,'line_kinds':[x.kind+' '+x.step for x in record.lines],'send_result':send.detail,'callbacks':callbacks},'deployment':{'N':N,'N_plus_1':grant.counter,'stale_fencing':fencing,'stale_record_unchanged':True,'reconcile':reconciled,'old_note':old_note,'old_answers':answers,'successor':second_answer,'final_note':final_note},'cleanup':'no owned worker remains','existing_rows_unchanged':True,'worker_group_empty':True,'worker_thread_stopped':True,'real_client_modules':[],'init':{'probe_pid':os.getpid(),'pid1':pid1}}
+    result={'format_version':1,'outcome':'handled-both','candidate_image_id':image,'configuration_sha256':sys.argv[5],'pristine_sha256':wanted,'working_pre_fixture_sha256':pre_fixture,'schema_version':schema,'columns':columns,'fixture_ids':{'build':build,'target':target},'git':{'G':G,'tip':tip,'J':J,'tree':tree},'publication':{'before_sha256':hashlib.sha256(publication_before.encode()).hexdigest(),'after_sha256':hashlib.sha256(publication_after.encode()).hexdigest(),'turn':record.turn,'result':record.result,'g_commit':record.g_commit,'j_commit':record.j_commit,'checked':record.checked,'original_lines_preserved':True,'line_kinds':[x.kind+' '+x.step for x in record.lines],'send_result':send.detail,'callbacks':callbacks},'deployment':{'N':N,'N_plus_1':grant.counter,'stale_fencing':fencing,'stale_record_unchanged':True,'reconcile':reconciled,'old_note':old_note,'old_answers':answers,'successor':second_answer,'final_note':final_note},'cleanup':'no owned worker remains','existing_rows_unchanged':True,'worker_group_empty':True,'worker_thread_stopped':True,'real_client_modules':[],'init':{'probe_pid':os.getpid(),'pid1':pid1}}
     (root/'h6-result.json').write_text(json.dumps(result,sort_keys=True,indent=2)+'\n');print(json.dumps(result))
 
 
@@ -144,7 +147,7 @@ def validate_h6(result,candidate,digest,configuration_sha256):
     try:
         require(type(result['format_version']) is int and result['format_version']==1 and result['outcome']=='handled-both')
         require(result['candidate_image_id']==candidate and result['pristine_sha256']==digest and result['working_pre_fixture_sha256']==digest and result['configuration_sha256']==configuration_sha256)
-        require(type(result['schema_version']) is int and result['schema_version']==16 and result['existing_rows_unchanged'] is True and result['real_client_modules']==[])
+        require(type(result['schema_version']) is int and result['schema_version']==r.LEDGER_SCHEMA_VERSION and result['existing_rows_unchanged'] is True and result['real_client_modules']==[])
         require(result['cleanup']=='no owned worker remains' and result['worker_group_empty'] is True and result['worker_thread_stopped'] is True)
         require(type(result['init']['probe_pid']) is int and result['init']['probe_pid']>1)
         needed={'builds':{'build_id','status','mode','start_commit','target_branch'},'publication_records':{'build_id','g_commit','j_commit','checked_json','turn','lines_json'},'deployment_targets':{'target','counter','holder_build','holder_turn','running_commit'}}

@@ -94,6 +94,7 @@ __all__ = [
     "approval_subject_for",
     "branch_to_merge",
     "card_line_about_the_after_deploy_check",
+    "card_line_about_the_supplied_plan",
     "default_merge_branch",
     "git_rev_parse_main",
     "merge_request_id",
@@ -1399,6 +1400,27 @@ def after_deploy_check_skip_for(
     return skip
 
 
+def card_line_about_the_supplied_plan(row: Any) -> str:
+    """One sentence for a PREPARED build, or ``""`` (the card unchanged).
+
+    4 October 2026 (project initialisation, Part 6). A feature planned
+    elsewhere is built from the commit it was supplied at, and its recorded
+    ``start_commit`` is that same commit, so the card's counts are the build's
+    own changes and never the supplied spec and plan files. The card says
+    where those came from. A build with no recorded ``source_commit`` — every
+    factory-planned or hand-queued build — gets nothing, byte for byte.
+    """
+    sha = str(getattr(row, "source_commit", None) or "").strip()
+    if not sha:
+        return ""
+    branch = str(getattr(row, "branch", None) or "").strip()
+    where = f" on {branch}" if branch else ""
+    return (
+        f"The spec and plan were written elsewhere and supplied at "
+        f"{sha[:12]}{where}; this card counts only what the build changed."
+    )
+
+
 def card_line_about_the_after_deploy_check(skip: AfterDeployCheckSkip | None) -> str:
     """The sentence both merge cards carry, or ``""`` (the card unchanged)."""
     return skip.sentence if skip is not None else ""
@@ -1647,6 +1669,23 @@ class MergeOfferService:
         # nothing at all when a check was registered or nothing can be read.
         no_check = self._read_the_after_deploy_check(event)
 
+        # A PREPARED feature (4 October 2026): one line naming the commit and
+        # branch its spec and plan were supplied at. Read off the build row;
+        # anything unreadable leaves the card exactly as it was.
+        try:
+            supplied = card_line_about_the_supplied_plan(
+                self._pool.get_build_row(event.build_id)
+            )
+        except Exception as exc:  # noqa: BLE001 — a reader never stops a card
+            logger.warning(
+                "merge-offer: could not read whether %s was a prepared "
+                "feature (%s: %s) — the card says nothing about it",
+                event.build_id,
+                type(exc).__name__,
+                exc,
+            )
+            supplied = ""
+
         def _words(branch: str, merge_branch: str | None) -> str:
             from forge.cli._serve_gate_activation import card_line_about_scope
 
@@ -1677,6 +1716,8 @@ class MergeOfferService:
             # the not-checked line and each "Asked / Answered" pair without
             # reading a paragraph.
             lines = [" ".join(opening)]
+            if supplied:
+                lines.append(supplied)
             lines.extend(line for line in checked.lines if line)
             about_the_check = card_line_about_the_after_deploy_check(no_check)
             if about_the_check:

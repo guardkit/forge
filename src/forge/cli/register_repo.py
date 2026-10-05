@@ -691,17 +691,44 @@ def _read_repo_config_dict(repo: Path) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
-def _declared_documents_missing(repo: Path, config_text: str) -> list[str]:
-    """The declared binding documents this checkout does not have, in order.
+def _declared_document_warnings(repo: Path, config_text: str) -> list[str]:
+    """One sentence per declared binding document builds would refuse, in order.
 
     Read with the same reader the build admission uses, so registration and
-    admission cannot disagree about what the project declared. A file that
-    cannot be read declares nothing here; admission says why at build time.
+    admission cannot disagree about what the project declared. A document
+    that is a symbolic link, or is reached through a folder that is one, is
+    named (``lstat`` on every component: builds refuse a link, whatever it
+    points at); one that is not in the checkout is named as
+    missing. A file that cannot be read declares nothing here; admission says
+    why at build time.
     """
     from forge.planning.declared_memory import read_declared_binding_documents
 
     documents, _why = read_declared_binding_documents(config_text or None)
-    return [path for path in documents if not (repo / path).is_file()]
+    warnings: list[str] = []
+    for path in documents:
+        parts = Path(path).parts
+        # Every component, not only the file: a folder on the way that is a
+        # link (``docs -> ../real``) is a link too, and in git the document is
+        # then not a file under that folder at all.
+        linked = next(
+            (
+                "/".join(parts[:index])
+                for index in range(1, len(parts) + 1)
+                if (repo.joinpath(*parts[:index])).is_symlink()
+            ),
+            None,
+        )
+        if linked == path:
+            warnings.append(f"declared document is a link, which builds refuse: {path}")
+        elif linked is not None:
+            warnings.append(
+                f"declared document is reached through a link ({linked}), "
+                f"which builds refuse: {path}"
+            )
+        elif not (repo / path).is_file():
+            warnings.append(f"declared but missing: {path}")
+    return warnings
 
 
 def _guardkit_is_importable() -> bool:
@@ -1389,18 +1416,13 @@ def register_repo_cmd(
     # ---- the documents the project's builds are held to (4 October 2026).
     # Registration stays mechanical: it never writes, templates or seeds these.
     # It only says which ones the project declares
-    # (autobuild.player.required_documents) and this checkout lacks, so the
-    # gap is seen now rather than at the first build. A warning; nothing is
-    # written and the exit code does not change.
-    missing_documents = _declared_documents_missing(repo, repo_text)
-    if missing_documents:
-        steps.append(
-            Step(
-                "documents",
-                "warn",
-                "; ".join(f"declared but missing: {path}" for path in missing_documents),
-            )
-        )
+    # (autobuild.player.required_documents) and this checkout lacks, or has
+    # only as a symbolic link (which builds refuse), so the gap is seen now
+    # rather than at the first build. A warning; nothing is written and the
+    # exit code does not change.
+    document_warnings = _declared_document_warnings(repo, repo_text)
+    if document_warnings:
+        steps.append(Step("documents", "warn", "; ".join(document_warnings)))
 
     if repo_changed and not dry_run:
         repo_config.parent.mkdir(parents=True, exist_ok=True)
