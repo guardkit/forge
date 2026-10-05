@@ -702,11 +702,15 @@ def _declared_document_warnings(repo: Path, config_text: str) -> list[str]:
     missing. A file that cannot be read declares nothing here; admission says
     why at build time.
     """
-    from forge.planning.declared_memory import read_declared_binding_documents
+    from forge.planning.declared_memory import read_declared_project_documents
 
-    documents, _why = read_declared_binding_documents(config_text or None)
+    declared, why = read_declared_project_documents(config_text or None)
     warnings: list[str] = []
-    for path in documents:
+    if why:
+        # The one reading rule's own check (4 October 2026): planning,
+        # admission and the Coach would all refuse this declaration.
+        warnings.append(f"declared documents cannot be used, which builds refuse: {why}")
+    for path in (entry.path for entry in declared.documents):
         parts = Path(path).parts
         # Every component, not only the file: a folder on the way that is a
         # link (``docs -> ../real``) is a link too, and in git the document is

@@ -1986,6 +1986,22 @@ def test_declared_but_missing_documents_are_warned_and_nothing_is_written(
     assert not (repo / "docs" / "constitution" / "tech-stack.md").exists()
 
 
+def test_a_declaration_builds_would_refuse_is_warned(_isolate, tmp_path):
+    """The one reading rule's own check (GuardKit's allowed keys) is reported
+    too, since planning, admission and the Coach would all refuse it."""
+    repo = _make_repo(
+        _isolate, "bench-one", toolchain=_DECLARES_TWO + "    surprise: [x]\n"
+    )
+    config = _write_config(tmp_path)
+
+    result = _run(config, str(repo), "--json")
+
+    assert result.exit_code == 0, result.output
+    (detail,) = [d for name, _, d in _steps(result) if name == "documents"]
+    assert detail.startswith("declared documents cannot be used, which builds refuse:")
+    assert "surprise" in detail
+
+
 def test_each_missing_document_is_named(_isolate, tmp_path):
     repo = _make_repo(_isolate, "bench-one", toolchain=_DECLARES_TWO)
     config = _write_config(tmp_path)

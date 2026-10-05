@@ -348,7 +348,10 @@ _MISSING_CASES = {
     "assumptions": (f"{SPEC_DIR}/{SPEC_NAME}_assumptions.yaml", "assumptions file"),
     "summary": (f"{SPEC_DIR}/{SPEC_NAME}_summary.md", "the spec's summary"),
     "guide": (f"{TASK_DIR}/IMPLEMENTATION-GUIDE.md", "the plan's guide"),
-    "declared document": ("docs/constitution/mission.md", "the binding document"),
+    "declared document": (
+        "docs/constitution/mission.md",
+        "autobuild.player.required_documents",
+    ),
     "pass bar": (f"qa/pass-bar-{TASKS[0]}.yaml", f"the pass bar for {TASKS[0]}"),
     "QA seed": (f"qa/pass-bar-seed-{SPEC_NAME}.yaml", "the spec's QA seed"),
 }
@@ -477,6 +480,103 @@ async def test_a_declared_document_that_is_a_symbolic_link_is_refused(
     assert not answer.ok
     assert "docs/constitution/mission.md" in (answer.refusal or "")
     assert "symbolic link" in (answer.refusal or "")
+
+
+# ---------------------------------------------------------------------------
+# The one reading rule: admission refuses what planning and the Coach refuse
+# ---------------------------------------------------------------------------
+
+
+def _commit_bytes_on(project: Project, branch: str, files: dict[str, bytes]) -> None:
+    _git(project.writer, "checkout", "-q", branch)
+    for rel, data in files.items():
+        (project.writer / rel).parent.mkdir(parents=True, exist_ok=True)
+        (project.writer / rel).write_bytes(data)
+    _git(project.writer, "add", "-A")
+    _git(project.writer, "commit", "-qm", "bytes")
+    _git(project.writer, "push", "-q", "-f", "origin", f"HEAD:refs/heads/{branch}")
+    _git(project.writer, "checkout", "-q", "main")
+
+
+@pytest.mark.asyncio
+async def test_a_binding_document_that_is_not_utf8_is_refused(
+    project: Project, runner: WorktreeGitRunner
+) -> None:
+    project.commit_on(BRANCH, bundle())
+    _commit_bytes_on(project, BRANCH, {"docs/constitution/mission.md": b"The \xff mission\n"})
+
+    answer = await _admit(project, runner)
+
+    assert not answer.ok
+    assert "docs/constitution/mission.md" in (answer.refusal or "")
+    assert "not UTF-8 text" in (answer.refusal or "")
+
+
+@pytest.mark.asyncio
+async def test_documents_over_the_budget_are_refused(
+    project: Project, runner: WorktreeGitRunner
+) -> None:
+    from forge.planning.project_documents import PROJECT_DOCUMENTS_BUDGET_BYTES
+
+    files = bundle()
+    files["docs/constitution/mission.md"] = "m" * (PROJECT_DOCUMENTS_BUDGET_BYTES + 1)
+    project.commit_on(BRANCH, files)
+
+    answer = await _admit(project, runner)
+
+    assert not answer.ok
+    assert str(PROJECT_DOCUMENTS_BUDGET_BYTES) in (answer.refusal or "")
+
+
+@pytest.mark.asyncio
+async def test_a_declared_instruction_file_must_be_there(
+    project: Project, runner: WorktreeGitRunner
+) -> None:
+    config = config_text().replace(
+        "    required_documents:", "    instructions: [docs/how-we-work.md]\n    required_documents:"
+    )
+    project.commit_on(BRANCH, bundle(config=config))
+
+    answer = await _admit(project, runner)
+
+    assert not answer.ok
+    assert "docs/how-we-work.md" in (answer.refusal or "")
+    assert "autobuild.player.instructions" in (answer.refusal or "")
+
+
+@pytest.mark.asyncio
+async def test_an_instruction_link_out_of_the_repository_is_refused(
+    project: Project, runner: WorktreeGitRunner
+) -> None:
+    project.commit_on(BRANCH, bundle())
+    _git(project.writer, "checkout", "-q", BRANCH)
+    (project.writer / "AGENTS.md").symlink_to("../../outside/AGENTS.md")
+    _git(project.writer, "add", "-A")
+    _git(project.writer, "commit", "-qm", "a link out")
+    _git(project.writer, "push", "-q", "-f", "origin", f"HEAD:refs/heads/{BRANCH}")
+    _git(project.writer, "checkout", "-q", "main")
+
+    answer = await _admit(project, runner)
+
+    assert not answer.ok
+    assert "AGENTS.md" in (answer.refusal or "")
+    assert "outside the repository" in (answer.refusal or "")
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_player_key_is_refused_only_when_documents_are_declared(
+    project: Project, runner: WorktreeGitRunner
+) -> None:
+    declared = config_text() + "    surprise: [x]\n"
+    project.commit_on(BRANCH, bundle(config=declared))
+    refused = await _admit(project, runner)
+
+    undeclared = config_text(documents=()) + "autobuild:\n  player:\n    surprise: [x]\n"
+    project.commit_on(BRANCH, bundle(config=undeclared))
+    admitted = await _admit(project, runner)
+
+    assert not refused.ok and "surprise" in (refused.refusal or "")
+    assert admitted.ok, admitted.refusal
 
 
 # ---------------------------------------------------------------------------
