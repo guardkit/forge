@@ -462,3 +462,93 @@ async def test_a_prepared_payload_marked_mode_c_is_refused(
     assert _row(persistence) is None
     assert starter.calls == []
     assert "single-task fix (mode-c)" in rejections[0][1]
+
+
+# ---------------------------------------------------------------------------
+# A prepared submission names the one feature file (Codex review round 1, R4)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "wrong",
+    [
+        lambda copy: str(copy / ".guardkit" / "features" / "FEAT-OTHER.yaml"),
+        lambda copy: str(copy.parent / "another-repo" / ".guardkit" / "features" / f"{FEATURE}.yaml"),
+        lambda copy: f".guardkit/features/FEAT-OTHER.yaml",
+    ],
+    ids=["absolute-wrong-feature", "absolute-wrong-repository", "relative-wrong-feature"],
+)
+async def test_a_prepared_feature_file_must_be_its_own_in_the_registered_checkout(
+    tmp_path: Path,
+    project: Project,
+    forge_config: ForgeConfig,
+    persistence: SqliteLifecyclePersistence,
+    wrong: Any,
+) -> None:
+    project.commit_on(BRANCH, bundle())
+    client, starter, rejections = _StubNatsClient(), _RecordingStarter(), []
+    deps = _deps(
+        client, forge_config, persistence, starter, _admission(forge_config, tmp_path), rejections
+    )
+
+    async def _ack() -> None:
+        return None
+
+    await deps.dispatch_build(_payload(feature_yaml_path=wrong(project.copy)), _ack)
+
+    assert _row(persistence) is None
+    assert starter.calls == []
+    assert f".guardkit/features/{FEATURE}.yaml" in rejections[0][1]
+    assert "the one file a build of" in rejections[0][1]
+
+
+@pytest.mark.asyncio
+async def test_a_prepared_feature_file_given_as_its_absolute_path_is_admitted(
+    tmp_path: Path,
+    project: Project,
+    forge_config: ForgeConfig,
+    persistence: SqliteLifecyclePersistence,
+) -> None:
+    project.commit_on(BRANCH, bundle())
+    client, starter, rejections = _StubNatsClient(), _RecordingStarter(), []
+    deps = _deps(
+        client, forge_config, persistence, starter, _admission(forge_config, tmp_path), rejections
+    )
+
+    async def _ack() -> None:
+        return None
+
+    absolute = str(project.copy / ".guardkit" / "features" / f"{FEATURE}.yaml")
+    await deps.dispatch_build(_payload(feature_yaml_path=absolute), _ack)
+
+    assert rejections == []
+    assert _row(persistence) is not None
+
+
+@pytest.mark.asyncio
+async def test_a_planned_build_keeps_todays_acceptance_of_an_absolute_path(
+    tmp_path: Path,
+    project: Project,
+    forge_config: ForgeConfig,
+    persistence: SqliteLifecyclePersistence,
+) -> None:
+    """A planned build never meets the prepared check: an absolute path
+    elsewhere (the factory's own planning trigger writes one) is accepted."""
+    _planning_run(persistence)
+    client, starter, rejections = _StubNatsClient(), _RecordingStarter(), []
+    admission = _admission(forge_config, tmp_path)
+    deps = _deps(client, forge_config, persistence, starter, admission, rejections)
+
+    async def _ack() -> None:
+        return None
+
+    elsewhere = str(tmp_path / "planning-worktree" / ".guardkit" / "features" / "FEAT-X.yaml")
+    payload = _payload(
+        branch=f"planning/{CID}", triggered_by="forge-internal", feature_yaml_path=elsewhere
+    )
+    await deps.dispatch_build(payload, _ack)
+
+    assert admission.calls == 0
+    assert rejections == []
+    assert _row(persistence) is not None

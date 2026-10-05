@@ -1906,6 +1906,44 @@ def _build_publish_build_failed(
     return publish_build_failed
 
 
+def _prepared_feature_file_refusal(
+    raw: str, *, feature_id: str, repo: str, checkout: str
+) -> str | None:
+    """``None`` when ``raw`` names ``<checkout>/.guardkit/features/<id>.yaml``.
+
+    A relative path must be exactly that repository path; an absolute one must
+    be that file in the registered checkout (compared lexically and, where the
+    paths exist, as resolved). Anything else is one plain sentence.
+    """
+    import os
+    import posixpath
+    from pathlib import Path
+
+    from forge.pipeline.prepared_admission import feature_yaml_relpath
+
+    wanted_rel = feature_yaml_relpath(feature_id)
+    wanted_abs = os.path.normpath(os.path.join(checkout, wanted_rel))
+    if not raw:
+        matches = False
+    elif os.path.isabs(raw):
+        given = os.path.normpath(raw)
+        matches = given == wanted_abs
+        if not matches:
+            try:
+                matches = Path(given).resolve() == Path(wanted_abs).resolve()
+            except (OSError, ValueError):
+                matches = False
+    else:
+        matches = posixpath.normpath(raw.replace("\\", "/")) == wanted_rel
+    if matches:
+        return None
+    return (
+        f"its feature file {raw or '(none)'} is not {wanted_rel} in {repo}'s "
+        f"registered checkout ({wanted_abs}), the one file a build of "
+        f"{feature_id} reads"
+    )
+
+
 def build_prepared_build_admission(
     forge_config: ForgeConfig,
     *,
@@ -1962,6 +2000,19 @@ def build_prepared_build_admission(
                     f"planned elsewhere cannot be admitted for it"
                 )
             )
+        # The ONE file a build of this feature reads (Codex review round 1,
+        # R4): a prepared submission's feature_yaml_path, absolute or relative,
+        # must name the registered checkout's .guardkit/features/<id>.yaml —
+        # never another feature's file, never another repository's. A planned
+        # build never reaches here and keeps today's acceptance.
+        wrong = _prepared_feature_file_refusal(
+            str(getattr(payload, "feature_yaml_path", "") or ""),
+            feature_id=str(payload.feature_id),
+            repo=repo,
+            checkout=str(repo_path),
+        )
+        if wrong is not None:
+            return AdmissionAnswer(refusal=wrong)
         try:
             runner = _runner()
         except Exception as exc:  # noqa: BLE001 — a refusal, never a crash
