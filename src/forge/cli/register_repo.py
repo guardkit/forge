@@ -1225,6 +1225,17 @@ def make_sandbox_clone(sandbox: SandboxStore, *, clone: str, leaf: str, url: str
 #:    build) is seen wholly before or wholly after the move, and every state
 #:    on both sides of each move is counted.
 #:
+#: 4. The consumers are read AGAIN after the snapshot. With intake closed,
+#:    every message that can still appear comes from an internal publisher
+#:    reacting to work that was in flight at some moment — for example a
+#:    planning run that finishes and publishes its build. If that work was in
+#:    flight at the snapshot, the snapshot counts it. If it finished and
+#:    published after the first consumer read and before the snapshot (the
+#:    run terminal, its build not yet admitted, so in no table the snapshot
+#:    counts), its message is on a consumer by the second read — pending, or
+#:    unacknowledged, since the build consumer acks only when the build ends.
+#:    DRAINED needs both consumer reads at zero and the snapshot empty.
+#:
 #: Reading the ledger first would leave a gap: a request processed and acked
 #: between the two reads would be in neither. ``__name__`` guards the run, so
 #: the tests can load these functions and move work between the observations.
@@ -1355,7 +1366,9 @@ def read_ledger(con, spec, between=None):
         "deploy_locks_live": locks_live, "deploy_locks_expired": locks_expired,
     }
 
-def observe(spec, environ, consumers=read_consumers, connect=None, between=None):
+def observe(spec, environ, consumers=read_consumers, connect=None, between=None, recheck=True):
+    # ``recheck=False`` is for the tests only: it shows the gap the second
+    # consumer read closes, by repeating the first read instead.
     url = environ.get("FORGE_NATS_URL", "")
     said = scrubber(url)
     out = {"consumers": consumers(url, spec, said)}
@@ -1368,6 +1381,7 @@ def observe(spec, environ, consumers=read_consumers, connect=None, between=None)
             con.close()
     except Exception as exc:
         out["ledger"] = {"error": said(exc)}
+    out["consumers_after"] = consumers(url, spec, said) if recheck else out["consumers"]
     return out
 
 if __name__ == "__main__":
@@ -1430,12 +1444,12 @@ def judge_drained(facts: Mapping[str, Any], consumers: Sequence[str]) -> list[st
     Drained means all of: no build in an active state (the coordinator's own
     list, ``BUILD_ACTIVE_STATES``); no planning run unfinished; nothing queued
     in the work queue and no admitted item whose planning run or build is not
-    written yet (``count_in_flight``'s rule); no merge and no deploy in progress (a publication
-    record's lease or a deployment target's lock held and not expired — the
-    coordinator's own ``lease_is_live`` and ``held_now`` rule);
-    and each durable consumer feeding the coordinator reads zero pending and
-    zero awaiting acknowledgement. Anything that could not be read is a reason
-    too. An INTERRUPTED build is not one: a restart leaves it as it is, and one
+    written yet (``count_in_flight``'s rule); no merge and no deploy in
+    progress (a publication record's lease or a deployment target's lock held
+    and not expired — the coordinator's own ``lease_is_live`` and ``held_now``
+    rule); and each durable consumer feeding the coordinator reads zero
+    pending and zero awaiting acknowledgement both before and after the
+    ledger read. Anything that could not be read is a reason too. An INTERRUPTED build is not one: a restart leaves it as it is, and one
     that can be relaunched holds an unacknowledged build request, which the
     consumer check already counts. Neither is a merge or a deploy that has
     stopped and holds nothing live (see :func:`drained_notes`).
@@ -1480,22 +1494,23 @@ def judge_drained(facts: Mapping[str, Any], consumers: Sequence[str]) -> list[st
                 reasons.append(f"the ledger's {key.replace('_', ' ')} could not be counted")
             elif n:
                 reasons.append(say(n))
-    read = facts.get("consumers")
-    read = read if isinstance(read, dict) else {}
-    for name in consumers:
-        row = read.get(name)
-        if not isinstance(row, dict) or row.get("error"):
-            why = row.get("error") if isinstance(row, dict) else "no answer"
-            reasons.append(f"the bus consumer {name} could not be read ({why})")
-            continue
-        pending, unacked = _count(row.get("pending")), _count(row.get("ack_pending"))
-        if pending is None or unacked is None:
-            reasons.append(f"the bus consumer {name} gave no counts")
-        elif pending or unacked:
-            reasons.append(
-                f"the bus consumer {name} has {pending} pending and {unacked} awaiting "
-                "acknowledgement (a request on its way in)"
-            )
+    for key, when in (("consumers", "before the ledger read"), ("consumers_after", "after the ledger read")):
+        read = facts.get(key)
+        read = read if isinstance(read, dict) else {}
+        for name in consumers:
+            row = read.get(name)
+            if not isinstance(row, dict) or row.get("error"):
+                why = row.get("error") if isinstance(row, dict) else "no answer"
+                reasons.append(f"the bus consumer {name} could not be read {when} ({why})")
+                continue
+            pending, unacked = _count(row.get("pending")), _count(row.get("ack_pending"))
+            if pending is None or unacked is None:
+                reasons.append(f"the bus consumer {name} gave no counts {when}")
+            elif pending or unacked:
+                reasons.append(
+                    f"the bus consumer {name} had {pending} pending and {unacked} awaiting "
+                    f"acknowledgement {when} (a request on its way in)"
+                )
     return reasons
 
 
@@ -2036,7 +2051,8 @@ def register_repo_cmd(
             _emit(
                 [Step("drained", "ok", "DRAINED: no build active, no planning run, merge or deploy "
                       "unfinished, nothing queued in the work queue, and "
-                      f"{' and '.join(consumers)} each read zero pending and zero unacknowledged")] + notes,
+                      f"{' and '.join(consumers)} each read zero pending and zero unacknowledged "
+                      "before and after the ledger read")] + notes,
                 as_json=as_json,
             )
             return
