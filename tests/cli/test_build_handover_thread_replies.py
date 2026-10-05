@@ -522,3 +522,32 @@ async def test_a_request_without_parent_request_id_gets_no_answer(
         if subject.startswith("pipeline.build-failed.")
     ]
     assert len(failed) == 2, "the refusals themselves are unchanged"
+
+
+@pytest.mark.asyncio
+async def test_a_request_from_another_adapter_gets_no_answer(
+    project: Project, bus: _Bus, starter: _Starter, build_deps: Any
+) -> None:
+    """Jarvis chat's ``queue_build`` sets a parent_request_id that is its own
+    dispatch id, not a Slack message: it is never answered in a thread."""
+    project.commit_on(BRANCH, bundle())
+
+    await handle_message(
+        _direct(
+            bus, originating_adapter="telegram", parent_request_id="dispatch-abc123"
+        ),
+        build_deps,
+    )
+    await handle_message(
+        _direct(
+            bus,
+            originating_adapter="telegram",
+            parent_request_id="dispatch-abc124",
+            repo="synthetic/unregistered",
+            correlation_id="corr-direct-0002",
+        ),
+        build_deps,
+    )
+
+    assert len(starter.replies_at_launch) == 1
+    assert bus.replies() == []
