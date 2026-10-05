@@ -89,14 +89,17 @@ def make_build_thread_reply(nats_client: Any) -> BuildThreadReply:
 
     The same anchored notification the queue commands answer with: the build
     request's ``parent_request_id`` (the Slack message it was typed as) is the
-    thread anchor. A request without one is not answered at all — every
-    build caller before the Slack hand-over sends none, and nothing new is
-    published for them.
+    thread anchor. Only a request that came through Slack
+    (``originating_adapter == "slack"``) and carries one is answered. Jarvis's
+    chat ``queue_build`` tool sets ``parent_request_id`` to its own dispatch
+    or session id, which is not a Slack message, so it is never used as a
+    thread; every other build caller sends none. Nothing new is published for
+    any of them.
     """
 
     async def reply(payload: Any, message: str, *, level: str = "info") -> None:
         anchor = getattr(payload, "parent_request_id", None)
-        if not anchor:
+        if not anchor or getattr(payload, "originating_adapter", None) != "slack":
             return
         envelope = build_planning_notification_envelope(
             correlation_id=str(getattr(payload, "correlation_id", "") or ""),
