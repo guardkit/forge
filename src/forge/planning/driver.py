@@ -1526,13 +1526,55 @@ class _HistoryEvent:
     details: Mapping[str, Any]
 
 
-#: What the plan-stop card says when the build system's stamp check had no
-#: model named (5 October 2026). Plain words for the owner; the build system's
-#: own sentence, which names its setting, stays in the receipt and the log.
+#: What the plan-stop card says about the stamp check's model (5 October
+#: 2026). Plain words for the owner, one sentence per outcome; the build
+#: system's own detail, which names settings and error classes, stays in the
+#: receipt's model_outcome and the coordinator log.
 _NO_STAMP_MODEL_SENTENCE = (
     "The plan's stamp check has no model named, so it did not ask a model; "
     "the factory's settings need the stamp model set."
 )
+_MODEL_RAN_OUT_OF_ROOM_SENTENCE = (
+    "The plan's stamp check asked its model, but the model ran out of room "
+    "before it answered, so these scenarios could not be labelled; the "
+    "model needs a larger answer allowance."
+)
+_MODEL_TIMED_OUT_SENTENCE = (
+    "The plan's stamp check asked its model, but no answer came back in "
+    "time, so these scenarios could not be labelled."
+)
+_MODEL_UNREACHABLE_SENTENCE = (
+    "The plan's stamp check could not reach its model, so these scenarios "
+    "could not be labelled; check that the model service is running."
+)
+_MODEL_FAILED_SENTENCE = (
+    "The plan's stamp check asked its model, but the model did not give a "
+    "usable answer, so these scenarios could not be labelled."
+)
+_MODEL_ANSWER_REJECTED_SENTENCE = (
+    "The plan's stamp check asked its model, but its answer was not one the "
+    "check accepts, so these scenarios could not be labelled."
+)
+
+
+def _model_failed_sentence(detail: str) -> str:
+    """The plain sentence for a stamp-check model call that failed, chosen
+    from the build system's own detail: it ran out of room, it timed out, it
+    could not be reached, or anything else. Never echoes the detail."""
+    lowered = detail.lower()
+    if "ran out of room" in lowered or "max_tokens" in lowered or "was empty" in lowered:
+        return _MODEL_RAN_OUT_OF_ROOM_SENTENCE
+    if "timed out" in lowered or "timeout" in lowered:
+        return _MODEL_TIMED_OUT_SENTENCE
+    if (
+        "connection refused" in lowered
+        or "connecterror" in lowered
+        or "urlerror" in lowered
+        or "name or service not known" in lowered
+        or "unreachable" in lowered
+    ):
+        return _MODEL_UNREACHABLE_SENTENCE
+    return _MODEL_FAILED_SENTENCE
 
 
 class PlanningRunDriver:
@@ -7745,34 +7787,40 @@ class PlanningRunDriver:
     @staticmethod
     def _model_fallback_sentence(stamps: "StampNormalizerOutcome") -> str | None:
         """The one sentence after the titles about the MODEL FALLBACK (rule 16,
-        2026-09-06): what it reported about itself, in the spec's words —
-        asked and could not answer, answer rejected, not asked because no
-        endpoint is configured, or decided some. ``None`` when the normalizer
-        said nothing about it (an older guardkit) — nothing is invented."""
+        2026-09-06): what it reported about itself, in plain words for the
+        owner (5 October 2026) — asked and could not answer (ran out of room,
+        timed out, unreachable, or otherwise), answer rejected, not asked
+        (no model named, or no endpoint configured), or decided some. Never
+        the build system's own detail. ``None`` when the normalizer said
+        nothing about it (an older guardkit) — nothing is invented."""
         outcome = stamps.model_outcome
         if not outcome:
             return None
         status = str(outcome.get("status") or "")
         detail = " ".join(str(outcome.get("detail") or "").split()).rstrip(".")
+        # The card is read by the owner (5 October 2026, Codex round 1): every
+        # sentence here is plain words, never the build system's own detail,
+        # which names settings and error classes. That detail stays in the
+        # receipt's model_outcome and in this one log line.
+        if status in ("asked_and_failed", "answer_rejected", "not_configured"):
+            logger.info(
+                "planning driver: the stamp check's model fallback ended %s; "
+                "the build system said: %s",
+                status,
+                detail or "nothing more",
+            )
         if status == "asked_and_failed":
-            return f"The model fallback was asked and could not answer: {detail or 'no reason was given'}."
+            return _model_failed_sentence(detail)
         if status == "answer_rejected":
-            return f"The model fallback's answer was rejected: {detail or 'no reason was given'}."
+            return _MODEL_ANSWER_REJECTED_SENTENCE
         if status == "not_configured":
-            # Two reasons share this status (5 October 2026): no endpoint is
-            # set, or (current guardkit) no stamp model is named. The card is
-            # read by the owner, so it says which in plain words and never
-            # echoes the build system's setting names; the build system's own
-            # words stay in the receipt's model_outcome and in this log line.
+            # Two reasons share this status: no endpoint is set, or (current
+            # guardkit) no stamp model is named. The endpoint sentence is
+            # unchanged word for word.
             lowered = detail.lower()
             if "endpoint" not in lowered and (
                 "stamp model" in lowered or "guardkit_stamp_model" in lowered
             ):
-                logger.info(
-                    "planning driver: the stamp check's model fallback was not "
-                    "asked; the build system said: %s",
-                    detail,
-                )
                 return _NO_STAMP_MODEL_SENTENCE
             return "The model fallback was not asked: no endpoint is configured."
         if status == "switched_off":
