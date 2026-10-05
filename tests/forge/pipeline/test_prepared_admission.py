@@ -649,6 +649,66 @@ async def test_a_guide_with_no_routes_and_no_manifest_is_admitted(
 
 
 # ---------------------------------------------------------------------------
+# Every bundle file is the file itself (R2); YAML paths stay inside (R3)
+# ---------------------------------------------------------------------------
+
+
+def _replace_with_link(project: Project, path: str, target: str) -> None:
+    _git(project.writer, "checkout", "-q", BRANCH)
+    full = project.writer / path
+    full.unlink()
+    full.symlink_to(target)
+    _git(project.writer, "add", "-A")
+    _git(project.writer, "commit", "-qm", f"{path} becomes a link")
+    _git(project.writer, "push", "-q", "-f", "origin", f"HEAD:refs/heads/{BRANCH}")
+    _git(project.writer, "checkout", "-q", "main")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("path", "target"),
+    [
+        (f"{TASK_DIR}/IMPLEMENTATION-GUIDE.md", "../../../README.md"),
+        (f"{TASK_DIR}/{TASKS[0]}-do-the-thing.md", "../../../../outside.md"),
+        (f"qa/pass-bar-{TASKS[0]}.yaml", "nowhere.yaml"),
+    ],
+    ids=["linked-guide", "linked-task-escaping", "linked-qa-dangling"],
+)
+async def test_a_bundle_file_that_is_a_symbolic_link_is_refused_by_name(
+    project: Project, runner: WorktreeGitRunner, path: str, target: str
+) -> None:
+    project.commit_on(BRANCH, bundle())
+    _replace_with_link(project, path, target)
+
+    answer = await _admit(project, runner)
+
+    assert not answer.ok
+    assert path in (answer.refusal or "")
+    assert "symbolic link" in (answer.refusal or "")
+
+
+@pytest.mark.asyncio
+async def test_a_bundle_file_reached_through_a_linked_folder_is_refused(
+    project: Project, runner: WorktreeGitRunner
+) -> None:
+    files = bundle()
+    real = {k.replace("qa/", "real-qa/", 1): v for k, v in files.items() if k.startswith("qa/")}
+    files = {k: v for k, v in files.items() if not k.startswith("qa/")}
+    project.commit_on(BRANCH, {**files, **real})
+    _git(project.writer, "checkout", "-q", BRANCH)
+    (project.writer / "qa").symlink_to("real-qa")
+    _git(project.writer, "add", "-A")
+    _git(project.writer, "commit", "-qm", "qa is a linked folder")
+    _git(project.writer, "push", "-q", "-f", "origin", f"HEAD:refs/heads/{BRANCH}")
+    _git(project.writer, "checkout", "-q", "main")
+
+    answer = await _admit(project, runner)
+
+    assert not answer.ok
+    assert "reached through qa, a symbolic link" in (answer.refusal or "")
+
+
+# ---------------------------------------------------------------------------
 # The two text rules, directly
 # ---------------------------------------------------------------------------
 
