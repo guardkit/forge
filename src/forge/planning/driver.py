@@ -7750,6 +7750,15 @@ class PlanningRunDriver:
         if status == "answer_rejected":
             return f"The model fallback's answer was rejected: {detail or 'no reason was given'}."
         if status == "not_configured":
+            # Two reasons share this status (5 October 2026): no endpoint is
+            # set, or (current guardkit) no stamp model is named. Say the one
+            # the build system reported; the endpoint sentence stays as it was.
+            # From the stderr echo the detail is the whole line, so its own
+            # lead-in and tail are taken off and only the reason is kept.
+            reason = re.sub(r"^.*?no rule could decide:\s*", "", detail)
+            reason = reason.split(". The titles stay refused")[0].strip().rstrip(".")
+            if reason and "endpoint" not in reason.lower():
+                return f"The model fallback was not asked: {reason}."
             return "The model fallback was not asked: no endpoint is configured."
         if status == "switched_off":
             # Rule 1a (2026-09-07): the machine itself ran this stamping by

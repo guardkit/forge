@@ -7059,6 +7059,39 @@ def test_the_card_prints_what_the_model_fallback_said_about_itself(
     assert ("no fallback home" in card) == (model_outcome["status"] == "not_configured")
 
 
+@pytest.mark.parametrize(
+    "detail",
+    [
+        # what the build system's JSON says
+        "stamp model not configured (GUARDKIT_STAMP_MODEL unset); no model call made",
+        # the same, recovered from its one stderr line
+        "the model fallback was not asked about 2 title(s) no rule could decide: "
+        "stamp model not configured (GUARDKIT_STAMP_MODEL unset); no model call made. "
+        "The titles stay refused and nothing was stamped.",
+    ],
+)
+def test_the_card_names_the_unset_stamp_model_rather_than_a_missing_endpoint(
+    detail: str,
+) -> None:
+    """5 October 2026: a current build system reports ``not_configured`` when
+    no stamp model is named, as well as when no endpoint is set. The card says
+    the reason it reported, and never points at the endpoint when that was
+    not the trouble."""
+    card = _Driver._stamp_normalizer_card(
+        CID,
+        "FEAT-1234",
+        _refusal_with_model({"status": "not_configured", "detail": detail}),
+    )
+    titles = "\n".join(f"  - {t}" for t in _UNDECIDABLE_TITLES)
+    sentence = (
+        "The model fallback was not asked: stamp model not configured "
+        "(GUARDKIT_STAMP_MODEL unset); no model call made."
+    )
+    assert f"{titles}\n{sentence}\nThis repo enforces the routing law" in card
+    assert "no endpoint is configured" not in card
+    assert "and there is no fallback home, so nothing was stamped" in card
+
+
 def test_the_card_says_nothing_about_the_model_when_the_normalizer_said_nothing() -> None:
     """An older guardkit that reports no ``model_outcome``: today's card,
     word for word — nothing invented."""

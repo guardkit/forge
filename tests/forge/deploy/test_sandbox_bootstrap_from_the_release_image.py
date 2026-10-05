@@ -859,6 +859,21 @@ class TestItStartsTwoContainersFromThatOneImage:
         # By name only: the values stay in the sandbox's own environment.
         assert "flash-next-t06" not in helper and "flash-next-t06" not in runner
 
+    def test_the_qa_verifiers_settings_reach_the_runner(self, sandbox):
+        """The QA verifier's second opinion (5 October 2026): its switch and
+        its two addresses reach both containers by name. The machine side
+        already handed the addresses in; this script's list dropped them."""
+        names = {
+            "GUARDKIT_QAV_SHADOW": "1",
+            "GUARDKIT_QAV_SHADOW_URL": "http://router:4000/v1",
+            "GUARDKIT_QAV_PROBE_URL": "http://switchboard:9000",
+        }
+        helper, runner = _the_two_starts(sandbox, **names)
+        for name in names:
+            assert f"--env {name}" in runner, f"{name} was not handed to the runner"
+            assert f"--env {name}" in helper, f"{name} was not handed to the helper"
+        assert "router:4000" not in runner and "switchboard:9000" not in runner
+
     def test_the_runner_serves_as_many_builds_at_once_as_it_is_told(self, sandbox):
         """The runner is ``langgraph dev``, which runs ONE build at a time
         unless told otherwise. FORGE_MAX_CONCURRENT_BUILDS tells it."""
@@ -2697,6 +2712,32 @@ class TestAFreshInstallForwardsWhatTheBootstrapNeeds:
             "GUARDKIT_MAX_PARALLEL_TASKS",
             "GUARDKIT_WAVE_SAME_AREA",
             "GUARDKIT_PLAYER_MODEL_LIMITS",
+        } <= self._names(relative)
+
+    @pytest.mark.parametrize(
+        "relative", ["deploy/estate/.env.example", "deploy/compose/.env.example"]
+    )
+    def test_the_stamp_checks_model_settings_are_forwarded(self, relative):
+        """5 October 2026: set on the machine, these reach the sandbox, and
+        from there the helper that runs the plan's stamp check. An estate set
+        up from these files would otherwise never hand the model's name in,
+        and the check would not ask the model it was told to."""
+        assert {
+            "GUARDKIT_STAMP_MODEL",
+            "GUARDKIT_STAMP_MODEL_URL",
+            "GUARDKIT_STAMP_MODEL_TIMEOUT_S",
+            "GUARDKIT_STAMP_MODEL_MAX_TOKENS",
+        } <= self._names(relative)
+
+    @pytest.mark.parametrize(
+        "relative", ["deploy/estate/.env.example", "deploy/compose/.env.example"]
+    )
+    def test_the_qa_verifiers_settings_are_forwarded(self, relative):
+        """5 October 2026: the QA verifier's switch and its two addresses."""
+        assert {
+            "GUARDKIT_QAV_SHADOW",
+            "GUARDKIT_QAV_SHADOW_URL",
+            "GUARDKIT_QAV_PROBE_URL",
         } <= self._names(relative)
 
     def test_the_two_files_still_agree(self):

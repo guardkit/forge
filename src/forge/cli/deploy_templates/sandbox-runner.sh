@@ -659,6 +659,15 @@ FACTORY_ENV_NAMES=(
   GUARDKIT_STAMP_MODEL_URL
   GUARDKIT_STAMP_MODEL_TIMEOUT_S
   GUARDKIT_STAMP_MODEL_MAX_TOKENS
+  # THE QA VERIFIER'S SECOND OPINION (5 October 2026). The build system's
+  # on/off switch for it and its two addresses. It only records an opinion
+  # beside each Coach verdict and never stops a build. The machine side
+  # already handed the two addresses into this sandbox; this list left them
+  # out, so inside the runner the calls went to "localhost" and were recorded
+  # absent.
+  GUARDKIT_QAV_SHADOW
+  GUARDKIT_QAV_SHADOW_URL
+  GUARDKIT_QAV_PROBE_URL
   FORGE_SIDECAR_IN_SANDBOX
   OPENAI_BASE_URL
   OPENAI_API_KEY
