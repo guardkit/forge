@@ -191,8 +191,13 @@ _ORDINARY_MODES = frozenset({"100644", "100755"})
 _BUILT_PREFIX = "the prepared feature cannot be built: "
 
 
-async def _raw(runner: Any, repo_path: str, commit: str, path: str) -> tuple[Any, str | None]:
-    """The raw committed read of one path: ``(answer, None)`` or ``(None, why)``."""
+async def _raw(
+    runner: Any, repo_path: str, commit: str, path: str, *, mode_only: bool = False
+) -> tuple[Any, str | None]:
+    """The raw committed read of one path: ``(answer, None)`` or ``(None, why)``.
+
+    ``mode_only`` asks only whether the entry is there and what kind it is;
+    nothing is read out of it or decoded (R7)."""
     read = getattr(runner, "read_file_at_commit", None)
     if read is None:
         return None, (
@@ -200,7 +205,10 @@ async def _raw(runner: Any, repo_path: str, commit: str, path: str) -> tuple[Any
             "commit, so the supplied files cannot be checked"
         )
     try:
-        answer = await read(repo_path, commit, path, raw=True)
+        if mode_only:
+            answer = await read(repo_path, commit, path, raw=True, mode_only=True)
+        else:
+            answer = await read(repo_path, commit, path, raw=True)
     except Exception as exc:  # noqa: BLE001 — boundary
         return None, f"{path} could not be read at {commit}: {type(exc).__name__}: {exc}"
     refusal = getattr(answer, "refusal", None)
@@ -366,7 +374,11 @@ async def _walk_reference(
             continue
         candidate = "/".join([*current, part])
         if candidate not in seen:
-            answer, why = await _raw(runner, repo_path, commit, candidate)
+            # Existence and kind only: a reference target is never parsed or
+            # delivered as text, so a picture is a fine target (R7).
+            answer, why = await _raw(
+                runner, repo_path, commit, candidate, mode_only=True
+            )
             if why:
                 return None, why
             seen[candidate] = answer

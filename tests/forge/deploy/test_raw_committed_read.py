@@ -157,3 +157,40 @@ async def test_the_host_runner_and_the_chooser_pass_raw_on(tmp_path: Path) -> No
     chosen = await chooser.read_file_at_commit(str(repo), sha, "docs/link.md", raw=True)
 
     assert direct.is_link and chosen == direct
+
+
+@pytest.mark.asyncio
+async def test_a_mode_only_read_says_what_is_there_without_reading_it(tmp_path: Path) -> None:
+    repo, sha = _repo(tmp_path)
+
+    bad = await read_file_at_commit(repo, sha, "docs/bad.md", raw=True, mode_only=True)
+    link = await read_file_at_commit(repo, sha, "docs/link.md", raw=True, mode_only=True)
+    folder = await read_file_at_commit(repo, sha, "docs", raw=True, mode_only=True)
+
+    # Not UTF-8, and still answered: nothing was read out of the blob.
+    assert bad == FileAtCommit(content="", found=True, ordinary=True, mode="100644")
+    assert link.is_link and link.content == ""
+    assert folder == FileAtCommit(found=False, mode="040000")
+
+
+def test_the_route_and_the_sandbox_runner_pass_mode_only_on(tmp_path: Path) -> None:
+    repo, sha = _repo(tmp_path)
+
+    status, body = process_git_read_file_at_commit_request(
+        {"repo": REPO_KEY, "commit": sha, "file_path": "docs/bad.md", "raw": True, "mode_only": True},
+        config=_config({REPO_KEY: str(repo)}),
+    )
+
+    assert status == 200
+    assert body == {"content": "", "found": True, "refusal": None, "ordinary": True, "mode": "100644"}
+
+
+@pytest.mark.asyncio
+async def test_the_sandbox_runner_sends_mode_only() -> None:
+    post: Any = _Post((200, {"content": "", "found": True, "refusal": None, "mode": "100644"}))
+    runner = SidecarGitRunner("http://127.0.0.1:8225", repo=REPO_KEY, post=post)
+
+    answer = await runner.read_file_at_commit("/srv/x", "c" * 40, "a.png", mode_only=True)
+
+    assert post.sent[0][1]["mode_only"] is True and post.sent[0][1]["raw"] is True
+    assert answer.found and answer.mode == "100644"

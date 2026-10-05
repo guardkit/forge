@@ -852,6 +852,61 @@ async def test_a_markdown_reference_through_a_link_is_refused(
     assert reference in (answer.refusal or "")
 
 
+_PNG = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\xff\xfe\x00binary"
+
+
+def _guide_referencing_a_picture(files: dict[str, str]) -> dict[str, str]:
+    guide = f"{TASK_DIR}/IMPLEMENTATION-GUIDE.md"
+    files[guide] += "\n![the flow](../../../docs/flow.png)\n"
+    return files
+
+
+@pytest.mark.asyncio
+async def test_a_committed_picture_referenced_from_the_guide_is_admitted(
+    project: Project, runner: WorktreeGitRunner
+) -> None:
+    """A reference target need only be an ordinary committed file; its bytes
+    are never decoded (R7)."""
+    project.commit_on(BRANCH, _guide_referencing_a_picture(bundle()))
+    _commit_bytes_on(project, BRANCH, {"docs/flow.png": _PNG})
+
+    answer = await _admit(project, runner)
+
+    assert answer.ok, answer.refusal
+
+
+@pytest.mark.asyncio
+async def test_a_missing_picture_referenced_from_the_guide_is_refused(
+    project: Project, runner: WorktreeGitRunner
+) -> None:
+    project.commit_on(BRANCH, _guide_referencing_a_picture(bundle()))
+
+    answer = await _admit(project, runner)
+
+    assert not answer.ok
+    assert "docs/flow.png is not in the commit" in (answer.refusal or "")
+
+
+@pytest.mark.asyncio
+async def test_a_linked_picture_referenced_from_the_guide_is_refused(
+    project: Project, runner: WorktreeGitRunner
+) -> None:
+    files = _guide_referencing_a_picture(bundle())
+    project.commit_on(BRANCH, files)
+    _commit_bytes_on(project, BRANCH, {"docs/real-flow.png": _PNG})
+    _git(project.writer, "checkout", "-q", BRANCH)
+    (project.writer / "docs" / "flow.png").symlink_to("real-flow.png")
+    _git(project.writer, "add", "-A")
+    _git(project.writer, "commit", "-qm", "a linked picture")
+    _git(project.writer, "push", "-q", "-f", "origin", f"HEAD:refs/heads/{BRANCH}")
+    _git(project.writer, "checkout", "-q", "main")
+
+    answer = await _admit(project, runner)
+
+    assert not answer.ok
+    assert "docs/flow.png is a symbolic link" in (answer.refusal or "")
+
+
 @pytest.mark.asyncio
 async def test_an_absolute_spec_file_path_is_refused(
     project: Project, runner: WorktreeGitRunner
