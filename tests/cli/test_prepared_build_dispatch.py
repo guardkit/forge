@@ -476,8 +476,16 @@ async def test_a_prepared_payload_marked_mode_c_is_refused(
         lambda copy: str(copy / ".guardkit" / "features" / "FEAT-OTHER.yaml"),
         lambda copy: str(copy.parent / "another-repo" / ".guardkit" / "features" / f"{FEATURE}.yaml"),
         lambda copy: f".guardkit/features/FEAT-OTHER.yaml",
+        lambda copy: f" .guardkit/features/{FEATURE}.yaml",
+        lambda copy: str(copy / ".guardkit" / "features" / f"{FEATURE}.yaml") + " ",
     ],
-    ids=["absolute-wrong-feature", "absolute-wrong-repository", "relative-wrong-feature"],
+    ids=[
+        "absolute-wrong-feature",
+        "absolute-wrong-repository",
+        "relative-wrong-feature",
+        "relative-leading-space",
+        "absolute-trailing-space",
+    ],
 )
 async def test_a_prepared_feature_file_must_be_its_own_in_the_registered_checkout(
     tmp_path: Path,
@@ -500,7 +508,6 @@ async def test_a_prepared_feature_file_must_be_its_own_in_the_registered_checkou
     assert _row(persistence) is None
     assert starter.calls == []
     assert f".guardkit/features/{FEATURE}.yaml" in rejections[0][1]
-    assert "the one file a build of" in rejections[0][1]
 
 
 @pytest.mark.asyncio

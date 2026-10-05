@@ -1923,6 +1923,12 @@ def _prepared_feature_file_refusal(
 
     wanted_rel = feature_yaml_relpath(feature_id)
     wanted_abs = os.path.normpath(os.path.join(checkout, wanted_rel))
+    if raw and (raw[0].isspace() or raw[-1].isspace()):
+        # Read exactly as written, never trimmed into the right file (R8).
+        return (
+            f"its feature file {raw!r} begins or ends with a space; name "
+            f"{wanted_rel} in {repo}'s registered checkout exactly"
+        )
     if not raw:
         matches = False
     elif os.path.isabs(raw):
