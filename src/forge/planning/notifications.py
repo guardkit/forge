@@ -14,10 +14,26 @@ still notifies.
 
 from __future__ import annotations
 
+import logging
+from typing import Any, Awaitable, Callable
+
 from nats_core.envelope import EventType, MessageEnvelope
 from nats_core.events import NotificationPayload
 
-__all__ = ["build_planning_notification_envelope"]
+__all__ = [
+    "NOTIFICATION_SUBJECT",
+    "BuildThreadReply",
+    "answer_build_thread",
+    "build_planning_notification_envelope",
+    "build_refused_reply",
+    "build_started_reply",
+    "make_build_thread_reply",
+]
+
+logger = logging.getLogger(__name__)
+
+#: The subject jarvis renders factory notifications from.
+NOTIFICATION_SUBJECT = "jarvis.notification.slack"
 
 
 def build_planning_notification_envelope(
@@ -56,3 +72,85 @@ def build_planning_notification_envelope(
         correlation_id=correlation_id,
         payload=payload.model_dump(mode="json"),
     )
+
+
+# ---------------------------------------------------------------------------
+# Answers in the thread a build was handed over from (register-projects
+# design, 5 October 2026, part 3)
+# ---------------------------------------------------------------------------
+
+BuildThreadReply = Callable[..., Awaitable[None]]
+"""``async (payload, message, *, level="info") -> None`` — one anchored
+notification about a build request, in the conversation it came from."""
+
+
+def make_build_thread_reply(nats_client: Any) -> BuildThreadReply:
+    """The build route's thread reply, on the daemon's shared client.
+
+    The same anchored notification the queue commands answer with: the build
+    request's ``parent_request_id`` (the Slack message it was typed as) is the
+    thread anchor. A request without one is not answered at all — every
+    build caller before the Slack hand-over sends none, and nothing new is
+    published for them.
+    """
+
+    async def reply(payload: Any, message: str, *, level: str = "info") -> None:
+        anchor = getattr(payload, "parent_request_id", None)
+        if not anchor:
+            return
+        envelope = build_planning_notification_envelope(
+            correlation_id=str(getattr(payload, "correlation_id", "") or ""),
+            message=message,
+            level=level,
+            parent_request_id=str(anchor),
+        )
+        await nats_client.publish(
+            NOTIFICATION_SUBJECT, envelope.model_dump_json().encode("utf-8")
+        )
+
+    return reply
+
+
+async def answer_build_thread(
+    reply: BuildThreadReply | None,
+    payload: Any,
+    message: str,
+    *,
+    level: str = "info",
+) -> None:
+    """Answer a build request in its thread. Never raises; never blocks.
+
+    Nothing happens when no reply is wired or the request carries no
+    ``parent_request_id``. A failed publish is logged and swallowed: the
+    answer is a courtesy, and the build route's acknowledgement and refusal
+    events stand on their own.
+    """
+    if reply is None or not getattr(payload, "parent_request_id", None):
+        return
+    try:
+        await reply(payload, message, level=level)
+    except Exception as exc:  # noqa: BLE001 — an answer never breaks a build
+        logger.warning(
+            "build thread reply: publish raised (%s: %s) for feature_id=%s "
+            "correlation_id=%s; continuing",
+            type(exc).__name__,
+            exc,
+            getattr(payload, "feature_id", None),
+            getattr(payload, "correlation_id", None),
+        )
+
+
+def build_refused_reply(feature_id: str, reason: str) -> str:
+    """The one sentence a refused build request is answered with."""
+    reason = str(reason).strip().rstrip(".") or "no reason was given"
+    return f"{feature_id} was not started: {reason}."
+
+
+def build_started_reply(
+    feature_id: str, repo: str, branch: str, commit: str | None
+) -> str:
+    """The one line an accepted hand-over is answered with."""
+    text = f"Building {feature_id} for {repo} from {branch}"
+    if commit:
+        text += f" at {commit[:7]}"
+    return text
