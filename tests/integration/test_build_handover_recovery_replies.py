@@ -279,3 +279,187 @@ async def test_a_build_not_handed_over_from_slack_gets_nothing_across_recovery(
     assert outcome is GateOutcome.RESUMED
     assert len(launcher.calls) == 1
     assert _replies(nats) == []
+
+
+# ---------------------------------------------------------------------------
+# A build already launched and answered, paused again across another restart
+# (Codex implementation review round 3, R3)
+# ---------------------------------------------------------------------------
+
+
+async def _answered_then_paused_again(
+    nats: EventLogNats,
+    pool: SqliteLifecyclePersistence,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    forge_config: Any = None,
+) -> str:
+    """Launched (and answered "Building"); restart mid-build; recovered into
+    its card; restart again while that card is PAUSED.
+
+    The launch is recorded as production records it: the state channel's
+    ``async_tasks`` row. Recovery marks the row INTERRUPTED and the live gate
+    drives it back to a PAUSED card; then the forge stops again. The earlier
+    run's interrupt goes to a stand-in runner.
+    """
+    from forge.cli import _recorded_run
+    from forge.cli._serve_deps_state_channel import build_autobuild_state_initialiser
+
+    async def _interrupt(*_a: Any, **_k: Any) -> bool:
+        return True
+
+    monkeypatch.setattr(_recorded_run, "interrupt_recorded_run", _interrupt)
+
+    payload = SimpleNamespace(
+        feature_id=FEATURE,
+        repo="guardkit/doc_probe",
+        branch="prepared/FEAT-HANDOV",
+        feature_yaml_path=f".guardkit/features/{FEATURE}.yaml",
+        max_turns=5,
+        sdk_timeout_seconds=1800,
+        triggered_by="jarvis",
+        originating_adapter="slack",
+        originating_user="U-RICH",
+        correlation_id=CORRELATION,
+        parent_request_id=THREAD,
+        queued_at=QUEUED_AT,
+        requested_at=QUEUED_AT,
+    )
+    build_id = pool.record_pending_build(
+        payload,
+        admitted=AdmittedBuild(
+            start_commit=SOURCE,
+            target_branch="main",
+            source_commit=SOURCE,
+            memory_project="doc_probe",
+        ),
+    )
+    # The first launch, as the runner records it.
+    build_autobuild_state_initialiser(pool).initialise_autobuild_state(
+        build_id=build_id,
+        feature_id=FEATURE,
+        task_id="task-first-launch",
+        correlation_id=CORRELATION,
+        lifecycle="starting",
+        wave_index=0,
+        task_index=0,
+    )
+    # Restart mid-build: boot recovery marks the row INTERRUPTED, and the
+    # redelivery drives it through the live gate back to a PAUSED card.
+    pool.connection.execute(
+        "UPDATE builds SET status = 'INTERRUPTED' WHERE build_id = ?", (build_id,)
+    )
+    repo, sm = build_sqlite_gate_adapters(pool, clock=FixedClock())
+    parts = _build_parts(nats, forge_config=forge_config)
+    task = asyncio.create_task(
+        maybe_gate_build(
+            parts=parts,
+            sqlite_pool=pool,
+            gate_repository=repo,
+            gate_state_machine=sm,
+            build_id=build_id,
+            feature_id=FEATURE,
+            correlation_id=CORRELATION,
+            clock=FixedClock(),
+        )
+    )
+    await _wait_until(
+        lambda: _row(pool, build_id)[0] == BuildState.PAUSED.value,
+        what="paused again",
+    )
+    await _wait_until(
+        lambda: nats.subscribers.get(_mirror_subject(build_id)),
+        what="subscriber live",
+    )
+    # ...and the forge stops again while the card waits.
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    assert (
+        pool.connection.execute(
+            "SELECT COUNT(*) FROM async_tasks WHERE build_id = ?", (build_id,)
+        ).fetchone()[0]
+        == 1
+    )
+    return build_id
+
+
+@pytest.mark.asyncio
+async def test_an_answered_build_paused_again_is_not_said_to_be_building_twice(
+    nats: EventLogNats,
+    pool: SqliteLifecyclePersistence,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    build_id = await _answered_then_paused_again(nats, pool, monkeypatch)
+    launcher = _FakeResumeLauncher()
+    tasks = await _restart(nats, pool, launcher)
+    await nats.deliver_response(
+        build_id=build_id, request_id=_request_id(build_id, 0), decision="approve"
+    )
+    outcome = await asyncio.wait_for(tasks[0], timeout=5.0)
+
+    assert outcome is GateOutcome.RESUMED
+    assert len(launcher.calls) == 1, "it is relaunched"
+    assert _replies(nats) == [], "but not said to be building a second time"
+    # The replacement launch removed the earlier run's record, as before.
+    assert (
+        pool.connection.execute(
+            "SELECT COUNT(*) FROM async_tasks WHERE build_id = ?", (build_id,)
+        ).fetchone()[0]
+        == 0
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_answered_build_declined_after_restart_is_told_once(
+    nats: EventLogNats,
+    pool: SqliteLifecyclePersistence,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    build_id = await _answered_then_paused_again(nats, pool, monkeypatch)
+    launcher = _FakeResumeLauncher()
+    tasks = await _restart(nats, pool, launcher)
+    await nats.deliver_response(
+        build_id=build_id,
+        request_id=_request_id(build_id, 0),
+        decision="reject",
+        notes="not again",
+    )
+    outcome = await asyncio.wait_for(tasks[0], timeout=5.0)
+
+    assert outcome is GateOutcome.CANCELLED
+    assert launcher.calls == []
+    (reply,) = _replies(nats)
+    # New information, said once: it was building, and it will not restart.
+    assert reply["message"] == (
+        f"{FEATURE} was not restarted: the build-start card was declined."
+    )
+    assert reply["parent_request_id"] == THREAD
+    assert await _restart(nats, pool, _FakeResumeLauncher()) == []
+    assert _replies(nats) == []
+
+
+@pytest.mark.asyncio
+async def test_an_answered_build_whose_card_timed_out_after_restart_is_told_once(
+    nats: EventLogNats,
+    pool: SqliteLifecyclePersistence,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = _forge_config(
+        default_wait_seconds=0,
+        max_wait_seconds=3600,
+        expected_approver=RICH,
+        autobuild_gate_max_wait_seconds=3600,
+    )
+    await _answered_then_paused_again(nats, pool, monkeypatch, forge_config=cfg)
+    launcher = _FakeResumeLauncher()
+    tasks = await _restart(nats, pool, launcher, forge_config=cfg)
+    outcome = await asyncio.wait_for(tasks[0], timeout=5.0)
+
+    assert outcome is GateOutcome.TIMED_OUT
+    assert launcher.calls == []
+    assert [r["message"] for r in _replies(nats)] == [
+        f"{FEATURE} was not restarted: the build-start card timed out."
+    ]

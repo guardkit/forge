@@ -101,6 +101,7 @@ from forge.cli._serve_deps_forward_context import (
 from forge.cli._serve_deps_lifecycle import build_publisher_and_emitter
 from forge.cli._serve_deps_stage_log import build_stage_log_recorder
 from forge.cli._recorded_run import (
+    had_recorded_launch,
     interrupt_recorded_run,
     launch_replacing_recorded_run,
 )
@@ -122,6 +123,7 @@ from forge.pipeline.dispatchers.autobuild_async import (
 from forge.planning.notifications import (
     BuildThreadReply,
     answer_build_thread,
+    build_not_restarted_reply,
     build_refused_reply,
     build_started_reply,
     gate_ended_reason,
@@ -1391,6 +1393,12 @@ def _build_dispatch_build(
                 reason,
                 payload.correlation_id,
             )
+            # A row of its own that had launched (so a hand-over was already
+            # answered "Building") is told it was not restarted, not that it
+            # was not started. Read before the row is closed.
+            own_answered = own_build_id is not None and had_recorded_launch(
+                sqlite_pool, own_build_id
+            )
             if own_build_id is not None:
                 # Its row was written ahead; close it so it never counts as
                 # active work again.
@@ -1433,16 +1441,21 @@ def _build_dispatch_build(
             await answer_build_thread(
                 reply_in_thread,
                 payload,
-                build_refused_reply(payload.feature_id, reason),
+                (build_not_restarted_reply if own_answered else build_refused_reply)(
+                    payload.feature_id, reason
+                ),
                 level="warning",
             )
             return
 
         # Whether this delivery answers the thread it came from: True when
-        # THIS delivery wrote the row, or (below) when it recovers a row that
-        # never launched. A redelivery of a launched build — already answered
-        # "Building" — stays silent.
+        # THIS delivery wrote the row, or (below) when it recovers a row
+        # through its card after a restart.
         answers_thread = False
+        # A recovered row that had launched — and so was already answered
+        # "Building" — is never told "Building" again; if its card now ends
+        # it, it is told once that it was not restarted.
+        answered_before = False
         # Who is answered: the request itself, or for a recovered row its
         # persisted row (parent_request_id, originating_adapter).
         thread_target: Any = payload
@@ -1528,18 +1541,19 @@ def _build_dispatch_build(
                 from forge.lifecycle.identifiers import derive_build_id
 
                 build_id = derive_build_id(payload.feature_id, payload.queued_at)
-                # A row recovered before it was ever launched (the forge
-                # stopped after the row was written but before, or at, its
-                # build-start card) was never answered, so this delivery
-                # answers it once, from the row. The persisted fact is the
-                # launch's ``async_tasks`` row: it is written when the runner
-                # takes the build, just before "Building" is said, so a row
-                # with one has launched and has been answered (or the forge
-                # stopped in the instant between, which stays silent rather
-                # than risk saying it twice).
-                if not _had_launched(sqlite_pool, build_id):
-                    answers_thread = True
-                    thread_target = _row_or(sqlite_pool, build_id, payload)
+                # A row recovered after a restart is answered from its
+                # persisted row (parent_request_id, originating_adapter). The
+                # persisted fact of a prior launch is its ``async_tasks`` row
+                # (``had_recorded_launch``), read here, before the replacement
+                # launch deletes it: a row with one was already answered
+                # "Building" and is never told so again; a row without one
+                # (the forge stopped after the row was written, before or at
+                # its card) was never answered and is answered once now. A
+                # forge that stopped in the instant between the launch and its
+                # answer stays silent rather than risk saying it twice.
+                answers_thread = True
+                answered_before = had_recorded_launch(sqlite_pool, build_id)
+                thread_target = _row_or(sqlite_pool, build_id, payload)
                 recovered = status == BuildState.INTERRUPTED
                 if recovered and not await _interrupted_first(build_id):
                     return
@@ -1607,7 +1621,7 @@ def _build_dispatch_build(
 
         async def _say_building() -> None:
             """The hand-over's one success answer, after the launch returned."""
-            if not answers_thread:
+            if not answers_thread or answered_before:
                 return
             if admitted is not None:
                 commit = admitted.source_commit
@@ -1833,34 +1847,19 @@ def _build_dispatch_build(
             # (After a restart mid-card, ``rearm_paused_gates`` answers
             # instead, from the build row.)
             if answers_thread:
+                ended = (
+                    build_not_restarted_reply
+                    if answered_before
+                    else build_refused_reply
+                )
                 await answer_build_thread(
                     reply_in_thread,
                     thread_target,
-                    build_refused_reply(
-                        payload.feature_id, gate_ended_reason(outcome)
-                    ),
+                    ended(payload.feature_id, gate_ended_reason(outcome)),
                     level="warning",
                 )
 
     return dispatch_build
-
-
-def _had_launched(sqlite_pool: Any, build_id: str) -> bool:
-    """Whether the ledger recorded a launch (an ``async_tasks`` row) for it.
-
-    A ledger with no ``async_tasks`` table has recorded none. Any other
-    failure to read counts as launched: the answer is then not said, rather
-    than said twice.
-    """
-    try:
-        row = sqlite_pool.connection.execute(
-            "SELECT 1 FROM async_tasks WHERE build_id = ? LIMIT 1", (build_id,)
-        ).fetchone()
-    except sqlite3.OperationalError as exc:
-        return "no such table" not in str(exc)
-    except Exception:  # noqa: BLE001 — silence over a second answer
-        return True
-    return row is not None
 
 
 def _row_or(sqlite_pool: Any, build_id: str, fallback: Any) -> Any:
