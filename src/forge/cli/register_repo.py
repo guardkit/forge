@@ -1177,8 +1177,11 @@ def make_sandbox_clone(sandbox: SandboxStore, *, clone: str, leaf: str, url: str
 #: the coordinator holds the ledger and the bus connection, so it is asked.
 #: Plain Python on purpose — the coordinator's image may be older than this
 #: checkout, so nothing of this module may be imported there. It reads only:
-#: the ledger opened read-only, and ``consumer_info`` on the two durable
-#: consumers (the same read the coordinator's own consumer-health check makes).
+#: the ledger opened read-only — active builds, unfinished planning runs,
+#: queued work, and the merge/publish/deploy work rollout-quiesce also counts
+#: (an unfinished publication record, a held deployment target) — and
+#: ``consumer_info`` on the two durable consumers (the same read the
+#: coordinator's own consumer-health check makes).
 #: The bus address carries a credential, so it is scrubbed out of anything said.
 DRAINED_READ_SCRIPT: str = r'''
 import asyncio, json, os, sqlite3, sys
@@ -1199,12 +1202,34 @@ try:
         def counts(sql, done):
             marks = ",".join("?" for _ in done)
             return {str(k): int(v) for k, v in con.execute(sql % marks, list(done)).fetchall()}
-        builds = counts("SELECT status, COUNT(*) FROM builds WHERE status NOT IN (%s) GROUP BY status", spec["build_terminal"])
+        def one(sql, *params):
+            return int(con.execute(sql, params).fetchone()[0])
+        builds = {
+            str(k): int(v)
+            for k, v in con.execute(
+                "SELECT status, COUNT(*) FROM builds WHERE status IN (%s) GROUP BY status"
+                % ",".join("?" for _ in spec["build_active"]),
+                list(spec["build_active"]),
+            ).fetchall()
+        }
+        interrupted = one("SELECT COUNT(*) FROM builds WHERE status = 'INTERRUPTED'")
         plans = counts("SELECT state, COUNT(*) FROM planning_runs WHERE state NOT IN (%s) GROUP BY state", spec["planning_terminal"])
-        queued = int(con.execute("SELECT COUNT(*) FROM work_queue WHERE status = 'QUEUED'").fetchone()[0])
+        free = one("SELECT COUNT(*) FROM work_queue WHERE status = 'QUEUED' AND after_id IS NULL")
+        held = one("SELECT COUNT(*) FROM work_queue WHERE status = 'QUEUED' AND after_id IS NOT NULL")
+        publications = one(
+            "SELECT COUNT(*) FROM publication_records WHERE result IS NULL OR result != ?",
+            spec["publication_finished"],
+        )
+        deploy_holds = one(
+            "SELECT COUNT(*) FROM deployment_targets WHERE holder_build IS NOT NULL AND holder_build != ''"
+        )
     finally:
         con.close()
-    out["ledger"] = {"builds": builds, "planning_runs": plans, "queue_waiting": queued}
+    out["ledger"] = {
+        "builds": builds, "interrupted": interrupted, "planning_runs": plans,
+        "queue_waiting": free, "queue_held": held,
+        "publications_unfinished": publications, "deploy_targets_held": deploy_holds,
+    }
 except Exception as exc:
     out["ledger"] = {"error": said(exc)}
 # nats-py retries a first connection for ever, printing each failure, unless
@@ -1243,11 +1268,13 @@ def drained_read_spec() -> dict[str, Any]:
     """The states, stream and consumer names the read uses — Forge's own."""
     from forge.adapters.nats.planning_consumer import PLANNING_DURABLE_NAME
     from forge.cli._serve_config import DEFAULT_DURABLE_NAME
-    from forge.planning.work_queue_loop import BUILD_TERMINAL_STATES, PLANNING_TERMINAL_STATES
+    from forge.pipeline.publication_record import RESULT_MERGED_AND_RUNNING
+    from forge.planning.work_queue_loop import BUILD_ACTIVE_STATES, PLANNING_TERMINAL_STATES
 
     return {
         "db": COORDINATOR_LEDGER,
-        "build_terminal": sorted(BUILD_TERMINAL_STATES),
+        "build_active": sorted(BUILD_ACTIVE_STATES),
+        "publication_finished": RESULT_MERGED_AND_RUNNING,
         "planning_terminal": sorted(PLANNING_TERMINAL_STATES),
         "stream": BUS_STREAM,
         "consumers": [PLANNING_DURABLE_NAME, DEFAULT_DURABLE_NAME],
@@ -1278,13 +1305,26 @@ def _by_state(counts: Mapping[str, Any]) -> str:
     return ", ".join(f"{state} {count}" for state, count in sorted(counts.items()))
 
 
+def _count(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _plural(n: int, one: str, many: str) -> str:
+    return one if n == 1 else many
+
+
 def judge_drained(facts: Mapping[str, Any], consumers: Sequence[str]) -> list[str]:
     """Why the factory is NOT drained; an empty list means drained.
 
-    Drained means all of: no build and no planning run in a state that is not
-    finished; no item waiting in the work queue; and each durable consumer
-    feeding the coordinator reads zero pending and zero awaiting
-    acknowledgement. Anything that could not be read is a reason too.
+    Drained means all of: no build in an active state (the coordinator's own
+    list, ``BUILD_ACTIVE_STATES``); no planning run unfinished; nothing queued
+    in the work queue; no publication record unfinished and no deployment
+    target held (the merge, publish and deploy work rollout-quiesce counts);
+    and each durable consumer feeding the coordinator reads zero pending and
+    zero awaiting acknowledgement. Anything that could not be read is a reason
+    too. An INTERRUPTED build is not one: a restart leaves it as it is, and one
+    that can be relaunched holds an unacknowledged build request, which the
+    consumer check already counts (see :func:`drained_notes`).
     """
     if facts.get("error"):
         return [str(facts["error"])]
@@ -1294,24 +1334,36 @@ def judge_drained(facts: Mapping[str, Any], consumers: Sequence[str]) -> list[st
         why = ledger.get("error") if isinstance(ledger, dict) else "no answer"
         reasons.append(f"the ledger could not be read ({why})")
     else:
-        for label, key in (("build", "builds"), ("planning run", "planning_runs")):
+        for label, key, finished in (
+            ("build", "builds", "running"),
+            ("planning run", "planning_runs", "finished"),
+        ):
             counts = ledger.get(key)
-            if not isinstance(counts, dict) or not all(
-                isinstance(v, int) and not isinstance(v, bool) for v in counts.values()
-            ):
+            if not isinstance(counts, dict) or any(_count(v) is None for v in counts.values()):
                 reasons.append(f"the ledger's {label}s could not be counted")
                 continue
             total = sum(counts.values())
-            if total:
-                reasons.append(f"{total} {label}{'s are' if total != 1 else ' is'} not finished ({_by_state(counts)})")
-        waiting = ledger.get("queue_waiting")
-        if not isinstance(waiting, int) or isinstance(waiting, bool):
-            reasons.append("the work queue could not be counted")
-        elif waiting:
-            reasons.append(
-                f"{waiting} item{'s wait' if waiting != 1 else ' waits'} in the work queue, "
-                "which the coordinator's automatic queue would admit within seconds"
-            )
+            if total and finished == "running":
+                reasons.append(f"{total} {_plural(total, 'build is', 'builds are')} active ({_by_state(counts)})")
+            elif total:
+                reasons.append(
+                    f"{total} {_plural(total, 'planning run is', 'planning runs are')} not finished ({_by_state(counts)})"
+                )
+        for key, say in (
+            ("queue_waiting", lambda n: f"{n} {_plural(n, 'item waits', 'items wait')} in the work queue, "
+             "which the coordinator's automatic queue would admit within seconds"),
+            ("queue_held", lambda n: f"{n} {_plural(n, 'item waits', 'items wait')} in the work queue behind "
+             "another item; wait for the item it waits on to finish, or withdraw it"),
+            ("publications_unfinished", lambda n: f"{n} {_plural(n, 'merge is', 'merges are')} not finished "
+             "(a publication record short of 'merged into the remote and running')"),
+            ("deploy_targets_held", lambda n: f"{n} deployment {_plural(n, 'target is', 'targets are')} held "
+             "by a build that is deploying"),
+        ):
+            n = _count(ledger.get(key))
+            if n is None:
+                reasons.append(f"the ledger's {key.replace('_', ' ')} could not be counted")
+            elif n:
+                reasons.append(say(n))
     read = facts.get("consumers")
     read = read if isinstance(read, dict) else {}
     for name in consumers:
@@ -1320,8 +1372,8 @@ def judge_drained(facts: Mapping[str, Any], consumers: Sequence[str]) -> list[st
             why = row.get("error") if isinstance(row, dict) else "no answer"
             reasons.append(f"the bus consumer {name} could not be read ({why})")
             continue
-        pending, unacked = row.get("pending"), row.get("ack_pending")
-        if not all(isinstance(v, int) and not isinstance(v, bool) for v in (pending, unacked)):
+        pending, unacked = _count(row.get("pending")), _count(row.get("ack_pending"))
+        if pending is None or unacked is None:
             reasons.append(f"the bus consumer {name} gave no counts")
         elif pending or unacked:
             reasons.append(
@@ -1329,6 +1381,19 @@ def judge_drained(facts: Mapping[str, Any], consumers: Sequence[str]) -> list[st
                 "acknowledgement (a request on its way in)"
             )
     return reasons
+
+
+def drained_notes(facts: Mapping[str, Any]) -> list[str]:
+    """What the read found that does not stop activation, said for information."""
+    ledger = facts.get("ledger")
+    n = _count(ledger.get("interrupted")) if isinstance(ledger, dict) else None
+    if not n:
+        return []
+    return [
+        f"for information: {n} {_plural(n, 'build is', 'builds are')} INTERRUPTED. A restart leaves "
+        "them as they are; one that can be relaunched holds an unacknowledged build request, "
+        "which the consumer check above already counts"
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -1779,17 +1844,20 @@ def register_repo_cmd(
 
     if check_drained:
         consumers = drained_read_spec()["consumers"]
-        reasons = judge_drained(read_drained_facts(run, coordinator), consumers)
+        facts = read_drained_facts(run, coordinator)
+        reasons = judge_drained(facts, consumers)
+        notes = [Step("drained", "note", note) for note in drained_notes(facts)]
         if not reasons:
             _emit(
-                [Step("drained", "ok", "DRAINED: no build or planning run unfinished, nothing "
-                      f"waiting in the work queue, and {' and '.join(consumers)} each read zero "
-                      "pending and zero unacknowledged")],
+                [Step("drained", "ok", "DRAINED: no build active, no planning run, merge or deploy "
+                      "unfinished, nothing queued in the work queue, and "
+                      f"{' and '.join(consumers)} each read zero pending and zero unacknowledged")] + notes,
                 as_json=as_json,
             )
             return
         _emit(
             [Step("drained", "no", reason) for reason in reasons]
+            + notes
             + [Step("drained", "no", "NOT DRAINED — reopen intake and activate later")],
             as_json=as_json,
         )
