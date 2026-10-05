@@ -68,6 +68,7 @@ import tempfile
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path, PurePosixPath
+from urllib.parse import urlsplit
 from typing import Any, Callable, Mapping, Sequence
 
 import click
@@ -1582,6 +1583,15 @@ def _parse_name(name: str) -> tuple[str, str]:
 
 def _check_url(url: str, leaf: str) -> str:
     url = url.strip()
+    parts = urlsplit(url)
+    if "@" in parts.netloc or parts.username or parts.password:
+        # Never echo it: the part before the @ may be a token.
+        raise Refused(
+            "github",
+            "--github carries a user name or password before the host; give the plain "
+            "https://github.com/<org>/<name> address — the sandbox and the settings must "
+            "never hold a credential this way",
+        )
     if not url.startswith("https://"):
         raise Refused("github", f"--github must be the repository's https:// address, not {url!r}")
     last = url.rstrip("/").rsplit("/", 1)[-1]

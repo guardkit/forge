@@ -1047,3 +1047,15 @@ def test_publish_without_a_gateway_address_is_refused(estate, publisher_file):
     assert result.exit_code == 1
     assert "--gateway-address" in result.output
     assert estate.calls == []
+
+
+@pytest.mark.parametrize(
+    "address",
+    ["https://someone:tok3n-value@github.com/guardkit/bench-one.git", "https://tok3n-value@github.com/guardkit/bench-one.git", "ssh://tok3n-value@github.com/guardkit/bench-one.git"],
+)
+def test_an_address_carrying_a_user_name_or_password_is_refused_without_echoing_it(estate, address):
+    result = CliRunner().invoke(main, ["register-repo", KEY, "--github", address], catch_exceptions=False)
+    assert result.exit_code == 1
+    assert "user name or password" in result.output
+    assert "tok3n-value" not in result.output
+    assert estate.calls == []
