@@ -8,8 +8,9 @@ every subcommand currently shipped:
 * ``forge history`` (TASK-PSM-010 — read-path bypass to SQLite)
 * ``forge cancel`` (TASK-PSM-011 — thin wrapper over CliSteeringHandler)
 * ``forge skip`` (TASK-PSM-011 — thin wrapper over CliSteeringHandler)
-* ``forge register-repo`` (register-repo spec 2026-09-05 — takes a git
-  checkout to "the factory can build in it")
+* ``forge register-repo`` (register-projects design 2026-10-05 — registers
+  a project on GitHub with the running, containerised factory: stages the
+  settings, makes the shared sandbox's clone, prints the stop/start sequence)
 * ``forge repo-paths`` (register-repo spec 2026-09-05 rule 9 — prints the
   repository map's distinct checkout paths so the forge-prod recreate script
   derives its binds instead of carrying them by hand)
