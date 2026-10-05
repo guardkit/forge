@@ -231,6 +231,34 @@ LAUNCH_SETTINGS: tuple[tuple[str, str], ...] = (
         "settings have set it since 18 September 2026, and leaving it off "
         "this list quietly put every build back on the shorter default",
     ),
+    # --- the model the plan's stamp check asks (5 October 2026) ------------
+    # At the end of planning the build system's stamp check may ask a model
+    # to stamp the scenarios its rules could not. It reads these four names
+    # (GuardKit's ``guardkit/orchestrator/stamp_model_fallback.py``). The
+    # release set the first one in the sandbox's settings, but this list left
+    # it out, so every stamp check fell back to the build system's built-in
+    # model name: a retired model whose load ran the machine's GPU out of
+    # memory on 5 October. The endpoint falls back to OPENAI_BASE_URL and the
+    # key is OPENAI_API_KEY, both above, so no new secret travels here.
+    (
+        "GUARDKIT_STAMP_MODEL",
+        "WHICH model the plan's stamp check asks; left off, the build system "
+        "asks its built-in default, a retired model nobody chose",
+    ),
+    (
+        "GUARDKIT_STAMP_MODEL_URL",
+        "where the stamp check asks, when it should not be the model seat "
+        "above; unset, the build system uses OPENAI_BASE_URL",
+    ),
+    (
+        "GUARDKIT_STAMP_MODEL_TIMEOUT_S",
+        "how long the stamp check waits for that model's answer",
+    ),
+    (
+        "GUARDKIT_STAMP_MODEL_MAX_TOKENS",
+        "how long that model's answer, thinking included, may be; a number, "
+        "not a credential",
+    ),
     # --- how much of one build runs at once (3 October 2026) ---------------
     # Concurrent builds. Each is the build system's own setting, unset on this
     # estate today, and unset keeps the build system's own default exactly. They
