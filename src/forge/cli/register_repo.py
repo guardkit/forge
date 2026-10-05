@@ -927,7 +927,12 @@ def plan_settings_edit(text: str, *, which: str, key: str, path: str) -> YamlEdi
     allowlist = [str(item) for item in (filesystem.get("allowlist") or [])]
     repo_paths = _mapping(planning.get("target_repo_paths"))
 
-    lines = text.split("\n")
+    # A file whose every line ends in CRLF is edited as plain lines and given
+    # CRLF back afterwards, so the inserted lines end the way the file's own
+    # do. A file mixing the two is edited as it stands.
+    crlf = "\n" in text and text.count("\r\n") == text.count("\n")
+    plain = text.replace("\r\n", "\n") if crlf else text
+    lines = plain.split("\n")
     expected = copy.deepcopy(data)
     steps: list[Step] = []
     changed = False
@@ -985,6 +990,8 @@ def plan_settings_edit(text: str, *, which: str, key: str, path: str) -> YamlEdi
     if not changed:
         return YamlEdit(which, text, None, steps, entry)
     staged = "\n".join(lines)
+    if crlf:
+        staged = staged.replace("\n", "\r\n")
     try:
         reread = yaml.safe_load(staged)
     except yaml.YAMLError as exc:
@@ -995,7 +1002,7 @@ def plan_settings_edit(text: str, *, which: str, key: str, path: str) -> YamlEdi
             "the edited forge.yaml would change more than the three entries; "
             "nothing was written — edit it by hand",
         )
-    if not _keeps_every_line(text.split("\n"), lines):
+    if not _keeps_every_line(plain.split("\n"), lines):
         raise Refused(which, "the edit would lose a line of the file; nothing was written")
     why_not = _loads_as_forge_settings(staged)
     if why_not is not None:
