@@ -648,6 +648,50 @@ async def test_a_guide_with_no_routes_and_no_manifest_is_admitted(
     assert (await _admit(project, runner)).ok
 
 
+def _colon_guide(files: dict[str, str]) -> dict[str, str]:
+    guide = f"{TASK_DIR}/IMPLEMENTATION-GUIDE.md"
+    files[guide] = files[guide].replace(
+        "## §4 Integration Contracts", "## §4: Integration Contracts"
+    )
+    return files
+
+
+@pytest.mark.asyncio
+async def test_an_attended_colon_heading_route_needs_the_manifest(
+    project: Project, runner: WorktreeGitRunner
+) -> None:
+    project.commit_on(BRANCH, _colon_guide(bundle(digest=False, routes=True)))
+
+    answer = await _admit(project, runner)
+
+    assert not answer.ok
+    assert "qa/leak-sweep.yaml" in (answer.refusal or "")
+
+
+@pytest.mark.asyncio
+async def test_an_attended_colon_heading_route_with_the_manifest_is_admitted(
+    project: Project, runner: WorktreeGitRunner
+) -> None:
+    project.commit_on(
+        BRANCH, _colon_guide(bundle(digest=False, routes=True, leak_sweep=True))
+    )
+
+    answer = await _admit(project, runner)
+
+    assert answer.ok, answer.refusal
+
+
+@pytest.mark.asyncio
+async def test_a_specialist_bundle_with_a_colon_heading_is_read_the_emitters_way(
+    project: Project, runner: WorktreeGitRunner
+) -> None:
+    project.commit_on(BRANCH, _colon_guide(bundle(digest=True, routes=True)))
+
+    answer = await _admit(project, runner)
+
+    assert answer.ok, answer.refusal
+
+
 # ---------------------------------------------------------------------------
 # Every bundle file is the file itself (R2); YAML paths stay inside (R3)
 # ---------------------------------------------------------------------------
@@ -671,8 +715,9 @@ def _replace_with_link(project: Project, path: str, target: str) -> None:
         (f"{TASK_DIR}/IMPLEMENTATION-GUIDE.md", "../../../README.md"),
         (f"{TASK_DIR}/{TASKS[0]}-do-the-thing.md", "../../../../outside.md"),
         (f"qa/pass-bar-{TASKS[0]}.yaml", "nowhere.yaml"),
+        (f"{SPEC_DIR}/{SPEC_NAME}_digest.yaml", f"{SPEC_NAME}_summary.md"),
     ],
-    ids=["linked-guide", "linked-task-escaping", "linked-qa-dangling"],
+    ids=["linked-guide", "linked-task-escaping", "linked-qa-dangling", "linked-digest"],
 )
 async def test_a_bundle_file_that_is_a_symbolic_link_is_refused_by_name(
     project: Project, runner: WorktreeGitRunner, path: str, target: str
@@ -764,10 +809,16 @@ def test_the_integration_contracts_rule_matches_the_producers() -> None:
     assert not guide_claims_routes("## §4 Integration Contracts\nroute:   \n")
 
 
-def test_guardkits_colon_form_is_not_recognised_like_the_emitter() -> None:
+def test_guardkits_colon_form_is_recognised_only_for_an_attended_bundle() -> None:
     # GuardKit's template writes this form; the specialist emitter does not
-    # recognise it, and neither does admission (noted for the producers).
-    assert not guide_claims_routes("## §4: Integration Contracts\n- route: /a\n")
+    # recognise it, so a specialist bundle is read the emitter's way, and an
+    # attended one GuardKit's way (Codex review round 1, R5).
+    colon = "## §4: Integration Contracts\n- route: /a\n"
+    assert not guide_claims_routes(colon)
+    assert guide_claims_routes(colon, attended=True)
+    assert guide_claims_routes("## Integration Contracts\nroute: /a\n", attended=True)
+    assert guide_claims_routes("## §4 Integration Contracts\nroute: /a\n", attended=True)
+    assert not guide_claims_routes("## §4: Integration Contracts\nnone\n", attended=True)
 
 
 def test_the_heading_is_case_sensitive_like_the_emitter() -> None:
