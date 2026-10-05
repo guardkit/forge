@@ -1461,9 +1461,11 @@ def activation_sequence(
         f"    dc stop {intake}",
         "(b) Confirm the factory is drained (reads only):",
         f"    forge register-repo --check-drained --coordinator-container {q(estate.coordinator)}",
-        "    It must print DRAINED: no build or planning run unfinished, nothing waiting in the work"
-        " queue, and zero pending and zero unacknowledged on both bus consumers. Anything else — or"
-        " anything it could not read — stops here: reopen intake and activate later:",
+        "    Go on only if it exits 0 (rely on the exit status, not the words: \"NOT DRAINED\""
+        " contains \"DRAINED\"). Exit 0 means no build active, no planning run, merge or deploy"
+        " unfinished, nothing queued, and zero pending and zero unacknowledged on both bus"
+        " consumers. Any other exit — including anything it could not read — stops here: reopen"
+        " intake and activate later:",
         f"    dc up -d {intake}",
         "(c) Stop the coordinator and the rest, intake still closed:",
         "    dc stop",
@@ -1471,29 +1473,38 @@ def activation_sequence(
         " prints nothing, and",
         f"    sbx exec {q(estate.sandbox)} docker ps --format '{{{{.Names}}}}' lists neither"
         f" {estate.sandbox}-helper nor {estate.sandbox}-runner.",
-        "(d) Put the staged settings in place. Each line first checks the live file is still the"
-        " one the staged copy was made from; if a check fails, stop, start again as in (g) without"
-        " swapping, and run register-repo again:",
+        "(d) Put the staged settings in place, as ONE command: it first checks that every live file"
+        " is still the one its staged copy was made from, and only then copies any. If a check"
+        " fails nothing is copied: start again as in (g) without swapping and run register-repo"
+        " again. If a copy fails part-way, put the files already copied back from their backups"
+        " before starting:",
     ]
+    checks: list[str] = []
+    copies: list[str] = []
     if coordinator is not None:
         volume = q(estate.volume)
         backup = coordinator.backup or "<its backup>"
-        lines.append(
-            f"    docker run --rm -v {volume}:/s:ro {VOLUME_HELPER_IMAGE} cmp /s/{coordinator.live}"
-            f" {q('/s/' + backup)} && docker run --rm --user {SANDBOX_USER}:{SANDBOX_USER} -v {volume}:/s"
+        checks.append(
+            f"docker run --rm -v {volume}:/s:ro {VOLUME_HELPER_IMAGE} cmp /s/{coordinator.live}"
+            f" {q('/s/' + backup)}"
+        )
+        copies.append(
+            f"docker run --rm --user {SANDBOX_USER}:{SANDBOX_USER} -v {volume}:/s"
             f" {VOLUME_HELPER_IMAGE} cp /s/{coordinator.pending} /s/{coordinator.live}"
         )
     if sandbox_file is not None:
         backup = sandbox_file.backup or "<its backup>"
-        lines.append(
-            f"    sbx exec -u {SANDBOX_USER} {q(estate.sandbox)} sh -c 'cmp \"$1\" \"$2\" && cp \"$3\" \"$1\"'"
-            f" swap {q(sandbox_file.live)} {q(backup)} {q(sandbox_file.pending)}"
-        )
+        exec_ = f"sbx exec -u {SANDBOX_USER} {q(estate.sandbox)}"
+        checks.append(f"{exec_} cmp {q(sandbox_file.live)} {q(backup)}")
+        copies.append(f"{exec_} cp {q(sandbox_file.pending)} {q(sandbox_file.live)}")
     if publisher is not None:
         backup = publisher.backup or "<its backup>"
-        lines.append(
-            f"    cmp {q(publisher.live)} {q(backup)} && cp {q(publisher.pending)} {q(publisher.live)}"
-        )
+        checks.append(f"cmp {q(publisher.live)} {q(backup)}")
+        copies.append(f"cp {q(publisher.pending)} {q(publisher.live)}")
+    chain = checks + copies
+    lines.append(f"    {chain[0]}" + (" \\" if len(chain) > 1 else ""))
+    for index, command in enumerate(chain[1:], start=1):
+        lines.append(f"      && {command}" + (" \\" if index < len(chain) - 1 else ""))
     lines += [
         "(e) Restart the sandbox supervisor and confirm the helper and runner are ready:",
         f"    dc up -d {SANDBOX_SUPERVISOR_SERVICE}",
