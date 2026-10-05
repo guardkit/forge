@@ -202,14 +202,14 @@ def test_each_address_is_asked_about_one_at_a_time(wrapper_repo, tmp_path):
         wrapper_repo,
         tmp_path,
         SBX_LS="bench-one-deploy   running",
-        SANDBOX_ALLOW_NETWORK="pypi.org,172.30.1.253:4000",
-        SBX_ALLOWED="http://pypi.org,172.30.1.253:4000",
+        SANDBOX_ALLOW_NETWORK="pypi.org,192.0.2.53:4000",
+        SBX_ALLOWED="http://pypi.org,192.0.2.53:4000",
     )
 
     assert result.returncode == 0, result.stderr
     assert [line for line in sbx if line.startswith("policy check ")] == [
         "policy check network --sandbox bench-one-deploy http://pypi.org",
-        "policy check network --sandbox bench-one-deploy 172.30.1.253:4000",
+        "policy check network --sandbox bench-one-deploy 192.0.2.53:4000",
     ]
     assert [line for line in sbx if line.startswith("policy allow ")] == []
 

@@ -35,7 +35,7 @@ KEY = f"guardkit/{LEAF}"
 URL = f"https://github.com/guardkit/{LEAF}.git"
 SANDBOX = "api-test-deploy"
 VOLUME = "forge-estate_forge-settings"
-CLONE = "/home/someone/Projects/api_test"
+CLONE = "/workspace/api_test"
 SANDBOX_SETTINGS = f"{CLONE}/.guardkit/tmp/factory-runtime/forge.yaml"
 CLONE_PATH = f"{CLONE}/.guardkit/tmp/factory-runtime/projects/{LEAF}"
 COORDINATOR_PATH = f"/var/lib/forge/projects/{LEAF}"
@@ -54,7 +54,7 @@ planning:
   # The coordinator's own copy of each project, by the key it is registered under.
   target_repo_paths:
     guardkit/api_test: /var/lib/forge/projects/api_test
-    appmilla_github/api_test: /var/lib/forge/projects/api_test
+    checkouts/api_test: /var/lib/forge/projects/api_test
   # One entry per project that has a sandbox.
   sandboxes:
     guardkit/api_test:
@@ -86,21 +86,21 @@ planning:
   sandboxes:
     guardkit/api_test:
       name: api-test-deploy
-      sidecar_url: http://10.254.41.1:8925
-      runner_url: http://10.254.41.1:8924
+      sidecar_url: http://192.0.2.10:8925
+      runner_url: http://192.0.2.10:8924
 """
 
 PUBLISHER_JSON = {
     "credential_file": "/etc/forge-publisher/credential",
     "ledger": "/var/lib/forge/forge.db",
-    "state_dir": "/home/publisher/state",
+    "state_dir": "/var/lib/publisher/state",
     "host": "0.0.0.0",
     "port": 8711,
     "git_timeout_seconds": 180,
     "known_hosts_file": "/etc/forge-publisher/known_hosts",
     "projects": {
         "guardkit/api_test": {
-            "source": "git://10.254.41.1:8918/api_test",
+            "source": "git://192.0.2.10:8918/api_test",
             "remote": "git@github.com:guardkit/api_test.git",
         }
     },
@@ -274,10 +274,14 @@ def publisher_file(tmp_path) -> Path:
     return path
 
 
+GATEWAY = "192.0.2.10"
+
+
 def _run(*args: str):
+    extra = ["--gateway-address", GATEWAY] if "--publish" in args and "--estate-env-file" not in args else []
     return CliRunner().invoke(
         main,
-        ["register-repo", KEY, "--github", URL, "--sandbox-settings", SANDBOX_SETTINGS, *args],
+        ["register-repo", KEY, "--github", URL, "--sandbox-settings", SANDBOX_SETTINGS, *args, *extra],
         catch_exceptions=False,
     )
 
@@ -382,8 +386,8 @@ def test_the_sandbox_file_gains_the_same_three_entries_with_its_own_paths(estate
     assert staged["planning"]["target_repo_paths"][KEY] == CLONE_PATH
     assert staged["planning"]["sandboxes"][KEY] == {
         "name": "api-test-deploy",
-        "sidecar_url": "http://10.254.41.1:8925",
-        "runner_url": "http://10.254.41.1:8924",
+        "sidecar_url": "http://192.0.2.10:8925",
+        "runner_url": "http://192.0.2.10:8924",
     }
     assert len(_added(SANDBOX_YAML, estate.sandbox_files[f"{SANDBOX_SETTINGS}.{LEAF}-pending"])) == 6
 
@@ -461,7 +465,7 @@ def test_once_live_a_re_run_stages_nothing_and_says_so(estate):
 
 def test_an_entry_that_already_says_something_else_is_refused_and_nothing_is_written(estate):
     estate.volume["forge.yaml"] = COORDINATOR_YAML.replace(
-        "    appmilla_github/api_test:", f"    {KEY}: /var/lib/forge/projects/elsewhere\n    appmilla_github/api_test:"
+        "    checkouts/api_test:", f"    {KEY}: /var/lib/forge/projects/elsewhere\n    checkouts/api_test:"
     )
     result = _run()
     assert result.exit_code == 1
@@ -496,7 +500,7 @@ def test_publish_adds_only_the_route(estate, publisher_file):
     staged = json.loads((publisher_file.parent / f"settings.json.{LEAF}-pending").read_text())
     expected = json.loads(json.dumps(PUBLISHER_JSON))
     expected["projects"][KEY] = {
-        "source": f"git://10.254.41.1:8918/api_test/.guardkit/tmp/factory-runtime/projects/{LEAF}",
+        "source": f"git://192.0.2.10:8918/api_test/.guardkit/tmp/factory-runtime/projects/{LEAF}",
         "remote": f"git@github.com:guardkit/{LEAF}.git",
     }
     assert staged == expected
@@ -516,7 +520,7 @@ def test_without_publish_the_publisher_is_not_touched_or_named(estate, publisher
 def test_a_route_already_there_is_unchanged_and_the_publisher_is_not_in_the_sequence(estate, publisher_file):
     data = json.loads(publisher_file.read_text())
     data["projects"][KEY] = {
-        "source": f"git://10.254.41.1:8918/api_test/.guardkit/tmp/factory-runtime/projects/{LEAF}",
+        "source": f"git://192.0.2.10:8918/api_test/.guardkit/tmp/factory-runtime/projects/{LEAF}",
         "remote": f"git@github.com:guardkit/{LEAF}.git",
     }
     publisher_file.write_text(json.dumps(data))
@@ -553,7 +557,7 @@ def test_the_sequence_names_the_check_the_services_check_and_the_coordinator_log
     result = _run()
     assert "estate-check" in result.output and " services" in result.output
     assert f"autobuild dispatch: {KEY} has a sandbox" in result.output
-    assert "curl -sf http://10.254.41.1:8925/healthz" in result.output
+    assert "curl -sf http://192.0.2.10:8925/healthz" in result.output
 
 
 def test_the_sequence_uses_the_estate_s_own_files_when_named(estate, tmp_path):
@@ -998,13 +1002,31 @@ def test_an_inline_value_is_refused_rather_than_guessed():
 def test_a_scalar_that_would_read_back_differently_is_quoted():
     assert register_repo._scalar("/var/lib/forge/projects/x") == "/var/lib/forge/projects/x"
     assert register_repo._scalar("${FORGE_SANDBOX_SIDECAR_URL}") == '"${FORGE_SANDBOX_SIDECAR_URL}"'
-    assert register_repo._scalar("http://10.254.41.1:8925") == '"http://10.254.41.1:8925"'
+    assert register_repo._scalar("http://192.0.2.10:8925") == '"http://192.0.2.10:8925"'
     assert register_repo._scalar("1.0") == '"1.0"'
     assert register_repo._scalar("true") == '"true"'
 
 
-def test_a_named_compose_values_file_is_used_in_the_compose_form(estate, tmp_path):
-    named = tmp_path / "elsewhere" / "values.env"
-    result = _run("--secrets-file", str(named))
+def test_the_publish_source_comes_from_the_estate_s_gateway_address(estate, tmp_path, publisher_file):
+    estate_env = tmp_path / "estate.env"
+    estate_env.write_text(
+        f"FACTORY_GATEWAY_ADDRESS=192.0.2.77\nFORGE_PUBLISHER_SETTINGS_FILE={publisher_file}\n"
+    )
+    result = _run("--publish", "--estate-env-file", str(estate_env))
     assert result.exit_code == 0, result.output
-    assert f"set -a; . {named}; set +a" in result.output
+    staged = json.loads((publisher_file.parent / f"settings.json.{LEAF}-pending").read_text())
+    assert staged["projects"][KEY]["source"] == (
+        f"git://192.0.2.77:8918/api_test/.guardkit/tmp/factory-runtime/projects/{LEAF}"
+    )
+
+
+def test_publish_without_a_gateway_address_is_refused(estate, publisher_file):
+    result = CliRunner().invoke(
+        main,
+        ["register-repo", KEY, "--github", URL, "--sandbox-settings", SANDBOX_SETTINGS,
+         "--publish", "--publisher-settings", str(publisher_file)],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 1
+    assert "--gateway-address" in result.output
+    assert estate.calls == []

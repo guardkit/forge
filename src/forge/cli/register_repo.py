@@ -119,17 +119,20 @@ PROJECTS_FOLDER: str = f"{RUNTIME_FOLDER}/projects"
 #: its two addresses are the same for every project in the shared sandbox.
 REFERENCE_PROJECT: str = "guardkit/api_test"
 
-#: The publisher's fetch address for a project's clone: sbx's git daemon,
-#: published on the factory gateway, serves anything inside the api_test clone.
-DEFAULT_PUBLISH_SOURCE_BASE: str = (
-    "git://10.254.41.1:8918/api_test/.guardkit/tmp/factory-runtime/projects"
-)
+#: The publisher fetches a project's clone from sbx's git daemon, which serves
+#: anything inside the api_test clone (its base path is the clone's parent
+#: folder) and is published on the factory gateway address at this port:
+#: ``git://<gateway>:<port>/<clone folder name>/<projects folder>/<leaf>``. The
+#: gateway address is this machine's, so it is never written here: it comes
+#: from the estate env file's FACTORY_GATEWAY_ADDRESS or --gateway-address.
+DEFAULT_GIT_EXPORT_PORT: int = 8918
 
 #: The settings in the estate env file and the sandbox's bootstrap env file
 #: this command takes its defaults from.
 ESTATE_ENV_SANDBOX_FILE: str = "SANDBOX_PROJECT_ENV_FILE"
 ESTATE_ENV_PUBLISHER_SETTINGS: str = "FORGE_PUBLISHER_SETTINGS_FILE"
 ESTATE_ENV_COMPOSE_FILE: str = "COMPOSE_FILE"
+ESTATE_ENV_GATEWAY: str = "FACTORY_GATEWAY_ADDRESS"
 SANDBOX_ENV_CONFIG_PATH: str = "FORGE_CONFIG_PATH"
 
 #: The three services that let work in: the two that receive Slack, and the
@@ -1441,7 +1444,7 @@ def activation_sequence(
     )
     lines = [
         ("What would make it live" if dry_run else "What makes it live")
-        + " — the one-page stop/start procedure, run by the delivery owner with Rich's word."
+        + " — the one-page stop/start procedure, run by the delivery owner once the factory's owner agrees."
         " This command restarted nothing.",
         "  The compose form, with the existing secrets loaded and nothing printed:",
         f"    {dc}",
@@ -1551,7 +1554,7 @@ class Options:
     sandbox_settings: str
     sandbox_clone: str
     publisher_settings: str | None
-    publish_source_base: str
+    publish_source_base: str | None
     estate: Estate
 
 
@@ -1584,12 +1587,12 @@ def resolve_options(
     publish: bool,
     dry_run: bool,
     estate_env_file: Path | None,
-    loaded_env_file: Path | None,
     sandbox_env_file: Path | None,
     sandbox_settings: str | None,
     sandbox_clone: str | None,
     publisher_settings: Path | None,
-    publish_source_base: str,
+    gateway_address: str | None,
+    git_export_port: int,
     sandbox: str,
     volume: str,
     coordinator: str,
@@ -1645,13 +1648,26 @@ def resolve_options(
             f"--estate-env-file (its {ESTATE_ENV_PUBLISHER_SETTINGS} names it)",
         )
 
+    publish_source_base: str | None = None
+    if publish:
+        gateway = (gateway_address or estate_values.get(ESTATE_ENV_GATEWAY, "")).strip()
+        if not gateway:
+            raise Refused(
+                "publisher",
+                "--publish needs the factory gateway address the publisher fetches from: pass "
+                f"--gateway-address, or --estate-env-file (its {ESTATE_ENV_GATEWAY} names it)",
+            )
+        if not re.fullmatch(r"[A-Za-z0-9.:\[\]-]+", gateway) or "${" in gateway:
+            raise Refused("publisher", f"the gateway address {gateway!r} is not a plain host name or address")
+        clone_folder = PurePosixPath(sandbox_clone.rstrip("/")).name
+        publish_source_base = f"git://{gateway}:{git_export_port}/{clone_folder}/{PROJECTS_FOLDER}"
+
     env_text = str(estate_env_file) if estate_env_file is not None else "$ESTATE_ENV"
-    if loaded_env_file is not None:
-        loaded_env_text = str(loaded_env_file)
-    elif estate_env_file is not None:
-        loaded_env_text = str(estate_env_file.parent / "secrets.env")
-    else:
-        loaded_env_text = "$RUN/secrets.env"
+    # The estate's secrets file sits beside its env file (the one-page
+    # procedure's $RUN/secrets.env); it is loaded, never printed.
+    loaded_env_text = (
+        str(estate_env_file.parent / "secrets.env") if estate_env_file is not None else "$RUN/secrets.env"
+    )
     estate_check = "$FORGE/deploy/estate/estate-check"
     compose = estate_values.get(ESTATE_ENV_COMPOSE_FILE, "")
     first = next((part for part in re.split(r"[:,]", compose) if part.strip()), "")
@@ -1712,7 +1728,7 @@ def register(options: Options, run: Runner, steps: list[Step]) -> list[str]:
 
     publisher_edit: JsonEdit | None = None
     if options.publish:
-        assert options.publisher_settings is not None
+        assert options.publisher_settings is not None and options.publish_source_base is not None
         publisher_text = host.read(options.publisher_settings)
         if publisher_text is None:
             raise Refused("publisher", f"could not read the publisher's settings file {options.publisher_settings}")
@@ -1797,8 +1813,6 @@ def register(options: Options, run: Runner, steps: list[Step]) -> list[str]:
 @click.option("--estate-env-file", type=click.Path(dir_okay=False, path_type=Path),
               envvar="FORGE_ESTATE_ENV_FILE", default=None,
               help="The estate env file the factory runs on now; the printed commands use it.")
-@click.option("--secrets-file", "loaded_env_file", type=click.Path(dir_okay=False, path_type=Path), default=None,
-              help="The estate's secrets file (default: secrets.env beside the estate env file).")
 @click.option("--sandbox-env-file", type=click.Path(dir_okay=False, path_type=Path), default=None,
               help=f"The sandbox's bootstrap env file (default: the estate env's {ESTATE_ENV_SANDBOX_FILE}).")
 @click.option("--sandbox-settings", default=None,
@@ -1807,8 +1821,10 @@ def register(options: Options, run: Runner, steps: list[Step]) -> list[str]:
               help="The api_test clone in the sandbox (default: worked out from --sandbox-settings).")
 @click.option("--publisher-settings", type=click.Path(dir_okay=False, path_type=Path), default=None,
               help=f"The publisher's settings file (default: the estate env's {ESTATE_ENV_PUBLISHER_SETTINGS}).")
-@click.option("--publish-source-base", default=DEFAULT_PUBLISH_SOURCE_BASE, show_default=True,
-              help="Where the publisher fetches a project's clone from, without the project's folder.")
+@click.option("--gateway-address", default=None,
+              help=f"With --publish: the factory gateway address (default: the estate env's {ESTATE_ENV_GATEWAY}).")
+@click.option("--git-export-port", type=int, default=DEFAULT_GIT_EXPORT_PORT, show_default=True,
+              help="With --publish: the port the sandbox's git export is published on.")
 @click.option("--sandbox", "sandbox", default=DEFAULT_SANDBOX, show_default=True, help="The shared sandbox.")
 @click.option("--settings-volume", "volume", default=DEFAULT_SETTINGS_VOLUME, show_default=True,
               help="The coordinator's settings volume.")
@@ -1822,12 +1838,12 @@ def register_repo_cmd(
     dry_run: bool,
     check_drained: bool,
     estate_env_file: Path | None,
-    loaded_env_file: Path | None,
     sandbox_env_file: Path | None,
     sandbox_settings: str | None,
     sandbox_clone: str | None,
     publisher_settings: Path | None,
-    publish_source_base: str,
+    gateway_address: str | None,
+    git_export_port: int,
     sandbox: str,
     volume: str,
     coordinator: str,
@@ -1873,12 +1889,12 @@ def register_repo_cmd(
             publish=publish,
             dry_run=dry_run,
             estate_env_file=estate_env_file,
-            loaded_env_file=loaded_env_file,
             sandbox_env_file=sandbox_env_file,
             sandbox_settings=sandbox_settings,
             sandbox_clone=sandbox_clone,
             publisher_settings=publisher_settings,
-            publish_source_base=publish_source_base,
+            gateway_address=gateway_address,
+            git_export_port=git_export_port,
             sandbox=sandbox,
             volume=volume,
             coordinator=coordinator,
