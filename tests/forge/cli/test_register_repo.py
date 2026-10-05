@@ -1172,12 +1172,21 @@ def test_publish_without_a_gateway_address_is_refused(estate, publisher_file):
 
 
 @pytest.mark.parametrize(
-    "address",
-    ["https://someone:tok3n-value@github.com/guardkit/bench-one.git", "https://tok3n-value@github.com/guardkit/bench-one.git", "ssh://tok3n-value@github.com/guardkit/bench-one.git"],
+    "address, said",
+    [
+        ("https://someone:tok3n-value@github.com/guardkit/bench-one.git", "contains an @"),
+        ("https://tok3n-value@github.com/guardkit/bench-one.git", "contains an @"),
+        ("ssh://tok3n-value@github.com/guardkit/bench-one.git", "contains an @"),
+        ("https://github.com/guardkit/bench-one.git?tok3n-value", "contains a ?"),
+        ("https://github.com/guardkit/bench-one.git#tok3n-value", "contains a #"),
+        ("https:/github.com/guardkit/tok3n-value/bench-one.git", "does not begin with https://"),
+        ("https:///github.com/tok3n-value/bench-one.git", "does not begin with https://"),
+        ("http://tok3n-value.example/guardkit/bench-one.git", "does not begin with https://"),
+    ],
 )
-def test_an_address_carrying_a_user_name_or_password_is_refused_without_echoing_it(estate, address):
+def test_a_bad_address_is_refused_without_echoing_it(estate, address, said):
     result = CliRunner().invoke(main, ["register-repo", KEY, "--github", address], catch_exceptions=False)
     assert result.exit_code == 1
-    assert "user name or password" in result.output
+    assert said in result.output
     assert "tok3n-value" not in result.output
     assert estate.calls == []

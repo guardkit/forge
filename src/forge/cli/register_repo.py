@@ -1650,18 +1650,22 @@ def _parse_name(name: str) -> tuple[str, str]:
 
 
 def _check_url(url: str, leaf: str) -> str:
+    """The plain ``https://<host>/<org>/<name>`` address, or a refusal.
+
+    No refusal here repeats the value: what was typed may hold a credential
+    (``https://<token>@github.com/...``), so only the character or the shape
+    that was wrong is named.
+    """
     url = url.strip()
-    parts = urlsplit(url)
-    if "@" in parts.netloc or parts.username or parts.password:
-        # Never echo it: the part before the @ may be a token.
-        raise Refused(
-            "github",
-            "--github carries a user name or password before the host; give the plain "
-            "https://github.com/<org>/<name> address — the sandbox and the settings must "
-            "never hold a credential this way",
-        )
-    if not url.startswith("https://"):
-        raise Refused("github", f"--github must be the repository's https:// address, not {url!r}")
+    plain = "give the plain https://github.com/<org>/<name> address (the value is not repeated here)"
+    for char, called in (("@", "an @ (a user name or token before the host)"),
+                         ("?", "a ? (a query)"), ("#", "a # (a fragment)")):
+        if char in url:
+            raise Refused("github", f"--github contains {called}; {plain}")
+    if not url.startswith("https://") or url.startswith("https:///"):
+        raise Refused("github", f"--github does not begin with https:// and a host; {plain}")
+    if not urlsplit(url).hostname:
+        raise Refused("github", f"--github names no host; {plain}")
     last = url.rstrip("/").rsplit("/", 1)[-1]
     last = last[:-4] if last.endswith(".git") else last
     if last != leaf:
