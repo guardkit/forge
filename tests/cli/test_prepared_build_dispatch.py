@@ -438,3 +438,27 @@ async def test_the_boot_reconcile_composition_wires_the_admission_too(
     )(_StubNatsClient())
 
     assert callable(seen.get("prepared_build_admission"))
+
+
+@pytest.mark.asyncio
+async def test_a_prepared_payload_marked_mode_c_is_refused(
+    tmp_path: Path,
+    project: Project,
+    forge_config: ForgeConfig,
+    persistence: SqliteLifecyclePersistence,
+) -> None:
+    """A prepared feature is a whole feature, not a single-task fix."""
+    project.commit_on(BRANCH, bundle())
+    client, starter, rejections = _StubNatsClient(), _RecordingStarter(), []
+    deps = _deps(
+        client, forge_config, persistence, starter, _admission(forge_config, tmp_path), rejections
+    )
+
+    async def _ack() -> None:
+        return None
+
+    await deps.dispatch_build(_payload(mode="mode-c", task_id="TASK-AB12-001"), _ack)
+
+    assert _row(persistence) is None
+    assert starter.calls == []
+    assert "single-task fix (mode-c)" in rejections[0][1]
