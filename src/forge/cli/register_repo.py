@@ -1739,8 +1739,12 @@ def resolve_options(
 def register(options: Options, run: Runner, steps: list[Step]) -> list[str]:
     """Steps 1–7: report lines go into ``steps``; returns the printed sequence.
 
-    Every read comes before every write, so a refusal anywhere leaves
-    everything — the project, the live settings and the sandbox — as it was.
+    Every check and every read comes before the first write, so a refusal from
+    a check leaves everything as it was. The writes come after, in order — the
+    sandbox clone, then each staged copy with its backup — and none of them is
+    a live file, so a write that fails part-way leaves at most a clone or a
+    staged copy behind (said in the report), never a changed live setting.
+    The project's own repository is never written.
     """
     with tempfile.TemporaryDirectory(prefix="forge-register-") as folder:
         steps += check_project(run, key=options.key, url=options.url, folder=Path(folder))
