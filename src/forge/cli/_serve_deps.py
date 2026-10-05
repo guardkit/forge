@@ -124,6 +124,7 @@ from forge.planning.notifications import (
     answer_build_thread,
     build_refused_reply,
     build_started_reply,
+    gate_ended_reason,
     make_build_thread_reply,
 )
 
@@ -1804,31 +1805,19 @@ def _build_dispatch_build(
             )
             await ack_callback()
             # A hand-over whose build-start card ended it is told so, once.
-            # The one remaining case with no answer: the forge restarts while
-            # the build waits at its card, and the rearm path
-            # (``rearm_paused_gates``) launches or ends it outside this
-            # closure, so neither "Building" nor this line is said.
+            # (After a restart mid-card, ``rearm_paused_gates`` answers
+            # instead, from the build row.)
             if fresh_row:
                 await answer_build_thread(
                     reply_in_thread,
                     payload,
                     build_refused_reply(
-                        payload.feature_id, _gate_ended_reason(outcome)
+                        payload.feature_id, gate_ended_reason(outcome)
                     ),
                     level="warning",
                 )
 
     return dispatch_build
-
-
-def _gate_ended_reason(outcome: Any) -> str:
-    """Why a build-start card ended a build, in plain words."""
-    value = str(getattr(outcome, "value", outcome))
-    if value == "CANCELLED":
-        return "the build-start card was declined"
-    if value == "TIMED_OUT":
-        return "the build-start card timed out"
-    return "the build-start check stopped it"
 
 
 #: How long a launch waits before asking the lifecycle bridge again when it
