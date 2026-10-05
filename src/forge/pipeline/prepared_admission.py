@@ -318,6 +318,15 @@ def relative_markdown_links(text: str) -> list[str]:
     return found
 
 
+def _padded(path: str) -> bool:
+    """Does ``path`` begin or end with whitespace (Codex review round 3, R8)?
+
+    Such a path is never trimmed into another: GuardKit reads it exactly as
+    written, and `` ./x`` is a folder named `` .`` (which a committed link
+    could redirect), not ``./x``. So it is refused, naming it."""
+    return bool(path) and (path[0].isspace() or path[-1].isspace())
+
+
 def _yaml_path(raw: str) -> str | None:
     """A path the feature YAML names (a task's ``file_path``, a spec file), or
     ``None`` when it is absolute or has a ``..`` component (Codex review
@@ -352,6 +361,15 @@ async def _walk_reference(
     A leading ``/`` starts at the repository's top.
     """
     at = _short(commit)
+    if _padded(target):
+        # CommonMark has already trimmed the destination; what is left (after
+        # %-decoding) still begins or ends with a space, so it names a
+        # different file from the one it appears to (R8).
+        return None, (
+            f"{_BUILT_PREFIX}{source} links to {target!r}, whose path begins or "
+            f"ends with a space; write the link without one and queue the "
+            f"build again."
+        )
     current: list[str] = [] if target.startswith("/") else (
         [p for p in source.split("/")[:-1] if p]
     )
@@ -520,7 +538,13 @@ async def check_supplied_bundle(
             return f"the prepared feature cannot be built: task {index + 1} in {yaml_path} has no id"
         if not isinstance(file_path, str) or not file_path.strip():
             return f"the prepared feature cannot be built: task {task_id} in {yaml_path} names no task file"
-        normal = _yaml_path(file_path.strip())
+        if _padded(file_path):
+            return (
+                f"the prepared feature cannot be built: task {task_id}'s file "
+                f"{file_path!r} begins or ends with a space; the path is read "
+                f"exactly as written, so write it without one"
+            )
+        normal = _yaml_path(file_path)
         if normal is None:
             return (
                 f"the prepared feature cannot be built: task {task_id}'s file "
@@ -554,7 +578,13 @@ async def check_supplied_bundle(
     for raw in feature_files:
         if not isinstance(raw, str) or not raw.strip():
             continue
-        normal = _yaml_path(raw.strip())
+        if _padded(raw):
+            return (
+                f"the prepared feature cannot be built: the spec file {raw!r} "
+                f"begins or ends with a space; the path is read exactly as "
+                f"written, so write it without one"
+            )
+        normal = _yaml_path(raw)
         if normal is None:
             return (
                 f"the prepared feature cannot be built: the spec file {raw} is "

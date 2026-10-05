@@ -901,6 +901,74 @@ async def test_a_linked_picture_referenced_from_the_guide_is_refused(
 
 
 @pytest.mark.asyncio
+async def test_a_task_path_with_a_leading_space_is_refused_not_trimmed(
+    project: Project, runner: WorktreeGitRunner
+) -> None:
+    """`` ./tasks/...`` is a folder named `` .`` to GuardKit, which a
+    committed link can redirect; trimmed, it would be checked as the real task
+    file. Both exist here; the path is refused (R8)."""
+    task = f"{TASKS[0]}-do-the-thing.md"
+    files = bundle()
+    plan_path = f".guardkit/features/{FEATURE}.yaml"
+    padded = f" ./{TASK_DIR}/{task}"
+    files[plan_path] = files[plan_path].replace(f'"{TASK_DIR}/{task}"', f'"{padded}"', 1)
+    files[f"elsewhere/{TASK_DIR}/{task}"] = "# a different task\n"
+    _commit_with_links(project, files, {" .": "elsewhere"})
+
+    answer = await _admit(project, runner)
+
+    assert not answer.ok
+    assert repr(padded) in (answer.refusal or "")
+    assert "begins or ends with a space" in (answer.refusal or "")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("which", ["task", "spec"])
+async def test_a_yaml_path_with_a_trailing_space_is_refused(
+    project: Project, runner: WorktreeGitRunner, which: str
+) -> None:
+    files = bundle()
+    plan_path = f".guardkit/features/{FEATURE}.yaml"
+    path = (
+        f"{TASK_DIR}/{TASKS[0]}-do-the-thing.md"
+        if which == "task"
+        else f"{SPEC_DIR}/{SPEC_NAME}.feature"
+    )
+    files[plan_path] = files[plan_path].replace(f'"{path}"', f'"{path} "', 1)
+    project.commit_on(BRANCH, files)
+
+    answer = await _admit(project, runner)
+
+    assert not answer.ok
+    assert "begins or ends with a space" in (answer.refusal or "")
+
+
+@pytest.mark.asyncio
+async def test_the_same_paths_written_plainly_are_admitted(
+    project: Project, runner: WorktreeGitRunner
+) -> None:
+    project.commit_on(BRANCH, bundle())
+
+    assert (await _admit(project, runner)).ok
+
+
+@pytest.mark.asyncio
+async def test_a_reference_whose_path_still_has_a_space_at_an_end_is_refused(
+    project: Project, runner: WorktreeGitRunner
+) -> None:
+    files = bundle()
+    task = f"{TASK_DIR}/{TASKS[0]}-do-the-thing.md"
+    files[task] += "\nSee [the API](../../../docs/API.md%20).\n"
+    files["docs/API.md"] = "# API\n"
+    project.commit_on(BRANCH, files)
+
+    answer = await _admit(project, runner)
+
+    assert not answer.ok
+    assert "begins or ends with a space" in (answer.refusal or "")
+
+
+@pytest.mark.asyncio
 async def test_an_absolute_spec_file_path_is_refused(
     project: Project, runner: WorktreeGitRunner
 ) -> None:
