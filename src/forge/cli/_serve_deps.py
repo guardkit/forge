@@ -1941,6 +1941,17 @@ def build_prepared_build_admission(
         return runners[0]
 
     async def admit(payload: Any) -> Any:
+        # A prepared feature is a whole feature, never a single-task fix: a
+        # fix journey writes its own row before it is queued, so one arriving
+        # here unplanned and marked mode-c is refused.
+        if str(getattr(payload, "mode", None) or "mode-a") == "mode-c":
+            return AdmissionAnswer(
+                refusal=(
+                    f"{payload.feature_id} was queued as a single-task fix "
+                    f"(mode-c) with nothing behind it; a feature planned "
+                    f"elsewhere is queued as a whole feature"
+                )
+            )
         repo = str(payload.repo)
         repo_path = (forge_config.planning.target_repo_paths or {}).get(repo)
         if not repo_path:

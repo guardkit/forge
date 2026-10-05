@@ -2183,10 +2183,13 @@ async def _make_source_branch(
 
 
 async def _delete_source_branch(repo_path: Path, branch: str | None) -> None:
-    """Delete a prepared build's own branch. Best effort, never raises."""
+    """Delete a prepared build's own branch if it is there. Best effort, never
+    raises; a branch already gone is nothing to do."""
     if not branch or not branch.startswith(SOURCE_BRANCH_PREFIX):
         return
     try:
+        if not await _local_branch_exists(repo_path, branch):
+            return
         code, output = await _run_git(["branch", "-D", branch], cwd=repo_path)
     except Exception as exc:  # noqa: BLE001 — clean-up never fails a build
         code, output = -1, f"{type(exc).__name__}: {exc}"
@@ -2522,11 +2525,14 @@ _DISK_RESERVATIONS: dict["_BuildClaim", int] = {}
 class _BuildClaim:
     """What one running build holds in this runner, released when it ends."""
 
-    __slots__ = ("build_id", "repo")
+    __slots__ = ("build_id", "repo", "source_branch")
 
     def __init__(self, build_id: str) -> None:
         self.build_id = build_id
         self.repo: Path | None = None
+        # A prepared build's own ``forge/source/<build_id>`` and the clone it
+        # is in (4 October 2026), deleted when the build ends however it ends.
+        self.source_branch: tuple[Path, str] | None = None
 
     def release(self) -> None:
         with _RUNNER_SHARED_LOCK:
@@ -3882,10 +3888,70 @@ async def _sweep_prior_build_residue(
         ) from exc
 
 
+async def _sweep_prior_source_branches(
+    repo_path: Path, feature_id: str, *, current_build_id: str
+) -> None:
+    """Delete ``forge/source/<prior build>`` for this feature's ended builds.
+
+    The branch is found by name — ``forge/source/build-<feature_id>-<when>``,
+    the build id :func:`forge.lifecycle.identifiers.derive_build_id` makes —
+    so it is cleared even when the prior build owns no worktree and no
+    ``autobuild/*`` branch (its runner was stopped before GuardKit made one).
+    The current build's own branch, and a prior build still live in the ledger
+    or in this runner, are left alone. Best effort: discovery that fails
+    touches nothing, and a delete that fails is logged.
+    """
+    prefix = f"{SOURCE_BRANCH_PREFIX}build-{feature_id}-"
+    try:
+        code, output = await _run_git(
+            ["for-each-ref", "--format=%(refname:short)", f"refs/heads/{prefix}*"],
+            cwd=repo_path,
+        )
+    except Exception as exc:  # noqa: BLE001 — discovery is not destruction
+        logger.warning(
+            "autobuild_runner: requeue sweep — could not list prior builds' "
+            "own branches in %s (%s: %s); nothing was touched",
+            repo_path,
+            type(exc).__name__,
+            exc,
+        )
+        return
+    if code != 0:
+        return
+    for branch in (line.strip() for line in output.splitlines()):
+        if not branch.startswith(prefix):
+            continue
+        prior_build_id = branch[len(SOURCE_BRANCH_PREFIX) :]
+        if prior_build_id == current_build_id:
+            continue
+        status = _prior_build_status(prior_build_id)
+        if status in _LIVE_BUILD_STATUSES or _running_in_this_runner(prior_build_id):
+            logger.info(
+                "autobuild_runner: requeue sweep — prior build %s is still "
+                "live; its branch %s is left alone",
+                prior_build_id,
+                branch,
+            )
+            continue
+        await _delete_source_branch(repo_path, branch)
+        logger.info(
+            "autobuild_runner: requeue sweep — prior build %s: its own branch "
+            "%s was cleared",
+            prior_build_id,
+            branch,
+        )
+
+
 async def _sweep_prior_build_residue_impl(
     repo_path: Path, feature_id: str, *, current_build_id: str
 ) -> None:
     """Body of :func:`_sweep_prior_build_residue` (see its docstring)."""
+    # A prior PREPARED build's own branch first (4 October 2026): a runner
+    # killed before GuardKit made any worktree leaves the branch and nothing
+    # else, so it is found by name, not through the worktrees below.
+    await _sweep_prior_source_branches(
+        repo_path, feature_id, current_build_id=current_build_id
+    )
     try:
         base = _worktree_base_dir().resolve()
     except OSError:  # pragma: no cover — unresolvable base ⇒ nothing to sweep
@@ -4107,6 +4173,10 @@ async def _sweep_prior_build_residue_impl(
                 branch,
             )
 
+        # A prior PREPARED build's own branch (4 October 2026) goes with its
+        # leftovers; a prior build that had none has nothing to delete.
+        await _delete_source_branch(repo_path, _source_branch_for(prior_build_id))
+
         try:
             # Off the event loop (3 October 2026, concurrent builds): a whole
             # kept worktree can take seconds to delete, and every other build
@@ -4318,6 +4388,36 @@ async def _running_wave_body(state: AutobuildRunnerState) -> dict[str, Any]:
     finally:
         _CURRENT_BUILD_CLAIM.reset(token)
         claim.release()
+        # A PREPARED build's own branch goes on EVERY exit — success, failure,
+        # a refused feature check, cancel, timeout, wedge (4 October 2026).
+        # Nothing needs it once the build has ended: a kept worktree is
+        # detached at the commit itself, the merge press works from the
+        # recorded commits, and a relaunch makes the branch again at the same
+        # admitted commit.
+        if claim.source_branch is not None:
+            repo_of_branch, branch = claim.source_branch
+            # Shielded, so a cancel arriving now cannot stop the delete half
+            # way; if one does arrive, the delete is allowed to finish and the
+            # cancel is then raised, never swallowed.
+            deleting = asyncio.ensure_future(
+                _delete_source_branch(repo_of_branch, branch)
+            )
+            cancelled: asyncio.CancelledError | None = None
+            while not deleting.done():
+                try:
+                    await asyncio.shield(deleting)
+                except asyncio.CancelledError as exc:
+                    cancelled = exc
+                except Exception as exc:  # noqa: BLE001 — clean-up only
+                    logger.warning(
+                        "autobuild_runner: could not delete %s after the build "
+                        "ended (%s); a later sweep of this feature deletes it",
+                        branch,
+                        type(exc).__name__,
+                    )
+                    break
+            if cancelled is not None:
+                raise cancelled
 
 
 async def _run_one_build(state: AutobuildRunnerState) -> dict[str, Any]:
@@ -4465,6 +4565,9 @@ async def _run_one_build(state: AutobuildRunnerState) -> dict[str, Any]:
             )
         source_branch = _source_branch_for(build_id)
         base_branch = source_branch
+        current_claim = _CURRENT_BUILD_CLAIM.get()
+        if current_claim is not None:
+            current_claim.source_branch = (repo_path, source_branch)
         try:
             worktree_path = await _materialise_worktree(
                 repo_path, source_branch, build_id

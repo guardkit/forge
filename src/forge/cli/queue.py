@@ -1041,6 +1041,14 @@ def queue_cmd(
     #    — TASK-MBC8-001) so crash-recovery (FEAT-FORGE-001) and the
     #    supervisor wiring from TASK-MBC8-008 see the correct mode after
     #    a restart.
+    #
+    #    NOT a door for a feature planned elsewhere (4 October 2026). This row
+    #    is written here, ahead of the bus, so the daemon's dispatch never
+    #    admits it: no remote is fetched, no start/target/memory/settings or
+    #    source commit is recorded, and the supplied files are not checked.
+    #    A prepared feature should be queued through Jarvis's ``queue_build``
+    #    (the build queue's consumer and its admission) instead. Recording
+    #    those facts here is out of scope for that change.
     try:
         if hasattr(persistence, "queue_build"):
             persistence.queue_build(payload, mode=build_mode, profile=profile_name)

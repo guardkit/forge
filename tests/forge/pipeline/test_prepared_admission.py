@@ -422,6 +422,21 @@ async def test_a_broken_relative_link_is_refused_naming_the_link(
 
 
 @pytest.mark.asyncio
+async def test_a_link_to_a_folder_is_refused(
+    project: Project, runner: WorktreeGitRunner
+) -> None:
+    files = bundle()
+    task_path = f"{TASK_DIR}/{TASKS[0]}-do-the-thing.md"
+    files[task_path] += "\nThe [constitution](../../../docs/constitution) folder.\n"
+    project.commit_on(BRANCH, files)
+
+    answer = await _admit(project, runner)
+
+    assert not answer.ok
+    assert "docs/constitution" in (answer.refusal or "")
+
+
+@pytest.mark.asyncio
 async def test_back_quoted_paths_urls_and_anchors_are_not_checked(
     project: Project, runner: WorktreeGitRunner
 ) -> None:
@@ -542,9 +557,34 @@ def test_the_integration_contracts_rule_matches_the_producers() -> None:
     assert guide_claims_routes("## §4 Integration Contracts\n- route: /a\n")
     assert guide_claims_routes("### Integration Contracts\nroute: /a\n## Next\n")
     assert guide_claims_routes("## §4\n  - route: /a\n")
+    assert guide_claims_routes("## 4 Integration Contract\nROUTE: /a\n")
     assert not guide_claims_routes("## Integration Contracts\nnone\n## B\nroute: /b\n")
     assert not guide_claims_routes("# Integration Contracts\nroute: /a\n")
     assert not guide_claims_routes("## Overview\nroute: /a\n")
+    assert not guide_claims_routes("## §4 Integration Contracts\nroute:   \n")
+
+
+def test_guardkits_colon_form_is_not_recognised_like_the_emitter() -> None:
+    # GuardKit's template writes this form; the specialist emitter does not
+    # recognise it, and neither does admission (noted for the producers).
+    assert not guide_claims_routes("## §4: Integration Contracts\n- route: /a\n")
+
+
+def test_the_heading_is_case_sensitive_like_the_emitter() -> None:
+    assert not guide_claims_routes("## integration contracts\nroute: /a\n")
+    assert not guide_claims_routes("## §4 INTEGRATION CONTRACTS\nroute: /a\n")
+
+
+def test_only_the_first_matching_section_is_read() -> None:
+    first_empty = (
+        "## §4 Integration Contracts\nnone here\n"
+        "## Other\n\n## §4 Integration Contracts\n- route: /late\n"
+    )
+    assert not guide_claims_routes(first_empty)
+    # The fallback heading is read only when no §4 heading exists at all.
+    assert not guide_claims_routes(
+        "## §4\nnothing\n## Integration Contracts\nroute: /a\n"
+    )
 
 
 def test_only_relative_markdown_links_are_collected() -> None:

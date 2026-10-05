@@ -290,3 +290,25 @@ async def test_the_sandbox_read_without_the_check_sends_what_it_always_sent() ->
 
     assert post.sent[0][1] == {"repo": REPO_KEY, "commit": "c" * 40, "file_path": "a.md"}
     assert answer.found and answer.content == "x"
+
+
+@pytest.mark.asyncio
+async def test_a_folder_is_not_a_file(copy: Path) -> None:
+    """``cat-file -s`` answers for a folder too; the reader must not."""
+    sha = _commit_with_link(copy)
+
+    answer = await read_file_at_commit(copy, sha, "docs")
+
+    assert answer.ok and not answer.found
+
+
+def test_the_route_says_a_folder_is_not_there(copy: Path) -> None:
+    sha = _commit_with_link(copy)
+
+    status, body = process_git_read_file_at_commit_request(
+        {"repo": REPO_KEY, "commit": sha, "file_path": "docs"},
+        config=_config({REPO_KEY: str(copy)}),
+    )
+
+    assert status == 200
+    assert body["found"] is False and body["refusal"] is None
