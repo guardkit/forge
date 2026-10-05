@@ -821,9 +821,11 @@ async def handle_message(msg: _MsgLike, deps: PipelineConsumerDeps) -> None:
         await answer_build_thread(
             deps.reply_in_thread,
             payload,
+            # Plain words in the thread; the exception itself is logged above.
             build_refused_reply(
                 payload.feature_id,
-                f"it could not be dispatched ({exc.__class__.__name__}: {exc})",
+                "the factory hit an error while starting it; the details are "
+                "in the factory's log",
             ),
             level="warning",
         )
