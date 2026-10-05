@@ -44,6 +44,10 @@ PARENT = {
     "GUARDKIT_TIMEOUT_MULTIPLIER": "4.0",
     "GUARDKIT_AUTOBUILD_TASK_TIMEOUT_FLOOR": "900",
     "GUARDKIT_SDK_TIMEOUT": "1800",
+    "GUARDKIT_STAMP_MODEL": "a-stamp-model",
+    "GUARDKIT_STAMP_MODEL_URL": "http://localhost:4000/v1",
+    "GUARDKIT_STAMP_MODEL_TIMEOUT_S": "30",
+    "GUARDKIT_STAMP_MODEL_MAX_TOKENS": "4096",
     "GUARDKIT_MAX_PARALLEL_TASKS": "2",
     "GUARDKIT_WAVE_SAME_AREA": "parallel",
     "GUARDKIT_PLAYER_MODEL_LIMITS": "another-model=4",
@@ -105,8 +109,11 @@ def test_the_list_names_nothing_twice() -> None:
 
 def test_the_list_is_short() -> None:
     """"A SHORT named list" is the design's own wording, and it stays short: a
-    list nobody can read is the copy-of-everything by another name."""
-    assert len(LAUNCH_SETTINGS) <= 30
+    list nobody can read is the copy-of-everything by another name.
+
+    Raised from 30 to 34 on 5 October 2026 for the four settings of the plan's
+    stamp check, which the list had left out (see the test below)."""
+    assert len(LAUNCH_SETTINGS) <= 34
 
 
 def test_the_list_names_no_language_framework_or_product() -> None:
@@ -358,3 +365,49 @@ def test_the_run_owner_is_the_build_and_never_inherited() -> None:
 
     assert handed[GUARDKIT_RUN_OWNER_ENV] == "build-FEAT-A-1"
     assert GUARDKIT_RUN_OWNER_ENV not in none_given
+
+
+# ---------------------------------------------------------------------------
+# The model the plan's stamp check asks (5 October 2026)
+# ---------------------------------------------------------------------------
+
+#: The stamp check's own settings, as the build system reads them
+#: (``guardkit/orchestrator/stamp_model_fallback.py``). Written out here
+#: rather than imported from the build system, which this repository does not
+#: depend on.
+STAMP_SETTINGS = {
+    "GUARDKIT_STAMP_MODEL": "flash-next-t06",
+    "GUARDKIT_STAMP_MODEL_URL": "http://router:4000/v1",
+    "GUARDKIT_STAMP_MODEL_TIMEOUT_S": "60",
+    "GUARDKIT_STAMP_MODEL_MAX_TOKENS": "8192",
+}
+
+#: The parent above with none of the stamp check's settings in it.
+PARENT_WITHOUT_STAMP = {k: v for k, v in PARENT.items() if k not in STAMP_SETTINGS}
+
+
+def test_the_stamp_checks_model_settings_reach_the_check() -> None:
+    """5 October 2026: the release set GUARDKIT_STAMP_MODEL in the sandbox's
+    settings and the sandbox helper had it, but this list left it out, so the
+    stamp check asked the build system's built-in default instead — a retired
+    model whose load ran the GPU out of memory. Set, each one reaches the
+    launch with the parent's own value; unset, it stays unset and the build
+    system keeps its own default."""
+    env = build_launch_env(parent={**PARENT_WITHOUT_STAMP, **STAMP_SETTINGS})
+    for name, value in STAMP_SETTINGS.items():
+        assert env[name] == value, f"{name} was not handed to the launch"
+
+    unset = build_launch_env(parent=PARENT_WITHOUT_STAMP)
+    for name in STAMP_SETTINGS:
+        assert name not in unset
+
+
+def test_each_stamp_setting_travels_on_its_own() -> None:
+    """Any one of them set alone is passed, so setting only the model name —
+    which is what the release does — is enough."""
+    for name, value in STAMP_SETTINGS.items():
+        env = build_launch_env(parent={**PARENT_WITHOUT_STAMP, name: value})
+        assert env[name] == value
+        for other in STAMP_SETTINGS:
+            if other != name:
+                assert other not in env

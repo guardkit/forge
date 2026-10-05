@@ -159,3 +159,69 @@ def test_the_live_gates_own_overlay_still_reaches_the_command(
     answer = _run(child, tmp_path, extra_env={"SOME_TOOL_CACHE": "/candidate"})
 
     assert answer["declared"] == "/candidate"
+
+
+# ---------------------------------------------------------------------------
+# The model the plan's stamp check asks (5 October 2026)
+# ---------------------------------------------------------------------------
+
+
+def test_the_stamp_check_is_handed_the_model_the_helper_was_given(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The defect of 5 October 2026, through the helper's own path.
+
+    The release set ``GUARDKIT_STAMP_MODEL`` in the sandbox's settings and the
+    helper held it, but the stamp check it starts — ``guardkit qa
+    normalize-stamps``, run by :func:`run_declared_check` with the helper's own
+    command runner — was not given it, so the build system asked its built-in
+    default instead: a retired model whose load ran the GPU out of memory.
+
+    Here a stand-in for the build system writes down the stamp settings it was
+    started with. The real check path and the real runner start it; nothing
+    else runs.
+    """
+    from forge.deploy_sidecar.service import _DeclaredCheck, run_declared_check
+
+    stamp_settings = {
+        "GUARDKIT_STAMP_MODEL": "flash-next-t06",
+        "GUARDKIT_STAMP_MODEL_URL": "http://router:4000/v1",
+        "GUARDKIT_STAMP_MODEL_TIMEOUT_S": "60",
+        "GUARDKIT_STAMP_MODEL_MAX_TOKENS": "8192",
+    }
+    for name, value in stamp_settings.items():
+        monkeypatch.setenv(name, value)
+
+    seen = tmp_path / "what-the-stamp-check-was-given.json"
+    standin = tmp_path / "guardkit-standin"
+    standin.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, sys\n"
+        f"names = {sorted(stamp_settings)!r}\n"
+        f"open({str(seen)!r}, 'w').write(json.dumps({{\n"
+        "    'argv': sys.argv[1:],\n"
+        "    'stamp': {n: os.environ.get(n) for n in names},\n"
+        "    'leaked': 'GH_TOKEN' in os.environ,\n"
+        "}))\n"
+        "print(json.dumps({'status': 'nothing_to_do'}))\n",
+        encoding="utf-8",
+    )
+    standin.chmod(standin.stat().st_mode | stat.S_IXUSR)
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+
+    run_declared_check(
+        _DeclaredCheck(
+            name="normalize-stamps",
+            args={"feature_id": "FEAT-STAMP-1", "no_model": False},
+            blocking=True,
+            timeout=30.0,
+        ),
+        worktree=worktree,
+        command=(str(standin),),
+    )
+
+    given = json.loads(seen.read_text(encoding="utf-8"))
+    assert given["argv"][:2] == ["qa", "normalize-stamps"]
+    assert given["stamp"] == stamp_settings
+    assert given["leaked"] is False
