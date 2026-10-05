@@ -447,6 +447,43 @@ async def test_a_build_whose_card_timed_out_is_told_so_once(
     assert starter.replies_at_launch == []
 
 
+@pytest.mark.asyncio
+async def test_a_dispatch_error_is_answered_in_plain_words(
+    project: Project,
+    bus: _Bus,
+    forge_config: ForgeConfig,
+    persistence: SqliteLifecyclePersistence,
+    tmp_path: Path,
+) -> None:
+    class _Broken:
+        def start_async_task(self, *_a: Any) -> str:
+            raise RuntimeError("runner socket refused")
+
+        async def astart_async_task(self, *_a: Any) -> str:
+            raise RuntimeError("runner socket refused")
+
+    project.commit_on(BRANCH, bundle())
+    deps = build_pipeline_consumer_deps(
+        bus,
+        forge_config,
+        persistence,
+        async_task_starter=_Broken(),
+        record_build_rejection=lambda _cid, _reason: None,
+        prepared_build_admission=build_prepared_build_admission(
+            forge_config, git_runner=WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+        ),
+    )
+
+    await handle_message(_direct(bus), deps)
+
+    messages = [r.message for r in bus.replies()]
+    assert messages == [
+        f"{FEATURE} was not started: the factory hit an error while starting "
+        "it; the details are in the factory's log."
+    ]
+    assert "RuntimeError" not in messages[0] and "socket" not in messages[0]
+
+
 # ---------------------------------------------------------------------------
 # Refused
 # ---------------------------------------------------------------------------
