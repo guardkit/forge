@@ -119,6 +119,13 @@ from forge.pipeline.dispatchers.autobuild_async import (
     AsyncTaskStarter,
     dispatch_autobuild_async,
 )
+from forge.planning.notifications import (
+    BuildThreadReply,
+    answer_build_thread,
+    build_refused_reply,
+    build_started_reply,
+    make_build_thread_reply,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - import-time only
     from nats_core.events import BuildFailedPayload, BuildQueuedPayload
@@ -806,6 +813,7 @@ def _build_dispatch_build(
     conductor_router: Callable[..., Any] | None = None,
     record_build_rejection: Callable[[str, str], Any] | None = None,
     prepared_build_admission: Callable[[Any], Awaitable[Any]] | None = None,
+    reply_in_thread: BuildThreadReply | None = None,
 ):
     """Return the production ``dispatch_build`` closure.
 
@@ -859,6 +867,16 @@ def _build_dispatch_build(
     facts are recorded on the row. ``None`` admits nothing and records
     nothing, exactly as before. Nothing on this route calls a planning
     capability.
+
+    ``reply_in_thread`` (register-projects design, 5 October 2026, part 3)
+    answers a build request in the conversation it was handed over from:
+    once on each refusal this closure makes before a row exists (the sandbox
+    policy, the prepared admission, the one-build-per-feature check), and
+    once — "Building FEAT-XXXX for <repo> from <branch> at <commit>" — after
+    a freshly recorded build has passed its approval gate and been launched,
+    never before. Only a request carrying ``parent_request_id`` is answered;
+    ``None`` answers nothing. Acknowledgement and admission order are
+    unchanged: each answer follows the step it reports.
     """
     launch = _build_resume_launcher(
         forward_context_builder,
@@ -1238,6 +1256,13 @@ def _build_dispatch_build(
                     failed_task_id=None,
                 )
             await ack_callback()
+            if existing is None:
+                await answer_build_thread(
+                    reply_in_thread,
+                    payload,
+                    build_refused_reply(payload.feature_id, reason),
+                    level="warning",
+                )
             return
 
         if async_task_starter is None:
@@ -1319,6 +1344,12 @@ def _build_dispatch_build(
                             failed_task_id=None,
                         )
                     await ack_callback()
+                    await answer_build_thread(
+                        reply_in_thread,
+                        payload,
+                        build_refused_reply(payload.feature_id, reason),
+                        level="warning",
+                    )
                     return
                 admitted = answer.admitted
                 logger.info(
@@ -1398,8 +1429,17 @@ def _build_dispatch_build(
                     failed_task_id=None,
                 )
             await ack_callback()
+            await answer_build_thread(
+                reply_in_thread,
+                payload,
+                build_refused_reply(payload.feature_id, reason),
+                level="warning",
+            )
             return
 
+        # True only when THIS delivery wrote the row: the "Building" answer
+        # is said once, never again for a redelivery or a recovered row.
+        fresh_row = False
         try:
             if admitted is not None:
                 build_id = sqlite_pool.record_pending_build(
@@ -1407,6 +1447,7 @@ def _build_dispatch_build(
                 )
             else:
                 build_id = sqlite_pool.record_pending_build(payload)
+            fresh_row = True
         except DuplicateBuildError as exc:
             # R2 refined to THREE arms (plan §D4.5, arch-review C2): the
             # consumer's ``is_duplicate_terminal`` filter already screened the
@@ -1546,6 +1587,21 @@ def _build_dispatch_build(
         # gate_check redesign, out of this lane's scope).
         prior_breach = sqlite_pool.latest_breach_for_feature(payload.feature_id)
 
+        async def _say_building() -> None:
+            """The hand-over's one success answer, after the launch returned."""
+            if not fresh_row:
+                return
+            await answer_build_thread(
+                reply_in_thread,
+                payload,
+                build_started_reply(
+                    payload.feature_id,
+                    payload.repo,
+                    payload.branch,
+                    admitted.source_commit if admitted is not None else None,
+                ),
+            )
+
         # --- Pre-dispatch approval gate (TASK-GATE-D659, R1) -------------
         from forge.cli import _serve_deps_gating, _serve_gate_activation
 
@@ -1646,6 +1702,7 @@ def _build_dispatch_build(
                 repo=payload.repo,
                 budget=budget_entry,
             )
+            await _say_building()
             return
 
         outcome = await _serve_gate_activation.maybe_gate_build(
@@ -1716,6 +1773,7 @@ def _build_dispatch_build(
 
             if not recovered:
                 await _register_and_launch()
+                await _say_building()
             elif not await launch_replacing_recorded_run(
                 sqlite_pool, build_id, _register_and_launch
             ):
@@ -2078,6 +2136,7 @@ def build_pipeline_consumer_deps(
     conductor_router: Callable[..., Any] | None = None,
     record_build_rejection: Callable[[str, str], Any] | None = None,
     prepared_build_admission: Callable[[Any], Awaitable[Any]] | None = None,
+    reply_in_thread: BuildThreadReply | None = None,
 ) -> PipelineConsumerDeps:
     """Compose the production :class:`PipelineConsumerDeps` for ``forge serve``.
 
@@ -2135,6 +2194,13 @@ def build_pipeline_consumer_deps(
             planned elsewhere). Production passes
             :func:`build_prepared_build_admission`; ``None`` admits nothing
             and records nothing, as before. See :func:`_build_dispatch_build`.
+        reply_in_thread: Optional ``async (payload, message, *, level) ->
+            None`` that answers a build request in the conversation it came
+            from (register-projects design, 5 October 2026, part 3). ``None``
+            takes the production answer on ``client``
+            (:func:`forge.planning.notifications.make_build_thread_reply`);
+            either way a request without ``parent_request_id`` is never
+            answered.
 
     Returns:
         A fully wired
@@ -2214,6 +2280,10 @@ def build_pipeline_consumer_deps(
     # ever. Production takes the default; a test may hand in its own.
     if record_build_rejection is None:
         record_build_rejection = _work_queue_rejection_recorder(sqlite_pool)
+    # The answer in the thread a build was handed over from, on the daemon's
+    # one client. A request without parent_request_id is never answered.
+    if reply_in_thread is None:
+        reply_in_thread = make_build_thread_reply(client)
     is_duplicate_terminal = _build_is_duplicate_terminal(sqlite_pool)
     dispatch_build = _build_dispatch_build(
         sqlite_pool=sqlite_pool,
@@ -2229,6 +2299,7 @@ def build_pipeline_consumer_deps(
         conductor_router=conductor_router,
         record_build_rejection=record_build_rejection,
         prepared_build_admission=prepared_build_admission,
+        reply_in_thread=reply_in_thread,
     )
     publish_build_failed = _build_publish_build_failed(
         publisher,
@@ -2242,6 +2313,7 @@ def build_pipeline_consumer_deps(
         publish_build_failed=publish_build_failed,
         register_ack_handle=register_ack_handle,
         record_build_rejection=record_build_rejection,
+        reply_in_thread=reply_in_thread,
     )
     logger.info(
         "build_pipeline_consumer_deps: composed PipelineConsumerDeps "
