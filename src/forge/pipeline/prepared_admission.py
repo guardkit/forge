@@ -42,10 +42,10 @@ from urllib.parse import unquote
 import yaml
 
 from forge.planning.declared_memory import (
-    BINDING_DOCUMENTS_FIELD,
     read_declarations_at_commit,
-    read_declared_binding_documents,
+    read_declared_project_documents,
 )
+from forge.planning.project_documents import read_project_documents_at_commit
 
 __all__ = [
     "AdmittedBuild",
@@ -191,8 +191,6 @@ async def _read(
     repo_path: str,
     commit: str,
     path: str,
-    *,
-    ordinary_file_only: bool = False,
 ) -> tuple[str | None, str | None]:
     """``(text, None)`` when present, ``(None, None)`` when absent, ``(None, why)``."""
     read = getattr(runner, "read_file_at_commit", None)
@@ -202,10 +200,7 @@ async def _read(
             "commit, so the supplied files cannot be checked"
         )
     try:
-        if ordinary_file_only:
-            answer = await read(repo_path, commit, path, ordinary_file_only=True)
-        else:
-            answer = await read(repo_path, commit, path)
+        answer = await read(repo_path, commit, path)
     except Exception as exc:  # noqa: BLE001 — boundary
         return None, f"{path} could not be read at {commit}: {type(exc).__name__}: {exc}"
     refusal = getattr(answer, "refusal", None)
@@ -445,26 +440,22 @@ async def check_supplied_bundle(
         texts[guide] = content
         guides.append(guide)
 
-    # 6. The project's binding documents, as ordinary files (R7).
-    documents, why = read_declared_binding_documents(config_text)
+    # 6. The project's own documents, by the ONE reading rule the planning
+    #    door and GuardKit's Coach use (4 October 2026): the same reader, so
+    #    admission refuses exactly what planning and the Coach would refuse —
+    #    declared instruction files present and resolvable, binding documents
+    #    ordinary files of strict UTF-8 at their exact committed bytes, and the
+    #    48 KiB budget. Opt-in: nothing is judged unless binding documents are
+    #    declared.
+    declared, why = read_declared_project_documents(config_text)
     if why:
-        return f"the prepared feature cannot be checked: {why}"
-    for document in documents:
-        content, why = await _read(
-            runner, repo_path, commit, document, ordinary_file_only=True
+        return f"the prepared feature cannot be built: {why}"
+    if declared.documents:
+        _documents, why = await read_project_documents_at_commit(
+            runner, repo_path=repo_path, commit=commit, declared=declared
         )
         if why:
-            return (
-                f"the prepared feature cannot be built: the binding document "
-                f"{document} (declared in {BINDING_DOCUMENTS_FIELD}) cannot be "
-                f"used: {why}"
-            )
-        if content is None:
-            return _missing(
-                f"the binding document (declared in {BINDING_DOCUMENTS_FIELD})",
-                document,
-                at,
-            )
+            return f"the prepared feature cannot be built: {why}"
 
     # 7. Referenced context: every relative Markdown link in the supplied
     #    summaries, guides and task files names a file at this commit.

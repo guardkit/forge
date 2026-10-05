@@ -75,7 +75,6 @@ __all__ = [
     "SETTINGS_KEY",
     "THE_TWO_LINES",
     "read_declarations_at_commit",
-    "read_declared_binding_documents",
     "read_declared_launch_settings",
     "read_declared_memory",
     "read_declared_project_documents",
@@ -575,63 +574,6 @@ async def read_declarations_at_commit(
 #: builder (GuardKit's Player) already reads. One list for every role, not a
 #: second one (project-initialisation design, 4 October 2026).
 BINDING_DOCUMENTS_FIELD: str = "autobuild.player.required_documents"
-
-
-def read_declared_binding_documents(
-    content: str | None,
-) -> tuple[tuple[str, ...], str | None]:
-    """``(paths, None)`` — the binding documents the file declares — or ``((), why)``.
-
-    Read the way GuardKit's own selector reads the list: absent is "none", a
-    list of non-empty repository-relative paths is the answer, anything else is
-    refused. Each path is normalised (``./a`` is ``a``) and one that would
-    leave the repository is refused. Never raises.
-    """
-    if not content:
-        return (), None
-    data, why_not = _parse(content)
-    if why_not is not None:
-        return (), f"{DECLARATION_PATH} could not be read: {why_not}"
-    assert data is not None
-    autobuild = data.get("autobuild")
-    if autobuild is None:
-        return (), None
-    if not isinstance(autobuild, dict):
-        return (), f"`autobuild` in {DECLARATION_PATH} is not a set of settings"
-    player = autobuild.get("player")
-    if player is None:
-        return (), None
-    if not isinstance(player, dict):
-        return (), f"`autobuild.player` in {DECLARATION_PATH} is not a set of settings"
-    raw = player.get("required_documents")
-    if raw is None:
-        return (), None
-    if not isinstance(raw, list):
-        return (), (
-            f"`{BINDING_DOCUMENTS_FIELD}` in {DECLARATION_PATH} is not a list "
-            f"of repository paths"
-        )
-    paths: list[str] = []
-    for index, value in enumerate(raw):
-        if not isinstance(value, str) or not value.strip():
-            return (), (
-                f"`{BINDING_DOCUMENTS_FIELD}[{index}]` in {DECLARATION_PATH} "
-                f"is not a repository path"
-            )
-        normal = posixpath.normpath(value.strip())
-        if (
-            value.strip().startswith("/")
-            or normal == ".."
-            or normal.startswith("../")
-            or normal == "."
-        ):
-            return (), (
-                f"`{BINDING_DOCUMENTS_FIELD}[{index}]` in {DECLARATION_PATH} "
-                f"({value!r}) is not a path inside the repository"
-            )
-        if normal not in paths:
-            paths.append(normal)
-    return tuple(paths), None
 
 
 #: The keys GuardKit's Player loader allows in ``autobuild.player``
