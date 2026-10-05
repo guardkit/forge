@@ -367,7 +367,7 @@ async def test_with_the_gate_wired_the_answer_waits_for_the_approval(
 
 
 @pytest.mark.asyncio
-async def test_a_build_declined_at_its_gate_is_never_said_to_be_building(
+async def test_a_build_declined_at_its_gate_is_told_so_never_building(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     project: Project,
@@ -399,9 +399,52 @@ async def test_a_build_declined_at_its_gate_is_never_said_to_be_building(
 
     msg = await _hand_over(planning_deps, deps, bus)
 
-    assert bus.replies() == []
+    (reply,) = bus.replies()
+    assert reply.message == (
+        f"{FEATURE} was not started: the build-start card was declined."
+    )
+    assert reply.parent_request_id == THREAD and reply.level == "warning"
     assert starter.replies_at_launch == []
     assert msg.acks == 1
+
+
+@pytest.mark.asyncio
+async def test_a_build_whose_card_timed_out_is_told_so_once(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    project: Project,
+    bus: _Bus,
+    starter: _Starter,
+    forge_config: ForgeConfig,
+    persistence: SqliteLifecyclePersistence,
+    planning_deps: PlanningConsumerDeps,
+) -> None:
+    project.commit_on(BRANCH, bundle())
+
+    async def _timed_out(**_kwargs: Any) -> Any:
+        return GateOutcome.TIMED_OUT
+
+    monkeypatch.setattr(_serve_deps_gating, "bound_gate_parts", lambda: object())
+    monkeypatch.setattr(_serve_gate_activation, "maybe_gate_build", _timed_out)
+    deps = build_pipeline_consumer_deps(
+        bus,
+        forge_config,
+        persistence,
+        async_task_starter=starter,
+        gate_repository=object(),
+        gate_state_machine=object(),
+        record_build_rejection=lambda _cid, _reason: None,
+        prepared_build_admission=build_prepared_build_admission(
+            forge_config, git_runner=WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+        ),
+    )
+
+    await _hand_over(planning_deps, deps, bus)
+
+    assert [r.message for r in bus.replies()] == [
+        f"{FEATURE} was not started: the build-start card timed out."
+    ]
+    assert starter.replies_at_launch == []
 
 
 # ---------------------------------------------------------------------------
