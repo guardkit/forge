@@ -181,11 +181,15 @@ class FakeEstate:
         if argv[:2] == ["docker", "run"]:
             return self._docker_run(argv)
         if argv[:2] == ["docker", "exec"]:
-            if self.drained_answer is None:
+            answer = self.drained_answer
+            if isinstance(answer, list):
+                # One answer per look, in order.
+                answer = answer.pop(0)
+            if answer is None:
                 return _no(1, "Error response from daemon: No such container")
-            if isinstance(self.drained_answer, subprocess.CompletedProcess):
-                return self.drained_answer
-            return _ok(json.dumps(self.drained_answer) + "\n")
+            if isinstance(answer, subprocess.CompletedProcess):
+                return answer
+            return _ok(json.dumps(answer) + "\n")
         if argv[:2] == ["sbx", "exec"]:
             return self._sbx_exec(argv[2:], input)
         raise AssertionError(f"the fake estate was asked something it does not know: {argv}")
@@ -267,6 +271,8 @@ class FakeEstate:
 def estate(tmp_path, monkeypatch) -> FakeEstate:
     fake = FakeEstate(tmp_path)
     monkeypatch.setattr(register_repo, "run_command", fake)
+    # A fake clock: the drained check's wait is recorded, never slept.
+    monkeypatch.setattr(register_repo, "sleep", lambda seconds: fake.calls.append(["sleep", str(seconds)]))
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("FORGE_ESTATE_ENV_FILE", raising=False)
     return fake
@@ -662,6 +668,7 @@ def _quiet() -> dict[str, Any]:
             "queue_held": 0, "admitted_unwritten": 0, "admitted_interrupted": 0,
             "merges_live": 0, "merges_resting": 0,
             "deploy_locks_live": 0, "deploy_locks_expired": 0,
+            "state_digest": "digest-of-a-quiet-ledger",
         },
         "consumers": {
             "forge-serve-planning": {"pending": 0, "ack_pending": 0},
@@ -872,6 +879,7 @@ def test_the_read_script_counts_a_real_ledger_and_says_an_unreachable_bus_is_unr
 
     facts = ledger.read()
 
+    assert len(facts["ledger"].pop("state_digest")) == 64
     assert facts["ledger"] == {
         "builds": {"RUNNING": 1}, "interrupted": 0, "planning_runs": {"FEATURE_SPEC": 1},
         "queue_waiting": 1, "queue_held": 1, "admitted_unwritten": 0, "admitted_interrupted": 0,
@@ -885,7 +893,11 @@ def test_the_read_script_counts_a_real_ledger_and_says_an_unreachable_bus_is_unr
 
 def test_an_empty_real_ledger_is_quiet(tmp_path):
     facts = Ledger(tmp_path / "forge.db").read()
-    assert facts["ledger"] == _quiet()["ledger"]
+    quiet = _quiet()["ledger"]
+    assert facts["ledger"].keys() == quiet.keys()
+    assert {k: v for k, v in facts["ledger"].items() if k != "state_digest"} == {
+        k: v for k, v in quiet.items() if k != "state_digest"
+    }
     assert register_repo.judge_drained({**facts, "consumers": QUIET_CONSUMERS, "consumers_after": QUIET_CONSUMERS}, CONSUMERS) == []
 
 
@@ -1194,6 +1206,84 @@ def test_without_one_snapshot_the_same_move_would_be_missed(tmp_path):
         between=_admit_into_a_planning_run(ledger, "moving"),
     )
     assert register_repo.judge_drained({"ledger": seen, "consumers": QUIET_CONSUMERS, "consumers_after": QUIET_CONSUMERS}, CONSUMERS) == []
+
+
+# ---------------------------------------------------------------------------
+# Two complete looks, --settle-seconds apart (fake clock: nothing sleeps)
+# ---------------------------------------------------------------------------
+
+
+def _drained_calls(estate) -> list[str]:
+    return [c[0] if c[0] == "sleep" else "look" for c in estate.calls if c[0] in ("sleep", "docker")]
+
+
+def test_a_quiet_factory_is_drained_after_two_looks_thirty_seconds_apart(estate):
+    result = _check(estate, [_quiet(), _quiet()])
+    assert result.exit_code == 0, result.output
+    assert "DRAINED: in two looks 30 seconds apart" in result.output
+    assert _drained_calls(estate) == ["look", "sleep", "look"]
+    assert ["sleep", "30"] in estate.calls
+
+
+def test_a_publication_visible_to_the_broker_only_after_the_first_look_is_not_drained(estate):
+    """The build request sat in the coordinator's client buffer during the
+    first look (publish had returned; the broker did not have it yet), so the
+    first look saw zero everywhere. It reached the broker within the client's
+    flush cycle, well inside the settle interval, and the second look sees it."""
+    second = _quiet()
+    second["consumers"]["forge-serve"] = {"pending": 1, "ack_pending": 0}
+    second["consumers_after"]["forge-serve"] = {"pending": 1, "ack_pending": 0}
+    result = _check(estate, [_quiet(), second])
+    assert result.exit_code == 1
+    assert "second look: the bus consumer forge-serve had 1 pending" in result.output
+    assert "first look:" not in result.output
+
+
+def test_a_ledger_that_changes_between_the_looks_is_not_drained(estate):
+    """Both looks are drained on their own, but a planning run started and
+    finished in between: the snapshots differ, so something moved."""
+    second = _quiet()
+    second["ledger"]["state_digest"] = "digest-after-a-run-came-and-went"
+    result = _check(estate, [_quiet(), second])
+    assert result.exit_code == 1
+    assert "the ledger changed between the two looks, 30 seconds apart (state_digest)" in result.output
+
+
+def test_a_changed_informational_count_also_means_something_moved(estate):
+    second = _quiet()
+    second["ledger"]["merges_resting"] = 1
+    result = _check(estate, [_quiet(), second])
+    assert result.exit_code == 1
+    assert "(merges_resting)" in result.output
+
+
+def test_the_settle_interval_is_an_option(estate):
+    estate.drained_answer = [_quiet(), _quiet()]
+    result = CliRunner().invoke(
+        main, ["register-repo", "--check-drained", "--settle-seconds", "5"], catch_exceptions=False
+    )
+    assert result.exit_code == 0, result.output
+    assert ["sleep", "5"] in estate.calls
+    assert "5 seconds apart" in result.output
+
+
+def test_the_digest_changes_when_a_run_comes_and_goes_between_two_looks(tmp_path):
+    ledger = Ledger(tmp_path / "forge.db")
+    first = ledger.read()["ledger"]
+    ledger.plan("PLANNED_HANDOFF", correlation_id="came-and-went")
+    second = ledger.read()["ledger"]
+    # Every count is the same — the run is finished — but the digest moved.
+    assert {k: v for k, v in first.items() if k != "state_digest"} == {
+        k: v for k, v in second.items() if k != "state_digest"
+    }
+    assert first["state_digest"] != second["state_digest"]
+    assert ledger.read()["ledger"] == second  # and nothing moved, nothing changes
+
+
+def test_the_step_b_instruction_prints_the_settle_interval(estate):
+    output = _run().output
+    assert "forge register-repo --check-drained --settle-seconds 30" in output
+    assert "It looks twice, 30 seconds apart" in output
 
 
 def test_a_held_queue_item_says_wait_for_its_antecedent_or_withdraw_it(estate):

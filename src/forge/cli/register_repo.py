@@ -65,6 +65,7 @@ import re
 import shlex
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path, PurePosixPath
@@ -1235,12 +1236,21 @@ def make_sandbox_clone(sandbox: SandboxStore, *, clone: str, leaf: str, url: str
 #:    counts), its message is on a consumer by the second read — pending, or
 #:    unacknowledged, since the build consumer acks only when the build ends.
 #:    DRAINED needs both consumer reads at zero and the snapshot empty.
+#: 5. That whole look is taken TWICE, ``--settle-seconds`` apart (default 30;
+#:    the host side does this, see :func:`check_drained`). A publication can
+#:    sit in the coordinator's NATS client after ``publish`` has returned and
+#:    before the broker has it, which the second consumer read would not see.
+#:    The client flushes within milliseconds, far inside the settle interval,
+#:    so such a message shows as pending or unacknowledged in the second look,
+#:    or its effects change the ledger. DRAINED needs both looks drained AND
+#:    the two snapshots identical — every count and a digest of every row's
+#:    moving parts — because a changed snapshot means something moved.
 #:
 #: Reading the ledger first would leave a gap: a request processed and acked
 #: between the two reads would be in neither. ``__name__`` guards the run, so
 #: the tests can load these functions and move work between the observations.
 DRAINED_READ_SCRIPT: str = r'''
-import asyncio, json, os, sqlite3, sys
+import asyncio, hashlib, json, os, sqlite3, sys
 from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
@@ -1356,6 +1366,20 @@ def read_ledger(con, spec, between=None):
             elif holder:
                 locks_expired += 1
         step("publication_records")
+        # A digest of every row's moving parts, read in the same snapshot, so
+        # two looks can tell "nothing moved" from "something moved and ended
+        # up looking the same" (a run started and finished in between).
+        digest = hashlib.sha256()
+        for sql in (
+            "SELECT build_id, status FROM builds ORDER BY build_id",
+            "SELECT correlation_id, state FROM planning_runs ORDER BY correlation_id",
+            "SELECT id, status FROM work_queue ORDER BY id",
+            "SELECT build_id, result, lease_holder, lease_expires_at, turn FROM publication_records ORDER BY build_id",
+            "SELECT target, counter, holder_build, expires_at FROM deployment_targets ORDER BY target",
+        ):
+            digest.update(sql.encode())
+            for row in rows(sql):
+                digest.update(json.dumps(row, default=str).encode())
     finally:
         con.execute("COMMIT")
     return {
@@ -1364,6 +1388,7 @@ def read_ledger(con, spec, between=None):
         "admitted_unwritten": unwritten, "admitted_interrupted": admitted_interrupted,
         "merges_live": merges_live, "merges_resting": merges_resting,
         "deploy_locks_live": locks_live, "deploy_locks_expired": locks_expired,
+        "state_digest": digest.hexdigest(),
     }
 
 def observe(spec, environ, consumers=read_consumers, connect=None, between=None, recheck=True):
@@ -1424,6 +1449,45 @@ def read_drained_facts(run: Runner, container: str) -> dict[str, Any]:
     if not isinstance(facts, dict):
         return {"error": f"the coordinator ({container}) answered something that is not the read's report"}
     return facts
+
+
+#: How long the drained check waits between its two looks. A publication
+#: buffered in the coordinator's NATS client reaches the broker within the
+#: client's flush cycle (milliseconds), far inside this.
+DEFAULT_SETTLE_SECONDS: int = 30
+
+#: The wait between the two looks. A seam: the tests replace it with a fake
+#: clock, so no test sleeps.
+sleep: Callable[[float], None] = time.sleep
+
+
+def check_drained(
+    run: Runner, container: str, settle_seconds: float
+) -> tuple[list[str], list[str]]:
+    """Two complete looks, ``settle_seconds`` apart: (reasons, notes).
+
+    Each look is consumers, one ledger snapshot, consumers again (see
+    :data:`DRAINED_READ_SCRIPT`). Drained only when both looks are drained and
+    the two snapshots are identical; an empty reason list means drained.
+    """
+    consumers = drained_read_spec()["consumers"]
+    first = read_drained_facts(run, container)
+    sleep(settle_seconds)
+    second = read_drained_facts(run, container)
+    reasons = [f"first look: {r}" for r in judge_drained(first, consumers)]
+    reasons += [f"second look: {r}" for r in judge_drained(second, consumers)]
+    before, after = first.get("ledger"), second.get("ledger")
+    if (
+        isinstance(before, dict) and isinstance(after, dict)
+        and not before.get("error") and not after.get("error")
+        and before != after
+    ):
+        moved = sorted(k for k in set(before) | set(after) if before.get(k) != after.get(k))
+        reasons.append(
+            f"the ledger changed between the two looks, {settle_seconds:g} seconds apart "
+            f"({', '.join(moved)}): something moved, so the factory is not settled"
+        )
+    return reasons, drained_notes(second)
 
 
 def _by_state(counts: Mapping[str, Any]) -> str:
@@ -1571,6 +1635,7 @@ class Estate:
     sandbox: str
     volume: str
     coordinator: str
+    settle_seconds: int = DEFAULT_SETTLE_SECONDS
 
 
 def activation_sequence(
@@ -1616,11 +1681,14 @@ def activation_sequence(
         " (sessions that publish on the bus directly are asked to hold):",
         f"    dc stop {intake}",
         "(b) Confirm the factory is drained (reads only):",
-        f"    forge register-repo --check-drained --coordinator-container {q(estate.coordinator)}",
+        f"    forge register-repo --check-drained --settle-seconds {estate.settle_seconds}"
+        f" --coordinator-container {q(estate.coordinator)}",
+        f"    It looks twice, {estate.settle_seconds} seconds apart (consumers, one ledger snapshot,"
+        " consumers again, each time), so a message still in a client's buffer is seen.",
         "    Go on only if it exits 0 (rely on the exit status, not the words: \"NOT DRAINED\""
-        " contains \"DRAINED\"). Exit 0 means no build active, no planning run, merge or deploy"
-        " unfinished, nothing queued, and zero pending and zero unacknowledged on both bus"
-        " consumers. Any other exit — including anything it could not read — stops here: reopen"
+        " contains \"DRAINED\"). Exit 0 means, in both looks: no build active, no planning run,"
+        " merge or deploy unfinished, nothing queued, and zero pending and zero unacknowledged on"
+        " both bus consumers; and nothing in the ledger moved between the looks. Any other exit — including anything it could not read — stops here: reopen"
         " intake and activate later:",
         f"    dc up -d {intake}",
         "(c) Stop the coordinator and the rest, intake still closed:",
@@ -1776,6 +1844,7 @@ def resolve_options(
     sandbox: str,
     volume: str,
     coordinator: str,
+    settle_seconds: int = DEFAULT_SETTLE_SECONDS,
 ) -> Options:
     """The command's options with every default worked out, or a refusal."""
     org, leaf = _parse_name(name)
@@ -1875,6 +1944,7 @@ def resolve_options(
             sandbox=sandbox,
             volume=volume,
             coordinator=coordinator,
+            settle_seconds=settle_seconds,
         ),
     )
 
@@ -1992,8 +2062,11 @@ def register(options: Options, run: Runner, steps: list[Step]) -> list[str]:
 @click.option("--publish", is_flag=True, default=False, help="Also add the publisher's route for it.")
 @click.option("--dry-run", "dry_run", is_flag=True, default=False,
               help="Check the project and say what would change; write nothing anywhere.")
-@click.option("--check-drained", "check_drained", is_flag=True, default=False,
+@click.option("--check-drained", "check_drained_only", is_flag=True, default=False,
               help="Activation step (b) only: say DRAINED, or why not. Reads only.")
+@click.option("--settle-seconds", type=click.IntRange(min=0), default=DEFAULT_SETTLE_SECONDS,
+              show_default=True,
+              help="How far apart the drained check's two looks are.")
 @click.option("--estate-env-file", type=click.Path(dir_okay=False, path_type=Path),
               envvar="FORGE_ESTATE_ENV_FILE", default=None,
               help="The estate env file the factory runs on now; the printed commands use it.")
@@ -2020,7 +2093,8 @@ def register_repo_cmd(
     github: str | None,
     publish: bool,
     dry_run: bool,
-    check_drained: bool,
+    check_drained_only: bool,
+    settle_seconds: int,
     estate_env_file: Path | None,
     sandbox_env_file: Path | None,
     sandbox_settings: str | None,
@@ -2042,17 +2116,17 @@ def register_repo_cmd(
     """
     run = run_command
 
-    if check_drained:
+    if check_drained_only:
         consumers = drained_read_spec()["consumers"]
-        facts = read_drained_facts(run, coordinator)
-        reasons = judge_drained(facts, consumers)
-        notes = [Step("drained", "note", note) for note in drained_notes(facts)]
+        reasons, found = check_drained(run, coordinator, settle_seconds)
+        notes = [Step("drained", "note", note) for note in found]
         if not reasons:
             _emit(
-                [Step("drained", "ok", "DRAINED: no build active, no planning run, merge or deploy "
-                      "unfinished, nothing queued in the work queue, and "
+                [Step("drained", "ok", "DRAINED: in two looks "
+                      f"{settle_seconds:g} seconds apart, no build active, no planning run, merge "
+                      "or deploy unfinished, nothing queued in the work queue, "
                       f"{' and '.join(consumers)} each read zero pending and zero unacknowledged "
-                      "before and after the ledger read")] + notes,
+                      "before and after the ledger read, and nothing in the ledger moved")] + notes,
                 as_json=as_json,
             )
             return
@@ -2083,6 +2157,7 @@ def register_repo_cmd(
             sandbox=sandbox,
             volume=volume,
             coordinator=coordinator,
+            settle_seconds=settle_seconds,
         )
         tail = register(options, run, steps)
     except Refused as refusal:
