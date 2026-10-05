@@ -318,21 +318,72 @@ def test_a_launch_with_no_branch_still_runs_when_nothing_else_is(
 # ---------------------------------------------------------------------------
 
 
-def test_two_builds_with_room_for_one_start_one_and_refuse_the_other(
+GIB = 1024**3
+
+
+def _free_space(monkeypatch: pytest.MonkeyPatch, available: int) -> None:
+    """The worktree filesystem reports ``available`` free bytes."""
+    from forge.subagents import autobuild_worktree_lifecycle as lifecycle
+
+    monkeypatch.setattr(
+        lifecycle,
+        "_capacity",
+        lambda _path: {"available_bytes": available, "available_inodes": 10**6},
+    )
+
+
+def test_four_builds_start_with_room_for_four_reserves_above_the_floor(
     factory: _Factory, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Floor 20 GiB, reserve 1 GiB, 28 GB free: four concurrent starts all
+    proceed (the live window of 4 October fitted only one, because each
+    running build reserved the whole floor)."""
+    branches = [f"planning/{n}" for n in "abcd"]
+    factory.repository("widget", *branches)
+    factory.worktrees.mkdir()
+    monkeypatch.setenv("FORGE_AUTOBUILD_MIN_AVAILABLE_BYTES", str(20 * GIB))
+    monkeypatch.setenv("FORGE_AUTOBUILD_PER_BUILD_RESERVE_BYTES", str(GIB))
+    _free_space(monkeypatch, 28_000_000_000)
+    factory.together(4)
+
+    async def scenario() -> list[dict]:
+        return await asyncio.gather(
+            *(
+                _build(
+                    _payload(
+                        f"build-FEAT-{n.upper()}-1", f"FEAT-{n.upper()}", "widget",
+                        branch=f"planning/{n}",
+                    )
+                )
+                for n in "abcd"
+            )
+        )
+
+    results = asyncio.run(scenario())
+    for n in "ABCD":
+        assert factory.child(f"FEAT-{n}") is not None, f"FEAT-{n} did not start"
+    assert all(r["lifecycle"] != "failed" for r in results), results
+    assert runner_module._DISK_RESERVATIONS == {}
+
+
+def test_a_second_build_without_room_for_its_reserve_is_refused_plainly(
+    factory: _Factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Floor 20 GiB, reserve 1 GiB, 21 GiB free: the first starts (20 GiB
+    stays free); the second would leave 19 GiB and is refused, with the
+    numbers said; when the first ends its reserve goes and the next starts."""
     factory.repository("widget", "planning/a", "planning/b")
     factory.worktrees.mkdir()
-    free = shutil.disk_usage(factory.worktrees).free
-    # Room for one build's floor, not two: free is one and a half floors.
-    floor = int(free / 1.5)
-    monkeypatch.setenv("FORGE_AUTOBUILD_MIN_AVAILABLE_BYTES", str(floor))
+    monkeypatch.setenv("FORGE_AUTOBUILD_MIN_AVAILABLE_BYTES", str(20 * GIB))
+    monkeypatch.setenv("FORGE_AUTOBUILD_PER_BUILD_RESERVE_BYTES", str(GIB))
+    _free_space(monkeypatch, 21 * GIB)
 
-    async def scenario() -> tuple[dict, dict]:
+    async def scenario() -> tuple[dict, dict, dict]:
         first = asyncio.create_task(
             _build(_payload("build-FEAT-A-1", "FEAT-A", "widget", branch="planning/a"))
         )
         await factory.started("FEAT-A")
+        held = dict(runner_module._DISK_RESERVATIONS)
         try:
             second = await asyncio.wait_for(
                 _build(_payload("build-FEAT-B-1", "FEAT-B", "widget", branch="planning/b")),
@@ -340,23 +391,75 @@ def test_two_builds_with_room_for_one_start_one_and_refuse_the_other(
             )
         finally:
             factory.release()
-        return await first, second
+        return await first, second, held
 
-    first, second = asyncio.run(scenario())
-
+    first, second, held = asyncio.run(scenario())
+    assert list(held.values()) == [GIB], held
     assert factory.child("FEAT-B") is None, "both builds started"
     assert second["lifecycle"] == "failed"
-    assert "autobuild worktree capacity preflight refused the build" in second[
-        "error_message"
-    ]
+    reason = second["error_message"]
+    assert "autobuild worktree capacity preflight refused the build" in reason
+    assert f"other builds running now reserve {GIB}" in reason
+    assert f"this build reserves {GIB}" in reason
+    assert f"below the {20 * GIB} that must stay free" in reason
     assert first["lifecycle"] != "failed", first
+    assert runner_module._DISK_RESERVATIONS == {}
 
-    # And the reservation goes with the build: the next one starts.
-    factory.release()
+    # The reserve went with the first build: the next one starts.
     third = asyncio.run(
         _build(_payload("build-FEAT-C-1", "FEAT-C", "widget", branch="planning/b"))
     )
     assert factory.child("FEAT-C") is not None, third
+    assert runner_module._DISK_RESERVATIONS == {}
+
+
+@pytest.mark.parametrize("ending", ["fails", "cancelled"])
+def test_the_reserve_is_released_on_every_exit(
+    factory: _Factory, monkeypatch: pytest.MonkeyPatch, ending: str
+) -> None:
+    factory.repository("widget", "planning/a")
+    factory.worktrees.mkdir()
+
+    async def scenario() -> None:
+        if ending == "fails":
+            (factory.out / "exit-code").write_text("5")
+            result = await _build(
+                _payload("build-FEAT-A-1", "FEAT-A", "widget", branch="planning/a")
+            )
+            assert result["lifecycle"] == "failed"
+            return
+        task = asyncio.create_task(
+            _build(_payload("build-FEAT-A-1", "FEAT-A", "widget", branch="planning/a"))
+        )
+        await factory.started("FEAT-A")
+        assert runner_module._DISK_RESERVATIONS, "no reserve held while running"
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())
+    assert runner_module._DISK_RESERVATIONS == {}
+
+
+def test_one_build_with_the_defaults_reserves_one_gibibyte(
+    factory: _Factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    factory.repository("widget", "planning/a")
+    factory.worktrees.mkdir()
+    monkeypatch.delenv("FORGE_AUTOBUILD_PER_BUILD_RESERVE_BYTES", raising=False)
+
+    async def scenario() -> tuple[dict, dict]:
+        task = asyncio.create_task(
+            _build(_payload("build-FEAT-A-1", "FEAT-A", "widget", branch="planning/a"))
+        )
+        await factory.started("FEAT-A")
+        held = dict(runner_module._DISK_RESERVATIONS)
+        factory.release()
+        return await task, held
+
+    result, held = asyncio.run(scenario())
+    assert result["lifecycle"] != "failed", result
+    assert list(held.values()) == [GIB]
+    assert runner_module._DISK_RESERVATIONS == {}
 
 
 # ---------------------------------------------------------------------------

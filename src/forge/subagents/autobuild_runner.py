@@ -1251,6 +1251,14 @@ FORGE_AUTOBUILD_MIN_AVAILABLE_BYTES_ENV: str = (
     "FORGE_AUTOBUILD_MIN_AVAILABLE_BYTES"
 )
 
+#: The free space each running build reserves while it runs (4 October 2026,
+#: concurrent builds), counted as spent when another build starts. Positive
+#: integer bytes; default one gibibyte (a worktree is a few hundred megabytes).
+FORGE_AUTOBUILD_PER_BUILD_RESERVE_BYTES_ENV: str = (
+    "FORGE_AUTOBUILD_PER_BUILD_RESERVE_BYTES"
+)
+DEFAULT_PER_BUILD_RESERVE_BYTES: int = 1024**3
+
 #: Regex matching one ``[guardkit-checkpoint] Turn N complete (tests: ...)``
 #: line in guardkit's verbose stdout. The runner counts these to drive the
 #: stage_complete fallback (TASK-ABW-001 §Scope item 3).
@@ -2458,6 +2466,22 @@ def _worktree_base_dir() -> Path:
     return Path(raw).expanduser()
 
 
+def _per_build_reserve_bytes() -> int:
+    """:data:`FORGE_AUTOBUILD_PER_BUILD_RESERVE_BYTES_ENV`, else the default."""
+    raw = os.environ.get(FORGE_AUTOBUILD_PER_BUILD_RESERVE_BYTES_ENV, "").strip()
+    if not raw:
+        return DEFAULT_PER_BUILD_RESERVE_BYTES
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    if value <= 0:
+        raise WorktreeMaterialisationError(
+            f"{FORGE_AUTOBUILD_PER_BUILD_RESERVE_BYTES_ENV} must be a positive integer"
+        )
+    return value
+
+
 def _worktree_min_available_bytes() -> int:
     """Resolve env override > configured resource-preflight floor > default."""
     raw = os.environ.get(FORGE_AUTOBUILD_MIN_AVAILABLE_BYTES_ENV, "").strip()
@@ -2616,13 +2640,16 @@ async def _materialise_worktree(
     base = _worktree_base_dir()
     from forge.subagents.autobuild_worktree_lifecycle import inspect_worktree_capacity
 
-    # A RESERVATION, NOT A LOOK (3 October 2026, concurrent builds). The free
-    # space other builds running in this runner have reserved counts as spent,
-    # and this build reserves its own floor in the same step, so two builds
-    # starting together cannot both pass on room for one. Released with the
-    # build's claim. A call outside a build's node reserves nothing.
+    # A RESERVATION, NOT A LOOK (3 October 2026, concurrent builds; corrected
+    # 4 October 2026). The floor is free space that must REMAIN after a build
+    # starts. Each running build reserves its own, much smaller, amount
+    # (FORGE_AUTOBUILD_PER_BUILD_RESERVE_BYTES) in the same step as the check,
+    # so builds starting together cannot all pass on the same free space; the
+    # other builds' reserves count as spent. Released with the build's claim.
+    # A call outside a build's node reserves nothing.
     min_available_bytes = _worktree_min_available_bytes()
     claim = _CURRENT_BUILD_CLAIM.get()
+    own_reserve = _per_build_reserve_bytes() if claim is not None else 0
     with _RUNNER_SHARED_LOCK:
         reserved_by_others = sum(
             reserved
@@ -2633,9 +2660,10 @@ async def _materialise_worktree(
             base,
             min_available_bytes=min_available_bytes,
             reserved_bytes=reserved_by_others,
+            own_reserve_bytes=own_reserve,
         )
         if capacity.get("ok") and claim is not None:
-            _DISK_RESERVATIONS[claim] = min_available_bytes
+            _DISK_RESERVATIONS[claim] = own_reserve
     if not capacity.get("ok"):
         raise WorktreeMaterialisationError(
             "autobuild worktree capacity preflight refused the build before "

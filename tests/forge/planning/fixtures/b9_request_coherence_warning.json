@@ -1,0 +1,12 @@
+{
+  "pairs": [
+    {
+      "first": "the request: \"Add a GET /users/created-per-day endpoint that returns the number of users created on each of the last 7 days, oldest first.\"",
+      "second": "The endpoint can return fewer than 7 days if fewer days of data exist",
+      "why": "The request fixes one entry for each of the last 7 days; 'The endpoint can return fewer than 7 days if fewer days of data exist' lets the answer carry fewer."
+    }
+  ],
+  "pair_count": 1,
+  "dropped_after_repair": [],
+  "spec_changed_after_check": false
+}
