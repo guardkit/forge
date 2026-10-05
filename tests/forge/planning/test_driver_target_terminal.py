@@ -6338,8 +6338,8 @@ async def test_a_rewrite_that_changed_nothing_stops_with_the_card_and_its_change
         "2 scenario(s) had no rule to decide which verifier proves them, and the model "
         "fallback could not settle them, so nothing was stamped and nothing was built:\n"
         f"{titles}\n"
-        "The model fallback's answer was rejected: 'maybe' is not one of the allowed "
-        "words.\n"
+        "The plan's stamp check asked its model, but its answer was not one the "
+        "check accepts, so these scenarios could not be labelled.\n"
         "This repo enforces the routing law"
     )
     assert "refused the rewrite twice" not in card
@@ -6666,8 +6666,9 @@ async def test_a_refused_rewrite_stops_with_both_sentences_when_the_model_cannot
     assert sink["order"] == ["normalize_stamps", "normalize_stamps"]
     assert sink["rules_only"] == [True, None]
     assert _error_cards(h) == [
-        f"{_REFUSED_TWICE_SENTENCE} The model fallback was asked and could not "
-        "answer: HTTPStatusError: 502 Bad Gateway from localhost:4000."
+        f"{_REFUSED_TWICE_SENTENCE} The plan's stamp check asked its model, but "
+        "the model did not give a usable answer, so these scenarios could not be "
+        "labelled."
     ]
     assert not any("This repo enforces the routing law" in m for _, m, _ in h.ctx["notifications"])
     assert not any("Your note" in m for _, m, _ in h.ctx["notifications"])
@@ -7022,12 +7023,12 @@ def _refusal_with_model(model_outcome: dict[str, Any] | None) -> StampNormalizer
     [
         (
             {"status": "asked_and_failed", "detail": "ConnectError: connection refused at localhost:4000."},
-            "The model fallback was asked and could not answer: ConnectError: connection refused at localhost:4000.",
+            "The plan's stamp check could not reach its model, so these scenarios could not be labelled; check that the model service is running.",
             "the model fallback could not settle them",
         ),
         (
             {"status": "answer_rejected", "detail": "'maybe' is not one of the allowed words"},
-            "The model fallback's answer was rejected: 'maybe' is not one of the allowed words.",
+            "The plan's stamp check asked its model, but its answer was not one the check accepts, so these scenarios could not be labelled.",
             "the model fallback could not settle them",
         ),
         (
@@ -7096,6 +7097,80 @@ def test_the_card_names_the_unset_stamp_model_rather_than_a_missing_endpoint(
     assert "and there is no fallback home, so nothing was stamped" in card
 
 
+#: Every outcome the stamp check's model fallback can report, with details in
+#: the build system's own words (settings, error classes, codes), and the plain
+#: sentence the owner's card must say instead (5 October 2026, Codex round 1).
+_EVERY_MODEL_OUTCOME = [
+    (
+        {"status": "asked_and_failed", "detail": (
+            "ValueError: the reply from 10.0.0.1:4000 was empty — the model was "
+            "still thinking when it ran out of room (raise "
+            "GUARDKIT_STAMP_MODEL_MAX_TOKENS above 8192)"
+        )},
+        "the model ran out of room before it answered",
+    ),
+    (
+        {"status": "asked_and_failed", "detail": "TimeoutError from localhost:4000 (timed out)"},
+        "no answer came back in time",
+    ),
+    (
+        {"status": "asked_and_failed", "detail": "URLError from localhost:4000 (Connection refused)"},
+        "could not reach its model",
+    ),
+    (
+        {"status": "asked_and_failed", "detail": "HTTPError 500 from 127.0.0.1:4000 (upstream command exited prematurely)"},
+        "the model did not give a usable answer",
+    ),
+    (
+        {"status": "asked_and_failed", "detail": ""},
+        "the model did not give a usable answer",
+    ),
+    (
+        {"status": "answer_rejected", "detail": "ModelAnswerRejected: 'maybe' is not one of the allowed words"},
+        "its answer was not one the check accepts",
+    ),
+    (
+        {"status": "not_configured", "detail": (
+            "no model endpoint is configured (set GUARDKIT_STAMP_MODEL_URL, or "
+            "OPENAI_BASE_URL, to something like http://localhost:4000/v1)"
+        )},
+        "The model fallback was not asked: no endpoint is configured.",
+    ),
+    (
+        {"status": "not_configured", "detail": "stamp model not configured (GUARDKIT_STAMP_MODEL unset); no model call made"},
+        "has no model named, so it did not ask a model",
+    ),
+    (
+        {"status": "decided", "detail": "decided all 1 of them: 'x' -> hurl", "count": 1},
+        "The model fallback decided 1 of them",
+    ),
+    (
+        {"status": "switched_off", "detail": "switched off for this stamping by the caller (GUARDKIT rules only)"},
+        "was not asked (it was switched off for this stamping)",
+    ),
+]
+
+
+@pytest.mark.parametrize(("model_outcome", "plain"), _EVERY_MODEL_OUTCOME)
+def test_every_model_outcome_reaches_the_card_in_plain_words(
+    model_outcome: dict[str, Any], plain: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The owner reads this card: no setting names, error class names or
+    codes, whatever the build system reported. Its own words stay in the
+    log (and the receipt's model_outcome)."""
+    with caplog.at_level(logging.INFO, logger="forge.planning.driver"):
+        card = _Driver._stamp_normalizer_card(
+            CID, "FEAT-1234", _refusal_with_model(model_outcome)
+        )
+    assert plain in card
+    for word in ("GUARDKIT_", "Error", "unset", "MAX_TOKENS", "OPENAI_"):
+        assert word not in card, f"{word!r} reached the card for {model_outcome}"
+    if model_outcome["detail"] and model_outcome["status"] in (
+        "asked_and_failed", "answer_rejected", "not_configured"
+    ):
+        assert any(model_outcome["detail"].rstrip(".") in m for m in _driver_log_lines(caplog))
+
+
 def test_the_card_says_nothing_about_the_model_when_the_normalizer_said_nothing() -> None:
     """An older guardkit that reports no ``model_outcome``: today's card,
     word for word — nothing invented."""
@@ -7143,9 +7218,10 @@ async def test_the_drivers_own_record_stops_saying_no_fallback_home_when_the_mod
     card = _error_cards(h)[0]
     assert "no fallback home" not in card
     assert (
-        "The model fallback was asked and could not answer: HTTPStatusError: 502 "
-        "Bad Gateway from localhost:4000." in card
+        "The plan's stamp check asked its model, but the model did not give a "
+        "usable answer, so these scenarios could not be labelled." in card
     )
+    assert "HTTPStatusError" not in card
 
 
 # ---------------------------------------------------------------------------
@@ -7622,7 +7698,7 @@ async def test_after_a_pre_card_round_the_plan_stage_asks_the_model_and_never_se
     assert len(cards) == 1
     assert _STOP_STILL_UNPROVEN in cards[0]
     assert "ok" in cards[0]
-    assert "The model fallback's answer was rejected" in cards[0]
+    assert "its answer was not one the check accepts" in cards[0]
     # The approved spec row carries the pre-card round; no plan-stage rewrite.
     approved = _approved_spec_rows(store)
     assert len(approved) == 1
