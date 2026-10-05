@@ -1438,9 +1438,14 @@ def _build_dispatch_build(
             )
             return
 
-        # True only when THIS delivery wrote the row: the "Building" answer
-        # is said once, never again for a redelivery or a recovered row.
-        fresh_row = False
+        # Whether this delivery answers the thread it came from: True when
+        # THIS delivery wrote the row, or (below) when it recovers a row that
+        # never launched. A redelivery of a launched build — already answered
+        # "Building" — stays silent.
+        answers_thread = False
+        # Who is answered: the request itself, or for a recovered row its
+        # persisted row (parent_request_id, originating_adapter).
+        thread_target: Any = payload
         try:
             if admitted is not None:
                 build_id = sqlite_pool.record_pending_build(
@@ -1448,7 +1453,7 @@ def _build_dispatch_build(
                 )
             else:
                 build_id = sqlite_pool.record_pending_build(payload)
-            fresh_row = True
+            answers_thread = True
         except DuplicateBuildError as exc:
             # R2 refined to THREE arms (plan §D4.5, arch-review C2): the
             # consumer's ``is_duplicate_terminal`` filter already screened the
@@ -1523,6 +1528,18 @@ def _build_dispatch_build(
                 from forge.lifecycle.identifiers import derive_build_id
 
                 build_id = derive_build_id(payload.feature_id, payload.queued_at)
+                # A row recovered before it was ever launched (the forge
+                # stopped after the row was written but before, or at, its
+                # build-start card) was never answered, so this delivery
+                # answers it once, from the row. The persisted fact is the
+                # launch's ``async_tasks`` row: it is written when the runner
+                # takes the build, just before "Building" is said, so a row
+                # with one has launched and has been answered (or the forge
+                # stopped in the instant between, which stays silent rather
+                # than risk saying it twice).
+                if not _had_launched(sqlite_pool, build_id):
+                    answers_thread = True
+                    thread_target = _row_or(sqlite_pool, build_id, payload)
                 recovered = status == BuildState.INTERRUPTED
                 if recovered and not await _interrupted_first(build_id):
                     return
@@ -1590,16 +1607,24 @@ def _build_dispatch_build(
 
         async def _say_building() -> None:
             """The hand-over's one success answer, after the launch returned."""
-            if not fresh_row:
+            if not answers_thread:
                 return
+            if admitted is not None:
+                commit = admitted.source_commit
+            else:
+                # A recovered row: the commit it was admitted at, as recorded.
+                try:
+                    commit = getattr(sqlite_pool, "read_source_commit")(build_id)
+                except Exception:  # noqa: BLE001 — the line without a commit
+                    commit = None
             await answer_build_thread(
                 reply_in_thread,
-                payload,
+                thread_target,
                 build_started_reply(
                     payload.feature_id,
                     payload.repo,
                     payload.branch,
-                    admitted.source_commit if admitted is not None else None,
+                    commit,
                 ),
             )
 
@@ -1774,11 +1799,11 @@ def _build_dispatch_build(
 
             if not recovered:
                 await _register_and_launch()
-                await _say_building()
             elif not await launch_replacing_recorded_run(
                 sqlite_pool, build_id, _register_and_launch
             ):
                 return
+            await _say_building()
         else:
             # Gate terminal (reject / expiry / hard-stop) — the build never
             # started; ack the slot so the next queued build proceeds and
@@ -1807,10 +1832,10 @@ def _build_dispatch_build(
             # A hand-over whose build-start card ended it is told so, once.
             # (After a restart mid-card, ``rearm_paused_gates`` answers
             # instead, from the build row.)
-            if fresh_row:
+            if answers_thread:
                 await answer_build_thread(
                     reply_in_thread,
-                    payload,
+                    thread_target,
                     build_refused_reply(
                         payload.feature_id, gate_ended_reason(outcome)
                     ),
@@ -1818,6 +1843,33 @@ def _build_dispatch_build(
                 )
 
     return dispatch_build
+
+
+def _had_launched(sqlite_pool: Any, build_id: str) -> bool:
+    """Whether the ledger recorded a launch (an ``async_tasks`` row) for it.
+
+    A ledger with no ``async_tasks`` table has recorded none. Any other
+    failure to read counts as launched: the answer is then not said, rather
+    than said twice.
+    """
+    try:
+        row = sqlite_pool.connection.execute(
+            "SELECT 1 FROM async_tasks WHERE build_id = ? LIMIT 1", (build_id,)
+        ).fetchone()
+    except sqlite3.OperationalError as exc:
+        return "no such table" not in str(exc)
+    except Exception:  # noqa: BLE001 — silence over a second answer
+        return True
+    return row is not None
+
+
+def _row_or(sqlite_pool: Any, build_id: str, fallback: Any) -> Any:
+    """The persisted build row, or ``fallback`` when it cannot be read."""
+    try:
+        row = sqlite_pool.get_build_row(build_id)
+    except Exception:  # noqa: BLE001 — the request carries the same facts
+        row = None
+    return row if row is not None else fallback
 
 
 #: How long a launch waits before asking the lifecycle bridge again when it

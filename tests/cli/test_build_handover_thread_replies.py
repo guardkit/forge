@@ -631,3 +631,197 @@ async def test_a_request_from_another_adapter_gets_no_answer(
 
     assert len(starter.replies_at_launch) == 1
     assert bus.replies() == []
+
+
+# ---------------------------------------------------------------------------
+# A restart after the row was written but before the build launched
+# (Codex implementation review round 2, R2)
+# ---------------------------------------------------------------------------
+
+
+def _gated_deps(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    bus: _Bus,
+    starter: _Starter,
+    forge_config: ForgeConfig,
+    persistence: SqliteLifecyclePersistence,
+    gate: Any,
+) -> Any:
+    """A fresh composition (a forge after a restart) with its gate wired."""
+    monkeypatch.setattr(_serve_deps_gating, "bound_gate_parts", lambda: object())
+    monkeypatch.setattr(_serve_gate_activation, "maybe_gate_build", gate)
+    return build_pipeline_consumer_deps(
+        bus,
+        forge_config,
+        persistence,
+        async_task_starter=starter,
+        gate_repository=object(),
+        gate_state_machine=object(),
+        record_build_rejection=lambda _cid, _reason: None,
+        prepared_build_admission=build_prepared_build_admission(
+            forge_config, git_runner=WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+        ),
+    )
+
+
+async def _stopped_before_the_card(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    bus: _Bus,
+    starter: _Starter,
+    forge_config: ForgeConfig,
+    persistence: SqliteLifecyclePersistence,
+    planning_deps: PlanningConsumerDeps,
+    *,
+    interrupted: bool,
+) -> bytes:
+    """The row is written, then the forge stops before the build's card.
+
+    Returns the held build request, which the broker redelivers after the
+    restart. ``interrupted`` marks the row as boot recovery does.
+    """
+    import asyncio
+
+    async def _never(**_kwargs: Any) -> Any:
+        await asyncio.Event().wait()
+
+    deps = _gated_deps(
+        monkeypatch, tmp_path, bus, starter, forge_config, persistence, _never
+    )
+    await handle_planning_message(_slack_message(), planning_deps)
+    (request,) = bus.build_requests()
+    task = asyncio.create_task(handle_message(_Msg(request), deps))
+    for _ in range(200):
+        await asyncio.sleep(0.01)
+        if _rows(persistence):
+            break
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    (row,) = _rows(persistence)
+    assert row["status"] == "QUEUED"
+    if interrupted:
+        persistence.connection.execute(
+            "UPDATE builds SET status = 'INTERRUPTED' WHERE build_id = ?",
+            (row["build_id"],),
+        )
+    assert bus.replies() == [] and starter.replies_at_launch == []
+    return request
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("interrupted", [False, True], ids=["queued", "interrupted"])
+@pytest.mark.parametrize(
+    ("outcome", "expected"),
+    [
+        (GateOutcome.RESUMED, "Building"),
+        (GateOutcome.CANCELLED, "was declined"),
+        (GateOutcome.TIMED_OUT, "timed out"),
+    ],
+)
+async def test_a_hand_over_stopped_before_its_card_is_answered_once_after_restart(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    project: Project,
+    bus: _Bus,
+    starter: _Starter,
+    forge_config: ForgeConfig,
+    persistence: SqliteLifecyclePersistence,
+    planning_deps: PlanningConsumerDeps,
+    interrupted: bool,
+    outcome: GateOutcome,
+    expected: str,
+) -> None:
+    source = project.commit_on(BRANCH, bundle())
+    request = await _stopped_before_the_card(
+        monkeypatch,
+        tmp_path,
+        bus,
+        starter,
+        forge_config,
+        persistence,
+        planning_deps,
+        interrupted=interrupted,
+    )
+
+    async def _decided(**_kwargs: Any) -> Any:
+        return outcome
+
+    after_restart = _gated_deps(
+        monkeypatch, tmp_path, bus, starter, forge_config, persistence, _decided
+    )
+    await handle_message(_Msg(request), after_restart)
+
+    (reply,) = bus.replies()
+    assert reply.parent_request_id == THREAD and reply.thread_ts == THREAD
+    if expected == "Building":
+        # From the persisted row, with the commit it was admitted at.
+        assert reply.message == (
+            f"Building {FEATURE} for {REPO} from {BRANCH} at {source[:7]}"
+        )
+        assert starter.replies_at_launch == [0], "said after the launch"
+    else:
+        assert reply.message == (
+            f"{FEATURE} was not started: the build-start card {expected}."
+        )
+        assert starter.replies_at_launch == []
+
+
+@pytest.mark.asyncio
+async def test_a_build_already_launched_and_answered_is_not_answered_again(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    project: Project,
+    bus: _Bus,
+    starter: _Starter,
+    forge_config: ForgeConfig,
+    persistence: SqliteLifecyclePersistence,
+    planning_deps: PlanningConsumerDeps,
+) -> None:
+    project.commit_on(BRANCH, bundle())
+
+    async def _approved(**_kwargs: Any) -> Any:
+        return GateOutcome.RESUMED
+
+    deps = _gated_deps(
+        monkeypatch, tmp_path, bus, starter, forge_config, persistence, _approved
+    )
+    await _hand_over(planning_deps, deps, bus)
+    (request,) = bus.build_requests()
+    assert [r.message.split(" ")[0] for r in bus.replies()] == ["Building"]
+    (row,) = _rows(persistence)
+    # The persisted fact that decides it: the launch's async_tasks row.
+    assert (
+        persistence.connection.execute(
+            "SELECT COUNT(*) FROM async_tasks WHERE build_id = ?", (row["build_id"],)
+        ).fetchone()[0]
+        == 1
+    )
+
+    # The forge stops mid-build; boot recovery marks the row INTERRUPTED and
+    # the held request comes back to a fresh forge, which relaunches it (its
+    # earlier run is interrupted first — the runner is a stand-in here).
+    from forge.cli import _serve_deps as serve_deps
+
+    interrupted: list[str] = []
+
+    async def _interrupt(_pool: Any, _config: Any, build_id: str, **_: Any) -> bool:
+        interrupted.append(build_id)
+        return True
+
+    monkeypatch.setattr(serve_deps, "interrupt_recorded_run", _interrupt)
+    persistence.connection.execute(
+        "UPDATE builds SET status = 'INTERRUPTED' WHERE build_id = ?",
+        (row["build_id"],),
+    )
+    after_restart = _gated_deps(
+        monkeypatch, tmp_path, bus, starter, forge_config, persistence, _approved
+    )
+    await handle_message(_Msg(request), after_restart)
+
+    assert interrupted == [row["build_id"]]
+    assert len(starter.replies_at_launch) == 2, "it was relaunched"
+    assert [r.message.split(" ")[0] for r in bus.replies()] == ["Building"]
