@@ -463,14 +463,24 @@ Runner = Callable[..., "subprocess.CompletedProcess[str]"]
 def _run_command(
     argv: Sequence[str], *, input: str | None = None, timeout: float = COMMAND_TIMEOUT
 ) -> "subprocess.CompletedProcess[str]":
-    """Run one command, capturing its output. Never uses a shell."""
-    return subprocess.run(  # noqa: S603 — fixed argv, no shell
+    """Run one command, capturing its output. Never uses a shell.
+
+    Bytes in and out, decoded without newline translation: a settings file
+    read through here must come back byte for byte, or the activation's
+    "is the live file still the one we staged from" check could never pass.
+    """
+    done = subprocess.run(  # noqa: S603 — fixed argv, no shell
         list(argv),
-        input=input,
+        input=None if input is None else input.encode("utf-8", "surrogateescape"),
         capture_output=True,
-        text=True,
         timeout=timeout,
         check=False,
+    )
+    return subprocess.CompletedProcess(
+        done.args,
+        done.returncode,
+        done.stdout.decode("utf-8", "surrogateescape"),
+        done.stderr.decode("utf-8", "replace"),
     )
 
 
@@ -512,14 +522,20 @@ class Refused(Exception):
 # ---------------------------------------------------------------------------
 
 
+#: Writes standard input (or, for the volume, ``/in``) to "$1" with nothing
+#: but its owner able to read it, then gives it the mode of "$2", the live file.
+_WRITE_LIKE: str = 'umask 077 && cat > "$1" && chmod "$(stat -c %a "$2")" "$1"'
+
+
 @dataclass(frozen=True)
 class VolumeStore:
     """Files in the coordinator's settings volume, through a throwaway container.
 
     Read: ``docker run --rm -v <volume>:/s:ro alpine cat /s/<file>``. Write: the
-    text goes into a private temporary file and is copied in with ``docker run
-    --rm --user 1000:1000 -v <volume>:/s -v <tmp>:/in:ro alpine cp /in /s/<file>``,
-    keeping the owner, exactly as the one-page procedure puts a settings file in.
+    text goes into a private temporary file and is copied in by ``docker run
+    --rm --user 1000:1000 -v <volume>:/s -v <tmp>:/in:ro alpine`` (``cp``),
+    keeping the owner as the one-page procedure does, and given the mode of
+    the live file it stands beside.
     """
 
     volume: str
@@ -544,15 +560,16 @@ class VolumeStore:
         )
         return result.stdout.split() if result.returncode == 0 else []
 
-    def write(self, name: str, text: str) -> None:
+    def write(self, name: str, text: str, *, like: str) -> None:
         with tempfile.TemporaryDirectory(prefix="forge-register-") as folder:
             local = Path(folder) / name
-            local.write_text(text, encoding="utf-8")
+            local.write_bytes(text.encode("utf-8", "surrogateescape"))
             result = _call(
                 self.run,
                 ["docker", "run", "--rm", "--user", f"{SANDBOX_USER}:{SANDBOX_USER}",
                  "-v", f"{self.volume}:/s", "-v", f"{local}:/in:ro",
-                 VOLUME_HELPER_IMAGE, "cp", "/in", f"/s/{name}"],
+                 VOLUME_HELPER_IMAGE, "sh", "-c", _WRITE_LIKE.replace("cat >", "cp /in"),
+                 "register-repo", f"/s/{name}", f"/s/{like}"],
             )
         if result.returncode != 0:
             raise Refused("coordinator", f"could not write {name} into {self.volume} ({_said(result)})")
@@ -565,7 +582,8 @@ class SandboxStore:
     """Files and commands inside the shared sandbox, as its own user.
 
     Every call is ``sbx exec -u 1000 <sandbox> ...``; a write hands the text in
-    on standard input (``-i``) to ``sh -c 'cat > "$1"'``.
+    on standard input (``-i``) to ``sh -c 'cat > "$1"'`` and gives the file
+    the mode of the live file it stands beside.
     """
 
     sandbox: str
@@ -598,8 +616,8 @@ class SandboxStore:
         result = self.exec("ls", "-1", folder)
         return result.stdout.split() if result.returncode == 0 else []
 
-    def write(self, name: str, text: str) -> None:
-        result = self.exec("sh", "-c", 'cat > "$1"', "register-repo", name, input=text)
+    def write(self, name: str, text: str, *, like: str) -> None:
+        result = self.exec("sh", "-c", _WRITE_LIKE, "register-repo", name, like, input=text)
         if result.returncode != 0:
             raise Refused("sandbox", f"could not write {name} in {self.sandbox} ({_said(result)})")
         if self.read(name) != text:
@@ -615,7 +633,7 @@ class HostStore:
 
     def read(self, name: str) -> str | None:
         try:
-            return Path(name).read_text(encoding="utf-8")
+            return Path(name).read_bytes().decode("utf-8", "surrogateescape")
         except OSError:
             return None
 
@@ -633,8 +651,8 @@ class HostStore:
             except OSError:
                 pass
         descriptor = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            handle.write(text)
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(text.encode("utf-8", "surrogateescape"))
         os.chmod(name, mode)
 
 
@@ -1085,12 +1103,10 @@ def stage(
     if dry_run:
         return Step(which, "would stage", store.where(pending)), None
     backup = _backup_name(live, leaf)
-    if isinstance(store, HostStore):
-        store.write(backup, original, like=like)
-        store.write(pending, staged, like=like)
-    else:
-        store.write(backup, original)
-        store.write(pending, staged)
+    # Both copies take the live file's mode: the publisher's is 600, and a
+    # sandbox or volume copy must not be readable more widely than its live file.
+    store.write(backup, original, like=like or live)
+    store.write(pending, staged, like=like or live)
     return (
         Step(which, "staged", f"{store.where(pending)} (backup {PurePosixPath(backup).name})"),
         Staged(live, pending, backup),

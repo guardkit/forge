@@ -139,6 +139,8 @@ class FakeEstate:
         self.tmp_path = tmp_path
         self.volume: dict[str, str] = {"forge.yaml": COORDINATOR_YAML}
         self.sandbox_files: dict[str, str] = {SANDBOX_SETTINGS: SANDBOX_YAML}
+        #: File modes, by volume name or sandbox path, as ``stat -c %a`` says them.
+        self.modes: dict[str, str] = {"forge.yaml": "640", SANDBOX_SETTINGS: "600"}
         self.clones: dict[str, str] = {}
         self.ignored = True
         self.sandbox_can_read = True
@@ -197,12 +199,14 @@ class FakeEstate:
             return _ok(self.volume[name]) if name in self.volume else _no(1, "cat: no such file")
         if command[:2] == ["ls", "-1"]:
             return _ok("\n".join(sorted(self.volume)) + "\n")
-        if command[0] == "cp":
+        if command[:2] == ["sh", "-c"]:
             assert "--user" in argv and argv[argv.index("--user") + 1] == "1000:1000"
             assert not mounts[0].endswith(":ro")
+            assert command[2] == 'umask 077 && cp /in "$1" && chmod "$(stat -c %a "$2")" "$1"'
             local = mounts[1].rsplit(":", 2)[0]
-            name = command[2].removeprefix("/s/")
-            self.volume[name] = Path(local).read_text(encoding="utf-8")
+            name, like = command[4].removeprefix("/s/"), command[5].removeprefix("/s/")
+            self.volume[name] = Path(local).read_bytes().decode("utf-8")
+            self.modes[name] = self.modes[like]
             self.writes.append(f"volume:{name}")
             return _ok()
         raise AssertionError(f"unexpected docker run {argv}")
@@ -233,7 +237,9 @@ class FakeEstate:
             return _ok("\n".join(names) + "\n")
         if command[:2] == ["sh", "-c"]:
             assert interactive and input is not None
+            assert command[2] == 'umask 077 && cat > "$1" && chmod "$(stat -c %a "$2")" "$1"'
             self.sandbox_files[command[4]] = input
+            self.modes[command[4]] = self.modes[command[5]]
             self.writes.append(f"sandbox:{command[4]}")
             return _ok()
         if command[0] == "test":
@@ -430,6 +436,44 @@ def test_each_file_has_a_dated_backup_of_the_live_text(estate, publisher_file):
     assert copy.read_bytes() == publisher_file.read_bytes()
     assert copy.stat().st_mode & 0o777 == 0o600
     assert (publisher_file.parent / f"settings.json.{LEAF}-pending").stat().st_mode & 0o777 == 0o600
+
+
+def test_staged_and_backup_copies_keep_the_live_file_s_mode(estate):
+    assert _run().exit_code == 0
+    stamp = register_repo.date.today().strftime("%Y%m%d")
+    for suffix in (f"{LEAF}-pending", f"bak-{stamp}-pre-register-{LEAF}"):
+        assert estate.modes[f"forge.yaml.{suffix}"] == "640"
+        assert estate.modes[f"{SANDBOX_SETTINGS}.{suffix}"] == "600"
+
+
+def test_the_runner_hands_bytes_through_without_newline_translation():
+    text = "a: 1\r\nb: 2\r\n# é\n"
+    done = register_repo._run_command(
+        [sys.executable, "-c", "import sys; sys.stdout.buffer.write(sys.stdin.buffer.read())"],
+        input=text,
+    )
+    assert done.returncode == 0
+    assert done.stdout == text
+
+
+def test_the_publisher_file_is_read_and_staged_byte_for_byte(estate, publisher_file):
+    crlf = (json.dumps(PUBLISHER_JSON, indent=2) + "\n").replace("\n", "\r\n")
+    publisher_file.write_bytes(crlf.encode())
+    assert _run("--publish", "--publisher-settings", str(publisher_file)).exit_code == 0
+    stamp = register_repo.date.today().strftime("%Y%m%d")
+    backup = publisher_file.parent / f"settings.json.bak-{stamp}-pre-register-{LEAF}"
+    assert backup.read_bytes() == crlf.encode()
+
+
+def test_a_crlf_settings_file_keeps_its_bytes_in_the_backup_and_staged_copy(estate):
+    estate.volume["forge.yaml"] = COORDINATOR_YAML.replace("\n", "\r\n")
+    result = _run()
+    assert result.exit_code == 0, result.output
+    stamp = register_repo.date.today().strftime("%Y%m%d")
+    assert estate.volume[f"forge.yaml.bak-{stamp}-pre-register-{LEAF}"] == estate.volume["forge.yaml"]
+    staged = estate.volume[f"forge.yaml.{LEAF}-pending"]
+    for line in estate.volume["forge.yaml"].split("\n"):
+        assert line in staged.split("\n")
 
 
 def test_re_running_changes_nothing(estate, publisher_file):
