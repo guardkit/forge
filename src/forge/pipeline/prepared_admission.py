@@ -186,13 +186,13 @@ async def admit_prepared_build(
 # ---------------------------------------------------------------------------
 
 
-async def _read(
-    runner: Any,
-    repo_path: str,
-    commit: str,
-    path: str,
-) -> tuple[str | None, str | None]:
-    """``(text, None)`` when present, ``(None, None)`` when absent, ``(None, why)``."""
+_LINK_MODE = "120000"
+_ORDINARY_MODES = frozenset({"100644", "100755"})
+_BUILT_PREFIX = "the prepared feature cannot be built: "
+
+
+async def _raw(runner: Any, repo_path: str, commit: str, path: str) -> tuple[Any, str | None]:
+    """The raw committed read of one path: ``(answer, None)`` or ``(None, why)``."""
     read = getattr(runner, "read_file_at_commit", None)
     if read is None:
         return None, (
@@ -200,16 +200,71 @@ async def _read(
             "commit, so the supplied files cannot be checked"
         )
     try:
-        answer = await read(repo_path, commit, path)
+        answer = await read(repo_path, commit, path, raw=True)
     except Exception as exc:  # noqa: BLE001 — boundary
         return None, f"{path} could not be read at {commit}: {type(exc).__name__}: {exc}"
     refusal = getattr(answer, "refusal", None)
     if refusal:
         return None, str(refusal)
-    if not getattr(answer, "found", False):
-        return None, None
-    content = getattr(answer, "content", None)
-    return (content if isinstance(content, str) else ""), None
+    if getattr(answer, "found", False) and not getattr(answer, "mode", None):
+        return None, (
+            f"{path} could not be read at {commit}: the reader did not say "
+            f"what kind of file it is"
+        )
+    return answer, None
+
+
+async def _read(
+    runner: Any,
+    repo_path: str,
+    commit: str,
+    path: str,
+) -> tuple[str | None, str | None]:
+    """``(text, None)`` for an ordinary committed file, ``(None, None)`` when
+    absent, ``(None, why)`` otherwise.
+
+    Every file of a prepared bundle must be the file itself (Codex review
+    round 1, R2): the raw read reports the tree entry's mode, and a symbolic
+    link — dangling, escaping or otherwise — is refused naming the file, as
+    is a path reached through a linked folder. A folder at the path is not a
+    file: absent.
+    """
+    answer, why = await _raw(runner, repo_path, commit, path)
+    if why:
+        return None, why
+    mode = getattr(answer, "mode", None)
+    if getattr(answer, "found", False) and mode == _LINK_MODE:
+        return None, (
+            f"{_BUILT_PREFIX}{path} is a symbolic link at {_short(commit)}; every "
+            f"file of a prepared feature must be the file itself"
+        )
+    if getattr(answer, "found", False) and mode in _ORDINARY_MODES:
+        content = getattr(answer, "content", None)
+        return (content if isinstance(content, str) else ""), None
+    if mode is None and "/" in path:
+        # Not there: say so plainly, unless a folder on the way is a link.
+        parts = path.split("/")
+        for index in range(1, len(parts)):
+            prefix = "/".join(parts[:index])
+            step, why = await _raw(runner, repo_path, commit, prefix)
+            if why:
+                return None, why
+            if getattr(step, "found", False) and getattr(step, "mode", None) == _LINK_MODE:
+                return None, (
+                    f"{_BUILT_PREFIX}{path} is reached through {prefix}, a "
+                    f"symbolic link at {_short(commit)}; every file of a "
+                    f"prepared feature must be the file itself"
+                )
+            if getattr(step, "mode", None) is None:
+                break
+    return None, None
+
+
+def _cannot(why: str) -> str:
+    """The refusal for a read that could not be used, in plain words."""
+    if why.startswith(_BUILT_PREFIX):
+        return why
+    return f"the prepared feature cannot be checked: {why}"
 
 
 def _missing(what: str, path: str, commit: str) -> str:
@@ -335,7 +390,7 @@ async def check_supplied_bundle(
     yaml_path = feature_yaml_relpath(feature_id)
     text, why = await _read(runner, repo_path, commit, yaml_path)
     if why:
-        return f"the prepared feature cannot be checked: {why}"
+        return _cannot(why)
     if text is None:
         return _missing("its feature file", yaml_path, at)
     try:
@@ -402,7 +457,7 @@ async def check_supplied_bundle(
             return f"the prepared feature cannot be built: the spec file {raw} is outside the repository"
         content, why = await _read(runner, repo_path, commit, normal)
         if why:
-            return f"the prepared feature cannot be checked: {why}"
+            return _cannot(why)
         if content is None:
             return _missing("the spec file", normal, at)
         specs.append(normal)
@@ -421,7 +476,7 @@ async def check_supplied_bundle(
             companion = posixpath.join(folder, f"{name}{suffix}")
             content, why = await _read(runner, repo_path, commit, companion)
             if why:
-                return f"the prepared feature cannot be checked: {why}"
+                return _cannot(why)
             if content is None:
                 return _missing(what, companion, at)
             if suffix == "_summary.md":
@@ -472,7 +527,7 @@ async def check_supplied_bundle(
                 continue
             content, why = await _read(runner, repo_path, commit, resolved)
             if why:
-                return f"the prepared feature cannot be checked: {why}"
+                return _cannot(why)
             if content is None:
                 return (
                     f"the prepared feature cannot be built: {source} links to "
@@ -488,7 +543,7 @@ async def check_supplied_bundle(
         bar = f"qa/pass-bar-{task_id}.yaml"
         content, why = await _read(runner, repo_path, commit, bar)
         if why:
-            return f"the prepared feature cannot be checked: {why}"
+            return _cannot(why)
         if content is None:
             return _missing(f"the pass bar for {task_id}", bar, at)
     for spec in specs:
@@ -498,7 +553,7 @@ async def check_supplied_bundle(
         seed = f"qa/pass-bar-seed-{name}.yaml"
         content, why = await _read(runner, repo_path, commit, seed)
         if why:
-            return f"the prepared feature cannot be checked: {why}"
+            return _cannot(why)
         if content is None:
             return _missing("the spec's QA seed", seed, at)
 
@@ -506,7 +561,7 @@ async def check_supplied_bundle(
     if any(guide_claims_routes(texts.get(guide, "")) for guide in guides):
         content, why = await _read(runner, repo_path, commit, LEAK_SWEEP_PATH)
         if why:
-            return f"the prepared feature cannot be checked: {why}"
+            return _cannot(why)
         if content is None:
             return (
                 f"the prepared feature cannot be built: the plan's guide "
