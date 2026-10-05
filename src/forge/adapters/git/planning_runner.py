@@ -147,6 +147,7 @@ class WorktreeGitRunner:
         *,
         ordinary_file_only: bool = False,
         raw: bool = False,
+        mode_only: bool = False,
     ) -> FileAtCommit:
         """Read one file exactly as it is at ``commit`` in this copy.
 
@@ -162,13 +163,14 @@ class WorktreeGitRunner:
             return FileAtCommit(
                 refusal=f"there is no copy of this project at {repo_path}"
             )
-        if raw:
+        if raw or mode_only:
             return await read_file_at_commit(
                 repo,
                 commit,
                 file_path,
                 ordinary_file_only=ordinary_file_only,
                 raw=True,
+                mode_only=mode_only,
             )
         return await read_file_at_commit(
             repo, commit, file_path, ordinary_file_only=ordinary_file_only

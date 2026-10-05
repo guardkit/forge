@@ -31,7 +31,7 @@ The narrow contract:
     POST /git/rev-parse {repo, ref} -> {sha|null}
     POST /git/remote-start-point {repo, branch?}
               -> {branch|null, commit|null, refusal|null, branch_commit?}
-    POST /git/read-file-at-commit {repo, commit, file_path, ordinary_file_only?, raw?}
+    POST /git/read-file-at-commit {repo, commit, file_path, ordinary_file_only?, raw?, mode_only?}
               -> {content|null, found, refusal|null, ordinary?}
     POST /git/is-ancestor {repo, ancestor, descendant} -> {is_ancestor|null}
     POST /git/candidate-tree {repo, feature_id, sha}
@@ -3960,6 +3960,8 @@ def process_git_read_file_at_commit_request(
     # documents): the entry's mode reported and the blob's exact bytes, strict
     # UTF-8. Absent, the read is unchanged.
     raw = payload.get("raw") is True
+    # Existence and mode only, nothing read out of the blob (R7).
+    mode_only = payload.get("mode_only") is True
     from forge.deploy.candidate_tree import read_file_at_commit
 
     try:
@@ -3970,6 +3972,7 @@ def process_git_read_file_at_commit_request(
                 str(file_path),
                 ordinary_file_only=ordinary_file_only,
                 raw=raw,
+                mode_only=mode_only,
             )
         )
     except Exception as exc:  # noqa: BLE001 — never raise past the boundary

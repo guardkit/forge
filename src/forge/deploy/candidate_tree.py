@@ -696,7 +696,7 @@ def _tree_entry(
 
 
 def _read_raw_at_commit_sync(
-    repo_root: Path, commit: str, file_path: str
+    repo_root: Path, commit: str, file_path: str, *, mode_only: bool = False
 ) -> FileAtCommit:
     """The RAW read: the tree entry's mode, then the blob's exact bytes.
 
@@ -721,6 +721,13 @@ def _read_raw_at_commit_sync(
         return FileAtCommit(found=False)
     if mode not in _ORDINARY_FILE_MODES and mode != _LINK_MODE:
         return FileAtCommit(found=False, mode=mode)
+    if mode_only:
+        # Existence and kind only (4 October 2026, Codex review round 2, R7):
+        # a reference target need only be an ordinary committed file, so its
+        # bytes are neither read nor decoded — a picture is a fine target.
+        return FileAtCommit(
+            content="", found=True, ordinary=mode in _ORDINARY_FILE_MODES, mode=mode
+        )
     sized = _run_git(
         repo_root, "cat-file", "-s", oid, timeout=READ_AT_COMMIT_TIMEOUT_SECONDS
     )
@@ -805,6 +812,7 @@ def read_file_at_commit_sync(
     *,
     ordinary_file_only: bool = False,
     raw: bool = False,
+    mode_only: bool = False,
 ) -> FileAtCommit:
     """The three steps, in order: is the commit here, is the file, read it.
 
@@ -825,6 +833,8 @@ def read_file_at_commit_sync(
     after the commit check, the read is :func:`_read_raw_at_commit_sync` —
     exact bytes, strict UTF-8, and the entry's ``mode`` reported. It takes
     precedence over ``ordinary_file_only``; the caller judges the mode.
+    ``mode_only`` (with ``raw``) answers the entry's existence and mode with
+    empty content: nothing is read out of the blob.
     """
     where = str(repo_root)
     try:
@@ -844,8 +854,10 @@ def read_file_at_commit_sync(
                 )
             )
 
-        if raw:
-            return _read_raw_at_commit_sync(repo_root, commit, file_path)
+        if raw or mode_only:
+            return _read_raw_at_commit_sync(
+                repo_root, commit, file_path, mode_only=mode_only
+            )
 
         # A FILE, not a folder (4 October 2026, coach finding). ``cat-file -s``
         # answers for a folder too (its tree object has a size) and ``git show``
@@ -941,6 +953,7 @@ async def read_file_at_commit(
     *,
     ordinary_file_only: bool = False,
     raw: bool = False,
+    mode_only: bool = False,
 ) -> FileAtCommit:
     """Read ``file_path`` exactly as it is at ``commit``.
 
@@ -958,6 +971,7 @@ async def read_file_at_commit(
             str(file_path),
             ordinary_file_only=ordinary_file_only,
             raw=raw,
+            mode_only=mode_only,
         )
     )
 
