@@ -649,6 +649,16 @@ FACTORY_ENV_NAMES=(
   # reserves (default one gibibyte). The factory's settings, not a project's.
   FORGE_AUTOBUILD_MIN_AVAILABLE_BYTES
   FORGE_AUTOBUILD_PER_BUILD_RESERVE_BYTES
+  # THE MODEL THE PLAN'S STAMP CHECK ASKS (5 October 2026). The helper runs
+  # the build system's stamp check at the end of planning; it reads these four.
+  # Left off, the check asked the build system's built-in default, a retired
+  # model whose load ran the machine's GPU out of memory. The build system's
+  # settings, not a project's, so they belong here rather than in a project's
+  # SANDBOX_CONTAINER_ENV_NAMES.
+  GUARDKIT_STAMP_MODEL
+  GUARDKIT_STAMP_MODEL_URL
+  GUARDKIT_STAMP_MODEL_TIMEOUT_S
+  GUARDKIT_STAMP_MODEL_MAX_TOKENS
   FORGE_SIDECAR_IN_SANDBOX
   OPENAI_BASE_URL
   OPENAI_API_KEY

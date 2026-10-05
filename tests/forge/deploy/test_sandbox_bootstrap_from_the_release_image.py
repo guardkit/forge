@@ -841,6 +841,24 @@ class TestItStartsTwoContainersFromThatOneImage:
         for name in names:
             assert f"--env {name}" in runner, f"{name} was not handed to the runner"
 
+    def test_the_stamp_checks_model_settings_reach_the_helper(self, sandbox):
+        """The model the plan's stamp check asks (5 October 2026). The helper
+        runs that check, so it must be handed all four by name from this
+        script's own list, not only when a release adds them to the extra
+        names. Left off, the check asked a retired model."""
+        names = {
+            "GUARDKIT_STAMP_MODEL": "flash-next-t06",
+            "GUARDKIT_STAMP_MODEL_URL": "http://router:4000/v1",
+            "GUARDKIT_STAMP_MODEL_TIMEOUT_S": "60",
+            "GUARDKIT_STAMP_MODEL_MAX_TOKENS": "8192",
+        }
+        helper, runner = _the_two_starts(sandbox, **names)
+        for name in names:
+            assert f"--env {name}" in helper, f"{name} was not handed to the helper"
+            assert f"--env {name}" in runner, f"{name} was not handed to the runner"
+        # By name only: the values stay in the sandbox's own environment.
+        assert "flash-next-t06" not in helper and "flash-next-t06" not in runner
+
     def test_the_runner_serves_as_many_builds_at_once_as_it_is_told(self, sandbox):
         """The runner is ``langgraph dev``, which runs ONE build at a time
         unless told otherwise. FORGE_MAX_CONCURRENT_BUILDS tells it."""
