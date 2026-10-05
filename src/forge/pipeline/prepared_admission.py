@@ -341,12 +341,19 @@ def _resolve_link(from_file: str, target: str) -> str | None:
 #: ``src/specialist_agent/qa/leak_sweep_emit.py``, ``_INTEGRATION_SECTION_RE``
 #: and ``_extract_integration_section``): case-sensitive, ``## §4 Integration
 #: Contracts`` or a bare ``## §4`` first, at any level of two or more.
-#: GuardKit's ``/feature-plan`` template writes the heading with a colon,
-#: ``## §4: Integration Contracts`` (installer/core/commands/feature-plan.md),
-#: which neither reader recognises; that is noted for the producers' owners
-#: and deliberately not papered over here.
+#: This is the rule for a bundle the SPECIALIST planner wrote (it carries the
+#: specialist-only ``<name>_digest.yaml``).
 _INTEGRATION_HEADING_RE = re.compile(
     r"^##+\s*(?:§\s*)?4\s*(?:Integration\s+Contracts?)?\s*$",
+    re.MULTILINE,
+)
+#: An ATTENDED bundle (GuardKit's own ``/feature-plan`` in Claude Code or Pi,
+#: no digest) is read with GuardKit's documented headings too: its template
+#: writes ``## §4: Integration Contracts``, with a colon
+#: (installer/core/commands/feature-plan.md:1978-1985 at guardkit 6f00751c),
+#: as well as the forms above (Codex review round 1, R5).
+_ATTENDED_HEADING_RE = re.compile(
+    r"^##+\s*(?:§\s*)?4\s*:?\s*(?:Integration\s+Contracts?)?\s*$",
     re.MULTILINE,
 )
 #: Only when no such heading exists: ``## Integration Contracts`` (the
@@ -361,14 +368,17 @@ _SECTION_RE = re.compile(r"^##+", re.MULTILINE)
 _ROUTE_LINE_RE = re.compile(r"(?i)^\s*[-]?\s*route:\s*\S", re.MULTILINE)
 
 
-def guide_claims_routes(guide_text: str) -> bool:
+def guide_claims_routes(guide_text: str, *, attended: bool = False) -> bool:
     """Does the guide's Integration Contracts section declare a ``route:``?
 
     Only the FIRST matching heading's section is read, exactly as the
     specialist emitter reads it; a ``route:`` line in it is that producer's own
-    signal that it wrote ``qa/leak-sweep.yaml``.
+    signal that it wrote ``qa/leak-sweep.yaml``. ``attended`` reads an
+    attended GuardKit bundle, whose documented heading has a colon.
     """
-    heading = _INTEGRATION_HEADING_RE.search(guide_text)
+    heading = (_ATTENDED_HEADING_RE if attended else _INTEGRATION_HEADING_RE).search(
+        guide_text
+    )
     if heading is None:
         heading = _INTEGRATION_FALLBACK_RE.search(guide_text)
     if heading is None:
@@ -449,7 +459,7 @@ async def check_supplied_bundle(
     for path in task_files:
         content, why = await _read(runner, repo_path, commit, path)
         if why:
-            return f"the prepared feature cannot be checked: {why}"
+            return _cannot(why)
         if content is None:
             return _missing("the task file", path, at)
         texts[path] = content
@@ -484,8 +494,11 @@ async def check_supplied_bundle(
             return _missing("the spec file", normal, at)
         specs.append(normal)
 
-    # 4. The two companion files both producers write beside each spec file.
+    # 4. The two companion files both producers write beside each spec file,
+    #    and whether the specialist-only digest is there too: it is what tells
+    #    the two producers apart for the leak-sweep rule (step 9).
     summaries: list[str] = []
+    specialist = False
     for spec in specs:
         folder = posixpath.dirname(spec)
         name = posixpath.basename(spec)
@@ -504,6 +517,12 @@ async def check_supplied_bundle(
             if suffix == "_summary.md":
                 texts[companion] = content
                 summaries.append(companion)
+        digest = posixpath.join(folder, f"{name}_digest.yaml")
+        content, why = await _read(runner, repo_path, commit, digest)
+        if why:
+            return _cannot(why)
+        if content is not None:
+            specialist = True
 
     # 5. The plan's guide, in each folder that holds task files.
     guides: list[str] = []
@@ -511,7 +530,7 @@ async def check_supplied_bundle(
         guide = posixpath.join(folder, GUIDE_NAME) if folder else GUIDE_NAME
         content, why = await _read(runner, repo_path, commit, guide)
         if why:
-            return f"the prepared feature cannot be checked: {why}"
+            return _cannot(why)
         if content is None:
             return _missing("the plan's guide", guide, at)
         texts[guide] = content
@@ -579,8 +598,13 @@ async def check_supplied_bundle(
         if content is None:
             return _missing("the spec's QA seed", seed, at)
 
-    # 9. The leak-sweep manifest, exactly when the guide claims a route.
-    if any(guide_claims_routes(texts.get(guide, "")) for guide in guides):
+    # 9. The leak-sweep manifest, exactly when the guide claims a route — by
+    #    the specialist emitter's own rule for a specialist bundle, and with
+    #    GuardKit's documented headings too for an attended one.
+    if any(
+        guide_claims_routes(texts.get(guide, ""), attended=not specialist)
+        for guide in guides
+    ):
         content, why = await _read(runner, repo_path, commit, LEAK_SWEEP_PATH)
         if why:
             return _cannot(why)
