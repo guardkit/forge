@@ -48,6 +48,9 @@ PARENT = {
     "GUARDKIT_STAMP_MODEL_URL": "http://localhost:4000/v1",
     "GUARDKIT_STAMP_MODEL_TIMEOUT_S": "30",
     "GUARDKIT_STAMP_MODEL_MAX_TOKENS": "4096",
+    "GUARDKIT_QAV_SHADOW": "1",
+    "GUARDKIT_QAV_SHADOW_URL": "http://router:4000/v1",
+    "GUARDKIT_QAV_PROBE_URL": "http://switchboard:9000",
     "GUARDKIT_MAX_PARALLEL_TASKS": "2",
     "GUARDKIT_WAVE_SAME_AREA": "parallel",
     "GUARDKIT_PLAYER_MODEL_LIMITS": "another-model=4",
@@ -111,9 +114,10 @@ def test_the_list_is_short() -> None:
     """"A SHORT named list" is the design's own wording, and it stays short: a
     list nobody can read is the copy-of-everything by another name.
 
-    Raised from 30 to 34 on 5 October 2026 for the four settings of the plan's
-    stamp check, which the list had left out (see the test below)."""
-    assert len(LAUNCH_SETTINGS) <= 34
+    Raised from 30 to 37 on 5 October 2026 for the four settings of the plan's
+    stamp check and the three of the QA verifier's second opinion, which the
+    list had left out (see the tests below)."""
+    assert len(LAUNCH_SETTINGS) <= 37
 
 
 def test_the_list_names_no_language_framework_or_product() -> None:
@@ -389,10 +393,11 @@ PARENT_WITHOUT_STAMP = {k: v for k, v in PARENT.items() if k not in STAMP_SETTIN
 def test_the_stamp_checks_model_settings_reach_the_check() -> None:
     """5 October 2026: the release set GUARDKIT_STAMP_MODEL in the sandbox's
     settings and the sandbox helper had it, but this list left it out, so the
-    stamp check asked the build system's built-in default instead — a retired
-    model whose load ran the GPU out of memory. Set, each one reaches the
-    launch with the parent's own value; unset, it stays unset and the build
-    system keeps its own default."""
+    build system of that day asked its built-in default instead — a retired
+    model whose load ran the GPU out of memory (a newer one makes no model
+    call when the name is missing). Set, each one reaches the launch with the
+    parent's own value; unset, it stays unset and the build system does what
+    it does with no name."""
     env = build_launch_env(parent={**PARENT_WITHOUT_STAMP, **STAMP_SETTINGS})
     for name, value in STAMP_SETTINGS.items():
         assert env[name] == value, f"{name} was not handed to the launch"
@@ -411,3 +416,32 @@ def test_each_stamp_setting_travels_on_its_own() -> None:
         for other in STAMP_SETTINGS:
             if other != name:
                 assert other not in env
+
+
+# ---------------------------------------------------------------------------
+# The QA verifier's second opinion (5 October 2026)
+# ---------------------------------------------------------------------------
+
+#: The build system's own settings for it (``guardkit/qa/qav_shadow.py``),
+#: written out here rather than imported.
+QAV_SETTINGS = {
+    "GUARDKIT_QAV_SHADOW": "1",
+    "GUARDKIT_QAV_SHADOW_URL": "http://10.0.0.1:4000/v1",
+    "GUARDKIT_QAV_PROBE_URL": "http://10.0.0.1:9000",
+}
+
+
+def test_the_qa_verifiers_settings_reach_the_build() -> None:
+    """The sandbox's settings carried the two addresses, and this list left
+    them out, so inside a sandbox every second opinion went to the project
+    file's own "localhost" and was recorded absent. Set, each reaches the
+    build with the parent's own value; unset, it stays unset, so the
+    project's own settings file still decides whether it is on."""
+    without = {k: v for k, v in PARENT.items() if k not in QAV_SETTINGS}
+    env = build_launch_env(parent={**without, **QAV_SETTINGS})
+    for name, value in QAV_SETTINGS.items():
+        assert env[name] == value, f"{name} was not handed to the launch"
+
+    unset = build_launch_env(parent=without)
+    for name in QAV_SETTINGS:
+        assert name not in unset

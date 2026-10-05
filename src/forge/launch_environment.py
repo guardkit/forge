@@ -236,14 +236,16 @@ LAUNCH_SETTINGS: tuple[tuple[str, str], ...] = (
     # to stamp the scenarios its rules could not. It reads these four names
     # (GuardKit's ``guardkit/orchestrator/stamp_model_fallback.py``). The
     # release set the first one in the sandbox's settings, but this list left
-    # it out, so every stamp check fell back to the build system's built-in
+    # it out. The build system of that day then fell back to its built-in
     # model name: a retired model whose load ran the machine's GPU out of
-    # memory on 5 October. The endpoint falls back to OPENAI_BASE_URL and the
-    # key is OPENAI_API_KEY, both above, so no new secret travels here.
+    # memory on 5 October. (A newer build system makes no model call at all
+    # when the name is missing.) The endpoint falls back to OPENAI_BASE_URL and
+    # the key is OPENAI_API_KEY, both above, so no new secret travels here.
     (
         "GUARDKIT_STAMP_MODEL",
-        "WHICH model the plan's stamp check asks; left off, the build system "
-        "asks its built-in default, a retired model nobody chose",
+        "WHICH model the plan's stamp check asks; left off, an older build "
+        "system falls back to a built-in default model, and a current one "
+        "makes no model call",
     ),
     (
         "GUARDKIT_STAMP_MODEL_URL",
@@ -258,6 +260,31 @@ LAUNCH_SETTINGS: tuple[tuple[str, str], ...] = (
         "GUARDKIT_STAMP_MODEL_MAX_TOKENS",
         "how long that model's answer, thinking included, may be; a number, "
         "not a credential",
+    ),
+    # --- the QA verifier's second opinion (5 October 2026) ----------------
+    # Beside every Coach verdict the build system can ask a small QA model for
+    # a second opinion. It only writes that opinion down: it never changes,
+    # delays or fails a build, and a call that fails or times out is recorded
+    # as "absent" (GuardKit's ``guardkit/qa/qav_shadow.py``). A project
+    # switches it on in its own settings file; the sandbox's settings carry
+    # the two addresses below, but this list left them out, so inside a
+    # sandbox every call went to the project file's own "localhost" and was
+    # recorded absent. The owner asked for it to work (5 October 2026). The
+    # key is OPENAI_API_KEY, above, so no new secret travels here.
+    (
+        "GUARDKIT_QAV_SHADOW",
+        "the machine's own on/off switch for that second opinion, over the "
+        "project's; unset, the project's settings file decides",
+    ),
+    (
+        "GUARDKIT_QAV_SHADOW_URL",
+        "where the second opinion is asked, from inside the sandbox; it wins "
+        "over the address in the project's settings file",
+    ),
+    (
+        "GUARDKIT_QAV_PROBE_URL",
+        "where the build system checks the QA model is loaded before asking; "
+        "an unreachable check never stops the asking",
     ),
     # --- how much of one build runs at once (3 October 2026) ---------------
     # Concurrent builds. Each is the build system's own setting, unset on this
