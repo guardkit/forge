@@ -30,9 +30,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-import posixpath
 import sqlite3
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 from typing import Any
 
@@ -163,10 +162,10 @@ def _declared(
 ) -> DeclaredProjectDocuments:
     return DeclaredProjectDocuments(
         instructions=tuple(
-            DeclaredPath(spelling=p, path=posixpath.normpath(p)) for p in instructions
+            DeclaredPath(spelling=p, path=PurePosixPath(p).as_posix()) for p in instructions
         ),
         documents=tuple(
-            DeclaredPath(spelling=p, path=posixpath.normpath(p)) for p in documents
+            DeclaredPath(spelling=p, path=PurePosixPath(p).as_posix()) for p in documents
         ),
     )
 
@@ -224,9 +223,17 @@ def test_the_declared_lists_keep_their_spelling_and_order() -> None:
     )
     assert why is not None and "autobuild.player.skills" in why
     _, why = read_declared_project_documents(
-        "autobuild:\n  player:\n    required_documents: [../a.md]\n"
+        "autobuild:\n  player:\n    required_documents: [/a.md]\n"
     )
-    assert why is not None and "not a path inside the repository" in why
+    assert why is not None and "not a repository-relative path" in why
+    # As GuardKit spells it (PurePosixPath): ``.`` collapses, ``..`` is kept
+    # for the component-by-component resolution inside the commit.
+    declared, why = read_declared_project_documents(
+        "autobuild:\n  player:\n    required_documents: [a.md]\n"
+        "    instructions: [guide/../rules.md, ./x//y.md]\n"
+    )
+    assert why is None
+    assert [d.path for d in declared.instructions] == ["guide/../rules.md", "x/y.md"]
 
 
 # ---------------------------------------------------------------------------
@@ -331,7 +338,7 @@ async def test_a_chain_of_links_and_a_linked_folder_are_followed_inside_the_comm
         ({"AGENTS.md": "../outside/AGENTS.md"}, {}, "outside the repository"),
         ({"AGENTS.md": "/etc/passwd"}, {}, "outside the repository"),
         ({".claude": "../../elsewhere"}, {}, "outside the repository"),
-        ({"AGENTS.md": "docs/not-there.md"}, {}, "target is not a file"),
+        ({"AGENTS.md": "docs/not-there.md"}, {}, "is not in the repository"),
         ({"AGENTS.md": "CLAUDE.md", "CLAUDE.md": "AGENTS.md"}, {}, "a loop"),
     ],
     ids=["outside", "absolute", "linked-folder-outside", "missing-target", "loop"],
@@ -344,6 +351,53 @@ async def test_an_instruction_link_that_cannot_be_followed_refuses_the_run(
     documents, why = await _read(tree, _declared(documents=(DECLARED[0],)))
     assert documents == ()
     assert why is not None and said in why
+
+
+@pytest.mark.asyncio
+async def test_dot_dot_after_a_linked_folder_is_the_targets_parent() -> None:
+    """``guide/../rules.md`` with ``guide -> docs/nested`` is docs/rules.md, as
+    on a filesystem and in GuardKit — never the root rules.md a textual
+    normalisation would give."""
+    tree = _Tree(
+        {
+            "rules.md": "# root rules\n",
+            "docs/rules.md": "# docs rules\n",
+            "docs/nested/x.md": "x\n",
+            DECLARED[0]: MISSION_V1,
+        },
+        links={"guide": "docs/nested"},
+    )
+    documents, why = await _read(
+        tree, _declared(documents=(DECLARED[0],), instructions=("guide/../rules.md",))
+    )
+    assert why is None
+    assert [(d.path, d.text) for d in documents] == [
+        ("guide/../rules.md", "# docs rules\n"),
+        (DECLARED[0], MISSION_V1),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_missing_component_after_a_linked_folder_is_simply_absent() -> None:
+    """``.claude -> config`` with no ``config/CLAUDE.md``: the conventional
+    file is not there (GuardKit's ``_Absent``), so it is not included."""
+    tree = _Tree(
+        {"config/other.md": "o\n", DECLARED[0]: MISSION_V1}, links={".claude": "config"}
+    )
+    documents, why = await _read(tree, _declared(documents=(DECLARED[0],)))
+    assert why is None
+    assert [d.path for d in documents] == [DECLARED[0]]
+
+
+@pytest.mark.asyncio
+async def test_a_binding_document_with_dot_dot_or_under_a_linked_folder_is_refused() -> None:
+    tree = _Tree(
+        {"docs/x.md": "x\n", "real/m.md": MISSION_V1}, links={"linked": "real"}
+    )
+    _, why = await _read(tree, _declared(documents=("docs/../docs/x.md",)))
+    assert why is not None and "no such file" in why
+    _, why = await _read(tree, _declared(documents=("linked/m.md",)))
+    assert why is not None and "linked is a symbolic link" in why
 
 
 @pytest.mark.asyncio
@@ -533,6 +587,32 @@ async def test_real_links_chains_and_linked_folders(tmp_path: Path) -> None:
         (".claude/CLAUDE.md", "# Claude\n"),
         (DECLARED[0], MISSION_V1),
     ]
+
+
+@pytest.mark.asyncio
+async def test_real_git_dot_dot_after_a_linked_folder(tmp_path: Path) -> None:
+    repo, sha = _commit_bytes(
+        tmp_path,
+        {
+            "rules.md": b"# root rules\n",
+            "docs/rules.md": b"# docs rules\n",
+            "docs/nested/x.md": b"x\n",
+            DECLARED[0]: MISSION_V1.encode(),
+        },
+        links={"guide": "docs/nested"},
+    )
+    runner = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+
+    documents, why = await read_project_documents_at_commit(
+        runner,
+        repo_path=str(repo),
+        commit=sha,
+        declared=_declared(documents=(DECLARED[0],), instructions=("guide/../rules.md",)),
+    )
+
+    assert why is None
+    assert documents[0].path == "guide/../rules.md"
+    assert documents[0].text == "# docs rules\n"
 
 
 @pytest.mark.asyncio

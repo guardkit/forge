@@ -134,16 +134,26 @@ class _Refused(Exception):
     """One plain sentence: why the documents cannot be given to the writers."""
 
 
+class _Absent(Exception):
+    """The path itself is simply not in the commit (no link led to the gap)."""
+
+
 class _Reader:
-    """The raw committed-file read, at one commit, refusing every failure."""
+    """The raw committed-file read, at one commit, refusing every failure.
+
+    Answers are kept per path, so a path asked about twice is read once.
+    """
 
     def __init__(self, runner: Any, repo_path: str, commit: str) -> None:
         self._read = getattr(runner, "read_file_at_commit", None)
         self._repo_path = repo_path
         self.commit = commit
         self.short = commit[:12]
+        self._answers: dict[str, Any] = {}
 
     async def __call__(self, path: str) -> Any:
+        if path in self._answers:
+            return self._answers[path]
         if self._read is None:
             raise _Refused(
                 "the git runner wired for this factory cannot read a file at a "
@@ -168,117 +178,143 @@ class _Reader:
             )
         if found and not isinstance(getattr(answer, "content", None), str):
             raise _Refused(f"{path} could not be read at {self.short}: no contents")
+        self._answers[path] = answer
         return answer
+
+
+def _is_entry(answer: Any) -> bool:
+    """A file, link or submodule entry — anything but a folder or nothing."""
+    return bool(answer.found) or (
+        answer.mode is not None and answer.mode != _FOLDER_MODE
+    )
+
+
+async def _resolve_instruction(read: _Reader, spelling: str, path: str) -> str:
+    """The repository path an instruction file resolves to, inside the commit.
+
+    Exactly as GuardKit resolves it (``_resolve_committed_path``): component by
+    component, ``.`` and empty components skipped, ``..`` taking the current
+    folder's parent (refused at the top), a link at any component replaced by
+    its target's components, at most :data:`MAX_LINK_STEPS` links. Raises
+    :class:`_Absent` when a component of the path ITSELF is not there (or a
+    file is used as a folder); refuses a link target outside the repository
+    or missing, a loop, or a result that is not an ordinary file.
+    """
+    queue: deque[tuple[str, bool]] = deque((part, False) for part in path.split("/"))
+    current: list[str] = []
+    steps = 0
+    while queue:
+        part, from_link = queue.popleft()
+        if part in ("", "."):
+            continue
+        if part == "..":
+            if not current:
+                raise _Refused(
+                    f"the instruction file {spelling} leads outside the "
+                    f"repository at {read.short}"
+                )
+            current.pop()
+            continue
+        candidate = "/".join([*current, part])
+        answer = await read(candidate)
+        if answer.found and answer.mode == _LINK_MODE:
+            steps += 1
+            if steps > MAX_LINK_STEPS:
+                raise _Refused(
+                    f"the instruction file {spelling} passes through more than "
+                    f"{MAX_LINK_STEPS} symbolic links at {read.short} (a loop, "
+                    f"or a chain too long)"
+                )
+            target = str(answer.content)
+            if target.startswith("/"):
+                raise _Refused(
+                    f"the instruction file {spelling} passes through "
+                    f"{candidate}, a symbolic link to {target!r} outside the "
+                    f"repository"
+                )
+            queue.extendleft(reversed([(token, True) for token in target.split("/")]))
+            continue
+        if _is_entry(answer):
+            if any(token not in ("", ".") for token, _ in queue):
+                raise _Absent(spelling)  # a file used as a folder: not there
+            current.append(part)
+            continue
+        if answer.mode == _FOLDER_MODE:
+            current.append(part)
+            continue
+        if from_link:
+            raise _Refused(
+                f"the instruction file {spelling} passes through a symbolic "
+                f"link whose target ({candidate}) is not in the repository at "
+                f"{read.short}"
+            )
+        raise _Absent(spelling)
+    resolved = "/".join(current)
+    final = await read(resolved) if resolved else None
+    if final is None or not final.found or final.mode not in _ORDINARY_MODES:
+        raise _Refused(
+            f"the instruction file {spelling} is not an ordinary file at "
+            f"{read.short}"
+        )
+    return resolved
 
 
 async def _instruction_file(
     read: _Reader, spelling: str, path: str, *, declared: bool
 ) -> tuple[str, str] | None:
-    """``(resolved path, text)`` for one instruction file, or ``None`` when an
-    undeclared one is absent. Resolved like a filesystem, inside the commit."""
-    pending: deque[str] = deque(path.split("/"))
-    resolved: list[str] = []
-    steps = 0
-    where = f"{_INSTRUCTIONS_FIELD}" if declared else "the repository's instruction files"
-
-    def absent() -> None:
-        if steps:
-            raise _Refused(
-                f"the instruction file {spelling} is a symbolic link whose "
-                f"target is not a file at {read.short}"
-            )
+    """``(resolved path, text)``, or ``None`` when an undeclared instruction
+    file is simply absent. A declared one that is absent is refused."""
+    try:
+        resolved = await _resolve_instruction(read, spelling, path)
+    except _Absent:
         if declared:
             raise _Refused(
                 f"the project declares {spelling} in {_INSTRUCTIONS_FIELD}, but "
                 f"there is no such file at the commit this work starts from "
                 f"({read.short}). Commit it, or take it off the list, then ask "
                 f"again."
-            )
-
-    while pending:
-        part = pending.popleft()
-        if part in ("", "."):
-            continue
-        if part == "..":
-            if not resolved:
-                raise _Refused(
-                    f"the instruction file {spelling} ({where}) leads outside "
-                    f"the repository at {read.short}"
-                )
-            resolved.pop()
-            continue
-        candidate = "/".join([*resolved, part])
-        answer = await read(candidate)
-        found = bool(answer.found)
-        mode = answer.mode
-        if found and mode == _LINK_MODE:
-            steps += 1
-            if steps > MAX_LINK_STEPS:
-                raise _Refused(
-                    f"the instruction file {spelling} passes through more than "
-                    f"{MAX_LINK_STEPS} symbolic links at {read.short} (a loop?)"
-                )
-            target = str(answer.content)
-            if not target or target.startswith("/"):
-                raise _Refused(
-                    f"the instruction file {spelling} is a symbolic link to "
-                    f"{target!r}, which is outside the repository"
-                )
-            pending.extendleft(reversed(target.split("/")))
-            continue
-        last = not pending
-        if not last:
-            if not found and mode == _FOLDER_MODE:
-                resolved.append(part)
-                continue
-            absent()
-            return None
-        if not found:
-            if mode is not None:
-                raise _Refused(
-                    f"the instruction file {spelling} is not an ordinary file "
-                    f"at {read.short} (git mode {mode})"
-                )
-            absent()
-            return None
-        if mode not in _ORDINARY_MODES:
-            raise _Refused(
-                f"the instruction file {spelling} is not an ordinary file at "
-                f"{read.short} (git mode {mode})"
-            )
-        return candidate, str(answer.content)
-    raise _Refused(f"the instruction file {spelling} names no file")
+            ) from None
+        return None
+    answer = await read(resolved)
+    return resolved, str(answer.content)
 
 
 async def _binding_document(read: _Reader, spelling: str, path: str) -> str:
-    """The text of one declared binding document, which must be an ordinary file."""
-    answer = await read(path)
-    if answer.found and answer.mode == _LINK_MODE:
-        raise _Refused(
-            f"the project's binding document {spelling} (declared in "
-            f"{BINDING_DOCUMENTS_FIELD}) is a symbolic link at the commit this "
-            f"work starts from ({read.short}); a document the project's builds "
-            f"are held to must be the file itself"
-        )
-    if not answer.found:
-        if answer.mode is not None:
+    """The text of one declared binding document, which must be an ordinary
+    file at exactly that path — no link at any component, as GuardKit checks."""
+    parts = path.split("/")
+    answer = None if ".." in parts else await read(path)
+    if answer is not None and answer.found and answer.mode in _ORDINARY_MODES:
+        return str(answer.content)
+    # Not an ordinary file there: say why, as GuardKit does — a link at any
+    # component first, then nothing there, then some other kind of entry.
+    for index in range(1, len(parts) + 1):
+        prefix_parts = parts[:index]
+        if ".." in prefix_parts:
+            break
+        prefix = "/".join(prefix_parts)
+        step = answer if index == len(parts) else await read(prefix)
+        if step is not None and step.found and step.mode == _LINK_MODE:
             raise _Refused(
                 f"the project's binding document {spelling} (declared in "
-                f"{BINDING_DOCUMENTS_FIELD}) is not an ordinary file at "
-                f"{read.short} (git mode {answer.mode})"
+                f"{BINDING_DOCUMENTS_FIELD}) cannot be used at the commit this "
+                f"work starts from ({read.short}): {prefix} is a symbolic link; "
+                f"a document the project's builds are held to must be the "
+                f"file itself"
             )
+        if step is None or not (step.found or step.mode is not None):
+            break
+    if answer is None or (not answer.found and answer.mode is None):
         raise _Refused(
             f"the project declares {spelling} in {BINDING_DOCUMENTS_FIELD}, but "
             f"there is no such file at the commit this work starts from "
             f"({read.short}). Commit it, or take it off the list, then ask again."
         )
-    if answer.mode not in _ORDINARY_MODES:
-        raise _Refused(
-            f"the project's binding document {spelling} (declared in "
-            f"{BINDING_DOCUMENTS_FIELD}) is not an ordinary file at "
-            f"{read.short} (git mode {answer.mode})"
-        )
-    return str(answer.content)
+    raise _Refused(
+        f"the project's binding document {spelling} (declared in "
+        f"{BINDING_DOCUMENTS_FIELD}) is not an ordinary file at {read.short} "
+        f"(git mode {answer.mode})"
+    )
 
 
 async def read_project_documents_at_commit(
