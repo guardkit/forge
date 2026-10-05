@@ -667,6 +667,10 @@ def _quiet() -> dict[str, Any]:
             "forge-serve-planning": {"pending": 0, "ack_pending": 0},
             "forge-serve": {"pending": 0, "ack_pending": 0},
         },
+        "consumers_after": {
+            "forge-serve-planning": {"pending": 0, "ack_pending": 0},
+            "forge-serve": {"pending": 0, "ack_pending": 0},
+        },
     }
 
 
@@ -710,7 +714,7 @@ def test_a_published_but_undelivered_request_stops_it(estate):
     facts["consumers"]["forge-serve-planning"] = {"pending": 1, "ack_pending": 0}
     result = _check(estate, facts)
     assert result.exit_code == 1
-    assert "forge-serve-planning has 1 pending and 0 awaiting acknowledgement" in result.output
+    assert "forge-serve-planning had 1 pending and 0 awaiting acknowledgement before the ledger read" in result.output
 
 
 def test_a_prepared_request_awaiting_admission_before_its_row_exists_stops_it(estate):
@@ -719,7 +723,7 @@ def test_a_prepared_request_awaiting_admission_before_its_row_exists_stops_it(es
     facts["consumers"]["forge-serve"] = {"pending": 0, "ack_pending": 1}
     result = _check(estate, facts)
     assert result.exit_code == 1
-    assert "forge-serve has 0 pending and 1 awaiting acknowledgement" in result.output
+    assert "forge-serve had 0 pending and 1 awaiting acknowledgement before the ledger read" in result.output
 
 
 def test_an_unreadable_consumer_stops_it(estate):
@@ -832,7 +836,7 @@ class Ledger:
         return _run_the_read_script(self.path)
 
     def judged(self) -> tuple[list[str], list[str]]:
-        facts = {**self.read(), "consumers": QUIET_CONSUMERS}
+        facts = {**self.read(), "consumers": QUIET_CONSUMERS, "consumers_after": QUIET_CONSUMERS}
         return register_repo.judge_drained(facts, CONSUMERS), register_repo.drained_notes(facts)
 
 
@@ -876,13 +880,13 @@ def test_the_read_script_counts_a_real_ledger_and_says_an_unreachable_bus_is_unr
     }
     assert set(facts["consumers"]) == {"forge-serve", "forge-serve-planning"}
     assert all("error" in row for row in facts["consumers"].values())
-    assert len(register_repo.judge_drained(facts, CONSUMERS)) == 8
+    assert len(register_repo.judge_drained(facts, CONSUMERS)) == 10
 
 
 def test_an_empty_real_ledger_is_quiet(tmp_path):
     facts = Ledger(tmp_path / "forge.db").read()
     assert facts["ledger"] == _quiet()["ledger"]
-    assert register_repo.judge_drained({**facts, "consumers": QUIET_CONSUMERS}, CONSUMERS) == []
+    assert register_repo.judge_drained({**facts, "consumers": QUIET_CONSUMERS, "consumers_after": QUIET_CONSUMERS}, CONSUMERS) == []
 
 
 def test_old_interrupted_builds_with_quiet_consumers_are_drained_and_said_for_information(tmp_path):
@@ -1035,7 +1039,7 @@ def test_the_consumers_are_read_before_the_ledger(tmp_path):
         return sqlite3.connect(ledger.path)
 
     _script()["observe"](register_repo.drained_read_spec(), {}, consumers=consumers, connect=connect)
-    assert order == ["consumers", "ledger"]
+    assert order == ["consumers", "ledger", "consumers"]
 
 
 def test_a_request_processed_during_the_consumer_read_is_in_the_ledger_read_after_it(tmp_path):
@@ -1059,6 +1063,76 @@ def test_a_request_processed_during_the_consumer_read_is_in_the_ledger_read_afte
     assert register_repo.judge_drained(facts, CONSUMERS) == [
         "1 item waits in the work queue, which the coordinator's automatic queue would admit within seconds"
     ]
+
+
+class _Bus:
+    """The two durable consumers' counts, as a test moves them."""
+
+    def __init__(self) -> None:
+        self.counts = {name: {"pending": 0, "ack_pending": 0} for name in CONSUMERS}
+        self.reads = 0
+
+    def __call__(self, url, spec, said):
+        self.reads += 1
+        return json.loads(json.dumps(self.counts))
+
+
+def _a_run_finishes_and_publishes_its_build_before_the_snapshot(ledger: Ledger, bus: _Bus):
+    """After the first consumer read and before the snapshot: the planning run
+    goes terminal and its build request is published to the build consumer,
+    whose admission is delayed — so no build row exists yet."""
+
+    def connect():
+        assert bus.reads == 1, "this happens after the first consumer read"
+        ledger.cx.execute("UPDATE planning_runs SET state = 'BUILD_QUEUED' WHERE correlation_id = 'run-1'")
+        ledger.cx.commit()
+        bus.counts["forge-serve"]["pending"] = 1
+        return sqlite3.connect(f"file:{ledger.path}?mode=ro", uri=True)
+
+    return connect
+
+
+def test_a_run_that_publishes_its_build_between_the_first_read_and_the_snapshot_is_not_drained(tmp_path):
+    ledger = Ledger(tmp_path / "forge.db")
+    ledger.plan("FEATURE_PLAN", correlation_id="run-1")
+    bus = _Bus()
+
+    facts = _script()["observe"](
+        register_repo.drained_read_spec(), {}, consumers=bus,
+        connect=_a_run_finishes_and_publishes_its_build_before_the_snapshot(ledger, bus),
+    )
+
+    # The snapshot alone sees nothing in flight: the run is terminal, no build yet.
+    assert facts["ledger"]["planning_runs"] == {} and facts["ledger"]["builds"] == {}
+    assert facts["consumers"] == QUIET_CONSUMERS
+    assert register_repo.judge_drained(facts, CONSUMERS) == [
+        "the bus consumer forge-serve had 1 pending and 0 awaiting acknowledgement after the "
+        "ledger read (a request on its way in)"
+    ]
+
+
+def test_without_the_second_consumer_read_the_same_hand_over_would_be_missed(tmp_path):
+    """The control: skip the second read and the hand-over falls in the gap."""
+    ledger = Ledger(tmp_path / "forge.db")
+    ledger.plan("FEATURE_PLAN", correlation_id="run-1")
+    bus = _Bus()
+
+    facts = _script()["observe"](
+        register_repo.drained_read_spec(), {}, consumers=bus,
+        connect=_a_run_finishes_and_publishes_its_build_before_the_snapshot(ledger, bus),
+        recheck=False,
+    )
+
+    assert bus.reads == 1
+    assert register_repo.judge_drained(facts, CONSUMERS) == []
+
+
+def test_a_missing_second_consumer_read_is_unreadable_not_zero(estate):
+    facts = _quiet()
+    del facts["consumers_after"]
+    result = _check(estate, facts)
+    assert result.exit_code == 1
+    assert "could not be read after the ledger read" in result.output
 
 
 class _NoTransaction:
@@ -1102,7 +1176,7 @@ def test_queue_to_planning_during_the_ledger_read_is_seen_by_the_one_snapshot(tm
         sqlite3.connect(f"file:{ledger.path}?mode=ro", uri=True), spec,
         between=_admit_into_a_planning_run(ledger, "moving"),
     )
-    reasons = register_repo.judge_drained({"ledger": seen, "consumers": QUIET_CONSUMERS}, CONSUMERS)
+    reasons = register_repo.judge_drained({"ledger": seen, "consumers": QUIET_CONSUMERS, "consumers_after": QUIET_CONSUMERS}, CONSUMERS)
     assert reasons and "waits in the work queue" in reasons[0]
     # The move really happened, and a fresh read after it counts the run.
     after = script["read_ledger"](sqlite3.connect(ledger.path), spec)
@@ -1119,7 +1193,7 @@ def test_without_one_snapshot_the_same_move_would_be_missed(tmp_path):
         _NoTransaction(sqlite3.connect(ledger.path)), register_repo.drained_read_spec(),
         between=_admit_into_a_planning_run(ledger, "moving"),
     )
-    assert register_repo.judge_drained({"ledger": seen, "consumers": QUIET_CONSUMERS}, CONSUMERS) == []
+    assert register_repo.judge_drained({"ledger": seen, "consumers": QUIET_CONSUMERS, "consumers_after": QUIET_CONSUMERS}, CONSUMERS) == []
 
 
 def test_a_held_queue_item_says_wait_for_its_antecedent_or_withdraw_it(estate):
