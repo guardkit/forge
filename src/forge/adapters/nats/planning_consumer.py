@@ -28,10 +28,11 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Mapping, Protocol, runtime_checkable
 
 from nats_core.envelope import MessageEnvelope
-from nats_core.events import PlanningQueuedPayload
+from nats_core.events import BuildQueuedPayload, PlanningQueuedPayload
 from pydantic import ValidationError
 
 from forge.planning.failure import fail_run
@@ -43,6 +44,7 @@ from forge.planning.run_store import (
 from forge.planning.states import PlanningState
 from forge.planning.target_repos import (
     refusal_message,
+    resolve_named_or_default,
     resolve_target_repo,
 )
 from forge.planning.work_queue_commands import (
@@ -90,6 +92,12 @@ NAK_REDELIVERY_DELAY_SECONDS: float = 5.0
 #: this forge does not know (2026-09-05 rule 4). The row records the refusal
 #: under this label; the person gets one plain sentence, not this string.
 UNKNOWN_REPO_STAGE_LABEL: str = "planning-intake"
+
+#: Added to a hand-over message's correlation id to make its build's own
+#: (``build: FEAT-XXXX from <branch>``). New for every Slack message, and the
+#: same for a redelivery of that message, so a redelivered hand-over is the
+#: same build request — the build route's duplicate checks see it as one.
+BUILD_HANDOVER_CORRELATION_SUFFIX: str = "-build"
 
 #: Who the durable row and the logs name when the intake — not the chain
 #: driver — ends a run. Keeps a refusal at the door out of the driver's
@@ -223,6 +231,11 @@ class PlanningConsumerDeps:
     on_recorded: Callable[[str], Awaitable[None]] | None = None
     planning_config: Any | None = None
     queue_store: WorkQueueStore | None = None
+    #: ``async (BuildQueuedPayload) -> None`` — publishes a build request on
+    #: ``pipeline.build-queued.{feature_id}`` for a feature handed over with
+    #: ``build: FEAT-XXXX from <branch>`` (register-projects design, 5 October
+    #: 2026, part 3). ``None`` takes no hand-overs: the person is told so.
+    publish_build_queued: Callable[[BuildQueuedPayload], Awaitable[None]] | None = None
 
     #: Whether ``publish_notification`` can be told which conversation to
     #: answer in. Read from the callable once, here, when the consumer is
@@ -449,6 +462,159 @@ async def _handle_with_queue(
 
 
 # ---------------------------------------------------------------------------
+# A feature planned elsewhere, handed over by its branch (register-projects
+# design, 5 October 2026, part 3)
+# ---------------------------------------------------------------------------
+
+
+async def publish_build_request(nats_client: Any, build: BuildQueuedPayload) -> None:
+    """Publish one build request exactly as the planning chain's own trigger does.
+
+    Subject ``pipeline.build-queued.{feature_id}``, a ``build_queued``
+    envelope from ``forge`` carrying the build's correlation id — the bytes
+    the build consumer reads (``pipeline_consumer.handle_message``).
+    """
+    from nats_core.envelope import EventType, MessageEnvelope
+
+    envelope = MessageEnvelope(
+        source_id="forge",
+        event_type=EventType.BUILD_QUEUED,
+        correlation_id=build.correlation_id,
+        payload=build.model_dump(mode="json"),
+    )
+    await nats_client.publish(
+        f"pipeline.build-queued.{build.feature_id}",
+        envelope.model_dump_json().encode("utf-8"),
+    )
+
+
+async def _hand_over_build(
+    msg: _MsgLike,
+    deps: PlanningConsumerDeps,
+    payload: Any,
+    command: Mapping[str, Any],
+) -> None:
+    """Resolve the repository, then hand the feature to the build queue.
+
+    ``build: FEAT-XXXX from <branch>`` arrives as a queue command. The
+    repository is resolved exactly as a sentence's ``target:`` is — the typed
+    name, or the configured default when none was typed — and a name that
+    does not resolve gets the same sentence a planning sentence gets, in this
+    thread, and nothing is published. A resolved one becomes one
+    ``BuildQueuedPayload`` carrying the canonical ``org/name``, the branch,
+    the feature's file, the person and this Slack message as
+    ``parent_request_id``; from there the normal build route checks it,
+    admits it and answers in this same thread. Nothing is said here on
+    success: the build route's answer is the acknowledgement.
+
+    Every outcome is acknowledged, like any queue command: a person can type
+    it again, and a redelivery loop would only repeat itself. No planning run
+    and no queue row is written.
+    """
+    correlation_id = payload.correlation_id
+
+    async def _say(text: str) -> None:
+        await _notify_best_effort(
+            deps, correlation_id, text, parent_request_id=payload.parent_request_id
+        )
+
+    planning = deps.planning_config
+    repo, refusal = resolve_named_or_default(
+        payload.target_repo,
+        dict(getattr(planning, "target_repo_paths", None) or {}),
+        getattr(planning, "default_target_repo", None),
+    )
+    feature_id = str(command.get("feature_id") or "")
+    if repo is None:
+        logger.info(
+            "planning_consumer: build hand-over of %s from correlation_id=%s "
+            "named repository %r, which does not resolve; answered, nothing "
+            "published",
+            feature_id,
+            correlation_id,
+            payload.target_repo,
+        )
+        await _say(refusal or "No repository could be found for this build.")
+        await msg.ack()
+        return
+
+    branch = str(command.get("branch") or "")
+    try:
+        build = BuildQueuedPayload(
+            feature_id=feature_id,
+            repo=repo,
+            branch=branch,
+            feature_yaml_path=f".guardkit/features/{feature_id}.yaml",
+            # The person came through jarvis's Slack adapter: the same
+            # provenance the build consumer's originator allowlist reads.
+            triggered_by=payload.triggered_by,
+            originating_adapter=payload.originating_adapter,
+            originating_user=payload.originating_user,
+            correlation_id=f"{correlation_id}{BUILD_HANDOVER_CORRELATION_SUFFIX}",
+            parent_request_id=payload.parent_request_id,
+            requested_at=payload.requested_at,
+            queued_at=datetime.now(timezone.utc),
+        )
+    except ValidationError as exc:
+        logger.warning(
+            "planning_consumer: build hand-over from correlation_id=%s could "
+            "not be made into a build request (%d errors); answered, nothing "
+            "published",
+            correlation_id,
+            len(exc.errors()),
+        )
+        await _say(
+            "That build could not be read, so nothing was started. "
+            "Type it as build: FEAT-XXXX from <branch>."
+        )
+        await msg.ack()
+        return
+
+    if deps.publish_build_queued is None:
+        logger.error(
+            "planning_consumer: build hand-over of %s from correlation_id=%s "
+            "but no build-queue publisher is wired; answered, nothing published",
+            feature_id,
+            correlation_id,
+        )
+        await _say(
+            f"{feature_id} was not started: this factory cannot take a build "
+            "handed over from here."
+        )
+        await msg.ack()
+        return
+
+    try:
+        await deps.publish_build_queued(build)
+    except Exception as exc:  # noqa: BLE001 — told, never wedged
+        logger.warning(
+            "planning_consumer: build hand-over of %s from correlation_id=%s "
+            "could not be published (%s: %s); answered",
+            feature_id,
+            correlation_id,
+            type(exc).__name__,
+            exc,
+        )
+        await _say(
+            f"{feature_id} was not started: it could not be handed to the "
+            "build queue. Please type it again in a few minutes."
+        )
+        await msg.ack()
+        return
+
+    logger.info(
+        "planning_consumer: build hand-over of %s for %s from %s published "
+        "(correlation_id=%s, from correlation_id=%s)",
+        feature_id,
+        repo,
+        branch,
+        build.correlation_id,
+        correlation_id,
+    )
+    await msg.ack()
+
+
+# ---------------------------------------------------------------------------
 # Correlation ID validation
 # ---------------------------------------------------------------------------
 
@@ -490,6 +656,10 @@ async def handle_planning_message(msg: _MsgLike, deps: PlanningConsumerDeps) -> 
        No store write, no wedge.
     2. *Invalid correlation_id* → ack + log rejection (RT-03).
        No store write, no wedge.
+    2a. *A ``build`` queue command* (``build: FEAT-XXXX from <branch>``) →
+       the repository is resolved (typed name or default); an unresolvable
+       one is answered in the thread, a resolved one is published as one
+       ``BuildQueuedPayload``; acked either way, no run and no queue row.
     2b. *A queue is wired in and the repository resolved* → the message goes
        to the queue: a sentence becomes one QUEUED ``work_queue`` row and no
        planning run; a forwarded ``queue_command`` is executed and answered
@@ -552,6 +722,16 @@ async def handle_planning_message(msg: _MsgLike, deps: PlanningConsumerDeps) -> 
             "correlation_id=%s; accepting with log",
             correlation_id,
         )
+
+    # --- 3a. A feature planned elsewhere, handed over by branch ----------
+    # ``build: FEAT-XXXX from <branch>`` resolves its repository and goes to
+    # the build queue. It writes no planning run and no queue row, so it is
+    # taken here, before either path below — an unknown name is answered in
+    # the thread exactly as a sentence's is, but no planning run is failed.
+    command = _queue_command_from(payload)
+    if command is not None and command.get("verb") == "build":
+        await _hand_over_build(msg, deps, payload, command)
+        return
 
     # --- 3b. Resolve the repository the sentence named (rule 3) ----------
     # Done BEFORE the row is written so the row carries the CONFIGURATION KEY
@@ -717,6 +897,7 @@ async def handle_planning_message(msg: _MsgLike, deps: PlanningConsumerDeps) -> 
 
 
 __all__ = [
+    "BUILD_HANDOVER_CORRELATION_SUFFIX",
     "CORRELATION_ID_PATTERN",
     "INTAKE_ACTOR",
     "create_and_start_planning_run",
@@ -726,5 +907,6 @@ __all__ = [
     "PLANNING_QUEUED_SUBJECT_FILTER",
     "PlanningConsumerDeps",
     "handle_planning_message",
+    "publish_build_request",
     "_is_valid_correlation_id",  # Exported for testing
 ]
