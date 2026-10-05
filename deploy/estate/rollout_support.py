@@ -34,6 +34,10 @@ RUNTIME = 'sha256:1eaa3360b280cadebb308363aa2bfae06ddb852b25b1b8c7cd603cfa62ec03
 UNIT_ROLES = {'gateway', 'frontdoor', 'watchdog_timer', 'watchdog_service', 'autobuild', 'runner', 'keeper', 'langgraph_sidecar', 'deploy_sidecar'}
 VOLUME_ROLES = {'ledger', 'settings', 'evidence', 'threads', 'relay_progress'}
 PUBLISHER_RUNTIME = 'sha256:dd5281444ec7fbe6f13473331c693383d458819b72789a85815305471a0a604b'
+# The ledger schema version this helper knows. Rich, 4 October 2026: "Teach it
+# version 17" (17 adds the builds.source_commit column and no table). Every
+# check below uses this one constant.
+LEDGER_SCHEMA_VERSION = 17
 WORK_TABLES = {'builds': 1, 'planning_runs': 3, 'work_queue': 10, 'publication_records': 15, 'deployment_targets': 16}
 
 # Temporary-folder names an estate env file may set for the sandbox (TMPDIR is
@@ -105,7 +109,7 @@ def ledger_state(p, *, consolidated=False):
         if 'schema_version' not in tables:
             refuse(f'ledger {p} has no recorded schema; select the authoritative Forge ledger')
         version = db.execute('SELECT max(version) FROM schema_version').fetchone()[0]
-        if type(version) is not int or not 1 <= version <= 16:
+        if type(version) is not int or not 1 <= version <= LEDGER_SCHEMA_VERSION:
             refuse(f'ledger {p} has an unsupported schema; select a release that knows this schema')
         counts = {}
         for name in tables:
@@ -175,12 +179,15 @@ module_path=pathlib.Path(canonical.__file__).parents[1]/'lifecycle_bridge'/'coex
 spec=importlib.util.spec_from_file_location('rollout_boot_coexistence',module_path)
 coexistence=importlib.util.module_from_spec(spec);sys.modules[spec.name]=coexistence;spec.loader.exec_module(coexistence)
 c=connect_writer(pathlib.Path('/copy/forge.db'))
-assert apply_at_boot(c)==16
+assert apply_at_boot(c)==__LEDGER_SCHEMA_VERSION__
 coexistence.apply_migration(c)
 lifecycle_bridge_registry.apply(c)
 c.execute('PRAGMA wal_checkpoint(TRUNCATE)');c.close()
 assert not any(n=='nats' or n.startswith('nats.') or n=='nats_core.client' for n in sys.modules)
 '''
+BOOT_SQLITE_CODE = BOOT_SQLITE_CODE.replace(
+    '__LEDGER_SCHEMA_VERSION__', str(LEDGER_SCHEMA_VERSION)
+)
 
 
 def verify_snapshot(directory):
@@ -458,7 +465,7 @@ def validate_receipt(c, metadata, receipt, sources=None):
     mark = receipt['mark']
     expected_mark = {'format_version': 1, 'snapshot_sha256': metadata['sha256'],
         'snapshot_created_at': metadata['created_at'], 'migrated_sha256': receipt['migrated_sha256'],
-        'source_schema_version': metadata['schema_version'], 'loaded_schema_version': 16,
+        'source_schema_version': metadata['schema_version'], 'loaded_schema_version': LEDGER_SCHEMA_VERSION,
         'loaded_logical_sha256': receipt['loaded_logical_sha256'], 'startup_logical_sha256': receipt['startup_logical_sha256']}
     if (type(receipt['format_version']) is not int or receipt['format_version'] != 1 or receipt['project'] != c['project']
             or receipt['snapshot_sha256'] != metadata['sha256'] or receipt['runtime_image'] != c['runtime_image']
@@ -513,7 +520,7 @@ def verify_loaded(c, receipt, model):
                 [f'type=volume,src={name},dst=/destination,readonly']))
         except Refusal:
             refuse(f'volume {name} has unreadable data or incorrect ownership and modes; reconcile it before retrying')
-        if role == 'ledger' and actual != {'sha256': receipt['migrated_sha256'], 'schema_version': 16, 'mark': receipt['mark']}:
+        if role == 'ledger' and actual != {'sha256': receipt['migrated_sha256'], 'schema_version': LEDGER_SCHEMA_VERSION, 'mark': receipt['mark']}:
             refuse(f'volume {name} ledger or snapshot mark differs; reconcile it before retrying')
 
 
@@ -565,7 +572,7 @@ def verify_derivation(c, directory, receipt, plan=False):
         refuse('retained migrated artifact has incorrect ownership or permissions; reconcile its private original copy')
     if sha256(artifact) != receipt['migrated_sha256']:
         refuse('retained migrated artifact differs from the recorded loaded bytes; reconcile the original migration evidence')
-    if ledger_state(artifact, consolidated=True)['schema_version'] != 16:
+    if ledger_state(artifact, consolidated=True)['schema_version'] != LEDGER_SCHEMA_VERSION:
         refuse('retained migrated artifact has the wrong schema; reconcile the original migration evidence')
     loaded = consolidated_logical_digest(artifact)
     if loaded != receipt['loaded_logical_sha256']:
@@ -745,7 +752,7 @@ print(json.dumps({'main_sha256':main_sha,'logical_sha256':logical,'schema_versio
         except Refusal:
             refuse(f'{service} cannot read its actual ledger and snapshot mark as its configured user; fix access before verifying')
         actual = json.loads(text)
-        if actual.get('schema_version') != 16 or actual.get('mark') != mark:
+        if actual.get('schema_version') != LEDGER_SCHEMA_VERSION or actual.get('mark') != mark:
             refuse(f'{service} reads a different ledger or snapshot mark; keep the door closed and reconcile its state')
         reconciled = None
         if actual.get('logical_sha256') not in {receipt['loaded_logical_sha256'], receipt['startup_logical_sha256']}:
@@ -820,7 +827,7 @@ def load_volumes(c, directory, plan=False, verify=False):
         except Refusal:
             refuse(f'migration of a disposable copy from {directory} failed; keep services stopped and reconcile the source schema before retrying')
         migrated = ledger_state(ledger, consolidated=True)
-        if migrated['schema_version'] != 16: refuse('disposable migration did not reach schema 16; repair the selected runtime before retrying')
+        if migrated['schema_version'] != LEDGER_SCHEMA_VERSION: refuse(f'disposable migration did not reach schema {LEDGER_SCHEMA_VERSION}; repair the selected runtime before retrying')
         if sha256(directory / 'forge.db') != metadata['sha256']: refuse('snapshot changed during disposable migration; stop and recover the original snapshot')
         loaded_logical = consolidated_logical_digest(ledger)
         startup_copy = temp / 'startup'; startup_copy.mkdir()
@@ -832,7 +839,7 @@ def load_volumes(c, directory, plan=False, verify=False):
         ledger_state(startup_copy / 'forge.db', consolidated=True)
         startup_logical = consolidated_logical_digest(startup_copy / 'forge.db')
         mark = {'format_version': 1, 'snapshot_sha256': metadata['sha256'], 'snapshot_created_at': metadata['created_at'],
-                'migrated_sha256': sha256(ledger), 'source_schema_version': metadata['schema_version'], 'loaded_schema_version': 16,
+                'migrated_sha256': sha256(ledger), 'source_schema_version': metadata['schema_version'], 'loaded_schema_version': LEDGER_SCHEMA_VERSION,
                 'loaded_logical_sha256': loaded_logical, 'startup_logical_sha256': startup_logical}
         atomic_json(temp / 'ledger' / MARK, mark)
         shutil.copyfile(sources['settings'], temp / 'settings' / 'forge.yaml')

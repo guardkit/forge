@@ -49,7 +49,7 @@ def packaged_boot_transport(monkeypatch):
         return child.stdout
     monkeypatch.setattr(r,'container_python',execute)
 
-def seed(path, version=16, build=False):
+def seed(path, version=r.LEDGER_SCHEMA_VERSION, build=False):
     db = connect_writer(path)
     original = migrations._MIGRATIONS
     try:
@@ -85,7 +85,7 @@ def setup(tmp_path):
     destination = root/'20260927T081500Z'
     return c,destination
 
-def snapshot_fixture(c,destination, version=16):
+def snapshot_fixture(c,destination, version=r.LEDGER_SCHEMA_VERSION):
     destination.mkdir()
     seed(destination/'forge.db', version=version)
     r.atomic_json(destination/'previous-runtime.json',{'format_version':1,'env_names':['SECRET_NAME']})
@@ -98,7 +98,7 @@ def snapshot_fixture(c,destination, version=16):
 def test_real_writer_state_contains_required_fields_without_build_payload(setup):
     c,_=setup
     state=r.ledger_state(c['source_db'])
-    assert state['schema_version']==16
+    assert state['schema_version']==r.LEDGER_SCHEMA_VERSION
     row=state['work_state']['builds']['rows'][0]
     assert row['status']=='QUEUED' and row['completed_at'] is None
     assert 'feature_yaml_path' not in row and 'repo' not in row
@@ -112,7 +112,7 @@ def test_real_older_schema_absence_is_not_zero(tmp_path,version):
 
 def test_hash_or_runtime_tamper_refuses(setup):
     c,d=setup; snapshot_fixture(c,d)
-    assert r.verify_snapshot(d)['schema_version']==16
+    assert r.verify_snapshot(d)['schema_version']==r.LEDGER_SCHEMA_VERSION
     (d/'previous-runtime.json').write_text('{}')
     with pytest.raises(r.Refusal,match='runtime record'): r.verify_snapshot(d)
 
@@ -382,7 +382,7 @@ def receipt_fixture(c,d,meta):
     startup=r.consolidated_logical_digest(boot);boot.unlink()
     r.retain_migrated_artifact(d,d/'forge.db')
     mark={'format_version':1,'snapshot_sha256':meta['sha256'],'snapshot_created_at':meta['created_at'],
-          'migrated_sha256':migrated,'source_schema_version':meta['schema_version'],'loaded_schema_version':16,
+          'migrated_sha256':migrated,'source_schema_version':meta['schema_version'],'loaded_schema_version':r.LEDGER_SCHEMA_VERSION,
           'loaded_logical_sha256':r.consolidated_logical_digest(d/'forge.db'),'startup_logical_sha256':startup}
     staging=d/'loaded-ledger';staging.mkdir()
     shutil.copyfile(d/'forge.db',staging/'forge.db');r.atomic_json(staging/r.MARK,mark)
@@ -671,3 +671,10 @@ def test_early_invalidation_refuses_hard_linked_malformed_object(setup,tmp_path)
     with pytest.raises(r.Refusal,match='hard link'):r.invalidate_verification(d)
     assert other.read_bytes()==receipt.read_bytes()==original
     assert other.stat().st_ino==receipt.stat().st_ino
+
+
+def test_a_ledger_at_the_previous_schema_is_still_accepted(tmp_path):
+    """A ledger written before schema 17 (\"Teach it version 17\") is still read."""
+    state=r.ledger_state(seed(tmp_path/'previous.db',16))
+    assert state['schema_version']==16
+    assert r.LEDGER_SCHEMA_VERSION==17
