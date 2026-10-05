@@ -28,7 +28,6 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Mapping, Protocol, runtime_checkable
 
 from nats_core.envelope import MessageEnvelope
@@ -553,7 +552,10 @@ async def _hand_over_build(
             correlation_id=f"{correlation_id}{BUILD_HANDOVER_CORRELATION_SUFFIX}",
             parent_request_id=payload.parent_request_id,
             requested_at=payload.requested_at,
-            queued_at=datetime.now(timezone.utc),
+            # Jarvis stamps the message once and a redelivery keeps it, so the
+            # build's id (derived from feature and queued_at) is the same for a
+            # redelivered hand-over, like its correlation id.
+            queued_at=payload.queued_at,
         )
     except ValidationError as exc:
         logger.warning(

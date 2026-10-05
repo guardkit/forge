@@ -46,6 +46,7 @@ USER = "U-RICH"
 THREAD = "1759660000.000300"
 FEATURE = "FEAT-1A2B"
 BRANCH = "prepared/FEAT-1A2B"
+QUEUED_AT = datetime(2026, 10, 5, 15, 0, 1, tzinfo=timezone.utc)
 
 PATHS = {
     "guardkit/api_test": "/var/lib/forge/projects/api_test",
@@ -110,7 +111,7 @@ def _msg(
         "parent_request_id": parent_request_id,
         "retry_count": 0,
         "requested_at": datetime(2026, 10, 5, 15, 0, tzinfo=timezone.utc).isoformat(),
-        "queued_at": datetime.now(timezone.utc).isoformat(),
+        "queued_at": QUEUED_AT.isoformat(),
         "queue_command": command
         or {"verb": "build", "feature_id": FEATURE, "branch": BRANCH},
     }
@@ -201,6 +202,15 @@ class TestAResolvedTargetPublishesOneBuildRequest:
         await handle_planning_message(_msg(correlation_id="plan-handover-0002"), deps)
         ids = [b.correlation_id for b in publish.builds]
         assert ids[0] == ids[1] != ids[2]
+        # The build id is derived from the feature and queued_at, so a
+        # redelivery names the same build: queued_at is the message's own.
+        from forge.lifecycle.identifiers import derive_build_id
+
+        first, again = publish.builds[0], publish.builds[1]
+        assert first.queued_at == again.queued_at == QUEUED_AT
+        assert derive_build_id(FEATURE, first.queued_at) == derive_build_id(
+            FEATURE, again.queued_at
+        )
 
     @pytest.mark.asyncio
     async def test_the_published_bytes_are_what_the_build_consumer_reads(self) -> None:
