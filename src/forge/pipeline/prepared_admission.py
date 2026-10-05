@@ -310,6 +310,20 @@ def relative_markdown_links(text: str) -> list[str]:
     return found
 
 
+def _yaml_path(raw: str) -> str | None:
+    """A path the feature YAML names (a task's ``file_path``, a spec file), or
+    ``None`` when it is absolute or leaves the repository (Codex review round
+    1, R3). Never rewritten into something else: an absolute path is refused,
+    not read as relative; ``.`` and ``..`` are resolved textually and any
+    ``..`` still left means outside."""
+    if raw.startswith("/") or raw.startswith("\\"):
+        return None
+    normal = posixpath.normpath(raw)
+    if normal in ("", ".") or normal == ".." or normal.startswith("../"):
+        return None
+    return normal
+
+
 def _resolve_link(from_file: str, target: str) -> str | None:
     """The repository path ``target`` names from ``from_file``, or None if outside."""
     if target.startswith("/"):
@@ -422,9 +436,13 @@ async def check_supplied_bundle(
             return f"the prepared feature cannot be built: task {index + 1} in {yaml_path} has no id"
         if not isinstance(file_path, str) or not file_path.strip():
             return f"the prepared feature cannot be built: task {task_id} in {yaml_path} names no task file"
-        normal = _resolve_link("", file_path.strip())
+        normal = _yaml_path(file_path.strip())
         if normal is None:
-            return f"the prepared feature cannot be built: task {task_id}'s file {file_path} is outside the repository"
+            return (
+                f"the prepared feature cannot be built: task {task_id}'s file "
+                f"{file_path} is not a path inside the repository (an absolute "
+                f"path, or one that leaves it)"
+            )
         task_ids.append(task_id)
         task_files.append(normal)
     texts: dict[str, str] = {}
@@ -452,9 +470,13 @@ async def check_supplied_bundle(
     for raw in feature_files:
         if not isinstance(raw, str) or not raw.strip():
             continue
-        normal = _resolve_link("", raw.strip())
+        normal = _yaml_path(raw.strip())
         if normal is None:
-            return f"the prepared feature cannot be built: the spec file {raw} is outside the repository"
+            return (
+                f"the prepared feature cannot be built: the spec file {raw} is "
+                f"not a path inside the repository (an absolute path, or one "
+                f"that leaves it)"
+            )
         content, why = await _read(runner, repo_path, commit, normal)
         if why:
             return _cannot(why)

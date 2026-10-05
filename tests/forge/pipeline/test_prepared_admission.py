@@ -708,6 +708,46 @@ async def test_a_bundle_file_reached_through_a_linked_folder_is_refused(
     assert "reached through qa, a symbolic link" in (answer.refusal or "")
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "file_path",
+    [f"/{TASK_DIR}/{TASKS[0]}-do-the-thing.md", "../other/TASK.md"],
+    ids=["absolute", "escaping"],
+)
+async def test_a_task_file_path_outside_the_repository_is_refused_not_rewritten(
+    project: Project, runner: WorktreeGitRunner, file_path: str
+) -> None:
+    files = bundle()
+    plan_path = f".guardkit/features/{FEATURE}.yaml"
+    files[plan_path] = files[plan_path].replace(
+        f'"{TASK_DIR}/{TASKS[0]}-do-the-thing.md"', f'"{file_path}"', 1
+    )
+    project.commit_on(BRANCH, files)
+
+    answer = await _admit(project, runner)
+
+    assert not answer.ok
+    assert file_path in (answer.refusal or "")
+    assert "not a path inside the repository" in (answer.refusal or "")
+
+
+@pytest.mark.asyncio
+async def test_an_absolute_spec_file_path_is_refused(
+    project: Project, runner: WorktreeGitRunner
+) -> None:
+    files = bundle()
+    plan_path = f".guardkit/features/{FEATURE}.yaml"
+    files[plan_path] = files[plan_path].replace(
+        f'"{SPEC_DIR}/{SPEC_NAME}.feature"', f'"/{SPEC_DIR}/{SPEC_NAME}.feature"'
+    )
+    project.commit_on(BRANCH, files)
+
+    answer = await _admit(project, runner)
+
+    assert not answer.ok
+    assert "not a path inside the repository" in (answer.refusal or "")
+
+
 # ---------------------------------------------------------------------------
 # The two text rules, directly
 # ---------------------------------------------------------------------------
