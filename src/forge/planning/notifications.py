@@ -27,6 +27,7 @@ __all__ = [
     "build_planning_notification_envelope",
     "build_refused_reply",
     "build_started_reply",
+    "gate_ended_reason",
     "make_build_thread_reply",
 ]
 
@@ -147,6 +148,16 @@ def build_refused_reply(feature_id: str, reason: str) -> str:
     """The one sentence a refused build request is answered with."""
     reason = str(reason).strip().rstrip(".") or "no reason was given"
     return f"{feature_id} was not started: {reason}."
+
+
+def gate_ended_reason(outcome: Any) -> str:
+    """Why a build-start card ended a build, in plain words."""
+    value = str(getattr(outcome, "value", outcome))
+    if value == "CANCELLED":
+        return "the build-start card was declined"
+    if value == "TIMED_OUT":
+        return "the build-start card timed out"
+    return "the build-start check stopped it"
 
 
 def build_started_reply(

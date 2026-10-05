@@ -62,6 +62,13 @@ from forge.lifecycle.state_machine import (
     transition_chain,
 )
 from forge.pipeline import BuildContext
+from forge.planning.notifications import (
+    BuildThreadReply,
+    answer_build_thread,
+    build_refused_reply,
+    build_started_reply,
+    gate_ended_reason,
+)
 from forge.pipeline.merge_offer import (
     approval_subject_for,
     card_line_about_the_after_deploy_check,
@@ -1020,6 +1027,7 @@ async def rearm_paused_gates(
     client: Any,
     clock: Callable[[], datetime],
     forge_config: Any = None,
+    reply_in_thread: BuildThreadReply | None = None,
 ) -> list["asyncio.Task[Any]"]:
     """Re-arm every PAUSED build's approval round-trip after a daemon restart.
 
@@ -1070,6 +1078,13 @@ async def rearm_paused_gates(
             :class:`_ArmSignallingClient` so the re-emit waits for a live
             subscription.
         clock: Injected ``() -> datetime`` (UTC). Clock hygiene.
+        reply_in_thread: The build route's thread answer
+            (``forge.planning.notifications.make_build_thread_reply``). A
+            build handed over from Slack and waiting at its build-start card
+            when the forge stopped is answered from its persisted row
+            (``parent_request_id``, ``originating_adapter``) once its card is
+            decided here: "Building …" after the launch, or the declined /
+            timed-out / stopped line. ``None`` answers nothing.
 
     Returns:
         The list of per-build background tasks (one per re-armed PAUSED build).
@@ -1239,6 +1254,8 @@ async def rearm_paused_gates(
                     # resumed builds of one repository would share one folder.
                     branch=getattr(build_row, "branch", None),
                     sqlite_pool=sqlite_pool,
+                    build_row=build_row,
+                    reply_in_thread=reply_in_thread,
                 ),
                 name=f"rearm-gate-{snap.build_id}",
             )
@@ -1310,6 +1327,8 @@ async def _rearm_dispatch(
     repo: str | None = None,
     branch: str | None = None,
     sqlite_pool: Any = None,
+    build_row: Any = None,
+    reply_in_thread: BuildThreadReply | None = None,
 ) -> "GateOutcome":
     """Await the re-armed decision and launch on approve.
 
@@ -1331,7 +1350,21 @@ async def _rearm_dispatch(
     3 October 2026): with it the runner cuts the resumed build its own
     worktree, as it does for a fresh dispatch, instead of running it in the
     repository's shared checkout.
+
+    ``build_row`` and ``reply_in_thread`` answer a Slack hand-over that was
+    waiting at its build-start card when the forge stopped, in the thread it
+    came from (the row's persisted ``parent_request_id`` and
+    ``originating_adapter``): "Building …" once the launch has gone out, or
+    the declined / timed-out / stopped line on a terminal outcome. Each
+    outcome is decided once — afterwards the row is no longer PAUSED, so no
+    later boot re-arms it — and so is answered once. The answer follows the
+    launch or the state change; nothing about acknowledgement changes.
     """
+    answers = (
+        reply_in_thread is not None
+        and build_row is not None
+        and snap.stage_label == _GATE_STAGE_LABEL
+    )
     outcome, _decision = await await_and_dispatch(
         deps=deps,
         build_id=snap.build_id,
@@ -1358,6 +1391,7 @@ async def _rearm_dispatch(
                 branch=branch,
             )
 
+        launched = True
         if sqlite_pool is None:
             await _launch()
         else:
@@ -1368,6 +1402,7 @@ async def _rearm_dispatch(
             if not await launch_replacing_recorded_run(
                 sqlite_pool, snap.build_id, _launch
             ):
+                launched = False
                 # Nothing launched and the earlier run's identity is kept: the
                 # build is picked up again by the next boot's recovery.
                 logger.error(
@@ -1375,4 +1410,22 @@ async def _rearm_dispatch(
                     "relaunched; held for the next boot's recovery",
                     snap.build_id,
                 )
+        if answers and launched:
+            await answer_build_thread(
+                reply_in_thread,
+                build_row,
+                build_started_reply(
+                    str(build_row.feature_id),
+                    str(build_row.repo),
+                    str(build_row.branch),
+                    getattr(build_row, "source_commit", None),
+                ),
+            )
+    elif answers:
+        await answer_build_thread(
+            reply_in_thread,
+            build_row,
+            build_refused_reply(str(build_row.feature_id), gate_ended_reason(outcome)),
+            level="warning",
+        )
     return outcome
