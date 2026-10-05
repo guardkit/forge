@@ -475,6 +475,10 @@ def test_a_crlf_settings_file_keeps_its_bytes_in_the_backup_and_staged_copy(esta
     staged = estate.volume[f"forge.yaml.{LEAF}-pending"]
     for line in estate.volume["forge.yaml"].split("\n"):
         assert line in staged.split("\n")
+    # Every line, the inserted ones included, ends the file's own way.
+    assert staged.count("\n") == staged.count("\r\n")
+    assert f"    {KEY}: {COORDINATOR_PATH}\r\n" in staged
+    assert yaml.safe_load(staged)["planning"]["target_repo_paths"][KEY] == COORDINATOR_PATH
 
 
 def test_re_running_changes_nothing(estate, publisher_file):
@@ -1190,3 +1194,11 @@ def test_a_bad_address_is_refused_without_echoing_it(estate, address, said):
     assert said in result.output
     assert "tok3n-value" not in result.output
     assert estate.calls == []
+
+
+def test_a_file_mixing_line_endings_is_edited_as_it_stands():
+    mixed = SANDBOX_YAML.replace("planning:\n", "planning:\r\n", 1)
+    edit = register_repo.plan_settings_edit(mixed, which="sandbox", key=KEY, path=CLONE_PATH)
+    assert edit.staged is not None
+    assert edit.staged.count("\r\n") == 1
+    assert "planning:\r\n" in edit.staged
