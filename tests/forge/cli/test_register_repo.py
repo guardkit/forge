@@ -553,6 +553,23 @@ def test_the_sequence_closes_intake_before_the_drained_check_and_restarts_nothin
         assert "compose" not in call and "restart" not in call and "stop" not in call
 
 
+def test_the_swap_is_one_command_that_checks_all_three_files_before_copying_any(estate, publisher_file):
+    lines = _lines(_run("--publish", "--publisher-settings", str(publisher_file)))
+    start = next(i for i, l in enumerate(lines) if l.startswith("(d)")) + 1
+    end = next(i for i, l in enumerate(lines) if l.startswith("(e)"))
+    chain = lines[start:end]
+    assert len(chain) == 6
+    assert all(l.rstrip().endswith("\\") for l in chain[:-1]) and not chain[-1].rstrip().endswith("\\")
+    assert all(l.lstrip().startswith("&&") for l in chain[1:])
+    kinds = ["cmp" if " cmp " in f" {l} " else "cp" for l in chain]
+    assert kinds == ["cmp", "cmp", "cmp", "cp", "cp", "cp"]
+
+
+def test_the_drained_step_says_to_rely_on_the_exit_status(estate):
+    output = _run().output
+    assert "rely on the exit status" in output
+
+
 def test_the_sequence_names_the_check_the_services_check_and_the_coordinator_log(estate):
     result = _run()
     assert "estate-check" in result.output and " services" in result.output
