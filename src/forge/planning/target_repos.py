@@ -28,7 +28,9 @@ __all__ = [
     "ambiguous_repo_message",
     "format_known_repos",
     "known_repo_names",
+    "no_default_repo_message",
     "refusal_message",
+    "resolve_named_or_default",
     "resolve_target_repo",
     "unknown_repo_message",
 ]
@@ -157,3 +159,36 @@ def resolve_target_repo(
         ),
         matches=tuple(matches),
     )
+
+
+def no_default_repo_message(target_repo_paths: Mapping[str, str]) -> str:
+    """What a person is told when they named no repository and there is no default."""
+    return (
+        "No repository was named and this factory has no default one. "
+        "Put a target: line first, naming one of: "
+        f"{format_known_repos(target_repo_paths)}."
+    )
+
+
+def resolve_named_or_default(
+    name: str | None,
+    target_repo_paths: Mapping[str, str],
+    default_target_repo: str | None,
+) -> tuple[str | None, str | None]:
+    """``(configuration key, None)``, or ``(None, the sentence to say)``.
+
+    A typed name resolves exactly as a sentence's ``target:`` does
+    (:func:`resolve_target_repo`, with the same unknown and ambiguous
+    sentences). No name means the configured default, which the planning
+    driver also uses, and which must itself be a configured repository.
+    """
+    if name:
+        resolution = resolve_target_repo(name, target_repo_paths)
+        if resolution.name is None:
+            return None, refusal_message(name, resolution, target_repo_paths)
+        return resolution.name, None
+    if not default_target_repo:
+        return None, no_default_repo_message(target_repo_paths)
+    if default_target_repo not in target_repo_paths:
+        return None, unknown_repo_message(default_target_repo, target_repo_paths)
+    return default_target_repo, None

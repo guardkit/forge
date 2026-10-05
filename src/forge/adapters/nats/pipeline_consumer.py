@@ -66,6 +66,11 @@ from forge.pipeline.build_ack_handle import (
     InFlightAckRegistry,
     make_msg_ack_handle,
 )
+from forge.planning.notifications import (
+    BuildThreadReply,
+    answer_build_thread,
+    build_refused_reply,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -223,6 +228,13 @@ class PipelineConsumerDeps:
     # row, so a row waiting "after" it is asked "hold or go" instead of
     # waiting for ever. ``None`` notes nothing, as before.
     record_build_rejection: Callable[[str, str], Any] | None = None
+    # The answer in the thread a build was handed over from (register-projects
+    # design, 5 October 2026, part 3) — ``forge.planning.notifications.
+    # make_build_thread_reply`` in production. Called once on every refusal
+    # below, after the refusal's own acknowledgement and ``build-failed``; a
+    # request without ``parent_request_id`` is never answered. ``None``
+    # answers nothing, as before.
+    reply_in_thread: BuildThreadReply | None = None
 
 
 def note_build_rejection(
@@ -583,6 +595,15 @@ async def handle_message(msg: _MsgLike, deps: PipelineConsumerDeps) -> None:
             payload.feature_id,
             correlation_id=envelope.correlation_id,
         )
+        await answer_build_thread(
+            deps.reply_in_thread,
+            payload,
+            build_refused_reply(
+                payload.feature_id,
+                f"it was sent by {originator}, which is not approved to start builds",
+            ),
+            level="warning",
+        )
         return
 
     # --- 3. The one feature file, then the path allowlist ----------------
@@ -616,6 +637,14 @@ async def handle_message(msg: _MsgLike, deps: PipelineConsumerDeps) -> None:
             payload.feature_id,
             correlation_id=envelope.correlation_id,
         )
+        # The unknown or unregistered repository lands here, as does a
+        # feature file that is not the one a build reads.
+        await answer_build_thread(
+            deps.reply_in_thread,
+            payload,
+            build_refused_reply(payload.feature_id, reason),
+            level="warning",
+        )
         return
     allowlist = deps.forge_config.permissions.filesystem.allowlist
     if not _path_inside_allowlist(feature_yaml_path, allowlist):
@@ -625,11 +654,14 @@ async def handle_message(msg: _MsgLike, deps: PipelineConsumerDeps) -> None:
             payload.feature_yaml_path,
             payload.feature_id,
         )
+        outside = (
+            f"its feature file {feature_yaml_path} is outside the "
+            "folders builds may read"
+        )
         if not note_build_rejection(
             deps.record_build_rejection,
             payload.correlation_id,
-            f"its feature file {feature_yaml_path} is outside the "
-            "folders builds may read",
+            outside,
         ):
             return
         await msg.ack()
@@ -642,6 +674,12 @@ async def handle_message(msg: _MsgLike, deps: PipelineConsumerDeps) -> None:
             ),
             payload.feature_id,
             correlation_id=envelope.correlation_id,
+        )
+        await answer_build_thread(
+            deps.reply_in_thread,
+            payload,
+            build_refused_reply(payload.feature_id, outside),
+            level="warning",
         )
         return
 
@@ -780,6 +818,17 @@ async def handle_message(msg: _MsgLike, deps: PipelineConsumerDeps) -> None:
                 ack_exc,
                 payload.feature_id,
             )
+        await answer_build_thread(
+            deps.reply_in_thread,
+            payload,
+            # Plain words in the thread; the exception itself is logged above.
+            build_refused_reply(
+                payload.feature_id,
+                "the factory hit an error while starting it; the details are "
+                "in the factory's log",
+            ),
+            level="warning",
+        )
 
 
 def _build_ack_callback(msg: _MsgLike) -> AckCallback:

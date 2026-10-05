@@ -21,6 +21,7 @@ from typing import Any, Awaitable, Callable
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "had_recorded_launch",
     "interrupt_recorded_run",
     "launch_replacing_recorded_run",
     "runner_url_for_repo",
@@ -62,6 +63,27 @@ def _recorded(sqlite_pool: Any, build_id: str) -> tuple[str | None, str | None]:
     if row is None:
         return None, None
     return (str(row[0]) if row[0] else None), (str(row[1]) if row[1] else None)
+
+
+def had_recorded_launch(sqlite_pool: Any, build_id: str) -> bool:
+    """Whether the ledger recorded a launch (an ``async_tasks`` row) for it.
+
+    The row is written when the runner takes the build, just before a Slack
+    hand-over is answered "Building", so it is the persisted fact that the
+    build launched and was answered. Read it BEFORE a replacement launch,
+    which deletes it (:func:`launch_replacing_recorded_run`). A ledger with no
+    ``async_tasks`` table has recorded none. Any other failure to read counts
+    as launched: an answer is then left unsaid rather than said twice.
+    """
+    try:
+        row = sqlite_pool.connection.execute(
+            "SELECT 1 FROM async_tasks WHERE build_id = ? LIMIT 1", (build_id,)
+        ).fetchone()
+    except sqlite3.OperationalError as exc:
+        return "no such table" not in str(exc)
+    except Exception:  # noqa: BLE001 — silence over a second answer
+        return True
+    return row is not None
 
 
 async def interrupt_recorded_run(

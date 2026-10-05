@@ -102,6 +102,7 @@ from forge.pipeline.dispatchers.autobuild_async import (
     dispatch_autobuild_async,
 )
 from forge.pipeline.supervisor import Supervisor
+from forge.planning.notifications import make_build_thread_reply
 
 if TYPE_CHECKING:  # pragma: no cover - import-time only
     from datetime import datetime
@@ -911,6 +912,9 @@ def bind_production_dispatch_chain(
                     client=client,
                     clock=_gate_wall_clock,
                     forge_config=forge_config,
+                    # A Slack hand-over waiting at its card when the forge
+                    # stopped is still answered in its thread.
+                    reply_in_thread=make_build_thread_reply(client),
                 )
             except Exception as exc:  # noqa: BLE001 — DDR-007 boot protection
                 logger.error(
