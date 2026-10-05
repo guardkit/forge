@@ -312,28 +312,87 @@ def relative_markdown_links(text: str) -> list[str]:
 
 def _yaml_path(raw: str) -> str | None:
     """A path the feature YAML names (a task's ``file_path``, a spec file), or
-    ``None`` when it is absolute or leaves the repository (Codex review round
-    1, R3). Never rewritten into something else: an absolute path is refused,
-    not read as relative; ``.`` and ``..`` are resolved textually and any
-    ``..`` still left means outside."""
+    ``None`` when it is absolute or has a ``..`` component (Codex review
+    rounds 1-2, R3 and R6). Nothing is normalised before the check: a ``..``
+    is refused outright, never collapsed, since in the commit it could mean a
+    linked folder's parent. Only ``.`` and empty components are dropped."""
     if raw.startswith("/") or raw.startswith("\\"):
         return None
-    normal = posixpath.normpath(raw)
-    if normal in ("", ".") or normal == ".." or normal.startswith("../"):
+    parts = [part for part in raw.split("/") if part not in ("", ".")]
+    if not parts or ".." in parts:
         return None
-    return normal
+    return "/".join(parts)
 
 
-def _resolve_link(from_file: str, target: str) -> str | None:
-    """The repository path ``target`` names from ``from_file``, or None if outside."""
-    if target.startswith("/"):
-        joined = target.lstrip("/")
-    else:
-        joined = posixpath.join(posixpath.dirname(from_file), target)
-    normal = posixpath.normpath(joined)
-    if normal in ("", ".") or normal == ".." or normal.startswith("../"):
-        return None
-    return normal
+async def _walk_reference(
+    runner: Any,
+    repo_path: str,
+    commit: str,
+    source: str,
+    target: str,
+    seen: dict[str, Any],
+) -> tuple[str | None, str | None]:
+    """Resolve a Markdown reference from ``source`` inside the commit.
+
+    ``(path, None)`` for an ordinary committed file, else ``(None, why)``
+    (Codex review round 2, R6). Walked component by component against the
+    commit tree, in order — as GuardKit's committed resolver walks — and
+    never collapsed first: ``.`` and empty components are skipped, ``..``
+    takes the parent of the folder reached so far (refused at the top), and
+    every component is looked at in the commit. A link at any component is
+    refused, as is a component that is not there or a file used as a folder.
+    A leading ``/`` starts at the repository's top.
+    """
+    at = _short(commit)
+    current: list[str] = [] if target.startswith("/") else (
+        [p for p in source.split("/")[:-1] if p]
+    )
+    parts = target.split("/")
+
+    def refused(reason: str) -> tuple[None, str]:
+        return None, (
+            f"{_BUILT_PREFIX}{source} links to {target}, {reason}. Commit "
+            f"it on the branch, or correct the link, and queue the build "
+            f"again."
+        )
+
+    for index, part in enumerate(parts):
+        if part in ("", "."):
+            continue
+        if part == "..":
+            if not current:
+                return refused("which is outside the repository")
+            current.pop()
+            continue
+        candidate = "/".join([*current, part])
+        if candidate not in seen:
+            answer, why = await _raw(runner, repo_path, commit, candidate)
+            if why:
+                return None, why
+            seen[candidate] = answer
+        answer = seen[candidate]
+        mode = getattr(answer, "mode", None)
+        found = bool(getattr(answer, "found", False))
+        last = all(rest in ("", ".") for rest in parts[index + 1 :])
+        if found and mode == _LINK_MODE:
+            return refused(
+                f"and {candidate} is a symbolic link at {at}; every file of a "
+                f"prepared feature, and every folder on the way to one, must "
+                f"be the thing itself"
+            )
+        if mode == "040000" and not last:
+            current.append(part)
+            continue
+        if last and found and mode in _ORDINARY_MODES:
+            return candidate, None
+        if mode is None:
+            what = "in the commit"
+        elif last:
+            what = "an ordinary file in the commit"
+        else:
+            what = "a folder in the commit"
+        return refused(f"and {candidate} is not {what} {at} it was supplied at")
+    return refused("which names no file")
 
 
 #: The guide's Integration Contracts heading, read EXACTLY as the specialist
@@ -554,29 +613,21 @@ async def check_supplied_bundle(
             return f"the prepared feature cannot be built: {why}"
 
     # 7. Referenced context: every relative Markdown link in the supplied
-    #    summaries, guides and task files names a file at this commit.
-    checked: set[str] = set()
+    #    summaries, guides and task files names an ordinary file at this
+    #    commit, walked component by component (R6).
+    checked: set[tuple[str, str]] = set()
+    seen: dict[str, Any] = {}
     for source in [*summaries, *guides, *task_files]:
         for target in relative_markdown_links(texts.get(source, "")):
-            resolved = _resolve_link(source, target)
-            if resolved is None:
-                return (
-                    f"the prepared feature cannot be built: {source} links to "
-                    f"{target}, which is outside the repository"
-                )
-            if resolved in checked:
+            key = ("" if target.startswith("/") else posixpath.dirname(source), target)
+            if key in checked:
                 continue
-            content, why = await _read(runner, repo_path, commit, resolved)
+            _resolved, why = await _walk_reference(
+                runner, repo_path, commit, source, target, seen
+            )
             if why:
                 return _cannot(why)
-            if content is None:
-                return (
-                    f"the prepared feature cannot be built: {source} links to "
-                    f"{target}, and {resolved} is not in the commit {at} it was "
-                    f"supplied at. Commit it on the branch, or correct the "
-                    f"link, and queue the build again."
-                )
-            checked.add(resolved)
+            checked.add(key)
 
     # 8. The QA files both producers write, whatever the tier-1 enforcement
     #    setting: a pass bar per task and a seed per spec file.
