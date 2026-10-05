@@ -517,7 +517,14 @@ async def check_supplied_bundle(
     if not isinstance(plan, dict):
         return f"the prepared feature cannot be built: {yaml_path} is not a feature plan"
     declared_id = plan.get("id")
-    if str(declared_id or "").strip() != feature_id:
+    if isinstance(declared_id, str) and _padded(declared_id):
+        # Read exactly as written, as GuardKit reads it (R8, same class).
+        return (
+            f"the prepared feature cannot be built: {yaml_path} at {at} names "
+            f"the feature {declared_id!r}, which begins or ends with a space; "
+            f"write it as {feature_id}"
+        )
+    if str(declared_id or "") != feature_id:
         return (
             f"the prepared feature cannot be built: {yaml_path} at {at} names "
             f"the feature {declared_id!r}, not {feature_id}"
@@ -532,10 +539,18 @@ async def check_supplied_bundle(
     for index, task in enumerate(tasks):
         if not isinstance(task, dict):
             return f"the prepared feature cannot be built: task {index + 1} in {yaml_path} is not a task"
-        task_id = str(task.get("id") or "").strip()
+        task_id = str(task.get("id") or "")
         file_path = task.get("file_path")
-        if not task_id:
+        if not task_id.strip():
             return f"the prepared feature cannot be built: task {index + 1} in {yaml_path} has no id"
+        if _padded(task_id):
+            # GuardKit keeps the id as written and reads qa/pass-bar-<id>.yaml
+            # with it, so a trimmed id would check a different bar (R8 class).
+            return (
+                f"the prepared feature cannot be built: task {index + 1} in "
+                f"{yaml_path} has the id {task_id!r}, which begins or ends with "
+                f"a space; write it without one"
+            )
         if not isinstance(file_path, str) or not file_path.strip():
             return f"the prepared feature cannot be built: task {task_id} in {yaml_path} names no task file"
         if _padded(file_path):

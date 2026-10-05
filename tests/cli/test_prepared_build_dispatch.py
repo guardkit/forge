@@ -493,6 +493,7 @@ async def test_a_prepared_feature_file_must_be_its_own_in_the_registered_checkou
     forge_config: ForgeConfig,
     persistence: SqliteLifecyclePersistence,
     wrong: Any,
+    request: pytest.FixtureRequest,
 ) -> None:
     project.commit_on(BRANCH, bundle())
     client, starter, rejections = _StubNatsClient(), _RecordingStarter(), []
@@ -508,6 +509,10 @@ async def test_a_prepared_feature_file_must_be_its_own_in_the_registered_checkou
     assert _row(persistence) is None
     assert starter.calls == []
     assert f".guardkit/features/{FEATURE}.yaml" in rejections[0][1]
+    if "space" not in request.node.callspec.id:
+        assert "the one file a build of" in rejections[0][1]
+    else:
+        assert "begins or ends with a space" in rejections[0][1]
 
 
 @pytest.mark.asyncio

@@ -969,6 +969,45 @@ async def test_a_reference_whose_path_still_has_a_space_at_an_end_is_refused(
 
 
 @pytest.mark.asyncio
+async def test_a_task_id_with_a_space_at_an_end_is_refused_not_trimmed(
+    project: Project, runner: WorktreeGitRunner
+) -> None:
+    """GuardKit reads ``qa/pass-bar-<id>.yaml`` with the id exactly as written:
+    `` TASK-AB12-001`` names a different bar (here a link) from the ordinary
+    canonical one, so the id is refused rather than trimmed."""
+    files = bundle()
+    plan_path = f".guardkit/features/{FEATURE}.yaml"
+    files[plan_path] = files[plan_path].replace(
+        f"- id: {TASKS[0]}", f'- id: " {TASKS[0]}"', 1
+    )
+    _commit_with_links(
+        project, files, {f"qa/pass-bar- {TASKS[0]}.yaml": f"pass-bar-{TASKS[1]}.yaml"}
+    )
+
+    answer = await _admit(project, runner)
+
+    assert not answer.ok
+    assert repr(f" {TASKS[0]}") in (answer.refusal or "")
+    assert "begins or ends with a space" in (answer.refusal or "")
+
+
+@pytest.mark.asyncio
+async def test_a_feature_id_with_a_space_at_an_end_is_refused(
+    project: Project, runner: WorktreeGitRunner
+) -> None:
+    files = bundle()
+    plan_path = f".guardkit/features/{FEATURE}.yaml"
+    files[plan_path] = files[plan_path].replace(f"id: {FEATURE}", f'id: "{FEATURE} "', 1)
+    project.commit_on(BRANCH, files)
+
+    answer = await _admit(project, runner)
+
+    assert not answer.ok
+    assert repr(f"{FEATURE} ") in (answer.refusal or "")
+    assert "begins or ends with a space" in (answer.refusal or "")
+
+
+@pytest.mark.asyncio
 async def test_an_absolute_spec_file_path_is_refused(
     project: Project, runner: WorktreeGitRunner
 ) -> None:
