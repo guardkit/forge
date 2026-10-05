@@ -825,3 +825,123 @@ async def test_a_build_already_launched_and_answered_is_not_answered_again(
     assert interrupted == [row["build_id"]]
     assert len(starter.replies_at_launch) == 2, "it was relaunched"
     assert [r.message.split(" ")[0] for r in bus.replies()] == ["Building"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("outcome", "expected"),
+    [
+        (GateOutcome.CANCELLED, "was declined"),
+        (GateOutcome.TIMED_OUT, "timed out"),
+    ],
+)
+async def test_a_launched_build_ended_at_its_recovered_card_is_told_once(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    project: Project,
+    bus: _Bus,
+    starter: _Starter,
+    forge_config: ForgeConfig,
+    persistence: SqliteLifecyclePersistence,
+    planning_deps: PlanningConsumerDeps,
+    outcome: GateOutcome,
+    expected: str,
+) -> None:
+    """Already said to be building; restarted mid-build; its recovered card
+    then ends it. That is new information, said once: it was not restarted."""
+    from forge.cli import _serve_deps as serve_deps
+
+    project.commit_on(BRANCH, bundle())
+
+    async def _approved(**_kwargs: Any) -> Any:
+        return GateOutcome.RESUMED
+
+    deps = _gated_deps(
+        monkeypatch, tmp_path, bus, starter, forge_config, persistence, _approved
+    )
+    await _hand_over(planning_deps, deps, bus)
+    (request,) = bus.build_requests()
+    (row,) = _rows(persistence)
+    persistence.connection.execute(
+        "UPDATE builds SET status = 'INTERRUPTED' WHERE build_id = ?",
+        (row["build_id"],),
+    )
+
+    async def _interrupt(*_a: Any, **_k: Any) -> bool:
+        return True
+
+    async def _decided(**_kwargs: Any) -> Any:
+        return outcome
+
+    monkeypatch.setattr(serve_deps, "interrupt_recorded_run", _interrupt)
+    after_restart = _gated_deps(
+        monkeypatch, tmp_path, bus, starter, forge_config, persistence, _decided
+    )
+    msg = _Msg(request)
+    await handle_message(msg, after_restart)
+
+    first, second = bus.replies()
+    assert first.message.startswith("Building ")
+    assert second.message == (
+        f"{FEATURE} was not restarted: the build-start card {expected}."
+    )
+    assert second.parent_request_id == THREAD
+    assert len(starter.replies_at_launch) == 1, "not relaunched"
+    assert msg.acks == 1
+
+
+@pytest.mark.asyncio
+async def test_a_launched_row_refused_as_a_second_build_is_not_restarted_not_unstarted(
+    tmp_path: Path,
+    project: Project,
+    bus: _Bus,
+    starter: _Starter,
+    forge_config: ForgeConfig,
+    persistence: SqliteLifecyclePersistence,
+    planning_deps: PlanningConsumerDeps,
+    build_deps: Any,
+) -> None:
+    """No gate wired (the legacy launch leaves the row QUEUED): the hand-over
+    launched and was answered; after a restart its redelivery finds another
+    build of the feature going first. Said once, as "not restarted"."""
+    project.commit_on(BRANCH, bundle())
+    await _hand_over(planning_deps, build_deps, bus)
+    (request,) = bus.build_requests()
+    (row,) = _rows(persistence)
+    assert row["status"] == "QUEUED"
+    other = persistence.record_pending_build(
+        BuildQueuedPayload(
+            feature_id=FEATURE,
+            repo=REPO,
+            branch=BRANCH,
+            feature_yaml_path=f".guardkit/features/{FEATURE}.yaml",
+            triggered_by="cli",
+            originating_adapter="cli-wrapper",
+            correlation_id="corr-other-0001",
+            requested_at=datetime(2026, 10, 5, 14, 0, tzinfo=UTC),
+            queued_at=datetime(2026, 10, 5, 14, 0, tzinfo=UTC),
+        )
+    )
+    persistence.connection.execute(
+        "UPDATE builds SET status = 'RUNNING' WHERE build_id = ?", (other,)
+    )
+
+    after_restart = build_pipeline_consumer_deps(
+        bus,
+        forge_config,
+        persistence,
+        async_task_starter=starter,
+        record_build_rejection=lambda _cid, _reason: None,
+        prepared_build_admission=build_prepared_build_admission(
+            forge_config, git_runner=WorktreeGitRunner(worktrees_root=tmp_path / "wt2")
+        ),
+    )
+    await handle_message(_Msg(request), after_restart)
+
+    first, second = bus.replies()
+    assert first.message.startswith("Building ")
+    assert second.message == (
+        f"{FEATURE} was not restarted: another build of {FEATURE} is already "
+        "in progress."
+    )
+    assert len(starter.replies_at_launch) == 1

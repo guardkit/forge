@@ -25,6 +25,7 @@ __all__ = [
     "BuildThreadReply",
     "answer_build_thread",
     "build_planning_notification_envelope",
+    "build_not_restarted_reply",
     "build_refused_reply",
     "build_started_reply",
     "gate_ended_reason",
@@ -158,6 +159,16 @@ def gate_ended_reason(outcome: Any) -> str:
     if value == "TIMED_OUT":
         return "the build-start card timed out"
     return "the build-start check stopped it"
+
+
+def build_not_restarted_reply(feature_id: str, reason: str) -> str:
+    """The line for a build already said to be building, stopped on restart.
+
+    Said once, when a build that launched (and was answered "Building") is
+    recovered after a restart and its build-start card then ends it.
+    """
+    reason = str(reason).strip().rstrip(".") or "no reason was given"
+    return f"{feature_id} was not restarted: {reason}."
 
 
 def build_started_reply(

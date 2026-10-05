@@ -65,6 +65,7 @@ from forge.pipeline import BuildContext
 from forge.planning.notifications import (
     BuildThreadReply,
     answer_build_thread,
+    build_not_restarted_reply,
     build_refused_reply,
     build_started_reply,
     gate_ended_reason,
@@ -1359,12 +1360,25 @@ async def _rearm_dispatch(
     outcome is decided once — afterwards the row is no longer PAUSED, so no
     later boot re-arms it — and so is answered once. The answer follows the
     launch or the state change; nothing about acknowledgement changes.
+
+    A build that had already launched before this card — it was answered
+    "Building" then, and was recovered into this card after a restart — is
+    never told "Building" again; if the card ends it, it is told once that it
+    was not restarted. The persisted fact is the launch's ``async_tasks`` row
+    (``had_recorded_launch``), read here, before the replacement launch
+    deletes it.
     """
     answers = (
         reply_in_thread is not None
         and build_row is not None
+        and sqlite_pool is not None
         and snap.stage_label == _GATE_STAGE_LABEL
     )
+    answered_before = False
+    if answers:
+        from forge.cli._recorded_run import had_recorded_launch
+
+        answered_before = had_recorded_launch(sqlite_pool, snap.build_id)
     outcome, _decision = await await_and_dispatch(
         deps=deps,
         build_id=snap.build_id,
@@ -1410,7 +1424,7 @@ async def _rearm_dispatch(
                     "relaunched; held for the next boot's recovery",
                     snap.build_id,
                 )
-        if answers and launched:
+        if answers and launched and not answered_before:
             await answer_build_thread(
                 reply_in_thread,
                 build_row,
@@ -1422,10 +1436,11 @@ async def _rearm_dispatch(
                 ),
             )
     elif answers:
+        ended = build_not_restarted_reply if answered_before else build_refused_reply
         await answer_build_thread(
             reply_in_thread,
             build_row,
-            build_refused_reply(str(build_row.feature_id), gate_ended_reason(outcome)),
+            ended(str(build_row.feature_id), gate_ended_reason(outcome)),
             level="warning",
         )
     return outcome
