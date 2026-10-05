@@ -1198,13 +1198,14 @@ def make_sandbox_clone(sandbox: SandboxStore, *, clone: str, leaf: str, url: str
 #: Plain Python on purpose — the coordinator's image may be older than this
 #: checkout, so nothing of this module may be imported there. It reads only:
 #: the ledger opened read-only — active builds, unfinished planning runs,
-#: queued work, and the merge/publish/deploy work rollout-quiesce also counts
-#: (an unfinished publication record, a held deployment target) — and
+#: queued work, and merge and deploy work that is LIVE (a publication record's
+#: lease or a deployment target's lock held and not yet expired) — and
 #: ``consumer_info`` on the two durable consumers (the same read the
 #: coordinator's own consumer-health check makes).
 #: The bus address carries a credential, so it is scrubbed out of anything said.
 DRAINED_READ_SCRIPT: str = r'''
 import asyncio, json, os, sqlite3, sys
+from datetime import datetime, timezone
 from urllib.parse import urlsplit
 spec = json.loads(sys.argv[1])
 url = os.environ.get("FORGE_NATS_URL", "")
@@ -1236,19 +1237,46 @@ try:
         plans = counts("SELECT state, COUNT(*) FROM planning_runs WHERE state NOT IN (%s) GROUP BY state", spec["planning_terminal"])
         free = one("SELECT COUNT(*) FROM work_queue WHERE status = 'QUEUED' AND after_id IS NULL")
         held = one("SELECT COUNT(*) FROM work_queue WHERE status = 'QUEUED' AND after_id IS NOT NULL")
-        publications = one(
-            "SELECT COUNT(*) FROM publication_records WHERE result IS NULL OR result != ?",
-            spec["publication_finished"],
-        )
-        deploy_holds = one(
-            "SELECT COUNT(*) FROM deployment_targets WHERE holder_build IS NOT NULL AND holder_build != ''"
-        )
+        # LIVE work only, the way the coordinator itself decides it: a record or
+        # a target is held when it names a holder AND its expiry is later than
+        # now (PublicationRecord.lease_is_live, DeploymentTarget.held_now). A
+        # resting result — a refused merge, publication off, a press or a
+        # deploy that stopped — is history nothing clears; it is counted for
+        # information, never waited on.
+        now = datetime.now(timezone.utc)
+        def live(holder, expires):
+            if not holder or not expires:
+                return False
+            try:
+                expiry = datetime.fromisoformat(str(expires))
+            except ValueError:
+                return False
+            if expiry.tzinfo is None:
+                expiry = expiry.replace(tzinfo=timezone.utc)
+            return expiry > now
+        merges_live = merges_resting = 0
+        for holder, expires, result in con.execute(
+            "SELECT lease_holder, lease_expires_at, result FROM publication_records"
+        ).fetchall():
+            if live(holder, expires):
+                merges_live += 1
+            elif result != spec["publication_finished"]:
+                merges_resting += 1
+        locks_live = locks_expired = 0
+        for holder, expires in con.execute(
+            "SELECT holder_build, expires_at FROM deployment_targets"
+        ).fetchall():
+            if live(holder, expires):
+                locks_live += 1
+            elif holder:
+                locks_expired += 1
     finally:
         con.close()
     out["ledger"] = {
         "builds": builds, "interrupted": interrupted, "planning_runs": plans,
         "queue_waiting": free, "queue_held": held,
-        "publications_unfinished": publications, "deploy_targets_held": deploy_holds,
+        "merges_live": merges_live, "merges_resting": merges_resting,
+        "deploy_locks_live": locks_live, "deploy_locks_expired": locks_expired,
     }
 except Exception as exc:
     out["ledger"] = {"error": said(exc)}
@@ -1338,13 +1366,15 @@ def judge_drained(facts: Mapping[str, Any], consumers: Sequence[str]) -> list[st
 
     Drained means all of: no build in an active state (the coordinator's own
     list, ``BUILD_ACTIVE_STATES``); no planning run unfinished; nothing queued
-    in the work queue; no publication record unfinished and no deployment
-    target held (the merge, publish and deploy work rollout-quiesce counts);
+    in the work queue; no merge and no deploy in progress (a publication
+    record's lease or a deployment target's lock held and not expired — the
+    coordinator's own ``lease_is_live`` and ``held_now`` rule);
     and each durable consumer feeding the coordinator reads zero pending and
     zero awaiting acknowledgement. Anything that could not be read is a reason
     too. An INTERRUPTED build is not one: a restart leaves it as it is, and one
     that can be relaunched holds an unacknowledged build request, which the
-    consumer check already counts (see :func:`drained_notes`).
+    consumer check already counts. Neither is a merge or a deploy that has
+    stopped and holds nothing live (see :func:`drained_notes`).
     """
     if facts.get("error"):
         return [str(facts["error"])]
@@ -1374,10 +1404,10 @@ def judge_drained(facts: Mapping[str, Any], consumers: Sequence[str]) -> list[st
              "which the coordinator's automatic queue would admit within seconds"),
             ("queue_held", lambda n: f"{n} {_plural(n, 'item waits', 'items wait')} in the work queue behind "
              "another item; wait for the item it waits on to finish, or withdraw it"),
-            ("publications_unfinished", lambda n: f"{n} {_plural(n, 'merge is', 'merges are')} not finished "
-             "(a publication record short of 'merged into the remote and running')"),
-            ("deploy_targets_held", lambda n: f"{n} deployment {_plural(n, 'target is', 'targets are')} held "
-             "by a build that is deploying"),
+            ("merges_live", lambda n: f"{n} {_plural(n, 'merge is', 'merges are')} in progress "
+             "(a publication record's lease is held and has not expired)"),
+            ("deploy_locks_live", lambda n: f"{n} {_plural(n, 'deploy is', 'deploys are')} in progress "
+             "(a deployment target's lock is held and has not expired)"),
         ):
             n = _count(ledger.get(key))
             if n is None:
@@ -1404,16 +1434,38 @@ def judge_drained(facts: Mapping[str, Any], consumers: Sequence[str]) -> list[st
 
 
 def drained_notes(facts: Mapping[str, Any]) -> list[str]:
-    """What the read found that does not stop activation, said for information."""
+    """What the read found that does not stop activation, said for information.
+
+    History nothing clears: INTERRUPTED builds, merges resting short of
+    "merged into the remote and running" with no live lease (a refused merge,
+    publication off, a press that stopped), and deployment locks whose holder
+    stopped and whose expiry has passed.
+    """
     ledger = facts.get("ledger")
-    n = _count(ledger.get("interrupted")) if isinstance(ledger, dict) else None
-    if not n:
+    if not isinstance(ledger, dict):
         return []
-    return [
-        f"for information: {n} {_plural(n, 'build is', 'builds are')} INTERRUPTED. A restart leaves "
-        "them as they are; one that can be relaunched holds an unacknowledged build request, "
-        "which the consumer check above already counts"
-    ]
+    notes: list[str] = []
+    n = _count(ledger.get("interrupted"))
+    if n:
+        notes.append(
+            f"for information: {n} {_plural(n, 'build is', 'builds are')} INTERRUPTED. A restart "
+            "leaves them as they are; one that can be relaunched holds an unacknowledged build "
+            "request, which the consumer check above already counts"
+        )
+    n = _count(ledger.get("merges_resting"))
+    if n:
+        notes.append(
+            f"for information: {n} {_plural(n, 'merge rests', 'merges rest')} short of 'merged into "
+            "the remote and running' with nobody holding it (refused, publication off, or a press "
+            "that stopped); a restart does not touch it"
+        )
+    n = _count(ledger.get("deploy_locks_expired"))
+    if n:
+        notes.append(
+            f"for information: {n} deployment {_plural(n, 'lock was', 'locks were')} left by a build "
+            f"that stopped and {_plural(n, 'has', 'have')} expired; the next deploy takes it over"
+        )
+    return notes
 
 
 # ---------------------------------------------------------------------------

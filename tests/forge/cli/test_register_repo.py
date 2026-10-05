@@ -20,6 +20,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -654,7 +655,8 @@ def _quiet() -> dict[str, Any]:
     return {
         "ledger": {
             "builds": {}, "interrupted": 0, "planning_runs": {}, "queue_waiting": 0,
-            "queue_held": 0, "publications_unfinished": 0, "deploy_targets_held": 0,
+            "queue_held": 0, "merges_live": 0, "merges_resting": 0,
+            "deploy_locks_live": 0, "deploy_locks_expired": 0,
         },
         "consumers": {
             "forge-serve-planning": {"pending": 0, "ack_pending": 0},
@@ -742,40 +744,87 @@ def test_an_unreadable_ledger_or_coordinator_stops_it(estate):
     assert result.exit_code == 1 and "not the read's report" in result.output
 
 
-def _ledger(
-    path: Path,
-    *,
-    builds: tuple[str, ...] = (),
-    plan: str | None = None,
-    queued: bool = False,
-    held: bool = False,
-    publication: str | None = "",
-    deploy_holder: str | None = None,
-) -> None:
-    """A ledger with the columns the read uses; ``publication=""`` means no row."""
-    with sqlite3.connect(path) as con:
-        con.execute("CREATE TABLE builds (build_id TEXT, status TEXT)")
-        con.execute("CREATE TABLE planning_runs (id TEXT, state TEXT)")
-        con.execute("CREATE TABLE work_queue (id INTEGER, status TEXT, after_id INTEGER)")
-        con.execute("CREATE TABLE publication_records (build_id TEXT, result TEXT)")
-        con.execute("CREATE TABLE deployment_targets (target TEXT, holder_build TEXT)")
-        con.executemany("INSERT INTO builds VALUES (?, ?)", [("a", "COMPLETE"), ("b", "FAILED")])
-        con.executemany("INSERT INTO planning_runs VALUES (?, ?)", [("p", "PLANNED_HANDOFF")])
-        con.execute("INSERT INTO work_queue VALUES (1, 'DONE', NULL)")
-        con.execute("INSERT INTO publication_records VALUES ('a', 'merged into the remote and running')")
-        con.execute("INSERT INTO deployment_targets VALUES ('guardkit/api_test:local', NULL)")
-        for index, status in enumerate(builds):
-            con.execute("INSERT INTO builds VALUES (?, ?)", (f"c{index}", status))
-        if plan:
-            con.execute("INSERT INTO planning_runs VALUES ('q', ?)", (plan,))
-        if queued:
-            con.execute("INSERT INTO work_queue VALUES (2, 'QUEUED', NULL)")
-        if held:
-            con.execute("INSERT INTO work_queue VALUES (3, 'QUEUED', 1)")
-        if publication != "":
-            con.execute("INSERT INTO publication_records VALUES ('c', ?)", (publication,))
-        if deploy_holder:
-            con.execute("INSERT INTO deployment_targets VALUES ('x:local', ?)", (deploy_holder,))
+class Ledger:
+    """A real ledger: Forge's own migrations, and rows written through Forge's
+    own stores wherever one exists, so the read is held to the schema the
+    coordinator really has."""
+
+    def __init__(self, path: Path) -> None:
+        from forge.lifecycle.migrations import apply_at_boot
+
+        self.path = path
+        self.cx = sqlite3.connect(path)
+        apply_at_boot(self.cx)
+        self.cx.commit()
+        self.now = datetime.now(timezone.utc)
+        self._n = 0
+
+    def build(self, status: str) -> str:
+        self._n += 1
+        build_id = f"build-FEAT-{self._n}"
+        self.cx.execute(
+            "INSERT INTO builds (build_id, feature_id, repo, branch, feature_yaml_path, status,"
+            " triggered_by, correlation_id, queued_at) VALUES (?,?,?,?,?,?,?,?,?)",
+            (build_id, f"FEAT-{self._n}", "guardkit/api_test", "main", "f.yaml", status, "cli",
+             build_id, self.now.isoformat()),
+        )
+        self.cx.commit()
+        return build_id
+
+    def plan(self, state: str) -> None:
+        self._n += 1
+        self.cx.execute(
+            "INSERT INTO planning_runs (correlation_id, state, originating_user, expected_approver,"
+            " request_text, triggered_by, queued_at) VALUES (?,?,?,?,?,?,?)",
+            (f"plan-{self._n}", state, "U1", "U1", "a sentence", "jarvis", self.now.isoformat()),
+        )
+        self.cx.commit()
+
+    def queue(self, *, after: int | None = None) -> int:
+        self._n += 1
+        cursor = self.cx.execute(
+            "INSERT INTO work_queue (sentence, kind, status, rank, after_id, originating_user,"
+            " correlation_id, queued_at) VALUES (?,?,?,?,?,?,?,?)",
+            ("a sentence", "feature", "QUEUED", float(self._n), after, "U1", f"q-{self._n}",
+             self.now.isoformat()),
+        )
+        self.cx.commit()
+        return int(cursor.lastrowid)
+
+    def merge(self, *, days_ago: float, result: str | None, release: bool) -> None:
+        from forge.pipeline.publication_record import PublicationRecordStore
+
+        build_id = self.build("COMPLETE")
+        store = PublicationRecordStore(self.cx)
+        then = self.now - timedelta(days=days_ago)
+        grant = store.take_lease(build_id=build_id, holder="merge-press:1", now=then, repo="guardkit/api_test")
+        assert grant is not None
+        if result is not None or release:
+            fields: dict[str, Any] = {}
+            if result is not None:
+                fields["result"] = result
+            if release:
+                fields.update(lease_holder=None, lease_expires_at=None)
+            assert store.record(build_id=build_id, turn=grant.turn, now=then, **fields)
+        self.cx.commit()
+
+    def deploy_lock(self, *, days_ago: float) -> None:
+        from forge.pipeline.deployment_lock import DeploymentLockStore
+
+        build_id = self.build("COMPLETE")
+        grant = DeploymentLockStore(self.cx).grant(
+            target=f"guardkit/api_test:{build_id}", build_id=build_id, turn=1, holder="h",
+            now=self.now - timedelta(days=days_ago),
+        )
+        assert grant is not None
+        self.cx.commit()
+
+    def read(self) -> dict[str, Any]:
+        return _run_the_read_script(self.path)
+
+    def judged(self) -> tuple[list[str], list[str]]:
+        facts = {**self.read(), "consumers": QUIET_CONSUMERS}
+        return register_repo.judge_drained(facts, CONSUMERS), register_repo.drained_notes(facts)
 
 
 def _run_the_read_script(db: Path) -> dict[str, Any]:
@@ -799,39 +848,42 @@ QUIET_CONSUMERS = _quiet()["consumers"]
 
 
 def test_the_read_script_counts_a_real_ledger_and_says_an_unreachable_bus_is_unreadable(tmp_path):
-    db = tmp_path / "forge.db"
-    _ledger(db, builds=("RUNNING",), plan="FEATURE_SPEC", queued=True, held=True,
-            publication="published, deployment pending", deploy_holder="build-c")
+    ledger = Ledger(tmp_path / "forge.db")
+    ledger.build("RUNNING")
+    ledger.build("COMPLETE")
+    ledger.plan("FEATURE_SPEC")
+    first = ledger.queue()
+    ledger.queue(after=first)
+    ledger.merge(days_ago=0, result=None, release=False)
+    ledger.deploy_lock(days_ago=0)
 
-    facts = _run_the_read_script(db)
+    facts = ledger.read()
 
     assert facts["ledger"] == {
         "builds": {"RUNNING": 1}, "interrupted": 0, "planning_runs": {"FEATURE_SPEC": 1},
-        "queue_waiting": 1, "queue_held": 1, "publications_unfinished": 1, "deploy_targets_held": 1,
+        "queue_waiting": 1, "queue_held": 1, "merges_live": 1, "merges_resting": 0,
+        "deploy_locks_live": 1, "deploy_locks_expired": 0,
     }
     assert set(facts["consumers"]) == {"forge-serve", "forge-serve-planning"}
     assert all("error" in row for row in facts["consumers"].values())
-    reasons = register_repo.judge_drained(facts, CONSUMERS)
-    assert len(reasons) == 8
+    assert len(register_repo.judge_drained(facts, CONSUMERS)) == 8
 
 
-def test_the_read_script_reads_a_finished_ledger_as_quiet(tmp_path):
-    db = tmp_path / "forge.db"
-    _ledger(db)
-    facts = _run_the_read_script(db)
+def test_an_empty_real_ledger_is_quiet(tmp_path):
+    facts = Ledger(tmp_path / "forge.db").read()
     assert facts["ledger"] == _quiet()["ledger"]
     assert register_repo.judge_drained({**facts, "consumers": QUIET_CONSUMERS}, CONSUMERS) == []
 
 
 def test_old_interrupted_builds_with_quiet_consumers_are_drained_and_said_for_information(tmp_path):
-    db = tmp_path / "forge.db"
-    _ledger(db, builds=("INTERRUPTED",) * 28)
-    facts = {**_run_the_read_script(db), "consumers": QUIET_CONSUMERS}
-
+    ledger = Ledger(tmp_path / "forge.db")
+    for _ in range(28):
+        ledger.build("INTERRUPTED")
+    facts = ledger.read()
     assert facts["ledger"]["builds"] == {}
     assert facts["ledger"]["interrupted"] == 28
-    assert register_repo.judge_drained(facts, CONSUMERS) == []
-    notes = register_repo.drained_notes(facts)
+    reasons, notes = ledger.judged()
+    assert reasons == []
     assert len(notes) == 1 and "28 builds are INTERRUPTED" in notes[0]
 
 
@@ -848,35 +900,61 @@ def test_every_active_build_state_is_counted(tmp_path, state):
     from forge.planning.work_queue_loop import BUILD_ACTIVE_STATES
 
     assert state in BUILD_ACTIVE_STATES
-    db = tmp_path / "forge.db"
-    _ledger(db, builds=(state,))
-    assert _run_the_read_script(db)["ledger"]["builds"] == {state: 1}
+    ledger = Ledger(tmp_path / "forge.db")
+    ledger.build(state)
+    assert ledger.read()["ledger"]["builds"] == {state: 1}
 
 
-@pytest.mark.parametrize("result", [None, "publication pending", "published, deployment pending"])
-def test_an_unfinished_merge_is_counted(tmp_path, result):
-    db = tmp_path / "forge.db"
-    _ledger(db, publication=result)
-    facts = {**_run_the_read_script(db), "consumers": QUIET_CONSUMERS}
-    reasons = register_repo.judge_drained(facts, CONSUMERS)
+def test_a_stale_refused_merge_with_its_lease_put_down_is_drained_with_a_note(tmp_path):
+    ledger = Ledger(tmp_path / "forge.db")
+    ledger.merge(days_ago=14, result="publication pending", release=True)
+    reasons, notes = ledger.judged()
+    assert reasons == []
+    assert notes == [
+        "for information: 1 merge rests short of 'merged into the remote and running' with nobody "
+        "holding it (refused, publication off, or a press that stopped); a restart does not touch it"
+    ]
+
+
+def test_a_press_that_crashed_with_its_lease_expired_is_drained_with_a_note(tmp_path):
+    ledger = Ledger(tmp_path / "forge.db")
+    ledger.merge(days_ago=10, result=None, release=False)
+    reasons, notes = ledger.judged()
+    assert reasons == []
+    assert len(notes) == 1 and "1 merge rests" in notes[0]
+
+
+def test_a_live_merge_lease_is_not_drained(tmp_path):
+    ledger = Ledger(tmp_path / "forge.db")
+    ledger.merge(days_ago=0, result="publication pending", release=False)
+    reasons, _ = ledger.judged()
     assert reasons == [
-        "1 merge is not finished (a publication record short of 'merged into the remote and running')"
+        "1 merge is in progress (a publication record's lease is held and has not expired)"
     ]
 
 
-def test_a_finished_merge_is_not_counted(tmp_path):
-    db = tmp_path / "forge.db"
-    _ledger(db, publication="merged into the remote and running")
-    assert _run_the_read_script(db)["ledger"]["publications_unfinished"] == 0
+def test_a_finished_merge_is_neither_counted_nor_noted(tmp_path):
+    ledger = Ledger(tmp_path / "forge.db")
+    ledger.merge(days_ago=3, result="merged into the remote and running", release=True)
+    assert ledger.judged() == ([], [])
 
 
-def test_a_held_deployment_target_is_counted(tmp_path):
-    db = tmp_path / "forge.db"
-    _ledger(db, deploy_holder="build-FEAT-1-20261005")
-    facts = {**_run_the_read_script(db), "consumers": QUIET_CONSUMERS}
-    assert register_repo.judge_drained(facts, CONSUMERS) == [
-        "1 deployment target is held by a build that is deploying"
+def test_a_crashed_deploy_lock_that_has_expired_is_drained_with_a_note(tmp_path):
+    ledger = Ledger(tmp_path / "forge.db")
+    ledger.deploy_lock(days_ago=10)
+    reasons, notes = ledger.judged()
+    assert reasons == []
+    assert notes == [
+        "for information: 1 deployment lock was left by a build that stopped and has expired; "
+        "the next deploy takes it over"
     ]
+
+
+def test_a_live_deploy_lock_is_not_drained(tmp_path):
+    ledger = Ledger(tmp_path / "forge.db")
+    ledger.deploy_lock(days_ago=0)
+    reasons, _ = ledger.judged()
+    assert reasons == ["1 deploy is in progress (a deployment target's lock is held and has not expired)"]
 
 
 def test_a_held_queue_item_says_wait_for_its_antecedent_or_withdraw_it(estate):
@@ -889,7 +967,7 @@ def test_a_held_queue_item_says_wait_for_its_antecedent_or_withdraw_it(estate):
 
 def test_a_missing_ledger_count_is_unreadable_not_zero(estate):
     facts = _quiet()
-    del facts["ledger"]["deploy_targets_held"]
+    del facts["ledger"]["deploy_locks_live"]
     result = _check(estate, facts)
     assert result.exit_code == 1
     assert "could not be counted" in result.output
