@@ -56,6 +56,7 @@ from forge.adapters.nats.planning_consumer import (
     PlanningConsumerDeps,
     create_and_start_planning_run,
     handle_planning_message,
+    publish_build_request,
 )
 from forge.adapters.sqlite import connect_writer
 from forge.planning.audit import audit_planning_model_resolution
@@ -1409,9 +1410,16 @@ async def compose_planning_consumer_and_dispatch(
                 correlation_id, message, "info", parent_request_id=parent_request_id
             )
 
+        async def _publish_build_queued(build: Any) -> None:
+            # A feature handed over with ``build: FEAT-XXXX from <branch>``
+            # (register-projects design, 5 October 2026, part 3), on the
+            # daemon's one client; the normal build route takes it from here.
+            await publish_build_request(nats_client, build)
+
         consumer_deps = PlanningConsumerDeps(
             store=store,
             publish_notification=_notify_in_thread,
+            publish_build_queued=_publish_build_queued,
             publish_planning_failed=publish_planning_failed,
             on_recorded=_on_recorded,
             # Lane B stage one: a sentence becomes a queue row here, and the
