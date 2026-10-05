@@ -412,25 +412,24 @@ async def _walk_reference(
 #: ``src/specialist_agent/qa/leak_sweep_emit.py``, ``_INTEGRATION_SECTION_RE``
 #: and ``_extract_integration_section``): case-sensitive, ``## §4 Integration
 #: Contracts`` or a bare ``## §4`` first, at any level of two or more.
-#: This is the rule for a bundle the SPECIALIST planner wrote (it carries the
-#: specialist-only ``<name>_digest.yaml``).
 _INTEGRATION_HEADING_RE = re.compile(
     r"^##+\s*(?:§\s*)?4\s*(?:Integration\s+Contracts?)?\s*$",
-    re.MULTILINE,
-)
-#: An ATTENDED bundle (GuardKit's own ``/feature-plan`` in Claude Code or Pi,
-#: no digest) is read with GuardKit's documented headings too: its template
-#: writes ``## §4: Integration Contracts``, with a colon
-#: (installer/core/commands/feature-plan.md:1978-1985 at guardkit 6f00751c),
-#: as well as the forms above (Codex review round 1, R5).
-_ATTENDED_HEADING_RE = re.compile(
-    r"^##+\s*(?:§\s*)?4\s*:?\s*(?:Integration\s+Contracts?)?\s*$",
     re.MULTILINE,
 )
 #: Only when no such heading exists: ``## Integration Contracts`` (the
 #: emitter's fallback, also case-sensitive).
 _INTEGRATION_FALLBACK_RE = re.compile(
     r"^##+\s*Integration\s+Contracts?\s*$", re.MULTILINE
+)
+#: GuardKit's documented heading, with its colon: ``## §4: Integration
+#: Contracts`` (installer/core/commands/feature-plan.md:1978-1985 at guardkit
+#: 6f00751c, which tells the planner to write exactly this). The specialist
+#: emitter's pattern above misses the colon form — a producer defect for
+#: specialist-agent's owner, recorded here and NOT changed from this side.
+#: Admission recognises both forms for every guide, whoever wrote it (Codex
+#: review round 2, R5).
+_GUARDKIT_HEADING_RE = re.compile(
+    r"^##+\s*§\s*4\s*:\s*Integration\s+Contracts?\s*$", re.MULTILINE
 )
 #: The section runs to the next heading of level two or more, as the emitter's.
 _SECTION_RE = re.compile(r"^##+", re.MULTILINE)
@@ -439,25 +438,29 @@ _SECTION_RE = re.compile(r"^##+", re.MULTILINE)
 _ROUTE_LINE_RE = re.compile(r"(?i)^\s*[-]?\s*route:\s*\S", re.MULTILINE)
 
 
-def guide_claims_routes(guide_text: str, *, attended: bool = False) -> bool:
-    """Does the guide's Integration Contracts section declare a ``route:``?
-
-    Only the FIRST matching heading's section is read, exactly as the
-    specialist emitter reads it; a ``route:`` line in it is that producer's own
-    signal that it wrote ``qa/leak-sweep.yaml``. ``attended`` reads an
-    attended GuardKit bundle, whose documented heading has a colon.
-    """
-    heading = (_ATTENDED_HEADING_RE if attended else _INTEGRATION_HEADING_RE).search(
-        guide_text
-    )
-    if heading is None:
-        heading = _INTEGRATION_FALLBACK_RE.search(guide_text)
+def _section_declares_a_route(guide_text: str, heading: "re.Match[str] | None") -> bool:
     if heading is None:
         return False
     rest = guide_text[heading.end():]
     following = _SECTION_RE.search(rest)
     body = rest[: following.start()] if following else rest
     return _ROUTE_LINE_RE.search(body) is not None
+
+
+def guide_claims_routes(guide_text: str) -> bool:
+    """Does an Integration Contracts section of the guide declare a ``route:``?
+
+    Either form counts: the section the specialist emitter reads (its first
+    matching heading, or its fallback when there is none), and the section
+    under GuardKit's documented colon heading. A ``route:`` line in either is
+    the producer's signal that ``qa/leak-sweep.yaml`` belongs with it.
+    """
+    emitter = _INTEGRATION_HEADING_RE.search(guide_text) or _INTEGRATION_FALLBACK_RE.search(
+        guide_text
+    )
+    return _section_declares_a_route(guide_text, emitter) or _section_declares_a_route(
+        guide_text, _GUARDKIT_HEADING_RE.search(guide_text)
+    )
 
 
 async def check_supplied_bundle(
@@ -566,10 +569,9 @@ async def check_supplied_bundle(
         specs.append(normal)
 
     # 4. The two companion files both producers write beside each spec file,
-    #    and whether the specialist-only digest is there too: it is what tells
-    #    the two producers apart for the leak-sweep rule (step 9).
+    #    and the specialist-only digest when it is there (never required, but
+    #    an ordinary file when present).
     summaries: list[str] = []
-    specialist = False
     for spec in specs:
         folder = posixpath.dirname(spec)
         name = posixpath.basename(spec)
@@ -592,8 +594,6 @@ async def check_supplied_bundle(
         content, why = await _read(runner, repo_path, commit, digest)
         if why:
             return _cannot(why)
-        if content is not None:
-            specialist = True
 
     # 5. The plan's guide, in each folder that holds task files.
     guides: list[str] = []
@@ -661,13 +661,10 @@ async def check_supplied_bundle(
         if content is None:
             return _missing("the spec's QA seed", seed, at)
 
-    # 9. The leak-sweep manifest, exactly when the guide claims a route — by
-    #    the specialist emitter's own rule for a specialist bundle, and with
-    #    GuardKit's documented headings too for an attended one.
-    if any(
-        guide_claims_routes(texts.get(guide, ""), attended=not specialist)
-        for guide in guides
-    ):
+    # 9. The leak-sweep manifest, exactly when a guide's Integration
+    #    Contracts section — in the specialist emitter's form or GuardKit's
+    #    documented colon form — declares a route.
+    if any(guide_claims_routes(texts.get(guide, "")) for guide in guides):
         content, why = await _read(runner, repo_path, commit, LEAK_SWEEP_PATH)
         if why:
             return _cannot(why)

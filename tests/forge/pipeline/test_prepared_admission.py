@@ -657,10 +657,13 @@ def _colon_guide(files: dict[str, str]) -> dict[str, str]:
 
 
 @pytest.mark.asyncio
-async def test_an_attended_colon_heading_route_needs_the_manifest(
-    project: Project, runner: WorktreeGitRunner
+@pytest.mark.parametrize("digest", [True, False], ids=["with-digest", "without-digest"])
+async def test_a_colon_heading_route_needs_the_manifest_whoever_wrote_it(
+    project: Project, runner: WorktreeGitRunner, digest: bool
 ) -> None:
-    project.commit_on(BRANCH, _colon_guide(bundle(digest=False, routes=True)))
+    """GuardKit's documented ``## §4: Integration Contracts`` counts for every
+    guide, with or without the specialist-only digest (R5)."""
+    project.commit_on(BRANCH, _colon_guide(bundle(digest=digest, routes=True)))
 
     answer = await _admit(project, runner)
 
@@ -669,23 +672,13 @@ async def test_an_attended_colon_heading_route_needs_the_manifest(
 
 
 @pytest.mark.asyncio
-async def test_an_attended_colon_heading_route_with_the_manifest_is_admitted(
-    project: Project, runner: WorktreeGitRunner
+@pytest.mark.parametrize("digest", [True, False], ids=["with-digest", "without-digest"])
+async def test_a_colon_heading_route_with_the_manifest_is_admitted(
+    project: Project, runner: WorktreeGitRunner, digest: bool
 ) -> None:
     project.commit_on(
-        BRANCH, _colon_guide(bundle(digest=False, routes=True, leak_sweep=True))
+        BRANCH, _colon_guide(bundle(digest=digest, routes=True, leak_sweep=True))
     )
-
-    answer = await _admit(project, runner)
-
-    assert answer.ok, answer.refusal
-
-
-@pytest.mark.asyncio
-async def test_a_specialist_bundle_with_a_colon_heading_is_read_the_emitters_way(
-    project: Project, runner: WorktreeGitRunner
-) -> None:
-    project.commit_on(BRANCH, _colon_guide(bundle(digest=True, routes=True)))
 
     answer = await _admit(project, runner)
 
@@ -940,16 +933,18 @@ def test_the_integration_contracts_rule_matches_the_producers() -> None:
     assert not guide_claims_routes("## §4 Integration Contracts\nroute:   \n")
 
 
-def test_guardkits_colon_form_is_recognised_only_for_an_attended_bundle() -> None:
-    # GuardKit's template writes this form; the specialist emitter does not
-    # recognise it, so a specialist bundle is read the emitter's way, and an
-    # attended one GuardKit's way (Codex review round 1, R5).
-    colon = "## §4: Integration Contracts\n- route: /a\n"
-    assert not guide_claims_routes(colon)
-    assert guide_claims_routes(colon, attended=True)
-    assert guide_claims_routes("## Integration Contracts\nroute: /a\n", attended=True)
-    assert guide_claims_routes("## §4 Integration Contracts\nroute: /a\n", attended=True)
-    assert not guide_claims_routes("## §4: Integration Contracts\nnone\n", attended=True)
+def test_both_heading_forms_are_recognised() -> None:
+    # GuardKit's pinned feature-plan.md tells its planner to write the colon
+    # form; the specialist emitter's pattern misses it (a producer defect for
+    # specialist-agent's owner). Admission recognises both (R5).
+    assert guide_claims_routes("## §4: Integration Contracts\n- route: /a\n")
+    assert guide_claims_routes("## §4 Integration Contracts\n- route: /a\n")
+    assert guide_claims_routes("## Integration Contracts\nroute: /a\n")
+    assert not guide_claims_routes("## §4: Integration Contracts\nnone\n## B\nroute: /b\n")
+    # Either form's own section counts, even when the other form comes first.
+    assert guide_claims_routes(
+        "## §4 Integration Contracts\nnone\n## §4: Integration Contracts\nroute: /a\n"
+    )
 
 
 def test_the_heading_is_case_sensitive_like_the_emitter() -> None:
