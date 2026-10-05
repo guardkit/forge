@@ -1297,6 +1297,23 @@ def read_ledger(con, spec, between=None):
         step("planning_runs")
         free = one("SELECT COUNT(*) FROM work_queue WHERE status = 'QUEUED' AND after_id IS NULL")
         held = one("SELECT COUNT(*) FROM work_queue WHERE status = 'QUEUED' AND after_id IS NOT NULL")
+        # The coordinator's own in-flight rule (work_queue_loop.count_in_flight):
+        # an ADMITTED row is work in flight until the planning run or build it
+        # starts has been written under its correlation id; once one exists,
+        # that row speaks for itself (an INTERRUPTED build included).
+        admitted = rows(
+            "SELECT DISTINCT q.correlation_id FROM work_queue q WHERE q.status = 'ADMITTED'"
+            " AND q.correlation_id IS NOT NULL")
+        unwritten = 0
+        admitted_interrupted = 0
+        for (correlation_id,) in admitted:
+            written = one("SELECT COUNT(*) FROM planning_runs WHERE correlation_id = ?", (correlation_id,)) \
+                + one("SELECT COUNT(*) FROM builds WHERE correlation_id = ?", (correlation_id,))
+            if not written:
+                unwritten += 1
+            elif one("SELECT COUNT(*) FROM builds WHERE correlation_id = ? AND status = 'INTERRUPTED'",
+                     (correlation_id,)):
+                admitted_interrupted += 1
         step("work_queue")
         # LIVE merge and deploy work only, the way the coordinator itself
         # decides it: held when it names a holder AND its expiry is later than
@@ -1333,6 +1350,7 @@ def read_ledger(con, spec, between=None):
     return {
         "builds": builds, "interrupted": interrupted, "planning_runs": plans,
         "queue_waiting": free, "queue_held": held,
+        "admitted_unwritten": unwritten, "admitted_interrupted": admitted_interrupted,
         "merges_live": merges_live, "merges_resting": merges_resting,
         "deploy_locks_live": locks_live, "deploy_locks_expired": locks_expired,
     }
@@ -1411,7 +1429,8 @@ def judge_drained(facts: Mapping[str, Any], consumers: Sequence[str]) -> list[st
 
     Drained means all of: no build in an active state (the coordinator's own
     list, ``BUILD_ACTIVE_STATES``); no planning run unfinished; nothing queued
-    in the work queue; no merge and no deploy in progress (a publication
+    in the work queue and no admitted item whose planning run or build is not
+    written yet (``count_in_flight``'s rule); no merge and no deploy in progress (a publication
     record's lease or a deployment target's lock held and not expired — the
     coordinator's own ``lease_is_live`` and ``held_now`` rule);
     and each durable consumer feeding the coordinator reads zero pending and
@@ -1447,6 +1466,8 @@ def judge_drained(facts: Mapping[str, Any], consumers: Sequence[str]) -> list[st
         for key, say in (
             ("queue_waiting", lambda n: f"{n} {_plural(n, 'item waits', 'items wait')} in the work queue, "
              "which the coordinator's automatic queue would admit within seconds"),
+            ("admitted_unwritten", lambda n: f"{n} admitted queue {_plural(n, 'item has', 'items have')} "
+             "no planning run or build yet (being prepared)"),
             ("queue_held", lambda n: f"{n} {_plural(n, 'item waits', 'items wait')} in the work queue behind "
              "another item; wait for the item it waits on to finish, or withdraw it"),
             ("merges_live", lambda n: f"{n} {_plural(n, 'merge is', 'merges are')} in progress "
@@ -1496,6 +1517,12 @@ def drained_notes(facts: Mapping[str, Any]) -> list[str]:
             f"for information: {n} {_plural(n, 'build is', 'builds are')} INTERRUPTED. A restart "
             "leaves them as they are; one that can be relaunched holds an unacknowledged build "
             "request, which the consumer check above already counts"
+        )
+    n = _count(ledger.get("admitted_interrupted"))
+    if n:
+        notes.append(
+            f"for information: {n} admitted queue {_plural(n, 'item stays', 'items stay')} ADMITTED "
+            "with an INTERRUPTED build; the build speaks for it, as the coordinator's own count has it"
         )
     n = _count(ledger.get("merges_resting"))
     if n:

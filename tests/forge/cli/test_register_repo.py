@@ -659,7 +659,7 @@ def _quiet() -> dict[str, Any]:
     return {
         "ledger": {
             "builds": {}, "interrupted": 0, "planning_runs": {}, "queue_waiting": 0,
-            "queue_held": 0,
+            "queue_held": 0, "admitted_unwritten": 0, "admitted_interrupted": 0,
             "merges_live": 0, "merges_resting": 0,
             "deploy_locks_live": 0, "deploy_locks_expired": 0,
         },
@@ -870,7 +870,7 @@ def test_the_read_script_counts_a_real_ledger_and_says_an_unreachable_bus_is_unr
 
     assert facts["ledger"] == {
         "builds": {"RUNNING": 1}, "interrupted": 0, "planning_runs": {"FEATURE_SPEC": 1},
-        "queue_waiting": 1, "queue_held": 1,
+        "queue_waiting": 1, "queue_held": 1, "admitted_unwritten": 0, "admitted_interrupted": 0,
         "merges_live": 1, "merges_resting": 0,
         "deploy_locks_live": 1, "deploy_locks_expired": 0,
     }
@@ -965,6 +965,49 @@ def test_a_live_deploy_lock_is_not_drained(tmp_path):
     ledger.deploy_lock(days_ago=0)
     reasons, _ = ledger.judged()
     assert reasons == ["1 deploy is in progress (a deployment target's lock is held and has not expired)"]
+
+
+# ---------------------------------------------------------------------------
+# Admitted work the coordinator counts as in flight (count_in_flight's rule)
+# ---------------------------------------------------------------------------
+
+
+def test_an_admission_awaiting_preparation_is_not_drained(tmp_path):
+    ledger = Ledger(tmp_path / "forge.db")
+    ledger.queue(status="ADMITTED", correlation_id="corr-1")
+    reasons, _ = ledger.judged()
+    assert reasons == ["1 admitted queue item has no planning run or build yet (being prepared)"]
+
+
+def test_a_historical_admitted_row_with_an_interrupted_build_is_drained_with_a_note(tmp_path):
+    ledger = Ledger(tmp_path / "forge.db")
+    ledger.queue(status="ADMITTED", correlation_id="corr-old")
+    ledger.build("INTERRUPTED", correlation_id="corr-old")
+    reasons, notes = ledger.judged()
+    assert reasons == []
+    assert any("1 admitted queue item stays ADMITTED with an INTERRUPTED build" in n for n in notes)
+
+
+def test_admitted_rows_are_judged_exactly_as_count_in_flight_judges_them(tmp_path):
+    from forge.planning.work_queue_loop import _correlation_ids_in, _work_is_written
+
+    ledger = Ledger(tmp_path / "forge.db")
+    ledger.queue(status="ADMITTED", correlation_id="unwritten-1")
+    ledger.queue(status="ADMITTED", correlation_id="unwritten-2")
+    ledger.queue(status="ADMITTED", correlation_id="has-run")
+    ledger.plan("PLANNED_HANDOFF", correlation_id="has-run")
+    ledger.queue(status="ADMITTED", correlation_id="has-build")
+    ledger.build("COMPLETE", correlation_id="has-build")
+    ledger.queue(status="ADMITTED", correlation_id="interrupted")
+    ledger.build("INTERRUPTED", correlation_id="interrupted")
+    ledger.queue(status="DONE", correlation_id="done")
+
+    theirs = {
+        c for c in _correlation_ids_in(ledger.cx, "work_queue", "status", ("ADMITTED",))
+        if not _work_is_written(ledger.cx, c)
+    }
+    assert theirs == {"unwritten-1", "unwritten-2"}
+    assert ledger.read()["ledger"]["admitted_unwritten"] == len(theirs)
 
 
 # ---------------------------------------------------------------------------
