@@ -6,7 +6,7 @@ services for it — the deploy sidecar and the build runner — on the factory's
 own clone of the repository. Rules 68 and 69 of the spec, and rule 72's
 inventory.
 
-Six halves are proven here:
+Five halves are proven here:
 
 * the deploy wrapper (``deploy/sandbox-deploy.sh``) creates such a sandbox
   with the clone, the read-only mounts of the factory's code, the read-write
@@ -20,8 +20,6 @@ Six halves are proven here:
   and the note where those tests used to be, below;
 * the profile's six new settings load, are checked, and reach the deploy
   script's environment exactly when they are set;
-* ``forge register-repo --deploy-port`` emits them with this repository's own
-  ports and paths, and ships the bootstrap byte for byte;
 * the host unit that holds the bootstrap open is shaped like the keeper, and
   its stop reaches inside the sandbox — proven by running its own ExecStop
   command line against a real process of this test's own making;
@@ -44,10 +42,8 @@ import subprocess
 from pathlib import Path
 
 import pytest
-import yaml
 
 import forge.cli.deploy_templates as templates
-from forge.cli import register_repo
 from forge.deploy.profile import DeployProfileError, parse_deploy_profile
 from forge.deploy.runbook_builder import build_deploy_runbook, sandbox_env
 
@@ -490,7 +486,7 @@ class TestTheWrapperLeavesTheComposeSupervisorAlone:
 # stop that exits 0 only when both containers are really gone.
 #
 # What is still proven HERE is everything around it: the wrapper that creates
-# the sandbox, the profile settings, what register-repo writes, and the host
+# the sandbox, the profile settings, and the host
 # unit that holds the bootstrap open.
 # ---------------------------------------------------------------------------
 
@@ -616,102 +612,6 @@ class TestTheProfileSettings:
                 env = step.params["extra_env"]
                 assert all(name in env for name in SIX), step.step_type
                 assert env["SANDBOX_RUNNER_PUBLISH"] == "127.0.0.1:8924:8124"
-
-
-# ---------------------------------------------------------------------------
-# register-repo emits the settings for this repository
-# ---------------------------------------------------------------------------
-
-
-class TestRegisterRepoEmitsTheSettings:
-    def test_the_service_ports_come_from_the_app_port(self):
-        # The spec's example: api_test on 8901 has its runner on 8924 and its
-        # sidecar on 8925.
-        assert register_repo.service_ports_for(8901) == (8924, 8925)
-        assert register_repo.service_ports_for(8911) == (8934, 8935)
-        assert register_repo.MAX_DEPLOY_PORT == 65511
-
-    def test_the_profile_names_the_ports_the_mounts_and_the_receipts_root(
-        self, tmp_path, monkeypatch
-    ):
-        receipts = tmp_path / "receipts"
-        monkeypatch.setenv("FORGE_RECEIPTS_DIR", str(receipts))
-        repo = tmp_path / "estate" / "bench-one"
-        repo.mkdir(parents=True)
-
-        rendered = register_repo.render_deploy_files(name="bench-one", repo=repo, app_port=8911)
-        profile = parse_deploy_profile(yaml.safe_load(rendered["deploy/profile.yaml"]))
-
-        sandbox = profile.sandbox
-        assert sandbox is not None
-        assert sandbox.name == "bench-one-deploy"
-        assert sandbox.publish == ("127.0.0.1:8911:8911", "127.0.0.1:8912:8912")
-        assert sandbox.sidecar_publish == "127.0.0.1:8935:8125"
-        assert sandbox.runner_publish == "127.0.0.1:8934:8124"
-        assert sandbox.forge_path == str(tmp_path / "estate" / "forge")
-        assert sandbox.guardkit_path == str(tmp_path / "estate" / "guardkit")
-        assert sandbox.receipts_path == str(receipts)
-        # The environment file is named once it exists: the sandbox is created
-        # with it, so the line is there to fill in, commented out.
-        assert sandbox.env_file is None
-        assert '# env_file: "/run/user/1000/forge-sandbox/bench-one-deploy.env"' in (
-            rendered["deploy/profile.yaml"]
-        )
-
-    def test_named_mounts_and_receipts_root_win_over_the_defaults(self, tmp_path):
-        repo = tmp_path / "estate" / "bench-one"
-        repo.mkdir(parents=True)
-
-        rendered = register_repo.render_deploy_files(
-            name="bench-one",
-            repo=repo,
-            app_port=8911,
-            forge_path=tmp_path / "elsewhere" / "forge",
-            guardkit_path=tmp_path / "elsewhere" / "guardkit",
-            receipts_path=tmp_path / "elsewhere" / "receipts",
-        )
-        sandbox = parse_deploy_profile(yaml.safe_load(rendered["deploy/profile.yaml"])).sandbox
-
-        assert sandbox is not None
-        assert sandbox.forge_path == str(tmp_path / "elsewhere" / "forge")
-        assert sandbox.guardkit_path == str(tmp_path / "elsewhere" / "guardkit")
-        assert sandbox.receipts_path == str(tmp_path / "elsewhere" / "receipts")
-
-    def test_the_bootstrap_is_shipped_byte_for_byte_as_the_fifth_file(self, tmp_path):
-        repo = tmp_path / "estate" / "bench-one"
-        repo.mkdir(parents=True)
-
-        rendered = register_repo.render_deploy_files(name="bench-one", repo=repo, app_port=8911)
-
-        assert register_repo.DEPLOY_FILES == (
-            "deploy/profile.yaml",
-            "deploy/sandbox-deploy.sh",
-            "deploy/sandbox-runner.sh",
-            "deploy/deploy.sh",
-            "deploy/docker-compose.candidate.yml",
-        )
-        assert set(rendered) == set(register_repo.DEPLOY_FILES)
-        assert rendered["deploy/sandbox-runner.sh"] == (TEMPLATES / "sandbox-runner.sh").read_text(
-            encoding="utf-8"
-        )
-        assert rendered["deploy/sandbox-deploy.sh"] == (TEMPLATES / "sandbox-deploy.sh").read_text(
-            encoding="utf-8"
-        )
-        assert "@@" not in rendered["deploy/sandbox-runner.sh"]
-
-    def test_the_written_profile_loads_through_the_deploy_step_s_own_loader(self, tmp_path):
-        from forge.deploy.profile import load_deploy_profile
-
-        repo = tmp_path / "estate" / "bench-one"
-        (repo / "deploy").mkdir(parents=True)
-        rendered = register_repo.render_deploy_files(name="bench-one", repo=repo, app_port=8911)
-        (repo / "deploy" / "profile.yaml").write_text(rendered["deploy/profile.yaml"], encoding="utf-8")
-
-        profile = load_deploy_profile(repo / "deploy" / "profile.yaml")
-
-        assert profile.sandbox is not None
-        assert profile.sandbox.runner_publish == "127.0.0.1:8934:8124"
-        assert "sandbox" not in profile.extra
 
 
 # ---------------------------------------------------------------------------

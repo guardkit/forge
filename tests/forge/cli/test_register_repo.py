@@ -1,23 +1,27 @@
-"""``forge register-repo`` — the register-repo spec (2026-09-05), rule 10.
+"""``forge register-repo`` for the container set-up (design of 5 October 2026).
 
-Every test builds its own ``forge.yaml`` and its own repository under
-``tmp_path``. Nothing here reads or writes the live estate: the repository base
-is redirected with ``FORGE_REPO_BASE``, the config comes from ``--config``, and
-the two seams that reach outside the process (``guardkit init`` and the build
-ledger) are rebound on the module.
+Every check of the design's register-repo acceptance list is here. Nothing in
+this file reaches git, docker or sbx: the command's one seam,
+``register_repo.run_command``, is replaced by :class:`FakeEstate`, which keeps
+the settings volume, the sandbox's files and clones, and the GitHub side as
+plain dictionaries and answers each command the way the live estate would.
+The one exception is the drained read's own script, which is run for real
+against a real (temporary) ledger and a bus address nothing listens on.
 
-The fixture ``forge.yaml`` carries comment lines on purpose. The live file's
-comments are the record of why entries exist, so "the comments survive byte for
-byte" is a test, not a nicety.
+The settings fixtures carry comment lines on purpose: the live files'
+comments are the record of why entries exist.
 """
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
+import shutil
+import sqlite3
 import subprocess
+import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 import yaml
@@ -25,2063 +29,887 @@ from click.testing import CliRunner
 
 from forge.cli import register_repo
 from forge.cli.main import main
-from forge.config.loader import load_config
 
-#: The real discovery seam, captured before the autouse fixture stubs it, so the
-#: fallback below can be exercised end to end.
-_REAL_DISCOVER = register_repo._discover_test_roots
+LEAF = "bench-one"
+KEY = f"guardkit/{LEAF}"
+URL = f"https://github.com/guardkit/{LEAF}.git"
+SANDBOX = "api-test-deploy"
+VOLUME = "forge-estate_forge-settings"
+CLONE = "/home/someone/Projects/api_test"
+SANDBOX_SETTINGS = f"{CLONE}/.guardkit/tmp/factory-runtime/forge.yaml"
+CLONE_PATH = f"{CLONE}/.guardkit/tmp/factory-runtime/projects/{LEAF}"
+COORDINATOR_PATH = f"/var/lib/forge/projects/{LEAF}"
 
-#: The real estate gate, captured before the autouse fixture stubs it, so the
-#: gate's own branches can be exercised directly without docker.
-_REAL_ESTATE_STEP = register_repo._estate_step
-
-# A comment on nearly every block: this is what must survive the edit.
-FIXTURE_CONFIG = """\
-# forge.yaml — the fixture. Every comment in this file is load-bearing prose.
+COORDINATOR_YAML = """\
+# THE COORDINATOR'S SETTINGS FILE (fixture). Every comment is load-bearing.
 permissions:
   filesystem:
-    # The allowlist is deliberately explicit: no implicit default.
+    # Only paths inside the container.
     allowlist:
-    - /home/forge
-    - /srv/checkouts/forge
-approval:
-  expected_approver: U03QR8WKT29
+      - /var/lib/forge-evidence
+      - /var/lib/forge/projects/api_test
 planning:
+  enabled: true
   default_target_repo: guardkit/api_test
+  # The coordinator's own copy of each project, by the key it is registered under.
   target_repo_paths:
-    guardkit/api_test: /srv/checkouts/api_test
-    # Namespace aliases (2026-08-02, attended): builds are queued with
-    # repo=<checkout-folder>/<name>.
-    checkouts/api_test: /srv/checkouts/api_test
+    guardkit/api_test: /var/lib/forge/projects/api_test
+    appmilla_github/api_test: /var/lib/forge/projects/api_test
+  # One entry per project that has a sandbox.
+  sandboxes:
+    guardkit/api_test:
+      name: api-test-deploy
+      sidecar_url: "${FORGE_SANDBOX_SIDECAR_URL}"
+      runner_url: "${FORGE_SANDBOX_RUNNER_URL}"
+    # A note after the last sandbox.
+deploy:
+  enabled: false
+  execution_surface: sidecar
+  sidecar_url: "${FORGE_SANDBOX_SIDECAR_URL}"
+publication:
+  enabled: false
+  publisher_url: "${FORGE_PUBLISHER_URL}"
+  builds_may_run_inside_the_coordinator: false
+"""
+
+SANDBOX_YAML = f"""\
+# THE SANDBOX'S OWN SETTINGS FILE (fixture): paths inside the sandbox.
+permissions:
+  filesystem:
+    allowlist:
+      - {CLONE}
+planning:
+  enabled: true
+  target_repo_paths:
+    # The helper resolves a project by this key.
+    guardkit/api_test: {CLONE}
+  sandboxes:
+    guardkit/api_test:
+      name: api-test-deploy
+      sidecar_url: http://10.254.41.1:8925
+      runner_url: http://10.254.41.1:8924
+"""
+
+PUBLISHER_JSON = {
+    "credential_file": "/etc/forge-publisher/credential",
+    "ledger": "/var/lib/forge/forge.db",
+    "state_dir": "/home/publisher/state",
+    "host": "0.0.0.0",
+    "port": 8711,
+    "git_timeout_seconds": 180,
+    "known_hosts_file": "/etc/forge-publisher/known_hosts",
+    "projects": {
+        "guardkit/api_test": {
+            "source": "git://10.254.41.1:8918/api_test",
+            "remote": "git@github.com:guardkit/api_test.git",
+        }
+    },
+}
+
+GOOD_CONFIG = """\
+memory:
+  project: bench_one
+toolchain:
+  test: pytest -q
+autobuild:
+  player:
+    required_documents:
+      - docs/rules.md
 """
 
 
-def _write_config(tmp_path: Path, text: str = FIXTURE_CONFIG) -> Path:
-    path = tmp_path / "forge.yaml"
-    path.write_text(text, encoding="utf-8")
-    return path
+def _ok(stdout: str = "") -> subprocess.CompletedProcess[str]:
+    return subprocess.CompletedProcess([], 0, stdout, "")
 
 
-def _make_repo(
-    base: Path,
-    name: str,
-    *,
-    git: bool = True,
-    remote: bool = True,
-    guardkit: bool = True,
-    toolchain: str | None = None,
-    extras: bool = True,
-) -> Path:
-    repo = base / name
-    repo.mkdir(parents=True)
-    if git:
-        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
-        if remote:
-            subprocess.run(
-                ["git", "remote", "add", "origin", "https://example.invalid/x.git"],
-                cwd=repo,
-                check=True,
-            )
-    if guardkit:
-        (repo / ".guardkit").mkdir()
-        body = "# the repository's guardkit config\n"
-        if toolchain is not None:
-            body += toolchain
-        (repo / ".guardkit" / "config.yaml").write_text(body, encoding="utf-8")
-    if extras:
-        (repo / "tests" / "smoke").mkdir(parents=True)
-        (repo / "qa" / "gates").mkdir(parents=True)
-        (repo / "qa" / "gates" / "registry.yaml").write_text("{}\n", encoding="utf-8")
-        (repo / "deploy").mkdir()
-        (repo / "deploy" / "profile.yaml").write_text("{}\n", encoding="utf-8")
-        (repo / "docs").mkdir()
-        (repo / "docs" / "architecture-rules.yaml").write_text(
-            "{}\n", encoding="utf-8"
-        )
-    return repo
+def _no(code: int = 1, stderr: str = "") -> subprocess.CompletedProcess[str]:
+    return subprocess.CompletedProcess([], code, "", stderr)
 
 
-@pytest.fixture(autouse=True)
-def _isolate(monkeypatch, tmp_path):
-    """Point the command at tmp_path and stub the two outside-the-process seams."""
-    base = tmp_path / "base"
-    base.mkdir()
-    monkeypatch.setenv(register_repo.FORGE_REPO_BASE_ENV, str(base))
-    # A tmp_path checkout belongs to whoever runs the suite; the uid rule is
-    # exercised directly in its own test.
-    monkeypatch.setattr(register_repo, "EXPECTED_OWNER_UID", os.getuid())
-    monkeypatch.setattr(
-        register_repo,
-        "_estate_step",
-        lambda: register_repo.Step("estate", "ok", "all builds terminal"),
-    )
-    monkeypatch.setattr(
-        register_repo, "_discover_test_roots", lambda repo: ["tests/smoke"]
-    )
+class FakeEstate:
+    """The live estate as three dictionaries and a project folder.
 
-    def _no_init(repo, template):  # pragma: no cover — asserted where it matters
-        raise AssertionError("guardkit init was shelled out to unexpectedly")
-
-    monkeypatch.setattr(register_repo, "_run_guardkit_init", _no_init)
-    return base
-
-
-def _run(config: Path, *args: str):
-    return CliRunner().invoke(main, ["--config", str(config), "register-repo", *args])
-
-
-def _steps(result) -> list[tuple[str, str, str]]:
-    return [
-        (row["step"], row["status"], row["detail"]) for row in json.loads(result.output)
-    ]
-
-
-def _status_of(result, step: str) -> list[str]:
-    return [s for name, s, _ in _steps(result) if name == step]
-
-
-# ---------------------------------------------------------------------------
-# The happy path
-# ---------------------------------------------------------------------------
-
-
-def test_fresh_repo_writes_the_allowlist_entry_and_both_keys(_isolate, tmp_path):
-    repo = _make_repo(_isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n")
-    config = _write_config(tmp_path)
-
-    result = _run(config, str(repo))
-
-    assert result.exit_code == 0, result.output
-    parsed = load_config(config)
-    assert Path(str(repo)) in [Path(p) for p in parsed.permissions.filesystem.allowlist]
-    assert parsed.planning.target_repo_paths["guardkit/bench-one"] == str(repo)
-    # The second spelling is the checkout folder's own name, derived from
-    # FORGE_REPO_BASE (here ``<tmp_path>/base``) rather than written into the
-    # source, so no machine's folder name lives in the code (2026-09-24).
-    assert parsed.planning.target_repo_paths["base/bench-one"] == str(repo)
-
-
-def test_the_second_key_spelling_follows_the_checkout_folder(_isolate, tmp_path,
-                                                             monkeypatch):
-    """Point FORGE_REPO_BASE somewhere else and the alias namespace moves."""
-    base = tmp_path / "somewhere-else"
-    base.mkdir()
-    monkeypatch.setenv(register_repo.FORGE_REPO_BASE_ENV, str(base))
-    repo = _make_repo(base, "bench-one", toolchain="toolchain:\n  test: pytest\n")
-    config = _write_config(tmp_path)
-
-    result = _run(config, str(repo))
-
-    assert result.exit_code == 0, result.output
-    parsed = load_config(config)
-    assert parsed.planning.target_repo_paths["somewhere-else/bench-one"] == str(repo)
-
-
-def test_it_refuses_when_no_checkout_directory_is_named(_isolate, tmp_path,
-                                                        monkeypatch):
-    """There is no default checkout directory any more (2026-09-24).
-
-    It used to default to one company's folder on one person's machine, which
-    is a path this factory cannot know and which travelled into the release
-    image. With the setting unset the command says so by name and writes
-    nothing.
+    ``volume``: file name -> text in the coordinator's settings volume.
+    ``sandbox_files``: absolute path -> text inside the sandbox.
+    ``clones``: absolute path -> origin URL of a clone inside the sandbox.
+    ``project``: the files GitHub would hand a clone of the project.
     """
-    repo = _make_repo(_isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n")
-    config = _write_config(tmp_path)
-    before = config.read_text(encoding="utf-8")
-    monkeypatch.delenv(register_repo.FORGE_REPO_BASE_ENV, raising=False)
 
-    result = _run(config, str(repo))
-
-    assert result.exit_code != 0
-    assert "FORGE_REPO_BASE is not set" in result.output
-    assert config.read_text(encoding="utf-8") == before
-
-
-def test_the_report_ends_with_the_recreate_command_and_the_slack_sentence(
-    _isolate, tmp_path
-):
-    repo = _make_repo(_isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n")
-    config = _write_config(tmp_path)
-
-    result = _run(config, str(repo))
-
-    lines = result.output.strip().splitlines()
-    assert lines[-2] == "next  run: bash ops/forge-prod-recreate.sh"
-    assert lines[-1] == "slack target: bench-one  <your first feature>"
-
-
-def test_comment_lines_survive_byte_for_byte(_isolate, tmp_path):
-    repo = _make_repo(_isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n")
-    config = _write_config(tmp_path)
-
-    _run(config, str(repo))
-
-    after = config.read_text(encoding="utf-8")
-    for line in FIXTURE_CONFIG.splitlines():
-        if line.strip().startswith("#"):
-            assert line in after.splitlines(), line
-    # And every original line is still there, in order.
-    original = FIXTURE_CONFIG.splitlines()
-    kept = [line for line in after.splitlines() if line in original]
-    assert kept == original
-
-
-def test_the_edited_yaml_re_parses_through_load_config(_isolate, tmp_path):
-    repo = _make_repo(_isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n")
-    config = _write_config(tmp_path)
-
-    result = _run(config, str(repo), "--json")
-
-    assert result.exit_code == 0, result.output
-    assert "ok" in _status_of(result, "config")
-    load_config(config)  # raises if the surgical edit broke the document
-
-
-def test_a_dated_backup_is_taken_before_the_first_change(_isolate, tmp_path):
-    repo = _make_repo(_isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n")
-    config = _write_config(tmp_path)
-
-    _run(config, str(repo))
-
-    backups = list(tmp_path.glob("forge.yaml.bak-*-pre-register-bench-one"))
-    assert len(backups) == 1
-    assert backups[0].read_text(encoding="utf-8") == FIXTURE_CONFIG
-
-
-# ---------------------------------------------------------------------------
-# Idempotence
-# ---------------------------------------------------------------------------
-
-
-def test_second_run_is_byte_identical_and_takes_no_backup(_isolate, tmp_path):
-    repo = _make_repo(_isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n")
-    config = _write_config(tmp_path)
-
-    _run(config, str(repo))
-    after_first = config.read_text(encoding="utf-8")
-    repo_config_first = (repo / ".guardkit" / "config.yaml").read_text(encoding="utf-8")
-    for backup in tmp_path.glob("forge.yaml.bak-*"):
-        backup.unlink()
-
-    second = _run(config, str(repo), "--json")
-
-    assert second.exit_code == 0, second.output
-    assert config.read_text(encoding="utf-8") == after_first
-    assert (repo / ".guardkit" / "config.yaml").read_text(
-        encoding="utf-8"
-    ) == repo_config_first
-    assert list(tmp_path.glob("forge.yaml.bak-*")) == []
-    assert {status for _, status, _ in _steps(second)} <= {"ok", "unchanged"}
-
-
-# ---------------------------------------------------------------------------
-# The checks that refuse
-# ---------------------------------------------------------------------------
-
-
-def test_non_git_path_is_refused(_isolate, tmp_path):
-    repo = _make_repo(_isolate, "bench-one", git=False)
-    config = _write_config(tmp_path)
-    before = config.read_text(encoding="utf-8")
-
-    result = _run(config, str(repo), "--toolchain-test", "pytest")
-
-    assert result.exit_code == 1
-    assert "is not a git checkout" in result.output
-    assert config.read_text(encoding="utf-8") == before
-
-
-def test_a_path_outside_the_base_is_refused(_isolate, tmp_path):
-    outside = tmp_path / "elsewhere" / "bench-one"
-    outside.mkdir(parents=True)
-    (outside / ".git").mkdir()
-    config = _write_config(tmp_path)
-    before = config.read_text(encoding="utf-8")
-
-    result = _run(config, str(outside), "--toolchain-test", "pytest")
-
-    assert result.exit_code == 1
-    assert "is not directly under" in result.output
-    assert config.read_text(encoding="utf-8") == before
-
-
-def test_a_missing_path_is_refused(_isolate, tmp_path):
-    config = _write_config(tmp_path)
-
-    result = _run(config, str(_isolate / "nope"), "--toolchain-test", "pytest")
-
-    assert result.exit_code == 1
-    assert "does not exist" in result.output
-
-
-def test_a_checkout_owned_by_someone_else_is_refused(_isolate, tmp_path, monkeypatch):
-    repo = _make_repo(_isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n")
-    config = _write_config(tmp_path)
-    monkeypatch.setattr(register_repo, "EXPECTED_OWNER_UID", os.getuid() + 5000)
-
-    result = _run(config, str(repo))
-
-    assert result.exit_code == 1
-    assert "is owned by uid" in result.output
-
-
-def test_a_map_key_pointing_somewhere_else_is_refused(_isolate, tmp_path):
-    repo = _make_repo(_isolate, "api_test", toolchain="toolchain:\n  test: pytest\n")
-    config = _write_config(tmp_path)
-    before = config.read_text(encoding="utf-8")
-
-    result = _run(config, str(repo))
-
-    assert result.exit_code == 1
-    assert "already points at" in result.output
-    assert config.read_text(encoding="utf-8") == before
-
-
-def test_missing_toolchain_test_flag_is_refused(_isolate, tmp_path):
-    repo = _make_repo(_isolate, "bench-one", toolchain=None)
-    config = _write_config(tmp_path)
-    before = config.read_text(encoding="utf-8")
-
-    result = _run(config, str(repo))
-
-    assert result.exit_code == 1
-    assert "--toolchain-test" in result.output
-    assert config.read_text(encoding="utf-8") == before
-
-
-@pytest.mark.parametrize("bad", ["guardkit/bench-one", "../bench-one", "a\\b"])
-def test_a_name_with_a_path_separator_is_refused_before_anything_is_written(
-    _isolate, tmp_path, bad
-):
-    """The name becomes two map keys, a folder name and part of a backup's name.
-
-    A separator in it would mint the key ``guardkit/guardkit/bench-one``, which
-    nothing looks up, and would put the dated backup in another directory. It is
-    refused before the first write, so both files are exactly as they were —
-    checked by mtime, not by reading, so "nothing was written" means nothing at
-    all, not "nothing that changed the bytes".
-    """
-    repo = _make_repo(_isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n")
-    repo_config = repo / ".guardkit" / "config.yaml"
-    config = _write_config(tmp_path)
-    before = (config.stat().st_mtime_ns, repo_config.stat().st_mtime_ns)
-    before_text = config.read_text(encoding="utf-8")
-
-    result = _run(config, str(repo), "--name", bad)
-
-    assert result.exit_code == 1
-    assert "path separator" in result.output
-    assert (config.stat().st_mtime_ns, repo_config.stat().st_mtime_ns) == before
-    assert config.read_text(encoding="utf-8") == before_text
-    assert list(tmp_path.glob("forge.yaml.bak-*")) == []
-
-
-def test_the_separator_refusal_is_a_refused_step_named_name(_isolate, tmp_path):
-    repo = _make_repo(_isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n")
-    config = _write_config(tmp_path)
-
-    result = _run(config, str(repo), "--name", "guardkit/bench-one", "--json")
-
-    payload = json.loads(result.output.split("Error:")[0])
-    assert payload[-1]["status"] == "refused"
-    assert payload[-1]["step"] == "name"
-
-
-def test_a_plain_name_is_still_accepted(_isolate, tmp_path):
-    repo = _make_repo(_isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n")
-    config = _write_config(tmp_path)
-
-    result = _run(config, str(repo), "--name", "bench_one")
-
-    assert result.exit_code == 0, result.output
-    parsed = load_config(config)
-    assert parsed.planning.target_repo_paths["guardkit/bench_one"] == str(repo)
-
-
-def test_a_refusal_is_reported_as_a_refused_step_under_json(_isolate, tmp_path):
-    repo = _make_repo(_isolate, "bench-one", toolchain=None)
-    config = _write_config(tmp_path)
-
-    result = _run(config, str(repo), "--json")
-
-    payload = json.loads(result.output.split("Error:")[0])
-    assert payload[-1]["status"] == "refused"
-    assert payload[-1]["step"] == "toolchain"
-
-
-def test_an_unparseable_edit_restores_the_file_and_exits_non_zero(
-    _isolate, tmp_path, monkeypatch
-):
-    repo = _make_repo(_isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n")
-    config = _write_config(tmp_path)
-    before = config.read_text(encoding="utf-8")
-    monkeypatch.setattr(
-        register_repo,
-        "append_sequence_item",
-        lambda lines, path, value: lines.insert(0, "  not: valid: yaml: at: all"),
-    )
-
-    result = _run(config, str(repo))
-
-    assert result.exit_code == 1
-    assert "no longer parses" in result.output
-    assert config.read_text(encoding="utf-8") == before
-
-
-# ---------------------------------------------------------------------------
-# The checks that warn and carry on
-# ---------------------------------------------------------------------------
-
-
-def test_no_remote_warns_and_exits_zero(_isolate, tmp_path):
-    repo = _make_repo(
-        _isolate, "bench-one", remote=False, toolchain="toolchain:\n  test: pytest\n"
-    )
-    config = _write_config(tmp_path)
-
-    result = _run(config, str(repo), "--json")
-
-    assert result.exit_code == 0, result.output
-    assert _status_of(result, "remote") == ["warn"]
-    assert any("not-pushed" in detail for _, _, detail in _steps(result))
-
-
-def test_empty_test_roots_warn_with_the_spec_sentence(_isolate, tmp_path, monkeypatch):
-    repo = _make_repo(_isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n")
-    config = _write_config(tmp_path)
-    monkeypatch.setattr(register_repo, "_discover_test_roots", lambda repo: [])
-
-    result = _run(config, str(repo), "--json")
-
-    assert result.exit_code == 0, result.output
-    detail = [d for step, _, d in _steps(result) if step == "test-roots"][0]
-    assert detail == (
-        "tests/ holds no subdirectory, so plans that name smoke gates will "
-        "fail plan-containment; add tests/<area>/"
-    )
-
-
-def test_missing_deploy_profile_and_architecture_rules_warn(_isolate, tmp_path):
-    repo = _make_repo(
-        _isolate,
-        "bench-one",
-        extras=False,
-        toolchain="toolchain:\n  test: pytest\n",
-    )
-    config = _write_config(tmp_path)
-
-    result = _run(config, str(repo), "--json")
-
-    assert result.exit_code == 0, result.output
-    assert _status_of(result, "deploy") == ["warn"]
-    assert _status_of(result, "arch-rules") == ["warn"]
-    assert _status_of(result, "qa-gates") == ["warn"]
-
-
-# ---------------------------------------------------------------------------
-# The repository's own guardkit config
-# ---------------------------------------------------------------------------
-
-
-def test_an_existing_toolchain_declaration_is_never_overwritten(_isolate, tmp_path):
-    repo = _make_repo(
-        _isolate,
-        "bench-one",
-        toolchain="toolchain:\n  test: uv run pytest\n  test_timeout: 900\n",
-    )
-    config = _write_config(tmp_path)
-
-    result = _run(config, str(repo), "--toolchain-test", "make test", "--json")
-
-    assert result.exit_code == 0, result.output
-    body = (repo / ".guardkit" / "config.yaml").read_text(encoding="utf-8")
-    assert "uv run pytest" in body
-    assert "make test" not in body
-    assert "test_timeout: 900" in body
-    assert _status_of(result, "toolchain") == ["unchanged"]
-
-
-def test_a_toolchain_block_that_declares_only_a_timeout_keeps_that_timeout(
-    _isolate, tmp_path
-):
-    """The blocker: a block with ``test_timeout`` but no ``test``.
-
-    Writing ``test_timeout`` unconditionally appended a second key; PyYAML takes
-    the last one, so the repository's declared 900 silently became 300 and the
-    file carried a duplicate key that stricter parsers reject.
-    """
-    repo = _make_repo(
-        _isolate,
-        "bench-one",
-        toolchain="toolchain:\n  test_timeout: 900\n  lint: ruff check\n",
-    )
-    config = _write_config(tmp_path)
-
-    result = _run(config, str(repo), "--toolchain-test", "uv run pytest", "--json")
-
-    assert result.exit_code == 0, result.output
-    body = (repo / ".guardkit" / "config.yaml").read_text(encoding="utf-8")
-    assert body.count("test_timeout:") == 1
-    assert "  test: uv run pytest" in body
-    assert "  lint: ruff check" in body
-    declared = yaml.safe_load(body)["toolchain"]
-    assert declared == {
-        "test": "uv run pytest",
-        "test_timeout": 900,
-        "lint": "ruff check",
-    }
-    assert _status_of(result, "toolchain") == ["added"]
-
-
-def test_a_toolchain_block_without_a_timeout_gets_the_default_once(
-    _isolate, tmp_path
-):
-    repo = _make_repo(
-        _isolate, "bench-one", toolchain="toolchain:\n  lint: ruff check\n"
-    )
-    config = _write_config(tmp_path)
-
-    result = _run(config, str(repo), "--toolchain-test", "uv run pytest", "--json")
-
-    assert result.exit_code == 0, result.output
-    body = (repo / ".guardkit" / "config.yaml").read_text(encoding="utf-8")
-    assert yaml.safe_load(body)["toolchain"] == {
-        "test": "uv run pytest",
-        "test_timeout": 300,
-        "lint": "ruff check",
-    }
-
-
-def test_the_minimal_toolchain_block_is_written_when_absent(_isolate, tmp_path):
-    repo = _make_repo(_isolate, "bench-one", toolchain=None)
-    config = _write_config(tmp_path)
-
-    result = _run(config, str(repo), "--toolchain-test", "uv run pytest", "--json")
-
-    assert result.exit_code == 0, result.output
-    body = (repo / ".guardkit" / "config.yaml").read_text(encoding="utf-8")
-    assert "# the repository's guardkit config" in body
-    assert "toolchain:" in body
-    assert "  test: uv run pytest" in body
-    assert "  test_timeout: 300" in body
-    assert _status_of(result, "toolchain") == ["added"]
-
-
-def test_the_memory_project_id_is_written_once_and_sanitised(_isolate, tmp_path):
-    repo = _make_repo(
-        _isolate, "ts-api-test", toolchain="toolchain:\n  test: pytest\n"
-    )
-    config = _write_config(tmp_path)
-
-    result = _run(config, str(repo), "--json")
-
-    assert result.exit_code == 0, result.output
-    body = (repo / ".guardkit" / "config.yaml").read_text(encoding="utf-8")
-    assert "memory:" in body
-    assert "  project: ts_api_test" in body
-    assert _status_of(result, "project-id") == ["ok"]
-
-
-def test_an_existing_memory_project_is_left_alone(_isolate, tmp_path):
-    repo = _make_repo(
-        _isolate,
-        "bench-one",
-        toolchain="toolchain:\n  test: pytest\nmemory:\n  project: chosen_by_hand\n",
-    )
-    config = _write_config(tmp_path)
-
-    result = _run(config, str(repo), "--json")
-
-    body = (repo / ".guardkit" / "config.yaml").read_text(encoding="utf-8")
-    assert body.count("project:") == 1
-    assert "chosen_by_hand" in body
-    assert _status_of(result, "memory") == ["unchanged"]
-
-
-def test_guardkit_init_is_shelled_out_to_when_the_repo_has_none(
-    _isolate, tmp_path, monkeypatch
-):
-    repo = _make_repo(_isolate, "bench-one", guardkit=False)
-    config = _write_config(tmp_path)
-    calls: list[tuple[Path, str]] = []
-
-    def _fake_init(repo_arg, template):
-        calls.append((repo_arg, template))
-        (repo_arg / ".guardkit").mkdir(exist_ok=True)
-        return subprocess.CompletedProcess(["guardkit", "init"], 0, "", "")
-
-    monkeypatch.setattr(register_repo, "_run_guardkit_init", _fake_init)
-
-    result = _run(config, str(repo), "--toolchain-test", "pytest", "--json")
-
-    assert result.exit_code == 0, result.output
-    assert calls == [(repo, "default")]
-    assert _status_of(result, "guardkit") == ["added"]
-
-
-def test_a_failing_guardkit_init_refuses_before_the_config_is_touched(
-    _isolate, tmp_path, monkeypatch
-):
-    repo = _make_repo(_isolate, "bench-one", guardkit=False)
-    config = _write_config(tmp_path)
-    before = config.read_text(encoding="utf-8")
-    monkeypatch.setattr(
-        register_repo,
-        "_run_guardkit_init",
-        lambda repo_arg, template: subprocess.CompletedProcess(
-            ["guardkit", "init"], 1, "", "template not found"
-        ),
-    )
-
-    result = _run(config, str(repo), "--toolchain-test", "pytest")
-
-    assert result.exit_code == 1
-    assert "guardkit init default failed" in result.output
-    assert config.read_text(encoding="utf-8") == before
-    assert list(tmp_path.glob("forge.yaml.bak-*")) == []
-
-
-# ---------------------------------------------------------------------------
-# --dry-run and --json
-# ---------------------------------------------------------------------------
-
-
-def test_dry_run_leaves_both_files_mtimes_unchanged(_isolate, tmp_path):
-    repo = _make_repo(_isolate, "bench-one", toolchain=None)
-    config = _write_config(tmp_path)
-    repo_config = repo / ".guardkit" / "config.yaml"
-    before = (config.stat().st_mtime_ns, repo_config.stat().st_mtime_ns)
-
-    result = _run(
-        config, str(repo), "--toolchain-test", "pytest", "--dry-run", "--json"
-    )
-
-    assert result.exit_code == 0, result.output
-    assert (config.stat().st_mtime_ns, repo_config.stat().st_mtime_ns) == before
-    assert list(tmp_path.glob("forge.yaml.bak-*")) == []
-    assert "would-add" in _status_of(result, "allowlist")
-    assert _status_of(result, "repo-map") == ["would-add", "would-add"]
-    assert _status_of(result, "toolchain") == ["would-add"]
-
-
-def test_json_is_a_list_of_step_status_detail(_isolate, tmp_path):
-    repo = _make_repo(_isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n")
-    config = _write_config(tmp_path)
-
-    result = _run(config, str(repo), "--json")
-
-    payload = json.loads(result.output)
-    assert isinstance(payload, list)
-    assert all(set(row) == {"step", "status", "detail"} for row in payload)
-    assert payload[-2]["step"] == "next"
-    assert payload[-2]["detail"] == "run: bash ops/forge-prod-recreate.sh"
-    assert payload[-1]["step"] == "slack"
-    assert payload[-1]["detail"] == "target: bench-one  <your first feature>"
-
-
-# ---------------------------------------------------------------------------
-# The estate gate — prints, never runs
-# ---------------------------------------------------------------------------
-
-
-# The gate reads a ledger. It reads it the way the recreate script of record
-# does — ask a running forge-prod container first, fall back to FORGE_DB_PATH,
-# and say so plainly when there is neither. No test here touches docker: the
-# thing that runs commands is a parameter, and every test answers it itself.
-
-
-def _fake_runner(answers):
-    """A runner that answers by command word and records what it was asked."""
-    calls: list[list[str]] = []
-
-    def run(argv):
+    def __init__(self, tmp_path: Path) -> None:
+        self.tmp_path = tmp_path
+        self.volume: dict[str, str] = {"forge.yaml": COORDINATOR_YAML}
+        self.sandbox_files: dict[str, str] = {SANDBOX_SETTINGS: SANDBOX_YAML}
+        self.clones: dict[str, str] = {}
+        self.ignored = True
+        self.sandbox_can_read = True
+        self.host_can_read = True
+        self.drained_answer: Any = None
+        self.calls: list[list[str]] = []
+        self.writes: list[str] = []
+        self.project = tmp_path / "github" / LEAF
+        self.project.mkdir(parents=True)
+        self.write_project(".guardkit/config.yaml", GOOD_CONFIG)
+        self.write_project("docs/rules.md", "# Rules\n")
+
+    def write_project(self, relative: str, text: str) -> None:
+        path = self.project / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+
+    def project_digest(self) -> dict[str, bytes]:
+        return {
+            str(p.relative_to(self.project)): (p.read_bytes() if p.is_file() and not p.is_symlink() else b"link")
+            for p in sorted(self.project.rglob("*"))
+        }
+
+    # -- the seam ---------------------------------------------------------
+
+    def __call__(self, argv, *, input=None, timeout=None):  # noqa: A002 — the seam's name
         argv = list(argv)
-        calls.append(argv)
-        return answers[argv[1]]  # 'inspect' or 'exec'
-
-    run.calls = calls  # type: ignore[attr-defined]
-    return run
-
-
-def _completed(returncode=0, stdout="", stderr=""):
-    return subprocess.CompletedProcess(
-        args=["docker"], returncode=returncode, stdout=stdout, stderr=stderr
-    )
-
-
-def _rows(*statuses):
-    return json.dumps(
-        [{"build_id": f"b{i}", "status": s} for i, s in enumerate(statuses)]
-    )
-
-
-def test_a_running_container_is_asked_the_way_the_recreate_script_asks_it():
-    runner = _fake_runner(
-        {
-            "inspect": _completed(stdout="true\n"),
-            "exec": _completed(stdout=_rows("COMPLETE", "FAILED")),
-        }
-    )
-
-    step = _REAL_ESTATE_STEP(runner=runner)
-
-    assert (step.status, step.detail) == ("ok", "all builds terminal")
-    assert runner.calls[1] == [
-        "docker",
-        "exec",
-        "forge-prod",
-        "forge",
-        "--config",
-        "/var/forge/forge.yaml",
-        "status",
-        "--json",
-    ]
-
-
-def test_the_container_branch_counts_the_builds_that_are_not_terminal():
-    runner = _fake_runner(
-        {
-            "inspect": _completed(stdout="true\n"),
-            "exec": _completed(stdout=_rows("COMPLETE", "RUNNING", "QUEUED")),
-        }
-    )
-
-    step = _REAL_ESTATE_STEP(runner=runner)
-
-    assert (step.status, step.detail) == ("wait", "2 builds are not terminal")
-
-
-def test_one_non_terminal_build_reads_as_a_sentence():
-    runner = _fake_runner(
-        {
-            "inspect": _completed(stdout="true\n"),
-            "exec": _completed(stdout=_rows("COMPLETE", "RUNNING")),
-        }
-    )
-
-    step = _REAL_ESTATE_STEP(runner=runner)
-
-    assert step.detail == "1 build is not terminal"
-
-
-def test_a_container_that_cannot_be_read_warns_rather_than_stopping():
-    runner = _fake_runner(
-        {
-            "inspect": _completed(stdout="true\n"),
-            "exec": _completed(returncode=1, stderr="forge status: database error"),
-        }
-    )
-
-    step = _REAL_ESTATE_STEP(runner=runner)
-
-    assert step.status == "warn"
-    assert step.detail.startswith("could not read the build ledger")
-
-
-def test_a_stopped_container_falls_through_to_the_ledger_path(monkeypatch, tmp_path):
-    """A container that exists but is down is not asked; FORGE_DB_PATH is read."""
-    ledger = tmp_path / "forge.db"
-    ledger.write_text("", encoding="utf-8")
-    monkeypatch.setenv("FORGE_DB_PATH", str(ledger))
-    monkeypatch.setattr(
-        register_repo, "_read_ledger_views", lambda path: ["running-build"]
-    )
-    monkeypatch.setattr(register_repo, "_all_terminal", lambda views: False)
-    runner = _fake_runner({"inspect": _completed(stdout="false\n")})
-
-    step = _REAL_ESTATE_STEP(runner=runner)
-
-    assert (step.status, step.detail) == ("wait", "1 build is not terminal")
-    assert [c[1] for c in runner.calls] == ["inspect"]  # never asked the container
-
-
-def test_no_container_at_all_falls_through_to_the_ledger_path(monkeypatch, tmp_path):
-    ledger = tmp_path / "forge.db"
-    ledger.write_text("", encoding="utf-8")
-    monkeypatch.setenv("FORGE_DB_PATH", str(ledger))
-    monkeypatch.setattr(register_repo, "_read_ledger_views", lambda path: [])
-    runner = _fake_runner({"inspect": _completed(returncode=1, stderr="No such object")})
-
-    step = _REAL_ESTATE_STEP(runner=runner)
-
-    assert (step.status, step.detail) == ("ok", "all builds terminal")
-
-
-def test_a_machine_with_no_docker_command_at_all_still_reads_the_ledger(
-    monkeypatch, tmp_path
-):
-    ledger = tmp_path / "forge.db"
-    ledger.write_text("", encoding="utf-8")
-    monkeypatch.setenv("FORGE_DB_PATH", str(ledger))
-    monkeypatch.setattr(register_repo, "_read_ledger_views", lambda path: [])
-
-    def _no_docker(argv):
-        raise FileNotFoundError("docker")
-
-    step = _REAL_ESTATE_STEP(runner=_no_docker)
-
-    assert step.status == "ok"
-
-
-def test_neither_a_container_nor_a_ledger_path_says_so_plainly(monkeypatch):
-    monkeypatch.delenv("FORGE_DB_PATH", raising=False)
-    runner = _fake_runner({"inspect": _completed(returncode=1)})
-
-    step = _REAL_ESTATE_STEP(runner=runner)
-
-    assert step.status == "warn"
-    assert step.detail == (
-        "could not read the build ledger (no forge-prod container and "
-        "FORGE_DB_PATH unset)"
-    )
-
-
-def test_the_gate_reads_the_ledger_and_never_creates_one(monkeypatch, tmp_path):
-    """The read-only path, run for real against a path that is not a database.
-
-    It must warn — and it must leave no file behind. A ledger this command
-    invented would show no builds, and the gate would say "all terminal" about
-    an estate it had never read.
-    """
-    missing = tmp_path / "nowhere" / "forge.db"
-    monkeypatch.setenv("FORGE_DB_PATH", str(missing))
-    runner = _fake_runner({"inspect": _completed(returncode=1)})
-
-    step = _REAL_ESTATE_STEP(runner=runner)
-
-    assert step.status == "warn"
-    assert step.detail.startswith("could not read the build ledger")
-    assert not missing.exists()
-    assert not missing.parent.exists()
-
-
-def test_the_gate_line_reaches_the_report_and_the_command_still_prints(
-    _isolate, tmp_path, monkeypatch
-):
-    repo = _make_repo(_isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n")
-    config = _write_config(tmp_path)
-    monkeypatch.setattr(
-        register_repo,
-        "_estate_step",
-        lambda: register_repo.Step("estate", "wait", "2 builds are not terminal"),
-    )
-
-    result = _run(config, str(repo))
-
-    assert result.exit_code == 0, result.output
-    assert "2 builds are not terminal" in result.output
-    assert "run: bash ops/forge-prod-recreate.sh" in result.output
-
-
-def test_an_unreadable_build_ledger_warns_rather_than_stopping(
-    _isolate, tmp_path, monkeypatch
-):
-    repo = _make_repo(_isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n")
-    config = _write_config(tmp_path)
-    monkeypatch.setattr(
-        register_repo,
-        "_estate_step",
-        lambda: register_repo.Step("estate", "warn", "could not read the build ledger"),
-    )
-
-    result = _run(config, str(repo), "--json")
-
-    assert result.exit_code == 0, result.output
-    assert _status_of(result, "estate") == ["warn"]
-
-
-# ---------------------------------------------------------------------------
-# The surgical writer, on its own
-# ---------------------------------------------------------------------------
-
-
-def test_a_missing_target_repo_paths_block_is_created_under_planning(
-    _isolate, tmp_path
-):
-    text = (
-        "permissions:\n"
-        "  filesystem:\n"
-        "    allowlist:\n"
-        "    - /home/forge\n"
-        "planning:\n"
-        "  # no map yet\n"
-        "  default_target_repo: guardkit/api_test\n"
-    )
-    repo = _make_repo(_isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n")
-    config = _write_config(tmp_path, text)
-
-    result = _run(config, str(repo))
-
-    assert result.exit_code == 0, result.output
-    parsed = load_config(config)
-    assert parsed.planning.target_repo_paths["guardkit/bench-one"] == str(repo)
-    assert "  # no map yet" in config.read_text(encoding="utf-8")
-
-
-def test_the_planning_block_is_created_when_the_config_has_none(_isolate, tmp_path):
-    text = (
-        "permissions:\n"
-        "  filesystem:\n"
-        "    allowlist:\n"
-        "    - /home/forge\n"
-    )
-    repo = _make_repo(_isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n")
-    config = _write_config(tmp_path, text)
-
-    result = _run(config, str(repo))
-
-    assert result.exit_code == 0, result.output
-    parsed = load_config(config)
-    assert set(parsed.planning.target_repo_paths) == {
-        "guardkit/bench-one",
-        "base/bench-one",
-    }
-
-
-def test_project_id_follows_the_existing_sanitiser_rule():
-    assert register_repo.project_id_for("ts-api-test") == "ts_api_test"
-    assert register_repo.project_id_for("api_test") == "api_test"
-    assert register_repo.project_id_for("--weird--name--") == "weird_name"
-    assert register_repo.project_id_for("") == "unknown"
-
-
-def test_locate_walks_indentation_to_a_nested_key():
-    lines = FIXTURE_CONFIG.split("\n")
-    block = register_repo.locate(lines, ("permissions", "filesystem", "allowlist"))
-    assert block is not None
-    assert lines[block.key_line].strip() == "allowlist:"
-    assert block.child_indent == 4
-
-
-# ---------------------------------------------------------------------------
-# The backup really is taken before the first mutation, and a refusal undoes
-# ---------------------------------------------------------------------------
-
-
-def test_the_backup_is_taken_before_the_repository_is_touched(
-    _isolate, tmp_path, monkeypatch
-):
-    repo = _make_repo(_isolate, "bench-one", guardkit=False)
-    config = _write_config(tmp_path)
-    backup_existed_at_init: list[bool] = []
-
-    def _init(repo_arg, template):
-        backup_existed_at_init.append(
-            bool(list(tmp_path.glob("forge.yaml.bak-*-pre-register-bench-one")))
-        )
-        (repo_arg / ".guardkit").mkdir()
-        (repo_arg / ".guardkit" / "config.yaml").write_text("", encoding="utf-8")
-        return subprocess.CompletedProcess(["guardkit", "init"], 0, "", "")
-
-    monkeypatch.setattr(register_repo, "_run_guardkit_init", _init)
-
-    result = _run(config, str(repo), "--toolchain-test", "uv run pytest")
-
-    assert result.exit_code == 0, result.output
-    assert backup_existed_at_init == [True]
-
-
-def test_a_refused_yaml_edit_undoes_the_repository_write_and_the_backup(
-    _isolate, tmp_path, monkeypatch
-):
-    """A refusal is "nothing was registered", so nothing may be left changed."""
-    repo = _make_repo(_isolate, "bench-one", toolchain=None)
-    config = _write_config(tmp_path)
-    repo_config = repo / ".guardkit" / "config.yaml"
-    repo_before = repo_config.read_text(encoding="utf-8")
-    config_before = config.read_text(encoding="utf-8")
-
-    def _refuse(lines, path, value):
-        raise register_repo.YamlEditRefused(
-            "the allowlist has a value on the same line — edit the file by hand"
-        )
-
-    monkeypatch.setattr(register_repo, "append_sequence_item", _refuse)
-
-    result = _run(config, str(repo), "--toolchain-test", "uv run pytest")
-
-    assert result.exit_code == 1
-    assert "edit the file by hand" in result.output
-    assert repo_config.read_text(encoding="utf-8") == repo_before
-    assert config.read_text(encoding="utf-8") == config_before
-    assert list(tmp_path.glob("forge.yaml.bak-*")) == []
-
-
-def test_a_refused_map_edit_undoes_a_repository_config_it_created(
-    _isolate, tmp_path, monkeypatch
-):
-    repo = _make_repo(_isolate, "bench-one", guardkit=False)
-    (repo / ".guardkit").mkdir()
-    config = _write_config(tmp_path)
-
-    def _refuse(lines, path, key, value):
-        raise register_repo.YamlEditRefused("the map cannot be edited safely")
-
-    monkeypatch.setattr(register_repo, "set_mapping_entry", _refuse)
-
-    result = _run(config, str(repo), "--toolchain-test", "uv run pytest")
-
-    assert result.exit_code == 1
-    assert not (repo / ".guardkit" / "config.yaml").exists()
-    assert list(tmp_path.glob("forge.yaml.bak-*")) == []
-
-
-# ---------------------------------------------------------------------------
-# Test roots on the surface Rich actually runs the command from
-# ---------------------------------------------------------------------------
-
-
-def test_test_roots_fall_back_to_a_plain_scan_when_guardkit_is_absent(
-    _isolate, tmp_path, monkeypatch
-):
-    """forge's venv has the guardkit CLI, not the guardkit package.
-
-    Forge's own discovery raises there, and the report used to say the roots
-    could not be listed on every real run. The plain scan answers instead.
-    """
-    from forge.planning import target_terminal_tools
-
-    repo = _make_repo(_isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n")
-    (repo / "tests" / "unit").mkdir(parents=True)
-    (repo / "tests" / "__pycache__").mkdir(parents=True)
-    (repo / "tests" / "conftest.py").write_text("", encoding="utf-8")
-    config = _write_config(tmp_path)
-
-    def _no_guardkit(path, **kwargs):
-        raise target_terminal_tools.TargetTestRootsUnresolved("no guardkit here")
-
-    monkeypatch.setattr(
-        target_terminal_tools, "discover_target_test_roots", _no_guardkit
-    )
-    monkeypatch.setattr(register_repo, "_discover_test_roots", _REAL_DISCOVER)
-
-    result = _run(config, str(repo), "--json")
-
-    assert result.exit_code == 0, result.output
-    assert _status_of(result, "test-roots") == ["ok"]
-    detail = [d for step, _, d in _steps(result) if step == "test-roots"][0]
-    assert detail == "tests/smoke, tests/unit"
-
-
-def test_the_fallback_still_gives_the_spec_sentence_on_an_empty_tests_tree(
-    _isolate, tmp_path, monkeypatch
-):
-    from forge.planning import target_terminal_tools
-
-    repo = _make_repo(
-        _isolate, "bench-one", extras=False, toolchain="toolchain:\n  test: pytest\n"
-    )
-    (repo / "tests").mkdir()
-    config = _write_config(tmp_path)
-
-    def _no_guardkit(path, **kwargs):
-        raise target_terminal_tools.TargetTestRootsUnresolved("no guardkit here")
-
-    monkeypatch.setattr(
-        target_terminal_tools, "discover_target_test_roots", _no_guardkit
-    )
-    monkeypatch.setattr(register_repo, "_discover_test_roots", _REAL_DISCOVER)
-
-    result = _run(config, str(repo), "--json")
-
-    assert result.exit_code == 0, result.output
-    detail = [d for step, _, d in _steps(result) if step == "test-roots"][0]
-    assert detail == (
-        "tests/ holds no subdirectory, so plans that name smoke gates will "
-        "fail plan-containment; add tests/<area>/"
-    )
-
-
-def test_the_plain_scan_follows_guardkits_own_rule(tmp_path):
-    repo = tmp_path / "repo"
-    (repo / "tests" / "unit").mkdir(parents=True)
-    (repo / "tests" / "smoke").mkdir()
-    (repo / "tests" / ".cache").mkdir()
-    (repo / "tests" / "node_modules").mkdir()
-    (repo / "tests" / "test_it.py").write_text("", encoding="utf-8")
-
-    assert register_repo._shallow_test_roots(repo) == ["tests/smoke", "tests/unit"]
-    assert register_repo._shallow_test_roots(tmp_path / "nothing") == []
-
-
-# ---------------------------------------------------------------------------
-# --deploy-port — the five files a repository needs to be deployed into its
-# own Docker Sandbox (the 2026-09-06 decision, rule 7, and rule 14 of the
-# 15:10Z amendment; the fifth, the bootstrap that brings up the factory's
-# services inside the sandbox, from Part O rule 69 of the 2026-09-06 spec)
-#
-# None of these tests runs sbx, creates a sandbox, or asks systemd for
-# anything: the wrapper is driven with a fake sbx and a fake systemctl first
-# on PATH, which record what they were asked to do and answer as told.
-# ---------------------------------------------------------------------------
-
-
-DEPLOY_FILE_LIST = (
-    "deploy/profile.yaml",
-    "deploy/sandbox-deploy.sh",
-    "deploy/sandbox-runner.sh",
-    "deploy/deploy.sh",
-    "deploy/docker-compose.candidate.yml",
-)
-
-
-def _load_written_profile(repo: Path):
-    from forge.deploy.profile import load_deploy_profile
-
-    return load_deploy_profile(repo / "deploy" / "profile.yaml")
-
-
-def test_deploy_port_writes_the_five_files(_isolate, tmp_path):
-    repo = _make_repo(
-        _isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n", extras=False
-    )
-    config = _write_config(tmp_path)
-
-    result = _run(config, str(repo), "--deploy-port", "8911", "--json")
-
-    assert result.exit_code == 0, result.output
-    for relative in DEPLOY_FILE_LIST:
-        assert (repo / relative).is_file(), relative
-    assert _status_of(result, "deploy-files").count("added") == 5
-
-
-def test_the_written_profile_carries_the_factory_s_two_services(_isolate, tmp_path):
-    # Part O, rule 68: the sandbox also carries the deploy sidecar and the
-    # build runner for this repository, on ports derived from --deploy-port,
-    # and mounts the factory's code from the checkouts beside this one.
-    repo = _make_repo(
-        _isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n", extras=False
-    )
-    config = _write_config(tmp_path)
-
-    result = _run(config, str(repo), "--deploy-port", "8911", "--json")
-
-    assert result.exit_code == 0, result.output
-    sandbox = _load_written_profile(repo).sandbox
-    assert sandbox.sidecar_publish == "127.0.0.1:8935:8125"
-    assert sandbox.runner_publish == "127.0.0.1:8934:8124"
-    assert sandbox.forge_path == str(_isolate / "forge")
-    assert sandbox.guardkit_path == str(_isolate / "guardkit")
-    assert sandbox.receipts_path == str(register_repo.default_receipts_path())
-    assert sandbox.env_file is None
-    bootstrap = repo / "deploy" / "sandbox-runner.sh"
-    assert bootstrap.is_file() and os.access(bootstrap, os.X_OK)
-    lines = [(s, d) for name, s, d in _steps(result) if name == "deploy-files"]
-    assert (
-        "ok",
-        "sandbox bench-one-deploy will carry the factory's build runner on "
-        "127.0.0.1:8934 and deploy sidecar on 127.0.0.1:8935",
-    ) in lines
-    # The checkouts are not beside a tmp_path repository, and the report says
-    # so rather than leaving it to be found at the first deploy.
-    warns = [d for s, d in lines if s == "warn"]
-    assert any(d.startswith("no checkout at ") for d in warns), warns
-
-
-def test_the_written_profile_names_the_sandbox_and_both_ports(_isolate, tmp_path):
-    repo = _make_repo(
-        _isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n", extras=False
-    )
-    config = _write_config(tmp_path)
-
-    _run(config, str(repo), "--deploy-port", "8911")
-
-    profile = _load_written_profile(repo)
-    assert profile.sandbox is not None
-    assert profile.sandbox.name == "bench-one-deploy"
-    assert profile.sandbox.publish == (
-        "127.0.0.1:8911:8911",
-        "127.0.0.1:8912:8912",
-    )
-    assert profile.compose.script == "deploy/sandbox-deploy.sh"
-    assert profile.cwd == str(repo)
-    assert profile.candidate is not None
-    assert profile.candidate.env["CANDIDATE_PORT"] == "8912"
-
-
-def test_the_debian_and_python_rules_are_always_there(_isolate, tmp_path):
-    repo = _make_repo(
-        _isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n", extras=False
-    )
-    config = _write_config(tmp_path)
-
-    _run(config, str(repo), "--deploy-port", "8911")
-
-    allowed = _load_written_profile(repo).sandbox.allow_network
-    assert "deb.debian.org" in allowed
-    assert "*.debian.org" in allowed
-    assert "pypi.org" in allowed
-    assert "files.pythonhosted.org" in allowed
-
-
-def test_deploy_allow_adds_the_model_door(_isolate, tmp_path):
-    repo = _make_repo(
-        _isolate, "agent-repo", toolchain="toolchain:\n  test: pytest\n", extras=False
-    )
-    config = _write_config(tmp_path)
-
-    _run(
-        config,
-        str(repo),
-        "--deploy-port",
-        "8911",
-        "--deploy-allow",
-        "172.30.1.253:4000",
-    )
-
-    assert "172.30.1.253:4000" in _load_written_profile(repo).sandbox.allow_network
-
-
-def test_without_deploy_allow_no_extra_host_is_reachable(_isolate, tmp_path):
-    repo = _make_repo(
-        _isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n", extras=False
-    )
-    config = _write_config(tmp_path)
-
-    _run(config, str(repo), "--deploy-port", "8911")
-
-    allowed = _load_written_profile(repo).sandbox.allow_network
-    assert not any(host.startswith("172.") for host in allowed)
-
-
-def test_the_deploy_script_carries_this_repository_s_project_and_ports(
-    _isolate, tmp_path
-):
-    repo = _make_repo(
-        _isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n", extras=False
-    )
-    config = _write_config(tmp_path)
-
-    _run(config, str(repo), "--deploy-port", "8911")
-
-    script = (repo / "deploy" / "deploy.sh").read_text(encoding="utf-8")
-    assert 'COMPOSE_PROJECT="${COMPOSE_PROJECT:-bench-one}"' in script
-    assert "http://localhost:8911/health" in script
-    assert 'CANDIDATE_PORT="${CANDIDATE_PORT:-8912}"' in script
-    # api_test's own names never travel to another repository.
-    assert "apitest-f2" not in script
-
-
-def test_no_placeholder_survives_in_either_script(_isolate, tmp_path):
-    repo = _make_repo(
-        _isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n", extras=False
-    )
-    config = _write_config(tmp_path)
-
-    _run(config, str(repo), "--deploy-port", "8911")
-
-    for relative in ("deploy/sandbox-deploy.sh", "deploy/deploy.sh"):
-        assert "@@" not in (repo / relative).read_text(encoding="utf-8"), relative
-
-
-def test_both_scripts_are_runnable(_isolate, tmp_path):
-    repo = _make_repo(
-        _isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n", extras=False
-    )
-    config = _write_config(tmp_path)
-
-    _run(config, str(repo), "--deploy-port", "8911")
-
-    for relative in ("deploy/sandbox-deploy.sh", "deploy/deploy.sh"):
-        path = repo / relative
-        assert os.access(path, os.X_OK), relative
-        assert (
-            subprocess.run(["bash", "-n", str(path)]).returncode == 0
-        ), f"{relative} is not valid shell"
-
-
-def test_without_the_flag_nothing_about_deploys_is_written(_isolate, tmp_path):
-    repo = _make_repo(
-        _isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n", extras=False
-    )
-    config = _write_config(tmp_path)
-
-    result = _run(config, str(repo), "--json")
-
-    assert result.exit_code == 0, result.output
-    assert not (repo / "deploy").exists()
-    assert _status_of(result, "deploy-files") == []
-    # And the old warning still stands, word for word.
-    assert ("deploy", "warn", "no deploy/profile.yaml") in _steps(result)
-
-
-def test_a_profile_already_there_is_never_rewritten(_isolate, tmp_path):
-    repo = _make_repo(
-        _isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n", extras=False
-    )
-    (repo / "deploy").mkdir()
-    written_by_hand = "# mine, thanks\nenv_id: local\ncompose:\n  file: dc.yml\n"
-    (repo / "deploy" / "profile.yaml").write_text(written_by_hand, encoding="utf-8")
-    config = _write_config(tmp_path)
-
-    result = _run(config, str(repo), "--deploy-port", "8911", "--json")
-
-    assert result.exit_code == 0, result.output
-    assert (repo / "deploy" / "profile.yaml").read_text(
-        encoding="utf-8"
-    ) == written_by_hand
-    assert "unchanged" in _status_of(result, "deploy-files")
-    # The two scripts it did not have are still written.
-    assert (repo / "deploy" / "sandbox-deploy.sh").is_file()
-
-
-def test_a_dry_run_writes_no_deploy_file(_isolate, tmp_path):
-    repo = _make_repo(
-        _isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n", extras=False
-    )
-    config = _write_config(tmp_path)
-
-    result = _run(config, str(repo), "--deploy-port", "8911", "--dry-run", "--json")
-
-    assert result.exit_code == 0, result.output
-    assert not (repo / "deploy").exists()
-    assert _status_of(result, "deploy-files") == ["would-add"] * 5
-
-
-def test_deploy_allow_without_deploy_port_is_refused(_isolate, tmp_path):
-    repo = _make_repo(
-        _isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n", extras=False
-    )
-    config = _write_config(tmp_path)
-
-    result = _run(config, str(repo), "--deploy-allow", "172.30.1.253:4000")
-
-    assert result.exit_code != 0
-    assert "--deploy-allow" in result.output
-    assert not (repo / "deploy").exists()
-    # Nothing was registered either.
-    assert "bench-one" not in config.read_text(encoding="utf-8")
-
-
-@pytest.mark.parametrize("port", ["0", "65535", "-1"])
-def test_a_port_the_pair_cannot_fit_in_is_refused(_isolate, tmp_path, port):
-    repo = _make_repo(
-        _isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n", extras=False
-    )
-    config = _write_config(tmp_path)
-
-    result = _run(config, str(repo), "--deploy-port", port)
-
-    assert result.exit_code != 0
-    assert "--deploy-port" in result.output
-    assert not (repo / "deploy").exists()
-
-
-def test_a_bad_host_in_deploy_allow_is_refused_before_anything_is_written(
-    _isolate, tmp_path
-):
-    repo = _make_repo(
-        _isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n", extras=False
-    )
-    config = _write_config(tmp_path)
-
-    result = _run(
-        config, str(repo), "--deploy-port", "8911", "--deploy-allow", "http://door/"
-    )
-
-    assert result.exit_code != 0
-    assert "deploy profile would not load" in result.output
-    assert not (repo / "deploy" / "profile.yaml").exists()
-
-
-def test_a_name_no_sandbox_could_carry_is_refused(_isolate, tmp_path):
-    repo = _make_repo(
-        _isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n", extras=False
-    )
-    config = _write_config(tmp_path)
-
-    result = _run(config, str(repo), "--name", "___", "--deploy-port", "8911")
-
-    assert result.exit_code != 0
-    assert "Docker Sandbox" in result.output
-    assert not (repo / "deploy").exists()
-
-
-def test_the_name_becomes_the_project_and_the_sandbox(_isolate, tmp_path):
-    from forge.cli.register_repo import compose_project_for, sandbox_name_for
-
-    assert compose_project_for("api_test") == "api-test"
-    assert sandbox_name_for("api_test") == "api-test-deploy"
-    assert sandbox_name_for("content-agent-py") == "content-agent-py-deploy"
-    assert sandbox_name_for("Bench.One") == "bench-one-deploy"
-    assert sandbox_name_for("___") == ""
-
-
-# ---------------------------------------------------------------------------
-# The wrapper, driven — with a fake sbx and a fake systemctl first on PATH
-#
-# The wrapper is the only script the deploy step runs. It brings the sandbox
-# up, runs the repository's own deploy script inside it, and hands back that
-# script's exit code unchanged. Every test below drives the real file the
-# command writes; the two fakes record every argument they are given and
-# answer as the test tells them to. No real sbx, no real systemctl, no
-# sandbox, no daemon.
-# ---------------------------------------------------------------------------
-
-
-FAKE_SBX = """#!/usr/bin/env bash
-# A stand-in for Docker's `sbx`, put first on PATH by the test. It writes down
-# every argument it is given and answers the way the test told it to. It never
-# creates, starts, stops or looks at a real sandbox, and it never runs the real
-# tool: no test in this file goes anywhere near the sandbox daemon.
-#
-# It models the three forms the real 0.39.0 tool actually has:
-#   sbx ls                                                  lists the sandboxes
-#   sbx policy check network --sandbox NAME TARGET           read-only question
-#   sbx policy allow network --sandbox NAME RULES            adds the rules
-# and `sbx create shell ...` and `sbx exec ...`.
-#
-# THE ANSWER TO THE QUESTION IS THE EXIT CODE: 0 means the target is allowed,
-# anything else means it is not. The test names the allowed targets in
-# SBX_ALLOWED (comma separated); SBX_POLICY_CHECK_STATUS forces one answer for
-# every target, which is how "the tool could not answer at all" is played.
-printf '%s\\n' "$*" >> "$SBX_LOG"
-case "$1" in
-  ls)
-    printf '%s\\n' "${SBX_LS:-}"
-    ;;
-  policy)
-    if [ "$2 $3" = "check network" ]; then
-      if [ -n "${SBX_POLICY_CHECK_STATUS:-}" ]; then
-        exit "${SBX_POLICY_CHECK_STATUS}"
-      fi
-      target="${@: -1}"
-      case ",${SBX_ALLOWED:-}," in
-        *",${target},"*) exit 0 ;;
-        *) exit 1 ;;
-      esac
-    fi
-    ;;
-  exec)
-    exit "${SBX_EXEC_STATUS:-0}"
-    ;;
-esac
-exit 0
-"""
-
-FAKE_SYSTEMCTL = """#!/usr/bin/env bash
-# A stand-in for systemctl. It writes down what it was asked to do and does
-# nothing: no unit is started, stopped or reloaded by any test in this file.
-# The wrapper's question whether a unit is masked is answered "disabled" and
-# not written down, so the log holds only what the wrapper did.
-if [ "$2" = "show" ]; then
-  printf 'disabled\\n'
-  exit 0
-fi
-printf '%s\\n' "$*" >> "$SYSTEMCTL_LOG"
-exit 0
-"""
-
-FAKE_DOCKER = """#!/usr/bin/env bash
-# A stand-in for the machine's docker: the wrapper only asks whether a
-# Compose sandbox supervisor exists, and here none does.
-exit 0
-"""
+        self.calls.append(argv)
+        if argv[:4] == ["env", "GIT_TERMINAL_PROMPT=0", "git", "clone"]:
+            if not self.host_can_read:
+                return _no(128, "fatal: could not read Username for 'https://github.com'")
+            dest = Path(argv[-1])
+            shutil.copytree(self.project, dest, symlinks=True)
+            return _ok()
+        if argv[:2] == ["git", "-C"] and argv[3:] == ["rev-parse", "HEAD"]:
+            return _ok("0123456789abcdef0123\n")
+        if argv[:2] == ["docker", "run"]:
+            return self._docker_run(argv)
+        if argv[:2] == ["docker", "exec"]:
+            if self.drained_answer is None:
+                return _no(1, "Error response from daemon: No such container")
+            if isinstance(self.drained_answer, subprocess.CompletedProcess):
+                return self.drained_answer
+            return _ok(json.dumps(self.drained_answer) + "\n")
+        if argv[:2] == ["sbx", "exec"]:
+            return self._sbx_exec(argv[2:], input)
+        raise AssertionError(f"the fake estate was asked something it does not know: {argv}")
+
+    def _docker_run(self, argv: list[str]):
+        image_at = argv.index("alpine")
+        command = argv[image_at + 1 :]
+        mounts = [argv[i + 1] for i, a in enumerate(argv) if a == "-v"]
+        assert mounts[0].startswith(f"{VOLUME}:/s"), mounts
+        if command[0] == "cat":
+            name = command[1].removeprefix("/s/")
+            return _ok(self.volume[name]) if name in self.volume else _no(1, "cat: no such file")
+        if command[:2] == ["ls", "-1"]:
+            return _ok("\n".join(sorted(self.volume)) + "\n")
+        if command[0] == "cp":
+            assert "--user" in argv and argv[argv.index("--user") + 1] == "1000:1000"
+            assert not mounts[0].endswith(":ro")
+            local = mounts[1].rsplit(":", 2)[0]
+            name = command[2].removeprefix("/s/")
+            self.volume[name] = Path(local).read_text(encoding="utf-8")
+            self.writes.append(f"volume:{name}")
+            return _ok()
+        raise AssertionError(f"unexpected docker run {argv}")
+
+    def _sbx_exec(self, rest: list[str], input):
+        interactive = False
+        env: list[str] = []
+        user = None
+        while rest and rest[0].startswith("-"):
+            flag = rest.pop(0)
+            if flag == "-i":
+                interactive = True
+            elif flag == "-u":
+                user = rest.pop(0)
+            elif flag == "-e":
+                env.append(rest.pop(0))
+            else:
+                raise AssertionError(f"unexpected sbx flag {flag}")
+        assert user == "1000", "every sandbox command runs as the sandbox user"
+        assert rest[0] == SANDBOX
+        command = rest[1:]
+        if command[0] == "cat":
+            path = command[1]
+            return _ok(self.sandbox_files[path]) if path in self.sandbox_files else _no(1, "cat: no such file")
+        if command[:2] == ["ls", "-1"]:
+            folder = command[2].rstrip("/") + "/"
+            names = sorted(p[len(folder):] for p in self.sandbox_files if p.startswith(folder) and "/" not in p[len(folder):])
+            return _ok("\n".join(names) + "\n")
+        if command[:2] == ["sh", "-c"]:
+            assert interactive and input is not None
+            self.sandbox_files[command[4]] = input
+            self.writes.append(f"sandbox:{command[4]}")
+            return _ok()
+        if command[0] == "test":
+            return _ok() if command[2] in self.clones else _no(1)
+        if command[0] == "git":
+            if command[1] == "ls-remote":
+                assert "GIT_TERMINAL_PROMPT=0" in env
+                return _ok("abc123\tHEAD\n") if self.sandbox_can_read else _no(
+                    128, "fatal: could not read Username for 'https://github.com': terminal prompts disabled"
+                )
+            if command[1] == "clone":
+                self.clones[command[-1]] = command[-2]
+                self.writes.append(f"clone:{command[-1]}")
+                return _ok()
+            if command[1] == "-C" and command[3] == "check-ignore":
+                assert command[2] == CLONE
+                return _ok() if self.ignored else _no(1)
+            if command[1] == "-C" and command[3:] == ["remote", "get-url", "origin"]:
+                return _ok(self.clones[command[2]] + "\n") if command[2] in self.clones else _no(2)
+        raise AssertionError(f"unexpected sbx exec {command}")
 
 
 @pytest.fixture
-def wrapper_repo(_isolate, tmp_path):
-    """A registered repository with its deploy files, plus the two fakes."""
-    repo = _make_repo(
-        _isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n", extras=False
+def estate(tmp_path, monkeypatch) -> FakeEstate:
+    fake = FakeEstate(tmp_path)
+    monkeypatch.setattr(register_repo, "run_command", fake)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("FORGE_ESTATE_ENV_FILE", raising=False)
+    return fake
+
+
+@pytest.fixture
+def publisher_file(tmp_path) -> Path:
+    path = tmp_path / "publisher" / "settings.json"
+    path.parent.mkdir()
+    path.write_text(json.dumps(PUBLISHER_JSON, indent=2) + "\n", encoding="utf-8")
+    path.chmod(0o600)
+    return path
+
+
+def _run(*args: str):
+    return CliRunner().invoke(
+        main,
+        ["register-repo", KEY, "--github", URL, "--sandbox-settings", SANDBOX_SETTINGS, *args],
+        catch_exceptions=False,
     )
-    config = _write_config(tmp_path)
-    result = _run(config, str(repo), "--deploy-port", "8911")
+
+
+def _lines(result) -> list[str]:
+    return result.output.splitlines()
+
+
+# ---------------------------------------------------------------------------
+# --dry-run writes nothing; preparation writes only staged copies
+# ---------------------------------------------------------------------------
+
+
+def test_dry_run_writes_nothing_anywhere(estate, publisher_file):
+    before_project = estate.project_digest()
+    before_publisher = publisher_file.read_bytes()
+
+    result = _run("--dry-run", "--publish", "--publisher-settings", str(publisher_file))
+
     assert result.exit_code == 0, result.output
+    assert estate.writes == []
+    assert estate.volume == {"forge.yaml": COORDINATOR_YAML}
+    assert estate.sandbox_files == {SANDBOX_SETTINGS: SANDBOX_YAML}
+    assert estate.clones == {}
+    assert sorted(os.listdir(publisher_file.parent)) == ["settings.json"]
+    assert publisher_file.read_bytes() == before_publisher
+    assert estate.project_digest() == before_project
+    assert "would stage" in result.output and "would add" in result.output
+    assert "What would make it live" in result.output
 
-    fake_bin = tmp_path / "fake-bin"
-    fake_bin.mkdir()
-    (fake_bin / "sbx").write_text(FAKE_SBX, encoding="utf-8")
-    (fake_bin / "systemctl").write_text(FAKE_SYSTEMCTL, encoding="utf-8")
-    (fake_bin / "docker").write_text(FAKE_DOCKER, encoding="utf-8")
-    for name in ("sbx", "systemctl", "docker"):
-        (fake_bin / name).chmod(0o755)
-    return repo, fake_bin
+
+def test_preparation_writes_only_staged_copies_and_leaves_the_live_files_alone(estate, publisher_file):
+    before_publisher = publisher_file.read_bytes()
+
+    result = _run("--publish", "--publisher-settings", str(publisher_file))
+
+    assert result.exit_code == 0, result.output
+    assert estate.volume["forge.yaml"] == COORDINATOR_YAML
+    assert estate.sandbox_files[SANDBOX_SETTINGS] == SANDBOX_YAML
+    assert publisher_file.read_bytes() == before_publisher
+    assert f"forge.yaml.{LEAF}-pending" in estate.volume
+    assert f"{SANDBOX_SETTINGS}.{LEAF}-pending" in estate.sandbox_files
+    assert (publisher_file.parent / f"settings.json.{LEAF}-pending").is_file()
+    written = {w.split(":", 1)[1] for w in estate.writes if not w.startswith("clone:")}
+    for name in written:
+        assert "-pending" in name or ".bak-" in name, name
+    assert estate.clones == {CLONE_PATH: URL}
 
 
-def _drive_wrapper(wrapper_repo, tmp_path, **env):
-    """Run the wrapper with the fakes first on PATH; return (result, sbx, systemctl)."""
-    repo, fake_bin = wrapper_repo
-    sbx_log = tmp_path / "sbx.log"
-    systemctl_log = tmp_path / "systemctl.log"
-    sbx_log.write_text("", encoding="utf-8")
-    systemctl_log.write_text("", encoding="utf-8")
-    run_env = {
-        **os.environ,
-        "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
-        "SBX_LOG": str(sbx_log),
-        "SYSTEMCTL_LOG": str(systemctl_log),
-        "SANDBOX_NAME": "bench-one-deploy",
-        "SANDBOX_MEMORY": "6g",
-        "SANDBOX_CPUS": "4",
-        "SANDBOX_PUBLISH": "127.0.0.1:8911:8911,127.0.0.1:8912:8912",
-        "SANDBOX_ALLOW_NETWORK": "pypi.org,*.debian.org",
+def test_nothing_is_ever_written_into_the_project(estate):
+    before = estate.project_digest()
+    result = _run()
+    assert result.exit_code == 0, result.output
+    assert estate.project_digest() == before
+
+
+# ---------------------------------------------------------------------------
+# Both settings files: exactly three entries, re-parse, comments, backups
+# ---------------------------------------------------------------------------
+
+
+def _added(old: str, new: str) -> list[str]:
+    remaining = list(new.split("\n"))
+    for line in old.split("\n"):
+        remaining.remove(line)
+    return remaining
+
+
+def test_the_coordinator_file_gains_exactly_the_three_entries(estate):
+    result = _run()
+    assert result.exit_code == 0, result.output
+    staged = estate.volume[f"forge.yaml.{LEAF}-pending"]
+
+    assert _added(COORDINATOR_YAML, staged) == [
+        f"      - {COORDINATOR_PATH}",
+        f"    {KEY}: {COORDINATOR_PATH}",
+        f"    {KEY}:",
+        "      name: api-test-deploy",
+        '      sidecar_url: "${FORGE_SANDBOX_SIDECAR_URL}"',
+        '      runner_url: "${FORGE_SANDBOX_RUNNER_URL}"',
+    ]
+    before, after = yaml.safe_load(COORDINATOR_YAML), yaml.safe_load(staged)
+    assert after["permissions"]["filesystem"]["allowlist"] == [
+        *before["permissions"]["filesystem"]["allowlist"], COORDINATOR_PATH
+    ]
+    assert after["planning"]["target_repo_paths"] == {
+        **before["planning"]["target_repo_paths"], KEY: COORDINATOR_PATH
     }
-    run_env.update({k: str(v) for k, v in env.items()})
-    result = subprocess.run(
-        [str(repo / "deploy" / "sandbox-deploy.sh")],
-        cwd=repo,
-        env=run_env,
-        capture_output=True,
-        text=True,
-    )
-    return (
-        result,
-        [line for line in sbx_log.read_text().splitlines() if line.strip()],
-        [line for line in systemctl_log.read_text().splitlines() if line.strip()],
-    )
-
-
-def test_the_wrapper_creates_the_sandbox_when_it_is_not_there(wrapper_repo, tmp_path):
-    result, sbx, _ = _drive_wrapper(wrapper_repo, tmp_path, SBX_LS="")
-
-    assert result.returncode == 0, result.stderr
-    created = [line for line in sbx if line.startswith("create ")]
-    assert len(created) == 1
-    assert "create shell" in created[0]
-    assert "--name bench-one-deploy" in created[0]
-    assert "--memory 6g" in created[0]
-    assert "--cpus 4" in created[0]
-    assert "--publish 127.0.0.1:8911:8911" in created[0]
-    assert "--publish 127.0.0.1:8912:8912" in created[0]
-
-
-def test_the_wrapper_does_not_create_a_sandbox_that_is_already_there(
-    wrapper_repo, tmp_path
-):
-    result, sbx, _ = _drive_wrapper(
-        wrapper_repo, tmp_path, SBX_LS="bench-one-deploy   running"
-    )
-
-    assert result.returncode == 0, result.stderr
-    assert [line for line in sbx if line.startswith("create ")] == []
-
-
-def test_a_similar_name_is_not_mistaken_for_this_sandbox(wrapper_repo, tmp_path):
-    result, sbx, _ = _drive_wrapper(
-        wrapper_repo, tmp_path, SBX_LS="bench-one-deploy-old   running"
-    )
-
-    assert result.returncode == 0, result.stderr
-    assert len([line for line in sbx if line.startswith("create ")]) == 1
-
-
-def test_the_network_rules_are_added_once_in_one_call(wrapper_repo, tmp_path):
-    result, sbx, _ = _drive_wrapper(wrapper_repo, tmp_path, SBX_LS="")
-
-    assert result.returncode == 0, result.stderr
-    allowed = [line for line in sbx if line.startswith("policy allow ")]
-    assert allowed == [
-        "policy allow network --sandbox bench-one-deploy pypi.org,*.debian.org"
-    ]
-
-
-def test_each_address_is_asked_about_one_at_a_time(wrapper_repo, tmp_path):
-    # The real tool judges a bare host name as if it were being reached over
-    # HTTPS on port 443, but the Debian mirrors are fetched over plain HTTP, so
-    # a bare host has to be asked about as an http:// address. An entry that
-    # already names a port is asked about exactly as it is written.
-    result, sbx, _ = _drive_wrapper(
-        wrapper_repo,
-        tmp_path,
-        SBX_LS="bench-one-deploy   running",
-        SANDBOX_ALLOW_NETWORK="pypi.org,172.30.1.253:4000",
-        SBX_ALLOWED="http://pypi.org,172.30.1.253:4000",
-    )
-
-    assert result.returncode == 0, result.stderr
-    assert [line for line in sbx if line.startswith("policy check ")] == [
-        "policy check network --sandbox bench-one-deploy http://pypi.org",
-        "policy check network --sandbox bench-one-deploy 172.30.1.253:4000",
-    ]
-    assert [line for line in sbx if line.startswith("policy allow ")] == []
-
-
-def test_the_rules_are_not_added_again_when_they_are_already_allowed(
-    wrapper_repo, tmp_path
-):
-    result, sbx, _ = _drive_wrapper(
-        wrapper_repo,
-        tmp_path,
-        SBX_LS="bench-one-deploy   running",
-        SBX_ALLOWED="http://pypi.org,http://*.debian.org",
-    )
-
-    assert result.returncode == 0, result.stderr
-    assert [line for line in sbx if line.startswith("policy allow ")] == []
-
-
-def test_a_missing_rule_means_the_whole_set_is_added(wrapper_repo, tmp_path):
-    result, sbx, _ = _drive_wrapper(
-        wrapper_repo,
-        tmp_path,
-        SBX_LS="bench-one-deploy   running",
-        SBX_ALLOWED="http://pypi.org",
-    )
-
-    assert result.returncode == 0, result.stderr
-    assert len([line for line in sbx if line.startswith("policy allow ")]) == 1
-
-
-def test_rules_are_added_when_the_question_cannot_be_answered(
-    wrapper_repo, tmp_path
-):
-    # A tool that cannot answer the question must not leave a sandbox walled
-    # off — adding a rule that is already there changes nothing.
-    result, sbx, _ = _drive_wrapper(
-        wrapper_repo,
-        tmp_path,
-        SBX_LS="bench-one-deploy   running",
-        SBX_POLICY_CHECK_STATUS="2",
-    )
-
-    assert result.returncode == 0, result.stderr
-    assert len([line for line in sbx if line.startswith("policy allow ")]) == 1
-
-
-def test_the_keeper_is_started_for_this_sandbox(wrapper_repo, tmp_path):
-    result, _, systemctl = _drive_wrapper(wrapper_repo, tmp_path, SBX_LS="")
-
-    assert result.returncode == 0, result.stderr
-    assert systemctl == ["--user start forge-sandbox-keeper@bench-one-deploy"]
-
-
-def test_the_deploy_script_runs_inside_with_exactly_the_named_settings(
-    wrapper_repo, tmp_path
-):
-    repo, _ = wrapper_repo
-    result, sbx, _ = _drive_wrapper(wrapper_repo, tmp_path, SBX_LS="")
-
-    assert result.returncode == 0, result.stderr
-    ran = [line for line in sbx if line.startswith("exec ")]
-    assert len(ran) == 1
-    assert ran[0] == (
-        f"exec -w {repo} "
-        "-e CANDIDATE -e PROMOTE -e REVERT -e CANDIDATE_DOWN "
-        "-e CANDIDATE_PORT -e ROLLBACK_IMAGE_REF -e ENV_FILE "
-        "bench-one-deploy deploy/deploy.sh"
-    )
-
-
-@pytest.mark.parametrize("status", ["0", "1", "2", "7"])
-def test_the_inner_exit_code_comes_back_unchanged(wrapper_repo, tmp_path, status):
-    result, _, _ = _drive_wrapper(
-        wrapper_repo, tmp_path, SBX_LS="", SBX_EXEC_STATUS=status
-    )
-
-    assert result.returncode == int(status), result.stderr
-    assert f"exited {status}" in result.stdout
-
-
-def test_no_sandbox_name_means_it_refuses_and_touches_nothing(wrapper_repo, tmp_path):
-    result, sbx, systemctl = _drive_wrapper(
-        wrapper_repo, tmp_path, SBX_LS="", SANDBOX_NAME=""
-    )
-
-    assert result.returncode == 2
-    assert "SANDBOX_NAME is not set" in result.stdout
-    assert sbx == []
-    assert systemctl == []
-
-
-def test_no_network_rules_means_no_policy_call_at_all(wrapper_repo, tmp_path):
-    result, sbx, _ = _drive_wrapper(
-        wrapper_repo, tmp_path, SBX_LS="", SANDBOX_ALLOW_NETWORK=""
-    )
-
-    assert result.returncode == 0, result.stderr
-    assert [line for line in sbx if line.startswith("policy ")] == []
-
-
-def test_settings_left_empty_are_left_off_the_create(wrapper_repo, tmp_path):
-    result, sbx, _ = _drive_wrapper(
-        wrapper_repo,
-        tmp_path,
-        SBX_LS="",
-        SANDBOX_MEMORY="",
-        SANDBOX_CPUS="",
-        SANDBOX_PUBLISH="",
-    )
-
-    assert result.returncode == 0, result.stderr
-    created = [line for line in sbx if line.startswith("create ")][0]
-    assert created == f"create shell {wrapper_repo[0]} --name bench-one-deploy"
-
-
-# ---------------------------------------------------------------------------
-# The candidate overlay (rule 14) — the file that puts the throwaway copy on
-# its own port. deploy/deploy.sh has always layered this file on top of
-# docker-compose.yml for the candidate leg; until now register-repo did not
-# write it, so a repository born by this command could not run that leg.
-# ---------------------------------------------------------------------------
-
-
-def test_the_candidate_overlay_is_written_with_this_repository_s_ports(
-    _isolate, tmp_path
-):
-    repo = _make_repo(
-        _isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n", extras=False
-    )
-    config = _write_config(tmp_path)
-
-    _run(config, str(repo), "--deploy-port", "8911")
-
-    overlay = (repo / "deploy" / "docker-compose.candidate.yml").read_text(
-        encoding="utf-8"
-    )
-    # The candidate publishes on the port above the app's, and the app still
-    # listens on its own port inside the container.
-    assert '- "${CANDIDATE_PORT:-8912}:8911"' in overlay
-    # !override REPLACES the base file's port list. Without it the candidate
-    # would also try to publish the live port and `up` would fail.
-    assert "ports: !override" in overlay
-    assert "@@" not in overlay
-
-
-def test_the_overlay_is_the_file_the_deploy_script_looks_for(_isolate, tmp_path):
-    repo = _make_repo(
-        _isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n", extras=False
-    )
-    config = _write_config(tmp_path)
-
-    _run(config, str(repo), "--deploy-port", "8911")
-
-    script = (repo / "deploy" / "deploy.sh").read_text(encoding="utf-8")
-    assert "deploy/docker-compose.candidate.yml" in script
-    assert (repo / "deploy" / "docker-compose.candidate.yml").is_file()
-
-
-def test_the_overlay_is_compose_yaml_that_names_only_the_app_s_ports(
-    _isolate, tmp_path
-):
-    repo = _make_repo(
-        _isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n", extras=False
-    )
-    config = _write_config(tmp_path)
-
-    _run(config, str(repo), "--deploy-port", "8911")
-
-    text = (repo / "deploy" / "docker-compose.candidate.yml").read_text(
-        encoding="utf-8"
-    )
-
-    # `!override` is compose's own merge tag, which plain YAML does not know,
-    # so it is read here with the tag ignored — the point of the check is the
-    # shape of the file: one service, one key changed, nothing else.
-    class _IgnoreTags(yaml.SafeLoader):
-        pass
-
-    _IgnoreTags.add_constructor(
-        "!override", lambda loader, node: loader.construct_sequence(node)
-    )
-    parsed = yaml.load(text, Loader=_IgnoreTags)
-    assert list(parsed) == ["services"]
-    assert list(parsed["services"]) == ["app"]
-    assert list(parsed["services"]["app"]) == ["ports"]
-
-
-# ---------------------------------------------------------------------------
-# The wrapper is ONE file (rule 13 of the 15:10Z amendment)
-#
-# api_test and every repository born by this command deploy with the same
-# wrapper, byte for byte. It holds no value belonging to any one repository:
-# the sandbox's name, size, ports and rules all reach it in its environment.
-#
-# 2026-09-07: the lane that makes a sandbox carry the factory's own services
-# (the deploy sidecar and the build runner, the spec's Part O rule 68) changes
-# the shipped wrapper. forge ships it; a repository's copy is refreshed by
-# copying the shipped file over it, and api_test's is refreshed at the
-# attended go-live, because nothing in a build lane writes into another
-# repository's checkout. So until that copy is made there are exactly two
-# states this check accepts: the same bytes, or api_test still carrying the
-# wrapper as it stood before this lane (the sha256 below). Anything else is
-# real drift and fails.
-# ---------------------------------------------------------------------------
-
-#: api_test's wrapper as it stood before the sandbox carried the factory
-#: (forge commit 74690a4's shipped file, byte for byte). This constant goes
-#: when api_test's copy is refreshed at the go-live.
-WRAPPER_BEFORE_THE_FACTORY_SHA256 = (
-    "e40bb550b8531d0c98f4f9b0a0c81d9dea5cba1e766ecca10196dd46d13d8fd0"
-)
-
-
-def _api_test_wrapper() -> Path | None:
-    """api_test's own wrapper, if a checkout of it sits beside this one."""
-    estate = Path(__file__).resolve().parents[3].parent
-    for checkout in ("api_test-wt-sandbox", "api_test"):
-        candidate = estate / checkout / "deploy" / "sandbox-deploy.sh"
-        if candidate.is_file():
-            return candidate
-    return None
-
-
-def test_the_shipped_wrapper_is_api_test_s_wrapper_byte_for_byte():
-    """The same bytes, or api_test still one refresh behind (see above)."""
-    theirs = _api_test_wrapper()
-    if theirs is None:
-        pytest.skip(
-            "no api_test checkout beside this one, so there is nothing to "
-            "compare the shipped wrapper with"
-        )
-    ours = (
-        Path(register_repo.__file__).resolve().parent
-        / "deploy_templates"
-        / "sandbox-deploy.sh"
-    )
-    if ours.read_bytes() == theirs.read_bytes():
-        return
-    behind = hashlib.sha256(theirs.read_bytes()).hexdigest()
-    assert behind == WRAPPER_BEFORE_THE_FACTORY_SHA256, (
-        f"{ours} and {theirs} have drifted apart; they are meant to be one "
-        "file, and this is not the one refresh that is expected to be "
-        f"outstanding — copy {ours} over {theirs}, or copy the other way if "
-        "it is api_test's copy that moved on purpose"
-    )
-
-
-def test_the_wrapper_written_into_a_repository_is_the_shipped_file_unchanged(
-    _isolate, tmp_path
-):
-    repo = _make_repo(
-        _isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n", extras=False
-    )
-    config = _write_config(tmp_path)
-
-    _run(config, str(repo), "--deploy-port", "8911")
-
-    shipped = (
-        Path(register_repo.__file__).resolve().parent
-        / "deploy_templates"
-        / "sandbox-deploy.sh"
-    )
-    written = repo / "deploy" / "sandbox-deploy.sh"
-    assert written.read_bytes() == shipped.read_bytes()
-    # Nothing in it is filled in for this repository — not even its name.
-    assert "bench-one" not in written.read_text(encoding="utf-8")
-
-
-# ---------------------------------------------------------------------------
-# The closing line (rule 14) — it reports the profile that is on disk, never
-# the ports the run happened to ask for.
-# ---------------------------------------------------------------------------
-
-
-def _closing_line(result) -> str:
-    return [
-        detail
-        for name, status, detail in _steps(result)
-        if name == "deploy-files" and status == "ok"
-    ][0]
-
-
-def test_the_closing_line_names_the_sandbox_and_the_ports_just_written(
-    _isolate, tmp_path
-):
-    repo = _make_repo(
-        _isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n", extras=False
-    )
-    config = _write_config(tmp_path)
-
-    result = _run(config, str(repo), "--deploy-port", "8911", "--json")
+    assert after["planning"]["sandboxes"][KEY] == before["planning"]["sandboxes"]["guardkit/api_test"]
+    del after["permissions"]["filesystem"]["allowlist"][-1]
+    del after["planning"]["target_repo_paths"][KEY]
+    del after["planning"]["sandboxes"][KEY]
+    assert after == before
+
+
+def test_the_sandbox_file_gains_the_same_three_entries_with_its_own_paths(estate):
+    result = _run()
+    assert result.exit_code == 0, result.output
+    staged = yaml.safe_load(estate.sandbox_files[f"{SANDBOX_SETTINGS}.{LEAF}-pending"])
+
+    assert staged["permissions"]["filesystem"]["allowlist"] == [CLONE, CLONE_PATH]
+    assert staged["planning"]["target_repo_paths"][KEY] == CLONE_PATH
+    assert staged["planning"]["sandboxes"][KEY] == {
+        "name": "api-test-deploy",
+        "sidecar_url": "http://10.254.41.1:8925",
+        "runner_url": "http://10.254.41.1:8924",
+    }
+    assert len(_added(SANDBOX_YAML, estate.sandbox_files[f"{SANDBOX_SETTINGS}.{LEAF}-pending"])) == 6
+
+
+def test_both_staged_files_re_parse_with_the_factory_s_loader(estate, tmp_path, monkeypatch):
+    from forge.config.loader import load_config
+
+    assert _run().exit_code == 0
+    for name in ("FORGE_SANDBOX_SIDECAR_URL", "FORGE_SANDBOX_RUNNER_URL", "FORGE_PUBLISHER_URL"):
+        monkeypatch.setenv(name, "http://10.0.0.1:1")
+    for text in (
+        estate.volume[f"forge.yaml.{LEAF}-pending"],
+        estate.sandbox_files[f"{SANDBOX_SETTINGS}.{LEAF}-pending"],
+    ):
+        path = tmp_path / "check.yaml"
+        path.write_text(text, encoding="utf-8")
+        config = load_config(path)
+        assert KEY in config.planning.sandboxes
+        assert config.planning.sandboxes[KEY].name == "api-test-deploy"
+
+
+def test_every_comment_survives_in_both_files(estate):
+    assert _run().exit_code == 0
+    for old, new in (
+        (COORDINATOR_YAML, estate.volume[f"forge.yaml.{LEAF}-pending"]),
+        (SANDBOX_YAML, estate.sandbox_files[f"{SANDBOX_SETTINGS}.{LEAF}-pending"]),
+    ):
+        comments = [line for line in old.split("\n") if line.strip().startswith("#")]
+        assert comments
+        assert [line for line in new.split("\n") if line.strip().startswith("#")] == comments
+
+
+def test_each_file_has_a_dated_backup_of_the_live_text(estate, publisher_file):
+    assert _run("--publish", "--publisher-settings", str(publisher_file)).exit_code == 0
+    stamp = register_repo.date.today().strftime("%Y%m%d")
+    backup = f"bak-{stamp}-pre-register-{LEAF}"
+    assert estate.volume[f"forge.yaml.{backup}"] == COORDINATOR_YAML
+    assert estate.sandbox_files[f"{SANDBOX_SETTINGS}.{backup}"] == SANDBOX_YAML
+    copy = publisher_file.parent / f"settings.json.{backup}"
+    assert copy.read_bytes() == publisher_file.read_bytes()
+    assert copy.stat().st_mode & 0o777 == 0o600
+    assert (publisher_file.parent / f"settings.json.{LEAF}-pending").stat().st_mode & 0o777 == 0o600
+
+
+def test_re_running_changes_nothing(estate, publisher_file):
+    args = ("--publish", "--publisher-settings", str(publisher_file))
+    assert _run(*args).exit_code == 0
+    volume, files, clones = dict(estate.volume), dict(estate.sandbox_files), dict(estate.clones)
+    listing = sorted(os.listdir(publisher_file.parent))
+    estate.writes.clear()
+
+    second = _run(*args)
+
+    assert second.exit_code == 0, second.output
+    assert estate.writes == []
+    assert (estate.volume, estate.sandbox_files, estate.clones) == (volume, files, clones)
+    assert sorted(os.listdir(publisher_file.parent)) == listing
+    assert "already staged" in second.output
+    # The activation still names the backup the staged copy was made from.
+    assert f"bak-{register_repo.date.today().strftime('%Y%m%d')}-pre-register-{LEAF}" in second.output
+
+
+def test_once_live_a_re_run_stages_nothing_and_says_so(estate):
+    assert _run().exit_code == 0
+    estate.volume["forge.yaml"] = estate.volume[f"forge.yaml.{LEAF}-pending"]
+    estate.sandbox_files[SANDBOX_SETTINGS] = estate.sandbox_files[f"{SANDBOX_SETTINGS}.{LEAF}-pending"]
+    estate.writes.clear()
+
+    result = _run()
 
     assert result.exit_code == 0, result.output
-    assert _closing_line(result) == "sandbox bench-one-deploy on ports 8911 and 8912"
+    assert estate.writes == []
+    assert f"nothing is staged — {KEY} is already in the live settings" in result.output
 
 
-def test_a_re_run_reports_the_ports_the_profile_on_disk_carries(_isolate, tmp_path):
-    # The profile that is already there is left alone, so the ports it names
-    # are the ports this repository really deploys on — reporting the ones the
-    # command was asked for would name ports nothing uses.
-    repo = _make_repo(
-        _isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n", extras=False
+def test_an_entry_that_already_says_something_else_is_refused_and_nothing_is_written(estate):
+    estate.volume["forge.yaml"] = COORDINATOR_YAML.replace(
+        "    appmilla_github/api_test:", f"    {KEY}: /var/lib/forge/projects/elsewhere\n    appmilla_github/api_test:"
     )
-    config = _write_config(tmp_path)
-    assert _run(config, str(repo), "--deploy-port", "9000").exit_code == 0
-
-    result = _run(config, str(repo), "--deploy-port", "8911", "--json")
-
-    assert result.exit_code == 0, result.output
-    assert _closing_line(result) == "sandbox bench-one-deploy on ports 9000 and 9001"
-    assert _status_of(result, "deploy-files").count("added") == 0
+    result = _run()
+    assert result.exit_code == 1
+    assert "already has guardkit/bench-one -> /var/lib/forge/projects/elsewhere" in result.output
+    assert estate.writes == []
 
 
-def test_a_hand_written_profile_with_no_sandbox_is_reported_as_unchanged(
-    _isolate, tmp_path
-):
-    repo = _make_repo(
-        _isolate, "bench-one", toolchain="toolchain:\n  test: pytest\n", extras=False
-    )
-    config = _write_config(tmp_path)
-    assert _run(config, str(repo), "--deploy-port", "8911").exit_code == 0
-    # Someone replaces the profile with one that deploys on the host, with no
-    # sandbox block at all. There are then no sandbox ports to report.
-    (repo / "deploy" / "profile.yaml").write_text(
-        'format_version: "1.0"\nenv_id: local\ncompose:\n  file: docker-compose.yml\n',
-        encoding="utf-8",
-    )
-
-    result = _run(config, str(repo), "--deploy-port", "8911", "--json")
-
-    assert result.exit_code == 0, result.output
-    assert _closing_line(result) == "deploy files already present, unchanged"
+def test_a_file_without_api_test_s_sandbox_entry_is_refused(estate):
+    estate.sandbox_files[SANDBOX_SETTINGS] = SANDBOX_YAML.split("  sandboxes:")[0]
+    result = _run()
+    assert result.exit_code == 1
+    assert "no complete planning.sandboxes entry for guardkit/api_test" in result.output
+    assert estate.writes == []
 
 
-def test_the_ports_sentence_reads_plainly_for_one_port_and_for_three():
-    assert register_repo._ports_phrase(["8911"]) == "port 8911"
-    assert register_repo._ports_phrase(["8911", "8912"]) == "ports 8911 and 8912"
-    assert register_repo._ports_phrase(["1", "2", "3"]) == "ports 1, 2 and 3"
-
-
-def test_the_host_port_is_read_from_every_shape_a_publish_rule_takes():
-    assert register_repo._host_ports_of(
-        ("8080", "9000:8080", "127.0.0.1:8911:8901")
-    ) == ["8080", "9000", "8911"]
-    assert register_repo._host_ports_of(()) == []
+def test_the_coordinator_folder_is_not_created_and_the_reason_is_said(estate):
+    result = _run()
+    assert result.exit_code == 0
+    assert "coordinator-folder" in result.output
+    assert "never reads" in result.output
+    assert not any(w.startswith("volume:") and "projects" in w for w in estate.writes)
 
 
 # ---------------------------------------------------------------------------
-# The documents a project's builds are held to (4 October 2026)
+# --publish adds only the route
 # ---------------------------------------------------------------------------
-#
-# Registration stays mechanical: it never writes a project document. It only
-# reports, in one warning step, each binding document the project declares
-# (autobuild.player.required_documents) that the checkout does not have.
-
-_DECLARES_TWO = (
-    "toolchain:\n  test: pytest\n"
-    "memory:\n  project: bench_one\n"
-    "autobuild:\n  player:\n    required_documents:\n"
-    "      - docs/constitution/mission.md\n"
-    "      - docs/constitution/tech-stack.md\n"
-)
 
 
-def _tree_digest(root: Path) -> dict[str, str]:
+def test_publish_adds_only_the_route(estate, publisher_file):
+    result = _run("--publish", "--publisher-settings", str(publisher_file))
+    assert result.exit_code == 0, result.output
+    staged = json.loads((publisher_file.parent / f"settings.json.{LEAF}-pending").read_text())
+    expected = json.loads(json.dumps(PUBLISHER_JSON))
+    expected["projects"][KEY] = {
+        "source": f"git://10.254.41.1:8918/api_test/.guardkit/tmp/factory-runtime/projects/{LEAF}",
+        "remote": f"git@github.com:guardkit/{LEAF}.git",
+    }
+    assert staged == expected
+
+
+def test_without_publish_the_publisher_is_not_touched_or_named(estate, publisher_file):
+    before = publisher_file.read_bytes()
+    result = _run()
+    assert result.exit_code == 0
+    assert publisher_file.read_bytes() == before
+    assert sorted(os.listdir(publisher_file.parent)) == ["settings.json"]
+    assert "--wait forge-publisher" in result.output  # started with the rest, before the coordinator
+    assert "routes did not change" in result.output
+    assert "grep 'publisher: settings'" not in result.output
+
+
+def test_a_route_already_there_is_unchanged_and_the_publisher_is_not_in_the_sequence(estate, publisher_file):
+    data = json.loads(publisher_file.read_text())
+    data["projects"][KEY] = {
+        "source": f"git://10.254.41.1:8918/api_test/.guardkit/tmp/factory-runtime/projects/{LEAF}",
+        "remote": f"git@github.com:guardkit/{LEAF}.git",
+    }
+    publisher_file.write_text(json.dumps(data))
+    result = _run("--publish", "--publisher-settings", str(publisher_file))
+    assert result.exit_code == 0, result.output
+    assert sorted(os.listdir(publisher_file.parent)) == ["settings.json"]
+    assert "grep 'publisher: settings'" not in result.output
+    assert "routes did not change" in result.output
+
+
+# ---------------------------------------------------------------------------
+# The printed activation sequence
+# ---------------------------------------------------------------------------
+
+
+def test_the_sequence_closes_intake_before_the_drained_check_and_restarts_nothing(estate, publisher_file):
+    result = _run("--publish", "--publisher-settings", str(publisher_file))
+    lines = _lines(result)
+    close = next(i for i, l in enumerate(lines) if "dc stop front-door bus-gateway gateway-watch" in l)
+    check = next(i for i, l in enumerate(lines) if "forge register-repo --check-drained" in l)
+    stop_all = next(i for i, l in enumerate(lines) if l.strip() == "dc stop")
+    swap = next(i for i, l in enumerate(lines) if f"forge.yaml.{LEAF}-pending /s/forge.yaml" in l)
+    supervisor = next(i for i, l in enumerate(lines) if "dc up -d sandbox-runner" in l)
+    publisher = next(i for i, l in enumerate(lines) if "dc up -d --wait forge-publisher" in l)
+    rest = next(i for i, l in enumerate(lines) if "dc config --services" in l)
+    door = max(i for i, l in enumerate(lines) if "dc up -d front-door bus-gateway gateway-watch" in l)
+    assert close < check < stop_all < swap < supervisor < publisher < rest < door
+    # Every docker/sbx call the command itself made was a read or a staged write.
+    for call in estate.calls:
+        assert "compose" not in call and "restart" not in call and "stop" not in call
+
+
+def test_the_sequence_names_the_check_the_services_check_and_the_coordinator_log(estate):
+    result = _run()
+    assert "estate-check" in result.output and " services" in result.output
+    assert f"autobuild dispatch: {KEY} has a sandbox" in result.output
+    assert "curl -sf http://10.254.41.1:8925/healthz" in result.output
+
+
+def test_the_sequence_uses_the_estate_s_own_files_when_named(estate, tmp_path):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    sandbox_env = run_dir / "sandbox-bootstrap.env"
+    sandbox_env.write_text(f"FORGE_IMAGE=forge:x\nFORGE_CONFIG_PATH={SANDBOX_SETTINGS}\n")
+    estate_env = run_dir / "estate.env"
+    estate_env.write_text(
+        "# the estate\n"
+        "COMPOSE_FILE=/srv/forge-abc/deploy/estate/compose.yaml:/srv/forge-abc/deploy/estate/compose.external-bus.yaml\n"
+        f"SANDBOX_PROJECT_ENV_FILE={sandbox_env}\n"
+        "FORGE_NATS_URL=nats://forge:not-printed@nats:4222\n"
+    )
+    result = CliRunner().invoke(
+        main, ["register-repo", KEY, "--github", URL, "--estate-env-file", str(estate_env)],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0, result.output
+    assert f"--env-file {estate_env}" in result.output
+    assert f". {run_dir / 'secrets.env'};" in result.output
+    assert "/srv/forge-abc/deploy/estate/estate-check" in result.output
+    assert "not-printed" not in result.output
+    assert f"{SANDBOX_SETTINGS}.{LEAF}-pending" in estate.sandbox_files
+
+
+# ---------------------------------------------------------------------------
+# Activation step (b): the drained check
+# ---------------------------------------------------------------------------
+
+
+def _quiet() -> dict[str, Any]:
     return {
-        str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest()
-        for path in sorted(root.rglob("*"))
-        if path.is_file() and ".git" not in path.parts
+        "ledger": {"builds": {}, "planning_runs": {}, "queue_waiting": 0},
+        "consumers": {
+            "forge-serve-planning": {"pending": 0, "ack_pending": 0},
+            "forge-serve": {"pending": 0, "ack_pending": 0},
+        },
     }
 
 
-def test_declared_but_missing_documents_are_warned_and_nothing_is_written(
-    _isolate, tmp_path
-):
-    repo = _make_repo(_isolate, "bench-one", toolchain=_DECLARES_TWO)
-    (repo / "docs" / "constitution").mkdir(parents=True)
-    (repo / "docs" / "constitution" / "mission.md").write_text("m\n", encoding="utf-8")
-    config = _write_config(tmp_path)
-    before = _tree_digest(repo)
+def _check(estate, answer):
+    estate.drained_answer = answer
+    return CliRunner().invoke(main, ["register-repo", "--check-drained"], catch_exceptions=False)
 
-    result = _run(config, str(repo), "--json")
 
+def test_a_quiet_factory_is_drained(estate):
+    result = _check(estate, _quiet())
     assert result.exit_code == 0, result.output
-    assert _status_of(result, "documents") == ["warn"]
-    (detail,) = [d for name, _, d in _steps(result) if name == "documents"]
-    assert detail == "declared but missing: docs/constitution/tech-stack.md"
-    # Nothing was created, templated or seeded in the repository.
-    assert _tree_digest(repo) == before
-    assert not (repo / "docs" / "constitution" / "tech-stack.md").exists()
+    assert "DRAINED" in result.output and "NOT DRAINED" not in result.output
+    asked = estate.calls[-1]
+    assert asked[:3] == ["docker", "exec", "forge-estate-coordinator-1"]
+    spec = json.loads(asked[-1])
+    assert spec["consumers"] == ["forge-serve-planning", "forge-serve"]
+    assert spec["stream"] == "PIPELINE"
 
 
-def test_a_declaration_builds_would_refuse_is_warned(_isolate, tmp_path):
-    """The one reading rule's own check (GuardKit's allowed keys) is reported
-    too, since planning, admission and the Coach would all refuse it."""
-    repo = _make_repo(
-        _isolate, "bench-one", toolchain=_DECLARES_TWO + "    surprise: [x]\n"
+def test_a_busy_factory_is_refused(estate):
+    facts = _quiet()
+    facts["ledger"]["builds"] = {"RUNNING": 1}
+    facts["ledger"]["planning_runs"] = {"FEATURE_PLAN": 1}
+    result = _check(estate, facts)
+    assert result.exit_code == 1
+    assert "1 build is not finished (RUNNING 1)" in result.output
+    assert "1 planning run is not finished (FEATURE_PLAN 1)" in result.output
+    assert "NOT DRAINED" in result.output
+
+
+def test_a_queued_item_present_at_the_first_check_stops_it(estate):
+    facts = _quiet()
+    facts["ledger"]["queue_waiting"] = 1
+    result = _check(estate, facts)
+    assert result.exit_code == 1
+    assert "1 item waits in the work queue" in result.output
+
+
+def test_a_published_but_undelivered_request_stops_it(estate):
+    facts = _quiet()
+    facts["consumers"]["forge-serve-planning"] = {"pending": 1, "ack_pending": 0}
+    result = _check(estate, facts)
+    assert result.exit_code == 1
+    assert "forge-serve-planning has 1 pending and 0 awaiting acknowledgement" in result.output
+
+
+def test_a_prepared_request_awaiting_admission_before_its_row_exists_stops_it(estate):
+    # The ledger shows nothing at all; the build consumer holds the request.
+    facts = _quiet()
+    facts["consumers"]["forge-serve"] = {"pending": 0, "ack_pending": 1}
+    result = _check(estate, facts)
+    assert result.exit_code == 1
+    assert "forge-serve has 0 pending and 1 awaiting acknowledgement" in result.output
+
+
+def test_an_unreadable_consumer_stops_it(estate):
+    facts = _quiet()
+    facts["consumers"]["forge-serve"] = {"error": "NotFoundError: consumer not found"}
+    result = _check(estate, facts)
+    assert result.exit_code == 1
+    assert "the bus consumer forge-serve could not be read" in result.output
+
+
+def test_a_missing_consumer_answer_stops_it(estate):
+    facts = _quiet()
+    del facts["consumers"]["forge-serve"]
+    assert _check(estate, facts).exit_code == 1
+
+
+def test_an_unreadable_ledger_or_coordinator_stops_it(estate):
+    facts = _quiet()
+    facts["ledger"] = {"error": "OperationalError: unable to open database file"}
+    result = _check(estate, facts)
+    assert result.exit_code == 1 and "the ledger could not be read" in result.output
+
+    result = _check(estate, None)
+    assert result.exit_code == 1 and "could not be asked" in result.output
+
+    result = _check(estate, _ok("not json\n"))
+    assert result.exit_code == 1 and "not the read's report" in result.output
+
+
+def _ledger(path: Path, *, build: str | None = None, plan: str | None = None, queued: bool = False) -> None:
+    with sqlite3.connect(path) as con:
+        con.execute("CREATE TABLE builds (build_id TEXT, status TEXT)")
+        con.execute("CREATE TABLE planning_runs (id TEXT, state TEXT)")
+        con.execute("CREATE TABLE work_queue (id INTEGER, status TEXT)")
+        con.executemany("INSERT INTO builds VALUES (?, ?)", [("a", "COMPLETE"), ("b", "FAILED")])
+        con.executemany("INSERT INTO planning_runs VALUES (?, ?)", [("p", "PLANNED_HANDOFF")])
+        con.execute("INSERT INTO work_queue VALUES (1, 'DONE')")
+        if build:
+            con.execute("INSERT INTO builds VALUES ('c', ?)", (build,))
+        if plan:
+            con.execute("INSERT INTO planning_runs VALUES ('q', ?)", (plan,))
+        if queued:
+            con.execute("INSERT INTO work_queue VALUES (2, 'QUEUED')")
+
+
+def _run_the_read_script(db: Path) -> dict[str, Any]:
+    env = {
+        **os.environ,
+        "FORGE_DB_PATH": str(db),
+        # Nothing listens here; the password must never come back out.
+        "FORGE_NATS_URL": "nats://forge:s3cret-pass@127.0.0.1:9",
+    }
+    done = subprocess.run(
+        [sys.executable, "-c", register_repo.DRAINED_READ_SCRIPT, json.dumps(register_repo.drained_read_spec())],
+        capture_output=True, text=True, env=env, timeout=120, check=False,
     )
-    config = _write_config(tmp_path)
+    assert done.returncode == 0, done.stderr
+    assert "s3cret-pass" not in done.stdout + done.stderr
+    return json.loads(done.stdout.strip().splitlines()[-1])
 
-    result = _run(config, str(repo), "--json")
 
+def test_the_read_script_counts_a_real_ledger_and_says_an_unreachable_bus_is_unreadable(tmp_path):
+    db = tmp_path / "forge.db"
+    _ledger(db, build="RUNNING", plan="FEATURE_SPEC", queued=True)
+
+    facts = _run_the_read_script(db)
+
+    assert facts["ledger"] == {"builds": {"RUNNING": 1}, "planning_runs": {"FEATURE_SPEC": 1}, "queue_waiting": 1}
+    assert set(facts["consumers"]) == {"forge-serve", "forge-serve-planning"}
+    assert all("error" in row for row in facts["consumers"].values())
+    reasons = register_repo.judge_drained(facts, ["forge-serve-planning", "forge-serve"])
+    assert len(reasons) == 5
+
+
+def test_the_read_script_reads_a_finished_ledger_as_quiet(tmp_path):
+    db = tmp_path / "forge.db"
+    _ledger(db)
+    facts = _run_the_read_script(db)
+    assert facts["ledger"] == {"builds": {}, "planning_runs": {}, "queue_waiting": 0}
+
+
+def test_interrupted_builds_count_as_not_finished(tmp_path):
+    # The design's rule is "no build in a non-terminal state"; INTERRUPTED is
+    # not terminal (forge status's own list), so it is named, not hidden.
+    db = tmp_path / "forge.db"
+    _ledger(db, build="INTERRUPTED")
+    facts = _run_the_read_script(db)
+    assert facts["ledger"]["builds"] == {"INTERRUPTED": 1}
+
+
+# ---------------------------------------------------------------------------
+# Step 1: the project is checked, and refused with the lines to add
+# ---------------------------------------------------------------------------
+
+
+def test_a_project_without_memory_project_is_refused_with_the_lines_to_add(estate):
+    estate.write_project(".guardkit/config.yaml", GOOD_CONFIG.replace("memory:\n  project: bench_one\n", ""))
+    result = _run()
+    assert result.exit_code == 1
+    assert "memory:\n    project: <a name of letters, digits and underscores>" in result.output
+    assert estate.writes == []
+
+
+def test_a_project_without_a_test_command_is_refused_with_the_lines_to_add(estate):
+    estate.write_project(".guardkit/config.yaml", GOOD_CONFIG.replace("toolchain:\n  test: pytest -q\n", ""))
+    result = _run()
+    assert result.exit_code == 1
+    assert "toolchain:\n    test: <the command that runs this project's tests>" in result.output
+    assert estate.writes == []
+
+
+def test_a_missing_declared_document_is_refused_by_name(estate):
+    (estate.project / "docs" / "rules.md").unlink()
+    result = _run()
+    assert result.exit_code == 1
+    assert "the declared document docs/rules.md" in result.output and "is not in the project" in result.output
+    assert estate.writes == []
+
+
+def test_a_declared_document_that_is_a_link_is_refused(estate):
+    (estate.project / "docs" / "real.md").write_text("x")
+    (estate.project / "docs" / "rules.md").unlink()
+    (estate.project / "docs" / "rules.md").symlink_to("real.md")
+    result = _run()
+    assert result.exit_code == 1
+    assert "docs/rules.md is a link" in result.output
+
+
+def test_a_project_with_no_settings_file_names_every_gap_at_once(estate):
+    (estate.project / ".guardkit" / "config.yaml").unlink()
+    result = _run()
+    assert result.exit_code == 1
+    assert "memory:" in result.output and "toolchain:" in result.output
+    assert estate.writes == []
+
+
+def test_a_project_the_machine_cannot_clone_is_refused(estate):
+    estate.host_can_read = False
+    result = _run()
+    assert result.exit_code == 1
+    assert f"could not read {URL}" in result.output
+    assert estate.writes == []
+
+
+# ---------------------------------------------------------------------------
+# Step 3: the factory's clone in the shared sandbox
+# ---------------------------------------------------------------------------
+
+
+def test_the_clone_is_made_as_the_sandbox_user_in_the_projects_folder(estate):
+    result = _run()
     assert result.exit_code == 0, result.output
-    (detail,) = [d for name, _, d in _steps(result) if name == "documents"]
-    assert detail.startswith("declared documents cannot be used, which builds refuse:")
-    assert "surprise" in detail
+    assert estate.clones == {CLONE_PATH: URL}
+    clone_call = next(c for c in estate.calls if c[:2] == ["sbx", "exec"] and "clone" in c)
+    assert clone_call[clone_call.index("-u") + 1] == "1000"
 
 
-def test_each_missing_document_is_named(_isolate, tmp_path):
-    repo = _make_repo(_isolate, "bench-one", toolchain=_DECLARES_TWO)
-    config = _write_config(tmp_path)
+def test_a_clone_with_a_different_origin_is_refused_and_left_alone(estate):
+    estate.clones[CLONE_PATH] = "https://github.com/someone-else/bench-one.git"
+    result = _run()
+    assert result.exit_code == 1
+    assert "cloned from https://github.com/someone-else/bench-one.git" in result.output
+    assert estate.writes == []
+    assert estate.clones == {CLONE_PATH: "https://github.com/someone-else/bench-one.git"}
 
-    result = _run(config, str(repo), "--json")
 
+def test_a_clone_with_the_same_origin_is_reused(estate):
+    estate.clones[CLONE_PATH] = f"https://github.com/guardkit/{LEAF}"
+    result = _run()
     assert result.exit_code == 0, result.output
-    (detail,) = [d for name, _, d in _steps(result) if name == "documents"]
-    assert detail == (
-        "declared but missing: docs/constitution/mission.md; "
-        "declared but missing: docs/constitution/tech-stack.md"
-    )
+    assert not any(w.startswith("clone:") for w in estate.writes)
+    assert "is already a clone of" in result.output
 
 
-def test_no_warning_when_every_declared_document_is_there_or_none_is_declared(
-    _isolate, tmp_path
-):
-    repo = _make_repo(_isolate, "bench-one", toolchain=_DECLARES_TWO)
-    (repo / "docs" / "constitution").mkdir(parents=True)
-    for name in ("mission.md", "tech-stack.md"):
-        (repo / "docs" / "constitution" / name).write_text("x\n", encoding="utf-8")
-    other = _make_repo(
-        _isolate, "bench-two", toolchain="toolchain:\n  test: pytest\n"
-    )
-    config = _write_config(tmp_path)
-
-    present = _run(config, str(repo), "--json")
-    undeclared = _run(config, str(other), "--json")
-
-    assert present.exit_code == 0, present.output
-    assert undeclared.exit_code == 0, undeclared.output
-    assert _status_of(present, "documents") == []
-    assert _status_of(undeclared, "documents") == []
+def test_an_unreadable_private_repository_is_refused_in_plain_words(estate):
+    estate.sandbox_can_read = False
+    result = _run()
+    assert result.exit_code == 1
+    assert "the sandbox cannot read" in result.output
+    assert "private one needs a read-only credential" in result.output
+    assert "owner decision" in result.output
+    assert estate.writes == []
 
 
-def test_a_declared_document_that_is_a_link_is_warned_and_nothing_is_written(
-    _isolate, tmp_path
-):
-    repo = _make_repo(_isolate, "bench-one", toolchain=_DECLARES_TWO)
-    (repo / "docs" / "constitution").mkdir(parents=True)
-    (repo / "docs" / "constitution" / "real.md").write_text("m\n", encoding="utf-8")
-    (repo / "docs" / "constitution" / "mission.md").symlink_to("real.md")
-    (repo / "docs" / "constitution" / "tech-stack.md").write_text("t\n", encoding="utf-8")
-    config = _write_config(tmp_path)
-    before = _tree_digest(repo)
+def test_a_projects_folder_that_is_not_git_ignored_is_refused(estate):
+    estate.ignored = False
+    result = _run()
+    assert result.exit_code == 1
+    assert "is not git-ignored in the api_test clone" in result.output
+    assert estate.writes == []
 
-    result = _run(config, str(repo), "--json")
 
+# ---------------------------------------------------------------------------
+# Arguments
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "args, said",
+    [
+        (["register-repo", "bench-one", "--github", URL], "not a project name of the form org/name"),
+        (["register-repo", KEY], "--github"),
+        (["register-repo", KEY, "--github", "git@github.com:guardkit/bench-one.git"], "https://"),
+        (["register-repo", KEY, "--github", "https://github.com/guardkit/other.git"], "names the repository 'other'"),
+        (["register-repo", KEY, "--github", URL], "which file is the sandbox's own forge.yaml"),
+        (["register-repo", KEY, "--github", URL, "--sandbox-settings", SANDBOX_SETTINGS, "--publish"],
+         "--publish needs the publisher's settings file"),
+        (["register-repo", KEY, "--github", URL, "--sandbox-settings", "/elsewhere/forge.yaml"], "--sandbox-clone"),
+    ],
+)
+def test_bad_arguments_are_refused_before_anything_is_asked(estate, args, said):
+    result = CliRunner().invoke(main, args, catch_exceptions=False)
+    assert result.exit_code == 1
+    assert said in result.output
+    assert estate.calls == []
+
+
+def test_json_reports_the_steps_and_the_activation(estate):
+    result = _run("--json")
     assert result.exit_code == 0, result.output
-    (detail,) = [d for name, _, d in _steps(result) if name == "documents"]
-    assert detail == (
-        "declared document is a link, which builds refuse: "
-        "docs/constitution/mission.md"
-    )
-    assert _tree_digest(repo) == before
-    assert (repo / "docs" / "constitution" / "mission.md").is_symlink()
+    report = json.loads(result.output)
+    assert {"step", "status", "detail"} == set(report["steps"][0])
+    assert any("--check-drained" in line for line in report["activation"])
 
 
-def test_a_declared_document_reached_through_a_linked_folder_is_warned(
-    _isolate, tmp_path
-):
-    repo = _make_repo(_isolate, "bench-one", toolchain=_DECLARES_TWO)
-    real = repo / "real-docs" / "constitution"
-    real.mkdir(parents=True)
-    for name in ("mission.md", "tech-stack.md"):
-        (real / name).write_text("x\n", encoding="utf-8")
-    shutil_docs = repo / "docs"
-    for child in shutil_docs.iterdir():
-        child.unlink()
-    shutil_docs.rmdir()
-    (repo / "docs").symlink_to("real-docs")
-    config = _write_config(tmp_path)
+# ---------------------------------------------------------------------------
+# The surgical YAML helpers (kept from the first register-repo)
+# ---------------------------------------------------------------------------
 
-    result = _run(config, str(repo), "--json")
 
+def test_locate_walks_indentation_to_a_nested_key():
+    lines = COORDINATOR_YAML.split("\n")
+    block = register_repo.locate(lines, ("planning", "sandboxes", "guardkit/api_test"))
+    assert block is not None
+    assert lines[block.key_line].strip() == "guardkit/api_test:"
+    assert register_repo.locate(lines, ("planning", "missing")) is None
+
+
+def test_missing_levels_are_created_and_the_result_parses():
+    lines = ["# a comment", "planning:", "  enabled: true"]
+    register_repo.set_mapping_entry(lines, ("planning", "target_repo_paths"), KEY, "/x")
+    register_repo.append_sequence_item(lines, ("permissions", "filesystem", "allowlist"), "/x")
+    assert yaml.safe_load("\n".join(lines)) == {
+        "planning": {"enabled": True, "target_repo_paths": {KEY: "/x"}},
+        "permissions": {"filesystem": {"allowlist": ["/x"]}},
+    }
+    assert lines[0] == "# a comment"
+
+
+def test_an_inline_value_is_refused_rather_than_guessed():
+    lines = ["planning:", "  target_repo_paths: {a: b}"]
+    with pytest.raises(register_repo.YamlEditRefused):
+        register_repo.set_mapping_entry(lines, ("planning", "target_repo_paths"), KEY, "/x")
+
+
+def test_a_scalar_that_would_read_back_differently_is_quoted():
+    assert register_repo._scalar("/var/lib/forge/projects/x") == "/var/lib/forge/projects/x"
+    assert register_repo._scalar("${FORGE_SANDBOX_SIDECAR_URL}") == '"${FORGE_SANDBOX_SIDECAR_URL}"'
+    assert register_repo._scalar("http://10.254.41.1:8925") == '"http://10.254.41.1:8925"'
+    assert register_repo._scalar("1.0") == '"1.0"'
+    assert register_repo._scalar("true") == '"true"'
+
+
+def test_a_named_compose_values_file_is_used_in_the_compose_form(estate, tmp_path):
+    named = tmp_path / "elsewhere" / "values.env"
+    result = _run("--secrets-file", str(named))
     assert result.exit_code == 0, result.output
-    (detail,) = [d for name, _, d in _steps(result) if name == "documents"]
-    assert detail == (
-        "declared document is reached through a link (docs), which builds "
-        "refuse: docs/constitution/mission.md; "
-        "declared document is reached through a link (docs), which builds "
-        "refuse: docs/constitution/tech-stack.md"
-    )
+    assert f"set -a; . {named}; set +a" in result.output

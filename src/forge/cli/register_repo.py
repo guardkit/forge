@@ -1,179 +1,168 @@
-"""``forge register-repo`` — one command takes a git checkout to "the factory
-can build in it" (Lane A, stage one; binding spec 2026-09-05).
+"""``forge register-repo`` — register a project on GitHub with the running factory.
 
-Registering a repository used to be thirteen manual steps across four files.
-This command does the twelve that are mechanical and *prints* the one that is
-not: the forge-prod recreate, which a human runs when they are ready. Nothing
-here starts, stops or recreates a container, and nothing here touches a model.
+The container set-up (design of 5 October 2026, "Registering more projects in
+the factory", Part 2). The factory runs as containers; every project is built
+in ONE shared Docker Sandbox (``api-test-deploy``), whose workspace is the
+api_test clone. A registered project gets the factory's own clone of it in a
+projects folder inside that clone's git-ignored runtime folder, so no sandbox
+rebuild, mount, port or start-up script change is needed.
 
-What it does, in order:
+What the command does, in order, saying one plain line per step:
 
-1. Refuses early and writes nothing at all when ``--name`` carries a path
-   separator, when the checkout is not a thing the build side could ever
-   resolve (missing, not a directory, no ``.git``, not owned by uid 1000, not
-   directly under ``FORGE_REPO_BASE``), when a repository map key for this name
-   already points somewhere else, or when there is no ``test:`` command for the
-   merge-ready gate to run.
-2. Warns and carries on for the things that are merely thin: no git remote, no
-   test roots, no ``deploy/profile.yaml``, no ``docs/architecture-rules.yaml``.
-   With ``--deploy-port`` it writes the five deploy files instead of warning:
-   a ``deploy/profile.yaml`` naming this repository's Docker Sandbox, the
-   wrapper that brings that sandbox up, the bootstrap that runs inside it and
-   brings up the factory's own two services there (the deploy sidecar and the
-   build runner — Rich's rule of 2026-09-07: nothing the factory runs on a
-   repository runs on the host), the deploy script that runs inside it, and
-   the candidate overlay that puts the throwaway copy on its own port.
-   Without the flag nothing about deploys is written and the warning stands.
-3. Scaffolds guardkit in the repository when it has none, writes the minimal
-   ``toolchain:`` block when the repository declares none (it NEVER overwrites a
-   declaration that is already there), and records the fleet-memory project id.
-4. Adds the checkout to ``permissions.filesystem.allowlist`` and both key
-   spellings — ``guardkit/<name>`` and ``<checkout-folder>/<name>`` — to
-   ``planning.target_repo_paths``, by **surgical line insertion**. The live
-   ``forge.yaml``'s comment blocks are load-bearing prose written by the people
-   who run this estate; dumping the parsed model back to YAML would erase them,
-   so this module never does that. One dated backup is taken before the first
-   change, and :func:`forge.config.loader.load_config` must re-parse the result
-   or the backup goes back and the command exits non-zero.
-5. Checks that no build is in flight — asking a running forge-prod container
-   first and ``FORGE_DB_PATH`` second, the way the recreate script's own gate
-   reads the ledger, and never creating a ledger of its own — and prints the
-   recreate command.
+1. **Checks the project and authors nothing in it.** It shallow-clones the
+   project's default branch into a temporary folder and reads
+   ``.guardkit/config.yaml``: ``memory.project`` must be declared, a toolchain
+   test command must be declared, and every declared binding document
+   (``autobuild.player.required_documents``) must exist as an ordinary file.
+   Anything missing is refused with the lines to add. It never writes to the
+   project's repository.
+2. **Prepares, and changes nothing live.** Every settings file it edits is
+   written beside the live one as a staged copy named
+   ``<file>.<leaf>-pending``, with a dated backup of the live file:
 
-Exit codes: 0 = registered (or nothing to do, or a warn-only run); 1 = refused,
-with a plain sentence saying which check said no.
+   * the coordinator's ``forge.yaml`` in the settings volume, read and written
+     through a throwaway ``alpine`` container, as the one-page upgrade
+     procedure does;
+   * the sandbox's own ``forge.yaml`` inside the api_test clone, read and
+     written through ``sbx exec``;
+   * with ``--publish``, the publisher's settings file, with one new route.
+
+   Each YAML file gains exactly three entries — the allowlist path, the
+   ``planning.target_repo_paths`` key and the ``planning.sandboxes`` entry
+   (copying api_test's sandbox name and addresses from the same file) — by
+   surgical line insertion that keeps every comment, and must re-parse with
+   :func:`forge.config.loader.load_config` or nothing is written.
+3. **The factory's clone**, in the sandbox, as the sandbox user: refused when
+   the projects folder is not git-ignored in the api_test clone, when the
+   sandbox cannot read the repository (a private repository needs a read
+   credential, which is an owner decision), or when a folder is already there
+   with a different origin; reused when it is there with the same origin.
+4. **Says what makes it live.** It prints the one-page procedure's own
+   sequence — close intake, confirm drained, stop, swap the staged files in,
+   restart the sandbox supervisor, start the publisher when its routes
+   changed, start the rest, check — and restarts nothing itself.
+
+``--check-drained`` is step (b) of that sequence: it reads the ledger, the work
+queue and the two durable bus consumers that feed the coordinator, and says
+DRAINED only when every one of them reads zero.
+
+``--dry-run`` does step 1 and prints what the rest would do; it writes nothing
+anywhere.
+
+Everything that reaches outside this process — git, docker and sbx — goes
+through :data:`run_command`, one small seam the tests replace with fakes.
+
+Exit codes: 0 = registered, prepared, unchanged or drained; 1 = refused or not
+drained, with a plain sentence saying which check said no.
 """
 
 from __future__ import annotations
 
-import importlib.resources
+import copy
 import json
 import os
 import re
+import shlex
 import subprocess
-from dataclasses import dataclass
+import tempfile
+from dataclasses import dataclass, field
 from datetime import date
-from pathlib import Path
-from typing import Any, Callable, Iterable, NoReturn, Sequence
+from pathlib import Path, PurePosixPath
+from typing import Any, Callable, Mapping, Sequence
 
 import click
 import yaml
-
-from forge.pipeline.deployment_identity import (
-    DEFAULT_ARTIFACT_SETTING,
-    DEFAULT_CHECKED_MARKER,
-    DEFAULT_REPORT_MARKER,
-    DEFAULT_SETTING_NAME,
-)
 
 __all__ = ["register_repo_cmd"]
 
 
 # ---------------------------------------------------------------------------
-# Constants — every one of them mirrors a seam named in the spec
+# The estate's facts. Every one is a default for an option, so a different
+# estate passes its own; none of them is a path on anybody's machine.
 # ---------------------------------------------------------------------------
 
-#: The uid the estate's checkouts belong to. A checkout owned by anyone else
-#: cannot be written by the build container's bind, so registering it would
-#: mint a claim the build side cannot honour.
-EXPECTED_OWNER_UID: int = 1000
+#: The one shared sandbox every project is built in (Rich, 5 October 2026).
+DEFAULT_SANDBOX: str = "api-test-deploy"
 
-#: Environment variable for the directory the build side resolves repositories
-#: under by basename (the resolution itself is
-#: ``forge.subagents.autobuild_runner._resolve_repo_path``).
-#:
-#: There is NO default (2026-09-24). Which directory a deployment keeps its
-#: checkouts in is a fact about that deployment, not about the factory, so an
-#: unset setting is refused by name instead of standing in for one folder on
-#: one person's machine — the old default did exactly that, and it was one of
-#: the machine-shaped paths the release image was found to be carrying.
-FORGE_REPO_BASE_ENV: str = "FORGE_REPO_BASE"
-DEFAULT_FORGE_REPO_BASE: str | None = None
+#: The user the sandbox's helper and runner run as, and the owner of the clone.
+SANDBOX_USER: str = "1000"
 
-#: The key spelling every repository is registered under. The estate also
-#: spells the same repository by the folder its checkouts sit in — builds are
-#: queued with ``<folder>/<name>`` — and that second namespace is derived from
-#: :data:`FORGE_REPO_BASE_ENV` at call time by :func:`_repo_map_namespaces`,
-#: because a folder name on one machine is not a fact about the factory. Both
-#: spellings are still minted from one loop so they cannot drift.
-REPO_MAP_NAMESPACES: tuple[str, ...] = ("guardkit",)
+#: The coordinator's settings volume and the file in it, as the one-page
+#: upgrade procedure names them.
+DEFAULT_SETTINGS_VOLUME: str = "forge-estate_forge-settings"
+SETTINGS_FILE_NAME: str = "forge.yaml"
 
-#: The command a human runs after this one, printed and never run.
-RECREATE_COMMAND: str = "bash ops/forge-prod-recreate.sh"
+#: The throwaway image the volume is read and written through, as the
+#: procedure does (``docker run --rm -v <volume>:/s alpine ...``).
+VOLUME_HELPER_IMAGE: str = "alpine"
 
-#: The container the estate runs the forge in, and the config path inside it.
-#: The recreate script's own gate reads the ledger through this container
-#: (``ops/forge-prod-recreate.sh``), because the ledger the *estate* builds
-#: against lives in the container's bind, not beside whatever directory a human
-#: happened to run this command from. This gate reads it the same way.
-FORGE_PROD_CONTAINER: str = "forge-prod"
-FORGE_PROD_CONFIG: str = "/var/forge/forge.yaml"
+#: The Compose project the estate runs as, and its coordinator container.
+COMPOSE_PROJECT: str = "forge-estate"
+DEFAULT_COORDINATOR_CONTAINER: str = "forge-estate-coordinator-1"
 
-#: The environment variable that names a ledger to read when there is no
-#: forge-prod container (``cli/status.py:108``).
-FORGE_DB_PATH_ENV: str = "FORGE_DB_PATH"
+#: Where the coordinator keeps its ledger (the ``forge-ledger`` volume,
+#: ``deploy/compose/compose.yaml``); its own ``FORGE_DB_PATH`` wins when set.
+COORDINATOR_LEDGER: str = "/var/lib/forge/forge.db"
 
-#: How long the two docker reads may take before the gate gives up and warns.
-DOCKER_READ_TIMEOUT: int = 30
+#: Where the coordinator's settings name a project's folder. For a project
+#: with a sandbox the coordinator never reads this folder: every read goes to
+#: the sandbox helper by the project's key (see :data:`COORDINATOR_FOLDER_NOTE`).
+COORDINATOR_PROJECTS_ROOT: str = "/var/lib/forge/projects"
 
-#: fleet-memory's identifier contract (``fleet-memory``
-#: ``src/fleet_memory/payloads/base.py:16``), enforced by guardkit's own
-#: sanitiser (``guardkit/knowledge/fleet_memory_payloads.py:38-53``).
-_IDENTIFIER_PATTERN = re.compile(r"^[a-zA-Z0-9_]+$")
-_IDENTIFIER_SANITISER = re.compile(r"[^A-Za-z0-9_]+")
+#: The api_test clone's git-ignored runtime folder, the sandbox's own
+#: settings file in it, and the projects folder registered projects live in.
+RUNTIME_FOLDER: str = ".guardkit/tmp/factory-runtime"
+SANDBOX_SETTINGS_IN_CLONE: str = f"{RUNTIME_FOLDER}/forge.yaml"
+PROJECTS_FOLDER: str = f"{RUNTIME_FOLDER}/projects"
 
-#: The default test timeout guardkit's declaration schema itself uses
-#: (``guardkit/orchestrator/toolchain_declaration.py:205``).
-DEFAULT_TEST_TIMEOUT: int = 300
+#: The project whose sandbox entry a new project copies: the sandbox name and
+#: its two addresses are the same for every project in the shared sandbox.
+REFERENCE_PROJECT: str = "guardkit/api_test"
 
-#: Where the shipped files for a new repository's deploy live: two shell
-#: scripts and the candidate overlay. They are real files, not Python strings,
-#: so they can be read and diffed as what they are (the same reasoning as the
-#: lifecycle schema's ``.sql``).
-DEPLOY_TEMPLATE_PACKAGE: str = "forge.cli.deploy_templates"
-
-#: The hosts every repository's sandbox is allowed to reach: the Debian
-#: mirrors it installs system packages from and the Python index it installs
-#: Python packages from. A sandbox reaches nothing off its own network without
-#: a rule, so without these an image build inside it cannot fetch anything.
-DEFAULT_SANDBOX_ALLOW_NETWORK: tuple[str, ...] = (
-    "deb.debian.org",
-    "security.debian.org",
-    "*.debian.org",
-    "pypi.org",
-    "files.pythonhosted.org",
+#: The publisher's fetch address for a project's clone: sbx's git daemon,
+#: published on the factory gateway, serves anything inside the api_test clone.
+DEFAULT_PUBLISH_SOURCE_BASE: str = (
+    "git://10.254.41.1:8918/api_test/.guardkit/tmp/factory-runtime/projects"
 )
 
-#: How much memory and how many processors a new repository's sandbox gets.
-#: The same settings the first sandbox on this box was proven with.
-DEFAULT_SANDBOX_MEMORY: str = "6g"
-DEFAULT_SANDBOX_CPUS: int = 4
+#: The settings in the estate env file and the sandbox's bootstrap env file
+#: this command takes its defaults from.
+ESTATE_ENV_SANDBOX_FILE: str = "SANDBOX_PROJECT_ENV_FILE"
+ESTATE_ENV_PUBLISHER_SETTINGS: str = "FORGE_PUBLISHER_SETTINGS_FILE"
+ESTATE_ENV_COMPOSE_FILE: str = "COMPOSE_FILE"
+SANDBOX_ENV_CONFIG_PATH: str = "FORGE_CONFIG_PATH"
 
-#: The five files ``--deploy-port`` writes, in the order they are reported.
-DEPLOY_FILES: tuple[str, ...] = (
-    "deploy/profile.yaml",
-    "deploy/sandbox-deploy.sh",
-    "deploy/sandbox-runner.sh",
-    "deploy/deploy.sh",
-    "deploy/docker-compose.candidate.yml",
+#: The three services that let work in: the two that receive Slack, and the
+#: watch on the gateway (stopped with them so it does not raise an alarm about
+#: a gateway that was stopped on purpose). The procedure starts them last.
+INTAKE_SERVICES: tuple[str, ...] = ("front-door", "bus-gateway", "gateway-watch")
+
+#: The publisher's Compose service and the sandbox supervisor's.
+PUBLISHER_SERVICE: str = "forge-publisher"
+SANDBOX_SUPERVISOR_SERVICE: str = "sandbox-runner"
+
+#: The bus stream the coordinator's two durable consumers read.
+BUS_STREAM: str = "PIPELINE"
+
+#: How long one outside command may take. A clone gets longer.
+COMMAND_TIMEOUT: float = 120.0
+CLONE_TIMEOUT: float = 900.0
+
+#: What a project's name and its last part may be: the repository map key is
+#: ``org/name``, and the last part becomes a folder name.
+_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+#: A YAML scalar written as it is; anything else is written double-quoted.
+_PLAIN_SCALAR = re.compile(r"^[A-Za-z0-9_./-]+$")
+
+#: What the coordinator does with its folder for a project that has a sandbox,
+#: found 5 October 2026 by reading the code rather than assumed.
+COORDINATOR_FOLDER_NOTE: str = (
+    f"not created: for a project with a sandbox the coordinator never reads "
+    f"its {COORDINATOR_PROJECTS_ROOT}/<leaf> folder — planning facts, worktrees, "
+    f"repairs and the toolchain are read through the sandbox helper by the "
+    f"project's key — and api_test's folder there does not exist either"
 )
-
-#: The factory's two services inside a repository's sandbox (the spec's Part O,
-#: rule 68), and where forge-prod reaches them on the host's loopback. Inside
-#: the sandbox the deploy sidecar listens on 8125 and the build runner on 8124,
-#: as their host-side units always have. On the host each repository gets its
-#: own pair, derived from its app port: the runner 23 above it and the sidecar
-#: 24 above it, so api_test (app 8901, candidate 8902) has its runner on 8924
-#: and its sidecar on 8925, and no two repositories share a port as long as
-#: their app ports are more than 24 apart.
-SIDECAR_PORT_INSIDE: int = 8125
-RUNNER_PORT_INSIDE: int = 8124
-RUNNER_PORT_OFFSET: int = 23
-SIDECAR_PORT_OFFSET: int = 24
-
-#: The highest app port that leaves room for the candidate copy (one above)
-#: and the two service ports (23 and 24 above).
-MAX_DEPLOY_PORT: int = 65535 - SIDECAR_PORT_OFFSET
 
 
 # ---------------------------------------------------------------------------
@@ -205,30 +194,22 @@ def _render(steps: Sequence[Step]) -> str:
     )
 
 
-def _tail(name: str) -> list[Step]:
-    """The two closing lines.
-
-    They are NOT part of the aligned table: they are the sentences a human
-    copies, so they print exactly as the spec writes them (``next`` and
-    ``slack`` both pad to six characters, so their values still line up).
-    """
-    return [
-        Step("next", "ok", f"run: {RECREATE_COMMAND}"),
-        Step("slack", "ok", f"target: {name}  <your first feature>"),
-    ]
-
-
-def _emit(
-    steps: Sequence[Step], *, as_json: bool, tail: Sequence[Step] = ()
-) -> None:
+def _emit(steps: Sequence[Step], *, as_json: bool, tail: Sequence[str] = ()) -> None:
     if as_json:
-        click.echo(json.dumps([s.as_dict() for s in (*steps, *tail)], indent=2))
+        click.echo(
+            json.dumps(
+                {"steps": [s.as_dict() for s in steps], "activation": list(tail)},
+                indent=2,
+            )
+        )
         return
     rendered = _render(steps)
     if rendered:
         click.echo(rendered)
-    for line in tail:
-        click.echo(f"{line.step.ljust(5)} {line.detail}")
+    if tail:
+        click.echo("")
+        for line in tail:
+            click.echo(line)
 
 
 # ---------------------------------------------------------------------------
@@ -432,317 +413,279 @@ def set_mapping_entry(
     lines.insert(at, f"{' ' * indent}{key}: {value}")
 
 
-def _split_lines(text: str) -> list[str]:
-    return text.split("\n")
+def _scalar(value: str) -> str:
+    """``value`` as a YAML scalar that reads back as exactly that text."""
+    text = str(value)
+    if _PLAIN_SCALAR.match(text):
+        try:
+            if yaml.safe_load(text) == text:
+                return text
+        except yaml.YAMLError:  # pragma: no cover — a plain match always parses
+            pass
+    return json.dumps(text)
 
 
-def _join_lines(lines: Sequence[str]) -> str:
-    return "\n".join(lines)
+def _without_empty_flow(line: str) -> str:
+    """A ``key: []`` / ``key: {}`` line as the editor rewrites it (``key:``)."""
+    stripped = line.rstrip()
+    for empty in (" []", " {}"):
+        if stripped.endswith(":" + empty):
+            return stripped[: -len(empty)]
+    return line
 
 
-# ---------------------------------------------------------------------------
-# Seams other modules own — module-level so tests can rebind them
-# ---------------------------------------------------------------------------
+def _keeps_every_line(old: Sequence[str], new: Sequence[str]) -> bool:
+    """True when every line of ``old`` is still in ``new``, in order.
 
-
-def _run_guardkit_init(repo: Path, template: str) -> subprocess.CompletedProcess[str]:
-    """Shell out to ``guardkit init <template>`` from the repository.
-
-    WHY THIS ONE IS NOT CUT DOWN to the short named list of 2026-09-21 (item 1,
-    second revision, section D; :mod:`forge.launch_environment`), when the
-    launches of the build system on the coordinator's side were. That list is
-    what an UNATTENDED build is given: it exists so a build cannot reach
-    whatever the long-running runner happened to be holding, which no person
-    ever looked at. This command is the opposite — somebody at a terminal
-    registering a repository, once, by hand, inheriting their own shell, which
-    they can see. It starts no build, reads and writes no memory, and writes
-    only into the repository in front of them. Handing it a list assembled for
-    a build would drop the settings their shell uses to find and run the build
-    system, and would buy nothing.
+    Comments included: the live files' comments are the record of why entries
+    exist. The one rewrite the editor makes, ``key: []`` becoming ``key:``
+    before its first item, is allowed for.
     """
+    remaining = iter(_without_empty_flow(line) for line in new)
+    return all(_without_empty_flow(line) in remaining for line in old)
+
+
+# ---------------------------------------------------------------------------
+# The seam — every outside command goes through here
+# ---------------------------------------------------------------------------
+
+
+#: ``run(argv, *, input=None, timeout=...)`` → a finished process. It is the
+#: only way this module reaches git, docker or sbx, so the tests can answer for
+#: all three without any of them being installed, running or touched.
+Runner = Callable[..., "subprocess.CompletedProcess[str]"]
+
+
+def _run_command(
+    argv: Sequence[str], *, input: str | None = None, timeout: float = COMMAND_TIMEOUT
+) -> "subprocess.CompletedProcess[str]":
+    """Run one command, capturing its output. Never uses a shell."""
     return subprocess.run(  # noqa: S603 — fixed argv, no shell
-        ["guardkit", "init", template],
-        cwd=str(repo),
-        capture_output=True,
-        text=True,
-        timeout=300,
-        check=False,
-    )
-
-
-#: Directory names that are never test roots, guardkit's own list verbatim
-#: (``installer/core/commands/lib/smoke_gates_nudge.py:32``).
-_TEST_ROOT_SKIP_NAMES = frozenset({"__pycache__", ".pytest_cache", "node_modules"})
-
-
-def _shallow_test_roots(repo: Path) -> list[str]:
-    """``tests/<name>`` for every immediate subdirectory of ``tests/``.
-
-    guardkit's own rule, rewritten here rather than imported: one level deep,
-    directories only, skipping names that begin with a dot and the three cache
-    and build directories guardkit skips, sorted
-    (``smoke_gates_nudge.py:40-82``). It is used only when guardkit is not
-    importable, which is the ordinary case on the surface Rich runs this
-    command from: forge's venv carries the guardkit CLI on PATH, not the
-    guardkit package.
-    """
-    tests_dir = Path(repo) / "tests"
-    if not tests_dir.is_dir():
-        return []
-    try:
-        return sorted(
-            f"tests/{child.name}"
-            for child in tests_dir.iterdir()
-            if child.is_dir()
-            and not child.name.startswith(".")
-            and child.name not in _TEST_ROOT_SKIP_NAMES
-        )
-    except OSError:
-        return []
-
-
-def _discover_test_roots(repo: Path) -> list[str]:
-    """Forge's own ``discover_target_test_roots`` (``target_terminal_tools.py:487``).
-
-    That function imports guardkit's discovery and raises
-    ``TargetTestRootsUnresolved`` when guardkit is not importable — which is
-    what happens every time this command is run the way the spec says Rich runs
-    it, from the forge checkout, whose venv has the guardkit CLI on PATH but no
-    guardkit package. Reporting "not available here" there would be useless to
-    the reader, so the plain directory scan above answers instead: it is the
-    same rule guardkit applies, and it gives the same answer for the shapes
-    this check exists to catch.
-    """
-    try:
-        from forge.planning.target_terminal_tools import discover_target_test_roots
-
-        return list(discover_target_test_roots(repo))
-    except Exception:  # noqa: BLE001 — no guardkit here; scan the tree instead
-        return _shallow_test_roots(repo)
-
-
-#: A callable that runs a command and hands back the finished process. It is a
-#: parameter, not a hard-wired ``subprocess.run``, so the tests can answer for
-#: docker without docker being installed, running, or touched.
-Runner = Callable[[Sequence[str]], "subprocess.CompletedProcess[str]"]
-
-
-def _run_command(argv: Sequence[str]) -> "subprocess.CompletedProcess[str]":
-    """Run a command and capture its output. Reads only; changes nothing."""
-    return subprocess.run(
         list(argv),
+        input=input,
         capture_output=True,
         text=True,
-        timeout=DOCKER_READ_TIMEOUT,
+        timeout=timeout,
         check=False,
     )
 
 
-def _forge_prod_is_running(run: Runner) -> bool:
-    """Is there a container called forge-prod, and is it up?
+#: The seam itself. Tests rebind this module attribute.
+run_command: Runner = _run_command
 
-    ``docker inspect`` answers both questions in one read: a missing container
-    is a non-zero exit, a stopped one prints ``false``.
-    """
+
+def _call(
+    run: Runner,
+    argv: Sequence[str],
+    *,
+    input: str | None = None,
+    timeout: float = COMMAND_TIMEOUT,
+) -> "subprocess.CompletedProcess[str]":
+    """Run through the seam; a command that could not start reads as a failure."""
     try:
-        result = run(
-            [
-                "docker",
-                "inspect",
-                "-f",
-                "{{.State.Running}}",
-                FORGE_PROD_CONTAINER,
-            ]
-        )
-    except (OSError, subprocess.SubprocessError):
-        # No docker on this machine, or it did not answer. Not an error: the
-        # next branch reads the ledger a different way.
-        return False
-    return result.returncode == 0 and result.stdout.strip() == "true"
+        return run(list(argv), input=input, timeout=timeout)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return subprocess.CompletedProcess(list(argv), 127, "", f"{type(exc).__name__}: {exc}")
 
 
-def _terminal_status_values() -> set[str]:
-    """The terminal build states, by name (``cli/status.py:95-100``)."""
-    from forge.cli.status import _TERMINAL_STATES
-
-    return {str(state.value) for state in _TERMINAL_STATES}
-
-
-def _not_terminal_in_container(run: Runner) -> int:
-    """How many builds the forge-prod ledger shows as not terminal.
-
-    The read is exactly the recreate script's gate of record, in its JSON
-    spelling: ``docker exec forge-prod forge --config /var/forge/forge.yaml
-    status --json``. It runs inside the container, so it reads the ledger the
-    estate actually builds against, and it starts, stops and changes nothing.
-    """
-    result = run(
-        [
-            "docker",
-            "exec",
-            FORGE_PROD_CONTAINER,
-            "forge",
-            "--config",
-            FORGE_PROD_CONFIG,
-            "status",
-            "--json",
-        ]
-    )
-    if result.returncode != 0:
-        said = (result.stderr or result.stdout or "").strip().splitlines()
-        raise RuntimeError(
-            said[-1]
-            if said
-            else f"'forge status' in {FORGE_PROD_CONTAINER} exited {result.returncode}"
-        )
-    rows = json.loads(result.stdout)
-    if not isinstance(rows, list):
-        raise RuntimeError("'forge status --json' did not print a list of builds")
-    terminal = _terminal_status_values()
-    return sum(1 for row in rows if str(row.get("status", "")) not in terminal)
+def _said(result: "subprocess.CompletedProcess[str]") -> str:
+    """The last line a failed command printed, or its exit code."""
+    lines = (result.stderr or result.stdout or "").strip().splitlines()
+    return lines[-1].strip() if lines else f"exit {result.returncode}"
 
 
-def _read_ledger_views(db_path: Path) -> list[Any]:
-    """The status projection from a ledger file, opened read-only.
+class Refused(Exception):
+    """One check said no. ``step`` names it; ``detail`` is the plain sentence."""
 
-    ``read_only_connect`` is a ``mode=ro`` handle: a path that is not already a
-    database is an error here, never a new empty one. This command must never
-    bring a ledger into being — an invented ledger would show no builds and the
-    gate would say "all terminal" about an estate it had not read.
-    """
-    from forge.cli.status import _read_status_views
-
-    return list(_read_status_views(db_path, None))
-
-
-def _all_terminal(views: Iterable[Any]) -> bool:
-    """The existing terminal test (``cli/status.py:416-425``) — not re-implemented."""
-    from forge.cli.status import _all_terminal as existing
-
-    return existing(views)
-
-
-def _waiting_step(waiting: int) -> Step:
-    """``estate ok`` when nothing is in flight, ``estate wait <n>`` otherwise."""
-    if waiting <= 0:
-        return Step("estate", "ok", "all builds terminal")
-    subject = "build is" if waiting == 1 else "builds are"
-    return Step("estate", "wait", f"{waiting} {subject} not terminal")
-
-
-def _estate_step(runner: Runner | None = None) -> Step:
-    """The estate gate's one line. Reads; never starts, stops or creates anything.
-
-    In the order the recreate gate of record uses:
-
-    1. a running ``forge-prod`` container — ask it, the way the recreate script
-       asks it;
-    2. otherwise ``FORGE_DB_PATH``, read-only;
-    3. otherwise say plainly that the ledger could not be read.
-
-    Any failure along the way is a warn, not a refusal: registering a
-    repository is not made wrong by a gate that could not see the queue, and
-    the human still gets the recreate command with the warning above it.
-    """
-    run = runner or _run_command
-    try:
-        if _forge_prod_is_running(run):
-            return _waiting_step(_not_terminal_in_container(run))
-        raw = os.environ.get(FORGE_DB_PATH_ENV, "").strip()
-        if raw:
-            views = _read_ledger_views(Path(raw).expanduser())
-            return _waiting_step(sum(1 for v in views if not _all_terminal([v])))
-        return Step(
-            "estate",
-            "warn",
-            "could not read the build ledger (no forge-prod container and "
-            "FORGE_DB_PATH unset)",
-        )
-    except Exception as exc:  # noqa: BLE001 — an unreadable ledger is a warn
-        return Step("estate", "warn", f"could not read the build ledger: {exc}")
+    def __init__(self, step: str, detail: str) -> None:
+        super().__init__(detail)
+        self.step = step
+        self.detail = detail
 
 
 # ---------------------------------------------------------------------------
-# Reading what the repository already declares
+# Where the three settings files live: three small stores, one shape
 # ---------------------------------------------------------------------------
 
 
-def _repo_config_path(repo: Path) -> Path:
-    """``<repo>/.guardkit/config.yaml`` (``toolchain_declaration.py:144``)."""
-    return repo / ".guardkit" / "config.yaml"
+@dataclass(frozen=True)
+class VolumeStore:
+    """Files in the coordinator's settings volume, through a throwaway container.
+
+    Read: ``docker run --rm -v <volume>:/s:ro alpine cat /s/<file>``. Write: the
+    text goes into a private temporary file and is copied in with ``docker run
+    --rm --user 1000:1000 -v <volume>:/s -v <tmp>:/in:ro alpine cp /in /s/<file>``,
+    keeping the owner, exactly as the one-page procedure puts a settings file in.
+    """
+
+    volume: str
+    run: Runner
+
+    def where(self, name: str) -> str:
+        return f"{self.volume}:/{name}"
+
+    def read(self, name: str) -> str | None:
+        result = _call(
+            self.run,
+            ["docker", "run", "--rm", "-v", f"{self.volume}:/s:ro",
+             VOLUME_HELPER_IMAGE, "cat", f"/s/{name}"],
+        )
+        return result.stdout if result.returncode == 0 else None
+
+    def names(self) -> list[str]:
+        result = _call(
+            self.run,
+            ["docker", "run", "--rm", "-v", f"{self.volume}:/s:ro",
+             VOLUME_HELPER_IMAGE, "ls", "-1", "/s"],
+        )
+        return result.stdout.split() if result.returncode == 0 else []
+
+    def write(self, name: str, text: str) -> None:
+        with tempfile.TemporaryDirectory(prefix="forge-register-") as folder:
+            local = Path(folder) / name
+            local.write_text(text, encoding="utf-8")
+            result = _call(
+                self.run,
+                ["docker", "run", "--rm", "--user", f"{SANDBOX_USER}:{SANDBOX_USER}",
+                 "-v", f"{self.volume}:/s", "-v", f"{local}:/in:ro",
+                 VOLUME_HELPER_IMAGE, "cp", "/in", f"/s/{name}"],
+            )
+        if result.returncode != 0:
+            raise Refused("coordinator", f"could not write {name} into {self.volume} ({_said(result)})")
+        if self.read(name) != text:
+            raise Refused("coordinator", f"{name} in {self.volume} did not read back as written")
+
+
+@dataclass(frozen=True)
+class SandboxStore:
+    """Files and commands inside the shared sandbox, as its own user.
+
+    Every call is ``sbx exec -u 1000 <sandbox> ...``; a write hands the text in
+    on standard input (``-i``) to ``sh -c 'cat > "$1"'``.
+    """
+
+    sandbox: str
+    run: Runner
+
+    def exec(
+        self,
+        *argv: str,
+        input: str | None = None,
+        env: Sequence[str] = (),
+        timeout: float = COMMAND_TIMEOUT,
+    ) -> "subprocess.CompletedProcess[str]":
+        command = ["sbx", "exec"]
+        if input is not None:
+            command.append("-i")
+        command += ["-u", SANDBOX_USER]
+        for item in env:
+            command += ["-e", item]
+        command += [self.sandbox, *argv]
+        return _call(self.run, command, input=input, timeout=timeout)
+
+    def where(self, name: str) -> str:
+        return f"{self.sandbox}:{name}"
+
+    def read(self, name: str) -> str | None:
+        result = self.exec("cat", name)
+        return result.stdout if result.returncode == 0 else None
+
+    def names(self, folder: str) -> list[str]:
+        result = self.exec("ls", "-1", folder)
+        return result.stdout.split() if result.returncode == 0 else []
+
+    def write(self, name: str, text: str) -> None:
+        result = self.exec("sh", "-c", 'cat > "$1"', "register-repo", name, input=text)
+        if result.returncode != 0:
+            raise Refused("sandbox", f"could not write {name} in {self.sandbox} ({_said(result)})")
+        if self.read(name) != text:
+            raise Refused("sandbox", f"{name} in {self.sandbox} did not read back as written")
+
+
+@dataclass(frozen=True)
+class HostStore:
+    """The publisher's settings file on this machine. Mode is kept (it is 600)."""
+
+    def where(self, name: str) -> str:
+        return name
+
+    def read(self, name: str) -> str | None:
+        try:
+            return Path(name).read_text(encoding="utf-8")
+        except OSError:
+            return None
+
+    def names(self, folder: str) -> list[str]:
+        try:
+            return sorted(os.listdir(folder))
+        except OSError:
+            return []
+
+    def write(self, name: str, text: str, *, like: str | None = None) -> None:
+        mode = 0o600
+        if like is not None:
+            try:
+                mode = Path(like).stat().st_mode & 0o777
+            except OSError:
+                pass
+        descriptor = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        os.chmod(name, mode)
+
+
+# ---------------------------------------------------------------------------
+# Small file readers: env files
+# ---------------------------------------------------------------------------
+
+
+def read_env_file(path: Path) -> dict[str, str]:
+    """``NAME=value`` lines of an env file. Comments and blank lines skipped.
+
+    Only names are looked up here, never printed: the estate env file also
+    holds addresses with credentials in them.
+    """
+    values: dict[str, str] = {}
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        name, _, value = line.partition("=")
+        name = name.strip()
+        if name.startswith("export "):
+            name = name[len("export "):].strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1]
+        values[name] = value
+    return values
+
+
+def _resolve_beside(value: str, anchor: Path) -> Path:
+    """A path an env file names, read relative to the env file's own folder."""
+    candidate = Path(value).expanduser()
+    return candidate if candidate.is_absolute() else (anchor.parent / candidate)
+
+
+# ---------------------------------------------------------------------------
+# Step 1 — check the project, author nothing
+# ---------------------------------------------------------------------------
 
 
 def _read_repo_config_dict(repo: Path) -> dict[str, Any]:
-    """The repository's guardkit config as a plain dict, or ``{}``.
-
-    guardkit reads this file the same way — ``yaml.safe_load`` into a plain
-    dict, keys pulled by name (``guardkit/orchestrator/security_config.py:84-86``,
-    ``guardkit/orchestrator/coach_grammar.py:88-93``,
-    ``guardkit/planning/context_switch.py:76-82``). There is no whole-file
-    schema, so a key guardkit does not know about is inert.
-    """
-    path = _repo_config_path(repo)
+    """The project's guardkit config as a plain dict, or ``{}``."""
+    path = repo / ".guardkit" / "config.yaml"
     if not path.is_file():
         return {}
     try:
         data = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except Exception:  # noqa: BLE001 — an unreadable config is "declares nothing"
+    except Exception:  # noqa: BLE001 — an unreadable config declares nothing
         return {}
     return data if isinstance(data, dict) else {}
 
 
-def _declared_document_warnings(repo: Path, config_text: str) -> list[str]:
-    """One sentence per declared binding document builds would refuse, in order.
-
-    Read with the same reader the build admission uses, so registration and
-    admission cannot disagree about what the project declared. A document
-    that is a symbolic link, or is reached through a folder that is one, is
-    named (``lstat`` on every component: builds refuse a link, whatever it
-    points at); one that is not in the checkout is named as
-    missing. A file that cannot be read declares nothing here; admission says
-    why at build time.
-    """
-    from forge.planning.declared_memory import read_declared_project_documents
-
-    declared, why = read_declared_project_documents(config_text or None)
-    warnings: list[str] = []
-    if why:
-        # The one reading rule's own check (4 October 2026): planning,
-        # admission and the Coach would all refuse this declaration.
-        warnings.append(f"declared documents cannot be used, which builds refuse: {why}")
-    for path in (entry.path for entry in declared.documents):
-        parts = Path(path).parts
-        # Every component, not only the file: a folder on the way that is a
-        # link (``docs -> ../real``) is a link too, and in git the document is
-        # then not a file under that folder at all.
-        linked = next(
-            (
-                "/".join(parts[:index])
-                for index in range(1, len(parts) + 1)
-                if (repo.joinpath(*parts[:index])).is_symlink()
-            ),
-            None,
-        )
-        if linked == path:
-            warnings.append(f"declared document is a link, which builds refuse: {path}")
-        elif linked is not None:
-            warnings.append(
-                f"declared document is reached through a link ({linked}), "
-                f"which builds refuse: {path}"
-            )
-        elif not (repo / path).is_file():
-            warnings.append(f"declared but missing: {path}")
-    return warnings
-
-
 def _guardkit_is_importable() -> bool:
-    """Is guardkit's declaration loader importable in this interpreter?
-
-    Asked BEFORE calling forge's wrapper, because the wrapper logs a loud
-    warning aimed at the forge image when guardkit is missing — a true sentence
-    in that context, and pure noise in this one, where the raw-dict fallback
-    below answers the same question correctly.
-    """
+    """Is guardkit's declaration loader importable in this interpreter?"""
     from importlib.util import find_spec
 
     try:
@@ -752,16 +695,13 @@ def _guardkit_is_importable() -> bool:
 
 
 def _declared_test_command(repo: Path) -> str | None:
-    """The repository's declared ``toolchain.test``, or ``None``.
+    """The project's declared ``toolchain.test``, or ``None``.
 
-    Asks guardkit's own loader first, through forge's existing wrapper
-    (``cli/_serve_conductor.py:367-410``), so the answer is the one the
-    merge-ready checkpoint will get. That wrapper returns ``None`` both when the
-    declaration is absent AND when guardkit is not importable in this
-    interpreter, and those two are very different for a writer: the second must
-    never be read as "declares nothing" or this command would append a second
-    ``toolchain:`` block over a real one. So the raw dict is consulted too, and
-    a declaration found either way counts.
+    guardkit's own loader first, through the reader the factory's gates use
+    (:func:`forge.cli._serve_conductor.load_declared_toolchain`), so the answer
+    is the one the merge-ready check will get; the plain ``toolchain.test`` key
+    otherwise, because that reader answers ``None`` both for "declares nothing"
+    and for "guardkit is not importable here".
     """
     declaration = None
     if _guardkit_is_importable():
@@ -769,7 +709,7 @@ def _declared_test_command(repo: Path) -> str | None:
             from forge.cli._serve_conductor import load_declared_toolchain
 
             declaration = load_declared_toolchain(repo)
-        except Exception:  # noqa: BLE001 — a reader defect is no licence to write
+        except Exception:  # noqa: BLE001 — a reader defect is "not declared"
             declaration = None
     if declaration is not None:
         command = getattr(declaration, "test", None)
@@ -781,317 +721,748 @@ def _declared_test_command(repo: Path) -> str | None:
     return None
 
 
-def project_id_for(name: str) -> str:
-    """The fleet-memory project id for a repository name.
+#: The lines a project adds to declare its test command.
+THE_TOOLCHAIN_LINES: str = "  toolchain:\n    test: <the command that runs this project's tests>"
 
-    The existing sanitiser rule, verbatim
-    (``guardkit/knowledge/fleet_memory_payloads.py:38-53``): every run of
-    characters outside ``[A-Za-z0-9_]`` becomes one underscore, and leading or
-    trailing underscores are trimmed.
+
+def _document_problems(repo: Path, config_text: str | None) -> list[str]:
+    """One sentence per declared binding document that builds would refuse.
+
+    Read with the same reader planning and admission use
+    (:func:`forge.planning.declared_memory.read_declared_project_documents`).
+    A document must be an ordinary file in the checkout: missing, a folder, a
+    symbolic link, or reached through a linked folder is named.
     """
-    if not name:
-        return "unknown"
-    cleaned = _IDENTIFIER_SANITISER.sub("_", name).strip("_")
-    return cleaned or "unknown"
+    from forge.planning.declared_memory import (
+        BINDING_DOCUMENTS_FIELD,
+        read_declared_project_documents,
+    )
 
-
-def _git_remote(repo: Path) -> str | None:
-    """The first configured git remote's name, or ``None``."""
-    try:
-        result = subprocess.run(  # noqa: S603 — fixed argv, no shell
-            ["git", "remote"],
-            cwd=str(repo),
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
+    declared, why = read_declared_project_documents(config_text or None)
+    if why:
+        return [f"the declared binding documents cannot be used: {why}"]
+    problems: list[str] = []
+    for path in (entry.path for entry in declared.documents):
+        parts = PurePosixPath(path).parts
+        linked = next(
+            (
+                "/".join(parts[:index])
+                for index in range(1, len(parts) + 1)
+                if repo.joinpath(*parts[:index]).is_symlink()
+            ),
+            None,
         )
-    except Exception:  # noqa: BLE001 — no git binary reads as "no remote"
-        return None
-    if result.returncode != 0:
-        return None
-    remotes = [line.strip() for line in result.stdout.splitlines() if line.strip()]
-    return remotes[0] if remotes else None
+        if linked == path:
+            problems.append(f"the declared document {path} is a link; builds need an ordinary file")
+        elif linked is not None:
+            problems.append(
+                f"the declared document {path} is reached through a link ({linked}); "
+                "builds need an ordinary file"
+            )
+        elif not (repo / path).exists():
+            problems.append(
+                f"the declared document {path} ({BINDING_DOCUMENTS_FIELD}) is not in "
+                "the project; commit it, or take it out of the list"
+            )
+        elif not (repo / path).is_file():
+            problems.append(f"the declared document {path} is not an ordinary file")
+    return problems
 
 
-# ---------------------------------------------------------------------------
-# Config path resolution
-# ---------------------------------------------------------------------------
+def check_project(run: Runner, *, key: str, url: str, folder: Path) -> list[Step]:
+    """Step 1: a shallow clone of the default branch, read, never written.
 
-
-def _resolve_config_path(ctx: click.Context) -> Path:
-    """The ``forge.yaml`` this command edits: ``--config``, else ``./forge.yaml``.
-
-    Never hard-coded. The group already loaded whichever of these it found
-    (``cli/main.py:62-80``); this reads the same decision back so the file that
-    gets edited is the file that got loaded.
+    Returns the report lines; raises :class:`Refused` naming every gap at once.
     """
-    parent = ctx.parent
-    explicit = parent.params.get("config_path") if parent is not None else None
-    if explicit is not None:
-        return Path(explicit)
-    default = Path("forge.yaml")
-    if default.exists():
-        return default
-    raise click.ClickException(
-        "no forge.yaml to register into — pass --config /path/to/forge.yaml "
-        "before the subcommand, or run from a directory that has one"
+    from forge.planning.declared_memory import DECLARATION_PATH, read_declared_memory
+
+    checkout = folder / "project"
+    cloned = _call(
+        run,
+        ["env", "GIT_TERMINAL_PROMPT=0", "git", "clone", "--depth", "1", "--quiet",
+         "--", url, str(checkout)],
+        timeout=CLONE_TIMEOUT,
     )
+    if cloned.returncode != 0 or not checkout.is_dir():
+        raise Refused("project", f"could not read {url} ({_said(cloned)})")
+    head = _call(run, ["git", "-C", str(checkout), "rev-parse", "HEAD"])
+    commit = head.stdout.strip()[:12] if head.returncode == 0 and head.stdout.strip() else "its default branch"
 
+    config_path = checkout / DECLARATION_PATH
+    found = config_path.exists() or config_path.is_symlink()
+    content: str | None = None
+    unreadable: str | None = None
+    if found:
+        if config_path.is_symlink() or not config_path.is_file():
+            unreadable = "it is not an ordinary file"
+        else:
+            try:
+                content = config_path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError) as exc:
+                unreadable = f"it could not be read ({type(exc).__name__})"
 
-def _has_path_separator(name: str) -> bool:
-    """Does this name carry a separator any filesystem here would act on?
-
-    ``/`` is checked outright rather than only through :data:`os.sep`, because
-    the repository-map keys are built with a literal ``/`` whatever platform
-    this runs on, and a backslash is checked because it is a separator on one
-    of them.
-    """
-    separators = {"/", "\\", os.sep}
-    if os.altsep:
-        separators.add(os.altsep)
-    return any(sep in name for sep in separators)
-
-
-def _repo_base() -> Path | None:
-    """The directory this deployment keeps its checkouts in, or ``None``.
-
-    ``None`` means the setting is unset and there is no default to fall back
-    on, which the caller turns into a refusal naming
-    :data:`FORGE_REPO_BASE_ENV`.
-    """
-    raw = os.environ.get(FORGE_REPO_BASE_ENV, "").strip() or DEFAULT_FORGE_REPO_BASE
-    return Path(raw).expanduser().resolve() if raw else None
-
-
-def _repo_map_namespaces(base: Path) -> tuple[str, ...]:
-    """The key spellings a repository under ``base`` is registered under.
-
-    :data:`REPO_MAP_NAMESPACES` plus the name of the checkout folder itself,
-    because that is the spelling builds are queued with — derived here rather
-    than written into the source, so no machine's folder name lives in the
-    code.
-    """
-    folder = base.name.strip()
-    if folder and folder not in REPO_MAP_NAMESPACES:
-        return REPO_MAP_NAMESPACES + (folder,)
-    return REPO_MAP_NAMESPACES
+    problems: list[str] = []
+    memory = read_declared_memory(
+        repo=key, commit=commit, content=content, found=found, unreadable_because=unreadable
+    )
+    if not memory.ok:
+        problems.append(str(memory.refusal))
+    test_command = _declared_test_command(checkout) if content is not None else None
+    if not test_command:
+        problems.append(
+            f"{key} declares no test command in {DECLARATION_PATH} at {commit}, so the "
+            "merge-ready check would have nothing to run. Add these lines, commit "
+            f"them to the default branch, and register again:\n{THE_TOOLCHAIN_LINES}"
+        )
+    problems += _document_problems(checkout, content)
+    if problems:
+        raise Refused("project", "\n".join(problems))
+    return [
+        Step("project", "ok", f"{url} at {commit}: memory {memory.project}, tests `{test_command}`"),
+    ]
 
 
 # ---------------------------------------------------------------------------
-# The deploy files (--deploy-port) — the Docker Sandbox this repository
-# deploys into, the wrapper that brings it up, the script that runs inside,
-# and the overlay that puts the candidate copy on its own port
+# Steps 2, 4 and 6 — the edits, computed and checked before anything is written
 # ---------------------------------------------------------------------------
 
 
-def compose_project_for(name: str) -> str:
-    """The compose project name for a repository, from its own name.
+def _address_names_filled(text: str) -> dict[str, str]:
+    """This process's environment, plus a stand-in for every ``${NAME}`` unset.
 
-    Lower case, with anything that is not a letter or a digit becoming a
-    hyphen, because that is what a compose project name and a sandbox name may
-    both contain. Returns an empty string when nothing usable is left.
+    The coordinator's settings name their addresses (``${FORGE_SANDBOX_...}``)
+    and the coordinator fills them from its own environment at start. Here only
+    the SHAPE is being checked, so an unset name gets an address that is plainly
+    a stand-in; nothing is ever sent to it.
     """
-    cleaned = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
-    return re.sub(r"-{2,}", "-", cleaned)
+    environ = dict(os.environ)
+    for name in re.findall(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", text):
+        if not str(environ.get(name, "")).strip():
+            environ[name] = "http://register-repo-shape-check.invalid"
+    return environ
 
 
-def sandbox_name_for(name: str) -> str:
-    """The sandbox name for a repository: its compose project plus ``-deploy``."""
-    project = compose_project_for(name)
-    return f"{project}-deploy" if project else ""
+def _loads_as_forge_settings(text: str) -> str | None:
+    """``None`` when ``text`` loads with the factory's own loader; else why not."""
+    from forge.config.loader import load_config
+
+    with tempfile.TemporaryDirectory(prefix="forge-register-") as folder:
+        path = Path(folder) / SETTINGS_FILE_NAME
+        path.write_text(text, encoding="utf-8")
+        try:
+            load_config(path, environ=_address_names_filled(text))
+        except Exception as exc:  # noqa: BLE001 — any refusal is the answer
+            first = str(exc).strip().splitlines()
+            return f"{type(exc).__name__}: {first[0] if first else 'no detail'}"
+    return None
 
 
-def _read_deploy_template(filename: str) -> str:
-    """Read one of the deploy files shipped beside this module."""
-    return (
-        importlib.resources.files(DEPLOY_TEMPLATE_PACKAGE)
-        .joinpath(filename)
-        .read_text(encoding="utf-8")
-    )
+def _mapping(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
 
 
-def service_ports_for(app_port: int) -> tuple[int, int]:
-    """The host ports for a repository's build runner and deploy sidecar.
+@dataclass
+class YamlEdit:
+    """What one settings file needs: the new text (``None`` = nothing) and why."""
 
-    Derived from the app port so every registered repository gets its own
-    pair: ``(runner, sidecar)`` = ``(app + 23, app + 24)``.
+    which: str
+    original: str
+    staged: str | None
+    steps: list[Step] = field(default_factory=list)
+    reference_entry: dict[str, str] = field(default_factory=dict)
+
+
+def plan_settings_edit(text: str, *, which: str, key: str, path: str) -> YamlEdit:
+    """The three entries ``key`` needs in one ``forge.yaml``, by line insertion.
+
+    ``path`` is the project's folder as that file's own world knows it. The
+    sandbox entry copies the reference project's name and addresses from the
+    same file, as written (an address may be a ``${NAME}``). Refuses — writing
+    nothing — when an entry already says something else, when the result would
+    not load, when it would change anything but the three entries, or when a
+    line of the original (a comment included) would be lost.
     """
-    return app_port + RUNNER_PORT_OFFSET, app_port + SIDECAR_PORT_OFFSET
-
-
-def default_receipts_path() -> Path:
-    """Where the factory writes its receipts on this box.
-
-    The same resolution the runner uses on the host: ``FORGE_RECEIPTS_DIR``
-    when set, else ``~/forge-state/receipts``.
-    """
-    from forge.receipts import DEFAULT_RECEIPTS_DIR, RECEIPTS_DIR_ENV
-
-    return Path(os.environ.get(RECEIPTS_DIR_ENV) or DEFAULT_RECEIPTS_DIR).expanduser()
-
-
-def render_deploy_files(
-    *,
-    name: str,
-    repo: Path,
-    app_port: int,
-    allow_extra: str | None = None,
-    forge_path: Path | None = None,
-    guardkit_path: Path | None = None,
-    receipts_path: Path | None = None,
-) -> dict[str, str]:
-    """Render the five deploy files for a repository, as {path: text}.
-
-    Args:
-        name: The repository's registered name.
-        repo: The checkout's absolute path — the profile's ``cwd``, and the
-            path the sandbox bind-mounts, so it reads the same inside and out.
-        app_port: The port the app is published on. The candidate copy is
-            published on the next port up; the factory's build runner and
-            deploy sidecar for this repository on the ports 23 and 24 up.
-        allow_extra: One more host the sandbox may reach, written ``host:port``
-            — the model door on this box for a repository whose app talks to a
-            model. None ⇒ only the Debian and Python rules.
-        forge_path: The forge checkout the sandbox mounts read-only, so the
-            factory's own code is installed from our tree. None ⇒ the folder
-            ``forge`` beside the checkout, which is where the estate keeps it.
-        guardkit_path: The guardkit checkout, likewise. None ⇒ ``guardkit``
-            beside the checkout.
-        receipts_path: The receipts root the sandbox mounts read-write. None ⇒
-            :func:`default_receipts_path`.
-    """
-    project = compose_project_for(name)
-    sandbox = sandbox_name_for(name)
-    candidate_port = app_port + 1
-    runner_port, sidecar_port = service_ports_for(app_port)
-    forge_checkout = forge_path if forge_path is not None else repo.parent / "forge"
-    guardkit_checkout = (
-        guardkit_path if guardkit_path is not None else repo.parent / "guardkit"
-    )
-    receipts_root = receipts_path if receipts_path is not None else default_receipts_path()
-    allow = list(DEFAULT_SANDBOX_ALLOW_NETWORK)
-    if allow_extra:
-        allow.append(allow_extra)
-    allow_yaml = ", ".join(f'"{host}"' for host in allow)
-
-    profile = f"""\
-# How the factory deploys {name}.
-#
-# Every merge deploys this repository into its own Docker Sandbox — a small
-# virtual machine with its own kernel and its own Docker engine. The sandbox
-# bind-mounts this checkout at the path below, so the path is the same inside
-# it and out, and publishes the app port and the candidate port back to the
-# host, so the health checks and the live gate keep running from the host.
-#
-# Written by `forge register-repo --deploy-port {app_port}`. Edit it freely; the
-# command never rewrites a profile that is already here.
-format_version: "1.0"
-env_id: local
-compose:
-  file: docker-compose.yml
-  # The only script the deploy step runs. It makes sure the sandbox below is
-  # up and awake, then runs deploy/deploy.sh inside it and returns that
-  # script's exit code unchanged.
-  script: deploy/sandbox-deploy.sh
-# HOW THIS REPOSITORY WANTS THE IDENTITY OF WHAT WAS CHECKED HANDED OVER.
-# These are names, and they are this repository's to change; the factory
-# carries them as text and knows nothing about what they mean here. They are
-# written in because a project that declares nothing is not deployed blind —
-# it is not deployed. The names below are the factory's own defaults, and the
-# deploy/deploy.sh beside this file already reads and prints exactly them.
-#   setting          -- the setting the identity of what was checked is handed
-#                       to the deploy step in. The candidate check names its own
-#                       throwaway copy after it, and the teardown is handed the
-#                       same one, so one build's cleanup can never take another
-#                       build's candidate — or its database — down with it.
-#   reported_as      -- the marker the deploy step prints one
-#                       "<marker>=<identity>" line with, to say what is running
-#   checked_as       -- the marker the CHECK prints the artifact it checked under
-#   artifact_setting -- the setting that artifact is handed BACK to the promote in
-identity:
-  setting: {DEFAULT_SETTING_NAME}
-  reported_as: {DEFAULT_REPORT_MARKER}
-  checked_as: {DEFAULT_CHECKED_MARKER}
-  artifact_setting: {DEFAULT_ARTIFACT_SETTING}
-hosts:
-  - host: localhost
-    role: app
-secret_injection: []
-models_required: []
-# Add a health check when this repository has one — a script path, never a
-# command line, because the script's exit code is the verdict:
-# health_checks:
-#   - cmd: "deploy/healthcheck.sh"
-# The image kept so a failed deploy can be put back. deploy/deploy.sh keeps it.
-rollback_image_ref: "{project}-app:rollback-pre-deploy"
-# This checkout's absolute path. The deploy step resolves the script above
-# relative to it, and the sandbox mounts this same path inside itself.
-cwd: "{repo}"
-# The candidate copy: the build stands up on the port below first and is
-# checked there, and only a pass takes the live port. `keep: false` tears the
-# candidate down again afterwards.
-candidate:
-  env:
-    CANDIDATE_PORT: "{candidate_port}"
-  keep: false
-# This repository's Docker Sandbox.
-sandbox:
-  name: {sandbox}
-  memory: {DEFAULT_SANDBOX_MEMORY}
-  cpus: {DEFAULT_SANDBOX_CPUS}
-  publish: ["127.0.0.1:{app_port}:{app_port}", "127.0.0.1:{candidate_port}:{candidate_port}"]
-  allow_network: [{allow_yaml}]
-  # The sandbox also carries the factory's own two services for this
-  # repository — the deploy sidecar and the build runner — on the factory's
-  # own clone of it, so nothing the factory runs on this repository runs on
-  # the host. forge-prod reaches them on these two loopback ports. Remove
-  # these two lines and the sandbox is a plain deployment sandbox again.
-  sidecar_publish: "127.0.0.1:{sidecar_port}:{SIDECAR_PORT_INSIDE}"
-  runner_publish: "127.0.0.1:{runner_port}:{RUNNER_PORT_INSIDE}"
-  # Where the factory's own code is mounted from, read-only: the two
-  # checkouts, and the folders beside forge that forge's own code needs
-  # (nats-core, fleet-memory, guardkitfactory) come with them.
-  forge_path: "{forge_checkout}"
-  guardkit_path: "{guardkit_checkout}"
-  # Where the receipts are written, mounted read-write.
-  receipts_path: "{receipts_root}"
-  # The sandbox's own environment — the router's address and key, the bus,
-  # the build settings — rendered by sops into a file at deploy time and
-  # never read from anyone's shell. Name the file here once it exists; the
-  # sandbox is created with it, so a changed file means recreating the
-  # sandbox, attended.
-  # env_file: "/run/user/1000/forge-sandbox/{sandbox}.env"
-"""
-
-    replacements = {
-        "@@NAME@@": name,
-        "@@PROJECT@@": project,
-        "@@SANDBOX@@": sandbox,
-        "@@APP_PORT@@": str(app_port),
-        "@@CANDIDATE_PORT@@": str(candidate_port),
-    }
-    rendered: dict[str, str] = {"deploy/profile.yaml": profile}
-    # The wrapper is copied exactly as it is shipped. It is the same file
-    # api_test deploys with, byte for byte: every value it needs — the sandbox
-    # name, its memory, its processors, its ports and the hosts it may reach —
-    # arrives in its environment from the profile above, so there is nothing in
-    # it to fill in for this repository.
-    rendered["deploy/sandbox-deploy.sh"] = _read_deploy_template("sandbox-deploy.sh")
-    # So is the bootstrap that runs inside the sandbox and brings up the
-    # factory's two services there: it reads everything from the sandbox's
-    # own environment.
-    rendered["deploy/sandbox-runner.sh"] = _read_deploy_template("sandbox-runner.sh")
-    # These two do carry this repository's own names and ports.
-    for path, template in (
-        ("deploy/deploy.sh", "deploy.sh"),
-        ("deploy/docker-compose.candidate.yml", "docker-compose.candidate.yml"),
+    try:
+        data = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        raise Refused(which, f"its forge.yaml is not readable YAML ({exc.__class__.__name__})") from None
+    if not isinstance(data, dict):
+        raise Refused(which, "its forge.yaml is not a set of settings")
+    planning = _mapping(data.get("planning"))
+    sandboxes = _mapping(planning.get("sandboxes"))
+    reference = sandboxes.get(REFERENCE_PROJECT)
+    wanted_keys = ("name", "sidecar_url", "runner_url")
+    if not isinstance(reference, dict) or not all(
+        isinstance(reference.get(k), str) and reference.get(k) for k in wanted_keys
     ):
-        text = _read_deploy_template(template)
-        for token, value in replacements.items():
-            text = text.replace(token, value)
-        rendered[path] = text
-    return rendered
+        raise Refused(
+            which,
+            f"its forge.yaml has no complete planning.sandboxes entry for "
+            f"{REFERENCE_PROJECT} to copy the sandbox name and addresses from",
+        )
+    entry = {k: str(reference[k]) for k in wanted_keys}
+    filesystem = _mapping(_mapping(data.get("permissions")).get("filesystem"))
+    allowlist = [str(item) for item in (filesystem.get("allowlist") or [])]
+    repo_paths = _mapping(planning.get("target_repo_paths"))
+
+    lines = text.split("\n")
+    expected = copy.deepcopy(data)
+    steps: list[Step] = []
+    changed = False
+    try:
+        if path in allowlist:
+            steps.append(Step(which, "unchanged", f"allowlist has {path}"))
+        else:
+            append_sequence_item(lines, ("permissions", "filesystem", "allowlist"), _scalar(path))
+            expected.setdefault("permissions", {}).setdefault("filesystem", {})
+            target = expected["permissions"]["filesystem"]
+            target["allowlist"] = [*(target.get("allowlist") or []), path]
+            steps.append(Step(which, "add", f"allowlist {path}"))
+            changed = True
+
+        current = repo_paths.get(key)
+        if current == path:
+            steps.append(Step(which, "unchanged", f"target_repo_paths has {key} -> {path}"))
+        elif current is not None:
+            raise Refused(
+                which,
+                f"planning.target_repo_paths already has {key} -> {current}, not {path}; "
+                "fix that line by hand or pick another name",
+            )
+        else:
+            set_mapping_entry(lines, ("planning", "target_repo_paths"), _scalar(key), _scalar(path))
+            expected.setdefault("planning", {})
+            expected["planning"]["target_repo_paths"] = {
+                **(expected["planning"].get("target_repo_paths") or {}),
+                key: path,
+            }
+            steps.append(Step(which, "add", f"target_repo_paths {key} -> {path}"))
+            changed = True
+
+        current_entry = sandboxes.get(key)
+        if current_entry == entry:
+            steps.append(Step(which, "unchanged", f"sandboxes has {key} in {entry['name']}"))
+        elif current_entry is not None:
+            raise Refused(
+                which,
+                f"planning.sandboxes already has an entry for {key} that differs from "
+                f"{REFERENCE_PROJECT}'s; fix it by hand",
+            )
+        else:
+            _ensure_block(lines, ("planning", "sandboxes", _scalar(key)))
+            for name in wanted_keys:
+                set_mapping_entry(
+                    lines, ("planning", "sandboxes", _scalar(key)), name, _scalar(entry[name])
+                )
+            expected["planning"]["sandboxes"][key] = dict(entry)
+            steps.append(Step(which, "add", f"sandboxes {key} in sandbox {entry['name']}"))
+            changed = True
+    except YamlEditRefused as exc:
+        raise Refused(which, str(exc)) from None
+
+    if not changed:
+        return YamlEdit(which, text, None, steps, entry)
+    staged = "\n".join(lines)
+    try:
+        reread = yaml.safe_load(staged)
+    except yaml.YAMLError as exc:
+        raise Refused(which, f"the edited forge.yaml would not parse ({exc.__class__.__name__})") from None
+    if reread != expected:
+        raise Refused(
+            which,
+            "the edited forge.yaml would change more than the three entries; "
+            "nothing was written — edit it by hand",
+        )
+    if not _keeps_every_line(text.split("\n"), lines):
+        raise Refused(which, "the edit would lose a line of the file; nothing was written")
+    why_not = _loads_as_forge_settings(staged)
+    if why_not is not None:
+        raise Refused(which, f"the edited forge.yaml would not load ({why_not}); nothing was written")
+    return YamlEdit(which, text, staged, steps, entry)
+
+
+@dataclass
+class JsonEdit:
+    """The publisher route: the new text (``None`` = nothing) and why."""
+
+    original: str
+    staged: str | None
+    steps: list[Step] = field(default_factory=list)
+
+
+def plan_publisher_edit(text: str, *, key: str, source: str, remote: str) -> JsonEdit:
+    """Add the one route ``projects[key] = {source, remote}``, and nothing else."""
+    from forge.publisher.settings import load_settings
+
+    try:
+        data = json.loads(text)
+    except ValueError:
+        raise Refused("publisher", "the publisher's settings file is not readable JSON") from None
+    if not isinstance(data, dict):
+        raise Refused("publisher", "the publisher's settings file must hold one object")
+    projects = data.get("projects")
+    if projects is not None and not isinstance(projects, dict):
+        raise Refused("publisher", "'projects' in the publisher's settings is not an object")
+    route = {"source": source, "remote": remote}
+    current = (projects or {}).get(key)
+    if current == route:
+        return JsonEdit(text, None, [Step("publisher", "unchanged", f"route {key} is there")])
+    if current is not None:
+        raise Refused(
+            "publisher",
+            f"the publisher already has a different route for {key}; fix it by hand",
+        )
+    data["projects"] = {**(projects or {}), key: route}
+    staged = json.dumps(data, indent=2) + "\n"
+    with tempfile.TemporaryDirectory(prefix="forge-register-") as folder:
+        probe = Path(folder) / "settings.json"
+        probe.write_text(staged, encoding="utf-8")
+        try:
+            load_settings(probe)
+        except Exception as exc:  # noqa: BLE001 — the loader's own sentence
+            raise Refused("publisher", f"the edited publisher settings would not load: {exc}") from None
+    return JsonEdit(text, staged, [Step("publisher", "add", f"route {key}: {source} -> {remote}")])
+
+
+def _backup_name(live: str, leaf: str, *, today: date | None = None) -> str:
+    stamp = (today or date.today()).strftime("%Y%m%d")
+    return f"{live}.bak-{stamp}-pre-register-{leaf}"
+
+
+def _pending_name(live: str, leaf: str) -> str:
+    return f"{live}.{leaf}-pending"
+
+
+def _existing_backup(store: Any, live: str, leaf: str, original: str, folder: str | None) -> str | None:
+    """The newest backup of ``live`` for this project that holds ``original``."""
+    base = PurePosixPath(live).name
+    pattern = re.compile(rf"^{re.escape(base)}\.bak-(\d{{8}})-pre-register-{re.escape(leaf)}$")
+    listed = store.names() if folder is None else store.names(folder)
+    for name in sorted((n for n in listed if pattern.match(n)), reverse=True):
+        full = name if folder is None else f"{folder.rstrip('/')}/{name}"
+        if store.read(full) == original:
+            return full
+    return None
+
+
+@dataclass
+class Staged:
+    """Where a staged copy and its backup are, once written or found."""
+
+    live: str
+    pending: str
+    backup: str | None
+
+
+def stage(
+    store: Any,
+    *,
+    which: str,
+    live: str,
+    folder: str | None,
+    leaf: str,
+    original: str,
+    staged: str,
+    dry_run: bool,
+    like: str | None = None,
+) -> tuple[Step, Staged | None]:
+    """Write ``staged`` beside ``live`` as the pending copy, with a dated backup.
+
+    Writes nothing when the same pending copy is already there (the backup it
+    was made with is found and named), and nothing at all in a dry run.
+    """
+    pending = _pending_name(live, leaf)
+    if store.read(pending) == staged:
+        backup = _existing_backup(store, live, leaf, original, folder)
+        detail = f"already staged as {store.where(pending)}"
+        if backup is not None:
+            detail += f" (backup {PurePosixPath(backup).name})"
+        return Step(which, "unchanged", detail), Staged(live, pending, backup)
+    if dry_run:
+        return Step(which, "would stage", store.where(pending)), None
+    backup = _backup_name(live, leaf)
+    if isinstance(store, HostStore):
+        store.write(backup, original, like=like)
+        store.write(pending, staged, like=like)
+    else:
+        store.write(backup, original)
+        store.write(pending, staged)
+    return (
+        Step(which, "staged", f"{store.where(pending)} (backup {PurePosixPath(backup).name})"),
+        Staged(live, pending, backup),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Step 3 — the factory's clone in the shared sandbox
+# ---------------------------------------------------------------------------
+
+
+def _same_repository(a: str, b: str) -> bool:
+    """Two remote addresses for one repository (``.git`` and ``/`` aside)."""
+
+    def norm(value: str) -> str:
+        value = value.strip().rstrip("/")
+        return value[:-4] if value.endswith(".git") else value
+
+    return norm(a) == norm(b)
+
+
+def check_sandbox_clone(sandbox: SandboxStore, *, clone: str, leaf: str, url: str) -> tuple[Step, bool]:
+    """Every read step 3 needs, before anything is written.
+
+    Returns the report line and whether a clone must be made.
+    """
+    folder = f"{PROJECTS_FOLDER}/{leaf}"
+    ignored = sandbox.exec("git", "-C", clone, "check-ignore", "-q", folder)
+    if ignored.returncode == 1:
+        raise Refused(
+            "clone",
+            f"{PROJECTS_FOLDER} is not git-ignored in the api_test clone ({clone}), so a "
+            "project cloned there would show up as api_test's own change; add it to "
+            "api_test's .gitignore first",
+        )
+    if ignored.returncode != 0:
+        raise Refused("clone", f"could not ask git whether {PROJECTS_FOLDER} is ignored in {clone} ({_said(ignored)})")
+
+    readable = sandbox.exec(
+        "git", "ls-remote", url, "HEAD", env=("GIT_TERMINAL_PROMPT=0",), timeout=CLONE_TIMEOUT
+    )
+    if readable.returncode != 0 or not readable.stdout.strip():
+        raise Refused(
+            "clone",
+            f"the sandbox cannot read {url}. The sandbox holds no GitHub credential, so it "
+            "can only read public repositories; a private one needs a read-only credential "
+            "handed to the sandbox, which is an owner decision. Nothing was written",
+        )
+
+    target = f"{clone.rstrip('/')}/{folder}"
+    exists = sandbox.exec("test", "-e", target)
+    if exists.returncode == 1:
+        return Step("clone", "add", f"git clone {url} {target}"), True
+    if exists.returncode != 0:
+        raise Refused("clone", f"could not look at {target} in the sandbox ({_said(exists)})")
+    origin = sandbox.exec("git", "-C", target, "remote", "get-url", "origin")
+    if origin.returncode != 0:
+        raise Refused("clone", f"{target} is already there and is not a clone with an origin; move it away first")
+    if not _same_repository(origin.stdout, url):
+        raise Refused(
+            "clone",
+            f"{target} is already there, cloned from {origin.stdout.strip()}, not {url}; "
+            "it is left alone — move it away or pick another name",
+        )
+    return Step("clone", "unchanged", f"{target} is already a clone of {url}"), False
+
+
+def make_sandbox_clone(sandbox: SandboxStore, *, clone: str, leaf: str, url: str) -> Step:
+    """``git clone <url> <projects folder>/<leaf>`` as the sandbox user."""
+    target = f"{clone.rstrip('/')}/{PROJECTS_FOLDER}/{leaf}"
+    made = sandbox.exec(
+        "git", "clone", "--quiet", url, target, env=("GIT_TERMINAL_PROMPT=0",), timeout=CLONE_TIMEOUT
+    )
+    if made.returncode != 0:
+        raise Refused("clone", f"git clone {url} in the sandbox failed ({_said(made)})")
+    origin = sandbox.exec("git", "-C", target, "remote", "get-url", "origin")
+    if origin.returncode != 0 or not _same_repository(origin.stdout, url):
+        raise Refused("clone", f"{target} was cloned but does not name {url} as its origin")
+    return Step("clone", "done", f"{target} cloned from {url}")
+
+
+# ---------------------------------------------------------------------------
+# Activation step (b) — is the factory drained?
+# ---------------------------------------------------------------------------
+
+
+#: What runs INSIDE the coordinator (``docker exec <coordinator> python -c``):
+#: the coordinator holds the ledger and the bus connection, so it is asked.
+#: Plain Python on purpose — the coordinator's image may be older than this
+#: checkout, so nothing of this module may be imported there. It reads only:
+#: the ledger opened read-only, and ``consumer_info`` on the two durable
+#: consumers (the same read the coordinator's own consumer-health check makes).
+#: The bus address carries a credential, so it is scrubbed out of anything said.
+DRAINED_READ_SCRIPT: str = r'''
+import asyncio, json, os, sqlite3, sys
+from urllib.parse import urlsplit
+spec = json.loads(sys.argv[1])
+url = os.environ.get("FORGE_NATS_URL", "")
+secrets = [s for s in (url, urlsplit(url).password if url else None) if s]
+def said(exc):
+    text = f"{type(exc).__name__}: {exc}".splitlines()[0][:300]
+    for s in secrets:
+        text = text.replace(s, "***")
+    return text
+out = {}
+db = os.environ.get("FORGE_DB_PATH") or spec["db"]
+try:
+    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=10)
+    try:
+        def counts(sql, done):
+            marks = ",".join("?" for _ in done)
+            return {str(k): int(v) for k, v in con.execute(sql % marks, list(done)).fetchall()}
+        builds = counts("SELECT status, COUNT(*) FROM builds WHERE status NOT IN (%s) GROUP BY status", spec["build_terminal"])
+        plans = counts("SELECT state, COUNT(*) FROM planning_runs WHERE state NOT IN (%s) GROUP BY state", spec["planning_terminal"])
+        queued = int(con.execute("SELECT COUNT(*) FROM work_queue WHERE status = 'QUEUED'").fetchone()[0])
+    finally:
+        con.close()
+    out["ledger"] = {"builds": builds, "planning_runs": plans, "queue_waiting": queued}
+except Exception as exc:
+    out["ledger"] = {"error": said(exc)}
+# nats-py retries a first connection for ever, printing each failure, unless
+# told to stop after one attempt and given a quiet error callback.
+async def quiet(exc):
+    pass
+async def read_consumers():
+    import nats
+    nc = await nats.connect(
+        url, connect_timeout=5, allow_reconnect=False, max_reconnect_attempts=1,
+        reconnect_time_wait=0.5, error_cb=quiet,
+    )
+    try:
+        js = nc.jetstream()
+        got = {}
+        for name in spec["consumers"]:
+            try:
+                info = await js.consumer_info(spec["stream"], name)
+                got[name] = {"pending": int(info.num_pending), "ack_pending": int(info.num_ack_pending)}
+            except Exception as exc:
+                got[name] = {"error": said(exc)}
+        return got
+    finally:
+        await nc.close()
+try:
+    if not url:
+        raise RuntimeError("the coordinator has no FORGE_NATS_URL")
+    out["consumers"] = asyncio.run(asyncio.wait_for(read_consumers(), 30))
+except BaseException as exc:
+    out["consumers"] = {name: {"error": said(exc)} for name in spec["consumers"]}
+print(json.dumps(out))
+'''
+
+
+def drained_read_spec() -> dict[str, Any]:
+    """The states, stream and consumer names the read uses — Forge's own."""
+    from forge.adapters.nats.planning_consumer import PLANNING_DURABLE_NAME
+    from forge.cli._serve_config import DEFAULT_DURABLE_NAME
+    from forge.planning.work_queue_loop import BUILD_TERMINAL_STATES, PLANNING_TERMINAL_STATES
+
+    return {
+        "db": COORDINATOR_LEDGER,
+        "build_terminal": sorted(BUILD_TERMINAL_STATES),
+        "planning_terminal": sorted(PLANNING_TERMINAL_STATES),
+        "stream": BUS_STREAM,
+        "consumers": [PLANNING_DURABLE_NAME, DEFAULT_DURABLE_NAME],
+    }
+
+
+def read_drained_facts(run: Runner, container: str) -> dict[str, Any]:
+    """Ask the coordinator. Anything that cannot be read is said, not assumed."""
+    spec = drained_read_spec()
+    result = _call(
+        run,
+        ["docker", "exec", container, "python", "-c", DRAINED_READ_SCRIPT, json.dumps(spec)],
+        timeout=90,
+    )
+    if result.returncode != 0:
+        return {"error": f"the coordinator ({container}) could not be asked ({_said(result)})"}
+    lines = [line for line in (result.stdout or "").strip().splitlines() if line.strip()]
+    try:
+        facts = json.loads(lines[-1]) if lines else None
+    except ValueError:
+        facts = None
+    if not isinstance(facts, dict):
+        return {"error": f"the coordinator ({container}) answered something that is not the read's report"}
+    return facts
+
+
+def _by_state(counts: Mapping[str, Any]) -> str:
+    return ", ".join(f"{state} {count}" for state, count in sorted(counts.items()))
+
+
+def judge_drained(facts: Mapping[str, Any], consumers: Sequence[str]) -> list[str]:
+    """Why the factory is NOT drained; an empty list means drained.
+
+    Drained means all of: no build and no planning run in a state that is not
+    finished; no item waiting in the work queue; and each durable consumer
+    feeding the coordinator reads zero pending and zero awaiting
+    acknowledgement. Anything that could not be read is a reason too.
+    """
+    if facts.get("error"):
+        return [str(facts["error"])]
+    reasons: list[str] = []
+    ledger = facts.get("ledger")
+    if not isinstance(ledger, dict) or ledger.get("error"):
+        why = ledger.get("error") if isinstance(ledger, dict) else "no answer"
+        reasons.append(f"the ledger could not be read ({why})")
+    else:
+        for label, key in (("build", "builds"), ("planning run", "planning_runs")):
+            counts = ledger.get(key)
+            if not isinstance(counts, dict) or not all(
+                isinstance(v, int) and not isinstance(v, bool) for v in counts.values()
+            ):
+                reasons.append(f"the ledger's {label}s could not be counted")
+                continue
+            total = sum(counts.values())
+            if total:
+                reasons.append(f"{total} {label}{'s are' if total != 1 else ' is'} not finished ({_by_state(counts)})")
+        waiting = ledger.get("queue_waiting")
+        if not isinstance(waiting, int) or isinstance(waiting, bool):
+            reasons.append("the work queue could not be counted")
+        elif waiting:
+            reasons.append(
+                f"{waiting} item{'s wait' if waiting != 1 else ' waits'} in the work queue, "
+                "which the coordinator's automatic queue would admit within seconds"
+            )
+    read = facts.get("consumers")
+    read = read if isinstance(read, dict) else {}
+    for name in consumers:
+        row = read.get(name)
+        if not isinstance(row, dict) or row.get("error"):
+            why = row.get("error") if isinstance(row, dict) else "no answer"
+            reasons.append(f"the bus consumer {name} could not be read ({why})")
+            continue
+        pending, unacked = row.get("pending"), row.get("ack_pending")
+        if not all(isinstance(v, int) and not isinstance(v, bool) for v in (pending, unacked)):
+            reasons.append(f"the bus consumer {name} gave no counts")
+        elif pending or unacked:
+            reasons.append(
+                f"the bus consumer {name} has {pending} pending and {unacked} awaiting "
+                "acknowledgement (a request on its way in)"
+            )
+    return reasons
+
+
+# ---------------------------------------------------------------------------
+# Step 7 — what makes it live, printed, never run
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Estate:
+    """The names the printed sequence uses, concrete wherever they are known."""
+
+    env_file: str
+    #: The estate's secrets.env, loaded into compose's environment and never printed.
+    loaded_env_file: str
+    estate_check: str
+    sandbox: str
+    volume: str
+    coordinator: str
+
+
+def activation_sequence(
+    *,
+    key: str,
+    estate: Estate,
+    coordinator: Staged | None,
+    sandbox_file: Staged | None,
+    publisher: Staged | None,
+    helper_urls: tuple[str, str] | None,
+    dry_run: bool,
+) -> list[str]:
+    """The one-page procedure's own order, for this registration (step 7 a–h)."""
+    if coordinator is None and sandbox_file is None and publisher is None:
+        if dry_run:
+            return ["Activation: nothing would be staged, so there would be nothing to activate."]
+        return [f"Activation: nothing is staged — {key} is already in the live settings."]
+    intake = " ".join(INTAKE_SERVICES)
+
+    def q(value: str) -> str:
+        # A name still to be filled in ("$ESTATE_ENV") stays expandable.
+        return f'"{value}"' if value.startswith("$") else shlex.quote(value)
+
+    dc = (
+        f'dc() {{ ( set -a; . {q(estate.loaded_env_file)}; set +a; docker compose -p '
+        f'{COMPOSE_PROJECT} --env-file {q(estate.env_file)} "$@" ); }}'
+    )
+    lines = [
+        ("What would make it live" if dry_run else "What makes it live")
+        + " — the one-page stop/start procedure, run by the delivery owner with Rich's word."
+        " This command restarted nothing.",
+        "  The compose form, with the existing secrets loaded and nothing printed:",
+        f"    {dc}",
+    ]
+    if any(v.startswith("$") for v in (estate.env_file, estate.loaded_env_file, estate.estate_check)):
+        lines.append(
+            "  Set these first (or pass --estate-env-file to have them filled in): ESTATE_ENV = the"
+            " estate env file the factory runs on now; RUN = the folder holding its secrets.env;"
+            " FORGE = the Forge checkout its compose files come from."
+        )
+    lines += [
+        "(a) Close intake first, so no sentence, queue command or hand-over can arrive"
+        " (sessions that publish on the bus directly are asked to hold):",
+        f"    dc stop {intake}",
+        "(b) Confirm the factory is drained (reads only):",
+        f"    forge register-repo --check-drained --coordinator-container {q(estate.coordinator)}",
+        "    It must print DRAINED: no build or planning run unfinished, nothing waiting in the work"
+        " queue, and zero pending and zero unacknowledged on both bus consumers. Anything else — or"
+        " anything it could not read — stops here: reopen intake and activate later:",
+        f"    dc up -d {intake}",
+        "(c) Stop the coordinator and the rest, intake still closed:",
+        "    dc stop",
+        f"    Check: docker ps --filter label=com.docker.compose.project={COMPOSE_PROJECT} -q"
+        " prints nothing, and",
+        f"    sbx exec {q(estate.sandbox)} docker ps --format '{{{{.Names}}}}' lists neither"
+        f" {estate.sandbox}-helper nor {estate.sandbox}-runner.",
+        "(d) Put the staged settings in place. Each line first checks the live file is still the"
+        " one the staged copy was made from; if a check fails, stop, start again as in (g) without"
+        " swapping, and run register-repo again:",
+    ]
+    if coordinator is not None:
+        volume = q(estate.volume)
+        backup = coordinator.backup or "<its backup>"
+        lines.append(
+            f"    docker run --rm -v {volume}:/s:ro {VOLUME_HELPER_IMAGE} cmp /s/{coordinator.live}"
+            f" {q('/s/' + backup)} && docker run --rm --user {SANDBOX_USER}:{SANDBOX_USER} -v {volume}:/s"
+            f" {VOLUME_HELPER_IMAGE} cp /s/{coordinator.pending} /s/{coordinator.live}"
+        )
+    if sandbox_file is not None:
+        backup = sandbox_file.backup or "<its backup>"
+        lines.append(
+            f"    sbx exec -u {SANDBOX_USER} {q(estate.sandbox)} sh -c 'cmp \"$1\" \"$2\" && cp \"$3\" \"$1\"'"
+            f" swap {q(sandbox_file.live)} {q(backup)} {q(sandbox_file.pending)}"
+        )
+    if publisher is not None:
+        backup = publisher.backup or "<its backup>"
+        lines.append(
+            f"    cmp {q(publisher.live)} {q(backup)} && cp {q(publisher.pending)} {q(publisher.live)}"
+        )
+    lines += [
+        "(e) Restart the sandbox supervisor and confirm the helper and runner are ready:",
+        f"    dc up -d {SANDBOX_SUPERVISOR_SERVICE}",
+        f"    sbx exec {q(estate.sandbox)} docker ps --format '{{{{.Names}}}} {{{{.Status}}}}'"
+        f"  (both {estate.sandbox}-helper and {estate.sandbox}-runner Up)",
+    ]
+    if helper_urls is not None:
+        sidecar, runner = helper_urls
+        lines.append(
+            f"    curl -sf {q(sidecar.rstrip('/') + '/healthz')} && curl -sf {q(runner.rstrip('/') + '/ok')}"
+        )
+    if publisher is not None:
+        lines += [
+            "(f) The publisher's routes changed: start it first and confirm it lists the new route:",
+            f"    dc up -d --wait {PUBLISHER_SERVICE}",
+            f"    docker logs {COMPOSE_PROJECT}-{PUBLISHER_SERVICE}-1 2>&1 | grep 'publisher: settings'"
+            f" | grep -F {q(key)}",
+        ]
+    else:
+        lines.append("(f) The publisher's routes did not change; it starts with the rest.")
+    lines.append(
+        "(g) Start the rest in the procedure's order — the publisher before the coordinator,"
+        " the Slack-facing services last:"
+    )
+    if publisher is None:
+        lines.append(f"    dc up -d --wait {PUBLISHER_SERVICE}")
+    pattern = "|".join(INTAKE_SERVICES)
+    lines += [
+        f"    dc up -d $(dc config --services | grep -vxE '{pattern}')",
+        f"    dc up -d {intake}",
+        "(h) Check the services, and that the coordinator lists the new project's sandbox:",
+        f"    DOCKER_HOST=unix:///var/run/docker.sock {q(estate.estate_check)} --env-file"
+        f" {q(estate.env_file)} --project {COMPOSE_PROJECT} services",
+        f"    docker logs {q(estate.coordinator)} 2>&1 | grep -F"
+        f" {q(f'autobuild dispatch: {key} has a sandbox')}",
+    ]
+    return lines
 
 
 # ---------------------------------------------------------------------------
@@ -1099,637 +1470,354 @@ sandbox:
 # ---------------------------------------------------------------------------
 
 
-@click.command(name="register-repo")
-@click.argument("repo_path", type=click.Path(path_type=Path))
-@click.option(
-    "--name",
-    "name_opt",
-    default=None,
-    help="Name the repository is registered under. Defaults to the folder name.",
-)
-@click.option(
-    "--template",
-    "template",
-    default="default",
-    show_default=True,
-    help="Template passed to `guardkit init` when the repository has no guardkit.",
-)
-@click.option(
-    "--toolchain-test",
-    "toolchain_test",
-    default=None,
-    help=(
-        "The test command the merge-ready gate runs. Required when the "
-        "repository does not already declare one."
-    ),
-)
-@click.option(
-    "--deploy-port",
-    "deploy_port",
-    type=int,
-    default=None,
-    help=(
-        "Write the repository's deploy files, publishing the app on this port, "
-        "its candidate copy on the next one up, and the factory's build runner "
-        "and deploy sidecar for it on the ports 23 and 24 up. Without this "
-        "nothing about deploys is written."
-    ),
-)
-@click.option(
-    "--deploy-allow",
-    "deploy_allow",
-    default=None,
-    help=(
-        "One more host the deployment sandbox may reach, written host:port — "
-        "the model door on this box for a repository whose app talks to a "
-        "model. Needs --deploy-port."
-    ),
-)
-@click.option(
-    "--dry-run",
-    "dry_run",
-    is_flag=True,
-    default=False,
-    help="Say what would change and change nothing.",
-)
-@click.option(
-    "--json",
-    "as_json",
-    is_flag=True,
-    default=False,
-    help="Emit the same report as a JSON list of {step, status, detail}.",
-)
-@click.pass_obj
-def register_repo_cmd(
-    config: Any,
-    repo_path: Path,
-    name_opt: str | None,
-    template: str,
-    toolchain_test: str | None,
-    deploy_port: int | None,
-    deploy_allow: str | None,
+@dataclass
+class Options:
+    """Every option, resolved: the estate's facts this run uses."""
+
+    key: str
+    org: str
+    leaf: str
+    url: str
+    publish: bool
+    dry_run: bool
+    sandbox: str
+    volume: str
+    coordinator: str
+    sandbox_settings: str
+    sandbox_clone: str
+    publisher_settings: str | None
+    publish_source_base: str
+    estate: Estate
+
+
+def _parse_name(name: str) -> tuple[str, str]:
+    if not _NAME_PATTERN.match(name) or ".." in name:
+        raise Refused(
+            "name",
+            f"{name!r} is not a project name of the form org/name (letters, digits, "
+            "dot, underscore and hyphen; the last part becomes a folder name)",
+        )
+    org, leaf = name.split("/")
+    return org, leaf
+
+
+def _check_url(url: str, leaf: str) -> str:
+    url = url.strip()
+    if not url.startswith("https://"):
+        raise Refused("github", f"--github must be the repository's https:// address, not {url!r}")
+    last = url.rstrip("/").rsplit("/", 1)[-1]
+    last = last[:-4] if last.endswith(".git") else last
+    if last != leaf:
+        raise Refused("github", f"--github names the repository {last!r}, but the project name ends in {leaf!r}")
+    return url
+
+
+def resolve_options(
+    *,
+    name: str,
+    github: str | None,
+    publish: bool,
     dry_run: bool,
+    estate_env_file: Path | None,
+    loaded_env_file: Path | None,
+    sandbox_env_file: Path | None,
+    sandbox_settings: str | None,
+    sandbox_clone: str | None,
+    publisher_settings: Path | None,
+    publish_source_base: str,
+    sandbox: str,
+    volume: str,
+    coordinator: str,
+) -> Options:
+    """The command's options with every default worked out, or a refusal."""
+    org, leaf = _parse_name(name)
+    if not github:
+        raise Refused("github", "--github <https address of the repository> is needed")
+    url = _check_url(github, leaf)
+
+    estate_values: dict[str, str] = {}
+    if estate_env_file is not None:
+        try:
+            estate_values = read_env_file(estate_env_file)
+        except OSError as exc:
+            raise Refused("estate", f"could not read the estate env file {estate_env_file} ({exc.strerror})") from None
+
+    if sandbox_env_file is None and estate_values.get(ESTATE_ENV_SANDBOX_FILE) and estate_env_file:
+        sandbox_env_file = _resolve_beside(estate_values[ESTATE_ENV_SANDBOX_FILE], estate_env_file)
+    if sandbox_settings is None and sandbox_env_file is not None:
+        try:
+            sandbox_values = read_env_file(sandbox_env_file)
+        except OSError as exc:
+            raise Refused("sandbox", f"could not read the sandbox env file {sandbox_env_file} ({exc.strerror})") from None
+        sandbox_settings = sandbox_values.get(SANDBOX_ENV_CONFIG_PATH) or None
+    if not sandbox_settings:
+        raise Refused(
+            "sandbox",
+            "which file is the sandbox's own forge.yaml? Pass --sandbox-settings, or "
+            f"--sandbox-env-file (its {SANDBOX_ENV_CONFIG_PATH} names it), or --estate-env-file "
+            f"(its {ESTATE_ENV_SANDBOX_FILE} names that)",
+        )
+    if not sandbox_settings.startswith("/"):
+        raise Refused("sandbox", f"the sandbox's settings path {sandbox_settings!r} is not a full path")
+    if sandbox_clone is None:
+        suffix = "/" + SANDBOX_SETTINGS_IN_CLONE
+        if not sandbox_settings.endswith(suffix):
+            raise Refused(
+                "sandbox",
+                f"the sandbox's settings file is not at <api_test clone>{suffix}, so the clone "
+                "cannot be worked out from it; pass --sandbox-clone",
+            )
+        sandbox_clone = sandbox_settings[: -len(suffix)]
+    if not sandbox_clone.startswith("/"):
+        raise Refused("sandbox", f"the api_test clone path {sandbox_clone!r} is not a full path")
+
+    if publish and publisher_settings is None and estate_values.get(ESTATE_ENV_PUBLISHER_SETTINGS) and estate_env_file:
+        publisher_settings = _resolve_beside(estate_values[ESTATE_ENV_PUBLISHER_SETTINGS], estate_env_file)
+    if publish and publisher_settings is None:
+        raise Refused(
+            "publisher",
+            "--publish needs the publisher's settings file: pass --publisher-settings, or "
+            f"--estate-env-file (its {ESTATE_ENV_PUBLISHER_SETTINGS} names it)",
+        )
+
+    env_text = str(estate_env_file) if estate_env_file is not None else "$ESTATE_ENV"
+    if loaded_env_file is not None:
+        loaded_env_text = str(loaded_env_file)
+    elif estate_env_file is not None:
+        loaded_env_text = str(estate_env_file.parent / "secrets.env")
+    else:
+        loaded_env_text = "$RUN/secrets.env"
+    estate_check = "$FORGE/deploy/estate/estate-check"
+    compose = estate_values.get(ESTATE_ENV_COMPOSE_FILE, "")
+    first = next((part for part in re.split(r"[:,]", compose) if part.strip()), "")
+    if first and estate_env_file is not None:
+        estate_check = str(_resolve_beside(first.strip(), estate_env_file).parent / "estate-check")
+
+    return Options(
+        key=f"{org}/{leaf}",
+        org=org,
+        leaf=leaf,
+        url=url,
+        publish=publish,
+        dry_run=dry_run,
+        sandbox=sandbox,
+        volume=volume,
+        coordinator=coordinator,
+        sandbox_settings=sandbox_settings,
+        sandbox_clone=sandbox_clone.rstrip("/"),
+        publisher_settings=str(publisher_settings) if publisher_settings is not None else None,
+        publish_source_base=publish_source_base,
+        estate=Estate(
+            env_file=env_text,
+            loaded_env_file=loaded_env_text,
+            estate_check=estate_check,
+            sandbox=sandbox,
+            volume=volume,
+            coordinator=coordinator,
+        ),
+    )
+
+
+def register(options: Options, run: Runner, steps: list[Step]) -> list[str]:
+    """Steps 1–7: report lines go into ``steps``; returns the printed sequence.
+
+    Every read comes before every write, so a refusal anywhere leaves
+    everything — the project, the live settings and the sandbox — as it was.
+    """
+    with tempfile.TemporaryDirectory(prefix="forge-register-") as folder:
+        steps += check_project(run, key=options.key, url=options.url, folder=Path(folder))
+
+    volume = VolumeStore(options.volume, run)
+    sandbox = SandboxStore(options.sandbox, run)
+    host = HostStore()
+
+    coordinator_text = volume.read(SETTINGS_FILE_NAME)
+    if coordinator_text is None:
+        raise Refused("coordinator", f"could not read {SETTINGS_FILE_NAME} from the volume {options.volume}")
+    sandbox_text = sandbox.read(options.sandbox_settings)
+    if sandbox_text is None:
+        raise Refused("sandbox", f"could not read {options.sandbox_settings} in the sandbox {options.sandbox}")
+
+    coordinator_path = f"{COORDINATOR_PROJECTS_ROOT}/{options.leaf}"
+    clone_path = f"{options.sandbox_clone}/{PROJECTS_FOLDER}/{options.leaf}"
+    coordinator_edit = plan_settings_edit(
+        coordinator_text, which="coordinator", key=options.key, path=coordinator_path
+    )
+    sandbox_edit = plan_settings_edit(sandbox_text, which="sandbox", key=options.key, path=clone_path)
+
+    publisher_edit: JsonEdit | None = None
+    if options.publish:
+        assert options.publisher_settings is not None
+        publisher_text = host.read(options.publisher_settings)
+        if publisher_text is None:
+            raise Refused("publisher", f"could not read the publisher's settings file {options.publisher_settings}")
+        publisher_edit = plan_publisher_edit(
+            publisher_text,
+            key=options.key,
+            source=f"{options.publish_source_base.rstrip('/')}/{options.leaf}",
+            remote=f"git@github.com:{options.org}/{options.leaf}.git",
+        )
+
+    clone_step, clone_needed = check_sandbox_clone(
+        sandbox, clone=options.sandbox_clone, leaf=options.leaf, url=options.url
+    )
+
+    # Every read is done and nothing refused: now, and only now, write.
+    if clone_needed and options.dry_run:
+        steps.append(Step("clone", "would add", clone_step.detail))
+    elif clone_needed:
+        steps.append(make_sandbox_clone(sandbox, clone=options.sandbox_clone, leaf=options.leaf, url=options.url))
+    else:
+        steps.append(clone_step)
+
+    staged: dict[str, Staged | None] = {"coordinator": None, "sandbox": None, "publisher": None}
+    for edit, store, live, folder_name in (
+        (coordinator_edit, volume, SETTINGS_FILE_NAME, None),
+        (sandbox_edit, sandbox, options.sandbox_settings, str(PurePosixPath(options.sandbox_settings).parent)),
+    ):
+        steps += edit.steps
+        if edit.staged is None:
+            steps.append(Step(edit.which, "unchanged", "nothing to change, nothing staged"))
+            continue
+        line, where = stage(
+            store, which=edit.which, live=live, folder=folder_name, leaf=options.leaf,
+            original=edit.original, staged=edit.staged, dry_run=options.dry_run,
+        )
+        steps.append(line)
+        staged[edit.which] = where if where is not None else Staged(
+            live, _pending_name(live, options.leaf), _backup_name(live, options.leaf)
+        )
+    if publisher_edit is not None:
+        assert options.publisher_settings is not None
+        steps += publisher_edit.steps
+        if publisher_edit.staged is None:
+            steps.append(Step("publisher", "unchanged", "nothing to change, nothing staged"))
+        else:
+            live = options.publisher_settings
+            line, where = stage(
+                host, which="publisher", live=live, folder=str(Path(live).parent),
+                leaf=options.leaf, original=publisher_edit.original,
+                staged=publisher_edit.staged, dry_run=options.dry_run, like=live,
+            )
+            steps.append(line)
+            staged["publisher"] = where if where is not None else Staged(
+                live, _pending_name(live, options.leaf), _backup_name(live, options.leaf)
+            )
+
+    steps.append(Step("coordinator-folder", "unchanged", COORDINATOR_FOLDER_NOTE))
+
+    entry = sandbox_edit.reference_entry
+    urls = (entry.get("sidecar_url", ""), entry.get("runner_url", ""))
+    helper_urls = urls if all(u and "${" not in u for u in urls) else None
+    tail = activation_sequence(
+        key=options.key,
+        estate=options.estate,
+        coordinator=staged["coordinator"],
+        sandbox_file=staged["sandbox"],
+        publisher=staged["publisher"],
+        helper_urls=helper_urls,
+        dry_run=options.dry_run,
+    )
+    return tail
+
+
+@click.command(name="register-repo")
+@click.argument("name", required=False)
+@click.option("--github", "github", default=None, help="The repository's https:// address on GitHub.")
+@click.option("--publish", is_flag=True, default=False, help="Also add the publisher's route for it.")
+@click.option("--dry-run", "dry_run", is_flag=True, default=False,
+              help="Check the project and say what would change; write nothing anywhere.")
+@click.option("--check-drained", "check_drained", is_flag=True, default=False,
+              help="Activation step (b) only: say DRAINED, or why not. Reads only.")
+@click.option("--estate-env-file", type=click.Path(dir_okay=False, path_type=Path),
+              envvar="FORGE_ESTATE_ENV_FILE", default=None,
+              help="The estate env file the factory runs on now; the printed commands use it.")
+@click.option("--secrets-file", "loaded_env_file", type=click.Path(dir_okay=False, path_type=Path), default=None,
+              help="The estate's secrets file (default: secrets.env beside the estate env file).")
+@click.option("--sandbox-env-file", type=click.Path(dir_okay=False, path_type=Path), default=None,
+              help=f"The sandbox's bootstrap env file (default: the estate env's {ESTATE_ENV_SANDBOX_FILE}).")
+@click.option("--sandbox-settings", default=None,
+              help=f"The sandbox's own forge.yaml (default: the bootstrap env's {SANDBOX_ENV_CONFIG_PATH}).")
+@click.option("--sandbox-clone", default=None,
+              help="The api_test clone in the sandbox (default: worked out from --sandbox-settings).")
+@click.option("--publisher-settings", type=click.Path(dir_okay=False, path_type=Path), default=None,
+              help=f"The publisher's settings file (default: the estate env's {ESTATE_ENV_PUBLISHER_SETTINGS}).")
+@click.option("--publish-source-base", default=DEFAULT_PUBLISH_SOURCE_BASE, show_default=True,
+              help="Where the publisher fetches a project's clone from, without the project's folder.")
+@click.option("--sandbox", "sandbox", default=DEFAULT_SANDBOX, show_default=True, help="The shared sandbox.")
+@click.option("--settings-volume", "volume", default=DEFAULT_SETTINGS_VOLUME, show_default=True,
+              help="The coordinator's settings volume.")
+@click.option("--coordinator-container", "coordinator", default=DEFAULT_COORDINATOR_CONTAINER,
+              show_default=True, help="The running coordinator's container.")
+@click.option("--json", "as_json", is_flag=True, default=False, help="Print the report as JSON.")
+def register_repo_cmd(
+    name: str | None,
+    github: str | None,
+    publish: bool,
+    dry_run: bool,
+    check_drained: bool,
+    estate_env_file: Path | None,
+    loaded_env_file: Path | None,
+    sandbox_env_file: Path | None,
+    sandbox_settings: str | None,
+    sandbox_clone: str | None,
+    publisher_settings: Path | None,
+    publish_source_base: str,
+    sandbox: str,
+    volume: str,
+    coordinator: str,
     as_json: bool,
 ) -> None:
-    """Register a git checkout so the factory can build in it.
+    """Register a project on GitHub with the running factory.
 
-    Checks the checkout, adds it to the forge's filesystem allowlist and to the
-    repository map under both key spellings, writes the toolchain block into the
-    repository's guardkit config when it has none, derives and prints the
-    fleet-memory project id, reports what the repository has and lacks, checks
-    that no build is running, and prints the one command left for a human.
-
-    With ``--deploy-port`` it also writes the five files a repository needs to
-    be deployed into its own Docker Sandbox: the profile that names the
-    sandbox, the wrapper that brings it up, the bootstrap that brings up the
-    factory's two services inside it, the deploy script that runs inside it,
-    and the candidate overlay that puts the throwaway copy on its own port.
+    Checks the project (authoring nothing in it), makes the factory's own clone
+    of it in the shared sandbox, stages the coordinator's, the sandbox's and
+    (with --publish) the publisher's settings beside the live ones, and prints
+    the stop/start sequence that makes it live. It restarts nothing.
     """
-    ctx = click.get_current_context()
+    run = run_command
+
+    if check_drained:
+        consumers = drained_read_spec()["consumers"]
+        reasons = judge_drained(read_drained_facts(run, coordinator), consumers)
+        if not reasons:
+            _emit(
+                [Step("drained", "ok", "DRAINED: no build or planning run unfinished, nothing "
+                      f"waiting in the work queue, and {' and '.join(consumers)} each read zero "
+                      "pending and zero unacknowledged")],
+                as_json=as_json,
+            )
+            return
+        _emit(
+            [Step("drained", "no", reason) for reason in reasons]
+            + [Step("drained", "no", "NOT DRAINED — reopen intake and activate later")],
+            as_json=as_json,
+        )
+        raise click.exceptions.Exit(1)
+
     steps: list[Step] = []
-
-    #: Undo actions for everything already written, newest first. A refusal is
-    #: "nothing was registered", so it must also be "nothing was left changed":
-    #: the repository's config goes back to what it said and the dated backup,
-    #: now standing behind no change at all, is removed.
-    rollbacks: list[Callable[[], None]] = []
-
-    def refuse(step: str, detail: str) -> NoReturn:
-        for undo in reversed(rollbacks):
-            try:
-                undo()
-            except OSError:  # pragma: no cover — a failed undo must not mask why
-                pass
-        steps.append(Step(step, "refused", detail))
+    try:
+        if not name:
+            raise Refused("name", "name the project: forge register-repo <org>/<name> --github <https address>")
+        options = resolve_options(
+            name=name,
+            github=github,
+            publish=publish,
+            dry_run=dry_run,
+            estate_env_file=estate_env_file,
+            loaded_env_file=loaded_env_file,
+            sandbox_env_file=sandbox_env_file,
+            sandbox_settings=sandbox_settings,
+            sandbox_clone=sandbox_clone,
+            publisher_settings=publisher_settings,
+            publish_source_base=publish_source_base,
+            sandbox=sandbox,
+            volume=volume,
+            coordinator=coordinator,
+        )
+        tail = register(options, run, steps)
+    except Refused as refusal:
+        steps.append(Step(refusal.step, "refused", refusal.detail))
         _emit(steps, as_json=as_json)
-        raise click.ClickException(detail)
-
-    config_path = _resolve_config_path(ctx)
-    if config is None:
-        config = _load(config_path)
-
-    # ---- the name is checked first, before anything at all is read from disk
-    # or written to it. A name is not free text: it becomes two repository-map
-    # keys, part of the backup file's name, and the folder name the build side
-    # resolves under the base. A separator in it would mint the key
-    # ``guardkit/a/b``, which nothing looks up, and would send the dated backup
-    # into some other directory — so it is refused here, where nothing has yet
-    # been written and there is nothing to undo.
-    if name_opt is not None and _has_path_separator(name_opt):
-        refuse(
-            "name",
-            f"--name {name_opt!r} contains a path separator — the name becomes "
-            "a folder name and two repository-map keys, so it must be a plain "
-            "name with no slashes in it",
-        )
-
-    # ---- the deploy flags are checked here too, before anything is written.
-    # A port that cannot be a port, or a name that cannot be a sandbox name,
-    # would only surface later as a file this repository could not deploy with.
-    if deploy_allow is not None and deploy_port is None:
-        refuse(
-            "deploy-files",
-            "--deploy-allow says what else the deployment sandbox may reach, "
-            "so it only means something with --deploy-port, which is what "
-            "writes the sandbox — pass both, or neither",
-        )
-    if deploy_port is not None and not (1 <= deploy_port <= MAX_DEPLOY_PORT):
-        refuse(
-            "deploy-files",
-            f"--deploy-port {deploy_port} is not a port the app, its candidate "
-            f"copy and the factory's two services can share — pass a whole "
-            f"number from 1 to {MAX_DEPLOY_PORT}, because the candidate copy "
-            "takes the next port up and the build runner and deploy sidecar "
-            "take the ports 23 and 24 up",
-        )
-
-    # ---- rule 2: the checks that refuse (nothing is written when any fails)
-    repo = Path(repo_path).expanduser()
-    if not repo.exists():
-        refuse("path", f"{repo} does not exist")
-    if not repo.is_dir():
-        refuse("path", f"{repo} is not a directory")
-    repo = repo.resolve()
-    steps.append(Step("path", "ok", str(repo)))
-
-    if not (repo / ".git").exists():
-        refuse("git", f"{repo} is not a git checkout — it has no .git")
-    steps.append(Step("git", "ok", "checkout has .git"))
-
-    owner_uid = repo.stat().st_uid
-    if owner_uid != EXPECTED_OWNER_UID:
-        refuse(
-            "owner",
-            f"{repo} is owned by uid {owner_uid}, not uid {EXPECTED_OWNER_UID} — "
-            "the build container could not write to it",
-        )
-    steps.append(Step("owner", "ok", f"uid {EXPECTED_OWNER_UID}"))
-
-    base = _repo_base()
-    if base is None:
-        refuse(
-            "base",
-            f"{FORGE_REPO_BASE_ENV} is not set, and there is no default — this "
-            "command cannot know which directory this deployment keeps its "
-            f"checkouts in. Set {FORGE_REPO_BASE_ENV} to that directory (the "
-            "build side resolves a repository by folder name under it) and run "
-            "this again",
-        )
-    if repo.parent != base:
-        refuse(
-            "base",
-            f"{repo} is not directly under {base} — the build side resolves a "
-            "repository by folder name under that directory, so a checkout "
-            "anywhere else can never be found",
-        )
-    steps.append(Step("base", "ok", f"directly under {base}"))
-
-    name = name_opt or repo.name
-    map_keys = [
-        f"{namespace}/{name}" for namespace in _repo_map_namespaces(base)
-    ]
-    existing_map: dict[str, str] = dict(
-        getattr(getattr(config, "planning", None), "target_repo_paths", {}) or {}
-    )
-    for key in map_keys:
-        current = existing_map.get(key)
-        if current is not None and Path(current).expanduser() != repo:
-            refuse(
-                "repo-map",
-                f"{key} already points at {current}, not {repo} — pick another "
-                "--name or fix the map by hand",
-            )
-
-    if deploy_port is not None and not sandbox_name_for(name):
-        refuse(
-            "deploy-files",
-            f"{name} does not reduce to a name a Docker Sandbox can carry — a "
-            "sandbox name is lower-case letters, digits and hyphens, so pick "
-            "another --name",
-        )
-
-    declared_test = _declared_test_command(repo)
-    if declared_test is None and not toolchain_test:
-        refuse(
-            "toolchain",
-            f"{name} declares no test command and none was given — pass "
-            "--toolchain-test 'the command that runs the tests'; without it the "
-            "merge-ready gate has nothing to run",
-        )
-
-    # ---- rule 4, first half: measure what forge.yaml needs and take the dated
-    # backup. This happens HERE, before the guardkit scaffold and before the
-    # repository's own config is written, because the spec says the backup is
-    # taken before the first mutation and the repository-side write is the
-    # first mutation. (The guardkit scaffold, when one is created, is left in
-    # place on a refusal: deleting a whole scaffold is a bigger act than the
-    # one that failed. Everything else undoes.)
-    original_text = config_path.read_text(encoding="utf-8")
-    lines = _split_lines(original_text)
-
-    allowlist = [
-        str(Path(entry).expanduser())
-        for entry in getattr(
-            getattr(getattr(config, "permissions", None), "filesystem", None),
-            "allowlist",
-            [],
-        )
-        or []
-    ]
-    allowlist_needed = str(repo) not in allowlist
-    map_needed = [key for key in map_keys if key not in existing_map]
-
-    if not allowlist_needed and not map_needed:
-        backup_step = Step("backup", "unchanged", "nothing to change, no backup taken")
-    elif dry_run:
-        backup_step = Step("backup", "would-add", _backup_path(config_path, name).name)
-    else:
-        backup_file = _backup_path(config_path, name)
-        backup_file.write_text(original_text, encoding="utf-8")
-        rollbacks.append(lambda: backup_file.unlink(missing_ok=True))
-        backup_step = Step("backup", "ok", backup_file.name)
-
-    # ---- rule 3: the checks that warn and carry on
-    remote = _git_remote(repo)
-    if remote is None:
-        steps.append(
-            Step(
-                "remote",
-                "warn",
-                "no git remote — branches stay local; the merge-ready push leg "
-                "will report not-pushed",
-            )
-        )
-    else:
-        steps.append(Step("remote", "ok", f"git remote {remote}"))
-
-    # ---- rule 5: the repository's own guardkit config
-    already_initialised = (repo / ".guardkit").is_dir() or (repo / ".claude").is_dir()
-    if already_initialised:
-        steps.append(Step("guardkit", "ok", "already initialised"))
-    elif dry_run:
-        steps.append(Step("guardkit", "would-add", f"guardkit init {template}"))
-    else:
-        result = _run_guardkit_init(repo, template)
-        if result.returncode != 0:
-            detail = (result.stderr or result.stdout or "").strip().splitlines()
-            reason = detail[-1] if detail else f"exit {result.returncode}"
-            refuse(
-                "guardkit",
-                f"guardkit init {template} failed in {repo} ({reason}) — nothing "
-                "was written to the forge config",
-            )
-        steps.append(Step("guardkit", "added", f"guardkit init {template}"))
-
-    identifier = project_id_for(name)
-    if not _IDENTIFIER_PATTERN.match(identifier):  # pragma: no cover — defensive
-        refuse(
-            "project-id",
-            f"{name} does not reduce to a usable fleet-memory project id",
-        )
-
-    repo_config = _repo_config_path(repo)
-    repo_text = (
-        repo_config.read_text(encoding="utf-8") if repo_config.is_file() else ""
-    )
-    repo_lines = _split_lines(repo_text) if repo_text else []
-    repo_changed = False
-
-    if declared_test is not None:
-        steps.append(Step("toolchain", "unchanged", f"declares test: {declared_test}"))
-    elif dry_run:
-        steps.append(Step("toolchain", "would-add", f"test: {toolchain_test}"))
-    else:
-        repo_lines = _write_toolchain_block(
-            repo_lines, str(toolchain_test), DEFAULT_TEST_TIMEOUT
-        )
-        repo_changed = True
-        steps.append(Step("toolchain", "added", f"test: {toolchain_test}"))
-
-    memory_block = _read_repo_config_dict(repo).get("memory")
-    has_project = isinstance(memory_block, dict) and memory_block.get("project")
-    if has_project:
-        steps.append(Step("memory", "unchanged", f"project: {memory_block['project']}"))
-    elif dry_run:
-        steps.append(Step("memory", "would-add", f"project: {identifier}"))
-    else:
-        repo_lines = _write_memory_project(repo_lines, identifier)
-        repo_changed = True
-        steps.append(Step("memory", "added", f"project: {identifier}"))
-
-    # ---- the documents the project's builds are held to (4 October 2026).
-    # Registration stays mechanical: it never writes, templates or seeds these.
-    # It only says which ones the project declares
-    # (autobuild.player.required_documents) and this checkout lacks, or has
-    # only as a symbolic link (which builds refuse), so the gap is seen now
-    # rather than at the first build. A warning; nothing is written and the
-    # exit code does not change.
-    document_warnings = _declared_document_warnings(repo, repo_text)
-    if document_warnings:
-        steps.append(Step("documents", "warn", "; ".join(document_warnings)))
-
-    if repo_changed and not dry_run:
-        repo_config.parent.mkdir(parents=True, exist_ok=True)
-        existed_before = repo_config.is_file()
-        previous_text = repo_text if existed_before else None
-        text = _join_lines(repo_lines)
-        if text and not text.endswith("\n"):
-            text += "\n"
-        repo_config.write_text(text, encoding="utf-8")
-
-        def _restore_repo_config(
-            path: Path = repo_config, previous: str | None = previous_text
-        ) -> None:
-            if previous is None:
-                path.unlink(missing_ok=True)
-            else:
-                path.write_text(previous, encoding="utf-8")
-
-        rollbacks.append(_restore_repo_config)
-
-    steps.append(Step("project-id", "ok", identifier))
-
-    # ---- the deploy files. Only written when --deploy-port asks for them,
-    # and never over a file that is already there: a profile someone wrote by
-    # hand is the record of how this repository actually deploys.
-    if deploy_port is not None:
-        rendered = render_deploy_files(
-            name=name, repo=repo, app_port=deploy_port, allow_extra=deploy_allow
-        )
-        try:
-            written = _parse_written_profile(rendered["deploy/profile.yaml"])
-        except Exception as exc:  # noqa: BLE001 — the parser's own sentence
-            refuse("deploy-files", f"the deploy profile would not load: {exc}")
-        added_any = False
-        profile_added = False
-        for relative in DEPLOY_FILES:
-            target = repo / relative
-            if target.exists():
-                steps.append(
-                    Step("deploy-files", "unchanged", f"{relative} is already there")
-                )
-                continue
-            if dry_run:
-                steps.append(Step("deploy-files", "would-add", relative))
-                continue
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(rendered[relative], encoding="utf-8")
-            if relative.endswith(".sh"):
-                target.chmod(0o755)
-            rollbacks.append(
-                lambda path=target: path.unlink(missing_ok=True)  # type: ignore[misc]
-            )
-            steps.append(Step("deploy-files", "added", relative))
-            added_any = True
-            profile_added = relative == "deploy/profile.yaml" or profile_added
-        # The closing line reports the profile that is now ON DISK, never the
-        # ports this run asked for: a profile someone wrote by hand is left
-        # alone, and saying "on ports 8911 and 8912" about a repository whose
-        # own profile deploys on 9000 would be a plain lie.
-        if not dry_run:
-            steps.append(
-                Step(
-                    "deploy-files",
-                    "ok",
-                    _deploy_profile_sentence(repo, added_any=added_any),
-                )
-            )
-        # ... and, only when THIS run wrote the profile, where the factory's
-        # own two services for this repository will be reached, and whether
-        # the checkouts they are installed from are there to be mounted.
-        if profile_added and written.sandbox is not None:
-            runner_port, sidecar_port = service_ports_for(deploy_port)
-            steps.append(
-                Step(
-                    "deploy-files",
-                    "ok",
-                    f"sandbox {written.sandbox.name} will carry the factory's "
-                    f"build runner on 127.0.0.1:{runner_port} and deploy sidecar "
-                    f"on 127.0.0.1:{sidecar_port}",
-                )
-            )
-            missing = [
-                path
-                for path in (written.sandbox.forge_path, written.sandbox.guardkit_path)
-                if path and not Path(path).is_dir()
-            ]
-            if missing:
-                steps.append(
-                    Step(
-                        "deploy-files",
-                        "warn",
-                        "no checkout at " + " or ".join(missing) + " — the sandbox "
-                        "mounts the factory's code from there, so it cannot carry "
-                        "the runner and the sidecar until those checkouts exist",
-                    )
-                )
-
-    # ---- rule 6: what the repository has and lacks
-    try:
-        roots = _discover_test_roots(repo)
-    except Exception as exc:  # noqa: BLE001 — a failure here warns, never stops
-        steps.append(
-            Step(
-                "test-roots",
-                "warn",
-                f"the repository's test roots could not be listed ({exc})",
-            )
-        )
-    else:
-        if roots:
-            steps.append(Step("test-roots", "ok", ", ".join(roots)))
-        else:
-            steps.append(
-                Step(
-                    "test-roots",
-                    "warn",
-                    "tests/ holds no subdirectory, so plans that name smoke "
-                    "gates will fail plan-containment; add tests/<area>/",
-                )
-            )
-
-    for step_name, relative, missing_sentence in (
-        ("qa-gates", "qa/gates/registry.yaml", "no qa/gates/registry.yaml"),
-        ("deploy", "deploy/profile.yaml", "no deploy/profile.yaml"),
-        (
-            "arch-rules",
-            "docs/architecture-rules.yaml",
-            "no docs/architecture-rules.yaml",
-        ),
-    ):
-        if (repo / relative).exists():
-            steps.append(Step(step_name, "ok", relative))
-        else:
-            steps.append(Step(step_name, "warn", missing_sentence))
-
-    # ---- rule 4, second half: the forge config, by surgical line insertion.
-    # The file was read and the backup taken above, before the first mutation.
-    steps.append(backup_step)
-
-    allowlist_status = (
-        "unchanged" if not allowlist_needed else ("would-add" if dry_run else "added")
-    )
-    if allowlist_needed and not dry_run:
-        try:
-            append_sequence_item(
-                lines, ("permissions", "filesystem", "allowlist"), str(repo)
-            )
-        except YamlEditRefused as exc:
-            refuse("allowlist", str(exc))
-    steps.append(Step("allowlist", allowlist_status, str(repo)))
-
-    for key in map_keys:
-        needed = key in map_needed
-        status = "unchanged" if not needed else ("would-add" if dry_run else "added")
-        if needed and not dry_run:
-            try:
-                set_mapping_entry(
-                    lines, ("planning", "target_repo_paths"), key, str(repo)
-                )
-            except YamlEditRefused as exc:
-                refuse("repo-map", str(exc))
-        steps.append(Step("repo-map", status, f"{key} -> {repo}"))
-
-    if (allowlist_needed or map_needed) and not dry_run:
-        config_path.write_text(_join_lines(lines), encoding="utf-8")
-        try:
-            _load(config_path)
-        except Exception as exc:  # noqa: BLE001 — any parse failure restores
-            config_path.write_text(original_text, encoding="utf-8")
-            refuse(
-                "config",
-                f"the edited {config_path.name} no longer parses "
-                f"({exc.__class__.__name__}) — the backup has been restored and "
-                "nothing was registered",
-            )
-        steps.append(Step("config", "ok", f"{config_path.name} re-parses"))
-    else:
-        steps.append(Step("config", "unchanged", f"{config_path.name} untouched"))
-
-    # ---- rule 7: the estate gate. Prints the recreate command, never runs it.
-    steps.append(_estate_step())
-
-    _emit(steps, as_json=as_json, tail=_tail(name))
-
-
-# ---------------------------------------------------------------------------
-# Small helpers used by the command
-# ---------------------------------------------------------------------------
-
-
-def _parse_written_profile(text: str) -> Any:
-    """Prove the profile just rendered is one the deploy step can read.
-
-    Uses the deploy step's own loader, so the file this command writes is held
-    to exactly the rules the deploy step will hold it to.
-    """
-    from forge.deploy.profile import parse_deploy_profile
-
-    return parse_deploy_profile(yaml.safe_load(text))
-
-
-def _deploy_profile_sentence(repo: Path, *, added_any: bool) -> str:
-    """One plain sentence about the deploy profile this repository now has.
-
-    Read back from disk after the files are written, so what is reported is
-    what the repository really carries. A profile that was already there keeps
-    its own sandbox and its own ports, and those are the ones named.
-
-    Args:
-        repo: The checkout.
-        added_any: Whether this run wrote any deploy file at all.
-    """
-    path = repo / "deploy" / "profile.yaml"
-    sandbox = None
-    try:
-        profile = _parse_written_profile(path.read_text(encoding="utf-8"))
-        sandbox = profile.sandbox
-    except Exception:  # noqa: BLE001 — an unreadable profile is reported, not raised
-        sandbox = None
-
-    ports = _host_ports_of(sandbox.publish) if sandbox is not None else []
-    if sandbox is not None and ports:
-        return f"sandbox {sandbox.name} on {_ports_phrase(ports)}"
-    if not added_any:
-        return "deploy files already present, unchanged"
-    if sandbox is not None:
-        return f"sandbox {sandbox.name}, whose profile publishes no port"
-    return "the deploy profile already here names no sandbox"
-
-
-def _host_ports_of(publish: tuple[str, ...]) -> list[str]:
-    """The host-side port of each publish rule, in the order they are written.
-
-    A rule is written ``PORT``, ``HOST_PORT:SANDBOX_PORT`` or
-    ``HOST_ADDRESS:HOST_PORT:SANDBOX_PORT``; the host port is the last part
-    but one, except in the one-part form where it is the only part.
-    """
-    ports: list[str] = []
-    for rule in publish:
-        parts = rule.split(":")
-        port = parts[0] if len(parts) == 1 else parts[-2]
-        if port and port not in ports:
-            ports.append(port)
-    return ports
-
-
-def _ports_phrase(ports: list[str]) -> str:
-    """``port 8911`` / ``ports 8911 and 8912`` / ``ports 1, 2 and 3``."""
-    if len(ports) == 1:
-        return f"port {ports[0]}"
-    return f"ports {', '.join(ports[:-1])} and {ports[-1]}"
-
-
-def _load(config_path: Path) -> Any:
-    from forge.config.loader import load_config
-
-    return load_config(config_path)
-
-
-def _backup_path(config_path: Path, name: str) -> Path:
-    """``forge.yaml.bak-YYYYMMDD-pre-register-<name>`` beside the config."""
-    stamp = date.today().strftime("%Y%m%d")
-    return config_path.with_name(f"{config_path.name}.bak-{stamp}-pre-register-{name}")
-
-
-def _write_toolchain_block(lines: list[str], command: str, timeout: int) -> list[str]:
-    """Add ``test:`` to the repository's toolchain declaration without overwriting.
-
-    When there is no ``toolchain:`` key the minimal block is appended whole.
-    When there is one that simply has no ``test:``, only the keys the block does
-    not already declare are inserted into it. Nothing that is already declared
-    is rewritten, and no key is ever written twice.
-    """
-    lines = list(lines)
-    if locate(lines, ("toolchain",)) is None:
-        while lines and not lines[-1].strip():
-            lines.pop()
-        if lines:
-            lines.append("")
-        lines.extend(["toolchain:", f"  test: {command}", f"  test_timeout: {timeout}"])
-        return lines
-    # The block is there but declares no ``test``. Insert that — and insert
-    # ``test_timeout`` ONLY when the block declares none. Writing it
-    # unconditionally appends a SECOND ``test_timeout:`` beside the
-    # repository's own; PyYAML takes the last key, so a repository that had
-    # declared 900 would silently be run at 300, and stricter parsers reject a
-    # file carrying duplicate keys at all. Never overwrite a declaration.
-    declares_timeout = locate(lines, ("toolchain", "test_timeout")) is not None
-    set_mapping_entry(lines, ("toolchain",), "test", command)
-    if not declares_timeout:
-        set_mapping_entry(lines, ("toolchain",), "test_timeout", str(timeout))
-    return lines
-
-
-def _write_memory_project(lines: list[str], identifier: str) -> list[str]:
-    """Add ``memory.project`` when it is absent, leaving anything else alone."""
-    lines = list(lines)
-    if locate(lines, ("memory",)) is None:
-        while lines and not lines[-1].strip():
-            lines.pop()
-        if lines:
-            lines.append("")
-        lines.extend(["memory:", f"  project: {identifier}"])
-        return lines
-    set_mapping_entry(lines, ("memory",), "project", identifier)
-    return lines
+        raise click.exceptions.Exit(1) from None
+    _emit(steps, as_json=as_json, tail=tail)
