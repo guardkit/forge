@@ -587,7 +587,10 @@ def test_the_sequence_uses_the_estate_s_own_files_when_named(estate, tmp_path):
 
 def _quiet() -> dict[str, Any]:
     return {
-        "ledger": {"builds": {}, "planning_runs": {}, "queue_waiting": 0},
+        "ledger": {
+            "builds": {}, "interrupted": 0, "planning_runs": {}, "queue_waiting": 0,
+            "queue_held": 0, "publications_unfinished": 0, "deploy_targets_held": 0,
+        },
         "consumers": {
             "forge-serve-planning": {"pending": 0, "ack_pending": 0},
             "forge-serve": {"pending": 0, "ack_pending": 0},
@@ -617,7 +620,7 @@ def test_a_busy_factory_is_refused(estate):
     facts["ledger"]["planning_runs"] = {"FEATURE_PLAN": 1}
     result = _check(estate, facts)
     assert result.exit_code == 1
-    assert "1 build is not finished (RUNNING 1)" in result.output
+    assert "1 build is active (RUNNING 1)" in result.output
     assert "1 planning run is not finished (FEATURE_PLAN 1)" in result.output
     assert "NOT DRAINED" in result.output
 
@@ -674,20 +677,40 @@ def test_an_unreadable_ledger_or_coordinator_stops_it(estate):
     assert result.exit_code == 1 and "not the read's report" in result.output
 
 
-def _ledger(path: Path, *, build: str | None = None, plan: str | None = None, queued: bool = False) -> None:
+def _ledger(
+    path: Path,
+    *,
+    builds: tuple[str, ...] = (),
+    plan: str | None = None,
+    queued: bool = False,
+    held: bool = False,
+    publication: str | None = "",
+    deploy_holder: str | None = None,
+) -> None:
+    """A ledger with the columns the read uses; ``publication=""`` means no row."""
     with sqlite3.connect(path) as con:
         con.execute("CREATE TABLE builds (build_id TEXT, status TEXT)")
         con.execute("CREATE TABLE planning_runs (id TEXT, state TEXT)")
-        con.execute("CREATE TABLE work_queue (id INTEGER, status TEXT)")
+        con.execute("CREATE TABLE work_queue (id INTEGER, status TEXT, after_id INTEGER)")
+        con.execute("CREATE TABLE publication_records (build_id TEXT, result TEXT)")
+        con.execute("CREATE TABLE deployment_targets (target TEXT, holder_build TEXT)")
         con.executemany("INSERT INTO builds VALUES (?, ?)", [("a", "COMPLETE"), ("b", "FAILED")])
         con.executemany("INSERT INTO planning_runs VALUES (?, ?)", [("p", "PLANNED_HANDOFF")])
-        con.execute("INSERT INTO work_queue VALUES (1, 'DONE')")
-        if build:
-            con.execute("INSERT INTO builds VALUES ('c', ?)", (build,))
+        con.execute("INSERT INTO work_queue VALUES (1, 'DONE', NULL)")
+        con.execute("INSERT INTO publication_records VALUES ('a', 'merged into the remote and running')")
+        con.execute("INSERT INTO deployment_targets VALUES ('guardkit/api_test:local', NULL)")
+        for index, status in enumerate(builds):
+            con.execute("INSERT INTO builds VALUES (?, ?)", (f"c{index}", status))
         if plan:
             con.execute("INSERT INTO planning_runs VALUES ('q', ?)", (plan,))
         if queued:
-            con.execute("INSERT INTO work_queue VALUES (2, 'QUEUED')")
+            con.execute("INSERT INTO work_queue VALUES (2, 'QUEUED', NULL)")
+        if held:
+            con.execute("INSERT INTO work_queue VALUES (3, 'QUEUED', 1)")
+        if publication != "":
+            con.execute("INSERT INTO publication_records VALUES ('c', ?)", (publication,))
+        if deploy_holder:
+            con.execute("INSERT INTO deployment_targets VALUES ('x:local', ?)", (deploy_holder,))
 
 
 def _run_the_read_script(db: Path) -> dict[str, Any]:
@@ -706,33 +729,105 @@ def _run_the_read_script(db: Path) -> dict[str, Any]:
     return json.loads(done.stdout.strip().splitlines()[-1])
 
 
+CONSUMERS = ["forge-serve-planning", "forge-serve"]
+QUIET_CONSUMERS = _quiet()["consumers"]
+
+
 def test_the_read_script_counts_a_real_ledger_and_says_an_unreachable_bus_is_unreadable(tmp_path):
     db = tmp_path / "forge.db"
-    _ledger(db, build="RUNNING", plan="FEATURE_SPEC", queued=True)
+    _ledger(db, builds=("RUNNING",), plan="FEATURE_SPEC", queued=True, held=True,
+            publication="published, deployment pending", deploy_holder="build-c")
 
     facts = _run_the_read_script(db)
 
-    assert facts["ledger"] == {"builds": {"RUNNING": 1}, "planning_runs": {"FEATURE_SPEC": 1}, "queue_waiting": 1}
+    assert facts["ledger"] == {
+        "builds": {"RUNNING": 1}, "interrupted": 0, "planning_runs": {"FEATURE_SPEC": 1},
+        "queue_waiting": 1, "queue_held": 1, "publications_unfinished": 1, "deploy_targets_held": 1,
+    }
     assert set(facts["consumers"]) == {"forge-serve", "forge-serve-planning"}
     assert all("error" in row for row in facts["consumers"].values())
-    reasons = register_repo.judge_drained(facts, ["forge-serve-planning", "forge-serve"])
-    assert len(reasons) == 5
+    reasons = register_repo.judge_drained(facts, CONSUMERS)
+    assert len(reasons) == 8
 
 
 def test_the_read_script_reads_a_finished_ledger_as_quiet(tmp_path):
     db = tmp_path / "forge.db"
     _ledger(db)
     facts = _run_the_read_script(db)
-    assert facts["ledger"] == {"builds": {}, "planning_runs": {}, "queue_waiting": 0}
+    assert facts["ledger"] == _quiet()["ledger"]
+    assert register_repo.judge_drained({**facts, "consumers": QUIET_CONSUMERS}, CONSUMERS) == []
 
 
-def test_interrupted_builds_count_as_not_finished(tmp_path):
-    # The design's rule is "no build in a non-terminal state"; INTERRUPTED is
-    # not terminal (forge status's own list), so it is named, not hidden.
+def test_old_interrupted_builds_with_quiet_consumers_are_drained_and_said_for_information(tmp_path):
     db = tmp_path / "forge.db"
-    _ledger(db, build="INTERRUPTED")
-    facts = _run_the_read_script(db)
-    assert facts["ledger"]["builds"] == {"INTERRUPTED": 1}
+    _ledger(db, builds=("INTERRUPTED",) * 28)
+    facts = {**_run_the_read_script(db), "consumers": QUIET_CONSUMERS}
+
+    assert facts["ledger"]["builds"] == {}
+    assert facts["ledger"]["interrupted"] == 28
+    assert register_repo.judge_drained(facts, CONSUMERS) == []
+    notes = register_repo.drained_notes(facts)
+    assert len(notes) == 1 and "28 builds are INTERRUPTED" in notes[0]
+
+
+def test_twenty_eight_interrupted_builds_print_drained(estate):
+    facts = _quiet()
+    facts["ledger"]["interrupted"] = 28
+    result = _check(estate, facts)
+    assert result.exit_code == 0, result.output
+    assert "28 builds are INTERRUPTED" in result.output
+
+
+@pytest.mark.parametrize("state", ["QUEUED", "PREPARING", "RUNNING", "PAUSED", "FINALISING"])
+def test_every_active_build_state_is_counted(tmp_path, state):
+    from forge.planning.work_queue_loop import BUILD_ACTIVE_STATES
+
+    assert state in BUILD_ACTIVE_STATES
+    db = tmp_path / "forge.db"
+    _ledger(db, builds=(state,))
+    assert _run_the_read_script(db)["ledger"]["builds"] == {state: 1}
+
+
+@pytest.mark.parametrize("result", [None, "publication pending", "published, deployment pending"])
+def test_an_unfinished_merge_is_counted(tmp_path, result):
+    db = tmp_path / "forge.db"
+    _ledger(db, publication=result)
+    facts = {**_run_the_read_script(db), "consumers": QUIET_CONSUMERS}
+    reasons = register_repo.judge_drained(facts, CONSUMERS)
+    assert reasons == [
+        "1 merge is not finished (a publication record short of 'merged into the remote and running')"
+    ]
+
+
+def test_a_finished_merge_is_not_counted(tmp_path):
+    db = tmp_path / "forge.db"
+    _ledger(db, publication="merged into the remote and running")
+    assert _run_the_read_script(db)["ledger"]["publications_unfinished"] == 0
+
+
+def test_a_held_deployment_target_is_counted(tmp_path):
+    db = tmp_path / "forge.db"
+    _ledger(db, deploy_holder="build-FEAT-1-20261005")
+    facts = {**_run_the_read_script(db), "consumers": QUIET_CONSUMERS}
+    assert register_repo.judge_drained(facts, CONSUMERS) == [
+        "1 deployment target is held by a build that is deploying"
+    ]
+
+
+def test_a_held_queue_item_says_wait_for_its_antecedent_or_withdraw_it(estate):
+    facts = _quiet()
+    facts["ledger"]["queue_held"] = 1
+    result = _check(estate, facts)
+    assert result.exit_code == 1
+    assert "behind another item; wait for the item it waits on to finish, or withdraw it" in result.output
+
+
+def test_a_missing_ledger_count_is_unreadable_not_zero(estate):
+    facts = _quiet()
+    del facts["ledger"]["deploy_targets_held"]
+    result = _check(estate, facts)
+    assert result.exit_code == 1
+    assert "could not be counted" in result.output
 
 
 # ---------------------------------------------------------------------------
