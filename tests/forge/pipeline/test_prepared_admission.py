@@ -776,6 +776,82 @@ async def test_a_task_file_path_outside_the_repository_is_refused_not_rewritten(
     assert "not a path inside the repository" in (answer.refusal or "")
 
 
+def _commit_with_links(project: Project, files: dict[str, str], links: dict[str, str]) -> None:
+    project.commit_on(BRANCH, files)
+    _git(project.writer, "checkout", "-q", BRANCH)
+    for path, target in links.items():
+        (project.writer / path).parent.mkdir(parents=True, exist_ok=True)
+        (project.writer / path).symlink_to(target)
+    _git(project.writer, "add", "-A")
+    _git(project.writer, "commit", "-qm", "links")
+    _git(project.writer, "push", "-q", "-f", "origin", f"HEAD:refs/heads/{BRANCH}")
+    _git(project.writer, "checkout", "-q", "main")
+
+
+@pytest.mark.asyncio
+async def test_a_task_path_with_dot_dot_through_a_link_is_refused_not_collapsed(
+    project: Project, runner: WorktreeGitRunner
+) -> None:
+    """``{TASK_DIR}/link/../TASK.md`` with ``link -> ../../../other/nested``:
+    textually it is the task file beside the link, on a filesystem it is
+    other/TASK.md. Both exist; the path is refused rather than guessed (R6)."""
+    task = f"{TASKS[0]}-do-the-thing.md"
+    files = bundle()
+    plan_path = f".guardkit/features/{FEATURE}.yaml"
+    sneaky = f"{TASK_DIR}/link/../{task}"
+    files[plan_path] = files[plan_path].replace(f'"{TASK_DIR}/{task}"', f'"{sneaky}"', 1)
+    files[f"other/{task}"] = "# another task\n"
+    files["other/nested/x.md"] = "x\n"
+    _commit_with_links(project, files, {f"{TASK_DIR}/link": "../../../other/nested"})
+
+    answer = await _admit(project, runner)
+
+    assert not answer.ok
+    assert sneaky in (answer.refusal or "")
+    assert "not a path inside the repository" in (answer.refusal or "")
+
+
+@pytest.mark.asyncio
+async def test_a_markdown_reference_up_and_across_to_a_real_file_is_admitted(
+    project: Project, runner: WorktreeGitRunner
+) -> None:
+    files = bundle()
+    task = f"{TASK_DIR}/{TASKS[0]}-do-the-thing.md"
+    files[task] += "\nSee [the API](../../../docs/design/API.md).\n"
+    files["docs/design/API.md"] = "# API\n"
+    project.commit_on(BRANCH, files)
+
+    answer = await _admit(project, runner)
+
+    assert answer.ok, answer.refusal
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reference",
+    ["../../../linked-docs/design/API.md", "link/../../../../docs/design/API.md"],
+    ids=["through-a-linked-folder", "dot-dot-after-a-link"],
+)
+async def test_a_markdown_reference_through_a_link_is_refused(
+    project: Project, runner: WorktreeGitRunner, reference: str
+) -> None:
+    files = bundle()
+    task = f"{TASK_DIR}/{TASKS[0]}-do-the-thing.md"
+    files[task] += f"\nSee [the API]({reference}).\n"
+    files["docs/design/API.md"] = "# API\n"
+    _commit_with_links(
+        project,
+        files,
+        {"linked-docs": "docs", f"{TASK_DIR}/link": "../../../docs/design"},
+    )
+
+    answer = await _admit(project, runner)
+
+    assert not answer.ok
+    assert "symbolic link" in (answer.refusal or "")
+    assert reference in (answer.refusal or "")
+
+
 @pytest.mark.asyncio
 async def test_an_absolute_spec_file_path_is_refused(
     project: Project, runner: WorktreeGitRunner
