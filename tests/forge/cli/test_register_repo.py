@@ -659,7 +659,8 @@ def _quiet() -> dict[str, Any]:
     return {
         "ledger": {
             "builds": {}, "interrupted": 0, "planning_runs": {}, "queue_waiting": 0,
-            "queue_held": 0, "merges_live": 0, "merges_resting": 0,
+            "queue_held": 0,
+            "merges_live": 0, "merges_resting": 0,
             "deploy_locks_live": 0, "deploy_locks_expired": 0,
         },
         "consumers": {
@@ -758,39 +759,43 @@ class Ledger:
 
         self.path = path
         self.cx = sqlite3.connect(path)
+        # The live ledger's journal mode (forge.adapters.sqlite.connect).
+        self.cx.execute("PRAGMA journal_mode = WAL")
         apply_at_boot(self.cx)
         self.cx.commit()
         self.now = datetime.now(timezone.utc)
         self._n = 0
 
-    def build(self, status: str) -> str:
+    def build(self, status: str, correlation_id: str | None = None) -> str:
         self._n += 1
         build_id = f"build-FEAT-{self._n}"
         self.cx.execute(
             "INSERT INTO builds (build_id, feature_id, repo, branch, feature_yaml_path, status,"
             " triggered_by, correlation_id, queued_at) VALUES (?,?,?,?,?,?,?,?,?)",
             (build_id, f"FEAT-{self._n}", "guardkit/api_test", "main", "f.yaml", status, "cli",
-             build_id, self.now.isoformat()),
+             correlation_id or build_id, self.now.isoformat()),
         )
         self.cx.commit()
         return build_id
 
-    def plan(self, state: str) -> None:
+    def plan(self, state: str, correlation_id: str | None = None, cx: sqlite3.Connection | None = None) -> None:
         self._n += 1
-        self.cx.execute(
+        cx = cx or self.cx
+        cx.execute(
             "INSERT INTO planning_runs (correlation_id, state, originating_user, expected_approver,"
             " request_text, triggered_by, queued_at) VALUES (?,?,?,?,?,?,?)",
-            (f"plan-{self._n}", state, "U1", "U1", "a sentence", "jarvis", self.now.isoformat()),
+            (correlation_id or f"plan-{self._n}", state, "U1", "U1", "a sentence", "jarvis",
+             self.now.isoformat()),
         )
-        self.cx.commit()
+        cx.commit()
 
-    def queue(self, *, after: int | None = None) -> int:
+    def queue(self, *, after: int | None = None, status: str = "QUEUED", correlation_id: str | None = None) -> int:
         self._n += 1
         cursor = self.cx.execute(
             "INSERT INTO work_queue (sentence, kind, status, rank, after_id, originating_user,"
             " correlation_id, queued_at) VALUES (?,?,?,?,?,?,?,?)",
-            ("a sentence", "feature", "QUEUED", float(self._n), after, "U1", f"q-{self._n}",
-             self.now.isoformat()),
+            ("a sentence", "feature", status, float(self._n), after, "U1",
+             correlation_id or f"q-{self._n}", self.now.isoformat()),
         )
         self.cx.commit()
         return int(cursor.lastrowid)
@@ -865,7 +870,8 @@ def test_the_read_script_counts_a_real_ledger_and_says_an_unreachable_bus_is_unr
 
     assert facts["ledger"] == {
         "builds": {"RUNNING": 1}, "interrupted": 0, "planning_runs": {"FEATURE_SPEC": 1},
-        "queue_waiting": 1, "queue_held": 1, "merges_live": 1, "merges_resting": 0,
+        "queue_waiting": 1, "queue_held": 1,
+        "merges_live": 1, "merges_resting": 0,
         "deploy_locks_live": 1, "deploy_locks_expired": 0,
     }
     assert set(facts["consumers"]) == {"forge-serve", "forge-serve-planning"}
@@ -959,6 +965,118 @@ def test_a_live_deploy_lock_is_not_drained(tmp_path):
     ledger.deploy_lock(days_ago=0)
     reasons, _ = ledger.judged()
     assert reasons == ["1 deploy is in progress (a deployment target's lock is held and has not expired)"]
+
+
+# ---------------------------------------------------------------------------
+# The order of the observations: consumers first, then ONE ledger snapshot
+# ---------------------------------------------------------------------------
+
+
+def _script() -> dict[str, Any]:
+    """The read script's own functions, loaded without running it."""
+    namespace: dict[str, Any] = {"__name__": "drained_read_under_test"}
+    exec(register_repo.DRAINED_READ_SCRIPT, namespace)  # noqa: S102 — our own constant
+    return namespace
+
+
+def test_the_consumers_are_read_before_the_ledger(tmp_path):
+    ledger = Ledger(tmp_path / "forge.db")
+    order: list[str] = []
+
+    def consumers(url, spec, said):
+        order.append("consumers")
+        return QUIET_CONSUMERS
+
+    def connect():
+        order.append("ledger")
+        return sqlite3.connect(ledger.path)
+
+    _script()["observe"](register_repo.drained_read_spec(), {}, consumers=consumers, connect=connect)
+    assert order == ["consumers", "ledger"]
+
+
+def test_a_request_processed_during_the_consumer_read_is_in_the_ledger_read_after_it(tmp_path):
+    """consumer -> queue during the check: NOT DRAINED.
+
+    The request is acked (consumers read zero) only after its queue row is
+    written, and the ledger is read after the consumers, so the row is seen.
+    (A request still being handled shows as unacknowledged instead; one that
+    arrives after the consumer read is impossible by construction, because
+    intake was closed in step (a).)"""
+    ledger = Ledger(tmp_path / "forge.db")
+
+    def consumers(url, spec, said):
+        ledger.queue()  # the consumer writes the row, then acks
+        return QUIET_CONSUMERS
+
+    facts = _script()["observe"](
+        register_repo.drained_read_spec(), {}, consumers=consumers,
+        connect=lambda: sqlite3.connect(ledger.path),
+    )
+    assert register_repo.judge_drained(facts, CONSUMERS) == [
+        "1 item waits in the work queue, which the coordinator's automatic queue would admit within seconds"
+    ]
+
+
+class _NoTransaction:
+    """A connection that ignores BEGIN and COMMIT: each query its own moment."""
+
+    def __init__(self, cx: sqlite3.Connection) -> None:
+        self._cx = cx
+        self.isolation_level = None
+
+    def execute(self, sql, params=()):
+        if sql in ("BEGIN", "COMMIT"):
+            return None
+        return self._cx.execute(sql, params)
+
+    def close(self):
+        self._cx.close()
+
+
+def _admit_into_a_planning_run(ledger: Ledger, correlation_id: str):
+    def between(name):
+        if name == "planning_runs":
+            writer = sqlite3.connect(ledger.path)
+            writer.execute("UPDATE work_queue SET status = 'ADMITTED' WHERE correlation_id = ?", (correlation_id,))
+            ledger.plan("RUNNING", correlation_id=correlation_id, cx=writer)
+            writer.close()
+    return between
+
+
+def test_queue_to_planning_during_the_ledger_read_is_seen_by_the_one_snapshot(tmp_path):
+    """queue -> planning during the check: NOT DRAINED.
+
+    Between the planning-run query and the queue query, the coordinator admits
+    the queued row and starts its run. One snapshot sees the row still QUEUED;
+    the run is counted after the move in any later check."""
+    ledger = Ledger(tmp_path / "forge.db")
+    ledger.queue(correlation_id="moving")
+    spec = register_repo.drained_read_spec()
+    script = _script()
+
+    seen = script["read_ledger"](
+        sqlite3.connect(f"file:{ledger.path}?mode=ro", uri=True), spec,
+        between=_admit_into_a_planning_run(ledger, "moving"),
+    )
+    reasons = register_repo.judge_drained({"ledger": seen, "consumers": QUIET_CONSUMERS}, CONSUMERS)
+    assert reasons and "waits in the work queue" in reasons[0]
+    # The move really happened, and a fresh read after it counts the run.
+    after = script["read_ledger"](sqlite3.connect(ledger.path), spec)
+    assert after["planning_runs"] == {"RUNNING": 1}
+
+
+def test_without_one_snapshot_the_same_move_would_be_missed(tmp_path):
+    """The control: each query at its own moment reads the run as not there
+    yet and the row as admitted-with-its-run-written, and calls it drained.
+    This is the gap the single read transaction closes."""
+    ledger = Ledger(tmp_path / "forge.db")
+    ledger.queue(correlation_id="moving")
+    seen = _script()["read_ledger"](
+        _NoTransaction(sqlite3.connect(ledger.path)), register_repo.drained_read_spec(),
+        between=_admit_into_a_planning_run(ledger, "moving"),
+    )
+    assert register_repo.judge_drained({"ledger": seen, "consumers": QUIET_CONSUMERS}, CONSUMERS) == []
 
 
 def test_a_held_queue_item_says_wait_for_its_antecedent_or_withdraw_it(estate):

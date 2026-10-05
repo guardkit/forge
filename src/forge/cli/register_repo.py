@@ -1204,94 +1204,50 @@ def make_sandbox_clone(sandbox: SandboxStore, *, clone: str, leaf: str, url: str
 #: the coordinator holds the ledger and the bus connection, so it is asked.
 #: Plain Python on purpose — the coordinator's image may be older than this
 #: checkout, so nothing of this module may be imported there. It reads only:
-#: the ledger opened read-only — active builds, unfinished planning runs,
-#: queued work, and merge and deploy work that is LIVE (a publication record's
-#: lease or a deployment target's lock held and not yet expired) — and
 #: ``consumer_info`` on the two durable consumers (the same read the
-#: coordinator's own consumer-health check makes).
-#: The bus address carries a credential, so it is scrubbed out of anything said.
+#: coordinator's own consumer-health check makes), and then the ledger, opened
+#: read-only. The bus address carries a credential, so it is scrubbed out of
+#: anything said.
+#:
+#: THE ORDER OF THE TWO OBSERVATIONS IS THE PROOF, and it is fixed here:
+#:
+#: 1. Intake is already closed (step a), so no new request can reach either
+#:    consumer while this runs.
+#: 2. The consumers are read FIRST. A request delivered and not yet finished
+#:    shows as unacknowledged; one still waiting shows as pending. Both
+#:    consumers ack only after their work is in the ledger (the planning
+#:    consumer acks after the run or queue row is written; the build consumer
+#:    acks on terminal completion), so a request acked before this read is
+#:    already in the ledger.
+#: 3. The ledger is then read as ONE snapshot — a single read transaction
+#:    (BEGIN, every query, COMMIT) — so work moving between tables during the
+#:    read (a queue row admitted into a planning run, a run handing over a
+#:    build) is seen wholly before or wholly after the move, and every state
+#:    on both sides of each move is counted.
+#:
+#: Reading the ledger first would leave a gap: a request processed and acked
+#: between the two reads would be in neither. ``__name__`` guards the run, so
+#: the tests can load these functions and move work between the observations.
 DRAINED_READ_SCRIPT: str = r'''
 import asyncio, json, os, sqlite3, sys
 from datetime import datetime, timezone
 from urllib.parse import urlsplit
-spec = json.loads(sys.argv[1])
-url = os.environ.get("FORGE_NATS_URL", "")
-secrets = [s for s in (url, urlsplit(url).password if url else None) if s]
-def said(exc):
-    text = f"{type(exc).__name__}: {exc}".splitlines()[0][:300]
-    for s in secrets:
-        text = text.replace(s, "***")
-    return text
-out = {}
-db = os.environ.get("FORGE_DB_PATH") or spec["db"]
-try:
-    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=10)
-    try:
-        def counts(sql, done):
-            marks = ",".join("?" for _ in done)
-            return {str(k): int(v) for k, v in con.execute(sql % marks, list(done)).fetchall()}
-        def one(sql, *params):
-            return int(con.execute(sql, params).fetchone()[0])
-        builds = {
-            str(k): int(v)
-            for k, v in con.execute(
-                "SELECT status, COUNT(*) FROM builds WHERE status IN (%s) GROUP BY status"
-                % ",".join("?" for _ in spec["build_active"]),
-                list(spec["build_active"]),
-            ).fetchall()
-        }
-        interrupted = one("SELECT COUNT(*) FROM builds WHERE status = 'INTERRUPTED'")
-        plans = counts("SELECT state, COUNT(*) FROM planning_runs WHERE state NOT IN (%s) GROUP BY state", spec["planning_terminal"])
-        free = one("SELECT COUNT(*) FROM work_queue WHERE status = 'QUEUED' AND after_id IS NULL")
-        held = one("SELECT COUNT(*) FROM work_queue WHERE status = 'QUEUED' AND after_id IS NOT NULL")
-        # LIVE work only, the way the coordinator itself decides it: a record or
-        # a target is held when it names a holder AND its expiry is later than
-        # now (PublicationRecord.lease_is_live, DeploymentTarget.held_now). A
-        # resting result — a refused merge, publication off, a press or a
-        # deploy that stopped — is history nothing clears; it is counted for
-        # information, never waited on.
-        now = datetime.now(timezone.utc)
-        def live(holder, expires):
-            if not holder or not expires:
-                return False
-            try:
-                expiry = datetime.fromisoformat(str(expires))
-            except ValueError:
-                return False
-            if expiry.tzinfo is None:
-                expiry = expiry.replace(tzinfo=timezone.utc)
-            return expiry > now
-        merges_live = merges_resting = 0
-        for holder, expires, result in con.execute(
-            "SELECT lease_holder, lease_expires_at, result FROM publication_records"
-        ).fetchall():
-            if live(holder, expires):
-                merges_live += 1
-            elif result != spec["publication_finished"]:
-                merges_resting += 1
-        locks_live = locks_expired = 0
-        for holder, expires in con.execute(
-            "SELECT holder_build, expires_at FROM deployment_targets"
-        ).fetchall():
-            if live(holder, expires):
-                locks_live += 1
-            elif holder:
-                locks_expired += 1
-    finally:
-        con.close()
-    out["ledger"] = {
-        "builds": builds, "interrupted": interrupted, "planning_runs": plans,
-        "queue_waiting": free, "queue_held": held,
-        "merges_live": merges_live, "merges_resting": merges_resting,
-        "deploy_locks_live": locks_live, "deploy_locks_expired": locks_expired,
-    }
-except Exception as exc:
-    out["ledger"] = {"error": said(exc)}
+
+def scrubber(url):
+    secrets = [s for s in (url, urlsplit(url).password if url else None) if s]
+    def said(exc):
+        text = f"{type(exc).__name__}: {exc}".splitlines()[0][:300]
+        for s in secrets:
+            text = text.replace(s, "***")
+        return text
+    return said
+
 # nats-py retries a first connection for ever, printing each failure, unless
 # told to stop after one attempt and given a quiet error callback.
 async def quiet(exc):
     pass
-async def read_consumers():
+
+async def _consumers(url, spec, said):
     import nats
     nc = await nats.connect(
         url, connect_timeout=5, allow_reconnect=False, max_reconnect_attempts=1,
@@ -1309,13 +1265,95 @@ async def read_consumers():
         return got
     finally:
         await nc.close()
-try:
-    if not url:
-        raise RuntimeError("the coordinator has no FORGE_NATS_URL")
-    out["consumers"] = asyncio.run(asyncio.wait_for(read_consumers(), 30))
-except BaseException as exc:
-    out["consumers"] = {name: {"error": said(exc)} for name in spec["consumers"]}
-print(json.dumps(out))
+
+def read_consumers(url, spec, said):
+    try:
+        if not url:
+            raise RuntimeError("the coordinator has no FORGE_NATS_URL")
+        return asyncio.run(asyncio.wait_for(_consumers(url, spec, said), 30))
+    except BaseException as exc:
+        return {name: {"error": said(exc)} for name in spec["consumers"]}
+
+def read_ledger(con, spec, between=None):
+    # One read transaction: every query below sees the same moment.
+    # ``between(name)`` is for the tests only: it runs after each query.
+    step = between or (lambda name: None)
+    con.isolation_level = None
+    con.execute("BEGIN")
+    try:
+        def rows(sql, params=()):
+            return con.execute(sql, params).fetchall()
+        def one(sql, params=()):
+            return int(rows(sql, params)[0][0])
+        marks = lambda values: ",".join("?" for _ in values)
+        builds = {str(k): int(v) for k, v in rows(
+            "SELECT status, COUNT(*) FROM builds WHERE status IN (%s) GROUP BY status"
+            % marks(spec["build_active"]), list(spec["build_active"]))}
+        interrupted = one("SELECT COUNT(*) FROM builds WHERE status = 'INTERRUPTED'")
+        step("builds")
+        plans = {str(k): int(v) for k, v in rows(
+            "SELECT state, COUNT(*) FROM planning_runs WHERE state NOT IN (%s) GROUP BY state"
+            % marks(spec["planning_terminal"]), list(spec["planning_terminal"]))}
+        step("planning_runs")
+        free = one("SELECT COUNT(*) FROM work_queue WHERE status = 'QUEUED' AND after_id IS NULL")
+        held = one("SELECT COUNT(*) FROM work_queue WHERE status = 'QUEUED' AND after_id IS NOT NULL")
+        step("work_queue")
+        # LIVE merge and deploy work only, the way the coordinator itself
+        # decides it: held when it names a holder AND its expiry is later than
+        # now (PublicationRecord.lease_is_live, DeploymentTarget.held_now). A
+        # resting result is history nothing clears; it is counted for
+        # information, never waited on.
+        now = datetime.now(timezone.utc)
+        def live(holder, expires):
+            if not holder or not expires:
+                return False
+            try:
+                expiry = datetime.fromisoformat(str(expires))
+            except ValueError:
+                return False
+            if expiry.tzinfo is None:
+                expiry = expiry.replace(tzinfo=timezone.utc)
+            return expiry > now
+        merges_live = merges_resting = 0
+        for holder, expires, result in rows(
+                "SELECT lease_holder, lease_expires_at, result FROM publication_records"):
+            if live(holder, expires):
+                merges_live += 1
+            elif result != spec["publication_finished"]:
+                merges_resting += 1
+        locks_live = locks_expired = 0
+        for holder, expires in rows("SELECT holder_build, expires_at FROM deployment_targets"):
+            if live(holder, expires):
+                locks_live += 1
+            elif holder:
+                locks_expired += 1
+        step("publication_records")
+    finally:
+        con.execute("COMMIT")
+    return {
+        "builds": builds, "interrupted": interrupted, "planning_runs": plans,
+        "queue_waiting": free, "queue_held": held,
+        "merges_live": merges_live, "merges_resting": merges_resting,
+        "deploy_locks_live": locks_live, "deploy_locks_expired": locks_expired,
+    }
+
+def observe(spec, environ, consumers=read_consumers, connect=None, between=None):
+    url = environ.get("FORGE_NATS_URL", "")
+    said = scrubber(url)
+    out = {"consumers": consumers(url, spec, said)}
+    db = environ.get("FORGE_DB_PATH") or spec["db"]
+    try:
+        con = connect() if connect else sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=10)
+        try:
+            out["ledger"] = read_ledger(con, spec, between)
+        finally:
+            con.close()
+    except Exception as exc:
+        out["ledger"] = {"error": said(exc)}
+    return out
+
+if __name__ == "__main__":
+    print(json.dumps(observe(json.loads(sys.argv[1]), os.environ)))
 '''
 
 
