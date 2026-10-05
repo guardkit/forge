@@ -44,8 +44,8 @@ file — the project's own ``.guardkit/config.yaml`` — out of one commit.
 
 from __future__ import annotations
 
-import posixpath
 import re
+from pathlib import PurePosixPath
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -585,7 +585,8 @@ PLAYER_ALLOWED_KEYS: frozenset[str] = frozenset(
 
 @dataclass(frozen=True)
 class DeclaredPath:
-    """One declared path: as the project spelled it, and normalised to read."""
+    """One declared path: as the project spelled it, and as GuardKit reads it
+    (``PurePosixPath(spelling).as_posix()``: ``.`` collapsed, ``..`` kept)."""
 
     spelling: str
     path: str
@@ -650,15 +651,18 @@ def read_declared_project_documents(
                     f"`{field}[{index}]` in {DECLARATION_PATH} is not a "
                     f"repository path"
                 )
-            normal = posixpath.normpath(value)
-            if value.startswith("/") or (
-                key in ("instructions", "required_documents")
-                and (normal in (".", "..") or normal.startswith("../"))
-            ):
+            # GuardKit's own check (``Path(value).is_absolute()``) and its own
+            # spelling (``PurePosixPath(value).as_posix()``): ``.`` and empty
+            # components collapse, ``..`` is KEPT, because a path is resolved
+            # component by component inside the commit and ``..`` after a
+            # linked folder means the link target's parent, as on a
+            # filesystem. Nothing is rewritten beyond that.
+            if PurePosixPath(value).is_absolute():
                 return empty, (
                     f"`{field}[{index}]` in {DECLARATION_PATH} ({value!r}) is "
-                    f"not a path inside the repository"
+                    f"not a repository-relative path"
                 )
+            normal = PurePosixPath(value).as_posix()
             paths.append(DeclaredPath(spelling=value, path=normal))
         lists[key] = tuple(paths)
     return (
