@@ -7071,24 +7071,28 @@ def test_the_card_prints_what_the_model_fallback_said_about_itself(
     ],
 )
 def test_the_card_names_the_unset_stamp_model_rather_than_a_missing_endpoint(
-    detail: str,
+    detail: str, caplog: pytest.LogCaptureFixture
 ) -> None:
     """5 October 2026: a current build system reports ``not_configured`` when
     no stamp model is named, as well as when no endpoint is set. The card says
-    the reason it reported, and never points at the endpoint when that was
-    not the trouble."""
-    card = _Driver._stamp_normalizer_card(
-        CID,
-        "FEAT-1234",
-        _refusal_with_model({"status": "not_configured", "detail": detail}),
-    )
+    which in plain words, never points at the endpoint when that was not the
+    trouble, and never shows the owner a setting name."""
+    with caplog.at_level(logging.INFO, logger="forge.planning.driver"):
+        card = _Driver._stamp_normalizer_card(
+            CID,
+            "FEAT-1234",
+            _refusal_with_model({"status": "not_configured", "detail": detail}),
+        )
+    # The build system's own words are kept, in the log rather than the card.
+    assert any("GUARDKIT_STAMP_MODEL unset" in m for m in _driver_log_lines(caplog))
     titles = "\n".join(f"  - {t}" for t in _UNDECIDABLE_TITLES)
     sentence = (
-        "The model fallback was not asked: stamp model not configured "
-        "(GUARDKIT_STAMP_MODEL unset); no model call made."
+        "The plan's stamp check has no model named, so it did not ask a model; "
+        "the factory's settings need the stamp model set."
     )
     assert f"{titles}\n{sentence}\nThis repo enforces the routing law" in card
     assert "no endpoint is configured" not in card
+    assert "GUARDKIT_" not in card and "unset" not in card
     assert "and there is no fallback home, so nothing was stamped" in card
 
 

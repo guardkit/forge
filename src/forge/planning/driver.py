@@ -1526,6 +1526,15 @@ class _HistoryEvent:
     details: Mapping[str, Any]
 
 
+#: What the plan-stop card says when the build system's stamp check had no
+#: model named (5 October 2026). Plain words for the owner; the build system's
+#: own sentence, which names its setting, stays in the receipt and the log.
+_NO_STAMP_MODEL_SENTENCE = (
+    "The plan's stamp check has no model named, so it did not ask a model; "
+    "the factory's settings need the stamp model set."
+)
+
+
 class PlanningRunDriver:
     """Re-entrant chain driver for one planning run at a time.
 
@@ -7751,14 +7760,20 @@ class PlanningRunDriver:
             return f"The model fallback's answer was rejected: {detail or 'no reason was given'}."
         if status == "not_configured":
             # Two reasons share this status (5 October 2026): no endpoint is
-            # set, or (current guardkit) no stamp model is named. Say the one
-            # the build system reported; the endpoint sentence stays as it was.
-            # From the stderr echo the detail is the whole line, so its own
-            # lead-in and tail are taken off and only the reason is kept.
-            reason = re.sub(r"^.*?no rule could decide:\s*", "", detail)
-            reason = reason.split(". The titles stay refused")[0].strip().rstrip(".")
-            if reason and "endpoint" not in reason.lower():
-                return f"The model fallback was not asked: {reason}."
+            # set, or (current guardkit) no stamp model is named. The card is
+            # read by the owner, so it says which in plain words and never
+            # echoes the build system's setting names; the build system's own
+            # words stay in the receipt's model_outcome and in this log line.
+            lowered = detail.lower()
+            if "endpoint" not in lowered and (
+                "stamp model" in lowered or "guardkit_stamp_model" in lowered
+            ):
+                logger.info(
+                    "planning driver: the stamp check's model fallback was not "
+                    "asked; the build system said: %s",
+                    detail,
+                )
+                return _NO_STAMP_MODEL_SENTENCE
             return "The model fallback was not asked: no endpoint is configured."
         if status == "switched_off":
             # Rule 1a (2026-09-07): the machine itself ran this stamping by
