@@ -1377,7 +1377,8 @@ def test_the_code_shown_is_kept_within_one_size_budget() -> None:
     assert sets[0]["listed_all"] is True and "lines_trimmed" not in sets[0]
     assert all("_covers" not in w for e in entries for w in e.get("evidence") or [])
 
-    # Past every window, candidate lines go: second lines first, from the
+    # Each part keeps its half: the windows go down to 8,000 characters and
+    # no further, then the lines go, second lines first, from the
     # lowest-ranked candidate up, and the entry is no longer listed_all.
     entries = [
         {"words": "/a", "already_in": [], "evidence": [window(8, 1), window(2, 2)]},
@@ -1388,11 +1389,58 @@ def test_the_code_shown_is_kept_within_one_size_budget() -> None:
     ]
     receipt = trim_to_budget(entries, sets)
     assert receipt["chars_after"] <= MAX_EVIDENCE_CHARS
-    assert receipt["windows_trimmed"] == 4
-    assert "evidence" not in entries[0] and "evidence" not in entries[1]
-    assert entries[0]["more_hits"] == 3 and entries[1]["more_hits"] == 2
-    assert [len(c["lines"]) for c in sets[0]["candidates"]] == [2, 1, 1]
-    assert sets[0]["lines_trimmed"] == 2 and sets[0]["listed_all"] is False
+    assert receipt["windows_trimmed"] == 2
+    assert [w["score"] for w in entries[0]["evidence"]] == [8]
+    assert [w["score"] for w in entries[1]["evidence"]] == [5]
+    assert entries[0]["more_hits"] == 2 and entries[1]["more_hits"] == 1
+    assert [len(c["lines"]) for c in sets[0]["candidates"]] == [1, 1, 0]
+    assert sets[0]["lines_trimmed"] == 4 and sets[0]["listed_all"] is False
+
+
+def _worst_windows() -> list[dict]:
+    """Twelve full windows: 16 lines of 200 characters each, 3 per word."""
+    text = "\n".join(f"{n}: " + "w" * 200 for n in range(1, 17))
+    return [
+        {"words": f"/w{k}", "already_in": [], "evidence": [
+            {"path": f"w{k}.py", "first_line": 1, "last_line": 16, "score": 10 - p,
+             "text": text, "_covers": 1}
+            for p in range(3)
+        ]}
+        for k in range(4)
+    ]
+
+
+def test_the_worst_case_sets_never_empty_the_top_windows() -> None:
+    from forge.planning.code_evidence import MAX_EVIDENCE_CHARS, trim_to_budget
+
+    entries = _worst_windows()
+    sets = [
+        {"phrase": f"all the s{k}", "looked_for": "xxxx", "listed": 24, "matched": 24,
+         "listed_all": True,
+         "candidates": [{"path": f"c{n}", "lines": ["1: " + "y" * 200, "2: " + "y" * 200]}
+                        for n in range(24)]}
+        for k in range(2)
+    ]
+    receipt = trim_to_budget(entries, sets)
+    assert receipt["chars_after"] <= MAX_EVIDENCE_CHARS
+    windows_left = sum(len(w["text"]) for e in entries for w in e.get("evidence") or [])
+    assert MAX_EVIDENCE_CHARS // 2 - 3300 < windows_left <= MAX_EVIDENCE_CHARS // 2
+    # The highest-scoring windows are the ones kept (earlier words first on
+    # a tie): the lines' share never takes them.
+    kept = [(e["words"], w["score"]) for e in entries for w in e.get("evidence") or []]
+    assert kept == [("/w0", 10), ("/w1", 10)]
+    assert all(s["listed_all"] is False and s["lines_trimmed"] > 0 for s in sets)
+
+
+def test_windows_alone_may_use_the_whole_budget() -> None:
+    from forge.planning.code_evidence import MAX_EVIDENCE_CHARS, trim_to_budget
+
+    entries = _worst_windows()
+    receipt = trim_to_budget(entries, [])
+    windows_left = sum(len(w["text"]) for e in entries for w in e.get("evidence") or [])
+    assert receipt["chars_after"] == windows_left
+    assert MAX_EVIDENCE_CHARS - 3300 < windows_left <= MAX_EVIDENCE_CHARS
+    assert windows_left > MAX_EVIDENCE_CHARS // 2
 
 
 def test_a_descriptor_within_the_budget_is_not_trimmed(tmp_path: Path) -> None:
