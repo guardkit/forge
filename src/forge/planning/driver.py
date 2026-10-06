@@ -113,6 +113,14 @@ from forge.planning.planner import (
     plan_next_step,
 )
 from forge.planning.assumption_review import review_assumptions
+from forge.planning.code_evidence import (
+    LISTED_ALL_MEANS,
+    MAX_EVIDENCE_WINDOWS,
+    evidence_for_word,
+    quantified_phrases,
+    request_words,
+    set_candidates,
+)
 from forge.planning.example_review import (
     ExampleReview,
     ExampleWords,
@@ -537,8 +545,10 @@ _MAX_PLACES_PER_SPEC_WORD = 5
 #: ordinary word like "numeric" or "boundaries" matches none of them, which is
 #: the point — looking for those returns half the repository and teaches the
 #: plan-writer nothing.
+#: A route path keeps its placeholders (6 October 2026): before, the
+#: request's ``/users/{user_id}`` was cut to ``/users/``.
 _SPEC_WORD_PATTERN = re.compile(
-    r"/[A-Za-z0-9][A-Za-z0-9/_-]{2,}"
+    r"/[A-Za-z0-9{][A-Za-z0-9/_{}-]{2,}"
     r"|[A-Za-z][A-Za-z0-9]*[_-][A-Za-z0-9][A-Za-z0-9_-]*"
     r"|[a-z]+[A-Z][A-Za-z0-9]+"
 )
@@ -555,6 +565,29 @@ _SPEC_WORDS_NOT_WORTH_LOOKING_FOR = frozenset(
         "without", "before", "after",
     }
 )
+
+
+def _how_interesting(place: str) -> tuple[int, str]:
+    """The repository's own code first, then its tests, then its paperwork.
+
+    A writer asking "does this already exist?" is answered by the code that
+    builds it, not by a line in a markdown file that happens to mention it.
+    Since 6 October 2026 this only orders the bare ``already_in`` places and
+    breaks ties between evidence windows of equal score: no file type is
+    ever left out because of it.
+    """
+    head = place.split("/", 1)[0]
+    name = place.split(":", 1)[0]
+    # Data and paperwork answer "where is it written down", never "where is
+    # it built". Last, always.
+    if name.endswith((".json", ".lock", ".yaml", ".yml", ".md", ".txt", ".csv")):
+        return (3, place)
+    if head in {"tests", "test", "spec", "qa"}:
+        return (1, place)
+    if head in {"docs", "doc", "features"}:
+        return (2, place)
+    return (0, place)
+
 
 #: The contract reference the auth door's card and its honest terminal name
 #: verbatim (the clause whose OWN words are "requires human confirmation").
@@ -5704,6 +5737,7 @@ class PlanningRunDriver:
             reader=self._repository_reader_for(repo_path, correlation_id),
             unavailable=descriptor_unavailable,
             partial=descriptor_partial,
+            request_text=self._request_text_of(row),
         )
         if descriptor_unavailable:
             self.__dict__.setdefault("_descriptor_unavailable", {})[correlation_id] = (
@@ -10902,6 +10936,7 @@ class PlanningRunDriver:
         reader: Any = None,
         unavailable: list[str] | None = None,
         partial: list[str] | None = None,
+        request_text: str = "",
     ) -> list[dict[str, Any]] | None:
         """Where this feature's own words already occur in the repository.
 
@@ -10941,6 +10976,27 @@ class PlanningRunDriver:
         places it found and is named in ``partial`` in plain words; it is not
         "the repository could not be read". A helper that stops answering
         part-way keeps every word already looked up.
+
+        THE CODE ITSELF, RANKED BY THE REQUEST (6 October 2026, planning
+        improvements item 1). Five places per word, ordered by kind of file
+        and then by path, never reached the delete route a request asked for:
+        comments and messages that mention the path sort first, and the route
+        is written apart from its prefix. So:
+
+        * the request's own words are looked for first (``request_text``),
+          then the specification's, still at most
+          :data:`_MAX_SPEC_WORDS_LOOKED_FOR`;
+        * a route's last segment is also looked for with its slash
+          (``/{user_id}``), which is how a route reads where its prefix is
+          declared elsewhere;
+        * each hit's file is read once and the window from 3 lines before to
+          12 after the hit is scored by how many of the request's words start
+          a word inside it. Each entry keeps ``words`` and ``already_in``
+          exactly as before and gains ``evidence``: up to 3 windows,
+          ``{"path", "first_line", "last_line", "score", "text"}`` with the
+          lines numbered in ``text``, at most 12 in all. ``more_hits`` counts
+          the hits that were not scored, so a cut list never reads as whole,
+          and ``evidence_not_read`` says why a file was refused.
         """
         reader = reader or LocalCheckoutReader(repo_path)
         try:
@@ -10959,6 +11015,9 @@ class PlanningRunDriver:
             )
             words: list[str] = []
             seen: set[str] = set()
+            # The request's own words first: a spec writer may drop the route
+            # the request named from its final draft (FEAT-F9B3 did).
+            readable = f"{request_text or ''}\n{readable}"
             for raw in _SPEC_WORD_PATTERN.findall(readable):
                 word = raw.strip().strip(".,;:")
                 lowered = word.lower().lstrip("/")
@@ -10975,15 +11034,22 @@ class PlanningRunDriver:
 
             found: list[dict[str, Any]] = []
             stopped: str | None = None
+            scoring_words = request_words(request_text)
+            texts: dict[str, str | None] = {}
+            windows_left = MAX_EVIDENCE_WINDOWS
             for word in words:
                 if stopped:
                     break
                 # The word as the specification wrote it, and the two other
                 # shapes a repository commonly spells the same name in. A route
                 # written /users/count-today is a function named count_today
-                # somewhere, and neither spelling finds the other.
+                # somewhere, and neither spelling finds the other. A route's
+                # last segment with its slash, too (6 October 2026): where a
+                # prefix is declared elsewhere, that is how the route reads.
                 tail = word.lstrip("/").split("/")[-1]
                 spellings = {word, tail, tail.replace("-", "_"), tail.replace("_", "-")}
+                if word.startswith("/") and tail:
+                    spellings.add("/" + tail)
                 places: list[str] = []
                 for spelling in sorted(s for s in spellings if len(s) > 3):
                     try:
@@ -11006,29 +11072,32 @@ class PlanningRunDriver:
                         if path_and_line not in places:
                             places.append(path_and_line)
                 if places:
-                    # The repository's own code first, then its tests, then its
-                    # paperwork. A writer asking "does this already exist?" is
-                    # answered by src/users/router.py, not by a line in a
-                    # markdown file that happens to mention it.
-                    def _how_interesting(place: str) -> tuple[int, str]:
-                        head = place.split("/", 1)[0]
-                        name = place.split(":", 1)[0]
-                        # Data and paperwork answer "where is it written
-                        # down", never "where is it built". Last, always.
-                        if name.endswith(
-                            (".json", ".lock", ".yaml", ".yml", ".md", ".txt", ".csv")
-                        ):
-                            return (3, place)
-                        if head in {"tests", "test", "spec", "qa"}:
-                            return (1, place)
-                        if head in {"docs", "doc", "features"}:
-                            return (2, place)
-                        return (0, place)
-
                     places.sort(key=_how_interesting)
-                    found.append(
-                        {"words": word, "already_in": places[:_MAX_PLACES_PER_SPEC_WORD]}
-                    )
+                    entry: dict[str, Any] = {
+                        "words": word,
+                        "already_in": places[:_MAX_PLACES_PER_SPEC_WORD],
+                    }
+                    try:
+                        windows, more_hits, not_read = evidence_for_word(
+                            reader,
+                            places,
+                            words=scoring_words,
+                            rank=_how_interesting,
+                            texts=texts,
+                            windows_left=windows_left,
+                        )
+                    except RepositoryUnreadable as exc:
+                        # What was found is kept; the windows stop here.
+                        stopped = str(exc)
+                        windows, more_hits, not_read = [], len(places), []
+                    if windows:
+                        entry["evidence"] = windows
+                        windows_left -= len(windows)
+                    if more_hits:
+                        entry["more_hits"] = more_hits
+                    if not_read:
+                        entry["evidence_not_read"] = not_read
+                    found.append(entry)
             if stopped:
                 logger.warning(
                     "target_repo_descriptor: stopped looking for the "
@@ -11065,6 +11134,89 @@ class PlanningRunDriver:
             return None
 
     @staticmethod
+    def _sets_the_request_names(
+        request_text: str,
+        *,
+        reader: Any,
+        unavailable: list[str] | None = None,
+        partial: list[str] | None = None,
+    ) -> list[dict[str, Any]] | None:
+        """The files most likely to hold each set the request names.
+
+        WHY (6 October 2026, planning improvements item 3). A request said
+        "make deleted users disappear from all the count endpoints", and the
+        plan's one count task named two files and missed the analytics
+        files. When a request says "all the X", "every X" or "each X", this
+        lists the files that hold the X word anywhere, so the plan-writer has
+        to sort each one into "a member" or "not a member".
+
+        * Every tracked file holding the word, case ignored, is a candidate.
+          There is no file-type filter and no same-line rule: where the
+          request's other words sit only ranks a file, never excludes it.
+        * Only the factory's own records are left out
+          (:data:`_REPO_INVENTORY_SKIP_PREFIXES` and the planner's own
+          ``qa/pass-bar-*.yaml``).
+        * Ranked by how many of the request's other words a file holds, then
+          by how densely it holds the X word, then by path; at most 120 files
+          are read for that, and the rest follow by path.
+        * At most 24 are listed, each with its two best matching lines.
+          ``listed_all`` is true only when nothing was cut by that limit or by
+          a search cut short. It says nothing about membership.
+
+        ``None`` when the request names no set. A repository that cannot be
+        read still gives the entry, with no candidates, ``listed_all`` false
+        and the reason, because finding the phrase needs no read. Never
+        raises.
+        """
+        try:
+            phrases = quantified_phrases(request_text or "")
+        except Exception:  # noqa: BLE001 — never fail a plan over this
+            return None
+        if not phrases:
+            return None
+        entries: list[dict[str, Any]] = []
+        for phrase, word, phrase_words in phrases:
+            try:
+                entries.append(
+                    set_candidates(
+                        reader,
+                        request_text,
+                        phrase,
+                        word,
+                        phrase_words,
+                        skip_prefixes=_REPO_INVENTORY_SKIP_PREFIXES,
+                        partial=partial,
+                    )
+                )
+                continue
+            except RepositoryUnreadable as exc:
+                reason = str(exc)
+            except Exception as exc:  # noqa: BLE001 — never fail a plan over this
+                reason = f"searching the repository failed ({type(exc).__name__})"
+            logger.warning(
+                "target_repo_descriptor: could not list the files that may hold "
+                "%r in %s (%s); the plan-writer is told so",
+                phrase,
+                getattr(reader, "where", "the repository"),
+                reason,
+            )
+            if unavailable is not None and reason not in unavailable:
+                unavailable.append(reason)
+            entries.append(
+                {
+                    "phrase": phrase,
+                    "looked_for": word,
+                    "candidates": [],
+                    "listed": 0,
+                    "matched": None,
+                    "listed_all": False,
+                    "listed_all_means": LISTED_ALL_MEANS,
+                    "unavailable": reason,
+                }
+            )
+        return entries
+
+    @staticmethod
     def _build_target_repo_descriptor(
         target_repo: str,
         repo_path: str,
@@ -11073,6 +11225,7 @@ class PlanningRunDriver:
         reader: Any = None,
         unavailable: list[str] | None = None,
         partial: list[str] | None = None,
+        request_text: str = "",
     ) -> dict[str, Any]:
         """Build the 008 ``target_repo_descriptor`` honestly from what forge knows.
 
@@ -11192,10 +11345,23 @@ class PlanningRunDriver:
         # when the specification has distinctive words AND the repository
         # already has them; absent, the plan is byte for byte what it is today.
         already_there = PlanningRunDriver._where_the_specs_words_already_appear(
-            repo_path, spec_feature, reader=reader, unavailable=reasons, partial=partial
+            repo_path,
+            spec_feature,
+            reader=reader,
+            unavailable=reasons,
+            partial=partial,
+            request_text=request_text,
         )
         if already_there:
             descriptor["where_the_specs_words_already_appear"] = already_there
+        # "All the X" (6 October 2026, planning improvements item 3): the
+        # files most likely to hold the set's members, for the plan-writer to
+        # sort into members and not. Absent when the request names no set.
+        sets = PlanningRunDriver._sets_the_request_names(
+            request_text, reader=reader, unavailable=reasons, partial=partial
+        )
+        if sets:
+            descriptor["sets_the_request_names"] = sets
         if reasons and unavailable is not None:
             unavailable.extend(reasons)
         return descriptor

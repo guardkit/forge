@@ -630,6 +630,11 @@ def _make_driver(
             # (2026-09-11): what the repository ALREADY contains, so the seat
             # stops planning to build what is already there.
             "repository_inventory",
+            # Where the request's and the specification's words already
+            # appear, with the code round them since 6 October 2026, and the
+            # files that may hold a set the request names ("all the X").
+            "where_the_specs_words_already_appear",
+            "sets_the_request_names",
         }
         counters["last_feature_id"] = feature_id
         counters["last_descriptor"] = target_repo_descriptor

@@ -164,6 +164,15 @@ class RepositoryReader(Protocol):
         """Every ``path:line`` whose text contains ``text`` literally. Raises
         :class:`RepositoryUnreadable` when the repository cannot be read."""
 
+    def lines_mentioning(
+        self, text: str, *, ignore_case: bool = False
+    ) -> list[tuple[str, int, str]]:
+        """``(path, line number, line text cut to 200 characters)`` for each
+        line holding ``text`` literally. An answer that could not be finished
+        carries a ``cut`` sentence, as :meth:`places_mentioning`'s does on a
+        sandbox reader. Raises :class:`RepositoryUnreadable` when the
+        repository cannot be read (planning improvements, 6 October 2026)."""
+
     def read_text(self, path: str) -> str | None:
         """One tracked file's text; ``None`` when that one file cannot be
         served (too large, not text) — and then the reason is kept in the
@@ -252,6 +261,20 @@ class LocalCheckoutReader:
             ":".join(line.split(":", 2)[:2])
             for line in self._grep("-n", "--fixed-strings", "--", text)
         ]
+
+    def lines_mentioning(
+        self, text: str, *, ignore_case: bool = False
+    ) -> list[tuple[str, int, str]]:
+        """Each line holding ``text`` literally, with its text: ``git grep``
+        over the tracked text files (binary files are skipped)."""
+        args = ["-n", "-I", "-F", "-z"] + (["-i"] if ignore_case else []) + ["-e", text]
+        found: list[tuple[str, int, str]] = []
+        for raw in self._grep(*args):
+            parts = raw.split("\0", 2)
+            if len(parts) != 3 or not parts[1].isdigit():
+                continue
+            found.append((parts[0], int(parts[1]), parts[2][:_LINE_TEXT_CHARS]))
+        return found
 
     def read_text(self, path: str) -> str | None:
         self._check_root()
@@ -556,6 +579,10 @@ _MODEL_SECTION_CHARS = 2400
 _MIGRATION_SECTION_CHARS = 600
 _NOTE_SECTION_CHARS = 600
 _MAX_READ_BYTES = 262_144
+
+#: How much of one matching line :meth:`RepositoryReader.lines_mentioning`
+#: returns: the same cut the sandbox helper's search makes.
+_LINE_TEXT_CHARS = 200
 _MAX_NOUN_SEARCHES = 2
 
 #: Where a project declares its own data-model and migration paths: the file
