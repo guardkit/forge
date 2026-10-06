@@ -885,3 +885,369 @@ def test_a_tracked_rules_file_the_helper_refuses_is_said(tmp_path: Path) -> None
     assert partial and partial[0].startswith(
         "the architecture rules file `docs/architecture-rules.yaml` could not be read (the helper answered 400:"
     )
+
+
+# ---------------------------------------------------------------------------
+# Planning improvements (6 October 2026): the reader returns matching lines,
+# the planner is shown the code ranked by the request's own words (item 1),
+# and "all the X" lists the files most likely to hold the set (item 3).
+# Neutral scratch repositories only.
+# ---------------------------------------------------------------------------
+
+from forge.planning.code_evidence import (  # noqa: E402
+    LISTED_ALL_MEANS,
+    MAX_SET_CANDIDATES_LISTED,
+    quantified_phrases,
+)
+from forge.planning.sidecar_git_runner import PartialPlaces  # noqa: E402
+
+#: A neutral request in the shape the evidence has to solve: the route's
+#: prefix is declared apart from its path.
+THING_REQUEST = (
+    "Add a REMOVE /things/{thing_id} endpoint that returns 204 on success and "
+    "404 for an unknown id, and make removed things disappear from all the "
+    "tally reports."
+)
+
+#: The route itself, its prefix declared elsewhere, as many frameworks write it.
+THING_ROUTER = (
+    "from web import Router\n"
+    "\n"
+    'router = Router(prefix="/things")\n'
+    "\n"
+    "\n"
+    "@router.remove(\n"
+    '    "/{thing_id}",\n'
+    "    status=204,\n"
+    '    summary="Remove thing",\n'
+    '    description="Removes a thing. Returns 204 on success.",\n'
+    "    answers={404: 'Thing unknown'},\n"
+    ")\n"
+    "def remove_thing(thing_id):\n"
+    "    store.remove(thing_id)\n"
+)
+
+#: A decoy that mentions the full path in a comment and sorts first by path.
+THING_DECOY = "# See /things/{thing_id} in the router.\nVALUE = 1\n"
+
+
+def test_a_local_checkout_returns_each_matching_line_with_its_text(tmp_path: Path) -> None:
+    checkout = _repo(
+        tmp_path / "checkout",
+        {"a/one.txt": "alpha Tally here\nnothing\n", "b/two.py": "x = 'tally'\n"},
+    )
+    reader = LocalCheckoutReader(str(checkout))
+    assert reader.lines_mentioning("tally") == [("b/two.py", 1, "x = 'tally'")]
+    assert reader.lines_mentioning("tally", ignore_case=True) == [
+        ("a/one.txt", 1, "alpha Tally here"),
+        ("b/two.py", 1, "x = 'tally'"),
+    ]
+
+
+def test_a_local_reader_with_no_repository_refuses_lines(tmp_path: Path) -> None:
+    (tmp_path / "plain").mkdir()
+    with pytest.raises(RepositoryUnreadable):
+        LocalCheckoutReader(str(tmp_path / "plain")).lines_mentioning("x")
+
+
+def test_the_helper_returns_each_matching_line_and_says_when_cut(tmp_path: Path) -> None:
+    files = {f"f{n:02d}.py": "".join(f'U = "/things/{n}-{i}"\n' for i in range(10)) for n in range(60)}
+    files["g.py"] = "Tally = 1\n"
+    clone = _repo(tmp_path / "clone", files)
+    with _serving(clone) as url:
+        reader = SidecarCodeReader(url, repo=REPO_KEY)
+        one = reader.lines_mentioning("tally", ignore_case=True)
+        assert list(one) == [("g.py", 1, "Tally = 1")]
+        assert getattr(one, "cut", None) is None
+        many = reader.lines_mentioning("/things")
+        files_answer = reader.files_mentioning("/things")
+    assert len(many) >= 200 and all(len(row) == 3 for row in many)
+    assert many.cut is not None and "were not searched" in many.cut
+    assert files_answer.cut is not None
+
+
+def _descriptor(reader, *, request: str = THING_REQUEST, spec: str = "", **kwargs):
+    reasons: list[str] = []
+    partial: list[str] = []
+    descriptor = PlanningRunDriver._build_target_repo_descriptor(
+        REPO_KEY, COORDINATOR_PATH, spec, reader=reader, unavailable=reasons,
+        partial=partial, request_text=request, **kwargs,
+    )
+    return descriptor, reasons, partial
+
+
+def test_the_request_is_searched_first_and_keeps_its_placeholders(tmp_path: Path) -> None:
+    checkout = _repo(
+        tmp_path / "checkout",
+        {"src/things/router.py": THING_ROUTER, "src/things/report.py": "def tally_report(): ...\n"},
+    )
+    spec = "Feature: x\n  Scenario: y\n    Given the tally_report\n"
+    descriptor, reasons, _ = _descriptor(LocalCheckoutReader(str(checkout)), spec=spec)
+    entries = descriptor["where_the_specs_words_already_appear"]
+    assert [entry["words"] for entry in entries] == ["/things/{thing_id}", "tally_report"]
+    assert reasons == []
+
+
+def test_the_route_is_found_by_its_last_segment_and_shown_as_a_window(tmp_path: Path) -> None:
+    checkout = _repo(tmp_path / "checkout", {"src/things/router.py": THING_ROUTER})
+    descriptor, _, _ = _descriptor(LocalCheckoutReader(str(checkout)))
+    entry = descriptor["where_the_specs_words_already_appear"][0]
+    assert "src/things/router.py:7" in entry["already_in"]
+    window = entry["evidence"][0]
+    # From 3 lines before the hit to 12 after, cut at the end of the file.
+    assert (window["path"], window["first_line"], window["last_line"]) == ("src/things/router.py", 4, 14)
+    assert window["text"].splitlines()[3] == '7:     "/{thing_id}",'
+    assert "204" in window["text"] and "404" in window["text"]
+
+
+def test_a_declaration_with_more_request_words_outranks_a_decoy_comment(tmp_path: Path) -> None:
+    checkout = _repo(
+        tmp_path / "checkout",
+        {"a/notes.py": THING_DECOY, "src/things/router.py": THING_ROUTER},
+    )
+    descriptor, _, _ = _descriptor(LocalCheckoutReader(str(checkout)))
+    entry = descriptor["where_the_specs_words_already_appear"][0]
+    # The bare places keep their old order: the decoy sorts first.
+    assert entry["already_in"][0] == "a/notes.py:1"
+    # The evidence is ranked by the request's words: the route first.
+    windows = entry["evidence"]
+    assert windows[0]["path"] == "src/things/router.py"
+    assert windows[0]["score"] > windows[-1]["score"]
+    assert windows[-1]["path"] == "a/notes.py"
+
+
+def test_the_windows_are_bounded_per_word_and_in_all(tmp_path: Path) -> None:
+    # Twelve files of one hit each: only ten are read, three windows travel.
+    files = {f"src/m{n:02d}.py": f"# /things/{{thing_id}} number {n}\n" for n in range(12)}
+    checkout = _repo(tmp_path / "checkout", files)
+    descriptor, _, _ = _descriptor(LocalCheckoutReader(str(checkout)))
+    entry = descriptor["where_the_specs_words_already_appear"][0]
+    assert len(entry["evidence"]) == 3
+    # 12 files x (the full path and the two shorter spellings on one line)
+    # = 12 places; ten files read, so two hits were never scored.
+    assert entry["more_hits"] == 2
+    assert len(entry["already_in"]) == 5
+
+
+def test_no_more_than_twelve_windows_travel_in_all(tmp_path: Path) -> None:
+    words = [f"/area{n}/{{item_id}}" for n in range(6)]
+    files = {
+        f"src/area{n}.py": "".join(f"# {word} line {i}\n" + "\n" * 20 for i in range(4))
+        for n, word in enumerate(words)
+    }
+    checkout = _repo(tmp_path / "checkout", files)
+    descriptor, _, _ = _descriptor(
+        LocalCheckoutReader(str(checkout)), request="Change " + " and ".join(words)
+    )
+    entries = descriptor["where_the_specs_words_already_appear"]
+    assert sum(len(entry.get("evidence") or []) for entry in entries) == 12
+    assert all(len(entry.get("evidence") or []) <= 3 for entry in entries)
+    assert "evidence" not in entries[-1] and entries[-1]["more_hits"] >= 1
+
+
+def test_a_file_the_reader_refuses_keeps_its_place_and_says_why(tmp_path: Path) -> None:
+    checkout = _repo(tmp_path / "checkout", {"src/things/router.py": THING_ROUTER})
+
+    class Refusing(LocalCheckoutReader):
+        def read_text(self, path: str) -> str | None:
+            self.refused[path] = "it is not text"
+            return None
+
+    descriptor, _, _ = _descriptor(Refusing(str(checkout)))
+    entry = descriptor["where_the_specs_words_already_appear"][0]
+    assert entry["already_in"] == ["src/things/router.py:7"]
+    assert "evidence" not in entry
+    assert entry["more_hits"] == 1
+    assert entry["evidence_not_read"] == ["`src/things/router.py` could not be read (it is not text)"]
+
+
+def test_an_unreadable_repository_leaves_the_evidence_out_and_says_why(tmp_path: Path) -> None:
+    (tmp_path / "plain").mkdir()
+    descriptor, reasons, _ = _descriptor(LocalCheckoutReader(str(tmp_path / "plain")))
+    assert "where_the_specs_words_already_appear" not in descriptor
+    assert any("is not a git repository" in reason for reason in reasons)
+
+
+# -- item 3: "all the X" ----------------------------------------------------
+
+
+def test_the_quantified_phrases_are_found_in_plain_grammar() -> None:
+    assert quantified_phrases("Show one thing.") == []
+    assert quantified_phrases(THING_REQUEST) == [
+        ("all the tally reports", "tally", ["all", "the", "tally", "reports"])
+    ]
+    two = quantified_phrases("Fix every exporter. Then each of its import jobs, and all the rest of it.")
+    # At most two phrases are kept.
+    assert [(phrase, word) for phrase, word, _ in two] == [
+        ("every exporter", "exporter"),
+        ("each of its import jobs", "import"),
+    ]
+    # "all count endpoints" and "all the count endpoints" are the same set.
+    assert quantified_phrases("hide them from all count endpoints")[0][:2] == (
+        "all count endpoints",
+        "count",
+    )
+    # A short first word names no set worth searching for.
+    assert quantified_phrases("all the ids") == []
+
+
+def test_a_phrase_stopped_short_by_a_number_is_not_a_set() -> None:
+    assert quantified_phrases(
+        "returns the number of users created on each of the last 7 days, oldest first."
+    ) == []
+
+
+#: A project implemented in a declarations file: the set's word and the
+#: request's other words sit on separate lines.
+ROUTES_YAML = (
+    "routes:\n"
+    "  - name: tally-by-day\n"
+    "    path: /things/tally-by-day\n"
+    "    removed: excluded\n"
+    "  - name: unknown-things\n"
+    "    path: /things/unknown\n"
+)
+
+
+def test_a_declarations_file_with_the_words_on_separate_lines_ranks_above_a_bare_mention(
+    tmp_path: Path,
+) -> None:
+    checkout = _repo(
+        tmp_path / "checkout",
+        {
+            "config/routes.yaml": ROUTES_YAML,
+            "aaa/bare.txt": "tally\n",
+            "tasks/TASK-1.md": "tally things removed\n",
+            "qa/pass-bar-TASK-1.yaml": "tally things removed\n",
+            ".guardkit/features/F.yaml": "tally\n",
+        },
+    )
+    descriptor, reasons, _ = _descriptor(LocalCheckoutReader(str(checkout)))
+    entry = descriptor["sets_the_request_names"][0]
+    assert reasons == []
+    assert [c["path"] for c in entry["candidates"]] == ["config/routes.yaml", "aaa/bare.txt"]
+    # Best line first: the one holding more of the request's words.
+    assert entry["candidates"][0]["lines"] == ["3: path: /things/tally-by-day", "2: - name: tally-by-day"]
+    assert entry["matched"] == 2 and entry["listed"] == 2 and entry["listed_all"] is True
+
+
+def test_at_most_twenty_four_are_listed_and_then_the_list_is_not_all(tmp_path: Path) -> None:
+    files = {f"src/f{n:02d}.py": f"tally = {n}\n" for n in range(30)}
+    checkout = _repo(tmp_path / "checkout", files)
+    descriptor, _, _ = _descriptor(LocalCheckoutReader(str(checkout)))
+    entry = descriptor["sets_the_request_names"][0]
+    assert entry["matched"] == 30
+    assert entry["listed"] == MAX_SET_CANDIDATES_LISTED == len(entry["candidates"])
+    assert entry["listed_all"] is False
+    assert entry["listed_all_means"] == LISTED_ALL_MEANS
+
+
+class _FakeSetReader:
+    """A reader whose file search answers as told, counting its reads."""
+
+    where = "a stand-in"
+
+    def __init__(self, files: dict[str, str], *, cut: str | None = None, dead: bool = False) -> None:
+        self.files = files
+        self.cut = cut
+        self.dead = dead
+        self.reads = 0
+        self.refused: dict[str, str] = {}
+
+    def list_files(self) -> list[str]:
+        return sorted(self.files)
+
+    def files_mentioning(self, text, *, ignore_case=False, relevant=None):
+        if self.dead:
+            raise RepositoryUnreadable("the stand-in could not be reached")
+        answer = PartialPlaces(p for p, t in sorted(self.files.items()) if text in t.lower())
+        answer.cut = self.cut
+        return answer
+
+    def places_mentioning(self, text):
+        return []
+
+    def read_text(self, path):
+        self.reads += 1
+        return self.files.get(path)
+
+
+def test_a_cut_search_is_never_listed_all() -> None:
+    reader = _FakeSetReader({"a.py": "tally\n"}, cut="the search stopped at the time limit")
+    partial: list[str] = []
+    sets = PlanningRunDriver._sets_the_request_names(THING_REQUEST, reader=reader, partial=partial)
+    assert sets is not None and sets[0]["matched"] == 1 and sets[0]["listed_all"] is False
+    assert partial == [
+        "the files that hold `tally` were only partly searched (the search stopped at the time limit)"
+    ]
+
+
+def test_at_most_a_hundred_and_twenty_files_are_read_for_the_ranking() -> None:
+    files = {f"f{n:03d}.py": "tally\n" for n in range(130)}
+    reader = _FakeSetReader(files)
+    sets = PlanningRunDriver._sets_the_request_names(THING_REQUEST, reader=reader)
+    assert sets is not None
+    assert reader.reads == 120
+    assert sets[0]["not_read"] == 10 and sets[0]["matched"] == 130
+
+
+def test_an_unreadable_repository_still_names_the_set_with_no_candidates() -> None:
+    reasons: list[str] = []
+    sets = PlanningRunDriver._sets_the_request_names(
+        THING_REQUEST, reader=_FakeSetReader({}, dead=True), unavailable=reasons
+    )
+    assert sets == [
+        {
+            "phrase": "all the tally reports",
+            "looked_for": "tally",
+            "candidates": [],
+            "listed": 0,
+            "matched": None,
+            "listed_all": False,
+            "listed_all_means": LISTED_ALL_MEANS,
+            "unavailable": "the stand-in could not be reached",
+        }
+    ]
+    assert reasons == ["the stand-in could not be reached"]
+
+
+def test_a_request_with_no_set_gives_no_key(tmp_path: Path) -> None:
+    checkout = _repo(tmp_path / "checkout", {"src/things/router.py": THING_ROUTER})
+    descriptor, _, _ = _descriptor(
+        LocalCheckoutReader(str(checkout)), request="Add a REMOVE /things/{thing_id} endpoint."
+    )
+    assert "sets_the_request_names" not in descriptor
+
+
+# -- the descriptor key contract (shared with the specialist-agent side) ----
+
+
+def test_the_descriptor_keys_the_plan_writer_and_its_checker_read(tmp_path: Path) -> None:
+    checkout = _repo(
+        tmp_path / "checkout",
+        {"src/things/router.py": THING_ROUTER, "config/routes.yaml": ROUTES_YAML},
+    )
+    descriptor, _, _ = _descriptor(LocalCheckoutReader(str(checkout)))
+    entry = descriptor["where_the_specs_words_already_appear"][0]
+    assert set(entry) <= {"words", "already_in", "evidence", "more_hits", "evidence_not_read"}
+    assert isinstance(entry["words"], str) and isinstance(entry["already_in"], list)
+    for window in entry["evidence"]:
+        assert set(window) == {"path", "first_line", "last_line", "score", "text"}
+        assert isinstance(window["first_line"], int) and isinstance(window["last_line"], int)
+        assert isinstance(window["score"], int)
+        numbered = window["text"].splitlines()
+        assert numbered[0].startswith(f"{window['first_line']}: ")
+        assert numbered[-1].startswith(f"{window['last_line']}: ")
+    (named,) = descriptor["sets_the_request_names"]
+    assert set(named) <= {
+        "phrase", "looked_for", "candidates", "listed", "matched", "listed_all",
+        "listed_all_means", "not_read", "unavailable",
+    }
+    assert {"phrase", "looked_for", "candidates", "listed", "matched", "listed_all"} <= set(named)
+    for candidate in named["candidates"]:
+        assert set(candidate) == {"path", "lines"}
+        assert len(candidate["lines"]) <= 2
+        assert all(line.split(": ", 1)[0].isdigit() for line in candidate["lines"])
+    # Either key is optional: a request without them sends neither.
+    plain, _, _ = _descriptor(LocalCheckoutReader(str(checkout)), request="")
+    assert "sets_the_request_names" not in plain

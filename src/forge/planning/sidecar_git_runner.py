@@ -156,8 +156,9 @@ _MAX_RECOVERY_REQUESTS: int = 24
 
 
 class PartialPlaces(list):  # type: ignore[type-arg]
-    """``path:line`` places, with :attr:`cut` set to a plain sentence when
-    the search could not be completed — what WAS found is kept."""
+    """``path:line`` places (or files, or ``(path, line, text)`` lines), with
+    :attr:`cut` set to a plain sentence when the search could not be
+    completed — what WAS found is kept."""
 
     cut: str | None = None
 
@@ -443,7 +444,30 @@ class SidecarCodeReader:
         recovered — and reported missing — only for those."""
         matches, gaps = self._search(text, ignore_case=ignore_case, relevant=relevant)
         self.cuts.extend(gaps)
-        return list(dict.fromkeys(str(m.get("path")) for m in matches if m.get("path")))
+        # A list, as before; its ``cut`` says when the answer is incomplete,
+        # so a caller that must not read a cut list as whole can tell
+        # (planning improvements, 6 October 2026).
+        files = PartialPlaces(
+            dict.fromkeys(str(m.get("path")) for m in matches if m.get("path"))
+        )
+        if gaps:
+            files.cut = "; ".join(gaps)
+        return files
+
+    def lines_mentioning(
+        self, text: str, *, ignore_case: bool = False
+    ) -> list[tuple[str, int, str]]:
+        """``(path, line, text)`` for each line holding ``text``: the same
+        search as :meth:`places_mentioning`, keeping each line's text (cut to
+        200 characters). Its ``cut`` says what could not be searched."""
+        matches, gaps = self._search(text, ignore_case=ignore_case)
+        lines = PartialPlaces(
+            (str(m.get("path")), int(m.get("line")), str(m.get("text") or "")[:200])
+            for m in matches
+        )
+        if gaps:
+            lines.cut = "; ".join(gaps)
+        return lines
 
     def places_mentioning(self, text: str) -> list[str]:
         matches, gaps = self._search(text, ignore_case=False)
