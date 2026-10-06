@@ -1251,3 +1251,26 @@ def test_the_descriptor_keys_the_plan_writer_and_its_checker_read(tmp_path: Path
     # Either key is optional: a request without them sends neither.
     plain, _, _ = _descriptor(LocalCheckoutReader(str(checkout)), request="")
     assert "sets_the_request_names" not in plain
+
+
+def test_a_reader_that_stops_while_ranking_keeps_what_it_found_and_says_so() -> None:
+    class Stopping(_FakeSetReader):
+        def read_text(self, path):
+            if self.reads >= 2:
+                raise RepositoryUnreadable("the stand-in stopped answering")
+            return super().read_text(path)
+
+    files = {f"f{n}.py": "tally\n" for n in range(4)}
+    partial: list[str] = []
+    sets = PlanningRunDriver._sets_the_request_names(
+        THING_REQUEST, reader=Stopping(files), partial=partial
+    )
+    assert sets is not None
+    entry = sets[0]
+    assert entry["matched"] == 4 and entry["listed"] == 4
+    assert entry["listed_all"] is False and entry["not_read"] == 2
+    assert entry["unavailable"] == "the stand-in stopped answering"
+    assert partial == [
+        "the files that hold `tally` could not all be read for ranking "
+        "(the stand-in stopped answering)"
+    ]

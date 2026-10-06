@@ -292,7 +292,7 @@ def set_candidates(
     # The phrase's own words, singular or plural, rank nothing: every
     # candidate holds the search word, and "endpoint" is the phrase's
     # "endpoints" again.
-    own = {_singular(word) for word in phrase_words}
+    own = {_singular(own_word) for own_word in phrase_words}
     others = [w for w in request_words(request_text) if _singular(w) not in own]
     relevant = lambda path: not _set_skipped(str(path), skip_prefixes)  # noqa: E731
     answer = reader.files_mentioning(word, ignore_case=True, relevant=relevant)
@@ -358,6 +358,10 @@ def set_candidates(
         entry["not_read"] = len(unread)
     if stopped is not None:
         entry["unavailable"] = stopped
+        if partial is not None:
+            partial.append(
+                f"the files that hold `{word}` could not all be read for ranking ({stopped})"
+            )
     return entry
 
 
