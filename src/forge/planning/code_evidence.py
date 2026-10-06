@@ -43,6 +43,7 @@ __all__ = [
     "EVIDENCE_LINES_AFTER",
     "EVIDENCE_LINES_BEFORE",
     "LISTED_ALL_MEANS",
+    "MAX_EVIDENCE_CHARS",
     "MAX_EVIDENCE_FILES_PER_WORD",
     "MAX_EVIDENCE_WINDOWS",
     "MAX_EVIDENCE_WINDOWS_PER_WORD",
@@ -53,6 +54,7 @@ __all__ = [
     "quantified_phrases",
     "request_words",
     "set_candidates",
+    "trim_to_budget",
     "words_starting_in",
 ]
 
@@ -92,8 +94,9 @@ _QUANTIFIED = re.compile(
 )
 
 #: What a phrase stopped short by a number looks like: "each of the last 7
-#: days" stops at "last" only because a word may not start with a digit.
-_STOPPED_BY_A_NUMBER = re.compile(r"\s+\d")
+#: days" stops at "last" only because a word may not start with a digit, and
+#: the noun ("days") comes after the number.
+_NUMBER_THEN_NOUN = re.compile(r"\s+\d+\s+[A-Za-z]")
 
 #: The factory's own records the set search never lists, beside the folders
 #: the driver already leaves out of every repository read: the pass bars the
@@ -104,9 +107,17 @@ _SET_SEARCH_SKIP_PATTERNS = ("qa/pass-bar-*.yaml",)
 LISTED_ALL_MEANS = (
     "listed_all is true only when every file that holds the looked_for word "
     "is in candidates: none was cut by the limit of "
-    f"{MAX_SET_CANDIDATES_LISTED} listed files and no search answer was cut "
-    "short. It says nothing about which files are members of the set."
+    f"{MAX_SET_CANDIDATES_LISTED} listed files, no search answer was cut "
+    "short and no candidate's lines were trimmed for size. It says nothing "
+    "about which files are members of the set."
 )
+
+#: The most characters the evidence windows' text and the set candidates'
+#: lines may take, together, across the whole descriptor. The plan-writer's
+#: prompt (and, with the planner's own switch on, its checker's) carries
+#: them; past this the lowest-scoring windows go first, then candidate
+#: lines from the lowest-ranked candidate up, and what went is counted.
+MAX_EVIDENCE_CHARS = 16_000
 
 
 def _tokens(text: str) -> set[str]:
@@ -160,13 +171,16 @@ def evidence_for_word(
     """The best windows round one word's hits.
 
     ``places`` are every ``path:line`` the word's spellings were found at,
-    the factory's own records already left out. ``rank`` is the driver's
-    kind-of-file order, used only to choose which files to read first and to
-    break ties. ``texts`` is the run's cache of files already read, so a file
-    is read once. Returns ``(windows, more_hits, not_read)``: ``more_hits``
-    counts the hits that were never scored (their file was past the read
-    limit, could not be read, or the window limit was already spent), and
-    ``not_read`` says why each refused file was refused. Raises
+    the factory's own records already left out. The files read are the ones
+    with the most hits, whatever their type; ``rank``, the driver's
+    kind-of-file order, only breaks ties. ``texts`` is the run's cache of
+    files already read, so a file is read once. Returns ``(windows,
+    more_hits, not_read)``: ``more_hits`` counts every hit not inside a
+    window shown (its file was past the read limit or could not be read, the
+    window limit was spent, or its window scored lower than those shown), and
+    ``not_read`` says why each refused file was refused. Each window carries
+    a private ``_covers`` count of the hits it shows, which
+    :func:`trim_to_budget` uses and removes. Raises
     :class:`RepositoryUnreadable` when the repository itself stops answering.
     """
     hits = [hit for hit in (_hit(place) for place in places) if hit is not None]
@@ -174,10 +188,12 @@ def evidence_for_word(
     if windows_left <= 0:
         return [], len(hits), []
     by_rank = sorted(hits, key=lambda hit: (rank(f"{hit[0]}:{hit[1]}"), hit[0], hit[1]))
-    to_read: list[str] = []
-    for path, _ in by_rank:
-        if path not in to_read:
-            to_read.append(path)
+    per_file: dict[str, int] = {}
+    for path, _ in hits:
+        per_file[path] = per_file.get(path, 0) + 1
+    # Which files to read: most hits first, never by file type; the
+    # kind-of-file order only breaks ties.
+    to_read = sorted(per_file, key=lambda path: (-per_file[path], rank(path), path))
     to_read = to_read[:MAX_EVIDENCE_FILES_PER_WORD]
     not_read: list[str] = []
     scored: list[tuple[int, Any, str, int, int, int]] = []
@@ -229,9 +245,21 @@ def evidence_for_word(
                 "text": "\n".join(
                     f"{n}: {lines[n - 1][:_WINDOW_LINE_CHARS]}" for n in range(first, last + 1)
                 ),
+                "_covers": 0,
             }
         )
-    return chosen, unscored, not_read
+    # Every scored hit is shown by the first window holding it, or counted.
+    not_shown = 0
+    for _negative, _rank, path, number, _first, _last in scored:
+        holder = next(
+            (w for w in chosen if w["path"] == path and w["first_line"] <= number <= w["last_line"]),
+            None,
+        )
+        if holder is None:
+            not_shown += 1
+        else:
+            holder["_covers"] += 1
+    return chosen, unscored + not_shown, not_read
 
 
 # ---------------------------------------------------------------------------
@@ -244,12 +272,18 @@ def quantified_phrases(request_text: str) -> list[tuple[str, str, list[str]]]:
 
     The search word is the first word after the quantifier and determiner,
     a plural "s" removed, kept only when it is at least four letters long. A
-    phrase stopped short by a number ("each of the last 7 days") names no set
-    of things in the repository and is left out.
+    phrase cut short before its noun by a number ("each of the last 7 days")
+    names no set of things in the repository and is left out.
     """
     found: list[tuple[str, str, list[str]]] = []
     for match in _QUANTIFIED.finditer(request_text or ""):
-        if _STOPPED_BY_A_NUMBER.match(request_text[match.end() :]):
+        # The noun comes after a number ("the last 7 days"): the phrase was
+        # cut before its noun. A phrase that already ends in a plural noun
+        # ("all active users 30 days after") or is followed by something
+        # other than a number and a word ("2x faster") keeps its set.
+        last_word = match.group(2).split()[-1].lower()
+        ends_in_a_plural = _singular(last_word) != last_word
+        if _NUMBER_THEN_NOUN.match(request_text[match.end() :]) and not ends_in_a_plural:
             continue
         phrase = " ".join(match.group(0).split())
         first = _singular(match.group(2).split()[0])
@@ -335,7 +369,7 @@ def set_candidates(
     ranked.sort(key=lambda row: (-row[0], -row[1], row[2]))
     order = [row[2] for row in ranked] + sorted(unread)
     listed = order[:MAX_SET_CANDIDATES_LISTED]
-    lines_by_path = _matching_lines(reader, word, listed, texts)
+    lines_by_path = _matching_lines(word, listed, texts)
     rows: list[dict[str, Any]] = []
     for path in listed:
         matching = lines_by_path.get(path, [])
@@ -366,21 +400,13 @@ def set_candidates(
 
 
 def _matching_lines(
-    reader: Any, word: str, listed: Sequence[str], texts: Mapping[str, str]
+    word: str, listed: Sequence[str], texts: Mapping[str, str]
 ) -> dict[str, list[tuple[int, str]]]:
-    """Each listed file's lines holding ``word``: from the reader's own line
-    search when it has one, else from the text already read."""
-    wanted = set(listed)
+    """Each listed file's lines holding ``word``, from the text already read
+    for the ranking: no second search, so nothing a search cap cuts can go
+    missing. A listed file that was not read has no lines (and the entry's
+    ``not_read`` counts it)."""
     found: dict[str, list[tuple[int, str]]] = {}
-    search = getattr(reader, "lines_mentioning", None)
-    if callable(search):
-        try:
-            for path, number, text in search(word, ignore_case=True):
-                if path in wanted:
-                    found.setdefault(path, []).append((int(number), str(text)))
-            return found
-        except RepositoryUnreadable:
-            found = {}
     for path in listed:
         text = texts.get(path)
         if text is None:
@@ -389,3 +415,75 @@ def _matching_lines(
             if word in line.lower():
                 found.setdefault(path, []).append((number, line))
     return found
+
+
+# ---------------------------------------------------------------------------
+# One size budget for what items 1 and 3 add to the plan-writer's prompt
+# ---------------------------------------------------------------------------
+
+
+def _evidence_chars(entries: Sequence[dict[str, Any]], sets: Sequence[dict[str, Any]]) -> int:
+    windows = sum(len(w.get("text") or "") for e in entries for w in e.get("evidence") or [])
+    lines = sum(len(line) for e in sets for c in e.get("candidates") or [] for line in c.get("lines") or [])
+    return windows + lines
+
+
+def trim_to_budget(
+    entries: list[dict[str, Any]],
+    sets: list[dict[str, Any]],
+    *,
+    budget: int = MAX_EVIDENCE_CHARS,
+) -> dict[str, int]:
+    """Keep the windows' text and the candidates' lines within ``budget``
+    characters, in place, and say what went.
+
+    The lowest-scoring windows go first (the later word's on a tie); each
+    one's hits are added to its entry's ``more_hits``. Then the candidates'
+    lines go, second lines before first ones, from the lowest-ranked
+    candidate up; each entry counts them in ``lines_trimmed`` and is no
+    longer ``listed_all``. The private ``_covers`` counts are always removed.
+    Returns ``{"chars_before", "chars_after", "windows_trimmed",
+    "lines_trimmed"}``.
+    """
+    before = total = _evidence_chars(entries, sets)
+    windows_trimmed = lines_trimmed = 0
+    ranked = sorted(
+        (
+            (window.get("score", 0), -index, -position, index, window)
+            for index, entry in enumerate(entries)
+            for position, window in enumerate(entry.get("evidence") or [])
+        ),
+        key=lambda row: (row[0], row[1], row[2]),
+    )
+    for _score, _i, _p, index, window in ranked:
+        if total <= budget:
+            break
+        entry = entries[index]
+        entry["evidence"] = [w for w in entry["evidence"] if w is not window]
+        entry["more_hits"] = int(entry.get("more_hits") or 0) + int(window.get("_covers") or 1)
+        if not entry["evidence"]:
+            del entry["evidence"]
+        total -= len(window.get("text") or "")
+        windows_trimmed += 1
+    for keep in (1, 0):
+        for entry in sets:
+            for candidate in reversed(entry.get("candidates") or []):
+                if total <= budget:
+                    break
+                lines = candidate.get("lines") or []
+                if len(lines) > keep:
+                    total -= sum(len(line) for line in lines[keep:])
+                    trimmed = len(lines) - keep
+                    candidate["lines"] = lines[:keep]
+                    entry["lines_trimmed"] = int(entry.get("lines_trimmed") or 0) + trimmed
+                    entry["listed_all"] = False
+                    lines_trimmed += trimmed
+    for entry in entries:
+        for window in entry.get("evidence") or []:
+            window.pop("_covers", None)
+    return {
+        "chars_before": before,
+        "chars_after": total,
+        "windows_trimmed": windows_trimmed,
+        "lines_trimmed": lines_trimmed,
+    }

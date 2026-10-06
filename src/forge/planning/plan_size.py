@@ -10,8 +10,9 @@ the plan's own minutes estimate, and starting it stays his choice.
 Only GuardKit's own plan format is read (``.guardkit/features/*.yaml``:
 ``tasks``, each task's ``estimated_minutes``, ``orchestration.
 parallel_groups``), through the planner's repository reader. No fixed number
-of tasks is anywhere here. At least five earlier plans with two or more tasks
-and an estimate on every task are needed, or no comparison is made. Any read
+of tasks is anywhere here. At least five earlier plans with two or more tasks,
+an estimate on every task and a positive total are needed, or no comparison
+is made. Any read
 or parse failure is no line. Nothing here can stop a plan or a build.
 """
 
@@ -87,10 +88,17 @@ def _about(minutes: float) -> str:
     return f"about {hours} hour" + ("" if hours == 1 else "s")
 
 
+def _comparable(earlier: list[PlanSize]) -> list[PlanSize]:
+    """The earlier plans worth comparing with: two or more tasks, and a
+    positive estimate in all (a plan estimated at nothing would make every
+    plan look big)."""
+    return [p for p in earlier if p.tasks >= 2 and p.minutes is not None and p.minutes > 0]
+
+
 def plan_size_note(this: PlanSize, earlier: list[PlanSize]) -> str | None:
     """The card's one line, or ``None``: only when this plan is half as big
     again as the median of at least five comparable earlier plans."""
-    usable = [p for p in earlier if p.tasks >= 2 and p.minutes is not None]
+    usable = _comparable(earlier)
     if len(usable) < MIN_EARLIER_PLANS:
         return None
     usual_tasks = statistics.median(p.tasks for p in usable)
@@ -98,7 +106,7 @@ def plan_size_note(this: PlanSize, earlier: list[PlanSize]) -> str | None:
     bigger = this.tasks >= _BIGGER_BY * usual_tasks or (
         this.minutes is not None and this.minutes >= _BIGGER_BY * usual_minutes
     )
-    if not bigger:
+    if not bigger or usual_minutes <= 0:
         return None
     if this.minutes is not None:
         now = f"{this.tasks} tasks, {_about(this.minutes)} by the plan's own estimate"
@@ -144,7 +152,7 @@ def read_plan_size_note(
             size = plan_size_of(text) if isinstance(text, str) else None
             if size is not None:
                 earlier.append(size)
-        usable = [p for p in earlier if p.tasks >= 2 and p.minutes is not None]
+        usable = _comparable(earlier)
         receipt["compared_with"] = len(usable)
         if len(usable) < MIN_EARLIER_PLANS:
             receipt["not_compared"] = (

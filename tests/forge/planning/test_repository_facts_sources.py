@@ -1023,9 +1023,9 @@ def test_the_windows_are_bounded_per_word_and_in_all(tmp_path: Path) -> None:
     descriptor, _, _ = _descriptor(LocalCheckoutReader(str(checkout)))
     entry = descriptor["where_the_specs_words_already_appear"][0]
     assert len(entry["evidence"]) == 3
-    # 12 files x (the full path and the two shorter spellings on one line)
-    # = 12 places; ten files read, so two hits were never scored.
-    assert entry["more_hits"] == 2
+    # 12 places: ten files read, so two hits were never scored, and seven
+    # were scored but not shown — every hit not in a window shown counts.
+    assert entry["more_hits"] == 9
     assert len(entry["already_in"]) == 5
 
 
@@ -1191,10 +1191,18 @@ def test_at_most_a_hundred_and_twenty_files_are_read_for_the_ranking() -> None:
     assert sets[0]["not_read"] == 10 and sets[0]["matched"] == 130
 
 
-def test_an_unreadable_repository_still_names_the_set_with_no_candidates() -> None:
+def test_a_set_search_that_cannot_be_finished_is_said_as_partly_read() -> None:
+    """Never the run-wide "could not read the repository": by then the
+    inventory and the evidence were read. Said on the entry, and as read in
+    part."""
     reasons: list[str] = []
+    partial: list[str] = []
     sets = PlanningRunDriver._sets_the_request_names(
-        THING_REQUEST, reader=_FakeSetReader({}, dead=True), unavailable=reasons
+        THING_REQUEST, reader=_FakeSetReader({}, dead=True), unavailable=reasons, partial=partial
+    )
+    finished = (
+        'the search for "all the tally reports" could not be finished: '
+        "the stand-in could not be reached"
     )
     assert sets == [
         {
@@ -1205,10 +1213,11 @@ def test_an_unreadable_repository_still_names_the_set_with_no_candidates() -> No
             "matched": 0,
             "listed_all": False,
             "listed_all_means": LISTED_ALL_MEANS,
-            "unavailable": "the stand-in could not be reached",
+            "unavailable": finished,
         }
     ]
-    assert reasons == ["the stand-in could not be reached"]
+    assert reasons == []
+    assert partial == [finished]
 
 
 def test_a_request_with_no_set_gives_no_key(tmp_path: Path) -> None:
@@ -1241,7 +1250,7 @@ def test_the_descriptor_keys_the_plan_writer_and_its_checker_read(tmp_path: Path
     (named,) = descriptor["sets_the_request_names"]
     assert set(named) <= {
         "phrase", "looked_for", "candidates", "listed", "matched", "listed_all",
-        "listed_all_means", "not_read", "unavailable",
+        "listed_all_means", "not_read", "unavailable", "lines_trimmed",
     }
     assert {"phrase", "looked_for", "candidates", "listed", "matched", "listed_all"} <= set(named)
     assert isinstance(named["listed"], int) and isinstance(named["matched"], int)
@@ -1276,3 +1285,121 @@ def test_a_reader_that_stops_while_ranking_keeps_what_it_found_and_says_so() -> 
         "the files that hold `tally` could not all be read for ranking "
         "(the stand-in stopped answering)"
     ]
+
+
+# -- coach check 1 (6 October 2026) ----------------------------------------
+
+
+def test_candidate_lines_come_from_the_texts_read_even_when_a_line_search_is_cut() -> None:
+    """A line search the helper cuts short can no longer leave a listed
+    candidate without its lines: they come from the text read for ranking."""
+
+    class CutLines(_FakeSetReader):
+        def lines_mentioning(self, text, *, ignore_case=False):
+            answer = PartialPlaces([("f0.py", 1, "tally")])
+            answer.cut = "the helper stopped at 200 matching lines"
+            return answer
+
+    files = {f"f{n}.py": "x = 1\ntally = 2\n" for n in range(5)}
+    sets = PlanningRunDriver._sets_the_request_names(THING_REQUEST, reader=CutLines(files))
+    assert sets is not None
+    entry = sets[0]
+    assert entry["listed_all"] is True
+    assert [c["lines"] for c in entry["candidates"]] == [["2: tally = 2"]] * 5
+
+
+def test_the_files_read_for_windows_are_chosen_by_hits_not_by_file_type(tmp_path: Path) -> None:
+    """Eleven code files mention the route once; a declarations file
+    mentions it three times. It is read and shown, though code sorts first."""
+    files = {f"src/m{n:02d}.py": "# /things/{thing_id}\n" for n in range(11)}
+    files["zz/routes.yaml"] = (
+        "routes:\n  - path: /things/{thing_id}\n    remove: 204 on success\n"
+        + "\n" * 20
+        + "  - path: /things/{thing_id}\n"
+        + "\n" * 20
+        + "  - path: /things/{thing_id}\n"
+    )
+    checkout = _repo(tmp_path / "checkout", files)
+    descriptor, _, _ = _descriptor(LocalCheckoutReader(str(checkout)))
+    entry = descriptor["where_the_specs_words_already_appear"][0]
+    assert entry["evidence"][0]["path"] == "zz/routes.yaml"
+
+
+def test_hits_scored_but_not_shown_are_counted(tmp_path: Path) -> None:
+    body = "".join("# /things/{thing_id}\n" + "\n" * 30 for _ in range(6))
+    checkout = _repo(tmp_path / "checkout", {"src/far.py": body})
+    descriptor, _, _ = _descriptor(LocalCheckoutReader(str(checkout)))
+    entry = descriptor["where_the_specs_words_already_appear"][0]
+    assert len(entry["evidence"]) == 3
+    assert entry["more_hits"] == 3
+    assert all("_covers" not in window for window in entry["evidence"])
+
+
+def test_a_phrase_followed_by_a_number_keeps_its_set_unless_the_number_comes_before_its_noun() -> None:
+    assert quantified_phrases("make all the count endpoints 2x faster")[0][:2] == (
+        "all the count endpoints",
+        "count",
+    )
+    assert quantified_phrases("show all active users 30 days after signup")[0][:2] == (
+        "all active users",
+        "active",
+    )
+    assert quantified_phrases("users created on each of the last 7 days") == []
+
+
+def test_the_code_shown_is_kept_within_one_size_budget() -> None:
+    from forge.planning.code_evidence import MAX_EVIDENCE_CHARS, trim_to_budget
+
+    def window(score: int, covers: int) -> dict:
+        return {"path": "a.py", "first_line": 1, "last_line": 16, "score": score,
+                "text": "x" * 3000, "_covers": covers}
+
+    entries = [
+        {"words": "/a", "already_in": [], "evidence": [window(8, 1), window(2, 2)]},
+        {"words": "/b", "already_in": [], "evidence": [window(5, 1), window(2, 1)], "more_hits": 4},
+    ]
+    sets = [{
+        "phrase": "all the x", "looked_for": "xxxx", "listed": 3, "matched": 3, "listed_all": True,
+        "candidates": [{"path": f"c{n}", "lines": ["1: " + "y" * 1000, "2: " + "y" * 1000]} for n in range(3)],
+    }]
+    receipt = trim_to_budget(entries, sets)
+    assert receipt == {
+        "chars_before": 12000 + 6 * 1003,
+        "chars_after": 9000 + 6 * 1003,
+        "windows_trimmed": 1,
+        "lines_trimmed": 0,
+    }
+    # The lowest-scoring window went first (the later word's, on a tie), and
+    # its hit is counted.
+    assert [w["score"] for w in entries[1]["evidence"]] == [5]
+    assert entries[1]["more_hits"] == 5
+    assert [w["score"] for w in entries[0]["evidence"]] == [8, 2]
+    assert sets[0]["listed_all"] is True and "lines_trimmed" not in sets[0]
+    assert all("_covers" not in w for e in entries for w in e.get("evidence") or [])
+
+    # Past every window, candidate lines go: second lines first, from the
+    # lowest-ranked candidate up, and the entry is no longer listed_all.
+    entries = [
+        {"words": "/a", "already_in": [], "evidence": [window(8, 1), window(2, 2)]},
+        {"words": "/b", "already_in": [], "evidence": [window(5, 1), window(2, 1)]},
+    ]
+    sets[0]["candidates"] = [
+        {"path": f"c{n}", "lines": ["1: " + "y" * 3500, "2: " + "y" * 3500]} for n in range(3)
+    ]
+    receipt = trim_to_budget(entries, sets)
+    assert receipt["chars_after"] <= MAX_EVIDENCE_CHARS
+    assert receipt["windows_trimmed"] == 4
+    assert "evidence" not in entries[0] and "evidence" not in entries[1]
+    assert entries[0]["more_hits"] == 3 and entries[1]["more_hits"] == 2
+    assert [len(c["lines"]) for c in sets[0]["candidates"]] == [2, 1, 1]
+    assert sets[0]["lines_trimmed"] == 2 and sets[0]["listed_all"] is False
+
+
+def test_a_descriptor_within_the_budget_is_not_trimmed(tmp_path: Path) -> None:
+    checkout = _repo(
+        tmp_path / "checkout",
+        {"src/things/router.py": THING_ROUTER, "config/routes.yaml": ROUTES_YAML},
+    )
+    descriptor, _, _ = _descriptor(LocalCheckoutReader(str(checkout)))
+    assert "lines_trimmed" not in descriptor["sets_the_request_names"][0]
+    assert descriptor["sets_the_request_names"][0]["listed_all"] is True
