@@ -12,8 +12,11 @@ and no file type filtered out:
 
 * **evidence windows** (item 1): for each place a word was found, the stretch
   of the file from 3 lines before to 12 lines after it, scored by how many of
-  the request's own words start a word inside it. The best few travel to the
-  planner, numbered, so it can say what is already done and cite the line;
+  the request's own words start a word inside it. The windows travel to the
+  planner, numbered, so it can say what is already done and cite the line.
+  They are chosen across all the words at once: the request's own and rarest
+  words first, one window per file before a second in any file, until the
+  size budget is spent (:func:`choose_windows`);
 * **the set search** (item 3): when the request says "all the X", "every X"
   or "each X", every tracked file that holds the X word anywhere is a
   candidate, ranked by how many of the request's other words it holds and how
@@ -46,11 +49,12 @@ __all__ = [
     "MAX_EVIDENCE_CHARS",
     "MAX_EVIDENCE_FILES_PER_WORD",
     "MAX_EVIDENCE_WINDOWS",
-    "MAX_EVIDENCE_WINDOWS_PER_WORD",
     "MAX_SET_CANDIDATES_LISTED",
     "MAX_SET_FILES_READ",
     "MAX_SET_PHRASES",
-    "evidence_for_word",
+    "candidate_windows",
+    "choose_windows",
+    "is_factory_record",
     "quantified_phrases",
     "request_words",
     "set_candidates",
@@ -61,9 +65,10 @@ __all__ = [
 #: The window around one hit: this many lines before it and after it.
 EVIDENCE_LINES_BEFORE = 3
 EVIDENCE_LINES_AFTER = 12
-#: At most this many windows per word, and in all.
-MAX_EVIDENCE_WINDOWS_PER_WORD = 3
-MAX_EVIDENCE_WINDOWS = 12
+#: At most this many windows in all (6 October 2026: was 3 per word and 12
+#: in all). The size budget, :data:`MAX_EVIDENCE_CHARS`, normally stops them
+#: first; see :func:`choose_windows`.
+MAX_EVIDENCE_WINDOWS = 24
 #: At most this many files are read for one word's windows.
 MAX_EVIDENCE_FILES_PER_WORD = 10
 #: Each line of a window is cut to this many characters.
@@ -98,10 +103,10 @@ _QUANTIFIED = re.compile(
 #: the noun ("days") comes after the number.
 _NUMBER_THEN_NOUN = re.compile(r"\s+\d+\s+[A-Za-z]")
 
-#: The factory's own records the set search never lists, beside the folders
-#: the driver already leaves out of every repository read: the pass bars the
-#: planner itself writes.
-_SET_SEARCH_SKIP_PATTERNS = ("qa/pass-bar-*.yaml",)
+#: The factory's own records that neither the set search nor the evidence
+#: windows ever show, beside the folders the driver already leaves out of
+#: every repository read: the pass bars the planner itself writes.
+_FACTORY_RECORD_PATTERNS = ("qa/pass-bar-*.yaml",)
 
 #: What ``listed_all`` means, in the descriptor's own words.
 LISTED_ALL_MEANS = (
@@ -161,49 +166,49 @@ def _not_read_sentence(reader: Any, path: str) -> str:
     return f"`{path}` could not be read ({why or 'it was not served'})"
 
 
-def evidence_for_word(
+def is_factory_record(path: str) -> bool:
+    """True for the factory's own records that sit in a project's folders
+    (the pass bars the planner writes): never the project's code, so never
+    evidence and never a set candidate."""
+    return any(fnmatch.fnmatchcase(str(path), pattern) for pattern in _FACTORY_RECORD_PATTERNS)
+
+
+def candidate_windows(
     reader: Any,
     places: Sequence[str],
     *,
     words: Sequence[str],
     rank: Callable[[str], Any],
     texts: dict[str, str | None],
-    windows_left: int,
-) -> tuple[list[dict[str, Any]], int, list[str]]:
-    """The best windows round one word's hits.
+) -> tuple[list[dict[str, Any]], list[tuple[str, int]], list[str]]:
+    """Every window round one word's hits, best first.
 
     ``places`` are every ``path:line`` the word's spellings were found at,
     the factory's own records already left out. The files read are the ones
     with the most hits, whatever their type; ``rank``, the driver's
     kind-of-file order, only breaks ties. ``texts`` is the run's cache of
-    files already read, so a file is read once. Returns ``(windows,
-    more_hits, not_read)``: ``more_hits`` counts every hit not inside a
-    window shown (its file was past the read limit or could not be read, the
-    window limit was spent, or its window scored lower than those shown), and
-    ``not_read`` says why each refused file was refused. Each window carries
-    a private ``_covers`` count of the hits it shows, which
-    :func:`trim_to_budget` uses and removes. Raises
+    files already read, so a file is read once. Returns ``(candidates, hits,
+    not_read)``: each candidate is a window ``{"path", "first_line",
+    "last_line", "score", "text"}`` with a private ``_hit`` (the line it was
+    cut round), best score first; ``hits`` is every ``(path, line)`` found,
+    read or not, which :func:`choose_windows` counts against the windows it
+    keeps; ``not_read`` says why each refused file was refused. Raises
     :class:`RepositoryUnreadable` when the repository itself stops answering.
     """
     hits = [hit for hit in (_hit(place) for place in places) if hit is not None]
     hits = list(dict.fromkeys(hits))
-    if windows_left <= 0:
-        return [], len(hits), []
-    by_rank = sorted(hits, key=lambda hit: (rank(f"{hit[0]}:{hit[1]}"), hit[0], hit[1]))
     per_file: dict[str, int] = {}
     for path, _ in hits:
         per_file[path] = per_file.get(path, 0) + 1
     # Which files to read: most hits first, never by file type; the
     # kind-of-file order only breaks ties.
     to_read = sorted(per_file, key=lambda path: (-per_file[path], rank(path), path))
-    to_read = to_read[:MAX_EVIDENCE_FILES_PER_WORD]
+    to_read = set(to_read[:MAX_EVIDENCE_FILES_PER_WORD])
     not_read: list[str] = []
-    scored: list[tuple[int, Any, str, int, int, int]] = []
     lines_of: dict[str, list[str]] = {}
-    unscored = 0
-    for path, number in by_rank:
+    scored: list[tuple[int, Any, str, int, int, int]] = []
+    for path, number in sorted(hits, key=lambda hit: (rank(f"{hit[0]}:{hit[1]}"), hit[0], hit[1])):
         if path not in to_read:
-            unscored += 1
             continue
         if path not in texts:
             texts[path] = reader.read_text(path)
@@ -212,7 +217,6 @@ def evidence_for_word(
             sentence = _not_read_sentence(reader, path)
             if sentence not in not_read:
                 not_read.append(sentence)
-            unscored += 1
             continue
         if path not in lines_of:
             # Numbered as the search numbers them: by "\n" only, and the
@@ -221,47 +225,136 @@ def evidence_for_word(
             lines_of[path] = split[:-1] if split and split[-1] == "" else split
         lines = lines_of[path]
         if number < 1 or number > len(lines):
-            unscored += 1
             continue
         first = max(1, number - EVIDENCE_LINES_BEFORE)
         last = min(len(lines), number + EVIDENCE_LINES_AFTER)
         score = words_starting_in(words, "\n".join(lines[first - 1 : last]))
         scored.append((-score, rank(f"{path}:{number}"), path, number, first, last))
     scored.sort(key=lambda row: (row[0], row[1], row[2], row[3]))
-    chosen: list[dict[str, Any]] = []
-    limit = min(MAX_EVIDENCE_WINDOWS_PER_WORD, windows_left)
-    for negative, _rank, path, number, first, last in scored:
-        if len(chosen) >= limit:
-            break
-        # A hit inside a window already chosen adds nothing the planner has
-        # not been shown.
-        if any(w["path"] == path and w["first_line"] <= number <= w["last_line"] for w in chosen):
-            continue
-        lines = lines_of[path]
-        chosen.append(
-            {
-                "path": path,
-                "first_line": first,
-                "last_line": last,
-                "score": -negative,
-                "text": "\n".join(
-                    f"{n}: {lines[n - 1][:_WINDOW_LINE_CHARS]}" for n in range(first, last + 1)
-                ),
-                "_covers": 0,
-            }
-        )
-    # Every scored hit is shown by the first window holding it, or counted.
-    not_shown = 0
-    for _negative, _rank, path, number, _first, _last in scored:
-        holder = next(
-            (w for w in chosen if w["path"] == path and w["first_line"] <= number <= w["last_line"]),
-            None,
-        )
-        if holder is None:
-            not_shown += 1
-        else:
-            holder["_covers"] += 1
-    return chosen, unscored + not_shown, not_read
+    candidates = [
+        {
+            "path": path,
+            "first_line": first,
+            "last_line": last,
+            "score": -negative,
+            "text": "\n".join(
+                f"{n}: {lines_of[path][n - 1][:_WINDOW_LINE_CHARS]}" for n in range(first, last + 1)
+            ),
+            "_hit": number,
+        }
+        for negative, _rank, path, number, first, last in scored
+    ]
+    return candidates, hits, not_read
+
+
+def _holds(window: Mapping[str, Any], path: str, number: int) -> bool:
+    return window["path"] == path and window["first_line"] <= number <= window["last_line"]
+
+
+def _mostly_shown(window: Mapping[str, Any], shown: Mapping[str, Any]) -> bool:
+    """More than half of ``window``'s lines are already in ``shown``."""
+    if window["path"] != shown["path"]:
+        return False
+    overlap = min(window["last_line"], shown["last_line"]) - max(
+        window["first_line"], shown["first_line"]
+    ) + 1
+    return overlap * 2 > window["last_line"] - window["first_line"] + 1
+
+
+def choose_windows(
+    entries: Sequence[dict[str, Any]],
+    candidates: Sequence[Sequence[dict[str, Any]]],
+    hits: Sequence[Sequence[tuple[str, int]]],
+    *,
+    from_request: Sequence[bool],
+    max_windows: int = MAX_EVIDENCE_WINDOWS,
+    max_chars: int = MAX_EVIDENCE_CHARS,
+) -> None:
+    """Choose the windows the planner is shown, across all the words, in place.
+
+    WHY (6 October 2026, evidence coverage). Up to 6 October each word kept
+    its own 3 best windows. The best-scoring windows are the ones holding the
+    most request words, which are usually the tests (they repeat the
+    request's vocabulary), so three windows in one test file could stand in
+    front of the code the request is about, and a request with one word
+    found sent 3 windows and left most of the size budget unused.
+
+    So, one list for the whole descriptor:
+
+    * words the request itself names go before words only the specification
+      names, and among those the word found in fewest places first: the
+      rarer a word, the more it says about where to look;
+    * round by round, each word in that order takes its best window in a
+      file no window shows yet; only when no word has one left does a word
+      take a second window in a file already shown;
+    * a hit already inside a window shown (any word's) is not shown again,
+      nor a window more than half of whose lines are already shown;
+    * it stops at ``max_windows`` windows or ``max_chars`` characters of
+      window text, whichever comes first, so the windows use what the set
+      candidates leave of the budget.
+
+    Each entry gets ``evidence`` (when any window was chosen for it) and
+    ``more_hits``: every hit of its word not inside a window shown, read or
+    not. Each window carries private ``_covers`` (its own word's hits it
+    shows) and ``_covers_other`` (``{entry index: hits}`` of other words'
+    hits it shows) for :func:`trim_to_budget`, which removes them.
+    """
+    order = sorted(
+        range(len(entries)),
+        key=lambda i: (not from_request[i], len(hits[i]), i),
+    )
+    chosen: list[tuple[int, dict[str, Any]]] = []
+    shown_files: set[str] = set()
+    used = 0
+
+    def take(index: int, new_file_only: bool) -> bool:
+        nonlocal used
+        for window in candidates[index]:
+            path = window["path"]
+            if new_file_only and path in shown_files:
+                continue
+            if any(_holds(w, path, window["_hit"]) for _, w in chosen):
+                continue
+            if any(_mostly_shown(window, w) for _, w in chosen):
+                continue
+            if used + len(window["text"]) > max_chars:
+                continue
+            chosen.append((index, window))
+            shown_files.add(path)
+            used += len(window["text"])
+            return True
+        return False
+
+    for new_file_only in (True, False):
+        progress = True
+        while progress and len(chosen) < max_windows:
+            progress = False
+            for index in order:
+                if len(chosen) >= max_windows:
+                    break
+                if take(index, new_file_only):
+                    progress = True
+    for _index, window in chosen:
+        window["_covers"] = 0
+        window["_covers_other"] = {}
+    for index, entry in enumerate(entries):
+        not_shown = 0
+        for path, number in hits[index]:
+            holder = next(((i, w) for i, w in chosen if _holds(w, path, number)), None)
+            if holder is None:
+                not_shown += 1
+            elif holder[0] == index:
+                holder[1]["_covers"] += 1
+            else:
+                other = holder[1]["_covers_other"]
+                other[index] = other.get(index, 0) + 1
+        mine = [w for i, w in chosen if i == index]
+        for window in mine:
+            window.pop("_hit", None)
+        if mine:
+            entry["evidence"] = mine
+        if not_shown:
+            entry["more_hits"] = not_shown
 
 
 # ---------------------------------------------------------------------------
@@ -306,9 +399,7 @@ def _singular(word: str) -> str:
 
 
 def _set_skipped(path: str, skip_prefixes: Sequence[str]) -> bool:
-    return path.startswith(tuple(skip_prefixes)) or any(
-        fnmatch.fnmatchcase(path, pattern) for pattern in _SET_SEARCH_SKIP_PATTERNS
-    )
+    return path.startswith(tuple(skip_prefixes)) or is_factory_record(path)
 
 
 def set_candidates(
@@ -442,10 +533,12 @@ def trim_to_budget(
     Each part is guaranteed half of ``budget``, and what one part does not
     use goes to the other. Past its share the windows lose their
     lowest-scoring ones first (the later word's on a tie); each one's hits
-    are added to its entry's ``more_hits``. Past theirs the candidates lose
+    are added to its entry's ``more_hits``, and the other words' hits it
+    alone showed to theirs. Past theirs the candidates lose
     lines, second lines before first ones, from the lowest-ranked candidate
     up; each entry counts them in ``lines_trimmed`` and is no longer
-    ``listed_all``. The private ``_covers`` counts are always removed.
+    ``listed_all``. The private ``_covers`` and ``_covers_other`` counts are
+    always removed.
     Returns ``{"chars_before", "chars_after", "windows_trimmed",
     "lines_trimmed"}``.
     """
@@ -471,6 +564,10 @@ def trim_to_budget(
         entry = entries[index]
         entry["evidence"] = [w for w in entry["evidence"] if w is not window]
         entry["more_hits"] = int(entry.get("more_hits") or 0) + int(window.get("_covers") or 1)
+        # Other words' hits it was the one window showing are no longer shown.
+        for other_index, count in (window.get("_covers_other") or {}).items():
+            other = entries[other_index]
+            other["more_hits"] = int(other.get("more_hits") or 0) + int(count)
         if not entry["evidence"]:
             del entry["evidence"]
         total -= len(window.get("text") or "")
@@ -495,6 +592,7 @@ def trim_to_budget(
     for entry in entries:
         for window in entry.get("evidence") or []:
             window.pop("_covers", None)
+            window.pop("_covers_other", None)
     return {
         "chars_before": before,
         "chars_after": windows_after + total,

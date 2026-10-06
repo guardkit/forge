@@ -896,6 +896,8 @@ def test_a_tracked_rules_file_the_helper_refuses_is_said(tmp_path: Path) -> None
 
 from forge.planning.code_evidence import (  # noqa: E402
     LISTED_ALL_MEANS,
+    MAX_EVIDENCE_FILES_PER_WORD,
+    MAX_EVIDENCE_WINDOWS,
     MAX_SET_CANDIDATES_LISTED,
     quantified_phrases,
 )
@@ -1016,21 +1018,26 @@ def test_a_declaration_with_more_request_words_outranks_a_decoy_comment(tmp_path
     assert windows[-1]["path"] == "a/notes.py"
 
 
-def test_the_windows_are_bounded_per_word_and_in_all(tmp_path: Path) -> None:
-    # Twelve files of one hit each: only ten are read, three windows travel.
+def test_the_files_read_for_one_word_are_bounded(tmp_path: Path) -> None:
+    # Twelve files of one hit each: only ten are read, and each of them is
+    # shown (the budget holds them; 6 October 2026, evidence coverage).
     files = {f"src/m{n:02d}.py": f"# /things/{{thing_id}} number {n}\n" for n in range(12)}
     checkout = _repo(tmp_path / "checkout", files)
     descriptor, _, _ = _descriptor(LocalCheckoutReader(str(checkout)))
     entry = descriptor["where_the_specs_words_already_appear"][0]
-    assert len(entry["evidence"]) == 3
-    # 12 places: ten files read, so two hits were never scored, and seven
-    # were scored but not shown — every hit not in a window shown counts.
-    assert entry["more_hits"] == 9
+    assert len(entry["evidence"]) == MAX_EVIDENCE_FILES_PER_WORD == 10
+    assert len({window["path"] for window in entry["evidence"]}) == 10
+    # The two hits in files never read are counted: every hit not in a
+    # window shown counts.
+    assert entry["more_hits"] == 2
     assert len(entry["already_in"]) == 5
 
 
-def test_no_more_than_twelve_windows_travel_in_all(tmp_path: Path) -> None:
-    words = [f"/area{n}/{{item_id}}" for n in range(6)]
+def test_no_more_than_the_window_limit_travels_in_all(tmp_path: Path) -> None:
+    # Seven words of four hits each, every window small: 28 would fit the
+    # size budget, the limit lets 24 travel, shared round by round. (No
+    # placeholder: ``/{item_id}`` would be every word's spelling.)
+    words = [f"/area{n}/items{n}" for n in range(7)]
     files = {
         f"src/area{n}.py": "".join(f"# {word} line {i}\n" + "\n" * 20 for i in range(4))
         for n, word in enumerate(words)
@@ -1040,9 +1047,9 @@ def test_no_more_than_twelve_windows_travel_in_all(tmp_path: Path) -> None:
         LocalCheckoutReader(str(checkout)), request="Change " + " and ".join(words)
     )
     entries = descriptor["where_the_specs_words_already_appear"]
-    assert sum(len(entry.get("evidence") or []) for entry in entries) == 12
-    assert all(len(entry.get("evidence") or []) <= 3 for entry in entries)
-    assert "evidence" not in entries[-1] and entries[-1]["more_hits"] >= 1
+    assert sum(len(entry.get("evidence") or []) for entry in entries) == MAX_EVIDENCE_WINDOWS == 24
+    assert [len(entry["evidence"]) for entry in entries] == [4, 4, 4, 3, 3, 3, 3]
+    assert [entry.get("more_hits") for entry in entries] == [None, None, None, 1, 1, 1, 1]
 
 
 def test_a_file_the_reader_refuses_keeps_its_place_and_says_why(tmp_path: Path) -> None:
@@ -1326,13 +1333,24 @@ def test_the_files_read_for_windows_are_chosen_by_hits_not_by_file_type(tmp_path
 
 
 def test_hits_scored_but_not_shown_are_counted(tmp_path: Path) -> None:
-    body = "".join("# /things/{thing_id}\n" + "\n" * 30 for _ in range(6))
+    # Six hits far apart in one file, each window about 1,000 characters,
+    # and a budget that holds three of them.
+    body = "".join("# /things/{thing_id}\n" + ("x" * 60 + "\n") * 30 for _ in range(6))
     checkout = _repo(tmp_path / "checkout", {"src/far.py": body})
-    descriptor, _, _ = _descriptor(LocalCheckoutReader(str(checkout)))
-    entry = descriptor["where_the_specs_words_already_appear"][0]
+    found = PlanningRunDriver._where_the_specs_words_already_appear(
+        COORDINATOR_PATH, "", reader=LocalCheckoutReader(str(checkout)),
+        request_text=THING_REQUEST, evidence_chars=3200,
+    )
+    entry = found[0]
     assert len(entry["evidence"]) == 3
+    assert sum(len(window["text"]) for window in entry["evidence"]) <= 3200
     assert entry["more_hits"] == 3
-    assert all("_covers" not in window for window in entry["evidence"])
+    # Only the private counts trim_to_budget reads and removes are extra.
+    assert all(
+        {key for key in window if not key.startswith("_")}
+        == {"path", "first_line", "last_line", "score", "text"}
+        for window in entry["evidence"]
+    )
 
 
 def test_a_phrase_followed_by_a_number_keeps_its_set_unless_the_number_comes_before_its_noun() -> None:
@@ -1451,3 +1469,171 @@ def test_a_descriptor_within_the_budget_is_not_trimmed(tmp_path: Path) -> None:
     descriptor, _, _ = _descriptor(LocalCheckoutReader(str(checkout)))
     assert "lines_trimmed" not in descriptor["sets_the_request_names"][0]
     assert descriptor["sets_the_request_names"][0]["listed_all"] is True
+
+
+# -- evidence coverage (6 October 2026): which windows the planner is shown --
+#
+# Replays of real plans found the code a request was about shown only as a
+# path:line pointer: three windows per word went to one test file that
+# repeats the request's words, and most of the size budget went unused.
+
+
+def _window(path: str, first: int, score: int, hit: int | None = None, size: int = 100) -> dict:
+    return {
+        "path": path, "first_line": first, "last_line": first + 15, "score": score,
+        "text": "x" * size, "_hit": hit if hit is not None else first + 3,
+    }
+
+
+def test_one_window_per_file_comes_before_a_second_in_any_file() -> None:
+    from forge.planning.code_evidence import choose_windows
+
+    entries = [{"words": "/widgets/cache"}]
+    candidates = [[
+        _window("tests/test_widgets.py", 10, 9),
+        _window("tests/test_widgets.py", 40, 9),
+        _window("tests/test_widgets.py", 70, 8),
+        _window("lib/widgets/cache.src", 1, 4),
+    ]]
+    hits = [[("tests/test_widgets.py", 13), ("tests/test_widgets.py", 43),
+             ("tests/test_widgets.py", 73), ("lib/widgets/cache.src", 4)]]
+    choose_windows(entries, candidates, hits, from_request=[True], max_windows=2)
+    assert [(w["path"], w["first_line"]) for w in entries[0]["evidence"]] == [
+        ("tests/test_widgets.py", 10),
+        ("lib/widgets/cache.src", 1),
+    ]
+    assert entries[0]["more_hits"] == 2
+
+
+def test_the_requests_rarest_word_is_shown_first_when_the_budget_is_short() -> None:
+    from forge.planning.code_evidence import choose_windows
+
+    entries = [{"words": "common_name"}, {"words": "spec-only"}, {"words": "RareName"}]
+    candidates = [
+        [_window(f"a/common{n}.txt", 1, 9) for n in range(5)],
+        [_window("b/spec.txt", 1, 9)],
+        [_window("c/rare.txt", 1, 2)],
+    ]
+    hits = [
+        [(f"a/common{n}.txt", 4) for n in range(5)] + [(f"a/more{n}.txt", 1) for n in range(40)],
+        [("b/spec.txt", 4)],
+        [("c/rare.txt", 4), ("c/rare.txt", 90)],
+    ]
+    # Room for two windows: the request's rarer word, then its common one;
+    # the word only the specification names (one hit) waits.
+    choose_windows(entries, candidates, hits, from_request=[True, False, True],
+                   max_windows=24, max_chars=200)
+    assert [e.get("evidence", [{}])[0].get("path") for e in entries] == [
+        "a/common0.txt", None, "c/rare.txt",
+    ]
+    assert entries[1]["more_hits"] == 1 and entries[2]["more_hits"] == 1
+
+
+def test_a_hit_already_shown_by_another_words_window_is_not_shown_twice() -> None:
+    from forge.planning.code_evidence import choose_windows, trim_to_budget
+
+    entries = [{"words": "first-word"}, {"words": "second_word"}]
+    candidates = [
+        [_window("src/a.src", 1, 5, hit=4)],
+        [_window("src/a.src", 3, 8, hit=6), _window("src/b.src", 1, 7, hit=2)],
+    ]
+    hits = [[("src/a.src", 4)], [("src/a.src", 6), ("src/b.src", 2)]]
+    choose_windows(entries, candidates, hits, from_request=[True, True])
+    # The second word's hit at line 6 is inside the first word's window.
+    assert [(w["path"], w["first_line"]) for w in entries[0]["evidence"]] == [("src/a.src", 1)]
+    assert [(w["path"], w["first_line"]) for w in entries[1]["evidence"]] == [("src/b.src", 1)]
+    assert "more_hits" not in entries[0] and "more_hits" not in entries[1]
+    # Trimmed (the lower score goes first), that window's hits go back to
+    # both words' counts.
+    trim_to_budget(entries, [], budget=150)
+    assert "evidence" not in entries[0] and entries[0]["more_hits"] == 1
+    assert entries[1]["more_hits"] == 1
+    assert all(not any(k.startswith("_") for k in w) for e in entries for w in e.get("evidence") or [])
+
+
+def test_a_window_mostly_inside_one_shown_is_skipped() -> None:
+    from forge.planning.code_evidence import choose_windows
+
+    entries = [{"words": "some-name"}]
+    candidates = [[_window("src/a.src", 20, 9, hit=23), _window("src/a.src", 16, 8, hit=19),
+                   _window("src/a.src", 30, 7, hit=33)]]
+    hits = [[("src/a.src", 23), ("src/a.src", 19), ("src/a.src", 33)]]
+    choose_windows(entries, candidates, hits, from_request=[True])
+    # 16-31 shares 12 of its 16 lines with 20-35, which already holds 33.
+    assert [w["first_line"] for w in entries[0]["evidence"]] == [20]
+    assert entries[0]["more_hits"] == 1
+
+
+#: A neutral repository where the tests repeat the request's words and the
+#: code that already does the work is one file among several.
+WIDGET_REQUEST = "Add WTag support to the GET /widgets list the same way GET /widgets/{widget_id} has it."
+WIDGET_TESTS = "".join(
+    f"def test_wtag_{n}(client):\n    r = client.get('/widgets')  # WTag support widgets list same way\n"
+    + "    assert r.status == 200\n" * 20
+    for n in range(8)
+)
+WIDGET_CODE = (
+    "class WTagLayer:\n"
+    "    def answer(self, body):\n"
+    "        tag = digest(body)\n"
+    "        return tag\n"
+)
+
+
+def test_a_mixed_case_name_in_the_request_is_looked_for(tmp_path: Path) -> None:
+    checkout = _repo(
+        tmp_path / "checkout",
+        {"tests/test_wtag.py": WIDGET_TESTS, "lib/wtag_layer.src": WIDGET_CODE,
+         "app/main.src": "app.use(WTagLayer)\n"},
+    )
+    descriptor, _, _ = _descriptor(LocalCheckoutReader(str(checkout)), request=WIDGET_REQUEST)
+    entries = descriptor["where_the_specs_words_already_appear"]
+    assert "WTag" in [entry["words"] for entry in entries]
+    shown = {w["path"] for e in entries for w in e.get("evidence") or []}
+    # Eight test windows score higher, yet the code and its use are shown.
+    assert {"lib/wtag_layer.src", "app/main.src", "tests/test_wtag.py"} <= shown
+
+
+def test_the_windows_use_what_the_set_candidates_leave(tmp_path: Path) -> None:
+    from forge.planning.code_evidence import MAX_EVIDENCE_CHARS
+
+    body = "".join("# /things/{thing_id}\n" + ("y" * 30 + "\n") * 20 for _ in range(30))
+    checkout = _repo(tmp_path / "checkout", {"src/many.py": body})
+    descriptor, _, _ = _descriptor(
+        LocalCheckoutReader(str(checkout)), request="Add a REMOVE /things/{thing_id} endpoint."
+    )
+    windows = [w for e in descriptor["where_the_specs_words_already_appear"] for w in e["evidence"]]
+    used = sum(len(w["text"]) for w in windows)
+    # No set: more than half the budget, never more than all of it, and
+    # more than the twelve windows of before.
+    assert MAX_EVIDENCE_CHARS // 2 < used <= MAX_EVIDENCE_CHARS
+    assert len(windows) > 12
+    assert all(set(w) == {"path", "first_line", "last_line", "score", "text"} for w in windows)
+
+
+def test_the_windows_keep_their_half_beside_a_large_set(tmp_path: Path) -> None:
+    from forge.planning.code_evidence import MAX_EVIDENCE_CHARS
+
+    body = "".join("# /things/{thing_id}\n" + ("y" * 80 + "\n") * 20 for _ in range(30))
+    files = {"src/many.py": body}
+    files.update({f"src/tally{n:02d}.py": ("tally " + "z" * 100 + "\n") * 2 for n in range(24)})
+    checkout = _repo(tmp_path / "checkout", files)
+    descriptor, _, _ = _descriptor(LocalCheckoutReader(str(checkout)))
+    windows = [w for e in descriptor["where_the_specs_words_already_appear"] for w in e["evidence"]]
+    used = sum(len(w["text"]) for w in windows)
+    lines = sum(len(line) for s in descriptor["sets_the_request_names"]
+                for c in s["candidates"] for line in c["lines"])
+    assert MAX_EVIDENCE_CHARS // 2 < used <= MAX_EVIDENCE_CHARS - lines
+    assert descriptor["sets_the_request_names"][0]["listed_all"] is True
+
+
+def test_the_factorys_pass_bars_are_never_evidence(tmp_path: Path) -> None:
+    checkout = _repo(
+        tmp_path / "checkout",
+        {"src/things/router.py": THING_ROUTER,
+         "qa/pass-bar-TASK-1.yaml": "check: /things/{thing_id} returns 204\n"},
+    )
+    descriptor, _, _ = _descriptor(LocalCheckoutReader(str(checkout)))
+    entry = descriptor["where_the_specs_words_already_appear"][0]
+    assert not any(p.startswith("qa/pass-bar-") for p in entry["already_in"])
+    assert {w["path"] for w in entry["evidence"]} == {"src/things/router.py"}

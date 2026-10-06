@@ -116,8 +116,11 @@ from forge.planning.assumption_review import review_assumptions
 from forge.planning.plan_size import read_plan_size_note
 from forge.planning.code_evidence import (
     LISTED_ALL_MEANS,
+    MAX_EVIDENCE_CHARS,
     MAX_EVIDENCE_WINDOWS,
-    evidence_for_word,
+    candidate_windows,
+    choose_windows,
+    is_factory_record,
     quantified_phrases,
     request_words,
     set_candidates,
@@ -553,10 +556,17 @@ _MAX_PLACES_PER_SPEC_WORD = 5
 #: plan-writer nothing.
 #: A route path keeps its placeholders (6 October 2026): before, the
 #: request's ``/users/{user_id}`` was cut to ``/users/``.
+#: A fourth shape (6 October 2026, evidence coverage): a name that starts
+#: with a capital and has another capital inside it, next to a small letter
+#: (``ETag``, ``HttpClient``, ``OrderLine``). Before, a request asking for
+#: "ETag support" never looked for ``ETag``. A capitalised English word
+#: ("Given"), an all-capitals one ("GET", "HTTP") and an all-capitals
+#: plural ("URLs", "APIs") are none of these shapes.
 _SPEC_WORD_PATTERN = re.compile(
     r"/[A-Za-z0-9{][A-Za-z0-9/_{}-]{2,}"
     r"|[A-Za-z][A-Za-z0-9]*[_-][A-Za-z0-9][A-Za-z0-9_-]*"
     r"|[a-z]+[A-Z][A-Za-z0-9]+"
+    r"|\b(?=[A-Za-z0-9]{4})(?![A-Z0-9]+s\b)[A-Z][A-Za-z0-9]*?(?:[a-z][A-Z]|[A-Z][a-z])[A-Za-z0-9]*"
 )
 
 #: Words that appear in almost every specification and would match half the
@@ -11185,6 +11195,7 @@ class PlanningRunDriver:
         unavailable: list[str] | None = None,
         partial: list[str] | None = None,
         request_text: str = "",
+        evidence_chars: int = MAX_EVIDENCE_CHARS,
     ) -> list[dict[str, Any]] | None:
         """Where this feature's own words already occur in the repository.
 
@@ -11240,11 +11251,21 @@ class PlanningRunDriver:
         * each hit's file is read once and the window from 3 lines before to
           12 after the hit is scored by how many of the request's words start
           a word inside it. Each entry keeps ``words`` and ``already_in``
-          exactly as before and gains ``evidence``: up to 3 windows,
+          exactly as before and gains ``evidence``: its windows,
           ``{"path", "first_line", "last_line", "score", "text"}`` with the
-          lines numbered in ``text``, at most 12 in all. ``more_hits`` counts
-          the hits that were not scored, so a cut list never reads as whole,
-          and ``evidence_not_read`` says why a file was refused.
+          lines numbered in ``text``. ``more_hits`` counts the hits not
+          inside a window shown, so a cut list never reads as whole, and
+          ``evidence_not_read`` says why a file was refused.
+
+        WHICH WINDOWS (6 October 2026, evidence coverage). The windows are
+        chosen across all the words at once, not 3 per word: the request's
+        own words before the specification's, the word found in fewest
+        places first, one window per file before a second in any file, and
+        as many as ``evidence_chars`` characters of window text hold (what
+        the set candidates leave of the budget; at most
+        :data:`MAX_EVIDENCE_WINDOWS`). See
+        :func:`~forge.planning.code_evidence.choose_windows`. The factory's
+        own pass bars are never a place.
         """
         reader = reader or LocalCheckoutReader(repo_path)
         try:
@@ -11265,6 +11286,10 @@ class PlanningRunDriver:
             seen: set[str] = set()
             # The request's own words first: a spec writer may drop the route
             # the request named from its final draft (FEAT-F9B3 did).
+            in_request = {
+                raw.strip().strip(".,;:").lower().lstrip("/")
+                for raw in _SPEC_WORD_PATTERN.findall(request_text or "")
+            }
             readable = f"{request_text or ''}\n{readable}"
             for raw in _SPEC_WORD_PATTERN.findall(readable):
                 word = raw.strip().strip(".,;:")
@@ -11281,10 +11306,12 @@ class PlanningRunDriver:
                 return None
 
             found: list[dict[str, Any]] = []
+            found_candidates: list[list[dict[str, Any]]] = []
+            found_hits: list[list[tuple[str, int]]] = []
+            found_in_request: list[bool] = []
             stopped: str | None = None
             scoring_words = request_words(request_text)
             texts: dict[str, str | None] = {}
-            windows_left = MAX_EVIDENCE_WINDOWS
             for word in words:
                 if stopped:
                     break
@@ -11317,6 +11344,8 @@ class PlanningRunDriver:
                             for prefix in _REPO_INVENTORY_SKIP_PREFIXES
                         ):
                             continue
+                        if is_factory_record(path_and_line.rpartition(":")[0]):
+                            continue
                         if path_and_line not in places:
                             places.append(path_and_line)
                 if places:
@@ -11326,26 +11355,41 @@ class PlanningRunDriver:
                         "already_in": places[:_MAX_PLACES_PER_SPEC_WORD],
                     }
                     try:
-                        windows, more_hits, not_read = evidence_for_word(
+                        candidates, hits, not_read = candidate_windows(
                             reader,
                             places,
                             words=scoring_words,
                             rank=_how_interesting,
                             texts=texts,
-                            windows_left=windows_left,
                         )
                     except RepositoryUnreadable as exc:
                         # What was found is kept; the windows stop here.
                         stopped = str(exc)
-                        windows, more_hits, not_read = [], len(places), []
-                    if windows:
-                        entry["evidence"] = windows
-                        windows_left -= len(windows)
-                    if more_hits:
-                        entry["more_hits"] = more_hits
+                        candidates, not_read = [], []
+                        hits = [
+                            (path, int(line))
+                            for path, _, line in (p.rpartition(":") for p in places)
+                            if path and line.isdigit()
+                        ]
                     if not_read:
                         entry["evidence_not_read"] = not_read
                     found.append(entry)
+                    found_candidates.append(candidates)
+                    found_hits.append(hits)
+                    found_in_request.append(word.lower().lstrip("/") in in_request)
+            choose_windows(
+                found,
+                found_candidates,
+                found_hits,
+                from_request=found_in_request,
+                max_windows=MAX_EVIDENCE_WINDOWS,
+                max_chars=evidence_chars,
+            )
+            for entry in found:
+                # The keys in the order the plan-writer has always read them.
+                for key in ("evidence", "more_hits", "evidence_not_read"):
+                    if key in entry:
+                        entry[key] = entry.pop(key)
             if stopped:
                 logger.warning(
                     "target_repo_descriptor: stopped looking for the "
@@ -11596,6 +11640,21 @@ class PlanningRunDriver:
         # existed and planned to create a route already inside it. Present only
         # when the specification has distinctive words AND the repository
         # already has them; absent, the plan is byte for byte what it is today.
+        # "All the X" (6 October 2026, planning improvements item 3): the
+        # files most likely to hold the set's members, for the plan-writer to
+        # sort into members and not. Absent when the request names no set.
+        # Found first (6 October 2026, evidence coverage) so the windows know
+        # how much of the budget the candidates' lines leave them: their
+        # half, and whatever the lines do not use.
+        sets = PlanningRunDriver._sets_the_request_names(
+            request_text, reader=reader, unavailable=reasons, partial=partial
+        )
+        set_lines_chars = sum(
+            len(line)
+            for entry in sets or []
+            for candidate in entry.get("candidates") or []
+            for line in candidate.get("lines") or []
+        )
         already_there = PlanningRunDriver._where_the_specs_words_already_appear(
             repo_path,
             spec_feature,
@@ -11603,12 +11662,9 @@ class PlanningRunDriver:
             unavailable=reasons,
             partial=partial,
             request_text=request_text,
-        )
-        # "All the X" (6 October 2026, planning improvements item 3): the
-        # files most likely to hold the set's members, for the plan-writer to
-        # sort into members and not. Absent when the request names no set.
-        sets = PlanningRunDriver._sets_the_request_names(
-            request_text, reader=reader, unavailable=reasons, partial=partial
+            evidence_chars=max(
+                MAX_EVIDENCE_CHARS // 2, MAX_EVIDENCE_CHARS - set_lines_chars
+            ),
         )
         # One size budget for both, across the whole descriptor: the
         # lowest-scoring windows go first, then candidate lines, and what
