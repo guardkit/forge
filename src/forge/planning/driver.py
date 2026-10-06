@@ -113,6 +113,7 @@ from forge.planning.planner import (
     plan_next_step,
 )
 from forge.planning.assumption_review import review_assumptions
+from forge.planning.plan_size import read_plan_size_note
 from forge.planning.code_evidence import (
     LISTED_ALL_MEANS,
     MAX_EVIDENCE_WINDOWS,
@@ -992,6 +993,12 @@ _PROVABILITY_REWRITTEN_CARD_LINE = (
 #: Where the plan leg's approved record carries that line for the build gate
 #: (:func:`forge.cli._serve_gate_activation.maybe_gate_build` reads it).
 PLAN_REPOSITORY_UNAVAILABLE_KEY = "repository_unavailable"
+
+#: Where the plan leg's approved record carries the one size warning for the
+#: build gate (6 October 2026, planning improvements item 6), read beside the
+#: line above; and what was compared, for the record.
+PLAN_SIZE_NOTE_KEY = "plan_size_note"
+PLAN_SIZE_KEY = "plan_size"
 
 #: The spec card's line when the planner could not read the repository
 #: (the 1 October planner fix, 1 October 2026). Plain words; the reason is the
@@ -5765,6 +5772,7 @@ class PlanningRunDriver:
             target_repo=target_repo,
             branch=branch,
             rewrite=rewrite,
+            repo_path=repo_path,
         )
 
     async def _plan_attempt(
@@ -7344,6 +7352,7 @@ class PlanningRunDriver:
         target_repo: str,
         branch: str,
         rewrite: Mapping[str, Any] | None,
+        repo_path: str | None = None,
     ) -> bool:
         """The plan is on the branch: receipts, the one line about the machine's
         rewrite when there was one (rule 5), the approved row, and on to the
@@ -7559,6 +7568,17 @@ class PlanningRunDriver:
             # taps to start the build says the plan was written without the
             # repository, in the same words as the spec card.
             details[PLAN_REPOSITORY_UNAVAILABLE_KEY] = unavailable_line
+        # One plain warning when this plan is half as big again as the
+        # project's own usual (6 October 2026). It never refuses anything.
+        if repo_path is not None:
+            size_note, size_receipt = await asyncio.to_thread(
+                read_plan_size_note,
+                self._repository_reader_for(repo_path, correlation_id),
+                files,
+            )
+            details[PLAN_SIZE_KEY] = size_receipt
+            if size_note is not None:
+                details[PLAN_SIZE_NOTE_KEY] = size_note
         deps.store._record_event(
             correlation_id=correlation_id,
             stage_label=_FEATURE_PLAN_STAGE,

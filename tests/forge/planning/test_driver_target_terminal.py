@@ -8205,3 +8205,181 @@ async def test_an_unreadable_repository_reaches_the_plan_writer_and_the_build_ga
     )
     ledger = SqliteLifecyclePersistence(connection=store._connection)
     assert ledger.read_planning_repository_unavailable(CID) == line
+
+
+# ---------------------------------------------------------------------------
+# Planning improvements, item 6 (6 October 2026): one plain size warning on
+# the build-gate card when a plan is half as big again as the median of the
+# project's own earlier plans, with at least five to compare. Never a refusal.
+# ---------------------------------------------------------------------------
+
+
+def _plan_yaml(feature_id: str, tasks: int, minutes: int) -> str:
+    lines = [f"id: {feature_id}", "tasks:"]
+    for n in range(1, tasks + 1):
+        lines += [f"  - id: TASK-{feature_id[-4:]}-{n:03d}", f"    estimated_minutes: {minutes}"]
+    lines += ["orchestration:", "  parallel_groups:"]
+    lines += [f"    - [TASK-{feature_id[-4:]}-{n:03d}]" for n in range(1, tasks + 1)]
+    return "\n".join(lines) + "\n"
+
+
+def _earlier(count: int, tasks: int = 5, minutes: int = 50) -> dict[str, str]:
+    return {
+        f".guardkit/features/FEAT-E{n:03d}.yaml": _plan_yaml(f"FEAT-E{n:03d}", tasks, minutes)
+        for n in range(count)
+    }
+
+
+class _PlansReader:
+    where = "a stand-in"
+
+    def __init__(self, files: dict[str, str]) -> None:
+        self.files = files
+
+    def list_files(self) -> list[str]:
+        return sorted(self.files)
+
+    def read_text(self, path: str) -> str | None:
+        return self.files.get(path)
+
+
+def test_the_size_of_a_plan_is_read_from_its_own_plan_file() -> None:
+    from forge.planning.plan_size import plan_size_of
+
+    size = plan_size_of(_plan_yaml("FEAT-207D", 8, 70))
+    assert size is not None
+    assert (size.tasks, size.waves, size.minutes) == (8, 8, 560.0)
+    assert plan_size_of("id: x\ntasks:\n- id: a\n- id: b\n  estimated_minutes: 5\n").minutes is None
+    assert plan_size_of("not: a plan\n") is None
+
+
+def test_fewer_than_five_earlier_plans_gives_no_line() -> None:
+    from forge.planning.plan_size import read_plan_size_note
+
+    big = {".guardkit/features/FEAT-207D.yaml": _plan_yaml("FEAT-207D", 8, 70)}
+    note, receipt = read_plan_size_note(_PlansReader(_earlier(4)), big)
+    assert note is None
+    assert receipt["compared_with"] == 4
+    assert "fewer than 5 earlier plans" in receipt["not_compared"]
+
+
+def test_a_plan_half_as_big_again_as_the_usual_gets_the_one_line() -> None:
+    from forge.planning.plan_size import read_plan_size_note
+
+    big = {".guardkit/features/FEAT-207D.yaml": _plan_yaml("FEAT-207D", 8, 70)}
+    # The plan's own file is never counted among the earlier ones.
+    history = {**_earlier(5), **big}
+    note, receipt = read_plan_size_note(_PlansReader(history), big)
+    assert note == (
+        "This plan is bigger than this project's usual: 8 tasks, about 9 hours by the "
+        "plan's own estimate (its plans usually have 5 tasks and about 4 hours). "
+        "Starting it is still your choice."
+    )
+    assert receipt["compared_with"] == 5 and receipt["warned"] is True
+    assert receipt["this_plan"] == {"tasks": 8, "waves": 8, "minutes": 560.0}
+
+
+def test_a_plan_of_the_usual_size_or_a_little_bigger_gets_no_line() -> None:
+    from forge.planning.plan_size import read_plan_size_note
+
+    usual = {".guardkit/features/FEAT-0001.yaml": _plan_yaml("FEAT-0001", 7, 50)}
+    note, receipt = read_plan_size_note(_PlansReader(_earlier(6)), usual)
+    assert note is None and receipt["warned"] is False
+    # Minutes alone can carry it: 5 tasks, but 1.5 x the usual minutes.
+    long = {".guardkit/features/FEAT-0002.yaml": _plan_yaml("FEAT-0002", 5, 75)}
+    note, _ = read_plan_size_note(_PlansReader(_earlier(6)), long)
+    assert note is not None and note.startswith("This plan is bigger than this project's usual: 5 tasks")
+
+
+def test_earlier_plans_without_estimates_or_with_one_task_are_not_compared() -> None:
+    from forge.planning.plan_size import read_plan_size_note
+
+    history = {
+        **_earlier(3),
+        ".guardkit/features/FEAT-S001.yaml": _plan_yaml("FEAT-S001", 1, 50),
+        ".guardkit/features/FEAT-N001.yaml": "id: FEAT-N001\ntasks:\n- id: a\n- id: b\n",
+        ".guardkit/features/FEAT-N002.yaml": ": not yaml : [",
+    }
+    big = {".guardkit/features/FEAT-207D.yaml": _plan_yaml("FEAT-207D", 8, 70)}
+    note, receipt = read_plan_size_note(_PlansReader(history), big)
+    assert note is None and receipt["compared_with"] == 3
+
+
+def test_a_reader_that_fails_gives_no_line_and_never_raises() -> None:
+    from forge.planning.plan_size import read_plan_size_note
+    from forge.planning.repository_facts import RepositoryUnreadable
+
+    class Broken(_PlansReader):
+        def list_files(self) -> list[str]:
+            raise RepositoryUnreadable("nothing there")
+
+    big = {".guardkit/features/FEAT-207D.yaml": _plan_yaml("FEAT-207D", 8, 70)}
+    note, receipt = read_plan_size_note(Broken({}), big)
+    assert note is None
+    assert receipt["not_compared"] == "the earlier plans could not be read (RepositoryUnreadable)"
+
+
+def test_the_repository_line_and_the_size_line_reach_the_gate_card_in_order(
+    store: SqlitePlanningRunStore,
+) -> None:
+    from forge.cli._serve_gate_activation import _planning_card_lines
+    from forge.gating.degraded import degraded_dispatch_gate_model_saying
+    from forge.lifecycle.persistence import SqliteLifecyclePersistence
+
+    _queue(store)
+    store._record_event(
+        correlation_id=CID,
+        stage_label="feature-plan",
+        status="approved",
+        actor_identity="planning-driver",
+        details_json=json.dumps(
+            {
+                "repository_unavailable": "The machine could not read the repository.",
+                "plan_size_note": "This plan is bigger than this project's usual.",
+            }
+        ),
+    )
+    ledger = SqliteLifecyclePersistence(connection=store._connection)
+    assert ledger.read_planning_plan_size_note(CID) == "This plan is bigger than this project's usual."
+    lines = _planning_card_lines(ledger, CID)
+    assert lines == (
+        "The machine could not read the repository. "
+        "This plan is bigger than this project's usual."
+    )
+    rationale = json.loads(degraded_dispatch_gate_model_saying(lines)("prompt"))["rationale"]
+    assert rationale.endswith(lines)
+    assert _planning_card_lines(ledger, "no-such-run") is None
+
+
+@pytest.mark.asyncio
+async def test_a_big_plan_carries_the_size_line_on_its_record_and_still_builds(
+    store: SqlitePlanningRunStore, tmp_path: Path
+) -> None:
+    repo = tmp_path / "api_test"
+    _init_scratch_repo(repo)
+    for rel, text in _earlier(5).items():
+        (repo / rel).parent.mkdir(parents=True, exist_ok=True)
+        (repo / rel).write_text(text)
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "earlier plans")
+    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+
+    def big_plan(feature_id: str) -> Any:
+        return _plan_result(
+            feature_id,
+            files={
+                f".guardkit/features/{feature_id}.yaml": _plan_yaml(feature_id, 8, 70),
+                "tasks/TASK-BIG-001.md": "# task\n",
+            },
+        )
+
+    _queue(store)
+    h = _make_driver(store, git_runner=git, repo_path=str(repo), plan_result_factory=big_plan)
+    await h.driver.drive(CID)
+
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+    details = _leg_details(store, "feature-plan")
+    assert details["plan_size_note"].startswith(
+        "This plan is bigger than this project's usual: 8 tasks, about 9 hours"
+    )
+    assert details["plan_size"]["compared_with"] == 5
