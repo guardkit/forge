@@ -121,6 +121,7 @@ from forge.planning.code_evidence import (
     quantified_phrases,
     request_words,
     set_candidates,
+    trim_to_budget,
 )
 from forge.planning.example_review import (
     ExampleReview,
@@ -11412,8 +11413,11 @@ class PlanningRunDriver:
 
         ``None`` when the request names no set. A repository that cannot be
         read still gives the entry, with no candidates, ``listed_all`` false
-        and the reason, because finding the phrase needs no read. Never
-        raises.
+        and the reason, because finding the phrase needs no read. A search
+        that cannot be finished is said on that entry and as a part of the
+        repository read only in part (``partial``), never as the repository
+        being unreadable: by then the inventory and the evidence were read.
+        Never raises.
         """
         try:
             phrases = quantified_phrases(request_text or "")
@@ -11437,18 +11441,17 @@ class PlanningRunDriver:
                 )
                 continue
             except RepositoryUnreadable as exc:
-                reason = str(exc)
+                why = str(exc)
             except Exception as exc:  # noqa: BLE001 — never fail a plan over this
-                reason = f"searching the repository failed ({type(exc).__name__})"
+                why = f"searching the repository failed ({type(exc).__name__})"
+            reason = f'the search for "{phrase}" could not be finished: {why}'
             logger.warning(
-                "target_repo_descriptor: could not list the files that may hold "
-                "%r in %s (%s); the plan-writer is told so",
-                phrase,
-                getattr(reader, "where", "the repository"),
+                "target_repo_descriptor: %s (%s); the plan-writer is told so",
                 reason,
+                getattr(reader, "where", "the repository"),
             )
-            if unavailable is not None and reason not in unavailable:
-                unavailable.append(reason)
+            if partial is not None and reason not in partial:
+                partial.append(reason)
             entries.append(
                 {
                     "phrase": phrase,
@@ -11601,14 +11604,24 @@ class PlanningRunDriver:
             partial=partial,
             request_text=request_text,
         )
-        if already_there:
-            descriptor["where_the_specs_words_already_appear"] = already_there
         # "All the X" (6 October 2026, planning improvements item 3): the
         # files most likely to hold the set's members, for the plan-writer to
         # sort into members and not. Absent when the request names no set.
         sets = PlanningRunDriver._sets_the_request_names(
             request_text, reader=reader, unavailable=reasons, partial=partial
         )
+        # One size budget for both, across the whole descriptor: the
+        # lowest-scoring windows go first, then candidate lines, and what
+        # went is counted on the entries it came from.
+        trimmed = trim_to_budget(already_there or [], sets or [])
+        if trimmed["windows_trimmed"] or trimmed["lines_trimmed"]:
+            logger.info(
+                "target_repo_descriptor: the code shown to the plan-writer was "
+                "trimmed to its size budget (%s)",
+                trimmed,
+            )
+        if already_there:
+            descriptor["where_the_specs_words_already_appear"] = already_there
         if sets:
             descriptor["sets_the_request_names"] = sets
         if reasons and unavailable is not None:

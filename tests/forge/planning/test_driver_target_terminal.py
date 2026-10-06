@@ -8379,3 +8379,12 @@ async def test_a_big_plan_carries_the_size_line_on_its_record_and_still_builds(
         "This plan is bigger than this project's usual: 8 tasks, about 9 hours"
     )
     assert details["plan_size"]["compared_with"] == 5
+
+
+def test_earlier_plans_estimated_at_nothing_never_make_every_plan_look_big() -> None:
+    from forge.planning.plan_size import read_plan_size_note
+
+    small = {".guardkit/features/FEAT-0003.yaml": _plan_yaml("FEAT-0003", 3, 5)}
+    note, receipt = read_plan_size_note(_PlansReader(_earlier(6, tasks=3, minutes=0)), small)
+    assert note is None
+    assert receipt["compared_with"] == 0
