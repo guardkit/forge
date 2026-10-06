@@ -282,6 +282,23 @@ class _MirroredApprovalPublisher:
 # ---------------------------------------------------------------------------
 
 
+def _planning_card_lines(sqlite_pool: Any, correlation_id: str | None) -> str | None:
+    """The plain lines the planning run left for the build gate's card, in
+    order: the repository line, then the size line. ``None`` when there are
+    none. A ledger that cannot answer is no line: a card line must never stop
+    the gate."""
+    lines: list[str] = []
+    for name in ("read_planning_repository_unavailable", "read_planning_plan_size_note"):
+        reader = getattr(sqlite_pool, name, None)
+        try:
+            line = reader(correlation_id) if callable(reader) else None
+        except Exception:  # noqa: BLE001 — a card line must never stop the gate
+            line = None
+        if isinstance(line, str) and line.strip():
+            lines.append(line.strip())
+    return " ".join(lines) if lines else None
+
+
 async def maybe_gate_build(
     *,
     parts: "ApprovalGateParts",
@@ -386,16 +403,13 @@ async def maybe_gate_build(
         wave_total=1,
     )
     # The card the person taps says, in plain words, when the plan behind
-    # this build was written without the repository (the 1 October planner fix):
-    # the planning run recorded the line on its approved plan.
+    # this build was written without the repository (the 1 October planner fix),
+    # and when it is much bigger than the project's usual (6 October 2026):
+    # the planning run recorded both lines on its approved plan.
     reasoning_model_call = degraded_dispatch_gate_model
-    reader = getattr(sqlite_pool, "read_planning_repository_unavailable", None)
-    try:
-        unavailable_line = reader(correlation_id) if callable(reader) else None
-    except Exception:  # noqa: BLE001 — a card line must never stop the gate
-        unavailable_line = None
-    if isinstance(unavailable_line, str) and unavailable_line.strip():
-        reasoning_model_call = degraded_dispatch_gate_model_saying(unavailable_line)
+    planning_lines = _planning_card_lines(sqlite_pool, correlation_id)
+    if planning_lines:
+        reasoning_model_call = degraded_dispatch_gate_model_saying(planning_lines)
     deps = make_gate_check_deps(
         parts,
         priors_reader=parts.priors_reader,

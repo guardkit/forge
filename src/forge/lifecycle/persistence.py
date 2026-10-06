@@ -1420,6 +1420,17 @@ class SqliteLifecyclePersistence:
         planning run, no such record, or a ledger that cannot answer is
         ``None`` — the gate card is then exactly what it always was.
         """
+        return self._planning_plan_line(correlation_id, "repository_unavailable")
+
+    def read_planning_plan_size_note(self, correlation_id: str | None) -> str | None:
+        """The one plain size warning the planning run recorded when its plan
+        is half as big again as the project's usual, or ``None`` (6 October
+        2026, planning improvements item 6). The same query and the same
+        forgiveness as :meth:`read_planning_repository_unavailable`."""
+        return self._planning_plan_line(correlation_id, "plan_size_note")
+
+    def _planning_plan_line(self, correlation_id: str | None, key: str) -> str | None:
+        """One plain line off the latest approved ``feature-plan`` record."""
         if not correlation_id:
             return None
         try:
@@ -1444,7 +1455,7 @@ class SqliteLifecyclePersistence:
             details = json.loads(raw) if raw else {}
         except (TypeError, ValueError):
             return None
-        line = details.get("repository_unavailable") if isinstance(details, dict) else None
+        line = details.get(key) if isinstance(details, dict) else None
         return str(line) if isinstance(line, str) and line.strip() else None
 
     def read_memory_project(self, build_id: str) -> str | None:
