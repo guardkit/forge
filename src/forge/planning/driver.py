@@ -543,6 +543,10 @@ _MAX_REPO_INVENTORY_FILES = 400
 #: and how many places each may report. Both small on purpose: this is a
 #: pointer for the plan-writer, not a search result page.
 _MAX_SPEC_WORDS_LOOKED_FOR = 8
+#: How many words are tried to find those 8 (6 October 2026, evidence
+#: coverage): a word the repository does not hold at all (a route still to
+#: be built, a product's name, an example id) no longer takes a place.
+_MAX_SPEC_WORDS_TRIED = 12
 _MAX_PLACES_PER_SPEC_WORD = 5
 
 #: A word out of the specification worth looking for: a route path, or an
@@ -581,6 +585,15 @@ _SPEC_WORDS_NOT_WORTH_LOOKING_FOR = frozenset(
         "without", "before", "after",
     }
 )
+
+
+def _one_form(word: str) -> str:
+    """A looked-for word's key: lower case, no leading slash, and a plural
+    "s" removed, so ``ETag`` and ``ETags`` are one word."""
+    lowered = word.lower().lstrip("/")
+    if len(lowered) > 4 and lowered.endswith("s") and not lowered.endswith("ss"):
+        return lowered[:-1]
+    return lowered
 
 
 def _how_interesting(place: str) -> tuple[int, str]:
@@ -11195,7 +11208,7 @@ class PlanningRunDriver:
         unavailable: list[str] | None = None,
         partial: list[str] | None = None,
         request_text: str = "",
-        evidence_chars: int = MAX_EVIDENCE_CHARS,
+        evidence_chars: int | Callable[[], int] = MAX_EVIDENCE_CHARS,
     ) -> list[dict[str, Any]] | None:
         """Where this feature's own words already occur in the repository.
 
@@ -11265,7 +11278,20 @@ class PlanningRunDriver:
         the set candidates leave of the budget; at most
         :data:`MAX_EVIDENCE_WINDOWS`). See
         :func:`~forge.planning.code_evidence.choose_windows`. The factory's
-        own pass bars are never a place.
+        own pass bars are never a place. ``evidence_chars`` may be a
+        callable: it is called once, after every file the windows need has
+        been read and before they are chosen, so the descriptor's other
+        searches can run after this one's reads and still set its share.
+
+        WHICH WORDS (6 October 2026, evidence coverage). A plural and its
+        singular are one word, looked for as the shorter (``ETag`` finds
+        ``ETags``). Up to :data:`_MAX_SPEC_WORDS_TRIED` words are tried to
+        find :data:`_MAX_SPEC_WORDS_LOOKED_FOR` the repository holds.
+
+        A SEARCH THAT STOPS PART-WAY (6 October 2026) keeps every word
+        already looked up and says so in ``partial``: it is a part read,
+        not an unreadable repository. Only a repository that answered no
+        search at all is ``unavailable``.
         """
         reader = reader or LocalCheckoutReader(repo_path)
         try:
@@ -11287,7 +11313,7 @@ class PlanningRunDriver:
             # The request's own words first: a spec writer may drop the route
             # the request named from its final draft (FEAT-F9B3 did).
             in_request = {
-                raw.strip().strip(".,;:").lower().lstrip("/")
+                _one_form(raw.strip().strip(".,;:"))
                 for raw in _SPEC_WORD_PATTERN.findall(request_text or "")
             }
             readable = f"{request_text or ''}\n{readable}"
@@ -11296,12 +11322,18 @@ class PlanningRunDriver:
                 lowered = word.lower().lstrip("/")
                 if not word or lowered in _SPEC_WORDS_NOT_WORTH_LOOKING_FOR:
                     continue
-                if lowered in seen:
+                key = _one_form(word)
+                if key in seen:
+                    # The same word again, singular or plural: keep the
+                    # shorter, whose search finds the longer too.
+                    at = next(i for i, w in enumerate(words) if _one_form(w) == key)
+                    if len(word) < len(words[at]):
+                        words[at] = word
                     continue
-                seen.add(lowered)
+                if len(words) >= _MAX_SPEC_WORDS_TRIED:
+                    continue
+                seen.add(key)
                 words.append(word)
-                if len(words) >= _MAX_SPEC_WORDS_LOOKED_FOR:
-                    break
             if not words:
                 return None
 
@@ -11312,8 +11344,9 @@ class PlanningRunDriver:
             stopped: str | None = None
             scoring_words = request_words(request_text)
             texts: dict[str, str | None] = {}
+            searched_any = False
             for word in words:
-                if stopped:
+                if stopped or len(found) >= _MAX_SPEC_WORDS_LOOKED_FOR:
                     break
                 # The word as the specification wrote it, and the two other
                 # shapes a repository commonly spells the same name in. A route
@@ -11332,6 +11365,7 @@ class PlanningRunDriver:
                     except RepositoryUnreadable as exc:
                         stopped = str(exc)
                         break
+                    searched_any = True
                     cut = getattr(answer, "cut", None)
                     if cut and partial is not None:
                         partial.append(
@@ -11376,14 +11410,14 @@ class PlanningRunDriver:
                     found.append(entry)
                     found_candidates.append(candidates)
                     found_hits.append(hits)
-                    found_in_request.append(word.lower().lstrip("/") in in_request)
+                    found_in_request.append(_one_form(word) in in_request)
             choose_windows(
                 found,
                 found_candidates,
                 found_hits,
                 from_request=found_in_request,
                 max_windows=MAX_EVIDENCE_WINDOWS,
-                max_chars=evidence_chars,
+                max_chars=evidence_chars() if callable(evidence_chars) else evidence_chars,
             )
             for entry in found:
                 # The keys in the order the plan-writer has always read them.
@@ -11398,8 +11432,15 @@ class PlanningRunDriver:
                     getattr(reader, "where", repo_path),
                     stopped,
                 )
-                if unavailable is not None:
-                    unavailable.append(stopped)
+                if not searched_any:
+                    if unavailable is not None:
+                        unavailable.append(stopped)
+                elif partial is not None:
+                    partial.append(
+                        "looking for where the specification's words already "
+                        f"appear stopped part-way ({stopped}); the words "
+                        "already looked up are kept"
+                    )
             return found or None
         except RepositoryUnreadable as exc:
             logger.warning(
@@ -11643,18 +11684,26 @@ class PlanningRunDriver:
         # "All the X" (6 October 2026, planning improvements item 3): the
         # files most likely to hold the set's members, for the plan-writer to
         # sort into members and not. Absent when the request names no set.
-        # Found first (6 October 2026, evidence coverage) so the windows know
-        # how much of the budget the candidates' lines leave them: their
-        # half, and whatever the lines do not use.
-        sets = PlanningRunDriver._sets_the_request_names(
-            request_text, reader=reader, unavailable=reasons, partial=partial
-        )
-        set_lines_chars = sum(
-            len(line)
-            for entry in sets or []
-            for candidate in entry.get("candidates") or []
-            for line in candidate.get("lines") or []
-        )
+        # Searched after the windows' files are read and before the windows
+        # are chosen (6 October 2026, evidence coverage): the windows then
+        # know how much of the budget the candidates' lines leave them (their
+        # half, and whatever the lines do not use), and on a reader with one
+        # shared time allowance the set search, not the code already there,
+        # is what a timeout cuts.
+        searched: dict[str, Any] = {}
+
+        def sets_then_window_share() -> int:
+            searched["sets"] = PlanningRunDriver._sets_the_request_names(
+                request_text, reader=reader, unavailable=reasons, partial=partial
+            )
+            set_lines_chars = sum(
+                len(line)
+                for entry in searched["sets"] or []
+                for candidate in entry.get("candidates") or []
+                for line in candidate.get("lines") or []
+            )
+            return max(MAX_EVIDENCE_CHARS // 2, MAX_EVIDENCE_CHARS - set_lines_chars)
+
         already_there = PlanningRunDriver._where_the_specs_words_already_appear(
             repo_path,
             spec_feature,
@@ -11662,10 +11711,13 @@ class PlanningRunDriver:
             unavailable=reasons,
             partial=partial,
             request_text=request_text,
-            evidence_chars=max(
-                MAX_EVIDENCE_CHARS // 2, MAX_EVIDENCE_CHARS - set_lines_chars
-            ),
+            evidence_chars=sets_then_window_share,
         )
+        if "sets" not in searched:
+            # No word to look for, or the search could not run: the set
+            # search still runs.
+            sets_then_window_share()
+        sets = searched["sets"]
         # One size budget for both, across the whole descriptor: the
         # lowest-scoring windows go first, then candidate lines, and what
         # went is counted on the entries it came from.
