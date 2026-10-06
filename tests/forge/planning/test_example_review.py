@@ -455,10 +455,9 @@ def test_the_note_names_each_example_and_never_orders_removal_outright(web_api_k
         '- "The endpoint fails gracefully when the database is unavailable" (a dependency being down)\n'
         "\n"
         "Remove each one unless the request needs it. If you keep one, quote the words of "
-        "the request that need it in its # Why: line, copied exactly, in double quotes, "
-        "and the example asks for nothing more than those words do. Remove any assumption "
-        "written only for an example you remove. Do not add other examples of the same "
-        "kind. Keep every other worked example exactly as it is."
+        "the request that need it in its # Why: line. Remove any assumption written only "
+        "for an example you remove. Do not add other examples of the same kind. Keep every "
+        "other worked example exactly as it is."
     )
     for sentence in note.split(". "):
         if "remove" in sentence.lower():
@@ -668,3 +667,19 @@ def test_the_three_checks_merge_into_one_review_with_every_kind(web_api_kinds) -
         'words it quotes); "A deletion survives a restart" (it asks for more than the '
         "words it quotes). If you approve, it will be built; to drop it, send a note."
     ]
+
+
+def test_only_a_merged_review_asks_for_the_quote_copied_exactly(web_api_kinds) -> None:
+    feature = _quoted(("A deletion survives a restart", ""), ("Real", '"make removed things disappear"'))
+    plain = review_examples(feature, request_text=DELETE_REQUEST, kinds=web_api_kinds)
+    assert "copied exactly" not in plain.note()
+    merged = merge_reviews(
+        [title for title, _ in worked_examples_in(feature)],
+        None,
+        untraced=untraced_examples(feature, sources=[DELETE_REQUEST]),
+    )
+    assert (
+        "quote the words of the request that need it in its # Why: line, copied "
+        "exactly, in double quotes, and the example asks for nothing more than "
+        "those words do. Remove any assumption"
+    ) in merged.note()

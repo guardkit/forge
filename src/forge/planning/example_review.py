@@ -49,7 +49,10 @@ item 4). Neither uses any project's words:
   only reads its verdicts (:func:`reading_of`).
 
 All three are merged into one :class:`ExampleReview` (:func:`merge_reviews`),
-so the note, the one rewrite and the card stay one.
+so the note, the one rewrite and the card stay one. The driver runs the two
+new checks only for a draft that carries the checker's
+``example_support.json``, which the spec writer writes only once its own
+switch is on; without it the 4 October check runs exactly as it did.
 
 Pure: no I/O except through the reader it is handed, no model, never raises.
 """
@@ -303,6 +306,10 @@ class ExampleReview:
 
     titles: list[str] = field(default_factory=list)
     findings: list[ExampleFinding] = field(default_factory=list)
+    #: Set only when the quote check and the checker's reading ran (6 October
+    #: 2026): the note then asks for the quote copied exactly. Off, the note
+    #: is word for word the 4 October note.
+    asks_for_exact_quotes: bool = False
 
     @property
     def flagged_titles(self) -> list[str]:
@@ -318,14 +325,19 @@ class ExampleReview:
         outright: the words can be wrong, so the writer may keep what the
         request needs, and says why in the example's own ``# Why:`` line."""
         lines = self.listed()
+        quote = (
+            "the words of the request that need it in its # Why: line, copied "
+            "exactly, in double quotes, and the example asks for nothing more "
+            "than those words do."
+            if self.asks_for_exact_quotes
+            else "the words of the request that need it in its # Why: line."
+        )
         lines += [
             "",
             "Remove each one unless the request needs it. If you keep one, quote "
-            "the words of the request that need it in its # Why: line, copied "
-            "exactly, in double quotes, and the example asks for nothing more "
-            "than those words do. Remove any assumption written only for an "
-            "example you remove. Do not add other examples of the same kind. "
-            "Keep every other worked example exactly as it is.",
+            f"{quote} Remove any assumption written only for an example you "
+            "remove. Do not add other examples of the same kind. Keep every "
+            "other worked example exactly as it is.",
         ]
         return "\n".join(lines)
 
@@ -527,7 +539,7 @@ def merge_reviews(
         kinds.setdefault(title, []).append(QUOTE_KIND)
     for title in goes_beyond:
         kinds.setdefault(title, []).append(READING_KIND)
-    merged = ExampleReview(titles=list(titles))
+    merged = ExampleReview(titles=list(titles), asks_for_exact_quotes=True)
     for title in dict.fromkeys(titles):
         if title in kinds:
             merged.findings.append(ExampleFinding(title, tuple(dict.fromkeys(kinds[title]))))

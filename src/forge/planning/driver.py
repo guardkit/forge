@@ -1095,6 +1095,16 @@ _EXAMPLE_REVIEW_AUTHOR = "planning-driver (spec example check)"
 _SHARED_REVIEW_NOTE_CLOSING = (
     "Remove these assumptions and every worked example that depends on them. "
     "Remove each worked example listed above unless the request needs it; if you "
+    "keep one, quote the words of the request that need it in its # Why: line. "
+    "Remove any assumption written only for an example you remove. Do not add "
+    "other assumptions or examples of the same kind. Change nothing else."
+)
+
+#: The same closing once the quote check runs (6 October 2026): the quote is
+#: asked for copied exactly, and the example asks for no more than it.
+_SHARED_REVIEW_NOTE_CLOSING_EXACT_QUOTES = (
+    "Remove these assumptions and every worked example that depends on them. "
+    "Remove each worked example listed above unless the request needs it; if you "
     "keep one, quote the words of the request that need it in its # Why: line, "
     "copied exactly, in double quotes, and the example asks for nothing more than "
     "those words do. Remove any assumption written only for an example you "
@@ -3903,9 +3913,10 @@ class PlanningRunDriver:
         # rewrite: an example about something the request does not mention,
         # by the project's own declared words, goes back with the flagged
         # assumptions in the same note. Since 6 October 2026 two more checks
-        # share it for every project, list or none: an example whose # Why:
-        # line quotes no words of the request, and one the spec writer's
-        # checker reads as asking for more than its quote.
+        # share it for every project, list or none, once the spec writer's
+        # checker sends its example_support.json: an example whose # Why:
+        # line quotes no words of the request, and one the checker reads as
+        # asking for more than its quote. Without that file, nothing changes.
         examples = await self._check_the_examples_first(
             correlation_id, draft, repo_path=repo_path, request_text=request_text, notes=notes
         )
@@ -4122,7 +4133,7 @@ class PlanningRunDriver:
         repo_path: str,
         request_text: str,
         notes: Sequence[str],
-    ) -> ExampleReview:
+    ) -> ExampleReview | None:
         """The first draft's examples held against the request and the
         owner's notes so far.
 
@@ -4131,13 +4142,32 @@ class PlanningRunDriver:
         ``# Why:`` line quotes words really in the request, a note or a
         project document the writer was given; and the spec writer's
         checker's reading of whether each example asks for more than its
-        quote. The last two run for every project.
+        quote. The last two run for every project, but ONLY for a draft that
+        carries the checker's ``example_support.json``: the spec writer writes
+        it, and quotes the request, only once its own switch is on. Without it
+        this is the 4 October check exactly: ``None`` when the project
+        declares no list, and the same note, card and receipt.
 
         What the card is later measured against is kept for the run, so
         :meth:`_open_the_card_with` can name what the rewrite removed and
         what it kept, whichever draft the card finally opens on.
         """
         words = await self._example_words_for(correlation_id, repo_path)
+        if draft.get("example_support") is None:
+            first = None
+            if words.kinds is not None:
+                feature_text = str((draft.get("card") or {}).get("worked_examples") or "")
+                first = review_examples(
+                    feature_text, request_text=request_text, notes=notes, kinds=words.kinds
+                )
+            self.__dict__.setdefault("_example_review_runs", {})[correlation_id] = {
+                "words": words,
+                "request_text": request_text,
+                "notes": [str(note) for note in notes],
+                "first": first,
+                "new_checks": False,
+            }
+            return first
         documents, _broken = self._recorded_project_documents(correlation_id)
         state: dict[str, Any] = {
             "words": words,
@@ -4148,6 +4178,7 @@ class PlanningRunDriver:
         first, quotes, reading = self._examples_reviewed(state, draft)
         state.update(
             {
+                "new_checks": True,
                 "first": first,
                 "first_quotes": quotes,
                 "first_reading": reading,
@@ -4158,6 +4189,36 @@ class PlanningRunDriver:
         )
         self.__dict__.setdefault("_example_review_runs", {})[correlation_id] = state
         return first
+
+    @staticmethod
+    def _project_words_lines(
+        state: Mapping[str, Any], card: Mapping[str, Any]
+    ) -> tuple[list[str], dict[str, Any] | None]:
+        """The 4 October card lines and receipt: the project's words only."""
+        words: ExampleWords = state["words"]
+        receipt: dict[str, Any] = {"checked": words.kinds is not None, **words.receipt()}
+        if words.unreadable:
+            line = _EXAMPLE_WORDS_UNREADABLE_CARD_LINE.format(reason=words.unreadable)
+            receipt["card_lines"] = [line]
+            return [line], receipt
+        if words.kinds is None:
+            return [], receipt
+        first: ExampleReview | None = state["first"]
+        final = review_examples(
+            str(card.get("worked_examples") or ""),
+            request_text=state["request_text"],
+            notes=state["notes"],
+            kinds=words.kinds,
+        )
+        lines = final.card_lines(first)
+        receipt.update(
+            {
+                "first": first.receipt() if first is not None else None,
+                "final": final.receipt(),
+                "card_lines": lines,
+            }
+        )
+        return lines, receipt
 
     @staticmethod
     def _examples_reviewed(
@@ -4207,11 +4268,22 @@ class PlanningRunDriver:
         The final draft is checked again by all three checks: an example
         flagged at first and gone now was removed; one flagged now was kept.
         A project list that is there and could not be read is said in one
-        line, and the other two checks still run (6 October 2026)."""
+        line, and the other two checks still run (6 October 2026).
+
+        Those two checks run only when a draft carried the checker's
+        ``example_support.json``; otherwise this is the 4 October card and
+        receipt, word for word."""
         state = (self.__dict__.get("_example_review_runs") or {}).get(correlation_id)
         if state is None:
             return [], None
         words: ExampleWords = state["words"]
+        if not state.get("new_checks") and final_draft.get("example_support") is None:
+            return self._project_words_lines(state, final_draft.get("card") or {})
+        if not state.get("new_checks"):
+            # Only the final draft carries the checker's file: the run's
+            # inputs for the two new checks, kept now.
+            documents, _broken = self._recorded_project_documents(correlation_id)
+            state = {**state, "documents": [document.text for document in documents]}
         lines: list[str] = []
         if words.unreadable:
             lines.append(_EXAMPLE_WORDS_UNREADABLE_CARD_LINE.format(reason=words.unreadable))
@@ -4259,7 +4331,12 @@ class PlanningRunDriver:
             "something the request did not ask for:"
         ]
         lines += [f"- {finding.assumption_id}: {finding.sentence}" for finding in review.findings]
-        lines += ["", *examples.listed(), "", _SHARED_REVIEW_NOTE_CLOSING]
+        closing = (
+            _SHARED_REVIEW_NOTE_CLOSING_EXACT_QUOTES
+            if examples.asks_for_exact_quotes
+            else _SHARED_REVIEW_NOTE_CLOSING
+        )
+        lines += ["", *examples.listed(), "", closing]
         return "\n".join(lines)
 
     @staticmethod
