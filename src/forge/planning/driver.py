@@ -11378,7 +11378,9 @@ class PlanningRunDriver:
                     "looked_for": word,
                     "candidates": [],
                     "listed": 0,
-                    "matched": None,
+                    # Nothing was searched: 0, with the reason beside it, so
+                    # the reader's whole-number field stays a whole number.
+                    "matched": 0,
                     "listed_all": False,
                     "listed_all_means": LISTED_ALL_MEANS,
                     "unavailable": reason,

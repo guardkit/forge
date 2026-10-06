@@ -1202,7 +1202,7 @@ def test_an_unreadable_repository_still_names_the_set_with_no_candidates() -> No
             "looked_for": "tally",
             "candidates": [],
             "listed": 0,
-            "matched": None,
+            "matched": 0,
             "listed_all": False,
             "listed_all_means": LISTED_ALL_MEANS,
             "unavailable": "the stand-in could not be reached",
@@ -1244,6 +1244,8 @@ def test_the_descriptor_keys_the_plan_writer_and_its_checker_read(tmp_path: Path
         "listed_all_means", "not_read", "unavailable",
     }
     assert {"phrase", "looked_for", "candidates", "listed", "matched", "listed_all"} <= set(named)
+    assert isinstance(named["listed"], int) and isinstance(named["matched"], int)
+    assert isinstance(named["listed_all"], bool)
     for candidate in named["candidates"]:
         assert set(candidate) == {"path", "lines"}
         assert len(candidate["lines"]) <= 2
