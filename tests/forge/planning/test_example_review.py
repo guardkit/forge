@@ -28,8 +28,15 @@ import pytest
 import yaml
 
 from forge.planning.example_review import (
+    QUOTE_KIND,
+    READING_KIND,
     ExampleReview,
+    check_quotes,
     example_words_from,
+    merge_reviews,
+    reading_of,
+    untraced_examples,
+    why_lines_in,
     read_example_words,
     review_examples,
     worked_examples_in,
@@ -448,9 +455,10 @@ def test_the_note_names_each_example_and_never_orders_removal_outright(web_api_k
         '- "The endpoint fails gracefully when the database is unavailable" (a dependency being down)\n'
         "\n"
         "Remove each one unless the request needs it. If you keep one, quote the words of "
-        "the request that need it in its # Why: line. Remove any assumption written only "
-        "for an example you remove. Do not add other examples of the same kind. Keep every "
-        "other worked example exactly as it is."
+        "the request that need it in its # Why: line, copied exactly, in double quotes, "
+        "and the example asks for nothing more than those words do. Remove any assumption "
+        "written only for an example you remove. Do not add other examples of the same "
+        "kind. Keep every other worked example exactly as it is."
     )
     for sentence in note.split(". "):
         if "remove" in sentence.lower():
@@ -522,3 +530,141 @@ def test_the_measured_results_are_reproduced_from_the_declared_file(tmp_path: Pa
         (1395, "The version endpoint signals missing metadata when stamper refused to stamp"),
     ):
         assert found[control] == ()
+
+
+# ---------------------------------------------------------------------------
+# The quote is real (6 October 2026, planning improvements item 4): each
+# example's # Why: line must quote at least three words really in the
+# request, an owner's note or a project document. No project words needed.
+# ---------------------------------------------------------------------------
+
+DELETE_REQUEST = (
+    "Add a REMOVE /things/{thing_id} endpoint that returns 204 on success, and "
+    "make removed things disappear from all the tally reports."
+)
+
+
+def _quoted(*scenarios: tuple[str, str]) -> str:
+    lines = ["Feature: things", ""]
+    for title, why in scenarios:
+        if why:
+            lines.append(f"  # Why: {why}")
+        lines += ["  @key-example", f"  Scenario: {title}", "    When it runs", "    Then it works", ""]
+    return "\n".join(lines)
+
+
+def test_the_why_line_above_each_heading_is_read_in_order() -> None:
+    feature = (
+        "Feature: x\n"
+        "  # a comment about nothing\n"
+        "  # Why: \"one two three\"\n"
+        "  # and it goes on\n"
+        "  @tag\n"
+        "  Scenario: First\n"
+        "    Given a\n"
+        "  # Divider\n"
+        "    When b\n"
+        "\n"
+        "  Scenario Outline: Second\n"
+        "    Given <x>\n"
+        "    Examples:\n"
+        "      | x |\n"
+    )
+    assert why_lines_in(feature) == [('First', 'Why: "one two three" and it goes on'), ("Second", "")]
+    assert [title for title, _ in why_lines_in(feature)] == [t for t, _ in worked_examples_in(feature)]
+
+
+def test_straight_and_curly_quotes_of_the_request_are_traced() -> None:
+    feature = _quoted(
+        ("A", '"make removed things disappear"'),
+        ("B", "the request says \u201cdisappear from all the tally reports\u201d"),
+        ("C", '"Returns 204 on success!"'),
+    )
+    assert untraced_examples(feature, sources=[DELETE_REQUEST]) == []
+
+
+def test_a_quote_under_three_words_is_not_enough() -> None:
+    feature = _quoted(("A", '"removed things"'), ("B", '"make removed things disappear"'))
+    assert untraced_examples(feature, sources=[DELETE_REQUEST]) == ["A"]
+
+
+def test_a_quote_found_in_a_note_or_a_project_document_is_traced() -> None:
+    feature = _quoted(
+        ("From the note", '"also show the empty case"'),
+        ("From the document", '"every report is read only"'),
+        ("From nowhere", '"survives a restart of the service"'),
+    )
+    sources = [DELETE_REQUEST, "Also show the empty case.", "# Rules\nEvery report is read-only."]
+    assert untraced_examples(feature, sources=sources) == ["From nowhere"]
+
+
+def test_a_quote_not_in_any_source_and_a_missing_why_are_untraced() -> None:
+    feature = _quoted(
+        ("Real", '"make removed things disappear"'),
+        ("Invented", '"the request asks for concurrent reads"'),
+        ("Silent", ""),
+        ("Real again", '"returns 204 on success"'),
+    )
+    assert untraced_examples(feature, sources=[DELETE_REQUEST]) == ["Invented", "Silent"]
+    check = check_quotes(feature, sources=[DELETE_REQUEST])
+    assert check.checked and not check.guard_fired
+    assert check.untraced == ("Invented", "Silent")
+
+
+def test_when_more_than_half_quote_nothing_the_guard_drops_the_findings() -> None:
+    feature = _quoted(
+        ("Real", '"make removed things disappear"'),
+        ("Silent one", ""),
+        ("Silent two", "because it matters"),
+    )
+    check = check_quotes(feature, sources=[DELETE_REQUEST])
+    assert check.guard_fired is True
+    assert check.untraced == ()
+    assert check.receipt() == {"examples": 3, "failed": 2, "guard_fired": True, "untraced": []}
+
+
+def test_the_checkers_reading_counts_only_a_checked_verdict_on_a_real_title() -> None:
+    titles = ["A deletion survives a restart", "A count drops by exactly one"]
+    support = {
+        "status": "checked",
+        "goes_beyond": [
+            {"title": "A deletion survives a restart", "why": "restart is not asked"},
+            {"title": "An example that is not in the draft", "why": "x"},
+        ],
+    }
+    assert reading_of(support, titles) == ("checked", ["A deletion survives a restart"])
+    assert reading_of({"status": "no_verdict", "goes_beyond": []}, titles) == ("no_verdict", [])
+    assert reading_of(None, titles) == ("", [])
+
+
+def test_the_three_checks_merge_into_one_review_with_every_kind(web_api_kinds) -> None:
+    feature = _quoted(
+        ("A POST request to the endpoint is rejected", '"the request asks for it"'),
+        ("A deletion survives a restart", '"make removed things disappear"'),
+        ("A count drops by exactly one", '"make removed things disappear"'),
+        ("Another real one", '"returns 204 on success"'),
+    )
+    project = review_examples(
+        feature.replace("    When it runs", "    When POST is sent", 1),
+        request_text=DELETE_REQUEST,
+        kinds=web_api_kinds,
+    )
+    titles = [title for title, _ in worked_examples_in(feature)]
+    merged = merge_reviews(
+        titles,
+        project,
+        untraced=untraced_examples(feature, sources=[DELETE_REQUEST]),
+        goes_beyond=["A deletion survives a restart", "A POST request to the endpoint is rejected"],
+    )
+    assert [(f.title, f.kinds) for f in merged.findings] == [
+        ("A POST request to the endpoint is rejected", (METHOD, QUOTE_KIND, READING_KIND)),
+        ("A deletion survives a restart", (READING_KIND,)),
+    ]
+    assert merged.titles == titles
+    lines = merged.card_lines(None)
+    assert lines == [
+        'Not asked for, but kept: "A POST request to the endpoint is rejected" (another '
+        "request method; it quotes no words of the request; it asks for more than the "
+        'words it quotes); "A deletion survives a restart" (it asks for more than the '
+        "words it quotes). If you approve, it will be built; to drop it, send a note."
+    ]
