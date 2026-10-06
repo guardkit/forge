@@ -124,8 +124,12 @@ from forge.planning.code_evidence import (
 from forge.planning.example_review import (
     ExampleReview,
     ExampleWords,
+    check_quotes,
+    merge_reviews,
     read_example_words,
+    reading_of,
     review_examples,
+    worked_examples_in,
 )
 from forge.planning.repository_facts import (
     LocalCheckoutReader,
@@ -1084,9 +1088,11 @@ _EXAMPLE_REVIEW_AUTHOR = "planning-driver (spec example check)"
 _SHARED_REVIEW_NOTE_CLOSING = (
     "Remove these assumptions and every worked example that depends on them. "
     "Remove each worked example listed above unless the request needs it; if you "
-    "keep one, quote the words of the request that need it in its # Why: line. "
-    "Remove any assumption written only for an example you remove. Do not add "
-    "other assumptions or examples of the same kind. Change nothing else."
+    "keep one, quote the words of the request that need it in its # Why: line, "
+    "copied exactly, in double quotes, and the example asks for nothing more than "
+    "those words do. Remove any assumption written only for an example you "
+    "remove. Do not add other assumptions or examples of the same kind. Change "
+    "nothing else."
 )
 
 #: The spec card's line when the project's ``spec_examples:`` block is there
@@ -1096,6 +1102,24 @@ _EXAMPLE_WORDS_UNREADABLE_CARD_LINE = (
     "The project's list of examples it does not want unless asked for could "
     "not be read ({reason}), so the worked examples were not checked against it."
 )
+
+#: The spec card's line when most worked examples quote nothing in their
+#: ``# Why:`` line (6 October 2026): a writer that does not quote yet, so the
+#: quotes were not held against the request for that draft.
+_EXAMPLE_QUOTES_GUARD_CARD_LINE = (
+    "Most worked examples do not quote the request in their # Why: line, so "
+    "their quotes were not checked."
+)
+
+#: The spec card's line when the spec writer's checker was asked whether each
+#: example follows from the request and gave no answer (6 October 2026).
+_EXAMPLE_READING_NO_VERDICT_CARD_LINE = (
+    "The check of whether each example follows from the request gave no answer."
+)
+
+#: The file the spec writer puts beside the spec with its checker's reading
+#: of whether each example asks for more than the words it quotes.
+_EXAMPLE_SUPPORT_FILE = "example_support.json"
 
 #: The author stamped on the one note the PLAN review sends (2026-09-15,
 #: planner fix design section 2g) — the plan read against the request before
@@ -3577,6 +3601,12 @@ class PlanningRunDriver:
         )
         if coherence_warning is not None:
             draft["coherence_warning"] = coherence_warning
+        # WHETHER EACH EXAMPLE ASKS FOR MORE THAN ITS QUOTE (6 October 2026):
+        # the spec writer's checker's reading, from THIS reply, beside the
+        # contradiction; the example check reads it from the draft.
+        example_support = self._capture_example_support(role_output, correlation_id)
+        if example_support is not None:
+            draft["example_support"] = example_support
         if record:
             self._record_spec_draft(
                 correlation_id, draft, note_from_machine=note_from_machine
@@ -3865,7 +3895,10 @@ class PlanningRunDriver:
         # THE SPEC EXAMPLE CHECK (4 October 2026) shares this step's one
         # rewrite: an example about something the request does not mention,
         # by the project's own declared words, goes back with the flagged
-        # assumptions in the same note. No list declared, no check.
+        # assumptions in the same note. Since 6 October 2026 two more checks
+        # share it for every project, list or none: an example whose # Why:
+        # line quotes no words of the request, and one the spec writer's
+        # checker reads as asking for more than its quote.
         examples = await self._check_the_examples_first(
             correlation_id, draft, repo_path=repo_path, request_text=request_text, notes=notes
         )
@@ -4082,64 +4115,131 @@ class PlanningRunDriver:
         repo_path: str,
         request_text: str,
         notes: Sequence[str],
-    ) -> ExampleReview | None:
+    ) -> ExampleReview:
         """The first draft's examples held against the request and the
-        owner's notes so far; ``None`` when the project declares no list.
+        owner's notes so far.
+
+        Three checks, merged into one review (6 October 2026): the words the
+        project declares, when it declares some; whether each example's
+        ``# Why:`` line quotes words really in the request, a note or a
+        project document the writer was given; and the spec writer's
+        checker's reading of whether each example asks for more than its
+        quote. The last two run for every project.
 
         What the card is later measured against is kept for the run, so
         :meth:`_open_the_card_with` can name what the rewrite removed and
         what it kept, whichever draft the card finally opens on.
         """
         words = await self._example_words_for(correlation_id, repo_path)
-        first = None
-        if words.kinds is not None:
-            feature_text = str((draft.get("card") or {}).get("worked_examples") or "")
-            first = review_examples(
-                feature_text, request_text=request_text, notes=notes, kinds=words.kinds
-            )
-        self.__dict__.setdefault("_example_review_runs", {})[correlation_id] = {
+        documents, _broken = self._recorded_project_documents(correlation_id)
+        state: dict[str, Any] = {
             "words": words,
             "request_text": request_text,
             "notes": [str(note) for note in notes],
-            "first": first,
+            "documents": [document.text for document in documents],
         }
+        first, quotes, reading = self._examples_reviewed(state, draft)
+        state.update(
+            {
+                "first": first,
+                "first_quotes": quotes,
+                "first_reading": reading,
+                "quotes_ran": quotes.checked,
+                "reading_ran": reading["status"] == "checked",
+                "guard_fired": quotes.guard_fired,
+            }
+        )
+        self.__dict__.setdefault("_example_review_runs", {})[correlation_id] = state
         return first
 
+    @staticmethod
+    def _examples_reviewed(
+        state: Mapping[str, Any], draft: Mapping[str, Any]
+    ) -> tuple[ExampleReview, Any, dict[str, Any]]:
+        """One draft's merged review, its quote check and the checker's
+        reading, from the inputs kept for the run."""
+        feature_text = str((draft.get("card") or {}).get("worked_examples") or "")
+        words: ExampleWords = state["words"]
+        titles = [title for title, _ in worked_examples_in(feature_text)]
+        project = (
+            review_examples(
+                feature_text,
+                request_text=state["request_text"],
+                notes=state["notes"],
+                kinds=words.kinds,
+            )
+            if words.kinds is not None
+            else None
+        )
+        quotes = check_quotes(
+            feature_text,
+            sources=[state["request_text"], *state["notes"], *state["documents"]],
+        )
+        support = draft.get("example_support")
+        status, goes_beyond = reading_of(support, titles)
+        reading = {
+            "status": status or "not_asked",
+            "goes_beyond": [
+                dict(entry)
+                for entry in (support or {}).get("goes_beyond") or []
+                if isinstance(entry, Mapping) and entry.get("title") in goes_beyond
+            ]
+            if isinstance(support, Mapping)
+            else [],
+        }
+        merged = merge_reviews(
+            titles, project, untraced=quotes.untraced, goes_beyond=goes_beyond
+        )
+        return merged, quotes, reading
+
     def _example_review_lines(
-        self, correlation_id: str, card: Mapping[str, Any]
+        self, correlation_id: str, final_draft: Mapping[str, Any]
     ) -> tuple[list[str], dict[str, Any] | None]:
         """The card's lines about the examples, and the run's receipt.
 
-        The final card is checked again: an example flagged at first and gone
-        now was removed; one flagged now was kept. A list that is there and
-        could not be read is said in one line. No list: no lines, and the
-        receipt says why there was no check."""
+        The final draft is checked again by all three checks: an example
+        flagged at first and gone now was removed; one flagged now was kept.
+        A project list that is there and could not be read is said in one
+        line, and the other two checks still run (6 October 2026)."""
         state = (self.__dict__.get("_example_review_runs") or {}).get(correlation_id)
         if state is None:
             return [], None
         words: ExampleWords = state["words"]
-        receipt: dict[str, Any] = {"checked": words.kinds is not None, **words.receipt()}
+        lines: list[str] = []
         if words.unreadable:
-            line = _EXAMPLE_WORDS_UNREADABLE_CARD_LINE.format(reason=words.unreadable)
-            receipt["card_lines"] = [line]
-            return [line], receipt
-        if words.kinds is None:
-            return [], receipt
+            lines.append(_EXAMPLE_WORDS_UNREADABLE_CARD_LINE.format(reason=words.unreadable))
         first: ExampleReview | None = state["first"]
-        final = review_examples(
-            str(card.get("worked_examples") or ""),
-            request_text=state["request_text"],
-            notes=state["notes"],
-            kinds=words.kinds,
-        )
-        lines = final.card_lines(first)
-        receipt.update(
-            {
-                "first": first.receipt() if first is not None else None,
-                "final": final.receipt(),
-                "card_lines": lines,
-            }
-        )
+        final, quotes, reading = self._examples_reviewed(state, final_draft)
+        lines += final.card_lines(first)
+        if quotes.guard_fired:
+            lines.append(_EXAMPLE_QUOTES_GUARD_CARD_LINE)
+        if reading["status"] == "no_verdict":
+            lines.append(_EXAMPLE_READING_NO_VERDICT_CARD_LINE)
+        first_quotes = state.get("first_quotes")
+        receipt: dict[str, Any] = {
+            "checked": bool(
+                words.kinds is not None
+                or state.get("quotes_ran")
+                or quotes.checked
+                or state.get("reading_ran")
+                or reading["status"] == "checked"
+            ),
+            "project_words": words.receipt(),
+            "quotes": {
+                "checked": bool(state.get("quotes_ran") or quotes.checked),
+                "guard_fired": bool(state.get("guard_fired") or quotes.guard_fired),
+                "first": first_quotes.receipt() if first_quotes is not None else None,
+                "final": quotes.receipt(),
+            },
+            "reading": {
+                "status": reading["status"],
+                "first": state.get("first_reading"),
+                "final": reading,
+            },
+            "first": first.receipt() if first is not None else None,
+            "final": final.receipt(),
+            "card_lines": lines,
+        }
         return lines, receipt
 
     @staticmethod
@@ -4420,9 +4520,7 @@ class PlanningRunDriver:
             provability["card_line"] = added
         # THE SPEC EXAMPLE CHECK's lines (4 October 2026): what the rewrite
         # removed and what it kept, named, so a possible loss shows as well.
-        example_lines, example_receipt = self._example_review_lines(
-            correlation_id, final.get("card") or {}
-        )
+        example_lines, example_receipt = self._example_review_lines(correlation_id, final)
         if example_lines:
             card = dict(final.get("card") or {})
             added = " ".join(example_lines)
@@ -10418,6 +10516,58 @@ class PlanningRunDriver:
             "spec_changed_after_check": bool(record.get("spec_changed_after_check")),
             "possible_contradiction": _possible_contradiction_text(pairs, pair_count),
         }
+
+    @staticmethod
+    def _capture_example_support(
+        role_output: Mapping[str, Any], correlation_id: str
+    ) -> dict[str, Any] | None:
+        """The spec writer's checker's reading of each worked example, or
+        ``None`` (6 October 2026, planning improvements item 4).
+
+        Reads ``example_support.json`` from the reply (a tolerated extra,
+        never committed), exactly as :meth:`_capture_coherence_warning` reads
+        its file: ``{"status", "checked_request", "goes_beyond": [{"title",
+        "why"}]}``. ``None`` when there is no file (an older spec writer) or
+        it cannot be read: a bad file is logged and never fails the leg.
+        """
+        raw: Any = None
+        for name, content in role_output.items():
+            if str(name).rsplit("/", 1)[-1] == _EXAMPLE_SUPPORT_FILE:
+                raw = content
+                break
+        if raw is None:
+            return None
+        try:
+            record = json.loads(raw) if isinstance(raw, (str, bytes)) else raw
+            if not isinstance(record, Mapping):
+                raise ValueError("not a JSON object")
+            status = str(record.get("status") or "")
+            if status not in ("checked", "no_verdict", "not_asked"):
+                raise ValueError(f"unknown status {status!r}")
+            entries = record.get("goes_beyond") or []
+            if not isinstance(entries, list):
+                raise ValueError("'goes_beyond' is not a list")
+            goes_beyond = [
+                {
+                    "title": str(entry.get("title") or "").strip(),
+                    "why": str(entry.get("why") or "").strip(),
+                }
+                for entry in entries
+                if isinstance(entry, Mapping) and str(entry.get("title") or "").strip()
+            ]
+        except (ValueError, TypeError) as exc:
+            logger.warning(
+                "planning driver: run %s — the spec writer's %s could not be "
+                "read (%s); the examples are checked without it",
+                correlation_id,
+                _EXAMPLE_SUPPORT_FILE,
+                exc,
+            )
+            return None
+        support: dict[str, Any] = {"status": status, "goes_beyond": goes_beyond}
+        if "checked_request" in record:
+            support["checked_request"] = record.get("checked_request")
+        return support
 
     @staticmethod
     def _capture_pass_bar_seed(role_output: Mapping[str, Any]) -> str | None:

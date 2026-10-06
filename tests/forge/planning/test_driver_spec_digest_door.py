@@ -78,15 +78,19 @@ _AUTH_DOOR_STAGE = "qa-pass-bars-auth-confirm"
 #: this string is a CONTRACT with whatever renders the card.
 _SIGN_IN_ITEM = "sign-in"
 
+#: Each worked example quotes the request in its # Why: line, as the spec
+#: writer is told to since 6 October 2026, so the quote check finds nothing.
 FEATURE_TEXT = (
     "Feature: version endpoint\n"
     "\n"
+    '  # Why: "add a GET /version endpoint"\n'
     "  @key-example @smoke\n"
     "  Scenario: Version endpoint returns the running build\n"
     "    Given the service is running\n"
     "    When the version is asked for\n"
     "    Then the build it started from comes back\n"
     "\n"
+    '  # Why: "a GET /version endpoint"\n'
     "  @negative\n"
     "  Scenario: Version endpoint rejects an unknown format\n"
     "    Given the service is running\n"
@@ -1813,18 +1817,21 @@ _THE_NOTE = "drop example 3, seven exactly is the rule"
 _FEATURE_THREE = (
     "Feature: version endpoint\n"
     "\n"
+    '  # Why: "add a GET /version endpoint"\n'
     "  @key-example @smoke\n"
     "  Scenario: Version endpoint returns the running build\n"
     "    Given the service is running\n"
     "    When the version is asked for\n"
     "    Then the build it started from comes back\n"
     "\n"
+    '  # Why: "a GET /version endpoint"\n'
     "  @negative\n"
     "  Scenario: Version endpoint rejects an unknown format\n"
     "    Given the service is running\n"
     "    When an unpublished format is asked for\n"
     "    Then the request is refused\n"
     "\n"
+    '  # Why: "a GET /version endpoint"\n'
     "  @negative\n"
     "  Scenario: Version endpoint refuses an empty request\n"
     "    Given the service is running\n"
@@ -1863,12 +1870,14 @@ _DIGEST_THREE = (
 _FEATURE_TWO_REWORDED = (
     "Feature: version endpoint\n"
     "\n"
+    '  # Why: "add a GET /version endpoint"\n'
     "  @key-example @smoke\n"
     "  Scenario: Version endpoint returns the running build\n"
     "    Given the service is running\n"
     "    When the version is asked for\n"
     "    Then the build it started from comes back\n"
     "\n"
+    '  # Why: "a GET /version endpoint"\n'
     "  @negative\n"
     "  Scenario: Version endpoint rejects an unknown format\n"
     "    Given the service is running\n"
@@ -3359,8 +3368,12 @@ async def test_a_refused_model_beside_other_facts_is_partly_read_on_coach_and_ca
 
 _PADDED_TITLE = "A POST request to the version endpoint is rejected"
 
+#: The padded example quotes real words of the request, stretched: only the
+#: project's own words can tell it was not asked for (the quote check of
+#: 6 October 2026 decides only that the quote is real).
 _PADDED_FEATURE = FEATURE_TEXT + (
     "\n"
+    '  # Why: "add a GET /version endpoint"\n'
     "  @negative\n"
     f"  Scenario: {_PADDED_TITLE}\n"
     "    Given the service is running\n"
@@ -3377,7 +3390,7 @@ _PADDED_DIGEST = DIGEST_YAML.replace(
 )
 #: The writer kept the example and quoted the request in its # Why: line.
 _PADDED_KEPT_FEATURE = _PADDED_FEATURE.replace(
-    f"  @negative\n  Scenario: {_PADDED_TITLE}\n",
+    f'  # Why: "add a GET /version endpoint"\n  @negative\n  Scenario: {_PADDED_TITLE}\n',
     f'  # Why: the request says "a GET /version endpoint"\n  @negative\n  Scenario: {_PADDED_TITLE}\n',
 )
 
@@ -3396,9 +3409,10 @@ _EXAMPLE_NOTE = (
     f'- "{_PADDED_TITLE}" (another request method)\n'
     "\n"
     "Remove each one unless the request needs it. If you keep one, quote the words of "
-    "the request that need it in its # Why: line. Remove any assumption written only "
-    "for an example you remove. Do not add other examples of the same kind. Keep every "
-    "other worked example exactly as it is."
+    "the request that need it in its # Why: line, copied exactly, in double quotes, "
+    "and the example asks for nothing more than those words do. Remove any assumption "
+    "written only for an example you remove. Do not add other examples of the same "
+    "kind. Keep every other worked example exactly as it is."
 )
 _REMOVED_LINE = (
     f'Removed as not asked for: "{_PADDED_TITLE}". If one of them was needed, send a note.'
@@ -3523,9 +3537,11 @@ async def test_assumptions_and_examples_share_one_rewrite_not_two(
     assert note.endswith(
         "\n\nRemove these assumptions and every worked example that depends on them. "
         "Remove each worked example listed above unless the request needs it; if you "
-        "keep one, quote the words of the request that need it in its # Why: line. "
-        "Remove any assumption written only for an example you remove. Do not add "
-        "other assumptions or examples of the same kind. Change nothing else."
+        "keep one, quote the words of the request that need it in its # Why: line, "
+        "copied exactly, in double quotes, and the example asks for nothing more than "
+        "those words do. Remove any assumption written only for an example you "
+        "remove. Do not add other assumptions or examples of the same kind. Change "
+        "nothing else."
     )
     # One closing instruction, not two that contradict each other.
     assert note.count("Change nothing else.") == 1
@@ -3590,12 +3606,13 @@ async def test_an_example_the_owner_asked_for_in_a_note_is_never_sent_back(
 
 
 @pytest.mark.asyncio
-async def test_no_declared_list_leaves_the_card_exactly_as_today(
+async def test_no_project_words_and_real_quotes_leave_the_card_exactly_as_today(
     store: SqlitePlanningRunStore,
 ) -> None:
-    """The same padded spec, from a project that declares nothing: one
-    dispatch, the card word for word as before, and the record says why
-    there was no check."""
+    """The same padded spec, from a project that declares no words: its
+    quote is real, so one dispatch and the card word for word as before. The
+    record says the quotes were checked and why the project's words were
+    not."""
     _queue(store)
     h = _make_driver(
         store,
@@ -3611,9 +3628,17 @@ async def test_no_declared_list_leaves_the_card_exactly_as_today(
     drafted = [d["spec_draft"] for status, d in _events(store, _DRAFT_STAGE) if status == "drafted"]
     assert [status for status, _ in _events(store, _DRAFT_STAGE)] == ["drafted"]
     receipt = drafted[-1]["example_review"]
-    assert receipt["checked"] is False
-    assert receipt["unreadable"] is None
-    assert receipt["not_checked"] == "`.guardkit/config.yaml` was not read (it was not served)"
+    assert receipt["checked"] is True
+    assert receipt["project_words"]["kinds"] is None
+    assert receipt["project_words"]["unreadable"] is None
+    assert receipt["project_words"]["not_checked"] == (
+        "`.guardkit/config.yaml` was not read (it was not served)"
+    )
+    assert receipt["quotes"]["checked"] is True
+    assert receipt["quotes"]["guard_fired"] is False
+    assert receipt["quotes"]["final"]["untraced"] == []
+    assert receipt["reading"]["status"] == "not_asked"
+    assert receipt["card_lines"] == []
 
 
 @pytest.mark.asyncio
@@ -4028,3 +4053,270 @@ async def test_a_pair_against_the_request_reaches_the_card_whole(
     drafted = [d for status, d in _events(store, _DRAFT_STAGE) if status == "drafted"]
     assert drafted[-1]["spec_draft"]["coherence_warning"]["pairs"] == [pair]
     assert drafted[-1]["spec_draft"]["coherence_warning"]["pair_count"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Planning improvements, item 4 (6 October 2026): two more example checks for
+# EVERY project, with no project words at all — the # Why: line must quote
+# the request (or a note, or a project document) for real, and the spec
+# writer's checker says whether an example asks for more than its quote.
+# They share the same note, the same one rewrite and the same card lines.
+# None of these projects declares a spec_examples block.
+# ---------------------------------------------------------------------------
+
+from forge.planning.project_documents import ProjectDocument  # noqa: E402
+
+_UNQUOTED_TITLE = "A version read survives a restart of the service"
+
+
+def _with_example(title: str, why: str) -> tuple[str, str]:
+    """FEATURE_TEXT and DIGEST_YAML with one more worked example."""
+    feature = FEATURE_TEXT + (
+        "\n"
+        + (f"  # Why: {why}\n" if why else "")
+        + "  @edge-case\n"
+        f"  Scenario: {title}\n"
+        "    Given the service has restarted\n"
+        "    When the version is asked for\n"
+        "    Then the same build comes back\n"
+    )
+    digest = DIGEST_YAML.replace(
+        "assumptions:\n",
+        f"- title: {title}\n"
+        "  tags:\n"
+        "  - '@edge-case'\n"
+        "  sentence: After a restart the same build comes back.\n"
+        "assumptions:\n",
+    )
+    return feature, digest
+
+
+def _reply_with_example(title: str, why: str, *, support: dict | None = None) -> Any:
+    feature, digest = _with_example(title, why)
+    reply = _spec_reply(feature=feature, digest=digest)
+    if support is not None:
+        reply.role_output["example_support.json"] = json.dumps(support)
+    return reply
+
+
+_QUOTE_NOTE = (
+    "These worked examples look like things the request does not mention:\n"
+    f'- "{_UNQUOTED_TITLE}" (it quotes no words of the request)\n'
+    "\n"
+    "Remove each one unless the request needs it. If you keep one, quote the words of "
+    "the request that need it in its # Why: line, copied exactly, in double quotes, "
+    "and the example asks for nothing more than those words do. Remove any assumption "
+    "written only for an example you remove. Do not add other examples of the same "
+    "kind. Keep every other worked example exactly as it is."
+)
+
+
+@pytest.mark.asyncio
+async def test_with_no_project_words_an_unquoted_example_goes_back_and_the_card_says_removed(
+    store: SqlitePlanningRunStore,
+) -> None:
+    _queue(store)
+    h = _make_driver(
+        store,
+        subscriber_factory=SharedScriptFactory([_answer("approve")]),
+        spec_replies=[
+            _reply_with_example(_UNQUOTED_TITLE, "the request asks for durable versions"),
+            _spec_reply(),
+        ],
+    )
+    await h.driver.drive(CID)
+
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+    dispatches = h.ctx["dispatches"]
+    assert len(dispatches) == 2
+    assert dispatches[1]["validate_feedback"] == _QUOTE_NOTE
+    removed = f'Removed as not asked for: "{_UNQUOTED_TITLE}". If one of them was needed, send a note.'
+    card = _digest_cards(h)[0].payload["details"]["summary"]
+    assert card["what_happened"] == f"{_ROUND_ONE_TEXT} {removed}"
+    drafted = [d["spec_draft"] for status, d in _events(store, _DRAFT_STAGE) if status == "drafted"]
+    receipt = drafted[-1]["example_review"]
+    assert receipt["checked"] is True
+    assert receipt["project_words"]["kinds"] is None
+    assert receipt["quotes"]["checked"] is True and receipt["quotes"]["guard_fired"] is False
+    assert receipt["quotes"]["first"]["untraced"] == [_UNQUOTED_TITLE]
+    assert receipt["quotes"]["final"]["untraced"] == []
+    assert receipt["reading"] == {
+        "status": "not_asked",
+        "first": {"status": "not_asked", "goes_beyond": []},
+        "final": {"status": "not_asked", "goes_beyond": []},
+    }
+    assert receipt["first"]["flagged"] == [
+        {"title": _UNQUOTED_TITLE, "kinds": ["it quotes no words of the request"]}
+    ]
+    assert receipt["card_lines"] == [removed]
+
+
+@pytest.mark.asyncio
+async def test_with_no_project_words_an_unquoted_example_the_writer_keeps_is_named(
+    store: SqlitePlanningRunStore,
+) -> None:
+    _queue(store)
+    unquoted = _reply_with_example(_UNQUOTED_TITLE, "")
+    h = _make_driver(
+        store,
+        subscriber_factory=SharedScriptFactory([_answer("approve")]),
+        spec_replies=[unquoted, _reply_with_example(_UNQUOTED_TITLE, "")],
+    )
+    await h.driver.drive(CID)
+
+    assert len(h.ctx["dispatches"]) == 2
+    card = _digest_cards(h)[0].payload["details"]["summary"]
+    assert card["what_happened"] == (
+        f'{_ROUND_ONE_TEXT} Not asked for, but kept: "{_UNQUOTED_TITLE}" (it quotes no '
+        "words of the request). If you approve, it will be built; to drop it, send a note."
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_example_that_quotes_a_project_document_is_not_flagged(
+    store: SqlitePlanningRunStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _queue(store)
+    h = _make_driver(
+        store,
+        subscriber_factory=SharedScriptFactory([_answer("approve")]),
+        spec_replies=[
+            _reply_with_example(_UNQUOTED_TITLE, '"the version survives every restart"')
+        ],
+    )
+    document = ProjectDocument.of(
+        "docs/rules.md", "# Rules\n\nThe version survives every restart.\n", "c" * 40
+    )
+    monkeypatch.setattr(
+        h.driver, "_recorded_project_documents", lambda correlation_id: ((document,), None)
+    )
+    # The writer is sent the document; this stand-in writer takes no context.
+    dispatch = h.driver._deps.dispatch_feature_spec
+
+    async def without_context(**kwargs: Any) -> Any:
+        assert kwargs.pop("context") == [f"File: docs/rules.md\n{document.text}"]
+        return await dispatch(**kwargs)
+
+    monkeypatch.setattr(h.driver._deps, "dispatch_feature_spec", without_context)
+    await h.driver.drive(CID)
+
+    assert len(h.ctx["dispatches"]) == 1
+    card = _digest_cards(h)[0].payload["details"]["summary"]
+    assert card["what_happened"] == _ROUND_ONE_TEXT
+
+
+_BEYOND = {
+    "status": "checked",
+    "checked_request": True,
+    "goes_beyond": [{"title": _UNQUOTED_TITLE, "why": "nothing in the request asks about restarts"}],
+}
+
+
+@pytest.mark.asyncio
+async def test_an_example_the_checker_reads_as_asking_for_more_is_sent_back_and_shown_kept(
+    store: SqlitePlanningRunStore,
+) -> None:
+    """The quote is real, so only the checker's reading can catch it: judged
+    to ask for more than its quote in the first and the final draft, it is
+    named as kept."""
+    _queue(store)
+    real_quote = '"add a GET /version endpoint"'
+    h = _make_driver(
+        store,
+        subscriber_factory=SharedScriptFactory([_answer("approve")]),
+        spec_replies=[
+            _reply_with_example(_UNQUOTED_TITLE, real_quote, support=_BEYOND),
+            _reply_with_example(_UNQUOTED_TITLE, real_quote, support=_BEYOND),
+        ],
+    )
+    await h.driver.drive(CID)
+
+    dispatches = h.ctx["dispatches"]
+    assert len(dispatches) == 2
+    assert (
+        f'- "{_UNQUOTED_TITLE}" (it asks for more than the words it quotes)'
+        in dispatches[1]["validate_feedback"]
+    )
+    card = _digest_cards(h)[0].payload["details"]["summary"]
+    assert card["what_happened"] == (
+        f'{_ROUND_ONE_TEXT} Not asked for, but kept: "{_UNQUOTED_TITLE}" (it asks for '
+        "more than the words it quotes). If you approve, it will be built; to drop it, "
+        "send a note."
+    )
+    drafted = [d["spec_draft"] for status, d in _events(store, _DRAFT_STAGE) if status == "drafted"]
+    receipt = drafted[-1]["example_review"]
+    assert receipt["checked"] is True
+    assert receipt["quotes"]["final"]["untraced"] == []
+    assert receipt["reading"]["status"] == "checked"
+    assert receipt["reading"]["final"]["goes_beyond"] == _BEYOND["goes_beyond"]
+    assert set(receipt) >= {"checked", "project_words", "quotes", "reading", "first", "final", "card_lines"}
+
+
+@pytest.mark.asyncio
+async def test_a_draft_that_mostly_quotes_nothing_is_not_sent_back_and_the_card_says_so(
+    store: SqlitePlanningRunStore,
+) -> None:
+    """An older spec writer that does not quote yet: its whole spec is not
+    sent back, and the card says the quotes were not checked."""
+    _queue(store)
+    unquoted = FEATURE_TEXT.replace('  # Why: "add a GET /version endpoint"\n', "").replace(
+        '  # Why: "a GET /version endpoint"\n', ""
+    )
+    h = _make_driver(
+        store,
+        subscriber_factory=SharedScriptFactory([_answer("approve")]),
+        spec_replies=[_spec_reply(feature=unquoted)],
+    )
+    await h.driver.drive(CID)
+
+    assert len(h.ctx["dispatches"]) == 1
+    card = _digest_cards(h)[0].payload["details"]["summary"]
+    assert card["what_happened"] == (
+        f"{_ROUND_ONE_TEXT} Most worked examples do not quote the request in their "
+        "# Why: line, so their quotes were not checked."
+    )
+    drafted = [d["spec_draft"] for status, d in _events(store, _DRAFT_STAGE) if status == "drafted"]
+    assert drafted[-1]["example_review"]["quotes"]["guard_fired"] is True
+
+
+@pytest.mark.asyncio
+async def test_a_checker_that_gave_no_answer_is_said_on_the_card(
+    store: SqlitePlanningRunStore,
+) -> None:
+    _queue(store)
+    reply = _spec_reply()
+    reply.role_output["example_support.json"] = json.dumps(
+        {"status": "no_verdict", "checked_request": True, "goes_beyond": []}
+    )
+    h = _make_driver(
+        store,
+        subscriber_factory=SharedScriptFactory([_answer("approve")]),
+        spec_replies=[reply],
+    )
+    await h.driver.drive(CID)
+
+    assert len(h.ctx["dispatches"]) == 1
+    card = _digest_cards(h)[0].payload["details"]["summary"]
+    assert card["what_happened"] == (
+        f"{_ROUND_ONE_TEXT} The check of whether each example follows from the "
+        "request gave no answer."
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_checker_file_is_ignored_and_never_fails_the_leg(
+    store: SqlitePlanningRunStore,
+) -> None:
+    _queue(store)
+    reply = _spec_reply()
+    reply.role_output["example_support.json"] = "{not json"
+    h = _make_driver(
+        store,
+        subscriber_factory=SharedScriptFactory([_answer("approve")]),
+        spec_replies=[reply],
+    )
+    await h.driver.drive(CID)
+
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+    card = _digest_cards(h)[0].payload["details"]["summary"]
+    assert card["what_happened"] == _ROUND_ONE_TEXT

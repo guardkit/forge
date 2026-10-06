@@ -33,6 +33,24 @@ starts "Do not", "Don't", "Never", "No", "Drop" or "Remove", is not counted.
 So "takes no parameters" in a request licenses nothing, and "does not
 require authentication" in an example only restates the request.
 
+TWO MORE CHECKS, FOR EVERY PROJECT (6 October 2026, planning improvements
+item 4). Neither uses any project's words:
+
+* **the quote is real** (:func:`untraced_examples`): each worked example's
+  ``# Why:`` line must hold a double-quoted span of at least three words that
+  appears, case, spacing and punctuation aside, in the request, an owner's
+  note or a project document the writer was given. This decides only that
+  the quote exists, never that it supports the example. When more than half
+  of a draft's examples fail it, the draft came from a writer that does not
+  quote yet, and these findings are dropped for that draft
+  (:class:`QuoteCheck` ``guard_fired``);
+* **the example asks for no more than its quote** is a judgement the spec
+  writer's own checker makes (its ``example_support.json``); this module
+  only reads its verdicts (:func:`reading_of`).
+
+All three are merged into one :class:`ExampleReview` (:func:`merge_reviews`),
+so the note, the one rewrite and the card stay one.
+
 Pure: no I/O except through the reader it is handed, no model, never raises.
 """
 
@@ -46,12 +64,20 @@ from typing import Any
 
 __all__ = [
     "DECLARATION_KEY",
+    "QUOTE_KIND",
+    "READING_KIND",
     "ExampleKind",
     "ExampleReview",
     "ExampleWords",
+    "QuoteCheck",
+    "check_quotes",
     "example_words_from",
+    "merge_reviews",
     "read_example_words",
+    "reading_of",
     "review_examples",
+    "untraced_examples",
+    "why_lines_in",
     "worked_examples_in",
 ]
 
@@ -295,10 +321,11 @@ class ExampleReview:
         lines += [
             "",
             "Remove each one unless the request needs it. If you keep one, quote "
-            "the words of the request that need it in its # Why: line. Remove any "
-            "assumption written only for an example you remove. Do not add other "
-            "examples of the same kind. Keep every other worked example exactly "
-            "as it is.",
+            "the words of the request that need it in its # Why: line, copied "
+            "exactly, in double quotes, and the example asks for nothing more "
+            "than those words do. Remove any assumption written only for an "
+            "example you remove. Do not add other examples of the same kind. "
+            "Keep every other worked example exactly as it is.",
         ]
         return "\n".join(lines)
 
@@ -359,3 +386,149 @@ def review_examples(
         if found:
             review.findings.append(ExampleFinding(title, found))
     return review
+
+
+# ---------------------------------------------------------------------------
+# The quote is real, and the example asks for no more than it (6 October 2026)
+# ---------------------------------------------------------------------------
+
+#: The plain words the card and the note use for each new finding.
+QUOTE_KIND = "it quotes no words of the request"
+READING_KIND = "it asks for more than the words it quotes"
+
+#: A double-quoted span, straight or curly.
+_QUOTED = re.compile(r'"([^"\n]+)"|\u201c([^\u201d\n]+)\u201d')
+_WHY = re.compile(r"#\s*why\s*:", re.IGNORECASE)
+_NOT_A_WORD = re.compile(r"[^0-9a-z]+")
+_MIN_QUOTE_WORDS = 3
+
+
+def _normal(text: str) -> str:
+    """Case, spacing and punctuation aside: lower-case words, one space apart."""
+    return " ".join(_NOT_A_WORD.sub(" ", str(text or "").lower()).split())
+
+
+def why_lines_in(feature_text: str) -> list[tuple[str, str]]:
+    """``[(title, why)]`` for each scenario, in the order
+    :func:`worked_examples_in` gives them: the ``# Why:`` comment (and any
+    comment lines after it) in the block of comments and tags directly above
+    the scenario's heading; ``""`` when there is none."""
+    found: list[tuple[str, str]] = []
+    block: list[str] = []
+    for line in (feature_text or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            block.append(stripped)
+            continue
+        if stripped.startswith("@") or not stripped:
+            continue
+        heading = _SCENARIO_LINE.match(stripped)
+        if heading:
+            kind, title = heading.groups()
+            if kind not in ("Background", "Rule", "Feature"):
+                why: list[str] = []
+                for comment in block:
+                    if why or _WHY.match(comment):
+                        why.append(comment.lstrip("#").strip())
+                found.append((title, " ".join(why)))
+        block = []
+    return found
+
+
+def _is_traced(why: str, sources: Sequence[str]) -> bool:
+    normal_sources = [f" {_normal(source)} " for source in sources if source]
+    for match in _QUOTED.finditer(why or ""):
+        span = _normal(match.group(1) or match.group(2) or "")
+        if len(span.split()) < _MIN_QUOTE_WORDS:
+            continue
+        if any(f" {span} " in source for source in normal_sources):
+            return True
+    return False
+
+
+def untraced_examples(feature_text: str, *, sources: Sequence[str]) -> list[str]:
+    """The titles of the worked examples whose ``# Why:`` line quotes nothing
+    found in ``sources`` (the request, the owner's notes and the project
+    documents the writer was given). Decides only that a quote exists."""
+    return [title for title, why in why_lines_in(feature_text) if not _is_traced(why, sources)]
+
+
+@dataclass(frozen=True)
+class QuoteCheck:
+    """One draft's quote check. ``untraced`` is empty when the guard fired."""
+
+    examples: int
+    untraced: tuple[str, ...]
+    guard_fired: bool = False
+    #: How many failed before the guard dropped them.
+    failed: int = 0
+
+    @property
+    def checked(self) -> bool:
+        return self.examples > 0
+
+    def receipt(self) -> dict[str, Any]:
+        return {
+            "examples": self.examples,
+            "failed": self.failed,
+            "guard_fired": self.guard_fired,
+            "untraced": list(self.untraced),
+        }
+
+
+def check_quotes(feature_text: str, *, sources: Sequence[str]) -> QuoteCheck:
+    """The quote check with its guard: when more than half of a draft's
+    examples fail, that draft came from a writer that does not quote yet, so
+    its quote findings are dropped and the guard says so. Never raises."""
+    try:
+        examples = len(why_lines_in(feature_text))
+        untraced = untraced_examples(feature_text, sources=sources)
+    except Exception:  # noqa: BLE001 — a reviewer must never stop a run
+        return QuoteCheck(examples=0, untraced=())
+    if examples and len(untraced) * 2 > examples:
+        return QuoteCheck(examples, (), guard_fired=True, failed=len(untraced))
+    return QuoteCheck(examples, tuple(untraced), failed=len(untraced))
+
+
+def reading_of(example_support: Any, titles: Sequence[str]) -> tuple[str, list[str]]:
+    """The checker's reading, as ``(status, titles that ask for more)``.
+
+    ``example_support`` is what the driver kept from the spec writer's
+    ``example_support.json``. Only a ``checked`` status counts; a title that
+    is not one of this draft's examples is dropped. Nothing there is ``""``.
+    """
+    if not isinstance(example_support, Mapping):
+        return "", []
+    status = str(example_support.get("status") or "")
+    if status != "checked":
+        return status, []
+    beyond: list[str] = []
+    for entry in example_support.get("goes_beyond") or []:
+        title = str(entry.get("title") or "").strip() if isinstance(entry, Mapping) else ""
+        if title and title in titles and title not in beyond:
+            beyond.append(title)
+    return status, beyond
+
+
+def merge_reviews(
+    titles: Sequence[str],
+    project: "ExampleReview | None",
+    *,
+    untraced: Sequence[str] = (),
+    goes_beyond: Sequence[str] = (),
+) -> ExampleReview:
+    """One review from the project's words, the quote check and the
+    checker's reading: an example flagged more than once carries every kind,
+    in that order, and the examples keep the draft's own order."""
+    kinds: dict[str, list[str]] = {}
+    for finding in project.findings if project is not None else []:
+        kinds.setdefault(finding.title, []).extend(finding.kinds)
+    for title in untraced:
+        kinds.setdefault(title, []).append(QUOTE_KIND)
+    for title in goes_beyond:
+        kinds.setdefault(title, []).append(READING_KIND)
+    merged = ExampleReview(titles=list(titles))
+    for title in dict.fromkeys(titles):
+        if title in kinds:
+            merged.findings.append(ExampleFinding(title, tuple(dict.fromkeys(kinds[title]))))
+    return merged
