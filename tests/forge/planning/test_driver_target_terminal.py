@@ -7688,14 +7688,10 @@ async def test_after_a_pre_card_round_the_plan_stage_asks_the_model_and_never_se
     assert classify.calls == [_FIXTURE_FEATURE, _FIXTURE_FEATURE]
     # The one card a person read carried rule 45's cannot-be-proven line.
     card = h.ctx["publisher"].envelopes[0].payload["details"]["summary"]
-    # Its one example quotes nothing in a # Why: line (an older writer's
-    # draft), so the card also says the quotes were not checked (6 October
-    # 2026), after rule 45's line.
     assert card["what_happened"].endswith(
         "1 of the worked examples cannot be proven as written: “ok”. If you "
         "approve, the plan stage will ask the model fallback to place them; or "
-        "send a note. Most worked examples do not quote the request in their "
-        "# Why: line, so their quotes were not checked."
+        "send a note."
     )
     assert "The machine rewrote 1 of the worked examples" in card["what_happened"]
     # The plan stage stamped ONCE, called the old way (the model allowed —
