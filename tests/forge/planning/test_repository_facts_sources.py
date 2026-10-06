@@ -1637,3 +1637,105 @@ def test_the_factorys_pass_bars_are_never_evidence(tmp_path: Path) -> None:
     entry = descriptor["where_the_specs_words_already_appear"][0]
     assert not any(p.startswith("qa/pass-bar-") for p in entry["already_in"])
     assert {w["path"] for w in entry["evidence"]} == {"src/things/router.py"}
+
+
+# -- coach check 1 on evidence coverage (6 October 2026) --------------------
+
+
+class _Allowance(LocalCheckoutReader):
+    """A checkout read through one shared allowance of ``calls`` answers, as
+    the sandbox helper's time allowance runs out; every call is logged."""
+
+    def __init__(self, root: str, calls: int) -> None:
+        super().__init__(root)
+        self.left = calls
+        self.log: list[str] = []
+
+    def _spend(self, what: str) -> None:
+        if self.left <= 0:
+            raise RepositoryUnreadable("the stand-in's allowance ran out")
+        self.left -= 1
+        self.log.append(what)
+
+    def places_mentioning(self, text):
+        self._spend("places")
+        return super().places_mentioning(text)
+
+    def files_mentioning(self, text, *, ignore_case=False, relevant=None):
+        self._spend("files")
+        return super().files_mentioning(text, ignore_case=ignore_case, relevant=relevant)
+
+    def read_text(self, path):
+        self._spend("read")
+        return super().read_text(path)
+
+
+def test_the_windows_are_read_before_the_set_search_spends_the_allowance(tmp_path: Path) -> None:
+    files = {"src/things/router.py": THING_ROUTER}
+    files.update({f"src/tally{n:02d}.py": "tally = 1\n" for n in range(40)})
+    checkout = _repo(tmp_path / "checkout", files)
+    probe = _Allowance(str(checkout), calls=10_000)
+    _descriptor(probe)
+    # Every search and read for the windows comes before the set search.
+    assert probe.log.index("files") > max(i for i, w in enumerate(probe.log) if w == "places")
+    # An allowance that runs out inside the set search: the windows stay,
+    # and the repository is never said to be unreadable.
+    short = _Allowance(str(checkout), calls=probe.log.index("files") + 5)
+    descriptor, reasons, partial = _descriptor(short)
+    entry = descriptor["where_the_specs_words_already_appear"][0]
+    assert entry["evidence"][0]["path"] == "src/things/router.py"
+    assert reasons == []
+    assert any("could not all be read for ranking" in line for line in partial)
+
+
+def test_a_window_search_stopped_part_way_is_a_part_read(tmp_path: Path) -> None:
+    checkout = _repo(
+        tmp_path / "checkout",
+        {"src/things/router.py": THING_ROUTER, "src/things/report.py": "def tally_report(): ...\n"},
+    )
+    spec = "Feature: x\n  Scenario: y\n    Given the tally_report\n"
+    probe = _Allowance(str(checkout), calls=10_000)
+    _descriptor(probe, spec=spec, request="Add a REMOVE /things/{thing_id} endpoint.")
+    # Out of allowance after the first word's searches and read.
+    first_word_calls = probe.log.index("places", 4)
+    short = _Allowance(str(checkout), calls=first_word_calls)
+    descriptor, reasons, partial = _descriptor(
+        short, spec=spec, request="Add a REMOVE /things/{thing_id} endpoint."
+    )
+    entries = descriptor["where_the_specs_words_already_appear"]
+    assert [entry["words"] for entry in entries] == ["/things/{thing_id}"]
+    assert entries[0]["evidence"][0]["path"] == "src/things/router.py"
+    assert reasons == []
+    assert any(
+        line.startswith("looking for where the specification's words already appear stopped part-way")
+        for line in partial
+    )
+    # A repository that answers no search at all is still unreadable.
+    none = _Allowance(str(checkout), calls=0)
+    descriptor, reasons, _ = _descriptor(none, spec=spec)
+    assert "where_the_specs_words_already_appear" not in descriptor
+    assert any("allowance ran out" in reason for reason in reasons)
+
+
+def test_a_plural_and_its_singular_are_one_word(tmp_path: Path) -> None:
+    checkout = _repo(tmp_path / "checkout", {"lib/tags.src": "WTags here\nWTag there\n"})
+    descriptor, _, _ = _descriptor(
+        LocalCheckoutReader(str(checkout)),
+        request="Make WTags strong.",
+        spec="Feature: x\n  Scenario: y\n    Given a WTag\n",
+    )
+    entries = descriptor["where_the_specs_words_already_appear"]
+    assert [entry["words"] for entry in entries] == ["WTag"]
+    assert entries[0]["already_in"] == ["lib/tags.src:1", "lib/tags.src:2"]
+
+
+def test_words_the_repository_does_not_hold_take_no_place(tmp_path: Path) -> None:
+    # Eight words found nowhere, then two the repository holds.
+    missing = [f"ex-ample-{n}" for n in range(8)]
+    checkout = _repo(tmp_path / "checkout", {"src/a.src": "keep_one\nkeep_two\n"})
+    descriptor, _, _ = _descriptor(
+        LocalCheckoutReader(str(checkout)),
+        request="Change " + " ".join(missing) + " keep_one keep_two",
+    )
+    entries = descriptor["where_the_specs_words_already_appear"]
+    assert [entry["words"] for entry in entries] == ["keep_one", "keep_two"]
