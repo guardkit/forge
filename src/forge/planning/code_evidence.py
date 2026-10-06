@@ -115,8 +115,10 @@ LISTED_ALL_MEANS = (
 #: The most characters the evidence windows' text and the set candidates'
 #: lines may take, together, across the whole descriptor. The plan-writer's
 #: prompt (and, with the planner's own switch on, its checker's) carries
-#: them; past this the lowest-scoring windows go first, then candidate
-#: lines from the lowest-ranked candidate up, and what went is counted.
+#: them. Each part is guaranteed half; what one part does not use goes to
+#: the other. Past its share, a part loses its lowest-scoring windows, or
+#: its candidate lines from the lowest-ranked candidate up, and what went is
+#: counted. The windows are never emptied to make room for candidate lines.
 MAX_EVIDENCE_CHARS = 16_000
 
 
@@ -437,15 +439,23 @@ def trim_to_budget(
     """Keep the windows' text and the candidates' lines within ``budget``
     characters, in place, and say what went.
 
-    The lowest-scoring windows go first (the later word's on a tie); each
-    one's hits are added to its entry's ``more_hits``. Then the candidates'
-    lines go, second lines before first ones, from the lowest-ranked
-    candidate up; each entry counts them in ``lines_trimmed`` and is no
-    longer ``listed_all``. The private ``_covers`` counts are always removed.
+    Each part is guaranteed half of ``budget``, and what one part does not
+    use goes to the other. Past its share the windows lose their
+    lowest-scoring ones first (the later word's on a tie); each one's hits
+    are added to its entry's ``more_hits``. Past theirs the candidates lose
+    lines, second lines before first ones, from the lowest-ranked candidate
+    up; each entry counts them in ``lines_trimmed`` and is no longer
+    ``listed_all``. The private ``_covers`` counts are always removed.
     Returns ``{"chars_before", "chars_after", "windows_trimmed",
     "lines_trimmed"}``.
     """
-    before = total = _evidence_chars(entries, sets)
+    before = _evidence_chars(entries, sets)
+    windows_total = _evidence_chars(entries, [])
+    lines_total = before - windows_total
+    half = budget // 2
+    # The windows' share: their half, and whatever the lines leave unused.
+    windows_allowed = max(half, budget - lines_total)
+    total = windows_total
     windows_trimmed = lines_trimmed = 0
     ranked = sorted(
         (
@@ -456,7 +466,7 @@ def trim_to_budget(
         key=lambda row: (row[0], row[1], row[2]),
     )
     for _score, _i, _p, index, window in ranked:
-        if total <= budget:
+        if total <= windows_allowed:
             break
         entry = entries[index]
         entry["evidence"] = [w for w in entry["evidence"] if w is not window]
@@ -465,10 +475,14 @@ def trim_to_budget(
             del entry["evidence"]
         total -= len(window.get("text") or "")
         windows_trimmed += 1
+    # The lines' share: whatever the windows now leave, at least half.
+    lines_allowed = budget - total
+    windows_after = total
+    total = lines_total
     for keep in (1, 0):
         for entry in sets:
             for candidate in reversed(entry.get("candidates") or []):
-                if total <= budget:
+                if total <= lines_allowed:
                     break
                 lines = candidate.get("lines") or []
                 if len(lines) > keep:
@@ -483,7 +497,7 @@ def trim_to_budget(
             window.pop("_covers", None)
     return {
         "chars_before": before,
-        "chars_after": total,
+        "chars_after": windows_after + total,
         "windows_trimmed": windows_trimmed,
         "lines_trimmed": lines_trimmed,
     }
