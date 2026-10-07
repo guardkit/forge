@@ -6776,9 +6776,13 @@ class _DeadlinePipe:
         self._fd = process.stdout.fileno()
 
     def _more(self) -> bytes:
+        # poll(), never select(): select() refuses any descriptor numbered
+        # 1024 or more, which a long-running helper reaches (coach check 2).
         import select
 
-        ready, _w, _x = select.select([self._fd], [], [], CODE_GIT_TIMEOUT_SECONDS)
+        poller = select.poll()
+        poller.register(self._fd, select.POLLIN | select.POLLHUP | select.POLLERR)
+        ready = poller.poll(CODE_GIT_TIMEOUT_SECONDS * 1000)
         if not ready:
             self.stop()
             raise _GitStalled(
@@ -6947,6 +6951,9 @@ class _CommitTree:
                 )
             if entry.mode != _CODE_LINK_MODE:
                 return None, None, f"{current} is not a file this door reads (mode {entry.mode})"
+            if (entry.size or 0) > CODE_MAX_FILE_BYTES:
+                # A link's target is a path; one this big is not read at all.
+                return None, None, _over_size_error(current, entry.size or 0, "a link this size is not followed")
             try:
                 target = self.blob(entry.oid).decode("utf-8", errors="replace")
             except OSError as exc:

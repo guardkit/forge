@@ -2315,3 +2315,24 @@ def test_the_copied_files_are_the_ones_guardkits_surface_detection_reads() -> No
         for chain in _re.findall(r'root((?:\s*/\s*"[^"]+")+)', source)
     }
     assert read == set(CLASSIFIER_READS)
+
+
+def test_the_check_copy_fetches_a_start_commit_this_checkout_lacks(tmp_path: Path) -> None:
+    """Coach check 2: the start commit may have been fetched elsewhere; the
+    copy fetches this checkout's remote once before saying it is missing."""
+    from forge.planning.driver import _lay_out_commit
+
+    seed = _repo(tmp_path / "seed", {"README.md": "x\n"})
+    subprocess.run(["git", "clone", "-q", str(seed), str(tmp_path / "copy")], check=True)
+    (seed / "pyproject.toml").write_text("[project]\nname = 'x'\n", encoding="utf-8")
+    git = ["git", "-C", str(seed), "-c", "user.name=t", "-c", "user.email=t@t"]
+    subprocess.run([*git, "add", "-A"], check=True)
+    subprocess.run([*git, "commit", "-qm", "manifest"], check=True)
+    newer = subprocess.run(
+        [*git, "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+    ).stdout.strip()
+    into = tmp_path / "tree"
+    assert _lay_out_commit(str(tmp_path / "copy"), newer, into) is None
+    assert (into / "pyproject.toml").read_text(encoding="utf-8") == "[project]\nname = 'x'\n"
+    why = _lay_out_commit(str(tmp_path / "copy"), "0123456789abcdef0123", tmp_path / "tree2")
+    assert why is not None and "even after fetching its remote" in why
