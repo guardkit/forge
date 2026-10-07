@@ -2141,3 +2141,82 @@ def test_a_start_that_cannot_be_looked_up_is_never_a_working_tree(tmp_path: Path
     recorded = driver(Recorded())._repository_reader_for(str(tmp_path), "cid-3")
     assert isinstance(recorded, LocalCheckoutReader)
     assert recorded.commit == "0123456789abcdef0123"
+
+
+def test_a_local_reader_takes_only_a_commit_id(tmp_path: Path) -> None:
+    """Coach check 1: the same rule as the helper, 7 to 40 lower-case hex;
+    anything else is "could not read the starting commit" before git runs."""
+    root = _repo(tmp_path / "checkout", {"a.txt": "one\n"})
+    asked: list[tuple[str, ...]] = []
+
+    class Counting(LocalCheckoutReader):
+        def _git(self, *args: str, timeout: float):
+            asked.append(args)
+            return super()._git(*args, timeout=timeout)
+
+    for bad in ("HEAD", "-Ocat", "--output=/tmp/x", "ABCDEF1", "abc", "zzzzzzz", "a" * 41):
+        reader = Counting(str(root), commit=bad)
+        with pytest.raises(RepositoryUnreadable, match="it is not a commit id"):
+            reader.list_files()
+    assert asked == []
+
+
+@pytest.mark.asyncio
+async def test_the_provability_check_reads_the_start_commit_not_the_checkout(
+    tmp_path: Path,
+) -> None:
+    """Coach check 1, note 3: the scenario check's view of the repository is
+    the start commit, laid out read-only, never the checkout's working tree."""
+    root = _repo(tmp_path / "checkout", {"pyproject.toml": "[project]\nname = 'x'\n"})
+    start = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+    ).stdout.strip()
+    (root / "pyproject.toml").write_text("an edit left in the working tree\n", encoding="utf-8")
+    seen: dict[str, str] = {}
+
+    async def classify(repo: Path, text: str):
+        seen["pyproject"] = (repo / "pyproject.toml").read_text(encoding="utf-8")
+        seen["where"] = str(repo)
+        from forge.planning.target_terminal_tools import ScenarioProvabilityOutcome
+
+        return ScenarioProvabilityOutcome(status="checked", detail="ok")
+
+    class Store:
+        def __init__(self, answer: object) -> None:
+            self.answer = answer
+
+        def get_start_point(self, correlation_id: str):
+            if isinstance(self.answer, Exception):
+                raise self.answer
+            return self.answer
+
+    class Runner:
+        async def read_file_from_branch(self, *, repo_path: str, branch: str, file_path: str):
+            return "Feature: x\n"
+
+    def driver(answer: object) -> PlanningRunDriver:
+        made = PlanningRunDriver(SimpleNamespace(  # type: ignore[arg-type]
+            git_runner=Runner(), store=Store(answer), classify_scenarios=classify,
+        ))
+        return made
+
+    draft = {"sha": "s", "spec_files": ["features/x/x.feature"]}
+    outcome = await driver((start, "main"))._check_provability_by_rule(
+        "cid-1", draft, repo_path=str(root), branch="planning/x"
+    )
+    assert outcome.status == "checked"
+    assert seen["pyproject"] == "[project]\nname = 'x'\n" and seen["where"] != str(root)
+    outcome = await driver(("0123456789abcdef0123", "main"))._check_provability_by_rule(
+        "cid-2", draft, repo_path=str(root), branch="planning/x"
+    )
+    assert outcome.status == "unavailable"
+    assert "could not read the starting commit 0123456789ab" in outcome.detail
+    outcome = await driver(RuntimeError("database is locked"))._check_provability_by_rule(
+        "cid-3", draft, repo_path=str(root), branch="planning/x"
+    )
+    assert outcome.status == "unavailable" and "database is locked" in outcome.detail
+    seen.clear()
+    outcome = await driver((None, None))._check_provability_by_rule(
+        "cid-4", draft, repo_path=str(root), branch="planning/x"
+    )
+    assert seen["where"] == str(root)

@@ -181,6 +181,10 @@ class RepositoryReader(Protocol):
         cannot be read."""
 
 
+#: A commit id as the readers take it: full or abbreviated, lower-case hex.
+_COMMIT_ID = re.compile(r"[0-9a-f]{7,40}")
+
+
 class LocalCheckoutReader:
     """A checkout the coordinator holds itself, read with ``git``.
 
@@ -215,6 +219,12 @@ class LocalCheckoutReader:
         #: Why the commit could not be read, once that is known: every later
         #: read says it at once, and the remote is fetched at most once.
         self._unavailable: str | None = None
+        if self._commit is not None and not _COMMIT_ID.fullmatch(self._commit):
+            # The same rule as the sandbox helper's: 7 to 40 lower-case hex.
+            self._unavailable = (
+                f"could not read the starting commit {self._commit!r}: it is not "
+                "a commit id (7 to 40 lower-case hex characters)"
+            )
         self.where = f"the checkout at {self._root}" + (
             f", at the commit {self._commit[:12]}" if self._commit else ""
         )
