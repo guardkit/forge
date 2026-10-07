@@ -46,7 +46,7 @@ from dataclasses import dataclass, field
 from functools import partial
 from datetime import datetime, timezone
 from pathlib import Path
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from forge.adapters.nats.envelope_subscribe import EnvelopeSubscribeClient
@@ -236,6 +236,7 @@ def build_feature_plan_command_args(
     revision_of: dict[str, str] | None = None,
     validate_feedback: str | None = None,
     context: Sequence[str] | None = None,
+    already_done_allowed: bool = False,
 ) -> dict[str, Any]:
     """Exact ``architect_feature_plan`` (008) wire args. See the CONTRACT note above.
 
@@ -307,7 +308,53 @@ def build_feature_plan_command_args(
     documents = _context_documents(context)
     if documents:
         args["context"] = documents
+    # "Already done, nothing to build" (7 October 2026): the plan writer may
+    # answer that every part of the request is already in the repository,
+    # with its proof. Sent only when Forge's ``planning.nothing_to_build``
+    # switch is on, and only as ``true``; off, the wire is what it was.
+    if already_done_allowed:
+        args["already_done_allowed"] = True
     return args
+
+
+def planning_complete_payload(
+    row: Any,
+    *,
+    correlation_id: str,
+    feature_id: str,
+    extra: Mapping[str, Any],
+    completed_at: datetime,
+) -> Any:
+    """The ``pipeline.planning-complete`` payload for a run that ended
+    PLANNED_HANDOFF with nothing built (7 October 2026).
+
+    The typed fields are filled honestly from the durable run row: who asked,
+    the minted feature id, when it ended and how long it ran (``None`` when
+    the row has no readable start). ``terminal_state`` keeps its only allowed
+    value, ``planned_handoff``, which is the run's real state. ``extra``
+    (``outcome``, ``proof``, ``summary``) rides as extra fields, which the
+    unchanged payload allows.
+    """
+    from nats_core.events import PlanningCompletePayload
+
+    started = row["started_at"] or row["queued_at"]
+    duration: int | None = None
+    if started:
+        try:
+            began = datetime.fromisoformat(str(started))
+            if began.tzinfo is None:
+                began = began.replace(tzinfo=timezone.utc)
+            duration = max(0, int((completed_at - began).total_seconds()))
+        except (TypeError, ValueError):
+            duration = None
+    return PlanningCompletePayload(
+        correlation_id=correlation_id,
+        originator=str(row["originating_user"]),
+        feat_id=feature_id,
+        completed_at=completed_at,
+        duration_seconds=duration,
+        **dict(extra),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1083,6 +1130,7 @@ async def compose_planning_consumer_and_dispatch(
             revision_of: dict[str, str] | None = None,
             validate_feedback: str | None = None,
             context: Sequence[str] | None = None,
+            already_done_allowed: bool = False,
         ) -> Any:
             return await dispatch_specialist_stage(
                 stage=StageClass.FEATURE_PLAN,
@@ -1104,6 +1152,7 @@ async def compose_planning_consumer_and_dispatch(
                     revision_of=revision_of,
                     validate_feedback=validate_feedback,
                     context=context,
+                    already_done_allowed=already_done_allowed,
                 ),
             )
 
@@ -1321,6 +1370,31 @@ async def compose_planning_consumer_and_dispatch(
                 )
             )
 
+        async def publish_planning_complete(
+            correlation_id: str,
+            *,
+            feature_id: str,
+            extra: dict[str, Any],
+        ) -> None:
+            # The successful terminal's event (7 October 2026, "already done,
+            # nothing to build"). The typed fields are filled honestly from
+            # the durable row; the marker, the proof and the message ride as
+            # extra fields, which the unchanged payload allows.
+            row = store.get_run(correlation_id)
+            if row is None:
+                raise RuntimeError(
+                    f"PLANNED_HANDOFF planning row {correlation_id!r} is unavailable"
+                )
+            await pipeline_publisher.publish_planning_complete(
+                planning_complete_payload(
+                    row,
+                    correlation_id=correlation_id,
+                    feature_id=feature_id,
+                    extra=extra,
+                    completed_at=clock_fn(),
+                )
+            )
+
         # -- second opinion provider (DF-006 default-off) ------------------
         second_opinion = FrontierSecondOpinion(
             client=_DisabledFrontierClient(),
@@ -1358,6 +1432,7 @@ async def compose_planning_consumer_and_dispatch(
                 clock=clock_fn,
                 publish_notification=publish_planning_notification,
                 publish_planning_failed=publish_planning_failed,
+                publish_planning_complete=publish_planning_complete,
                 # O-27/O-29 (E2-S4) — pre-run memory/disk headroom preflight,
                 # bound to a zero-arg callable so the driver stays ignorant of
                 # /proc + shutil. Defaults enabled=True (refuses only BEFORE a

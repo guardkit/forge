@@ -135,6 +135,11 @@ PLANNING_TRANSITIONS_TARGET_TERMINAL: Final[
         PlanningState.BUILD_QUEUED,
         PlanningState.FAILED,
         PlanningState.TIMED_OUT,
+        # 2026-10-07: the plan writer found every part of the request already
+        # done, with proof, and Forge accepted it ("already done, nothing to
+        # build"). The run ends in the existing success terminal with the
+        # marker on the transition's details; nothing is built or queued.
+        PlanningState.PLANNED_HANDOFF,
     },
     # BUILD_QUEUED is the target terminal — the feature is now on the Mode B
     # dispatcher's pre-dispatch approval gate; planning's job is done.
