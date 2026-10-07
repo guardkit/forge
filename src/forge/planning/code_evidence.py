@@ -23,6 +23,11 @@ and no file type filtered out:
   densely it holds the X word. At most 24 are listed, and the entry says
   plainly whether that list holds every matching file.
 
+Neither ever shows the factory's own files in a project (its records and the
+sandbox scripts it ships, :func:`is_factory_record`), nor makes a window of,
+or ranks first, a line written by a program rather than a person
+(:data:`MACHINE_WRITTEN_LINE_CHARS`).
+
 The only English this module knows is the quantifier grammar ("all", "every",
 "each") and a short list of filler words left out of the scoring, of the same
 kind as the negation words :mod:`forge.planning.example_review` knows.
@@ -40,12 +45,14 @@ import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any
 
+from forge.cli.deploy_templates import SHIPPED_SCRIPTS
 from forge.planning.repository_facts import RepositoryUnreadable
 
 __all__ = [
     "EVIDENCE_LINES_AFTER",
     "EVIDENCE_LINES_BEFORE",
     "LISTED_ALL_MEANS",
+    "MACHINE_WRITTEN_LINE_CHARS",
     "MAX_EVIDENCE_CHARS",
     "MAX_EVIDENCE_FILES_PER_WORD",
     "MAX_EVIDENCE_WINDOWS",
@@ -108,6 +115,16 @@ _NUMBER_THEN_NOUN = re.compile(r"\s+\d+\s+[A-Za-z]")
 #: every repository read: the pass bars the planner itself writes.
 _FACTORY_RECORD_PATTERNS = ("qa/pass-bar-*.yaml",)
 
+#: A line longer than this was written by a program, not a person: a
+#: one-line report, a minified bundle, a data dump. A word found only on
+#: such lines is never a window (a window shows 200 characters of each
+#: line, so it would show nothing of where the word is), and a file holding
+#: the set's word only on such lines is ranked after every other candidate.
+#: Its hits are still counted. (7 October 2026: a committed one-line test
+#: coverage report holds every source file's name, so it held most of the
+#: request's words and ranked above the code.)
+MACHINE_WRITTEN_LINE_CHARS = 1_000
+
 #: What ``listed_all`` means, in the descriptor's own words.
 LISTED_ALL_MEANS = (
     "listed_all is true only when every file that holds the looked_for word "
@@ -167,10 +184,15 @@ def _not_read_sentence(reader: Any, path: str) -> str:
 
 
 def is_factory_record(path: str) -> bool:
-    """True for the factory's own records that sit in a project's folders
-    (the pass bars the planner writes): never the project's code, so never
+    """True for the factory's own files that sit in a project's folders: the
+    pass bars the planner writes, and the scripts the factory ships for a
+    project's sandbox (:data:`forge.cli.deploy_templates.SHIPPED_SCRIPTS`,
+    by file name, wherever they sit). Never the project's code, so never
     evidence and never a set candidate."""
-    return any(fnmatch.fnmatchcase(str(path), pattern) for pattern in _FACTORY_RECORD_PATTERNS)
+    path = str(path)
+    if path.rpartition("/")[2] in SHIPPED_SCRIPTS:
+        return True
+    return any(fnmatch.fnmatchcase(path, pattern) for pattern in _FACTORY_RECORD_PATTERNS)
 
 
 def candidate_windows(
@@ -225,6 +247,9 @@ def candidate_windows(
             lines_of[path] = split[:-1] if split and split[-1] == "" else split
         lines = lines_of[path]
         if number < 1 or number > len(lines):
+            continue
+        if len(lines[number - 1]) > MACHINE_WRITTEN_LINE_CHARS:
+            # Machine-written: the window would show nothing of the hit.
             continue
         first = max(1, number - EVIDENCE_LINES_BEFORE)
         last = min(len(lines), number + EVIDENCE_LINES_AFTER)
@@ -458,9 +483,13 @@ def set_candidates(
         lines = text.split("\n")
         # How densely: the search word's matches per thousand lines.
         density = text.lower().count(word) * 1000.0 / max(len(lines), 1)
-        ranked.append((words_starting_in(others, text), density, path))
-    ranked.sort(key=lambda row: (-row[0], -row[1], row[2]))
-    order = [row[2] for row in ranked] + sorted(unread)
+        by_hand = any(
+            word in line.lower() and len(line) <= MACHINE_WRITTEN_LINE_CHARS for line in lines
+        )
+        ranked.append((by_hand, words_starting_in(others, text), density, path))
+    # Files holding the word only on machine-written lines go last.
+    ranked.sort(key=lambda row: (not row[0], -row[1], -row[2], row[3]))
+    order = [row[3] for row in ranked] + sorted(unread)
     listed = order[:MAX_SET_CANDIDATES_LISTED]
     lines_by_path = _matching_lines(word, listed, texts)
     rows: list[dict[str, Any]] = []
