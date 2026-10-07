@@ -48,6 +48,7 @@ import logging
 import math
 import os
 import re
+import subprocess
 import tempfile
 import time
 from dataclasses import dataclass, field
@@ -596,6 +597,40 @@ def _one_form(word: str) -> str:
     if len(lowered) > 4 and lowered.endswith("s") and not lowered.endswith("ss"):
         return lowered[:-1]
     return lowered
+
+
+def _lay_out_commit(repo_path: str, commit: str, into: Path) -> str | None:
+    """Write ``commit``'s files out of ``repo_path``'s git objects into the
+    new folder ``into`` (``git archive``, extracted with the safe ``data``
+    filter); ``None`` on success, else one plain reason. Nothing in the
+    checkout is touched, and nothing of its working tree is copied."""
+    import io
+    import tarfile
+
+    if not re.fullmatch(r"[0-9a-f]{7,40}", commit or ""):
+        return f"{commit!r} is not a commit id"
+    try:
+        made = subprocess.run(
+            [
+                "git", "-c", "safe.directory=*", "-C", str(repo_path),
+                "archive", "--format=tar", f"{commit}^{{commit}}",
+            ],
+            capture_output=True,
+            timeout=_REPO_INVENTORY_GIT_TIMEOUT_SECONDS * 6,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return f"git could not be run ({type(exc).__name__})"
+    if made.returncode != 0:
+        said = " ".join(made.stderr.decode("utf-8", errors="replace").split())[:200]
+        return f"git archive failed in the checkout at {repo_path} ({said or 'no reason given'})"
+    into.mkdir(parents=True)
+    try:
+        with tarfile.open(fileobj=io.BytesIO(made.stdout)) as archive:
+            archive.extractall(into, filter="data")
+    except (tarfile.TarError, OSError) as exc:
+        return f"its files could not be laid out ({type(exc).__name__}: {exc})"
+    return None
 
 
 def _reads_beyond_the_working_tree(reader: Any) -> bool:
@@ -3946,6 +3981,40 @@ class PlanningRunDriver:
             cache[correlation_id] = facts
         return cache[correlation_id]
 
+    def _recorded_start(self, correlation_id: str | None) -> tuple[str | None, str | None]:
+        """``(the run's recorded starting commit or None, None)``, or
+        ``(None, why)`` when looking it up FAILED.
+
+        An ABSENT start (the store answers ``(None, None)``: a run older than
+        the starting rule, or no store to ask) is ``(None, None)`` and reads
+        as before. A lookup that failed is not an absent start (Codex review
+        round 1, 7 October 2026): its reads are "could not read the starting
+        commit", never a working tree in its place.
+        """
+        start_point = getattr(getattr(self._deps, "store", None), "get_start_point", None)
+        if correlation_id is None or not callable(start_point):
+            return None, None
+        failed: str | None = None
+        recorded: Any = None
+        try:
+            recorded = start_point(correlation_id)
+        except Exception as exc:  # noqa: BLE001 — said, never a working tree
+            failed = f"{type(exc).__name__}: {exc}"
+        else:
+            if not isinstance(recorded, (tuple, list)) or len(recorded) != 2:
+                failed = f"the run store answered {type(recorded).__name__}"
+            else:
+                first = recorded[0]
+                if first is None:
+                    return None, None
+                if isinstance(first, str) and first.strip():
+                    return first.strip(), None
+                failed = f"the run store's recorded start is {first!r}"
+        return None, (
+            f"could not read the starting commit of run {correlation_id}: "
+            f"looking it up failed ({str(failed)[:200]})"
+        )
+
     def _repository_reader_for(self, repo_path: str, correlation_id: str | None = None) -> Any:
         """Where the fact sheet reads the repository: wherever every other
         planning call for ``repo_path`` goes.
@@ -3979,36 +4048,13 @@ class PlanningRunDriver:
         key = (str(correlation_id), str(repo_path))
         if correlation_id is not None and key in cache:
             return cache[key]
-        commit: str | None = None
-        start_point = getattr(getattr(self._deps, "store", None), "get_start_point", None)
-        if correlation_id is not None and callable(start_point):
-            # An ABSENT start (the store answers ``(None, None)``: a run older
-            # than the starting rule) reads as before. A lookup that FAILED
-            # is not an absent start: the run's reads are "could not read
-            # the starting commit", never the working tree in its place.
-            failed: str | None = None
-            try:
-                recorded = start_point(correlation_id)
-            except Exception as exc:  # noqa: BLE001 — said, never a working tree
-                recorded = None
-                failed = f"{type(exc).__name__}: {exc}"
-            else:
-                if not isinstance(recorded, (tuple, list)) or len(recorded) != 2:
-                    failed = f"the run store answered {type(recorded).__name__}"
-            if failed is None:
-                first = recorded[0] if recorded else None
-                if first is not None and not (isinstance(first, str) and first.strip()):
-                    failed = f"the run store's recorded start is {first!r}"
-                commit = first.strip() if isinstance(first, str) and first.strip() else None
-            if failed is not None:
-                reason = (
-                    f"could not read the starting commit of run {correlation_id}: "
-                    f"looking it up failed ({failed[:200]})"
-                )
-                logger.warning("planning driver: %s; nothing is read in its place", reason)
-                reader = UnreadableRepository(reason)
+        commit, failed = self._recorded_start(correlation_id)
+        if failed is not None:
+            logger.warning("planning driver: %s; nothing is read in its place", failed)
+            reader = UnreadableRepository(failed)
+            if correlation_id is not None:
                 cache[key] = reader
-                return reader
+            return reader
         runner = self._deps.git_runner
         route = getattr(runner, "runner_for_path", None)
         if callable(route):
@@ -4937,8 +4983,31 @@ class PlanningRunDriver:
                     "branch to be checked"
                 ),
             )
+        # AT THE RUN'S STARTING COMMIT (7 October 2026). The verb reads the
+        # repository's own files to detect its HTTP surface. Where this
+        # coordinator holds a checkout, it is handed a read-only copy of the
+        # commit the run starts from, never that checkout's working tree,
+        # which can lag the commit or carry local edits. A run with no
+        # recorded start (older than the starting rule), or no checkout here
+        # at all (nothing stale to read), is called as before.
+        start, failed = self._recorded_start(correlation_id)
+        if failed is not None:
+            return ScenarioProvabilityOutcome(status="unavailable", detail=failed)
         try:
-            return await classify(Path(repo_path), text)
+            if start is None or not (Path(repo_path) / ".git").exists():
+                return await classify(Path(repo_path), text)
+            with tempfile.TemporaryDirectory(prefix="forge-start-commit-") as scratch:
+                tree = Path(scratch) / "tree"
+                why = await asyncio.to_thread(_lay_out_commit, repo_path, start, tree)
+                if why is not None:
+                    return ScenarioProvabilityOutcome(
+                        status="unavailable",
+                        detail=(
+                            f"could not read the starting commit {start[:12]} to check "
+                            f"the worked examples against: {why}"
+                        ),
+                    )
+                return await classify(tree, text)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 — collaborator boundary
