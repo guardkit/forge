@@ -599,37 +599,72 @@ def _one_form(word: str) -> str:
     return lowered
 
 
-def _lay_out_commit(repo_path: str, commit: str, into: Path) -> str | None:
-    """Write ``commit``'s files out of ``repo_path``'s git objects into the
-    new folder ``into`` (``git archive``, extracted with the safe ``data``
-    filter); ``None`` on success, else one plain reason. Nothing in the
-    checkout is touched, and nothing of its working tree is copied."""
-    import io
-    import tarfile
+#: The repository files GuardKit's ``qa classify-scenarios`` reads to detect
+#: an HTTP surface (``detect_repo_http_surface`` at GuardKit ``7e8844ec``: the
+#: gate registry, the project's own declaration, and the two manifests). The
+#: verb is given the feature as a file of its own, so these are all it reads.
+CLASSIFIER_READS: tuple[str, ...] = (
+    "qa/gates/registry.yaml",
+    ".guardkit/config.yaml",
+    "pyproject.toml",
+    "package.json",
+)
+#: The largest of those files copied out of a commit; one bigger is refused.
+_CLASSIFIER_FILE_MAX_BYTES = 256 * 1024
 
+
+def _lay_out_commit(repo_path: str, commit: str, into: Path) -> str | None:
+    """Write the files the scenario check reads (:data:`CLASSIFIER_READS`),
+    as ``commit`` has them, into the new folder ``into``; ``None`` on
+    success, else one plain reason.
+
+    Each is read out of git's objects on its own (``git ls-tree`` for its
+    mode and size, then ``git cat-file blob``), so the cost is bounded by
+    those few files: nothing else of the commit is copied, a file the commit
+    does not hold is simply absent, a link or anything but an ordinary file
+    is not followed, and a file over :data:`_CLASSIFIER_FILE_MAX_BYTES` is
+    refused before it is read. Nothing in the checkout is touched, and
+    nothing of its working tree is copied (Codex review round 2, 7 October
+    2026: the earlier whole-commit archive was buffered with no limit)."""
     if not re.fullmatch(r"[0-9a-f]{7,40}", commit or ""):
         return f"{commit!r} is not a commit id"
-    try:
-        made = subprocess.run(
-            [
-                "git", "-c", "safe.directory=*", "-C", str(repo_path),
-                "archive", "--format=tar", f"{commit}^{{commit}}",
-            ],
+
+    def git(*args: str) -> "subprocess.CompletedProcess[bytes]":
+        return subprocess.run(
+            ["git", "-c", "safe.directory=*", "-C", str(repo_path), *args],
             capture_output=True,
-            timeout=_REPO_INVENTORY_GIT_TIMEOUT_SECONDS * 6,
+            timeout=_REPO_INVENTORY_GIT_TIMEOUT_SECONDS,
             check=False,
         )
+
+    try:
+        listed = git("ls-tree", "-z", "-l", f"{commit}^{{commit}}", "--", *CLASSIFIER_READS)
+        if listed.returncode != 0:
+            said = " ".join(listed.stderr.decode("utf-8", errors="replace").split())[:200]
+            return f"git could not read the commit in the checkout at {repo_path} ({said or 'no reason given'})"
+        into.mkdir(parents=True)
+        for record in listed.stdout.split(b"\0"):
+            head, _, name = record.partition(b"\t")
+            parts = head.decode("ascii", errors="replace").split()
+            rel = name.decode("utf-8", errors="replace")
+            if len(parts) != 4 or rel not in CLASSIFIER_READS:
+                continue
+            mode, kind, oid, size = parts
+            if kind != "blob" or mode not in ("100644", "100755"):
+                continue  # not an ordinary file: as good as absent
+            if not size.isdigit() or int(size) > _CLASSIFIER_FILE_MAX_BYTES:
+                return (
+                    f"{rel} is {size} bytes at that commit, over the "
+                    f"{_CLASSIFIER_FILE_MAX_BYTES}-byte limit for a file the check reads"
+                )
+            blob = git("cat-file", "blob", oid)
+            if blob.returncode != 0:
+                return f"git could not read {rel} out of the commit"
+            target = into / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(blob.stdout[: _CLASSIFIER_FILE_MAX_BYTES])
     except (OSError, subprocess.TimeoutExpired) as exc:
         return f"git could not be run ({type(exc).__name__})"
-    if made.returncode != 0:
-        said = " ".join(made.stderr.decode("utf-8", errors="replace").split())[:200]
-        return f"git archive failed in the checkout at {repo_path} ({said or 'no reason given'})"
-    into.mkdir(parents=True)
-    try:
-        with tarfile.open(fileobj=io.BytesIO(made.stdout)) as archive:
-            archive.extractall(into, filter="data")
-    except (tarfile.TarError, OSError) as exc:
-        return f"its files could not be laid out ({type(exc).__name__}: {exc})"
     return None
 
 
@@ -4985,9 +5020,10 @@ class PlanningRunDriver:
             )
         # AT THE RUN'S STARTING COMMIT (7 October 2026). The verb reads the
         # repository's own files to detect its HTTP surface. Where this
-        # coordinator holds a checkout, it is handed a read-only copy of the
-        # commit the run starts from, never that checkout's working tree,
-        # which can lag the commit or carry local edits. A run with no
+        # coordinator holds a checkout, it is handed a copy of just those
+        # files as the commit the run starts from has them, never that
+        # checkout's working tree, which can lag the commit or carry local
+        # edits. A run with no
         # recorded start (older than the starting rule), or no checkout here
         # at all (nothing stale to read), is called as before.
         start, failed = self._recorded_start(correlation_id)
@@ -4997,6 +5033,8 @@ class PlanningRunDriver:
             if start is None or not (Path(repo_path) / ".git").exists():
                 return await classify(Path(repo_path), text)
             with tempfile.TemporaryDirectory(prefix="forge-start-commit-") as scratch:
+                # Only the files the check reads, as the start commit has
+                # them (CLASSIFIER_READS).
                 tree = Path(scratch) / "tree"
                 why = await asyncio.to_thread(_lay_out_commit, repo_path, start, tree)
                 if why is not None:
