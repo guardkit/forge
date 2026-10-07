@@ -1035,40 +1035,74 @@ def test_the_integration_contracts_rule_matches_the_producers() -> None:
     assert guide_claims_routes("## §4\n  - route: /a\n")
     assert guide_claims_routes("## 4 Integration Contract\nROUTE: /a\n")
     assert not guide_claims_routes("## Integration Contracts\nnone\n## B\nroute: /b\n")
-    assert not guide_claims_routes("# Integration Contracts\nroute: /a\n")
     assert not guide_claims_routes("## Overview\nroute: /a\n")
     assert not guide_claims_routes("## §4 Integration Contracts\nroute:   \n")
+    # A level-one heading is a heading too, as the emitter reads it.
+    assert guide_claims_routes("# Integration Contracts\nroute: /a\n")
+    # "#tag" is not a heading.
+    assert not guide_claims_routes("#Integration Contracts\nroute: /a\n")
 
 
-def test_both_heading_forms_are_recognised() -> None:
-    # GuardKit's pinned feature-plan.md tells its planner to write the colon
-    # form; the specialist emitter's pattern misses it (a producer defect for
-    # specialist-agent's owner). Admission recognises both (R5).
-    assert guide_claims_routes("## §4: Integration Contracts\n- route: /a\n")
-    assert guide_claims_routes("## §4 Integration Contracts\n- route: /a\n")
-    assert guide_claims_routes("## Integration Contracts\nroute: /a\n")
-    assert not guide_claims_routes("## §4: Integration Contracts\nnone\n## B\nroute: /b\n")
-    # Either form's own section counts, even when the other form comes first.
+def test_every_heading_form_the_emitter_reads_is_recognised() -> None:
+    """The specialist emitter's heading forms (specialist-agent
+    leak_sweep_emit.py, 7 October 2026): numbering, §, a colon, qualifiers in
+    round or square brackets, any case and spacing, up to three spaces in."""
+    for heading in (
+        "## §4: Integration Contracts",
+        "## §4 Integration Contracts",
+        "## 4. Integration Contracts",
+        "## 4) Integration Contracts",
+        "## 4: Integration Contracts",
+        "## 4. §4: Integration Contracts (MANDATORY for multi-task features)",
+        "## §4: Integration Contracts [MANDATORY]",
+        "## integration contracts",
+        "## INTEGRATION  CONTRACTS",
+        "##4Integration Contracts",
+        "   ## §4: Integration Contracts",
+        "## §4:",
+        "## 4",
+    ):
+        assert guide_claims_routes(f"{heading}\n- route: /a\n"), heading
+    # Four spaces in is indented code, not a heading.
+    assert not guide_claims_routes("    ## Integration Contracts\n- route: /a\n")
+    assert not guide_claims_routes("## Integration Contractors\n- route: /a\n")
+
+
+def test_every_integration_section_is_read() -> None:
+    # GuardKit's template has a diagram section and a §4 section; the
+    # routes may be in either.
     assert guide_claims_routes(
-        "## §4 Integration Contracts\nnone\n## §4: Integration Contracts\nroute: /a\n"
+        "## Integration Contracts\nsee below\n## Other\n\n## §4: Integration Contracts\n"
+        "### Contract: users\n- route: /late\n"
     )
 
 
-def test_the_heading_is_case_sensitive_like_the_emitter() -> None:
-    assert not guide_claims_routes("## integration contracts\nroute: /a\n")
-    assert not guide_claims_routes("## §4 INTEGRATION CONTRACTS\nroute: /a\n")
+def test_routes_only_in_a_fenced_example_need_no_manifest() -> None:
+    """A refusal layout the leak-sweep builder found: the only Integration
+    Contracts heading is inside a fenced example. The emitter writes no
+    manifest, so admission must not ask for one."""
+    for fence in ("```", "~~~"):
+        guide = (
+            "## Overview\nHow a guide declares a route:\n\n"
+            f"{fence}markdown\n## §4: Integration Contracts\n- route: /example\n{fence}\n\n"
+            "## Tasks\nnothing else\n"
+        )
+        assert not guide_claims_routes(guide), fence
+    # A fenced heading-like line does not end a real section either.
+    assert guide_claims_routes(
+        "## §4: Integration Contracts\n```\n## not a heading\n```\n- route: /a\n"
+    )
 
 
-def test_only_the_first_matching_section_is_read() -> None:
-    first_empty = (
-        "## §4 Integration Contracts\nnone here\n"
-        "## Other\n\n## §4 Integration Contracts\n- route: /late\n"
+def test_routes_after_an_empty_section_and_a_level_one_heading_need_no_manifest() -> None:
+    """The other refusal layout: an empty §4, then ``# Appendix`` with routes
+    under it. A level-one heading ends the section, so the emitter writes no
+    manifest and admission must not ask for one."""
+    guide = (
+        "## §4: Integration Contracts\n\nNone for this feature.\n\n"
+        "# Appendix\n\n- route: /users/{user_id}\n"
     )
-    assert not guide_claims_routes(first_empty)
-    # The fallback heading is read only when no §4 heading exists at all.
-    assert not guide_claims_routes(
-        "## §4\nnothing\n## Integration Contracts\nroute: /a\n"
-    )
+    assert not guide_claims_routes(guide)
 
 
 def test_only_relative_markdown_links_are_collected() -> None:

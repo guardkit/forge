@@ -425,60 +425,107 @@ async def _walk_reference(
     return refused("which names no file")
 
 
-#: The guide's Integration Contracts heading, read EXACTLY as the specialist
-#: planner's own emitter reads it (specialist-agent
-#: ``src/specialist_agent/qa/leak_sweep_emit.py``, ``_INTEGRATION_SECTION_RE``
-#: and ``_extract_integration_section``): case-sensitive, ``## §4 Integration
-#: Contracts`` or a bare ``## §4`` first, at any level of two or more.
-_INTEGRATION_HEADING_RE = re.compile(
-    r"^##+\s*(?:§\s*)?4\s*(?:Integration\s+Contracts?)?\s*$",
-    re.MULTILINE,
-)
-#: Only when no such heading exists: ``## Integration Contracts`` (the
-#: emitter's fallback, also case-sensitive).
-_INTEGRATION_FALLBACK_RE = re.compile(
-    r"^##+\s*Integration\s+Contracts?\s*$", re.MULTILINE
-)
-#: GuardKit's documented heading, with its colon: ``## §4: Integration
-#: Contracts`` (installer/core/commands/feature-plan.md:1978-1985 at guardkit
-#: 6f00751c, which tells the planner to write exactly this). The specialist
-#: emitter's pattern above misses the colon form — a producer defect for
-#: specialist-agent's owner, recorded here and NOT changed from this side.
-#: Admission recognises both forms for every guide, whoever wrote it (Codex
-#: review round 2, R5).
-_GUARDKIT_HEADING_RE = re.compile(
-    r"^##+\s*§\s*4\s*:\s*Integration\s+Contracts?\s*$", re.MULTILINE
-)
-#: The section runs to the next heading of level two or more, as the emitter's.
-_SECTION_RE = re.compile(r"^##+", re.MULTILINE)
-#: The emitter's own route pattern (``_ROUTE_RE``, which is case-insensitive),
-#: with a route that is only spaces not counted, as the emitter skips it.
+#: The guide's Integration Contracts sections, read the way the specialist
+#: planner's own emitter reads them (specialist-agent
+#: ``src/specialist_agent/qa/leak_sweep_emit.py``: ``_HEADING_RE`` and
+#: ``_FENCE_RE``, here ``_GUIDE_HEADING_RE`` and ``_GUIDE_FENCE_RE``, and
+#: ``_heading_anchor``, ``_is_integration_heading``,
+#: ``_extract_integration_sections`` and ``_fenced_line_starts``, as fixed on
+#: 7 October 2026), ported here small. Admission must never require a
+#: ``qa/leak-sweep.yaml`` the emitter correctly does not write, so it asks
+#: exactly the emitter's question of the guide:
+#:
+#: * a heading is up to three spaces, then two or more hashes, or one hash
+#:   followed by a space (``# Appendix`` is a level-one heading and ends a
+#:   section); a heading-like line inside a fenced ``` or ~~~ block is not a
+#:   heading, and neither opens nor ends a section;
+#: * a heading opens an Integration Contracts section when, numbering,
+#:   ``§``, a colon, bracketed qualifiers, case and spacing taken away, it
+#:   reads "integration contract(s)", or it is a bare ``§4`` / ``4``;
+#: * every such section counts, and each runs to the next heading of the
+#:   same or a higher level.
+#:
+#: Until 7 October 2026 this read only the emitter's old, case-sensitive
+#: first section, plus GuardKit's colon form, and ran a section to the next
+#: ``##`` only, so a ``# Appendix`` after an empty section, or a heading in a
+#: fenced example, made admission ask for a manifest no emitter would write.
+_GUIDE_HEADING_RE = re.compile(r"^ {0,3}(#{2,}|#(?=[ \t]|$))[ \t]*(.*?)[ \t#]*$", re.MULTILINE)
+_GUIDE_FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
+_BARE_SECTION_FOUR_RE = re.compile(r"(?:§\s*)?4\s*:?")
+#: The emitter's own route pattern (``_ROUTE_RE``, case-insensitive), with a
+#: route that is only spaces not counted, as the emitter skips it.
 _ROUTE_LINE_RE = re.compile(r"(?i)^\s*[-]?\s*route:\s*\S", re.MULTILINE)
 
 
-def _section_declares_a_route(guide_text: str, heading: "re.Match[str] | None") -> bool:
-    if heading is None:
-        return False
-    rest = guide_text[heading.end():]
-    following = _SECTION_RE.search(rest)
-    body = rest[: following.start()] if following else rest
-    return _ROUTE_LINE_RE.search(body) is not None
+def _heading_anchor(text: str) -> str:
+    """The heading text with its numbering, qualifiers and punctuation taken
+    away: "§4: Integration Contracts [MANDATORY]" -> "integration contracts"."""
+    t = text.lower()
+    t = re.sub(r"\([^)]*\)", " ", t)
+    t = re.sub(r"\[[^\]]*\]", " ", t)
+    t = re.sub(r"§\s*\d+\s*:?", " ", t)
+    t = re.sub(r"^\s*\d+\s*[.):]?\s*", "", t)
+    t = re.sub(r"[^a-z0-9]+", " ", t)
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def _is_integration_heading(text: str) -> bool:
+    if _BARE_SECTION_FOUR_RE.fullmatch(text.strip()):
+        return True
+    return _heading_anchor(text) in ("integration contract", "integration contracts")
+
+
+def _fenced_line_starts(text: str) -> set[int]:
+    """The offsets of the lines inside fenced code blocks, fences included;
+    a block closes on a line of the same character at least as long, with
+    nothing after it, and an unclosed block runs to the end."""
+    fenced: set[int] = set()
+    open_char = ""
+    open_len = 0
+    offset = 0
+    for line in text.splitlines(keepends=True):
+        match = _GUIDE_FENCE_RE.match(line)
+        if open_char:
+            fenced.add(offset)
+            if match and match.group(1)[0] == open_char and len(match.group(1)) >= open_len:
+                if not line[match.end() :].strip():
+                    open_char = ""
+        elif match:
+            fenced.add(offset)
+            open_char = match.group(1)[0]
+            open_len = len(match.group(1))
+        offset += len(line)
+    return fenced
+
+
+def _integration_sections(guide_text: str) -> list[str]:
+    fenced = _fenced_line_starts(guide_text)
+    headings = [
+        (m.start(), m.end(), len(m.group(1)), m.group(2))
+        for m in _GUIDE_HEADING_RE.finditer(guide_text)
+        if m.start() not in fenced
+    ]
+    sections: list[str] = []
+    for index, (_start, body_start, level, text) in enumerate(headings):
+        if not _is_integration_heading(text):
+            continue
+        body_end = len(guide_text)
+        for next_start, _end, next_level, _text in headings[index + 1 :]:
+            if next_level <= level:
+                body_end = next_start
+                break
+        sections.append(guide_text[body_start:body_end])
+    return sections
 
 
 def guide_claims_routes(guide_text: str) -> bool:
     """Does an Integration Contracts section of the guide declare a ``route:``?
 
-    Either form counts: the section the specialist emitter reads (its first
-    matching heading, or its fallback when there is none), and the section
-    under GuardKit's documented colon heading. A ``route:`` line in either is
-    the producer's signal that ``qa/leak-sweep.yaml`` belongs with it.
+    The emitter's own question (see :data:`_GUIDE_HEADING_RE` above): a ``route:``
+    line in any of the guide's Integration Contracts sections is the
+    producer's signal that ``qa/leak-sweep.yaml`` belongs with it.
     """
-    emitter = _INTEGRATION_HEADING_RE.search(guide_text) or _INTEGRATION_FALLBACK_RE.search(
-        guide_text
-    )
-    return _section_declares_a_route(guide_text, emitter) or _section_declares_a_route(
-        guide_text, _GUARDKIT_HEADING_RE.search(guide_text)
-    )
+    return any(_ROUTE_LINE_RE.search(body) for body in _integration_sections(guide_text))
 
 
 async def check_supplied_bundle(
@@ -706,9 +753,9 @@ async def check_supplied_bundle(
         if content is None:
             return _missing("the spec's QA seed", seed, at)
 
-    # 9. The leak-sweep manifest, exactly when a guide's Integration
-    #    Contracts section — in the specialist emitter's form or GuardKit's
-    #    documented colon form — declares a route.
+    # 9. The leak-sweep manifest, exactly when one of a guide's Integration
+    #    Contracts sections, read as the specialist emitter reads them,
+    #    declares a route.
     if any(guide_claims_routes(texts.get(guide, "")) for guide in guides):
         content, why = await _read(runner, repo_path, commit, LEAK_SWEEP_PATH)
         if why:
