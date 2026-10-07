@@ -11486,9 +11486,13 @@ class PlanningRunDriver:
         * Every tracked file holding the word, case ignored, is a candidate.
           There is no file-type filter and no same-line rule: where the
           request's other words sit only ranks a file, never excludes it.
-        * Only the factory's own records are left out
-          (:data:`_REPO_INVENTORY_SKIP_PREFIXES` and the planner's own
-          ``qa/pass-bar-*.yaml``).
+        * Only the factory's own files are left out
+          (:data:`_REPO_INVENTORY_SKIP_PREFIXES`, the planner's own
+          ``qa/pass-bar-*.yaml`` and, since 7 October 2026, the sandbox
+          scripts the factory ships into a project, by name). A file that
+          holds the word only on machine-written lines (over
+          :data:`~forge.planning.code_evidence.MACHINE_WRITTEN_LINE_CHARS`
+          characters) is ranked after every other.
         * Ranked by how many of the request's other words a file holds, then
           by how densely it holds the X word, then by path; at most 120 files
           are read for that, and the rest follow by path.

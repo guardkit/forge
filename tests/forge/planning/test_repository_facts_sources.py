@@ -1739,3 +1739,86 @@ def test_words_the_repository_does_not_hold_take_no_place(tmp_path: Path) -> Non
     )
     entries = descriptor["where_the_specs_words_already_appear"]
     assert [entry["words"] for entry in entries] == ["keep_one", "keep_two"]
+
+
+# -- the factory's own files and machine-written lines (7 October 2026) -----
+#
+# A live run offered the factory's own sandbox runner (it mentions a
+# "counter") and a committed one-line coverage report as members of "all
+# the count endpoints".
+
+
+def test_the_shipped_script_names_are_the_scripts_the_factory_ships() -> None:
+    import forge.cli.deploy_templates as templates
+    from forge.cli.deploy_templates import SHIPPED_SCRIPTS
+    from forge.planning.code_evidence import is_factory_record
+
+    folder = Path(templates.__file__).parent
+    assert set(SHIPPED_SCRIPTS) == {p.name for p in folder.glob("*.sh")}
+    for name in SHIPPED_SCRIPTS:
+        assert is_factory_record(f"deploy/{name}") and is_factory_record(f"ops/x/{name}")
+    assert not is_factory_record("deploy/deploy.sh")
+    assert not is_factory_record("src/my-sandbox-runner.sh")
+
+
+def test_the_factorys_own_scripts_are_neither_candidates_nor_evidence(tmp_path: Path) -> None:
+    from forge.cli.deploy_templates import SHIPPED_SCRIPTS
+
+    files = {
+        "src/things/router.py": THING_ROUTER,
+        "config/routes.yaml": ROUTES_YAML,
+    }
+    for name in SHIPPED_SCRIPTS:
+        files[f"deploy/{name}"] = (
+            "# the tally counter for things removed\n# /things/{thing_id} 204 404\n"
+        )
+    checkout = _repo(tmp_path / "checkout", files)
+    descriptor, _, _ = _descriptor(LocalCheckoutReader(str(checkout)))
+    (named,) = descriptor["sets_the_request_names"]
+    assert [c["path"] for c in named["candidates"]] == ["config/routes.yaml"]
+    assert named["matched"] == 1 and named["listed_all"] is True
+    entry = descriptor["where_the_specs_words_already_appear"][0]
+    assert not any(p.startswith("deploy/") for p in entry["already_in"])
+    assert {w["path"] for w in entry["evidence"]} == {"src/things/router.py"}
+
+
+#: A committed report a tool wrote on one line: it names every file and so
+#: holds most of the request's words.
+ONE_LINE_REPORT = (
+    '{"files": {'
+    + ", ".join(
+        f'"src/things/remove_{n}.py": {{"tally": {n}, "unknown": 0, "removed": 1}}'
+        for n in range(40)
+    )
+    + ', "/things/{thing_id}": "204 404 success endpoint returns"}}\n'
+)
+
+
+def test_a_one_line_report_ranks_after_every_hand_written_candidate(tmp_path: Path) -> None:
+    from forge.planning.code_evidence import MACHINE_WRITTEN_LINE_CHARS
+
+    assert len(ONE_LINE_REPORT) > MACHINE_WRITTEN_LINE_CHARS
+    checkout = _repo(
+        tmp_path / "checkout",
+        {"aaa/report.json": ONE_LINE_REPORT, "config/routes.yaml": ROUTES_YAML,
+         "zz/bare.txt": "tally\n"},
+    )
+    descriptor, _, _ = _descriptor(LocalCheckoutReader(str(checkout)))
+    (named,) = descriptor["sets_the_request_names"]
+    # Still a candidate (it does hold the word), but last.
+    assert [c["path"] for c in named["candidates"]] == [
+        "config/routes.yaml", "zz/bare.txt", "aaa/report.json",
+    ]
+
+
+def test_a_word_found_only_on_a_machine_written_line_is_no_window(tmp_path: Path) -> None:
+    checkout = _repo(
+        tmp_path / "checkout",
+        {"aaa/report.json": ONE_LINE_REPORT, "src/things/router.py": THING_ROUTER},
+    )
+    descriptor, _, _ = _descriptor(LocalCheckoutReader(str(checkout)))
+    entry = descriptor["where_the_specs_words_already_appear"][0]
+    assert "aaa/report.json:1" in entry["already_in"]
+    assert {w["path"] for w in entry["evidence"]} == {"src/things/router.py"}
+    # Its hit is still counted as one not shown.
+    assert entry["more_hits"] == 1
