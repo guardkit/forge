@@ -2,7 +2,7 @@
 
 The design of record is ai-transition
 ``docs/designs/already-done-outcome-2026-10-07.md``, Part 2 sections 4 and 7
-(Rich's simple option; Codex round 1, R1). The whole chain is driven with
+(the accepted design's simple option; design review R1). The whole chain is driven with
 ``drive()`` from a queued sentence, on a real SQLite store, with fakes only
 at the wire seams, and with spies on the three legs that must never run after
 this outcome: the pass bars, the feature gate and the build trigger.

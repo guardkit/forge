@@ -2563,7 +2563,7 @@ class PlanningRunDriver:
     ) -> None:
         """End a run whose plan writer answered "already done, nothing to build".
 
-        Rich's option of 7 October 2026: Forge ends the run with one plain
+        the accepted design (already-done-outcome): Forge ends the run with one plain
         message listing the proof: no build, no merge, no card, no new
         approval. Three steps:
 

@@ -21,7 +21,7 @@ never writes a ``feature-plan`` event, so the plan leg's re-drive shortcut can
 never mistake it for a committed plan.
 
 Design of record: ai-transition ``docs/designs/already-done-outcome-2026-10-07.md``
-(Rich's simple option, 7 October 2026), Part 2 section 4.
+(the accepted design's simple option), Part 2 section 4.
 """
 
 from __future__ import annotations

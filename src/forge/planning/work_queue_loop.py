@@ -1016,7 +1016,7 @@ class WorkQueueLoop:
             if state in success:
                 # "Already done, nothing to build" (7 October 2026): the run
                 # ended in the success state with nothing built, and the row
-                # closes saying so, with the first line of the proof Rich was
+                # closes saying so, with the first line of the proof the owner was
                 # sent. Every other success closes exactly as before.
                 already_done = (
                     None
