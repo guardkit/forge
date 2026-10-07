@@ -124,7 +124,7 @@ def was_rejected_by_owner(row: sqlite3.Row | Mapping[str, Any]) -> bool:
 
 def closed_word(row: sqlite3.Row | Mapping[str, Any]) -> str:
     """How a closed row's status is spoken: done, withdrawn, blocked — or
-    ``rejected by you`` for a blocked row that closed on Rich's own reject,
+    ``rejected by you`` for a blocked row that closed on the owner's own reject,
     or ``already done, nothing to build`` for a done row whose planning run
     found the work already in the repository (7 October 2026).
 
