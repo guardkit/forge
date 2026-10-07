@@ -231,7 +231,10 @@ class RecordingGitRunner:
         #: repository unreachable puts its own reader here.
         self.reader: Any = _EmptyRepository()
 
-    def code_reader(self) -> Any:
+    def code_reader(self, commit: str | None = None) -> Any:
+        #: The commit the planner asked to read at (7 October 2026): the
+        #: run's recorded start.
+        self.read_at = commit
         return self.reader
 
     async def fetch_remote_start_point(self, repo_path: str) -> Any:

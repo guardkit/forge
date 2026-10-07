@@ -1880,3 +1880,128 @@ def test_a_long_hand_written_line_with_the_hit_near_its_start_keeps_its_window(
     (window,) = entry["evidence"]
     assert window["path"] == "src/routes.src" and "/things/{thing_id}" in window["text"]
     assert "more_hits" not in entry
+
+
+# -- reading at the commit the work starts from (7 October 2026) -----------
+#
+# The sandbox clone's working tree was four days behind the commit every run
+# started from, with local edits, and the planner read the working tree.
+
+
+def _lagging_checkout(tmp_path: Path) -> tuple[Path, str]:
+    """A checkout whose working tree lags a newer commit it holds (the run's
+    start), with a local edit and an untracked file. Returns ``(checkout,
+    start commit)``."""
+    root = _repo(
+        tmp_path / "checkout",
+        {"src/things/router.py": "# old router\n", "deploy/runner.sh": "echo committed\n"},
+    )
+    git = ["git", "-C", str(root), "-c", "user.name=t", "-c", "user.email=t@t"]
+    subprocess.run([*git, "checkout", "-q", "-b", "work"], check=True)
+    (root / "src/things/router.py").write_text(THING_ROUTER, encoding="utf-8")
+    (root / "src/things/report.py").write_text("def tally_report(): ...\n", encoding="utf-8")
+    subprocess.run([*git, "add", "-A"], check=True)
+    subprocess.run([*git, "commit", "-q", "-m", "the start"], check=True)
+    start = subprocess.run(
+        [*git, "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+    ).stdout.strip()
+    # The checked-out tree goes back to the older commit, then the factory
+    # edits a file in it and leaves a stray one.
+    subprocess.run([*git, "checkout", "-q", "HEAD~1"], check=True)
+    (root / "deploy/runner.sh").write_text("echo /things/{thing_id} local edit\n", encoding="utf-8")
+    (root / "src/stray.py").write_text("# /things/{thing_id} stray\n", encoding="utf-8")
+    return root, start
+
+
+def test_a_local_checkout_read_at_the_start_commit_never_reads_its_working_tree(
+    tmp_path: Path,
+) -> None:
+    root, start = _lagging_checkout(tmp_path)
+    reader = LocalCheckoutReader(str(root), commit=start)
+    assert "src/things/report.py" in reader.list_files()
+    assert "src/stray.py" not in reader.list_files()
+    assert reader.read_text("src/things/router.py") == THING_ROUTER
+    assert reader.read_text("deploy/runner.sh") == "echo committed\n"
+    assert reader.read_text("src/stray.py") is None
+    places = reader.places_mentioning("/{thing_id}")
+    assert places == ["src/things/router.py:7"]
+    assert reader.files_mentioning("tally", ignore_case=True) == ["src/things/report.py"]
+    assert reader.lines_mentioning("tally_report") == [
+        ("src/things/report.py", 1, "def tally_report(): ...")
+    ]
+    # The working tree, without a commit, is what it always was.
+    plain = LocalCheckoutReader(str(root))
+    assert "src/things/report.py" not in plain.list_files()
+
+
+def test_the_descriptor_at_the_start_commit_shows_the_start_not_the_checkout(
+    tmp_path: Path,
+) -> None:
+    root, start = _lagging_checkout(tmp_path)
+    spec = "Feature: x\n  Scenario: y\n    Given the tally_report\n"
+    descriptor, reasons, _ = _descriptor(
+        LocalCheckoutReader(str(root), commit=start), spec=spec
+    )
+    assert reasons == []
+    entries = descriptor["where_the_specs_words_already_appear"]
+    shown = {w["path"] for e in entries for w in e.get("evidence") or []}
+    assert "src/things/router.py" in shown and "src/things/report.py" in shown
+    assert not any("deploy/runner.sh" in p or "stray" in p for e in entries for p in e["already_in"])
+
+
+def test_a_start_commit_the_checkout_cannot_get_is_said_never_read_from_the_tree(
+    tmp_path: Path,
+) -> None:
+    root, _start = _lagging_checkout(tmp_path)
+    reader = LocalCheckoutReader(str(root), commit="0123456789abcdef0123")
+    with pytest.raises(RepositoryUnreadable, match="could not read the starting commit 0123456789abcdef0123"):
+        reader.list_files()
+    descriptor, reasons, _ = _descriptor(reader)
+    assert "where_the_specs_words_already_appear" not in descriptor
+    assert any("could not read the starting commit" in r for r in reasons)
+
+
+def test_a_start_commit_missing_locally_is_fetched_from_the_remote(tmp_path: Path) -> None:
+    seed = _repo(tmp_path / "seed", {"a.txt": "one\n"})
+    git = ["git", "-c", "user.name=t", "-c", "user.email=t@t"]
+    subprocess.run(["git", "clone", "-q", str(seed), str(tmp_path / "copy")], check=True)
+    (seed / "b.txt").write_text("two\n", encoding="utf-8")
+    subprocess.run([*git, "-C", str(seed), "add", "-A"], check=True)
+    subprocess.run([*git, "-C", str(seed), "commit", "-q", "-m", "more"], check=True)
+    newer = subprocess.run(
+        ["git", "-C", str(seed), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+    ).stdout.strip()
+    reader = LocalCheckoutReader(str(tmp_path / "copy"), commit=newer)
+    assert reader.read_text("b.txt") == "two\n"
+
+
+def test_the_helper_reader_reads_at_the_start_commit(tmp_path: Path) -> None:
+    root, start = _lagging_checkout(tmp_path)
+    with _serving(root) as url:
+        reader = SidecarCodeReader(url, repo=REPO_KEY, commit=start)
+        assert reader.read_text("src/things/router.py") == THING_ROUTER
+        assert reader.read_text("deploy/runner.sh") == "echo committed\n"
+        assert reader.places_mentioning("/{thing_id}") == ["src/things/router.py:7"]
+        assert "src/things/report.py" in reader.list_files()
+        assert "src/stray.py" not in reader.list_files()
+        missing = SidecarCodeReader(url, repo=REPO_KEY, commit="0123456789abcdef")
+        with pytest.raises(RepositoryUnreadable, match="could not read the starting commit"):
+            missing.list_files()
+        # Said once, then every later read says it at once.
+        with pytest.raises(RepositoryUnreadable, match="could not read the starting commit"):
+            missing.read_text("src/things/router.py")
+
+
+def test_a_helper_too_old_to_read_at_a_commit_is_never_believed(tmp_path: Path) -> None:
+    """A helper that ignores ``commit`` answers from its working tree without
+    saying so: its answer is refused, never used."""
+    root, start = _lagging_checkout(tmp_path)
+    with _serving(root) as url:
+        def old_helper(address: str, body: dict, timeout: float):
+            from forge.planning.sidecar_git_runner import _urllib_post
+
+            return _urllib_post(address, {k: v for k, v in body.items() if k != "commit"}, timeout)
+
+        reader = SidecarCodeReader(url, repo=REPO_KEY, commit=start, post=old_helper)
+        with pytest.raises(RepositoryUnreadable, match="answered without saying it read that commit"):
+            reader.read_text("src/things/router.py")

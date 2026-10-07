@@ -1791,3 +1791,153 @@ class TestTheRefusalsThatAlreadyHeldStillHold:
         assert status == 200, body
         assert len(calls) == 1, calls
         assert calls[0][-2:] == ["ls-files", "-z"]
+
+
+# ---------------------------------------------------------------------------
+# The code door at a commit (7 October 2026)
+#
+# The factory's own clone in a sandbox was four days behind the commit the
+# work started from, with local edits in its working tree, and every route
+# read the working tree. With ``commit`` every route reads that commit out
+# of git's objects and nothing else.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def lagging(tmp_path: Path) -> tuple[Path, str, str]:
+    """A remote whose main is one commit ahead of a clone's checked-out
+    tree, and a clone whose working tree also carries a local edit and an
+    untracked file. Returns ``(clone, old commit, new commit)``."""
+    seed = tmp_path / "seed"
+    (seed / "lib").mkdir(parents=True)
+    (seed / "lib" / "thing.src").write_text("value = old\n", encoding="utf-8")
+    (seed / "lib" / "same.src").write_text("unchanged\n", encoding="utf-8")
+    _git(seed, "init", "-q", "-b", "main")
+    _git(seed, "add", "-A")
+    _git(seed, "commit", "-qm", "old")
+    old = _git(seed, "rev-parse", "HEAD").stdout.strip()
+    remote = tmp_path / "remote.git"
+    _git(tmp_path, "clone", "-q", "--bare", str(seed), str(remote))
+    clone = tmp_path / "clone"
+    _git(tmp_path, "clone", "-q", str(remote), str(clone))
+    # The remote moves on: the thing changes, a new file arrives, a link.
+    (seed / "lib" / "thing.src").write_text("value = new\n", encoding="utf-8")
+    (seed / "lib" / "only_at_new.src").write_text("value = arrived\n", encoding="utf-8")
+    (seed / "lib" / "alias.src").symlink_to("thing.src")
+    (seed / "lib" / "away.src").symlink_to("../../elsewhere/secret.txt")
+    _git(seed, "add", "-A")
+    _git(seed, "commit", "-qm", "new")
+    new = _git(seed, "rev-parse", "HEAD").stdout.strip()
+    _git(seed, "push", "-q", str(remote), "main")
+    # The clone's working tree: the factory's own local edit, and a file
+    # nobody committed.
+    (clone / "lib" / "same.src").write_text("value = local edit\n", encoding="utf-8")
+    (clone / "lib" / "untracked.src").write_text("value = stray\n", encoding="utf-8")
+    return clone, old, new
+
+
+class TestTheCodeDoorAtACommit:
+    def _cfg(self, clone: Path) -> ForgeConfig:
+        return _config({REPO_KEY: str(clone)})
+
+    def test_every_route_reads_the_commit_and_never_the_working_tree(
+        self, lagging: tuple[Path, str, str]
+    ) -> None:
+        clone, old, new = lagging
+        cfg = self._cfg(clone)
+        # The new commit is not in the clone yet: it is fetched once.
+        missing = subprocess.run(
+            ["git", "cat-file", "-e", f"{new}^{{commit}}"], cwd=clone, capture_output=True
+        )
+        assert missing.returncode != 0
+        status, body = process_code_list_files_request(
+            {"repo": REPO_KEY, "commit": new[:10]}, config=cfg
+        )
+        assert status == 200, body
+        assert body["commit"] == new
+        assert "lib/only_at_new.src" in body["files"]
+        assert "lib/untracked.src" not in body["files"]
+
+        status, body = process_code_read_file_request(
+            {"repo": REPO_KEY, "path": "lib/thing.src", "commit": new}, config=cfg
+        )
+        assert status == 200 and body["content"] == "value = new\n" and body["commit"] == new
+        # The local edit in the working tree never reaches an answer.
+        status, body = process_code_read_file_request(
+            {"repo": REPO_KEY, "path": "lib/same.src", "commit": new}, config=cfg
+        )
+        assert status == 200 and body["content"] == "unchanged\n"
+
+        status, body = process_code_search_request(
+            {"repo": REPO_KEY, "pattern": "value =", "fixed_string": True, "commit": new},
+            config=cfg,
+        )
+        assert status == 200 and body["commit"] == new
+        found = {(m["path"], m["text"]) for m in body["matches"]}
+        assert ("lib/only_at_new.src", "value = arrived") in found
+        assert ("lib/thing.src", "value = new") in found
+        # The link to a file the commit holds is searched as that file.
+        assert ("lib/alias.src", "value = new") in found
+        assert not any("local edit" in text or "stray" in text for _p, text in found)
+
+        # And the old commit is still readable as itself.
+        status, body = process_code_read_file_request(
+            {"repo": REPO_KEY, "path": "lib/thing.src", "commit": old}, config=cfg
+        )
+        assert status == 200 and body["content"] == "value = old\n"
+        status, body = process_code_read_file_request(
+            {"repo": REPO_KEY, "path": "lib/only_at_new.src", "commit": old}, config=cfg
+        )
+        assert status == 400 and "is not a file at the commit" in body["error"]
+
+    def test_a_link_out_of_the_tree_is_refused_at_a_commit(
+        self, lagging: tuple[Path, str, str]
+    ) -> None:
+        clone, _old, new = lagging
+        status, body = process_code_read_file_request(
+            {"repo": REPO_KEY, "path": "lib/away.src", "commit": new}, config=self._cfg(clone)
+        )
+        assert status == 400 and "leaves the repository" in body["error"]
+        status, body = process_code_read_file_request(
+            {"repo": REPO_KEY, "path": "lib/alias.src", "commit": new}, config=self._cfg(clone)
+        )
+        assert status == 200 and body["content"] == "value = new\n"
+
+    def test_a_commit_nobody_has_is_could_not_read_never_the_working_tree(
+        self, lagging: tuple[Path, str, str]
+    ) -> None:
+        clone, _old, _new = lagging
+        for handler, extra in (
+            (process_code_list_files_request, {}),
+            (process_code_read_file_request, {"path": "lib/thing.src"}),
+            (process_code_search_request, {"pattern": "value"}),
+            (process_code_imports_request, {"path": "lib"}),
+        ):
+            status, body = handler(
+                {"repo": REPO_KEY, "commit": "0123456789abcdef", **extra},
+                config=self._cfg(clone),
+            )
+            assert status == 409, body
+            assert body["commit_unavailable"] is True
+            assert body["error"].startswith("could not read the starting commit 0123456789abcdef")
+            assert "files" not in body and "content" not in body and "matches" not in body
+
+    def test_a_commit_that_is_not_a_commit_id_is_refused(
+        self, lagging: tuple[Path, str, str]
+    ) -> None:
+        clone, _old, _new = lagging
+        for bad in ("HEAD", "main", "--all", "abc", 12345):
+            status, body = process_code_list_files_request(
+                {"repo": REPO_KEY, "commit": bad}, config=self._cfg(clone)
+            )
+            assert status == 400 and "'commit' must be a commit id" in body["error"]
+
+    def test_without_a_commit_the_working_tree_is_read_as_before(
+        self, lagging: tuple[Path, str, str]
+    ) -> None:
+        clone, _old, _new = lagging
+        status, body = process_code_read_file_request(
+            {"repo": REPO_KEY, "path": "lib/same.src"}, config=self._cfg(clone)
+        )
+        assert status == 200 and body["content"] == "value = local edit\n"
+        assert "commit" not in body

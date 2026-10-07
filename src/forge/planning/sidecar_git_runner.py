@@ -194,6 +194,15 @@ class SidecarCodeReader:
     reader's life (one planning run) and every later read says so at once;
     each pass started with :meth:`begin` may spend at most
     :data:`FACT_GATHERING_BUDGET_S`.
+
+    AT THE COMMIT THE WORK STARTS FROM (7 October 2026). With ``commit``,
+    every read is made at that commit: the helper reads git's objects, never
+    the clone's working tree, which on 7 October was four days behind its
+    remote and carried the factory's own local edits. Every answer must say
+    it was read at that commit; a helper too old to read at a commit (it
+    would answer from the working tree without saying so) and a commit the
+    clone cannot get are each "could not read the starting commit", for the
+    rest of the reader's life. Never the working tree instead.
     """
 
     def __init__(
@@ -204,6 +213,7 @@ class SidecarCodeReader:
         post: HttpPost = _urllib_post,
         timeout_s: float = _DEFAULT_CODE_READ_TIMEOUT_S,
         clock: Callable[[], float] | None = None,
+        commit: str | None = None,
     ) -> None:
         import time
 
@@ -212,7 +222,10 @@ class SidecarCodeReader:
         self._post = post
         self._timeout_s = timeout_s
         self._clock = clock or time.monotonic
-        self.where = f"{repo} through the sandbox helper at {self._base_url}"
+        self._commit = (commit or "").strip() or None
+        self.where = f"{repo} through the sandbox helper at {self._base_url}" + (
+            f", at the commit {self._commit[:12]}" if self._commit else ""
+        )
         #: Plain sentences, one per answer that came back incomplete.
         self.cuts: list[str] = []
         #: The sentence when the listing itself was cut, else ``None``.
@@ -247,14 +260,47 @@ class SidecarCodeReader:
                 )
             timeout = min(timeout, left)
         url = f"{self._base_url}{route}"
+        sent = {"repo": self._repo, **body}
+        if self._commit:
+            sent["commit"] = self._commit
         try:
-            return self._post(url, {"repo": self._repo, **body}, timeout)
+            status, decoded = self._post(url, sent, timeout)
         except Exception as exc:  # noqa: BLE001 — transport boundary
             self._dead = (
                 f"the sandbox helper at {self._base_url} could not be reached "
                 f"for {route} ({type(exc).__name__}: {str(exc)[:160]})"
             )
             raise RepositoryUnreadable(self._dead) from exc
+        if self._commit:
+            self._check_read_at_commit(route, status, decoded)
+        return status, decoded
+
+    def _check_read_at_commit(self, route: str, status: int, decoded: Any) -> None:
+        """Raise unless the helper read at :attr:`_commit`: a commit it could
+        not get, or an answer that does not say it was read at the commit (a
+        helper older than reads at a commit), is never served as the code."""
+        from forge.planning.repository_facts import RepositoryUnreadable
+
+        if isinstance(decoded, dict) and decoded.get("commit_unavailable"):
+            self._dead = str(decoded.get("error") or "") or (
+                f"could not read the starting commit {self._commit} through the "
+                f"sandbox helper at {self._base_url}"
+            )
+            raise RepositoryUnreadable(self._dead)
+        if status != 200:
+            return
+        said = decoded.get("commit") if isinstance(decoded, dict) else None
+        commit = self._commit or ""
+        if not isinstance(said, str) or not said or not (
+            said.startswith(commit) or commit.startswith(said)
+        ):
+            self._dead = (
+                f"could not read the starting commit {commit} through the sandbox "
+                f"helper at {self._base_url}: its {route} answered without saying "
+                "it read that commit (a helper older than reads at a commit "
+                "answers from its working tree), so nothing it said is used"
+            )
+            raise RepositoryUnreadable(self._dead)
 
     def _refused(self, route: str, status: int, decoded: Any) -> Exception:
         from forge.planning.repository_facts import RepositoryUnreadable
@@ -535,10 +581,13 @@ class SidecarGitRunner:
         """This runner takes the declared form, never a closure."""
         return True
 
-    def code_reader(self) -> SidecarCodeReader:
+    def code_reader(self, commit: str | None = None) -> SidecarCodeReader:
         """A reader of this repository's tracked files through the helper's
-        read-only code door — what the planner's fact sheet reads."""
-        return SidecarCodeReader(self._base_url, repo=self._repo, post=self._post)
+        read-only code door — what the planner's fact sheet reads. With
+        ``commit`` (7 October 2026), every read is at that commit."""
+        return SidecarCodeReader(
+            self._base_url, repo=self._repo, post=self._post, commit=commit
+        )
 
     # -- the wire ----------------------------------------------------------
 

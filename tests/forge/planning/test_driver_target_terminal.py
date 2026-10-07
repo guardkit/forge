@@ -8143,21 +8143,29 @@ async def test_the_plan_writers_inventory_comes_from_the_sandbox_helper(
     store: SqlitePlanningRunStore, tmp_path: Path
 ) -> None:
     """The plan-writer's inventory is the sandbox clone's, read through the
-    helper — a file only that clone tracks is on it — and nothing says the
-    repository could not be read."""
+    helper at the commit the run starts from — a file the coordinator's
+    checkout does not have is on it — and nothing says the repository could
+    not be read."""
     from forge.planning.sidecar_git_runner import SidecarCodeReader
 
     repo = tmp_path / "api_test"
     _init_repo_with_a_stats_route(repo)
+    origin = subprocess.run(
+        ["git", "remote", "get-url", "origin"], cwd=repo, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
     clone = tmp_path / "sandbox-clone"
-    _init_repo_with_a_stats_route(clone)
+    subprocess.run(["git", "clone", "-q", origin, str(clone)], check=True, env=_git_env())
     (clone / "src" / "only_in_the_sandbox_clone.py").write_text("x = 1\n")
     _git(clone, "add", "-A")
     _git(clone, "commit", "-qm", "the clone's own file")
+    subprocess.run(["git", "push", "-q", "origin", "HEAD"], cwd=clone, check=True, env=_git_env())
     url, stop = _helper_over(clone)
     try:
         git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
-        git.code_reader = lambda: SidecarCodeReader(url, repo=TARGET_REPO)  # type: ignore[attr-defined]
+        git.code_reader = lambda commit=None: SidecarCodeReader(  # type: ignore[attr-defined]
+            url, repo=TARGET_REPO, commit=commit
+        )
         _queue(store)
         h = _make_driver(store, git_runner=git, repo_path=str(repo))
         await h.driver.drive(CID)
@@ -8190,7 +8198,9 @@ async def test_an_unreadable_repository_reaches_the_plan_writer_and_the_build_ga
     repo = tmp_path / "api_test"
     _init_repo_with_a_stats_route(repo)
     git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
-    git.code_reader = lambda: SidecarCodeReader(url, repo=TARGET_REPO)  # type: ignore[attr-defined]
+    git.code_reader = lambda commit=None: SidecarCodeReader(  # type: ignore[attr-defined]
+        url, repo=TARGET_REPO, commit=commit
+    )
     _queue(store)
     h = _make_driver(store, git_runner=git, repo_path=str(repo))
     await h.driver.drive(CID)
@@ -8365,6 +8375,8 @@ async def test_a_big_plan_carries_the_size_line_on_its_record_and_still_builds(
         (repo / rel).write_text(text)
     _git(repo, "add", "-A")
     _git(repo, "commit", "-qm", "earlier plans")
+    # On the remote: the planner reads the commit the work starts from.
+    _publish_to_origin(repo)
     git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
 
     def big_plan(feature_id: str) -> Any:
@@ -8395,3 +8407,38 @@ def test_earlier_plans_estimated_at_nothing_never_make_every_plan_look_big() -> 
     note, receipt = read_plan_size_note(_PlansReader(_earlier(6, tasks=3, minutes=0)), small)
     assert note is None
     assert receipt["compared_with"] == 0
+
+
+@pytest.mark.asyncio
+async def test_the_planner_reads_the_commit_the_run_starts_from_not_the_checkout(
+    store: SqlitePlanningRunStore, tmp_path: Path
+) -> None:
+    """7 October 2026: the copy's checked-out tree lagged the remote's main
+    the run started from, and the planner was shown the old tree. Now a file
+    that only the start commit has is on the plan-writer's inventory, and a
+    local edit in the checkout reaches nothing."""
+    repo = tmp_path / "api_test"
+    _init_repo_with_a_stats_route(repo)
+    origin = subprocess.run(
+        ["git", "remote", "get-url", "origin"], cwd=repo, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    elsewhere = tmp_path / "elsewhere"
+    subprocess.run(["git", "clone", "-q", origin, str(elsewhere)], check=True, env=_git_env())
+    (elsewhere / "src" / "arrived_on_main.py").write_text("x = 1\n")
+    _git(elsewhere, "add", "-A")
+    _git(elsewhere, "commit", "-qm", "main moves on")
+    subprocess.run(["git", "push", "-q", "origin", "HEAD"], cwd=elsewhere, check=True, env=_git_env())
+    (repo / "src" / "local_only.py").write_text("y = 2\n")
+    _git(repo, "add", "src/local_only.py")
+
+    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    _queue(store)
+    h = _make_driver(store, git_runner=git, repo_path=str(repo))
+    await h.driver.drive(CID)
+
+    counters = h.ctx["counters"]
+    assert counters["plan"] == 1
+    inventory = counters["last_descriptor"]["repository_inventory"]["files"]
+    assert "src/arrived_on_main.py" in inventory
+    assert "src/local_only.py" not in inventory

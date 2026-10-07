@@ -3955,17 +3955,40 @@ class PlanningRunDriver:
         With ``correlation_id`` the reader is kept for the run, so a helper
         found unreachable once is not waited on again by every later read of
         the same run (the 1 October planner fix, review round 1).
+
+        AT THE RUN'S STARTING COMMIT (7 October 2026). The reader reads the
+        commit the run recorded as its start, never whatever the copy has
+        checked out. Until then it read the sandbox clone's working tree,
+        which on 7 October was four days behind the remote's main the run
+        started from, and carried the factory's own local edits to two
+        deploy files: every plan in those four days was shown four-day-old
+        code. A commit that cannot be read is said as "could not read the
+        starting commit", never answered from the working tree. A run with
+        no recorded start (only one older than the starting rule) reads as
+        before.
         """
         cache: dict[tuple[str, str], Any] = self.__dict__.setdefault("_repository_readers", {})
         key = (str(correlation_id), str(repo_path))
         if correlation_id is not None and key in cache:
             return cache[key]
+        commit: str | None = None
+        start_point = getattr(getattr(self._deps, "store", None), "get_start_point", None)
+        if correlation_id is not None and callable(start_point):
+            try:
+                recorded = start_point(correlation_id)
+                commit = recorded[0] if isinstance(recorded, tuple) and recorded else None
+            except Exception:  # noqa: BLE001 — a store that cannot say has no start
+                commit = None
+            commit = commit if isinstance(commit, str) and commit.strip() else None
         runner = self._deps.git_runner
         route = getattr(runner, "runner_for_path", None)
         if callable(route):
             runner = route(repo_path)
         make = getattr(runner, "code_reader", None)
-        reader = make() if callable(make) else LocalCheckoutReader(repo_path)
+        if callable(make):
+            reader = make(commit) if commit else make()
+        else:
+            reader = LocalCheckoutReader(repo_path, commit=commit)
         if correlation_id is not None:
             cache[key] = reader
         return reader
