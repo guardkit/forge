@@ -6759,6 +6759,74 @@ class _TreeEntry:
     size: int | None
 
 
+class _GitStalled(OSError):
+    """git stopped producing output within :data:`CODE_GIT_TIMEOUT_SECONDS`."""
+
+
+class _DeadlinePipe:
+    """A child's stdout read with a deadline on every wait for output. A
+    child that goes quiet past the deadline is killed and reaped, and the
+    read raises :class:`_GitStalled` with one plain sentence."""
+
+    def __init__(self, process: "subprocess.Popen[bytes]", what: str) -> None:
+        self.process = process
+        self.what = what
+        self.buffer = b""
+        assert process.stdout is not None
+        self._fd = process.stdout.fileno()
+
+    def _more(self) -> bytes:
+        import select
+
+        ready, _w, _x = select.select([self._fd], [], [], CODE_GIT_TIMEOUT_SECONDS)
+        if not ready:
+            self.stop()
+            raise _GitStalled(
+                f"git stopped answering while {self.what} (no output for "
+                f"{CODE_GIT_TIMEOUT_SECONDS:g} seconds); it was stopped"
+            )
+        return os.read(self._fd, CODE_READ_CHUNK_BYTES)
+
+    def read(self, size: int = -1) -> bytes:
+        """Up to ``size`` bytes (``b""`` at the end), as a file's read."""
+        if not self.buffer:
+            self.buffer = self._more()
+        if size < 0 or size >= len(self.buffer):
+            out, self.buffer = self.buffer, b""
+        else:
+            out, self.buffer = self.buffer[:size], self.buffer[size:]
+        return out
+
+    def read_line(self) -> bytes:
+        while b"\n" not in self.buffer:
+            chunk = self._more()
+            if not chunk:
+                break
+            self.buffer += chunk
+        line, sep, rest = self.buffer.partition(b"\n")
+        self.buffer = rest
+        return line + sep
+
+    def read_exactly(self, size: int) -> bytes:
+        while len(self.buffer) < size:
+            chunk = self._more()
+            if not chunk:
+                break
+            self.buffer += chunk
+        out, self.buffer = self.buffer[:size], self.buffer[size:]
+        return out
+
+    def stop(self) -> None:
+        try:
+            self.process.kill()
+        except OSError:
+            pass
+        try:
+            self.process.wait(timeout=CODE_GIT_TIMEOUT_SECONDS)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+
 class _CommitTree:
     """One commit's tracked files, read only out of git's objects."""
 
@@ -6767,7 +6835,9 @@ class _CommitTree:
         self.commit = commit
         self.entries = entries
         self.files = sorted(entries)
-        self._batch: subprocess.Popen[bytes] | None = None
+        self._batch: _DeadlinePipe | None = None
+        #: Set once git stalls: every later read of this request says it.
+        self.stalled: str | None = None
 
     # -- reading blobs ------------------------------------------------------
 
@@ -6777,56 +6847,70 @@ class _CommitTree:
     def blob(self, oid: str) -> bytes:
         """One object's whole content, through one ``cat-file --batch``
         process kept for the request, so a search costs one process, not one
-        per file. Raises ``OSError`` when git cannot answer."""
+        per file. Every wait for output has the door's git deadline; a git
+        that stalls is stopped, and this and every later read raise
+        :class:`_GitStalled`. Raises ``OSError`` when git cannot answer."""
+        if self.stalled is not None:
+            raise _GitStalled(self.stalled)
         if self._batch is None:
-            self._batch = subprocess.Popen(  # noqa: S603 — fixed argv, no shell
+            process = subprocess.Popen(  # noqa: S603 — fixed argv, no shell
                 self._git_argv("cat-file", "--batch"),
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
             )
+            self._batch = _DeadlinePipe(process, f"reading the commit {self.commit[:12]}")
         batch = self._batch
-        assert batch.stdin is not None and batch.stdout is not None
-        batch.stdin.write(oid.encode("ascii") + b"\n")
-        batch.stdin.flush()
-        header = batch.stdout.readline().decode("ascii", errors="replace").split()
-        if len(header) != 3 or header[1] != "blob":
-            raise OSError(f"git could not read object {oid} ({' '.join(header) or 'no answer'})")
-        size = int(header[2])
-        data = batch.stdout.read(size)
-        batch.stdout.read(1)
+        stdin = batch.process.stdin
+        assert stdin is not None
+        try:
+            stdin.write(oid.encode("ascii") + b"\n")
+            stdin.flush()
+            header = batch.read_line().decode("ascii", errors="replace").split()
+            if len(header) != 3 or header[1] != "blob":
+                raise OSError(
+                    f"git could not read object {oid} ({' '.join(header) or 'no answer'})"
+                )
+            size = int(header[2])
+            data = batch.read_exactly(size)
+            batch.read_exactly(1)
+        except _GitStalled as exc:
+            self.stalled = str(exc)
+            self._batch = None
+            raise
         if len(data) != size:
             raise OSError(f"git answered {len(data)} of the {size} bytes of object {oid}")
         return data
 
     def stream(self, oid: str) -> Any:
         """A context manager giving a binary stream of one object, for a
-        file too big to hold whole; the process ends when the stream does."""
+        file too big to hold whole, with the same deadline on every wait;
+        the process is stopped and reaped when the stream ends."""
         import contextlib
 
         @contextlib.contextmanager
         def opened() -> Any:
+            if self.stalled is not None:
+                raise _GitStalled(self.stalled)
             process = subprocess.Popen(  # noqa: S603 — fixed argv, no shell
                 self._git_argv("cat-file", "blob", oid),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
             )
+            pipe = _DeadlinePipe(process, f"reading a file at the commit {self.commit[:12]}")
             try:
-                assert process.stdout is not None
-                yield process.stdout
+                yield pipe
+            except _GitStalled as exc:
+                self.stalled = str(exc)
+                raise
             finally:
-                process.kill()
-                process.wait()
+                pipe.stop()
 
         return opened
 
     def close(self) -> None:
         if self._batch is not None:
-            try:
-                self._batch.kill()
-                self._batch.wait()
-            except OSError:
-                pass
+            self._batch.stop()
             self._batch = None
 
     # -- which file a path is -----------------------------------------------
@@ -7003,6 +7087,10 @@ def _code_at_commit(
         status, body = handler(tree, payload)
     finally:
         tree.close()
+    if tree.stalled is not None and kind != "search":
+        # git went quiet past the door's deadline and was stopped: said as
+        # what it is, never as a file that is not there.
+        return 504, {"error": tree.stalled, "git_stalled": True}
     if status == 200:
         body["commit"] = tree.commit
     return status, body
@@ -7203,7 +7291,13 @@ def _search_at(tree: _CommitTree, payload: dict[str, Any]) -> tuple[int, dict[st
 
             yield path, read
 
-    return 200, _search_walk(compiled, pattern, fixed, prefix, limit, contents())
+    body = _search_walk(compiled, pattern, fixed, prefix, limit, contents())
+    if tree.stalled is not None:
+        # The walk was cut short by git going quiet: the answer is partial,
+        # and says so the way a search that ran out of time does.
+        body["timed_out"] = True
+        body["stalled"] = tree.stalled
+    return 200, body
 
 
 # ---------------------------------------------------------------------------

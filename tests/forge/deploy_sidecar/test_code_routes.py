@@ -1941,3 +1941,73 @@ class TestTheCodeDoorAtACommit:
         )
         assert status == 200 and body["content"] == "value = local edit\n"
         assert "commit" not in body
+
+
+class TestAGitThatGoesQuietAtACommit:
+    """Codex round 1, R4: every wait for git's output at a commit has the
+    door's deadline; a git that stops answering is stopped and reaped, and
+    the answer says so."""
+
+    @pytest.fixture
+    def quiet(
+        self, lagging: tuple[Path, str, str], monkeypatch: pytest.MonkeyPatch
+    ) -> tuple[ForgeConfig, str, list[Any]]:
+        clone, old, _new = lagging
+        # A file over the byte cap, for the streamed line-range read.
+        (clone / "lib" / "big.src").write_text("line\n" * 60_000, encoding="utf-8")
+        _git(clone, "add", "lib/big.src")
+        _git(clone, "commit", "-qm", "big")
+        head = _git(clone, "rev-parse", "HEAD").stdout.strip()
+        monkeypatch.setattr(sidecar, "CODE_GIT_TIMEOUT_SECONDS", 0.5)
+        monkeypatch.setattr(
+            sidecar._CommitTree, "_git_argv", lambda self, *args: ["sleep", "30"]
+        )
+        started: list[Any] = []
+        real = subprocess.Popen
+
+        def recording(*args: Any, **kwargs: Any) -> Any:
+            process = real(*args, **kwargs)
+            started.append(process)
+            return process
+
+        monkeypatch.setattr(sidecar.subprocess, "Popen", recording)
+        return _config({REPO_KEY: str(clone)}), head, started
+
+    def test_a_read_is_stopped_said_and_its_child_reaped(
+        self, quiet: tuple[ForgeConfig, str, list[Any]]
+    ) -> None:
+        cfg, head, started = quiet
+        began = time.monotonic()
+        status, body = process_code_read_file_request(
+            {"repo": REPO_KEY, "path": "lib/thing.src", "commit": head}, config=cfg
+        )
+        assert time.monotonic() - began < 10
+        assert status == 504 and body["git_stalled"] is True
+        assert "git stopped answering" in body["error"] and "content" not in body
+        assert started and all(p.poll() is not None for p in started)
+
+    def test_a_streamed_line_range_is_stopped_too(
+        self, quiet: tuple[ForgeConfig, str, list[Any]]
+    ) -> None:
+        cfg, head, started = quiet
+        status, body = process_code_read_file_request(
+            {"repo": REPO_KEY, "path": "lib/big.src", "commit": head, "first_line": 5,
+             "last_line": 6},
+            config=cfg,
+        )
+        assert status == 504 and "git stopped answering" in body["error"]
+        assert started and all(p.poll() is not None for p in started)
+
+    def test_a_search_stops_and_says_it_is_partial(
+        self, quiet: tuple[ForgeConfig, str, list[Any]]
+    ) -> None:
+        cfg, head, started = quiet
+        status, body = process_code_search_request(
+            {"repo": REPO_KEY, "pattern": "value", "commit": head}, config=cfg
+        )
+        assert status == 200
+        assert body["timed_out"] is True and "git stopped answering" in body["stalled"]
+        assert body["matches"] == []
+        # One quiet git, stopped once: the rest of the walk started no other.
+        quiet_ones = [p for p in started if p.args == ["sleep", "30"]]
+        assert len(quiet_ones) == 1 and quiet_ones[0].poll() is not None

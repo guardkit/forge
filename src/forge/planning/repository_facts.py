@@ -212,6 +212,9 @@ class LocalCheckoutReader:
         self._full: str | None = None
         #: ``path -> (mode, object id, size)`` at the commit, read once.
         self._entries: dict[str, tuple[str, str, int | None]] | None = None
+        #: Why the commit could not be read, once that is known: every later
+        #: read says it at once, and the remote is fetched at most once.
+        self._unavailable: str | None = None
         self.where = f"the checkout at {self._root}" + (
             f", at the commit {self._commit[:12]}" if self._commit else ""
         )
@@ -249,13 +252,30 @@ class LocalCheckoutReader:
 
     # -- at a commit ----------------------------------------------------------
 
+    @property
+    def commit(self) -> str | None:
+        """The commit every read is made at, or ``None`` for the working tree."""
+        return self._commit
+
     def _at(self) -> str | None:
-        """The commit's full id when reading at a commit, else ``None``;
-        fetches the remote once when the checkout does not have it."""
+        """The commit's full id when reading at a commit, else ``None``.
+        Fetches the remote at most once in the reader's life when the
+        checkout does not have the commit; a commit that cannot be read is
+        remembered, and every later read says so without asking git again."""
         if self._commit is None:
             return None
         if self._full is not None:
             return self._full
+        if self._unavailable is not None:
+            raise RepositoryUnreadable(self._unavailable)
+        try:
+            self._full = self._resolve_commit()
+        except RepositoryUnreadable as exc:
+            self._unavailable = str(exc)
+            raise
+        return self._full
+
+    def _resolve_commit(self) -> str:
 
         def resolve() -> str | None:
             done = self._git(
@@ -267,7 +287,15 @@ class LocalCheckoutReader:
 
         full = resolve()
         if full is None:
-            fetched = self._git("fetch", "--quiet", "origin", timeout=self._search_timeout_s)
+            try:
+                fetched = self._git(
+                    "fetch", "--quiet", "origin", timeout=self._search_timeout_s
+                )
+            except RepositoryUnreadable as exc:
+                raise RepositoryUnreadable(
+                    f"could not read the starting commit {self._commit} in the "
+                    f"checkout at {self._root}: fetching its remote failed ({exc})"
+                ) from exc
             full = resolve()
             if full is None:
                 why = (
@@ -279,7 +307,6 @@ class LocalCheckoutReader:
                     f"could not read the starting commit {self._commit} in "
                     f"the checkout at {self._root}: {why}"
                 )
-        self._full = full
         return full
 
     def _tree(self) -> dict[str, tuple[str, str, int | None]]:
@@ -456,6 +483,26 @@ class LocalCheckoutReader:
             self.refused[path] = "it is not text"
             return None
         return data.decode("utf-8", errors="replace")
+
+
+class UnreadableRepository:
+    """A reader that can read nothing, and says why on every read: for a
+    run whose starting commit could not be looked up, so nothing is ever
+    read from a working tree in its place (7 October 2026)."""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        self.where = "the repository"
+        self.refused: dict[str, str] = {}
+
+    def _no(self, *_args: Any, **_kwargs: Any) -> Any:
+        raise RepositoryUnreadable(self.reason)
+
+    list_files = _no
+    files_mentioning = _no
+    places_mentioning = _no
+    lines_mentioning = _no
+    read_text = _no
 
 
 def _not_read(reader: Any, path: str) -> str:
