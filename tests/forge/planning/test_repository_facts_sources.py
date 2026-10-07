@@ -2220,3 +2220,98 @@ async def test_the_provability_check_reads_the_start_commit_not_the_checkout(
         "cid-4", draft, repo_path=str(root), branch="planning/x"
     )
     assert seen["where"] == str(root)
+
+
+# -- Codex round 2, R5: the scenario check's copy of the start commit --------
+
+
+def test_only_the_files_the_check_reads_are_copied_out_of_the_commit(tmp_path: Path) -> None:
+    from forge.planning.driver import CLASSIFIER_READS, _lay_out_commit
+
+    root = _repo(
+        tmp_path / "checkout",
+        {
+            "pyproject.toml": "[project]\nname = 'x'\n",
+            ".guardkit/config.yaml": "surface: http\n",
+            "src/app.py": "x = 1\n",
+        },
+    )
+    start = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+    ).stdout.strip()
+    into = tmp_path / "tree"
+    assert _lay_out_commit(str(root), start, into) is None
+    copied = sorted(str(p.relative_to(into)) for p in into.rglob("*") if p.is_file())
+    assert copied == [".guardkit/config.yaml", "pyproject.toml"]
+    assert set(copied) <= set(CLASSIFIER_READS)
+
+
+def test_an_oversized_file_the_check_reads_is_refused_before_it_is_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import forge.planning.driver as driver_module
+    from forge.planning.driver import _CLASSIFIER_FILE_MAX_BYTES, _lay_out_commit
+
+    root = _repo(tmp_path / "checkout", {"package.json": "{" + " " * (_CLASSIFIER_FILE_MAX_BYTES + 10) + "}"})
+    start = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+    ).stdout.strip()
+    ran: list[list[str]] = []
+    real = subprocess.run
+
+    def recording(argv, *args, **kwargs):
+        ran.append(list(argv))
+        return real(argv, *args, **kwargs)
+
+    monkeypatch.setattr(driver_module.subprocess, "run", recording)
+    why = _lay_out_commit(str(root), start, tmp_path / "tree")
+    assert why is not None and "package.json" in why and "over the" in why
+    # The size came from the tree listing: the content was never asked for.
+    assert not any("cat-file" in argv for argv in ran)
+
+
+def test_a_link_among_the_files_the_check_reads_is_not_followed(tmp_path: Path) -> None:
+    from forge.planning.driver import _lay_out_commit
+
+    outside = tmp_path / "outside.toml"
+    outside.write_text("[project]\ndependencies = ['fastapi']\n", encoding="utf-8")
+    root = _repo(tmp_path / "checkout", {"README.md": "x\n"})
+    (root / "pyproject.toml").symlink_to(outside)
+    subprocess.run(
+        ["git", "-C", str(root), "-c", "user.name=t", "-c", "user.email=t@t", "add", "-A"], check=True
+    )
+    subprocess.run(
+        ["git", "-C", str(root), "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "link"],
+        check=True,
+    )
+    start = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+    ).stdout.strip()
+    into = tmp_path / "tree"
+    assert _lay_out_commit(str(root), start, into) is None
+    assert not (into / "pyproject.toml").exists()
+
+
+def test_the_copied_files_are_the_ones_guardkits_surface_detection_reads() -> None:
+    """A tripwire: if GuardKit's ``detect_repo_http_surface`` starts reading
+    another file, the copy must carry it too."""
+    import inspect
+    import re as _re
+
+    stamp = pytest.importorskip("guardkit.orchestrator.stamp_normalizer")
+    from forge.planning.driver import CLASSIFIER_READS
+
+    source = "".join(
+        inspect.getsource(getattr(stamp, name))
+        for name in (
+            "detect_repo_http_surface",
+            "_config_declares_http_surface",
+            "_pyproject_web_framework",
+            "_package_json_web_framework",
+        )
+    )
+    read = {
+        "/".join(_re.findall(r'"([^"]+)"', chain))
+        for chain in _re.findall(r'root((?:\s*/\s*"[^"]+")+)', source)
+    }
+    assert read == set(CLASSIFIER_READS)
