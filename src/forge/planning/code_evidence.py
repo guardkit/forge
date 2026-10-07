@@ -23,10 +23,11 @@ and no file type filtered out:
   densely it holds the X word. At most 24 are listed, and the entry says
   plainly whether that list holds every matching file.
 
-Neither ever shows the factory's own files in a project (its records and the
-sandbox scripts it ships, :func:`is_factory_record`), nor makes a window of,
-or ranks first, a line written by a program rather than a person
-(:data:`MACHINE_WRITTEN_LINE_CHARS`).
+Neither ever shows the factory's own files in a project (its records, and
+the sandbox scripts it ships where it puts them, :func:`is_factory_file`).
+A window is never made round a hit past the 200 characters it shows of the
+hit's line, and a candidate holding its word only on lines written by a
+program (:data:`MACHINE_WRITTEN_LINE_CHARS`) is ranked last.
 
 The only English this module knows is the quantifier grammar ("all", "every",
 "each") and a short list of filler words left out of the scoring, of the same
@@ -45,7 +46,7 @@ import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any
 
-from forge.cli.deploy_templates import SHIPPED_SCRIPTS
+from forge.factory_files import is_shipped_script, shipped_script_path
 from forge.planning.repository_facts import RepositoryUnreadable
 
 __all__ = [
@@ -116,13 +117,13 @@ _NUMBER_THEN_NOUN = re.compile(r"\s+\d+\s+[A-Za-z]")
 _FACTORY_RECORD_PATTERNS = ("qa/pass-bar-*.yaml",)
 
 #: A line longer than this was written by a program, not a person: a
-#: one-line report, a minified bundle, a data dump. A word found only on
-#: such lines is never a window (a window shows 200 characters of each
-#: line, so it would show nothing of where the word is), and a file holding
-#: the set's word only on such lines is ranked after every other candidate.
-#: Its hits are still counted. (7 October 2026: a committed one-line test
+#: one-line report, a minified bundle, a data dump. A file holding the set's
+#: word only on such lines stays a candidate, and in ``matched``, but is
+#: ranked after every other. (7 October 2026: a committed one-line test
 #: coverage report holds every source file's name, so it held most of the
-#: request's words and ranked above the code.)
+#: request's words and ranked above the code.) The evidence windows have
+#: their own rule: a hit is no window only when it lies past the 200
+#: characters a window shows of its line, and it is still counted.
 MACHINE_WRITTEN_LINE_CHARS = 1_000
 
 #: What ``listed_all`` means, in the descriptor's own words.
@@ -184,15 +185,32 @@ def _not_read_sentence(reader: Any, path: str) -> str:
 
 
 def is_factory_record(path: str) -> bool:
-    """True for the factory's own files that sit in a project's folders: the
-    pass bars the planner writes, and the scripts the factory ships for a
-    project's sandbox (:data:`forge.cli.deploy_templates.SHIPPED_SCRIPTS`,
-    by file name, wherever they sit). Never the project's code, so never
-    evidence and never a set candidate."""
+    """True for the factory's own records that sit in a project's folders
+    (the pass bars the planner writes), by path alone."""
+    return any(fnmatch.fnmatchcase(str(path), pattern) for pattern in _FACTORY_RECORD_PATTERNS)
+
+
+def is_factory_file(reader: Any, path: str, texts: dict[str, str | None]) -> bool:
+    """True for the factory's own files in a project's tree: its records
+    (:func:`is_factory_record`), and a script the factory ships for a
+    project's sandbox, at the place the factory puts it (``deploy/<name>``)
+    and reading as that script (its header,
+    :func:`forge.factory_files.is_shipped_script`). Never the project's code,
+    so never evidence and never a set candidate. A project's own file of the
+    same name elsewhere, or with other content, stays the project's. Only a
+    file at a shipped script's place is read, once, into ``texts``; a file
+    that cannot be read is not taken to be the factory's."""
     path = str(path)
-    if path.rpartition("/")[2] in SHIPPED_SCRIPTS:
+    if is_factory_record(path):
         return True
-    return any(fnmatch.fnmatchcase(path, pattern) for pattern in _FACTORY_RECORD_PATTERNS)
+    if shipped_script_path(path) is None:
+        return False
+    if path not in texts:
+        try:
+            texts[path] = reader.read_text(path)
+        except RepositoryUnreadable:
+            return False
+    return is_shipped_script(path, texts[path])
 
 
 def candidate_windows(
@@ -202,6 +220,7 @@ def candidate_windows(
     words: Sequence[str],
     rank: Callable[[str], Any],
     texts: dict[str, str | None],
+    spellings: Sequence[str] = (),
 ) -> tuple[list[dict[str, Any]], list[tuple[str, int]], list[str]]:
     """Every window round one word's hits, best first.
 
@@ -248,8 +267,10 @@ def candidate_windows(
         lines = lines_of[path]
         if number < 1 or number > len(lines):
             continue
-        if len(lines[number - 1]) > MACHINE_WRITTEN_LINE_CHARS:
-            # Machine-written: the window would show nothing of the hit.
+        if _hit_past_what_is_shown(lines[number - 1], spellings):
+            # The window shows the first 200 characters of each line, so it
+            # would show nothing of this hit (a one-line report, a minified
+            # file). The hit is still counted.
             continue
         first = max(1, number - EVIDENCE_LINES_BEFORE)
         last = min(len(lines), number + EVIDENCE_LINES_AFTER)
@@ -270,6 +291,16 @@ def candidate_windows(
         for negative, _rank, path, number, first, last in scored
     ]
     return candidates, hits, not_read
+
+
+def _hit_past_what_is_shown(line: str, spellings: Sequence[str]) -> bool:
+    """True when no spelling's first occurrence on ``line`` ends within the
+    characters a window shows of it. A line short enough to be shown whole
+    is never past; without spellings, nothing is known to be past."""
+    if len(line) <= _WINDOW_LINE_CHARS or not spellings:
+        return False
+    ends = [line.find(s) + len(s) for s in spellings if s and s in line]
+    return bool(ends) and min(ends) > _WINDOW_LINE_CHARS
 
 
 def _holds(window: Mapping[str, Any], path: str, number: int) -> bool:
@@ -453,6 +484,13 @@ def set_candidates(
     if cut and partial is not None:
         partial.append(f"the files that hold `{word}` were only partly searched ({cut})")
     candidates = sorted(dict.fromkeys(str(p) for p in answer if relevant(str(p))))
+    # The factory's own scripts, where it puts them and reading as them.
+    looked_at: dict[str, str | None] = {}
+    candidates = [
+        p
+        for p in candidates
+        if shipped_script_path(p) is None or not is_factory_file(reader, p, looked_at)
+    ]
     entry: dict[str, Any] = {
         "phrase": phrase,
         "looked_for": word,

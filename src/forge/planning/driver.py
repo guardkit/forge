@@ -120,7 +120,7 @@ from forge.planning.code_evidence import (
     MAX_EVIDENCE_WINDOWS,
     candidate_windows,
     choose_windows,
-    is_factory_record,
+    is_factory_file,
     quantified_phrases,
     request_words,
     set_candidates,
@@ -11378,7 +11378,9 @@ class PlanningRunDriver:
                             for prefix in _REPO_INVENTORY_SKIP_PREFIXES
                         ):
                             continue
-                        if is_factory_record(path_and_line.rpartition(":")[0]):
+                        if is_factory_file(
+                            reader, path_and_line.rpartition(":")[0], texts
+                        ):
                             continue
                         if path_and_line not in places:
                             places.append(path_and_line)
@@ -11395,6 +11397,7 @@ class PlanningRunDriver:
                             words=scoring_words,
                             rank=_how_interesting,
                             texts=texts,
+                            spellings=sorted(s for s in spellings if len(s) > 3),
                         )
                     except RepositoryUnreadable as exc:
                         # What was found is kept; the windows stop here.
@@ -11489,7 +11492,8 @@ class PlanningRunDriver:
         * Only the factory's own files are left out
           (:data:`_REPO_INVENTORY_SKIP_PREFIXES`, the planner's own
           ``qa/pass-bar-*.yaml`` and, since 7 October 2026, the sandbox
-          scripts the factory ships into a project, by name). A file that
+          scripts the factory ships into a project, at ``deploy/<name>``
+          and reading as the script). A file that
           holds the word only on machine-written lines (over
           :data:`~forge.planning.code_evidence.MACHINE_WRITTEN_LINE_CHARS`
           characters) is ranked after every other.

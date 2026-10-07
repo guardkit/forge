@@ -1748,30 +1748,40 @@ def test_words_the_repository_does_not_hold_take_no_place(tmp_path: Path) -> Non
 # the count endpoints".
 
 
-def test_the_shipped_script_names_are_the_scripts_the_factory_ships() -> None:
+def test_the_shipped_scripts_are_the_scripts_the_factory_ships() -> None:
     import forge.cli.deploy_templates as templates
-    from forge.cli.deploy_templates import SHIPPED_SCRIPTS
-    from forge.planning.code_evidence import is_factory_record
+    from forge.factory_files import SHIPPED_SCRIPTS, is_shipped_script
 
     folder = Path(templates.__file__).parent
     assert set(SHIPPED_SCRIPTS) == {p.name for p in folder.glob("*.sh")}
+    assert templates.SHIPPED_SCRIPTS is SHIPPED_SCRIPTS
     for name in SHIPPED_SCRIPTS:
-        assert is_factory_record(f"deploy/{name}") and is_factory_record(f"ops/x/{name}")
-    assert not is_factory_record("deploy/deploy.sh")
-    assert not is_factory_record("src/my-sandbox-runner.sh")
+        text = (folder / name).read_text()
+        # Each template, as shipped, reads as itself at deploy/<name> only.
+        assert is_shipped_script(f"deploy/{name}", text)
+        assert not is_shipped_script(f"tools/{name}", text)
+        assert not is_shipped_script(f"deploy/{name}", "#!/bin/sh\necho mine\n")
+        assert not is_shipped_script(f"deploy/{name}", None)
+
+
+def _factory_script(name: str) -> str:
+    from forge.factory_files import SHIPPED_SCRIPTS
+
+    return (
+        "#!/usr/bin/env bash\n#\n" + SHIPPED_SCRIPTS[name] + "\n"
+        "# the tally counter for things removed\n# /things/{thing_id} 204 404\n"
+    )
 
 
 def test_the_factorys_own_scripts_are_neither_candidates_nor_evidence(tmp_path: Path) -> None:
-    from forge.cli.deploy_templates import SHIPPED_SCRIPTS
+    from forge.factory_files import SHIPPED_SCRIPTS
 
     files = {
         "src/things/router.py": THING_ROUTER,
         "config/routes.yaml": ROUTES_YAML,
     }
     for name in SHIPPED_SCRIPTS:
-        files[f"deploy/{name}"] = (
-            "# the tally counter for things removed\n# /things/{thing_id} 204 404\n"
-        )
+        files[f"deploy/{name}"] = _factory_script(name)
     checkout = _repo(tmp_path / "checkout", files)
     descriptor, _, _ = _descriptor(LocalCheckoutReader(str(checkout)))
     (named,) = descriptor["sets_the_request_names"]
@@ -1780,6 +1790,33 @@ def test_the_factorys_own_scripts_are_neither_candidates_nor_evidence(tmp_path: 
     entry = descriptor["where_the_specs_words_already_appear"][0]
     assert not any(p.startswith("deploy/") for p in entry["already_in"])
     assert {w["path"] for w in entry["evidence"]} == {"src/things/router.py"}
+
+
+def test_a_projects_own_script_of_the_same_name_stays_the_projects(tmp_path: Path) -> None:
+    """Elsewhere in the tree, or at deploy/ with the project's own content,
+    a file named like the factory's script is the project's: listed, shown
+    and counted, and listed_all stays true."""
+    mine = "#!/bin/sh\n# our tally runner\necho /things/{thing_id}\n"
+    checkout = _repo(
+        tmp_path / "checkout",
+        {
+            "src/things/router.py": THING_ROUTER,
+            "tools/sandbox-runner.sh": mine,
+            "deploy/sandbox-deploy.sh": mine,
+            "deploy/sandbox-runner.sh": _factory_script("sandbox-runner.sh"),
+        },
+    )
+    descriptor, _, _ = _descriptor(LocalCheckoutReader(str(checkout)))
+    (named,) = descriptor["sets_the_request_names"]
+    assert sorted(c["path"] for c in named["candidates"]) == [
+        "deploy/sandbox-deploy.sh", "tools/sandbox-runner.sh",
+    ]
+    assert named["matched"] == 2 and named["listed_all"] is True
+    entry = descriptor["where_the_specs_words_already_appear"][0]
+    shown = {w["path"] for w in entry["evidence"]}
+    assert {"tools/sandbox-runner.sh", "deploy/sandbox-deploy.sh"} <= shown
+    assert "deploy/sandbox-runner.sh" not in shown
+    assert not any(p.startswith("deploy/sandbox-runner.sh") for p in entry["already_in"])
 
 
 #: A committed report a tool wrote on one line: it names every file and so
@@ -1811,7 +1848,7 @@ def test_a_one_line_report_ranks_after_every_hand_written_candidate(tmp_path: Pa
     ]
 
 
-def test_a_word_found_only_on_a_machine_written_line_is_no_window(tmp_path: Path) -> None:
+def test_a_hit_past_what_a_window_shows_of_its_line_is_no_window(tmp_path: Path) -> None:
     checkout = _repo(
         tmp_path / "checkout",
         {"aaa/report.json": ONE_LINE_REPORT, "src/things/router.py": THING_ROUTER},
@@ -1819,6 +1856,27 @@ def test_a_word_found_only_on_a_machine_written_line_is_no_window(tmp_path: Path
     descriptor, _, _ = _descriptor(LocalCheckoutReader(str(checkout)))
     entry = descriptor["where_the_specs_words_already_appear"][0]
     assert "aaa/report.json:1" in entry["already_in"]
+    # The report's hit is thousands of characters into its one line.
+    assert ONE_LINE_REPORT.find("{thing_id}") > 2000
     assert {w["path"] for w in entry["evidence"]} == {"src/things/router.py"}
     # Its hit is still counted as one not shown.
     assert entry["more_hits"] == 1
+
+
+def test_a_long_hand_written_line_with_the_hit_near_its_start_keeps_its_window(
+    tmp_path: Path,
+) -> None:
+    from forge.planning.code_evidence import MACHINE_WRITTEN_LINE_CHARS
+
+    table = (
+        'ROUTES = ["/things/{thing_id}", '
+        + ", ".join(f'"/things/extra-{n}"' for n in range(120))
+        + "]\n"
+    )
+    assert len(table) > MACHINE_WRITTEN_LINE_CHARS and table.find("{thing_id}") < 60
+    checkout = _repo(tmp_path / "checkout", {"src/routes.src": table})
+    descriptor, _, _ = _descriptor(LocalCheckoutReader(str(checkout)))
+    entry = descriptor["where_the_specs_words_already_appear"][0]
+    (window,) = entry["evidence"]
+    assert window["path"] == "src/routes.src" and "/things/{thing_id}" in window["text"]
+    assert "more_hits" not in entry
