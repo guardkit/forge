@@ -2011,3 +2011,58 @@ class TestAGitThatGoesQuietAtACommit:
         # One quiet git, stopped once: the rest of the walk started no other.
         quiet_ones = [p for p in started if p.args == ["sleep", "30"]]
         assert len(quiet_ones) == 1 and quiet_ones[0].poll() is not None
+
+
+class TestManyOpenDescriptors:
+    """Coach check 2: the deadline wait must not refuse a descriptor numbered
+    1024 or more, which a long-running helper reaches."""
+
+    def test_a_read_at_a_commit_works_past_descriptor_1024(
+        self, lagging: tuple[Path, str, str]
+    ) -> None:
+        import resource
+
+        clone, _old, new = lagging
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        wanted = 1300
+        if soft < wanted:
+            if hard != resource.RLIM_INFINITY and hard < wanted:
+                pytest.skip(f"this machine allows only {hard} open files")
+            resource.setrlimit(resource.RLIMIT_NOFILE, (wanted, hard))
+        held = [os.open(os.devnull, os.O_RDONLY) for _ in range(1100)]
+        try:
+            assert max(held) >= 1024
+            cfg = _config({REPO_KEY: str(clone)})
+            status, body = process_code_read_file_request(
+                {"repo": REPO_KEY, "path": "lib/thing.src", "commit": new}, config=cfg
+            )
+            assert status == 200, body
+            assert body["content"] == "value = new\n"
+            status, body = process_code_search_request(
+                {"repo": REPO_KEY, "pattern": "value =", "fixed_string": True, "commit": new},
+                config=cfg,
+            )
+            assert status == 200 and not body["timed_out"] and body["matches"]
+        finally:
+            for fd in held:
+                os.close(fd)
+            resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+
+    def test_a_link_whose_target_is_too_big_is_not_read(self, tmp_path: Path) -> None:
+        repo = tmp_path / "linked"
+        repo.mkdir()
+        _git(repo, "init", "-q")
+        (repo / "a.txt").write_text("a\n", encoding="utf-8")
+        _git(repo, "add", "a.txt")
+        huge = repo / "target-path.bin"
+        huge.write_bytes(b"x" * (sidecar.CODE_MAX_FILE_BYTES + 10))
+        oid = _git(repo, "hash-object", "-w", str(huge)).stdout.strip()
+        huge.unlink()
+        _git(repo, "update-index", "--add", "--cacheinfo", f"120000,{oid},big-link")
+        _git(repo, "commit", "-qm", "a link with a huge target")
+        head = _git(repo, "rev-parse", "HEAD").stdout.strip()
+        status, body = process_code_read_file_request(
+            {"repo": REPO_KEY, "path": "big-link", "commit": head},
+            config=_config({REPO_KEY: str(repo)}),
+        )
+        assert status == 400 and "a link this size is not followed" in body["error"]

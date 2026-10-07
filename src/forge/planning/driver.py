@@ -611,6 +611,8 @@ CLASSIFIER_READS: tuple[str, ...] = (
 )
 #: The largest of those files copied out of a commit; one bigger is refused.
 _CLASSIFIER_FILE_MAX_BYTES = 256 * 1024
+#: How long the one fetch of a start commit this checkout lacks may take.
+_START_COMMIT_FETCH_TIMEOUT_SECONDS = 60
 
 
 def _lay_out_commit(repo_path: str, commit: str, into: Path) -> str | None:
@@ -629,15 +631,32 @@ def _lay_out_commit(repo_path: str, commit: str, into: Path) -> str | None:
     if not re.fullmatch(r"[0-9a-f]{7,40}", commit or ""):
         return f"{commit!r} is not a commit id"
 
-    def git(*args: str) -> "subprocess.CompletedProcess[bytes]":
+    def git(*args: str, timeout: float = _REPO_INVENTORY_GIT_TIMEOUT_SECONDS) -> "subprocess.CompletedProcess[bytes]":
         return subprocess.run(
             ["git", "-c", "safe.directory=*", "-C", str(repo_path), *args],
             capture_output=True,
-            timeout=_REPO_INVENTORY_GIT_TIMEOUT_SECONDS,
+            timeout=timeout,
             check=False,
         )
 
+    def present() -> bool:
+        return git("rev-parse", "--verify", "--quiet", f"{commit}^{{commit}}").returncode == 0
+
     try:
+        # The start commit is fetched by the starting rule where the run's
+        # work happens, which need not be this checkout: a commit missing
+        # here is fetched from its remote once, time-limited (coach check 2).
+        if not present():
+            fetched = git("fetch", "--quiet", "origin", timeout=_START_COMMIT_FETCH_TIMEOUT_SECONDS)
+            if not present():
+                why = (
+                    "it is not there even after fetching its remote"
+                    if fetched.returncode == 0
+                    else "fetching its remote failed ("
+                    + (" ".join(fetched.stderr.decode("utf-8", errors="replace").split())[:200] or "no reason given")
+                    + ")"
+                )
+                return f"the checkout at {repo_path} does not have it: {why}"
         listed = git("ls-tree", "-z", "-l", f"{commit}^{{commit}}", "--", *CLASSIFIER_READS)
         if listed.returncode != 0:
             said = " ".join(listed.stderr.decode("utf-8", errors="replace").split())[:200]
@@ -651,7 +670,11 @@ def _lay_out_commit(repo_path: str, commit: str, into: Path) -> str | None:
                 continue
             mode, kind, oid, size = parts
             if kind != "blob" or mode not in ("100644", "100755"):
-                continue  # not an ordinary file: as good as absent
+                # Not an ordinary file: as good as absent. A manifest stored
+                # as a symbolic link is not followed (GuardKit, reading a
+                # real checkout, would follow it); then no web framework is
+                # found through it, which is the safe side.
+                continue
             if not size.isdigit() or int(size) > _CLASSIFIER_FILE_MAX_BYTES:
                 return (
                     f"{rel} is {size} bytes at that commit, over the "

@@ -436,6 +436,9 @@ class LocalCheckoutReader:
                 return None
             mode, oid, size = entry
             if mode == "120000":
+                if size is not None and size > _MAX_READ_BYTES:
+                    self.refused[path] = "it is a link too large to follow"
+                    return None
                 target = self._git("cat-file", "blob", oid, timeout=self._timeout_s).stdout
                 joined = posixpath.normpath(posixpath.join(posixpath.dirname(current), target))
                 if target.startswith("/") or joined in (".", "..") or joined.startswith("../"):
