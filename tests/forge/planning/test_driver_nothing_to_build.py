@@ -28,6 +28,7 @@ from forge.planning.states import PlanningState
 from forge.adapters.git.planning_runner import WorktreeGitRunner
 from tests.forge.planning.test_driver_target_terminal import (
     CID,
+    RecordingGitRunner,
     _init_scratch_repo,
     _make_driver,
     _plan_result_native,
@@ -76,6 +77,17 @@ def _scratch_repo(tmp_path: Path) -> Path:
     subprocess.run(["git", "add", "-A"], cwd=repo, check=True, env=env)
     subprocess.run(["git", "commit", "-qm", "stats"], cwd=repo, check=True, env=env)
     return repo
+
+
+def _starting_at(repo: Path) -> RecordingGitRunner:
+    """The stand-in remote answering the repository's own commit as where the
+    work starts: the planner reads the code at that commit (7 October 2026)."""
+    import subprocess
+
+    head = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+    ).stdout.strip()
+    return RecordingGitRunner(start_commit=head)
 
 
 def _citation(window: nothing_to_build.Window) -> str:
@@ -201,7 +213,7 @@ async def test_nothing_to_build_ends_the_run_once_and_runs_no_later_leg(
 ) -> None:
     repo = _scratch_repo(tmp_path)
     _queue(store)
-    h = _make_driver(store, repo_path=str(repo))
+    h = _make_driver(store, repo_path=str(repo), git_runner=_starting_at(repo))
     _switch_on(h)
     rec = _Recorder()
     _wire(h, rec, lambda descriptor: _nothing_reply(*_proof_from_windows(descriptor)))
@@ -277,7 +289,7 @@ async def test_a_refused_transition_sends_nothing(
 ) -> None:
     repo = _scratch_repo(tmp_path)
     _queue(store)
-    h = _make_driver(store, repo_path=str(repo))
+    h = _make_driver(store, repo_path=str(repo), git_runner=_starting_at(repo))
     _switch_on(h)
     rec = _Recorder()
     _wire(h, rec, lambda descriptor: _nothing_reply(*_proof_from_windows(descriptor)))
@@ -318,7 +330,7 @@ async def test_a_citation_outside_the_windows_sent_fails_once_and_runs_no_leg(
 ) -> None:
     repo = _scratch_repo(tmp_path)
     _queue(store)
-    h = _make_driver(store, repo_path=str(repo))
+    h = _make_driver(store, repo_path=str(repo), git_runner=_starting_at(repo))
     _switch_on(h)
     rec = _Recorder()
 
@@ -413,7 +425,7 @@ async def test_switch_off_sends_todays_call_and_refuses_the_answer(
 ) -> None:
     repo = _scratch_repo(tmp_path)
     _queue(store)
-    h = _make_driver(store, repo_path=str(repo))
+    h = _make_driver(store, repo_path=str(repo), git_runner=_starting_at(repo))
     rec = _Recorder()
     _wire(h, rec, lambda descriptor: _nothing_reply(*_proof_from_windows(descriptor)))
 
@@ -482,7 +494,7 @@ async def test_a_nothing_to_build_reply_that_also_plans_work_is_refused(
 ) -> None:
     repo = _scratch_repo(tmp_path)
     _queue(store)
-    h = _make_driver(store, repo_path=str(repo))
+    h = _make_driver(store, repo_path=str(repo), git_runner=_starting_at(repo))
     _switch_on(h)
     rec = _Recorder()
 
