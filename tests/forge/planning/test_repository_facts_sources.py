@@ -2005,3 +2005,139 @@ def test_a_helper_too_old_to_read_at_a_commit_is_never_believed(tmp_path: Path) 
         reader = SidecarCodeReader(url, repo=REPO_KEY, commit=start, post=old_helper)
         with pytest.raises(RepositoryUnreadable, match="answered without saying it read that commit"):
             reader.read_text("src/things/router.py")
+
+
+# -- Codex round 1 on the start-commit reads (7 October 2026) ---------------
+
+
+RULES_AT_START = "rules:\n  - id: R-START\n    rule: the rule the start commit has\n"
+RULES_EDITED = "rules:\n  - id: R-EDITED\n    rule: an edit left in the working tree\n"
+
+
+def _commit_all(root: Path, message: str) -> str:
+    git = ["git", "-C", str(root), "-c", "user.name=t", "-c", "user.email=t@t"]
+    subprocess.run([*git, "add", "-A"], check=True)
+    subprocess.run([*git, "commit", "-q", "-m", message], check=True)
+    return subprocess.run(
+        [*git, "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+
+def test_rules_and_test_folders_are_the_start_commits_not_the_working_trees(
+    tmp_path: Path,
+) -> None:
+    """R1: the architecture rules and the test folders come through the
+    pinned reader, never off the disk beside it."""
+    root = _repo(
+        tmp_path / "checkout",
+        {"docs/architecture-rules.yaml": RULES_AT_START, "tests/alpha/test_a.py": "x = 1\n"},
+    )
+    start = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+    ).stdout.strip()
+    # The working tree moves away from the start commit.
+    (root / "docs/architecture-rules.yaml").write_text(RULES_EDITED, encoding="utf-8")
+    (root / "tests/alpha/test_a.py").unlink()
+    (root / "tests/beta").mkdir(parents=True)
+    (root / "tests/beta/test_b.py").write_text("y = 2\n", encoding="utf-8")
+    pinned, _, _ = _descriptor(LocalCheckoutReader(str(root), commit=start))
+    assert [r["id"] for r in pinned["architecture_rules"]["rules"]] == ["R-START"]
+    assert pinned["test_roots"] == ["tests/alpha"]
+    # Unpinned, the checkout's working tree is read as it always was.
+    loose = PlanningRunDriver._build_target_repo_descriptor(
+        REPO_KEY, str(root), "", reader=LocalCheckoutReader(str(root)), request_text=THING_REQUEST
+    )
+    assert [r["id"] for r in loose["architecture_rules"]["rules"]] == ["R-EDITED"]
+
+
+def test_a_rules_file_linking_out_of_the_tree_is_not_read_at_a_commit(tmp_path: Path) -> None:
+    """R1: at a commit, a link is followed inside the commit only."""
+    outside = tmp_path / "outside-rules.yaml"
+    outside.write_text("rules:\n  - id: R-OUTSIDE\n    rule: never to be read\n", encoding="utf-8")
+    root = _repo(tmp_path / "checkout", {"README.md": "x\n"})
+    (root / "docs").mkdir()
+    (root / "docs/architecture-rules.yaml").symlink_to(outside)
+    start = _commit_all(root, "a link out")
+    descriptor, _, partial = _descriptor(LocalCheckoutReader(str(root), commit=start))
+    assert "architecture_rules" not in descriptor
+    assert "R-OUTSIDE" not in str(descriptor)
+    assert any("link out of the repository" in line for line in partial)
+
+
+def test_a_commit_that_cannot_be_read_is_fetched_once_for_every_kind_of_read(
+    tmp_path: Path,
+) -> None:
+    """R3: the reader remembers that the commit could not be read; the
+    remote is asked once, whichever reads follow."""
+    root = _repo(tmp_path / "checkout", {"a.txt": "one\n"})
+    asked: list[tuple[str, ...]] = []
+
+    class Counting(LocalCheckoutReader):
+        def _git(self, *args: str, timeout: float):
+            asked.append(args)
+            return super()._git(*args, timeout=timeout)
+
+    reader = Counting(str(root), commit="0123456789abcdef0123")
+    for read in (
+        reader.list_files,
+        lambda: reader.read_text("a.txt"),
+        lambda: reader.places_mentioning("one"),
+        lambda: reader.files_mentioning("one"),
+        lambda: reader.lines_mentioning("one"),
+        reader.list_files,
+    ):
+        with pytest.raises(RepositoryUnreadable, match="could not read the starting commit"):
+            read()
+    assert sum(1 for args in asked if args[0] == "fetch") == 1
+
+
+def test_a_fetch_that_times_out_is_remembered_too(tmp_path: Path) -> None:
+    root = _repo(tmp_path / "checkout", {"a.txt": "one\n"})
+    fetches = []
+
+    class Hanging(LocalCheckoutReader):
+        def _git(self, *args: str, timeout: float):
+            if args[0] == "fetch":
+                fetches.append(args)
+                raise RepositoryUnreadable("git could not read the checkout (TimeoutExpired)")
+            return super()._git(*args, timeout=timeout)
+
+    reader = Hanging(str(root), commit="0123456789abcdef0123")
+    for _ in range(3):
+        with pytest.raises(RepositoryUnreadable, match="fetching its remote failed"):
+            reader.list_files()
+    assert len(fetches) == 1
+
+
+def test_a_start_that_cannot_be_looked_up_is_never_a_working_tree(tmp_path: Path) -> None:
+    """R2: a failed lookup of the recorded start reads nothing; an absent
+    start (the store's ``(None, None)``) reads as before."""
+    from forge.planning.repository_facts import UnreadableRepository
+
+    class Broken:
+        def get_start_point(self, correlation_id: str):
+            raise RuntimeError("database is locked")
+
+    class Absent:
+        def get_start_point(self, correlation_id: str):
+            return None, None
+
+    class Recorded:
+        def get_start_point(self, correlation_id: str):
+            return "0123456789abcdef0123", "main"
+
+    def driver(store: object) -> PlanningRunDriver:
+        return PlanningRunDriver(SimpleNamespace(git_runner=SimpleNamespace(), store=store))  # type: ignore[arg-type]
+
+    broken = driver(Broken())._repository_reader_for(str(tmp_path), "cid-1")
+    assert isinstance(broken, UnreadableRepository)
+    with pytest.raises(RepositoryUnreadable, match="could not read the starting commit of run cid-1"):
+        broken.list_files()
+    descriptor, reasons, _ = _descriptor(broken)
+    assert "repository_inventory" not in descriptor
+    assert any("database is locked" in r for r in reasons)
+    absent = driver(Absent())._repository_reader_for(str(tmp_path), "cid-2")
+    assert isinstance(absent, LocalCheckoutReader) and absent.commit is None
+    recorded = driver(Recorded())._repository_reader_for(str(tmp_path), "cid-3")
+    assert isinstance(recorded, LocalCheckoutReader)
+    assert recorded.commit == "0123456789abcdef0123"

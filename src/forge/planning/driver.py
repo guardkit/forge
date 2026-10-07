@@ -141,6 +141,7 @@ from forge.planning.repository_facts import (
     LocalCheckoutReader,
     RepositoryFacts,
     RepositoryUnreadable,
+    UnreadableRepository,
     read_repository_facts,
     unavailable_text,
 )
@@ -595,6 +596,13 @@ def _one_form(word: str) -> str:
     if len(lowered) > 4 and lowered.endswith("s") and not lowered.endswith("ss"):
         return lowered[:-1]
     return lowered
+
+
+def _reads_beyond_the_working_tree(reader: Any) -> bool:
+    """True unless ``reader`` reads this coordinator's checkout as it is on
+    disk (a :class:`LocalCheckoutReader` with no commit): every other reader
+    must be asked, never the filesystem beside it."""
+    return not isinstance(reader, LocalCheckoutReader) or reader.commit is not None
 
 
 def _how_interesting(place: str) -> tuple[int, str]:
@@ -3974,12 +3982,33 @@ class PlanningRunDriver:
         commit: str | None = None
         start_point = getattr(getattr(self._deps, "store", None), "get_start_point", None)
         if correlation_id is not None and callable(start_point):
+            # An ABSENT start (the store answers ``(None, None)``: a run older
+            # than the starting rule) reads as before. A lookup that FAILED
+            # is not an absent start: the run's reads are "could not read
+            # the starting commit", never the working tree in its place.
+            failed: str | None = None
             try:
                 recorded = start_point(correlation_id)
-                commit = recorded[0] if isinstance(recorded, tuple) and recorded else None
-            except Exception:  # noqa: BLE001 — a store that cannot say has no start
-                commit = None
-            commit = commit if isinstance(commit, str) and commit.strip() else None
+            except Exception as exc:  # noqa: BLE001 — said, never a working tree
+                recorded = None
+                failed = f"{type(exc).__name__}: {exc}"
+            else:
+                if not isinstance(recorded, (tuple, list)) or len(recorded) != 2:
+                    failed = f"the run store answered {type(recorded).__name__}"
+            if failed is None:
+                first = recorded[0] if recorded else None
+                if first is not None and not (isinstance(first, str) and first.strip()):
+                    failed = f"the run store's recorded start is {first!r}"
+                commit = first.strip() if isinstance(first, str) and first.strip() else None
+            if failed is not None:
+                reason = (
+                    f"could not read the starting commit of run {correlation_id}: "
+                    f"looking it up failed ({failed[:200]})"
+                )
+                logger.warning("planning driver: %s; nothing is read in its place", reason)
+                reader = UnreadableRepository(reason)
+                cache[key] = reader
+                return reader
         runner = self._deps.git_runner
         route = getattr(runner, "runner_for_path", None)
         if callable(route):
@@ -11206,7 +11235,11 @@ class PlanningRunDriver:
 
         path: Any = Path(repo_path) / _ARCHITECTURE_RULES_REL
         try:
-            if reader is not None and not isinstance(reader, LocalCheckoutReader):
+            # Through the reader whenever it reads something other than this
+            # checkout's working tree: the helper, or (7 October 2026) any
+            # reader pinned to the run's starting commit, so the rules are the
+            # commit's and a link is followed inside the commit only.
+            if reader is not None and _reads_beyond_the_working_tree(reader):
                 path = f"{_ARCHITECTURE_RULES_REL} ({getattr(reader, 'where', 'the helper')})"
                 try:
                     if _ARCHITECTURE_RULES_REL not in set(reader.list_files()):
@@ -11857,9 +11890,10 @@ class PlanningRunDriver:
         begin = getattr(reader, "begin", None)
         if callable(begin):
             begin()  # one time allowance for the whole description
-        if not isinstance(reader, LocalCheckoutReader):
-            # No checkout here to walk: the same discovery runs over the
-            # helper's listing of the factory's own clone.
+        if _reads_beyond_the_working_tree(reader):
+            # No checkout here to walk, or (7 October 2026) a reader pinned
+            # to the starting commit, whose working tree is not that commit:
+            # the same discovery runs over the reader's own listing.
             try:
                 test_roots = discover_test_roots_from_listing(reader.list_files())
             except RepositoryUnreadable as exc:

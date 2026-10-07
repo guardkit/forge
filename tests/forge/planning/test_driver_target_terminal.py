@@ -1159,8 +1159,14 @@ async def test_plan_leg_threads_spec_contents_and_discovered_descriptor(
     repo = tmp_path / "api_test"
     _init_scratch_repo(repo)
     # api_test-shaped test tree: real per-suite roots, NOT a bare ``tests/``.
-    (repo / "tests" / "health").mkdir(parents=True)
-    (repo / "tests" / "users").mkdir(parents=True)
+    # Committed and on the remote (7 October 2026): the planner reads the
+    # commit the run starts from, where an empty folder does not exist.
+    for suite in ("health", "users"):
+        (repo / "tests" / suite).mkdir(parents=True)
+        (repo / "tests" / suite / f"test_{suite}.py").write_text("def test_x():\n    pass\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "the test suites")
+    _publish_to_origin(repo)
     git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
 
     _queue(store)
@@ -1174,9 +1180,11 @@ async def test_plan_leg_threads_spec_contents_and_discovered_descriptor(
     # crucially NOT the shallow ``["tests"]`` that let 008 invent ``tests/smoke``.
     descriptor = h.ctx["counters"]["last_descriptor"]
     # The inventory of what the repository already contains rides too, since
-    # 2026-09-11 — here the one tracked file of the scratch repo. Everything
-    # else is exactly as it was.
-    assert descriptor["repository_inventory"]["files"] == ["README.md"]
+    # 2026-09-11 — here the scratch repo's tracked files at the starting
+    # commit. Everything else is exactly as it was.
+    assert descriptor["repository_inventory"]["files"] == [
+        "README.md", "tests/health/test_health.py", "tests/users/test_users.py",
+    ]
     assert {k: v for k, v in descriptor.items() if k != "repository_inventory"} == {
         "repo": TARGET_REPO,
         "test_roots": ["tests/health", "tests/users"],
