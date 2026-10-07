@@ -45,19 +45,23 @@ The narrow contract:
     POST /git/branch-scope {repo, base, head, feature_id}
               -> {name_status, added_by_file, added_lines_read_whole,
                   feature_file, plan_documents, head|null, error|null}
-    POST /code/list-files {repo, under?}
+    POST /code/list-files {repo, under?, commit?}
               -> {files, count, total_tracked, under, capped, cap}
-    POST /code/read-file  {repo, path, first_line?, last_line?}
+    POST /code/read-file  {repo, path, first_line?, last_line?, commit?}
               -> {path, content, bytes, total_lines|null, first_line,
                   last_line, partial, note|null}
-    POST /code/imports    {repo, path}
+    POST /code/imports    {repo, path, commit?}
               -> {path, files: [{path, language, imports, note?}],
                   files_walked, capped, cap}
     POST /code/search     {repo, pattern, under?, fixed_string?,
-                           case_insensitive?, max_results?}
+                           case_insensitive?, max_results?, commit?}
               -> {matches: [{path, line, text, line_truncated}], count,
                   files_searched, capped, cap, line_cap,
                   long_lines_partly_searched, timed_out}
+              (with ``commit``, every /code route reads that commit out of
+              git's objects, never the working tree, and answers ``commit``
+              too; a commit the clone cannot get is 409 with
+              ``commit_unavailable`` — see "the code door at a commit")
 
 The three routes after ``/git/rev-parse`` are the merge press's own git
 (sandbox first, 2026-09-07, rule 89): its ancestry guards, and the lay-out and
@@ -5885,7 +5889,7 @@ def _read_text_file(
 
 
 def _read_line_window(
-    resolved: Path, relative: str, first: int, last: int | None
+    resolved: "Path | Callable[[], Any]", relative: str, first: int, last: int | None
 ) -> tuple[list[str] | None, tuple[int, dict[str, Any]] | None]:
     """Lines ``first`` to ``last`` of a file too big to hand back whole.
 
@@ -5898,13 +5902,18 @@ def _read_line_window(
     Three walls, each with its own sentence: the file must still be text, the
     lines kept must still come to less than the byte limit, and the walk stops
     after :data:`CODE_READ_SCAN_BYTES` and says where it stopped.
+
+    ``resolved`` is the file on disk, or (7 October 2026, reads at a commit)
+    a callable that opens a binary stream of the file's committed bytes as a
+    context manager.
     """
     kept: list[str] = []
     kept_bytes = 0
     number = 1
     scanned = 0
+    opener = resolved if callable(resolved) else (lambda: open(resolved, "rb"))
     try:
-        with open(resolved, "rb") as handle:
+        with opener() as handle:
             block = handle.read(CODE_BINARY_SNIFF_BYTES)
             if _looks_binary(block):
                 return None, (400, {"error": _not_text_error(relative)})
@@ -6021,6 +6030,8 @@ def process_code_list_files_request(
     """
     if not isinstance(payload, dict):
         return 400, {"error": "request body must be a JSON object"}
+    if payload.get("commit") is not None:
+        return _code_at_commit("list-files", payload, config)
     repo_path, tracked, refusal = _code_repo_and_files(payload, config)
     if refusal is not None or repo_path is None or tracked is None:
         return refusal or (500, {"error": "the sidecar could not read the repository"})
@@ -6060,6 +6071,8 @@ def process_code_read_file_request(
     """
     if not isinstance(payload, dict):
         return 400, {"error": "request body must be a JSON object"}
+    if payload.get("commit") is not None:
+        return _code_at_commit("read-file", payload, config)
     repo_path, tracked, refusal = _code_repo_and_files(payload, config)
     if refusal is not None or repo_path is None or tracked is None:
         return refusal or (500, {"error": "the sidecar could not read the repository"})
@@ -6210,6 +6223,8 @@ def process_code_imports_request(
     """
     if not isinstance(payload, dict):
         return 400, {"error": "request body must be a JSON object"}
+    if payload.get("commit") is not None:
+        return _code_at_commit("imports", payload, config)
     repo_path, tracked, refusal = _code_repo_and_files(payload, config)
     if refusal is not None or repo_path is None or tracked is None:
         return refusal or (500, {"error": "the sidecar could not read the repository"})
@@ -6532,38 +6547,21 @@ def process_code_search_request(
     character — is refused in one sentence before any file is read. A pattern
     that passes both checks and still outlasts the clock is possible in
     principle; both shapes we have been able to make do that are refused here.
+
+    With ``commit`` (7 October 2026) the search walks that commit's files, out
+    of git's objects, and never the working tree (see the code door at a
+    commit, below).
     """
     if not isinstance(payload, dict):
         return 400, {"error": "request body must be a JSON object"}
+    if payload.get("commit") is not None:
+        return _code_at_commit("search", payload, config)
     repo_path, tracked, refusal = _code_repo_and_files(payload, config)
     if refusal is not None or repo_path is None or tracked is None:
         return refusal or (500, {"error": "the sidecar could not read the repository"})
-    pattern = payload.get("pattern")
-    if not isinstance(pattern, str) or not pattern.strip():
-        return 400, {"error": "'pattern' is required (the text to search for)"}
-    if len(pattern) > CODE_SEARCH_MAX_PATTERN_CHARS:
-        return 400, {
-            "error": (
-                f"'pattern' is {len(pattern)} characters, over this door's "
-                f"limit of {CODE_SEARCH_MAX_PATTERN_CHARS}"
-            )
-        }
-    fixed = bool(payload.get("fixed_string", False))
-    flags = re.IGNORECASE if bool(payload.get("case_insensitive", False)) else 0
-    try:
-        compiled = re.compile(re.escape(pattern) if fixed else pattern, flags)
-    except re.error as exc:
-        return 400, {
-            "error": (
-                f"'pattern' {pattern!r} is not a regular expression this door "
-                f"can use ({exc}) — fix it, or send 'fixed_string': true to "
-                "search for it as plain text"
-            )
-        }
-    if not fixed:
-        explosive = _explosive_pattern_error(pattern, flags)
-        if explosive is not None:
-            return 400, {"error": explosive}
+    compiled, pattern, fixed, refusal = _search_pattern(payload)
+    if refusal is not None or compiled is None:
+        return refusal or (400, {"error": "'pattern' could not be used"})
     prefix, error = _code_under_error(repo_path, payload.get("under"))
     if error:
         return 400, {"error": error}
@@ -6579,35 +6577,96 @@ def process_code_search_request(
     # otherwise be three thousand git processes for one search.
     tracked_set = set(tracked)
 
+    def contents() -> Any:
+        for path in _under_filter(tracked, prefix):
+
+            def read(path: str = path) -> bytes | None:
+                resolved, _error = _resolve_inside_repo(repo_path, path, what="path")
+                if resolved is None or not resolved.is_file():
+                    return None
+                # A tracked link whose target git does not track is passed
+                # over unsearched, exactly as a link out of the tree already
+                # is: a search that matched a line of an untracked file would
+                # hand back its contents, which is the one thing this door
+                # must never do.
+                if _resolved_not_tracked_error(repo_path, resolved, path, tracked_set):
+                    return None
+                try:
+                    if resolved.stat().st_size > CODE_MAX_FILE_BYTES:
+                        return None
+                    return resolved.read_bytes()
+                except OSError:
+                    return None
+
+            yield path, read
+
+    return 200, _search_walk(compiled, pattern, fixed, prefix, limit, contents())
+
+
+def _search_pattern(
+    payload: dict[str, Any],
+) -> tuple[Any, str, bool, tuple[int, dict[str, Any]] | None]:
+    """``(compiled, pattern, fixed, None)``, or the refusal already shaped."""
+    pattern = payload.get("pattern")
+    if not isinstance(pattern, str) or not pattern.strip():
+        return None, "", False, (400, {"error": "'pattern' is required (the text to search for)"})
+    if len(pattern) > CODE_SEARCH_MAX_PATTERN_CHARS:
+        return None, pattern, False, (
+            400,
+            {
+                "error": (
+                    f"'pattern' is {len(pattern)} characters, over this door's "
+                    f"limit of {CODE_SEARCH_MAX_PATTERN_CHARS}"
+                )
+            },
+        )
+    fixed = bool(payload.get("fixed_string", False))
+    flags = re.IGNORECASE if bool(payload.get("case_insensitive", False)) else 0
+    try:
+        compiled = re.compile(re.escape(pattern) if fixed else pattern, flags)
+    except re.error as exc:
+        return None, pattern, fixed, (
+            400,
+            {
+                "error": (
+                    f"'pattern' {pattern!r} is not a regular expression this door "
+                    f"can use ({exc}) — fix it, or send 'fixed_string': true to "
+                    "search for it as plain text"
+                )
+            },
+        )
+    if not fixed:
+        explosive = _explosive_pattern_error(pattern, flags)
+        if explosive is not None:
+            return None, pattern, fixed, (400, {"error": explosive})
+    return compiled, pattern, fixed, None
+
+
+def _search_walk(
+    compiled: Any,
+    pattern: str,
+    fixed: bool,
+    prefix: str | None,
+    limit: int,
+    contents: Any,
+) -> dict[str, Any]:
+    """The search's walk over ``(path, read)`` pairs, in order: ``read()``
+    gives the file's bytes, or ``None`` for a file passed over unsearched."""
     matches: list[dict[str, Any]] = []
     files_searched = 0
     long_lines = 0
     capped = False
     timed_out = False
     deadline = time.monotonic() + CODE_SEARCH_TIMEOUT_SECONDS
-    for path in _under_filter(tracked, prefix):
+    for path, read in contents:
         if len(matches) >= limit:
             capped = True
             break
         if time.monotonic() > deadline:
             timed_out = True
             break
-        resolved, _error = _resolve_inside_repo(repo_path, path, what="path")
-        if resolved is None or not resolved.is_file():
-            continue
-        # A tracked link whose target git does not track is passed over
-        # unsearched, exactly as a link out of the tree already is: a search
-        # that matched a line of an untracked file would hand back its
-        # contents, which is the one thing this door must never do.
-        if _resolved_not_tracked_error(repo_path, resolved, path, tracked_set):
-            continue
-        try:
-            if resolved.stat().st_size > CODE_MAX_FILE_BYTES:
-                continue
-            data = resolved.read_bytes()
-        except OSError:
-            continue
-        if _looks_binary(data):
+        data = read()
+        if data is None or _looks_binary(data):
             continue
         files_searched += 1
         for number, line in enumerate(
@@ -6640,7 +6699,7 @@ def process_code_search_request(
             )
         if timed_out:
             break
-    return 200, {
+    return {
         "pattern": pattern,
         "fixed_string": fixed,
         "under": prefix,
@@ -6653,6 +6712,498 @@ def process_code_search_request(
         "long_lines_partly_searched": long_lines,
         "timed_out": timed_out,
     }
+
+
+# ---------------------------------------------------------------------------
+# The code door AT A COMMIT (7 October 2026)
+# ---------------------------------------------------------------------------
+#
+# WHY. Every route above reads the clone's WORKING TREE. The factory's own
+# clone inside a sandbox is not kept on the commit a piece of work starts
+# from: on 7 October its checked-out main was four days behind its remote's
+# main, and its working tree carried the factory's own edits to two deploy
+# files. Every plan written in those four days was shown four-day-old code,
+# and one planned "nothing found" for a route the project already had.
+#
+# So each of the four routes takes an optional ``commit``: the commit the
+# work starts from, which the planner already records. With it, nothing is
+# read from the working tree at all. The listing is ``git ls-tree`` of that
+# commit, every byte is read out of git's own objects (``git cat-file``), and
+# the working tree, the index and any local edit cannot reach the answer.
+# A symbolic link is followed inside the commit only, to a file the commit
+# itself holds, so nothing outside the commit can be served through one.
+#
+# A commit the clone does not have is fetched once from the clone's remote
+# (the same fetch the starting rule makes); one still missing after that is
+# refused with ``409`` and ``commit_unavailable``: "could not read the
+# starting commit". Never the working tree instead. Every answer made at a
+# commit carries that commit's full id as ``commit``, so a caller can tell a
+# helper that read at the commit from one too old to know the field.
+#
+# Without ``commit`` every route answers exactly as before.
+
+#: A commit as this door takes it: a full or abbreviated id, lower-case hex.
+_CODE_COMMIT_RE = re.compile(r"[0-9a-f]{7,40}")
+#: Git's modes for an ordinary file, a symbolic link and a submodule.
+_CODE_FILE_MODES = frozenset({"100644", "100755"})
+_CODE_LINK_MODE = "120000"
+_CODE_GITLINK_MODE = "160000"
+#: How many links in a row are followed before the chain is refused.
+_CODE_MAX_LINK_HOPS = 8
+
+
+@dataclass(frozen=True)
+class _TreeEntry:
+    mode: str
+    oid: str
+    size: int | None
+
+
+class _CommitTree:
+    """One commit's tracked files, read only out of git's objects."""
+
+    def __init__(self, repo_path: Path, commit: str, entries: dict[str, _TreeEntry]) -> None:
+        self.repo_path = repo_path
+        self.commit = commit
+        self.entries = entries
+        self.files = sorted(entries)
+        self._batch: subprocess.Popen[bytes] | None = None
+
+    # -- reading blobs ------------------------------------------------------
+
+    def _git_argv(self, *args: str) -> list[str]:
+        return ["git", "-c", "safe.directory=*", "-C", str(self.repo_path), *args]
+
+    def blob(self, oid: str) -> bytes:
+        """One object's whole content, through one ``cat-file --batch``
+        process kept for the request, so a search costs one process, not one
+        per file. Raises ``OSError`` when git cannot answer."""
+        if self._batch is None:
+            self._batch = subprocess.Popen(  # noqa: S603 — fixed argv, no shell
+                self._git_argv("cat-file", "--batch"),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+        batch = self._batch
+        assert batch.stdin is not None and batch.stdout is not None
+        batch.stdin.write(oid.encode("ascii") + b"\n")
+        batch.stdin.flush()
+        header = batch.stdout.readline().decode("ascii", errors="replace").split()
+        if len(header) != 3 or header[1] != "blob":
+            raise OSError(f"git could not read object {oid} ({' '.join(header) or 'no answer'})")
+        size = int(header[2])
+        data = batch.stdout.read(size)
+        batch.stdout.read(1)
+        if len(data) != size:
+            raise OSError(f"git answered {len(data)} of the {size} bytes of object {oid}")
+        return data
+
+    def stream(self, oid: str) -> Any:
+        """A context manager giving a binary stream of one object, for a
+        file too big to hold whole; the process ends when the stream does."""
+        import contextlib
+
+        @contextlib.contextmanager
+        def opened() -> Any:
+            process = subprocess.Popen(  # noqa: S603 — fixed argv, no shell
+                self._git_argv("cat-file", "blob", oid),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+            try:
+                assert process.stdout is not None
+                yield process.stdout
+            finally:
+                process.kill()
+                process.wait()
+
+        return opened
+
+    def close(self) -> None:
+        if self._batch is not None:
+            try:
+                self._batch.kill()
+                self._batch.wait()
+            except OSError:
+                pass
+            self._batch = None
+
+    # -- which file a path is -----------------------------------------------
+
+    def landed(self, path: str) -> tuple[str | None, _TreeEntry | None, str | None]:
+        """``(path it lands on, its entry, None)`` or ``(None, None, why)``.
+
+        An ordinary file is itself. A symbolic link is followed inside the
+        commit, up to :data:`_CODE_MAX_LINK_HOPS` links, and must land on an
+        ordinary file the commit holds; a link out of the tree, to nothing,
+        or to a folder or a submodule is refused. A submodule is refused."""
+        import posixpath
+
+        current = path
+        for _hop in range(_CODE_MAX_LINK_HOPS + 1):
+            entry = self.entries.get(current)
+            if entry is None:
+                if current == path:
+                    return None, None, (
+                        f"{path} is not a file at the commit {self.commit[:12]}, so "
+                        "this door will not read it — at a commit it serves that "
+                        "commit's own files and nothing else"
+                    )
+                return None, None, (
+                    f"{path} is a link to {current}, which is not a file at the "
+                    f"commit {self.commit[:12]}, so this door will not read it"
+                )
+            if entry.mode in _CODE_FILE_MODES:
+                return current, entry, None
+            if entry.mode == _CODE_GITLINK_MODE:
+                return None, None, (
+                    f"{current} is a submodule at the commit {self.commit[:12]}, "
+                    "not a file, so this door will not read it"
+                )
+            if entry.mode != _CODE_LINK_MODE:
+                return None, None, f"{current} is not a file this door reads (mode {entry.mode})"
+            try:
+                target = self.blob(entry.oid).decode("utf-8", errors="replace")
+            except OSError as exc:
+                return None, None, _unreadable_error(current, exc)
+            if target.startswith("/"):
+                return None, None, (
+                    f"{path} is a link to {target}, outside the repository — this "
+                    "door reads only files inside it"
+                )
+            joined = posixpath.normpath(posixpath.join(posixpath.dirname(current), target))
+            if joined == ".." or joined.startswith("../") or joined == ".":
+                return None, None, (
+                    f"{path} is a link that leaves the repository, so this door "
+                    "will not read it"
+                )
+            current = joined
+        return None, None, f"{path} is a chain of more than {_CODE_MAX_LINK_HOPS} links"
+
+    def text(
+        self, path: str, *, over_size_advice: str = OVER_SIZE_READ_ADVICE
+    ) -> tuple[str | None, int, tuple[int, dict[str, Any]] | None]:
+        """As :func:`_read_text_file`, out of the commit."""
+        landed, entry, why = self.landed(path)
+        if why is not None or entry is None or landed is None:
+            return None, 0, (400, {"error": why or f"{path} could not be read"})
+        size = entry.size or 0
+        if size > CODE_MAX_FILE_BYTES:
+            return None, size, (400, {"error": _over_size_error(path, size, over_size_advice)})
+        try:
+            data = self.blob(entry.oid)
+        except OSError as exc:
+            return None, size, (400, {"error": _unreadable_error(path, exc)})
+        if _looks_binary(data):
+            return None, size, (400, {"error": _not_text_error(path)})
+        return data.decode("utf-8", errors="replace"), size, None
+
+
+def _open_commit_tree(
+    repo_path: Path, commit: Any
+) -> tuple[_CommitTree | None, tuple[int, dict[str, Any]] | None]:
+    """The commit's tree, or the refusal already shaped. Fetches the clone's
+    remote once when the commit is not in the clone; a commit still missing
+    is ``409`` with ``commit_unavailable`` and never the working tree."""
+    if not isinstance(commit, str) or not _CODE_COMMIT_RE.fullmatch(commit):
+        return None, (
+            400,
+            {"error": "'commit' must be a commit id: 7 to 40 lower-case hex characters"},
+        )
+
+    def resolve() -> str | None:
+        completed = subprocess.run(  # noqa: S603 — fixed argv, no shell
+            [
+                "git", "-c", "safe.directory=*", "-C", str(repo_path),
+                "rev-parse", "--verify", "--quiet", f"{commit}^{{commit}}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=CODE_GIT_TIMEOUT_SECONDS,
+            check=False,
+        )
+        out = (completed.stdout or "").strip()
+        return out if completed.returncode == 0 and out else None
+
+    try:
+        full = resolve()
+        fetched = ""
+        if full is None:
+            from forge.deploy.candidate_tree import fetch_remote_start_point
+
+            answer = _run_coroutine(fetch_remote_start_point(repo_path, None))
+            fetched = (
+                f"; its remote was fetched and {answer.branch} is at {answer.commit}"
+                if answer.ok
+                else f"; fetching its remote failed: {answer.refusal}"
+            )
+            full = resolve()
+        if full is None:
+            return None, (
+                409,
+                {
+                    "error": (
+                        f"could not read the starting commit {commit}: it is not in "
+                        f"the clone at {repo_path}{fetched}"
+                    ),
+                    "commit_unavailable": True,
+                },
+            )
+        listed = subprocess.run(  # noqa: S603 — fixed argv, no shell
+            [
+                "git", "-c", "safe.directory=*", "-C", str(repo_path),
+                "ls-tree", "-r", "-z", "-l", "--full-tree", full,
+            ],
+            capture_output=True,
+            timeout=CODE_GIT_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired, Exception) as exc:  # noqa: BLE001
+        return None, (500, {"error": f"sidecar git error: {type(exc).__name__}: {exc}"})
+    if listed.returncode != 0:
+        detail = " ".join(listed.stderr.decode("utf-8", errors="replace").split())[:200]
+        return None, (
+            500,
+            {"error": f"git could not list the files of the commit {full[:12]} ({detail})"},
+        )
+    entries: dict[str, _TreeEntry] = {}
+    for record in listed.stdout.split(b"\0"):
+        if not record:
+            continue
+        head, _, name = record.partition(b"\t")
+        parts = head.decode("ascii", errors="replace").split()
+        if len(parts) != 4 or parts[1] == "tree":
+            continue
+        size = int(parts[3]) if parts[3].isdigit() else None
+        entries[name.decode("utf-8", errors="replace")] = _TreeEntry(parts[0], parts[2], size)
+    return _CommitTree(repo_path, full, entries), None
+
+
+def _code_at_commit(
+    kind: str, payload: dict[str, Any], config: ForgeConfig
+) -> tuple[int, dict[str, Any]]:
+    """One of the four routes, answered at ``payload['commit']``."""
+    repo_path, error = _resolve_repo_key(payload, config)
+    if error or repo_path is None:
+        return 400, {"error": error}
+    error = _code_repo_error(repo_path)
+    if error:
+        return 400, {"error": error}
+    tree, refusal = _open_commit_tree(repo_path, payload.get("commit"))
+    if refusal is not None or tree is None:
+        return refusal or (500, {"error": "the sidecar could not read the commit"})
+    try:
+        handler = {
+            "list-files": _list_files_at,
+            "read-file": _read_file_at,
+            "imports": _imports_at,
+            "search": _search_at,
+        }[kind]
+        status, body = handler(tree, payload)
+    finally:
+        tree.close()
+    if status == 200:
+        body["commit"] = tree.commit
+    return status, body
+
+
+def _under_at(tree: _CommitTree, value: Any) -> tuple[str | None, str | None]:
+    if value is None:
+        return None, None
+    error = _relative_path_error(value, what="under")
+    if error:
+        return None, error
+    prefix = str(value).rstrip("/")
+    if not any(path.startswith(prefix + "/") for path in tree.files):
+        return None, (
+            f"'under' {str(value)!r} is not a directory at the commit {tree.commit[:12]}"
+        )
+    return prefix, None
+
+
+def _list_files_at(tree: _CommitTree, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    prefix, error = _under_at(tree, payload.get("under"))
+    if error:
+        return 400, {"error": error}
+    chosen = _under_filter(tree.files, prefix)
+    return 200, {
+        "files": chosen[:CODE_MAX_TRACKED_PATHS],
+        "count": min(len(chosen), CODE_MAX_TRACKED_PATHS),
+        "total_tracked": len(tree.files),
+        "under": prefix,
+        "capped": len(chosen) > CODE_MAX_TRACKED_PATHS,
+        "cap": CODE_MAX_TRACKED_PATHS,
+    }
+
+
+def _read_file_at(tree: _CommitTree, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    relative = payload.get("path")
+    error = _relative_path_error(relative, what="path")
+    if error:
+        return 400, {"error": error}
+    relative = str(relative)
+    landed, entry, why = tree.landed(relative)
+    if why is not None or entry is None or landed is None:
+        return 400, {"error": why or f"{relative} could not be read"}
+    first, error = _positive_int(payload.get("first_line"), what="first_line")
+    if error:
+        return 400, {"error": error}
+    last, error = _positive_int(payload.get("last_line"), what="last_line")
+    if error:
+        return 400, {"error": error}
+    if first is not None and last is not None and last < first:
+        return 400, {
+            "error": (
+                f"'last_line' {last} is before 'first_line' {first}, so there "
+                "are no lines to read"
+            )
+        }
+    size = entry.size or 0
+    partial = size > CODE_MAX_FILE_BYTES
+    if partial:
+        if first is None and last is None:
+            return 400, {"error": _over_size_error(relative, size, OVER_SIZE_READ_ADVICE)}
+        lines, refusal = _read_line_window(tree.stream(entry.oid), relative, first or 1, last)
+        if refusal is not None or lines is None:
+            return refusal or (500, {"error": f"{relative} could not be read"})
+    else:
+        text, _size, refusal = tree.text(relative)
+        if refusal is not None or text is None:
+            return refusal or (500, {"error": f"{relative} could not be read"})
+        lines = _split_lines(text)
+    start = (first or 1) - 1
+    note: str | None = None
+    if partial:
+        chosen = lines
+        total: int | None = None
+        if not chosen:
+            return 400, {
+                "error": (
+                    f"'first_line' {start + 1} is past the end of {relative}, "
+                    "which has fewer lines than that"
+                )
+            }
+        note = (
+            f"{relative} is {size} bytes, over this door's limit of "
+            f"{CODE_MAX_FILE_BYTES} bytes, so only the lines you asked for "
+            "were read — the number of lines in the whole file is not known "
+            "from here"
+        )
+    else:
+        if start >= len(lines) and lines:
+            return 400, {
+                "error": (
+                    f"'first_line' {start + 1} is past the end of {relative}, "
+                    f"which has {len(lines)} lines"
+                )
+            }
+        end = last if last is not None else len(lines)
+        chosen = lines[start:end]
+        total = len(lines)
+    return 200, {
+        "path": relative,
+        "content": "\n".join(chosen) + ("\n" if chosen else ""),
+        "bytes": size,
+        "total_lines": total,
+        "first_line": start + 1,
+        "last_line": start + len(chosen),
+        "partial": partial,
+        "note": note,
+    }
+
+
+def _imports_at(tree: _CommitTree, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    relative = payload.get("path")
+    error = _relative_path_error(relative, what="path")
+    if error:
+        return 400, {"error": error}
+    relative = str(relative).rstrip("/")
+    if relative in tree.entries:
+        chosen = [relative]
+    else:
+        chosen = _under_filter(tree.files, relative)
+        if not chosen:
+            return 400, {
+                "error": (
+                    f"{relative} is not a file at the commit {tree.commit[:12]}, and "
+                    "that commit holds no files under it either, so there is "
+                    "nothing here to read imports from"
+                )
+            }
+    capped = len(chosen) > CODE_IMPORTS_MAX_FILES
+    chosen = chosen[:CODE_IMPORTS_MAX_FILES]
+    files: list[dict[str, Any]] = []
+    for path in chosen:
+        entry: dict[str, Any] = {"path": path, "imports": []}
+        if Path(path).suffix not in CODE_PYTHON_SUFFIXES:
+            entry["language"] = "other"
+            entry["note"] = (
+                f"{path} is not a Python file; this door reads imports by "
+                "parsing Python and does not guess at other languages"
+            )
+            files.append(entry)
+            continue
+        entry["language"] = "python"
+        text, _size, refusal = tree.text(path, over_size_advice=OVER_SIZE_IMPORTS_ADVICE)
+        if refusal is not None or text is None:
+            entry["note"] = (refusal[1].get("error") if refusal else None) or (
+                f"{path} could not be read"
+            )
+            files.append(entry)
+            continue
+        try:
+            entry["imports"] = _import_statements(text)
+        except SyntaxError as exc:
+            entry["note"] = (
+                f"{path} does not parse as Python (line {exc.lineno}: "
+                f"{exc.msg}), so its imports were not read"
+            )
+        except (ValueError, RecursionError) as exc:
+            entry["note"] = (
+                f"{path} could not be parsed as Python: {type(exc).__name__}: {exc}"
+            )
+        files.append(entry)
+    return 200, {
+        "path": relative,
+        "files": files,
+        "files_walked": len(files),
+        "capped": capped,
+        "cap": CODE_IMPORTS_MAX_FILES,
+    }
+
+
+def _search_at(tree: _CommitTree, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    compiled, pattern, fixed, refusal = _search_pattern(payload)
+    if refusal is not None or compiled is None:
+        return refusal or (400, {"error": "'pattern' could not be used"})
+    prefix, error = _under_at(tree, payload.get("under"))
+    if error:
+        return 400, {"error": error}
+    wanted, error = _positive_int(payload.get("max_results"), what="max_results")
+    if error:
+        return 400, {"error": error}
+    limit = min(wanted or CODE_SEARCH_MAX_MATCHES, CODE_SEARCH_MAX_MATCHES)
+
+    def contents() -> Any:
+        for path in _under_filter(tree.files, prefix):
+
+            def read(path: str = path) -> bytes | None:
+                # A link is followed inside the commit only, to a file the
+                # commit holds; anything else is passed over unsearched.
+                _landed, entry, why = tree.landed(path)
+                if why is not None or entry is None:
+                    return None
+                if (entry.size or 0) > CODE_MAX_FILE_BYTES:
+                    return None
+                try:
+                    return tree.blob(entry.oid)
+                except OSError:
+                    return None
+
+            yield path, read
+
+    return 200, _search_walk(compiled, pattern, fixed, prefix, limit, contents())
 
 
 # ---------------------------------------------------------------------------

@@ -188,15 +188,33 @@ class LocalCheckoutReader:
     directory without its own ``.git`` is refused rather than read: ``git -C``
     walks UP to find a repository, so a plain directory inside somebody
     else's checkout would otherwise answer with that checkout's files.
+
+    With ``commit`` (7 October 2026) every read is at that commit, out of
+    git's objects (``git ls-tree``, ``git grep <commit>``, ``git cat-file``),
+    never the working tree. A commit the checkout does not have is fetched
+    once from its remote; one still missing is "could not read the starting
+    commit" (:class:`RepositoryUnreadable`), never the working tree instead.
     """
 
     def __init__(
-        self, repo_path: str, *, timeout_s: float = 10.0, search_timeout_s: float = 30.0
+        self,
+        repo_path: str,
+        *,
+        timeout_s: float = 10.0,
+        search_timeout_s: float = 30.0,
+        commit: str | None = None,
     ) -> None:
         self._root = Path(str(repo_path))
         self._timeout_s = timeout_s
         self._search_timeout_s = search_timeout_s
-        self.where = f"the checkout at {self._root}"
+        self._commit = (commit or "").strip() or None
+        #: The commit's full id once it is known to be in the checkout.
+        self._full: str | None = None
+        #: ``path -> (mode, object id, size)`` at the commit, read once.
+        self._entries: dict[str, tuple[str, str, int | None]] | None = None
+        self.where = f"the checkout at {self._root}" + (
+            f", at the commit {self._commit[:12]}" if self._commit else ""
+        )
         #: Why each file that could not be served was refused, by path.
         self.refused: dict[str, str] = {}
 
@@ -229,7 +247,76 @@ class LocalCheckoutReader:
     def _first_line(stderr: str) -> str:
         return (" ".join((stderr or "").split()) or "no reason given")[:200]
 
+    # -- at a commit ----------------------------------------------------------
+
+    def _at(self) -> str | None:
+        """The commit's full id when reading at a commit, else ``None``;
+        fetches the remote once when the checkout does not have it."""
+        if self._commit is None:
+            return None
+        if self._full is not None:
+            return self._full
+
+        def resolve() -> str | None:
+            done = self._git(
+                "rev-parse", "--verify", "--quiet", f"{self._commit}^{{commit}}",
+                timeout=self._timeout_s,
+            )
+            out = (done.stdout or "").strip()
+            return out if done.returncode == 0 and out else None
+
+        full = resolve()
+        if full is None:
+            fetched = self._git("fetch", "--quiet", "origin", timeout=self._search_timeout_s)
+            full = resolve()
+            if full is None:
+                why = (
+                    "it is not there even after fetching its remote"
+                    if fetched.returncode == 0
+                    else f"fetching its remote failed: {self._first_line(fetched.stderr)}"
+                )
+                raise RepositoryUnreadable(
+                    f"could not read the starting commit {self._commit} in "
+                    f"the checkout at {self._root}: {why}"
+                )
+        self._full = full
+        return full
+
+    def _tree(self) -> dict[str, tuple[str, str, int | None]]:
+        if self._entries is None:
+            commit = self._at()
+            completed = self._git(
+                "ls-tree", "-r", "-z", "-l", "--full-tree", str(commit),
+                timeout=self._timeout_s,
+            )
+            if completed.returncode != 0:
+                raise RepositoryUnreadable(
+                    f"listing the files of {self.where} failed (git exited "
+                    f"{completed.returncode}: {self._first_line(completed.stderr)})"
+                )
+            entries: dict[str, tuple[str, str, int | None]] = {}
+            for record in completed.stdout.split("\0"):
+                head, _, name = record.partition("\t")
+                parts = head.split()
+                if not name or len(parts) != 4 or parts[1] == "tree":
+                    continue
+                entries[name] = (parts[0], parts[2], int(parts[3]) if parts[3].isdigit() else None)
+            self._entries = entries
+        return self._entries
+
+    def _strip_commit(self, line: str) -> str:
+        """A ``git grep <commit>`` line without its ``<commit>:`` prefix."""
+        prefix = f"{self._full}:"
+        if line.startswith(prefix):
+            return line[len(prefix):]
+        binary = f"Binary file {prefix}"
+        if line.startswith(binary):
+            return "Binary file " + line[len(binary):]
+        return line
+
     def list_files(self) -> list[str]:
+        if self._commit is not None:
+            return sorted(self._tree())
         completed = self._git("ls-files", "-z", timeout=self._timeout_s)
         if completed.returncode != 0:
             raise RepositoryUnreadable(
@@ -239,6 +326,23 @@ class LocalCheckoutReader:
         return [p for p in completed.stdout.split("\0") if p]
 
     def _grep(self, *args: str) -> list[str]:
+        commit = self._at()
+        if commit is not None:
+            # At a commit the tree-ish goes after the pattern, and every line
+            # comes back prefixed by it.
+            completed = self._git("grep", *args, commit, timeout=self._search_timeout_s)
+            if completed.returncode == 1 and not completed.stderr.strip():
+                return []
+            if completed.returncode != 0:
+                raise RepositoryUnreadable(
+                    f"searching {self.where} failed (git exited "
+                    f"{completed.returncode}: {self._first_line(completed.stderr)})"
+                )
+            return [
+                self._strip_commit(line)
+                for line in completed.stdout.splitlines()
+                if line.strip()
+            ]
         completed = self._git("grep", *args, timeout=self._search_timeout_s)
         # git grep answers 1 for "no match": that is an answer, not a failure.
         if completed.returncode == 1 and not completed.stderr.strip():
@@ -276,8 +380,68 @@ class LocalCheckoutReader:
             found.append((parts[0], int(parts[1]), parts[2][:_LINE_TEXT_CHARS]))
         return found
 
+    def _read_at_commit(self, path: str) -> bytes | None:
+        """One file's committed bytes, a link followed inside the commit to
+        a file the commit holds; ``None`` (with the reason in
+        :attr:`refused`) for anything else."""
+        import posixpath
+
+        entries = self._tree()
+        current = path
+        for _hop in range(9):
+            entry = entries.get(current)
+            if entry is None:
+                self.refused[path] = (
+                    "it is not a file at the commit"
+                    if current == path
+                    else f"it is a link to {current}, which is not a file at the commit"
+                )
+                return None
+            mode, oid, size = entry
+            if mode == "120000":
+                target = self._git("cat-file", "blob", oid, timeout=self._timeout_s).stdout
+                joined = posixpath.normpath(posixpath.join(posixpath.dirname(current), target))
+                if target.startswith("/") or joined in (".", "..") or joined.startswith("../"):
+                    self.refused[path] = "it is a link out of the repository"
+                    return None
+                current = joined
+                continue
+            if mode not in ("100644", "100755"):
+                self.refused[path] = "it is not an ordinary file at the commit"
+                return None
+            if size is not None and size > _MAX_READ_BYTES:
+                self.refused[path] = (
+                    f"it is {size} bytes, over the {_MAX_READ_BYTES}-byte limit for one file"
+                )
+                return None
+            try:
+                completed = subprocess.run(
+                    ["git", "-c", "safe.directory=*", "-C", str(self._root), "cat-file", "blob", oid],
+                    capture_output=True,
+                    timeout=self._timeout_s,
+                    check=False,
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                raise RepositoryUnreadable(
+                    f"git could not read {self.where} ({type(exc).__name__})"
+                ) from exc
+            if completed.returncode != 0:
+                self.refused[path] = "git could not read it out of the commit"
+                return None
+            return completed.stdout
+        self.refused[path] = "it is a chain of links"
+        return None
+
     def read_text(self, path: str) -> str | None:
         self._check_root()
+        if self._commit is not None:
+            data = self._read_at_commit(path)
+            if data is None:
+                return None
+            if b"\0" in data[:8192]:
+                self.refused[path] = "it is not text"
+                return None
+            return data.decode("utf-8", errors="replace")
         try:
             data = (self._root / path).read_bytes()
         except OSError as exc:
