@@ -11658,8 +11658,10 @@ class PlanningRunDriver:
           (``/{user_id}``), which is how a route reads where its prefix is
           declared elsewhere;
         * each hit's file is read once and the window from 3 lines before to
-          12 after the hit is scored by how many of the request's words start
-          a word inside it. Each entry keeps ``words`` and ``already_in``
+          12 after the hit (starting higher, at the first line of the block
+          the hit sits in, when that block begins at most 24 lines above it)
+          is scored by how many of the request's words start a word inside
+          it. Each entry keeps ``words`` and ``already_in``
           exactly as before and gains ``evidence``: its windows,
           ``{"path", "first_line", "last_line", "score", "text"}`` with the
           lines numbered in ``text``. ``more_hits`` counts the hits not

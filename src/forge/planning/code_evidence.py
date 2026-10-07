@@ -12,7 +12,10 @@ and no file type filtered out:
 
 * **evidence windows** (item 1): for each place a word was found, the stretch
   of the file from 3 lines before to 12 lines after it, scored by how many of
-  the request's own words start a word inside it. The windows travel to the
+  the request's own words start a word inside it. A window starts higher
+  when the place sits in a block of lines with no blank line between them
+  that begins at most 24 lines above it: it then starts at the block's first
+  line (:func:`window_start`). The windows travel to the
   planner, numbered, so it can say what is already done and cite the line.
   They are chosen across all the words at once: the request's own and rarest
   words first, one window per file before a second in any file, until the
@@ -50,6 +53,7 @@ from forge.factory_files import is_shipped_script, shipped_script_path
 from forge.planning.repository_facts import RepositoryUnreadable
 
 __all__ = [
+    "EVIDENCE_BLOCK_LINES_ABOVE",
     "EVIDENCE_LINES_AFTER",
     "EVIDENCE_LINES_BEFORE",
     "LISTED_ALL_MEANS",
@@ -67,12 +71,16 @@ __all__ = [
     "request_words",
     "set_candidates",
     "trim_to_budget",
+    "window_start",
     "words_starting_in",
 ]
 
 #: The window around one hit: this many lines before it and after it.
 EVIDENCE_LINES_BEFORE = 3
 EVIDENCE_LINES_AFTER = 12
+#: How far above its hit a window may start to take in the whole block of
+#: lines the hit sits in (:func:`window_start`).
+EVIDENCE_BLOCK_LINES_ABOVE = 24
 #: At most this many windows in all (6 October 2026: was 3 per word and 12
 #: in all). The size budget, :data:`MAX_EVIDENCE_CHARS`, normally stops them
 #: first; see :func:`choose_windows`.
@@ -272,7 +280,7 @@ def candidate_windows(
             # would show nothing of this hit (a one-line report, a minified
             # file). The hit is still counted.
             continue
-        first = max(1, number - EVIDENCE_LINES_BEFORE)
+        first = window_start(lines, number)
         last = min(len(lines), number + EVIDENCE_LINES_AFTER)
         score = words_starting_in(words, "\n".join(lines[first - 1 : last]))
         scored.append((-score, rank(f"{path}:{number}"), path, number, first, last))
@@ -291,6 +299,33 @@ def candidate_windows(
         for negative, _rank, path, number, first, last in scored
     ]
     return candidates, hits, not_read
+
+
+def window_start(lines: Sequence[str], number: int) -> int:
+    """The first line of the window round the hit on line ``number``.
+
+    Normally :data:`EVIDENCE_LINES_BEFORE` lines above the hit. But when the
+    hit sits in a block of lines with no blank line between them (or the
+    start of the file) that begins higher, and no more than
+    :data:`EVIDENCE_BLOCK_LINES_ABOVE` lines above the hit, the window starts
+    at the block's first line. A block whose start is further up than that
+    leaves the window where it was.
+
+    WHY (7 October 2026). A hit on a function's own line showed the
+    function, but not the long block of route options written directly above
+    it, which is where the route's method and path were (the planner and its
+    checks were shown the handler of PATCH .../deactivate, not the line
+    declaring PATCH). Only blank lines are looked at, which every language
+    and text format uses to set blocks apart, so nothing here knows any
+    language's decorators, annotations, attributes or route tables.
+    """
+    first = max(1, number - EVIDENCE_LINES_BEFORE)
+    top = number
+    while top > 1 and lines[top - 2].strip():
+        if number - (top - 1) > EVIDENCE_BLOCK_LINES_ABOVE:
+            return first
+        top -= 1
+    return min(first, top)
 
 
 def _hit_past_what_is_shown(line: str, spellings: Sequence[str]) -> bool:
