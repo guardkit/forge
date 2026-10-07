@@ -96,7 +96,8 @@ from forge.planning.escalation import (
     EscalationPolicy,
     evaluate_escalation_phase,
 )
-from forge.planning.failure import fail_run, mark_run_failed
+from forge.planning.failure import DRIVER_ACTOR, fail_run, mark_run_failed
+from forge.planning import nothing_to_build
 from forge.planning.handoff import (
     PlannedHandoffHandler,
     PreCommitCheck,
@@ -665,6 +666,13 @@ three-positional form otherwise."""
 
 PublishPlanningFailedFn = Callable[[str, str], Awaitable[None]]
 """``async (correlation_id, reason)`` — terminal derived projection."""
+
+PublishPlanningCompleteFn = Callable[..., Awaitable[None]]
+"""``async (correlation_id, *, feature_id, extra) -> None`` — the successful
+terminal's derived projection, ``pipeline.planning-complete``. ``extra`` holds
+the fields the event carries beyond its typed ones (``outcome``, ``proof``,
+``summary``). Published only for the "already done, nothing to build" outcome
+(7 October 2026), and only after its PLANNED_HANDOFF transition committed."""
 
 ResourcePreflightFn = Callable[[], "ResourcePreflightResult"]
 """``() -> ResourcePreflightResult`` — a zero-arg pre-run resource check.
@@ -1312,6 +1320,21 @@ class _PlanAttempt:
     #: ``None`` only where the attempt never got as far as a reviewed tree.
     #: The legacy field name is retained to avoid widening this private record.
     traceability: Mapping[str, Any] | None = None
+    #: Set when the plan writer answered "already done, nothing to build"
+    #: (7 October 2026): nothing was written, and the caller ends the run
+    #: through :meth:`PlanningRunDriver._finish_nothing_to_build`.
+    nothing_to_build: "_NothingToBuildAnswer | None" = None
+
+
+@dataclass(frozen=True)
+class _NothingToBuildAnswer:
+    """The plan writer's "nothing to build" answer, and what it is checked
+    against: the code windows Forge sent it. ``claim`` is ``None`` and
+    ``problem`` says why when the answer could not be read as one."""
+
+    claim: "nothing_to_build.Claim | None"
+    problem: str | None
+    windows: tuple["nothing_to_build.Window", ...]
 
 
 @dataclass(frozen=True)
@@ -1556,6 +1579,10 @@ class PlanningDriverDeps:
     clock: Callable[[], datetime]
     publish_notification: PublishNotificationFn | None = None
     publish_planning_failed: PublishPlanningFailedFn | None = None
+    # The "already done, nothing to build" outcome (7 October 2026): the
+    # successful terminal's event. None = nothing is published, and the run
+    # still ends and the owner is still told.
+    publish_planning_complete: PublishPlanningCompleteFn | None = None
     # Sandbox first (2026-09-07, rule 71) — the git runner BY TARGET REPO. The
     # composition sets it when any repository has a sandbox: ``org/name`` →
     # that repository's runner (its sandbox sidecar's, or the in-container
@@ -1834,6 +1861,19 @@ class PlanningRunDriver:
                 # green, queue the feature onto forge's own Mode B dispatcher and
                 # advance to BUILD_QUEUED.
                 if not await self._feature_plan_leg(row, correlation_id):
+                    return
+                # The run may have ENDED inside the plan leg without failing
+                # (7 October 2026, "already done, nothing to build"), or been
+                # ended by another writer while it ran: the leg's re-drive
+                # shortcut returns True whenever a ``feature-plan`` event
+                # exists, whatever the row says now. Read the row again, and
+                # never run the pass-bar, gate or build legs for a run that is
+                # over.
+                current = deps.store.get_run(correlation_id)
+                if (
+                    current is None
+                    or PlanningState(current["state"]) in _TERMINAL_STATES
+                ):
                     return
                 if not await self._register_pass_bars_leg(row, correlation_id):
                     return
@@ -2506,6 +2546,127 @@ class PlanningRunDriver:
         """True iff the ``planning.target_terminal.enabled`` flag is on."""
         tt = getattr(self._deps.planning_config, "target_terminal", None)
         return bool(getattr(tt, "enabled", False))
+
+    def _nothing_to_build_enabled(self) -> bool:
+        """True iff the ``planning.nothing_to_build.enabled`` switch is on."""
+        cfg = getattr(self._deps.planning_config, "nothing_to_build", None)
+        return bool(getattr(cfg, "enabled", False))
+
+    async def _finish_nothing_to_build(
+        self,
+        row: Any,
+        correlation_id: str,
+        answer: _NothingToBuildAnswer,
+        *,
+        target_repo: str,
+        feature_id: str,
+    ) -> None:
+        """End a run whose plan writer answered "already done, nothing to build".
+
+        Rich's option of 7 October 2026: Forge ends the run with one plain
+        message listing the proof: no build, no merge, no card, no new
+        approval. Three steps:
+
+        1. **Check the proof against Forge's own windows.** Every citation must
+           lie inside a code window Forge sent the plan writer. A miss, a
+           malformed answer, or the switch off ends the run FAILED through
+           :meth:`_fail_leg`, with an honest sentence and nothing built.
+        2. **End the run in the existing success state.** FEATURE_PLAN →
+           PLANNED_HANDOFF, labelled :data:`nothing_to_build.STAGE_LABEL`,
+           with the marker, the proof and the owner's sentence in the
+           transition's ``details_json``. No ``feature-plan`` event is
+           written, so the plan leg's re-drive shortcut can never fire.
+        3. **Tell people once, and only if the transition committed.** One
+           ``pipeline.planning-complete`` carrying the marker and the proof,
+           then one owner message. A refused transition means another writer
+           already ended the run: nothing is sent, and the refusal is logged.
+        """
+        request = " ".join(self._request_text_of(row).split())
+        quoted = f'"{request}"' if request else "the request"
+
+        async def refuse(reason: str, sentence: str) -> None:
+            await self._fail_leg(
+                correlation_id,
+                _FEATURE_PLAN_STAGE,
+                "nothing to build refused: " + reason,
+                owner_message=sentence + " Nothing was built.",
+            )
+
+        if not self._nothing_to_build_enabled():
+            await refuse(
+                "the planning.nothing_to_build switch is off",
+                f"The planner answered that {quoted} is already done, but this "
+                "factory does not take that answer yet, so the run stopped.",
+            )
+            return
+        claim = answer.claim
+        if claim is None:
+            problem = answer.problem or "it could not be read"
+            await refuse(
+                problem,
+                f"The planner answered that {quoted} is already done, but its "
+                f"proof was incomplete: {problem}.",
+            )
+            return
+        outside = nothing_to_build.citations_outside(claim, answer.windows)
+        if outside:
+            await refuse(
+                "citations outside the windows sent: " + ", ".join(outside),
+                f"The planner found every part of {quoted} already done, but it "
+                "pointed at lines outside the code it was shown ("
+                + ", ".join(outside)
+                + "), so the claim could not be checked.",
+            )
+            return
+
+        message = nothing_to_build.owner_message(
+            self._request_text_of(row), target_repo, claim
+        )
+        details = nothing_to_build.terminal_details(claim, message)
+        refused = self._deps.store.transition(
+            correlation_id=correlation_id,
+            to_state=PlanningState.PLANNED_HANDOFF,
+            actor_identity=DRIVER_ACTOR,
+            stage_label=nothing_to_build.STAGE_LABEL,
+            details_json=json.dumps(details),
+            expected_from_state=PlanningState.FEATURE_PLAN,
+        )
+        if isinstance(refused, TransitionRefused):
+            logger.warning(
+                "planning driver: run %s nothing-to-build PLANNED_HANDOFF "
+                "transition refused (current=%s); another writer ended the run, "
+                "so nothing is sent",
+                correlation_id,
+                refused.current_state,
+            )
+            return
+        logger.info(
+            "planning driver: run %s ended already done, nothing to build "
+            "(%d proof lines; no build queued)",
+            correlation_id,
+            len(details[nothing_to_build.PROOF_KEY]),
+        )
+        publish = self._deps.publish_planning_complete
+        if publish is not None:
+            try:
+                await publish(
+                    correlation_id,
+                    feature_id=feature_id,
+                    extra={
+                        nothing_to_build.OUTCOME_KEY: nothing_to_build.OUTCOME,
+                        nothing_to_build.PROOF_KEY: list(
+                            details[nothing_to_build.PROOF_KEY]
+                        ),
+                        "summary": message,
+                    },
+                )
+            except Exception:  # noqa: BLE001 — a projection never blocks the row
+                logger.warning(
+                    "planning driver: planning-complete projection did not go "
+                    "out for %s (durable row remains PLANNED_HANDOFF)",
+                    correlation_id,
+                )
+        await self._notify(correlation_id, message, level="info")
 
     async def _enter_target_terminal(self, row: Any, correlation_id: str) -> bool:
         """Write the handoff file (the 007 input) and transition RUNNING → FEATURE_SPEC.
@@ -5666,7 +5827,8 @@ class PlanningRunDriver:
         """FEATURE_PLAN leg: mint the FEAT id, dispatch 008, write + validate.
 
         Returns True once the plan tree is validated + committed (the caller
-        proceeds to the B3 build trigger), False on a loud terminal failure. A
+        proceeds to the B3 build trigger), False when the run has ended
+        (failed, or nothing to build). A
         durable ``feature-plan`` approved event short-circuits a re-drive
         (no re-dispatch — returns True so the build trigger still runs, which is
         what makes a crash between the plan commit and BUILD_QUEUED recover).
@@ -5762,6 +5924,17 @@ class PlanningRunDriver:
         )
         if first is None:
             return False  # already loud and terminal
+        if first.nothing_to_build is not None:
+            # "Already done, nothing to build" (7 October 2026): the run ends
+            # here whichever way the finish goes, so this drive stops.
+            await self._finish_nothing_to_build(
+                row,
+                correlation_id,
+                first.nothing_to_build,
+                target_repo=target_repo,
+                feature_id=feature_id,
+            )
+            return False
         attempt = first
         rewrite: dict[str, Any] | None = None
         if not first.committed:
@@ -5820,6 +5993,15 @@ class PlanningRunDriver:
                 rules_only=False,
             )
             if second is None:
+                return False
+            if second.nothing_to_build is not None:
+                await self._finish_nothing_to_build(
+                    row,
+                    correlation_id,
+                    second.nothing_to_build,
+                    target_repo=target_repo,
+                    feature_id=feature_id,
+                )
                 return False
             attempt = second
             if not second.committed:
@@ -6003,6 +6185,11 @@ class PlanningRunDriver:
                 extra["revision_of"] = dict(prior)
             if documents:
                 extra["context"] = context_texts(documents)
+            # "Already done, nothing to build" (7 October 2026): asked for only
+            # with the switch on, on every plan call of the run (the exact
+            # re-review must judge the same shape). Off, the call is today's.
+            if self._nothing_to_build_enabled():
+                extra[nothing_to_build.REQUEST_FIELD] = True
             return await deps.dispatch_feature_plan(
                 plan_run_id=plan_run_id,
                 correlation_id=correlation_id,
@@ -6071,6 +6258,29 @@ class PlanningRunDriver:
                 "008 semantic review refused: " + semantic_error,
             )
             return None
+
+        # "ALREADY DONE, NOTHING TO BUILD" (7 October 2026). The plan writer
+        # may answer that every part of the request is already in the
+        # repository, with its proof, and its reviewer accepted that exact
+        # answer (the receipt above binds to it). Nothing is written: the
+        # caller checks the proof against the code windows Forge sent, and
+        # ends the run. A reply without the marker goes on exactly as today.
+        claim, claim_problem = nothing_to_build.read_claim(role_output, files)
+        if claim is not None or claim_problem is not None:
+            return _PlanAttempt(
+                committed=False,
+                stamps=None,
+                files=files,
+                slug=slug,
+                traceability=traceability,
+                nothing_to_build=_NothingToBuildAnswer(
+                    claim=claim,
+                    problem=claim_problem,
+                    windows=tuple(
+                        nothing_to_build.windows_sent(target_repo_descriptor)
+                    ),
+                ),
+            )
 
         semantic_state: dict[str, Any] = {
             "role_output": role_output,

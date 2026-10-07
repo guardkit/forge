@@ -598,7 +598,14 @@ def _make_driver(
         repository_facts: str | None = None,
         revision_of: dict[str, str] | None = None,
         validate_feedback: str | None = None,
+        already_done_allowed: bool = False,
     ) -> Any:
+        # "Already done, nothing to build" (7 October 2026): sent only with
+        # Forge's switch on; recorded so a test can read what went out.
+        counters["last_already_done_allowed"] = already_done_allowed
+        counters.setdefault("already_done_allowed_by_call", []).append(
+            ("re-review" if revision_of is not None else "plan", already_done_allowed)
+        )
         if revision_of is None:
             counters["plan"] += 1
         else:

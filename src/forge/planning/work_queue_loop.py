@@ -116,6 +116,7 @@ from forge.pipeline.publication_record import (
     PublicationRecordStore,
 )
 from forge.planning.failure import FAILURE_DETAILS_KEY, OWNER_MESSAGE_KEY
+from forge.planning.nothing_to_build import queue_reason
 from forge.planning.states import PlanningState
 from forge.planning.work_queue_commands import (
     REJECTED_BY_OWNER,
@@ -1013,11 +1014,26 @@ class WorkQueueLoop:
             failure = BUILD_FAILURE_STATES if is_fix else PLANNING_FAILURE_STATES
             queue_id = int(row["id"])
             if state in success:
+                # "Already done, nothing to build" (7 October 2026): the run
+                # ended in the success state with nothing built, and the row
+                # closes saying so, with the first line of the proof Rich was
+                # sent. Every other success closes exactly as before.
+                already_done = (
+                    None
+                    if is_fix
+                    else self._already_done_reason(str(row["correlation_id"]))
+                )
                 if self._store.close(
-                    queue_id, status="DONE", actor_identity=LOOP_ACTOR
+                    queue_id,
+                    status="DONE",
+                    actor_identity=LOOP_ACTOR,
+                    **({"reason": already_done} if already_done else {}),
                 ):
                     closed += 1
-                    logger.info("work queue: #%d is done", queue_id)
+                    if already_done:
+                        logger.info("work queue: #%d is %s", queue_id, already_done)
+                    else:
+                        logger.info("work queue: #%d is done", queue_id)
             elif state in failure:
                 rejected = None
                 spoken = None
@@ -1085,6 +1101,21 @@ class WorkQueueLoop:
         if not words or words == _NO_REJECT_REASON:
             return REJECTED_BY_OWNER
         return f"{REJECTED_BY_OWNER}: {words}"
+
+    def _already_done_reason(self, correlation_id: str) -> str | None:
+        """The closing reason for a run that ended "already done, nothing to
+        build"; None for every other finished run.
+
+        The driver writes the marker and the proof on the PLANNED_HANDOFF
+        event's details (``forge.planning.nothing_to_build``). Nothing that
+        goes wrong in the read reaches the caller: the row then closes DONE
+        with no reason, as before.
+        """
+        return queue_reason(
+            self._terminal_event_details(
+                correlation_id, PlanningState.PLANNED_HANDOFF.value
+            )
+        )
 
     def _owner_failure_sentence(self, correlation_id: str) -> str | None:
         """The plain sentence the driver sent Rich when it failed the run;

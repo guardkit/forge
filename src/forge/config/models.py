@@ -828,6 +828,30 @@ class PlanningDigestReviewConfig(BaseModel):
     )
 
 
+class NothingToBuildConfig(BaseModel):
+    """The plan leg's "already done, nothing to build" outcome (7 October 2026).
+
+    On, Forge tells the plan writer it may answer that every part of the
+    request is already in the repository (``already_done_allowed: true`` on
+    the plan call). When the writer does, with proof that lies inside the code
+    Forge showed it, the run ends with one plain message listing the proof:
+    no build, no merge, no card. Off (the default), the plan call is today's,
+    and a "nothing to build" answer is refused like any plan that cannot be
+    built.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = Field(
+        default=False,
+        description=(
+            "True = the plan writer may answer 'nothing to build' with its "
+            "proof, and a checked answer ends the run without a build. False "
+            "(default) = today's plan call, and such an answer fails the run."
+        ),
+    )
+
+
 class SandboxEntry(BaseModel):
     """One repository's sandbox (sandbox first, 2026-09-07, rule 71).
 
@@ -997,6 +1021,13 @@ class PlanningConfig(BaseModel):
             "to the spec writer once, as its own note, and stamps again; only "
             "a second refusal stops the run and asks a person. False = the "
             "first refusal stops the run, exactly as before 2026-09-06."
+        ),
+    )
+    nothing_to_build: NothingToBuildConfig = Field(
+        default_factory=NothingToBuildConfig,
+        description=(
+            "The plan leg's 'already done, nothing to build' outcome. "
+            "Defaults to disabled: the plan call and the plan leg are today's."
         ),
     )
     sandboxes: dict[str, SandboxEntry] = Field(

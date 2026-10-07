@@ -32,6 +32,7 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import Any, Callable, Mapping
 
+from forge.planning.nothing_to_build import QUEUE_REASON_PREFIX
 from forge.planning.work_queue_store import (
     OPEN_STATUSES,
     FiledRow,
@@ -95,12 +96,24 @@ _CLOSED_WORDS: Mapping[str, str] = {
 REJECTED_BY_OWNER: str = "rejected by you"
 
 
+#: How a row whose planning run found the work already done is described
+#: (7 October 2026). The loop writes these words at the front of the row's
+#: closing reason; the stored status stays DONE.
+ALREADY_DONE: str = QUEUE_REASON_PREFIX
+
+
 def _field(row: sqlite3.Row | Mapping[str, Any], name: str) -> Any:
     """One field of a row, or None when the row has no such field."""
     try:
         return row[name]
     except (KeyError, IndexError, TypeError):
         return None
+
+
+def was_already_done(row: sqlite3.Row | Mapping[str, Any]) -> bool:
+    """True when this closed row's reason starts with the already-done words."""
+    reason = _field(row, "closed_reason")
+    return str(reason or "").startswith(ALREADY_DONE)
 
 
 def was_rejected_by_owner(row: sqlite3.Row | Mapping[str, Any]) -> bool:
@@ -111,7 +124,9 @@ def was_rejected_by_owner(row: sqlite3.Row | Mapping[str, Any]) -> bool:
 
 def closed_word(row: sqlite3.Row | Mapping[str, Any]) -> str:
     """How a closed row's status is spoken: done, withdrawn, blocked — or
-    ``rejected by you`` for a blocked row that closed on Rich's own reject.
+    ``rejected by you`` for a blocked row that closed on Rich's own reject,
+    or ``already done, nothing to build`` for a done row whose planning run
+    found the work already in the repository (7 October 2026).
 
     Every surface that tells Rich what became of a closed row goes through
     here, so the reject is spoken the same way on all of them.
@@ -119,6 +134,8 @@ def closed_word(row: sqlite3.Row | Mapping[str, Any]) -> str:
     status = str(_field(row, "status") or "")
     if status == "BLOCKED" and was_rejected_by_owner(row):
         return REJECTED_BY_OWNER
+    if status == "DONE" and was_already_done(row):
+        return ALREADY_DONE
     return _CLOSED_WORDS.get(status, status.lower())
 
 
@@ -353,6 +370,7 @@ def execute_command(
 __all__ = [
     "COMMAND_VERBS",
     "NOT_A_ROW_NUMBER",
+    "ALREADY_DONE",
     "REJECTED_BY_OWNER",
     "age_phrase",
     "closed_word",
@@ -360,5 +378,6 @@ __all__ = [
     "execute_command",
     "list_reply",
     "queued_reply",
+    "was_already_done",
     "was_rejected_by_owner",
 ]

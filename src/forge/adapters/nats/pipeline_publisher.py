@@ -53,6 +53,7 @@ from nats_core.events import (
     BuildProgressPayload,
     BuildResumedPayload,
     BuildStartedPayload,
+    PlanningCompletePayload,
     PlanningFailedPayload,
     StageCompletePayload,
 )
@@ -278,6 +279,24 @@ class PipelinePublisher:
             event_name="build-cancelled",
             event_type=EventType.BUILD_CANCELLED,
             payload=payload,
+        )
+
+    async def publish_planning_complete(
+        self, payload: PlanningCompletePayload
+    ) -> None:
+        """Publish ``pipeline.planning-complete.{correlation_id}`` terminal.
+
+        Forge publishes it for one outcome only (7 October 2026): the plan
+        writer found every part of the request already done, and the run
+        ended PLANNED_HANDOFF with nothing built. The payload's extra fields
+        (``outcome``, ``proof``, ``summary``) ride unchanged: the payload
+        allows extra fields and the envelope carries it as a plain dict.
+        """
+        await self._publish_envelope(
+            event_name="planning-complete",
+            event_type=EventType.PLANNING_COMPLETE,
+            payload=payload,
+            subject_key="correlation_id",
         )
 
     async def publish_planning_failed(self, payload: PlanningFailedPayload) -> None:
