@@ -21,11 +21,8 @@ set-up's register-repo writes nothing into a project, and deploy files belong
 to a project that deploys its own app, so those two templates were removed.
 """
 
-#: The scripts above, by the file name each has in a project (6 October
-#: 2026). The planner's code evidence and its "all the X" candidates leave
-#: out any tracked file with one of these names: it is the factory's own
-#: script in the project's folders, never the project's code. The sandbox's
-#: clone carries the newest runner whatever the project committed, so on
-#: 7 October a request about "all the count endpoints" was offered
-#: ``deploy/sandbox-runner.sh`` (it mentions a "counter") as a member.
-SHIPPED_SCRIPTS: tuple[str, ...] = ("sandbox-deploy.sh", "sandbox-runner.sh")
+# Which of these scripts a project's tree holds as the factory's own, and
+# where, is kept in forge.factory_files, which the planner reads too.
+from forge.factory_files import SHIPPED_SCRIPTS  # noqa: E402
+
+__all__ = ["SHIPPED_SCRIPTS"]
