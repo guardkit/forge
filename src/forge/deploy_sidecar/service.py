@@ -4411,15 +4411,37 @@ def process_git_worktree_remove_request(
 ) -> tuple[int, dict[str, Any]]:
     """Validate and perform a ``/git/worktree-remove`` payload.
 
-    ``{repo, path}`` → ``{status, path, detail}``. A path that is already
-    gone is a success: there is nothing left to remove, and a second call
-    must be safe. Never raises.
+    ``{repo, leaf}`` or ``{repo, path}`` → ``{status, path, detail}``. A path
+    that is already gone is a success: there is nothing left to remove, and a
+    second call must be safe. Never raises.
+
+    ``leaf`` (8 October 2026) is the folder's own name, exactly as
+    ``/git/worktree-add`` takes it: the path is built here, from the
+    repository this service resolved, because the coordinator knows a
+    sandboxed repository by a different path. Sending its own path made every
+    merge's clean-up a 400 and left each ``integration-FEAT-*`` folder behind
+    (FEAT-A804, window 12). The full ``path`` form is still accepted for older
+    callers, under the same rule as before.
     """
     if not isinstance(payload, dict):
         return 400, {"error": "request body must be a JSON object"}
     repo_path, error = _resolve_repo_key(payload, config)
     if error or repo_path is None:
         return 400, {"error": error}
+    leaf = payload.get("leaf")
+    if leaf is not None and not payload.get("path"):
+        if not isinstance(leaf, str) or not SAFE_NAME_PATTERN.match(leaf):
+            return 400, {
+                "error": (
+                    "'leaf' is the working folder's own name — letters, "
+                    "digits, dots, dashes and underscores, no slash; got "
+                    f"{leaf!r}"
+                )
+            }
+        from forge.cli._conductor_worktree import WORKTREES_DIR
+
+        payload = dict(payload)
+        payload["path"] = str(repo_path / WORKTREES_DIR / leaf)
     error = _worktree_path_error(repo_path, payload.get("path"))
     if error:
         return 400, {"error": error}

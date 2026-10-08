@@ -292,6 +292,35 @@ class TestTheWorktreeRemoveRoute:
         assert "is not a journey worktree of this repository" in body["error"]
         assert repo.is_dir()
 
+    def test_a_tree_is_removed_by_its_name_alone(
+        self, cfg: ForgeConfig, repo: Path
+    ) -> None:
+        """FEAT-A804: the coordinator knows a sandboxed repository by another
+        path, so it names the folder and this side builds the path."""
+        process_git_worktree_add_request(
+            {"repo": REPO_KEY, "leaf": BUILD_ID, "branch": BRANCH}, config=cfg
+        )
+        assert Path(_tree(repo)).is_dir()
+        status, body = process_git_worktree_remove_request(
+            {"repo": REPO_KEY, "leaf": BUILD_ID}, config=cfg
+        )
+        assert status == 200 and body["status"] == "success", body
+        assert body["path"] == _tree(repo)
+        assert not Path(_tree(repo)).exists()
+        assert _tree(repo) not in _git(repo, "worktree", "list")
+
+    @pytest.mark.parametrize(
+        "leaf", ["..", "../escape", "a/b", "/abs", ".hidden", "", 7]
+    )
+    def test_a_name_that_is_not_one_plain_folder_name_is_refused(
+        self, cfg: ForgeConfig, repo: Path, leaf: object
+    ) -> None:
+        status, body = process_git_worktree_remove_request(
+            {"repo": REPO_KEY, "leaf": leaf}, config=cfg
+        )
+        assert status == 400, body
+        assert repo.is_dir()
+
 
 # ---------------------------------------------------------------------------
 # /git/worktree-commit-count

@@ -5000,6 +5000,10 @@ async def execute_merge_deploy(
         retired: list[dict[str, Any]] = []
         highest = int(getattr(record, "attempt", 0) or 0) if record is not None else 0
         for attempt_number in range(1, max(highest, 1) + 1):
+            # This side's path, for the record and for a repository with no
+            # sandbox. The sandbox venue sends only the folder's own name and
+            # the sandbox builds its own path from it (8 October 2026: sending
+            # this path to the sandbox was refused, and every folder stayed).
             folder = working_folder_path(repo_root, feature_id, attempt_number)
             try:
                 removed = await git.remove_working_folder(folder)

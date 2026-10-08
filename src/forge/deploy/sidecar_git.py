@@ -63,6 +63,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from pathlib import PurePath
 from typing import Any
 
 from forge.deploy.candidate_tree import (
@@ -367,10 +368,19 @@ class SidecarCandidateGit:
         )
 
     async def remove_working_folder(self, path: str) -> bool:
-        """Remove the join's working folder in the sandbox. Never raises."""
+        """Remove the join's working folder in the sandbox. Never raises.
+
+        Only the folder's NAME goes over the wire, as for
+        :meth:`add_working_folder`. ``path`` is whatever the caller has for
+        it — for the merge press, the coordinator's own idea of where the
+        repository lives — and the sandbox holds its clone at a different
+        path, so sending the whole path was refused (FEAT-A804, 8 October
+        2026) and the folder stayed behind.
+        """
+        leaf = PurePath(str(path)).name
         decoded, why = await self._ok(
             "/git/worktree-remove",
-            {"repo": self._repo, "path": str(path)},
+            {"repo": self._repo, "leaf": leaf},
             timeout=self._read_timeout_s,
         )
         if decoded is None:
