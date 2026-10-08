@@ -71,6 +71,7 @@ __all__ = [
     "choose_windows",
     "is_factory_record",
     "quantified_phrases",
+    "request_method",
     "request_words",
     "scenario_words",
     "set_candidates",
@@ -333,15 +334,45 @@ def _window_body(window: Mapping[str, Any]) -> str:
     return re.sub(r"(?m)^\d+: ", "", window.get("text") or "")
 
 
-#: A quoted stretch on one line, in any of the three quotes most languages
-#: use for strings: where a test writes the route it calls.
-_QUOTED_ON_A_LINE = re.compile(r"\"[^\"\n]*\"|'[^'\n]*'|`[^`\n]*`")
+#: A quoted stretch that is a call's argument or a list's item: its quote
+#: (any of the three most languages use for strings, after at most two
+#: prefix letters such as a format or raw marker) opens right after "(",
+#: "[" or ",", with only spaces or line breaks between. A one-line
+#: description in quotes, or a comment whose apostrophes happen to pair
+#: up, is not one.
+_QUOTED_ARGUMENT = re.compile(
+    r"[(\[,]\s*[A-Za-z$@]{0,2}(\"[^\"\n]*\"|'[^'\n]*'|`[^`\n]*`)"
+)
+
+#: The method a request names before its route: an all-capitals word
+#: followed by a path ("PATCH /users/{user_id}/deactivate").
+_METHOD_BEFORE_A_ROUTE = re.compile(r"\b([A-Z]{3,7})\s+/")
 
 
-def _quoted(body: str) -> str:
-    """The quoted stretches of ``body``, one per line. A name written only
-    in a comment is not among them."""
-    return "\n".join(match.group(0) for match in _QUOTED_ON_A_LINE.finditer(body))
+def request_method(request_text: str) -> str:
+    """The method word the request writes right before its route, lower
+    case, or ``""`` when it names none."""
+    match = _METHOD_BEFORE_A_ROUTE.search(request_text or "")
+    return match.group(1).lower() if match else ""
+
+
+def _calls(body: str, anchor: str, method: str) -> bool:
+    """``body`` (lower case) passes ``anchor`` as a call's quoted argument
+    or a list's quoted item, and, when ``method`` is given, says that word
+    on the same line or the line before."""
+    for match in _QUOTED_ARGUMENT.finditer(body):
+        if not _names(match.group(1), anchor):
+            continue
+        if not method:
+            return True
+        start = match.start(1)
+        line_start = body.rfind("\n", 0, start) + 1
+        before_start = body.rfind("\n", 0, max(line_start - 1, 0)) + 1 if line_start else 0
+        line_end = body.find("\n", start)
+        near = body[before_start : line_end if line_end != -1 else len(body)]
+        if re.search(r"(?<![a-z0-9])" + re.escape(method) + r"(?![a-z0-9])", near):
+            return True
+    return False
 
 
 def _is_data(value: str) -> bool:
@@ -367,12 +398,15 @@ class _ScenarioFit:
 
     * it is in the project's declared test folders;
     * it names what the request names, as the request writes it with its
-      punctuation (``/deactivate``, ``active_count``): ``anchors``, inside a
-      quoted stretch (``"``, ``'`` or a backquote), where a test writes what
-      it calls; a mention in a comment does not count. A test of some other
-      feature's code that only shares a plain word, or names the route only
-      in passing, is not this request's test. A path is matched whole:
-      ``/users/{user_id}`` is not found in ``/users/{user_id}/deactivate``;
+      punctuation (``/deactivate``, ``active_count``): ``anchors``, as a
+      call's quoted argument or a list's quoted item
+      (:data:`_QUOTED_ARGUMENT`), where a test writes what it calls; a
+      mention in a comment or a one-line description does not count. When
+      the request names a method before its route (``PATCH``), that word
+      must be on the same line or the line before (``client.patch(``), so
+      a test of another method on the same route is not this request's
+      test. A path is matched whole: ``/users/{user_id}`` is not found in
+      ``/users/{user_id}/deactivate``;
     * it holds at least half of the words most of the scenarios say (the
       feature's own vocabulary, such as ``deactivate``, ``patch``,
       ``request``), so it is a test of this feature;
@@ -402,6 +436,7 @@ class _ScenarioFit:
     ) -> None:
         self.test_roots = list(test_roots)
         self.anchors = [a.lower() for a in anchors if a]
+        self.method = request_method(request_text)
         stems = [set(words) for words, _values in scenarios]
         values = [set(vals) for _words, vals in scenarios]
         # A word tells scenarios apart only when at most half of them say it
@@ -436,8 +471,9 @@ class _ScenarioFit:
                 self._cache[key] = None
             else:
                 body = _window_body(window).lower()
-                quoted = _quoted(body)
-                if self.anchors and not any(_names(quoted, anchor) for anchor in self.anchors):
+                if self.anchors and not any(
+                    _calls(body, anchor, self.method) for anchor in self.anchors
+                ):
                     self._cache[key] = None
                 else:
                     stems = {_stem(token) for token in _scenario_tokens(_window_body(window))}
@@ -735,7 +771,8 @@ def choose_windows(
     may then say "already done" when it is not), so only strong evidence
     counts (:class:`_ScenarioFit`): a window in ``test_roots`` (the
     project's declared test folders) that names what the request names
-    (``anchors``) inside a quoted stretch, speaks the feature's own words,
+    (``anchors``) as a call's quoted argument, with the request's method
+    beside it when it names one, speaks the feature's own words,
     says nothing only another scenario says, and holds this scenario's own
     values (not only example data) or at least two of the words that tell
     it apart. When nothing fits, the
