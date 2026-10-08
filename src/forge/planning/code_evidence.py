@@ -69,6 +69,7 @@ __all__ = [
     "MAX_SET_PHRASES",
     "candidate_windows",
     "choose_windows",
+    "is_documentation",
     "is_factory_record",
     "quantified_phrases",
     "request_method",
@@ -356,37 +357,100 @@ def request_method(request_text: str) -> str:
     return match.group(1).lower() if match else ""
 
 
+#: What a line starts with when the whole line is a comment, in the
+#: common languages and file formats.
+_COMMENT_LINE_STARTS = ("#", "//", "--", ";", "*", "/*", "<!--", "%")
+
+
+def _code_only(body: str) -> str:
+    """``body`` with its comments blanked out, line by line, so a call
+    written in a comment is never taken for one the test makes: a line
+    starting with a common comment marker is blanked, and a ``#`` or
+    ``//`` comment after code is cut off where it starts outside quotes.
+    Line breaks are kept, so lines keep their places."""
+    kept: list[str] = []
+    for line in body.split("\n"):
+        if line.lstrip().startswith(_COMMENT_LINE_STARTS):
+            kept.append("")
+            continue
+        quote = ""
+        cut = len(line)
+        for at, char in enumerate(line):
+            if quote:
+                if char == quote:
+                    quote = ""
+            elif char in "\"'`":
+                quote = char
+            elif char == "#" or (line.startswith("//", at) and not line[:at].endswith(":")):
+                cut = at
+                break
+        kept.append(line[:cut])
+    return "\n".join(kept)
+
+
+def _route_pattern(route: str) -> re.Pattern[str]:
+    """The whole of ``route`` as a quoted call argument may write it: each
+    ``{placeholder}`` segment stands for any one segment (``{thing_id}``
+    for ``t-1``), every other segment is itself, nothing may be missing
+    before it but a scheme and host (``http://test``), and only a closing
+    slash, a query or a fragment may follow it."""
+    segment = r"[^/\s\"'`?#]+"
+    parts = [segment if "{" in part else re.escape(part) for part in route.strip("/").split("/")]
+    return re.compile(
+        r"(?:[a-z][a-z0-9+.-]*://[^/\s]+)?/" + "/".join(parts) + r"/?(?:[?#]\S*)?"
+    )
+
+
 def _calls(body: str, anchor: str, method: str) -> bool:
     """``body`` (lower case) passes ``anchor`` as a call's quoted argument
-    or a list's quoted item, and, when ``method`` is given, says that word
-    on the same line or the line before."""
-    for match in _QUOTED_ARGUMENT.finditer(body):
-        if not _names(match.group(1), anchor):
+    or a list's quoted item, outside comments, and, when ``method`` is
+    given, says that word on the same line or the line before, outside
+    comments too. A route (``anchor`` starting with a slash) must be the
+    whole route (:func:`_route_pattern`); another name is looked for
+    inside the quoted text."""
+    code = _code_only(body)
+    route = _route_pattern(anchor) if anchor.startswith("/") else None
+    for match in _QUOTED_ARGUMENT.finditer(code):
+        quoted = match.group(1)[1:-1]
+        if route is not None:
+            if not route.fullmatch(quoted):
+                continue
+        elif anchor not in quoted:
             continue
         if not method:
             return True
         start = match.start(1)
-        line_start = body.rfind("\n", 0, start) + 1
-        before_start = body.rfind("\n", 0, max(line_start - 1, 0)) + 1 if line_start else 0
-        line_end = body.find("\n", start)
-        near = body[before_start : line_end if line_end != -1 else len(body)]
+        line_start = code.rfind("\n", 0, start) + 1
+        before_start = code.rfind("\n", 0, max(line_start - 1, 0)) + 1 if line_start else 0
+        line_end = code.find("\n", start)
+        near = code[before_start : line_end if line_end != -1 else len(code)]
         if re.search(r"(?<![a-z0-9])" + re.escape(method) + r"(?![a-z0-9])", near):
             return True
     return False
+
+
+#: Prose formats: a window in one of these, outside the test and source
+#: folders, is documentation.
+_PROSE_SUFFIXES = (".md", ".rst", ".adoc", ".txt")
+#: Folders that commonly hold a project's own code.
+_SOURCE_FOLDERS = frozenset({"src", "lib", "app", "pkg", "cmd", "internal", "source"})
+
+
+def is_documentation(path: str, test_roots: Sequence[str]) -> bool:
+    """True only for a file that is positively documentation: prose (by its
+    suffix) outside the declared test folders and outside the common
+    source folders. Anything else, a data or settings file included, is
+    not, because it may be a test's cases or the project's code."""
+    path = str(path)
+    if _under(path, test_roots) or path.split("/", 1)[0] in _SOURCE_FOLDERS:
+        return False
+    return path.lower().endswith(_PROSE_SUFFIXES)
 
 
 def _is_data(value: str) -> bool:
     """A value that looks like example data (``user-123``, an address, a
     number): it cannot make a window a scenario's test on its own."""
     return bool(re.search(r"[0-9@]", value))
-
-
-def _names(body: str, anchor: str) -> bool:
-    """``body`` holds ``anchor``; a path (starting with a slash) only as a
-    whole path, not as the start of a longer one."""
-    if not anchor.startswith("/"):
-        return anchor in body
-    return re.search(re.escape(anchor) + r"(?![/A-Za-z0-9_{-])", body) is not None
 
 
 class _ScenarioFit:
@@ -398,15 +462,16 @@ class _ScenarioFit:
 
     * it is in the project's declared test folders;
     * it names what the request names, as the request writes it with its
-      punctuation (``/deactivate``, ``active_count``): ``anchors``, as a
-      call's quoted argument or a list's quoted item
-      (:data:`_QUOTED_ARGUMENT`), where a test writes what it calls; a
-      mention in a comment or a one-line description does not count. When
-      the request names a method before its route (``PATCH``), that word
-      must be on the same line or the line before (``client.patch(``), so
-      a test of another method on the same route is not this request's
-      test. A path is matched whole: ``/users/{user_id}`` is not found in
-      ``/users/{user_id}/deactivate``;
+      punctuation: ``anchors``, as a call's quoted argument or a list's
+      quoted item (:data:`_QUOTED_ARGUMENT`) outside comments
+      (:func:`_code_only`), where a test writes what it calls; a mention in
+      a comment or a one-line description does not count. A route must be
+      called whole (:func:`_route_pattern`): ``/widgets/t-1/archive`` is
+      not ``/things/{thing_id}/archive``, nor is ``/users/{user_id}`` found
+      in ``/users/{user_id}/deactivate``. When the request names a method
+      before its route (``PATCH``), that word must be on the same line or
+      the line before (``client.patch(``), outside comments, so a test of
+      another method on the same route is not this request's test;
     * it holds at least half of the words most of the scenarios say (the
       feature's own vocabulary, such as ``deactivate``, ``patch``,
       ``request``), so it is a test of this feature;
@@ -462,23 +527,24 @@ class _ScenarioFit:
             self.mine.append((own & telling) - requested)
             self.theirs.append((set().union(*others) - own) & telling)
             self.values.append(values[position] - set().union(*other_values))
-        self._cache: dict[int, tuple[str, set[str]] | None] = {}
+        # Each window read once, kept beside its reading, so a window made
+        # later at the same address is never given another's reading.
+        self._cache: dict[int, tuple[Mapping[str, Any], tuple[str, set[str]] | None]] = {}
 
     def _read(self, window: Mapping[str, Any]) -> tuple[str, set[str]] | None:
-        key = id(window)
-        if key not in self._cache:
-            if not _under(str(window.get("path", "")), self.test_roots):
-                self._cache[key] = None
-            else:
-                body = _window_body(window).lower()
-                if self.anchors and not any(
-                    _calls(body, anchor, self.method) for anchor in self.anchors
-                ):
-                    self._cache[key] = None
-                else:
-                    stems = {_stem(token) for token in _scenario_tokens(_window_body(window))}
-                    self._cache[key] = (body, stems)
-        return self._cache[key]
+        cached = self._cache.get(id(window))
+        if cached is not None and cached[0] is window:
+            return cached[1]
+        reading: tuple[str, set[str]] | None = None
+        if _under(str(window.get("path", "")), self.test_roots):
+            body = _window_body(window).lower()
+            if not self.anchors or any(
+                _calls(body, anchor, self.method) for anchor in self.anchors
+            ):
+                stems = {_stem(token) for token in _scenario_tokens(_window_body(window))}
+                reading = (body, stems)
+        self._cache[id(window)] = (window, reading)
+        return reading
 
     def score(self, position: int, window: Mapping[str, Any]) -> tuple[int, int] | None:
         """How strongly ``window`` is scenario ``position``'s test, when it
@@ -771,15 +837,17 @@ def choose_windows(
     may then say "already done" when it is not), so only strong evidence
     counts (:class:`_ScenarioFit`): a window in ``test_roots`` (the
     project's declared test folders) that names what the request names
-    (``anchors``) as a call's quoted argument, with the request's method
+    (``anchors``, a route whole) as a call's quoted argument outside
+    comments, with the request's method
     beside it when it names one, speaks the feature's own words,
     says nothing only another scenario says, and holds this scenario's own
     values (not only example data) or at least two of the words that tell
     it apart. When nothing fits, the
     scenario gets no window. Room is made only by taking out windows for
-    which ``may_give_way`` is true (the driver passes the documentation),
-    never a word's first window and never a test, so no scenario loses the
-    test it was shown. These windows count against the same limits and
+    which ``may_give_way`` is true (the driver passes
+    :func:`is_documentation`: prose outside the test and source folders),
+    never a word's first window and never a window in the test folders,
+    so no scenario loses the test it was shown. These windows count against the same limits and
     together take at most half of the windows and half of the characters.
     Without ``scenarios``, ``test_roots`` or ``anchors`` nothing changes.
 
@@ -924,6 +992,7 @@ def _add_scenario_tests(
                     i
                     for i, (_, w) in enumerate(chosen)
                     if may_give_way(w["path"])
+                    and not _under(w["path"], fit.test_roots)
                     and not w.get("_scenario")
                     and not any(w is k for k in keep)
                 ),

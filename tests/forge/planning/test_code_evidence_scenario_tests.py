@@ -28,7 +28,11 @@ import pytest
 
 from forge.planning.code_evidence import (
     MAX_EVIDENCE_WINDOWS,
+    _code_only,
+    _ScenarioFit,
+    _route_pattern,
     choose_windows,
+    is_documentation,
     request_method,
     scenario_words,
     trim_to_budget,
@@ -379,6 +383,27 @@ LISTED = (
 )
 
 
+#: Codex's shapes: another route sharing the request's last segment, and a
+#: matching call written only in a comment beside a real call to another
+#: route.
+SAME_LAST_SEGMENT = (
+    "check a widget archive succeeds\n"
+    '  call patch("/widgets/t-1/archive")\n'
+    "  expect it to succeed: 200, and the thing is marked live\n"
+)
+COMMENTED_CALL = (
+    "check switching a thing on succeeds\n"
+    '  # call patch("/things/t-1/archive")\n'
+    '  call post("/admin/t-1/enable")\n'
+    "  expect it to succeed: 200, and the thing is marked live\n"
+)
+TRAILING_COMMENT = (
+    "check switching a thing on succeeds\n"
+    '  call post("/admin/t-1/enable")  // was patch("/things/t-1/archive")\n'
+    "  expect it to succeed: 200, and the thing is marked live\n"
+)
+
+
 def _after_success(block: str) -> dict[str, str]:
     return {SUCCESS_CHECK: CHECKS + "\n" * 2 + _filler(20) + "\n" + block}
 
@@ -394,6 +419,11 @@ LOOKALIKES = {
     "in a one-line description": (_after_success(DESCRIBED), SUCCESS_CHECK, DESCRIBED),
     "in a comment with apostrophes": (_after_success(APOSTROPHES), SUCCESS_CHECK, APOSTROPHES),
     "in a list called with another method": (_after_success(LISTED), SUCCESS_CHECK, LISTED),
+    "on another route with the same last segment": (
+        _after_success(SAME_LAST_SEGMENT), SUCCESS_CHECK, SAME_LAST_SEGMENT
+    ),
+    "as a commented-out call": (_after_success(COMMENTED_CALL), SUCCESS_CHECK, COMMENTED_CALL),
+    "in a comment after code": (_after_success(TRAILING_COMMENT), SUCCESS_CHECK, TRAILING_COMMENT),
 }
 
 
@@ -424,10 +454,136 @@ def test_a_lookalike_is_never_taken_as_the_scenarios_test(tmp_path: Path, where:
     assert not any(p == path and lo <= last and hi >= first for p, lo, hi in added)
 
 
+def _fit() -> _ScenarioFit:
+    """The fit the driver builds for this request and specification."""
+    return _ScenarioFit(
+        [(words, values) for _title, words, values in scenario_words(SPEC)],
+        TEST_ROOTS,
+        ["/things/{thing_id}/archive"],
+        REQUEST,
+    )
+
+
+def _as_window(path: str, block: str) -> dict:
+    return {
+        "path": path,
+        "first_line": 1,
+        "last_line": block.count("\n"),
+        "text": "\n".join(f"{n}: {line}" for n, line in enumerate(block.split("\n")[:-1], 1)),
+    }
+
+
+@pytest.mark.parametrize("where", sorted(LOOKALIKES))
+def test_no_lookalike_is_evidence_of_any_scenario(where: str) -> None:
+    """Window by window, whatever the budget: no look-alike is any
+    scenario's test, while the real success check is the success one's."""
+    _extra, path, block = LOOKALIKES[where]
+    fit = _fit()
+    assert all(fit.score(p, _as_window(path, block)) is None for p in range(3))
+    real = CHECKS[CHECKS.index("check live thing"):]
+    assert fit.score(0, _as_window(SUCCESS_CHECK, real)) is not None
+
+
 def test_the_request_method_is_the_word_before_its_route() -> None:
     assert request_method(REQUEST) == "patch"
     assert request_method("Add GET /things/count returning a number") == "get"
     assert request_method("Make things archivable") == ""
+
+
+def test_a_route_is_matched_whole() -> None:
+    route = _route_pattern("/things/{thing_id}/archive")
+    for called in (
+        "/things/t-1/archive",
+        "/things/{thing_id}/archive",
+        "http://test/things/t-1/archive",
+        "/things/t-1/archive/",
+        "/things/t-1/archive?force=1",
+    ):
+        assert route.fullmatch(called), called
+    for other in (
+        "/widgets/t-1/archive",
+        "/archive",
+        "/api/things/t-1/archive",
+        "/things/t-1/archive/undo",
+        "/things/t-1/x/archive",
+    ):
+        assert not route.fullmatch(other), other
+
+
+def test_comments_are_not_code() -> None:
+    body = (
+        '# call patch("/a")\n'
+        '  // patch("/b")\n'
+        '-- patch("/c")\n'
+        'post("/d")  # patch("/e")\n'
+        'post("/f")  // patch("/g")\n'
+        'get("http://test/h")\n'
+        'say("a # in quotes")\n'
+    )
+    code = _code_only(body)
+    for gone in ("/a", "/b", "/c", "/e", "/g"):
+        assert gone not in code, gone
+    for kept in ("/d", "/f", "http://test/h", "a # in quotes"):
+        assert kept in code, kept
+    assert code.count("\n") == body.count("\n")
+
+
+def test_only_prose_outside_tests_and_code_is_documentation() -> None:
+    roots = ["checks/things"]
+    for doc in ("docs/a.md", "README.md", "guide/setup.rst", "notes/x.adoc", "docs/changes.txt"):
+        assert is_documentation(doc, roots), doc
+    for kept in (
+        "checks/things/notes.md",
+        "checks/things/cases.yaml",
+        "src/workflow.yaml",
+        "src/readme.md",
+        "docs/openapi.yaml",
+        "config/settings.json",
+        "lib/table.csv",
+    ):
+        assert not is_documentation(kept, roots), kept
+
+
+def test_no_test_or_data_window_gives_way_to_a_scenario() -> None:
+    """Under budget pressure, data-file test windows and code windows stay;
+    only a documentation page gives way."""
+    roots = ["checks"]
+    first = _window("src/things.routes", 1, '1: route("/route") ' + "r" * 90, score=9)
+    cases = _window("checks/cases.yaml", 1, '1: path("/route") ' + "c" * 90, score=8)
+    workflow = _window("src/workflow.yaml", 1, '1: step("/route") ' + "w" * 90, score=7)
+    fixture = _window("checks/data.json", 1, '1: ["/route"] ' + "j" * 94, score=6)
+    page = _window("docs/a.md", 1, '1: see("/route") ' + "d" * 92, score=5)
+    strong = _window("checks/a.checks", 40, '40: GO("/route") alpha beta gamma ' + "s" * 64, score=1)
+    windows = [first, cases, workflow, fixture, page, strong]
+    entries = [{"words": "/route"}]
+    choose_windows(
+        entries,
+        [windows],
+        [[(w["path"], w["first_line"]) for w in windows]],
+        from_request=[True],
+        max_chars=5 * 110,
+        scenarios=[(["alpha", "beta", "gamma"], [])],
+        test_roots=roots,
+        anchors=["/route"],
+        may_give_way=lambda path: is_documentation(path, roots),
+    )
+    shown = {w["path"] for w in entries[0]["evidence"]}
+    assert {"src/things.routes", "checks/cases.yaml", "src/workflow.yaml", "checks/data.json"} <= shown
+    assert "checks/a.checks" in shown and "docs/a.md" not in shown
+
+
+def test_the_descriptor_never_evicts_a_data_file(tmp_path: Path) -> None:
+    """The same project with its older notes kept as a data file in the
+    code and its cases as a data file in the tests: under the same budget
+    pressure nothing that was shown is taken out for a scenario."""
+    files = {k: v for k, v in FILES.items() if k != "docs/history.md"}
+    files["src/history.yaml"] = HISTORY
+    files["checks/things/cases.json"] = HISTORY
+    repo = _git(tmp_path, files)
+    plain = _windows(repo, TIGHT, [])
+    chosen = _windows(repo, TIGHT, TEST_ROOTS)
+    kept = {_key(w) for w in chosen}
+    assert all(_key(w) in kept for w in plain if not w["path"].startswith("docs/"))
 
 
 def test_example_data_alone_does_not_make_a_check_the_scenarios_test(tmp_path: Path) -> None:
