@@ -2357,7 +2357,13 @@ async def _sweep_build_refs(repo_path: Path, feature_id: str) -> None:
     poison the next run. This clears ONLY this feature's residue, loudly and
     itemised:
 
-    1. ``git worktree prune`` — drops registrations whose dirs are gone.
+    1. ``git worktree prune --verbose`` — drops registrations whose dirs are
+       gone, and names each one in the log. The repository is shared with the
+       sandbox helper, whose planning worktrees live in ITS OWN temporary
+       folder, which this container cannot see; the helper locks them while
+       they are in use, and git never prunes a locked worktree (8 October
+       2026, window 12: before the lock, this prune took a planning run's
+       worktree out from under it).
     2. For each of this feature's task ids ``T`` with a live ``autobuild/<T>``
        branch: if that branch is still checked out in an on-disk (stale, prior
        build) worktree, ``git -C <that-worktree> checkout --detach`` FIRST — the
@@ -2370,7 +2376,9 @@ async def _sweep_build_refs(repo_path: Path, feature_id: str) -> None:
     not crash the build (the FEAT-UBS1C loud-warn-never-crash convention).
     """
     try:
-        code, output = await _run_git(["worktree", "prune"], cwd=repo_path)
+        code, output = await _run_git(
+            ["worktree", "prune", "--verbose"], cwd=repo_path
+        )
         if code == 0:
             logger.info(
                 "autobuild_runner: F3 preflight sweep — `git worktree prune` "
@@ -4174,7 +4182,9 @@ async def _sweep_prior_build_residue_impl(
                 ),
             )
 
-        code, output = await _run_git(["worktree", "prune"], cwd=repo_path)
+        code, output = await _run_git(
+            ["worktree", "prune", "--verbose"], cwd=repo_path
+        )
         logger.info(
             "autobuild_runner: requeue sweep — prior build %s: `git worktree "
             "prune` exit=%s%s",

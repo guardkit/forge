@@ -26,6 +26,19 @@ composing the existing :mod:`forge.adapters.git.operations` primitives
    leftovers ``--force`` exists for and do NOT block.
 4. **Never raises** (ADR-ARCH-025): every failure becomes
    ``GitOpResult(status="failed", ...)``.
+5. **Locked while in use** (8 October 2026): every worktree is made with
+   ``git worktree add --lock --reason "forge planning run <id> in use
+   since <time>"`` and unlocked just before it is removed. The folder lives
+   in this process's own temporary directory, and the repository's ``.git``
+   is shared with other containers that cannot see that directory. A build
+   starting in the build runner runs ``git worktree prune`` on the same
+   repository; to that container the folder looks missing, so before the
+   lock the prune deleted the worktree's registration in the middle of a
+   planning write, and the next git command in it failed with "not a git
+   repository" (window 12, the sorting sentence). git never prunes a locked
+   worktree, whichever container runs the prune. A lock left behind by a
+   process that died mid-write is cleared by the next write once it is
+   :data:`STALE_LOCK_AFTER_S` old and its folder is gone.
 
 No push in v1 (ASSUM-006): the branch stays local to the target working
 copy for the attended ``/feature-spec`` follow-up.
@@ -36,9 +49,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import shutil
 import tempfile
 import uuid
 from collections.abc import Mapping, Sequence
+from datetime import datetime, timezone
 from pathlib import Path
 
 from forge.adapters.git.models import GitOpResult
@@ -63,6 +78,57 @@ __all__ = ["WorktreeGitRunner"]
 
 _OPERATION = "prepare_branch_and_write"
 _TREE_OPERATION = "prepare_branch_and_write_tree"
+
+#: How every planning worktree's lock reason begins. The rest is the run (the
+#: branch without its ``planning/`` prefix) and the time the lock was taken,
+#: e.g. ``forge planning run 8209dcd4-... in use since 2026-10-08T07:10:58Z``.
+PLANNING_LOCK_PREFIX = "forge planning run "
+
+#: The time format inside a lock reason (UTC, to the second).
+_LOCK_TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+
+#: How old a planning lock must be, with its folder gone, before a later
+#: write clears it. One write is bounded by the per-operation and pre-commit
+#: hook timeouts (minutes, not hours), so a lock this old whose folder is
+#: missing belongs to a process that died before it could clean up. Age is
+#: the test, not "my folder is missing here", because a folder made by a
+#: process in another container is always missing here.
+STALE_LOCK_AFTER_S: float = 6 * 3600.0
+
+
+def planning_lock_reason(branch: str, *, now: datetime | None = None) -> str:
+    """The reason recorded on a planning worktree's lock."""
+    run = branch[len("planning/") :] if branch.startswith("planning/") else branch
+    moment = (now or datetime.now(timezone.utc)).strftime(_LOCK_TIME_FORMAT)
+    return f"{PLANNING_LOCK_PREFIX}{run} in use since {moment}"
+
+
+def _lock_taken_at(reason: str) -> datetime | None:
+    """When a planning lock was taken, or None if ``reason`` is not one."""
+    if not reason.startswith(PLANNING_LOCK_PREFIX) or " in use since " not in reason:
+        return None
+    stamp = reason.rsplit(" in use since ", 1)[1].strip()
+    try:
+        return datetime.strptime(stamp, _LOCK_TIME_FORMAT).replace(
+            tzinfo=timezone.utc
+        )
+    except ValueError:
+        return None
+
+
+def _worktree_entries(porcelain: str) -> list[dict[str, str]]:
+    """``git worktree list --porcelain`` as one dict per worktree."""
+    entries: list[dict[str, str]] = []
+    current: dict[str, str] = {}
+    for line in [*porcelain.splitlines(), ""]:
+        if not line.strip():
+            if current:
+                entries.append(current)
+            current = {}
+            continue
+        key, _, value = line.partition(" ")
+        current[key] = value
+    return entries
 
 
 class WorktreeGitRunner:
@@ -253,10 +319,12 @@ class WorktreeGitRunner:
                         exit_code=-1,
                     )
 
+            await self._clear_stale_planning_locks(repo)
             self._worktrees_root.mkdir(parents=True, exist_ok=True)
             worktree = self._worktrees_root / (
                 f"{branch.replace('/', '-')}-{uuid.uuid4().hex[:8]}"
             )
+            lock = self._lock_args(branch)
 
             if branch_exists:
                 # --force re-attaches a branch a crashed prior attempt may
@@ -265,12 +333,15 @@ class WorktreeGitRunner:
                     "git",
                     "worktree",
                     "add",
+                    *lock,
                     "--force",
                     str(worktree),
                     branch,
                 ]
             else:
-                add_cmd = ["git", "worktree", "add", "-b", branch, str(worktree)]
+                add_cmd = [
+                    "git", "worktree", "add", *lock, "-b", branch, str(worktree)
+                ]
                 if start_commit:
                     # The named starting point: the branch is cut from the
                     # commit the caller fetched, never from whatever this copy
@@ -474,16 +545,19 @@ class WorktreeGitRunner:
                         exit_code=-1,
                     )
 
+            await self._clear_stale_planning_locks(repo)
             self._worktrees_root.mkdir(parents=True, exist_ok=True)
             worktree = self._worktrees_root / (
                 f"{branch.replace('/', '-')}-{uuid.uuid4().hex[:8]}"
             )
+            lock = self._lock_args(branch)
 
             if expected_head is not None:
                 add_cmd = [
                     "git",
                     "worktree",
                     "add",
+                    *lock,
                     "--detach",
                     str(worktree),
                     expected_head,
@@ -493,12 +567,15 @@ class WorktreeGitRunner:
                     "git",
                     "worktree",
                     "add",
+                    *lock,
                     "--force",
                     str(worktree),
                     branch,
                 ]
             else:
-                add_cmd = ["git", "worktree", "add", "-b", branch, str(worktree)]
+                add_cmd = [
+                    "git", "worktree", "add", *lock, "-b", branch, str(worktree)
+                ]
                 if start_commit:
                     add_cmd.append(str(start_commit))
 
@@ -649,26 +726,119 @@ class WorktreeGitRunner:
             )
             return None
 
+    @staticmethod
+    def _lock_args(branch: str) -> list[str]:
+        """``--lock --reason <...>`` for ``git worktree add``: the worktree is
+        locked from the moment it exists, so no prune can take it, whichever
+        container runs the prune."""
+        return ["--lock", "--reason", planning_lock_reason(branch)]
+
+    async def _is_registered(self, repo: Path, worktree: Path) -> bool | None:
+        """Whether ``repo`` still lists ``worktree``; None if git cannot say."""
+        res = await self._execute_timed(
+            command=["git", "worktree", "list", "--porcelain"], cwd=str(repo)
+        )
+        if res.exit_code != 0:
+            return None
+        wanted = os.path.normpath(os.path.abspath(str(worktree)))
+        return any(
+            os.path.normpath(entry.get("worktree", "")) == wanted
+            for entry in _worktree_entries(res.stdout or "")
+        )
+
     async def _cleanup_worktree(self, repo: Path, worktree: Path) -> None:
-        """Best-effort worktree removal anchored in the source repo."""
+        """Unlock, then remove, anchored in the source repo. Never raises.
+
+        If the repository no longer has the worktree registered (something
+        pruned it while it was in use), git cannot remove it; the folder is
+        removed directly and that is said plainly, rather than failing.
+        """
         try:
+            # Unlock first: git refuses to remove a locked worktree. A failed
+            # unlock (already unlocked, or no longer registered) is not itself
+            # a problem; the remove below says what the state really is.
+            await self._execute_timed(
+                command=["git", "worktree", "unlock", str(worktree)],
+                cwd=str(repo),
+            )
             res = await self._execute_timed(
                 command=["git", "worktree", "remove", str(worktree), "--force"],
                 cwd=str(repo),
             )
-            if res.exit_code != 0:
+            if res.exit_code == 0:
+                return
+            if await self._is_registered(repo, worktree) is False:
+                shutil.rmtree(worktree, ignore_errors=True)
                 logger.warning(
-                    "planning worktree cleanup non-zero exit (best-effort, "
-                    "worktree=%s, exit=%d): %s",
+                    "planning worktree %s was no longer registered with the "
+                    "repository at %s (something pruned it while it was in "
+                    "use), so git could not remove it; its folder was removed "
+                    "directly%s",
                     worktree,
-                    res.exit_code,
-                    _failure_stderr(res.stderr, res.stdout),
+                    repo,
+                    "" if not worktree.exists() else " but some of it remains",
                 )
+                return
+            logger.warning(
+                "planning worktree cleanup non-zero exit (best-effort, "
+                "worktree=%s, exit=%d): %s",
+                worktree,
+                res.exit_code,
+                _failure_stderr(res.stderr, res.stdout),
+            )
         except Exception:  # noqa: BLE001 — cleanup never blocks the handoff
             logger.exception(
                 "planning worktree cleanup raised (best-effort, worktree=%s)",
                 worktree,
             )
+
+    async def _clear_stale_planning_locks(self, repo: Path) -> None:
+        """Clear planning locks left by a process that died mid-write.
+
+        Only a worktree under this runner's own folder, locked by a planning
+        write, whose folder is gone and whose lock is older than
+        :data:`STALE_LOCK_AFTER_S`. Without this, a helper that was stopped
+        between making a worktree and removing it would leave a registration
+        nothing ever clears, still holding its planning branch. Never raises.
+        """
+        try:
+            res = await self._execute_timed(
+                command=["git", "worktree", "list", "--porcelain"], cwd=str(repo)
+            )
+            if res.exit_code != 0:
+                return
+            root = os.path.normpath(os.path.abspath(str(self._worktrees_root)))
+            now = datetime.now(timezone.utc)
+            for entry in _worktree_entries(res.stdout or ""):
+                path = entry.get("worktree", "")
+                taken = _lock_taken_at(entry.get("locked", ""))
+                if (
+                    taken is None
+                    or os.path.dirname(os.path.normpath(path)) != root
+                    or Path(path).exists()
+                    or (now - taken).total_seconds() < STALE_LOCK_AFTER_S
+                ):
+                    continue
+                await self._execute_timed(
+                    command=["git", "worktree", "unlock", path], cwd=str(repo)
+                )
+                gone = await self._execute_timed(
+                    command=["git", "worktree", "remove", "--force", path],
+                    cwd=str(repo),
+                )
+                logger.warning(
+                    "cleared a planning worktree left locked since %s at %s; "
+                    "its folder was gone, so the process that made it stopped "
+                    "before cleaning up%s",
+                    taken.strftime(_LOCK_TIME_FORMAT),
+                    path,
+                    ""
+                    if gone.exit_code == 0
+                    else f" (the removal said: "
+                    f"{_failure_stderr(gone.stderr, gone.stdout)})",
+                )
+        except Exception:  # noqa: BLE001 — a sweep never blocks a write
+            logger.exception("clearing stale planning worktree locks raised")
 
     # -- probes ---------------------------------------------------------- #
 
