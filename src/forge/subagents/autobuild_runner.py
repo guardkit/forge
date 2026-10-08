@@ -4267,12 +4267,13 @@ async def _sweep_prior_build_residue_impl(
                 outer_root,
                 _receipts_root() / prior_build_id,
             )
-        await _run_git(["worktree", "prune"], cwd=repo_path)
+        _, pruned = await _run_git(["worktree", "prune", "--verbose"], cwd=repo_path)
         logger.info(
             "autobuild_runner: requeue sweep — prior build %s swept; the "
-            "fresh dispatch for feature %s may proceed",
+            "fresh dispatch for feature %s may proceed%s",
             prior_build_id,
             feature_id,
+            f" (prune: {pruned})" if pruned else "",
         )
 
 
