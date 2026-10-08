@@ -579,7 +579,11 @@ class _ScenarioFit:
     an understanding of the test. A test written to look like this
     scenario's (one that calls the requested route with the requested
     method and plants the scenario's own words and values) can still be
-    taken for its test, and a real test written in another way (a route
+    taken for its test. Shapes known to pass that way: a different call
+    whose method-override header carries the requested method, a
+    parametrised (method, route) tuple the test does not actually use, and
+    a call inside a triple-quoted string that does not open its own line.
+    A real test written in another way (a route
     built from pieces or held in a constant named elsewhere, a call in a
     form not recognised, a window starting inside a comment or description)
     can be missed. Nothing knows a language's grammar. The backstop is the
