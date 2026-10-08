@@ -215,6 +215,8 @@ _NOT_SCENARIO_WORDS = frozenset(
     var let void typeof instanceof interface struct enum type
     types trait impl extends implements override abstract throw throws
     raise raises try catch except finally assert expect expected test tests
+    match case switch break range select record records using namespace
+    internal readonly lambda elif pass equal equals unsafe
     describe context string int integer float bool boolean list dict map
     array object value values result results
     """.split()
@@ -331,6 +333,23 @@ def _window_body(window: Mapping[str, Any]) -> str:
     return re.sub(r"(?m)^\d+: ", "", window.get("text") or "")
 
 
+#: A quoted stretch on one line, in any of the three quotes most languages
+#: use for strings: where a test writes the route it calls.
+_QUOTED_ON_A_LINE = re.compile(r"\"[^\"\n]*\"|'[^'\n]*'|`[^`\n]*`")
+
+
+def _quoted(body: str) -> str:
+    """The quoted stretches of ``body``, one per line. A name written only
+    in a comment is not among them."""
+    return "\n".join(match.group(0) for match in _QUOTED_ON_A_LINE.finditer(body))
+
+
+def _is_data(value: str) -> bool:
+    """A value that looks like example data (``user-123``, an address, a
+    number): it cannot make a window a scenario's test on its own."""
+    return bool(re.search(r"[0-9@]", value))
+
+
 def _names(body: str, anchor: str) -> bool:
     """``body`` holds ``anchor``; a path (starting with a slash) only as a
     whole path, not as the start of a longer one."""
@@ -348,17 +367,24 @@ class _ScenarioFit:
 
     * it is in the project's declared test folders;
     * it names what the request names, as the request writes it with its
-      punctuation (``/deactivate``, ``active_count``): ``anchors``. A test of
-      some other feature's code that only shares a plain word is not this
-      request's test. A path is matched whole: ``/users/{user_id}`` is not
-      found in ``/users/{user_id}/deactivate``;
+      punctuation (``/deactivate``, ``active_count``): ``anchors``, inside a
+      quoted stretch (``"``, ``'`` or a backquote), where a test writes what
+      it calls; a mention in a comment does not count. A test of some other
+      feature's code that only shares a plain word, or names the route only
+      in passing, is not this request's test. A path is matched whole:
+      ``/users/{user_id}`` is not found in ``/users/{user_id}/deactivate``;
     * it holds at least half of the words most of the scenarios say (the
       feature's own vocabulary, such as ``deactivate``, ``patch``,
       ``request``), so it is a test of this feature;
     * it holds no word that only the other scenarios say;
     * and either it holds at least half of the values only this scenario
-      gives (``domain.co.uk``), or at least :data:`_SCENARIO_MIN_WORDS` of
-      the words that tell this scenario apart.
+      gives (``domain.co.uk``), not only example data (``user-123``, an
+      address, a number) with nothing else of the scenario's beside it, or
+      at least :data:`_SCENARIO_MIN_WORDS` of the words that tell this
+      scenario apart.
+
+    When several windows are, the one holding more of the scenario's own
+    values and words is preferred (:meth:`score`).
 
     Only words at most half of the scenarios say tell them apart; the
     others (``user``, ``request``) are the feature's, and are left out of
@@ -410,7 +436,8 @@ class _ScenarioFit:
                 self._cache[key] = None
             else:
                 body = _window_body(window).lower()
-                if self.anchors and not any(_names(body, anchor) for anchor in self.anchors):
+                quoted = _quoted(body)
+                if self.anchors and not any(_names(quoted, anchor) for anchor in self.anchors):
                     self._cache[key] = None
                 else:
                     stems = {_stem(token) for token in _scenario_tokens(_window_body(window))}
@@ -418,8 +445,10 @@ class _ScenarioFit:
         return self._cache[key]
 
     def score(self, position: int, window: Mapping[str, Any]) -> tuple[int, int] | None:
-        """``(values held, words held)`` when ``window`` is strong evidence
-        of scenario ``position``'s test, else ``None``."""
+        """How strongly ``window`` is scenario ``position``'s test, when it
+        is strong evidence of it, else ``None``: ``(the scenario's own
+        values that are not example data and its own words held, its
+        example data held)``; the larger, the better."""
         read = self._read(window)
         if read is None:
             return None
@@ -429,12 +458,13 @@ class _ScenarioFit:
         if self.theirs[position] & stems:
             return None  # it says what only another scenario says
         values = self.values[position]
-        held_values = sum(1 for value in values if value in body)
-        mine = len(self.mine[position] & stems)
-        if values and held_values * 2 >= len(values):
-            return (held_values, mine)
-        if mine >= _SCENARIO_MIN_WORDS:
-            return (0, mine)
+        held = [value for value in values if value in body]
+        held_data = sum(1 for value in held if _is_data(value))
+        strength = (len(held) - held_data + len(self.mine[position] & stems), held_data)
+        if values and len(held) * 2 >= len(values) and strength[0] >= 1:
+            return strength  # its values, and not only its example data
+        if len(self.mine[position] & stems) >= _SCENARIO_MIN_WORDS:
+            return strength
         return None
 
 
@@ -444,12 +474,13 @@ def _scenario_windows(
     from_request: Sequence[bool],
     fit: _ScenarioFit,
     count: int,
-) -> list[list[tuple[int, dict[str, Any]]]]:
+) -> list[list[tuple[int, dict[str, Any], tuple[int, int]]]]:
     """For each of ``count`` scenarios, the windows that are strong evidence
     of its test (:class:`_ScenarioFit`), best first, as ``(entry index,
     window)``: those holding more of its values, then more of its words, then
     the higher request score. Only windows round the request's own words
-    when there are any."""
+    when there are any. Each comes with its strength
+    (:meth:`_ScenarioFit.score`)."""
     pool: list[tuple[int, dict[str, Any]]] = []
     seen: set[tuple[str, int, int]] = set()
     asked = [i for i in order if from_request[i]] or list(order)
@@ -459,7 +490,7 @@ def _scenario_windows(
             if key not in seen:
                 seen.add(key)
                 pool.append((index, window))
-    fits: list[list[tuple[int, dict[str, Any]]]] = []
+    fits: list[list[tuple[int, dict[str, Any], tuple[int, int]]]] = []
     for position in range(count):
         rows = []
         for index, window in pool:
@@ -469,7 +500,7 @@ def _scenario_windows(
         rows.sort(
             key=lambda row: (-row[0][0], -row[0][1], -row[1], row[3]["path"], row[3]["first_line"])
         )
-        fits.append([(index, window) for _score, _s, index, window in rows])
+        fits.append([(index, window, score) for score, _s, index, window in rows])
     return fits
 
 
@@ -698,14 +729,16 @@ def choose_windows(
 
     So, once the windows above are chosen, each scenario in ``scenarios``
     (each one's words and values, from :func:`scenario_words`) that no
-    window shown is a test of is given the best window that is, if any. A
+    window shown is as strong a test of as the best one there is, is given
+    that best one. A
     wrong test shown as a scenario's proof is worse than none (the planner
     may then say "already done" when it is not), so only strong evidence
     counts (:class:`_ScenarioFit`): a window in ``test_roots`` (the
     project's declared test folders) that names what the request names
-    (``anchors``), speaks the feature's own words, says nothing only
-    another scenario says, and holds this scenario's own values or at
-    least two of the words that tell it apart. When nothing fits, the
+    (``anchors``) inside a quoted stretch, speaks the feature's own words,
+    says nothing only another scenario says, and holds this scenario's own
+    values (not only example data) or at least two of the words that tell
+    it apart. When nothing fits, the
     scenario gets no window. Room is made only by taking out windows for
     which ``may_give_way`` is true (the driver passes the documentation),
     never a word's first window and never a test, so no scenario loses the
@@ -830,11 +863,15 @@ def _add_scenario_tests(
     for position, fitting in enumerate(
         _scenario_windows(candidates, order, from_request, fit, count)
     ):
-        if any(fit.score(position, w) is not None for _, w in chosen):
-            continue  # a window already shown is this scenario's test
+        shown = [fit.score(position, w) for _, w in chosen]
+        best_shown = max((s for s in shown if s is not None), default=None)
+        if best_shown is not None and (not fitting or best_shown >= fitting[0][2]):
+            continue  # a window already shown is this scenario's test, as strong as any
         if taken >= max_windows // _SCENARIO_SHARE:
             break
-        for index, window in fitting:
+        for index, window, strength in fitting:
+            if best_shown is not None and strength <= best_shown:
+                break  # no stronger test than the one already shown
             if overlaps(window):
                 continue
             size = len(window["text"])

@@ -93,21 +93,21 @@ def _filler(count: int) -> str:
 #: below them, each its own block.
 CHECKS = (
     "check never-made thing\n"
-    "  call PATCH /things/t-9/archive with an unknown id\n"
+    "  call PATCH \"/things/t-9/archive\" with an unknown id\n"
     "  expect 404, not found\n"
     + _filler(3)
     + "\n" * 2
     + _filler(20)
     + "\n"
     + "check already archived thing\n"
-    "  call PATCH /things/t-2/archive when already archived\n"
+    "  call PATCH \"/things/t-2/archive\" when already archived\n"
     "  expect 409 conflict and the thing returns unchanged\n"
     + _filler(3)
     + "\n" * 2
     + _filler(20)
     + "\n"
     + "check live thing\n"
-    "  call PATCH /things/t-1/archive\n"
+    "  call PATCH \"/things/t-1/archive\"\n"
     "  expect it to succeed: 200, and the returned thing is marked archived\n"
 )
 
@@ -127,7 +127,7 @@ def _other_checks(n: int) -> str:
 #: request's "archive", but never names the request's route.
 LOOKALIKE = (
     "check widget archive succeeds\n"
-    "  call PUT /widgets/w-1/store to archive the widget\n"
+    "  call PUT \"/widgets/w-1/store\" to archive the widget\n"
     "  expect it to succeed, marked live, the thing is archived and returned\n"
 )
 
@@ -335,6 +335,82 @@ def test_a_scenario_already_shown_its_check_takes_nothing(repo: Path) -> None:
     assert sorted(map(_key, plain)) == sorted(map(_key, _windows(repo, 16_000, TEST_ROOTS)))
 
 
+#: Checks of other routes that name the request's route only in a comment
+#: and share the success scenario's example value and words.
+RESTORE = (
+    "check restoring a thing succeeds\n"
+    "  # same shape as /things/{thing_id}/archive, the other way round\n"
+    '  thing "t-1" is live again\n'
+    '  call PATCH "/things/t-1/restore"\n'
+    "  expect it to succeed: 200, and the returned thing is marked live\n"
+)
+ENABLE = (
+    "check enabling a thing succeeds\n"
+    "  # mirrors /things/{thing_id}/archive\n"
+    '  thing "t-1" is live again\n'
+    '  call POST "/admin/t-1/enable"\n'
+    "  expect it to succeed: 200, and the returned thing is marked live\n"
+)
+LOOKALIKES = {
+    "in a file of its own": {"checks/things/restore.checks": RESTORE},
+    "after the success check": {SUCCESS_CHECK: CHECKS + "\n" * 2 + _filler(20) + "\n" + RESTORE},
+    "for another route": {SUCCESS_CHECK: CHECKS + "\n" * 2 + _filler(20) + "\n" + ENABLE},
+}
+
+
+@pytest.mark.parametrize("where", sorted(LOOKALIKES))
+def test_a_check_naming_the_route_only_in_a_comment_is_never_the_scenarios_test(
+    tmp_path: Path, where: str
+) -> None:
+    """The look-alike shares the success scenario's example value and words,
+    and names the request's route only in a comment. The real success check
+    is shown; the look-alike is never taken as the scenario's test (it is
+    shown only as the words' own rounds already show it)."""
+    files = {**FILES, **LOOKALIKES[where]}
+    repo = _git(tmp_path, files)
+    budget = 2_400  # room for the success check once documentation gives way
+    plain = _windows(repo, budget, [])
+    chosen = _windows(repo, budget, TEST_ROOTS)
+    assert not _shows(plain, SUCCESS_CHECK, _success_line())
+    assert _shows(chosen, SUCCESS_CHECK, _success_line())
+    text = files[SUCCESS_CHECK] if where != "in a file of its own" else RESTORE
+    path = SUCCESS_CHECK if where != "in a file of its own" else "checks/things/restore.checks"
+    lookalike_line = _line_of(text, "same shape as" if "same shape as" in text else "mirrors")
+    added = {_key(w) for w in chosen} - {_key(w) for w in plain}
+    assert not any(
+        p == path and first <= lookalike_line + 3 and last >= lookalike_line
+        for p, first, last in added
+    )
+
+
+def test_example_data_alone_does_not_make_a_check_the_scenarios_test(tmp_path: Path) -> None:
+    """A check that holds the success scenario's example value and the
+    route, quoted, but none of its words, is not taken as its test."""
+    data_only = (
+        "check something else\n"
+        '  call PATCH "/things/t-1/archive"\n'
+        "  expect 200\n"
+    )
+    repo = _git(tmp_path, {**FILES, SUCCESS_CHECK: CHECKS.replace(
+        "check live thing\n"
+        '  call PATCH "/things/t-1/archive"\n'
+        "  expect it to succeed: 200, and the returned thing is marked archived\n",
+        data_only,
+    )})
+    plain = _windows(repo, TIGHT, [])
+    chosen = _windows(repo, TIGHT, TEST_ROOTS)
+    assert list(map(_key, plain)) == list(map(_key, chosen))
+
+
+def test_scenario_words_leave_out_more_programming_keywords() -> None:
+    spec = (
+        "Feature: f\n  Scenario: s\n"
+        "    Then match case switch record using lambda equals select range\n"
+    )
+    [(_title, words, _values)] = scenario_words(spec)
+    assert words == []
+
+
 def _window(path: str, first: int, text: str, score: int = 1) -> dict:
     return {"path": path, "first_line": first, "last_line": first + 1, "score": score,
             "text": text, "_hit": first}
@@ -345,7 +421,7 @@ def test_scenario_windows_take_at_most_half_the_budget() -> None:
     only half of the characters."""
     words = [("northern", "nightly"), ("southern", "sunny"), ("eastward", "early"), ("westward", "windy")]
     checks = [
-        _window("checks/a.checks", 10 * n, f"{10 * n}: GO /route {a} {b} " + "x" * 80)
+        _window("checks/a.checks", 10 * n, f"{10 * n}: GO \"/route\" {a} {b} " + "x" * 80)
         for n, (a, b) in enumerate(words, start=1)
     ]
     docs = [_window("docs/a.md", 10 * n, f"{10 * n}: /route " + "y" * 80, score=5) for n in range(1, 5)]
@@ -365,6 +441,32 @@ def test_scenario_windows_take_at_most_half_the_budget() -> None:
     assert marked
     assert sum(len(w["text"]) for w in marked) <= 220
     assert all(w["path"] == "checks/a.checks" for w in marked)
+
+
+def test_a_weaker_test_already_shown_does_not_block_a_stronger_one() -> None:
+    """A check already shown holds two of the scenario's words; another
+    holds three. The stronger one is added, in place of documentation."""
+    doc_a = _window("docs/a.md", 1, '1: "/route" ' + "a" * 90, score=9)
+    weak = _window("checks/a.checks", 10, '10: GO "/route" alpha beta ' + "w" * 70, score=8)
+    doc_b = _window("docs/b.md", 1, '1: "/route" ' + "b" * 90, score=7)
+    strong = _window("checks/a.checks", 40, '40: GO "/route" alpha beta gamma ' + "s" * 64, score=1)
+    windows = [doc_a, weak, doc_b, strong]
+    entries = [{"words": "/route"}]
+    choose_windows(
+        entries,
+        [windows],
+        [[(w["path"], w["first_line"]) for w in windows]],
+        from_request=[True],
+        max_chars=3 * 110,
+        scenarios=[(["alpha", "beta", "gamma"], [])],
+        test_roots=["checks"],
+        anchors=["/route"],
+        may_give_way=lambda path: path.startswith("docs/"),
+    )
+    shown = {(w["path"], w["first_line"]) for w in entries[0]["evidence"]}
+    assert ("checks/a.checks", 40) in shown
+    assert ("checks/a.checks", 10) in shown  # a test never gives way
+    assert ("docs/b.md", 1) not in shown
 
 
 def test_the_trim_drops_a_scenario_window_last() -> None:
