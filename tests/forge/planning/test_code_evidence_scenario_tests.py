@@ -7,10 +7,15 @@ scenario, though the repository had it: that window scored below the
 documentation's and the error tests', sat in a file already shown, and the
 size budget ran out first.
 
-Neutral, made-up files in no real language or test tool: a route table, a
-page of documentation, the request's own file of checks, and other features'
-checks under the declared test folders. Nothing here is any real project's
-code.
+A wrong test shown as a scenario's proof is worse than none, because the
+planner may then say "already done" when it is not. So a window is taken as
+a scenario's test only on strong evidence, nothing but documentation ever
+gives way to one, and a scenario already shown a test takes nothing.
+
+Neutral, made-up files in no real language or test tool: a route table, two
+pages of documentation, the request's own file of checks, and other
+features' checks under the declared test folders. Nothing here is any real
+project's code.
 """
 
 from __future__ import annotations
@@ -118,19 +123,44 @@ def _other_checks(n: int) -> str:
     )
 
 
+#: Another feature's check that says the success scenario's words and the
+#: request's "archive", but never names the request's route.
+LOOKALIKE = (
+    "check widget archive succeeds\n"
+    "  call PUT /widgets/w-1/store to archive the widget\n"
+    "  expect it to succeed, marked live, the thing is archived and returned\n"
+)
+
+NOTES = (
+    "# Notes\n"
+    "\n"
+    "The archive route is PATCH /things/{thing_id}/archive.\n"
+)
+
+#: An older page that mentions the route in passing, three times.
+HISTORY = "".join(
+    f"# Release {n}\n\nMentions /archive once.\n" + "\n" * 20 for n in range(1, 4)
+)
+
 FILES = {
     "src/things.routes": ROUTES,
     "docs/things.md": DOCS,
+    "docs/notes.md": NOTES,
+    "docs/history.md": HISTORY,
     "checks/things/archive.checks": CHECKS,
+    "checks/widgets/lookalike.checks": LOOKALIKE,
     **{f"checks/widgets/widget_{n}.checks": _other_checks(n) for n in range(1, 9)},
 }
 TEST_ROOTS = ["checks/things", "checks/widgets"]
 SUCCESS_CHECK = "checks/things/archive.checks"
 
 
+def _line_of(text: str, needle: str) -> int:
+    return next(n for n, line in enumerate(text.split("\n"), start=1) if needle in line)
+
+
 def _success_line() -> int:
-    lines = CHECKS.split("\n")
-    return next(n for n, line in enumerate(lines, start=1) if "/things/t-1/archive" in line)
+    return _line_of(CHECKS, "/things/t-1/archive")
 
 
 def _shows(windows: list[dict], path: str, line: int) -> bool:
@@ -141,9 +171,7 @@ def _key(window: dict) -> tuple[str, int, int]:
     return (window["path"], window["first_line"], window["last_line"])
 
 
-@pytest.fixture(scope="module")
-def repo(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    path = tmp_path_factory.mktemp("things")
+def _git(path: Path, files: dict[str, str]) -> Path:
     env = {
         **os.environ,
         "GIT_AUTHOR_NAME": "t",
@@ -151,7 +179,7 @@ def repo(tmp_path_factory: pytest.TempPathFactory) -> Path:
         "GIT_COMMITTER_NAME": "t",
         "GIT_COMMITTER_EMAIL": "t@t",
     }
-    for name, text in FILES.items():
+    for name, text in files.items():
         (path / name).parent.mkdir(parents=True, exist_ok=True)
         (path / name).write_text(text)
     subprocess.run(["git", "init", "-q"], cwd=path, check=True, env=env)
@@ -160,12 +188,19 @@ def repo(tmp_path_factory: pytest.TempPathFactory) -> Path:
     return path
 
 
-def _windows(repo: Path, budget: int, test_roots: list[str]) -> list[dict]:
+@pytest.fixture(scope="module")
+def repo(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    return _git(tmp_path_factory.mktemp("things"), FILES)
+
+
+def _windows(
+    repo: Path, budget: int, test_roots: list[str], spec: str = SPEC
+) -> list[dict]:
     """The windows the planner is shown, chosen and trimmed as the
     descriptor chooses and trims them."""
     found = PlanningRunDriver._where_the_specs_words_already_appear(
         str(repo),
-        SPEC,
+        spec,
         reader=LocalCheckoutReader(str(repo)),
         request_text=REQUEST,
         evidence_chars=budget,
@@ -176,25 +211,51 @@ def _windows(repo: Path, budget: int, test_roots: list[str]) -> list[dict]:
 
 
 #: Room for some of the windows, not all.
-TIGHT = 1_600
+TIGHT = 2_000
 
 
 def test_scenario_words_are_each_scenarios_own_words() -> None:
     found = scenario_words(SPEC)
-    assert [title for title, _ in found] == [
+    assert [title for title, _words, _values in found] == [
         "A thing is successfully archived",
         "Archiving an already archived thing returns a conflict",
         "Archiving a never-made thing returns not found",
     ]
-    success = found[0][1]
+    _title, success, values = found[0]
     # The title's and the steps' words, by their first five letters.
     assert "succe" in success and "archi" in success and "thing" in success
-    # Not the format's own words, the tags or the comments.
-    for word in ("given", "when", "then", "shoul", "key", "why", "main", "gener"):
+    # Not the format's words, common English, the tags or the comments.
+    for word in ("given", "when", "then", "shoul", "that", "key", "why", "main", "gener"):
         assert word not in success
     # Not the background's words either: they belong to no one scenario.
     assert "avail" not in success
+    # A quoted value with punctuation inside is a value, not words.
+    assert "/things/t-1/archive" in values
+    assert "t-1" not in success
     assert "confl" in found[1][1] and "found" in found[2][1]
+
+
+def test_scenario_values_come_from_quotes_tables_and_punctuated_names() -> None:
+    spec = (
+        "Feature: f\n"
+        "  Scenario: Odd domains are kept\n"
+        "    Given the following users exist:\n"
+        "      | email                |\n"
+        "      | admin@domain.co.uk   |\n"
+        "    When I ask for the list at /users/domains\n"
+        '    Then it includes "domain.co.uk" and "inactive"\n'
+    )
+    [(_title, words, values)] = scenario_words(spec)
+    assert {"admin@domain.co.uk", "domain.co.uk", "/users/domains"} <= set(values)
+    # A plain quoted word is a word, not a value; the data's pieces are not words.
+    assert "inactive" not in values and "inact" in words
+    assert "admin" not in words
+
+
+def test_scenario_words_leave_out_programming_keywords() -> None:
+    spec = "Feature: f\n  Scenario: None of it\n    Then null is returned as none, self and class\n"
+    [(_title, words, _values)] = scenario_words(spec)
+    assert not {"none", "null", "self", "class"} & set(words)
 
 
 def test_scenario_words_ignore_a_specification_without_scenarios() -> None:
@@ -212,10 +273,16 @@ def test_without_test_folders_the_success_check_is_not_shown(repo: Path) -> None
 
 
 def test_each_scenario_is_shown_a_check_when_one_fits(repo: Path) -> None:
+    plain = _windows(repo, TIGHT, [])
     chosen = _windows(repo, TIGHT, TEST_ROOTS)
     assert _shows(chosen, SUCCESS_CHECK, _success_line())
     # The code the request names is still shown.
     assert _shows(chosen, "src/things.routes", 2)
+    # Only documentation gave way: every test window shown before still is.
+    tests_before = {_key(w) for w in plain if w["path"].startswith("checks/")}
+    assert tests_before <= {_key(w) for w in chosen}
+    went = {_key(w) for w in plain} - {_key(w) for w in chosen}
+    assert went and all(path.startswith("docs/") for path, _first, _last in went)
     # Within the same budget and limit.
     assert sum(len(w["text"]) for w in chosen) <= TIGHT
     assert len(chosen) <= MAX_EVIDENCE_WINDOWS
@@ -223,10 +290,13 @@ def test_each_scenario_is_shown_a_check_when_one_fits(repo: Path) -> None:
     assert all(not key.startswith("_") for w in chosen for key in w)
 
 
-def test_with_room_for_everything_nothing_is_lost(repo: Path) -> None:
+def test_a_check_that_does_not_name_the_route_is_never_a_scenario_window(repo: Path) -> None:
+    """The look-alike says the success scenario's words but tests another
+    feature: no window rather than a wrong one."""
+    chosen = _windows(repo, 16_000, TEST_ROOTS)
     plain = _windows(repo, 16_000, [])
-    with_scenarios = _windows(repo, 16_000, TEST_ROOTS)
-    assert sorted(map(_key, plain)) == sorted(map(_key, with_scenarios))
+    lookalike = [w for w in chosen if w["path"] == "checks/widgets/lookalike.checks"]
+    assert lookalike == [w for w in plain if w["path"] == "checks/widgets/lookalike.checks"]
 
 
 def test_a_window_outside_the_test_folders_is_never_a_scenario_window(repo: Path) -> None:
@@ -236,6 +306,35 @@ def test_a_window_outside_the_test_folders_is_never_a_scenario_window(repo: Path
     assert list(map(_key, plain)) == list(map(_key, elsewhere))
 
 
+def test_with_room_for_everything_nothing_is_lost(repo: Path) -> None:
+    plain = _windows(repo, 16_000, [])
+    with_scenarios = _windows(repo, 16_000, TEST_ROOTS)
+    assert sorted(map(_key, plain)) == sorted(map(_key, with_scenarios))
+
+
+def test_a_scenario_whose_check_holds_another_scenarios_words_takes_nothing(
+    tmp_path: Path,
+) -> None:
+    """The only check near the success scenario also says "conflict": it may
+    be the other scenario's, so it is not taken as the success one's."""
+    mixed = CHECKS.replace(
+        "expect it to succeed: 200, and the returned thing is marked archived",
+        "expect it to succeed: 200, marked archived, never a conflict",
+    )
+    repo = _git(tmp_path, {**FILES, SUCCESS_CHECK: mixed})
+    plain = _windows(repo, TIGHT, [])
+    chosen = _windows(repo, TIGHT, TEST_ROOTS)
+    assert list(map(_key, plain)) == list(map(_key, chosen))
+
+
+def test_a_scenario_already_shown_its_check_takes_nothing(repo: Path) -> None:
+    """With room for every window, each scenario's check is shown by the
+    words' own rounds, so no scenario adds one (and nothing changes)."""
+    plain = _windows(repo, 16_000, [])
+    assert _shows(plain, SUCCESS_CHECK, _success_line())
+    assert sorted(map(_key, plain)) == sorted(map(_key, _windows(repo, 16_000, TEST_ROOTS)))
+
+
 def _window(path: str, first: int, text: str, score: int = 1) -> dict:
     return {"path": path, "first_line": first, "last_line": first + 1, "score": score,
             "text": text, "_hit": first}
@@ -243,25 +342,29 @@ def _window(path: str, first: int, text: str, score: int = 1) -> dict:
 
 def test_scenario_windows_take_at_most_half_the_budget() -> None:
     """Four scenarios each fit their own check, but together they may take
-    only half of the characters; the rest are left to the other windows."""
-    words = ["northern", "southern", "eastward", "westward"]
+    only half of the characters."""
+    words = [("northern", "nightly"), ("southern", "sunny"), ("eastward", "early"), ("westward", "windy")]
     checks = [
-        _window("checks/a.checks", 10 * n, f"{10 * n}: {word} " + "x" * 90)
-        for n, word in enumerate(words, start=1)
+        _window("checks/a.checks", 10 * n, f"{10 * n}: GO /route {a} {b} " + "x" * 80)
+        for n, (a, b) in enumerate(words, start=1)
     ]
-    entries = [{"words": "w"}]
+    docs = [_window("docs/a.md", 10 * n, f"{10 * n}: /route " + "y" * 80, score=5) for n in range(1, 5)]
+    entries = [{"words": "/route"}]
     choose_windows(
         entries,
-        [checks],
-        [[(w["path"], w["first_line"]) for w in checks]],
+        [docs + checks],
+        [[(w["path"], w["first_line"]) for w in docs + checks]],
         from_request=[True],
         max_chars=440,
-        scenarios=[[word[:5]] for word in words],
+        scenarios=[([a[:5], b[:5]], []) for a, b in words],
         test_roots=["checks"],
+        anchors=["/route"],
+        may_give_way=lambda path: path.startswith("docs/"),
     )
     marked = [w for w in entries[0]["evidence"] if w.get("_scenario")]
     assert marked
     assert sum(len(w["text"]) for w in marked) <= 220
+    assert all(w["path"] == "checks/a.checks" for w in marked)
 
 
 def test_the_trim_drops_a_scenario_window_last() -> None:

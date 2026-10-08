@@ -11689,11 +11689,13 @@ class PlanningRunDriver:
         find :data:`_MAX_SPEC_WORDS_LOOKED_FOR` the repository holds.
 
         A TEST FOR EACH SCENARIO (8 October 2026). Each approved scenario
-        first takes the window in ``test_roots`` (the project's declared test
-        folders) that best fits its own words, when one fits, so the planner
-        is shown a test it can cite for each scenario (on the deactivate
-        request it was shown the error scenarios' tests and not the success
-        one's, and could not answer "already done"). See
+        that no window shown is a test of is given one from ``test_roots``
+        (the project's declared test folders), on strong evidence only, in
+        place of documentation windows, so the planner is shown a test it
+        can cite for each scenario (on the deactivate request it was shown
+        the error scenarios' tests and not the success one's, and could not
+        answer "already done"). A test window must name what the request
+        names: its own words' spellings with punctuation in them. See
         :func:`~forge.planning.code_evidence.choose_windows`.
 
         A SEARCH THAT STOPS PART-WAY (6 October 2026) keeps every word
@@ -11749,6 +11751,11 @@ class PlanningRunDriver:
             found_candidates: list[list[dict[str, Any]]] = []
             found_hits: list[list[tuple[str, int]]] = []
             found_in_request: list[bool] = []
+            # What the request names, as it writes it: the spellings of its
+            # own words that carry punctuation (``/deactivate``,
+            # ``active_count``), or the word itself when none does. A
+            # scenario's test window must hold one of them.
+            anchors: list[str] = []
             stopped: str | None = None
             scoring_words = request_words(request_text)
             texts: dict[str, str | None] = {}
@@ -11822,6 +11829,17 @@ class PlanningRunDriver:
                     found_candidates.append(candidates)
                     found_hits.append(hits)
                     found_in_request.append(_one_form(word) in in_request)
+                    if found_in_request[-1]:
+                        # Not a bare placeholder (``{user_id}``): that is
+                        # any route's, not this request's name.
+                        named = [
+                            s
+                            for s in spellings
+                            if len(s) > 3
+                            and re.search(r"[^A-Za-z0-9]", s)
+                            and not re.fullmatch(r"/?\{[^}]*\}", s)
+                        ]
+                        anchors.extend(a for a in (named or [word]) if a not in anchors)
             choose_windows(
                 found,
                 found_candidates,
@@ -11829,8 +11847,12 @@ class PlanningRunDriver:
                 from_request=found_in_request,
                 max_windows=MAX_EVIDENCE_WINDOWS,
                 max_chars=evidence_chars() if callable(evidence_chars) else evidence_chars,
-                scenarios=[words for _title, words in scenario_words(spec_feature)],
+                scenarios=[(words, values) for _title, words, values in scenario_words(spec_feature)],
                 test_roots=test_roots,
+                anchors=anchors,
+                # Only the documentation may give way to a scenario's test.
+                may_give_way=lambda path: _how_interesting(path)[0] >= 2,
+                request_text=request_text,
             )
             for entry in found:
                 # The keys in the order the plan-writer has always read them.
