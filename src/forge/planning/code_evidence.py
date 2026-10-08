@@ -362,29 +362,82 @@ def request_method(request_text: str) -> str:
 _COMMENT_LINE_STARTS = ("#", "//", "--", ";", "*", "/*", "<!--", "%")
 
 
+#: Comments that run until a closing mark, possibly over several lines.
+_BLOCK_COMMENTS = (("/*", "*/"), ("<!--", "-->"))
+#: A line starting with one of these opens a description block (a
+#: docstring) that runs until the same mark closes it.
+_DESCRIPTION_MARKS = ('"""', "'''")
+
+
 def _code_only(body: str) -> str:
-    """``body`` with its comments blanked out, line by line, so a call
-    written in a comment is never taken for one the test makes: a line
-    starting with a common comment marker is blanked, and a ``#`` or
-    ``//`` comment after code is cut off where it starts outside quotes.
-    Line breaks are kept, so lines keep their places."""
+    """``body`` with its comments and descriptions blanked out, so a call
+    written in one is never taken for one the test makes. Line breaks are
+    kept, so lines keep their places.
+
+    * a ``/* ... */`` or ``<!-- ... -->`` comment, over as many lines as
+      it runs; one that never closes is blanked to the end;
+    * a block opened by a line starting with three quotes, until the same
+      three quotes close it (a one-line one is blanked too); one that never
+      closes is blanked to the end;
+    * a line starting with a common comment marker
+      (:data:`_COMMENT_LINE_STARTS`);
+    * a ``#`` or ``//`` comment after code, from where it starts outside
+      quotes (not the ``//`` after a ``:`` in an address).
+    """
     kept: list[str] = []
+    closer = ""
     for line in body.split("\n"):
-        if line.lstrip().startswith(_COMMENT_LINE_STARTS):
+        chars = list(line)
+        at = 0
+        if closer:
+            end = line.find(closer)
+            if end == -1:
+                kept.append("")
+                continue
+            at = end + len(closer)
+            chars[:at] = " " * at
+            closer = ""
+        stripped = line[at:].lstrip()
+        if at == 0 and stripped.startswith(_DESCRIPTION_MARKS):
+            if stripped[3:].find(stripped[:3]) == -1:
+                closer = stripped[:3]
+            kept.append("")
+            continue
+        if (
+            at == 0
+            and stripped.startswith(_COMMENT_LINE_STARTS)
+            and not stripped.startswith(tuple(o for o, _c in _BLOCK_COMMENTS))
+        ):
             kept.append("")
             continue
         quote = ""
-        cut = len(line)
-        for at, char in enumerate(line):
+        i = at
+        while i < len(line):
+            char = line[i]
             if quote:
                 if char == quote:
                     quote = ""
-            elif char in "\"'`":
+                i += 1
+                continue
+            if char in "\"'`":
                 quote = char
-            elif char == "#" or (line.startswith("//", at) and not line[:at].endswith(":")):
-                cut = at
+                i += 1
+                continue
+            block = next(((o, c) for o, c in _BLOCK_COMMENTS if line.startswith(o, i)), None)
+            if block is not None:
+                end = line.find(block[1], i + len(block[0]))
+                if end == -1:
+                    chars[i:] = " " * (len(line) - i)
+                    closer = block[1]
+                    break
+                chars[i : end + len(block[1])] = " " * (end + len(block[1]) - i)
+                i = end + len(block[1])
+                continue
+            if char == "#" or (line.startswith("//", i) and not line[:i].endswith(":")):
+                chars[i:] = " " * (len(line) - i)
                 break
-        kept.append(line[:cut])
+            i += 1
+        kept.append("".join(chars).rstrip())
     return "\n".join(kept)
 
 
@@ -393,21 +446,62 @@ def _route_pattern(route: str) -> re.Pattern[str]:
     ``{placeholder}`` segment stands for any one segment (``{thing_id}``
     for ``t-1``), every other segment is itself, nothing may be missing
     before it but a scheme and host (``http://test``), and only a closing
-    slash, a query or a fragment may follow it."""
+    slash, a query or a fragment may follow it. Its fixed segments are
+    matched with their case, as a router matches them."""
     segment = r"[^/\s\"'`?#]+"
     parts = [segment if "{" in part else re.escape(part) for part in route.strip("/").split("/")]
     return re.compile(
-        r"(?:[a-z][a-z0-9+.-]*://[^/\s]+)?/" + "/".join(parts) + r"/?(?:[?#]\S*)?"
+        r"(?:[A-Za-z][A-Za-z0-9+.-]*://[^/\s]+)?/" + "/".join(parts) + r"/?(?:[?#]\S*)?"
+    )
+
+
+def _enclosing_call(code: str, at: int) -> int:
+    """Where the opening parenthesis of the call holding position ``at``
+    is, through any lists or brackets on the way, or -1."""
+    depth = 0
+    for i in range(at - 1, -1, -1):
+        char = code[i]
+        if char in ")]}":
+            depth += 1
+        elif char in "([{":
+            if depth:
+                depth -= 1
+            elif char == "(":
+                return i
+    return -1
+
+
+def _call_uses(code: str, paren: int, method: str) -> bool:
+    """The call opening at ``paren`` is made with ``method``: the name just
+    before the parenthesis is that word (``patch(``, ``client.patch(``), or
+    one of the call's own arguments is that word quoted (``"PATCH"``).
+    Case is ignored."""
+    name = re.search(r"([A-Za-z_][A-Za-z0-9_]*)\s*$", code[:paren])
+    if name and name.group(1).lower() == method:
+        return True
+    depth = 0
+    for i in range(paren, len(code)):
+        if code[i] in "([{":
+            depth += 1
+        elif code[i] in ")]}":
+            depth -= 1
+            if depth == 0:
+                break
+    arguments = code[paren : i + 1]
+    return (
+        re.search(r"[\"'`]" + re.escape(method) + r"[\"'`]", arguments, re.IGNORECASE)
+        is not None
     )
 
 
 def _calls(body: str, anchor: str, method: str) -> bool:
-    """``body`` (lower case) passes ``anchor`` as a call's quoted argument
-    or a list's quoted item, outside comments, and, when ``method`` is
-    given, says that word on the same line or the line before, outside
-    comments too. A route (``anchor`` starting with a slash) must be the
-    whole route (:func:`_route_pattern`); another name is looked for
-    inside the quoted text."""
+    """``body`` passes ``anchor`` as a call's quoted argument or a list's
+    quoted item, outside comments and descriptions (:func:`_code_only`),
+    and, when ``method`` is given, in a call made with that method
+    (:func:`_call_uses`). A route (``anchor`` starting with a slash) must
+    be the whole route, its fixed segments with their case
+    (:func:`_route_pattern`); another name is looked for inside the quoted
+    text, case ignored."""
     code = _code_only(body)
     route = _route_pattern(anchor) if anchor.startswith("/") else None
     for match in _QUOTED_ARGUMENT.finditer(code):
@@ -415,16 +509,12 @@ def _calls(body: str, anchor: str, method: str) -> bool:
         if route is not None:
             if not route.fullmatch(quoted):
                 continue
-        elif anchor not in quoted:
+        elif anchor.lower() not in quoted.lower():
             continue
         if not method:
             return True
-        start = match.start(1)
-        line_start = code.rfind("\n", 0, start) + 1
-        before_start = code.rfind("\n", 0, max(line_start - 1, 0)) + 1 if line_start else 0
-        line_end = code.find("\n", start)
-        near = code[before_start : line_end if line_end != -1 else len(code)]
-        if re.search(r"(?<![a-z0-9])" + re.escape(method) + r"(?![a-z0-9])", near):
+        paren = _enclosing_call(code, match.start(1))
+        if paren != -1 and _call_uses(code, paren, method):
             return True
     return False
 
@@ -485,6 +575,17 @@ class _ScenarioFit:
     When several windows are, the one holding more of the scenario's own
     values and words is preferred (:meth:`score`).
 
+    KNOWN LIMITS (8 October 2026). This is word matching on plain text, not
+    an understanding of the test. A test written to look like this
+    scenario's (one that calls the requested route with the requested
+    method and plants the scenario's own words and values) can still be
+    taken for its test, and a real test written in another way (a route
+    built from pieces or held in a constant named elsewhere, a call in a
+    form not recognised, a window starting inside a comment or description)
+    can be missed. Nothing knows a language's grammar. The backstop is the
+    planner's proof question: the model is asked whether a cited test
+    proves the scenario before "already done" is accepted.
+
     Only words at most half of the scenarios say tell them apart; the
     others (``user``, ``request``) are the feature's, and are left out of
     both counts. A word the request itself says (``already``, ``inactive``)
@@ -500,7 +601,7 @@ class _ScenarioFit:
         request_text: str = "",
     ) -> None:
         self.test_roots = list(test_roots)
-        self.anchors = [a.lower() for a in anchors if a]
+        self.anchors = [a for a in anchors if a]
         self.method = request_method(request_text)
         stems = [set(words) for words, _values in scenarios]
         values = [set(vals) for _words, vals in scenarios]
@@ -537,9 +638,10 @@ class _ScenarioFit:
             return cached[1]
         reading: tuple[str, set[str]] | None = None
         if _under(str(window.get("path", "")), self.test_roots):
-            body = _window_body(window).lower()
+            text = _window_body(window)
+            body = text.lower()
             if not self.anchors or any(
-                _calls(body, anchor, self.method) for anchor in self.anchors
+                _calls(text, anchor, self.method) for anchor in self.anchors
             ):
                 stems = {_stem(token) for token in _scenario_tokens(_window_body(window))}
                 reading = (body, stems)

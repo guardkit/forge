@@ -404,6 +404,37 @@ TRAILING_COMMENT = (
 )
 
 
+#: Codex's round-2 shapes: a matching call inside a block comment or a
+#: description block, the requested method only in the check's title while
+#: the call is another method, and the route in another case.
+BLOCK_COMMENTED_CALL = (
+    "check switching a thing on succeeds\n"
+    "  /*\n"
+    '  call patch("/things/t-1/archive")\n'
+    "  */\n"
+    '  call post("/admin/t-1/enable")\n'
+    "  expect it to succeed: 200, and the thing is marked live\n"
+)
+DESCRIBED_CALL = (
+    "check switching a thing on succeeds\n"
+    '  """\n'
+    '  call patch("/things/t-1/archive")\n'
+    '  """\n'
+    '  call post("/admin/t-1/enable")\n'
+    "  expect it to succeed: 200, and the thing is marked live\n"
+)
+METHOD_IN_TITLE = (
+    "check a get on the PATCH route succeeds and leaves the thing live\n"
+    '  call get("/things/t-1/archive")\n'
+    "  expect it to succeed with 405, the thing marked live as it was\n"
+)
+OTHER_CASE = (
+    "check a shouted archive succeeds\n"
+    '  call patch("/THINGS/t-1/ARCHIVE")\n'
+    "  expect it to succeed: 200, and the thing is marked live\n"
+)
+
+
 def _after_success(block: str) -> dict[str, str]:
     return {SUCCESS_CHECK: CHECKS + "\n" * 2 + _filler(20) + "\n" + block}
 
@@ -424,6 +455,14 @@ LOOKALIKES = {
     ),
     "as a commented-out call": (_after_success(COMMENTED_CALL), SUCCESS_CHECK, COMMENTED_CALL),
     "in a comment after code": (_after_success(TRAILING_COMMENT), SUCCESS_CHECK, TRAILING_COMMENT),
+    "inside a block comment": (
+        _after_success(BLOCK_COMMENTED_CALL), SUCCESS_CHECK, BLOCK_COMMENTED_CALL
+    ),
+    "inside a description block": (_after_success(DESCRIBED_CALL), SUCCESS_CHECK, DESCRIBED_CALL),
+    "with the method only in its title": (
+        _after_success(METHOD_IN_TITLE), SUCCESS_CHECK, METHOD_IN_TITLE
+    ),
+    "with the route in another case": (_after_success(OTHER_CASE), SUCCESS_CHECK, OTHER_CASE),
 }
 
 
@@ -484,6 +523,26 @@ def test_no_lookalike_is_evidence_of_any_scenario(where: str) -> None:
     assert fit.score(0, _as_window(SUCCESS_CHECK, real)) is not None
 
 
+@pytest.mark.parametrize(
+    "call",
+    [
+        'call patch("/things/t-1/archive")',
+        'call client.patch(\n    "/things/t-1/archive",\n)',
+        'call request("PATCH", "/things/t-1/archive")',
+        "call send('patch', \"http://test/things/t-1/archive\")",
+    ],
+)
+def test_the_real_check_still_counts_however_its_call_is_written(call: str) -> None:
+    """Positive controls: the method as the call's name, on a call spread
+    over lines, or as one of the call's own quoted arguments."""
+    block = (
+        "check live thing\n"
+        f"  {call}\n"
+        "  expect it to succeed: 200, and the returned thing is marked archived\n"
+    )
+    assert _fit().score(0, _as_window(SUCCESS_CHECK, block)) is not None
+
+
 def test_the_request_method_is_the_word_before_its_route() -> None:
     assert request_method(REQUEST) == "patch"
     assert request_method("Add GET /things/count returning a number") == "get"
@@ -501,6 +560,7 @@ def test_a_route_is_matched_whole() -> None:
     ):
         assert route.fullmatch(called), called
     for other in (
+        "/THINGS/t-1/ARCHIVE",
         "/widgets/t-1/archive",
         "/archive",
         "/api/things/t-1/archive",
@@ -520,12 +580,23 @@ def test_comments_are_not_code() -> None:
         'get("http://test/h")\n'
         'say("a # in quotes")\n'
     )
+    body += (
+        '/*\n patch("/i")\n*/\n'
+        'post("/j") /* patch("/k") */ get("/l")\n'
+        '<!-- patch("/m")\n-->\n'
+        '    """\n    patch("/n")\n    """\n'
+        '    """One line, patch("/o")."""\n'
+        'post("/p")\n'
+    )
     code = _code_only(body)
-    for gone in ("/a", "/b", "/c", "/e", "/g"):
+    for gone in ("/a", "/b", "/c", "/e", "/g", "/i", "/k", "/m", "/n", "/o"):
         assert gone not in code, gone
-    for kept in ("/d", "/f", "http://test/h", "a # in quotes"):
+    for kept in ("/d", "/f", "http://test/h", "a # in quotes", "/j", "/l", "/p"):
         assert kept in code, kept
     assert code.count("\n") == body.count("\n")
+    # A block that never closes is blanked to the end.
+    assert "/r" not in _code_only('/* open\npatch("/r")\n')
+    assert "/s" not in _code_only('"""\npatch("/s")\n')
 
 
 def test_only_prose_outside_tests_and_code_is_documentation() -> None:
