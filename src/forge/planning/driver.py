@@ -122,6 +122,7 @@ from forge.planning.code_evidence import (
     MAX_EVIDENCE_WINDOWS,
     candidate_windows,
     choose_windows,
+    is_documentation,
     is_factory_file,
     quantified_phrases,
     request_words,
@@ -11751,11 +11752,13 @@ class PlanningRunDriver:
             found_candidates: list[list[dict[str, Any]]] = []
             found_hits: list[list[tuple[str, int]]] = []
             found_in_request: list[bool] = []
-            # What the request names, as it writes it: the spellings of its
-            # own words that carry punctuation (``/deactivate``,
-            # ``active_count``), or the word itself when none does. A
-            # scenario's test window must hold one of them.
+            # What the request names, as it writes it. A scenario's test
+            # window must call one of the request's routes whole
+            # (``routes``); only when the request names no route, one of
+            # its other words' spellings that carry punctuation
+            # (``active_count``), or the word itself when none does.
             anchors: list[str] = []
+            routes: list[str] = []
             stopped: str | None = None
             scoring_words = request_words(request_text)
             texts: dict[str, str | None] = {}
@@ -11829,7 +11832,13 @@ class PlanningRunDriver:
                     found_candidates.append(candidates)
                     found_hits.append(hits)
                     found_in_request.append(_one_form(word) in in_request)
-                    if found_in_request[-1]:
+                    if found_in_request[-1] and word.startswith("/"):
+                        # A route the request names, whole: a scenario's
+                        # test must call all of it, never just its last
+                        # segment (``/archive`` is any route's).
+                        if word not in routes:
+                            routes.append(word)
+                    elif found_in_request[-1]:
                         # Not a bare placeholder (``{user_id}``): that is
                         # any route's, not this request's name.
                         named = [
@@ -11849,9 +11858,10 @@ class PlanningRunDriver:
                 max_chars=evidence_chars() if callable(evidence_chars) else evidence_chars,
                 scenarios=[(words, values) for _title, words, values in scenario_words(spec_feature)],
                 test_roots=test_roots,
-                anchors=anchors,
-                # Only the documentation may give way to a scenario's test.
-                may_give_way=lambda path: _how_interesting(path)[0] >= 2,
+                anchors=routes or anchors,
+                # Only what is positively documentation may give way to a
+                # scenario's test; a data file may be a test's cases or code.
+                may_give_way=lambda path: is_documentation(path, test_roots),
                 request_text=request_text,
             )
             for entry in found:
