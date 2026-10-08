@@ -144,6 +144,23 @@ class TestTheTwoHalvesOfTheSeamAgree:
         assert (other / "keep.txt").is_file()
 
 
+class TestTheJoinsWorkingFolderIsRemovedInThere:
+    @pytest.mark.asyncio
+    async def test_a_path_from_this_side_still_removes_the_folder_in_there(
+        self, git: SidecarCandidateGit, clone: Path
+    ) -> None:
+        """FEAT-A804 (8 October 2026): the press removes the folder by the path
+        it has on its own side, which for a sandboxed repository is not the
+        clone's path in there. Only the folder's name travels, so it works."""
+        made = await git.add_working_folder("integration-FEAT-SG1", "factory-integration/FEAT-SG1", "main")
+        assert made.ok, made.refusal
+        assert Path(made.path) == clone / ".forge" / "worktrees" / "integration-FEAT-SG1"
+
+        coordinator_side = "/var/lib/forge/projects/api_test/.forge/worktrees/integration-FEAT-SG1"
+        assert await git.remove_working_folder(coordinator_side) is True
+        assert not Path(made.path).exists()
+
+
 class TestTheProjectsOwnFileIsReadInThere:
     """The press reads ``deploy/profile.yaml`` at a commit through this venue
     (3 October 2026, FEAT-E592), so the two halves must agree on that too."""
