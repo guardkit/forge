@@ -29,6 +29,7 @@ import pytest
 from forge.planning.code_evidence import (
     MAX_EVIDENCE_WINDOWS,
     choose_windows,
+    request_method,
     scenario_words,
     trim_to_budget,
 )
@@ -93,21 +94,21 @@ def _filler(count: int) -> str:
 #: below them, each its own block.
 CHECKS = (
     "check never-made thing\n"
-    "  call PATCH \"/things/t-9/archive\" with an unknown id\n"
+    "  call patch(\"/things/t-9/archive\") with an unknown id\n"
     "  expect 404, not found\n"
     + _filler(3)
     + "\n" * 2
     + _filler(20)
     + "\n"
     + "check already archived thing\n"
-    "  call PATCH \"/things/t-2/archive\" when already archived\n"
+    "  call patch(\"/things/t-2/archive\") when already archived\n"
     "  expect 409 conflict and the thing returns unchanged\n"
     + _filler(3)
     + "\n" * 2
     + _filler(20)
     + "\n"
     + "check live thing\n"
-    "  call PATCH \"/things/t-1/archive\"\n"
+    "  call patch(\"/things/t-1/archive\")\n"
     "  expect it to succeed: 200, and the returned thing is marked archived\n"
 )
 
@@ -127,7 +128,7 @@ def _other_checks(n: int) -> str:
 #: request's "archive", but never names the request's route.
 LOOKALIKE = (
     "check widget archive succeeds\n"
-    "  call PUT \"/widgets/w-1/store\" to archive the widget\n"
+    "  call put(\"/widgets/w-1/store\") to archive the widget\n"
     "  expect it to succeed, marked live, the thing is archived and returned\n"
 )
 
@@ -341,46 +342,92 @@ RESTORE = (
     "check restoring a thing succeeds\n"
     "  # same shape as /things/{thing_id}/archive, the other way round\n"
     '  thing "t-1" is live again\n'
-    '  call PATCH "/things/t-1/restore"\n'
+    '  call patch("/things/t-1/restore")\n'
     "  expect it to succeed: 200, and the returned thing is marked live\n"
 )
 ENABLE = (
     "check enabling a thing succeeds\n"
     "  # mirrors /things/{thing_id}/archive\n"
     '  thing "t-1" is live again\n'
-    '  call POST "/admin/t-1/enable"\n'
+    '  call post("/admin/t-1/enable")\n'
     "  expect it to succeed: 200, and the returned thing is marked live\n"
 )
+#: The coach's later shapes, each with the success scenario's own words
+#: ("succeed", "marked", "live") planted in it.
+OTHER_METHOD = (
+    "check a get on the route succeeds and leaves the thing live\n"
+    '  call get("/things/t-1/archive")\n'
+    "  expect it to succeed with 405, the thing marked live as it was\n"
+)
+DESCRIBED = (
+    "check switching a thing back on succeeds\n"
+    '  """The way back from PATCH /things/{thing_id}/archive."""\n'
+    '  call post("/admin/t-1/enable")\n'
+    "  expect it to succeed: 200, and the thing is marked live\n"
+)
+APOSTROPHES = (
+    "check switching a thing back on again succeeds\n"
+    "  # Doesn't go through /things/{thing_id}/archive; it's the way back.\n"
+    '  call post("/admin/t-1/enable")\n'
+    "  expect it to succeed: 200, and the thing is marked live\n"
+)
+LISTED = (
+    "check every route succeeds for a live thing\n"
+    '  routes ["/things/{thing_id}/archive", "/things/{thing_id}/restore"]\n'
+    "  call post(route)\n"
+    "  expect it to succeed: 200, and the thing is marked live\n"
+)
+
+
+def _after_success(block: str) -> dict[str, str]:
+    return {SUCCESS_CHECK: CHECKS + "\n" * 2 + _filler(20) + "\n" + block}
+
+
+#: Where each look-alike goes: ``{name: (files, its file, its first line's text)}``.
 LOOKALIKES = {
-    "in a file of its own": {"checks/things/restore.checks": RESTORE},
-    "after the success check": {SUCCESS_CHECK: CHECKS + "\n" * 2 + _filler(20) + "\n" + RESTORE},
-    "for another route": {SUCCESS_CHECK: CHECKS + "\n" * 2 + _filler(20) + "\n" + ENABLE},
+    "in a file of its own": (
+        {"checks/things/restore.checks": RESTORE}, "checks/things/restore.checks", RESTORE
+    ),
+    "after the success check": (_after_success(RESTORE), SUCCESS_CHECK, RESTORE),
+    "for another route": (_after_success(ENABLE), SUCCESS_CHECK, ENABLE),
+    "with another method": (_after_success(OTHER_METHOD), SUCCESS_CHECK, OTHER_METHOD),
+    "in a one-line description": (_after_success(DESCRIBED), SUCCESS_CHECK, DESCRIBED),
+    "in a comment with apostrophes": (_after_success(APOSTROPHES), SUCCESS_CHECK, APOSTROPHES),
+    "in a list called with another method": (_after_success(LISTED), SUCCESS_CHECK, LISTED),
 }
 
 
 @pytest.mark.parametrize("where", sorted(LOOKALIKES))
-def test_a_check_naming_the_route_only_in_a_comment_is_never_the_scenarios_test(
-    tmp_path: Path, where: str
-) -> None:
-    """The look-alike shares the success scenario's example value and words,
-    and names the request's route only in a comment. The real success check
-    is shown; the look-alike is never taken as the scenario's test (it is
-    shown only as the words' own rounds already show it)."""
-    files = {**FILES, **LOOKALIKES[where]}
+def test_a_lookalike_is_never_taken_as_the_scenarios_test(tmp_path: Path, where: str) -> None:
+    """Each look-alike shares the success scenario's example value and
+    words but does not call the request's route with its method: it names
+    the route only in a comment or a description, calls another route or
+    method, or lists the route and calls another method. The real success
+    check is shown, or no window is added; the look-alike is never taken as
+    the scenario's test (it is shown only where the words' own rounds
+    already show it)."""
+    extra, path, block = LOOKALIKES[where]
+    files = {**FILES, **extra}
     repo = _git(tmp_path, files)
     budget = 2_400  # room for the success check once documentation gives way
     plain = _windows(repo, budget, [])
     chosen = _windows(repo, budget, TEST_ROOTS)
     assert not _shows(plain, SUCCESS_CHECK, _success_line())
-    assert _shows(chosen, SUCCESS_CHECK, _success_line())
-    text = files[SUCCESS_CHECK] if where != "in a file of its own" else RESTORE
-    path = SUCCESS_CHECK if where != "in a file of its own" else "checks/things/restore.checks"
-    lookalike_line = _line_of(text, "same shape as" if "same shape as" in text else "mirrors")
-    added = {_key(w) for w in chosen} - {_key(w) for w in plain}
-    assert not any(
-        p == path and first <= lookalike_line + 3 and last >= lookalike_line
-        for p, first, last in added
+    # The real check wins, or (when no documentation can give way to it)
+    # nothing is added at all.
+    assert _shows(chosen, SUCCESS_CHECK, _success_line()) or list(map(_key, chosen)) == list(
+        map(_key, plain)
     )
+    first = _line_of(files[path], block.split("\n")[0])
+    last = first + block.count("\n") - 1
+    added = {_key(w) for w in chosen} - {_key(w) for w in plain}
+    assert not any(p == path and lo <= last and hi >= first for p, lo, hi in added)
+
+
+def test_the_request_method_is_the_word_before_its_route() -> None:
+    assert request_method(REQUEST) == "patch"
+    assert request_method("Add GET /things/count returning a number") == "get"
+    assert request_method("Make things archivable") == ""
 
 
 def test_example_data_alone_does_not_make_a_check_the_scenarios_test(tmp_path: Path) -> None:
@@ -388,12 +435,12 @@ def test_example_data_alone_does_not_make_a_check_the_scenarios_test(tmp_path: P
     route, quoted, but none of its words, is not taken as its test."""
     data_only = (
         "check something else\n"
-        '  call PATCH "/things/t-1/archive"\n'
+        '  call patch("/things/t-1/archive")\n'
         "  expect 200\n"
     )
     repo = _git(tmp_path, {**FILES, SUCCESS_CHECK: CHECKS.replace(
         "check live thing\n"
-        '  call PATCH "/things/t-1/archive"\n'
+        '  call patch("/things/t-1/archive")\n'
         "  expect it to succeed: 200, and the returned thing is marked archived\n",
         data_only,
     )})
@@ -421,7 +468,7 @@ def test_scenario_windows_take_at_most_half_the_budget() -> None:
     only half of the characters."""
     words = [("northern", "nightly"), ("southern", "sunny"), ("eastward", "early"), ("westward", "windy")]
     checks = [
-        _window("checks/a.checks", 10 * n, f"{10 * n}: GO \"/route\" {a} {b} " + "x" * 80)
+        _window("checks/a.checks", 10 * n, f"{10 * n}: GO(\"/route\") {a} {b} " + "x" * 80)
         for n, (a, b) in enumerate(words, start=1)
     ]
     docs = [_window("docs/a.md", 10 * n, f"{10 * n}: /route " + "y" * 80, score=5) for n in range(1, 5)]
@@ -447,9 +494,9 @@ def test_a_weaker_test_already_shown_does_not_block_a_stronger_one() -> None:
     """A check already shown holds two of the scenario's words; another
     holds three. The stronger one is added, in place of documentation."""
     doc_a = _window("docs/a.md", 1, '1: "/route" ' + "a" * 90, score=9)
-    weak = _window("checks/a.checks", 10, '10: GO "/route" alpha beta ' + "w" * 70, score=8)
+    weak = _window("checks/a.checks", 10, '10: GO("/route") alpha beta ' + "w" * 70, score=8)
     doc_b = _window("docs/b.md", 1, '1: "/route" ' + "b" * 90, score=7)
-    strong = _window("checks/a.checks", 40, '40: GO "/route" alpha beta gamma ' + "s" * 64, score=1)
+    strong = _window("checks/a.checks", 40, '40: GO("/route") alpha beta gamma ' + "s" * 64, score=1)
     windows = [doc_a, weak, doc_b, strong]
     entries = [{"words": "/route"}]
     choose_windows(
