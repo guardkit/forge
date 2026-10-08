@@ -23,6 +23,7 @@ from pathlib import Path
 
 import pytest
 
+from forge.adapters.git.operations import ExecuteResult
 from forge.adapters.git.planning_runner import (
     PLANNING_LOCK_PREFIX,
     STALE_LOCK_AFTER_S,
@@ -236,3 +237,82 @@ class TestALockLeftByAProcessThatDied:
 
         assert result.status == "success"
         assert _registered(repo) == [str(fresh)]
+
+
+class TestATemporaryFolderReachedThroughASymlink:
+    """git records a worktree's real path; macOS's temporary folder sits
+    behind ``/var -> /private/var``. Comparisons must use real paths."""
+
+    @pytest.fixture
+    def linked_root(self, tmp_path: Path) -> Path:
+        real = tmp_path / "real-tmp"
+        real.mkdir()
+        link = tmp_path / "linked-tmp"
+        link.symlink_to(real, target_is_directory=True)
+        return link / "helper-tmp"
+
+    @pytest.mark.asyncio
+    async def test_a_live_worktree_is_seen_as_registered(
+        self, repo: Path, linked_root: Path
+    ) -> None:
+        worktree = linked_root / "planning-live"
+        _git(repo, "worktree", "add", "-b", BRANCH, str(worktree))
+
+        runner = WorktreeGitRunner(worktrees_root=linked_root)
+        assert await runner._is_registered(repo, worktree) is True
+
+    @pytest.mark.asyncio
+    async def test_an_old_lock_with_its_folder_gone_is_still_cleared(
+        self, repo: Path, linked_root: Path
+    ) -> None:
+        old = linked_root / "planning-old"
+        long_ago = datetime.now(timezone.utc) - timedelta(
+            seconds=STALE_LOCK_AFTER_S + 60
+        )
+        _git(
+            repo, "worktree", "add", "--lock", "--reason",
+            planning_lock_reason("planning/old", now=long_ago),
+            "-b", "planning/old", str(old),
+        )
+        shutil.rmtree(old.resolve())
+
+        runner = WorktreeGitRunner(worktrees_root=linked_root)
+        result = await runner.prepare_branch_and_write_tree(
+            str(repo), BRANCH, FILES, "planning: spec"
+        )
+
+        assert result.status == "success"
+        assert _registered(repo) == []
+
+
+class TestAnAddThatTimesOutAfterMakingTheWorktree:
+    @pytest.mark.asyncio
+    async def test_no_lock_folder_or_registration_outlives_it(
+        self, repo: Path, tmp_path: Path
+    ) -> None:
+        """The add really happens (folder, registration and lock), then the
+        caller is told it timed out, as the 180-second limit would."""
+        root = tmp_path / "helper-tmp"
+        runner = WorktreeGitRunner(worktrees_root=root)
+        real = runner._execute
+
+        async def _add_then_time_out(*, command, cwd=None, timeout=None):
+            done = await real(command=command, cwd=cwd, timeout=timeout)
+            if list(command)[1:3] == ["worktree", "add"]:
+                assert done.exit_code == 0, done.stderr
+                return ExecuteResult(
+                    exit_code=-1,
+                    stdout="",
+                    stderr=f"git-runner timeout: command timed out: {command!r}",
+                )
+            return done
+
+        runner._execute = _add_then_time_out
+        result = await runner.prepare_branch_and_write_tree(
+            str(repo), BRANCH, FILES, "planning: spec"
+        )
+
+        assert result.status == "failed"
+        assert "timeout" in (result.stderr or "")
+        assert _registered(repo) == []
+        assert list(root.iterdir()) == []

@@ -350,6 +350,7 @@ class WorktreeGitRunner:
 
             add_res = await self._execute_timed(command=add_cmd, cwd=str(repo))
             if add_res.exit_code != 0:
+                await self._undo_failed_add(repo, worktree)
                 return GitOpResult(
                     status="failed",
                     operation=_OPERATION,
@@ -581,6 +582,7 @@ class WorktreeGitRunner:
 
             add_res = await self._execute_timed(command=add_cmd, cwd=str(repo))
             if add_res.exit_code != 0:
+                await self._undo_failed_add(repo, worktree)
                 return GitOpResult(
                     status="failed",
                     operation=_TREE_OPERATION,
@@ -740,9 +742,11 @@ class WorktreeGitRunner:
         )
         if res.exit_code != 0:
             return None
-        wanted = os.path.normpath(os.path.abspath(str(worktree)))
+        # Real paths on both sides: git records a worktree's real path, and a
+        # temporary folder can sit behind a symlink (macOS's /var).
+        wanted = os.path.realpath(str(worktree))
         return any(
-            os.path.normpath(entry.get("worktree", "")) == wanted
+            os.path.realpath(entry.get("worktree", "")) == wanted
             for entry in _worktree_entries(res.stdout or "")
         )
 
@@ -792,6 +796,46 @@ class WorktreeGitRunner:
                 worktree,
             )
 
+    async def _undo_failed_add(self, repo: Path, worktree: Path) -> None:
+        """Take away whatever a failed ``git worktree add --lock`` left.
+
+        An add that is stopped by its time limit, or fails part-way, can
+        leave the folder, the registration and its lock behind. Nothing else
+        would clear that lock while the folder exists, so it goes here: unlock
+        if it is registered, remove it (which also clears a registration whose
+        folder never appeared), then delete any folder that remains. Never
+        raises.
+        """
+        try:
+            registered = await self._is_registered(repo, worktree)
+            if registered is not False:
+                await self._execute_timed(
+                    command=["git", "worktree", "unlock", str(worktree)],
+                    cwd=str(repo),
+                )
+                await self._execute_timed(
+                    command=["git", "worktree", "remove", "--force", str(worktree)],
+                    cwd=str(repo),
+                )
+            if worktree.exists():
+                shutil.rmtree(worktree, ignore_errors=True)
+            if registered is not False:
+                logger.warning(
+                    "planning worktree add failed part-way at %s; what it left "
+                    "was unlocked and removed%s",
+                    worktree,
+                    ""
+                    if await self._is_registered(repo, worktree) is False
+                    else " except its registration, now unlocked, which the "
+                    "next prune will take",
+                )
+        except Exception:  # noqa: BLE001 — never hides the add's own failure
+            logger.exception(
+                "clearing up after a failed planning worktree add raised "
+                "(worktree=%s)",
+                worktree,
+            )
+
     async def _clear_stale_planning_locks(self, repo: Path) -> None:
         """Clear planning locks left by a process that died mid-write.
 
@@ -807,14 +851,15 @@ class WorktreeGitRunner:
             )
             if res.exit_code != 0:
                 return
-            root = os.path.normpath(os.path.abspath(str(self._worktrees_root)))
+            # Real paths on both sides, as in _is_registered.
+            root = os.path.realpath(str(self._worktrees_root))
             now = datetime.now(timezone.utc)
             for entry in _worktree_entries(res.stdout or ""):
                 path = entry.get("worktree", "")
                 taken = _lock_taken_at(entry.get("locked", ""))
                 if (
                     taken is None
-                    or os.path.dirname(os.path.normpath(path)) != root
+                    or os.path.dirname(os.path.realpath(path)) != root
                     or Path(path).exists()
                     or (now - taken).total_seconds() < STALE_LOCK_AFTER_S
                 ):
