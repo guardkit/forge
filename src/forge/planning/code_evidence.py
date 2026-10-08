@@ -19,7 +19,11 @@ and no file type filtered out:
   planner, numbered, so it can say what is already done and cite the line.
   They are chosen across all the words at once: the request's own and rarest
   words first, one window per file before a second in any file, until the
-  size budget is spent (:func:`choose_windows`);
+  size budget is spent (:func:`choose_windows`). After each word's first
+  window, each approved scenario is given the window in the project's
+  declared test folders that best fits its own words, when one fits
+  (:func:`scenario_words`), so the planner is shown a test it can cite for
+  every scenario it can;
 * **the set search** (item 3): when the request says "all the X", "every X"
   or "each X", every tracked file that holds the X word anywhere is a
   candidate, ranked by how many of the request's other words it holds and how
@@ -69,6 +73,7 @@ __all__ = [
     "is_factory_record",
     "quantified_phrases",
     "request_words",
+    "scenario_words",
     "set_candidates",
     "trim_to_budget",
     "window_start",
@@ -173,6 +178,136 @@ def words_starting_in(words: Sequence[str], text: str) -> int:
     """How many of ``words`` start a word somewhere in ``text``, case ignored."""
     tokens = _tokens(text)
     return sum(1 for word in words if any(token.startswith(word) for token in tokens))
+
+
+# ---------------------------------------------------------------------------
+# A test window for each approved scenario
+# ---------------------------------------------------------------------------
+
+#: A scenario's header in the specification (the factory's own Gherkin
+#: specification format, not the project's): its words start here.
+_SCENARIO_HEADER = re.compile(r"(?:Scenario(?:\s+Outline)?|Example)\s*:\s*(.*)")
+#: Any other header ends the scenario before it.
+_OTHER_HEADER = re.compile(r"(?:Feature|Background|Rule)\s*:")
+#: The specification format's own words, said in every scenario.
+_SCENARIO_FORMAT_WORDS = frozenset(
+    {"given", "when", "then", "and", "but", "scenario", "outline", "example",
+     "examples", "should"}
+)
+#: Words are compared by their first five letters, so "succeeds" and
+#: "successfully", or "deactivated" and "deactivating", are one word.
+_SCENARIO_STEM_LETTERS = 5
+#: The scenario windows take at most one part in this many of the windows,
+#: and of the characters, so the other windows keep at least half.
+_SCENARIO_SHARE = 2
+
+
+def _stem(word: str) -> str:
+    return word[:_SCENARIO_STEM_LETTERS]
+
+
+def _scenario_tokens(text: str) -> set[str]:
+    """The words of ``text``, lower case, with a capital inside a word
+    starting a new one (``TestDeactivatingAnActiveUser`` holds ``active``):
+    a test is often named after its scenario in one joined-up word."""
+    split = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", text or "")
+    return {token.lower() for token in _TOKEN.findall(split)}
+
+
+def scenario_words(spec_feature: str) -> list[tuple[str, list[str]]]:
+    """``[(title, words)]`` for each scenario of the specification, in order.
+
+    ``words`` are the scenario's own words (its title, its steps and its
+    examples), cut to their first five letters: words of four or more
+    letters, and numbers of three or more digits (a status code is often what
+    sets one scenario apart), without the filler words and the
+    specification format's own words. Comments and tags are not the
+    scenario's words. Plain text only: nothing about the project's language
+    or test tools.
+    """
+    found: list[tuple[str, list[str]]] = []
+    lines: list[str] | None = None
+    for raw in (spec_feature or "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith(("#", "@")):
+            continue
+        header = _SCENARIO_HEADER.match(line)
+        if header:
+            lines = [header.group(1)]
+            found.append((header.group(1).strip(), lines))
+            continue
+        if _OTHER_HEADER.match(line):
+            lines = None
+            continue
+        if lines is not None:
+            lines.append(line)
+    result: list[tuple[str, list[str]]] = []
+    skip = _FILLER_WORDS | _SCENARIO_FORMAT_WORDS
+    for title, text_lines in found:
+        words: list[str] = []
+        for token in _scenario_tokens(" ".join(text_lines)):
+            keep = len(token) >= 3 if token.isdigit() else len(token) >= 4
+            if keep and token not in skip and _stem(token) not in words:
+                words.append(_stem(token))
+        result.append((title, sorted(words)))
+    return result
+
+
+def _under(path: str, roots: Sequence[str]) -> bool:
+    return any(path.startswith(root.rstrip("/") + "/") for root in roots if root.strip("/"))
+
+
+def _window_tokens(window: Mapping[str, Any]) -> set[str]:
+    """The stems of a window's words, its line numbers left out."""
+    text = re.sub(r"(?m)^\d+: ", "", window.get("text") or "")
+    return {_stem(token) for token in _scenario_tokens(text)}
+
+
+def _scenario_windows(
+    candidates: Sequence[Sequence[dict[str, Any]]],
+    order: Sequence[int],
+    from_request: Sequence[bool],
+    scenarios: Sequence[Sequence[str]],
+    test_roots: Sequence[str],
+) -> list[list[tuple[int, int, dict[str, Any]]]]:
+    """For each scenario, the test windows that fit it, best first, as
+    ``(entry index, fit, window)``.
+
+    Only windows in the declared test folders, and only those round the
+    request's own words when there are any (a test of this feature names
+    what the request names). A window fits a scenario when it holds more of
+    the words only that scenario says than of the words only the other
+    scenarios say. The best fit (the first count less the second) comes
+    first, then the higher request score (the window more about this
+    request), then the window holding more of the scenario's own words. A
+    scenario saying nothing the others do not say has no window of its own.
+    """
+    pool: list[tuple[int, dict[str, Any]]] = []
+    seen: set[tuple[str, int, int]] = set()
+    asked = [i for i in order if from_request[i]] or list(order)
+    for index in asked:
+        for window in candidates[index]:
+            key = (window["path"], window["first_line"], window["last_line"])
+            if key in seen or not _under(window["path"], test_roots):
+                continue
+            seen.add(key)
+            pool.append((index, window))
+    tokens = [_window_tokens(window) for _, window in pool]
+    stems = [set(words) for words in scenarios]
+    fits: list[list[tuple[int, int, dict[str, Any]]]] = []
+    for position, own in enumerate(stems):
+        others = set().union(*(s for i, s in enumerate(stems) if i != position))
+        only_mine, only_theirs = own - others, others - own
+        rows = []
+        for (index, window), held in zip(pool, tokens):
+            mine, theirs = len(only_mine & held), len(only_theirs & held)
+            if mine and mine > theirs:
+                rows.append((mine - theirs, mine, window.get("score", 0), index, window))
+        rows.sort(
+            key=lambda row: (-row[0], -row[2], -row[1], row[4]["path"], row[4]["first_line"])
+        )
+        fits.append([(index, fit, window) for fit, _m, _s, index, window in rows])
+    return fits
 
 
 # ---------------------------------------------------------------------------
@@ -360,6 +495,8 @@ def choose_windows(
     from_request: Sequence[bool],
     max_windows: int = MAX_EVIDENCE_WINDOWS,
     max_chars: int = MAX_EVIDENCE_CHARS,
+    scenarios: Sequence[Sequence[str]] = (),
+    test_roots: Sequence[str] = (),
 ) -> None:
     """Choose the windows the planner is shown, across all the words, in place.
 
@@ -384,6 +521,24 @@ def choose_windows(
       window text, whichever comes first, so the windows use what the set
       candidates leave of the budget.
 
+    A TEST FOR EACH SCENARIO (8 October 2026). The planner may answer "already
+    done" only when every approved scenario has a test it was shown and can
+    cite. On the deactivate request the tests for the two error scenarios
+    were shown and the one for "A user is successfully deactivated" was not,
+    though the repository had two: their windows scored below the
+    documentation's, sat in files already shown, and the budget was spent on
+    one-per-file windows of a word only the error scenario said. So the
+    planner planned "verify" tasks instead. Now, after the first round (each
+    word's best window, which is where the code the request names comes
+    in) and before the others, each scenario in ``scenarios`` (each one's
+    words, from :func:`scenario_words`) takes the window under
+    ``test_roots`` (the project's declared test folders) that best fits it,
+    if one does (see :func:`_scenario_windows`), in a file already shown or
+    not. A scenario whose best window is already shown takes no second one.
+    These windows count against the same limits, and together take at most
+    half of the windows and half of the characters. Without ``scenarios``
+    or ``test_roots`` nothing changes.
+
     Each entry gets ``evidence`` (when any window was chosen for it) and
     ``more_hits``: every hit of its word not inside a window shown, read or
     not. Each window carries private ``_covers`` (its own word's hits it
@@ -398,33 +553,60 @@ def choose_windows(
     shown_files: set[str] = set()
     used = 0
 
-    def take(index: int, new_file_only: bool) -> bool:
+    def shown(window: Mapping[str, Any]) -> bool:
+        return any(
+            _holds(w, window["path"], window["_hit"]) or _mostly_shown(window, w)
+            for _, w in chosen
+        )
+
+    def add(index: int, window: dict[str, Any]) -> None:
         nonlocal used
+        chosen.append((index, window))
+        shown_files.add(window["path"])
+        used += len(window["text"])
+
+    def take(index: int, new_file_only: bool) -> bool:
         for window in candidates[index]:
-            path = window["path"]
-            if new_file_only and path in shown_files:
+            if new_file_only and window["path"] in shown_files:
                 continue
-            if any(_holds(w, path, window["_hit"]) for _, w in chosen):
-                continue
-            if any(_mostly_shown(window, w) for _, w in chosen):
+            if shown(window):
                 continue
             if used + len(window["text"]) > max_chars:
                 continue
-            chosen.append((index, window))
-            shown_files.add(path)
-            used += len(window["text"])
+            add(index, window)
             return True
         return False
 
+    def one_round(new_file_only: bool) -> bool:
+        progress = False
+        for index in order:
+            if len(chosen) >= max_windows:
+                break
+            if take(index, new_file_only):
+                progress = True
+        return progress
+
+    # Each word's best window in a file not yet shown: the code the request
+    # names comes first, then each scenario's test, then the rest in rounds.
+    one_round(True)
+    if scenarios and test_roots:
+        taken = taken_chars = 0
+        for fitting in _scenario_windows(candidates, order, from_request, scenarios, test_roots):
+            if taken >= max_windows // _SCENARIO_SHARE or len(chosen) >= max_windows:
+                break
+            for index, _fit, window in fitting:
+                if shown(window):
+                    break  # this scenario's best test is already shown
+                size = len(window["text"])
+                if taken_chars + size > max_chars // _SCENARIO_SHARE or used + size > max_chars:
+                    continue
+                window["_scenario"] = True
+                add(index, window)
+                taken, taken_chars = taken + 1, taken_chars + size
+                break
     for new_file_only in (True, False):
-        progress = True
-        while progress and len(chosen) < max_windows:
-            progress = False
-            for index in order:
-                if len(chosen) >= max_windows:
-                    break
-                if take(index, new_file_only):
-                    progress = True
+        while len(chosen) < max_windows and one_round(new_file_only):
+            pass
     for _index, window in chosen:
         window["_covers"] = 0
         window["_covers_other"] = {}
@@ -634,13 +816,14 @@ def trim_to_budget(
 
     Each part is guaranteed half of ``budget``, and what one part does not
     use goes to the other. Past its share the windows lose their
-    lowest-scoring ones first (the later word's on a tie); each one's hits
+    lowest-scoring ones first (the later word's on a tie), and a scenario's
+    own test window (:func:`choose_windows`) only after every other; each one's hits
     are added to its entry's ``more_hits``, and the other words' hits it
     alone showed to theirs. Past theirs the candidates lose
     lines, second lines before first ones, from the lowest-ranked candidate
     up; each entry counts them in ``lines_trimmed`` and is no longer
-    ``listed_all``. The private ``_covers`` and ``_covers_other`` counts are
-    always removed.
+    ``listed_all``. The private ``_covers``, ``_covers_other`` and
+    ``_scenario`` marks are always removed.
     Returns ``{"chars_before", "chars_after", "windows_trimmed",
     "lines_trimmed"}``.
     """
@@ -654,13 +837,13 @@ def trim_to_budget(
     windows_trimmed = lines_trimmed = 0
     ranked = sorted(
         (
-            (window.get("score", 0), -index, -position, index, window)
+            (bool(window.get("_scenario")), window.get("score", 0), -index, -position, index, window)
             for index, entry in enumerate(entries)
             for position, window in enumerate(entry.get("evidence") or [])
         ),
-        key=lambda row: (row[0], row[1], row[2]),
+        key=lambda row: (row[0], row[1], row[2], row[3]),
     )
-    for _score, _i, _p, index, window in ranked:
+    for _scenario, _score, _i, _p, index, window in ranked:
         if total <= windows_allowed:
             break
         entry = entries[index]
@@ -695,6 +878,7 @@ def trim_to_budget(
         for window in entry.get("evidence") or []:
             window.pop("_covers", None)
             window.pop("_covers_other", None)
+            window.pop("_scenario", None)
     return {
         "chars_before": before,
         "chars_after": windows_after + total,

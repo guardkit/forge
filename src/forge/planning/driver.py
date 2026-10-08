@@ -125,6 +125,7 @@ from forge.planning.code_evidence import (
     is_factory_file,
     quantified_phrases,
     request_words,
+    scenario_words,
     set_candidates,
     trim_to_budget,
 )
@@ -11605,6 +11606,7 @@ class PlanningRunDriver:
         partial: list[str] | None = None,
         request_text: str = "",
         evidence_chars: int | Callable[[], int] = MAX_EVIDENCE_CHARS,
+        test_roots: Sequence[str] = (),
     ) -> list[dict[str, Any]] | None:
         """Where this feature's own words already occur in the repository.
 
@@ -11685,6 +11687,14 @@ class PlanningRunDriver:
         singular are one word, looked for as the shorter (``ETag`` finds
         ``ETags``). Up to :data:`_MAX_SPEC_WORDS_TRIED` words are tried to
         find :data:`_MAX_SPEC_WORDS_LOOKED_FOR` the repository holds.
+
+        A TEST FOR EACH SCENARIO (8 October 2026). Each approved scenario
+        first takes the window in ``test_roots`` (the project's declared test
+        folders) that best fits its own words, when one fits, so the planner
+        is shown a test it can cite for each scenario (on the deactivate
+        request it was shown the error scenarios' tests and not the success
+        one's, and could not answer "already done"). See
+        :func:`~forge.planning.code_evidence.choose_windows`.
 
         A SEARCH THAT STOPS PART-WAY (6 October 2026) keeps every word
         already looked up and says so in ``partial``: it is a part read,
@@ -11819,6 +11829,8 @@ class PlanningRunDriver:
                 from_request=found_in_request,
                 max_windows=MAX_EVIDENCE_WINDOWS,
                 max_chars=evidence_chars() if callable(evidence_chars) else evidence_chars,
+                scenarios=[words for _title, words in scenario_words(spec_feature)],
+                test_roots=test_roots,
             )
             for entry in found:
                 # The keys in the order the plan-writer has always read them.
@@ -12119,6 +12131,7 @@ class PlanningRunDriver:
             partial=partial,
             request_text=request_text,
             evidence_chars=sets_then_window_share,
+            test_roots=test_roots,
         )
         if "sets" not in searched:
             # No word to look for, or the search could not run: the set
