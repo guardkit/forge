@@ -1125,9 +1125,8 @@ def _possible_contradiction_text(
 #: (rule 45, the spec's own words). ``{changes}`` is the what-changed
 #: sentence from :func:`_plain_card_changes`.
 _PROVABILITY_REWRITTEN_CARD_LINE = (
-    "The machine rewrote {n} of the worked examples so they can be proven "
-    "(they described the database or the code rather than what a caller "
-    "sees). What changed: {changes}."
+    "The machine rewrote {n} of the worked examples after their provability "
+    "check. What changed: {changes}."
 )
 
 #: Where the plan leg's approved record carries that line for the build gate
@@ -1194,26 +1193,30 @@ _PROVABILITY_NOT_WIRED_DETAIL = (
 # The machine rewrites on a refusal before it asks (2026-09-06).
 #
 # Two of Rich's sentences that weekend stopped at the plan stage because the
-# spec writer wrote worked examples the routing law could not prove — examples
-# about a migration or a column instead of about what a caller sees at the
-# endpoint. The law was right to refuse; the machine was wrong to ask a person
-# to fix what it could have fixed itself. So the plan leg now sends the
-# refused examples back to the spec writer ONCE, as its own note, exactly as
-# an owner's note is sent, and stamps again. Only a second refusal asks.
+# routing law could not prove some worked examples. The law was right to
+# refuse; the machine was wrong to ask a person to repair its draft. So the
+# plan leg sends the refused titles back to the spec writer ONCE, as its own
+# note, exactly as an owner's note is sent, and stamps again. The note is
+# stack-neutral and bounded by the request/context the writer can actually
+# read. Only a second refusal asks.
 # ---------------------------------------------------------------------------
 
 #: The machine's note to the spec writer — the refused titles verbatim, one
 #: per line, and one ask. Rule 2 of the lane's spec; the words are the spec's.
 _MACHINE_REWRITE_NOTE = (
-    "These worked examples cannot be proven as written, because they describe "
-    "the database or the code rather than what a caller sees:\n"
+    "These worked examples cannot be proven as written:\n"
     "{titles}\n"
     "\n"
-    "Rewrite each of them as what can be proven, keeping the behaviour itself "
-    "unchanged: a request to the endpoint and the reply it gets (the method and "
-    "path, the status code, and what is in the body), or, for behaviour one "
-    "request cannot show — two requests at once, timing — the repository test "
-    "that proves it, named. Keep every other worked example exactly as it is."
+    "Revise only these examples using facts in the supplied request and context. "
+    "Keep the behaviour each example specifies unchanged, including its "
+    "concurrency, timing, and other multi-interaction behaviour; never turn that "
+    "behaviour into sequential or single-interaction behaviour. Describe only "
+    "what a caller or user can observe through the interface the request or "
+    "context actually supplies (for example, an HTTP, command, screen, or message "
+    "interface). Do not invent an interface, status, field, implementation detail, "
+    "test name, or verifier. If the supplied facts cannot support a faithful "
+    "provable revision, leave that example unchanged; do not add an assumption or "
+    "ask a question. Keep every other worked example exactly as it is."
 )
 
 #: The note's author on every receipt: the machine, never a person.
@@ -1302,8 +1305,8 @@ _ASSUMPTION_REMOVED_CARD_LINE = (
 #: (rule 5). The spec card is not shown again; the three touches stand.
 _MACHINE_REWRITE_LINE = (
     "{n} of the worked examples could not be proven as written, so the machine "
-    "asked the spec writer to rewrite them as what the endpoint does. What "
-    "changed: {changes}. The plan carries on."
+    "asked the spec writer to express their behaviour through the supplied "
+    "interface. What changed: {changes}. The plan carries on."
 )
 
 #: The one sentence at the top of the plan-stop card when the rewrite did not
@@ -1315,8 +1318,8 @@ _MACHINE_REWRITE_LINE = (
 #: the checker refused stops, after the model's turn, with the note-refused
 #: sentence below and the model's own sentence after it (rule 6b).
 _MACHINE_REWRITE_STOP_SENTENCE = (
-    "The machine already asked the spec writer once to rewrite these as what "
-    "the endpoint does; the rewrite {why}."
+    "The machine already asked the spec writer once to express these as "
+    "observable behaviour through the supplied interface; the rewrite {why}."
 )
 _REWRITE_STILL_UNPROVEN = "still could not be proven"
 _REWRITE_CHANGED_NOTHING = "changed nothing"
@@ -1353,8 +1356,9 @@ _REWRITE_CHANGED_NOTHING_WHY = "the rewrite changed nothing"
 #: the real word from the second stamping's stamped map.
 _MACHINE_REWRITE_MODEL_LINE = (
     "{n} of the worked examples could not be proven as written; the spec "
-    "writer could not rewrite {it} as what the endpoint does ({why}), so the "
-    "model fallback decided {its_verifier}: {decided}. The plan carries on."
+    "writer could not express {it} as observable behaviour through the supplied "
+    "interface ({why}), so the model fallback decided {its_verifier}: {decided}. "
+    "The plan carries on."
 )
 
 #: What the owner reads when the spec writer's revision round is refused by
@@ -1375,10 +1379,10 @@ _NOTE_REFUSED_MESSAGE = (
 _MACHINE_NOTE_REFUSED_MESSAGE = (
     "Planning run {correlation_id} stopped at {stage}: {count} of the worked "
     "examples could not be proven as written, and when the machine asked the "
-    "spec writer to rewrite them as what the endpoint does, the checker refused "
-    "the rewrite twice ({reason}). Nothing was built. To try again, send the "
-    "sentence as what the endpoint does: the method and path, the status code, "
-    "and what is in the reply."
+    "spec writer to express their behaviour through the supplied interface, the "
+    "checker refused the rewrite twice ({reason}). Nothing was built. To try "
+    "again, state the intended interface and its observable behaviour explicitly "
+    "in the sentence or supplied context, without unsupported details."
 )
 
 #: The commit that puts the approved spec back on the planning branch when the

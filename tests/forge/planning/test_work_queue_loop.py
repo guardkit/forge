@@ -1606,11 +1606,11 @@ MACHINE_REASON = (
 OWNER_SENTENCE = (
     "Planning run 696a3e38 stopped at writing the task plan: 1 of the worked "
     "examples could not be proven as written, and when the machine asked the "
-    "spec writer to rewrite them as what the endpoint does, the checker "
-    "refused the rewrite twice (the rewritten example still described the "
-    "database). Nothing was built. To try again, send the sentence as what "
-    "the endpoint does: the method and path, the status code, and what is in "
-    "the reply."
+    "spec writer to express their behaviour through the supplied interface, the "
+    "checker refused the rewrite twice (the rewritten example still described the "
+    "database). Nothing was built. To try again, state the intended interface and "
+    "its observable behaviour explicitly in the sentence or supplied context, "
+    "without unsupported details."
 )
 
 

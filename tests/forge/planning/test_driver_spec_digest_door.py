@@ -2523,23 +2523,26 @@ _HOMED_TITLE = "Version endpoint returns the running build"
 
 #: Rule 2's note, the spec's own words, with the fixture's refused title.
 _PRE_CARD_NOTE = (
-    "These worked examples cannot be proven as written, because they describe "
-    "the database or the code rather than what a caller sees:\n"
+    "These worked examples cannot be proven as written:\n"
     f"- {_REFUSED_TITLE}\n"
     "\n"
-    "Rewrite each of them as what can be proven, keeping the behaviour itself "
-    "unchanged: a request to the endpoint and the reply it gets (the method and "
-    "path, the status code, and what is in the body), or, for behaviour one "
-    "request cannot show — two requests at once, timing — the repository test "
-    "that proves it, named. Keep every other worked example exactly as it is."
+    "Revise only these examples using facts in the supplied request and context. "
+    "Keep the behaviour each example specifies unchanged, including its "
+    "concurrency, timing, and other multi-interaction behaviour; never turn that "
+    "behaviour into sequential or single-interaction behaviour. Describe only "
+    "what a caller or user can observe through the interface the request or "
+    "context actually supplies (for example, an HTTP, command, screen, or message "
+    "interface). Do not invent an interface, status, field, implementation detail, "
+    "test name, or verifier. If the supplied facts cannot support a faithful "
+    "provable revision, leave that example unchanged; do not add an assumption or "
+    "ask a question. Keep every other worked example exactly as it is."
 )
 _PRE_CARD_AUTHOR = "planning-driver (stamp normalizer refusal)"
 
 #: Rule 45's two lines, the spec's own words, with the fixture's numbers.
 _REWROTE_LINE = (
-    "The machine rewrote 1 of the worked examples so they can be proven (they "
-    "described the database or the code rather than what a caller sees). What "
-    "changed: 1 example changed."
+    "The machine rewrote 1 of the worked examples after their provability check. "
+    "What changed: 1 example changed."
 )
 _UNPROVABLE_LINE = (
     f"1 of the worked examples cannot be proven as written: “{_REFUSED_TITLE}”. "
@@ -2547,7 +2550,7 @@ _UNPROVABLE_LINE = (
     "or send a note."
 )
 
-#: The rewrite: the refused example said as what the endpoint does.
+#: The rewrite: the refused example said as observable interface behaviour.
 _REWRITTEN_FEATURE = FEATURE_TEXT.replace(
     "    When an unpublished format is asked for\n    Then the request is refused\n",
     "    When GET /version?format=xml is sent\n    Then the reply is 406\n",
