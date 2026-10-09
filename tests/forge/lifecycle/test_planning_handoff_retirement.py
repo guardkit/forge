@@ -133,3 +133,35 @@ def test_reader_joins_caller_transaction(tmp_path: Path) -> None:
     assert retired_planning_handoff_correlations(connection) == frozenset({CORRELATION})
     assert connection.in_transaction
     connection.rollback()
+
+
+def test_deep_selected_json_is_a_named_refusal(tmp_path: Path) -> None:
+    db_path = tmp_path / "forge.db"
+    connection, event_ids = make_planning_ledger(db_path, version=18)
+    deep = (
+        '{"planning_handoff_retirement":'
+        + "[" * 16000
+        + "0"
+        + "]" * 16000
+        + "}"
+    )
+    add_planning_retirement(connection, event_ids, details=deep)
+    connection.commit()
+    connection.close()
+
+    with pytest.raises(PlanningHandoffRetirementError, match="not valid JSON"):
+        preflight_retired_planning_handoff_correlations(db_path)
+
+
+def test_deep_unselected_ordinary_json_is_tolerated(tmp_path: Path) -> None:
+    db_path = tmp_path / "forge.db"
+    connection, _ = make_planning_ledger(db_path, version=18)
+    ordinary_deep = '{"ordinary":' + "[" * 16000 + "0" + "]" * 16000 + "}"
+    connection.execute(
+        "UPDATE planning_run_events SET details_json=? WHERE id=1",
+        (ordinary_deep,),
+    )
+    connection.commit()
+    connection.close()
+
+    assert preflight_retired_planning_handoff_correlations(db_path) == frozenset()
