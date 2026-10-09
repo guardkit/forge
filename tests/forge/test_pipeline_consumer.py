@@ -483,6 +483,47 @@ class TestPlanningHandoffRetirementGuard:
         deps.publish_build_failed.assert_not_called()
         connection.close()
 
+    @pytest.mark.asyncio
+    async def test_real_deep_malformed_receipt_holds_without_ack(
+        self,
+        tmp_path: Path,
+        forge_config: ForgeConfig,
+        allowlist_root: Path,
+    ) -> None:
+        db_path = tmp_path / "forge.db"
+        connection, event_ids = make_planning_ledger(db_path, version=18)
+        deep = (
+            '{"planning_handoff_retirement":'
+            + "[" * 16000
+            + "0"
+            + "]" * 16000
+            + "}"
+        )
+        add_planning_retirement(connection, event_ids, details=deep)
+        connection.commit()
+        pool = SqliteLifecyclePersistence(connection=connection, db_path=db_path)
+        dispatch = AsyncMock()
+        publish_failed = AsyncMock()
+        deps = PipelineConsumerDeps(
+            forge_config=forge_config,
+            is_duplicate_terminal=AsyncMock(return_value=False),
+            dispatch_build=dispatch,
+            publish_build_failed=publish_failed,
+            retired_planning_handoffs=_build_retired_planning_handoffs_reader(pool),
+        )
+        msg = _make_msg(
+            _envelope_bytes(_valid_payload_dict(allowlist_root / "feature.yaml"))
+        )
+
+        await handle_message(msg, deps)
+
+        msg.ack.assert_not_called()
+        msg.nak.assert_not_called()
+        dispatch.assert_not_called()
+        publish_failed.assert_not_called()
+        deps.is_duplicate_terminal.assert_not_called()
+        connection.close()
+
 
 # ---------------------------------------------------------------------------
 # AC-008: ack is called exactly once

@@ -124,11 +124,14 @@ def strict_json_loads(value: str) -> object:
     def invalid_constant(value: str) -> object:
         raise ValueError(f"non-standard JSON constant {value!r}")
 
-    return json.loads(
-        value,
-        object_pairs_hook=unique_object,
-        parse_constant=invalid_constant,
-    )
+    try:
+        return json.loads(
+            value,
+            object_pairs_hook=unique_object,
+            parse_constant=invalid_constant,
+        )
+    except RecursionError as exc:
+        raise ValueError("JSON nesting exceeds the decoder limit") from exc
 
 
 def _fail(message: str) -> PlanningHandoffRetirementError:
