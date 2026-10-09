@@ -37,7 +37,7 @@ PUBLISHER_RUNTIME = 'sha256:dd5281444ec7fbe6f13473331c693383d458819b72789a858153
 # The ledger schema version this helper knows. Rich, 4 October 2026: "Teach it
 # version 17" (17 adds the builds.source_commit column and no table). Every
 # check below uses this one constant.
-LEDGER_SCHEMA_VERSION = 17
+LEDGER_SCHEMA_VERSION = 18
 WORK_TABLES = {'builds': 1, 'planning_runs': 3, 'work_queue': 10, 'publication_records': 15, 'deployment_targets': 16}
 
 # Temporary-folder names an estate env file may set for the sandbox (TMPDIR is

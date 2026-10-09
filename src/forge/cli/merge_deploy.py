@@ -178,6 +178,18 @@ async def _arun(
 
     pool = _open_pool(_resolve_db_path())
     row = _resolve_build_row(pool, feature_id, build_id)
+    # Refuse permanent retirement immediately after selecting the build,
+    # before repository resolution, git/sandbox work or backend connections.
+    from forge.lifecycle.merge_retirement import (
+        MergeRetired,
+        MergeRetirementError,
+        refuse_retired_build,
+    )
+
+    try:
+        refuse_retired_build(pool.connection, row.build_id)
+    except (MergeRetired, MergeRetirementError) as exc:
+        raise click.ClickException(str(exc)) from exc
 
     paths = config.planning.target_repo_paths
     if row.repo not in paths:

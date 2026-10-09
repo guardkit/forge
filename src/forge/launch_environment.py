@@ -103,6 +103,8 @@ __all__ = [
     "GUARDKIT_FACTORY_LAUNCH_ENV",
     "GUARDKIT_MEMORY_PROJECT_ENV",
     "GUARDKIT_RUN_OWNER_ENV",
+    "GUARDKIT_FEATURE_ROUTING_ID_ENV",
+    "GUARDKIT_FEATURE_ROUTING_REQUIRED_ENV",
     "LAUNCH_SETTINGS",
     "MAX_DECLARED_SETTINGS",
     "MAX_DECLARED_NAME_LENGTH",
@@ -140,10 +142,18 @@ GUARDKIT_FACTORY_LAUNCH_ENV: str = "GUARDKIT_FACTORY_LAUNCH"
 #: Decided from the build's own record (its build ID), like the memory name,
 #: and never inherited.
 GUARDKIT_RUN_OWNER_ENV: str = "GUARDKIT_RUN_OWNER"
+GUARDKIT_FEATURE_ROUTING_ID_ENV: str = "GUARDKIT_FEATURE_ROUTING_ID"
+GUARDKIT_FEATURE_ROUTING_REQUIRED_ENV: str = "GUARDKIT_FEATURE_ROUTING_REQUIRED"
 
 #: The three settings decided per launch rather than taken from the parent.
 _DECIDED_PER_LAUNCH: frozenset[str] = frozenset(
-    {GUARDKIT_MEMORY_PROJECT_ENV, GUARDKIT_FACTORY_LAUNCH_ENV, GUARDKIT_RUN_OWNER_ENV}
+    {
+        GUARDKIT_MEMORY_PROJECT_ENV,
+        GUARDKIT_FACTORY_LAUNCH_ENV,
+        GUARDKIT_RUN_OWNER_ENV,
+        GUARDKIT_FEATURE_ROUTING_ID_ENV,
+        GUARDKIT_FEATURE_ROUTING_REQUIRED_ENV,
+    }
 )
 
 
@@ -545,6 +555,8 @@ def build_launch_env(
     memory_project: str | None = None,
     declared: Sequence[str] | Iterable[str] | None = None,
     run_owner: str | None = None,
+    feature_routing_id: str | None = None,
+    feature_routing_required: bool = False,
 ) -> dict[str, str]:
     """The environment a build is launched with: the named list and nothing else.
 
@@ -607,4 +619,16 @@ def build_launch_env(
         env[GUARDKIT_MEMORY_PROJECT_ENV] = str(memory_project).strip()
     if run_owner and str(run_owner).strip():
         env[GUARDKIT_RUN_OWNER_ENV] = str(run_owner).strip()
+    if feature_routing_id is not None:
+        from forge.lifecycle.feature_routing import validate_feature_routing_id
+
+        env[GUARDKIT_FEATURE_ROUTING_ID_ENV] = validate_feature_routing_id(
+            feature_routing_id
+        )
+    if feature_routing_required:
+        if feature_routing_id is None:
+            raise ValueError(
+                "required feature routing launch has no admitted routing identity"
+            )
+        env[GUARDKIT_FEATURE_ROUTING_REQUIRED_ENV] = "1"
     return env

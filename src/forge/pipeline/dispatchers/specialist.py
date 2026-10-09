@@ -579,6 +579,9 @@ async def dispatch_specialist_stage(
     retry_of: str | None = None,
     request_text: str | None = None,
     extra_command_args: Mapping[str, Any] | None = None,
+    feature_routing_id: str | None = None,
+    feature_routing_gate: Any | None = None,
+    feature_routing_required: bool = False,
 ) -> StageDispatchResult:
     """Dispatch one specialist stage (PRODUCT_OWNER or ARCHITECT).
 
@@ -666,6 +669,22 @@ async def dispatch_specialist_stage(
             f"{sorted(s.value for s in SPECIALIST_STAGES)}",
         )
 
+    if feature_routing_id is not None:
+        from forge.lifecycle.feature_routing import validate_feature_routing_id
+
+        feature_routing_id = validate_feature_routing_id(feature_routing_id)
+    if feature_routing_required and feature_routing_id is None:
+        raise ValueError("required specialist dispatch has no feature_routing_id")
+    if feature_routing_id is not None:
+        if feature_routing_gate is None and feature_routing_required:
+            raise ValueError("required specialist dispatch has no durable routing gate")
+        if feature_routing_gate is not None:
+            await feature_routing_gate.ensure_seeded(
+                feature_routing_id,
+                origin_kind="planning",
+                origin_id=correlation_id,
+            )
+
     capability = SPECIALIST_CAPABILITY_BY_STAGE[stage]
     # Intent-pattern fallback (TASK-FWD-PLAN-PODISCO). The exact tool name
     # above stays the first-choice; this intent is what the resolver falls
@@ -702,6 +721,8 @@ async def dispatch_specialist_stage(
         context_entries=context_entries,
         extra_command_args=extra_command_args,
     )
+    if feature_routing_id is not None:
+        command_args["feature_routing_id"] = feature_routing_id
     missing_args = [
         name
         for name in SPECIALIST_REQUIRED_ARGS_BY_STAGE.get(stage, ())

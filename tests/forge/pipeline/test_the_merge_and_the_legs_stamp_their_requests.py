@@ -65,6 +65,7 @@ from forge.cli._serve_conductor import make_conductor_guardkit_run_chooser
 from forge.config.models import ForgeConfig
 from forge.deploy_sidecar.service import COORDINATOR_OWNER_ENV, build_server
 from forge.lifecycle import migrations
+from forge.lifecycle.feature_routing import FeatureRoutingReceipt
 from forge.lifecycle.persistence import SqliteLifecyclePersistence
 from forge.pipeline.dispatchers.conductor_subprocess import (
     make_conductor_subprocess_dispatcher,
@@ -454,7 +455,12 @@ class _APoolOfOneRow:
 
 
 async def _a_leg(
-    *, config: ForgeConfig, row: _Row, stage: StageClass = StageClass.TASK_REVIEW
+    *,
+    config: ForgeConfig,
+    row: _Row,
+    stage: StageClass = StageClass.TASK_REVIEW,
+    feature_routing_gate: Any | None = None,
+    feature_routing_required: bool = False,
 ) -> Any:
     """One fix-journey leg, chooser and dispatcher both the real ones."""
     pool = _APoolOfOneRow(row)
@@ -471,6 +477,8 @@ async def _a_leg(
         stage_log_writer=_NoStageLog(),
         subprocess_runner=runner_for(row.build_id),
         correlation_id_minter=lambda **_kw: "corr-leg",
+        feature_routing_gate=feature_routing_gate,
+        feature_routing_required=feature_routing_required,
     )
     return await dispatcher(stage=stage, build_id=row.build_id, feature_id=None)
 
@@ -513,6 +521,39 @@ class _NoStageLog:
 
 
 class TestAJourneysLegStampsItsOwnRequest:
+    @pytest.mark.asyncio
+    async def test_the_committed_receipt_reaches_the_sidecar_request_exactly(
+        self, project, start_commit, helper
+    ) -> None:
+        worktree = _a_journey_worktree(project)
+        receipt = FeatureRoutingReceipt(
+            feature_routing_id=CORRELATION,
+            attempt_id="exact-attempt",
+            server_id=2,
+        )
+
+        class _Gate:
+            async def ensure_seeded(self, *_args: Any, **_kwargs: Any) -> Any:
+                return receipt
+
+        outcome = await _a_leg(
+            config=_config(project, sandbox_url=helper.url),
+            row=_Row(
+                build_id=BUILD_ID,
+                repo=REPO,
+                start_commit=start_commit,
+                worktree_path=str(worktree),
+            ),
+            feature_routing_gate=_Gate(),
+            feature_routing_required=True,
+        )
+
+        sent = helper.only("/guardkit-leg")
+        assert sent, getattr(outcome, "rationale", outcome)
+        assert sent[0]["feature_routing_id"] == CORRELATION
+        assert sent[0]["feature_routing_required"] is True
+        assert sent[0]["feature_routing_receipt"] == receipt.to_wire()
+
     @pytest.mark.asyncio
     async def test_the_leg_carries_its_build_and_the_rows_recorded_commit(
         self, project, start_commit, helper, tmp_path

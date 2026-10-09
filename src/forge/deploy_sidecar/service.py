@@ -2470,6 +2470,9 @@ def run_merge_command(
     extra_env: dict[str, str] | None = None,
     memory_project: str | None = None,
     launch_settings: Sequence[str] | None = None,
+    feature_routing_id: str | None = None,
+    feature_routing_required: bool = False,
+    feature_routing_receipt: object = None,
 ) -> tuple[int, str, str]:
     """Run one fixed argument list with no shell; return exit code and output.
 
@@ -2544,13 +2547,50 @@ def run_merge_command(
     passed. A project that has declared nothing gets the factory's list, which
     is the honest state rather than a hidden one.
     """
+    # This is the sidecar's last local subprocess boundary.  The HTTP handler
+    # validates first as well, before it resolves repositories/settings/git;
+    # keeping the same check here protects direct runner callers and makes a
+    # required launch structurally unable to spawn without its receipt.
+    try:
+        from forge.lifecycle.feature_routing import (
+            validate_feature_routing_launch_receipt,
+        )
+
+        feature_routing_id, _canonical_receipt = (
+            validate_feature_routing_launch_receipt(
+                feature_routing_id,
+                feature_routing_receipt,
+                required=feature_routing_required,
+            )
+        )
+    except (RuntimeError, ValueError) as exc:
+        return (
+            MERGE_NOT_STARTED_EXIT_CODE,
+            "",
+            f"{what} refused feature routing authority: {exc}",
+        )
+
     env = build_launch_env(
         parent=os.environ,
         memory_project=memory_project,
         declared=launch_settings,
+        feature_routing_id=feature_routing_id,
+        feature_routing_required=feature_routing_required,
     )
+    protected_routing = {
+        name: value
+        for name, value in env.items()
+        if name
+        in {
+            "GUARDKIT_FEATURE_ROUTING_ID",
+            "GUARDKIT_FEATURE_ROUTING_REQUIRED",
+        }
+    }
     if extra_env:
         env |= extra_env
+    # Driver/profile environment is additive, but routing authority is decided
+    # by the coordinator and cannot be replaced by a project-supplied value.
+    env |= protected_routing
     try:
         process = subprocess.Popen(  # noqa: S603 — fixed argv, no shell
             argv,
@@ -2663,6 +2703,15 @@ def process_guardkit_merge_request(
     """
     if not isinstance(payload, dict):
         return 400, {"error": "request body must be a JSON object"}
+
+    (
+        feature_routing_id,
+        feature_routing_required,
+        feature_routing_receipt,
+        routing_error,
+    ) = _feature_routing_fields(payload, what="merge")
+    if routing_error is not None:
+        return 400, {"error": routing_error}
 
     # The repository must be one the forge configuration already names.
     repo = payload.get("repo")
@@ -2907,7 +2956,7 @@ def process_guardkit_merge_request(
         timeout,
     )
     try:
-        exit_code, stdout, stderr = merge_runner(
+        runner_kwargs: dict[str, Any] = dict(
             argv=argv,
             cwd=str(repo_path),
             timeout=timeout,
@@ -2920,6 +2969,12 @@ def process_guardkit_merge_request(
             memory_project=memory_project,
             launch_settings=launch_settings,
         )
+        if feature_routing_id is not None or feature_routing_required:
+            runner_kwargs["feature_routing_id"] = feature_routing_id
+            runner_kwargs["feature_routing_required"] = feature_routing_required
+        if feature_routing_receipt is not None:
+            runner_kwargs["feature_routing_receipt"] = feature_routing_receipt
+        exit_code, stdout, stderr = merge_runner(**runner_kwargs)
     except Exception as exc:  # noqa: BLE001 — never raise past the boundary
         return 500, {
             "error": f"sidecar execution error: {type(exc).__name__}: {exc}",
@@ -3309,6 +3364,9 @@ def run_declared_check(
     normalizer_command: tuple[str, ...] | None = None,
     memory_project: str | None = None,
     launch_settings: Sequence[str] | None = None,
+    feature_routing_id: str | None = None,
+    feature_routing_required: bool = False,
+    feature_routing_receipt: object = None,
 ) -> PreCommitCheckOutcome:
     """Run one declared check in ``worktree`` and judge it the way the
     driver's closure judged it.
@@ -3352,13 +3410,19 @@ def run_declared_check(
         # Every check is launched with the factory's own named list, the
         # project's own declared names, and the memory this work belongs to —
         # the same three things every other launch of the build system gets.
-        return check_runner(
+        kwargs: dict[str, Any] = dict(
             argv=argv,
             cwd=str(worktree),
             timeout=check.timeout,
             memory_project=memory_project,
             launch_settings=launch_settings,
         )
+        if feature_routing_id is not None or feature_routing_required:
+            kwargs["feature_routing_id"] = feature_routing_id
+            kwargs["feature_routing_required"] = feature_routing_required
+        if feature_routing_receipt is not None:
+            kwargs["feature_routing_receipt"] = feature_routing_receipt
+        return check_runner(**kwargs)
 
     try:
         if check.name == "normalize-stamps":
@@ -3577,6 +3641,9 @@ def _declared_checks_hook(
     normalizer_command: tuple[str, ...] | None = None,
     memory_project: str | None = None,
     launch_settings: Sequence[str] | None = None,
+    feature_routing_id: str | None = None,
+    feature_routing_required: bool = False,
+    feature_routing_receipt: object = None,
 ) -> Callable[[Path], Awaitable[PreCommitResult]]:
     """The pre-commit hook the in-container runner takes, built from the
     declaration: each check in order, in a worker thread (the runner is
@@ -3594,6 +3661,9 @@ def _declared_checks_hook(
                 normalizer_command=normalizer_command,
                 memory_project=memory_project,
                 launch_settings=launch_settings,
+                feature_routing_id=feature_routing_id,
+                feature_routing_required=feature_routing_required,
+                feature_routing_receipt=feature_routing_receipt,
             )
             outcomes.append(outcome)
             if check.blocking and not outcome.passed:
@@ -3656,6 +3726,14 @@ def process_git_write_tree_request(
     """
     if not isinstance(payload, dict):
         return 400, {"error": "request body must be a JSON object"}
+    (
+        feature_routing_id,
+        feature_routing_required,
+        feature_routing_receipt,
+        routing_error,
+    ) = _feature_routing_fields(payload, what="tree write")
+    if routing_error is not None:
+        return 400, {"error": routing_error}
     repo_path, error = _resolve_repo_key(payload, config)
     if error or repo_path is None:
         return 400, {"error": error}
@@ -3732,6 +3810,9 @@ def process_git_write_tree_request(
             normalizer_command=normalizer_command,
             memory_project=memory_project,
             launch_settings=launch_settings,
+            feature_routing_id=feature_routing_id,
+            feature_routing_required=feature_routing_required,
+            feature_routing_receipt=feature_routing_receipt,
         )
         if checks
         else None
@@ -5222,6 +5303,30 @@ def _leg_context_flags(
     return list(resolved.flags), warnings
 
 
+def _feature_routing_fields(
+    payload: Mapping[str, Any], *, what: str
+) -> tuple[str | None, bool, dict[str, object] | None, str | None]:
+    """Read and canonicalise routing authority before any side effect."""
+    required = payload.get("feature_routing_required", False)
+    if not isinstance(required, bool):
+        return None, False, None, "'feature_routing_required' must be true or false"
+    if required and payload.get("feature_routing_id") is None:
+        return None, required, None, f"required {what} has no feature_routing_id"
+    try:
+        from forge.lifecycle.feature_routing import (
+            validate_feature_routing_launch_receipt,
+        )
+
+        key, receipt = validate_feature_routing_launch_receipt(
+            payload.get("feature_routing_id"),
+            payload.get("feature_routing_receipt"),
+            required=required,
+        )
+    except (RuntimeError, ValueError) as exc:
+        return None, required, None, f"{what} feature routing is invalid: {exc}"
+    return key, required, receipt, None
+
+
 def process_guardkit_leg_request(
     payload: Any,
     *,
@@ -5258,6 +5363,14 @@ def process_guardkit_leg_request(
     """
     if not isinstance(payload, dict):
         return 400, {"error": "request body must be a JSON object"}
+    (
+        feature_routing_id,
+        feature_routing_required,
+        feature_routing_receipt,
+        routing_error,
+    ) = _feature_routing_fields(payload, what="guardkit leg")
+    if routing_error is not None:
+        return 400, {"error": routing_error}
     repo_path, error = _resolve_repo_key(payload, config)
     if error or repo_path is None:
         return 400, {"error": error}
@@ -5399,7 +5512,7 @@ def process_guardkit_leg_request(
         "on" if with_nats_streaming else "off",
     )
     try:
-        exit_code, stdout, stderr = leg_runner(
+        runner_kwargs: dict[str, Any] = dict(
             argv=argv,
             cwd=cwd,
             timeout=timeout,
@@ -5410,6 +5523,12 @@ def process_guardkit_leg_request(
             memory_project=memory_project,
             launch_settings=launch_settings,
         )
+        if feature_routing_id is not None or feature_routing_required:
+            runner_kwargs["feature_routing_id"] = feature_routing_id
+            runner_kwargs["feature_routing_required"] = feature_routing_required
+        if feature_routing_receipt is not None:
+            runner_kwargs["feature_routing_receipt"] = feature_routing_receipt
+        exit_code, stdout, stderr = leg_runner(**runner_kwargs)
     except Exception as exc:  # noqa: BLE001 — never raise past the boundary
         return 500, {
             "error": f"sidecar execution error: {type(exc).__name__}: {exc}",

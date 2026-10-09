@@ -64,6 +64,10 @@ services:
       # Never this machine's loopback address: the coordinator is not on this
       # machine's network any more.
       FORGE_NATS_URL: ${FORGE_NATS_URL:?name the bus in the env file, e.g. nats://nats:4222 - a service name on the factory network}
+      # Optional until feature routing is enabled for this estate.  Compose
+      # must still pass an operator-supplied router address into the
+      # coordinator; an empty value preserves the unopted deployment.
+      FORGE_FEATURE_ROUTER_URL: ${FORGE_FEATURE_ROUTER_URL:-}
       # THE RECORD. One file on the ledger volume, which this service is the
       # only writer of.
       FORGE_DB_PATH: /var/lib/forge/forge.db

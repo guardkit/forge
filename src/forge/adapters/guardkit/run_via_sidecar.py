@@ -309,6 +309,9 @@ def build_sidecar_guardkit_run(
         launch_settings: Sequence[str] | None = None,
         build: str | None = None,
         start_commit: str | None = None,
+        feature_routing_id: str | None = None,
+        feature_routing_required: bool = False,
+        feature_routing_receipt: object = None,
     ) -> GuardKitResult:
         started_at = time.monotonic()
 
@@ -390,6 +393,12 @@ def build_sidecar_guardkit_run(
             body["build"] = str(build)
         if start_commit:
             body["declared_at"] = str(start_commit)
+        if feature_routing_id is not None:
+            body["feature_routing_id"] = feature_routing_id
+        if feature_routing_required:
+            body["feature_routing_required"] = True
+        if feature_routing_receipt is not None:
+            body["feature_routing_receipt"] = feature_routing_receipt
         # THE BRANCH TRAVELS AS ITS OWN FIELD. The sidecar builds the command
         # on the far side, so a --branch left in this list would be dropped
         # and a fix journey's repair would be merged from a branch nobody
@@ -615,6 +624,9 @@ def build_sidecar_leg_run(
         launch_settings: Sequence[str] | None = None,
         build: str | None = None,
         start_commit: str | None = None,
+        feature_routing_id: str | None = None,
+        feature_routing_required: bool = False,
+        feature_routing_receipt: object = None,
     ) -> GuardKitResult:
         started_at = time.monotonic()
 
@@ -683,6 +695,12 @@ def build_sidecar_leg_run(
             body["build"] = str(build)
         if start_commit:
             body["declared_at"] = str(start_commit)
+        if feature_routing_id is not None:
+            body["feature_routing_id"] = feature_routing_id
+        if feature_routing_required:
+            body["feature_routing_required"] = True
+        if feature_routing_receipt is not None:
+            body["feature_routing_receipt"] = feature_routing_receipt
         http_timeout = float(timeout_seconds) + http_timeout_margin
         try:
             status, parsed = await asyncio.to_thread(

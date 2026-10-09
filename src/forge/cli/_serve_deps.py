@@ -303,6 +303,8 @@ def _build_resume_launcher(
     memory_project_reader: Callable[[str], str | None] | None = None,
     launch_settings_reader: Callable[[str], "Sequence[str]"] | None = None,
     source_commit_reader: Callable[[str], str | None] | None = None,
+    feature_routing_gate: Any | None = None,
+    feature_routing_required: bool = False,
 ) -> Callable[..., Any]:
     """Return the launch closure — ``dispatch_build`` minus ``record_pending_build``.
 
@@ -373,6 +375,7 @@ def _build_resume_launcher(
             if source_commit_reader is not None and build_id
             else None
         )
+        feature_routing_id = correlation_id or build_id
         if source_commit:
             return await dispatch_autobuild_async(
                 build_id=build_id,
@@ -389,6 +392,9 @@ def _build_resume_launcher(
                 memory_project=memory_project,
                 launch_settings=launch_settings,
                 source_commit=source_commit,
+                feature_routing_id=feature_routing_id,
+                feature_routing_gate=feature_routing_gate,
+                feature_routing_required=feature_routing_required,
             )
         return await dispatch_autobuild_async(
             build_id=build_id,
@@ -404,6 +410,9 @@ def _build_resume_launcher(
             budget=budget,
             memory_project=memory_project,
             launch_settings=launch_settings,
+            feature_routing_id=feature_routing_id,
+            feature_routing_gate=feature_routing_gate,
+            feature_routing_required=feature_routing_required,
         )
 
     return launch
@@ -416,6 +425,8 @@ def build_serve_resume_launcher(
     lifecycle_emitter: PipelineLifecycleEmitter,
     async_task_starter: AsyncTaskStarter | None,
     conductor_router: Callable[..., Any] | None = None,
+    feature_routing_gate: Any | None = None,
+    feature_routing_required: bool = False,
 ) -> Callable[..., Any]:
     """Compose the boot-time rearm resume launcher (TASK-GATE-D659 §D4.2).
 
@@ -491,6 +502,8 @@ def build_serve_resume_launcher(
         # The exact commit a prepared feature was admitted at (4 October
         # 2026); a resumed prepared build builds that commit, never the branch.
         getattr(sqlite_pool, "read_source_commit", None),
+        feature_routing_gate,
+        feature_routing_required,
     )
 
     async def guarded_launch(
@@ -817,6 +830,8 @@ def _build_dispatch_build(
     record_build_rejection: Callable[[str, str], Any] | None = None,
     prepared_build_admission: Callable[[Any], Awaitable[Any]] | None = None,
     reply_in_thread: BuildThreadReply | None = None,
+    feature_routing_gate: Any | None = None,
+    feature_routing_required: bool = False,
 ):
     """Return the production ``dispatch_build`` closure.
 
@@ -900,6 +915,8 @@ def _build_dispatch_build(
         # The exact commit a prepared feature was admitted at (4 October
         # 2026). ``None`` for every other build, whose launch is unchanged.
         getattr(sqlite_pool, "read_source_commit", None),
+        feature_routing_gate,
+        feature_routing_required,
     )
     clock = gate_clock or _utc_now
 
@@ -1125,6 +1142,28 @@ def _build_dispatch_build(
             """Interrupt a recovered build's recorded run before its card,
             refusal or relaunch. ``False``: it could not be sent; show no
             card, hold the message (no ack) — the redelivery tries again."""
+            if feature_routing_required:
+                try:
+                    if feature_routing_gate is None:
+                        raise RuntimeError("required feature routing gate is not wired")
+                    feature_routing_gate.require_committed_success(
+                        payload.correlation_id
+                    )
+                except Exception as exc:  # noqa: BLE001 — supersession boundary
+                    fail_mode_c_build(
+                        sqlite_pool,
+                        build_id,
+                        summary=f"feature routing recovery refused: {exc}",
+                        what="recovered build supersession",
+                        log=logger,
+                    )
+                    logger.error(
+                        "dispatch_build: recovered build_id=%s has no committed "
+                        "routing authority; refusing before interrupting the "
+                        "recorded run",
+                        build_id,
+                    )
+                    return False
             if await interrupt_recorded_run(sqlite_pool, forge_config, build_id):
                 return True
             logger.error(
@@ -1587,6 +1626,61 @@ def _build_dispatch_build(
                     gate_wired,
                     exc,
                 )
+                return
+
+        # Routing is an admission barrier too.  It runs after the durable
+        # build identity exists but before budget/approval cards, recovery
+        # replacement or either launch arm.  The launch gate below re-reads
+        # the committed receipt and therefore performs no second HTTP seed.
+        if feature_routing_required:
+            routing_id = payload.correlation_id or build_id
+            routing_reason: str | None = None
+            if feature_routing_gate is None:
+                routing_reason = "required feature routing gate is not wired"
+            else:
+                try:
+                    await feature_routing_gate.ensure_seeded(
+                        routing_id,
+                        origin_kind="build",
+                        origin_id=build_id,
+                    )
+                except Exception as exc:  # noqa: BLE001 — admission boundary
+                    routing_reason = (
+                        "feature routing admission failed: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+            if routing_reason is not None:
+                durable_reason = fail_mode_c_build(
+                    sqlite_pool,
+                    build_id,
+                    summary=routing_reason,
+                    what="feature routing admission",
+                    log=logger,
+                )
+                persisted = sqlite_pool.get_build_row(build_id)
+                if persisted is None or persisted.status is not BuildState.FAILED:
+                    logger.error(
+                        "dispatch_build: routing refusal for build_id=%s did "
+                        "not durably reach FAILED; holding WITHOUT card, "
+                        "runner or ack",
+                        build_id,
+                    )
+                    return
+                if lifecycle_emitter is not None:
+                    from forge.pipeline import BuildContext
+
+                    await lifecycle_emitter.emit_failed(
+                        BuildContext(
+                            feature_id=payload.feature_id,
+                            build_id=build_id,
+                            correlation_id=payload.correlation_id,
+                            wave_total=1,
+                        ),
+                        failure_reason=durable_reason,
+                        recoverable=False,
+                        failed_task_id=None,
+                    )
+                await ack_callback()
                 return
 
         # FEAT-UBS-002 (Option-B, stage 1) — resolve the per-build budget entry
@@ -2201,6 +2295,8 @@ def build_pipeline_consumer_deps(
     record_build_rejection: Callable[[str, str], Any] | None = None,
     prepared_build_admission: Callable[[Any], Awaitable[Any]] | None = None,
     reply_in_thread: BuildThreadReply | None = None,
+    feature_routing_gate: Any | None = None,
+    feature_routing_required: bool = False,
 ) -> PipelineConsumerDeps:
     """Compose the production :class:`PipelineConsumerDeps` for ``forge serve``.
 
@@ -2364,6 +2460,8 @@ def build_pipeline_consumer_deps(
         record_build_rejection=record_build_rejection,
         prepared_build_admission=prepared_build_admission,
         reply_in_thread=reply_in_thread,
+        feature_routing_gate=feature_routing_gate,
+        feature_routing_required=feature_routing_required,
     )
     publish_build_failed = _build_publish_build_failed(
         publisher,

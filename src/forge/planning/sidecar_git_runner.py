@@ -734,6 +734,9 @@ class SidecarGitRunner:
         launch_settings: Sequence[str] | None = None,
         build: str | None = None,
         declared_at: str | None = None,
+        feature_routing_id: str | None = None,
+        feature_routing_required: bool = False,
+        feature_routing_receipt: object = None,
     ) -> SidecarGitOpResult:
         """Write ``files`` onto ``branch`` in one commit on the sandbox's clone,
         with the declared checks run there first.
@@ -815,6 +818,14 @@ class SidecarGitRunner:
             # read-only answer about the run named above and reads at the
             # commit THAT names.
             body["declared_at"] = str(declared_at)
+        if feature_routing_id is not None:
+            # Raw dedicated carrier: never trim/coerce it like the generic
+            # build provenance label.
+            body["feature_routing_id"] = feature_routing_id
+        if feature_routing_required:
+            body["feature_routing_required"] = True
+        if feature_routing_receipt is not None:
+            body["feature_routing_receipt"] = feature_routing_receipt
         if (
             body.get("memory_project") or body.get("launch_settings")
         ) and not body.get("declared_at"):
@@ -1068,6 +1079,9 @@ class RepoRoutedGitRunner:
         launch_settings: Sequence[str] | None = None,
         build: str | None = None,
         declared_at: str | None = None,
+        feature_routing_id: str | None = None,
+        feature_routing_required: bool = False,
+        feature_routing_receipt: object = None,
     ) -> GitOpResult:
         return await self.runner_for_path(repo_path).prepare_branch_and_write_tree(
             repo_path,
@@ -1080,6 +1094,9 @@ class RepoRoutedGitRunner:
             launch_settings=launch_settings,
             build=build,
             declared_at=declared_at,
+            feature_routing_id=feature_routing_id,
+            feature_routing_required=feature_routing_required,
+            feature_routing_receipt=feature_routing_receipt,
         )
 
     async def read_file_from_branch(

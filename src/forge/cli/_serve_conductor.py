@@ -3229,6 +3229,8 @@ def build_conductor_supervisor_factory(
     budget_kwargs_builder: Callable[..., dict] | None = None,
     timeout_seconds_by_stage: "Mapping[StageClass, int] | None" = None,
     leg_model: str | None = None,
+    feature_routing_gate: Any | None = None,
+    feature_routing_required: bool = False,
 ) -> Callable[[str], Any]:
     """Return the ``(build_id) -> Supervisor`` factory the router injects.
 
@@ -3414,6 +3416,8 @@ def build_conductor_supervisor_factory(
             timeout_seconds_by_stage=stage_timeouts,
             leg_model=resolved_leg_model,
             leg_budgets=leg_budgets,
+            feature_routing_gate=feature_routing_gate,
+            feature_routing_required=feature_routing_required,
         )
         # HOW MANY REVIEW CYCLES THIS BUILD MAY SPEND — read off the SAME
         # resolved profile the supervisor is judged against (above), never

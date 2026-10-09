@@ -296,6 +296,8 @@ async def _execute_subprocess(
     timeout: int,
     memory_project: str | None = None,
     launch_settings: Sequence[str] | None = None,
+    feature_routing_id: str | None = None,
+    feature_routing_required: bool = False,
 ) -> tuple[str, str, int, float, bool, bool]:
     """Execute a command via :func:`asyncio.create_subprocess_exec`.
 
@@ -361,7 +363,10 @@ async def _execute_subprocess(
         *command,
         cwd=cwd,
         env=build_launch_env(
-            memory_project=memory_project, declared=launch_settings
+            memory_project=memory_project,
+            declared=launch_settings,
+            feature_routing_id=feature_routing_id,
+            feature_routing_required=feature_routing_required,
         ),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -431,6 +436,9 @@ async def run(
     launch_settings: Sequence[str] | None = None,
     build: str | None = None,  # noqa: ARG001 — see the note in the docstring
     start_commit: str | None = None,  # noqa: ARG001 — likewise
+    feature_routing_id: str | None = None,
+    feature_routing_required: bool = False,
+    feature_routing_receipt: object = None,
 ) -> GuardKitResult:
     """Single subprocess entry point for every GuardKit subcommand.
 
@@ -505,6 +513,21 @@ async def run(
     warnings: list[GuardKitWarning] = []
 
     try:
+        # This is the local model-bearing launch boundary.  Consume the
+        # coordinator's committed receipt before path checks, binary/context
+        # resolution or subprocess creation.  Optional unkeyed standalone
+        # calls keep their historical behaviour.
+        from forge.lifecycle.feature_routing import (
+            validate_feature_routing_launch_receipt,
+        )
+
+        feature_routing_id, _canonical_receipt = (
+            validate_feature_routing_launch_receipt(
+                feature_routing_id,
+                feature_routing_receipt,
+                required=feature_routing_required,
+            )
+        )
         # Defence-in-depth: cwd must be absolute. DeepAgents' permission
         # layer enforces the working_directory_allowlist, but we also
         # check here so a test or a misconfigured caller cannot bypass
@@ -591,6 +614,16 @@ async def run(
             # last element is the post-kill surrender flag; a stub that
             # answers the historical 5-tuple reads as "nothing surrendered",
             # which is the truth for a seam that kills nothing.
+            execute_kwargs: dict[str, Any] = dict(
+                command=command,
+                cwd=str(resolved_repo),
+                timeout=timeout_seconds,
+                memory_project=memory_project,
+                launch_settings=launch_settings,
+            )
+            if feature_routing_id is not None or feature_routing_required:
+                execute_kwargs["feature_routing_id"] = feature_routing_id
+                execute_kwargs["feature_routing_required"] = feature_routing_required
             (
                 stdout,
                 stderr,
@@ -598,13 +631,7 @@ async def run(
                 duration,
                 timed_out,
                 *_surrender,
-            ) = await _execute_subprocess(
-                command=command,
-                cwd=str(resolved_repo),
-                timeout=timeout_seconds,
-                memory_project=memory_project,
-                launch_settings=launch_settings,
-            )
+            ) = await _execute_subprocess(**execute_kwargs)
             output_surrendered = bool(_surrender[0]) if _surrender else False
         except PermissionError as exc:
             # Binary not in DeepAgents' shell allowlist — convert to a

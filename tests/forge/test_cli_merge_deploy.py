@@ -403,3 +403,38 @@ class TestHappyPath:
         assert "failed_step=merge" in result.output
         # The join comes first, so nothing was stood up to come down.
         assert [c["leg"] for c in fakes["dp_calls"]] == []
+
+    def test_retired_build_refuses_before_backends_or_git(
+        self, config, pool, fakes, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from tests.forge.lifecycle.test_merge_retirement import (
+            _insert_receipt,
+            _stage,
+        )
+
+        _insert_build(pool)
+        decision = _stage(
+            pool.connection,
+            BUILD_ID,
+            "merge_deploy_decision",
+            "PASSED",
+            {"merge_decision": {"decision": "approve"}},
+        )
+        _insert_receipt(pool.connection, BUILD_ID, [decision])
+
+        async def forbidden_backends(_config: ForgeConfig):
+            raise AssertionError("retirement must refuse before backend setup")
+
+        monkeypatch.setattr(
+            merge_deploy_module, "_aopen_backends", forbidden_backends
+        )
+        result = CliRunner().invoke(merge_deploy_cmd, [FEATURE_ID], obj=config)
+
+        assert result.exit_code != 0
+        assert "permanently retired" in result.output
+        assert fakes["gk_calls"] == []
+        assert fakes["dp_calls"] == []
+        assert fakes["publisher"].reports == []
+        assert pool.connection.execute(
+            "SELECT count(*) FROM publication_records"
+        ).fetchone()[0] == 0

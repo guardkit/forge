@@ -129,7 +129,7 @@ from typing import Final
 # ``schema_v{N}.sql`` and add a ``(N, "schema_v{N}.sql")`` entry to
 # ``_MIGRATIONS`` in ascending order. The runner applies every entry whose
 # version is greater than the current ``schema_version`` ledger row.
-_SCHEMA_VERSION: Final[int] = 17
+_SCHEMA_VERSION: Final[int] = 18
 _MIGRATIONS: Final[tuple[tuple[int, str], ...]] = (
     (1, "schema.sql"),
     (2, "schema_v2.sql"),
@@ -210,6 +210,10 @@ _MIGRATIONS: Final[tuple[tuple[int, str], ...]] = (
     # NULL-able: every other build reads back as "not a prepared build" and
     # launches exactly as before.
     (17, "schema_v17.sql"),
+    # v18 (feature routing) -- the coordinator-owned, seed-once authority.
+    # It is deliberately separate from planning/build state because one
+    # admitted sentence crosses both records.
+    (18, "schema_v18.sql"),
 )
 
 

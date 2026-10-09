@@ -793,6 +793,27 @@ class TestConsumerDecisions:
         assert MERGE_STEP_DEPLOY_TARGET_IDENTIFIER not in ids
         assert len(publisher.reports) == 1
         assert publisher.reports[0].result == "publication-pending"
+        decision = next(
+            stage
+            for stage in pool.read_stages(BUILD_ID)
+            if stage.target_identifier == MERGE_DECISION_TARGET_IDENTIFIER
+        )
+        attempt = decision.details["merge_decision"]
+        assert attempt["execution_attempt_version"] == 1
+        assert len(attempt["execution_attempt_id"]) == 32
+        assert set(attempt["execution_attempt_id"]) <= set("0123456789abcdef")
+        assert publisher.reports[0].merge_decision == {
+            "execution_attempt_version": 1,
+            "execution_attempt_id": attempt["execution_attempt_id"],
+        }
+        durable_report = next(
+            stage
+            for stage in pool.read_stages(BUILD_ID)
+            if stage.target_identifier == MERGE_REPORT_TARGET_IDENTIFIER
+        )
+        assert durable_report.details["merge_decision"] == (
+            publisher.reports[0].merge_decision
+        )
 
     @pytest.mark.asyncio
     async def test_single_flight_serialises_a_repo(self, config, pool) -> None:
@@ -4399,3 +4420,65 @@ class TestALostSandboxCleanUpKeepsTheHold:
             assert "another worker" in again.detail
         finally:
             sidecar.close()
+
+
+class TestPermanentMergeRetirement:
+    @pytest.mark.asyncio
+    async def test_shared_executor_refuses_before_any_effect(
+        self, config: ForgeConfig, pool: SqliteLifecyclePersistence, repo_root: Path
+    ) -> None:
+        from forge.lifecycle.merge_retirement import MergeRetired
+        from tests.forge.lifecycle.test_merge_retirement import (
+            _insert_receipt,
+            _stage,
+        )
+
+        _ensure_build(pool, build_id=BUILD_ID, feature_id=FEATURE_ID)
+        decision = _stage(
+            pool.connection,
+            BUILD_ID,
+            "merge_deploy_decision",
+            "PASSED",
+            {"merge_decision": {"decision": "approve"}},
+        )
+        _insert_receipt(pool.connection, BUILD_ID, [decision])
+        deps, publisher, guardkit, deploy = _deps(config, pool)
+
+        with pytest.raises(MergeRetired, match="permanently retired"):
+            await _run_executor(deps, repo_root)
+
+        assert publisher.reports == []
+        assert guardkit.calls == []
+        assert deploy.calls == []
+        assert pool.connection.execute(
+            "SELECT count(*) FROM publication_records"
+        ).fetchone()[0] == 0
+
+    @pytest.mark.asyncio
+    async def test_original_duplicate_callback_fence_still_launches_nothing(
+        self, config: ForgeConfig, pool: SqliteLifecyclePersistence
+    ) -> None:
+        from tests.forge.lifecycle.test_merge_retirement import (
+            _insert_receipt,
+            _stage,
+        )
+
+        _write_offer(pool)
+        decision = _stage(
+            pool.connection,
+            BUILD_ID,
+            "merge_deploy_decision",
+            "PASSED",
+            {"merge_decision": {"decision": "approve"}},
+        )
+        _insert_receipt(pool.connection, BUILD_ID, [decision])
+        deps, publisher, guardkit, deploy = _deps(config, pool)
+        consumer = MergeApprovalConsumer(deps)
+
+        await consumer.handle_envelope(_envelope())
+        await _drain(consumer)
+
+        assert consumer._tasks == set()
+        assert publisher.reports == []
+        assert guardkit.calls == []
+        assert deploy.calls == []

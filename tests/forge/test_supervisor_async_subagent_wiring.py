@@ -249,18 +249,22 @@ class TestDispatchAutobuildSignature:
         # project declared its own builds need, read at the same commit.
         # ``source_commit`` on 2026-10-04 — the exact commit a feature planned
         # elsewhere was admitted at, which the runner builds.
-        additive_data_kwargs = [
+        additive_data_and_routing_kwargs = [
             "branch",
             "repo",
             "budget",
             "memory_project",
             "launch_settings",
             "source_commit",
+            "feature_routing_id",
+            "feature_routing_gate",
+            "feature_routing_required",
         ]
-        assert kw_only == collaborators + additive_data_kwargs, (
+        assert kw_only == collaborators + additive_data_and_routing_kwargs, (
             f"dispatch_autobuild_async must expose exactly the five collaborator "
             f"parameters {collaborators!r} followed only by the additive data "
-            f"kwargs {additive_data_kwargs!r}; got {kw_only!r}"
+            "and routing authority kwargs "
+            f"{additive_data_and_routing_kwargs!r}; got {kw_only!r}"
         )
         # The additive kwargs are pure data (default None), never collaborators.
         for name in ("branch", "repo"):

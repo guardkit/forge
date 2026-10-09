@@ -345,6 +345,9 @@ class GitRunner(Protocol):
         launch_settings: "Sequence[str] | None" = None,
         build: str | None = None,
         declared_at: str | None = None,
+        feature_routing_id: str | None = None,
+        feature_routing_required: bool = False,
+        feature_routing_receipt: object = None,
     ) -> GitOpResult:
         """Write a MULTI-file tree onto ``branch`` in one commit (Lane B B2).
 
