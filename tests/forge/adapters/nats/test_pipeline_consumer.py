@@ -138,6 +138,7 @@ def _make_deps(
         is_duplicate_terminal=is_dup,
         dispatch_build=dispatch,
         publish_build_failed=publish_failed,
+        retired_planning_handoffs=lambda: frozenset(),
         register_ack_handle=register_ack_handle,
     )
     return deps, {

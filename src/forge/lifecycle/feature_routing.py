@@ -323,6 +323,14 @@ def _router_restart_blockers_snapshot(
     connection: sqlite3.Connection,
 ) -> tuple[str, ...]:
     from forge.lifecycle.merge_retirement import retired_decision_ids
+    from forge.lifecycle.planning_handoff_retirement import (
+        retired_planning_handoff_correlations,
+    )
+
+    # Parity validation with the router's production maintenance guard. Forge
+    # grants no blocker exemption from this set; its runtime admission guards
+    # consume the same canonical reader separately.
+    retired_planning_handoff_correlations(connection)
 
     planning_terminal = (
         "FAILED",

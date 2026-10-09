@@ -214,6 +214,9 @@ class _FakePersistence:
 def fake_persistence(monkeypatch: pytest.MonkeyPatch) -> _FakePersistence:
     fake = _FakePersistence()
     monkeypatch.setattr(cli_queue, "make_persistence", lambda config: fake)
+    monkeypatch.setattr(
+        cli_queue, "_planning_handoff_retirement_preflight", lambda path: frozenset()
+    )
     return fake
 
 

@@ -260,6 +260,7 @@ class TestSyncRaiseUsesSafetyNetNotBridge:
             is_duplicate_terminal=AsyncMock(return_value=False),
             dispatch_build=dispatch_build,
             publish_build_failed=wrapped_publish,
+            retired_planning_handoffs=lambda: frozenset(),
         )
 
         msg = _make_msg(_envelope_bytes(_valid_payload_dict(feature_yaml)))

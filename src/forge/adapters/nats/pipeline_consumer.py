@@ -115,6 +115,9 @@ UNKNOWN_FEATURE_ID: str = "unknown"
 REASON_MALFORMED_PAYLOAD: str = "malformed BuildQueuedPayload"
 REASON_PATH_OUTSIDE_ALLOWLIST: str = "path outside allowlist"
 REASON_ORIGINATOR_NOT_RECOGNISED: str = "originator not recognised"
+REASON_PLANNING_HANDOFF_RETIRED: str = (
+    "planning handoff was permanently retired before routing"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -128,6 +131,9 @@ IsDuplicateTerminal = Callable[[str, str], Awaitable[bool]]
 """``async (feature_id, correlation_id) -> bool`` — True if the build already
 terminated (``COMPLETE | FAILED | CANCELLED | SKIPPED``) and the consumer
 should ack-and-skip."""
+
+RetiredPlanningHandoffs = Callable[[], frozenset[str]]
+"""Synchronous full-ledger validation returning retired correlations."""
 
 RegisterObserver = Callable[[], Awaitable[None]]
 """``async () -> None`` — TASK-GATE-D659 R1 deferred bridge-registration.
@@ -221,6 +227,7 @@ class PipelineConsumerDeps:
     is_duplicate_terminal: IsDuplicateTerminal
     dispatch_build: DispatchBuild
     publish_build_failed: PublishBuildFailed
+    retired_planning_handoffs: RetiredPlanningHandoffs | None = None
     register_ack_handle: InFlightAckRegistry | None = None
     # A build refused before any build row is written (3 October 2026) —
     # ``(correlation_id, reason) -> Any``, in production the work queue's
@@ -460,6 +467,87 @@ async def _safe_publish_failure(
         )
 
 
+async def _settle_retired_planning_handoff(
+    msg: _MsgLike,
+    deps: PipelineConsumerDeps,
+    envelope: MessageEnvelope,
+    payload: BuildQueuedPayload,
+) -> bool:
+    """Refuse a retired correlation or hold intake on invalid history.
+
+    Returns ``True`` when the caller must stop processing this message. Reader
+    failures are contained here because the daemon's outer exception fallback
+    acknowledges messages; returning normally without ack keeps this build
+    pending and therefore fails closed.
+    """
+
+    reader = deps.retired_planning_handoffs
+    if reader is None:
+        logger.error(
+            "pipeline_consumer: planning handoff retirement validator is not "
+            "wired; holding feature_id=%s correlation_id=%s WITHOUT ack",
+            payload.feature_id,
+            payload.correlation_id,
+        )
+        return True
+    try:
+        retired = reader()
+    except Exception as exc:  # noqa: BLE001 — must not reach ack-on-error wrapper
+        logger.error(
+            "pipeline_consumer: planning handoff retirement history is invalid "
+            "(%s: %s); holding feature_id=%s correlation_id=%s WITHOUT ack",
+            type(exc).__name__,
+            exc,
+            payload.feature_id,
+            payload.correlation_id,
+        )
+        return True
+
+    if type(retired) is not frozenset or not all(
+        isinstance(correlation_id, str) for correlation_id in retired
+    ):
+        logger.error(
+            "pipeline_consumer: planning handoff retirement validator returned "
+            "an invalid result; holding feature_id=%s correlation_id=%s WITHOUT ack",
+            payload.feature_id,
+            payload.correlation_id,
+        )
+        return True
+
+    if (
+        payload.correlation_id not in retired
+        and envelope.correlation_id not in retired
+    ):
+        return False
+
+    logger.warning(
+        "pipeline_consumer: %s; feature_id=%s payload_correlation_id=%s "
+        "envelope_correlation_id=%s; ack + build-failed",
+        REASON_PLANNING_HANDOFF_RETIRED,
+        payload.feature_id,
+        payload.correlation_id,
+        envelope.correlation_id,
+    )
+    await msg.ack()
+    await _safe_publish_failure(
+        deps,
+        _failure_payload(
+            feature_id=payload.feature_id,
+            build_id=payload.feature_id,
+            reason=REASON_PLANNING_HANDOFF_RETIRED,
+        ),
+        payload.feature_id,
+        correlation_id=envelope.correlation_id,
+    )
+    await answer_build_thread(
+        deps.reply_in_thread,
+        payload,
+        build_refused_reply(payload.feature_id, REASON_PLANNING_HANDOFF_RETIRED),
+        level="warning",
+    )
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Core message handler
 # ---------------------------------------------------------------------------
@@ -473,9 +561,12 @@ async def handle_message(msg: _MsgLike, deps: PipelineConsumerDeps) -> None:
     1. *Malformed envelope or payload* → ``msg.ack()`` and publish
        ``build-failed`` with reason :data:`REASON_MALFORMED_PAYLOAD`.
        The state machine is **never** invoked.
-    2. *Unrecognised ``originating_adapter``* → ack + ``build-failed`` with
+    2. *Retired planning-handoff correlation* → ack + ``build-failed`` with
+       :data:`REASON_PLANNING_HANDOFF_RETIRED`; invalid retirement history is
+       held without ack so JetStream can redeliver after the ledger is repaired.
+    3. *Unrecognised ``originating_adapter``* → ack + ``build-failed`` with
        :data:`REASON_ORIGINATOR_NOT_RECOGNISED`.
-    3. *``feature_yaml_path`` outside allowlist* → ack + ``build-failed``
+    4. *``feature_yaml_path`` outside allowlist* → ack + ``build-failed``
        with :data:`REASON_PATH_OUTSIDE_ALLOWLIST`. ``..`` traversal is
        rejected because :func:`_path_inside_allowlist` calls
        :meth:`Path.resolve` before :meth:`Path.is_relative_to`. A relative
@@ -483,9 +574,9 @@ async def handle_message(msg: _MsgLike, deps: PipelineConsumerDeps) -> None:
        and must be ``.guardkit/features/<feature_id>.yaml``; any other
        relative path, or one for an unregistered repository, is refused the
        same way with its own plain reason (4 October 2026).
-    4. *Duplicate already-terminal build* → ack + idempotent skip. No build
+    5. *Duplicate already-terminal build* → ack + idempotent skip. No build
        is started, no event is published.
-    5. *Accepted build* → :meth:`PipelineConsumerDeps.dispatch_build` is
+    6. *Accepted build* → :meth:`PipelineConsumerDeps.dispatch_build` is
        awaited with an ``ack_callback`` bound to ``msg.ack``. The message
        remains unacked until the state machine invokes the callback at the
        terminal transition.
@@ -546,6 +637,14 @@ async def handle_message(msg: _MsgLike, deps: PipelineConsumerDeps) -> None:
             feature_id,
             correlation_id=envelope.correlation_id,
         )
+        return
+
+    # A planning-handoff retirement is permanent admission authority. Check
+    # both identities before any origin/path refusal telemetry, build row,
+    # routing seed, model call or dispatch. Build-failed keeps the established
+    # envelope-correlation threading even when only the payload identity is
+    # retired.
+    if await _settle_retired_planning_handoff(msg, deps, envelope, payload):
         return
 
     # --- 2. Originator allowlist -----------------------------------------
@@ -1422,6 +1521,7 @@ __all__ = [
     "REASON_MALFORMED_PAYLOAD",
     "REASON_ORIGINATOR_NOT_RECOGNISED",
     "REASON_PATH_OUTSIDE_ALLOWLIST",
+    "REASON_PLANNING_HANDOFF_RETIRED",
     "RESTART_FROM_PREPARING_STATES",
     "ReconcileDeps",
     "ReconcileReport",

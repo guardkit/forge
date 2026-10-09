@@ -52,6 +52,7 @@ def _deps(config: ForgeConfig) -> tuple[PipelineConsumerDeps, dict[str, Any]]:
         is_duplicate_terminal=AsyncMock(return_value=False),
         dispatch_build=dispatch,
         publish_build_failed=publish,
+        retired_planning_handoffs=lambda: frozenset(),
         record_build_rejection=lambda cid, reason: rejections.append((cid, reason)),
     )
     return deps, {"dispatch": dispatch, "publish": publish, "rejections": rejections}

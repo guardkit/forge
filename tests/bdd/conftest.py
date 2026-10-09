@@ -712,6 +712,11 @@ def forge_runner(monkeypatch, persistence, stub_publisher):
     monkeypatch.setattr(
         _queue_module, "make_persistence", lambda _config: persistence
     )
+    monkeypatch.setattr(
+        _queue_module,
+        "_planning_handoff_retirement_preflight",
+        lambda _path: frozenset(),
+    )
     monkeypatch.setattr(_queue_module, "publish", stub_publisher.publish)
     return CliRunner()
 
