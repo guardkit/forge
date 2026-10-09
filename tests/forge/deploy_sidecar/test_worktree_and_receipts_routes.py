@@ -846,6 +846,76 @@ class TestTheLegRoute:
         assert status == 400 and wanted in body["error"]
         assert _leg_calls(leg_guardkit) == []
 
+
+@pytest.mark.parametrize(
+    "receipt",
+    [
+        None,
+        {
+            "feature_routing_id": "wrong",
+            "attempt_id": "attempt",
+            "server_id": 1,
+        },
+        {
+            "feature_routing_id": "repair_A",
+            "attempt_id": "attempt",
+            "server_id": "1",
+        },
+    ],
+)
+def test_required_leg_http_refuses_bad_receipt_before_process(
+    server: str,
+    cfg: ForgeConfig,
+    repo: Path,
+    leg_guardkit: Path,
+    receipt: object,
+) -> None:
+    tree = _worktree_with_receipts(cfg, repo)
+    payload: dict[str, Any] = {
+        "repo": REPO_KEY,
+        "cwd": str(tree),
+        "subcommand": "task-review",
+        "feature_routing_id": "repair_A",
+        "feature_routing_required": True,
+    }
+    if receipt is not None:
+        payload["feature_routing_receipt"] = receipt
+
+    status, _body = _post(server + "/guardkit-leg", payload)
+
+    assert status == 400
+    assert _leg_calls(leg_guardkit) == []
+
+
+def test_required_leg_http_accepts_and_runs_with_exact_receipt(
+    server: str,
+    cfg: ForgeConfig,
+    repo: Path,
+    leg_guardkit: Path,
+) -> None:
+    tree = _worktree_with_receipts(cfg, repo)
+    receipt = {
+        "feature_routing_id": "repair_A",
+        "attempt_id": "exact-attempt",
+        "server_id": 2,
+    }
+
+    status, body = _post(
+        server + "/guardkit-leg",
+        {
+            "repo": REPO_KEY,
+            "cwd": str(tree),
+            "subcommand": "task-review",
+            "feature_routing_id": "repair_A",
+            "feature_routing_required": True,
+            "feature_routing_receipt": receipt,
+        },
+    )
+
+    assert status == 200, body
+    assert body["exit_code"] == 0
+    assert len(_leg_calls(leg_guardkit)) == 1
+
     def test_a_working_directory_that_is_not_a_journey_tree_is_refused(
         self, cfg: ForgeConfig, repo: Path, leg_guardkit: Path
     ) -> None:

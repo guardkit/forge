@@ -266,8 +266,9 @@ class TestBootLogEmitsAppliedCount:
         # holds the lock and until when, and what is running on it now by
         # commit and by the identity the running thing reported; schema_v17.sql
         # added on 4 October 2026 for the builds.source_commit column — the
-        # exact commit a feature planned elsewhere was admitted at).
-        assert "applied 17" in applied_lines[0], applied_lines[0]
+        # exact commit a feature planned elsewhere was admitted at;
+        # schema_v18.sql adds the coordinator's durable seed-once authority).
+        assert "applied 18" in applied_lines[0], applied_lines[0]
 
 
 # ---------------------------------------------------------------------------

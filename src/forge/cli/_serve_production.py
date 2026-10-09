@@ -36,6 +36,7 @@ References:
 from __future__ import annotations
 
 import logging
+import os
 import sqlite3
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Mapping
@@ -774,6 +775,8 @@ async def _settle_strict_runless_builds_at_boot(
 def _build_recovery_reconcile_seam(
     sqlite_pool: SqliteLifecyclePersistence,
     forge_config: ForgeConfig,
+    feature_routing_gate: Any | None = None,
+    feature_routing_required: bool = False,
 ) -> Any:
     """Return the production ``recovery_reconcile_on_boot`` closure (§D4.1).
 
@@ -798,6 +801,47 @@ def _build_recovery_reconcile_seam(
             client, config=forge_config.pipeline
         )
         before_recovery = sqlite_pool.read_non_terminal_builds()
+        if feature_routing_required:
+            admitted_recovery = []
+            for build in before_recovery:
+                try:
+                    if feature_routing_gate is None:
+                        raise RuntimeError("required feature routing gate is not wired")
+                    feature_routing_gate.require_committed_success(
+                        build.correlation_id
+                    )
+                except Exception as exc:  # noqa: BLE001 — recovery authority
+                    from forge.cli._conductor_outcome import fail_mode_c_build
+                    from forge.pipeline import BuildContext
+
+                    reason = f"feature routing recovery refused: {exc}"
+                    fail_mode_c_build(
+                        sqlite_pool,
+                        build.build_id,
+                        summary=reason,
+                        what="boot recovery without a committed pin",
+                        log=logger,
+                    )
+                    persisted = sqlite_pool.get_build_row(build.build_id)
+                    if persisted is None or persisted.status is not BuildState.FAILED:
+                        raise RuntimeError(
+                            "feature routing poison could not durably settle "
+                            f"build {build.build_id} before boot recovery"
+                        )
+                    await emitter.emit_failed(
+                        BuildContext(
+                            feature_id=persisted.feature_id,
+                            build_id=persisted.build_id,
+                            correlation_id=persisted.correlation_id,
+                            wave_total=1,
+                        ),
+                        failure_reason=reason,
+                        recoverable=False,
+                        failed_task_id=persisted.task_id,
+                    )
+                    continue
+                admitted_recovery.append(build)
+            before_recovery = admitted_recovery
         runless_before_recovery = [
             build
             for build in before_recovery
@@ -853,6 +897,8 @@ def _build_consumer_reconcile_seam(
     sqlite_pool: SqliteLifecyclePersistence,
     forge_config: ForgeConfig,
     async_task_starter: AsyncTaskStarter | None,
+    feature_routing_gate: Any | None = None,
+    feature_routing_required: bool = False,
 ) -> Any:
     """Return the production ``consumer_reconcile_on_boot`` closure (§D4.4).
 
@@ -889,6 +935,8 @@ def _build_consumer_reconcile_seam(
             # planning run and no row is checked exactly as the live
             # consumer checks it, never let through unadmitted.
             prepared_build_admission=build_prepared_build_admission(forge_config),
+            feature_routing_gate=feature_routing_gate,
+            feature_routing_required=feature_routing_required,
         )
 
         async def _fetch_redeliveries() -> list[Any]:
@@ -1316,6 +1364,29 @@ def bind_production_serve(config: ServeConfig, forge_config: ForgeConfig) -> Non
     # this module's public API only inside ``serve_cmd``'s body.
     from forge.cli import serve as serve_module
 
+    # The real coordinator boot barrier: poison unfinished attempts exactly
+    # once, after v18 exists and before _run_serve can enter recovery/rearm or
+    # attach consumers.  Absence of the operator URL keeps standalone mode
+    # byte-compatible and creates no routing rows.
+    router_url = os.environ.get("FORGE_FEATURE_ROUTER_URL")
+    if router_url:
+        from forge.lifecycle.feature_routing import FeatureRoutingSeedStore
+        from forge.pipeline.feature_routing import FeatureRoutingGate
+
+        routing_store = FeatureRoutingSeedStore(connection)
+        poisoned = routing_store.poison_unfinished_seeds_on_boot()
+        serve_module.feature_routing_gate = FeatureRoutingGate(
+            routing_store, router_url
+        )
+        serve_module.feature_routing_required = True
+        logger.info(
+            "forge-serve: feature routing enabled; poisoned %d unfinished seed(s)",
+            poisoned,
+        )
+    else:
+        serve_module.feature_routing_gate = None
+        serve_module.feature_routing_required = False
+
     # Step 5 — eagerly construct the middleware. ImportErrors / wiring
     # bugs raise here, before the daemon attaches its consumer.
     # TASK-FORGE-FRR-F010J: thread the langgraph-runner sidecar URL
@@ -1380,10 +1451,17 @@ def bind_production_serve(config: ServeConfig, forge_config: ForgeConfig) -> Non
     # (PAUSED approval re-emit suppressed) and the consumer twin seam runs
     # with its PAUSED scan suppressed (rearm owns PAUSED).
     serve_module.recovery_reconcile_on_boot = _build_recovery_reconcile_seam(
-        sqlite_pool, forge_config
+        sqlite_pool,
+        forge_config,
+        serve_module.feature_routing_gate,
+        serve_module.feature_routing_required,
     )
     serve_module.consumer_reconcile_on_boot = _build_consumer_reconcile_seam(
-        sqlite_pool, forge_config, async_task_starter
+        sqlite_pool,
+        forge_config,
+        async_task_starter,
+        serve_module.feature_routing_gate,
+        serve_module.feature_routing_required,
     )
 
     # Step 8 — close any previous binding's writer connection cleanly.

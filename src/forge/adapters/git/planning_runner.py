@@ -430,6 +430,9 @@ class WorktreeGitRunner:
         launch_settings: "Sequence[str] | None" = None,  # noqa: ARG002
         build: str | None = None,  # noqa: ARG002 — see below
         declared_at: str | None = None,  # noqa: ARG002
+        feature_routing_id: str | None = None,
+        feature_routing_required: bool = False,
+        feature_routing_receipt: object = None,
     ) -> GitOpResult:
         """Write a multi-file tree onto ``branch`` in one commit (Lane B B2).
 
@@ -456,13 +459,24 @@ class WorktreeGitRunner:
         branch is cut from; a branch that already exists is re-attached, never
         moved onto it.
         """
-        logger.info(
-            "prepare_branch_and_write_tree: begin branch=%s files=%d repo=%s",
-            branch,
-            len(files),
-            repo_path,
-        )
         try:
+            # This is the local planning git boundary. Consume routing
+            # authority before path inspection, worktree creation or git.
+            from forge.lifecycle.feature_routing import (
+                validate_feature_routing_launch_receipt,
+            )
+
+            validate_feature_routing_launch_receipt(
+                feature_routing_id,
+                feature_routing_receipt,
+                required=feature_routing_required,
+            )
+            logger.info(
+                "prepare_branch_and_write_tree: begin branch=%s files=%d repo=%s",
+                branch,
+                len(files),
+                repo_path,
+            )
             repo = Path(repo_path)
             if not repo.is_dir():
                 return GitOpResult(

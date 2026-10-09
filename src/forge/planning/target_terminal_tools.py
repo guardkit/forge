@@ -2836,7 +2836,13 @@ def make_normalize_stamps(
     """
 
     async def _run_once(
-        worktree_path: Path, feature_id: str, *, no_model: bool
+        worktree_path: Path,
+        feature_id: str,
+        *,
+        no_model: bool,
+        feature_routing_id: str | None,
+        feature_routing_required: bool,
+        feature_routing_receipt: object,
     ) -> object:
         args = [
             "normalize-stamps",
@@ -2847,8 +2853,7 @@ def make_normalize_stamps(
         ]
         if no_model:
             args.append("--no-model")
-        return await guardkit_run_shim(
-            run_fn,
+        run_kwargs: dict[str, object] = dict(
             subcommand="qa",
             args=args,
             repo_path=worktree_path,
@@ -2856,9 +2861,21 @@ def make_normalize_stamps(
             timeout_seconds=timeout_seconds,
             with_nats_streaming=False,
         )
+        if feature_routing_id is not None or feature_routing_required:
+            run_kwargs["feature_routing_id"] = feature_routing_id
+            run_kwargs["feature_routing_required"] = feature_routing_required
+        if feature_routing_receipt is not None:
+            run_kwargs["feature_routing_receipt"] = feature_routing_receipt
+        return await guardkit_run_shim(run_fn, **run_kwargs)
 
     async def _normalize(
-        worktree_path: Path, feature_id: str, *, rules_only: bool = False
+        worktree_path: Path,
+        feature_id: str,
+        *,
+        rules_only: bool = False,
+        feature_routing_id: str | None = None,
+        feature_routing_required: bool = False,
+        feature_routing_receipt: object = None,
     ) -> StampNormalizerOutcome:
         by_rule_only = bool(rules_only)
         rules_only_note = ""
@@ -2869,7 +2886,14 @@ def make_normalize_stamps(
                 feature_id,
             )
         try:
-            result = await _run_once(worktree_path, feature_id, no_model=by_rule_only)
+            result = await _run_once(
+                worktree_path,
+                feature_id,
+                no_model=by_rule_only,
+                feature_routing_id=feature_routing_id,
+                feature_routing_required=feature_routing_required,
+                feature_routing_receipt=feature_routing_receipt,
+            )
             if (
                 by_rule_only
                 and int(getattr(result, "exit_code", -1)) != 0
@@ -2882,7 +2906,14 @@ def make_normalize_stamps(
                 by_rule_only = False
                 rules_only_note = NO_MODEL_OPTION_UNKNOWN_NOTE
                 logger.warning("normalize_stamps: %s — %s", feature_id, rules_only_note)
-                result = await _run_once(worktree_path, feature_id, no_model=False)
+                result = await _run_once(
+                    worktree_path,
+                    feature_id,
+                    no_model=False,
+                    feature_routing_id=feature_routing_id,
+                    feature_routing_required=feature_routing_required,
+                    feature_routing_receipt=feature_routing_receipt,
+                )
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 — oracle boundary

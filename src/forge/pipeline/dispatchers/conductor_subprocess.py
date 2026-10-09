@@ -282,6 +282,8 @@ def make_conductor_subprocess_dispatcher(
     with_nats_streaming: bool = True,
     receipts_root: "Path | str | None" = None,
     fix_task_yaml_in_worktree: bool = False,
+    feature_routing_gate: Any | None = None,
+    feature_routing_required: bool | None = None,
 ) -> Callable[..., Awaitable[Any]]:
     """Build the ``subprocess_dispatcher`` the conductor's Supervisor calls.
 
@@ -354,6 +356,25 @@ def make_conductor_subprocess_dispatcher(
     Returns:
         ``async (**supervisor_kwargs) -> StageDispatchResult``.
     """
+
+    # The production composition passes both values explicitly.  Retain a
+    # lazy fallback for direct adapter callers: this factory predates routing,
+    # and several internal callers deliberately construct it without going
+    # through the composition root.  Reading the coordinator bindings here
+    # keeps those callers on the same gate instead of silently disabling the
+    # authority at the final adapter seam.
+    if feature_routing_required is None:
+        from forge.cli import serve
+
+        resolved_feature_routing_gate = (
+            feature_routing_gate
+            if feature_routing_gate is not None
+            else serve.feature_routing_gate
+        )
+        resolved_feature_routing_required = serve.feature_routing_required
+    else:
+        resolved_feature_routing_gate = feature_routing_gate
+        resolved_feature_routing_required = bool(feature_routing_required)
 
     def _repo_path(row: Any) -> Path | None:
         if repo_path_reader is not None:
@@ -510,6 +531,17 @@ def make_conductor_subprocess_dispatcher(
             rationale or "none",
         )
 
+        routing_kwargs: dict[str, Any] = {}
+        if resolved_feature_routing_gate is not None or resolved_feature_routing_required:
+            # A repair admission owns one durable identity.  The minted
+            # correlation above remains per-leg reply attribution and must not
+            # become the routing key: it changes between work/review/retries.
+            routing_kwargs = {
+                "feature_routing_id": build_correlation_id or None,
+                "feature_routing_gate": resolved_feature_routing_gate,
+                "feature_routing_required": resolved_feature_routing_required,
+            }
+
         return await dispatch(
             stage,
             build_id,
@@ -538,6 +570,7 @@ def make_conductor_subprocess_dispatcher(
             # the fault this closes.
             memory_project=_memory_project_of(row),
             launch_settings=_launch_settings_of(row),
+            **routing_kwargs,
         )
 
     return conductor_subprocess_dispatcher

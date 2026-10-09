@@ -261,6 +261,61 @@ class TestCwdAllowlistEnforcement:
         )
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "receipt",
+    [
+        None,
+        {
+            "feature_routing_id": "wrong",
+            "attempt_id": "attempt",
+            "server_id": 1,
+        },
+        {
+            "feature_routing_id": "routing_A",
+            "attempt_id": "attempt",
+            "server_id": "1",
+        },
+    ],
+)
+async def test_required_local_launch_refuses_bad_receipt_before_resolution(
+    worktree: Path,
+    allowlist: list[Path],
+    monkeypatch: pytest.MonkeyPatch,
+    receipt: object,
+) -> None:
+    calls: list[str] = []
+
+    def _resolved() -> tuple[str, list[str]]:
+        calls.append("binary")
+        return "/unused/guardkit", []
+
+    monkeypatch.setattr(run_module, "_resolve_guardkit_binary", _resolved)
+    monkeypatch.setattr(
+        run_module,
+        "resolve_context_flags",
+        lambda *_args, **_kwargs: calls.append("context"),
+    )
+
+    async def _execute(**_kwargs: Any) -> tuple[str, str, int, float, bool]:
+        calls.append("subprocess")
+        return "", "", 0, 0.0, False
+
+    monkeypatch.setattr(run_module, "_execute_subprocess", _execute)
+    result = await run(
+        subcommand="task-review",
+        args=[],
+        repo_path=worktree,
+        read_allowlist=allowlist,
+        feature_routing_id="routing_A",
+        feature_routing_required=True,
+        feature_routing_receipt=receipt,
+    )
+
+    assert result.status == "failed"
+    assert calls == []
+
+
 # ---------------------------------------------------------------------------
 # AC-004 — resolver integration
 # ---------------------------------------------------------------------------

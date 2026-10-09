@@ -104,6 +104,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from typing_extensions import NotRequired, Required, TypedDict
 
 from forge import build_processes, receipts as _receipts
+from forge.lifecycle.feature_routing import FeatureRoutingError
 from forge.subagents import build_monitor
 from forge.subagents.autobuild_worktree_lifecycle import inspect_autobuild_worktree
 from forge.launch_environment import build_launch_env
@@ -933,6 +934,28 @@ def _extract_launch_payload(messages: list[Any]) -> dict[str, Any]:
     if not isinstance(payload, dict):
         return {}
     return payload
+
+
+def _validated_feature_routing(payload: Mapping[str, Any]) -> tuple[str | None, bool]:
+    """Validate a coordinator receipt before supersession or child launch."""
+    from forge.lifecycle.feature_routing import (
+        FeatureRoutingReceipt,
+        validate_feature_routing_id,
+    )
+
+    required = payload.get("feature_routing_required") is True
+    raw_key = payload.get("feature_routing_id")
+    if raw_key is None:
+        if required:
+            raise ValueError("required autobuild payload has no feature_routing_id")
+        return None, False
+    key = validate_feature_routing_id(raw_key)
+    if required:
+        FeatureRoutingReceipt.from_wire(
+            payload.get("feature_routing_receipt"),
+            expected_feature_routing_id=key,
+        )
+    return key, required
 
 
 def _build_snapshot(
@@ -4825,6 +4848,7 @@ async def _run_one_build(state: AutobuildRunnerState) -> dict[str, Any]:
     # code carries them as text: nothing here knows or cares what tool any of
     # them belongs to.
     declared_settings = _launch_settings_for_build(payload)
+    feature_routing_id, feature_routing_required = _validated_feature_routing(payload)
     launch_env = build_launch_env(
         memory_project=memory_project,
         declared=declared_settings,
@@ -4832,6 +4856,8 @@ async def _run_one_build(state: AutobuildRunnerState) -> dict[str, Any]:
         # builds): its test containers are named after it and a stop finds its
         # processes by it. From the payload's build ID, never inherited.
         run_owner=payload.get("build_id") or None,
+        feature_routing_id=feature_routing_id,
+        feature_routing_required=feature_routing_required,
     )
     logger.info(
         "autobuild_runner: launching subprocess feature_id=%s cwd=%s "
@@ -5440,13 +5466,36 @@ async def _node_running_wave(state: AutobuildRunnerState) -> dict[str, Any]:
     error — this runner stops keeping the build's process record.
     """
     payload = _extract_launch_payload(list(state.get("messages", [])))
+    # Validate before stopping a prior runner: an unauthorised replacement
+    # must not disturb a currently valid build.
+    try:
+        _validated_feature_routing(payload)
+    except (FeatureRoutingError, ValueError) as exc:
+        return _snapshot_update(
+            _build_failed_snapshot(
+                payload,
+                reason=f"feature routing refused the autobuild launch: {exc}",
+            )
+        )
     build_id = str(payload.get("build_id") or "")
     if not build_id:
         return await _running_wave_body(state)
     await _stop_an_earlier_run_of(payload, build_id)
     entry = build_processes.begin(build_id)
     try:
-        return await _running_wave_body(state)
+        try:
+            return await _running_wave_body(state)
+        except FeatureRoutingError as exc:
+            # The launch boundary validates before supersession; the child
+            # boundary validates again immediately before constructing its
+            # environment.  Either refusal is an ordinary nonrecoverable
+            # failed snapshot so the graph reaches failed -> finalize.
+            return _snapshot_update(
+                _build_failed_snapshot(
+                    payload,
+                    reason=f"feature routing refused the child launch: {exc}",
+                )
+            )
     finally:
         build_processes.end(entry)
 

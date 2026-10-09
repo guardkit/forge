@@ -114,6 +114,11 @@ if TYPE_CHECKING:  # pragma: no cover - import-time only
 
 logger = logging.getLogger(__name__)
 
+# Bound once by ``bind_production_serve`` after migrations and boot poisoning.
+# Tests/standalone composition leave it None and retain prior behaviour.
+feature_routing_gate: Any | None = None
+feature_routing_required: bool = False
+
 # stdlib ``logging`` format chosen for daemon-grep readability across
 # replicas: ISO-8601 timestamp, level, logger name, message. If the
 # project ever moves to structlog/JSON, ``_configure_logging`` is the
@@ -398,7 +403,7 @@ def compose_routine_subprocess_dispatcher(forge_config: Any) -> Any:
     configured = getattr(getattr(forge_config, "routine", None), "seat", None)
     seat = (str(configured).strip() if configured else "") or None
 
-    if seat is None:
+    if seat is None and feature_routing_gate is None:
         logger.info(
             "forge-serve: no routine seat is named (routine.seat is unset), so "
             "a routine build is dispatched exactly as it is today — no "
@@ -407,12 +412,26 @@ def compose_routine_subprocess_dispatcher(forge_config: Any) -> Any:
         )
         return dispatch_subprocess_stage
 
-    logger.info(
-        "forge-serve: routine builds run on %r — the factory names its own "
-        "seat on every routine dispatch (--model, from routine.seat)",
-        seat,
-    )
-    return functools.partial(dispatch_subprocess_stage, routine_seat=seat)
+    if seat is not None:
+        logger.info(
+            "forge-serve: routine builds run on %r — the factory names its own "
+            "seat on every routine dispatch (--model, from routine.seat)",
+            seat,
+        )
+
+    async def routed_dispatch(*args: Any, **kwargs: Any) -> Any:
+        correlation_id = kwargs.get("correlation_id")
+        if feature_routing_required and not correlation_id:
+            raise ValueError("required subprocess dispatch has no admitted correlation")
+        if correlation_id:
+            kwargs["feature_routing_id"] = correlation_id
+        kwargs["feature_routing_gate"] = feature_routing_gate
+        kwargs["feature_routing_required"] = feature_routing_required
+        if seat is not None:
+            kwargs["routine_seat"] = seat
+        return await dispatch_subprocess_stage(*args, **kwargs)
+
+    return routed_dispatch
 
 
 def compose_merge_git_surface(forge_config: Any) -> Any | None:
@@ -498,6 +517,8 @@ def compose_merge_executor_deps(
         what_the_machine_says=functools.partial(
             the_publishers_self_check, forge_config
         ),
+        feature_routing_gate=feature_routing_gate,
+        feature_routing_required=feature_routing_required,
     )
 
 
@@ -902,6 +923,8 @@ def bind_production_dispatch_chain(
                     # (the conductor switched off) leaves the guard exactly
                     # as it was: refuse, never routine-launch.
                     conductor_router=conductor_router,
+                    feature_routing_gate=feature_routing_gate,
+                    feature_routing_required=feature_routing_required,
                 )
                 await _serve_gate_activation.rearm_paused_gates(
                     parts=gate_parts,
@@ -915,6 +938,8 @@ def bind_production_dispatch_chain(
                     # A Slack hand-over waiting at its card when the forge
                     # stopped is still answered in its thread.
                     reply_in_thread=make_build_thread_reply(client),
+                    feature_routing_gate=feature_routing_gate,
+                    feature_routing_required=feature_routing_required,
                 )
             except Exception as exc:  # noqa: BLE001 — DDR-007 boot protection
                 logger.error(
@@ -944,6 +969,8 @@ def bind_production_dispatch_chain(
                     nats_client=client,
                     config=forge_config,
                     nats_url=nats_url,
+                    feature_routing_gate=feature_routing_gate,
+                    feature_routing_required=feature_routing_required,
                 )
                 planning_dispatch = (
                     planning_composition.dispatch_callable
@@ -1045,6 +1072,8 @@ def bind_production_dispatch_chain(
             # commit its branch names, through the planning door's own git
             # runner, before its row is written.
             prepared_build_admission=build_prepared_build_admission(forge_config),
+            feature_routing_gate=feature_routing_gate,
+            feature_routing_required=feature_routing_required,
         )
         dispatcher = make_handle_message_dispatcher(deps)
         # Rebind the daemon's dispatch seam BEFORE the consumer's first
@@ -1173,6 +1202,11 @@ def _make_autobuild_dispatcher_closure(
         feature_id: str,
         rationale: str = "",
     ) -> Any:
+        if feature_routing_required:
+            raise ValueError(
+                "required feature routing refuses the fallback supervisor's "
+                "feature-id placeholder; an admitted correlation is required"
+            )
         return await dispatch_autobuild_async(
             build_id=build_id,
             feature_id=feature_id,
@@ -2003,6 +2037,8 @@ def _compose_conductor_router(
         gates_green_reader=gates_green_reader,
         failure_pack_source_reader=failure_pack_source_reader,
         leg_model=forge_config.conductor.seat,
+        feature_routing_gate=feature_routing_gate,
+        feature_routing_required=feature_routing_required,
     )
     driver_deps_factory = build_conductor_driver_deps_factory(
         pool=sqlite_pool,

@@ -43,6 +43,7 @@ __all__ = [
     "fail_run",
     "failure_details",
     "mark_run_failed",
+    "settle_routing_failure",
 ]
 
 
@@ -141,6 +142,50 @@ def mark_run_failed(
         )
         return False
     return True
+
+
+def settle_routing_failure(
+    store: _StoreLike,
+    correlation_id: str,
+    *,
+    stage_label: str,
+    reason: str,
+    log: logging.Logger | None = None,
+) -> bool:
+    """Legally settle routing poison from QUEUED/PAUSED as FAILED.
+
+    Those states have no direct FAILED edge.  After the caller has established
+    durable routing poison, advance synchronously to RUNNING solely for
+    terminal reporting, then use the ordinary failure writer.  There is no
+    await, approval or dispatch between the two commits.
+    """
+    logger = log or _logger
+    row = store.get_run(correlation_id)
+    if row is None:
+        return False
+    state = PlanningState(row["state"])
+    if state in (PlanningState.QUEUED, PlanningState.PAUSED):
+        refused = store.transition(
+            correlation_id=correlation_id,
+            to_state=PlanningState.RUNNING,
+            actor_identity="feature-routing-failure-settlement",
+            stage_label="feature-routing-failure-settlement",
+        )
+        if isinstance(refused, TransitionRefused):
+            logger.warning(
+                "routing failure settlement could not advance %s from %s",
+                correlation_id,
+                state.value,
+            )
+            return False
+    return mark_run_failed(
+        store,
+        correlation_id,
+        stage_label=stage_label,
+        reason=reason,
+        actor="feature-routing-failure-settlement",
+        log=logger,
+    )
 
 
 async def fail_run(

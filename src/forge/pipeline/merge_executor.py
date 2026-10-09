@@ -202,6 +202,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "MERGE_DECISION_TARGET_IDENTIFIER",
+    "MERGE_EXECUTION_ATTEMPT_VERSION",
     "MERGE_REPORT_STAGE_LABEL",
     "MERGE_REPORT_TARGET_IDENTIFIER",
     "MERGE_RESPONSE_SUBJECT_FILTER",
@@ -307,6 +308,13 @@ def _verify_timeout_from(config: Any) -> int:
 
 #: ``details_json`` key on the decision row.
 MERGE_DECISION_DETAILS_KEY: str = "merge_decision"
+
+#: Versioned attribution joining one durable approved decision to the one
+#: executor report allowed to settle it.  A direct CLI press has no consumer
+#: decision token and therefore cannot close queued approved work.
+MERGE_EXECUTION_ATTEMPT_VERSION: int = 1
+MERGE_EXECUTION_ATTEMPT_ID_KEY: str = "execution_attempt_id"
+MERGE_EXECUTION_ATTEMPT_VERSION_KEY: str = "execution_attempt_version"
 
 #: THE THREE RESULT WORDS of the design's second revision, section B, as the
 #: report and the card carry them. Only the first is reachable in this
@@ -466,6 +474,8 @@ class MergeExecutorDeps:
     #: has none runs with no record at all and says so in the log, which is
     #: the same fact as a build whose record reads "not recorded".
     publication_store: Callable[[], Any] | None = None
+    feature_routing_gate: Any | None = None
+    feature_routing_required: bool = False
     #: HOW THE SEND IS ASKED FOR — ``async (config, request) -> answer``.
     #: Left unset it is :func:`~forge.pipeline.publisher_client.ask_the_publisher`,
     #: which posts to the address in the settings. The coordinator never holds
@@ -1154,6 +1164,7 @@ async def execute_merge_deploy(
     expected_candidate_tree: str | None = None,
     expected_candidate_branch: str | None = None,
     worktree_retention: dict[str, Any] | None = None,
+    merge_execution_attempt_id: str | None = None,
 ) -> MergeDeployOutcome:
     """Run join -> checks -> report for one press, and stop before publishing.
 
@@ -1237,6 +1248,18 @@ async def execute_merge_deploy(
     given ``--branch`` only when it is set, so a feature build's argv is byte
     for byte what it always was.
     """
+    # Permanent administrative retirement is checked before routing, clocks,
+    # receipts, leases, publishers, git, model-bearing commands, or deploy.
+    # A malformed retirement-looking row raises just as early and fail-closed.
+    from forge.lifecycle.merge_retirement import refuse_retired_build
+
+    refuse_retired_build(deps.pool.connection, build_id)
+    feature_routing_receipt: dict[str, object] | None = None
+    if deps.feature_routing_required:
+        if deps.feature_routing_gate is None:
+            raise RuntimeError("required merge execution has no feature routing gate")
+        committed = deps.feature_routing_gate.require_committed_success(correlation_id)
+        feature_routing_receipt = committed.to_wire()
     started = deps.clock()
     receipts_dir = deps.receipts_root_fn() / f"merge-{build_id}"
     # The branch of record for this press (Part M, rules 54 and 55).
@@ -1542,6 +1565,24 @@ async def execute_merge_deploy(
             # Additive (Part M, rule 55): the branch this press merged, or
             # would have — truthful for a repair, the feature's own otherwise.
             branch=branch,
+            # A consumer-approved press carries the exact durable decision
+            # attempt.  Direct CLI presses deliberately carry no such block,
+            # so their later report cannot settle queued approval work merely
+            # because it shares the build id and happened later.
+            **(
+                {
+                    MERGE_DECISION_DETAILS_KEY: {
+                        MERGE_EXECUTION_ATTEMPT_VERSION_KEY: (
+                            MERGE_EXECUTION_ATTEMPT_VERSION
+                        ),
+                        MERGE_EXECUTION_ATTEMPT_ID_KEY: (
+                            merge_execution_attempt_id
+                        ),
+                    }
+                }
+                if merge_execution_attempt_id is not None
+                else {}
+            ),
             # Additive, and only when there is something to say: a deploy that
             # ran nowhere special sends no field at all, so every payload that
             # was written before Docker Sandboxes existed is unchanged.
@@ -4198,7 +4239,7 @@ async def execute_merge_deploy(
                         )
                         baseline_path = None
 
-                result = await deps.guardkit_run(
+                merge_run_kwargs: dict[str, Any] = dict(
                     subcommand="autobuild",
                     args=args,
                     repo_path=repo_root,
@@ -4222,6 +4263,13 @@ async def execute_merge_deploy(
                     build=build_id,
                     start_commit=_the_recorded_start_commit(),
                 )
+                if deps.feature_routing_required:
+                    merge_run_kwargs["feature_routing_id"] = correlation_id
+                    merge_run_kwargs["feature_routing_required"] = True
+                    merge_run_kwargs["feature_routing_receipt"] = (
+                        feature_routing_receipt
+                    )
+                result = await deps.guardkit_run(**merge_run_kwargs)
                 report = _parse_merge_report(result)
                 merged_in_report = bool(report and report.get("outcome") == "merged")
                 refusal: str | None = None
@@ -4556,8 +4604,7 @@ async def execute_merge_deploy(
                 and not _the_recorded_step_passed(STEP_MERGE_CHECKS)
                 and _why_the_recorded_step_failed(STEP_MERGE_CHECKS) is None
             ):
-                check_join_said = await ask_the_build_system_to_check_the_join(
-                    deps.guardkit_run,
+                check_join_kwargs: dict[str, Any] = dict(
                     repo_root=repo_root,
                     feature_id=feature_id,
                     j_commit=str(j_commit),
@@ -4566,6 +4613,15 @@ async def execute_merge_deploy(
                     # merge in between that the merge wall allows for are not
                     # its to spend.
                     timeout_seconds=float(_verify_timeout_from(deps.config)),
+                )
+                if deps.feature_routing_required:
+                    check_join_kwargs["feature_routing_id"] = correlation_id
+                    check_join_kwargs["feature_routing_required"] = True
+                    check_join_kwargs["feature_routing_receipt"] = (
+                        feature_routing_receipt
+                    )
+                check_join_said = await ask_the_build_system_to_check_the_join(
+                    deps.guardkit_run, **check_join_kwargs
                 )
                 if check_join_said.ran:
                     checks_passed = check_join_said.checks_passed
@@ -5543,8 +5599,13 @@ class MergeApprovalConsumer:
             )
             return
 
-        # Durable decision row FIRST — the restart / duplicate fence.
+        # Durable decision row FIRST — the restart / duplicate fence.  An
+        # approved decision gets a fresh unguessable executor-attribution
+        # token in the same committed row, before its async task exists.
         now = self._deps.clock()
+        merge_execution_attempt_id = (
+            uuid.uuid4().hex if decision == "approve" else None
+        )
         self._deps.pool.record_stage(
             StageLogEntry(
                 build_id=build_id,
@@ -5561,6 +5622,18 @@ class MergeApprovalConsumer:
                         "decision": decision,
                         "decided_by": payload.decided_by,
                         "request_id": request_id,
+                        **(
+                            {
+                                MERGE_EXECUTION_ATTEMPT_VERSION_KEY: (
+                                    MERGE_EXECUTION_ATTEMPT_VERSION
+                                ),
+                                MERGE_EXECUTION_ATTEMPT_ID_KEY: (
+                                    merge_execution_attempt_id
+                                ),
+                            }
+                            if merge_execution_attempt_id is not None
+                            else {}
+                        ),
                     }
                 },
             )
@@ -5662,6 +5735,7 @@ class MergeApprovalConsumer:
                 expected_candidate_tree=expected_candidate_tree,
                 expected_candidate_branch=expected_candidate_branch,
                 worktree_retention=worktree_retention,
+                merge_execution_attempt_id=str(merge_execution_attempt_id),
             )
         )
         self._tasks.add(task)
@@ -5683,6 +5757,7 @@ class MergeApprovalConsumer:
         expected_candidate_tree: str | None = None,
         expected_candidate_branch: str | None = None,
         worktree_retention: dict[str, Any] | None = None,
+        merge_execution_attempt_id: str,
     ) -> None:
         # Per-repo single-flight: an asyncio lock per repo key PLUS the
         # executor's own durable step probes.
@@ -5703,6 +5778,7 @@ class MergeApprovalConsumer:
                     expected_candidate_tree=expected_candidate_tree,
                     expected_candidate_branch=expected_candidate_branch,
                     worktree_retention=worktree_retention,
+                    merge_execution_attempt_id=merge_execution_attempt_id,
                 )
             except Exception as exc:  # noqa: BLE001 — the task must not die silent
                 logger.error(

@@ -157,6 +157,9 @@ async def ask_the_build_system_to_check_the_join(
     feature_id: str,
     j_commit: str,
     timeout_seconds: float,
+    feature_routing_id: str | None = None,
+    feature_routing_required: bool = False,
+    feature_routing_receipt: object = None,
 ) -> CheckJoinAnswer:
     """Ask for the checks on an already-joined commit. Never raises.
 
@@ -166,7 +169,7 @@ async def ask_the_build_system_to_check_the_join(
     """
     args = [CHECK_JOIN_VERB, feature_id, "--joined", j_commit, "--json"]
     try:
-        result = await run(
+        run_kwargs: dict[str, Any] = dict(
             subcommand=CHECK_JOIN_SUBCOMMAND,
             args=args,
             repo_path=repo_root,
@@ -174,6 +177,12 @@ async def ask_the_build_system_to_check_the_join(
             timeout_seconds=timeout_seconds,
             with_nats_streaming=False,
         )
+        if feature_routing_id is not None or feature_routing_required:
+            run_kwargs["feature_routing_id"] = feature_routing_id
+            run_kwargs["feature_routing_required"] = feature_routing_required
+        if feature_routing_receipt is not None:
+            run_kwargs["feature_routing_receipt"] = feature_routing_receipt
+        result = await run(**run_kwargs)
     except Exception as exc:  # noqa: BLE001 — a GATED ending, never a crash
         # The door the factory runs the build system through carries exactly
         # the commands it was built to carry and refuses anything else, and

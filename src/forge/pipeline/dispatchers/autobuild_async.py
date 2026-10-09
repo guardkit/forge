@@ -345,6 +345,9 @@ async def dispatch_autobuild_async(
     memory_project: str | None = None,
     launch_settings: "Sequence[str] | None" = None,
     source_commit: str | None = None,
+    feature_routing_id: str | None = None,
+    feature_routing_gate: Any | None = None,
+    feature_routing_required: bool = False,
 ) -> AutobuildDispatchHandle:
     """Dispatch ``feature_id``'s autobuild as a long-running async subagent.
 
@@ -514,6 +517,23 @@ async def dispatch_autobuild_async(
             "dispatch_autobuild_async: correlation_id must be a non-empty string"
         )
 
+    routing_receipt = None
+    if feature_routing_id is not None:
+        from forge.lifecycle.feature_routing import validate_feature_routing_id
+
+        feature_routing_id = validate_feature_routing_id(feature_routing_id)
+    if feature_routing_required and feature_routing_id is None:
+        raise ValueError("required autobuild dispatch has no feature_routing_id")
+    if feature_routing_id is not None:
+        if feature_routing_gate is None and feature_routing_required:
+            raise ValueError("required autobuild dispatch has no durable routing gate")
+        if feature_routing_gate is not None:
+            routing_receipt = await feature_routing_gate.ensure_seeded(
+                feature_routing_id,
+                origin_kind="build",
+                origin_id=build_id,
+            )
+
     # 1. Resolve forward context. The builder filters approval and
     #    allowlist internally; if the feature-plan is not yet approved
     #    the builder returns an empty list and we still proceed —
@@ -565,6 +585,13 @@ async def dispatch_autobuild_async(
         "context_entries": serialised_context,
         "lifecycle_emitter": lifecycle_emitter,
     }
+    if feature_routing_id is not None:
+        launch_payload["feature_routing_id"] = feature_routing_id
+    if feature_routing_required:
+        launch_payload["feature_routing_required"] = True
+        if routing_receipt is None:
+            raise ValueError("required autobuild dispatch has no committed routing receipt")
+        launch_payload["feature_routing_receipt"] = routing_receipt.to_wire()
     # DEFECT #19 activation (B4 round-17): thread ``branch`` (and ``repo`` when
     # equally available) from the ALREADY-VALIDATED BuildQueuedPayload the
     # consumer's dispatch closure accepted into the launch payload. Without

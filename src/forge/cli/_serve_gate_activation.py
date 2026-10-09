@@ -1043,6 +1043,8 @@ async def rearm_paused_gates(
     clock: Callable[[], datetime],
     forge_config: Any = None,
     reply_in_thread: BuildThreadReply | None = None,
+    feature_routing_gate: Any | None = None,
+    feature_routing_required: bool = False,
 ) -> list["asyncio.Task[Any]"]:
     """Re-arm every PAUSED build's approval round-trip after a daemon restart.
 
@@ -1138,6 +1140,29 @@ async def rearm_paused_gates(
         # it daemon boot): wrap the per-snapshot body so any unexpected error
         # logs and continues to the next PAUSED build.
         try:
+            if feature_routing_required:
+                routing_id = snap.correlation_id or ""
+                try:
+                    if feature_routing_gate is None:
+                        raise RuntimeError("required feature routing gate is not wired")
+                    feature_routing_gate.require_committed_success(routing_id)
+                except Exception as exc:  # noqa: BLE001 — recovery authority
+                    from forge.cli._conductor_outcome import fail_mode_c_build
+
+                    fail_mode_c_build(
+                        sqlite_pool,
+                        snap.build_id,
+                        summary=f"feature routing recovery refused: {exc}",
+                        what="a paused build recovery without a committed pin",
+                        log=logger,
+                    )
+                    logger.error(
+                        "rearm_paused_gates: build_id=%s has no committed "
+                        "routing authority; settled without interrupting its "
+                        "recorded run or showing a card",
+                        snap.build_id,
+                    )
+                    continue
             ctx = BuildContext(
                 feature_id=snap.feature_id,
                 build_id=snap.build_id,

@@ -155,6 +155,75 @@ def test_a_sidecar_result_is_a_git_op_result_that_carries_the_checks() -> None:
     assert json.loads(result.model_dump_json())["checks"][0]["passed"] is True
 
 
+@pytest.mark.asyncio
+async def test_tree_write_carries_the_exact_committed_routing_receipt() -> None:
+    sent: list[dict[str, Any]] = []
+
+    def post(_url: str, body: dict[str, Any], _timeout: float) -> tuple[int, Any]:
+        sent.append(body)
+        return 200, {"status": "success", "sha": "a" * 40, "checks": []}
+
+    receipt = {
+        "feature_routing_id": "planning_A",
+        "attempt_id": "exact-attempt",
+        "server_id": 2,
+    }
+    runner = SidecarGitRunner("http://unused.invalid", repo=REPO_KEY, post=post)
+
+    result = await runner.prepare_branch_and_write_tree(
+        "/ignored",
+        BRANCH,
+        PLAN_FILES,
+        "planning: plan",
+        feature_routing_id="planning_A",
+        feature_routing_required=True,
+        feature_routing_receipt=receipt,
+    )
+
+    assert result.status == "success"
+    assert sent[0]["feature_routing_id"] == "planning_A"
+    assert sent[0]["feature_routing_required"] is True
+    assert sent[0]["feature_routing_receipt"] == receipt
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "receipt",
+    [
+        None,
+        {
+            "feature_routing_id": "wrong",
+            "attempt_id": "attempt",
+            "server_id": 1,
+        },
+        {
+            "feature_routing_id": "planning_A",
+            "attempt_id": "attempt",
+            "server_id": "1",
+        },
+    ],
+)
+async def test_local_tree_write_refuses_bad_receipt_before_path_or_git(
+    tmp_path: Path, receipt: object
+) -> None:
+    worktrees = tmp_path / "must-not-exist"
+    runner = WorktreeGitRunner(worktrees_root=worktrees)
+
+    result = await runner.prepare_branch_and_write_tree(
+        str(tmp_path / "missing-repo"),
+        BRANCH,
+        PLAN_FILES,
+        "planning: plan",
+        feature_routing_id="planning_A",
+        feature_routing_required=True,
+        feature_routing_receipt=receipt,
+    )
+
+    assert result.status == "failed"
+    assert "feature routing" in result.stderr
+    assert not worktrees.exists()
+
+
 # ---------------------------------------------------------------------------
 # Against the real sidecar
 # ---------------------------------------------------------------------------

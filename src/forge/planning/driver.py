@@ -97,7 +97,12 @@ from forge.planning.escalation import (
     EscalationPolicy,
     evaluate_escalation_phase,
 )
-from forge.planning.failure import DRIVER_ACTOR, fail_run, mark_run_failed
+from forge.planning.failure import (
+    DRIVER_ACTOR,
+    fail_run,
+    mark_run_failed,
+    settle_routing_failure,
+)
 from forge.planning import nothing_to_build
 from forge.planning.handoff import (
     PlannedHandoffHandler,
@@ -1743,6 +1748,8 @@ class PlanningDriverDeps:
     # the target-terminal flag OFF it is never consulted; with the flag ON it is
     # required and a missing collaborator fails the run LOUDLY (never silent).
     dispatch_build_trigger: DispatchBuildTriggerFn | None = None
+    feature_routing_gate: Any | None = None
+    feature_routing_required: bool = False
 
 
 @dataclass(frozen=True)
@@ -1820,6 +1827,15 @@ class PlanningRunDriver:
     def __init__(self, deps: PlanningDriverDeps) -> None:
         self._deps = deps
 
+    def _feature_routing_receipt(
+        self, correlation_id: str
+    ) -> dict[str, object] | None:
+        """Read the immutable committed receipt for a planning launch."""
+        gate = self._deps.feature_routing_gate
+        if gate is None:
+            return None
+        return gate.require_committed_success(correlation_id).to_wire()
+
     # ------------------------------------------------------------------ #
     # Public API
     # ------------------------------------------------------------------ #
@@ -1851,6 +1867,17 @@ class PlanningRunDriver:
                 state.value,
             )
             return
+
+        # Recovery/card entry points may only reuse a committed receipt.  A
+        # PAUSED run is never a fresh admission and therefore cannot seed.
+        if deps.feature_routing_gate is not None and state is PlanningState.PAUSED:
+            try:
+                deps.feature_routing_gate.require_committed_success(correlation_id)
+            except Exception as exc:  # fail closed; settlement remains existing path
+                await self._settle_routing_failure(
+                    correlation_id, f"feature routing is unavailable: {exc}"
+                )
+                return
 
         plan_run_id = f"plan-{correlation_id}"
 
@@ -1890,6 +1917,27 @@ class PlanningRunDriver:
                         reason=preflight.summary,
                     )
                     return
+
+        # The QUEUED→RUNNING commit above precedes the sole HTTP seed.  A
+        # recovered RUNNING/FEATURE_* path executes the same durable gate;
+        # SUCCEEDED reuses its receipt and STARTED/UNKNOWN/FAILED refuses.
+        if deps.feature_routing_required and deps.feature_routing_gate is None:
+            await self._settle_routing_failure(
+                correlation_id, "required feature routing gate is unavailable"
+            )
+            return
+        if deps.feature_routing_gate is not None and state is not PlanningState.PAUSED:
+            try:
+                await deps.feature_routing_gate.ensure_seeded(
+                    correlation_id,
+                    origin_kind="planning",
+                    origin_id=correlation_id,
+                )
+            except Exception as exc:
+                await self._settle_routing_failure(
+                    correlation_id, f"feature routing admission failed: {exc}"
+                )
+                return
 
         # THE DOOR, AND IT IS BEFORE THE FIRST MODEL IS ASKED ANYTHING
         # (22 September 2026, after the stage's second independent review).
@@ -3789,6 +3837,9 @@ class PlanningRunDriver:
                 launch_settings=recorded_settings,
                 build=whose_work,
                 declared_at=declared_at,
+                feature_routing_id=correlation_id,
+                feature_routing_required=self._deps.feature_routing_required,
+                feature_routing_receipt=self._feature_routing_receipt(correlation_id),
             )
         except Exception as exc:  # noqa: BLE001 — write boundary
             await self._fail_leg(
@@ -6543,7 +6594,11 @@ class PlanningRunDriver:
             # failed normalizer never kills the plan — the decided stamps it
             # wrote ride the commit, and everything is receipted below.
             stamps = await self._stamp_normalizer_step(
-                worktree, feature_id, spec_feature_paths, rules_only=rules_only
+                worktree,
+                feature_id,
+                spec_feature_paths,
+                rules_only=rules_only,
+                feature_routing_id=correlation_id,
             )
             stamp_state["outcome"] = stamps
             if stamps.stops_the_run:
@@ -6639,6 +6694,9 @@ class PlanningRunDriver:
                 launch_settings=recorded_settings,
                 build=whose_work,
                 declared_at=declared_at,
+                feature_routing_id=correlation_id,
+                feature_routing_required=self._deps.feature_routing_required,
+                feature_routing_receipt=self._feature_routing_receipt(correlation_id),
             )
         except Exception as exc:  # noqa: BLE001 — write boundary
             await self._fail_leg(
@@ -7650,6 +7708,9 @@ class PlanningRunDriver:
                 launch_settings=recorded_settings,
                 build=whose_work,
                 declared_at=declared_at,
+                feature_routing_id=correlation_id,
+                feature_routing_required=self._deps.feature_routing_required,
+                feature_routing_receipt=self._feature_routing_receipt(correlation_id),
             )
         except Exception as exc:  # noqa: BLE001 — write boundary
             await self._fail_leg(
@@ -8103,6 +8164,7 @@ class PlanningRunDriver:
         spec_feature_paths: list[str],
         *,
         rules_only: bool = False,
+        feature_routing_id: str | None = None,
     ) -> "StampNormalizerOutcome":
         """Run THE STAMP NORMALIZER against the planning worktree (pre-validate).
 
@@ -8181,6 +8243,19 @@ class PlanningRunDriver:
             outcome = StampNormalizerOutcome(status="refused", detail=fill.reason)
         else:
             try:
+                routing_kwargs: dict[str, Any] = {}
+                if _accepts_keyword(normalize, "feature_routing_id"):
+                    routing_kwargs["feature_routing_id"] = feature_routing_id
+                if _accepts_keyword(normalize, "feature_routing_required"):
+                    routing_kwargs["feature_routing_required"] = (
+                        self._deps.feature_routing_required
+                    )
+                if _accepts_keyword(normalize, "feature_routing_receipt"):
+                    routing_kwargs["feature_routing_receipt"] = (
+                        self._feature_routing_receipt(feature_routing_id)
+                        if feature_routing_id is not None
+                        else None
+                    )
                 if by_rule_only:
                     logger.info(
                         "stamp normalizer hook: %s — first stamping by rule only "
@@ -8188,9 +8263,11 @@ class PlanningRunDriver:
                         "asked on this call",
                         feature_id,
                     )
-                    outcome = await normalize(worktree, feature_id, rules_only=True)
+                    outcome = await normalize(
+                        worktree, feature_id, rules_only=True, **routing_kwargs
+                    )
                 else:
-                    outcome = await normalize(worktree, feature_id)
+                    outcome = await normalize(worktree, feature_id, **routing_kwargs)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 — collaborator boundary
@@ -9069,6 +9146,9 @@ class PlanningRunDriver:
                 launch_settings=recorded_settings,
                 build=whose_work,
                 declared_at=declared_at,
+                feature_routing_id=correlation_id,
+                feature_routing_required=self._deps.feature_routing_required,
+                feature_routing_receipt=self._feature_routing_receipt(correlation_id),
             )
         except Exception as exc:  # noqa: BLE001 — write boundary
             return await self._fail_leg(
@@ -10129,6 +10209,9 @@ class PlanningRunDriver:
                 launch_settings=recorded_settings,
                 build=whose_work,
                 declared_at=declared_at,
+                feature_routing_id=correlation_id,
+                feature_routing_required=self._deps.feature_routing_required,
+                feature_routing_receipt=self._feature_routing_receipt(correlation_id),
             )
         except Exception as exc:  # noqa: BLE001 — write boundary
             return await self._fail_leg(
@@ -12360,6 +12443,27 @@ class PlanningRunDriver:
             except Exception:
                 logger.warning(
                     "planning driver: planning-failed projection did not go out "
+                    "for %s (durable row remains FAILED)",
+                    correlation_id,
+                )
+
+    async def _settle_routing_failure(
+        self, correlation_id: str, reason: str
+    ) -> None:
+        transitioned = settle_routing_failure(
+            self._deps.store,
+            correlation_id,
+            stage_label="feature-routing",
+            reason=reason,
+            log=logger,
+        )
+        publish = self._deps.publish_planning_failed
+        if transitioned and publish is not None:
+            try:
+                await publish(correlation_id, reason)
+            except Exception:
+                logger.warning(
+                    "planning driver: routing failure projection did not go out "
                     "for %s (durable row remains FAILED)",
                     correlation_id,
                 )

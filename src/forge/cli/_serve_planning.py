@@ -829,6 +829,8 @@ async def compose_planning_consumer_and_dispatch(
     config: ForgeConfig,
     nats_url: str | None = None,
     clock: Callable[[], datetime] | None = None,
+    feature_routing_gate: Any | None = None,
+    feature_routing_required: bool = False,
 ) -> PlanningCompositionResult | None:
     """Compose planning consumer + dispatch stack with boot audit gating.
 
@@ -1074,6 +1076,9 @@ async def compose_planning_consumer_and_dispatch(
                 stage_log_writer=stage_log_writer,
                 feature_id=plan_run_id,
                 request_text=request_text,
+                feature_routing_id=correlation_id,
+                feature_routing_gate=feature_routing_gate,
+                feature_routing_required=feature_routing_required,
             )
 
         # -- target terminal legs (Lane B / Phase E1 B2) ------------------
@@ -1113,6 +1118,9 @@ async def compose_planning_consumer_and_dispatch(
                     repository_facts=repository_facts,
                     context=context,
                 ),
+                feature_routing_id=correlation_id,
+                feature_routing_gate=feature_routing_gate,
+                feature_routing_required=feature_routing_required,
             )
 
         async def dispatch_feature_plan(
@@ -1154,6 +1162,9 @@ async def compose_planning_consumer_and_dispatch(
                     context=context,
                     already_done_allowed=already_done_allowed,
                 ),
+                feature_routing_id=correlation_id,
+                feature_routing_gate=feature_routing_gate,
+                feature_routing_required=feature_routing_required,
             )
 
         # -- the build trigger (Lane B / Phase E1 B3) ---------------------
@@ -1455,6 +1466,8 @@ async def compose_planning_consumer_and_dispatch(
                 validate_gate_registry=validate_gate_registry,
                 # Lane B / Phase E1 (B3) — the Mode B build trigger.
                 dispatch_build_trigger=dispatch_build_trigger,
+                feature_routing_gate=feature_routing_gate,
+                feature_routing_required=feature_routing_required,
             )
         )
 

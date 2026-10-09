@@ -92,6 +92,32 @@ class TestTaskIdBinding:
         assert dispatch.calls[0]["task_id"] == "TASK-FIX007"
 
     @pytest.mark.asyncio
+    async def test_every_repair_leg_reuses_the_admitted_routing_identity(self) -> None:
+        dispatch = _RecordingDispatch()
+        gate = object()
+        adapter = _adapter(
+            dispatch,
+            feature_routing_gate=gate,
+            feature_routing_required=True,
+        )
+
+        await adapter(stage=StageClass.TASK_REVIEW, build_id=BUILD_ID)
+        await adapter(
+            stage=StageClass.TASK_WORK,
+            build_id=BUILD_ID,
+            fix_task=FixTaskRef(
+                fix_task_id="TASK-FIX007-A", review_history_index=0
+            ),
+        )
+
+        assert [call["feature_routing_id"] for call in dispatch.calls] == [
+            "corr-build-1",
+            "corr-build-1",
+        ]
+        assert all(call["feature_routing_gate"] is gate for call in dispatch.calls)
+        assert all(call["feature_routing_required"] is True for call in dispatch.calls)
+
+    @pytest.mark.asyncio
     async def test_a_row_without_task_id_still_reaches_the_dispatcher(self) -> None:
         """One refusal, not two.
 

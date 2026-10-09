@@ -677,4 +677,4 @@ def test_a_ledger_at_the_previous_schema_is_still_accepted(tmp_path):
     """A ledger written before schema 17 (\"Teach it version 17\") is still read."""
     state=r.ledger_state(seed(tmp_path/'previous.db',16))
     assert state['schema_version']==16
-    assert r.LEDGER_SCHEMA_VERSION==17
+    assert r.LEDGER_SCHEMA_VERSION==18

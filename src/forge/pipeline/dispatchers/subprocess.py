@@ -893,6 +893,9 @@ async def dispatch_subprocess_stage(
     extra_args: list[str] | None = None,
     memory_project: str | None = None,
     launch_settings: Sequence[str] | None = None,
+    feature_routing_id: str | None = None,
+    feature_routing_gate: Any | None = None,
+    feature_routing_required: bool = False,
 ) -> StageDispatchResult:
     """Dispatch a Mode A subprocess stage and return a structured outcome.
 
@@ -1077,6 +1080,23 @@ async def dispatch_subprocess_stage(
     started_at = time.monotonic()
 
     try:
+        feature_routing_receipt: dict[str, object] | None = None
+        if feature_routing_id is not None:
+            from forge.lifecycle.feature_routing import validate_feature_routing_id
+
+            feature_routing_id = validate_feature_routing_id(feature_routing_id)
+        if feature_routing_required and feature_routing_id is None:
+            raise ValueError("required subprocess dispatch has no feature_routing_id")
+        if feature_routing_id is not None:
+            if feature_routing_gate is None and feature_routing_required:
+                raise ValueError("required subprocess dispatch has no durable routing gate")
+            if feature_routing_gate is not None:
+                committed = await feature_routing_gate.ensure_seeded(
+                    feature_routing_id,
+                    origin_kind="repair",
+                    origin_id=build_id,
+                )
+                feature_routing_receipt = committed.to_wire()
         plan = _build_argv_for_stage(
             stage=stage,
             build_id=build_id,
@@ -1114,6 +1134,12 @@ async def dispatch_subprocess_stage(
             runner_kwargs["memory_project"] = str(memory_project)
         if launch_settings:
             runner_kwargs["launch_settings"] = tuple(str(n) for n in launch_settings)
+        if feature_routing_id is not None:
+            runner_kwargs["feature_routing_id"] = feature_routing_id
+        if feature_routing_required:
+            runner_kwargs["feature_routing_required"] = True
+        if feature_routing_receipt is not None:
+            runner_kwargs["feature_routing_receipt"] = feature_routing_receipt
 
         guardkit_result = await subprocess_runner(**runner_kwargs)
 

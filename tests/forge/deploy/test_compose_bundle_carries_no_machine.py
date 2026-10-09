@@ -139,6 +139,18 @@ class TestTheBundleRenders:
         for service in ("coordinator:", "answer-service:", "forge-publisher:"):
             assert service in rendered, f"{service} is missing from the bundle"
 
+    def test_the_coordinator_carries_the_optional_feature_router_setting(self) -> None:
+        compose = (BUNDLE / "compose.yaml").read_text()
+        assert (
+            "FORGE_FEATURE_ROUTER_URL: ${FORGE_FEATURE_ROUTER_URL:-}" in compose
+        ), (
+            "the coordinator does not receive an operator-supplied feature "
+            "router URL, or makes the still-optional setting mandatory"
+        )
+        assert "FORGE_FEATURE_ROUTER_URL=\n" in (
+            BUNDLE / ".env.example"
+        ).read_text()
+
 
 class TestNothingOfThisMachineIsInIt:
     def test_no_address_but_the_documentation_one(self, rendered: str) -> None:
