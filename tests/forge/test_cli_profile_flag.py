@@ -98,6 +98,11 @@ def fake_persistence(monkeypatch: pytest.MonkeyPatch) -> _FakePersistence:
     monkeypatch.setattr(
         cli_queue, "_planning_handoff_retirement_preflight", lambda path: frozenset()
     )
+    monkeypatch.setattr(
+        cli_queue,
+        "_planning_handoff_retirement_after_migration",
+        lambda persistence: frozenset(),
+    )
     monkeypatch.setattr(cli_queue, "publish", lambda subject, body: None)
     return fake
 

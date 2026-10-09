@@ -23,6 +23,7 @@ attempt must not reach it anyway.
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 from typing import Any
 from unittest.mock import Mock
@@ -34,8 +35,13 @@ from click.testing import CliRunner
 from forge.cli import queue as cli_queue
 from forge.config.conductor import CONDUCTOR_FLAG_PATH
 from forge.lifecycle.modes import BuildMode
+from forge.lifecycle.migrations import apply_at_boot
 from forge.lifecycle.planning_handoff_preflight import (
     preflight_retired_planning_handoff_correlations,
+)
+from forge.lifecycle.planning_handoff_retirement import (
+    PlanningHandoffRetirementError,
+    retired_planning_handoff_correlations,
 )
 from tests.forge.lifecycle.planning_handoff_fixture import (
     CORRELATION as RETIRED_CORRELATION,
@@ -83,6 +89,11 @@ def persistence(monkeypatch: pytest.MonkeyPatch) -> _RecordingPersistence:
     monkeypatch.setattr(cli_queue, "make_persistence", lambda config: fake)
     monkeypatch.setattr(
         cli_queue, "_planning_handoff_retirement_preflight", lambda path: frozenset()
+    )
+    monkeypatch.setattr(
+        cli_queue,
+        "_planning_handoff_retirement_after_migration",
+        lambda persistence: frozenset(),
     )
     return fake
 
@@ -195,6 +206,35 @@ def _assert_nothing_written(
     assert published == [], "a refused queue attempt published to the bus"
 
 
+def _make_v16_ledger(path: Path, *, malformed: bool = False) -> None:
+    connection = sqlite3.connect(path)
+    apply_at_boot(connection)
+    connection.execute("DROP TABLE feature_routing_seeds")
+    connection.execute("DELETE FROM schema_version WHERE version > 16")
+    connection.execute("ALTER TABLE builds DROP COLUMN source_commit")
+    if malformed:
+        connection.execute("ALTER TABLE planning_runs DROP COLUMN launch_settings")
+    connection.commit()
+    connection.close()
+
+
+def _record_queue_writer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[sqlite3.Connection]:
+    from forge.adapters.sqlite import connect as sqlite_connect
+
+    opened: list[sqlite3.Connection] = []
+    original = sqlite_connect.connect_writer
+
+    def recording_connect(path: Path) -> sqlite3.Connection:
+        connection = original(path)
+        opened.append(connection)
+        return connection
+
+    monkeypatch.setattr(sqlite_connect, "connect_writer", recording_connect)
+    return opened
+
+
 class TestPlanningHandoffRetirementPreflight:
     """The permanent guard precedes both queue admission paths."""
 
@@ -295,6 +335,133 @@ class TestPlanningHandoffRetirementPreflight:
         assert "planning handoff was permanently retired before routing" in result.output
         _assert_nothing_written(persistence, published)
 
+
+class TestPlanningHandoffPostMigrationValidation:
+    """The migrated writer is authoritative before either admission path."""
+
+    def test_malformed_v16_refuses_after_migration_and_closes_writer(
+        self,
+        tmp_path: Path,
+        repo_dir: Path,
+        feature_yaml: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        db_path = tmp_path / "legacy-malformed.db"
+        _make_v16_ledger(db_path, malformed=True)
+        assert preflight_retired_planning_handoff_correlations(db_path) == frozenset()
+        config = _write_config(
+            tmp_path, repo_dir, conductor=None, name="forge-connected.yaml"
+        )
+        monkeypatch.setenv("FORGE_DB_PATH", str(db_path))
+        published: list[tuple[str, bytes]] = []
+        monkeypatch.setattr(
+            cli_queue, "publish", lambda *args: published.append(args)
+        )
+        opened = _record_queue_writer(monkeypatch)
+
+        result = _queue(
+            config,
+            positional="FEAT-INDEPENDENT",
+            repo_dir=repo_dir,
+            feature_yaml=feature_yaml,
+            mode="a",
+            extra=["--correlation-id", "ordinary"],
+        )
+
+        assert result.exit_code != 0
+        assert "could not be validated after migration" in result.output
+        assert len(opened) == 1
+        with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+            opened[0].execute("SELECT 1")
+        inspection = sqlite3.connect(db_path)
+        with pytest.raises(PlanningHandoffRetirementError, match="launch_settings"):
+            retired_planning_handoff_correlations(inspection)
+        assert inspection.execute("SELECT count(*) FROM builds").fetchone()[0] == 0
+        inspection.close()
+        assert published == []
+
+    def test_final_snapshot_refuses_retirement_missed_by_preflight(
+        self,
+        tmp_path: Path,
+        repo_dir: Path,
+        feature_yaml: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        db_path = tmp_path / "retired-after-preflight.db"
+        connection, event_ids = make_planning_ledger(db_path, version=18)
+        add_planning_retirement(connection, event_ids)
+        connection.commit()
+        connection.close()
+        config = _write_config(
+            tmp_path, repo_dir, conductor=None, name="forge-connected.yaml"
+        )
+        monkeypatch.setenv("FORGE_DB_PATH", str(db_path))
+        monkeypatch.setattr(
+            cli_queue,
+            "_planning_handoff_retirement_preflight",
+            lambda path: frozenset(),
+        )
+        published: list[tuple[str, bytes]] = []
+        monkeypatch.setattr(
+            cli_queue, "publish", lambda *args: published.append(args)
+        )
+        opened = _record_queue_writer(monkeypatch)
+
+        result = _queue(
+            config,
+            positional="FEAT-INDEPENDENT",
+            repo_dir=repo_dir,
+            feature_yaml=feature_yaml,
+            mode="a",
+            extra=["--correlation-id", RETIRED_CORRELATION],
+        )
+
+        assert result.exit_code != 0
+        assert "planning handoff was permanently retired before routing" in result.output
+        assert len(opened) == 1
+        with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+            opened[0].execute("SELECT 1")
+        inspection = sqlite3.connect(db_path)
+        assert inspection.execute("SELECT count(*) FROM builds").fetchone()[0] == 0
+        inspection.close()
+        assert published == []
+
+    def test_valid_receipt_free_v16_migrates_and_queues_normally(
+        self,
+        tmp_path: Path,
+        repo_dir: Path,
+        feature_yaml: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        db_path = tmp_path / "legacy-valid.db"
+        _make_v16_ledger(db_path)
+        config = _write_config(
+            tmp_path, repo_dir, conductor=None, name="forge-connected.yaml"
+        )
+        monkeypatch.setenv("FORGE_DB_PATH", str(db_path))
+        published: list[tuple[str, bytes]] = []
+        monkeypatch.setattr(
+            cli_queue, "publish", lambda *args: published.append(args)
+        )
+        opened = _record_queue_writer(monkeypatch)
+
+        result = _queue(
+            config,
+            positional="FEAT-INDEPENDENT",
+            repo_dir=repo_dir,
+            feature_yaml=feature_yaml,
+            mode="a",
+            extra=["--correlation-id", "ordinary"],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert len(opened) == 1
+        assert opened[0].execute("SELECT max(version) FROM schema_version").fetchone()[
+            0
+        ] == 18
+        assert opened[0].execute("SELECT count(*) FROM builds").fetchone()[0] == 1
+        assert len(published) == 1
+        opened[0].close()
 
 # ---------------------------------------------------------------------------
 # The retired full journey

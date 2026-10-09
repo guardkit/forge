@@ -69,6 +69,11 @@ def persistence(monkeypatch: pytest.MonkeyPatch) -> _RecordingPersistence:
     monkeypatch.setattr(
         cli_queue, "_planning_handoff_retirement_preflight", lambda path: frozenset()
     )
+    monkeypatch.setattr(
+        cli_queue,
+        "_planning_handoff_retirement_after_migration",
+        lambda persistence: frozenset(),
+    )
     return fake
 
 
