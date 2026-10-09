@@ -298,13 +298,63 @@ def make_persistence(config: ForgeConfig) -> _PersistenceLike:
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
     connection = connect_writer(db_path)
-    apply_at_boot(connection)
+    try:
+        apply_at_boot(connection)
+    except Exception:
+        connection.close()
+        raise
 
     # ``config`` is forward-passed only — current persistence reads no
     # config fields. Keeping the parameter lets future tasks (e.g.
     # WAL-mode tuning) plumb new fields without breaking the seam.
     _ = config
     return SqliteLifecyclePersistence(connection=connection, db_path=db_path)
+
+
+def _planning_handoff_retirement_after_migration(
+    persistence: _PersistenceLike,
+) -> frozenset[str]:
+    """Validate the migrated ledger on the persistence writer connection."""
+
+    from forge.lifecycle.planning_handoff_retirement import (
+        retired_planning_handoff_correlations,
+    )
+
+    connection = getattr(persistence, "connection", None)
+    if connection is None:
+        raise RuntimeError(
+            "queue persistence does not expose its migrated SQLite connection"
+        )
+    return retired_planning_handoff_correlations(connection)
+
+
+def _close_persistence_connection(persistence: _PersistenceLike) -> None:
+    """Close a refused queue command's writer without masking its refusal."""
+
+    connection = getattr(persistence, "connection", None)
+    if connection is None:
+        return
+    try:
+        connection.close()
+    except Exception as exc:  # pragma: no cover - best-effort diagnostic
+        logger.warning(
+            "forge queue: could not close refused persistence connection (%s)",
+            exc,
+        )
+
+
+def _make_validated_persistence(
+    config: ForgeConfig,
+) -> tuple[_PersistenceLike, frozenset[str]]:
+    """Create one persistence facade and validate its post-migration ledger."""
+
+    persistence = make_persistence(config)
+    try:
+        retired = _planning_handoff_retirement_after_migration(persistence)
+    except Exception:
+        _close_persistence_connection(persistence)
+        raise
+    return persistence, retired
 
 
 def publish(subject: str, body: bytes) -> None:
@@ -1015,9 +1065,28 @@ def queue_cmd(
         )
         sys.exit(EXIT_PUBLISH_FAILED)
 
-    # Construct one persistence facade only after the read-only preflight and
-    # share it with both the Mode-C admission and the ordinary queue path.
-    persistence = make_persistence(config)
+    # Construct one persistence facade after the read-only preflight, migrate
+    # through its writer, then validate the resulting v18 ledger on that same
+    # connection before either queue path can create a row, seed, model call or
+    # publication. This second authoritative snapshot also closes the race in
+    # which a retirement becomes visible after the read-only preflight.
+    try:
+        persistence, retired_handoffs = _make_validated_persistence(config)
+    except Exception as exc:
+        click.echo(
+            "Nothing was queued: planning handoff retirement history could "
+            f"not be validated after migration ({type(exc).__name__}: {exc}).",
+            err=True,
+        )
+        sys.exit(EXIT_PUBLISH_FAILED)
+    if effective_correlation_id in retired_handoffs:
+        _close_persistence_connection(persistence)
+        click.echo(
+            "Nothing was queued: planning handoff was permanently retired "
+            "before routing.",
+            err=True,
+        )
+        sys.exit(EXIT_PUBLISH_FAILED)
 
     # 3c. THE FIX JOURNEY GOES THROUGH THE SHARED ADMISSION.
     #     Everything a fix journey needs — the cap law, the TASK-id check,

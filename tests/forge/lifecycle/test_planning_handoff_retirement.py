@@ -149,8 +149,11 @@ def test_deep_selected_json_is_a_named_refusal(tmp_path: Path) -> None:
     connection.commit()
     connection.close()
 
-    with pytest.raises(PlanningHandoffRetirementError, match="not valid JSON"):
+    with pytest.raises(PlanningHandoffRetirementError) as exc_info:
         preflight_retired_planning_handoff_correlations(db_path)
+    assert str(exc_info.value).startswith(
+        "invalid planning handoff retirement receipt:"
+    )
 
 
 def test_deep_unselected_ordinary_json_is_tolerated(tmp_path: Path) -> None:
