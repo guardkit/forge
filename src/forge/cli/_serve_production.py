@@ -46,6 +46,12 @@ from forge.cli._serve_async_task_starter import build_async_task_starter
 from forge.cli._serve_config import ServeConfig
 from forge.config.models import ForgeConfig
 from forge.lifecycle.migrations import apply_at_boot
+from forge.lifecycle.planning_handoff_preflight import (
+    preflight_retired_planning_handoff_correlations,
+)
+from forge.lifecycle.planning_handoff_retirement import (
+    retired_planning_handoff_correlations,
+)
 from forge.lifecycle.persistence import SqliteLifecyclePersistence
 from forge.pipeline.publication_switch import say_where_publication_stands_at_boot
 from forge.pipeline.publisher_client import the_publishers_self_check
@@ -1271,6 +1277,13 @@ def bind_production_serve(config: ServeConfig, forge_config: ForgeConfig) -> Non
             "directory containing ./forge.yaml."
         )
 
+    # Validate permanent planning-handoff retirement history through a
+    # read-only handle before this binding creates a directory, opens a writer,
+    # migrates, writes bridge telemetry or poisons an unfinished routing seed.
+    # A missing database and a receipt-free legacy database retain the existing
+    # fresh-start/migration path.
+    preflight_retired_planning_handoff_correlations(config.db_path)
+
     # Step 1.2 (22 September 2026) — WHERE PUBLICATION STANDS, said once, at
     # boot. The design's section G says the activation check is run again each
     # time the coordinator starts. The merge press asks it per press, which
@@ -1331,6 +1344,11 @@ def bind_production_serve(config: ServeConfig, forge_config: ForgeConfig) -> Non
     schema_version_after = apply_at_boot(connection)
     applied = max(0, schema_version_after - schema_version_before)
     logger.info("forge-serve: applied %d SQLite migration(s) at boot", applied)
+
+    # The database is now the release's v18 shape. Validate it again through
+    # the full canonical reader before any later boot writer or recovery path.
+    # The returned set grants no runtime exemption here.
+    retired_planning_handoff_correlations(connection)
 
     # Step 3.5b (TASK-FORGE-FRR-PEBR-WIREUP) — apply the lifecycle-
     # bridge coexistence migration so the

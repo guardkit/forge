@@ -103,6 +103,7 @@ def deps_factory(forge_config: ForgeConfig):
             is_duplicate_terminal=is_dup,
             dispatch_build=dispatch,
             publish_build_failed=publish_failed,
+            retired_planning_handoffs=lambda: frozenset(),
         )
         return deps, {
             "is_duplicate_terminal": is_dup,

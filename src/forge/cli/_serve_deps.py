@@ -281,6 +281,22 @@ def _build_is_duplicate_terminal(
     return is_duplicate_terminal
 
 
+def _build_retired_planning_handoffs_reader(
+    sqlite_pool: SqliteLifecyclePersistence,
+) -> Callable[[], frozenset[str]]:
+    """Bind the canonical reader to the daemon's read-only SQLite handle."""
+
+    def read_retired_planning_handoffs() -> frozenset[str]:
+        from forge.lifecycle.planning_handoff_retirement import (
+            retired_planning_handoff_correlations,
+        )
+
+        with sqlite_pool._reader() as connection:
+            return retired_planning_handoff_correlations(connection)
+
+    return read_retired_planning_handoffs
+
+
 def _utc_now() -> datetime:
     """Composition-root wall clock for the gate.
 
@@ -2445,6 +2461,9 @@ def build_pipeline_consumer_deps(
     if reply_in_thread is None:
         reply_in_thread = make_build_thread_reply(client)
     is_duplicate_terminal = _build_is_duplicate_terminal(sqlite_pool)
+    retired_planning_handoffs = _build_retired_planning_handoffs_reader(
+        sqlite_pool
+    )
     dispatch_build = _build_dispatch_build(
         sqlite_pool=sqlite_pool,
         forward_context_builder=forward_context_builder,
@@ -2473,6 +2492,7 @@ def build_pipeline_consumer_deps(
         is_duplicate_terminal=is_duplicate_terminal,
         dispatch_build=dispatch_build,
         publish_build_failed=publish_build_failed,
+        retired_planning_handoffs=retired_planning_handoffs,
         register_ack_handle=register_ack_handle,
         record_build_rejection=record_build_rejection,
         reply_in_thread=reply_in_thread,

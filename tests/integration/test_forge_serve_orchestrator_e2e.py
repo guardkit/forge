@@ -552,6 +552,7 @@ class TestForgeServeLifecycleE2E:
                 is_duplicate_terminal=_is_duplicate_terminal,
                 dispatch_build=_dispatch_build,
                 publish_build_failed=_publish_build_failed,
+                retired_planning_handoffs=lambda: frozenset(),
             )
             _serve_daemon.dispatch_payload = make_handle_message_dispatcher(deps)
 

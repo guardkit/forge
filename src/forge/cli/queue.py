@@ -248,6 +248,27 @@ class _PersistenceLike(Protocol):
     def record_pending_build(self, payload: Any) -> str: ...
 
 
+def _resolved_db_path() -> Path:
+    """Return the queue command's canonical Forge database path."""
+
+    raw_path = os.environ.get("FORGE_DB_PATH")
+    return Path(raw_path).expanduser() if raw_path else DEFAULT_DB_PATH.expanduser()
+
+
+def _planning_handoff_retirement_preflight(db_path: Path) -> frozenset[str]:
+    """Run the shared read-only retirement preflight.
+
+    Kept as a module-level seam so CLI tests can remain hermetic without a
+    real Forge database. Production always uses the canonical lifecycle helper.
+    """
+
+    from forge.lifecycle.planning_handoff_preflight import (
+        preflight_retired_planning_handoff_correlations,
+    )
+
+    return preflight_retired_planning_handoff_correlations(db_path)
+
+
 # ---------------------------------------------------------------------------
 # Module-level seams (mockable in tests)
 # ---------------------------------------------------------------------------
@@ -273,8 +294,7 @@ def make_persistence(config: ForgeConfig) -> _PersistenceLike:
     from forge.adapters.sqlite.connect import connect_writer
     from forge.lifecycle.migrations import apply_at_boot
 
-    raw_path = os.environ.get("FORGE_DB_PATH")
-    db_path = Path(raw_path).expanduser() if raw_path else DEFAULT_DB_PATH.expanduser()
+    db_path = _resolved_db_path()
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
     connection = connect_writer(db_path)
@@ -554,6 +574,7 @@ def _admit_fix_journey(
     uncapped_acknowledged: bool,
     max_turns: int,
     sdk_timeout_seconds: int,
+    persistence: _PersistenceLike,
 ) -> None:
     """Open a fix journey through the shared admission, then exit.
 
@@ -574,8 +595,6 @@ def _admit_fix_journey(
         FixPublishFailed,
         admit_fix_build,
     )
-
-    persistence = make_persistence(config)
 
     # Part L, rule 49: a repair rides a branch that carries its task file.
     preparer = _repair_task_preparer(
@@ -973,6 +992,33 @@ def queue_cmd(
     )
     effective_correlation_id = correlation_id or str(uuid.uuid4())
 
+    # Retirement is checked through a read-only handle before make_persistence
+    # can create directories, open a writer or apply migrations. A receipt-free
+    # legacy database retains the ordinary migration path; selected retirement
+    # history is always validated by the canonical shared reader.
+    try:
+        retired_handoffs = _planning_handoff_retirement_preflight(
+            _resolved_db_path()
+        )
+    except Exception as exc:
+        click.echo(
+            "Nothing was queued: planning handoff retirement history could "
+            f"not be validated ({type(exc).__name__}: {exc}).",
+            err=True,
+        )
+        sys.exit(EXIT_PUBLISH_FAILED)
+    if effective_correlation_id in retired_handoffs:
+        click.echo(
+            "Nothing was queued: planning handoff was permanently retired "
+            "before routing.",
+            err=True,
+        )
+        sys.exit(EXIT_PUBLISH_FAILED)
+
+    # Construct one persistence facade only after the read-only preflight and
+    # share it with both the Mode-C admission and the ordinary queue path.
+    persistence = make_persistence(config)
+
     # 3c. THE FIX JOURNEY GOES THROUGH THE SHARED ADMISSION.
     #     Everything a fix journey needs — the cap law, the TASK-id check,
     #     the fix-task YAML's parent_feature, the build row and the publish —
@@ -993,6 +1039,7 @@ def queue_cmd(
             uncapped_acknowledged=uncapped_acknowledged,
             max_turns=effective_max_turns,
             sdk_timeout_seconds=effective_timeout,
+            persistence=persistence,
         )
         return  # pragma: no cover - _admit_fix_journey always exits
 
@@ -1022,9 +1069,8 @@ def queue_cmd(
         task_id=task_id,
     )
 
-    # 5. Construct the persistence facade (production: SQLite; tests:
-    #    monkey-patched fake).
-    persistence = make_persistence(config)
+    # 5. The persistence facade was constructed after the read-only retirement
+    #    preflight above (production: SQLite; tests: monkey-patched fake).
 
     # 6. Active in-flight check (Group C "active duplicate").
     if persistence.exists_active_build(feature_id):

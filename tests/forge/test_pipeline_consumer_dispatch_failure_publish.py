@@ -143,6 +143,7 @@ def _make_deps(
         is_duplicate_terminal=is_dup,
         dispatch_build=dispatch_build,
         publish_build_failed=publish_failed,
+        retired_planning_handoffs=lambda: frozenset(),
     )
     return deps, {
         "is_duplicate_terminal": is_dup,

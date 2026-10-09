@@ -34,6 +34,14 @@ from click.testing import CliRunner
 from forge.cli import queue as cli_queue
 from forge.config.conductor import CONDUCTOR_FLAG_PATH
 from forge.lifecycle.modes import BuildMode
+from forge.lifecycle.planning_handoff_preflight import (
+    preflight_retired_planning_handoff_correlations,
+)
+from tests.forge.lifecycle.planning_handoff_fixture import (
+    CORRELATION as RETIRED_CORRELATION,
+    add_planning_retirement,
+    make_planning_ledger,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -73,6 +81,9 @@ class _RecordingPersistence:
 def persistence(monkeypatch: pytest.MonkeyPatch) -> _RecordingPersistence:
     fake = _RecordingPersistence()
     monkeypatch.setattr(cli_queue, "make_persistence", lambda config: fake)
+    monkeypatch.setattr(
+        cli_queue, "_planning_handoff_retirement_preflight", lambda path: frozenset()
+    )
     return fake
 
 
@@ -182,6 +193,107 @@ def _assert_nothing_written(
     assert persistence.rows == [], "a refused queue attempt wrote a build row"
     assert persistence.calls == [], "a refused queue attempt touched persistence"
     assert published == [], "a refused queue attempt published to the bus"
+
+
+class TestPlanningHandoffRetirementPreflight:
+    """The permanent guard precedes both queue admission paths."""
+
+    @pytest.mark.parametrize("mode", ["a", "c"])
+    def test_retired_correlation_refuses_before_persistence_or_publish(
+        self,
+        mode: str,
+        config_on: Path,
+        repo_dir: Path,
+        feature_yaml: Path,
+        fix_task_yaml: Path,
+        persistence: _RecordingPersistence,
+        published: list,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        retired = "retired-correlation"
+        monkeypatch.setattr(
+            cli_queue,
+            "_planning_handoff_retirement_preflight",
+            lambda path: frozenset({retired}),
+        )
+
+        result = _queue(
+            config_on,
+            positional="FEAT-ROUTINE" if mode == "a" else "TASK-FIX007",
+            repo_dir=repo_dir,
+            feature_yaml=feature_yaml if mode == "a" else fix_task_yaml,
+            mode=mode,
+            extra=["--correlation-id", retired]
+            + (["--profile", "fix-journey"] if mode == "c" else []),
+        )
+
+        assert result.exit_code != 0
+        assert "planning handoff was permanently retired before routing" in result.output
+        _assert_nothing_written(persistence, published)
+
+    def test_invalid_history_refuses_before_persistence_or_publish(
+        self,
+        config_no_section: Path,
+        repo_dir: Path,
+        feature_yaml: Path,
+        persistence: _RecordingPersistence,
+        published: list,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        def invalid_history(path: Path) -> frozenset[str]:
+            raise RuntimeError("malformed fixture history")
+
+        monkeypatch.setattr(
+            cli_queue, "_planning_handoff_retirement_preflight", invalid_history
+        )
+
+        result = _queue(
+            config_no_section,
+            positional="FEAT-ROUTINE",
+            repo_dir=repo_dir,
+            feature_yaml=feature_yaml,
+            mode="a",
+            extra=["--correlation-id", "ordinary-correlation"],
+        )
+
+        assert result.exit_code != 0
+        assert "history could not be validated" in result.output
+        _assert_nothing_written(persistence, published)
+
+    def test_real_v18_receipt_refuses_through_cli_before_persistence(
+        self,
+        config_no_section: Path,
+        repo_dir: Path,
+        feature_yaml: Path,
+        persistence: _RecordingPersistence,
+        published: list,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        db_path = tmp_path / "forge.db"
+        connection, event_ids = make_planning_ledger(db_path, version=18)
+        add_planning_retirement(connection, event_ids)
+        connection.commit()
+        connection.close()
+        monkeypatch.setenv("FORGE_DB_PATH", str(db_path))
+        monkeypatch.setattr(
+            cli_queue,
+            "_planning_handoff_retirement_preflight",
+            preflight_retired_planning_handoff_correlations,
+        )
+
+        result = _queue(
+            config_no_section,
+            positional="FEAT-ROUTINE",
+            repo_dir=repo_dir,
+            feature_yaml=feature_yaml,
+            mode="a",
+            extra=["--correlation-id", RETIRED_CORRELATION],
+        )
+
+        assert result.exit_code != 0
+        assert "planning handoff was permanently retired before routing" in result.output
+        _assert_nothing_written(persistence, published)
 
 
 # ---------------------------------------------------------------------------

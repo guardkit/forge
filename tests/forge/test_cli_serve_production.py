@@ -21,6 +21,14 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from forge.lifecycle.planning_handoff_retirement import (
+    PlanningHandoffRetirementError,
+)
+from tests.forge.lifecycle.planning_handoff_fixture import (
+    add_planning_retirement,
+    make_planning_ledger,
+)
+
 # ---------------------------------------------------------------------------
 # Shared fixtures
 # ---------------------------------------------------------------------------
@@ -136,6 +144,42 @@ def fake_forge_config() -> Any:
 # ---------------------------------------------------------------------------
 # AC-2 — middleware is constructed eagerly inside the wrapper
 # ---------------------------------------------------------------------------
+
+
+class TestPlanningHandoffRetirementStartupGuard:
+    """Malformed permanent history blocks boot before writer allocation."""
+
+    def test_invalid_history_refuses_before_writer_or_mutation(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        fake_forge_config,
+    ) -> None:
+        from forge.cli import _serve_production as serve_production
+        from forge.cli._serve_config import ServeConfig
+
+        db_path = tmp_path / "forge.db"
+        connection, event_ids = make_planning_ledger(db_path, version=18)
+        add_planning_retirement(connection, event_ids)
+        connection.execute(
+            "UPDATE planning_run_events SET actor_identity='' WHERE id>?",
+            (event_ids[-1],),
+        )
+        connection.commit()
+        connection.close()
+        before = db_path.read_bytes()
+        connect_writer = MagicMock()
+        monkeypatch.setattr(serve_production, "connect_writer", connect_writer)
+        config = ServeConfig(
+            db_path=db_path,
+            autobuild_runner_url="http://forge-autobuild-runner:8124",
+        )
+
+        with pytest.raises(PlanningHandoffRetirementError):
+            serve_production.bind_production_serve(config, fake_forge_config)
+
+        connect_writer.assert_not_called()
+        assert db_path.read_bytes() == before
 
 
 class TestEagerMiddlewareConstruction:
@@ -479,6 +523,14 @@ class TestRaisesOnMissingAsyncTaskStarterTool:
             serve_production,
             "SqliteLifecyclePersistence",
             lambda **kw: MagicMock(name="pool"),
+        )
+        # This test supplies a non-SQLite writer double because it covers the
+        # later middleware contract. The retirement reader itself has real-DB
+        # coverage in TestPlanningHandoffRetirementStartupGuard.
+        monkeypatch.setattr(
+            serve_production,
+            "retired_planning_handoff_correlations",
+            lambda connection: frozenset(),
         )
 
         with pytest.raises(RuntimeError, match="start_async_task"):

@@ -767,6 +767,7 @@ class TestTerminalAckInvariant:
             is_duplicate_terminal=is_dup,
             dispatch_build=fake_state_machine,
             publish_build_failed=publish_failed,
+            retired_planning_handoffs=lambda: frozenset(),
         )
 
         await handle_message(msg, deps)
@@ -820,6 +821,7 @@ class TestTerminalAckInvariant:
             is_duplicate_terminal=AsyncMock(return_value=False),
             dispatch_build=capture_dispatch,
             publish_build_failed=AsyncMock(),
+            retired_planning_handoffs=lambda: frozenset(),
         )
 
         await handle_message(msg, deps)
