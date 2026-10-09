@@ -5742,23 +5742,27 @@ _MACHINE_NOTE_AUTHOR = "planning-driver (stamp normalizer refusal)"
 
 #: Rule 2, the spec's own words, with the two fixture titles verbatim.
 _MACHINE_NOTE_FOR_TITLES = (
-    "These worked examples cannot be proven as written, because they describe "
-    "the database or the code rather than what a caller sees:\n"
+    "These worked examples cannot be proven as written:\n"
     f"- {_MOON_TITLE}\n"
     "- Another undecidable one\n"
     "\n"
-    "Rewrite each of them as what can be proven, keeping the behaviour itself "
-    "unchanged: a request to the endpoint and the reply it gets (the method and "
-    "path, the status code, and what is in the body), or, for behaviour one "
-    "request cannot show — two requests at once, timing — the repository test "
-    "that proves it, named. Keep every other worked example exactly as it is."
+    "Revise only these examples using facts in the supplied request and context. "
+    "Keep the behaviour each example specifies unchanged, including its "
+    "concurrency, timing, and other multi-interaction behaviour; never turn that "
+    "behaviour into sequential or single-interaction behaviour. Describe only "
+    "what a caller or user can observe through the interface the request or "
+    "context actually supplies (for example, an HTTP, command, screen, or message "
+    "interface). Do not invent an interface, status, field, implementation detail, "
+    "test name, or verifier. If the supplied facts cannot support a faithful "
+    "provable revision, leave that example unchanged; do not add an assumption or "
+    "ask a question. Keep every other worked example exactly as it is."
 )
 
 #: Rule 5: the ONE un-mentioned line when the rewrite stamped clean.
 _MACHINE_REWRITE_LINE_EXPECTED = (
     "2 of the worked examples could not be proven as written, so the machine "
-    "asked the spec writer to rewrite them as what the endpoint does. What "
-    "changed: 1 example changed. The plan carries on."
+    "asked the spec writer to express their behaviour through the supplied "
+    "interface. What changed: 1 example changed. The plan carries on."
 )
 
 #: Rule 6: the sentence at the top of the plan-stop card after the rewrite
@@ -5766,9 +5770,36 @@ _MACHINE_REWRITE_LINE_EXPECTED = (
 #: changed nothing no longer reaches the card: since rule 6b the model gets
 #: its turn first — see the tests below.)
 _STOP_STILL_UNPROVEN = (
-    "The machine already asked the spec writer once to rewrite these as what "
-    "the endpoint does; the rewrite still could not be proven."
+    "The machine already asked the spec writer once to express these as observable "
+    "behaviour through the supplied interface; the rewrite still could not be "
+    "proven."
 )
+
+
+def test_the_machine_note_is_stack_neutral_and_evidence_bounded() -> None:
+    """The rewrite contract carries observable behaviour without choosing a stack
+    or weakening behaviour that needs more than one interaction.
+
+    This checks the instruction bytes; it does not claim a model will obey them.
+    """
+    titles = ["Two messages arrive together", "A warning remains on screen"]
+
+    note = _Driver._machine_rewrite_note(titles)
+
+    assert note.splitlines()[1:3] == [f"- {title}" for title in titles]
+    assert "facts in the supplied request and context" in note
+    assert "HTTP, command, screen, or message interface" in note
+    assert "concurrency, timing, and other multi-interaction behaviour" in note
+    assert "never turn that behaviour into sequential or single-interaction behaviour" in note
+    assert (
+        "leave that example unchanged; do not add an assumption or ask a question" in note
+    )
+    assert "Keep every other worked example exactly as it is" in note
+    assert "Do not invent an interface, status, field, implementation detail" in note
+    assert "test name, or verifier" in note
+    assert "because they describe the database or the code" not in note
+    assert "a request to the endpoint and the reply it gets" not in note
+    assert "the repository test that proves it" not in note
 
 
 def _refusal_outcome() -> StampNormalizerOutcome:
@@ -6158,16 +6189,17 @@ _MODEL_ASKED_AND_FAILED = {
 #: fixture's real title and the real word the model decided.
 _MODEL_LINE_AFTER_REFUSED_REWRITE = (
     "1 of the worked examples could not be proven as written; the spec writer "
-    "could not rewrite it as what the endpoint does (the checker refused the "
-    "rewrite twice), so the model fallback decided its verifier: "
+    "could not express it as observable behaviour through the supplied interface "
+    "(the checker refused the rewrite twice), so the model fallback decided its "
+    "verifier: "
     f"{_MOON_TITLE} → probe:process. The plan carries on."
 )
 
 #: The same shape for two examples after a rewrite that changed nothing.
 _MODEL_LINE_AFTER_CHANGED_NOTHING = (
     "2 of the worked examples could not be proven as written; the spec writer "
-    "could not rewrite them as what the endpoint does (the rewrite changed "
-    "nothing), so the model fallback decided their verifiers: "
+    "could not express them as observable behaviour through the supplied interface "
+    "(the rewrite changed nothing), so the model fallback decided their verifiers: "
     f"{_MOON_TITLE} → probe:process; Another undecidable one → hurl. "
     "The plan carries on."
 )
@@ -6178,11 +6210,11 @@ _MODEL_LINE_AFTER_CHANGED_NOTHING = (
 _REFUSED_TWICE_SENTENCE = (
     f"Planning run {CID} stopped at writing the task plan: 2 of the worked "
     "examples could not be proven as written, and when the machine asked the "
-    "spec writer to rewrite them as what the endpoint does, the checker "
-    "refused the rewrite twice (the rewrite moved two examples the note did "
-    "not name). Nothing was built. To try again, send the sentence as what "
-    "the endpoint does: the method and path, the status code, and what is "
-    "in the reply."
+    "spec writer to express their behaviour through the supplied interface, the "
+    "checker refused the rewrite twice (the rewrite moved two examples the note "
+    "did not name). Nothing was built. To try again, state the intended interface "
+    "and its observable behaviour explicitly in the sentence or supplied context, "
+    "without unsupported details."
 )
 
 #: Rule 6's sentence at the top of the plan-stop card when the rewrite
@@ -6191,11 +6223,11 @@ _REFUSED_TWICE_SENTENCE = (
 #: the note-refused sentence would blame the checker for a refusal that
 #: never was, and the spec quotes no other sentence for it.
 _STOP_CHANGED_NOTHING = (
-    "The machine already asked the spec writer once to rewrite these as what "
-    "the endpoint does; the rewrite changed nothing."
+    "The machine already asked the spec writer once to express these as observable "
+    "behaviour through the supplied interface; the rewrite changed nothing."
 )
 
-#: The same worked example with its steps said as what the endpoint does and
+#: The same worked example with its steps said as observable interface behaviour and
 #: the title untouched: a rewrite that moves the .feature but not one digest
 #: sentence, so the cards say the same thing while the bytes differ.
 _FIXTURE_FEATURE_ENDPOINT_STEPS = (
@@ -6606,15 +6638,19 @@ async def test_a_refused_rewrite_gives_the_model_its_turn_and_carries_on(
     assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
     assert h.ctx["counters"]["spec"] == 2
     assert h.ctx["counters"]["spec_revisions"][0]["validate_feedback"] == (
-        "These worked examples cannot be proven as written, because they describe "
-        "the database or the code rather than what a caller sees:\n"
+        "These worked examples cannot be proven as written:\n"
         f"- {_MOON_TITLE}\n"
         "\n"
-        "Rewrite each of them as what can be proven, keeping the behaviour itself "
-        "unchanged: a request to the endpoint and the reply it gets (the method and "
-        "path, the status code, and what is in the body), or, for behaviour one "
-        "request cannot show — two requests at once, timing — the repository test "
-        "that proves it, named. Keep every other worked example exactly as it is."
+        "Revise only these examples using facts in the supplied request and context. "
+        "Keep the behaviour each example specifies unchanged, including its "
+        "concurrency, timing, and other multi-interaction behaviour; never turn that "
+        "behaviour into sequential or single-interaction behaviour. Describe only "
+        "what a caller or user can observe through the interface the request or "
+        "context actually supplies (for example, an HTTP, command, screen, or message "
+        "interface). Do not invent an interface, status, field, implementation detail, "
+        "test name, or verifier. If the supplied facts cannot support a faithful "
+        "provable revision, leave that example unchanged; do not add an assumption or "
+        "ask a question. Keep every other worked example exactly as it is."
     )
     assert h.ctx["counters"]["plan"] == 2
     assert sink["order"] == ["normalize_stamps", "normalize_stamps", "validate"]
@@ -7663,10 +7699,10 @@ def _refusal_of_ok() -> StampNormalizerOutcome:
 
 
 _STOP_REFUSED_BY_CHECKER = (
-    "The machine already asked the spec writer once to rewrite these as what "
-    "the endpoint does; the rewrite was refused by the checker: could not carry "
-    "out what this round required, after 2 attempts. 'feedback_resolved' must "
-    "be met."
+    "The machine already asked the spec writer once to express these as observable "
+    "behaviour through the supplied interface; the rewrite was refused by the "
+    "checker: could not carry out what this round required, after 2 attempts. "
+    "'feedback_resolved' must be met."
 )
 
 
