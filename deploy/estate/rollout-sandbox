@@ -53,6 +53,21 @@ def digest(data):
     return hashlib.sha256(data).hexdigest()
 
 
+def sandbox_publish_address(values, gateway):
+    if 'SANDBOX_PUBLISH_ADDRESS' not in values:
+        return gateway
+    value = values['SANDBOX_PUBLISH_ADDRESS']
+    if not re.fullmatch(r'(?:0|[1-9][0-9]{0,2})(?:\.(?:0|[1-9][0-9]{0,2})){3}',value):
+        raise Refusal('SANDBOX_PUBLISH_ADDRESS must be a canonical dotted-decimal IPv4 literal')
+    try:
+        address = ipaddress.IPv4Address(value)
+    except ipaddress.AddressValueError:
+        raise Refusal('SANDBOX_PUBLISH_ADDRESS must be a canonical dotted-decimal IPv4 literal') from None
+    require(not (address.is_unspecified or address.is_loopback or address.is_multicast or value == '255.255.255.255'),
+            'SANDBOX_PUBLISH_ADDRESS cannot be unspecified, loopback, multicast or limited broadcast')
+    return value
+
+
 def json_read(path):
     return json.loads(Path(path).read_text())
 
@@ -155,11 +170,12 @@ from forge.deploy.profile import parse_deploy_profile
 p=json.load(sys.stdin); doc=yaml.safe_load(p['source']); c=p['sandbox']; env=p['env']
 assert isinstance(doc,dict) and isinstance(doc.get('sandbox'),dict)
 s=doc['sandbox']; assert s['name']==c['name']
+sandbox_address=env['SANDBOX_PUBLISH_ADDRESS']
 gateway=env['FACTORY_GATEWAY_ADDRESS']
 old_publish=list(s['publish'])+[s['sidecar_publish'],s['runner_publish']]
 def publish(value):
  parts=value.split(':'); assert len(parts)==3 and parts[1].isdigit() and parts[2].isdigit()
- return gateway+':'+':'.join(parts[1:])
+ return sandbox_address+':'+':'.join(parts[1:])
 s['publish']=[publish(x) for x in s['publish']]
 assert len(s['publish'])==2
 for field,key in [('sidecar_publish','FORGE_SANDBOX_SIDECAR_URL'),('runner_publish','FORGE_SANDBOX_RUNNER_URL')]:
@@ -259,10 +275,12 @@ class Rollout:
             raise Refusal('FACTORY_GATEWAY_ADDRESS is missing or not an IP address; name the sandbox boundary address in the env file') from None
         require(address.version == 4 and not address.is_loopback and not address.is_unspecified,
                 'gateway address is loopback or unspecified; name the sandbox boundary address')
+        self.sandbox_address = sandbox_publish_address(self.values, gateway)
         for key in ('FORGE_TARGET_OWNER_URL','FORGE_SANDBOX_SIDECAR_URL','FORGE_SANDBOX_RUNNER_URL'):
             u = urlsplit(self.values[key])
-            require(u.scheme in ('http','https') and u.hostname == gateway and u.port and not u.username and not u.password and u.path in (('','/','/recorded') if key == 'FORGE_TARGET_OWNER_URL' else ('','/')) and not u.query and not u.fragment,
-                    f'{key} does not use the gateway with an explicit port; fix the env route')
+            expected_host = gateway if key == 'FORGE_TARGET_OWNER_URL' else self.sandbox_address
+            require(u.scheme in ('http','https') and u.hostname == expected_host and u.port and not u.username and not u.password and u.path in (('','/','/recorded') if key == 'FORGE_TARGET_OWNER_URL' else ('','/')) and not u.query and not u.fragment,
+                    f'{key} does not use its declared host with an explicit port; fix the env route')
         owner = urlsplit(self.values['FORGE_TARGET_OWNER_URL'])
         self.answer = f'{gateway}:{owner.port}'
         # Same published port compose.yaml binds at the gateway for the memory MCP.
@@ -414,7 +432,7 @@ class Rollout:
             raise Refusal(f'stopped status is unknown or not proved for {self.s["name"]}; work may still be running inside, so keep units masked and inspect before retrying') from None
 
     def profile(self):
-        payload = {'source':self.source,'sandbox':self.s,'env':{k:v for k,v in self.values.items() if k in {'FACTORY_GATEWAY_ADDRESS','FORGE_SANDBOX_SIDECAR_URL','FORGE_SANDBOX_RUNNER_URL'} or k in self.s.get('allow_replacements',{}).values()},'answer':self.answer,'memory_mcp':self.memory_mcp}
+        payload = {'source':self.source,'sandbox':self.s,'env':{**{k:v for k,v in self.values.items() if k in {'FACTORY_GATEWAY_ADDRESS','FORGE_SANDBOX_SIDECAR_URL','FORGE_SANDBOX_RUNNER_URL'} or k in self.s.get('allow_replacements',{}).values()},'SANDBOX_PUBLISH_ADDRESS':self.sandbox_address},'answer':self.answer,'memory_mcp':self.memory_mcp}
         out = self.run(['docker','--context',self.config['docker_context'],'run','--rm','--pull=never','--network=none','--read-only','-i','--entrypoint','python',self.config['runtime_image'],'-c',PROFILE], input=json.dumps(payload)).stdout
         return json.loads(out)
 
@@ -458,6 +476,12 @@ class Rollout:
             'FORGE_RELEASE_VERSION':labels.get('com.guardkit.release.version'),
             'FORGE_RELEASE_MANIFEST_SHA256':labels.get('com.guardkit.release.manifest.sha256'),
         }
+
+    def render_bootstrap_env(self, image_settings):
+        bootstrap = {name:self.values[name] for name in self.forwarded_names if name in self.values}
+        bootstrap.update(image_settings)
+        return ''.join(name+'='+json.dumps(value.replace('$','$$'),ensure_ascii=False)+'\n'
+                       for name,value in sorted(bootstrap.items())).encode()
 
     def handoff(self):
         expected = self.reviewed_image_settings()  # Immutable host ID, never the mutable transfer tag.
@@ -508,10 +532,8 @@ class Rollout:
             settings = previous['bootstrap_image_settings']
             reviewed = self.reviewed_image_settings()
             require(settings.get('FORGE_IMAGE') == self.s['release_image'] and all(settings.get(name) == value for name,value in reviewed.items()), 'existing installation identity differs from the reviewed immutable image; reconcile its receipt and runner settings')
-            expected = {name:self.values[name] for name in self.forwarded_names if name in self.values}
-            expected.update(settings)
-            encoded = ''.join(name+'='+json.dumps(value.replace('$','$$'),ensure_ascii=False)+'\n' for name,value in sorted(expected.items()))
-            require(self.bootstrap_env.read_bytes() == encoded.encode(), 'normal runner env file differs from explicit inputs; reconcile it before starting the sandbox service')
+            encoded = self.render_bootstrap_env(settings)
+            require(self.bootstrap_env.read_bytes() == encoded, 'normal runner env file differs from explicit inputs; reconcile it before starting the sandbox service')
             print('Sandbox replacement already matches the current template and profile; legacy shutdown was not repeated.')
             return
         before = self.disk()
@@ -576,11 +598,9 @@ class Rollout:
         private_write(Path(self.s['profile_source']),profile['text'].encode(),0o644)
         # Existing Compose runner consumes this exact explicit env_file. Its
         # normal run.sh forwards only SANDBOX_ENV_NAMES, unchanged by this tool.
-        bootstrap = {name:self.values[name] for name in self.forwarded_names if name in self.values}
-        bootstrap.update(image_settings)
-        encoded = ''.join(name+'='+json.dumps(value.replace('$','$$'),ensure_ascii=False)+'\n' for name,value in sorted(bootstrap.items()))
-        private_write(self.bootstrap_env,encoded.encode())
-        require(self.bootstrap_env.read_bytes() == encoded.encode(), 'normal runner env file readback differs; reconcile the private operational output')
+        encoded = self.render_bootstrap_env(image_settings)
+        private_write(self.bootstrap_env,encoded)
+        require(self.bootstrap_env.read_bytes() == encoded, 'normal runner env file readback differs; reconcile the private operational output')
         for path in self.s['legacy_dropins']:
             Path(path).unlink(missing_ok=True)
         self.dropin.unlink()
@@ -596,7 +616,7 @@ class Rollout:
             self.systemctl('daemon-reload',check=False)
             raise
         self.save('commands.json',self.events)
-        self.save('sandbox-installed.json',{'format_version':1,'project':self.args.project,'sandbox':self.s['name'],'image':self.config['runtime_image'],'template_sha256':digest(self.template),'profile_sha256':digest(profile['text'].encode()),'answer_rule':self.answer,'memory_mcp_rule':self.memory_mcp,'disk_before':before,'disk_after':after,'bootstrap_image_settings':image_settings,'bootstrap_env_file':str(self.bootstrap_env),'bootstrap_env_names':sorted(bootstrap),'remote_fetch_through_normal_entry':'NOT-TESTED','memory_forwarded_names':list(MEMORY_NAMES),'actual_memory_read_write':'NOT-TESTED'})
+        self.save('sandbox-installed.json',{'format_version':1,'project':self.args.project,'sandbox':self.s['name'],'image':self.config['runtime_image'],'template_sha256':digest(self.template),'profile_sha256':digest(profile['text'].encode()),'answer_rule':self.answer,'memory_mcp_rule':self.memory_mcp,'disk_before':before,'disk_after':after,'bootstrap_image_settings':image_settings,'bootstrap_env_file':str(self.bootstrap_env),'bootstrap_env_names':sorted({name for name in self.forwarded_names if name in self.values} | image_settings.keys()),'remote_fetch_through_normal_entry':'NOT-TESTED','memory_forwarded_names':list(MEMORY_NAMES),'actual_memory_read_write':'NOT-TESTED'})
         self.complete = True
         print('Current template and producer profile installed and read back; units are unmasked but stopped; actual memory read/write and normal lifecycle checks remain required.')
 

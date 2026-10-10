@@ -44,6 +44,8 @@
 #                     running. Left out, the env file's FORGE_IMAGE is taken as
 #                     the image the rollout names, because that is the line the
 #                     estate was started from
+#   --retained-sandbox NAME  with services or --pre-resume, verify the selected
+#                     sandbox is uniquely stopped and leave item 9 unchecked
 #   --items           print the item list and stop
 # ---------------------------------------------------------------------------
 set -uo pipefail
@@ -54,6 +56,7 @@ ENV_FILE="${HERE}/.env"
 PROJECT=""
 MODE=""
 EXPECT_IMAGE=""
+RETAINED_SANDBOX=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -63,8 +66,9 @@ while [ $# -gt 0 ]; do
         --env-file)    ENV_FILE="${2:?--env-file needs a file}"; shift 2 ;;
         --project)     PROJECT="${2:?--project needs a name}"; shift 2 ;;
         --for-image)   EXPECT_IMAGE="${2:?--for-image needs a tag or an image id}"; shift 2 ;;
+        --retained-sandbox) RETAINED_SANDBOX="${2:?--retained-sandbox needs a name}"; shift 2 ;;
         --items)       MODE="items"; shift ;;
-        --help|-h)     sed -n '2,47p' "${BASH_SOURCE[0]}"; exit 0 ;;
+        --help|-h)     sed -n '2,49p' "${BASH_SOURCE[0]}"; exit 0 ;;
         *)             printf 'estate-check: unknown argument "%s". Try --help.\n' "$1" >&2; exit 2 ;;
     esac
 done
@@ -99,6 +103,11 @@ ITEMS=(
 "pre-resume|10|the-producers-are-stopped|the two things that can bring work in are really stopped - no front-door and no bus-gateway container in this estate, the legacy host units inactive if they are on this machine, and nothing waiting or unconfirmed on the bus's two durable readers"
 "pre-resume|10b|the-running-release-is-the-one-this-rollout-names|what is running is the release this rollout is FOR - the image the rollout names is resolved to an image id and compared with the image id the coordinator is really running, and a difference refuses the phase by name"
 )
+
+if [ -n "${RETAINED_SANDBOX}" ] && [ "${MODE}" != "services" ] && [ "${MODE}" != "pre-resume" ]; then
+    printf 'estate-check: --retained-sandbox is permitted only with services or --pre-resume.\n' >&2
+    exit 2
+fi
 
 if [ "${MODE}" = "items" ]; then
     for row in "${ITEMS[@]}"; do
@@ -166,6 +175,15 @@ if ! read_env_file "${ENV_FILE}"; then
 fi
 
 get() { value_of "$1"; }
+
+if [ -n "${RETAINED_SANDBOX}" ]; then
+    selected_sandbox="$(get SANDBOX_NAME)"
+    file_sandbox="${ENVV[SANDBOX_NAME]:-}"
+    if [ -z "${file_sandbox}" ] || [ "${file_sandbox}" != "${selected_sandbox}" ] || [ "${selected_sandbox}" != "${RETAINED_SANDBOX}" ]; then
+        printf 'estate-check: --retained-sandbox must match the selected SANDBOX_NAME in the env file without an ambient override.\n' >&2
+        exit 2
+    fi
+fi
 
 # An address with a password in it, said out loud safely.
 redact() {
@@ -1317,6 +1335,33 @@ check_from_inside_a_sandbox() {
     gateway="$(get FACTORY_GATEWAY_ADDRESS)"
     port="$(get FORGE_ANSWER_PORT)"
     url="http://${gateway}:${port}/recorded?build=a-build-nobody-ever-queued"
+
+    if [ -n "${RETAINED_SANDBOX}" ]; then
+        local listing result count status
+        if ! command -v sbx >/dev/null 2>&1; then
+            fail 9 "the sandbox tool is missing; stopped status for retained sandbox '${name}' is unproved."
+            return
+        fi
+        if ! listing="$(sbx ls --json 2>/dev/null)"; then
+            fail 9 "the sandbox listing failed; stopped status for retained sandbox '${name}' is unproved."
+            return
+        fi
+        result="$(printf '%s' "${listing}" | jq -er --arg name "${name}" '
+            if type == "object" and (.sandboxes | type) == "array"
+               and all(.sandboxes[]; type == "object" and (.name | type) == "string" and (.status | type) == "string")
+            then [.sandboxes[] | select(.name == $name)] | [length, (if length == 1 then .[0].status else "" end)] | @tsv
+            else empty end' 2>/dev/null)" || {
+            fail 9 "the sandbox JSON listing is unreadable; stopped status for retained sandbox '${name}' is unproved."
+            return
+        }
+        IFS=$'\t' read -r count status <<< "${result}"
+        if [ "${count}" != "1" ] || [ "${status}" != "stopped" ]; then
+            fail 9 "retained sandbox '${name}' is absent, duplicated or not stopped in the actual sandbox listing; no local probe was run."
+            return
+        fi
+        unchecked 9 "the local sandbox '${name}' is retained and stopped; its route was not probed here. Prove the answer-service route from the active-host sandbox before migration acceptance."
+        return
+    fi
 
     if [ -z "${name}" ]; then
         unchecked 9 "the env file names no sandbox (SANDBOX_NAME is empty), so nothing could be asked from inside one. Until this runs for real the route from a sandbox to the answer service is unproven, and a deploy helper inside a sandbox refuses every deploy that names a commit."
