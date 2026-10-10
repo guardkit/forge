@@ -322,6 +322,88 @@ def test_profile_preserves_choices_and_all_routes(inventory,monkeypatch):
     assert len(publishes)==4 and all(x.startswith('192.0.2.10:') for x in publishes)
 
 
+def test_split_sandbox_publications_keep_factory_return_rules(inventory, monkeypatch):
+    config,path,args=inventory
+    edit_env(config, {'SANDBOX_PUBLISH_ADDRESS':'169.254.88.7',
+        'FORGE_SANDBOX_SIDECAR_URL':'http://169.254.88.7:8925',
+        'FORGE_SANDBOX_RUNNER_URL':'http://169.254.88.7:8924'})
+    boundary=Boundary(config,monkeypatch)
+    assert m.main(args)==0
+    published=[x[-1] for x in boundary.argv() if x[:3]==['sbx','ports','owned-sandbox'] and '--publish' in x]
+    assert published==['169.254.88.7:8901:8901','169.254.88.7:8902:8902',
+                       '169.254.88.7:8925:8125','169.254.88.7:8924:8124']
+    import yaml
+    profile=yaml.safe_load(Path(config['sandbox']['profile_source']).read_text())
+    assert profile['sandbox']['allow_network']==['example.test:443','192.0.2.10:8900','192.0.2.10:30822']
+
+
+def test_explicit_shared_host_alias_and_ambient_absence(inventory, monkeypatch):
+    config,path,args=inventory
+    edit_env(config, {'SANDBOX_PUBLISH_ADDRESS':'${FACTORY_GATEWAY_ADDRESS}'})
+    monkeypatch.setenv('SANDBOX_PUBLISH_ADDRESS','203.0.113.99')
+    boundary=Boundary(config,monkeypatch)
+    assert m.main(args)==0
+    assert all(x[-1].startswith('192.0.2.10:') for x in boundary.argv()
+               if x[:3]==['sbx','ports','owned-sandbox'] and '--publish' in x)
+
+
+@pytest.mark.parametrize('value',['','0.0.0.0','127.2.3.4','224.0.0.1','255.255.255.255',
+    '192.0.2.999','192.000.2.1','192.0.2.1 ','example.test','http://192.0.2.1',
+    '192.0.2.1:8925','192.0.2.0/24','[::1]'])
+def test_invalid_sandbox_publish_address_refuses_before_external_calls(inventory, monkeypatch, value):
+    config,path,args=inventory
+    edit_env(config, {'SANDBOX_PUBLISH_ADDRESS':value})
+    monkeypatch.setattr(m.subprocess,'run',lambda *a,**k:pytest.fail('external call before address validation'))
+    assert m.main(args)==2
+    assert not Path(config['sandbox']['evidence_dir']).exists()
+
+
+@pytest.mark.parametrize('change',[
+    {'SANDBOX_PUBLISH_ADDRESS':'169.254.88.7'},
+    {'SANDBOX_PUBLISH_ADDRESS':'169.254.88.7','FORGE_SANDBOX_SIDECAR_URL':'http://169.254.88.7:8926'},
+    {'SANDBOX_PUBLISH_ADDRESS':'169.254.88.7','FORGE_TARGET_OWNER_URL':'http://169.254.88.7:8900'},
+])
+def test_mismatched_split_routes_refuse_before_external_calls(inventory, monkeypatch, change):
+    config,path,args=inventory
+    edit_env(config,change)
+    monkeypatch.setattr(m.subprocess,'run',lambda *a,**k:pytest.fail('external call before route validation'))
+    assert m.main(args)==2
+
+
+def test_bootstrap_serializer_preserves_bytes_and_image_precedence(inventory):
+    config,path,args=inventory
+    edit_env(config, {'QUOTE_VALUE':'café "quoted" $cash', 'EMPTY_VALUE':'',
+        'FORGE_IMAGE':'sha256:'+'1'*64}, add_forward=('QUOTE_VALUE','EMPTY_VALUE'))
+    rollout=m.Rollout(argparse.Namespace(config=str(path),env_file=config['env_file'],project='owned-project',secret_env_file=[]))
+    image={'FORGE_IMAGE':'forge:fixture','FORGE_IMAGE_IDENTITY':IDENTITY,
+        'FORGE_RELEASE_VERSION':'fixture','FORGE_RELEASE_MANIFEST_SHA256':'b'*64}
+    expected={name:rollout.values[name] for name in rollout.forwarded_names if name in rollout.values}
+    expected.update(image)
+    bytes_before=''.join(name+'='+json.dumps(value.replace('$','$$'),ensure_ascii=False)+'\n'
+                         for name,value in sorted(expected.items())).encode()
+    assert rollout.render_bootstrap_env(image)==bytes_before
+    assert b'FORGE_IMAGE="forge:fixture"\n' in bytes_before
+    assert 'QUOTE_VALUE="café \\"quoted\\" $$cash"\n'.encode() in bytes_before
+
+
+def test_both_execute_branches_use_identical_bootstrap_bytes(inventory,monkeypatch):
+    config,path,args=inventory
+    edit_env(config,{'QUOTE_VALUE':'café "quoted" $cash','EMPTY_VALUE':''},
+             add_forward=('QUOTE_VALUE','EMPTY_VALUE'))
+    boundary=Boundary(config,monkeypatch)
+    assert m.main(args)==0
+    actual=Path(config['sandbox']['bootstrap_env_file']).read_bytes()
+    rollout=m.Rollout(argparse.Namespace(config=str(path),env_file=config['env_file'],
+        project=config['project'],secret_env_file=[]))
+    settings={'FORGE_IMAGE':'forge:fixture','FORGE_IMAGE_IDENTITY':IDENTITY,
+        'FORGE_RELEASE_VERSION':'fixture','FORGE_RELEASE_MANIFEST_SHA256':'b'*64}
+    assert actual==rollout.render_bootstrap_env(settings)
+    boundary.calls.clear()
+    assert m.main(args)==0
+    assert Path(config['sandbox']['bootstrap_env_file']).read_bytes()==actual
+    assert not any(call[:2]==['sbx','stop'] for call in boundary.argv())
+
+
 @pytest.mark.parametrize('manual',[False,True])
 def test_memory_mcp_rule_is_one_gateway_port_beside_the_answer_rule(inventory,monkeypatch,manual):
     config,path,args=inventory

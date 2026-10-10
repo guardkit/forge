@@ -991,6 +991,62 @@ def test_host_environment_cannot_override_explicit_env_file_route(scenario):
     assert "203.0.113.99" not in scenario["outputs"]["settings"].read_text()
 
 
+def test_split_sandbox_routes_keep_compose_and_reverse_routes_on_gateway(scenario):
+    with scenario['env_file'].open('a') as stream:
+        stream.write('SANDBOX_PUBLISH_ADDRESS=169.254.88.7\n')
+    lines=scenario['env_file'].read_text().replace(
+        'http://${FACTORY_GATEWAY_ADDRESS}:${FORGE_SANDBOX_',
+        'http://${SANDBOX_PUBLISH_ADDRESS}:${FORGE_SANDBOX_')
+    scenario['env_file'].write_text(lines)
+    compose=json.loads(scenario['compose_json'].read_text())
+    coordinator=compose['services']['coordinator']['environment']
+    for name in ('FORGE_AUTOBUILD_RUNNER_URL','FORGE_SANDBOX_SIDECAR_URL','FORGE_SANDBOX_RUNNER_URL'):
+        coordinator[name]=coordinator[name].replace('192.0.2.44','169.254.88.7')
+    scenario['compose_json'].write_text(json.dumps(compose))
+    result=run(scenario)
+    assert result.returncode==0,result.stderr
+    env=scenario['outputs']['env'].read_text()
+    assert 'FORGE_SANDBOX_SIDECAR_URL=http://${SANDBOX_PUBLISH_ADDRESS}' in env
+    assert 'FORGE_SANDBOX_RUNNER_URL=http://${SANDBOX_PUBLISH_ADDRESS}' in env
+    assert 'FORGE_TARGET_OWNER_URL=http://${FACTORY_GATEWAY_ADDRESS}' in env
+    assert 'FLEET_MEMORY_EMBED_URL=http://${FACTORY_GATEWAY_ADDRESS}' in env
+    assert compose['services']['answer-service']['ports'][0]['host_ip']=='192.0.2.44'
+    assert compose['services']['memory']['ports'][0]['host_ip']=='192.0.2.44'
+    receipt=json.loads(scenario['outputs']['receipt'].read_text())
+    assert receipt['routes']['gateway_routes_match'] is False
+    assert receipt['routes']['sandbox_publish_address_match'] is True
+
+
+def test_explicit_shared_host_alias_and_ambient_value(scenario):
+    with scenario['env_file'].open('a') as stream:
+        stream.write('SANDBOX_PUBLISH_ADDRESS=${FACTORY_GATEWAY_ADDRESS}\n')
+    scenario['env']['SANDBOX_PUBLISH_ADDRESS']='203.0.113.99'
+    result=run(scenario)
+    assert result.returncode==0,result.stderr
+    assert '203.0.113.99' not in scenario['outputs']['env'].read_text()
+
+
+@pytest.mark.parametrize('value',['','0.0.0.0','127.2.3.4','224.0.0.1','255.255.255.255',
+    '192.0.2.999','192.000.2.1','192.0.2.1 ','example.test','http://192.0.2.1',
+    '192.0.2.1:18125','192.0.2.0/24','[::1]'])
+def test_invalid_explicit_sandbox_address_refuses_without_outputs(scenario,value):
+    with scenario['env_file'].open('a') as stream:
+        stream.write('SANDBOX_PUBLISH_ADDRESS='+value+'\n')
+    result=run(scenario)
+    assert result.returncode==2
+    assert 'SANDBOX_PUBLISH_ADDRESS' in result.stderr
+    assert not any(path.exists() for path in scenario['outputs'].values())
+
+
+def test_undeclared_sandbox_address_reference_remains_invalid(scenario):
+    scenario['env_file'].write_text(scenario['env_file'].read_text().replace(
+        'http://${FACTORY_GATEWAY_ADDRESS}:${FORGE_SANDBOX_',
+        'http://${SANDBOX_PUBLISH_ADDRESS}:${FORGE_SANDBOX_'))
+    result=run(scenario)
+    assert result.returncode==2
+    assert 'SANDBOX_PUBLISH_ADDRESS' in result.stderr
+
+
 def test_docker_cli_is_never_handed_the_env_files_sandbox_temp_folder(scenario):
     # TMPDIR in the estate env file is a path inside the sandbox; the Docker CLI
     # runs on this machine, where that folder does not exist.

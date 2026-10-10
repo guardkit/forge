@@ -957,8 +957,9 @@ A failed post-resume check follows this current-state recovery path too.
   and `hand-release-image-to-sandbox.sh` beside this file carries the image in
   and checks what arrived. What is still outstanding is the **rollout step**:
   each project's own copy of that bootstrap has to be replaced with the new
-  template, and its `deploy/profile.yaml` has to publish the two service ports
-  on the factory gateway address and allow the answer service's address. That
+  template, and its `deploy/profile.yaml` has to publish its service ports
+  on the sandbox publication address and allow the factory gateway's
+  answer-service address. That
   is the project's own file and a gate of its own.
 
 ## Carrying the release image into a sandbox

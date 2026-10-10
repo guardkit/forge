@@ -143,13 +143,66 @@ def test_positive_receipt_and_strict_reader(probe) -> None:
     data["compose_project"] = ""
     receipt.write_text(json.dumps(data))
     assert run(read=True).returncode == 1
-
     assert run().returncode == 0
     data = json.loads(receipt.read_text())
     data["items"].pop()
     receipt.write_text(json.dumps(data))
     assert run(read=True).returncode == 1
 
+
+def test_retained_sandbox_observation_never_wakes_or_passes_item_nine(probe, tmp_path):
+    run,state,env_file,env=probe
+    trace=tmp_path/'sbx-calls.jsonl'
+    _executable(Path(env['PATH'].split(':')[0])/'sbx', '''#!/usr/bin/env python3
+import json,os,sys
+with open(os.environ['SBX_TRACE'],'a') as stream: stream.write(json.dumps(sys.argv[1:])+'\\n')
+assert sys.argv[1:] == ['ls','--json']
+mode=os.environ.get('SBX_LIST_CASE','stopped')
+if mode=='error': raise SystemExit(1)
+if mode=='malformed': print('bad-json'); raise SystemExit(0)
+rows=[{'name':'codex-owned-fake-sandbox','status':mode}]
+if mode=='duplicate': rows.append(dict(rows[0]))
+if mode=='missing': rows=[]
+print(json.dumps({'sandboxes':rows}))
+''')
+    base=["bash",str(CHECK),'--env-file',str(env_file),'--project','codex-review']
+    call_env=env | {'SBX_TRACE':str(trace)}
+    for mode in ('services','--pre-resume'):
+        result=subprocess.run([*base,mode,'--retained-sandbox','codex-owned-fake-sandbox'],
+            env=call_env,text=True,capture_output=True,timeout=30)
+        assert result.returncode==1,result.stdout+result.stderr
+        assert 'not checked   9' in result.stdout and 'retained and stopped' in result.stdout
+        assert 'NOT PASSED' in result.stdout
+        if mode=='--pre-resume':
+            receipt=json.loads((state/'pre-resume.json').read_text())
+            assert receipt['verdict']=='passed-with-items-not-checked'
+            assert next(x for x in receipt['items'] if x['item']=='9')['verdict']=='not-checked'
+            assert {x['item'] for x in receipt['items']}=={'8','8b','8c','8c-forge',
+                '8c-relay','8d','8e','8f','8g','8h','8i','9','10','10b'}
+            assert all(x['verdict']=='ok' for x in receipt['items']
+                       if x['item'] not in {'8h','8i','9'})
+            refused=subprocess.run([*base,'--read-pre-resume'],env=call_env,text=True,capture_output=True)
+            assert refused.returncode==1
+    assert [json.loads(line) for line in trace.read_text().splitlines()]==[['ls','--json'],['ls','--json']]
+    for case in ('running','duplicate','missing','malformed','error'):
+        result=subprocess.run([*base,'services','--retained-sandbox','codex-owned-fake-sandbox'],
+            env=call_env | {'SBX_LIST_CASE':case},text=True,capture_output=True,timeout=30)
+        assert result.returncode==1 and 'NOT PASSED    9' in result.stdout
+    assert all(call==['ls','--json'] for call in map(json.loads,trace.read_text().splitlines()))
+    for mode in ('host','--read-pre-resume','--items'):
+        result=subprocess.run([*base,mode,'--retained-sandbox','codex-owned-fake-sandbox'],
+            env=call_env,text=True,capture_output=True)
+        assert result.returncode==2 and '--retained-sandbox is permitted only' in result.stderr
+    for selected in ('different',''):
+        bad=env_file.with_name('conflict.env')
+        bad.write_text(env_file.read_text().replace('SANDBOX_NAME=codex-owned-fake-sandbox',
+            'SANDBOX_NAME='+selected))
+        result=subprocess.run(['bash',str(CHECK),'--env-file',str(bad),'services',
+            '--retained-sandbox','codex-owned-fake-sandbox'],env=call_env,text=True,capture_output=True)
+        assert result.returncode==2
+    result=subprocess.run([*base,'services','--retained-sandbox','codex-owned-fake-sandbox'],
+        env=call_env | {'SANDBOX_NAME':'other'},text=True,capture_output=True)
+    assert result.returncode==2 and 'ambient override' in result.stderr
 
 def test_unknowns_are_recorded_as_unknown_and_refused(probe) -> None:
     run, state, _, _ = probe

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -39,6 +40,21 @@ NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 IMAGE_ID = re.compile(r"^sha256:[0-9a-f]{64}$")
 REFERENCE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 V4 = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
+
+
+def sandbox_publish_address(env: dict[str, str], gateway: str) -> str:
+    if "SANDBOX_PUBLISH_ADDRESS" not in env:
+        return gateway
+    value = env["SANDBOX_PUBLISH_ADDRESS"]
+    if not re.fullmatch(r"(?:0|[1-9][0-9]{0,2})(?:\.(?:0|[1-9][0-9]{0,2})){3}", value):
+        refuse("SANDBOX_PUBLISH_ADDRESS must be a canonical dotted-decimal IPv4 literal")
+    try:
+        address = ipaddress.IPv4Address(value)
+    except ipaddress.AddressValueError:
+        refuse("SANDBOX_PUBLISH_ADDRESS must be a canonical dotted-decimal IPv4 literal")
+    if address.is_unspecified or address.is_loopback or address.is_multicast or value == "255.255.255.255":
+        refuse("SANDBOX_PUBLISH_ADDRESS cannot be unspecified, loopback, multicast or limited broadcast")
+    return value
 
 TRANSFORMER = r'''
 import copy, hashlib, json, os, re, sys
@@ -669,10 +685,11 @@ def validate_routes(env: dict[str, str], metadata: dict) -> dict:
     gateway = require(env, "FACTORY_GATEWAY_ADDRESS")
     if gateway in {"0.0.0.0", "127.0.0.1", "localhost"}:
         refuse("FACTORY_GATEWAY_ADDRESS is not a private boundary address; set the proven gateway")
+    sandbox_address = sandbox_publish_address(env, gateway)
     sidecar_host, sidecar_port, _ = endpoint(require(env, "FORGE_SANDBOX_SIDECAR_URL"), "FORGE_SANDBOX_SIDECAR_URL", ("http", "https"))
     runner_host, runner_port, _ = endpoint(require(env, "FORGE_SANDBOX_RUNNER_URL"), "FORGE_SANDBOX_RUNNER_URL", ("http", "https"))
-    if sidecar_host != gateway.lower() or runner_host != gateway.lower():
-        refuse("sandbox helper and runner routes do not use FACTORY_GATEWAY_ADDRESS; correct the env file")
+    if sidecar_host != sandbox_address.lower() or runner_host != sandbox_address.lower():
+        refuse("sandbox helper and runner routes do not use SANDBOX_PUBLISH_ADDRESS; correct the env file")
     if sidecar_port != int(require(env, "FORGE_SANDBOX_SIDECAR_PORT")) or runner_port != int(require(env, "FORGE_SANDBOX_RUNNER_PORT")):
         refuse("sandbox helper or runner URL disagrees with its declared port; correct the env file")
     if require(env, "FORGE_AUTOBUILD_RUNNER_URL") != require(env, "FORGE_SANDBOX_RUNNER_URL"):
@@ -720,7 +737,10 @@ def validate_routes(env: dict[str, str], metadata: dict) -> dict:
     if metadata["routes"]["deploy_sidecar"] != expected_sidecar or metadata["routes"]["publisher"] != require(env, "FORGE_PUBLISHER_URL"):
         refuse("resolved deploy or publisher route differs from the section 7 route; correct the settings")
     return {
-        "gateway_routes_match": True,
+        # The legacy field meant every sandbox route shared the factory gateway.
+        # Split-host receipts state that difference explicitly for old consumers.
+        "gateway_routes_match": sandbox_address == gateway,
+        "sandbox_publish_address_match": True,
         "sandbox_sidecar_port": sidecar_port,
         "sandbox_runner_port": runner_port,
         "publisher_private_service_match": True,

@@ -21,8 +21,8 @@
 #   * THE SANDBOXES, and the build runner and deploy helper that run INSIDE
 #     each project's sandbox. A sandbox is a small machine of its own with its
 #     own engine; it is made by the sandbox daemon on the host, not by
-#     compose. The coordinator reaches into it at the factory gateway address
-#     (see the answer service's ports below);
+#     compose. The coordinator reaches its published services at the sandbox
+#     publication address named in the env file;
 #   * THE FRONT DOOR (the Slack side) and the bus gateway — jarvis's own
 #     compose file, a later rollout row.
 #
@@ -77,9 +77,9 @@ services:
       FORGE_HEALTHZ_PORT: "8080"
       FORGE_LOG_LEVEL: ${FORGE_LOG_LEVEL:-info}
       # THE BUILD RUNNER the coordinator dispatches to. In the container world
-      # this is a runner inside a project's sandbox, reached at the factory
-      # gateway address (see section 7 of the design); the env file builds the
-      # whole address out of FACTORY_GATEWAY_ADDRESS and a port.
+      # this is a runner inside a project's sandbox, reached at its publication
+      # address (see section 7 of the design); the env file builds the
+      # whole address out of SANDBOX_PUBLISH_ADDRESS and a port.
       FORGE_AUTOBUILD_RUNNER_URL: ${FORGE_AUTOBUILD_RUNNER_URL:?name the build runner's address in the env file}
       # The addresses the SETTINGS FILE writes as ${NAME}. The loader fills
       # them in from here and refuses, by name, anything nothing set
@@ -182,8 +182,8 @@ services:
       # sandbox is a separate small machine with its own engine and its own
       # network: it is not on the 'factory' network and never will be, so a
       # service name does not reach it and it does not reach a service name.
-      # Every crossing of that boundary goes through ONE machine address, the
-      # factory gateway address, and each crossing is permitted per route -
+      # Return routes to this factory host use its gateway address, and each
+      # crossing is permitted per route -
       # this listener, this port, this allowed source - and refused to every
       # other caller including the local network. See section 7 of
       # docs/factory-containerisation-design-pass-2026-09-23.md ("The routes
