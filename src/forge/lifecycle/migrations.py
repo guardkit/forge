@@ -129,7 +129,7 @@ from typing import Final
 # ``schema_v{N}.sql`` and add a ``(N, "schema_v{N}.sql")`` entry to
 # ``_MIGRATIONS`` in ascending order. The runner applies every entry whose
 # version is greater than the current ``schema_version`` ledger row.
-_SCHEMA_VERSION: Final[int] = 18
+_SCHEMA_VERSION: Final[int] = 19
 _MIGRATIONS: Final[tuple[tuple[int, str], ...]] = (
     (1, "schema.sql"),
     (2, "schema_v2.sql"),
@@ -214,6 +214,10 @@ _MIGRATIONS: Final[tuple[tuple[int, str], ...]] = (
     # It is deliberately separate from planning/build state because one
     # admitted sentence crosses both records.
     (18, "schema_v18.sql"),
+    # v19 (web readiness W7, 12 October 2026) -- the new ``preview_leases``
+    # table: which review preview holds which slot, with which link token,
+    # until when. Purely additive: one new table and its indexes.
+    (19, "schema_v19.sql"),
 )
 
 

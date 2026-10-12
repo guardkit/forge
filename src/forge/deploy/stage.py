@@ -935,6 +935,166 @@ class DeployStageRunner:
             detail={"candidate": "torn-down" if torn_down else "standing"},
         )
 
+    async def preview_up(
+        self,
+        profile: DeployProfile,
+        *,
+        correlation_id: str,
+        deploy_run_id: str,
+        preview_env: dict[str, str],
+        cwd: str,
+        memory_project: str | None = None,
+        launch_settings: tuple[str, ...] = (),
+    ) -> DeployStageResult:
+        """THE REVIEW PREVIEW, STOOD UP (web readiness W7, 12 October 2026).
+
+        The candidate leg's own deploy steps — the same runbook, the same
+        sidecar, the project's own deploy script — run in the preview's laid-out
+        tree ``cwd``. ``preview_env`` is the overlay that makes it a preview and
+        names it (the slot's ports and address, the link token, the resource
+        label, the evidence folder and the compose project); it goes to the
+        deploy step with ``PREVIEW=1`` beside it, and to the health checks, the
+        way ``candidate.env`` goes to the candidate's.
+
+        A preview is not a deploy: no queue, start or failure event is
+        published, no deploy record is written and no reservation is taken.
+        Never raises; ``outcome="failed"`` names the step that stopped it, with
+        the sidecar's own sentence when the step never ran.
+        """
+        profile = self._profile_for_run(profile)
+        runbook = build_deploy_runbook(
+            profile,
+            runbook_id=f"deploy-pv-{deploy_run_id}",
+            target=profile.env_id,
+            now=self._clock(),
+            compose_extra_env={"PREVIEW": "1", **preview_env},
+            check_extra_env=dict(preview_env),
+            cwd_override=cwd,
+            inside_sandbox=self._runs_inside_the_sandbox(),
+            memory_project=memory_project,
+            launch_settings=launch_settings,
+        )
+        try:
+            run_result = await self._run_runbook(runbook, correlation_id)
+            executed = self._repo.load_runbook(
+                runbook.runbook_id, correlation_id=correlation_id
+            )
+        except Exception as exc:  # noqa: BLE001 — a preview never crashes the offer
+            return DeployStageResult(
+                outcome="failed",
+                deploy_run_id=deploy_run_id,
+                failed_step="preview_deploy",
+                deploy_runbook_id=runbook.runbook_id,
+                dry_run=self._dry_run,
+                detail={"refusal": f"{type(exc).__name__}: {exc}"},
+            )
+        if run_result.status != "complete":
+            failed_step, refusal = self._stopped_at(
+                executed, run_result, default="deploy_compose"
+            )
+            return DeployStageResult(
+                outcome="failed",
+                deploy_run_id=deploy_run_id,
+                failed_step=failed_step,
+                deploy_runbook_id=runbook.runbook_id,
+                dry_run=self._dry_run,
+                detail={
+                    "refusal": refusal,
+                    "deploy_output": deploy_step_output(executed),
+                },
+            )
+        return DeployStageResult(
+            outcome="complete",
+            deploy_run_id=deploy_run_id,
+            deploy_runbook_id=runbook.runbook_id,
+            dry_run=self._dry_run,
+            detail={"deploy_output": deploy_step_output(executed)},
+        )
+
+    async def preview_journey(
+        self,
+        profile: DeployProfile,
+        *,
+        correlation_id: str,
+        deploy_run_id: str,
+        feature: str,
+        preview_env: dict[str, str],
+        cwd: str,
+    ) -> DeployStageResult:
+        """THE REVIEW PREVIEW'S RECORDED JOURNEY (web readiness W7).
+
+        The project's own live-gate driver, run in the preview's tree with the
+        preview's overlay — moved and overlaid by exactly the rules the
+        candidate's gate uses — through one live-gate runbook. The step's whole
+        answer comes back in ``detail["journey"]``: the verdict, and the
+        evidence the driver said it left (its report, screenshots, video,
+        traces and test counts). No QA verdict is published: this journey is
+        evidence for a person, not the deploy's verdict.
+
+        ``outcome="complete"`` means the driver answered; whether the journey
+        PASSED is ``verdict``. ``outcome="failed"`` means no answer came back,
+        or the live gate is switched off (``detail["reason"]``).
+        """
+        profile = self._profile_for_run(profile)
+        if not self._config.run_live_gate:
+            return DeployStageResult(
+                outcome="failed",
+                deploy_run_id=deploy_run_id,
+                failed_step="preview_journey",
+                dry_run=self._dry_run,
+                detail={"reason": "the live gate is switched off (deploy.run_live_gate)"},
+            )
+        gate_runbook = build_live_gate_runbook(
+            profile,
+            runbook_id=f"live-gate-pv-{deploy_run_id}",
+            target=profile.env_id,
+            feature=feature,
+            now=self._clock(),
+        )
+        invoker_override = self._gate_invoker_for(
+            driver_cwd_override=cwd, driver_env_overlay=dict(preview_env)
+        )
+        try:
+            run_result = await self._run_runbook(
+                gate_runbook, correlation_id, live_gate_invoker=invoker_override
+            )
+            executed = self._repo.load_runbook(
+                gate_runbook.runbook_id, correlation_id=correlation_id
+            )
+        except Exception as exc:  # noqa: BLE001 — a preview never crashes the offer
+            return DeployStageResult(
+                outcome="failed",
+                deploy_run_id=deploy_run_id,
+                failed_step="preview_journey",
+                live_gate_runbook_id=gate_runbook.runbook_id,
+                dry_run=self._dry_run,
+                detail={"reason": f"{type(exc).__name__}: {exc}"},
+            )
+        payload = None
+        if executed is not None and executed.steps:
+            step = executed.steps[0]
+            payload = step.result.payload if step.result else None
+        if run_result.status != "complete" or not isinstance(payload, dict):
+            reason = None
+            if isinstance(payload, dict):
+                reason = payload.get("error")
+            return DeployStageResult(
+                outcome="failed",
+                deploy_run_id=deploy_run_id,
+                failed_step="preview_journey",
+                live_gate_runbook_id=gate_runbook.runbook_id,
+                dry_run=self._dry_run,
+                detail={"reason": str(reason or "the journey gave no answer")},
+            )
+        return DeployStageResult(
+            outcome="complete",
+            deploy_run_id=deploy_run_id,
+            verdict=str(payload.get("verdict") or "") or None,
+            live_gate_runbook_id=gate_runbook.runbook_id,
+            dry_run=self._dry_run,
+            detail={"journey": dict(payload)},
+        )
+
     async def what_is_running(
         self,
         profile: DeployProfile,
@@ -1480,6 +1640,57 @@ class DeployStageRunner:
         )
         return write_deploy_record(record, root=self._deploy_record_root)
 
+    def _gate_invoker_for(
+        self,
+        *,
+        driver_cwd_override: str | None,
+        driver_env_overlay: dict[str, str] | None,
+    ) -> LiveGateInvoker | None:
+        """The invoker a gate run uses: moved into a tree, then given an overlay.
+
+        ``None`` = the injected invoker unchanged. Factored out of
+        :meth:`_run_live_gate` (12 October 2026) so the review preview's
+        journey (:meth:`preview_journey`) moves and overlays the invoker by the
+        very same rules; the behaviour is unchanged.
+        """
+        invoker_override: LiveGateInvoker | None = None
+        if driver_cwd_override is not None:
+            with_cwd = getattr(self._live_gate_invoker, "with_repo_path", None)
+            if callable(with_cwd):
+                invoker_override = with_cwd(driver_cwd_override)
+            else:
+                logger.error(
+                    "live-gate invoker %s cannot be moved into the candidate tree "
+                    "%s (no with_repo_path); the candidate gate is refused rather "
+                    "than run in the checkout",
+                    type(self._live_gate_invoker).__name__,
+                    driver_cwd_override,
+                )
+                invoker_override = RefusingLiveGateInvoker(
+                    f"the live-gate invoker "
+                    f"({type(self._live_gate_invoker).__name__}) cannot run in "
+                    f"the candidate tree {driver_cwd_override}, and a gate run "
+                    "in the checkout would check main's registry, not the "
+                    "branch's"
+                )
+        if driver_env_overlay and not isinstance(
+            invoker_override, RefusingLiveGateInvoker
+        ):
+            base = invoker_override or self._live_gate_invoker
+            with_overlay = getattr(base, "with_extra_env", None)
+            if callable(with_overlay):
+                invoker_override = with_overlay(driver_env_overlay)
+            else:
+                # The injected invoker cannot carry an env overlay (a dry-run /
+                # fixed-verdict test seam). The overlay is best-effort only here;
+                # the candidate.env already reaches deploy_compose + health_check
+                # (which is what physically addresses the -cand instance).
+                logger.debug(
+                    "live-gate invoker has no with_extra_env; candidate driver "
+                    "overlay not applied"
+                )
+        return invoker_override
+
     async def _run_live_gate(
         self,
         profile: DeployProfile,
@@ -1532,42 +1743,10 @@ class DeployStageRunner:
             feature=feature,
             now=self._clock(),
         )
-        invoker_override: LiveGateInvoker | None = None
-        if driver_cwd_override is not None:
-            with_cwd = getattr(self._live_gate_invoker, "with_repo_path", None)
-            if callable(with_cwd):
-                invoker_override = with_cwd(driver_cwd_override)
-            else:
-                logger.error(
-                    "live-gate invoker %s cannot be moved into the candidate tree "
-                    "%s (no with_repo_path); the candidate gate is refused rather "
-                    "than run in the checkout",
-                    type(self._live_gate_invoker).__name__,
-                    driver_cwd_override,
-                )
-                invoker_override = RefusingLiveGateInvoker(
-                    f"the live-gate invoker "
-                    f"({type(self._live_gate_invoker).__name__}) cannot run in "
-                    f"the candidate tree {driver_cwd_override}, and a gate run "
-                    "in the checkout would check main's registry, not the "
-                    "branch's"
-                )
-        if driver_env_overlay and not isinstance(
-            invoker_override, RefusingLiveGateInvoker
-        ):
-            base = invoker_override or self._live_gate_invoker
-            with_overlay = getattr(base, "with_extra_env", None)
-            if callable(with_overlay):
-                invoker_override = with_overlay(driver_env_overlay)
-            else:
-                # The injected invoker cannot carry an env overlay (a dry-run /
-                # fixed-verdict test seam). The overlay is best-effort only here;
-                # the candidate.env already reaches deploy_compose + health_check
-                # (which is what physically addresses the -cand instance).
-                logger.debug(
-                    "live-gate invoker has no with_extra_env; candidate driver "
-                    "overlay not applied"
-                )
+        invoker_override = self._gate_invoker_for(
+            driver_cwd_override=driver_cwd_override,
+            driver_env_overlay=driver_env_overlay,
+        )
         run_result = await self._run_runbook(
             gate_runbook, correlation_id, live_gate_invoker=invoker_override
         )

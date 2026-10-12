@@ -261,3 +261,98 @@ class TestLiveGateSection:
         raw["live_gate"] = {"driver": ["x"], "env": {"PORT": 8080}}
         with pytest.raises(DeployProfileError, match="string value"):
             parse_deploy_profile(raw)
+
+
+class TestPreviewSection:
+    """The optional ``preview`` section (web readiness W7, 12 October 2026)."""
+
+    BASE = {"env_id": "notes", "compose": {"file": "compose.yml"}}
+    SLOTS = [
+        {
+            "port": 8950,
+            "internal_port": 18950,
+            "public_url": "https://spark-fcf6.tailebf801.ts.net:8950",
+        },
+        {
+            "port": 8951,
+            "internal_port": 18951,
+            "public_url": "https://spark-fcf6.tailebf801.ts.net:8951/",
+        },
+    ]
+
+    def test_absent_is_none(self) -> None:
+        assert parse_deploy_profile(dict(self.BASE)).preview is None
+
+    def test_full_section_parses_with_defaults(self) -> None:
+        p = parse_deploy_profile(
+            {**self.BASE, "preview": {"enabled": True, "slots": self.SLOTS}}
+        )
+        assert p.preview is not None
+        assert p.preview.enabled is True
+        assert [s.port for s in p.preview.slots] == [8950, 8951]
+        assert p.preview.slots[1].public_url == "https://spark-fcf6.tailebf801.ts.net:8951"
+        assert (p.preview.app_ttl_hours, p.preview.evidence_days, p.preview.slot_wait_minutes) == (
+            24,
+            14,
+            30,
+        )
+        assert "preview" not in p.extra
+
+    def test_enabled_defaults_to_off(self) -> None:
+        p = parse_deploy_profile({**self.BASE, "preview": {"slots": self.SLOTS}})
+        assert p.preview is not None and p.preview.enabled is False
+
+    def test_explicit_lifetimes(self) -> None:
+        p = parse_deploy_profile(
+            {
+                **self.BASE,
+                "preview": {
+                    "enabled": True,
+                    "slots": self.SLOTS,
+                    "app_ttl_hours": 2,
+                    "evidence_days": 3,
+                    "slot_wait_minutes": 4,
+                },
+            }
+        )
+        assert (p.preview.app_ttl_hours, p.preview.evidence_days, p.preview.slot_wait_minutes) == (
+            2,
+            3,
+            4,
+        )
+
+    @pytest.mark.parametrize(
+        "preview, match",
+        [
+            ({"enabled": "yes", "slots": SLOTS}, "preview.enabled"),
+            ({"enabled": True}, "at least one slot"),
+            ({"enabled": True, "slots": "8950"}, "preview.slots must be a list"),
+            (
+                {"enabled": True, "slots": [{**SLOTS[0], "port": 0}]},
+                r"preview.slots\[0\].port",
+            ),
+            (
+                {"enabled": True, "slots": [{**SLOTS[0], "internal_port": "x"}]},
+                "internal_port",
+            ),
+            (
+                {"enabled": True, "slots": [{**SLOTS[0], "public_url": "http://x:1"}]},
+                "https",
+            ),
+            (
+                {"enabled": True, "slots": [SLOTS[0], {**SLOTS[1], "port": 8950}]},
+                "ports of its own",
+            ),
+            (
+                {"enabled": True, "slots": [{**SLOTS[0], "internal_port": 8950}]},
+                "ports of its own",
+            ),
+            ({"enabled": True, "slots": SLOTS, "app_ttl_hours": 0}, "app_ttl_hours"),
+            ({"enabled": True, "slots": SLOTS, "evidence_days": True}, "evidence_days"),
+            ({"enabled": True, "slots": SLOTS, "slot_wait_minutes": -1}, "slot_wait_minutes"),
+            ("on", "preview must be a mapping"),
+        ],
+    )
+    def test_bad_sections_are_refused_in_words(self, preview, match) -> None:
+        with pytest.raises(DeployProfileError, match=match):
+            parse_deploy_profile({**self.BASE, "preview": preview})
