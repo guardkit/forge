@@ -7409,10 +7409,19 @@ def _load_code_search() -> Any:
     """
     import importlib.util
 
-    cached = sys.modules.get("_forge_code_search")
-    if cached is not None:
-        return cached
-    package = importlib.util.find_spec("guardkitfactory")
+    with _CODE_SEARCH_LOAD_LOCK:
+        cached = sys.modules.get("_forge_code_search")
+        if cached is not None:
+            return cached
+        return _load_code_search_once(importlib.util)
+
+
+#: One request at a time loads the module, so none sees it half loaded.
+_CODE_SEARCH_LOAD_LOCK = threading.Lock()
+
+
+def _load_code_search_once(util: Any) -> Any:
+    package = util.find_spec("guardkitfactory")
     locations = list(package.submodule_search_locations or []) if package else []
     source = next(
         (Path(where) / "code_search.py" for where in locations
@@ -7421,10 +7430,10 @@ def _load_code_search() -> Any:
     )
     if source is None:
         raise ImportError("guardkitfactory.code_search is not installed")
-    spec = importlib.util.spec_from_file_location("_forge_code_search", source)
+    spec = util.spec_from_file_location("_forge_code_search", source)
     if spec is None or spec.loader is None:
         raise ImportError(f"cannot load {source}")
-    module = importlib.util.module_from_spec(spec)
+    module = util.module_from_spec(spec)
     sys.modules["_forge_code_search"] = module
     try:
         spec.loader.exec_module(module)

@@ -236,6 +236,8 @@ class SidecarCodeReader:
         self._dead: str | None = None
         self._deadline: float | None = None
         self._long_line_files: tuple[list[str], str | None] | None = None
+        #: The route of the last request that failed on the wire, if any.
+        self._last_transport_failure: str | None = None
 
     def begin(self, budget_s: float = FACT_GATHERING_BUDGET_S) -> None:
         """Start one fact-gathering pass with its own time budget. A helper
@@ -266,6 +268,7 @@ class SidecarCodeReader:
         try:
             status, decoded = self._post(url, sent, timeout)
         except Exception as exc:  # noqa: BLE001 — transport boundary
+            self._last_transport_failure = route
             self._dead = (
                 f"the sandbox helper at {self._base_url} could not be reached "
                 f"for {route} ({type(exc).__name__}: {str(exc)[:160]})"
@@ -541,6 +544,7 @@ class SidecarCodeReader:
                 "ranked code search runs only at the run's recorded starting commit"
             )
         dead_before = self._dead
+        self._last_transport_failure = None
         try:
             status, decoded = self._answer(
                 "/code/query",
@@ -553,7 +557,9 @@ class SidecarCodeReader:
                 },
             )
         except RepositoryUnreadable:
-            if dead_before is None:
+            # A slow or failed search is not a dead helper; a commit the
+            # clone cannot get stays said for every later read.
+            if dead_before is None and self._last_transport_failure == "/code/query":
                 self._dead = None
             raise
         if status != 200 or not isinstance(decoded, dict) or "status" not in decoded:

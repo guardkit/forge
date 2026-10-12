@@ -702,6 +702,12 @@ def _lay_out_commit(repo_path: str, commit: str, into: Path) -> str | None:
 #: The longest ranked code search query sent to the sandbox helper (12 October
 #: 2026): the request's distinctive words, cut here.
 _RANKED_QUERY_CHARS = 300
+#: The specification format's own words, left out of that query when it is
+#: built from the specification (no request text).
+_GHERKIN_WORDS = (
+    "feature", "scenario", "outline", "background", "examples", "example",
+    "given", "when", "then", "and", "but", "rule",
+)
 
 
 def _reads_beyond_the_working_tree(reader: Any) -> bool:
@@ -12320,7 +12326,9 @@ class PlanningRunDriver:
             return None
         # The request's own distinctive words, filler words left out, so a
         # long request or a Gherkin specification still makes a short query.
-        query = " ".join(request_words(text or ""))[:_RANKED_QUERY_CHARS].strip()
+        query = " ".join(request_words(text or "", leave_out=_GHERKIN_WORDS))[
+            :_RANKED_QUERY_CHARS
+        ].strip()
         if not query:
             return None
         try:
