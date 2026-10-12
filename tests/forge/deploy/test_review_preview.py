@@ -929,9 +929,11 @@ async def test_release_is_idempotent_and_keeps_the_evidence(world: World) -> Non
     lease = world.lease("pv000000000001")
     assert (lease.state, lease.reason) == ("ended", "rejected")
     assert Path(lease.evidence_dir, "index.html").is_file()
-    # An ended preview cannot be approved, but only because the record says
-    # so; the folder is still there for the report link.
-    assert world.service.approval_refusal(evidence.model_dump(mode="json"), now=START) is None
+    # The folder is still there for the report link, but an ended preview
+    # is not approvable: its lease is no longer running.
+    assert "no longer running" in world.service.approval_refusal(
+        evidence.model_dump(mode="json"), now=START
+    )
     await world.service.release(feature_id="FEAT-ZZ99", build_id="no-such-build", reason="x")
 
 
@@ -1022,6 +1024,29 @@ async def test_approval_refusal_reasons(world: World) -> None:
 
     assert delete_evidence(folder, world.root)
     assert "evidence folder is missing" in service.approval_refusal(ready, now=START)
+
+
+@pytest.mark.asyncio
+async def test_a_preview_whose_lease_has_ended_is_not_approvable(world: World) -> None:
+    ready = (await world.service.prepare(_request())).model_dump(mode="json")
+    assert world.service.approval_refusal(ready, now=START) is None
+
+    await world.service.release(
+        feature_id="FEAT-AB12", build_id="build-1", reason="rejected"
+    )
+
+    refusal = world.service.approval_refusal(ready, now=START)
+    assert refusal == (
+        "the preview for this offer is no longer running (rejected), so it cannot "
+        "be approved — reject it and run the feature again"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_record_with_no_lease_behind_it_is_not_approvable(world: World) -> None:
+    ready = (await world.service.prepare(_request())).model_dump(mode="json")
+    forged = {**ready, "run_id": "pvrun-nobodywrote"}
+    assert "no longer running" in world.service.approval_refusal(forged, now=START)
 
 
 # ---------------------------------------------------------------------------

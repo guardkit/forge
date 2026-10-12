@@ -368,6 +368,11 @@ class PreviewLeaseStore:
         marks = ", ".join("?" for _ in _LIVE_STATES)
         return self._rows(f"WHERE state IN ({marks}) ORDER BY created_at", _LIVE_STATES)
 
+    def for_run(self, run_id: str) -> PreviewLease | None:
+        """The lease a preparation run wrote, or None."""
+        rows = self._rows("WHERE run_id = ? ORDER BY created_at DESC", (run_id,))
+        return rows[0] if rows else None
+
     def live_for_build(self, build_id: str) -> list[PreviewLease]:
         marks = ", ".join("?" for _ in _LIVE_STATES)
         return self._rows(
@@ -1949,6 +1954,21 @@ class ReviewPreviewService:
                 f"the preview and its approval window ended at "
                 f"{expires.strftime('%a %d %b %H:%M UTC')} — reject it and run the "
                 "feature again"
+            )
+        # The preview must still be standing: a lease ended by a release, the
+        # sweep or the start-up reconcile is not approvable, whatever the
+        # card's own record says. A ledger that cannot be read raises, which
+        # the merge press treats as a check that could not be made.
+        lease = self._store.for_run(str(review_evidence.get("run_id") or ""))
+        if (
+            lease is None
+            or lease.state != "ready"
+            or lease.candidate_sha != review_evidence.get("candidate_sha")
+        ):
+            return (
+                "the preview for this offer is no longer running"
+                + (f" ({lease.reason})" if lease is not None and lease.reason else "")
+                + ", so it cannot be approved — reject it and run the feature again"
             )
         folder = self._folder_of(review_evidence)
         if folder is None or not folder.is_dir():
