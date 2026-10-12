@@ -152,8 +152,15 @@ _LIVE_STATES: tuple[str, ...] = ("preparing", "ready", "ending")
 #: a different or expired candidate; 403 is accepted as the same refusal.
 _REFUSED_STATUSES: frozenset[int] = frozenset({403, 410})
 
-#: The most evidence one preview may send out of its sandbox.
-EVIDENCE_TRANSFER_CAP_BYTES: int = 256 * 1024 * 1024
+#: The most evidence one preview may send out of its sandbox, and the most
+#: the coordinator will take in: checked on the files before packing, on the
+#: packed archive, and again on the coordinator while unpacking. The archive
+#: travels base64 in one JSON answer, so the coordinator briefly holds about
+#: two copies of it; 64 MiB keeps that well clear of its memory guard.
+EVIDENCE_TRANSFER_CAP_BYTES: int = 64 * 1024 * 1024
+
+#: The most files one preview's evidence may hold.
+EVIDENCE_MEMBER_CAP: int = 2000
 
 #: Said after a reason whose teardown has not been confirmed yet.
 _NOT_CONFIRMED: str = " (teardown not confirmed yet)"
@@ -636,35 +643,77 @@ def pack_preview_evidence(
 ) -> dict[str, Any]:
     """The preview's evidence folder as a gzipped tar, base64 — or a refusal.
 
-    Regular files and folders only: a link inside the folder is left out
-    rather than followed, so nothing outside it can be sent.
+    Nothing outside the folder can be sent. The folder itself, and every
+    folder between the repository and it (``.forge-candidates``, the
+    preview's tree), must be a real folder, not a symbolic link — checked
+    with ``lstat``, so a project cannot point ``.factory-evidence`` at
+    anything else in its sandbox. Inside, only regular files and folders are
+    packed: a link is left out rather than followed, and a linked folder is
+    never walked into.
     """
     folder = preview_tree_path(repo_root, lease_id) / EVIDENCE_FOLDER
-    if not folder.is_dir():
-        return {"refusal": f"the preview left no evidence folder ({folder})"}
+    here = Path(repo_root)
+    for name in folder.relative_to(here).parts:
+        here = here / name
+        try:
+            mode = here.lstat().st_mode
+        except FileNotFoundError:
+            return {"refusal": f"the preview left no evidence folder ({folder})"}
+        if stat.S_ISLNK(mode):
+            return {
+                "refusal": (
+                    f"the preview's evidence folder is reached through a symbolic "
+                    f"link ({here}), so nothing was sent"
+                )
+            }
+        if not stat.S_ISDIR(mode):
+            return {"refusal": f"the preview left no evidence folder ({folder})"}
     total = 0
     buffer = io.BytesIO()
     count = 0
     with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
-        for path in sorted(folder.rglob("*")):
-            if path.is_symlink():
-                continue
-            relative = path.relative_to(folder).as_posix()
-            if path.is_dir():
-                archive.add(str(path), arcname=relative, recursive=False)
-            elif path.is_file():
-                total += path.stat().st_size
-                if total > cap:
+        for here, folders, files in os.walk(folder, followlinks=False):
+            folders.sort()
+            base = Path(here)
+            for name in list(folders):
+                path = base / name
+                if path.is_symlink():
+                    folders.remove(name)
+                    continue
+                archive.add(
+                    str(path), arcname=path.relative_to(folder).as_posix(),
+                    recursive=False,
+                )
+            for name in sorted(files):
+                path = base / name
+                mode = path.lstat().st_mode
+                if not stat.S_ISREG(mode):
+                    continue
+                total += path.lstat().st_size
+                count += 1
+                if total > cap or count > EVIDENCE_MEMBER_CAP:
                     return {
                         "refusal": (
                             f"the preview's evidence is larger than {cap // (1024 * 1024)} "
-                            "MiB, which is more than one preview may send"
+                            f"MiB or {EVIDENCE_MEMBER_CAP} files, which is more than "
+                            "one preview may send"
                         )
                     }
-                archive.add(str(path), arcname=relative, recursive=False)
-                count += 1
+                archive.add(
+                    str(path), arcname=path.relative_to(folder).as_posix(),
+                    recursive=False,
+                )
+    packed = buffer.getvalue()
+    buffer.close()
+    if len(packed) > cap:
+        return {
+            "refusal": (
+                f"the preview's packed evidence is larger than {cap // (1024 * 1024)} "
+                "MiB, which is more than one preview may send"
+            )
+        }
     return {
-        "archive": base64.b64encode(buffer.getvalue()).decode("ascii"),
+        "archive": base64.b64encode(packed).decode("ascii"),
         "files": count,
         "bytes": total,
     }
@@ -896,10 +945,17 @@ class SidecarPreviewVenue:
             return None, why
         if answer.get("refusal"):
             return None, str(answer["refusal"])
+        encoded = answer.pop("archive", None) or ""
+        del answer
+        # Held to this side's own limit before decoding, so an oversized
+        # answer is never doubled in memory.
+        if len(encoded) > (EVIDENCE_TRANSFER_CAP_BYTES // 3 + 1) * 4:
+            return None, (
+                "the evidence archive is larger than "
+                f"{EVIDENCE_TRANSFER_CAP_BYTES // (1024 * 1024)} MiB"
+            )
         try:
-            return base64.b64decode(
-                str(answer.get("archive") or ""), validate=True
-            ), None
+            return base64.b64decode(str(encoded), validate=True), None
         except (ValueError, TypeError) as exc:
             return None, f"the evidence archive could not be read: {exc}"
 
@@ -935,18 +991,45 @@ def _segments(project: str, feature_id: str, sha: str, run_id: str) -> list[str]
     return parts
 
 
-def store_evidence_once(archive: bytes, dest: Path) -> list[str]:
+def store_evidence_once(
+    archive: bytes,
+    dest: Path,
+    *,
+    cap: int = EVIDENCE_TRANSFER_CAP_BYTES,
+    max_members: int = EVIDENCE_MEMBER_CAP,
+) -> list[str]:
     """Unpack ``archive`` into ``dest`` — once — and make it read-only.
 
-    ``dest`` must not exist: an existing folder is never written into. On a
-    failure part-way the folder this call made is removed again. Returns the
-    files kept, relative to ``dest``.
+    ``dest`` must not exist: an existing folder is never written into. The
+    archive, the total size of what it holds and the number of its members
+    are all held to this machine's own limits WHILE unpacking, member by
+    member, so a small archive that would unpack into something huge stops
+    at the limit (``ValueError``). On any failure part-way the folder this
+    call made is removed again. Returns the files kept, relative to ``dest``.
     """
+    if len(archive) > cap:
+        raise ValueError(
+            f"the evidence archive is larger than {cap // (1024 * 1024)} MiB"
+        )
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.mkdir(exist_ok=False)  # FileExistsError = refuse to overwrite
     try:
+        total = 0
+        count = 0
         with tarfile.open(fileobj=io.BytesIO(archive), mode="r:*") as unpacked:
-            unpacked.extractall(dest, filter="data")
+            for member in unpacked:
+                count += 1
+                if count > max_members:
+                    raise ValueError(
+                        f"the evidence archive holds more than {max_members} entries"
+                    )
+                total += max(0, int(member.size))
+                if total > cap:
+                    raise ValueError(
+                        "the evidence would unpack to more than "
+                        f"{cap // (1024 * 1024)} MiB"
+                    )
+                unpacked.extract(member, dest, filter="data")
     except BaseException:
         _make_writable(dest)
         shutil.rmtree(dest, ignore_errors=True)

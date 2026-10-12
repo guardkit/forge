@@ -789,6 +789,124 @@ def test_packed_evidence_leaves_links_out(tmp_path: Path) -> None:
     assert "no evidence folder" in pack_preview_evidence(clone, lease_id="pv0000000000ff")["refusal"]
 
 
+def _evidence_folder(clone: Path, lease: str = "pv000000000001") -> Path:
+    return clone / ".forge-candidates" / f"preview-{lease}" / EVIDENCE_FOLDER
+
+
+def test_an_evidence_folder_that_is_a_link_is_refused(tmp_path: Path) -> None:
+    clone = tmp_path / "clone"
+    folder = _evidence_folder(clone)
+    folder.parent.mkdir(parents=True)
+    secrets_dir = tmp_path / "sandbox-secrets"
+    secrets_dir.mkdir()
+    (secrets_dir / "id_rsa").write_text("PRIVATE")
+    folder.symlink_to(secrets_dir)
+
+    packed = pack_preview_evidence(clone, lease_id="pv000000000001")
+    assert "archive" not in packed
+    assert "symbolic link" in packed["refusal"]
+
+
+def test_a_preview_tree_reached_through_a_link_is_refused(tmp_path: Path) -> None:
+    clone = tmp_path / "clone"
+    elsewhere = tmp_path / "elsewhere"
+    (elsewhere / EVIDENCE_FOLDER).mkdir(parents=True)
+    (elsewhere / EVIDENCE_FOLDER / "index.html").write_text("not ours")
+    (clone / ".forge-candidates").mkdir(parents=True)
+    (clone / ".forge-candidates" / "preview-pv000000000001").symlink_to(elsewhere)
+
+    packed = pack_preview_evidence(clone, lease_id="pv000000000001")
+    assert "archive" not in packed
+    assert "symbolic link" in packed["refusal"]
+
+
+def test_a_linked_folder_inside_the_evidence_is_never_walked(tmp_path: Path) -> None:
+    import base64
+
+    clone = tmp_path / "clone"
+    folder = _evidence_folder(clone)
+    (folder / "report").mkdir(parents=True)
+    (folder / "report" / "index.html").write_text("ok")
+    secrets_dir = tmp_path / "sandbox-secrets"
+    secrets_dir.mkdir()
+    (secrets_dir / "id_rsa").write_text("PRIVATE")
+    (folder / "sub").symlink_to(secrets_dir)
+
+    packed = pack_preview_evidence(clone, lease_id="pv000000000001")
+    names = tarfile.open(fileobj=io.BytesIO(base64.b64decode(packed["archive"]))).getnames()
+    assert sorted(names) == ["report", "report/index.html"]
+
+
+def test_the_transfer_cap_is_64_mib_on_both_sides() -> None:
+    from forge.deploy.review_preview import EVIDENCE_TRANSFER_CAP_BYTES
+
+    assert EVIDENCE_TRANSFER_CAP_BYTES == 64 * 1024 * 1024
+
+
+def test_an_archive_that_would_unpack_past_the_cap_stops_and_leaves_nothing(
+    tmp_path: Path,
+) -> None:
+    class _Zeros:
+        def __init__(self, n: int) -> None:
+            self.left = n
+
+        def read(self, k: int = -1) -> bytes:
+            k = self.left if k < 0 else min(k, self.left)
+            self.left -= k
+            return bytes(k)
+
+    buffer = io.BytesIO()
+    size = 2 * 1024 * 1024
+    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+        info = tarfile.TarInfo("big.bin")
+        info.size = size
+        archive.addfile(info, _Zeros(size))
+    small = buffer.getvalue()
+    assert len(small) < 64 * 1024
+
+    dest = tmp_path / "root" / "run"
+    with pytest.raises(ValueError, match="unpack to more than"):
+        store_evidence_once(small, dest, cap=1024 * 1024)
+    assert not dest.exists()
+
+
+def test_an_archive_with_too_many_entries_stops_and_leaves_nothing(
+    tmp_path: Path,
+) -> None:
+    dest = tmp_path / "root" / "run"
+    many = _archive({f"f{n}.txt": b"x" for n in range(5)})
+    with pytest.raises(ValueError, match="more than 4 entries"):
+        store_evidence_once(many, dest, max_members=4)
+    assert not dest.exists()
+
+
+def test_an_archive_larger_than_the_cap_is_refused_before_unpacking(
+    tmp_path: Path,
+) -> None:
+    dest = tmp_path / "root" / "run"
+    with pytest.raises(ValueError, match="larger than"):
+        store_evidence_once(_archive(EVIDENCE_FILES), dest, cap=16)
+    assert not dest.exists()
+
+
+@pytest.mark.asyncio
+async def test_an_oversized_evidence_answer_is_refused_before_it_is_decoded(
+    monkeypatch,
+) -> None:
+    import forge.deploy.review_preview as module
+    from forge.deploy.review_preview import SidecarPreviewVenue
+
+    monkeypatch.setattr(module, "EVIDENCE_TRANSFER_CAP_BYTES", 30)
+    venue = SidecarPreviewVenue(
+        "http://sidecar.example.test",
+        repo=PROJECT,
+        post=lambda url, body, timeout: (200, {"archive": "A" * 100}),
+    )
+    archive, why = await venue.fetch_evidence("pv000000000001")
+    assert archive is None
+    assert "larger than" in why
+
+
 # ---------------------------------------------------------------------------
 # Release, sweep, start-up
 # ---------------------------------------------------------------------------
