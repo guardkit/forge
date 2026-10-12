@@ -5709,9 +5709,16 @@ class MergeApprovalConsumer:
                 self._deps.review_preview, offer, now=self._deps.clock()
             )
             if refusal is not None:
+                # Known limitation (recorded 12 October 2026): Jarvis has
+                # already shown the press as recorded, as it does today for a
+                # refused moved branch, and nothing here tells the card
+                # otherwise. From Slack the way on is Reject, or running the
+                # feature again.
                 logger.warning(
-                    "merge-executor: refusing %s — %s; no decision is "
-                    "recorded, so the card can still be rejected",
+                    "merge-executor: refusing %s — %s; nothing was merged and "
+                    "no decision was recorded. The card in Slack may still show "
+                    "the approval as recorded; from Slack the way on is Reject, "
+                    "or running the feature again",
                     request_id,
                     refusal,
                 )

@@ -556,3 +556,59 @@ class TestAnOfferWithAPreview:
         _insert_build(pool)
         result = CliRunner().invoke(merge_deploy_cmd, [FEATURE_ID], obj=config)
         assert result.exit_code == 0, result.output
+
+
+class TestAProjectThatPreparesPreviewsWithNoPreviewedCard:
+    """Previews on, the project prepares them, no previewed card on record."""
+
+    @pytest.fixture
+    def previews_on(self, repo_root: Path) -> ForgeConfig:
+        return ForgeConfig.model_validate(
+            {
+                "permissions": {"filesystem": {"allowlist": ["/tmp"]}},
+                "planning": {"target_repo_paths": {REPO: str(repo_root)}},
+                "approval": {"expected_approver": "the-approver"},
+                "review_preview": {"enabled": True},
+            }
+        )
+
+    def test_it_is_refused_and_nothing_is_merged(
+        self, previews_on, pool, fakes, preview
+    ) -> None:
+        _insert_build(pool)
+        preview.enabled = True
+
+        result = CliRunner().invoke(merge_deploy_cmd, [FEATURE_ID], obj=previews_on)
+
+        assert result.exit_code == 1
+        assert (
+            "this project prepares previews and no previewed card is on record; "
+            "run the feature again"
+        ) in result.output
+        assert fakes["gk_calls"] == [] and fakes["dp_calls"] == []
+        assert preview.asked_about == [REPO]
+
+    def test_a_profile_that_cannot_be_read_is_refused_too(
+        self, previews_on, pool, fakes, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(
+            merge_deploy_module, "_preview_service", lambda _c, _p, _d: None
+        )
+        _insert_build(pool)
+
+        result = CliRunner().invoke(merge_deploy_cmd, [FEATURE_ID], obj=previews_on)
+
+        assert result.exit_code == 1
+        assert "no previewed card is on record" in result.output
+        assert fakes["gk_calls"] == []
+
+    def test_a_project_without_previews_is_pressed_as_before(
+        self, previews_on, pool, fakes, preview
+    ) -> None:
+        _insert_build(pool)
+        preview.enabled = False
+
+        result = CliRunner().invoke(merge_deploy_cmd, [FEATURE_ID], obj=previews_on)
+
+        assert result.exit_code == 0, result.output
+        assert "result=publication-pending" in result.output

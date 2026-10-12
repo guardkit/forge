@@ -62,8 +62,11 @@ It never says "merged and running", and it never deploys anything.
 A BUILD WHOSE MERGE OFFER CARRIES A REVIEW PREVIEW (web readiness W7) is
 pressed on the card's own terms: refused, and written down as a refusal,
 unless its preview is still usable; held to the tree that was previewed; and
-its preview released afterwards. A build with no offer on record, or an offer
-without a preview, is pressed exactly as before.
+its preview released afterwards. With previews switched on
+(``review_preview.enabled``), a build whose project prepares previews (its
+profile enables them, or cannot be read) and that has no previewed card on
+record is refused — there is no override; run the feature again. Every other
+build is pressed exactly as before.
 """
 
 from __future__ import annotations
@@ -335,6 +338,25 @@ async def _arun(
             "USER", "operator"
         )
         preview_service = None
+        # A PROJECT THAT PREPARES PREVIEWS IS NEVER PRESSED WITHOUT ONE. With
+        # previews switched on, a build whose project's profile enables them
+        # (or cannot be read — the same question the card asks) and that has
+        # no previewed card on record — a card lost to a restart during
+        # preparation, say — is refused. No flag overrides it: the remedy is
+        # to run the feature again, which prepares a preview and a card.
+        if not previewed and getattr(
+            getattr(config, "review_preview", None), "enabled", False
+        ):
+            preview_service = _preview_service(config, pool, dispatcher)
+            if preview_service is None or await asyncio.to_thread(
+                preview_service.enabled_for, row.repo
+            ):
+                click.echo(
+                    f"merge-deploy {row.feature_id} @ {row.repo}: refused — "
+                    "this project prepares previews and no previewed card is on "
+                    "record; run the feature again. Nothing was merged."
+                )
+                return 1
         if previewed:
             from datetime import datetime, timezone
 
