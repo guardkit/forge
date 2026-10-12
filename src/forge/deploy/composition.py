@@ -289,7 +289,11 @@ async def dispatch_deploy_stage(
       ``ask_env`` the question the project declared it wants to be asked with.
       It changes nothing and takes no lock: the press asks it before it decides
       whether to deploy, so the only-forwards rule is applied to what the TARGET
-      says rather than to a ledger row a crash may have left stale.
+      says rather than to a ledger row a crash may have left stale;
+    * ``"preview_up"`` / ``"preview_journey"`` — the review preview's
+      :meth:`DeployStageRunner.preview_up` and
+      :meth:`DeployStageRunner.preview_journey`, run in ``candidate_cwd`` (the
+      preview's laid-out tree) with ``identity_env`` as the preview's overlay.
 
     Any other word is refused with a ``ValueError`` before a seam is touched.
 
@@ -401,7 +405,37 @@ async def dispatch_deploy_stage(
             identity_env=identity_env,
             scripts_cwd=candidate_cwd,
         )
+    if leg in ("preview_up", "preview_journey"):
+        # THE REVIEW PREVIEW (web readiness W7, 12 October 2026). The deploy
+        # dispatch the merge press already uses is reused unchanged, so the
+        # preview is composed exactly as a candidate is — the same sandbox,
+        # the same stamps, the same live-gate driver. ``candidate_cwd`` is the
+        # preview's laid-out tree and ``identity_env`` carries the preview's
+        # overlay: both are "the working directory and the values the caller
+        # made for this leg", which is all the dispatcher's two parameters
+        # have ever been.
+        if not candidate_cwd:
+            raise ValueError(f"the {leg} leg needs the preview's laid-out tree")
+        if leg == "preview_up":
+            return await runner.preview_up(
+                profile,
+                correlation_id=correlation_id,
+                deploy_run_id=deploy_run_id,
+                preview_env=dict(identity_env or {}),
+                cwd=candidate_cwd,
+                memory_project=memory_project,
+                launch_settings=tuple(launch_settings),
+            )
+        return await runner.preview_journey(
+            profile,
+            correlation_id=correlation_id,
+            deploy_run_id=deploy_run_id,
+            feature=str(feature or feat_id or profile.env_id),
+            preview_env=dict(identity_env or {}),
+            cwd=candidate_cwd,
+        )
     raise ValueError(
         f"unknown deploy leg {leg!r} — expected 'deploy', 'candidate_check', "
-        "'promote', 'candidate_down' or 'what_is_running'"
+        "'promote', 'candidate_down', 'what_is_running', 'preview_up' or "
+        "'preview_journey'"
     )

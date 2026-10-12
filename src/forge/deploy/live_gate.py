@@ -102,6 +102,13 @@ class LiveGateInvocation:
         leak_sweep_findings: Count of leak-sweep findings, or None.
         dry_run: True when this is a dry-run projection, not a real verdict.
         detail: Backend-specific detail (command line, stdout tail, …).
+        media_refs: Recordings of the journey (the video), in the order the
+            envelope listed them (web readiness W7).
+        report_ref: The driver's HTML test report, or None.
+        outcome: The test counts the driver reported — ``passed``,
+            ``failed``, ``skipped`` and ``flaky`` — each ``None`` when it said
+            nothing about that one. ``None`` as a whole when the envelope
+            carried no counts at all. Never a 0 for "unknown".
     """
 
     verdict: str
@@ -117,6 +124,9 @@ class LiveGateInvocation:
     leak_sweep_findings: int | None = None
     dry_run: bool = False
     detail: dict[str, Any] = field(default_factory=dict)
+    media_refs: tuple[str, ...] = ()
+    report_ref: str | None = None
+    outcome: dict[str, int | None] | None = None
 
     def __post_init__(self) -> None:
         if self.verdict not in _VALID_VERDICTS:
@@ -370,6 +380,39 @@ def _bounded_tail(text: str | None, cap: int = _STDIO_TAIL_CAP) -> str:
     return text[-cap:]
 
 
+#: The test counts a results envelope may carry under ``outcome``.
+_OUTCOME_COUNTS: tuple[str, ...] = ("passed", "failed", "skipped", "flaky")
+
+
+def _envelope_refs(envelope: dict[str, Any], key: str) -> tuple[str, ...]:
+    """A list of evidence references from the envelope; anything else is dropped."""
+    raw = envelope.get(key)
+    if not isinstance(raw, list):
+        return ()
+    return tuple(str(item).strip() for item in raw if isinstance(item, str) and item.strip())
+
+
+def _envelope_text(envelope: dict[str, Any], key: str) -> str | None:
+    raw = envelope.get(key)
+    return raw.strip() if isinstance(raw, str) and raw.strip() else None
+
+
+def _envelope_outcome(envelope: dict[str, Any]) -> dict[str, int | None] | None:
+    """The counts under ``outcome``; a count that is not a whole number reads as unknown."""
+    raw = envelope.get("outcome")
+    if not isinstance(raw, dict):
+        return None
+    counts: dict[str, int | None] = {}
+    for name in _OUTCOME_COUNTS:
+        value = raw.get(name)
+        counts[name] = (
+            value
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0
+            else None
+        )
+    return counts
+
+
 def project_driver_answer(
     *,
     argv: list[str],
@@ -391,6 +434,15 @@ def project_driver_answer(
     for a repository with no sandbox and through that repository's sandbox
     sidecar for one that has (sandbox first, rule 85), and the two must read
     an identical answer identically or the same gate would mean two things.
+
+    THE JOURNEY'S EVIDENCE (web readiness W7, 12 October 2026). An envelope
+    may also say where its evidence is, and the review preview reads it from
+    here: ``app_url``, ``screenshot_refs``, ``trace_refs``, ``media_refs`` (the
+    video), ``report_ref`` (the HTML report) and ``outcome`` (the test counts
+    ``passed``, ``failed``, ``skipped`` and ``flaky``). Every one is optional,
+    and an envelope without them reads exactly as it did before: no refs, no
+    report and no counts. This reading is not behind the review_preview switch:
+    it only adds optional fields, and nothing but the preview acts on them.
     """
     import json
 
@@ -426,6 +478,12 @@ def project_driver_answer(
                 evidence_index_ref=str(envelope.get("evidence_index_ref") or ""),
                 dispositions_ref=envelope.get("dispositions_ref"),
                 attempts_ledger_ref=envelope.get("attempts_ledger_ref"),
+                app_url=_envelope_text(envelope, "app_url"),
+                screenshot_refs=_envelope_refs(envelope, "screenshot_refs"),
+                trace_refs=_envelope_refs(envelope, "trace_refs"),
+                media_refs=_envelope_refs(envelope, "media_refs"),
+                report_ref=_envelope_text(envelope, "report_ref"),
+                outcome=_envelope_outcome(envelope),
                 dry_run=False,
                 detail={**detail, "source": "results_envelope"},
             )

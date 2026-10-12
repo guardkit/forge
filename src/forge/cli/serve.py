@@ -119,6 +119,16 @@ logger = logging.getLogger(__name__)
 feature_routing_gate: Any | None = None
 feature_routing_required: bool = False
 
+# The review-preview service (web-readiness W7), set by the dispatch chain's
+# composition when both the merge press and ``review_preview.enabled`` are on
+# and composing it succeeded. The
+# serve loop reconciles it at start-up and sweeps it while running; ``None``
+# leaves both steps out and every merge card exactly as it was.
+review_preview_service: Any | None = None
+
+#: How often the serve loop sweeps previews whose time is up, in seconds.
+REVIEW_PREVIEW_SWEEP_SECONDS: int = 300
+
 # stdlib ``logging`` format chosen for daemon-grep readability across
 # replicas: ISO-8601 timestamp, level, logger name, message. If the
 # project ever moves to structlog/JSON, ``_configure_logging`` is the
@@ -489,6 +499,7 @@ def compose_merge_executor_deps(
     pipeline_publisher: Any,
     nats_client: Any,
     db_path: Any,
+    review_preview: Any = None,
 ) -> Any:
     """The merge press's deps, as the coordinator's merge-word listener has them.
 
@@ -519,6 +530,36 @@ def compose_merge_executor_deps(
         ),
         feature_routing_gate=feature_routing_gate,
         feature_routing_required=feature_routing_required,
+        review_preview=review_preview,
+    )
+
+
+def compose_review_preview(
+    *,
+    forge_config: Any,
+    sqlite_pool: Any,
+    nats_client: Any,
+    db_path: Any,
+) -> Any:
+    """The review-preview service for the merge card (web-readiness W7).
+
+    Built on the ledger connection the serve path already holds and the same
+    deploy dispatcher the merge press is given, so a preview is stood up and
+    taken down by exactly the deploy legs the press uses. Which projects
+    actually get a preview is the service's own question, asked of each
+    project's deploy profile; every other project's card is unchanged.
+    """
+    from forge.deploy.review_preview import build_review_preview_service
+    from forge.pipeline.merge_executor import build_in_daemon_deploy_dispatcher
+
+    return build_review_preview_service(
+        forge_config,
+        connection=sqlite_pool.connection,
+        deploy_dispatcher=build_in_daemon_deploy_dispatcher(
+            config=forge_config,
+            nats_client=nats_client,
+            db_path=db_path,
+        ),
     )
 
 
@@ -664,6 +705,35 @@ def bind_production_dispatch_chain(
         # purpose — the card the owner taps has to be the card the merge
         # press consumes, and there is now only one of them.
         merge_offer_service: Any = None
+        # The review previews (web-readiness W7): one service, shared by the
+        # card that prepares a preview and the press that checks and releases
+        # it, and handed to the serve loop for its start-up reconcile and its
+        # sweep. A composition failure leaves previews off, never boot.
+        global review_preview_service
+        review_preview: Any = None
+        try:
+            _merge_cfg = getattr(forge_config, "merge_executor", None)
+            _preview_cfg = getattr(forge_config, "review_preview", None)
+            if (
+                _merge_cfg is not None
+                and _merge_cfg.enabled
+                and _preview_cfg is not None
+                and _preview_cfg.enabled
+            ):
+                review_preview = compose_review_preview(
+                    forge_config=forge_config,
+                    sqlite_pool=sqlite_pool,
+                    nats_client=client,
+                    db_path=db_path,
+                )
+        except Exception as exc:  # noqa: BLE001 — DDR-007 boot protection
+            review_preview = None
+            logger.error(
+                "forge-serve: review-preview composition FAILED (%s) — merge "
+                "cards carry no preview until fixed",
+                exc,
+            )
+        review_preview_service = review_preview
         try:
             _merge_cfg = getattr(forge_config, "merge_executor", None)
             if _merge_cfg is not None and _merge_cfg.enabled:
@@ -676,6 +746,8 @@ def bind_production_dispatch_chain(
                     _offer_kwargs["git_head"] = _offer_git_head
                 if _offer_git_surface is not None:
                     _offer_kwargs["git_surface"] = _offer_git_surface
+                if review_preview is not None:
+                    _offer_kwargs["review_preview"] = review_preview
                 merge_offer_service = MergeOfferService(
                     config=forge_config,
                     pool=sqlite_pool,
@@ -1040,6 +1112,7 @@ def bind_production_dispatch_chain(
                         pipeline_publisher=publisher,
                         nats_client=client,
                         db_path=db_path,
+                        review_preview=review_preview,
                     )
                 )
                 await _merge_consumer.attach(EnvelopeSubscribeClient(client))
@@ -2781,6 +2854,30 @@ async def _run_ack_watchdog(
             )
 
 
+async def _run_review_preview_sweep(service: Any, interval_seconds: int) -> None:
+    """Sweep previews whose time is up, every ``interval_seconds`` (W7).
+
+    Beside the daemon, like the ack-slot watchdog, and cancelled with it. Each
+    sweep is exception-guarded so a fault never stops the next one;
+    cancellation propagates cleanly for shutdown.
+    """
+    from datetime import datetime, timezone
+
+    while True:
+        try:
+            await asyncio.sleep(interval_seconds)
+            await service.sweep(now=datetime.now(timezone.utc))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — a sweep fault must not stop the next
+            logger.warning(
+                "forge-serve: review-preview sweep failed (%s: %s); will "
+                "retry next interval",
+                type(exc).__name__,
+                exc,
+            )
+
+
 async def _run_serve(config: ServeConfig, state: SubscriptionState) -> None:
     """Open one NATS client, run reconcile_on_boot, then daemon + healthz.
 
@@ -2870,6 +2967,21 @@ async def _run_serve(config: ServeConfig, state: SubscriptionState) -> None:
         # production code path (Group A scenario).
         await compose_dispatch_chain(client)
 
+        # Step 3.6 — the review previews (web-readiness W7). Composed with the
+        # chain above, so reconciled here, before the daemon can offer a card:
+        # leases whose preview is gone are ended and previews with no live
+        # lease are removed. Guarded: a preview fault never blocks boot.
+        if review_preview_service is not None:
+            try:
+                await review_preview_service.reconcile_on_boot()
+            except Exception as exc:  # noqa: BLE001 — never blocks boot
+                logger.error(
+                    "forge-serve: review-preview start-up reconcile failed "
+                    "(%s: %s)",
+                    type(exc).__name__,
+                    exc,
+                )
+
         # Step 4 — chain composition complete. The daemon may still
         # be bootstrapping its pull subscription, but the lifecycle
         # chain is reconciled and ready to receive dispatches.
@@ -2899,6 +3011,18 @@ async def _run_serve(config: ServeConfig, state: SubscriptionState) -> None:
                         client, config, state, watchdog_interval
                     ),
                     name="forge-serve-ack-watchdog",
+                )
+            )
+
+        # Step 5.6 — the review-preview sweep, beside the daemon and
+        # cancelled with it. Only when previews are composed.
+        if review_preview_service is not None:
+            tasks.add(
+                asyncio.create_task(
+                    _run_review_preview_sweep(
+                        review_preview_service, REVIEW_PREVIEW_SWEEP_SECONDS
+                    ),
+                    name="forge-serve-review-preview-sweep",
                 )
             )
 

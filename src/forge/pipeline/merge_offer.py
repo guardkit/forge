@@ -95,6 +95,7 @@ __all__ = [
     "approval_subject_for",
     "branch_to_merge",
     "card_line_about_the_after_deploy_check",
+    "card_line_about_the_preview",
     "card_line_about_the_supplied_plan",
     "default_merge_branch",
     "git_rev_parse_main",
@@ -1427,6 +1428,22 @@ def card_line_about_the_after_deploy_check(skip: AfterDeployCheckSkip | None) ->
     return skip.sentence if skip is not None else ""
 
 
+def card_line_about_the_preview(evidence: Any) -> str:
+    """The one line a card with a review preview adds (web-readiness W7).
+
+    Jarvis draws the buttons, the counts and the expiry times from the
+    evidence itself; this line only says, in words, whether the preview is
+    there to try, and when it is not, why and that Approve is not offered.
+    """
+    if getattr(evidence, "state", None) == "ready":
+        return "Preview ready — see the buttons below."
+    reason = str(getattr(evidence, "failure_reason", "") or "").strip().rstrip(".")
+    return (
+        f"Preview could not be prepared: {reason or 'no reason was given'}; "
+        "Approve is not available."
+    )
+
+
 def run_the_scope_pass(
     *,
     config: Any,
@@ -1676,6 +1693,9 @@ class MergeOfferService:
             :func:`read_after_deploy_check_skip`. Anything it does, including
             raising, costs the card nothing but that one sentence.
         clock: Wall-clock seam for the stage row / paused_at stamps.
+        review_preview: The review-preview service (web-readiness W7), or
+            ``None``. Only a project it says is enabled gets a preview; every
+            other offer is byte for byte what it was.
     """
 
     def __init__(
@@ -1694,6 +1714,7 @@ class MergeOfferService:
         after_deploy_check_reader: Callable[
             [Any, Any], AfterDeployCheckSkip | None
         ] = read_after_deploy_check_skip,
+        review_preview: Any | None = None,
     ) -> None:
         self._config = config
         self._pool = pool
@@ -1706,6 +1727,9 @@ class MergeOfferService:
         self._git_surface = git_surface
         self._clock = clock
         self._after_deploy_check_reader = after_deploy_check_reader
+        self._review_preview = review_preview
+        # Builds whose offer is preparing a preview (see :meth:`offer`).
+        self._preparing: set[str] = set()
 
     async def maybe_offer(self, event: Any) -> None:
         """The wireup's fire-and-forget hook — never raises past itself."""
@@ -1958,6 +1982,96 @@ class MergeOfferService:
             )
             return None
 
+    async def _prepare_the_preview(
+        self,
+        *,
+        row: Any,
+        git: Any,
+        build_id: str,
+        feature_id: str,
+        branch: str,
+        candidate_sha: str,
+        candidate_tree: str,
+        expect_main_sha: str,
+        target_branch: str,
+    ) -> tuple[Any, str | None] | None:
+        """``(evidence or None, the commit it was joined onto)`` — or ``None``
+        when the service raised and no card may be offered.
+
+        ``(None, None)`` is a project without a preview: its card is today's.
+        A preparation that fails comes back as failed evidence, and its card
+        is offered with the reason and no Approve.
+        """
+        assert self._review_preview is not None
+        try:
+            if not await asyncio.to_thread(self._review_preview.enabled_for, row.repo):
+                return None, None
+            from forge.deploy.review_preview import PreviewRequest
+            from forge.pipeline.merge_join import target_branch_now
+
+            # THE PREVIEW IS JOINED ONTO WHAT THE PRESS WILL JOIN ONTO: the
+            # recorded target branch, fetched afresh from the remote through
+            # the same git surface and the same helper the merge press uses —
+            # never the clone's local branch, which can lag the remote after
+            # any other merge.
+            start_point = self._pool.read_start_point(build_id)
+            where = await target_branch_now(
+                git,
+                recorded_branch=(
+                    getattr(start_point, "target_branch", None)
+                    if getattr(start_point, "recorded", False)
+                    else None
+                ),
+            )
+            base = where.commit if where.ok else None
+            evidence = await self._review_preview.prepare(
+                PreviewRequest(
+                    project=row.repo,
+                    feature_id=feature_id,
+                    build_id=build_id,
+                    branch=branch,
+                    candidate_sha=candidate_sha,
+                    candidate_tree=candidate_tree,
+                    expect_main_sha=expect_main_sha,
+                    target_branch=target_branch,
+                    preview_base_sha=base,
+                    preview_base_refusal=None if where.ok else where.refusal,
+                )
+            )
+            return evidence, base
+        except Exception as exc:  # noqa: BLE001 — refused before any write
+            logger.error(
+                "merge-offer: the review preview for %s raised (%s: %s) — "
+                "no card is offered",
+                build_id,
+                type(exc).__name__,
+                exc,
+            )
+            await self._release_the_preview(
+                feature_id=feature_id,
+                build_id=build_id,
+                reason=f"the preview could not be prepared ({type(exc).__name__})",
+            )
+            return None
+
+    async def _release_the_preview(
+        self, *, feature_id: str, build_id: str, reason: str
+    ) -> None:
+        """Release this build's preview, best effort; a failure is logged."""
+        if self._review_preview is None:
+            return
+        try:
+            await self._review_preview.release(
+                feature_id=feature_id, build_id=build_id, reason=reason
+            )
+        except Exception as exc:  # noqa: BLE001 — best effort
+            logger.warning(
+                "merge-offer: the preview for %s could not be released (%s: %s)",
+                build_id,
+                type(exc).__name__,
+                exc,
+            )
+
     async def offer(
         self,
         *,
@@ -2157,6 +2271,53 @@ class MergeOfferService:
             "baseline_failing": baseline_failing,
             "resume_options": ["approve", "reject"],
         }
+        # A REVIEW PREVIEW (web-readiness W7, 12 October 2026), prepared after
+        # the pins and before the latch, and only for a project whose deploy
+        # profile switches one on. A preparation that fails still comes back
+        # as evidence and the card is offered with its reason and no Approve;
+        # only a service that raises leaves no card. Every other offer passes
+        # straight by and is byte for byte what it was. Whether a project has
+        # a preview is read from its deploy profile, which can mean a git or
+        # sidecar read, so it is asked off the event loop.
+        review_evidence: Any = None
+        preview_base_sha: str | None = None
+        if self._review_preview is not None:
+            # One offer per build while the preview is asked about and
+            # prepared (that can take minutes, and the latch is written only
+            # afterwards): a second offer for the same build in that window is
+            # refused, so a preview is never prepared twice and a card never
+            # offered twice. Nothing awaits between here and the latch write.
+            if build_id in self._preparing:
+                logger.info(
+                    "merge-offer: a preview for %s is already being prepared — "
+                    "not offering twice",
+                    build_id,
+                )
+                return False
+            self._preparing.add(build_id)
+            try:
+                prepared = await self._prepare_the_preview(
+                    row=row,
+                    git=git,
+                    build_id=build_id,
+                    feature_id=feature_id,
+                    branch=branch,
+                    candidate_sha=candidate_sha,
+                    candidate_tree=candidate_tree,
+                    expect_main_sha=expect_main_sha,
+                    target_branch=recorded_target or MERGE_BASE_REF,
+                )
+            finally:
+                self._preparing.discard(build_id)
+            if prepared is None:
+                return False
+            review_evidence, preview_base_sha = prepared
+            if review_evidence is not None:
+                details["review_evidence"] = review_evidence.model_dump(mode="json")
+                details["preview_tree"] = review_evidence.preview_tree
+                # Also on the record itself (nats-core's optional field);
+                # here beside preview_tree for the press and the receipts.
+                details["preview_base_sha"] = preview_base_sha
         now = self._clock()
         self._pool.record_stage(
             StageLogEntry(
@@ -2182,6 +2343,8 @@ class MergeOfferService:
 
         # (d) ONE publish attempt ever — dual envelope, approval FIRST.
         rationale = card_words(branch, merge_branch)
+        if review_evidence is not None:
+            rationale = f"{rationale}\n{card_line_about_the_preview(review_evidence)}"
         try:
             approval = ApprovalRequestPayload(
                 request_id=request_id,
@@ -2213,6 +2376,11 @@ class MergeOfferService:
                 approval_subject=subject,
                 paused_at=now.isoformat(),
                 correlation_id=row.correlation_id,
+                **(
+                    {"review_evidence": review_evidence}
+                    if review_evidence is not None
+                    else {}
+                ),
             )
             await self._publisher.publish_build_paused(paused)
         except Exception as exc:  # noqa: BLE001 — one attempt, honest terminal log
@@ -2223,4 +2391,13 @@ class MergeOfferService:
                 build_id,
                 exc,
             )
+            # A preview is not left standing for a card that may never have
+            # reached anyone. Approving a card that did get out is then
+            # refused, because its preview's lease has ended.
+            if review_evidence is not None:
+                await self._release_the_preview(
+                    feature_id=feature_id,
+                    build_id=build_id,
+                    reason="the merge card could not be published",
+                )
         return True
