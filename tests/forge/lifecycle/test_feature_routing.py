@@ -426,6 +426,14 @@ def test_live_pins_count_model_work_ahead_and_not_terminal_history(tmp_path):
     connection.close()
 
 
+def test_live_pins_count_a_build_with_empty_correlation_under_its_build_id(tmp_path):
+    _path, connection, store = _store(tmp_path)
+    _build(connection, "build-bare", "", "RUNNING")
+    _seeded(store, "build-bare", 2)
+    assert store.live_pin_counts() == {1: 0, 2: 1}
+    connection.close()
+
+
 def _echo_gate(store, seen, *, delay=None, ack=None):
     async def request(_url, key, _timeout, preference):
         seen.append((key, preference))

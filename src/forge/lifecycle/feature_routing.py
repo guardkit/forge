@@ -303,8 +303,8 @@ class FeatureRoutingSeedStore:
         A key is live when its seed SUCCEEDED and its correlation has a
         nonterminal planning run, a BUILD_QUEUED planning run whose build has
         not been delivered yet, or a nonterminal (including paused) build.
-        Merge cards and publication after a terminal build make no model
-        calls and are not counted.  Build routing keys fall back to the build
+        Post-build work (merge cards, the merge and publication) is short
+        and is not counted.  Build routing keys fall back to the build
         ID when the correlation ID is empty, as build admission does.
         """
         planning_marks = ",".join("?" for _ in _PLANNING_TERMINAL_STATES)
