@@ -1763,7 +1763,7 @@ class ReviewPreviewConfig(BaseModel):
         default=None,
         description=(
             "The https address evidence_root is published under, for example "
-            "'https://promaxgb10-41b1.tailebf801.ts.net/factory-evidence'."
+            "'https://evidence.example.test/factory-evidence'."
         ),
     )
 
@@ -1772,9 +1772,14 @@ class ReviewPreviewConfig(BaseModel):
     def _validate_evidence_base_url(cls, v: str | None) -> str | None:
         if v is None:
             return v
-        value = v.strip().rstrip("/")
-        if not value.startswith("https://") or len(value) <= len("https://"):
-            raise ValueError(f"must be an https:// address, got {v!r}")
+        from forge.deploy.profile import unambiguous_https_url
+
+        value = unambiguous_https_url(v.strip())
+        if value is None:
+            raise ValueError(
+                "must be a plain https:// address (a host, no user name, "
+                f"query, fragment, backslash or spaces), got {v!r}"
+            )
         return value
 
 

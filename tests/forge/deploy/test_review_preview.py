@@ -52,7 +52,7 @@ from forge.deploy.stage import DeployStageResult
 from forge.lifecycle import migrations
 
 START = datetime(2026, 10, 12, 9, 0, 0, tzinfo=UTC)
-BASE_URL = "https://promaxgb10-41b1.tailebf801.ts.net/factory-evidence"
+BASE_URL = "https://evidence.example.test/factory-evidence"
 PROJECT = "guardkit/notes-fixture"
 SHA_MAIN = "a" * 40
 #: The target branch as freshly fetched from the remote: ahead of the clone's
@@ -66,12 +66,12 @@ SLOTS = [
     {
         "port": 8950,
         "internal_port": 18950,
-        "public_url": "https://spark-fcf6.tailebf801.ts.net:8950",
+        "public_url": "https://preview.example.test:8950",
     },
     {
         "port": 8951,
         "internal_port": 18951,
-        "public_url": "https://spark-fcf6.tailebf801.ts.net:8951",
+        "public_url": "https://preview.example.test:8951",
     },
 ]
 
@@ -411,7 +411,7 @@ async def test_a_prepared_preview_is_ready_with_its_links_and_evidence(world: Wo
     evidence = await world.service.prepare(_request())
 
     assert evidence.state == "ready", evidence.failure_reason
-    assert evidence.app_url == "https://spark-fcf6.tailebf801.ts.net:8950/?preview=the-right-token"
+    assert evidence.app_url == "https://preview.example.test:8950/?preview=the-right-token"
     folder = f"{BASE_URL}/guardkit/notes-fixture/FEAT-AB12/{SHA_CAND}/pvrun-000000000001"
     assert evidence.report_url == f"{folder}/index.html"
     assert evidence.media_urls == [f"{folder}/shots/sign-in.png", f"{folder}/video/journey.webm"]
@@ -441,7 +441,7 @@ async def test_a_prepared_preview_is_ready_with_its_links_and_evidence(world: Wo
         "COMPOSE_PROJECT_NAME": "notes-pv0",
         "FACTORY_PREVIEW_PORT": "8950",
         "FACTORY_PREVIEW_INTERNAL_PORT": "18950",
-        "FACTORY_PREVIEW_URL": "https://spark-fcf6.tailebf801.ts.net:8950",
+        "FACTORY_PREVIEW_URL": "https://preview.example.test:8950",
         "FACTORY_PREVIEW_TOKEN": "the-right-token",
         "FACTORY_RESOURCE_LABEL": f"{LEASE_LABEL}=pv000000000001",
         "FACTORY_EVIDENCE_DIR": f"{tree}/{EVIDENCE_FOLDER}",
@@ -473,8 +473,8 @@ async def test_two_concurrent_preparations_get_different_slots(world: World) -> 
     )
     assert first.state == second.state == "ready"
     assert {first.app_url.split("?")[0], second.app_url.split("?")[0]} == {
-        "https://spark-fcf6.tailebf801.ts.net:8950/",
-        "https://spark-fcf6.tailebf801.ts.net:8951/",
+        "https://preview.example.test:8950/",
+        "https://preview.example.test:8951/",
     }
     ports = {lease.port for lease in world.store.live()}
     assert ports == {8950, 8951}
@@ -516,7 +516,7 @@ async def test_a_slot_that_comes_free_while_waiting_is_taken(world: World) -> No
     world.clock.on_sleep = free_one
     third = await world.service.prepare(_request("build-3", "FEAT-EF56"))
     assert third.state == "ready", third.failure_reason
-    assert third.app_url.startswith("https://spark-fcf6.tailebf801.ts.net:8950/")
+    assert third.app_url.startswith("https://preview.example.test:8950/")
     assert world.clock.now - START < timedelta(minutes=30)
 
 
@@ -843,6 +843,32 @@ def test_a_linked_folder_inside_the_evidence_is_never_walked(tmp_path: Path) -> 
     packed = pack_preview_evidence(clone, lease_id="pv000000000001")
     names = tarfile.open(fileobj=io.BytesIO(base64.b64decode(packed["archive"]))).getnames()
     assert sorted(names) == ["report", "report/index.html"]
+
+
+@pytest.mark.asyncio
+async def test_every_link_built_from_evidence_names_is_plain(world: World) -> None:
+    """File names a project chose are quoted, so no link carries a backslash,
+    a space or a control character, and nats-core accepts every one."""
+    world.venue.evidence = (
+        _archive(
+            {
+                "index.html": b"report",
+                "shots/a b\\c.png": b"png",
+                "shots/tab\there.png": b"png",
+            }
+        ),
+        None,
+    )
+    world.dispatch.journey_changes = {"screenshot_refs": [], "media_refs": []}
+    evidence = await world.service.prepare(_request())
+    assert evidence.state == "ready", evidence.failure_reason
+    links = [evidence.app_url, evidence.report_url, *evidence.media_urls]
+    assert len(links) == 4
+    for link in links:
+        assert "\\" not in link and not any(ch.isspace() for ch in link)
+        assert all(ord(ch) >= 32 for ch in link)
+        assert link.startswith("https://") and "@" not in link.split("/")[2]
+    assert any("a%20b%5Cc.png" in link for link in links)
 
 
 def test_the_transfer_cap_is_64_mib_on_both_sides() -> None:

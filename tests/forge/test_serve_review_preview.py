@@ -120,7 +120,7 @@ class TestComposingTheService:
         )
         assert isinstance(service, ReviewPreviewService)
         # A project with no deploy profile here has no preview.
-        assert service.enabled_for("appmilla/nothing-here") is False
+        assert service.enabled_for("example/nothing-here") is False
 
     def test_a_composition_that_raises_leaves_previews_off_not_boot(
         self, monkeypatch: pytest.MonkeyPatch, pool, tmp_path: Path

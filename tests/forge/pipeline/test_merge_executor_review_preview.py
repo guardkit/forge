@@ -52,7 +52,6 @@ from tests.forge.pipeline.test_merge_executor import (  # noqa: F401 - fixtures
     _deps,
     _drain,
     _ensure_build,
-    _envelope,
     _git,
     _JoinsForReal,
     _legs,
@@ -61,10 +60,33 @@ from tests.forge.pipeline.test_merge_executor import (  # noqa: F401 - fixtures
     _stage_ids,
     _tree_of,
     _write_offer,
-    config,
     pool,
     repo_root,
 )
+from tests.forge.pipeline.test_merge_executor import _envelope as _an_envelope
+
+#: Who approves in this file (a neutral name; the shared fixtures' own
+#: approver is left as it is).
+APPROVER = "the-approver"
+
+
+@pytest.fixture
+def config(repo_root):
+    from forge.config.models import ForgeConfig
+
+    return ForgeConfig.model_validate(
+        {
+            "permissions": {"filesystem": {"allowlist": ["/tmp"]}},
+            "planning": {"target_repo_paths": {REPO: str(repo_root)}},
+            "approval": {"expected_approver": APPROVER},
+            "merge_executor": {"enabled": True},
+        }
+    )
+
+
+def _envelope(**kwargs: Any) -> Any:
+    kwargs.setdefault("decided_by", APPROVER)
+    return _an_envelope(**kwargs)
 
 PRESSED_AT = datetime(2026, 10, 12, 15, 0, tzinfo=timezone.utc)
 
@@ -181,7 +203,7 @@ class TestAnApprovalThePreviewRefuses:
         # The refusal is on the build's publication record, with who and why.
         record = _the_record(pool)
         assert record is not None
-        assert record[0] == "rich"
+        assert record[0] == APPROVER
         assert record[1] == "publication pending"
         assert record[3] is None
         lines = json.loads(record[2])
@@ -392,7 +414,7 @@ async def _press(deps, repo_root, **kwargs: Any) -> Any:
         repo_root=repo_root,
         expect_main_sha=MAIN_SHA,
         correlation_id=CORRELATION,
-        decided_by="rich",
+        decided_by=APPROVER,
         **kwargs,
     )
 

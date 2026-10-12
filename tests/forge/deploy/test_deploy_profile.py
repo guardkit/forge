@@ -271,12 +271,12 @@ class TestPreviewSection:
         {
             "port": 8950,
             "internal_port": 18950,
-            "public_url": "https://spark-fcf6.tailebf801.ts.net:8950",
+            "public_url": "https://preview.example.test:8950",
         },
         {
             "port": 8951,
             "internal_port": 18951,
-            "public_url": "https://spark-fcf6.tailebf801.ts.net:8951/",
+            "public_url": "https://preview.example.test:8951/",
         },
     ]
 
@@ -290,7 +290,7 @@ class TestPreviewSection:
         assert p.preview is not None
         assert p.preview.enabled is True
         assert [s.port for s in p.preview.slots] == [8950, 8951]
-        assert p.preview.slots[1].public_url == "https://spark-fcf6.tailebf801.ts.net:8951"
+        assert p.preview.slots[1].public_url == "https://preview.example.test:8951"
         assert (p.preview.app_ttl_hours, p.preview.evidence_days, p.preview.slot_wait_minutes) == (
             24,
             14,
@@ -356,3 +356,67 @@ class TestPreviewSection:
     def test_bad_sections_are_refused_in_words(self, preview, match) -> None:
         with pytest.raises(DeployProfileError, match=match):
             parse_deploy_profile({**self.BASE, "preview": preview})
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://user:pw@preview.example.test:8950",
+            "https://preview.example.test:8950\\evil",
+            "https://preview.example.test :8950",
+            "https://preview.example.test:8950/\x07",
+            "https://preview.example.test:8950/?x=1",
+            "https://preview.example.test:8950/#frag",
+            "https://",
+            "https://preview.example.test:port",
+        ],
+    )
+    def test_a_slot_address_that_could_be_read_two_ways_is_refused(self, url) -> None:
+        with pytest.raises(DeployProfileError, match="plain https"):
+            parse_deploy_profile(
+                {
+                    **self.BASE,
+                    "preview": {"enabled": True, "slots": [{**self.SLOTS[0], "public_url": url}]},
+                }
+            )
+
+
+class TestTheEvidenceBaseAddress:
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://user@evidence.example.test/factory-evidence",
+            "https://evidence.example.test/factory\\evidence",
+            "https://evidence.example.test/factory evidence",
+            "http://evidence.example.test/factory-evidence",
+            "https://evidence.example.test/factory-evidence?x=1",
+        ],
+    )
+    def test_an_address_that_could_be_read_two_ways_is_refused(self, url) -> None:
+        from pydantic import ValidationError
+
+        from forge.config.models import ForgeConfig
+
+        with pytest.raises(ValidationError, match="plain https"):
+            ForgeConfig.model_validate(
+                {
+                    "permissions": {"filesystem": {"allowlist": ["/tmp"]}},
+                    "review_preview": {"evidence_base_url": url},
+                }
+            )
+
+    def test_a_plain_address_is_kept_without_its_trailing_slash(self) -> None:
+        from forge.config.models import ForgeConfig
+
+        config = ForgeConfig.model_validate(
+            {
+                "permissions": {"filesystem": {"allowlist": ["/tmp"]}},
+                "review_preview": {
+                    "evidence_base_url": "https://evidence.example.test/factory-evidence/"
+                },
+            }
+        )
+        assert config.review_preview.evidence_base_url == (
+            "https://evidence.example.test/factory-evidence"
+        )
+        assert config.review_preview.enabled is False
+        assert config.review_preview.evidence_root is None

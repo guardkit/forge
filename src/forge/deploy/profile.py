@@ -67,6 +67,7 @@ __all__ = [
     "DeploySandbox",
     "DeployPreview",
     "PreviewSlot",
+    "unambiguous_https_url",
     "DeployProfileError",
     "load_deploy_profile",
     "SANDBOX_WRAPPER_PREFIX",
@@ -314,6 +315,37 @@ class PreviewSlot:
     port: int
     internal_port: int
     public_url: str
+
+
+def unambiguous_https_url(value: object) -> str | None:
+    """``value`` without a trailing ``/`` when it is a plain https address, else None.
+
+    Plain means: ``https``, a host, and none of the things a reader could take
+    two ways — no backslash, whitespace or control character, no
+    ``user:password@``, no query and no fragment. The review preview builds
+    every link on its card from these, and Jarvis and nats-core refuse any
+    link that is not plain (web readiness W7).
+    """
+    from urllib.parse import urlsplit
+
+    if not isinstance(value, str) or not value:
+        return None
+    if "\\" in value or any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in value):
+        return None
+    try:
+        parts = urlsplit(value)
+        parts.port  # noqa: B018 — raises on a port that is not a number
+    except ValueError:
+        return None
+    if (
+        parts.scheme != "https"
+        or not parts.hostname
+        or "@" in parts.netloc
+        or parts.query
+        or parts.fragment
+    ):
+        return None
+    return value.rstrip("/")
 
 
 @dataclass(frozen=True, slots=True)
@@ -987,15 +1019,11 @@ def _parse_preview(raw: Any) -> DeployPreview | None:
                 )
             ports_seen.add(value)
         public_url = slot.get("public_url")
-        if (
-            not isinstance(public_url, str)
-            or not public_url.startswith("https://")
-            or len(public_url) <= len("https://")
-            or any(ch.isspace() for ch in public_url)
-        ):
+        if unambiguous_https_url(public_url) is None:
             raise DeployProfileError(
-                f"preview.slots[{i}].public_url must be an https:// address, for "
-                "example 'https://spark-fcf6.tailebf801.ts.net:8950'; got "
+                f"preview.slots[{i}].public_url must be a plain https:// address "
+                "(a host; no user name, query, fragment, backslash or spaces), "
+                "for example 'https://preview.example.test:8950'; got "
                 f"{public_url!r}"
             )
         slots.append(
