@@ -70,8 +70,11 @@ consequences (recorded 12 October 2026):
   window minutes rather than moments. No retry mechanism is added for it.
 
 ONLY ``forge.preview.lease`` IS EVER TOUCHED. Teardown, the sweep and the
-start-up reconciliation find and remove containers, networks and volumes by
-that one label and its exact value. The disposable runs' own label
+start-up reconciliation find and remove containers, networks, volumes and
+images by that one label and its exact value (an image still used by a
+container without that label is never removed). Preparation checks that the
+started preview really carries the label, so a teardown that finds nothing
+means nothing is there. The disposable runs' own label
 (``guardkit.fixture.owner``) never appears here.
 """
 
@@ -747,11 +750,21 @@ def _engine_lines(run: CommandRunner, argv: Sequence[str]) -> list[str] | None:
 
 
 def list_preview_leases(run: CommandRunner = _run_command) -> dict[str, Any]:
-    """The lease ids of every container, network and volume carrying the label."""
+    """The lease ids of everything carrying the label, and of running containers.
+
+    ``leases``: every container (running or not), network, volume and image
+    carrying the label. ``running``: the leases with at least one RUNNING
+    container — what preparation checks after the preview is started.
+    """
     engine = shutil.which("docker") or "docker"
     found: set[str] = set()
     template = '{{.Label "' + LEASE_LABEL + '"}}'
-    for kind in (["ps", "--all"], ["network", "ls"], ["volume", "ls"]):
+    for kind in (
+        ["ps", "--all"],
+        ["network", "ls"],
+        ["volume", "ls"],
+        ["image", "ls"],
+    ):
         lines = _engine_lines(
             run,
             [engine, *kind, "--filter", f"label={LEASE_LABEL}", "--format", template],
@@ -759,13 +772,52 @@ def list_preview_leases(run: CommandRunner = _run_command) -> dict[str, Any]:
         if lines is None:
             return {"refusal": "the container engine could not be asked about previews"}
         found.update(line for line in lines if _LEASE_ID.match(line))
-    return {"leases": sorted(found)}
+    running = _engine_lines(
+        run, [engine, "ps", "--filter", f"label={LEASE_LABEL}", "--format", template]
+    )
+    if running is None:
+        return {"refusal": "the container engine could not be asked about previews"}
+    return {
+        "leases": sorted(found),
+        "running": sorted({line for line in running if _LEASE_ID.match(line)}),
+    }
+
+
+def _images_other_containers_use(
+    run: CommandRunner, engine: str, lease_id: str, image_ids: Sequence[str]
+) -> set[str] | None:
+    """Of ``image_ids``, those a container NOT labelled for this lease uses.
+
+    Asked per image with the engine's ``ancestor`` filter (which also matches
+    containers built on top of the image, so it can only protect more).
+    ``None`` when the engine could not be asked.
+    """
+    protected: set[str] = set()
+    template = '{{.ID}} {{.Label "' + LEASE_LABEL + '"}}'
+    for image in image_ids:
+        lines = _engine_lines(
+            run,
+            [engine, "ps", "--all", "--filter", f"ancestor={image}", "--format", template],
+        )
+        if lines is None:
+            return None
+        for line in lines:
+            parts = line.split()
+            if (parts[1] if len(parts) > 1 else "") != lease_id:
+                protected.add(image)
+    return protected
 
 
 def remove_preview_resources(
     lease_id: str, run: CommandRunner = _run_command
 ) -> dict[str, Any]:
-    """Remove the containers, networks and volumes labelled for this lease, only."""
+    """Remove the containers, networks, volumes and images labelled for this lease.
+
+    Only that label and value is ever matched. An image is never removed while
+    a container without this lease's label uses it (another lease's, or one
+    that is nothing to do with previews); it is left, and not counted as
+    remaining, because it is not this lease's to remove.
+    """
     engine = shutil.which("docker") or "docker"
     selector = f"label={LEASE_LABEL}={lease_id}"
     plans = (
@@ -776,6 +828,7 @@ def remove_preview_resources(
             ["volume", "rm", "--force"],
         ),
     )
+    images = ["image", "ls", "--quiet", "--no-trunc", "--filter", selector]
     for listing, removal in plans:
         ids = _engine_lines(run, [engine, *listing])
         if ids is None:
@@ -785,6 +838,16 @@ def remove_preview_resources(
             }
         if ids:
             run([engine, *removal, *ids])
+    # Images last: their containers are gone by now.
+    image_ids = _engine_lines(run, [engine, *images])
+    if image_ids is None:
+        return {"removed": False, "refusal": "the container engine could not be asked"}
+    protected = _images_other_containers_use(run, engine, lease_id, image_ids)
+    if protected is None:
+        return {"removed": False, "refusal": "the container engine could not be asked"}
+    removable = [image for image in image_ids if image not in protected]
+    if removable:
+        run([engine, "image", "rm", *removable])
     remaining = 0
     for listing, _removal in plans:
         ids = _engine_lines(run, [engine, *listing])
@@ -794,7 +857,14 @@ def remove_preview_resources(
                 "refusal": "the container engine could not be asked",
             }
         remaining += len(ids)
-    return {"removed": remaining == 0, "remaining": remaining}
+    left = _engine_lines(run, [engine, *images])
+    if left is None:
+        return {"removed": False, "refusal": "the container engine could not be asked"}
+    remaining += len([image for image in left if image not in protected])
+    answer: dict[str, Any] = {"removed": remaining == 0, "remaining": remaining}
+    if protected:
+        answer["images_kept_in_use"] = sorted(protected)
+    return answer
 
 
 def serve_preview_operation(
@@ -984,6 +1054,17 @@ class SidecarPreviewVenue:
             )
             return None
         return {str(item) for item in answer["leases"]}
+
+    async def running_leases(self) -> set[str] | None:
+        """The leases with at least one running container, or None if unknown."""
+        answer, why = await self._ask(PREVIEW_PROJECTS_ROUTE, {})
+        if answer is None or not isinstance(answer.get("running"), list):
+            logger.warning(
+                "review preview: running previews could not be listed: %s",
+                why or answer,
+            )
+            return None
+        return {str(item) for item in answer["running"]}
 
     async def remove_project(self, lease_id: str) -> bool:
         answer, why = await self._ask(
@@ -1413,6 +1494,20 @@ class ReviewPreviewService:
         if up is None or getattr(up, "outcome", None) != "complete":
             return await self._fail(
                 context, f"the preview could not be started: {self._why(up)}"
+            )
+
+        # (3b) Its resources carry the lease's label. Teardown, the sweep and
+        # the start-up reconcile find a preview ONLY by that label, so a
+        # project that did not apply it would leave a preview nothing could
+        # find, while its teardown read as "confirmed".
+        running = await venue.running_leases()
+        if running is None:
+            return await self._fail(
+                context, "the preview's containers could not be listed"
+            )
+        if lease_id not in running:
+            return await self._fail(
+                context, "the project did not label its preview resources"
             )
 
         # (4) The link.

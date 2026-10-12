@@ -148,6 +148,8 @@ class FakeVenue:
         self.evidence: tuple[bytes | None, str | None] = (_archive(EVIDENCE_FILES), None)
         self.running: set[str] | None = set()
         self.remove_ok = True
+        # Whether the started preview's containers carry the lease's label.
+        self.labelled = True
 
     async def lay_out(self, lease_id: str, *, onto: str, candidate: str) -> PreviewTree:
         self.calls.append(("lay_out", (lease_id, onto, candidate)))
@@ -178,6 +180,12 @@ class FakeVenue:
     async def remove_project(self, lease_id: str) -> bool:
         self.calls.append(("remove_project", lease_id))
         return self.remove_ok
+
+    async def running_leases(self) -> set[str] | None:
+        self.calls.append(("running_leases", None))
+        if not self.labelled:
+            return set()
+        return {args[0] for args in self.named("lay_out")}
 
     def named(self, op: str) -> list[Any]:
         return [arg for name, arg in self.calls if name == op]
@@ -1049,7 +1057,10 @@ class FakeEngine:
 
 def test_listing_and_removal_use_only_the_preview_label() -> None:
     engine = FakeEngine({"pv000000000001": ["c1", "c2"], "pv000000000002": ["c3"]})
-    assert list_preview_leases(engine) == {"leases": ["pv000000000001", "pv000000000002"]}
+    assert list_preview_leases(engine) == {
+        "leases": ["pv000000000001", "pv000000000002"],
+        "running": ["pv000000000001", "pv000000000002"],
+    }
     answer = remove_preview_resources("pv000000000001", engine)
     assert answer == {"removed": True, "remaining": 0}
     assert engine.labelled["pv000000000002"] == ["c3"]  # another lease is left alone
@@ -1064,6 +1075,93 @@ def test_listing_and_removal_use_only_the_preview_label() -> None:
         assert filters and all(f.startswith(f"label={LEASE_LABEL}") for f in filters)
         if "--quiet" in argv:
             assert filters == [f"label={LEASE_LABEL}=pv000000000001"]
+
+
+class FakeImageEngine:
+    """An engine with containers and images, each container naming its image."""
+
+    def __init__(
+        self,
+        containers: dict[str, tuple[str, str]],
+        images: dict[str, str],
+    ) -> None:
+        self.containers = dict(containers)  # id -> (image id, lease label or "")
+        self.images = dict(images)  # image id -> lease label
+        self.argv: list[list[str]] = []
+
+    def __call__(self, argv) -> tuple[int, str, str]:
+        argv = list(argv)
+        self.argv.append(argv)
+        filters = [argv[i + 1] for i, a in enumerate(argv) if a == "--filter"]
+        if argv[1:3] == ["image", "ls"]:
+            lease = filters[0].split("=", 2)[2]
+            return 0, "\n".join(i for i, l in self.images.items() if l == lease), ""
+        if argv[1:3] == ["image", "rm"]:
+            for image in argv[3:]:
+                if any(c[0] == image for c in self.containers.values()):
+                    return 1, "", f"image {image} is in use"
+                self.images.pop(image, None)
+            return 0, "", ""
+        if argv[1] == "ps" and filters and filters[0].startswith("ancestor="):
+            image = filters[0].split("=", 1)[1]
+            lines = [f"{cid} {label}" for cid, (img, label) in self.containers.items() if img == image]
+            return 0, "\n".join(lines), ""
+        if argv[1] == "ps" and "--quiet" in argv:
+            lease = filters[0].split("=", 2)[2]
+            return 0, "\n".join(c for c, (_i, l) in self.containers.items() if l == lease), ""
+        if argv[1] == "rm":
+            for cid in argv[3:]:
+                self.containers.pop(cid, None)
+            return 0, "", ""
+        return 0, "", ""
+
+
+def test_teardown_removes_the_lease_s_images_but_never_one_still_in_use() -> None:
+    lease = "pv000000000001"
+    engine = FakeImageEngine(
+        containers={
+            "c1": ("sha256:app", lease),  # the preview's own container
+            "c9": ("sha256:shared", ""),  # not a preview: uses a labelled image
+        },
+        images={"sha256:app": lease, "sha256:shared": lease, "sha256:other": "pv000000000002"},
+    )
+
+    answer = remove_preview_resources(lease, engine)
+
+    assert answer == {
+        "removed": True,
+        "remaining": 0,
+        "images_kept_in_use": ["sha256:shared"],
+    }
+    assert "sha256:app" not in engine.images  # this lease's image, removed
+    assert "sha256:shared" in engine.images  # still used by c9, kept
+    assert "sha256:other" in engine.images  # another lease's, never touched
+    removals = [argv for argv in engine.argv if argv[1:3] == ["image", "rm"]]
+    assert removals == [[removals[0][0], "image", "rm", "sha256:app"]]
+    assert "--force" not in removals[0]
+
+
+@pytest.mark.asyncio
+async def test_a_preview_that_did_not_label_its_resources_fails(world: World) -> None:
+    world.venue.labelled = False
+    evidence = await world.service.prepare(_request())
+    assert evidence.state == "failed"
+    assert evidence.failure_reason == "the project did not label its preview resources"
+    assert world.venue.named("probe") == []  # stopped before the link check
+    assert world.venue.named("remove_project") == ["pv000000000001"]
+
+
+@pytest.mark.asyncio
+async def test_running_previews_that_cannot_be_listed_fail_the_preparation(
+    world: World,
+) -> None:
+    async def unknown() -> None:
+        return None
+
+    world.venue.running_leases = unknown
+    evidence = await world.service.prepare(_request())
+    assert evidence.state == "failed"
+    assert evidence.failure_reason == "the preview's containers could not be listed"
 
 
 def test_an_engine_that_cannot_be_asked_is_unknown_not_empty() -> None:
@@ -1110,7 +1208,9 @@ def test_the_routes_check_what_they_are_sent(tmp_path: Path) -> None:
     status, body = serve_preview_operation(
         PREVIEW_PROJECTS_ROUTE, {}, repo_path=tmp_path, slot_ports=frozenset(), run=engine
     )
-    assert (status, body) == (200, {"leases": ["pv000000000001"]})
+    assert (status, body) == (
+        200, {"leases": ["pv000000000001"], "running": ["pv000000000001"]}
+    )
     status, body = serve_preview_operation(
         PREVIEW_PROJECT_REMOVE_ROUTE,
         {"lease_id": "pv000000000001"},

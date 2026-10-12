@@ -67,7 +67,7 @@ The narrow contract:
     POST /preview/probe {repo, lease_id, port, token}
               -> {no_token, wrong_token, right_token}
     POST /preview/evidence {repo, lease_id} -> {archive, files, bytes}
-    POST /preview/projects {repo} -> {leases}
+    POST /preview/projects {repo} -> {leases, running}
     POST /preview/project-remove {repo, lease_id} -> {removed, remaining}
               (the review preview's routes, web readiness W7 — see the block
               above :func:`process_preview_request`)
