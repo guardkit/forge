@@ -65,8 +65,9 @@ consequences (recorded 12 October 2026):
   no existing path offers a COMPLETE build's card again. The start-up
   reconcile ends the half-prepared lease ("the coordinator restarted while
   this preview was being prepared"). Recovery is the existing one: run the
-  feature again (``forge merge-deploy`` is the attended press, with no
-  preview). This gap is as old as the offer itself; a preview only makes the
+  feature again. ``forge merge-deploy`` refuses such a build (previews on,
+  the project prepares them, no previewed card on record), so it is never
+  merged unseen. This gap is as old as the offer itself; a preview only makes the
   window minutes rather than moments. No retry mechanism is added for it.
 
 ONLY ``forge.preview.lease`` IS EVER TOUCHED. Teardown, the sweep and the
