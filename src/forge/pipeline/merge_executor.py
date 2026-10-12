@@ -1285,6 +1285,7 @@ async def execute_merge_deploy(
     expected_candidate_branch: str | None = None,
     worktree_retention: dict[str, Any] | None = None,
     merge_execution_attempt_id: str | None = None,
+    expected_preview_tree: str | None = None,
 ) -> MergeDeployOutcome:
     """Run join -> checks -> report for one press, and stop before publishing.
 
@@ -1367,6 +1368,11 @@ async def execute_merge_deploy(
     when it is set, else ``autobuild/<feature id>``; the merge command is
     given ``--branch`` only when it is set, so a feature build's argv is byte
     for byte what it always was.
+
+    ``expected_preview_tree`` is the tree an offer with a review preview
+    previewed (web-readiness W7). When it is set, a joined tree that differs
+    from it is refused before anything is checked or published; when it is
+    ``None`` — every offer without a preview — nothing here changes.
     """
     # Permanent administrative retirement is checked before routing, clocks,
     # receipts, leases, publishers, git, model-bearing commands, or deploy.
@@ -4737,6 +4743,24 @@ async def execute_merge_deploy(
             gate["merged_tree"] = j_tree
             gate["trees_match"] = bool(j_tree)
 
+            # THE TREE THAT WAS PREVIEWED IS THE ONLY TREE THIS APPROVAL MAY
+            # MERGE (web-readiness W7, R3). The offer previewed the candidate
+            # joined onto the main it pinned; if main has moved since, the
+            # join made now is a different tree that nobody tried. It is
+            # refused like a candidate that moved, and nothing is merged.
+            if expected_preview_tree and j_tree != expected_preview_tree:
+                logger.warning(
+                    "merge-executor: refusing %s — main moved since the "
+                    "preview (previewed tree %s, joined tree %s)",
+                    build_id,
+                    expected_preview_tree,
+                    j_tree,
+                )
+                return _could_not_check(
+                    "main moved since the preview: previewed tree "
+                    f"{expected_preview_tree}, joined tree {j_tree}"
+                )
+
             if store is not None and not store.about_to(
                 build_id=build_id,
                 turn=turn,
@@ -5811,6 +5835,11 @@ class MergeApprovalConsumer:
                 worktree_retention=worktree_retention,
                 merge_execution_attempt_id=str(merge_execution_attempt_id),
                 **({"previewed_offer": offer} if "review_evidence" in offer else {}),
+                **(
+                    {"expected_preview_tree": str(offer["preview_tree"])}
+                    if offer.get("preview_tree")
+                    else {}
+                ),
             )
         )
         self._tasks.add(task)
@@ -5834,6 +5863,7 @@ class MergeApprovalConsumer:
         worktree_retention: dict[str, Any] | None = None,
         merge_execution_attempt_id: str,
         previewed_offer: dict[str, Any] | None = None,
+        expected_preview_tree: str | None = None,
     ) -> None:
         # Per-repo single-flight: an asyncio lock per repo key PLUS the
         # executor's own durable step probes.
@@ -5856,6 +5886,11 @@ class MergeApprovalConsumer:
                     expected_candidate_branch=expected_candidate_branch,
                     worktree_retention=worktree_retention,
                     merge_execution_attempt_id=merge_execution_attempt_id,
+                    **(
+                        {"expected_preview_tree": expected_preview_tree}
+                        if expected_preview_tree
+                        else {}
+                    ),
                 )
                 ended = f"approval ended: {getattr(outcome, 'result', None)}"
             except Exception as exc:  # noqa: BLE001 — the task must not die silent
@@ -5879,6 +5914,8 @@ class MergeApprovalConsumer:
         Fails closed: no service here, or a service whose check raises, is a
         refusal in its own words, never a pass.
         """
+        if not str(offer.get("preview_tree") or "").strip():
+            return "the offer does not say which tree was previewed"
         service = self._deps.review_preview
         if service is None:
             return (
