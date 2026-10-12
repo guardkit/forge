@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Mapping
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -90,6 +91,8 @@ __all__ = [
     "HOLD_SLOT",
     "GateDispatchOutcome",
     "MergeCardNotPublished",
+    "EXISTING_FILES_NAMED_ON_THE_CARD",
+    "card_line_about_files_that_already_existed",
     "card_line_about_scope",
     "card_line_about_tests",
     "make_merge_card_publisher",
@@ -538,12 +541,21 @@ def card_line_about_tests(counts: Any) -> str:
 
     ``""`` when nobody counted, which is what every card looked like before
     this ruling.
+
+    Whatever the shape, a test file that was already there before the branch
+    and that it changed is NAMED (repair 2 part B, 12 October 2026). An
+    existing test whose assertion was rewritten, or whose setup changed with
+    no assertion touched at all, has moved what the passing result was
+    measured against, and "changed 1 test file" alone would hide which.
     """
     if counts is None:
         return ""
     files = int(getattr(counts, "files_changed", 0) or 0)
     deleted = int(getattr(counts, "tests_deleted", 0) or 0)
     removed = int(getattr(counts, "assertions_removed", 0) or 0)
+    existing = tuple(
+        str(path) for path in (getattr(counts, "existing_files", ()) or ()) if str(path).strip()
+    )
     if deleted or removed:
         said: list[str] = []
         if deleted:
@@ -552,24 +564,118 @@ def card_line_about_tests(counts: Any) -> str:
             said.append(
                 f"removed {removed} assertion{'s' if removed != 1 else ''}"
             )
-        where = _names_the_files(tuple(getattr(counts, "files", ()) or ()))
-        return (
+        named = tuple(getattr(counts, "files", ()) or ())
+        where = _names_the_files(named)
+        line = (
             f"This branch {' and '.join(said)} in {where} — worth a look "
             "before you merge."
         )
+        also = tuple(path for path in existing if path not in named)
+        if also:
+            line += (
+                f" It also changed {len(also)} test "
+                f"file{'s' if len(also) != 1 else ''} that already existed: "
+                f"{_names_the_files(also)}."
+            )
+        return line
     if not getattr(counts, "read_whole", True):
         if files:
             return (
                 f"This branch changed {files} test file"
                 f"{'s' if files != 1 else ''}, and what it changed in them "
-                "could not be read here."
+                f"could not be read here.{_which_already_existed(existing, files)}"
             )
         return "What this branch changed in the tests could not be read here."
     if not files:
         return "This branch changed no test files."
     return (
         f"This branch changed {files} test file{'s' if files != 1 else ''} "
-        "and removed no tests or assertions."
+        f"and removed no tests or assertions.{_which_already_existed(existing, files)}"
+    )
+
+
+def _which_already_existed(existing: "tuple[str, ...]", files: int) -> str:
+    """The sentence naming the changed test files that were already there.
+
+    Starts with a space so it can follow the test line's own sentence, and is
+    ``""`` when every changed test file is new.
+    """
+    if not existing:
+        return ""
+    names = _names_the_files(existing)
+    if len(existing) >= files:
+        if files == 1:
+            return f" That file already existed: {names}."
+        return f" All of them already existed: {names}."
+    return f" {len(existing)} of them already existed: {names}."
+
+
+#: How many files that already existed the card names before it counts the
+#: rest. More than the three the other lines name, because here the names are
+#: the point: a changed dependency file or a rewritten test is exactly what
+#: the person deciding needs to see. The receipt keeps every one.
+EXISTING_FILES_NAMED_ON_THE_CARD: int = 6
+
+
+def card_line_about_files_that_already_existed(report: Any) -> str:
+    """The ONE line naming the files this branch changed that were already
+    there (repair 2 part B, 12 October 2026).
+
+    In the four-worker trial both builds that counted had rewritten an
+    existing test and changed the dependency declarations, and the card
+    showed only a passing suite. That suite was run WITH those changes, so it
+    was not evidence that the original tests passed unchanged. This line says
+    so, and names the files. It is disclosure only: it never stops a merge.
+
+    ``report`` is the build's scope report (it carries
+    ``files_that_already_existed``, read from the branch's own file list).
+    Three shapes:
+
+    * files that already existed were changed — how many, which (a test file
+      marked as one, a deleted file as deleted, at most
+      :data:`EXISTING_FILES_NAMED_ON_THE_CARD` named, then "and N more"), and
+      what that means for the test result above;
+    * the branch could not be read — said plainly, never as "nothing";
+    * ``""`` when the branch only added files, or nobody read it at all.
+    """
+    if report is None:
+        return ""
+    if not bool(getattr(report, "read", False)):
+        return (
+            "Whether this branch changes files that already existed could not "
+            "be read here, so the test result above is not evidence that the "
+            "original tests pass unchanged."
+        )
+    existing = list(getattr(report, "files_that_already_existed", ()) or ())
+    if not existing:
+        return ""
+    named: list[str] = []
+    for item in existing[:EXISTING_FILES_NAMED_ON_THE_CARD]:
+        if isinstance(item, Mapping):
+            path = str(item.get("path", "") or "")
+            is_test = bool(item.get("is_test"))
+            deleted = bool(item.get("deleted"))
+        else:
+            path = str(getattr(item, "path", item) or "")
+            is_test = bool(getattr(item, "is_test", False))
+            deleted = bool(getattr(item, "deleted", False))
+        notes = (["a test file"] if is_test else []) + (["deleted"] if deleted else [])
+        named.append(f"{path} ({', '.join(notes)})" if notes else path)
+    listing = ", ".join(named)
+    rest = len(existing) - len(named)
+    if rest > 0:
+        listing += f" and {rest} more"
+    count = len(existing)
+    if count == 1:
+        return (
+            f"This branch changes 1 file that already existed: {listing}. The "
+            "test result above was measured with this change, so it is not "
+            "evidence that the original tests pass unchanged."
+        )
+    return (
+        f"This branch changes {count} files that already existed: {listing}. "
+        "The test result above was measured with these changes, so it is not "
+        "evidence that the original tests pass unchanged."
     )
 
 
@@ -709,6 +815,9 @@ def merge_card_words(
     tests = card_line_about_tests(getattr(gates, "test_changes", None))
     if tests:
         sentences.append(tests)
+    already_there = card_line_about_files_that_already_existed(scope)
+    if already_there:
+        sentences.append(already_there)
     in_scope = card_line_about_scope(scope)
     if in_scope:
         sentences.append(in_scope)

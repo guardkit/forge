@@ -545,6 +545,50 @@ class TestTheCardAndTheDurableRow:
         assert kept["read"] is True
         assert kept["files_the_plan_did_not_name"] == ["src/analytics/service.py"]
 
+    def test_the_card_and_the_row_name_the_file_that_already_existed(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Repair 2 part B, 12 October 2026: the branch changed the router
+        that was already on main and added a new service. The card names the
+        router, after what was checked, and the durable row and the receipt
+        keep the same list for anyone reading the build afterwards."""
+        _insert_build(pool)
+        _insert_planning_run(pool)
+        receipts = tmp_path / "receipts"
+        (receipts / BUILD_ID).mkdir(parents=True)
+        monkeypatch.setenv("FORGE_RECEIPTS_DIR", str(receipts))
+        recorder = _Recorder()
+
+        asyncio.run(_service(config, pool, recorder).maybe_offer(_event()))
+
+        words = recorder.paused.rationale
+        sentence = (
+            "This branch changes 1 file that already existed: "
+            "src/users/router.py. The test result above was measured with this "
+            "change, so it is not evidence that the original tests pass "
+            "unchanged."
+        )
+        assert sentence in words
+        assert words.index(sentence) < words.index("Approve =")
+        expected = [
+            {"path": "src/users/router.py", "deleted": False, "is_test": False}
+        ]
+        offered = [
+            stage
+            for stage in pool.read_stages(BUILD_ID)
+            if stage.target_identifier == MERGE_OFFER_TARGET_IDENTIFIER
+        ]
+        kept = offered[0].details[MERGE_OFFER_DETAILS_KEY]["scope_report"]
+        assert kept["files_that_already_existed"] == expected
+        receipt = json.loads(
+            (receipts / BUILD_ID / SCOPE_REPORT_NAME).read_text(encoding="utf-8")
+        )
+        assert receipt["files_that_already_existed"] == expected
+
     def test_a_pass_nobody_could_take_leaves_the_card_as_it_was(
         self,
         config: ForgeConfig,
@@ -698,6 +742,40 @@ class TestTheRepairJourneysCardCarriesTheSameLine:
         assert words.endswith(
             "Reject = nothing changes; the branch is kept either way."
         )
+
+    def test_the_repair_card_names_the_file_that_already_existed(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _insert_build(pool)
+        _insert_planning_run(pool)
+        receipts = tmp_path / "receipts"
+        (receipts / BUILD_ID).mkdir(parents=True)
+        monkeypatch.setenv("FORGE_RECEIPTS_DIR", str(receipts))
+        recorder = _Recorder()
+
+        asyncio.run(
+            _repair_publisher(pool, recorder, config=config, scope_config=config)(
+                build_id=BUILD_ID,
+                feature_id=FEATURE_ID,
+                rationale="mode-c-commits-present",
+                branch=BRANCH,
+                gates=_repair_gates(),
+            )
+        )
+
+        words = recorder.paused.rationale
+        sentence = (
+            "This branch changes 1 file that already existed: "
+            "src/users/router.py. The test result above was measured with this "
+            "change, so it is not evidence that the original tests pass "
+            "unchanged."
+        )
+        assert sentence in words
+        assert words.index("What was checked") < words.index(sentence)
 
     def test_the_receipt_is_written_before_anyone_is_asked_to_merge(
         self,

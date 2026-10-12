@@ -505,6 +505,15 @@ class ScopeReport:
     #: What the branch was held against: the commit the build started from,
     #: or the branch name used when the record named none.
     compared_against: str | None = None
+    #: Every file that was already there at that commit and that this branch
+    #: changed, deleted or renamed (a rename once, under its new name), each a
+    #: :class:`~forge.pipeline.merge_ready_checkpoint.ExistingFileChange`.
+    #: Repair 2 part B, 12 October 2026: a passing suite measured with these
+    #: changes is not evidence that the original tests pass unchanged, so the
+    #: card and this receipt both say which files they were. Empty when the
+    #: branch only added files, and when the branch could not be read (then
+    #: :attr:`read` is ``False`` and the card says so instead).
+    files_that_already_existed: list[Any] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         """The receipt, exactly as it is written to disk and put on the row."""
@@ -528,6 +537,10 @@ class ScopeReport:
             ),
             "routes_read": self.routes_read,
             "compared_against": self.compared_against,
+            "files_that_already_existed": [
+                item.to_dict() if hasattr(item, "to_dict") else dict(item)
+                for item in self.files_that_already_existed
+            ],
         }
 
 
@@ -538,6 +551,7 @@ def scope_of_the_build(
     request_source: str | None = None,
     request_why_not: str | None = None,
     test_roots: Sequence[str] | None = None,
+    test_paths: Sequence[str] | None = None,
 ) -> ScopeReport:
     """Compare a finished branch with its plan and with the request.
 
@@ -547,11 +561,18 @@ def scope_of_the_build(
     the comparison with the sentence is simply not taken, and the report says
     so instead of reporting nothing wrong. ``request_why_not`` is the caller's
     own sentence for why it could not be found, used in place of the plain
-    one below when the caller knows something more useful.
+    one below when the caller knows something more useful. ``test_paths``
+    are the path patterns this repository's tests live under, used only to
+    mark which of the files that already existed are tests; ``None`` means
+    the plain default.
 
     Never raises.
     """
-    from forge.pipeline.merge_ready_checkpoint import parse_changed_files
+    from forge.pipeline.merge_ready_checkpoint import (
+        DEFAULT_TEST_PATHS,
+        files_that_already_existed,
+        parse_changed_files,
+    )
     from forge.planning.task_traceability import (
         _ALL_CAPABILITIES,
         _is_a_place_on_disk,
@@ -570,6 +591,15 @@ def scope_of_the_build(
     changed_paths = [change.path for change in changes if str(change.path).strip()]
     report.read = True
     report.files_changed = len(changed_paths)
+
+    # FILES THAT ALREADY EXISTED (repair 2 part B, 12 October 2026). From the
+    # same reading, with no idea what kind of file anything is: whatever was
+    # there at the base and this branch changed, the card names.
+    report.files_that_already_existed = list(
+        files_that_already_existed(
+            changes, tuple(test_paths) if test_paths else DEFAULT_TEST_PATHS
+        )
+    )
 
     # (a) AGAINST THE PLAN — the blast radius.
     named, declared = files_the_plan_named(

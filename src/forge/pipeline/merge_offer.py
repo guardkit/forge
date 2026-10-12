@@ -1532,10 +1532,49 @@ def run_the_scope_pass(
         request=request,
         request_source=source,
         request_why_not=why_not,
+        test_paths=_test_paths_of(repo_root_raw, repo_key, sandbox),
     )
     report.compared_against = base
+    existing = list(report.files_that_already_existed)
+    if existing:
+        # The same list the card names, said in the log as well, so an
+        # operator reading the build's own record sees it without the card.
+        logger.info(
+            "the scope pass: %s changes %d file%s that already existed at %s: "
+            "%s — its test result was measured with these changes",
+            build_id,
+            len(existing),
+            "s" if len(existing) != 1 else "",
+            base,
+            ", ".join(item.path for item in existing),
+        )
     write_scope_report(build_id, report)
     return report
+
+
+def _test_paths_of(repo_root: Any, repo_key: str, sandbox: Any) -> tuple[str, ...]:
+    """Where this repository's tests live, for marking test files on the card.
+
+    The same answer the repair card's test count uses: the paths the
+    repository's own declared test command names, beside the plain default,
+    read where the repository lives. It feeds a few words on a card, so any
+    failure leaves the plain default standing and never stops the pass.
+    """
+    from forge.pipeline.merge_ready_checkpoint import DEFAULT_TEST_PATHS
+
+    try:
+        from forge.cli._serve_conductor import test_paths_for
+
+        return tuple(test_paths_for(repo_root, repo_key, sandbox=sandbox))
+    except Exception as exc:  # noqa: BLE001 — a card's few words never stop it
+        logger.warning(
+            "the scope pass: where %s keeps its tests could not be read "
+            "(%s: %s) — the plain default stands",
+            repo_key,
+            type(exc).__name__,
+            exc,
+        )
+        return DEFAULT_TEST_PATHS
 
 
 def _utcnow() -> datetime:
@@ -1687,7 +1726,10 @@ class MergeOfferService:
             supplied = ""
 
         def _words(branch: str, merge_branch: str | None) -> str:
-            from forge.cli._serve_gate_activation import card_line_about_scope
+            from forge.cli._serve_gate_activation import (
+                card_line_about_files_that_already_existed,
+                card_line_about_scope,
+            )
 
             # The card names the branch only when it is not the feature's own
             # (Part M, rule 55): a feature build's card reads exactly as before.
@@ -1719,6 +1761,12 @@ class MergeOfferService:
             if supplied:
                 lines.append(supplied)
             lines.extend(line for line in checked.lines if line)
+            # FILES THAT ALREADY EXISTED (repair 2 part B, 12 October 2026),
+            # straight after what was checked, because it says what that
+            # result was measured with.
+            already_there = card_line_about_files_that_already_existed(scope)
+            if already_there:
+                lines.append(already_there)
             about_the_check = card_line_about_the_after_deploy_check(no_check)
             if about_the_check:
                 lines.append(about_the_check)
