@@ -1,0 +1,152 @@
+{
+  "routine": {
+    "subject": "agents.approval.forge.merge-FEAT-MO1",
+    "correlation_id": "corr-mo-1",
+    "approval": {
+      "request_id": "merge-build-FEAT-MO1-20260824",
+      "agent_id": "merge-deploy-executor",
+      "action_description": "FEAT-MO1 built \u2014 5 of 5 tasks passed.\nFeature-check evidence unavailable: nothing was exported for this build\nApprove = merge into main, deploy to the sandbox and run the checks; the branch is kept either way. Reject = nothing changes.",
+      "risk_level": "high",
+      "details": {
+        "kind": "merge_deploy_offer",
+        "build_id": "build-FEAT-MO1-20260824",
+        "feature_id": "FEAT-MO1",
+        "repo": "appmilla/api_test",
+        "branch": "autobuild/FEAT-MO1",
+        "merge_branch": null,
+        "expect_main_sha": "mainsha1234",
+        "candidate_identity_version": 1,
+        "candidate_sha": "cccccccccccccccccccccccccccccccccccccccc",
+        "candidate_tree": "dddddddddddddddddddddddddddddddddddddddd",
+        "tasks_completed": 5,
+        "tasks_total": 5,
+        "finished_feature_check": {
+          "budget_characters": 900,
+          "state": "unavailable",
+          "reason": "nothing was exported for this build",
+          "card_characters": 71,
+          "not_checked_shortened_to_a_count": false,
+          "observations_not_shown": 0,
+          "cut_to_fit": false,
+          "card_lines": [
+            "Feature-check evidence unavailable: nothing was exported for this build"
+          ]
+        },
+        "baseline_failing": null,
+        "resume_options": [
+          "approve",
+          "reject"
+        ]
+      },
+      "timeout_seconds": 86400
+    },
+    "paused": {
+      "feature_id": "FEAT-MO1",
+      "build_id": "merge-FEAT-MO1",
+      "stage_label": "the merge word",
+      "gate_mode": "MANDATORY_HUMAN_APPROVAL",
+      "coach_score": null,
+      "rationale": "FEAT-MO1 built \u2014 5 of 5 tasks passed.\nFeature-check evidence unavailable: nothing was exported for this build\nApprove = merge into main, deploy to the sandbox and run the checks; the branch is kept either way. Reject = nothing changes.",
+      "approval_subject": "agents.approval.forge.merge-FEAT-MO1",
+      "paused_at": "2026-10-12T09:00:00+00:00",
+      "correlation_id": "corr-mo-1"
+    },
+    "latch": {
+      "merge_offer": {
+        "approval_subject": "agents.approval.forge.merge-FEAT-MO1",
+        "baseline_failing": null,
+        "branch": "autobuild/FEAT-MO1",
+        "build_id": "build-FEAT-MO1-20260824",
+        "candidate_identity_version": 1,
+        "candidate_sha": "cccccccccccccccccccccccccccccccccccccccc",
+        "candidate_tree": "dddddddddddddddddddddddddddddddddddddddd",
+        "correlation_id": "corr-mo-1",
+        "expect_main_sha": "mainsha1234",
+        "feature_id": "FEAT-MO1",
+        "finished_feature_check": {
+          "budget_characters": 900,
+          "card_characters": 71,
+          "card_lines": [
+            "Feature-check evidence unavailable: nothing was exported for this build"
+          ],
+          "cut_to_fit": false,
+          "not_checked_shortened_to_a_count": false,
+          "observations_not_shown": 0,
+          "reason": "nothing was exported for this build",
+          "state": "unavailable"
+        },
+        "kind": "merge_deploy_offer",
+        "merge_branch": null,
+        "repo": "appmilla/api_test",
+        "request_id": "merge-build-FEAT-MO1-20260824",
+        "resume_options": [
+          "approve",
+          "reject"
+        ],
+        "tasks_completed": 5,
+        "tasks_total": 5
+      }
+    }
+  },
+  "checkpoint": {
+    "subject": "agents.approval.forge.merge-FEAT-MO1",
+    "correlation_id": "corr-mo-2",
+    "approval": {
+      "request_id": "merge-build-FEAT-MO1-20260825",
+      "agent_id": "merge-deploy-executor",
+      "action_description": "FEAT-MO1 is ready to merge on branch autobuild/FEAT-MO1. What was checked: the checks this repository declares came back green. Approve = check the candidate in the sandbox, merge the branch into main and promote it. Reject = nothing changes; the branch is kept either way.",
+      "risk_level": "high",
+      "details": {
+        "kind": "merge_deploy_offer",
+        "build_id": "build-FEAT-MO1-20260825",
+        "feature_id": "FEAT-MO1",
+        "repo": "appmilla/api_test",
+        "branch": "autobuild/FEAT-MO1",
+        "merge_branch": null,
+        "expect_main_sha": "mainsha1234",
+        "candidate_identity_version": 1,
+        "candidate_sha": "cccccccccccccccccccccccccccccccccccccccc",
+        "candidate_tree": "dddddddddddddddddddddddddddddddddddddddd",
+        "baseline_failing": null,
+        "resume_options": [
+          "approve",
+          "reject"
+        ]
+      },
+      "timeout_seconds": 86400
+    },
+    "paused": {
+      "feature_id": "FEAT-MO1",
+      "build_id": "merge-FEAT-MO1",
+      "stage_label": "the merge word",
+      "gate_mode": "MANDATORY_HUMAN_APPROVAL",
+      "coach_score": null,
+      "rationale": "FEAT-MO1 is ready to merge on branch autobuild/FEAT-MO1. What was checked: the checks this repository declares came back green. Approve = check the candidate in the sandbox, merge the branch into main and promote it. Reject = nothing changes; the branch is kept either way.",
+      "approval_subject": "agents.approval.forge.merge-FEAT-MO1",
+      "paused_at": "2026-10-12T09:00:00+00:00",
+      "correlation_id": "corr-mo-2"
+    },
+    "latch": {
+      "merge_offer": {
+        "approval_subject": "agents.approval.forge.merge-FEAT-MO1",
+        "baseline_failing": null,
+        "branch": "autobuild/FEAT-MO1",
+        "build_id": "build-FEAT-MO1-20260825",
+        "candidate_identity_version": 1,
+        "candidate_sha": "cccccccccccccccccccccccccccccccccccccccc",
+        "candidate_tree": "dddddddddddddddddddddddddddddddddddddddd",
+        "correlation_id": "corr-mo-2",
+        "expect_main_sha": "mainsha1234",
+        "feature_id": "FEAT-MO1",
+        "kind": "merge_deploy_offer",
+        "merge_branch": null,
+        "repo": "appmilla/api_test",
+        "request_id": "merge-build-FEAT-MO1-20260825",
+        "resume_options": [
+          "approve",
+          "reject"
+        ]
+      }
+    }
+  }
+}
