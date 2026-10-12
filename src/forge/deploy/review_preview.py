@@ -52,6 +52,23 @@ here, with a fake command runner, and the sidecar only resolves the
 repository and calls in. A repository without a sandbox gets a failed preview
 saying so.
 
+PREPARATION RUNS BEFORE THE OFFER'S DURABLE ROW, and that has three
+consequences (recorded 12 October 2026):
+
+* a second offer for the same build while one is preparing is refused by the
+  offer itself (:class:`forge.pipeline.merge_offer.MergeOfferService`), so a
+  preview is never prepared twice;
+* a card whose publish fails has its preview released at once;
+* A RESTART DURING PREPARATION LEAVES THE BUILD WITH NO CARD. The merge offer
+  is fired once, after the build's terminal event is published and its queue
+  message acknowledged (``lifecycle_bridge.wireup._spawn_merge_offer``), and
+  no existing path offers a COMPLETE build's card again. The start-up
+  reconcile ends the half-prepared lease ("the coordinator restarted while
+  this preview was being prepared"). Recovery is the existing one: run the
+  feature again (``forge merge-deploy`` is the attended press, with no
+  preview). This gap is as old as the offer itself; a preview only makes the
+  window minutes rather than moments. No retry mechanism is added for it.
+
 ONLY ``forge.preview.lease`` IS EVER TOUCHED. Teardown, the sweep and the
 start-up reconciliation find and remove containers, networks and volumes by
 that one label and its exact value. The disposable runs' own label

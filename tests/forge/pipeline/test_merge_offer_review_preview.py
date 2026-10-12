@@ -300,3 +300,65 @@ class TestAnOfferWithAPreview:
         await _one_card(config, pool, _Recording())
         assert len(asked_on) == 1
         assert asked_on[0] is not threading.main_thread()
+
+
+# ---------------------------------------------------------------------------
+# Preparation runs before the durable row (coach item 6)
+# ---------------------------------------------------------------------------
+
+
+class TestPreparationBeforeTheRow:
+    @pytest.mark.asyncio
+    async def test_a_second_offer_while_preparing_prepares_nothing(
+        self, config, pool
+    ) -> None:
+        import asyncio
+
+        started = asyncio.Event()
+        go_on = asyncio.Event()
+
+        class _Slow(StandInReviewPreview):
+            async def prepare(self, req: Any) -> Any:
+                started.set()
+                await go_on.wait()
+                return await super().prepare(req)
+
+        _insert_build(pool)
+        preview = _Slow()
+        first = _Recorder()
+        service = _service(config, pool, first, review_preview=preview)
+
+        offering = asyncio.create_task(service.maybe_offer(_event()))
+        await started.wait()
+        again = await service.offer(
+            build_id=BUILD_ID,
+            feature_id=FEATURE_ID,
+            card_words=lambda _b, _m: "words",
+        )
+        go_on.set()
+        await offering
+
+        assert again is False
+        assert len(preview.requests) == 1
+        assert len(_offer_rows(pool)) == 1
+        assert [kind for kind, _ in first.events] == ["approval", "paused"]
+
+    @pytest.mark.asyncio
+    async def test_a_card_that_could_not_be_published_releases_its_preview(
+        self, config, pool
+    ) -> None:
+        _insert_build(pool)
+        preview = StandInReviewPreview()
+        recorder = _Recorder(approval_raises=True)
+        await _service(config, pool, recorder, review_preview=preview).maybe_offer(
+            _event()
+        )
+
+        assert len(_offer_rows(pool)) == 1  # latched, never retried
+        assert preview.released == [
+            {
+                "feature_id": FEATURE_ID,
+                "build_id": BUILD_ID,
+                "reason": "the merge card could not be published",
+            }
+        ]
