@@ -461,3 +461,131 @@ class TestTheTreeThatWasPreviewed:
             "the approval was refused: the offer does not say which tree was "
             "previewed"
         )
+
+
+# ---------------------------------------------------------------------------
+# The preview joins what the press joins: the remote, never a stale local main
+# ---------------------------------------------------------------------------
+
+
+class _JoinsLikeThePreview(StandInReviewPreview):
+    """Prepares with the real preview join (``make_preview_tree``), in the repo."""
+
+    def __init__(self, repo_root) -> None:
+        super().__init__()
+        self.repo_root = repo_root
+
+    async def prepare(self, req: Any) -> Any:
+        from forge.deploy.review_preview import make_preview_tree
+
+        self.requests.append(req)
+        laid = make_preview_tree(
+            self.repo_root,
+            lease_id="pv000000000001",
+            onto=req.preview_base_sha,
+            candidate=req.candidate_sha,
+        )
+        assert "refusal" not in laid, laid
+        return an_evidence(
+            "ready",
+            candidate_sha=req.candidate_sha,
+            candidate_tree=req.candidate_tree,
+            preview_tree=laid["tree"],
+        )
+
+
+def _local_main_lags_the_remote(repo_root) -> tuple[str, str]:
+    """Another feature was merged and published; this clone's main never moved."""
+    local = _git(repo_root, "rev-parse", "main")
+    _git(repo_root, "checkout", "-q", "-b", "elsewhere", "main")
+    (repo_root / "other.txt").write_text("another feature\n", encoding="utf-8")
+    _git(repo_root, "add", "other.txt")
+    _git(repo_root, "commit", "-q", "-m", "another feature merged and published")
+    _git(repo_root, "push", "-q", "origin", "elsewhere:main")
+    _git(repo_root, "checkout", "-q", "main")
+    return local, _git(repo_root, "rev-parse", "elsewhere")
+
+
+def _the_remote_moves_again(repo_root) -> None:
+    _git(repo_root, "checkout", "-q", "elsewhere")
+    (repo_root / "third.txt").write_text("a third feature\n", encoding="utf-8")
+    _git(repo_root, "add", "third.txt")
+    _git(repo_root, "commit", "-q", "-m", "a third feature")
+    _git(repo_root, "push", "-q", "origin", "elsewhere:main")
+    _git(repo_root, "checkout", "-q", "main")
+
+
+async def _offer_with_a_preview(config, pool, preview) -> dict[str, Any]:
+    from types import SimpleNamespace
+
+    from forge.pipeline.merge_offer import MergeOfferService
+
+    _ensure_build(pool, build_id=BUILD_ID, feature_id=FEATURE_ID)
+
+    async def _publish(*_a: Any) -> None:
+        return None
+
+    service = MergeOfferService(
+        config=config,
+        pool=pool,
+        pipeline_publisher=SimpleNamespace(publish_build_paused=_publish),
+        raw_publish=_publish,
+        baseline_reader=lambda _b: None,
+        finished_feature_reader=lambda *_a, **_k: (None, None, "nothing exported"),
+        scope_pass=lambda **_k: None,
+        after_deploy_check_reader=lambda _p, _r: None,
+        review_preview=preview,
+    )
+    assert await service.offer(
+        build_id=BUILD_ID, feature_id=FEATURE_ID, card_words=lambda _b, _m: "words"
+    )
+    return next(
+        s for s in pool.read_stages(BUILD_ID)
+        if s.target_identifier == MERGE_OFFER_TARGET_IDENTIFIER
+    ).details[MERGE_OFFER_DETAILS_KEY]
+
+
+class TestThePreviewJoinsWhatThePressJoins:
+    @pytest.mark.asyncio
+    async def test_a_local_main_lagging_the_remote_is_not_refused(
+        self, config, pool, repo_root
+    ) -> None:
+        local, fetched = _local_main_lags_the_remote(repo_root)
+        preview = _JoinsLikeThePreview(repo_root)
+
+        offer = await _offer_with_a_preview(config, pool, preview)
+
+        # The card pins the clone's main, but the preview was joined onto the
+        # remote's — the commit the press will join onto.
+        assert offer["expect_main_sha"] == local
+        assert offer["preview_base_sha"] == fetched != local
+        assert preview.requests[0].preview_base_sha == fetched
+        consumer, publisher, gk, dp = _consumer(
+            config, pool, preview, guardkit=_JoinsForReal()
+        )
+        await consumer.handle_envelope(_envelope(correlation_id=f"corr-{BUILD_ID}"))
+        await _drain(consumer)
+
+        assert [r.result for r in publisher.reports] == ["publication-pending"]
+        assert _legs(dp) == ["candidate_check", "candidate_down"]
+
+    @pytest.mark.asyncio
+    async def test_the_remote_moving_after_the_preview_is_refused(
+        self, config, pool, repo_root
+    ) -> None:
+        _local_main_lags_the_remote(repo_root)
+        preview = _JoinsLikeThePreview(repo_root)
+        offer = await _offer_with_a_preview(config, pool, preview)
+        _the_remote_moves_again(repo_root)
+        consumer, publisher, gk, dp = _consumer(
+            config, pool, preview, guardkit=_JoinsForReal()
+        )
+
+        await consumer.handle_envelope(_envelope(correlation_id=f"corr-{BUILD_ID}"))
+        await _drain(consumer)
+
+        assert [r.result for r in publisher.reports] == ["candidate-refused"]
+        detail = publisher.reports[0].detail
+        assert f"previewed tree {offer['preview_tree']}" in detail
+        assert "main moved since the preview" in detail
+        assert dp.calls == []

@@ -5,8 +5,11 @@ its merge card, a running copy of exactly what approval would merge, the
 recording of its key journey, and the test report — all prepared BEFORE the
 card goes out. This module prepares that and looks after it afterwards:
 
-1. **Join.** The candidate is joined onto the pinned target commit
-   (``expect_main_sha``) the way the merge press joins it: the build system's
+1. **Join.** The candidate is joined onto the recorded target branch as the
+   offer has just fetched it from ``origin`` (``preview_base_sha``, read with
+   the merge press's own helper, so it is the commit the press will join onto;
+   never the clone's local branch, which can lag the remote) the way the
+   merge press joins it: the build system's
    merge is ``git merge --no-ff``, whose tree for a clean merge is exactly
    what ``git merge-tree --write-tree`` computes, and the press's own
    executor refuses an approval whose joined tree differs from the one
@@ -227,6 +230,14 @@ class PreviewRequest:
     candidate_tree: str
     expect_main_sha: str
     target_branch: str
+    #: The commit the preview is joined onto: the recorded target branch as
+    #: freshly fetched from ``origin`` by the offer, through the merge press's
+    #: own helper (:func:`forge.pipeline.merge_join.target_branch_now`), so it
+    #: is what the press will join onto. ``expect_main_sha`` is the clone's
+    #: local branch and can lag the remote, so it is never joined onto.
+    preview_base_sha: str | None = None
+    #: Why that commit could not be read, when it could not.
+    preview_base_refusal: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -1133,6 +1144,12 @@ class ReviewPreviewService:
         for name in ("candidate_sha", "candidate_tree", "expect_main_sha"):
             if not _SHA.match(str(getattr(req, name))):
                 return early(f"the offer's {name} is not a full commit id")
+        if not _SHA.match(str(req.preview_base_sha or "")):
+            return early(
+                f"{req.target_branch} could not be fetched from the remote, so "
+                "there is nothing to join the candidate onto"
+                + (f": {req.preview_base_refusal}" if req.preview_base_refusal else "")
+            )
         venue = self._venue_for(req.project)
         if venue is None:
             return early(
@@ -1180,7 +1197,7 @@ class ReviewPreviewService:
 
         # (1) Join, and lay the joined tree out.
         laid: PreviewTree = await venue.lay_out(
-            lease_id, onto=req.expect_main_sha, candidate=req.candidate_sha
+            lease_id, onto=str(req.preview_base_sha), candidate=req.candidate_sha
         )
         if laid.refusal or not laid.tree or not laid.path:
             reason = (

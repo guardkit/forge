@@ -55,6 +55,9 @@ START = datetime(2026, 10, 12, 9, 0, 0, tzinfo=UTC)
 BASE_URL = "https://promaxgb10-41b1.tailebf801.ts.net/factory-evidence"
 PROJECT = "guardkit/notes-fixture"
 SHA_MAIN = "a" * 40
+#: The target branch as freshly fetched from the remote: ahead of the clone's
+#: local main, which is what the offer's ``expect_main_sha`` pins.
+SHA_FETCHED = "f" * 40
 SHA_CAND = "b" * 40
 TREE_CAND = "c" * 40
 JOIN_COMMIT = "d" * 40
@@ -94,6 +97,7 @@ def _request(build: str = "build-1", feature: str = "FEAT-AB12") -> PreviewReque
         candidate_tree=TREE_CAND,
         expect_main_sha=SHA_MAIN,
         target_branch="main",
+        preview_base_sha=SHA_FETCHED,
     )
 
 
@@ -323,8 +327,9 @@ async def test_a_prepared_preview_is_ready_with_its_links_and_evidence(world: Wo
     assert evidence.app_expires_at == START + timedelta(hours=24)
     assert evidence.evidence_expires_at == START + timedelta(days=14)
 
-    # The join is onto the pinned main, and the slot is held.
-    assert world.venue.named("lay_out") == [("pv000000000001", SHA_MAIN, SHA_CAND)]
+    # The join is onto the target branch as fetched from the remote (what the
+    # merge press joins onto), never the clone's local main; the slot is held.
+    assert world.venue.named("lay_out") == [("pv000000000001", SHA_FETCHED, SHA_CAND)]
     lease = world.lease("pv000000000001")
     assert (lease.state, lease.slot, lease.port) == ("ready", 0, 8950)
     assert lease.compose_project == "notes-pv0"
@@ -599,6 +604,24 @@ async def test_something_unexpected_after_the_slot_still_tears_down(world: World
     assert world.venue.named("remove_project") == ["pv000000000001"]
     assert world.lease("pv000000000001").state == "failed"
     assert world.store.live() == []
+
+
+@pytest.mark.asyncio
+async def test_a_target_branch_that_could_not_be_fetched_starts_nothing(
+    world: World,
+) -> None:
+    from dataclasses import replace as _replace
+
+    request = _replace(
+        _request(), preview_base_sha=None, preview_base_refusal="origin answered 503"
+    )
+    evidence = await world.service.prepare(request)
+    assert evidence.state == "failed"
+    assert evidence.failure_reason == (
+        "main could not be fetched from the remote, so there is nothing to join "
+        "the candidate onto: origin answered 503"
+    )
+    assert world.venue.calls == [] and world.dispatch.calls == []
 
 
 @pytest.mark.asyncio

@@ -2188,13 +2188,30 @@ class MergeOfferService:
         # a preview is read from its deploy profile, which can mean a git or
         # sidecar read, so it is asked off the event loop.
         review_evidence: Any = None
+        preview_base_sha: str | None = None
         if self._review_preview is not None:
             try:
                 if await asyncio.to_thread(
                     self._review_preview.enabled_for, row.repo
                 ):
                     from forge.deploy.review_preview import PreviewRequest
+                    from forge.pipeline.merge_join import target_branch_now
 
+                    # THE PREVIEW IS JOINED ONTO WHAT THE PRESS WILL JOIN ONTO:
+                    # the recorded target branch, fetched afresh from the
+                    # remote through the same git surface and the same helper
+                    # the merge press uses — never the clone's local branch,
+                    # which can lag the remote after any other merge.
+                    start_point = self._pool.read_start_point(build_id)
+                    where = await target_branch_now(
+                        git,
+                        recorded_branch=(
+                            getattr(start_point, "target_branch", None)
+                            if getattr(start_point, "recorded", False)
+                            else None
+                        ),
+                    )
+                    preview_base_sha = where.commit if where.ok else None
                     review_evidence = await self._review_preview.prepare(
                         PreviewRequest(
                             project=row.repo,
@@ -2205,6 +2222,8 @@ class MergeOfferService:
                             candidate_tree=candidate_tree,
                             expect_main_sha=expect_main_sha,
                             target_branch=recorded_target or MERGE_BASE_REF,
+                            preview_base_sha=preview_base_sha,
+                            preview_base_refusal=None if where.ok else where.refusal,
                         )
                     )
             except Exception as exc:  # noqa: BLE001 — refused before any write
@@ -2236,6 +2255,7 @@ class MergeOfferService:
             if review_evidence is not None:
                 details["review_evidence"] = review_evidence.model_dump(mode="json")
                 details["preview_tree"] = review_evidence.preview_tree
+                details["preview_base_sha"] = preview_base_sha
         now = self._clock()
         self._pool.record_stage(
             StageLogEntry(
