@@ -532,23 +532,30 @@ class SidecarCodeReader:
         ``status``, ``truncation`` and ``source.omitted`` say how complete it
         is. Raises :class:`RepositoryUnreadable` when there is no recorded
         commit or the helper cannot answer (an older helper without the route
-        included); the other reads are unaffected."""
+        included). A failure here never marks the helper unreachable for the
+        reader's other reads: a slow search is not a dead helper."""
         from forge.planning.repository_facts import RepositoryUnreadable
 
         if not self._commit:
             raise RepositoryUnreadable(
                 "ranked code search runs only at the run's recorded starting commit"
             )
-        status, decoded = self._answer(
-            "/code/query",
-            {
-                "operation": "search",
-                "mode": "ranked",
-                "query": query,
-                "max_results": max_results,
-                "max_chars": max_chars,
-            },
-        )
+        dead_before = self._dead
+        try:
+            status, decoded = self._answer(
+                "/code/query",
+                {
+                    "operation": "search",
+                    "mode": "ranked",
+                    "query": query,
+                    "max_results": max_results,
+                    "max_chars": max_chars,
+                },
+            )
+        except RepositoryUnreadable:
+            if dead_before is None:
+                self._dead = None
+            raise
         if status != 200 or not isinstance(decoded, dict) or "status" not in decoded:
             error = decoded.get("error") if isinstance(decoded, dict) else None
             raise RepositoryUnreadable(

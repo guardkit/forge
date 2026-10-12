@@ -51,6 +51,17 @@ ROUTER = (
     "def deactivate_user(store: Store, user_id: int) -> None:\n"
     "    store.users[user_id].active = False\n"
 )
+#: Found by Probe's stemming ("tally"/"tallied", "members"/"member") but by
+#: none of the existing window search's literal words, so its block cannot be
+#: hidden as "already shown as a window".
+METRICS = (
+    "def tallied_dormancy(member) -> int:\n"
+    "    return 0 if member.recent_login else 1\n"
+)
+METRICS_TEST = (
+    "def test_tallied_member_total():\n"
+    "    assert tallied_dormancy(Member()) == 1\n"
+)
 TEST = (
     "from router import count_active_users\n"
     "\n"
@@ -83,6 +94,8 @@ def clone(tmp_path: Path) -> tuple[Path, str]:
     (seed / "tests" / "users").mkdir(parents=True)
     (seed / "app" / "router.py").write_text(ROUTER)
     (seed / "tests" / "users" / "test_router.py").write_text(TEST)
+    (seed / "app" / "metrics.py").write_text(METRICS)
+    (seed / "tests" / "users" / "test_metrics.py").write_text(METRICS_TEST)
     # Tracked, would match, and too large for the snapshot.
     (seed / "app" / "huge_report.py").write_text(
         "# count active users report\n" + "x = 1\n" * 60_000
@@ -187,7 +200,7 @@ def test_snapshot_is_reused_and_read_only(clone: tuple[Path, str],
              "path": "app/router.py"},
             config=_cfg(path),
         )
-    folders = [p for p in _private_snapshots.iterdir() if p.is_dir()]
+    folders = [p for p in (_private_snapshots / "forge-code-snapshots").iterdir() if p.is_dir()]
     assert [p.name for p in folders] == [recorded]
     assert not os.access(folders[0] / "app" / "router.py", os.W_OK) or os.geteuid() == 0
     # Nothing was written into the clone.
@@ -200,7 +213,7 @@ def test_reader_and_descriptor_over_the_real_server(clone: tuple[Path, str]) -> 
         reader = SidecarCodeReader(url, repo=REPO_KEY, commit=recorded)
         answer = reader.ranked_source("count active users")
         assert answer["commit"] == recorded and answer["status"] == "partial"
-        descriptor = PlanningRunDriver._build_target_repo_descriptor(
+        counted = PlanningRunDriver._build_target_repo_descriptor(
             REPO_KEY, str(path), "Feature: count active users",
             reader=SidecarCodeReader(url, repo=REPO_KEY, commit=recorded),
             request_text="Add an endpoint that counts the active users",
@@ -211,26 +224,54 @@ def test_reader_and_descriptor_over_the_real_server(clone: tuple[Path, str]) -> 
             reader=SidecarCodeReader(url, repo=REPO_KEY, commit=recorded),
             request_text="Add an endpoint that counts the active users",
         )
-    field = descriptor["ranked_source"]
-    assert field["commit"] == recorded
-    assert field["status"] == "partial"
-    blocks = {b["path"]: b for b in field["blocks"]}
-    router = blocks["app/router.py"]
-    assert router["text"].splitlines()[0].startswith(f"{router['first_line']}: ")
-    assert "count_active_users" in router["text"] and router["test"] is False
-    assert blocks["tests/users/test_router.py"]["test"] is True
+        tallied = PlanningRunDriver._build_target_repo_descriptor(
+            REPO_KEY, str(path), "Feature: tally dormant members",
+            reader=SidecarCodeReader(url, repo=REPO_KEY, commit=recorded),
+            request_text="Tally the dormant members",
+            ranked_source=True,
+        )
     # Off, the descriptor is exactly what it was before the switch existed.
     assert "ranked_source" not in without
-    assert {k: v for k, v in descriptor.items() if k != "ranked_source"} == without
+    assert {k: v for k, v in counted.items() if k != "ranked_source"} == without
+    # On: every ranked block is either shown or counted as already a window.
+    field = counted["ranked_source"]
+    assert field["commit"] == recorded and field["status"] == "partial"
+    assert field["query_words"]
+    assert field["blocks"] or field["coverage"]["blocks_already_shown_as_windows"]
+    for block in field["blocks"]:
+        assert block["text"].splitlines()[0].startswith(f"{block['first_line']}: ")
+        assert block["test"] is block["path"].startswith("tests/")
+    # A block the windows did not show reaches the plan writer, numbered.
+    field = tallied["ranked_source"]
+    blocks = {b["path"]: b for b in field["blocks"]}
+    metrics = blocks["app/metrics.py"]
+    assert metrics["text"].splitlines()[0] == "1: def tallied_dormancy(member) -> int:"
+    assert metrics["test"] is False
+    assert blocks["tests/users/test_metrics.py"]["test"] is True
     out = os.environ.get("FORGE_CODE_SEARCH_FIXTURE_OUT")
     if out:
         folder = Path(out)
         folder.mkdir(parents=True, exist_ok=True)
-        data = json.dumps(descriptor, indent=2, sort_keys=True)
-        (folder / "ranked-source-descriptor.json").write_text(data)
-        (folder / "ranked-source-descriptor.json.sha256").write_text(
+        data = json.dumps(tallied, indent=2, sort_keys=True)
+        (folder / "ranked_source_descriptor_from_forge.json").write_text(data)
+        (folder / "ranked_source_descriptor_from_forge.json.sha256").write_text(
             hashlib.sha256(data.encode()).hexdigest() + "\n"
         )
+
+
+def test_a_failed_ranked_search_leaves_the_other_reads_working() -> None:
+    calls: list[str] = []
+
+    def post(url: str, body: dict[str, Any], timeout: float) -> tuple[int, Any]:
+        calls.append(url)
+        if url.endswith(CODE_QUERY_ROUTE):
+            raise TimeoutError("slow search")
+        return 200, {"commit": "a" * 40, "content": "x\n", "partial": False}
+
+    reader = SidecarCodeReader("http://helper", repo=REPO_KEY, commit="a" * 40, post=post)
+    with pytest.raises(RepositoryUnreadable):
+        reader.ranked_source("count")
+    assert reader.read_text("a.py") == "x\n"
 
 
 def test_reader_without_a_commit_never_searches_the_working_tree(

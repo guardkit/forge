@@ -699,6 +699,11 @@ def _lay_out_commit(repo_path: str, commit: str, into: Path) -> str | None:
     return None
 
 
+#: The longest ranked code search query sent to the sandbox helper (12 October
+#: 2026): the request's distinctive words, cut here.
+_RANKED_QUERY_CHARS = 300
+
+
 def _reads_beyond_the_working_tree(reader: Any) -> bool:
     """True unless ``reader`` reads this coordinator's checkout as it is on
     disk (a :class:`LocalCheckoutReader` with no commit): every other reader
@@ -12311,10 +12316,15 @@ class PlanningRunDriver:
         cannot ask the sandbox helper (a local checkout). A helper that cannot
         answer gives a field that says so, never an empty "nothing found"."""
         ask = getattr(reader, "ranked_source", None)
-        if not callable(ask) or not (text or "").strip():
+        if not callable(ask):
+            return None
+        # The request's own distinctive words, filler words left out, so a
+        # long request or a Gherkin specification still makes a short query.
+        query = " ".join(request_words(text or ""))[:_RANKED_QUERY_CHARS].strip()
+        if not query:
             return None
         try:
-            answer = ask(text)
+            answer = ask(query)
         except RepositoryUnreadable as exc:
             logger.warning("target_repo_descriptor: ranked code search failed (%s)", exc)
             return {

@@ -7265,10 +7265,14 @@ def _code_at_commit(
 
 #: Where commit snapshots are kept; the helper's temporary folder by default.
 CODE_SNAPSHOT_ROOT_ENV: str = "FORGE_CODE_SNAPSHOT_ROOT"
-#: How many commit snapshots are kept; older ones are removed.
+#: How many commit snapshots are kept; older ones are removed once no request
+#: has used them for :data:`CODE_SNAPSHOT_IDLE_SECONDS` (a snapshot a request
+#: may still be reading is never removed under it).
 CODE_SNAPSHOT_KEEP: int = 4
-#: A snapshot no request has used for this long may be removed.
-CODE_SNAPSHOT_IDLE_SECONDS: float = 600.0
+CODE_SNAPSHOT_IDLE_SECONDS: float = 120.0
+#: A half-written staging folder older than this is left over from a stopped
+#: helper and is removed.
+CODE_SNAPSHOT_STALE_STAGING_SECONDS: float = 3600.0
 #: The most file bytes one snapshot holds.
 CODE_SNAPSHOT_MAX_BYTES: int = 64 * 1024 * 1024
 #: How long the search program may run.
@@ -7290,26 +7294,33 @@ def _snapshot_root() -> Path:
     )
 
 
+def _mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
 def _prune_snapshots(root: Path, keep: str) -> None:
     """Keep the newest :data:`CODE_SNAPSHOT_KEEP` snapshots; remove older ones
-    no request has used for :data:`CODE_SNAPSHOT_IDLE_SECONDS`."""
+    no request has used for :data:`CODE_SNAPSHOT_IDLE_SECONDS`, and staging
+    folders a stopped helper left behind."""
     try:
-        folders = [p for p in root.iterdir() if p.is_dir() and not p.name.startswith(".")]
+        entries = list(root.iterdir())
     except OSError:
         return
-    folders.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     now = time.time()
+    for staging in (p for p in entries if p.is_dir() and p.name.startswith(".")):
+        if now - _mtime(staging) >= CODE_SNAPSHOT_STALE_STAGING_SECONDS:
+            shutil.rmtree(staging, ignore_errors=True)
+    folders = [p for p in entries if p.is_dir() and not p.name.startswith(".")]
+    folders.sort(key=_mtime, reverse=True)
     for folder in folders[CODE_SNAPSHOT_KEEP:]:
-        if folder.name == keep:
+        if folder.name == keep or now - _mtime(folder) < CODE_SNAPSHOT_IDLE_SECONDS:
             continue
-        try:
-            idle = now - folder.stat().st_mtime
-        except OSError:
-            continue
-        if idle >= CODE_SNAPSHOT_IDLE_SECONDS:
-            shutil.rmtree(folder, ignore_errors=True)
-            with contextlib.suppress(OSError):
-                (root / f"{folder.name}.json").unlink()
+        shutil.rmtree(folder, ignore_errors=True)
+        with contextlib.suppress(OSError):
+            (root / f"{folder.name}.json").unlink()
 
 
 def _commit_snapshot(tree: _CommitTree) -> tuple[Path, dict[str, Any]]:
@@ -7352,9 +7363,16 @@ def _commit_snapshot(tree: _CommitTree) -> tuple[Path, dict[str, Any]]:
             elif total + entry.size > CODE_SNAPSHOT_MAX_BYTES:
                 omitted.append({"path": path, "reason": "beyond the snapshot size limit"})
             else:
+                try:
+                    data = tree.blob(entry.oid)
+                except _GitStalled:
+                    raise
+                except OSError:
+                    omitted.append({"path": path, "reason": "could not be read from git"})
+                    continue
                 target = staging / path
                 target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_bytes(tree.blob(entry.oid))
+                target.write_bytes(data)
                 target.chmod(0o444)
                 written += 1
                 total += entry.size
@@ -7380,10 +7398,46 @@ def _commit_snapshot(tree: _CommitTree) -> tuple[Path, dict[str, Any]]:
         raise
 
 
+def _load_code_search() -> Any:
+    """GuardKitFactory's ``code_search`` module, loaded on its own.
+
+    The module uses only the standard library. Importing it as
+    ``guardkitfactory.code_search`` would first run the package's
+    ``__init__``, which imports the whole agent harness and changes this
+    process's environment, so the file is loaded by itself instead. Raises
+    ``ImportError`` when GuardKitFactory is not installed.
+    """
+    import importlib.util
+
+    cached = sys.modules.get("_forge_code_search")
+    if cached is not None:
+        return cached
+    package = importlib.util.find_spec("guardkitfactory")
+    locations = list(package.submodule_search_locations or []) if package else []
+    source = next(
+        (Path(where) / "code_search.py" for where in locations
+         if (Path(where) / "code_search.py").is_file()),
+        None,
+    )
+    if source is None:
+        raise ImportError("guardkitfactory.code_search is not installed")
+    spec = importlib.util.spec_from_file_location("_forge_code_search", source)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load {source}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["_forge_code_search"] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop("_forge_code_search", None)
+        raise
+    return module
+
+
 def _query_at(tree: _CommitTree, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
     try:
-        from guardkitfactory import code_search
-    except ImportError as exc:
+        code_search = _load_code_search()
+    except Exception as exc:  # noqa: BLE001 — any failure to load is "not installed"
         return 503, {"error": f"code search is not installed in this image ({exc})"}
     operation = payload.get("operation")
     if operation not in code_search.OPERATIONS:
@@ -7414,18 +7468,19 @@ def _query_at(tree: _CommitTree, payload: dict[str, Any]) -> tuple[int, dict[str
         max_results=payload.get("max_results"),
         max_chars=max_chars,
         timeout_s=CODE_QUERY_TIMEOUT_SECONDS,
+        # The answer names the first few omitted files and counts the rest;
+        # the runner gets the whole list to decide whether the search was
+        # complete, without copying it into the answer.
         source={
             "kind": "commit",
             "commit": tree.commit,
             "files": manifest.get("files"),
-            "omitted": omitted,
+            "omitted": omitted[:CODE_QUERY_OMITTED_SHOWN],
+            "omitted_count": len(omitted),
         },
+        omitted=omitted,
         respect_ignore=False,
     )
-    source = dict(answer.get("source") or {})
-    source["omitted"] = omitted[:CODE_QUERY_OMITTED_SHOWN]
-    source["omitted_count"] = len(omitted)
-    answer["source"] = source
     return 200, answer
 
 
