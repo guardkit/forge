@@ -19,6 +19,7 @@ from forge.lifecycle.feature_routing import (
 FEATURE_HEADER = "x-feature-id"
 STORED_SERVER_HEADER = "x-feature-stored-server-id"
 ACTUAL_SERVER_HEADER = "x-feature-actual-server-id"
+SEED_SERVER_HEADER = "x-feature-seed-server"
 
 
 class SeedResponseRejected(FeatureRoutingBlocked):
@@ -34,7 +35,7 @@ class FeatureRoutingGate:
         router_url: str,
         *,
         timeout_seconds: float = 15.0,
-        request: Callable[[str, str, float], tuple[int, object]] | None = None,
+        request: Callable[[str, str, float, int], tuple[int, object]] | None = None,
     ) -> None:
         self._store = store
         self._router_url = router_url.rstrip("/")
@@ -42,6 +43,9 @@ class FeatureRoutingGate:
         self._request = request or self._request_seed
         self._locks: dict[str, asyncio.Lock] = {}
         self._locks_guard = asyncio.Lock()
+        # One placement at a time across all keys, so each admission counts
+        # every earlier placement before choosing a seat.
+        self._placement_lock = asyncio.Lock()
 
     async def _lock_for(self, key: str) -> asyncio.Lock:
         async with self._locks_guard:
@@ -57,59 +61,72 @@ class FeatureRoutingGate:
                 return self._store.read_success_receipt(key)
             except FeatureRoutingBlocked:
                 pass
-            attempt_id = uuid.uuid4().hex
-            claim = self._store.claim_initial_seed(
-                key, attempt_id, origin_kind=origin_kind, origin_id=origin_id
-            )
-            if claim.receipt is not None:
-                return claim.receipt
-            try:
-                if inspect.iscoroutinefunction(self._request):
-                    pending = self._request(self._router_url, key, self._timeout)
-                else:
-                    pending = asyncio.to_thread(
-                        self._request, self._router_url, key, self._timeout
-                    )
-                status, headers = await asyncio.wait_for(
-                    pending, timeout=self._timeout
+            async with self._placement_lock:
+                preference = self._preferred_server()
+                attempt_id = uuid.uuid4().hex
+                claim = self._store.claim_initial_seed(
+                    key, attempt_id, origin_kind=origin_kind, origin_id=origin_id
                 )
-                if status != 200:
-                    raise SeedResponseRejected(f"seed-http-status-{status}")
-                stored = self._header(headers, STORED_SERVER_HEADER)
-                actual = self._header(headers, ACTUAL_SERVER_HEADER)
+                if claim.receipt is not None:
+                    return claim.receipt
                 try:
-                    stored_id, actual_id = int(stored), int(actual)
-                except (TypeError, ValueError) as exc:
-                    raise SeedResponseRejected("seed-ack-invalid") from exc
-                if stored_id not in (1, 2) or stored_id != actual_id:
-                    raise SeedResponseRejected("seed-ack-mismatch")
-                return self._store.complete_seed(key, attempt_id, stored_id)
-            except asyncio.CancelledError:
-                try:
+                    if inspect.iscoroutinefunction(self._request):
+                        pending = self._request(
+                            self._router_url, key, self._timeout, preference
+                        )
+                    else:
+                        pending = asyncio.to_thread(
+                            self._request,
+                            self._router_url,
+                            key,
+                            self._timeout,
+                            preference,
+                        )
+                    status, headers = await asyncio.wait_for(
+                        pending, timeout=self._timeout
+                    )
+                    if status != 200:
+                        raise SeedResponseRejected(f"seed-http-status-{status}")
+                    stored = self._header(headers, STORED_SERVER_HEADER)
+                    actual = self._header(headers, ACTUAL_SERVER_HEADER)
+                    try:
+                        stored_id, actual_id = int(stored), int(actual)
+                    except (TypeError, ValueError) as exc:
+                        raise SeedResponseRejected("seed-ack-invalid") from exc
+                    if stored_id not in (1, 2) or stored_id != actual_id:
+                        raise SeedResponseRejected("seed-ack-mismatch")
+                    return self._store.complete_seed(key, attempt_id, stored_id)
+                except asyncio.CancelledError:
+                    try:
+                        self._store.fail_seed(
+                            key, attempt_id, state="UNKNOWN", reason="seed-cancelled"
+                        )
+                    except BaseException:
+                        # Cancellation must still propagate.  A failed best-effort
+                        # CAS leaves STARTED, which remains blocking and is
+                        # poisoned to UNKNOWN at the next coordinator boot.
+                        pass
+                    raise
+                except SeedResponseRejected as exc:
                     self._store.fail_seed(
-                        key, attempt_id, state="UNKNOWN", reason="seed-cancelled"
+                        key, attempt_id, state="FAILED", reason=str(exc)
                     )
-                except BaseException:
-                    # Cancellation must still propagate.  A failed best-effort
-                    # CAS leaves STARTED, which remains blocking and is
-                    # poisoned to UNKNOWN at the next coordinator boot.
-                    pass
-                raise
-            except SeedResponseRejected as exc:
-                self._store.fail_seed(
-                    key, attempt_id, state="FAILED", reason=str(exc)
-                )
-                raise
-            except BaseException as exc:
-                self._store.fail_seed(
-                    key,
-                    attempt_id,
-                    state="UNKNOWN",
-                    reason=f"seed-transport-ambiguous:{type(exc).__name__}",
-                )
-                raise FeatureRoutingBlocked(
-                    "feature routing seed outcome is unknown"
-                ) from exc
+                    raise
+                except BaseException as exc:
+                    self._store.fail_seed(
+                        key,
+                        attempt_id,
+                        state="UNKNOWN",
+                        reason=f"seed-transport-ambiguous:{type(exc).__name__}",
+                    )
+                    raise FeatureRoutingBlocked(
+                        "feature routing seed outcome is unknown"
+                    ) from exc
+
+    def _preferred_server(self) -> int:
+        """Prefer the server with fewer live pins; ties go to server 1."""
+        counts = self._store.live_pin_counts()
+        return 2 if counts.get(2, 0) < counts.get(1, 0) else 1
 
     def require_committed_success(
         self, feature_routing_id: str
@@ -135,9 +152,16 @@ class FeatureRoutingGate:
         return value
 
     @staticmethod
-    def _request_seed(url: str, key: str, timeout: float) -> tuple[int, object]:
+    def _request_seed(
+        url: str, key: str, timeout: float, server_preference: int
+    ) -> tuple[int, object]:
         request = urllib.request.Request(
-            f"{url}/factory/seed", headers={FEATURE_HEADER: key}, method="GET"
+            f"{url}/factory/seed",
+            headers={
+                FEATURE_HEADER: key,
+                SEED_SERVER_HEADER: str(server_preference),
+            },
+            method="GET",
         )
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:
