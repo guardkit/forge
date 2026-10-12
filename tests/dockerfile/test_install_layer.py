@@ -1019,3 +1019,43 @@ def test_the_runtime_image_carries_the_pinned_compose_plugin() -> None:
     assert "/usr/local/lib/docker/cli-plugins/docker-compose" in dockerfile
     assert 'sha256sum --check --strict' in dockerfile.split("DOCKER_COMPOSE_SHA256=", 1)[1]
 
+
+
+class TestTheCodeSearchPrograms:
+    """12 October 2026: ripgrep, ast-grep and Probe for the planner (through
+    the sandbox helper) and the coding Player and Coach. Each archive is
+    pinned and checksummed before it is unpacked, the programs go in a folder
+    on no PATH, and GuardKitFactory's runner checks them inside the built
+    image. The static halves are here; the self-check runs during the build."""
+
+    PROGRAMS = (
+        ("RIPGREP", "15.2.0", "800b1e7206afe799dfb5a6901f23147cfaabe0e52210538100f61e86e1740915"),
+        ("AST_GREP", "0.50.0", "3a4ad22dd1dca7a4900a173de65885578617af57fa13dd93b8d345d6b352770e"),
+        ("PROBE", "0.6.0-rc341", "4fa43d6259428727444f7b2415f407e0697e0da8424ded3a16b7784832773032"),
+    )
+
+    @pytest.mark.parametrize(("name", "version", "digest"), PROGRAMS)
+    def test_each_archive_is_pinned_and_checked(
+        self, dockerfile_text: str, name: str, version: str, digest: str
+    ) -> None:
+        runtime_body = _runtime_stage_body(dockerfile_text)
+        assert re.search(rf"^ARG\s+{name}_VERSION={re.escape(version)}\s*$", runtime_body,
+                         re.MULTILINE)
+        assert re.search(rf"^ARG\s+{name}_SHA256={digest}\s*$", runtime_body, re.MULTILINE)
+        assert re.search(
+            rf'echo "\$\{{{name}_SHA256\}}\s+/tmp/[^"]+" \| sha256sum --check --strict -',
+            runtime_body,
+        ), f"{name}'s archive must be checked against its sha256 before unpacking"
+
+    def test_the_programs_are_on_no_path(self, dockerfile_text: str) -> None:
+        runtime_body = _runtime_stage_body(dockerfile_text)
+        assert "--directory /opt/code-search/bin" in runtime_body
+        assert "test ! -e /usr/local/bin/rg && test ! -e /usr/local/bin/sg" in runtime_body
+        assert "/opt/code-search" not in "".join(
+            line for line in runtime_body.splitlines() if line.startswith("ENV PATH")
+        )
+
+    def test_the_runner_checks_them_inside_the_image(self, dockerfile_text: str) -> None:
+        runtime_body = _runtime_stage_body(dockerfile_text)
+        check = runtime_body.index("RUN python -m guardkitfactory.code_search self-check")
+        assert check > runtime_body.index("COPY --from=builder /opt/venv /opt/venv")

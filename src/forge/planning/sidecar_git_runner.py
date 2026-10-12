@@ -524,6 +524,39 @@ class SidecarCodeReader:
             places.cut = "; ".join(gaps)
         return places
 
+    def ranked_source(
+        self, query: str, *, max_results: int = 12, max_chars: int = 24_000
+    ) -> dict[str, Any]:
+        """Code blocks ranked against ``query`` at the starting commit
+        (``/code/query``, 12 October 2026): the helper's whole answer, whose
+        ``status``, ``truncation`` and ``source.omitted`` say how complete it
+        is. Raises :class:`RepositoryUnreadable` when there is no recorded
+        commit or the helper cannot answer (an older helper without the route
+        included); the other reads are unaffected."""
+        from forge.planning.repository_facts import RepositoryUnreadable
+
+        if not self._commit:
+            raise RepositoryUnreadable(
+                "ranked code search runs only at the run's recorded starting commit"
+            )
+        status, decoded = self._answer(
+            "/code/query",
+            {
+                "operation": "search",
+                "mode": "ranked",
+                "query": query,
+                "max_results": max_results,
+                "max_chars": max_chars,
+            },
+        )
+        if status != 200 or not isinstance(decoded, dict) or "status" not in decoded:
+            error = decoded.get("error") if isinstance(decoded, dict) else None
+            raise RepositoryUnreadable(
+                f"the sandbox helper at {self._base_url} could not rank the code "
+                f"({status}: {str(error or decoded)[:200]})"
+            )
+        return decoded
+
     def read_text(self, path: str) -> str | None:
         status, decoded = self._answer("/code/read-file", {"path": path})
         if status == 200 and isinstance(decoded, dict) and not decoded.get("partial"):

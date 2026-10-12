@@ -852,6 +852,27 @@ class NothingToBuildConfig(BaseModel):
     )
 
 
+class RankedSourceConfig(BaseModel):
+    """Ranked code blocks for the plan writer (12 October 2026).
+
+    On, Forge asks the sandbox helper to rank the code at the run's recorded
+    starting commit against the request's words (Probe, tests included) and
+    adds the best blocks to the plan call as ``ranked_source``. Off (the
+    default), the plan call is byte for byte today's, so no plan changes
+    before the bounded retrieval comparison has measured the blocks.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = Field(
+        default=False,
+        description=(
+            "True = the plan writer is also shown ranked code blocks from the "
+            "starting commit. False (default) = today's plan call."
+        ),
+    )
+
+
 class SandboxEntry(BaseModel):
     """One repository's sandbox (sandbox first, 2026-09-07, rule 71).
 
@@ -1028,6 +1049,13 @@ class PlanningConfig(BaseModel):
         description=(
             "The plan leg's 'already done, nothing to build' outcome. "
             "Defaults to disabled: the plan call and the plan leg are today's."
+        ),
+    )
+    ranked_source: RankedSourceConfig = Field(
+        default_factory=RankedSourceConfig,
+        description=(
+            "Ranked code blocks from the starting commit for the plan writer. "
+            "Defaults to disabled: the plan call is today's."
         ),
     )
     sandboxes: dict[str, SandboxEntry] = Field(

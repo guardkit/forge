@@ -328,6 +328,45 @@ RUN mkdir -p /usr/local/lib/docker/cli-plugins \
     && chmod 0755 /usr/local/lib/docker/cli-plugins/docker-compose \
     && docker compose version | grep -q "${DOCKER_COMPOSE_VERSION}"
 
+# 12 October 2026 — code search for the planner (through the sandbox helper)
+# and the coding Player and Coach: ripgrep, ast-grep and Probe, each one
+# official Linux ARM64 release archive pinned by version and sha256 and
+# checked before anything is unpacked. They go in /opt/code-search/bin, which
+# is deliberately on no PATH: the agents' shell runs with PATH=/usr/bin:/bin,
+# where `sg` is the system's newgrp, and Deep Agents' built-in grep would
+# silently start using an `rg` it found on PATH. GuardKitFactory's
+# code_search module calls them by absolute path and checks each executable's
+# own sha256 and version again before first use. No index, daemon, model or
+# download at run time. ripgrep and Probe are static builds; ast-grep needs
+# glibc 2.18 at most. The self-check further down runs them in this image.
+ARG RIPGREP_VERSION=15.2.0
+ARG RIPGREP_SHA256=800b1e7206afe799dfb5a6901f23147cfaabe0e52210538100f61e86e1740915
+ARG AST_GREP_VERSION=0.50.0
+ARG AST_GREP_SHA256=3a4ad22dd1dca7a4900a173de65885578617af57fa13dd93b8d345d6b352770e
+ARG PROBE_VERSION=0.6.0-rc341
+ARG PROBE_SHA256=4fa43d6259428727444f7b2415f407e0697e0da8424ded3a16b7784832773032
+RUN mkdir -p /opt/code-search/bin \
+    && curl -fsSL "https://github.com/BurntSushi/ripgrep/releases/download/${RIPGREP_VERSION}/ripgrep-${RIPGREP_VERSION}-aarch64-unknown-linux-musl.tar.gz" \
+        -o /tmp/ripgrep.tgz \
+    && echo "${RIPGREP_SHA256}  /tmp/ripgrep.tgz" | sha256sum --check --strict - \
+    && tar --extract --file /tmp/ripgrep.tgz --directory /opt/code-search/bin \
+        --strip-components=1 "ripgrep-${RIPGREP_VERSION}-aarch64-unknown-linux-musl/rg" \
+    && curl -fsSL "https://github.com/ast-grep/ast-grep/releases/download/${AST_GREP_VERSION}/app-aarch64-unknown-linux-gnu.zip" \
+        -o /tmp/ast-grep.zip \
+    && echo "${AST_GREP_SHA256}  /tmp/ast-grep.zip" | sha256sum --check --strict - \
+    && python -c "import zipfile; zipfile.ZipFile('/tmp/ast-grep.zip').extract('ast-grep', '/opt/code-search/bin')" \
+    && curl -fsSL "https://github.com/probelabs/probe/releases/download/v${PROBE_VERSION}/probe-v${PROBE_VERSION}-aarch64-unknown-linux-musl.tar.gz" \
+        -o /tmp/probe.tgz \
+    && echo "${PROBE_SHA256}  /tmp/probe.tgz" | sha256sum --check --strict - \
+    && tar --extract --file /tmp/probe.tgz --directory /opt/code-search/bin \
+        --strip-components=1 "probe-v${PROBE_VERSION}-aarch64-unknown-linux-musl/probe" \
+    && rm -f /tmp/ripgrep.tgz /tmp/ast-grep.zip /tmp/probe.tgz \
+    && chmod 0755 /opt/code-search/bin/rg /opt/code-search/bin/ast-grep /opt/code-search/bin/probe \
+    && /opt/code-search/bin/rg --version | grep -q "ripgrep ${RIPGREP_VERSION}" \
+    && /opt/code-search/bin/ast-grep --version | grep -q "ast-grep ${AST_GREP_VERSION}" \
+    && /opt/code-search/bin/probe --version | grep -q "probe-code" \
+    && test ! -e /usr/local/bin/rg && test ! -e /usr/local/bin/sg
+
 # 2026-08-15 — HISTORICAL REASON, LIVE PACKAGE. guardkit deleted the DCL spec
 # track outright (guardkit b138d92c) and forge's W1-S2 leg went with it, so
 # nothing shells the vendored checker any more. ``nodejs`` and the flag below
@@ -389,6 +428,12 @@ COPY --from=builder /opt/venv /opt/venv
 # touching the frozen adapter. The venv crossed from the builder above, so the
 # target exists at this point.
 RUN ln -s /opt/venv/bin/guardkit-py /usr/local/bin/guardkit
+
+# 12 October 2026 — the code search programs, run by GuardKitFactory's own
+# runner inside this exact image: every operation on a fresh neutral fixture,
+# including a missing path, an unsupported language and an invalid pattern.
+# A program that cannot run on this base fails the build here.
+RUN python -m guardkitfactory.code_search self-check
 
 # The sandbox runner's supervisor script (added 2026-09-24, stage 3 of the
 # containerisation rollout gate). It is the start command of the compose

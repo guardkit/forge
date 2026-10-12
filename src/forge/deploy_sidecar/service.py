@@ -175,6 +175,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import concurrent.futures
+import contextlib
 import importlib.util
 import json
 import logging
@@ -184,6 +185,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -5628,6 +5630,10 @@ CODE_LIST_FILES_ROUTE: str = "/code/list-files"
 CODE_READ_FILE_ROUTE: str = "/code/read-file"
 CODE_IMPORTS_ROUTE: str = "/code/imports"
 CODE_SEARCH_ROUTE: str = "/code/search"
+#: Code search with the pinned programs at a commit (12 October 2026): ranked
+#: blocks, exact or regex lines, symbol outlines and structural patterns,
+#: over an immutable snapshot of that commit's tracked files.
+CODE_QUERY_ROUTE: str = "/code/query"
 
 #: How long the one git command this door runs may take. Listing an index is
 #: fast; this is a wall against a repository on a stalled filesystem, not a
@@ -7231,6 +7237,7 @@ def _code_at_commit(
             "read-file": _read_file_at,
             "imports": _imports_at,
             "search": _search_at,
+            "query": _query_at,
         }[kind]
         status, body = handler(tree, payload)
     finally:
@@ -7242,6 +7249,205 @@ def _code_at_commit(
     if status == 200:
         body["commit"] = tree.commit
     return status, body
+
+
+# ---------------------------------------------------------------------------
+# Code search at a commit (12 October 2026)
+#
+# The pinned programs (ripgrep, Probe, ast-grep) read files on disk, not git
+# objects, so the commit's tracked files are written once into an immutable
+# snapshot folder in the helper's own temporary storage — never the product
+# clone, its working tree or the receipts — and searched there. The runner is
+# GuardKitFactory's ``code_search``, installed in this same image. Every file
+# the snapshot leaves out is named in the answer's ``source.omitted``, and an
+# omission inside the searched path makes the answer ``partial``, never
+# ``no_matches``.
+
+#: Where commit snapshots are kept; the helper's temporary folder by default.
+CODE_SNAPSHOT_ROOT_ENV: str = "FORGE_CODE_SNAPSHOT_ROOT"
+#: How many commit snapshots are kept; older ones are removed.
+CODE_SNAPSHOT_KEEP: int = 4
+#: A snapshot no request has used for this long may be removed.
+CODE_SNAPSHOT_IDLE_SECONDS: float = 600.0
+#: The most file bytes one snapshot holds.
+CODE_SNAPSHOT_MAX_BYTES: int = 64 * 1024 * 1024
+#: How long the search program may run.
+CODE_QUERY_TIMEOUT_SECONDS: float = 30.0
+#: The most characters one answer carries.
+CODE_QUERY_MAX_CHARS: int = 60_000
+CODE_QUERY_DEFAULT_CHARS: int = 24_000
+#: Omitted files named in an answer; the rest are counted.
+CODE_QUERY_OMITTED_SHOWN: int = 20
+
+_SNAPSHOT_LOCK = threading.Lock()
+
+
+def _snapshot_root() -> Path:
+    import tempfile
+
+    return Path(os.environ.get(CODE_SNAPSHOT_ROOT_ENV) or tempfile.gettempdir()) / (
+        "forge-code-snapshots"
+    )
+
+
+def _prune_snapshots(root: Path, keep: str) -> None:
+    """Keep the newest :data:`CODE_SNAPSHOT_KEEP` snapshots; remove older ones
+    no request has used for :data:`CODE_SNAPSHOT_IDLE_SECONDS`."""
+    try:
+        folders = [p for p in root.iterdir() if p.is_dir() and not p.name.startswith(".")]
+    except OSError:
+        return
+    folders.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    now = time.time()
+    for folder in folders[CODE_SNAPSHOT_KEEP:]:
+        if folder.name == keep:
+            continue
+        try:
+            idle = now - folder.stat().st_mtime
+        except OSError:
+            continue
+        if idle >= CODE_SNAPSHOT_IDLE_SECONDS:
+            shutil.rmtree(folder, ignore_errors=True)
+            with contextlib.suppress(OSError):
+                (root / f"{folder.name}.json").unlink()
+
+
+def _commit_snapshot(tree: _CommitTree) -> tuple[Path, dict[str, Any]]:
+    """The commit's tracked files on disk, and what was left out.
+
+    Written into a hidden staging folder and renamed into place, so a
+    reader never sees half a snapshot and two plans of one commit share it.
+    Raises ``OSError`` (including :class:`_GitStalled`) when git cannot
+    answer.
+    """
+    import uuid
+
+    root = _snapshot_root()
+    root.mkdir(parents=True, exist_ok=True)
+    final = root / tree.commit
+    manifest_path = root / f"{tree.commit}.json"
+    with _SNAPSHOT_LOCK:
+        if final.is_dir() and manifest_path.is_file():
+            os.utime(final)
+            return final, json.loads(manifest_path.read_text(encoding="utf-8"))
+    staging = root / f".{tree.commit}.{os.getpid()}.{uuid.uuid4().hex[:8]}"
+    staging.mkdir()
+    omitted: list[dict[str, str]] = []
+    written = 0
+    total = 0
+    try:
+        for path in tree.files:
+            entry = tree.entries[path]
+            parts = Path(path).parts
+            if not parts or Path(path).is_absolute() or ".." in parts:
+                omitted.append({"path": path, "reason": "unsafe path"})
+            elif entry.mode == _CODE_LINK_MODE:
+                omitted.append({"path": path, "reason": "symbolic link"})
+            elif not entry.mode.startswith("100"):
+                omitted.append({"path": path, "reason": "not a regular file"})
+            elif written >= CODE_MAX_TRACKED_PATHS:
+                omitted.append({"path": path, "reason": "beyond the path limit"})
+            elif entry.size is None or entry.size > CODE_MAX_FILE_BYTES:
+                omitted.append({"path": path, "reason": "larger than the file size limit"})
+            elif total + entry.size > CODE_SNAPSHOT_MAX_BYTES:
+                omitted.append({"path": path, "reason": "beyond the snapshot size limit"})
+            else:
+                target = staging / path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(tree.blob(entry.oid))
+                target.chmod(0o444)
+                written += 1
+                total += entry.size
+        manifest = {
+            "commit": tree.commit,
+            "files": written,
+            "bytes": total,
+            "omitted": omitted,
+        }
+        with _SNAPSHOT_LOCK:
+            if final.is_dir() and manifest_path.is_file():
+                shutil.rmtree(staging, ignore_errors=True)
+                os.utime(final)
+                return final, json.loads(manifest_path.read_text(encoding="utf-8"))
+            if final.exists():
+                shutil.rmtree(final, ignore_errors=True)
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            staging.rename(final)
+        _prune_snapshots(root, keep=final.name)
+        return final, manifest
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+
+
+def _query_at(tree: _CommitTree, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    try:
+        from guardkitfactory import code_search
+    except ImportError as exc:
+        return 503, {"error": f"code search is not installed in this image ({exc})"}
+    operation = payload.get("operation")
+    if operation not in code_search.OPERATIONS:
+        return 400, {
+            "error": f"'operation' must be one of {', '.join(code_search.OPERATIONS)}"
+        }
+    try:
+        snapshot, manifest = _commit_snapshot(tree)
+    except _GitStalled as exc:
+        return 504, {"error": str(exc), "git_stalled": True}
+    except OSError as exc:
+        return 500, {"error": f"could not write the commit's snapshot: {exc}"}
+    try:
+        max_chars = int(payload.get("max_chars") or CODE_QUERY_DEFAULT_CHARS)
+    except (TypeError, ValueError):
+        max_chars = CODE_QUERY_DEFAULT_CHARS
+    max_chars = max(2_000, min(CODE_QUERY_MAX_CHARS, max_chars))
+    omitted = manifest.get("omitted") or []
+    answer = code_search.run(
+        operation,
+        snapshot,
+        query=str(payload.get("query") or ""),
+        mode=str(payload.get("mode") or "ranked"),
+        path=payload.get("path") if isinstance(payload.get("path"), str) else None,
+        pattern=str(payload.get("pattern") or ""),
+        language=str(payload.get("language") or ""),
+        items=str(payload.get("items") or "all"),
+        max_results=payload.get("max_results"),
+        max_chars=max_chars,
+        timeout_s=CODE_QUERY_TIMEOUT_SECONDS,
+        source={
+            "kind": "commit",
+            "commit": tree.commit,
+            "files": manifest.get("files"),
+            "omitted": omitted,
+        },
+        respect_ignore=False,
+    )
+    source = dict(answer.get("source") or {})
+    source["omitted"] = omitted[:CODE_QUERY_OMITTED_SHOWN]
+    source["omitted_count"] = len(omitted)
+    answer["source"] = source
+    return 200, answer
+
+
+def process_code_query_request(
+    payload: Any, *, config: ForgeConfig
+) -> tuple[int, dict[str, Any]]:
+    """``{repo, commit, operation, query?, mode?, path?, pattern?, language?,
+    items?, max_results?, max_chars?}`` → one code search answer at the commit.
+
+    The commit is required: this route only ever answers about a recorded
+    commit, read out of git's objects into a snapshot, never the clone's
+    working tree. The answer's ``status`` says whether the search covered
+    everything (``ok``/``no_matches``), only part (``partial``, with every
+    reason in ``truncation``), or could not run. Never raises.
+    """
+    if not isinstance(payload, dict):
+        return 400, {"error": "request body must be a JSON object"}
+    if payload.get("commit") is None:
+        return 400, {
+            "error": "'commit' is required: /code/query only answers at a recorded commit"
+        }
+    return _code_at_commit("query", payload, config)
 
 
 def _under_at(tree: _CommitTree, value: Any) -> tuple[str | None, str | None]:
@@ -7573,6 +7779,7 @@ class DeploySidecarHandler(BaseHTTPRequestHandler):
                 CODE_READ_FILE_ROUTE,
                 CODE_IMPORTS_ROUTE,
                 CODE_SEARCH_ROUTE,
+                CODE_QUERY_ROUTE,
             ):
                 self._write_json(404, {"error": f"no such path: {self.path}"})
                 return
@@ -7677,6 +7884,8 @@ class DeploySidecarHandler(BaseHTTPRequestHandler):
                 status, body = process_code_imports_request(payload, config=config)
             elif route == CODE_SEARCH_ROUTE:
                 status, body = process_code_search_request(payload, config=config)
+            elif route == CODE_QUERY_ROUTE:
+                status, body = process_code_query_request(payload, config=config)
             elif route == GUARDKIT_LEG_ROUTE:
                 status, body = process_guardkit_leg_request(
                     payload,
@@ -7888,6 +8097,8 @@ __all__ = [
     "CODE_READ_FILE_ROUTE",
     "CODE_IMPORTS_ROUTE",
     "CODE_SEARCH_ROUTE",
+    "CODE_QUERY_ROUTE",
+    "process_code_query_request",
     "CODE_GIT_TIMEOUT_SECONDS",
     "CODE_MAX_TRACKED_PATHS",
     "CODE_MAX_FILE_BYTES",

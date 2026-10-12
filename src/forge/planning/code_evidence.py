@@ -79,6 +79,9 @@ __all__ = [
     "trim_to_budget",
     "window_start",
     "words_starting_in",
+    "MAX_RANKED_SOURCE_CHARS",
+    "MAX_RANKED_BLOCK_LINES",
+    "ranked_source_field",
 ]
 
 #: The window around one hit: this many lines before it and after it.
@@ -1377,3 +1380,128 @@ def trim_to_budget(
         "windows_trimmed": windows_trimmed,
         "lines_trimmed": lines_trimmed,
     }
+
+
+# ---------------------------------------------------------------------------
+# Ranked code blocks (12 October 2026)
+
+#: The ranked blocks' own size budget, separate from :data:`MAX_EVIDENCE_CHARS`.
+MAX_RANKED_SOURCE_CHARS = 6_000
+#: The most blocks shown.
+MAX_RANKED_BLOCKS = 8
+#: A block longer than this is shown from its first line, and its range says so.
+MAX_RANKED_BLOCK_LINES = 40
+
+
+def _inside_any_root(path: str, roots: Sequence[str]) -> bool:
+    return any(path == root or path.startswith(root.rstrip("/") + "/") for root in roots)
+
+
+def ranked_source_field(
+    answer: Mapping[str, Any],
+    *,
+    reader: Any,
+    test_roots: Sequence[str],
+    shown_windows: Iterable[Mapping[str, Any]] = (),
+    budget: int = MAX_RANKED_SOURCE_CHARS,
+) -> dict[str, Any]:
+    """The descriptor's ``ranked_source`` from the helper's ``/code/query``
+    answer.
+
+    Each block's text is read again at the commit through ``reader.read_text``
+    and numbered ``N: line`` exactly like the evidence windows, so the plan
+    writer, its checker and every other tool agree on line numbers; Probe's
+    own text is not used. ``test`` says the block is inside one of the
+    project's declared test folders. A block wholly inside a window already
+    shown is left out. The answer's ``status``, ``truncation`` and
+    ``coverage`` are kept, and this function's own cuts are added to
+    ``truncation`` (an ``ok`` answer then becomes ``partial``): it never says
+    more was searched or shown than was.
+    """
+    source = answer.get("source") or {}
+    query = answer.get("query") or {}
+    tool = answer.get("tool") or {}
+    status = str(answer.get("status") or "tool_error")
+    truncation = list(answer.get("truncation") or [])
+    windows = [
+        (str(w.get("path")), int(w.get("first_line") or 0), int(w.get("last_line") or 0))
+        for w in shown_windows
+        if isinstance(w, Mapping)
+    ]
+    blocks: list[dict[str, Any]] = []
+    used = 0
+    left_out_budget = 0
+    already_shown = 0
+    unreadable = 0
+    texts: dict[str, list[str] | None] = {}
+    for result in answer.get("results") or []:
+        path = str(result.get("path") or "")
+        first = result.get("first_line")
+        last = result.get("last_line")
+        if not path or not isinstance(first, int) or not isinstance(last, int) or last < first:
+            continue
+        if any(p == path and a <= first and last <= b for p, a, b in windows):
+            already_shown += 1
+            continue
+        if len(blocks) >= MAX_RANKED_BLOCKS:
+            left_out_budget += 1
+            continue
+        if path not in texts:
+            try:
+                text = reader.read_text(path)
+            except RepositoryUnreadable:
+                text = None
+            if text is None:
+                texts[path] = None
+            else:
+                split = text.split("\n")
+                texts[path] = split[:-1] if split and split[-1] == "" else split
+        lines = texts[path]
+        if lines is None or first > len(lines):
+            unreadable += 1
+            continue
+        shown_last = min(last, len(lines), first + MAX_RANKED_BLOCK_LINES - 1)
+        rendered = "\n".join(
+            f"{n}: {lines[n - 1][:_WINDOW_LINE_CHARS]}" for n in range(first, shown_last + 1)
+        )
+        if used + len(rendered) > budget:
+            left_out_budget += 1
+            continue
+        used += len(rendered)
+        block: dict[str, Any] = {
+            "path": path,
+            "first_line": first,
+            "last_line": shown_last,
+            "score": result.get("score"),
+            "test": _inside_any_root(path, test_roots),
+            "text": rendered,
+        }
+        if shown_last < last:
+            block["block_continues_to"] = last
+        blocks.append(block)
+    if left_out_budget:
+        truncation.append(
+            f"{left_out_budget} ranked block(s) left out to fit {budget} characters "
+            f"or {MAX_RANKED_BLOCKS} blocks"
+        )
+    if unreadable:
+        truncation.append(f"{unreadable} ranked block(s) could not be read at the commit")
+    if (left_out_budget or unreadable) and status in ("ok", "no_matches"):
+        status = "partial"
+    field: dict[str, Any] = {
+        "commit": source.get("commit"),
+        "tool": f"{tool.get('name')} {tool.get('version')}" if tool else None,
+        "query_words": list(query.get("words") or []),
+        "status": status,
+        "blocks": blocks,
+        "truncated": bool(truncation),
+        "truncation": truncation,
+        "coverage": {
+            **dict(answer.get("coverage") or {}),
+            "snapshot_files": source.get("files"),
+            "snapshot_omitted": source.get("omitted_count", 0),
+            "blocks_already_shown_as_windows": already_shown,
+        },
+        "note": str(answer.get("note") or ""),
+    }
+    return field

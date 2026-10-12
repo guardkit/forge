@@ -126,6 +126,7 @@ from forge.planning.code_evidence import (
     MAX_EVIDENCE_CHARS,
     MAX_EVIDENCE_WINDOWS,
     candidate_windows,
+    ranked_source_field,
     choose_windows,
     is_documentation,
     is_factory_file,
@@ -2701,6 +2702,11 @@ class PlanningRunDriver:
         """True iff the ``planning.target_terminal.enabled`` flag is on."""
         tt = getattr(self._deps.planning_config, "target_terminal", None)
         return bool(getattr(tt, "enabled", False))
+
+    def _ranked_source_enabled(self) -> bool:
+        """True iff the ``planning.ranked_source.enabled`` switch is on."""
+        cfg = getattr(self._deps.planning_config, "ranked_source", None)
+        return bool(getattr(cfg, "enabled", False))
 
     def _nothing_to_build_enabled(self) -> bool:
         """True iff the ``planning.nothing_to_build.enabled`` switch is on."""
@@ -6366,6 +6372,7 @@ class PlanningRunDriver:
             unavailable=descriptor_unavailable,
             partial=descriptor_partial,
             request_text=self._request_text_of(row),
+            ranked_source=self._ranked_source_enabled(),
         )
         if descriptor_unavailable:
             self.__dict__.setdefault("_descriptor_unavailable", {})[correlation_id] = (
@@ -12100,6 +12107,7 @@ class PlanningRunDriver:
         unavailable: list[str] | None = None,
         partial: list[str] | None = None,
         request_text: str = "",
+        ranked_source: bool = False,
     ) -> dict[str, Any]:
         """Build the 008 ``target_repo_descriptor`` honestly from what forge knows.
 
@@ -12271,9 +12279,58 @@ class PlanningRunDriver:
             descriptor["where_the_specs_words_already_appear"] = already_there
         if sets:
             descriptor["sets_the_request_names"] = sets
+        # Ranked code blocks from the starting commit (12 October 2026), only
+        # with the planning.ranked_source switch on and a reader that can ask
+        # the sandbox helper; off, the descriptor is byte for byte today's.
+        if ranked_source:
+            field = PlanningRunDriver._ranked_source_for(
+                reader,
+                request_text or spec_feature,
+                test_roots=test_roots,
+                shown=[
+                    window
+                    for entry in already_there or []
+                    for window in entry.get("evidence") or []
+                ],
+            )
+            if field is not None:
+                descriptor["ranked_source"] = field
         if reasons and unavailable is not None:
             unavailable.extend(reasons)
         return descriptor
+
+    @staticmethod
+    def _ranked_source_for(
+        reader: Any,
+        text: str,
+        *,
+        test_roots: list[str],
+        shown: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        """The descriptor's ``ranked_source``, or ``None`` when this reader
+        cannot ask the sandbox helper (a local checkout). A helper that cannot
+        answer gives a field that says so, never an empty "nothing found"."""
+        ask = getattr(reader, "ranked_source", None)
+        if not callable(ask) or not (text or "").strip():
+            return None
+        try:
+            answer = ask(text)
+        except RepositoryUnreadable as exc:
+            logger.warning("target_repo_descriptor: ranked code search failed (%s)", exc)
+            return {
+                "commit": None,
+                "tool": None,
+                "query_words": [],
+                "status": "tool_error",
+                "blocks": [],
+                "truncated": False,
+                "truncation": [],
+                "coverage": {},
+                "note": f"the ranked code search could not run: {exc}",
+            }
+        return ranked_source_field(
+            answer, reader=reader, test_roots=test_roots, shown_windows=shown
+        )
 
     def _has_leg_event(self, correlation_id: str, stage_label: str) -> bool:
         """True iff a durable ``approved`` event exists for ``stage_label``.
