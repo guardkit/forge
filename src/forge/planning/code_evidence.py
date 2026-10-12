@@ -1433,6 +1433,7 @@ def ranked_source_field(
     left_out_budget = 0
     already_shown = 0
     unreadable = 0
+    shown_in_part = 0
     texts: dict[str, list[str] | None] = {}
     for result in answer.get("results") or []:
         path = str(result.get("path") or "")
@@ -1461,6 +1462,9 @@ def ranked_source_field(
             unreadable += 1
             continue
         shown_last = min(last, len(lines), first + MAX_RANKED_BLOCK_LINES - 1)
+        cut = shown_last < last or any(
+            len(lines[n - 1]) > _WINDOW_LINE_CHARS for n in range(first, shown_last + 1)
+        )
         rendered = "\n".join(
             f"{n}: {lines[n - 1][:_WINDOW_LINE_CHARS]}" for n in range(first, shown_last + 1)
         )
@@ -1478,6 +1482,8 @@ def ranked_source_field(
         }
         if shown_last < last:
             block["block_continues_to"] = last
+        if cut:
+            shown_in_part += 1
         blocks.append(block)
     if left_out_budget:
         truncation.append(
@@ -1486,7 +1492,12 @@ def ranked_source_field(
         )
     if unreadable:
         truncation.append(f"{unreadable} ranked block(s) could not be read at the commit")
-    if (left_out_budget or unreadable) and status in ("ok", "no_matches"):
+    if shown_in_part:
+        truncation.append(
+            f"{shown_in_part} ranked block(s) shown only in part (the first "
+            f"{MAX_RANKED_BLOCK_LINES} lines, each cut at {_WINDOW_LINE_CHARS} characters)"
+        )
+    if (left_out_budget or unreadable or shown_in_part) and status in ("ok", "no_matches"):
         status = "partial"
     field: dict[str, Any] = {
         "commit": source.get("commit"),

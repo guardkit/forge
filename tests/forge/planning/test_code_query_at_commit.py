@@ -328,6 +328,26 @@ def test_field_numbering_dedupe_tests_and_budget() -> None:
     assert field["blocks"][1]["test"] is True
     assert field["coverage"]["blocks_already_shown_as_windows"] == 1
     assert field["status"] == "partial"  # gone.py could not be read at the commit
+    assert any("shown only in part" in reason for reason in field["truncation"])
     tight = ranked_source_field(answer, reader=_Lines(files), test_roots=[], budget=50)
     assert tight["status"] == "partial"
     assert any("to fit 50 characters" in reason for reason in tight["truncation"])
+
+
+def test_one_shortened_block_alone_makes_the_field_partial() -> None:
+    files = {"a.py": "".join(f"line {n}\n" for n in range(1, 101))}
+    answer = {
+        "status": "ok", "truncation": [], "coverage": {}, "note": "",
+        "tool": {"name": "probe", "version": "0.6.0-rc341"}, "query": {"words": ["line"]},
+        "source": {"commit": "c" * 40, "files": 1, "omitted_count": 0},
+        "results": [{"path": "a.py", "first_line": 1, "last_line": 100, "score": 1.0}],
+    }
+    field = ranked_source_field(answer, reader=_Lines(files), test_roots=[])
+    assert [b["last_line"] for b in field["blocks"]] == [40]
+    assert field["status"] == "partial" and field["truncated"] is True
+    whole = ranked_source_field(
+        {**answer, "results": [{"path": "a.py", "first_line": 1, "last_line": 5, "score": 1.0}]},
+        reader=_Lines(files), test_roots=[],
+    )
+    assert whole["status"] == "ok" and whole["truncation"] == []
+
