@@ -1224,7 +1224,8 @@ class TestTheWebToolchain:
             'test "$(${as_player} go env GOTOOLCHAIN)" = "local"',
             'test "$(${as_player} go env CGO_ENABLED)" = "1"',
             '${as_player} go run -race "${check_home}/race.go"',
-            '${as_player} gofmt -l',
+            'gofmt_out="$(${as_player} gofmt -l "${check_home}/race.go")"',
+            'test -z "${gofmt_out}"',
             'test "$(${as_player} staticcheck -version)" = '
             '"staticcheck ${STATICCHECK_VERSION} (0.8.1)"',
             "--headless --no-sandbox",
@@ -1232,6 +1233,27 @@ class TestTheWebToolchain:
         ):
             assert check in run, f"the self-check must include: {check}"
         assert re.search(r"^ARG\s+NODE_NPM_VERSION=10\.9\.8\s*$", runtime_body, re.MULTILINE)
+
+    def test_the_self_check_finds_the_chromium_binaries_playwright_installs(
+        self, dockerfile_text: str
+    ) -> None:
+        # Playwright 1.63.0 on linux-arm64 (playwright-core lib/coreBundle.js,
+        # EXECUTABLE_PATHS) installs Chrome for Testing builds:
+        #   chromium-<rev>/chrome-linux-arm64/chrome
+        #   chromium_headless_shell-<rev>/chrome-headless-shell-linux-arm64/chrome-headless-shell
+        # The first W1 draft searched for ``headless_shell``, the name older
+        # Playwright builds used, and the self-check would have failed the build.
+        runtime_body = _runtime_stage_body(dockerfile_text)
+        (run,) = [r for r in _run_instructions(runtime_body) if "as_player=" in r]
+        assert (
+            "-path '*/chromium-*/chrome-linux-arm64/chrome' -name chrome)"
+        ) in run
+        assert (
+            "-path '*/chromium_headless_shell-*/chrome-headless-shell-linux-arm64/"
+            "chrome-headless-shell' -name chrome-headless-shell)"
+        ) in run
+        assert "-name headless_shell" not in run
+        assert 'test -x "${chrome}" && test -x "${headless_shell}"' in run
 
     def test_the_toolchain_layers_sit_before_the_cache_barrier(
         self, dockerfile_text: str

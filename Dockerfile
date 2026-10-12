@@ -428,9 +428,14 @@ RUN curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-l
 
 # Go 1.26 in /usr/local/go. `go` finds its root by resolving its own link, so
 # the /usr/bin links are enough. GOTOOLCHAIN=local is written into Go's own
-# installation defaults file, go.env, which Go reads whatever the environment
-# holds — the Player's shell included — so a project's go.mod cannot make Go
-# download a different toolchain. gcc and libc6-dev are here because Go's race
+# installation defaults file, go.env, which Go reads even when the environment
+# carries no Go settings — the Player's shell included — so by default a
+# project's go.mod cannot make Go download a different toolchain. It is the
+# image's DEFAULT, not a lock: a GOTOOLCHAIN environment variable, or a
+# per-user $HOME/.config/go/env (written by `go env -w`), overrides it. The
+# Player's HOME is its worktree, so a project closes that second route by
+# declaring XDG_CONFIG_HOME as a launch scratch name, as the React/Go template
+# does. gcc and libc6-dev are here because Go's race
 # detector needs cgo on arm64; build-essential and g++ are not installed.
 ARG GO_VERSION=1.26.9
 ARG GO_SHA256=4a97373d49fcacdcf3694fea368a500b00ee3e963974f3e7514132717632f052
@@ -490,9 +495,12 @@ RUN npx -y "playwright@${PLAYWRIGHT_VERSION}" install --with-deps chromium firef
 # minimal environment — `env -i PATH=/usr/bin:/bin HOME=<fresh folder>` — so it
 # proves what the Player and Coach will actually find, not what root with this
 # image's PATH finds. Exact versions; cgo on, proved by building with the race
-# detector; GOTOOLCHAIN=local from go.env alone; and both Chromium binaries
-# Playwright uses (the full browser, and the headless shell its default
-# headless mode runs) loading a page headless. --no-sandbox is what Playwright
+# detector; gofmt finding nothing to change in a well-formatted file;
+# GOTOOLCHAIN=local from go.env alone; and both Chromium binaries Playwright
+# 1.63 uses on linux-arm64 (the full browser, chromium-<rev>/chrome-linux-arm64/
+# chrome, and the headless shell its default headless mode runs,
+# chromium_headless_shell-<rev>/chrome-headless-shell-linux-arm64/
+# chrome-headless-shell) loading a page headless. --no-sandbox is what Playwright
 # itself passes by default. Firefox and WebKit are checked for presence and
 # readability only: they have no one-line headless launch outside Playwright's
 # own driver, so launching all three browsers is the acceptance smoke run in
@@ -508,10 +516,11 @@ RUN check_home="$(mktemp -d)" \
     && test "$(${as_player} go env CGO_ENABLED)" = "1" \
     && printf 'package main\n\nfunc main() {}\n' > "${check_home}/race.go" \
     && ${as_player} go run -race "${check_home}/race.go" \
-    && ${as_player} gofmt -l "${check_home}/race.go" \
+    && gofmt_out="$(${as_player} gofmt -l "${check_home}/race.go")" \
+    && test -z "${gofmt_out}" \
     && test "$(${as_player} staticcheck -version)" = "staticcheck ${STATICCHECK_VERSION} (0.8.1)" \
-    && chrome="$(find "${PLAYWRIGHT_BROWSERS_PATH}" -path '*/chromium-*' -type f -name chrome)" \
-    && headless_shell="$(find "${PLAYWRIGHT_BROWSERS_PATH}" -path '*/chromium_headless_shell-*' -type f -name headless_shell)" \
+    && chrome="$(find "${PLAYWRIGHT_BROWSERS_PATH}" -type f -path '*/chromium-*/chrome-linux-arm64/chrome' -name chrome)" \
+    && headless_shell="$(find "${PLAYWRIGHT_BROWSERS_PATH}" -type f -path '*/chromium_headless_shell-*/chrome-headless-shell-linux-arm64/chrome-headless-shell' -name chrome-headless-shell)" \
     && test -x "${chrome}" && test -x "${headless_shell}" \
     && for browser in "${chrome}" "${headless_shell}"; do \
            ${as_player} "${browser}" --headless --no-sandbox --disable-gpu --disable-dev-shm-usage \
