@@ -359,7 +359,7 @@ class TestTheLineOnTheCard:
         )
 
         assert line == (
-            "This branch deleted 2 tests and removed 3 assertions in "
+            "This branch deleted 2 tests and removed or changed 3 assertions in "
             "tests/users/test_router.py — worth a look before you merge."
         )
 
@@ -373,14 +373,14 @@ class TestTheLineOnTheCard:
             )
         )
 
-        assert "deleted 1 test and removed 1 assertion in" in line
+        assert "deleted 1 test and removed or changed 1 assertion in" in line
 
     def test_only_assertions_removed_says_only_that(self) -> None:
         line = card_line_about_tests(
             ChangedTestsReport(files_changed=1, assertions_removed=2, files=(ROUTER,))
         )
 
-        assert line.startswith("This branch removed 2 assertions in")
+        assert line.startswith("This branch removed or changed 2 assertions in")
         assert "deleted" not in line
 
     def test_many_files_are_named_three_at_a_time_and_then_counted(self) -> None:
@@ -418,6 +418,54 @@ class TestTheLineOnTheCard:
 
     def test_nobody_counted_means_the_card_says_nothing_about_tests(self) -> None:
         assert card_line_about_tests(None) == ""
+
+    def test_existing_test_files_are_named_whatever_the_shape(self) -> None:
+        """Repair 2 part B, 12 October 2026."""
+        assert card_line_about_tests(
+            ChangedTestsReport(files_changed=2, existing_files=(ROUTER,))
+        ) == (
+            "This branch changed 2 test files and removed no tests or "
+            "assertions. 1 of them already existed: tests/users/test_router.py."
+        )
+        assert card_line_about_tests(
+            ChangedTestsReport(files_changed=2, existing_files=(ROUTER, "tests/b.py"))
+        ).endswith(
+            "All of them already existed: tests/users/test_router.py and tests/b.py."
+        )
+        assert card_line_about_tests(
+            ChangedTestsReport(files_changed=1, read_whole=False, existing_files=(ROUTER,))
+        ) == (
+            "This branch changed 1 test file, and what it changed in them could "
+            "not be read here. That file already existed: "
+            "tests/users/test_router.py."
+        )
+
+    def test_an_existing_file_not_already_named_for_a_loss_is_added(self) -> None:
+        line = card_line_about_tests(
+            ChangedTestsReport(
+                files_changed=2,
+                assertions_removed=1,
+                files=(ROUTER,),
+                existing_files=(ROUTER, "tests/conftest.py"),
+            )
+        )
+
+        assert line == (
+            "This branch removed or changed 1 assertion in tests/users/test_router.py — "
+            "worth a look before you merge. It also changed 1 test file that "
+            "already existed: tests/conftest.py."
+        )
+
+    def test_the_count_keeps_which_test_files_already_existed(self) -> None:
+        counted = count_test_changes(
+            changes=parse_changed_files(
+                f"M\0{ROUTER}\0A\0tests/test_new.py\0R090\0tests/a.py\0tests/b.py\0"
+            ),
+            patch="",
+        )
+
+        assert counted.files_changed == 3
+        assert counted.existing_files == (ROUTER, "tests/b.py")
 
 
 class TestTheCardItself:

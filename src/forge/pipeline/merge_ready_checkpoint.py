@@ -119,6 +119,7 @@ __all__ = [
     "ApprovalLineChange",
     "BranchFileChange",
     "ChangedTestsReport",
+    "ExistingFileChange",
     "GateStatus",
     "GatesReport",
     "MergeCardDecision",
@@ -129,6 +130,7 @@ __all__ = [
     "SpecificationFenceStatus",
     "approval_line_owner",
     "count_test_changes",
+    "files_that_already_existed",
     "is_assertion",
     "iter_patch_lines",
     "judge_branch_changes",
@@ -885,6 +887,78 @@ def paths_in_test_command(command: Any) -> "tuple[str, ...]":
     return tuple(found)
 
 
+# ---------------------------------------------------------------------------
+# FILES THAT ALREADY EXISTED — said on the card, never fenced
+# (factory reliability repairs, 12 October 2026, repair 2 part B)
+# ---------------------------------------------------------------------------
+#
+# In the four-worker trial both builds that counted had rewritten a URL test
+# that was already in the repository and changed its dependency declarations,
+# and nothing a person read said so. The card reported a passing suite, and
+# that suite had been run with the rewritten test and the changed
+# declarations, so it was not evidence that the original tests passed.
+#
+# So the card names every file that was already there when the work started
+# and that the branch changed, deleted or renamed. It is read from the same
+# ``diff --name-status`` the card already takes, and it needs no idea what
+# kind of file anything is: a dependency manifest, a lock file, a fixture and
+# a test are all simply files that already existed, whatever the stack. It is
+# disclosure only and refuses nothing.
+
+#: git's letters for a file the branch brought into being: added, or copied
+#: from another file (a copy leaves the original untouched). Every other
+#: letter — changed, deleted, renamed, type changed, and any letter git adds
+#: later — is a file that was already there.
+_NEW_FILE_LETTERS: frozenset[str] = frozenset({"A", "C"})
+
+
+@dataclass(frozen=True, slots=True)
+class ExistingFileChange:
+    """One file that existed at the branch's base and that the branch changed.
+
+    Attributes:
+        path: The file's path now. For a rename this is the NEW name, so a
+            renamed file is listed once, where a person would open it.
+        deleted: ``True`` when the branch deleted the file.
+        is_test: ``True`` when the file is one of the repository's tests, read
+            by the same rule as the test count (either end of a rename).
+    """
+
+    path: str
+    deleted: bool = False
+    is_test: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        """The entry as the receipt writes it."""
+        return {"path": self.path, "deleted": self.deleted, "is_test": self.is_test}
+
+
+def files_that_already_existed(
+    changes: "tuple[BranchFileChange, ...]",
+    test_paths: "tuple[str, ...]" = DEFAULT_TEST_PATHS,
+) -> "tuple[ExistingFileChange, ...]":
+    """Every file the branch changed that was already there at its base.
+
+    ``changes`` is the branch's own ``diff --name-status`` reading. Added and
+    copied files are left out; everything else is listed once, in git's own
+    order, a rename under its new name. Never raises.
+    """
+    found: dict[str, ExistingFileChange] = {}
+    for change in changes:
+        letter = (change.status or "").upper()[:1]
+        if letter in _NEW_FILE_LETTERS:
+            continue
+        path = str(change.path or "").strip()
+        if not path or path in found:
+            continue
+        found[path] = ExistingFileChange(
+            path=path,
+            deleted=letter == "D",
+            is_test=any(path_is_test(each, test_paths) for each in change.paths),
+        )
+    return tuple(found.values())
+
+
 @dataclass(frozen=True, slots=True)
 class ChangedTestsReport:
     """What one branch did to the repository's tests.
@@ -901,6 +975,13 @@ class ChangedTestsReport:
         read_whole: ``False`` when the branch's own diff could not be read,
             or was too long to read whole, so the two counts above are not
             to be trusted and the card says so instead of reciting them.
+        existing_files: The test files the branch changed, deleted or
+            renamed that were already there at its base (repair 2 part B,
+            12 October 2026). The card names them whatever the counts say:
+            an existing test whose assertion was rewritten, or whose setup
+            was changed with no assertion touched, has still moved what the
+            passing result was measured against. Read from the file list, so
+            it is known even when the lines could not be read whole.
     """
 
     files_changed: int = 0
@@ -908,6 +989,7 @@ class ChangedTestsReport:
     assertions_removed: int = 0
     files: tuple[str, ...] = ()
     read_whole: bool = True
+    existing_files: tuple[str, ...] = ()
 
     @property
     def lost_something(self) -> bool:
@@ -948,8 +1030,15 @@ def count_test_changes(
         for change in changes
         if any(path_is_test(path, test_paths) for path in change.paths)
     )
+    existing = tuple(
+        item.path
+        for item in files_that_already_existed(changes, test_paths)
+        if item.is_test
+    )
     if not read_whole:
-        return ChangedTestsReport(files_changed=files_changed, read_whole=False)
+        return ChangedTestsReport(
+            files_changed=files_changed, read_whole=False, existing_files=existing
+        )
 
     # A renamed file's removed lines are printed against the name it HAD.
     # The person reading the card has to open the file it IS, so every path
@@ -1001,6 +1090,7 @@ def count_test_changes(
         tests_deleted=len(deleted),
         assertions_removed=len(removed),
         files=tuple(path for path in where if path),
+        existing_files=existing,
     )
 
 

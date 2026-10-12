@@ -488,6 +488,235 @@ class TestTheBranchIsHeldAgainstWhereTheBuildStarted:
         assert report is not None and report.compared_against == start
 
 
+class TestWhereTheTestsLiveIsAskedOnlyWhenItMatters:
+    """Where a repository keeps its tests only marks which files that already
+    existed are tests, and for a sandboxed repository asking costs a second
+    wait on its sidecar. So it is asked only when the branch was read and
+    something that already existed was changed (12 October 2026)."""
+
+    @staticmethod
+    def _asked(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+        from forge.pipeline import merge_offer
+
+        asked: list[str] = []
+
+        def _where_the_tests_live(repo_root: Any, repo_key: str, sandbox: Any) -> tuple[str, ...]:
+            asked.append(repo_key)
+            return ("**/tests/**", "src/users/**")
+
+        monkeypatch.setattr(merge_offer, "_test_paths_of", _where_the_tests_live)
+        return asked
+
+    @staticmethod
+    def _pass(pool: SqliteLifecyclePersistence, root: Path) -> ScopeReport | None:
+        config = ForgeConfig.model_validate(
+            {
+                "permissions": {"filesystem": {"allowlist": ["/tmp"]}},
+                "planning": {"target_repo_paths": {REPO: str(root)}},
+                "merge_executor": {"enabled": True},
+            }
+        )
+        _insert_build(pool)
+        return run_the_scope_pass(
+            config=config,
+            pool=pool,
+            build_id=BUILD_ID,
+            feature_id=FEATURE_ID,
+            row=pool.get_build_row(BUILD_ID),
+        )
+
+    def test_asked_when_a_file_that_already_existed_changed(
+        self,
+        pool: SqliteLifecyclePersistence,
+        repo_root: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        asked = self._asked(monkeypatch)
+
+        report = self._pass(pool, repo_root)
+
+        assert asked == [REPO]
+        assert report is not None
+        assert [item.path for item in report.files_that_already_existed] == [
+            "src/users/router.py"
+        ]
+        # the answer is used: the declared path marks the router as a test
+        assert report.files_that_already_existed[0].is_test is True
+
+    def test_the_report_knows_where_its_receipt_was_written(
+        self,
+        pool: SqliteLifecyclePersistence,
+        repo_root: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """So a card whose list is too long to name in full can say exactly
+        where the complete list is."""
+        self._asked(monkeypatch)
+        receipts = tmp_path / "receipts"
+        (receipts / BUILD_ID).mkdir(parents=True)
+        monkeypatch.setenv("FORGE_RECEIPTS_DIR", str(receipts))
+
+        report = self._pass(pool, repo_root)
+
+        assert report is not None
+        assert report.receipt_path == str(receipts / BUILD_ID / SCOPE_REPORT_NAME)
+        kept = json.loads(Path(report.receipt_path).read_text(encoding="utf-8"))
+        assert [item["path"] for item in kept["files_that_already_existed"]] == [
+            "src/users/router.py"
+        ]
+
+    def test_not_asked_when_the_branch_could_not_be_read(
+        self,
+        pool: SqliteLifecyclePersistence,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        asked = self._asked(monkeypatch)
+        nowhere = tmp_path / "not-a-repository"
+        nowhere.mkdir()
+
+        report = self._pass(pool, nowhere)
+
+        assert report is not None and report.read is False
+        assert asked == []
+
+    def test_not_asked_when_the_branch_only_added_files(
+        self,
+        pool: SqliteLifecyclePersistence,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        asked = self._asked(monkeypatch)
+        root = tmp_path / "only-adds"
+        root.mkdir()
+        _git(root, "init", "-q", "-b", "main")
+        _write(root, "README.md", "a repository\n")
+        _git(root, "add", "-A")
+        _git(root, "commit", "-q", "-m", "base")
+        _git(root, "checkout", "-q", "-b", BRANCH)
+        _write(root, "src/new.py", "def new():\n    return 1\n")
+        _git(root, "add", "-A")
+        _git(root, "commit", "-q", "-m", "only adds")
+
+        report = self._pass(pool, root)
+
+        assert report is not None and report.read is True
+        assert report.files_that_already_existed == []
+        assert asked == []
+
+
+class TestAStuckTestSettingsReadNeverHoldsUpTheCard:
+    """Learning where a repository keeps its tests reads a file, and a read
+    that never returns must not hold up either merge card (12 October 2026).
+    Both consumers are driven with that read blocked for good: each card goes
+    out within the deadline, names every file that already existed, and says
+    which of them are tests could not be fully checked."""
+
+    NOTE = (
+        "Which of these are test files could not be fully checked: this "
+        "repository's own test settings could not be read in time, so only "
+        "the usual test locations were used."
+    )
+    LISTED = "This branch changes 1 file that already existed: src/users/router.py."
+
+    @pytest.fixture
+    def stuck(self, monkeypatch: pytest.MonkeyPatch):
+        import threading
+
+        from forge.cli import _serve_conductor
+        from forge.pipeline import merge_offer
+
+        released = threading.Event()
+        entered = threading.Event()
+
+        def _a_read_that_never_returns(*_args: Any, **_kwargs: Any) -> Any:
+            entered.set()
+            released.wait(60)
+            return ()
+
+        monkeypatch.setattr(_serve_conductor, "test_paths_for", _a_read_that_never_returns)
+        monkeypatch.setattr(merge_offer, "TEST_PATHS_DEADLINE_SECONDS", 0.3)
+        try:
+            yield entered
+        finally:
+            released.set()
+
+    @staticmethod
+    def _offered_scope(pool: SqliteLifecyclePersistence) -> dict[str, Any]:
+        offered = [
+            stage
+            for stage in pool.read_stages(BUILD_ID)
+            if stage.target_identifier == MERGE_OFFER_TARGET_IDENTIFIER
+        ]
+        assert len(offered) == 1
+        return offered[0].details[MERGE_OFFER_DETAILS_KEY]["scope_report"]
+
+    def test_the_routine_card_goes_out_within_the_deadline(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+        stuck: Any,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import time
+
+        _insert_build(pool)
+        _insert_planning_run(pool)
+        monkeypatch.setenv("FORGE_RECEIPTS_DIR", str(tmp_path / "receipts"))
+        recorder = _Recorder()
+
+        started = time.monotonic()
+        asyncio.run(_service(config, pool, recorder).maybe_offer(_event()))
+        took = time.monotonic() - started
+
+        assert stuck.is_set(), "the blocked read was really reached"
+        assert took < 10
+        words = recorder.paused.rationale
+        assert self.LISTED in words
+        assert self.NOTE in words
+        kept = self._offered_scope(pool)
+        assert kept["test_files_checked"] is False
+        assert [item["path"] for item in kept["files_that_already_existed"]] == [
+            "src/users/router.py"
+        ]
+
+    def test_the_repair_card_goes_out_within_the_deadline(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+        stuck: Any,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import time
+
+        _insert_build(pool)
+        _insert_planning_run(pool)
+        monkeypatch.setenv("FORGE_RECEIPTS_DIR", str(tmp_path / "receipts"))
+        recorder = _Recorder()
+
+        started = time.monotonic()
+        asyncio.run(
+            _repair_publisher(pool, recorder, config=config, scope_config=config)(
+                build_id=BUILD_ID,
+                feature_id=FEATURE_ID,
+                rationale="mode-c-commits-present",
+                branch=BRANCH,
+                gates=_repair_gates(),
+            )
+        )
+        took = time.monotonic() - started
+
+        assert stuck.is_set(), "the blocked read was really reached"
+        assert took < 10
+        words = recorder.paused.rationale
+        assert self.LISTED in words
+        assert self.NOTE in words
+        assert self._offered_scope(pool)["test_files_checked"] is False
+
+
 class TestTheCardAndTheDurableRow:
     def test_the_card_says_what_went_beyond_the_plan_and_the_request(
         self,
@@ -544,6 +773,50 @@ class TestTheCardAndTheDurableRow:
         kept = offered[0].details[MERGE_OFFER_DETAILS_KEY]["scope_report"]
         assert kept["read"] is True
         assert kept["files_the_plan_did_not_name"] == ["src/analytics/service.py"]
+
+    def test_the_card_and_the_row_name_the_file_that_already_existed(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Repair 2 part B, 12 October 2026: the branch changed the router
+        that was already on main and added a new service. The card names the
+        router, after what was checked, and the durable row and the receipt
+        keep the same list for anyone reading the build afterwards."""
+        _insert_build(pool)
+        _insert_planning_run(pool)
+        receipts = tmp_path / "receipts"
+        (receipts / BUILD_ID).mkdir(parents=True)
+        monkeypatch.setenv("FORGE_RECEIPTS_DIR", str(receipts))
+        recorder = _Recorder()
+
+        asyncio.run(_service(config, pool, recorder).maybe_offer(_event()))
+
+        words = recorder.paused.rationale
+        sentence = (
+            "This branch changes 1 file that already existed: "
+            "src/users/router.py. Any passing result on this card was measured "
+            "with this change, so it is not evidence that the original tests "
+            "pass unchanged."
+        )
+        assert sentence in words
+        assert words.index(sentence) < words.index("Approve =")
+        expected = [
+            {"path": "src/users/router.py", "deleted": False, "is_test": False}
+        ]
+        offered = [
+            stage
+            for stage in pool.read_stages(BUILD_ID)
+            if stage.target_identifier == MERGE_OFFER_TARGET_IDENTIFIER
+        ]
+        kept = offered[0].details[MERGE_OFFER_DETAILS_KEY]["scope_report"]
+        assert kept["files_that_already_existed"] == expected
+        receipt = json.loads(
+            (receipts / BUILD_ID / SCOPE_REPORT_NAME).read_text(encoding="utf-8")
+        )
+        assert receipt["files_that_already_existed"] == expected
 
     def test_a_pass_nobody_could_take_leaves_the_card_as_it_was(
         self,
@@ -698,6 +971,51 @@ class TestTheRepairJourneysCardCarriesTheSameLine:
         assert words.endswith(
             "Reject = nothing changes; the branch is kept either way."
         )
+
+    def test_the_repair_card_names_the_file_that_already_existed(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _insert_build(pool)
+        _insert_planning_run(pool)
+        receipts = tmp_path / "receipts"
+        (receipts / BUILD_ID).mkdir(parents=True)
+        monkeypatch.setenv("FORGE_RECEIPTS_DIR", str(receipts))
+        recorder = _Recorder()
+
+        asyncio.run(
+            _repair_publisher(pool, recorder, config=config, scope_config=config)(
+                build_id=BUILD_ID,
+                feature_id=FEATURE_ID,
+                rationale="mode-c-commits-present",
+                branch=BRANCH,
+                gates=_repair_gates(),
+            )
+        )
+
+        words = recorder.paused.rationale
+        sentence = (
+            "This branch changes 1 file that already existed: "
+            "src/users/router.py. Any passing result on this card was measured "
+            "with this change, so it is not evidence that the original tests "
+            "pass unchanged."
+        )
+        assert sentence in words
+        assert words.index("What was checked") < words.index(sentence)
+        # and the merge offer's durable row keeps the same list
+        offered = [
+            stage
+            for stage in pool.read_stages(BUILD_ID)
+            if stage.target_identifier == MERGE_OFFER_TARGET_IDENTIFIER
+        ]
+        assert len(offered) == 1
+        kept = offered[0].details[MERGE_OFFER_DETAILS_KEY]["scope_report"]
+        assert kept["files_that_already_existed"] == [
+            {"path": "src/users/router.py", "deleted": False, "is_test": False}
+        ]
 
     def test_the_receipt_is_written_before_anyone_is_asked_to_merge(
         self,

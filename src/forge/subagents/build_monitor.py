@@ -1152,6 +1152,11 @@ TERMINAL_CLASSES: tuple[str, ...] = (
 #: The ``TaskProgress`` marker kind that means guardkit's own clock fired.
 _IN_BAND_TIMEOUT_MARKER: str = "TIMEOUT"
 
+#: The marker kind guardkit writes when it ends a task in an orderly way. It
+#: carries the task's final decision, and an orderly task timeout ends here,
+#: as ``COMPLETE TASK-X: ... decision=timeout``, not on a ``TIMEOUT`` marker.
+_ORDERLY_END_MARKER: str = "COMPLETE"
+
 #: Substrings that mark an ``events.jsonl`` ``failure_category`` as a timeout.
 #: Matched case-insensitively against the raw category so guardkit is free to
 #: spell it ``timeout`` / ``task_timeout`` / ``sdk-timeout`` without forge
@@ -1178,6 +1183,31 @@ def _names_a_timeout(lowered: str) -> bool:
     return False
 
 
+def _ends_on_a_timeout(item: TaskProgress) -> bool:
+    """Does this task's ``progress.log`` END on guardkit's own timeout?
+
+    Two shapes say so. A final ``TIMEOUT`` marker is written the moment an SDK
+    call is abandoned. A final ``COMPLETE`` record whose decision names a
+    timeout is how guardkit ends a task whose overall time ran out in an
+    orderly way (DC47, 12 October 2026: ``COMPLETE TASK-DC47-001: ...
+    decision=timeout``). Forge already read that decision and then ignored
+    it, so the failure manifest called the build an ordinary error and said
+    no clock was known to have fired.
+
+    Every ``COMPLETE`` record guardkit writes carries its own ``decision=``,
+    so when the final marker is ``COMPLETE`` the parsed decision is that
+    record's own. A decision is read with the same test as an
+    ``events.jsonl`` category, so ``no_timeout`` is never a timeout.
+    """
+    marker = (item.last_marker or "").upper()
+    if marker == _IN_BAND_TIMEOUT_MARKER:
+        return True
+    if marker == _ORDERLY_END_MARKER:
+        decision = (item.decision or "").strip().lower()
+        return bool(decision) and _names_a_timeout(decision)
+    return False
+
+
 def _in_band_timeout_evidence(
     progress: "tuple[TaskProgress, ...] | None",
     last_event: Mapping[str, Any] | None,
@@ -1188,20 +1218,21 @@ def _in_band_timeout_evidence(
 
     1. a task's ``progress.log`` whose last non-heartbeat record is a
        ``TIMEOUT`` marker — guardkit writes it the moment the SDK call is
-       abandoned;
+       abandoned — or a ``COMPLETE`` record whose decision names a timeout,
+       which is how guardkit ends a task whose own time ran out
+       (:func:`_ends_on_a_timeout`);
     2. the last ``events.jsonl`` record carrying a timeout-flavoured
        ``failure_category``.
+
+    Neither touches ``timed_out``: that flag keeps meaning forge's own outer
+    deadline, and this is evidence that guardkit's inner one fired.
 
     Pure; never raises; ``None`` means NO EVIDENCE, which is deliberately not
     the same as "not a timeout" — the caller degrades to the honest
     :data:`TERMINAL_CLASS_ERROR` rather than guessing.
     """
     items = tuple(progress or ())
-    timed_out_items = [
-        item
-        for item in items
-        if (item.last_marker or "").upper() == _IN_BAND_TIMEOUT_MARKER
-    ]
+    timed_out_items = [item for item in items if _ends_on_a_timeout(item)]
     if timed_out_items:
         # The witness must be the MOST RECENTLY TOUCHED task, not merely the
         # alphabetically first with a TIMEOUT marker (coach-proven false
@@ -1211,9 +1242,15 @@ def _in_band_timeout_evidence(
         witness = max(timed_out_items, key=lambda item: item.mtime)
         freshest_mtime = max(item.mtime for item in items)
         if witness.mtime >= freshest_mtime:
+            if (witness.last_marker or "").upper() == _IN_BAND_TIMEOUT_MARKER:
+                return (
+                    f"{witness.task_id}'s progress.log ends on a TIMEOUT "
+                    "marker — guardkit abandoned the SDK call on its own clock"
+                )
             return (
-                f"{witness.task_id}'s progress.log ends on a TIMEOUT marker — "
-                "guardkit abandoned the SDK call on its own clock"
+                f"{witness.task_id}'s progress.log ends on a COMPLETE record "
+                f"with decision={witness.decision} — guardkit stopped the task "
+                "when its own time ran out"
             )
     if isinstance(last_event, Mapping):
         raw = last_event.get("failure_category")
