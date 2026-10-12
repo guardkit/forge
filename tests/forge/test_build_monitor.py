@@ -2118,3 +2118,148 @@ class TestInBandEvidencePrecision:
         )
         assert klass == bm.TERMINAL_CLASS_IN_BAND
         assert "sdk_timeout" in evidence
+
+
+class TestAnOrderlyTaskTimeoutIsInBand:
+    """Repair 5, 12 October 2026: DC47's task ran out of time inside guardkit,
+    which ended it in an orderly way with ``COMPLETE ... decision=timeout``.
+    That record is evidence of guardkit's own clock; ``timed_out`` keeps
+    meaning forge's outer deadline only."""
+
+    @staticmethod
+    def _read(tmp_path: Path, task_id: str, lines: list[str]) -> "tuple[bm.TaskProgress, ...]":
+        _write_progress(tmp_path, task_id, lines)
+        progress = bm.read_task_progress(tmp_path)
+        assert progress is not None
+        return progress
+
+    @staticmethod
+    def _dc47_lines(decision: str) -> list[str]:
+        """The shape DC47's progress.log ended on, with the decision varied."""
+        return [
+            "[2026-10-12T00:11:20] START TASK-DC47-001: task-work implementation",
+            _snapshot_line(
+                "TASK-DC47-001",
+                elapsed=3240,
+                files_changed=0,
+                phase="task-work implementation",
+            ),
+            "[2026-10-12T03:11:37] TIMEOUT TASK-DC47-001: elapsed=3259s, "
+            "snapshots=54, last_state=phase=task-work implementation",
+            f"[2026-10-12T03:14:07] COMPLETE TASK-DC47-001: elapsed=10984s, "
+            f"decision={decision}, snapshots=54",
+        ]
+
+    def test_dc47s_saved_shape_is_an_inner_timeout(self, tmp_path: Path) -> None:
+        progress = self._read(tmp_path, "TASK-DC47-001", self._dc47_lines("timeout"))
+        assert progress[0].last_marker == "COMPLETE"
+        assert progress[0].decision == "timeout"
+
+        klass, evidence = bm.classify_terminal(
+            wedged=False,
+            timed_out=False,
+            budget_bound=False,
+            exit_code=2,
+            progress=progress,
+            last_event={"task_id": "TASK-DC47-001", "turn": 4},
+        )
+
+        assert klass == bm.TERMINAL_CLASS_IN_BAND
+        assert "TASK-DC47-001" in evidence
+        assert "decision=timeout" in evidence
+        assert "exit=2" in evidence
+        assert "no clock" not in evidence
+
+    def test_an_approved_complete_is_classified_as_before(self, tmp_path: Path) -> None:
+        progress = self._read(tmp_path, "TASK-DC47-001", self._dc47_lines("approved"))
+
+        klass, evidence = bm.classify_terminal(
+            wedged=False,
+            timed_out=False,
+            budget_bound=False,
+            exit_code=2,
+            progress=progress,
+            last_event={"task_id": "TASK-DC47-001", "turn": 4},
+        )
+
+        assert klass == bm.TERMINAL_CLASS_ERROR
+        assert "no clock, forge-side or guardkit-side" in evidence
+
+    @pytest.mark.parametrize(
+        "decision", ["max_turns_exceeded", "unrecoverable_stall", "no_timeout"]
+    )
+    def test_a_decision_that_is_not_a_timeout_is_classified_as_before(
+        self, tmp_path: Path, decision: str
+    ) -> None:
+        progress = self._read(tmp_path, "TASK-DC47-001", self._dc47_lines(decision))
+
+        klass, _ = bm.classify_terminal(
+            wedged=False,
+            timed_out=False,
+            budget_bound=False,
+            exit_code=2,
+            progress=progress,
+            last_event=None,
+        )
+
+        assert klass == bm.TERMINAL_CLASS_ERROR
+
+    def test_an_outer_deadline_still_outranks_it(self, tmp_path: Path) -> None:
+        """``timed_out`` keeps its meaning: when forge's own clock fired, that
+        is the class, whatever guardkit wrote."""
+        progress = self._read(tmp_path, "TASK-DC47-001", self._dc47_lines("timeout"))
+
+        klass, _ = bm.classify_terminal(
+            wedged=False,
+            timed_out=True,
+            budget_bound=False,
+            exit_code=-9,
+            progress=progress,
+        )
+
+        assert klass == bm.TERMINAL_CLASS_WALL_CLOCK
+
+    def test_a_stale_timeout_decision_is_outranked_by_later_activity(self) -> None:
+        stale = bm.TaskProgress(
+            task_id="TASK-A",
+            files_changed=1,
+            phase="Player",
+            markers=2,
+            decision="timeout",
+            mtime=100.0,
+            last_marker="COMPLETE",
+        )
+        later = bm.TaskProgress(
+            task_id="TASK-Z",
+            files_changed=1,
+            phase="Player",
+            markers=2,
+            decision=None,
+            mtime=900.0,
+            last_marker="START",
+        )
+
+        klass, _ = bm.classify_terminal(
+            wedged=False,
+            timed_out=False,
+            budget_bound=False,
+            exit_code=2,
+            progress=(stale, later),
+        )
+
+        assert klass == bm.TERMINAL_CLASS_ERROR
+
+    def test_a_timeout_decision_with_a_clean_exit_is_not_a_failure_class(
+        self, tmp_path: Path
+    ) -> None:
+        progress = self._read(tmp_path, "TASK-DC47-001", self._dc47_lines("timeout"))
+
+        klass, _ = bm.classify_terminal(
+            wedged=False,
+            timed_out=False,
+            budget_bound=False,
+            exit_code=0,
+            progress=progress,
+        )
+
+        assert klass == bm.TERMINAL_CLASS_ERROR

@@ -659,6 +659,80 @@ class TestWhichFilesThisRepositoryCallsItsTests:
         assert paths == DEFAULT_TEST_PATHS
 
 
+class TestAnExistingTestThatChangedIsNamed:
+    """Repair 2 part B, 12 October 2026: where a test file that was already
+    there changed, the test line names it — when an assertion was rewritten
+    rather than removed, and when only its setup changed."""
+
+    def test_a_rewritten_assertion_names_the_existing_file(
+        self, pool: Any, clone: Path, worktree: Path
+    ) -> None:
+        _write(
+            worktree / TESTS,
+            THE_TESTS.replace(
+                "assert response.status_code == 404",
+                "assert response.status_code in (404, 410)",
+            ),
+        )
+        _commit(worktree, "relax the check")
+
+        counted = _counts(pool, _config(clone))
+
+        assert counted.existing_files == (TESTS,)
+        card = merge_card_words(
+            feature_id="FEAT-39F6",
+            branch=JOURNEY_BRANCH,
+            gates=_gates(SimpleNamespace(test_changes=counted)),
+        )
+        assert (
+            "This branch removed or changed 1 assertion in tests/users/test_router.py — "
+            "worth a look before you merge."
+        ) in card
+
+    def test_a_setup_only_change_still_names_the_existing_file(
+        self, pool: Any, clone: Path, worktree: Path
+    ) -> None:
+        _write(
+            worktree / TESTS,
+            THE_TESTS.replace('"/users?email=gone@b"', '"/users?email=other@b"'),
+        )
+        _commit(worktree, "change the setup only")
+
+        counted = _counts(pool, _config(clone))
+
+        assert counted.lost_something is False
+        assert counted.existing_files == (TESTS,)
+        card = merge_card_words(
+            feature_id="FEAT-39F6",
+            branch=JOURNEY_BRANCH,
+            gates=_gates(SimpleNamespace(test_changes=counted)),
+        )
+        assert (
+            "This branch changed 1 test file and removed no tests or "
+            "assertions. That file already existed: tests/users/test_router.py."
+        ) in card
+
+    def test_a_brand_new_test_file_is_not_called_existing(
+        self, pool: Any, clone: Path, worktree: Path
+    ) -> None:
+        _write(
+            worktree / "tests" / "users" / "test_new.py",
+            "def test_new():\n    assert True\n",
+        )
+        _commit(worktree, "a new test")
+
+        counted = _counts(pool, _config(clone))
+
+        assert counted.files_changed == 1
+        assert counted.existing_files == ()
+        card = merge_card_words(
+            feature_id="FEAT-39F6",
+            branch=JOURNEY_BRANCH,
+            gates=_gates(SimpleNamespace(test_changes=counted)),
+        )
+        assert "already existed" not in card
+
+
 class TestTheWholeWayToTheCard:
     def _publish(self, pool: Any, config: ForgeConfig) -> dict[str, Any]:
         handed: list[dict[str, Any]] = []
@@ -696,7 +770,7 @@ class TestTheWholeWayToTheCard:
         )
 
         assert (
-            "This branch deleted 1 test and removed 2 assertions in "
+            "This branch deleted 1 test and removed or changed 2 assertions in "
             "tests/users/test_router.py — worth a look before you merge."
         ) in card
 

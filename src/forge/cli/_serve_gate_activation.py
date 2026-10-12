@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Mapping
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -90,6 +91,8 @@ __all__ = [
     "HOLD_SLOT",
     "GateDispatchOutcome",
     "MergeCardNotPublished",
+    "EXISTING_FILES_NAMED_ON_THE_CARD",
+    "card_line_about_files_that_already_existed",
     "card_line_about_scope",
     "card_line_about_tests",
     "make_merge_card_publisher",
@@ -538,39 +541,185 @@ def card_line_about_tests(counts: Any) -> str:
 
     ``""`` when nobody counted, which is what every card looked like before
     this ruling.
+
+    Whatever the shape, a test file that was already there before the branch
+    and that it changed is NAMED (repair 2 part B, 12 October 2026). An
+    existing test whose assertion was rewritten, or whose setup changed with
+    no assertion touched at all, has moved what the passing result was
+    measured against, and "changed 1 test file" alone would hide which.
     """
     if counts is None:
         return ""
     files = int(getattr(counts, "files_changed", 0) or 0)
     deleted = int(getattr(counts, "tests_deleted", 0) or 0)
     removed = int(getattr(counts, "assertions_removed", 0) or 0)
+    existing = tuple(
+        str(path) for path in (getattr(counts, "existing_files", ()) or ()) if str(path).strip()
+    )
     if deleted or removed:
         said: list[str] = []
         if deleted:
             said.append(f"deleted {deleted} test{'s' if deleted != 1 else ''}")
         if removed:
             said.append(
-                f"removed {removed} assertion{'s' if removed != 1 else ''}"
+                # "removed or changed": the count includes an assertion whose
+                # words changed (a rewrite), and "removed" alone would say
+                # something false about a rewritten check.
+                f"removed or changed {removed} "
+                f"assertion{'s' if removed != 1 else ''}"
             )
-        where = _names_the_files(tuple(getattr(counts, "files", ()) or ()))
-        return (
+        named = tuple(getattr(counts, "files", ()) or ())
+        where = _names_the_files(named)
+        line = (
             f"This branch {' and '.join(said)} in {where} — worth a look "
             "before you merge."
         )
+        also = tuple(path for path in existing if path not in named)
+        if also:
+            line += (
+                f" It also changed {len(also)} test "
+                f"file{'s' if len(also) != 1 else ''} that already existed: "
+                f"{_names_the_files(also)}."
+            )
+        return line
     if not getattr(counts, "read_whole", True):
         if files:
             return (
                 f"This branch changed {files} test file"
                 f"{'s' if files != 1 else ''}, and what it changed in them "
-                "could not be read here."
+                f"could not be read here.{_which_already_existed(existing, files)}"
             )
         return "What this branch changed in the tests could not be read here."
     if not files:
         return "This branch changed no test files."
     return (
         f"This branch changed {files} test file{'s' if files != 1 else ''} "
-        "and removed no tests or assertions."
+        f"and removed no tests or assertions.{_which_already_existed(existing, files)}"
     )
+
+
+def _which_already_existed(existing: "tuple[str, ...]", files: int) -> str:
+    """The sentence naming the changed test files that were already there.
+
+    Starts with a space so it can follow the test line's own sentence, and is
+    ``""`` when every changed test file is new.
+    """
+    if not existing:
+        return ""
+    names = _names_the_files(existing)
+    if len(existing) >= files:
+        if files == 1:
+            return f" That file already existed: {names}."
+        return f" All of them already existed: {names}."
+    return f" {len(existing)} of them already existed: {names}."
+
+
+#: How many files that already existed the card names. Every one is named up
+#: to this bound, because here the names are the point: a changed dependency
+#: file or a rewritten test is exactly what the person deciding needs to see,
+#: and a short cut could hide one. Jarvis does not cut a long card, it splits
+#: it into 2,900-character blocks, so the bound is only for readability: forty
+#: ordinary paths are about one such block. Past it, the card says where the
+#: complete list is, never a bare count.
+EXISTING_FILES_NAMED_ON_THE_CARD: int = 40
+
+
+def card_line_about_files_that_already_existed(report: Any) -> str:
+    """The ONE line naming the files this branch changed that were already
+    there (repair 2 part B, 12 October 2026).
+
+    In the four-worker trial both builds that counted had rewritten an
+    existing test and changed the dependency declarations, and the card
+    showed only a passing suite. That suite was run WITH those changes, so it
+    was not evidence that the original tests passed unchanged. This line says
+    so, and names the files. It is disclosure only: it never stops a merge.
+
+    ``report`` is the build's scope report (it carries
+    ``files_that_already_existed``, read from the branch's own file list).
+    Three shapes:
+
+    * files that already existed were changed — how many, which (a test file
+      marked as one, a deleted file as deleted), and what that means for any
+      passing result on the card. Every file is named, test files first, then
+      deleted files, then the rest. Only past
+      :data:`EXISTING_FILES_NAMED_ON_THE_CARD` names does the card stop, and
+      then it says exactly where the complete list is: the scope receipt the
+      pass wrote (``report.receipt_path``), or the build's merge offer record
+      when no receipt could be written;
+    * the branch could not be read — said plainly, never as "nothing";
+    * ``""`` when the branch only added files, or nobody read it at all.
+    """
+    if report is None:
+        return ""
+    if not bool(getattr(report, "read", False)):
+        return (
+            "Whether this branch changes files that already existed could not "
+            "be read here, so any passing result on this card is not evidence "
+            "that the original tests pass unchanged."
+        )
+    existing = list(getattr(report, "files_that_already_existed", ()) or ())
+    if not existing:
+        return ""
+    read: list[tuple[str, bool, bool]] = []
+    for item in existing:
+        if isinstance(item, Mapping):
+            read.append(
+                (
+                    str(item.get("path", "") or ""),
+                    bool(item.get("is_test")),
+                    bool(item.get("deleted")),
+                )
+            )
+        else:
+            read.append(
+                (
+                    str(getattr(item, "path", item) or ""),
+                    bool(getattr(item, "is_test", False)),
+                    bool(getattr(item, "deleted", False)),
+                )
+            )
+    # TEST FILES FIRST, then deleted files, then the rest. git lists files in
+    # path order, so a test file usually sorts late, and if a very long list
+    # ever has to stop, the tests and deletions must not be what is left off.
+    # The sort is stable, so each group keeps git's order.
+    read.sort(key=lambda entry: (not entry[1], not entry[2]))
+    named: list[str] = []
+    for path, is_test, deleted in read[:EXISTING_FILES_NAMED_ON_THE_CARD]:
+        notes = (["a test file"] if is_test else []) + (["deleted"] if deleted else [])
+        named.append(f"{path} ({', '.join(notes)})" if notes else path)
+    listing = ", ".join(named)
+    count = len(existing)
+    if count == 1:
+        line = (
+            f"This branch changes 1 file that already existed: {listing}. Any "
+            "passing result on this card was measured with this change, so it "
+            "is not evidence that the original tests pass unchanged."
+        )
+    else:
+        line = (
+            f"This branch changes {count} files that already existed"
+            f"{'' if count <= len(named) else f' (the first {len(named)} named here)'}"
+            f": {listing}. Any passing result on this card was measured with "
+            "these changes, so it is not evidence that the original tests pass "
+            "unchanged."
+        )
+    if not bool(getattr(report, "test_files_checked", True)):
+        line += (
+            " Which of these are test files could not be fully checked: this "
+            "repository's own test settings could not be read in time, so only "
+            "the usual test locations were used."
+        )
+    if count > len(named):
+        where = str(getattr(report, "receipt_path", "") or "").strip()
+        line += (
+            f" The complete list of all {count} is in {where}."
+            if where
+            else (
+                f" The complete list of all {count} is kept on this build's "
+                "merge offer record."
+            )
+        )
+    return line
 
 
 def card_line_about_scope(report: Any) -> str:
@@ -709,6 +858,9 @@ def merge_card_words(
     tests = card_line_about_tests(getattr(gates, "test_changes", None))
     if tests:
         sentences.append(tests)
+    already_there = card_line_about_files_that_already_existed(scope)
+    if already_there:
+        sentences.append(already_there)
     in_scope = card_line_about_scope(scope)
     if in_scope:
         sentences.append(in_scope)
@@ -920,10 +1072,18 @@ def make_merge_card_publisher(
             branch,
             resolved_feature,
         )
+        # The scope report rides on the merge offer's durable row, as it does
+        # for the routine card, so the files that already existed are on the
+        # record for every build that reaches a card (12 October 2026).
         published = await offer_service.offer(
             build_id=build_id,
             feature_id=resolved_feature,
             card_words=_words,
+            extra_details=(
+                {"scope_report": scope.to_dict()}
+                if scope is not None and hasattr(scope, "to_dict")
+                else None
+            ),
         )
         if not published:
             raise MergeCardNotPublished(

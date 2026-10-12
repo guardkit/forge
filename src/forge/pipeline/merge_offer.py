@@ -45,6 +45,7 @@ import inspect
 import json
 import logging
 import re
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1534,8 +1535,107 @@ def run_the_scope_pass(
         request_why_not=why_not,
     )
     report.compared_against = base
-    write_scope_report(build_id, report)
+    existing = list(report.files_that_already_existed)
+    if report.read and existing:
+        # Only now is it worth asking where this repository keeps its tests:
+        # the answer only marks which of these files are tests. Asking for
+        # every card would cost a second wait on the sandbox for a branch that
+        # could not be read or only added files, and a sandbox that does not
+        # answer logs an alarming sentence about the checks for no reason.
+        from forge.pipeline.merge_ready_checkpoint import (
+            files_that_already_existed,
+            parse_changed_files,
+        )
+
+        declared = _test_paths_of(repo_root_raw, repo_key, sandbox)
+        if declared is None:
+            # The list itself is already complete; only WHICH of these are
+            # tests by the repository's own settings is unknown, and the card
+            # says so rather than waiting on it.
+            report.test_files_checked = False
+        else:
+            existing = list(
+                files_that_already_existed(
+                    parse_changed_files(str(getattr(reading, "name_status", "") or "")),
+                    declared,
+                )
+            )
+            report.files_that_already_existed = existing
+        # The same list the card names, said in the log as well, so an
+        # operator reading the build's own record sees it without the card.
+        logger.info(
+            "the scope pass: %s changes %d file%s that already existed at %s: "
+            "%s — its test result was measured with these changes",
+            build_id,
+            len(existing),
+            "s" if len(existing) != 1 else "",
+            base,
+            ", ".join(item.path for item in existing),
+        )
+    written = write_scope_report(build_id, report)
+    report.receipt_path = str(written) if written is not None else None
     return report
+
+
+#: How long the scope pass waits to learn where a repository keeps its tests.
+#: The answer only marks which files that already existed are tests, so a
+#: card never waits longer than this for it (12 October 2026).
+TEST_PATHS_DEADLINE_SECONDS: float = 10.0
+
+
+def _test_paths_of(
+    repo_root: Any, repo_key: str, sandbox: Any
+) -> tuple[str, ...] | None:
+    """Where this repository's tests live, for marking test files on the card.
+
+    The same answer the repair card's test count uses: the paths the
+    repository's own declared test command names, beside the plain default,
+    read where the repository lives. ``None`` means it could not be learned —
+    an error, or no answer within :data:`TEST_PATHS_DEADLINE_SECONDS`.
+
+    WHY A DEADLINE. Reading the declaration reads a file (or asks a sandbox),
+    and a read that never returns — a stalled mount, a pipe where the file
+    should be — would otherwise hold up the merge card for good, because the
+    card's own callers wait on the scope pass with no limit. The read runs on
+    a daemon thread that is waited for only this long; a thread cannot be
+    cancelled, so a stuck one is left behind, harmless, and the card goes out.
+    """
+    from forge.cli._serve_conductor import test_paths_for
+
+    answer: list[tuple[str, ...]] = []
+    failure: list[BaseException] = []
+
+    def _read() -> None:
+        try:
+            answer.append(tuple(test_paths_for(repo_root, repo_key, sandbox=sandbox)))
+        except BaseException as exc:  # noqa: BLE001 — reported below
+            failure.append(exc)
+
+    reader = threading.Thread(
+        target=_read, name=f"scope-pass-test-paths-{repo_key}", daemon=True
+    )
+    reader.start()
+    reader.join(TEST_PATHS_DEADLINE_SECONDS)
+    if answer:
+        return answer[0]
+    if failure:
+        logger.warning(
+            "the scope pass: where %s keeps its tests could not be read "
+            "(%s: %s) — the card says which files are tests could not be "
+            "fully checked",
+            repo_key,
+            type(failure[0]).__name__,
+            failure[0],
+        )
+    else:
+        logger.warning(
+            "the scope pass: where %s keeps its tests was not read within %s "
+            "seconds — the card goes out now and says which files are tests "
+            "could not be fully checked",
+            repo_key,
+            TEST_PATHS_DEADLINE_SECONDS,
+        )
+    return None
 
 
 def _utcnow() -> datetime:
@@ -1687,7 +1787,10 @@ class MergeOfferService:
             supplied = ""
 
         def _words(branch: str, merge_branch: str | None) -> str:
-            from forge.cli._serve_gate_activation import card_line_about_scope
+            from forge.cli._serve_gate_activation import (
+                card_line_about_files_that_already_existed,
+                card_line_about_scope,
+            )
 
             # The card names the branch only when it is not the feature's own
             # (Part M, rule 55): a feature build's card reads exactly as before.
@@ -1719,6 +1822,12 @@ class MergeOfferService:
             if supplied:
                 lines.append(supplied)
             lines.extend(line for line in checked.lines if line)
+            # FILES THAT ALREADY EXISTED (repair 2 part B, 12 October 2026),
+            # straight after what was checked, because it says what that
+            # result was measured with.
+            already_there = card_line_about_files_that_already_existed(scope)
+            if already_there:
+                lines.append(already_there)
             about_the_check = card_line_about_the_after_deploy_check(no_check)
             if about_the_check:
                 lines.append(about_the_check)
