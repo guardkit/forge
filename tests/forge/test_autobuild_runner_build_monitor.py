@@ -1441,6 +1441,60 @@ class TestTerminalClass:
             bm.TERMINAL_CLASS_IN_BAND
         )
 
+    @pytest.mark.asyncio
+    async def test_an_orderly_task_timeout_reaches_the_failure_manifest(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """DC47, 12 October 2026 (repair 5).
+
+        guardkit's overall task time ran out and it ended the task in an
+        orderly way: the progress.log's last record is ``COMPLETE ...
+        decision=timeout`` rather than a ``TIMEOUT`` marker, and the last
+        events.jsonl record carries no failure category. The manifest called
+        that an ordinary error and said no clock was known to have fired. It
+        now names guardkit's own timeout, and ``timed_out`` still means only
+        forge's outer deadline.
+        """
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        _seed_worktree(
+            worktree, statuses={"TASK-BMW-003": "in_progress"}, tasks_completed=0
+        )
+        _append_progress_line(
+            worktree,
+            "TASK-BMW-003",
+            "[2026-10-12T03:14:07] COMPLETE TASK-BMW-003: elapsed=10984s, "
+            "decision=timeout, snapshots=61",
+        )
+        events = worktree / ".guardkit" / "autobuild" / FEATURE_ID / "events.jsonl"
+        events.parent.mkdir(parents=True, exist_ok=True)
+        events.write_text(
+            json.dumps({"task_id": "TASK-BMW-003", "turn": 4}) + "\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv(bm.BUILD_MONITOR_ENABLED_ENV, "0")
+        proc = _LiveFakeProc([])
+
+        async def _exit_nonzero_later() -> None:
+            await asyncio.sleep(0.05)
+            proc.finish(2)
+
+        finisher = asyncio.ensure_future(_exit_nonzero_later())
+        result = await _run_node(
+            _launch_state(), proc=proc, worktree=worktree, repo=repo
+        )
+        await finisher
+
+        snap = result["async_tasks"][FEATURE_ID]
+        assert snap["terminal_class"] == bm.TERMINAL_CLASS_IN_BAND
+        manifest = _read_manifest(tmp_path)
+        assert manifest["terminal_class"] == bm.TERMINAL_CLASS_IN_BAND
+        assert "TASK-BMW-003" in manifest["terminal_class_evidence"]
+        assert "decision=timeout" in manifest["terminal_class_evidence"]
+        assert manifest["timed_out"] is False
+
 
 class TestOrdinaryFailuresAreBYTE_IDENTICAL:
     """THE CONTROL. ``error`` is never written — its absence IS its value.
