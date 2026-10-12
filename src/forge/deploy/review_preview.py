@@ -1586,6 +1586,11 @@ class ReviewPreviewService:
             candidate_sha=req.candidate_sha,
             candidate_tree=req.candidate_tree,
             preview_tree=tree,
+            preview_base_sha=(
+                req.preview_base_sha
+                if _SHA.match(str(req.preview_base_sha or ""))
+                else None
+            ),
             run_id=run_id,
             created_at=now,
             app_expires_at=now + timedelta(hours=hours),

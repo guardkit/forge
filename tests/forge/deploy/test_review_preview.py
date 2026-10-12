@@ -417,6 +417,7 @@ async def test_a_prepared_preview_is_ready_with_its_links_and_evidence(world: Wo
     # The join is onto the target branch as fetched from the remote (what the
     # merge press joins onto), never the clone's local main; the slot is held.
     assert world.venue.named("lay_out") == [("pv000000000001", SHA_FETCHED, SHA_CAND)]
+    assert evidence.preview_base_sha == SHA_FETCHED
     lease = world.lease("pv000000000001")
     assert (lease.state, lease.slot, lease.port) == ("ready", 0, 8950)
     assert lease.compose_project == "notes-pv0"

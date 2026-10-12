@@ -2255,6 +2255,8 @@ class MergeOfferService:
             if review_evidence is not None:
                 details["review_evidence"] = review_evidence.model_dump(mode="json")
                 details["preview_tree"] = review_evidence.preview_tree
+                # Also on the record itself (nats-core's optional field);
+                # here beside preview_tree for the press and the receipts.
                 details["preview_base_sha"] = preview_base_sha
         now = self._clock()
         self._pool.record_stage(
