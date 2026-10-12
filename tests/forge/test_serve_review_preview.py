@@ -46,7 +46,7 @@ def _no_service_left_behind(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(serve_mod, "review_preview_service", None)
 
 
-def _config(*, merge_on: bool) -> ForgeConfig:
+def _config(*, merge_on: bool, preview_on: bool = True) -> ForgeConfig:
     raw: dict[str, Any] = {
         "pipeline": {
             "build_queue_subject": "pipeline.build-queued.team-a",
@@ -56,6 +56,8 @@ def _config(*, merge_on: bool) -> ForgeConfig:
     }
     if merge_on:
         raw["merge_executor"] = {"enabled": True}
+    if preview_on:
+        raw["review_preview"] = {"enabled": True}
     return ForgeConfig.model_validate(raw)
 
 
@@ -140,6 +142,7 @@ def _drive_boot(
     merge_on: bool,
     preview: Any,
     compose: bool = True,
+    preview_on: bool = True,
 ) -> dict[str, Any]:
     """Run the production dispatch-chain composition once; say what was built."""
     seen: dict[str, Any] = {"offer": [], "consumer": []}
@@ -178,12 +181,38 @@ def _drive_boot(
         deps.return_value = MagicMock()
         publisher.return_value = (MagicMock(), MagicMock())
         compose = serve_mod.bind_production_dispatch_chain(
-            forge_config=_config(merge_on=merge_on),
+            forge_config=_config(merge_on=merge_on, preview_on=preview_on),
             sqlite_pool=pool,
             db_path=tmp_path / "forge.db",
         )
         asyncio.run(compose(_FakeNats()))
     return seen
+
+
+class TestTheSwitchIsOffByDefault:
+    def test_the_setting_defaults_to_off(self) -> None:
+        assert _config(merge_on=True, preview_on=False).review_preview.enabled is False
+
+    def test_off_builds_no_service_and_the_offer_and_press_are_today_s(
+        self, monkeypatch: pytest.MonkeyPatch, pool, tmp_path: Path
+    ) -> None:
+        def _never(**_k: Any) -> Any:
+            raise AssertionError("the preview service was composed with the switch off")
+
+        monkeypatch.setattr(serve_mod, "compose_review_preview", _never)
+        seen = _drive_boot(
+            pool, tmp_path, merge_on=True, preview=None, compose=False, preview_on=False
+        )
+
+        assert len(seen["offer"]) == 1
+        assert "review_preview" not in seen["offer"][0]
+        assert seen["consumer"][0].review_preview is None
+        assert serve_mod.review_preview_service is None
+
+    def test_on_builds_the_service(self, pool, tmp_path: Path) -> None:
+        preview = StandInReviewPreview()
+        seen = _drive_boot(pool, tmp_path, merge_on=True, preview=preview)
+        assert seen["offer"][0]["review_preview"] is preview
 
 
 class TestTheServiceReachesTheCardAndThePress:
@@ -305,8 +334,19 @@ class TestTheServeLoop:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         events: list[str] = []
+        names: list[str] = []
+        real_create_task = asyncio.create_task
+
+        def _named(coro: Any, *, name: str | None = None) -> Any:
+            names.append(str(name))
+            return real_create_task(coro, name=name)
+
+        monkeypatch.setattr(serve_mod.asyncio, "create_task", _named)
         _run_serve_once(monkeypatch, None, events)
+
         assert "daemon_started" in events
+        assert "forge-serve-review-preview-sweep" not in names
+        assert "forge-serve-daemon" in names
 
 
 class TestTheSweep:

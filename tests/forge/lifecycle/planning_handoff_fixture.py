@@ -45,7 +45,7 @@ def make_planning_ledger(
         CREATE TABLE work_queue(id INTEGER PRIMARY KEY, correlation_id TEXT);
         """
     )
-    if version == 18:
+    if version >= 18:
         connection.execute(
             "CREATE TABLE feature_routing_seeds("
             "feature_routing_id TEXT PRIMARY KEY, state TEXT NOT NULL)"

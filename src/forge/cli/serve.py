@@ -120,7 +120,8 @@ feature_routing_gate: Any | None = None
 feature_routing_required: bool = False
 
 # The review-preview service (web-readiness W7), set by the dispatch chain's
-# composition when the merge press is on and composing it succeeded. The
+# composition when both the merge press and ``review_preview.enabled`` are on
+# and composing it succeeded. The
 # serve loop reconciles it at start-up and sweeps it while running; ``None``
 # leaves both steps out and every merge card exactly as it was.
 review_preview_service: Any | None = None
@@ -712,7 +713,13 @@ def bind_production_dispatch_chain(
         review_preview: Any = None
         try:
             _merge_cfg = getattr(forge_config, "merge_executor", None)
-            if _merge_cfg is not None and _merge_cfg.enabled:
+            _preview_cfg = getattr(forge_config, "review_preview", None)
+            if (
+                _merge_cfg is not None
+                and _merge_cfg.enabled
+                and _preview_cfg is not None
+                and _preview_cfg.enabled
+            ):
                 review_preview = compose_review_preview(
                     forge_config=forge_config,
                     sqlite_pool=sqlite_pool,

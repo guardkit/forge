@@ -1734,10 +1734,23 @@ class ReviewPreviewConfig(BaseModel):
     **Deploy-order law** (as :class:`MergeExecutorConfig`): ``extra="forbid"``,
     so a ``review_preview:`` section written into a deployed ``forge.yaml``
     before the image that defines it is running refuses the whole config.
+
+    ``enabled`` is the coordinator-wide switch. Off (the default), the
+    coordinator builds no preview service at all: no project's profile is
+    read for a preview, nothing is reconciled or swept, and every merge card
+    is exactly today's.
     """
 
     model_config = ConfigDict(extra="forbid")
 
+    enabled: bool = Field(
+        default=False,
+        description=(
+            "True = projects whose deploy profile switches a preview on get "
+            "one on their merge card. False (default) = no preview service "
+            "is built and every merge card is today's."
+        ),
+    )
     evidence_root: str | None = Field(
         default=None,
         description=(
