@@ -1082,22 +1082,36 @@ class ReviewPreviewService:
 
     def _preview_of(
         self, project: str
-    ) -> "tuple[DeployProfile | None, DeployPreview | None]":
-        try:
-            profile = self._profile_reader(project)
-        except Exception as exc:  # noqa: BLE001 — a project's file is input
-            logger.warning(
-                "review preview: %s's profile could not be read (%s)", project, exc
-            )
-            return None, None
-        preview = getattr(profile, "preview", None) if profile is not None else None
-        if preview is None or not preview.enabled or not preview.slots:
-            return profile, None
-        return profile, preview
+    ) -> "tuple[DeployProfile | None, DeployPreview | None, str | None]":
+        """``(profile, preview, None)``, or ``(None, None, why)`` when unreadable.
+
+        A profile that cannot be read is asked for once more; a second failure
+        is reported, never taken for "no preview" — with previews switched on,
+        an unreadable profile must not become an ordinary approvable card.
+        A project with no profile at all reads as ``(None, None, None)``.
+        """
+        why = ""
+        for _attempt in range(2):
+            try:
+                profile = self._profile_reader(project)
+            except Exception as exc:  # noqa: BLE001 — a project's file is input
+                why = f"{type(exc).__name__}: {exc}"
+                logger.warning(
+                    "review preview: %s's profile could not be read (%s)", project, why
+                )
+                continue
+            preview = getattr(profile, "preview", None) if profile is not None else None
+            if preview is None or not preview.enabled or not preview.slots:
+                return profile, None, None
+            return profile, preview, None
+        return None, None, why
 
     def enabled_for(self, project: str) -> bool:
-        """True only when the project's deploy profile has an enabled ``preview``."""
-        return self._preview_of(project)[1] is not None
+        """True when the project's deploy profile has an enabled ``preview`` —
+        and when the profile cannot be read, so that preparation fails closed
+        with the reason and the card offers no Approve."""
+        _profile, preview, unreadable = self._preview_of(project)
+        return preview is not None or unreadable is not None
 
     # -- preparing ------------------------------------------------------------
 
@@ -1121,7 +1135,11 @@ class ReviewPreviewService:
     async def _prepare(
         self, req: PreviewRequest, *, now: datetime, run_id: str
     ) -> "ReviewEvidence":
-        profile, preview = self._preview_of(req.project)
+        # Off the event loop: the profile is read where the project lives,
+        # which for a sandbox is a sidecar call of up to 30 seconds.
+        profile, preview, unreadable = await asyncio.to_thread(
+            self._preview_of, req.project
+        )
 
         def early(reason: str) -> "ReviewEvidence":
             return self._record(
@@ -1134,6 +1152,8 @@ class ReviewPreviewService:
                 failure_reason=reason,
             )
 
+        if unreadable is not None:
+            return early(f"could not read the deploy profile ({unreadable})")
         if profile is None or preview is None:
             return early("the project's deploy profile has no preview switched on")
         if self._evidence_root is None or not self._evidence_base_url:
@@ -1814,15 +1834,17 @@ def _profile_reader_for(config: Any) -> Callable[[str], "DeployProfile | None"]:
     For a repository with a sandbox: the sandbox sidecar's
     ``/git/read-file-at-commit`` at its clone's committed ``HEAD`` (the same
     read the merge press makes). Otherwise the copy here, at its committed
-    ``HEAD``. Synchronous, because ``enabled_for`` is.
+    ``HEAD``. Synchronous, because ``enabled_for`` is. ``None`` when the
+    project has no profile; RAISES when it cannot be read (a sidecar that
+    answers anything but 200, a read refused, a file that cannot be used), so
+    the service can retry once and then fail the preview closed.
     """
 
     def read(project: str) -> "DeployProfile | None":
         from forge.config.sandboxes import sandbox_for
-        from forge.deploy.candidate_tree import FileAtCommit
+        from forge.deploy.candidate_tree import FileAtCommit, read_file_at_commit_sync
         from forge.pipeline.merge_executor import (
             DEPLOY_PROFILE_PATH,
-            _the_profile_at,
             _the_profile_out_of,
         )
         from forge.planning.sidecar_git_runner import _urllib_post
@@ -1832,7 +1854,7 @@ def _profile_reader_for(config: Any) -> Callable[[str], "DeployProfile | None"]:
             root = config.planning.target_repo_paths.get(project)
             if not root:
                 return None
-            profile, why = _the_profile_at(root, None)
+            answer = read_file_at_commit_sync(Path(root), "HEAD", DEPLOY_PROFILE_PATH)
         else:
             status, decoded = _urllib_post(
                 f"{str(sandbox.sidecar_url).rstrip('/')}/git/read-file-at-commit",
@@ -1840,16 +1862,17 @@ def _profile_reader_for(config: Any) -> Callable[[str], "DeployProfile | None"]:
                 30.0,
             )
             if status != 200:
-                why = f"the sandbox sidecar answered {status}"
-                profile = None
-            else:
-                profile, why = _the_profile_out_of(
-                    FileAtCommit.from_wire(decoded), "HEAD"
-                )
+                raise OSError(f"the sandbox sidecar answered {status}")
+            answer = FileAtCommit.from_wire(decoded)
+        # Unreadable is an error (the caller retries once and then fails the
+        # preview closed); a profile the project simply does not have is None.
+        if answer.refusal:
+            raise OSError(str(answer.refusal))
+        if not answer.found:
+            return None
+        profile, why = _the_profile_out_of(answer, "HEAD")
         if profile is None:
-            logger.info(
-                "review preview: %s's deploy profile was not read (%s)", project, why
-            )
+            raise ValueError(why or "the deploy profile could not be used")
         return profile
 
     return read

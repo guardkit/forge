@@ -298,12 +298,99 @@ def test_enabled_only_for_a_profile_with_an_enabled_preview(world: World) -> Non
     assert world.service.enabled_for(PROJECT) is False
 
 
-def test_a_profile_that_cannot_be_read_is_not_enabled(world: World) -> None:
+def test_a_profile_that_cannot_be_read_fails_closed(world: World) -> None:
+    """Unreadable twice is not "no preview": the card must not be approvable."""
+    asked: list[str] = []
+
     def broken(project: str):
+        asked.append(project)
         raise OSError("sidecar down")
 
     world.service._profile_reader = broken
-    assert world.service.enabled_for(PROJECT) is False
+    assert world.service.enabled_for(PROJECT) is True
+    assert asked == [PROJECT, PROJECT]  # asked once more before giving up
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_profile_is_a_failed_preview_without_approve(
+    world: World,
+) -> None:
+    def broken(project: str):
+        raise OSError("the sandbox sidecar answered 502")
+
+    world.service._profile_reader = broken
+    evidence = await world.service.prepare(_request())
+    assert evidence.state == "failed"
+    assert evidence.failure_reason == (
+        "could not read the deploy profile (OSError: the sandbox sidecar answered 502)"
+    )
+    assert world.venue.calls == [] and world.dispatch.calls == []
+    assert world.service.approval_refusal(
+        evidence.model_dump(mode="json"), now=START
+    ) is not None
+
+
+def test_one_failed_read_is_asked_again(world: World) -> None:
+    answers = iter([OSError("blip"), world.profile])
+
+    def flaky(project: str):
+        answer = next(answers)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    world.service._profile_reader = flaky
+    assert world.service.enabled_for(PROJECT) is True
+
+
+def test_the_production_reader_raises_when_the_sidecar_does_not_answer_200(
+    monkeypatch,
+) -> None:
+    from forge.config.models import ForgeConfig
+    from forge.deploy.review_preview import _profile_reader_for
+
+    config = ForgeConfig.model_validate(
+        {
+            "permissions": {"filesystem": {"allowlist": ["/tmp"]}},
+            "planning": {
+                "target_repo_paths": {PROJECT: "/clone"},
+                "sandboxes": {
+                    PROJECT: {
+                        "name": "notes-sbx",
+                        "sidecar_url": "http://127.0.0.1:8225",
+                        "runner_url": "http://127.0.0.1:8224",
+                    }
+                },
+            },
+        }
+    )
+    monkeypatch.setattr(
+        "forge.planning.sidecar_git_runner._urllib_post",
+        lambda url, body, timeout: (502, {"error": "bad gateway"}),
+    )
+    with pytest.raises(OSError, match="answered 502"):
+        _profile_reader_for(config)(PROJECT)
+
+
+def test_the_production_reader_says_none_for_a_project_without_a_profile(
+    tmp_path: Path,
+) -> None:
+    from forge.config.models import ForgeConfig
+    from forge.deploy.review_preview import _profile_reader_for
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    (repo / "README.md").write_text("x\n")
+    _git(repo, "add", "README.md")
+    _git(repo, "commit", "-q", "-m", "first")
+    config = ForgeConfig.model_validate(
+        {
+            "permissions": {"filesystem": {"allowlist": ["/tmp"]}},
+            "planning": {"target_repo_paths": {PROJECT: str(repo)}},
+        }
+    )
+    assert _profile_reader_for(config)(PROJECT) is None
 
 
 # ---------------------------------------------------------------------------
