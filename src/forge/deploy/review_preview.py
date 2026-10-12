@@ -93,6 +93,7 @@ import sqlite3
 import stat
 import subprocess
 import tarfile
+import time
 import urllib.error
 import urllib.request
 import uuid
@@ -164,6 +165,8 @@ PREVIEW_ENV_KEYS: frozenset[str] = frozenset(
 #: name, a folder name and a label value, so it is held to one plain shape.
 _LEASE_ID = re.compile(r"^pv[0-9a-f]{12}$")
 _SHA = re.compile(r"^[0-9a-f]{40}$")
+#: A compose project name, as compose itself allows one.
+_COMPOSE_PROJECT = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
 _SAFE_SEGMENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 #: A lease holds its slot in these states.
@@ -180,11 +183,18 @@ _REFUSED_STATUSES: frozenset[int] = frozenset({403, 410})
 #: two copies of it; 64 MiB keeps that well clear of its memory guard.
 EVIDENCE_TRANSFER_CAP_BYTES: int = 64 * 1024 * 1024
 
+#: The longest evidence answer the coordinator reads off the wire: the base64
+#: of the cap and a margin for the rest of the JSON.
+_EVIDENCE_ANSWER_MAX_BYTES: int = (EVIDENCE_TRANSFER_CAP_BYTES // 3 + 1) * 4 + 64 * 1024
+
 #: The most files one preview's evidence may hold.
 EVIDENCE_MEMBER_CAP: int = 2000
 
 #: Said after a reason whose teardown has not been confirmed yet.
 _NOT_CONFIRMED: str = " (teardown not confirmed yet)"
+
+#: How long to wait before reading an unreadable profile a second time.
+_PROFILE_RETRY_SECONDS: float = 3.0
 
 #: How often a preparation waiting for a free slot looks again.
 _SLOT_POLL_SECONDS: float = 15.0
@@ -673,9 +683,11 @@ def pack_preview_evidence(
     folder between the repository and it (``.forge-candidates``, the
     preview's tree), must be a real folder, not a symbolic link — checked
     with ``lstat``, so a project cannot point ``.factory-evidence`` at
-    anything else in its sandbox. Inside, only regular files and folders are
-    packed: a link is left out rather than followed, and a linked folder is
-    never walked into.
+    anything else in its sandbox. The walk then starts from a descriptor
+    opened with ``O_NOFOLLOW`` (``os.fwalk``), so a folder swapped for a link
+    after those checks is refused, not read. Inside, only regular files and
+    folders are packed, each file opened with ``O_NOFOLLOW``: a link is left
+    out rather than followed, and a linked folder is never walked into.
     """
     folder = preview_tree_path(repo_root, lease_id) / EVIDENCE_FOLDER
     here = Path(repo_root)
@@ -694,41 +706,63 @@ def pack_preview_evidence(
             }
         if not stat.S_ISDIR(mode):
             return {"refusal": f"the preview left no evidence folder ({folder})"}
+    # The walk starts from a descriptor opened WITHOUT following a link, so a
+    # folder swapped for a link after the checks above is refused rather than
+    # read, and everything below it is opened relative to real folders only.
+    try:
+        top = os.open(folder, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as exc:
+        return {
+            "refusal": (
+                "the preview's evidence folder could not be opened without "
+                f"following a link ({exc.strerror})"
+            )
+        }
     total = 0
     buffer = io.BytesIO()
     count = 0
-    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
-        for here, folders, files in os.walk(folder, followlinks=False):
-            folders.sort()
-            base = Path(here)
-            for name in list(folders):
-                path = base / name
-                if path.is_symlink():
-                    folders.remove(name)
-                    continue
-                archive.add(
-                    str(path), arcname=path.relative_to(folder).as_posix(),
-                    recursive=False,
-                )
-            for name in sorted(files):
-                path = base / name
-                mode = path.lstat().st_mode
-                if not stat.S_ISREG(mode):
-                    continue
-                total += path.lstat().st_size
-                count += 1
-                if total > cap or count > EVIDENCE_MEMBER_CAP:
-                    return {
-                        "refusal": (
-                            f"the preview's evidence is larger than {cap // (1024 * 1024)} "
-                            f"MiB or {EVIDENCE_MEMBER_CAP} files, which is more than "
-                            "one preview may send"
-                        )
-                    }
-                archive.add(
-                    str(path), arcname=path.relative_to(folder).as_posix(),
-                    recursive=False,
-                )
+    try:
+        with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+            for here, folders, files, here_fd in os.fwalk(
+                ".", dir_fd=top, follow_symlinks=False
+            ):
+                for name in sorted(folders):
+                    st = os.stat(name, dir_fd=here_fd, follow_symlinks=False)
+                    if not stat.S_ISDIR(st.st_mode):
+                        folders.remove(name)  # a link: never walked into
+                        continue
+                    info = tarfile.TarInfo(os.path.normpath(os.path.join(here, name)))
+                    info.type = tarfile.DIRTYPE
+                    info.mode = 0o755
+                    info.mtime = int(st.st_mtime)
+                    archive.addfile(info)
+                for name in sorted(files):
+                    try:
+                        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=here_fd)
+                    except OSError:
+                        continue  # a link, or gone: left out
+                    with os.fdopen(fd, "rb") as handle:
+                        st = os.fstat(handle.fileno())
+                        if not stat.S_ISREG(st.st_mode):
+                            continue
+                        total += st.st_size
+                        count += 1
+                        if total > cap or count > EVIDENCE_MEMBER_CAP:
+                            return {
+                                "refusal": (
+                                    f"the preview's evidence is larger than "
+                                    f"{cap // (1024 * 1024)} MiB or "
+                                    f"{EVIDENCE_MEMBER_CAP} files, which is more "
+                                    "than one preview may send"
+                                )
+                            }
+                        info = tarfile.TarInfo(os.path.normpath(os.path.join(here, name)))
+                        info.size = st.st_size
+                        info.mode = 0o644
+                        info.mtime = int(st.st_mtime)
+                        archive.addfile(info, handle)
+    finally:
+        os.close(top)
     packed = buffer.getvalue()
     buffer.close()
     if len(packed) > cap:
@@ -755,12 +789,17 @@ def _engine_lines(run: CommandRunner, argv: Sequence[str]) -> list[str] | None:
     return [line.strip() for line in out.splitlines() if line.strip()]
 
 
-def list_preview_leases(run: CommandRunner = _run_command) -> dict[str, Any]:
+def list_preview_leases(
+    run: CommandRunner = _run_command, *, compose_project: str | None = None
+) -> dict[str, Any]:
     """The lease ids of everything carrying the label, and of running containers.
 
     ``leases``: every container (running or not), network, volume and image
     carrying the label. ``running``: the leases with at least one RUNNING
-    container — what preparation checks after the preview is started.
+    container — what preparation checks after the preview is started. With
+    ``compose_project``, also ``compose_containers``: every container of that
+    compose project, by name, with the lease label it carries (``""`` for
+    none), so preparation can require every one of them to be labelled.
     """
     engine = shutil.which("docker") or "docker"
     found: set[str] = set()
@@ -783,10 +822,30 @@ def list_preview_leases(run: CommandRunner = _run_command) -> dict[str, Any]:
     )
     if running is None:
         return {"refusal": "the container engine could not be asked about previews"}
-    return {
+    answer: dict[str, Any] = {
         "leases": sorted(found),
         "running": sorted({line for line in running if _LEASE_ID.match(line)}),
     }
+    if compose_project is not None:
+        members = _engine_lines(
+            run,
+            [
+                engine,
+                "ps",
+                "--all",
+                "--filter",
+                f"label=com.docker.compose.project={compose_project}",
+                "--format",
+                '{{.Names}} {{.Label "' + LEASE_LABEL + '"}}',
+            ],
+        )
+        if members is None:
+            return {"refusal": "the container engine could not be asked about previews"}
+        answer["compose_containers"] = [
+            {"name": parts[0], "lease": parts[1] if len(parts) > 1 else ""}
+            for parts in (line.split() for line in members)
+        ]
+    return answer
 
 
 def _images_other_containers_use(
@@ -890,7 +949,15 @@ def serve_preview_operation(
     """
     try:
         if route == PREVIEW_PROJECTS_ROUTE:
-            answer = list_preview_leases(run)
+            compose_project = payload.get("compose_project")
+            if compose_project is not None and (
+                not isinstance(compose_project, str)
+                or not _COMPOSE_PROJECT.match(compose_project)
+            ):
+                return 400, {
+                    "error": f"'compose_project' must be a compose project name; got {compose_project!r}"
+                }
+            answer = list_preview_leases(run, compose_project=compose_project)
             return (200 if "leases" in answer else 503), answer
         lease_id = payload.get("lease_id")
         if not isinstance(lease_id, str) or not _LEASE_ID.match(lease_id):
@@ -972,7 +1039,12 @@ class SidecarPreviewVenue:
         self._layout_timeout_s = layout_timeout_s
 
     async def _ask(
-        self, route: str, body: dict[str, Any], *, timeout: float | None = None
+        self,
+        route: str,
+        body: dict[str, Any],
+        *,
+        timeout: float | None = None,
+        max_bytes: int | None = None,
     ) -> tuple[dict[str, Any] | None, str | None]:
         url = f"{self._base_url}{route}"
         try:
@@ -981,6 +1053,7 @@ class SidecarPreviewVenue:
                 url,
                 {"repo": self._repo, **body},
                 timeout or self._timeout_s,
+                **({"max_bytes": max_bytes} if max_bytes is not None else {}),
             )
         except Exception as exc:  # noqa: BLE001 — transport boundary
             return None, (
@@ -1033,6 +1106,9 @@ class SidecarPreviewVenue:
             PREVIEW_EVIDENCE_ROUTE,
             {"lease_id": lease_id},
             timeout=self._layout_timeout_s,
+            # The base64 of the most a preview may send, and room for the rest
+            # of the JSON: anything longer is refused before it is parsed.
+            max_bytes=_EVIDENCE_ANSWER_MAX_BYTES,
         )
         if answer is None:
             return None, why
@@ -1061,16 +1137,30 @@ class SidecarPreviewVenue:
             return None
         return {str(item) for item in answer["leases"]}
 
-    async def running_leases(self) -> set[str] | None:
-        """The leases with at least one running container, or None if unknown."""
-        answer, why = await self._ask(PREVIEW_PROJECTS_ROUTE, {})
-        if answer is None or not isinstance(answer.get("running"), list):
+    async def preview_containers(
+        self, compose_project: str
+    ) -> tuple[set[str], list[tuple[str, str]]] | None:
+        """``(leases with a running container, [(container, its lease label)]
+        for every container of ``compose_project``)``, or None if unknown."""
+        answer, why = await self._ask(
+            PREVIEW_PROJECTS_ROUTE, {"compose_project": compose_project}
+        )
+        if (
+            answer is None
+            or not isinstance(answer.get("running"), list)
+            or not isinstance(answer.get("compose_containers"), list)
+        ):
             logger.warning(
-                "review preview: running previews could not be listed: %s",
+                "review preview: the preview's containers could not be listed: %s",
                 why or answer,
             )
             return None
-        return {str(item) for item in answer["running"]}
+        members = [
+            (str(item.get("name") or ""), str(item.get("lease") or ""))
+            for item in answer["compose_containers"]
+            if isinstance(item, dict)
+        ]
+        return {str(item) for item in answer["running"]}, members
 
     async def remove_project(self, lease_id: str) -> bool:
         answer, why = await self._ask(
@@ -1248,6 +1338,8 @@ class ReviewPreviewService:
         lease_id_factory: Callable[[], str] = _new_lease_id,
         run_id_factory: Callable[[], str] = _new_run_id,
         slot_poll_seconds: float = _SLOT_POLL_SECONDS,
+        profile_retry_seconds: float = _PROFILE_RETRY_SECONDS,
+        blocking_sleep: Callable[[float], Any] = time.sleep,
     ) -> None:
         self._store = store
         self._profile_reader = profile_reader
@@ -1264,6 +1356,8 @@ class ReviewPreviewService:
         self._lease_id_factory = lease_id_factory
         self._run_id_factory = run_id_factory
         self._slot_poll_seconds = slot_poll_seconds
+        self._profile_retry_seconds = profile_retry_seconds
+        self._blocking_sleep = blocking_sleep
 
     # -- the switch ---------------------------------------------------------
 
@@ -1278,7 +1372,11 @@ class ReviewPreviewService:
         A project with no profile at all reads as ``(None, None, None)``.
         """
         why = ""
-        for _attempt in range(2):
+        for attempt in range(2):
+            if attempt:
+                # A short pause, so one blip does not withhold Approve. This
+                # runs off the event loop (both callers ask from a thread).
+                self._blocking_sleep(self._profile_retry_seconds)
             try:
                 profile = self._profile_reader(project)
             except Exception as exc:  # noqa: BLE001 — a project's file is input
@@ -1506,10 +1604,23 @@ class ReviewPreviewService:
         # the start-up reconcile find a preview ONLY by that label, so a
         # project that did not apply it would leave a preview nothing could
         # find, while its teardown read as "confirmed".
-        running = await venue.running_leases()
-        if running is None:
+        # EVERY container of the preview's compose project must carry it: one
+        # left unlabelled would outlive the teardown unseen.
+        seen = await venue.preview_containers(overlay["COMPOSE_PROJECT_NAME"])
+        if seen is None:
             return await self._fail(
                 context, "the preview's containers could not be listed"
+            )
+        running, members = seen
+        unlabelled = [name for name, label in members if label != lease_id]
+        if unlabelled:
+            return await self._fail(
+                context,
+                "the project did not label its preview resources: "
+                + ", ".join(unlabelled[:5])
+                + (f" and {len(unlabelled) - 5} more" if len(unlabelled) > 5 else "")
+                + f" carr{'y' if len(unlabelled) > 1 else 'ies'} no "
+                f"{LEASE_LABEL}={lease_id}",
             )
         if lease_id not in running:
             return await self._fail(

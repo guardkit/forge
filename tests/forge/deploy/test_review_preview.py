@@ -148,8 +148,10 @@ class FakeVenue:
         self.evidence: tuple[bytes | None, str | None] = (_archive(EVIDENCE_FILES), None)
         self.running: set[str] | None = set()
         self.remove_ok = True
-        # Whether the started preview's containers carry the lease's label.
+        # Whether the started preview's containers carry the lease's label,
+        # and any more of its compose project's containers that do not.
         self.labelled = True
+        self.unlabelled_members: list[str] = []
 
     async def lay_out(self, lease_id: str, *, onto: str, candidate: str) -> PreviewTree:
         self.calls.append(("lay_out", (lease_id, onto, candidate)))
@@ -181,11 +183,15 @@ class FakeVenue:
         self.calls.append(("remove_project", lease_id))
         return self.remove_ok
 
-    async def running_leases(self) -> set[str] | None:
-        self.calls.append(("running_leases", None))
-        if not self.labelled:
-            return set()
-        return {args[0] for args in self.named("lay_out")}
+    async def preview_containers(
+        self, compose_project: str
+    ) -> tuple[set[str], list[tuple[str, str]]] | None:
+        self.calls.append(("preview_containers", compose_project))
+        lease = self.named("lay_out")[-1][0]
+        label = lease if self.labelled else ""
+        members = [(f"{compose_project}-app-1", label)]
+        members += [(name, "") for name in self.unlabelled_members]
+        return ({lease} if self.labelled else set()), members
 
     def named(self, op: str) -> list[Any]:
         return [arg for name, arg in self.calls if name == op]
@@ -258,6 +264,7 @@ def connection(tmp_path: Path) -> sqlite3.Connection:
 class World:
     def __init__(self, tmp_path: Path, connection: sqlite3.Connection) -> None:
         self.clock = FakeClock()
+        self.blocking_sleeps: list[float] = []
         self.venue = FakeVenue()
         self.dispatch = FakeDispatch()
         self.profile = _profile()
@@ -278,6 +285,7 @@ class World:
             token_factory=lambda: "the-right-token",
             lease_id_factory=lambda: next(self.leases),
             run_id_factory=lambda: next(self.runs),
+            blocking_sleep=self.blocking_sleeps.append,
         )
 
     def lease(self, lease_id: str) -> PreviewLease:
@@ -317,6 +325,7 @@ def test_a_profile_that_cannot_be_read_fails_closed(world: World) -> None:
     world.service._profile_reader = broken
     assert world.service.enabled_for(PROJECT) is True
     assert asked == [PROJECT, PROJECT]  # asked once more before giving up
+    assert world.blocking_sleeps == [3.0]  # after a short pause
 
 
 @pytest.mark.asyncio
@@ -828,6 +837,30 @@ def test_a_preview_tree_reached_through_a_link_is_refused(tmp_path: Path) -> Non
     assert "symbolic link" in packed["refusal"]
 
 
+def test_a_folder_swapped_for_a_link_after_the_checks_is_refused(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The race: the lstat checks pass, then the folder is a link when opened."""
+    clone = tmp_path / "clone"
+    folder = _evidence_folder(clone)
+    folder.parent.mkdir(parents=True)
+    secrets_dir = tmp_path / "sandbox-secrets"
+    secrets_dir.mkdir()
+    (secrets_dir / "id_rsa").write_text("PRIVATE")
+    folder.symlink_to(secrets_dir)
+    real_lstat = Path.lstat
+    # The checks see what was there a moment earlier: a real folder.
+    monkeypatch.setattr(
+        Path,
+        "lstat",
+        lambda self: self.stat() if self == folder else real_lstat(self),
+    )
+
+    packed = pack_preview_evidence(clone, lease_id="pv000000000001")
+    assert "archive" not in packed
+    assert "without following a link" in packed["refusal"]
+
+
 def test_a_linked_folder_inside_the_evidence_is_never_walked(tmp_path: Path) -> None:
     import base64
 
@@ -869,6 +902,42 @@ async def test_every_link_built_from_evidence_names_is_plain(world: World) -> No
         assert all(ord(ch) >= 32 for ch in link)
         assert link.startswith("https://") and "@" not in link.split("/")[2]
     assert any("a%20b%5Cc.png" in link for link in links)
+
+
+def test_the_sidecar_answer_is_read_only_up_to_its_bound() -> None:
+    """An over-long answer is refused before it is parsed; a short one reads."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    from forge.planning.sidecar_git_runner import _urllib_post
+
+    class _Answer(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # noqa: N802
+            self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            body = json.dumps({"archive": "A" * 1000}).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args: Any) -> None:
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Answer)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        url = f"http://127.0.0.1:{server.server_address[1]}/preview/evidence"
+        status, decoded = _urllib_post(url, {}, 5.0, max_bytes=100)
+        assert status == 413
+        assert "larger than 100 bytes" in decoded["error"]
+        status, decoded = _urllib_post(url, {}, 5.0, max_bytes=5000)
+        assert status == 200 and decoded["archive"] == "A" * 1000
+        status, decoded = _urllib_post(url, {}, 5.0)
+        assert status == 200 and decoded["archive"] == "A" * 1000
+    finally:
+        server.shutdown()
+        server.server_close()
 
 
 def test_the_transfer_cap_is_64_mib_on_both_sides() -> None:
@@ -934,7 +1003,7 @@ async def test_an_oversized_evidence_answer_is_refused_before_it_is_decoded(
     venue = SidecarPreviewVenue(
         "http://sidecar.example.test",
         repo=PROJECT,
-        post=lambda url, body, timeout: (200, {"archive": "A" * 100}),
+        post=lambda url, body, timeout, **_kw: (200, {"archive": "A" * 100}),
     )
     archive, why = await venue.fetch_evidence("pv000000000001")
     assert archive is None
@@ -1197,19 +1266,61 @@ async def test_a_preview_that_did_not_label_its_resources_fails(world: World) ->
     world.venue.labelled = False
     evidence = await world.service.prepare(_request())
     assert evidence.state == "failed"
-    assert evidence.failure_reason == "the project did not label its preview resources"
+    assert evidence.failure_reason == (
+        "the project did not label its preview resources: notes-pv0-app-1 "
+        "carries no forge.preview.lease=pv000000000001"
+    )
     assert world.venue.named("probe") == []  # stopped before the link check
     assert world.venue.named("remove_project") == ["pv000000000001"]
+
+
+@pytest.mark.asyncio
+async def test_one_unlabelled_container_in_the_preview_s_project_fails_it(
+    world: World,
+) -> None:
+    """Partly labelled is not labelled: the one left out would outlive teardown."""
+    world.venue.unlabelled_members = ["notes-pv0-worker-1"]
+    evidence = await world.service.prepare(_request())
+    assert evidence.state == "failed"
+    assert evidence.failure_reason == (
+        "the project did not label its preview resources: notes-pv0-worker-1 "
+        "carries no forge.preview.lease=pv000000000001"
+    )
+    assert world.venue.named("preview_containers") == ["notes-pv0"]
+    assert world.venue.named("probe") == []
+
+
+def test_the_projects_route_lists_the_compose_project_s_containers() -> None:
+    def engine(argv) -> tuple[int, str, str]:
+        argv = list(argv)
+        filters = [argv[i + 1] for i, a in enumerate(argv) if a == "--filter"]
+        if filters == ["label=com.docker.compose.project=notes-pv0"]:
+            return 0, "notes-pv0-app-1 pv000000000001\nnotes-pv0-worker-1 \n", ""
+        return 0, "pv000000000001\n", ""
+
+    answer = list_preview_leases(engine, compose_project="notes-pv0")
+    assert answer["compose_containers"] == [
+        {"name": "notes-pv0-app-1", "lease": "pv000000000001"},
+        {"name": "notes-pv0-worker-1", "lease": ""},
+    ]
+    status, body = serve_preview_operation(
+        PREVIEW_PROJECTS_ROUTE,
+        {"compose_project": "Bad Name"},
+        repo_path=Path("/nowhere"),
+        slot_ports=frozenset(),
+        run=engine,
+    )
+    assert status == 400 and "compose project name" in body["error"]
 
 
 @pytest.mark.asyncio
 async def test_running_previews_that_cannot_be_listed_fail_the_preparation(
     world: World,
 ) -> None:
-    async def unknown() -> None:
+    async def unknown(compose_project: str) -> None:
         return None
 
-    world.venue.running_leases = unknown
+    world.venue.preview_containers = unknown
     evidence = await world.service.prepare(_request())
     assert evidence.state == "failed"
     assert evidence.failure_reason == "the preview's containers could not be listed"
