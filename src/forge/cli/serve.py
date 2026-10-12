@@ -120,7 +120,7 @@ feature_routing_gate: Any | None = None
 feature_routing_required: bool = False
 
 # The review-preview service (web-readiness W7), set by the dispatch chain's
-# composition when the merge press is on and the module is installed. The
+# composition when the merge press is on and composing it succeeded. The
 # serve loop reconciles it at start-up and sweeps it while running; ``None``
 # leaves both steps out and every merge card exactly as it was.
 review_preview_service: Any | None = None
@@ -533,23 +533,33 @@ def compose_merge_executor_deps(
     )
 
 
-def compose_review_preview(*, forge_config: Any, sqlite_pool: Any) -> Any | None:
-    """The review-preview service for the merge card (web-readiness W7), or None.
+def compose_review_preview(
+    *,
+    forge_config: Any,
+    sqlite_pool: Any,
+    nats_client: Any,
+    db_path: Any,
+) -> Any:
+    """The review-preview service for the merge card (web-readiness W7).
 
-    ``None`` when this build has no ``forge.deploy.review_preview`` module, so
-    the merge card and the merge press stay exactly as they were. Which
-    projects actually get a preview is the service's own question, asked of
-    each project's deploy profile.
+    Built on the ledger connection the serve path already holds and the same
+    deploy dispatcher the merge press is given, so a preview is stood up and
+    taken down by exactly the deploy legs the press uses. Which projects
+    actually get a preview is the service's own question, asked of each
+    project's deploy profile; every other project's card is unchanged.
     """
-    try:
-        from forge.deploy.review_preview import ReviewPreviewService
-    except ImportError:
-        logger.info(
-            "forge-serve: no review-preview module in this build — merge "
-            "cards carry no preview"
-        )
-        return None
-    return ReviewPreviewService(config=forge_config, pool=sqlite_pool)
+    from forge.deploy.review_preview import build_review_preview_service
+    from forge.pipeline.merge_executor import build_in_daemon_deploy_dispatcher
+
+    return build_review_preview_service(
+        forge_config,
+        connection=sqlite_pool.connection,
+        deploy_dispatcher=build_in_daemon_deploy_dispatcher(
+            config=forge_config,
+            nats_client=nats_client,
+            db_path=db_path,
+        ),
+    )
 
 
 def compose_merge_offer_git_head(forge_config: Any) -> Any | None:
@@ -704,7 +714,10 @@ def bind_production_dispatch_chain(
             _merge_cfg = getattr(forge_config, "merge_executor", None)
             if _merge_cfg is not None and _merge_cfg.enabled:
                 review_preview = compose_review_preview(
-                    forge_config=forge_config, sqlite_pool=sqlite_pool
+                    forge_config=forge_config,
+                    sqlite_pool=sqlite_pool,
+                    nats_client=client,
+                    db_path=db_path,
                 )
         except Exception as exc:  # noqa: BLE001 — DDR-007 boot protection
             review_preview = None

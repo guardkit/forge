@@ -2184,11 +2184,15 @@ class MergeOfferService:
         # profile switches one on. A preparation that fails still comes back
         # as evidence and the card is offered with its reason and no Approve;
         # only a service that raises leaves no card. Every other offer passes
-        # straight by and is byte for byte what it was.
+        # straight by and is byte for byte what it was. Whether a project has
+        # a preview is read from its deploy profile, which can mean a git or
+        # sidecar read, so it is asked off the event loop.
         review_evidence: Any = None
         if self._review_preview is not None:
             try:
-                if self._review_preview.enabled_for(row.repo):
+                if await asyncio.to_thread(
+                    self._review_preview.enabled_for, row.repo
+                ):
                     from forge.deploy.review_preview import PreviewRequest
 
                     review_evidence = await self._review_preview.prepare(

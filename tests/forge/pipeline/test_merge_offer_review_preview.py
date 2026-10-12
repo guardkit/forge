@@ -16,13 +16,14 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from nats_core.envelope import MessageEnvelope
 
 from forge.cli._serve_gate_activation import merge_card_words
+from forge.deploy.review_preview import PreviewRequest
 from forge.pipeline.merge_offer import MERGE_OFFER_DETAILS_KEY, MergeOfferService
 from tests.forge._a_stand_in_review_preview import (
     PREVIEW_TREE,
@@ -53,36 +54,6 @@ CHECKPOINT_BUILD_ID = "build-FEAT-MO1-20260825"
 CHECKPOINT_CORRELATION = "corr-mo-2"
 
 FIXED_NOW = datetime(2026, 10, 12, 9, 0, tzinfo=timezone.utc)
-
-
-@pytest.fixture(autouse=True)
-def _the_preview_interface(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The fixed ``PreviewRequest`` when the real module is not installed yet.
-
-    ``forge.deploy.review_preview`` is written by a separate package of work
-    (W7a). Until it is merged here the request type is put in place from the
-    coordinator's fixed interface, for the length of each test only; once it
-    is merged the real module is used and this does nothing.
-    """
-    try:
-        import forge.deploy.review_preview  # noqa: F401
-    except ImportError:
-        from dataclasses import dataclass
-
-        @dataclass(frozen=True, slots=True)
-        class PreviewRequest:
-            project: str
-            feature_id: str
-            build_id: str
-            branch: str
-            candidate_sha: str
-            candidate_tree: str
-            expect_main_sha: str
-            target_branch: str
-
-        module = ModuleType("forge.deploy.review_preview")
-        module.PreviewRequest = PreviewRequest  # type: ignore[attr-defined]
-        monkeypatch.setitem(__import__("sys").modules, module.__name__, module)
 
 
 def _service(config, pool, recorder: _Recorder, **kwargs: Any) -> MergeOfferService:
@@ -207,6 +178,7 @@ class TestAnOfferWithAPreview:
         await _one_card(config, pool, preview)
         assert len(preview.requests) == 1
         asked = preview.requests[0]
+        assert isinstance(asked, PreviewRequest)
         assert asked.project == REPO
         assert asked.feature_id == FEATURE_ID
         assert asked.build_id == BUILD_ID
@@ -310,3 +282,21 @@ class TestAnOfferWithAPreview:
                 "reason": "the preview could not be prepared (RuntimeError)",
             }
         ]
+
+    @pytest.mark.asyncio
+    async def test_whether_a_project_has_a_preview_is_asked_off_the_event_loop(
+        self, config, pool
+    ) -> None:
+        """The real ``enabled_for`` reads the deploy profile, which can block."""
+        import threading
+
+        asked_on: list[threading.Thread] = []
+
+        class _Recording(StandInReviewPreview):
+            def enabled_for(self, project: str) -> bool:
+                asked_on.append(threading.current_thread())
+                return super().enabled_for(project)
+
+        await _one_card(config, pool, _Recording())
+        assert len(asked_on) == 1
+        assert asked_on[0] is not threading.main_thread()

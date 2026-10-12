@@ -16,9 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
-import sys
 from pathlib import Path
-from types import ModuleType
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -67,38 +65,72 @@ def _config(*, merge_on: bool) -> ForgeConfig:
 
 
 class TestComposingTheService:
-    def test_no_module_in_this_build_means_no_service(
-        self, monkeypatch: pytest.MonkeyPatch, pool
+    def test_it_is_built_on_the_ledger_and_the_press_s_deploy_dispatcher(
+        self, monkeypatch: pytest.MonkeyPatch, pool, tmp_path: Path
     ) -> None:
-        # ``None`` in sys.modules makes the import fail, as a missing module does.
-        monkeypatch.setitem(sys.modules, "forge.deploy.review_preview", None)
-        assert (
-            serve_mod.compose_review_preview(
-                forge_config=_config(merge_on=True), sqlite_pool=pool
-            )
-            is None
+        built: list[tuple[Any, dict[str, Any]]] = []
+        dispatchers: list[dict[str, Any]] = []
+        dispatcher = object()
+
+        def _build(config: Any, **kwargs: Any) -> Any:
+            built.append((config, kwargs))
+            return "the service"
+
+        def _dispatcher(**kwargs: Any) -> Any:
+            dispatchers.append(kwargs)
+            return dispatcher
+
+        monkeypatch.setattr(
+            "forge.deploy.review_preview.build_review_preview_service", _build
         )
-
-    def test_the_module_s_service_is_built_with_the_config_and_the_ledger(
-        self, monkeypatch: pytest.MonkeyPatch, pool
-    ) -> None:
-        built: list[dict[str, Any]] = []
-
-        class ReviewPreviewService:
-            def __init__(self, **kwargs: Any) -> None:
-                built.append(kwargs)
-
-        module = ModuleType("forge.deploy.review_preview")
-        module.ReviewPreviewService = ReviewPreviewService  # type: ignore[attr-defined]
-        monkeypatch.setitem(sys.modules, module.__name__, module)
+        monkeypatch.setattr(
+            "forge.pipeline.merge_executor.build_in_daemon_deploy_dispatcher",
+            _dispatcher,
+        )
         config = _config(merge_on=True)
+        client = object()
 
         service = serve_mod.compose_review_preview(
-            forge_config=config, sqlite_pool=pool
+            forge_config=config,
+            sqlite_pool=pool,
+            nats_client=client,
+            db_path=tmp_path / "forge.db",
         )
 
+        assert service == "the service"
+        assert built == [
+            (config, {"connection": pool.connection, "deploy_dispatcher": dispatcher})
+        ]
+        assert dispatchers == [
+            {"config": config, "nats_client": client, "db_path": tmp_path / "forge.db"}
+        ]
+
+    def test_the_real_service_composes_from_a_plain_config(
+        self, pool, tmp_path: Path
+    ) -> None:
+        from forge.deploy.review_preview import ReviewPreviewService
+
+        service = serve_mod.compose_review_preview(
+            forge_config=_config(merge_on=True),
+            sqlite_pool=pool,
+            nats_client=MagicMock(),
+            db_path=tmp_path / "forge.db",
+        )
         assert isinstance(service, ReviewPreviewService)
-        assert built == [{"config": config, "pool": pool}]
+        # A project with no deploy profile here has no preview.
+        assert service.enabled_for("appmilla/nothing-here") is False
+
+    def test_a_composition_that_raises_leaves_previews_off_not_boot(
+        self, monkeypatch: pytest.MonkeyPatch, pool, tmp_path: Path
+    ) -> None:
+        def _raises(**_k: Any) -> Any:
+            raise RuntimeError("no ledger")
+
+        monkeypatch.setattr(serve_mod, "compose_review_preview", _raises)
+        seen = _drive_boot(pool, tmp_path, merge_on=True, preview=None, compose=False)
+        assert len(seen["offer"]) == 1
+        assert "review_preview" not in seen["offer"][0]
+        assert serve_mod.review_preview_service is None
 
 
 def _drive_boot(
@@ -107,6 +139,7 @@ def _drive_boot(
     *,
     merge_on: bool,
     preview: Any,
+    compose: bool = True,
 ) -> dict[str, Any]:
     """Run the production dispatch-chain composition once; say what was built."""
     seen: dict[str, Any] = {"offer": [], "consumer": []}
@@ -130,8 +163,9 @@ def _drive_boot(
         async def attach(self, client: Any) -> Any:
             return None
 
+    composer = (lambda **_k: preview) if compose else serve_mod.compose_review_preview
     with (
-        patch.object(serve_mod, "compose_review_preview", lambda **_k: preview),
+        patch.object(serve_mod, "compose_review_preview", composer),
         patch("forge.pipeline.merge_offer.MergeOfferService", _Offer),
         patch("forge.pipeline.merge_executor.MergeApprovalConsumer", _Consumer),
         patch("forge.cli._serve_deps_gating.bind_gate_parts") as gate_parts,

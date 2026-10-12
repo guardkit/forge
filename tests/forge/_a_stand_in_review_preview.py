@@ -19,6 +19,8 @@ from typing import Any, Mapping
 
 from nats_core.events import ReviewEvidence
 
+from forge.deploy.review_preview import PreviewRequest
+
 __all__ = ["PREVIEW_TREE", "StandInReviewPreview", "an_evidence"]
 
 #: The tree the stand-in says it previewed: the candidate joined onto main.
@@ -103,7 +105,7 @@ class StandInReviewPreview:
         self.asked_about.append(project)
         return self.enabled
 
-    async def prepare(self, req: Any) -> ReviewEvidence:
+    async def prepare(self, req: PreviewRequest) -> ReviewEvidence:
         self.requests.append(req)
         if self.prepare_raises is not None:
             raise self.prepare_raises
