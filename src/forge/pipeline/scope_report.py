@@ -514,6 +514,12 @@ class ScopeReport:
     #: branch only added files, and when the branch could not be read (then
     #: :attr:`read` is ``False`` and the card says so instead).
     files_that_already_existed: list[Any] = field(default_factory=list)
+    #: Where this report was written (``<receipts>/<build id>/scope_report.json``),
+    #: set once :func:`write_scope_report` has written it; ``None`` before
+    #: then or when it could not be written. Not part of the receipt itself:
+    #: it is where the receipt is. The card points at it when the list of
+    #: files that already existed is too long to name in full.
+    receipt_path: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """The receipt, exactly as it is written to disk and put on the row."""

@@ -614,11 +614,14 @@ def _which_already_existed(existing: "tuple[str, ...]", files: int) -> str:
     return f" {len(existing)} of them already existed: {names}."
 
 
-#: How many files that already existed the card names before it counts the
-#: rest. More than the three the other lines name, because here the names are
-#: the point: a changed dependency file or a rewritten test is exactly what
-#: the person deciding needs to see. The receipt keeps every one.
-EXISTING_FILES_NAMED_ON_THE_CARD: int = 6
+#: How many files that already existed the card names. Every one is named up
+#: to this bound, because here the names are the point: a changed dependency
+#: file or a rewritten test is exactly what the person deciding needs to see,
+#: and a short cut could hide one. Jarvis does not cut a long card, it splits
+#: it into 2,900-character blocks, so the bound is only for readability: forty
+#: ordinary paths are about one such block. Past it, the card says where the
+#: complete list is, never a bare count.
+EXISTING_FILES_NAMED_ON_THE_CARD: int = 40
 
 
 def card_line_about_files_that_already_existed(report: Any) -> str:
@@ -636,10 +639,13 @@ def card_line_about_files_that_already_existed(report: Any) -> str:
     Three shapes:
 
     * files that already existed were changed — how many, which (a test file
-      marked as one, a deleted file as deleted, at most
-      :data:`EXISTING_FILES_NAMED_ON_THE_CARD` named, then "and N more"), and
-      what that means for any passing result on the card. Test files are
-      named first, then deleted files, so neither is lost to the cut;
+      marked as one, a deleted file as deleted), and what that means for any
+      passing result on the card. Every file is named, test files first, then
+      deleted files, then the rest. Only past
+      :data:`EXISTING_FILES_NAMED_ON_THE_CARD` names does the card stop, and
+      then it says exactly where the complete list is: the scope receipt the
+      pass wrote (``report.receipt_path``), or the build's merge offer record
+      when no receipt could be written;
     * the branch could not be read — said plainly, never as "nothing";
     * ``""`` when the branch only added files, or nobody read it at all.
     """
@@ -672,21 +678,16 @@ def card_line_about_files_that_already_existed(report: Any) -> str:
                     bool(getattr(item, "deleted", False)),
                 )
             )
-    # TEST FILES FIRST, then deleted files, then the rest, before the list is
-    # cut. git lists files in path order, so a test file usually sorts late,
-    # and cut in that order a changed existing test could fall into "and N
-    # more" — on the routine card, which has no other line about tests, it
-    # would then be hidden altogether. The sort is stable, so each group keeps
-    # git's order.
+    # TEST FILES FIRST, then deleted files, then the rest. git lists files in
+    # path order, so a test file usually sorts late, and if a very long list
+    # ever has to stop, the tests and deletions must not be what is left off.
+    # The sort is stable, so each group keeps git's order.
     read.sort(key=lambda entry: (not entry[1], not entry[2]))
     named: list[str] = []
     for path, is_test, deleted in read[:EXISTING_FILES_NAMED_ON_THE_CARD]:
         notes = (["a test file"] if is_test else []) + (["deleted"] if deleted else [])
         named.append(f"{path} ({', '.join(notes)})" if notes else path)
     listing = ", ".join(named)
-    rest = len(existing) - len(named)
-    if rest > 0:
-        listing += f" and {rest} more"
     count = len(existing)
     if count == 1:
         return (
@@ -694,11 +695,23 @@ def card_line_about_files_that_already_existed(report: Any) -> str:
             "passing result on this card was measured with this change, so it "
             "is not evidence that the original tests pass unchanged."
         )
-    return (
-        f"This branch changes {count} files that already existed: {listing}. "
-        "Any passing result on this card was measured with these changes, so "
-        "it is not evidence that the original tests pass unchanged."
+    line = (
+        f"This branch changes {count} files that already existed"
+        f"{'' if count <= len(named) else f' (the first {len(named)} named here)'}"
+        f": {listing}. Any passing result on this card was measured with these "
+        "changes, so it is not evidence that the original tests pass unchanged."
     )
+    if count > len(named):
+        where = str(getattr(report, "receipt_path", "") or "").strip()
+        line += (
+            f" The complete list of all {count} is in {where}."
+            if where
+            else (
+                f" The complete list of all {count} is kept on this build's "
+                "merge offer record."
+            )
+        )
+    return line
 
 
 def card_line_about_scope(report: Any) -> str:

@@ -1564,7 +1564,8 @@ def run_the_scope_pass(
             base,
             ", ".join(item.path for item in existing),
         )
-    write_scope_report(build_id, report)
+    written = write_scope_report(build_id, report)
+    report.receipt_path = str(written) if written is not None else None
     return report
 
 

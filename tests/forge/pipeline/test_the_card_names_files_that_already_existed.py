@@ -218,18 +218,65 @@ class TestTheWordsOnTheCard:
 
         assert card_line_about_files_that_already_existed(report) == THE_DESIGNS_SENTENCE
 
-    def test_a_long_list_is_cut_and_counted(self) -> None:
+    def test_every_changed_test_and_dependency_file_is_named(self) -> None:
+        """Seven changed tests must not push the dependency files off the
+        card: every file that already existed is named."""
+        tests = [f"tests/test_{index}.py" for index in range(7)]
+        manifests = ["package-lock.json", "pyproject.toml", "requirements.txt", "uv.lock"]
+        report = scope_of_the_build(
+            reading=BranchScopeReading(
+                name_status="".join(f"M\0{path}\0" for path in manifests + tests)
+            ),
+            request=None,
+        )
+
+        line = card_line_about_files_that_already_existed(report)
+
+        assert line.startswith("This branch changes 11 files that already existed: ")
+        for path in tests:
+            assert f"{path} (a test file)" in line
+        for path in manifests:
+            assert path in line
+        assert "more" not in line
+        assert "complete list" not in line
+
+    def test_past_the_bound_the_card_says_where_the_complete_list_is(self) -> None:
+        bound = EXISTING_FILES_NAMED_ON_THE_CARD
         report = ScopeReport(read=True)
         report.files_that_already_existed = [
-            ExistingFileChange(path=f"src/module_{index}.py") for index in range(9)
+            ExistingFileChange(path=f"src/module_{index:02d}.py")
+            for index in range(bound + 5)
+        ]
+        report.receipt_path = "/var/forge/receipts/build-FEAT-EXIST-1/scope_report.json"
+
+        line = card_line_about_files_that_already_existed(report)
+
+        assert line.startswith(
+            f"This branch changes {bound + 5} files that already existed (the "
+            f"first {bound} named here): src/module_00.py, "
+        )
+        assert f"src/module_{bound - 1:02d}.py" in line
+        assert f"src/module_{bound:02d}.py" not in line
+        assert line.endswith(
+            f"The complete list of all {bound + 5} is in "
+            "/var/forge/receipts/build-FEAT-EXIST-1/scope_report.json."
+        )
+        assert "more" not in line
+
+    def test_past_the_bound_with_no_receipt_it_names_the_offer_record(self) -> None:
+        bound = EXISTING_FILES_NAMED_ON_THE_CARD
+        report = ScopeReport(read=True)
+        report.files_that_already_existed = [
+            ExistingFileChange(path=f"src/module_{index:02d}.py")
+            for index in range(bound + 1)
         ]
 
         line = card_line_about_files_that_already_existed(report)
 
-        assert line.startswith("This branch changes 9 files that already existed: ")
-        shown = EXISTING_FILES_NAMED_ON_THE_CARD
-        assert f"src/module_{shown - 1}.py and {9 - shown} more." in line
-        assert f"src/module_{shown}.py" not in line
+        assert line.endswith(
+            f"The complete list of all {bound + 1} is kept on this build's "
+            "merge offer record."
+        )
 
     def test_a_test_file_that_sorts_last_is_still_named_and_marked(self) -> None:
         """git lists paths in order, and tests usually sort late. Cut in that
@@ -251,7 +298,8 @@ class TestTheWordsOnTheCard:
         assert line.startswith(
             "This branch changes 9 files that already existed: "
             f"{URL_TEST} (a test file), src/app/old.py (deleted), src/app/a.py, "
-            "src/app/b.py, src/app/c.py, src/app/d.py and 3 more. "
+            "src/app/b.py, src/app/c.py, src/app/d.py, src/app/e.py, "
+            "src/app/f.py, src/app/g.py. "
         )
 
     def test_an_unreadable_branch_says_so_instead_of_listing(

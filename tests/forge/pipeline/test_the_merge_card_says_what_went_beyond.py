@@ -543,6 +543,29 @@ class TestWhereTheTestsLiveIsAskedOnlyWhenItMatters:
         # the answer is used: the declared path marks the router as a test
         assert report.files_that_already_existed[0].is_test is True
 
+    def test_the_report_knows_where_its_receipt_was_written(
+        self,
+        pool: SqliteLifecyclePersistence,
+        repo_root: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """So a card whose list is too long to name in full can say exactly
+        where the complete list is."""
+        self._asked(monkeypatch)
+        receipts = tmp_path / "receipts"
+        (receipts / BUILD_ID).mkdir(parents=True)
+        monkeypatch.setenv("FORGE_RECEIPTS_DIR", str(receipts))
+
+        report = self._pass(pool, repo_root)
+
+        assert report is not None
+        assert report.receipt_path == str(receipts / BUILD_ID / SCOPE_REPORT_NAME)
+        kept = json.loads(Path(report.receipt_path).read_text(encoding="utf-8"))
+        assert [item["path"] for item in kept["files_that_already_existed"]] == [
+            "src/users/router.py"
+        ]
+
     def test_not_asked_when_the_branch_could_not_be_read(
         self,
         pool: SqliteLifecyclePersistence,
