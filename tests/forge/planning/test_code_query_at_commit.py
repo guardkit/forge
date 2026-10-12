@@ -373,4 +373,3 @@ def test_one_shortened_block_alone_makes_the_field_partial() -> None:
         reader=_Lines(files), test_roots=[],
     )
     assert whole["status"] == "ok" and whole["truncation"] == []
-
