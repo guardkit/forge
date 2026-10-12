@@ -62,6 +62,18 @@ METRICS_TEST = (
     "def test_tallied_member_total():\n"
     "    assert tallied_dormancy(Member()) == 1\n"
 )
+#: A route and a code name the request quotes, for the plan checks P9 and A8
+#: on Forge's own descriptor.
+MEMBERS = (
+    "from fastapi import APIRouter\n"
+    "\n"
+    "router = APIRouter()\n"
+    "\n"
+    "\n"
+    '@router.get("/members/dormant")\n'
+    "def list_dormant_members():\n"
+    "    return [m for m in MEMBERS if tallied_dormancy(m)]\n"
+)
 TEST = (
     "from router import count_active_users\n"
     "\n"
@@ -95,6 +107,7 @@ def clone(tmp_path: Path) -> tuple[Path, str]:
     (seed / "app" / "router.py").write_text(ROUTER)
     (seed / "tests" / "users" / "test_router.py").write_text(TEST)
     (seed / "app" / "metrics.py").write_text(METRICS)
+    (seed / "app" / "members.py").write_text(MEMBERS)
     (seed / "tests" / "users" / "test_metrics.py").write_text(METRICS_TEST)
     # Tracked, would match, and too large for the snapshot.
     (seed / "app" / "huge_report.py").write_text(
@@ -230,6 +243,12 @@ def test_reader_and_descriptor_over_the_real_server(clone: tuple[Path, str]) -> 
             request_text="Tally the dormant members",
             ranked_source=True,
         )
+        routes = PlanningRunDriver._build_target_repo_descriptor(
+            REPO_KEY, str(path), "Feature: list dormant members",
+            reader=SidecarCodeReader(url, repo=REPO_KEY, commit=recorded),
+            request_text="Add GET /members/dormant that returns list_dormant_members results",
+            ranked_source=True,
+        )
     # Off, the descriptor is exactly what it was before the switch existed.
     assert "ranked_source" not in without
     assert {k: v for k, v in counted.items() if k != "ranked_source"} == without
@@ -248,11 +267,15 @@ def test_reader_and_descriptor_over_the_real_server(clone: tuple[Path, str]) -> 
     assert metrics["text"].splitlines()[0] == "1: def tallied_dormancy(member) -> int:"
     assert metrics["test"] is False
     assert blocks["tests/users/test_metrics.py"]["test"] is True
+    # The route case: Forge shows the route's code (as a window or a block).
+    shown = [w for e in routes.get("where_the_specs_words_already_appear") or []
+             for w in e.get("evidence") or []] + routes["ranked_source"]["blocks"]
+    assert any(w["path"] == "app/members.py" and "/members/dormant" in w["text"] for w in shown)
     out = os.environ.get("FORGE_CODE_SEARCH_FIXTURE_OUT")
     if out:
         folder = Path(out)
         folder.mkdir(parents=True, exist_ok=True)
-        data = json.dumps(tallied, indent=2, sort_keys=True)
+        data = json.dumps({"tally": tallied, "routes": routes}, indent=2, sort_keys=True)
         (folder / "ranked_source_descriptor_from_forge.json").write_text(data)
         (folder / "ranked_source_descriptor_from_forge.json.sha256").write_text(
             hashlib.sha256(data.encode()).hexdigest() + "\n"
