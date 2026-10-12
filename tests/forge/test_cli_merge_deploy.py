@@ -438,3 +438,121 @@ class TestHappyPath:
         assert pool.connection.execute(
             "SELECT count(*) FROM publication_records"
         ).fetchone()[0] == 0
+
+
+# ---------------------------------------------------------------------------
+# An offer with a review preview (web-readiness W7): the card's own terms
+# ---------------------------------------------------------------------------
+
+
+def _write_previewed_offer(pool, preview_tree: str) -> None:
+    from datetime import datetime, timezone
+
+    from forge.lifecycle.persistence import StageLogEntry
+    from forge.pipeline.merge_offer import (
+        MERGE_OFFER_DETAILS_KEY,
+        MERGE_OFFER_STAGE_LABEL,
+        MERGE_OFFER_TARGET_IDENTIFIER,
+    )
+    from tests.forge._a_stand_in_review_preview import an_evidence
+
+    now = datetime.now(timezone.utc)
+    pool.record_stage(
+        StageLogEntry(
+            build_id=BUILD_ID,
+            stage_label=MERGE_OFFER_STAGE_LABEL,
+            target_kind="local_tool",
+            target_identifier=MERGE_OFFER_TARGET_IDENTIFIER,
+            status="GATED",
+            gate_mode="MANDATORY_HUMAN_APPROVAL",
+            started_at=now,
+            completed_at=now,
+            duration_secs=0.0,
+            details={
+                MERGE_OFFER_DETAILS_KEY: {
+                    "request_id": f"merge-{BUILD_ID}",
+                    "feature_id": FEATURE_ID,
+                    "repo": REPO,
+                    "review_evidence": an_evidence(
+                        "ready",
+                        candidate_sha="c" * 40,
+                        candidate_tree="d" * 40,
+                        preview_tree=preview_tree,
+                    ).model_dump(mode="json"),
+                    "preview_tree": preview_tree,
+                }
+            },
+        )
+    )
+
+
+@pytest.fixture
+def preview(monkeypatch: pytest.MonkeyPatch):
+    from tests.forge._a_stand_in_review_preview import StandInReviewPreview
+
+    service = StandInReviewPreview()
+    monkeypatch.setattr(
+        merge_deploy_module, "_preview_service", lambda _c, _p, _d: service
+    )
+    return service
+
+
+class TestAnOfferWithAPreview:
+    def test_a_refused_preview_merges_nothing_and_is_written_down(
+        self, config, pool, fakes, preview, repo_root
+    ) -> None:
+        _insert_build(pool)
+        _write_previewed_offer(pool, _git(repo_root, "rev-parse", f"autobuild/{FEATURE_ID}^{{tree}}"))
+        preview.refusal = "the preview for this offer is no longer running"
+
+        result = CliRunner().invoke(merge_deploy_cmd, [FEATURE_ID], obj=config)
+
+        assert result.exit_code == 1
+        assert "refused — the preview for this offer is no longer running" in result.output
+        assert fakes["gk_calls"] == [] and fakes["dp_calls"] == []
+        row = pool.connection.execute(
+            "SELECT lines_json FROM publication_records WHERE build_id = ?", (BUILD_ID,)
+        ).fetchone()
+        assert "the approval was refused" in row[0]
+        assert [r["reason"] for r in preview.released] == [
+            "approval refused: the preview for this offer is no longer running"
+        ]
+
+    def test_a_usable_preview_is_pressed_on_its_tree_and_released(
+        self, config, pool, fakes, preview, repo_root
+    ) -> None:
+        _insert_build(pool)
+        # The stand-in merge command lands on the branch's own tip, so that is
+        # the joined tree the press sees.
+        _write_previewed_offer(pool, _git(repo_root, "rev-parse", f"autobuild/{FEATURE_ID}^{{tree}}"))
+
+        result = CliRunner().invoke(merge_deploy_cmd, [FEATURE_ID], obj=config)
+
+        assert result.exit_code == 0, result.output
+        assert "result=publication-pending" in result.output
+        assert [r["reason"] for r in preview.released] == [
+            "approval ended: publication-pending"
+        ]
+
+    def test_a_joined_tree_that_is_not_the_previewed_one_is_refused(
+        self, config, pool, fakes, preview
+    ) -> None:
+        _insert_build(pool)
+        _write_previewed_offer(pool, "e" * 40)
+
+        result = CliRunner().invoke(merge_deploy_cmd, [FEATURE_ID], obj=config)
+
+        assert result.exit_code == 1
+        assert "main moved since the preview: previewed tree " + "e" * 40 in result.output
+        assert fakes["dp_calls"] == []
+
+    def test_an_offer_without_a_preview_never_asks_about_one(
+        self, config, pool, fakes, monkeypatch
+    ) -> None:
+        def _never(*_a):
+            raise AssertionError("asked for a preview service without a preview")
+
+        monkeypatch.setattr(merge_deploy_module, "_preview_service", _never)
+        _insert_build(pool)
+        result = CliRunner().invoke(merge_deploy_cmd, [FEATURE_ID], obj=config)
+        assert result.exit_code == 0, result.output
