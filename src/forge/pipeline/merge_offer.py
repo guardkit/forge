@@ -45,6 +45,7 @@ import inspect
 import json
 import logging
 import re
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1546,13 +1547,20 @@ def run_the_scope_pass(
             parse_changed_files,
         )
 
-        existing = list(
-            files_that_already_existed(
-                parse_changed_files(str(getattr(reading, "name_status", "") or "")),
-                _test_paths_of(repo_root_raw, repo_key, sandbox),
+        declared = _test_paths_of(repo_root_raw, repo_key, sandbox)
+        if declared is None:
+            # The list itself is already complete; only WHICH of these are
+            # tests by the repository's own settings is unknown, and the card
+            # says so rather than waiting on it.
+            report.test_files_checked = False
+        else:
+            existing = list(
+                files_that_already_existed(
+                    parse_changed_files(str(getattr(reading, "name_status", "") or "")),
+                    declared,
+                )
             )
-        )
-        report.files_that_already_existed = existing
+            report.files_that_already_existed = existing
         # The same list the card names, said in the log as well, so an
         # operator reading the build's own record sees it without the card.
         logger.info(
@@ -1569,29 +1577,65 @@ def run_the_scope_pass(
     return report
 
 
-def _test_paths_of(repo_root: Any, repo_key: str, sandbox: Any) -> tuple[str, ...]:
+#: How long the scope pass waits to learn where a repository keeps its tests.
+#: The answer only marks which files that already existed are tests, so a
+#: card never waits longer than this for it (12 October 2026).
+TEST_PATHS_DEADLINE_SECONDS: float = 10.0
+
+
+def _test_paths_of(
+    repo_root: Any, repo_key: str, sandbox: Any
+) -> tuple[str, ...] | None:
     """Where this repository's tests live, for marking test files on the card.
 
     The same answer the repair card's test count uses: the paths the
     repository's own declared test command names, beside the plain default,
-    read where the repository lives. It feeds a few words on a card, so any
-    failure leaves the plain default standing and never stops the pass.
+    read where the repository lives. ``None`` means it could not be learned —
+    an error, or no answer within :data:`TEST_PATHS_DEADLINE_SECONDS`.
+
+    WHY A DEADLINE. Reading the declaration reads a file (or asks a sandbox),
+    and a read that never returns — a stalled mount, a pipe where the file
+    should be — would otherwise hold up the merge card for good, because the
+    card's own callers wait on the scope pass with no limit. The read runs on
+    a daemon thread that is waited for only this long; a thread cannot be
+    cancelled, so a stuck one is left behind, harmless, and the card goes out.
     """
-    from forge.pipeline.merge_ready_checkpoint import DEFAULT_TEST_PATHS
+    from forge.cli._serve_conductor import test_paths_for
 
-    try:
-        from forge.cli._serve_conductor import test_paths_for
+    answer: list[tuple[str, ...]] = []
+    failure: list[BaseException] = []
 
-        return tuple(test_paths_for(repo_root, repo_key, sandbox=sandbox))
-    except Exception as exc:  # noqa: BLE001 — a card's few words never stop it
+    def _read() -> None:
+        try:
+            answer.append(tuple(test_paths_for(repo_root, repo_key, sandbox=sandbox)))
+        except BaseException as exc:  # noqa: BLE001 — reported below
+            failure.append(exc)
+
+    reader = threading.Thread(
+        target=_read, name=f"scope-pass-test-paths-{repo_key}", daemon=True
+    )
+    reader.start()
+    reader.join(TEST_PATHS_DEADLINE_SECONDS)
+    if answer:
+        return answer[0]
+    if failure:
         logger.warning(
             "the scope pass: where %s keeps its tests could not be read "
-            "(%s: %s) — the plain default stands",
+            "(%s: %s) — the card says which files are tests could not be "
+            "fully checked",
             repo_key,
-            type(exc).__name__,
-            exc,
+            type(failure[0]).__name__,
+            failure[0],
         )
-        return DEFAULT_TEST_PATHS
+    else:
+        logger.warning(
+            "the scope pass: where %s keeps its tests was not read within %s "
+            "seconds — the card goes out now and says which files are tests "
+            "could not be fully checked",
+            repo_key,
+            TEST_PATHS_DEADLINE_SECONDS,
+        )
+    return None
 
 
 def _utcnow() -> datetime:

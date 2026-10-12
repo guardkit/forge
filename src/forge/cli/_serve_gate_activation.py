@@ -690,17 +690,25 @@ def card_line_about_files_that_already_existed(report: Any) -> str:
     listing = ", ".join(named)
     count = len(existing)
     if count == 1:
-        return (
+        line = (
             f"This branch changes 1 file that already existed: {listing}. Any "
             "passing result on this card was measured with this change, so it "
             "is not evidence that the original tests pass unchanged."
         )
-    line = (
-        f"This branch changes {count} files that already existed"
-        f"{'' if count <= len(named) else f' (the first {len(named)} named here)'}"
-        f": {listing}. Any passing result on this card was measured with these "
-        "changes, so it is not evidence that the original tests pass unchanged."
-    )
+    else:
+        line = (
+            f"This branch changes {count} files that already existed"
+            f"{'' if count <= len(named) else f' (the first {len(named)} named here)'}"
+            f": {listing}. Any passing result on this card was measured with "
+            "these changes, so it is not evidence that the original tests pass "
+            "unchanged."
+        )
+    if not bool(getattr(report, "test_files_checked", True)):
+        line += (
+            " Which of these are test files could not be fully checked: this "
+            "repository's own test settings could not be read in time, so only "
+            "the usual test locations were used."
+        )
     if count > len(named):
         where = str(getattr(report, "receipt_path", "") or "").strip()
         line += (

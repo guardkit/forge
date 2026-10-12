@@ -606,6 +606,117 @@ class TestWhereTheTestsLiveIsAskedOnlyWhenItMatters:
         assert asked == []
 
 
+class TestAStuckTestSettingsReadNeverHoldsUpTheCard:
+    """Learning where a repository keeps its tests reads a file, and a read
+    that never returns must not hold up either merge card (12 October 2026).
+    Both consumers are driven with that read blocked for good: each card goes
+    out within the deadline, names every file that already existed, and says
+    which of them are tests could not be fully checked."""
+
+    NOTE = (
+        "Which of these are test files could not be fully checked: this "
+        "repository's own test settings could not be read in time, so only "
+        "the usual test locations were used."
+    )
+    LISTED = "This branch changes 1 file that already existed: src/users/router.py."
+
+    @pytest.fixture
+    def stuck(self, monkeypatch: pytest.MonkeyPatch):
+        import threading
+
+        from forge.cli import _serve_conductor
+        from forge.pipeline import merge_offer
+
+        released = threading.Event()
+        entered = threading.Event()
+
+        def _a_read_that_never_returns(*_args: Any, **_kwargs: Any) -> Any:
+            entered.set()
+            released.wait(60)
+            return ()
+
+        monkeypatch.setattr(_serve_conductor, "test_paths_for", _a_read_that_never_returns)
+        monkeypatch.setattr(merge_offer, "TEST_PATHS_DEADLINE_SECONDS", 0.3)
+        try:
+            yield entered
+        finally:
+            released.set()
+
+    @staticmethod
+    def _offered_scope(pool: SqliteLifecyclePersistence) -> dict[str, Any]:
+        offered = [
+            stage
+            for stage in pool.read_stages(BUILD_ID)
+            if stage.target_identifier == MERGE_OFFER_TARGET_IDENTIFIER
+        ]
+        assert len(offered) == 1
+        return offered[0].details[MERGE_OFFER_DETAILS_KEY]["scope_report"]
+
+    def test_the_routine_card_goes_out_within_the_deadline(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+        stuck: Any,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import time
+
+        _insert_build(pool)
+        _insert_planning_run(pool)
+        monkeypatch.setenv("FORGE_RECEIPTS_DIR", str(tmp_path / "receipts"))
+        recorder = _Recorder()
+
+        started = time.monotonic()
+        asyncio.run(_service(config, pool, recorder).maybe_offer(_event()))
+        took = time.monotonic() - started
+
+        assert stuck.is_set(), "the blocked read was really reached"
+        assert took < 10
+        words = recorder.paused.rationale
+        assert self.LISTED in words
+        assert self.NOTE in words
+        kept = self._offered_scope(pool)
+        assert kept["test_files_checked"] is False
+        assert [item["path"] for item in kept["files_that_already_existed"]] == [
+            "src/users/router.py"
+        ]
+
+    def test_the_repair_card_goes_out_within_the_deadline(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+        stuck: Any,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import time
+
+        _insert_build(pool)
+        _insert_planning_run(pool)
+        monkeypatch.setenv("FORGE_RECEIPTS_DIR", str(tmp_path / "receipts"))
+        recorder = _Recorder()
+
+        started = time.monotonic()
+        asyncio.run(
+            _repair_publisher(pool, recorder, config=config, scope_config=config)(
+                build_id=BUILD_ID,
+                feature_id=FEATURE_ID,
+                rationale="mode-c-commits-present",
+                branch=BRANCH,
+                gates=_repair_gates(),
+            )
+        )
+        took = time.monotonic() - started
+
+        assert stuck.is_set(), "the blocked read was really reached"
+        assert took < 10
+        words = recorder.paused.rationale
+        assert self.LISTED in words
+        assert self.NOTE in words
+        assert self._offered_scope(pool)["test_files_checked"] is False
+
+
 class TestTheCardAndTheDurableRow:
     def test_the_card_says_what_went_beyond_the_plan_and_the_request(
         self,

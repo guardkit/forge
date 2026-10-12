@@ -520,6 +520,10 @@ class ScopeReport:
     #: it is where the receipt is. The card points at it when the list of
     #: files that already existed is too long to name in full.
     receipt_path: str | None = None
+    #: ``False`` when this repository's own settings for where its tests live
+    #: could not be read in time, so the files above were marked as tests by
+    #: the usual test locations only. The list of files is complete either way.
+    test_files_checked: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         """The receipt, exactly as it is written to disk and put on the row."""
@@ -547,6 +551,7 @@ class ScopeReport:
                 item.to_dict() if hasattr(item, "to_dict") else dict(item)
                 for item in self.files_that_already_existed
             ],
+            "test_files_checked": self.test_files_checked,
         }
 
 
