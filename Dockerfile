@@ -23,9 +23,11 @@
 #     malformed 0.2.0 wheel (TASK-FIX-F0E6 / TASK-REV-F0E4 §5.1).
 #   * ``pyproject.toml`` is NOT mutated inside the layer — the dev-host
 #     ``[tool.uv.sources]`` semantics are preserved (scoping §11.4).
-#   * Only the resolved venv crosses the builder→runtime boundary; gcc,
-#     build-essential, and apt-cache state stay behind in the discarded
-#     builder layer.
+#   * Only the resolved venv crosses the builder→runtime boundary; the
+#     builder's gcc, build-essential, and apt-cache state stay behind in the
+#     discarded builder layer. (Since 12 October 2026 the runtime stage
+#     installs its own gcc and libc6-dev, for Go's race detector — see the
+#     toolchain layers there. build-essential and g++ are still builder-only.)
 #
 # Digest source: ``docker buildx imagetools inspect
 # python:3.14-slim-bookworm`` resolved on 2026-04-22 (image revision
@@ -208,12 +210,14 @@ RUN pip install \
 # ---------------------------------------------------------------------------
 # Stage 2: runtime
 #
-# Minimal surface: copy the resolved venv from the builder stage, add
-# curl for the HEALTHCHECK probe and git for the Mode P planning
-# PLANNED-HANDOFF terminal (in-process ``WorktreeGitRunner`` shells out
-# to ``git worktree add``; TASK-FWD-PLAN-GITMOUNT), and run as the
-# unprivileged ``forge`` user. No package install beyond curl and git,
-# no SSH, no debugger, no secrets.
+# Copy the resolved venv from the builder stage, add curl for the
+# HEALTHCHECK probe and git for the Mode P planning PLANNED-HANDOFF
+# terminal (in-process ``WorktreeGitRunner`` shells out to ``git worktree
+# add``; TASK-FWD-PLAN-GITMOUNT), add the pinned tools the builds and
+# checks run (hurl, the docker client and Compose, code search, and since
+# 12 October 2026 Node, Go, Staticcheck, gcc and the Playwright browsers),
+# and run as the unprivileged ``forge`` user. No SSH, no debugger, no
+# secrets.
 # ---------------------------------------------------------------------------
 FROM python:3.14-slim-bookworm@sha256:2e256d0381371566ed96980584957ed31297f437569b79b0e5f7e17f2720e53a AS runtime
 
@@ -240,13 +244,15 @@ ENV PATH="/opt/venv/bin:${PATH}"
 
 # curl is required by HEALTHCHECK and git by the Mode P planning
 # PLANNED-HANDOFF terminal (in-process ``WorktreeGitRunner``); neither
-# is in the slim-bookworm base. Install with ``--no-install-recommends``
-# to keep the layer small and ``rm -rf /var/lib/apt/lists/*`` to drop
-# the apt cache. These are the only packages added to the runtime
-# stage; gcc and build-essential live exclusively in the discarded
-# builder stage.
+# is in the slim-bookworm base. xz-utils unpacks the Node release
+# archive further down (12 October 2026). Install with
+# ``--no-install-recommends`` to keep the layer small and
+# ``rm -rf /var/lib/apt/lists/*`` to drop the apt cache. Debian's
+# ``nodejs`` (Node 18, no npm) was removed from this line on 12 October
+# 2026: the pinned Node 22 below replaces it. build-essential and g++
+# still live only in the discarded builder stage.
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends curl git nodejs \
+    && apt-get install --yes --no-install-recommends curl git xz-utils \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
@@ -367,11 +373,163 @@ RUN mkdir -p /opt/code-search/bin \
     && /opt/code-search/bin/probe --version | grep -q "probe-code" \
     && test ! -e /usr/local/bin/rg && test ! -e /usr/local/bin/sg
 
-# 2026-08-15 — HISTORICAL REASON, LIVE PACKAGE. guardkit deleted the DCL spec
-# track outright (guardkit b138d92c) and forge's W1-S2 leg went with it, so
-# nothing shells the vendored checker any more. ``nodejs`` and the flag below
-# are LEFT IN PLACE deliberately: removing a runtime package is an image
-# question of its own, not a side effect of striking a planning leg.
+# ---------------------------------------------------------------------------
+# NODE, GO, STATICCHECK, GCC AND THE PLAYWRIGHT BROWSERS
+# 12 October 2026, Phase 1 web-app readiness (package W1).
+#
+# WHY THESE ARE IN THE FACTORY'S IMAGE. The coding Player and Coach, and the
+# checks run after them, are children of the sandbox runner, which runs this
+# image. Until now nothing here could run a project whose declared install
+# and checks call node, npm, go or a browser: Debian's Node 18 had no npm and
+# there was no Go at all. The tools are generic — nothing below names a
+# project, and a project still says in its own declaration which commands it
+# runs. Product images built by projects stay their own business.
+#
+# WHERE THEY ARE FOUND. The Player's and Coach's shell does not inherit this
+# image's environment: GuardKitFactory's harness gives it PATH=/usr/bin:/bin,
+# HOME=<worktree> and its own TMPDIR. So every executable a project's checks
+# call is linked into /usr/bin, and no setting the shell needs is left to an
+# image ENV. Each link is a plain `ln -s`, which refuses to replace a file
+# that is already there, so no Debian binary is shadowed.
+#
+# HOW EACH DOWNLOAD IS TRUSTED. Node, Go and Staticcheck are official release
+# archives, pinned by version and checked against the sha256 recorded here
+# before anything is unpacked (the same rule as hurl, docker and code search
+# above). Each of the three is unpacked with --no-same-owner: the Staticcheck
+# archive's files belong to uid 1000 and Node's to uid 1001, and uid 1000 is
+# the forge user, which must not own a program it runs.
+#
+# NO SHARED CACHE IS BAKED IN. GOPATH, GOCACHE and npm's cache are not set
+# here. They resolve under the HOME each build is given, or wherever the
+# project's own declaration puts them, so nothing in the image is a cache that
+# two builds write to.
+# ---------------------------------------------------------------------------
+
+# Node 22, with the npm it ships, under /usr/local (node, npm, npx and corepack
+# land in /usr/local/bin). The archive's three top-level text files are left
+# out so they do not litter /usr/local.
+ARG NODE_VERSION=22.23.2
+ARG NODE_SHA256=fff4078c5def658577f92c88db7db3bc0072924bfb93fe52c1e744a54e94abb8
+# The npm that Node 22.23.2 ships — checked by the self-check, not chosen.
+ARG NODE_NPM_VERSION=10.9.8
+RUN curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-arm64.tar.xz" \
+        -o /tmp/node.tar.xz \
+    && echo "${NODE_SHA256}  /tmp/node.tar.xz" | sha256sum --check --strict - \
+    && tar --extract --xz --file /tmp/node.tar.xz --directory /usr/local \
+        --strip-components=1 --no-same-owner \
+        --exclude="node-v${NODE_VERSION}-linux-arm64/CHANGELOG.md" \
+        --exclude="node-v${NODE_VERSION}-linux-arm64/LICENSE" \
+        --exclude="node-v${NODE_VERSION}-linux-arm64/README.md" \
+    && rm -f /tmp/node.tar.xz \
+    && ln -s /usr/local/bin/node /usr/bin/node \
+    && ln -s /usr/local/bin/npm /usr/bin/npm \
+    && ln -s /usr/local/bin/npx /usr/bin/npx \
+    && /usr/bin/node --version | grep -qx "v${NODE_VERSION}"
+
+# Go 1.26 in /usr/local/go. `go` finds its root by resolving its own link, so
+# the /usr/bin links are enough. GOTOOLCHAIN=local is written into Go's own
+# installation defaults file, go.env, which Go reads whatever the environment
+# holds — the Player's shell included — so a project's go.mod cannot make Go
+# download a different toolchain. gcc and libc6-dev are here because Go's race
+# detector needs cgo on arm64; build-essential and g++ are not installed.
+ARG GO_VERSION=1.26.9
+ARG GO_SHA256=4a97373d49fcacdcf3694fea368a500b00ee3e963974f3e7514132717632f052
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends gcc libc6-dev \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-arm64.tar.gz" \
+        -o /tmp/go.tgz \
+    && echo "${GO_SHA256}  /tmp/go.tgz" | sha256sum --check --strict - \
+    && tar --extract --gzip --file /tmp/go.tgz --directory /usr/local --no-same-owner \
+    && rm -f /tmp/go.tgz \
+    && sed 's/^GOTOOLCHAIN=auto$/GOTOOLCHAIN=local/' /usr/local/go/go.env > /tmp/go.env \
+    && mv /tmp/go.env /usr/local/go/go.env \
+    && grep -qx 'GOTOOLCHAIN=local' /usr/local/go/go.env \
+    && ln -s /usr/local/go/bin/go /usr/bin/go \
+    && ln -s /usr/local/go/bin/gofmt /usr/bin/gofmt \
+    && /usr/bin/go version | grep -q " go${GO_VERSION} linux/arm64$"
+
+# Staticcheck, the one binary out of its release archive.
+ARG STATICCHECK_VERSION=2026.2.1
+ARG STATICCHECK_SHA256=594421f28ba620ea14b98377cb84a309cf73cc420ba0f52f30c7fa4d92fd2b0e
+RUN curl -fsSL "https://github.com/dominikh/go-tools/releases/download/${STATICCHECK_VERSION}/staticcheck_linux_arm64.tar.gz" \
+        -o /tmp/staticcheck.tgz \
+    && echo "${STATICCHECK_SHA256}  /tmp/staticcheck.tgz" | sha256sum --check --strict - \
+    && tar --extract --gzip --file /tmp/staticcheck.tgz --directory /usr/local/bin \
+        --strip-components=1 --no-same-owner staticcheck/staticcheck \
+    && rm -f /tmp/staticcheck.tgz \
+    && chmod 0755 /usr/local/bin/staticcheck \
+    && ln -s /usr/local/bin/staticcheck /usr/bin/staticcheck
+
+# The Playwright 1.63 browsers (Chromium, Firefox, WebKit) and the Debian
+# libraries they need, in /opt/ms-playwright, readable by every user and
+# writable by none but root. A project locks @playwright/test 1.63.0 to use
+# them, and its builds never download browsers. PLAYWRIGHT_BROWSERS_PATH is set
+# for the runner's environment; the harness hands it to a project's shell only
+# when the project declares it.
+#
+# TRUSTED DIFFERENTLY FROM THE ARCHIVES ABOVE, and said plainly: `npx` fetches
+# the playwright package from the npm registry at image build time (pinned by
+# version, checked by npm against the registry's own integrity record), and
+# that package downloads the browser builds its version names from
+# Playwright's own download host. No sha256 is recorded here for either. Like
+# every download in this file this needs network at image build time only;
+# nothing is fetched when the image runs. npm's and Playwright's working files
+# from the install are removed in the same layer.
+ARG PLAYWRIGHT_VERSION=1.63.0
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
+RUN npx -y "playwright@${PLAYWRIGHT_VERSION}" install --with-deps chromium firefox webkit \
+    && npx -y "playwright@${PLAYWRIGHT_VERSION}" --version | grep -qx "Version ${PLAYWRIGHT_VERSION}" \
+    && chmod -R a+rX,go-w "${PLAYWRIGHT_BROWSERS_PATH}" \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* /root/.npm /root/.cache
+
+# THE TOOLCHAIN SELF-CHECK. Every check runs as uid 1000 (the forge user; it
+# is created further down, so setpriv takes the number) in the Player's own
+# minimal environment — `env -i PATH=/usr/bin:/bin HOME=<fresh folder>` — so it
+# proves what the Player and Coach will actually find, not what root with this
+# image's PATH finds. Exact versions; cgo on, proved by building with the race
+# detector; GOTOOLCHAIN=local from go.env alone; and both Chromium binaries
+# Playwright uses (the full browser, and the headless shell its default
+# headless mode runs) loading a page headless. --no-sandbox is what Playwright
+# itself passes by default. Firefox and WebKit are checked for presence and
+# readability only: they have no one-line headless launch outside Playwright's
+# own driver, so launching all three browsers is the acceptance smoke run in
+# the built image, not this step.
+RUN check_home="$(mktemp -d)" \
+    && chown 1000:1000 "${check_home}" \
+    && as_player="setpriv --reuid=1000 --regid=1000 --clear-groups env -i PATH=/usr/bin:/bin HOME=${check_home}" \
+    && test "$(${as_player} node --version)" = "v${NODE_VERSION}" \
+    && test "$(${as_player} npm --version)" = "${NODE_NPM_VERSION}" \
+    && test "$(${as_player} npx --version)" = "${NODE_NPM_VERSION}" \
+    && ${as_player} go version | grep -q " go${GO_VERSION} linux/arm64$" \
+    && test "$(${as_player} go env GOTOOLCHAIN)" = "local" \
+    && test "$(${as_player} go env CGO_ENABLED)" = "1" \
+    && printf 'package main\n\nfunc main() {}\n' > "${check_home}/race.go" \
+    && ${as_player} go run -race "${check_home}/race.go" \
+    && ${as_player} gofmt -l "${check_home}/race.go" \
+    && test "$(${as_player} staticcheck -version)" = "staticcheck ${STATICCHECK_VERSION} (0.8.1)" \
+    && chrome="$(find "${PLAYWRIGHT_BROWSERS_PATH}" -path '*/chromium-*' -type f -name chrome)" \
+    && headless_shell="$(find "${PLAYWRIGHT_BROWSERS_PATH}" -path '*/chromium_headless_shell-*' -type f -name headless_shell)" \
+    && test -x "${chrome}" && test -x "${headless_shell}" \
+    && for browser in "${chrome}" "${headless_shell}"; do \
+           ${as_player} "${browser}" --headless --no-sandbox --disable-gpu --disable-dev-shm-usage \
+               --user-data-dir="${check_home}/profile" --dump-dom about:blank \
+               | grep -q '<body>' || exit 1; \
+       done \
+    && ${as_player} ls -d "${PLAYWRIGHT_BROWSERS_PATH}"/firefox-* "${PLAYWRIGHT_BROWSERS_PATH}"/webkit-* \
+    && rm -rf "${check_home}"
+
+# 2026-08-15 — HISTORICAL REASON, KEPT AS AN INERT SETTING. guardkit deleted
+# the DCL spec track outright (guardkit b138d92c) and forge's W1-S2 leg went
+# with it, so nothing shells the vendored checker any more. On 12 October 2026
+# Debian's Node 18 left this image for the pinned Node 22 above, where the
+# webcrypto global is on by default (from Node 19) and this flag is accepted
+# and changes nothing. It is kept, as the Phase 1 design records, rather than
+# removed as a side effect of the toolchain change. It reaches only processes
+# started with this image's own environment; the Player's shell does not
+# inherit it.
 #
 # The original reason, kept for the record: guardkit's vendored DCL checker
 # (qa/dcl/bin/dcl_check.mjs, WASM) needs a node runtime — the ``guardkit dcl
@@ -397,8 +555,9 @@ ENV NODE_OPTIONS=--experimental-global-webcrypto
 # These three instructions are the guard, and their PLACEMENT is the whole of
 # it: they are declared and consumed BEFORE the COPY below, so every layer
 # from here down carries the commit in its cache key and cannot be reused from
-# a build of a different commit. They sit after the apt and hurl layers on
-# purpose, so those stay cached and a rebuild does not re-download anything.
+# a build of a different commit. They sit after the apt, download and toolchain
+# layers on purpose, so those stay cached and a rebuild does not re-download
+# anything.
 #
 # The stamp file is what ``scripts/verify-forge-oracles.sh`` reads to prove the
 # image knows its own origin; the two environment variables are the same two
