@@ -17,6 +17,18 @@ from typing import Literal, Mapping
 FEATURE_ROUTING_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,256}\Z", re.ASCII)
 MAX_ERROR_LENGTH = 240
 
+# Terminal states shared by the router restart-blocker projection and the
+# live-pin count used for seat placement.  BUILD_QUEUED is planning-terminal;
+# its delivery gap is handled explicitly by both readers.
+_PLANNING_TERMINAL_STATES = (
+    "FAILED",
+    "CANCELLED",
+    "TIMED_OUT",
+    "PLANNED_HANDOFF",
+    "BUILD_QUEUED",
+)
+_BUILD_TERMINAL_STATES = ("COMPLETE", "FAILED", "CANCELLED", "SKIPPED")
+
 
 class FeatureRoutingError(RuntimeError):
     """Base class for fail-closed routing errors."""
@@ -285,6 +297,45 @@ class FeatureRoutingSeedStore:
             expected_feature_routing_id=key,
         )
 
+    def live_pin_counts(self) -> dict[int, int]:
+        """Count distinct routing keys per server that still have model work.
+
+        A key is live when its seed SUCCEEDED and its correlation has a
+        nonterminal planning run, a BUILD_QUEUED planning run whose build has
+        not been delivered yet, or a nonterminal (including paused) build.
+        Post-build work (merge cards, the merge and publication) is short
+        and is not counted.  Build routing keys fall back to the build
+        ID when the correlation ID is empty, as build admission does.
+        """
+        planning_marks = ",".join("?" for _ in _PLANNING_TERMINAL_STATES)
+        build_marks = ",".join("?" for _ in _BUILD_TERMINAL_STATES)
+        with self._lock:
+            self._require_clean_boundary()
+            rows = self._connection.execute(
+                "SELECT s.server_id, COUNT(DISTINCT s.feature_routing_id) "
+                "FROM feature_routing_seeds AS s "
+                "WHERE s.state = 'SUCCEEDED' AND s.server_id IS NOT NULL AND ("
+                "EXISTS (SELECT 1 FROM planning_runs AS p "
+                "WHERE p.correlation_id = s.feature_routing_id "
+                f"AND p.state NOT IN ({planning_marks})) "
+                "OR EXISTS (SELECT 1 FROM planning_runs AS p "
+                "WHERE p.correlation_id = s.feature_routing_id "
+                "AND p.state = 'BUILD_QUEUED' AND NOT EXISTS ("
+                "SELECT 1 FROM builds AS b "
+                "WHERE b.correlation_id = p.correlation_id)) "
+                "OR EXISTS (SELECT 1 FROM builds AS b "
+                "WHERE COALESCE(NULLIF(b.correlation_id, ''), b.build_id) "
+                "= s.feature_routing_id "
+                f"AND b.status NOT IN ({build_marks}))"
+                ") GROUP BY s.server_id",
+                (*_PLANNING_TERMINAL_STATES, *_BUILD_TERMINAL_STATES),
+            ).fetchall()
+        counts = {1: 0, 2: 0}
+        for server_id, count in rows:
+            if server_id in counts:
+                counts[server_id] = int(count)
+        return counts
+
     def state_for(self, feature_routing_id: str) -> str | None:
         key = validate_feature_routing_id(feature_routing_id)
         row = self._connection.execute(
@@ -332,14 +383,8 @@ def _router_restart_blockers_snapshot(
     # consume the same canonical reader separately.
     retired_planning_handoff_correlations(connection)
 
-    planning_terminal = (
-        "FAILED",
-        "CANCELLED",
-        "TIMED_OUT",
-        "PLANNED_HANDOFF",
-        "BUILD_QUEUED",
-    )
-    build_terminal = ("COMPLETE", "FAILED", "CANCELLED", "SKIPPED")
+    planning_terminal = _PLANNING_TERMINAL_STATES
+    build_terminal = _BUILD_TERMINAL_STATES
     blockers: list[str] = []
     planning_marks = ",".join("?" for _ in planning_terminal)
     for correlation_id, state in connection.execute(

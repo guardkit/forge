@@ -36,7 +36,7 @@ def test_started_and_success_are_committed_before_authority(tmp_path):
     path, connection, store = _store(tmp_path)
     observations = []
 
-    async def request(_url, key, _timeout):
+    async def request(_url, key, _timeout, _preference):
         with sqlite3.connect(path) as reader:
             observations.append(
                 reader.execute(
@@ -356,4 +356,245 @@ def test_restart_projection_requires_integer_merge_attempt_versions(
     assert router_restart_blockers(connection) == (
         "merge-approved-pending:build-version-type",
     )
+    connection.close()
+
+
+def _planning(connection, correlation_id, state):
+    connection.execute(
+        "INSERT INTO planning_runs "
+        "(correlation_id, state, request_text, originating_user, expected_approver, "
+        "triggered_by, queued_at) VALUES "
+        "(?, ?, 'request', 'owner', 'owner', 'forge-internal', datetime('now'))",
+        (correlation_id, state),
+    )
+
+
+def _build(connection, build_id, correlation_id, status, approval=None):
+    connection.execute(
+        "INSERT INTO builds "
+        "(build_id, feature_id, repo, branch, feature_yaml_path, status, "
+        "triggered_by, correlation_id, queued_at, pending_approval_request_id) "
+        "VALUES (?, 'FEAT-PIN', 'org/repo', 'feature/pin', 'f.yaml', ?, "
+        "'forge-internal', ?, datetime('now'), ?)",
+        (build_id, status, correlation_id, approval),
+    )
+
+
+def _seeded(store, key, server_id):
+    store.claim_initial_seed(key, f"token-{key}", origin_kind="planning", origin_id=key)
+    store.complete_seed(key, f"token-{key}", server_id)
+
+
+def test_live_pins_count_model_work_ahead_and_not_terminal_history(tmp_path):
+    _path, connection, store = _store(tmp_path)
+    assert store.live_pin_counts() == {1: 0, 2: 0}
+
+    # Delivery gap: planning handed over but the build row does not exist yet.
+    _planning(connection, "gap_A", "BUILD_QUEUED")
+    _seeded(store, "gap_A", 1)
+    # Planning-to-build overlap counts the routing key once.
+    _planning(connection, "overlap_A", "RUNNING")
+    _build(connection, "build-overlap", "overlap_A", "RUNNING")
+    _seeded(store, "overlap_A", 2)
+    # A paused build still holds its seat.
+    _planning(connection, "paused_A", "BUILD_QUEUED")
+    _build(connection, "build-paused", "paused_A", "PAUSED")
+    _seeded(store, "paused_A", 2)
+    # A build admitted without planning is keyed by its correlation.
+    _build(connection, "build-direct", "direct_A", "QUEUED")
+    _seeded(store, "direct_A", 1)
+    assert store.live_pin_counts() == {1: 2, 2: 2}
+
+    # Fully terminal history, including a merge card after COMPLETE, does not count.
+    _planning(connection, "done_A", "BUILD_QUEUED")
+    _build(connection, "build-done", "done_A", "COMPLETE", approval="approval-1")
+    _seeded(store, "done_A", 1)
+    _planning(connection, "failed_A", "FAILED")
+    _seeded(store, "failed_A", 2)
+    # Live work without a successful seed is not a pin.
+    _planning(connection, "unknown_A", "RUNNING")
+    store.claim_initial_seed(
+        "unknown_A", "token-unknown", origin_kind="planning", origin_id="unknown_A"
+    )
+    store.fail_seed("unknown_A", "token-unknown", state="UNKNOWN", reason="test")
+    assert store.live_pin_counts() == {1: 2, 2: 2}
+
+    connection.execute("UPDATE builds SET status='COMPLETE' WHERE build_id='build-paused'")
+    connection.execute("UPDATE planning_runs SET state='CANCELLED' WHERE correlation_id='overlap_A'")
+    connection.execute("UPDATE builds SET status='CANCELLED' WHERE build_id='build-overlap'")
+    assert store.live_pin_counts() == {1: 2, 2: 0}
+    connection.close()
+
+
+def test_live_pins_count_a_build_with_empty_correlation_under_its_build_id(tmp_path):
+    _path, connection, store = _store(tmp_path)
+    _build(connection, "build-bare", "", "RUNNING")
+    _seeded(store, "build-bare", 2)
+    assert store.live_pin_counts() == {1: 0, 2: 1}
+    connection.close()
+
+
+def _echo_gate(store, seen, *, delay=None, ack=None):
+    async def request(_url, key, _timeout, preference):
+        seen.append((key, preference))
+        if delay is not None:
+            await delay(key)
+        server = ack if ack is not None else preference
+        return 200, _headers(str(server), str(server))
+
+    return FeatureRoutingGate(store, "http://router.invalid", request=request)
+
+
+def test_preference_is_the_seat_with_fewer_live_pins(tmp_path):
+    _path, connection, store = _store(tmp_path)
+    seen = []
+    gate = _echo_gate(store, seen)
+
+    async def admit(key):
+        _planning(connection, key, "RUNNING")
+        return await gate.ensure_seeded(key, origin_kind="planning", origin_id=key)
+
+    first = asyncio.run(admit("pref_A"))
+    second = asyncio.run(admit("pref_B"))
+    assert seen == [("pref_A", 1), ("pref_B", 2)]
+    assert (first.server_id, second.server_id) == (1, 2)
+    # Terminal correlations are not counted: once pref_A ends, server 1 is emptier.
+    connection.execute("UPDATE planning_runs SET state='FAILED' WHERE correlation_id='pref_A'")
+    asyncio.run(admit("pref_C"))
+    assert seen[-1] == ("pref_C", 1)
+    connection.close()
+
+
+def test_recorded_server_comes_from_the_ack_not_the_preference(tmp_path):
+    _path, connection, store = _store(tmp_path)
+    seen = []
+    gate = _echo_gate(store, seen, ack=2)
+    _planning(connection, "fallback_A", "RUNNING")
+    receipt = asyncio.run(
+        gate.ensure_seeded("fallback_A", origin_kind="planning", origin_id="fallback_A")
+    )
+    assert seen == [("fallback_A", 1)]
+    assert receipt.server_id == 2
+    assert store.live_pin_counts() == {1: 0, 2: 1}
+    connection.close()
+
+
+@pytest.mark.parametrize(
+    "headers",
+    (
+        {},
+        {"x-feature-stored-server-id": "0", "x-feature-actual-server-id": "0"},
+        {"x-feature-stored-server-id": "1", "x-feature-actual-server-id": "2"},
+        {"x-feature-stored-server-id": "3", "x-feature-actual-server-id": "3"},
+    ),
+)
+def test_missing_or_invalid_ack_still_refuses(tmp_path, headers):
+    _path, connection, store = _store(tmp_path)
+
+    async def respond(_url, _key, _timeout, _preference):
+        message = Message()
+        for name, value in headers.items():
+            message[name] = value
+        return 200, message
+
+    gate = FeatureRoutingGate(store, "http://router.invalid", request=respond)
+    with pytest.raises(FeatureRoutingBlocked):
+        asyncio.run(gate.ensure_seeded("ack_A", origin_kind="planning", origin_id="A"))
+    assert store.state_for("ack_A") == "FAILED"
+    connection.close()
+
+
+def test_concurrent_different_keys_wait_for_the_earlier_placement(tmp_path):
+    _path, connection, store = _store(tmp_path)
+    _planning(connection, "race_A", "RUNNING")
+    _planning(connection, "race_B", "RUNNING")
+    seen = []
+
+    async def scenario():
+        release_first = asyncio.Event()
+
+        async def delay(key):
+            if key == "race_A":
+                await release_first.wait()
+
+        gate = _echo_gate(store, seen, delay=delay)
+        first = asyncio.create_task(
+            gate.ensure_seeded("race_A", origin_kind="planning", origin_id="race_A")
+        )
+        await asyncio.sleep(0)
+        second = asyncio.create_task(
+            gate.ensure_seeded("race_B", origin_kind="planning", origin_id="race_B")
+        )
+        for _ in range(20):
+            await asyncio.sleep(0)
+        # The second admission has not counted or sent while the first is open.
+        assert seen == [("race_A", 1)]
+        release_first.set()
+        return await asyncio.gather(first, second)
+
+    first, second = asyncio.run(scenario())
+    assert seen == [("race_A", 1), ("race_B", 2)]
+    assert (first.server_id, second.server_id) == (1, 2)
+    connection.close()
+
+
+@pytest.mark.parametrize("outcome", ("rejected", "ambiguous", "cancelled"))
+def test_failed_or_cancelled_seed_releases_the_placement_lock(tmp_path, outcome):
+    _path, connection, store = _store(tmp_path)
+    seen = []
+
+    async def scenario():
+        started = asyncio.Event()
+        never = asyncio.Event()
+
+        async def request(_url, key, _timeout, preference):
+            seen.append((key, preference))
+            if key == "other_B":
+                return 200, _headers(str(preference), str(preference))
+            if outcome == "rejected":
+                return 503, Message()
+            if outcome == "ambiguous":
+                raise ConnectionResetError("reset")
+            started.set()
+            await never.wait()
+
+        gate = FeatureRoutingGate(store, "http://router.invalid", request=request)
+        first = asyncio.create_task(
+            gate.ensure_seeded("stuck_A", origin_kind="planning", origin_id="A")
+        )
+        if outcome == "cancelled":
+            await asyncio.wait_for(started.wait(), timeout=2)
+            first.cancel()
+        with pytest.raises((FeatureRoutingBlocked, asyncio.CancelledError)):
+            await first
+        return await asyncio.wait_for(
+            gate.ensure_seeded("other_B", origin_kind="planning", origin_id="B"),
+            timeout=2,
+        )
+
+    receipt = asyncio.run(scenario())
+    assert receipt.server_id == 1
+    assert seen[-1] == ("other_B", 1)
+    assert store.state_for("stuck_A") == (
+        "FAILED" if outcome == "rejected" else "UNKNOWN"
+    )
+    connection.close()
+
+
+def test_eight_long_admissions_a_minute_apart_split_four_and_four(tmp_path):
+    """Simulation: admissions arrive a minute apart; every build runs for hours."""
+    _path, connection, store = _store(tmp_path)
+    seen = []
+    gate = _echo_gate(store, seen)
+
+    async def admissions():
+        for minute in range(8):
+            key = f"long_{minute}"
+            _planning(connection, key, "BUILD_QUEUED")
+            _build(connection, f"build-{minute}", key, "RUNNING")
+            await gate.ensure_seeded(key, origin_kind="build", origin_id=key)
+
+    asyncio.run(admissions())
+    assert [preference for _key, preference in seen] == [1, 2] * 4
+    assert store.live_pin_counts() == {1: 4, 2: 4}
     connection.close()
