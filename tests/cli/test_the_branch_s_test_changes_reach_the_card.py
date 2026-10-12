@@ -685,7 +685,7 @@ class TestAnExistingTestThatChangedIsNamed:
             gates=_gates(SimpleNamespace(test_changes=counted)),
         )
         assert (
-            "This branch removed 1 assertion in tests/users/test_router.py — "
+            "This branch removed or changed 1 assertion in tests/users/test_router.py — "
             "worth a look before you merge."
         ) in card
 
@@ -770,7 +770,7 @@ class TestTheWholeWayToTheCard:
         )
 
         assert (
-            "This branch deleted 1 test and removed 2 assertions in "
+            "This branch deleted 1 test and removed or changed 2 assertions in "
             "tests/users/test_router.py — worth a look before you merge."
         ) in card
 

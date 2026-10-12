@@ -359,7 +359,7 @@ class TestTheLineOnTheCard:
         )
 
         assert line == (
-            "This branch deleted 2 tests and removed 3 assertions in "
+            "This branch deleted 2 tests and removed or changed 3 assertions in "
             "tests/users/test_router.py — worth a look before you merge."
         )
 
@@ -373,14 +373,14 @@ class TestTheLineOnTheCard:
             )
         )
 
-        assert "deleted 1 test and removed 1 assertion in" in line
+        assert "deleted 1 test and removed or changed 1 assertion in" in line
 
     def test_only_assertions_removed_says_only_that(self) -> None:
         line = card_line_about_tests(
             ChangedTestsReport(files_changed=1, assertions_removed=2, files=(ROUTER,))
         )
 
-        assert line.startswith("This branch removed 2 assertions in")
+        assert line.startswith("This branch removed or changed 2 assertions in")
         assert "deleted" not in line
 
     def test_many_files_are_named_three_at_a_time_and_then_counted(self) -> None:
@@ -451,7 +451,7 @@ class TestTheLineOnTheCard:
         )
 
         assert line == (
-            "This branch removed 1 assertion in tests/users/test_router.py — "
+            "This branch removed or changed 1 assertion in tests/users/test_router.py — "
             "worth a look before you merge. It also changed 1 test file that "
             "already existed: tests/conftest.py."
         )

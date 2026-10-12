@@ -562,7 +562,11 @@ def card_line_about_tests(counts: Any) -> str:
             said.append(f"deleted {deleted} test{'s' if deleted != 1 else ''}")
         if removed:
             said.append(
-                f"removed {removed} assertion{'s' if removed != 1 else ''}"
+                # "removed or changed": the count includes an assertion whose
+                # words changed (a rewrite), and "removed" alone would say
+                # something false about a rewritten check.
+                f"removed or changed {removed} "
+                f"assertion{'s' if removed != 1 else ''}"
             )
         named = tuple(getattr(counts, "files", ()) or ())
         where = _names_the_files(named)
@@ -634,7 +638,7 @@ def card_line_about_files_that_already_existed(report: Any) -> str:
     * files that already existed were changed — how many, which (a test file
       marked as one, a deleted file as deleted, at most
       :data:`EXISTING_FILES_NAMED_ON_THE_CARD` named, then "and N more"), and
-      what that means for the test result above;
+      what that means for any passing result on the card;
     * the branch could not be read — said plainly, never as "nothing";
     * ``""`` when the branch only added files, or nobody read it at all.
     """
@@ -643,8 +647,8 @@ def card_line_about_files_that_already_existed(report: Any) -> str:
     if not bool(getattr(report, "read", False)):
         return (
             "Whether this branch changes files that already existed could not "
-            "be read here, so the test result above is not evidence that the "
-            "original tests pass unchanged."
+            "be read here, so any passing result on this card is not evidence "
+            "that the original tests pass unchanged."
         )
     existing = list(getattr(report, "files_that_already_existed", ()) or ())
     if not existing:
@@ -668,14 +672,14 @@ def card_line_about_files_that_already_existed(report: Any) -> str:
     count = len(existing)
     if count == 1:
         return (
-            f"This branch changes 1 file that already existed: {listing}. The "
-            "test result above was measured with this change, so it is not "
-            "evidence that the original tests pass unchanged."
+            f"This branch changes 1 file that already existed: {listing}. Any "
+            "passing result on this card was measured with this change, so it "
+            "is not evidence that the original tests pass unchanged."
         )
     return (
         f"This branch changes {count} files that already existed: {listing}. "
-        "The test result above was measured with these changes, so it is not "
-        "evidence that the original tests pass unchanged."
+        "Any passing result on this card was measured with these changes, so "
+        "it is not evidence that the original tests pass unchanged."
     )
 
 

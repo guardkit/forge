@@ -1532,11 +1532,27 @@ def run_the_scope_pass(
         request=request,
         request_source=source,
         request_why_not=why_not,
-        test_paths=_test_paths_of(repo_root_raw, repo_key, sandbox),
     )
     report.compared_against = base
     existing = list(report.files_that_already_existed)
-    if existing:
+    if report.read and existing:
+        # Only now is it worth asking where this repository keeps its tests:
+        # the answer only marks which of these files are tests. Asking for
+        # every card would cost a second wait on the sandbox for a branch that
+        # could not be read or only added files, and a sandbox that does not
+        # answer logs an alarming sentence about the checks for no reason.
+        from forge.pipeline.merge_ready_checkpoint import (
+            files_that_already_existed,
+            parse_changed_files,
+        )
+
+        existing = list(
+            files_that_already_existed(
+                parse_changed_files(str(getattr(reading, "name_status", "") or "")),
+                _test_paths_of(repo_root_raw, repo_key, sandbox),
+            )
+        )
+        report.files_that_already_existed = existing
         # The same list the card names, said in the log as well, so an
         # operator reading the build's own record sees it without the card.
         logger.info(

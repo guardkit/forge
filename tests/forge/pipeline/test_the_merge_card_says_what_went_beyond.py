@@ -488,6 +488,101 @@ class TestTheBranchIsHeldAgainstWhereTheBuildStarted:
         assert report is not None and report.compared_against == start
 
 
+class TestWhereTheTestsLiveIsAskedOnlyWhenItMatters:
+    """Where a repository keeps its tests only marks which files that already
+    existed are tests, and for a sandboxed repository asking costs a second
+    wait on its sidecar. So it is asked only when the branch was read and
+    something that already existed was changed (12 October 2026)."""
+
+    @staticmethod
+    def _asked(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+        from forge.pipeline import merge_offer
+
+        asked: list[str] = []
+
+        def _where_the_tests_live(repo_root: Any, repo_key: str, sandbox: Any) -> tuple[str, ...]:
+            asked.append(repo_key)
+            return ("**/tests/**", "src/users/**")
+
+        monkeypatch.setattr(merge_offer, "_test_paths_of", _where_the_tests_live)
+        return asked
+
+    @staticmethod
+    def _pass(pool: SqliteLifecyclePersistence, root: Path) -> ScopeReport | None:
+        config = ForgeConfig.model_validate(
+            {
+                "permissions": {"filesystem": {"allowlist": ["/tmp"]}},
+                "planning": {"target_repo_paths": {REPO: str(root)}},
+                "merge_executor": {"enabled": True},
+            }
+        )
+        _insert_build(pool)
+        return run_the_scope_pass(
+            config=config,
+            pool=pool,
+            build_id=BUILD_ID,
+            feature_id=FEATURE_ID,
+            row=pool.get_build_row(BUILD_ID),
+        )
+
+    def test_asked_when_a_file_that_already_existed_changed(
+        self,
+        pool: SqliteLifecyclePersistence,
+        repo_root: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        asked = self._asked(monkeypatch)
+
+        report = self._pass(pool, repo_root)
+
+        assert asked == [REPO]
+        assert report is not None
+        assert [item.path for item in report.files_that_already_existed] == [
+            "src/users/router.py"
+        ]
+        # the answer is used: the declared path marks the router as a test
+        assert report.files_that_already_existed[0].is_test is True
+
+    def test_not_asked_when_the_branch_could_not_be_read(
+        self,
+        pool: SqliteLifecyclePersistence,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        asked = self._asked(monkeypatch)
+        nowhere = tmp_path / "not-a-repository"
+        nowhere.mkdir()
+
+        report = self._pass(pool, nowhere)
+
+        assert report is not None and report.read is False
+        assert asked == []
+
+    def test_not_asked_when_the_branch_only_added_files(
+        self,
+        pool: SqliteLifecyclePersistence,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        asked = self._asked(monkeypatch)
+        root = tmp_path / "only-adds"
+        root.mkdir()
+        _git(root, "init", "-q", "-b", "main")
+        _write(root, "README.md", "a repository\n")
+        _git(root, "add", "-A")
+        _git(root, "commit", "-q", "-m", "base")
+        _git(root, "checkout", "-q", "-b", BRANCH)
+        _write(root, "src/new.py", "def new():\n    return 1\n")
+        _git(root, "add", "-A")
+        _git(root, "commit", "-q", "-m", "only adds")
+
+        report = self._pass(pool, root)
+
+        assert report is not None and report.read is True
+        assert report.files_that_already_existed == []
+        assert asked == []
+
+
 class TestTheCardAndTheDurableRow:
     def test_the_card_says_what_went_beyond_the_plan_and_the_request(
         self,
@@ -568,9 +663,9 @@ class TestTheCardAndTheDurableRow:
         words = recorder.paused.rationale
         sentence = (
             "This branch changes 1 file that already existed: "
-            "src/users/router.py. The test result above was measured with this "
-            "change, so it is not evidence that the original tests pass "
-            "unchanged."
+            "src/users/router.py. Any passing result on this card was measured "
+            "with this change, so it is not evidence that the original tests "
+            "pass unchanged."
         )
         assert sentence in words
         assert words.index(sentence) < words.index("Approve =")
@@ -770,9 +865,9 @@ class TestTheRepairJourneysCardCarriesTheSameLine:
         words = recorder.paused.rationale
         sentence = (
             "This branch changes 1 file that already existed: "
-            "src/users/router.py. The test result above was measured with this "
-            "change, so it is not evidence that the original tests pass "
-            "unchanged."
+            "src/users/router.py. Any passing result on this card was measured "
+            "with this change, so it is not evidence that the original tests "
+            "pass unchanged."
         )
         assert sentence in words
         assert words.index("What was checked") < words.index(sentence)

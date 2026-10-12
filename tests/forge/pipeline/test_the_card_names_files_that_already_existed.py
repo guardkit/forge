@@ -35,12 +35,14 @@ BRANCH = f"autobuild/{FEATURE_ID}"
 URL_TEST = "tests/test_conftest_database_url.py"
 
 #: The design's own sentence (factory-reliability-repairs-2026-10-12.md,
-#: repair 2 part B), as it reads on a plain-text card.
+#: repair 2 part B), as it reads on a plain-text card. Its second sentence
+#: says "any passing result on this card" rather than "the test result above",
+#: because the line above can be one saying the evidence was unavailable.
 THE_DESIGNS_SENTENCE = (
     "This branch changes 3 files that already existed: pyproject.toml, "
-    "requirements.txt, tests/test_conftest_database_url.py (a test file). The "
-    "test result above was measured with these changes, so it is not evidence "
-    "that the original tests pass unchanged."
+    "requirements.txt, tests/test_conftest_database_url.py (a test file). Any "
+    "passing result on this card was measured with these changes, so it is not "
+    "evidence that the original tests pass unchanged."
 )
 
 _GIT_ENV = {
@@ -170,8 +172,8 @@ class TestWhichFilesAreListed:
         ]
         assert card_line_about_files_that_already_existed(report) == (
             "This branch changes 1 file that already existed: requirements.txt "
-            "(deleted). The test result above was measured with this change, so "
-            "it is not evidence that the original tests pass unchanged."
+            "(deleted). Any passing result on this card was measured with this "
+            "change, so it is not evidence that the original tests pass unchanged."
         )
 
     def test_a_copied_file_is_new_and_its_original_is_untouched(self) -> None:
@@ -242,8 +244,8 @@ class TestTheWordsOnTheCard:
         assert report.read is False
         assert card_line_about_files_that_already_existed(report) == (
             "Whether this branch changes files that already existed could not "
-            "be read here, so the test result above is not evidence that the "
-            "original tests pass unchanged."
+            "be read here, so any passing result on this card is not evidence "
+            "that the original tests pass unchanged."
         )
 
     def test_nobody_read_the_branch_means_nothing_is_said(self) -> None:
