@@ -638,7 +638,8 @@ def card_line_about_files_that_already_existed(report: Any) -> str:
     * files that already existed were changed — how many, which (a test file
       marked as one, a deleted file as deleted, at most
       :data:`EXISTING_FILES_NAMED_ON_THE_CARD` named, then "and N more"), and
-      what that means for any passing result on the card;
+      what that means for any passing result on the card. Test files are
+      named first, then deleted files, so neither is lost to the cut;
     * the branch could not be read — said plainly, never as "nothing";
     * ``""`` when the branch only added files, or nobody read it at all.
     """
@@ -653,16 +654,33 @@ def card_line_about_files_that_already_existed(report: Any) -> str:
     existing = list(getattr(report, "files_that_already_existed", ()) or ())
     if not existing:
         return ""
-    named: list[str] = []
-    for item in existing[:EXISTING_FILES_NAMED_ON_THE_CARD]:
+    read: list[tuple[str, bool, bool]] = []
+    for item in existing:
         if isinstance(item, Mapping):
-            path = str(item.get("path", "") or "")
-            is_test = bool(item.get("is_test"))
-            deleted = bool(item.get("deleted"))
+            read.append(
+                (
+                    str(item.get("path", "") or ""),
+                    bool(item.get("is_test")),
+                    bool(item.get("deleted")),
+                )
+            )
         else:
-            path = str(getattr(item, "path", item) or "")
-            is_test = bool(getattr(item, "is_test", False))
-            deleted = bool(getattr(item, "deleted", False))
+            read.append(
+                (
+                    str(getattr(item, "path", item) or ""),
+                    bool(getattr(item, "is_test", False)),
+                    bool(getattr(item, "deleted", False)),
+                )
+            )
+    # TEST FILES FIRST, then deleted files, then the rest, before the list is
+    # cut. git lists files in path order, so a test file usually sorts late,
+    # and cut in that order a changed existing test could fall into "and N
+    # more" — on the routine card, which has no other line about tests, it
+    # would then be hidden altogether. The sort is stable, so each group keeps
+    # git's order.
+    read.sort(key=lambda entry: (not entry[1], not entry[2]))
+    named: list[str] = []
+    for path, is_test, deleted in read[:EXISTING_FILES_NAMED_ON_THE_CARD]:
         notes = (["a test file"] if is_test else []) + (["deleted"] if deleted else [])
         named.append(f"{path} ({', '.join(notes)})" if notes else path)
     listing = ", ".join(named)
@@ -1033,10 +1051,18 @@ def make_merge_card_publisher(
             branch,
             resolved_feature,
         )
+        # The scope report rides on the merge offer's durable row, as it does
+        # for the routine card, so the files that already existed are on the
+        # record for every build that reaches a card (12 October 2026).
         published = await offer_service.offer(
             build_id=build_id,
             feature_id=resolved_feature,
             card_words=_words,
+            extra_details=(
+                {"scope_report": scope.to_dict()}
+                if scope is not None and hasattr(scope, "to_dict")
+                else None
+            ),
         )
         if not published:
             raise MergeCardNotPublished(

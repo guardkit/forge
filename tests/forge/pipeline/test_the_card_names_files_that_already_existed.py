@@ -37,10 +37,12 @@ URL_TEST = "tests/test_conftest_database_url.py"
 #: The design's own sentence (factory-reliability-repairs-2026-10-12.md,
 #: repair 2 part B), as it reads on a plain-text card. Its second sentence
 #: says "any passing result on this card" rather than "the test result above",
-#: because the line above can be one saying the evidence was unavailable.
+#: because the line above can be one saying the evidence was unavailable, and
+#: it names the test file first, so a long list can never cut it off.
 THE_DESIGNS_SENTENCE = (
-    "This branch changes 3 files that already existed: pyproject.toml, "
-    "requirements.txt, tests/test_conftest_database_url.py (a test file). Any "
+    "This branch changes 3 files that already existed: "
+    "tests/test_conftest_database_url.py (a test file), pyproject.toml, "
+    "requirements.txt. Any "
     "passing result on this card was measured with these changes, so it is not "
     "evidence that the original tests pass unchanged."
 )
@@ -228,6 +230,29 @@ class TestTheWordsOnTheCard:
         shown = EXISTING_FILES_NAMED_ON_THE_CARD
         assert f"src/module_{shown - 1}.py and {9 - shown} more." in line
         assert f"src/module_{shown}.py" not in line
+
+    def test_a_test_file_that_sorts_last_is_still_named_and_marked(self) -> None:
+        """git lists paths in order, and tests usually sort late. Cut in that
+        order, the one changed test would vanish into "and N more"."""
+        report = scope_of_the_build(
+            reading=BranchScopeReading(
+                name_status="".join(
+                    f"M\0src/app/{name}.py\0" for name in "abcdefg"
+                )
+                + "D\0src/app/old.py\0"
+                + f"M\0{URL_TEST}\0"
+            ),
+            request=None,
+        )
+        assert [item.path for item in report.files_that_already_existed][-1] == URL_TEST
+
+        line = card_line_about_files_that_already_existed(report)
+
+        assert line.startswith(
+            "This branch changes 9 files that already existed: "
+            f"{URL_TEST} (a test file), src/app/old.py (deleted), src/app/a.py, "
+            "src/app/b.py, src/app/c.py, src/app/d.py and 3 more. "
+        )
 
     def test_an_unreadable_branch_says_so_instead_of_listing(
         self, tmp_path: Path

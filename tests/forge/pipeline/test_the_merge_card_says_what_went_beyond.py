@@ -871,6 +871,17 @@ class TestTheRepairJourneysCardCarriesTheSameLine:
         )
         assert sentence in words
         assert words.index("What was checked") < words.index(sentence)
+        # and the merge offer's durable row keeps the same list
+        offered = [
+            stage
+            for stage in pool.read_stages(BUILD_ID)
+            if stage.target_identifier == MERGE_OFFER_TARGET_IDENTIFIER
+        ]
+        assert len(offered) == 1
+        kept = offered[0].details[MERGE_OFFER_DETAILS_KEY]["scope_report"]
+        assert kept["files_that_already_existed"] == [
+            {"path": "src/users/router.py", "deleted": False, "is_test": False}
+        ]
 
     def test_the_receipt_is_written_before_anyone_is_asked_to_merge(
         self,
