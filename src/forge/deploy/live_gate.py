@@ -441,7 +441,8 @@ def project_driver_answer(
     video), ``report_ref`` (the HTML report) and ``outcome`` (the test counts
     ``passed``, ``failed``, ``skipped`` and ``flaky``). Every one is optional,
     and an envelope without them reads exactly as it did before: no refs, no
-    report and no counts.
+    report and no counts. This reading is not behind the review_preview switch:
+    it only adds optional fields, and nothing but the preview acts on them.
     """
     import json
 
