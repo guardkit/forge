@@ -261,6 +261,34 @@ class TestAnApprovalThePreviewRefuses:
         assert lines[0]["detail"]["refusal"] == (
             "the approval was refused: the preview could not be checked (OSError)"
         )
+        # A check that could not be made is not a verdict on the preview: it
+        # is left standing, so the same card can be approved later.
+        assert preview.released == []
+
+    @pytest.mark.asyncio
+    async def test_after_a_check_that_could_not_be_made_the_card_can_still_be_approved(
+        self, config, pool
+    ) -> None:
+        _write_previewed_offer(pool)
+        failures = [OSError("ledger busy")]
+
+        class _BusyOnce(StandInReviewPreview):
+            def approval_refusal(self, review_evidence, *, now):
+                if failures:
+                    raise failures.pop()
+                return super().approval_refusal(review_evidence, now=now)
+
+        preview = _BusyOnce()
+        consumer, publisher, gk, dp = _consumer(config, pool, preview)
+        await consumer.handle_envelope(_envelope())
+        await _drain(consumer)
+        assert gk.calls == [] and preview.released == []
+
+        await consumer.handle_envelope(_envelope())
+        await _drain(consumer)
+
+        assert len(gk.calls) == 1
+        assert MERGE_DECISION_TARGET_IDENTIFIER in _stage_ids(pool)
 
 
 # ---------------------------------------------------------------------------

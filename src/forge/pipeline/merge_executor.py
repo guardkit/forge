@@ -227,6 +227,7 @@ __all__ = [
     "deployed_in_for",
     "merge_wall_seconds",
     "sandbox_merge_words",
+    "why_a_previewed_offer_is_refused",
 ]
 
 #: CORE subscription filter — one token per feature (``merge-FEAT-X``).
@@ -1371,8 +1372,11 @@ async def execute_merge_deploy(
 
     ``expected_preview_tree`` is the tree an offer with a review preview
     previewed (web-readiness W7). When it is set, a joined tree that differs
-    from it is refused before anything is checked or published; when it is
-    ``None`` — every offer without a preview — nothing here changes.
+    from it is refused after the join — so after the build system's own checks
+    inside the merge command have run on it — and before the factory's live
+    check, any publication or any deploy; nothing reaches the target branch.
+    When it is ``None`` — every offer without a preview — nothing here
+    changes.
     """
     # Permanent administrative retirement is checked before routing, clocks,
     # receipts, leases, publishers, git, model-bearing commands, or deploy.
@@ -4745,9 +4749,11 @@ async def execute_merge_deploy(
 
             # THE TREE THAT WAS PREVIEWED IS THE ONLY TREE THIS APPROVAL MAY
             # MERGE (web-readiness W7, R3). The offer previewed the candidate
-            # joined onto the main it pinned; if main has moved since, the
-            # join made now is a different tree that nobody tried. It is
-            # refused like a candidate that moved, and nothing is merged.
+            # joined onto the target branch as fetched then; if the branch has
+            # moved since, the join made now is a different tree that nobody
+            # tried. It is refused like a candidate that moved: the build
+            # system's checks inside the join have already run on it, but the
+            # live check, publication and deploy never happen.
             if expected_preview_tree and j_tree != expected_preview_tree:
                 logger.warning(
                     "merge-executor: refusing %s — main moved since the "
@@ -5552,6 +5558,33 @@ def _deploy_task_id(feature_id: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+def why_a_previewed_offer_is_refused(
+    service: Any, offer: dict[str, Any], *, now: datetime
+) -> tuple[str | None, bool]:
+    """Why an offer with a review preview may not be approved now (web-readiness W7).
+
+    ``(None, False)`` when it may. Otherwise ``(reason, definitive)``:
+    ``definitive`` is True when the preview itself answers no (not ready,
+    expired, its lease ended, its evidence gone, no previewed tree on the
+    offer), and False when the check could not be made at all (no service
+    here, or a check that raised). It fails closed either way; only a
+    definitive refusal should end the preview. Shared by the card's press and
+    ``forge merge-deploy``.
+    """
+    if not str(offer.get("preview_tree") or "").strip():
+        return "the offer does not say which tree was previewed", True
+    if service is None:
+        return (
+            "the preview service is not running here, so the preview "
+            "cannot be confirmed"
+        ), False
+    try:
+        refusal = service.approval_refusal(offer.get("review_evidence"), now=now)
+    except Exception as exc:  # noqa: BLE001 — a refusal, never a pass
+        return f"the preview could not be checked ({type(exc).__name__})", False
+    return refusal, refusal is not None
+
+
 class MergeApprovalConsumer:
     """Consumes merge-card presses and runs the executor on a genuine approve.
 
@@ -5672,7 +5705,9 @@ class MergeApprovalConsumer:
         # decision, and the card can still be rejected. Offers without
         # ``review_evidence`` never reach this.
         if decision == "approve" and "review_evidence" in offer:
-            refusal = self._why_the_preview_refuses(offer)
+            refusal, definitive = why_a_previewed_offer_is_refused(
+                self._deps.review_preview, offer, now=self._deps.clock()
+            )
             if refusal is not None:
                 logger.warning(
                     "merge-executor: refusing %s — %s; no decision is "
@@ -5691,9 +5726,14 @@ class MergeApprovalConsumer:
                     target_branch=None,
                     refusal=f"the approval was refused: {refusal}",
                 )
-                await self._release_the_preview(
-                    offer, build_id=build_id, reason=f"approval refused: {refusal}"
-                )
+                # Only a definitive refusal ends the preview. One that came
+                # from a check that could not be made (a service that is not
+                # here, a check that raised) leaves it standing, so the same
+                # card can be approved once the check can be made again.
+                if definitive:
+                    await self._release_the_preview(
+                        offer, build_id=build_id, reason=f"approval refused: {refusal}"
+                    )
                 return
 
         # Durable decision row FIRST — the restart / duplicate fence.  An
@@ -5907,27 +5947,6 @@ class MergeApprovalConsumer:
                 await self._release_the_preview(
                     previewed_offer, build_id=build_id, reason=ended
                 )
-
-    def _why_the_preview_refuses(self, offer: dict[str, Any]) -> str | None:
-        """Why this previewed offer may not be approved now, or ``None``.
-
-        Fails closed: no service here, or a service whose check raises, is a
-        refusal in its own words, never a pass.
-        """
-        if not str(offer.get("preview_tree") or "").strip():
-            return "the offer does not say which tree was previewed"
-        service = self._deps.review_preview
-        if service is None:
-            return (
-                "the preview service is not running here, so the preview "
-                "cannot be confirmed"
-            )
-        try:
-            return service.approval_refusal(
-                offer.get("review_evidence"), now=self._deps.clock()
-            )
-        except Exception as exc:  # noqa: BLE001 — a refusal, never a pass
-            return f"the preview could not be checked ({type(exc).__name__})"
 
     async def _release_the_preview(
         self, offer: dict[str, Any], *, build_id: str, reason: str
