@@ -639,3 +639,42 @@ class TestThePreviewJoinsWhatThePressJoins:
         assert f"previewed tree {offer['preview_tree']}" in detail
         assert "main moved since the preview" in detail
         assert dp.calls == []
+
+
+# ---------------------------------------------------------------------------
+# Previews on, but the service could not start: every card fails closed (R2)
+# ---------------------------------------------------------------------------
+
+
+class TestThePreviewServiceCouldNotStart:
+    @pytest.mark.asyncio
+    async def test_the_card_carries_a_failed_preview_and_approval_is_refused(
+        self, config, pool, repo_root
+    ) -> None:
+        from forge.deploy.review_preview import UnavailableReviewPreview
+
+        stand_in = UnavailableReviewPreview("RuntimeError: no ledger")
+        offer = await _offer_with_a_preview(config, pool, stand_in)
+
+        reason = (
+            "previews are switched on but the preview service could not start: "
+            "RuntimeError: no ledger"
+        )
+        assert offer["review_evidence"]["state"] == "failed"
+        assert offer["review_evidence"]["failure_reason"] == reason
+        consumer, publisher, gk, dp = _consumer(
+            config, pool, stand_in, guardkit=_JoinsForReal()
+        )
+        await consumer.handle_envelope(_envelope(correlation_id=f"corr-{BUILD_ID}"))
+        await _drain(consumer)
+
+        assert gk.calls == [] and dp.calls == []
+        assert MERGE_DECISION_TARGET_IDENTIFIER not in _stage_ids(pool)
+        lines = json.loads(_the_record(pool)[2])
+        assert lines[0]["detail"]["refusal"] == f"the approval was refused: {reason}"
+        # Reject still ends it.
+        await consumer.handle_envelope(
+            _envelope(decision="reject", correlation_id=f"corr-{BUILD_ID}")
+        )
+        await _drain(consumer)
+        assert [r.result for r in publisher.reports] == ["rejected"]

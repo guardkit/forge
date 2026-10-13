@@ -708,31 +708,38 @@ def bind_production_dispatch_chain(
         # The review previews (web-readiness W7): one service, shared by the
         # card that prepares a preview and the press that checks and releases
         # it, and handed to the serve loop for its start-up reconcile and its
-        # sweep. A composition failure leaves previews off, never boot.
+        # sweep. A composition failure never stops boot, and with previews
+        # switched on it never lets an unpreviewed card out either: every card
+        # then carries a failed preview record with the reason, and no Approve.
         global review_preview_service
         review_preview: Any = None
-        try:
-            _merge_cfg = getattr(forge_config, "merge_executor", None)
-            _preview_cfg = getattr(forge_config, "review_preview", None)
-            if (
-                _merge_cfg is not None
-                and _merge_cfg.enabled
-                and _preview_cfg is not None
-                and _preview_cfg.enabled
-            ):
+        _merge_cfg = getattr(forge_config, "merge_executor", None)
+        _preview_cfg = getattr(forge_config, "review_preview", None)
+        if (
+            _merge_cfg is not None
+            and _merge_cfg.enabled
+            and _preview_cfg is not None
+            and _preview_cfg.enabled
+        ):
+            try:
                 review_preview = compose_review_preview(
                     forge_config=forge_config,
                     sqlite_pool=sqlite_pool,
                     nats_client=client,
                     db_path=db_path,
                 )
-        except Exception as exc:  # noqa: BLE001 — DDR-007 boot protection
-            review_preview = None
-            logger.error(
-                "forge-serve: review-preview composition FAILED (%s) — merge "
-                "cards carry no preview until fixed",
-                exc,
-            )
+            except Exception as exc:  # noqa: BLE001 — DDR-007 boot protection
+                from forge.deploy.review_preview import UnavailableReviewPreview
+
+                review_preview = UnavailableReviewPreview(
+                    f"{type(exc).__name__}: {exc}"
+                )
+                logger.error(
+                    "forge-serve: review-preview composition FAILED (%s) — every "
+                    "merge card carries a failed preview and no Approve until "
+                    "fixed",
+                    exc,
+                )
         review_preview_service = review_preview
         try:
             _merge_cfg = getattr(forge_config, "merge_executor", None)

@@ -362,3 +362,23 @@ class TestPreparationBeforeTheRow:
                 "reason": "the merge card could not be published",
             }
         ]
+
+
+@pytest.mark.asyncio
+async def test_a_service_that_could_not_start_puts_its_reason_on_the_card(
+    config, pool
+) -> None:
+    from forge.deploy.review_preview import UnavailableReviewPreview
+
+    _insert_build(pool)
+    recorder = _Recorder()
+    await _service(
+        config, pool, recorder, review_preview=UnavailableReviewPreview("OSError: x")
+    ).maybe_offer(_event())
+
+    paused = recorder.events[1][1]
+    assert paused.review_evidence.state == "failed"
+    assert paused.rationale.endswith(
+        "\nPreview could not be prepared: previews are switched on but the preview "
+        "service could not start: OSError: x; Approve is not available."
+    )

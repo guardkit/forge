@@ -574,11 +574,20 @@ def make_run_live_gate_handler(*, live_gate_invoker: LiveGateInvoker):
                 "attempts_ledger_ref": invocation.attempts_ledger_ref,
                 "leak_sweep_findings": invocation.leak_sweep_findings,
                 "dry_run": invocation.dry_run,
-                # The journey's own evidence (web readiness W7). Read only by
-                # the review preview; every other reader ignores them.
-                "media_refs": list(invocation.media_refs),
-                "report_ref": invocation.report_ref,
-                "outcome": invocation.outcome,
+                # The journey's own evidence (web readiness W7), only when the
+                # review preview's journey read some: every other gate's
+                # result is byte for byte what it was.
+                **(
+                    {
+                        "media_refs": list(invocation.media_refs),
+                        "report_ref": invocation.report_ref,
+                        "outcome": invocation.outcome,
+                    }
+                    if invocation.media_refs
+                    or invocation.report_ref is not None
+                    or invocation.outcome is not None
+                    else {}
+                ),
             },
         )
 

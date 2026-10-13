@@ -674,6 +674,47 @@ async def test_every_failure_is_torn_down_and_never_approvable(
     assert world.service.approval_refusal(record, now=START) is not None
 
 
+@pytest.mark.parametrize(
+    "files",
+    [
+        pytest.param({"index.html": b"report"}, id="html-only"),
+        pytest.param({"index.html": b"report", "shots/a.png": b"png"}, id="screenshots-only"),
+        pytest.param({"index.html": b"report", "video/j.webm": b"webm"}, id="video-only"),
+        pytest.param(
+            {"index.html": b"report", "shots/a.png": b"png", "trace.zip": b"zip"},
+            id="video-only-on-failure",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_passing_journey_without_its_recording_is_not_ready(
+    world: World, files: dict[str, bytes]
+) -> None:
+    world.venue.evidence = (_archive(files), None)
+    world.dispatch.journey_changes = {"screenshot_refs": [], "media_refs": []}
+    evidence = await world.service.prepare(_request())
+    assert evidence.state == "failed"
+    assert evidence.failure_reason == (
+        "the passing journey left no video/screenshots (failure-only recording?)"
+    )
+    assert world.lease("pv000000000001").state == "failed"
+    assert world.venue.named("remove_project") == ["pv000000000001"]
+    assert world.service.approval_refusal(evidence.model_dump(mode="json"), now=START)
+
+
+@pytest.mark.asyncio
+async def test_a_passing_journey_with_video_and_screenshots_is_ready(world: World) -> None:
+    world.venue.evidence = (
+        _archive({"index.html": b"r", "shots/a.png": b"png", "video/j.webm": b"webm"}),
+        None,
+    )
+    world.dispatch.journey_changes = {"screenshot_refs": [], "media_refs": []}
+    evidence = await world.service.prepare(_request())
+    assert evidence.state == "ready", evidence.failure_reason
+    assert any(url.endswith(".webm") for url in evidence.media_urls)
+    assert any(url.endswith(".png") for url in evidence.media_urls)
+
+
 @pytest.mark.asyncio
 async def test_a_failed_journey_links_its_report_as_diagnostics(world: World) -> None:
     _journey_red(world)
@@ -888,6 +929,7 @@ async def test_every_link_built_from_evidence_names_is_plain(world: World) -> No
                 "index.html": b"report",
                 "shots/a b\\c.png": b"png",
                 "shots/tab\there.png": b"png",
+                "video/a b.webm": b"webm",
             }
         ),
         None,
@@ -896,7 +938,7 @@ async def test_every_link_built_from_evidence_names_is_plain(world: World) -> No
     evidence = await world.service.prepare(_request())
     assert evidence.state == "ready", evidence.failure_reason
     links = [evidence.app_url, evidence.report_url, *evidence.media_urls]
-    assert len(links) == 4
+    assert len(links) == 5
     for link in links:
         assert "\\" not in link and not any(ch.isspace() for ch in link)
         assert all(ord(ch) >= 32 for ch in link)
@@ -1484,18 +1526,30 @@ def test_a_host_sidecar_refuses_the_preview_routes(monkeypatch) -> None:
 
 
 class _Invoker:
-    def __init__(self, cwd: str | None = None, env: dict[str, str] | None = None) -> None:
-        self.cwd, self.env = cwd, dict(env or {})
+    """Answers with the journey's evidence only when it was asked to read it."""
+
+    def __init__(
+        self,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        journey: bool = False,
+    ) -> None:
+        self.cwd, self.env, self.journey = cwd, dict(env or {}), journey
 
     def with_repo_path(self, path: Any) -> "_Invoker":
-        return _Invoker(str(path), self.env)
+        return _Invoker(str(path), self.env, self.journey)
 
     def with_extra_env(self, overlay: dict[str, str]) -> "_Invoker":
-        return _Invoker(self.cwd, {**self.env, **overlay})
+        return _Invoker(self.cwd, {**self.env, **overlay}, self.journey)
+
+    def with_journey_evidence(self) -> "_Invoker":
+        return _Invoker(self.cwd, self.env, True)
 
     def invoke(self, *, feature: str, target: str, gates: tuple[str, ...] = ()):
         from forge.deploy.live_gate import LiveGateInvocation
 
+        if not self.journey:
+            return LiveGateInvocation(verdict="pass", run_id="journey-1")
         return LiveGateInvocation(
             verdict="pass",
             run_id="journey-1",
