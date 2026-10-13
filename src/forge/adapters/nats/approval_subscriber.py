@@ -67,7 +67,7 @@ from nats_core.topics import Topics
 from pydantic import ValidationError
 
 from forge.config.models import ApprovalConfig
-from forge.gating.identity import derive_request_id
+from forge.gating.identity import derive_request_id, parse_request_id
 
 if TYPE_CHECKING:  # pragma: no cover - import-time only
     from forge.pipeline import BuildContext, PipelineLifecycleEmitter
@@ -286,6 +286,25 @@ class ApprovalSubscriberDeps:
 # ---------------------------------------------------------------------------
 # Subscriber
 # ---------------------------------------------------------------------------
+
+
+def _answers_this_gate(
+    payload: ApprovalResponsePayload, *, build_id: str, stage_label: str
+) -> bool:
+    """False only for a ``reject`` whose request id is not this gate's.
+
+    A request id carries build, stage and attempt (:func:`parse_request_id`);
+    the attempt is ignored, because a refreshed card is the same decision at
+    the same gate. An id that does not parse counts as another gate's.
+    Approve, override and defer are not checked here.
+    """
+    if payload.decision != "reject":
+        return True
+    try:
+        card_build_id, card_stage, _attempt = parse_request_id(payload.request_id)
+    except ValueError:
+        return False
+    return card_build_id == build_id and card_stage == stage_label
 
 
 class ApprovalSubscriber:
@@ -541,6 +560,24 @@ class ApprovalSubscriber:
                     payload = await asyncio.wait_for(queue.get(), timeout=wait)
                 except asyncio.TimeoutError:
                     payload = None
+
+                if payload is not None and not _answers_this_gate(
+                    payload, build_id=build_id, stage_label=stage_label
+                ):
+                    # A rejection names the gate it was issued for. One for
+                    # another gate of this build (an earlier one, arriving
+                    # late) must not cancel the gate it is waiting at now;
+                    # any copy of THIS gate's card, refreshed or not, still
+                    # applies (design 2026-10-13 section 4 step 5). Same
+                    # queue, attempt, budget and subscription: keep waiting.
+                    logger.warning(
+                        "approval_subscriber: a rejection for another gate was "
+                        "ignored build_id=%s stage=%s request_id=%r",
+                        build_id,
+                        stage_label,
+                        payload.request_id,
+                    )
+                    continue
 
                 if payload is not None:
                     logger.debug(
