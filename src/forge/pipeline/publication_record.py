@@ -137,9 +137,11 @@ def default_lease_seconds() -> int:
     """How long a worker holds a build's record before it may be taken over.
 
     Long enough that a healthy press is never taken over mid-step, short
-    enough that a dead one is not waited on all day. A worker renews while it
-    works, so the number only bounds how long a *stopped* worker keeps its
-    claim.
+    enough that a dead one is not waited on all day. A step that may run
+    longer than this pushes the lease out first and puts it back afterwards:
+    since 13 October 2026 the merge press renews it to cover the merge
+    command's whole wall before sending that command, and back to this length
+    once it has answered. Nothing else renews it.
     """
     return 1800
 

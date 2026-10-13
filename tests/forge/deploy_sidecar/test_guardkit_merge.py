@@ -1022,3 +1022,145 @@ def test_the_fix_journeys_branch_reaches_the_command_over_the_wire(
     finally:
         server.shutdown()
         server.server_close()
+
+
+# ---------------------------------------------------------------------------
+# A declared setting reaches the merge command, through the real route
+# (13 October 2026, the merge-install design, item 7)
+# ---------------------------------------------------------------------------
+
+#: A name the stand-in project declares in its committed launch block.
+DECLARED_FOR_THE_MERGE = "PLAYWRIGHT_BROWSERS_PATH"
+#: A name it does not declare.
+NOT_DECLARED_FOR_THE_MERGE = "SOME_OTHER_CACHE"
+#: The build the request says it is for.
+MERGE_BUILD = "build-FEAT-3ABD-20261013"
+
+
+def _git_in(where: Path, *args: str) -> str:
+    import subprocess
+
+    done = subprocess.run(
+        [
+            "git",
+            "-c", "user.email=tests@example.invalid",
+            "-c", "user.name=tests",
+            "-c", "commit.gpgsign=false",
+            *args,
+        ],
+        cwd=str(where),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return done.stdout.strip()
+
+
+@pytest.fixture
+def declaring_repo(tmp_path: Path) -> tuple[Path, str]:
+    """A real repository whose committed launch block declares one name."""
+    root = tmp_path / "widget-shop"
+    root.mkdir()
+    _git_in(root, "init", "-q", "-b", "main")
+    (root / ".guardkit").mkdir()
+    (root / ".guardkit" / "config.yaml").write_text(
+        f"launch:\n  settings: [{DECLARED_FOR_THE_MERGE}]\n", encoding="utf-8"
+    )
+    _git_in(root, "add", "-A")
+    _git_in(root, "commit", "-q", "-m", "the project declares its setting")
+    return root, _git_in(root, "rev-parse", "HEAD")
+
+
+@pytest.fixture
+def guardkit_that_prints_the_setting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Path:
+    """A real executable named guardkit that reports what it was handed."""
+    binary = tmp_path / "bin-env" / "guardkit"
+    binary.parent.mkdir(parents=True, exist_ok=True)
+    marker = tmp_path / "the-merge-command-ran"
+    binary.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, pathlib\n"
+        f"pathlib.Path({str(marker)!r}).write_text('ran')\n"
+        "print(json.dumps({'outcome': 'merged', 'post_sha': 'b' * 40,\n"
+        f"    'declared': os.environ.get({DECLARED_FOR_THE_MERGE!r}),\n"
+        f"    'undeclared': os.environ.get({NOT_DECLARED_FOR_THE_MERGE!r})}}))\n",
+        encoding="utf-8",
+    )
+    binary.chmod(binary.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    monkeypatch.setenv(GUARDKIT_PATH_ENV, str(binary))
+    return marker
+
+
+class TestADeclaredSettingReachesTheMergeCommand:
+    """The coordinator sends the setting NAMES its record holds for the build;
+    the helper checks each against the project's declaration at the recorded
+    commit and hands the merge command that name's value from its own
+    environment, and nothing it was not asked for."""
+
+    def test_a_declared_name_reaches_the_command(
+        self,
+        declaring_repo: tuple[Path, str],
+        guardkit_that_prints_the_setting: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from tests.forge._a_stand_in_coordinator import a_coordinator_that_recorded
+
+        repo_root, head = declaring_repo
+        monkeypatch.setenv(DECLARED_FOR_THE_MERGE, "/opt/the-browsers")
+        monkeypatch.setenv(NOT_DECLARED_FOR_THE_MERGE, "/opt/not-asked-for")
+        with a_coordinator_that_recorded({MERGE_BUILD: head}, monkeypatch):
+            server = build_server(
+                port=0, config_loader=lambda: _config({REPO_KEY: str(repo_root)})
+            )
+            _serve_in_thread(server)
+            try:
+                host, port = server.server_address[:2]
+                body = _post(
+                    f"http://{host}:{port}/guardkit-merge",
+                    _payload(
+                        launch_settings=[DECLARED_FOR_THE_MERGE],
+                        build=MERGE_BUILD,
+                        declared_at=head,
+                    ),
+                )
+            finally:
+                server.shutdown()
+                server.server_close()
+        assert body["exit_code"] == 0, body
+        report = json.loads(body["stdout"])
+        assert report["declared"] == "/opt/the-browsers"
+        assert report["undeclared"] is None
+
+    def test_a_name_the_project_does_not_declare_starts_nothing(
+        self,
+        declaring_repo: tuple[Path, str],
+        guardkit_that_prints_the_setting: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from tests.forge._a_stand_in_coordinator import a_coordinator_that_recorded
+
+        repo_root, head = declaring_repo
+        with a_coordinator_that_recorded({MERGE_BUILD: head}, monkeypatch):
+            server = build_server(
+                port=0, config_loader=lambda: _config({REPO_KEY: str(repo_root)})
+            )
+            _serve_in_thread(server)
+            try:
+                host, port = server.server_address[:2]
+                with pytest.raises(urllib.error.HTTPError) as caught:
+                    _post(
+                        f"http://{host}:{port}/guardkit-merge",
+                        _payload(
+                            launch_settings=[NOT_DECLARED_FOR_THE_MERGE],
+                            build=MERGE_BUILD,
+                            declared_at=head,
+                        ),
+                    )
+            finally:
+                server.shutdown()
+                server.server_close()
+        assert caught.value.code == 400
+        assert NOT_DECLARED_FOR_THE_MERGE in caught.value.read().decode("utf-8")
+        assert not guardkit_that_prints_the_setting.exists()

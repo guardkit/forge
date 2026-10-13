@@ -388,10 +388,15 @@ class _JoinsForReal:
         verify_detail: str = "",
         checks_passed: int = 3,
         checks_total: int = 3,
+        verify_status: str | None = None,
     ) -> None:
         self.feature_id = feature_id
         self.verify_ok = verify_ok
         self.verify_detail = verify_detail
+        # "unverified" is the build system saying its checks could not run
+        # (an install that failed, a declaration it could not read); anything
+        # else is read off ``verify_ok`` as before.
+        self.verify_status = verify_status
         self.checks_passed = checks_passed
         self.checks_total = checks_total
         self.calls: list[dict[str, Any]] = []
@@ -416,9 +421,10 @@ class _JoinsForReal:
         report = {
             "outcome": "merged",
             "post_sha": joined,
-            "verify_ran": True,
+            "verify_ran": self.verify_status != "unverified",
             "verify_ok": self.verify_ok,
-            "verify_status": "passed" if self.verify_ok else "failed",
+            "verify_status": self.verify_status
+            or ("passed" if self.verify_ok else "failed"),
             "verify_detail": self.verify_detail
             or ("" if self.verify_ok else "3 checks went red"),
             "charged_failures": [],
@@ -1951,6 +1957,288 @@ class TestChecksThatCouldNotRun:
 
 
 # ---------------------------------------------------------------------------
+# A join picked up again keeps "could not run" (design item 9, review R4)
+# ---------------------------------------------------------------------------
+
+#: What the build system says when the project's declared install failed
+#: before its checks could run (the merge-install design, item 4).
+INSTALL_FAILED = (
+    "the declared install (bash scripts/install.sh) failed on main (exit 3): "
+    "registry unreachable"
+)
+
+
+def _the_publication_result(pool: SqliteLifecyclePersistence) -> str:
+    return str(
+        pool.connection.execute(
+            "SELECT result FROM publication_records WHERE build_id = ?",
+            (BUILD_ID,),
+        ).fetchone()[0]
+    )
+
+
+def _spy_on_repair_filing(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    """Every repair the press asks the queue to file, then filed as usual."""
+    import forge.pipeline.fix_row_producer as producer
+
+    asked: list[dict[str, Any]] = []
+    real = producer.maybe_mint_fix_row
+
+    def _recorded(**kwargs: Any) -> Any:
+        asked.append(kwargs)
+        return real(**kwargs)
+
+    monkeypatch.setattr(producer, "maybe_mint_fix_row", _recorded)
+    return asked
+
+
+class _ACheckJoinThatCouldNotRunTheChecks:
+    """An installed build system that has check-join, and whose checks on the
+    joined commit could not run (its install failed there).
+
+    ``verify_ran`` is either left out, with the process exiting 0, or said to
+    be true with the process exiting 1. Both shapes are read as "it ran" by the
+    question's reader, which is how an "unverified" answer reaches the path
+    for a join this press did not make.
+    """
+
+    def __init__(self, *, shape: str) -> None:
+        self.shape = shape
+        self.calls: list[dict[str, Any]] = []
+
+    async def __call__(self, **kwargs: Any) -> GuardKitResult:
+        self.calls.append(kwargs)
+        args = list(kwargs.get("args") or [])
+        assert args and args[0] == "check-join", args
+        report: dict[str, Any] = {
+            "outcome": "checked",
+            "joined_commit": args[args.index("--joined") + 1],
+            "verify_ok": False,
+            "verify_status": "unverified",
+            "verify_detail": INSTALL_FAILED,
+        }
+        if self.shape == "said-ran":
+            report["verify_ran"] = True
+        exits_zero = self.shape == "silent"
+        return GuardKitResult(
+            status="success" if exits_zero else "failed",
+            subcommand="autobuild",
+            duration_secs=0.1,
+            stdout_tail=json.dumps(report),
+            stderr=None,
+            exit_code=0 if exits_zero else 1,
+        )
+
+
+class TestAResumedJoinKeepsCouldNotRun:
+    """A press that picks a recorded join up must not turn "the checks could
+    not run" into "the checks went red".
+
+    The first press records the merge report's ``verify_status``. A later
+    press used to read only ``verify_ok`` off that record and hard-code
+    "failed" — so an install that failed, a judge file the build changed or
+    a declaration nobody could read came back as a red result, and filed a
+    repair for a failure no code could fix.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_resumed_join_keeps_could_not_run(
+        self, config, pool, repo_root, monkeypatch
+    ) -> None:
+        filed = _spy_on_repair_filing(monkeypatch)
+        joiner = _JoinsForReal(
+            verify_ok=False, verify_status="unverified", verify_detail=INSTALL_FAILED
+        )
+        deps, publisher, gk, dp = _deps(config, pool, guardkit=joiner)
+        first = await _run_executor(deps, repo_root)
+        assert first.result == "merged-verify-failed"
+        assert first.verify_status == "unverified"
+        assert "could not run" in first.detail
+        lines = json.loads(
+            pool.connection.execute(
+                "SELECT lines_json FROM publication_records WHERE build_id = ?",
+                (BUILD_ID,),
+            ).fetchone()[0]
+        )
+        recorded = [
+            l for l in lines if l["step"] == "merge-checks" and l["kind"] == "done"
+        ]
+        assert recorded and recorded[-1]["detail"]["verify_status"] == "unverified"
+        assert _repair_rows(pool) == []
+
+        deps, publisher, gk, dp = _deps(config, pool, guardkit=joiner)
+        second = await _run_executor(deps, repo_root)
+
+        # The recorded join was picked up: the merge command did not run again.
+        assert len(joiner.calls) == 1
+        assert second.merged_sha == first.merged_sha
+        assert second.result == "merged-verify-failed"
+        assert second.verify_status == "unverified"
+        assert second.detail == first.detail
+        assert "the checks after the join could not run" in second.detail
+        assert INSTALL_FAILED in second.detail
+        assert "did not pass" not in second.detail
+        assert "Nothing was published." in second.detail
+        # Publication stays pending, nothing was sent, and no repair was filed.
+        assert _the_publication_result(pool) == "publication pending"
+        assert _legs(dp) == []
+        assert publisher.reports[-1].verify_status == "unverified"
+        assert filed == []
+        assert _repair_rows(pool) == []
+
+    @pytest.mark.asyncio
+    async def test_a_resumed_red_join_still_says_failed_and_files_a_repair(
+        self, config, pool, repo_root, monkeypatch
+    ) -> None:
+        filed = _spy_on_repair_filing(monkeypatch)
+        joiner = _JoinsForReal(verify_ok=False, verify_detail="3 checks went red")
+        deps, publisher, gk, dp = _deps(config, pool, guardkit=joiner)
+        first = await _run_executor(deps, repo_root)
+        assert first.verify_status == "failed"
+        assert len(filed) == 1
+        assert len(_repair_rows(pool)) == 1
+
+        deps, publisher, gk, dp = _deps(config, pool, guardkit=joiner)
+        second = await _run_executor(deps, repo_root)
+
+        assert len(joiner.calls) == 1
+        assert second.result == "merged-verify-failed"
+        assert second.verify_status == "failed"
+        assert "did not pass: 3 checks went red" in second.detail
+        # The resumed red result is handed to the repair filing as red; the
+        # queue itself keeps one open repair per build.
+        assert len(filed) == 2
+        assert "did not pass" in str(filed[-1]["detail"])
+        assert len(_repair_rows(pool)) == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("shape", ["silent", "said-ran"])
+    async def test_a_reused_join_the_build_system_could_not_check_is_not_red(
+        self, config, pool, repo_root, shape, monkeypatch
+    ) -> None:
+        filed = _spy_on_repair_filing(monkeypatch)
+        # A press dies while the merge command runs, leaving a join whose
+        # build-system checks never ran.
+        dying = _DiesWhileMerging()
+        deps, publisher, gk, dp = _deps(config, pool, guardkit=dying)
+        with pytest.raises(KeyboardInterrupt):
+            await _run_executor(deps, repo_root)
+        _the_kept_hold_runs_out(pool)
+
+        # The next press asks the build system to check that join, and the
+        # build system says its checks could not run there.
+        asked = _ACheckJoinThatCouldNotRunTheChecks(shape=shape)
+        deps, publisher, gk, dp = _deps(config, pool, guardkit=asked)
+        outcome = await _run_executor(deps, repo_root)
+
+        assert [c["args"][0] for c in asked.calls] == ["check-join"]
+        assert outcome.result == "merged-verify-failed"
+        assert outcome.verify_status == "unverified"
+        assert "the checks after the join could not run" in outcome.detail
+        assert INSTALL_FAILED in outcome.detail
+        assert "did not pass" not in outcome.detail
+        assert "Nothing was published." in outcome.detail
+        assert _the_publication_result(pool) == "publication pending"
+        assert _legs(dp) == []
+        assert _repair_rows(pool) == []
+
+        # And a press after that, which reads the answer back off the record,
+        # still says "could not run".
+        deps, publisher, gk, dp = _deps(config, pool, guardkit=asked)
+        again = await _run_executor(deps, repo_root)
+        assert len(asked.calls) == 1
+        assert again.verify_status == "unverified"
+        assert "could not run" in again.detail
+        assert INSTALL_FAILED in again.detail
+        assert "did not pass" not in again.detail
+        assert again.detail.endswith(
+            f"the checks after the join could not run: {INSTALL_FAILED}. "
+            "Nothing was published."
+        )
+        assert filed == []
+        assert _repair_rows(pool) == []
+
+
+class _JoinsWhileAnotherPressTriesToTakeOver(_JoinsForReal):
+    """Makes the join for real, after another press tries to take the build's
+    record at a moment just inside the merge command's own wall."""
+
+    def __init__(self, *, pool: SqliteLifecyclePersistence, seconds_in: int) -> None:
+        super().__init__()
+        self.pool = pool
+        self.seconds_in = seconds_in
+        self.takeover: Any = "not tried"
+
+    async def __call__(self, **kwargs: Any) -> GuardKitResult:
+        from datetime import timedelta
+
+        from forge.pipeline.publication_record import PublicationRecordStore
+
+        if list(kwargs.get("args") or [])[:1] == ["merge"]:
+            self.takeover = PublicationRecordStore(self.pool.connection).take_lease(
+                build_id=BUILD_ID,
+                holder="another-press",
+                now=_utcnow() + timedelta(seconds=self.seconds_in),
+            )
+        return await super().__call__(**kwargs)
+
+
+class TestTheHoldOutlastsTheJoin:
+    """The press holds the build's record for as long as its merge command
+    may run. The command may now install and check twice (2580 seconds at the
+    default limits), which is longer than the hold taken when the press
+    starts (1800 seconds); a second press must not take over mid-join."""
+
+    @pytest.mark.asyncio
+    async def test_a_second_press_just_inside_the_wall_cannot_take_over(
+        self, config, pool, repo_root
+    ) -> None:
+        from forge.pipeline.merge_executor import merge_wall_seconds
+
+        wall = merge_wall_seconds(600)
+        joiner = _JoinsWhileAnotherPressTriesToTakeOver(pool=pool, seconds_in=wall - 1)
+        deps, publisher, gk, dp = _deps(config, pool, guardkit=joiner)
+        outcome = await _run_executor(deps, repo_root)
+
+        assert joiner.takeover is None, "another press took the record mid-join"
+        assert outcome.result == "publication-pending", outcome.detail
+
+    @pytest.mark.asyncio
+    async def test_after_the_join_the_hold_is_the_ordinary_one_again(
+        self, config, pool, repo_root
+    ) -> None:
+        """The longer hold covers the merge command only; once it has answered,
+        the rest of the press holds the record for the ordinary time."""
+        from datetime import datetime as _dt
+
+        from forge.pipeline.publication_record import default_lease_seconds
+
+        seen: list[str] = []
+
+        class _LooksAtTheHoldAfterTheJoin(_FakeDeploy):
+            async def __call__(self, **kwargs: Any) -> Any:
+                if kwargs.get("leg") == "candidate_check":
+                    seen.append(
+                        pool.connection.execute(
+                            "SELECT lease_expires_at FROM publication_records "
+                            "WHERE build_id = ?",
+                            (BUILD_ID,),
+                        ).fetchone()[0]
+                    )
+                return await super().__call__(**kwargs)
+
+        joiner = _JoinsForReal()
+        deps, publisher, gk, dp = _deps(
+            config, pool, guardkit=joiner, deploy=_LooksAtTheHoldAfterTheJoin()
+        )
+        before = _utcnow()
+        await _run_executor(deps, repo_root)
+        assert seen, "the live check never ran"
+        left = (_dt.fromisoformat(seen[0]) - before).total_seconds()
+        assert left <= default_lease_seconds() + 60
+
+
+# ---------------------------------------------------------------------------
 # The merge run through the deploy sidecar reads exactly the same
 # ---------------------------------------------------------------------------
 
@@ -2119,17 +2407,25 @@ class TestTheTwoTimeLimits:
     drive of this lane caught.
     """
 
-    def test_the_wall_holds_two_check_runs_and_the_merge(self) -> None:
+    def test_the_wall_holds_four_runs_and_the_merge(self) -> None:
         from forge.pipeline.merge_executor import (
             MERGE_WALL_MERGE_ALLOWANCE_SECONDS,
             merge_wall_seconds,
         )
 
         assert MERGE_WALL_MERGE_ALLOWANCE_SECONDS == 180
-        # The merge command may run the checks twice: once on main to see what
-        # was already failing, once on the merged tree.
-        assert merge_wall_seconds(600) == 2 * 600 + 180
-        assert merge_wall_seconds(60) == 2 * 60 + 180
+        # The merge command may install and check twice: on main to see what
+        # was already failing, and on the merged tree. Each install is held
+        # to one check run's limit, so four of those plus the merge.
+        assert merge_wall_seconds(600) == 2580
+        assert merge_wall_seconds(60) == 4 * 60 + 180
+
+    def test_both_caps_are_an_hour(self) -> None:
+        from forge.deploy_sidecar.service import MERGE_TIMEOUT_MAX
+        from forge.pipeline.merge_executor import MERGE_WALL_CAP_SECONDS
+
+        assert MERGE_WALL_CAP_SECONDS == 3600
+        assert MERGE_TIMEOUT_MAX == 3600.0
 
     def test_the_wall_never_asks_for_more_than_is_allowed(self) -> None:
         from forge.pipeline.merge_executor import (
@@ -2149,7 +2445,7 @@ class TestTheTwoTimeLimits:
         assert float(MERGE_WALL_CAP_SECONDS) == MERGE_TIMEOUT_MAX
 
     @pytest.mark.asyncio
-    async def test_the_default_limits_are_ten_minutes_and_a_wall_that_holds_two(
+    async def test_the_default_limits_are_ten_minutes_and_a_wall_that_holds_four(
         self, config, pool, repo_root
     ) -> None:
         deps, _publisher, gk, _dp = _deps(config, pool)
@@ -2158,7 +2454,7 @@ class TestTheTwoTimeLimits:
         args = gk.calls[0]["args"]
         assert "--verify-timeout" in args
         assert args[args.index("--verify-timeout") + 1] == "600"
-        assert gk.calls[0]["timeout_seconds"] == 2 * 600 + 180
+        assert gk.calls[0]["timeout_seconds"] == 4 * 600 + 180
 
     @pytest.mark.asyncio
     async def test_a_longer_limit_for_the_checks_widens_the_wall(
@@ -2180,7 +2476,7 @@ class TestTheTwoTimeLimits:
 
         args = gk.calls[0]["args"]
         assert args[args.index("--verify-timeout") + 1] == "300"
-        assert gk.calls[0]["timeout_seconds"] == 2 * 300 + 180
+        assert gk.calls[0]["timeout_seconds"] == 4 * 300 + 180
 
     @pytest.mark.asyncio
     async def test_a_very_long_limit_is_held_to_the_cap(
@@ -2200,7 +2496,7 @@ class TestTheTwoTimeLimits:
         deps, _publisher, gk, _dp = _deps(config, pool)
         await _run_executor(deps, repo_root)
 
-        assert gk.calls[0]["timeout_seconds"] == 1800
+        assert gk.calls[0]["timeout_seconds"] == 3600
 
 
 class TestARefusalSpeaksTheMergeCommandsOwnSentence:
