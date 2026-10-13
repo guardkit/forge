@@ -1,0 +1,50 @@
+{
+  "invocation": {
+    "verdict": "pass",
+    "run_id": "run-1",
+    "gate_ids": [
+      "health",
+      "journey"
+    ],
+    "assertions": [],
+    "evidence_index_ref": "evidence/index.json",
+    "app_url": null,
+    "screenshot_refs": [],
+    "trace_refs": [],
+    "dispositions_ref": "evidence/dispositions.json",
+    "attempts_ledger_ref": "evidence/attempts.json",
+    "leak_sweep_findings": null,
+    "dry_run": false,
+    "detail": {
+      "argv": [
+        "driver",
+        "--feature",
+        "F",
+        "--target",
+        "env"
+      ],
+      "cwd": "/repo",
+      "exit_code": 0,
+      "stdout_tail": "{\"verdict\": \"pass\", \"run_id\": \"run-1\", \"gates\": [{\"gate_id\": \"health\"}, {\"gate_id\": \"journey\"}], \"evidence_index_ref\": \"evidence/index.json\", \"dispositions_ref\": \"evidence/dispositions.json\", \"attempts_ledger_ref\": \"evidence/attempts.json\", \"app_url\": \"https://preview.example.test:8950/\", \"screenshot_refs\": [\"shots/a.png\"], \"trace_refs\": [\"trace.zip\"], \"media_refs\": [\"video/journey.webm\"], \"report_ref\": \"report/index.html\", \"outcome\": {\"passed\": 3, \"failed\": 0, \"skipped\": null, \"flaky\": null}}",
+      "stderr_tail": "",
+      "source": "results_envelope"
+    }
+  },
+  "step_result": {
+    "verdict": "pass",
+    "run_id": "run-1",
+    "gate_ids": [
+      "health",
+      "journey"
+    ],
+    "assertions": [],
+    "evidence_index_ref": "evidence/index.json",
+    "app_url": null,
+    "screenshot_refs": [],
+    "trace_refs": [],
+    "dispositions_ref": "evidence/dispositions.json",
+    "attempts_ledger_ref": "evidence/attempts.json",
+    "leak_sweep_findings": null,
+    "dry_run": false
+  }
+}

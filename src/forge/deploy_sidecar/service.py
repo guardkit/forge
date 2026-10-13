@@ -62,6 +62,15 @@ The narrow contract:
               git's objects, never the working tree, and answers ``commit``
               too; a commit the clone cannot get is 409 with
               ``commit_unavailable`` — see "the code door at a commit")
+    POST /preview/tree {repo, lease_id, onto, candidate} -> {commit, tree, path}
+    POST /preview/tree-remove {repo, lease_id} -> {removed, path}
+    POST /preview/probe {repo, lease_id, port, token}
+              -> {no_token, wrong_token, right_token}
+    POST /preview/evidence {repo, lease_id} -> {archive, files, bytes}
+    POST /preview/projects {repo} -> {leases, running}
+    POST /preview/project-remove {repo, lease_id} -> {removed, remaining}
+              (the review preview's routes, web readiness W7 — see the block
+              above :func:`process_preview_request`)
 
 The three routes after ``/git/rev-parse`` are the merge press's own git
 (sandbox first, 2026-09-07, rule 89): its ancestry guards, and the lay-out and
@@ -206,6 +215,12 @@ from forge.deploy.profile import (
     load_deploy_profile,
     parse_deploy_profile,
     wrapper_inner_script,
+)
+from forge.deploy.review_preview import (
+    PREVIEW_ENV_KEYS,
+    PREVIEW_ROUTES,
+    PREVIEW_ROUTES_NEEDING_THE_SWITCH,
+    serve_preview_operation,
 )
 from forge.deploy_sidecar.deploy_executor import (
     NOTES_SETTING_NAME,
@@ -868,6 +883,14 @@ def allowed_env_keys(
             cand_env = candidate.get("env")
             if isinstance(cand_env, dict):
                 keys.update(str(k) for k in cand_env)
+    # THE REVIEW PREVIEW'S OVERLAY (web readiness W7, 12 October 2026), and
+    # only for a project whose committed profile switches its preview on: the
+    # slot's ports and address, the link token, the resource label, the
+    # evidence folder and the compose project. All are the factory's own
+    # names, so the door is widened here rather than by the project.
+    preview = getattr(widens, "preview", None)
+    if preview is not None and preview.enabled:
+        keys.update(PREVIEW_ENV_KEYS)
     # THE NAMES THE PROJECT DECLARED, each one checked before it is permitted.
     declaration = declared_identity(widens)
     return keys | _permitted_declared_names(
@@ -4282,6 +4305,47 @@ def process_git_candidate_tree_remove_request(
     except Exception as exc:  # noqa: BLE001 — never raise past the boundary
         return 500, {"error": f"sidecar git error: {type(exc).__name__}: {exc}"}
     return 200, {"removed": bool(removed), "path": str(path)}
+
+
+# ---------------------------------------------------------------------------
+# The review preview's six routes (web readiness W7, 12 October 2026)
+# ---------------------------------------------------------------------------
+#
+# A preview's join, its link check, its evidence and its removal all happen
+# where the repository and its Docker engine are: in this sandbox. The work
+# itself is in :mod:`forge.deploy.review_preview`; this adapter only applies
+# the laws every route here keeps — the repository is a known key (LAW 1),
+# the work happens only inside a sandbox (as LAW 11's routes), and the
+# project's profile, read at its committed HEAD, decides which ports the link
+# check may reach and whether a preview may be started at all. Removal and
+# the evidence read never need the switch, so a preview switched off later
+# is still cleaned up. Only resources labelled ``forge.preview.lease`` with
+# the request's exact lease id are ever removed.
+
+
+def process_preview_request(
+    route: str, payload: Any, *, config: ForgeConfig
+) -> tuple[int, dict[str, Any]]:
+    """One ``/preview/...`` request. Never raises."""
+    if not isinstance(payload, dict):
+        return 400, {"error": "request body must be a JSON object"}
+    if not sidecar_is_inside_sandbox():
+        return 400, {"error": _not_inside_a_sandbox("review preview", verb="prepare")}
+    repo_path, error = _resolve_repo_key(payload, config)
+    if error or repo_path is None:
+        return 400, {"error": error}
+    profile, _why = profile_at_commit(repo_path)
+    preview = getattr(profile, "preview", None) if profile is not None else None
+    switched_on = preview is not None and preview.enabled
+    if route in PREVIEW_ROUTES_NEEDING_THE_SWITCH and not switched_on:
+        return 400, {
+            "error": (
+                f"{payload.get('repo')}'s committed deploy profile does not switch "
+                "a review preview on, so none is started here"
+            )
+        }
+    ports = frozenset(slot.port for slot in preview.slots) if switched_on else frozenset()
+    return serve_preview_operation(route, payload, repo_path=repo_path, slot_ports=ports)
 
 
 def _autobuild_worktree_request(
@@ -7844,6 +7908,7 @@ class DeploySidecarHandler(BaseHTTPRequestHandler):
                 CODE_IMPORTS_ROUTE,
                 CODE_SEARCH_ROUTE,
                 CODE_QUERY_ROUTE,
+                *PREVIEW_ROUTES,
             ):
                 self._write_json(404, {"error": f"no such path: {self.path}"})
                 return
@@ -7950,6 +8015,8 @@ class DeploySidecarHandler(BaseHTTPRequestHandler):
                 status, body = process_code_search_request(payload, config=config)
             elif route == CODE_QUERY_ROUTE:
                 status, body = process_code_query_request(payload, config=config)
+            elif route in PREVIEW_ROUTES:
+                status, body = process_preview_request(route, payload, config=config)
             elif route == GUARDKIT_LEG_ROUTE:
                 status, body = process_guardkit_leg_request(
                     payload,

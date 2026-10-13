@@ -1720,6 +1720,69 @@ class PublicationConfig(BaseModel):
     )
 
 
+class ReviewPreviewConfig(BaseModel):
+    """Where a review preview's evidence is kept (web readiness W7, 12 October 2026).
+
+    A web project switches the preview on in its own deploy profile
+    (``preview:``); this section holds the two coordinator-wide facts the
+    profile cannot: the folder on this machine the evidence is copied into,
+    and the address that folder is published under on the tailnet. Both are
+    ``None`` by default, and a preview prepared with either missing fails in
+    plain words ("evidence storage is not set up") rather than producing a
+    card with links to nowhere.
+
+    **Deploy-order law** (as :class:`MergeExecutorConfig`): ``extra="forbid"``,
+    so a ``review_preview:`` section written into a deployed ``forge.yaml``
+    before the image that defines it is running refuses the whole config.
+
+    ``enabled`` is the coordinator-wide switch. Off (the default), the
+    coordinator builds no preview service at all: no project's profile is
+    read for a preview, nothing is reconciled or swept, and every merge card
+    is exactly today's.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = Field(
+        default=False,
+        description=(
+            "True = projects whose deploy profile switches a preview on get "
+            "one on their merge card. False (default) = no preview service "
+            "is built and every merge card is today's."
+        ),
+    )
+    evidence_root: str | None = Field(
+        default=None,
+        description=(
+            "The folder evidence is copied into, as "
+            "<evidence_root>/<org>/<name>/<feature>/<candidate sha>/<run id>/. "
+            "Each run's folder is written once and never overwritten."
+        ),
+    )
+    evidence_base_url: str | None = Field(
+        default=None,
+        description=(
+            "The https address evidence_root is published under, for example "
+            "'https://evidence.example.test/factory-evidence'."
+        ),
+    )
+
+    @field_validator("evidence_base_url")
+    @classmethod
+    def _validate_evidence_base_url(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        from forge.deploy.profile import unambiguous_https_url
+
+        value = unambiguous_https_url(v.strip())
+        if value is None:
+            raise ValueError(
+                "must be a plain https:// address (a host, no user name, "
+                f"query, fragment, backslash or spaces), got {v!r}"
+            )
+        return value
+
+
 class ForgeConfig(BaseModel):
     """Root model for ``forge.yaml``.
 
@@ -1802,6 +1865,14 @@ class ForgeConfig(BaseModel):
             "stops at 'publication pending', which is today's behaviour."
         ),
     )
+    review_preview: ReviewPreviewConfig = Field(
+        default_factory=ReviewPreviewConfig,
+        description=(
+            "Where review-preview evidence is kept and published (web "
+            "readiness W7). Defaults to nothing configured; a project that "
+            "turns its preview on then gets a failed preview saying so."
+        ),
+    )
     resource_preflight: ResourcePreflightConfig = Field(
         default_factory=ResourcePreflightConfig,
         description=(
@@ -1864,6 +1935,7 @@ __all__ = [
     "QueueConfig",
     "ResourcePreflightConfig",
     "ReviewGateConfig",
+    "ReviewPreviewConfig",
     "RoutineConfig",
 ]
 

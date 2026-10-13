@@ -106,21 +106,35 @@ class SidecarGitOpResult(GitOpResult):
 HttpPost = Callable[[str, dict[str, Any], float], tuple[int, Any]]
 
 
-def _urllib_post(url: str, body: dict[str, Any], timeout: float) -> tuple[int, Any]:
+def _urllib_post(
+    url: str, body: dict[str, Any], timeout: float, *, max_bytes: int | None = None
+) -> tuple[int, Any]:
     """POST ``body`` as JSON with the standard library; return the status and
     the decoded answer (an HTTP error's body is decoded too — the sidecar's
-    refusals are JSON with one plain ``error`` sentence)."""
+    refusals are JSON with one plain ``error`` sentence).
+
+    ``max_bytes`` bounds the read: at most that many bytes and one more are
+    read, and a longer answer is refused (status 413) before anything is
+    parsed. Left unset, the whole answer is read, as always.
+    """
     data = json.dumps(body).encode("utf-8")
     request = urllib.request.Request(
         url, data=data, headers={"Content-Type": "application/json"}, method="POST"
     )
+    def _read(stream: Any) -> bytes:
+        return stream.read() if max_bytes is None else stream.read(int(max_bytes) + 1)
+
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310 — loopback sidecar
-            raw = response.read()
+            raw = _read(response)
             status = int(response.status)
     except urllib.error.HTTPError as exc:
-        raw = exc.read()
+        raw = _read(exc)
         status = int(exc.code)
+    if max_bytes is not None and len(raw) > max_bytes:
+        return 413, {
+            "error": f"the answer was larger than {max_bytes} bytes and was not read"
+        }
     try:
         decoded = json.loads(raw.decode("utf-8")) if raw else None
     except (json.JSONDecodeError, UnicodeDecodeError):

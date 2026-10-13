@@ -65,6 +65,9 @@ __all__ = [
     "DeployLiveGate",
     "DeployCandidate",
     "DeploySandbox",
+    "DeployPreview",
+    "PreviewSlot",
+    "unambiguous_https_url",
     "DeployProfileError",
     "load_deploy_profile",
     "SANDBOX_WRAPPER_PREFIX",
@@ -297,6 +300,79 @@ class DeploySandbox:
 
 
 @dataclass(frozen=True, slots=True)
+class PreviewSlot:
+    """One place a review preview can run (web readiness W7, 12 October 2026).
+
+    Attributes:
+        port: The port the preview's public listener uses inside the sandbox.
+            The sandbox publishes it, and the tailnet's HTTPS server exposes it
+            as ``public_url``.
+        internal_port: The preview's internal listener inside the sandbox, never
+            published. The recorded journey runs against it.
+        public_url: The address a reviewer opens, ``https://<host>:<port>``.
+    """
+
+    port: int
+    internal_port: int
+    public_url: str
+
+
+def unambiguous_https_url(value: object) -> str | None:
+    """``value`` without a trailing ``/`` when it is a plain https address, else None.
+
+    Plain means: ``https``, a host, and none of the things a reader could take
+    two ways — no backslash, whitespace or control character, no
+    ``user:password@``, no query and no fragment. The review preview builds
+    every link on its card from these, and Jarvis and nats-core refuse any
+    link that is not plain (web readiness W7).
+    """
+    from urllib.parse import urlsplit
+
+    if not isinstance(value, str) or not value:
+        return None
+    if "\\" in value or any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in value):
+        return None
+    try:
+        parts = urlsplit(value)
+        parts.port  # noqa: B018 — raises on a port that is not a number
+    except ValueError:
+        return None
+    if (
+        parts.scheme != "https"
+        or not parts.hostname
+        or "@" in parts.netloc
+        or parts.query
+        or parts.fragment
+    ):
+        return None
+    return value.rstrip("/")
+
+
+@dataclass(frozen=True, slots=True)
+class DeployPreview:
+    """The optional review preview before a merge offer (web readiness W7).
+
+    A web project switches this on to have the factory stand the candidate,
+    joined onto the target branch, up for a person to try, record the key
+    journey, and keep the evidence, before the merge card goes out. Absent ⇒
+    ``None`` ⇒ the merge offer is exactly what it was.
+
+    Attributes:
+        enabled: On or off. A section that leaves it out is off.
+        slots: Where previews can run. Two previews never share a slot.
+        app_ttl_hours: How long a preview, and the card's Approve, last.
+        evidence_days: How long the report, screenshots and video are kept.
+        slot_wait_minutes: How long preparation waits for a free slot.
+    """
+
+    enabled: bool = False
+    slots: tuple[PreviewSlot, ...] = ()
+    app_ttl_hours: int = 24
+    evidence_days: int = 14
+    slot_wait_minutes: int = 30
+
+
+@dataclass(frozen=True, slots=True)
 class DeployProfile:
     """A parsed, validated deploy profile — the DEPLOY stage's input.
 
@@ -335,6 +411,8 @@ class DeployProfile:
         sandbox: The Docker Sandbox this repository deploys into, or None.
             Absent ⇒ the deploy runs against the host's own Docker engine
             exactly as it did before sandboxes existed.
+        preview: The review preview before a merge offer, or None. Absent ⇒
+            the merge offer is exactly what it was.
         source_ref: Path the profile was loaded from (for deploy_profile_ref).
     """
 
@@ -353,6 +431,7 @@ class DeployProfile:
     live_gate: DeployLiveGate | None = None
     candidate: DeployCandidate | None = None
     sandbox: DeploySandbox | None = None
+    preview: DeployPreview | None = None
     source_ref: str | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -883,6 +962,94 @@ def _parse_sandbox_path(raw: Any, *, what: str) -> str | None:
     return path
 
 
+def _parse_preview_count(raw: Any, *, what: str, default: int) -> int:
+    """A whole number greater than zero, or ``default`` when absent."""
+    if raw is None:
+        return default
+    if not isinstance(raw, int) or isinstance(raw, bool) or raw <= 0:
+        raise DeployProfileError(
+            f"{what} must be a whole number greater than zero when present"
+        )
+    return raw
+
+
+def _parse_preview_port(raw: Any, *, what: str) -> int:
+    if not isinstance(raw, int) or isinstance(raw, bool) or not 1 <= raw <= 65535:
+        raise DeployProfileError(
+            f"{what} must be a port number — a whole number from 1 to 65535; "
+            f"got {raw!r}"
+        )
+    return raw
+
+
+def _parse_preview(raw: Any) -> DeployPreview | None:
+    """Parse the optional ``preview`` block (web readiness W7).
+
+    Absent ⇒ ``None`` ⇒ the merge offer is exactly what it was. Present ⇒
+    every slot is checked here, so a clash between two slots' ports, or an
+    address that is not https, is refused on load with one plain sentence.
+    """
+    if raw is None:
+        return None
+    m = _require_mapping(raw, "preview")
+    enabled = m.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise DeployProfileError("preview.enabled must be true or false when present")
+
+    slots_raw = m.get("slots")
+    if slots_raw is None:
+        slots_raw = []
+    if not isinstance(slots_raw, list):
+        raise DeployProfileError(
+            "preview.slots must be a list of {port, internal_port, public_url}"
+        )
+    slots: list[PreviewSlot] = []
+    ports_seen: set[int] = set()
+    for i, item in enumerate(slots_raw):
+        slot = _require_mapping(item, f"preview.slots[{i}]")
+        port = _parse_preview_port(slot.get("port"), what=f"preview.slots[{i}].port")
+        internal = _parse_preview_port(
+            slot.get("internal_port"), what=f"preview.slots[{i}].internal_port"
+        )
+        for value in (port, internal):
+            if value in ports_seen:
+                raise DeployProfileError(
+                    f"preview.slots[{i}] uses port {value}, which another "
+                    "preview port already uses — every slot needs ports of its own"
+                )
+            ports_seen.add(value)
+        public_url = slot.get("public_url")
+        if unambiguous_https_url(public_url) is None:
+            raise DeployProfileError(
+                f"preview.slots[{i}].public_url must be a plain https:// address "
+                "(a host; no user name, query, fragment, backslash or spaces), "
+                "for example 'https://preview.example.test:8950'; got "
+                f"{public_url!r}"
+            )
+        slots.append(
+            PreviewSlot(
+                port=port, internal_port=internal, public_url=public_url.rstrip("/")
+            )
+        )
+    if enabled and not slots:
+        raise DeployProfileError(
+            "preview.slots must name at least one slot when the preview is enabled"
+        )
+    return DeployPreview(
+        enabled=enabled,
+        slots=tuple(slots),
+        app_ttl_hours=_parse_preview_count(
+            m.get("app_ttl_hours"), what="preview.app_ttl_hours", default=24
+        ),
+        evidence_days=_parse_preview_count(
+            m.get("evidence_days"), what="preview.evidence_days", default=14
+        ),
+        slot_wait_minutes=_parse_preview_count(
+            m.get("slot_wait_minutes"), what="preview.slot_wait_minutes", default=30
+        ),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Public loader
 # ---------------------------------------------------------------------------
@@ -936,6 +1103,7 @@ def parse_deploy_profile(
         "live_gate",
         "candidate",
         "sandbox",
+        "preview",
     }
     extra = {k: v for k, v in data.items() if k not in known_keys}
 
@@ -957,6 +1125,7 @@ def parse_deploy_profile(
         live_gate=_parse_live_gate(data.get("live_gate")),
         candidate=_parse_candidate(data.get("candidate")),
         sandbox=_parse_sandbox(data.get("sandbox")),
+        preview=_parse_preview(data.get("preview")),
         source_ref=source_ref,
         extra=extra,
     )

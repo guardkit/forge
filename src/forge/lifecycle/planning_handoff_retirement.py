@@ -22,7 +22,7 @@ RETIREMENT_DETAILS_KEY = "planning_handoff_retirement"
 RETIREMENT_REASON = "owner-retired-undelivered-pre-routing-handoff"
 MAX_DETAILS_BYTES = 64 * 1024
 EXPECTED_ORIGINAL_EVENTS = 20
-SUPPORTED_RECEIPT_SCHEMA_VERSIONS = frozenset({17, 18})
+SUPPORTED_RECEIPT_SCHEMA_VERSIONS = frozenset({17, 18, 19})
 
 _HEX = frozenset("0123456789abcdef")
 _TOP_KEYS = frozenset({RETIREMENT_DETAILS_KEY})
@@ -232,7 +232,7 @@ def _validate_schema(connection: sqlite3.Connection) -> int:
             raise _fail("schema v17 unexpectedly contains feature_routing_seeds")
     else:
         if not seed_columns:
-            raise _fail("schema v18 is missing feature_routing_seeds")
+            raise _fail(f"schema v{version} is missing feature_routing_seeds")
         missing = {"feature_routing_id", "state"} - seed_columns
         if missing:
             raise _fail(

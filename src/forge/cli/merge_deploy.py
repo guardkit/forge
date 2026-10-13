@@ -58,6 +58,15 @@ Then one of two things:
   the deploy is the stage after this one.
 
 It never says "merged and running", and it never deploys anything.
+
+A BUILD WHOSE MERGE OFFER CARRIES A REVIEW PREVIEW (web readiness W7) is
+pressed on the card's own terms: refused, and written down as a refusal,
+unless its preview is still usable; held to the tree that was previewed; and
+its preview released afterwards. With previews switched on
+(``review_preview.enabled``), a build whose project prepares previews (its
+profile enables them, or cannot be read) and that has no previewed card on
+record is refused — there is no override; run the feature again. Every other
+build is pressed exactly as before.
 """
 
 from __future__ import annotations
@@ -137,6 +146,60 @@ async def _aopen_backends(
     return publisher, guardkit_run, dispatcher, _close
 
 
+def _preview_service(config: ForgeConfig, pool: Any, dispatcher: Any) -> Any | None:
+    """The review-preview service, for an offer that carries a preview.
+
+    A module-level test seam. ``None`` when it cannot be built, which the
+    preview check then treats as a check that could not be made — a refusal.
+    """
+    try:
+        from forge.deploy.review_preview import build_review_preview_service
+
+        return build_review_preview_service(
+            config, connection=pool.connection, deploy_dispatcher=dispatcher
+        )
+    except Exception as exc:  # noqa: BLE001 — fail closed, said plainly
+        logger.error(
+            "merge-deploy: the review-preview service could not be built (%s: %s)",
+            type(exc).__name__,
+            exc,
+        )
+        return None
+
+
+def _the_durable_offer(pool: Any, build_id: str) -> dict[str, Any] | None:
+    """The build's merge offer as its durable row holds it, or None."""
+    from forge.pipeline.merge_offer import (
+        MERGE_OFFER_DETAILS_KEY,
+        MERGE_OFFER_TARGET_IDENTIFIER,
+    )
+
+    offers = [
+        stage
+        for stage in pool.read_stages(build_id)
+        if stage.target_identifier == MERGE_OFFER_TARGET_IDENTIFIER
+    ]
+    if not offers:
+        return None
+    offer = offers[-1].details.get(MERGE_OFFER_DETAILS_KEY)
+    return dict(offer) if isinstance(offer, dict) else None
+
+
+async def _release_quietly(service: Any, row: Any, reason: str) -> None:
+    """Release the build's preview; a failure is logged, never raised."""
+    try:
+        await service.release(
+            feature_id=row.feature_id, build_id=row.build_id, reason=reason
+        )
+    except Exception as exc:  # noqa: BLE001 — best effort
+        logger.warning(
+            "merge-deploy: the preview for %s could not be released (%s: %s)",
+            row.build_id,
+            type(exc).__name__,
+            exc,
+        )
+
+
 def _resolve_build_row(pool: Any, feature_id: str, build_id: str | None) -> Any:
     """The newest COMPLETE non-fix-journey build row (or the named one).
 
@@ -171,7 +234,10 @@ async def _arun(
 ) -> int:
     from forge.pipeline.merge_executor import (
         MergeExecutorDeps,
+        _publication_store_for,
+        _write_the_refusal_down_for,
         execute_merge_deploy,
+        why_a_previewed_offer_is_refused,
     )
     from forge.pipeline.merge_offer import read_baseline_failing
     from forge.pipeline.publisher_client import the_publishers_self_check
@@ -248,6 +314,12 @@ async def _arun(
     baseline_failing = read_baseline_failing(row.build_id)
     # The branch the build made, when the conductor recorded one (a repair).
     merge_branch = str(getattr(row, "merge_branch", None) or "").strip() or None
+    # AN OFFER WITH A REVIEW PREVIEW (web-readiness W7) is pressed here on the
+    # card's own terms: refused unless its preview is usable, held to the tree
+    # that was previewed, and released afterwards. Every other build — no
+    # offer on record, or an offer without a preview — is pressed as before.
+    offer = _the_durable_offer(pool, row.build_id)
+    previewed = offer is not None and "review_evidence" in offer
 
     publisher, guardkit_run, dispatcher, closer = await _aopen_backends(config)
     try:
@@ -265,6 +337,55 @@ async def _arun(
         decided_by = config.approval.expected_approver or os.environ.get(
             "USER", "operator"
         )
+        preview_service = None
+        # A PROJECT THAT PREPARES PREVIEWS IS NEVER PRESSED WITHOUT ONE. With
+        # previews switched on, a build whose project's profile enables them
+        # (or cannot be read — the same question the card asks) and that has
+        # no previewed card on record — a card lost to a restart during
+        # preparation, say — is refused. No flag overrides it: the remedy is
+        # to run the feature again, which prepares a preview and a card.
+        if not previewed and getattr(
+            getattr(config, "review_preview", None), "enabled", False
+        ):
+            preview_service = _preview_service(config, pool, dispatcher)
+            if preview_service is None or await asyncio.to_thread(
+                preview_service.enabled_for, row.repo
+            ):
+                click.echo(
+                    f"merge-deploy {row.feature_id} @ {row.repo}: refused — "
+                    "this project prepares previews and no previewed card is on "
+                    "record; run the feature again. Nothing was merged."
+                )
+                return 1
+        if previewed:
+            from datetime import datetime, timezone
+
+            preview_service = _preview_service(config, pool, dispatcher)
+            refusal, definitive = why_a_previewed_offer_is_refused(
+                preview_service, offer, now=datetime.now(timezone.utc)
+            )
+            if refusal is not None:
+                if not dry_run:
+                    _write_the_refusal_down_for(
+                        _publication_store_for(deps, row.build_id),
+                        deps=deps,
+                        build_id=row.build_id,
+                        holder=f"merge-deploy:{os.getpid()}",
+                        feature_id=row.feature_id,
+                        repo=row.repo,
+                        decided_by=decided_by,
+                        target_branch=recorded_branch,
+                        refusal=f"the approval was refused: {refusal}",
+                    )
+                    if definitive and preview_service is not None:
+                        await _release_quietly(
+                            preview_service, row, f"approval refused: {refusal}"
+                        )
+                click.echo(
+                    f"merge-deploy {row.feature_id} @ {row.repo}: refused — "
+                    f"{refusal}. Nothing was merged."
+                )
+                return 1
         outcome = await execute_merge_deploy(
             deps=deps,
             build_id=row.build_id,
@@ -277,7 +398,16 @@ async def _arun(
             baseline_failing=baseline_failing,
             dry_run=dry_run,
             merge_branch=merge_branch,
+            **(
+                {"expected_preview_tree": str(offer["preview_tree"])}
+                if previewed and offer.get("preview_tree")
+                else {}
+            ),
         )
+        if previewed and not dry_run and preview_service is not None:
+            await _release_quietly(
+                preview_service, row, f"approval ended: {outcome.result}"
+            )
     finally:
         await closer()
 

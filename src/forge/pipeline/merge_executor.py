@@ -227,6 +227,7 @@ __all__ = [
     "deployed_in_for",
     "merge_wall_seconds",
     "sandbox_merge_words",
+    "why_a_previewed_offer_is_refused",
 ]
 
 #: CORE subscription filter — one token per feature (``merge-FEAT-X``).
@@ -503,6 +504,11 @@ class MergeExecutorDeps:
     #: reader, called afresh on EVERY merge word; production passes
     #: :func:`~forge.pipeline.publisher_client.the_publishers_self_check`.
     what_the_machine_says: Any = None
+    #: THE REVIEW-PREVIEW SERVICE (web-readiness W7), or ``None``. Read only
+    #: for an offer whose details carry ``review_evidence``: its approval is
+    #: refused unless the preview is usable, and the preview is released once
+    #: the decision has ended. Every other offer never touches it.
+    review_preview: Any = None
 
 
 # ---------------------------------------------------------------------------
@@ -1143,6 +1149,121 @@ async def _the_profile_where_it_lives(
 
 
 # ---------------------------------------------------------------------------
+# The publication record, for a press and for a refused approval
+# ---------------------------------------------------------------------------
+
+
+def _publication_store_for(deps: MergeExecutorDeps, build_id: str) -> Any:
+    """The publication record's store, or None when there is no ledger here.
+
+    A press driven against a faked persistence facade — every unit test
+    written before the record existed — has no connection to write to. It
+    runs without a record and says so in the log, exactly as a build with
+    no record reads as "not recorded".
+    """
+    if deps.publication_store is not None:
+        return deps.publication_store()
+    connection = getattr(deps.pool, "connection", None)
+    if connection is None:
+        return None
+    try:
+        return PublicationRecordStore(connection)
+    except Exception as exc:  # noqa: BLE001 — a record never costs a press
+        logger.warning(
+            "merge-executor: no publication record for %s (%s: %s)",
+            build_id,
+            type(exc).__name__,
+            exc,
+        )
+        return None
+
+
+def _write_the_refusal_down_for(
+    store: Any,
+    *,
+    deps: MergeExecutorDeps,
+    build_id: str,
+    holder: str,
+    feature_id: str,
+    repo: str,
+    decided_by: str,
+    target_branch: str | None,
+    refusal: str,
+) -> None:
+    """One row for this build, saying the merge word was given and refused.
+
+    Used where the press stops BEFORE it would otherwise have taken the
+    lease — no branch of the remote was ever written down for this build,
+    or the remote's default branch has been renamed since — and, for an offer
+    with a review preview, where the approval itself is refused because the
+    preview is not usable (web-readiness W7). Taking the
+    lease is what creates the row, so it is taken here too; it carries
+    who gave the merge word and when, and the refusal is written onto the
+    record as the result with its reason beside it.
+
+    It never costs the press anything: a record that cannot be taken or
+    written is logged and the refusal is returned either way. A build
+    whose record somebody else is holding is left alone, which is the
+    same rule as everywhere else.
+    """
+    if store is None:
+        return
+    try:
+        grant = store.take_lease(
+            build_id=build_id,
+            holder=holder,
+            now=deps.clock(),
+            feature_id=feature_id,
+            repo=repo,
+            decided_by=decided_by,
+            target_branch=target_branch,
+        )
+        if grant is None:
+            logger.warning(
+                "merge-executor: %s's merge word was refused (%s) and the "
+                "refusal could not be written down — another worker holds "
+                "the record",
+                build_id,
+                refusal,
+            )
+            return
+        store.done(
+            build_id=build_id,
+            turn=grant.turn,
+            now=deps.clock(),
+            step=STEP_JOIN,
+            attempt=0,
+            result={
+                "joined": False,
+                "refused_before_the_join": True,
+                "recorded_target_branch": target_branch,
+                "refusal": refusal,
+            },
+        )
+        store.record(
+            build_id=build_id,
+            turn=grant.turn,
+            now=deps.clock(),
+            result=RESULT_PUBLICATION_PENDING,
+            # AND THE LEASE IS PUT DOWN AGAIN. Nothing is in progress:
+            # the press stopped before it did anything, so holding the
+            # record would only make the next merge word — from another
+            # process, once somebody has fixed the cause — wait out the
+            # lease for no reason.
+            lease_holder=None,
+            lease_expires_at=None,
+        )
+    except Exception as exc:  # noqa: BLE001 — a record never costs a press
+        logger.warning(
+            "merge-executor: %s's refusal could not be written onto its "
+            "publication record (%s: %s)",
+            build_id,
+            type(exc).__name__,
+            exc,
+        )
+
+
+# ---------------------------------------------------------------------------
 # The executor coroutine
 # ---------------------------------------------------------------------------
 
@@ -1165,6 +1286,7 @@ async def execute_merge_deploy(
     expected_candidate_branch: str | None = None,
     worktree_retention: dict[str, Any] | None = None,
     merge_execution_attempt_id: str | None = None,
+    expected_preview_tree: str | None = None,
 ) -> MergeDeployOutcome:
     """Run join -> checks -> report for one press, and stop before publishing.
 
@@ -1247,6 +1369,14 @@ async def execute_merge_deploy(
     when it is set, else ``autobuild/<feature id>``; the merge command is
     given ``--branch`` only when it is set, so a feature build's argv is byte
     for byte what it always was.
+
+    ``expected_preview_tree`` is the tree an offer with a review preview
+    previewed (web-readiness W7). When it is set, a joined tree that differs
+    from it is refused after the join — so after the build system's own checks
+    inside the merge command have run on it — and before the factory's live
+    check, any publication or any deploy; nothing reaches the target branch.
+    When it is ``None`` — every offer without a preview — nothing here
+    changes.
     """
     # Permanent administrative retirement is checked before routing, clocks,
     # receipts, leases, publishers, git, model-bearing commands, or deploy.
@@ -2138,28 +2268,8 @@ async def execute_merge_deploy(
         return None
 
     def _publication_store() -> Any:
-        """The publication record's store, or None when there is no ledger here.
-
-        A press driven against a faked persistence facade — every unit test
-        written before the record existed — has no connection to write to. It
-        runs without a record and says so in the log, exactly as a build with
-        no record reads as "not recorded".
-        """
-        if deps.publication_store is not None:
-            return deps.publication_store()
-        connection = getattr(deps.pool, "connection", None)
-        if connection is None:
-            return None
-        try:
-            return PublicationRecordStore(connection)
-        except Exception as exc:  # noqa: BLE001 — a record never costs a press
-            logger.warning(
-                "merge-executor: no publication record for %s (%s: %s)",
-                build_id,
-                type(exc).__name__,
-                exc,
-            )
-            return None
+        """The publication record's store (:func:`_publication_store_for`)."""
+        return _publication_store_for(deps, build_id)
 
     def _cannot_join(sentence: str) -> MergeDeployOutcome:
         """Nothing could be joined, so nothing happened. The branch is kept."""
@@ -2174,75 +2284,18 @@ async def execute_merge_deploy(
     def _write_the_refusal_down(
         *, store: Any, target_branch: str | None, refusal: str
     ) -> None:
-        """One row for this build, saying the merge word was given and refused.
-
-        Used where the press stops BEFORE it would otherwise have taken the
-        lease — no branch of the remote was ever written down for this build,
-        or the remote's default branch has been renamed since. Taking the
-        lease is what creates the row, so it is taken here too; it carries
-        who gave the merge word and when, and the refusal is written onto the
-        record as the result with its reason beside it.
-
-        It never costs the press anything: a record that cannot be taken or
-        written is logged and the refusal is returned either way. A build
-        whose record somebody else is holding is left alone, which is the
-        same rule as everywhere else.
-        """
-        if store is None:
-            return
-        try:
-            grant = store.take_lease(
-                build_id=build_id,
-                holder=worker_name,
-                now=deps.clock(),
-                feature_id=feature_id,
-                repo=repo,
-                decided_by=decided_by,
-                target_branch=target_branch,
-            )
-            if grant is None:
-                logger.warning(
-                    "merge-executor: %s's merge word was refused (%s) and the "
-                    "refusal could not be written down — another worker holds "
-                    "the record",
-                    build_id,
-                    refusal,
-                )
-                return
-            store.done(
-                build_id=build_id,
-                turn=grant.turn,
-                now=deps.clock(),
-                step=STEP_JOIN,
-                attempt=0,
-                result={
-                    "joined": False,
-                    "refused_before_the_join": True,
-                    "recorded_target_branch": target_branch,
-                    "refusal": refusal,
-                },
-            )
-            store.record(
-                build_id=build_id,
-                turn=grant.turn,
-                now=deps.clock(),
-                result=RESULT_PUBLICATION_PENDING,
-                # AND THE LEASE IS PUT DOWN AGAIN. Nothing is in progress:
-                # the press stopped before it did anything, so holding the
-                # record would only make the next merge word — from another
-                # process, once somebody has fixed the cause — wait out the
-                # lease for no reason.
-                lease_holder=None,
-                lease_expires_at=None,
-            )
-        except Exception as exc:  # noqa: BLE001 — a record never costs a press
-            logger.warning(
-                "merge-executor: %s's refusal could not be written onto its "
-                "publication record (%s: %s)",
-                build_id,
-                type(exc).__name__,
-                exc,
-            )
+        """This press's refusal, on its record (:func:`_write_the_refusal_down_for`)."""
+        _write_the_refusal_down_for(
+            store,
+            deps=deps,
+            build_id=build_id,
+            holder=worker_name,
+            feature_id=feature_id,
+            repo=repo,
+            decided_by=decided_by,
+            target_branch=target_branch,
+            refusal=refusal,
+        )
 
     # -----------------------------------------------------------------------
     # THE SEND, and the three endings it can have
@@ -4694,6 +4747,26 @@ async def execute_merge_deploy(
             gate["merged_tree"] = j_tree
             gate["trees_match"] = bool(j_tree)
 
+            # THE TREE THAT WAS PREVIEWED IS THE ONLY TREE THIS APPROVAL MAY
+            # MERGE (web-readiness W7, R3). The offer previewed the candidate
+            # joined onto the target branch as fetched then; if the branch has
+            # moved since, the join made now is a different tree that nobody
+            # tried. It is refused like a candidate that moved: the build
+            # system's checks inside the join have already run on it, but the
+            # live check, publication and deploy never happen.
+            if expected_preview_tree and j_tree != expected_preview_tree:
+                logger.warning(
+                    "merge-executor: refusing %s — main moved since the "
+                    "preview (previewed tree %s, joined tree %s)",
+                    build_id,
+                    expected_preview_tree,
+                    j_tree,
+                )
+                return _could_not_check(
+                    "main moved since the preview: previewed tree "
+                    f"{expected_preview_tree}, joined tree {j_tree}"
+                )
+
             if store is not None and not store.about_to(
                 build_id=build_id,
                 turn=turn,
@@ -5485,6 +5558,33 @@ def _deploy_task_id(feature_id: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+def why_a_previewed_offer_is_refused(
+    service: Any, offer: dict[str, Any], *, now: datetime
+) -> tuple[str | None, bool]:
+    """Why an offer with a review preview may not be approved now (web-readiness W7).
+
+    ``(None, False)`` when it may. Otherwise ``(reason, definitive)``:
+    ``definitive`` is True when the preview itself answers no (not ready,
+    expired, its lease ended, its evidence gone, no previewed tree on the
+    offer), and False when the check could not be made at all (no service
+    here, or a check that raised). It fails closed either way; only a
+    definitive refusal should end the preview. Shared by the card's press and
+    ``forge merge-deploy``.
+    """
+    if not str(offer.get("preview_tree") or "").strip():
+        return "the offer does not say which tree was previewed", True
+    if service is None:
+        return (
+            "the preview service is not running here, so the preview "
+            "cannot be confirmed"
+        ), False
+    try:
+        refusal = service.approval_refusal(offer.get("review_evidence"), now=now)
+    except Exception as exc:  # noqa: BLE001 — a refusal, never a pass
+        return f"the preview could not be checked ({type(exc).__name__})", False
+    return refusal, refusal is not None
+
+
 class MergeApprovalConsumer:
     """Consumes merge-card presses and runs the executor on a genuine approve.
 
@@ -5599,6 +5699,50 @@ class MergeApprovalConsumer:
             )
             return
 
+        # A PREVIEWED OFFER IS APPROVED ONLY WHILE ITS PREVIEW IS USABLE
+        # (web-readiness W7, 12 October 2026). Asked before the decision row,
+        # so a refused approval is written down as a refusal and never as a
+        # decision, and the card can still be rejected. Offers without
+        # ``review_evidence`` never reach this.
+        if decision == "approve" and "review_evidence" in offer:
+            refusal, definitive = why_a_previewed_offer_is_refused(
+                self._deps.review_preview, offer, now=self._deps.clock()
+            )
+            if refusal is not None:
+                # Known limitation (recorded 12 October 2026): Jarvis has
+                # already shown the press as recorded, as it does today for a
+                # refused moved branch, and nothing here tells the card
+                # otherwise. From Slack the way on is Reject, or running the
+                # feature again.
+                logger.warning(
+                    "merge-executor: refusing %s — %s; nothing was merged and "
+                    "no decision was recorded. The card in Slack may still show "
+                    "the approval as recorded; from Slack the way on is Reject, "
+                    "or running the feature again",
+                    request_id,
+                    refusal,
+                )
+                _write_the_refusal_down_for(
+                    _publication_store_for(self._deps, build_id),
+                    deps=self._deps,
+                    build_id=build_id,
+                    holder=f"merge-press:{os.getpid()}:{uuid.uuid4().hex[:8]}",
+                    feature_id=str(offer.get("feature_id") or ""),
+                    repo=str(offer.get("repo") or ""),
+                    decided_by=payload.decided_by,
+                    target_branch=None,
+                    refusal=f"the approval was refused: {refusal}",
+                )
+                # Only a definitive refusal ends the preview. One that came
+                # from a check that could not be made (a service that is not
+                # here, a check that raised) leaves it standing, so the same
+                # card can be approved once the check can be made again.
+                if definitive:
+                    await self._release_the_preview(
+                        offer, build_id=build_id, reason=f"approval refused: {refusal}"
+                    )
+                return
+
         # Durable decision row FIRST — the restart / duplicate fence.  An
         # approved decision gets a fresh unguessable executor-attribution
         # token in the same committed row, before its async task exists.
@@ -5668,6 +5812,7 @@ class MergeApprovalConsumer:
                     build_id,
                     exc,
                 )
+            await self._release_the_preview(offer, build_id=build_id, reason="rejected")
             return
 
         # approve — resolve what the executor needs from the durable offer.
@@ -5736,6 +5881,12 @@ class MergeApprovalConsumer:
                 expected_candidate_branch=expected_candidate_branch,
                 worktree_retention=worktree_retention,
                 merge_execution_attempt_id=str(merge_execution_attempt_id),
+                **({"previewed_offer": offer} if "review_evidence" in offer else {}),
+                **(
+                    {"expected_preview_tree": str(offer["preview_tree"])}
+                    if offer.get("preview_tree")
+                    else {}
+                ),
             )
         )
         self._tasks.add(task)
@@ -5758,12 +5909,15 @@ class MergeApprovalConsumer:
         expected_candidate_branch: str | None = None,
         worktree_retention: dict[str, Any] | None = None,
         merge_execution_attempt_id: str,
+        previewed_offer: dict[str, Any] | None = None,
+        expected_preview_tree: str | None = None,
     ) -> None:
         # Per-repo single-flight: an asyncio lock per repo key PLUS the
         # executor's own durable step probes.
         async with self._lock_for(repo):
+            ended = "approval failed: the merge press raised"
             try:
-                await execute_merge_deploy(
+                outcome = await execute_merge_deploy(
                     deps=self._deps,
                     build_id=build_id,
                     feature_id=feature_id,
@@ -5779,7 +5933,13 @@ class MergeApprovalConsumer:
                     expected_candidate_branch=expected_candidate_branch,
                     worktree_retention=worktree_retention,
                     merge_execution_attempt_id=merge_execution_attempt_id,
+                    **(
+                        {"expected_preview_tree": expected_preview_tree}
+                        if expected_preview_tree
+                        else {}
+                    ),
                 )
+                ended = f"approval ended: {getattr(outcome, 'result', None)}"
             except Exception as exc:  # noqa: BLE001 — the task must not die silent
                 logger.error(
                     "merge-executor: executor raised (%s) for build %s — see "
@@ -5788,3 +5948,35 @@ class MergeApprovalConsumer:
                     build_id,
                     build_id,
                 )
+            # A cancelled press (a restart) does not get here: its preview is
+            # left to its own expiry and the start-up reconcile.
+            if previewed_offer is not None:
+                await self._release_the_preview(
+                    previewed_offer, build_id=build_id, reason=ended
+                )
+
+    async def _release_the_preview(
+        self, offer: dict[str, Any], *, build_id: str, reason: str
+    ) -> None:
+        """Tear this offer's preview down once its decision has ended.
+
+        Only for an offer that carried ``review_evidence``. Best effort: a
+        release that fails is logged and never costs the decision.
+        """
+        service = self._deps.review_preview
+        if service is None or "review_evidence" not in offer:
+            return
+        try:
+            await service.release(
+                feature_id=str(offer.get("feature_id") or ""),
+                build_id=build_id,
+                reason=reason,
+            )
+        except Exception as exc:  # noqa: BLE001 — never costs the decision
+            logger.warning(
+                "merge-executor: the preview for %s could not be released "
+                "(%s: %s)",
+                build_id,
+                type(exc).__name__,
+                exc,
+            )

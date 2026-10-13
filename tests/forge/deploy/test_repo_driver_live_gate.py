@@ -8,6 +8,7 @@ stdout returns an honest non-SUT verdict, never an exception).
 
 from __future__ import annotations
 
+import json
 import os
 import stat
 from pathlib import Path
@@ -384,3 +385,80 @@ def test_the_other_backends_can_be_moved_too(tmp_path: Path) -> None:
 
     with pytest.raises(LiveGateSeamError, match="cannot run here"):
         RefusingLiveGateInvoker("cannot run here").invoke(feature="F", target="t")
+
+
+# ---------------------------------------------------------------------------
+# The journey's evidence in the envelope (web readiness W7, 12 October 2026)
+# ---------------------------------------------------------------------------
+
+
+def _answer(envelope: dict, **kwargs: "object") -> "object":
+    from forge.deploy.live_gate import project_driver_answer
+
+    return project_driver_answer(
+        argv=["driver"],
+        cwd="/tree",
+        exit_code=0,
+        stdout=json.dumps(envelope),
+        stderr="",
+        gate_ids=(),
+        run_id_fallback="fallback",
+        **kwargs,
+    )
+
+
+def test_an_envelope_without_evidence_reads_exactly_as_before() -> None:
+    invocation = _answer({"verdict": "pass", "run_id": "r1"})
+    assert invocation.app_url is None
+    assert invocation.screenshot_refs == ()
+    assert invocation.trace_refs == ()
+    assert invocation.media_refs == ()
+    assert invocation.report_ref is None
+    assert invocation.outcome is None
+
+
+_JOURNEY_ENVELOPE = {
+    "verdict": "pass",
+    "run_id": "r1",
+    "app_url": "http://127.0.0.1:18950/",
+    "screenshot_refs": ["shots/a.png", "", 7, "shots/b.png"],
+    "trace_refs": ["trace.zip"],
+    "media_refs": ["video/journey.webm"],
+    "report_ref": "report/index.html",
+    "outcome": {"passed": 5, "failed": 0, "skipped": "two", "flaky": -1},
+}
+
+
+def test_an_ordinary_gate_does_not_read_the_journey_evidence() -> None:
+    invocation = _answer(_JOURNEY_ENVELOPE)
+    assert invocation.app_url is None
+    assert invocation.screenshot_refs == () and invocation.trace_refs == ()
+    assert invocation.media_refs == () and invocation.report_ref is None
+    assert invocation.outcome is None
+
+
+def test_the_journey_evidence_is_carried_from_the_envelope() -> None:
+    invocation = _answer(_JOURNEY_ENVELOPE, journey_evidence=True)
+    assert invocation.app_url == "http://127.0.0.1:18950/"
+    assert invocation.screenshot_refs == ("shots/a.png", "shots/b.png")
+    assert invocation.trace_refs == ("trace.zip",)
+    assert invocation.media_refs == ("video/journey.webm",)
+    assert invocation.report_ref == "report/index.html"
+    # Unknown stays unknown: never a 0 for something the driver did not say.
+    assert invocation.outcome == {"passed": 5, "failed": 0, "skipped": None, "flaky": None}
+
+
+def test_the_exit_code_fallback_carries_no_evidence() -> None:
+    from forge.deploy.live_gate import project_driver_answer
+
+    invocation = project_driver_answer(
+        argv=["driver"],
+        cwd="/tree",
+        exit_code=1,
+        stdout="not json",
+        stderr="",
+        gate_ids=(),
+        run_id_fallback="fallback",
+    )
+    assert invocation.verdict == "fail"
+    assert invocation.media_refs == () and invocation.outcome is None

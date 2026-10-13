@@ -728,12 +728,18 @@ class TestRuntimeVenvHandover:
     def test_runtime_does_not_install_build_essentials(
         self, dockerfile_text: str
     ) -> None:
-        # gcc/build-essential must stay in the discarded builder stage —
+        # build-essential/g++ must stay in the discarded builder stage —
         # shipping them in runtime would inflate the image and broaden
         # attack surface (E1.3). We strip comment lines before scanning
         # so explanatory references in comments don't trigger a false
         # match. The check anchors on actual ``apt-get install`` /
         # ``pip install`` directives in the runtime stage body.
+        #
+        # gcc left this list on 12 October 2026 (Phase 1 web-app readiness,
+        # W1): Go's race detector needs cgo on arm64, so the runtime stage
+        # installs gcc and libc6-dev on purpose. That is pinned by
+        # ``TestTheWebToolchain.test_gcc_is_installed_for_the_race_detector``;
+        # the rest of the C/C++ build kit is still refused here.
         runtime_body = _runtime_stage_body(dockerfile_text)
         non_comment_lines = [
             line
@@ -744,7 +750,6 @@ class TestRuntimeVenvHandover:
 
         forbidden_packages = (
             "build-essential",
-            "gcc",
             "g++",
         )
         for pkg in forbidden_packages:
@@ -1059,3 +1064,247 @@ class TestTheCodeSearchPrograms:
         runtime_body = _runtime_stage_body(dockerfile_text)
         check = runtime_body.index("RUN python -m guardkitfactory.code_search self-check")
         assert check > runtime_body.index("COPY --from=builder /opt/venv /opt/venv")
+
+
+def _run_instructions(text: str) -> list[str]:
+    """Every RUN instruction in ``text``, continuation lines joined into one."""
+    return [
+        re.sub(r"\\\s*\n\s*", " ", match.group())
+        for match in re.finditer(r"^RUN\b(?:[^\n]*\\\n)*[^\n]*$", text, re.MULTILINE)
+    ]
+
+
+class TestTheWebToolchain:
+    """12 October 2026 (Phase 1 web-app readiness, W1): Node 22, Go 1.26,
+    Staticcheck, gcc for the race detector, and the Playwright 1.63 browsers.
+
+    The coding Player's and Coach's shell runs with PATH=/usr/bin:/bin and
+    inherits none of the image's environment, so the tools are linked into
+    /usr/bin and Go's toolchain setting lives in Go's own go.env. The static
+    halves are here; the self-check RUN proves them inside the image as
+    uid 1000 under that minimal environment."""
+
+    ARCHIVES = (
+        (
+            "NODE",
+            "22.23.2",
+            "fff4078c5def658577f92c88db7db3bc0072924bfb93fe52c1e744a54e94abb8",
+            "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-arm64.tar.xz",
+            "/tmp/node.tar.xz",
+        ),
+        (
+            "GO",
+            "1.26.9",
+            "4a97373d49fcacdcf3694fea368a500b00ee3e963974f3e7514132717632f052",
+            "https://go.dev/dl/go${GO_VERSION}.linux-arm64.tar.gz",
+            "/tmp/go.tgz",
+        ),
+        (
+            "STATICCHECK",
+            "2026.2.1",
+            "594421f28ba620ea14b98377cb84a309cf73cc420ba0f52f30c7fa4d92fd2b0e",
+            "https://github.com/dominikh/go-tools/releases/download/"
+            "${STATICCHECK_VERSION}/staticcheck_linux_arm64.tar.gz",
+            "/tmp/staticcheck.tgz",
+        ),
+    )
+
+    @pytest.mark.parametrize(("name", "version", "digest", "url", "path"), ARCHIVES)
+    def test_each_archive_is_pinned_and_checked_before_unpacking(
+        self, dockerfile_text: str, name: str, version: str, digest: str, url: str, path: str
+    ) -> None:
+        runtime_body = _runtime_stage_body(dockerfile_text)
+        assert re.search(
+            rf"^ARG\s+{name}_VERSION={re.escape(version)}\s*$", runtime_body, re.MULTILINE
+        ), f"{name} must be pinned at {version}"
+        assert re.search(
+            rf"^ARG\s+{name}_SHA256={digest}\s*$", runtime_body, re.MULTILINE
+        ), f"{name}'s archive sha256 must be the one recorded in the baseline"
+        (run,) = [r for r in _run_instructions(runtime_body) if url in r]
+        check = run.index(
+            f'echo "${{{name}_SHA256}}  {path}" | sha256sum --check --strict -'
+        )
+        unpack = run.index(f"--file {path}")
+        assert check < unpack, f"{name}'s archive must be checked before it is unpacked"
+        assert "--no-same-owner" in run, (
+            f"{name}'s archive must be unpacked as root-owned files, never as "
+            "the uids recorded inside it (Staticcheck's is uid 1000, the forge user)"
+        )
+
+    def test_debian_nodejs_is_gone(self, dockerfile_text: str) -> None:
+        runtime_body = _runtime_stage_body(dockerfile_text)
+        for run in _run_instructions(runtime_body):
+            assert not re.search(r"apt-get\s+install[^&]*\bnodejs\b", run), (
+                "Debian's nodejs (Node 18, no npm) must not be installed; the "
+                "pinned Node 22 replaces it"
+            )
+
+    def test_the_tools_are_linked_where_the_player_looks(self, dockerfile_text: str) -> None:
+        runtime_body = _runtime_stage_body(dockerfile_text)
+        links = {
+            "node": "/usr/local/bin/node",
+            "npm": "/usr/local/bin/npm",
+            "npx": "/usr/local/bin/npx",
+            "go": "/usr/local/go/bin/go",
+            "gofmt": "/usr/local/go/bin/gofmt",
+            "staticcheck": "/usr/local/bin/staticcheck",
+        }
+        for tool, target in links.items():
+            # A plain ``ln -s`` refuses to replace an existing file, so no
+            # Debian binary in /usr/bin can be shadowed silently.
+            assert re.search(
+                rf"&& ln -s {re.escape(target)} /usr/bin/{tool}(?:\s|$)", runtime_body
+            ), f"{tool} must be linked into /usr/bin with a plain ln -s"
+        assert not re.search(r"\bln\s+-[a-z]*f", runtime_body), (
+            "no link may be forced over an existing file"
+        )
+
+    def test_gotoolchain_local_is_written_into_go_env(self, dockerfile_text: str) -> None:
+        runtime_body = _runtime_stage_body(dockerfile_text)
+        # Written through a copy, not ``sed -i``: the BDD background step
+        # treats any ``sed -i`` in this file as a possible pyproject rewrite.
+        assert (
+            "sed 's/^GOTOOLCHAIN=auto$/GOTOOLCHAIN=local/' /usr/local/go/go.env > /tmp/go.env"
+            in runtime_body
+        )
+        assert "mv /tmp/go.env /usr/local/go/go.env" in runtime_body
+        assert "grep -qx 'GOTOOLCHAIN=local' /usr/local/go/go.env" in runtime_body, (
+            "the edit must be proved in the same layer, so a changed go.env "
+            "in a later Go fails the build instead of leaving auto in place"
+        )
+
+    def test_gcc_is_installed_for_the_race_detector(self, dockerfile_text: str) -> None:
+        runtime_body = _runtime_stage_body(dockerfile_text)
+        (run,) = [r for r in _run_instructions(runtime_body) if "/tmp/go.tgz" in r]
+        assert re.search(r"apt-get install --yes --no-install-recommends gcc libc6-dev\b", run)
+        assert "rm -rf /var/lib/apt/lists/*" in run
+
+    def test_the_playwright_browsers_are_installed_for_every_user(
+        self, dockerfile_text: str
+    ) -> None:
+        runtime_body = _runtime_stage_body(dockerfile_text)
+        assert re.search(r"^ARG\s+PLAYWRIGHT_VERSION=1\.63\.0\s*$", runtime_body, re.MULTILINE)
+        env = re.search(
+            r"^ENV\s+PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright\s*$", runtime_body, re.MULTILINE
+        )
+        assert env, "PLAYWRIGHT_BROWSERS_PATH must be set in the image for the pass-through"
+        install = runtime_body.index(
+            'RUN npx -y "playwright@${PLAYWRIGHT_VERSION}" install --with-deps '
+            "chromium firefox webkit"
+        )
+        assert env.start() < install, "the browsers must land in /opt/ms-playwright"
+        (run,) = [r for r in _run_instructions(runtime_body) if "install --with-deps" in r]
+        assert 'grep -qx "Version ${PLAYWRIGHT_VERSION}"' in run
+        assert 'chmod -R a+rX,go-w "${PLAYWRIGHT_BROWSERS_PATH}"' in run
+        assert "rm -rf /var/lib/apt/lists/* /root/.npm /root/.cache" in run
+
+    def test_no_shared_cache_is_baked_into_the_image(self, dockerfile_text: str) -> None:
+        settings = " ".join(
+            re.sub(r"\\\s*\n", " ", match.group())
+            for match in re.finditer(
+                r"^(?:ENV|ARG)\b(?:[^\n]*\\\n)*[^\n]*$", dockerfile_text, re.MULTILINE
+            )
+        )
+        for name in ("GOPATH", "GOCACHE", "GOMODCACHE", "npm_config_cache", "NPM_CONFIG_CACHE"):
+            assert not re.search(rf"(?<![A-Za-z0-9_]){name}=", settings), (
+                f"{name} must resolve under each build's HOME, never a shared image path"
+            )
+
+    def test_the_self_check_runs_as_the_player_would(self, dockerfile_text: str) -> None:
+        runtime_body = _runtime_stage_body(dockerfile_text)
+        (run,) = [r for r in _run_instructions(runtime_body) if "as_player=" in r]
+        assert (
+            'as_player="setpriv --reuid=1000 --regid=1000 --clear-groups '
+            'env -i PATH=/usr/bin:/bin HOME=${check_home}"'
+        ) in run
+        for check in (
+            'test "$(${as_player} node --version)" = "v${NODE_VERSION}"',
+            'test "$(${as_player} npm --version)" = "${NODE_NPM_VERSION}"',
+            '${as_player} go version | grep -q " go${GO_VERSION} linux/arm64$"',
+            'test "$(${as_player} go env GOTOOLCHAIN)" = "local"',
+            'test "$(${as_player} go env CGO_ENABLED)" = "1"',
+            '${as_player} go run -race "${check_home}/race.go"',
+            'gofmt_out="$(${as_player} gofmt -l "${check_home}/race.go")"',
+            'test -z "${gofmt_out}"',
+            'test "$(${as_player} staticcheck -version)" = '
+            '"staticcheck ${STATICCHECK_VERSION} (0.8.1)"',
+        ):
+            assert check in run, f"the self-check must include: {check}"
+        assert re.search(r"^ARG\s+NODE_NPM_VERSION=10\.9\.8\s*$", runtime_body, re.MULTILINE)
+
+    def test_the_self_check_finds_the_chromium_binaries_playwright_installs(
+        self, dockerfile_text: str
+    ) -> None:
+        # Playwright 1.63.0 on linux-arm64 (playwright-core lib/coreBundle.js,
+        # EXECUTABLE_PATHS) installs Chrome for Testing builds:
+        #   chromium-<rev>/chrome-linux-arm64/chrome
+        #   chromium_headless_shell-<rev>/chrome-headless-shell-linux-arm64/chrome-headless-shell
+        # The first W1 draft searched for ``headless_shell``, the name older
+        # Playwright builds used, and the self-check would have failed the build.
+        runtime_body = _runtime_stage_body(dockerfile_text)
+        (run,) = [r for r in _run_instructions(runtime_body) if "as_player=" in r]
+        assert (
+            "-path '*/chromium-*/chrome-linux-arm64/chrome' -name chrome)"
+        ) in run
+        assert (
+            "-path '*/chromium_headless_shell-*/chrome-headless-shell-linux-arm64/"
+            "chrome-headless-shell' -name chrome-headless-shell)"
+        ) in run
+        assert "-name headless_shell" not in run
+        assert 'test -x "${chrome}" && test -x "${headless_shell}"' in run
+
+    def test_every_browser_run_in_the_self_check_is_bounded(
+        self, dockerfile_text: str
+    ) -> None:
+        # 13 October 2026: the first real build ran full Chrome with
+        # --dump-dom, it never exited, and the build hung for over two hours.
+        # Now the page load uses only the headless shell (what Playwright's
+        # default headless mode runs), full Chrome only answers --version, and
+        # each run is under a timeout and writes to a file, never a pipe.
+        runtime_body = _runtime_stage_body(dockerfile_text)
+        (run,) = [r for r in _run_instructions(runtime_body) if "as_player=" in r]
+        run = re.sub(r"\s+", " ", run)
+        assert (
+            'timeout --kill-after=5 30 ${as_player} "${chrome}" --version'
+            ' < /dev/null > "${check_home}/chrome-version.txt" 2>&1'
+        ) in run
+        assert "grep -Eq '[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+' \"${check_home}/chrome-version.txt\"" in run
+        assert (
+            'timeout --kill-after=5 60 ${as_player} "${headless_shell}" --no-sandbox'
+        ) in run
+        assert '--dump-dom about:blank < /dev/null > "${check_home}/dom.html"' in run
+        assert "grep -q '<body>' \"${check_home}/dom.html\"" in run
+        # Every place a browser binary is run is wrapped in a timeout.
+        browser_runs = [
+            segment
+            for segment in re.split(r"&&|\|\|", run)
+            if re.search(r'"\$\{(?:chrome|headless_shell)\}" --', segment)
+        ]
+        assert len(browser_runs) == 2
+        for browser_run in browser_runs:
+            assert "timeout --kill-after=5 " in browser_run, browser_run
+        # Full Chrome is never asked to load a page, and no browser feeds a pipe.
+        assert not re.search(r'"\$\{chrome\}"[^;]*--dump-dom', run)
+        assert not re.search(r'about:blank\s*\|', run)
+
+    def test_the_toolchain_layers_sit_before_the_cache_barrier(
+        self, dockerfile_text: str
+    ) -> None:
+        # Behind the provenance barrier every layer is rebuilt for each commit;
+        # the downloads and the browser install must stay cached, and the
+        # self-check must run after everything it checks.
+        runtime_body = _runtime_stage_body(dockerfile_text)
+        barrier = runtime_body.index("ARG FORGE_GIT_SHA")
+        node = runtime_body.index("ARG NODE_VERSION=")
+        playwright = runtime_body.index('RUN npx -y "playwright@')
+        self_check = runtime_body.index('RUN check_home="$(mktemp -d)"')
+        assert runtime_body.index("ARG RIPGREP_VERSION=") < node < playwright < self_check < barrier
+
+    def test_the_node_options_flag_is_kept(self, dockerfile_text: str) -> None:
+        # Kept as the Phase 1 design records: Node 22 accepts the flag and it
+        # changes nothing there.
+        assert re.search(
+            r"^ENV\s+NODE_OPTIONS=--experimental-global-webcrypto\s*$",
+            dockerfile_text,
+            re.MULTILINE,
+        )
