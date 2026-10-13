@@ -1915,3 +1915,116 @@ def test_the_ledger_allows_one_live_lease_per_port(connection: sqlite3.Connectio
     store.update("pv000000000001", now=START, state="ended")
     store.insert(PreviewLease(**{**lease.__dict__, "lease_id": "pv000000000002"}), now=START)
     assert json.dumps([row.lease_id for row in store.live()]) == '["pv000000000002"]'
+
+
+# ---------------------------------------------------------------------------
+# The slot's public address: the profile's, else the coordinator's host
+# ---------------------------------------------------------------------------
+
+SLOTS_WITHOUT_ADDRESSES = [
+    {"port": 8950, "internal_port": 18950},
+    {"port": 8951, "internal_port": 18951},
+]
+
+
+@pytest.mark.asyncio
+async def test_a_profile_without_addresses_uses_the_coordinator_s_host(
+    world: World,
+) -> None:
+    world.profile = _profile(slots=SLOTS_WITHOUT_ADDRESSES)
+    world.service._public_host = "preview.example.test"
+
+    evidence = await world.service.prepare(_request())
+
+    assert evidence.state == "ready", evidence.failure_reason
+    assert evidence.app_url == "https://preview.example.test:8950/?preview=the-right-token"
+    up = next(call for call in world.dispatch.calls if call["leg"] == "preview_up")
+    assert up["identity_env"]["FACTORY_PREVIEW_URL"] == "https://preview.example.test:8950"
+
+
+@pytest.mark.asyncio
+async def test_a_profile_s_own_address_still_wins(world: World) -> None:
+    world.service._public_host = "other.example.test"
+
+    evidence = await world.service.prepare(_request())
+
+    assert evidence.app_url.startswith("https://preview.example.test:8950/?preview=")
+
+
+@pytest.mark.asyncio
+async def test_with_no_address_anywhere_nothing_is_prepared(world: World) -> None:
+    world.profile = _profile(slots=SLOTS_WITHOUT_ADDRESSES)
+
+    evidence = await world.service.prepare(_request())
+
+    assert evidence.state == "failed"
+    assert evidence.failure_reason == "no public address configured for preview slot 8950"
+    assert world.venue.calls == [] and world.dispatch.calls == []
+    assert world.service.approval_refusal(evidence.model_dump(mode="json"), now=START)
+
+
+def test_the_production_service_takes_the_coordinator_s_host(tmp_path: Path) -> None:
+    from forge.config.models import ForgeConfig
+    from forge.deploy.review_preview import build_review_preview_service
+
+    config = ForgeConfig.model_validate(
+        {
+            "permissions": {"filesystem": {"allowlist": ["/tmp"]}},
+            "review_preview": {"enabled": True, "public_host": "preview.example.test"},
+        }
+    )
+    cx = connect_writer(tmp_path / "forge.db")
+    migrations.apply_at_boot(cx)
+    service = build_review_preview_service(
+        config, connection=cx, deploy_dispatcher=AsyncMock()
+    )
+    assert service._public_host == "preview.example.test"
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        "h\x80x.test", "0x7f000001", "a|b.test", "a..b",
+        "127.0.0x1", "127.0x0.0.1", "a.123", "a.0x1", "a.0X1F",
+        "preview.example.test\n", "\npreview.example.test",
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_host_that_is_not_a_dns_name_never_reaches_a_link(
+    world: World, host: str
+) -> None:
+    """Even handed to the service directly, past the settings' own check."""
+    world.profile = _profile(slots=SLOTS_WITHOUT_ADDRESSES)
+    world.service._public_host = host
+
+    evidence = await world.service.prepare(_request())
+
+    assert evidence.state == "failed"
+    assert evidence.app_url is None
+    assert evidence.failure_reason == "no public address configured for preview slot 8950"
+    assert world.store.live() == []
+
+
+@pytest.mark.asyncio
+async def test_a_mixed_case_host_is_used_lower_cased(world: World) -> None:
+    world.profile = _profile(slots=SLOTS_WITHOUT_ADDRESSES)
+    world.service._public_host = "Preview.Example.Test"
+
+    evidence = await world.service.prepare(_request())
+
+    assert evidence.app_url.startswith("https://preview.example.test:8950/?preview=")
+
+
+@pytest.mark.parametrize(
+    "host",
+    ["preview.example.test", "123.example.test", "xn--exmple-cua.test", "a" * 63 + ".test"],
+)
+@pytest.mark.asyncio
+async def test_an_ordinary_dns_name_reaches_the_link(world: World, host: str) -> None:
+    world.profile = _profile(slots=SLOTS_WITHOUT_ADDRESSES)
+    world.service._public_host = host
+
+    evidence = await world.service.prepare(_request())
+
+    assert evidence.state == "ready", evidence.failure_reason
+    assert evidence.app_url.startswith(f"https://{host}:8950/?preview=")

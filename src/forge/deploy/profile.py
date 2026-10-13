@@ -67,6 +67,7 @@ __all__ = [
     "DeploySandbox",
     "DeployPreview",
     "PreviewSlot",
+    "plain_public_host",
     "unambiguous_https_url",
     "DeployProfileError",
     "load_deploy_profile",
@@ -305,16 +306,59 @@ class PreviewSlot:
 
     Attributes:
         port: The port the preview's public listener uses inside the sandbox.
-            The sandbox publishes it, and the tailnet's HTTPS server exposes it
-            as ``public_url``.
+            The sandbox publishes it, and an HTTPS server exposes it at the
+            slot's public address.
         internal_port: The preview's internal listener inside the sandbox, never
             published. The recorded journey runs against it.
-        public_url: The address a reviewer opens, ``https://<host>:<port>``.
+        public_url: Optional. The address a reviewer opens,
+            ``https://<host>:<port>``. Left out, the coordinator's
+            ``review_preview.public_host`` gives it as
+            ``https://<public_host>:<port>``, so a public repository's profile
+            need name no machine.
     """
 
     port: int
     internal_port: int
-    public_url: str
+    public_url: str | None = None
+
+
+#: One DNS label: letters, digits and hyphens, 1-63 long, no hyphen at
+#: either end (matched whole, with ``fullmatch``, on the lower-cased name).
+_DNS_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
+
+#: The WHATWG URL standard's "ends in a number": a host whose LAST label is
+#: all decimal digits, or ``0x`` followed by hex digits (even none), is
+#: parsed by a browser as an IPv4 address.
+_ENDS_IN_A_NUMBER = re.compile(r"[0-9]+|0x[0-9a-f]*")
+
+
+def plain_public_host(value: object) -> str | None:
+    """``value`` lower-cased when it is a DNS host name, else None.
+
+    An allowlist, not a blocklist: 1-253 ASCII characters in dot-separated
+    labels of 1-63 letters, digits and hyphens, no label starting or ending
+    with a hyphen, no trailing dot, and no whitespace or control character
+    anywhere (a trailing newline included). A name a browser would read as an
+    IPv4 address is refused by the WHATWG URL standard's "ends in a number"
+    rule — its last label all decimal digits, or ``0x``/``0X`` followed by
+    hex digits — because previews are reached at a DNS name. Digits in any
+    other label are fine (``123.example.test``). The review preview's slots
+    are then reached at ``https://<host>:<slot port>/``; the host is
+    lower-cased, as Jarvis and nats-core compare hosts.
+    """
+    if not isinstance(value, str) or not value.isascii():
+        return None
+    if any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in value):
+        return None
+    host = value.lower()
+    if not 1 <= len(host) <= 253 or host.endswith("."):
+        return None
+    labels = host.split(".")
+    if not all(_DNS_LABEL.fullmatch(label) for label in labels):
+        return None
+    if _ENDS_IN_A_NUMBER.fullmatch(labels[-1]):
+        return None
+    return host
 
 
 def unambiguous_https_url(value: object) -> str | None:
@@ -1001,7 +1045,7 @@ def _parse_preview(raw: Any) -> DeployPreview | None:
         slots_raw = []
     if not isinstance(slots_raw, list):
         raise DeployProfileError(
-            "preview.slots must be a list of {port, internal_port, public_url}"
+            "preview.slots must be a list of {port, internal_port[, public_url]}"
         )
     slots: list[PreviewSlot] = []
     ports_seen: set[int] = set()
@@ -1019,7 +1063,7 @@ def _parse_preview(raw: Any) -> DeployPreview | None:
                 )
             ports_seen.add(value)
         public_url = slot.get("public_url")
-        if unambiguous_https_url(public_url) is None:
+        if public_url is not None and unambiguous_https_url(public_url) is None:
             raise DeployProfileError(
                 f"preview.slots[{i}].public_url must be a plain https:// address "
                 "(a host; no user name, query, fragment, backslash or spaces), "
@@ -1028,7 +1072,9 @@ def _parse_preview(raw: Any) -> DeployPreview | None:
             )
         slots.append(
             PreviewSlot(
-                port=port, internal_port=internal, public_url=public_url.rstrip("/")
+                port=port,
+                internal_port=internal,
+                public_url=public_url.rstrip("/") if public_url is not None else None,
             )
         )
     if enabled and not slots:

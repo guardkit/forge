@@ -380,6 +380,96 @@ class TestPreviewSection:
             )
 
 
+class TestASlotWithoutAnAddress:
+    BASE = {"env_id": "notes", "compose": {"file": "compose.yml"}}
+
+    def test_port_and_internal_port_are_enough(self) -> None:
+        p = parse_deploy_profile(
+            {
+                **self.BASE,
+                "preview": {
+                    "enabled": True,
+                    "slots": [{"port": 8950, "internal_port": 18950}],
+                },
+            }
+        )
+        assert p.preview.slots[0].public_url is None
+        assert (p.preview.slots[0].port, p.preview.slots[0].internal_port) == (8950, 18950)
+
+
+class TestThePublicHost:
+    @staticmethod
+    def _config(**preview):
+        from forge.config.models import ForgeConfig
+
+        return ForgeConfig.model_validate(
+            {
+                "permissions": {"filesystem": {"allowlist": ["/tmp"]}},
+                "review_preview": preview,
+            }
+        )
+
+    @pytest.mark.parametrize(
+        "host, kept",
+        [
+            ("preview.example.test", "preview.example.test"),
+            ("Preview.Example.Test", "preview.example.test"),
+            ("host", "host"),
+            ("xn--exmple-cua.test", "xn--exmple-cua.test"),
+            ("a-b.example.test", "a-b.example.test"),
+            ("a1.example.test", "a1.example.test"),
+            ("123.example.test", "123.example.test"),
+            ("0xabc.example.test", "0xabc.example.test"),
+        ],
+    )
+    def test_a_dns_name_is_kept_lower_cased(self, host, kept) -> None:
+        config = self._config(public_host=host)
+        assert config.review_preview.public_host == kept
+
+    def test_it_is_unset_by_default(self) -> None:
+        config = self._config()
+        assert config.review_preview.public_host is None
+        assert config.review_preview.enabled is False
+
+    @pytest.mark.parametrize(
+        "host",
+        [
+            # the review's probes, every one
+            "host.", "", " ", " host ", "https://h", "h:443", "h/x", "u@h", "h?q",
+            "h#f", "h\\x", "h x", "h\tx", "h\x00x", "h\x7fx", "h\x80x", "h\x85x",
+            "h\u200bx", "[::1]", "::1", "127.0.0.1", "127.1", "0x7f000001",
+            "2130706433", "017.0.0.1", "1.2.3.4.5", "a<b", "a>b", "a|b", "a^b",
+            "a%2fb", "a%00b", "a;b", "a'b", 'a"b', "a`b", "a{b}", "exämple.test",
+            "a..b", ".a", "-a", "a_b", "*.a", "a,b", "a$b", "a&b", "a!b", "a=b",
+            "a~b", "a+b", "a(b)", "a*b",
+            # and the edges of the rules
+            "a-.example.test", "a" * 64 + ".test", ("a" * 63 + ".") * 4 + "a",
+            "0X7f000001", "a|b.test",
+            # a browser would read these as IPv4 (WHATWG "ends in a number")
+            "127.0.0x1", "127.0x0.0.1", "a.123", "a.0x1", "a.0X1F", "a.0x",
+            # a newline or carriage return at either end
+            "preview.example.test\n", "\npreview.example.test",
+            "preview.example.test\r", "preview.example.test\r\n",
+        ],
+    )
+    def test_anything_but_a_dns_name_is_refused(self, host) -> None:
+        from pydantic import ValidationError
+
+        from forge.deploy.profile import plain_public_host
+
+        assert plain_public_host(host) is None
+        with pytest.raises(ValidationError, match="plain host name"):
+            self._config(public_host=host)
+
+    def test_the_longest_name_and_label_are_accepted(self) -> None:
+        from forge.deploy.profile import plain_public_host
+
+        label = "a" * 63
+        name = ".".join([label] * 3 + ["b" * 61])
+        assert len(name) == 253
+        assert plain_public_host(name) == name
+
+
 class TestTheEvidenceBaseAddress:
     @pytest.mark.parametrize(
         "url",
