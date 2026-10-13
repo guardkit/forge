@@ -323,8 +323,13 @@ class PreviewSlot:
 
 
 #: One DNS label: letters, digits and hyphens, 1-63 long, no hyphen at
-#: either end (checked on the lower-cased name).
-_DNS_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+#: either end (matched whole, with ``fullmatch``, on the lower-cased name).
+_DNS_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
+
+#: The WHATWG URL standard's "ends in a number": a host whose LAST label is
+#: all decimal digits, or ``0x`` followed by hex digits (even none), is
+#: parsed by a browser as an IPv4 address.
+_ENDS_IN_A_NUMBER = re.compile(r"[0-9]+|0x[0-9a-f]*")
 
 
 def plain_public_host(value: object) -> str | None:
@@ -332,20 +337,26 @@ def plain_public_host(value: object) -> str | None:
 
     An allowlist, not a blocklist: 1-253 ASCII characters in dot-separated
     labels of 1-63 letters, digits and hyphens, no label starting or ending
-    with a hyphen, and no trailing dot. Anything that reads as an IP address
-    is refused — a name made only of digits and dots, or one starting with
-    ``0x`` — because previews are reached at a DNS name. The review preview's
-    slots are then reached at ``https://<host>:<slot port>/``; the host is
+    with a hyphen, no trailing dot, and no whitespace or control character
+    anywhere (a trailing newline included). A name a browser would read as an
+    IPv4 address is refused by the WHATWG URL standard's "ends in a number"
+    rule — its last label all decimal digits, or ``0x``/``0X`` followed by
+    hex digits — because previews are reached at a DNS name. Digits in any
+    other label are fine (``123.example.test``). The review preview's slots
+    are then reached at ``https://<host>:<slot port>/``; the host is
     lower-cased, as Jarvis and nats-core compare hosts.
     """
     if not isinstance(value, str) or not value.isascii():
         return None
+    if any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in value):
+        return None
     host = value.lower()
-    if not 1 <= len(host) <= 253 or host.endswith(".") or host.startswith("0x"):
+    if not 1 <= len(host) <= 253 or host.endswith("."):
         return None
-    if all(ch.isdigit() or ch == "." for ch in host):
+    labels = host.split(".")
+    if not all(_DNS_LABEL.fullmatch(label) for label in labels):
         return None
-    if not all(_DNS_LABEL.match(label) for label in host.split(".")):
+    if _ENDS_IN_A_NUMBER.fullmatch(labels[-1]):
         return None
     return host
 

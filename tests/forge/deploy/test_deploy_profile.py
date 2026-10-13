@@ -418,6 +418,8 @@ class TestThePublicHost:
             ("xn--exmple-cua.test", "xn--exmple-cua.test"),
             ("a-b.example.test", "a-b.example.test"),
             ("a1.example.test", "a1.example.test"),
+            ("123.example.test", "123.example.test"),
+            ("0xabc.example.test", "0xabc.example.test"),
         ],
     )
     def test_a_dns_name_is_kept_lower_cased(self, host, kept) -> None:
@@ -443,6 +445,11 @@ class TestThePublicHost:
             # and the edges of the rules
             "a-.example.test", "a" * 64 + ".test", ("a" * 63 + ".") * 4 + "a",
             "0X7f000001", "a|b.test",
+            # a browser would read these as IPv4 (WHATWG "ends in a number")
+            "127.0.0x1", "127.0x0.0.1", "a.123", "a.0x1", "a.0X1F", "a.0x",
+            # a newline or carriage return at either end
+            "preview.example.test\n", "\npreview.example.test",
+            "preview.example.test\r", "preview.example.test\r\n",
         ],
     )
     def test_anything_but_a_dns_name_is_refused(self, host) -> None:

@@ -1981,7 +1981,14 @@ def test_the_production_service_takes_the_coordinator_s_host(tmp_path: Path) -> 
     assert service._public_host == "preview.example.test"
 
 
-@pytest.mark.parametrize("host", ["h\x80x.test", "0x7f000001", "a|b.test", "a..b"])
+@pytest.mark.parametrize(
+    "host",
+    [
+        "h\x80x.test", "0x7f000001", "a|b.test", "a..b",
+        "127.0.0x1", "127.0x0.0.1", "a.123", "a.0x1", "a.0X1F",
+        "preview.example.test\n", "\npreview.example.test",
+    ],
+)
 @pytest.mark.asyncio
 async def test_a_host_that_is_not_a_dns_name_never_reaches_a_link(
     world: World, host: str
@@ -2006,3 +2013,18 @@ async def test_a_mixed_case_host_is_used_lower_cased(world: World) -> None:
     evidence = await world.service.prepare(_request())
 
     assert evidence.app_url.startswith("https://preview.example.test:8950/?preview=")
+
+
+@pytest.mark.parametrize(
+    "host",
+    ["preview.example.test", "123.example.test", "xn--exmple-cua.test", "a" * 63 + ".test"],
+)
+@pytest.mark.asyncio
+async def test_an_ordinary_dns_name_reaches_the_link(world: World, host: str) -> None:
+    world.profile = _profile(slots=SLOTS_WITHOUT_ADDRESSES)
+    world.service._public_host = host
+
+    evidence = await world.service.prepare(_request())
+
+    assert evidence.state == "ready", evidence.failure_reason
+    assert evidence.app_url.startswith(f"https://{host}:8950/?preview=")
