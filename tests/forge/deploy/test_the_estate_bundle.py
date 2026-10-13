@@ -648,6 +648,62 @@ class TestWhatTheEstatePromises:
             "start with no command at all"
         )
 
+    def test_the_coordinator_names_the_settings_file_it_starts_with(
+        self, rendered: str
+    ) -> None:
+        """A ``forge cancel`` run inside the coordinator's container, with no
+        ``--config`` and no ``./forge.yaml``, finds the settings file through
+        FORGE_CONFIG_PATH and reads the card's approver from it (13 October
+        2026). The estate sets neither itself: both come from Forge's own
+        compose file, composed in. This holds that the RENDERED estate
+        coordinator still carries the name, and that it names the same file the
+        coordinator's ``--config`` starts ``serve`` with."""
+        import yaml
+
+        coordinator = yaml.safe_load(rendered)["services"]["coordinator"]
+        command = coordinator["command"]
+        assert "--config" in command, (
+            "the estate's coordinator no longer names --config"
+        )
+        started_with = command[command.index("--config") + 1]
+        assert coordinator["environment"].get("FORGE_CONFIG_PATH") == started_with, (
+            "the estate's coordinator does not carry FORGE_CONFIG_PATH naming "
+            f"the settings file it is started with ({started_with}), so a "
+            "'forge cancel' run inside it would read a different approver from "
+            "the gate's, or none"
+        )
+
+    def test_the_estate_takes_the_coordinators_settings_name_from_forges_file(
+        self,
+    ) -> None:
+        """Without Docker: the estate composes Forge's own compose file in and
+        neither replaces the coordinator's command nor sets FORGE_CONFIG_PATH
+        to something else, so the name Forge's file gives the coordinator is
+        the one the estate's coordinator runs with."""
+        import yaml
+
+        estate = yaml.safe_load((ESTATE / "compose.yaml").read_text())
+        included = [
+            entry["path"] if isinstance(entry, dict) else entry
+            for entry in estate.get("include", [])
+        ]
+        assert "../compose/compose.yaml" in included, (
+            "the estate no longer composes Forge's own compose file in"
+        )
+        own = estate["services"]["coordinator"]
+        assert "command" not in own, (
+            "the estate replaces the coordinator's command, so its --config may "
+            "no longer match the FORGE_CONFIG_PATH Forge's file sets"
+        )
+        environment = own.get("environment") or {}
+        if "FORGE_CONFIG_PATH" in environment:
+            forge = yaml.safe_load(
+                (ESTATE.parent / "compose" / "compose.yaml").read_text()
+            )["services"]["coordinator"]
+            assert environment["FORGE_CONFIG_PATH"] == forge["environment"][
+                "FORGE_CONFIG_PATH"
+            ], "the estate sets FORGE_CONFIG_PATH to a different file from Forge's"
+
     # -----------------------------------------------------------------
     # THE SLACK FRONT DOOR AND THE BUS GATEWAY (25 September 2026, stage 4c)
     # -----------------------------------------------------------------

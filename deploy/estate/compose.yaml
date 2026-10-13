@@ -1100,6 +1100,14 @@ services:
   # what a Claude session asks over MCP. Both are memory; they are two different
   # paths to it, and only one of them is the coordinator's. README.md says so at
   # more length.
+  #
+  # NOT REPEATED HERE: the settings file's name. Forge's own file, composed in,
+  # starts the coordinator with '--config /etc/forge/forge.yaml' and sets
+  # FORGE_CONFIG_PATH to the same path, so a 'forge cancel' run inside this
+  # container reads the approver from the file the gate was built from
+  # (13 October 2026). Compose merges the lines below into that service, so the
+  # rendered estate carries it; tests/forge/deploy/test_the_estate_bundle.py
+  # holds that.
   # -------------------------------------------------------------------------
   coordinator:
     depends_on:

@@ -151,6 +151,29 @@ class TestTheBundleRenders:
             BUNDLE / ".env.example"
         ).read_text()
 
+    def test_the_coordinator_names_the_settings_file_it_starts_with(
+        self,
+    ) -> None:
+        """A ``forge cancel`` run inside the coordinator's container, with no
+        ``--config`` and no ``./forge.yaml``, finds the settings file through
+        FORGE_CONFIG_PATH, and reads the card's approver from it (13 October
+        2026). That only clears the card if it is the SAME file the gate was
+        built from, so the name must equal the path ``serve`` is started with.
+        Read from the file itself, so it holds without Docker."""
+        import yaml
+
+        coordinator = yaml.safe_load((BUNDLE / "compose.yaml").read_text())[
+            "services"
+        ]["coordinator"]
+        command = coordinator["command"]
+        assert "--config" in command, "the coordinator no longer names --config"
+        started_with = command[command.index("--config") + 1]
+        assert coordinator["environment"].get("FORGE_CONFIG_PATH") == started_with, (
+            "the coordinator's FORGE_CONFIG_PATH does not name the settings "
+            f"file it is started with ({started_with}), so a 'forge cancel' run "
+            "inside it would read a different approver from the gate's, or none"
+        )
+
 
 class TestNothingOfThisMachineIsInIt:
     def test_no_address_but_the_documentation_one(self, rendered: str) -> None:
