@@ -422,3 +422,78 @@ class TestEveryWayOfSpellingTheCredentialFileIsCaught:
         }
         verdict = run_the_activation_check(config, IT_PASSED)
         assert verdict.all_hold is True, verdict.sentence
+
+
+class TestAProtectedPathCannotHideASeparator:
+    """Codex, implementation round 2 (R2). Paths are found inside settings by
+    splitting on whitespace, '=', ':', ',', ';' and quotes, so a protected
+    path containing one could never be found. The settings model refuses
+    such a path at load, naming the field; and the whole value is also
+    compared as one path, so an identical standalone path is always found."""
+
+    @pytest.mark.parametrize("field", ["publisher_route_keys_dir", "publisher_credential_file"])
+    @pytest.mark.parametrize(
+        "value", ["/srv/publisher/route keys", "/srv/a=b/keys", "/srv/a:b/keys", "relative/keys"]
+    )
+    def test_the_settings_refuse_a_path_with_a_separator(self, field: str, value: str) -> None:
+        from pydantic import ValidationError
+
+        from forge.config.models import ForgeConfig
+
+        with pytest.raises(ValidationError) as refused:
+            ForgeConfig.model_validate(
+                {
+                    "permissions": {"filesystem": {"allowlist": ["/tmp"]}},
+                    "publication": {field: value},
+                }
+            )
+        assert f"publication.{field}" in str(refused.value)
+
+    @pytest.mark.parametrize(
+        "value",
+        [None, "", "/etc/forge-publisher/credential", "/srv/factory-live/publisher/credential.deploy-key"],
+    )
+    def test_the_settings_take_a_plain_absolute_path(self, value) -> None:
+        from forge.config.models import ForgeConfig
+
+        config = ForgeConfig.model_validate(
+            {
+                "permissions": {"filesystem": {"allowlist": ["/tmp"]}},
+                "publication": {
+                    "publisher_credential_file": value,
+                    "publisher_route_keys_dir": value,
+                },
+            }
+        )
+        assert config.publication.publisher_credential_file == value
+
+    def test_a_standalone_route_keys_path_with_a_space_is_still_found(self) -> None:
+        """The model refuses it; this is the belt and braces behind that."""
+        config = a_config(publisher_route_keys_dir="/srv/publisher/route keys")
+        config.conductor.launch_settings = ["/srv/publisher/route keys/a"]
+        config.planning.sandboxes = {
+            "the-sandbox": SimpleNamespace(name="the-sandbox", some_folder="//srv/publisher/route keys")
+        }
+        verdict = run_the_activation_check(config, IT_PASSED)
+        assert "conductor.launch_settings" in verdict.sentence
+        assert "planning.sandboxes.the-sandbox.some_folder" in verdict.sentence
+
+    def test_a_standalone_credential_path_with_a_space_is_still_found(self) -> None:
+        config = a_config(publisher_credential_file="/srv/the credential")
+        config.conductor.launch_settings = ["/srv/./the credential"]
+        verdict = run_the_activation_check(config, IT_PASSED)
+        assert [answer.name for answer in verdict.refusals] == [
+            "the-credential-is-named-in-no-other-settings"
+        ]
+        assert "conductor.launch_settings" in verdict.sentence
+
+    @pytest.mark.parametrize(
+        "elsewhere", ["/srv/publisher/route keys2/a", "/srv/the credential.bak"]
+    )
+    def test_siblings_of_a_spaced_path_still_do_not_match(self, elsewhere: str) -> None:
+        config = a_config(
+            publisher_route_keys_dir="/srv/publisher/route keys",
+            publisher_credential_file="/srv/the credential",
+        )
+        config.conductor.launch_settings = [elsewhere]
+        assert run_the_activation_check(config, IT_PASSED).all_hold is True

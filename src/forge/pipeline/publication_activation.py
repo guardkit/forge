@@ -324,12 +324,21 @@ def _a_linux_path(text: str) -> str:
 
 
 def _the_paths_in(value: str) -> list[str]:
-    """Every absolute path written anywhere in a setting's text, normalised."""
-    return [
+    """Every absolute path written anywhere in a setting's text, normalised.
+
+    THE WHOLE VALUE FIRST, as one path, and then each path between
+    separators. The settings model refuses a protected path containing a
+    separator; the whole-value candidate means an identical standalone path
+    is still found even if that refusal were ever bypassed.
+    """
+    whole = value.strip()
+    found = [_a_linux_path(whole)] if whole.startswith("/") else []
+    found += [
         _a_linux_path(token)
         for token in _BETWEEN_PATHS.split(value)
         if token.startswith("/")
     ]
+    return found
 
 
 def _inside(folder: str) -> Any:
