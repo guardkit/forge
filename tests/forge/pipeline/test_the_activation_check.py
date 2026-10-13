@@ -298,6 +298,10 @@ class TestTheRouteKeysFolderIsNamedNowhereElse:
         config.planning.sandboxes = {
             "the-sandbox": SimpleNamespace(name="the-sandbox", some_folder=elsewhere)
         }
+        # The folder WAS searched for, and found nowhere.
+        true = what_is_true_here(config, IT_PASSED)
+        assert true.the_route_keys_dir == ROUTE_KEYS
+        assert true.where_the_route_keys_dir_is_named == ()
         assert run_the_activation_check(config, IT_PASSED).all_hold is True
 
     def test_every_path_isolated_activates(self) -> None:
@@ -307,6 +311,9 @@ class TestTheRouteKeysFolderIsNamedNowhereElse:
         config.planning.sandboxes = {
             "the-sandbox": SimpleNamespace(name="the-sandbox", mounts=["/srv/projects"])
         }
+        true = what_is_true_here(config, IT_PASSED)
+        assert true.the_route_keys_dir == ROUTE_KEYS
+        assert true.where_the_route_keys_dir_is_named == ()
         verdict = run_the_activation_check(config, IT_PASSED)
         assert verdict.all_hold is True, verdict.sentence
         assert publication_is_switched_on(config, IT_PASSED) is True
@@ -314,6 +321,7 @@ class TestTheRouteKeysFolderIsNamedNowhereElse:
     def test_without_the_setting_nothing_changes(self) -> None:
         config = a_config()
         config.conductor.launch_settings = [f"{ROUTE_KEYS}/a"]
+        assert what_is_true_here(config, IT_PASSED).the_route_keys_dir is None
         assert run_the_activation_check(config, IT_PASSED).all_hold is True
 
     def test_the_real_settings_model_takes_the_field(self) -> None:
