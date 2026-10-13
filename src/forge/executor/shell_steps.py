@@ -18,7 +18,7 @@ from typing import Any, Callable, Sequence
 from forge.executor.registry import StepOutcome, StepTypeRegistry
 from forge.launch_environment import (
     build_project_command_env,
-    minimal_environment_note,
+    project_program_note,
 )
 from forge.memory.redaction import scrub_process_output
 from forge.persistence.repositories.runbook_models import Step, StepStatus
@@ -240,7 +240,12 @@ def _run_script_step(
     # names of the settings the factory holds and did not pass, and of any it
     # declared that are not set here. Names only, never a value.
     if exit_code != 0:
-        note = minimal_environment_note(env, declared=launch_settings or ())
+        note = project_program_note(
+            declared=launch_settings or (),
+            additions={"ENV_FILE": env_file} if env_file is not None else None,
+            issued=issued_env or None,
+            overlay=extra_env,
+        )
         output = f"{output}\n{note}" if output else note
 
     return (exit_code, output)

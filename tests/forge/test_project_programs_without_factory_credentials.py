@@ -1575,12 +1575,6 @@ _ANY_RECEIVER_LAUNCHES = {
     "create_subprocess_exec", "create_subprocess_shell", "subprocess_exec",
     "subprocess_shell",
 }
-#: Methods that change a dictionary in place.
-_MUTATORS = {"update", "setdefault", "__setitem__", "__ior__", "pop", "popitem", "clear"}
-#: Functions an environment may be handed to before the launch: they only
-#: read it.
-_READS_ONLY = {"dict", "len", "sorted", "list", "minimal_environment_note", "withheld_settings"}
-
 #: Launches allowed by name, each with its one-line reason, keyed by the file
 #: (under ``src/forge``) and the function the launch is written in.
 ALLOWED: dict[tuple[str, str], str] = {
@@ -1609,6 +1603,11 @@ ALLOWED: dict[tuple[str, str], str] = {
     ("planning/target_terminal_tools.py", "_default_normalizer_subprocess"): "the planner's normalizer, a factory program",
     ("review_gate/record.py", "validate_review_findings"): "guardkit qa validate, a factory program",
     ("subagents/autobuild_runner.py", "_guardkit_feature_validate"): "guardkit feature validate, a factory program",
+    ("subagents/autobuild_runner.py", "_run_git"): (
+        "git with the local verbs its callers pass (rev-parse, worktree); the "
+        "program is the literal git, and its arguments are unpacked, so the "
+        "inline-literal rule cannot see it"
+    ),
     ("subagents/autobuild_runner.py", "_run_one_build"): "starts GuardKit's build with the factory's launch list",
 }
 
@@ -1766,19 +1765,6 @@ def _resolve(mod: _Module, func_node: ast.AST, at: ast.AST) -> str | None:
     return None
 
 
-def _module_constants(modules: list[_Module]) -> dict[str, ast.AST]:
-    out: dict[str, ast.AST] = {}
-    for mod in modules:
-        for node in mod.tree.body:
-            if isinstance(node, ast.Assign):
-                for target in node.targets:
-                    if isinstance(target, ast.Name):
-                        out[target.id] = node.value
-            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.value:
-                out[node.target.id] = node.value
-    return out
-
-
 def _assignments(func: ast.AST, name: str) -> list[ast.AST]:
     values: list[ast.AST] = []
     for node in ast.walk(func):
@@ -1811,67 +1797,6 @@ def _is_parameter(func: Any, name: str) -> bool:
     every = [*args.posonlyargs, *args.args, *args.kwonlyargs]
     every += [a for a in (args.vararg, args.kwarg) if a is not None]
     return any(a.arg == name for a in every)
-
-
-def _mutated(func: ast.AST, name: str) -> bool:
-    """True when the dictionary ``name`` is changed in place in ``func``."""
-    for node in ast.walk(func):
-        targets: list[ast.AST] = []
-        if isinstance(node, ast.Assign):
-            targets = list(node.targets)
-        elif isinstance(node, (ast.AugAssign, ast.AnnAssign)):
-            targets = [node.target]
-            if isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name) and node.target.id == name:
-                return True
-        elif isinstance(node, ast.Delete):
-            targets = list(node.targets)
-        for target in targets:
-            for sub in ast.walk(target):
-                if isinstance(sub, ast.Subscript) and isinstance(sub.value, ast.Name) and sub.value.id == name:
-                    return True
-        if (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr in _MUTATORS
-            and isinstance(node.func.value, ast.Name)
-            and node.func.value.id == name
-        ):
-            return True
-    return False
-
-
-def _in_return(func: ast.AST, target: ast.AST) -> bool:
-    for node in ast.walk(func):
-        if isinstance(node, ast.Return) and node.value is not None:
-            if any(sub is target for sub in ast.walk(node.value)):
-                return True
-    return False
-
-
-#: Callees an environment may be handed to: launches and generic runners are
-#: judged on their own ``env=``; filled in by :func:`unaccounted_launches`.
-_TRUSTED_CALLEES: set[str] = set()
-
-
-def _escapes(func: ast.AST, name: str, before_line: int | None) -> bool:
-    """True when the dictionary ``name`` could be widened through another
-    name: bound to a second name, or handed to a function not known to only
-    read it, before the launch at ``before_line``."""
-    for node in ast.walk(func):
-        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr)):
-            value = node.value
-            if isinstance(value, ast.Name) and value.id == name:
-                return True
-        if isinstance(node, ast.Call) and (before_line is None or node.lineno < before_line):
-            callee = _last_name(node.func)
-            if callee in _READS_ONLY or callee in _TRUSTED_CALLEES or _in_return(func, node):
-                continue
-            handed = list(node.args) + [kw.value for kw in node.keywords]
-            for arg in handed:
-                for sub in [arg, *([arg.body, arg.orelse] if isinstance(arg, ast.IfExp) else [])]:
-                    if isinstance(sub, ast.Name) and sub.id == name:
-                        return True
-    return False
 
 
 def _reads_this_process_environment(
@@ -1918,37 +1843,101 @@ def _feeds_values_from_parameters(call: ast.Call, func: Any) -> bool:
     return False
 
 
-def _helper_shaped(
-    node: ast.AST | None, mod: _Module, func: Any, wrappers: set[str],
-    before_line: int | None = None,
-) -> bool:
-    """True when ``node`` (an ``env=`` value) can only be the helper's result."""
+def _inline_helper(node: ast.AST | None, mod: _Module, func: Any, wrappers: set[str]) -> bool:
+    """``node`` is a call to the helper — or to a function that only ever
+    returns one inline — written right there, with no argument fed from this
+    process's own environment."""
+    if not isinstance(node, ast.Call):
+        return False
+    target = _resolve(mod, node.func, node)
+    if target in HELPERS:
+        arguments = [*node.args, *(kw.value for kw in node.keywords)]
+        return not any(_reads_this_process_environment(mod, a, func) for a in arguments)
+    return target in wrappers
+
+
+def _is_launch_or_runner(mod: _Module, call: ast.Call) -> bool:
+    return bool(_launch_kind(mod, call.func) or _runner_named(mod, call.func))
+
+
+def _single_use_helper_name(name: str, mod: _Module, func: Any, wrappers: set[str]) -> bool:
+    """``name`` is assigned exactly once in ``func``, by a single-target
+    assignment of an inline helper call, and every other use of it is as the
+    ``env=`` keyword of a launch or generic-runner call in ``func`` itself:
+    never an attribute, a subscript, an argument to another call, a return
+    value, an alias or a closure capture."""
+    if _is_parameter(func, name):
+        return False
+    values: list[ast.AST] = []
+    for node in ast.walk(func):
+        if isinstance(node, (ast.Global, ast.Nonlocal)) and name in node.names:
+            return False
+        if isinstance(node, ast.Assign):
+            bound = [
+                n for t in node.targets for n in ast.walk(t)
+                if isinstance(n, ast.Name) and n.id == name
+            ]
+            if bound:
+                if len(node.targets) != 1 or not isinstance(node.targets[0], ast.Name):
+                    return False  # a chained or unpacking assignment
+                values.append(node.value)
+        elif isinstance(node, ast.AnnAssign):
+            if isinstance(node.target, ast.Name) and node.target.id == name:
+                if node.value is None:
+                    return False
+                values.append(node.value)
+        elif isinstance(node, ast.ExceptHandler):
+            if node.name == name:
+                return False
+        elif isinstance(
+            node,
+            (ast.AugAssign, ast.NamedExpr, ast.Delete, ast.For, ast.AsyncFor,
+             ast.With, ast.AsyncWith, ast.comprehension),
+        ):
+            if isinstance(node, ast.Delete):
+                targets = list(node.targets)
+            elif isinstance(node, (ast.With, ast.AsyncWith)):
+                targets = [i.optional_vars for i in node.items if i.optional_vars is not None]
+            else:
+                targets = [node.target]
+            if any(isinstance(n, ast.Name) and n.id == name for t in targets for n in ast.walk(t)):
+                return False
+    if len(values) != 1 or not _inline_helper(values[0], mod, func, wrappers):
+        return False
+    for node in ast.walk(func):
+        if not (isinstance(node, ast.Name) and node.id == name and isinstance(node.ctx, ast.Load)):
+            continue
+        parent = mod.parents.get(id(node))
+        if not (isinstance(parent, ast.keyword) and parent.arg == "env"):
+            return False  # an attribute, subscript, argument, return, alias ...
+        call = mod.parents.get(id(parent))
+        if not isinstance(call, ast.Call) or not _is_launch_or_runner(mod, call):
+            return False
+        scope = mod.parents.get(id(call))
+        while scope is not None and scope is not func:
+            if isinstance(scope, (ast.Lambda, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                return False  # captured by a closure
+            scope = mod.parents.get(id(scope))
+    return True
+
+
+def _helper_shaped(node: ast.AST | None, mod: _Module, func: Any, wrappers: set[str]) -> bool:
+    """True when ``node`` (an ``env=`` value) is, provably, the helper's
+    result: the helper called inline, or a name that holds nothing else and
+    is used for nothing else (:func:`_single_use_helper_name`)."""
     if node is None:
         return False
-    if isinstance(node, ast.Call):
-        target = _resolve(mod, node.func, node)
-        if target in HELPERS:
-            arguments = [*node.args, *(kw.value for kw in node.keywords)]
-            return not any(
-                _reads_this_process_environment(mod, a, func) for a in arguments
-            )
-        return target in wrappers
-    if isinstance(node, ast.IfExp):
-        return _helper_shaped(node.body, mod, func, wrappers, before_line) and _helper_shaped(
-            node.orelse, mod, func, wrappers, before_line
-        )
+    if _inline_helper(node, mod, func, wrappers):
+        return True
     if isinstance(node, ast.Name) and func is not None:
-        if _is_parameter(func, node.id) or _mutated(func, node.id):
-            return False
-        if _escapes(func, node.id, before_line):
-            return False
-        values = _assignments(func, node.id)
-        return bool(values) and all(_helper_shaped(v, mod, func, wrappers) for v in values)
+        return _single_use_helper_name(node.id, mod, func, wrappers)
     return False
 
 
 def _wrappers(modules: list[_Module]) -> set[str]:
-    """Functions whose every return is the helper's result, by dotted name."""
+    """Functions whose every return is an inline helper call (or a call to
+    another such function), by dotted name, and none of whose parameters
+    flows into the helper's ``additions`` or ``parent``."""
     found: set[str] = set()
     changed = True
     while changed:
@@ -1970,7 +1959,7 @@ def _wrappers(modules: list[_Module]) -> set[str]:
                 ]
                 if any(_feeds_values_from_parameters(c, node) for c in helper_calls):
                     continue
-                if returns and all(_helper_shaped(r.value, mod, node, found) for r in returns):
+                if returns and all(_inline_helper(r.value, mod, node, found) for r in returns):
                     found.add(full)
                     changed = True
     return found
@@ -1993,31 +1982,51 @@ def _launch_kind(mod: _Module, node: ast.AST) -> str | None:
     return None
 
 
-def _factory_literal(
-    node: ast.AST | None, constants: dict[str, ast.AST], func: Any = None
-) -> bool:
-    """A list whose first item is the literal git/docker/pgrep/ps."""
-    if node is None:
+def _factory_program(call: ast.Call) -> bool:
+    """True only for a factory program launched by an inline literal.
+
+    The simplified rule (14 October 2026, after a review found a named
+    command could be aliased and changed, and ``executable=`` could replace
+    the program): a launch skips the environment check as one of the
+    factory's own programs ONLY when
+
+    * its command is a list or tuple literal written inline in the launch
+      call as its only positional argument, whose first element is the
+      literal ``"git"``, ``"docker"``,
+      ``"pgrep"`` or ``"ps"`` — or, for ``create_subprocess_exec``, whose
+      program is that literal written as the first positional argument; and
+    * the call has no ``executable=``, no ``shell=`` other than the literal
+      ``False``, no ``**`` and no ``*`` unpacking.
+
+    A named command and a module-level constant never qualify: such a launch
+    uses the helper's environment or is on the allowed list with a reason.
+    """
+    if any(isinstance(arg, ast.Starred) for arg in call.args):
         return False
-    if isinstance(node, ast.Constant):
-        return node.value in FACTORY_PROGRAMS
-    if isinstance(node, ast.Name) and func is not None and not _is_parameter(func, node.id):
-        values = _assignments(func, node.id)
-        if values and all(_factory_literal(v, constants) for v in values):
-            return True
-    if isinstance(node, (ast.List, ast.Tuple)):
+    for kw in call.keywords:
+        if kw.arg is None or kw.arg == "executable":
+            return False
+        if kw.arg == "shell" and not (
+            isinstance(kw.value, ast.Constant) and kw.value.value is False
+        ):
+            return False
+    if not call.args:
+        return False
+    first = call.args[0]
+    if isinstance(first, (ast.List, ast.Tuple)):
+        # The ONLY positional argument: a second one can be the executable
+        # (Popen's third) or the shell switch.
         return (
-            bool(node.elts)
-            and isinstance(node.elts[0], ast.Constant)
-            and node.elts[0].value in FACTORY_PROGRAMS
+            len(call.args) == 1
+            and bool(first.elts)
+            and isinstance(first.elts[0], ast.Constant)
+            and first.elts[0].value in FACTORY_PROGRAMS
         )
-    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
-        return _factory_literal(node.left, constants)
-    if isinstance(node, ast.Call) and _dotted(node.func) in ("list", "tuple") and node.args:
-        return _factory_literal(node.args[0], constants)
-    if isinstance(node, ast.Name) and node.id in constants:
-        return _factory_literal(constants[node.id], constants)
-    return False
+    return (
+        _last_name(call.func) == "create_subprocess_exec"
+        and isinstance(first, ast.Constant)
+        and first.value in FACTORY_PROGRAMS
+    )
 
 
 def _env_keyword(call: ast.Call) -> ast.AST | None:
@@ -2043,16 +2052,6 @@ def _annotation_nodes(tree: ast.AST) -> set[int]:
     return found
 
 
-def _first_argument(call: ast.Call) -> ast.AST | None:
-    if call.args:
-        first = call.args[0]
-        return first.value if isinstance(first, ast.Starred) else first
-    for kw in call.keywords:
-        if kw.arg in ("args", "argv", "command", "cmd"):
-            return kw.value
-    return None
-
-
 def _runner_named(mod: _Module, node: ast.AST) -> tuple[str, str] | None:
     """Which generic runner ``node`` names, if any: by where it is defined
     (an import under any name, a module attribute) or, on an object, by the
@@ -2070,13 +2069,6 @@ def _runner_named(mod: _Module, node: ast.AST) -> tuple[str, str] | None:
 
 def unaccounted_launches(package: Path) -> list[str]:
     modules = _load_modules(package)
-    constants = _module_constants(modules)
-    _TRUSTED_CALLEES.clear()
-    for launches in _LAUNCHES.values():
-        _TRUSTED_CALLEES.update(launches)
-    _TRUSTED_CALLEES.update(_ANY_RECEIVER_LAUNCHES)
-    for spec in GENERIC_RUNNERS.values():
-        _TRUSTED_CALLEES.update(spec.get("names", ()))
     wrappers = _wrappers(modules)
     problems: list[str] = []
 
@@ -2089,10 +2081,10 @@ def unaccounted_launches(package: Path) -> list[str]:
         func, fname = place(mod, call)
         if (mod.rel, fname) in ALLOWED:
             return
-        if _factory_literal(_first_argument(call), constants, func):
+        if _factory_program(call):
             return
         env = _env_keyword(call)
-        if _helper_shaped(env, mod, func, wrappers, call.lineno):
+        if _helper_shaped(env, mod, func, wrappers):
             return
         reason = "no env= (it inherits everything)" if env is None else "env= is not the helper's"
         problems.append(f"{mod.rel}:{call.lineno} in {fname}: {what}: {reason}")
@@ -2484,6 +2476,160 @@ def test_the_guard_catches_the_second_reviews_probes(tmp_path: Path) -> None:
     assert len(expected) == 11
     assert expected - named == set(), f"slipped past the guard: {sorted(expected - named)}"
     assert not {n for n in named if n.startswith("ok_") or n == "_fixed"}, problems
+
+
+#: The factory-program exemption, probed (14 October 2026): a named command
+#: that an alias changes, ``executable=``, ``shell=True``, ``**`` and ``*``
+#: unpacking, a named list and a module-level tuple all lose the exemption;
+#: an inline literal and a helper-built environment keep passing.
+GUARD_PROBES_3 = textwrap.dedent(
+    '''\
+    import subprocess
+
+    GIT_STATUS = ("git", "status")
+
+
+    def q3_chained_alias(cmd):
+        argv = other = ["git", "-c", "x"]
+        other[0] = "sh"
+        subprocess.run(argv)
+
+
+    def q3_executable_override(cmd):
+        subprocess.run(["git", "status"], executable="/bin/sh")
+
+
+    def q3_shell_true(cmd):
+        subprocess.run(["git", "status"], shell=True)
+
+
+    def q3_double_star(cmd, kw):
+        subprocess.run(["git", "status"], **kw)
+
+
+    def q3_star_args(cmd):
+        parts = ["git", "status"]
+        subprocess.run(*[parts])
+
+
+    def q3_named_list(cmd):
+        command = ["git", "status"]
+        subprocess.run(command)
+
+
+    def q3_module_tuple(cmd):
+        subprocess.run(GIT_STATUS)
+
+
+    def ok_inline_literal(cmd):
+        subprocess.run(["git", "status"], capture_output=True, shell=False)
+
+
+    def ok_helper_env(cmd, folder):
+        from forge.launch_environment import build_project_command_env
+
+        env = build_project_command_env(folder)
+        subprocess.run(cmd, env=env)
+    '''
+)
+
+
+def test_only_an_inline_literal_factory_program_skips_the_check(tmp_path: Path) -> None:
+    pkg = tmp_path / "forge"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "zz_probe3.py").write_text(GUARD_PROBES_3, encoding="utf-8")
+    problems = unaccounted_launches(pkg)
+    named = {p.split(" in ", 1)[1].split(":", 1)[0] for p in problems}
+    expected = {
+        n.name
+        for n in ast.parse(GUARD_PROBES_3).body
+        if isinstance(n, ast.FunctionDef) and n.name.startswith("q3_")
+    }
+    assert len(expected) == 7
+    assert expected - named == set(), f"slipped past the guard: {sorted(expected - named)}"
+    assert not {n for n in named if n.startswith("ok_")}, problems
+
+
+#: The strict rules, probed (14 October 2026): a second positional argument
+#: (the executable or the shell switch) loses the factory-program exemption,
+#: and an environment counts as the helper's only when it is the helper call
+#: written inline or a name assigned once and used only as ``env=`` — so a
+#: chained alias, a tuple unpacking, a name handed to another call and a
+#: returned name are all flagged.
+GUARD_PROBES_4 = textwrap.dedent(
+    '''\
+    import os
+    import subprocess
+
+    from forge.launch_environment import build_project_command_env
+
+
+    def q4_positional_executable(cmd):
+        subprocess.Popen(["git", "-c", "env"], -1, "/bin/sh")
+
+
+    def q4_positional_shell(cmd):
+        subprocess.Popen(["git", "status"], -1, None, None, None, None, None, True, True)
+
+
+    def q4_chained_env_alias(cmd, folder):
+        env = other = build_project_command_env(folder)
+        other.update(os.environ)
+        subprocess.run(cmd, env=env)
+
+
+    def q4_tuple_unpack_env(cmd, folder):
+        env, extra = build_project_command_env(folder), dict(os.environ)
+        subprocess.run(cmd, env=env)
+
+
+    def _log(value):
+        return value
+
+
+    def q4_env_passed_to_another_call(cmd, folder):
+        env = build_project_command_env(folder)
+        _log(env)
+        subprocess.run(cmd, env=env)
+
+
+    def q4_env_returned(cmd, folder):
+        env = build_project_command_env(folder)
+        subprocess.run(cmd, env=env)
+        return env
+
+
+    def ok_inline_helper_env(cmd, folder):
+        subprocess.run(cmd, env=build_project_command_env(folder))
+
+
+    def ok_single_use_named_env(cmd, folder):
+        env = build_project_command_env(folder)
+        subprocess.run(cmd, env=env)
+
+
+    def ok_inline_git_literal(cmd):
+        subprocess.run(["git", "status"], capture_output=True)
+    '''
+)
+
+
+def test_the_strict_rules_catch_every_probe(tmp_path: Path) -> None:
+    pkg = tmp_path / "forge"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "zz_probe4.py").write_text(GUARD_PROBES_4, encoding="utf-8")
+    problems = unaccounted_launches(pkg)
+    named = {p.split(" in ", 1)[1].split(":", 1)[0] for p in problems}
+    expected = {
+        n.name
+        for n in ast.parse(GUARD_PROBES_4).body
+        if isinstance(n, ast.FunctionDef) and n.name.startswith("q4_")
+    }
+    assert len(expected) == 6
+    assert expected - named == set(), f"slipped past the guard: {sorted(expected - named)}"
+    assert not {n for n in named if n.startswith("ok_")}, problems
 
 
 def test_every_process_launch_is_accounted_for() -> None:

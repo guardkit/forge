@@ -665,7 +665,7 @@ class RepoDriverLiveGateInvoker:
 
         from forge.launch_environment import (
             build_project_command_env,
-            minimal_environment_note,
+            project_program_note,
         )
 
         argv = [*self._driver_argv, "--feature", feature, "--target", target]
@@ -729,8 +729,8 @@ class RepoDriverLiveGateInvoker:
                     "stderr_tail": _bounded_tail(
                         exc.stderr if isinstance(exc.stderr, str) else None
                     ),
-                    "environment_note": minimal_environment_note(
-                        env, declared=self._launch_settings
+                    "environment_note": project_program_note(
+                        declared=self._launch_settings, overlay=self._extra_env
                     ),
                 },
             )
@@ -782,8 +782,8 @@ class RepoDriverLiveGateInvoker:
                 answer,
                 detail={
                     **dict(answer.detail or {}),
-                    "environment_note": minimal_environment_note(
-                        env, declared=self._launch_settings
+                    "environment_note": project_program_note(
+                        declared=self._launch_settings, overlay=self._extra_env
                     ),
                 },
             )

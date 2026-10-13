@@ -233,7 +233,7 @@ from forge.launch_environment import (
     build_launch_env,
     build_project_command_env,
     declared_setting_refusal,
-    minimal_environment_note,
+    project_program_note,
 )
 from forge.memory.redaction import scrub_process_output
 from forge.pipeline.deployment_identity import declared_identity
@@ -2774,7 +2774,12 @@ def run_project_program(
         argv=argv, cwd=cwd, env=env, timeout=timeout, what=what
     )
     if exit_code != 0:
-        note = minimal_environment_note(env, declared=launch_settings or ())
+        note = project_program_note(
+            declared=launch_settings or (),
+            issued=issued,
+            overlay=extra_env,
+            run_owner=run_owner,
+        )
         stderr = f"{stderr}\n{note}" if stderr else note
     return exit_code, stdout, stderr
 

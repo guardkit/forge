@@ -873,7 +873,7 @@ def _run_declared_command(
     """
     from forge.launch_environment import (
         build_project_command_env,
-        minimal_environment_note,
+        project_program_note,
     )
 
     try:
@@ -905,7 +905,7 @@ def _run_declared_command(
     # A FAILED COMMAND IS TOLD WHAT IT WAS NOT GIVEN (design section 4):
     # names only, never a value.
     note = (
-        " " + minimal_environment_note(env, declared=launch_settings or ())
+        " " + project_program_note(declared=launch_settings or ())
         if completed.returncode != 0
         else ""
     )

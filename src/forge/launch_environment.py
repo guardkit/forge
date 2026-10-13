@@ -124,6 +124,7 @@ __all__ = [
     "build_project_command_env",
     "declared_settings_not_set",
     "minimal_environment_note",
+    "project_program_note",
     "withheld_settings",
     "declared_setting_refusal",
     "launch_setting_names",
@@ -1159,3 +1160,42 @@ def minimal_environment_note(
         + " If the command needs one, add its name to `launch.settings` in "
         "`.guardkit/config.yaml`."
     )
+
+
+def project_program_note(
+    *,
+    declared: Sequence[str] | Iterable[str] | None = (),
+    additions: Mapping[str, str] | None = None,
+    overlay: Mapping[str, str] | None = None,
+    issued: "IssuedPreviewValues | None" = None,
+    run_owner: str | None = None,
+    parent: Mapping[str, str] | None = None,
+) -> str:
+    """:func:`minimal_environment_note` worked out from the same inputs
+    :func:`build_project_command_env` was given, without the environment.
+
+    A launch hands the environment it built to the program and to nothing
+    else (the launch guard holds it to that), so the plain words for a failed
+    program are worked out here from what went in: the names it was given are
+    the shell's own three, the locale and proxy settings this process holds,
+    the declared names this process holds, the additions, the overlay, the
+    issued values and the run-owner marker. Names only, never a value.
+    """
+    source: Mapping[str, str] = os.environ if parent is None else parent
+    declared_names = [str(name).strip() for name in (declared or ())]
+    given: dict[str, str] = {name: "" for name in ("PATH", "HOME", "TMPDIR")}
+    for name in source:
+        if (
+            name in ("LANG", "LC_ALL")
+            or name.startswith("LC_")
+            or name in PROJECT_PROXY_NAMES
+            or (name in declared_names and declared_setting_refusal(name) is None)
+        ):
+            given[name] = ""
+    given.update({name: "" for name in (additions or {})})
+    given.update({name: "" for name in (overlay or {})})
+    if issued is not None:
+        given.update({name: "" for name in issued.names()})
+    if run_owner and str(run_owner).strip():
+        given[GUARDKIT_RUN_OWNER_ENV] = ""
+    return minimal_environment_note(given, declared=declared_names, parent=source)
