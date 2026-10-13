@@ -194,6 +194,10 @@ EVIDENCE_MEMBER_CAP: int = 2000
 #: Said after a reason whose teardown has not been confirmed yet.
 _NOT_CONFIRMED: str = " (teardown not confirmed yet)"
 
+#: On top of the slot wait and the live-gate timeout, how long a preparation
+#: may take (the start-up and the evidence copy) before the sweep ends it.
+_PREPARATION_MARGIN: timedelta = timedelta(minutes=60)
+
 #: How long to wait before reading an unreadable profile a second time.
 _PROFILE_RETRY_SECONDS: float = 3.0
 
@@ -1528,43 +1532,53 @@ class ReviewPreviewService:
             evidence_expires_at=evidence_expires.isoformat(),
         )
 
-        # (1) Join, and lay the joined tree out.
-        laid: PreviewTree = await venue.lay_out(
-            lease_id, onto=str(req.preview_base_sha), candidate=req.candidate_sha
-        )
-        if laid.refusal or not laid.tree or not laid.path:
-            reason = (
-                f"the candidate could not be joined onto {req.target_branch}: "
-                f"{laid.refusal or 'no tree came back'}"
+        # A preparation cancelled before it holds a slot (a restart, an offer
+        # that was itself cancelled) still removes its joined tree and writes
+        # its lease down as failed — shielded, so the cleanup is not cancelled
+        # with it — and then lets the cancellation go on.
+        try:
+            # (1) Join, and lay the joined tree out.
+            laid: PreviewTree = await venue.lay_out(
+                lease_id, onto=str(req.preview_base_sha), candidate=req.candidate_sha
             )
-            self._store.insert(
-                replace(base, reason=reason, ended_at=now.isoformat()),
-                now=now,
-            )
-            await venue.remove_tree(lease_id)
-            return early(reason)
-        base = replace(base, preview_tree=laid.tree)
+            if laid.refusal or not laid.tree or not laid.path:
+                reason = (
+                    f"the candidate could not be joined onto {req.target_branch}: "
+                    f"{laid.refusal or 'no tree came back'}"
+                )
+                self._store.insert(
+                    replace(base, reason=reason, ended_at=now.isoformat()),
+                    now=now,
+                )
+                await venue.remove_tree(lease_id)
+                return early(reason)
+            base = replace(base, preview_tree=laid.tree)
 
-        # (2) A slot.
-        taken = await self._take_slot(base, preview)
-        if taken is None:
-            reason = (
-                f"no preview slot came free within {preview.slot_wait_minutes} minutes"
+            # (2) A slot.
+            taken = await self._take_slot(base, preview)
+            if taken is None:
+                reason = (
+                    f"no preview slot came free within {preview.slot_wait_minutes} minutes"
+                )
+                self._store.insert(
+                    replace(base, reason=reason, ended_at=self._clock().isoformat()),
+                    now=self._clock(),
+                )
+                await venue.remove_tree(lease_id)
+                return self._record(
+                    req,
+                    state="failed",
+                    run_id=run_id,
+                    now=now,
+                    preview=preview,
+                    preview_tree=laid.tree,
+                    failure_reason=reason,
+                )
+        except asyncio.CancelledError:
+            await asyncio.shield(
+                self._cancelled_before_the_slot(venue, base, lease_id)
             )
-            self._store.insert(
-                replace(base, reason=reason, ended_at=self._clock().isoformat()),
-                now=self._clock(),
-            )
-            await venue.remove_tree(lease_id)
-            return self._record(
-                req,
-                state="failed",
-                run_id=run_id,
-                now=now,
-                preview=preview,
-                preview_tree=laid.tree,
-                failure_reason=reason,
-            )
+            raise
         slot_index, _port = taken
         slot = preview.slots[slot_index]
         compose_project = f"{profile.env_id}-pv{slot_index}"
@@ -1603,11 +1617,53 @@ class ReviewPreviewService:
                 evidence_dir=str(dest),
             )
             return await self._stand_up(context, overlay)
+        except asyncio.CancelledError:
+            # Cancelled while the slot is held (during the start-up, the checks
+            # or the journey): torn down and failed, shielded, then re-raised.
+            await asyncio.shield(self._cancelled(context))
+            raise
         except Exception as exc:  # noqa: BLE001 — never leave the slot behind
             logger.exception("review preview: preparing %s raised", lease_id)
             return await self._fail(
                 context,
                 f"the preview could not be prepared ({type(exc).__name__}: {exc})",
+            )
+
+    async def _cancelled_before_the_slot(
+        self, venue: Any, base: PreviewLease, lease_id: str
+    ) -> None:
+        """Clean up a preparation cancelled before it held a slot."""
+        now = self._clock()
+        try:
+            if self._store.get(lease_id) is None:
+                self._store.insert(
+                    replace(
+                        base,
+                        reason="the preparation was cancelled",
+                        ended_at=now.isoformat(),
+                    ),
+                    now=now,
+                )
+            await venue.remove_tree(lease_id)
+        except Exception:  # noqa: BLE001 — a cleanup never raises
+            logger.exception("review preview: cleaning up %s raised", lease_id)
+
+    async def _cancelled(self, context: "_Preparation") -> None:
+        """Clean up a preparation cancelled while it held a slot."""
+        try:
+            torn_down = await self._tear_down(context.venue, context.lease_id)
+            now = self._clock()
+            reason = "the preparation was cancelled"
+            self._store.update(
+                context.lease_id,
+                now=now,
+                state="failed" if torn_down else "ending",
+                reason=reason if torn_down else f"{reason}{_NOT_CONFIRMED}",
+                ended_at=now.isoformat() if torn_down else None,
+            )
+        except Exception:  # noqa: BLE001 — a cleanup never raises
+            logger.exception(
+                "review preview: cleaning up %s raised", context.lease_id
             )
 
     async def _stand_up(
@@ -2016,6 +2072,43 @@ class ReviewPreviewService:
                 await self._end(lease, reason="the preview's time was up")
             elif lease.state == "ending":
                 await self._end(lease, reason=lease.reason or "teardown retried")
+            elif lease.state == "preparing" and await self._preparation_overran(
+                lease, now
+            ):
+                # A preparation that should long since have finished — its
+                # process died, or it was cut off without cleaning up.
+                await self._end(
+                    lease,
+                    reason="its preparation never finished",
+                    state="failed",
+                )
+
+    async def _preparation_overran(self, lease: PreviewLease, now: datetime) -> bool:
+        """Is this preparing lease past the longest a preparation can take?
+
+        The bound is the lease's start, plus the profile's slot wait, plus its
+        live-gate timeout, plus :data:`_PREPARATION_MARGIN` for the start-up
+        and the evidence copy. A profile that cannot be read uses the
+        defaults. Nothing younger than the margin is ever looked at.
+        """
+        started = _parse_time(lease.created_at)
+        if started is None:
+            return False
+        if now < started + _PREPARATION_MARGIN:
+            return False
+        slot_wait = timedelta(minutes=30)
+        gate = timedelta(seconds=600)
+        try:
+            profile = await asyncio.to_thread(self._profile_reader, lease.project)
+        except Exception:  # noqa: BLE001 — the defaults stand in
+            profile = None
+        preview = getattr(profile, "preview", None)
+        if preview is not None:
+            slot_wait = timedelta(minutes=preview.slot_wait_minutes)
+        live_gate = getattr(profile, "live_gate", None)
+        if live_gate is not None:
+            gate = timedelta(seconds=live_gate.timeout_seconds)
+        return now >= started + slot_wait + gate + _PREPARATION_MARGIN
 
     async def sweep(self, *, now: datetime) -> None:
         """Tear down previews past their time; delete evidence past its retention."""

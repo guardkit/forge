@@ -1794,6 +1794,109 @@ async def test_the_dispatch_carries_the_two_preview_legs(tmp_path: Path) -> None
     assert runner_calls["journey"]["feature"] == "FEAT-AB12"
 
 
+# ---------------------------------------------------------------------------
+# Cancellation never leaves a preview behind (Codex R8)
+# ---------------------------------------------------------------------------
+
+
+async def _cancel_when(world: World, blocked: "asyncio.Event", task: "asyncio.Task") -> None:
+    await asyncio.wait_for(blocked.wait(), timeout=5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.asyncio
+async def test_cancelled_while_waiting_for_a_slot(world: World) -> None:
+    await world.service.prepare(_request("build-1", "FEAT-AB12"))
+    await world.service.prepare(_request("build-2", "FEAT-CD34"))
+    blocked = asyncio.Event()
+
+    async def hold() -> None:
+        blocked.set()
+        await asyncio.Event().wait()
+
+    world.clock.on_sleep = hold
+    task = asyncio.create_task(world.service.prepare(_request("build-3", "FEAT-EF56")))
+    await _cancel_when(world, blocked, task)
+
+    lease = world.lease("pv000000000003")
+    assert (lease.state, lease.reason) == ("failed", "the preparation was cancelled")
+    assert lease.slot is None
+    assert "pv000000000003" in world.venue.named("remove_tree")
+
+
+@pytest.mark.asyncio
+async def test_cancelled_right_after_the_preview_was_started(world: World) -> None:
+    blocked = asyncio.Event()
+
+    async def containers(compose_project: str) -> Any:
+        blocked.set()
+        await asyncio.Event().wait()
+
+    world.venue.preview_containers = containers
+    task = asyncio.create_task(world.service.prepare(_request()))
+    await _cancel_when(world, blocked, task)
+
+    assert world.dispatch.legs() == ["preview_up"]
+    lease = world.lease("pv000000000001")
+    assert (lease.state, lease.reason) == ("failed", "the preparation was cancelled")
+    assert world.venue.named("remove_project") == ["pv000000000001"]
+    assert world.store.live() == []
+
+
+@pytest.mark.asyncio
+async def test_cancelled_during_the_journey(world: World) -> None:
+    blocked = asyncio.Event()
+    real = world.dispatch.__call__
+
+    async def dispatch(**kwargs: Any) -> Any:
+        if kwargs["leg"] == "preview_journey":
+            blocked.set()
+            await asyncio.Event().wait()
+        return await real(**kwargs)
+
+    world.service._dispatch = dispatch
+    task = asyncio.create_task(world.service.prepare(_request()))
+    await _cancel_when(world, blocked, task)
+
+    lease = world.lease("pv000000000001")
+    assert (lease.state, lease.reason) == ("failed", "the preparation was cancelled")
+    assert world.venue.named("remove_project") == ["pv000000000001"]
+    assert world.store.live() == []
+
+
+@pytest.mark.asyncio
+async def test_the_sweep_reclaims_a_preparation_that_never_finished(world: World) -> None:
+    stale = PreviewLease(
+        lease_id="pv0000000000bb", slot=0, port=8950, token="t", project=PROJECT,
+        feature_id="FEAT-AB12", build_id="b1", candidate_sha=SHA_CAND,
+        candidate_tree=TREE_CAND, preview_tree=None, run_id="r1",
+        compose_project="notes-pv0", evidence_dir=None, state="preparing", reason=None,
+        created_at=(START - timedelta(days=30)).isoformat(),
+        app_expires_at=START.isoformat(), evidence_expires_at=START.isoformat(),
+    )
+    world.store.insert(stale, now=START)
+    young = PreviewLease(
+        **{
+            **stale.__dict__,
+            "lease_id": "pv0000000000cc",
+            "slot": 1,
+            "port": 8951,
+            "created_at": (START - timedelta(minutes=50)).isoformat(),
+        }
+    )
+    world.store.insert(young, now=START)
+
+    await world.service.sweep(now=START)
+
+    ended = world.lease("pv0000000000bb")
+    assert (ended.state, ended.reason) == ("failed", "its preparation never finished")
+    assert world.venue.named("remove_project") == ["pv0000000000bb"]
+    # One that could still be running is left alone.
+    assert world.lease("pv0000000000cc").state == "preparing"
+
+
 def test_the_ledger_allows_one_live_lease_per_port(connection: sqlite3.Connection) -> None:
     store = PreviewLeaseStore(connection)
     lease = PreviewLease(
