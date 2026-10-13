@@ -72,7 +72,7 @@ class _FakePersistence:
 
     def get_build_row(self, build_id: str) -> None:
         # These scenarios model a PAUSED build with no persisted pending
-        # approval request id, so ``try_inject_paused_cancel`` returns False
+        # approval request id, so ``pending_gate_request`` returns None
         # and the wrapper falls back to ``handle_cancel`` (the path the
         # Gherkin then-steps assert). Returning ``None`` is the falsy row.
         return None

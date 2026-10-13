@@ -118,18 +118,13 @@ def resolve_gate_responder(
     return _first_nonempty(explicit, os.environ.get(RESPONDER_ENV_VAR), approver)
 
 
-def config_expected_approver(ctx: Any) -> str | None:
-    """Best-effort read of ``forge.yaml`` ``approval.expected_approver``.
+def config_expected_approver(config: Any) -> str | None:
+    """Best-effort read of ``approval.expected_approver`` from a loaded config.
 
-    The top-level ``forge`` group loads ``forge.yaml`` into ``ctx.obj`` when one
-    is present (see :func:`forge.cli.main._resolve_context_object`). When it is a
-    :class:`~forge.config.models.ForgeConfig` this returns its pinned approver so
-    the paused-cancel path defaults the responder to the gate's expected
-    identity. Returns ``None`` when no config is loaded (e.g. ``forge cancel``
-    run from a directory without ``forge.yaml``, or invoked directly in tests) —
-    the resolver then falls through to the env / OS-user chain, so cancel keeps
-    working config-free.
+    ``config`` is the :class:`~forge.config.models.ForgeConfig` a command was
+    given (``--config`` / ./forge.yaml, else ``$FORGE_CONFIG_PATH`` — see
+    :func:`forge.cli._cancel_run._selected_config`), or ``None``. Returns
+    ``None`` when there is no configuration or it pins no approver.
     """
-    obj = getattr(ctx, "obj", None)
-    approval = getattr(obj, "approval", None)
+    approval = getattr(config, "approval", None)
     return getattr(approval, "expected_approver", None)

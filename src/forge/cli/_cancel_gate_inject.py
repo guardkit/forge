@@ -26,7 +26,6 @@ __all__ = [
     "PendingGateRequest",
     "pending_gate_request",
     "send_paused_cancel",
-    "try_inject_paused_cancel",
 ]
 
 
@@ -63,6 +62,8 @@ def pending_gate_request(runtime: Any, *, build_id: str) -> PendingGateRequest |
             f"the build is no longer waiting at its card (it is now "
             f"{row.status.value})."
         )
+    # No pending id: mark_paused refuses an empty one and recovery treats such
+    # a row as corrupt, so no live card can be waiting on it; cancel directly.
     if not row.pending_approval_request_id:
         return None
     try:
@@ -103,62 +104,6 @@ def send_paused_cancel(
         reason,
         responder,
     )
-
-
-def try_inject_paused_cancel(
-    runtime: Any, *, build_id: str, reason: str, responder: str | None = None
-) -> bool:
-    """Inject a synthetic reject for a gate-paused build; return True on success.
-
-    Reads the persisted ``pending_approval_request_id`` (the durable home of the
-    paused ``(stage_label, attempt_count)`` pair), parses it, and publishes a
-    synthetic reject onto the response mirror subject via the one-shot NATS
-    connect pattern (mirrors ``forge.cli.queue.publish``). Returns ``False``
-    (caller falls back to ``handle_cancel``) when the row carries no pending
-    request id or the id is a legacy / unparseable value — there is nothing for
-    the daemon's live frame to correlate a synthetic reject against.
-
-    ``responder`` (O-02 / TASK-FWD-005 break #3) is the identity stamped onto the
-    synthetic reject's ``decided_by``. It MUST match the gate's
-    ``expected_approver`` or the daemon's identity-pinned approval subscriber
-    refuses the reject as an anomaly and the build stays PAUSED. ``None`` falls
-    back to the injector's legacy default for callers that do not resolve one.
-    """
-    from forge.gating.identity import parse_request_id
-
-    row = runtime.persistence.get_build_row(build_id)
-    if row is None or not row.pending_approval_request_id:
-        return False
-    try:
-        _bid, stage_label, attempt_count = parse_request_id(
-            row.pending_approval_request_id
-        )
-    except ValueError:
-        logger.warning(
-            "forge cancel: build %s is PAUSED but its "
-            "pending_approval_request_id is unparseable; falling back to a "
-            "direct cancel",
-            build_id,
-        )
-        return False
-
-    _inject_synthetic_reject(
-        build_id=build_id,
-        stage_label=stage_label,
-        attempt_count=attempt_count,
-        correlation_id=row.correlation_id,
-        responder=responder,
-    )
-    logger.info(
-        "forge cancel: build %s paused at the approval gate; injected a "
-        "synthetic reject (%r, responder=%r) onto its approval response "
-        "subject — the daemon's live frame owns the CANCELLED transition + "
-        "build-cancelled",
-        build_id,
-        reason,
-        responder,
-    )
-    return True
 
 
 def _inject_synthetic_reject(

@@ -352,6 +352,75 @@ def test_forge_cancel_without_config_uses_forge_config_path(
     assert runners["global"].cancelled == []
 
 
+def test_forge_cancel_inside_the_coordinator_interrupts_where_serve_launched(
+    runners, tmp_path, monkeypatch, quiet_bus
+) -> None:
+    """The coordinator's own set-up (13 October 2026): no --config, no
+    ./forge.yaml, ``FORGE_CONFIG_PATH`` naming the settings file serve runs
+    with. Each RUNNING build's run is interrupted on the runner serve's
+    launch rule picks for its repository, and the build is cancelled."""
+    from forge.cli._recorded_run import runner_url_for_repo
+    from forge.config.loader import load_config
+    from forge.lifecycle.state_machine import BuildState
+
+    db_path = tmp_path / "forge.db"
+    pool = _ledger(db_path)
+    sandboxed_build, sandboxed_thread = _running(pool, "FEAT-CRD1", REPO)
+    plain_build, plain_thread = _running(pool, "FEAT-CRD2", OTHER)
+    pool.connection.close()
+    settings = _config_file(tmp_path, runners["project_url"])
+    monkeypatch.setenv("FORGE_AUTOBUILD_RUNNER_URL", runners["global_url"])
+    monkeypatch.setenv("FORGE_CONFIG_PATH", str(settings))
+    work = tmp_path / "coordinator"
+    work.mkdir()
+    monkeypatch.chdir(work)
+
+    for feature in ("FEAT-CRD1", "FEAT-CRD2"):
+        result = _cancel_command(db_path, feature)
+        assert result.exit_code == 0, result.output
+
+    config = load_config(settings)
+    assert runner_url_for_repo(config, REPO) == runners["project_url"]
+    assert runner_url_for_repo(config, OTHER) == runners["global_url"]
+    assert runners["project"].cancelled == [sandboxed_thread]
+    assert runners["global"].cancelled == [plain_thread]
+    after = _ledger(db_path)
+    assert after.get_build_row(sandboxed_build).status is BuildState.CANCELLED
+    assert after.get_build_row(plain_build).status is BuildState.CANCELLED
+    after.connection.close()
+
+
+def test_forge_cancel_with_an_unloadable_settings_file_says_so(
+    runners, tmp_path, monkeypatch, quiet_bus
+) -> None:
+    """``FORGE_CONFIG_PATH`` names a file that does not load: one sentence,
+    exit 2, no runner contacted and nothing cancelled."""
+    from forge.lifecycle.state_machine import BuildState
+
+    db_path = tmp_path / "forge.db"
+    pool = _ledger(db_path)
+    build_id, _ = _running(pool, "FEAT-BAD1", REPO)
+    pool.connection.close()
+    broken = tmp_path / "broken.yaml"
+    broken.write_text("planning: {sandboxes: [\n")
+    monkeypatch.setenv("FORGE_AUTOBUILD_RUNNER_URL", runners["global_url"])
+    monkeypatch.setenv("FORGE_CONFIG_PATH", str(broken))
+    work = tmp_path / "coordinator"
+    work.mkdir()
+    monkeypatch.chdir(work)
+
+    result = _cancel_command(db_path, "FEAT-BAD1")
+
+    assert result.exit_code == 2
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    assert f"settings file $FORGE_CONFIG_PATH names ({broken})" in result.output
+    assert "Nothing was cancelled" in result.output
+    assert runners["project"].cancelled == [] and runners["global"].cancelled == []
+    after = _ledger(db_path)
+    assert after.get_build_row(build_id).status is BuildState.RUNNING
+    after.connection.close()
+
+
 def test_forge_cancel_after_the_runner_restarted_still_cancels(
     runners, tmp_path, monkeypatch, quiet_bus
 ) -> None:

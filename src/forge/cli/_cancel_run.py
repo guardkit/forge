@@ -42,7 +42,11 @@ from forge.cli._cancel_gate_inject import (
 )
 from forge.cli._recorded_run import interrupt_recorded_run
 from forge.cli._db_resolve import resolve_db_path
-from forge.cli._responder import resolve_gate_responder, resolve_responder
+from forge.cli._responder import (
+    config_expected_approver,
+    resolve_gate_responder,
+    resolve_responder,
+)
 from forge.cli.runtime import build_cli_runtime
 from forge.lifecycle.state_machine import TERMINAL_STATES, BuildState
 
@@ -56,7 +60,10 @@ POLL_SECONDS: float = 0.5
 
 def _selected_config(ctx: Any) -> Any:
     """The configuration this command was given (``--config`` / ./forge.yaml),
-    else the one ``FORGE_CONFIG_PATH`` names; ``None`` when there is none."""
+    else the one ``FORGE_CONFIG_PATH`` names; ``None`` when there is none.
+
+    A file ``FORGE_CONFIG_PATH`` names that cannot be loaded stops the command
+    with one sentence and exit 2, before anything is sent or cancelled."""
     if getattr(ctx, "obj", None) is not None:
         return ctx.obj
     path = os.environ.get("FORGE_CONFIG_PATH")
@@ -64,7 +71,14 @@ def _selected_config(ctx: Any) -> Any:
         return None
     from forge.config.loader import load_config
 
-    return load_config(Path(path))
+    try:
+        return load_config(Path(path))
+    except Exception as exc:  # noqa: BLE001 — any load failure is said plainly
+        detail = (str(exc).strip().splitlines() or [type(exc).__name__])[0]
+        _refuse(
+            f"the settings file $FORGE_CONFIG_PATH names ({path}) could not be "
+            f"loaded: {detail}. Fix it or pass --config. Nothing was cancelled."
+        )
 
 
 def execute_cancel(
@@ -185,8 +199,7 @@ def _cancel_at_card(
     if request is None:
         return False
 
-    config = _selected_config(ctx)
-    approver = getattr(getattr(config, "approval", None), "expected_approver", None)
+    approver = config_expected_approver(_selected_config(ctx))
     signer = resolve_gate_responder(responder, approver=approver)
     if signer is None:
         _refuse(
