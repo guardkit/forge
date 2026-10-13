@@ -27,8 +27,8 @@ from forge.cli._cancel_run import execute_cancel
     help=(
         "Operator identity for the cancel; also stamped onto the synthetic "
         "reject so an identity-pinned gate accepts it. Falls back to "
-        "$FORGE_RESPONDER, the gate's expected approver, then the OS user — "
-        "never requires a controlling terminal."
+        "$FORGE_RESPONDER, the gate's expected approver, then the OS user "
+        "(never for a build waiting at its card); no terminal needed."
     ),
 )
 @click.option(

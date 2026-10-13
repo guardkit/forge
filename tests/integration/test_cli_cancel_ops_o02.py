@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import UTC, datetime
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -320,3 +321,378 @@ class TestPausedCancelIdentityRoundTrip:
         wait_task.cancel()
         with pytest.raises((asyncio.CancelledError, Exception)):
             await wait_task
+
+
+# ---------------------------------------------------------------------------
+# 12 October 2026 — cancel a build waiting at its card, signed by the approver
+# the card is pinned to, and report it only once the row reads CANCELLED.
+#
+# These drive the real ``execute_cancel`` against a real SQLite ledger. The
+# bus seam (``_inject_synthetic_reject``) carries the rejection to the real
+# ``ApprovalSubscriber`` on the in-memory bus, pinned to the approver in the
+# same settings file; a stand-in for the coordinator's gate frame cancels the
+# row through the real SQLite gate state machine when the subscriber accepts.
+# ---------------------------------------------------------------------------
+
+CARD_APPROVER = "U-PINNED"
+CARD_STAGE = "Implementation"
+
+
+def _settings_file(tmp_path: Path, approver: str) -> Path:
+    import yaml
+
+    data = {
+        "permissions": {"filesystem": {"allowlist": [str(tmp_path)]}},
+        "approval": {"expected_approver": approver},
+    }
+    path = tmp_path / "settings" / "forge.yaml"
+    path.parent.mkdir()
+    path.write_text(yaml.safe_dump(data))
+    return path
+
+
+def _seed_paused_build(
+    db_path: Path, *, feature_id: str, card_build_id: str | None = None
+) -> str:
+    """A build waiting at its card; ``card_build_id`` names whose card it is."""
+    from forge.lifecycle.persistence import Build
+    from forge.lifecycle.state_machine import transition as compose_transition
+
+    build_id = _seed_queued_build(db_path, feature_id=feature_id)
+    cx = sqlite_connect.connect_writer(db_path)
+    try:
+        persistence = SqliteLifecyclePersistence(connection=cx, db_path=db_path)
+        for frm, to in (
+            (BuildState.QUEUED, BuildState.PREPARING),
+            (BuildState.PREPARING, BuildState.RUNNING),
+        ):
+            persistence.apply_transition(
+                compose_transition(Build(build_id=build_id, status=frm), to)
+            )
+        persistence.mark_paused(
+            build_id,
+            derive_request_id(
+                build_id=card_build_id or build_id,
+                stage_label=CARD_STAGE,
+                attempt_count=0,
+            ),
+        )
+    finally:
+        cx.close()
+    return build_id
+
+
+@pytest.fixture
+def incident_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Inside the coordinator: user ``forge``, no --config, no ./forge.yaml."""
+    monkeypatch.chdir(tmp_path)  # no forge.yaml here
+    monkeypatch.setenv("USER", "forge")
+    monkeypatch.setenv("LOGNAME", "forge")
+    monkeypatch.delenv("FORGE_RESPONDER", raising=False)
+    monkeypatch.delenv("FORGE_CONFIG_PATH", raising=False)
+    return tmp_path
+
+
+class _Card:
+    """The coordinator's side: a gate waiting on the in-memory bus."""
+
+    def __init__(self, db_path: Path, build_id: str, pinned_to: str | None) -> None:
+        from forge.gating.sqlite_adapters import build_sqlite_gate_adapters
+
+        self.nats = InMemoryNats()
+        self.build_id = build_id
+        self.sent: list[str | None] = []
+        self._cx = sqlite_connect.connect_writer(db_path)
+        pool = SqliteLifecyclePersistence(connection=self._cx, db_path=db_path)
+        _repo, self._state_machine = build_sqlite_gate_adapters(
+            pool, clock=lambda: datetime.now(UTC)
+        )
+        self.subscriber = ApprovalSubscriber(
+            ApprovalSubscriberDeps(
+                nats_client=self.nats,
+                config=ApprovalConfig(default_wait_seconds=30, max_wait_seconds=30),
+                publish_refresh=None,
+                expected_approver=pinned_to,
+                clock=FakeMonotonicClock(),
+            )
+        )
+
+    async def wait(self) -> None:
+        """Await the answer; a reject cancels the row, as the gate frame does."""
+        response = await self.subscriber.await_response(
+            self.build_id, stage_label=CARD_STAGE
+        )
+        if response is not None and response.decision == "reject":
+            await self._state_machine.transition_to_cancelled(
+                build_id=self.build_id, reason=response.notes or "rejected"
+            )
+
+    def bus_seam(self, loop: asyncio.AbstractEventLoop) -> Callable[..., None]:
+        """Replacement for ``_inject_synthetic_reject`` that uses this bus."""
+
+        def _send(
+            *,
+            build_id: str,
+            stage_label: str,
+            attempt_count: int,
+            correlation_id: str | None,
+            responder: str | None,
+        ) -> None:
+            self.sent.append(responder)
+            asyncio.run_coroutine_threadsafe(
+                SyntheticResponseInjector(nats_client=self.nats).inject_cli_cancel(
+                    build_id=build_id,
+                    stage_label=stage_label,
+                    attempt_count=attempt_count,
+                    correlation_id=correlation_id,
+                    responder=responder,
+                ),
+                loop,
+            ).result(timeout=5)
+
+        return _send
+
+    def close(self) -> None:
+        self._cx.close()
+
+
+async def _cancel_with_card_waiting(
+    monkeypatch: pytest.MonkeyPatch,
+    db_path: Path,
+    feature_id: str,
+    build_id: str,
+    *,
+    card_pinned_to: str | None,
+    **cancel_kwargs: object,
+) -> tuple[int, _Card]:
+    """Run ``execute_cancel`` (in a worker thread) while the card waits."""
+    from forge.cli import _cancel_gate_inject
+    from forge.cli._cancel_run import execute_cancel
+
+    card = _Card(db_path, build_id, card_pinned_to)
+    monkeypatch.setattr(
+        _cancel_gate_inject,
+        "_inject_synthetic_reject",
+        card.bus_seam(asyncio.get_running_loop()),
+    )
+    waiting = asyncio.create_task(card.wait())
+    await _await_registered(card.nats, build_id)
+
+    def _run() -> int:
+        try:
+            execute_cancel(
+                ctx=SimpleNamespace(obj=None),  # no --config, no ./forge.yaml
+                identifier=feature_id,
+                reason="cli cancel",
+                db_path=db_path,
+                **cancel_kwargs,  # type: ignore[arg-type]
+            )
+        except SystemExit as exc:
+            return int(exc.code or 0)
+        return 0
+
+    try:
+        exit_code = await asyncio.to_thread(_run)
+    finally:
+        if not waiting.done():
+            waiting.cancel()
+        await asyncio.gather(waiting, return_exceptions=True)
+        card.close()
+    return exit_code, card
+
+
+class TestCancelAtCardSignedByTheConfiguredApprover:
+    """``forge cancel`` clears a build waiting at its card (12 October)."""
+
+    @pytest.mark.asyncio
+    async def test_incident_cancel_in_coordinator_is_accepted_and_confirmed(
+        self,
+        incident_env: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        stub_publish: list[tuple[str, bytes]],
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """No --config, no ./forge.yaml, FORGE_CONFIG_PATH set, USER=forge."""
+        from forge.config.loader import load_config
+
+        settings = _settings_file(incident_env, CARD_APPROVER)
+        monkeypatch.setenv("FORGE_CONFIG_PATH", str(settings))
+        db_path = incident_env / "forge.db"
+        build_id = _seed_paused_build(db_path, feature_id="FEAT-CARD1")
+
+        exit_code, card = await _cancel_with_card_waiting(
+            monkeypatch,
+            db_path,
+            "FEAT-CARD1",
+            build_id,
+            # The gate is pinned to the approver in the same settings file.
+            card_pinned_to=load_config(settings).approval.expected_approver,
+            responder=None,
+        )
+
+        out = capsys.readouterr()
+        assert card.sent == [CARD_APPROVER], out.err
+        assert _final_status(db_path, build_id) is BuildState.CANCELLED
+        assert exit_code == 0, out.err
+        assert "cancelled" in out.out.lower()
+
+    @pytest.mark.asyncio
+    async def test_no_identity_known_sends_nothing_and_says_how_to_fix(
+        self,
+        incident_env: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """No --responder, no $FORGE_RESPONDER and no settings file anywhere."""
+        db_path = incident_env / "forge.db"
+        build_id = _seed_paused_build(db_path, feature_id="FEAT-CARD2")
+
+        exit_code, card = await _cancel_with_card_waiting(
+            monkeypatch,
+            db_path,
+            "FEAT-CARD2",
+            build_id,
+            card_pinned_to=CARD_APPROVER,
+            responder=None,
+        )
+
+        err = capsys.readouterr().err
+        assert exit_code != 0
+        assert card.sent == []
+        assert _final_status(db_path, build_id) is BuildState.PAUSED
+        assert "settings file" in err and "--config" in err
+
+    @pytest.mark.asyncio
+    async def test_responder_differing_from_the_approver_sends_nothing(
+        self,
+        incident_env: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        settings = _settings_file(incident_env, CARD_APPROVER)
+        monkeypatch.setenv("FORGE_CONFIG_PATH", str(settings))
+        db_path = incident_env / "forge.db"
+        build_id = _seed_paused_build(db_path, feature_id="FEAT-CARD3")
+
+        exit_code, card = await _cancel_with_card_waiting(
+            monkeypatch,
+            db_path,
+            "FEAT-CARD3",
+            build_id,
+            card_pinned_to=CARD_APPROVER,
+            responder="someone-else",
+        )
+
+        err = capsys.readouterr().err
+        assert exit_code != 0
+        assert card.sent == []
+        assert _final_status(db_path, build_id) is BuildState.PAUSED
+        assert CARD_APPROVER in err and "someone-else" in err
+
+    @pytest.mark.asyncio
+    async def test_card_naming_another_build_sends_nothing(
+        self,
+        incident_env: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        settings = _settings_file(incident_env, CARD_APPROVER)
+        monkeypatch.setenv("FORGE_CONFIG_PATH", str(settings))
+        db_path = incident_env / "forge.db"
+        build_id = _seed_paused_build(
+            db_path, feature_id="FEAT-CARD4", card_build_id="build-OTHER-1"
+        )
+
+        exit_code, card = await _cancel_with_card_waiting(
+            monkeypatch,
+            db_path,
+            "FEAT-CARD4",
+            build_id,
+            card_pinned_to=CARD_APPROVER,
+            responder=None,
+        )
+
+        err = capsys.readouterr().err
+        assert exit_code != 0
+        assert card.sent == []
+        assert _final_status(db_path, build_id) is BuildState.PAUSED
+        assert "another build" in err
+
+    def test_row_that_left_paused_sends_nothing(
+        self,
+        incident_env: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """The card was answered between the lookup and the re-read."""
+        from forge.cli import _cancel_gate_inject, _cancel_run
+        from forge.lifecycle.persistence import Build
+        from forge.lifecycle.state_machine import transition as compose_transition
+
+        settings = _settings_file(incident_env, CARD_APPROVER)
+        monkeypatch.setenv("FORGE_CONFIG_PATH", str(settings))
+        db_path = incident_env / "forge.db"
+        build_id = _seed_paused_build(db_path, feature_id="FEAT-CARD5")
+        sent: list[object] = []
+        monkeypatch.setattr(
+            _cancel_gate_inject,
+            "_inject_synthetic_reject",
+            lambda **kw: sent.append(kw),
+        )
+        real_pending = _cancel_gate_inject.pending_gate_request
+
+        def _answered_first(runtime, *, build_id):  # type: ignore[no-untyped-def]
+            runtime.persistence.apply_transition(
+                compose_transition(
+                    Build(build_id=build_id, status=BuildState.PAUSED),
+                    BuildState.RUNNING,
+                )
+            )
+            return real_pending(runtime, build_id=build_id)
+
+        monkeypatch.setattr(_cancel_run, "pending_gate_request", _answered_first)
+
+        with pytest.raises(SystemExit) as exc:
+            _cancel_run.execute_cancel(
+                ctx=SimpleNamespace(obj=None),
+                identifier="FEAT-CARD5",
+                reason="cli cancel",
+                responder=None,
+                db_path=db_path,
+            )
+
+        assert exc.value.code != 0
+        assert sent == []
+        assert _final_status(db_path, build_id) is BuildState.RUNNING
+        assert "no longer waiting at its card" in capsys.readouterr().err
+
+    @pytest.mark.asyncio
+    async def test_not_confirmed_when_the_card_refuses_the_rejection(
+        self,
+        incident_env: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """The gate is pinned to someone else: the cancel says so, plainly."""
+        settings = _settings_file(incident_env, CARD_APPROVER)
+        monkeypatch.setenv("FORGE_CONFIG_PATH", str(settings))
+        db_path = incident_env / "forge.db"
+        build_id = _seed_paused_build(db_path, feature_id="FEAT-CARD6")
+
+        exit_code, card = await _cancel_with_card_waiting(
+            monkeypatch,
+            db_path,
+            "FEAT-CARD6",
+            build_id,
+            card_pinned_to="U-SOMEONE-ELSE",
+            responder=None,
+            confirm_seconds=0.3,
+            poll_seconds=0.05,
+        )
+
+        captured = capsys.readouterr()
+        assert card.sent == [CARD_APPROVER]
+        assert exit_code != 0
+        assert "did not accept" in captured.err
+        assert "cancelled" not in captured.out.lower()
+        assert _final_status(db_path, build_id) is BuildState.PAUSED

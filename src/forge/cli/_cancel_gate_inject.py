@@ -17,11 +17,92 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any
+from typing import Any, NamedTuple
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["try_inject_paused_cancel"]
+__all__ = [
+    "PausedCardChanged",
+    "PendingGateRequest",
+    "pending_gate_request",
+    "send_paused_cancel",
+    "try_inject_paused_cancel",
+]
+
+
+class PausedCardChanged(Exception):
+    """The build is no longer waiting at the card this cancel would answer."""
+
+
+class PendingGateRequest(NamedTuple):
+    """The card a paused build is waiting at, read back from its row."""
+
+    stage_label: str
+    attempt_count: int
+    correlation_id: str | None
+
+
+def pending_gate_request(runtime: Any, *, build_id: str) -> PendingGateRequest | None:
+    """Re-read the build row and return the exact card it is waiting at.
+
+    Raises :class:`PausedCardChanged` when the row has left PAUSED or its
+    ``pending_approval_request_id`` names another build: a rejection sent
+    then would answer a card this cancel was not asked about. Returns
+    ``None`` — the caller keeps today's direct-cancel fallback — when there
+    is no row, or a PAUSED row carries no pending request id or a legacy one
+    that does not parse.
+    """
+    from forge.gating.identity import parse_request_id
+    from forge.lifecycle.state_machine import BuildState
+
+    row = runtime.persistence.get_build_row(build_id)
+    if row is None:
+        return None
+    if row.status is not BuildState.PAUSED:
+        raise PausedCardChanged(
+            f"the build is no longer waiting at its card (it is now "
+            f"{row.status.value})."
+        )
+    if not row.pending_approval_request_id:
+        return None
+    try:
+        card_build_id, stage_label, attempt_count = parse_request_id(
+            row.pending_approval_request_id
+        )
+    except ValueError:
+        logger.warning(
+            "forge cancel: build %s is PAUSED but its "
+            "pending_approval_request_id is unparseable; falling back to a "
+            "direct cancel",
+            build_id,
+        )
+        return None
+    if card_build_id != build_id:
+        raise PausedCardChanged(
+            f"the card it is waiting at belongs to another build "
+            f"({card_build_id})."
+        )
+    return PendingGateRequest(stage_label, attempt_count, row.correlation_id)
+
+
+def send_paused_cancel(
+    *, build_id: str, request: PendingGateRequest, reason: str, responder: str
+) -> None:
+    """Send the synthetic reject for ``request``, signed by ``responder``."""
+    _inject_synthetic_reject(
+        build_id=build_id,
+        stage_label=request.stage_label,
+        attempt_count=request.attempt_count,
+        correlation_id=request.correlation_id,
+        responder=responder,
+    )
+    logger.info(
+        "forge cancel: build %s paused at the approval gate; sent a synthetic "
+        "reject (%r, responder=%r)",
+        build_id,
+        reason,
+        responder,
+    )
 
 
 def try_inject_paused_cancel(

@@ -71,6 +71,10 @@ services:
       # THE RECORD. One file on the ledger volume, which this service is the
       # only writer of.
       FORGE_DB_PATH: /var/lib/forge/forge.db
+      # THE SETTINGS FILE, named for commands run inside this container: a
+      # 'forge cancel' without --config reads the card's approver from the
+      # same file the gate was built from (13 October 2026).
+      FORGE_CONFIG_PATH: /etc/forge/forge.yaml
       # WHERE A BUILD'S RECEIPTS ARE — the receipts folder bound below, not
       # beside the code.
       FORGE_RECEIPTS_DIR: /var/lib/forge-evidence

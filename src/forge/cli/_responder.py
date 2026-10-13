@@ -47,6 +47,7 @@ __all__ = [
     "RESPONDER_ENV_VAR",
     "UNKNOWN_RESPONDER",
     "config_expected_approver",
+    "resolve_gate_responder",
     "resolve_responder",
 ]
 
@@ -100,6 +101,21 @@ def resolve_responder(explicit: str | None = None, *, pinned: str | None = None)
             UNKNOWN_RESPONDER,
         )
         return UNKNOWN_RESPONDER
+
+
+def resolve_gate_responder(
+    explicit: str | None = None, *, approver: str | None = None
+) -> str | None:
+    """The identity that signs a cancel sent to a build waiting at its card.
+
+    ``--responder``, then ``$FORGE_RESPONDER``, then the approver the card is
+    pinned to; ``None`` when none of them is known. Unlike
+    :func:`resolve_responder` it never falls back to the login name: a card
+    pinned to an approver refuses any other name, so guessing one only sends
+    a rejection that is certain to be refused (12 October 2026, when a cancel
+    run as user ``forge`` was signed ``forge`` and the build stayed paused).
+    """
+    return _first_nonempty(explicit, os.environ.get(RESPONDER_ENV_VAR), approver)
 
 
 def config_expected_approver(ctx: Any) -> str | None:
