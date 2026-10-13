@@ -38,6 +38,7 @@ PARENT = {
     "FORGE_CONFIG_PATH": "/state/forge.yaml",
     "FORGE_RECEIPTS_DIR": "/receipts",
     "FORGE_NATS_URL": "nats://bus:4222",
+    "FORGE_IMAGE_IDENTITY": "e" * 64,
     "OPENAI_BASE_URL": "http://localhost:9000/v1",
     "OPENAI_API_KEY": "placeholder",
     "ANTHROPIC_BASE_URL": "http://localhost:9000",
@@ -116,8 +117,11 @@ def test_the_list_is_short() -> None:
 
     Raised from 30 to 37 on 5 October 2026 for the four settings of the plan's
     stamp check and the three of the QA verifier's second opinion, which the
-    list had left out (see the tests below)."""
-    assert len(LAUNCH_SETTINGS) <= 37
+    list had left out (see the tests below).
+
+    Raised from 37 to 38 on 13 October 2026 for FORGE_IMAGE_IDENTITY, which
+    the build system records beside each build and this list had left out."""
+    assert len(LAUNCH_SETTINGS) <= 38
 
 
 def test_the_list_names_no_language_framework_or_product() -> None:

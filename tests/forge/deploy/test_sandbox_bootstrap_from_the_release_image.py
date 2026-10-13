@@ -874,6 +874,18 @@ class TestItStartsTwoContainersFromThatOneImage:
             assert f"--env {name}" in helper, f"{name} was not handed to the helper"
         assert "router:4000" not in runner and "switchboard:9000" not in runner
 
+    def test_the_release_identity_reaches_the_runner(self, sandbox):
+        """Which release image a build ran in (13 October 2026): the identity
+        this script has just checked the image against reaches both
+        containers by name, so the build system can record it. Before, this
+        list left it out and every build recorded "not set"."""
+        helper, runner = _the_two_starts(sandbox)
+        for call in (helper, runner):
+            assert "--env FORGE_IMAGE_IDENTITY" in call
+            # By name only: the value is never on a command line.
+            assert sandbox["identity"] not in call
+            assert "FORGE_IMAGE_IDENTITY=" not in call
+
     def test_the_runner_serves_as_many_builds_at_once_as_it_is_told(self, sandbox):
         """The runner is ``langgraph dev``, which runs ONE build at a time
         unless told otherwise. FORGE_MAX_CONCURRENT_BUILDS tells it."""
