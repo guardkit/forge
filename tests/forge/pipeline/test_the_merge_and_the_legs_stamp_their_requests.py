@@ -412,6 +412,76 @@ class TestTheMergeWordStampsItsOwnCommand:
             assert "by_hand" not in request
 
 
+class TestTheMergeWordSendsTheBuildsDeclaredSettings:
+    """The join is handed the setting NAMES this build's project declared.
+
+    The merge command runs the project's own install and checks inside the
+    sandbox. Without the recorded names, the helper passes only the factory's
+    own list, so a name the project needs (a browser cache folder, say) never
+    reaches the build system. The names come off this coordinator's ledger,
+    never out of the coordinator's own environment, and the helper checks
+    each one against the project's declaration at the recorded commit.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_press_sends_the_recorded_settings(
+        self, project, start_commit, pool, helper, tmp_path
+    ) -> None:
+        _a_build_row(pool, start_commit=start_commit, worktree=tmp_path / "wt")
+        pool.connection.execute(
+            "UPDATE builds SET launch_settings = ? WHERE build_id = ?",
+            (json.dumps(["PLAYWRIGHT_BROWSERS_PATH"]), BUILD_ID),
+        )
+        pool.connection.commit()
+        assert pool.read_launch_settings(BUILD_ID) == ("PLAYWRIGHT_BROWSERS_PATH",)
+
+        await _press(
+            config=_config(project), pool=pool, project=project, url=helper.url
+        )
+
+        sent = helper.only("/guardkit-merge")
+        assert sent, "the press sent no merge request at all"
+        assert sent[0]["launch_settings"] == ["PLAYWRIGHT_BROWSERS_PATH"]
+
+    @pytest.mark.asyncio
+    async def test_a_build_with_no_recorded_settings_sends_none(
+        self, project, start_commit, pool, helper, tmp_path
+    ) -> None:
+        _a_build_row(pool, start_commit=start_commit, worktree=tmp_path / "wt")
+        assert pool.read_launch_settings(BUILD_ID) == ()
+
+        await _press(
+            config=_config(project), pool=pool, project=project, url=helper.url
+        )
+
+        sent = helper.only("/guardkit-merge")
+        assert sent, "the press sent no merge request at all"
+        assert "launch_settings" not in sent[0]
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_record_sends_none_and_the_press_goes_on(
+        self, project, start_commit, pool, helper, tmp_path, monkeypatch, caplog
+    ) -> None:
+        _a_build_row(pool, start_commit=start_commit, worktree=tmp_path / "wt")
+
+        def _cannot_read(_build_id: str) -> tuple[str, ...]:
+            raise sqlite3.OperationalError("disk I/O error")
+
+        monkeypatch.setattr(pool, "read_launch_settings", _cannot_read)
+        with caplog.at_level("WARNING"):
+            await _press(
+                config=_config(project), pool=pool, project=project, url=helper.url
+            )
+
+        sent = helper.only("/guardkit-merge")
+        assert sent, "the press sent no merge request at all"
+        assert "launch_settings" not in sent[0]
+        assert any(
+            "settings" in record.getMessage() and BUILD_ID in record.getMessage()
+            for record in caplog.records
+        ), [r.getMessage() for r in caplog.records]
+
+
 # ---------------------------------------------------------------------------
 # A journey's leg, driven through the real chooser and the real dispatcher
 # ---------------------------------------------------------------------------

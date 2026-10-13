@@ -213,6 +213,7 @@ __all__ = [
     "MERGE_VERIFY_TIMEOUT_DEFAULT_SECONDS",
     "MERGE_WALL_CAP_SECONDS",
     "MERGE_WALL_MERGE_ALLOWANCE_SECONDS",
+    "MERGE_WALL_RUNS",
     "MergeApprovalConsumer",
     "RESULT_WORD_MERGED_AND_RUNNING",
     "RESULT_WORD_PUBLICATION_PENDING",
@@ -259,27 +260,38 @@ MERGE_REPORT_TARGET_IDENTIFIER: str = "merge_deploy_executor"
 #: does not say (``merge_executor.verify_timeout_seconds``).
 MERGE_VERIFY_TIMEOUT_DEFAULT_SECONDS: int = 600
 
-#: Seconds allowed for the merge itself, on top of the two check runs, when
-#: sizing the wall around the whole command.
+#: Seconds allowed for the merge itself, on top of the four install-or-check
+#: runs, when sizing the wall around the whole command.
 MERGE_WALL_MERGE_ALLOWANCE_SECONDS: int = 180
 
-#: The longest wall the deploy sidecar will accept. Written out here rather
-#: than imported so this module does not depend on the sidecar; a test pins
-#: the two together (``deploy_sidecar.service.MERGE_TIMEOUT_MAX``).
-MERGE_WALL_CAP_SECONDS: int = 1800
+#: How many runs, each held to one check run's limit, the merge command may
+#: make: the project's declared install and the checks on the target branch,
+#: then the install and the checks again on the merged tree (13 October 2026,
+#: the merge-install design, item 8).
+MERGE_WALL_RUNS: int = 4
+
+#: The longest wall the deploy sidecar will accept (an hour). Written out here
+#: rather than imported so this module does not depend on the sidecar; a test
+#: pins the two together (``deploy_sidecar.service.MERGE_TIMEOUT_MAX``).
+MERGE_WALL_CAP_SECONDS: int = 3600
 
 
 def merge_wall_seconds(verify_timeout_seconds: int) -> int:
     """How long the whole merge command may take, given one check run's limit.
 
-    The merge command may run the checks TWICE — once on main to see what was
-    already failing, once on the merged tree — and merges in between. So the
-    wall around the whole thing holds two check runs plus three minutes, and
-    never more than the deploy sidecar will accept. Sized any smaller, the
-    outer wall fires first and the merge is killed mid-flight: the branch is
-    on main and nothing says so.
+    The merge command may install and check TWICE — on the target branch to
+    see what was already failing, and on the merged tree — and merges in
+    between. The build system holds each install to the shorter of the
+    project's own install limit and one check run's limit, so the wall around
+    the whole thing holds four such runs plus three minutes, and never more
+    than the deploy sidecar will accept. Sized any smaller, the outer wall
+    fires first and the merge is killed mid-flight: the branch is joined and
+    nothing says so.
     """
-    wall = 2 * int(verify_timeout_seconds) + MERGE_WALL_MERGE_ALLOWANCE_SECONDS
+    wall = (
+        MERGE_WALL_RUNS * int(verify_timeout_seconds)
+        + MERGE_WALL_MERGE_ALLOWANCE_SECONDS
+    )
     return min(wall, MERGE_WALL_CAP_SECONDS)
 
 
@@ -1519,6 +1531,9 @@ async def execute_merge_deploy(
     # stamped with it and confirms it before it reads a line. A list of one, so
     # a nested reader can fill it without a nonlocal.
     _start_commit_memo: list[str | None] = []
+    # THE SETTING NAMES THIS BUILD'S PROJECT DECLARED, off the same record and
+    # kept the same way (13 October 2026, the merge-install design, item 7).
+    _launch_settings_memo: list[tuple[str, ...]] = []
 
     def _write_receipt(name: str, data: dict[str, Any]) -> None:
         try:
@@ -2647,6 +2662,41 @@ async def execute_merge_deploy(
             )
         _start_commit_memo.append(recorded)
         return recorded
+
+    def _the_recorded_launch_settings() -> tuple[str, ...]:
+        """The setting NAMES this coordinator's ledger records this build's
+        project as declaring, or ``()`` when it recorded none.
+
+        Names only, off the record, never out of this process's own
+        environment. The join's command runs the project's declared install
+        and checks, and the helper that runs it passes only the factory's own
+        list unless it is told these; it checks each name against the
+        project's declaration at the recorded commit before it passes one. An
+        unreadable record is logged and sends nothing, which is how the join
+        ran before.
+        """
+        if _launch_settings_memo:
+            return _launch_settings_memo[0]
+        names: tuple[str, ...] = ()
+        try:
+            reader = getattr(deps.pool, "read_launch_settings", None)
+            if reader is not None:
+                names = tuple(
+                    str(name).strip()
+                    for name in (reader(build_id) or ())
+                    if str(name).strip()
+                )
+        except Exception as exc:  # noqa: BLE001 — an unreadable record is not a crash
+            logger.warning(
+                "merge-executor: the settings %s's project declared could not "
+                "be read off the record (%s: %s), so the join is sent none",
+                build_id,
+                type(exc).__name__,
+                exc,
+            )
+            names = ()
+        _launch_settings_memo.append(names)
+        return names
 
     async def _the_target_and_how_it_wants_the_identity() -> tuple[str, Any] | None:
         """This project's deployment target, and its identity declaration.
@@ -4315,6 +4365,12 @@ async def execute_merge_deploy(
                     # commit.
                     build=build_id,
                     start_commit=_the_recorded_start_commit(),
+                    # WHAT ELSE THIS BUILD'S PROJECT DECLARED IT NEEDS (13
+                    # October 2026). The join runs the project's own install
+                    # and checks; the names recorded for this build travel
+                    # with it, and the helper checks each against the
+                    # project's declaration at the commit above.
+                    launch_settings=_the_recorded_launch_settings(),
                 )
                 if deps.feature_routing_required:
                     merge_run_kwargs["feature_routing_id"] = correlation_id
@@ -4596,17 +4652,40 @@ async def execute_merge_deploy(
             # ------------------------------------------------------------------
             recorded_why = _why_the_recorded_step_failed(STEP_MERGE_CHECKS)
             if recorded_why is not None and not merge_checks_ran_here:
-                detail = (
-                    f"{feature_id} was joined onto {target_branch} "
-                    f"({(j_commit or '')[:10]}), but the checks after the join "
-                    f"did not pass: {recorded_why}. Nothing was published."
+                recorded_line = _the_recorded_line(STEP_MERGE_CHECKS)
+                # "COULD NOT RUN" STAYS "COULD NOT RUN" (13 October 2026, the
+                # merge-install design, item 9). The record keeps the status
+                # the first press was given. When that was "unverified" — an
+                # install that failed, a judge file the build changed, a
+                # declaration nobody could read — the checks never ran, so this
+                # is the first press's wording, not a red result, and no repair.
+                recorded_could_not_run = (
+                    recorded_line is not None
+                    and str(recorded_line.detail.get("verify_status") or "")
+                    .strip()
+                    .lower()
+                    == "unverified"
                 )
+                if recorded_could_not_run:
+                    detail = (
+                        f"{feature_id} was joined onto {target_branch} "
+                        f"({(j_commit or '')[:10]}), but the checks after the "
+                        f"join could not run: {recorded_why}. Nothing was "
+                        "published."
+                    )
+                else:
+                    detail = (
+                        f"{feature_id} was joined onto {target_branch} "
+                        f"({(j_commit or '')[:10]}), but the checks after the join "
+                        f"did not pass: {recorded_why}. Nothing was published."
+                    )
                 logger.warning(
                     "merge-executor: %s's join (%s) was checked by an earlier "
-                    "press and went red (%s) — this press re-runs nothing and "
-                    "says so; it is not 'checked'",
+                    "press and %s (%s) — this press re-runs nothing and says "
+                    "so; it is not 'checked'",
                     feature_id,
                     str(j_commit)[:10],
+                    "its checks could not run" if recorded_could_not_run else "went red",
                     recorded_why,
                 )
                 if store is not None:
@@ -4616,7 +4695,6 @@ async def execute_merge_deploy(
                         now=deps.clock(),
                         result=RESULT_PUBLICATION_PENDING,
                     )
-                recorded_line = _the_recorded_line(STEP_MERGE_CHECKS)
                 return _settled(MergeDeployOutcome(
                     result="merged-verify-failed",
                     status="FAILED",
@@ -4633,7 +4711,9 @@ async def execute_merge_deploy(
                         if recorded_line is not None
                         else None
                     ),
-                    verify_status="failed",
+                    verify_status=(
+                        "unverified" if recorded_could_not_run else "failed"
+                    ),
                 ))
 
             # ------------------------------------------------------------------
@@ -4662,9 +4742,9 @@ async def execute_merge_deploy(
                     feature_id=feature_id,
                     j_commit=str(j_commit),
                     # ONE CHECK RUN'S WALL, not the merge command's: this
-                    # command merges nothing, so the two check runs and the
-                    # merge in between that the merge wall allows for are not
-                    # its to spend.
+                    # command merges nothing, so the runs on both sides of a
+                    # merge that the merge wall allows for are not its to
+                    # spend.
                     timeout_seconds=float(_verify_timeout_from(deps.config)),
                 )
                 if deps.feature_routing_required:
@@ -4705,6 +4785,25 @@ async def execute_merge_deploy(
                                 now=deps.clock(),
                                 result=RESULT_PUBLICATION_PENDING,
                             )
+                        # The build system may say its checks on the join
+                        # could not run (13 October 2026, item 9). That is
+                        # "could not run", not a red result, and files no
+                        # repair.
+                        joined_could_not_run = (
+                            str(check_join_said.verify_status or "").strip().lower()
+                            == "unverified"
+                        )
+                        if joined_could_not_run:
+                            why_not = str(
+                                (check_join_said.report or {}).get("verify_detail")
+                                or check_join_said.sentence
+                            )
+                            said = (
+                                "the checks after the join could not run: "
+                                f"{why_not}"
+                            )
+                        else:
+                            said = check_join_said.sentence
                         return _settled(MergeDeployOutcome(
                             result="merged-verify-failed",
                             status="FAILED",
@@ -4713,11 +4812,13 @@ async def execute_merge_deploy(
                             detail=(
                                 f"{feature_id} was joined onto {target_branch} "
                                 f"({str(j_commit)[:10]}) by an earlier press, and "
-                                f"{check_join_said.sentence}. Nothing was published."
+                                f"{said}. Nothing was published."
                             ),
                             checks_passed=check_join_said.checks_passed,
                             checks_total=check_join_said.checks_total,
-                            verify_status="failed",
+                            verify_status=(
+                                "unverified" if joined_could_not_run else "failed"
+                            ),
                         ))
                     logger.info(
                         "merge-executor: the build system checked %s's reused "

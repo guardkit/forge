@@ -143,7 +143,7 @@ THE DENY-BY-DEFAULT LAWS (each one a test in tests/forge/deploy_sidecar):
 7. The merge operation runs ``guardkit autobuild merge`` and nothing else. The
    repository key, the feature name (``FEAT-`` plus three to twelve capitals or
    digits) and the forty-character target commit are all checked before any
-   process starts, and the timeout may not exceed half an hour.
+   process starts, and the timeout may not exceed an hour.
 8. A working directory named by the caller (``cwd``) takes effect in ONE case
    only — protect-main (2026-09-07): an existing directory directly under
    ``<repo>/.forge-candidates/``, where the merge word lays out the feature
@@ -408,10 +408,14 @@ MERGE_DEFAULT_TARGET: str = "main"
 #: a service that can be told to merge into a person's branch.
 MERGE_INTEGRATION_PREFIX: str = "factory-integration/"
 
-#: Hard cap on a caller-supplied merge timeout, in seconds (half an hour). A
+#: Hard cap on a caller-supplied merge timeout, in seconds (an hour). A
 #: request asking for longer is refused, not quietly shortened, so nobody can
-#: believe they asked for something the sidecar did not do.
-MERGE_TIMEOUT_MAX: float = 1800.0
+#: believe they asked for something the sidecar did not do. Raised from half
+#: an hour on 13 October 2026: the merge command now runs the project's
+#: declared install before each of its two check runs, and the coordinator's
+#: wall (``pipeline.merge_executor.MERGE_WALL_CAP_SECONDS``, pinned equal to
+#: this by a test) holds four runs plus the merge.
+MERGE_TIMEOUT_MAX: float = 3600.0
 
 #: How long the merge command's process group gets to stop politely after a
 #: timeout before it is killed outright.
@@ -2709,7 +2713,7 @@ def process_guardkit_merge_request(
     the forge configuration names, the feature name and the target commit must
     both be well formed, the branch to merge — when one is named — must be a
     name git will accept, the timeout must be a positive number no larger than
-    half an hour, and a pre-merge baseline, if one is sent, must be a list of
+    an hour, and a pre-merge baseline, if one is sent, must be a list of
     test names. A refusal is a 4xx with one plain sentence saying what was
     wrong.
 
