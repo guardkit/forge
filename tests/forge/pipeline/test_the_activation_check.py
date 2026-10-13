@@ -341,3 +341,50 @@ class TestTheRouteKeysFolderIsNamedNowhereElse:
         true = what_is_true_here(config, IT_PASSED)
         assert true.the_route_keys_dir == ROUTE_KEYS
         assert true.where_the_route_keys_dir_is_named == ()
+
+
+class TestEveryWayOfSpellingTheFolderIsCaught:
+    """Codex, implementation round 1 (R1): path text has many spellings of one
+    folder. Each path in a value is taken out and normalised, and so is the
+    recorded folder, before they are compared."""
+
+    @pytest.mark.parametrize(
+        "written",
+        [
+            "KEY_FILE=/srv/publisher/./route-keys/a",
+            "//srv/publisher/route-keys/a",
+            "/srv/publisher/route-keys/../route-keys/a",
+            "/srv//publisher/route-keys/a",
+            "/opt/a:/srv/publisher/route-keys:/opt/b",
+            "--mount='/srv/publisher/route-keys/a'",
+            "a=1, b=/srv/publisher/route-keys/k; c=2",
+        ],
+    )
+    def test_an_equivalent_spelling_refuses(self, written: str) -> None:
+        for recorded in (ROUTE_KEYS, ROUTE_KEYS + "/", "//srv/publisher/./route-keys/"):
+            config = a_config(publisher_route_keys_dir=recorded)
+            config.conductor.launch_settings = [written]
+            config.planning.sandboxes = {
+                "the-sandbox": SimpleNamespace(name="the-sandbox", some_file=written)
+            }
+            verdict = run_the_activation_check(config, IT_PASSED)
+            assert verdict.all_hold is False, (recorded, written)
+            assert "conductor.launch_settings" in verdict.sentence
+            assert "planning.sandboxes.the-sandbox.some_file" in verdict.sentence
+
+    @pytest.mark.parametrize(
+        "elsewhere",
+        [
+            "/srv/publisher/route-keys2/a",
+            "KEY=/srv/publisher/route-keys-old/a",
+            "/opt/a:/srv/publisher/route-keys2",
+            "/srv/publisher/route-keys/../other/a",
+            "srv/publisher/route-keys/a",
+        ],
+    )
+    def test_a_different_folder_still_does_not_match(self, elsewhere: str) -> None:
+        config = a_config(publisher_route_keys_dir=ROUTE_KEYS + "/")
+        config.conductor.launch_settings = [elsewhere]
+        true = what_is_true_here(config, IT_PASSED)
+        assert true.where_the_route_keys_dir_is_named == ()
+        assert run_the_activation_check(config, IT_PASSED).all_hold is True

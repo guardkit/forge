@@ -303,28 +303,49 @@ def _names_the_credential_file(config: Any, credential_file: str) -> tuple[str, 
     )
 
 
+#: What separates one path from the next inside a setting's text: whitespace,
+#: '=', ':', ',', ';' and quotes. None of them is in a path this check
+#: protects, so everything between them is one candidate path.
+_BETWEEN_PATHS = re.compile(r"[\s=:,;\"'`]+")
+
+
+def _a_linux_path(text: str) -> str:
+    """One path, normalised the way Linux resolves its spelling.
+
+    Any run of leading slashes is one slash (``posixpath.normpath`` keeps
+    two, which Linux does not treat differently), then ``.``, ``..`` and
+    repeated separators collapse. Path text only: nothing is looked up, so a
+    symbolic link is not followed.
+    """
+    return posixpath.normpath("/" + text.lstrip("/"))
+
+
+def _the_paths_in(value: str) -> list[str]:
+    """Every absolute path written anywhere in a setting's text, normalised."""
+    return [
+        _a_linux_path(token)
+        for token in _BETWEEN_PATHS.split(value)
+        if token.startswith("/")
+    ]
+
+
 def _inside(folder: str) -> Any:
     """Does a setting's text name ``folder`` or any path inside it?
 
-    PATH TEXT ONLY, never a file opened. The whole value, normalised, is the
-    folder or starts with it and a separator — so ``/x/route-keys2`` is not
-    ``/x/route-keys``. And the folder written anywhere inside a longer value
-    (``KEY=/x/route-keys/a``, ``--mount=...``) counts as well, on the same
-    boundary.
+    PATH TEXT ONLY, never a file opened. Every absolute path in the value —
+    the whole value, or one written inside a longer one (``KEY=/x/a``,
+    ``/a:/b``) — is taken out and normalised, and so is the folder; a path
+    names the folder when it IS the folder or starts with it and a separator.
+    So ``/x/route-keys2`` is not ``/x/route-keys``, while ``/x/./route-keys/a``,
+    ``//x/route-keys/a`` and ``/x/route-keys/../route-keys/a`` all are.
     """
-    root = posixpath.normpath(folder.strip())
-    inside_at = re.compile(
-        r"(?:^|[^A-Za-z0-9._/-])" + re.escape(root) + r"(?:/|$|[^A-Za-z0-9._-])"
-    )
+    root = _a_linux_path(folder.strip())
+    beneath = root.rstrip("/") + "/"
 
     def names_it(text: str) -> bool:
-        value = text.strip()
-        if not value:
-            return False
-        normal = posixpath.normpath(value)
-        if normal == root or normal.startswith(root.rstrip("/") + "/"):
-            return True
-        return bool(inside_at.search(value))
+        return any(
+            path == root or path.startswith(beneath) for path in _the_paths_in(text)
+        )
 
     return names_it
 
