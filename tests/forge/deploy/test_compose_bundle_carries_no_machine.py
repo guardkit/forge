@@ -218,7 +218,8 @@ class TestWhatTheBundlePromises:
     def test_nothing_binds_a_folder_off_this_machine(self, rendered: str) -> None:
         """Binds are allowed only for files and the one folder a machine supplies.
 
-        The publisher's settings file, its credential file and its pinned host keys are supplied by
+        The publisher's settings file, its credential file, its folder of
+        per-route keys and its pinned host keys are supplied by
         the machine at paths the env file names, and so is the build receipts
         folder the coordinator reads failure packs from. Everything else is a
         named volume, because a bind is a path and a path belongs to a machine.
@@ -226,6 +227,7 @@ class TestWhatTheBundlePromises:
         allowed_targets = (
             "/etc/forge-publisher/settings.json",
             "/etc/forge-publisher/credential",
+            "/etc/forge-publisher/route-keys",
             "/etc/forge-publisher/known_hosts",
             "/var/lib/forge-evidence",
         )
@@ -365,6 +367,7 @@ class TestTheSandboxRunnerAddsNothingOfThisMachine:
         allowed_targets = (
             "/etc/forge-publisher/settings.json",
             "/etc/forge-publisher/credential",
+            "/etc/forge-publisher/route-keys",
             "/etc/forge-publisher/known_hosts",
             "/var/lib/forge-evidence",
             "/usr/bin/sbx",
@@ -447,3 +450,53 @@ class TestTheExampleNamesTheReleaseThatExists:
         assert "supported standalone up route. Follow ../estate/README.md" in compose and f"FORGE_IMAGE=forge:{version}" in (BUNDLE / ".env.example").read_text(), (
             f"compose.yaml's example tag does not name release {version}"
         )
+
+
+#: The publisher's own fragment, which the bundle composes in.
+FRAGMENT = BUNDLE.parents[1] / "src" / "forge" / "publisher" / "compose-fragment.yml"
+
+
+class TestTheKeysAreNeverMadeEmpty:
+    """13 October 2026. The publisher's keys are decrypted into a tmpfs at
+    start, so after a reboot they are absent until the attended start. A bind
+    in the short form CREATES a missing source as an empty, root-owned folder,
+    leaving debris and a publisher that restart-loops for no visible reason.
+    Both key mounts are written in the long form, read-only, with
+    ``create_host_path: false``, so Docker refuses to start instead. Read from
+    the fragment itself: no docker is needed to check what it says."""
+
+    def _mount(self, target: str) -> dict:
+        import yaml
+
+        volumes = yaml.safe_load(FRAGMENT.read_text())["services"]["forge-publisher"]["volumes"]
+        found = [v for v in volumes if isinstance(v, dict) and v.get("target") == target]
+        assert len(found) == 1, (
+            f"the publisher does not mount {target} exactly once in the long form: {volumes}"
+        )
+        assert not [
+            v for v in volumes if isinstance(v, str) and v.split(":")[-2:-1] == [target]
+        ], f"{target} is also mounted in the short form"
+        return found[0]
+
+    def test_both_key_mounts_are_read_only_and_never_created(self) -> None:
+        for target in ("/etc/forge-publisher/credential", "/etc/forge-publisher/route-keys"):
+            mount = self._mount(target)
+            assert mount["type"] == "bind"
+            assert mount["read_only"] is True, target
+            assert mount["bind"]["create_host_path"] is False, target
+
+    def test_the_publisher_wide_mount_keeps_its_setting_name(self) -> None:
+        assert self._mount("/etc/forge-publisher/credential")["source"] == (
+            "${FORGE_PUBLISHER_CREDENTIAL_FILE}"
+        )
+
+    def test_the_route_keys_folder_is_required_by_name(self) -> None:
+        source = self._mount("/etc/forge-publisher/route-keys")["source"]
+        assert source.startswith("${FORGE_PUBLISHER_ROUTE_KEYS_DIR:?"), source
+
+    def test_both_example_env_files_name_the_route_keys_folder(self) -> None:
+        for example in (BUNDLE / ".env.example", BUNDLE.parent / "estate" / ".env.example"):
+            lines = example.read_text().splitlines()
+            assert any(
+                line.startswith("FORGE_PUBLISHER_ROUTE_KEYS_DIR=/") for line in lines
+            ), f"{example} has no FORGE_PUBLISHER_ROUTE_KEYS_DIR line"

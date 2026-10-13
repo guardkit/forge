@@ -9,9 +9,10 @@
 # (forge/src/forge/publisher/__main__.py), and publication stays off until it
 # has passed that check:
 #
-#   1. the credential file is mounted READ-ONLY, into this service and into
-#      nothing else. It is not in the coordinator's settings, not in the
-#      runner's, and not in any sandbox's;
+#   1. the credential file, and the one folder of per-route keys, are mounted
+#      READ-ONLY, into this service and into nothing else, and a missing one
+#      stops the container rather than being made empty. Neither is in the
+#      coordinator's settings, the runner's, or any sandbox's;
 #   2. the ledger's FOLDER is mounted READ-ONLY. The publisher reads the
 #      record and writes nothing to it, ever. Why the folder and not the one
 #      file is written out below, where it is mounted;
@@ -103,9 +104,35 @@ services:
       # looked for a file that a clean machine does not have. The machine says
       # where its own copy is, in its env file, like every other path here.
       - ${FORGE_PUBLISHER_SETTINGS_FILE:?name the publisher's settings file in the env file}:/etc/forge-publisher/settings.json:ro
-      # THE ONE FILE THE CREDENTIAL IS IN. Read-only, and mounted nowhere else
-      # in this estate.
-      - ${FORGE_PUBLISHER_CREDENTIAL_FILE}:/etc/forge-publisher/credential:ro
+      # THE KEYS, BOTH WRITTEN IN LONG FORM (13 October 2026), so that each
+      # can say 'create_host_path: false'. The keys are decrypted into a
+      # tmpfs at start and are ABSENT after a reboot until the attended start.
+      # In the short form a missing source is CREATED by Docker as an empty,
+      # root-owned folder: debris in that tmpfs, and a publisher that
+      # restart-loops for a reason nobody can see. In this form Docker
+      # refuses to start the container and names the missing path.
+      #
+      # THE ONE FILE THE PUBLISHER-WIDE CREDENTIAL IS IN. Read-only, and
+      # mounted nowhere else in this estate.
+      - type: bind
+        source: ${FORGE_PUBLISHER_CREDENTIAL_FILE}
+        target: /etc/forge-publisher/credential
+        read_only: true
+        bind:
+          create_host_path: false
+      # THE ONE FOLDER EVERY ROUTE'S OWN KEY IS IN (13 October 2026). A route
+      # names a key by bare name, and that name is a file directly inside
+      # this folder and nowhere else. One folder, so a later project needs a
+      # new file and a new route, never a compose change. REQUIRED: on a
+      # machine with no route keys, point it at an empty folder (owned by the
+      # publisher's user, mode 700; each key in it mode 600). Read-only, and
+      # mounted nowhere else in this estate.
+      - type: bind
+        source: ${FORGE_PUBLISHER_ROUTE_KEYS_DIR:?name the folder of the publisher's per-route keys in the env file - an empty folder when there are none}
+        target: /etc/forge-publisher/route-keys
+        read_only: true
+        bind:
+          create_host_path: false
       # THE PINNED HOST KEYS for a remote reached over SSH (its settings then
       # say "known_hosts_file": "/etc/forge-publisher/known_hosts"). Not a
       # secret. Unset, an empty file stands in, and an SSH remote is refused.

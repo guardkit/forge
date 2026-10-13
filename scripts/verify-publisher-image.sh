@@ -33,7 +33,8 @@
 #      wall.
 #   7. IT CARRIES NO CREDENTIAL. The one file the credential lives in is
 #      MOUNTED at run time; an image that had one baked in would put it in
-#      every copy of that image for ever.
+#      every copy of that image for ever. The same holds for the folder the
+#      per-route keys are mounted at: nothing is there in the image.
 #
 # Nothing here names a target project's language, test runner, package
 # manager, database or layout. It asks about one image of this factory's own.
@@ -190,5 +191,11 @@ echo "  OK  no build    no docker client, no docker socket, no sandbox client, n
 docker run --rm --entrypoint sh "${IMAGE}" -c '[ ! -e /etc/forge-publisher/credential ]' \
     || fail "${IMAGE} has a file at /etc/forge-publisher/credential. The credential is MOUNTED at run time and is never in an image."
 echo "  OK  no secret   nothing at the path the credential is mounted at"
+# The same for the folder every route's own key is mounted at (13 October
+# 2026). Nothing at all may be there in the image: not a key, and not an empty
+# folder either, which would be where a key could be baked in later.
+docker run --rm --entrypoint sh "${IMAGE}" -c '[ ! -e /etc/forge-publisher/route-keys ] && [ ! -L /etc/forge-publisher/route-keys ]' \
+    || fail "${IMAGE} has something at /etc/forge-publisher/route-keys. The route keys are MOUNTED at run time, as one read-only folder, and are never in an image."
+echo "  OK  no route    nothing at the path the route keys are mounted at"
 
 echo "publisher image verification PASSED for ${IMAGE}"
