@@ -1234,6 +1234,9 @@ def test_listing_and_removal_use_only_the_preview_label() -> None:
             # A removal names only what the lease's own listing returned.
             assert not filters and set(argv[3:]) <= {"c1", "c2"}
             continue
+        if argv[1:3] == ["image", "inspect"]:
+            # Reads the labels of images the labelled listing returned.
+            continue
         assert filters and all(f.startswith(f"label={LEASE_LABEL}") for f in filters)
         if "--quiet" in argv:
             assert filters == [f"label={LEASE_LABEL}=pv000000000001"]
@@ -1366,6 +1369,127 @@ async def test_running_previews_that_cannot_be_listed_fail_the_preparation(
     evidence = await world.service.prepare(_request())
     assert evidence.state == "failed"
     assert evidence.failure_reason == "the preview's containers could not be listed"
+
+
+class ContractEngine:
+    """A container engine that answers only the commands Docker documents.
+
+    ``docker image ls`` has no ``.Label`` format field (its fields are ID,
+    Repository, Tag, Digest, CreatedSince, CreatedAt and Size), so asking for
+    one is answered the way Docker answers it: an error. ``ps``, ``network ls``
+    and ``volume ls`` do have ``.Label``.
+    """
+
+    def __init__(self) -> None:
+        self.argv: list[list[str]] = []
+        # name -> (lease label, running, compose project, image id)
+        self.containers = {
+            "notes-pv0-app-1": ("pv000000000001", True, "notes-pv0", "sha256:app"),
+        }
+        self.networks = {"notes-pv0_default": "pv000000000001"}
+        self.volumes = {"notes-pv0_data": "pv000000000001"}
+        # image id -> lease label; the second is left over by a crashed run.
+        self.images = {"sha256:app": "pv000000000001", "sha256:orphan": "pv0000000000aa"}
+
+    def __call__(self, argv) -> tuple[int, str, str]:
+        argv = list(argv)[1:]
+        self.argv.append(argv)
+        label = 'label=forge.preview.lease'
+        fmt = argv[argv.index("--format") + 1] if "--format" in argv else None
+        if argv[:2] == ["image", "ls"]:
+            if fmt is not None and ".Label" in fmt:
+                return 1, "", (
+                    'template: :1:2: executing "" at <.Label>: can\'t evaluate '
+                    "field Label in type *formatter.imageContext"
+                )
+            if argv == ["image", "ls", "--filter", label, "--format", "{{.ID}}"]:
+                return 0, "\n".join(self.images) + "\n", ""
+        if argv[:2] == ["image", "inspect"]:
+            assert argv[2:4] == ["--format", '{{index .Config.Labels "forge.preview.lease"}}']
+            return 0, "\n".join(self.images[i] for i in argv[4:]) + "\n", ""
+        if argv == ["ps", "--all", "--filter", label, "--format", '{{.Label "forge.preview.lease"}}']:
+            return 0, "\n".join(c[0] for c in self.containers.values()) + "\n", ""
+        if argv == ["ps", "--filter", label, "--format", '{{.Label "forge.preview.lease"}}']:
+            return 0, "\n".join(c[0] for c in self.containers.values() if c[1]) + "\n", ""
+        if argv == ["network", "ls", "--filter", label, "--format", '{{.Label "forge.preview.lease"}}']:
+            return 0, "\n".join(self.networks.values()) + "\n", ""
+        if argv == ["volume", "ls", "--filter", label, "--format", '{{.Label "forge.preview.lease"}}']:
+            return 0, "\n".join(self.volumes.values()) + "\n", ""
+        if argv == [
+            "ps", "--all", "--filter", "label=com.docker.compose.project=notes-pv0",
+            "--format", '{{.Names}} {{.Label "forge.preview.lease"}}',
+        ]:
+            lines = [f"{n} {c[0]}" for n, c in self.containers.items() if c[2] == "notes-pv0"]
+            return 0, "\n".join(lines) + "\n", ""
+        return 2, "", f"unexpected command: {argv}"
+
+
+#: The exact commands the listing sends, in order (for the Dell's own check).
+LISTING_ARGV = [
+    ["ps", "--all", "--filter", "label=forge.preview.lease", "--format", '{{.Label "forge.preview.lease"}}'],
+    ["network", "ls", "--filter", "label=forge.preview.lease", "--format", '{{.Label "forge.preview.lease"}}'],
+    ["volume", "ls", "--filter", "label=forge.preview.lease", "--format", '{{.Label "forge.preview.lease"}}'],
+    ["image", "ls", "--filter", "label=forge.preview.lease", "--format", "{{.ID}}"],
+    ["image", "inspect", "--format", '{{index .Config.Labels "forge.preview.lease"}}', "sha256:app", "sha256:orphan"],
+    ["ps", "--filter", "label=forge.preview.lease", "--format", '{{.Label "forge.preview.lease"}}'],
+    [
+        "ps", "--all", "--filter", "label=com.docker.compose.project=notes-pv0",
+        "--format", '{{.Names}} {{.Label "forge.preview.lease"}}',
+    ],
+]
+
+
+def test_the_listing_sends_only_documented_commands_and_finds_labelled_images() -> None:
+    engine = ContractEngine()
+    answer = list_preview_leases(engine, compose_project="notes-pv0")
+    assert engine.argv == LISTING_ARGV
+    # The lease that is left only as a labelled image is found too.
+    assert answer["leases"] == ["pv000000000001", "pv0000000000aa"]
+    assert answer["running"] == ["pv000000000001"]
+    assert answer["compose_containers"] == [
+        {"name": "notes-pv0-app-1", "lease": "pv000000000001"}
+    ]
+
+
+def test_an_image_listing_that_asks_for_label_is_refused_by_the_engine() -> None:
+    """The regression this guards: ``.Label`` on ``image ls`` is an error."""
+    engine = ContractEngine()
+    code, _out, err = engine(
+        ["docker", "image", "ls", "--filter", "label=forge.preview.lease",
+         "--format", '{{.Label "forge.preview.lease"}}']
+    )
+    assert code == 1 and "imageContext" in err
+
+
+def test_with_no_labelled_images_nothing_is_inspected() -> None:
+    engine = ContractEngine()
+    engine.images = {}
+    list_preview_leases(engine)
+    assert not any(argv[:2] == ["image", "inspect"] for argv in engine.argv)
+
+
+def test_the_teardown_commands_are_pinned() -> None:
+    lease = "pv000000000001"
+    engine = FakeImageEngine(
+        containers={"c1": ("sha256:app", lease)},
+        images={"sha256:app": lease},
+    )
+    remove_preview_resources(lease, engine)
+    selector = f"label=forge.preview.lease={lease}"
+    assert [argv[1:] for argv in engine.argv] == [
+        ["ps", "--all", "--quiet", "--filter", selector],
+        ["rm", "--force", "c1"],
+        ["network", "ls", "--quiet", "--filter", selector],
+        ["volume", "ls", "--quiet", "--filter", selector],
+        ["image", "ls", "--quiet", "--no-trunc", "--filter", selector],
+        ["ps", "--all", "--filter", "ancestor=sha256:app", "--format",
+         '{{.ID}} {{.Label "forge.preview.lease"}}'],
+        ["image", "rm", "sha256:app"],
+        ["ps", "--all", "--quiet", "--filter", selector],
+        ["network", "ls", "--quiet", "--filter", selector],
+        ["volume", "ls", "--quiet", "--filter", selector],
+        ["image", "ls", "--quiet", "--no-trunc", "--filter", selector],
+    ]
 
 
 def test_an_engine_that_cannot_be_asked_is_unknown_not_empty() -> None:
@@ -1668,6 +1792,109 @@ async def test_the_dispatch_carries_the_two_preview_legs(tmp_path: Path) -> None
     assert runner_calls["up"]["preview_env"] == {"FACTORY_PREVIEW_PORT": "8950"}
     assert runner_calls["up"]["cwd"] == "/tree"
     assert runner_calls["journey"]["feature"] == "FEAT-AB12"
+
+
+# ---------------------------------------------------------------------------
+# Cancellation never leaves a preview behind (Codex R8)
+# ---------------------------------------------------------------------------
+
+
+async def _cancel_when(world: World, blocked: "asyncio.Event", task: "asyncio.Task") -> None:
+    await asyncio.wait_for(blocked.wait(), timeout=5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.asyncio
+async def test_cancelled_while_waiting_for_a_slot(world: World) -> None:
+    await world.service.prepare(_request("build-1", "FEAT-AB12"))
+    await world.service.prepare(_request("build-2", "FEAT-CD34"))
+    blocked = asyncio.Event()
+
+    async def hold() -> None:
+        blocked.set()
+        await asyncio.Event().wait()
+
+    world.clock.on_sleep = hold
+    task = asyncio.create_task(world.service.prepare(_request("build-3", "FEAT-EF56")))
+    await _cancel_when(world, blocked, task)
+
+    lease = world.lease("pv000000000003")
+    assert (lease.state, lease.reason) == ("failed", "the preparation was cancelled")
+    assert lease.slot is None
+    assert "pv000000000003" in world.venue.named("remove_tree")
+
+
+@pytest.mark.asyncio
+async def test_cancelled_right_after_the_preview_was_started(world: World) -> None:
+    blocked = asyncio.Event()
+
+    async def containers(compose_project: str) -> Any:
+        blocked.set()
+        await asyncio.Event().wait()
+
+    world.venue.preview_containers = containers
+    task = asyncio.create_task(world.service.prepare(_request()))
+    await _cancel_when(world, blocked, task)
+
+    assert world.dispatch.legs() == ["preview_up"]
+    lease = world.lease("pv000000000001")
+    assert (lease.state, lease.reason) == ("failed", "the preparation was cancelled")
+    assert world.venue.named("remove_project") == ["pv000000000001"]
+    assert world.store.live() == []
+
+
+@pytest.mark.asyncio
+async def test_cancelled_during_the_journey(world: World) -> None:
+    blocked = asyncio.Event()
+    real = world.dispatch.__call__
+
+    async def dispatch(**kwargs: Any) -> Any:
+        if kwargs["leg"] == "preview_journey":
+            blocked.set()
+            await asyncio.Event().wait()
+        return await real(**kwargs)
+
+    world.service._dispatch = dispatch
+    task = asyncio.create_task(world.service.prepare(_request()))
+    await _cancel_when(world, blocked, task)
+
+    lease = world.lease("pv000000000001")
+    assert (lease.state, lease.reason) == ("failed", "the preparation was cancelled")
+    assert world.venue.named("remove_project") == ["pv000000000001"]
+    assert world.store.live() == []
+
+
+@pytest.mark.asyncio
+async def test_the_sweep_reclaims_a_preparation_that_never_finished(world: World) -> None:
+    stale = PreviewLease(
+        lease_id="pv0000000000bb", slot=0, port=8950, token="t", project=PROJECT,
+        feature_id="FEAT-AB12", build_id="b1", candidate_sha=SHA_CAND,
+        candidate_tree=TREE_CAND, preview_tree=None, run_id="r1",
+        compose_project="notes-pv0", evidence_dir=None, state="preparing", reason=None,
+        created_at=(START - timedelta(days=30)).isoformat(),
+        app_expires_at=START.isoformat(), evidence_expires_at=START.isoformat(),
+    )
+    world.store.insert(stale, now=START)
+    young = PreviewLease(
+        **{
+            **stale.__dict__,
+            "lease_id": "pv0000000000cc",
+            "slot": 1,
+            "port": 8951,
+            "created_at": (START - timedelta(minutes=50)).isoformat(),
+        }
+    )
+    world.store.insert(young, now=START)
+
+    await world.service.sweep(now=START)
+
+    ended = world.lease("pv0000000000bb")
+    assert (ended.state, ended.reason) == ("failed", "its preparation never finished")
+    assert world.venue.named("remove_project") == ["pv0000000000bb"]
+    # One that could still be running is left alone.
+    assert world.lease("pv0000000000cc").state == "preparing"
 
 
 def test_the_ledger_allows_one_live_lease_per_port(connection: sqlite3.Connection) -> None:
