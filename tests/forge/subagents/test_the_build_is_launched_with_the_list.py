@@ -210,6 +210,57 @@ def test_a_name_in_the_runners_own_environment_is_not_inherited(
     assert launched.env[GUARDKIT_MEMORY_PROJECT_ENV] == "widget_shop"
 
 
+#: A release identity as the sandbox's start script checked it.
+IDENTITY = "d" * 64
+
+
+def test_the_release_identity_reaches_the_build(
+    launched: _Recorder,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Which release image the build ran in (13 October 2026). The build
+    system records it beside each build; this list left it out, so every
+    build recorded "not set"."""
+    monkeypatch.setenv("FORGE_IMAGE_IDENTITY", IDENTITY)
+    caplog.set_level("DEBUG")
+
+    _run(
+        launched,
+        {
+            "build_id": "build-FEAT-L-6",
+            "feature_id": "FEAT-L",
+            "correlation_id": "corr-L",
+            "memory_project": "widget_shop",
+        },
+        tmp_path,
+    )
+
+    assert launched.env["FORGE_IMAGE_IDENTITY"] == IDENTITY
+    assert IDENTITY not in caplog.text
+
+
+def test_no_release_identity_means_none_is_set(
+    launched: _Recorder, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On the host nothing sets it, and the build is handed nothing."""
+    monkeypatch.delenv("FORGE_IMAGE_IDENTITY", raising=False)
+
+    _run(
+        launched,
+        {
+            "build_id": "build-FEAT-L-7",
+            "feature_id": "FEAT-L",
+            "correlation_id": "corr-L",
+            "memory_project": "widget_shop",
+        },
+        tmp_path,
+    )
+
+    assert "FORGE_IMAGE_IDENTITY" not in launched.env
+
+
 def test_a_memory_name_that_is_not_text_is_read_as_nothing_recorded() -> None:
     assert runner_module._memory_project_for_build({"memory_project": 17}) is None
     assert runner_module._memory_project_for_build({"memory_project": "  "}) is None

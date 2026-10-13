@@ -206,6 +206,13 @@ LAUNCH_SETTINGS: tuple[tuple[str, str], ...] = (
         "the bus a build publishes its progress on; without it the build runs "
         "blind and nothing can be shown while it works",
     ),
+    (
+        "FORGE_IMAGE_IDENTITY",
+        "WHICH release image the build ran in (13 October 2026): the identity "
+        "the sandbox's start script checked the running image against, which "
+        "the build system records beside each build; unset, it records 'not "
+        "set', as on the host. A hash, not a secret, and never printed here",
+    ),
     # --- the model seat ----------------------------------------------------
     (
         "OPENAI_BASE_URL",

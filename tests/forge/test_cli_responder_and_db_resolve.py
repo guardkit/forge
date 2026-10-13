@@ -86,15 +86,13 @@ class TestResolveResponder:
 
 class TestConfigExpectedApprover:
     def test_reads_pinned_approver_from_forge_config(self) -> None:
-        ctx = SimpleNamespace(
-            obj=SimpleNamespace(approval=SimpleNamespace(expected_approver="pinned"))
-        )
-        assert config_expected_approver(ctx) == "pinned"
+        config = SimpleNamespace(approval=SimpleNamespace(expected_approver="pinned"))
+        assert config_expected_approver(config) == "pinned"
 
     def test_returns_none_when_no_config_loaded(self) -> None:
-        assert config_expected_approver(SimpleNamespace(obj=None)) is None
+        assert config_expected_approver(None) is None
 
-    def test_returns_none_when_ctx_has_no_obj(self) -> None:
+    def test_returns_none_when_config_has_no_approval(self) -> None:
         assert config_expected_approver(SimpleNamespace()) is None
 
 
@@ -123,7 +121,7 @@ class TestResolveDbPath:
 
 
 # ---------------------------------------------------------------------------
-# try_inject_paused_cancel — responder threading (break #3)
+# pending_gate_request / send_paused_cancel — responder threading (break #3)
 # ---------------------------------------------------------------------------
 
 
@@ -143,33 +141,43 @@ class TestPausedCancelThreadsResponder:
 
         monkeypatch.setattr(gate_inject, "_inject_synthetic_reject", _spy)
 
-        # A row carrying a parseable pending_approval_request_id.
+        # A PAUSED row carrying a parseable pending_approval_request_id.
         from forge.gating.identity import derive_request_id
+        from forge.lifecycle.state_machine import BuildState
 
         rid = derive_request_id(
             build_id="build-X", stage_label="Implementation", attempt_count=2
         )
-        row = SimpleNamespace(pending_approval_request_id=rid, correlation_id="corr")
+        row = SimpleNamespace(
+            status=BuildState.PAUSED,
+            pending_approval_request_id=rid,
+            correlation_id="corr",
+        )
         runtime = SimpleNamespace(
             persistence=SimpleNamespace(get_build_row=lambda _b: row)
         )
 
-        ok = gate_inject.try_inject_paused_cancel(
-            runtime, build_id="build-X", reason="cli cancel", responder="U0PINNED"
+        request = gate_inject.pending_gate_request(runtime, build_id="build-X")
+        assert request is not None
+        gate_inject.send_paused_cancel(
+            build_id="build-X",
+            request=request,
+            reason="cli cancel",
+            responder="U0PINNED",
         )
 
-        assert ok is True
         assert captured["responder"] == "U0PINNED"
         assert captured["attempt_count"] == 2
 
     def test_no_pending_id_falls_back(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        row = SimpleNamespace(pending_approval_request_id=None, correlation_id=None)
+        from forge.lifecycle.state_machine import BuildState
+
+        row = SimpleNamespace(
+            status=BuildState.PAUSED,
+            pending_approval_request_id=None,
+            correlation_id=None,
+        )
         runtime = SimpleNamespace(
             persistence=SimpleNamespace(get_build_row=lambda _b: row)
         )
-        assert (
-            gate_inject.try_inject_paused_cancel(
-                runtime, build_id="b", reason="r", responder="U0"
-            )
-            is False
-        )
+        assert gate_inject.pending_gate_request(runtime, build_id="b") is None

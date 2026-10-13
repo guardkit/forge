@@ -668,6 +668,12 @@ FACTORY_ENV_NAMES=(
   GUARDKIT_QAV_SHADOW
   GUARDKIT_QAV_SHADOW_URL
   GUARDKIT_QAV_PROBE_URL
+  # WHICH RELEASE IMAGE THE BUILD RAN IN (13 October 2026). The identity this
+  # script has just checked the running image against, above, so it names the
+  # image actually in use. The build system records it beside each build;
+  # this list left it out, so every build said "not set". By name only, like
+  # everything here.
+  FORGE_IMAGE_IDENTITY
   FORGE_SIDECAR_IN_SANDBOX
   OPENAI_BASE_URL
   OPENAI_API_KEY
@@ -877,8 +883,50 @@ stop_everything() {
   return 1
 }
 
+# --- one checkout per engine -------------------------------------------------
+# THE ENGINE CLAIM (13 October 2026). The start-up sweep removes every build's
+# fixtures on this engine, and with the default prefix two checkouts share
+# container names, so only one checkout may use the engine. Its claim is a
+# container that is created and never started, under one fixed name, labelled
+# with this checkout's state hash. The engine allows one container per name,
+# so taking it is atomic. Both the stop and the start take or confirm it before
+# they stop or remove anything. It is made from the release image already in
+# this engine (never pulled), and this script never removes it.
+ENGINE_CLAIM_NAME="forge-sandbox-engine-owner"
+ENGINE_CLAIM_LABEL="forge.sandbox.engine.owner"
+CHECKOUT_HASH="${STATE_ROOT##*/}"
+CLAIM_REFUSAL=""
+take_or_confirm_the_engine_claim() {
+  local image="$1" holder="" said="no release image is named (FORGE_IMAGE is not set)" complaint=""
+  if [[ -n "${image}" ]] &&
+     said="$("${DOCKER}" create --name "${ENGINE_CLAIM_NAME}" \
+       --label "${ENGINE_CLAIM_LABEL}=${CHECKOUT_HASH}" \
+       --pull never --entrypoint true "${image}" 2>&1 >/dev/null)"; then
+    log "this checkout (${CHECKOUT_HASH}) now holds this sandbox's engine: ${ENGINE_CLAIM_NAME}"
+    return 0
+  fi
+  # The label is read from the answer alone; a warning on the side is not it.
+  complaint="$(mktemp)"
+  if ! holder="$("${DOCKER}" container inspect --format "{{index .Config.Labels \"${ENGINE_CLAIM_LABEL}\"}}" "${ENGINE_CLAIM_NAME}" 2>"${complaint}")"; then
+    CLAIM_REFUSAL="this checkout could not create the engine claim from ${image:-no image}: $(printf '%s' "${said}" | tr '\n' ' ' | cut -c1-300). And the engine would not say who holds it: $(tr '\n' ' ' < "${complaint}" | cut -c1-300)"
+    rm -f "${complaint}"
+    return 1
+  fi
+  rm -f "${complaint}"
+  holder="$(only_the_line_endings "${holder}")"
+  if [[ "${holder}" == "${CHECKOUT_HASH}" ]]; then
+    return 0
+  fi
+  CLAIM_REFUSAL="this sandbox's engine is held by another checkout (state hash ${holder:-not recorded}; this one is ${CHECKOUT_HASH}), and only one checkout may use an engine. If that checkout no longer exists, remove the container ${ENGINE_CLAIM_NAME} to release the engine."
+  return 1
+}
+
 case "${1:-start}" in
   stop)
+    if ! take_or_confirm_the_engine_claim "${IMAGE}"; then
+      log "FATAL: ${CLAIM_REFUSAL} Nothing was stopped or removed."
+      exit 5
+    fi
     stop_everything
     exit $?
     ;;
@@ -910,8 +958,13 @@ printf '%s %s\n' "$$" "$(process_birth_time $$)" > "${PID_FILE}.tmp"
 mv "${PID_FILE}.tmp" "${PID_FILE}"
 
 STOPPING=0
+# Containers are removed on the way out only once this checkout holds the
+# engine claim (below). Before that they may be another checkout's.
+ENGINE_CLAIM_HELD=0
 cleanup() {
-  remove_both_containers
+  if ((ENGINE_CLAIM_HELD == 1)); then
+    remove_both_containers
+  fi
   rm -f "${PID_FILE}"
 }
 trap cleanup EXIT
@@ -1053,6 +1106,11 @@ if [[ "${SANDBOX_RUNNER_BOOTSTRAP_ONLY:-}" == "1" ]]; then
   rm -f "${PID_FILE}"
   exit 0
 fi
+
+if ! take_or_confirm_the_engine_claim "${IMAGE_REFERENCE}"; then
+  refuse "${CLAIM_REFUSAL} Nothing was started, stopped or removed. Refusing to start."
+fi
+ENGINE_CLAIM_HELD=1
 
 # --- step 3: the folders the two containers share ---------------------------
 # Each one is a folder of THIS SANDBOX's own filesystem, made here before
@@ -1520,14 +1578,24 @@ start_helper() {
 # started live on this sandbox's engine and carry on. They carry GuardKit's
 # fixture label, and before a runner starts no build can be running, so every
 # one of them is removed here. Never anything without that label.
+# Their compose networks and volumes carry the same label and go too, after the
+# containers (13 October 2026). One still in use is left and said, not forced.
 remove_leftover_fixtures() {
-  local ids=""
+  local ids="" kind=""
   ids="$("${DOCKER}" ps --all --quiet --filter "label=guardkit.fixture.owner" 2>/dev/null | tr -d '\r' || true)"
   if [[ -n "${ids}" ]]; then
     log "removing $(printf '%s\n' "${ids}" | wc -l | tr -d ' ') fixture container(s) a build left behind before this runner starts"
     # shellcheck disable=SC2086 # one id per word, by construction
     "${DOCKER}" rm --force ${ids} >/dev/null 2>&1 || log "note: not every leftover fixture container could be removed"
   fi
+  for kind in network volume; do
+    ids="$("${DOCKER}" "${kind}" ls --quiet --filter "label=guardkit.fixture.owner" 2>/dev/null | tr -d '\r' || true)"
+    if [[ -n "${ids}" ]]; then
+      log "removing $(printf '%s\n' "${ids}" | wc -l | tr -d ' ') fixture ${kind}(s) a build left behind"
+      # shellcheck disable=SC2086 # one id per word, by construction
+      "${DOCKER}" "${kind}" rm ${ids} >/dev/null 2>&1 || log "note: not every leftover fixture ${kind} could be removed (one still in use is left)"
+    fi
+  done
 }
 
 start_runner() {
@@ -1595,13 +1663,31 @@ ensure_helper() {
   remove_container "${HELPER_NAME}"
   start_helper
 }
+# THE RUNNER IS MADE AGAIN ONLY ONCE THE OLD ONE IS CONFIRMED GONE (13 October
+# 2026). Every build runs inside it, and start_runner's sweep removes every
+# build's fixtures, so a runner that would not go, or an engine that will not
+# say, means nothing is swept and nothing is started; RUNNER_NOT_GONE then
+# says which. (Called as a plain command, so `set -e` still covers the start.)
+RUNNER_NOT_GONE=""
 ensure_runner() {
+  local answer=0
+  RUNNER_NOT_GONE=""
   remove_container "${RUNNER_NAME}"
-  start_runner
+  container_exists "${RUNNER_NAME}" || answer=$?
+  if ((answer == 1)); then
+    start_runner
+  elif ((answer == 0)); then
+    RUNNER_NOT_GONE="the old build runner ${RUNNER_NAME} is still there after it was asked to go"
+  else
+    RUNNER_NOT_GONE="this sandbox's own engine would not say whether the old build runner ${RUNNER_NAME} has gone (${WHY_THE_ENGINE_WOULD_NOT_SAY})"
+  fi
 }
 
 ensure_helper
 ensure_runner
+if [[ -n "${RUNNER_NOT_GONE}" ]]; then
+  refuse "${RUNNER_NOT_GONE}. Its builds may still be running, so no leftover fixture was removed and no runner was started. Refusing to start."
+fi
 
 # "BOTH CONTAINERS ARE UP" ONLY WHEN THEY ARE (2 October 2026, after the re-check of
 # the network change). `docker run --detach` succeeds as soon as a container is
@@ -1737,5 +1823,12 @@ while ((STOPPING == 0)); do
   # cannot repeat round after round.
   watch_one "the deploy helper" "${HELPER_NAME}" || { ensure_helper; confirm_the_helper || true; }
   ((STOPPING == 1)) && break
-  watch_one "the build runner" "${RUNNER_NAME}" || { ensure_runner; confirm_the_runner || true; }
+  watch_one "the build runner" "${RUNNER_NAME}" || {
+    ensure_runner
+    if [[ -z "${RUNNER_NOT_GONE}" ]]; then
+      confirm_the_runner || true
+    else
+      log "${RUNNER_NOT_GONE}; nothing was swept or started, and it is tried again in ${RESTART_SECONDS}s"
+    fi
+  }
 done

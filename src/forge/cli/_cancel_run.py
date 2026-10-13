@@ -17,6 +17,11 @@ hardening:
   responder (default = the gate's ``expected_approver``) so an identity-pinned
   approval gate accepts it instead of rejecting the old hardcoded ``"rich"``
   (break #3).
+* **A cancel the card will accept, confirmed** (12 October 2026): on the
+  paused path the approver comes from the coordinator's settings file
+  (``--config`` / ./forge.yaml, else ``$FORGE_CONFIG_PATH``), never from the
+  login name; a rejection the card would refuse is not sent, and success is
+  reported only after the row reads CANCELLED.
 """
 
 from __future__ import annotations
@@ -24,24 +29,41 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+import time
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 import click
 
-from forge.cli._cancel_gate_inject import try_inject_paused_cancel
+from forge.cli._cancel_gate_inject import (
+    PausedCardChanged,
+    pending_gate_request,
+    send_paused_cancel,
+)
 from forge.cli._recorded_run import interrupt_recorded_run
 from forge.cli._db_resolve import resolve_db_path
-from forge.cli._responder import config_expected_approver, resolve_responder
+from forge.cli._responder import (
+    config_expected_approver,
+    resolve_gate_responder,
+    resolve_responder,
+)
 from forge.cli.runtime import build_cli_runtime
 from forge.lifecycle.state_machine import TERMINAL_STATES, BuildState
 
 __all__ = ["execute_cancel"]
 
+#: How long a cancel sent to a card waits to read CANCELLED back.
+CONFIRM_SECONDS: float = 30.0
+#: How often it re-reads the row while it waits.
+POLL_SECONDS: float = 0.5
+
 
 def _selected_config(ctx: Any) -> Any:
     """The configuration this command was given (``--config`` / ./forge.yaml),
-    else the one ``FORGE_CONFIG_PATH`` names; ``None`` when there is none."""
+    else the one ``FORGE_CONFIG_PATH`` names; ``None`` when there is none.
+
+    A file ``FORGE_CONFIG_PATH`` names that cannot be loaded stops the command
+    with one sentence and exit 2, before anything is sent or cancelled."""
     if getattr(ctx, "obj", None) is not None:
         return ctx.obj
     path = os.environ.get("FORGE_CONFIG_PATH")
@@ -49,7 +71,14 @@ def _selected_config(ctx: Any) -> Any:
         return None
     from forge.config.loader import load_config
 
-    return load_config(Path(path))
+    try:
+        return load_config(Path(path))
+    except Exception as exc:  # noqa: BLE001 — any load failure is said plainly
+        detail = (str(exc).strip().splitlines() or [type(exc).__name__])[0]
+        _refuse(
+            f"the settings file $FORGE_CONFIG_PATH names ({path}) could not be "
+            f"loaded: {detail}. Fix it or pass --config. Nothing was cancelled."
+        )
 
 
 def execute_cancel(
@@ -59,6 +88,8 @@ def execute_cancel(
     reason: str,
     responder: str | None,
     db_path: Path | None,
+    confirm_seconds: float = CONFIRM_SECONDS,
+    poll_seconds: float = POLL_SECONDS,
 ) -> None:
     """Resolve, then cancel, an active-or-recent build for ``identifier``.
 
@@ -69,6 +100,9 @@ def execute_cancel(
         reason: Free-text reason recorded on the cancel.
         responder: Explicit ``--responder`` identity, or ``None`` to resolve it.
         db_path: Explicit ``--db`` path, or ``None`` to resolve canonically.
+        confirm_seconds: How long a cancel sent to a card waits to read
+            CANCELLED back before saying the card did not accept it.
+        poll_seconds: How often it re-reads the row while it waits.
 
     Exits the process (``sys.exit(2)``) — loudly, naming the resolved DB — when
     the ledger is missing or carries no such run.
@@ -96,17 +130,17 @@ def execute_cancel(
         sys.exit(2)
 
     # PAUSED-at-gate → the daemon's live gate frame owns the CANCELLED
-    # transition via a synthetic reject (§D6). The reject is stamped with the
-    # pinned responder (default = the gate's expected_approver) so an
-    # identity-pinned gate accepts it (O-02 break #3).
-    pinned = config_expected_approver(ctx)
-    if build.status is BuildState.PAUSED and try_inject_paused_cancel(
+    # transition via a synthetic reject (§D6), signed by the approver the
+    # card is pinned to (O-02 break #3).
+    if build.status is BuildState.PAUSED and _cancel_at_card(
         runtime,
+        ctx=ctx,
         build_id=build.build_id,
         reason=reason,
-        responder=resolve_responder(responder, pinned=pinned),
+        responder=responder,
+        confirm_seconds=confirm_seconds,
+        poll_seconds=poll_seconds,
     ):
-        click.echo(f"forge cancel: {build.build_id} — synthetic reject injected.")
         return
 
     # A build that may be running: send its recorded run the ordinary
@@ -133,3 +167,86 @@ def execute_cancel(
     )
     click.echo(f"Cancelled {build.build_id}: {outcome.status.value}")
     click.echo(outcome.rationale)
+
+
+def _refuse(message: str) -> NoReturn:
+    click.echo(f"forge cancel: {message}", err=True)
+    sys.exit(2)
+
+
+def _cancel_at_card(
+    runtime: Any,
+    *,
+    ctx: Any,
+    build_id: str,
+    reason: str,
+    responder: str | None,
+    confirm_seconds: float,
+    poll_seconds: float,
+) -> bool:
+    """Cancel a build waiting at its card by answering the card; confirm it.
+
+    Returns ``False`` only when there is no row, or it carries no pending
+    request id or a legacy one, so the caller keeps today's direct cancel. Otherwise it
+    returns ``True`` once the row reads CANCELLED, or exits non-zero. It
+    never falls back to the direct cancel once the card is known: that would
+    mark the build cancelled while the gate is still waiting.
+    """
+    try:
+        request = pending_gate_request(runtime, build_id=build_id)
+    except PausedCardChanged as exc:
+        _refuse(f"{build_id} — {exc} Nothing was sent; check the build and try again.")
+    if request is None:
+        return False
+
+    approver = config_expected_approver(_selected_config(ctx))
+    signer = resolve_gate_responder(responder, approver=approver)
+    if signer is None:
+        _refuse(
+            f"{build_id} is waiting at its card, and this command cannot tell "
+            "who may answer it: there is no --responder, no $FORGE_RESPONDER "
+            "and no approver in a settings file. Run it with the coordinator's "
+            "settings file (forge --config /etc/forge/forge.yaml cancel ..., or "
+            "set $FORGE_CONFIG_PATH). Nothing was sent."
+        )
+    if approver is not None and signer != approver:
+        _refuse(
+            f"{build_id} — its card accepts an answer only from {approver!r}, "
+            f"and this cancel would be signed {signer!r}, so the card would "
+            "refuse it. Nothing was sent."
+        )
+
+    send_paused_cancel(
+        build_id=build_id, request=request, reason=reason, responder=signer
+    )
+    status = _status_after_cancel(runtime, build_id, confirm_seconds, poll_seconds)
+    if status is BuildState.CANCELLED:
+        click.echo(
+            f"forge cancel: {build_id} — cancelled (the card accepted the "
+            f"rejection signed {signer!r})."
+        )
+        return True
+    if status is BuildState.PAUSED:
+        _refuse(
+            f"{build_id} — the card did not accept the rejection signed "
+            f"{signer!r}; after {confirm_seconds:g} seconds the build is still "
+            "waiting at its card."
+        )
+    _refuse(
+        f"{build_id} was not cancelled by this command: it is now "
+        f"{status.value if status is not None else 'missing'} "
+        "(the card was answered first)."
+    )
+
+
+def _status_after_cancel(
+    runtime: Any, build_id: str, confirm_seconds: float, poll_seconds: float
+) -> BuildState | None:
+    """Re-read the row until it leaves PAUSED or ``confirm_seconds`` pass."""
+    deadline = time.monotonic() + confirm_seconds
+    while True:
+        row = runtime.persistence.get_build_row(build_id)
+        status = row.status if row is not None else None
+        if status is not BuildState.PAUSED or time.monotonic() >= deadline:
+            return status
+        time.sleep(poll_seconds)
