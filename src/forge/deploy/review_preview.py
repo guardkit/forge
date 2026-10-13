@@ -806,12 +806,15 @@ def list_preview_leases(
     """
     engine = shutil.which("docker") or "docker"
     found: set[str] = set()
+    # ``.Label`` is a documented format field of ``docker ps``, ``network ls``
+    # and ``volume ls`` — but NOT of ``docker image ls`` (its fields are ID,
+    # Repository, Tag, Digest, CreatedSince, CreatedAt and Size). Images are
+    # therefore listed by ID and their labels read with ``image inspect``.
     template = '{{.Label "' + LEASE_LABEL + '"}}'
     for kind in (
         ["ps", "--all"],
         ["network", "ls"],
         ["volume", "ls"],
-        ["image", "ls"],
     ):
         lines = _engine_lines(
             run,
@@ -820,6 +823,28 @@ def list_preview_leases(
         if lines is None:
             return {"refusal": "the container engine could not be asked about previews"}
         found.update(line for line in lines if _LEASE_ID.match(line))
+    image_ids = _engine_lines(
+        run,
+        [engine, "image", "ls", "--filter", f"label={LEASE_LABEL}", "--format", "{{.ID}}"],
+    )
+    if image_ids is None:
+        return {"refusal": "the container engine could not be asked about previews"}
+    image_ids = sorted(set(image_ids))
+    if image_ids:
+        labels = _engine_lines(
+            run,
+            [
+                engine,
+                "image",
+                "inspect",
+                "--format",
+                '{{index .Config.Labels "' + LEASE_LABEL + '"}}',
+                *image_ids,
+            ],
+        )
+        if labels is None:
+            return {"refusal": "the container engine could not be asked about previews"}
+        found.update(line for line in labels if _LEASE_ID.match(line))
     running = _engine_lines(
         run, [engine, "ps", "--filter", f"label={LEASE_LABEL}", "--format", template]
     )

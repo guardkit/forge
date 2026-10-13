@@ -1234,6 +1234,9 @@ def test_listing_and_removal_use_only_the_preview_label() -> None:
             # A removal names only what the lease's own listing returned.
             assert not filters and set(argv[3:]) <= {"c1", "c2"}
             continue
+        if argv[1:3] == ["image", "inspect"]:
+            # Reads the labels of images the labelled listing returned.
+            continue
         assert filters and all(f.startswith(f"label={LEASE_LABEL}") for f in filters)
         if "--quiet" in argv:
             assert filters == [f"label={LEASE_LABEL}=pv000000000001"]
@@ -1366,6 +1369,127 @@ async def test_running_previews_that_cannot_be_listed_fail_the_preparation(
     evidence = await world.service.prepare(_request())
     assert evidence.state == "failed"
     assert evidence.failure_reason == "the preview's containers could not be listed"
+
+
+class ContractEngine:
+    """A container engine that answers only the commands Docker documents.
+
+    ``docker image ls`` has no ``.Label`` format field (its fields are ID,
+    Repository, Tag, Digest, CreatedSince, CreatedAt and Size), so asking for
+    one is answered the way Docker answers it: an error. ``ps``, ``network ls``
+    and ``volume ls`` do have ``.Label``.
+    """
+
+    def __init__(self) -> None:
+        self.argv: list[list[str]] = []
+        # name -> (lease label, running, compose project, image id)
+        self.containers = {
+            "notes-pv0-app-1": ("pv000000000001", True, "notes-pv0", "sha256:app"),
+        }
+        self.networks = {"notes-pv0_default": "pv000000000001"}
+        self.volumes = {"notes-pv0_data": "pv000000000001"}
+        # image id -> lease label; the second is left over by a crashed run.
+        self.images = {"sha256:app": "pv000000000001", "sha256:orphan": "pv0000000000aa"}
+
+    def __call__(self, argv) -> tuple[int, str, str]:
+        argv = list(argv)[1:]
+        self.argv.append(argv)
+        label = 'label=forge.preview.lease'
+        fmt = argv[argv.index("--format") + 1] if "--format" in argv else None
+        if argv[:2] == ["image", "ls"]:
+            if fmt is not None and ".Label" in fmt:
+                return 1, "", (
+                    'template: :1:2: executing "" at <.Label>: can\'t evaluate '
+                    "field Label in type *formatter.imageContext"
+                )
+            if argv == ["image", "ls", "--filter", label, "--format", "{{.ID}}"]:
+                return 0, "\n".join(self.images) + "\n", ""
+        if argv[:2] == ["image", "inspect"]:
+            assert argv[2:4] == ["--format", '{{index .Config.Labels "forge.preview.lease"}}']
+            return 0, "\n".join(self.images[i] for i in argv[4:]) + "\n", ""
+        if argv == ["ps", "--all", "--filter", label, "--format", '{{.Label "forge.preview.lease"}}']:
+            return 0, "\n".join(c[0] for c in self.containers.values()) + "\n", ""
+        if argv == ["ps", "--filter", label, "--format", '{{.Label "forge.preview.lease"}}']:
+            return 0, "\n".join(c[0] for c in self.containers.values() if c[1]) + "\n", ""
+        if argv == ["network", "ls", "--filter", label, "--format", '{{.Label "forge.preview.lease"}}']:
+            return 0, "\n".join(self.networks.values()) + "\n", ""
+        if argv == ["volume", "ls", "--filter", label, "--format", '{{.Label "forge.preview.lease"}}']:
+            return 0, "\n".join(self.volumes.values()) + "\n", ""
+        if argv == [
+            "ps", "--all", "--filter", "label=com.docker.compose.project=notes-pv0",
+            "--format", '{{.Names}} {{.Label "forge.preview.lease"}}',
+        ]:
+            lines = [f"{n} {c[0]}" for n, c in self.containers.items() if c[2] == "notes-pv0"]
+            return 0, "\n".join(lines) + "\n", ""
+        return 2, "", f"unexpected command: {argv}"
+
+
+#: The exact commands the listing sends, in order (for the Dell's own check).
+LISTING_ARGV = [
+    ["ps", "--all", "--filter", "label=forge.preview.lease", "--format", '{{.Label "forge.preview.lease"}}'],
+    ["network", "ls", "--filter", "label=forge.preview.lease", "--format", '{{.Label "forge.preview.lease"}}'],
+    ["volume", "ls", "--filter", "label=forge.preview.lease", "--format", '{{.Label "forge.preview.lease"}}'],
+    ["image", "ls", "--filter", "label=forge.preview.lease", "--format", "{{.ID}}"],
+    ["image", "inspect", "--format", '{{index .Config.Labels "forge.preview.lease"}}', "sha256:app", "sha256:orphan"],
+    ["ps", "--filter", "label=forge.preview.lease", "--format", '{{.Label "forge.preview.lease"}}'],
+    [
+        "ps", "--all", "--filter", "label=com.docker.compose.project=notes-pv0",
+        "--format", '{{.Names}} {{.Label "forge.preview.lease"}}',
+    ],
+]
+
+
+def test_the_listing_sends_only_documented_commands_and_finds_labelled_images() -> None:
+    engine = ContractEngine()
+    answer = list_preview_leases(engine, compose_project="notes-pv0")
+    assert engine.argv == LISTING_ARGV
+    # The lease that is left only as a labelled image is found too.
+    assert answer["leases"] == ["pv000000000001", "pv0000000000aa"]
+    assert answer["running"] == ["pv000000000001"]
+    assert answer["compose_containers"] == [
+        {"name": "notes-pv0-app-1", "lease": "pv000000000001"}
+    ]
+
+
+def test_an_image_listing_that_asks_for_label_is_refused_by_the_engine() -> None:
+    """The regression this guards: ``.Label`` on ``image ls`` is an error."""
+    engine = ContractEngine()
+    code, _out, err = engine(
+        ["docker", "image", "ls", "--filter", "label=forge.preview.lease",
+         "--format", '{{.Label "forge.preview.lease"}}']
+    )
+    assert code == 1 and "imageContext" in err
+
+
+def test_with_no_labelled_images_nothing_is_inspected() -> None:
+    engine = ContractEngine()
+    engine.images = {}
+    list_preview_leases(engine)
+    assert not any(argv[:2] == ["image", "inspect"] for argv in engine.argv)
+
+
+def test_the_teardown_commands_are_pinned() -> None:
+    lease = "pv000000000001"
+    engine = FakeImageEngine(
+        containers={"c1": ("sha256:app", lease)},
+        images={"sha256:app": lease},
+    )
+    remove_preview_resources(lease, engine)
+    selector = f"label=forge.preview.lease={lease}"
+    assert [argv[1:] for argv in engine.argv] == [
+        ["ps", "--all", "--quiet", "--filter", selector],
+        ["rm", "--force", "c1"],
+        ["network", "ls", "--quiet", "--filter", selector],
+        ["volume", "ls", "--quiet", "--filter", selector],
+        ["image", "ls", "--quiet", "--no-trunc", "--filter", selector],
+        ["ps", "--all", "--filter", "ancestor=sha256:app", "--format",
+         '{{.ID}} {{.Label "forge.preview.lease"}}'],
+        ["image", "rm", "sha256:app"],
+        ["ps", "--all", "--quiet", "--filter", selector],
+        ["network", "ls", "--quiet", "--filter", selector],
+        ["volume", "ls", "--quiet", "--filter", selector],
+        ["image", "ls", "--quiet", "--no-trunc", "--filter", selector],
+    ]
 
 
 def test_an_engine_that_cannot_be_asked_is_unknown_not_empty() -> None:
