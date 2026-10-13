@@ -668,6 +668,12 @@ FACTORY_ENV_NAMES=(
   GUARDKIT_QAV_SHADOW
   GUARDKIT_QAV_SHADOW_URL
   GUARDKIT_QAV_PROBE_URL
+  # WHICH RELEASE IMAGE THE BUILD RAN IN (13 October 2026). The identity this
+  # script has just checked the running image against, above, so it names the
+  # image actually in use. The build system records it beside each build;
+  # this list left it out, so every build said "not set". By name only, like
+  # everything here.
+  FORGE_IMAGE_IDENTITY
   FORGE_SIDECAR_IN_SANDBOX
   OPENAI_BASE_URL
   OPENAI_API_KEY
