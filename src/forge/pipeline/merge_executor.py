@@ -4315,7 +4315,7 @@ async def execute_merge_deploy(
                     "--in-worktree",
                     folder,
                     # How long ONE run of the checks may take. The wall below holds
-                    # the whole command: two such runs plus the merge between them.
+                    # the whole command: four check-or-install runs plus the merge.
                     "--verify-timeout",
                     str(verify_timeout),
                     "--json",
