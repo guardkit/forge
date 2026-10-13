@@ -422,7 +422,8 @@ async def test_a_prepared_preview_is_ready_with_its_links_and_evidence(world: Wo
     assert evidence.state == "ready", evidence.failure_reason
     assert evidence.app_url == "https://preview.example.test:8950/?preview=the-right-token"
     folder = f"{BASE_URL}/guardkit/notes-fixture/FEAT-AB12/{SHA_CAND}/pvrun-000000000001"
-    assert evidence.report_url == f"{folder}/index.html"
+    # The report is linked as its folder (see ReviewPreviewService._url).
+    assert evidence.report_url == f"{folder}/"
     assert evidence.media_urls == [f"{folder}/shots/sign-in.png", f"{folder}/video/journey.webm"]
     assert evidence.preview_tree == JOIN_TREE
     assert (evidence.candidate_sha, evidence.candidate_tree) == (SHA_CAND, TREE_CAND)
@@ -716,10 +717,40 @@ async def test_a_passing_journey_with_video_and_screenshots_is_ready(world: Worl
 
 
 @pytest.mark.asyncio
+async def test_a_report_in_a_subfolder_is_linked_as_that_folder(world: World) -> None:
+    # The live fixture's layout (13 October 2026): tailscale serve answered
+    # ".../playwright-report/index.html" with a redirect to the evidence root,
+    # so the card links the folder, which the server answers with the report.
+    world.venue.evidence = (
+        _archive(
+            {
+                "playwright-report/index.html": b"<html>report</html>",
+                "test-output/journey/video.webm": b"webm",
+                "test-output/journey/after-create.png": b"png",
+            }
+        ),
+        None,
+    )
+    world.dispatch.journey_changes = {
+        "report_ref": "playwright-report/index.html",
+        "screenshot_refs": [],
+        "media_refs": [],
+    }
+    evidence = await world.service.prepare(_request())
+    assert evidence.state == "ready", evidence.failure_reason
+    folder = f"{BASE_URL}/guardkit/notes-fixture/FEAT-AB12/{SHA_CAND}/pvrun-000000000001"
+    assert evidence.report_url == f"{folder}/playwright-report/"
+    assert not any(url.endswith("index.html") for url in evidence.media_urls)
+    # Approval still finds the run's evidence folder from the folder link.
+    ready = evidence.model_dump(mode="json")
+    assert world.service.approval_refusal(ready, now=START) is None
+
+
+@pytest.mark.asyncio
 async def test_a_failed_journey_links_its_report_as_diagnostics(world: World) -> None:
     _journey_red(world)
     evidence = await world.service.prepare(_request())
-    assert evidence.diagnostics_url.endswith("/pvrun-000000000001/index.html")
+    assert evidence.diagnostics_url.endswith("/pvrun-000000000001/")
     assert evidence.outcome.failed == 1 and evidence.outcome.skipped is None
 
 
