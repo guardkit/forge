@@ -1928,9 +1928,18 @@ class ReviewPreviewService:
             context.req.candidate_sha,
             context.run_id,
         )
+        names = relative.split("/")
+        # A report's index.html is linked as its folder ("…/report/"): static
+        # file servers redirect a request for ".../index.html" to "./", and
+        # behind a path-mounted server (tailscale serve --set-path) that
+        # redirect drops the mount's sub-path and lands on the evidence root
+        # (seen live on 13 October 2026). Every such server answers the
+        # folder with its index.html.
+        if names[-1] == "index.html":
+            names[-1] = ""
         return "/".join(
             [str(self._evidence_base_url), *(quote(p, safe="") for p in parts)]
-            + [quote(p, safe="") for p in relative.split("/")]
+            + [quote(p, safe="") for p in names]
         )
 
     def _kept_ref(self, context: "_Preparation", ref: Any) -> str | None:
