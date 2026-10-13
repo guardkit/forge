@@ -30,6 +30,7 @@ pure declarative schema layer.
 
 from __future__ import annotations
 
+import posixpath
 import re
 from pathlib import Path
 from typing import Any, Literal
@@ -1766,6 +1767,20 @@ class PublicationConfig(BaseModel):
                 "= : , ; ' \" ` in it, because the activation check finds "
                 "it inside other settings by splitting on those; "
                 f"{value!r} has one. Move the file or folder to such a path"
+            )
+        # CANONICAL, because the check protects the path by its own NAME (its
+        # last component): '/a/keys/.' or '/a/x/..' would give it the wrong
+        # name, and the real spellings would escape.
+        canonical = posixpath.normpath("/" + value.lstrip("/"))
+        if canonical == "/":
+            raise ValueError(
+                f"{where} must name a file or folder, not the root '/'"
+            )
+        if value != canonical or posixpath.basename(canonical) in (".", ".."):
+            raise ValueError(
+                f"{where} must be written in its plain form, with one leading "
+                "'/', no trailing '/', and no '.', '..' or repeated '/': "
+                f"{value!r} is not; write {canonical!r}"
             )
         return value
 

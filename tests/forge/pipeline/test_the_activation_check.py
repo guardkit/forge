@@ -586,3 +586,59 @@ class TestTheRuleIsANameAsAWholeComponent:
         }
         verdict = run_the_activation_check(config, IT_PASSED)
         assert verdict.all_hold is True, verdict.sentence
+
+
+class TestAProtectedPathIsWrittenInItsPlainForm:
+    """Codex, implementation round 4 (R3). The check protects a path by its
+    own name, so the recorded path has to be canonical: '/a/keys/.' would be
+    named '.', and every real spelling of '/a/keys' would escape."""
+
+    @pytest.mark.parametrize("field", ["publisher_route_keys_dir", "publisher_credential_file"])
+    @pytest.mark.parametrize(
+        "value, expected",
+        [
+            ("/srv/publisher/route-keys/.", "/srv/publisher/route-keys"),
+            ("/srv/publisher/sub/..", "/srv/publisher"),
+            ("//srv/publisher/route-keys", "/srv/publisher/route-keys"),
+            ("/srv/publisher//route-keys", "/srv/publisher/route-keys"),
+            ("/srv/publisher/route-keys/", "/srv/publisher/route-keys"),
+            ("/", None),
+        ],
+    )
+    def test_a_path_not_in_its_plain_form_is_refused(
+        self, field: str, value: str, expected: str | None
+    ) -> None:
+        from pydantic import ValidationError
+
+        from forge.config.models import ForgeConfig
+
+        with pytest.raises(ValidationError) as refused:
+            ForgeConfig.model_validate(
+                {
+                    "permissions": {"filesystem": {"allowlist": ["/tmp"]}},
+                    "publication": {field: value},
+                }
+            )
+        said = str(refused.value)
+        assert f"publication.{field}" in said
+        if expected is None:
+            assert "not the root" in said
+        else:
+            assert repr(expected) in said
+
+    @pytest.mark.parametrize(
+        "value", ["/srv/publisher/route-keys", "/srv/publisher/credential.deploy-key", "/a"]
+    )
+    def test_a_plain_path_loads(self, value: str) -> None:
+        from forge.config.models import ForgeConfig
+
+        config = ForgeConfig.model_validate(
+            {
+                "permissions": {"filesystem": {"allowlist": ["/tmp"]}},
+                "publication": {
+                    "publisher_route_keys_dir": value,
+                    "publisher_credential_file": value,
+                },
+            }
+        )
+        assert config.publication.publisher_route_keys_dir == value
