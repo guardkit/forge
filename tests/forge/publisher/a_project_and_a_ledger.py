@@ -147,6 +147,7 @@ def make_the_ledger(
     candidate_check: bool | None = True,
     ran_on: str | None = None,
     attempt: int = 1,
+    repo: str = PROJECT,
 ) -> PublicationRecordStore:
     """A ledger with one build's publication record, written by the REAL store.
 
@@ -166,7 +167,7 @@ def make_the_ledger(
             now=now,
             seconds=0,
             feature_id=FEATURE,
-            repo=PROJECT,
+            repo=repo,
             decided_by="the owner",
             target_branch=project["branch"],
         )
@@ -299,3 +300,31 @@ def every_push_the_remote_saw(bare: Path, branch: str = "main") -> list[str]:
 
 def as_json(value: Any) -> str:
     return json.dumps(value, default=str, sort_keys=True)
+
+
+# ---------------------------------------------------------------------------
+# A route's own key (13 October 2026)
+# ---------------------------------------------------------------------------
+
+
+def a_route_keys_folder(root: Path, monkeypatch: Any) -> Path:
+    """The one protected folder route keys live in, pointed at a test folder.
+
+    The publisher reads the folder's place at call time, so this is the only
+    thing a test changes; nothing else about where a key is can be set.
+    """
+    import forge.publisher.settings as the_settings
+
+    folder = root / "route-keys"
+    folder.mkdir(parents=True, exist_ok=True)
+    folder.chmod(0o700)
+    monkeypatch.setattr(the_settings, "ROUTE_KEYS_DIR", str(folder))
+    return folder
+
+
+def a_route_key(folder: Path, name: str, text: str) -> Path:
+    """A key file with this made-up text, owner-only, directly in the folder."""
+    where = folder / name
+    where.write_text(text + "\n", encoding="utf-8")
+    where.chmod(0o600)
+    return where

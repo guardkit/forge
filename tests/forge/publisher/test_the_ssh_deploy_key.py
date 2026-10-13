@@ -250,3 +250,254 @@ def test_a_whole_send_goes_through_ssh_with_the_key(
     assert "git-receive-pack" in called
     assert "ASKPASS= AGENT=\n" in called
     assert "TESTONLY" not in called
+
+
+# ---------------------------------------------------------------------------
+# One key per route (13 October 2026)
+#
+# Two projects, each with a bare remote under one folder the stand-in ssh
+# serves from, and each with its own key in the protected route-keys folder.
+# The stand-in writes ONE FILE PER CALL, so calls made at the same moment by
+# two sends cannot be mixed up in the log, and it refuses any key whose path
+# it was told to refuse — the way a remote refuses a key it does not know.
+# ---------------------------------------------------------------------------
+
+#: The second project. Its build and record are its own.
+SECOND = "bench/second-shop"
+SECOND_BUILD = "build-FEAT-PUB2-1"
+KEY_A = "-----BEGIN OPENSSH PRIVATE KEY-----\nTESTONLY-route-key-A\n"
+KEY_B = "-----BEGIN OPENSSH PRIVATE KEY-----\nTESTONLY-route-key-B\n"
+
+
+def _a_logging_stand_in_ssh(
+    bin_dir: Path, remote_root: Path, calls: Path, *, refuse: tuple[Path, ...] = ()
+) -> None:
+    bin_dir.mkdir()
+    calls.mkdir()
+    refused = " ".join(shlex.quote(str(path)) for path in refuse)
+    ssh = bin_dir / "ssh"
+    ssh.write_text(
+        "#!/bin/sh\n"
+        f"log=$(mktemp {shlex.quote(str(calls))}/call.XXXXXX)\n"
+        'printf "%s\\n" "$@" > "$log"\n'
+        'key=""; previous=""\n'
+        'for a; do [ "$previous" = "-i" ] && key="$a"; previous="$a"; done\n'
+        f"for no in {refused}; do\n"
+        '    if [ "$key" = "$no" ]; then echo "Permission denied (publickey)." >&2; exit 255; fi\n'
+        "done\n"
+        "for last; do :; done\n"
+        f"cd {shlex.quote(str(remote_root))} && exec sh -c \"$last\"\n",
+        encoding="utf-8",
+    )
+    ssh.chmod(0o755)
+
+
+def _the_calls(calls: Path) -> list[tuple[str, str]]:
+    """Each ssh call as (the key it was given, the repository it was for)."""
+    found = []
+    for one in sorted(calls.iterdir()):
+        args = one.read_text(encoding="utf-8").splitlines()
+        key = args[args.index("-i") + 1]
+        found.append((key, args[-1]))
+    return found
+
+
+def _two_projects(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **ssh: object):
+    from tests.forge.publisher.a_project_and_a_ledger import (
+        a_route_key,
+        a_route_keys_folder,
+        the_credential_file,
+    )
+
+    root = tmp_path / "world"
+    a = make_the_project(root / "a")
+    b = make_the_project(root / "b")
+    make_the_ledger(root / "forge.db", project=a)
+    make_the_ledger(root / "forge.db", project=b, build_id=SECOND_BUILD, repo=SECOND)
+    folder = a_route_keys_folder(tmp_path, monkeypatch)
+    key_a = a_route_key(folder, "key-a", KEY_A)
+    key_b = a_route_key(folder, "key-b", KEY_B)
+    wide = the_credential_file(root)
+    calls = tmp_path / "ssh-calls"
+    _a_logging_stand_in_ssh(tmp_path / "bin", root, calls, **ssh)  # type: ignore[arg-type]
+    monkeypatch.setenv("PATH", f"{tmp_path / 'bin'}{os.pathsep}{os.environ['PATH']}")
+    settings = settings_for(
+        root,
+        a,
+        ledger=root / "forge.db",
+        credential_file=wide,
+        projects={
+            PROJECT: ProjectRoute(
+                name=PROJECT,
+                source=str(a["copy"]),
+                remote="git@example.invalid:a/remote.git",
+                credential_name="key-a",
+            ),
+            SECOND: ProjectRoute(
+                name=SECOND,
+                source=str(b["copy"]),
+                remote="git@example.invalid:b/remote.git",
+                credential_name="key-b",
+            ),
+        },
+    )
+    settings = dataclasses.replace(settings, known_hosts_file="/pinned")
+    return {
+        "a": a,
+        "b": b,
+        "key_a": key_a,
+        "key_b": key_b,
+        "wide": wide,
+        "calls": calls,
+        "settings": settings,
+    }
+
+
+def _to_b(world: dict) -> dict:
+    """A request for the second project's own build."""
+    return {**a_request(world["b"], build_id=SECOND_BUILD), "project": SECOND}
+
+
+def _for(calls: list[tuple[str, str]], folder: str) -> list[str]:
+    return [key for key, command in calls if f"'{folder}/remote.git'" in command]
+
+
+def test_each_route_sends_with_its_own_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    world = _two_projects(tmp_path, monkeypatch)
+    publisher = Publisher(world["settings"])
+
+    to_a = publisher.publish(a_request(world["a"]))
+    to_b = publisher.publish(
+        _to_b(world)
+    )
+
+    assert to_a.published is True, to_a.refusal
+    assert to_b.published is True, to_b.refusal
+    assert what_the_remote_has(world["a"]["bare"]) == world["a"]["j"]
+    assert what_the_remote_has(world["b"]["bare"]) == world["b"]["j"]
+    calls = _the_calls(world["calls"])
+    assert len(calls) == len(_for(calls, "a")) + len(_for(calls, "b"))
+    assert _for(calls, "a") and set(_for(calls, "a")) == {str(world["key_a"])}
+    assert _for(calls, "b") and set(_for(calls, "b")) == {str(world["key_b"])}
+
+
+def test_a_refused_route_key_is_not_retried_with_another(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    world = _two_projects(tmp_path, monkeypatch, refuse=(tmp_path / "route-keys" / "key-b",))
+    before = what_the_remote_has(world["b"]["bare"])
+
+    answer = Publisher(world["settings"]).publish(
+        _to_b(world)
+    )
+
+    assert answer.published is False
+    assert answer.refusal_kind == "the-remote-could-not-be-read"
+    calls = _the_calls(world["calls"])
+    # EXACTLY ONE call, with B's own key, and nothing else was tried: not the
+    # publisher-wide key, not A's.
+    assert calls == [(str(world["key_b"]), "git-upload-pack 'b/remote.git'")]
+    assert what_the_remote_has(world["b"]["bare"]) == before
+    assert every_push_the_remote_saw(world["b"]["bare"]) == []
+
+
+def test_a_route_naming_no_file_uses_the_publisher_wide_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A regression guard: a route that names no key is sent as it always was."""
+    root = tmp_path / "world"
+    a = make_the_project(root / "a")
+    make_the_ledger(root / "forge.db", project=a)
+    wide = root / "deploy-key"
+    wide.write_text(THE_MADE_UP_KEY, encoding="utf-8")
+    wide.chmod(0o600)
+    calls = tmp_path / "ssh-calls"
+    _a_logging_stand_in_ssh(tmp_path / "bin", root, calls)
+    monkeypatch.setenv("PATH", f"{tmp_path / 'bin'}{os.pathsep}{os.environ['PATH']}")
+    settings = settings_for(
+        root,
+        a,
+        ledger=root / "forge.db",
+        credential_file=wide,
+        projects={
+            PROJECT: ProjectRoute(
+                name=PROJECT,
+                source=str(a["copy"]),
+                remote="git@example.invalid:a/remote.git",
+            )
+        },
+    )
+    settings = dataclasses.replace(settings, known_hosts_file="/pinned")
+
+    answer = Publisher(settings).publish(a_request(a))
+
+    assert answer.published is True, answer.refusal
+    keys = {key for key, _ in _the_calls(calls)}
+    assert keys == {str(wide)}
+
+
+def test_two_sends_at_the_same_time_each_use_only_their_own_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Different projects run at the same moment (their locks are per
+    project). Neither send's git ever sees the other route's key."""
+    import threading
+
+    world = _two_projects(tmp_path, monkeypatch)
+    publisher = Publisher(world["settings"])
+    answers: dict[str, object] = {}
+
+    def send(which: str, request: dict) -> None:
+        answers[which] = publisher.publish(request)
+
+    threads = [
+        threading.Thread(target=send, args=("a", a_request(world["a"]))),
+        threading.Thread(
+            target=send,
+            args=("b", _to_b(world)),
+        ),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert answers["a"].published is True, answers["a"].refusal  # type: ignore[attr-defined]
+    assert answers["b"].published is True, answers["b"].refusal  # type: ignore[attr-defined]
+    calls = _the_calls(world["calls"])
+    assert set(_for(calls, "a")) == {str(world["key_a"])}
+    assert set(_for(calls, "b")) == {str(world["key_b"])}
+
+
+def test_a_key_swapped_after_the_health_check_is_refused_before_the_send(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from forge.publisher import __main__ as entry
+
+    world = _two_projects(tmp_path, monkeypatch)
+    publisher = Publisher(world["settings"])
+    interfaces = tmp_path / "net"
+    for name in ("lo", "eth0"):
+        (interfaces / name).mkdir(parents=True)
+    check = entry.the_self_check(world["settings"], publisher, interfaces=interfaces)
+    assert check() is None
+    before = what_the_remote_has(world["a"]["bare"])
+
+    # A's key is replaced by a link to B's, after a passing health check.
+    world["key_a"].unlink()
+    world["key_a"].symlink_to(world["key_b"])
+
+    answer = publisher.publish(a_request(world["a"]))
+
+    assert answer.published is False
+    assert answer.refusal_kind == "the-route-credential-changed"
+    assert PROJECT in str(answer.refusal)
+    assert "TESTONLY" not in str(answer.refusal)
+    # No ssh call at all for A: so none carrying B's key for A.
+    assert _for(_the_calls(world["calls"]), "a") == []
+    assert what_the_remote_has(world["a"]["bare"]) == before
+    # And the health check now fails, naming A.
+    said = check()
+    assert said and PROJECT in said

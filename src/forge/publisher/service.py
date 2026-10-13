@@ -38,6 +38,16 @@ function that builds a push and it cannot express one. It never deploys
 anything: what happens after a commit is on the remote is the executor's
 stage, and this service has no part in it.
 
+ONE CREDENTIAL PER ROUTE (13 October 2026). A project's route may name a key
+of its own (:mod:`forge.publisher.settings`). Each distinct file is read once,
+at start, into one cache: ``"publisher-wide"`` for the existing file and
+``"route:<name>"`` for each route key. Two entries that are the same file —
+by ``(st_dev, st_ino)``, not by path text — stop the publisher before anything
+is read. A route that names a key is sent with that key or refused: there is
+no fallback to another credential, ever. A route key's identity is looked at
+again (``lstat``, never opening it) on every health self-check and
+immediately before each send for that route.
+
 EVERY REFUSAL IS ONE SENTENCE a person can act on, and rides beside a short
 machine-readable name so that the coordinator can tell the one refusal it
 retries — the remote moved — from every other, which it does not.
@@ -47,6 +57,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import stat
 import threading
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -63,7 +75,11 @@ from forge.publisher.git_work import (
     a_plain_branch_name,
     a_plain_commit_name,
 )
-from forge.publisher.settings import ProjectRoute, PublisherSettings
+from forge.publisher.settings import (
+    ProjectRoute,
+    PublisherSettings,
+    the_route_key_file,
+)
 from forge.publisher.the_record import (
     STEP_CANDIDATE_CHECK,
     STEP_MERGE_CHECKS,
@@ -77,8 +93,10 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "PUBLISH_ROUTE",
+    "PUBLISHER_WIDE",
     "Answer",
     "Publisher",
+    "PublisherWillNotStart",
     "PublisherHandler",
     "serve",
     "the_remote_moved",
@@ -87,10 +105,31 @@ __all__ = [
 #: The one route that does anything.
 PUBLISH_ROUTE: str = "/publish"
 
+#: The cache key of the publisher-wide credential. A route's own key is
+#: ``"route:<name>"``.
+PUBLISHER_WIDE: str = "publisher-wide"
+
+
+class PublisherWillNotStart(RuntimeError):
+    """The publisher refuses to start, in one sentence naming the settings.
+
+    Raised when two credential entries are the same file. Never carries a
+    credential's contents: it is raised before anything is read.
+    """
+
+
+def _route_key(name: str) -> str:
+    return f"route:{name}"
+
+
 #: The short name on the refusal the coordinator retries: the remote moved
 #: under this send, so a new join onto where it is now is the answer. Every
 #: other refusal name is a stop.
 THE_REMOTE_MOVED: str = "the-remote-moved"
+
+
+#: The refusal said when a route's key is not the file read at start.
+THE_ROUTE_KEY_CHANGED: str = "the-route-credential-changed"
 
 
 def the_remote_moved(answer: dict[str, Any] | None) -> bool:
@@ -142,9 +181,26 @@ class Publisher:
         self._settings = settings
         self._state = Path(settings.state_dir).expanduser()
         self._state.mkdir(parents=True, exist_ok=True)
-        credential, refusal = read_the_credential(settings.credential_file)
+        # ONE CACHE, keyed by WHICH credential, never by path text: the
+        # publisher-wide file and each distinct route key name, each read
+        # once, here, and nowhere else.
+        self._credentials: dict[str, Credential | None] = {}
+        self._refusals: dict[str, str | None] = {}
+        #: The (st_dev, st_ino) of each route key, recorded with ``lstat``
+        #: before it was read. Looked at again before each send and on every
+        #: health self-check, never by opening the file.
+        self._identities: dict[str, tuple[int, int]] = {}
+        #: With it, the file's type and its inode-change time. An inode
+        #: number freed by a deleted file is commonly handed straight to the
+        #: next file made, so (st_dev, st_ino) alone can call a replacement
+        #: "the same file"; a replacement also has a new change time, and a
+        #: link a different type.
+        self._looked: dict[str, tuple[int, int]] = {}
+        self._look_before_reading()
+        self._read_each_credential_once()
+        credential = self._credentials.get(PUBLISHER_WIDE)
         self._credential: Credential | None = credential
-        self._no_credential: str | None = refusal.sentence if refusal else None
+        self._no_credential: str | None = self._refusals.get(PUBLISHER_WIDE)
         if self._no_credential:
             logger.warning("publisher: %s", self._no_credential)
         else:
@@ -153,13 +209,22 @@ class Publisher:
                 "file; it is never logged, never in an answer and never in a "
                 "child's environment"
             )
+        for key, held in sorted(self._credentials.items()):
+            if held is None or not held.held:
+                continue
             # AT START, ONCE. The program git asks for the credential through
             # is written here rather than on the way into each git command:
             # this publisher runs requests for different projects at the same
             # time, and a program being rewritten under a running git command
             # is a program that command can read half of. Writing it now means
-            # every later call finds it already there.
-            the_askpass_program(self._credential, state_dir=self._state)
+            # every later call finds it already there. Each credential has a
+            # program of its own (Credential.program_name).
+            the_askpass_program(held, state_dir=self._state)
+        for key in sorted(k for k in self._refusals if k != PUBLISHER_WIDE):
+            if self._refusals[key]:
+                logger.warning(
+                    "publisher: %s: %s", self._who_names(key), self._refusals[key]
+                )
         self._reader = reader or TheRecordReader(settings.ledger)
         self._commits_for = commits_for or self._its_own_copy
         # ONE PROJECT AT A TIME. The publisher keeps one repository of its own
@@ -174,6 +239,172 @@ class Publisher:
         #: again on every health request. ``None`` means it was never set.
         self.self_check: Callable[[], str | None] | None = None
         self._handing_out_locks = threading.Lock()
+
+    # -- the credentials, read once ----------------------------------------
+
+    def _route_key_names(self) -> list[str]:
+        return sorted(
+            {
+                route.credential_name
+                for route in self._settings.projects.values()
+                if route.credential_name is not None
+            }
+        )
+
+    def _who_names(self, key: str) -> str:
+        """``project 'a'`` or ``projects 'a', 'b'``: the routes using a key."""
+        name = key.split(":", 1)[1] if key.startswith("route:") else None
+        projects = sorted(
+            route.name
+            for route in self._settings.projects.values()
+            if route.credential_name == name
+        )
+        listed = ", ".join(f"'{project}'" for project in projects)
+        return f"project{'s' if len(projects) > 1 else ''} {listed}"
+
+    def _look_before_reading(self) -> None:
+        """Record each credential file's identity, and refuse aliases.
+
+        The publisher-wide file is looked at with ``stat``, which follows a
+        symbolic link: it may be one (the start-up check allows it), and its
+        identity is then the file it really reads. A route key is looked at
+        with ``lstat``: it may never be a link. Two entries with one identity
+        are one file, and the publisher will not start — before anything is
+        read.
+        """
+        seen: dict[tuple[int, int], tuple[str, str]] = {}
+        wide = str(self._settings.credential_file or "").strip()
+        if wide:
+            where = Path(wide).expanduser()
+            try:
+                found = os.stat(where)
+            except OSError:
+                found = None  # the read below says why, as it always has
+            if found is not None:
+                seen[(found.st_dev, found.st_ino)] = (
+                    "the publisher-wide credential_file",
+                    str(where),
+                )
+        for name in self._route_key_names():
+            key = _route_key(name)
+            where = the_route_key_file(name)
+            try:
+                found = os.lstat(where)
+            except FileNotFoundError:
+                self._refusals[key] = (
+                    f"the credential file {where} is not there, so the "
+                    "publisher holds no credential for this route and can "
+                    "send nothing for it."
+                )
+                continue
+            except OSError as exc:
+                self._refusals[key] = (
+                    f"the credential file {where} could not be looked at "
+                    f"({exc.strerror or type(exc).__name__}), so the publisher "
+                    "holds no credential for this route and can send nothing "
+                    "for it."
+                )
+                continue
+            identity = (found.st_dev, found.st_ino)
+            said = (f"the route key '{name}' of {self._who_names(key)}", str(where))
+            if identity in seen:
+                other, other_path = seen[identity]
+                raise PublisherWillNotStart(
+                    f"{other} ({other_path}) and {said[0]} ({said[1]}) are "
+                    "the same file. Every credential has to be a file of its "
+                    "own, so that a route's key is never another's; nothing "
+                    "was read."
+                )
+            seen[identity] = said
+            self._identities[key] = identity
+            self._looked[key] = (stat.S_IFMT(found.st_mode), found.st_ctime_ns)
+
+    def _read_each_credential_once(self) -> None:
+        credential, refusal = read_the_credential(self._settings.credential_file)
+        self._credentials[PUBLISHER_WIDE] = credential
+        self._refusals[PUBLISHER_WIDE] = refusal.sentence if refusal else None
+        for name in self._route_key_names():
+            key = _route_key(name)
+            if key not in self._identities:
+                self._credentials[key] = None  # its refusal is already said
+                continue
+            credential, refusal = read_the_credential(
+                the_route_key_file(name),
+                no_follow=True,
+                identity=self._identities[key],
+                own_program=True,
+            )
+            self._credentials[key] = credential
+            self._refusals[key] = refusal.sentence if refusal else None
+
+    def _the_credential_for(
+        self, route: ProjectRoute
+    ) -> tuple[Credential | None, str | None]:
+        """THE ONE PLACE a route's credential is picked. No fallback, ever.
+
+        A route that names a key gets that key or that key's refusal, and
+        nothing else. A route that names none gets the publisher-wide
+        credential and its refusal, as before.
+        """
+        if route.credential_name is None:
+            return self._credential, self._no_credential
+        key = _route_key(route.credential_name)
+        credential = self._credentials.get(key)
+        refusal = self._refusals.get(key)
+        if credential is None or not credential.held:
+            return None, (
+                f"the route for project '{route.name}' names its own key "
+                f"'{route.credential_name}': "
+                + (refusal or "the publisher holds no credential from it.")
+            )
+        return credential, None
+
+    def why_route_keys_refuse_to_start(self) -> str | None:
+        """A route key that could not be read at start, or ``None``.
+
+        A route that names a key can never reach a send without it, so the
+        process entry point does not start while this says anything.
+        """
+        said = [
+            f"{self._who_names(key)}: {self._refusals[key]}"
+            for key in sorted(self._refusals)
+            if key != PUBLISHER_WIDE and self._refusals[key]
+        ]
+        return "; ".join(said) or None
+
+    def _what_changed_under(self, name: str) -> str | None:
+        """Is the route key still the very file that was read? ``lstat`` only."""
+        key = _route_key(name)
+        recorded = self._identities.get(key)
+        if recorded is None:
+            return None  # never read; its refusal stands on its own
+        where = the_route_key_file(name)
+        try:
+            found = os.lstat(where)
+        except OSError as exc:
+            return (
+                f"the credential file {where} named for {self._who_names(key)} "
+                f"is no longer there ({exc.strerror or type(exc).__name__})"
+            )
+        if (found.st_dev, found.st_ino) != recorded or (
+            stat.S_IFMT(found.st_mode),
+            found.st_ctime_ns,
+        ) != self._looked.get(key):
+            return (
+                f"the credential file {where} named for {self._who_names(key)} "
+                "is not the file that was read at start (it was replaced, or "
+                "made a link)"
+            )
+        return None
+
+    def why_a_route_key_changed(self) -> str | None:
+        """Every route key looked at again, never opened. For the health check."""
+        said = [
+            changed
+            for changed in (self._what_changed_under(n) for n in self._route_key_names())
+            if changed
+        ]
+        return "; ".join(said) or None
 
     # -- the pieces --------------------------------------------------------
 
@@ -190,10 +421,12 @@ class Publisher:
             return self._one_at_a_time.setdefault(str(project), threading.Lock())
 
     def _its_own_copy(self, route: ProjectRoute) -> TheProjectsCommits:
+        # A project's copy is handed ITS OWN route's credential and no other.
+        credential, _refusal = self._the_credential_for(route)
         return TheProjectsCommits(
             route,
             state_dir=self._state,
-            credential=self._credential,
+            credential=credential,
             timeout_seconds=self._settings.git_timeout_seconds,
             known_hosts=self._settings.known_hosts_file,
         )
@@ -290,15 +523,19 @@ class Publisher:
                 "itself and sent nothing.",
             )
 
-        # -- the credential ------------------------------------------------
-        if not self.holds_a_credential:
+        # -- the credential: this route's own, and no other -----------------
+        credential, no_credential = self._the_credential_for(route)
+        if credential is None or not credential.held:
             return _refused(
                 "there-is-no-credential",
-                f"{self._no_credential or 'the publisher holds no credential'} "
+                f"{no_credential or 'the publisher holds no credential'} "
                 "Nothing was sent.",
             )
 
         with self._the_lock_for(route.name):
+            changed = self._a_route_key_that_changed(route)
+            if changed is not None:
+                return changed
             return self._the_git_part(
                 route,
                 build_id=build_id,
@@ -307,6 +544,20 @@ class Publisher:
                 build_tip=build_tip,
                 target_branch=target_branch,
             )
+
+    def _a_route_key_that_changed(self, route: ProjectRoute) -> Answer | None:
+        """Immediately before a send: is this route's key the file read?"""
+        if route.credential_name is None:
+            return None
+        changed = self._what_changed_under(route.credential_name)
+        if changed is None:
+            return None
+        logger.warning("publisher: %s; nothing was sent", changed)
+        return _refused(
+            THE_ROUTE_KEY_CHANGED,
+            f"the route for project '{route.name}': {changed}, so nothing was "
+            "sent with it and no other credential was tried. Nothing was sent.",
+        )
 
     def _the_git_part(
         self,
@@ -413,6 +664,11 @@ class Publisher:
             )
 
         # -- the send ------------------------------------------------------
+        # Looked at once more, immediately before the push, so the window in
+        # which a route's key could be swapped is as short as it can be.
+        changed = self._a_route_key_that_changed(route)
+        if changed is not None:
+            return changed
         sent = commits.send(j_commit, target_branch)
         if not sent.ok:
             after = commits.where_the_remotes_branch_is(target_branch)
