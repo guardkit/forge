@@ -189,6 +189,7 @@ from forge.pipeline.publication_record import (
     STEP_MERGE_CHECKS,
     STEP_SEND,
     PublicationRecordStore,
+    default_lease_seconds,
 )
 from forge.pipeline.publication_switch import (
     publication_is_switched_on,
@@ -214,6 +215,7 @@ __all__ = [
     "MERGE_WALL_CAP_SECONDS",
     "MERGE_WALL_MERGE_ALLOWANCE_SECONDS",
     "MERGE_WALL_RUNS",
+    "MERGE_LEASE_MARGIN_SECONDS",
     "MergeApprovalConsumer",
     "RESULT_WORD_MERGED_AND_RUNNING",
     "RESULT_WORD_PUBLICATION_PENDING",
@@ -269,6 +271,11 @@ MERGE_WALL_MERGE_ALLOWANCE_SECONDS: int = 180
 #: then the install and the checks again on the merged tree (13 October 2026,
 #: the merge-install design, item 8).
 MERGE_WALL_RUNS: int = 4
+
+#: How much longer than the merge command's wall the press holds the build's
+#: record while that command runs: the HTTP wait beyond the wall, and the time
+#: to read and record the answer.
+MERGE_LEASE_MARGIN_SECONDS: int = 300
 
 #: The longest wall the deploy sidecar will accept (an hour). Written out here
 #: rather than imported so this module does not depend on the sidecar; a test
@@ -4378,7 +4385,29 @@ async def execute_merge_deploy(
                     merge_run_kwargs["feature_routing_receipt"] = (
                         feature_routing_receipt
                     )
+                # THE HOLD OUTLASTS THE COMMAND (13 October 2026). The merge
+                # command may now install and check twice, so its wall can be
+                # longer than the hold this press took when it started. The
+                # hold is pushed out to cover the whole wall and a margin
+                # before the command is sent, so no second press can take the
+                # build over while the join runs, and put back to the
+                # ordinary length once it has answered. A renewal that changes
+                # no row means this press has already been replaced.
+                if store is not None and not store.renew_lease(
+                    build_id=build_id,
+                    turn=turn,
+                    now=deps.clock(),
+                    seconds=max(
+                        default_lease_seconds(),
+                        merge_wall + MERGE_LEASE_MARGIN_SECONDS,
+                    ),
+                ):
+                    return _replaced_here()
                 result = await deps.guardkit_run(**merge_run_kwargs)
+                if store is not None:
+                    store.renew_lease(
+                        build_id=build_id, turn=turn, now=deps.clock()
+                    )
                 report = _parse_merge_report(result)
                 merged_in_report = bool(report and report.get("outcome") == "merged")
                 refusal: str | None = None
@@ -4759,6 +4788,19 @@ async def execute_merge_deploy(
                 if check_join_said.ran:
                     checks_passed = check_join_said.checks_passed
                     checks_total = check_join_said.checks_total
+                    # The build system may say its checks on the join could
+                    # not run (13 October 2026, item 9). That is "could not
+                    # run", not a red result, and files no repair; the record
+                    # says so in the same words, so a later press reads it
+                    # back exactly as this one says it.
+                    joined_could_not_run = not check_join_said.passed and (
+                        str(check_join_said.verify_status or "").strip().lower()
+                        == "unverified"
+                    )
+                    why_not = str(
+                        (check_join_said.report or {}).get("verify_detail")
+                        or check_join_said.sentence
+                    )
                     if store is not None and not store.done(
                         build_id=build_id,
                         turn=turn,
@@ -4767,10 +4809,14 @@ async def execute_merge_deploy(
                         attempt=attempt,
                         result={
                             "ran_on": j_commit,
-                            "verify_ran": True,
+                            "verify_ran": not joined_could_not_run,
                             "verify_ok": check_join_said.passed,
                             "verify_status": check_join_said.verify_status,
-                            "verify_detail": check_join_said.sentence,
+                            "verify_detail": (
+                                why_not
+                                if joined_could_not_run
+                                else check_join_said.sentence
+                            ),
                             "checks_passed": check_join_said.checks_passed,
                             "checks_total": check_join_said.checks_total,
                             "asked_the_build_system_about_a_reused_join": True,
@@ -4785,19 +4831,7 @@ async def execute_merge_deploy(
                                 now=deps.clock(),
                                 result=RESULT_PUBLICATION_PENDING,
                             )
-                        # The build system may say its checks on the join
-                        # could not run (13 October 2026, item 9). That is
-                        # "could not run", not a red result, and files no
-                        # repair.
-                        joined_could_not_run = (
-                            str(check_join_said.verify_status or "").strip().lower()
-                            == "unverified"
-                        )
                         if joined_could_not_run:
-                            why_not = str(
-                                (check_join_said.report or {}).get("verify_detail")
-                                or check_join_said.sentence
-                            )
                             said = (
                                 "the checks after the join could not run: "
                                 f"{why_not}"

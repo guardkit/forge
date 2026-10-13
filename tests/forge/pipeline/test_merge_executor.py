@@ -2150,8 +2150,92 @@ class TestAResumedJoinKeepsCouldNotRun:
         assert again.verify_status == "unverified"
         assert "could not run" in again.detail
         assert INSTALL_FAILED in again.detail
+        assert "did not pass" not in again.detail
+        assert again.detail.endswith(
+            f"the checks after the join could not run: {INSTALL_FAILED}. "
+            "Nothing was published."
+        )
         assert filed == []
         assert _repair_rows(pool) == []
+
+
+class _JoinsWhileAnotherPressTriesToTakeOver(_JoinsForReal):
+    """Makes the join for real, after another press tries to take the build's
+    record at a moment just inside the merge command's own wall."""
+
+    def __init__(self, *, pool: SqliteLifecyclePersistence, seconds_in: int) -> None:
+        super().__init__()
+        self.pool = pool
+        self.seconds_in = seconds_in
+        self.takeover: Any = "not tried"
+
+    async def __call__(self, **kwargs: Any) -> GuardKitResult:
+        from datetime import timedelta
+
+        from forge.pipeline.publication_record import PublicationRecordStore
+
+        if list(kwargs.get("args") or [])[:1] == ["merge"]:
+            self.takeover = PublicationRecordStore(self.pool.connection).take_lease(
+                build_id=BUILD_ID,
+                holder="another-press",
+                now=_utcnow() + timedelta(seconds=self.seconds_in),
+            )
+        return await super().__call__(**kwargs)
+
+
+class TestTheHoldOutlastsTheJoin:
+    """The press holds the build's record for as long as its merge command
+    may run. The command may now install and check twice (2580 seconds at the
+    default limits), which is longer than the hold taken when the press
+    starts (1800 seconds); a second press must not take over mid-join."""
+
+    @pytest.mark.asyncio
+    async def test_a_second_press_just_inside_the_wall_cannot_take_over(
+        self, config, pool, repo_root
+    ) -> None:
+        from forge.pipeline.merge_executor import merge_wall_seconds
+
+        wall = merge_wall_seconds(600)
+        joiner = _JoinsWhileAnotherPressTriesToTakeOver(pool=pool, seconds_in=wall - 1)
+        deps, publisher, gk, dp = _deps(config, pool, guardkit=joiner)
+        outcome = await _run_executor(deps, repo_root)
+
+        assert joiner.takeover is None, "another press took the record mid-join"
+        assert outcome.result == "publication-pending", outcome.detail
+
+    @pytest.mark.asyncio
+    async def test_after_the_join_the_hold_is_the_ordinary_one_again(
+        self, config, pool, repo_root
+    ) -> None:
+        """The longer hold covers the merge command only; once it has answered,
+        the rest of the press holds the record for the ordinary time."""
+        from datetime import datetime as _dt
+
+        from forge.pipeline.publication_record import default_lease_seconds
+
+        seen: list[str] = []
+
+        class _LooksAtTheHoldAfterTheJoin(_FakeDeploy):
+            async def __call__(self, **kwargs: Any) -> Any:
+                if kwargs.get("leg") == "candidate_check":
+                    seen.append(
+                        pool.connection.execute(
+                            "SELECT lease_expires_at FROM publication_records "
+                            "WHERE build_id = ?",
+                            (BUILD_ID,),
+                        ).fetchone()[0]
+                    )
+                return await super().__call__(**kwargs)
+
+        joiner = _JoinsForReal()
+        deps, publisher, gk, dp = _deps(
+            config, pool, guardkit=joiner, deploy=_LooksAtTheHoldAfterTheJoin()
+        )
+        before = _utcnow()
+        await _run_executor(deps, repo_root)
+        assert seen, "the live check never ran"
+        left = (_dt.fromisoformat(seen[0]) - before).total_seconds()
+        assert left <= default_lease_seconds() + 60
 
 
 # ---------------------------------------------------------------------------
