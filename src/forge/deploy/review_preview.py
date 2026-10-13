@@ -1364,6 +1364,7 @@ class ReviewPreviewService:
         repo_paths: Mapping[str, str],
         evidence_root: str | Path | None,
         evidence_base_url: str | None,
+        public_host: str | None = None,
         clock: Callable[[], datetime] = _utcnow,
         sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
         token_factory: Callable[[], str] = lambda: secrets.token_urlsafe(32),
@@ -1382,6 +1383,7 @@ class ReviewPreviewService:
         self._evidence_base_url = (
             str(evidence_base_url).rstrip("/") if evidence_base_url else None
         )
+        self._public_host = public_host or None
         self._clock = clock
         self._sleep = sleep
         self._token_factory = token_factory
@@ -1390,6 +1392,16 @@ class ReviewPreviewService:
         self._slot_poll_seconds = slot_poll_seconds
         self._profile_retry_seconds = profile_retry_seconds
         self._blocking_sleep = blocking_sleep
+
+    def _public_url_of(self, slot: "PreviewSlot") -> str | None:
+        """Where a reviewer opens this slot: the profile's own ``public_url``
+        when it names one, else ``https://<review_preview.public_host>:<port>``,
+        else None (and the preview is not prepared)."""
+        if slot.public_url:
+            return slot.public_url
+        if self._public_host:
+            return f"https://{self._public_host}:{int(slot.port)}"
+        return None
 
     # -- the switch ---------------------------------------------------------
 
@@ -1473,6 +1485,11 @@ class ReviewPreviewService:
             return early(f"could not read the deploy profile ({unreadable})")
         if profile is None or preview is None:
             return early("the project's deploy profile has no preview switched on")
+        for preview_slot in preview.slots:
+            if self._public_url_of(preview_slot) is None:
+                return early(
+                    f"no public address configured for preview slot {preview_slot.port}"
+                )
         if self._evidence_root is None or not self._evidence_base_url:
             return early(
                 "evidence storage is not set up on the coordinator "
@@ -1587,7 +1604,7 @@ class ReviewPreviewService:
             "COMPOSE_PROJECT_NAME": compose_project,
             "FACTORY_PREVIEW_PORT": str(slot.port),
             "FACTORY_PREVIEW_INTERNAL_PORT": str(slot.internal_port),
-            "FACTORY_PREVIEW_URL": slot.public_url,
+            "FACTORY_PREVIEW_URL": str(self._public_url_of(slot)),
             "FACTORY_PREVIEW_TOKEN": token,
             "FACTORY_RESOURCE_LABEL": f"{LEASE_LABEL}={lease_id}",
             "FACTORY_EVIDENCE_DIR": vm_evidence_dir,
@@ -1771,7 +1788,7 @@ class ReviewPreviewService:
             now=now,
             preview=context.preview,
             preview_tree=context.tree.tree,
-            app_url=f"{slot.public_url}/?preview={quote(token, safe='')}",
+            app_url=f"{self._public_url_of(slot)}/?preview={quote(token, safe='')}",
             report_url=self._url(context, report),
             media_urls=[
                 self._url(context, rel) for rel in self._media_of(context, journey)
@@ -2432,5 +2449,6 @@ def build_review_preview_service(
         repo_paths=dict(config.planning.target_repo_paths),
         evidence_root=settings.evidence_root,
         evidence_base_url=settings.evidence_base_url,
+        public_host=settings.public_host,
         clock=clock,
     )

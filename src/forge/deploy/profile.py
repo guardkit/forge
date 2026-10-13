@@ -67,6 +67,7 @@ __all__ = [
     "DeploySandbox",
     "DeployPreview",
     "PreviewSlot",
+    "plain_public_host",
     "unambiguous_https_url",
     "DeployProfileError",
     "load_deploy_profile",
@@ -305,16 +306,39 @@ class PreviewSlot:
 
     Attributes:
         port: The port the preview's public listener uses inside the sandbox.
-            The sandbox publishes it, and the tailnet's HTTPS server exposes it
-            as ``public_url``.
+            The sandbox publishes it, and an HTTPS server exposes it at the
+            slot's public address.
         internal_port: The preview's internal listener inside the sandbox, never
             published. The recorded journey runs against it.
-        public_url: The address a reviewer opens, ``https://<host>:<port>``.
+        public_url: Optional. The address a reviewer opens,
+            ``https://<host>:<port>``. Left out, the coordinator's
+            ``review_preview.public_host`` gives it as
+            ``https://<public_host>:<port>``, so a public repository's profile
+            need name no machine.
     """
 
     port: int
     internal_port: int
-    public_url: str
+    public_url: str | None = None
+
+
+def plain_public_host(value: object) -> str | None:
+    """``value`` when it is a bare host for an https address, else None.
+
+    A host name only — no scheme, port, path, user name, query, fragment,
+    backslash, whitespace or control character — checked by the same rules
+    as :func:`unambiguous_https_url`. The review preview's slots are then
+    reached at ``https://<host>:<slot port>/``.
+    """
+    from urllib.parse import urlsplit
+
+    if not isinstance(value, str) or not value or any(c in value for c in ":/@?#"):
+        return None
+    if unambiguous_https_url(f"https://{value}") is None:
+        return None
+    if urlsplit(f"https://{value}").hostname != value.lower():
+        return None
+    return value
 
 
 def unambiguous_https_url(value: object) -> str | None:
@@ -1001,7 +1025,7 @@ def _parse_preview(raw: Any) -> DeployPreview | None:
         slots_raw = []
     if not isinstance(slots_raw, list):
         raise DeployProfileError(
-            "preview.slots must be a list of {port, internal_port, public_url}"
+            "preview.slots must be a list of {port, internal_port[, public_url]}"
         )
     slots: list[PreviewSlot] = []
     ports_seen: set[int] = set()
@@ -1019,7 +1043,7 @@ def _parse_preview(raw: Any) -> DeployPreview | None:
                 )
             ports_seen.add(value)
         public_url = slot.get("public_url")
-        if unambiguous_https_url(public_url) is None:
+        if public_url is not None and unambiguous_https_url(public_url) is None:
             raise DeployProfileError(
                 f"preview.slots[{i}].public_url must be a plain https:// address "
                 "(a host; no user name, query, fragment, backslash or spaces), "
@@ -1028,7 +1052,9 @@ def _parse_preview(raw: Any) -> DeployPreview | None:
             )
         slots.append(
             PreviewSlot(
-                port=port, internal_port=internal, public_url=public_url.rstrip("/")
+                port=port,
+                internal_port=internal,
+                public_url=public_url.rstrip("/") if public_url is not None else None,
             )
         )
     if enabled and not slots:

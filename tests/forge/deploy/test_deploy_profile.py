@@ -380,6 +380,66 @@ class TestPreviewSection:
             )
 
 
+class TestASlotWithoutAnAddress:
+    BASE = {"env_id": "notes", "compose": {"file": "compose.yml"}}
+
+    def test_port_and_internal_port_are_enough(self) -> None:
+        p = parse_deploy_profile(
+            {
+                **self.BASE,
+                "preview": {
+                    "enabled": True,
+                    "slots": [{"port": 8950, "internal_port": 18950}],
+                },
+            }
+        )
+        assert p.preview.slots[0].public_url is None
+        assert (p.preview.slots[0].port, p.preview.slots[0].internal_port) == (8950, 18950)
+
+
+class TestThePublicHost:
+    @staticmethod
+    def _config(**preview):
+        from forge.config.models import ForgeConfig
+
+        return ForgeConfig.model_validate(
+            {
+                "permissions": {"filesystem": {"allowlist": ["/tmp"]}},
+                "review_preview": preview,
+            }
+        )
+
+    def test_a_plain_host_is_kept(self) -> None:
+        config = self._config(public_host="preview.example.test")
+        assert config.review_preview.public_host == "preview.example.test"
+
+    def test_it_is_unset_by_default(self) -> None:
+        config = self._config()
+        assert config.review_preview.public_host is None
+        assert config.review_preview.enabled is False
+
+    @pytest.mark.parametrize(
+        "host",
+        [
+            "https://preview.example.test",
+            "preview.example.test:8950",
+            "preview.example.test/path",
+            "user@preview.example.test",
+            "preview.example.test?x=1",
+            "preview.example.test#frag",
+            "preview\\example.test",
+            "preview example.test",
+            "preview.example.test\x07",
+            "",
+        ],
+    )
+    def test_anything_but_a_plain_host_is_refused(self, host) -> None:
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError, match="plain host name"):
+            self._config(public_host=host)
+
+
 class TestTheEvidenceBaseAddress:
     @pytest.mark.parametrize(
         "url",

@@ -1724,12 +1724,14 @@ class ReviewPreviewConfig(BaseModel):
     """Where a review preview's evidence is kept (web readiness W7, 12 October 2026).
 
     A web project switches the preview on in its own deploy profile
-    (``preview:``); this section holds the two coordinator-wide facts the
+    (``preview:``); this section holds the coordinator-wide facts the
     profile cannot: the folder on this machine the evidence is copied into,
-    and the address that folder is published under on the tailnet. Both are
-    ``None`` by default, and a preview prepared with either missing fails in
-    plain words ("evidence storage is not set up") rather than producing a
-    card with links to nowhere.
+    the address that folder is published under, and the host the preview
+    slots are reached at (``public_host``, so a public repository's profile
+    need name no machine). All are ``None`` by default, and a preview prepared
+    with any missing fails in plain words ("evidence storage is not set up",
+    "no public address configured for preview slot <port>") rather than
+    producing a card with links to nowhere.
 
     **Deploy-order law** (as :class:`MergeExecutorConfig`): ``extra="forbid"``,
     so a ``review_preview:`` section written into a deployed ``forge.yaml``
@@ -1766,6 +1768,33 @@ class ReviewPreviewConfig(BaseModel):
             "'https://evidence.example.test/factory-evidence'."
         ),
     )
+    public_host: str | None = Field(
+        default=None,
+        description=(
+            "The host a preview slot is reached at, for example "
+            "'preview.example.test': a slot whose profile names no public_url "
+            "is opened at https://<public_host>:<slot port>/. A host only — no "
+            "scheme, port, path, user name, query or fragment. This is also the "
+            "host Jarvis's link allow-list must name. A profile's own "
+            "public_url, when it has one, still wins."
+        ),
+    )
+
+    @field_validator("public_host")
+    @classmethod
+    def _validate_public_host(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        from forge.deploy.profile import plain_public_host
+
+        value = plain_public_host(v.strip())
+        if value is None:
+            raise ValueError(
+                "must be a plain host name for an https address (no scheme, "
+                f"port, path, user name, query, fragment, backslash or spaces), "
+                f"got {v!r}"
+            )
+        return value
 
     @field_validator("evidence_base_url")
     @classmethod
