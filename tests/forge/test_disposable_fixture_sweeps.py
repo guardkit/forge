@@ -19,9 +19,8 @@ reliability lane):
 1. Both sweeps stay keyed ONLY on the ``guardkit.fixture.owner`` label. Every
    listing they make filters on it; they never list everything and pick.
 2. Both sweeps remove that label's compose NETWORKS and VOLUMES as well as its
-   containers. Today they remove containers only, so networks and volumes
-   pile up on the sandbox's engine. Those tests are
-   ``xfail(strict=True)`` and flip loudly once the repair lands.
+   containers. Before 13 October 2026 they removed containers only, so
+   networks and volumes piled up on the sandbox's engine.
 3. Neither sweep ever lists, filters on or removes anything labelled
    ``forge.preview.lease=<id>``: those are review previews kept on purpose for
    the person reviewing a merge. A restart with one live preview stack and one
@@ -60,14 +59,6 @@ PREVIEW = "forge.preview.lease"
 
 #: The bootstrap that holds the runner-start sweep, as Forge ships it.
 BOOTSTRAP = Path(templates.__file__).resolve().parent / "sandbox-runner.sh"
-
-_R6 = pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "reliability lane: disposable sweep covers networks/volumes — "
-        "web readiness R6"
-    ),
-)
 
 #: A stand-in Docker client: a table of resources in one JSON file.
 STANDIN_DOCKER = r'''#!/usr/bin/env python3
@@ -308,7 +299,6 @@ def _every_listing_is_keyed_on_the_owner_label(engine) -> None:
 
 
 class TestTheCancelSweep:
-    @_R6
     def test_it_removes_this_builds_networks_and_volumes(self, engine):
         _with_preview_and_two_builds(engine)
         _cancel_sweep("build-mine")
@@ -350,7 +340,6 @@ class TestTheRunnerStartSweep:
         first = [line.strip() for line in body.group(1).splitlines() if line.strip()]
         assert first[0] == "remove_leftover_fixtures"
 
-    @_R6
     def test_it_removes_leftover_owner_labelled_networks_and_volumes(self, engine):
         data = engine["data"]
         _stack(data, "old", {OWNER: "build-old"}, running=False)

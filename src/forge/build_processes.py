@@ -506,13 +506,74 @@ def _engine_ids(build_id: str, *, include_stopped: bool) -> list[str] | None:
     return [line.strip() for line in done.stdout.splitlines() if line.strip()]
 
 
+def _remove_networks_and_volumes(build_id: str) -> None:
+    """Remove this build's labelled compose networks, then volumes.
+
+    Keyed on the same exact filter as the containers. One still in use is
+    left and logged, never forced.
+    """
+    engine = _engine()
+    if engine is None:
+        return
+    rule = f"label={FIXTURE_OWNER_LABEL}={build_id}"
+    for kind in ("network", "volume"):
+        try:
+            listed = subprocess.run(
+                [engine, kind, "ls", "--quiet", "--filter", rule],
+                capture_output=True,
+                text=True,
+                timeout=_ENGINE_TIMEOUT_SECONDS,
+                check=False,
+            )
+            names = [line.strip() for line in listed.stdout.splitlines() if line.strip()]
+            if listed.returncode != 0 or not names:
+                if listed.returncode != 0:
+                    logger.warning(
+                        "build_processes: the container engine would not list build "
+                        "%s's fixture %ss (exit %s)",
+                        build_id,
+                        kind,
+                        listed.returncode,
+                    )
+                continue
+            removed = subprocess.run(
+                [engine, kind, "rm", *names],
+                capture_output=True,
+                text=True,
+                timeout=_ENGINE_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            logger.warning(
+                "build_processes: removing build %s's fixture %ss failed (%s: %s)",
+                build_id,
+                kind,
+                type(exc).__name__,
+                exc,
+            )
+            continue
+        if removed.returncode != 0:
+            logger.warning(
+                "build_processes: not every fixture %s of build %s could be "
+                "removed (one still in use is left): %s",
+                kind,
+                build_id,
+                removed.stderr.strip()[:300],
+            )
+
+
 async def remove_fixture_containers(build_id: str) -> list[str] | None:
     """Remove this build's labelled fixture containers; the ones left, or None.
 
     ``None`` means the engine could not be asked, so nothing is confirmed.
+    The build's labelled networks and volumes are removed after the
+    containers; any left behind are logged and do not change the answer.
     """
     ids = await asyncio.to_thread(_engine_ids, build_id, include_stopped=True)
+    if ids is None:
+        return None
     if not ids:
+        await asyncio.to_thread(_remove_networks_and_volumes, build_id)
         return ids
     engine = _engine()
     assert engine is not None  # ids came from it
@@ -537,6 +598,7 @@ async def remove_fixture_containers(build_id: str) -> list[str] | None:
             type(exc).__name__,
             exc,
         )
+    await asyncio.to_thread(_remove_networks_and_volumes, build_id)
     return await asyncio.to_thread(_engine_ids, build_id, include_stopped=False)
 
 

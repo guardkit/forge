@@ -643,12 +643,15 @@ class TestTheRealBootstrapsFailedStopStopsThisService:
         record.parent.mkdir(parents=True)
         record.write_text("999999999 0\n")
 
+        # FORGE_IMAGE crosses to the stop as it does in the estate's env file:
+        # since 13 October 2026 the stop takes the engine claim from it.
         service = _start(
             root,
             SANDBOX_BOOTSTRAP=str(bootstrap),
-            SANDBOX_ENV_NAMES="HOME SANDBOX_DOCKER",
+            SANDBOX_ENV_NAMES="HOME SANDBOX_DOCKER FORGE_IMAGE",
             HOME=str(home),
             SANDBOX_DOCKER=str(engine),
+            FORGE_IMAGE="a-throwaway-release:for-this-test",
         )
         output = _finish(service)
 
@@ -690,12 +693,15 @@ class TestTheRealBootstrapsFailedStopStopsThisService:
         home = root / "a-home-inside-the-sandbox"
         home.mkdir()
 
+        # FORGE_IMAGE crosses to the stop as it does in the estate's env file:
+        # since 13 October 2026 the stop takes the engine claim from it.
         service = _start(
             root,
             SANDBOX_BOOTSTRAP=str(bootstrap),
-            SANDBOX_ENV_NAMES="HOME SANDBOX_DOCKER",
+            SANDBOX_ENV_NAMES="HOME SANDBOX_DOCKER FORGE_IMAGE",
             HOME=str(home),
             SANDBOX_DOCKER=str(engine),
+            FORGE_IMAGE="a-throwaway-release:for-this-test",
         )
         try:
             assert _wait_for(
