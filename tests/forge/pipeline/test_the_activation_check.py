@@ -257,7 +257,10 @@ class TestTheRouteKeysFolderIsNamedNowhereElse:
         assert [answer.name for answer in verdict.refusals] == [
             "the-credential-is-named-in-no-other-settings"
         ]
-        assert "per-route keys" in verdict.sentence
+        assert (
+            "names a path component equal to the protected folder's name "
+            "'route-keys'" in verdict.sentence
+        )
         assert where in verdict.sentence
         assert publication_is_switched_on(config, IT_PASSED) is False
 
@@ -290,7 +293,7 @@ class TestTheRouteKeysFolderIsNamedNowhereElse:
 
     @pytest.mark.parametrize(
         "elsewhere",
-        [ROUTE_KEYS + "2", ROUTE_KEYS + "2/a", ROUTE_KEYS + "-old/a", "/home" + ROUTE_KEYS],
+        [ROUTE_KEYS + "2", ROUTE_KEYS + "2/a", ROUTE_KEYS + "-old/a", ROUTE_KEYS + ".bak/a"],
     )
     def test_a_sibling_folder_with_a_longer_name_does_not_match(self, elsewhere: str) -> None:
         config = a_config(publisher_route_keys_dir=ROUTE_KEYS)
@@ -378,8 +381,7 @@ class TestEveryWayOfSpellingTheFolderIsCaught:
             "/srv/publisher/route-keys2/a",
             "KEY=/srv/publisher/route-keys-old/a",
             "/opt/a:/srv/publisher/route-keys2",
-            "/srv/publisher/route-keys/../other/a",
-            "srv/publisher/route-keys/a",
+            "/srv/publisher/route-keys.bak/a",
         ],
     )
     def test_a_different_folder_still_does_not_match(self, elsewhere: str) -> None:
@@ -497,3 +499,90 @@ class TestAProtectedPathCannotHideASeparator:
         )
         config.conductor.launch_settings = [elsewhere]
         assert run_the_activation_check(config, IT_PASSED).all_hold is True
+
+
+class TestTheRuleIsANameAsAWholeComponent:
+    """Codex, implementation round 3. Normalising path text kept losing to
+    crafted spellings, so the rule is now conservative: a setting is refused
+    when the protected path's own NAME appears in it as a whole component.
+    Every spelling that reaches the protected place has to write that name;
+    an unrelated path that shares the name is refused too, and said so."""
+
+    @pytest.mark.parametrize(
+        "written",
+        [
+            "KEY_FILE='/srv/publisher/staging dir/../route-keys/a'",
+            "/srv/publisher/a=b/../route-keys/a",
+            "KEY_FILE=/srv/publisher/./route-keys/a",
+            "//srv/publisher/route-keys/a",
+            "/srv/publisher/route-keys/../route-keys/a",
+            "/srv//publisher/route-keys/a",
+            "/opt/a:/srv/publisher/route-keys:/opt/b",
+            "route-keys",
+        ],
+    )
+    def test_every_spelling_of_the_folder_refuses(self, written: str) -> None:
+        config = a_config(publisher_route_keys_dir=ROUTE_KEYS + "/")
+        config.conductor.launch_settings = [written]
+        verdict = run_the_activation_check(config, IT_PASSED)
+        assert verdict.all_hold is False, written
+        assert (
+            "names a path component equal to the protected folder's name "
+            "'route-keys'" in verdict.sentence
+        )
+
+    @pytest.mark.parametrize(
+        "written",
+        [
+            "KEY_FILE='/x/staging dir/../credential'",
+            "/x/a=b/../credential",
+            "/x/./credential",
+            "//x/credential",
+            "KEY=/x/credential",
+        ],
+    )
+    def test_every_spelling_of_the_credential_file_refuses(self, written: str) -> None:
+        config = a_config(publisher_credential_file="/x/credential")
+        config.conductor.launch_settings = [written]
+        verdict = run_the_activation_check(config, IT_PASSED)
+        assert [answer.name for answer in verdict.refusals] == [
+            "the-credential-is-named-in-no-other-settings"
+        ]
+        assert (
+            "names a path component equal to the protected file's name "
+            "'credential'" in verdict.sentence
+        )
+
+    @pytest.mark.parametrize(
+        "same_name_elsewhere",
+        ["/home" + ROUTE_KEYS, "/srv/publisher/route-keys/../other/a", "srv/route-keys/a"],
+    )
+    def test_a_different_folder_of_the_same_name_fails_closed(
+        self, same_name_elsewhere: str
+    ) -> None:
+        config = a_config(publisher_route_keys_dir=ROUTE_KEYS)
+        config.conductor.launch_settings = [same_name_elsewhere]
+        verdict = run_the_activation_check(config, IT_PASSED)
+        assert verdict.all_hold is False
+        assert "rename one of the two folders" in verdict.sentence
+
+    @pytest.mark.parametrize(
+        "elsewhere",
+        [
+            ROUTE_KEYS + "2/a",
+            ROUTE_KEYS + ".bak/a",
+            "/srv/publisher/credential.deploy-key.pub",
+            "KEY=/srv/publisher/credential.deploy-key.bak",
+        ],
+    )
+    def test_names_that_only_begin_the_same_do_not_match(self, elsewhere: str) -> None:
+        config = a_config(
+            publisher_route_keys_dir=ROUTE_KEYS,
+            publisher_credential_file="/srv/publisher/credential.deploy-key",
+        )
+        config.conductor.launch_settings = [elsewhere]
+        config.planning.sandboxes = {
+            "the-sandbox": SimpleNamespace(name="the-sandbox", some_file=elsewhere)
+        }
+        verdict = run_the_activation_check(config, IT_PASSED)
+        assert verdict.all_hold is True, verdict.sentence

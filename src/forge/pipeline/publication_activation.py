@@ -46,7 +46,6 @@ product.
 from __future__ import annotations
 
 import logging
-import posixpath
 import re
 from dataclasses import dataclass, field
 from typing import Any, Iterable
@@ -209,10 +208,14 @@ def _the_credential_is_named_in_no_other_settings(true: WhatIsTrue) -> Answer:
             name,
             question,
             False,
-            f"the publisher's folder of per-route keys ({true.the_route_keys_dir}), "
-            f"or a path inside it, is named in {named}. Every key in it "
-            "belongs to the publisher and to nothing else; take it out of "
-            "those settings before publication is switched on",
+            f"{named} names a path component equal to the protected "
+            f"folder's name '{_the_last_component(true.the_route_keys_dir or '')}' "
+            f"(the publisher's folder of per-route keys, "
+            f"{true.the_route_keys_dir}). Any path that reaches inside that "
+            "folder has to name it, so such a setting is refused even when it "
+            "means a different folder of the same name; take the path out of "
+            "those settings, or rename one of the two folders, before "
+            "publication is switched on",
         )
     if true.where_the_credential_file_is_named:
         named = ", ".join(true.where_the_credential_file_is_named)
@@ -220,9 +223,14 @@ def _the_credential_is_named_in_no_other_settings(true: WhatIsTrue) -> Answer:
             name,
             question,
             False,
-            f"the publisher's credential file is named in {named}. It "
-            "belongs to the publisher and to nothing else; take it out of "
-            "those settings before publication is switched on",
+            f"{named} names a path component equal to the protected "
+            f"file's name '{_the_last_component(true.the_credential_file or '')}' "
+            f"(the publisher's credential file, {true.the_credential_file}). "
+            "It belongs to the publisher and to nothing else, and any path "
+            "to it has to name it, so such a setting is refused even when it "
+            "means a different file of the same name; take the path out of "
+            "those settings, or rename one of the two files, before "
+            "publication is switched on",
         )
     return Answer(
         name,
@@ -288,91 +296,69 @@ def _text(value: Any) -> str:
 def _names_the_credential_file(config: Any, credential_file: str) -> tuple[str, ...]:
     """Every settings block that names the publisher's credential file.
 
-    Looked for, by exact path, in the coordinator's own settings (anywhere but
-    the one field that records where the publisher's file is, which is a note
-    of a path and not a copy of a secret), the list of settings a build is
-    launched with, and every sandbox's declared settings.
+    Looked for in the coordinator's own settings (anywhere but the one field
+    that records where the publisher's file is, which is a note of a path and
+    not a copy of a secret), the list of settings a build is launched with,
+    and every sandbox's declared settings — by the file's NAME as a whole
+    path component (:func:`_names_the_component`).
     """
-    wanted = _text(credential_file)
-    if not wanted:
+    if not _text(credential_file):
         return ()
-    # Every spelling of the one file: each absolute path in a value is taken
-    # out and normalised, and has to BE the file (no prefix: it is a file).
-    the_file = _a_linux_path(wanted)
     return _where_settings_name(
         config,
-        lambda text: the_file in _the_paths_in(text),
+        _names_the_component(_the_last_component(credential_file)),
         own_field="publisher_credential_file",
     )
-
-
-#: What separates one path from the next inside a setting's text: whitespace,
-#: '=', ':', ',', ';' and quotes. None of them is in a path this check
-#: protects, so everything between them is one candidate path.
-_BETWEEN_PATHS = re.compile(r"[\s=:,;\"'`]+")
-
-
-def _a_linux_path(text: str) -> str:
-    """One path, normalised the way Linux resolves its spelling.
-
-    Any run of leading slashes is one slash (``posixpath.normpath`` keeps
-    two, which Linux does not treat differently), then ``.``, ``..`` and
-    repeated separators collapse. Path text only: nothing is looked up, so a
-    symbolic link is not followed.
-    """
-    return posixpath.normpath("/" + text.lstrip("/"))
-
-
-def _the_paths_in(value: str) -> list[str]:
-    """Every absolute path written anywhere in a setting's text, normalised.
-
-    THE WHOLE VALUE FIRST, as one path, and then each path between
-    separators. The settings model refuses a protected path containing a
-    separator; the whole-value candidate means an identical standalone path
-    is still found even if that refusal were ever bypassed.
-    """
-    whole = value.strip()
-    found = [_a_linux_path(whole)] if whole.startswith("/") else []
-    found += [
-        _a_linux_path(token)
-        for token in _BETWEEN_PATHS.split(value)
-        if token.startswith("/")
-    ]
-    return found
-
-
-def _inside(folder: str) -> Any:
-    """Does a setting's text name ``folder`` or any path inside it?
-
-    PATH TEXT ONLY, never a file opened. Every absolute path in the value —
-    the whole value, or one written inside a longer one (``KEY=/x/a``,
-    ``/a:/b``) — is taken out and normalised, and so is the folder; a path
-    names the folder when it IS the folder or starts with it and a separator.
-    So ``/x/route-keys2`` is not ``/x/route-keys``, while ``/x/./route-keys/a``,
-    ``//x/route-keys/a`` and ``/x/route-keys/../route-keys/a`` all are.
-    """
-    root = _a_linux_path(folder.strip())
-    beneath = root.rstrip("/") + "/"
-
-    def names_it(text: str) -> bool:
-        return any(
-            path == root or path.startswith(beneath) for path in _the_paths_in(text)
-        )
-
-    return names_it
 
 
 def _names_the_route_keys_dir(config: Any, folder: str) -> tuple[str, ...]:
     """Every settings block that names the route-keys folder or a path in it.
 
     Searched where the credential file is searched, skipping only the one
-    field that records where the folder is.
+    field that records where the folder is, by the folder's NAME as a whole
+    path component (:func:`_names_the_component`).
     """
     if not _text(folder):
         return ()
     return _where_settings_name(
-        config, _inside(folder), own_field="publisher_route_keys_dir"
+        config,
+        _names_the_component(_the_last_component(folder)),
+        own_field="publisher_route_keys_dir",
     )
+
+
+def _the_last_component(path: str) -> str:
+    """A protected path's own name: its last component, slashes trimmed."""
+    return path.strip().rstrip("/").rsplit("/", 1)[-1]
+
+
+#: What may stand either side of a path component in a setting's text: a
+#: separator, or one of the characters settings put between paths.
+_AROUND_A_COMPONENT = r"""[/\s=:,;'"`]"""
+
+
+def _names_the_component(name: str) -> Any:
+    """Does a setting's text carry ``name`` as a whole path component?
+
+    A CONSERVATIVE RULE, NOT A PARSER (13 October 2026, review round 3). Path
+    text can spell one place in endless ways — '.', '..', repeated slashes,
+    quotes, a path inside a longer value — and every attempt to normalise
+    them lost to a crafted spelling. But any spelling that reaches the
+    protected file, or inside the protected folder, has to write its name
+    literally as one component. So a value is refused when that name appears
+    bounded by the start or end of the text, a '/', whitespace, or one of
+    = : , ; and quotes. That covers every spelling; an unrelated component
+    that happens to share the name is refused too, which fails closed and is
+    said plainly so that one of the two can be renamed. The settings model
+    refuses a protected path whose name holds any of those characters.
+    Path text only: nothing is opened.
+    """
+    if not name:
+        # A protected path with no name of its own ("/"): everything is in it.
+        return lambda text: bool(text.strip())
+    around = _AROUND_A_COMPONENT
+    whole = re.compile(f"(?:^|{around}){re.escape(name)}(?:$|{around})")
+    return lambda text: whole.search(text) is not None
 
 
 def _where_settings_name(
