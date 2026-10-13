@@ -392,8 +392,9 @@ class Publisher:
         ) != self._looked.get(key):
             return (
                 f"the credential file {where} named for {self._who_names(key)} "
-                "is not the file that was read at start (it was replaced, or "
-                "made a link)"
+                "has changed since the publisher started (it was replaced, "
+                "made a link, or its permissions or owner changed). The "
+                "publisher must be restarted after a key file is changed"
             )
         return None
 

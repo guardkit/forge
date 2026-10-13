@@ -494,6 +494,8 @@ def test_a_key_swapped_after_the_health_check_is_refused_before_the_send(
     assert answer.published is False
     assert answer.refusal_kind == "the-route-credential-changed"
     assert PROJECT in str(answer.refusal)
+    assert "changed since the publisher started" in str(answer.refusal)
+    assert "must be restarted" in str(answer.refusal)
     assert "TESTONLY" not in str(answer.refusal)
     # No ssh call at all for A: so none carrying B's key for A.
     assert _for(_the_calls(world["calls"]), "a") == []
@@ -501,3 +503,26 @@ def test_a_key_swapped_after_the_health_check_is_refused_before_the_send(
     # And the health check now fails, naming A.
     said = check()
     assert said and PROJECT in said
+
+
+def test_a_key_whose_permissions_changed_after_start_is_refused_until_a_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Not only a swap: a chmod changes the file's change time, and the send
+    is refused with the instruction to restart the publisher."""
+    world = _two_projects(tmp_path, monkeypatch)
+    publisher = Publisher(world["settings"])
+    before = what_the_remote_has(world["a"]["bare"])
+
+    world["key_a"].chmod(0o400)
+
+    answer = publisher.publish(a_request(world["a"]))
+
+    assert answer.published is False
+    assert answer.refusal_kind == "the-route-credential-changed"
+    assert "permissions or owner changed" in str(answer.refusal)
+    assert "must be restarted" in str(answer.refusal)
+    assert _for(_the_calls(world["calls"]), "a") == []
+    assert what_the_remote_has(world["a"]["bare"]) == before
+    # A restarted publisher reads it afresh and sends.
+    assert Publisher(world["settings"]).publish(a_request(world["a"])).published is True
