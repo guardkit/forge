@@ -322,23 +322,32 @@ class PreviewSlot:
     public_url: str | None = None
 
 
+#: One DNS label: letters, digits and hyphens, 1-63 long, no hyphen at
+#: either end (checked on the lower-cased name).
+_DNS_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+
+
 def plain_public_host(value: object) -> str | None:
-    """``value`` when it is a bare host for an https address, else None.
+    """``value`` lower-cased when it is a DNS host name, else None.
 
-    A host name only — no scheme, port, path, user name, query, fragment,
-    backslash, whitespace or control character — checked by the same rules
-    as :func:`unambiguous_https_url`. The review preview's slots are then
-    reached at ``https://<host>:<slot port>/``.
+    An allowlist, not a blocklist: 1-253 ASCII characters in dot-separated
+    labels of 1-63 letters, digits and hyphens, no label starting or ending
+    with a hyphen, and no trailing dot. Anything that reads as an IP address
+    is refused — a name made only of digits and dots, or one starting with
+    ``0x`` — because previews are reached at a DNS name. The review preview's
+    slots are then reached at ``https://<host>:<slot port>/``; the host is
+    lower-cased, as Jarvis and nats-core compare hosts.
     """
-    from urllib.parse import urlsplit
-
-    if not isinstance(value, str) or not value or any(c in value for c in ":/@?#"):
+    if not isinstance(value, str) or not value.isascii():
         return None
-    if unambiguous_https_url(f"https://{value}") is None:
+    host = value.lower()
+    if not 1 <= len(host) <= 253 or host.endswith(".") or host.startswith("0x"):
         return None
-    if urlsplit(f"https://{value}").hostname != value.lower():
+    if all(ch.isdigit() or ch == "." for ch in host):
         return None
-    return value
+    if not all(_DNS_LABEL.match(label) for label in host.split(".")):
+        return None
+    return host
 
 
 def unambiguous_https_url(value: object) -> str | None:

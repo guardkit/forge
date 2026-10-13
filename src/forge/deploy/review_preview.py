@@ -1399,8 +1399,13 @@ class ReviewPreviewService:
         else None (and the preview is not prepared)."""
         if slot.public_url:
             return slot.public_url
-        if self._public_host:
-            return f"https://{self._public_host}:{int(slot.port)}"
+        # Checked here too, not only in the settings, so a host that is not a
+        # plain DNS name can never reach a link: it counts as no address.
+        from forge.deploy.profile import plain_public_host
+
+        host = plain_public_host(self._public_host)
+        if host:
+            return f"https://{host}:{int(slot.port)}"
         return None
 
     # -- the switch ---------------------------------------------------------

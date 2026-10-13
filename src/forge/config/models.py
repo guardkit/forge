@@ -1773,8 +1773,9 @@ class ReviewPreviewConfig(BaseModel):
         description=(
             "The host a preview slot is reached at, for example "
             "'preview.example.test': a slot whose profile names no public_url "
-            "is opened at https://<public_host>:<slot port>/. A host only — no "
-            "scheme, port, path, user name, query or fragment. This is also the "
+            "is opened at https://<public_host>:<slot port>/. A DNS name only "
+            "(letters, digits, hyphens and dots; lower-cased) — no scheme, "
+            "port, path, user name or IP address. This is also the "
             "host Jarvis's link allow-list must name. A profile's own "
             "public_url, when it has one, still wins."
         ),
@@ -1787,12 +1788,12 @@ class ReviewPreviewConfig(BaseModel):
             return v
         from forge.deploy.profile import plain_public_host
 
-        value = plain_public_host(v.strip())
+        value = plain_public_host(v)
         if value is None:
             raise ValueError(
-                "must be a plain host name for an https address (no scheme, "
-                f"port, path, user name, query, fragment, backslash or spaces), "
-                f"got {v!r}"
+                "must be a plain host name: a DNS name of letters, digits, "
+                "hyphens and dots (no scheme, port, path, user name, IP "
+                f"address, spaces or other characters), got {v!r}"
             )
         return value
 

@@ -1979,3 +1979,30 @@ def test_the_production_service_takes_the_coordinator_s_host(tmp_path: Path) -> 
         config, connection=cx, deploy_dispatcher=AsyncMock()
     )
     assert service._public_host == "preview.example.test"
+
+
+@pytest.mark.parametrize("host", ["h\x80x.test", "0x7f000001", "a|b.test", "a..b"])
+@pytest.mark.asyncio
+async def test_a_host_that_is_not_a_dns_name_never_reaches_a_link(
+    world: World, host: str
+) -> None:
+    """Even handed to the service directly, past the settings' own check."""
+    world.profile = _profile(slots=SLOTS_WITHOUT_ADDRESSES)
+    world.service._public_host = host
+
+    evidence = await world.service.prepare(_request())
+
+    assert evidence.state == "failed"
+    assert evidence.app_url is None
+    assert evidence.failure_reason == "no public address configured for preview slot 8950"
+    assert world.store.live() == []
+
+
+@pytest.mark.asyncio
+async def test_a_mixed_case_host_is_used_lower_cased(world: World) -> None:
+    world.profile = _profile(slots=SLOTS_WITHOUT_ADDRESSES)
+    world.service._public_host = "Preview.Example.Test"
+
+    evidence = await world.service.prepare(_request())
+
+    assert evidence.app_url.startswith("https://preview.example.test:8950/?preview=")

@@ -409,9 +409,20 @@ class TestThePublicHost:
             }
         )
 
-    def test_a_plain_host_is_kept(self) -> None:
-        config = self._config(public_host="preview.example.test")
-        assert config.review_preview.public_host == "preview.example.test"
+    @pytest.mark.parametrize(
+        "host, kept",
+        [
+            ("preview.example.test", "preview.example.test"),
+            ("Preview.Example.Test", "preview.example.test"),
+            ("host", "host"),
+            ("xn--exmple-cua.test", "xn--exmple-cua.test"),
+            ("a-b.example.test", "a-b.example.test"),
+            ("a1.example.test", "a1.example.test"),
+        ],
+    )
+    def test_a_dns_name_is_kept_lower_cased(self, host, kept) -> None:
+        config = self._config(public_host=host)
+        assert config.review_preview.public_host == kept
 
     def test_it_is_unset_by_default(self) -> None:
         config = self._config()
@@ -421,23 +432,35 @@ class TestThePublicHost:
     @pytest.mark.parametrize(
         "host",
         [
-            "https://preview.example.test",
-            "preview.example.test:8950",
-            "preview.example.test/path",
-            "user@preview.example.test",
-            "preview.example.test?x=1",
-            "preview.example.test#frag",
-            "preview\\example.test",
-            "preview example.test",
-            "preview.example.test\x07",
-            "",
+            # the review's probes, every one
+            "host.", "", " ", " host ", "https://h", "h:443", "h/x", "u@h", "h?q",
+            "h#f", "h\\x", "h x", "h\tx", "h\x00x", "h\x7fx", "h\x80x", "h\x85x",
+            "h\u200bx", "[::1]", "::1", "127.0.0.1", "127.1", "0x7f000001",
+            "2130706433", "017.0.0.1", "1.2.3.4.5", "a<b", "a>b", "a|b", "a^b",
+            "a%2fb", "a%00b", "a;b", "a'b", 'a"b', "a`b", "a{b}", "exämple.test",
+            "a..b", ".a", "-a", "a_b", "*.a", "a,b", "a$b", "a&b", "a!b", "a=b",
+            "a~b", "a+b", "a(b)", "a*b",
+            # and the edges of the rules
+            "a-.example.test", "a" * 64 + ".test", ("a" * 63 + ".") * 4 + "a",
+            "0X7f000001", "a|b.test",
         ],
     )
-    def test_anything_but_a_plain_host_is_refused(self, host) -> None:
+    def test_anything_but_a_dns_name_is_refused(self, host) -> None:
         from pydantic import ValidationError
 
+        from forge.deploy.profile import plain_public_host
+
+        assert plain_public_host(host) is None
         with pytest.raises(ValidationError, match="plain host name"):
             self._config(public_host=host)
+
+    def test_the_longest_name_and_label_are_accepted(self) -> None:
+        from forge.deploy.profile import plain_public_host
+
+        label = "a" * 63
+        name = ".".join([label] * 3 + ["b" * 61])
+        assert len(name) == 253
+        assert plain_public_host(name) == name
 
 
 class TestTheEvidenceBaseAddress:
