@@ -891,18 +891,22 @@ ENGINE_CLAIM_LABEL="forge.sandbox.engine.owner"
 CHECKOUT_HASH="${STATE_ROOT##*/}"
 CLAIM_REFUSAL=""
 take_or_confirm_the_engine_claim() {
-  local image="$1" holder=""
+  local image="$1" holder="" said="no release image is named (FORGE_IMAGE is not set)" complaint=""
   if [[ -n "${image}" ]] &&
-     "${DOCKER}" create --name "${ENGINE_CLAIM_NAME}" \
+     said="$("${DOCKER}" create --name "${ENGINE_CLAIM_NAME}" \
        --label "${ENGINE_CLAIM_LABEL}=${CHECKOUT_HASH}" \
-       --pull never --entrypoint true "${image}" >/dev/null 2>&1; then
+       --pull never --entrypoint true "${image}" 2>&1 >/dev/null)"; then
     log "this checkout (${CHECKOUT_HASH}) now holds this sandbox's engine: ${ENGINE_CLAIM_NAME}"
     return 0
   fi
-  if ! holder="$("${DOCKER}" container inspect --format "{{index .Config.Labels \"${ENGINE_CLAIM_LABEL}\"}}" "${ENGINE_CLAIM_NAME}" 2>&1)"; then
-    CLAIM_REFUSAL="this checkout could not take or confirm its claim on this sandbox's engine, and the engine would not say who holds it: $(printf '%s' "${holder}" | tr '\n' ' ' | cut -c1-300)"
+  # The label is read from the answer alone; a warning on the side is not it.
+  complaint="$(mktemp)"
+  if ! holder="$("${DOCKER}" container inspect --format "{{index .Config.Labels \"${ENGINE_CLAIM_LABEL}\"}}" "${ENGINE_CLAIM_NAME}" 2>"${complaint}")"; then
+    CLAIM_REFUSAL="this checkout could not create the engine claim from ${image:-no image}: $(printf '%s' "${said}" | tr '\n' ' ' | cut -c1-300). And the engine would not say who holds it: $(tr '\n' ' ' < "${complaint}" | cut -c1-300)"
+    rm -f "${complaint}"
     return 1
   fi
+  rm -f "${complaint}"
   holder="$(only_the_line_endings "${holder}")"
   if [[ "${holder}" == "${CHECKOUT_HASH}" ]]; then
     return 0

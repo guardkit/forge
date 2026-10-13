@@ -187,9 +187,11 @@ THE_TAG_HAS_MOVED = "the-tag-has-moved"
 #: keeps container labels, answers label-filtered listings, ``create`` (one
 #: container per name, from an image it holds), ``container inspect`` of one
 #: label, and ``network``/``volume`` ``ls``/``rm``. STANDIN_INSPECT_FAILS makes
-#: that inspect go unanswered; STANDIN_CREATE_WAITS_FOR names a file a
-#: ``create`` waits for before it does anything, so a test can pause a stop
-#: just before it takes the claim.
+#: that inspect go unanswered and STANDIN_INSPECT_WARNS adds a warning on its
+#: error output; STANDIN_CREATE_WAITS_FOR names a file a ``create`` waits for
+#: before it does anything, so a test can pause a stop just before it takes the
+#: claim. STANDIN_RM_REFUSES_WHILE and STANDIN_PS_ALL_FAILS_WHILE name files
+#: that switch a refusing removal, or silent ``ps -a`` listings, on and off.
 STANDIN_DOCKER = '''#!/usr/bin/env python3
 import json, os, pathlib, sys, time
 
@@ -384,6 +386,11 @@ if verb == "ps":
         print("Cannot connect to the Docker daemon (a stand-in, on purpose)",
               file=sys.stderr)
         sys.exit(1)
+    silent_while = os.environ.get("STANDIN_PS_ALL_FAILS_WHILE", "")
+    if "-a" in argv and silent_while and pathlib.Path(silent_while).exists():
+        print("Cannot connect to the Docker daemon (a stand-in, on purpose)",
+              file=sys.stderr)
+        sys.exit(1)
     all_of_them = "-a" in argv or "--all" in argv
     rules = label_rules(argv)
     if rules and not named(argv):
@@ -409,7 +416,9 @@ if verb == "rm":
     for name in argv[1:]:
         if name.startswith("-"):
             continue
-        if name == os.environ.get("STANDIN_RM_REFUSES", ""):
+        refuses_while = os.environ.get("STANDIN_RM_REFUSES_WHILE", "")
+        if name == os.environ.get("STANDIN_RM_REFUSES", "") and (
+                not refuses_while or pathlib.Path(refuses_while).exists()):
             sys.exit(1)
         (state / name).unlink(missing_ok=True)
         (state / (name + ".running")).unlink(missing_ok=True)
@@ -450,6 +459,8 @@ if verb == "container" and argv[1:2] == ["inspect"]:
     if not exists(argv[-1]):
         print("Error: No such container: " + argv[-1], file=sys.stderr)
         sys.exit(1)
+    if os.environ.get("STANDIN_INSPECT_WARNS"):
+        print("WARNING: a stand-in warning, on purpose", file=sys.stderr)
     fmt = argv[argv.index("--format") + 1] if "--format" in argv else ""
     key = fmt.split('"')[1] if fmt.count('"') >= 2 else ""
     print(labels_of(argv[-1]).get(key, ""))
@@ -3483,6 +3494,17 @@ class TestOneCheckoutPerEngine:
         _nothing_keyed_on_the_fixture_label(calls)
         _the_fixture_stack_is_intact(sandbox, build)
 
+    def test_a_warning_beside_this_checkouts_own_claim_is_not_a_refusal(
+        self, sandbox
+    ):
+        _the_claim_is_held_by(sandbox, _checkout_hash(sandbox))
+        process = _in_background(sandbox, STANDIN_INSPECT_WARNS="1")
+        try:
+            assert _both_runs(sandbox)
+        finally:
+            said = _end(process)
+        assert "held by another checkout" not in said
+
     def test_an_image_refusal_before_the_claim_removes_nothing(self, sandbox):
         # Another same-prefix checkout's containers are on the engine.
         _a_container(sandbox, "forge-sandbox-helper")
@@ -3511,6 +3533,17 @@ class TestTheStopTakesTheClaimToo:
         first_removal = next(i for i, c in enumerate(calls)
                              if c.split(" ", 1)[0] in ("stop", "rm"))
         assert claim < first_removal
+
+    def test_a_missing_image_with_no_claim_is_named_with_the_engines_words(
+        self, sandbox
+    ):
+        _a_container(sandbox, "forge-sandbox-helper")
+        stopped = _run(sandbox, "stop", STANDIN_NO_IMAGE="1")
+        assert stopped.returncode == 5, stopped.stdout
+        assert f"could not create the engine claim from {IMAGE}" in stopped.stdout
+        assert "No such image" in stopped.stdout
+        _no_stop_or_rm(_calls(sandbox))
+        assert (sandbox["state"] / "forge-sandbox-helper").exists()
 
     def test_a_stop_by_another_checkout_removes_nothing(self, sandbox):
         first = _in_background(sandbox)
@@ -3606,3 +3639,65 @@ class TestTheStopTakesTheClaimToo:
                 _end(stopping)
             if first is not None:
                 _end(first)
+
+
+class TestTheSupervisorWaitsForTheOldRunnerToBeGone:
+    """Mid-run: a runner found not gone is logged and retried, never swept over."""
+
+    @pytest.mark.parametrize(
+        "how, said",
+        [
+            ("still-there", "is still there after it was asked to go"),
+            ("engine-silent", "would not say whether the old build runner"),
+        ],
+    )
+    def test_it_is_retried_and_nothing_is_swept_until_it_is_gone(
+        self, sandbox, how, said
+    ):
+        switch = sandbox["project"].parent / "not-gone-yet"
+        log = sandbox["project"].parent / "supervisor.log"
+        with log.open("w") as out:
+            process = subprocess.Popen(
+                ["bash", str(sandbox["script"])],
+                env=_settings(
+                    sandbox,
+                    SANDBOX_RUNNER_RESTART_SECONDS="0.2",
+                    STANDIN_RM_REFUSES="forge-sandbox-runner" if how == "still-there" else None,
+                    STANDIN_RM_REFUSES_WHILE=str(switch) if how == "still-there" else None,
+                    STANDIN_PS_ALL_FAILS_WHILE=str(switch) if how == "engine-silent" else None,
+                ),
+                stdout=out,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+        try:
+            assert _both_runs(sandbox)
+            build = _a_fixture_stack(sandbox)
+            switch.write_text("on\n")
+            before = len(_calls(sandbox))
+            # The runner dies; the supervisor finds it on its next round.
+            (sandbox["state"] / "forge-sandbox-runner.running").unlink()
+            for _ in range(150):
+                if log.read_text().count("tried again in") >= 2:
+                    break
+                time.sleep(0.1)
+            text = log.read_text()
+            assert text.count("tried again in") >= 2, text
+            assert said in text
+            assert process.poll() is None, text
+            _nothing_keyed_on_the_fixture_label(_calls(sandbox)[before:])
+            _the_fixture_stack_is_intact(sandbox, build)
+            # Once it is confirmed gone, the sweep runs and the runner returns.
+            switch.unlink()
+            for _ in range(150):
+                if not (sandbox["state"] / f"{build}-db-1").exists() and (
+                    sandbox["state"] / "forge-sandbox-runner.running"
+                ).exists():
+                    break
+                time.sleep(0.1)
+            _the_fixture_stack_is_gone(sandbox, build)
+            assert (sandbox["state"] / "forge-sandbox-runner.running").exists()
+        finally:
+            switch.unlink(missing_ok=True)
+            process.terminate()
+            process.wait(timeout=30)
