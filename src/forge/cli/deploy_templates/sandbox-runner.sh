@@ -1551,6 +1551,23 @@ the_engine_socket_for() {
 # own network as from a bridge. Nothing here uses host.docker.internal. The
 # network allow-list is the sandbox's, and applies to both as to everything in
 # here.
+#
+# AN INIT PROCESS IN FRONT OF EACH (13 October 2026). Both containers are
+# run with --init, so Docker's own docker-init (tini) is PID 1 and collects
+# the orphaned processes builds and commands leave behind: as PID 1 the helper
+# and the runner never did, and on 13 October the runner held 106 zombies out
+# of 111 processes. Tini passes signals on to the one process it starts. The
+# helper's stop is kept exactly as it was: as PID 1 with no SIGTERM handler,
+# the kernel dropped the SIGTERM `docker stop` sends, so a stop waited its ten
+# seconds and ended in SIGKILL (exit status 137), and the commands it had
+# started, each in a session of its own, received nothing. Its program
+# therefore installs a do-nothing SIGTERM handler before anything else, which
+# reproduces that under tini. A handler and not SIG_IGN: an ignored signal
+# stays ignored across exec, so every command the helper starts would ignore
+# the SIGTERM of its own polite stop of them; a handled one is reset to the
+# default in the new program. The runner keeps its own clean shutdown on
+# SIGTERM (uvicorn's); the one difference is that it now ends with status 143,
+# where as PID 1 it ended with about 0, and nothing acts on that status (it is only logged).
 start_helper() {
   log "starting the deploy helper from ${IMAGE_REFERENCE} on this sandbox's own network, ${BIND}:${SIDECAR_PORT}"
   # The helper's job is to run a project's own vetted deploy and merge
@@ -1560,6 +1577,7 @@ start_helper() {
     --name "${HELPER_NAME}" \
     --user "${CONTAINER_USER}" \
     --no-healthcheck \
+    --init \
     --network host \
     --env "FORGE_DEPLOY_SIDECAR_PORT=${SIDECAR_PORT}" \
     --env "FORGE_DEPLOY_SIDECAR_HOST=${BIND}" \
@@ -1569,7 +1587,7 @@ start_helper() {
     --workdir "${REPO_ROOT}" \
     --entrypoint python \
     "${IMAGE_REFERENCE}" \
-    -c 'import os; from forge.deploy_sidecar.service import serve; serve(host=os.environ["FORGE_DEPLOY_SIDECAR_HOST"], port=int(os.environ["FORGE_DEPLOY_SIDECAR_PORT"]))' \
+    -c 'import os, signal; signal.signal(signal.SIGTERM, lambda signum, frame: None); from forge.deploy_sidecar.service import serve; serve(host=os.environ["FORGE_DEPLOY_SIDECAR_HOST"], port=int(os.environ["FORGE_DEPLOY_SIDECAR_PORT"]))' \
     >/dev/null
 }
 
@@ -1610,6 +1628,7 @@ start_runner() {
     --name "${RUNNER_NAME}" \
     --user "${CONTAINER_USER}" \
     --no-healthcheck \
+    --init \
     --network host \
     ${ENV_ARGUMENTS[@]+"${ENV_ARGUMENTS[@]}"} \
     "${MOUNTS[@]}" \

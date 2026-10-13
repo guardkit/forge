@@ -192,6 +192,10 @@ THE_TAG_HAS_MOVED = "the-tag-has-moved"
 #: before it does anything, so a test can pause a stop just before it takes the
 #: claim. STANDIN_RM_REFUSES_WHILE and STANDIN_PS_ALL_FAILS_WHILE name files
 #: that switch a refusing removal, or silent ``ps -a`` listings, on and off.
+#:
+#: STANDIN_EXIT_STATUS (13 October 2026) is the exit status a container that
+#: dies at once is left with: 1 unless a test says otherwise. Under ``--init``
+#: the build runner ends a stop with 143, not 0 (see test_sandbox_runner_init).
 STANDIN_DOCKER = '''#!/usr/bin/env python3
 import json, os, pathlib, sys, time
 
@@ -516,7 +520,9 @@ if verb == "run":
         lines.append("x" * 1000)
         lines.append("OSError: [Errno 98] Address already in use")
         (state / (name + ".logs")).write_text("\\n".join(lines) + "\\n")
-        (state / (name + ".exitcode")).write_text("1\\n")
+        (state / (name + ".exitcode")).write_text(
+            os.environ.get("STANDIN_EXIT_STATUS", "1") + "\\n"
+        )
     print("an-id-for-" + name)
     sys.exit(0)
 
@@ -823,6 +829,17 @@ class TestItStartsTwoContainersFromThatOneImage:
             ENGINE_ID,
             ENGINE_ID,
         ]
+
+    def test_both_containers_are_run_with_init(self, sandbox, started):
+        """Both start behind Docker's own init process (13 October 2026), so the
+        orphans their builds and commands leave are collected, not kept as
+        zombies. ``--init`` is a Docker option: it comes before the image."""
+        runs = [c for c in _calls(sandbox) if c.startswith("run ")]
+        assert len(runs) == 2
+        for call in runs:
+            words = call.split()
+            assert "--init" in words, call
+            assert words.index("--init") < words.index(ENGINE_ID), call
 
     def test_the_two_ports_are_open_inside_the_sandbox(self, sandbox, started):
         runs = [c for c in _calls(sandbox) if c.startswith("run ")]
@@ -1495,6 +1512,22 @@ class TestAnUnreadableEngineIsNotAnEmptyEngine:
         assert not (sandbox["state"] / "forge-sandbox-helper").exists()
         assert not (sandbox["state"] / "forge-sandbox-runner").exists()
         # Nothing to recover from, so the record goes.
+        assert not record.exists()
+
+    def test_a_stop_after_the_runner_ended_with_143_still_ends_zero(self, sandbox):
+        """Under ``--init`` the runner ends a stop with 143 (uvicorn raises the
+        SIGTERM again after its clean shutdown, and tini reports it). A stop
+        is confirmed by both containers being gone, never by that number."""
+        self._two_containers_running(sandbox)
+        (sandbox["state"] / "forge-sandbox-runner.exitcode").write_text("143\n")
+        record = self._a_record_left_behind(sandbox)
+
+        stopped = _run(sandbox, "stop")
+
+        assert stopped.returncode == 0, stopped.stdout
+        assert "stopped:" in stopped.stdout
+        assert not (sandbox["state"] / "forge-sandbox-helper").exists()
+        assert not (sandbox["state"] / "forge-sandbox-runner").exists()
         assert not record.exists()
 
     def test_the_supervisor_does_not_replace_a_container_it_cannot_see(
@@ -3030,6 +3063,22 @@ class TestAContainerThatDiesSaysWhy:
             assert any(this < r < following for r in reads), calls
         assert said.count("Address already in use") >= 2
         assert "the build runner is no longer running" in said
+
+    def test_a_runner_that_ended_with_143_is_reported_and_replaced_like_any_other(
+        self, sandbox
+    ):
+        """143 is the runner's status after a SIGTERM under ``--init`` (13
+        October 2026). The supervisor only prints a status; it restarts on
+        "not running", so 143 is reported and replaced exactly as 1 is."""
+        said = self._run_until(
+            sandbox,
+            lambda: len(self._calls_starting(sandbox, "run", "forge-sandbox-runner")) >= 2,
+            STANDIN_DIES_AT_ONCE="forge-sandbox-runner",
+            STANDIN_EXIT_STATUS="143",
+        )
+        assert "(forge-sandbox-runner) stopped with exit status 143" in said
+        assert "the build runner is no longer running; starting it again" in said
+        assert len(self._calls_starting(sandbox, "run", "forge-sandbox-runner")) >= 2
 
     @staticmethod
     def _a_listener(answers: dict[str, str]):
