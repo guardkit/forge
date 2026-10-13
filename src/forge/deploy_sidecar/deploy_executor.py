@@ -980,6 +980,14 @@ class DeployExecutor:
         """
         if not note.group:
             return True, ""
+        if note.group == os.getpgrp():
+            # A note naming this helper's own process group is damaged: a
+            # signal to it would stop the helper itself. Refuse, the safe side.
+            return False, (
+                f"the deploy command still running for {note.target} could "
+                "not be stopped (its note names this helper's own process "
+                "group), so nothing new was started"
+            )
         deadline = self._clock() + self._stop_confirm_seconds
         for sig in (signal.SIGTERM, signal.SIGKILL):
             # Looked at again before EVERY signal, not only by whoever decided
@@ -1790,7 +1798,7 @@ class DeployExecutor:
         # Never signal group 0 (this process's own group) or our own group: a
         # spawn seam that answers with no pid would otherwise turn this into
         # the deploy sidecar killing itself (23 September 2026, the hazard a
-        # reviewer met with a stubbed spawn). _stop_confirmed guards the same.
+        # reviewer met with a stubbed spawn). _stop_and_confirm guards the same.
         if not group or group == os.getpgrp():
             return
         for sig in (signal.SIGTERM, signal.SIGKILL):

@@ -451,13 +451,46 @@ class TestATakeoverStopsAndConfirms:
             process_table=_AlwaysAlive(),
         )
         # A note of a live command, written by hand: this test is about the
-        # refusal, not about starting anything.
-        _write_note(notes, TARGET, counter=1, build="build-a", group=os.getpid())
-        answer = executor.run(_ask(TARGET, _quick(workshop), 2, "build-b", workshop))
+        # refusal, not about starting anything. The noted group is a throwaway
+        # process of its own: naming the test runner's group here once made the
+        # stop signal pytest itself whenever pytest led its own group.
+        stand_in = subprocess.Popen(["sleep", "60"], start_new_session=True)
+        try:
+            _write_note(
+                notes, TARGET, counter=1, build="build-a", group=stand_in.pid
+            )
+            answer = executor.run(
+                _ask(TARGET, _quick(workshop), 2, "build-b", workshop)
+            )
+        finally:
+            _kill(stand_in.pid)
+            stand_in.wait(timeout=10)
         assert answer.accepted is False
         assert answer.word == "the-old-command-could-not-be-confirmed-stopped"
         assert "published, deployment pending" in answer.sentence
         assert "not confirmed gone" in answer.sentence
+
+    def test_a_note_naming_the_helpers_own_group_is_never_signalled(
+        self, notes, workshop, TARGET, monkeypatch
+    ) -> None:
+        """A damaged note can never make the helper stop itself."""
+        import forge.deploy_sidecar.deploy_executor as deploy_executor
+
+        signalled: list[int] = []
+        monkeypatch.setattr(
+            deploy_executor.os, "killpg", lambda group, sig: signalled.append(group)
+        )
+        executor = _executor(
+            notes,
+            stop_confirm_seconds=0.4,
+            process_table=_AlwaysAlive(),
+        )
+        _write_note(notes, TARGET, counter=1, build="build-a", group=os.getpgrp())
+        answer = executor.run(_ask(TARGET, _quick(workshop), 2, "build-b", workshop))
+        assert os.getpgrp() not in signalled
+        assert answer.accepted is False
+        assert answer.word == "the-old-command-could-not-be-confirmed-stopped"
+        assert "own process group" in answer.sentence
 
     def test_a_stop_on_one_target_does_not_hold_up_another_target(
         self, notes, workshop, tmp_path
