@@ -159,7 +159,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
-from forge.launch_environment import build_launch_env, declared_setting_refusal
+from forge.launch_environment import build_project_command_env, declared_setting_refusal
 
 logger = logging.getLogger(__name__)
 
@@ -491,6 +491,10 @@ class DeployRequest:
     #: another build can have taken since the check (23 September 2026).
     artifact: str | None = None
     artifact_setting: str | None = None
+    #: The values a review preview issued to the project
+    #: (:class:`forge.deploy.review_preview.IssuedPreviewValues`), read and
+    #: checked by the helper service; ``None`` for every other deploy.
+    issued_env: Any = None
 
 
 @dataclass(frozen=True)
@@ -1574,13 +1578,21 @@ class DeployExecutor:
         return subprocess.Popen(**kwargs)  # noqa: S603 — a fixed argument list
 
     def _child_environment(self, request: DeployRequest) -> dict[str, str]:
-        """RULE (h): the named list, never a copy of this process's own.
+        """RULE (h): built, never a copy of this process's own.
 
-        The list is the factory's own, plus the memory name recorded for this
-        build and the setting NAMES the project itself declared — both carried
-        on the request, because the coordinator is the thing that read them off
-        the ledger at the commit the work started from. The identity the step
-        must deploy is added under the name the PROJECT declared for it.
+        BUILT FROM NOTHING (13 October 2026). The deploy step is the project's
+        own program, so it is given none of the factory's credentials: its
+        environment comes from
+        :func:`forge.launch_environment.build_project_command_env` — ``PATH``,
+        a private ``HOME`` and ``TMPDIR``, the locale, the proxies, the setting
+        NAMES the project itself declared (carried on the request, because the
+        coordinator read them off the ledger at the commit the work started
+        from), then the values the factory sets for this one command
+        (``ENV_FILE``, and the identity and artifact the step must deploy,
+        under the names the PROJECT declared for them), the values a review
+        preview issued, and the request's allowed values. Raises
+        :class:`forge.launch_environment.ProjectCommandEnvironmentError` when
+        one of those is refused; the step is then not started.
 
         AND THOSE TWO NAMES ARE CHECKED HERE TOO (23 September 2026, the
         fourth review of this stage). The request's own setting names used to
@@ -1594,19 +1606,12 @@ class DeployExecutor:
         is the rule :func:`declared_setting_refusal` already states for every
         other declared name.
         """
-        env = build_launch_env(
-            parent=self._parent,
-            memory_project=request.memory_project,
-            declared=request.launch_settings,
-        )
-        for name, value in (request.extra_env or {}).items():
-            if isinstance(name, str) and isinstance(value, str):
-                env[name] = value
+        additions: dict[str, str] = {}
         if request.env_file:
-            env["ENV_FILE"] = str(request.env_file)
+            additions["ENV_FILE"] = str(request.env_file)
         if request.identity and request.identity_setting:
             self._put_declared(
-                env,
+                additions,
                 str(request.identity_setting),
                 str(request.identity),
                 what="the identity this step must deploy",
@@ -1617,12 +1622,24 @@ class DeployExecutor:
         # in through (23 September 2026).
         if request.artifact and request.artifact_setting:
             self._put_declared(
-                env,
+                additions,
                 str(request.artifact_setting),
                 str(request.artifact),
                 what="the artifact that was checked",
             )
-        return env
+        overlay = {
+            name: value
+            for name, value in (request.extra_env or {}).items()
+            if isinstance(name, str) and isinstance(value, str)
+        }
+        return build_project_command_env(
+            request.cwd,
+            declared=request.launch_settings,
+            additions=additions,
+            issued=request.issued_env,
+            overlay=overlay,
+            parent=self._parent,
+        )
 
     @staticmethod
     def _put_declared(
@@ -1689,7 +1706,19 @@ class DeployExecutor:
             marker,
             program,
         ]
-        env = self._child_environment(request)
+        try:
+            env = self._child_environment(request)
+        except (OSError, ValueError) as exc:
+            return ExecutorAnswer(
+                accepted=False,
+                word="the-environment-was-refused",
+                sentence=(
+                    f"the deploy step for {target} was not started, because "
+                    f"its environment could not be built: {exc}. Nothing was "
+                    "deployed."
+                ),
+                marker=marker,
+            )
         limit = float(request.timeout or self._command_seconds)
         limit = min(limit, self._command_seconds) if limit > 0 else self._command_seconds
         # 1. THE PROVISIONAL NOTE, before anything is started.
@@ -2061,4 +2090,5 @@ def request_from(
         artifact_setting=(
             str(artifact_setting).strip() if artifact_setting else None
         ),
+        issued_env=defaults.get("issued_env"),
     )

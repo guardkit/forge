@@ -24,6 +24,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
+import pytest
 import yaml
 
 from forge.config.models import DeployStageConfig, ForgeConfig
@@ -540,3 +541,16 @@ def test_a_command_the_executor_stopped_comes_back_as_no_deploy(tmp_path: Path) 
     finally:
         server.shutdown()
         server.server_close()
+
+
+@pytest.fixture(autouse=True)
+def _tmp_path_is_a_checkout(tmp_path):
+    """A project's own program runs only inside a git checkout (13 October
+    2026): its private HOME and TMPDIR are made in the checkout's own git
+    directory, outside the project's files. So the folder these tests run
+    programs in is one."""
+    import subprocess as _subprocess
+
+    _subprocess.run(
+        ["git", "init", "-q", str(tmp_path)], check=True, capture_output=True
+    )

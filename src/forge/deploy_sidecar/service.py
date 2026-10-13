@@ -217,9 +217,10 @@ from forge.deploy.profile import (
     wrapper_inner_script,
 )
 from forge.deploy.review_preview import (
-    PREVIEW_ENV_KEYS,
     PREVIEW_ROUTES,
     PREVIEW_ROUTES_NEEDING_THE_SWITCH,
+    IssuedPreviewValues,
+    issued_preview_refusal,
     serve_preview_operation,
 )
 from forge.deploy_sidecar.deploy_executor import (
@@ -228,7 +229,11 @@ from forge.deploy_sidecar.deploy_executor import (
     request_from as deploy_request_from,
 )
 from forge.executor.shell_steps import _run_script_step
-from forge.launch_environment import build_launch_env, declared_setting_refusal
+from forge.launch_environment import (
+    build_launch_env,
+    build_project_command_env,
+    declared_setting_refusal,
+)
 from forge.memory.redaction import scrub_process_output
 from forge.pipeline.deployment_identity import declared_identity
 from forge.planning.declared_memory import (
@@ -470,6 +475,11 @@ class ScriptRunner(Protocol):
 
     Injected so tests can substitute a stub runner and the production path uses
     the real credential-scrubbing subprocess core — never a second executor.
+
+    ``issued_env`` (13 October 2026) is the values a review preview issued to
+    the project, as :class:`forge.deploy.review_preview.IssuedPreviewValues`.
+    It is passed only when a request carries some, so a runner written before
+    it is called exactly as before.
     """
 
     def __call__(
@@ -480,6 +490,7 @@ class ScriptRunner(Protocol):
         env_file: str | None,
         timeout: float = ...,
         extra_env: dict[str, str] | None = ...,
+        issued_env: IssuedPreviewValues | None = ...,
     ) -> tuple[int, str]: ...
 
 
@@ -496,6 +507,12 @@ class MergeRunner(Protocol):
     declared its builds need. All four are optional: every caller that predates
     them leaves them out, so a runner that does not accept them is still a
     runner.
+
+    Two runners have this shape (13 October 2026): :func:`run_merge_command`,
+    which starts the build system with the factory's list, and
+    :func:`run_project_program`, which starts the project's own program with
+    none of it. The project runner also takes ``issued`` (a review preview's
+    issued values), passed only when there are some.
     """
 
     def __call__(
@@ -887,14 +904,12 @@ def allowed_env_keys(
             cand_env = candidate.get("env")
             if isinstance(cand_env, dict):
                 keys.update(str(k) for k in cand_env)
-    # THE REVIEW PREVIEW'S OVERLAY (web readiness W7, 12 October 2026), and
-    # only for a project whose committed profile switches its preview on: the
-    # slot's ports and address, the link token, the resource label, the
-    # evidence folder and the compose project. All are the factory's own
-    # names, so the door is widened here rather than by the project.
-    preview = getattr(widens, "preview", None)
-    if preview is not None and preview.enabled:
-        keys.update(PREVIEW_ENV_KEYS)
+    # THE REVIEW PREVIEW'S VALUES DO NOT COME THROUGH THIS DOOR (13 October
+    # 2026). They used to widen it, for a project whose committed profile
+    # switches its preview on. They are values the preview ISSUES to the
+    # project — the link token among them — so they now travel in a field of
+    # their own, ``issued_env``, which :func:`_read_issued_env` checks; a
+    # preview name sent here is refused like any other undeclared key.
     # THE NAMES THE PROJECT DECLARED, each one checked before it is permitted.
     declaration = declared_identity(widens)
     return keys | _permitted_declared_names(
@@ -1023,6 +1038,46 @@ def _allowlisted_env(
             )
         env[key] = value
     return env, None
+
+
+def _read_issued_env(
+    raw: Any, committed: Any
+) -> tuple[IssuedPreviewValues | None, str | None]:
+    """A request's ``issued_env``, as values the review preview issued.
+
+    ``(values, None)``, ``(None, None)`` when the request carries none, or
+    ``(None, <plain sentence>)``. The sentence names the setting and never
+    shows a value (13 October 2026; design "Project commands run without the
+    factory's credentials", section 1a).
+
+    The checks, where the values are read:
+
+    * every name is one of the review preview's own (:data:`PREVIEW_ENV_KEYS`);
+    * the project's committed profile, at the bound commit, switches its
+      preview on (``committed``; ``None`` means it could not be read there,
+      and then nothing is accepted);
+    * the link token has the shape of a freshly made one;
+    * the token equals no value this service holds, so a credential of the
+      factory's own cannot be passed off as one the preview issued.
+
+    The helper that builds the program's environment checks the last three
+    again, against the additions and the overlay too.
+    """
+    if raw is None:
+        return None, None
+    if not isinstance(raw, dict):
+        return None, "'issued_env' must be a JSON object of text values"
+    refusal = issued_preview_refusal(raw, parent=os.environ)
+    if refusal is not None:
+        return None, f"the values sent as issued by the review preview were refused: {refusal}"
+    preview = getattr(committed, "preview", None) if committed is not None else None
+    if preview is None or not preview.enabled:
+        return None, (
+            "this request carries values issued by a review preview, and this "
+            "project's committed deploy profile does not switch its preview "
+            "on, so nothing was started"
+        )
+    return IssuedPreviewValues(raw), None
 
 
 def _not_declared_by_the_project(
@@ -1869,6 +1924,7 @@ def process_live_gate_run(
     command_runner: MergeRunner,
     memory_project: str | None = None,
     launch_settings: Sequence[str] | None = None,
+    issued: IssuedPreviewValues | None = None,
 ) -> tuple[int, dict[str, Any]]:
     """``/run`` carrying the repository's own live-gate driver (rule 85).
 
@@ -1948,6 +2004,10 @@ def process_live_gate_run(
         cwd,
         timeout,
     )
+    # THE VALUES THE REVIEW PREVIEW ISSUED, for its recorded journey (13
+    # October 2026): handed on as a keyword of their own, and only when there
+    # are some, so a runner written before them is called exactly as before.
+    issued_kwargs: dict[str, Any] = {"issued": issued} if issued is not None else {}
     try:
         exit_code, stdout, stderr = command_runner(
             argv=argv,
@@ -1957,6 +2017,7 @@ def process_live_gate_run(
             extra_env=extra_env or None,
             memory_project=memory_project,
             launch_settings=launch_settings,
+            **issued_kwargs,
         )
     except Exception as exc:  # noqa: BLE001 — never raise past the boundary
         return 500, {
@@ -2119,8 +2180,11 @@ def process_run_request(
     the project's deploy script through ``_run_script_step``, which built the
     child's environment with ``os.environ.copy()`` and handed it everything
     this process held. The environment door is now closed (the design's fourth
-    revision H): the script's environment is BUILT from the factory's own
-    named list plus these two fields, and what is not named is not passed.
+    revision H): the script's environment is BUILT, and since 13 October 2026
+    it is built from nothing (:func:`build_project_command_env`): the names the
+    project declared, the allowed values and the values a review preview
+    issued (``issued_env``, checked by :func:`_read_issued_env`), and none of
+    the factory's credentials.
 
     A REQUEST THAT CARRIES A ``deploy`` BLOCK is a deploy of the live thing,
     and it goes through the EXECUTOR (the design's H, I and J) rather than
@@ -2198,7 +2262,12 @@ def process_run_request(
         repo_path=repo_path,
         repo=repo,
         reads_declaration=(
-            payload.get("deploy") is not None or asks_the_project_to_widen
+            payload.get("deploy") is not None
+            or asks_the_project_to_widen
+            # Issued preview values are accepted only when the project's
+            # committed profile switches the preview on, so a request that
+            # carries them asks for that declaration to be read too.
+            or payload.get("issued_env") is not None
         ),
     )
     if launch_error is not None:
@@ -2221,6 +2290,15 @@ def process_run_request(
     # a request name", which is the one this reader answers.
     committed_profile, _ = profile_at_commit(repo_path, bound_at)
 
+    # THE VALUES A REVIEW PREVIEW ISSUED TO THE PROJECT (13 October 2026),
+    # read and checked here, where they arrive, and again where the program's
+    # environment is built. They never come through ``env``.
+    issued, issued_error = _read_issued_env(
+        payload.get("issued_env"), committed_profile
+    )
+    if issued_error is not None:
+        return 400, {"error": issued_error}
+
     # SANDBOX FIRST (rule 88) — the merge-ready gates reader's declared test
     # command. It is answered BEFORE the deploy profile is read, because a
     # repository can have a fix journey without being deployable at all: what
@@ -2229,10 +2307,17 @@ def process_run_request(
     if payload.get("declared_test") is not None:
         if not in_sandbox:
             return 400, {"error": _not_inside_a_sandbox("declared test command")}
+        if issued is not None:
+            return 400, {
+                "error": (
+                    "the declared test command is not part of a review preview, "
+                    "so it takes no values a preview issued; nothing was started"
+                )
+            }
         return process_declared_test_run(
             payload,
             repo_path=repo_path,
-            command_runner=command_runner or run_merge_command,
+            command_runner=command_runner or run_project_program,
             memory_project=launch_memory,
             launch_settings=launch_names,
         )
@@ -2265,9 +2350,10 @@ def process_run_request(
             repo_path=repo_path,
             profile=profile,
             extra_env=env_only,
-            command_runner=command_runner or run_merge_command,
+            command_runner=command_runner or run_project_program,
             memory_project=launch_memory,
             launch_settings=launch_names,
+            issued=issued,
         )
 
     # LAW 2 (part b) — refuse any script the profile does not name.
@@ -2372,6 +2458,7 @@ def process_run_request(
             memory_project=launch_memory,
             launch_settings=launch_names,
             timeout=timeout,
+            issued_env=issued,
         )
         if isinstance(built, str):
             return 400, {"error": built}
@@ -2401,17 +2488,19 @@ def process_run_request(
     # LAW 6 — execute through the shared subprocess core, no shell. The runner
     # itself never raises, but we still fence it so a stub/HTTP-layer surprise
     # cannot take the process down.
+    issued_kwargs: dict[str, Any] = {"issued_env": issued} if issued is not None else {}
     try:
         exit_code, output = script_runner(
+            **issued_kwargs,
             cwd=str(cwd),
             script=script,
             env_file=env_file,
             timeout=timeout,
             extra_env=extra_env or None,
             # THE ENVIRONMENT DOOR, closed for the vetted-script path too
-            # (23 September 2026). The runner builds the child's environment
-            # from the factory's own named list plus these two, rather than
-            # copying this process's whole one.
+            # (23 September 2026), and since 13 October 2026 built from
+            # nothing: the runner gives the project's script no credential of
+            # the factory's, only the names the project declared.
             memory_project=launch_memory,
             launch_settings=launch_names,
         )
@@ -2564,17 +2653,12 @@ def run_merge_command(
       child of it has no business reading that, and the named list already
       leaves it out.
 
-    The project's declared check and its live-gate driver go through here too,
-    and the factory does not know what those need. Its DEPLOY SCRIPT does NOT
-    yet (corrected 22 September 2026 after the stage's review): that runs
-    through ``process_run_request`` and ``executor/shell_steps.py``, which
-    still hands the child everything. It is closed in the executor stage, which
-    owns that path; until then the deploy script is the one command from the
-    helper that is not filtered. That is
-    exactly what the project declares by name in its own settings file and what
-    ``launch_settings`` carries: a project says what its scripts need, and it is
-    passed. A project that has declared nothing gets the factory's list, which
-    is the honest state rather than a hidden one.
+    ONLY THE FACTORY'S OWN LAUNCHES COME HERE NOW (13 October 2026). This
+    runner starts the build system — the merge, a fix journey's legs, the
+    declared checks — and the build system needs the factory's list. The
+    project's OWN programs (its declared test command and its live-gate
+    driver) go through :func:`run_project_program` instead, which hands them
+    no credential at all; the service's ``/run`` route defaults to that one.
     """
     # This is the sidecar's last local subprocess boundary.  The HTTP handler
     # validates first as well, before it resolves repositories/settings/git;
@@ -2620,6 +2704,71 @@ def run_merge_command(
     # Driver/profile environment is additive, but routing authority is decided
     # by the coordinator and cannot be replaced by a project-supplied value.
     env |= protected_routing
+    return _start_and_collect(argv=argv, cwd=cwd, env=env, timeout=timeout, what=what)
+
+
+def run_project_program(
+    *,
+    argv: list[str],
+    cwd: str,
+    timeout: float = MERGE_TIMEOUT_DEFAULT,
+    what: str = "the project's program",
+    extra_env: dict[str, str] | None = None,
+    memory_project: str | None = None,  # noqa: ARG001 — one runner signature
+    launch_settings: Sequence[str] | None = None,
+    issued: IssuedPreviewValues | None = None,
+    run_owner: str | None = None,
+) -> tuple[int, str, str]:
+    """Run one of the PROJECT'S own programs; return exit code and output.
+
+    The declared test command and the live-gate driver (rules 88 and 85) are
+    the project's own code, not the factory's, so — unlike
+    :func:`run_merge_command`, which starts the build system and must hand it
+    the factory's list — this runner gives the child an environment built from
+    nothing (:func:`forge.launch_environment.build_project_command_env`, 13
+    October 2026): ``PATH``, a private ``HOME`` and ``TMPDIR`` under the
+    repository's own git directory, the locale, the proxies, the NAMES the
+    project declared (``launch_settings``), the values a review preview issued
+    (``issued``) and the profile-allowed overlay (``extra_env``). The model
+    key, the bus password and the memory store's address stay with this
+    service, and so does the memory name: a project's program is not a build,
+    so ``memory_project`` is accepted for the one runner signature and never
+    handed on. ``run_owner`` sets the run-owner marker when a caller has the
+    build on the coordinator's record; nothing here guesses one.
+
+    Never raises: a program whose environment is refused (a credential-shaped
+    overlay name, a proxy carrying a password, an issued value that does not
+    check out) is reported as not started, with a sentence that names the
+    setting and never its value.
+    """
+    try:
+        env = build_project_command_env(
+            cwd,
+            declared=launch_settings or (),
+            issued=issued,
+            overlay=extra_env,
+            run_owner=run_owner,
+        )
+    except (OSError, ValueError) as exc:
+        return (MERGE_NOT_STARTED_EXIT_CODE, "", f"{what} was not started: {exc}")
+    return _start_and_collect(argv=argv, cwd=cwd, env=env, timeout=timeout, what=what)
+
+
+def _start_and_collect(
+    *,
+    argv: list[str],
+    cwd: str,
+    env: dict[str, str],
+    timeout: float,
+    what: str,
+) -> tuple[int, str, str]:
+    """Start ``argv`` in a session of its own with exactly ``env``, wait, read.
+
+    The one place the two runners above start a process, so a timeout stops
+    the whole process group for both and both outputs pass through the same
+    credential scrub. Which environment the child gets is decided by the
+    caller and only by the caller. Never raises.
+    """
     try:
         process = subprocess.Popen(  # noqa: S603 — fixed argv, no shell
             argv,
@@ -7833,11 +7982,17 @@ class _SidecarServer(ThreadingHTTPServer):
         check_runner: MergeRunner = run_merge_command,
         worktrees_root: Path | None = None,
         deploy_executor: DeployExecutor | None = None,
+        project_runner: MergeRunner = run_project_program,
     ) -> None:
         super().__init__(server_address, handler_cls)
         self.config_loader = config_loader
         self.script_runner = script_runner
+        # TWO RUNNERS, NOT ONE (13 October 2026). ``merge_runner`` starts the
+        # build system (the merge and the legs) with the factory's list;
+        # ``project_runner`` starts the PROJECT'S own programs (the declared
+        # test and the live-gate driver on ``/run``) with none of it.
         self.merge_runner = merge_runner
+        self.project_runner = project_runner
         # The git routes' seams: the subprocess core the declared checks run
         # through, and where the worktrees are made (None = the runner's own
         # default under the temp directory).
@@ -8032,7 +8187,9 @@ class DeploySidecarHandler(BaseHTTPRequestHandler):
                     payload,
                     config=config,
                     script_runner=self.server.script_runner,  # type: ignore[attr-defined]
-                    command_runner=self.server.merge_runner,  # type: ignore[attr-defined]
+                    # The project's own programs: never the merge runner,
+                    # which hands its child the factory's credentials.
+                    command_runner=self.server.project_runner,  # type: ignore[attr-defined]
                     deploy_executor=self.server.deploy_executor,  # type: ignore[attr-defined]
                 )
             self._write_json(status, body)
@@ -8059,12 +8216,20 @@ def build_server(
     check_runner: MergeRunner = run_merge_command,
     worktrees_root: Path | None = None,
     deploy_executor: DeployExecutor | None = None,
+    project_runner: MergeRunner = run_project_program,
 ) -> _SidecarServer:
     """Build (but do not start) the loopback-only sidecar HTTP server.
 
     ``host`` defaults to the loopback constant (LAW 5). Tests pass ``port=0`` to
     claim an ephemeral port and assert the bound address is loopback.
     ``check_runner`` and ``worktrees_root`` are the git routes' seams.
+
+    ``project_runner`` runs the project's own programs on ``/run`` (the
+    declared test and the live-gate driver); it defaults to
+    :func:`run_project_program`, which hands them none of the factory's
+    credentials. ``merge_runner`` (the merge and the legs) and
+    ``check_runner`` keep :func:`run_merge_command`, because they start the
+    build system.
 
     ``deploy_executor`` is the gate on deploys of the live thing. Left unset,
     this helper runs no such deploy: a request that owns a deployment target
@@ -8080,6 +8245,7 @@ def build_server(
         check_runner=check_runner,
         worktrees_root=worktrees_root,
         deploy_executor=deploy_executor,
+        project_runner=project_runner,
     )
 
 
@@ -8091,6 +8257,7 @@ def serve(
     script_runner: ScriptRunner = _run_script_step,
     merge_runner: MergeRunner = run_merge_command,
     check_runner: MergeRunner = run_merge_command,
+    project_runner: MergeRunner = run_project_program,
 ) -> None:
     """Run the sidecar forever (the ``python -m forge.deploy_sidecar`` body)."""
     logging.basicConfig(level=logging.INFO)
@@ -8117,6 +8284,7 @@ def serve(
         merge_runner=merge_runner,
         check_runner=check_runner,
         deploy_executor=executor,
+        project_runner=project_runner,
     )
     bound_host, bound_port = server.server_address[:2]
     logger.info(
@@ -8168,6 +8336,7 @@ __all__ = [
     "resolve_code_version",
     "resolve_guardkit_command",
     "run_merge_command",
+    "run_project_program",
     "allowed_scripts",
     "sidecar_is_inside_sandbox",
     "SIDECAR_IN_SANDBOX_ENV",

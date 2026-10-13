@@ -553,8 +553,17 @@ class RepoDriverLiveGateInvoker:
         driver_argv: The per-target driver command, e.g.
             ``["python3", "qa/gates/local_live_gate.py"]``.
         timeout_seconds: Hard wall on the driver subprocess (default 600).
-        extra_env: Non-secret env overlaid on ``os.environ`` for the driver
-            (e.g. a base URL); an empty map by default.
+        extra_env: Non-secret, profile-allowed values for the driver (e.g. a
+            base URL); an empty map by default.
+        launch_settings: The setting NAMES the project declared its own
+            programs need. Names only; each value is taken from this process.
+
+    WHAT THE DRIVER IS GIVEN (13 October 2026). The driver is the project's
+    own program, so its environment is built from nothing
+    (:func:`forge.launch_environment.build_project_command_env`): ``PATH``, a
+    private ``HOME`` and ``TMPDIR``, the locale, the proxies, the declared
+    names and ``extra_env``. It used to be this process's whole environment,
+    the factory's credentials included.
     """
 
     def __init__(
@@ -565,12 +574,14 @@ class RepoDriverLiveGateInvoker:
         timeout_seconds: int = 600,
         extra_env: dict[str, str] | None = None,
         journey_evidence: bool = False,
+        launch_settings: Sequence[str] | None = None,
     ) -> None:
         self._repo_path = Path(repo_path)
         self._driver_argv = list(driver_argv)
         self._timeout_seconds = timeout_seconds
         self._extra_env = dict(extra_env or {})
         self._journey_evidence = bool(journey_evidence)
+        self._launch_settings = tuple(str(name) for name in (launch_settings or ()))
 
     @property
     def repo_path(self) -> Path:
@@ -594,6 +605,7 @@ class RepoDriverLiveGateInvoker:
             timeout_seconds=self._timeout_seconds,
             extra_env=self._extra_env,
             journey_evidence=self._journey_evidence,
+            launch_settings=self._launch_settings,
         )
 
     def with_extra_env(self, overlay: dict[str, str]) -> "RepoDriverLiveGateInvoker":
@@ -615,6 +627,7 @@ class RepoDriverLiveGateInvoker:
             timeout_seconds=self._timeout_seconds,
             extra_env=merged,
             journey_evidence=self._journey_evidence,
+            launch_settings=self._launch_settings,
         )
 
     def with_journey_evidence(self) -> "RepoDriverLiveGateInvoker":
@@ -629,6 +642,7 @@ class RepoDriverLiveGateInvoker:
             timeout_seconds=self._timeout_seconds,
             extra_env=self._extra_env,
             journey_evidence=True,
+            launch_settings=self._launch_settings,
         )
 
     def invoke(
@@ -638,14 +652,20 @@ class RepoDriverLiveGateInvoker:
         # (the seam-boundary precedent above).
         import subprocess
 
+        from forge.launch_environment import build_project_command_env
+
         argv = [*self._driver_argv, "--feature", feature, "--target", target]
         if gates:
             argv += ["--gates", ",".join(gates)]
-        env = os.environ | self._extra_env
         run_id_fallback = f"{feature}-{target}"
         gate_ids = tuple(gates)
 
         try:
+            env = build_project_command_env(
+                self._repo_path,
+                declared=self._launch_settings,
+                overlay=self._extra_env,
+            )
             proc = subprocess.run(
                 argv,
                 cwd=str(self._repo_path),
@@ -782,8 +802,13 @@ class SidecarLiveGateInvoker:
         start_commit: str | None = None,
         by_hand: bool = False,
         journey_evidence: bool = False,
+        issued_env: dict[str, str] | None = None,
     ) -> None:
         self._journey_evidence = bool(journey_evidence)
+        # THE VALUES THE REVIEW PREVIEW ISSUED (13 October 2026), kept apart
+        # from ``extra_env`` and sent in a field of their own, so the helper
+        # can check where they came from before the driver is given them.
+        self._issued_env = {str(k): str(v) for k, v in dict(issued_env or {}).items()}
         self._base_url = str(base_url).rstrip("/")
         self._repo = repo
         self._repo_path = Path(repo_path)
@@ -839,6 +864,7 @@ class SidecarLiveGateInvoker:
             "start_commit": self._start_commit,
             "by_hand": self._by_hand,
             "journey_evidence": self._journey_evidence,
+            "issued_env": dict(self._issued_env),
         }
         fields.update(changes)
         return SidecarLiveGateInvoker(**fields)
@@ -854,6 +880,18 @@ class SidecarLiveGateInvoker:
     def with_journey_evidence(self) -> "SidecarLiveGateInvoker":
         """A copy that also reads the journey's evidence (the review preview only)."""
         return self._copy(journey_evidence=True)
+
+    def with_issued_env(self, issued: Any) -> "SidecarLiveGateInvoker":
+        """A copy carrying the values the review preview issued, on their own.
+
+        Takes the preview's :class:`forge.deploy.review_preview.IssuedPreviewValues`
+        and nothing else; they are never merged into ``extra_env``.
+        """
+        from forge.deploy.review_preview import IssuedPreviewValues
+
+        if not isinstance(issued, IssuedPreviewValues):
+            raise TypeError("issued values come only from the review preview")
+        return self._copy(issued_env=issued.as_dict())
 
     def invoke(
         self, *, feature: str, target: str, gates: tuple[str, ...] = ()
@@ -885,6 +923,8 @@ class SidecarLiveGateInvoker:
             body["memory_project"] = self._memory_project
         if self._launch_settings:
             body["launch_settings"] = list(self._launch_settings)
+        if self._issued_env:
+            body["issued_env"] = dict(self._issued_env)
         if self._build:
             body["build"] = self._build
         if self._start_commit:

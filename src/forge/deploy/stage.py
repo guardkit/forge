@@ -108,7 +108,7 @@ import logging
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from nats_core.events import (
     AssertionResult,
@@ -155,6 +155,9 @@ from forge.executor.registry import StepTypeRegistry
 from forge.executor.shell_steps import ScriptRunner
 from forge.persistence.repositories.runbook import RunbookRepository
 from forge.persistence.repositories.runbook_models import Runbook, Step
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from forge.deploy.review_preview import IssuedPreviewValues
 
 logger = logging.getLogger(__name__)
 
@@ -941,7 +944,7 @@ class DeployStageRunner:
         *,
         correlation_id: str,
         deploy_run_id: str,
-        preview_env: dict[str, str],
+        issued_env: "IssuedPreviewValues",
         cwd: str,
         memory_project: str | None = None,
         launch_settings: tuple[str, ...] = (),
@@ -950,11 +953,13 @@ class DeployStageRunner:
 
         The candidate leg's own deploy steps — the same runbook, the same
         sidecar, the project's own deploy script — run in the preview's laid-out
-        tree ``cwd``. ``preview_env`` is the overlay that makes it a preview and
-        names it (the slot's ports and address, the link token, the resource
-        label, the evidence folder and the compose project); it goes to the
-        deploy step with ``PREVIEW=1`` beside it, and to the health checks, the
-        way ``candidate.env`` goes to the candidate's.
+        tree ``cwd``. ``issued_env`` is what makes it a preview and names it
+        (the slot's ports and address, the link token, the resource label, the
+        evidence folder and the compose project): the values the preview
+        ISSUED to the project (13 October 2026). They go to the deploy step
+        with ``PREVIEW=1`` beside them, and to the health checks, as the
+        steps' ``issued_env`` — never in their ``extra_env`` — so the helper
+        can tell an issued token from a factory credential.
 
         A preview is not a deploy: no queue, start or failure event is
         published, no deploy record is written and no reservation is taken.
@@ -967,8 +972,8 @@ class DeployStageRunner:
             runbook_id=f"deploy-pv-{deploy_run_id}",
             target=profile.env_id,
             now=self._clock(),
-            compose_extra_env={"PREVIEW": "1", **preview_env},
-            check_extra_env=dict(preview_env),
+            compose_issued_env={"PREVIEW": "1", **issued_env.as_dict()},
+            check_issued_env=issued_env.as_dict(),
             cwd_override=cwd,
             inside_sandbox=self._runs_inside_the_sandbox(),
             memory_project=memory_project,
@@ -1018,7 +1023,7 @@ class DeployStageRunner:
         correlation_id: str,
         deploy_run_id: str,
         feature: str,
-        preview_env: dict[str, str],
+        issued_env: "IssuedPreviewValues",
         cwd: str,
     ) -> DeployStageResult:
         """THE REVIEW PREVIEW'S RECORDED JOURNEY (web readiness W7).
@@ -1052,7 +1057,9 @@ class DeployStageRunner:
             now=self._clock(),
         )
         invoker_override = self._gate_invoker_for(
-            driver_cwd_override=cwd, driver_env_overlay=dict(preview_env)
+            driver_cwd_override=cwd,
+            driver_env_overlay=None,
+            driver_issued_env=issued_env,
         )
         # Only this journey reads the driver's evidence fields (its report,
         # screenshots, video and counts); every other gate reads the envelope
@@ -1654,6 +1661,7 @@ class DeployStageRunner:
         *,
         driver_cwd_override: str | None,
         driver_env_overlay: dict[str, str] | None,
+        driver_issued_env: "IssuedPreviewValues | None" = None,
     ) -> LiveGateInvoker | None:
         """The invoker a gate run uses: moved into a tree, then given an overlay.
 
@@ -1697,6 +1705,25 @@ class DeployStageRunner:
                 logger.debug(
                     "live-gate invoker has no with_extra_env; candidate driver "
                     "overlay not applied"
+                )
+        # THE VALUES THE REVIEW PREVIEW ISSUED (13 October 2026), carried on
+        # their own so the helper can tell them from a factory credential. An
+        # invoker that cannot carry them separately refuses the gate rather
+        # than running the journey without them or mixing them into its
+        # ordinary overlay: a preview runs only inside a sandbox, and its
+        # invoker is the helper's.
+        if driver_issued_env is not None and not isinstance(
+            invoker_override, RefusingLiveGateInvoker
+        ):
+            base = invoker_override or self._live_gate_invoker
+            with_issued = getattr(base, "with_issued_env", None)
+            if callable(with_issued):
+                invoker_override = with_issued(driver_issued_env)
+            else:
+                invoker_override = RefusingLiveGateInvoker(
+                    f"the live-gate invoker ({type(base).__name__}) cannot carry "
+                    "the values the review preview issued, which run only in "
+                    "the repository's sandbox"
                 )
         return invoker_override
 

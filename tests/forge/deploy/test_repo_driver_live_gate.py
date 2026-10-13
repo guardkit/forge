@@ -13,6 +13,8 @@ import os
 import stat
 from pathlib import Path
 
+import pytest
+
 from forge.deploy.live_gate import LiveGateInvocation, RepoDriverLiveGateInvoker
 
 
@@ -462,3 +464,16 @@ def test_the_exit_code_fallback_carries_no_evidence() -> None:
     )
     assert invocation.verdict == "fail"
     assert invocation.media_refs == () and invocation.outcome is None
+
+
+@pytest.fixture(autouse=True)
+def _tmp_path_is_a_checkout(tmp_path):
+    """A project's own program runs only inside a git checkout (13 October
+    2026): its private HOME and TMPDIR are made in the checkout's own git
+    directory, outside the project's files. So the folder these tests run
+    programs in is one."""
+    import subprocess as _subprocess
+
+    _subprocess.run(
+        ["git", "init", "-q", str(tmp_path)], check=True, capture_output=True
+    )

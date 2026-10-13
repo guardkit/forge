@@ -290,3 +290,16 @@ class TestResultShape:
             "output_tail",
             "duration_seconds",
         }
+
+
+@pytest.fixture(autouse=True)
+def _tmp_path_is_a_checkout(tmp_path):
+    """A project's own program runs only inside a git checkout (13 October
+    2026): its private HOME and TMPDIR are made in the checkout's own git
+    directory, outside the project's files. So the folder these tests run
+    programs in is one."""
+    import subprocess as _subprocess
+
+    _subprocess.run(
+        ["git", "init", "-q", str(tmp_path)], check=True, capture_output=True
+    )

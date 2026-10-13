@@ -13,10 +13,10 @@ from __future__ import annotations
 
 import os
 import subprocess
-from typing import Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from forge.executor.registry import StepOutcome, StepTypeRegistry
-from forge.launch_environment import build_launch_env
+from forge.launch_environment import build_project_command_env
 from forge.memory.redaction import scrub_process_output
 from forge.persistence.repositories.runbook_models import Step, StepStatus
 
@@ -59,6 +59,7 @@ def _run_script_step(
     memory_project: str | None = None,
     launch_settings: Sequence[str] | None = None,
     deploy: dict[str, object] | None = None,
+    issued_env: Any = None,
 ) -> tuple[int, str]:
     """Run a shell script with timeout, size-cap, and credential scrubbing.
 
@@ -86,14 +87,17 @@ def _run_script_step(
             subprocess environment AFTER ENV_FILE (so entries here win on a
             key collision). Handlers use this to thread step-level signals
             (e.g. the O-32 revert contract) to the vetted script.
-        memory_project: The memory name recorded for the build this script is
-            running for, handed over on purpose. ``None`` = nothing was
-            recorded, and then no name is set at all, which is memory off
-            rather than somebody else's project name.
+        memory_project: Accepted so every script runner keeps one signature
+            (the helper service's runner sends it on). A project's own script
+            is not a build and is never given a memory name (13 October 2026).
         launch_settings: The setting NAMES the project itself declared its own
-            programs need beyond the factory's own list, read at the commit the
-            work started from. Names only; a value never comes out of a
-            project's settings file.
+            programs need, read at the commit the work started from. Names
+            only; a value never comes out of a project's settings file.
+        issued_env: The values the review preview issued to the project
+            (:class:`forge.deploy.review_preview.IssuedPreviewValues`), from
+            the helper service's own reader. A plain mapping is refused: a
+            preview runs only inside a sandbox, so a local call that carries
+            one has been handed something nobody issued.
 
     Returns:
         A tuple of (exit_code, output):
@@ -129,19 +133,33 @@ def _run_script_step(
     # command the sandbox's helper service did not filter, and its own
     # docstring said so where a reader met it.
     #
-    # Now the child's environment is BUILT: the factory's own named list, plus
-    # the memory name recorded for this build and the setting NAMES the
-    # project itself declared, both passed in by the caller that read them off
-    # the ledger. What is not named is not passed — not a credential the
-    # operator's shell was carrying, not an agent socket, not the
-    # coordinator's ledger.
-    env = build_launch_env(
-        memory_project=memory_project, declared=launch_settings or ()
-    )
-    if env_file is not None:
-        env["ENV_FILE"] = env_file
-    if extra_env:
-        env.update(extra_env)
+    # AND NOT EVEN THE FACTORY'S OWN LIST (13 October 2026). A deploy script
+    # is the project's own program, so its environment is built from nothing
+    # by the project-program helper: PATH, a private HOME and TMPDIR, the
+    # locale, the proxies, the NAMES the project declared, ``ENV_FILE``, the
+    # values the review preview issued and the allowed overlay. The model
+    # key, the bus password and the memory store's address stay with the
+    # factory, and so does the memory name: a project program is not a build.
+    if issued_env:
+        from forge.deploy.review_preview import IssuedPreviewValues
+
+        if not isinstance(issued_env, IssuedPreviewValues):
+            return (
+                1,
+                "this script was handed values as issued by the review "
+                "preview, and a preview runs only in the repository's sandbox, "
+                "where the helper service checks them first. Nothing was run.",
+            )
+    try:
+        env = build_project_command_env(
+            cwd,
+            declared=launch_settings or (),
+            additions={"ENV_FILE": env_file} if env_file is not None else None,
+            issued=issued_env or None,
+            overlay=_without(extra_env, "ENV_FILE") if env_file is not None else extra_env,
+        )
+    except (OSError, ValueError) as exc:
+        return (1, f"the script was not run: {exc}")
 
     # Resolve a bare script name (no directory component) relative to cwd.
     # subprocess resolves an executable containing a path separator relative
@@ -208,6 +226,11 @@ def _run_script_step(
     output = scrub_process_output(output)
 
     return (exit_code, output)
+
+
+def _without(values: Mapping[str, str] | None, name: str) -> dict[str, str]:
+    """``values`` less ``name``: an overlay never sets what an addition set."""
+    return {k: v for k, v in (values or {}).items() if k != name}
 
 
 def deploy_compose(step: Step, *, runner: ScriptRunner = _run_script_step) -> StepOutcome:
@@ -305,6 +328,18 @@ def deploy_compose(step: Step, *, runner: ScriptRunner = _run_script_step) -> St
     # ledger; the runner stamps them onto every request it sends and this step
     # hands over nothing about either.
 
+    # THE VALUES THE REVIEW PREVIEW ISSUED (13 October 2026), read apart from
+    # ``extra_env`` and handed to the runner apart from it, and only when there
+    # are some, so a runner written before them is called exactly as before.
+    params_issued = step.params.get("issued_env")
+    issued: dict[str, Any] = {}
+    if isinstance(params_issued, dict) and params_issued:
+        issued["issued_env"] = {
+            k: v
+            for k, v in params_issued.items()
+            if isinstance(k, str) and isinstance(v, str)
+        }
+
     # Delegate to the runner (default = in-process subprocess core)
     exit_code, captured_output = runner(
         cwd=cwd,
@@ -320,6 +355,7 @@ def deploy_compose(step: Step, *, runner: ScriptRunner = _run_script_step) -> St
         ),
         launch_settings=launch_settings,
         deploy=dict(ownership) if isinstance(ownership, dict) else None,
+        **issued,
     )
 
     # Map exit status to verdict

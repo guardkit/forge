@@ -93,6 +93,7 @@ def _run_scripts(
     dry_run: bool,
     runner: ScriptRunner = _run_script_step,
     extra_env: dict[str, str] | None = None,
+    issued_env: dict[str, str] | None = None,
 ) -> StepOutcome:
     """Run a list of ``{script, cwd?, env_file?}`` entries as subprocess steps.
 
@@ -108,6 +109,10 @@ def _run_scripts(
     overlay pointing the candidate-leg health checks at the ``-cand`` port).
     ``None`` (every legacy call) ⇒ ``extra_env=None`` to the runner ⇒
     byte-identical to before the overlay existed.
+
+    ``issued_env`` (13 October 2026): the values the review preview issued,
+    handed to the runner as a keyword of their own and only when there are
+    some, so a runner written before them is called exactly as before.
     """
     if dry_run:
         return StepOutcome(
@@ -129,6 +134,7 @@ def _run_scripts(
                     "ran": ran,
                 },
             )
+        issued: dict[str, Any] = {"issued_env": dict(issued_env)} if issued_env else {}
         exit_code, output = runner(
             cwd=cwd,
             script=script,
@@ -136,6 +142,7 @@ def _run_scripts(
             timeout=entry.get("timeout", DEFAULT_TIMEOUT_SECONDS),
             output_cap=entry.get("output_cap", DEFAULT_OUTPUT_CAP_BYTES),
             extra_env=extra_env,
+            **issued,
         )
         ran.append(
             {"script": script, "exit_code": exit_code, "captured_output": output}
@@ -457,6 +464,18 @@ def make_health_check_handler(
             if isinstance(params_extra_env, dict)
             else None
         )
+        # THE VALUES THE REVIEW PREVIEW ISSUED, read apart from ``extra_env``
+        # and handed on apart from it (13 October 2026).
+        params_issued = step.params.get("issued_env")
+        issued_env = (
+            {
+                k: v
+                for k, v in params_issued.items()
+                if isinstance(k, str) and isinstance(v, str)
+            }
+            if isinstance(params_issued, dict)
+            else None
+        )
         return _run_scripts(
             scripts,
             default_cwd=step.params.get("cwd"),
@@ -464,6 +483,7 @@ def make_health_check_handler(
             dry_run=dry_run,
             runner=runner,
             extra_env=extra_env,
+            issued_env=issued_env,
         )
 
     return health_check

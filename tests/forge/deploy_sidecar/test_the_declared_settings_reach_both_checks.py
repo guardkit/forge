@@ -273,7 +273,9 @@ class TestTheLiveCheckRoute:
         assert outcome.verdict == "pass", outcome.detail
 
         given = _what_the_child_got(repo)
-        assert given["memory"] == MEMORY_NAME
+        # The project's own program is not a build (13 October 2026): it is
+        # given the names its project declared, and no memory name.
+        assert given["memory"] is None
         assert given["declared"] == "/var/cache/some-tool"
         assert DECLARED_SETTING in given["names"]
 
@@ -374,7 +376,9 @@ class TestTheDeclaredTestRoute:
         assert exit_code == 0, detail
 
         given = _what_the_child_got(repo / ".forge" / "worktrees" / "journey-1")
-        assert given["memory"] == MEMORY_NAME
+        # The project's own program is not a build (13 October 2026): it is
+        # given the names its project declared, and no memory name.
+        assert given["memory"] is None
         assert given["declared"] == "/var/cache/some-tool"
         assert DECLARED_SETTING in given["names"]
 

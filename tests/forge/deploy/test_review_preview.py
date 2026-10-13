@@ -447,7 +447,10 @@ async def test_a_prepared_preview_is_ready_with_its_links_and_evidence(world: Wo
     assert (up["leg"], journey["leg"]) == ("preview_up", "preview_journey")
     tree = "/clone/.forge-candidates/preview-pv000000000001"
     assert up["candidate_cwd"] == journey["candidate_cwd"] == tree
-    assert up["identity_env"] == {
+    # The preview's values travel as values it ISSUED, never as an ordinary
+    # overlay (13 October 2026).
+    assert "identity_env" not in up and "identity_env" not in journey
+    assert up["issued_env"].as_dict() == {
         "COMPOSE_PROJECT_NAME": "notes-pv0",
         "FACTORY_PREVIEW_PORT": "8950",
         "FACTORY_PREVIEW_INTERNAL_PORT": "18950",
@@ -456,8 +459,11 @@ async def test_a_prepared_preview_is_ready_with_its_links_and_evidence(world: Wo
         "FACTORY_RESOURCE_LABEL": f"{LEASE_LABEL}=pv000000000001",
         "FACTORY_EVIDENCE_DIR": f"{tree}/{EVIDENCE_FOLDER}",
     }
-    assert journey["identity_env"] == {**up["identity_env"], "FACTORY_RECORD_VIDEO": "1"}
-    assert set(journey["identity_env"]) <= PREVIEW_ENV_KEYS
+    assert journey["issued_env"].as_dict() == {
+        **up["issued_env"].as_dict(),
+        "FACTORY_RECORD_VIDEO": "1",
+    }
+    assert journey["issued_env"].names() <= PREVIEW_ENV_KEYS
 
     # The evidence was kept once, read-only, before anything else.
     kept = world.root / "guardkit" / "notes-fixture" / "FEAT-AB12" / SHA_CAND / "pvrun-000000000001"
@@ -488,7 +494,7 @@ async def test_two_concurrent_preparations_get_different_slots(world: World) -> 
     }
     ports = {lease.port for lease in world.store.live()}
     assert ports == {8950, 8951}
-    projects = {call["identity_env"]["COMPOSE_PROJECT_NAME"] for call in world.dispatch.calls}
+    projects = {call["issued_env"]["COMPOSE_PROJECT_NAME"] for call in world.dispatch.calls}
     assert projects == {"notes-pv0", "notes-pv1"}
 
 
@@ -1661,10 +1667,13 @@ def test_the_preview_join_has_the_tree_the_build_systems_merge_makes(tmp_path: P
 # ---------------------------------------------------------------------------
 
 
-def test_the_sidecar_permits_the_overlay_only_when_the_preview_is_on() -> None:
+def test_the_sidecar_never_takes_the_preview_names_as_an_ordinary_overlay() -> None:
+    """Changed 13 October 2026: the preview's values travel only as values it
+    issued (``issued_env``), so its names never widen the ordinary door, even
+    with the preview switched on."""
     from forge.deploy_sidecar.service import allowed_env_keys
 
-    assert PREVIEW_ENV_KEYS <= allowed_env_keys(_profile())
+    assert not PREVIEW_ENV_KEYS & allowed_env_keys(_profile())
     assert not PREVIEW_ENV_KEYS & allowed_env_keys(_profile(enabled=False))
     plain = parse_deploy_profile({"env_id": "x", "compose": {"file": "c.yml"}})
     assert not PREVIEW_ENV_KEYS & allowed_env_keys(plain)
@@ -1699,6 +1708,9 @@ class _Invoker:
 
     def with_journey_evidence(self) -> "_Invoker":
         return _Invoker(self.cwd, self.env, True)
+
+    def with_issued_env(self, issued: Any) -> "_Invoker":
+        return _Invoker(self.cwd, {**self.env, **issued.as_dict()}, self.journey)
 
     def invoke(self, *, feature: str, target: str, gates: tuple[str, ...] = ()):
         from forge.deploy.live_gate import LiveGateInvocation
@@ -1749,26 +1761,36 @@ async def test_the_stage_runs_the_preview_with_the_candidate_legs_own_steps(tmp_
             "preview": {"enabled": True, "slots": SLOTS},
         }
     )
+    from forge.deploy.review_preview import IssuedPreviewValues
+
     overlay = {"COMPOSE_PROJECT_NAME": "notes-pv0", "FACTORY_PREVIEW_PORT": "8950"}
     tree = "/clone/.forge-candidates/preview-pv000000000001"
 
     up = await runner.preview_up(
-        profile, correlation_id="c", deploy_run_id="r1", preview_env=overlay, cwd=tree
+        profile,
+        correlation_id="c",
+        deploy_run_id="r1",
+        issued_env=IssuedPreviewValues(overlay),
+        cwd=tree,
     )
     assert up.outcome == "complete", up
     rb = repository.load_runbook("deploy-pv-r1", correlation_id="c")
     compose, health = rb.steps
     assert compose.step_type == "deploy_compose"
-    assert compose.params["extra_env"] == {"PREVIEW": "1", **overlay}
+    # The preview's values ride as the steps' ``issued_env``, never in
+    # ``extra_env`` (13 October 2026).
+    assert compose.params["issued_env"] == {"PREVIEW": "1", **overlay}
+    assert not set(compose.params.get("extra_env") or {}) & PREVIEW_ENV_KEYS
     assert compose.params["cwd"] == tree
-    assert health.params["extra_env"] == overlay and health.params["cwd"] == tree
+    assert health.params["issued_env"] == overlay and health.params["cwd"] == tree
+    assert not set(health.params.get("extra_env") or {}) & PREVIEW_ENV_KEYS
 
     journey = await runner.preview_journey(
         profile,
         correlation_id="c",
         deploy_run_id="r1",
         feature="FEAT-AB12",
-        preview_env={**overlay, "FACTORY_RECORD_VIDEO": "1"},
+        issued_env=IssuedPreviewValues({**overlay, "FACTORY_RECORD_VIDEO": "1"}),
         cwd=tree,
     )
     assert journey.outcome == "complete" and journey.verdict == "pass"
@@ -1797,7 +1819,9 @@ async def test_the_dispatch_carries_the_two_preview_legs(tmp_path: Path) -> None
             return "journey"
 
     import forge.deploy.composition as composition
+    from forge.deploy.review_preview import IssuedPreviewValues
 
+    issued = IssuedPreviewValues({"FACTORY_PREVIEW_PORT": "8950"})
     original = composition.build_deploy_stage_runner
     composition.build_deploy_stage_runner = lambda *a, **k: _Runner()
     try:
@@ -1808,7 +1832,7 @@ async def test_the_dispatch_carries_the_two_preview_legs(tmp_path: Path) -> None
             runbook_publisher=None,
             deploy_publisher=None,
             candidate_cwd="/tree",
-            identity_env={"FACTORY_PREVIEW_PORT": "8950"},
+            issued_env=issued,
             feature="FEAT-AB12",
         )
         config = DeployStageConfig(enabled=True)
@@ -1818,9 +1842,20 @@ async def test_the_dispatch_carries_the_two_preview_legs(tmp_path: Path) -> None
             await dispatch_deploy_stage(
                 config, _profile(), leg="preview_up", **{**common, "candidate_cwd": None}
             )
+        # A plain mapping, the old way, is not a value the preview issued.
+        with pytest.raises(ValueError, match="values the preview issued"):
+            await dispatch_deploy_stage(
+                config,
+                _profile(),
+                leg="preview_up",
+                **{
+                    **{k: v for k, v in common.items() if k != "issued_env"},
+                    "identity_env": {"FACTORY_PREVIEW_PORT": "8950"},
+                },
+            )
     finally:
         composition.build_deploy_stage_runner = original
-    assert runner_calls["up"]["preview_env"] == {"FACTORY_PREVIEW_PORT": "8950"}
+    assert runner_calls["up"]["issued_env"] is issued
     assert runner_calls["up"]["cwd"] == "/tree"
     assert runner_calls["journey"]["feature"] == "FEAT-AB12"
 
@@ -1970,7 +2005,7 @@ async def test_a_profile_without_addresses_uses_the_coordinator_s_host(
     assert evidence.state == "ready", evidence.failure_reason
     assert evidence.app_url == "https://preview.example.test:8950/?preview=the-right-token"
     up = next(call for call in world.dispatch.calls if call["leg"] == "preview_up")
-    assert up["identity_env"]["FACTORY_PREVIEW_URL"] == "https://preview.example.test:8950"
+    assert up["issued_env"]["FACTORY_PREVIEW_URL"] == "https://preview.example.test:8950"
 
 
 @pytest.mark.asyncio
