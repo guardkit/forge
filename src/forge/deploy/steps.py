@@ -85,6 +85,12 @@ def _default_secret_presence(name: str) -> bool:
     return name in os.environ
 
 
+def _the_checkout(step: Step) -> str | None:
+    """The checkout a step's scripts belong to, when the stage put it there."""
+    value = step.params.get("repository")
+    return value if isinstance(value, str) and value.strip() else None
+
+
 def _run_scripts(
     scripts: list[dict[str, Any]],
     *,
@@ -94,6 +100,7 @@ def _run_scripts(
     runner: ScriptRunner = _run_script_step,
     extra_env: dict[str, str] | None = None,
     issued_env: dict[str, str] | None = None,
+    repository: str | None = None,
 ) -> StepOutcome:
     """Run a list of ``{script, cwd?, env_file?}`` entries as subprocess steps.
 
@@ -135,6 +142,10 @@ def _run_scripts(
                 },
             )
         issued: dict[str, Any] = {"issued_env": dict(issued_env)} if issued_env else {}
+        if repository:
+            # The checkout these scripts belong to, when the stage knows it:
+            # their private home is made in its own git directory.
+            issued["repository"] = repository
         exit_code, output = runner(
             cwd=cwd,
             script=script,
@@ -249,6 +260,7 @@ def make_import_realm_handler(*, dry_run: bool):
             default_cwd=step.params.get("cwd"),
             default_env_file=step.params.get("env_file"),
             dry_run=False,
+            repository=_the_checkout(step),
         )
 
     return import_realm
@@ -358,6 +370,7 @@ def make_seed_fixtures_handler(*, dry_run: bool):
             default_cwd=step.params.get("cwd"),
             default_env_file=step.params.get("env_file"),
             dry_run=dry_run,
+            repository=_the_checkout(step),
         )
 
     return seed_fixtures
@@ -408,6 +421,7 @@ def make_warm_models_handler(*, dry_run: bool):
             default_cwd=step.params.get("cwd"),
             default_env_file=step.params.get("env_file"),
             dry_run=False,
+            repository=_the_checkout(step),
         )
 
     return warm_models
@@ -481,6 +495,7 @@ def make_health_check_handler(
             default_cwd=step.params.get("cwd"),
             default_env_file=step.params.get("env_file"),
             dry_run=dry_run,
+            repository=_the_checkout(step),
             runner=runner,
             extra_env=extra_env,
             issued_env=issued_env,

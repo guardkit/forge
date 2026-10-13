@@ -170,6 +170,12 @@ def _config(repo_paths: dict[str, str]) -> ForgeConfig:
 def worktree(tmp_path: Path) -> Path:
     tree = tmp_path / "worktree"
     (tree / ".guardkit" / "autobuild").mkdir(parents=True)
+    # A worktree is a checkout of its own (14 October 2026): the declared
+    # test's private HOME is made in that checkout's git directory, and no
+    # folder above it is looked at.
+    import subprocess as _subprocess
+
+    _subprocess.run(["git", "init", "-q", str(tree)], check=True, capture_output=True)
     (tree / ".guardkit" / "autobuild" / "review.json").write_text(
         "{}", encoding="utf-8"
     )

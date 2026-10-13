@@ -160,6 +160,7 @@ async def verify_tests(
     test_command: str = "pytest",
     timeout_seconds: int = 600,
     output_tail_chars: int = 4000,
+    repository: Path | None = None,
 ) -> TestVerificationResult:
     """Run ``test_command`` inside ``worktree_path`` and parse its output.
 
@@ -203,7 +204,12 @@ async def verify_tests(
     # own git directory.
     from forge.launch_environment import build_project_command_env
 
-    env = build_project_command_env(worktree_path)
+    # Anchored on the checkout itself (``repository``, or the worktree, which
+    # is a checkout of its own): no folder above it is ever looked at.
+    env = build_project_command_env(
+        worktree_path,
+        repository=repository if repository is not None else worktree_path,
+    )
     stdout, _stderr, exit_code, duration, timed_out = await _execute_via_deepagents(
         command=argv,
         cwd=str(worktree_path),

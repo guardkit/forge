@@ -352,6 +352,11 @@ def deploy_compose(step: Step, *, runner: ScriptRunner = _run_script_step) -> St
             for k, v in params_issued.items()
             if isinstance(k, str) and isinstance(v, str)
         }
+    # THE CHECKOUT THIS STEP BELONGS TO, when the stage put it on the step:
+    # the script's private home is made in that checkout's own git directory.
+    checkout = step.params.get("repository")
+    if isinstance(checkout, str) and checkout.strip():
+        issued["repository"] = checkout
 
     # Delegate to the runner (default = in-process subprocess core)
     exit_code, captured_output = runner(
@@ -411,6 +416,8 @@ def run_smoke_tests(step: Step) -> StepOutcome:
     timeout = step.params.get("timeout", DEFAULT_TIMEOUT_SECONDS)
     output_cap = step.params.get("output_cap", DEFAULT_OUTPUT_CAP_BYTES)
 
+    checkout = step.params.get("repository")
+
     # Delegate to shared core
     exit_code, captured_output = _run_script_step(
         cwd=cwd,
@@ -418,6 +425,7 @@ def run_smoke_tests(step: Step) -> StepOutcome:
         env_file=env_file,
         timeout=timeout,
         output_cap=output_cap,
+        repository=checkout if isinstance(checkout, str) and checkout.strip() else None,
     )
 
     # Map exit status to verdict: 0 → passed, non-zero → failed

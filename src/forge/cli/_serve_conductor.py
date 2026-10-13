@@ -845,6 +845,7 @@ def _run_declared_command(
     cwd: "Path | str",
     timeout_seconds: int,
     launch_settings: "Sequence[str] | None" = None,
+    repository: "Path | str | None" = None,
 ) -> "tuple[int | None, str]":
     """Run one declared command, bounded. ``(exit_code, detail)``.
 
@@ -866,6 +867,9 @@ def _run_declared_command(
     (:func:`forge.launch_environment.build_project_command_env`), with the
     setting NAMES the project declared (``launch_settings``) and a private
     ``HOME`` and ``TMPDIR`` in the repository's own git directory.
+    ``repository`` is the checkout the command belongs to; left out, it is
+    ``cwd`` itself (a declared test runs at the root of a worktree, which is
+    a checkout of its own), so no folder above it is ever looked at.
     """
     from forge.launch_environment import (
         build_project_command_env,
@@ -873,7 +877,11 @@ def _run_declared_command(
     )
 
     try:
-        env = build_project_command_env(cwd, declared=launch_settings or ())
+        env = build_project_command_env(
+            cwd,
+            declared=launch_settings or (),
+            repository=repository if repository is not None else cwd,
+        )
         completed = subprocess.run(  # noqa: S602 — the repo's own declared command
             command,
             shell=True,

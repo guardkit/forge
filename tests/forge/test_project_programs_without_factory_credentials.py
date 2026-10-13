@@ -1339,6 +1339,202 @@ def test_a_request_env_file_that_clashes_with_the_factorys_is_refused(
 
 
 # ---------------------------------------------------------------------------
+# A value the factory sets may not carry one of the factory's own (14 Oct)
+# ---------------------------------------------------------------------------
+
+
+class TestAnAdditionCannotCarryTheFactorysOwnValues:
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "FLEET_MEMORY_PG_DSN",
+            "FORGE_NATS_URL",
+            "FLEET_MEMORY_NATS_URL",
+            "OPENAI_BASE_URL",
+            "ANTHROPIC_BASE_URL",
+        ],
+    )
+    def test_a_factory_name_is_refused_as_an_addition(
+        self, project: Path, name: str
+    ) -> None:
+        from forge.launch_environment import build_project_command_env
+
+        with pytest.raises(ValueError) as refused:
+            build_project_command_env(project, additions={name: "x"})
+        assert name in str(refused.value)
+
+    @pytest.mark.parametrize("name", ["FLEET_MEMORY_PG_DSN", "OPENAI_BASE_URL"])
+    def test_an_ordinary_name_carrying_a_factory_value_is_refused(
+        self, project: Path, name: str
+    ) -> None:
+        from forge.launch_environment import (
+            ProjectCommandEnvironmentError,
+            build_project_command_env,
+        )
+
+        with pytest.raises(ProjectCommandEnvironmentError) as refused:
+            build_project_command_env(
+                project, additions={"DATABASE_URL": SENTINELS[name]}
+            )
+        assert "DATABASE_URL" in str(refused.value)
+        assert name in str(refused.value)
+        _no_sentinel(str(refused.value), "the refusal")
+
+    def test_the_additions_the_factory_really_sets_still_arrive(
+        self, project: Path
+    ) -> None:
+        from forge.launch_environment import build_project_command_env
+
+        env = build_project_command_env(
+            project,
+            additions={
+                "ENV_FILE": "/the/project/.env",
+                "DEPLOY_IDENTITY": "shop:abc123",
+                "DEPLOY_ARTIFACT": "sha256:" + "0" * 64,
+            },
+        )
+        assert env["ENV_FILE"] == "/the/project/.env"
+        assert env["DEPLOY_IDENTITY"] == "shop:abc123"
+
+    def test_the_owned_deploy_refuses_an_identity_carrying_a_factory_value(
+        self, project: Path, tmp_path: Path
+    ) -> None:
+        from forge.deploy_sidecar.deploy_executor import DeployExecutor, DeployRequest
+
+        answer = DeployExecutor(
+            notes_root=tmp_path / "notes",
+            ask_the_coordinator=lambda _t: {"counter": 1, "build": BUILD},
+        ).run(
+            DeployRequest(
+                target=f"shop-{tmp_path.name}::live",
+                target_counter=1,
+                build=BUILD,
+                cwd=str(project),
+                script="deploy/deploy.sh",
+                identity=SENTINELS["FLEET_MEMORY_PG_DSN"],
+                identity_setting="DEPLOY_IDENTITY",
+                repository=str(project),
+            )
+        )
+        assert not answer.accepted, answer
+        assert "DEPLOY_IDENTITY" in answer.sentence
+        _no_sentinel(answer.sentence, "the refusal")
+        assert not (project / "env-deploy.json").exists(), "it ran"
+
+
+# ---------------------------------------------------------------------------
+# A named repository's git directory is its own (14 October 2026)
+# ---------------------------------------------------------------------------
+
+
+class TestANamedRepositoryUsesItsOwnGitDirectory:
+    def _refused(self, folder: Path, **kwargs: Any) -> None:
+        from forge.launch_environment import (
+            ProjectCommandEnvironmentError,
+            build_project_command_env,
+        )
+
+        with pytest.raises(ProjectCommandEnvironmentError):
+            build_project_command_env(folder, **kwargs)
+
+    def test_a_gitdir_file_naming_an_unrelated_repository_is_refused(
+        self, tmp_path: Path
+    ) -> None:
+        foreign = _a_project(tmp_path / "foreign")
+        redirect = tmp_path / "redirect"
+        redirect.mkdir()
+        (redirect / ".git").write_text(f"gitdir: {foreign / '.git'}\n", encoding="utf-8")
+        self._refused(redirect, repository=redirect)
+        self._refused(redirect)
+        assert not (foreign / ".git" / "forge-project-home").exists()
+
+    def test_a_commondir_naming_an_unrelated_repository_is_refused(
+        self, tmp_path: Path
+    ) -> None:
+        foreign = _a_project(tmp_path / "foreign")
+        admin = tmp_path / "admin"
+        admin.mkdir()
+        (admin / "HEAD").write_text("ref: refs/heads/x\n", encoding="utf-8")
+        (admin / "commondir").write_text(f"{foreign / '.git'}\n", encoding="utf-8")
+        checkout = tmp_path / "checkout"
+        checkout.mkdir()
+        (checkout / ".git").write_text(f"gitdir: {admin}\n", encoding="utf-8")
+        (admin / "gitdir").write_text(f"{checkout / '.git'}\n", encoding="utf-8")
+        self._refused(checkout, repository=checkout)
+        self._refused(checkout)
+        assert not (foreign / ".git" / "forge-project-home").exists()
+
+    def test_another_checkouts_worktree_folder_is_refused(self, tmp_path: Path) -> None:
+        """A ``gitdir`` naming a real worktree folder of a real repository that
+        does not point back at this checkout is borrowed, not owned."""
+        root = _a_project(tmp_path / "shop")
+        tree = root / ".forge" / "worktrees" / "journey-3"
+        _git(root, "worktree", "add", "-q", "-b", "repair/three", str(tree))
+        impostor = tmp_path / "impostor"
+        impostor.mkdir()
+        admin = (root / ".git" / "worktrees" / "journey-3").resolve()
+        (impostor / ".git").write_text(f"gitdir: {admin}\n", encoding="utf-8")
+        self._refused(impostor, repository=impostor)
+        self._refused(impostor)
+
+    def test_a_git_directory_with_a_commondir_of_its_own_is_refused(
+        self, tmp_path: Path
+    ) -> None:
+        foreign = _a_project(tmp_path / "foreign")
+        odd = _a_project(tmp_path / "odd")
+        (odd / ".git" / "commondir").write_text(f"{foreign / '.git'}\n", encoding="utf-8")
+        self._refused(odd, repository=odd)
+
+
+def test_the_coordinators_declared_test_is_anchored_on_its_checkout(
+    tmp_path: Path,
+) -> None:
+    """F6: with no repository named, the command's own working folder is the
+    checkout, and nothing above it is looked at."""
+    from forge.cli._serve_conductor import _run_declared_command
+
+    root = _a_project(tmp_path / "shop")
+    inside = root / "not-a-checkout"
+    inside.mkdir()
+    exit_code, detail = _run_declared_command(
+        command=str(root / "deploy" / "test.sh"), cwd=inside, timeout_seconds=60
+    )
+    assert exit_code is None, detail
+    assert not (inside / "env-test.json").exists(), "it ran"
+
+
+def test_the_local_stage_tells_its_script_steps_their_checkout(tmp_path: Path) -> None:
+    """Local runbook steps: the stage puts the checkout it knows on every step
+    that runs the project's scripts."""
+    from forge.config.models import DeployStageConfig
+    from forge.deploy.runbook_builder import build_deploy_runbook
+    from forge.deploy.profile import parse_deploy_profile
+    from forge.deploy.stage import DeployStageRunner
+
+    root = _a_project(tmp_path / "shop")
+    runner = DeployStageRunner(
+        repository=None,
+        runbook_publisher=None,
+        deploy_publisher=None,
+        reservation=None,
+        live_gate_invoker=None,
+        broker_inspector=None,
+        config=DeployStageConfig(),
+        deploy_record_root=str(tmp_path / "records"),
+        target_repo_root=str(root),
+    )
+    profile = parse_deploy_profile(
+        yaml.safe_load((root / "deploy" / "profile.yaml").read_text())
+    )
+    runbook = build_deploy_runbook(
+        profile, runbook_id="r", target="shop", now=datetime(2026, 10, 14, tzinfo=timezone.utc)
+    )
+    told = runner._with_the_checkout(runbook)
+    scripts = [s for s in told.steps if s.step_type in ("deploy_compose", "health_check")]
+    assert scripts and all(s.params["repository"] == str(root) for s in scripts)
+
+
+# ---------------------------------------------------------------------------
 # Section 5: a guard that cannot be missed by leaving a site out
 # ---------------------------------------------------------------------------
 #
@@ -1400,6 +1596,11 @@ ALLOWED: dict[tuple[str, str], str] = {
     ("cli/register_repo.py", "_run_command"): "the operator's register command: git, docker and sbx",
     ("deploy/review_preview.py", "_run_command"): "git and the container engine for the preview's tree",
     ("deploy_sidecar/deploy_executor.py", "_default_spawn"): "generic runner; every call to it is checked below",
+    ("deploy_sidecar/deploy_executor.py", "_start"): (
+        "the owned deploy: its additions are the request's ENV_FILE, identity "
+        "and artifact under names the project declared, and the helper refuses "
+        "any of them carrying a value of the factory's own settings"
+    ),
     ("deploy_sidecar/service.py", "_start_and_collect"): "generic runner; every call to it is checked below",
     ("deploy_sidecar/service.py", "run_merge_command"): "starts GuardKit (merge, legs, checks) with the factory's launch list",
     ("deploy_sidecar/service.py", "blob"): "git cat-file, the argument list from _git_argv",
@@ -1411,17 +1612,32 @@ ALLOWED: dict[tuple[str, str], str] = {
     ("subagents/autobuild_runner.py", "_run_one_build"): "starts GuardKit's build with the factory's launch list",
 }
 
-#: Generic runners: every call to them is judged as a launch of its own.
+#: Generic runners: every call to them is judged as a launch of its own, and
+#: using one as a value (a variable, ``functools.partial``, ``x = self._spawn``)
+#: is flagged. ``dotted`` is where each is defined, so an import under another
+#: name or a module attribute is still recognised; ``names`` are the
+#: attribute names it is reached by on an object (``self._spawn``).
 GENERIC_RUNNERS: dict[tuple[str, str], dict[str, Any]] = {
     ("build/git_operations.py", "_execute_via_deepagents"): {
+        "dotted": {"forge.build.git_operations._execute_via_deepagents"},
         "names": {"_execute_via_deepagents"},
     },
     ("deploy_sidecar/deploy_executor.py", "_default_spawn"): {
+        "dotted": {"forge.deploy_sidecar.deploy_executor.DeployExecutor._default_spawn"},
         "names": {"_spawn", "_default_spawn"},
     },
     ("deploy_sidecar/service.py", "_start_and_collect"): {
+        "dotted": {"forge.deploy_sidecar.service._start_and_collect"},
         "names": {"_start_and_collect"},
     },
+}
+
+#: Places a generic runner may be used as a value, each with its reason.
+RUNNER_VALUE_USES: dict[tuple[str, str], str] = {
+    ("deploy_sidecar/deploy_executor.py", "__init__"): (
+        "the executor's own spawn seam: tests inject one, and every call "
+        "through it (self._spawn) is judged"
+    ),
 }
 
 #: The only two places that may build an issued preview value.
@@ -1658,16 +1874,47 @@ def _escapes(func: ast.AST, name: str, before_line: int | None) -> bool:
     return False
 
 
-def _reads_this_process_environment(mod: _Module, node: ast.AST) -> bool:
+def _reads_this_process_environment(
+    mod: _Module, node: ast.AST, func: Any = None, seen: frozenset[str] = frozenset()
+) -> bool:
     """True when ``node`` reads the launching process's own environment
-    (``os.environ`` or ``os.getenv``): a helper call fed from it could pass a
-    factory credential under a name the helper does not refuse."""
+    (``os.environ`` or ``os.getenv``), directly or through a local name that
+    was assigned from such a read in ``func``: a helper call fed from it
+    could pass a factory credential under a name the helper does not refuse."""
     for sub in ast.walk(node):
         if isinstance(sub, ast.Attribute) and sub.attr in ("environ", "environb", "getenv"):
             if isinstance(sub.value, ast.Name) and mod.imports.get(sub.value.id) == "os":
                 return True
         if isinstance(sub, ast.Name) and mod.imports.get(sub.id) in ("os.environ", "os.getenv"):
             return True
+        if (
+            func is not None
+            and isinstance(sub, ast.Name)
+            and sub.id not in seen
+            and any(
+                _reads_this_process_environment(mod, value, func, seen | {sub.id})
+                for value in _assignments(func, sub.id)
+            )
+        ):
+            return True
+    return False
+
+
+#: The helper's arguments that put values into the program's environment by
+#: a name the helper does not check against the project's declarations.
+_VALUE_ARGUMENTS = {"additions", "parent"}
+
+
+def _feeds_values_from_parameters(call: ast.Call, func: Any) -> bool:
+    """True when a parameter of ``func`` flows into the helper's ``additions``
+    or ``parent``: a wrapper like that is only as clean as its every caller."""
+    if func is None:
+        return False
+    for kw in call.keywords:
+        if kw.arg in _VALUE_ARGUMENTS:
+            for sub in ast.walk(kw.value):
+                if isinstance(sub, ast.Name) and _is_parameter(func, sub.id):
+                    return True
     return False
 
 
@@ -1682,7 +1929,9 @@ def _helper_shaped(
         target = _resolve(mod, node.func, node)
         if target in HELPERS:
             arguments = [*node.args, *(kw.value for kw in node.keywords)]
-            return not any(_reads_this_process_environment(mod, a) for a in arguments)
+            return not any(
+                _reads_this_process_environment(mod, a, func) for a in arguments
+            )
         return target in wrappers
     if isinstance(node, ast.IfExp):
         return _helper_shaped(node.body, mod, func, wrappers, before_line) and _helper_shaped(
@@ -1715,6 +1964,12 @@ def _wrappers(modules: list[_Module]) -> set[str]:
                     r for r in ast.walk(node)
                     if isinstance(r, ast.Return) and _enclosing_function(mod, r) is node
                 ]
+                helper_calls = [
+                    c for c in ast.walk(node)
+                    if isinstance(c, ast.Call) and _resolve(mod, c.func, c) in HELPERS
+                ]
+                if any(_feeds_values_from_parameters(c, node) for c in helper_calls):
+                    continue
                 if returns and all(_helper_shaped(r.value, mod, node, found) for r in returns):
                     found.add(full)
                     changed = True
@@ -1798,6 +2053,21 @@ def _first_argument(call: ast.Call) -> ast.AST | None:
     return None
 
 
+def _runner_named(mod: _Module, node: ast.AST) -> tuple[str, str] | None:
+    """Which generic runner ``node`` names, if any: by where it is defined
+    (an import under any name, a module attribute) or, on an object, by the
+    attribute name it is reached by (``self._spawn``)."""
+    target = _resolve(mod, node, node) if isinstance(node, (ast.Name, ast.Attribute)) else None
+    for key, spec in GENERIC_RUNNERS.items():
+        if target and target in spec["dotted"]:
+            return key
+        if isinstance(node, ast.Attribute) and node.attr in spec["names"]:
+            return key
+        if isinstance(node, ast.Name) and node.id in spec["names"] and target is None:
+            return key
+    return None
+
+
 def unaccounted_launches(package: Path) -> list[str]:
     modules = _load_modules(package)
     constants = _module_constants(modules)
@@ -1812,7 +2082,7 @@ def unaccounted_launches(package: Path) -> list[str]:
 
     def place(mod: _Module, node: ast.AST) -> tuple[Any, str]:
         func = _enclosing_function(mod, node)
-        named = _enclosing(mod, node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        named = func or _enclosing(mod, node, ast.ClassDef)
         return func, getattr(named, "name", "<module>")
 
     def judge(mod: _Module, call: ast.Call, what: str) -> None:
@@ -1874,6 +2144,18 @@ def unaccounted_launches(package: Path) -> list[str]:
                             "helper's reader"
                         )
             elif isinstance(node, (ast.Attribute, ast.Name)) and id(node) not in called:
+                runner = _runner_named(mod, node)
+                if runner and isinstance(getattr(node, "ctx", None), ast.Load):
+                    _, fname = place(mod, node)
+                    if (mod.rel, fname) not in RUNNER_VALUE_USES and not (
+                        mod.rel == runner[0] and fname == runner[1]
+                    ):
+                        problems.append(
+                            f"{mod.rel}:{node.lineno} in {fname}: the generic runner "
+                            f"{runner[1]} is used as a value (held in a variable, "
+                            "passed on or wrapped), so its env= cannot be checked"
+                        )
+                    continue
                 kind = _launch_kind(mod, node)
                 if kind and isinstance(getattr(node, "ctx", None), ast.Load):
                     if isinstance(mod.parents.get(id(node)), ast.Attribute):
@@ -1887,7 +2169,7 @@ def unaccounted_launches(package: Path) -> list[str]:
     for (rel, fname), spec in GENERIC_RUNNERS.items():
         for mod in modules:
             for node in ast.walk(mod.tree):
-                if not isinstance(node, ast.Call) or _last_name(node.func) not in spec["names"]:
+                if not isinstance(node, ast.Call) or _runner_named(mod, node.func) != (rel, fname):
                     continue
                 func = _enclosing_function(mod, node)
                 if mod.rel == rel and getattr(func, "name", None) == fname:
@@ -2087,6 +2369,121 @@ def test_the_guard_catches_every_probe(tmp_path: Path) -> None:
     assert COACH_PROBES <= expected
     assert expected - named == set(), f"slipped past the guard: {sorted(expected - named)}"
     assert not {"ok_helper", "ok_git", "ok_wrapper", "_real_wrapper"} & named, problems
+
+
+#: The second review's probes (14 October 2026): a generic runner reached
+#: under another name, as a module attribute, in a variable, through
+#: ``functools.partial`` or as ``spawn = self._spawn``; a wrapper whose
+#: parameter flows into the helper's additions; a value read from this
+#: process's environment into a local first. Every ``p2_`` function must be
+#: caught and no ``ok_`` one.
+GUARD_PROBES_2 = textwrap.dedent(
+    '''\
+    import functools
+    import os
+    import subprocess
+
+    from forge.deploy_sidecar.service import _start_and_collect as launch
+    from forge.deploy_sidecar import service as svc
+    from forge.launch_environment import build_project_command_env
+    from forge.launch_environment import build_project_command_env as bpce
+
+
+    def p2_runner_alias(cmd):
+        launch(argv=cmd, cwd=".", env=dict(os.environ), timeout=1, what="x")
+
+
+    def p2_runner_module_attr(cmd):
+        svc._start_and_collect(argv=cmd, cwd=".", env=dict(os.environ), timeout=1, what="x")
+
+
+    def p2_runner_in_variable(cmd):
+        runner = svc._start_and_collect
+        runner(argv=cmd, cwd=".", env=dict(os.environ), timeout=1, what="x")
+
+
+    def p2_runner_partial(cmd):
+        functools.partial(launch, env=dict(os.environ))(argv=cmd, cwd=".", timeout=1, what="x")
+
+
+    def _sanitise(env):
+        return dict(env)
+
+
+    def p2_sanitiser_copies_input(cmd):
+        subprocess.run(cmd, env=_sanitise(os.environ))
+
+
+    def _clean(extra):
+        return build_project_command_env(".", additions=extra)
+
+
+    def p2_wrapper_with_parameter_additions(cmd):
+        subprocess.run(cmd, env=_clean({"FLEET_MEMORY_PG_DSN": os.environ["FLEET_MEMORY_PG_DSN"]}))
+
+
+    def p2_value_read_first_then_additions(cmd):
+        dsn = os.environ.get("FLEET_MEMORY_PG_DSN", "")
+        env = build_project_command_env(".", additions={"DATABASE_URL": dsn})
+        subprocess.run(cmd, env=env)
+
+
+    def p2_helper_alias_direct_environ(cmd):
+        subprocess.run(cmd, env=bpce(".", overlay=dict(os.environ)))
+
+
+    def p2_popen_subclass(cmd):
+        class P(subprocess.Popen):
+            pass
+        P(cmd)
+
+
+    def p2_self_spawn_variable(self, cmd):
+        spawn = self._spawn
+        spawn(args=cmd, env=dict(os.environ))
+
+
+    def p2_parent_from_environ_copy(cmd):
+        parent = os.environ.copy()
+        env = build_project_command_env(".", additions={"X": parent["OPENAI_BASE_URL"]})
+        subprocess.run(cmd, env=env)
+
+
+    def ok_plain(cmd):
+        env = build_project_command_env(".")
+        subprocess.run(cmd, env=env)
+
+
+    def ok_runner_with_helper(cmd):
+        env = build_project_command_env(".")
+        launch(argv=cmd, cwd=".", env=env, timeout=1, what="x")
+
+
+    def _fixed(folder):
+        return build_project_command_env(folder, additions={"ENV_FILE": "/the/file"})
+
+
+    def ok_wrapper_with_fixed_additions(cmd):
+        subprocess.run(cmd, env=_fixed("."))
+    '''
+)
+
+
+def test_the_guard_catches_the_second_reviews_probes(tmp_path: Path) -> None:
+    pkg = tmp_path / "forge"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "zz_probe2.py").write_text(GUARD_PROBES_2, encoding="utf-8")
+    problems = unaccounted_launches(pkg)
+    named = {p.split(" in ", 1)[1].split(":", 1)[0] for p in problems}
+    expected = {
+        n.name
+        for n in ast.parse(GUARD_PROBES_2).body
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name.startswith("p2_")
+    }
+    assert len(expected) == 11
+    assert expected - named == set(), f"slipped past the guard: {sorted(expected - named)}"
+    assert not {n for n in named if n.startswith("ok_") or n == "_fixed"}, problems
 
 
 def test_every_process_launch_is_accounted_for() -> None:

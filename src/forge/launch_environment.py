@@ -733,13 +733,19 @@ def _a_real_git_directory(folder: Path) -> Path | None:
 def _git_directory_from_marker(marker: Path) -> Path | None:
     """The shared git directory a checkout's ``.git`` entry names, or ``None``.
 
-    A folder is checked as it is. A file (a linked worktree's) must say
-    ``gitdir: <path>`` with a path that is not empty, and that path must be a
-    real git directory. A link is never followed.
+    A folder must be the checkout's own git directory: real, and not itself
+    pointing elsewhere with a ``commondir``. A file (a linked worktree's) must
+    say ``gitdir: <path>`` with a path that is not empty, and that path must
+    be one of a real git directory's own worktree folders
+    (``<git directory>/worktrees/<name>``) whose ``gitdir`` file points back
+    at this very ``.git`` file — so a checkout cannot borrow an unrelated
+    repository's git directory. A link is never followed.
     """
     if marker.is_symlink():
         return None
     if marker.is_dir():
+        if (marker / "commondir").exists():
+            return None
         return _a_real_git_directory(marker)
     if not marker.is_file():
         return None
@@ -755,7 +761,22 @@ def _git_directory_from_marker(marker: Path) -> Path | None:
     own = Path(named)
     if not own.is_absolute():
         own = marker.parent / own
-    return _a_real_git_directory(own)
+    try:
+        own = own.resolve()
+    except OSError:
+        return None
+    shared = _a_real_git_directory(own)
+    if shared is None or shared == own or own.parent != shared / "worktrees":
+        return None
+    try:
+        back = Path((own / "gitdir").read_text(encoding="utf-8").strip())
+        if not back.is_absolute():
+            back = own / back
+        if back.resolve() != marker.resolve():
+            return None
+    except OSError:
+        return None
+    return shared
 
 
 def _git_directory_of(
@@ -827,15 +848,42 @@ def _private_folder(path: Path) -> Path:
 
 
 def _addition_refusal(name: object) -> str | None:
-    """Why a value the factory sets may not be passed, or ``None``."""
+    """Why a value the factory sets may not be passed, or ``None``.
+
+    The same rule a project's own declared names meet
+    (:func:`declared_setting_refusal`): never one of the factory's own names
+    or prefixes, never credential-shaped, and never the run-owner marker.
+    """
     if not isinstance(name, str) or not DECLARED_NAME_PATTERN.fullmatch(name):
         return f"{name!r} is not the shape of a setting name"
     upper = name.upper()
     if upper == GUARDKIT_RUN_OWNER_ENV:
         return f"{name!r} comes only from the build's own record (run_owner)"
-    for word in RESERVED_CREDENTIAL_WORDS:
-        if word in upper:
-            return f"{name!r} is credential-shaped (it contains {word!r})"
+    return declared_setting_refusal(name)
+
+
+def _carries_a_factory_value(
+    values: Mapping[str, str], source: Mapping[str, str]
+) -> str | None:
+    """The sentence when one of ``values`` equals the value of a setting the
+    factory keeps for itself in ``source``; never shows the value.
+
+    A value the factory sets for a command under an ordinary name (say
+    ``DATABASE_URL``) could otherwise carry the memory store's address or the
+    bus's out of the factory's own settings, past every check on names.
+    """
+    reserved = {
+        str(value): name
+        for name, value in source.items()
+        if str(value) and declared_setting_refusal(name) is not None
+    }
+    for name, value in values.items():
+        held = reserved.get(str(value))
+        if held is not None:
+            return (
+                f"the value given for {name!r} is the value of {held!r}, a "
+                f"setting the factory keeps for itself"
+            )
     return None
 
 
@@ -947,7 +995,14 @@ def build_project_command_env(
                 name,
             )
 
-    # Step 2: additions.
+    # Step 2: additions — and none of them may carry a value of the
+    # factory's own settings under another name.
+    carried = _carries_a_factory_value(additions, source)
+    if carried is not None:
+        raise ProjectCommandEnvironmentError(
+            f"a value the factory set for this project program was refused, so "
+            f"it was not run: {carried}"
+        )
     env.update({name: str(value) for name, value in additions.items()})
 
     # Step 3: issued values.

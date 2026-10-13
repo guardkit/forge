@@ -116,6 +116,7 @@ class SidecarScriptRunner:
         launch_settings: Sequence[str] | None = None,
         deploy: dict[str, object] | None = None,
         issued_env: dict[str, str] | None = None,
+        repository: str | None = None,  # noqa: ARG002 — the far side knows its own
     ) -> tuple[int, str]:
         env: dict[str, str] = dict(extra_env or {})
         if env_file is not None:

@@ -159,6 +159,18 @@ from forge.persistence.repositories.runbook_models import Runbook, Step
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from forge.deploy.review_preview import IssuedPreviewValues
 
+#: The runbook steps that run the project's own scripts.
+_STEPS_THAT_RUN_PROJECT_SCRIPTS: frozenset[str] = frozenset(
+    {
+        "deploy_compose",
+        "health_check",
+        "run_smoke_tests",
+        "seed_fixtures",
+        "import_realm",
+        "warm_models",
+    }
+)
+
 logger = logging.getLogger(__name__)
 
 __all__ = [
@@ -1591,6 +1603,7 @@ class DeployStageRunner:
         its driver addresses the ``-cand`` instance). ``None`` = the injected
         invoker unchanged.
         """
+        runbook = self._with_the_checkout(runbook)
         self._repo.create_runbook(runbook, correlation_id=correlation_id)
         executor = RunbookExecutor(
             self._repo,
@@ -1598,6 +1611,28 @@ class DeployStageRunner:
             self._runbook_publisher,
         )
         return await executor.run(runbook.runbook_id, correlation_id=correlation_id)
+
+    def _with_the_checkout(self, runbook: Runbook) -> Runbook:
+        """The runbook with its script steps told which checkout they belong to.
+
+        THE PROJECT'S SCRIPTS GET A PRIVATE HOME IN THEIR OWN CHECKOUT'S GIT
+        DIRECTORY (13 October 2026), and for a repository with no sandbox
+        this stage knows that checkout (``target_repo_root``). Each step that
+        runs the project's scripts is handed it as ``repository``, so the home
+        is made there and no folder above it is ever looked at. A repository
+        with a sandbox is left as it is: its scripts run in the sandbox's
+        helper, which knows its own checkout.
+        """
+        if self._sandbox is not None or not self._target_repo_root:
+            return runbook
+        checkout = str(self._target_repo_root)
+        steps = tuple(
+            replace(step, params={**dict(step.params), "repository": checkout})
+            if step.step_type in _STEPS_THAT_RUN_PROJECT_SCRIPTS
+            else step
+            for step in runbook.steps
+        )
+        return replace(runbook, steps=steps)
 
     def _claims_from_runbook(
         self, runbook: Runbook | None, *, when: datetime

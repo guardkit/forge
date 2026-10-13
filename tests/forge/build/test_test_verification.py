@@ -62,6 +62,12 @@ def fake_seam(monkeypatch: pytest.MonkeyPatch) -> FakeSeam:
 def worktree(tmp_path: Path) -> Path:
     wt = tmp_path / "worktree"
     wt.mkdir()
+    # A worktree is a checkout of its own (14 October 2026): the test run's
+    # private HOME is made in that checkout's git directory, and no folder
+    # above it is looked at.
+    import subprocess as _subprocess
+
+    _subprocess.run(["git", "init", "-q", str(wt)], check=True, capture_output=True)
     return wt
 
 
