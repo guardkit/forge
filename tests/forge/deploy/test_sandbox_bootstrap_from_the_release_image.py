@@ -3078,10 +3078,18 @@ class TestAContainerThatDiesSaysWhy:
         try:
             def the_supervisor_has_begun():
                 # The start-up's verdict is printed before the supervisor's
-                # first look round, so one listing after the runner's output
-                # was read means the verdict has been said.
+                # first look round, so one listing after the RUNNER's output
+                # was read means the verdict has been said. (13 October 2026:
+                # under load a slow `ps` let the helper's one-second settle
+                # run out first, so the first `logs` read was the helper's
+                # and this fired early; reproduced on cbd1fc48 with a 1.2 s
+                # per-ps stand-in delay. Hence the runner's own read, and
+                # five seconds to settle.)
                 calls = _calls(sandbox)
-                reads = [i for i, c in enumerate(calls) if c.startswith("logs ")]
+                reads = [
+                    i for i, c in enumerate(calls)
+                    if c.startswith("logs ") and c.split()[-1] == "forge-sandbox-runner"
+                ]
                 return bool(reads) and any(
                     c.startswith("ps ") for c in calls[reads[0] + 1:]
                 )
@@ -3089,7 +3097,7 @@ class TestAContainerThatDiesSaysWhy:
             said = self._run_until(
                 sandbox,
                 the_supervisor_has_begun,
-                SANDBOX_RUNNER_SETTLE_SECONDS="1",
+                SANDBOX_RUNNER_SETTLE_SECONDS="5",
                 SANDBOX_RUNNER_BIND="127.0.0.1",
                 SANDBOX_SIDECAR_PORT=str(helper.server_address[1]),
                 SANDBOX_RUNNER_PORT=str(squatter.server_address[1]),
