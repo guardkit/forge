@@ -122,15 +122,38 @@ class TestComposingTheService:
         # A project with no deploy profile here has no preview.
         assert service.enabled_for("example/nothing-here") is False
 
-    def test_a_composition_that_raises_leaves_previews_off_not_boot(
+    def test_a_composition_that_raises_fails_every_preview_closed_not_boot(
         self, monkeypatch: pytest.MonkeyPatch, pool, tmp_path: Path
     ) -> None:
+        from forge.deploy.review_preview import UnavailableReviewPreview
+
         def _raises(**_k: Any) -> Any:
             raise RuntimeError("no ledger")
 
         monkeypatch.setattr(serve_mod, "compose_review_preview", _raises)
         seen = _drive_boot(pool, tmp_path, merge_on=True, preview=None, compose=False)
-        assert len(seen["offer"]) == 1
+
+        # Boot went on, and the card and the press both got the stand-in that
+        # fails every preview closed — never an unpreviewed card.
+        stand_in = seen["offer"][0]["review_preview"]
+        assert isinstance(stand_in, UnavailableReviewPreview)
+        assert seen["consumer"][0].review_preview is stand_in
+        assert serve_mod.review_preview_service is stand_in
+        assert stand_in.reason == (
+            "previews are switched on but the preview service could not start: "
+            "RuntimeError: no ledger"
+        )
+
+    def test_with_the_switch_off_a_failing_composer_is_never_called(
+        self, monkeypatch: pytest.MonkeyPatch, pool, tmp_path: Path
+    ) -> None:
+        def _raises(**_k: Any) -> Any:
+            raise AssertionError("composed with the switch off")
+
+        monkeypatch.setattr(serve_mod, "compose_review_preview", _raises)
+        seen = _drive_boot(
+            pool, tmp_path, merge_on=True, preview=None, compose=False, preview_on=False
+        )
         assert "review_preview" not in seen["offer"][0]
         assert serve_mod.review_preview_service is None
 

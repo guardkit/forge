@@ -123,6 +123,7 @@ __all__ = [
     "PreviewTree",
     "ReviewPreviewService",
     "SidecarPreviewVenue",
+    "UnavailableReviewPreview",
     "build_review_preview_service",
     "serve_preview_operation",
 ]
@@ -2153,6 +2154,65 @@ def _outcome_counts(raw: Any) -> dict[str, int | None]:
             else None
         )
     return counts
+
+
+class UnavailableReviewPreview:
+    """Stands in when previews are switched on but the service could not start.
+
+    It keeps the coordinator running and fails every preview CLOSED: each
+    project counts as previewing, each preparation comes back as a failed
+    record with the reason (so the card offers no Approve), and every approval
+    of such a record is refused. Nothing is started, so there is nothing to
+    release, sweep or reconcile.
+    """
+
+    def __init__(self, error: str, *, clock: Callable[[], datetime] = _utcnow) -> None:
+        self.reason = (
+            "previews are switched on but the preview service could not start: "
+            f"{error}"
+        )
+        self._clock = clock
+
+    def enabled_for(self, project: str) -> bool:
+        return True
+
+    async def prepare(self, req: PreviewRequest) -> "ReviewEvidence":
+        from nats_core.events import ReviewEvidence, ReviewOutcome
+
+        now = self._clock()
+        return ReviewEvidence(
+            state="failed",
+            failure_reason=self.reason,
+            candidate_sha=req.candidate_sha,
+            candidate_tree=req.candidate_tree,
+            # Nothing was joined: the candidate's own tree stands in, and the
+            # record is failed, so it can never be approved.
+            preview_tree=req.candidate_tree,
+            preview_base_sha=(
+                req.preview_base_sha
+                if _SHA.match(str(req.preview_base_sha or ""))
+                else None
+            ),
+            run_id=_new_run_id(),
+            created_at=now,
+            app_expires_at=now + timedelta(hours=24),
+            evidence_expires_at=now + timedelta(days=14),
+            outcome=ReviewOutcome(),
+        )
+
+    async def release(self, *, feature_id: str, build_id: str, reason: str) -> None:
+        return None
+
+    async def sweep(self, *, now: datetime) -> None:
+        return None
+
+    async def reconcile_on_boot(self) -> None:
+        return None
+
+    def approval_refusal(
+        self, review_evidence: Mapping[str, Any] | None, *, now: datetime
+    ) -> str | None:
+        return self.reason
 
 
 # ---------------------------------------------------------------------------
