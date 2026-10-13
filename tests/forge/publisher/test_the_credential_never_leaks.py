@@ -436,3 +436,316 @@ class TestNoAddressIsEverWrittenDown:
         assert answer.refusal_kind == "the-joined-commit-is-not-there"
         assert THE_PLANTED_STRING not in str(answer.refusal)
         assert THE_ADDRESS_IS_NOT_WRITTEN_DOWN in str(answer.refusal)
+
+
+# ---------------------------------------------------------------------------
+# One credential per route (13 October 2026)
+# ---------------------------------------------------------------------------
+
+#: The made-up texts of two route keys. Nothing anywhere accepts them.
+ROUTE_SECRET_A = "not-a-real-route-key-A-TESTONLY-71c4"
+ROUTE_SECRET_B = "not-a-real-route-key-B-TESTONLY-c09a"
+SECOND = "bench/second-shop"
+SECOND_BUILD = "build-FEAT-PUB2-1"
+
+#: Every file opened in this process while ``_OPENS_ON`` holds a list. An
+#: audit hook sees every open — ``open``, ``Path.read_text`` and ``os.open``
+#: alike — and cannot be removed, so it records only while a test asks it to.
+_OPENS_ON: list[list[str]] = []
+
+
+def _record_opens(event: str, args: tuple) -> None:
+    if event == "open" and _OPENS_ON and args and isinstance(args[0], (str, bytes, os.PathLike)):
+        _OPENS_ON[-1].append(os.fsdecode(args[0]))
+
+
+import sys as _sys  # noqa: E402 - beside the hook it serves
+
+_sys.addaudithook(_record_opens)
+
+
+def _two_routes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    routes: dict[str, str | None],
+) -> dict:
+    """Projects with real bare remotes on disk, named by route; each route
+    names a key (or ``None`` to inherit). Key ``a`` holds secret A, any other
+    key name secret B."""
+    from forge.publisher.settings import ProjectRoute
+    from tests.forge.publisher.a_project_and_a_ledger import (
+        a_route_key,
+        a_route_keys_folder,
+    )
+
+    root = tmp_path / "world"
+    folder = a_route_keys_folder(tmp_path, monkeypatch)
+    projects = {}
+    worlds = {}
+    for index, (project_name, key_name) in enumerate(sorted(routes.items())):
+        world = make_the_project(root / f"p{index}")
+        make_the_ledger(
+            root / "forge.db",
+            project=world,
+            build_id=f"build-{index}",
+            repo=project_name,
+        )
+        if key_name is not None and not (folder / key_name).exists():
+            a_route_key(
+                folder, key_name, ROUTE_SECRET_A if key_name == "a" else ROUTE_SECRET_B
+            )
+        projects[project_name] = ProjectRoute(
+            name=project_name,
+            source=str(world["copy"]),
+            remote=str(world["bare"]),
+            credential_name=key_name,
+        )
+        worlds[project_name] = (world, f"build-{index}")
+    first = next(iter(worlds.values()))[0]
+    settings = settings_for(root, first, ledger=root / "forge.db", projects=projects)
+    return {"settings": settings, "worlds": worlds, "folder": folder}
+
+
+def _request_for(setup: dict, project_name: str) -> dict:
+    world, build = setup["worlds"][project_name]
+    return {**a_request(world, build_id=build), "project": project_name}
+
+
+def _health_once(publisher: Publisher, settings, tmp_path: Path) -> str:
+    """One real health request, over the loopback, with the real self-check."""
+    import urllib.request
+
+    from forge.publisher import __main__ as entry
+    from forge.publisher.service import serve
+
+    interfaces = tmp_path / "net"
+    for name in ("lo", "eth0"):
+        (interfaces / name).mkdir(parents=True, exist_ok=True)
+    publisher.self_check = entry.the_self_check(settings, publisher, interfaces=interfaces)
+    server, _thread = serve(settings, publisher=publisher)
+    try:
+        host, port = server.server_address[0], server.server_address[1]
+        with urllib.request.urlopen(f"http://{host}:{port}/healthz", timeout=10) as answer:
+            return json.loads(answer.read())["self_check"]
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+class TestEachCredentialHasItsOwnProgram:
+    def test_two_https_credentials_get_two_programs(self, tmp_path: Path) -> None:
+        a = tmp_path / "key-a"
+        a.write_text(ROUTE_SECRET_A + "\n", encoding="utf-8")
+        b = tmp_path / "key-b"
+        b.write_text(ROUTE_SECRET_B + "\n", encoding="utf-8")
+        held_a, _ = read_the_credential(a, no_follow=True, own_program=True)
+        held_b, _ = read_the_credential(b, no_follow=True, own_program=True)
+        assert held_a is not None and held_b is not None
+        state = tmp_path / "state"
+
+        program_a = the_askpass_program(held_a, state_dir=state)
+        program_b = the_askpass_program(held_b, state_dir=state)
+
+        assert program_a != program_b
+        # Each program names its own file, after both are written: the second
+        # did not overwrite the first.
+        assert str(a) in program_a.read_text(encoding="utf-8")
+        assert str(b) not in program_a.read_text(encoding="utf-8")
+        assert str(b) in program_b.read_text(encoding="utf-8")
+        # And each, RUN, prints its own credential and no other.
+        import subprocess
+
+        said_a = subprocess.run([str(program_a)], capture_output=True, text=True, check=True)
+        said_b = subprocess.run([str(program_b)], capture_output=True, text=True, check=True)
+        assert said_a.stdout.strip() == ROUTE_SECRET_A
+        assert said_b.stdout.strip() == ROUTE_SECRET_B
+        assert ROUTE_SECRET_A not in program_a.read_text(encoding="utf-8")
+
+
+class TestEachFileIsReadOnce:
+    def _count(self, setup: dict, tmp_path: Path) -> dict[str, int]:
+        settings = setup["settings"]
+        files = {"publisher-wide": str(Path(settings.credential_file))}
+        for key in setup["folder"].iterdir():
+            files[f"route:{key.name}"] = str(key)
+        opened: list[str] = []
+        _OPENS_ON.append(opened)
+        try:
+            publisher = Publisher(settings)
+            for project_name in sorted(setup["worlds"]):
+                answer = publisher.publish(_request_for(setup, project_name))
+                assert answer.published is True, answer.refusal
+            assert _health_once(publisher, settings, tmp_path) == "passed"
+        finally:
+            _OPENS_ON.remove(opened)
+        return {label: opened.count(path) for label, path in files.items()}
+
+    def test_each_named_file_is_read_once_at_start(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        setup = _two_routes(
+            tmp_path, monkeypatch, {"bench/one": "a", "bench/two": "b"}
+        )
+        counts = self._count(setup, tmp_path)
+        assert counts == {"publisher-wide": 1, "route:a": 1, "route:b": 1}
+
+    def test_one_read_per_distinct_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Two routes sharing one name, one inheriting, one with its own."""
+        setup = _two_routes(
+            tmp_path,
+            monkeypatch,
+            {
+                "bench/one": "a",
+                "bench/also-one": "a",
+                "bench/inherits": None,
+                "bench/own": "b",
+            },
+        )
+        counts = self._count(setup, tmp_path)
+        assert counts == {"publisher-wide": 1, "route:a": 1, "route:b": 1}
+
+
+class TestTwoEntriesThatAreOneFileRefuse:
+    """By file identity, not by path text, and before anything is read."""
+
+    def _settings(self, tmp_path: Path, monkeypatch, routes, wide: Path | None = None):
+        setup = _two_routes(tmp_path, monkeypatch, routes)
+        settings = setup["settings"]
+        if wide is not None:
+            import dataclasses
+
+            settings = dataclasses.replace(settings, credential_file=str(wide))
+        return setup, settings
+
+    def _refuses_before_reading(self, setup, settings, *said: str) -> None:
+        from forge.publisher.service import PublisherWillNotStart
+
+        opened: list[str] = []
+        _OPENS_ON.append(opened)
+        try:
+            with pytest.raises(PublisherWillNotStart) as refused:
+                Publisher(settings)
+        finally:
+            _OPENS_ON.remove(opened)
+        sentence = str(refused.value)
+        for part in said:
+            assert part in sentence, sentence
+        for secret in (ROUTE_SECRET_A, ROUTE_SECRET_B, THE_MADE_UP_CREDENTIAL):
+            assert secret not in sentence
+        # Nothing was read: no credential file, of any kind, was opened.
+        credentials = {str(settings.credential_file)} | {
+            str(key) for key in setup["folder"].iterdir()
+        }
+        assert credentials.isdisjoint(opened), opened
+
+    def test_a_route_name_aliasing_the_publisher_wide_file_refuses(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        folder = tmp_path / "route-keys"
+        setup, settings = self._settings(
+            tmp_path, monkeypatch, {"bench/one": "a"}, wide=folder / "a"
+        )
+        self._refuses_before_reading(
+            setup,
+            settings, "publisher-wide credential_file", "route key 'a'", "bench/one"
+        )
+
+    def test_two_hard_linked_names_refuse(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        setup, settings = self._settings(
+            tmp_path, monkeypatch, {"bench/one": "a", "bench/two": "b"}
+        )
+        (setup["folder"] / "b").unlink()
+        os.link(setup["folder"] / "a", setup["folder"] / "b")
+        self._refuses_before_reading(setup, settings, "route key 'a'", "route key 'b'")
+
+    def test_a_publisher_wide_symlink_to_a_route_file_refuses(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        link = tmp_path / "the-publisher-wide-link"
+        link.symlink_to(tmp_path / "route-keys" / "a")
+        setup, settings = self._settings(
+            tmp_path, monkeypatch, {"bench/one": "a"}, wide=link
+        )
+        self._refuses_before_reading(
+            setup,
+            settings, "publisher-wide credential_file", "route key 'a'"
+        )
+
+    def test_main_refuses_to_start_for_an_alias(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+    ) -> None:
+        from forge.publisher import __main__ as entry
+
+        folder = tmp_path / "route-keys"
+        _setup, settings = self._settings(
+            tmp_path, monkeypatch, {"bench/one": "a"}, wide=folder / "a"
+        )
+        monkeypatch.setattr(entry, "load_settings", lambda _path: settings)
+        monkeypatch.setattr(entry, "why_it_will_not_start", lambda *_a, **_k: None)
+        monkeypatch.setattr(
+            entry, "serve", lambda *_a, **_k: pytest.fail("it started with an alias")
+        )
+        assert entry.main(["--settings", "unused"]) == 2
+        assert "same file" in capsys.readouterr().err
+
+
+class TestTwoRoutesLeakNothing:
+    def test_grep_everything_a_two_route_run_produced(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The whole-run grep above, for two routes with two keys of their own
+        and the publisher-wide credential beside them: all three secrets."""
+        setup = _two_routes(
+            tmp_path, monkeypatch, {"bench/one": "a", "bench/two": "b"}
+        )
+        settings = setup["settings"]
+        planted = (ROUTE_SECRET_A, ROUTE_SECRET_B, THE_MADE_UP_CREDENTIAL)
+        caplog.set_level(logging.DEBUG)
+        what_every_child_was_given: list[dict[str, str]] = []
+        real_run = __import__("subprocess").run
+
+        def watch(argv, **kwargs):  # noqa: ANN001, ANN003
+            what_every_child_was_given.append(dict(kwargs.get("env") or {}))
+            return real_run(argv, **kwargs)
+
+        import forge.publisher.git_work as git_work
+
+        monkeypatch.setattr(git_work.subprocess, "run", watch)
+        publisher = Publisher(settings)
+        answers = [
+            publisher.publish(_request_for(setup, name)) for name in sorted(setup["worlds"])
+        ]
+        assert all(answer.published for answer in answers), [a.refusal for a in answers]
+        assert _health_once(publisher, settings, tmp_path) == "passed"
+
+        for secret in planted:
+            for answer in answers:
+                assert secret not in json.dumps(answer.to_wire())
+            for record in caplog.records:
+                assert secret not in record.getMessage()
+                assert secret not in str(record.args)
+            assert what_every_child_was_given
+            for environment in what_every_child_was_given:
+                for name, value in environment.items():
+                    assert secret not in str(value), name
+            assert secret not in json.dumps(settings.without_secrets())
+            looked_at = 0
+            for path in Path(settings.state_dir).rglob("*"):
+                if not path.is_file():
+                    continue
+                looked_at += 1
+                text = path.read_text(encoding="utf-8", errors="replace")
+                assert secret not in text, str(path)
+            assert looked_at > 0
+        # Each route has a program of its own, and the publisher-wide one is
+        # still where it always was.
+        programs = sorted(p.name for p in Path(settings.state_dir).glob("ask-for-the-credential*"))
+        assert len(programs) == 3, programs
+        assert "ask-for-the-credential" in programs
+        # The one place each secret is allowed to be: the file it was put in.
+        assert (setup["folder"] / "a").read_text(encoding="utf-8").strip() == ROUTE_SECRET_A
+        assert (setup["folder"] / "b").read_text(encoding="utf-8").strip() == ROUTE_SECRET_B

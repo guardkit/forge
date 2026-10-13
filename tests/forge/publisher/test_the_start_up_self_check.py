@@ -203,3 +203,206 @@ class TestTheCoordinatorAsksTheHealthRoute:
             db_path=None,
         )
         assert deps.what_the_machine_says().the_publisher_passed_its_self_check is True
+
+
+# ---------------------------------------------------------------------------
+# Every route's own key gets the same checks (13 October 2026)
+# ---------------------------------------------------------------------------
+
+#: The made-up text in a route's key. No sentence may contain it.
+ROUTE_SECRET = "not-a-real-route-key-TESTONLY-5d0e"
+ROUTED = "bench/routed-shop"
+
+
+def _with_a_route_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, mode: int = 0o600, text: str = ROUTE_SECRET
+) -> tuple[PublisherSettings, Path]:
+    from tests.forge.publisher.a_project_and_a_ledger import (
+        a_route_key,
+        a_route_keys_folder,
+    )
+    from forge.publisher.settings import ProjectRoute
+
+    folder = a_route_keys_folder(tmp_path, monkeypatch)
+    key = a_route_key(folder, "routed", text)
+    if not text:
+        key.write_text("", encoding="utf-8")
+    key.chmod(mode)
+    settings = _settings(tmp_path)
+    settings = PublisherSettings(
+        credential_file=settings.credential_file,
+        ledger=settings.ledger,
+        state_dir=settings.state_dir,
+        projects={
+            ROUTED: ProjectRoute(
+                name=ROUTED,
+                source="git://192.0.2.1:9418/p",
+                remote="https://example.invalid/o/p.git",
+                credential_name="routed",
+            )
+        },
+    )
+    return settings, key
+
+
+def _said_about_the_route(said: str | None, key: Path) -> str:
+    assert said, "a bad route key passed the self-check"
+    assert ROUTED in said
+    assert str(key) in said
+    assert ROUTE_SECRET not in said
+    return said
+
+
+class TestEachRouteKeyIsCheckedToo:
+    def test_a_good_route_key_passes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        settings, _key = _with_a_route_key(tmp_path, monkeypatch)
+        assert entry.why_it_will_not_start(
+            settings, interfaces=_interfaces(tmp_path, "eth0")
+        ) is None
+
+    def test_a_route_credential_that_is_not_there_refuses(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        settings, key = _with_a_route_key(tmp_path, monkeypatch)
+        key.unlink()
+        said = entry.why_it_will_not_start(settings, interfaces=_interfaces(tmp_path, "eth0"))
+        assert "could not be looked at" in _said_about_the_route(said, key)
+
+    @pytest.mark.parametrize("mode", [0o640, 0o604, 0o660])
+    def test_a_route_credential_others_can_read_refuses(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: int
+    ) -> None:
+        settings, key = _with_a_route_key(tmp_path, monkeypatch, mode=mode)
+        said = entry.why_it_will_not_start(settings, interfaces=_interfaces(tmp_path, "eth0"))
+        assert "readable by the publisher's own user alone" in _said_about_the_route(said, key)
+
+    def test_a_route_credential_owned_by_someone_else_refuses(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        settings, key = _with_a_route_key(tmp_path, monkeypatch)
+        # The publisher-wide file is looked at with stat and stays this
+        # user's; only what lstat says about the route key is made foreign.
+        real = os.geteuid()
+        monkeypatch.setattr(
+            entry.os,
+            "lstat",
+            lambda where, _real=os.lstat: _as_owned_by(_real(where), real + 1),
+        )
+        said = entry.why_it_will_not_start(settings, interfaces=_interfaces(tmp_path, "eth0"))
+        assert "not to the publisher's own user" in _said_about_the_route(said, key)
+
+    def test_a_route_credential_that_is_empty_refuses(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        settings, key = _with_a_route_key(tmp_path, monkeypatch, text="")
+        said = entry.why_it_will_not_start(settings, interfaces=_interfaces(tmp_path, "eth0"))
+        assert "is empty" in _said_about_the_route(said, key)
+
+    def test_a_route_key_that_is_a_symbolic_link_refuses(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        settings, key = _with_a_route_key(tmp_path, monkeypatch)
+        real = tmp_path / "elsewhere"
+        real.write_text(ROUTE_SECRET, encoding="utf-8")
+        real.chmod(0o600)
+        key.unlink()
+        key.symlink_to(real)
+        said = entry.why_it_will_not_start(settings, interfaces=_interfaces(tmp_path, "eth0"))
+        assert "symbolic link" in _said_about_the_route(said, key)
+
+    def test_the_check_never_opens_a_route_key(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """It runs again on every health request, so it looks and never reads."""
+        settings, key = _with_a_route_key(tmp_path, monkeypatch)
+        key.chmod(0o000)  # unreadable even by its owner; looking still works
+        try:
+            assert entry.why_it_will_not_start(
+                settings, interfaces=_interfaces(tmp_path, "eth0")
+            ) is None
+        finally:
+            key.chmod(0o600)
+
+    def test_main_refuses_to_start_for_a_bad_route_credential(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+    ) -> None:
+        import json
+
+        settings, key = _with_a_route_key(tmp_path, monkeypatch, mode=0o644)
+        settings_file = tmp_path / "settings.json"
+        settings_file.write_text(
+            json.dumps(
+                {
+                    "credential_file": settings.credential_file,
+                    "ledger": settings.ledger,
+                    "state_dir": settings.state_dir,
+                    "projects": {
+                        ROUTED: {
+                            "source": "git://192.0.2.1:9418/p",
+                            "remote": "https://example.invalid/o/p.git",
+                            "credential_name": "routed",
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        # The route keys are looked at before the interfaces are counted, so
+        # this machine's own interfaces do not decide the answer here.
+        monkeypatch.setattr(
+            entry,
+            "serve",
+            lambda *_a, **_k: pytest.fail("it started with a bad route key"),
+        )
+        assert entry.main(["--settings", str(settings_file)]) == 2
+        err = capsys.readouterr().err
+        assert "will not start" in err
+        _said_about_the_route(err, key)
+
+    def test_main_refuses_to_start_when_a_route_key_cannot_be_read(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+    ) -> None:
+        """Past the look, a key that will not READ (whitespace only) still
+        stops the start: a route that names a key never reaches a send
+        without it."""
+        import json
+
+        settings, key = _with_a_route_key(tmp_path, monkeypatch, text="   ")
+        settings_file = tmp_path / "settings.json"
+        settings_file.write_text(
+            json.dumps(
+                {
+                    "credential_file": settings.credential_file,
+                    "ledger": settings.ledger,
+                    "state_dir": settings.state_dir,
+                    "projects": {
+                        ROUTED: {
+                            "source": "git://192.0.2.1:9418/p",
+                            "remote": "https://example.invalid/o/p.git",
+                            "credential_name": "routed",
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            entry, "why_it_will_not_start", lambda *_a, **_k: None
+        )
+        monkeypatch.setattr(
+            entry,
+            "serve",
+            lambda *_a, **_k: pytest.fail("it started with an unreadable route key"),
+        )
+        assert entry.main(["--settings", str(settings_file)]) == 2
+        err = capsys.readouterr().err
+        assert "will not start" in err and "is empty" in err
+        _said_about_the_route(err, key)
+
+
+def _as_owned_by(found: os.stat_result, uid: int) -> os.stat_result:
+    fields = list(found)
+    fields[4] = uid  # st_uid
+    return os.stat_result(fields)

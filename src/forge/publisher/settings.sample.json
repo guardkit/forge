@@ -12,7 +12,9 @@
   "projects": {
     "the-project-name-as-registered": {
       "source": "the read-only git address the joined commit is brought out of (the sandbox's git daemon, or the project's copy)",
-      "remote": "the address of the remote named origin, WITHOUT any credential in it: an SSH address (git@host:owner/repo.git) to push with a deploy key, or an https address to push with a token"
+      "remote": "the address of the remote named origin, WITHOUT any credential in it: an SSH address (git@host:owner/repo.git) to push with a deploy key, or an https address to push with a token",
+      "_credential_name": "Optional, and only for a project that needs a key of its own (a deploy key is accepted by one repository only). The bare NAME of its key file, never a path: the file is /etc/forge-publisher/route-keys/<name>, mounted read-only from FORGE_PUBLISHER_ROUTE_KEYS_DIR. Delete the line below to use credential_file for this project; a name that is not there stops the publisher at start, it never falls back.",
+      "credential_name": "the-project-s-key-file-name"
     }
   }
 }

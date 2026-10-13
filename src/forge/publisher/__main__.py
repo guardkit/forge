@@ -18,6 +18,14 @@ health route runs the check again on every request and reports
 publication can switch on. What the check does NOT prove is written at
 :func:`why_it_will_not_start`.
 
+EVERY ROUTE'S OWN KEY GETS THE SAME CHECKS (13 October 2026): looked at with
+``lstat`` and never opened, it has to be a regular file (not a symbolic
+link), owned by the publisher's UID, with no group or other access, and not
+empty. It also refuses to start when two credential entries are the same
+file, or when a route's key could not be read at start; and the health route
+looks again at each route key's identity, so a key replaced after start turns
+the check to "failed".
+
 IT PRINTS NO CREDENTIAL, and it cannot: the only thing it holds is a
 :class:`~forge.publisher.credential.Credential`, which shows itself as
 "not shown" on every path Python prints an object by, and the settings it
@@ -35,10 +43,15 @@ import stat
 import sys
 import threading
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Sequence
 
-from forge.publisher.service import Publisher, serve
-from forge.publisher.settings import PublisherSettings, SettingsRefused, load_settings
+from forge.publisher.service import Publisher, PublisherWillNotStart, serve
+from forge.publisher.settings import (
+    PublisherSettings,
+    SettingsRefused,
+    load_settings,
+    the_route_key_file,
+)
 
 logger = logging.getLogger("forge.publisher")
 
@@ -58,6 +71,9 @@ def why_it_will_not_start(
 
     * the credential file is a regular file owned by the publisher's UID with
       no group or other access;
+    * each route's own key, looked at with ``lstat`` and never opened, is a
+      regular file and not a symbolic link, owned by the publisher's UID, with
+      no group or other access, and not empty;
     * the publisher has exactly one network interface besides loopback.
 
     WHAT IT DOES NOT PROVE. Several estate containers and the host login share
@@ -89,6 +105,9 @@ def why_it_will_not_start(
             f"(mode {stat.S_IMODE(found.st_mode):o}); it must be readable by "
             "the publisher's own user alone"
         )
+    refused = _why_a_route_key_will_not_do(settings)
+    if refused:
+        return refused
     try:
         names = sorted(entry.name for entry in interfaces.iterdir() if entry.name != "lo")
     except OSError as exc:
@@ -100,6 +119,63 @@ def why_it_will_not_start(
         )
     return None
 
+def _why_a_route_key_will_not_do(settings: PublisherSettings) -> str | None:
+    """The same checks for every route's own key, with ``lstat`` alone.
+
+    Never opens a file: this runs again on every health request. Each
+    sentence names the project and the path, never the contents.
+    """
+    named: dict[str, list[str]] = {}
+    for route in settings.projects.values():
+        if route.credential_name is not None:
+            named.setdefault(route.credential_name, []).append(route.name)
+    for name in sorted(named):
+        projects = sorted(named[name])
+        who = (
+            f"project{'s' if len(projects) > 1 else ''} "
+            + ", ".join(f"'{project}'" for project in projects)
+        )
+        where = the_route_key_file(name)
+        said = f"the credential file {where} named for {who}"
+        try:
+            found = os.lstat(where)
+        except OSError as exc:
+            return f"{said} could not be looked at ({exc.strerror or type(exc).__name__})"
+        if stat.S_ISLNK(found.st_mode):
+            return f"{said} is a symbolic link; a route's key has to be the file itself"
+        if not stat.S_ISREG(found.st_mode):
+            return f"{said} is not a file"
+        if found.st_uid != os.geteuid():
+            return (
+                f"{said} belongs to user {found.st_uid}, not to the publisher's "
+                f"own user {os.geteuid()}"
+            )
+        if found.st_mode & 0o077:
+            return (
+                f"{said} can be read or written by others (mode "
+                f"{stat.S_IMODE(found.st_mode):o}); it must be readable by the "
+                "publisher's own user alone"
+            )
+        if found.st_size == 0:
+            return f"{said} is empty"
+    return None
+
+
+def the_self_check(
+    settings: PublisherSettings,
+    publisher: Publisher,
+    *,
+    interfaces: Path = THE_INTERFACES,
+) -> Callable[[], str | None]:
+    """What the health route runs on every request: the start-up checks, and
+    every route key looked at again to be the very file that was read."""
+
+    def check() -> str | None:
+        return why_it_will_not_start(
+            settings, interfaces=interfaces
+        ) or publisher.why_a_route_key_changed()
+
+    return check
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -133,8 +209,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     if refused:
         print(f"the publisher will not start: {refused}", file=sys.stderr)
         return 2
-    publisher = Publisher(settings)
-    publisher.self_check = lambda: why_it_will_not_start(settings)
+    try:
+        publisher = Publisher(settings)
+    except PublisherWillNotStart as exc:
+        print(f"the publisher will not start: {exc}", file=sys.stderr)
+        return 2
+    unread = publisher.why_route_keys_refuse_to_start()
+    if unread:
+        print(f"the publisher will not start: {unread}", file=sys.stderr)
+        return 2
+    publisher.self_check = the_self_check(settings, publisher)
     logger.info("publisher: settings %s", json.dumps(settings.without_secrets()))
     if not publisher.holds_a_credential:
         logger.warning(

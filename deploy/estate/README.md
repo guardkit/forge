@@ -745,9 +745,16 @@ is true **and** three things hold, asked again at every merge word:
 
 - `publication.builds_may_run_inside_the_coordinator` is false;
 - `publication.publisher_credential_file` names the publisher's credential
-  file, and no other coordinator, runner or sandbox setting names it;
-- the publisher passed its self-check: its credential file is a regular file
-  owned by the publisher's UID with no group or other access, and it has
+  file, and no other coordinator, runner or sandbox setting names it. When
+  `publication.publisher_route_keys_dir` records the folder the publisher's
+  per-route keys are mounted from (`FORGE_PUBLISHER_ROUTE_KEYS_DIR`), no such
+  setting may name that folder or any path inside it either. `estate-check`
+  item 6b compares that setting with the env file's folder; it is a comparison
+  of two settings, and item 6's owner and mode checks are not isolation;
+- the publisher passed its self-check: its credential file, and each route's
+  own key, is a regular file owned by the publisher's UID with no group or
+  other access (a route key is also never a link, never empty, and still the
+  file read at start), and it has
   exactly one network interface besides loopback. The publisher will not
   start without this, and its health route runs the check again on every
   request and says `"self_check": "passed"` only then. The coordinator asks

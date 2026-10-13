@@ -26,6 +26,10 @@ What the command does, in order, saying one plain line per step:
    * the sandbox's own ``forge.yaml`` inside the api_test clone, read and
      written through ``sbx exec``;
    * with ``--publish``, the publisher's settings file, with one new route.
+     With ``--publish-credential-name NAME`` as well, that route names its
+     own key: the bare name of a file in the publisher's route-keys folder.
+     The key itself is never read, made or sent anywhere by this command;
+     adding a deploy key to a repository is the owner's decision.
 
    Each YAML file gains exactly three entries — the allowlist path, the
    ``planning.target_repo_paths`` key and the ``planning.sandboxes`` entry
@@ -1020,8 +1024,19 @@ class JsonEdit:
     steps: list[Step] = field(default_factory=list)
 
 
-def plan_publisher_edit(text: str, *, key: str, source: str, remote: str) -> JsonEdit:
-    """Add the one route ``projects[key] = {source, remote}``, and nothing else."""
+def plan_publisher_edit(
+    text: str,
+    *,
+    key: str,
+    source: str,
+    remote: str,
+    credential_name: str | None = None,
+) -> JsonEdit:
+    """Add the one route ``projects[key] = {source, remote}``, and nothing else.
+
+    With ``credential_name`` the route also names its own key, by bare name;
+    without it the route is written exactly as it always was.
+    """
     from forge.publisher.settings import load_settings
 
     try:
@@ -1034,6 +1049,8 @@ def plan_publisher_edit(text: str, *, key: str, source: str, remote: str) -> Jso
     if projects is not None and not isinstance(projects, dict):
         raise Refused("publisher", "'projects' in the publisher's settings is not an object")
     route = {"source": source, "remote": remote}
+    if credential_name is not None:
+        route["credential_name"] = credential_name
     current = (projects or {}).get(key)
     if current == route:
         return JsonEdit(text, None, [Step("publisher", "unchanged", f"route {key} is there")])
@@ -1051,7 +1068,10 @@ def plan_publisher_edit(text: str, *, key: str, source: str, remote: str) -> Jso
             load_settings(probe)
         except Exception as exc:  # noqa: BLE001 — the loader's own sentence
             raise Refused("publisher", f"the edited publisher settings would not load: {exc}") from None
-    return JsonEdit(text, staged, [Step("publisher", "add", f"route {key}: {source} -> {remote}")])
+    said = f"route {key}: {source} -> {remote}"
+    if credential_name is not None:
+        said += f", sent with its own key '{credential_name}'"
+    return JsonEdit(text, staged, [Step("publisher", "add", said)])
 
 
 def _backup_name(live: str, leaf: str, *, today: date | None = None) -> str:
@@ -1791,6 +1811,8 @@ class Options:
     publisher_settings: str | None
     publish_source_base: str | None
     estate: Estate
+    #: With --publish: the bare name of the route's own key, or None.
+    publish_credential_name: str | None = None
 
 
 def _parse_name(name: str) -> tuple[str, str]:
@@ -1845,8 +1867,24 @@ def resolve_options(
     volume: str,
     coordinator: str,
     settle_seconds: int = DEFAULT_SETTLE_SECONDS,
+    publish_credential_name: str | None = None,
 ) -> Options:
     """The command's options with every default worked out, or a refusal."""
+    if publish_credential_name is not None:
+        from forge.publisher.settings import WHAT_A_KEY_NAME_IS, a_route_key_name
+
+        if not publish:
+            raise Refused(
+                "publisher",
+                "--publish-credential-name needs --publish: it names the key of "
+                "the publisher's route, and without --publish no route is written",
+            )
+        if not a_route_key_name(publish_credential_name):
+            raise Refused(
+                "publisher",
+                "--publish-credential-name is not a key name: it must be "
+                f"{WHAT_A_KEY_NAME_IS} (the value is not repeated here)",
+            )
     org, leaf = _parse_name(name)
     if not github:
         raise Refused("github", "--github <https address of the repository> is needed")
@@ -1937,6 +1975,7 @@ def resolve_options(
         sandbox_clone=sandbox_clone.rstrip("/"),
         publisher_settings=str(publisher_settings) if publisher_settings is not None else None,
         publish_source_base=publish_source_base,
+        publish_credential_name=publish_credential_name,
         estate=Estate(
             env_file=env_text,
             loaded_env_file=loaded_env_text,
@@ -1991,6 +2030,7 @@ def register(options: Options, run: Runner, steps: list[Step]) -> list[str]:
             key=options.key,
             source=f"{options.publish_source_base.rstrip('/')}/{options.leaf}",
             remote=f"git@github.com:{options.org}/{options.leaf}.git",
+            credential_name=options.publish_credential_name,
         )
 
     clone_step, clone_needed = check_sandbox_clone(
@@ -2060,6 +2100,9 @@ def register(options: Options, run: Runner, steps: list[Step]) -> list[str]:
 @click.argument("name", required=False)
 @click.option("--github", "github", default=None, help="The repository's https:// address on GitHub.")
 @click.option("--publish", is_flag=True, default=False, help="Also add the publisher's route for it.")
+@click.option("--publish-credential-name", "publish_credential_name", default=None,
+              help="With --publish: the bare name of the route's own key in the publisher's "
+                   "route-keys folder (default: the publisher-wide credential).")
 @click.option("--dry-run", "dry_run", is_flag=True, default=False,
               help="Check the project and say what would change; write nothing anywhere.")
 @click.option("--check-drained", "check_drained_only", is_flag=True, default=False,
@@ -2092,6 +2135,7 @@ def register_repo_cmd(
     name: str | None,
     github: str | None,
     publish: bool,
+    publish_credential_name: str | None,
     dry_run: bool,
     check_drained_only: bool,
     settle_seconds: int,
@@ -2158,6 +2202,7 @@ def register_repo_cmd(
             volume=volume,
             coordinator=coordinator,
             settle_seconds=settle_seconds,
+            publish_credential_name=publish_credential_name,
         )
         tail = register(options, run, steps)
     except Refused as refusal:

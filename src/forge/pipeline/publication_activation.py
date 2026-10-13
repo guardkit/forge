@@ -8,7 +8,12 @@ these holds:
 2. **the publisher's credential file is named in no other settings** — the
    coordinator's, the runner's launch list or any sandbox's. Read here, from
    the settings. A credential file that is not named at all is a refusal, not
-   a pass: with no path there is nothing to search for;
+   a pass: with no path there is nothing to search for. When the coordinator
+   records the publisher's folder of per-route keys
+   (``publication.publisher_route_keys_dir``, 13 October 2026), the same
+   search also refuses any setting naming that folder or any path inside it,
+   so a route key added later is covered with no change here. Path text only:
+   nothing is opened;
 3. **the publisher passed its self-check** — the credential file is a regular
    file owned by the publisher's UID with no group or other access, and the
    publisher has exactly one network interface besides loopback. It will not
@@ -41,6 +46,7 @@ product.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
@@ -77,6 +83,10 @@ class WhatIsTrue:
     the_credential_file: str | None
     where_the_credential_file_is_named: tuple[str, ...]
     machine: WhatTheMachineSays
+    #: The host folder the publisher's per-route keys are in, if recorded.
+    the_route_keys_dir: str | None = None
+    #: Every setting that names that folder or a path inside it.
+    where_the_route_keys_dir_is_named: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -192,15 +202,35 @@ def _the_credential_is_named_in_no_other_settings(true: WhatIsTrue) -> Answer:
             "file the publisher's credential is in, before publication is "
             "switched on",
         )
+    if true.where_the_route_keys_dir_is_named:
+        named = ", ".join(true.where_the_route_keys_dir_is_named)
+        return Answer(
+            name,
+            question,
+            False,
+            f"{named} names a path component equal to the protected "
+            f"folder's name '{_the_last_component(true.the_route_keys_dir or '')}' "
+            f"(the publisher's folder of per-route keys, "
+            f"{true.the_route_keys_dir}). Any path that reaches inside that "
+            "folder has to name it, so such a setting is refused even when it "
+            "means a different folder of the same name; take the path out of "
+            "those settings, or rename one of the two folders, before "
+            "publication is switched on",
+        )
     if true.where_the_credential_file_is_named:
         named = ", ".join(true.where_the_credential_file_is_named)
         return Answer(
             name,
             question,
             False,
-            f"the publisher's credential file is named in {named}. It "
-            "belongs to the publisher and to nothing else; take it out of "
-            "those settings before publication is switched on",
+            f"{named} names a path component equal to the protected "
+            f"file's name '{_the_last_component(true.the_credential_file or '')}' "
+            f"(the publisher's credential file, {true.the_credential_file}). "
+            "It belongs to the publisher and to nothing else, and any path "
+            "to it has to name it, so such a setting is refused even when it "
+            "means a different file of the same name; take the path out of "
+            "those settings, or rename one of the two files, before "
+            "publication is switched on",
         )
     return Answer(
         name,
@@ -266,15 +296,76 @@ def _text(value: Any) -> str:
 def _names_the_credential_file(config: Any, credential_file: str) -> tuple[str, ...]:
     """Every settings block that names the publisher's credential file.
 
-    Looked for, by exact path, in the coordinator's own settings (anywhere but
-    the one field that records where the publisher's file is, which is a note
-    of a path and not a copy of a secret), the list of settings a build is
-    launched with, and every sandbox's declared settings.
+    Looked for in the coordinator's own settings (anywhere but the one field
+    that records where the publisher's file is, which is a note of a path and
+    not a copy of a secret), the list of settings a build is launched with,
+    and every sandbox's declared settings — by the file's NAME as a whole
+    path component (:func:`_names_the_component`).
     """
-    found: list[str] = []
-    wanted = _text(credential_file)
-    if not wanted:
+    if not _text(credential_file):
         return ()
+    return _where_settings_name(
+        config,
+        _names_the_component(_the_last_component(credential_file)),
+        own_field="publisher_credential_file",
+    )
+
+
+def _names_the_route_keys_dir(config: Any, folder: str) -> tuple[str, ...]:
+    """Every settings block that names the route-keys folder or a path in it.
+
+    Searched where the credential file is searched, skipping only the one
+    field that records where the folder is, by the folder's NAME as a whole
+    path component (:func:`_names_the_component`).
+    """
+    if not _text(folder):
+        return ()
+    return _where_settings_name(
+        config,
+        _names_the_component(_the_last_component(folder)),
+        own_field="publisher_route_keys_dir",
+    )
+
+
+def _the_last_component(path: str) -> str:
+    """A protected path's own name: its last component, slashes trimmed."""
+    return path.strip().rstrip("/").rsplit("/", 1)[-1]
+
+
+#: What may stand either side of a path component in a setting's text: a
+#: separator, or one of the characters settings put between paths.
+_AROUND_A_COMPONENT = r"""[/\s=:,;'"`]"""
+
+
+def _names_the_component(name: str) -> Any:
+    """Does a setting's text carry ``name`` as a whole path component?
+
+    A CONSERVATIVE RULE, NOT A PARSER (13 October 2026, review round 3). Path
+    text can spell one place in endless ways — '.', '..', repeated slashes,
+    quotes, a path inside a longer value — and every attempt to normalise
+    them lost to a crafted spelling. But any spelling that reaches the
+    protected file, or inside the protected folder, has to write its name
+    literally as one component. So a value is refused when that name appears
+    bounded by the start or end of the text, a '/', whitespace, or one of
+    = : , ; and quotes. That covers every spelling; an unrelated component
+    that happens to share the name is refused too, which fails closed and is
+    said plainly so that one of the two can be renamed. The settings model
+    refuses a protected path whose name holds any of those characters.
+    Path text only: nothing is opened.
+    """
+    if not name:
+        # A protected path with no name of its own ("/"): everything is in it.
+        return lambda text: bool(text.strip())
+    around = _AROUND_A_COMPONENT
+    whole = re.compile(f"(?:^|{around}){re.escape(name)}(?:$|{around})")
+    return lambda text: whole.search(text) is not None
+
+
+def _where_settings_name(
+    config: Any, matches: Any, *, own_field: str
+) -> tuple[str, ...]:
+    """Every settings block with a text value ``matches`` says yes to."""
+    found: list[str] = []
 
     def _looks_at(block: Any, said: str, *, skip: Iterable[str] = ()) -> None:
         if block is None:
@@ -297,20 +388,20 @@ def _names_the_credential_file(config: Any, credential_file: str) -> tuple[str, 
                 continue
             if callable(value):
                 continue
-            if isinstance(value, str) and value.strip() == wanted:
+            if isinstance(value, str) and matches(value):
                 found.append(f"{said}.{field_name}")
             elif isinstance(value, (list, tuple)) and any(
-                isinstance(entry, str) and entry.strip() == wanted for entry in value
+                isinstance(entry, str) and matches(entry) for entry in value
             ):
                 found.append(f"{said}.{field_name}")
             elif isinstance(value, dict) and any(
-                isinstance(entry, str) and entry.strip() == wanted
+                isinstance(entry, str) and matches(entry)
                 for entry in value.values()
             ):
                 found.append(f"{said}.{field_name}")
 
     publication = getattr(config, "publication", None)
-    _looks_at(publication, "publication", skip={"publisher_credential_file"})
+    _looks_at(publication, "publication", skip={own_field})
     planning = getattr(config, "planning", None)
     _looks_at(planning, "planning", skip={"sandboxes"})
     sandboxes = getattr(planning, "sandboxes", None)
@@ -318,9 +409,9 @@ def _names_the_credential_file(config: Any, credential_file: str) -> tuple[str, 
         for sandbox_name, entry in sorted(sandboxes.items()):
             _looks_at(entry, f"planning.sandboxes.{sandbox_name}")
     launch = getattr(getattr(config, "conductor", None), "launch_settings", None)
-    if isinstance(launch, (list, tuple)) and wanted in {
-        _text(entry) for entry in launch
-    }:
+    if isinstance(launch, (list, tuple)) and any(
+        matches(_text(entry)) for entry in launch
+    ):
         found.append("conductor.launch_settings")
     return tuple(sorted(set(found)))
 
@@ -338,7 +429,16 @@ def what_is_true_here(
     credential_file = _text(
         getattr(publication, "publisher_credential_file", None)
     ) or None
+    route_keys_dir = _text(
+        getattr(publication, "publisher_route_keys_dir", None)
+    ) or None
     return WhatIsTrue(
+        the_route_keys_dir=route_keys_dir,
+        where_the_route_keys_dir_is_named=(
+            _names_the_route_keys_dir(config, route_keys_dir)
+            if route_keys_dir
+            else ()
+        ),
         builds_may_run_inside_the_coordinator=allowed,
         the_credential_file=credential_file,
         where_the_credential_file_is_named=(

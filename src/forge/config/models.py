@@ -30,6 +30,8 @@ pure declarative schema layer.
 
 from __future__ import annotations
 
+import posixpath
+import re
 from pathlib import Path
 from typing import Any, Literal
 
@@ -1621,6 +1623,12 @@ class MergeExecutorConfig(BaseModel):
     )
 
 
+#: What the publication activation check splits settings on to find paths
+#: (forge.pipeline.publication_activation._BETWEEN_PATHS). A protected path
+#: may contain none of them.
+_A_PATH_SEPARATOR_CHARACTER = re.compile(r"[\s=:,;\"'`]")
+
+
 class PublicationConfig(BaseModel):
     """Whether the merge word may send the joined commit to the remote.
 
@@ -1718,6 +1726,63 @@ class PublicationConfig(BaseModel):
             "list or any sandbox's settings."
         ),
     )
+    publisher_route_keys_dir: str | None = Field(
+        default=None,
+        description=(
+            "The HOST PATH of the one folder the publisher's per-route keys "
+            "are in — the folder its container mounts read-only at "
+            "/etc/forge-publisher/route-keys (FORGE_PUBLISHER_ROUTE_KEYS_DIR "
+            "in the estate's env file). Not a key, and not a copy of one: a "
+            "note of where the folder is, so that the activation check can "
+            "prove neither the folder nor any path inside it is named in the "
+            "coordinator's settings, the runner's launch list or any "
+            "sandbox's settings. None (the default) = no route keys are "
+            "protected by the check."
+        ),
+    )
+
+    @field_validator("publisher_credential_file", "publisher_route_keys_dir")
+    @classmethod
+    def _a_plain_absolute_path(cls, value: str | None, info: Any) -> str | None:
+        """An absolute path with none of the characters that separate paths.
+
+        The activation check finds these paths inside other settings by
+        splitting a setting's text on whitespace, '=', ':', ',', ';' and
+        quotes. A protected path that itself contained one could never be
+        found that way, so such a path is refused here, at load, naming the
+        field. Unset (None, or blank, which the check already refuses as "not
+        named") is left alone.
+        """
+        if value is None or not value.strip():
+            return value
+        where = f"publication.{info.field_name}"
+        if not value.startswith("/"):
+            raise ValueError(
+                f"{where} must be an absolute path (starting with '/'); "
+                f"{value!r} is not"
+            )
+        if "\x00" in value or _A_PATH_SEPARATOR_CHARACTER.search(value):
+            raise ValueError(
+                f"{where} must be a path with no whitespace and none of "
+                "= : , ; ' \" ` in it, because the activation check finds "
+                "it inside other settings by splitting on those; "
+                f"{value!r} has one. Move the file or folder to such a path"
+            )
+        # CANONICAL, because the check protects the path by its own NAME (its
+        # last component): '/a/keys/.' or '/a/x/..' would give it the wrong
+        # name, and the real spellings would escape.
+        canonical = posixpath.normpath("/" + value.lstrip("/"))
+        if canonical == "/":
+            raise ValueError(
+                f"{where} must name a file or folder, not the root '/'"
+            )
+        if value != canonical or posixpath.basename(canonical) in (".", ".."):
+            raise ValueError(
+                f"{where} must be written in its plain form, with one leading "
+                "'/', no trailing '/', and no '.', '..' or repeated '/': "
+                f"{value!r} is not; write {canonical!r}"
+            )
+        return value
 
 
 class ReviewPreviewConfig(BaseModel):

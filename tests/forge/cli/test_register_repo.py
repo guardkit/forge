@@ -586,6 +586,64 @@ def test_a_route_already_there_is_unchanged_and_the_publisher_is_not_in_the_sequ
     assert "routes did not change" in result.output
 
 
+def test_publish_with_a_credential_name_puts_it_in_the_route(estate, publisher_file):
+    """13 October 2026: the route names its own key, by bare name, and nothing
+    else about the route changes. The key itself is never read or made."""
+    result = _run(
+        "--publish", "--publisher-settings", str(publisher_file),
+        "--publish-credential-name", "widget-shop-key",
+    )
+    assert result.exit_code == 0, result.output
+    staged = json.loads((publisher_file.parent / f"settings.json.{LEAF}-pending").read_text())
+    expected = json.loads(json.dumps(PUBLISHER_JSON))
+    expected["projects"][KEY] = {
+        "source": f"git://192.0.2.10:8918/api_test/.guardkit/tmp/factory-runtime/projects/{LEAF}",
+        "remote": f"git@github.com:guardkit/{LEAF}.git",
+        "credential_name": "widget-shop-key",
+    }
+    assert staged == expected
+    assert "its own key 'widget-shop-key'" in result.output
+
+
+def test_publish_credential_name_without_publish_is_refused(estate, publisher_file):
+    before = publisher_file.read_bytes()
+    result = _run("--publish-credential-name", "widget-shop-key")
+    assert result.exit_code == 1
+    # The tool's own sentence, not click's "no such option".
+    assert "--publish-credential-name needs --publish" in result.output
+    assert estate.writes == []
+    assert publisher_file.read_bytes() == before
+    assert sorted(os.listdir(publisher_file.parent)) == ["settings.json"]
+
+
+@pytest.mark.parametrize("name", ["a/b", "../x", ".", "..", "", " key", "key\n", "/etc/x"])
+def test_a_publish_credential_name_that_is_not_a_key_name_is_refused(estate, publisher_file, name):
+    result = _run(
+        "--publish", "--publisher-settings", str(publisher_file),
+        "--publish-credential-name", name,
+    )
+    assert result.exit_code == 1
+    assert "--publish-credential-name is not a key name" in result.output
+    assert estate.writes == []
+    assert sorted(os.listdir(publisher_file.parent)) == ["settings.json"]
+
+
+def test_a_route_without_a_key_asked_again_with_one_is_refused(estate, publisher_file):
+    data = json.loads(publisher_file.read_text())
+    data["projects"][KEY] = {
+        "source": f"git://192.0.2.10:8918/api_test/.guardkit/tmp/factory-runtime/projects/{LEAF}",
+        "remote": f"git@github.com:guardkit/{LEAF}.git",
+    }
+    publisher_file.write_text(json.dumps(data))
+    result = _run(
+        "--publish", "--publisher-settings", str(publisher_file),
+        "--publish-credential-name", "widget-shop-key",
+    )
+    assert result.exit_code == 1
+    assert "different route" in result.output and "fix it by hand" in result.output
+    assert sorted(os.listdir(publisher_file.parent)) == ["settings.json"]
+
+
 # ---------------------------------------------------------------------------
 # The printed activation sequence
 # ---------------------------------------------------------------------------

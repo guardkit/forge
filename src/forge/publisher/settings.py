@@ -14,6 +14,11 @@ does ONE thing, so it is told only the things that one thing needs:
   is for that project, which is the only place anything is ever sent;
 * **its own private folder**, where it keeps its own copy of each project's
   commits and the small program git asks for the credential through;
+* **for a project that needs a key of its own** (13 October 2026): the bare
+  NAME of that key, never a path. The name is a file directly inside the one
+  protected, read-only folder the container mounts
+  (:data:`ROUTE_KEYS_DIR`). A route that names no key uses the
+  publisher-wide credential, exactly as before;
 * **where to listen** — an address and a port. The loopback address by
   default; every address inside its own container when it is run as the
   service the compose fragment beside this package describes, which
@@ -31,6 +36,7 @@ branch name that came off the ledger are the whole of what it knows.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -38,11 +44,48 @@ from typing import Any
 from forge.publisher.credential import a_remote_the_publisher_takes, an_ssh_address
 
 __all__ = [
+    "ROUTE_KEYS_DIR",
     "ProjectRoute",
     "PublisherSettings",
     "SettingsRefused",
+    "a_route_key_name",
     "load_settings",
+    "the_route_key_file",
 ]
+
+#: The one folder every route's own key lives in, directly. The container
+#: mounts it read-only; a route names a file in it by bare name and can name
+#: nothing anywhere else. Read at call time, never copied, so a test can point
+#: it at a folder of its own.
+ROUTE_KEYS_DIR: str = "/etc/forge-publisher/route-keys"
+
+#: A key's bare name: a letter or digit, then letters, digits, dot, underscore
+#: or hyphen, at most 100 characters in all. No slash, so never a path; no
+#: whitespace or newline. ``.`` and ``..`` cannot match (they start with a
+#: dot) and are refused by name as well.
+_A_KEY_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
+
+#: The sentence that says what a key name is, shared by the settings and by
+#: ``forge register-repo --publish-credential-name``.
+WHAT_A_KEY_NAME_IS: str = (
+    "the bare name of a file directly inside the publisher's route-keys "
+    "folder: a letter or digit, then letters, digits, dot, underscore or "
+    "hyphen, at most 100 characters, never a path"
+)
+
+
+def a_route_key_name(value: object) -> bool:
+    """Is this a key name a route may give? Strings only; never a path."""
+    return (
+        isinstance(value, str)
+        and value not in (".", "..")
+        and _A_KEY_NAME.fullmatch(value) is not None
+    )
+
+
+def the_route_key_file(name: str) -> Path:
+    """Where the key with this bare name is: directly inside the one folder."""
+    return Path(ROUTE_KEYS_DIR) / name
 
 
 class SettingsRefused(ValueError):
@@ -55,11 +98,16 @@ class ProjectRoute:
 
     ``source`` is read-only by contract: the publisher only ever fetches from
     it, and a test pins that no code path here writes to it.
+
+    ``credential_name`` is the bare name of this project's own key, or
+    ``None`` to use the publisher-wide credential. It is never a path: the
+    file is :func:`the_route_key_file` of it, and nothing else.
     """
 
     name: str
     source: str
     remote: str
+    credential_name: str | None = None
 
 
 @dataclass(frozen=True)
@@ -93,7 +141,17 @@ class PublisherSettings:
             "ledger": self.ledger,
             "state_dir": self.state_dir,
             "projects": {
-                name: {"source": route.source, "remote": route.remote}
+                name: {
+                    "source": route.source,
+                    "remote": route.remote,
+                    # The NAME of the route's own key, which is not a secret;
+                    # left out for a route that uses the publisher-wide one.
+                    **(
+                        {"credential_name": route.credential_name}
+                        if route.credential_name is not None
+                        else {}
+                    ),
+                }
                 for name, route in sorted(self.projects.items())
             },
             "host": self.host,
@@ -112,6 +170,29 @@ def _text(block: Any, key: str, *, where: str, required: bool = True) -> str:
             )
         return ""
     return value.strip()
+
+
+def _a_route_s_key_name(block: Any, project: str) -> str | None:
+    """The route's own key name: absent means inherit; anything else is checked.
+
+    A STRICT reader, not :func:`_text`: that one turns a number, a list or
+    ``null`` into "nothing", which here would quietly mean "use the
+    publisher-wide key" — the one fallback this field must never have. So a
+    present field is either a key name or a refusal naming the route. The
+    value is not repeated in the refusal: whatever was put there by mistake
+    (a key's own text, say) is not written into a log.
+    """
+    if not isinstance(block, dict) or "credential_name" not in block:
+        return None
+    value = block["credential_name"]
+    if not a_route_key_name(value):
+        raise SettingsRefused(
+            f"'credential_name' of project '{project}' in the publisher's "
+            f"settings is not a key name: it must be {WHAT_A_KEY_NAME_IS} "
+            f"({ROUTE_KEYS_DIR}). Leave the field out to use the "
+            "publisher-wide credential. The value is not repeated here."
+        )
+    return str(value)
 
 
 def load_settings(path: str | Path) -> PublisherSettings:
@@ -162,6 +243,7 @@ def load_settings(path: str | Path) -> PublisherSettings:
             name=readable,
             source=_text(block, "source", where=f"projects.{readable}"),
             remote=remote,
+            credential_name=_a_route_s_key_name(block, readable),
         )
     port = decoded.get("port", 0)
     if isinstance(port, bool) or not isinstance(port, int) or port < 0:

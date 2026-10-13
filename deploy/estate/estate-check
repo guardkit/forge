@@ -85,6 +85,7 @@ ITEMS=(
 "host|4|release-images-present-or-fetchable|the release images are present, or can be fetched, at the TAGS the env file names - the design asks for digests, which this bundle does not do yet (README.md, the rollout preconditions)"
 "host|5|volumes-and-disk-room|the declared volumes exist or can be created, and the disk has room"
 "host|6|secret-files-present-and-private|every secret file the env file names exists and is readable by its own service's user and by nobody else"
+"host|6b|publisher-route-keys-folder-agrees|the folder the publisher's per-route keys are mounted from (FORGE_PUBLISHER_ROUTE_KEYS_DIR) is the folder the coordinator's settings record as publication.publisher_route_keys_dir, which its isolation check protects - and a publisher whose routes name keys of their own is refused without that setting"
 "host|7|every-setting-name-has-a-value|every setting name the composed files require has a value"
 "host|7b|bus-mode-and-the-files-agree|BUS_MODE says whose bus this estate runs against, and the compose profiles and files in force say the same thing - a half-set mode is the one state that could start a second bus beside a bus that is being kept"
 "host|7c|publisher-host-policy-is-current|the exact project-bound publisher OUTPUT policy is present in the current kernel on the selected local Docker daemon"
@@ -507,6 +508,9 @@ check_host() {
         fi
     fi
 
+    # --- 6b ----------------------------------------------------------------
+    check_the_route_keys_folder_agrees "${docker_ok}"
+
     # --- 7 -----------------------------------------------------------------
     local required unset_names="" v
     required="$(required_setting_names)"
@@ -543,6 +547,103 @@ check_host() {
     fi
 
     finish
+}
+
+# ---------------------------------------------------------------------------
+# ITEM 6b — THE PUBLISHER'S ROUTE-KEYS FOLDER, AS THE ENV FILE AND THE
+# COORDINATOR EACH NAME IT (13 October 2026).
+#
+# The publisher mounts every project route's own key from one folder,
+# FORGE_PUBLISHER_ROUTE_KEYS_DIR. The coordinator's activation check keeps that
+# folder out of every other setting only if its own settings record the same
+# folder as publication.publisher_route_keys_dir. Two names for one fact can
+# drift apart, so this compares them: a difference fails, and so does a
+# publisher whose routes name keys of their own while the coordinator records
+# no folder at all, because then nothing protects those keys.
+#
+# WHAT IT READS. The env file; the publisher's settings file, for which routes
+# name a key (names only, never a key); and the coordinator's forge.yaml from
+# its settings volume, read by the coordinator's own image with no network.
+# It opens no key and prints nothing out of one. This is a comparison of two
+# settings, not a check of who can read the keys: item 6 checks owners and
+# modes, and neither is isolation.
+# ---------------------------------------------------------------------------
+_strip_trailing_slashes() {
+    local text="$1"
+    while [ "${#text}" -gt 1 ] && [ "${text%/}" != "${text}" ]; do text="${text%/}"; done
+    printf '%s' "${text}"
+}
+
+#: The coordinator's settings volume, as Docker knows it, out of the rendered
+#: bundle: the 'name:' under the top-level volume keyed 'forge-settings'.
+_the_settings_volume_of() {
+    printf '%s' "$1" | awk '
+        /^volumes:$/ { inside = 1; next }
+        /^[a-z]/     { inside = 0 }
+        inside && /^  [^ ]/ { key = $1 }
+        inside && key == "forge-settings:" && $1 == "name:" { print $2; exit }
+    '
+}
+
+check_the_route_keys_folder_agrees() {
+    local docker_ok="$1" env_dir settings_file named volume image said coord_dir
+    env_dir="$(_strip_trailing_slashes "$(get FORGE_PUBLISHER_ROUTE_KEYS_DIR)")"
+    if [ -z "${env_dir}" ]; then
+        fail 6b "the env file names no FORGE_PUBLISHER_ROUTE_KEYS_DIR, and the publisher's compose fragment requires it: point it at the folder of per-route keys, an empty folder when there are none."
+        return
+    fi
+    settings_file="$(get FORGE_PUBLISHER_SETTINGS_FILE)"
+    named="$(python3 -c '
+import json, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        projects = (json.load(handle) or {}).get("projects") or {}
+    print(sum(1 for route in projects.values() if isinstance(route, dict) and "credential_name" in route))
+except Exception:
+    print("unreadable")
+' "${settings_file}" 2>/dev/null)"
+    [ -n "${named}" ] || named="unreadable"
+    if [ "${docker_ok}" != "yes" ]; then
+        unchecked 6b "docker does not answer, so the coordinator's settings could not be read to compare its publication.publisher_route_keys_dir with FORGE_PUBLISHER_ROUTE_KEYS_DIR (${env_dir})."
+        return
+    fi
+    [ -n "${COMPOSE_SAID}" ] || compose_says config
+    volume="$(_the_settings_volume_of "${COMPOSE_SAID}")"
+    image="$(get FORGE_IMAGE)"
+    if [ -z "${volume}" ] || [ -z "${image}" ]; then
+        unchecked 6b "the coordinator's settings volume or image could not be worked out from the bundle and the env file, so its publication.publisher_route_keys_dir could not be compared with FORGE_PUBLISHER_ROUTE_KEYS_DIR (${env_dir})."
+        return
+    fi
+    said="$(docker run --rm --network none --entrypoint python \
+        -v "${volume}:/etc/forge:ro" "${image}" -c '
+import sys, yaml
+try:
+    with open("/etc/forge/forge.yaml", encoding="utf-8") as handle:
+        settings = yaml.safe_load(handle) or {}
+except FileNotFoundError:
+    print("NO-FILE"); sys.exit(0)
+publication = settings.get("publication") if isinstance(settings, dict) else None
+value = publication.get("publisher_route_keys_dir") if isinstance(publication, dict) else None
+print("SET=" + (value if isinstance(value, str) else ""))
+' 2>/dev/null)"
+    case "${said}" in
+        SET=*) coord_dir="$(_strip_trailing_slashes "${said#SET=}")" ;;
+        *)
+            unchecked 6b "the coordinator's forge.yaml could not be read from its settings volume ${volume}, so its publication.publisher_route_keys_dir could not be compared with FORGE_PUBLISHER_ROUTE_KEYS_DIR (${env_dir})."
+            return
+            ;;
+    esac
+    if [ -n "${coord_dir}" ] && [ "${coord_dir}" != "${env_dir}" ]; then
+        fail 6b "the publisher mounts its per-route keys from ${env_dir} (FORGE_PUBLISHER_ROUTE_KEYS_DIR), and the coordinator's settings record ${coord_dir} as publication.publisher_route_keys_dir. They have to be the same folder, or the coordinator's isolation check protects the wrong one."
+    elif [ -n "${coord_dir}" ]; then
+        ok 6b "the publisher's per-route keys folder ${env_dir} is the folder the coordinator's settings record as publication.publisher_route_keys_dir, so its isolation check protects it."
+    elif [ "${named}" = "unreadable" ]; then
+        unchecked 6b "the coordinator's settings record no publication.publisher_route_keys_dir, and the publisher's settings file ${settings_file:-(not named)} could not be read to tell whether any route names a key of its own."
+    elif [ "${named}" -gt 0 ]; then
+        fail 6b "${named} of the publisher's routes name a key of their own, and the coordinator's settings record no publication.publisher_route_keys_dir, so nothing keeps the folder ${env_dir} out of other settings. Set it to ${env_dir} in the coordinator's forge.yaml."
+    else
+        ok 6b "no publisher route names a key of its own, and the coordinator records no route-keys folder. Set publication.publisher_route_keys_dir to ${env_dir} before any route names one."
+    fi
 }
 
 # ---------------------------------------------------------------------------

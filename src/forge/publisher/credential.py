@@ -29,12 +29,22 @@ Reading the same named file makes none. The helper is the publisher's own,
 written into the publisher's own private folder with owner-only permissions,
 and it is the only child that ever learns the credential.
 
+ONE CREDENTIAL PER ROUTE (13 October 2026). A project's route may name a key
+of its own, by bare name, inside the one protected folder the container
+mounts read-only. Every rule above holds for each such file. Two more hold
+for a route's key: it is never a symbolic link (it is opened with
+``O_NOFOLLOW``, and the file opened has to be the very file that was looked
+at), and the program git asks for it through has a name of its own, so that
+two routes' programs never overwrite each other.
+
 Nothing here names a language, a test runner, a hosting provider or a
 product. It is a file path and a string.
 """
 
 from __future__ import annotations
 
+import errno
+import hashlib
 import logging
 import os
 import re
@@ -61,6 +71,9 @@ __all__ = [
 #: What a credential says when anything asks it to describe itself.
 CREDENTIAL_IS_NOT_SHOWN: str = "<the publisher's credential: not shown>"
 
+#: The name of the program git asks the publisher-wide credential through.
+THE_PUBLISHER_WIDE_PROGRAM: str = "ask-for-the-credential"
+
 
 class Credential:
     """One credential, held in memory, which will not print itself.
@@ -71,11 +84,18 @@ class Credential:
     so that it reads as what it is wherever it appears.
     """
 
-    __slots__ = ("_text", "_path")
+    __slots__ = ("_text", "_path", "_own_program")
 
-    def __init__(self, text: str, *, path: str | os.PathLike[str]) -> None:
+    def __init__(
+        self,
+        text: str,
+        *,
+        path: str | os.PathLike[str],
+        own_program: bool = False,
+    ) -> None:
         self._text = str(text)
         self._path = str(path)
+        self._own_program = bool(own_program)
 
     # -- the ways a thing gets printed, all of them closed ------------------
 
@@ -98,6 +118,21 @@ class Credential:
         """The one named file it was read from. A path, never the secret."""
         return self._path
 
+    @property
+    def program_name(self) -> str:
+        """The name of the program git asks for THIS credential through.
+
+        The publisher-wide credential keeps the name it always had. A route's
+        own key gets a name of its own, made from its file's PATH (never its
+        contents), so that two routes' programs are two files: with one name,
+        the second program written would overwrite the first, and the first
+        route's git would send with the second route's token.
+        """
+        if not self._own_program:
+            return THE_PUBLISHER_WIDE_PROGRAM
+        digest = hashlib.sha256(self._path.encode("utf-8")).hexdigest()[:16]
+        return f"{THE_PUBLISHER_WIDE_PROGRAM}.{digest}"
+
     def _secret(self) -> str:
         """The text itself. One caller, in this module, and nowhere else."""
         return self._text
@@ -110,8 +145,38 @@ class CredentialRefusal:
     sentence: str
 
 
+def _read_without_following(
+    where: Path, identity: tuple[int, int] | None
+) -> str:
+    """The file's text, opened with ``O_NOFOLLOW``: a symbolic link is refused.
+
+    With ``identity`` given, the file opened has to be that very file — the
+    ``(st_dev, st_ino)`` recorded when it was looked at — or nothing is read.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    descriptor = os.open(str(where), flags)
+    try:
+        found = os.fstat(descriptor)
+        if identity is not None and (found.st_dev, found.st_ino) != tuple(identity):
+            raise _NotTheFileLookedAt()
+        with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+            descriptor = -1
+            return handle.read()
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+class _NotTheFileLookedAt(Exception):
+    """The file at the path changed between being looked at and being read."""
+
+
 def read_the_credential(
     path: str | os.PathLike[str] | None,
+    *,
+    no_follow: bool = False,
+    identity: tuple[int, int] | None = None,
+    own_program: bool = False,
 ) -> tuple[Credential | None, CredentialRefusal | None]:
     """Read the credential ONCE, from the one named file. Never raises.
 
@@ -119,6 +184,13 @@ def read_the_credential(
     empty file are four different sentences, because they need four different
     things done about them. None of the four says anything about the file's
     contents.
+
+    For a ROUTE's own key (13 October 2026) the publisher passes
+    ``no_follow`` (the file is opened with ``O_NOFOLLOW``, so a symbolic link
+    is refused), the ``identity`` it recorded when it looked at the file (the
+    file opened has to be that one), and ``own_program`` (the program git
+    asks for it through gets a name of its own). With none of them given,
+    this reads exactly as it always has.
     """
     named = str(path or "").strip()
     if not named:
@@ -129,13 +201,29 @@ def read_the_credential(
         )
     where = Path(named).expanduser()
     try:
-        text = where.read_text(encoding="utf-8")
+        if no_follow:
+            text = _read_without_following(where, identity)
+        else:
+            text = where.read_text(encoding="utf-8")
+    except _NotTheFileLookedAt:
+        return None, CredentialRefusal(
+            f"the publisher's credential file {where} is not the file that "
+            "was looked at a moment before (it was replaced in between), so "
+            "it was not read, and the publisher holds no credential from it "
+            "and can send nothing with it."
+        )
     except FileNotFoundError:
         return None, CredentialRefusal(
             f"the publisher's credential file {where} is not there, so it "
             "holds no credential and can send nothing."
         )
     except OSError as exc:
+        if no_follow and exc.errno == errno.ELOOP:
+            return None, CredentialRefusal(
+                f"the publisher's credential file {where} is a symbolic link, "
+                "and a route's key has to be the file itself, so it was not "
+                "read and the publisher can send nothing with it."
+            )
         return None, CredentialRefusal(
             f"the publisher's credential file {where} could not be read "
             f"({exc.strerror or type(exc).__name__}), so it holds no "
@@ -146,7 +234,7 @@ def read_the_credential(
             f"the publisher's credential file {where} is empty, so it holds "
             "no credential and can send nothing."
         )
-    return Credential(text.strip(), path=str(where)), None
+    return Credential(text.strip(), path=str(where), own_program=own_program), None
 
 
 #: The programs already written, by the folder they are in and the file they
@@ -203,9 +291,12 @@ def the_askpass_program(credential: Credential, *, state_dir: Path) -> Path:
         if known is not None and known.is_file():
             return known
         state_dir.mkdir(parents=True, exist_ok=True)
-        program = state_dir / "ask-for-the-credential"
+        # ONE PROGRAM PER CREDENTIAL (13 October 2026): a route's own key has
+        # a program name of its own, so this never writes over another
+        # credential's program (see Credential.program_name).
+        program = state_dir / credential.program_name
         being_written = state_dir / (
-            f"ask-for-the-credential.{os.getpid()}.being-written"
+            f"{credential.program_name}.{os.getpid()}.being-written"
         )
         being_written.write_text(_the_program_text(credential), encoding="utf-8")
         being_written.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)

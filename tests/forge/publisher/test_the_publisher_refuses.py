@@ -451,3 +451,49 @@ class TestARecordBelongsToItsOwnProject:
         assert answer.refusal_kind == "the-record-does-not-say-which-project"
         assert BUILD in str(answer.refusal)
         _nothing_moved(project, before)
+
+
+class TestARouteSOwnKeyNeverFallsBack:
+    """13 October 2026: a route that names a key is sent with it or refused."""
+
+    def test_a_route_whose_own_credential_is_empty_never_falls_back(
+        self, tmp_path: Path, project: dict, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from tests.forge.publisher.a_project_and_a_ledger import (
+            THE_MADE_UP_CREDENTIAL,
+            a_route_keys_folder,
+        )
+
+        root = tmp_path / "world"
+        make_the_ledger(root / "forge.db", project=project)
+        folder = a_route_keys_folder(tmp_path, monkeypatch)
+        (folder / "its-own").write_text("   \n", encoding="utf-8")
+        (folder / "its-own").chmod(0o600)
+        publisher = Publisher(
+            settings_for(
+                root,
+                project,
+                ledger=root / "forge.db",
+                projects={
+                    PROJECT: ProjectRoute(
+                        name=PROJECT,
+                        source=str(project["copy"]),
+                        remote=str(project["bare"]),
+                        credential_name="its-own",
+                    )
+                },
+            )
+        )
+        # The publisher-wide credential is there and good.
+        assert publisher.holds_a_credential is True
+        before = what_the_remote_has(project["bare"], project["branch"])
+
+        answer = publisher.publish(a_request(project))
+
+        assert answer.published is False
+        assert answer.refusal_kind == "there-is-no-credential"
+        assert PROJECT in str(answer.refusal)
+        assert "its-own" in str(answer.refusal)
+        assert "is empty" in str(answer.refusal)
+        assert THE_MADE_UP_CREDENTIAL not in str(answer.refusal)
+        _nothing_moved(project, before)
