@@ -201,7 +201,9 @@ _PROFILE_RETRY_SECONDS: float = 3.0
 _SLOT_POLL_SECONDS: float = 15.0
 
 #: File kinds read as media when the driver named none.
-_MEDIA_SUFFIXES: frozenset[str] = frozenset({".png", ".jpg", ".jpeg", ".webm", ".mp4"})
+_SCREENSHOT_SUFFIXES: frozenset[str] = frozenset({".png", ".jpg", ".jpeg"})
+_VIDEO_SUFFIXES: frozenset[str] = frozenset({".webm", ".mp4"})
+_MEDIA_SUFFIXES: frozenset[str] = _SCREENSHOT_SUFFIXES | _VIDEO_SUFFIXES
 _MEDIA_SCAN_CAP: int = 20
 
 #: The six sidecar routes.
@@ -1666,6 +1668,19 @@ class ReviewPreviewService:
         if report is None:
             return await self._fail(
                 context, "the key journey left no test report", journey=journey
+            )
+        # A person approves what they could watch: the PASSING journey's own
+        # recording and screenshots must be among what was copied. A driver
+        # that records only on failure leaves neither for a pass.
+        kept = context.kept or []
+        if not any(Path(f).suffix.lower() in _VIDEO_SUFFIXES for f in kept) or not any(
+            Path(f).suffix.lower() in _SCREENSHOT_SUFFIXES for f in kept
+        ):
+            return await self._fail(
+                context,
+                "the passing journey left no video/screenshots "
+                "(failure-only recording?)",
+                journey=journey,
             )
         self._store.update(lease_id, now=self._clock(), state="ready", reason=None)
         return self._record(
