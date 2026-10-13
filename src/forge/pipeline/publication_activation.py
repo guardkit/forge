@@ -296,9 +296,12 @@ def _names_the_credential_file(config: Any, credential_file: str) -> tuple[str, 
     wanted = _text(credential_file)
     if not wanted:
         return ()
+    # Every spelling of the one file: each absolute path in a value is taken
+    # out and normalised, and has to BE the file (no prefix: it is a file).
+    the_file = _a_linux_path(wanted)
     return _where_settings_name(
         config,
-        lambda text: text.strip() == wanted,
+        lambda text: the_file in _the_paths_in(text),
         own_field="publisher_credential_file",
     )
 

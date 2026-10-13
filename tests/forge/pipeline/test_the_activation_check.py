@@ -388,3 +388,37 @@ class TestEveryWayOfSpellingTheFolderIsCaught:
         true = what_is_true_here(config, IT_PASSED)
         assert true.where_the_route_keys_dir_is_named == ()
         assert run_the_activation_check(config, IT_PASSED).all_hold is True
+
+
+class TestEveryWayOfSpellingTheCredentialFileIsCaught:
+    """The same token extraction and normalisation for the publisher-wide
+    file: a path in a setting has to BE that file, by any spelling."""
+
+    @pytest.mark.parametrize(
+        "written",
+        ["/x/./credential", "//x/credential", "KEY=/x/credential"],
+    )
+    def test_an_equivalent_spelling_refuses(self, written: str) -> None:
+        config = a_config(publisher_credential_file="/x/credential")
+        config.conductor.launch_settings = [written]
+        config.planning.sandboxes = {
+            "the-sandbox": SimpleNamespace(name="the-sandbox", some_file=written)
+        }
+        verdict = run_the_activation_check(config, IT_PASSED)
+        assert [answer.name for answer in verdict.refusals] == [
+            "the-credential-is-named-in-no-other-settings"
+        ]
+        assert "conductor.launch_settings" in verdict.sentence
+        assert "planning.sandboxes.the-sandbox.some_file" in verdict.sentence
+
+    @pytest.mark.parametrize(
+        "elsewhere", ["/x/credential2", "/x/credential.bak", "KEY=/x/credential.bak"]
+    )
+    def test_a_different_file_does_not_match(self, elsewhere: str) -> None:
+        config = a_config(publisher_credential_file="/x/credential")
+        config.conductor.launch_settings = [elsewhere]
+        config.planning.sandboxes = {
+            "the-sandbox": SimpleNamespace(name="the-sandbox", some_file=elsewhere)
+        }
+        verdict = run_the_activation_check(config, IT_PASSED)
+        assert verdict.all_hold is True, verdict.sentence
