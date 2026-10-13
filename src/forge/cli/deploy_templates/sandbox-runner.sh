@@ -1567,7 +1567,7 @@ the_engine_socket_for() {
 # the SIGTERM of its own polite stop of them; a handled one is reset to the
 # default in the new program. The runner keeps its own clean shutdown on
 # SIGTERM (uvicorn's); the one difference is that it now ends with status 143,
-# where as PID 1 it ended with about 0, and nothing reads that status.
+# where as PID 1 it ended with about 0, and nothing acts on that status (it is only logged).
 start_helper() {
   log "starting the deploy helper from ${IMAGE_REFERENCE} on this sandbox's own network, ${BIND}:${SIDECAR_PORT}"
   # The helper's job is to run a project's own vetted deploy and merge
