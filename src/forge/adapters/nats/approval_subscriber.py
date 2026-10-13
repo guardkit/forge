@@ -291,19 +291,21 @@ class ApprovalSubscriberDeps:
 def _answers_this_gate(
     payload: ApprovalResponsePayload, *, build_id: str, stage_label: str
 ) -> bool:
-    """False only for a ``reject`` whose request id is not this gate's.
+    """False only for a ``reject`` whose request id names another gate.
 
     A request id carries build, stage and attempt (:func:`parse_request_id`);
     the attempt is ignored, because a refreshed card is the same decision at
-    the same gate. An id that does not parse counts as another gate's.
-    Approve, override and defer are not checked here.
+    the same gate. An id that does not parse is applied as before: it cannot
+    be shown to belong to another gate (an old-format card, such as a
+    conductor resume waiting under a default stage label, must still be
+    rejectable). Approve, override and defer are not checked here.
     """
     if payload.decision != "reject":
         return True
     try:
         card_build_id, card_stage, _attempt = parse_request_id(payload.request_id)
     except ValueError:
-        return False
+        return True
     return card_build_id == build_id and card_stage == stage_label
 
 

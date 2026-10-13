@@ -946,6 +946,34 @@ class TestRejectionAppliesToItsOwnGate:
         assert _final_status(db_path, build_id) is BuildState.RUNNING
 
     @pytest.mark.asyncio
+    async def test_rejection_with_an_unparsable_request_id_is_applied(
+        self, incident_env: Path
+    ) -> None:
+        """An old-format id cannot be shown to name another gate: applied."""
+        db_path = incident_env / "forge.db"
+        build_id = _seed_paused_build(db_path, feature_id="FEAT-CARD10")
+        card = _Card(db_path, build_id, CARD_APPROVER)
+        waiting = asyncio.create_task(card.wait())
+        await _await_registered(card.nats, build_id)
+        try:
+            await card.nats.deliver_response(
+                build_id=build_id,
+                request_id="legacy-uuid-no-colons",
+                decision="reject",
+                decided_by=CARD_APPROVER,
+            )
+            await asyncio.wait_for(waiting, timeout=5)
+        finally:
+            if not waiting.done():
+                waiting.cancel()
+            await asyncio.gather(waiting, return_exceptions=True)
+            card.close()
+
+        assert card.response is not None
+        assert card.response.request_id == "legacy-uuid-no-colons"
+        assert _final_status(db_path, build_id) is BuildState.CANCELLED
+
+    @pytest.mark.asyncio
     async def test_recovered_gate_applies_a_rejection_after_several_timeouts(
         self,
         incident_env: Path,
