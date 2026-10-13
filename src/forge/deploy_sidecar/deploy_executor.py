@@ -159,7 +159,11 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
-from forge.launch_environment import build_project_command_env, declared_setting_refusal
+from forge.launch_environment import (
+    build_project_command_env,
+    declared_setting_refusal,
+    minimal_environment_note,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -495,6 +499,10 @@ class DeployRequest:
     #: (:class:`forge.deploy.review_preview.IssuedPreviewValues`), read and
     #: checked by the helper service; ``None`` for every other deploy.
     issued_env: Any = None
+    #: The checkout the step belongs to, when the caller knows it: the step's
+    #: private home is made in that checkout's own git directory, and ``cwd``
+    #: must be inside it.
+    repository: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1639,6 +1647,7 @@ class DeployExecutor:
             issued=request.issued_env,
             overlay=overlay,
             parent=self._parent,
+            repository=request.repository,
         )
 
     @staticmethod
@@ -1919,7 +1928,7 @@ class DeployExecutor:
                 sentence=(
                     f"the deploy step for {note.target} was given "
                     f"{note.limit:.0f}s and had not finished, so it was "
-                    "stopped."
+                    "stopped. " + self._what_it_was_not_given(request)
                 ),
                 exit_code=124,
                 output=output,
@@ -1932,10 +1941,22 @@ class DeployExecutor:
             sentence=(
                 f"the deploy step for {note.target} ran and ended with "
                 f"{code}."
+                + (f" {self._what_it_was_not_given(request)}" if code != 0 else "")
             ),
             exit_code=int(code),
             output=output,
             marker=note.marker,
+        )
+
+    def _what_it_was_not_given(self, request: DeployRequest) -> str:
+        """Design section 4: the plain words for a failed deploy step — the
+        names of the settings it was not given, never a value."""
+        try:
+            env = self._child_environment(request)
+        except (OSError, ValueError):
+            return ""
+        return minimal_environment_note(
+            env, declared=request.launch_settings, parent=self._parent
         )
 
     @staticmethod
@@ -2091,4 +2112,5 @@ def request_from(
             str(artifact_setting).strip() if artifact_setting else None
         ),
         issued_env=defaults.get("issued_env"),
+        repository=defaults.get("repository"),
     )

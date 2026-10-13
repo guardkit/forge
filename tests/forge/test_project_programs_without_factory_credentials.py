@@ -38,6 +38,7 @@ import sqlite3
 import stat
 import subprocess
 import sys
+import textwrap
 import threading
 import urllib.error
 import urllib.request
@@ -105,7 +106,9 @@ LOADER_NAME = "guardkit.orchestrator.toolchain_declaration"
 # ---------------------------------------------------------------------------
 
 
-def _writer(path: Path, label: str, *, envelope: bool = False) -> None:
+def _writer(
+    path: Path, label: str, *, envelope: bool = False, exit_code: int = 0
+) -> None:
     """A program that writes its whole environment to ``env-<label>.json``.
 
     The file goes in the program's working directory: its environment is the
@@ -118,9 +121,12 @@ def _writer(path: Path, label: str, *, envelope: bool = False) -> None:
         "    json.dumps(dict(os.environ)), encoding='utf-8')",
     ]
     if envelope:
+        verdict = "pass" if exit_code == 0 else "fail"
         lines.append(
-            "print(json.dumps({'verdict': 'pass', 'run_id': 'r1', 'gates': []}))"
+            f"print(json.dumps({{'verdict': '{verdict}', 'run_id': 'r1', 'gates': []}}))"
         )
+    if exit_code:
+        lines.append(f"raise SystemExit({exit_code})")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
@@ -148,15 +154,23 @@ def _a_project(
     *,
     preview: bool = True,
     gate_env: dict[str, str] | None = None,
+    exit_code: int = 0,
+    declares: tuple[str, ...] = (DECLARED,),
 ) -> Path:
-    """A committed repository with a deploy profile and a declared test."""
+    """A committed repository with a deploy profile and a declared test.
+
+    ``exit_code`` is what every one of its programs ends with, after writing
+    down what it was given; ``declares`` is its ``launch.settings``.
+    """
     for label, envelope in (
         ("deploy", False),
         ("check", False),
         ("journey", True),
         ("test", False),
     ):
-        _writer(root / "deploy" / f"{label}.sh", label, envelope=envelope)
+        _writer(
+            root / "deploy" / f"{label}.sh", label, envelope=envelope, exit_code=exit_code
+        )
     profile: dict[str, Any] = {
         "env_id": "shop",
         "compose": {"file": "compose.yml", "script": "deploy/deploy.sh"},
@@ -175,7 +189,7 @@ def _a_project(
     (root / ".guardkit").mkdir(parents=True, exist_ok=True)
     (root / ".guardkit" / "config.yaml").write_text(
         f"toolchain:\n  test: {root / 'deploy' / 'test.sh'}\n  test_timeout: 60\n"
-        f"launch:\n  settings: [{DECLARED}]\n",
+        f"launch:\n  settings: [{', '.join(declares)}]\n",
         encoding="utf-8",
     )
     (root / ".gitignore").write_text(
@@ -1093,45 +1107,301 @@ class TestTheProductionChain:
 
 
 # ---------------------------------------------------------------------------
-# Section 5: a guard that cannot be missed by leaving a site out
+# A failed program is told what it was not given (design section 4)
 # ---------------------------------------------------------------------------
 
-SOURCE = Path(__file__).resolve().parents[2] / "src" / "forge"
+#: Set where the factory runs, not declared: offered by name, never shown.
+WITHHELD = "STANDIN_WITHHELD"
+WITHHELD_VALUE = "a-value-that-must-never-be-shown-" + "w" * 12
+#: Declared by the project, not set where the factory runs.
+UNSET_DECLARED = "STANDIN_UNSET"
 
-_LAUNCH_NAMES = {
+
+@pytest.fixture
+def failing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    monkeypatch.setenv(WITHHELD, WITHHELD_VALUE)
+    monkeypatch.delenv(UNSET_DECLARED, raising=False)
+    return _a_project(
+        tmp_path / "shop", exit_code=3, declares=(DECLARED, UNSET_DECLARED)
+    )
+
+
+def _names_never_values(detail: Any, where: str) -> None:
+    text = detail if isinstance(detail, str) else json.dumps(detail)
+    assert UNSET_DECLARED in text, f"{where} does not name the declared, unset setting"
+    assert WITHHELD in text, f"{where} does not name the setting it was not given"
+    assert "minimal environment" in text, where
+    assert WITHHELD_VALUE not in text, f"{where} shows a value"
+    _no_sentinel(text, where)
+
+
+class TestAFailedProgramIsToldWhatItWasNotGiven:
+    def test_the_declared_test_through_the_helper(
+        self, failing: Path, toolchain_loader: ModuleType
+    ) -> None:
+        from forge.cli._serve_conductor import run_declared_command_in_sandbox
+
+        tree = failing / ".forge" / "worktrees" / "journey-1"
+        tree.mkdir(parents=True)
+        with _a_helper(_config(failing)) as (_server, url):
+            exit_code, detail = run_declared_command_in_sandbox(
+                command=str(failing / "deploy" / "test.sh"),
+                cwd=tree,
+                timeout_seconds=60,
+                sandbox=SimpleNamespace(name="shop-sbx", sidecar_url=url),
+                repo=REPO,
+                launch_settings=[DECLARED, UNSET_DECLARED],
+                by_hand=True,
+            )
+        assert exit_code == 3, detail
+        _names_never_values(detail, "the declared test's failure detail")
+
+    def test_the_live_gate_driver_through_the_helper(self, failing: Path) -> None:
+        from forge.deploy.live_gate import SidecarLiveGateInvoker
+
+        with _a_helper(_config(failing)) as (_server, url):
+            outcome = SidecarLiveGateInvoker(
+                base_url=url,
+                repo=REPO,
+                repo_path=failing,
+                driver_argv=["deploy/journey.sh"],
+                timeout_seconds=60,
+                launch_settings=[DECLARED, UNSET_DECLARED],
+                by_hand=True,
+            ).invoke(feature=FEATURE, target="candidate")
+        assert outcome.verdict != "pass"
+        _names_never_values(outcome.detail, "the live-gate driver's failure detail")
+
+    def test_the_deploy_script(self, failing: Path) -> None:
+        from forge.executor.shell_steps import _run_script_step
+
+        exit_code, output = _run_script_step(
+            cwd=str(failing),
+            script="deploy/deploy.sh",
+            env_file=None,
+            launch_settings=[DECLARED, UNSET_DECLARED],
+        )
+        assert exit_code == 3
+        _names_never_values(output, "the deploy script's output")
+
+    def test_the_declared_test_without_a_sandbox(self, failing: Path) -> None:
+        from forge.cli._serve_conductor import _run_declared_command
+
+        exit_code, detail = _run_declared_command(
+            command=str(failing / "deploy" / "test.sh"),
+            cwd=failing,
+            timeout_seconds=60,
+            launch_settings=[DECLARED, UNSET_DECLARED],
+        )
+        assert exit_code == 3
+        _names_never_values(detail, "the declared test's detail (no sandbox)")
+
+    def test_the_live_gate_without_a_sandbox(self, failing: Path) -> None:
+        from forge.deploy.live_gate import RepoDriverLiveGateInvoker
+
+        outcome = RepoDriverLiveGateInvoker(
+            repo_path=failing,
+            driver_argv=[str(failing / "deploy" / "journey.sh")],
+            timeout_seconds=60,
+            launch_settings=[DECLARED, UNSET_DECLARED],
+        ).invoke(feature=FEATURE, target="candidate")
+        assert outcome.verdict != "pass"
+        _names_never_values(outcome.detail, "the live gate's detail (no sandbox)")
+
+    def test_the_owned_deploy(self, failing: Path, tmp_path: Path) -> None:
+        from forge.deploy_sidecar.deploy_executor import DeployExecutor, DeployRequest
+
+        target = f"shop-{tmp_path.name}::live"
+        answer = DeployExecutor(
+            notes_root=tmp_path / "notes",
+            # A stand-in coordinator that agrees this build owns the target.
+            ask_the_coordinator=lambda _t: {"counter": 1, "build": BUILD},
+        ).run(
+            DeployRequest(
+                target=target,
+                target_counter=1,
+                build=BUILD,
+                cwd=str(failing),
+                script="deploy/deploy.sh",
+                launch_settings=(DECLARED, UNSET_DECLARED),
+                repository=str(failing),
+            )
+        )
+        assert answer.accepted and answer.exit_code == 3, answer
+        _names_never_values(answer.sentence, "the owned deploy's answer")
+
+
+# ---------------------------------------------------------------------------
+# The private home goes only in a real git directory of the right checkout
+# ---------------------------------------------------------------------------
+
+
+class TestTheGitDirectoryIsARealOne:
+    def _refused(self, folder: Path, **kwargs: Any) -> str:
+        from forge.launch_environment import (
+            ProjectCommandEnvironmentError,
+            build_project_command_env,
+        )
+
+        with pytest.raises(ProjectCommandEnvironmentError) as refused:
+            build_project_command_env(folder, **kwargs)
+        return str(refused.value)
+
+    def test_an_empty_folder_called_git_above_is_not_a_git_directory(
+        self, tmp_path: Path
+    ) -> None:
+        outer = tmp_path / "outer"
+        (outer / ".git").mkdir(parents=True)
+        inner = outer / "inner"
+        inner.mkdir()
+        self._refused(inner)
+        assert not (outer / ".git" / "forge-project-home").exists()
+
+    def test_an_empty_gitdir_line_is_not_a_git_directory(self, tmp_path: Path) -> None:
+        odd = tmp_path / "odd"
+        odd.mkdir()
+        (odd / ".git").write_text("gitdir: \n", encoding="utf-8")
+        self._refused(odd)
+        assert not (odd / "forge-project-home").exists()
+
+    def test_a_gitdir_naming_the_work_folder_is_refused(self, tmp_path: Path) -> None:
+        odd = tmp_path / "odd"
+        odd.mkdir()
+        (odd / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+        (odd / "objects").mkdir()
+        (odd / ".git").write_text("gitdir: .\n", encoding="utf-8")
+        self._refused(odd)
+        assert not (odd / "forge-project-home").exists()
+
+    def test_the_walk_stops_at_the_first_git_entry(self, tmp_path: Path) -> None:
+        """A real checkout above an empty ``.git`` is never reached."""
+        outer = _a_project(tmp_path / "shop")
+        nested = outer / "vendor" / "thing"
+        (nested / ".git").mkdir(parents=True)
+        self._refused(nested)
+
+    def test_nothing_above_the_named_repository_is_used(self, tmp_path: Path) -> None:
+        outer = _a_project(tmp_path / "shop")
+        inner = outer / "sub"
+        inner.mkdir()
+        sentence = self._refused(inner, repository=inner)
+        assert "sub" in sentence
+        assert not (outer / ".git" / "forge-project-home").exists()
+
+    def test_a_work_folder_outside_the_named_repository_is_refused(
+        self, tmp_path: Path
+    ) -> None:
+        first = _a_project(tmp_path / "shop")
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        self._refused(elsewhere, repository=first)
+
+    def test_the_named_repository_is_used_for_a_tree_inside_it(
+        self, tmp_path: Path
+    ) -> None:
+        from forge.launch_environment import build_project_command_env
+
+        root = _a_project(tmp_path / "shop")
+        tree = root / ".forge-candidates" / "FEAT-AB12"
+        tree.mkdir(parents=True)
+        env = build_project_command_env(tree, repository=root)
+        _home_is_private(env, root)
+
+    def test_a_linked_worktree_uses_the_shared_git_directory(
+        self, tmp_path: Path
+    ) -> None:
+        from forge.launch_environment import build_project_command_env
+
+        root = _a_project(tmp_path / "shop")
+        tree = root / ".forge" / "worktrees" / "journey-9"
+        _git(root, "worktree", "add", "-q", "-b", "repair/nine", str(tree))
+        _home_is_private(build_project_command_env(tree), root)
+        _home_is_private(build_project_command_env(tree, repository=root), root)
+
+
+def test_a_request_env_file_that_clashes_with_the_factorys_is_refused(
+    project: Path,
+) -> None:
+    """``ENV_FILE`` is the factory's value for this one command: a request's
+    overlay naming it too is refused, as the deploy executor refuses it, and
+    nothing runs."""
+    from forge.executor.shell_steps import _run_script_step
+
+    exit_code, output = _run_script_step(
+        cwd=str(project),
+        script="deploy/deploy.sh",
+        env_file="/the/project/.env",
+        extra_env={"ENV_FILE": "/somewhere/else"},
+    )
+    assert exit_code != 0
+    assert "ENV_FILE" in output
+    assert not (project / "env-deploy.json").exists(), "it ran"
+
+
+# ---------------------------------------------------------------------------
+# Section 5: a guard that cannot be missed by leaving a site out
+# ---------------------------------------------------------------------------
+#
+# Hardened after the first review (13 October 2026) to the level of the build
+# system's own guard: the helper is recognised by where it is imported from,
+# not by its name; an environment counts as the helper's only when every
+# assignment to it is the helper and nothing changes it before the launch;
+# module aliases, launches on an event loop or held in a variable,
+# ``functools.partial``, ``getattr`` and ``__import__`` are all seen; and a
+# helper call that reads this process's own environment into its arguments
+# does not count.
+
+PACKAGE = Path(__file__).resolve().parents[2] / "src" / "forge"
+
+#: The helper, by where it is defined.
+HELPERS = {"forge.launch_environment.build_project_command_env"}
+
+#: The factory's own programs, recognised from a literal first argument.
+FACTORY_PROGRAMS = {"git", "docker", "pgrep", "ps"}
+
+_LAUNCHES = {
     "subprocess": {
         "run", "Popen", "call", "check_call", "check_output", "getoutput",
         "getstatusoutput",
     },
     "asyncio": {"create_subprocess_exec", "create_subprocess_shell"},
     "os": {
-        "system", "popen", "execv", "execve", "execvp", "execvpe", "execl",
-        "execle", "execlp", "execlpe", "spawnv", "spawnve", "spawnvp",
-        "spawnvpe", "spawnl", "spawnle", "spawnlp", "spawnlpe", "posix_spawn",
+        "system", "popen", "execl", "execle", "execlp", "execlpe", "execv",
+        "execve", "execvp", "execvpe", "spawnl", "spawnle", "spawnlp",
+        "spawnlpe", "spawnv", "spawnve", "spawnvp", "spawnvpe", "posix_spawn",
         "posix_spawnp", "fork", "forkpty",
     },
     "pty": {"spawn", "fork"},
 }
+#: Launch methods recognised on any object: ``asyncio.subprocess.create_*``
+#: and an event loop's ``subprocess_exec`` / ``subprocess_shell``.
+_ANY_RECEIVER_LAUNCHES = {
+    "create_subprocess_exec", "create_subprocess_shell", "subprocess_exec",
+    "subprocess_shell",
+}
+#: Methods that change a dictionary in place.
+_MUTATORS = {"update", "setdefault", "__setitem__", "__ior__", "pop", "popitem", "clear"}
+#: Functions an environment may be handed to before the launch: they only
+#: read it.
+_READS_ONLY = {"dict", "len", "sorted", "list", "minimal_environment_note", "withheld_settings"}
 
-#: The factory's own programs, recognised from the first argument.
-_FACTORY_PROGRAMS = {"git", "docker", "pgrep", "ps"}
-
-#: The helper whose result a project command's ``env=`` must be.
-_HELPER = "build_project_command_env"
-
-#: Launches allowed by name, each with its one-line reason. Keyed by the file
+#: Launches allowed by name, each with its one-line reason, keyed by the file
 #: (under ``src/forge``) and the function the launch is written in.
 ALLOWED: dict[tuple[str, str], str] = {
     ("adapters/gh/operations.py", "_execute"): "runs gh, the factory's own GitHub client",
     ("adapters/git/operations.py", "_default_execute"): "runs git commands the git adapter composes",
     ("adapters/guardkit/run.py", "_execute_subprocess"): "starts GuardKit with the factory's launch list",
-    ("build/git_operations.py", "_execute_via_deepagents"): "generic runner; every caller is checked below",
+    ("build/git_operations.py", "_execute_via_deepagents"): "generic runner; every call to it is checked below",
+    ("build/git_operations.py", "_run_via_execute"): "git and gh, the factory's own programs, with its own environment",
+    ("build/test_verification.py", "_execute_via_deepagents"): "a pass-through seam; its caller verify_tests is checked",
     ("build_processes.py", "_engine_ids"): "the container engine, called through a variable",
     ("build_processes.py", "_remove_networks_and_volumes"): "the container engine, called through a variable",
+    ("build_processes.py", "remove_fixture_containers"): "the container engine, run in a worker thread",
     ("cli/register_repo.py", "_run_command"): "the operator's register command: git, docker and sbx",
     ("deploy/review_preview.py", "_run_command"): "git and the container engine for the preview's tree",
-    ("deploy_sidecar/deploy_executor.py", "_default_spawn"): "generic runner; every caller is checked below",
-    ("deploy_sidecar/service.py", "_start_and_collect"): "generic runner; every caller is checked below",
+    ("deploy_sidecar/deploy_executor.py", "_default_spawn"): "generic runner; every call to it is checked below",
+    ("deploy_sidecar/service.py", "_start_and_collect"): "generic runner; every call to it is checked below",
+    ("deploy_sidecar/service.py", "run_merge_command"): "starts GuardKit (merge, legs, checks) with the factory's launch list",
     ("deploy_sidecar/service.py", "blob"): "git cat-file, the argument list from _git_argv",
     ("deploy_sidecar/service.py", "opened"): "git cat-file, the argument list from _git_argv",
     ("pipeline/routing_stamps.py", "read_last_code_commit_time"): "git log, from a literal git list",
@@ -1141,19 +1411,17 @@ ALLOWED: dict[tuple[str, str], str] = {
     ("subagents/autobuild_runner.py", "_run_one_build"): "starts GuardKit's build with the factory's launch list",
 }
 
-#: Generic runners: every call to them is checked as a launch of its own.
-#: The value is the names they are called by.
-GENERIC_RUNNERS: dict[tuple[str, str], set[str]] = {
-    ("build/git_operations.py", "_execute_via_deepagents"): {"_execute_via_deepagents"},
-    ("deploy_sidecar/deploy_executor.py", "_default_spawn"): {"_spawn", "_default_spawn"},
-    ("deploy_sidecar/service.py", "_start_and_collect"): {"_start_and_collect"},
-}
-
-#: Calls to a generic runner allowed by name, with the reason.
-ALLOWED_RUNNER_CALLS: dict[tuple[str, str], str] = {
-    ("build/git_operations.py", "_run_via_execute"): "git and gh, the factory's own programs, with its own environment",
-    ("build/test_verification.py", "_execute_via_deepagents"): "a pass-through seam; its caller verify_tests is checked",
-    ("deploy_sidecar/service.py", "run_merge_command"): "starts GuardKit (merge, legs, checks) with the factory's launch list",
+#: Generic runners: every call to them is judged as a launch of its own.
+GENERIC_RUNNERS: dict[tuple[str, str], dict[str, Any]] = {
+    ("build/git_operations.py", "_execute_via_deepagents"): {
+        "names": {"_execute_via_deepagents"},
+    },
+    ("deploy_sidecar/deploy_executor.py", "_default_spawn"): {
+        "names": {"_spawn", "_default_spawn"},
+    },
+    ("deploy_sidecar/service.py", "_start_and_collect"): {
+        "names": {"_start_and_collect"},
+    },
 }
 
 #: The only two places that may build an issued preview value.
@@ -1161,191 +1429,718 @@ ISSUED_BUILDERS: set[tuple[str, str]] = {
     ("deploy/review_preview.py", "_prepare"),
     ("deploy_sidecar/service.py", "_read_issued_env"),
 }
+ISSUED_TYPE = "forge.deploy.review_preview.IssuedPreviewValues"
 
 
-def _function_of(tree: ast.AST) -> dict[int, ast.AST]:
-    owner: dict[int, ast.AST] = {}
+class _Module(SimpleNamespace):
+    rel: str
+    dotted: str
+    tree: ast.Module
+    parents: dict[int, ast.AST]
+    imports: dict[str, str]
 
-    def visit(node: ast.AST, current: ast.AST | None) -> None:
-        for child in ast.iter_child_nodes(node):
-            here = (
-                child
-                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
-                else current
+
+def _load_modules(package: Path) -> list[_Module]:
+    modules = []
+    for path in sorted(package.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        parents: dict[int, ast.AST] = {}
+        for node in ast.walk(tree):
+            for child in ast.iter_child_nodes(node):
+                parents[id(child)] = node
+        rel = path.relative_to(package).as_posix()
+        parts = [package.name, *Path(rel).with_suffix("").parts]
+        is_package = parts[-1] == "__init__"
+        if is_package:
+            parts = parts[:-1]
+        dotted = ".".join(parts)
+        modules.append(
+            _Module(
+                rel=rel, dotted=dotted, tree=tree, parents=parents,
+                imports=_imports(tree, dotted, is_package),
             )
-            if current is not None:
-                owner[id(child)] = current
-            visit(child, here)
-
-    visit(tree, None)
-    return owner
+        )
+    return modules
 
 
-def _is_helper_call(node: ast.AST | None) -> bool:
-    if not isinstance(node, ast.Call):
-        return False
-    func = node.func
-    name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
-    return name == _HELPER
+def _imports(tree: ast.Module, dotted: str, is_package: bool) -> dict[str, str]:
+    """Every name an import binds anywhere in the module -> what it names."""
+    out: dict[str, str] = {}
+    package = dotted if is_package else dotted.rsplit(".", 1)[0]
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.asname:
+                    out[alias.asname] = alias.name
+                else:
+                    out[alias.name.split(".")[0]] = alias.name.split(".")[0]
+        elif isinstance(node, ast.ImportFrom):
+            base = node.module or ""
+            if node.level:
+                anchor = package.split(".")
+                anchor = anchor[: len(anchor) - (node.level - 1)]
+                base = ".".join([*anchor, base] if base else anchor)
+            for alias in node.names:
+                out[alias.asname or alias.name] = f"{base}.{alias.name}"
+    return out
 
 
-def _returns_helper(function: ast.AST) -> bool:
-    """Every ``return`` of ``function`` is the helper's result."""
-    returns = [n for n in ast.walk(function) if isinstance(n, ast.Return)]
-    if not returns:
-        return False
-    assigned = _helper_names(function)
-    return all(
-        _is_helper_call(r.value)
-        or (isinstance(r.value, ast.Name) and r.value.id in assigned)
-        for r in returns
-    )
+def _dotted(node: ast.AST) -> str:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return f"{_dotted(node.value)}.{node.attr}"
+    return "?"
 
 
-def _helper_names(function: ast.AST, functions: dict[str, ast.AST] | None = None) -> set[str]:
-    """Local names assigned from the helper (or a same-file function that
-    returns only the helper's result)."""
-    names: set[str] = set()
-    for node in ast.walk(function):
-        if isinstance(node, ast.Assign) and len(node.targets) == 1:
-            target = node.targets[0]
-            if isinstance(target, ast.Name) and _env_is_helper(
-                node.value, function, functions, names
-            ):
-                names.add(target.id)
-    return names
+def _last_name(node: ast.AST) -> str:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    return ""
 
 
-def _env_is_helper(
-    value: ast.AST | None,
-    function: ast.AST | None,
-    functions: dict[str, ast.AST] | None,
-    assigned: set[str] | None = None,
-) -> bool:
-    if _is_helper_call(value):
-        return True
-    if isinstance(value, ast.Name) and function is not None:
-        known = assigned if assigned is not None else _helper_names(function, functions)
-        return value.id in known
-    if isinstance(value, ast.Call) and functions:
-        func = value.func
-        name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
-        target = functions.get(str(name))
-        return target is not None and _returns_helper(target)
-    return False
+def _enclosing(mod: _Module, node: ast.AST, kinds: Any) -> ast.AST | None:
+    current = mod.parents.get(id(node))
+    while current is not None and not isinstance(current, kinds):
+        current = mod.parents.get(id(current))
+    return current
 
 
-def _first_program(call: ast.Call) -> str | None:
-    if not call.args:
-        return None
-    first = call.args[0]
-    if isinstance(first, ast.Constant) and isinstance(first.value, str):
-        return first.value
-    if isinstance(first, ast.List) and first.elts:
-        head = first.elts[0]
-        if isinstance(head, ast.Constant) and isinstance(head.value, str):
-            return head.value
+def _enclosing_function(mod: _Module, node: ast.AST) -> ast.AST | None:
+    return _enclosing(mod, node, (ast.FunctionDef, ast.AsyncFunctionDef))
+
+
+def _qualname(mod: _Module, func: Any) -> str:
+    names = [func.name]
+    current = mod.parents.get(id(func))
+    while current is not None:
+        if isinstance(current, ast.ClassDef):
+            names.append(current.name)
+        elif isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            names.append(f"{current.name}.<locals>")
+        current = mod.parents.get(id(current))
+    return ".".join(reversed(names))
+
+
+def _resolve(mod: _Module, func_node: ast.AST, at: ast.AST) -> str | None:
+    """The dotted name a call target refers to, or ``None`` when unknown."""
+    if isinstance(func_node, ast.Name):
+        name = func_node.id
+        scope = _enclosing_function(mod, at)
+        while scope is not None:  # a function defined in an enclosing function
+            for child in ast.iter_child_nodes(scope):
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) and child.name == name:
+                    return f"{mod.dotted}.{_qualname(mod, child)}"
+            scope = _enclosing_function(mod, scope)
+        for child in mod.tree.body:
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and child.name == name:
+                return f"{mod.dotted}.{name}"
+        return mod.imports.get(name)
+    if isinstance(func_node, ast.Attribute):
+        value = func_node.value
+        if isinstance(value, ast.Name) and value.id in ("self", "cls"):
+            klass = _enclosing(mod, at, ast.ClassDef)
+            if klass is not None:
+                return f"{mod.dotted}.{klass.name}.{func_node.attr}"
+            return None
+        base = _resolve(mod, value, at)
+        return f"{base}.{func_node.attr}" if base else None
     return None
 
 
-def _the_problems() -> list[str]:
-    problems: list[str] = []
-    for path in sorted(SOURCE.rglob("*.py")):
-        rel = path.relative_to(SOURCE).as_posix()
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-        owner = _function_of(tree)
-        functions = {
-            n.name: n
-            for n in ast.walk(tree)
-            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
-        }
-        direct: dict[str, str] = {}
-        for node in ast.walk(tree):
-            if isinstance(node, ast.ImportFrom) and node.module in _LAUNCH_NAMES:
-                for alias in node.names:
-                    if alias.name in _LAUNCH_NAMES[node.module]:
-                        direct[alias.asname or alias.name] = node.module
-        runner_names = {
-            name
-            for (file, _fn), names in GENERIC_RUNNERS.items()
-            for name in names
-        }
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
-                continue
-            func = node.func
-            kind = None
-            if (
-                isinstance(func, ast.Attribute)
-                and isinstance(func.value, ast.Name)
-                and func.attr in _LAUNCH_NAMES.get(func.value.id, set())
+def _module_constants(modules: list[_Module]) -> dict[str, ast.AST]:
+    out: dict[str, ast.AST] = {}
+    for mod in modules:
+        for node in mod.tree.body:
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        out[target.id] = node.value
+            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.value:
+                out[node.target.id] = node.value
+    return out
+
+
+def _assignments(func: ast.AST, name: str) -> list[ast.AST]:
+    values: list[ast.AST] = []
+    for node in ast.walk(func):
+        if isinstance(node, ast.Assign):
+            if any(isinstance(t, ast.Name) and t.id == name for t in node.targets):
+                values.append(node.value)
+            elif any(
+                isinstance(sub, ast.Name) and sub.id == name
+                for t in node.targets
+                if isinstance(t, (ast.Tuple, ast.List))
+                for sub in ast.walk(t)
             ):
-                if not (func.value.id == "asyncio" and func.attr == "run"):
-                    kind = "launch"
-            elif isinstance(func, ast.Name) and func.id in direct:
-                kind = "launch"
-            name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
-            if kind is None and name in runner_names:
-                kind = "runner-call"
-            if kind is None:
-                continue
-            function = owner.get(id(node))
-            fname = getattr(function, "name", "<module>")
-            where = f"{rel}:{node.lineno} ({fname})"
-            if kind == "runner-call" and (rel, fname) in GENERIC_RUNNERS:
-                continue  # the runner's own body, e.g. a self-call
-            if _first_program(node) in _FACTORY_PROGRAMS:
-                continue
-            env = next((k.value for k in node.keywords if k.arg == "env"), None)
-            if _env_is_helper(env, function, functions):
-                continue
-            if kind == "launch" and (rel, fname) in ALLOWED:
-                continue
-            if kind == "runner-call" and (rel, fname) in ALLOWED_RUNNER_CALLS:
-                continue
-            problems.append(
-                f"{where}: a process launch whose env= is not "
-                f"{_HELPER}(...) and that is on no allowed list"
+                values.append(ast.Constant(value="<unpacked>"))
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.target.id == name:
+            if node.value is not None:
+                values.append(node.value)
+        elif isinstance(node, (ast.For, ast.AsyncFor, ast.With, ast.AsyncWith, ast.NamedExpr)):
+            targets = (
+                [node.target] if isinstance(node, (ast.For, ast.AsyncFor, ast.NamedExpr))
+                else [i.optional_vars for i in node.items if i.optional_vars is not None]
             )
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
+            for target in targets:
+                if any(isinstance(n, ast.Name) and n.id == name for n in ast.walk(target)):
+                    values.append(ast.Constant(value="<bound by a loop or with>"))
+    return values
+
+
+def _is_parameter(func: Any, name: str) -> bool:
+    args = func.args
+    every = [*args.posonlyargs, *args.args, *args.kwonlyargs]
+    every += [a for a in (args.vararg, args.kwarg) if a is not None]
+    return any(a.arg == name for a in every)
+
+
+def _mutated(func: ast.AST, name: str) -> bool:
+    """True when the dictionary ``name`` is changed in place in ``func``."""
+    for node in ast.walk(func):
+        targets: list[ast.AST] = []
+        if isinstance(node, ast.Assign):
+            targets = list(node.targets)
+        elif isinstance(node, (ast.AugAssign, ast.AnnAssign)):
+            targets = [node.target]
+            if isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name) and node.target.id == name:
+                return True
+        elif isinstance(node, ast.Delete):
+            targets = list(node.targets)
+        for target in targets:
+            for sub in ast.walk(target):
+                if isinstance(sub, ast.Subscript) and isinstance(sub.value, ast.Name) and sub.value.id == name:
+                    return True
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in _MUTATORS
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == name
+        ):
+            return True
+    return False
+
+
+def _in_return(func: ast.AST, target: ast.AST) -> bool:
+    for node in ast.walk(func):
+        if isinstance(node, ast.Return) and node.value is not None:
+            if any(sub is target for sub in ast.walk(node.value)):
+                return True
+    return False
+
+
+#: Callees an environment may be handed to: launches and generic runners are
+#: judged on their own ``env=``; filled in by :func:`unaccounted_launches`.
+_TRUSTED_CALLEES: set[str] = set()
+
+
+def _escapes(func: ast.AST, name: str, before_line: int | None) -> bool:
+    """True when the dictionary ``name`` could be widened through another
+    name: bound to a second name, or handed to a function not known to only
+    read it, before the launch at ``before_line``."""
+    for node in ast.walk(func):
+        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr)):
+            value = node.value
+            if isinstance(value, ast.Name) and value.id == name:
+                return True
+        if isinstance(node, ast.Call) and (before_line is None or node.lineno < before_line):
+            callee = _last_name(node.func)
+            if callee in _READS_ONLY or callee in _TRUSTED_CALLEES or _in_return(func, node):
                 continue
-            func = node.func
-            built = (isinstance(func, ast.Name) and func.id == "IssuedPreviewValues") or (
-                isinstance(func, ast.Attribute)
-                and isinstance(func.value, ast.Name)
-                and func.value.id == "IssuedPreviewValues"
-            )
-            if not built:
-                continue
-            fname = getattr(owner.get(id(node)), "name", "<module>")
-            if (rel, fname) not in ISSUED_BUILDERS:
-                problems.append(
-                    f"{rel}:{node.lineno} ({fname}): IssuedPreviewValues is built "
-                    "outside the preview's preparation and the helper's reader"
-                )
-    return problems
+            handed = list(node.args) + [kw.value for kw in node.keywords]
+            for arg in handed:
+                for sub in [arg, *([arg.body, arg.orelse] if isinstance(arg, ast.IfExp) else [])]:
+                    if isinstance(sub, ast.Name) and sub.id == name:
+                        return True
+    return False
+
+
+def _reads_this_process_environment(mod: _Module, node: ast.AST) -> bool:
+    """True when ``node`` reads the launching process's own environment
+    (``os.environ`` or ``os.getenv``): a helper call fed from it could pass a
+    factory credential under a name the helper does not refuse."""
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Attribute) and sub.attr in ("environ", "environb", "getenv"):
+            if isinstance(sub.value, ast.Name) and mod.imports.get(sub.value.id) == "os":
+                return True
+        if isinstance(sub, ast.Name) and mod.imports.get(sub.id) in ("os.environ", "os.getenv"):
+            return True
+    return False
+
+
+def _helper_shaped(
+    node: ast.AST | None, mod: _Module, func: Any, wrappers: set[str],
+    before_line: int | None = None,
+) -> bool:
+    """True when ``node`` (an ``env=`` value) can only be the helper's result."""
+    if node is None:
+        return False
+    if isinstance(node, ast.Call):
+        target = _resolve(mod, node.func, node)
+        if target in HELPERS:
+            arguments = [*node.args, *(kw.value for kw in node.keywords)]
+            return not any(_reads_this_process_environment(mod, a) for a in arguments)
+        return target in wrappers
+    if isinstance(node, ast.IfExp):
+        return _helper_shaped(node.body, mod, func, wrappers, before_line) and _helper_shaped(
+            node.orelse, mod, func, wrappers, before_line
+        )
+    if isinstance(node, ast.Name) and func is not None:
+        if _is_parameter(func, node.id) or _mutated(func, node.id):
+            return False
+        if _escapes(func, node.id, before_line):
+            return False
+        values = _assignments(func, node.id)
+        return bool(values) and all(_helper_shaped(v, mod, func, wrappers) for v in values)
+    return False
+
+
+def _wrappers(modules: list[_Module]) -> set[str]:
+    """Functions whose every return is the helper's result, by dotted name."""
+    found: set[str] = set()
+    changed = True
+    while changed:
+        changed = False
+        for mod in modules:
+            for node in ast.walk(mod.tree):
+                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                full = f"{mod.dotted}.{_qualname(mod, node)}"
+                if full in found:
+                    continue
+                returns = [
+                    r for r in ast.walk(node)
+                    if isinstance(r, ast.Return) and _enclosing_function(mod, r) is node
+                ]
+                if returns and all(_helper_shaped(r.value, mod, node, found) for r in returns):
+                    found.add(full)
+                    changed = True
+    return found
+
+
+def _launch_kind(mod: _Module, node: ast.AST) -> str | None:
+    """What launch ``node`` (a call target or a value) names, if any."""
+    if isinstance(node, ast.Attribute):
+        if node.attr in _ANY_RECEIVER_LAUNCHES:
+            return _dotted(node)
+        if isinstance(node.value, ast.Name):
+            module = mod.imports.get(node.value.id)
+            if module in _LAUNCHES and node.attr in _LAUNCHES[module]:
+                return f"{module}.{node.attr}"
+    if isinstance(node, ast.Name):
+        target = mod.imports.get(node.id, "")
+        module, _, name = target.rpartition(".")
+        if module in _LAUNCHES and name in _LAUNCHES[module]:
+            return target
+    return None
+
+
+def _factory_literal(
+    node: ast.AST | None, constants: dict[str, ast.AST], func: Any = None
+) -> bool:
+    """A list whose first item is the literal git/docker/pgrep/ps."""
+    if node is None:
+        return False
+    if isinstance(node, ast.Constant):
+        return node.value in FACTORY_PROGRAMS
+    if isinstance(node, ast.Name) and func is not None and not _is_parameter(func, node.id):
+        values = _assignments(func, node.id)
+        if values and all(_factory_literal(v, constants) for v in values):
+            return True
+    if isinstance(node, (ast.List, ast.Tuple)):
+        return (
+            bool(node.elts)
+            and isinstance(node.elts[0], ast.Constant)
+            and node.elts[0].value in FACTORY_PROGRAMS
+        )
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        return _factory_literal(node.left, constants)
+    if isinstance(node, ast.Call) and _dotted(node.func) in ("list", "tuple") and node.args:
+        return _factory_literal(node.args[0], constants)
+    if isinstance(node, ast.Name) and node.id in constants:
+        return _factory_literal(constants[node.id], constants)
+    return False
+
+
+def _env_keyword(call: ast.Call) -> ast.AST | None:
+    for kw in call.keywords:
+        if kw.arg == "env":
+            return kw.value
+    return None
+
+
+def _annotation_nodes(tree: ast.AST) -> set[int]:
+    """Nodes inside type annotations: naming a launch as a type runs nothing."""
+    found: set[int] = set()
+    roots: list[ast.AST] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.arg) and node.annotation is not None:
+            roots.append(node.annotation)
+        elif isinstance(node, ast.AnnAssign):
+            roots.append(node.annotation)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.returns is not None:
+            roots.append(node.returns)
+    for root in roots:
+        found.update(id(n) for n in ast.walk(root))
+    return found
+
+
+def _first_argument(call: ast.Call) -> ast.AST | None:
+    if call.args:
+        first = call.args[0]
+        return first.value if isinstance(first, ast.Starred) else first
+    for kw in call.keywords:
+        if kw.arg in ("args", "argv", "command", "cmd"):
+            return kw.value
+    return None
+
+
+def unaccounted_launches(package: Path) -> list[str]:
+    modules = _load_modules(package)
+    constants = _module_constants(modules)
+    _TRUSTED_CALLEES.clear()
+    for launches in _LAUNCHES.values():
+        _TRUSTED_CALLEES.update(launches)
+    _TRUSTED_CALLEES.update(_ANY_RECEIVER_LAUNCHES)
+    for spec in GENERIC_RUNNERS.values():
+        _TRUSTED_CALLEES.update(spec.get("names", ()))
+    wrappers = _wrappers(modules)
+    problems: list[str] = []
+
+    def place(mod: _Module, node: ast.AST) -> tuple[Any, str]:
+        func = _enclosing_function(mod, node)
+        named = _enclosing(mod, node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        return func, getattr(named, "name", "<module>")
+
+    def judge(mod: _Module, call: ast.Call, what: str) -> None:
+        func, fname = place(mod, call)
+        if (mod.rel, fname) in ALLOWED:
+            return
+        if _factory_literal(_first_argument(call), constants, func):
+            return
+        env = _env_keyword(call)
+        if _helper_shaped(env, mod, func, wrappers, call.lineno):
+            return
+        reason = "no env= (it inherits everything)" if env is None else "env= is not the helper's"
+        problems.append(f"{mod.rel}:{call.lineno} in {fname}: {what}: {reason}")
+
+    def flag(mod: _Module, node: ast.AST, sentence: str) -> None:
+        _, fname = place(mod, node)
+        if (mod.rel, fname) not in ALLOWED:
+            problems.append(f"{mod.rel}:{node.lineno} in {fname}: {sentence}")
+
+    for mod in modules:
+        called = {id(n.func) for n in ast.walk(mod.tree) if isinstance(n, ast.Call)}
+        called |= _annotation_nodes(mod.tree)
+        for node in ast.walk(mod.tree):
+            if isinstance(node, ast.Call):
+                kind = _launch_kind(mod, node.func)
+                if kind:
+                    judge(mod, node, f"process launch {kind}")
+                elif (
+                    _dotted(node.func) in ("__import__", "importlib.import_module", "import_module")
+                    and node.args
+                    and isinstance(node.args[0], ast.Constant)
+                    and str(node.args[0].value).split(".")[0] in _LAUNCHES
+                ):
+                    flag(
+                        mod, node,
+                        f"the launch module {node.args[0].value} is imported by "
+                        "name, so its launches cannot be checked",
+                    )
+                elif (
+                    _dotted(node.func) == "getattr"
+                    and len(node.args) >= 2
+                    and isinstance(node.args[1], ast.Constant)
+                    and isinstance(node.args[1].value, str)
+                    and _launch_kind(
+                        mod, ast.Attribute(value=node.args[0], attr=node.args[1].value, ctx=ast.Load())
+                    )
+                ):
+                    flag(
+                        mod, node,
+                        "a launch function looked up with getattr, so its env= "
+                        "cannot be checked",
+                    )
+                elif _resolve(mod, node.func, node) == ISSUED_TYPE:
+                    _, fname = place(mod, node)
+                    if (mod.rel, fname) not in ISSUED_BUILDERS:
+                        problems.append(
+                            f"{mod.rel}:{node.lineno} in {fname}: IssuedPreviewValues "
+                            "is built outside the preview's preparation and the "
+                            "helper's reader"
+                        )
+            elif isinstance(node, (ast.Attribute, ast.Name)) and id(node) not in called:
+                kind = _launch_kind(mod, node)
+                if kind and isinstance(getattr(node, "ctx", None), ast.Load):
+                    if isinstance(mod.parents.get(id(node)), ast.Attribute):
+                        continue  # part of a longer dotted name, judged there
+                    flag(
+                        mod, node,
+                        f"the launch function {kind} is used as a value (held in "
+                        "a variable, passed on or wrapped), so its env= cannot be "
+                        "checked",
+                    )
+    for (rel, fname), spec in GENERIC_RUNNERS.items():
+        for mod in modules:
+            for node in ast.walk(mod.tree):
+                if not isinstance(node, ast.Call) or _last_name(node.func) not in spec["names"]:
+                    continue
+                func = _enclosing_function(mod, node)
+                if mod.rel == rel and getattr(func, "name", None) == fname:
+                    continue  # the runner's own body
+                judge(mod, node, f"call to the generic runner {fname}")
+    return sorted(set(problems))
+
+
+#: The first review's probes (13 October 2026), and the build system's guard's
+#: own: every function here starting with a letter and an underscore must be
+#: named by the guard, and none starting ``ok_``. Fed to the guard as
+#: synthetic source; never added to the package.
+GUARD_PROBES = textwrap.dedent(
+    '''\
+    import asyncio
+    import functools
+    import os
+    import subprocess
+    import subprocess as sp
+    import os as o
+    from forge.launch_environment import build_project_command_env
+
+
+    def a_reassigned(cmd, folder):
+        env = build_project_command_env(folder)
+        env = dict(os.environ)
+        subprocess.run(cmd, env=env)
+
+
+    def b_mutated_after(cmd, folder):
+        env = build_project_command_env(folder)
+        env.update(os.environ)
+        subprocess.run(cmd, env=env)
+
+
+    def c_empty_then_mutated(cmd, folder):
+        env = {}
+        env["OPENAI_API_KEY"] = os.environ["OPENAI_API_KEY"]
+        subprocess.run(cmd, env=env)
+
+
+    def d_item_set_after(cmd, folder):
+        env = build_project_command_env(folder)
+        env["OPENAI_API_KEY"] = os.environ.get("OPENAI_API_KEY", "")
+        subprocess.Popen(cmd, env=env)
+
+
+    def e_module_alias(cmd):
+        sp.run(cmd)
+
+
+    def f_os_alias(cmd):
+        o.system(cmd)
+
+
+    async def g_loop_subprocess(cmd):
+        loop = asyncio.get_running_loop()
+        await loop.subprocess_shell(asyncio.SubprocessProtocol, cmd)
+        await loop.subprocess_exec(asyncio.SubprocessProtocol, cmd)
+
+
+    async def h_asyncio_attr_chain(cmd):
+        await asyncio.subprocess.create_subprocess_shell(cmd)
+
+
+    def i_runner_in_variable(cmd):
+        runner = subprocess.run
+        runner(cmd)
+
+
+    def j_partial(cmd):
+        functools.partial(subprocess.run, cmd)()
+
+
+    def k_getattr(cmd):
+        getattr(subprocess, "run")(cmd)
+
+
+    def l_spelled_runner(cmd, folder):
+        def build_project_command_env(_folder):
+            return dict(os.environ)
+        subprocess.run(cmd, env=build_project_command_env(folder))
+
+
+    def m_helper_then_ignored(cmd, folder):
+        env = build_project_command_env(folder)
+        if cmd:
+            env = os.environ.copy()
+        subprocess.run(cmd, env=env)
+
+
+    def n_asyncio_shell_no_env(cmd):
+        return asyncio.create_subprocess_shell(cmd)
+
+
+    def o_dunder_import(cmd):
+        __import__("subprocess").run(cmd)
+
+
+    def p_os_environ_mutated_before_helper(cmd, folder):
+        env = build_project_command_env(folder, parent={**os.environ})
+        subprocess.run(cmd, env=env)
+
+
+    def q_helper_with_parent_overlay(cmd, folder):
+        env = build_project_command_env(
+            folder, additions={"DATABASE_URL": os.environ.get("FLEET_MEMORY_PG_DSN", "")}
+        )
+        subprocess.run(cmd, env=env)
+
+
+    def _widen(env):
+        env.update(os.environ)
+
+
+    def r_widened_through_an_alias(cmd, folder):
+        env = build_project_command_env(folder)
+        other = env
+        other.update(os.environ)
+        subprocess.run(cmd, env=env)
+
+
+    def s_handed_to_a_function_first(cmd, folder):
+        env = build_project_command_env(folder)
+        _widen(env)
+        subprocess.run(cmd, env=env)
+
+
+    def t_or_assigned(cmd, folder):
+        env = build_project_command_env(folder)
+        env |= dict(os.environ)
+        subprocess.run(cmd, env=env)
+
+
+    class u_PopenSubclass(subprocess.Popen):
+        pass
+
+
+    def _copy_everything():
+        out = {}
+        for k, v in os.environ.items():
+            out[k] = v
+        return out
+
+
+    def v_wrapper_built_from_empty(cmd):
+        subprocess.run(cmd, env=_copy_everything())
+
+
+    def ok_helper(cmd, folder):
+        env = build_project_command_env(folder)
+        subprocess.run(cmd, env=env)
+
+
+    def ok_git(cmd):
+        subprocess.run(["git", "status"])
+
+
+    def ok_wrapper(cmd, folder):
+        subprocess.run(cmd, env=_real_wrapper(folder))
+
+
+    def _real_wrapper(folder):
+        return build_project_command_env(folder, additions={"X": "1"})
+    '''
+)
+
+#: The first review's seventeen probes, by name: each must be caught.
+COACH_PROBES = {
+    "a_reassigned", "b_mutated_after", "c_empty_then_mutated",
+    "d_item_set_after", "e_module_alias", "f_os_alias", "g_loop_subprocess",
+    "h_asyncio_attr_chain", "i_runner_in_variable", "j_partial", "k_getattr",
+    "l_spelled_runner", "m_helper_then_ignored", "n_asyncio_shell_no_env",
+    "o_dunder_import", "p_os_environ_mutated_before_helper",
+    "q_helper_with_parent_overlay",
+}
+
+
+def _probe_package(tmp_path: Path) -> Path:
+    pkg = tmp_path / "forge"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "zz_probe.py").write_text(GUARD_PROBES, encoding="utf-8")
+    return pkg
+
+
+def test_the_guard_catches_every_probe(tmp_path: Path) -> None:
+    """Synthetic source fed to the guard (never added to the package)."""
+    problems = unaccounted_launches(_probe_package(tmp_path))
+    named = {p.split(" in ", 1)[1].split(":", 1)[0] for p in problems}
+    expected = {
+        n.name
+        for n in ast.walk(ast.parse(GUARD_PROBES))
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        and n.name[:2] in {f"{c}_" for c in "abcdefghijklmnopqrstuv"}
+    }
+    assert COACH_PROBES <= expected
+    assert expected - named == set(), f"slipped past the guard: {sorted(expected - named)}"
+    assert not {"ok_helper", "ok_git", "ok_wrapper", "_real_wrapper"} & named, problems
 
 
 def test_every_process_launch_is_accounted_for() -> None:
-    problems = _the_problems()
-    assert not problems, "\n".join(problems)
-
-
-def test_the_guard_sees_a_launch_that_was_left_out(tmp_path: Path) -> None:
-    """The guard is not vacuous: a launch that inherits everything fails it."""
-    tree = ast.parse(
-        "import subprocess\n"
-        "def f(cmd):\n"
-        "    subprocess.run(cmd)\n"
-        "def g(cmd, folder):\n"
-        "    env = build_project_command_env(folder)\n"
-        "    subprocess.run(cmd, env=env)\n"
+    problems = unaccounted_launches(PACKAGE)
+    assert not problems, (
+        "These process launches neither build their environment with "
+        "build_project_command_env, nor run the factory's own program by a "
+        "literal first argument, nor are on the allowed list with a reason:\n  "
+        + "\n  ".join(problems)
     )
-    owner = _function_of(tree)
-    calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and getattr(n.func, "attr", "") == "run"]
-    verdicts = []
-    for call in calls:
-        env = next((k.value for k in call.keywords if k.arg == "env"), None)
-        verdicts.append(_env_is_helper(env, owner.get(id(call)), {}))
-    assert verdicts == [False, True]
+
+
+def test_the_allowed_list_names_only_real_places() -> None:
+    modules = {m.rel: m for m in _load_modules(PACKAGE)}
+    missing = []
+    for rel, fname in [*ALLOWED, *GENERIC_RUNNERS, *ISSUED_BUILDERS]:
+        mod = modules.get(rel)
+        names = (
+            {
+                n.name
+                for n in ast.walk(mod.tree)
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+            }
+            if mod
+            else set()
+        )
+        if fname not in names:
+            missing.append(f"{rel}:{fname}")
+    assert not missing, f"allowed-list entries that name nothing: {missing}"
+
+
+def test_the_guard_catches_a_new_launch(tmp_path: Path) -> None:
+    pkg = tmp_path / "forge"
+    pkg.mkdir()
+    (pkg / "new.py").write_text(
+        textwrap.dedent(
+            """\
+            import os, subprocess
+            from subprocess import Popen as P
+            from forge.launch_environment import build_project_command_env
+            def a(cmd):
+                subprocess.run(cmd, shell=True)
+            def b(cmd):
+                P(cmd, env=os.environ.copy())
+            def c(cmd):
+                subprocess.run(["git", "status"])
+            def d(cmd, wf):
+                env = build_project_command_env(wf)
+                subprocess.run(cmd, env=env)
+            """
+        ),
+        encoding="utf-8",
+    )
+    problems = unaccounted_launches(pkg)
+    assert any("new.py:5 in a" in p for p in problems)
+    assert any("new.py:7 in b" in p for p in problems)
+    assert not any(" in c:" in p or " in d:" in p for p in problems)

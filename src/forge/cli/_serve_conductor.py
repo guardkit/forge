@@ -867,7 +867,10 @@ def _run_declared_command(
     setting NAMES the project declared (``launch_settings``) and a private
     ``HOME`` and ``TMPDIR`` in the repository's own git directory.
     """
-    from forge.launch_environment import build_project_command_env
+    from forge.launch_environment import (
+        build_project_command_env,
+        minimal_environment_note,
+    )
 
     try:
         env = build_project_command_env(cwd, declared=launch_settings or ())
@@ -891,9 +894,17 @@ def _run_declared_command(
             f"{cwd}: {type(exc).__name__}: {exc}"
         )
     tail = (completed.stderr or completed.stdout or "").strip().splitlines()
+    # A FAILED COMMAND IS TOLD WHAT IT WAS NOT GIVEN (design section 4):
+    # names only, never a value.
+    note = (
+        " " + minimal_environment_note(env, declared=launch_settings or ())
+        if completed.returncode != 0
+        else ""
+    )
     return completed.returncode, _detail_with_the_run_kept(
         f"`{command}` exited {completed.returncode} in {cwd}"
-        + (f" — last line: {tail[-1]}" if tail else ""),
+        + (f" — last line: {tail[-1]}" if tail else "")
+        + note,
         _both_streams(completed.stdout, completed.stderr),
         exit_code=completed.returncode,
         command=command,

@@ -39,15 +39,17 @@ def _env_probe_script(tmp_path: Path) -> Path:
 class TestDeployComposeHandler:
     """Test suite for deploy_compose handler (AC-001 through AC-006)."""
 
-    def test_handler_satisfies_protocol(self) -> None:
+    def test_handler_satisfies_protocol(self, tmp_path: Path) -> None:
         """AC-001: deploy_compose satisfies StepHandler Protocol."""
         # Verify callable signature: (step: Step) -> StepOutcome
         # This is validated structurally by the type system, but we verify it's
-        # actually callable with a Step instance.
+        # actually callable with a Step instance. It runs in a git checkout of
+        # its own (13 October 2026): a project's program is given a private
+        # HOME in its checkout's git directory, never one found elsewhere.
         step = Step(
             step_type="deploy_compose",
             params={
-                "cwd": "/tmp",
+                "cwd": str(tmp_path),
                 "script": "/bin/true",
                 "env_file": None,
             },

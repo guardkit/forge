@@ -73,7 +73,12 @@ def repo(tmp_path: Path) -> Path:
     root = tmp_path / "api_test"
     root.mkdir()
     # A deploy profile is deliberately NOT written: the merge operation runs one
-    # fixed command, so it must not require a deployable repository.
+    # fixed command, so it must not require a deployable repository. It is a
+    # git checkout (13 October 2026): a project's own program on /run is given
+    # a private HOME in the repository's own git directory.
+    import subprocess as _subprocess
+
+    _subprocess.run(["git", "init", "-q", str(root)], check=True, capture_output=True)
     return root
 
 

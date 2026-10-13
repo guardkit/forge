@@ -122,6 +122,9 @@ __all__ = [
     "SETTINGS_DELIBERATELY_NOT_PASSED",
     "build_launch_env",
     "build_project_command_env",
+    "declared_settings_not_set",
+    "minimal_environment_note",
+    "withheld_settings",
     "declared_setting_refusal",
     "launch_setting_names",
 ]
@@ -696,40 +699,105 @@ class ProjectCommandEnvironmentError(OSError):
     """
 
 
-def _git_directory_of(work_folder: Path) -> Path | None:
-    """The git directory shared by the checkout ``work_folder`` is inside.
+def _a_real_git_directory(folder: Path) -> Path | None:
+    """``folder`` resolved, when it is a real git directory; else ``None``.
 
-    Walks up from ``work_folder`` to the first ``.git``. A folder is the git
-    directory itself; a file (a linked worktree's) names its own git
-    directory, whose ``commondir`` names the shared one. Read, never run: no
-    program is started to find it. ``None`` when there is none.
+    A real one has a ``HEAD`` file and either its own ``objects`` folder or a
+    ``commondir`` file naming the shared one (a linked worktree's). A folder
+    that merely happens to be called ``.git`` — empty, or made by somebody
+    else — is not one. With a ``commondir``, the shared directory it names is
+    returned, and it must be a real one too.
+    """
+    try:
+        folder = folder.resolve()
+    except OSError:
+        return None
+    if not folder.is_dir() or not (folder / "HEAD").is_file():
+        return None
+    common = folder / "commondir"
+    if common.is_file():
+        try:
+            named = common.read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+        if not named:
+            return None
+        shared = Path(named)
+        shared = (shared if shared.is_absolute() else folder / shared).resolve()
+        if shared == folder or not (shared / "HEAD").is_file() or not (shared / "objects").is_dir():
+            return None
+        return shared
+    return folder if (folder / "objects").is_dir() else None
+
+
+def _git_directory_from_marker(marker: Path) -> Path | None:
+    """The shared git directory a checkout's ``.git`` entry names, or ``None``.
+
+    A folder is checked as it is. A file (a linked worktree's) must say
+    ``gitdir: <path>`` with a path that is not empty, and that path must be a
+    real git directory. A link is never followed.
+    """
+    if marker.is_symlink():
+        return None
+    if marker.is_dir():
+        return _a_real_git_directory(marker)
+    if not marker.is_file():
+        return None
+    try:
+        line = marker.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not line.startswith("gitdir:"):
+        return None
+    named = line[len("gitdir:"):].strip()
+    if not named:
+        return None
+    own = Path(named)
+    if not own.is_absolute():
+        own = marker.parent / own
+    return _a_real_git_directory(own)
+
+
+def _git_directory_of(
+    work_folder: Path, repository: Path | None = None
+) -> Path | None:
+    """The real git directory a project program's private home goes in.
+
+    With ``repository`` — the checkout the caller knows the program belongs
+    to — only that checkout's own ``.git`` is used, and ``work_folder`` must
+    be inside it; nothing above it is ever looked at. Without one, the walk
+    up from ``work_folder`` stops at the FIRST ``.git`` it meets: a real one
+    is used, and anything else (an empty folder called ``.git``, a ``gitdir:``
+    with no path, a link) is ``None``, never a reason to keep climbing.
+
+    The answer is never ``work_folder`` itself nor a folder above it, so the
+    private home can never land among the project's own files. Read, never
+    run: no program is started to find it.
     """
     try:
         here = work_folder.resolve()
     except OSError:
         return None
-    for folder in (here, *here.parents):
-        marker = folder / ".git"
-        if marker.is_dir():
-            return marker
-        if marker.is_file():
-            try:
-                line = marker.read_text(encoding="utf-8").strip()
-            except OSError:
-                return None
-            if not line.startswith("gitdir:"):
-                return None
-            own = Path(line[len("gitdir:"):].strip())
-            if not own.is_absolute():
-                own = folder / own
-            common = own / "commondir"
-            if common.is_file():
-                try:
-                    shared = Path(common.read_text(encoding="utf-8").strip())
-                except OSError:
-                    return None
-                return (shared if shared.is_absolute() else own / shared).resolve()
-            return own.resolve()
+    if repository is not None:
+        try:
+            root = Path(repository).resolve()
+        except OSError:
+            return None
+        if here != root and root not in here.parents:
+            return None
+        markers = [root / ".git"]
+    else:
+        markers = []
+        for folder in (here, *here.parents):
+            marker = folder / ".git"
+            if marker.is_symlink() or marker.exists():
+                markers = [marker]
+                break
+    for marker in markers:
+        found = _git_directory_from_marker(marker)
+        if found is None or found == here or found in here.parents:
+            return None
+        return found
     return None
 
 
@@ -780,8 +848,14 @@ def build_project_command_env(
     overlay: Mapping[str, str] | None = None,
     run_owner: str | None = None,
     parent: Mapping[str, str] | None = None,
+    repository: Path | str | None = None,
 ) -> dict[str, str]:
     """The whole environment for one of a project's own programs.
+
+    ``repository`` is the checkout the caller knows the program belongs to;
+    when given, the private home goes in that checkout's own git directory
+    and ``work_folder`` must be inside it. Without it, the first ``.git``
+    above ``work_folder`` is used, and only if it is a real git directory.
 
     Built from an empty dictionary, in this order, each step working on the
     one before:
@@ -838,12 +912,19 @@ def build_project_command_env(
     for name in PROJECT_PROXY_NAMES:
         if name in source:
             env[name] = str(source[name])
-    git_directory = _git_directory_of(Path(work_folder))
+    git_directory = _git_directory_of(
+        Path(work_folder), Path(repository) if repository is not None else None
+    )
     if git_directory is None:
+        where = (
+            f"{work_folder} is not inside the checkout {repository} that has a "
+            f"real git directory"
+            if repository is not None
+            else f"{work_folder} is in no git checkout with a real git directory"
+        )
         raise ProjectCommandEnvironmentError(
-            f"{work_folder} is in no git checkout, so there is nowhere outside "
-            f"the project to give its program a private HOME and TMPDIR, and "
-            f"it was not run"
+            f"{where}, so there is nowhere outside the project to give its "
+            f"program a private HOME and TMPDIR, and it was not run"
         )
     home_root = _private_folder(git_directory / PROJECT_HOME_DIRNAME)
     env["HOME"] = str(_private_folder(home_root / "HOME"))
@@ -931,3 +1012,95 @@ def build_project_command_env(
     if run_owner and str(run_owner).strip():
         env[GUARDKIT_RUN_OWNER_ENV] = str(run_owner).strip()
     return env
+
+
+# ===========================================================================
+# What the project is told when its program fails: names only, never values
+# ===========================================================================
+#
+# Design section 4. A project program now runs with the factory's minimal
+# environment, so a command that used to find a setting by accident may fail
+# without it. Its failure detail says so in plain words, naming the settings
+# the factory holds that the project could ask for and the ones it declared
+# that are not set here. No value of any setting ever appears. The wording
+# mirrors GuardKit's ``project_command_env.minimal_environment_note``.
+
+#: Shell bookkeeping nobody means to pass; left out so the names that matter
+#: are not buried.
+_SHELL_BOOKKEEPING: frozenset[str] = frozenset({"_", "PWD", "OLDPWD", "SHLVL"})
+
+
+def withheld_settings(
+    env: Mapping[str, str], *, parent: Mapping[str, str] | None = None
+) -> tuple[list[str], int]:
+    """Settings ``parent`` holds that a program given ``env`` did not get.
+
+    Returns the names a project may declare (they pass
+    :func:`declared_setting_refusal`), sorted, and how many of the factory's
+    own reserved names were held back too. Those are counted, never offered.
+    Values are never read out.
+    """
+    source: Mapping[str, str] = os.environ if parent is None else parent
+    offerable: list[str] = []
+    own = 0
+    for name in source:
+        if name in env or name in _SHELL_BOOKKEEPING:
+            continue
+        if declared_setting_refusal(name) is None:
+            offerable.append(name)
+        else:
+            own += 1
+    return sorted(offerable), own
+
+
+def declared_settings_not_set(
+    declared: Sequence[str] | Iterable[str] | None,
+    *,
+    parent: Mapping[str, str] | None = None,
+) -> list[str]:
+    """The declared names this process does not hold (so none were passed)."""
+    source: Mapping[str, str] = os.environ if parent is None else parent
+    return [
+        str(name).strip()
+        for name in (declared or ())
+        if declared_setting_refusal(name) is None and str(name).strip() not in source
+    ]
+
+
+def minimal_environment_note(
+    env: Mapping[str, str] | None,
+    *,
+    declared: Sequence[str] | Iterable[str] | None = (),
+    parent: Mapping[str, str] | None = None,
+) -> str:
+    """The plain words added to a failed project program's detail.
+
+    Empty when ``env`` is ``None`` (the program never had an environment, so
+    it never ran). Names only: no value of any setting appears in it.
+    """
+    if env is None:
+        return ""
+    offerable, own = withheld_settings(env, parent=parent)
+    listed = ", ".join(f"`{name}`" for name in offerable)
+    held = (
+        f"Settings the factory holds that were not given to it: {listed}."
+        if offerable
+        else "The factory holds no other setting a project could declare."
+    )
+    if own:
+        held += (
+            f" ({own} of the factory's own settings were also held back; a "
+            f"project cannot declare those.)"
+        )
+    unset = "".join(
+        f" The project declares `{name}` in `launch.settings`, but it is not "
+        f"set where the factory runs, so the command ran without it."
+        for name in declared_settings_not_set(declared, parent=parent)
+    )
+    return (
+        "This command ran with the factory's minimal environment. "
+        + held
+        + unset
+        + " If the command needs one, add its name to `launch.settings` in "
+        "`.guardkit/config.yaml`."
+    )

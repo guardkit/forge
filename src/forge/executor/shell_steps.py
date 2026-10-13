@@ -13,10 +13,13 @@ from __future__ import annotations
 
 import os
 import subprocess
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Sequence
 
 from forge.executor.registry import StepOutcome, StepTypeRegistry
-from forge.launch_environment import build_project_command_env
+from forge.launch_environment import (
+    build_project_command_env,
+    minimal_environment_note,
+)
 from forge.memory.redaction import scrub_process_output
 from forge.persistence.repositories.runbook_models import Step, StepStatus
 
@@ -60,6 +63,7 @@ def _run_script_step(
     launch_settings: Sequence[str] | None = None,
     deploy: dict[str, object] | None = None,
     issued_env: Any = None,
+    repository: str | None = None,
 ) -> tuple[int, str]:
     """Run a shell script with timeout, size-cap, and credential scrubbing.
 
@@ -98,6 +102,9 @@ def _run_script_step(
             the helper service's own reader. A plain mapping is refused: a
             preview runs only inside a sandbox, so a local call that carries
             one has been handed something nobody issued.
+        repository: The checkout the script belongs to, when the caller knows
+            it (the helper service does): the script's private home goes in
+            that checkout's own git directory, and ``cwd`` must be inside it.
 
     Returns:
         A tuple of (exit_code, output):
@@ -150,13 +157,17 @@ def _run_script_step(
                 "preview, and a preview runs only in the repository's sandbox, "
                 "where the helper service checks them first. Nothing was run.",
             )
+    # ``ENV_FILE`` is set by the factory for this one command; an overlay
+    # that names it too is refused by the helper, as the deploy executor
+    # refuses it, rather than one of the two being quietly dropped.
     try:
         env = build_project_command_env(
             cwd,
             declared=launch_settings or (),
             additions={"ENV_FILE": env_file} if env_file is not None else None,
             issued=issued_env or None,
-            overlay=_without(extra_env, "ENV_FILE") if env_file is not None else extra_env,
+            overlay=extra_env,
+            repository=repository,
         )
     except (OSError, ValueError) as exc:
         return (1, f"the script was not run: {exc}")
@@ -225,12 +236,14 @@ def _run_script_step(
     # Scrub credentials at the capture boundary (exactly once)
     output = scrub_process_output(output)
 
+    # A FAILED SCRIPT IS TOLD WHAT IT WAS NOT GIVEN (design section 4): the
+    # names of the settings the factory holds and did not pass, and of any it
+    # declared that are not set here. Names only, never a value.
+    if exit_code != 0:
+        note = minimal_environment_note(env, declared=launch_settings or ())
+        output = f"{output}\n{note}" if output else note
+
     return (exit_code, output)
-
-
-def _without(values: Mapping[str, str] | None, name: str) -> dict[str, str]:
-    """``values`` less ``name``: an overlay never sets what an addition set."""
-    return {k: v for k, v in (values or {}).items() if k != name}
 
 
 def deploy_compose(step: Step, *, runner: ScriptRunner = _run_script_step) -> StepOutcome:

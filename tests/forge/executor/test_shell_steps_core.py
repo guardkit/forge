@@ -56,8 +56,9 @@ class TestScriptExecution:
         """extra_env entries are exposed to the script alongside ENV_FILE (O-32).
 
         Changed 13 October 2026: ``ENV_FILE`` is a value the factory sets for
-        this one command, and the request's overlay may not replace it, so on
-        a collision the factory's ``env_file`` is the one the script sees.
+        this one command, and the request's overlay may not name it too. So
+        ``extra_env`` here no longer carries it; the clash itself is refused
+        (see the credentials tests).
         """
         from forge.executor.shell_steps import _run_script_step
 
@@ -75,7 +76,7 @@ class TestScriptExecution:
             cwd=str(tmp_path),
             script=str(script),
             env_file=str(env_file),
-            extra_env={"REVERT": "1", "ENV_FILE": "/overridden/by/extra_env"},
+            extra_env={"REVERT": "1"},
         )
 
         assert exit_code == 0

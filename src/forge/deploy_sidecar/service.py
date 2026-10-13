@@ -233,6 +233,7 @@ from forge.launch_environment import (
     build_launch_env,
     build_project_command_env,
     declared_setting_refusal,
+    minimal_environment_note,
 )
 from forge.memory.redaction import scrub_process_output
 from forge.pipeline.deployment_identity import declared_identity
@@ -479,7 +480,9 @@ class ScriptRunner(Protocol):
     ``issued_env`` (13 October 2026) is the values a review preview issued to
     the project, as :class:`forge.deploy.review_preview.IssuedPreviewValues`.
     It is passed only when a request carries some, so a runner written before
-    it is called exactly as before.
+    it is called exactly as before. ``repository`` is the checkout the script
+    belongs to, so its private home is made in that checkout's own git
+    directory.
     """
 
     def __call__(
@@ -491,6 +494,7 @@ class ScriptRunner(Protocol):
         timeout: float = ...,
         extra_env: dict[str, str] | None = ...,
         issued_env: IssuedPreviewValues | None = ...,
+        repository: str | None = ...,
     ) -> tuple[int, str]: ...
 
 
@@ -512,7 +516,8 @@ class MergeRunner(Protocol):
     which starts the build system with the factory's list, and
     :func:`run_project_program`, which starts the project's own program with
     none of it. The project runner also takes ``issued`` (a review preview's
-    issued values), passed only when there are some.
+    issued values), passed only when there are some, and ``repository`` (the
+    checkout the program belongs to).
     """
 
     def __call__(
@@ -2017,6 +2022,9 @@ def process_live_gate_run(
             extra_env=extra_env or None,
             memory_project=memory_project,
             launch_settings=launch_settings,
+            # The checkout the driver belongs to, so its private home is
+            # made in that checkout's own git directory and nowhere above.
+            repository=str(repo_path),
             **issued_kwargs,
         )
     except Exception as exc:  # noqa: BLE001 — never raise past the boundary
@@ -2115,6 +2123,7 @@ def process_declared_test_run(
             what="the declared test command",
             memory_project=memory_project,
             launch_settings=launch_settings,
+            repository=str(repo_path),
         )
     except Exception as exc:  # noqa: BLE001 — never raise past the boundary
         return 500, {
@@ -2459,6 +2468,7 @@ def process_run_request(
             launch_settings=launch_names,
             timeout=timeout,
             issued_env=issued,
+            repository=str(repo_path),
         )
         if isinstance(built, str):
             return 400, {"error": built}
@@ -2492,6 +2502,7 @@ def process_run_request(
     try:
         exit_code, output = script_runner(
             **issued_kwargs,
+            repository=str(repo_path),
             cwd=str(cwd),
             script=script,
             env_file=env_file,
@@ -2718,6 +2729,7 @@ def run_project_program(
     launch_settings: Sequence[str] | None = None,
     issued: IssuedPreviewValues | None = None,
     run_owner: str | None = None,
+    repository: str | None = None,
 ) -> tuple[int, str, str]:
     """Run one of the PROJECT'S own programs; return exit code and output.
 
@@ -2736,10 +2748,16 @@ def run_project_program(
     handed on. ``run_owner`` sets the run-owner marker when a caller has the
     build on the coordinator's record; nothing here guesses one.
 
+    ``repository`` is the checkout the program belongs to, when the caller
+    knows it: the private home then goes in that checkout's own git directory
+    and ``cwd`` must be inside it.
+
     Never raises: a program whose environment is refused (a credential-shaped
     overlay name, a proxy carrying a password, an issued value that does not
     check out) is reported as not started, with a sentence that names the
-    setting and never its value.
+    setting and never its value. A program that ran and failed has a plain
+    note added to its error output naming, never showing, the settings it was
+    not given (design section 4).
     """
     try:
         env = build_project_command_env(
@@ -2748,10 +2766,17 @@ def run_project_program(
             issued=issued,
             overlay=extra_env,
             run_owner=run_owner,
+            repository=repository,
         )
     except (OSError, ValueError) as exc:
         return (MERGE_NOT_STARTED_EXIT_CODE, "", f"{what} was not started: {exc}")
-    return _start_and_collect(argv=argv, cwd=cwd, env=env, timeout=timeout, what=what)
+    exit_code, stdout, stderr = _start_and_collect(
+        argv=argv, cwd=cwd, env=env, timeout=timeout, what=what
+    )
+    if exit_code != 0:
+        note = minimal_environment_note(env, declared=launch_settings or ())
+        stderr = f"{stderr}\n{note}" if stderr else note
+    return exit_code, stdout, stderr
 
 
 def _start_and_collect(

@@ -299,6 +299,11 @@ def _checkout_and_tree(tmp_path: Path) -> tuple[Path, Path, list[str]]:
     checkout = tmp_path / "checkout"
     tree = checkout / ".forge-candidates" / "FEAT-1"
     checkout.mkdir()
+    # The checkout is a git checkout (13 October 2026): the driver's private
+    # HOME is made in the checkout's own git directory, and nowhere above it.
+    import subprocess as _subprocess
+
+    _subprocess.run(["git", "init", "-q", str(checkout)], check=True, capture_output=True)
     tree.mkdir(parents=True)
     argv = _write_driver(checkout, _REPORTS_CWD_AND_ENV)
     _write_driver(tree, _REPORTS_CWD_AND_ENV)

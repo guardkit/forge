@@ -557,6 +557,8 @@ class RepoDriverLiveGateInvoker:
             base URL); an empty map by default.
         launch_settings: The setting NAMES the project declared its own
             programs need. Names only; each value is taken from this process.
+        repository: The checkout the driver belongs to; defaults to
+            ``repo_path`` and is kept by every copy.
 
     WHAT THE DRIVER IS GIVEN (13 October 2026). The driver is the project's
     own program, so its environment is built from nothing
@@ -575,8 +577,14 @@ class RepoDriverLiveGateInvoker:
         extra_env: dict[str, str] | None = None,
         journey_evidence: bool = False,
         launch_settings: Sequence[str] | None = None,
+        repository: Path | str | None = None,
     ) -> None:
         self._repo_path = Path(repo_path)
+        # THE CHECKOUT THE DRIVER BELONGS TO (13 October 2026): the one this
+        # invoker was first made for, kept when a copy moves into a candidate
+        # tree, so the driver's private home is made in that checkout's own
+        # git directory and never in one found above it.
+        self._repository = Path(repository) if repository is not None else Path(repo_path)
         self._driver_argv = list(driver_argv)
         self._timeout_seconds = timeout_seconds
         self._extra_env = dict(extra_env or {})
@@ -606,6 +614,7 @@ class RepoDriverLiveGateInvoker:
             extra_env=self._extra_env,
             journey_evidence=self._journey_evidence,
             launch_settings=self._launch_settings,
+            repository=self._repository,
         )
 
     def with_extra_env(self, overlay: dict[str, str]) -> "RepoDriverLiveGateInvoker":
@@ -628,6 +637,7 @@ class RepoDriverLiveGateInvoker:
             extra_env=merged,
             journey_evidence=self._journey_evidence,
             launch_settings=self._launch_settings,
+            repository=self._repository,
         )
 
     def with_journey_evidence(self) -> "RepoDriverLiveGateInvoker":
@@ -643,6 +653,7 @@ class RepoDriverLiveGateInvoker:
             extra_env=self._extra_env,
             journey_evidence=True,
             launch_settings=self._launch_settings,
+            repository=self._repository,
         )
 
     def invoke(
@@ -652,7 +663,10 @@ class RepoDriverLiveGateInvoker:
         # (the seam-boundary precedent above).
         import subprocess
 
-        from forge.launch_environment import build_project_command_env
+        from forge.launch_environment import (
+            build_project_command_env,
+            minimal_environment_note,
+        )
 
         argv = [*self._driver_argv, "--feature", feature, "--target", target]
         if gates:
@@ -665,7 +679,28 @@ class RepoDriverLiveGateInvoker:
                 self._repo_path,
                 declared=self._launch_settings,
                 overlay=self._extra_env,
+                repository=self._repository,
             )
+        except (OSError, ValueError) as exc:
+            # The driver's environment was refused (a credential-shaped
+            # setting, a proxy carrying a password, no checkout to give it a
+            # private home): the gate could not be run, which is an
+            # INSTRUMENT problem, never a SUT fail.
+            return LiveGateInvocation(
+                verdict="instrument_fail",
+                run_id=run_id_fallback,
+                gate_ids=gate_ids,
+                dry_run=False,
+                detail={
+                    "argv": argv,
+                    "cwd": str(self._repo_path),
+                    "exit_code": None,
+                    "error": f"could not spawn driver: {exc}",
+                    "stdout_tail": "",
+                    "stderr_tail": "",
+                },
+            )
+        try:
             proc = subprocess.run(
                 argv,
                 cwd=str(self._repo_path),
@@ -693,6 +728,9 @@ class RepoDriverLiveGateInvoker:
                     ),
                     "stderr_tail": _bounded_tail(
                         exc.stderr if isinstance(exc.stderr, str) else None
+                    ),
+                    "environment_note": minimal_environment_note(
+                        env, declared=self._launch_settings
                     ),
                 },
             )
@@ -727,7 +765,7 @@ class RepoDriverLiveGateInvoker:
                 },
             )
 
-        return project_driver_answer(
+        answer = project_driver_answer(
             argv=argv,
             cwd=str(self._repo_path),
             exit_code=proc.returncode,
@@ -737,6 +775,19 @@ class RepoDriverLiveGateInvoker:
             run_id_fallback=run_id_fallback,
             journey_evidence=self._journey_evidence,
         )
+        if answer.verdict != "pass":
+            # A FAILED DRIVER IS TOLD WHAT IT WAS NOT GIVEN (design section
+            # 4): names only, never a value.
+            answer = replace(
+                answer,
+                detail={
+                    **dict(answer.detail or {}),
+                    "environment_note": minimal_environment_note(
+                        env, declared=self._launch_settings
+                    ),
+                },
+            )
+        return answer
 
 
 class SidecarLiveGateInvoker:
