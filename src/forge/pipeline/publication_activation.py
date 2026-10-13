@@ -8,7 +8,12 @@ these holds:
 2. **the publisher's credential file is named in no other settings** — the
    coordinator's, the runner's launch list or any sandbox's. Read here, from
    the settings. A credential file that is not named at all is a refusal, not
-   a pass: with no path there is nothing to search for;
+   a pass: with no path there is nothing to search for. When the coordinator
+   records the publisher's folder of per-route keys
+   (``publication.publisher_route_keys_dir``, 13 October 2026), the same
+   search also refuses any setting naming that folder or any path inside it,
+   so a route key added later is covered with no change here. Path text only:
+   nothing is opened;
 3. **the publisher passed its self-check** — the credential file is a regular
    file owned by the publisher's UID with no group or other access, and the
    publisher has exactly one network interface besides loopback. It will not
@@ -41,6 +46,8 @@ product.
 from __future__ import annotations
 
 import logging
+import posixpath
+import re
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
@@ -77,6 +84,10 @@ class WhatIsTrue:
     the_credential_file: str | None
     where_the_credential_file_is_named: tuple[str, ...]
     machine: WhatTheMachineSays
+    #: The host folder the publisher's per-route keys are in, if recorded.
+    the_route_keys_dir: str | None = None
+    #: Every setting that names that folder or a path inside it.
+    where_the_route_keys_dir_is_named: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -192,6 +203,17 @@ def _the_credential_is_named_in_no_other_settings(true: WhatIsTrue) -> Answer:
             "file the publisher's credential is in, before publication is "
             "switched on",
         )
+    if true.where_the_route_keys_dir_is_named:
+        named = ", ".join(true.where_the_route_keys_dir_is_named)
+        return Answer(
+            name,
+            question,
+            False,
+            f"the publisher's folder of per-route keys ({true.the_route_keys_dir}), "
+            f"or a path inside it, is named in {named}. Every key in it "
+            "belongs to the publisher and to nothing else; take it out of "
+            "those settings before publication is switched on",
+        )
     if true.where_the_credential_file_is_named:
         named = ", ".join(true.where_the_credential_file_is_named)
         return Answer(
@@ -271,10 +293,60 @@ def _names_the_credential_file(config: Any, credential_file: str) -> tuple[str, 
     of a path and not a copy of a secret), the list of settings a build is
     launched with, and every sandbox's declared settings.
     """
-    found: list[str] = []
     wanted = _text(credential_file)
     if not wanted:
         return ()
+    return _where_settings_name(
+        config,
+        lambda text: text.strip() == wanted,
+        own_field="publisher_credential_file",
+    )
+
+
+def _inside(folder: str) -> Any:
+    """Does a setting's text name ``folder`` or any path inside it?
+
+    PATH TEXT ONLY, never a file opened. The whole value, normalised, is the
+    folder or starts with it and a separator — so ``/x/route-keys2`` is not
+    ``/x/route-keys``. And the folder written anywhere inside a longer value
+    (``KEY=/x/route-keys/a``, ``--mount=...``) counts as well, on the same
+    boundary.
+    """
+    root = posixpath.normpath(folder.strip())
+    inside_at = re.compile(
+        r"(?:^|[^A-Za-z0-9._/-])" + re.escape(root) + r"(?:/|$|[^A-Za-z0-9._-])"
+    )
+
+    def names_it(text: str) -> bool:
+        value = text.strip()
+        if not value:
+            return False
+        normal = posixpath.normpath(value)
+        if normal == root or normal.startswith(root.rstrip("/") + "/"):
+            return True
+        return bool(inside_at.search(value))
+
+    return names_it
+
+
+def _names_the_route_keys_dir(config: Any, folder: str) -> tuple[str, ...]:
+    """Every settings block that names the route-keys folder or a path in it.
+
+    Searched where the credential file is searched, skipping only the one
+    field that records where the folder is.
+    """
+    if not _text(folder):
+        return ()
+    return _where_settings_name(
+        config, _inside(folder), own_field="publisher_route_keys_dir"
+    )
+
+
+def _where_settings_name(
+    config: Any, matches: Any, *, own_field: str
+) -> tuple[str, ...]:
+    """Every settings block with a text value ``matches`` says yes to."""
+    found: list[str] = []
 
     def _looks_at(block: Any, said: str, *, skip: Iterable[str] = ()) -> None:
         if block is None:
@@ -297,20 +369,20 @@ def _names_the_credential_file(config: Any, credential_file: str) -> tuple[str, 
                 continue
             if callable(value):
                 continue
-            if isinstance(value, str) and value.strip() == wanted:
+            if isinstance(value, str) and matches(value):
                 found.append(f"{said}.{field_name}")
             elif isinstance(value, (list, tuple)) and any(
-                isinstance(entry, str) and entry.strip() == wanted for entry in value
+                isinstance(entry, str) and matches(entry) for entry in value
             ):
                 found.append(f"{said}.{field_name}")
             elif isinstance(value, dict) and any(
-                isinstance(entry, str) and entry.strip() == wanted
+                isinstance(entry, str) and matches(entry)
                 for entry in value.values()
             ):
                 found.append(f"{said}.{field_name}")
 
     publication = getattr(config, "publication", None)
-    _looks_at(publication, "publication", skip={"publisher_credential_file"})
+    _looks_at(publication, "publication", skip={own_field})
     planning = getattr(config, "planning", None)
     _looks_at(planning, "planning", skip={"sandboxes"})
     sandboxes = getattr(planning, "sandboxes", None)
@@ -318,9 +390,9 @@ def _names_the_credential_file(config: Any, credential_file: str) -> tuple[str, 
         for sandbox_name, entry in sorted(sandboxes.items()):
             _looks_at(entry, f"planning.sandboxes.{sandbox_name}")
     launch = getattr(getattr(config, "conductor", None), "launch_settings", None)
-    if isinstance(launch, (list, tuple)) and wanted in {
-        _text(entry) for entry in launch
-    }:
+    if isinstance(launch, (list, tuple)) and any(
+        matches(_text(entry)) for entry in launch
+    ):
         found.append("conductor.launch_settings")
     return tuple(sorted(set(found)))
 
@@ -338,7 +410,16 @@ def what_is_true_here(
     credential_file = _text(
         getattr(publication, "publisher_credential_file", None)
     ) or None
+    route_keys_dir = _text(
+        getattr(publication, "publisher_route_keys_dir", None)
+    ) or None
     return WhatIsTrue(
+        the_route_keys_dir=route_keys_dir,
+        where_the_route_keys_dir_is_named=(
+            _names_the_route_keys_dir(config, route_keys_dir)
+            if route_keys_dir
+            else ()
+        ),
         builds_may_run_inside_the_coordinator=allowed,
         the_credential_file=credential_file,
         where_the_credential_file_is_named=(

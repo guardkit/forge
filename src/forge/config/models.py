@@ -1718,6 +1718,20 @@ class PublicationConfig(BaseModel):
             "list or any sandbox's settings."
         ),
     )
+    publisher_route_keys_dir: str | None = Field(
+        default=None,
+        description=(
+            "The HOST PATH of the one folder the publisher's per-route keys "
+            "are in — the folder its container mounts read-only at "
+            "/etc/forge-publisher/route-keys (FORGE_PUBLISHER_ROUTE_KEYS_DIR "
+            "in the estate's env file). Not a key, and not a copy of one: a "
+            "note of where the folder is, so that the activation check can "
+            "prove neither the folder nor any path inside it is named in the "
+            "coordinator's settings, the runner's launch list or any "
+            "sandbox's settings. None (the default) = no route keys are "
+            "protected by the check."
+        ),
+    )
 
 
 class ReviewPreviewConfig(BaseModel):

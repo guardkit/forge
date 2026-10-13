@@ -240,3 +240,96 @@ class TestTheBootLine:
         assert say_where_publication_stands_at_boot(None).startswith(
             "publication is OFF: "
         )
+
+
+#: The host folder the publisher's per-route keys are in (13 October 2026).
+ROUTE_KEYS = "/srv/publisher/route-keys"
+
+
+class TestTheRouteKeysFolderIsNamedNowhereElse:
+    """The coordinator records the folder, and the same search that protects
+    the publisher-wide file protects the folder and every path inside it — by
+    path text alone, never opening anything. A key added to the folder later
+    is covered with no change here."""
+
+    def _refused_in(self, config, where: str) -> None:
+        verdict = run_the_activation_check(config, IT_PASSED)
+        assert [answer.name for answer in verdict.refusals] == [
+            "the-credential-is-named-in-no-other-settings"
+        ]
+        assert "per-route keys" in verdict.sentence
+        assert where in verdict.sentence
+        assert publication_is_switched_on(config, IT_PASSED) is False
+
+    def test_a_route_key_path_in_launch_settings_refuses(self) -> None:
+        config = a_config(publisher_route_keys_dir=ROUTE_KEYS)
+        config.conductor.launch_settings = [f"{ROUTE_KEYS}/widget-shop-key"]
+        self._refused_in(config, "conductor.launch_settings")
+
+    def test_a_route_key_written_inside_a_longer_launch_setting_refuses(self) -> None:
+        config = a_config(publisher_route_keys_dir=ROUTE_KEYS)
+        config.conductor.launch_settings = [f"KEY_FILE={ROUTE_KEYS}/a"]
+        self._refused_in(config, "conductor.launch_settings")
+
+    def test_a_route_key_path_in_sandbox_settings_refuses(self) -> None:
+        config = a_config(publisher_route_keys_dir=ROUTE_KEYS)
+        config.planning.sandboxes = {
+            "the-sandbox": SimpleNamespace(
+                name="the-sandbox", mounts=[f"{ROUTE_KEYS}//a"]
+            )
+        }
+        self._refused_in(config, "planning.sandboxes.the-sandbox.mounts")
+
+    @pytest.mark.parametrize("written", [ROUTE_KEYS, ROUTE_KEYS + "/", ROUTE_KEYS + "/."])
+    def test_the_route_keys_dir_itself_named_refuses(self, written: str) -> None:
+        config = a_config(publisher_route_keys_dir=ROUTE_KEYS)
+        config.planning.sandboxes = {
+            "the-sandbox": SimpleNamespace(name="the-sandbox", some_folder=written)
+        }
+        self._refused_in(config, "planning.sandboxes.the-sandbox.some_folder")
+
+    @pytest.mark.parametrize(
+        "elsewhere",
+        [ROUTE_KEYS + "2", ROUTE_KEYS + "2/a", ROUTE_KEYS + "-old/a", "/home" + ROUTE_KEYS],
+    )
+    def test_a_sibling_folder_with_a_longer_name_does_not_match(self, elsewhere: str) -> None:
+        config = a_config(publisher_route_keys_dir=ROUTE_KEYS)
+        config.conductor.launch_settings = [elsewhere]
+        config.planning.sandboxes = {
+            "the-sandbox": SimpleNamespace(name="the-sandbox", some_folder=elsewhere)
+        }
+        assert run_the_activation_check(config, IT_PASSED).all_hold is True
+
+    def test_every_path_isolated_activates(self) -> None:
+        """The positive control: the folder recorded, named nowhere else."""
+        config = a_config(publisher_route_keys_dir=ROUTE_KEYS)
+        config.conductor.launch_settings = ["/srv/forge/launch.env"]
+        config.planning.sandboxes = {
+            "the-sandbox": SimpleNamespace(name="the-sandbox", mounts=["/srv/projects"])
+        }
+        verdict = run_the_activation_check(config, IT_PASSED)
+        assert verdict.all_hold is True, verdict.sentence
+        assert publication_is_switched_on(config, IT_PASSED) is True
+
+    def test_without_the_setting_nothing_changes(self) -> None:
+        config = a_config()
+        config.conductor.launch_settings = [f"{ROUTE_KEYS}/a"]
+        assert run_the_activation_check(config, IT_PASSED).all_hold is True
+
+    def test_the_real_settings_model_takes_the_field(self) -> None:
+        from forge.config.models import ForgeConfig
+
+        config = ForgeConfig.model_validate(
+            {
+                "permissions": {"filesystem": {"allowlist": ["/tmp"]}},
+                "publication": {
+                    "publisher_credential_file": "/etc/forge-publisher/credential",
+                    "publisher_route_keys_dir": ROUTE_KEYS,
+                    "builds_may_run_inside_the_coordinator": False,
+                },
+            }
+        )
+        assert config.publication.publisher_route_keys_dir == ROUTE_KEYS
+        true = what_is_true_here(config, IT_PASSED)
+        assert true.the_route_keys_dir == ROUTE_KEYS
+        assert true.where_the_route_keys_dir_is_named == ()
