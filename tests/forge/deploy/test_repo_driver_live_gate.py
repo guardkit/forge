@@ -392,7 +392,7 @@ def test_the_other_backends_can_be_moved_too(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _answer(envelope: dict) -> "object":
+def _answer(envelope: dict, **kwargs: "object") -> "object":
     from forge.deploy.live_gate import project_driver_answer
 
     return project_driver_answer(
@@ -403,6 +403,7 @@ def _answer(envelope: dict) -> "object":
         stderr="",
         gate_ids=(),
         run_id_fallback="fallback",
+        **kwargs,
     )
 
 
@@ -416,19 +417,28 @@ def test_an_envelope_without_evidence_reads_exactly_as_before() -> None:
     assert invocation.outcome is None
 
 
+_JOURNEY_ENVELOPE = {
+    "verdict": "pass",
+    "run_id": "r1",
+    "app_url": "http://127.0.0.1:18950/",
+    "screenshot_refs": ["shots/a.png", "", 7, "shots/b.png"],
+    "trace_refs": ["trace.zip"],
+    "media_refs": ["video/journey.webm"],
+    "report_ref": "report/index.html",
+    "outcome": {"passed": 5, "failed": 0, "skipped": "two", "flaky": -1},
+}
+
+
+def test_an_ordinary_gate_does_not_read_the_journey_evidence() -> None:
+    invocation = _answer(_JOURNEY_ENVELOPE)
+    assert invocation.app_url is None
+    assert invocation.screenshot_refs == () and invocation.trace_refs == ()
+    assert invocation.media_refs == () and invocation.report_ref is None
+    assert invocation.outcome is None
+
+
 def test_the_journey_evidence_is_carried_from_the_envelope() -> None:
-    invocation = _answer(
-        {
-            "verdict": "pass",
-            "run_id": "r1",
-            "app_url": "http://127.0.0.1:18950/",
-            "screenshot_refs": ["shots/a.png", "", 7, "shots/b.png"],
-            "trace_refs": ["trace.zip"],
-            "media_refs": ["video/journey.webm"],
-            "report_ref": "report/index.html",
-            "outcome": {"passed": 5, "failed": 0, "skipped": "two", "flaky": -1},
-        }
-    )
+    invocation = _answer(_JOURNEY_ENVELOPE, journey_evidence=True)
     assert invocation.app_url == "http://127.0.0.1:18950/"
     assert invocation.screenshot_refs == ("shots/a.png", "shots/b.png")
     assert invocation.trace_refs == ("trace.zip",)

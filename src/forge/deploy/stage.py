@@ -1054,6 +1054,15 @@ class DeployStageRunner:
         invoker_override = self._gate_invoker_for(
             driver_cwd_override=cwd, driver_env_overlay=dict(preview_env)
         )
+        # Only this journey reads the driver's evidence fields (its report,
+        # screenshots, video and counts); every other gate reads the envelope
+        # exactly as before.
+        journey_base = invoker_override or self._live_gate_invoker
+        with_evidence = getattr(journey_base, "with_journey_evidence", None)
+        if callable(with_evidence) and not isinstance(
+            journey_base, RefusingLiveGateInvoker
+        ):
+            invoker_override = with_evidence()
         try:
             run_result = await self._run_runbook(
                 gate_runbook, correlation_id, live_gate_invoker=invoker_override

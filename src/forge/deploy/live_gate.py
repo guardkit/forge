@@ -422,6 +422,7 @@ def project_driver_answer(
     stderr: str,
     gate_ids: tuple[str, ...],
     run_id_fallback: str,
+    journey_evidence: bool = False,
 ) -> LiveGateInvocation:
     """One driver's answer, read into a :class:`LiveGateInvocation`.
 
@@ -436,13 +437,14 @@ def project_driver_answer(
     an identical answer identically or the same gate would mean two things.
 
     THE JOURNEY'S EVIDENCE (web readiness W7, 12 October 2026). An envelope
-    may also say where its evidence is, and the review preview reads it from
-    here: ``app_url``, ``screenshot_refs``, ``trace_refs``, ``media_refs`` (the
-    video), ``report_ref`` (the HTML report) and ``outcome`` (the test counts
-    ``passed``, ``failed``, ``skipped`` and ``flaky``). Every one is optional,
-    and an envelope without them reads exactly as it did before: no refs, no
-    report and no counts. This reading is not behind the review_preview switch:
-    it only adds optional fields, and nothing but the preview acts on them.
+    may also say where its evidence is: ``app_url``, ``screenshot_refs``,
+    ``trace_refs``, ``media_refs`` (the video), ``report_ref`` (the HTML
+    report) and ``outcome`` (the test counts ``passed``, ``failed``,
+    ``skipped`` and ``flaky``). They are read ONLY when ``journey_evidence``
+    is set, which only the review preview's recorded journey does
+    (:meth:`RepoDriverLiveGateInvoker.with_journey_evidence`). Every other
+    gate — the ordinary live gate and the candidate leg — reads an envelope
+    exactly as it did before, whatever optional fields it carries.
     """
     import json
 
@@ -478,12 +480,18 @@ def project_driver_answer(
                 evidence_index_ref=str(envelope.get("evidence_index_ref") or ""),
                 dispositions_ref=envelope.get("dispositions_ref"),
                 attempts_ledger_ref=envelope.get("attempts_ledger_ref"),
-                app_url=_envelope_text(envelope, "app_url"),
-                screenshot_refs=_envelope_refs(envelope, "screenshot_refs"),
-                trace_refs=_envelope_refs(envelope, "trace_refs"),
-                media_refs=_envelope_refs(envelope, "media_refs"),
-                report_ref=_envelope_text(envelope, "report_ref"),
-                outcome=_envelope_outcome(envelope),
+                **(
+                    {
+                        "app_url": _envelope_text(envelope, "app_url"),
+                        "screenshot_refs": _envelope_refs(envelope, "screenshot_refs"),
+                        "trace_refs": _envelope_refs(envelope, "trace_refs"),
+                        "media_refs": _envelope_refs(envelope, "media_refs"),
+                        "report_ref": _envelope_text(envelope, "report_ref"),
+                        "outcome": _envelope_outcome(envelope),
+                    }
+                    if journey_evidence
+                    else {}
+                ),
                 dry_run=False,
                 detail={**detail, "source": "results_envelope"},
             )
@@ -556,11 +564,13 @@ class RepoDriverLiveGateInvoker:
         driver_argv: list[str],
         timeout_seconds: int = 600,
         extra_env: dict[str, str] | None = None,
+        journey_evidence: bool = False,
     ) -> None:
         self._repo_path = Path(repo_path)
         self._driver_argv = list(driver_argv)
         self._timeout_seconds = timeout_seconds
         self._extra_env = dict(extra_env or {})
+        self._journey_evidence = bool(journey_evidence)
 
     @property
     def repo_path(self) -> Path:
@@ -583,6 +593,7 @@ class RepoDriverLiveGateInvoker:
             driver_argv=self._driver_argv,
             timeout_seconds=self._timeout_seconds,
             extra_env=self._extra_env,
+            journey_evidence=self._journey_evidence,
         )
 
     def with_extra_env(self, overlay: dict[str, str]) -> "RepoDriverLiveGateInvoker":
@@ -603,6 +614,21 @@ class RepoDriverLiveGateInvoker:
             driver_argv=self._driver_argv,
             timeout_seconds=self._timeout_seconds,
             extra_env=merged,
+            journey_evidence=self._journey_evidence,
+        )
+
+    def with_journey_evidence(self) -> "RepoDriverLiveGateInvoker":
+        """A copy that also reads the journey's evidence from the envelope.
+
+        Only the review preview's recorded journey asks for this (web
+        readiness W7); every other gate reads the envelope as it always did.
+        """
+        return RepoDriverLiveGateInvoker(
+            repo_path=self._repo_path,
+            driver_argv=self._driver_argv,
+            timeout_seconds=self._timeout_seconds,
+            extra_env=self._extra_env,
+            journey_evidence=True,
         )
 
     def invoke(
@@ -689,6 +715,7 @@ class RepoDriverLiveGateInvoker:
             stderr=proc.stderr or "",
             gate_ids=gate_ids,
             run_id_fallback=run_id_fallback,
+            journey_evidence=self._journey_evidence,
         )
 
 
@@ -754,7 +781,9 @@ class SidecarLiveGateInvoker:
         build: str | None = None,
         start_commit: str | None = None,
         by_hand: bool = False,
+        journey_evidence: bool = False,
     ) -> None:
+        self._journey_evidence = bool(journey_evidence)
         self._base_url = str(base_url).rstrip("/")
         self._repo = repo
         self._repo_path = Path(repo_path)
@@ -809,6 +838,7 @@ class SidecarLiveGateInvoker:
             "build": self._build,
             "start_commit": self._start_commit,
             "by_hand": self._by_hand,
+            "journey_evidence": self._journey_evidence,
         }
         fields.update(changes)
         return SidecarLiveGateInvoker(**fields)
@@ -820,6 +850,10 @@ class SidecarLiveGateInvoker:
     def with_extra_env(self, overlay: dict[str, str]) -> "SidecarLiveGateInvoker":
         """A copy whose driver env is this one's plus ``overlay`` (overlay wins)."""
         return self._copy(extra_env={**self._extra_env, **overlay})
+
+    def with_journey_evidence(self) -> "SidecarLiveGateInvoker":
+        """A copy that also reads the journey's evidence (the review preview only)."""
+        return self._copy(journey_evidence=True)
 
     def invoke(
         self, *, feature: str, target: str, gates: tuple[str, ...] = ()
@@ -961,6 +995,7 @@ class SidecarLiveGateInvoker:
             stderr=str(answer.get("stderr_tail") or ""),
             gate_ids=gate_ids,
             run_id_fallback=run_id_fallback,
+            journey_evidence=self._journey_evidence,
         )
         return replace(
             invocation,

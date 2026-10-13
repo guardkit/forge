@@ -1526,18 +1526,30 @@ def test_a_host_sidecar_refuses_the_preview_routes(monkeypatch) -> None:
 
 
 class _Invoker:
-    def __init__(self, cwd: str | None = None, env: dict[str, str] | None = None) -> None:
-        self.cwd, self.env = cwd, dict(env or {})
+    """Answers with the journey's evidence only when it was asked to read it."""
+
+    def __init__(
+        self,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        journey: bool = False,
+    ) -> None:
+        self.cwd, self.env, self.journey = cwd, dict(env or {}), journey
 
     def with_repo_path(self, path: Any) -> "_Invoker":
-        return _Invoker(str(path), self.env)
+        return _Invoker(str(path), self.env, self.journey)
 
     def with_extra_env(self, overlay: dict[str, str]) -> "_Invoker":
-        return _Invoker(self.cwd, {**self.env, **overlay})
+        return _Invoker(self.cwd, {**self.env, **overlay}, self.journey)
+
+    def with_journey_evidence(self) -> "_Invoker":
+        return _Invoker(self.cwd, self.env, True)
 
     def invoke(self, *, feature: str, target: str, gates: tuple[str, ...] = ()):
         from forge.deploy.live_gate import LiveGateInvocation
 
+        if not self.journey:
+            return LiveGateInvocation(verdict="pass", run_id="journey-1")
         return LiveGateInvocation(
             verdict="pass",
             run_id="journey-1",
