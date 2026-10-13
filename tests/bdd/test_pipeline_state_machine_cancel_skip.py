@@ -22,6 +22,7 @@ AC-008 coverage map:
 
 from __future__ import annotations
 
+import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -34,6 +35,7 @@ from forge.cli import _cancel_run as cancel_run_module
 from forge.cli import cancel as cancel_module  # noqa: F401 — kept for symmetry
 from forge.cli import runtime as cli_runtime
 from forge.cli import skip as skip_module
+from forge.lifecycle import migrations
 from forge.lifecycle.persistence import Build
 from forge.lifecycle.state_machine import BuildState
 from forge.pipeline.cli_steering import (
@@ -58,9 +60,25 @@ _FEATURE = (
 # ---------------------------------------------------------------------------
 
 
+def _ledger_with_no_recorded_run() -> sqlite3.Connection:
+    """A freshly migrated in-memory ledger: the schema ``forge serve`` boots,
+    with no run recorded for any build."""
+    connection = sqlite3.connect(":memory:")
+    migrations.apply_at_boot(connection)
+    return connection
+
+
 @dataclass
 class _FakePersistence:
     builds: dict[str, Build] = field(default_factory=dict)
+    # The real ``SqliteLifecyclePersistence`` exposes its ledger connection;
+    # ``forge cancel`` reads a non-terminal build's recorded run from it
+    # (``interrupt_recorded_run``) before the direct cancel. These builds
+    # have no recorded run, so there is nothing to interrupt and the cancel
+    # proceeds.
+    connection: sqlite3.Connection = field(
+        default_factory=_ledger_with_no_recorded_run
+    )
 
     def find_active_or_recent(self, identifier: str) -> Build | None:
         if identifier in self.builds:
