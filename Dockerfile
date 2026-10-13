@@ -496,12 +496,18 @@ RUN npx -y "playwright@${PLAYWRIGHT_VERSION}" install --with-deps chromium firef
 # proves what the Player and Coach will actually find, not what root with this
 # image's PATH finds. Exact versions; cgo on, proved by building with the race
 # detector; gofmt finding nothing to change in a well-formatted file;
-# GOTOOLCHAIN=local from go.env alone; and both Chromium binaries Playwright
-# 1.63 uses on linux-arm64 (the full browser, chromium-<rev>/chrome-linux-arm64/
-# chrome, and the headless shell its default headless mode runs,
-# chromium_headless_shell-<rev>/chrome-headless-shell-linux-arm64/
-# chrome-headless-shell) loading a page headless. --no-sandbox is what Playwright
-# itself passes by default. Firefox and WebKit are checked for presence and
+# GOTOOLCHAIN=local from go.env alone; and the two Chromium binaries
+# Playwright 1.63 installs on linux-arm64. The headless shell
+# (chromium_headless_shell-<rev>/chrome-headless-shell-linux-arm64/
+# chrome-headless-shell), which Playwright's default headless mode runs, must
+# load a page; --no-sandbox is what Playwright itself passes by default. The
+# full browser (chromium-<rev>/chrome-linux-arm64/chrome) must only answer
+# --version: on 13 October 2026 its --dump-dom run in the first real build
+# never exited (D-Bus and GCM noise) and held the build for over two hours.
+# Every browser run here is therefore under `timeout --kill-after`, writes to
+# a file rather than a pipe (a pipe would wait on any browser child process
+# still holding it), and prints what the browser said if it fails, so a hang
+# fails the build within about a minute. Firefox and WebKit are checked for presence and
 # readability only: they have no one-line headless launch outside Playwright's
 # own driver, so launching all three browsers is the acceptance smoke run in
 # the built image, not this step.
@@ -522,11 +528,15 @@ RUN check_home="$(mktemp -d)" \
     && chrome="$(find "${PLAYWRIGHT_BROWSERS_PATH}" -type f -path '*/chromium-*/chrome-linux-arm64/chrome' -name chrome)" \
     && headless_shell="$(find "${PLAYWRIGHT_BROWSERS_PATH}" -type f -path '*/chromium_headless_shell-*/chrome-headless-shell-linux-arm64/chrome-headless-shell' -name chrome-headless-shell)" \
     && test -x "${chrome}" && test -x "${headless_shell}" \
-    && for browser in "${chrome}" "${headless_shell}"; do \
-           ${as_player} "${browser}" --headless --no-sandbox --disable-gpu --disable-dev-shm-usage \
-               --user-data-dir="${check_home}/profile" --dump-dom about:blank \
-               | grep -q '<body>' || exit 1; \
-       done \
+    && { timeout --kill-after=5 30 ${as_player} "${chrome}" --version \
+             < /dev/null > "${check_home}/chrome-version.txt" 2>&1 \
+         && grep -Eq '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' "${check_home}/chrome-version.txt" \
+         || { cat "${check_home}/chrome-version.txt" >&2; exit 1; }; } \
+    && { timeout --kill-after=5 60 ${as_player} "${headless_shell}" --no-sandbox --disable-gpu \
+             --disable-dev-shm-usage --user-data-dir="${check_home}/profile" --dump-dom about:blank \
+             < /dev/null > "${check_home}/dom.html" 2> "${check_home}/headless-shell.log" \
+         && grep -q '<body>' "${check_home}/dom.html" \
+         || { cat "${check_home}/dom.html" "${check_home}/headless-shell.log" >&2; exit 1; }; } \
     && ${as_player} ls -d "${PLAYWRIGHT_BROWSERS_PATH}"/firefox-* "${PLAYWRIGHT_BROWSERS_PATH}"/webkit-* \
     && rm -rf "${check_home}"
 

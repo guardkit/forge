@@ -1228,8 +1228,6 @@ class TestTheWebToolchain:
             'test -z "${gofmt_out}"',
             'test "$(${as_player} staticcheck -version)" = '
             '"staticcheck ${STATICCHECK_VERSION} (0.8.1)"',
-            "--headless --no-sandbox",
-            "--dump-dom about:blank",
         ):
             assert check in run, f"the self-check must include: {check}"
         assert re.search(r"^ARG\s+NODE_NPM_VERSION=10\.9\.8\s*$", runtime_body, re.MULTILINE)
@@ -1254,6 +1252,40 @@ class TestTheWebToolchain:
         ) in run
         assert "-name headless_shell" not in run
         assert 'test -x "${chrome}" && test -x "${headless_shell}"' in run
+
+    def test_every_browser_run_in_the_self_check_is_bounded(
+        self, dockerfile_text: str
+    ) -> None:
+        # 13 October 2026: the first real build ran full Chrome with
+        # --dump-dom, it never exited, and the build hung for over two hours.
+        # Now the page load uses only the headless shell (what Playwright's
+        # default headless mode runs), full Chrome only answers --version, and
+        # each run is under a timeout and writes to a file, never a pipe.
+        runtime_body = _runtime_stage_body(dockerfile_text)
+        (run,) = [r for r in _run_instructions(runtime_body) if "as_player=" in r]
+        run = re.sub(r"\s+", " ", run)
+        assert (
+            'timeout --kill-after=5 30 ${as_player} "${chrome}" --version'
+            ' < /dev/null > "${check_home}/chrome-version.txt" 2>&1'
+        ) in run
+        assert "grep -Eq '[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+' \"${check_home}/chrome-version.txt\"" in run
+        assert (
+            'timeout --kill-after=5 60 ${as_player} "${headless_shell}" --no-sandbox'
+        ) in run
+        assert '--dump-dom about:blank < /dev/null > "${check_home}/dom.html"' in run
+        assert "grep -q '<body>' \"${check_home}/dom.html\"" in run
+        # Every place a browser binary is run is wrapped in a timeout.
+        browser_runs = [
+            segment
+            for segment in re.split(r"&&|\|\|", run)
+            if re.search(r'"\$\{(?:chrome|headless_shell)\}" --', segment)
+        ]
+        assert len(browser_runs) == 2
+        for browser_run in browser_runs:
+            assert "timeout --kill-after=5 " in browser_run, browser_run
+        # Full Chrome is never asked to load a page, and no browser feeds a pipe.
+        assert not re.search(r'"\$\{chrome\}"[^;]*--dump-dom', run)
+        assert not re.search(r'about:blank\s*\|', run)
 
     def test_the_toolchain_layers_sit_before_the_cache_barrier(
         self, dockerfile_text: str
