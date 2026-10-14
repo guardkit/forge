@@ -49,6 +49,7 @@ import logging
 import os
 import re
 import shlex
+import shutil
 import stat
 import sys
 import threading
@@ -64,8 +65,13 @@ __all__ = [
     "an_ssh_address",
     "CredentialRefusal",
     "read_the_credential",
+    "a_source_the_publisher_takes",
     "the_askpass_program",
+    "the_credential_environment",
     "the_environment_git_is_given",
+    "the_remote_transport",
+    "the_ssh_command_for",
+    "the_source_transport",
 ]
 
 #: What a credential says when anything asks it to describe itself.
@@ -336,6 +342,49 @@ def a_remote_the_publisher_takes(address: str) -> bool:
     return text.startswith("https://") or an_ssh_address(text)
 
 
+def the_remote_transport(address: str) -> str | None:
+    """The one transport a remote is fetched and sent over (14 October 2026):
+    ``ssh`` for the recognised SSH forms, ``https`` for an ``https://``
+    address, else ``None``.
+
+    Anything else, a local folder included, is refused here as the settings
+    refuse it (:func:`a_remote_the_publisher_takes`): a remote is only ever
+    reached over the network, with the route's own credential.
+    """
+    text = str(address or "").strip()
+    if an_ssh_address(text):
+        return "ssh"
+    if text.startswith("https://"):
+        return "https"
+    return None
+
+
+def the_source_transport(address: str) -> str | None:
+    """The one transport the project's copy is read over (14 October 2026):
+    ``git`` for a ``git://`` address (the factory's read-only export), ``file``
+    for an absolute local folder, else ``None``. ``file://``, ``http(s)``,
+    ``ssh``, ``ext::`` and relative paths are not taken."""
+    from forge.network_git import transport_of
+
+    found = transport_of(str(address or "").strip())
+    return found if found in ("git", "file") else None
+
+
+def a_source_the_publisher_takes(address: str) -> bool:
+    """A ``git://`` address or an absolute local folder (see
+    :func:`the_source_transport`)."""
+    return the_source_transport(address) is not None
+
+
+def the_ssh_command_for(key_file: str, known_hosts: str) -> str:
+    """The ssh git runs for ONE key file and ONE pinned host list.
+
+    Shared with ``forge register-repo``, whose check clone of a private
+    repository uses the publisher's route key in exactly this way.
+    """
+    return _the_ssh_command(Credential("", path=key_file), known_hosts)
+
+
 def _the_ssh_command(credential: Credential, known_hosts: str) -> str:
     """The ssh git runs: this one key, this one pinned host list, nothing else.
 
@@ -344,7 +393,10 @@ def _the_ssh_command(credential: Credential, known_hosts: str) -> str:
     """
     return " ".join(
         [
-            "ssh",
+            # The ssh program by its full path, found from the publisher's own
+            # PATH (14 October 2026): git's environment is given a fixed PATH,
+            # not the publisher's.
+            shlex.quote(shutil.which("ssh") or "ssh"),
             "-F", "/dev/null",
             "-i", shlex.quote(credential.file),
             "-o", "IdentitiesOnly=yes",
@@ -358,41 +410,52 @@ def _the_ssh_command(credential: Credential, known_hosts: str) -> str:
     )
 
 
+def the_credential_environment(
+    credential: Credential | None,
+    *,
+    state_dir: Path,
+    known_hosts: str | None = None,
+) -> dict[str, str]:
+    """The ONE credential value a publisher git command may carry, or none.
+
+    ``GIT_SSH_COMMAND`` naming the route's own key and the pinned host list
+    for a remote reached over SSH; ``GIT_ASKPASS`` naming the publisher's own
+    program, which reads the one named credential file, for ``https``. A
+    path, never the secret.
+    """
+    if credential is None or not credential.held:
+        return {}
+    if known_hosts is not None:
+        return {"GIT_SSH_COMMAND": _the_ssh_command(credential, known_hosts)}
+    return {"GIT_ASKPASS": str(the_askpass_program(credential, state_dir=state_dir))}
+
+
 def the_environment_git_is_given(
     credential: Credential | None,
     *,
     state_dir: Path,
     home: Path,
     known_hosts: str | None = None,
+    transport: str = "none",
 ) -> dict[str, str]:
-    """The WHOLE environment the publisher's git commands are given.
+    """The WHOLE environment a publisher git command is given.
 
     Built from nothing, not copied from this process: a child that is handed
-    the publisher's own environment is handed whatever else is in it. Only
-    these names are set, and none of their values is a credential.
-
-    ``HOME`` is the publisher's own private folder, so git reads no person's
-    configuration and finds no person's stored credentials: the only
-    credential in reach is the one named file.
-
-    ``known_hosts`` is given for a remote reached over SSH: the credential
-    file is then a private key, handed to ssh by its PATH, and there is no
-    program to ask for a password.
+    the publisher's own environment is handed whatever else is in it. Since
+    14 October 2026 it is :func:`forge.network_git.isolated_environment`:
+    ``HOME`` is a FRESH EMPTY folder made for each command and removed after
+    it (``home`` here), never the publisher's state folder, so git and its
+    HTTP library find no ``.netrc``, ``.gitconfig`` or XDG settings file
+    there; no system or personal settings file is read; exactly one
+    ``transport`` is allowed; and the only credential is the one from
+    :func:`the_credential_environment`. None of the values is a secret.
     """
-    given = {
-        "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
-        "HOME": str(home),
-        # Never stop and ask a person: there is nobody at this end.
-        "GIT_TERMINAL_PROMPT": "0",
-        # Nothing this process does needs a system or a person's config.
-        "GIT_CONFIG_NOSYSTEM": "1",
-        "LC_ALL": "C",
-    }
-    if credential is not None and credential.held:
-        if known_hosts is not None:
-            given["GIT_SSH_COMMAND"] = _the_ssh_command(credential, known_hosts)
-        else:
-            given["GIT_ASKPASS"] = str(
-                the_askpass_program(credential, state_dir=state_dir)
-            )
-    return given
+    from forge.network_git import isolated_environment
+
+    return isolated_environment(
+        transport,
+        Path(home),
+        the_credential_environment(
+            credential, state_dir=state_dir, known_hosts=known_hosts
+        ),
+    )

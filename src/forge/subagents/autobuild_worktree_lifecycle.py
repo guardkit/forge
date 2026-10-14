@@ -25,9 +25,10 @@ import hashlib
 import os
 import re
 import stat
-import subprocess
 from pathlib import Path
 from typing import Any, Mapping
+
+from forge.project_git import run_git
 
 FORGE_AUTOBUILD_WORKTREE_BASE_ENV = "FORGE_AUTOBUILD_WORKTREE_BASE"
 DEFAULT_AUTOBUILD_WORKTREE_BASE = "/tmp/forge-autobuild-worktrees"
@@ -38,12 +39,15 @@ INNER_WORKTREES_REL = Path(".guardkit/worktrees")
 
 
 def _git(repo: Path, *args: str) -> tuple[int, bytes]:
+    """Run ``git -C <repo> <args>``; ``(returncode, stdout or the failure sentence)``.
+
+    Through :func:`forge.project_git.run_git` (14 October 2026), the one way
+    Forge runs git. On failure the bytes are the helper's fixed sentence
+    ("git status stopped with exit code 128."), never git's own error text,
+    because callers copy them into the cleanup receipt and the logs.
+    """
     try:
-        done = subprocess.run(  # noqa: S603 - fixed argv, no shell
-            ["git", "-C", str(repo), *args],
-            capture_output=True,
-            check=False,
-        )
+        done = run_git(["-C", str(repo), *args], text=False)
     except OSError as exc:
         return 127, f"{type(exc).__name__}: {exc}".encode()
     return done.returncode, done.stdout if done.returncode == 0 else done.stderr

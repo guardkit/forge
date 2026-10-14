@@ -109,17 +109,23 @@ def test_a_recognised_ssh_remote_always_takes_the_pinned_host_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Even with no known-hosts file named, git never gets the token path."""
+    import subprocess as real_subprocess
+
+    from forge import network_git
     from forge.publisher import git_work
 
     key = tmp_path / "key"
     key.write_text(THE_MADE_UP_KEY, encoding="utf-8")
     seen: list[dict] = []
+    real_run = real_subprocess.run
 
-    def capture(*_args, env=None, **_kwargs):
+    def capture(argv, *args, env=None, **kwargs):
+        if "fetch" not in argv:
+            return real_run(argv, *args, env=env, **kwargs)  # making the copy
         seen.append(env)
         raise OSError("not run in this test")
 
-    monkeypatch.setattr(git_work.subprocess, "run", capture)
+    monkeypatch.setattr(network_git.subprocess, "run", capture)
     commits = git_work.TheProjectsCommits(
         ProjectRoute(name="p", source="git://h/p", remote="git@example.org:o/p.git"),
         state_dir=tmp_path,
@@ -129,7 +135,8 @@ def test_a_recognised_ssh_remote_always_takes_the_pinned_host_path(
     commits.where_the_remotes_branch_is("main")
     assert seen
     for env in seen:
-        assert "GIT_ASKPASS" not in env
+        assert not env.get("GIT_ASKPASS")
+        assert env["GIT_ALLOW_PROTOCOL"] == "ssh"
         assert "UserKnownHostsFile=/dev/null" in env["GIT_SSH_COMMAND"]
         assert "StrictHostKeyChecking=yes" in env["GIT_SSH_COMMAND"]
 
@@ -144,7 +151,9 @@ def test_the_environment_over_ssh(tmp_path: Path) -> None:
         known_hosts="/etc/forge-publisher/known_hosts",
     )
     command = shlex.split(given["GIT_SSH_COMMAND"])
-    assert command[:3] == ["ssh", "-F", "/dev/null"]
+    # The ssh program by its full path (14 October 2026: git's PATH is fixed).
+    assert command[0] == "ssh" or command[0].endswith("/ssh")
+    assert command[1:3] == ["-F", "/dev/null"]
     assert command[command.index("-i") + 1] == str(key)
     for option in (
         "IdentitiesOnly=yes",
@@ -155,7 +164,7 @@ def test_the_environment_over_ssh(tmp_path: Path) -> None:
         "GlobalKnownHostsFile=/dev/null",
     ):
         assert option in command
-    assert "GIT_ASKPASS" not in given
+    assert not given["GIT_ASKPASS"]
     assert "SSH_AUTH_SOCK" not in given
     assert "TESTONLY" not in json.dumps(given)
 

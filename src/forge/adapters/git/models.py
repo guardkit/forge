@@ -39,13 +39,12 @@ class GitOpResult(BaseModel):
 
     - ``"prepare_worktree"`` — sets ``worktree_path`` on success.
     - ``"commit_all"`` — sets ``sha`` on success.
-    - ``"push"`` — sets ``sha`` on success (the SHA pushed).
     - ``"cleanup_worktree"`` — neither ``sha`` nor ``worktree_path`` is
       populated.
 
-    On ``status="failed"``, ``stderr`` carries the captured subprocess
-    stderr (truncated by the adapter if necessary) and ``exit_code``
-    holds the non-zero return code.
+    On ``status="failed"``, ``stderr`` carries the git helper's fixed
+    sentence (never git's own text, since 14 October 2026) and
+    ``exit_code`` holds the non-zero return code.
     """
 
     status: Literal["success", "failed"]
@@ -53,12 +52,12 @@ class GitOpResult(BaseModel):
         ...,
         description=(
             "Adapter operation label: "
-            '"prepare_worktree" | "commit_all" | "push" | "cleanup_worktree".'
+            '"prepare_worktree" | "commit_all" | "cleanup_worktree".'
         ),
     )
     sha: str | None = Field(
         default=None,
-        description="Commit SHA (commit/push operations only).",
+        description="Commit SHA (commit operations only).",
     )
     worktree_path: str | None = Field(
         default=None,

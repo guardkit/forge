@@ -321,6 +321,79 @@ class TestPrepareBranchAndWriteTree:
         assert second.sha == first.sha
 
 
+class TestNothingToCommitIsAskedNotRead:
+    """14 October 2026: "is there anything to commit?" is asked with
+    ``git diff --cached --quiet`` before the commit, instead of running the
+    commit and searching git's output for "nothing to commit"."""
+
+    _FILES = {"features/stats/stats.feature": "Feature: stats\n"}
+
+    @pytest.mark.asyncio
+    async def test_identical_tree_with_a_hook_is_success_without_a_commit(
+        self, repo: Path, tmp_path: Path
+    ) -> None:
+        from forge.adapters.git.operations import _default_execute
+        from forge.planning.handoff import PreCommitResult
+
+        commands: list[list[str]] = []
+
+        async def _recording(*, command, cwd=None, timeout=None):  # noqa: ANN001
+            commands.append(list(command))
+            return await _default_execute(command=command, cwd=cwd, timeout=timeout)
+
+        runner = WorktreeGitRunner(
+            worktrees_root=tmp_path / "worktrees", execute=_recording
+        )
+
+        async def _hook(worktree: Path) -> PreCommitResult:
+            return PreCommitResult(ok=True)
+
+        first = await runner.prepare_branch_and_write_tree(
+            str(repo), BRANCH, self._FILES, "planning: spec", pre_commit=_hook
+        )
+        assert first.status == "success"
+        commands.clear()
+
+        # A hook switches off the read-only idempotency probe, so the second
+        # write reaches the commit step with nothing changed on disk.
+        second = await runner.prepare_branch_and_write_tree(
+            str(repo), BRANCH, self._FILES, "planning: spec", pre_commit=_hook
+        )
+
+        assert second.status == "success", second
+        assert second.sha == first.sha
+        assert ["git", "diff", "--cached", "--quiet"] in commands
+        assert not any(c[:2] == ["git", "commit"] for c in commands)
+        assert _git(repo, "rev-list", "--count", BRANCH) == "2"
+
+    @pytest.mark.asyncio
+    async def test_a_failed_staging_check_is_a_failure_with_the_sentence(
+        self, repo: Path, tmp_path: Path
+    ) -> None:
+        from forge.adapters.git.operations import _default_execute
+
+        async def _diff_fails(*, command, cwd=None, timeout=None):  # noqa: ANN001
+            if list(command)[:3] == ["git", "diff", "--cached"]:
+                return ExecuteResult(
+                    exit_code=128,
+                    stdout="",
+                    stderr="git diff stopped with exit code 128.",
+                )
+            return await _default_execute(command=command, cwd=cwd, timeout=timeout)
+
+        runner = WorktreeGitRunner(
+            worktrees_root=tmp_path / "worktrees", execute=_diff_fails
+        )
+
+        result = await runner.prepare_branch_and_write(
+            str(repo), BRANCH, FILE_PATH, CONTENT
+        )
+
+        assert result.status == "failed"
+        assert result.stderr == "git diff stopped with exit code 128."
+        assert result.exit_code == 128
+
+
 class TestTimeoutRobustness:
     """The 2026-07-18 silent-hang fix: a wedged git op or pre-commit hook
     must surface as a loud, quick, non-raising ``status="failed"`` — never

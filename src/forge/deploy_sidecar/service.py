@@ -29,7 +29,7 @@ The narrow contract:
                                           detail, note}], detail}
     POST /git/read-file-from-branch {repo, branch, file_path} -> {content|null}
     POST /git/rev-parse {repo, ref} -> {sha|null}
-    POST /git/remote-start-point {repo, branch?}
+    POST /git/remote-start-point {repo, branch?, fetch_address}
               -> {branch|null, commit|null, refusal|null, branch_commit?}
     POST /git/read-file-at-commit {repo, commit, file_path, ordinary_file_only?, raw?, mode_only?}
               -> {content|null, found, refusal|null, ordinary?}
@@ -249,6 +249,7 @@ from forge.planning.handoff import (
     PreCommitCheckOutcome,
     PreCommitResult,
 )
+from forge.project_git import failure_sentence, open_git, run_git
 
 logger = logging.getLogger(__name__)
 
@@ -557,14 +558,12 @@ def resolve_code_version() -> str:
     """
     module_dir = Path(__file__).resolve().parent
     try:
-        result = subprocess.run(  # noqa: S603 — fixed argv, no shell
-            ["git", "-C", str(module_dir), "rev-parse", "--short", "HEAD"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
+        # Forge's own install folder, but still through the one git helper
+        # (14 October 2026): no git command here runs outside it.
+        result = run_git(
+            ["-C", str(module_dir), "rev-parse", "--short", "HEAD"], timeout=5
         )
-        rev = result.stdout.strip()
+        rev = result.stdout.strip() if result.returncode == 0 else ""
         if rev:
             return f"git-{rev}"
     except Exception:  # noqa: BLE001 — never block boot on the stamp
@@ -4120,12 +4119,11 @@ def process_git_rev_parse_request(
         return 400, {"error": error}
     spec = str(ref) if str(ref).endswith("}") else f"{ref}^{{commit}}"
     try:
-        result = subprocess.run(  # noqa: S603 — fixed argv, no shell
-            ["git", "-C", str(repo_path), "rev-parse", "--verify", "--quiet", spec],
-            capture_output=True,
-            text=True,
+        # Through the one git helper (14 October 2026): a refusal or a
+        # timeout carries only its fixed sentence, never git's own words.
+        result = run_git(
+            ["-C", str(repo_path), "rev-parse", "--verify", "--quiet", spec],
             timeout=GIT_REV_PARSE_TIMEOUT_SECONDS,
-            check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return 500, {"error": f"sidecar git error: {type(exc).__name__}: {exc}"}
@@ -4152,16 +4150,15 @@ def process_git_list_files_on_branch_request(
     if error:
         return 400, {"error": error}
     try:
-        result = subprocess.run(  # noqa: S603 — fixed argv, no shell
+        # Through the one git helper (14 October 2026); ``under`` is passed
+        # as a literal file name, never a pattern.
+        result = run_git(
             [
-                "git", "-C", str(repo_path), "ls-tree", "-r", "--name-only", "-z",
+                "-C", str(repo_path), "ls-tree", "-r", "--name-only", "-z",
                 str(branch) if str(branch).endswith("}") else f"{branch}^{{commit}}",
                 "--", str(payload["under"]),
             ],
-            capture_output=True,
-            text=True,
             timeout=GIT_REV_PARSE_TIMEOUT_SECONDS,
-            check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return 500, {"error": f"sidecar git error: {type(exc).__name__}: {exc}"}
@@ -4170,16 +4167,46 @@ def process_git_list_files_on_branch_request(
     return 200, {"files": sorted(p for p in result.stdout.split("\0") if p)}
 
 
+def _fetch_address_of(payload: dict[str, Any]) -> tuple[str | None, str | None]:
+    """The request's ``fetch_address``, checked: ``(address, None)``,
+    ``(None, None)`` when none was sent, or ``(None, sentence)``.
+
+    The coordinator sends the project's recorded address
+    (``planning.fetch_addresses``) with each request (Forge git hardening,
+    14 October 2026). It is never read from this sandbox's own settings file,
+    which sits inside a project clone, and never from the clone's origin. The
+    shape check is the coordinator's own; the sentence never repeats the
+    value, which may hold a credential.
+    """
+    from forge.network_git import check_fetch_address
+
+    sent = payload.get("fetch_address")
+    if sent is None or (isinstance(sent, str) and not sent.strip()):
+        return None, None
+    if not isinstance(sent, str):
+        return None, "'fetch_address' must be a string"
+    problem = check_fetch_address(sent)
+    if problem:
+        return None, problem
+    return sent.strip(), None
+
+
 def process_git_remote_start_point_request(
     payload: Any, *, config: ForgeConfig
 ) -> tuple[int, dict[str, Any]]:
-    """``{repo}`` → ``{branch, commit, refusal}`` — the starting rule's answer.
+    """``{repo, fetch_address}`` → ``{branch, commit, refusal}`` — the
+    starting rule's answer.
 
-    Fetches this repository's remote named ``origin`` inside the sandbox and
-    says which branch that remote calls its default and which commit it is at,
-    through the same code the in-container venue runs
+    Fetches the project's RECORDED address (``fetch_address``, which the
+    coordinator sends from ``planning.fetch_addresses``) into the factory's
+    own copy inside this container, brings the commit into this repository's
+    clone as ``refs/remotes/origin/<branch>``, and says which branch the
+    remote calls its default and which commit it is at, through the same
+    code the in-container venue runs
     (:func:`forge.deploy.candidate_tree.fetch_remote_start_point`), so both
-    venues give the same answer and the same sentences.
+    venues give the same answer and the same sentences. The clone's own
+    origin is never asked; a request with no address is answered with a
+    refusal that names the setting.
 
     A request this route refuses (an unknown repository key, a body that is
     not an object) is a 4xx with one plain sentence, as every git route here
@@ -4202,11 +4229,19 @@ def process_git_remote_start_point_request(
         error = _ref_error(branch, what="branch")
         if error:
             return 400, {"error": error}
+    fetch_address, error = _fetch_address_of(payload)
+    if error:
+        return 400, {"error": error}
     from forge.deploy.candidate_tree import fetch_remote_start_point
 
     try:
         answer = _run_coroutine(
-            fetch_remote_start_point(repo_path, str(branch) if branch else None)
+            fetch_remote_start_point(
+                repo_path,
+                str(branch) if branch else None,
+                fetch_address=fetch_address,
+                repo=str(payload.get("repo") or "") or None,
+            )
         )
     except Exception as exc:  # noqa: BLE001 — never raise past the boundary
         return 500, {"error": f"sidecar git error: {type(exc).__name__}: {exc}"}
@@ -4368,9 +4403,9 @@ def process_git_is_ancestor_request(
     if error:
         return 400, {"error": error}
     try:
-        result = subprocess.run(  # noqa: S603 — fixed argv, no shell
+        # Through the one git helper (14 October 2026).
+        result = run_git(
             [
-                "git",
                 "-C",
                 str(repo_path),
                 "merge-base",
@@ -4378,10 +4413,7 @@ def process_git_is_ancestor_request(
                 str(ancestor),
                 str(descendant),
             ],
-            capture_output=True,
-            text=True,
             timeout=GIT_REV_PARSE_TIMEOUT_SECONDS,
-            check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return 500, {"error": f"sidecar git error: {type(exc).__name__}: {exc}"}
@@ -4848,13 +4880,8 @@ def process_git_worktree_commit_count_request(
         return 400, {"error": error}
 
     def _git(*args: str) -> "subprocess.CompletedProcess[str]":
-        return subprocess.run(  # noqa: S603 — fixed argv, no shell
-            ["git", "-C", worktree, *args],
-            capture_output=True,
-            text=True,
-            timeout=GIT_REV_PARSE_TIMEOUT_SECONDS,
-            check=False,
-        )
+        # Through the one git helper (14 October 2026).
+        return run_git(["-C", worktree, *args], timeout=GIT_REV_PARSE_TIMEOUT_SECONDS)
 
     try:
         counted = _git("rev-list", "--count", f"{base}..HEAD")
@@ -4863,7 +4890,11 @@ def process_git_worktree_commit_count_request(
         return 500, {"error": f"sidecar git error: {type(exc).__name__}: {exc}"}
 
     if counted.returncode != 0:
-        detail = (counted.stderr or counted.stdout or "").strip() or "<no output>"
+        # Only the helper's fixed sentence: git's own words, and anything a
+        # failed command printed, never reach the answer (14 October 2026).
+        detail = (counted.stderr or "").strip() or failure_sentence(
+            "rev-list", counted.returncode
+        )
         return 500, {
             "error": (
                 f"git could not count {base}..HEAD in {worktree} "
@@ -4994,12 +5025,10 @@ def process_git_worktree_changed_files_request(
         return 400, {"error": error}
 
     def _git(*args: str) -> "subprocess.CompletedProcess[str]":
-        return subprocess.run(  # noqa: S603 — fixed argv, no shell
-            ["git", "-c", "core.quotepath=false", "-C", worktree, *args],
-            capture_output=True,
-            text=True,
+        # Through the one git helper (14 October 2026).
+        return run_git(
+            ["-c", "core.quotepath=false", "-C", worktree, *args],
             timeout=GIT_BRANCH_DIFF_TIMEOUT_SECONDS,
-            check=False,
         )
 
     span = f"{base}...HEAD"
@@ -5037,7 +5066,12 @@ def process_git_worktree_changed_files_request(
 
     for label, result in (("the changed files", names), ("the approval lines", patch)):
         if result is not None and result.returncode != 0:
-            detail = (result.stderr or result.stdout or "").strip() or "<no output>"
+            # Only the helper's fixed sentence: git's own words, and anything
+            # a failed command printed, never reach the answer (14 October
+            # 2026).
+            detail = (result.stderr or "").strip() or failure_sentence(
+                "diff", result.returncode
+            )
             return 500, {
                 "error": (
                     f"git could not read {label} of {span} in {worktree} "
@@ -6000,9 +6034,9 @@ def _tracked_files(repo_path: Path) -> tuple[list[str] | None, str | None]:
     approximation nothing else here would match.
     """
     try:
-        completed = subprocess.run(  # noqa: S603 — fixed argv, no shell
+        # Through the one git helper (14 October 2026).
+        completed = run_git(
             [
-                "git",
                 "-c",
                 "safe.directory=*",
                 "-C",
@@ -6010,19 +6044,18 @@ def _tracked_files(repo_path: Path) -> tuple[list[str] | None, str | None]:
                 "ls-files",
                 "-z",
             ],
-            capture_output=True,
-            text=True,
             encoding="utf-8",
             errors="replace",
             timeout=CODE_GIT_TIMEOUT_SECONDS,
-            check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return None, f"sidecar git error: {type(exc).__name__}: {exc}"
     if completed.returncode != 0:
-        detail = (
-            " ".join((completed.stderr or completed.stdout or "").split())[:200]
-            or "<no output>"
+        # This sentence reaches the planner model, so it carries only the
+        # helper's fixed sentence: never git's own words, and never what a
+        # failed command printed (14 October 2026).
+        detail = (completed.stderr or "").strip() or failure_sentence(
+            "ls-files", completed.returncode
         )
         return None, (
             f"git could not list the tracked files of {repo_path} (it exited "
@@ -7251,7 +7284,17 @@ class _CommitTree:
     # -- reading blobs ------------------------------------------------------
 
     def _git_argv(self, *args: str) -> list[str]:
-        return ["git", "-c", "safe.directory=*", "-C", str(self.repo_path), *args]
+        """The command for :func:`forge.project_git.open_git`, which starts
+        every git reader here (14 October 2026): the protected command line
+        and environment, git's own error text discarded."""
+        return ["-c", "safe.directory=*", "-C", str(self.repo_path), *args]
+
+    def _open(self, *args: str, stdin: Any = None) -> "subprocess.Popen[bytes]":
+        """Start one streaming git reader through the helper. Raises
+        ``OSError`` (the helper's ``GitRefused``) when it is refused."""
+        return open_git(
+            self._git_argv(*args), stdin=stdin, timeout=CODE_GIT_TIMEOUT_SECONDS
+        )
 
     def blob(self, oid: str) -> bytes:
         """One object's whole content, through one ``cat-file --batch``
@@ -7262,12 +7305,7 @@ class _CommitTree:
         if self.stalled is not None:
             raise _GitStalled(self.stalled)
         if self._batch is None:
-            process = subprocess.Popen(  # noqa: S603 — fixed argv, no shell
-                self._git_argv("cat-file", "--batch"),
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-            )
+            process = self._open("cat-file", "--batch", stdin=subprocess.PIPE)
             self._batch = _DeadlinePipe(process, f"reading the commit {self.commit[:12]}")
         batch = self._batch
         stdin = batch.process.stdin
@@ -7277,9 +7315,9 @@ class _CommitTree:
             stdin.flush()
             header = batch.read_line().decode("ascii", errors="replace").split()
             if len(header) != 3 or header[1] != "blob":
-                raise OSError(
-                    f"git could not read object {oid} ({' '.join(header) or 'no answer'})"
-                )
+                # A fixed sentence: what git printed about the object is not
+                # passed on to the caller (14 October 2026).
+                raise OSError(f"git could not read object {oid} as a file's content")
             size = int(header[2])
             data = batch.read_exactly(size)
             batch.read_exactly(1)
@@ -7301,11 +7339,7 @@ class _CommitTree:
         def opened() -> Any:
             if self.stalled is not None:
                 raise _GitStalled(self.stalled)
-            process = subprocess.Popen(  # noqa: S603 — fixed argv, no shell
-                self._git_argv("cat-file", "blob", oid),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-            )
+            process = self._open("cat-file", "blob", oid)
             pipe = _DeadlinePipe(process, f"reading a file at the commit {self.commit[:12]}")
             try:
                 yield pipe
@@ -7397,11 +7431,12 @@ class _CommitTree:
 
 
 def _open_commit_tree(
-    repo_path: Path, commit: Any
+    repo_path: Path, commit: Any, fetch_address: str | None = None
 ) -> tuple[_CommitTree | None, tuple[int, dict[str, Any]] | None]:
-    """The commit's tree, or the refusal already shaped. Fetches the clone's
-    remote once when the commit is not in the clone; a commit still missing
-    is ``409`` with ``commit_unavailable`` and never the working tree."""
+    """The commit's tree, or the refusal already shaped. Fetches the
+    project's recorded address (``fetch_address``) once when the commit is
+    not in the clone; a commit still missing is ``409`` with
+    ``commit_unavailable`` and never the working tree."""
     if not isinstance(commit, str) or not _CODE_COMMIT_RE.fullmatch(commit):
         return None, (
             400,
@@ -7409,15 +7444,13 @@ def _open_commit_tree(
         )
 
     def resolve() -> str | None:
-        completed = subprocess.run(  # noqa: S603 — fixed argv, no shell
+        # Through the one git helper (14 October 2026).
+        completed = run_git(
             [
-                "git", "-c", "safe.directory=*", "-C", str(repo_path),
+                "-c", "safe.directory=*", "-C", str(repo_path),
                 "rev-parse", "--verify", "--quiet", f"{commit}^{{commit}}",
             ],
-            capture_output=True,
-            text=True,
             timeout=CODE_GIT_TIMEOUT_SECONDS,
-            check=False,
         )
         out = (completed.stdout or "").strip()
         return out if completed.returncode == 0 and out else None
@@ -7428,7 +7461,9 @@ def _open_commit_tree(
         if full is None:
             from forge.deploy.candidate_tree import fetch_remote_start_point
 
-            answer = _run_coroutine(fetch_remote_start_point(repo_path, None))
+            answer = _run_coroutine(
+                fetch_remote_start_point(repo_path, None, fetch_address=fetch_address)
+            )
             fetched = (
                 f"; its remote was fetched and {answer.branch} is at {answer.commit}"
                 if answer.ok
@@ -7446,19 +7481,23 @@ def _open_commit_tree(
                     "commit_unavailable": True,
                 },
             )
-        listed = subprocess.run(  # noqa: S603 — fixed argv, no shell
+        # Through the one git helper (14 October 2026); bytes, as before.
+        listed = run_git(
             [
-                "git", "-c", "safe.directory=*", "-C", str(repo_path),
+                "-c", "safe.directory=*", "-C", str(repo_path),
                 "ls-tree", "-r", "-z", "-l", "--full-tree", full,
             ],
-            capture_output=True,
+            text=False,
             timeout=CODE_GIT_TIMEOUT_SECONDS,
-            check=False,
         )
     except (OSError, subprocess.TimeoutExpired, Exception) as exc:  # noqa: BLE001
         return None, (500, {"error": f"sidecar git error: {type(exc).__name__}: {exc}"})
     if listed.returncode != 0:
-        detail = " ".join(listed.stderr.decode("utf-8", errors="replace").split())[:200]
+        # This sentence reaches the planner model, so it carries only the
+        # helper's fixed sentence, never git's own words (14 October 2026).
+        detail = (listed.stderr or b"").decode("utf-8", errors="replace").strip() or (
+            failure_sentence("ls-tree", listed.returncode)
+        )
         return None, (
             500,
             {"error": f"git could not list the files of the commit {full[:12]} ({detail})"},
@@ -7486,7 +7525,10 @@ def _code_at_commit(
     error = _code_repo_error(repo_path)
     if error:
         return 400, {"error": error}
-    tree, refusal = _open_commit_tree(repo_path, payload.get("commit"))
+    fetch_address, error = _fetch_address_of(payload)
+    if error:
+        return 400, {"error": error}
+    tree, refusal = _open_commit_tree(repo_path, payload.get("commit"), fetch_address)
     if refusal is not None or tree is None:
         return refusal or (500, {"error": "the sidecar could not read the commit"})
     try:

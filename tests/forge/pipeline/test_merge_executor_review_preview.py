@@ -64,6 +64,7 @@ from tests.forge.pipeline.test_merge_executor import (  # noqa: F401 - fixtures
     repo_root,
 )
 from tests.forge.pipeline.test_merge_executor import _envelope as _an_envelope
+from tests.forge.recorded_fetch_address import origin_of
 
 #: Who approves in this file (a neutral name; the shared fixtures' own
 #: approver is left as it is).
@@ -77,7 +78,10 @@ def config(repo_root):
     return ForgeConfig.model_validate(
         {
             "permissions": {"filesystem": {"allowlist": ["/tmp"]}},
-            "planning": {"target_repo_paths": {REPO: str(repo_root)}},
+            "planning": {
+                "target_repo_paths": {REPO: str(repo_root)},
+                "fetch_addresses": {REPO: origin_of(repo_root)},
+            },
             "approval": {"expected_approver": APPROVER},
             "merge_executor": {"enabled": True},
         }

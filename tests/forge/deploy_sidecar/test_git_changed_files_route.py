@@ -327,14 +327,18 @@ class TestTheTestDiffNeverTurnsIntoARefusal:
         _git(tree, "add", "-A")
         _git(tree, "commit", "-m", "trim the tests")
         marker = f"-G{TEST_CHANGE_MARKER}"
-        real = subprocess.run
+        from forge.deploy_sidecar import service as sidecar
 
-        def _run(argv, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003
-            if isinstance(argv, (list, tuple)) and marker in argv:
-                raise subprocess.TimeoutExpired(cmd=list(argv), timeout=120.0)
-            return real(argv, *args, **kwargs)
+        # The route runs git through the one helper (14 October 2026), so the
+        # stand-in replaces the helper as the route sees it.
+        real = sidecar.run_git
 
-        monkeypatch.setattr(subprocess, "run", _run)
+        def _run(args, *rest, **kwargs):  # noqa: ANN001, ANN002, ANN003
+            if isinstance(args, (list, tuple)) and marker in args:
+                raise subprocess.TimeoutExpired(cmd="git diff", timeout=120.0)
+            return real(args, *rest, **kwargs)
+
+        monkeypatch.setattr(sidecar, "run_git", _run)
 
         status, body = _ask(cfg, tree)
 

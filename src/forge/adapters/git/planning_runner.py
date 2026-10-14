@@ -42,6 +42,15 @@ composing the existing :mod:`forge.adapters.git.operations` primitives
 
 No push in v1 (ASSUM-006): the branch stays local to the target working
 copy for the attended ``/feature-spec`` follow-up.
+
+Every git command here (14 October 2026) goes through the injected
+``execute``, whose production default hands it to
+:func:`forge.project_git.run_git`: git runs with a fixed environment, the
+project's own settings cannot make it start another program, and a failure
+reports only a fixed sentence, never git's own text. "Is there anything to
+commit?" is asked with ``git diff --cached --quiet`` rather than by reading
+the words git prints. The one exception is :meth:`WorktreeGitRunner.fetch_remote_start_point`,
+which calls :func:`forge.deploy.candidate_tree.fetch_remote_start_point`.
 """
 
 from __future__ import annotations
@@ -138,7 +147,8 @@ class WorktreeGitRunner:
         worktrees_root: Directory under which ephemeral worktrees are
             created. Defaults to ``<tempdir>/forge-planning-worktrees``.
         execute: Injectable subprocess primitive (tests inject a fake;
-            production uses the shared list-token, no-shell default).
+            production uses the git adapter's default, which runs git
+            through :func:`forge.project_git.run_git`).
         op_timeout_s: Per-git-operation timeout (seconds). Every git
             subprocess this runner drives is bounded by this value so a
             wedged git invocation surfaces as a loud, retryable failure
@@ -157,7 +167,14 @@ class WorktreeGitRunner:
         execute: ExecuteCallable = _default_execute,
         op_timeout_s: float = 180.0,
         hook_timeout_s: float = 900.0,
+        target_repo_paths: Mapping[str, str] | None = None,
+        fetch_addresses: Mapping[str, str] | None = None,
     ) -> None:
+        # The coordinator's own record of each project's clone and fetch
+        # address (Forge git hardening, 14 October 2026): the starting point
+        # is fetched from the recorded address, never the clone's origin.
+        self._target_repo_paths = dict(target_repo_paths or {})
+        self._fetch_addresses = dict(fetch_addresses or {})
         self._worktrees_root = worktrees_root or (
             Path(tempfile.gettempdir()) / "forge-planning-worktrees"
         )
@@ -188,10 +205,13 @@ class WorktreeGitRunner:
     async def fetch_remote_start_point(
         self, repo_path: str, branch: str | None = None
     ) -> RemoteStartPoint:
-        """Fetch this copy's remote ``origin`` and say where its default branch is.
+        """Fetch the project's recorded address and say where its default
+        branch is, bringing it into the copy as ``origin/<branch>``.
 
         The starting rule's one operation (one true copy, item 1,
-        2026-09-21), run here against the copy at ``repo_path``. The answer is
+        2026-09-21), run here against the copy at ``repo_path``. The address
+        is the coordinator's ``planning.fetch_addresses`` entry for the
+        project whose clone this is; with none, the answer is a refusal. The answer is
         a branch and a commit, or one plain sentence saying why there is
         nothing to start from. Never raises; nothing it does changes the
         branch the copy has checked out or touches its working folder.
@@ -203,7 +223,14 @@ class WorktreeGitRunner:
             return RemoteStartPoint(
                 refusal=f"there is no copy of this project at {repo_path}"
             )
-        return await fetch_remote_start_point(repo, branch)
+        from forge.network_git import address_for_path
+
+        name, address = address_for_path(
+            self._target_repo_paths, self._fetch_addresses, repo
+        )
+        return await fetch_remote_start_point(
+            repo, branch, fetch_address=address, repo=name
+        )
 
     async def read_file_at_commit(
         self,
@@ -354,7 +381,7 @@ class WorktreeGitRunner:
                 return GitOpResult(
                     status="failed",
                     operation=_OPERATION,
-                    stderr=_failure_stderr(add_res.stderr, add_res.stdout),
+                    stderr=_failure_stderr(add_res.stderr),
                     exit_code=add_res.exit_code,
                 )
 
@@ -374,20 +401,19 @@ class WorktreeGitRunner:
                 target.write_text(content, encoding="utf-8")
 
                 message = f"planning: add {file_path} (Mode P planned handoff)"
-                commit_res = await commit_all(worktree, message, execute=self._execute_timed)
+                commit_res = await self._commit_if_changed(worktree, message)
+                if commit_res is None:
+                    # Nothing staged: the content is byte-identical on disk
+                    # (e.g. the probe could not read the blob but the tree
+                    # already matches) — idempotent success per RT-08.
+                    sha = await self._rev_parse(repo, branch)
+                    return GitOpResult(
+                        status="success",
+                        operation=_OPERATION,
+                        sha=sha,
+                        exit_code=0,
+                    )
                 if commit_res.status == "failed":
-                    stderr = commit_res.stderr or ""
-                    if "nothing to commit" in stderr:
-                        # Content byte-identical on disk (e.g. probe could
-                        # not read the blob but the tree already matches) —
-                        # idempotent success per RT-08.
-                        sha = await self._rev_parse(repo, branch)
-                        return GitOpResult(
-                            status="success",
-                            operation=_OPERATION,
-                            sha=sha,
-                            exit_code=0,
-                        )
                     return GitOpResult(
                         status="failed",
                         operation=_OPERATION,
@@ -600,7 +626,7 @@ class WorktreeGitRunner:
                 return GitOpResult(
                     status="failed",
                     operation=_TREE_OPERATION,
-                    stderr=_failure_stderr(add_res.stderr, add_res.stdout),
+                    stderr=_failure_stderr(add_res.stderr),
                     exit_code=add_res.exit_code,
                 )
             logger.info("worktree ready at %s", worktree)
@@ -660,20 +686,19 @@ class WorktreeGitRunner:
                             exit_code=-1,
                         )
 
-                commit_res = await commit_all(worktree, message, execute=self._execute_timed)
-                if commit_res.status == "failed":
-                    stderr = commit_res.stderr or ""
-                    if "nothing to commit" in stderr:
-                        # Tree already matched on disk (e.g. an idempotent
-                        # re-run whose hook made no change) — RT-08 success.
-                        sha = expected_head or await self._rev_parse(repo, branch)
-                    else:
-                        return GitOpResult(
-                            status="failed",
-                            operation=_TREE_OPERATION,
-                            stderr=commit_res.stderr,
-                            exit_code=commit_res.exit_code,
-                        )
+                commit_res = await self._commit_if_changed(worktree, message)
+                if commit_res is None:
+                    # Nothing staged: the tree already matched on disk (e.g.
+                    # an idempotent re-run whose hook made no change) —
+                    # RT-08 success.
+                    sha = expected_head or await self._rev_parse(repo, branch)
+                elif commit_res.status == "failed":
+                    return GitOpResult(
+                        status="failed",
+                        operation=_TREE_OPERATION,
+                        stderr=commit_res.stderr,
+                        exit_code=commit_res.exit_code,
+                    )
                 else:
                     sha = commit_res.sha
                 if expected_head is not None:
@@ -695,7 +720,7 @@ class WorktreeGitRunner:
                                 f"branch {branch} changed while its prepared tree "
                                 "was being written; refusing to overwrite that "
                                 "concurrent update"
-                                f": {_failure_stderr(updated.stderr, updated.stdout)}"
+                                f": {_failure_stderr(updated.stderr)}"
                             ),
                             exit_code=updated.exit_code,
                         )
@@ -741,6 +766,42 @@ class WorktreeGitRunner:
                 file_path,
             )
             return None
+
+    async def _commit_if_changed(
+        self, worktree: Path, message: str
+    ) -> GitOpResult | None:
+        """Stage everything and commit it; ``None`` when nothing was staged.
+
+        Whether there is anything to commit is asked of git directly
+        (14 October 2026): ``git add -A``, then ``git diff --cached --quiet``,
+        whose exit code 0 means the index matches ``HEAD`` (nothing to
+        commit) and 1 means something is staged. Before, the commit was run
+        and its output searched for the words "nothing to commit"; git's own
+        text is no longer read anywhere. Any other answer from either step
+        is a failure carrying only the failure sentence.
+        """
+        cwd = str(worktree)
+        added = await self._execute_timed(command=["git", "add", "-A"], cwd=cwd)
+        if added.exit_code != 0:
+            return GitOpResult(
+                status="failed",
+                operation="commit_all",
+                stderr=_failure_stderr(added.stderr),
+                exit_code=added.exit_code,
+            )
+        staged = await self._execute_timed(
+            command=["git", "diff", "--cached", "--quiet"], cwd=cwd
+        )
+        if staged.exit_code == 0:
+            return None
+        if staged.exit_code != 1:
+            return GitOpResult(
+                status="failed",
+                operation="commit_all",
+                stderr=_failure_stderr(staged.stderr),
+                exit_code=staged.exit_code,
+            )
+        return await commit_all(worktree, message, execute=self._execute_timed)
 
     @staticmethod
     def _lock_args(branch: str) -> list[str]:
@@ -802,7 +863,7 @@ class WorktreeGitRunner:
                 "worktree=%s, exit=%d): %s",
                 worktree,
                 res.exit_code,
-                _failure_stderr(res.stderr, res.stdout),
+                _failure_stderr(res.stderr),
             )
         except Exception:  # noqa: BLE001 — cleanup never blocks the handoff
             logger.exception(
@@ -894,7 +955,7 @@ class WorktreeGitRunner:
                     ""
                     if gone.exit_code == 0
                     else f" (the removal said: "
-                    f"{_failure_stderr(gone.stderr, gone.stdout)})",
+                    f"{_failure_stderr(gone.stderr)})",
                 )
         except Exception:  # noqa: BLE001 — a sweep never blocks a write
             logger.exception("clearing stale planning worktree locks raised")
@@ -932,7 +993,7 @@ class WorktreeGitRunner:
         if res.exit_code != 0:
             return (
                 "<unverifiable: 'git worktree list --porcelain' exited "
-                f"{res.exit_code}: {_failure_stderr(res.stderr, res.stdout)}>"
+                f"{res.exit_code}: {_failure_stderr(res.stderr)}>"
             )
 
         branch_ref = f"refs/heads/{branch}"

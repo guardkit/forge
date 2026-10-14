@@ -328,6 +328,23 @@ class TestFailuresAreLoud:
 
         self._assert_failed(_run(probe(_BUILD)), "fatal: bad revision 'main'")
 
+    def test_a_failed_commands_stdout_is_never_recorded(self) -> None:
+        # 14 October 2026: on failure only ``stderr`` (with the default
+        # executor, the git helper's fixed sentence) is recorded; a failed
+        # command's stdout could carry git's own words.
+        probe = make_mode_c_commit_probe(
+            _FakePool(_row()),
+            execute=_FakeExecute(
+                exit_code=128,
+                stdout="words git printed",
+                stderr="git rev-list stopped with exit code 128.",
+            ),
+        )
+
+        result = _run(probe(_BUILD))
+        self._assert_failed(result, "git rev-list stopped with exit code 128.")
+        assert "words git printed" not in (result.error or "")
+
     def test_unparseable_stdout(self) -> None:
         probe = make_mode_c_commit_probe(
             _FakePool(_row()), execute=_FakeExecute(stdout="lots, probably")

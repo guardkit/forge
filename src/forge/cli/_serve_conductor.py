@@ -59,6 +59,7 @@ from forge.pipeline.conductor_driver import (
     WaitWindow,
 )
 from forge.pipeline.stage_taxonomy import StageClass
+from forge.project_git import run_git
 
 logger = logging.getLogger(__name__)
 
@@ -1803,10 +1804,11 @@ def read_branch_changes(*, worktree: "Path | str", base: str) -> BranchReading:
     span = f"{base}...HEAD"
 
     def _git(*args: str) -> "subprocess.CompletedProcess[str]":
-        return subprocess.run(  # noqa: S603 — fixed argv, no shell
-            ["git", "-c", "core.quotepath=false", "-C", str(root), *args],
-            capture_output=True,
-            text=True,
+        # Through the factory's one git helper: on a failure its ``stderr`` is
+        # a fixed sentence, never git's own text, so nothing git printed can
+        # reach the fence's record.
+        return run_git(
+            ["-c", "core.quotepath=false", "-C", str(root), *args],
             timeout=BRANCH_DIFF_TIMEOUT_SECONDS,
             check=False,
         )
@@ -1814,7 +1816,9 @@ def read_branch_changes(*, worktree: "Path | str", base: str) -> BranchReading:
     try:
         names = _git("diff", "--name-status", "-M", "-z", span)
         if names.returncode != 0:
-            detail = (names.stderr or names.stdout or "").strip() or "<no output>"
+            # Only the helper's fixed sentence: a failed command's stdout
+            # could carry git's own words too.
+            detail = (names.stderr or "").strip() or "<no output>"
             return BranchReading(
                 error=(
                     f"git could not read the changed files of {span} in {root} "
@@ -1825,7 +1829,7 @@ def read_branch_changes(*, worktree: "Path | str", base: str) -> BranchReading:
             "diff", "-U0", "--no-color", "--no-renames", f"-G{APPROVAL_MARKER}", span
         )
         if patch.returncode != 0:
-            detail = (patch.stderr or patch.stdout or "").strip() or "<no output>"
+            detail = (patch.stderr or "").strip() or "<no output>"
             return BranchReading(
                 error=(
                     f"git could not read the approval lines of {span} in {root} "

@@ -66,6 +66,9 @@ from functools import partial
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
+from forge import network_git
+from forge.project_git import failure_sentence, open_git, run_git, run_git_async
+
 logger = logging.getLogger(__name__)
 
 __all__ = [
@@ -145,22 +148,20 @@ def is_candidate_tree_path(repo_root: Path | str, candidate: Path | str) -> bool
 def _git(repo_root: Path, *args: str) -> str:
     """Run one git command in ``repo_root`` and return its stdout, trimmed.
 
-    Raises :class:`CandidateTreeError` with git's own words when it fails.
+    Through the one git helper (14 October 2026). Raises
+    :class:`CandidateTreeError` with the helper's fixed sentence when it
+    fails; git's own words are never repeated.
     """
     try:
-        done = subprocess.run(  # noqa: S603 — fixed argv, no shell
-            ["git", *args],
-            cwd=str(repo_root),
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        done = run_git(list(args), cwd=repo_root)
     except OSError as exc:
-        raise CandidateTreeError(f"git could not be run in {repo_root}: {exc}") from exc
+        raise CandidateTreeError(
+            f"git could not be run in {repo_root} ({type(exc).__name__})"
+        ) from exc
     if done.returncode != 0:
-        said = (done.stderr or done.stdout or "").strip().splitlines()
-        last = said[-1] if said else f"exit code {done.returncode}"
-        raise CandidateTreeError(f"git {' '.join(args)} failed: {last}")
+        raise CandidateTreeError(
+            done.stderr or failure_sentence(args[0] if args else "git", done.returncode)
+        )
     return done.stdout.strip()
 
 
@@ -185,27 +186,31 @@ async def git_rev_parse(repo_root: Path | str, ref: str) -> str | None:
 #
 # A new piece of work must start from the commit the project's remote holds,
 # not from whatever the factory's own copy happens to have checked out. This
-# is the one operation that asks: fetch the remote named ``origin``, and say
-# which branch that remote calls its default and which commit that branch is
-# at.
+# is the one operation that asks: fetch the project's remote, and say which
+# branch that remote calls its default and which commit that branch is at.
 #
-# WHY ``git ls-remote --symref origin HEAD`` AND NOT THE OTHER TWO WAYS.
-# ``git symbolic-ref refs/remotes/origin/HEAD`` reads a ref this copy wrote
-# when it was cloned: it answers even when the remote is gone, and it goes on
-# answering the old branch after the remote's default changes, so it cannot
-# tell the truth about the remote. ``git remote show origin`` does ask the
-# remote, but it is porcelain meant for a person to read and its wording is
-# free to change. ``ls-remote --symref`` is plumbing, it asks the remote
-# itself, and it works against a bare repository on a local path exactly as
-# it does against one reached over a network — which is what lets every case
-# here be driven without touching anybody's real repository.
+# THE REMOTE IS THE RECORDED ADDRESS, NEVER THE CLONE'S ORIGIN (Forge git
+# hardening, 14 October 2026). The clone's settings can be written by the
+# project or the model, and plain git obeys an address rewrite, an ssh
+# program, a credential helper or an upload-pack program named there. So the
+# address is the one the factory recorded (``planning.fetch_addresses``), and
+# :mod:`forge.network_git` fetches it into the factory's own copy, with no
+# credential and one transport, then brings the commit into this clone as
+# ``refs/remotes/origin/<branch>`` (the name every reader here uses) and
+# checks it is the same commit.
+#
+# WHY ``ls-remote --symref`` AND NOT ``symbolic-ref refs/remotes/origin/HEAD``.
+# That ref was written when the copy was cloned: it answers even when the
+# remote is gone, and it goes on answering the old branch after the remote's
+# default changes. ``ls-remote --symref`` is plumbing and asks the remote
+# itself.
 #
 # Nothing here knows what the project contains, who hosts the remote, or what
-# the default branch is called. Two facts are used and no others: there is a
-# remote named ``origin``, and that remote says which branch is its default.
+# the default branch is called.
 
-#: The one remote a project's copy is asked about. A copy that has no remote
-#: by this name is refused, not guessed at.
+#: The remote-tracking namespace the starting point is brought into
+#: (``refs/remotes/origin/<branch>``). The clone's own ``origin`` setting is
+#: never read.
 REMOTE_NAME: str = "origin"
 
 #: How long a command that talks to the remote may take.
@@ -338,55 +343,55 @@ def answered_as_ordinary(answer: "FileAtCommit", asked: bool) -> "FileAtCommit":
 
 
 def _git_said(done: "subprocess.CompletedProcess[str]") -> str:
-    """What git said, in one line, for a sentence a person reads.
+    """Why a git command failed, for a sentence a person reads.
 
-    Git says the useful thing FIRST and then advises ("Please make sure you
-    have the correct access rights / and the repository exists"), so the first
-    ``fatal:`` line is taken where there is one — quoting the last line would
-    hand a person the tail of a sentence with no subject.
+    Since 14 October 2026 that is the git helper's fixed sentence ("git
+    ls-tree stopped with exit code 128."): git's own words are discarded,
+    because they can carry the project's text (a file name, a remote's
+    message) into a card, a record or a model's prompt.
     """
-    said = ((done.stderr or "") + "\n" + (done.stdout or "")).strip().splitlines()
-    lines = [line.strip() for line in said if line.strip()]
-    if not lines:
-        return f"exit code {done.returncode}"
-    for line in lines:
-        if line.lower().startswith("fatal:") or line.lower().startswith("error:"):
-            return line
-    return lines[0]
+    return (done.stderr or "").strip() or f"exit code {done.returncode}"
 
 
 def _run_git(
     repo_root: Path, *args: str, timeout: float | None = None
 ) -> "subprocess.CompletedProcess[str]":
-    """One git command, fixed argv, no shell, bounded.
+    """One local git command through the one git helper, bounded.
 
     ``errors="replace"`` because the bytes may come out of a commit the factory
     did not write: a file that is not text is then a sentence a person can read
     rather than an exception nobody catches.
     """
-    return subprocess.run(  # noqa: S603 — fixed argv, no shell
-        ["git", "-C", str(repo_root), *args],
-        capture_output=True,
-        text=True,
+    return run_git(
+        ["-C", str(repo_root), *args],
         errors="replace",
         timeout=REMOTE_TIMEOUT_SECONDS if timeout is None else timeout,
-        check=False,
     )
 
 
 def _fetch_remote_start_point_sync(
-    repo_root: Path, branch: str | None = None
+    repo_root: Path,
+    branch: str | None = None,
+    *,
+    fetch_address: str | None = None,
+    repo: str | None = None,
 ) -> RemoteStartPoint:
-    """The four steps, in order, each one's failure ending it with a sentence.
+    """The starting point, fetched from the project's RECORDED address.
+
+    Since 14 October 2026 (the Forge git hardening design, part 2) this never
+    asks the clone's own ``origin``: the clone's settings can be written by
+    the project or the model, and an address rewrite, an ssh program or a
+    credential helper there would be obeyed. Instead
+    :func:`forge.network_git.fetch_start_point` fetches the address the
+    factory recorded (``planning.fetch_addresses``) into the factory's own
+    copy, with no credential and one transport, then brings the commit into
+    this clone's ``refs/remotes/origin/<branch>`` and checks it is the same
+    commit. A project with no recorded address is refused, with no fallback
+    to the clone's origin.
 
     ``branch`` (4 October 2026) names one more branch to fetch in the same
-    call and answer the commit of, as ``branch_commit``. The remote is asked
-    about it in the same ``ls-remote`` that asks for the default branch, so a
-    branch the remote does not have is said in plain words rather than as a
-    failed fetch; then both are fetched together. Without ``branch`` every git
-    command is exactly the one it always was.
+    call and answer the commit of, as ``branch_commit``.
     """
-    where = str(repo_root)
     wanted = (branch or "").strip() or None
     if wanted is not None and not _REMOTE_BRANCH_PATTERN.match(wanted):
         return RemoteStartPoint(
@@ -396,145 +401,51 @@ def _fetch_remote_start_point_sync(
             )
         )
     try:
-        named = _run_git(repo_root, "remote", "get-url", REMOTE_NAME)
-        if named.returncode != 0:
-            return RemoteStartPoint(
-                refusal=(
-                    f"the copy of this project at {where} has no remote named "
-                    f"'{REMOTE_NAME}', so there is nothing to start the work "
-                    f"from. Add that remote to the copy, then ask again."
-                )
-            )
-
-        asked = _run_git(
-            repo_root,
-            "ls-remote",
-            "--symref",
-            REMOTE_NAME,
-            "HEAD",
-            *([f"refs/heads/{wanted}"] if wanted is not None else []),
-        )
-        if asked.returncode != 0:
-            return RemoteStartPoint(
-                refusal=(
-                    f"the remote named '{REMOTE_NAME}' could not be reached "
-                    f"from {where}, so the work cannot be started from it: "
-                    f"{_git_said(asked)}"
-                )
-            )
-
-        branch: str | None = None
-        for line in (asked.stdout or "").splitlines():
-            stripped = line.strip()
-            if stripped.startswith("ref:"):
-                rest = stripped[len("ref:") :].strip().split()
-                ref = rest[0] if rest else ""
-                if ref.startswith("refs/heads/"):
-                    branch = ref[len("refs/heads/") :]
-                break
-        if not branch or not _REMOTE_BRANCH_PATTERN.match(branch):
-            return RemoteStartPoint(
-                refusal=(
-                    f"the remote named '{REMOTE_NAME}' does not say which "
-                    f"branch is its default, so there is nothing to start the "
-                    f"work from. Set that remote's default branch, then ask "
-                    f"again."
-                )
-            )
-
-        refspecs = [f"+refs/heads/{branch}:refs/remotes/{REMOTE_NAME}/{branch}"]
-        if wanted is not None and wanted != branch:
-            listed = {
-                parts[1]
-                for parts in (
-                    line.split("\t", 1) for line in (asked.stdout or "").splitlines()
-                )
-                if len(parts) == 2
-            }
-            if f"refs/heads/{wanted}" not in listed:
-                return RemoteStartPoint(
-                    refusal=(
-                        f"the remote named '{REMOTE_NAME}' has no branch called "
-                        f"'{wanted}', so there is nothing to build from it. "
-                        f"Push that branch, then ask again."
-                    )
-                )
-            refspecs.append(
-                f"+refs/heads/{wanted}:refs/remotes/{REMOTE_NAME}/{wanted}"
-            )
-
-        fetched = _run_git(
-            repo_root,
-            "fetch",
-            "--no-tags",
-            REMOTE_NAME,
-            *refspecs,
-        )
-        if fetched.returncode != 0:
-            return RemoteStartPoint(
-                refusal=(
-                    f"the branch '{branch}' could not be fetched from the "
-                    f"remote named '{REMOTE_NAME}': {_git_said(fetched)}"
-                )
-            )
-
-        read = _run_git(
-            repo_root,
-            "rev-parse",
-            "--verify",
-            "--quiet",
-            f"refs/remotes/{REMOTE_NAME}/{branch}^{{commit}}",
-        )
-        commit = (read.stdout or "").strip()
-        if read.returncode != 0 or not commit:
-            return RemoteStartPoint(
-                refusal=(
-                    f"the branch '{branch}' was fetched from the remote named "
-                    f"'{REMOTE_NAME}' but git could not say which commit it is "
-                    f"at: {_git_said(read)}"
-                )
-            )
-        if wanted is None:
-            return RemoteStartPoint(branch=branch, commit=commit)
-        if wanted == branch:
-            return RemoteStartPoint(branch=branch, commit=commit, branch_commit=commit)
-        named = _run_git(
-            repo_root,
-            "rev-parse",
-            "--verify",
-            "--quiet",
-            f"refs/remotes/{REMOTE_NAME}/{wanted}^{{commit}}",
-        )
-        named_commit = (named.stdout or "").strip()
-        if named.returncode != 0 or not named_commit:
-            return RemoteStartPoint(
-                refusal=(
-                    f"the branch '{wanted}' was fetched from the remote named "
-                    f"'{REMOTE_NAME}' but git could not say which commit it is "
-                    f"at: {_git_said(named)}"
-                )
-            )
-        return RemoteStartPoint(
-            branch=branch, commit=commit, branch_commit=named_commit
+        start = network_git.fetch_start_point(
+            Path(repo_root),
+            fetch_address,
+            branch=wanted,
+            repo=repo,
+            timeout=REMOTE_TIMEOUT_SECONDS,
         )
     except OSError as exc:
         return RemoteStartPoint(
-            refusal=f"git could not be run in {where}: {type(exc).__name__}: {exc}"
+            refusal=f"git could not be run in {repo_root} ({type(exc).__name__})"
         )
     except subprocess.TimeoutExpired:
         return RemoteStartPoint(
             refusal=(
-                f"the remote named '{REMOTE_NAME}' did not answer within "
+                f"the project's recorded address did not answer within "
                 f"{REMOTE_TIMEOUT_SECONDS:.0f} seconds, so the work cannot be "
                 f"started from it"
             )
         )
+    if start.refusal or not start.branch or not start.commit:
+        return RemoteStartPoint(
+            refusal=start.refusal or "the starting point could not be read"
+        )
+    if wanted is None:
+        return RemoteStartPoint(branch=start.branch, commit=start.commit)
+    return RemoteStartPoint(
+        branch=start.branch,
+        commit=start.commit,
+        branch_commit=start.branch_commit or start.commit,
+    )
 
 
 async def fetch_remote_start_point(
-    repo_root: Path | str, branch: str | None = None
+    repo_root: Path | str,
+    branch: str | None = None,
+    *,
+    fetch_address: str | None = None,
+    repo: str | None = None,
 ) -> RemoteStartPoint:
-    """Fetch ``origin``'s default branch and say which commit it is at.
+    """Fetch the project's default branch and say which commit it is at.
+
+    ``fetch_address`` is the project's recorded address
+    (``planning.fetch_addresses``); without one the answer is a refusal that
+    names that setting. ``repo`` is the project's ``org/name``, for the
+    sentence.
 
     Never raises: everything that can go wrong comes back as ``refusal`` with
     one plain sentence in it. Nothing this does changes the branch the copy
@@ -543,7 +454,13 @@ async def fetch_remote_start_point(
     branch, whose commit then comes back as ``branch_commit``).
     """
     return await asyncio.to_thread(
-        _fetch_remote_start_point_sync, Path(repo_root), branch
+        partial(
+            _fetch_remote_start_point_sync,
+            Path(repo_root),
+            branch,
+            fetch_address=fetch_address,
+            repo=repo,
+        )
     )
 
 
@@ -749,18 +666,16 @@ def _read_raw_at_commit_sync(
                 f"{MAX_FILE_AT_COMMIT_BYTES} this factory will read"
             )
         )
-    shown = subprocess.run(  # noqa: S603 — fixed argv, no shell
-        ["git", "-C", str(repo_root), "cat-file", "blob", oid],
-        capture_output=True,
+    shown = run_git(
+        ["-C", str(repo_root), "cat-file", "blob", oid],
+        text=False,
         timeout=READ_AT_COMMIT_TIMEOUT_SECONDS,
-        check=False,
     )
     if shown.returncode != 0:
-        said = (shown.stderr or b"").decode("utf-8", "replace").strip()
         return FileAtCommit(
             refusal=(
                 f"{file_path} could not be read at {commit} in {where}: "
-                f"{said or f'exit code {shown.returncode}'}"
+                f"{failure_sentence('cat-file', shown.returncode)}"
             )
         )
     try:
@@ -992,17 +907,19 @@ def _materialise_sync(repo_root: Path, dest: Path, sha: str) -> None:
 
 
 def _extract_archive_into(repo_root: Path, dest: Path, sha: str) -> None:
-    """Stream ``git archive <sha>`` into ``dest``; raise with git's own words."""
+    """Stream ``git archive <sha>`` into ``dest``; raise with a fixed sentence.
+
+    Through the one git helper's streaming reader (14 October 2026): a
+    project's smudge filter is switched off, and git's own words are never
+    repeated.
+    """
     try:
-        proc = subprocess.Popen(  # noqa: S603 — fixed argv, no shell
-            ["git", "archive", "--format=tar", sha],
-            cwd=str(repo_root),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
+        proc = open_git(["archive", "--format=tar", sha], cwd=repo_root)
     except OSError as exc:
-        raise CandidateTreeError(f"git could not be run in {repo_root}: {exc}") from exc
-    assert proc.stdout is not None and proc.stderr is not None
+        raise CandidateTreeError(
+            f"git archive could not be run in {repo_root}: {exc}"
+        ) from exc
+    assert proc.stdout is not None
     extract_error: Exception | None = None
     try:
         with tarfile.open(fileobj=proc.stdout, mode="r|") as archive:
@@ -1011,12 +928,11 @@ def _extract_archive_into(repo_root: Path, dest: Path, sha: str) -> None:
         extract_error = exc
     finally:
         proc.stdout.close()
-        stderr = proc.stderr.read().decode("utf-8", errors="replace").strip()
-        proc.stderr.close()
         returncode = proc.wait()
     if returncode != 0:
-        last = stderr.splitlines()[-1] if stderr else f"exit code {returncode}"
-        raise CandidateTreeError(f"git archive {sha} failed: {last}")
+        raise CandidateTreeError(
+            f"git archive {sha} failed: {failure_sentence('archive', returncode)}"
+        )
     if extract_error is not None:
         raise CandidateTreeError(
             f"the archive of {sha} could not be extracted into {dest}: {extract_error}"
@@ -1107,19 +1023,8 @@ async def git_is_ancestor(
     root = Path(repo_root)
     args = ("merge-base", "--is-ancestor", str(ancestor), str(descendant))
     try:
-        # The whole command written inline (14 October 2026), so the launch
-        # guard can see it is git and nothing else.
-        proc = await asyncio.create_subprocess_exec(
-            "git",
-            "merge-base",
-            "--is-ancestor",
-            str(ancestor),
-            str(descendant),
-            cwd=str(root),
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        await proc.communicate()
+        # Through the one git helper (14 October 2026).
+        proc = await run_git_async(list(args), cwd=root)
     except Exception as exc:  # noqa: BLE001 — best-effort probe, honest None
         logger.warning(
             "candidate tree: git %s could not be run in %s (%s)",
@@ -1275,8 +1180,18 @@ class InContainerCandidateGit:
     operator gives one a sandbox — so nothing about such a press changes.
     """
 
-    def __init__(self, repo_root: Path | str) -> None:
+    def __init__(
+        self,
+        repo_root: Path | str,
+        *,
+        fetch_address: str | None = None,
+        repo: str | None = None,
+    ) -> None:
         self._repo_root = Path(repo_root)
+        # The project's recorded fetch address (planning.fetch_addresses) and
+        # its org/name; the starting point is fetched from that address only.
+        self._fetch_address = fetch_address
+        self._repo = repo
 
     @property
     def repo_root(self) -> Path:
@@ -1293,7 +1208,9 @@ class InContainerCandidateGit:
     async def fetch_remote_start_point(
         self, branch: str | None = None
     ) -> RemoteStartPoint:
-        return await fetch_remote_start_point(self._repo_root, branch)
+        return await fetch_remote_start_point(
+            self._repo_root, branch, fetch_address=self._fetch_address, repo=self._repo
+        )
 
     async def is_ancestor(self, ancestor: str, descendant: str) -> bool | None:
         return await git_is_ancestor(self._repo_root, ancestor, descendant)

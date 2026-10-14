@@ -12,13 +12,17 @@ What they hold down:
   factory's own copy of the project has its own branch three commits away;
 * the commit and the branch name are written down on the planning run;
 * a project with no remote, or a remote that cannot be reached, is refused in
-  plain words and nothing is started;
+  plain words and nothing is started. Since 14 October 2026 the remote is the
+  address the coordinator records for the project
+  (``planning.fetch_addresses``), never the copy's own ``origin``: a project
+  with none recorded is refused with the sentence that names that setting;
 * a run that already has a starting point recorded keeps it — the target
   branch is decided once.
 """
 
 from __future__ import annotations
 
+import re
 import sqlite3
 import subprocess
 from datetime import datetime, timezone
@@ -34,6 +38,8 @@ from forge.planning.driver import PlanningDriverDeps, PlanningRunDriver
 from forge.planning.gate_adapters import build_planning_gate_adapters
 from forge.planning.run_store import SqlitePlanningRunStore
 from forge.planning.states import PlanningState
+from forge.network_git import no_fetch_address_sentence
+from tests.forge.recorded_fetch_address import allow_local_remotes, origin_of
 
 CID = "start-run-0001"
 REPO_KEY = "guardkit/api_test"
@@ -118,6 +124,33 @@ def diverge_the_copy(copy: Path, commits: int = 3) -> str:
     return _git(copy, "rev-parse", "HEAD")
 
 
+def _recorded(copy: Path, fetch_address: str | None = None) -> dict[str, Any]:
+    """The coordinator's record of this project: where its copy is, and the
+    address its starting point is fetched from. By default that is the
+    stand-in remote the test gave the copy; a copy given no remote has no
+    address recorded."""
+    if fetch_address is None:
+        has_remote = subprocess.run(
+            ["git", "-C", str(copy), "remote", "get-url", "origin"],
+            capture_output=True,
+            text=True,
+        )
+        if has_remote.returncode == 0:
+            fetch_address = origin_of(copy)
+    return {
+        "target_repo_paths": {REPO_KEY: str(copy)},
+        "fetch_addresses": {REPO_KEY: fetch_address} if fetch_address else {},
+    }
+
+
+@pytest.fixture(autouse=True)
+def _local_remotes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The stand-in remote is a bare repository in ``tmp_path``: let a local
+    folder be a recorded fetch address, and keep the factory's own fetch
+    copies inside ``tmp_path`` (Forge git hardening, 14 October 2026)."""
+    allow_local_remotes(monkeypatch, tmp_path / "factory-fetch-copies")
+
+
 @pytest.fixture
 def store(tmp_path: Path) -> SqlitePlanningRunStore:
     connection = sqlite3.connect(str(tmp_path / "start.db"))
@@ -142,6 +175,7 @@ def _make_driver(
     repo_path: Path,
     worktrees_root: Path,
     git_runner: Any | None = None,
+    fetch_address: str | None = None,
 ) -> _Harness:
     clock = lambda: datetime.now(timezone.utc)  # noqa: E731
     repository, state_machine = build_planning_gate_adapters(store, clock=clock)
@@ -158,7 +192,7 @@ def _make_driver(
         escalation_approver="U-ESC",
         originator_wait_seconds=300,
         escalated_wait_seconds=1800,
-        target_repo_paths={REPO_KEY: str(repo_path)},
+        **_recorded(repo_path, fetch_address),
         target_terminal={"enabled": True},
     )
     driver = PlanningRunDriver(
@@ -170,7 +204,10 @@ def _make_driver(
             subscriber_factory=lambda expected_approver, armed: object(),
             dispatch_product_owner=dispatch_po,
             second_opinion_provider=object(),
-            git_runner=git_runner or WorktreeGitRunner(worktrees_root=worktrees_root),
+            git_runner=git_runner
+            or WorktreeGitRunner(
+                worktrees_root=worktrees_root, **_recorded(repo_path, fetch_address)
+            ),
             planning_config=config,
             clock=clock,
             publish_notification=publish_notification,
@@ -321,16 +358,17 @@ async def test_a_project_with_no_remote_is_refused_and_nothing_is_started(
 
     run = store.get_run(CID)
     assert run["state"] == PlanningState.FAILED.value
-    assert run["error"] == (
-        f"the copy of this project at {alone} has no remote named 'origin', "
-        f"so there is nothing to start the work from. Add that remote to the "
-        f"copy, then ask again."
+    # No address is recorded for the project: refused with the sentence that
+    # names the setting to record it in.
+    assert run["error"] == no_fetch_address_sentence(REPO_KEY)
+    assert run["error"].startswith(
+        f"No fetch address is recorded for {REPO_KEY}, so the factory will not "
+        "fetch its starting point."
     )
+    assert "planning.fetch_addresses" in run["error"]
     assert h.errors == [
         f"Planning run {CID} stopped at starting the machine chain: "
-        f"the copy of this project at {alone} has no remote named 'origin', "
-        f"so there is nothing to start the work from. Add that remote to the "
-        f"copy, then ask again."
+        + no_fetch_address_sentence(REPO_KEY)
     ]
     # Nothing was cut and nothing was recorded.
     branches = _git(alone, "for-each-ref", "--format=%(refname)", "refs/heads")
@@ -342,23 +380,35 @@ async def test_a_project_with_no_remote_is_refused_and_nothing_is_started(
 async def test_a_remote_that_cannot_be_reached_is_refused_in_plain_words(
     store: SqlitePlanningRunStore, tmp_path: Path
 ) -> None:
+    # The recorded address leads nowhere. The copy's own origin still names
+    # the stand-in remote, which is never asked in its place.
     remote, copy = make_remote_and_copy(tmp_path)
-    _git(copy, "remote", "set-url", "origin", str(tmp_path / "not-here.git"))
-    h = _make_driver(store, repo_path=copy, worktrees_root=tmp_path / "wt")
+    h = _make_driver(
+        store,
+        repo_path=copy,
+        worktrees_root=tmp_path / "wt",
+        fetch_address=str(tmp_path / "not-here.git"),
+    )
     row = _queue_running(store)
 
     assert await h.driver._enter_target_terminal(row, CID) is False
 
     run = store.get_run(CID)
     assert run["state"] == PlanningState.FAILED.value
-    assert run["error"].startswith(
-        f"the remote named 'origin' could not be reached from {copy}, so the "
-        f"work cannot be started from it: "
-    )
+    assert re.fullmatch(
+        r"The project's recorded fetch address could not be reached, so the "
+        r"work cannot be started from it: git ls-remote stopped with exit "
+        r"code -?\d+\.",
+        run["error"],
+    ), run["error"]
+    assert "fatal" not in run["error"]
     assert h.errors and h.errors[0].startswith(
-        f"Planning run {CID} stopped at starting the machine chain: the "
-        f"remote named 'origin' could not be reached"
+        f"Planning run {CID} stopped at starting the machine chain: The "
+        f"project's recorded fetch address could not be reached"
     )
+    branches = _git(copy, "for-each-ref", "--format=%(refname)", "refs/heads")
+    assert f"planning/{CID}" not in branches
+    assert store.get_start_point(CID) == (None, None)
 
 
 @pytest.mark.asyncio
@@ -397,7 +447,7 @@ async def test_the_remote_is_asked_before_anything_is_written(
     """The order, pinned: the fetch happens first, and its commit is what the
     write is given."""
     _remote, copy = make_remote_and_copy(tmp_path)
-    real = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    real = WorktreeGitRunner(worktrees_root=tmp_path / "wt", **_recorded(copy))
     order: list[str] = []
 
     class _Watching:

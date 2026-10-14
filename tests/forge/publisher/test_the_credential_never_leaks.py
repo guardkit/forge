@@ -123,9 +123,13 @@ class TestTheProgramGitAsksThrough:
         assert all(THE_MADE_UP_CREDENTIAL not in value for value in given.values())
         assert given["GIT_ASKPASS"].endswith("ask-for-the-credential")
         assert given["GIT_TERMINAL_PROMPT"] == "0"
-        # HOME is the publisher's own folder, so git reads no person's
-        # configuration and finds no person's stored credentials.
+        # HOME is the folder handed in, which the publisher makes FRESH AND
+        # EMPTY for each command (14 October 2026), so git reads no person's
+        # configuration and finds no stored credentials; no system or
+        # personal settings file is read at all.
         assert given["HOME"] == str(tmp_path / "state")
+        assert given["GIT_CONFIG_GLOBAL"] == "/dev/null"
+        assert given["GIT_CONFIG_NOSYSTEM"] == "1"
 
     def test_it_is_built_from_nothing_not_copied_from_this_process(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -136,14 +140,23 @@ class TestTheProgramGitAsksThrough:
             None, state_dir=tmp_path / "state", home=tmp_path / "state"
         )
         assert "SOMETHING_ELSE_ENTIRELY" not in given
+        # The isolated network environment (14 October 2026): a fixed PATH,
+        # a fresh home, no settings files, one transport, no askpass but the
+        # factory's own.
         assert set(given) <= {
             "PATH",
             "HOME",
+            "XDG_CONFIG_HOME",
             "GIT_TERMINAL_PROMPT",
             "GIT_CONFIG_NOSYSTEM",
+            "GIT_CONFIG_GLOBAL",
             "LC_ALL",
             "GIT_ASKPASS",
+            "SSH_ASKPASS",
+            "GIT_NO_LAZY_FETCH",
+            "GIT_ALLOW_PROTOCOL",
         }
+        assert given["PATH"].endswith(":/usr/bin:/bin")
 
 
 class TestItIsWrittenOnceAndNotOncePerGitCommand:
@@ -248,15 +261,17 @@ class TestAWholePublishLeaksNothing:
             what_every_child_was_given.append(dict(kwargs.get("env") or {}))
             return real_run(argv, **kwargs)
 
-        import forge.publisher.git_work as git_work
+        # Every publisher git command starts at the network boundary
+        # (14 October 2026).
+        import forge.network_git as network_git
 
-        original = git_work.subprocess.run
-        git_work.subprocess.run = watch  # type: ignore[assignment]
+        original = network_git.subprocess.run
+        network_git.subprocess.run = watch  # type: ignore[assignment]
         try:
             publisher = Publisher(settings)
             answer = publisher.publish(a_request(project))
         finally:
-            git_work.subprocess.run = original  # type: ignore[assignment]
+            network_git.subprocess.run = original  # type: ignore[assignment]
 
         assert answer.published is True
         assert what_the_remote_has(project["bare"]) == project["j"]
@@ -343,9 +358,10 @@ class TestAWholePublishLeaksNothing:
             for line in source.splitlines()
             if "os.environ" in line and not line.strip().startswith("#")
         ]
-        # The only environment read anywhere in the module is PATH, for the
-        # child's own environment — never a credential.
-        assert reads == ['"PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),']
+        # No environment is read anywhere in the module (14 October 2026: the
+        # child's PATH is now the network boundary's fixed one) — and never a
+        # credential.
+        assert reads == []
         assert os.environ is not None  # the module under test, not this one
 
 
@@ -417,7 +433,9 @@ class TestNoAddressIsEverWrittenDown:
         assert answer.published is False
         assert answer.refusal_kind == "the-remote-could-not-be-read"
         assert THE_PLANTED_STRING not in str(answer.refusal)
-        assert THE_ADDRESS_IS_NOT_WRITTEN_DOWN in str(answer.refusal)
+        # Since 14 October 2026 git's own words are never kept at all: the
+        # refusal is a fixed sentence (which step, git's exit code).
+        assert "git fetch stopped with exit code" in str(answer.refusal)
 
     def test_the_source_address_is_not_in_a_refusal_either(
         self, tmp_path: Path
@@ -435,7 +453,9 @@ class TestNoAddressIsEverWrittenDown:
         assert answer.published is False
         assert answer.refusal_kind == "the-joined-commit-is-not-there"
         assert THE_PLANTED_STRING not in str(answer.refusal)
-        assert THE_ADDRESS_IS_NOT_WRITTEN_DOWN in str(answer.refusal)
+        # Since 14 October 2026 git's own words are never kept at all: the
+        # refusal is a fixed sentence (which step, git's exit code).
+        assert "git fetch stopped with exit code" in str(answer.refusal)
 
 
 # ---------------------------------------------------------------------------
@@ -712,9 +732,9 @@ class TestTwoRoutesLeakNothing:
             what_every_child_was_given.append(dict(kwargs.get("env") or {}))
             return real_run(argv, **kwargs)
 
-        import forge.publisher.git_work as git_work
+        import forge.network_git as network_git
 
-        monkeypatch.setattr(git_work.subprocess, "run", watch)
+        monkeypatch.setattr(network_git.subprocess, "run", watch)
         publisher = Publisher(settings)
         answers = [
             publisher.publish(_request_for(setup, name)) for name in sorted(setup["worlds"])

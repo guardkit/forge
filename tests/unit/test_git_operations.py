@@ -39,7 +39,6 @@ from forge.build.git_operations import (
     commit_changes,
     create_branch,
     create_pull_request,
-    push_branch,
 )
 
 # ---------------------------------------------------------------------------
@@ -176,18 +175,6 @@ class TestExecuteSeamRouting:
         ]
         for call in fake_seam.calls:
             assert call["cwd"] == str(WORKTREE)
-
-    @pytest.mark.asyncio
-    async def test_push_branch_uses_set_upstream(self, fake_seam: FakeExecute) -> None:
-        await push_branch(WORKTREE, "feat/branch")
-        assert fake_seam.calls[0]["command"] == [
-            "git",
-            "push",
-            "-u",
-            "origin",
-            "feat/branch",
-        ]
-        assert fake_seam.calls[0]["cwd"] == str(WORKTREE)
 
     @pytest.mark.asyncio
     async def test_create_pull_request_invokes_gh(
@@ -393,7 +380,7 @@ class TestPullRequestUrlParsing:
 class TestAwaitable:
     @pytest.mark.parametrize(
         "fn",
-        [create_branch, commit_changes, push_branch, create_pull_request],
+        [create_branch, commit_changes, create_pull_request],
     )
     def test_function_is_coroutine_function(self, fn: Any) -> None:
         assert inspect.iscoroutinefunction(fn), (
@@ -427,15 +414,6 @@ class TestFailureSurfacing:
         fake_seam.stderr = "nothing to commit\n"
         with pytest.raises(RuntimeError, match="git"):
             await commit_changes(WORKTREE, "msg")
-
-    @pytest.mark.asyncio
-    async def test_push_failure_raises_runtime_error(
-        self, fake_seam: FakeExecute
-    ) -> None:
-        fake_seam.exit_code = 1
-        fake_seam.stderr = "remote rejected\n"
-        with pytest.raises(RuntimeError, match="git push"):
-            await push_branch(WORKTREE, "x")
 
     @pytest.mark.asyncio
     async def test_create_pr_genuine_failure_raises(

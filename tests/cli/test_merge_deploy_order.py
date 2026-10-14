@@ -33,6 +33,7 @@ from forge.config.models import ForgeConfig
 from forge.lifecycle import migrations
 from forge.lifecycle.persistence import SqliteLifecyclePersistence
 from forge.pipeline import merge_offer as merge_offer_module
+from tests.forge.recorded_fetch_address import allow_local_remotes, origin_of
 
 FEATURE_ID = "FEAT-ORD1"
 BUILD_ID = "build-FEAT-ORD1-20260907"
@@ -53,6 +54,14 @@ def _receipts_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     root = tmp_path / "receipts"
     monkeypatch.setenv("FORGE_RECEIPTS_DIR", str(root))
     return root
+
+
+@pytest.fixture(autouse=True)
+def _remotes_on_disk(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every "remote" here is a bare repository on disk: allow a local folder
+    as a fetch address. Each configuration records the folder its project's
+    clone was given as the project's fetch address."""
+    allow_local_remotes(monkeypatch, tmp_path / "factory-fetch-copies")
 
 
 def _bare_remote_for(root: Path, tmp_path: Path, name: str = "origin.git") -> Path:
@@ -121,7 +130,10 @@ def config(repo_root: Path) -> ForgeConfig:
     return ForgeConfig.model_validate(
         {
             "permissions": {"filesystem": {"allowlist": ["/tmp"]}},
-            "planning": {"target_repo_paths": {REPO: str(repo_root)}},
+            "planning": {
+                "target_repo_paths": {REPO: str(repo_root)},
+                "fetch_addresses": {REPO: origin_of(repo_root)},
+            },
             "approval": {"expected_approver": "rich"},
         }
     )
@@ -442,6 +454,7 @@ def test_the_attended_command_presses_a_sandboxed_repository_in_its_sandbox(
             "permissions": {"filesystem": {"allowlist": ["/tmp"]}},
             "planning": {
                 "target_repo_paths": {SANDBOX_REPO: str(on_this_side)},
+                "fetch_addresses": {SANDBOX_REPO: origin_of(sandbox_clone)},
                 "sandboxes": {
                     SANDBOX_REPO: {
                         "name": "api-test-factory",

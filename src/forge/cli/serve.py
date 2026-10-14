@@ -471,7 +471,12 @@ def compose_merge_git_surface(forge_config: Any) -> Any | None:
             return None
         if repo not in per_repo:
             per_repo[repo] = SidecarCandidateGit(
-                str(entry.sidecar_url), repo=str(repo)
+                str(entry.sidecar_url),
+                repo=str(repo),
+                # The project's recorded fetch address (14 October 2026).
+                fetch_address=(
+                    getattr(forge_config.planning, "fetch_addresses", {}) or {}
+                ).get(str(repo)),
             )
             logger.info(
                 "forge-serve: %s has a sandbox (%s), so the merge word's own "

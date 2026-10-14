@@ -43,6 +43,7 @@ from forge.deploy_sidecar.service import build_server
 from forge.lifecycle import migrations
 from forge.lifecycle.persistence import SqliteLifecyclePersistence
 from forge.pipeline.merge_executor import MergeExecutorDeps, execute_merge_deploy
+from tests.forge.recorded_fetch_address import allow_local_remotes, origin_of
 
 REPO = "guardkit/api_test"
 REPO_WITHOUT = "guardkit/plain"
@@ -169,6 +170,7 @@ class _RecordingAsyncio:
 
 @pytest.fixture
 def git_calls(monkeypatch: pytest.MonkeyPatch) -> _GitCalls:
+    from forge import network_git, project_git
     from forge.deploy import candidate_tree
     from forge.pipeline import merge_offer
 
@@ -176,12 +178,25 @@ def git_calls(monkeypatch: pytest.MonkeyPatch) -> _GitCalls:
     monkeypatch.setattr(candidate_tree, "subprocess", _RecordingSubprocess(calls))
     monkeypatch.setattr(candidate_tree, "asyncio", _RecordingAsyncio(calls))
     monkeypatch.setattr(merge_offer, "asyncio", _RecordingAsyncio(calls))
+    # Since 14 October 2026 every git command goes through Forge's one way of
+    # running git, and every fetch through its one way of reaching a remote,
+    # so those are watched too: the press's git is started there now.
+    monkeypatch.setattr(project_git, "subprocess", _RecordingSubprocess(calls))
+    monkeypatch.setattr(network_git, "subprocess", _RecordingSubprocess(calls))
     return calls
 
 
 # ---------------------------------------------------------------------------
 # The estate: a clone in the sandbox, a real sidecar, and nothing on this side
 # ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _remotes_on_disk(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every "remote" here is a bare repository on disk: allow a local folder
+    as a fetch address. Each configuration records the folder its project's
+    clone was given, as ``forge register-repo`` records the https address."""
+    allow_local_remotes(monkeypatch, tmp_path / "factory-fetch-copies")
 
 
 @pytest.fixture
@@ -227,7 +242,9 @@ def sidecar(clone: Path, plain_checkout: Path, monkeypatch: pytest.MonkeyPatch):
 
 
 @pytest.fixture
-def config(sidecar: str, on_this_side: Path, plain_checkout: Path) -> ForgeConfig:
+def config(
+    sidecar: str, clone: Path, on_this_side: Path, plain_checkout: Path
+) -> ForgeConfig:
     """forge-prod's own settings: the sandboxed repository names its sandbox."""
     return ForgeConfig.model_validate(
         {
@@ -236,6 +253,10 @@ def config(sidecar: str, on_this_side: Path, plain_checkout: Path) -> ForgeConfi
                 "target_repo_paths": {
                     REPO: str(on_this_side),
                     REPO_WITHOUT: str(plain_checkout),
+                },
+                "fetch_addresses": {
+                    REPO: origin_of(clone),
+                    REPO_WITHOUT: origin_of(plain_checkout),
                 },
                 "sandboxes": {
                     REPO: {
@@ -1132,12 +1153,13 @@ class TestEveryDeployLegRunsTheStepsOfItsOwnCommit:
         return old, started_at
 
     @staticmethod
-    def _config(helper_url: str, on_this_side: Path) -> ForgeConfig:
+    def _config(helper_url: str, on_this_side: Path, clone: Path) -> ForgeConfig:
         return ForgeConfig.model_validate(
             {
                 "permissions": {"filesystem": {"allowlist": ["/tmp"]}},
                 "planning": {
                     "target_repo_paths": {REPO: str(on_this_side)},
+                    "fetch_addresses": {REPO: origin_of(clone)},
                     "sandboxes": {
                         REPO: {
                             "name": "api-test-factory",
@@ -1286,7 +1308,7 @@ class TestEveryDeployLegRunsTheStepsOfItsOwnCommit:
 
         log = tmp_path / "which-steps-ran.log"
         old, started_at = self._a_clone_left_behind(clone, log)
-        config = self._config(a_helper_that_deploys[0], on_this_side)
+        config = self._config(a_helper_that_deploys[0], on_this_side, clone)
         # The coordinator's own path for the repository holds nothing.
         assert not on_this_side.exists()
 
@@ -1350,7 +1372,7 @@ class TestEveryDeployLegRunsTheStepsOfItsOwnCommit:
         log = tmp_path / "which-steps-ran.log"
         _, started_at = self._a_clone_left_behind(clone, log)
         helper_url, owner = a_helper_that_deploys
-        config = self._config(helper_url, on_this_side)
+        config = self._config(helper_url, on_this_side, clone)
         # Another build holds the target, so the first press publishes and
         # deploys nothing.
         lock = DeploymentLockStore(pool.connection)
@@ -1433,7 +1455,7 @@ class TestEveryDeployLegRunsTheStepsOfItsOwnCommit:
 
         log = tmp_path / "which-steps-ran.log"
         _, started_at = self._a_clone_left_behind(clone, log)
-        config = self._config(a_helper_that_deploys[0], on_this_side)
+        config = self._config(a_helper_that_deploys[0], on_this_side, clone)
         # The first press publishes and deploys nothing: the target is held.
         lock = DeploymentLockStore(pool.connection)
         target = f"{REPO}::live"
@@ -1491,7 +1513,7 @@ class TestEveryDeployLegRunsTheStepsOfItsOwnCommit:
 
         log = tmp_path / "which-steps-ran.log"
         _, started_at = self._a_clone_left_behind(clone, log)
-        config = self._config(a_helper_that_deploys[0], on_this_side)
+        config = self._config(a_helper_that_deploys[0], on_this_side, clone)
         lock = DeploymentLockStore(pool.connection)
         target = f"{REPO}::live"
         held = lock.grant(
@@ -1562,7 +1584,7 @@ class TestEveryDeployLegRunsTheStepsOfItsOwnCommit:
         _, started_at = self._a_clone_left_behind(
             clone, log, deploy=a_teardown_that_fails
         )
-        config = self._config(a_helper_that_deploys[0], on_this_side)
+        config = self._config(a_helper_that_deploys[0], on_this_side, clone)
         bare = _git(clone, "remote", "get-url", "origin")
         asked = self._the_clone_can_no_longer_lay_a_tree_out(monkeypatch, after=1)
 

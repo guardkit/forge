@@ -541,4 +541,38 @@ COMPOSE_IN_IMAGE="$(docker run --rm --network none --entrypoint docker "${IMAGE}
 }
 echo "  OK  compose     the compose plugin answers in the image (${COMPOSE_IN_IMAGE}), for a project's own suite or deploy"
 
+# --- the git rules: Forge's copy matches GuardKit's (14 October 2026) --------
+# Forge runs every local git command through forge.project_git, a copy of
+# GuardKit's guardkit.lib.project_git (Forge does not import GuardKit as a
+# library). Forge's own tests compare its copy with a pinned copy of GuardKit's;
+# this image is the one place both packages are installed, so here the two are
+# compared live, and a release whose two copies differ does not ship. Forge's
+# own additions (FORGE_COMMAND_OPTIONS, FORGE_REFUSED_OPTIONS, CALLER_SETTINGS)
+# are separate constants and are not compared.
+read -r -d '' GIT_RULES_PROG <<'PY' || true
+from forge import project_git as forge_rules
+from guardkit.lib import project_git as guardkit_rules
+
+NAMES = (
+    "BASE_SETTINGS", "REBASE_SETTINGS", "FIXED_SETTINGS", "FIXED_ENVIRONMENT",
+    "IDENTITY_ENVIRONMENT_NAMES", "KEPT_ENVIRONMENT_NAMES", "CALLER_ENVIRONMENT_NAMES",
+    "NETWORK_COMMANDS", "NETWORK_REMOTE_COMMANDS", "COMMAND_OPTIONS", "REBASE_OPTIONS",
+    "WRITE_COMMANDS", "MERGE_PROGRAM", "NETWORK_REFUSAL", "SUBMODULE_REFUSAL",
+    "REBASE_REFUSAL", "WORKTREE_REFUSAL", "SETTINGS_REFUSAL", "UNSAFE_NAME_REFUSAL",
+    "REFUSED_EXIT_CODE",
+)
+different = [
+    name for name in NAMES
+    if getattr(forge_rules, name, None) != getattr(guardkit_rules, name, object())
+]
+if different:
+    raise SystemExit(
+        "Forge's git rules differ from GuardKit's in: " + ", ".join(different)
+        + ". Bring src/forge/project_git.py into step with guardkit/lib/project_git.py "
+        "(and the pinned copy in tests/forge/git/guardkit_project_git.json)."
+    )
+print(f"  OK  git rules   forge.project_git matches guardkit.lib.project_git ({len(NAMES)} constants)")
+PY
+docker run --rm --network none --entrypoint python "${IMAGE}" -c "${GIT_RULES_PROG}"
+
 echo "forge oracle verification PASSED for ${IMAGE}"

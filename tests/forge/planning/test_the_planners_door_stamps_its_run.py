@@ -49,6 +49,7 @@ from forge.lifecycle import migrations
 from forge.planning.run_store import SqlitePlanningRunStore
 from forge.planning.sidecar_git_runner import SidecarGitRunner
 from forge.record_answer.service import ANSWER_ROUTE, serve
+from tests.forge.recorded_fetch_address import local_remotes  # noqa: F401
 
 #: A repository, a planning run and a declared name that exist nowhere but here.
 REPO = "acme/widget-shop"
@@ -385,12 +386,13 @@ async def test_a_write_that_names_nothing_declared_is_served_with_nobody_to_ask(
 
 @pytest.mark.asyncio
 async def test_the_driver_reads_the_run_and_its_start_point_off_the_record(
-    tmp_path: Path,
+    tmp_path: Path, local_remotes: Path
 ) -> None:
     """The driver's own read, driven through the real first git step.
 
-    ``_enter_target_terminal`` is the step that fetches the project's remote and
-    writes the starting commit onto the run. What the write legs then hand the
+    ``_enter_target_terminal`` is the step that fetches the project's remote
+    (the stand-in remote in ``tmp_path``, recorded as the project's fetch
+    address) and writes the starting commit onto the run. What the write legs then hand the
     door is read back off that same run: the run's own id, and that commit.
     """
     from tests.forge.planning.test_memory_name_at_the_door import (

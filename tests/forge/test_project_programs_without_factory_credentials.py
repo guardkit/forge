@@ -1847,10 +1847,15 @@ _ANY_RECEIVER_LAUNCHES = {
 #: (under ``src/forge``) and the function the launch is written in.
 ALLOWED: dict[tuple[str, str], str] = {
     ("adapters/gh/operations.py", "_execute"): "runs gh, the factory's own GitHub client",
-    ("adapters/git/operations.py", "_default_execute"): "runs git commands the git adapter composes",
     ("adapters/guardkit/run.py", "_execute_subprocess"): "starts GuardKit with the factory's launch list",
-    ("build/git_operations.py", "_execute_via_deepagents"): "generic runner; every call to it is checked below",
-    ("build/git_operations.py", "_run_via_execute"): "git and gh, the factory's own programs, with its own environment",
+    ("build/git_operations.py", "_execute_via_deepagents"): (
+        "generic runner for gh and pytest (git goes to forge.project_git); every "
+        "call to it is checked below"
+    ),
+    ("build/git_operations.py", "_run_via_execute"): (
+        "gh with the factory's own environment; git with none (the git helper "
+        "builds its own)"
+    ),
     ("build/test_verification.py", "_execute_via_deepagents"): (
         "a pass-through seam onto the git operations' runner; it is a generic "
         "runner itself, so every call to it (verify_tests) is checked"
@@ -1858,8 +1863,13 @@ ALLOWED: dict[tuple[str, str], str] = {
     ("build_processes.py", "_engine_ids"): "the container engine, called through a variable",
     ("build_processes.py", "_remove_networks_and_volumes"): "the container engine, called through a variable",
     ("build_processes.py", "remove_fixture_containers"): "the container engine, run in a worker thread",
-    ("cli/register_repo.py", "_run_command"): "the operator's register command: git, docker and sbx",
-    ("deploy/review_preview.py", "_run_command"): "git and the container engine for the preview's tree",
+    ("cli/register_repo.py", "_run_command"): (
+        "the operator's register command: docker and sbx, and git only as "
+        "command lines forge.network_git builds whole (env -i, no settings files)"
+    ),
+    ("deploy/review_preview.py", "_run_command"): (
+        "the container engine for the preview's tree (git goes to forge.project_git)"
+    ),
     ("deploy_sidecar/deploy_executor.py", "_default_spawn"): "generic runner; every call to it is checked below",
     ("deploy_sidecar/deploy_executor.py", "_start"): (
         "the owned deploy: its additions are the request's ENV_FILE, identity "
@@ -1868,17 +1878,25 @@ ALLOWED: dict[tuple[str, str], str] = {
     ),
     ("deploy_sidecar/service.py", "_start_and_collect"): "generic runner; every call to it is checked below",
     ("deploy_sidecar/service.py", "run_merge_command"): "starts GuardKit (merge, legs, checks) with the factory's launch list",
-    ("deploy_sidecar/service.py", "blob"): "git cat-file, the argument list from _git_argv",
-    ("deploy_sidecar/service.py", "opened"): "git cat-file, the argument list from _git_argv",
-    ("pipeline/routing_stamps.py", "read_last_code_commit_time"): "git log, from a literal git list",
+    ("network_git.py", "run_network_git"): (
+        "the network boundary's one git launch: an environment built from "
+        "nothing (forge.network_git.isolated_environment), a fresh empty home"
+    ),
     ("planning/target_terminal_tools.py", "_default_normalizer_subprocess"): "the planner's normalizer, a factory program",
+    ("project_git.py", "_spawn"): (
+        "the git helper's own setting-name and submodule reads: git by its full "
+        "path, the helper's fixed environment (forge.project_git._child_environment)"
+    ),
+    ("project_git.py", "_launch"): (
+        "the git helper's one launch: git by its full path, the helper's fixed "
+        "environment, fixed settings"
+    ),
+    ("project_git.py", "open_git"): (
+        "the git helper's streaming reader: the same command line and fixed "
+        "environment as _launch"
+    ),
     ("review_gate/record.py", "validate_review_findings"): "guardkit qa validate, a factory program",
     ("subagents/autobuild_runner.py", "_guardkit_feature_validate"): "guardkit feature validate, a factory program",
-    ("subagents/autobuild_runner.py", "_run_git"): (
-        "git with the local verbs its callers pass (rev-parse, worktree); the "
-        "program is the literal git, and its arguments are unpacked, so the "
-        "inline-literal rule cannot see it"
-    ),
     ("subagents/autobuild_runner.py", "_run_one_build"): "starts GuardKit's build with the factory's launch list",
 }
 

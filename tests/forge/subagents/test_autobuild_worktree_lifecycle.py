@@ -280,3 +280,50 @@ def test_a_prepared_builds_own_branch_goes_with_its_retired_worktree(
     assert result["status"] == "removed", result
     assert result["source_branch_removed"] == f"forge/source/{BUILD_ID}"
     assert _git(repo, "branch", "--list", f"forge/source/{BUILD_ID}") == ""
+
+
+def test_a_failed_git_command_reports_only_the_fixed_sentence(
+    tmp_path: Path,
+) -> None:
+    """Git runs through the one git helper (14 October 2026). A failed command
+    hands back the helper's fixed sentence, never git's own error words, since
+    the text goes into the cleanup receipt and the logs; a command that works
+    still hands back git's standard output as data."""
+    from forge.subagents import autobuild_worktree_lifecycle as lifecycle
+
+    repo, _base, _outer, _inner = _repo_with_nested(tmp_path)
+
+    code, said = lifecycle._git(repo, "branch", "-D", "no-such-branch")
+    assert code != 0
+    assert said == f"git branch stopped with exit code {code}.".encode()
+
+    code, head = lifecycle._git(repo, "rev-parse", "HEAD")
+    assert code == 0
+    assert head.strip() == _git(repo, "rev-parse", "HEAD").encode()
+
+
+def test_a_failed_removal_puts_only_the_fixed_sentence_in_the_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from forge.subagents import autobuild_worktree_lifecycle as lifecycle
+
+    repo, base, outer, _inner = _repo_with_nested(tmp_path)
+    offered = inspect_autobuild_worktree(
+        repo=repo, base=base, build_id=BUILD_ID, path=outer
+    )
+    offered["cleanup_registrations"] = offered["nested_registrations"]
+    real = lifecycle.run_git
+
+    def _remove_fails(args, **kwargs):
+        if "remove" in args:
+            # A real failing git command, so the sentence is the helper's own.
+            return real(["-C", str(repo), "branch", "-D", "no-such-branch"], **kwargs)
+        return real(args, **kwargs)
+
+    monkeypatch.setattr(lifecycle, "run_git", _remove_fails)
+    result = retire_autobuild_worktree(
+        repo=repo, base=base, build_id=BUILD_ID, path=outer, expected=offered
+    )
+    assert result["status"] == "kept", result
+    assert result["detail"].endswith(": git branch stopped with exit code 1."), result
+    assert "error:" not in result["detail"]

@@ -54,6 +54,7 @@ from forge.pipeline.merge_offer import (
     MergeOfferService,
 )
 from tests.forge._a_stand_in_coordinator import a_coordinator_that_recorded
+from tests.forge.recorded_fetch_address import allow_local_remotes, origin_of
 
 BUILD_ID = "build-FEAT-MX1-20260824"
 FEATURE_ID = "FEAT-MX1"
@@ -148,14 +149,18 @@ def _bare_remote(tmp_path: Path, name: str = "origin.git") -> Path:
 
 
 @pytest.fixture
-def repo_root(tmp_path: Path) -> Path:
+def repo_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """A real repository, with a bare "remote" the merge word joins onto.
 
     The merge word fetches the branch of the remote this work was recorded
     against and joins the build onto the commit it is at, so a repository the
     press is driven against needs a remote. It is a bare repository in the
-    same temporary directory: real git, nobody's account.
+    same temporary directory: real git, nobody's account. A local folder is
+    allowed as a fetch address for the test, and every configuration below
+    records that folder as the project's fetch address (the factory never
+    reads the clone's own origin).
     """
+    allow_local_remotes(monkeypatch, tmp_path / "factory-fetch-copies")
     root = tmp_path / "api_test"
     root.mkdir()
     _git(root, "init", "-b", "main", "-q")
@@ -179,7 +184,10 @@ def config(repo_root: Path) -> ForgeConfig:
     return ForgeConfig.model_validate(
         {
             "permissions": {"filesystem": {"allowlist": ["/tmp"]}},
-            "planning": {"target_repo_paths": {REPO: str(repo_root)}},
+            "planning": {
+                "target_repo_paths": {REPO: str(repo_root)},
+                "fetch_addresses": {REPO: origin_of(repo_root)},
+            },
             "approval": {"expected_approver": "rich"},
             "merge_executor": {"enabled": True},
         }
@@ -2463,7 +2471,10 @@ class TestTheTwoTimeLimits:
         config = ForgeConfig.model_validate(
             {
                 "permissions": {"filesystem": {"allowlist": ["/tmp"]}},
-                "planning": {"target_repo_paths": {REPO: str(repo_root)}},
+                "planning": {
+                    "target_repo_paths": {REPO: str(repo_root)},
+                    "fetch_addresses": {REPO: origin_of(repo_root)},
+                },
                 "approval": {"expected_approver": "rich"},
                 "merge_executor": {
                     "enabled": True,
@@ -2485,7 +2496,10 @@ class TestTheTwoTimeLimits:
         config = ForgeConfig.model_validate(
             {
                 "permissions": {"filesystem": {"allowlist": ["/tmp"]}},
-                "planning": {"target_repo_paths": {REPO: str(repo_root)}},
+                "planning": {
+                    "target_repo_paths": {REPO: str(repo_root)},
+                    "fetch_addresses": {REPO: origin_of(repo_root)},
+                },
                 "approval": {"expected_approver": "rich"},
                 "merge_executor": {
                     "enabled": True,
@@ -3656,8 +3670,10 @@ class _RecordingGit:
     work somewhere the container's own git functions were never pointed at.
     """
 
-    def __init__(self, where: Path) -> None:
-        self._real = InContainerCandidateGit(where)
+    def __init__(self, where: Path, fetch_address: str) -> None:
+        self._real = InContainerCandidateGit(
+            where, fetch_address=fetch_address, repo=REPO
+        )
         self.calls: list[tuple[str, tuple[Any, ...]]] = []
 
     venue = "in the sandbox that holds appmilla/api_test"
@@ -3718,6 +3734,7 @@ class TestARepositoryWithASandboxIsPressedWhereItLives:
                 "permissions": {"filesystem": {"allowlist": ["/tmp"]}},
                 "planning": {
                     "target_repo_paths": {REPO: str(repo_root)},
+                    "fetch_addresses": {REPO: origin_of(repo_root)},
                     "sandboxes": {
                         REPO: {
                             "name": "api-test-factory",
@@ -3746,7 +3763,7 @@ class TestARepositoryWithASandboxIsPressedWhereItLives:
         elsewhere = repo_root
         on_this_side = repo_root.parent / "no-checkout-here"
         on_this_side.mkdir()
-        venue = _RecordingGit(elsewhere)
+        venue = _RecordingGit(elsewhere, origin_of(elsewhere))
         # The merge command runs in the sandbox too (L3b): its report names
         # the commit that landed in there, which for a clean fast-forward is
         # the branch's own tip.
@@ -3811,7 +3828,7 @@ class TestARepositoryWithASandboxIsPressedWhereItLives:
         pool.connection.execute("DELETE FROM publication_records")
         pool.connection.commit()
 
-        venue = _RecordingGit(repo_root)
+        venue = _RecordingGit(repo_root, origin_of(repo_root))
         deps, _publisher, gk, dp = _deps(self._sandbox_config(repo_root), pool)
         deps.git_surface = lambda repo, root: venue
         outcome = await _run_executor(deps, repo_root)
@@ -3829,7 +3846,7 @@ class TestARepositoryWithASandboxIsPressedWhereItLives:
     ) -> None:
         empty = repo_root.parent / "empty-clone"
         empty.mkdir()
-        venue = _RecordingGit(empty)
+        venue = _RecordingGit(empty, origin_of(repo_root))
         deps, _publisher, gk, dp = _deps(self._sandbox_config(repo_root), pool)
         deps.git_surface = lambda repo, root: venue
 
@@ -4269,7 +4286,9 @@ class TestDurableRetainedCandidateIdentity:
             pool=pool,
             pipeline_publisher=wire,
             raw_publish=wire.raw_publish,
-            git_surface=lambda _repo, root: InContainerCandidateGit(root),
+            git_surface=lambda _repo, root: InContainerCandidateGit(
+                root, fetch_address=origin_of(root), repo=REPO
+            ),
             scope_pass=lambda **_kwargs: None,
         )
         event = BuildCompletePayload(
@@ -4678,7 +4697,7 @@ class _ATreeRemovalWhoseAnswerIsLost(InContainerCandidateGit):
     def __init__(self, repo_root: Path, sidecar: ASidecarThat) -> None:
         from forge.deploy.sidecar_git import SidecarCandidateGit
 
-        super().__init__(repo_root)
+        super().__init__(repo_root, fetch_address=origin_of(repo_root), repo=REPO)
         host, port = sidecar.server.server_address[:2]
         self._sandbox = SidecarCandidateGit(f"http://{host}:{port}", repo=REPO)
         self.removals: list[bool] = []

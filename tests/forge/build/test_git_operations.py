@@ -10,6 +10,7 @@ end-to-end scenario contract.
 from __future__ import annotations
 
 import asyncio
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -23,7 +24,6 @@ from forge.build.git_operations import (
     commit_changes,
     create_branch,
     create_pull_request,
-    push_branch,
 )
 
 
@@ -118,22 +118,6 @@ class TestCommitChanges:
         commit_argv = fake_seam.commands[1][0]
         # The full message remains a single argv element — no shell parsing.
         assert commit_argv[-1] == "msg; rm -rf / && echo x"
-
-
-# --------------------------------------------------------------------------- #
-# push_branch
-# --------------------------------------------------------------------------- #
-
-
-class TestPushBranch:
-    def test_invokes_git_push_with_upstream(
-        self, fake_seam: FakeSeam, worktree: Path
-    ) -> None:
-        asyncio.run(push_branch(worktree, "build/feat-001"))
-
-        cmd, cwd, _timeout = fake_seam.commands[0]
-        assert cmd == ["git", "push", "-u", "origin", "build/feat-001"]
-        assert cwd == str(worktree)
 
 
 # --------------------------------------------------------------------------- #
@@ -286,6 +270,82 @@ class TestRunViaExecuteHelper:
         assert fake_seam.commands == []
 
 
+class TestGitThroughTheHelper:
+    """Since 14 October 2026 a git command reaching the default seam runs
+    through ``forge.project_git.run_git``, and git is given nothing from
+    this process's environment."""
+
+    def test_default_seam_hands_git_to_run_git(
+        self, monkeypatch: pytest.MonkeyPatch, worktree: Path
+    ) -> None:
+        seen: list[tuple[list[str], dict[str, Any]]] = []
+
+        async def _fake(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
+            seen.append((list(args), kwargs))
+            return subprocess.CompletedProcess(
+                args, 1, "", "git commit stopped with exit code 1."
+            )
+
+        monkeypatch.setattr(git_operations, "run_git_async", _fake)
+
+        stdout, stderr, exit_code, _duration, timed_out = asyncio.run(
+            git_operations._execute_via_deepagents(
+                command=["git", "commit", "-m", "x"],
+                cwd=str(worktree),
+                timeout=30,
+                env={"SOME_FACTORY_SECRET": "not for git"},
+            )
+        )
+
+        assert seen[0][0] == ["git", "commit", "-m", "x"]
+        assert seen[0][1]["cwd"] == str(worktree)
+        assert seen[0][1]["timeout"] == 30
+        assert "env" not in seen[0][1]
+        assert (stdout, stderr, exit_code, timed_out) == (
+            "",
+            "git commit stopped with exit code 1.",
+            1,
+            False,
+        )
+
+    def test_default_seam_reports_a_git_timeout(
+        self, monkeypatch: pytest.MonkeyPatch, worktree: Path
+    ) -> None:
+        async def _times_out(args: list[str], **kwargs: Any) -> None:
+            raise subprocess.TimeoutExpired(
+                "git add", 5, stderr="git add did not finish within 5 seconds."
+            )
+
+        monkeypatch.setattr(git_operations, "run_git_async", _times_out)
+
+        _stdout, stderr, exit_code, _duration, timed_out = asyncio.run(
+            git_operations._execute_via_deepagents(
+                command=["git", "add", "-A"], cwd=str(worktree), timeout=5, env={}
+            )
+        )
+
+        assert (exit_code, timed_out) == (124, True)
+        assert stderr == "git add did not finish within 5 seconds."
+
+    def test_git_is_given_no_environment_and_gh_is_given_this_processs(
+        self, monkeypatch: pytest.MonkeyPatch, worktree: Path
+    ) -> None:
+        envs: list[dict[str, str]] = []
+
+        async def _seam(*, command, cwd, timeout, env):  # noqa: ANN001
+            envs.append(env)
+            return "", "", 0, 0.0, False
+
+        monkeypatch.setattr(git_operations, "_execute_via_deepagents", _seam)
+        monkeypatch.setenv("GH_TOKEN", "ghp_dummy")
+
+        asyncio.run(git_operations._run_via_execute(worktree, ["git", "status"]))
+        asyncio.run(git_operations._run_via_execute(worktree, ["gh", "pr", "list"]))
+
+        assert envs[0] == {}
+        assert envs[1].get("GH_TOKEN") == "ghp_dummy"
+
+
 class TestNonZeroExitSurfacing:
     def test_create_branch_failure_raises(
         self, fake_seam: FakeSeam, worktree: Path
@@ -300,13 +360,6 @@ class TestNonZeroExitSurfacing:
         fake_seam.queue(("", "permission denied", 1, 0.1, False))
         with pytest.raises(RuntimeError, match="git"):
             asyncio.run(commit_changes(worktree, "msg"))
-
-    def test_push_failure_raises(
-        self, fake_seam: FakeSeam, worktree: Path
-    ) -> None:
-        fake_seam.queue(("", "remote rejected", 1, 0.1, False))
-        with pytest.raises(RuntimeError, match="git push"):
-            asyncio.run(push_branch(worktree, "x"))
 
     def test_empty_branch_name_rejected(
         self, fake_seam: FakeSeam, worktree: Path

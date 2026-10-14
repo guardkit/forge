@@ -1393,6 +1393,28 @@ def test_p8_when_this_runs_own_writing_cannot_be_read_nothing_is_rewritten(
     assert rel in result.receipt("FEAT-07F3")
 
 
+def test_p8_no_repository_is_decided_by_the_git_entry_not_by_gits_words(
+    tmp_path: Path,
+) -> None:
+    """Git's own error text is no longer kept, so "there is no repository
+    here" is read from the ``.git`` entry git would have looked for: none
+    anywhere means no repository; one that git cannot read means git could
+    not say."""
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    assert ttt._is_git_worktree(plain) is False
+
+    broken = tmp_path / "broken"
+    broken.mkdir()
+    (broken / ".git").write_text("gitdir: /nowhere/at/all\n", encoding="utf-8")
+    assert ttt._is_git_worktree(broken) is None
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    assert ttt._is_git_worktree(repo) is True
+
+
 def test_p8_the_shape_bound_is_the_observed_defect_and_no_wider(tmp_path: Path) -> None:
     """A one- or two-character truncation is the defect; three is not."""
     assert ttt.MAX_TRUNCATION_CHARS == 2

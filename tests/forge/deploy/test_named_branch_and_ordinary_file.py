@@ -6,8 +6,10 @@ branch AND that branch's commit in one call; and the documents a project's
 builds are held to must be ordinary files, so the committed-file reader can be
 asked to refuse a symbolic link rather than hand back the link's target name.
 
-Every remote here is a bare repository in a temporary directory. Nothing
-touches a real remote, a live service or a sandbox.
+Every remote here is a bare repository in a temporary directory, recorded as
+the project's fetch address (since 14 October 2026 the factory fetches only
+from the recorded address). Nothing touches a real remote, a live service or
+a sandbox.
 """
 
 from __future__ import annotations
@@ -17,7 +19,6 @@ from typing import Any
 
 import pytest
 
-from forge.adapters.git.planning_runner import WorktreeGitRunner
 from forge.deploy.candidate_tree import (
     FileAtCommit,
     RemoteStartPoint,
@@ -38,7 +39,14 @@ from tests.forge.deploy.test_remote_start_point import (
     _Post,
     clone_of,
     make_remote,
+    recorded_runner,
 )
+from tests.forge.recorded_fetch_address import local_remotes, origin_of  # noqa: F401
+
+
+@pytest.fixture(autouse=True)
+def _local_remotes(local_remotes: Path) -> None:
+    """Every remote here is a bare repository on disk, recorded by its path."""
 
 
 @pytest.fixture
@@ -77,7 +85,9 @@ async def test_a_named_branch_is_fetched_and_its_commit_answered(
 ) -> None:
     prepared = _push_branch(remote, "feature/prepared", {"spec.md": "spec\n"})
 
-    answer = await fetch_remote_start_point(copy, "feature/prepared")
+    answer = await fetch_remote_start_point(
+        copy, "feature/prepared", fetch_address=origin_of(copy)
+    )
 
     assert answer.ok
     assert answer.branch == "main"
@@ -91,7 +101,7 @@ async def test_a_named_branch_is_fetched_and_its_commit_answered(
 async def test_naming_the_default_branch_answers_its_own_commit(
     remote: Path, copy: Path
 ) -> None:
-    answer = await fetch_remote_start_point(copy, "main")
+    answer = await fetch_remote_start_point(copy, "main", fetch_address=origin_of(copy))
 
     assert answer.ok
     assert answer.branch_commit == answer.commit
@@ -101,7 +111,9 @@ async def test_naming_the_default_branch_answers_its_own_commit(
 async def test_a_branch_the_remote_does_not_have_is_refused_in_plain_words(
     copy: Path,
 ) -> None:
-    answer = await fetch_remote_start_point(copy, "feature/nowhere")
+    answer = await fetch_remote_start_point(
+        copy, "feature/nowhere", fetch_address=origin_of(copy)
+    )
 
     assert not answer.ok
     assert "has no branch called 'feature/nowhere'" in (answer.refusal or "")
@@ -119,7 +131,7 @@ async def test_an_unusable_branch_name_is_refused_before_git_runs(copy: Path) ->
 async def test_without_a_branch_the_answer_is_what_it_always_was(
     remote: Path, copy: Path
 ) -> None:
-    answer = await fetch_remote_start_point(copy)
+    answer = await fetch_remote_start_point(copy, fetch_address=origin_of(copy))
 
     assert answer == RemoteStartPoint(
         branch="main", commit=_git(remote, "rev-parse", "refs/heads/main")
@@ -132,7 +144,7 @@ async def test_the_host_runner_and_the_chooser_pass_the_branch_on(
     tmp_path: Path, remote: Path, copy: Path
 ) -> None:
     prepared = _push_branch(remote, "feature/prepared", {"spec.md": "spec\n"})
-    host = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    host = recorded_runner(tmp_path / "wt", copy)
     routed = RepoRoutedGitRunner(runners_by_repo={}, repo_paths={}, default=host)
 
     direct = await host.fetch_remote_start_point(str(copy), "feature/prepared")
@@ -145,7 +157,11 @@ def test_the_route_answers_a_named_branch(remote: Path, copy: Path) -> None:
     prepared = _push_branch(remote, "feature/prepared", {"spec.md": "spec\n"})
 
     status, body = process_git_remote_start_point_request(
-        {"repo": REPO_KEY, "branch": "feature/prepared"},
+        {
+            "repo": REPO_KEY,
+            "branch": "feature/prepared",
+            "fetch_address": origin_of(copy),
+        },
         config=_config({REPO_KEY: str(copy)}),
     )
 

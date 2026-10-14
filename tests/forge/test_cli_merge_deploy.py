@@ -29,6 +29,7 @@ from forge.config.models import ForgeConfig
 from forge.lifecycle import migrations
 from forge.lifecycle.persistence import SqliteLifecyclePersistence
 from forge.pipeline import merge_offer as merge_offer_module
+from tests.forge.recorded_fetch_address import allow_local_remotes
 
 FEATURE_ID = "FEAT-CLI1"
 BUILD_ID = "build-FEAT-CLI1-20260824"
@@ -98,7 +99,10 @@ def _git(repo: Path, *args: str) -> str:
 
 
 @pytest.fixture
-def repo_root(tmp_path: Path) -> Path:
+def repo_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    # The bare remote below is recorded as the project's fetch address
+    # (planning.fetch_addresses, 14 October 2026), so a local folder may be one.
+    allow_local_remotes(monkeypatch, tmp_path / "factory-fetch-copies")
     root = tmp_path / "api_test"
     root.mkdir()
     _git(root, "init", "-b", "main", "-q")
@@ -128,7 +132,10 @@ def config(repo_root: Path) -> ForgeConfig:
     return ForgeConfig.model_validate(
         {
             "permissions": {"filesystem": {"allowlist": ["/tmp"]}},
-            "planning": {"target_repo_paths": {REPO: str(repo_root)}},
+            "planning": {
+                "target_repo_paths": {REPO: str(repo_root)},
+                "fetch_addresses": {REPO: str(repo_root.parent / "origin.git")},
+            },
             "approval": {"expected_approver": "rich"},
         }
     )
@@ -566,7 +573,10 @@ class TestAProjectThatPreparesPreviewsWithNoPreviewedCard:
         return ForgeConfig.model_validate(
             {
                 "permissions": {"filesystem": {"allowlist": ["/tmp"]}},
-                "planning": {"target_repo_paths": {REPO: str(repo_root)}},
+                "planning": {
+                    "target_repo_paths": {REPO: str(repo_root)},
+                    "fetch_addresses": {REPO: str(repo_root.parent / "origin.git")},
+                },
                 "approval": {"expected_approver": "the-approver"},
                 "review_preview": {"enabled": True},
             }

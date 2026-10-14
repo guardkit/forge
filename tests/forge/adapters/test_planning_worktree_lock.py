@@ -159,7 +159,12 @@ class TestThePlanningWriterLocksItsWorktree:
         )
 
         assert result.status == "failed"
-        assert "not a git repository" in (result.stderr or "")
+        # Since 14 October 2026 git's own text ("not a git repository") is
+        # never reported: the first git step in the pruned worktree fails
+        # (the helper cannot read its settings there, so it refuses), and
+        # the failure carries only the helper's fixed sentence.
+        assert (result.stderr or "").startswith("git add ")
+        assert "not a git repository" not in (result.stderr or "")
 
     @pytest.mark.asyncio
     async def test_the_single_file_write_is_locked_too(

@@ -151,15 +151,21 @@ def test_a_route_key_that_is_a_symlink_is_refused(
 
 def _the_line_git_would_get(publisher: Publisher, route: ProjectRoute, monkeypatch) -> str:
     """Run the program git would be handed for this route's copy, by hand."""
-    from forge.publisher import git_work
+    # Every publisher git command starts at the network boundary (14 October
+    # 2026); making the publisher's own copy carries no credential, so only
+    # the fetch is captured.
+    from forge import network_git
 
     given: list[dict] = []
+    real_run = subprocess.run
     with monkeypatch.context() as patched:
-        def capture(*_args, env=None, **_kwargs):  # noqa: ANN001, ANN003
+        def capture(argv, *args, env=None, **kwargs):  # noqa: ANN001, ANN003
+            if "fetch" not in argv:
+                return real_run(argv, *args, env=env, **kwargs)
             given.append(env)
             raise OSError("not run in this test")
 
-        patched.setattr(git_work.subprocess, "run", capture)
+        patched.setattr(network_git.subprocess, "run", capture)
         publisher._its_own_copy(route).where_the_remotes_branch_is("main")
     assert given
     programs = {env["GIT_ASKPASS"] for env in given}

@@ -1016,7 +1016,13 @@ def git_surface_for(
             surface = None
         if surface is not None:
             return surface
-    return InContainerCandidateGit(repo_root)
+    # The project's recorded fetch address (Forge git hardening, 14 October
+    # 2026): the starting point is fetched from it, never the clone's origin.
+    planning = getattr(getattr(deps, "config", None), "planning", None)
+    addresses = getattr(planning, "fetch_addresses", None) or {}
+    return InContainerCandidateGit(
+        repo_root, fetch_address=addresses.get(str(repo)), repo=str(repo)
+    )
 
 
 # ---------------------------------------------------------------------------

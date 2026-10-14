@@ -487,15 +487,21 @@ class TestNothingAboutTheTestDiffCanRefuseTheBranch:
     def _make_the_test_diff_raise(monkeypatch: pytest.MonkeyPatch) -> None:
         from forge.pipeline.merge_ready_checkpoint import TEST_CHANGE_MARKER
 
+        from forge.deploy_sidecar import service as sidecar_service
+        from forge.project_git import run_git as real
+
         marker = f"-G{TEST_CHANGE_MARKER}"
-        real = subprocess.run
+        # Both readings (here, and the sidecar's) run git through the
+        # factory's one helper, so the stand-in sits on each module's
+        # ``run_git`` and lets every other command through to the real one.
 
         def _run(argv: Any, *args: Any, **kwargs: Any) -> Any:
             if isinstance(argv, (list, tuple)) and marker in argv:
                 raise subprocess.TimeoutExpired(cmd=list(argv), timeout=120.0)
             return real(argv, *args, **kwargs)
 
-        monkeypatch.setattr(subprocess, "run", _run)
+        monkeypatch.setattr(conductor, "run_git", _run)
+        monkeypatch.setattr(sidecar_service, "run_git", _run)
 
     def test_read_here_a_test_diff_that_never_answers_is_not_an_error(
         self, worktree: Path, monkeypatch: pytest.MonkeyPatch

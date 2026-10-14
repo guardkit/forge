@@ -1,0 +1,183 @@
+{
+  "source": "guardkit/lib/project_git.py",
+  "guardkit_commit": "bdd6df34cbd84f6b16ef232727ae53d4cf2040cc",
+  "branch": "fix/git-hardening-2026-10-13",
+  "note": "A pinned copy of GuardKit's fixed git rules. Forge's own copy (src/forge/project_git.py) must match; the release image check compares the two live.",
+  "constants": {
+    "BASE_SETTINGS": [
+      "core.fsmonitor=false",
+      "core.hooksPath=/dev/null",
+      "commit.gpgSign=false",
+      "tag.gpgSign=false",
+      "log.showSignature=false",
+      "merge.verifySignatures=false",
+      "gpg.program=false",
+      "gpg.ssh.program=false",
+      "gpg.x509.program=false",
+      "submodule.recurse=false",
+      "diff.ignoreSubmodules=dirty",
+      "diff.submodule=short",
+      "status.submoduleSummary=false",
+      "gc.auto=0",
+      "maintenance.auto=false",
+      "core.alternateRefsCommand=",
+      "merge.default=text",
+      "core.editor=:",
+      "sequence.editor=:",
+      "core.pager=cat"
+    ],
+    "REBASE_SETTINGS": [
+      "rebase.instructionFormat=%s",
+      "rebase.rebaseMerges=false",
+      "rebase.updateRefs=false",
+      "rebase.autoSquash=false",
+      "rebase.backend=merge",
+      "rebase.missingCommitsCheck=ignore"
+    ],
+    "FIXED_SETTINGS": [
+      "core.fsmonitor=false",
+      "core.hooksPath=/dev/null",
+      "commit.gpgSign=false",
+      "tag.gpgSign=false",
+      "log.showSignature=false",
+      "merge.verifySignatures=false",
+      "gpg.program=false",
+      "gpg.ssh.program=false",
+      "gpg.x509.program=false",
+      "submodule.recurse=false",
+      "diff.ignoreSubmodules=dirty",
+      "diff.submodule=short",
+      "status.submoduleSummary=false",
+      "gc.auto=0",
+      "maintenance.auto=false",
+      "core.alternateRefsCommand=",
+      "merge.default=text",
+      "core.editor=:",
+      "sequence.editor=:",
+      "core.pager=cat",
+      "rebase.instructionFormat=%s",
+      "rebase.rebaseMerges=false",
+      "rebase.updateRefs=false",
+      "rebase.autoSquash=false",
+      "rebase.backend=merge",
+      "rebase.missingCommitsCheck=ignore"
+    ],
+    "FIXED_ENVIRONMENT": {
+      "LC_ALL": "C",
+      "GIT_TERMINAL_PROMPT": "0",
+      "GIT_ALLOW_PROTOCOL": "none",
+      "GIT_NO_LAZY_FETCH": "1"
+    },
+    "IDENTITY_ENVIRONMENT_NAMES": [
+      "GIT_AUTHOR_NAME",
+      "GIT_AUTHOR_EMAIL",
+      "GIT_AUTHOR_DATE",
+      "GIT_COMMITTER_NAME",
+      "GIT_COMMITTER_EMAIL",
+      "GIT_COMMITTER_DATE"
+    ],
+    "KEPT_ENVIRONMENT_NAMES": [
+      "HOME",
+      "XDG_CONFIG_HOME",
+      "TZ",
+      "TMPDIR",
+      "GIT_CONFIG_GLOBAL",
+      "GIT_CONFIG_SYSTEM",
+      "GIT_CONFIG_NOSYSTEM",
+      "GIT_AUTHOR_NAME",
+      "GIT_AUTHOR_EMAIL",
+      "GIT_AUTHOR_DATE",
+      "GIT_COMMITTER_NAME",
+      "GIT_COMMITTER_EMAIL",
+      "GIT_COMMITTER_DATE"
+    ],
+    "CALLER_ENVIRONMENT_NAMES": [
+      "GIT_INDEX_FILE",
+      "GIT_OPTIONAL_LOCKS",
+      "GIT_AUTHOR_NAME",
+      "GIT_AUTHOR_EMAIL",
+      "GIT_AUTHOR_DATE",
+      "GIT_COMMITTER_NAME",
+      "GIT_COMMITTER_EMAIL",
+      "GIT_COMMITTER_DATE"
+    ],
+    "NETWORK_COMMANDS": [
+      "fetch",
+      "pull",
+      "push",
+      "clone",
+      "ls-remote",
+      "fetch-pack",
+      "send-pack",
+      "credential",
+      "submodule"
+    ],
+    "NETWORK_REMOTE_COMMANDS": [
+      "update",
+      "show",
+      "prune",
+      "set-head"
+    ],
+    "COMMAND_OPTIONS": {
+      "diff": [
+        "--no-ext-diff",
+        "--no-textconv",
+        "--submodule=short",
+        "--ignore-submodules=dirty"
+      ],
+      "log": [
+        "--no-ext-diff",
+        "--no-textconv",
+        "--submodule=short"
+      ],
+      "show": [
+        "--no-ext-diff",
+        "--no-textconv",
+        "--submodule=short"
+      ],
+      "status": [
+        "--ignore-submodules=dirty"
+      ],
+      "merge": [
+        "--no-gpg-sign",
+        "--no-verify-signatures"
+      ],
+      "commit": [
+        "--no-gpg-sign"
+      ],
+      "rebase": [
+        "--no-gpg-sign",
+        "--no-rebase-merges",
+        "--no-update-refs",
+        "--no-autosquash"
+      ]
+    },
+    "REBASE_OPTIONS": [
+      "--autostash",
+      "--abort"
+    ],
+    "WRITE_COMMANDS": [
+      "add",
+      "commit",
+      "checkout",
+      "switch",
+      "restore",
+      "reset",
+      "merge",
+      "rebase",
+      "stash",
+      "apply",
+      "cherry-pick",
+      "revert",
+      "read-tree"
+    ],
+    "MERGE_PROGRAM": "git merge-file --marker-size=%L %A %O %B",
+    "NETWORK_REFUSAL": "The factory does not run git commands that reach another repository.",
+    "SUBMODULE_REFUSAL": "This project contains another git repository inside it (a submodule or a nested repository). The factory does not build projects like that yet, so it stopped before running git {command}.",
+    "REBASE_REFUSAL": "The factory runs git rebase only with the options it uses itself (--autostash, --abort), because other rebase options can run programs from the to-do list.",
+    "WORKTREE_REFUSAL": "git worktree add could not finish filling the new worktree, so the half-made worktree was removed.",
+    "SETTINGS_REFUSAL": "git {command} was not run because the project's git settings could not be read, so nothing they name could be switched off.",
+    "UNSAFE_NAME_REFUSAL": "git {command} was not run because the project's git settings use a name the factory cannot switch off.",
+    "REFUSED_EXIT_CODE": 128
+  }
+}

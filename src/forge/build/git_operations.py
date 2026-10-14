@@ -1,11 +1,17 @@
 """Git/gh operations via the DeepAgents ``execute`` seam (TASK-IC-010).
 
-Four async operations needed by the build state machine:
+Three async operations needed by the build state machine:
 
 * :func:`create_branch` — ``git checkout -b <branch>``
 * :func:`commit_changes` — ``git add -A`` + ``git commit -m <message>``
-* :func:`push_branch` — ``git push -u origin <branch>``
 * :func:`create_pull_request` — ``gh pr create --title --body --base``
+
+There is no push here (14 October 2026): ``push_branch`` was called by
+nothing in production and pushed to whatever the clone's ``origin`` named,
+so it was removed. A git command reaching the default seam is run through
+:func:`forge.project_git.run_git` (a fixed environment, no hooks or filters
+from the project's settings, and a fixed sentence instead of git's own
+error text); ``gh`` and ``pytest`` are started as before.
 
 Constitutional constraints
 --------------------------
@@ -40,7 +46,10 @@ from __future__ import annotations
 
 import asyncio
 import os
+import subprocess
 from pathlib import Path
+
+from forge.project_git import run_git_async
 
 ALLOWED_BINARIES: frozenset[str] = frozenset({"git", "gh", "pytest"})
 """Binaries the build subprocess seam may invoke.
@@ -70,8 +79,10 @@ async def _execute_via_deepagents(
     """Default seam — async subprocess executor (no shell).
 
     ``env`` is REQUIRED (13 October 2026): the caller decides exactly what
-    the child is given. The git and gh operations below pass the factory's
-    own environment by name; the build's test run
+    the child is given. The gh operation below passes the factory's own
+    environment by name; a git command is handed to the git helper, which
+    gives git its own fixed environment and ignores ``env`` (14 October
+    2026); the build's test run
     (:func:`forge.build.test_verification.verify_tests`) passes a project
     program's, built from nothing, so it carries none of the factory's
     credentials.
@@ -91,6 +102,29 @@ async def _execute_via_deepagents(
     """
     loop = asyncio.get_event_loop()
     start = loop.time()
+
+    if command and Path(command[0]).name == "git":
+        # git goes through the one local git helper (14 October 2026). The
+        # helper gives git its own fixed environment, so ``env`` is not
+        # passed on, and a failure's ``stderr`` is its fixed sentence.
+        try:
+            done = await run_git_async(
+                ["git", *command[1:]],
+                cwd=cwd,
+                timeout=timeout,
+                encoding="utf-8",
+                errors="replace",
+            )
+        except subprocess.TimeoutExpired as exc:
+            sentence = exc.stderr if isinstance(exc.stderr, str) else ""
+            return "", sentence, 124, loop.time() - start, True
+        return (
+            done.stdout or "",
+            done.stderr or "",
+            done.returncode or 0,
+            loop.time() - start,
+            False,
+        )
 
     proc = await asyncio.create_subprocess_exec(
         *command,
@@ -180,13 +214,15 @@ async def _run_via_execute(
     _validate_binary(command)
     # Read the seam through the module so monkeypatching
     # ``_execute_via_deepagents`` at module scope is visible here.
+    is_git = _binary_basename(command) == "git"
     return await _execute_via_deepagents(
         command=command,
         cwd=str(worktree_path),
         timeout=timeout,
-        # git and gh are the factory's own programs, and gh reads its token
-        # from this process's environment: they are given it, by name.
-        env=dict(os.environ),
+        # gh is the factory's own program and reads its token from this
+        # process's environment, so it is given it, by name. git is given
+        # nothing from this process: the git helper builds its environment.
+        env={} if is_git else dict(os.environ),
     )
 
 
@@ -198,7 +234,7 @@ def _check_exit(
 ) -> None:
     """Surface non-zero exits as :class:`RuntimeError` with diagnostic context.
 
-    Used by the four public operations to convert seam-level failure
+    Used by the three public operations to convert seam-level failure
     into a clean exception that the build state machine can log without
     digging through subprocess internals. The PR-creation path does not
     use this helper directly because it differentiates auth-failure
@@ -250,17 +286,6 @@ async def commit_changes(worktree_path: Path, message: str) -> None:
         worktree_path, commit_cmd
     )
     _check_exit("git commit", commit_cmd, exit_code, stderr)
-
-
-async def push_branch(worktree_path: Path, branch_name: str) -> None:
-    """Push ``branch_name`` to ``origin`` with upstream tracking."""
-    if not branch_name:
-        raise ValueError("branch_name must be a non-empty string")
-    command = ["git", "push", "-u", "origin", branch_name]
-    _stdout, stderr, exit_code, _duration, _timed_out = await _run_via_execute(
-        worktree_path, command
-    )
-    _check_exit("git push", command, exit_code, stderr)
 
 
 def _has_credentials() -> bool:

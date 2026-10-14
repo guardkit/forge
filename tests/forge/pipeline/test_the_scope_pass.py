@@ -713,6 +713,11 @@ class TestWhenNothingCouldBeRead:
             feature_id="FEAT-NOTHERE",
         )
         assert reading.error is not None
+        # The card's scope line carries the factory's own sentence, never
+        # git's error text (which names the revision git could not find).
+        assert "git diff stopped with exit code" in reading.error
+        assert "fatal" not in reading.error.lower()
+        assert "unknown revision" not in reading.error.lower()
         report = scope_of_the_build(reading=reading, request=REQUEST)
         assert report.read is False
         assert report.files_changed == 0

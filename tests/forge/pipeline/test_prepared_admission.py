@@ -4,7 +4,9 @@
 the round 1-3 review dispositions R1, R3 and R7). Every "remote" here is a bare
 repository in a temporary directory and the runner is the coordinator's own
 ``WorktreeGitRunner``, so a fetch and every committed-file read is real git.
-Nothing touches a live service, a sandbox or a model.
+Since 14 October 2026 the factory fetches only from the address recorded for
+the project, so each test records its bare remote as the project's fetch
+address. Nothing touches a live service, a sandbox or a model.
 
 The project in these tests is synthetic: a few text files, no code, no
 particular language.
@@ -15,6 +17,7 @@ from __future__ import annotations
 import os
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -25,6 +28,8 @@ from forge.pipeline.prepared_admission import (
     guide_claims_routes,
     relative_markdown_links,
 )
+
+from tests.forge.recorded_fetch_address import local_remotes, origin_of  # noqa: F401
 
 FEATURE = "FEAT-AB12"
 REPO = "synthetic/project"
@@ -159,6 +164,20 @@ class Project:
         _git(self.writer, "remote", "add", "origin", str(self.remote))
         _git(self.writer, "push", "-q", "origin", "HEAD:refs/heads/main")
         _git(root, "clone", "-q", str(self.remote), str(self.copy))
+        # The address recorded for the project, as forge register-repo
+        # records it: the bare remote its clone was made from.
+        self.fetch_address = origin_of(self.copy)
+
+    def runner(
+        self, worktrees_root: Path, *, address: str | None = None
+    ) -> WorktreeGitRunner:
+        """The coordinator's own runner, with this project's clone and its
+        recorded fetch address (``address`` records a different one)."""
+        return WorktreeGitRunner(
+            worktrees_root=worktrees_root,
+            target_repo_paths={REPO: str(self.copy)},
+            fetch_addresses={REPO: address or self.fetch_address},
+        )
 
     def commit_on(
         self, branch: str, files: dict[str, str], *, remove: tuple[str, ...] = ()
@@ -186,14 +205,25 @@ class Project:
         return _git(self.remote, "rev-parse", "refs/heads/main")
 
 
+def recorded_runner(config: Any, worktrees_root: Path) -> WorktreeGitRunner:
+    """The coordinator's own runner, given the clones and fetch addresses the
+    config records (``planning.target_repo_paths`` and
+    ``planning.fetch_addresses``), as the daemon composes it."""
+    return WorktreeGitRunner(
+        worktrees_root=worktrees_root,
+        target_repo_paths=config.planning.target_repo_paths,
+        fetch_addresses=config.planning.fetch_addresses,
+    )
+
+
 @pytest.fixture
-def project(tmp_path: Path) -> Project:
+def project(tmp_path: Path, local_remotes: Path) -> Project:
     return Project(tmp_path)
 
 
 @pytest.fixture
-def runner(tmp_path: Path) -> WorktreeGitRunner:
-    return WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+def runner(tmp_path: Path, project: Project) -> WorktreeGitRunner:
+    return project.runner(tmp_path / "wt")
 
 
 async def _admit(project: Project, runner: WorktreeGitRunner, **kw: str):
@@ -327,14 +357,18 @@ async def test_a_branch_the_remote_does_not_have_is_refused(
 
 @pytest.mark.asyncio
 async def test_an_unreachable_remote_is_refused(
-    project: Project, runner: WorktreeGitRunner
+    project: Project, tmp_path: Path
 ) -> None:
-    _git(project.copy, "remote", "set-url", "origin", str(project.remote) + "-gone")
+    # The address recorded for the project leads nowhere; the clone's own
+    # origin still reaches the remote, and is never asked.
+    gone = project.runner(tmp_path / "wt", address=str(project.remote) + "-gone")
 
-    answer = await _admit(project, runner)
+    answer = await _admit(project, gone)
 
     assert not answer.ok
     assert "could not be reached" in (answer.refusal or "")
+    # The refusal is the factory's own sentence, never git's text.
+    assert "fatal" not in (answer.refusal or "")
 
 
 # ---------------------------------------------------------------------------

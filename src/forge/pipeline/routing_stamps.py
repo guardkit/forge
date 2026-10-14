@@ -130,7 +130,6 @@ from __future__ import annotations
 
 import json
 import logging
-import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import StrEnum
@@ -138,6 +137,8 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 import yaml
+
+from forge.project_git import pattern_pathspec, run_git
 
 logger = logging.getLogger(__name__)
 
@@ -664,17 +665,19 @@ def read_last_code_commit_time(
     reads as "freshness cannot be proven", i.e. ABSENT.
     """
     refs = [branch, "HEAD"] if branch and branch != "HEAD" else ["HEAD"]
-    excludes = [f":(exclude){p}" for p in receipt_only_paths]
+    # The exclusions are the factory's own patterns (``:(exclude)...``), so
+    # they are marked as patterns: git reads them as patterns, not file names.
+    excludes = [pattern_pathspec(f":(exclude){p}") for p in receipt_only_paths]
     for ref in refs:
-        base = ["git", "log", "-1", "--format=%ct", ref, "--", "."]
+        base = ["log", "-1", "--format=%ct", ref, "--", "."]
         ref_failed = False
         for argv in (base + excludes, base):
             try:
-                completed = subprocess.run(  # noqa: S603 — fixed argv, no shell
+                # Through the factory's one git helper: on a failure its
+                # ``stderr`` is a fixed sentence, never git's own text.
+                completed = run_git(
                     argv,
                     cwd=str(worktree),
-                    capture_output=True,
-                    text=True,
                     timeout=_GIT_TIMEOUT_SECONDS,
                     check=False,
                 )

@@ -37,6 +37,7 @@ from forge.planning.driver import PlanningDriverDeps, PlanningRunDriver
 from forge.planning.gate_adapters import build_planning_gate_adapters
 from forge.planning.run_store import SqlitePlanningRunStore
 from forge.planning.states import PlanningState
+from tests.forge.recorded_fetch_address import allow_local_remotes, origin_of
 
 CID = "memory-run-0001"
 REPO_KEY = "guardkit/api_test"
@@ -101,6 +102,23 @@ def make_remote_and_copy(
     return remote, copy
 
 
+def _recorded(copy: Path) -> dict[str, dict[str, str]]:
+    """The coordinator's record of this project: where its copy is, and the
+    address its starting point is fetched from (the stand-in remote)."""
+    return {
+        "target_repo_paths": {REPO_KEY: str(copy)},
+        "fetch_addresses": {REPO_KEY: origin_of(copy)},
+    }
+
+
+@pytest.fixture(autouse=True)
+def _local_remotes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The stand-in remote is a bare repository in ``tmp_path``: let a local
+    folder be a recorded fetch address, and keep the factory's own fetch
+    copies inside ``tmp_path`` (Forge git hardening, 14 October 2026)."""
+    allow_local_remotes(monkeypatch, tmp_path / "factory-fetch-copies")
+
+
 @pytest.fixture
 def store(tmp_path: Path) -> SqlitePlanningRunStore:
     connection = sqlite3.connect(str(tmp_path / "memory.db"))
@@ -141,7 +159,7 @@ def _make_driver(
         escalation_approver="U-ESC",
         originator_wait_seconds=300,
         escalated_wait_seconds=1800,
-        target_repo_paths={REPO_KEY: str(repo_path)},
+        **_recorded(repo_path),
         target_terminal={"enabled": True},
     )
     driver = PlanningRunDriver(
@@ -153,7 +171,8 @@ def _make_driver(
             subscriber_factory=lambda expected_approver, armed: object(),
             dispatch_product_owner=dispatch_po,
             second_opinion_provider=object(),
-            git_runner=git_runner or WorktreeGitRunner(worktrees_root=worktrees_root),
+            git_runner=git_runner
+            or WorktreeGitRunner(worktrees_root=worktrees_root, **_recorded(repo_path)),
             planning_config=config,
             clock=clock,
             publish_notification=publish_notification,
@@ -314,7 +333,7 @@ async def test_a_venue_that_cannot_read_the_file_is_not_told_it_declares_nothing
         store,
         repo_path=copy,
         worktrees_root=tmp_path / "wt",
-        git_runner=_Unreachable(worktrees_root=tmp_path / "wt"),
+        git_runner=_Unreachable(worktrees_root=tmp_path / "wt", **_recorded(copy)),
     )
     row = _queue_running(store)
 
@@ -340,7 +359,7 @@ async def test_a_runner_that_raises_stops_the_run_rather_than_guessing(
         store,
         repo_path=copy,
         worktrees_root=tmp_path / "wt",
-        git_runner=_Explodes(worktrees_root=tmp_path / "wt"),
+        git_runner=_Explodes(worktrees_root=tmp_path / "wt", **_recorded(copy)),
     )
     row = _queue_running(store)
 
@@ -378,7 +397,7 @@ async def test_a_run_that_already_has_a_name_keeps_it(
         store,
         repo_path=copy,
         worktrees_root=tmp_path / "wt",
-        git_runner=_Watching(worktrees_root=tmp_path / "wt"),
+        git_runner=_Watching(worktrees_root=tmp_path / "wt", **_recorded(copy)),
     )
     await again.driver._enter_target_terminal(store.get_run(CID), CID)
 

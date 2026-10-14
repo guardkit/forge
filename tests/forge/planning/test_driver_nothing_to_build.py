@@ -25,14 +25,15 @@ from forge.config.models import NothingToBuildConfig
 from forge.planning import nothing_to_build
 from forge.planning.run_store import SqlitePlanningRunStore
 from forge.planning.states import PlanningState
-from forge.adapters.git.planning_runner import WorktreeGitRunner
 from tests.forge.planning.test_driver_target_terminal import (
     CID,
     RecordingGitRunner,
     _init_scratch_repo,
+    _local_remotes,  # noqa: F401 — the autouse fixture: the remotes here are local folders
     _make_driver,
     _plan_result_native,
     _queue,
+    _recorded_runner,
     _semantic_review_json,
     _spec_result_native,
     _stamping_normalizer,
@@ -471,7 +472,7 @@ async def test_the_flag_rides_on_the_exact_re_review_call_too(
     sink: dict[str, Any] = {}
     h = _make_driver(
         store,
-        git_runner=WorktreeGitRunner(worktrees_root=tmp_path / "wt"),
+        git_runner=_recorded_runner(tmp_path / "wt", repo),
         repo_path=str(repo),
         spec_result=_spec_result_native(),
         plan_result_factory=_plan_result_native,

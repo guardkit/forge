@@ -17,18 +17,22 @@ habit:
    commit has to be a plain hexadecimal name and a branch has to be a plain
    branch name, both anchored at a character that cannot be read as an
    option.
-4. **No child is given this process's environment.** Every git command is
-   given a small environment built from nothing
-   (:func:`forge.publisher.credential.the_environment_git_is_given`), with
-   ``HOME`` inside the publisher's own folder so git reads no person's
-   configuration and finds no person's stored credentials.
-5. **No address is ever written down.** Git names the address it was working
-   with in its own messages, and those messages go into refusal sentences,
-   receipts and rows of the ledger. The addresses come out of a settings file
-   somebody fills in at rollout, and an address is the easiest place for a
-   credential to end up. So every sentence git gives this module passes
-   through :func:`without_the_addresses` on its one way out
-   (:func:`_one_line`), and what it says is what went wrong, not where.
+4. **No child is given this process's environment.** Every git command runs
+   through :func:`forge.network_git.run_network_git` (14 October 2026): an
+   environment built from nothing, a FRESH EMPTY home folder for each command
+   (never the publisher's state folder, where a ``.netrc`` or ``.gitconfig``
+   would be read), no system or personal settings file, credential helpers,
+   extra headers and cookie files cleared, and exactly ONE transport per
+   step: ``git`` or ``file`` for the project's copy (by the source's checked
+   form), ``ssh`` or ``https`` for the remote (by the remote's). The only
+   credential is the route's own, chosen here.
+5. **Git's own words are never written down.** Git names the address it was
+   working with in its own messages, and a remote's reason for refusing a
+   send is the remote's text. Every sentence this module says is a fixed one
+   (which step, git's exit code), with at most one of three reasons
+   recognised from git's text but never quoted
+   (:data:`forge.network_git.REASONS`): the remote's branch has moved on, the
+   remote refused the key, the host key is not the pinned one.
 
 THE PUBLISHER'S OWN COPY. It keeps one repository of its own per project, so
 that the commits it fetches have somewhere to live that is nobody else's. It
@@ -44,15 +48,17 @@ from __future__ import annotations
 
 import logging
 import re
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
+from forge.network_git import run_network_git
 from forge.publisher.credential import (
     Credential,
     an_ssh_address,
-    the_environment_git_is_given,
+    the_credential_environment,
+    the_remote_transport,
+    the_source_transport,
 )
 from forge.publisher.settings import ProjectRoute
 
@@ -171,29 +177,6 @@ def without_the_addresses(said: str, addresses: "Iterable[str]" = ()) -> str:
     return _WHO_IS_ASKING.sub(THE_ADDRESS_IS_NOT_WRITTEN_DOWN + "@", cleaned)
 
 
-def _one_line(
-    done: "subprocess.CompletedProcess[str]", addresses: "Iterable[str]" = ()
-) -> str:
-    """Git's own reason, in one line, with no address left in it.
-
-    Every sentence the publisher says about a git command comes through here,
-    which is why the taking-out happens here rather than at each caller: a
-    caller that forgot would be a leak, and there is no path around this
-    function.
-    """
-    text = ((done.stderr or "") + "\n" + (done.stdout or "")).strip().splitlines()
-    lines = [line.strip() for line in text if line.strip()]
-    if not lines:
-        return f"git exited {done.returncode} and said nothing"
-    chosen = lines[0]
-    for line in lines:
-        low = line.lower()
-        if low.startswith("fatal:") or low.startswith("error:") or " ! [" in line:
-            chosen = line
-            break
-    return without_the_addresses(chosen, addresses)
-
-
 class TheProjectsCommits:
     """The publisher's own bare repository for one project.
 
@@ -236,38 +219,38 @@ class TheProjectsCommits:
 
     # -- running git -------------------------------------------------------
 
-    def _git(self, *args: str, timeout: float | None = None) -> GitSaid:
-        """One git command in the publisher's own repository. Never raises."""
-        environment = the_environment_git_is_given(
-            self._credential,
-            state_dir=self._state,
-            home=self._state,
-            known_hosts=self._known_hosts,
+    def _git(
+        self,
+        *args: str,
+        transport: str = "none",
+        with_credential: bool = False,
+        git_dir: bool = True,
+        timeout: float | None = None,
+    ) -> GitSaid:
+        """One git command at the network boundary. Never raises.
+
+        In the publisher's own repository (unless ``git_dir`` is False), with
+        exactly one ``transport`` and, only when ``with_credential``, the
+        route's own credential. The sentence is fixed; git's words are not
+        kept.
+        """
+        done = run_network_git(
+            list(args),
+            transport=transport,
+            git_dir=self._where if git_dir else None,
+            timeout=self._timeout if timeout is None else timeout,
+            credential_env=(
+                the_credential_environment(
+                    self._credential, state_dir=self._state, known_hosts=self._known_hosts
+                )
+                if with_credential
+                else None
+            ),
         )
-        try:
-            done = subprocess.run(  # noqa: S603 - fixed argv, no shell
-                ["git", "--git-dir", str(self._where), *args],
-                capture_output=True,
-                text=True,
-                errors="replace",
-                timeout=self._timeout if timeout is None else timeout,
-                check=False,
-                env=environment,
-            )
-        except subprocess.TimeoutExpired:
-            return GitSaid(
-                ok=False,
-                said=(
-                    f"git did not finish within "
-                    f"{int(self._timeout if timeout is None else timeout)} seconds"
-                ),
-            )
-        except OSError as exc:
-            return GitSaid(ok=False, said=f"git could not be run ({exc})")
         return GitSaid(
-            ok=done.returncode == 0,
+            ok=done.ok,
             out=(done.stdout or "").strip(),
-            said=_one_line(done, self._the_addresses),
+            said=done.said.rstrip("."),
         )
 
     def ready(self) -> GitSaid:
@@ -275,29 +258,13 @@ class TheProjectsCommits:
         if (self._where / "HEAD").is_file():
             return GitSaid(ok=True)
         self._where.parent.mkdir(parents=True, exist_ok=True)
-        environment = the_environment_git_is_given(
-            self._credential,
-            state_dir=self._state,
-            home=self._state,
-            known_hosts=self._known_hosts,
+        made = self._git(
+            "init", "--bare", "-q", "--template=", str(self._where), git_dir=False
         )
-        try:
-            done = subprocess.run(  # noqa: S603 - fixed argv, no shell
-                ["git", "init", "--bare", "-q", str(self._where)],
-                capture_output=True,
-                text=True,
-                errors="replace",
-                timeout=self._timeout,
-                check=False,
-                env=environment,
-            )
-        except (subprocess.TimeoutExpired, OSError) as exc:
+        if not made.ok:
             return GitSaid(
-                ok=False,
-                said=f"the publisher's own copy could not be made ({exc})",
+                ok=False, said=f"the publisher's own copy could not be made ({made.said})"
             )
-        if done.returncode != 0:
-            return GitSaid(ok=False, said=_one_line(done, self._the_addresses))
         return GitSaid(ok=True)
 
     # -- the four things it does -------------------------------------------
@@ -313,12 +280,24 @@ class TheProjectsCommits:
         ready = self.ready()
         if not ready.ok:
             return ready
+        transport = the_source_transport(self._route.source)
+        if transport is None:
+            return GitSaid(
+                ok=False,
+                said=(
+                    f"{self._route.name}'s copy is not at a git:// address or an "
+                    "absolute local folder, so the publisher will not read it"
+                ),
+            )
         fetched = self._git(
             "fetch",
             "--no-tags",
+            "--no-recurse-submodules",
             "--prune",
+            "--",
             self._route.source,
             f"+refs/heads/*:{THE_COPYS_BRANCHES}*",
+            transport=transport,
         )
         if not fetched.ok:
             return GitSaid(
@@ -352,11 +331,24 @@ class TheProjectsCommits:
         ready = self.ready()
         if not ready.ok:
             return ready
+        transport = the_remote_transport(self._route.remote)
+        if transport is None:
+            return GitSaid(
+                ok=False,
+                said=(
+                    "the remote is not an https:// or SSH address, so the "
+                    "publisher will not read it"
+                ),
+            )
         fetched = self._git(
             "fetch",
             "--no-tags",
+            "--no-recurse-submodules",
+            "--",
             self._route.remote,
             f"+refs/heads/{branch}:{THE_REMOTES_BRANCHES}{branch}",
+            transport=transport,
+            with_credential=True,
         )
         if not fetched.ok:
             return GitSaid(
@@ -381,32 +373,12 @@ class TheProjectsCommits:
 
     def is_in(self, ancestor: str, descendant: str) -> bool | None:
         """Is ``ancestor`` part of ``descendant``? ``None`` = git could not say."""
-        environment = the_environment_git_is_given(
-            self._credential,
-            state_dir=self._state,
-            home=self._state,
-            known_hosts=self._known_hosts,
+        done = run_network_git(
+            ["merge-base", "--is-ancestor", str(ancestor), str(descendant)],
+            transport="none",
+            git_dir=self._where,
+            timeout=self._timeout,
         )
-        try:
-            done = subprocess.run(  # noqa: S603 - fixed argv, no shell
-                [
-                    "git",
-                    "--git-dir",
-                    str(self._where),
-                    "merge-base",
-                    "--is-ancestor",
-                    str(ancestor),
-                    str(descendant),
-                ],
-                capture_output=True,
-                text=True,
-                errors="replace",
-                timeout=self._timeout,
-                check=False,
-                env=environment,
-            )
-        except (subprocess.TimeoutExpired, OSError):
-            return None
         if done.returncode == 0:
             return True
         if done.returncode == 1:
@@ -415,4 +387,14 @@ class TheProjectsCommits:
 
     def send(self, commit: str, branch: str) -> GitSaid:
         """An ordinary, non-forcing push of one commit to one branch."""
-        return self._git(*the_send_argv(self._route.remote, commit, branch))
+        transport = the_remote_transport(self._route.remote)
+        if transport is None:
+            return GitSaid(
+                ok=False,
+                said="the remote is not an https:// or SSH address, so nothing was sent",
+            )
+        return self._git(
+            *the_send_argv(self._route.remote, commit, branch),
+            transport=transport,
+            with_credential=True,
+        )

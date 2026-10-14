@@ -2207,12 +2207,11 @@ def build_prepared_build_admission(
     def _runner() -> Any:
         # Composed on first use, so composing the daemon never depends on it.
         if not runners:
-            from forge.adapters.git.planning_runner import WorktreeGitRunner
             from forge.cli._serve_planning import compose_planning_git_runner
 
-            composed, _resolver = compose_planning_git_runner(
-                forge_config.planning, worktree_runner_factory=WorktreeGitRunner
-            )
+            # The default in-container runner, given each project's recorded
+            # fetch address (14 October 2026).
+            composed, _resolver = compose_planning_git_runner(forge_config.planning)
             runners.append(composed)
         return runners[0]
 

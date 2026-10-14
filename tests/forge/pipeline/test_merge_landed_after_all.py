@@ -45,6 +45,7 @@ from forge.pipeline.merge_executor import (
     execute_merge_deploy,
 )
 from tests.forge._a_stand_in_coordinator import a_coordinator_that_recorded
+from tests.forge.recorded_fetch_address import allow_local_remotes, origin_of
 
 REPO_KEY = "appmilla/api_test"
 BUILD_ID = "build-FEAT-MX9-20260906"
@@ -84,8 +85,13 @@ def _git(repo: Path, *args: str) -> str:
 
 
 @pytest.fixture
-def repo(tmp_path: Path) -> Path:
-    """main with one commit, and ``autobuild/FEAT-MX9`` one commit ahead."""
+def repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """main with one commit, and ``autobuild/FEAT-MX9`` one commit ahead.
+
+    Its "remote" is a local folder, which the test allows as a fetch address;
+    the configurations below record it as the project's fetch address.
+    """
+    allow_local_remotes(monkeypatch, tmp_path / "factory-fetch-copies")
     root = tmp_path / "api_test"
     root.mkdir()
     _git(root, "init", "-b", "main", "-q")
@@ -228,7 +234,10 @@ def config(repo: Path) -> ForgeConfig:
     return ForgeConfig.model_validate(
         {
             "permissions": {"filesystem": {"allowlist": ["/tmp"]}},
-            "planning": {"target_repo_paths": {REPO_KEY: str(repo)}},
+            "planning": {
+                "target_repo_paths": {REPO_KEY: str(repo)},
+                "fetch_addresses": {REPO_KEY: origin_of(repo)},
+            },
             "approval": {"expected_approver": "rich"},
             "merge_executor": {"enabled": True},
         }
@@ -574,7 +583,10 @@ async def test_the_checks_time_limit_reaches_the_command_on_the_host(
     config = ForgeConfig.model_validate(
         {
             "permissions": {"filesystem": {"allowlist": ["/tmp"]}},
-            "planning": {"target_repo_paths": {REPO_KEY: str(repo)}},
+            "planning": {
+                "target_repo_paths": {REPO_KEY: str(repo)},
+                "fetch_addresses": {REPO_KEY: origin_of(repo)},
+            },
             "approval": {"expected_approver": "rich"},
             "merge_executor": {"enabled": True, "verify_timeout_seconds": 300},
         }

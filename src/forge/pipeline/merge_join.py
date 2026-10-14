@@ -185,8 +185,9 @@ async def target_branch_now(
         return TargetNow(
             branch=recorded,
             refusal=(
-                f"this work is aimed at the branch '{recorded}', but the remote "
-                f"named 'origin' now says its default branch is "
+                f"this work is aimed at the branch '{recorded}', but the "
+                f"project's remote (its recorded fetch address) now says its "
+                f"default branch is "
                 f"'{start.branch}'. Nothing was joined and nothing was sent: "
                 f"which branch the work belongs on is a decision for a person, "
                 f"not a guess for the factory."

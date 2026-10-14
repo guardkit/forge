@@ -79,6 +79,7 @@ import os
 import re
 import shutil
 import sqlite3
+import subprocess
 import threading
 import uuid
 from collections.abc import Mapping
@@ -105,6 +106,7 @@ from typing_extensions import NotRequired, Required, TypedDict
 
 from forge import build_processes, receipts as _receipts
 from forge.lifecycle.feature_routing import FeatureRoutingError
+from forge.project_git import run_git, run_git_async, timeout_sentence
 from forge.subagents import build_monitor
 from forge.subagents.autobuild_worktree_lifecycle import inspect_autobuild_worktree
 from forge.launch_environment import build_launch_env
@@ -2107,26 +2109,128 @@ class WorktreeMaterialisationError(RuntimeError):
     """Raised when a branch-isolated worktree cannot be created (DEFECT #19)."""
 
 
-async def _run_git(args: list[str], *, cwd: Path) -> tuple[int, str]:
-    """Run ``git <args>`` in ``cwd``; return ``(returncode, combined output)``.
+#: How long one of the runner's own git commands may take: the planning
+#: runner's per-operation limit (``WorktreeGitRunner(op_timeout_s=180.0)``).
+GIT_COMMAND_TIMEOUT_SECONDS: float = 180.0
 
-    Uses :func:`asyncio.create_subprocess_exec` — the same subprocess seam the
-    guardkit invocation uses — so tests that stub the guardkit call can
-    dispatch on ``argv[0]`` and let real git run against a throwaway repo. Only
-    LOCAL git verbs are ever passed here (``rev-parse``, ``worktree``); no
+
+async def _run_git(args: list[str], *, cwd: Path) -> tuple[int, str]:
+    """Run ``git <args>`` in ``cwd``; return ``(returncode, text)``.
+
+    The command goes through :func:`forge.project_git.run_git_async`, the one
+    way Forge runs git: a fixed environment with no factory secret, the
+    project's filters, hooks and helper programs switched off, and no network
+    command. Only LOCAL git verbs are ever passed here (``rev-parse``,
+    ``worktree``, ``branch``, ``checkout --detach``, ``for-each-ref``); no
     network verb (``fetch``/``pull``) is issued, honouring the DEFECT #19
     "read the local ref only" rule.
+
+    Git's standard output and its error output are kept apart (14 October
+    2026; before then they were merged). On success ``text`` is git's own
+    standard output, which callers parse as data. On failure ``text`` is only
+    the helper's fixed sentence ("git branch stopped with exit code 128."),
+    never git's own error words, because callers put it in log lines and in
+    a build's failure reason.
+
+    A TIME LIMIT (coach fix pass, 14 October 2026): the command runs in a
+    worker thread, so a git that never finishes would hold that thread for
+    ever. Each call gets :data:`GIT_COMMAND_TIMEOUT_SECONDS`, the same
+    per-operation limit the planning runner gives its git; a command that
+    does not finish is stopped and answers exit code 124 with the helper's
+    fixed sentence ("git worktree did not finish within 180 seconds.").
+
+    A command stopped by that limit can leave the worktree's ``index.lock``
+    behind (a ``checkout --detach`` in the F3 sweep did, and every later
+    checkout there then failed, so the sweep skipped that branch for ever).
+    The kept worktree is never removed for it (the F11 forensics law), so the
+    lock alone is cleared, and only when no git process is still working in
+    that worktree (:func:`_clear_a_lock_left_by_a_timeout`).
     """
-    proc = await asyncio.create_subprocess_exec(
-        "git",
-        *args,
-        cwd=str(cwd),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
-    )
-    out_bytes, _ = await proc.communicate()
-    code = proc.returncode if proc.returncode is not None else -1
-    return code, out_bytes.decode("utf-8", errors="replace").strip()
+    try:
+        done = await run_git_async(list(args), cwd=cwd, timeout=GIT_COMMAND_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired as exc:
+        said = exc.stderr if isinstance(exc.stderr, str) else ""
+        label = next((a for a in args if not str(a).startswith("-")), "git")
+        await asyncio.to_thread(_clear_a_lock_left_by_a_timeout, list(args), cwd)
+        return 124, said or timeout_sentence(str(label), GIT_COMMAND_TIMEOUT_SECONDS)
+    code = done.returncode if done.returncode is not None else -1
+    if code == 0:
+        return code, (done.stdout or "").strip()
+    return code, (done.stderr or "").strip()
+
+
+#: Commands that take the worktree's index lock while they run.
+_INDEX_LOCKING_COMMANDS: frozenset[str] = frozenset(
+    {"checkout", "switch", "restore", "reset", "merge", "rebase", "stash", "apply",
+     "cherry-pick", "revert", "read-tree", "update-index", "add", "commit"}
+)
+
+
+def _a_git_still_works_in(folder: Path, git_dir: Path) -> bool:
+    """True when any git process is still working in ``folder`` or on
+    ``git_dir`` (its working folder is inside one, or its command line names
+    one), or when that cannot be told. Read from ``/proc``."""
+    proc = Path("/proc")
+    if not proc.is_dir():
+        return True
+    targets = {str(folder.resolve()), str(git_dir.resolve())}
+    for entry in proc.iterdir():
+        if not entry.name.isdigit() or entry.name == str(os.getpid()):
+            continue
+        try:
+            argv = [a.decode("utf-8", "replace") for a in
+                    (entry / "cmdline").read_bytes().split(b"\0") if a]
+            if not argv or not os.path.basename(argv[0]).startswith("git"):
+                continue
+            where = os.readlink(entry / "cwd")
+        except OSError:
+            continue
+        if any(where == t or where.startswith(t + "/") for t in targets):
+            return True
+        if any(t in word for t in targets for word in argv):
+            return True
+    return False
+
+
+def _clear_a_lock_left_by_a_timeout(args: list[str], cwd: Path) -> None:
+    """After a command that takes the index lock was stopped by the time
+    limit, remove the ``index.lock`` it left in its worktree's git folder, so
+    the next run can use that worktree. Only when no git process is still
+    working there: the stopped command was killed and waited for by the git
+    helper, and with the helper's fixed settings it starts no other program
+    (no hooks, filters, file monitor or background work). Never raises."""
+    command = [str(a) for a in args]
+    folder = Path(cwd)
+    while command[:1] == ["-C"] and len(command) > 1:
+        folder = folder / command[1]
+        command = command[2:]
+    if not command or command[0] not in _INDEX_LOCKING_COMMANDS:
+        return
+    try:
+        found = run_git(["-C", str(folder), "rev-parse", "--absolute-git-dir"], timeout=30)
+        git_dir = Path((found.stdout or "").strip())
+        if found.returncode != 0 or not git_dir.is_absolute():
+            return
+        lock = git_dir / "index.lock"
+        if not lock.is_file() or _a_git_still_works_in(folder, git_dir):
+            return
+        lock.unlink()
+        logger.warning(
+            "autobuild_runner: git %s in %s was stopped by its time limit and "
+            "left %s; no git is still working there, so the lock was removed "
+            "(the worktree and its files are kept)",
+            command[0],
+            folder,
+            lock,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning(
+            "autobuild_runner: a lock left by a stopped git %s in %s could not "
+            "be cleared (%s)",
+            command[0] if command else "command",
+            folder,
+            type(exc).__name__,
+        )
 
 
 async def _local_branch_exists(repo_path: Path, branch: str) -> bool:
@@ -2381,7 +2485,9 @@ async def _sweep_build_refs(repo_path: Path, feature_id: str) -> None:
     itemised:
 
     1. ``git worktree prune --verbose`` — drops registrations whose dirs are
-       gone, and names each one in the log. The repository is shared with the
+       gone. (Git writes the names it prunes to its error output, which the
+       git helper discards since 14 October 2026, so the log says only that
+       the prune ran.) The repository is shared with the
        sandbox helper, whose planning worktrees live in ITS OWN temporary
        folder, which this container cannot see; the helper locks them while
        they are in use, and git never prunes a locked worktree (8 October
@@ -6194,16 +6300,13 @@ def _resolve_runner_code_version() -> str:
     """
     module_dir = Path(__file__).resolve().parent
     try:
-        import subprocess  # local import — runs once at module import
-
-        result = subprocess.run(  # noqa: S603 — fixed argv, no shell
-            ["git", "-C", str(module_dir), "rev-parse", "--short", "HEAD"],
-            capture_output=True,
-            text=True,
+        # Through the one git helper (14 October 2026), like every other git
+        # command Forge runs; the same five-second limit as before.
+        result = run_git(
+            ["-C", str(module_dir), "rev-parse", "--short", "HEAD"],
             timeout=5,
-            check=False,
         )
-        rev = result.stdout.strip()
+        rev = result.stdout.strip() if result.returncode == 0 else ""
         if rev:
             return f"git-{rev}"
     except Exception:  # noqa: BLE001 — never block import on the stamp

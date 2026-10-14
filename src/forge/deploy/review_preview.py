@@ -106,6 +106,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote, unquote
 
+from forge.project_git import run_git
+
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from nats_core.events import ReviewEvidence
 
@@ -618,7 +620,24 @@ _GIT_IDENTITY: dict[str, str] = {
 
 
 def _run_command(argv: Sequence[str]) -> tuple[int, str, str]:
-    """Run one fixed argument list (no shell), with a one-minute wall."""
+    """Run one fixed argument list (no shell), with a one-minute wall.
+
+    Git commands go through Forge's one way of running git
+    (:func:`forge.project_git.run_git`): a fixed environment with no factory
+    secret, no hooks, filters, merge programs or signing from the project's
+    settings, and on failure a fixed sentence instead of git's own text, so
+    nothing git prints reaches the review card. Only the commit identity is
+    passed in. Every other command (the container engine) runs as before.
+    """
+    if argv and argv[0] == "git":
+        try:
+            done = run_git(list(argv), timeout=60, env=_GIT_IDENTITY)
+        except subprocess.TimeoutExpired as exc:
+            # The helper's timeout carries only a sentence naming the command.
+            return 127, "", str(exc.stderr or "git did not finish within 60 seconds.")
+        except OSError as exc:  # a refusal (GitRefused) or git missing
+            return 127, "", f"{type(exc).__name__}: {exc}"
+        return done.returncode, done.stdout or "", done.stderr or ""
     try:
         done = subprocess.run(  # noqa: S603 — fixed argv, no shell
             list(argv),
@@ -699,7 +718,10 @@ def make_preview_tree(
         return {
             "refusal": (
                 f"git could not join the candidate onto {onto[:10]}: "
-                f"{_last_line(err) or _last_line(out) or f'exit code {code}'}"
+                # Only the runner's stderr: for the real runner that is the
+                # helper's fixed sentence. A failed command's stdout is not
+                # read for the reason, as it can carry git's own words.
+                f"{_last_line(err) or f'exit code {code}'}"
             )
         }
     tree = lines[0].strip()
