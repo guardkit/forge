@@ -2374,6 +2374,34 @@ def _class_assignment_hides_outer(
     return positions[id(node)] < positions[id(child)]
 
 
+_COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+
+
+def _class_lookup_at(mod: _Module, at: ast.AST) -> ast.ClassDef | None:
+    """The class whose OWN bindings a name at ``at`` is looked up in, if any
+    (15 October 2026, class bodies, review 3): as for
+    :func:`_class_body_at`, except that a comprehension or generator
+    expression is a scope of its own that, like a function or lambda, skips
+    the enclosing class's bindings. Only a comprehension's outermost
+    iterable is evaluated in the class scope."""
+    previous: ast.AST | None = None
+    child: ast.AST = at
+    current = mod.parents.get(id(at))
+    while current is not None:
+        if isinstance(current, _COMPREHENSIONS):
+            first = current.generators[0]
+            if not (child is first and previous is first.iter):
+                return None  # inside the comprehension's own scope
+        elif isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            scope = _evaluation_scope(mod, at)
+            return scope if isinstance(scope, ast.ClassDef) else None
+        elif isinstance(current, ast.ClassDef):
+            scope = _evaluation_scope(mod, at)
+            return scope if isinstance(scope, ast.ClassDef) else None
+        previous, child, current = child, current, mod.parents.get(id(current))
+    return None
+
+
 def _class_body_at(mod: _Module, at: ast.AST) -> ast.ClassDef | None:
     """The class whose body ``at`` is written directly in (outside any
     method), if any."""
@@ -2422,7 +2450,7 @@ def _possible_name_targets(mod: _Module, name: str, at: ast.AST) -> set[str]:
     # when one plain unconditional assignment at the top of the class body,
     # earlier than the use, is the class's only binding of the name
     # (:func:`_class_assignment_hides_outer`).
-    klass = _class_body_at(mod, at)
+    klass = _class_lookup_at(mod, at)
     if klass is not None:
         found = _bindings(klass).get(name, [])
         if found:
@@ -2500,7 +2528,7 @@ def _resolve_all_strict(mod: _Module, func_node: ast.AST, at: ast.AST) -> set[st
     """
     if isinstance(func_node, ast.Name):
         name = func_node.id
-        klass = _class_body_at(mod, at)
+        klass = _class_lookup_at(mod, at)
         if klass is not None and _bindings(klass).get(name):
             # Bound in the class body it is used in: it may be the class's
             # binding or the outer one (review 2), so nothing can vouch for
@@ -3238,7 +3266,9 @@ def _guarded_callables() -> set[str]:
     return names
 
 
-def _direct_use_violations(modules: list[_Module]) -> list[str]:
+def _direct_use_violations(
+    modules: list[_Module], wrappers: frozenset[str] = frozenset()
+) -> list[str]:
     """The direct-use-only rule (14 October 2026).
 
     For every guarded name — a launch module, a launch function, a generic
@@ -3255,7 +3285,9 @@ def _direct_use_violations(modules: list[_Module]) -> list[str]:
 
     Type annotations name things without running them and are left out.
     """
-    callables = _guarded_callables()
+    # The discovered wrappers' names are guarded like the helper's (15
+    # October 2026, class bodies, review 3, R4).
+    callables = _guarded_callables() | {w.rsplit(".", 1)[1] for w in wrappers}
     problems: list[str] = []
     for mod in modules:
         skip = _annotation_nodes(mod.tree)
@@ -3370,6 +3402,21 @@ def _direct_use_violations(modules: list[_Module]) -> list[str]:
                             f"the launch-bearing module {bearing} is referred to other "
                             "than as the base of an attribute",
                         )
+        # A guarded name stored or deleted as an attribute through setattr,
+        # delattr or the dunder methods, by a literal string (15 October
+        # 2026, class bodies, review 3, R4).
+        for node in ast.walk(mod.tree):
+            if (
+                isinstance(node, ast.Call)
+                and _last_name(node.func) in ("setattr", "delattr", "__setattr__", "__delattr__")
+            ):
+                for argument in node.args:
+                    if (
+                        isinstance(argument, ast.Constant)
+                        and isinstance(argument.value, str)
+                        and argument.value in callables
+                    ):
+                        report(node, f"{argument.value} is rebound as an attribute")
     return problems
 
 
@@ -3727,7 +3774,7 @@ def unaccounted_launches(package: Path) -> list[str]:
                             "helper's reader"
                         )
     problems.extend(_reserved_name_rebindings(modules, frozenset(wrappers)))
-    problems.extend(_direct_use_violations(modules))
+    problems.extend(_direct_use_violations(modules, frozenset(wrappers)))
     for (rel, fname), spec in GENERIC_RUNNERS.items():
         for mod in modules:
             for node in ast.walk(mod.tree):
@@ -6713,6 +6760,155 @@ def test_the_environment_helpers_name_is_reserved_in_the_whole_package(tmp_path:
     ), problems
     assert not any(p.startswith("zz_imports.py:") for p in problems), problems
     assert not any(" in ok_" in p for p in problems), problems
+
+
+#: Class bodies, review 3, R3 (15 October 2026): a comprehension, generator
+#: expression or lambda is a scope of its own that skips the enclosing
+#: class's bindings, so a class-local ``subprocess = "label"`` does not hide
+#: the module inside one; only a comprehension's outermost iterable is
+#: evaluated in the class scope. Rejected: the list, set, dict and generator
+#: versions, a lambda called right away, and an outermost iterable that is
+#: itself a launch. Clean: review 1's control.
+GUARD_PROBES_34: dict[str, str] = {
+    "__init__.py": "",
+    "zz_ok.py": GUARD_PROBES_31["zz_ok.py"],
+    "zz_main.py": textwrap.dedent(
+        '''\
+        import subprocess
+
+
+        class p34_list_comprehension:
+            subprocess = "label"
+            results = [subprocess.run(["make"]) for _ in range(1)]
+
+
+        class p34_set_comprehension:
+            subprocess = "label"
+            results = {subprocess.run(["make"]) for _ in range(1)}
+
+
+        class p34_dict_comprehension:
+            subprocess = "label"
+            results = {i: subprocess.run(["make"]) for i in range(1)}
+
+
+        class p34_generator_expression:
+            subprocess = "label"
+            results = list(subprocess.run(["make"]) for _ in range(1))
+
+
+        class p34_lambda_called_right_away:
+            subprocess = "label"
+            result = (lambda: subprocess.run(["make"]))()
+
+
+        class p34_outermost_iterable_is_a_launch:
+            results = [line for line in subprocess.check_output(["make"]).splitlines()]
+        '''
+    ),
+}
+
+
+def test_a_comprehension_in_a_class_body_skips_the_class_bindings(tmp_path: Path) -> None:
+    problems = unaccounted_launches(_write_package(tmp_path, GUARD_PROBES_34))
+    named = {p.split(" in ", 1)[1].split(":", 1)[0] for p in problems if p.startswith("zz_main.py:")}
+    expected = {
+        n.name
+        for n in ast.parse(GUARD_PROBES_34["zz_main.py"]).body
+        if isinstance(n, ast.ClassDef) and n.name.startswith("p34_")
+    }
+    assert len(expected) == 6
+    assert expected - named == set(), f"slipped past the guard: {sorted(expected - named)}"
+    assert not any(p.startswith("zz_ok.py:") for p in problems), problems
+
+
+#: Class bodies, review 3, R4 (15 October 2026): a reserved environment name
+#: (the helper's or a discovered wrapper's) used as the attribute name of
+#: any store or delete target is a violation, whatever the object: a plain,
+#: augmented or annotated assignment, ``del``, a ``for`` or ``with`` target,
+#: an unpacking target, and setattr or delattr with a literal name. Clean:
+#: the wrapper's own definition, and the wrapper imported and called.
+GUARD_PROBES_35: dict[str, str] = {
+    "__init__.py": "",
+    "zz_wrapper.py": GUARD_PROBES_33["zz_wrapper.py"],
+    "zz_wrapper_user.py": textwrap.dedent(
+        '''\
+        import subprocess
+
+        from forge.zz_wrapper import project_env
+
+
+        def ok_wrapper_imported_and_called(cmd, folder):
+            subprocess.run(cmd, env=project_env(folder))
+        '''
+    ),
+    "zz_attributes.py": textwrap.dedent(
+        '''\
+        class C:
+            pass
+
+
+        def p35_plain_assignment():
+            C.project_env = None
+
+
+        def p35_augmented_assignment():
+            C.project_env += 1
+
+
+        def p35_annotated_assignment():
+            C.project_env: object = None
+
+
+        def p35_delete():
+            del C.project_env
+
+
+        def p35_for_target():
+            for C.project_env in []:
+                pass
+
+
+        def p35_with_target(manager):
+            with manager as C.project_env:
+                pass
+
+
+        def p35_unpacking_target():
+            C.project_env, other = 1, 2
+            return other
+
+
+        def p35_setattr():
+            setattr(C, "project_env", None)
+
+
+        def p35_delattr():
+            delattr(C, "project_env")
+
+
+        def p35_helper_name_as_an_attribute():
+            C.build_project_command_env = None
+        '''
+    ),
+}
+
+
+def test_a_reserved_name_is_never_an_attribute_store_target(tmp_path: Path) -> None:
+    problems = unaccounted_launches(_write_package(tmp_path, GUARD_PROBES_35))
+    named = {
+        p.split(" in ", 1)[1].split(":", 1)[0]
+        for p in problems
+        if p.startswith("zz_attributes.py:") and "rebound as an attribute" in p
+    }
+    expected = {
+        n.name
+        for n in ast.parse(GUARD_PROBES_35["zz_attributes.py"]).body
+        if isinstance(n, ast.FunctionDef) and n.name.startswith("p35_")
+    }
+    assert len(expected) == 10
+    assert expected - named == set(), f"slipped past the guard: {sorted(expected - named)}"
+    assert not any(p.startswith(("zz_wrapper.py:", "zz_wrapper_user.py:")) for p in problems), problems
 
 
 def test_env_slots_are_read_from_signatures() -> None:
