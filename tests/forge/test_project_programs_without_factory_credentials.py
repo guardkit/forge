@@ -1986,8 +1986,86 @@ def _imports(tree: ast.Module, dotted: str, is_package: bool) -> dict[str, set[s
     return out
 
 
+#: The package's own modules by dotted name, for following a name it
+#: re-exports to what it finally is (set by :func:`unaccounted_launches`).
+_PACKAGE_MODULES: dict[str, _Module] = {}
+
+#: A name whose chain through the package's own modules cannot be followed
+#: to an end (a cycle, a missing or doubled binding, a binding other than an
+#: import, a definition or one plain assignment): in call position it is
+#: treated as a possible launch.
+UNRESOLVED = "?unresolved:"
+
+_FINAL_CACHE: dict[str, frozenset[str]] = {}
+
+
+def _finalise(dotted: str, seen: frozenset[str] = frozenset()) -> set[str]:
+    """Follow a name through the package's own modules to its final identity
+    (14 October 2026).
+
+    ``forge.a.run`` where ``forge/a.py`` says ``from subprocess import run``
+    finally names ``subprocess.run``: the exporting module's own binding of
+    the name is followed — an import to what it imports, again and again —
+    until the name leaves the package or reaches a single definition or a
+    single plain assignment (the exporting module's own direct-use rule keeps
+    a launch, a runner or a launch module out of any stored name). A cycle,
+    several bindings, any other kind of binding or no binding at all cannot
+    be followed and ends ``UNRESOLVED``. A name outside the package, or a
+    module itself, is its own end.
+    """
+    cached = _FINAL_CACHE.get(dotted)
+    if cached is not None and not seen:
+        return set(cached)
+    parts = dotted.split(".")
+    for cut in range(len(parts), 0, -1):
+        prefix = ".".join(parts[:cut])
+        if prefix in _PACKAGE_MODULES:
+            break
+    else:
+        return {dotted}
+    if cut == len(parts):
+        return {dotted}
+    if dotted in seen:
+        return {UNRESOLVED + dotted}
+    mod = _PACKAGE_MODULES[prefix]
+    name, rest = parts[cut], parts[cut + 1:]
+    bound = _bindings(mod.tree).get(name, [])
+    kinds = {kind for kind, _node in bound}
+    result: set[str]
+    if not bound and mod.rel.endswith("__init__.py"):
+        # A package's ``__init__`` that does not bind the name: the name is
+        # a submodule of the package (one this scan did not load), never a
+        # re-export, so it is its own end.
+        result = {dotted}
+    elif len(bound) == 1 and kinds <= {"def", "class", "assign", "annassign"}:
+        # A single definition, or a single plain assignment, is an end: the
+        # exporting module's own direct-use rule already refuses to store a
+        # launch function, runner or launch module in a name.
+        result = {dotted}
+    elif bound and kinds == {"import"}:
+        result = set()
+        for _kind, node in bound:
+            for local, target in _import_bindings(node, mod.package):
+                if local != name:
+                    continue
+                for final in _finalise(target, seen | {dotted}):
+                    if rest and not final.startswith(UNRESOLVED):
+                        final = f"{final}.{'.'.join(rest)}"
+                    result.add(final)
+        result = result or {UNRESOLVED + dotted}
+    else:
+        result = {UNRESOLVED + dotted}
+    if not seen:
+        _FINAL_CACHE[dotted] = frozenset(result)
+    return result
+
+
 def _targets(mod: _Module, name: str) -> set[str]:
-    return mod.imports.get(name, set())
+    """Every final identity a name imported in ``mod`` may have."""
+    out: set[str] = set()
+    for target in mod.imports.get(name, set()):
+        out |= _finalise(target)
+    return out
 
 
 def _dotted(node: ast.AST) -> str:
@@ -2205,7 +2283,12 @@ def _resolve_all(mod: _Module, func_node: ast.AST, at: ast.AST) -> set[str]:
             if klass is not None:
                 return {f"{mod.dotted}.{klass.name}.{func_node.attr}"}
             return set()
-        return {f"{base}.{func_node.attr}" for base in _resolve_all(mod, value, at)}
+        return {
+            final
+            for base in _resolve_all(mod, value, at)
+            if not base.startswith(UNRESOLVED)
+            for final in _finalise(f"{base}.{func_node.attr}")
+        }
     return set()
 
 
@@ -2470,7 +2553,7 @@ def _launch_kind(mod: _Module, node: ast.AST) -> str | None:
     elif isinstance(node, ast.Name):
         candidates |= _resolve_all(mod, node, node) | _targets(mod, node.id)
     for target in sorted(candidates):
-        if _is_launch(target):
+        if _is_launch(target) or target.startswith(UNRESOLVED):
             return target
     return None
 
@@ -2588,9 +2671,9 @@ def _reserved_name_rebindings(modules: list[_Module]) -> list[str]:
     problems: list[str] = []
     for mod in modules:
         reserved = set(base)
-        for alias, every in mod.imports.items():
-            for target in every:
-                module, _, last = target.rpartition(".")
+        for alias in mod.imports:
+            for target in _targets(mod, alias):
+                last = target.rpartition(".")[2]
                 if last in base or target in HELPERS or _is_launch(target):
                     reserved.add(alias)
 
@@ -2606,14 +2689,14 @@ def _reserved_name_rebindings(modules: list[_Module]) -> list[str]:
             for name, target in _import_bindings(node, mod.package):
                 if name != local:
                     continue
-                module, _, last = target.rpartition(".")
-                if not (
-                    target in HELPERS
-                    or any(target in spec["dotted"] for spec in GENERIC_RUNNERS.values())
-                    or _is_launch(target)
-                    or _is_launch_module(target)
-                ):
-                    return False
+                for final in _finalise(target):
+                    if not (
+                        final in HELPERS
+                        or any(final in spec["dotted"] for spec in GENERIC_RUNNERS.values())
+                        or _is_launch(final)
+                        or _is_launch_module(final)
+                    ):
+                        return False
             return True
 
         scopes: list[ast.AST] = [mod.tree] + [
@@ -2802,13 +2885,21 @@ def _attribute_chain_targets(mod: _Module, node: ast.Attribute) -> set[str]:
         return set()
     suffix = ".".join(reversed(attributes))
     bases = _resolve_all(mod, current, current) | _targets(mod, current.id)
-    return {f"{base}.{suffix}" for base in bases}
+    return {
+        final
+        for base in bases
+        if not base.startswith(UNRESOLVED)
+        for final in _finalise(f"{base}.{suffix}")
+    }
 
 
 def unaccounted_launches(package: Path) -> list[str]:
     _SCOPE_CACHE.clear()
     _QUALNAME_CACHE.clear()
+    _FINAL_CACHE.clear()
     modules = _load_modules(package)
+    _PACKAGE_MODULES.clear()
+    _PACKAGE_MODULES.update({m.dotted: m for m in modules})
     wrappers = _wrappers(modules)
     problems_of_trust = _untrusted_definitions(modules)
     problems: list[str] = []
@@ -4481,6 +4572,94 @@ def test_a_launch_bearing_module_is_only_ever_an_attribute_base(tmp_path: Path) 
     assert len(expected) == 4
     assert expected - named == set(), f"slipped past the guard: {sorted(expected - named)}"
     assert any("multiprocessing.popen_fork is referred to" in p for p in problems), problems
+    assert not {n for n in named if n.startswith("ok_")}, problems
+
+
+#: Re-exports through the package's own modules, probed (14 October 2026):
+#: subprocess.run and a generic runner re-exported through another module,
+#: a two-hop re-export and a cyclic one. The control is a re-exported launch
+#: given the helper's environment. Each name is followed to its final
+#: identity; a cycle is treated as a possible launch.
+GUARD_PROBES_18: dict[str, str] = {
+    "zz_a.py": textwrap.dedent(
+        '''\
+        from subprocess import run
+
+        from forge.deploy_sidecar.service import _start_and_collect
+        '''
+    ),
+    "zz_b.py": textwrap.dedent(
+        '''\
+        import os
+
+        from forge.launch_environment import build_project_command_env
+
+        from .zz_a import _start_and_collect, run
+
+
+        def p18_reexported_subprocess_run(cmd):
+            run(cmd, shell=True)
+
+
+        def p18_reexported_generic_runner(cmd):
+            return _start_and_collect(argv=cmd, cwd=".", env=dict(os.environ), timeout=1, what="x")
+
+
+        def ok_reexported_launch_with_helper_env(cmd, folder):
+            run(cmd, env=build_project_command_env(folder))
+        '''
+    ),
+    "zz_hop2.py": textwrap.dedent(
+        '''\
+        from .zz_a import run
+        '''
+    ),
+    "zz_c.py": textwrap.dedent(
+        '''\
+        from .zz_hop2 import run
+
+
+        def p18_two_hop(cmd):
+            run(cmd, shell=True)
+        '''
+    ),
+    "zz_cycle_one.py": textwrap.dedent(
+        '''\
+        from .zz_cycle_two import loop_name
+        '''
+    ),
+    "zz_cycle_two.py": textwrap.dedent(
+        '''\
+        from .zz_cycle_one import loop_name
+        '''
+    ),
+    "zz_d.py": textwrap.dedent(
+        '''\
+        from .zz_cycle_one import loop_name
+
+
+        def p18_cyclic(cmd):
+            loop_name(cmd)
+        '''
+    ),
+}
+
+
+def test_a_reexported_launch_is_followed_to_what_it_finally_is(tmp_path: Path) -> None:
+    pkg = tmp_path / "forge"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    for name, text in GUARD_PROBES_18.items():
+        (pkg / name).write_text(text, encoding="utf-8")
+    problems = unaccounted_launches(pkg)
+    named = {p.split(" in ", 1)[1].split(":", 1)[0] for p in problems}
+    assert {
+        "p18_reexported_subprocess_run",
+        "p18_reexported_generic_runner",
+        "p18_two_hop",
+        "p18_cyclic",
+    } <= named, problems
+    assert any("in p18_two_hop: process launch subprocess.run" in p for p in problems), problems
     assert not {n for n in named if n.startswith("ok_")}, problems
 
 
