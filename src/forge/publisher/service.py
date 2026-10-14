@@ -773,18 +773,18 @@ class Publisher:
             )
         if private:
             logger.warning(
-                "publisher: %s holds %d new file version(s) naming a private "
-                "folder; nothing was sent",
+                "publisher: %s holds %d file version(s), file name(s) or commit "
+                "message(s) naming a private folder; nothing was sent",
                 j_commit[:10],
                 private[0].count,
             )
             return _refused(
                 IT_HOLDS_PRIVATE_PATHS,
                 f"{j_commit[:10]} would publish {private[0].count} new file "
-                f"version(s), first {private[0].first}, naming a folder that "
-                "exists only on the factory's own machines. Nothing was sent. "
-                "Build the feature again on a release that keeps such paths "
-                "out of commits.",
+                "version(s), file name(s) or commit message(s) naming a folder "
+                "that exists only on the factory's own machines (first: "
+                f"{private[0].first}). Nothing was sent. Build the feature "
+                "again on a release that keeps such paths out of commits.",
                 remote_now=remote_now,
             )
         logger.info(

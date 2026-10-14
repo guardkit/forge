@@ -693,3 +693,91 @@ class TestTheSettingIsRequired:
         assert loaded.private_path_prefixes == (PRIVATE, "/srv/sandboxes/storage")
         assert "private_path_prefixes" not in json.dumps(loaded.without_secrets())
         assert loaded.without_secrets()["private_path_prefix_count"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Coach review 1 fix pass
+# ---------------------------------------------------------------------------
+
+
+class TestCoachFixPass1:
+    def test_f2_a_record_under_a_folder_name_with_a_line_break_is_refused(
+        self, world: World
+    ) -> None:
+        world.commit({"we\nird/.guardkit/autobuild/x.json": '{"turn": 1}\n'})
+        world.commit({"we\nird/.guardkit/autobuild/x.json": None, "src/app.txt": "two\n"})
+        project = world.join()
+
+        refused(world, world.publish(project), RECORDS_KIND)
+
+    def test_f4_a_longer_folder_name_that_starts_the_same_is_published(
+        self, world: World
+    ) -> None:
+        world.commit({"deploy/Dockerfile": f"WORKDIR {PRIVATE}s-shop/app\n"})
+        project = world.join()
+
+        published(world, world.publish(project), project)
+
+    @pytest.mark.parametrize(
+        "text",
+        [f'{{"cwd": "{PRIVATE}"}}\n', f"cd {PRIVATE}\n", f"{PRIVATE}"],
+        ids=["quoted", "end of a line", "end of the file"],
+    )
+    def test_f4_the_folder_itself_is_still_found(self, world: World, text: str) -> None:
+        world.commit({"deploy/notes.txt": text})
+        project = world.join()
+
+        refused(world, world.publish(project), PRIVATE_KIND)
+
+    def test_a_commit_message_naming_a_private_folder_is_refused(
+        self, world: World
+    ) -> None:
+        world.write({"src/app.txt": "two\n"})
+        world.run("add", "-A")
+        world.run("commit", "-q", "-m", f"work done in {PRIVATE}/projects/shop")
+        named = world.run("rev-parse", "HEAD")
+        project = world.join()
+
+        sentence = refused(world, world.publish(project), PRIVATE_KIND)
+
+        assert PRIVATE not in sentence
+        assert f"the message of commit {named[:10]}" in sentence
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            f"mirror{PRIVATE}/forge-state/x.txt",
+            f"{PRIVATE.lstrip('/')}/notes.txt",
+            f"mirror{PRIVATE}/café à la carte.txt",
+        ],
+        ids=["inside a folder", "at the top", "a name git would quote"],
+    )
+    def test_a_file_path_holding_a_private_folder_is_refused(
+        self, world: World, path: str
+    ) -> None:
+        world.commit({path: "ordinary text\n"})
+        world.commit({path: None, "src/app.txt": "two\n"})
+        project = world.join()
+
+        sentence = refused(world, world.publish(project), PRIVATE_KIND)
+
+        assert PRIVATE not in sentence
+        assert PRIVATE.lstrip("/") not in sentence
+
+
+class TestTheSettingRefusesGenericFolders:
+    @pytest.mark.parametrize(
+        "value",
+        ["/home/node", "/home/runner", "/usr/local/bin", "/usr/share", "/opt/app",
+         "/var/lib", "/tmp/build", "/srv/app", "/root/app", "/app/src"],
+    )
+    def test_a_generic_folder_is_refused(self, tmp_path: Path, value: str) -> None:
+        with pytest.raises(SettingsRefused):
+            load_settings(_settings_file(tmp_path, private_path_prefixes=[value]))
+
+    @pytest.mark.parametrize(
+        "value", [PRIVATE, "/Users/example", "/srv/sandboxes/storage", "/opt/factory/receipts"]
+    )
+    def test_a_machine_s_own_folder_is_read(self, tmp_path: Path, value: str) -> None:
+        loaded = load_settings(_settings_file(tmp_path, private_path_prefixes=[value]))
+        assert loaded.private_path_prefixes == (value,)

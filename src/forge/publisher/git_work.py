@@ -281,8 +281,23 @@ def _raw_moves(text: str) -> list[tuple[str, str, str]]:
     return moves
 
 
-def _blobs_holding(data: bytes, wanted: list[str], needles: list[bytes]) -> set[str] | None:
-    """The blob ids among ``wanted`` whose bytes hold any of ``needles``,
+#: What may follow a private folder name for it to count: anything but a
+#: character that would continue the folder's own name. So ``/home/example``
+#: is found in ``/home/example/x``, ``"/home/example"`` and at the end of a
+#: file, and not in ``/home/examples-shop`` (coach review 1, F4).
+_NAME_GOES_ON = rb"(?![A-Za-z0-9._\-])"
+
+
+def _private_folder_pattern(prefixes: list[str]) -> "re.Pattern[bytes]":
+    """One pattern matching any of ``prefixes`` on a folder-name boundary."""
+    alternatives = b"|".join(re.escape(p.encode("utf-8")) for p in prefixes)
+    return re.compile(b"(?:" + alternatives + b")" + _NAME_GOES_ON)
+
+
+def _blobs_holding(
+    data: bytes, wanted: list[str], private: "re.Pattern[bytes]"
+) -> set[str] | None:
+    """The blob ids among ``wanted`` whose bytes hold a private folder name,
     from ``git cat-file --batch`` output. ``None`` when the output is not
     what was asked for (a missing object, a short read)."""
     found: set[str] = set()
@@ -304,10 +319,28 @@ def _blobs_holding(data: bytes, wanted: list[str], needles: list[bytes]) -> set[
         content = data[start : start + size]
         if len(content) != size:
             return None
-        if any(needle in content for needle in needles):
+        if private.search(content):
             found.add(object_id)
         at = start + size + 1  # the newline after the content
     return found
+
+
+#: What a finding says in place of a file name that holds a private folder.
+NAME_NOT_WRITTEN = "a file whose name is not written here"
+
+
+def _unquoted(finding: Finding, prefixes: list[str]) -> Finding:
+    """The same finding, with any file name holding a private folder name
+    replaced: a refusal sentence never quotes one."""
+    def clean(text: str) -> str:
+        return NAME_NOT_WRITTEN if any(p in text for p in prefixes) else text
+
+    return Finding(
+        finding.look,
+        finding.count,
+        clean(finding.first),
+        tuple(clean(path) for path in finding.paths),
+    )
 
 
 def without_the_addresses(said: str, addresses: "Iterable[str]" = ()) -> str:
@@ -587,13 +620,21 @@ class TheProjectsCommits:
         d. **Private folder names**: every blob the range adds, changes or
            retypes, at any path, merges included, is read whole and its raw
            bytes searched for each private prefix. A gitlink is never read.
-           A blob seen twice is read once.
+           A blob seen twice is read once. The names of the files the range
+           adds, changes or retypes (as ``-z`` prints them, never quoted, and
+           with a leading ``/`` so a folder at the top counts) and every
+           commit message in the range are searched too (coach review 1). A
+           prefix counts only where the folder's name ends: followed by
+           ``/``, the end, or any character that cannot continue a name.
 
-        No look parses a patch, and nothing is removed or rewritten.
+        No look parses a patch, and nothing is removed or rewritten. No
+        finding's sentence quotes a private folder name: a name holding one
+        is not written down.
         """
-        needles = [p.encode("utf-8") for p in private_prefixes if str(p or "")]
-        if not needles:
+        prefixes = [str(p) for p in private_prefixes if str(p or "")]
+        if not prefixes:
             return None
+        private = _private_folder_pattern(prefixes)
         if a_plain_commit_name(since) is None or a_plain_commit_name(commit) is None:
             return None
         span = f"{since}..{commit}"
@@ -671,7 +712,10 @@ class TheProjectsCommits:
         added = self._read(*_HISTORY, "--diff-filter=AMT", span)
         if added is None:
             return None
-        new_blobs = [entry for entry in _raw_entries(added) if entry.is_new_blob]
+        added_entries = [
+            entry for entry in _raw_entries(added) if not _NO_OBJECT.match(entry.object_id)
+        ]
+        new_blobs = [entry for entry in added_entries if entry.is_new_blob]
         copies: dict[str, str] = {}
         for entry in new_blobs:
             if is_factory_record(entry.path) or entry.object_id not in record_blobs:
@@ -703,16 +747,50 @@ class TheProjectsCommits:
             )
             if not done.ok:
                 return None
-            found = _blobs_holding(done.data, chunk, needles)
+            found = _blobs_holding(done.data, chunk, private)
             if found is None:
                 return None
             holding |= found
-        if holding:
-            matched = tuple(
-                dict.fromkeys(e.path for e in new_blobs if e.object_id in holding)
+        matched = tuple(
+            dict.fromkeys(e.path for e in new_blobs if e.object_id in holding)
+        )
+        named_in_path = list(
+            dict.fromkeys(
+                e.path
+                for e in added_entries
+                if private.search(("/" + e.path).encode("utf-8", "surrogateescape"))
             )
-            findings.append(Finding("d", len(holding), matched[0], matched))
-        return findings
+        )
+        messages = run_network_git(
+            ["log", "-z", "--format=%H%n%B", span],
+            transport="none",
+            git_dir=self._where,
+            timeout=self._timeout,
+            binary=True,
+        )
+        if not messages.ok:
+            return None
+        named_in_message = [
+            record.split(b"\n", 1)[0].decode("ascii", "replace").strip()
+            for record in messages.data.split(b"\0")
+            if record.strip() and private.search(record.split(b"\n", 1)[-1])
+        ]
+        if holding or named_in_path or named_in_message:
+            if matched:
+                first = matched[0]
+            elif named_in_path:
+                first = "a file name in those commits"
+            else:
+                first = f"the message of commit {named_in_message[0][:10]}"
+            findings.append(
+                Finding(
+                    "d",
+                    len(holding) + len(named_in_path) + len(named_in_message),
+                    first,
+                    matched,
+                )
+            )
+        return [_unquoted(f, prefixes) for f in findings]
 
     def send(self, commit: str, branch: str) -> GitSaid:
         """An ordinary, non-forcing push of one commit to one branch."""

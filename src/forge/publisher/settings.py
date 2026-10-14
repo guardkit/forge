@@ -214,18 +214,40 @@ def _a_route_s_key_name(block: Any, project: str) -> str | None:
     return str(value)
 
 
-#: Folders shared by every machine, or too broad to be one machine's own.
-#: A prefix equal to one of these would match ordinary product files.
-_SHARED_FOLDERS: frozenset[str] = frozenset(
-    {
-        "/home", "/var", "/tmp", "/usr", "/opt", "/srv", "/etc", "/mnt",
-        "/media", "/root", "/run", "/Users", "/private", "/Volumes", "/data",
-        "/var/lib", "/var/tmp", "/var/log", "/var/run", "/var/cache",
-        "/var/folders", "/usr/local", "/usr/lib", "/usr/share", "/usr/bin",
-        "/opt/homebrew", "/private/var", "/private/tmp", "/home/runner",
-        "/Users/Shared",
-    }
+#: THE RULE FOR A PRIVATE FOLDER (coach review 1). A value is refused when:
+#:
+#: 1. it is not an absolute path at least two folders deep;
+#: 2. it is under a system folder (:data:`_SYSTEM_FOLDERS`), at any depth;
+#: 3. it is exactly two deep under a shared top folder (:data:`_SHARED_TOPS`),
+#:    such as ``/opt/app`` or ``/var/lib``;
+#: 4. it is the home folder of a common container or CI user
+#:    (:data:`_SHARED_USERS`), such as ``/home/node``.
+#:
+#: Every one of these is a folder that ordinary products name, so it would
+#: refuse ordinary work. A factory machine's own folders (an owner's home
+#: folder, the receipts folder, the sandbox storage folder) pass.
+_SYSTEM_FOLDERS = frozenset(
+    {"usr", "bin", "sbin", "lib", "lib64", "etc", "proc", "sys", "dev", "run", "boot"}
 )
+_SHARED_TOPS = frozenset(
+    {"var", "opt", "tmp", "srv", "root", "mnt", "media", "app", "data",
+     "workspace", "workspaces", "private", "Volumes"}
+)
+_SHARED_USERS = frozenset(
+    {"node", "runner", "ubuntu", "user", "app", "admin", "root", "vscode",
+     "codespace", "jenkins", "circleci", "gitpod", "coder", "docker", "guest",
+     "Shared", "www-data", "dev"}
+)
+
+
+def _a_shared_folder(parts: list[str]) -> bool:
+    """Rules 2 to 4 above, for a path's folder names (rule 1 already held)."""
+    if parts[0] in _SYSTEM_FOLDERS:
+        return True
+    if len(parts) == 2 and parts[0] in _SHARED_TOPS:
+        return True
+    return len(parts) == 2 and parts[0] in ("home", "Users") and parts[1] in _SHARED_USERS
+
 
 #: Why a ``private_path_prefixes`` value was refused. The values are not
 #: repeated: they name folders on the factory's own machines.
@@ -233,8 +255,9 @@ _PREFIXES_SENTENCE = (
     "'private_path_prefixes' in the publisher's settings must be a list of "
     "the folders that exist only on the factory's own machines (each owner's "
     "home folder, the receipts folder, the sandbox storage folder), each an "
-    "absolute path at least two folders deep and not a shared folder such as "
-    "/home/ or /var/. Before every send the publisher refuses a commit that "
+    "absolute path at least two folders deep and not a folder ordinary "
+    "products name, such as /home/, /var/lib, /opt/app, /usr/local/bin or "
+    "/home/node. Before every send the publisher refuses a commit that "
     "would publish a file naming one, so it will not start without them. The "
     "values are not repeated here"
 )
@@ -257,8 +280,8 @@ def _private_path_prefixes(decoded: dict[str, Any]) -> tuple[str, ...]:
         normal = posixpath.normpath(text)
         if normal.startswith("//"):
             normal = "/" + normal.lstrip("/")
-        depth = len([part for part in normal.split("/") if part])
-        if depth < 2 or normal in _SHARED_FOLDERS:
+        parts = [part for part in normal.split("/") if part]
+        if len(parts) < 2 or _a_shared_folder(parts):
             raise SettingsRefused(_PREFIXES_SENTENCE)
         if normal not in kept:
             kept.append(normal)
