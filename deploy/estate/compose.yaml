@@ -516,6 +516,162 @@ services:
       start_period: 30s
 
   # -------------------------------------------------------------------------
+  # THE MODEL DOOR (14 October 2026) — how a project's sandbox reaches the
+  # model router without holding a key.
+  #
+  # The sandbox used to be given a model-router key, and anything a build runs
+  # in there can read whatever its containers are given. Now its containers
+  # get a fixed placeholder, and this small proxy, at the gateway address,
+  # replaces the caller's key with its own and passes the call to the router.
+  # Its settings are model-door.cfg, beside this file, bound read-only.
+  #
+  # THE HOST'S NETWORK, AND WHY THIS ONE SERVICE IS ON IT. The model router
+  # listens on this machine and a guard refuses Docker's bridges on its port,
+  # so the door reaches it on the loopback, which only the host's network
+  # has. It binds only the gateway address and its own port (MODEL_DOOR_PORT),
+  # and the machine's guard admits only the sandbox's machine to that port.
+  # It publishes nothing and joins no Compose network.
+  #
+  # ITS KEY IS A FILE, the same way the memory service's database address is:
+  # read from the environment the command was run in, handed to the container
+  # under /run/secrets, and put into the environment of HAProxy's own process
+  # by the entry shell below. It is in no declared setting, so 'docker
+  # inspect' does not show it, and it is in no file in this bundle.
+  #
+  # The image is the stock HAProxy the feature router is built from, pinned by
+  # digest (estate-pins.conf). It runs as the image's own unprivileged user,
+  # with every capability dropped and no way to gain one: it binds a port
+  # above 1024 and writes nothing.
+  #
+  # WHY IT IS NOT MARKED read_only (found by starting it, 14 October 2026).
+  # Compose hands a secret read from the environment into a container by
+  # copying it in, and it refuses to do that for a read-only service ("`file`
+  # is the sole supported option"), so a read-only door could not be given its
+  # key the way every other estate secret is given. What that costs is small:
+  # the image's user can write only in /tmp and /var/tmp (checked on the
+  # pinned image), HAProxy writes nothing, and it runs no code but its own.
+  # -------------------------------------------------------------------------
+  model-door:
+    image: ${FACTORY_MODEL_DOOR_IMAGE:?name the model door's image in the env file, pinned by digest - estate-pins.conf says which}
+    restart: unless-stopped
+    network_mode: host
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        # WHERE IT LISTENS: one specific address and a port, never every address of
+        # the machine. MODEL_DOOR_BIND is parsed, not matched as text: an IPv4
+        # address must be four numbers of 0 to 255, an IPv6 address must be in
+        # brackets with at most eight groups of hex, and an address that works out
+        # to "unspecified" (0.0.0.0, ::, and every other spelling of them) or to the
+        # IPv4 broadcast address is refused.
+        refuse_the_address() {
+            echo "the model door listens only on one specific address and port, and MODEL_DOOR_BIND ($$MODEL_DOOR_BIND) is not one: $$1. Set FACTORY_GATEWAY_ADDRESS and MODEL_DOOR_PORT in the env file (deploy/estate/README.md, 'The model door')." >&2
+            exit 1
+        }
+        an_ipv4_address() {
+            case "$$1" in ""|*[!0-9.]*|.*|*.|*..*) return 1 ;; esac
+            old_ifs="$$IFS"; IFS=.; set -f; set -- $$1; set +f; IFS="$$old_ifs"
+            [ "$$#" -eq 4 ] || return 1
+            total=0; all_full=1
+            for part in "$$@"; do
+                case "$$part" in 0) ;; 0*|????*) return 1 ;; esac
+                [ "$$part" -le 255 ] || return 1
+                total=$$((total + part))
+                [ "$$part" -eq 255 ] || all_full=0
+            done
+            [ "$$total" -gt 0 ] || refuse_the_address "it is the unspecified address, which means every IPv4 address"
+            [ "$$all_full" -eq 0 ] || refuse_the_address "it is the IPv4 broadcast address"
+            return 0
+        }
+        some_ipv6_groups() {
+            # Prints how many groups of one to four hex digits $$1 holds, or fails.
+            [ -n "$$1" ] || { echo 0; return 0; }
+            case "$$1" in :*|*:|*::*) return 1 ;; esac
+            old_ifs="$$IFS"; IFS=:; set -f; set -- $$1; set +f; IFS="$$old_ifs"
+            for group in "$$@"; do
+                case "$$group" in ""|?????*|*[!0-9a-fA-F]*) return 1 ;; esac
+            done
+            echo "$$#"
+        }
+        an_ipv6_address() {
+            case "$$1" in ""|*[!0-9a-fA-F:]*|*::*::*) return 1 ;; esac
+            case "$$1" in
+                *::*)
+                    left="$$(some_ipv6_groups "$${1%%::*}")" || return 1
+                    right="$$(some_ipv6_groups "$${1#*::}")" || return 1
+                    [ $$((left + right)) -le 7 ] || return 1
+                    ;;
+                *)
+                    groups="$$(some_ipv6_groups "$$1")" || return 1
+                    [ "$$groups" -eq 8 ] || return 1
+                    ;;
+            esac
+            # Every group zero, however it is spelt, is the unspecified address.
+            nonzero="$$(printf '%s' "$$1" | tr -d ':0')"
+            [ -n "$$nonzero" ] || refuse_the_address "it is the unspecified address, which means every IPv6 address"
+            return 0
+        }
+        bind="$$MODEL_DOOR_BIND"
+        case "$$bind" in
+            \[*\]:*)
+                host="$${bind%%]:*}"; host="$${host#\[}"; port="$${bind##*]:}"
+                [ "$$bind" = "[$$host]:$$port" ] || refuse_the_address "it is not one [address]:port"
+                an_ipv6_address "$$host" || refuse_the_address "the part in brackets is not one IPv6 address"
+                ;;
+            *:*:*)
+                refuse_the_address "an IPv6 address must be written in brackets, as [address]:port"
+                ;;
+            *:*)
+                host="$${bind%:*}"; port="$${bind##*:}"
+                an_ipv4_address "$$host" || refuse_the_address "the part before the port is not one IPv4 address"
+                ;;
+            *)
+                refuse_the_address "it has no port"
+                ;;
+        esac
+        case "$$port" in ""|0*|*[!0-9]*|??????*) refuse_the_address "the port is not a number from 1 to 65535" ;; esac
+        [ "$$port" -le 65535 ] || refuse_the_address "the port is not a number from 1 to 65535"
+        key_file=/run/secrets/sandbox_model_key
+        if [ ! -s "$$key_file" ]; then
+            echo "the model door was given no key: the estate passes it in as a file, and this one arrived missing or empty. Start the estate the way deploy/estate/README.md says ('The model door'), with SANDBOX_MODEL_KEY passed in from a child process." >&2
+            exit 1
+        fi
+        MODEL_DOOR_KEY="$$(cat "$$key_file")"
+        # A file holding only a newline or spaces is no key, and a key with
+        # whitespace in it is a broken one. Either would start a door that
+        # sends an empty or broken key and fails every model call later.
+        if [ -z "$$MODEL_DOOR_KEY" ] || [ "$$(printf '%s' "$$MODEL_DOOR_KEY" | tr -d '[:space:]')" != "$$MODEL_DOOR_KEY" ]; then
+            echo "the model door's key file holds no usable key (it is blank, or has spaces or line breaks in it). Mint the key again and pass it in as SANDBOX_MODEL_KEY, the way deploy/estate/README.md says ('The model door')." >&2
+            exit 1
+        fi
+        export MODEL_DOOR_KEY
+        exec "$$@"
+      - the-estate-hands-the-model-door-its-key-as-a-file
+    command: ["haproxy", "-db", "-f", "/usr/local/etc/haproxy/model-door.cfg"]
+    environment:
+      # Where it listens: BUILT here from the gateway address and the door's
+      # port, as every other gateway service's address is, so it cannot be
+      # set to every address of the machine by hand. The entry shell above
+      # also parses it and refuses anything but one specific address.
+      MODEL_DOOR_BIND: ${FACTORY_GATEWAY_ADDRESS:?name this machine's factory gateway address in the env file}:${MODEL_DOOR_PORT:?name the port the model door listens on at the gateway address in the env file}
+    secrets:
+      - source: sandbox-model-key
+        target: sandbox_model_key
+    volumes:
+      - type: bind
+        source: ./model-door.cfg
+        target: /usr/local/etc/haproxy/model-door.cfg
+        read_only: true
+        bind:
+          create_host_path: false
+
+  # -------------------------------------------------------------------------
   # THE MEMORY RELAY — it listens on the bus and writes what it hears into the
   # store. It PUBLISHES NOTHING: nothing outside the estate ever calls it, so
   # it has no port, and a sandbox cannot reach it at all.
@@ -1258,6 +1414,15 @@ secrets:
   # container's declared environment and in nothing either service prints.
   memory-database-address:
     environment: FLEET_MEMORY_PG_DSN
+
+  # THE MODEL DOOR'S KEY (14 October 2026). A model-router key minted for the
+  # door alone, read from the environment the command was run in — the same
+  # child process the other secrets come from — and handed to the model door
+  # as a file. It is in no file in this bundle, in no image, in no container's
+  # declared environment and in nothing the door prints. It never enters a
+  # project's sandbox: that is the whole point of the door.
+  sandbox-model-key:
+    environment: SANDBOX_MODEL_KEY
 
   # THE FRONT DOOR'S TWO SLACK CREDENTIALS, added 25 September 2026.
   #

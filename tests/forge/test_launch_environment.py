@@ -59,6 +59,7 @@ PARENT = {
     "GUARDKIT_ZERO_TEST_BLOCKING": "1",
     "GUARDKIT_BOOT_SMOKE_BLOCKING": "1",
     "FLEET_MEMORY_ENABLED": "true",
+    "FLEET_MEMORY_MCP_URL": "http://memory-door:31822/mcp",
     "FLEET_MEMORY_PG_DSN": "postgresql://somewhere/memory",
     "FLEET_MEMORY_EMBED_URL": "http://embed:9000",
     "FLEET_MEMORY_EMBED_MODEL": "embed",
@@ -120,8 +121,12 @@ def test_the_list_is_short() -> None:
     list had left out (see the tests below).
 
     Raised from 37 to 38 on 13 October 2026 for FORGE_IMAGE_IDENTITY, which
-    the build system records beside each build and this list had left out."""
-    assert len(LAUNCH_SETTINGS) <= 38
+    the build system records beside each build and this list had left out.
+
+    Raised from 38 to 39 on 14 October 2026 for FLEET_MEMORY_MCP_URL, the
+    memory door a build in the sandbox reads and writes memory through now
+    that no database address or bus password is handed in there."""
+    assert len(LAUNCH_SETTINGS) <= 39
 
 
 def test_the_list_names_no_language_framework_or_product() -> None:

@@ -4,7 +4,9 @@
 
 This folder starts the factory's own services on a clean machine — a laptop or
 a cloud machine — from one set of files and one env file. It carries no
-machine's address, no home path, no checkout and no host network.
+machine's address, no home path and no checkout. One service, the model door,
+runs on the host's network, and *The model door* below says why; nothing else
+does.
 
 ## Supported first start and publisher host policy
 
@@ -78,10 +80,11 @@ two today. One description of each service, in the repository that owns it.
 
 | File | What it is |
 |---|---|
-| `compose.yaml` | composes Forge's two compose files and adds the bus, the one-shot that provisions it, the one-shot that says the bus is ready, the memory service's two containers, the Slack front door with its bus gateway, and the watch that says whether that door is really carrying traffic |
+| `compose.yaml` | composes Forge's two compose files and adds the bus, the one-shot that provisions it, the one-shot that says the bus is ready, the memory service's two containers, the model door, the Slack front door with its bus gateway, and the watch that says whether that door is really carrying traffic |
+| `model-door.cfg` | the model door's settings: where it listens, the key it puts on every call, and the model router it passes calls to. Bound read-only into the door |
 | `compose.external-bus.yaml` | the overlay for **external bus mode** — the estate started against a bus that is already running and belongs to somebody else. *Whose bus is it* below says when |
 | `.env.example` | every setting name the whole estate needs, with no machine's values. Copy to `.env` |
-| `estate-pins.conf` | what the estate's own two images are built from. Part of the release, never edited per machine. Not named `.env`, because this repository ignores the whole `.env` family as a secrets fence and these are pins, not secrets |
+| `estate-pins.conf` | what the estate's own two images are built from, and the digest of the stock HAProxy image the model door runs as it is. Part of the release, never edited per machine. Not named `.env`, because this repository ignores the whole `.env` family as a secrets fence and these are pins, not secrets |
 | `build-estate-images.sh` | builds those two images, and fills the volume holding the bus's own config, from the bus repository at its pinned commit |
 | `provisioner/Dockerfile` | the small tool image the estate's own scripts run in: the NATS project's tool image plus `bash`, carrying the read-only bus comparison and the gateway watch |
 | `provisioner/compare-bus-with-definitions.sh` | that comparison. It reads a bus's own monitoring route and the pinned definitions and compares them field by field. It never writes to a bus |
@@ -269,6 +272,51 @@ found.**
   `/var/lib/fleet-memory` created in the relay's image owned by that user,
   because Docker fills a fresh named volume from what the image has at that
   path, ownership included.
+
+## The model door
+
+**What it is.** `model-door` is how a project's sandbox reaches the model
+router without holding a key (14 October 2026). Anything a build runs in the
+sandbox can read whatever the sandbox's containers are given, so they are given
+no model key at all: their `OPENAI_API_KEY` is the fixed placeholder
+`no-key-the-model-door-adds-it`. The door is a stock HAProxy at the gateway
+address. It replaces whatever key a caller sends with its own and passes the
+call to the model router on this machine's loopback. Its settings are
+`model-door.cfg`.
+
+**What it needs.**
+
+- `SANDBOX_MODEL_KEY`, a model-router key minted for the door alone. It is a
+  secret: keep it in the estate's encrypted secrets file and start the estate
+  the supported way (above), so it reaches Compose only as a value in the
+  command's environment. Compose hands it to the door as a file under
+  `/run/secrets`, and the door's entry shell puts it into HAProxy's own process.
+  It is in no file in this bundle and in no declared setting, so `docker
+  inspect` does not show it. The door refuses to start if the file is missing,
+  blank, or has spaces or line breaks in it.
+- `MODEL_DOOR_PORT` in the env file (31823 in the example). The door listens on
+  `FACTORY_GATEWAY_ADDRESS` and that port only: `compose.yaml` builds the
+  address from the two, and the entry shell parses it and refuses anything but
+  one specific IPv4 or IPv6 address and port (every spelling of "every
+  address", such as `0`, `0.0.0.0` or `[::]`, included).
+- `FACTORY_MODEL_DOOR_IMAGE`, the pinned HAProxy image, which must agree with
+  `estate-pins.conf`.
+
+**Why it is on the host's network.** The model router listens on this machine,
+and a guard refuses Docker's bridges on its port, so the door reaches it on the
+loopback, which only the host's network has. The door publishes nothing. The
+machine's own guard must admit only the sandbox's machine to `MODEL_DOOR_PORT`,
+as it does for the answer service's and the memory service's ports.
+
+**How it is hardened.** It runs as the image's own unprivileged user with every
+capability dropped and no way to gain one. It is not marked read-only, because
+Compose will not hand a secret read from the environment to a read-only
+service; that user can write only in `/tmp` and `/var/tmp`, and HAProxy writes
+nothing.
+
+**In a sandbox,** `OPENAI_BASE_URL` and `GUARDKIT_QAV_SHADOW_URL` are
+`http://<gateway address>:<MODEL_DOOR_PORT>`, and the sandbox's network list
+must allow that address and port.
 
 ## The Slack front door, and the bus gateway
 
@@ -925,9 +973,10 @@ A failed post-resume check follows this current-state recovery path too.
   the coordinator the same five names). Proven on 25 September 2026: a message
   published as `guardkit` went the whole way into the store; as `fleet-memory`
   the broker refused it, by design. So on a fresh machine the relay sits
-  correct and silent until a build is handed that credential — which is the
-  sandbox's business (a secret the sandbox's containers get by name), and is
-  named in the plan as a gap, not fixed here. Related: the project name the
+  correct and silent until a build is handed that credential. A build in a
+  project's sandbox is not handed it either, since 14 October 2026: no key
+  enters the sandbox, and a build there writes memory through the memory
+  service at the gateway address instead (`FLEET_MEMORY_MCP_URL`). Related: the project name the
   coordinator reads memory under comes from a code default (`guardkit`) because
   `FORGE_MEMORY_PROJECT` is in no env file; right today, and its own docstring
   says when it stops being.

@@ -15,7 +15,9 @@
 #      runner unit did: one session, running the command the project declares,
 #      with the settings it needs handed in on the front of the line. This
 #      service knows none of those settings by name: it forwards the NAMES
-#      listed in SANDBOX_ENV_NAMES and never looks at a value.
+#      listed in SANDBOX_ENV_NAMES and never prints a value. It looks at a
+#      value only to refuse one that carries a password (see "nothing
+#      credential-shaped is handed into the sandbox" below).
 #   3. ON STOP, ENDS THE WORK INSIDE. This is the heart of it. The client runs
 #      out here and all the work runs in there, so ending the client ends
 #      NOTHING: the bootstrap keeps running inside the sandbox and keeps
@@ -99,8 +101,9 @@
 #                           quietly decides it is talking to a hosted service
 #                           and complains about authentication.
 #
-# EXIT. 0 after a clean stop. 2 when a required setting is missing — said in
-# one sentence, at the door, rather than started half-configured. 3 when the
+# EXIT. 0 after a clean stop. 2 when a required setting is missing, or when
+# SANDBOX_ENV_NAMES would hand something credential-shaped into the sandbox —
+# said in one sentence, at the door, rather than started half-configured. 3 when the
 # work inside would not stop: nothing was started on top of it, nothing claims
 # to have stopped, and the container comes back under its restart policy to try
 # the same stop again.
@@ -161,6 +164,159 @@ fi
 # shellcheck disable=SC2206
 CLIENT_CALL=("${CLIENT}" ${SANDBOX_CLIENT_ARGUMENTS:-} exec "${NAME}")
 
+# NOTHING CREDENTIAL-SHAPED IS HANDED INTO THE SANDBOX (14 October 2026).
+# Whatever crosses here ends up in the settings of the bootstrap's own process
+# inside the sandbox, and from there in both factory containers, where the code
+# a build runs can read it. The factory's keys stay outside: model calls go
+# through the model door on the gateway and memory through the memory door.
+# So a name in SANDBOX_ENV_NAMES that looks like a credential stops the start
+# here, before the sandbox client is called at all, with one sentence naming
+# each setting and never a value. The same rule, word for word, is in the
+# bootstrap inside the sandbox (src/forge/cli/deploy_templates/
+# sandbox-runner.sh):
+#   - a name containing one of Forge's own credential words
+#     (RESERVED_CREDENTIAL_WORDS in src/forge/launch_environment.py), or DSN;
+#   - a name with KEY as a whole word in it (A_SERVICE_KEY, KEY_FILE);
+#   - a value that is an address with any user information in it, an address
+#     whose query or fragment names a credential, or a password pair (with =
+#     or :), including the same written with escapes: every percent-escape
+#     is decoded, however many times over (up to five), and a value whose
+#     encoding cannot be read safely is refused too.
+# ONE EXACT NAME IS EXCUSED, and no pattern is: the stamp check's token count,
+# whose name contains TOKEN. It may cross only as a plain number; anything
+# else in it (a letter, a space, nothing at all) refuses the start too.
+CREDENTIAL_WORDS=(TOKEN SECRET PASSWORD PASSWD API_KEY APIKEY CREDENTIAL PRIVATE_KEY DSN)
+# Words that make a name a credential only as a whole word between
+# underscores: KEY in A_SERVICE_KEY, KEY_FILE or MY_KEY_ID, but not in
+# KEYBOARD_LAYOUT or MONKEY_COUNT.
+CREDENTIAL_WHOLE_WORDS=(KEY)
+CREDENTIAL_SHAPED_BUT_ALLOWED=(GUARDKIT_STAMP_MODEL_MAX_TOKENS)
+# The shapes of a value that carries a credential, matched on the value in
+# lower case, and again once escapes are undone (every percent-escape,
+# decoded again and again until it stops changing, JSON's \/, and a backslash
+# used for a slash, as in http:\\someone@host), so an encoded copy is caught
+# too:
+#   an address with any user information in it, a user alone or a user and a
+#   password (scheme://someone@ or scheme://someone:secret@);
+#   an address whose query names a credential (?access_token=, &api_key=,
+#   ;pwd=, ?auth=);
+#   an address whose fragment, after #, holds user information or names a
+#   credential (#access_token=);
+#   a password pair anywhere, with = or : (password=, pwd: x, "passwd":).
+USER_IN_AN_ADDRESS='[a-z][a-z0-9+.-]*://[^/?#[:space:]]*@'
+CREDENTIAL_IN_A_QUERY='://[^?#[:space:]]*[?]([^#[:space:]]*[&;])?[^=&;#[:space:]]*(pass|pwd|token|secret|key|auth)[^=&;#[:space:]]*='
+CREDENTIAL_IN_A_FRAGMENT='://[^#[:space:]]*#[^[:space:]]*(@|(pass|pwd|token|secret|key|auth)[^=&;[:space:]]*=)'
+PASSWORD_PAIR="(^|[^a-z0-9])(password|passwd|pwd)[\"']?[[:space:]]*[=:]"
+
+# A value as a reader of it would see it, put in UNESCAPED: every %XX escape
+# decoded, one level a round, until a round changes nothing (at most five
+# rounds), so an escape-spelt word (%74oken) and a value encoded twice are
+# caught; then JSON's \/ and a backslash used for a slash turned into
+# slashes; then folded to lower case. It fails, and the value is refused
+# rather than judged half-read, when a % is not followed by two hex digits,
+# when an escape is a NUL byte, or when the value is still encoded after
+# five rounds. Used only to judge a value, never printed. The C locale makes
+# it work byte by byte.
+UNESCAPED=""
+the_value_unescaped() {
+  local LC_ALL=C value="$1" rest decoded hex char round escaped_slash='\/' backslash='\'
+  UNESCAPED=""
+  for round in 1 2 3 4 5 6; do
+    [[ "${value}" == *%* ]] || break
+    ((round <= 5)) || return 1
+    rest="${value}"
+    decoded=""
+    while [[ "${rest}" == *%* ]]; do
+      decoded+="${rest%%\%*}"
+      rest="${rest#*%}"
+      [[ "${rest}" =~ ^[0-9A-Fa-f]{2} ]] || return 1
+      hex="${rest:0:2}"
+      [[ "${hex}" != "00" ]] || return 1
+      printf -v char "\\x${hex}"
+      decoded+="${char}"
+      rest="${rest:2}"
+    done
+    value="${decoded}${rest}"
+  done
+  value="${value//"${escaped_slash}"/\/}"
+  value="${value//"${backslash}"/\/}"
+  UNESCAPED="${value,,}"
+}
+
+# Prints why one named setting may not be handed in, or nothing when it may.
+# Arguments: the entry, the name of the list it came from, and its position
+# in that list. It reads the value only to judge it, and never prints it; an
+# entry that is not a setting name is named by its list and position only,
+# because its text may be a value written into the list by mistake.
+why_this_setting_may_not_cross() {
+  local name="$1" list="$2" position="$3" word allowed value seen
+  if [[ ! "${name}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+    printf 'an entry in %s is not a setting name (position %s)' "${list}" "${position}"
+    return 0
+  fi
+  for allowed in "${CREDENTIAL_SHAPED_BUT_ALLOWED[@]}"; do
+    if [[ "${name}" == "${allowed}" ]]; then
+      if [[ -n "${!name+set}" && ! "${!name}" =~ ^[0-9]+$ ]]; then
+        printf '%s (it may be handed in only as a plain number)' "${name}"
+      fi
+      return 0
+    fi
+  done
+  for word in "${CREDENTIAL_WORDS[@]}"; do
+    if [[ "${name^^}" == *"${word}"* ]]; then
+      printf '%s (its name says it is a credential)' "${name}"
+      return 0
+    fi
+  done
+  for word in "${CREDENTIAL_WHOLE_WORDS[@]}"; do
+    if [[ "_${name^^}_" == *"_${word}_"* ]]; then
+      printf '%s (its name says it is a credential)' "${name}"
+      return 0
+    fi
+  done
+  value="${!name:-}"
+  [[ -n "${value}" ]] || return 0
+  if ! the_value_unescaped "${value}"; then
+    printf '%s (its value is percent-encoded in a way that cannot be read safely)' "${name}"
+    return 0
+  fi
+  for seen in "${value,,}" "${UNESCAPED}"; do
+    if [[ "${seen}" =~ ${USER_IN_AN_ADDRESS} ]]; then
+      printf '%s (its value is an address with a user or a password in it)' "${name}"
+      return 0
+    fi
+    if [[ "${seen}" =~ ${CREDENTIAL_IN_A_QUERY} ]]; then
+      printf '%s (its value is an address whose query carries a credential)' "${name}"
+      return 0
+    fi
+    if [[ "${seen}" =~ ${CREDENTIAL_IN_A_FRAGMENT} ]]; then
+      printf '%s (its value is an address whose fragment carries a credential)' "${name}"
+      return 0
+    fi
+    if [[ "${seen}" =~ ${PASSWORD_PAIR} ]]; then
+      printf '%s (its value carries a password pair)' "${name}"
+      return 0
+    fi
+  done
+  return 0
+}
+
+NAMES_TO_HAND_IN="${SANDBOX_ENV_NAMES:-}"
+REFUSED_SETTINGS=()
+position=0
+for name in ${NAMES_TO_HAND_IN//,/ }; do
+  position=$((position + 1))
+  reason="$(why_this_setting_may_not_cross "${name}" "SANDBOX_ENV_NAMES" "${position}")"
+  if [[ -n "${reason}" ]]; then
+    REFUSED_SETTINGS+=("${reason}")
+  fi
+done
+if ((${#REFUSED_SETTINGS[@]})); then
+  joined="$(printf '%s, ' "${REFUSED_SETTINGS[@]}")"
+  log "FATAL: refusing to start, because no key belongs in the sandbox and SANDBOX_ENV_NAMES would hand these settings in: ${joined%, }. Take them off SANDBOX_ENV_NAMES; the model door and the memory door on the gateway hold the factory's keys outside the sandbox. Nothing was started inside ${NAME}."
+  exit 2
+fi
+
 # The settings handed to the bootstrap: the NAMES the project declares, each
 # with whatever this container's environment has under it. A name with nothing
 # set is left out, so the bootstrap's own "setting X: unset" line stays true.
@@ -168,7 +324,6 @@ CLIENT_CALL=("${CLIENT}" ${SANDBOX_CLIENT_ARGUMENTS:-} exec "${NAME}")
 ENV_PREFIX=()
 FORWARDED=()
 SKIPPED=()
-NAMES_TO_HAND_IN="${SANDBOX_ENV_NAMES:-}"
 for name in ${NAMES_TO_HAND_IN//,/ }; do
   if [[ -n "${!name:-}" ]]; then
     ENV_PREFIX+=("${name}=${!name}")

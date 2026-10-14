@@ -38,7 +38,7 @@ def inventory(tmp_path):
         'FORGE_TARGET_OWNER_URL=http://192.0.2.10:8900',
         'FORGE_SANDBOX_SIDECAR_URL=http://192.0.2.10:8925',
         'FORGE_SANDBOX_RUNNER_URL=http://192.0.2.10:8924',
-        'FLEET_MEMORY_ENABLED=false','FLEET_MEMORY_PORT=30822','SANDBOX_RECEIPTS_PATH=/private/receipts',
+        'FLEET_MEMORY_ENABLED=false','FLEET_MEMORY_PORT=30822','MODEL_DOOR_PORT=30823','SANDBOX_RECEIPTS_PATH=/private/receipts',
         'SANDBOX_NAME=owned-sandbox','SANDBOX_BOOTSTRAP=/private/clone/deploy/sandbox-runner.sh',
         'SANDBOX_PROJECT_ENV_FILE='+str(tmp_path/'operational'/'bootstrap.env'),
         'FORGE_CONFIG_PATH=/private/settings/forge.yaml','GIT_AUTHOR_NAME=fixture','GIT_AUTHOR_EMAIL=fixture@example.invalid',
@@ -315,7 +315,7 @@ def test_profile_preserves_choices_and_all_routes(inventory,monkeypatch):
     import yaml
     doc=yaml.safe_load(Path(config['sandbox']['profile_source']).read_text())
     assert doc['custom_choice']=={'keep':True}
-    assert doc['sandbox']['allow_network']==['example.test:443','192.0.2.10:8900','192.0.2.10:30822']
+    assert doc['sandbox']['allow_network']==['example.test:443','192.0.2.10:8900','192.0.2.10:30822','192.0.2.10:30823']
     assert doc['sandbox']['receipts_path']=='/private/receipts'
     assert doc['cwd']=='/private/clone'
     publishes=[x[-1] for x in b.argv() if x[:3]==['sbx','ports','owned-sandbox'] and '--publish' in x]
@@ -334,7 +334,7 @@ def test_split_sandbox_publications_keep_factory_return_rules(inventory, monkeyp
                        '169.254.88.7:8925:8125','169.254.88.7:8924:8124']
     import yaml
     profile=yaml.safe_load(Path(config['sandbox']['profile_source']).read_text())
-    assert profile['sandbox']['allow_network']==['example.test:443','192.0.2.10:8900','192.0.2.10:30822']
+    assert profile['sandbox']['allow_network']==['example.test:443','192.0.2.10:8900','192.0.2.10:30822','192.0.2.10:30823']
 
 
 def test_explicit_shared_host_alias_and_ambient_absence(inventory, monkeypatch):
@@ -419,11 +419,45 @@ def test_memory_mcp_rule_is_one_gateway_port_beside_the_answer_rule(inventory,mo
     import yaml
     rules=yaml.safe_load(Path(config['sandbox']['profile_source']).read_text())['sandbox']['allow_network']
     assert rules.count('192.0.2.10:30822')==1 and rules.count('192.0.2.10:8900')==1
-    assert [x for x in rules if x.startswith('192.0.2.10')]==(['192.0.2.10:30822','192.0.2.10:8900'] if manual else ['192.0.2.10:8900','192.0.2.10:30822'])
+    assert [x for x in rules if x.startswith('192.0.2.10')]==(['192.0.2.10:30822','192.0.2.10:8900','192.0.2.10:30823'] if manual else ['192.0.2.10:8900','192.0.2.10:30822','192.0.2.10:30823'])
     allowed=next(x for x in b.argv() if x[:4]==['sbx','policy','allow','network'])[-1].split(',')
     assert allowed==rules
     receipt=json.loads((Path(config['sandbox']['evidence_dir'])/'sandbox-installed.json').read_text())
     assert receipt['answer_rule']=='192.0.2.10:8900' and receipt['memory_mcp_rule']=='192.0.2.10:30822'
+
+
+def test_the_model_door_rule_is_one_gateway_port_beside_the_other_two(inventory,monkeypatch):
+    """14 October 2026: a sandbox holds no model key and calls the models
+    through the model door on the gateway, so the sandbox this tool sets up is
+    given the door's one port, the same way as the answer service's and the
+    memory door's, and the receipt records it."""
+    config,path,args=inventory
+    b=Boundary(config,monkeypatch)
+    assert m.main(args)==0
+    import yaml
+    rules=yaml.safe_load(Path(config['sandbox']['profile_source']).read_text())['sandbox']['allow_network']
+    assert rules.count('192.0.2.10:30823')==1
+    allowed=next(x for x in b.argv() if x[:4]==['sbx','policy','allow','network'])[-1].split(',')
+    assert '192.0.2.10:30823' in allowed
+    receipt=json.loads((Path(config['sandbox']['evidence_dir'])/'sandbox-installed.json').read_text())
+    assert receipt['model_door_rule']=='192.0.2.10:30823'
+
+
+@pytest.mark.parametrize('change,message',[
+    ({'MODEL_DOOR_PORT':None},'MODEL_DOOR_PORT is missing or not a port number'),
+    ({'MODEL_DOOR_PORT':'door'},'MODEL_DOOR_PORT is missing or not a port number'),
+    ({'MODEL_DOOR_PORT':'0'},'MODEL_DOOR_PORT is missing or not a port number'),
+    ({'MODEL_DOOR_PORT':'192.0.2.10:30823'},'MODEL_DOOR_PORT is missing or not a port number'),
+    ({'MODEL_DOOR_PORT':'8900'},'MODEL_DOOR_PORT equals the answer-service or memory port'),
+    ({'MODEL_DOOR_PORT':'30822'},'MODEL_DOOR_PORT equals the answer-service or memory port'),
+])
+def test_bad_model_door_route_refuses_before_anything_is_written(inventory,monkeypatch,capsys,tmp_path,change,message):
+    config,path,args=inventory;edit_env(config,change)
+    monkeypatch.setattr(m.subprocess,'run',lambda *a,**k:pytest.fail('external call before route validation'))
+    before={p:p.read_bytes() for p in tmp_path.rglob('*') if p.is_file()}
+    assert m.main(args)==2
+    assert message in capsys.readouterr().err
+    assert {p:p.read_bytes() for p in tmp_path.rglob('*') if p.is_file()}==before
 
 
 def test_plan_shows_answer_and_memory_mcp_rules(inventory):
@@ -432,6 +466,7 @@ def test_plan_shows_answer_and_memory_mcp_rules(inventory):
     assert result.returncode==0,result.stderr
     assert 'answer service 192.0.2.10:8900' in result.stdout
     assert 'memory MCP 192.0.2.10:30822' in result.stdout
+    assert 'model door 192.0.2.10:30823' in result.stdout
 
 
 @pytest.mark.parametrize('change,message',[
@@ -549,8 +584,11 @@ def test_private_env_cannot_override_public_authority(inventory,monkeypatch):
 def test_normal_runner_private_values_are_not_evidence(inventory,monkeypatch):
     config,path,args=inventory
     env=Path(config['env_file'])
-    with env.open('a') as f:f.write('FLEET_MEMORY_PG_DSN=${PRIVATE_DSN}\n')
-    private=env.parent/'secrets.env';private.write_text('PRIVATE_DSN=postgres://fixture:private-canary@example.invalid/db\n');private.chmod(0o600)
+    # A private value of a forwarded name. Since 14 October 2026 no memory
+    # setting handed into a sandbox carries a password (the start scripts
+    # refuse one), so the private value is a plain one.
+    with env.open('a') as f:f.write('FLEET_MEMORY_EMBED_MODEL=${PRIVATE_MODEL}\n')
+    private=env.parent/'secrets.env';private.write_text('PRIVATE_MODEL=private-canary-model\n');private.chmod(0o600)
     b=Boundary(config,monkeypatch)
     assert m.main([*args,'--secret-env-file',str(private)])==0
     runtime=Path(config['sandbox']['bootstrap_env_file'])
