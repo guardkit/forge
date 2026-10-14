@@ -2339,6 +2339,41 @@ def _evaluation_scope(mod: _Module, at: ast.AST) -> ast.AST | None:
     return None
 
 
+def _class_assignment_hides_outer(
+    mod: _Module, klass: ast.ClassDef, name: str, at: ast.AST
+) -> bool:
+    """True only when the class body's ONE binding of ``name`` is a plain,
+    unconditional ``name = <expr>`` written directly at the top level of the
+    body, on an earlier statement than ``at`` (15 October 2026, class
+    bodies, review 2). Any other binding of the name in the class body (a
+    ``del``, one nested in if/try/for/while/with/match, an augmented or
+    annotated assignment, a walrus, an import, a def or class, a tuple
+    target) keeps the outer possibilities; so does any doubt."""
+    found = _bindings(klass).get(name, [])
+    if len(found) != 1:
+        return False
+    kind, node = found[0]
+    if (
+        kind != "assign"
+        or not isinstance(node, ast.Assign)
+        or len(node.targets) != 1
+        or not isinstance(node.targets[0], ast.Name)
+        or not any(statement is node for statement in klass.body)
+    ):
+        return False
+    # The top-level statement of the class body that holds the use.
+    child: ast.AST = at
+    parent = mod.parents.get(id(at))
+    while parent is not None and parent is not klass:
+        child, parent = parent, mod.parents.get(id(parent))
+    if parent is not klass:
+        return False
+    positions = {id(statement): index for index, statement in enumerate(klass.body)}
+    if id(child) not in positions:
+        return False
+    return positions[id(node)] < positions[id(child)]
+
+
 def _class_body_at(mod: _Module, at: ast.AST) -> ast.ClassDef | None:
     """The class whose body ``at`` is written directly in (outside any
     method), if any."""
@@ -2381,8 +2416,12 @@ def _possible_name_targets(mod: _Module, name: str, at: ast.AST) -> set[str]:
     being "shadowed" or rebound never exempts a name. ``global`` sends the
     lookup to the module as well; ``nonlocal`` to the enclosing function."""
     out: set[str] = set()
-    # A name used directly in a class body is looked up in that class's own
-    # bindings first, then in the scopes around the class (15 October 2026).
+    # A name used directly in a class body may hold what the class binds it
+    # to AND what the scopes around the class give it: the union (15 October
+    # 2026, class bodies, review 2). The outer possibilities are dropped only
+    # when one plain unconditional assignment at the top of the class body,
+    # earlier than the use, is the class's only binding of the name
+    # (:func:`_class_assignment_hides_outer`).
     klass = _class_body_at(mod, at)
     if klass is not None:
         found = _bindings(klass).get(name, [])
@@ -2395,7 +2434,7 @@ def _possible_name_targets(mod: _Module, name: str, at: ast.AST) -> set[str]:
                 for kind, node in found
                 if kind in ("def", "class")
             }
-            if not kinds & {"global", "nonlocal"}:
+            if _class_assignment_hides_outer(mod, klass, name, at):
                 return out
     scope = _defining_scope(mod, at)
     while scope is not None:
@@ -2463,14 +2502,10 @@ def _resolve_all_strict(mod: _Module, func_node: ast.AST, at: ast.AST) -> set[st
         name = func_node.id
         klass = _class_body_at(mod, at)
         if klass is not None and _bindings(klass).get(name):
-            # Bound in the class body it is used in: that binding, if it is
-            # a single definition or import, else unknown (15 October 2026).
-            kinds, definition = _scope_bindings(klass, name)
-            if "other" in kinds or ("def" in kinds and "import" in kinds):
-                return set()
-            if "def" in kinds and definition is not None:
-                return {f"{mod.dotted}.{_qualname(mod, definition)}"}
-            return set(_targets(mod, name))
+            # Bound in the class body it is used in: it may be the class's
+            # binding or the outer one (review 2), so nothing can vouch for
+            # it.
+            return set()
         scope = _defining_scope(mod, at)
         while scope is not None:
             kinds, definition = _scope_bindings(scope, name)
@@ -3072,7 +3107,9 @@ def _reserved_names() -> set[str]:
     return reserved
 
 
-def _reserved_name_rebindings(modules: list[_Module]) -> list[str]:
+def _reserved_name_rebindings(
+    modules: list[_Module], wrappers: frozenset[str] = frozenset()
+) -> list[str]:
     """Every rebinding of a reserved name, and every launch imported under
     another name.
 
@@ -3085,9 +3122,15 @@ def _reserved_name_rebindings(modules: list[_Module]) -> list[str]:
     imported under a different local name (``as``) is flagged anywhere.
     """
     base = _reserved_names()
+    # The helper's name and every discovered wrapper's name are reserved in
+    # the whole package (15 October 2026, GuardKit's round 25, R28): bound
+    # only by that helper's or wrapper's own single definition, or by an
+    # import of that very helper or wrapper.
+    environment = HELPERS | set(wrappers)
+    environment_names = {t.rsplit(".", 1)[1] for t in environment}
     problems: list[str] = []
     for mod in modules:
-        reserved = set(base)
+        reserved = set(base) | environment_names
         # Deliberately module-wide (not a lookup): a name imported anywhere
         # in the module as a guarded thing is reserved in the whole module.
         for alias in mod.imports:
@@ -3118,17 +3161,45 @@ def _reserved_name_rebindings(modules: list[_Module]) -> list[str]:
                         return False
             return True
 
+        def is_the_environment_itself(name: str, kind: str, node: ast.AST, scope: ast.AST) -> bool:
+            if kind == "import":
+                return all(
+                    _finalise(target) <= environment
+                    for local, target in _import_bindings(node, mod.package)
+                    if local == name
+                )
+            return (
+                kind == "def"
+                and scope is mod.tree
+                and f"{mod.dotted}.{name}" in environment
+                and _module_wide_binding_count(mod, name) == 1
+            )
+
+        # Every scope, class bodies included: a class attribute is a binding.
         scopes: list[ast.AST] = [mod.tree] + [
             n for n in ast.walk(mod.tree)
-            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef))
         ]
         for scope in scopes:
             for name, bound in _bindings(scope).items():
                 if name not in reserved:
                     continue
                 for kind, node in bound:
+                    if name in environment_names:
+                        if not is_the_environment_itself(name, kind, node, scope):
+                            flag(
+                                node,
+                                f"the reserved name {name!r} (the environment helper's or "
+                                f"a wrapper's) is rebound by a {kind} binding",
+                            )
+                        continue
                     if kind == "import" and is_the_thing_itself(name, node):
                         continue
+                    if kind == "def" and any(
+                        f"{mod.dotted}.{_qualname(mod, node)}" in spec["dotted"]
+                        for spec in GENERIC_RUNNERS.values()
+                    ):
+                        continue  # a generic runner's own definition (a method included)
                     if (
                         kind in ("def", "class")
                         and scope is mod.tree
@@ -3655,7 +3726,7 @@ def unaccounted_launches(package: Path) -> list[str]:
                             "is built outside the preview's preparation and the "
                             "helper's reader"
                         )
-    problems.extend(_reserved_name_rebindings(modules))
+    problems.extend(_reserved_name_rebindings(modules, frozenset(wrappers)))
     problems.extend(_direct_use_violations(modules))
     for (rel, fname), spec in GENERIC_RUNNERS.items():
         for mod in modules:
@@ -6478,6 +6549,170 @@ def test_a_class_body_name_is_read_through_the_class_first(tmp_path: Path) -> No
     assert not any(
         p.startswith("zz_ok.py:") and "referred to other than" in p for p in problems
     ), problems
+
+
+#: Class bodies, review 2 (15 October 2026): a class-local binding hides
+#: the outer name only when it is one plain unconditional assignment at the
+#: top of the class body, earlier than the use. Rejected: the assignment
+#: after the use (the reproducer), an annotation-only binding, an assignment
+#: inside ``if True:`` before a top-level use, and an assignment followed by
+#: ``del``. Clean: review 1's control, an unconditional string assignment
+#: before the use.
+GUARD_PROBES_32: dict[str, str] = {
+    "__init__.py": "",
+    "zz_ok.py": textwrap.dedent(
+        '''\
+        import subprocess
+
+
+        class ok_unconditional_assignment_before_the_use:
+            subprocess = "label"
+            label = subprocess
+        '''
+    ),
+    "zz_main.py": textwrap.dedent(
+        '''\
+        import subprocess
+
+
+        class p32_assignment_after_the_use:
+            subprocess.run(["make"])
+            subprocess = "label"
+
+
+        class p32_annotation_only_binding:
+            subprocess: object
+            subprocess.run(["make"])
+
+
+        class p32_assignment_inside_a_conditional:
+            if True:
+                subprocess = "label"
+            subprocess.run(["make"])
+
+
+        class p32_assignment_then_del:
+            subprocess = "x"
+            del subprocess
+            subprocess.run(["make"])
+        '''
+    ),
+}
+
+
+def test_a_class_binding_hides_the_outer_name_only_when_it_surely_ran(tmp_path: Path) -> None:
+    problems = unaccounted_launches(_write_package(tmp_path, GUARD_PROBES_32))
+    named = {p.split(" in ", 1)[1].split(":", 1)[0] for p in problems if p.startswith("zz_main.py:")}
+    expected = {
+        n.name
+        for n in ast.parse(GUARD_PROBES_32["zz_main.py"]).body
+        if isinstance(n, ast.ClassDef) and n.name.startswith("p32_")
+    }
+    assert len(expected) == 4
+    assert expected - named == set(), f"slipped past the guard: {sorted(expected - named)}"
+    assert not any(
+        p.startswith("zz_ok.py:") and "referred to other than" in p for p in problems
+    ), problems
+
+
+#: The environment helper's and wrappers' names, probed (15 October 2026,
+#: GuardKit's round 25, R28): reserved across the whole package, bound only
+#: by their own single definition or an import of that very thing. Rejected:
+#: a module-level lambda whose parameter, defaulted to a stand-in that
+#: copies this process's environment, takes the helper's name (in a module
+#: of its own, beside one that imports the helper), a def parameter of the
+#: same name, a class attribute of that name, and a wrapper's name bound as
+#: a parameter in another module. Clean: the plain import, the ordinary
+#: inline call, and the wrapper imported and called.
+GUARD_PROBES_33: dict[str, str] = {
+    "__init__.py": "",
+    "zz_imports.py": textwrap.dedent(
+        """\
+        import subprocess
+
+        from forge.launch_environment import build_project_command_env
+
+
+        def ok_inline_helper_call(cmd, folder):
+            subprocess.run(cmd, env=build_project_command_env(folder))
+        """
+    ),
+    "zz_lambda.py": textwrap.dedent(
+        """\
+        import os
+        import subprocess
+
+        launch = lambda cmd, build_project_command_env=(lambda *a, **k: dict(os.environ)): subprocess.run(  # noqa: E731
+            cmd, env=build_project_command_env(".")
+        )
+        """
+    ),
+    "zz_param.py": textwrap.dedent(
+        """\
+        import os
+        import subprocess
+
+
+        def p33_def_parameter_named_like_the_helper(cmd, build_project_command_env=None):
+            subprocess.run(cmd, env=build_project_command_env("."))
+        """
+    ),
+    "zz_class_attribute.py": textwrap.dedent(
+        """\
+        import os
+
+
+        class p33_class_attribute_named_like_the_helper:
+            build_project_command_env = staticmethod(lambda folder: dict(os.environ))
+        """
+    ),
+    "zz_wrapper.py": textwrap.dedent(
+        """\
+        from forge.launch_environment import build_project_command_env
+
+
+        def project_env(folder):
+            return build_project_command_env(folder)
+        """
+    ),
+    "zz_wrapper_user.py": textwrap.dedent(
+        """\
+        import subprocess
+
+        from forge.zz_wrapper import project_env
+
+
+        def ok_wrapper_imported_and_called(cmd, folder):
+            subprocess.run(cmd, env=project_env(folder))
+
+
+        def p33_wrapper_name_as_a_parameter_elsewhere(cmd, project_env=None):
+            return cmd
+        """
+    ),
+}
+
+
+def test_the_environment_helpers_name_is_reserved_in_the_whole_package(tmp_path: Path) -> None:
+    problems = unaccounted_launches(_write_package(tmp_path, GUARD_PROBES_33))
+    assert any(
+        p.startswith("zz_lambda.py:") and "reserved name 'build_project_command_env'" in p
+        for p in problems
+    ), problems
+    assert any(
+        p.startswith("zz_param.py:") and "reserved name 'build_project_command_env'" in p
+        for p in problems
+    ), problems
+    assert any(
+        p.startswith("zz_class_attribute.py:") and "reserved name 'build_project_command_env'" in p
+        for p in problems
+    ), problems
+    assert any(
+        " in p33_wrapper_name_as_a_parameter_elsewhere: the reserved name 'project_env'" in p
+        for p in problems
+    ), problems
+    assert not any(p.startswith("zz_imports.py:") for p in problems), problems
+    assert not any(" in ok_" in p for p in problems), problems
 
 
 def test_env_slots_are_read_from_signatures() -> None:
