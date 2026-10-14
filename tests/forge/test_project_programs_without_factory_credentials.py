@@ -1699,6 +1699,55 @@ class TestTimeoutsAndTheBuildPackageAreToldWhatWasWithheld:
         _names_never_values(detail, "the declared test's timeout")
 
 
+def test_an_attended_deploy_hands_every_project_program_the_declared_names(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R4: ``forge deploy`` (the attended path) reads the project's declared
+    names at the commit being deployed and hands them to the deploy script,
+    the health check and the live-gate driver, while the factory's
+    credentials stay absent."""
+    from unittest.mock import AsyncMock
+
+    from click.testing import CliRunner
+
+    from forge.cli import _deploy_run
+    from forge.cli.deploy import deploy_cmd
+    from forge.persistence.migrations.runbook import apply
+    from forge.persistence.repositories.runbook import RunbookRepository
+
+    root = _a_project(tmp_path / "shop")
+    profile = yaml.safe_load((root / "deploy" / "profile.yaml").read_text())
+    profile["cwd"] = str(root)
+    profile.pop("preview", None)
+    (root / "deploy" / "profile.yaml").write_text(yaml.safe_dump(profile), encoding="utf-8")
+    _git(root, "commit", "-q", "-am", "deploy from the checkout")
+
+    conn = sqlite3.connect(str(tmp_path / "forge.db"))
+    apply(conn)
+
+    async def _backends(config: Any, *, dry_run: bool) -> Any:
+        async def _close() -> None:
+            return None
+
+        return RunbookRepository(connection=conn), AsyncMock(), AsyncMock(), _close
+
+    monkeypatch.setattr(_deploy_run, "_aopen_backends", _backends)
+    config = ForgeConfig.model_validate(
+        {
+            "permissions": {"filesystem": {"allowlist": [str(tmp_path)]}},
+            "planning": {"target_repo_paths": {REPO: str(root)}},
+            "deploy": {"enabled": True, "run_live_gate": True},
+        }
+    )
+    result = CliRunner().invoke(deploy_cmd, [FEATURE, "--repo", REPO], obj=config)
+    assert result.exit_code == 0, result.output
+    for label in ("deploy", "check", "journey"):
+        given = _given(root, label)
+        assert given.get(DECLARED) == "present", f"the {label} program was not given it"
+        _no_sentinel(given, f"the attended deploy's {label} program")
+        _home_is_private(given, root)
+
+
 # ---------------------------------------------------------------------------
 # Section 5: a guard that cannot be missed by leaving a site out
 # ---------------------------------------------------------------------------
@@ -1824,7 +1873,8 @@ class _Module(SimpleNamespace):
     dotted: str
     tree: ast.Module
     parents: dict[int, ast.AST]
-    imports: dict[str, str]
+    imports: dict[str, set[str]]
+    package: str
 
 
 def _load_modules(package: Path) -> list[_Module]:
@@ -1845,31 +1895,48 @@ def _load_modules(package: Path) -> list[_Module]:
             _Module(
                 rel=rel, dotted=dotted, tree=tree, parents=parents,
                 imports=_imports(tree, dotted, is_package),
+                package=dotted if is_package else dotted.rsplit(".", 1)[0],
             )
         )
     return modules
 
 
-def _imports(tree: ast.Module, dotted: str, is_package: bool) -> dict[str, str]:
-    """Every name an import binds anywhere in the module -> what it names."""
-    out: dict[str, str] = {}
+def _import_bindings(node: ast.AST, package: str) -> list[tuple[str, str]]:
+    """``(local name, what it names)`` for each name one import binds."""
+    out: list[tuple[str, str]] = []
+    if isinstance(node, ast.Import):
+        for alias in node.names:
+            if alias.asname:
+                out.append((alias.asname, alias.name))
+            else:
+                first = alias.name.split(".")[0]
+                out.append((first, first))
+    elif isinstance(node, ast.ImportFrom):
+        base = node.module or ""
+        if node.level:
+            anchor = package.split(".")
+            anchor = anchor[: len(anchor) - (node.level - 1)]
+            base = ".".join([*anchor, base] if base else anchor)
+        for alias in node.names:
+            out.append((alias.asname or alias.name, f"{base}.{alias.name}"))
+    return out
+
+
+def _imports(tree: ast.Module, dotted: str, is_package: bool) -> dict[str, set[str]]:
+    """Every name an import binds anywhere in the module -> EVERY thing it
+    names in any scope (14 October 2026: one name can be one module in one
+    function and another in another, so a launch is any of them and the
+    helper only all of them)."""
+    out: dict[str, set[str]] = {}
     package = dotted if is_package else dotted.rsplit(".", 1)[0]
     for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                if alias.asname:
-                    out[alias.asname] = alias.name
-                else:
-                    out[alias.name.split(".")[0]] = alias.name.split(".")[0]
-        elif isinstance(node, ast.ImportFrom):
-            base = node.module or ""
-            if node.level:
-                anchor = package.split(".")
-                anchor = anchor[: len(anchor) - (node.level - 1)]
-                base = ".".join([*anchor, base] if base else anchor)
-            for alias in node.names:
-                out[alias.asname or alias.name] = f"{base}.{alias.name}"
+        for local, target in _import_bindings(node, package):
+            out.setdefault(local, set()).add(target)
     return out
+
+
+def _targets(mod: _Module, name: str) -> set[str]:
+    return mod.imports.get(name, set())
 
 
 def _dotted(node: ast.AST) -> str:
@@ -1912,118 +1979,190 @@ def _qualname(mod: _Module, func: Any) -> str:
 
 
 #: Each scope's bindings, worked out once per guard run (cleared by
-#: :func:`unaccounted_launches`): scope id -> name -> (kinds, definition).
-_SCOPE_CACHE: dict[int, dict[str, tuple[set[str], ast.AST | None]]] = {}
+#: :func:`unaccounted_launches`): scope id -> name -> [(kind, node)].
+_SCOPE_CACHE: dict[int, dict[str, list[tuple[str, ast.AST]]]] = {}
 
 
-def _scope_bindings(scope: ast.AST, name: str) -> tuple[set[str], ast.AST | None]:
-    every = _SCOPE_CACHE.get(id(scope))
-    if every is None:
-        every = _SCOPE_CACHE[id(scope)] = _all_scope_bindings(scope)
-    return every.get(name, (set(), None))
+def _bindings(scope: ast.AST) -> dict[str, list[tuple[str, ast.AST]]]:
+    """EVERY binding made directly in ``scope`` (a module, function or
+    lambda), by name: the one enumerator every "bound once", "shadowed" and
+    "reserved name" decision uses (14 October 2026).
 
-
-def _all_scope_bindings(scope: ast.AST) -> dict[str, tuple[set[str], ast.AST | None]]:
-    """How each name is bound directly in ``scope`` (a function or a module).
-
-    For each name, the kinds of binding found — ``"def"`` (a nested or
-    module-level function or class), ``"import"``, or ``"other"`` (a
-    parameter, with its default; an assignment of any kind; a for, with,
-    except or comprehension target; a ``global`` or ``nonlocal``; a ``del``)
-    — and the definition node for a ``"def"``. Nested function, class and
-    lambda bodies are their own scopes and are not looked inside, but their
-    names are bindings here.
+    Kinds: ``param`` (a parameter), ``assign`` (a plain assignment), ``augassign``,
+    ``annassign``, ``walrus``, ``for``, ``with``, ``except``, ``comprehension``,
+    ``import`` (an import or from-import alias), ``def`` and ``class``,
+    ``global``, ``nonlocal``, ``del`` and ``match`` (a match-case capture).
+    Nested function, class and lambda bodies are scopes of their own and are
+    not looked inside, but their names, defaults and decorators belong here.
     """
-    found: dict[str, tuple[set[str], ast.AST | None]] = {}
+    cached = _SCOPE_CACHE.get(id(scope))
+    if cached is not None:
+        return cached
+    found: dict[str, list[tuple[str, ast.AST]]] = {}
 
-    def bind(name: str, kind: str, definition: ast.AST | None = None) -> None:
-        kinds, current = found.get(name, (set(), None))
-        kinds.add(kind)
-        found[name] = (kinds, definition if definition is not None else current)
+    def bind(name: str | None, kind: str, node: ast.AST) -> None:
+        if name:
+            found.setdefault(name, []).append((kind, node))
 
+    def targets_of(target: ast.AST, kind: str, node: ast.AST) -> None:
+        for sub in ast.walk(target):
+            if isinstance(sub, ast.Name):
+                bind(sub.id, kind, node)
+
+    pending: list[ast.AST] = []
     if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
         args = scope.args
-        every = [*args.posonlyargs, *args.args, *args.kwonlyargs]
-        every += [a for a in (args.vararg, args.kwarg) if a is not None]
-        for arg in every:
-            bind(arg.arg, "other")
-    pending = list(ast.iter_child_nodes(scope))
-    if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
-        pending = list(scope.body)
+        for arg in [*args.posonlyargs, *args.args, *args.kwonlyargs]:
+            bind(arg.arg, "param", arg)
+        for arg in (args.vararg, args.kwarg):
+            if arg is not None:
+                bind(arg.arg, "param", arg)
+        pending = list(scope.body) if not isinstance(scope, ast.Lambda) else [scope.body]
+    else:
+        pending = list(ast.iter_child_nodes(scope))
     while pending:
         node = pending.pop()
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            bind(node.name, "def", node)
-            continue  # its body is a scope of its own
+            bind(node.name, "class" if isinstance(node, ast.ClassDef) else "def", node)
+            # Its decorators, defaults and bases are evaluated here.
+            pending.extend(node.decorator_list)
+            if isinstance(node, ast.ClassDef):
+                pending.extend(node.bases)
+                pending.extend(kw.value for kw in node.keywords)
+            else:
+                pending.extend(d for d in node.args.defaults)
+                pending.extend(d for d in node.args.kw_defaults if d is not None)
+            continue
         if isinstance(node, ast.Lambda):
+            pending.extend(node.args.defaults)
+            pending.extend(d for d in node.args.kw_defaults if d is not None)
             continue
         if isinstance(node, (ast.Import, ast.ImportFrom)):
-            for alias in node.names:
-                bind(alias.asname or alias.name.split(".")[0], "import")
+            for local, _target in _import_bindings(node, ""):
+                bind(local, "import", node)
             continue
-        if isinstance(node, (ast.Global, ast.Nonlocal)):
+        if isinstance(node, ast.Global):
             for name in node.names:
-                bind(name, "other")
-        targets: list[ast.AST] = []
-        if isinstance(node, ast.Assign):
-            targets = list(node.targets)
-        elif isinstance(
-            node,
-            (ast.AnnAssign, ast.AugAssign, ast.NamedExpr, ast.For, ast.AsyncFor, ast.comprehension),
-        ):
-            targets = [node.target]
+                bind(name, "global", node)
+        elif isinstance(node, ast.Nonlocal):
+            for name in node.names:
+                bind(name, "nonlocal", node)
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                targets_of(target, "assign", node)
+        elif isinstance(node, ast.AugAssign):
+            targets_of(node.target, "augassign", node)
+        elif isinstance(node, ast.AnnAssign):
+            targets_of(node.target, "annassign", node)
+        elif isinstance(node, ast.NamedExpr):
+            targets_of(node.target, "walrus", node)
+        elif isinstance(node, (ast.For, ast.AsyncFor)):
+            targets_of(node.target, "for", node)
         elif isinstance(node, (ast.With, ast.AsyncWith)):
-            targets = [i.optional_vars for i in node.items if i.optional_vars is not None]
+            for item in node.items:
+                if item.optional_vars is not None:
+                    targets_of(item.optional_vars, "with", node)
+        elif isinstance(node, ast.ExceptHandler):
+            bind(node.name, "except", node)
+        elif isinstance(node, ast.comprehension):
+            targets_of(node.target, "comprehension", node)
         elif isinstance(node, ast.Delete):
-            targets = list(node.targets)
-        elif isinstance(node, ast.ExceptHandler) and node.name:
-            bind(node.name, "other")
-        for target in targets:
-            for sub in ast.walk(target):
-                if isinstance(sub, ast.Name):
-                    bind(sub.id, "other")
+            for target in node.targets:
+                targets_of(target, "del", node)
+        elif isinstance(node, (ast.MatchAs, ast.MatchStar)):
+            bind(node.name, "match", node)
+        elif isinstance(node, ast.MatchMapping):
+            bind(node.rest, "match", node)
         pending.extend(ast.iter_child_nodes(node))
+    _SCOPE_CACHE[id(scope)] = found
     return found
 
 
-def _resolve(mod: _Module, func_node: ast.AST, at: ast.AST) -> str | None:
-    """The dotted name a call target refers to, or ``None`` when unknown.
+def _scope_bindings(scope: ast.AST, name: str) -> tuple[set[str], ast.AST | None]:
+    """``({"def"|"import"|"other"}, the definition)`` for ``name`` in ``scope``."""
+    kinds: set[str] = set()
+    definition: ast.AST | None = None
+    for kind, node in _bindings(scope).get(name, []):
+        if kind in ("def", "class"):
+            kinds.add("def")
+            definition = node
+        elif kind == "import":
+            kinds.add("import")
+        else:
+            kinds.add("other")
+    return kinds, definition
+
+
+def _defining_scope(mod: _Module, at: ast.AST) -> ast.AST | None:
+    """The function whose scope a name at ``at`` is looked up in.
+
+    A parameter's default, an annotation and a decorator are evaluated where
+    the function is DEFINED, not inside it, so for those the scope is the
+    function enclosing the definition (14 October 2026: a default such as
+    ``_start_and_collect=_start_and_collect`` names the runner itself).
+    """
+    child: ast.AST = at
+    current = mod.parents.get(id(at))
+    while current is not None:
+        if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            evaluated_outside = (
+                child is current.args
+                or any(child is d for d in current.decorator_list)
+                or child is current.returns
+            )
+            if not evaluated_outside:
+                return current
+        if isinstance(current, ast.Lambda) and child is current.args:
+            pass  # a lambda's defaults are evaluated where it is written
+        child, current = current, mod.parents.get(id(current))
+    return None
+
+
+def _resolve_all(mod: _Module, func_node: ast.AST, at: ast.AST) -> set[str]:
+    """Every dotted name a call target may refer to (empty when unknown).
 
     A bare name is looked up as Python would: in each enclosing function,
-    innermost first, then in the module. A name bound in a function by
-    anything but a nested definition or an import (a parameter or its
-    default, an assignment, a loop, ``with`` or ``except`` target, a
-    comprehension, ``global``/``nonlocal``) is unknown; so is a module name
-    that is rebound at module level after it is imported.
+    innermost first, then in the module. Bound in a function by anything but
+    a nested definition or an import, it is unknown; so is a module name
+    rebound at module level after it is imported. An imported name may name
+    several things, one per import of it anywhere in the module.
     """
     if isinstance(func_node, ast.Name):
         name = func_node.id
-        scope = _enclosing_function(mod, at)
+        scope = _defining_scope(mod, at)
         while scope is not None:
             kinds, definition = _scope_bindings(scope, name)
             if "other" in kinds:
-                return None
+                return set()
             if "def" in kinds and definition is not None:
-                return f"{mod.dotted}.{_qualname(mod, definition)}"
+                if "import" in kinds:
+                    return set()
+                return {f"{mod.dotted}.{_qualname(mod, definition)}"}
             if "import" in kinds:
-                return mod.imports.get(name)
+                return set(_targets(mod, name))
             scope = _enclosing_function(mod, scope)
         kinds, _definition = _scope_bindings(mod.tree, name)
-        if "other" in kinds:
-            return None
+        if "other" in kinds or ("def" in kinds and "import" in kinds):
+            return set()
         if "def" in kinds:
-            return f"{mod.dotted}.{name}"
-        return mod.imports.get(name)
+            return {f"{mod.dotted}.{name}"}
+        return set(_targets(mod, name))
     if isinstance(func_node, ast.Attribute):
         value = func_node.value
         if isinstance(value, ast.Name) and value.id in ("self", "cls"):
             klass = _enclosing(mod, at, ast.ClassDef)
             if klass is not None:
-                return f"{mod.dotted}.{klass.name}.{func_node.attr}"
-            return None
-        base = _resolve(mod, value, at)
-        return f"{base}.{func_node.attr}" if base else None
-    return None
+                return {f"{mod.dotted}.{klass.name}.{func_node.attr}"}
+            return set()
+        return {f"{base}.{func_node.attr}" for base in _resolve_all(mod, value, at)}
+    return set()
+
+
+def _resolve(mod: _Module, func_node: ast.AST, at: ast.AST) -> str | None:
+    """The one dotted name a call target refers to, or ``None`` when it is
+    unknown or could be more than one thing."""
+    every = _resolve_all(mod, func_node, at)
+    return next(iter(every)) if len(every) == 1 else None
 
 
 def _assignments(func: ast.AST, name: str) -> list[ast.AST]:
@@ -2069,9 +2208,9 @@ def _reads_this_process_environment(
     could pass a factory credential under a name the helper does not refuse."""
     for sub in ast.walk(node):
         if isinstance(sub, ast.Attribute) and sub.attr in ("environ", "environb", "getenv"):
-            if isinstance(sub.value, ast.Name) and mod.imports.get(sub.value.id) == "os":
+            if isinstance(sub.value, ast.Name) and "os" in _targets(mod, sub.value.id):
                 return True
-        if isinstance(sub, ast.Name) and mod.imports.get(sub.id) in ("os.environ", "os.getenv"):
+        if isinstance(sub, ast.Name) and _targets(mod, sub.id) & {"os.environ", "os.getenv"}:
             return True
         if (
             func is not None
@@ -2122,48 +2261,25 @@ def _is_launch_or_runner(mod: _Module, call: ast.Call) -> bool:
 
 
 def _single_use_helper_name(name: str, mod: _Module, func: Any, wrappers: set[str]) -> bool:
-    """``name`` is assigned exactly once in ``func``, by a single-target
-    assignment of an inline helper call, and every other use of it is as the
+    """``name`` has exactly ONE binding in ``func`` — a single-target
+    assignment of an inline helper call — and every other use of it is as the
     ``env=`` keyword of a launch or generic-runner call in ``func`` itself:
     never an attribute, a subscript, an argument to another call, a return
-    value, an alias or a closure capture."""
-    if _is_parameter(func, name):
+    value, an alias or a closure capture. Any other binding of the name (an
+    import, a definition, a loop or match capture, a ``del``...) disqualifies
+    it."""
+    bound = _bindings(func).get(name, [])
+    if len(bound) != 1:
         return False
-    values: list[ast.AST] = []
-    for node in ast.walk(func):
-        if isinstance(node, (ast.Global, ast.Nonlocal)) and name in node.names:
-            return False
-        if isinstance(node, ast.Assign):
-            bound = [
-                n for t in node.targets for n in ast.walk(t)
-                if isinstance(n, ast.Name) and n.id == name
-            ]
-            if bound:
-                if len(node.targets) != 1 or not isinstance(node.targets[0], ast.Name):
-                    return False  # a chained or unpacking assignment
-                values.append(node.value)
-        elif isinstance(node, ast.AnnAssign):
-            if isinstance(node.target, ast.Name) and node.target.id == name:
-                if node.value is None:
-                    return False
-                values.append(node.value)
-        elif isinstance(node, ast.ExceptHandler):
-            if node.name == name:
-                return False
-        elif isinstance(
-            node,
-            (ast.AugAssign, ast.NamedExpr, ast.Delete, ast.For, ast.AsyncFor,
-             ast.With, ast.AsyncWith, ast.comprehension),
-        ):
-            if isinstance(node, ast.Delete):
-                targets = list(node.targets)
-            elif isinstance(node, (ast.With, ast.AsyncWith)):
-                targets = [i.optional_vars for i in node.items if i.optional_vars is not None]
-            else:
-                targets = [node.target]
-            if any(isinstance(n, ast.Name) and n.id == name for t in targets for n in ast.walk(t)):
-                return False
-    if len(values) != 1 or not _inline_helper(values[0], mod, func, wrappers):
+    kind, node = bound[0]
+    if (
+        kind != "assign"
+        or not isinstance(node, ast.Assign)
+        or len(node.targets) != 1
+        or not isinstance(node.targets[0], ast.Name)
+    ):
+        return False
+    if not _inline_helper(node.value, mod, func, wrappers):
         return False
     for node in ast.walk(func):
         if not (isinstance(node, ast.Name) and node.id == name and isinstance(node.ctx, ast.Load)):
@@ -2243,14 +2359,14 @@ def _launch_kind(mod: _Module, node: ast.AST) -> str | None:
         if node.attr in _ANY_RECEIVER_LAUNCHES:
             return _dotted(node)
         if isinstance(node.value, ast.Name):
-            module = mod.imports.get(node.value.id)
-            if module in _LAUNCHES and node.attr in _LAUNCHES[module]:
-                return f"{module}.{node.attr}"
+            for module in sorted(_targets(mod, node.value.id)):
+                if module in _LAUNCHES and node.attr in _LAUNCHES[module]:
+                    return f"{module}.{node.attr}"
     if isinstance(node, ast.Name):
-        target = mod.imports.get(node.id, "")
-        module, _, name = target.rpartition(".")
-        if module in _LAUNCHES and name in _LAUNCHES[module]:
-            return target
+        for target in sorted(_targets(mod, node.id)):
+            module, _, name = target.rpartition(".")
+            if module in _LAUNCHES and name in _LAUNCHES[module]:
+                return target
     return None
 
 
@@ -2328,9 +2444,10 @@ def _runner_named(mod: _Module, node: ast.AST) -> tuple[str, str] | None:
     """Which generic runner ``node`` names, if any: by where it is defined
     (an import under any name, a module attribute) or, on an object, by the
     attribute name it is reached by (``self._spawn``)."""
-    target = _resolve(mod, node, node) if isinstance(node, (ast.Name, ast.Attribute)) else None
+    every = _resolve_all(mod, node, node) if isinstance(node, (ast.Name, ast.Attribute)) else set()
+    target = next(iter(every)) if len(every) == 1 else None
     for key, spec in GENERIC_RUNNERS.items():
-        if target and target in spec["dotted"]:
+        if every & spec["dotted"]:
             return key
     for key, spec in GENERIC_RUNNERS.items():
         if isinstance(node, ast.Attribute) and node.attr in spec["names"]:
@@ -2338,6 +2455,108 @@ def _runner_named(mod: _Module, node: ast.AST) -> tuple[str, str] | None:
         if isinstance(node, ast.Name) and node.id in spec["names"] and target is None:
             return key
     return None
+
+
+def _reserved_names() -> set[str]:
+    """Names that may never be rebound: the helper's, and every generic
+    runner's."""
+    reserved = {target.rsplit(".", 1)[1] for target in HELPERS}
+    for (_rel, fname), spec in GENERIC_RUNNERS.items():
+        reserved.add(fname)
+        reserved.update(spec["names"])
+    return reserved
+
+
+def _reserved_name_rebindings(modules: list[_Module]) -> list[str]:
+    """Every rebinding of a reserved name, and every launch imported under
+    another name.
+
+    A reserved name is the helper's, a generic runner's or a launch
+    function's — an imported alias of one included. In every module,
+    function and lambda scope, each binding of one (found by the one binding
+    enumerator, :func:`_bindings`) is flagged unless it is an import of the
+    very thing itself, or a module-level definition of a name the module
+    does not also import. Separately, a launch module or launch function
+    imported under a different local name (``as``) is flagged anywhere.
+    """
+    base = _reserved_names()
+    problems: list[str] = []
+    for mod in modules:
+        reserved = set(base)
+        for alias, every in mod.imports.items():
+            for target in every:
+                module, _, last = target.rpartition(".")
+                if (
+                    last in base
+                    or target in HELPERS
+                    or (module in _LAUNCHES and last in _LAUNCHES[module])
+                ):
+                    reserved.add(alias)
+
+        def flag(node: ast.AST, sentence: str) -> None:
+            holder = _enclosing(mod, node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+            where = getattr(holder, "name", "<module>")
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                outer = _enclosing(mod, node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+                where = getattr(outer, "name", "<module>")
+            problems.append(f"{mod.rel}:{getattr(node, 'lineno', 0)} in {where}: {sentence}")
+
+        def is_the_thing_itself(local: str, node: ast.AST) -> bool:
+            for name, target in _import_bindings(node, mod.package):
+                if name != local:
+                    continue
+                module, _, last = target.rpartition(".")
+                if not (
+                    target in HELPERS
+                    or any(target in spec["dotted"] for spec in GENERIC_RUNNERS.values())
+                    or (module in _LAUNCHES and last in _LAUNCHES[module])
+                    or target in _LAUNCHES
+                ):
+                    return False
+            return True
+
+        scopes: list[ast.AST] = [mod.tree] + [
+            n for n in ast.walk(mod.tree)
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))
+        ]
+        for scope in scopes:
+            for name, bound in _bindings(scope).items():
+                if name not in reserved:
+                    continue
+                for kind, node in bound:
+                    if kind == "import" and is_the_thing_itself(name, node):
+                        continue
+                    if (
+                        kind in ("def", "class")
+                        and scope is mod.tree
+                        and name not in mod.imports
+                    ):
+                        continue
+                    flag(
+                        node,
+                        f"the reserved name {name!r} (the helper's, a generic "
+                        f"runner's or a launch function's) is rebound by a "
+                        f"{kind} binding",
+                    )
+        # A launch module or launch function imported under another name.
+        for node in ast.walk(mod.tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.asname and alias.name in _LAUNCHES and alias.asname != alias.name:
+                        flag(node, f"the launch module {alias.name} is imported as {alias.asname!r}")
+            elif isinstance(node, ast.ImportFrom) and node.module in _LAUNCHES and not node.level:
+                for alias in node.names:
+                    if (
+                        alias.asname
+                        and alias.name in _LAUNCHES[node.module]
+                        and alias.asname != alias.name
+                    ):
+                        flag(
+                            node,
+                            f"the launch function {node.module}.{alias.name} is "
+                            f"imported as {alias.asname!r}",
+                        )
+    return problems
 
 
 def unaccounted_launches(package: Path) -> list[str]:
@@ -2432,6 +2651,7 @@ def unaccounted_launches(package: Path) -> list[str]:
                         "a variable, passed on or wrapped), so its env= cannot be "
                         "checked",
                     )
+    problems.extend(_reserved_name_rebindings(modules))
     for (rel, fname), spec in GENERIC_RUNNERS.items():
         for mod in modules:
             for node in ast.walk(mod.tree):
@@ -3114,6 +3334,225 @@ def test_decorators_and_shadowed_names_are_never_the_helper(tmp_path: Path) -> N
     assert len(expected) == 4
     assert expected - named == set(), f"slipped past the guard: {sorted(expected - named)}"
     assert not {n for n in named if n.startswith("ok_")}, problems
+
+
+#: Defaults and reserved names, probed (14 October 2026): a default that
+#: captures a generic runner under its own name or another, a lambda default
+#: that calls one, and a local named like the helper.
+GUARD_PROBES_7 = textwrap.dedent(
+    '''\
+    import os
+    import subprocess
+
+    from forge.deploy_sidecar.service import _start_and_collect
+    from forge.launch_environment import build_project_command_env
+
+
+    def p7_same_named_default_capture(cmd, _start_and_collect=_start_and_collect):
+        return _start_and_collect(argv=cmd, cwd=".", env=dict(os.environ), timeout=1, what="x")
+
+
+    def p7_differently_named_default(cmd, run_it=_start_and_collect):
+        return run_it(argv=cmd, cwd=".", env=dict(os.environ), timeout=1, what="x")
+
+
+    def p7_lambda_default_calling_runner(cmd, go=lambda **k: _start_and_collect(**k)):
+        return go(argv=cmd, cwd=".", env=dict(os.environ), timeout=1, what="x")
+
+
+    def p7_local_named_like_the_helper(cmd, folder):
+        build_project_command_env = dict
+        subprocess.run(cmd, env=build_project_command_env(os.environ))
+
+
+    def ok_inline_helper(cmd, folder):
+        subprocess.run(cmd, env=build_project_command_env(folder))
+
+
+    def ok_single_use_named_env(cmd, folder):
+        env = build_project_command_env(folder)
+        subprocess.run(cmd, env=env)
+
+
+    def ok_runner_with_helper(cmd, folder):
+        return _start_and_collect(
+            argv=cmd, cwd=".", env=build_project_command_env(folder), timeout=1, what="x"
+        )
+    '''
+)
+
+
+def test_defaults_and_reserved_names_are_caught(tmp_path: Path) -> None:
+    pkg = tmp_path / "forge"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "zz_probe7.py").write_text(GUARD_PROBES_7, encoding="utf-8")
+    problems = unaccounted_launches(pkg)
+    by_function: dict[str, list[str]] = {}
+    for problem in problems:
+        where, why = problem.split(" in ", 1)[1].split(": ", 1)
+        by_function.setdefault(where, []).append(why)
+    expected = {
+        n.name
+        for n in ast.parse(GUARD_PROBES_7).body
+        if isinstance(n, ast.FunctionDef) and n.name.startswith("p7_")
+    }
+    assert len(expected) == 4
+    assert expected - set(by_function) == set(), problems
+    assert not {n for n in by_function if n.startswith("ok_")}, problems
+    assert any("reserved name '_start_and_collect'" in why for why in by_function["p7_same_named_default_capture"])
+    assert any("used as a value" in why for why in by_function["p7_differently_named_default"])
+    assert any("call to the generic runner" in why for why in by_function["p7_lambda_default_calling_runner"])
+    assert any(
+        "reserved name 'build_project_command_env'" in why
+        for why in by_function["p7_local_named_like_the_helper"]
+    )
+
+
+#: Every binding form, probed (14 October 2026): a named helper environment
+#: rebound by an import, a from-import, a definition, a class, a match-case
+#: capture, or deleted and reassigned.
+GUARD_PROBES_8 = textwrap.dedent(
+    '''\
+    import os
+    import subprocess
+
+    from forge.launch_environment import build_project_command_env
+
+
+    def p8_import_rebinding(cmd, folder):
+        env = build_project_command_env(folder)
+        import json as env
+        subprocess.run(cmd, env=env)
+
+
+    def p8_from_import_rebinding(cmd, folder):
+        env = build_project_command_env(folder)
+        from os import environ as env
+        subprocess.run(cmd, env=env)
+
+
+    def p8_def_rebinding(cmd, folder):
+        env = build_project_command_env(folder)
+
+        def env():
+            return dict(os.environ)
+
+        subprocess.run(cmd, env=env)
+
+
+    def p8_class_rebinding(cmd, folder):
+        env = build_project_command_env(folder)
+
+        class env(dict):
+            pass
+
+        subprocess.run(cmd, env=env)
+
+
+    def p8_match_capture(cmd, folder, value):
+        env = build_project_command_env(folder)
+        match value:
+            case dict() as env:
+                pass
+        subprocess.run(cmd, env=env)
+
+
+    def p8_del_then_reassign(cmd, folder):
+        env = build_project_command_env(folder)
+        del env
+        env = dict(os.environ)
+        subprocess.run(cmd, env=env)
+
+
+    def ok_inline_helper(cmd, folder):
+        subprocess.run(cmd, env=build_project_command_env(folder))
+
+
+    def ok_single_use_named_env(cmd, folder):
+        env = build_project_command_env(folder)
+        subprocess.run(cmd, env=env)
+    '''
+)
+
+#: The import table, probed (14 October 2026): one local name imported as a
+#: launch module or function in one scope and as something harmless in
+#: another — across functions, as a from-import, and module level against
+#: function level.
+GUARD_PROBES_9 = textwrap.dedent(
+    '''\
+    import json as worker
+
+
+    def p9_alias_reused_across_functions(cmd):
+        import subprocess as tool
+        tool.run(cmd, shell=True)
+
+
+    def _elsewhere():
+        import json as tool
+        return tool.dumps({})
+
+
+    def p9_from_import_variant(cmd):
+        from subprocess import run as go
+        go(cmd, shell=True)
+
+
+    def _elsewhere_too():
+        from json import dumps as go
+        return go({})
+
+
+    def p9_module_level_against_function_level(cmd):
+        import subprocess as worker
+        worker.run(cmd, shell=True)
+
+
+    def ok_helper_environment(cmd, folder):
+        import subprocess
+
+        from forge.launch_environment import build_project_command_env
+
+        subprocess.run(cmd, env=build_project_command_env(folder))
+
+
+    def ok_single_use_helper_environment(cmd, folder):
+        import subprocess
+
+        from forge.launch_environment import build_project_command_env
+
+        env = build_project_command_env(folder)
+        subprocess.run(cmd, env=env)
+    '''
+)
+
+
+@pytest.mark.parametrize(
+    ("source", "prefix", "count"),
+    [("GUARD_PROBES_8", "p8_", 6), ("GUARD_PROBES_9", "p9_", 3)],
+)
+def test_every_binding_and_every_import_is_seen(
+    tmp_path: Path, source: str, prefix: str, count: int
+) -> None:
+    text = globals()[source]
+    pkg = tmp_path / "forge"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "zz_probe.py").write_text(text, encoding="utf-8")
+    problems = unaccounted_launches(pkg)
+    named = {p.split(" in ", 1)[1].split(":", 1)[0] for p in problems}
+    expected = {
+        n.name
+        for n in ast.parse(text).body
+        if isinstance(n, ast.FunctionDef) and n.name.startswith(prefix)
+    }
+    assert len(expected) == count
+    assert expected - named == set(), f"slipped past the guard: {sorted(expected - named)}"
+    assert not {n for n in named if n.startswith("ok_")}, problems
+    if prefix == "p9_":
+        assert any("is imported as 'tool'" in p for p in problems), problems
+        assert any("is imported as 'go'" in p for p in problems), problems
 
 
 def test_every_process_launch_is_accounted_for() -> None:

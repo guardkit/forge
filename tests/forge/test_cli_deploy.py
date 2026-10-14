@@ -221,7 +221,7 @@ def test_exit_code_mapping(
     monkeypatch.setattr(
         _deploy_run,
         "_make_live_gate_invoker",
-        lambda profile, repo_path: _FixedVerdictInvoker(verdict),
+        lambda profile, repo_path, *_declared: _FixedVerdictInvoker(verdict),
     )
     _write_profile(tmp_path, rollback=rollback)
 
