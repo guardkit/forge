@@ -178,8 +178,9 @@ CLIENT_CALL=("${CLIENT}" ${SANDBOX_CLIENT_ARGUMENTS:-} exec "${NAME}")
 #     (RESERVED_CREDENTIAL_WORDS in src/forge/launch_environment.py), or DSN;
 #   - a name with KEY as a whole word in it (A_SERVICE_KEY, KEY_FILE);
 #   - a value that is an address with any user information in it, an address
-#     whose query names a credential, or a password=-style pair, including
-#     the same written with common escapes.
+#     whose query or fragment names a credential, or a password pair (with =
+#     or :), including the same written with escapes, however many times
+#     percent-encoded.
 # ONE EXACT NAME IS EXCUSED, and no pattern is: the stamp check's token count,
 # whose name contains TOKEN. It may cross only as a plain number; anything
 # else in it (a letter, a space, nothing at all) refuses the start too.
@@ -189,32 +190,46 @@ CREDENTIAL_WORDS=(TOKEN SECRET PASSWORD PASSWD API_KEY APIKEY CREDENTIAL PRIVATE
 # KEYBOARD_LAYOUT or MONKEY_COUNT.
 CREDENTIAL_WHOLE_WORDS=(KEY)
 CREDENTIAL_SHAPED_BUT_ALLOWED=(GUARDKIT_STAMP_MODEL_MAX_TOKENS)
-# The three shapes of a value that carries a credential, matched on the value
-# in lower case, and again once common escapes are undone (%3a, %2f, %40 and
-# the rest, and JSON's \/), so an encoded copy is caught too:
+# The shapes of a value that carries a credential, matched on the value in
+# lower case, and again once escapes are undone (percent-encoding, decoded
+# again and again until it stops changing, JSON's \/, and a backslash used
+# for a slash, as in http:\\someone@host), so an encoded copy is caught too:
 #   an address with any user information in it, a user alone or a user and a
 #   password (scheme://someone@ or scheme://someone:secret@);
 #   an address whose query names a credential (?access_token=, &api_key=,
 #   ;pwd=, ?auth=);
-#   a password=-style pair anywhere (password=, passwd=, pwd=).
+#   an address whose fragment, after #, holds user information or names a
+#   credential (#access_token=);
+#   a password pair anywhere, with = or : (password=, pwd: x, "passwd":).
 USER_IN_AN_ADDRESS='[a-z][a-z0-9+.-]*://[^/?#[:space:]]*@'
 CREDENTIAL_IN_A_QUERY='://[^?#[:space:]]*[?]([^#[:space:]]*[&;])?[^=&;#[:space:]]*(pass|pwd|token|secret|key|auth)[^=&;#[:space:]]*='
-PASSWORD_PAIR='(^|[^a-z0-9])(password|passwd|pwd)[[:space:]]*='
+CREDENTIAL_IN_A_FRAGMENT='://[^#[:space:]]*#[^[:space:]]*(@|(pass|pwd|token|secret|key|auth)[^=&;[:space:]]*=)'
+PASSWORD_PAIR="(^|[^a-z0-9])(password|passwd|pwd)[\"']?[[:space:]]*[=:]"
 
-# A value as a reader of it would see it: lower case, with the common escapes
-# undone. Used only to judge a value, never printed.
+# A value as a reader of it would see it: lower case, with the escapes undone.
+# Percent-encoding is decoded one level a round, until a round changes nothing
+# (at most five rounds), so a value encoded twice is caught too. Used only to
+# judge a value, never printed.
 the_value_unescaped() {
-  local value="${1,,}" escaped_slash='\/'
+  local value="${1,,}" before="" round escaped_slash='\/' backslash='\'
+  for round in 1 2 3 4 5; do
+    before="${value}"
+    value="${value//%3a/:}"
+    value="${value//%2f/\/}"
+    value="${value//%5c/${backslash}}"
+    value="${value//%40/@}"
+    value="${value//%3f/?}"
+    value="${value//%3d/=}"
+    value="${value//%26/&}"
+    value="${value//%3b/;}"
+    value="${value//%23/#}"
+    value="${value//%22/\"}"
+    value="${value//%20/ }"
+    value="${value//%25/%}"
+    [[ "${value}" != "${before}" ]] || break
+  done
   value="${value//"${escaped_slash}"/\/}"
-  value="${value//%3a/:}"
-  value="${value//%2f/\/}"
-  value="${value//%40/@}"
-  value="${value//%3f/?}"
-  value="${value//%3d/=}"
-  value="${value//%26/&}"
-  value="${value//%3b/;}"
-  value="${value//%23/#}"
-  value="${value//%20/ }"
+  value="${value//"${backslash}"/\/}"
   printf '%s' "${value}"
 }
 
@@ -260,8 +275,12 @@ why_this_setting_may_not_cross() {
       printf '%s (its value is an address whose query carries a credential)' "${name}"
       return 0
     fi
+    if [[ "${seen}" =~ ${CREDENTIAL_IN_A_FRAGMENT} ]]; then
+      printf '%s (its value is an address whose fragment carries a credential)' "${name}"
+      return 0
+    fi
     if [[ "${seen}" =~ ${PASSWORD_PAIR} ]]; then
-      printf '%s (its value carries a password= pair)' "${name}"
+      printf '%s (its value carries a password pair)' "${name}"
       return 0
     fi
   done

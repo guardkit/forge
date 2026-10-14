@@ -502,6 +502,15 @@ CREDENTIAL_VALUES = {
     "a-libpq-password": f"host=192.0.2.10 dbname=memory password={SENTINEL}",
     "a-passwd-pair": f"passwd={SENTINEL}",
     "an-upper-case-password-pair": f"user=a PASSWORD = {SENTINEL}",
+    # Fix pass 2 (14 October 2026).
+    "a-pwd-colon": f"pwd:{SENTINEL}",
+    "a-password-colon-with-spaces": f"user: a\npassword : {SENTINEL}",
+    "a-json-password": f'{{"user": "a", "passwd": "{SENTINEL}"}}',
+    "a-token-in-the-fragment": f"https://192.0.2.10/callback#access_token={SENTINEL}",
+    "a-user-in-the-fragment": f"https://192.0.2.10/#someone:{SENTINEL}@192.0.2.11",
+    "double-percent-encoded": f"https%253A%252F%252Fsomeone%253A{SENTINEL}%2540192.0.2.10",
+    "triple-percent-encoded": f"https%25253A%25252F%25252Fsomeone%252540192.0.2.10%25252F{SENTINEL}",
+    "a-backslash-scheme": f"http:\\\\someone:{SENTINEL}@192.0.2.10/",
 }
 
 
@@ -524,7 +533,11 @@ def test_a_value_carrying_a_credential_is_refused_by_name(script, value):
     "a-project@example.invalid",
     "an-ordinary-value-with=an-equals-sign",
     "flash-next-t06",
-], ids=["the-memory-door", "a-plain-query", "an-email-address", "a-plain-pair", "a-model-name"])
+    "http://192.0.2.1:9000/docs#section-2",
+    "a-label: a-value",
+    "http://192.0.2.1:9000/a%2520path",
+], ids=["the-memory-door", "a-plain-query", "an-email-address", "a-plain-pair", "a-model-name",
+        "a-plain-fragment", "a-plain-colon", "a-double-encoded-space"])
 def test_an_ordinary_value_still_crosses(script, value):
     """The control for the value rules: the addresses, names and numbers the
     factory really hands in are not caught."""
@@ -637,22 +650,53 @@ def test_the_door_refuses_a_key_that_is_blank_or_broken(door_entry, tmp_path, ke
     assert "made-up" not in done.stdout + done.stderr
 
 
-@pytest.mark.parametrize("bind", ["0.0.0.0:31823", "[::]:31823", ":::31823", ":31823", "*:31823"],
-                         ids=["every-ipv4-address", "every-ipv6-address", "every-ipv6-bare",
-                              "no-host", "a-wildcard"])
+#: Listening addresses the door refuses: every spelling of "every address",
+#: and anything that is not one specific IPv4 or IPv6 address and a port.
+NOT_ONE_SPECIFIC_ADDRESS = {
+    "every-ipv4-address": "0.0.0.0:31823",
+    "a-bare-zero": "0:31823",
+    "two-zeros": "0.0:31823",
+    "every-ipv6-address": "[::]:31823",
+    "every-ipv6-address-with-a-zero": "[::0]:31823",
+    "every-ipv6-address-spelt-out": "[0000:0:0:0:0:0:0:0]:31823",
+    "every-ipv6-address-in-two-parts": "[0:0::0]:31823",
+    "every-ipv6-bare": ":::31823",
+    "ipv6-without-brackets": "2001:db8::1:31823",
+    "no-host": ":31823",
+    "a-wildcard": "*:31823",
+    "empty-brackets": "[]:31823",
+    "the-broadcast-address": "255.255.255.255:31823",
+    "a-number-too-big": "192.0.2.256:31823",
+    "a-leading-zero": "192.0.02.1:31823",
+    "three-parts": "192.0.2:31823",
+    "a-name": "gateway.test:31823",
+    "an-ipv6-zone": "[fe80::1%eth0]:31823",
+    "nine-ipv6-groups": "[1:2:3:4:5:6:7:8:9]:31823",
+    "two-double-colons": "[1::2::3]:31823",
+    "junk-after-the-port": "[2001:db8::1]:31823]:1",
+    "no-port": "192.0.2.1",
+    "port-zero": "192.0.2.1:0",
+    "port-too-big": "192.0.2.1:65536",
+}
+
+
+@pytest.mark.parametrize("bind", list(NOT_ONE_SPECIFIC_ADDRESS.values()),
+                         ids=list(NOT_ONE_SPECIFIC_ADDRESS))
 def test_the_door_refuses_to_listen_everywhere(door_entry, tmp_path, bind):
-    """Item 6: whatever reaches it, the door refuses to listen on every
-    address of the machine."""
+    """Item 6, and fix pass 2: the address is parsed, not matched as text.
+    Whatever reaches it, the door refuses every spelling of "every address"
+    and anything that is not one specific address and port."""
     done = _start_the_door(door_entry, tmp_path, b"made-up-door-key-for-the-test\n", bind)
     assert done.returncode != 0, done.stdout + done.stderr
     assert "the model door" in done.stderr
     assert "made-up" not in done.stdout + done.stderr
 
 
-def test_the_door_starts_with_a_good_key_and_the_gateway_address(door_entry, tmp_path):
+@pytest.mark.parametrize("bind", ["192.0.2.1:31823", "[2001:db8::1]:31823", "10.0.0.0:1"],
+                         ids=["an-ipv4-address", "an-ipv6-address", "a-network-number"])
+def test_the_door_starts_with_a_good_key_and_the_gateway_address(door_entry, tmp_path, bind):
     """The control for the two refusals above."""
-    done = _start_the_door(door_entry, tmp_path, b"made-up-door-key-for-the-test\n",
-                           "192.0.2.1:31823")
+    done = _start_the_door(door_entry, tmp_path, b"made-up-door-key-for-the-test\n", bind)
     assert done.returncode == 0, done.stdout + done.stderr
 
 

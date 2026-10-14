@@ -296,8 +296,9 @@ call to the model router on this machine's loopback. Its settings are
   blank, or has spaces or line breaks in it.
 - `MODEL_DOOR_PORT` in the env file (31823 in the example). The door listens on
   `FACTORY_GATEWAY_ADDRESS` and that port only: `compose.yaml` builds the
-  address from the two, and the entry shell refuses an address that would mean
-  every address of the machine.
+  address from the two, and the entry shell parses it and refuses anything but
+  one specific IPv4 or IPv6 address and port (every spelling of "every
+  address", such as `0`, `0.0.0.0` or `[::]`, included).
 - `FACTORY_MODEL_DOOR_IMAGE`, the pinned HAProxy image, which must agree with
   `estate-pins.conf`.
 

@@ -564,14 +564,79 @@ services:
       - -c
       - |
         set -eu
-        # Where it listens: never every address of the machine.
-        host="$${MODEL_DOOR_BIND%:*}"
-        case "$$host" in
-            ""|"*"|0.0.0.0|::|"[::]"|:*)
-                echo "the model door was asked to listen on every address of this machine; it listens only on the factory gateway address. Set FACTORY_GATEWAY_ADDRESS and MODEL_DOOR_PORT in the env file (deploy/estate/README.md, 'The model door')." >&2
-                exit 1
+        # WHERE IT LISTENS: one specific address and a port, never every address of
+        # the machine. MODEL_DOOR_BIND is parsed, not matched as text: an IPv4
+        # address must be four numbers of 0 to 255, an IPv6 address must be in
+        # brackets with at most eight groups of hex, and an address that works out
+        # to "unspecified" (0.0.0.0, ::, and every other spelling of them) or to the
+        # IPv4 broadcast address is refused.
+        refuse_the_address() {
+            echo "the model door listens only on one specific address and port, and MODEL_DOOR_BIND ($$MODEL_DOOR_BIND) is not one: $$1. Set FACTORY_GATEWAY_ADDRESS and MODEL_DOOR_PORT in the env file (deploy/estate/README.md, 'The model door')." >&2
+            exit 1
+        }
+        an_ipv4_address() {
+            case "$$1" in ""|*[!0-9.]*|.*|*.|*..*) return 1 ;; esac
+            old_ifs="$$IFS"; IFS=.; set -f; set -- $$1; set +f; IFS="$$old_ifs"
+            [ "$$#" -eq 4 ] || return 1
+            total=0; all_full=1
+            for part in "$$@"; do
+                case "$$part" in 0) ;; 0*|????*) return 1 ;; esac
+                [ "$$part" -le 255 ] || return 1
+                total=$$((total + part))
+                [ "$$part" -eq 255 ] || all_full=0
+            done
+            [ "$$total" -gt 0 ] || refuse_the_address "it is the unspecified address, which means every IPv4 address"
+            [ "$$all_full" -eq 0 ] || refuse_the_address "it is the IPv4 broadcast address"
+            return 0
+        }
+        some_ipv6_groups() {
+            # Prints how many groups of one to four hex digits $$1 holds, or fails.
+            [ -n "$$1" ] || { echo 0; return 0; }
+            case "$$1" in :*|*:|*::*) return 1 ;; esac
+            old_ifs="$$IFS"; IFS=:; set -f; set -- $$1; set +f; IFS="$$old_ifs"
+            for group in "$$@"; do
+                case "$$group" in ""|?????*|*[!0-9a-fA-F]*) return 1 ;; esac
+            done
+            echo "$$#"
+        }
+        an_ipv6_address() {
+            case "$$1" in ""|*[!0-9a-fA-F:]*|*::*::*) return 1 ;; esac
+            case "$$1" in
+                *::*)
+                    left="$$(some_ipv6_groups "$${1%%::*}")" || return 1
+                    right="$$(some_ipv6_groups "$${1#*::}")" || return 1
+                    [ $$((left + right)) -le 7 ] || return 1
+                    ;;
+                *)
+                    groups="$$(some_ipv6_groups "$$1")" || return 1
+                    [ "$$groups" -eq 8 ] || return 1
+                    ;;
+            esac
+            # Every group zero, however it is spelt, is the unspecified address.
+            nonzero="$$(printf '%s' "$$1" | tr -d ':0')"
+            [ -n "$$nonzero" ] || refuse_the_address "it is the unspecified address, which means every IPv6 address"
+            return 0
+        }
+        bind="$$MODEL_DOOR_BIND"
+        case "$$bind" in
+            \[*\]:*)
+                host="$${bind%%]:*}"; host="$${host#\[}"; port="$${bind##*]:}"
+                [ "$$bind" = "[$$host]:$$port" ] || refuse_the_address "it is not one [address]:port"
+                an_ipv6_address "$$host" || refuse_the_address "the part in brackets is not one IPv6 address"
+                ;;
+            *:*:*)
+                refuse_the_address "an IPv6 address must be written in brackets, as [address]:port"
+                ;;
+            *:*)
+                host="$${bind%:*}"; port="$${bind##*:}"
+                an_ipv4_address "$$host" || refuse_the_address "the part before the port is not one IPv4 address"
+                ;;
+            *)
+                refuse_the_address "it has no port"
                 ;;
         esac
+        case "$$port" in ""|0*|*[!0-9]*|??????*) refuse_the_address "the port is not a number from 1 to 65535" ;; esac
+        [ "$$port" -le 65535 ] || refuse_the_address "the port is not a number from 1 to 65535"
         key_file=/run/secrets/sandbox_model_key
         if [ ! -s "$$key_file" ]; then
             echo "the model door was given no key: the estate passes it in as a file, and this one arrived missing or empty. Start the estate the way deploy/estate/README.md says ('The model door'), with SANDBOX_MODEL_KEY passed in from a child process." >&2
@@ -593,7 +658,7 @@ services:
       # Where it listens: BUILT here from the gateway address and the door's
       # port, as every other gateway service's address is, so it cannot be
       # set to every address of the machine by hand. The entry shell above
-      # refuses an unspecified address as well.
+      # also parses it and refuses anything but one specific address.
       MODEL_DOOR_BIND: ${FACTORY_GATEWAY_ADDRESS:?name this machine's factory gateway address in the env file}:${MODEL_DOOR_PORT:?name the port the model door listens on at the gateway address in the env file}
     secrets:
       - source: sandbox-model-key
