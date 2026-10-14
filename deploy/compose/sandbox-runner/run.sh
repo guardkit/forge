@@ -179,8 +179,9 @@ CLIENT_CALL=("${CLIENT}" ${SANDBOX_CLIENT_ARGUMENTS:-} exec "${NAME}")
 #   - a name with KEY as a whole word in it (A_SERVICE_KEY, KEY_FILE);
 #   - a value that is an address with any user information in it, an address
 #     whose query or fragment names a credential, or a password pair (with =
-#     or :), including the same written with escapes, however many times
-#     percent-encoded.
+#     or :), including the same written with escapes: every percent-escape
+#     is decoded, however many times over (up to five), and a value whose
+#     encoding cannot be read safely is refused too.
 # ONE EXACT NAME IS EXCUSED, and no pattern is: the stamp check's token count,
 # whose name contains TOKEN. It may cross only as a plain number; anything
 # else in it (a letter, a space, nothing at all) refuses the start too.
@@ -191,9 +192,10 @@ CREDENTIAL_WORDS=(TOKEN SECRET PASSWORD PASSWD API_KEY APIKEY CREDENTIAL PRIVATE
 CREDENTIAL_WHOLE_WORDS=(KEY)
 CREDENTIAL_SHAPED_BUT_ALLOWED=(GUARDKIT_STAMP_MODEL_MAX_TOKENS)
 # The shapes of a value that carries a credential, matched on the value in
-# lower case, and again once escapes are undone (percent-encoding, decoded
-# again and again until it stops changing, JSON's \/, and a backslash used
-# for a slash, as in http:\\someone@host), so an encoded copy is caught too:
+# lower case, and again once escapes are undone (every percent-escape,
+# decoded again and again until it stops changing, JSON's \/, and a backslash
+# used for a slash, as in http:\\someone@host), so an encoded copy is caught
+# too:
 #   an address with any user information in it, a user alone or a user and a
 #   password (scheme://someone@ or scheme://someone:secret@);
 #   an address whose query names a credential (?access_token=, &api_key=,
@@ -206,31 +208,39 @@ CREDENTIAL_IN_A_QUERY='://[^?#[:space:]]*[?]([^#[:space:]]*[&;])?[^=&;#[:space:]
 CREDENTIAL_IN_A_FRAGMENT='://[^#[:space:]]*#[^[:space:]]*(@|(pass|pwd|token|secret|key|auth)[^=&;[:space:]]*=)'
 PASSWORD_PAIR="(^|[^a-z0-9])(password|passwd|pwd)[\"']?[[:space:]]*[=:]"
 
-# A value as a reader of it would see it: lower case, with the escapes undone.
-# Percent-encoding is decoded one level a round, until a round changes nothing
-# (at most five rounds), so a value encoded twice is caught too. Used only to
-# judge a value, never printed.
+# A value as a reader of it would see it, put in UNESCAPED: every %XX escape
+# decoded, one level a round, until a round changes nothing (at most five
+# rounds), so an escape-spelt word (%74oken) and a value encoded twice are
+# caught; then JSON's \/ and a backslash used for a slash turned into
+# slashes; then folded to lower case. It fails, and the value is refused
+# rather than judged half-read, when a % is not followed by two hex digits,
+# when an escape is a NUL byte, or when the value is still encoded after
+# five rounds. Used only to judge a value, never printed. The C locale makes
+# it work byte by byte.
+UNESCAPED=""
 the_value_unescaped() {
-  local value="${1,,}" before="" round escaped_slash='\/' backslash='\'
-  for round in 1 2 3 4 5; do
-    before="${value}"
-    value="${value//%3a/:}"
-    value="${value//%2f/\/}"
-    value="${value//%5c/${backslash}}"
-    value="${value//%40/@}"
-    value="${value//%3f/?}"
-    value="${value//%3d/=}"
-    value="${value//%26/&}"
-    value="${value//%3b/;}"
-    value="${value//%23/#}"
-    value="${value//%22/\"}"
-    value="${value//%20/ }"
-    value="${value//%25/%}"
-    [[ "${value}" != "${before}" ]] || break
+  local LC_ALL=C value="$1" rest decoded hex char round escaped_slash='\/' backslash='\'
+  UNESCAPED=""
+  for round in 1 2 3 4 5 6; do
+    [[ "${value}" == *%* ]] || break
+    ((round <= 5)) || return 1
+    rest="${value}"
+    decoded=""
+    while [[ "${rest}" == *%* ]]; do
+      decoded+="${rest%%\%*}"
+      rest="${rest#*%}"
+      [[ "${rest}" =~ ^[0-9A-Fa-f]{2} ]] || return 1
+      hex="${rest:0:2}"
+      [[ "${hex}" != "00" ]] || return 1
+      printf -v char "\\x${hex}"
+      decoded+="${char}"
+      rest="${rest:2}"
+    done
+    value="${decoded}${rest}"
   done
   value="${value//"${escaped_slash}"/\/}"
   value="${value//"${backslash}"/\/}"
-  printf '%s' "${value}"
+  UNESCAPED="${value,,}"
 }
 
 # Prints why one named setting may not be handed in, or nothing when it may.
@@ -266,7 +276,11 @@ why_this_setting_may_not_cross() {
   done
   value="${!name:-}"
   [[ -n "${value}" ]] || return 0
-  for seen in "${value,,}" "$(the_value_unescaped "${value}")"; do
+  if ! the_value_unescaped "${value}"; then
+    printf '%s (its value is percent-encoded in a way that cannot be read safely)' "${name}"
+    return 0
+  fi
+  for seen in "${value,,}" "${UNESCAPED}"; do
     if [[ "${seen}" =~ ${USER_IN_AN_ADDRESS} ]]; then
       printf '%s (its value is an address with a user or a password in it)' "${name}"
       return 0

@@ -511,6 +511,25 @@ CREDENTIAL_VALUES = {
     "double-percent-encoded": f"https%253A%252F%252Fsomeone%253A{SENTINEL}%2540192.0.2.10",
     "triple-percent-encoded": f"https%25253A%25252F%25252Fsomeone%252540192.0.2.10%25252F{SENTINEL}",
     "a-backslash-scheme": f"http:\\\\someone:{SENTINEL}@192.0.2.10/",
+    # Fix pass 3 (14 October 2026): every %XX is decoded, not only some.
+    "an-encoded-token-key": f"http://192.0.2.1/?%74oken={SENTINEL}",
+    "an-encoded-password-key": f"http://192.0.2.1/?%70assword={SENTINEL}",
+    "a-double-encoded-password-key": f"http://192.0.2.1/?%2570assword={SENTINEL}",
+    "an-upper-case-encoded-token-key": f"http://192.0.2.1/?%54OKEN={SENTINEL}",
+    "an-encoded-password-pair": f"host=192.0.2.10 %70ass%77ord={SENTINEL}",
+    "an-encoded-pwd-colon": f"%70wd%3A{SENTINEL}",
+    "an-encoded-user-part": f"https://%73omeone%3A{SENTINEL}%40192.0.2.10/",
+    "an-encoded-user-alone": f"https://{SENTINEL}%40192.0.2.10/",
+    "an-encoded-fragment-token": f"https://192.0.2.10/%23%61ccess_token={SENTINEL}",
+}
+
+#: Values whose percent-encoding cannot be read safely. Each is refused
+#: rather than judged half-read.
+UNREADABLE_ENCODINGS = {
+    "a-partial-escape": f"http://192.0.2.1/?q={SENTINEL}%2",
+    "an-invalid-escape": f"http://192.0.2.1/?q=%zz{SENTINEL}",
+    "a-nul-byte": f"http://192.0.2.1/?q={SENTINEL}%00",
+    "encoded-six-times": "http://192.0.2.1/?" + "%" + "25" * 5 + "74oken=" + SENTINEL,
 }
 
 
@@ -536,12 +555,44 @@ def test_a_value_carrying_a_credential_is_refused_by_name(script, value):
     "http://192.0.2.1:9000/docs#section-2",
     "a-label: a-value",
     "http://192.0.2.1:9000/a%2520path",
+    "http://192.0.2.1:9000/a%20path/with%2Fan%2fencoded%2Fslash?q=a%20b",
+    "http://192.0.2.1:9000/caf%C3%A9",
 ], ids=["the-memory-door", "a-plain-query", "an-email-address", "a-plain-pair", "a-model-name",
-        "a-plain-fragment", "a-plain-colon", "a-double-encoded-space"])
+        "a-plain-fragment", "a-plain-colon", "a-double-encoded-space",
+        "encoded-spaces-and-slashes", "an-encoded-letter-outside-ascii"])
 def test_an_ordinary_value_still_crosses(script, value):
     """The control for the value rules: the addresses, names and numbers the
     factory really hands in are not caught."""
     assert _the_rule_says(script, "FLEET_MEMORY_EMBED_URL", value) == ""
+
+
+@BOTH_SCRIPTS
+@pytest.mark.parametrize("value", list(UNREADABLE_ENCODINGS.values()),
+                         ids=list(UNREADABLE_ENCODINGS))
+def test_an_encoding_that_cannot_be_read_is_refused(script, value):
+    """Fix pass 3: a broken or partial % sequence, a NUL byte, or an encoding
+    still changing after five rounds of decoding is refused, by name, rather
+    than judged on a half-decoded value."""
+    said = _the_rule_says(script, "FLEET_MEMORY_EMBED_URL", value)
+    assert "FLEET_MEMORY_EMBED_URL" in said, said
+    assert SENTINEL not in said
+
+
+def test_an_encoded_credential_word_stops_both_scripts(sandbox, root):
+    """Fix pass 3, end to end: a query key spelt with percent-escapes
+    (%74oken for token) stops the start script and the outer supervisor."""
+    value = CREDENTIAL_VALUES["an-encoded-token-key"]
+    status, said = _start_expecting_it_to_end(
+        sandbox, SANDBOX_CONTAINER_ENV_NAMES="A_MODEL_URL", A_MODEL_URL=value
+    )
+    assert status == 2, said
+    assert "A_MODEL_URL" in said and SENTINEL not in said
+    assert not [call for call in _calls(sandbox) if call.startswith("run ")]
+
+    status, said = _run_the_supervisor(root, SANDBOX_ENV_NAMES="A_MODEL_URL", A_MODEL_URL=value)
+    assert status == 2, said
+    assert "A_MODEL_URL" in said and SENTINEL not in said
+    assert _client_calls(root) == []
 
 
 def test_the_tightened_rules_reach_the_start_script(sandbox):
