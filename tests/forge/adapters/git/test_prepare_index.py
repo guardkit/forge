@@ -240,3 +240,108 @@ class TestTheAnswerComesAfterTheRecordsAreOut:
 
         assert first.staged is True and second.staged is True
         assert _git(project, "diff", "--cached", "--name-only").split() == ["src/app.txt"]
+
+
+class TestCoachFixPass1:
+    """Coach review 1 of the Forge half, and parity with GuardKit e6bd14d2."""
+
+    @pytest.mark.asyncio
+    async def test_f1_an_empty_product_file_beside_a_tracked_empty_record_is_committed(
+        self, project: Path
+    ) -> None:
+        # git pairs empty files with each other as copies; an empty product
+        # file is not a copy of a record.
+        _write(project, {".guardkit/autobuild/events.jsonl": ""})
+        _git(project, "add", "-f", ".guardkit/autobuild/events.jsonl")
+        _git(project, "commit", "-q", "-m", "an older build committed an empty record")
+        _write(project, {"src/__init__.py": "", "src/app.txt": "two\n"})
+
+        result = await commit_all(project, "the work")
+
+        assert result.status == "success", result
+        assert _committed(project) == {"src/__init__.py", "src/app.txt"}
+
+    @pytest.mark.asyncio
+    async def test_f3_a_rename_inside_the_record_folders_keeps_the_tracked_record(
+        self, project: Path
+    ) -> None:
+        _write(project, {".guardkit/autobuild/a.json": OLD_RECORD})
+        _git(project, "add", "-f", ".guardkit/autobuild/a.json")
+        _git(project, "commit", "-q", "-m", "an older build committed a record")
+        _git(project, "mv", ".guardkit/autobuild/a.json", ".guardkit/autobuild/b.json")
+        _write(project, {"src/app.txt": "two\n"})
+
+        result = await commit_all(project, "the work")
+
+        assert result.status == "success", result
+        assert _committed(project) == {"src/app.txt"}
+        assert ".guardkit/autobuild/a.json" in _tracked(project)
+        assert ".guardkit/autobuild/b.json" not in _tracked(project)
+
+    @pytest.mark.parametrize("ignored", [False, True], ids=["not ignored", "ignored"])
+    @pytest.mark.asyncio
+    async def test_an_exact_copy_of_an_uncommitted_record_is_left_out(
+        self, project: Path, ignored: bool, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        if ignored:
+            _write(project, {".gitignore": ".guardkit/autobuild/\nlarge_tool_results/\n"})
+            _git(project, "add", ".gitignore")
+            _git(project, "commit", "-q", "-m", "ignore the records")
+        _write(
+            project,
+            {
+                ".guardkit/autobuild/TASK-1/player_turn_1.json": OLD_RECORD,
+                "large_tool_results/out.txt": "a lot of tool output\n",
+                "docs/turn.json": OLD_RECORD,
+                "docs/out.txt": "a lot of tool output\n",
+                "src/app.txt": "two\n",
+            },
+        )
+
+        with caplog.at_level(logging.WARNING):
+            result = await commit_all(project, "the work")
+
+        assert result.status == "success", result
+        assert _committed(project) == {"src/app.txt"}
+        assert (project / "docs/turn.json").is_file()
+        assert "docs/" in caplog.text
+        assert "moves or copies of GuardKit's own records" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_copies_controls_empty_files_and_inner_build_folders_are_not_compared(
+        self, project: Path
+    ) -> None:
+        inner = project / ".guardkit" / "worktrees" / "FEAT-1"
+        inner.mkdir(parents=True)
+        _git(inner, "init", "-q", "-b", "main")
+        _write(inner, {"src/feature.txt": "the product's own code\n"})
+        _write(
+            project,
+            {
+                ".guardkit/autobuild/empty.json": "",
+                "src/empty.txt": "",
+                "src/feature.txt": "the product's own code\n",
+            },
+        )
+
+        result = await commit_all(project, "the work")
+
+        assert result.status == "success", result
+        assert _committed(project) == {"src/empty.txt", "src/feature.txt"}
+
+    @pytest.mark.parametrize(
+        "link", [".guardkit/autobuild", ".guardkit/qav-shadow", "large_tool_results"]
+    )
+    @pytest.mark.asyncio
+    async def test_a_link_named_like_a_record_folder_is_left_out(
+        self, project: Path, link: str
+    ) -> None:
+        where = project / link
+        where.parent.mkdir(parents=True, exist_ok=True)
+        where.symlink_to("/home/example/forge-state/receipts")
+        _write(project, {"src/app.txt": "two\n"})
+
+        result = await commit_all(project, "the work")
+
+        assert result.status == "success", result
+        assert _committed(project) == {"src/app.txt"}

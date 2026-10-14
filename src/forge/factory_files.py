@@ -34,8 +34,10 @@ from __future__ import annotations
 import re
 
 __all__ = [
+    "FACTORY_RECORD_FOLDER_NAMES",
     "FACTORY_RECORD_PATHS",
     "SHIPPED_SCRIPTS",
+    "factory_record_content_pathspecs",
     "factory_record_exclusions",
     "factory_record_pathspecs",
     "is_factory_record",
@@ -65,10 +67,25 @@ FACTORY_RECORD_PATHS: tuple[str, ...] = (
     "**/large_tool_results/**",
 )
 
-#: The one path never left out of ``git add`` itself: naming a top-level
-#: folder there makes git refuse the whole add in a project whose ignore file
-#: covers it. It is taken out of what is staged afterwards, like the rest.
-_NOT_AT_ADD_TIME = "conversation_history/**"
+#: Each folder path's own name (``x/**`` gives ``x``): a symbolic link of that
+#: name is not matched by the ``/**`` form, and its link text can be a private
+#: path, so it counts as a record too. The same as GuardKit's
+#: ``_with_folder_names`` (GuardKit e6bd14d2).
+FACTORY_RECORD_FOLDER_NAMES: tuple[str, ...] = tuple(
+    p[:-3] for p in FACTORY_RECORD_PATHS if p.endswith("/**")
+)
+
+#: Every pattern a record path can match: the eight, then the folder names.
+_ALL_RECORD_PATTERNS: tuple[str, ...] = FACTORY_RECORD_PATHS + FACTORY_RECORD_FOLDER_NAMES
+
+#: Never left out of ``git add`` itself: naming a top-level folder there makes
+#: git refuse the whole add in a project whose ignore file covers it. It is
+#: taken out of what is staged afterwards, like the rest.
+_NOT_AT_ADD_TIME = ("conversation_history/**", "conversation_history")
+
+#: The inner build folders hold copies of the product itself, so their content
+#: is never compared with product files.
+_NOT_FOR_CONTENT = "**/.guardkit/worktrees/**"
 
 
 def _glob_to_regex(pattern: str) -> "re.Pattern[str]":
@@ -92,42 +109,60 @@ def _glob_to_regex(pattern: str) -> "re.Pattern[str]":
             for ch in part
         )
         out.append(piece if index == last else piece + "/")
-    return re.compile("".join(out))
+    # DOTALL: a file name can hold a line break, and git's ``*`` and ``**``
+    # match it like any other character (coach review 1, F2).
+    return re.compile("".join(out), re.DOTALL)
 
 
 _RECORD_MATCHERS: tuple["re.Pattern[str]", ...] = tuple(
-    _glob_to_regex(p) for p in FACTORY_RECORD_PATHS
+    _glob_to_regex(p) for p in _ALL_RECORD_PATTERNS
 )
 
 
 def is_factory_record(path: str) -> bool:
     """True when ``path``, as git prints it (relative to the top of the
-    repository, ``/``-separated), lies under one of the record paths.
+    repository, ``/``-separated), lies under one of the record paths or is a
+    record folder's own name.
 
     The same answer git's own ``:(glob)`` pathspec matching gives for the
-    list; a test pins the two together."""
+    list and the folder names, and the same answer as GuardKit's
+    ``is_factory_record``; tests pin all three together."""
     text = str(path or "")
     return bool(text) and any(m.fullmatch(text) for m in _RECORD_MATCHERS)
 
 
 def factory_record_exclusions() -> tuple[str, ...]:
-    """Record paths 1 to 6 and 8 as ``:(exclude,glob)`` pathspecs for
-    ``git add``, marked as patterns for the factory's git helper (which
-    otherwise takes every name literally)."""
+    """Record paths 1 to 6 and 8, and their folder names, as
+    ``:(exclude,glob)`` pathspecs for ``git add``, marked as patterns for the
+    factory's git helper (which otherwise takes every name literally)."""
     from forge.project_git import pattern_pathspec
 
     return tuple(
         pattern_pathspec(f":(exclude,glob){p}")
-        for p in FACTORY_RECORD_PATHS
-        if p != _NOT_AT_ADD_TIME
+        for p in _ALL_RECORD_PATTERNS
+        if p not in _NOT_AT_ADD_TIME
     )
 
 
 def factory_record_pathspecs() -> tuple[str, ...]:
-    """All eight record paths as ``:(glob)`` pathspecs, marked as patterns."""
+    """All eight record paths and the folder names as ``:(glob)`` pathspecs,
+    marked as patterns."""
     from forge.project_git import pattern_pathspec
 
-    return tuple(pattern_pathspec(f":(glob){p}") for p in FACTORY_RECORD_PATHS)
+    return tuple(pattern_pathspec(f":(glob){p}") for p in _ALL_RECORD_PATTERNS)
+
+
+def factory_record_content_pathspecs() -> tuple[str, ...]:
+    """Where record CONTENT is looked for on disk, to catch an exact copy of
+    a record that was never committed: every record path except the inner
+    build folders, as ``:(glob)`` pathspecs marked as patterns."""
+    from forge.project_git import pattern_pathspec
+
+    return tuple(
+        pattern_pathspec(f":(glob){p}")
+        for p in FACTORY_RECORD_PATHS
+        if p != _NOT_FOR_CONTENT
+    )
 
 #: Each script the factory ships for a project's sandbox, by file name, and
 #: the line its header carries in every version shipped so far (its third

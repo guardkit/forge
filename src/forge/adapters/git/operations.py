@@ -60,6 +60,8 @@ Design notes
 from __future__ import annotations
 
 import logging
+import os
+import stat
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -67,6 +69,7 @@ from typing import Awaitable, Callable, Sequence
 
 from forge.adapters.git.models import GitOpResult
 from forge.factory_files import (
+    factory_record_content_pathspecs,
     factory_record_exclusions,
     factory_record_pathspecs,
     is_factory_record,
@@ -332,26 +335,65 @@ class PreparedIndex:
     failure: GitOpResult | None = None
 
 
-def _moved_out_of_records(name_status: str) -> list[str]:
+#: The empty blob, in both object formats. An empty file is never a copy of
+#: a record: git pairs empty files with each other (coach review 1, F1).
+_EMPTY_BLOBS = frozenset(
+    {
+        "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+        "473a0f4c3be8a93681a267e3b1e9a7dcda1185436fe141f7749120a303721813",
+    }
+)
+
+#: How many file names one ``git reset`` or ``git hash-object`` is given.
+_NAMES_PER_COMMAND = 200
+
+
+def _moved_out_of_records(raw: str) -> list[str]:
     """Destinations of staged renames or copies whose source is a record and
-    whose destination is not, from ``git diff --name-status -z`` output."""
-    fields = name_status.split("\0")
+    whose destination is neither a record nor empty, from ``git diff --raw
+    -z`` output with rename detection on. A rename or copy names two paths;
+    every other status names one."""
+    fields = raw.split("\0")
     found: list[str] = []
     index = 0
     while index < len(fields):
-        status = fields[index].strip()
+        head = fields[index].lstrip("\n")
         index += 1
-        if not status:
+        if not head.startswith(":"):
             continue
-        if status[0] in "RC":
-            # A rename or copy names its source, then its destination.
+        parts = head[1:].split()
+        status = parts[4] if len(parts) >= 5 else ""
+        if status[:1] in ("R", "C"):
             source, destination = (fields[index : index + 2] + ["", ""])[:2]
             index += 2
-            if is_factory_record(source) and destination and not is_factory_record(destination):
+            if (
+                is_factory_record(source)
+                and destination
+                and not is_factory_record(destination)
+                and parts[3] not in _EMPTY_BLOBS
+            ):
                 found.append(destination)
         else:
-            index += 1  # every other status names one path
+            index += 1
     return found
+
+
+def _staged_outside_records(raw: str) -> list[tuple[str, str]]:
+    """``(blob id, path)`` for every file staged as added, changed or retyped
+    outside the record paths, from ``git diff --cached --raw -z --no-renames``
+    output. Embedded-repository links and empty files are left out."""
+    fields = raw.split("\0")
+    staged: list[tuple[str, str]] = []
+    index = 0
+    while index + 1 < len(fields):
+        meta, path = fields[index].lstrip("\n").split(), fields[index + 1]
+        index += 2
+        if len(meta) < 4 or meta[1] == "160000" or is_factory_record(path):
+            continue
+        if meta[3] in _EMPTY_BLOBS:
+            continue
+        staged.append((meta[3], path))
+    return staged
 
 
 async def prepare_index(
@@ -375,7 +417,9 @@ async def prepare_index(
        unstaged, with one warning. ``--find-copies-harder`` is needed for a
        plain move on disk (the source's deletion is never staged, so git sees
        a copy), and ``-l0`` stops git skipping the comparison quietly on a
-       large change;
+       large change. An empty destination is not a copy of anything. Then
+       every staged file outside the record paths whose content is exactly
+       that of a record file on disk, committed or not, is unstaged too;
     3. whatever is still staged under any of the eight record paths (a record
        force-added earlier, a change to a tracked record, the transcript
        folder) is unstaged, with one warning naming the count and the first
@@ -397,6 +441,70 @@ async def prepare_index(
             ),
         )
 
+    async def _reset(names: list[str]) -> ExecuteResult | None:
+        """Unstage ``names`` literally, in batches; the failed step, if any."""
+        for start in range(0, len(names), _NAMES_PER_COMMAND):
+            done = await execute(
+                command=["git", "reset", "-q", "--", *names[start : start + _NAMES_PER_COMMAND]],
+                cwd=cwd,
+            )
+            if done.exit_code != 0:
+                return done
+        return None
+
+    async def _exact_copies_of_records() -> list[str] | ExecuteResult:
+        """Staged files outside the record paths whose content is byte for
+        byte that of a record file on disk, committed or not (GuardKit
+        e6bd14d2). Records are never committed, so git's copy detection,
+        which only looks at what ``HEAD`` or the index holds, cannot see an
+        exact copy of one. The record files are listed tracked, untracked and
+        ignored alike, inner build folders are skipped, and each non-empty
+        regular file is hashed with ``git hash-object`` (nothing is written).
+        """
+        staged_res = await execute(
+            command=[
+                "git", "diff", "--cached", "--raw", "-z", "--no-abbrev",
+                "--no-renames", "--diff-filter=AMT",
+            ],
+            cwd=cwd,
+        )
+        if staged_res.exit_code != 0:
+            return staged_res
+        staged = _staged_outside_records(staged_res.stdout or "")
+        if not staged:
+            return []
+        listed = await execute(
+            command=[
+                "git", "ls-files", "-z", "--cached", "--others", "--",
+                *factory_record_content_pathspecs(),
+            ],
+            cwd=cwd,
+        )
+        if listed.exit_code != 0:
+            return listed
+        files: list[str] = []
+        for name in sorted({n for n in (listed.stdout or "").split("\0") if n}):
+            if name.endswith("/"):
+                continue  # a nested repository, never read
+            try:
+                info = os.lstat(os.path.join(cwd, name))
+            except OSError:
+                continue
+            if stat.S_ISREG(info.st_mode) and info.st_size > 0:
+                files.append(name)
+        record_ids: set[str] = set()
+        for start in range(0, len(files), _NAMES_PER_COMMAND):
+            hashed = await execute(
+                command=["git", "hash-object", "--", *files[start : start + _NAMES_PER_COMMAND]],
+                cwd=cwd,
+            )
+            if hashed.exit_code != 0:
+                return hashed
+            record_ids.update(
+                line.strip() for line in (hashed.stdout or "").splitlines() if line.strip()
+            )
+        return [path for blob, path in staged if blob in record_ids]
+
     try:
         added = await execute(
             command=["git", "add", "-A", "--", ".", *factory_record_exclusions()],
@@ -407,7 +515,7 @@ async def prepare_index(
 
         moves = await execute(
             command=[
-                "git", "diff", "--cached", "--name-status", "-z",
+                "git", "diff", "--cached", "--raw", "--no-abbrev", "-z",
                 "-M", "-C", "--find-copies-harder", "-l0",
             ],
             cwd=cwd,
@@ -416,14 +524,25 @@ async def prepare_index(
             return failed(moves)
         moved = _moved_out_of_records(moves.stdout or "")
         if moved:
-            reset = await execute(command=["git", "reset", "-q", "--", *moved], cwd=cwd)
-            if reset.exit_code != 0:
+            reset = await _reset(moved)
+            if reset is not None:
                 return failed(reset)
             logger.warning(MOVED_RECORDS_WARNING, len(moved), worktree, moved[0])
 
+        copied = await _exact_copies_of_records()
+        if isinstance(copied, ExecuteResult):
+            return failed(copied)
+        if copied:
+            reset = await _reset(copied)
+            if reset is not None:
+                return failed(reset)
+            logger.warning(MOVED_RECORDS_WARNING, len(copied), worktree, copied[0])
+
+        # ``--no-renames``: a record renamed to another record path must list
+        # both names, or the source's deletion stays staged (coach review 1, F3).
         listed = await execute(
             command=[
-                "git", "diff", "--cached", "--name-only", "-z", "--",
+                "git", "diff", "--cached", "--name-only", "--no-renames", "-z", "--",
                 *factory_record_pathspecs(),
             ],
             cwd=cwd,
@@ -432,8 +551,8 @@ async def prepare_index(
             return failed(listed)
         records = [name for name in (listed.stdout or "").split("\0") if name]
         if records:
-            reset = await execute(command=["git", "reset", "-q", "--", *records], cwd=cwd)
-            if reset.exit_code != 0:
+            reset = await _reset(records)
+            if reset is not None:
                 return failed(reset)
             logger.warning(
                 STAGED_RECORDS_WARNING,

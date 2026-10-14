@@ -100,10 +100,12 @@ def _fail(exit_code: int = 1, stdout: str = "", stderr: str = "boom") -> Execute
     return ExecuteResult(exit_code=exit_code, stdout=stdout, stderr=stderr)
 
 
-#: The four answers ``prepare_index`` asks for when nothing needs taking out
-#: and something is staged: the add, no moves of records, no staged records,
-#: and "something is staged" (``git diff --cached --quiet`` exits 1).
+#: The answers ``prepare_index`` asks for when nothing needs taking out and
+#: something is staged: the add, no moves of records, nothing staged outside
+#: the records to compare, no staged records, and "something is staged"
+#: (``git diff --cached --quiet`` exits 1).
 _PREPARED_WITH_SOMETHING_STAGED = (
+    _ok(),
     _ok(),
     _ok(),
     _ok(),
@@ -344,6 +346,7 @@ class TestCommitAll:
         # and rev-parse (14 October 2026).
         assert [c.command[:3] for c in fake.calls] == [
             ["git", "add", "-A"],
+            ["git", "diff", "--cached"],
             ["git", "diff", "--cached"],
             ["git", "diff", "--cached"],
             ["git", "diff", "--cached"],

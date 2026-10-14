@@ -13,6 +13,7 @@ Everything here is real git in a temporary folder. Nothing names a language.
 
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -37,6 +38,14 @@ THE_EIGHT = (
     "conversation_history/**",
     "**/large_tool_results/**",
 )
+
+#: Each folder path's own name (``x/**`` gives ``x``): a symbolic link of that
+#: name is a record too (GuardKit e6bd14d2).
+BARE_NAMES = tuple(p[:-3] for p in THE_EIGHT if p.endswith("/**"))
+
+#: GuardKit's lists and its matcher's answers, pinned from the commit named in
+#: the file (Forge does not import GuardKit).
+PINNED = Path(__file__).with_name("guardkit_factory_records.json")
 
 #: Paths a project could hold. Some are records, most are not.
 PATHS = (
@@ -73,6 +82,16 @@ PATHS = (
     "README",
     "large_tool_results.txt",
     "conversation_history.md",
+    # Folder names on their own (as a file or a link), at some depth.
+    "b1/.guardkit/autobuild",
+    "b2/.guardkit/autobuild-private",
+    "b3/.guardkit/qav-shadow",
+    "b4/.guardkit/worktrees",
+    "b5/large_tool_results",
+    "src/conversation_history.txt",
+    # A name with a line break in it (coach review 1, F2).
+    "we\nird/.guardkit/autobuild/x.json",
+    "line\nbreak/notes.md",
 )
 
 
@@ -97,9 +116,11 @@ def test_the_pathspec_helpers_are_marked_as_patterns() -> None:
     # Paths 1 to 6 and 8 are left out of the add; path 7 never is, because
     # naming it there makes git refuse the add in a project that ignores it.
     assert list(exclusions) == [
-        f":(exclude,glob){p}" for p in THE_EIGHT if p != "conversation_history/**"
+        f":(exclude,glob){p}"
+        for p in (*THE_EIGHT, *BARE_NAMES)
+        if not p.startswith("conversation_history")
     ]
-    assert list(pathspecs) == [f":(glob){p}" for p in THE_EIGHT]
+    assert list(pathspecs) == [f":(glob){p}" for p in (*THE_EIGHT, *BARE_NAMES)]
     assert all(isinstance(p, PatternPathspec) for p in (*exclusions, *pathspecs))
 
 
@@ -122,7 +143,7 @@ def test_the_matcher_agrees_with_gits_own_pathspec_matching(tmp_path: Path) -> N
     assert ".guardkit/worktrees/FEAT-2" in every
 
     matched_by_git: set[str] = set()
-    for pattern in THE_EIGHT:
+    for pattern in (*THE_EIGHT, *BARE_NAMES):
         listed = _git(repo, "ls-files", "-z", "--", f":(glob){pattern}")
         matched_by_git.update(p for p in listed.split("\0") if p)
 
@@ -132,6 +153,32 @@ def test_the_matcher_agrees_with_gits_own_pathspec_matching(tmp_path: Path) -> N
     assert "src/conversation_history/k.go" not in matched_here
     assert ".guardkit/worktrees/FEAT-2" in matched_here
     assert ".guardkit/features/F.yaml" not in matched_here
+    assert "we\nird/.guardkit/autobuild/x.json" in matched_here
+    assert "b5/large_tool_results" in matched_here
+
+
+def test_the_list_matches_guardkits_pinned_copy() -> None:
+    pinned = json.loads(PINNED.read_text(encoding="utf-8"))
+    assert pinned["source"] == "guardkit/orchestrator/worktree_checkpoints.py"
+    assert len(pinned["guardkit_commit"]) == 40
+    assert list(FACTORY_RECORD_PATHS) == pinned["FACTORY_RECORD_PATHS"]
+    # GuardKit's add-time exclusions of its records are Forge's, in any order.
+    assert sorted(factory_record_exclusions()) == pinned["record_exclusions"]
+
+
+def test_the_matcher_gives_guardkits_answers() -> None:
+    pinned = json.loads(PINNED.read_text(encoding="utf-8"))["is_factory_record"]
+    assert len(pinned) > 30
+    differ = {p: want for p, want in pinned.items() if is_factory_record(p) is not want}
+    assert differ == {}
+
+
+def test_against_guardkit_itself_when_it_is_installed() -> None:
+    checkpoints = pytest.importorskip("guardkit.orchestrator.worktree_checkpoints")
+    pinned = json.loads(PINNED.read_text(encoding="utf-8"))["is_factory_record"]
+    assert tuple(checkpoints.FACTORY_RECORD_PATHS) == FACTORY_RECORD_PATHS
+    for path in pinned:
+        assert checkpoints.is_factory_record(path) is is_factory_record(path), path
 
 
 @pytest.mark.parametrize(
@@ -141,6 +188,10 @@ def test_the_matcher_agrees_with_gits_own_pathspec_matching(tmp_path: Path) -> N
         ("conversation_history/x.md", True),
         ("src/conversation_history/k.go", False),
         (".guardkit/features/G.yaml", False),
+        (".guardkit/autobuild", True),
+        ("conversation_history", True),
+        ("a/large_tool_results", True),
+        ("we\nird/.guardkit/autobuild/x.json", True),
         ("", False),
     ],
 )
