@@ -2700,7 +2700,9 @@ def _every_binding(mod: _Module) -> list[tuple[str, str, ast.AST]]:
     scope-free walk of the whole tree (15 October 2026, class bodies,
     review 4): wherever it sits — annotations, defaults, decorators, bases,
     keywords, lambda bodies, comprehensions, class bodies, anywhere. A name
-    stored or deleted, every parameter, a def or class name, an import
+    stored or deleted (assignment, augmented and annotated assignment, for,
+    with, comprehension and walrus targets, ``del``, and a ``type`` alias's
+    name), every parameter, a def or class name, a type parameter, an import
     alias, an except name, a match capture, and a global or nonlocal
     declaration."""
     found: list[tuple[str, str, ast.AST]] = []
@@ -2721,6 +2723,10 @@ def _every_binding(mod: _Module) -> list[tuple[str, str, ast.AST]]:
             found.append((node.name, "match", node))
         elif isinstance(node, ast.MatchMapping) and node.rest:
             found.append((node.rest, "match", node))
+        elif isinstance(node, (ast.TypeVar, ast.TypeVarTuple, ast.ParamSpec)):
+            # A type parameter (``def f[T]``, ``class C[*Ts]``, ``type X[**P]``)
+            # binds its name (15 October 2026, class bodies, review 5, R6).
+            found.append((node.name, "type parameter", node))
         elif isinstance(node, ast.Global):
             found.extend((name, "global", node) for name in node.names)
         elif isinstance(node, ast.Nonlocal):
@@ -3136,6 +3142,26 @@ def _reserved_name_rebindings(
                 finals = finals_of(name, node)
                 if finals and all(guarded(f) for f in finals):
                     imported_guarded.setdefault(name, set()).update(finals)
+        # Every import of a reserved local name must resolve to the same
+        # single identity (15 October 2026, class bodies, review 5, R7):
+        # ``from subprocess import Popen`` beside ``from
+        # multiprocessing.popen_fork import Popen`` is a violation at each.
+        identities: dict[str, set[frozenset[str]]] = {}
+        for name, kind, node in bindings:
+            if kind == "import" and (name in imported_guarded or name in environment_names):
+                identities.setdefault(name, set()).add(frozenset(finals_of(name, node)))
+        disagreeing = {
+            name
+            for name, seen in identities.items()
+            if len(seen) > 1 or any(len(one) != 1 for one in seen)
+        }
+        for name, kind, node in bindings:
+            if kind == "import" and name in disagreeing:
+                flag(
+                    node,
+                    f"the reserved name {name!r} is imported as different things in "
+                    "this module; every import of it must name the same one",
+                )
         counts: dict[str, int] = {}
         for name, _kind, _node in bindings:
             counts[name] = counts.get(name, 0) + 1
@@ -6998,6 +7024,53 @@ def test_reservations_are_scope_free(tmp_path: Path) -> None:
         for p in problems
     ), problems
     assert not any(p.startswith("zz_ok_") for p in problems), problems
+
+
+#: Review 5 (15 October 2026). R6: a type parameter binds its name, so a
+#: generic def or class may not use the helper's name, a wrapper's name or
+#: an imported guarded name as one; an ordinary ``def f[T](x: T) -> T`` is
+#: clean. R7: every import of a reserved local name must name the same one
+#: thing: ``Popen`` from subprocess and from multiprocessing.popen_fork in
+#: one module is rejected; the same import repeated, at module level and
+#: inside a function, is clean.
+GUARD_PROBES_37: dict[str, str] = {
+    "__init__.py": "",
+    "zz_wrapper.py": GUARD_PROBES_33["zz_wrapper.py"],
+    "zz_p37_generic_def_named_like_the_helper.py": (
+        "def f[build_project_command_env]():\n    pass\n"
+    ),
+    "zz_p37_generic_class_named_like_a_wrapper.py": (
+        "from forge.zz_wrapper import project_env\n\n\nclass C[project_env]:\n    pass\n"
+    ),
+    "zz_p37_generic_class_named_like_an_imported_launch_module.py": (
+        "import subprocess\n\n\nclass C[subprocess]:\n    pass\n"
+    ),
+    "zz_p37_generic_def_param_spec_named_like_an_imported_launch.py": (
+        "from subprocess import run\n\n\ndef f[**run]():\n    pass\n"
+    ),
+    "zz_p37_two_different_popens.py": (
+        "from subprocess import Popen\nfrom multiprocessing.popen_fork import Popen\n"
+    ),
+    "zz_ok_ordinary_generic.py": "def f[T](x: T) -> T:\n    return x\n",
+    "zz_ok_the_same_import_repeated.py": (
+        "import subprocess\n\nfrom forge.launch_environment import build_project_command_env\n\n\n"
+        "def f(cmd, folder):\n    import subprocess\n\n"
+        "    subprocess.run(cmd, env=build_project_command_env(folder))\n"
+    ),
+}
+
+
+def test_type_parameters_bind_and_imports_of_a_name_must_agree(tmp_path: Path) -> None:
+    problems = unaccounted_launches(_write_package(tmp_path, GUARD_PROBES_37))
+    probes = {name for name in GUARD_PROBES_37 if name.startswith("zz_p37_")}
+    assert len(probes) == 5
+    caught = {p.split(":", 1)[0] for p in problems}
+    assert probes - caught == set(), f"slipped past the guard: {sorted(probes - caught)}"
+    assert sum(
+        p.startswith("zz_p37_two_different_popens.py:") and "imported as different things" in p
+        for p in problems
+    ) == 2, problems
+    assert not any(p.startswith(("zz_ok_", "zz_wrapper.py")) for p in problems), problems
 
 
 def test_env_slots_are_read_from_signatures() -> None:
