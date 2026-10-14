@@ -2308,6 +2308,16 @@ def _helper_shaped(node: ast.AST | None, mod: _Module, func: Any, wrappers: set[
     return False
 
 
+def _defined_once(mod: _Module, node: Any) -> bool:
+    """``node``'s name has exactly ONE binding in the scope it is defined in —
+    this very definition — by the single binding enumerator: no second
+    definition, no conditional alternative, no later rebinding of any form
+    (14 October 2026). Only such a function's identity is trusted."""
+    scope = _enclosing(mod, node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) or mod.tree
+    bound = _bindings(scope).get(node.name, [])
+    return len(bound) == 1 and bound[0][1] is node
+
+
 def _wrappers(modules: list[_Module]) -> set[str]:
     """Functions whose whole body is ``return <helper call>`` (or a call to
     another such function), by dotted name, none of whose parameters flows
@@ -2322,6 +2332,11 @@ def _wrappers(modules: list[_Module]) -> set[str]:
                     continue
                 full = f"{mod.dotted}.{_qualname(mod, node)}"
                 if full in found:
+                    continue
+                # Only a function defined exactly once in its scope: a second
+                # (or conditional) definition, or a later rebinding, can put
+                # something else under the same name.
+                if not _defined_once(mod, node):
                     continue
                 # Never a decorated function: a decorator can turn the
                 # helper's refusal into None, and env=None inherits everything.
@@ -2674,6 +2689,7 @@ def unaccounted_launches(package: Path) -> list[str]:
     _SCOPE_CACHE.clear()
     modules = _load_modules(package)
     wrappers = _wrappers(modules)
+    problems_of_trust = _untrusted_definitions(modules)
     problems: list[str] = []
 
     def place(mod: _Module, node: ast.AST) -> tuple[Any, str]:
@@ -2683,7 +2699,7 @@ def unaccounted_launches(package: Path) -> list[str]:
 
     def judge(mod: _Module, call: ast.Call, what: str) -> None:
         func, fname = place(mod, call)
-        if (mod.rel, fname) in ALLOWED:
+        if (mod.rel, fname) in ALLOWED and func is not None and _defined_once(mod, func):
             return
         if _factory_program(call):
             return
@@ -2745,10 +2761,44 @@ def unaccounted_launches(package: Path) -> list[str]:
                 if not isinstance(node, ast.Call) or _runner_named(mod, node.func) != (rel, fname):
                     continue
                 func = _enclosing_function(mod, node)
-                if mod.rel == rel and getattr(func, "name", None) in spec.get("bodies", {fname}):
+                if (
+                    mod.rel == rel
+                    and getattr(func, "name", None) in spec.get("bodies", {fname})
+                    and _defined_once(mod, func)
+                ):
                     continue  # the runner's own body
                 judge(mod, node, f"call to the generic runner {fname}")
+    problems.extend(problems_of_trust)
     return sorted(set(problems))
+
+
+def _untrusted_definitions(modules: list[_Module]) -> list[str]:
+    """Every function whose identity the guard trusts — the helper, a generic
+    runner (each of its bodies) and every allowed launch site — must be
+    defined exactly once in its scope; one that is not is reported."""
+    trusted_dotted = set(HELPERS) | {
+        d for spec in GENERIC_RUNNERS.values() for d in spec["dotted"]
+    }
+    trusted_places = set(ALLOWED) | {
+        (rel, body)
+        for (rel, fname), spec in GENERIC_RUNNERS.items()
+        for body in spec.get("bodies", {fname})
+    }
+    problems: list[str] = []
+    for mod in modules:
+        for node in ast.walk(mod.tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            dotted = f"{mod.dotted}.{_qualname(mod, node)}"
+            if (mod.rel, node.name) not in trusted_places and dotted not in trusted_dotted:
+                continue
+            if not _defined_once(mod, node):
+                problems.append(
+                    f"{mod.rel}:{node.lineno} in {node.name}: {node.name} is trusted "
+                    "by the launch guard but has more than one binding in its "
+                    "scope (a second or conditional definition, or a rebinding)"
+                )
+    return problems
 
 
 #: The first review's probes (13 October 2026), and the build system's guard's
@@ -3805,6 +3855,106 @@ def test_relative_imports_are_resolved_before_every_check(tmp_path: Path) -> Non
     assert any(
         "deploy_sidecar/zz_probe11.py:3 in <module>: "
         "forge.deploy_sidecar.service._start_and_collect is imported as 'go'" in p
+        for p in problems
+    ), problems
+    assert not {n for n in named if n.startswith("ok_")}, problems
+
+
+#: One definition, probed (14 October 2026): a wrapper defined safely under
+#: one condition and unsafely under another, defined twice, or rebound by an
+#: assignment after its definition, and a generic runner defined twice (safe,
+#: then unsafe). Only a function with exactly one binding in its scope is
+#: trusted.
+GUARD_PROBES_12 = textwrap.dedent(
+    '''\
+    import os
+    import subprocess
+
+    from forge.launch_environment import build_project_command_env
+
+    if os.environ.get("SOME_SWITCH"):
+
+        def _conditional(folder):
+            return build_project_command_env(folder)
+
+    else:
+
+        def _conditional(folder):
+            return dict(os.environ)
+
+
+    def p12_conditional_safe_and_unsafe_definitions(cmd, folder):
+        subprocess.run(cmd, env=_conditional(folder))
+
+
+    def _duplicate(folder):
+        return build_project_command_env(folder)
+
+
+    def _duplicate(folder):  # noqa: F811
+        return dict(os.environ)
+
+
+    def p12_duplicate_definitions(cmd, folder):
+        subprocess.run(cmd, env=_duplicate(folder))
+
+
+    def _rebound(folder):
+        return build_project_command_env(folder)
+
+
+    _rebound = lambda folder: dict(os.environ)  # noqa: E731
+
+
+    def p12_definition_rebound_by_assignment(cmd, folder):
+        subprocess.run(cmd, env=_rebound(folder))
+
+
+    def _single(folder):
+        return build_project_command_env(folder)
+
+
+    def ok_single_definition_wrapper(cmd, folder):
+        subprocess.run(cmd, env=_single(folder))
+
+
+    def ok_inline_helper(cmd, folder):
+        subprocess.run(cmd, env=build_project_command_env(folder))
+    '''
+)
+GUARD_PROBES_12_RUNNER = textwrap.dedent(
+    '''\
+    import subprocess
+
+
+    def _start_and_collect(*, argv, cwd, env, timeout, what):
+        return subprocess.Popen(argv, cwd=cwd, env=env)
+
+
+    def _start_and_collect(*, argv, cwd, env, timeout, what):  # noqa: F811
+        return subprocess.Popen(argv, cwd=cwd)
+    '''
+)
+
+
+def test_only_a_function_defined_once_is_trusted(tmp_path: Path) -> None:
+    pkg = tmp_path / "forge"
+    (pkg / "deploy_sidecar").mkdir(parents=True)
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "deploy_sidecar" / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "zz_probe12.py").write_text(GUARD_PROBES_12, encoding="utf-8")
+    (pkg / "deploy_sidecar" / "service.py").write_text(GUARD_PROBES_12_RUNNER, encoding="utf-8")
+    problems = unaccounted_launches(pkg)
+    named = {p.split(" in ", 1)[1].split(":", 1)[0] for p in problems}
+    expected = {
+        n.name
+        for n in ast.parse(GUARD_PROBES_12).body
+        if isinstance(n, ast.FunctionDef) and n.name.startswith("p12_")
+    }
+    assert len(expected) == 3
+    assert expected - named == set(), f"slipped past the guard: {sorted(expected - named)}"
+    assert any(
+        "deploy_sidecar/service.py" in p and "has more than one binding" in p
         for p in problems
     ), problems
     assert not {n for n in named if n.startswith("ok_")}, problems
