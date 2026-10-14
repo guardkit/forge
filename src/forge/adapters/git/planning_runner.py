@@ -72,6 +72,7 @@ from forge.adapters.git.operations import (
     _exception_failure,
     _failure_stderr,
     commit_all,
+    prepare_index,
 )
 from forge.deploy.candidate_tree import (
     FileAtCommit,
@@ -770,37 +771,25 @@ class WorktreeGitRunner:
     async def _commit_if_changed(
         self, worktree: Path, message: str
     ) -> GitOpResult | None:
-        """Stage everything and commit it; ``None`` when nothing was staged.
+        """Stage the worktree and commit it; ``None`` when nothing was staged.
 
-        Whether there is anything to commit is asked of git directly
-        (14 October 2026): ``git add -A``, then ``git diff --cached --quiet``,
-        whose exit code 0 means the index matches ``HEAD`` (nothing to
-        commit) and 1 means something is staged. Before, the commit was run
-        and its output searched for the words "nothing to commit"; git's own
-        text is no longer read anywhere. Any other answer from either step
-        is a failure carrying only the failure sentence.
+        Staging is :func:`forge.adapters.git.operations.prepare_index`
+        (14 October 2026, design "Factory records never enter a project's
+        commits"): the folder is staged with the factory's own records left
+        out, any record (or move or copy of one) that got staged anyway is
+        taken out, and only then does git answer, with ``git diff --cached
+        --quiet``, whether anything is left. So a worktree whose only change
+        is a record (GuardKit's query log, written by a check that ran here;
+        a transcript; a record staged earlier) makes no commit, and the
+        callers treat ``None`` as idempotent success. git's own text is not
+        read anywhere; any other answer is a failure carrying only the
+        failure sentence.
         """
-        cwd = str(worktree)
-        added = await self._execute_timed(command=["git", "add", "-A"], cwd=cwd)
-        if added.exit_code != 0:
-            return GitOpResult(
-                status="failed",
-                operation="commit_all",
-                stderr=_failure_stderr(added.stderr),
-                exit_code=added.exit_code,
-            )
-        staged = await self._execute_timed(
-            command=["git", "diff", "--cached", "--quiet"], cwd=cwd
-        )
-        if staged.exit_code == 0:
+        prepared = await prepare_index(worktree, execute=self._execute_timed)
+        if prepared.failure is not None:
+            return prepared.failure
+        if not prepared.staged:
             return None
-        if staged.exit_code != 1:
-            return GitOpResult(
-                status="failed",
-                operation="commit_all",
-                stderr=_failure_stderr(staged.stderr),
-                exit_code=staged.exit_code,
-            )
         return await commit_all(worktree, message, execute=self._execute_timed)
 
     @staticmethod

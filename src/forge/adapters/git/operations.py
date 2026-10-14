@@ -10,7 +10,9 @@ Three operations:
 - :func:`prepare_worktree` — ``git worktree add`` for the build's path,
   optionally ``-b <branch> <path> <base>`` when the branch must be
   CREATED (the fix journey's per-build branch, conductor activation §1).
-- :func:`commit_all` — ``git add -A`` + ``git commit -m`` + ``git rev-parse HEAD``.
+- :func:`commit_all` — :func:`prepare_index` + ``git commit -m`` + ``git rev-parse HEAD``.
+- :func:`prepare_index` — stage the working folder with the factory's own
+  records left out, and say whether anything is left to commit.
 - :func:`cleanup_worktree` — ``git worktree remove --force``; **best-effort**:
   failure is logged and returned as ``status="failed"`` but never raises,
   so callers (the build state machine) can treat it as a warning rather
@@ -64,7 +66,12 @@ from pathlib import Path
 from typing import Awaitable, Callable, Sequence
 
 from forge.adapters.git.models import GitOpResult
-from forge.project_git import run_git_async
+from forge.factory_files import (
+    factory_record_exclusions,
+    factory_record_pathspecs,
+    is_factory_record,
+)
+from forge.project_git import PatternPathspec, run_git_async
 
 logger = logging.getLogger(__name__)
 
@@ -127,7 +134,12 @@ async def _default_execute(
     a ``stderr`` that says which git command did not finish in time, so the
     caller sees a loud, retryable failure rather than an unbounded hang.
     """
-    argv = [str(token) for token in command]
+    # A pathspec the factory wrote as a pattern keeps its marker: the git
+    # helper takes every other name literally.
+    argv = [
+        token if isinstance(token, PatternPathspec) else str(token)
+        for token in command
+    ]
     if not argv or argv[0] != "git":
         return ExecuteResult(
             exit_code=-1,
@@ -296,17 +308,164 @@ async def prepare_worktree(
         return _exception_failure(operation, exc)
 
 
+#: The warning given when moves or copies of a record were left out.
+MOVED_RECORDS_WARNING = (
+    "Left %d file(s) out of the commit in %s: they are moves or copies of "
+    "GuardKit's own records (first: %s), which can hold private paths. They "
+    "stay on disk and are never committed."
+)
+
+#: The warning given when records that were staged were taken out.
+STAGED_RECORDS_WARNING = (
+    "Left %d of the factory's own record file(s) out of the commit in %s "
+    "(%s). They stay on disk and are never committed; nothing reads them "
+    "from git."
+)
+
+
+@dataclass(frozen=True)
+class PreparedIndex:
+    """What :func:`prepare_index` found: whether anything is left to commit,
+    or the failure that stopped it (then ``staged`` means nothing)."""
+
+    staged: bool
+    failure: GitOpResult | None = None
+
+
+def _moved_out_of_records(name_status: str) -> list[str]:
+    """Destinations of staged renames or copies whose source is a record and
+    whose destination is not, from ``git diff --name-status -z`` output."""
+    fields = name_status.split("\0")
+    found: list[str] = []
+    index = 0
+    while index < len(fields):
+        status = fields[index].strip()
+        index += 1
+        if not status:
+            continue
+        if status[0] in "RC":
+            # A rename or copy names its source, then its destination.
+            source, destination = (fields[index : index + 2] + ["", ""])[:2]
+            index += 2
+            if is_factory_record(source) and destination and not is_factory_record(destination):
+                found.append(destination)
+        else:
+            index += 1  # every other status names one path
+    return found
+
+
+async def prepare_index(
+    worktree: Path,
+    *,
+    execute: ExecuteCallable = _default_execute,
+    operation: str = "commit_all",
+) -> PreparedIndex:
+    """Stage ``worktree`` for a commit with the factory's records left out.
+
+    Design "Factory records never enter a project's commits" (14 October
+    2026); the same step as GuardKit's checkpoint, written again here because
+    Forge does not import GuardKit:
+
+    1. ``git add -A -- . <record exclusions>`` — record paths 1 to 6 and 8
+       are never staged in the first place (path 7, the top-level transcript
+       folder, cannot be named here without git refusing the add in a project
+       that ignores it);
+    2. before anything is restored, every staged rename or copy whose source
+       is a record and whose destination is not has its DESTINATION
+       unstaged, with one warning. ``--find-copies-harder`` is needed for a
+       plain move on disk (the source's deletion is never staged, so git sees
+       a copy), and ``-l0`` stops git skipping the comparison quietly on a
+       large change;
+    3. whatever is still staged under any of the eight record paths (a record
+       force-added earlier, a change to a tracked record, the transcript
+       folder) is unstaged, with one warning naming the count and the first
+       five paths;
+    4. ``git diff --cached --quiet`` answers whether anything is left.
+
+    Files left out stay on disk. Safe to run twice. Never raises.
+    """
+    cwd = str(worktree)
+
+    def failed(result: ExecuteResult) -> PreparedIndex:
+        return PreparedIndex(
+            staged=False,
+            failure=GitOpResult(
+                status="failed",
+                operation=operation,
+                stderr=_failure_stderr(result.stderr, result.stdout),
+                exit_code=result.exit_code,
+            ),
+        )
+
+    try:
+        added = await execute(
+            command=["git", "add", "-A", "--", ".", *factory_record_exclusions()],
+            cwd=cwd,
+        )
+        if added.exit_code != 0:
+            return failed(added)
+
+        moves = await execute(
+            command=[
+                "git", "diff", "--cached", "--name-status", "-z",
+                "-M", "-C", "--find-copies-harder", "-l0",
+            ],
+            cwd=cwd,
+        )
+        if moves.exit_code != 0:
+            return failed(moves)
+        moved = _moved_out_of_records(moves.stdout or "")
+        if moved:
+            reset = await execute(command=["git", "reset", "-q", "--", *moved], cwd=cwd)
+            if reset.exit_code != 0:
+                return failed(reset)
+            logger.warning(MOVED_RECORDS_WARNING, len(moved), worktree, moved[0])
+
+        listed = await execute(
+            command=[
+                "git", "diff", "--cached", "--name-only", "-z", "--",
+                *factory_record_pathspecs(),
+            ],
+            cwd=cwd,
+        )
+        if listed.exit_code != 0:
+            return failed(listed)
+        records = [name for name in (listed.stdout or "").split("\0") if name]
+        if records:
+            reset = await execute(command=["git", "reset", "-q", "--", *records], cwd=cwd)
+            if reset.exit_code != 0:
+                return failed(reset)
+            logger.warning(
+                STAGED_RECORDS_WARNING,
+                len(records),
+                worktree,
+                ", ".join(records[:5]) + (", ..." if len(records) > 5 else ""),
+            )
+
+        quiet = await execute(command=["git", "diff", "--cached", "--quiet"], cwd=cwd)
+        if quiet.exit_code == 0:
+            return PreparedIndex(staged=False)
+        if quiet.exit_code == 1:
+            return PreparedIndex(staged=True)
+        return failed(quiet)
+    except Exception as exc:  # noqa: BLE001 — adapter boundary, ADR-ARCH-025
+        logger.exception("prepare_index failed (worktree=%s)", worktree)
+        return PreparedIndex(staged=False, failure=_exception_failure(operation, exc))
+
+
 async def commit_all(
     worktree: Path,
     message: str,
     *,
     execute: ExecuteCallable = _default_execute,
 ) -> GitOpResult:
-    """Stage all changes and commit them inside ``worktree``.
+    """Stage all changes, without the factory's records, and commit them.
 
-    Issues three separate, list-token git invocations:
+    Issues these list-token git invocations:
 
-    1. ``git add -A``
+    1. :func:`prepare_index` — ``git add -A`` with the factory's own record
+       paths left out, then any staged record (or move or copy of one) taken
+       out again (14 October 2026; before, a plain ``git add -A``);
     2. ``git commit -m <message>`` — the message is passed as a single
        argv token, so shell metacharacters are literal.
     3. ``git rev-parse HEAD`` — to retrieve the commit SHA.
@@ -321,14 +480,9 @@ async def commit_all(
     operation = "commit_all"
     cwd = str(worktree)
     try:
-        add_res = await execute(command=["git", "add", "-A"], cwd=cwd)
-        if add_res.exit_code != 0:
-            return GitOpResult(
-                status="failed",
-                operation=operation,
-                stderr=_failure_stderr(add_res.stderr, add_res.stdout),
-                exit_code=add_res.exit_code,
-            )
+        prepared = await prepare_index(worktree, execute=execute, operation=operation)
+        if prepared.failure is not None:
+            return prepared.failure
 
         commit_res = await execute(command=["git", "commit", "-m", message], cwd=cwd)
         if commit_res.exit_code != 0:
@@ -424,7 +578,9 @@ async def cleanup_worktree(
 __all__ = [
     "ExecuteCallable",
     "ExecuteResult",
+    "PreparedIndex",
     "cleanup_worktree",
     "commit_all",
+    "prepare_index",
     "prepare_worktree",
 ]
