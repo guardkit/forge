@@ -2238,14 +2238,29 @@ def _bindings(scope: ast.AST) -> dict[str, list[tuple[str, ast.AST]]]:
         node = pending.pop()
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             bind(node.name, "class" if isinstance(node, ast.ClassDef) else "def", node)
-            # Its decorators, defaults and bases are evaluated here.
+            # Its decorators, defaults and bases are evaluated here, and so,
+            # bluntly, are its annotations and type parameters (15 October
+            # 2026, class bodies, review 6: no binding is skipped because it
+            # sits in an annotation).
             pending.extend(node.decorator_list)
+            pending.extend(getattr(node, "type_params", []))
             if isinstance(node, ast.ClassDef):
                 pending.extend(node.bases)
                 pending.extend(kw.value for kw in node.keywords)
             else:
                 pending.extend(d for d in node.args.defaults)
                 pending.extend(d for d in node.args.kw_defaults if d is not None)
+                every_arg = [
+                    *node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs,
+                    *(a for a in (node.args.vararg, node.args.kwarg) if a is not None),
+                ]
+                pending.extend(a.annotation for a in every_arg if a.annotation is not None)
+                if node.returns is not None:
+                    pending.append(node.returns)
+            continue
+        if isinstance(node, (ast.TypeVar, ast.TypeVarTuple, ast.ParamSpec)):
+            bind(node.name, "type parameter", node)
+            pending.extend(ast.iter_child_nodes(node))
             continue
         if isinstance(node, ast.Lambda):
             pending.extend(node.args.defaults)
@@ -3036,22 +3051,6 @@ def _env_argument(call: ast.Call, slot: EnvSlot) -> tuple[str, ast.AST | None]:
     return ("omitted", None)
 
 
-def _annotation_nodes(tree: ast.AST) -> set[int]:
-    """Nodes inside type annotations: naming a launch as a type runs nothing."""
-    found: set[int] = set()
-    roots: list[ast.AST] = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.arg) and node.annotation is not None:
-            roots.append(node.annotation)
-        elif isinstance(node, ast.AnnAssign):
-            roots.append(node.annotation)
-        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.returns is not None:
-            roots.append(node.returns)
-    for root in roots:
-        found.update(id(n) for n in ast.walk(root))
-    return found
-
-
 def _runner_named(mod: _Module, node: ast.AST) -> tuple[str, str] | None:
     """Which generic runner ``node`` names, if any: by where it is defined
     (an import under any name, a module attribute) or, on an object, by the
@@ -3253,14 +3252,15 @@ def _direct_use_violations(
        container, a lambda's value, a decorator — is a violation, and so is
        rebinding a runner or the helper as an attribute.
 
-    Type annotations name things without running them and are left out.
+    Nothing is left out (15 October 2026, class bodies, review 6): a type
+    annotation is checked like any other code, since it can hold a call or a
+    store and Python 3.14 evaluates annotations when they are read.
     """
     # The discovered wrappers' names are guarded like the helper's (15
     # October 2026, class bodies, review 3, R4).
     callables = _guarded_callables() | {w.rsplit(".", 1)[1] for w in wrappers}
     problems: list[str] = []
     for mod in modules:
-        skip = _annotation_nodes(mod.tree)
 
         def report(node: ast.AST, sentence: str) -> None:
             holder = _enclosing_function(mod, node) or _enclosing(mod, node, ast.ClassDef)
@@ -3283,9 +3283,17 @@ def _direct_use_violations(
             parent = mod.parents.get(id(node))
             return isinstance(parent, ast.Call) and parent.func is node
 
+        # A guarded name stored or deleted as an attribute: over a PLAIN walk
+        # of the whole module, with no exemption of any kind (15 October
+        # 2026, class bodies, review 6, R8): an annotation can hold a store.
         for node in ast.walk(mod.tree):
-            if id(node) in skip:
-                continue
+            if (
+                isinstance(node, ast.Attribute)
+                and isinstance(node.ctx, (ast.Store, ast.Del))
+                and (node.attr in callables or node.attr in _ANY_RECEIVER_LAUNCHES)
+            ):
+                report(node, f"{node.attr} is rebound as an attribute")
+        for node in ast.walk(mod.tree):
             # (1) imported only under its own name. Every import — relative
             # ones included — is first resolved to the absolute name it binds
             # by the one resolver (:func:`_import_bindings`, 14 October 2026).
@@ -3339,7 +3347,7 @@ def _direct_use_violations(
             elif isinstance(node, ast.Attribute):
                 if node.attr in callables or node.attr in _ANY_RECEIVER_LAUNCHES:
                     if isinstance(node.ctx, (ast.Store, ast.Del)):
-                        report(node, f"{node.attr} is rebound as an attribute")
+                        pass  # reported by the plain walk above
                     elif not called(node):
                         report(node, f"{node.attr} is referred to other than by calling it")
                 elif isinstance(node.ctx, ast.Load) and not called(node):
@@ -3454,7 +3462,12 @@ def _module_name_collisions(modules: list[_Module]) -> list[str]:
             for dotted in by_dotted
             if dotted.rpartition(".")[0] == mod.dotted and dotted != mod.dotted
         }
-        bound = _bindings(mod.tree)
+        # Scope-free (15 October 2026, class bodies, review 6): a binding of a
+        # submodule's name anywhere in the package's __init__ counts, a
+        # function's ``global`` one or one inside an annotation included.
+        bound: dict[str, list[tuple[str, ast.AST]]] = {}
+        for name, kind, node in _every_binding(mod):
+            bound.setdefault(name, []).append((kind, node))
         for child in sorted(children):
             submodule = f"{mod.dotted}.{child}"
             for kind, node in bound.get(child, []):
@@ -3555,7 +3568,6 @@ def _module_object_and_dynamic_import_violations(
     """
     problems: list[str] = []
     for mod in modules:
-        skip = _annotation_nodes(mod.tree)
 
         def place(node: ast.AST) -> str:
             holder = _enclosing_function(mod, node) or _enclosing(mod, node, ast.ClassDef)
@@ -3590,8 +3602,6 @@ def _module_object_and_dynamic_import_violations(
             )
 
         for node in ast.walk(mod.tree):
-            if id(node) in skip:
-                continue
             if isinstance(node, ast.Call):
                 callee = _resolve_all(mod, node.func, node) if isinstance(
                     node.func, (ast.Name, ast.Attribute)
@@ -7070,6 +7080,41 @@ def test_type_parameters_bind_and_imports_of_a_name_must_agree(tmp_path: Path) -
         p.startswith("zz_p37_two_different_popens.py:") and "imported as different things" in p
         for p in problems
     ) == 2, problems
+    assert not any(p.startswith(("zz_ok_", "zz_wrapper.py")) for p in problems), problems
+
+
+#: Review 6, R8 (15 October 2026): no exemption for annotations. An
+#: attribute store inside a parameter annotation (a comprehension target
+#: ``C.build_project_command_env``) is rejected, and so is the same with a
+#: wrapper's name defined in another module (``C.project_env``). Ordinary
+#: annotations stay clean.
+GUARD_PROBES_38: dict[str, str] = {
+    "__init__.py": "",
+    "zz_wrapper.py": GUARD_PROBES_33["zz_wrapper.py"],
+    "zz_p38_helper_name_stored_in_an_annotation.py": (
+        "class C:\n    pass\n\n\n"
+        "def f(value: [None for C.build_project_command_env in (None,)]):\n    pass\n"
+    ),
+    "zz_p38_wrapper_name_stored_in_an_annotation.py": (
+        "class C:\n    pass\n\n\n"
+        "def f(value: [None for C.project_env in (None,)]):\n    pass\n"
+    ),
+    "zz_ok_ordinary_annotations.py": (
+        "x: int = 1\n\n\ndef f(a: list[int]) -> None:\n    y: int = len(a)\n    return None\n"
+    ),
+}
+
+
+def test_an_annotation_hides_no_store(tmp_path: Path) -> None:
+    problems = unaccounted_launches(_write_package(tmp_path, GUARD_PROBES_38))
+    for probe, name in (
+        ("zz_p38_helper_name_stored_in_an_annotation.py", "build_project_command_env"),
+        ("zz_p38_wrapper_name_stored_in_an_annotation.py", "project_env"),
+    ):
+        assert any(
+            p.startswith(f"{probe}:") and f"{name} is rebound as an attribute" in p
+            for p in problems
+        ), problems
     assert not any(p.startswith(("zz_ok_", "zz_wrapper.py")) for p in problems), problems
 
 
