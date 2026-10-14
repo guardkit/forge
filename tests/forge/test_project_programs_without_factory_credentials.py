@@ -2339,69 +2339,6 @@ def _evaluation_scope(mod: _Module, at: ast.AST) -> ast.AST | None:
     return None
 
 
-def _class_assignment_hides_outer(
-    mod: _Module, klass: ast.ClassDef, name: str, at: ast.AST
-) -> bool:
-    """True only when the class body's ONE binding of ``name`` is a plain,
-    unconditional ``name = <expr>`` written directly at the top level of the
-    body, on an earlier statement than ``at`` (15 October 2026, class
-    bodies, review 2). Any other binding of the name in the class body (a
-    ``del``, one nested in if/try/for/while/with/match, an augmented or
-    annotated assignment, a walrus, an import, a def or class, a tuple
-    target) keeps the outer possibilities; so does any doubt."""
-    found = _bindings(klass).get(name, [])
-    if len(found) != 1:
-        return False
-    kind, node = found[0]
-    if (
-        kind != "assign"
-        or not isinstance(node, ast.Assign)
-        or len(node.targets) != 1
-        or not isinstance(node.targets[0], ast.Name)
-        or not any(statement is node for statement in klass.body)
-    ):
-        return False
-    # The top-level statement of the class body that holds the use.
-    child: ast.AST = at
-    parent = mod.parents.get(id(at))
-    while parent is not None and parent is not klass:
-        child, parent = parent, mod.parents.get(id(parent))
-    if parent is not klass:
-        return False
-    positions = {id(statement): index for index, statement in enumerate(klass.body)}
-    if id(child) not in positions:
-        return False
-    return positions[id(node)] < positions[id(child)]
-
-
-_COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
-
-
-def _class_lookup_at(mod: _Module, at: ast.AST) -> ast.ClassDef | None:
-    """The class whose OWN bindings a name at ``at`` is looked up in, if any
-    (15 October 2026, class bodies, review 3): as for
-    :func:`_class_body_at`, except that a comprehension or generator
-    expression is a scope of its own that, like a function or lambda, skips
-    the enclosing class's bindings. Only a comprehension's outermost
-    iterable is evaluated in the class scope."""
-    previous: ast.AST | None = None
-    child: ast.AST = at
-    current = mod.parents.get(id(at))
-    while current is not None:
-        if isinstance(current, _COMPREHENSIONS):
-            first = current.generators[0]
-            if not (child is first and previous is first.iter):
-                return None  # inside the comprehension's own scope
-        elif isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
-            scope = _evaluation_scope(mod, at)
-            return scope if isinstance(scope, ast.ClassDef) else None
-        elif isinstance(current, ast.ClassDef):
-            scope = _evaluation_scope(mod, at)
-            return scope if isinstance(scope, ast.ClassDef) else None
-        previous, child, current = child, current, mod.parents.get(id(current))
-    return None
-
-
 def _class_body_at(mod: _Module, at: ast.AST) -> ast.ClassDef | None:
     """The class whose body ``at`` is written directly in (outside any
     method), if any."""
@@ -2444,26 +2381,6 @@ def _possible_name_targets(mod: _Module, name: str, at: ast.AST) -> set[str]:
     being "shadowed" or rebound never exempts a name. ``global`` sends the
     lookup to the module as well; ``nonlocal`` to the enclosing function."""
     out: set[str] = set()
-    # A name used directly in a class body may hold what the class binds it
-    # to AND what the scopes around the class give it: the union (15 October
-    # 2026, class bodies, review 2). The outer possibilities are dropped only
-    # when one plain unconditional assignment at the top of the class body,
-    # earlier than the use, is the class's only binding of the name
-    # (:func:`_class_assignment_hides_outer`).
-    klass = _class_lookup_at(mod, at)
-    if klass is not None:
-        found = _bindings(klass).get(name, [])
-        if found:
-            kinds = {kind for kind, _node in found}
-            if "import" in kinds:
-                out |= _targets(mod, name)
-            out |= {
-                f"{mod.dotted}.{_qualname(mod, node)}"
-                for kind, node in found
-                if kind in ("def", "class")
-            }
-            if _class_assignment_hides_outer(mod, klass, name, at):
-                return out
     scope = _defining_scope(mod, at)
     while scope is not None:
         found = _bindings(scope).get(name, [])
@@ -2528,12 +2445,6 @@ def _resolve_all_strict(mod: _Module, func_node: ast.AST, at: ast.AST) -> set[st
     """
     if isinstance(func_node, ast.Name):
         name = func_node.id
-        klass = _class_lookup_at(mod, at)
-        if klass is not None and _bindings(klass).get(name):
-            # Bound in the class body it is used in: it may be the class's
-            # binding or the outer one (review 2), so nothing can vouch for
-            # it.
-            return set()
         scope = _defining_scope(mod, at)
         while scope is not None:
             kinds, definition = _scope_bindings(scope, name)
@@ -2784,15 +2695,42 @@ def _defined_once(mod: _Module, node: Any) -> bool:
     return True
 
 
+def _every_binding(mod: _Module) -> list[tuple[str, str, ast.AST]]:
+    """EVERY binding in the module as ``(name, kind, node)``, by a
+    scope-free walk of the whole tree (15 October 2026, class bodies,
+    review 4): wherever it sits — annotations, defaults, decorators, bases,
+    keywords, lambda bodies, comprehensions, class bodies, anywhere. A name
+    stored or deleted, every parameter, a def or class name, an import
+    alias, an except name, a match capture, and a global or nonlocal
+    declaration."""
+    found: list[tuple[str, str, ast.AST]] = []
+    for node in ast.walk(mod.tree):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            found.append((node.id, "del" if isinstance(node.ctx, ast.Del) else "store", node))
+        elif isinstance(node, ast.arg):
+            found.append((node.arg, "param", node))
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            found.append((node.name, "def", node))
+        elif isinstance(node, ast.ClassDef):
+            found.append((node.name, "class", node))
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            found.extend((local, "import", node) for local, _ in _import_bindings(node, mod.package))
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            found.append((node.name, "except", node))
+        elif isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name:
+            found.append((node.name, "match", node))
+        elif isinstance(node, ast.MatchMapping) and node.rest:
+            found.append((node.rest, "match", node))
+        elif isinstance(node, ast.Global):
+            found.extend((name, "global", node) for name in node.names)
+        elif isinstance(node, ast.Nonlocal):
+            found.extend((name, "nonlocal", node) for name in node.names)
+    return found
+
+
 def _module_wide_binding_count(mod: _Module, name: str) -> int:
-    """How many bindings ``name`` has in the whole module: at module level
-    and in every function, lambda and class body."""
-    scopes: list[ast.AST] = [mod.tree] + [
-        n
-        for n in ast.walk(mod.tree)
-        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef))
-    ]
-    return sum(len(_bindings(scope).get(name, [])) for scope in scopes)
+    """How many bindings ``name`` has anywhere in the module."""
+    return sum(1 for bound, _kind, _node in _every_binding(mod) if bound == name)
 
 
 def _wrappers(modules: list[_Module]) -> set[str]:
@@ -3139,33 +3077,42 @@ def _reserved_name_rebindings(
     modules: list[_Module], wrappers: frozenset[str] = frozenset()
 ) -> list[str]:
     """Every rebinding of a reserved name, and every launch imported under
-    another name.
+    another name: SCOPE-FREE (15 October 2026, class bodies, review 4).
 
-    A reserved name is the helper's, a generic runner's or a launch
-    function's — an imported alias of one included. In every module,
-    function and lambda scope, each binding of one (found by the one binding
-    enumerator, :func:`_bindings`) is flagged unless it is an import of the
-    very thing itself, or a module-level definition of a name the module
-    does not also import. Separately, a launch module or launch function
-    imported under a different local name (``as``) is flagged anywhere.
+    Every binding in a module is enumerated by one walk of its whole tree
+    (:func:`_every_binding`), wherever it sits. Reserved:
+
+    1. the helper's name and every discovered wrapper's name, in the whole
+       package: bound only by that helper's or wrapper's own single
+       definition, or by an import of that very thing;
+    2. every name an import in the module binds to a launch module, a launch
+       function, a generic runner, the helper or a wrapper: bound only by
+       imports of that same thing;
+    3. every generic runner's name: bound only by an import of a runner, the
+       helper or a launch, by a runner's own definition, or by a
+       module-level definition of a name the module does not also import.
+
+    Any other binding of a reserved name anywhere in the module is a
+    violation. So no guarded name can be shadowed in any scope, and the
+    lookup never has to work out shadowing for one. Separately, a launch
+    module or launch function imported under a different local name
+    (``as``) is a violation.
     """
-    base = _reserved_names()
-    # The helper's name and every discovered wrapper's name are reserved in
-    # the whole package (15 October 2026, GuardKit's round 25, R28): bound
-    # only by that helper's or wrapper's own single definition, or by an
-    # import of that very helper or wrapper.
     environment = HELPERS | set(wrappers)
     environment_names = {t.rsplit(".", 1)[1] for t in environment}
+    runner_dotted = {d for spec in GENERIC_RUNNERS.values() for d in spec["dotted"]}
+    runner_names = _reserved_names() - environment_names
+
+    def guarded(final: str) -> bool:
+        return (
+            final in environment
+            or final in runner_dotted
+            or _is_launch(final)
+            or _is_launch_module(final)
+        )
+
     problems: list[str] = []
     for mod in modules:
-        reserved = set(base) | environment_names
-        # Deliberately module-wide (not a lookup): a name imported anywhere
-        # in the module as a guarded thing is reserved in the whole module.
-        for alias in mod.imports:
-            for target in _targets(mod, alias):
-                last = target.rpartition(".")[2]
-                if last in base or target in HELPERS or _is_launch(target):
-                    reserved.add(alias)
 
         def flag(node: ast.AST, sentence: str) -> None:
             holder = _enclosing(mod, node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
@@ -3175,71 +3122,68 @@ def _reserved_name_rebindings(
                 where = getattr(outer, "name", "<module>")
             problems.append(f"{mod.rel}:{getattr(node, 'lineno', 0)} in {where}: {sentence}")
 
-        def is_the_thing_itself(local: str, node: ast.AST) -> bool:
-            for name, target in _import_bindings(node, mod.package):
-                if name != local:
-                    continue
-                for final in _finalise(target):
-                    if not (
-                        final in HELPERS
-                        or any(final in spec["dotted"] for spec in GENERIC_RUNNERS.values())
-                        or _is_launch(final)
-                        or _is_launch_module(final)
-                    ):
-                        return False
-            return True
+        def finals_of(name: str, node: ast.AST) -> set[str]:
+            out: set[str] = set()
+            for local, target in _import_bindings(node, mod.package):
+                if local == name:
+                    out |= _finalise(target)
+            return out
 
-        def is_the_environment_itself(name: str, kind: str, node: ast.AST, scope: ast.AST) -> bool:
+        bindings = _every_binding(mod)
+        imported_guarded: dict[str, set[str]] = {}
+        for name, kind, node in bindings:
             if kind == "import":
-                return all(
-                    _finalise(target) <= environment
-                    for local, target in _import_bindings(node, mod.package)
-                    if local == name
-                )
-            return (
-                kind == "def"
-                and scope is mod.tree
-                and f"{mod.dotted}.{name}" in environment
-                and _module_wide_binding_count(mod, name) == 1
-            )
+                finals = finals_of(name, node)
+                if finals and all(guarded(f) for f in finals):
+                    imported_guarded.setdefault(name, set()).update(finals)
+        counts: dict[str, int] = {}
+        for name, _kind, _node in bindings:
+            counts[name] = counts.get(name, 0) + 1
 
-        # Every scope, class bodies included: a class attribute is a binding.
-        scopes: list[ast.AST] = [mod.tree] + [
-            n for n in ast.walk(mod.tree)
-            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef))
-        ]
-        for scope in scopes:
-            for name, bound in _bindings(scope).items():
-                if name not in reserved:
-                    continue
-                for kind, node in bound:
-                    if name in environment_names:
-                        if not is_the_environment_itself(name, kind, node, scope):
-                            flag(
-                                node,
-                                f"the reserved name {name!r} (the environment helper's or "
-                                f"a wrapper's) is rebound by a {kind} binding",
-                            )
-                        continue
-                    if kind == "import" and is_the_thing_itself(name, node):
-                        continue
-                    if kind == "def" and any(
-                        f"{mod.dotted}.{_qualname(mod, node)}" in spec["dotted"]
-                        for spec in GENERIC_RUNNERS.values()
-                    ):
-                        continue  # a generic runner's own definition (a method included)
-                    if (
-                        kind in ("def", "class")
-                        and scope is mod.tree
-                        and name not in mod.imports
-                    ):
-                        continue
+        for name, kind, node in bindings:
+            if name in environment_names:
+                allowed = (
+                    kind == "import" and bool(finals_of(name, node)) and finals_of(name, node) <= environment
+                ) or (
+                    kind == "def"
+                    and any(node is top for top in mod.tree.body)
+                    and f"{mod.dotted}.{name}" in environment
+                    and counts[name] == 1
+                )
+                if not allowed:
                     flag(
                         node,
-                        f"the reserved name {name!r} (the helper's, a generic "
-                        f"runner's or a launch function's) is rebound by a "
+                        f"the reserved name {name!r} (the environment helper's or a "
+                        f"wrapper's) is rebound by a {kind} binding",
+                    )
+                continue
+            if name in imported_guarded:
+                finals = finals_of(name, node) if kind == "import" else set()
+                if not (finals and finals <= imported_guarded[name]):
+                    flag(
+                        node,
+                        f"the reserved name {name!r} (imported here as a launch, a launch "
+                        f"module, a runner, the helper or a wrapper) is rebound by a "
                         f"{kind} binding",
                     )
+                continue
+            if name in runner_names:
+                if kind == "import" and all(guarded(f) for f in finals_of(name, node)):
+                    continue
+                if kind == "def" and f"{mod.dotted}.{_qualname(mod, node)}" in runner_dotted:
+                    continue  # a generic runner's own definition (a method included)
+                if (
+                    kind in ("def", "class")
+                    and any(node is top for top in mod.tree.body)
+                    and name not in mod.imports
+                ):
+                    continue
+                flag(
+                    node,
+                    f"the reserved name {name!r} (the helper's, a generic "
+                    f"runner's or a launch function's) is rebound by a "
+                    f"{kind} binding",
+                )
         # A launch module or launch function imported under another name, by
         # the one launch predicate on the resolved import.
         for node in ast.walk(mod.tree):
@@ -6556,19 +6500,19 @@ def test_class_bodies_are_never_trusted(tmp_path: Path) -> None:
     assert not any(p.startswith("zz_ok.py") for p in problems), problems
 
 
-#: Class bodies, review 1 (15 October 2026): every check reads a name
-#: through the one scoped lookup, class body first. The control (clean): a
-#: class that rebinds ``subprocess`` to a string in its own body and then
-#: stores that name, which there is the string, not the module. The probe
-#: (still rejected): a class body that stores the real imported module.
+#: Class bodies, review 1 (15 October 2026): a class body that stores the
+#: real imported module is rejected. Review 1's control, a class that
+#: rebinds ``subprocess`` to a string and then stores it, was clean then; since
+#: review 4 it is REJECTED on purpose, because it rebinds an imported
+#: launch-module name (no guarded name may be bound but by its own import).
 GUARD_PROBES_31: dict[str, str] = {
     "__init__.py": "",
-    "zz_ok.py": textwrap.dedent(
+    "zz_rebinding.py": textwrap.dedent(
         '''\
         import subprocess
 
 
-        class ok_class_local_rebinding_then_stored:
+        class rejected_class_local_rebinding_then_stored:
             subprocess = "label"
             label = subprocess
         '''
@@ -6593,8 +6537,12 @@ def test_a_class_body_name_is_read_through_the_class_first(tmp_path: Path) -> No
         and "the launch module subprocess" in p
         for p in problems
     ), problems
-    assert not any(
-        p.startswith("zz_ok.py:") and "referred to other than" in p for p in problems
+    # Since review 4 (15 October 2026) the class-local rebinding of the
+    # imported launch module is itself REJECTED: no guarded name may be
+    # bound anywhere but by its own import, whatever the scope.
+    assert any(
+        p.startswith("zz_rebinding.py:") and "the reserved name 'subprocess'" in p
+        for p in problems
     ), problems
 
 
@@ -6603,16 +6551,16 @@ def test_a_class_body_name_is_read_through_the_class_first(tmp_path: Path) -> No
 #: top of the class body, earlier than the use. Rejected: the assignment
 #: after the use (the reproducer), an annotation-only binding, an assignment
 #: inside ``if True:`` before a top-level use, and an assignment followed by
-#: ``del``. Clean: review 1's control, an unconditional string assignment
-#: before the use.
+#: ``del``. Review 1's control (an unconditional string assignment before
+#: the use) is rejected since review 4: it rebinds an imported launch name.
 GUARD_PROBES_32: dict[str, str] = {
     "__init__.py": "",
-    "zz_ok.py": textwrap.dedent(
+    "zz_rebinding.py": textwrap.dedent(
         '''\
         import subprocess
 
 
-        class ok_unconditional_assignment_before_the_use:
+        class rejected_unconditional_assignment_before_the_use:
             subprocess = "label"
             label = subprocess
         '''
@@ -6657,8 +6605,12 @@ def test_a_class_binding_hides_the_outer_name_only_when_it_surely_ran(tmp_path: 
     }
     assert len(expected) == 4
     assert expected - named == set(), f"slipped past the guard: {sorted(expected - named)}"
-    assert not any(
-        p.startswith("zz_ok.py:") and "referred to other than" in p for p in problems
+    # Since review 4 (15 October 2026) the class-local rebinding of the
+    # imported launch module is itself REJECTED: no guarded name may be
+    # bound anywhere but by its own import, whatever the scope.
+    assert any(
+        p.startswith("zz_rebinding.py:") and "the reserved name 'subprocess'" in p
+        for p in problems
     ), problems
 
 
@@ -6768,10 +6720,10 @@ def test_the_environment_helpers_name_is_reserved_in_the_whole_package(tmp_path:
 #: the module inside one; only a comprehension's outermost iterable is
 #: evaluated in the class scope. Rejected: the list, set, dict and generator
 #: versions, a lambda called right away, and an outermost iterable that is
-#: itself a launch. Clean: review 1's control.
+#: itself a launch. Review 1's control is rejected since review 4.
 GUARD_PROBES_34: dict[str, str] = {
     "__init__.py": "",
-    "zz_ok.py": GUARD_PROBES_31["zz_ok.py"],
+    "zz_rebinding.py": GUARD_PROBES_31["zz_rebinding.py"],
     "zz_main.py": textwrap.dedent(
         '''\
         import subprocess
@@ -6819,7 +6771,13 @@ def test_a_comprehension_in_a_class_body_skips_the_class_bindings(tmp_path: Path
     }
     assert len(expected) == 6
     assert expected - named == set(), f"slipped past the guard: {sorted(expected - named)}"
-    assert not any(p.startswith("zz_ok.py:") for p in problems), problems
+    # Since review 4 (15 October 2026) the class-local rebinding of the
+    # imported launch module is itself REJECTED: no guarded name may be
+    # bound anywhere but by its own import, whatever the scope.
+    assert any(
+        p.startswith("zz_rebinding.py:") and "the reserved name 'subprocess'" in p
+        for p in problems
+    ), problems
 
 
 #: Class bodies, review 3, R4 (15 October 2026): a reserved environment name
@@ -6909,6 +6867,137 @@ def test_a_reserved_name_is_never_an_attribute_store_target(tmp_path: Path) -> N
     assert len(expected) == 10
     assert expected - named == set(), f"slipped past the guard: {sorted(expected - named)}"
     assert not any(p.startswith(("zz_wrapper.py:", "zz_wrapper_user.py:")) for p in problems), problems
+
+
+#: Scope-free reservations, probed (15 October 2026, class bodies, review
+#: 4): every binding anywhere in a module counts, and a name an import binds
+#: to a launch, a launch module, a runner, the helper or a wrapper may be
+#: bound only by imports of that same thing. Each ``zz_p36_`` module must
+#: be rejected: a lambda default inside a comprehension inside a class body,
+#: a comprehension inside a parameter annotation binding the helper's name,
+#: a function-local rebinding of ``subprocess``, a parameter and a ``for``
+#: target named like an imported launch function, and a binding inside a
+#: decorator and inside a default. The ``zz_ok_`` modules stay clean: plain
+#: imports, the inline helper, an imported wrapper called, and ordinary
+#: local variables.
+GUARD_PROBES_36: dict[str, str] = {
+    "__init__.py": "",
+    "zz_p36_lambda_default_in_a_class_comprehension.py": textwrap.dedent(
+        '''\
+        import subprocess
+
+
+        class C:
+            subprocess = "label"
+            callbacks = [(lambda value=subprocess.run(["make"]): value) for _ in range(1)]
+        '''
+    ),
+    "zz_p36_comprehension_in_an_annotation.py": textwrap.dedent(
+        '''\
+        def f(value: [None for build_project_command_env in ()]):
+            pass
+        '''
+    ),
+    "zz_p36_function_local_rebinding.py": textwrap.dedent(
+        '''\
+        import subprocess
+
+
+        def f():
+            subprocess = "x"
+            return subprocess
+        '''
+    ),
+    "zz_p36_parameter_named_like_an_imported_launch.py": textwrap.dedent(
+        '''\
+        from subprocess import run
+
+
+        def f(run):
+            return run
+        '''
+    ),
+    "zz_p36_for_target_named_like_an_imported_launch.py": textwrap.dedent(
+        '''\
+        from subprocess import run
+
+
+        def f():
+            for run in []:
+                pass
+        '''
+    ),
+    "zz_p36_binding_inside_a_decorator.py": textwrap.dedent(
+        '''\
+        import subprocess
+
+
+        def register(value):
+            return lambda function: function
+
+
+        @register(subprocess := None)
+        def f():
+            pass
+        '''
+    ),
+    "zz_p36_binding_inside_a_default.py": textwrap.dedent(
+        '''\
+        import subprocess
+
+
+        def f(value=(subprocess := None)):
+            return value
+        '''
+    ),
+    "zz_ok_imports_and_locals.py": textwrap.dedent(
+        '''\
+        import subprocess
+
+        from forge.launch_environment import build_project_command_env
+        from forge.zz_ok_wrapper import project_env
+
+
+        def ok_inline_helper(cmd, folder):
+            subprocess.run(cmd, env=build_project_command_env(folder))
+
+
+        def ok_imported_wrapper_called(cmd, folder):
+            subprocess.run(cmd, env=project_env(folder))
+
+
+        def ok_ordinary_locals(items):
+            total = 0
+            for item in items:
+                total += item
+            label = [value for value in items]
+            return total, label
+        '''
+    ),
+    "zz_ok_wrapper.py": textwrap.dedent(
+        '''\
+        from forge.launch_environment import build_project_command_env
+
+
+        def project_env(folder):
+            return build_project_command_env(folder)
+        '''
+    ),
+}
+
+
+def test_reservations_are_scope_free(tmp_path: Path) -> None:
+    problems = unaccounted_launches(_write_package(tmp_path, GUARD_PROBES_36))
+    probes = {name for name in GUARD_PROBES_36 if name.startswith("zz_p36_")}
+    assert len(probes) == 7
+    caught = {p.split(":", 1)[0] for p in problems}
+    assert probes - caught == set(), f"slipped past the guard: {sorted(probes - caught)}"
+    assert any(
+        p.startswith("zz_p36_comprehension_in_an_annotation.py:")
+        and "the reserved name 'build_project_command_env'" in p
+        for p in problems
+    ), problems
+    assert not any(p.startswith("zz_ok_") for p in problems), problems
 
 
 def test_env_slots_are_read_from_signatures() -> None:
