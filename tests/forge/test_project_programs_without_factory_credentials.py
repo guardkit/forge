@@ -2072,8 +2072,15 @@ def _follow(
         # launch function, runner or launch module in a name.
         prefix = ".".join(parts[: cut + 1])
         return {prefix if not rest else f"{prefix}.{'.'.join(rest)}"}
-    if bound and kinds == {"import"}:
+    if bound and "import" in kinds:
+        # Every import binding is followed, and when the name has any other
+        # binding as well (``import subprocess`` then ``subprocess: object``)
+        # the result also carries UNRESOLVED (15 October 2026, review 5, R6):
+        # the name MAY still be what an import gave it, so a module stays a
+        # module and a launch stays a launch, and the rest is unknown.
         result: set[str] = set()
+        if kinds != {"import"}:
+            result.add(UNRESOLVED + dotted)
         for _kind, node in bound:
             for local, target in _import_bindings(node, mod.package):
                 if local != name:
@@ -3137,7 +3144,9 @@ def _module_object_and_dynamic_import_violations(
     1. ANY module object — one of the package's own, a standard-library one,
        or any bound by an ``import`` statement — may only be used as the
        base of an attribute access. Storing, passing, returning, defaulting
-       or containing one is a violation.
+       or containing one is a violation. So is any of those uses of a name or
+       attribute chain whose identity cannot be followed (UNRESOLVED): it may
+       only be called or be the base of a further attribute.
     2. ANY dynamic import (``importlib.import_module``, ``__import__``,
        ``importlib.__import__``, ``builtins.__import__``), any loading of
        code from a file or a spec (``module_from_spec``,
@@ -3210,10 +3219,21 @@ def _module_object_and_dynamic_import_violations(
                 module_like = any(is_module(t) for t in identities)
                 if isinstance(node, ast.Name) and builtin_import(node):
                     identities = identities | {"__import__"}
+                unresolved = any(t.startswith(UNRESOLVED) for t in identities)
                 if (identities & (DYNAMIC_IMPORTERS | CODE_LOADERS)) and not called(node):
                     report(node, "a dynamic importer or code loader is held as a value")
                 elif module_like and not attribute_base(node):
                     report(node, "a module object is used other than as the base of an attribute")
+                elif unresolved and not attribute_base(node) and not called(node):
+                    # A name the guard cannot follow to its end may be a
+                    # launch module or a launch (15 October 2026, review 5,
+                    # R6): it may only be called, which is judged as a
+                    # possible launch, or be the base of a further attribute.
+                    report(
+                        node,
+                        "a value whose identity cannot be followed is used other than "
+                        "by calling it or as the base of an attribute",
+                    )
     return problems
 
 
@@ -5519,6 +5539,68 @@ def test_every_binding_of_a_name_counts(tmp_path: Path) -> None:
     assert any(
         " in p24_launch_function_conditionally_rebound: process launch subprocess.run" in p
         for p in problems
+    ), problems
+    assert not {n for n in named if n.startswith("ok_")}, problems
+
+
+#: Values the guard cannot follow, probed (15 October 2026, review 5, R6):
+#: ``a.py`` imports subprocess and then annotates the name (``subprocess:
+#: object``), so ``a.subprocess`` has an import binding and another one. It
+#: is still a module (any binding counts) and it is also unresolved; storing
+#: it and calling ``.run`` through the store is a violation, and so is
+#: storing an unresolved launch function (``b.run``, imported then
+#: annotated, and ``d.starter``, ``Popen`` imported under another name then
+#: annotated). The controls: the direct call through the same chain with the
+#: helper's environment, and a harmless resolved value stored.
+GUARD_PROBES_25: dict[str, str] = {
+    "__init__.py": "",
+    "a.py": "import subprocess\nsubprocess: object\n",
+    "b.py": "from subprocess import run\nrun: object\n",
+    "c.py": "VALUE = 1\n",
+    "d.py": "from subprocess import Popen as starter\nstarter: object\n",
+    "zz_main.py": textwrap.dedent(
+        '''\
+        from forge import a, b, c, d
+        from forge.launch_environment import build_project_command_env
+
+
+        def p25_annotated_module_stored_then_run(cmd):
+            backend = a.subprocess
+            backend.run(cmd)
+
+
+        def p25_unresolved_launch_function_stored(cmd):
+            launch = b.run
+            launch(cmd)
+
+
+        def p25_unresolved_launch_under_another_name_stored(cmd):
+            starter = d.starter
+            starter(cmd)
+
+
+        def ok_direct_call_through_the_chain_with_helper_env(cmd, folder):
+            a.subprocess.run(cmd, env=build_project_command_env(folder))
+
+
+        def ok_harmless_resolved_value_stored():
+            value = c.VALUE
+            return value
+        '''
+    ),
+}
+
+
+def test_a_value_the_guard_cannot_follow_is_never_stored(tmp_path: Path) -> None:
+    problems = unaccounted_launches(_write_package(tmp_path, GUARD_PROBES_25))
+    named = {p.split(" in ", 1)[1].split(":", 1)[0] for p in problems}
+    assert {
+        "p25_annotated_module_stored_then_run",
+        "p25_unresolved_launch_function_stored",
+        "p25_unresolved_launch_under_another_name_stored",
+    } <= named, problems
+    assert any(
+        " in p25_annotated_module_stored_then_run: a module object" in p for p in problems
     ), problems
     assert not {n for n in named if n.startswith("ok_")}, problems
 
